@@ -26,12 +26,18 @@ and recover the class.
 THE NET
 -------
   Input(T,1,DIN) spike trains
-    -> PointwiseConvLinear(HIDDEN)   per-timestep linear projection (the input
-                                     "synaptic current"); pointwise so each time
-                                     step is projected independently (a plain
-                                     FullConnect would flatten/mix the time axis)
-    -> TNNetLIFNeuron(tau, V_th, alpha)   HIDDEN spiking neurons over time
-    -> TNNetAvgChannel                rate readout: mean spikes over time -> (1,1,HIDDEN)
+    -> AddSpikingBlock(HIDDEN, tau, V_th, alpha, LearnDynamics=true)
+         which wires, in one call:
+           PointwiseConvLinear(HIDDEN)  per-timestep linear projection (the input
+                                        "synaptic current"); pointwise so each
+                                        time step is projected independently (a
+                                        FullConnect would flatten/mix the time axis)
+           TNNetLIFNeuron(tau,V_th,alpha,LearnDynamics)  HIDDEN spiking neurons
+                                        over time; LearnDynamics makes the
+                                        per-channel threshold V_th and leak beta
+                                        TRAINABLE parameters (opt-in)
+           TNNetAvgChannel              rate readout: mean spikes over time
+                                        -> (1,1,HIDDEN)
     -> FullConnectLinear(NCLASS) -> SoftMax
 
 Trained with plain SoftMax + cross-entropy (NN.Backpropagate against a one-hot
@@ -181,10 +187,12 @@ begin
 
   NN := TNNet.Create();
   NN.AddLayer(TNNetInput.Create(T, 1, DIN));
-  NN.AddLayer(TNNetPointwiseConvLinear.Create(HIDDEN)); // per-timestep current
-  NN.AddLayer(TNNetLIFNeuron.Create(TAU, VTH, ALPHA));
-  LIFIdx := NN.GetLastLayerIdx();
-  NN.AddLayer(TNNetAvgChannel.Create());                // rate readout over time
+  // AddSpikingBlock wires the canonical PointwiseConvLinear -> TNNetLIFNeuron ->
+  // TNNetAvgChannel (rate-readout) pipeline in one call. LearnDynamics=true makes
+  // the per-channel firing threshold V_th and leak beta TRAINABLE (opt-in).
+  NN.AddSpikingBlock(HIDDEN, TAU, VTH, ALPHA, {LearnDynamics=}true);
+  // The LIF layer is the one BEFORE the AvgChannel rate readout (= last - 1).
+  LIFIdx := NN.GetLastLayerIdx() - 1;
   NN.AddLayer(TNNetFullConnectLinear.Create(NCLASS));
   NN.AddLayer(TNNetSoftMax.Create());
 

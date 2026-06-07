@@ -26,9 +26,31 @@ S[t] = 1 if V[t] >= V_th else 0             hard Heaviside spike
 ```
 
 `beta = exp(-1/tau)` is the membrane leak, `V_th` the firing threshold. The layer
-**output is the binary spike train `S`** (faithfully binary at inference). It has
-**no trainable parameters of its own** — it is a pointwise neuron model over an
-upstream linear/conv layer, like an activation.
+**output is the binary spike train `S`** (faithfully binary at inference). By
+default it has **no trainable parameters of its own** — it is a pointwise neuron
+model over an upstream linear/conv layer, like an activation.
+
+### Opt-in learnable per-channel dynamics
+
+The constructor's 4th flag `pLearnDynamics` (default `false`) makes the
+per-channel firing threshold `V_th[d]` and leak `beta[d]` **trainable**
+parameters instead of fixed scalars. Two weight neurons of width `Depth` are
+installed: an unconstrained raw threshold (`V_th[d] = raw`) and a constrained
+raw leak (`beta[d] = sigmoid(raw)`, always in `(0,1)`), seeded so the layer
+starts at the scalar `(tau, V_th)` it was created with. The exact surrogate
+backward accumulates `dL/dV_th[d]` and `dL/dbeta[d]` (chaining
+`dbeta/draw = beta*(1-beta)`). With the flag **off** the layer is byte-identical
+to the original parameter-free layer. This example trains with
+`LearnDynamics=true`.
+
+### One-line builder: `AddSpikingBlock`
+
+`TNNet.AddSpikingBlock(pHidden, tau, V_th, alpha, LearnDynamics)` wires the
+canonical **linear -> LIF -> rate-readout** pipeline (a per-timestep
+`TNNetPointwiseConvLinear` projection, a `TNNetLIFNeuron`, then a
+`TNNetAvgChannel` rate readout averaging spikes over the time axis to a
+`(1,1,pHidden)` firing-rate vector) and returns the rate-readout layer. This
+example builds its spiking stage with that single call.
 
 ### Why a surrogate gradient
 
@@ -48,11 +70,10 @@ receives the direct spike-path term plus the membrane-carry term from `t+1`
 
 ```
 Input(T,1,DIN) spike trains
-  -> PointwiseConvLinear(HIDDEN)   per-timestep synaptic current (pointwise so the
-                                   time axis is projected independently; a plain
-                                   FullConnect would flatten/mix time)
-  -> TNNetLIFNeuron(tau, V_th, alpha)   HIDDEN spiking neurons over time
-  -> TNNetAvgChannel               rate readout: mean spikes over time -> (1,1,HIDDEN)
+  -> AddSpikingBlock(HIDDEN, tau, V_th, alpha, LearnDynamics=true)
+       PointwiseConvLinear(HIDDEN)        per-timestep synaptic current (pointwise)
+       TNNetLIFNeuron(tau,V_th,alpha,...) HIDDEN spiking neurons, trainable V_th/leak
+       TNNetAvgChannel                    rate readout -> (1,1,HIDDEN)
   -> FullConnectLinear(NCLASS) -> SoftMax
 ```
 

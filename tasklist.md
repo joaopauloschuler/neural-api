@@ -75,10 +75,14 @@ rather than acted on.
 - [ ] TNNetLIFNeuron follow-ups (the spiking leaky-integrate-and-fire surrogate-
       gradient leaf layer + examples/SpikingMNIST/ + numerical-gradient/forward/
       shape/save-load + FFloatSt round-trip tests all LANDED 2026-06-07 on a2):
-      - [ ] a learnable per-channel threshold / leak (trainable V_th, beta).
+      - [x] a learnable per-channel threshold / leak (trainable V_th, beta) —
+            LANDED 2026-06-07 on a2: opt-in TNNetLIFNeuron.Create(...,LearnDynamics)
+            4th flag, two width-Depth weight neurons (V_th[d]=raw, beta[d]=sigmoid),
+            exact surrogate backward + grad-checked, FStruct[0] round-trip.
       - [ ] the adaptive-LIF (ALIF) variant with a second slow threshold-
             adaptation state.
-      - [ ] a builder AddSpikingBlock wiring the linear+LIF+rate-readout pattern.
+      - [x] a builder AddSpikingBlock wiring the linear+LIF+rate-readout pattern —
+            LANDED 2026-06-07 on a2 (PointwiseConvLinear->TNNetLIFNeuron->AvgChannel).
 - [ ] TNNetComplexLinear (+ TNNetComplexConv) — the MISSING 2-D base rung of the
       Cayley-Dickson hypercomplex ladder. We already have TNNetQuaternionLinear (4-D)
       and TNNetOctonionLinear (8-D) + their conv siblings, but NOT the simplest

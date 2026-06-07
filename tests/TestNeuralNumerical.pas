@@ -218,6 +218,13 @@ type
     procedure TestLIFNeuronSpikePattern;
     procedure TestLIFNeuronShape;
     procedure TestLIFNeuronSerializationRoundTrip;
+    // TNNetLIFNeuron learnable per-channel threshold/leak (opt-in) + AddSpikingBlock
+    procedure TestLIFNeuronLearnableForward;
+    procedure TestLIFNeuronLearnableVthGradientCheck;
+    procedure TestLIFNeuronLearnableBetaGradientCheck;
+    procedure TestLIFNeuronLearnableInputGradientCheck;
+    procedure TestLIFNeuronLearnableSerializationRoundTrip;
+    procedure TestSpikingBlockBuilder;
     // TNNetTropicalConv max-plus / min-plus morphological convolution layer
     procedure TestTropicalConvInputGradientCheck;
     procedure TestTropicalConvWeightGradientCheck;
@@ -38696,6 +38703,400 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLIFNeuronLearnableForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LIF, LIFFixed: TNNetLIFNeuron;
+  NNFixed: TNNet;
+  InputF: TNNetVolume;
+  i, T, Depth: integer;
+begin
+  // With the learnable flag ON but the raw params left at their seeds (V_th and
+  // beta == the scalar values), the forward must MATCH the parameter-free layer.
+  RandSeed := 424242;
+  T := 6; Depth := 3;
+  NN := TNNet.Create();
+  NNFixed := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  InputF := TNNetVolume.Create(T, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth));
+    LIF := TNNetLIFNeuron.Create(2.5, 0.9, 2.0, {LearnDynamics=}true);
+    NN.AddLayer(LIF);
+
+    NNFixed.AddLayer(TNNetInput.Create(T, 1, Depth));
+    LIFFixed := TNNetLIFNeuron.Create(2.5, 0.9, 2.0, {LearnDynamics=}false);
+    NNFixed.AddLayer(LIFFixed);
+
+    AssertEquals('learnable LIF has 2 weight neurons', 2, LIF.Neurons.Count);
+    AssertEquals('fixed LIF has 0 weight neurons', 0, LIFFixed.Neurons.Count);
+    AssertTrue('learnable flag exposed', LIF.LearnDynamics);
+    // Per-channel seeds equal the scalar requests.
+    for i := 0 to Depth - 1 do
+    begin
+      AssertEquals('seed V_th[d]', 0.9, LIF.Neurons[0].Weights.FData[i], 1e-6);
+      AssertEquals('seed beta[d]', Exp(-1.0/2.5),
+        Sigmoid(LIF.Neurons[1].Weights.FData[i]), 1e-5);
+    end;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.7) * 0.8 + 0.3;
+      InputF.Raw[i] := Input.Raw[i];
+    end;
+    NN.Compute(Input);
+    NNFixed.Compute(InputF);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('learnable==fixed forward at ' + IntToStr(i),
+        NNFixed.GetLastLayer.Output.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    NNFixed.Free;
+    Input.Free;
+    InputF.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLIFNeuronLearnableVthGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired, Smooth: TNNetVolume;
+  LIF: TNNetLIFNeuron;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr, saved: TNeuralFloat;
+  d, T, Depth: integer;
+
+  function SurrogateLoss(): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    LIF.ComputeSurrogate(Smooth);
+    Result := 0;
+    for kk := 0 to Smooth.Size - 1 do
+    begin
+      diff := Smooth.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Gradient check the per-channel THRESHOLD gradient: FD the surrogate loss wrt
+  // raw_th[d] (== V_th[d]) and compare to the accumulated FNeurons[0].Delta. With
+  // LR=1 and momentum=0, Delta = -grad. (Shared RNG -> reseed.)
+  RandSeed := 424242;
+  T := 6; Depth := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  Desired := TNNetVolume.Create(T, 1, Depth);
+  Smooth := TNNetVolume.Create(T, 1, Depth);
+  epsilon := 0.0008;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth));
+    LIF := TNNetLIFNeuron.Create(2.0, 1.0, 2.0, {LearnDynamics=}true);
+    NN.AddLayer(LIF);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);   // do NOT flush deltas inside Backpropagate
+
+    for d := 0 to Input.Size - 1 do
+      Input.Raw[d] := Sin(d * 0.6) * 0.7 + 0.4;
+    for d := 0 to Input.Size - 1 do
+      Desired.Raw[d] := 0.3 + 0.1 * Cos(d * 0.4);
+
+    for d := 0 to Depth - 1 do
+    begin
+      saved := LIF.Neurons[0].Weights.FData[d];
+      LIF.Neurons[0].Weights.FData[d] := saved + epsilon;
+      lossPlus := SurrogateLoss();
+      LIF.Neurons[0].Weights.FData[d] := saved - epsilon;
+      lossMinus := SurrogateLoss();
+      LIF.Neurons[0].Weights.FData[d] := saved;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      // Analytic: surrogate forward, seed dL/dS = (gate-desired), clear deltas,
+      // backprop. Delta[d] = -LR*grad = -grad (LR=1).
+      NN.Compute(Input);
+      LIF.ComputeSurrogate(Smooth);
+      NN.ClearDeltas();
+      LIF.OutputError.Copy(Smooth);
+      LIF.OutputError.Sub(Desired);
+      LIF.IncDepartingBranchesCnt();
+      LIF.Backpropagate();
+      analyticalGrad := -LIF.Neurons[0].Delta.FData[d];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('LIF learnable V_th grad d=' + IntToStr(d) + ' (num=' +
+        FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  LIFNeuron learnable V_th grad max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free; Smooth.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLIFNeuronLearnableBetaGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired, Smooth: TNNetVolume;
+  LIF: TNNetLIFNeuron;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr, saved: TNeuralFloat;
+  d, T, Depth: integer;
+
+  function SurrogateLoss(): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    LIF.ComputeSurrogate(Smooth);
+    Result := 0;
+    for kk := 0 to Smooth.Size - 1 do
+    begin
+      diff := Smooth.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Gradient check the per-channel LEAK gradient: FD the surrogate loss wrt the
+  // RAW leak weight (beta=sigmoid(raw)) and compare to FNeurons[1].Delta. The
+  // analytic backward already chains dbeta/draw, so this checks the full chain.
+  RandSeed := 424242;
+  T := 6; Depth := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  Desired := TNNetVolume.Create(T, 1, Depth);
+  Smooth := TNNetVolume.Create(T, 1, Depth);
+  epsilon := 0.0008;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth));
+    LIF := TNNetLIFNeuron.Create(2.0, 1.0, 2.0, {LearnDynamics=}true);
+    NN.AddLayer(LIF);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for d := 0 to Input.Size - 1 do
+      Input.Raw[d] := Sin(d * 0.6) * 0.7 + 0.4;
+    for d := 0 to Input.Size - 1 do
+      Desired.Raw[d] := 0.3 + 0.1 * Cos(d * 0.4);
+
+    for d := 0 to Depth - 1 do
+    begin
+      saved := LIF.Neurons[1].Weights.FData[d];   // raw leak
+      LIF.Neurons[1].Weights.FData[d] := saved + epsilon;
+      lossPlus := SurrogateLoss();
+      LIF.Neurons[1].Weights.FData[d] := saved - epsilon;
+      lossMinus := SurrogateLoss();
+      LIF.Neurons[1].Weights.FData[d] := saved;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LIF.ComputeSurrogate(Smooth);
+      NN.ClearDeltas();
+      LIF.OutputError.Copy(Smooth);
+      LIF.OutputError.Sub(Desired);
+      LIF.IncDepartingBranchesCnt();
+      LIF.Backpropagate();
+      analyticalGrad := -LIF.Neurons[1].Delta.FData[d];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('LIF learnable beta(raw) grad d=' + IntToStr(d) + ' (num=' +
+        FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  LIFNeuron learnable leak(raw) grad max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free; Smooth.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLIFNeuronLearnableInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired, Smooth: TNNetVolume;
+  LIF: TNNetLIFNeuron;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, T, Depth, InSize: integer;
+
+  function ComputeSurrogateLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    LIF.ComputeSurrogate(Smooth);
+    Result := 0;
+    for k := 0 to Smooth.Size - 1 do
+    begin
+      diff := Smooth.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Input gradient must STILL be exact when the learnable variant is active (the
+  // per-channel beta/V_th simply replace the scalars in the same backward).
+  RandSeed := 424242;
+  T := 6; Depth := 3;
+  InSize := T * Depth;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  InputPlus := TNNetVolume.Create(T, 1, Depth);
+  Desired := TNNetVolume.Create(T, 1, Depth);
+  Smooth := TNNetVolume.Create(T, 1, Depth);
+  epsilon := 0.0008;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth, 1));
+    LIF := TNNetLIFNeuron.Create(2.0, 1.0, 2.0, {LearnDynamics=}true);
+    NN.AddLayer(LIF);
+    // Move the per-channel dynamics off the seeds so the test exercises non-scalar
+    // V_th/beta in the input backward.
+    LIF.Neurons[0].Weights.FData[0] := 0.8;
+    LIF.Neurons[0].Weights.FData[1] := 1.1;
+    LIF.Neurons[1].Weights.FData[0] := 0.4;   // raw -> beta=sigmoid(0.4)
+    LIF.Neurons[1].Weights.FData[2] := -0.2;
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.4;
+    for i := 0 to InSize - 1 do
+      Desired.Raw[i] := 0.3 + 0.1 * Cos(i * 0.4);
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeSurrogateLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeSurrogateLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LIF.ComputeSurrogate(Smooth);
+      NN.Layers[0].OutputError.Fill(0);
+      LIF.OutputError.Copy(Smooth);
+      LIF.OutputError.Sub(Desired);
+      LIF.IncDepartingBranchesCnt();
+      LIF.Backpropagate();
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('LIF learnable input grad at ' + IntToStr(i),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  LIFNeuron learnable input grad max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free; Smooth.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLIFNeuronLearnableSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  LIF: TNNetLIFNeuron;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, T, Depth: integer;
+begin
+  // The opt-in flag (FStruct[0]) AND the trained per-channel weights must survive
+  // SaveToString -> LoadFromString -> SaveToString (byte identical), restoring the
+  // 2 weight neurons and matching Compute.
+  RandSeed := 424242;
+  T := 5; Depth := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth));
+    LIF := TNNetLIFNeuron.Create(3.0, 0.85, 2.5, {LearnDynamics=}true);
+    NN.AddLayer(LIF);
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    // Perturb the trained dynamics so the saved weights are non-trivial.
+    LIF.Neurons[0].Weights.FData[0] := 0.7;
+    LIF.Neurons[0].Weights.FData[1] := 1.05;
+    LIF.Neurons[1].Weights.FData[0] := 0.3;
+    LIF.Neurons[1].Weights.FData[2] := -0.4;
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.8) * 0.9 + 0.3;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('learnable LIF save round-trip byte-identical', Saved, Saved2);
+      AssertTrue('learnable flag restored',
+        (NN2.Layers[1] as TNNetLIFNeuron).LearnDynamics);
+      AssertEquals('restored 2 weight neurons', 2,
+        (NN2.Layers[1] as TNNetLIFNeuron).Neurons.Count);
+      // Per-channel weights restored.
+      AssertEquals('V_th[0] restored', 0.7,
+        (NN2.Layers[1] as TNNetLIFNeuron).Neurons[0].Weights.FData[0], 1e-5);
+      AssertEquals('raw-leak[2] restored', -0.4,
+        (NN2.Layers[1] as TNNetLIFNeuron).Neurons[1].Weights.FData[2], 1e-5);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('learnable LIF compute matches after round-trip ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpikingBlockBuilder;
+var
+  NN: TNNet;
+  Input, Tgt: TNNetVolume;
+  RateLayer: TNNetLayer;
+  i, T, Depth, Hidden: integer;
+begin
+  // AddSpikingBlock must wire a valid linear->LIF->rate-readout net that computes
+  // and backprops. Rate readout collapses the time axis to (1,1,Hidden).
+  RandSeed := 424242;
+  T := 8; Depth := 5; Hidden := 6;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, Depth);
+  Tgt := TNNetVolume.Create(3, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, Depth));
+    RateLayer := NN.AddSpikingBlock(Hidden, 2.5, 1.0, 2.0, {LearnDynamics=}true);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+
+    AssertEquals('rate readout SizeX collapses to 1', 1, RateLayer.Output.SizeX);
+    AssertEquals('rate readout Depth = Hidden', Hidden, RateLayer.Output.Depth);
+
+    NN.SetLearningRate(0.01, 0.9);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do
+      if Sin(i * 0.5) > 0 then Input.Raw[i] := 1 else Input.Raw[i] := 0;
+
+    NN.Compute(Input);
+    AssertEquals('softmax output classes', 3, NN.GetLastLayer.Output.Size);
+    // The LIF spike train (block layer 2 after input) stays binary.
+    AssertTrue('block computes a finite output',
+      NN.GetLastLayer.Output.Raw[0] = NN.GetLastLayer.Output.Raw[0]); // not NaN
+
+    NN.ClearDeltas();
+    Tgt.Fill(0); Tgt.FData[1] := 1;
+    NN.Backpropagate(Tgt);
+    NN.UpdateWeights();
+    NN.Compute(Input);
+    AssertTrue('block still finite after a train step',
+      NN.GetLastLayer.Output.Raw[0] = NN.GetLastLayer.Output.Raw[0]);
+  finally
+    NN.Free; Input.Free; Tgt.Free;
   end;
 end;
 

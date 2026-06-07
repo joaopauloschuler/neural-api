@@ -7137,6 +7137,21 @@ type
   /// beta = FFloatSt[0], V_th = FFloatSt[1], alpha = FFloatSt[2] round-trip via
   /// save/load (tau is recovered as -1/ln(beta)). Constructor: Create(tau, V_th,
   /// alpha).
+  ///
+  /// OPT-IN LEARNABLE DYNAMICS (pLearnDynamics, 4th ctor flag, FStruct[0]=1):
+  /// the per-channel firing threshold V_th[d] and leak beta[d] become TRAINABLE
+  /// parameters instead of fixed scalars. Two weight neurons of width Depth are
+  /// installed (wired like TNNetRetention's learnable gamma so they round-trip
+  /// through the base per-neuron save/load and are stepped by UpdateWeights):
+  ///   FNeurons[0].Weights[d] = raw threshold  -> V_th[d] = raw  (unconstrained)
+  ///   FNeurons[1].Weights[d] = raw leak       -> beta[d] = sigmoid(raw) in (0,1)
+  /// InitDefault seeds raw_th[d]=FVth and raw_leak[d]=logit(FBeta) so the layer
+  /// starts at the requested scalar dynamics. The exact backward accumulates
+  ///   dL/dV_th[d] += -sgPrime[t]*gS[t]                 (gate depends on -V_th)
+  ///   dL/dbeta[d] += gV[t]*V[t-1]*(1-S[t-1])           (membrane recurrence)
+  /// chaining dbeta/draw = beta*(1-beta) into FNeurons[1].Delta. With the flag
+  /// OFF (default) NO neurons are installed and serialization is byte-identical
+  /// to the original parameter-free layer.
   // Coded by Claude (AI).
   TNNetLIFNeuron = class(TNNetLayer)
   private
@@ -7144,16 +7159,21 @@ type
     FBeta: TNeuralFloat;    // leak = exp(-1/tau), in (0,1)
     FVth: TNeuralFloat;     // firing threshold
     FAlpha: TNeuralFloat;   // surrogate sharpness (>0)
+    FLearnDynamics: boolean;// opt-in trainable per-channel V_th and beta
     FSeqLen: integer;       // T (SizeX)
     FDepth: integer;        // D
     FVmem: TNNetVolume;     // cached membrane potential V[t] per (t,d)
     FSpike: TNNetVolume;    // cached binary spikes S[t] per (t,d) (== Output)
+    // Per-channel effective dynamics (== scalar FBeta/FVth when not learning).
+    function EffBeta(d: integer): TNeuralFloat;
+    function EffVth(d: integer): TNeuralFloat;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
   public
     constructor Create(pTau: TNeuralFloat = 2.0; pVth: TNeuralFloat = 1.0;
-      pAlpha: TNeuralFloat = 2.0); overload;
+      pAlpha: TNeuralFloat = 2.0; pLearnDynamics: boolean = false); overload;
     destructor Destroy(); override;
+    procedure InitDefault(); override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -7169,6 +7189,7 @@ type
     property Beta: TNeuralFloat read FBeta;
     property Vth: TNeuralFloat read FVth;
     property Alpha: TNeuralFloat read FAlpha;
+    property LearnDynamics: boolean read FLearnDynamics;
   end;
 
   /// CONDITIONALLY-PARAMETERIZED ("dynamic") CONVOLUTION layer (CondConv,
@@ -8948,6 +8969,19 @@ type
       // to TNNetSinkhorn (smaller Tau -> sharper / more permutation-like).
       procedure AddSinkhornAttention(out Attended, W: TNNetLayer;
         KIter: integer = 20; Tau: TNeuralFloat = 1.0);
+      // SPIKING block: the canonical linear -> LIF -> rate-readout pipeline of a
+      // spiking neural network, over a (T,1,D) spike/feature tensor on the time
+      // axis. Wires (1) a per-timestep PointwiseConvLinear projection to pHidden
+      // channels (the "synaptic current"; pointwise so each time step is projected
+      // INDEPENDENTLY -- a FullConnect would flatten/mix the time axis), (2) a
+      // TNNetLIFNeuron (tau, V_th, alpha; pLearnDynamics enables trainable
+      // per-channel threshold/leak) emitting a binary spike train, then (3) a
+      // TNNetAvgChannel rate readout averaging spikes over time to a (1,1,pHidden)
+      // firing-rate vector. Returns the rate-readout layer (ready for a dense head).
+      // See examples/SpikingMNIST. Composes existing layers (no new class).
+      function AddSpikingBlock(pHidden: integer; pTau: TNeuralFloat = 2.0;
+        pVth: TNeuralFloat = 1.0; pAlpha: TNeuralFloat = 2.0;
+        pLearnDynamics: boolean = false): TNNetLayer;
       function AddSelfAttention(Heads: integer; NoForward:boolean = false;
         HasNorm: boolean = false;
         pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
@@ -35613,6 +35647,26 @@ begin
   Attended := AddLayer( TNNetPointwiseConvLinear.Create(EmbeddingDim) );
 end;
 
+function TNNet.AddSpikingBlock(pHidden: integer; pTau: TNeuralFloat = 2.0;
+  pVth: TNeuralFloat = 1.0; pAlpha: TNeuralFloat = 2.0;
+  pLearnDynamics: boolean = false): TNNetLayer;
+begin
+  if pHidden < 1 then
+    FErrorProc('AddSpikingBlock requires pHidden >= 1. Got ' + IntToStr(pHidden));
+  if GetLastLayer().Output.SizeY <> 1 then
+    FErrorProc('AddSpikingBlock requires a (T,1,D) input (SizeY=1). Got SizeY=' +
+      IntToStr(GetLastLayer().Output.SizeY));
+  // (1) Per-timestep synaptic-current projection D -> pHidden. PointwiseConvLinear
+  // projects each time step INDEPENDENTLY (a FullConnect would flatten/mix the
+  // time axis, per the per-token-projection convention).
+  AddLayer( TNNetPointwiseConvLinear.Create(pHidden) );
+  // (2) Spiking leaky-integrate-and-fire neurons over the time axis -> binary
+  // spike train (T,1,pHidden). pLearnDynamics makes V_th/leak trainable per channel.
+  AddLayer( TNNetLIFNeuron.Create(pTau, pVth, pAlpha, pLearnDynamics) );
+  // (3) Rate readout: mean spikes over time -> (1,1,pHidden) firing-rate vector.
+  Result := AddLayer( TNNetAvgChannel.Create() );
+end;
+
 function TNNet.AddSelfAttention(Heads: integer; NoForward:boolean = false;
   HasNorm: boolean = False;
   pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
@@ -39036,7 +39090,7 @@ end;
 // parameters. Per (t,d) state V[t]=FVmem, S[t]=FSpike. See class doc comment.
 
 constructor TNNetLIFNeuron.Create(pTau: TNeuralFloat; pVth: TNeuralFloat;
-  pAlpha: TNeuralFloat);
+  pAlpha: TNeuralFloat; pLearnDynamics: boolean);
 begin
   inherited Create();
   if pTau <= 0 then pTau := 2.0;
@@ -39045,14 +39099,19 @@ begin
   FBeta := Exp(-1.0 / pTau);    // membrane leak in (0,1)
   FVth := pVth;
   FAlpha := pAlpha;
+  FLearnDynamics := pLearnDynamics;
   FSeqLen := 0;
   FDepth := 0;
-  FFloatSt[0] := FBeta;         // beta (leak) round-trips
-  FFloatSt[1] := FVth;          // firing threshold
+  // FStruct[0] flags the opt-in trainable per-channel dynamics so it round-trips.
+  if FLearnDynamics then FStruct[0] := 1 else FStruct[0] := 0;
+  FFloatSt[0] := FBeta;         // beta (leak) round-trips (init value when learning)
+  FFloatSt[1] := FVth;          // firing threshold (init value when learning)
   FFloatSt[2] := FAlpha;        // surrogate sharpness
   FVmem := TNNetVolume.Create();
   FSpike := TNNetVolume.Create();
-  // LIF is parameter-free: drop any inherited weight neurons.
+  // LIF is parameter-free by default: drop any inherited weight neurons. The
+  // learnable variant installs its two per-channel neurons in SetPrevLayer once
+  // Depth is known.
   while FNeurons.Count > 0 do
     FNeurons.Delete(FNeurons.Count - 1);
   BuildArrNeurons();
@@ -39063,6 +39122,41 @@ begin
   FSpike.Free;
   FVmem.Free;
   inherited Destroy();
+end;
+
+// beta[d]=sigmoid(raw_leak[d]) when learning (always in (0,1)); else the scalar.
+function TNNetLIFNeuron.EffBeta(d: integer): TNeuralFloat;
+begin
+  if FLearnDynamics and (FNeurons.Count >= 2) then
+    Result := Sigmoid(FNeurons[1].FWeights.FData[d])
+  else
+    Result := FBeta;
+end;
+
+// V_th[d]=raw_th[d] (unconstrained) when learning; else the scalar threshold.
+function TNNetLIFNeuron.EffVth(d: integer): TNeuralFloat;
+begin
+  if FLearnDynamics and (FNeurons.Count >= 2) then
+    Result := FNeurons[0].FWeights.FData[d]
+  else
+    Result := FVth;
+end;
+
+// Seed the per-channel raw dynamics so the layer starts at the scalar (tau,V_th)
+// it was created with: raw_th[d]=FVth, raw_leak[d]=logit(FBeta). The optimizer
+// then moves these unconstrained scalars (beta stays in (0,1) via sigmoid).
+procedure TNNetLIFNeuron.InitDefault();
+var
+  d: integer;
+begin
+  if not FLearnDynamics then exit;
+  if FNeurons.Count < 2 then exit;
+  for d := 0 to FDepth - 1 do
+  begin
+    FNeurons[0].FWeights.FData[d] := FVth;
+    FNeurons[1].FWeights.FData[d] := Ln(FBeta / (1.0 - FBeta));
+  end;
+  AfterWeightUpdate();
 end;
 
 procedure TNNetLIFNeuron.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -39078,6 +39172,26 @@ begin
   FOutputErrorDeriv.ReSize(FSeqLen, 1, FDepth);
   FVmem.ReSize(FSeqLen, 1, FDepth);
   FSpike.ReSize(FSeqLen, 1, FDepth);
+  // Learnable variant: two per-channel weight neurons (threshold, leak) of width
+  // Depth. Wired like TNNetRetention's learnable gamma so they round-trip via the
+  // base per-neuron save/load and are stepped by UpdateWeights.
+  if FLearnDynamics then
+  begin
+    while FNeurons.Count > 2 do
+      FNeurons.Delete(FNeurons.Count - 1);
+    while FNeurons.Count < 2 do
+      FNeurons.Add(TNNetNeuron.Create());
+    FNeurons[0].FWeights.ReSize(FDepth, 1, 1);
+    FNeurons[0].FBackInertia.ReSize(FDepth, 1, 1);
+    FNeurons[0].FDelta.ReSize(FDepth, 1, 1);
+    FNeurons[0].FBiasWeight := 0;
+    FNeurons[1].FWeights.ReSize(FDepth, 1, 1);
+    FNeurons[1].FBackInertia.ReSize(FDepth, 1, 1);
+    FNeurons[1].FDelta.ReSize(FDepth, 1, 1);
+    FNeurons[1].FBiasWeight := 0;
+    BuildArrNeurons();
+    InitDefault();
+  end;
 end;
 
 procedure TNNetLIFNeuron.Compute();
@@ -39096,21 +39210,23 @@ end;
 procedure TNNetLIFNeuron.ComputeCPU();
 var
   t, d, idx: integer;
-  vPrev, sPrev, vt, current: TNeuralFloat;
+  vPrev, sPrev, vt, current, betaD, vthD: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   Prev := FPrevLayer.FOutput;
   for d := 0 to FDepth - 1 do
   begin
+    betaD := EffBeta(d);
+    vthD := EffVth(d);
     vPrev := 0;
     sPrev := 0;
     for t := 0 to FSeqLen - 1 do
     begin
       idx := t * FDepth + d;
       current := Prev.FData[idx];
-      vt := FBeta * vPrev * (1 - sPrev) + current;
+      vt := betaD * vPrev * (1 - sPrev) + current;
       FVmem.FData[idx] := vt;
-      if vt >= FVth then
+      if vt >= vthD then
       begin
         FSpike.FData[idx] := 1;
         FOutput.FData[idx] := 1;
@@ -39142,21 +39258,23 @@ end;
 procedure TNNetLIFNeuron.ComputeSurrogate(ADst: TNNetVolume);
 var
   t, d, idx: integer;
-  vPrev, sPrev, vt, current, u, denom, gate: TNeuralFloat;
+  vPrev, sPrev, vt, current, u, denom, gate, betaD, vthD: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   Prev := FPrevLayer.FOutput;
   ADst.ReSize(FSeqLen, 1, FDepth);
   for d := 0 to FDepth - 1 do
   begin
+    betaD := EffBeta(d);
+    vthD := EffVth(d);
     vPrev := 0;
     sPrev := 0;
     for t := 0 to FSeqLen - 1 do
     begin
       idx := t * FDepth + d;
       current := Prev.FData[idx];
-      vt := FBeta * vPrev * (1 - sPrev) + current;
-      u := vt - FVth;
+      vt := betaD * vPrev * (1 - sPrev) + current;
+      u := vt - vthD;
       denom := 1 + FAlpha * Abs(u);
       // g(v): antiderivative of the SuperSpike kernel, so g'(v)=1/denom^2.
       if u >= 0
@@ -39185,6 +39303,14 @@ begin
     BackpropagateCPU();
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+  // Learnable dynamics: step the per-channel raw threshold/leak neurons unless a
+  // batch update is in progress (then the caller flushes via UpdateWeights).
+  if FLearnDynamics and (FNeurons.Count >= 2) and (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    FNeurons[1].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -39194,38 +39320,75 @@ end;
 //   gS  = gO[t] + gVnext*(-beta*V[t])                   (reset coupling dV[t+1]/dS[t])
 //   gV  = gS*sgPrime + gVnext*beta*(1 - S[t])           (spike path + membrane carry)
 //   dL/dI[t] = gV   (since dV[t]/dI[t] = 1)
-// Each channel is independent. No trainable weights, so nothing is flushed to
-// neuron deltas; the SetBatchUpdate(True) idiom is used by callers only to keep
-// the per-sample forward caches (FVmem/FSpike) valid across a mini-batch.
+// Each channel is independent. When LearnDynamics is OFF there are no trainable
+// weights (nothing flushed to neuron deltas); the SetBatchUpdate(True) idiom is
+// used by callers only to keep the per-sample forward caches (FVmem/FSpike) valid
+// across a mini-batch. When ON, the per-channel raw threshold/leak gradients are
+// accumulated into FNeurons[0]/[1].Delta:
+//   dL/dV_th[d] += gS[t]*(-sgPrime[t])             (gate g(V-V_th) depends on -V_th)
+//   dL/dbeta[d] += gV[t]*V[t-1]*(1-S[t-1])         (explicit V[t] partial in beta)
+// then chained through dbeta/draw = beta*(1-beta) and pushed as
+// Delta += (-FLearningRate)*grad, mirroring TNNetRetention's learnable gamma.
 procedure TNNetLIFNeuron.BackpropagateCPU();
 var
   t, d, idx: integer;
-  gVnext, gO, gS, gV, sgPrime, vt, st, denom: TNeuralFloat;
-  hasInputGrad: boolean;
+  gVnext, gO, gS, gV, sgPrime, vt, st, denom, betaD, vthD: TNeuralFloat;
+  vPrevTm1, sPrevTm1, gradVth, gradBeta: TNeuralFloat;
+  hasInputGrad, learn: boolean;
   PrevErr: TNNetVolume;
 begin
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
-  if not hasInputGrad then exit;
-  PrevErr := FPrevLayer.FOutputError;
+  learn := FLearnDynamics and (FNeurons.Count >= 2);
+  if (not hasInputGrad) and (not learn) then exit;
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
   for d := 0 to FDepth - 1 do
   begin
+    betaD := EffBeta(d);
+    vthD := EffVth(d);
     gVnext := 0;
+    gradVth := 0;
+    gradBeta := 0;
     for t := FSeqLen - 1 downto 0 do
     begin
       idx := t * FDepth + d;
       vt := FVmem.FData[idx];
       st := FSpike.FData[idx];
       gO := FOutputError.FData[idx];
-      denom := 1 + FAlpha * Abs(vt - FVth);
+      denom := 1 + FAlpha * Abs(vt - vthD);
       sgPrime := 1 / (denom * denom);
       // dL/dS[t]: direct grad + reset coupling from V[t+1] = beta*V[t]*(1-S[t])+..
-      gS := gO + gVnext * (-FBeta * vt);
+      gS := gO + gVnext * (-betaD * vt);
       // dL/dV[t]: spike emission path + membrane carry into V[t+1].
-      gV := gS * sgPrime + gVnext * FBeta * (1 - st);
+      gV := gS * sgPrime + gVnext * betaD * (1 - st);
       // dV[t]/dI[t] = 1, so the input-current gradient is gV.
-      PrevErr.FData[idx] := PrevErr.FData[idx] + gV;
+      if hasInputGrad then
+        PrevErr.FData[idx] := PrevErr.FData[idx] + gV;
+      if learn then
+      begin
+        // V_th: gate emission g(V[t]-V_th) so dS[t]/dV_th = -sgPrime.
+        gradVth := gradVth + gS * (-sgPrime);
+        // beta: explicit partial of V[t]=beta*V[t-1]*(1-S[t-1])+I[t] (V[t-1],S[t-1]
+        // held; their dependence on beta is already captured by the total gV).
+        if t > 0 then
+        begin
+          vPrevTm1 := FVmem.FData[idx - FDepth];
+          sPrevTm1 := FSpike.FData[idx - FDepth];
+          gradBeta := gradBeta + gV * vPrevTm1 * (1 - sPrevTm1);
+        end;
+      end;
       gVnext := gV;
+    end;
+    if learn then
+    begin
+      // V_th is unconstrained (raw==V_th): step directly.
+      FNeurons[0].FDelta.FData[d] := FNeurons[0].FDelta.FData[d] +
+        (-FLearningRate) * gradVth;
+      // beta=sigmoid(raw): chain dbeta/draw = beta*(1-beta).
+      gradBeta := gradBeta * betaD * (1 - betaD);
+      FNeurons[1].FDelta.FData[d] := FNeurons[1].FDelta.FData[d] +
+        (-FLearningRate) * gradBeta;
     end;
   end;
 end;
@@ -66562,7 +66725,7 @@ begin
       'TNNetTropicalLinear' :       Result := TNNetTropicalLinear.Create(St[0], St[6]);
       'TNNetTropicalConv' :         Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]);
       'TNNetSinkhorn' :             Result := TNNetSinkhorn.Create(St[0], Ft[0]);
-      'TNNetLIFNeuron' :            Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2]);
+      'TNNetLIFNeuron' :            Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1);
       'TNNetCondConv' :             Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
       'TNNetKroneckerLinear' :      Result := TNNetKroneckerLinear.Create(St[3], St[1]);
@@ -66901,7 +67064,7 @@ begin
       if S[0] = 'TNNetTropicalLinear' then Result := TNNetTropicalLinear.Create(St[0], St[6]) else
       if S[0] = 'TNNetTropicalConv' then Result := TNNetTropicalConv.Create(St[0], St[1], St[2], St[3], St[6]) else
       if S[0] = 'TNNetSinkhorn' then Result := TNNetSinkhorn.Create(St[0], Ft[0]) else
-      if S[0] = 'TNNetLIFNeuron' then Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2]) else
+      if S[0] = 'TNNetLIFNeuron' then Result := TNNetLIFNeuron.Create(-1.0/Ln(Ft[0]), Ft[1], Ft[2], St[0] = 1) else
       if S[0] = 'TNNetCondConv' then Result := TNNetCondConv.Create(St[5], St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
       if S[0] = 'TNNetKroneckerLinear' then Result := TNNetKroneckerLinear.Create(St[3], St[1]) else
