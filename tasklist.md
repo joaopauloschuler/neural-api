@@ -75,44 +75,25 @@ rather than acted on.
 - [ ] TNNetLIFNeuron follow-ups (the spiking leaky-integrate-and-fire surrogate-
       gradient leaf layer + examples/SpikingMNIST/ + numerical-gradient/forward/
       shape/save-load + FFloatSt round-trip tests all LANDED 2026-06-07 on a2):
-      - [x] a learnable per-channel threshold / leak (trainable V_th, beta) —
+      - [X] a learnable per-channel threshold / leak (trainable V_th, beta) —
             LANDED 2026-06-07 on a2: opt-in TNNetLIFNeuron.Create(...,LearnDynamics)
             4th flag, two width-Depth weight neurons (V_th[d]=raw, beta[d]=sigmoid),
             exact surrogate backward + grad-checked, FStruct[0] round-trip.
       - [ ] the adaptive-LIF (ALIF) variant with a second slow threshold-
             adaptation state.
-      - [x] a builder AddSpikingBlock wiring the linear+LIF+rate-readout pattern —
+      - [X] a builder AddSpikingBlock wiring the linear+LIF+rate-readout pattern —
             LANDED 2026-06-07 on a2 (PointwiseConvLinear->TNNetLIFNeuron->AvgChannel).
-- [ ] TNNetComplexLinear (+ TNNetComplexConv) — the MISSING 2-D base rung of the
-      Cayley-Dickson hypercomplex ladder. We already have TNNetQuaternionLinear (4-D)
-      and TNNetOctonionLinear (8-D) + their conv siblings, but NOT the simplest
-      complex-valued (2-D) dense/conv layer they generalize. NOTE: complex weights
-      currently exist ONLY inside the SPECTRAL family (TNNetSpectralConv1D/2D do a
-      complex matmul in the Fourier domain); there is no general-purpose
-      complex-valued layer that operates directly on interleaved (Re,Im) channel
-      pairs in the spatial/feature domain. Spec:
-      - Pack channels as adjacent (Re,Im) pairs: Depth must be a multiple of 2,
-        group g holds Re=chan[2g], Im=chan[2g+1]; the OutDepth follows the same
-        convention. Per output group the layer learns one complex weight w=a+bi per
-        (in-group,out-group) and applies the 2x2 complex-multiply block
-        (Re' = a*Re - b*Im, Im' = a*Im + b*Re), exactly mirroring how the
-        quaternion/octonion layers pack a fixed hypercomplex multiply table — so
-        this becomes the 2-D rung of the SAME family with ~1/2 the weights of an
-        equal-width real dense layer. Optional learned complex bias.
-      - TNNetComplexConv: the spatial-convolution analogue (subclass the conv-linear
-        base the way TNNetQuaternionConv/TNNetOctonionConv do), reusing the verified
-        2x2 block per kernel tap.
-      - Last comment line `// Coded by Claude (AI).` above each new class.
-      - Tests (TestNeuralNumerical.pas, reseed RandSeed:=424242): numerical-gradient
-        (BOTH input AND complex-weight grads — the 2x2 block must be the exact real
-        adjoint), forward (verify against a hand-computed complex product),
-        shape, save/load round-trip; bound weights, don't loosen tolerance.
-      - examples/ComplexLinear/ — a small demo learning a complex-valued mapping
-        (e.g. recovering a known phase rotation / complex-gain on synthetic signal),
-        contrasting weight count vs a matched real dense net. Verify
-        norm/phase behaviour the way OctonionLinear checks |W.X|=|W|.|X|.
-      - Links the hypercomplex family note in MEMORY.md ([[quaternion-linear-layer]],
-        [[octonion-linear-layer]], [[octonion-conv-layer]]).
+- [X] TNNetComplexLinear (+ TNNetComplexConv) — the 2-D base rung of the
+      Cayley-Dickson hypercomplex ladder. LANDED 2026-06-07 on a2 (commit 3140d95):
+      both layers pack adjacent (Re,Im) channel pairs and apply the 2x2 complex
+      multiply block (Re'=a*Re-b*Im, Im'=a*Im+b*Re) via a CPX_SRC/CPX_SGN table in
+      the same idiom as OCT_SRC/OCT_SGN; ~1/2 the weights of an equal real dense
+      layer, optional complex bias, exact real-adjoint backward (input + weight),
+      registered in all 4 dispatch points. Tests: forward/grad-check/shape/save-load
+      for both (max-err 5.5e-5, RandSeed:=424242, bounded weights). Example
+      examples/ComplexLinear/ recovers a 50-deg phase rotation exactly while matched
+      real baselines plateau ~0.4; |w.x|=|w||x| holds to ~1e-7. See MEMORY note
+      [[complex-linear-conv-layer]].
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
