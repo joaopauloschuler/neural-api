@@ -81,15 +81,6 @@ rather than acted on.
       L2-normalized keys, sigmoid beta gate, exact dL/dS BPTT, serialization,
       input+weight gradient tests and examples/DeltaNet/ recall demo — has landed;
       see [[mlstm-cell-layer]] / [[ntm-memory-layer]] for the BPTT pattern.)
-- [ ] TNNetDeformableConv follow-up (the content-adaptive deformable-conv leaf
-      layer with predicted bilinear sampling offsets, weight+offset
-      numerical-gradient tests, serialization, shape smoke, and
-      examples/DeformableConv/ all landed 2026-06-07 on a2, commit 0f6be5c):
-  - [x] Optional v2: modulated deformable conv (DCNv2) adding a learnable
-        per-tap sigmoid amplitude (modulation mask). LANDED 2026-06-07 on a2 as
-        a Modulated flag (FStruct[5]) on TNNetDeformableConv widening the offset
-        head to 3*KK; input/weight numerical-gradient + serialization round-trip
-        tests added; non-modulated path unchanged.
 - [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
       + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
       shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
@@ -217,18 +208,6 @@ rather than acted on.
               backwards using the `SetBatchUpdate(True)` weight-accumulation idiom).
               Shares the O(1)-memory goal with the open `TNNetReversibleBlock`
               recompute path and the "Gradient checkpointing" infra task.
-- [ ] TNNetHamiltonianCell follow-ups (leaf layer + input/weight numerical-gradient
-      tests + LoadFromString round-trip + examples/HamiltonianPendulum/ all LANDED
-      2026-06-07 on a2, commit 4fd7309):
-      - [x] builder TNNet.AddHamiltonianBlock — LANDED 2026-06-07 on a2 (commit
-            e2ddb00): `y = x + HamiltonianCell(RMSNorm(x))` via AddRMSNormResidual,
-            even-Depth/SizeY=1 guards; builder smoke test asserts residual TNNetSum +
-            shape preservation.
-      - [x] separable H(q,p)=T(p)+V(q) (kinetic+potential split) variant — LANDED
-            2026-06-07 on a2 (commit e2ddb00): `pSeparable` ctor flag (FStruct[3]),
-            two independent half-width MLPs T(p)+V(q), exact leapfrog (Störmer-Verlet)
-            forward + reverse-leapfrog half-width-HVP backward; input+weight
-            numerical-gradient + serialization round-trip tests, coupled path unchanged.
 - [ ] Reptile follow-up (TNNetReptileMetaTrainer + examples/MetaLearningReptile/
       landed 2026-06-01, sine-regression task distribution, manual inner-loop
       Compute/Backpropagate/UpdateWeights path): (a) a CLASSIFICATION task
