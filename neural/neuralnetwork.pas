@@ -9896,11 +9896,18 @@ type
       // and SaliencyReport (per-sample input attribution for a class logit, not
       // a batch-averaged spatial-extent measurement). Forward+backward only; the
       // trained weights are never modified.
+      // CsvFile (default '' => no file written) optionally writes one CSV row
+      // per centred-square radius bin "radius,mass_fraction" (with a header
+      // line) so the cumulative-mass curve can be plotted outside the terminal;
+      // the terminal output is unchanged. mass_fraction is the fraction of the
+      // total gradient mass enclosed by the centred square of half-width radius,
+      // so the column is monotonically non-decreasing and ends at 1.0.
       class function EffectiveReceptiveFieldReport(
         NN: TNNet;
         Probes: TNNetVolumeList;
         MassFraction: TNeuralFloat = 0.9;
-        MaxProbes: integer = 64
+        MaxProbes: integer = 64;
+        CsvFile: string = ''
       ): string;
       // Linear-probe (linear separability) diagnostic. Given a classifier NN
       // (trained or fresh) and a labelled probe batch Samples (input volume +
@@ -55703,7 +55710,8 @@ class function TNNet.EffectiveReceptiveFieldReport(
   NN: TNNet;
   Probes: TNNetVolumeList;
   MassFraction: TNeuralFloat = 0.9;
-  MaxProbes: integer = 64
+  MaxProbes: integer = 64;
+  CsvFile: string = ''
 ): string;
 const
   cEps = 1e-30;
@@ -55732,6 +55740,8 @@ var
   RFLinePos, NumStart, NumEnd: integer;
   FS: TFormatSettings;
   TmpStr: string;
+  // optional (radius, mass-fraction) CSV side-output
+  Csv: TStringList;
 
   // Find Sub in S at or after FromIdx (1-based); 0 if not found. Avoids the
   // StrUtils PosEx dependency (this unit does not use StrUtils).
@@ -56023,6 +56033,33 @@ begin
     else
       Lines.Add('Theoretical RF unavailable (could not parse the analytical ' +
         'report); effective RF reported alone.');
+
+    // ------------------- optional (radius, mass-fraction) CSV side-output ----
+    // One row per centred-square radius bin: the cumulative fraction of the
+    // total gradient mass enclosed at that half-width. Monotone non-decreasing,
+    // ending at 1.0. The terminal report above is unchanged.
+    if CsvFile <> '' then
+    begin
+      Csv := TStringList.Create();
+      try
+        Csv.Add('radius,mass_fraction');
+        for rad := 0 to Trunc(MaxR) do
+        begin
+          BoxMass := 0;
+          for Py := 0 to InY - 1 do
+            for Px := 0 to InX - 1 do
+              if (Abs(Px - CX) <= rad) and (Abs(Py - CY) <= rad) then
+                BoxMass := BoxMass + Heat[Py * InX + Px];
+          Csv.Add(Format('%d,%.8f', [rad, BoxMass / TotalMass], FS));
+        end;
+        Csv.SaveToFile(CsvFile);
+        Lines.Add('');
+        Lines.Add(Format('CSV side-output (radius,mass_fraction; %d rows) ' +
+          'written to: %s', [Trunc(MaxR) + 1, CsvFile]));
+      finally
+        Csv.Free;
+      end;
+    end;
 
     Result := Lines.Text;
   finally

@@ -4293,7 +4293,12 @@ var
   RatioStr: string;
   Ratio: TNeuralFloat;
   FS: TFormatSettings;
+  CsvName: string;
+  CsvLines: TStringList;
+  PrevMass, CurMass: TNeuralFloat;
+  CommaPos: integer;
 begin
+  RandSeed := 424242;
   FS := DefaultFormatSettings;
   FS.DecimalSeparator := '.';
   FS.ThousandSeparator := #0;
@@ -4374,6 +4379,42 @@ begin
       Ratio <= 1.01);
     AssertTrue('effective RF is a real fraction of theoretical (ratio > 0)',
       Ratio > 0);
+
+    // --- CSV side-output: file created, header + one row per radius bin, and
+    // the cumulative mass_fraction column is monotonically non-decreasing and
+    // ends at ~1.0. Input plane is 13x13 so MaxR=13 => 14 radius rows (0..13)
+    // plus the header line = 15 lines. ---
+    CsvName := GetTempDir(False) + 'erf_report_test.csv';
+    if FileExists(CsvName) then DeleteFile(CsvName);
+    Report := TNNet.EffectiveReceptiveFieldReport(NN, Probes, 0.9, 64, CsvName);
+    AssertTrue('CSV file created', FileExists(CsvName));
+    AssertTrue('CSV mention in terminal report',
+      Pos('CSV side-output', Report) > 0);
+    CsvLines := TStringList.Create();
+    try
+      CsvLines.LoadFromFile(CsvName);
+      AssertTrue('CSV header present', CsvLines[0] = 'radius,mass_fraction');
+      // 13x13 input => MaxR = 13 => radii 0..13 => 14 data rows + header.
+      AssertEquals('CSV row count (header + 14 radius bins)', 15, CsvLines.Count);
+      PrevMass := -1;
+      CurMass := 0;
+      for I := 1 to CsvLines.Count - 1 do
+      begin
+        CommaPos := Pos(',', CsvLines[I]);
+        AssertTrue('CSV row has a comma', CommaPos > 0);
+        CurMass := StrToFloatDef(
+          Copy(CsvLines[I], CommaPos + 1, Length(CsvLines[I])), -1, FS);
+        AssertTrue('CSV mass_fraction parsed', CurMass >= 0);
+        AssertTrue('CSV cumulative mass non-decreasing',
+          CurMass >= PrevMass - 1e-6);
+        PrevMass := CurMass;
+      end;
+      // Final radius encloses the whole plane => mass fraction ~ 1.0.
+      AssertTrue('CSV final mass_fraction ~ 1.0', Abs(CurMass - 1.0) < 1e-4);
+    finally
+      CsvLines.Free;
+      if FileExists(CsvName) then DeleteFile(CsvName);
+    end;
   finally
     Probes.Free;
     NN.Free;
