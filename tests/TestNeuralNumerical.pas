@@ -428,6 +428,10 @@ type
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
     procedure TestWKVSerializationRoundTrip;
+    procedure TestCrossWKVShapeInference;
+    procedure TestCrossWKVInputGradientCheck;
+    procedure TestCrossWKVWeightGradientCheck;
+    procedure TestCrossWKVSerializationRoundTrip;
     procedure TestTTTShapeInference;
     procedure TestTTTLinearInputGradientCheck;
     procedure TestTTTLinearWeightGradientCheck;
@@ -23612,6 +23616,284 @@ begin
   // sweep (not persisted); FStruct[0]=C. Input depth must be 2*C=4 -> C=2.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetWKV.Create(), 'WKV', 4, 1, 4, 1e-5);
+end;
+
+// --- TNNetCrossWKV (two-source RWKV WKV: receptance src + key|value src) -----
+
+procedure TTestNeuralNumerical.TestCrossWKVShapeInference;
+var
+  NN: TNNet;
+  RcpIn, KVIn: TNNetLayer;
+  L: TNNetCrossWKV;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    // Receptance source: SeqLen=5, C=3 (depth C). Key|Value source: depth 2*C=6.
+    RcpIn := NN.AddLayer(TNNetInput.Create(5, 1, 3, 1));
+    KVIn  := NN.AddLayerAfter(TNNetInput.Create(5, 1, 6, 1), 0);
+    L := TNNetCrossWKV.Create(KVIn);
+    NN.AddLayerAfter(L, RcpIn);
+    AssertEquals('CrossWKV output SizeX = SeqLen', 5, L.Output.SizeX);
+    AssertEquals('CrossWKV output SizeY', 1, L.Output.SizeY);
+    AssertEquals('CrossWKV output Depth = C = KVDepth/2', 3, L.Output.Depth);
+    AssertEquals('CrossWKV neuron count (w_raw,u)', 2, L.Neurons.Count);
+    AssertEquals('CrossWKV w_raw size = C', 3, L.Neurons[0].Weights.Size);
+    AssertEquals('CrossWKV u size = C', 3, L.Neurons[1].Weights.Size);
+    AssertTrue('CrossWKV KeyValueSource wired', L.KeyValueSource = KVIn);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCrossWKVInputGradientCheck;
+// Central-difference gradient into BOTH sources: receptance (src A, depth C)
+// and the key|value stream (src B, depth 2*C). SeqLen=4, C=2.
+var
+  NN: TNNet;
+  RcpIn, KVIn, LW: TNNetLayer;
+  RcpData, KVData, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr, saved: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    RcpIn.Output.Copy(RcpData);
+    KVIn.Output.Copy(KVData);
+    NN.Compute(RcpIn.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  RcpData := TNNetVolume.Create(4, 1, 2);
+  KVData := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    RcpIn := NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    KVIn  := NN.AddLayerAfter(TNNetInput.Create(4, 1, 4, 1), 0);
+    LW := NN.AddLayerAfter(TNNetCrossWKV.Create(KVIn), RcpIn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // BOUNDED inputs (FD truncation control).
+    for i := 0 to RcpData.Size - 1 do RcpData.Raw[i] := Sin(i * 0.6) * 0.5 - 0.1;
+    for i := 0 to KVData.Size - 1 do KVData.Raw[i] := Sin(i * 0.7) * 0.5 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.6;
+
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[0] :=  0.4;  // w_raw
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[1] := -0.3;
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[0] :=  0.5;  // u
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[1] := -0.6;
+
+    // ---- Receptance source A grads (NN.Layers[0]) ----
+    for i := 0 to RcpData.Size - 1 do
+    begin
+      saved := RcpData.Raw[i];
+      RcpData.Raw[i] := saved + epsilon; lossPlus := ComputeLoss;
+      RcpData.Raw[i] := saved - epsilon; lossMinus := ComputeLoss;
+      RcpData.Raw[i] := saved;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ComputeLoss;
+      RcpIn.OutputError.Fill(0);
+      KVIn.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := RcpIn.OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('CrossWKV receptance gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Key|Value source B grads (KVIn) ----
+    for i := 0 to KVData.Size - 1 do
+    begin
+      saved := KVData.Raw[i];
+      KVData.Raw[i] := saved + epsilon; lossPlus := ComputeLoss;
+      KVData.Raw[i] := saved - epsilon; lossMinus := ComputeLoss;
+      KVData.Raw[i] := saved;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ComputeLoss;
+      RcpIn.OutputError.Fill(0);
+      KVIn.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := KVIn.OutputError.Raw[i];
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('CrossWKV key|value gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('CrossWKV input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    RcpData.Free;
+    KVData.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCrossWKVWeightGradientCheck;
+var
+  NN: TNNet;
+  RcpIn, KVIn, LW: TNNetLayer;
+  RcpData, KVData, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..1] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    RcpIn.Output.Copy(RcpData);
+    KVIn.Output.Copy(KVData);
+    NN.Compute(RcpIn.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;  // shared-RNG ordering requirement
+  NN := TNNet.Create();
+  RcpData := TNNetVolume.Create(4, 1, 2);
+  KVData := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'w_raw';
+  Names[1] := 'u';
+  try
+    RcpIn := NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    KVIn  := NN.AddLayerAfter(TNNetInput.Create(4, 1, 4, 1), 0);
+    LW := NN.AddLayerAfter(TNNetCrossWKV.Create(KVIn), RcpIn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to RcpData.Size - 1 do RcpData.Raw[i] := Sin(i * 0.5) * 0.5 + 0.1;
+    for i := 0 to KVData.Size - 1 do KVData.Raw[i] := Sin(i * 0.55) * 0.5 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[0] :=  0.4;  // w_raw
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[1] := -0.3;
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[0] :=  0.5;  // u
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[1] := -0.6;
+
+    for n := 0 to 1 do
+      for i := 0 to TNNetCrossWKV(LW).Neurons[n].Weights.Size - 1 do
+      begin
+        TNNetCrossWKV(LW).Neurons[n].Weights.Raw[i] :=
+          TNNetCrossWKV(LW).Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        TNNetCrossWKV(LW).Neurons[n].Weights.Raw[i] :=
+          TNNetCrossWKV(LW).Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        TNNetCrossWKV(LW).Neurons[n].Weights.Raw[i] :=
+          TNNetCrossWKV(LW).Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        ComputeLoss;
+        TNNetCrossWKV(LW).Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -TNNetCrossWKV(LW).Neurons[n].Delta.Raw[i];
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('CrossWKV weight gradient ' + Names[n] + '[' +
+          IntToStr(i) + '] num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('CrossWKV weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    RcpData.Free;
+    KVData.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCrossWKVSerializationRoundTrip;
+// Two-source serialization: the K|V source index is injected into the
+// structure string (like TNNetCrossAttention / TNNetConcat) and must survive
+// SaveToString -> LoadFromString, reproducing the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  RcpIn, KVIn, LW: TNNetLayer;
+  RcpData, KVData: TNNetVolume;
+  SeqLen, C, i: integer;
+  Saved, Saved2: string;
+  FoundCross: boolean;
+begin
+  RandSeed := 424242;
+  SeqLen := 4; C := 2;
+  NN := TNNet.Create();
+  RcpData := TNNetVolume.Create(SeqLen, 1, C);
+  KVData := TNNetVolume.Create(SeqLen, 1, 2 * C);
+  try
+    RcpIn := NN.AddLayer(TNNetInput.Create(SeqLen, 1, C, 1));
+    KVIn  := NN.AddLayerAfter(TNNetInput.Create(SeqLen, 1, 2 * C, 1), 0);
+    LW := NN.AddLayerAfter(TNNetCrossWKV.Create(KVIn), RcpIn);
+    // Perturb w_raw/u so the round-trip carries non-default weights.
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[0] :=  0.4;
+    TNNetCrossWKV(LW).Neurons[0].Weights.Raw[1] := -0.3;
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[0] :=  0.5;
+    TNNetCrossWKV(LW).Neurons[1].Weights.Raw[1] := -0.6;
+
+    for i := 0 to RcpData.Size - 1 do RcpData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to KVData.Size - 1 do KVData.Raw[i] := Cos(i * 0.37) * 0.8 - 0.2;
+    RcpIn.Output.Copy(RcpData);
+    KVIn.Output.Copy(KVData);
+    NN.Compute(RcpIn.Output);
+
+    FoundCross := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetCrossWKV then FoundCross := true;
+    AssertTrue('CrossWKV layer present', FoundCross);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('CrossWKV SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Layers[0].Output.Copy(RcpData);
+      NN2.Layers[1].Output.Copy(KVData);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('CrossWKV round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    RcpData.Free;
+    KVData.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestKalmanFilterCellSerializationRoundTrip;

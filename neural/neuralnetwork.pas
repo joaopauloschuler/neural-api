@@ -5146,6 +5146,71 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetCrossWKV: a TWO-SOURCE key/value variant of the RWKV-4 WKV
+  // time-mixing recurrence (TNNetWKV). Where TNNetWKV splits its OWN input
+  // channels into the key|value pair that drives its running numerator/
+  // denominator state, TNNetCrossWKV reads the key|value stream from a
+  // SEPARATE source tensor than the receptance/query stream -- exactly
+  // analogous to how TNNetCrossAttention generalises self-attention's packed
+  // Q|K|V to two independent sources. This makes cross-WKV (decode-time
+  // external memory: query one sequence against a WKV state accumulated over
+  // ANOTHER sequence) expressible, which the single-source TNNetWKV cannot do.
+  //
+  // TWO sources (wired exactly like TNNetCrossAttention -> PrevLayer plus an
+  // explicit serialized second source):
+  //   PrevLayer       (receptance r): SizeY=1, SizeX=SeqLen, Depth=C
+  //   KeyValueSource  (k then v):     SizeY=1, SizeX=SeqLen, Depth=2*C
+  // SEQLEN CONTRACT (v1): EQUAL sequence length on both sources. The read-out
+  // at time t uses the WKV state accumulated over the KEY|VALUE source up to t
+  // (the current-token bonus from the kv source's k_t), then gates it by the
+  // receptance from the QUERY source at the SAME index t. (Asymmetric/full-
+  // context cross -- summarise kv once, query with a different-length r stream
+  // -- is a documented follow-up, not implemented here.)
+  //
+  // Per channel d, per timestep t (a_{-1}=b_{-1}=0; k_t,v_t from kv source,
+  // r_t from receptance source):
+  //   wkv_t = ( a_{t-1} + e^{u+k_t} v_t ) / ( b_{t-1} + e^{u+k_t} )
+  //   a_t   = e^{-w} a_{t-1} + e^{k_t} v_t
+  //   b_t   = e^{-w} b_{t-1} + e^{k_t}
+  //   y_t   = sigmoid(r_t) * wkv_t                     (receptance gating)
+  // The decay/bonus core is the EXACT log-space-stable RWKV-v4 kernel of
+  // TNNetWKV (per-channel positive w=softplus(w_raw), per-channel bonus u,
+  // running-max stabiliser Q_t). The only additions are the second source
+  // (k,v come from KeyValueSource) and the sigmoid receptance gate read from
+  // PrevLayer -- so TNNetWKV is the SAME-SOURCE special case (k|v and r drawn
+  // from one tensor) with the gate folded out.
+  //
+  // Storage in Neurons[] (2 tensors, each C-long), identical to TNNetWKV:
+  //   [0] = w_raw  ->  w = softplus(w_raw) > 0
+  //   [1] = u      ->  bonus (unconstrained)
+  // FStruct[0]=C (resolved in SetPrevLayer). a,b re-init per sweep, NOT
+  // persisted. The KeyValueSource layer index is serialized (like TNNetConcat /
+  // TNNetCrossAttention) so the layer round-trips through SaveToString /
+  // LoadFromString. BACKWARD is the exact coupled-BPTT of TNNetWKV (two
+  // right-to-left adjoint scans over a_t,b_t) folding dL/d(k_t),dL/d(v_t) into
+  // the KEY|VALUE source, dL/d(r_t) into the receptance source, and
+  // dL/dw,dL/du per channel. Coded by Claude (AI).
+  TNNetCrossWKV = class(TNNetLayer)
+    private
+      FChannels: integer;       // C, resolved in SetPrevLayer
+      FKVLayer: TNNetLayer;     // explicit Key|Value source (width 2*C)
+      FW: TNNetVolume;          // per-channel w=softplus(w_raw), C-long scratch
+      FWKV: TNNetVolume;        // cached pre-gate wkv_t, (SeqLen,1,C)
+      FA: TNNetVolume;          // cached true accumulator a_t, (SeqLen,1,C)
+      FB: TNNetVolume;          // cached true accumulator b_t, (SeqLen,1,C)
+      FGradW, FGradU: TNNetVolume; // C-long grad accumulators
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(KeyValueSource: TNNetLayer); overload;
+      destructor Destroy(); override;
+      function SaveStructureToString(): string; override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property KeyValueSource: TNNetLayer read FKVLayer;
+  end;
+
   /// TNNetTestTimeTraining: the Test-Time Training (TTT) sequence-mixing layer
   // (Sun et al. 2024, "Learning to (Learn at Test Time): RNNs with Expressive
   // Hidden States", arXiv:2407.04620). The recurrent hidden STATE is itself a
@@ -32200,6 +32265,308 @@ end;
 procedure TNNetWKV.InitDefault();
 const
   // softplus^-1(1) ~= 0.5413 so w starts at ~1 (a moderate decay e^{-1}~=0.37).
+  cSoftplusInv1 = 0.541324854612918;
+begin
+  if FNeurons.Count < 2 then AddMissingNeurons(2);
+  FNeurons[0].FWeights.Fill(cSoftplusInv1);  // w_raw -> w ~= 1
+  FNeurons[1].FWeights.Fill(0);              // bonus u = 0
+  AfterWeightUpdate();
+end;
+
+{ TNNetCrossWKV }
+
+constructor TNNetCrossWKV.Create();
+begin
+  // Parameterless ctor used by CreateLayer; the K|V source is wired by
+  // SaveStructureToString's injected index during LoadFromString.
+  Create(nil);
+end;
+
+constructor TNNetCrossWKV.Create(KeyValueSource: TNNetLayer);
+begin
+  inherited Create();
+  FChannels := 0;           // resolved in SetPrevLayer
+  FStruct[0] := 0;
+  FKVLayer := KeyValueSource;
+  FW := TNNetVolume.Create();
+  FWKV := TNNetVolume.Create();
+  FA := TNNetVolume.Create();
+  FB := TNNetVolume.Create();
+  FGradW := TNNetVolume.Create();
+  FGradU := TNNetVolume.Create();
+  // [0]=w_raw [1]=u
+  AddMissingNeurons(2);
+  if Assigned(FKVLayer) then
+  begin
+    if FKVLayer is TNNetInput then TNNetInput(FKVLayer).EnableErrorCollection;
+    // Two-source layer: register the extra departing branch on the K|V source
+    // (the receptance/query branch is incremented the usual way by AddLayer).
+    FKVLayer.IncDepartingBranchesCnt();
+  end;
+end;
+
+destructor TNNetCrossWKV.Destroy();
+begin
+  FGradU.Free;
+  FGradW.Free;
+  FB.Free;
+  FA.Free;
+  FWKV.Free;
+  FW.Free;
+  inherited Destroy();
+end;
+
+function TNNetCrossWKV.SaveStructureToString(): string;
+begin
+  // Inject the Key|Value source layer index into the (otherwise empty) third
+  // ':'-delimited slot, exactly as TNNetCrossAttention / TNNetConcatBase do,
+  // so CreateLayer / LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FKVLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetCrossWKV.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetCrossWKV requires receptance SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if not Assigned(FKVLayer) then
+    FErrorProc('TNNetCrossWKV requires a non-nil KeyValueSource.');
+  if FKVLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetCrossWKV requires Key|Value SizeY=1, got SizeY=' +
+      IntToStr(FKVLayer.FOutput.SizeY));
+  if (FKVLayer.FOutput.Depth mod 2) <> 0 then
+    FErrorProc('TNNetCrossWKV requires an EVEN Key|Value depth (2*C). Depth=' +
+      IntToStr(FKVLayer.FOutput.Depth));
+  FChannels := FKVLayer.FOutput.Depth div 2;
+  if pPrevLayer.FOutput.Depth <> FChannels then
+    FErrorProc('TNNetCrossWKV requires receptance depth = C = KVDepth/2. Got ' +
+      'receptance depth=' + IntToStr(pPrevLayer.FOutput.Depth) + ', C=' +
+      IntToStr(FChannels));
+  // v1 EQUAL-seqlen contract: read-out grid = receptance grid, which must match
+  // the kv accumulation grid.
+  if pPrevLayer.FOutput.SizeX <> FKVLayer.FOutput.SizeX then
+    FErrorProc('TNNetCrossWKV (v1) requires EQUAL seqlen on both sources. ' +
+      'Receptance SeqLen=' + IntToStr(pPrevLayer.FOutput.SizeX) +
+      ', Key|Value SeqLen=' + IntToStr(FKVLayer.FOutput.SizeX));
+  FStruct[0] := FChannels;
+  // Output = gated wkv, C channels, same length as the sequence.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FChannels);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 2 then AddMissingNeurons(2);
+  SetNumWeightsForAllNeurons(1, 1, FChannels);
+  for ii := 0 to 1 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FW.ReSize(1, 1, FChannels);
+  FWKV.ReSize(FOutput.SizeX, 1, FChannels);
+  FA.ReSize(FOutput.SizeX, 1, FChannels);
+  FB.ReSize(FOutput.SizeX, 1, FChannels);
+  FGradW.ReSize(1, 1, FChannels);
+  FGradU.ReSize(1, 1, FChannels);
+  InitDefault();
+end;
+
+procedure TNNetCrossWKV.Compute();
+var
+  StartTime: double;
+  Ww, Wu, Rcp, KVv: TNNetVolume;
+  SeqLen, C, t, d: integer;
+  raw, wv, uv, kt, vt, rt, aprev, bprev: TNeuralFloat;
+  qprev, ww1, qmax, e1, e2, num, den: TNeuralFloat;
+  ww2, qmax2, e3, e4, anew, bnew, wkv: TNeuralFloat;
+begin
+  StartTime := Now();
+  Rcp := FPrevLayer.FOutput;        // receptance source A (depth C)
+  KVv := FKVLayer.FOutput;          // key|value source B (depth 2C)
+  Ww := FNeurons[0].FWeights;
+  Wu := FNeurons[1].FWeights;
+  SeqLen := FOutput.SizeX;
+  C := FChannels;
+  // Per-channel positive decay w = softplus(w_raw).
+  for d := 0 to C - 1 do
+  begin
+    raw := Ww.FData[d];
+    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := Ln(1 + Exp(raw));
+  end;
+  // Numerically-stabilised RWKV-v4 WKV recurrence per channel (a_-1=b_-1=0),
+  // k|v read from source B, then receptance-gated by sigmoid(r) from source A.
+  for d := 0 to C - 1 do
+  begin
+    wv := FW.FData[d];
+    uv := Wu.FData[d];
+    aprev := 0;                    // stabilised A_{t-1}
+    bprev := 0;                    // stabilised B_{t-1}
+    qprev := -1e30;                // log-space running max, -inf
+    for t := 0 to SeqLen - 1 do
+    begin
+      kt := KVv.FData[KVv.GetRawPos(t, 0, d)];         // key channel d  (src B)
+      vt := KVv.FData[KVv.GetRawPos(t, 0, C + d)];     // value channel d (src B)
+      rt := Rcp.FData[Rcp.GetRawPos(t, 0, d)];         // receptance     (src A)
+      // OUTPUT step: bonus path weights the current token by e^{u+k}.
+      ww1 := uv + kt;
+      qmax := qprev;
+      if ww1 > qmax then qmax := ww1;
+      e1 := Exp(qprev - qmax);
+      e2 := Exp(ww1 - qmax);
+      num := e1 * aprev + e2 * vt;
+      den := e1 * bprev + e2;
+      wkv := num / den;
+      FWKV.FData[FWKV.GetRawPos(t, 0, d)] := wkv;       // cache pre-gate wkv
+      FOutput.FData[FOutput.GetRawPos(t, 0, d)] := Sigmoid(rt) * wkv;
+      // STATE step: decay path. a_t = e^{-w} a_{t-1} + e^{k} v.
+      ww2 := (-wv) + qprev;
+      qmax2 := ww2;
+      if kt > qmax2 then qmax2 := kt;
+      e3 := Exp(ww2 - qmax2);
+      e4 := Exp(kt - qmax2);
+      anew := e3 * aprev + e4 * vt;
+      bnew := e3 * bprev + e4;
+      FA.FData[FA.GetRawPos(t, 0, d)] := anew * Exp(qmax2);
+      FB.FData[FB.GetRawPos(t, 0, d)] := bnew * Exp(qmax2);
+      aprev := anew;
+      bprev := bnew;
+      qprev := qmax2;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCrossWKV.Backpropagate();
+var
+  StartTime: double;
+  Nw, Nu: TNNetNeuron;
+  Ww, Wu, Rcp, KVv, RcpErr, KVErr: TNNetVolume;
+  SeqLen, C, t, d: integer;
+  wv, uv, dwexp, kt, vt, rt, sg: TNeuralFloat;
+  aprev, bprev, Ek, Eu, dyt, dwkv, denT, yt, numT: TNeuralFloat;
+  pa, pb, dnum, dden, dEu, dDk, dDw, dkt, dvt: TNeuralFloat;
+  gradW, gradU, paPrev, pbPrev: TNeuralFloat;
+  hasRcpGrad, hasKVGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Nw := FNeurons[0];
+  Nu := FNeurons[1];
+  Ww := Nw.FWeights;
+  Wu := Nu.FWeights;
+  Rcp := FPrevLayer.FOutput;
+  KVv := FKVLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  C := FChannels;
+  hasRcpGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  hasKVGrad := Assigned(FKVLayer) and
+    (FKVLayer.FOutputError.Size = FKVLayer.FOutput.Size);
+  RcpErr := nil; KVErr := nil;
+  if hasRcpGrad then RcpErr := FPrevLayer.FOutputError;
+  if hasKVGrad then KVErr := FKVLayer.FOutputError;
+  // Recompute w = softplus(w_raw) (same map as Compute).
+  for d := 0 to C - 1 do
+  begin
+    if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
+    else FW.FData[d] := Ln(1 + Exp(Ww.FData[d]));
+  end;
+  FGradW.Fill(0);
+  FGradU.Fill(0);
+  // Exact BPTT in TRUE-accumulator space. y_t = sigmoid(r_t)*wkv_t, so first
+  // peel off the receptance gate: dwkv_t = sigmoid(r_t)*dy_t, and the gate
+  // contributes dr_t = wkv_t * sigmoid'(r_t) * dy_t into source A. The carried
+  // dwkv then drives the EXACT TNNetWKV adjoint into k,v (source B) and w,u.
+  for d := 0 to C - 1 do
+  begin
+    wv := FW.FData[d];
+    uv := Wu.FData[d];
+    dwexp := Exp(-wv);
+    pa := 0;
+    pb := 0;
+    gradW := 0;
+    gradU := 0;
+    for t := SeqLen - 1 downto 0 do
+    begin
+      kt := KVv.FData[KVv.GetRawPos(t, 0, d)];
+      vt := KVv.FData[KVv.GetRawPos(t, 0, C + d)];
+      rt := Rcp.FData[Rcp.GetRawPos(t, 0, d)];
+      Ek := Exp(kt);
+      Eu := Exp(uv + kt);
+      if t > 0 then
+      begin
+        aprev := FA.FData[FA.GetRawPos(t - 1, 0, d)];
+        bprev := FB.FData[FB.GetRawPos(t - 1, 0, d)];
+      end
+      else
+      begin
+        aprev := 0;
+        bprev := 0;
+      end;
+      dyt := FOutputError.FData[FOutputError.GetRawPos(t, 0, d)];
+      // ---- Receptance gate: y = sigmoid(r) * wkv ----
+      sg := Sigmoid(rt);
+      dwkv := sg * dyt;                       // upstream grad on pre-gate wkv
+      if hasRcpGrad then
+        RcpErr.FData[RcpErr.GetRawPos(t, 0, d)] :=
+          RcpErr.FData[RcpErr.GetRawPos(t, 0, d)] +
+          FWKV.FData[FWKV.GetRawPos(t, 0, d)] * sg * (1 - sg) * dyt;
+      numT := aprev + Eu * vt;
+      denT := bprev + Eu;
+      yt := numT / denT;                      // = wkv_t
+      dkt := 0;
+      dvt := 0;
+      // ---- STATE step adjoints (pa,pb hold dL/da_t, dL/db_t) ----
+      paPrev := dwexp * pa;
+      pbPrev := dwexp * pb;
+      dvt := dvt + pa * Ek;
+      dDk := pa * vt + pb;
+      dkt := dkt + dDk * Ek;
+      dDw := pa * aprev + pb * bprev;
+      gradW := gradW + dDw * (-dwexp);
+      // ---- OUTPUT step adjoints (wkv = num/den) ----
+      dnum := dwkv / denT;
+      dden := -dwkv * yt / denT;
+      paPrev := paPrev + dnum;
+      pbPrev := pbPrev + dden;
+      dvt := dvt + dnum * Eu;
+      dEu := dnum * vt + dden;
+      dkt := dkt + dEu * Eu;
+      gradU := gradU + dEu * Eu;
+      // Scatter input grads into the KEY|VALUE source (k channel d, v channel C+d).
+      if hasKVGrad then
+      begin
+        KVErr.FData[KVErr.GetRawPos(t, 0, d)] :=
+          KVErr.FData[KVErr.GetRawPos(t, 0, d)] + dkt;
+        KVErr.FData[KVErr.GetRawPos(t, 0, C + d)] :=
+          KVErr.FData[KVErr.GetRawPos(t, 0, C + d)] + dvt;
+      end;
+      pa := paPrev;
+      pb := pbPrev;
+    end;
+    FGradW.FData[d] := gradW * Sigmoid(Ww.FData[d]);
+    FGradU.FData[d] := gradU;
+  end;
+  TNNetVolume.MulAdd(Nw.FDelta.GetRawPtr(), FGradW.GetRawPtr(), -FLearningRate, C);
+  TNNetVolume.MulAdd(Nu.FDelta.GetRawPtr(), FGradU.GetRawPtr(), -FLearningRate, C);
+  if (not FBatchUpdate) then
+  begin
+    Nw.UpdateWeights(FInertia);
+    Nu.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  // Propagate into BOTH sources (the K|V branch then the receptance chain).
+  if hasKVGrad then FKVLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetCrossWKV.InitDefault();
+const
   cSoftplusInv1 = 0.541324854612918;
 begin
   if FNeurons.Count < 2 then AddMissingNeurons(2);
@@ -75016,7 +75383,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -75371,6 +75738,7 @@ begin
       'TNNetDeltaNet':              Result := TNNetDeltaNet.Create();
       'TNNetGatedLinearAttention':  Result := TNNetGatedLinearAttention.Create();
       'TNNetWKV':                   Result := TNNetWKV.Create();
+      'TNNetCrossWKV':              Result := TNNetCrossWKV.Create(aL[0]);
       'TNNetTestTimeTraining':      Result := TNNetTestTimeTraining.Create(St[1], St[2]);
       'TNNetTitansMemory':          Result := TNNetTitansMemory.Create(St[2]);
       'TNNetNTMMemory':             Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]);
@@ -75731,6 +76099,7 @@ begin
       if S[0] = 'TNNetDeltaNet' then Result := TNNetDeltaNet.Create() else
       if S[0] = 'TNNetGatedLinearAttention' then Result := TNNetGatedLinearAttention.Create() else
       if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
+      if S[0] = 'TNNetCrossWKV' then Result := TNNetCrossWKV.Create(aL[0]) else
       if S[0] = 'TNNetTestTimeTraining' then Result := TNNetTestTimeTraining.Create(St[1], St[2]) else
       if S[0] = 'TNNetTitansMemory' then Result := TNNetTitansMemory.Create(St[2]) else
       if S[0] = 'TNNetNTMMemory' then Result := TNNetNTMMemory.Create(St[0], St[1], Ft[0]) else
