@@ -210,52 +210,13 @@ rather than acted on.
               backwards using the `SetBatchUpdate(True)` weight-accumulation idiom).
               Shares the O(1)-memory goal with the open `TNNetReversibleBlock`
               recompute path and the "Gradient checkpointing" infra task.
-- [X] TNNetHamiltonianCell — a structure-preserving (symplectic) dynamics layer.
-      LANDED 2026-06-07 on a2 (commit 4fd7309): leaf layer (scalar tanh-MLP
-      Hamiltonian H(q,p) integrated with sequential symplectic-Euler sub-steps
-      over the (T,1,2*D) phase axis; forward computes the field dH/dz via one inner
-      backward sweep; training backward is the Hessian-vector product via a SECOND
-      tape pass over the same MLP, no Hessian materialized), input+weight
-      numerical-gradient tests (bounded inner weights, RandSeed:=424242) + LoadFromString
-      round-trip, examples/HamiltonianPendulum/ (HNN conserves energy ~4x better than
-      an unconstrained residual-MLP NeuralODE field over an 800-step rollout at
-      matched one-step fit, ~30s). OPEN FOLLOW-UPS:
+- [ ] TNNetHamiltonianCell follow-ups (leaf layer + input/weight numerical-gradient
+      tests + LoadFromString round-trip + examples/HamiltonianPendulum/ all LANDED
+      2026-06-07 on a2, commit 4fd7309):
       - [ ] builder TNNet.AddHamiltonianBlock (skipped at landing; leaf+tests+example
             were the priority).
       - [ ] separable H(q,p)=T(p)+V(q) (kinetic+potential split) variant that makes the
             leapfrog step exact and cheaper.
-      ORIGINAL SPEC (kept for the follow-ups):
-      Greenberg & co's "Hamiltonian Neural Networks" (Greydanus et al. 2019,
-      arXiv:1906.01563): instead of regressing the time-derivative field directly
-      (which is what the existing TNNet.AddNeuralODEBlock residual field and the
-      CfC / TNNetClosedFormContinuous cells do — neither conserves energy), this
-      layer parameterizes a SCALAR learned Hamiltonian H(q,p) with a small MLP and
-      produces the SYMPLECTIC gradient field dq/dt = +dH/dp, dp/dt = -dH/dq, then
-      integrates one or more leapfrog/Stormer-Verlet steps along the time axis.
-      The conserved quantity falls out of the construction, so a free-swinging
-      pendulum / mass-spring trajectory stays on its energy level set instead of
-      spiralling in or blowing up the way a plain MLP-field NeuralODE does. This
-      is genuinely distinct from every continuous-dynamics layer already in tree
-      (NeuralODE = unconstrained field; CfC = liquid closed-form gate; DiagonalSSM
-      / SelectiveSSM = linear state space; TNNetKalmanFilterCell = uncertainty
-      propagation) — none of them compute the gradient of a learned scalar energy
-      or guarantee a symplectic (volume-preserving) update. Input/output shape
-      (T, 1, 2*D): the depth axis is the (q | p) phase-space pair, D coords each.
-      KEY GRADIENT SUBTLETY: the forward pass already needs dH/dq and dH/dp (a
-      first derivative through the inner MLP via one backward sweep), so the
-      training backward pass differentiates THROUGH that gradient — a Hessian-
-      vector product of H. Implement it as a second tape pass over the same inner
-      MLP rather than materializing the Hessian; gradient-check the composed
-      forward+backward with the standard LayerInputAndWeightGradientCheck against
-      central differences (expect to bound the inner weights, per the FD-truncation
-      gotcha, rather than loosen tolerance). Deliverables per the introspection /
-      layer-authoring recipe: decl + impl + LoadFromString round-trip + numerical
-      gradient test + a `examples/HamiltonianPendulum/` demo that trains on noisy
-      (q,p) samples from an ideal pendulum and shows the learned rollout conserves
-      energy over a long horizon vs an unconstrained-MLP-field baseline that drifts.
-      Follow-up once it lands: a builder `TNNet.AddHamiltonianBlock` and a separable
-      H(q,p)=T(p)+V(q) variant (kinetic + potential split) that makes the leapfrog
-      step exact and even cheaper.
 - [ ] Reptile follow-up (TNNetReptileMetaTrainer + examples/MetaLearningReptile/
       landed 2026-06-01, sine-regression task distribution, manual inner-loop
       Compute/Backpropagate/UpdateWeights path): (a) a CLASSIFICATION task
@@ -901,58 +862,13 @@ rather than acted on.
       agree with their textbook formula.
 
 ### Experiments I'm curious about (additional)
-- [X] `examples/InformationPlane/` — LANDED 2026-06-07 on a2 (commit dd5e983).
-      Tiny 3-hidden-layer (width 4) tanh FC classifier on a synthetic 12-bit
-      binary task (label = sign of a 5-bit subset, 7 nuisance bits, 2048 samples).
-      Binning MI estimator B=30 in bits: deterministic net + unique inputs =>
-      I(X;T)=H(T), I(T;Y)=H(T)-H(T|Y) via per-class code histograms (sorted
-      TStringList code counter). Per-epoch table + ASCII information-plane scatter,
-      TWO arms. tanh arm REPRODUCES the compression bend (deepest layer I(X;T)
-      5.61->3.59 bits while I(T;Y) holds at 1.0, bend strengthens with depth);
-      ReLU arm I(X;T) stays flat (~5.2, ill-defined fixed-width bins) — the Saxe
-      et al. 2018 contrast. ~42s pure CPU. OPEN FOLLOW-UP: the optional
-      `TNNet.InformationPlaneReport` introspection method ([[introspection-report-pattern]])
-      was NOT added (the example computes MI inline) — promote the binning-MI
+- [ ] TNNetInformationPlaneReport follow-up: examples/InformationPlane/ LANDED
+      2026-06-07 on a2 (commit dd5e983) — tiny tanh FC classifier whose binning-MI
+      information-plane trajectory reproduces the compression bend (tanh arm) while
+      a ReLU arm stays flat (the Saxe et al. 2018 contrast); MI is computed inline.
+      The optional `TNNet.InformationPlaneReport` introspection method
+      ([[introspection-report-pattern]]) was NOT added — promote the binning-MI
       collector to a report method if a second consumer appears.
-      ORIGINAL SPEC (kept for the report follow-up):
-      (optionally backed by a
-      `TNNet.InformationPlaneReport` introspection method, [[introspection-report-pattern]])
-      — reproduce the **information-plane trajectory** of the Information
-      Bottleneck story (Tishby & Zaslavsky 2015; Shwartz-Ziv & Tishby 2017,
-      "Opening the Black Box of Deep Neural Networks via Information"): for a
-      tiny fully-connected classifier on a small synthetic binary task, track
-      the mutual information pair `(I(X;T), I(T;Y))` of EACH hidden layer `T`
-      across training epochs and plot every layer's path through the 2-D
-      information plane as an ASCII scatter. The narrative target is the two
-      reported phases — a fast **fitting/ERM** phase where both `I(X;T)` and
-      `I(T;Y)` rise, followed by a slow **compression** phase where `I(X;T)`
-      DROPS while `I(T;Y)` stays high (the layer forgets input detail
-      irrelevant to the label). MI is estimated with the original *binning*
-      estimator: discretize each neuron's bounded activation into B equal-width
-      bins, treat the per-sample bin-tuple as a discrete code, and compute
-      plug-in entropies `I(X;T)=H(T)-H(T|X)` and `I(T;Y)=H(T)-H(T|Y)` from
-      empirical histograms — no new gradient machinery, only forward-pass
-      activation collection over the full dataset at each logged epoch. This is
-      a DIFFERENT axis from everything already shipped: [[RepresentationSimilarity]]
-      (CKA = representation geometry, not MI), IntrinsicDimension /
-      PredictionDepth (per-example geometry), and the SLT/curvature reports
-      (LocalLearningCoefficient, HessianCurvature, FisherImportance — posterior
-      volume & 2nd-order curvature, never input/label MI). HONEST headline in
-      the house "what did NOT reproduce" style: the binning estimator REQUIRES
-      a saturating activation to show compression — use `TNNetFullConnect`
-      (tanh, bounded -> bins are meaningful) for the headline run, and document
-      Saxe et al. 2018 ("On the Information Bottleneck Theory of Deep
-      Learning") which showed the compression phase is largely an artifact of
-      double-saturating nonlinearities and binning: ship a built-in
-      contrast arm with a ReLU trunk (`TNNetFullConnectReLU`, unbounded ->
-      fixed-width binning is ill-defined and the clean compression bend
-      vanishes), so the example itself demonstrates the controversy rather than
-      overclaiming. Document the known pitfalls: MI is upper-bounded by
-      `log2(#samples)` and by `B^width`, so keep width/B/sample-count balanced
-      (e.g. B=30, hidden width ~4-6, a few thousand samples) and state that the
-      absolute MI values are estimator-dependent — the robust, reproducible
-      signal is the SHAPE of the trajectory and the tanh-vs-ReLU difference,
-      not the nats. Pure CPU, tiny MLP, <5-min budget.
 - [ ] `examples/CurriculumLearning/` — does **sample ordering by difficulty**
       help? Reproduce the curriculum-learning effect (Bengio et al. 2009,
       "Curriculum Learning") on a tiny self-contained task and, crucially, ship
@@ -1490,24 +1406,6 @@ rather than acted on.
       should drop faster under PGD than FGSM at matched eps, which is itself
       a built-in sanity check. Gate behind a `Steps` parameter (Steps=1 ==
       today's FGSM).
-
-### Parameter importance (continual learning / pruning)
-- [X] EWC two-task experiment building on the landed
-      TNNet.FisherImportanceReport: train on task A, snapshot the diagonal
-      Fisher, then train on task B with an L2 penalty pulling high-Fisher
-      params back toward their task-A values; chart task-A retention with and
-      without the penalty.
-      LANDED 2026-06-07 on a2 (commit 686c564): examples/EWCContinualLearning/.
-      Tiny MLP, Task A = 4 overlapping 2-D Gaussian clusters, Task B = same
-      labels with inputs rotated ~52deg. Diagonal empirical Fisher snapshotted the
-      FisherImportanceReport way (squared per-param grads on a frozen net,
-      SetBatchUpdate(true), read Neuron.Delta/BiasDelta / LR). Decoupled CLAMPED
-      EWC pull w <- w - clamp(LR*lambda*F,0,1)*(w-w_A). Result: PLAIN forgets A
-      (1.000->0.285), EWC retains A 0.535 for a 0.016 Task-B cost; ~3s.
-      Findings for future continual-learning examples: pair list has no Shuffle
-      (use L.Exchange, naive L[I]:=L[J] double-frees), FBiasDelta is private (read
-      via BiasDelta, write via BiasWeight), empirical Fisher of a confident model
-      is tiny (~1e-6) so lambda~1e8 and an unclamped step diverges.
 
 ### Loss-landscape degeneracy (Singular Learning Theory)
 - [ ] `TNNet.LocalLearningCoefficientReport` + `examples/LocalLearningCoefficient/`
