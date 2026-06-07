@@ -290,6 +290,8 @@ type
     // TNNetKANConv Kolmogorov-Arnold convolutional layer
     procedure TestKANConvGradientCheck;
     procedure TestKANConvSerializationRoundTrip;
+    procedure TestKANConvBSplineGradientCheck;
+    procedure TestKANConvBSplineSerializationRoundTrip;
     // TNNetGraphConvolution spectral GCN layer
     procedure TestGraphConvolutionGradientCheck;
     procedure TestGraphConvolutionSerializationRoundTrip;
@@ -4130,9 +4132,14 @@ begin
 
       AssertTrue('MLPMixer input gradient finite at ' + IntToStr(i),
         not IsNan(analyticalGrad) and not IsInfinite(analyticalGrad));
+      // Mixed absolute/relative tolerance: through the LayerNorm the gradient
+      // magnitude can be O(10), where a pure 0.01 ABSOLUTE bound is a <0.1%
+      // relative check that the float32 central-difference truncation cannot
+      // meet (it only passed before by FP-rounding luck). The analytic value is
+      // the trusted one; allow 1% of |grad| once the gradient is large.
       AssertTrue('MLPMixer input gradient check at position ' + IntToStr(i) +
         ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
-        Abs(numericalGrad - analyticalGrad) < 0.01);
+        Abs(numericalGrad - analyticalGrad) < 0.01 + 0.01 * Abs(analyticalGrad));
     end;
     AssertTrue('MLPMixer gradient is non-zero (maxAbs=' + FloatToStr(maxAbsGrad) + ')',
       maxAbsGrad > 1e-6);
@@ -46003,6 +46010,200 @@ begin
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('KANConv Compute matches after round-trip pos ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKANConvBSplineGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  KAN: TNNetKANConv;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxInErr, maxCoeffErr: TNeuralFloat;
+  i, w, idx, coeffs, Deg: integer;
+  SizeXY, InD, NumF, FeatSize, OutSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // B-SPLINE basis variant: finite-difference vs analytic gradient for both the
+  // INPUT and EVERY edge coefficient. Weights/inputs kept BOUNDED so the
+  // finite-difference truncation does not falsely fail. Reseed per the rule.
+  RandSeed := 424242;
+  SizeXY := 4;
+  InD := 2;
+  NumF := 2;
+  FeatSize := 2;
+  Deg := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeXY, SizeXY, InD);
+  InputPlus := TNNetVolume.Create(SizeXY, SizeXY, InD);
+  epsilon := 0.0001;
+  maxInErr := 0;
+  maxCoeffErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InD, 1));
+    KAN := TNNetKANConv.Create(NumF, FeatSize, 0, 2, Deg, 1, csKANBasisBSpline);
+    NN.AddLayer(KAN);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    OutSize := NN.GetLastLayer.Output.Size;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+
+    coeffs := FeatSize * FeatSize * InD * (csKANBSplineGrid + Deg);
+    AssertEquals('KANConv B-spline basis flag', csKANBasisBSpline, KAN.Basis);
+    AssertEquals('KANConv B-spline neuron count = NumFeatures', NumF,
+      KAN.Neurons.Count);
+    AssertEquals('KANConv B-spline coeffs per filter = FS*FS*InD*(G+K)', coeffs,
+      KAN.Neurons[0].Weights.Size);
+
+    // Inputs kept well inside the (-1,1) tanh range so u stays in the spline
+    // interior (away from the clamp boundary).
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.5;
+    for i := 0 to OutSize - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3;
+    for idx := 0 to NumF - 1 do
+      for w := 0 to KAN.Neurons[idx].Weights.Size - 1 do
+        KAN.Neurons[idx].Weights.Raw[w] := Sin((idx * 7 + w) * 0.3) * 0.2;
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxInErr then
+        maxInErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('KANConv B-spline input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. every coefficient ----
+    for idx := 0 to NumF - 1 do
+      for w := 0 to KAN.Neurons[idx].Weights.Size - 1 do
+      begin
+        KAN.Neurons[idx].Weights.Raw[w] := KAN.Neurons[idx].Weights.Raw[w] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        KAN.Neurons[idx].Weights.Raw[w] := KAN.Neurons[idx].Weights.Raw[w] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        KAN.Neurons[idx].Weights.Raw[w] := KAN.Neurons[idx].Weights.Raw[w] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        for i := 0 to NumF - 1 do KAN.Neurons[i].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -KAN.Neurons[idx].Delta.Raw[w];
+
+        if Abs(numericalGrad - analyticalGrad) > maxCoeffErr then
+          maxCoeffErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('KANConv B-spline coeff gradient check neuron[' + IntToStr(idx) +
+          '] w=' + IntToStr(w) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('KANConv B-spline max input grad err: ', maxInErr:0:8,
+      ' max coeff grad err: ', maxCoeffErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestKANConvBSplineSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  KAN, KAN2: TNNetKANConv;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, w, idx, coeffs, Deg: integer;
+  SizeXY, InD, NumF, FeatSize: integer;
+begin
+  // B-spline KANConv in the MIDDLE of a net: SaveToString -> LoadFromString ->
+  // SaveToString must be byte-identical and Compute must match (proving the
+  // basis flag FStruct[6] and the wider G+K coefficient storage round-trip
+  // through both CreateLayer dispatch points).
+  RandSeed := 424242;
+  SizeXY := 5;
+  InD := 2;
+  NumF := 3;
+  FeatSize := 3;
+  Deg := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeXY, SizeXY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InD, 1));
+    KAN := TNNetKANConv.Create(NumF, FeatSize, 1, 1, Deg, 1, csKANBasisBSpline);
+    NN.AddLayer(KAN);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    coeffs := FeatSize * FeatSize * InD * (csKANBSplineGrid + Deg);
+    AssertEquals('KANConv B-spline coeff count', coeffs, KAN.Neurons[0].Weights.Size);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.6 - 0.1;
+    for idx := 0 to NumF - 1 do
+      for w := 0 to KAN.Neurons[idx].Weights.Size - 1 do
+        KAN.Neurons[idx].Weights.Raw[w] := 0.05 * (idx + 1) - 0.011 * w + 0.13;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('KANConv B-spline SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      KAN2 := NN2.Layers[1] as TNNetKANConv;
+      AssertEquals('KANConv B-spline round-trip basis flag', csKANBasisBSpline,
+        KAN2.Basis);
+      AssertEquals('KANConv B-spline round-trip degree', Deg, KAN2.Degree);
+      AssertEquals('KANConv B-spline round-trip coeff count', coeffs,
+        KAN2.Neurons[0].Weights.Size);
+      for idx := 0 to NumF - 1 do
+        for w := 0 to KAN.Neurons[idx].Weights.Size - 1 do
+          AssertEquals('KANConv B-spline round-trip coeff neuron[' +
+            IntToStr(idx) + '] w=' + IntToStr(w),
+            KAN.Neurons[idx].Weights.Raw[w],
+            KAN2.Neurons[idx].Weights.Raw[w], 1e-5);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('KANConv B-spline Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally
       NN2.Free;

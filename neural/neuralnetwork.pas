@@ -57,6 +57,14 @@ const
   csNNetMaxParameterIdx = 7;
   csErrorOverflowBackpropProtection = 100;
 
+  // TNNetKANConv edge-function basis selectors (FStruct[6]).
+  csKANBasisChebyshev = 0;  // default: Chebyshev-T expansion over tanh(x)
+  csKANBasisBSpline   = 1;  // uniform clamped B-spline (KAN-paper parameterisation)
+  // Number of interior intervals of the fixed uniform B-spline knot grid over
+  // the [-1,1] support. The number of basis functions per edge (and hence the
+  // trainable coefficient count) is csKANBSplineGrid + degree.
+  csKANBSplineGrid = 5;
+
   // TNNetDWT1D lifting-scheme wavelet filter selectors.
   csDWT1DHaar  = 0;   // unnormalised Haar (default)
   csDWT1DCDF53 = 1;   // CDF / LeGall 5/3
@@ -7207,25 +7215,49 @@ type
   /// (second-kind recurrence U_0=1, U_1=2u, U_k = 2u*U_{k-1} - U_{k-2}).
   /// Padding/stride follow the usual convolution semantics; out-of-range
   /// (padded) input positions contribute zero.
+  ///
+  /// BASIS VARIANT (FStruct[6]): the edge functions may instead be parameterised
+  /// as the KAN paper's original B-SPLINES (csKANBasisBSpline), selected via the
+  /// last (pBasis) argument of the degree constructor. Each edge is then a
+  /// degree-K uniform clamped B-spline over the same squashed input u=tanh(x)
+  /// mapped onto a FIXED knot grid of csKANBSplineGrid interior intervals on the
+  /// [-1,1] support; phi(x)=sum_j c_j * B_j(u), with G+K trainable coefficients
+  /// per edge (G=csKANBSplineGrid). The knots are fixed (non-trainable); only the
+  /// per-edge coefficients train. Forward and both gradients use the Cox-de Boor
+  /// recurrence and its analytic derivative recurrence. Default stays Chebyshev
+  /// (csKANBasisChebyshev), so existing nets are bit-for-bit unchanged. B-splines
+  /// have COMPACT support (locally smooth, no global oscillation; gracefully flat
+  /// extrapolation outside the grid) whereas Chebyshev is a global orthogonal
+  /// polynomial (better global approximation but oscillatory extrapolation).
   // Coded by Claude (AI).
   TNNetKANConv = class(TNNetConvolutionLinear)
   private
     FDegree: integer;            // K (polynomial degree -> K+1 coeffs per edge)
+    FBasis: integer;             // csKANBasisChebyshev (default) | csKANBasisBSpline
     FInDepth: integer;           // input Depth, learned in SetPrevLayer
     FTapsPerFilter: integer;     // FeatureSizeX*FeatureSizeY*InDepth
+    FCoeffsPerEdge: integer;     // Chebyshev: K+1; B-spline: csKANBSplineGrid+K
     FT: array of TNeuralFloat;   // scratch T_k(u) buffer (length K+1)
     FU2: array of TNeuralFloat;  // scratch U_k(u) buffer (length K+1)
+    FKnots: array of TNeuralFloat;     // B-spline knot vector (clamped uniform)
+    FBVal: array of TNeuralFloat;      // scratch B_j(u) buffer (length G+K)
+    FBDeriv: array of TNeuralFloat;    // scratch B_j'(u) buffer (length G+K)
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     procedure ComputePreviousLayerErrorCPU();
+    procedure SetupBSplineBasis();
+    // Evaluates all G+K B-spline basis values (and, if wantDeriv, derivatives)
+    // at squashed coordinate u in [-1,1] into FBVal / FBDeriv.
+    procedure EvalBSpline(u: TNeuralFloat; wantDeriv: boolean);
   public
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
-    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pDegree, pSuppressBias: integer); overload;
+    constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, pDegree, pSuppressBias: integer; pBasis: integer = csKANBasisChebyshev); overload;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
     property Degree: integer read FDegree;
+    property Basis: integer read FBasis;
   end;
 
   /// 8-DIMENSIONAL HYPERCOMPLEX (octonion / Cayley-Dickson) DENSE layer.
@@ -47405,25 +47437,141 @@ begin
   // (NumFeatures,...,K) ctor overrides it AFTER this runs.
   if FStruct[5] < 1 then FStruct[5] := 3;
   FDegree := FStruct[5];
+  // FStruct[6] carries the basis selector; the base ctor leaves it 0, which is
+  // exactly csKANBasisChebyshev (the default, unchanged behaviour).
+  FBasis := FStruct[6];
   FInDepth := 0;
   FTapsPerFilter := 0;
-  // KAN edges carry their OWN constant term (c_0); the conv bias is not used.
+  // KAN edges carry their OWN constant term; the conv bias is not used.
   FSuppressBias := 1;
   FStruct[4] := 1;
   SetLength(FT, FDegree + 1);
   SetLength(FU2, FDegree + 1);
+  if FBasis = csKANBasisBSpline then
+  begin
+    FCoeffsPerEdge := csKANBSplineGrid + FDegree;
+    SetupBSplineBasis();
+  end
+  else
+    FCoeffsPerEdge := FDegree + 1;
 end;
 
 constructor TNNetKANConv.Create(pNumFeatures, pFeatureSize, pInputPadding,
-  pStride, pDegree, pSuppressBias: integer);
+  pStride, pDegree, pSuppressBias: integer; pBasis: integer = csKANBasisChebyshev);
 begin
   if pDegree < 1 then
     raise Exception.Create('TNNetKANConv requires degree K >= 1.');
+  if (pBasis <> csKANBasisChebyshev) and (pBasis <> csKANBasisBSpline) then
+    raise Exception.Create('TNNetKANConv unknown basis selector.');
   Self.Create(pNumFeatures, pFeatureSize, pInputPadding, pStride, 1);
   FStruct[5] := pDegree;
   FDegree := pDegree;
+  FStruct[6] := pBasis;
+  FBasis := pBasis;
   SetLength(FT, FDegree + 1);
   SetLength(FU2, FDegree + 1);
+  if FBasis = csKANBasisBSpline then
+  begin
+    FCoeffsPerEdge := csKANBSplineGrid + FDegree;
+    SetupBSplineBasis();
+  end
+  else
+    FCoeffsPerEdge := FDegree + 1;
+end;
+
+// Builds the fixed clamped uniform knot vector for the degree-K B-spline over
+// the [-1,1] squashed-input support. A clamped (open uniform) knot vector
+// repeats the end knots K+1 times so the basis spans the whole support, with
+// G=csKANBSplineGrid interior intervals between. Number of basis functions is
+// G+K, with G+2K+1 knots total.
+procedure TNNetKANConv.SetupBSplineBasis();
+var
+  nKnots, jj, gi, KK1: integer;
+  step: TNeuralFloat;
+begin
+  KK1 := FDegree;
+  nKnots := csKANBSplineGrid + 2 * KK1 + 1;
+  SetLength(FKnots, nKnots);
+  step := 2.0 / csKANBSplineGrid; // interior spacing over [-1,1]
+  for jj := 0 to KK1 do FKnots[jj] := -1.0;
+  for gi := 1 to csKANBSplineGrid - 1 do
+    FKnots[KK1 + gi] := -1.0 + gi * step;
+  for jj := 0 to KK1 do FKnots[KK1 + csKANBSplineGrid + jj] := 1.0;
+  SetLength(FBVal, csKANBSplineGrid + KK1);
+  SetLength(FBDeriv, csKANBSplineGrid + KK1);
+end;
+
+// Cox-de Boor evaluation of all G+K basis functions at squashed coordinate u.
+// u is clamped into the closed support [-1,1] so values outside the grid map to
+// the boundary (graceful flat extrapolation). When wantDeriv is set the analytic
+// derivative recurrence B_{i,p}'(x) = p*( B_{i,p-1}/(t_{i+p}-t_i)
+//   - B_{i+1,p-1}/(t_{i+p+1}-t_{i+1}) ) is evaluated as well.
+procedure TNNetKANConv.EvalBSpline(u: TNeuralFloat; wantDeriv: boolean);
+var
+  nBasis, nKnots, p, ii: integer;
+  left, right, denomA, denomB, termA, termB: TNeuralFloat;
+  Nprev, Ncur: array of TNeuralFloat;
+begin
+  nBasis := csKANBSplineGrid + FDegree;
+  nKnots := Length(FKnots);
+  if u < -1.0 then u := -1.0;
+  if u > 1.0 then u := 1.0;
+  SetLength(Nprev, nKnots);
+  SetLength(Ncur, nKnots);
+  // Degree-0 basis: indicator of each knot span [t_i, t_{i+1}).
+  for ii := 0 to nKnots - 2 do
+  begin
+    if ((u >= FKnots[ii]) and (u < FKnots[ii + 1])) then Nprev[ii] := 1.0
+    else Nprev[ii] := 0.0;
+  end;
+  // Closed right end: u=1 belongs to the last non-empty span.
+  if u >= FKnots[nKnots - 1] then
+  begin
+    for ii := nKnots - 2 downto 0 do
+      if FKnots[ii] < FKnots[ii + 1] then
+      begin
+        Nprev[ii] := 1.0;
+        break;
+      end;
+  end;
+  // Raise the degree from 1 up to K via Cox-de Boor.
+  for p := 1 to FDegree do
+  begin
+    for ii := 0 to nKnots - 2 - p do
+    begin
+      denomA := FKnots[ii + p] - FKnots[ii];
+      denomB := FKnots[ii + p + 1] - FKnots[ii + 1];
+      termA := 0; termB := 0;
+      if denomA > 0 then
+      begin
+        left := (u - FKnots[ii]) / denomA;
+        termA := left * Nprev[ii];
+      end;
+      if denomB > 0 then
+      begin
+        right := (FKnots[ii + p + 1] - u) / denomB;
+        termB := right * Nprev[ii + 1];
+      end;
+      Ncur[ii] := termA + termB;
+    end;
+    if p < FDegree then
+      for ii := 0 to nKnots - 2 - p do Nprev[ii] := Ncur[ii];
+  end;
+  for ii := 0 to nBasis - 1 do FBVal[ii] := Ncur[ii];
+  if wantDeriv then
+  begin
+    // Need the degree-(K-1) basis (it is in Nprev after the last raise above,
+    // since the loop copies Ncur->Nprev only for p<FDegree).
+    for ii := 0 to nBasis - 1 do
+    begin
+      denomA := FKnots[ii + FDegree] - FKnots[ii];
+      denomB := FKnots[ii + FDegree + 1] - FKnots[ii + 1];
+      termA := 0; termB := 0;
+      if denomA > 0 then termA := Nprev[ii] / denomA;
+      if denomB > 0 then termB := Nprev[ii + 1] / denomB;
+      FBDeriv[ii] := FDegree * (termA - termB);
+    end;
+  end;
 end;
 
 procedure TNNetKANConv.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -47439,9 +47587,10 @@ begin
 
   FInDepth := pPrevLayer.Output.Depth;
   FTapsPerFilter := FFeatureSizeX * FFeatureSizeY * FInDepth;
-  // Each output filter neuron holds FTapsPerFilter*(K+1) coefficients laid out
-  // as tap*(K+1)+k where tap sweeps (fy,fx,inputChannel).
-  coeffs := FTapsPerFilter * (FDegree + 1);
+  // Each output filter neuron holds FTapsPerFilter*FCoeffsPerEdge coefficients
+  // laid out as tap*FCoeffsPerEdge+k where tap sweeps (fy,fx,inputChannel).
+  // FCoeffsPerEdge is K+1 for Chebyshev, csKANBSplineGrid+K for the B-spline.
+  coeffs := FTapsPerFilter * FCoeffsPerEdge;
 
   while FNeurons.Count > OutDepth do FNeurons.Delete(FNeurons.Count - 1);
   while FNeurons.Count < OutDepth do FNeurons.Add(TNNetNeuron.Create());
@@ -47466,17 +47615,46 @@ begin
   AfterWeightUpdate();
 end;
 
-// Near-linear init: the degree-1 (T_1=u) coefficient of each edge gets a small
-// random value, c_0 and c_{k>=2} stay 0.
+// Near-linear init. Chebyshev: the degree-1 (T_1=u) coefficient of each edge
+// gets a small random value, c_0 and c_{k>=2} stay 0. B-spline: because the
+// basis partitions unity and sum_j greville_j * B_j(u) = u, scaling every edge
+// coefficient by a small random weight times the Greville abscissa gives a
+// near-linear edge phi(u) ~ w*u (the B-spline analogue of the near-linear
+// Chebyshev start), so an untrained B-spline KANConv also behaves like a
+// tanh-squashed linear convolution.
 procedure TNNetKANConv.InitDefault();
 var
-  oo, t, base, OutDepth: integer;
-  scale: TNeuralFloat;
+  oo, t, base, jj, mm, OutDepth: integer;
+  scale, w0, greville: TNeuralFloat;
   W: TNNetVolume;
 begin
   if FTapsPerFilter <= 0 then exit;
   OutDepth := FNeurons.Count;
   scale := Sqrt(2.0 / Max(1, FTapsPerFilter));
+  if FBasis = csKANBasisBSpline then
+  begin
+    for oo := 0 to OutDepth - 1 do
+    begin
+      W := FArrNeurons[oo].FWeights;
+      W.Fill(0);
+      FArrNeurons[oo].FBiasWeight := 0;
+      for t := 0 to FTapsPerFilter - 1 do
+      begin
+        base := t * FCoeffsPerEdge;
+        w0 := scale * (Random - 0.5) * 2.0;
+        for jj := 0 to FCoeffsPerEdge - 1 do
+        begin
+          // Greville abscissa of basis jj = mean of knots jj+1..jj+FDegree.
+          greville := 0;
+          for mm := 1 to FDegree do greville := greville + FKnots[jj + mm];
+          greville := greville / FDegree;
+          W.FData[base + jj] := w0 * greville;
+        end;
+      end;
+    end;
+    AfterWeightUpdate();
+    exit;
+  end;
   for oo := 0 to OutDepth - 1 do
   begin
     W := FArrNeurons[oo].FWeights;
@@ -47501,7 +47679,8 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
-// Forward: y_oo(ox,oy) = sum_{fx,fy} sum_i sum_k c_{oo,tap,k} * T_k(tanh(x_i)).
+// Forward: y_oo(ox,oy) = sum_{fx,fy} sum_i phi_{oo,tap}(tanh(x_i)) with the edge
+// function phi evaluated in the Chebyshev OR B-spline basis (FBasis).
 procedure TNNetKANConv.ComputeCPU();
 var
   ox, oy, oo, fx, fy, ic, kk, tap, base, OutDepth: integer;
@@ -47532,13 +47711,22 @@ begin
           begin
             xv := PrevOut.Get(prevX, prevY, ic);
             u := Tanh(xv);
-            FT[0] := 1;
-            if FDegree >= 1 then FT[1] := u;
-            for kk := 2 to FDegree do FT[kk] := 2 * u * FT[kk - 1] - FT[kk - 2];
             tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
-            base := tap * (FDegree + 1);
-            for kk := 0 to FDegree do
-              acc := acc + W.FData[base + kk] * FT[kk];
+            base := tap * FCoeffsPerEdge;
+            if FBasis = csKANBasisBSpline then
+            begin
+              EvalBSpline(u, false);
+              for kk := 0 to FCoeffsPerEdge - 1 do
+                acc := acc + W.FData[base + kk] * FBVal[kk];
+            end
+            else
+            begin
+              FT[0] := 1;
+              if FDegree >= 1 then FT[1] := u;
+              for kk := 2 to FDegree do FT[kk] := 2 * u * FT[kk - 1] - FT[kk - 2];
+              for kk := 0 to FDegree do
+                acc := acc + W.FData[base + kk] * FT[kk];
+            end;
           end;
         end;
       end;
@@ -47598,13 +47786,22 @@ begin
           begin
             xv := PrevOut.Get(prevX, prevY, ic);
             u := Tanh(xv);
-            FT[0] := 1;
-            if FDegree >= 1 then FT[1] := u;
-            for kk := 2 to FDegree do FT[kk] := 2 * u * FT[kk - 1] - FT[kk - 2];
             tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
-            base := tap * (FDegree + 1);
-            for kk := 0 to FDegree do
-              WDelta.FData[base + kk] := WDelta.FData[base + kk] + localErr * FT[kk];
+            base := tap * FCoeffsPerEdge;
+            if FBasis = csKANBasisBSpline then
+            begin
+              EvalBSpline(u, false);
+              for kk := 0 to FCoeffsPerEdge - 1 do
+                WDelta.FData[base + kk] := WDelta.FData[base + kk] + localErr * FBVal[kk];
+            end
+            else
+            begin
+              FT[0] := 1;
+              if FDegree >= 1 then FT[1] := u;
+              for kk := 2 to FDegree do FT[kk] := 2 * u * FT[kk - 1] - FT[kk - 2];
+              for kk := 0 to FDegree do
+                WDelta.FData[base + kk] := WDelta.FData[base + kk] + localErr * FT[kk];
+            end;
           end;
         end;
       end;
@@ -47652,14 +47849,32 @@ begin
           xv := PrevOut.Get(prevX, prevY, ic);
           u := Tanh(xv);
           dudx := 1 - u * u;
+          tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
+          base := tap * FCoeffsPerEdge;
+          if FBasis = csKANBasisBSpline then
+          begin
+            // dphi/du = sum_j c_j * B_j'(u); chain through dudx = 1-u^2.
+            EvalBSpline(u, true);
+            gradAcc := 0;
+            for oo := 0 to OutDepth - 1 do
+            begin
+              gy := FOutputError.Get(ox, oy, oo);
+              if gy = 0.0 then continue;
+              W := FArrNeurons[oo].FWeights;
+              edgeDeriv := 0;
+              for kk := 0 to FCoeffsPerEdge - 1 do
+                edgeDeriv := edgeDeriv + W.FData[base + kk] * FBDeriv[kk];
+              gradAcc := gradAcc + gy * edgeDeriv;
+            end;
+            LocalPrevError.Add(prevX, prevY, ic, dudx * gradAcc);
+            continue;
+          end;
           // T_k'(u) = k * U_{k-1}(u). FU2 holds U_0..U_{K-1}; U_{-1}=0 so T_0'=0.
           FU2[0] := 1;
           if FDegree >= 1 then FU2[1] := 2 * u;
           for kk := 2 to FDegree do FU2[kk] := 2 * u * FU2[kk - 1] - FU2[kk - 2];
           Tderiv[0] := 0;
           for kk := 1 to FDegree do Tderiv[kk] := kk * FU2[kk - 1];
-          tap := (fy * FFeatureSizeX + fx) * FInDepth + ic;
-          base := tap * (FDegree + 1);
           gradAcc := 0;
           for oo := 0 to OutDepth - 1 do
           begin
@@ -72376,7 +72591,7 @@ begin
       'TNNetComplexConv' :          Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetQuaternionConv' :       Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetOctonionConv' :         Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]);
-      'TNNetKANConv' :              Result := TNNetKANConv.Create(St[0], St[1], St[2], St[3], St[5], St[4]);
+      'TNNetKANConv' :              Result := TNNetKANConv.Create(St[0], St[1], St[2], St[3], St[5], St[4], St[6]);
       'TNNetWeightStandardizationConv' : Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]);
       'TNNetSpectralNormConv' :     Result := TNNetSpectralNormConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]);
       'TNNetConvolutionSwish' :     Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -72730,7 +72945,7 @@ begin
       if S[0] = 'TNNetComplexConv' then Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetQuaternionConv' then Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetOctonionConv' then Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
-      if S[0] = 'TNNetKANConv' then Result := TNNetKANConv.Create(St[0], St[1], St[2], St[3], St[5], St[4]) else
+      if S[0] = 'TNNetKANConv' then Result := TNNetKANConv.Create(St[0], St[1], St[2], St[3], St[5], St[4], St[6]) else
       if S[0] = 'TNNetWeightStandardizationConv' then Result := TNNetWeightStandardizationConv.Create(St[0], St[1], St[2], St[3], St[4], Ft[0]) else
       if S[0] = 'TNNetSpectralNormConv' then Result := TNNetSpectralNormConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]) else
       if S[0] = 'TNNetConvolutionSwish' then Result := TNNetConvolutionSwish.Create(St[0], St[1], St[2], St[3], St[4]) else
