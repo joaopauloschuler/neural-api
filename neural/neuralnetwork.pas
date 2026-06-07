@@ -7628,6 +7628,29 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Expert-Choice routing gate (Zhou et al. 2022, "Mixture-of-Experts with
+  /// Expert Choice Routing"). This is the TRANSPOSE of TNNetTopKGate: where
+  /// TNNetTopKGate has each TOKEN keep its top-K experts along the Depth axis,
+  /// TNNetExpertChoiceGate has each EXPERT (Depth channel) keep its top-Capacity
+  /// largest TOKEN positions along the SizeX axis and zero the rest. Load
+  /// balance is therefore GUARANTEED by construction (each expert processes
+  /// exactly Capacity tokens) so no Switch-style aux loss is required; a token
+  /// may be selected by 0, 1, or several experts.
+  /// The input is the per-token softmax gate-weight tensor (SeqLen,1,NumExperts)
+  /// built upstream exactly as in AddTopKMixtureOfExperts. Survivors are NOT
+  /// renormalized: the raw per-token-softmax gate value is kept as the combine
+  /// weight. The backward is therefore a hard 0/1 mask multiply (straight-through
+  /// on survivors, zero elsewhere) with no renorm Jacobian. Capacity is stored
+  /// in FStruct[0]; if Capacity >= SizeX the layer is the identity. No trainable
+  /// parameters; output shape equals input shape.
+  // Coded by Claude (AI).
+  TNNetExpertChoiceGate = class(TNNetIdentity)
+    public
+      constructor Create(Capacity: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   TNNetLayerFullConnect = class(TNNetFullConnect);
   TNNetLayerFullConnectReLU = class(TNNetFullConnectReLU);
   TNNetLayerSoftMax = class(TNNetSoftMax);
@@ -9932,6 +9955,20 @@ type
         NumExperts, ExpertHiddenDim, TopCnt: integer;
         out AuxLossHead: TNNetLayer;
         AuxCoeff: TNeuralFloat = 0.01): TNNetLayer;
+      // Expert-Choice Mixture-of-Experts block (Zhou et al. 2022) -- the
+      // TRANSPOSE of AddTopKMixtureOfExperts. Each EXPERT picks its top-Capacity
+      // TOKENS (over the SizeX axis) instead of each token picking its top-K
+      // experts. Load balance is structural (every expert processes exactly
+      // Capacity tokens) so there is NO aux-loss head and NO out AuxLossHead
+      // param. Same expert-MLP + gate-slice + broadcast + weighted-sum wiring as
+      // AddTopKMixtureOfExperts, but the gate path uses TNNetExpertChoiceGate
+      // (no survivor renormalization -- the raw per-token softmax weight is the
+      // combine weight). A token may be processed by 0, 1, or several experts.
+      // InputLayer defaults to GetLastLayer() when nil; NumExperts/ExpertHiddenDim
+      // are clamped to >= 1; Capacity is clamped to 1..SeqLen. Returns the block
+      // output.
+      function AddExpertChoiceMixtureOfExperts(InputLayer: TNNetLayer;
+        NumExperts, ExpertHiddenDim, Capacity: integer): TNNetLayer;
       // Pre-norm residual block:  y = x + Sublayer(Norm(x)).
       // pSublayers is the caller-provided sublayer stack; its output shape MUST
       // match the block input shape so the residual sum is valid. Returns the
@@ -58916,6 +58953,108 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetExpertChoiceGate }
+
+constructor TNNetExpertChoiceGate.Create(Capacity: integer);
+begin
+  inherited Create();
+  if Capacity < 1 then Capacity := 1;
+  FStruct[0] := Capacity;
+end;
+
+procedure TNNetExpertChoiceGate.Compute;
+var
+  StartTime: double;
+  CntX, CntY, CntD, CntK, MaxX, MaxY, MaxD, Capacity, BestIdx: integer;
+  BestVal, Val: TNeuralFloat;
+  Kept: array of boolean;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Capacity := FStruct[0];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  if Capacity >= FOutput.SizeX then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  SetLength(Kept, FOutput.SizeX);
+  // For EACH expert channel (Depth) keep the top-Capacity TOKEN positions
+  // (SizeX); zero the rest. No renormalization (raw gate value is the combine
+  // weight) so the backward is a hard 0/1 mask.
+  for CntD := 0 to MaxD do
+    for CntY := 0 to MaxY do
+    begin
+      for CntX := 0 to MaxX do Kept[CntX] := False;
+      for CntK := 1 to Capacity do
+      begin
+        BestIdx := -1;
+        BestVal := 0;
+        for CntX := 0 to MaxX do
+        begin
+          if Kept[CntX] then continue;
+          Val := FOutput.FData[FOutput.GetRawPos(CntX, CntY, CntD)];
+          if (BestIdx = -1) or (Val > BestVal) then
+          begin
+            BestIdx := CntX;
+            BestVal := Val;
+          end;
+        end;
+        if BestIdx >= 0 then Kept[BestIdx] := True;
+      end;
+      for CntX := 0 to MaxX do
+        if not Kept[CntX] then
+          FOutput.FData[FOutput.GetRawPos(CntX, CntY, CntD)] := 0;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetExpertChoiceGate.Backpropagate;
+var
+  StartTime: double;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, Capacity, RawPos: integer;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) and
+    (FOutput.Size = FOutputError.Size) then
+  begin
+    Capacity := FStruct[0];
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := FOutput.Depth - 1;
+    if Capacity >= FOutput.SizeX then
+    begin
+      // Identity path: pass the gradient straight through.
+      for CntX := 0 to FOutput.Size - 1 do
+        FPrevLayer.OutputError.FData[CntX] :=
+          FPrevLayer.OutputError.FData[CntX] + FOutputError.FData[CntX];
+      FBackwardTime := FBackwardTime + (Now() - StartTime);
+      FPrevLayer.Backpropagate();
+      exit;
+    end;
+    // Straight-through hard mask: gradient flows for surviving (FOutput<>0)
+    // positions, zeroed elsewhere. No renorm Jacobian (no renormalization).
+    for CntD := 0 to MaxD do
+      for CntY := 0 to MaxY do
+        for CntX := 0 to MaxX do
+        begin
+          RawPos := FOutput.GetRawPos(CntX, CntY, CntD);
+          if FOutput.FData[RawPos] <> 0 then
+            FPrevLayer.OutputError.FData[RawPos] :=
+              FPrevLayer.OutputError.FData[RawPos] + FOutputError.FData[RawPos];
+        end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FPrevLayer.Backpropagate();
+end;
+
 { TNNetConvolutionReLU }
 constructor TNNetConvolutionReLU.Create(pNumFeatures, pFeatureSize,
   pInputPadding, pStride: integer; pSuppressBias: integer = 0);
@@ -77766,6 +77905,7 @@ begin
       'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
       'TNNetTopK' :                 Result := TNNetTopK.Create(St[0]);
       'TNNetTopKGate' :             Result := TNNetTopKGate.Create(St[0]);
+      'TNNetExpertChoiceGate' :     Result := TNNetExpertChoiceGate.Create(St[0]);
       'TNNetPointwiseNorm' :        Result := TNNetPointwiseNorm.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -78133,6 +78273,7 @@ begin
       if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
       if S[0] = 'TNNetTopK' then Result := TNNetTopK.Create(St[0]) else
       if S[0] = 'TNNetTopKGate' then Result := TNNetTopKGate.Create(St[0]) else
+      if S[0] = 'TNNetExpertChoiceGate' then Result := TNNetExpertChoiceGate.Create(St[0]) else
       if S[0] = 'TNNetPointwiseNorm' then Result := TNNetPointwiseNorm.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
@@ -78916,6 +79057,58 @@ begin
   end;
 
   // Sum the sparse gate-weighted expert outputs: y = Sum_e gTopK[e] * E_e(x).
+  if NumExperts = 1
+    then Result := WeightedExperts[0]
+    else Result := AddLayer( TNNetSum.Create(WeightedExperts) );
+  SetLength(WeightedExperts, 0);
+end;
+
+function TNNet.AddExpertChoiceMixtureOfExperts(InputLayer: TNNetLayer;
+  NumExperts, ExpertHiddenDim, Capacity: integer): TNNetLayer;
+var
+  d_model, SeqLen, e: integer;
+  GateSoft, GateChoice: TNNetLayer;
+  ExpertOut, GateE, GateEBroadcast, WeightedExpert: TNNetLayer;
+  WeightedExperts: array of TNNetLayer;
+begin
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  if NumExperts < 1 then NumExperts := 1;
+  if ExpertHiddenDim < 1 then ExpertHiddenDim := 1;
+  d_model := InputLayer.Output.Depth;
+  SeqLen := InputLayer.Output.SizeX;
+  if Capacity < 1 then Capacity := 1;
+  if Capacity > SeqLen then Capacity := SeqLen;
+
+  // --- GATING NETWORK ------------------------------------------------------
+  // Token-wise linear projection InputLayer -> NumExperts logits, SoftMax to a
+  // dense per-expert weight distribution gSoft (sums to 1 over Depth/experts,
+  // PER TOKEN -- same as AddTopKMixtureOfExperts).
+  AddLayerAfter( TNNetPointwiseConvLinear.Create(NumExperts), InputLayer );
+  GateSoft := AddLayer( TNNetSoftMax.Create() );
+
+  // Expert-choice gate: for EACH expert channel keep its top-Capacity TOKEN
+  // positions (over SizeX), zero the rest. No survivor renorm; no aux-loss head
+  // (load balance is structural -- every expert gets exactly Capacity tokens).
+  GateChoice := AddLayerAfter( TNNetExpertChoiceGate.Create(Capacity), GateSoft );
+
+  // --- EXPERTS + GATE-WEIGHTED COMBINE -------------------------------------
+  SetLength(WeightedExperts, NumExperts);
+  for e := 0 to NumExperts - 1 do
+  begin
+    // Shape-preserving 2-layer expert MLP over Depth (1x1 convs keep the
+    // sequence axis; FullConnect would flatten it and break per-token blocks).
+    AddLayerAfter( TNNetPointwiseConvReLU.Create(ExpertHiddenDim), InputLayer );
+    ExpertOut := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+    // Slice expert e's gate weight g[e] (a (.,.,1) channel; zero for tokens NOT
+    // selected by expert e)...
+    GateE := AddLayerAfter( TNNetSplitChannels.Create(e, 1), GateChoice );
+    // ...broadcast across the d_model channels, then cell-multiply it in.
+    GateEBroadcast := AddLayer( TNNetDeepConcat.Replicate(d_model, GateE) );
+    WeightedExpert := AddLayer( TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+    WeightedExperts[e] := WeightedExpert;
+  end;
+
+  // Sum the sparse gate-weighted expert outputs: y = Sum_e gChoice[e] * E_e(x).
   if NumExperts = 1
     then Result := WeightedExperts[0]
     else Result := AddLayer( TNNetSum.Create(WeightedExperts) );

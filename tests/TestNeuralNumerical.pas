@@ -643,6 +643,10 @@ type
     procedure TestLoadBalanceLossCollapsedVsBalanced;
     procedure TestLoadBalanceLossLoadFromString;
     procedure TestTopKMoEOnlyKExpertsActive;
+    procedure TestExpertChoiceGateForward;
+    procedure TestExpertChoiceGateGradientCheck;
+    procedure TestExpertChoiceGateLoadFromString;
+    procedure TestExpertChoiceMoEBalancedLoad;
     procedure TestArcFaceForwardPassthrough;
     procedure TestArcFaceFeatureGradient;
     procedure TestArcFaceDegenerateIsCosineSoftmax;
@@ -51112,6 +51116,236 @@ begin
   finally
     NN.Free;
     NN2.Free;
+    Input.Free;
+  end;
+end;
+
+// ===========================================================================
+//  Expert-Choice routing: TNNetExpertChoiceGate (transpose of TNNetTopKGate)
+// ===========================================================================
+
+procedure TTestNeuralNumerical.TestExpertChoiceGateForward;
+const
+  cTok = 4;   // SeqLen (token axis, SizeX)
+  cE = 2;     // experts (Depth)
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  x, d, NumNonZero: integer;
+begin
+  // Capacity=2 over 4 well-separated token positions per expert: each expert
+  // keeps its two largest TOKEN positions (along SizeX), zeros the rest. No
+  // renormalization: surviving values are the raw inputs.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cTok, 1, cE);
+  try
+    NN.AddLayer(TNNetInput.Create(cTok, 1, cE, 1));
+    NN.AddLayer(TNNetExpertChoiceGate.Create(2));
+    // Expert 0: keep tokens 0 (0.9) and 2 (0.7); drop tokens 1,3.
+    Input[0, 0, 0] := 0.9; Input[1, 0, 0] := 0.1;
+    Input[2, 0, 0] := 0.7; Input[3, 0, 0] := 0.2;
+    // Expert 1: keep tokens 1 (0.8) and 3 (0.6); drop tokens 0,2.
+    Input[0, 0, 1] := 0.1; Input[1, 0, 1] := 0.8;
+    Input[2, 0, 1] := 0.2; Input[3, 0, 1] := 0.6;
+    NN.Compute(Input);
+
+    // Each expert keeps exactly Capacity survivors.
+    for d := 0 to cE - 1 do
+    begin
+      NumNonZero := 0;
+      for x := 0 to cTok - 1 do
+        if NN.GetLastLayer.Output[x, 0, d] <> 0 then Inc(NumNonZero);
+      AssertEquals('ExpertChoiceGate expert keeps Capacity tokens', 2, NumNonZero);
+    end;
+    // Survivors keep the RAW (un-renormalized) input value.
+    AssertEquals('EC survivor e0 t0 raw', 0.9, NN.GetLastLayer.Output[0, 0, 0], 1e-6);
+    AssertEquals('EC survivor e0 t2 raw', 0.7, NN.GetLastLayer.Output[2, 0, 0], 1e-6);
+    AssertEquals('EC dropped e0 t1 zero', 0.0, NN.GetLastLayer.Output[1, 0, 0], 1e-6);
+    AssertEquals('EC dropped e0 t3 zero', 0.0, NN.GetLastLayer.Output[3, 0, 0], 1e-6);
+    AssertEquals('EC survivor e1 t1 raw', 0.8, NN.GetLastLayer.Output[1, 0, 1], 1e-6);
+    AssertEquals('EC survivor e1 t3 raw', 0.6, NN.GetLastLayer.Output[3, 0, 1], 1e-6);
+    AssertEquals('EC dropped e1 t0 zero', 0.0, NN.GetLastLayer.Output[0, 0, 1], 1e-6);
+    AssertEquals('EC dropped e1 t2 zero', 0.0, NN.GetLastLayer.Output[2, 0, 1], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestExpertChoiceGateGradientCheck;
+const
+  cEps = 1e-4;
+  cTok = 4;
+  cE = 1;        // single expert keeps it a pure top-Capacity-along-SizeX mask
+  cCap = 2;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LMid: TNNetIdentity;
+  AnaGrad, NumGrad, OldV, LossP, LossM: TNeuralFloat;
+  i: integer;
+
+  // Scalar loss = sum_x w_x * y_x with fixed weights, recomputing the SAME
+  // straight-through mask by hand (keep Capacity largest tokens, raw values).
+  function GateLossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    xx, kk, BestIdx: integer;
+    BestVal: TNeuralFloat;
+    Kept: array of boolean;
+    W: array[0..cTok - 1] of TNeuralFloat;
+  begin
+    W[0] := 1.0; W[1] := -0.5; W[2] := 0.7; W[3] := 0.2;
+    SetLength(Kept, cTok);
+    for xx := 0 to cTok - 1 do Kept[xx] := False;
+    for kk := 1 to cCap do
+    begin
+      BestIdx := -1; BestVal := 0;
+      for xx := 0 to cTok - 1 do
+      begin
+        if Kept[xx] then continue;
+        if (BestIdx = -1) or (AInput[xx, 0, 0] > BestVal) then
+        begin BestIdx := xx; BestVal := AInput[xx, 0, 0]; end;
+      end;
+      if BestIdx >= 0 then Kept[BestIdx] := True;
+    end;
+    Result := 0;
+    for xx := 0 to cTok - 1 do
+      if Kept[xx] then Result := Result + W[xx] * AInput[xx, 0, 0];
+  end;
+
+begin
+  // Well-separated token weights so the top-Capacity set is unambiguous under
+  // +/-eps (top-k boundary is non-differentiable at ties; keep margins large).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cTok, 1, cE);
+  try
+    NN.AddLayer(TNNetInput.Create(cTok, 1, cE, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddLayer(TNNetExpertChoiceGate.Create(cCap));
+
+    Input[0, 0, 0] := 0.60;  // survivor
+    Input[1, 0, 0] := 0.05;  // dropped (far below)
+    Input[2, 0, 0] := 0.30;  // survivor
+    Input[3, 0, 0] := 0.05;  // dropped (far below)
+
+    NN.Compute(Input);
+    // Last layer has no downstream consumer; register one departing branch so
+    // the manual Backpropagate() call passes TestBackPropCallCurrCnt cleanly.
+    NN.GetLastLayer.IncDepartingBranchesCnt();
+    NN.GetLastLayer.OutputError.Fill(0);
+    NN.GetLastLayer.OutputError[0, 0, 0] := 1.0;
+    NN.GetLastLayer.OutputError[1, 0, 0] := -0.5;
+    NN.GetLastLayer.OutputError[2, 0, 0] := 0.7;
+    NN.GetLastLayer.OutputError[3, 0, 0] := 0.2;
+    NN.GetLastLayer.Backpropagate();
+
+    for i := 0 to cTok - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+      OldV := Input.Raw[i];
+      Input.Raw[i] := OldV + cEps; LossP := GateLossAt(Input);
+      Input.Raw[i] := OldV - cEps; LossM := GateLossAt(Input);
+      Input.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      AssertEquals('ExpertChoiceGate grad at ' + IntToStr(i), NumGrad, AnaGrad, 1e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestExpertChoiceGateLoadFromString;
+const
+  cCap = 3;
+  cTok = 5;
+  cE = 2;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Resaved: string;
+  x, d: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(cTok, 1, cE);
+  try
+    NN.AddLayer(TNNetInput.Create(cTok, 1, cE, 1));
+    NN.AddLayer(TNNetExpertChoiceGate.Create(cCap));
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+    // save -> load -> save round-trip string equality.
+    Resaved := NN2.SaveToString();
+    AssertEquals('ExpertChoiceGate save->load->save round-trip', Saved, Resaved);
+    AssertTrue('Loaded last layer is TNNetExpertChoiceGate',
+      NN2.GetLastLayer is TNNetExpertChoiceGate);
+    AssertEquals('ExpertChoiceGate round-trip preserves Capacity',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+    for x := 0 to cTok - 1 do
+      for d := 0 to cE - 1 do Input[x, 0, d] := 0.05 + 0.1 * x + 0.03 * d;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for x := 0 to cTok * cE - 1 do
+      AssertEquals('ExpertChoiceGate round-trip output ' + IntToStr(x),
+        NN.GetLastLayer.Output.Raw[x], NN2.GetLastLayer.Output.Raw[x], 1e-6);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestExpertChoiceMoEBalancedLoad;
+const
+  cTok = 6;
+  cExperts = 3;
+  cHidden = 4;
+  cCap = 2;
+  cDModel = 5;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Block, GateChoice: TNNetLayer;
+  e, x, d, Cnt: integer;
+begin
+  // Structural load balance: every expert selects exactly Capacity tokens, so
+  // its gate channel has exactly Capacity non-zero entries (regardless of the
+  // gate distribution shape).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cTok, 1, cDModel);
+  try
+    NN.AddLayer(TNNetInput.Create(cTok, 1, cDModel, 1));
+    Block := NN.AddExpertChoiceMixtureOfExperts(nil, cExperts, cHidden, cCap);
+    AssertTrue('AddExpertChoiceMixtureOfExperts returns a layer', Block <> nil);
+    AssertEquals('Block output Depth = d_model', cDModel, Block.Output.Depth);
+    AssertEquals('Block output SeqLen preserved', cTok, Block.Output.SizeX);
+
+    // Locate the gate layer.
+    GateChoice := nil;
+    for e := 0 to NN.CountLayers - 1 do
+      if NN.Layers[e] is TNNetExpertChoiceGate then GateChoice := NN.Layers[e];
+    AssertTrue('ExpertChoiceGate layer present in block', GateChoice <> nil);
+
+    Input.Randomize();
+    NN.Compute(Input);
+
+    // Every expert channel has exactly Capacity surviving (non-zero) tokens.
+    for d := 0 to cExperts - 1 do
+    begin
+      Cnt := 0;
+      for x := 0 to cTok - 1 do
+        if GateChoice.Output[x, 0, d] <> 0 then Inc(Cnt);
+      AssertEquals('Expert ' + IntToStr(d) + ' processes exactly Capacity tokens',
+        cCap, Cnt);
+    end;
+  finally
+    NN.Free;
     Input.Free;
   end;
 end;
