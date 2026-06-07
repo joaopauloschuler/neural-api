@@ -72,6 +72,37 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
+- [ ] `TNNetEvidentialRegression` — Deep Evidential Regression head (Amini et al.,
+      NeurIPS 2020, arXiv:1910.02600). A single-forward-pass uncertainty head that,
+      per scalar target, emits the 4 parameters of a Normal-Inverse-Gamma (NIG)
+      higher-order distribution — gamma (mean), nu (>0), alpha (>1), beta (>0) — and
+      thereby reports BOTH aleatoric (data) and epistemic (model) uncertainty with no
+      sampling and no ensemble. This is genuinely distinct from the existing
+      uncertainty family: [[mixture-density-head]] models only aleatoric noise as a
+      Gaussian mixture, and [[kalman-filter-cell-layer]] propagates a recursive
+      sequential covariance — neither produces a closed-form epistemic estimate from
+      one deterministic pass. Design notes:
+      - Output packing over the Depth axis: 4 raw channels per target, mapped via
+        softplus to keep nu, alpha-1, beta strictly positive (gamma stays linear) —
+        same Depth-packing + positivity-link discipline as TNNetMixtureDensity.
+      - Loss = NIG negative log-likelihood (a Student-t marginal, closed form using
+        lgamma) PLUS the paper's evidence regularizer lambda*|y-gamma|*(2*nu+alpha)
+        that penalizes misleading evidence on errors. Follow the [[loss-layer-pattern]]
+        (TNNetIdentity passthrough forward + backward rewrite + two dispatch-table
+        entries); derive and hand-verify the exact dL/d{gamma,nu,alpha,beta} adjoints
+        against TestNeuralNumerical.pas with `RandSeed := 424242`
+        ([[numerical-test-rng-ordering]]), bounding raw params so the lgamma/digamma
+        terms stay well-conditioned rather than loosening the tolerance.
+      - Inference helpers: prediction = gamma; aleatoric var = beta/(alpha-1);
+        epistemic var = beta/(nu*(alpha-1)). Expose them so an example can rank test
+        points by epistemic uncertainty (the paper's OOD-detection use case).
+      - Deliverables: leaf class with `// Coded by Claude (AI).`
+        ([[claude-authorship-comment]]), numerical-gradient + serialization tests,
+        and `examples/EvidentialRegression/` on a 1-D function with a held-out gap,
+        showing epistemic uncertainty spiking in the unobserved region (mirrors the
+        Mixture Density / Hamiltonian example style). Optional follow-up: a
+        Dirichlet-evidence CLASSIFICATION variant (Sensoy et al. 2018) reusing the
+        same evidence-regularizer machinery.
 - [ ] TNNetGatedLinearAttention follow-ups (Gated Linear Attention, Yang et al.
       2023, arXiv:2312.06635 — matrix-state (d x d) linear-attention recurrence
       with a data-dependent per-channel diagonal forget gate
