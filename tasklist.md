@@ -297,8 +297,12 @@ rather than acted on.
 
 - [ ] TNNetLinformerAttention follow-ups (low-rank linear-complexity single-head SDPA
       projecting K,V down the sequence axis via learnable E,F; landed 2026-06-07, commit 4c6248b):
-      - [ ] TNNet.AddLinformerAttention block builder (pre/post-norm residual + FFN)
+      - [x] TNNet.AddLinformerAttention block builder (pre/post-norm residual + FFN)
             and a multi-head Linformer (concat of H per-head E/F) for drop-in stacking.
+            (landed 2026-06-07 on a2: AddMultiHeadLinformerAttention(Heads,k) =
+            AddSplitQKVHeads -> per-head TNNetLinformerAttention -> DeepConcat ->
+            PointwiseConvLinear out-proj; AddLinformerAttention(Heads,d_ff,k,PreNorm,NormClass)
+            wraps it in the AddTransformerEncoderBlock-style residual + SwiGLU FFN.)
       - [ ] Parameter-sharing variants (headwise / key-value shared E=F / layerwise),
             the paper's main param-budget knob; plus d_v != d_k support (v1 fixes d_v=d_k).
 - [ ] TNNetPerformerAttention follow-ups (Performer / FAVOR+ positive-random-feature

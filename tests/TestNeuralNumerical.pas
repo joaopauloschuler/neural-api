@@ -450,6 +450,9 @@ type
     procedure TestAddConformerBlockShape;
     procedure TestAddConformerBlockSerializationRoundTrip;
     procedure TestAddConformerBlockGradientFlow;
+    procedure TestAddLinformerAttentionShape;
+    procedure TestAddLinformerAttentionSerializationRoundTrip;
+    procedure TestAddLinformerAttentionGradientFlow;
     procedure TestWKVShapeInference;
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
@@ -29644,6 +29647,127 @@ begin
     end;
     AssertTrue('Conformer block input gradient finite', not AnyNan);
     AssertTrue('Conformer block input gradient non-zero (sum=' +
+      FloatToStr(GradSum) + ')', GradAbsMax > 1e-9);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddLinformerAttentionShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Out: TNNetLayer;
+  i: integer;
+begin
+  // The AddLinformerAttention block builder must be shape-preserving over the
+  // (SeqLen,1,d_model) sequence (multi-head Linformer residual + SwiGLU FFN
+  // residual all keep the layout) so blocks stack like a normal encoder block.
+  // The inner multi-head Linformer attention is also exercised directly here.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 8));
+    NN.AddLinformerAttention({Heads=}2, {d_ff=}16, {k=}3);
+    Out := NN.AddLinformerAttention({Heads=}2, {d_ff=}16, {k=}3);
+    AssertEquals('Linformer block output SizeX', 6, Out.Output.SizeX);
+    AssertEquals('Linformer block output SizeY', 1, Out.Output.SizeY);
+    AssertEquals('Linformer block output Depth', 8, Out.Output.Depth);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6;
+    NN.Compute(Input);
+    AssertEquals('Linformer block computed SizeX', 6, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Linformer block computed Depth', 8, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddLinformerAttentionSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical for a
+  // net containing an AddLinformerAttention block (proving every composed
+  // sub-layer - LayerNorms, pointwise convs, SwiGLU, the per-head
+  // TNNetLinformerAttention leaves with their learnable E,F and the residual
+  // sums - all serialize and reload).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 6));
+    NN.AddLinformerAttention({Heads=}2, {d_ff=}12, {k=}2);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('Linformer block round-trip layer count',
+        NN.CountLayers(), NN2.CountLayers());
+      AssertEquals('Linformer block round-trip output Depth',
+        NN.GetLastLayer.Output.Depth, NN2.GetLastLayer.Output.Depth);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Linformer block SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Linformer block round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddLinformerAttentionGradientFlow;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  GradSum, GradAbsMax: TNeuralFloat;
+  AnyNan: boolean;
+begin
+  // Gradient-flow smoke: one forward+backward must leave the INPUT gradient
+  // finite and non-zero. If any per-token projection used FullConnect (flattening
+  // the sequence) the input gradient would be identically zero, so this guards
+  // the PointwiseConvLinear token-axis wiring through the multi-head Linformer
+  // path. Uses pError=1 so reading Layers[0].OutputError beyond index 0 is valid.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 6);
+  Desired := TNNetVolume.Create(5, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 6, 1));
+    NN.AddLinformerAttention({Heads=}2, {d_ff=}12, {k=}2);
+    NN.SetLearningRate(0.01, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.1) * 0.7;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.6) * 0.3;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+
+    GradSum := 0; GradAbsMax := 0; AnyNan := false;
+    for i := 0 to NN.Layers[0].OutputError.Size - 1 do
+    begin
+      if IsNan(NN.Layers[0].OutputError.Raw[i]) or
+         IsInfinite(NN.Layers[0].OutputError.Raw[i]) then AnyNan := true;
+      GradSum := GradSum + Abs(NN.Layers[0].OutputError.Raw[i]);
+      if Abs(NN.Layers[0].OutputError.Raw[i]) > GradAbsMax then
+        GradAbsMax := Abs(NN.Layers[0].OutputError.Raw[i]);
+    end;
+    AssertTrue('Linformer block input gradient finite', not AnyNan);
+    AssertTrue('Linformer block input gradient non-zero (sum=' +
       FloatToStr(GradSum) + ')', GradAbsMax > 1e-9);
   finally
     NN.Free; Input.Free; Desired.Free;

@@ -10612,6 +10612,23 @@ type
         CausalMask: boolean = false; UseRoPE: boolean = false;
         Variant: TNNetAttentionVariant = avSDPA;
         NumSinks: integer = 1): TNNetLayer;
+      // Multi-head LINFORMER self-attention (Wang et al. 2020, arXiv:2006.04768)
+      // over a (SeqLen,1,3*d_model) Q|K|V slab. Linformer keeps the softmax but
+      // projects K and V DOWN the sequence axis to a fixed rank k (k << SeqLen)
+      // via two learnable matrices E,F, giving O(SeqLen*k) instead of
+      // O(SeqLen^2) attention. Multi-head is built exactly like
+      // AddMultiHeadSelfAttention: the slab is split per head (AddSplitQKVHeads),
+      // each head runs its OWN TNNetLinformerAttention(d_k,k) leaf (each with its
+      // own learnable E,F low-rank projections), the H per-head (SeqLen,1,d_k)
+      // outputs are TNNetDeepConcat'd back to d_model, then a per-token
+      // TNNetPointwiseConvLinear(d_model) out-projection (a FullConnect would
+      // flatten the sequence axis -- see AddMultiHeadSelfAttention). There is no
+      // head-axis tensor in this tree; heads are H separate concatenated leaves.
+      // d_model is inferred from the input depth (the Q|K|V slab, so d_model =
+      // GetLastLayer().Output.Depth div 3); d_k = d_model div Heads must divide
+      // evenly and k must satisfy 1 <= k <= SeqLen. Requires SizeY=1 and a FIXED
+      // SeqLen (Linformer's E,F are sized to it). Returns the out-projection.
+      function AddMultiHeadLinformerAttention(Heads, k: integer): TNNetLayer;
       // Talking-Heads Attention (Shazeer et al. 2020, arXiv:2003.02436) over a
       // (SeqLen,1,d_in) sequence tensor. Talking-heads inserts a small learnable
       // HxH linear mixing ACROSS the attention heads at two points: on the
@@ -11038,6 +11055,31 @@ type
       // shorter sequence. ToMe adds NO trainable parameters. Returns the last
       // layer. (Coded by Claude (AI).)
       function AddToMeTransformerBlock(Blocks, R, Heads, d_ff: integer;
+        PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
+      // Composite builder: a transformer-style ENCODER block whose attention is
+      // multi-head LINFORMER (linear-complexity low-rank) attention instead of
+      // full softmax attention. Same residual + FFN structure as
+      // AddTransformerEncoderBlock, so it drops into the same stacks:
+      //   PreNorm=True  (default):
+      //     x := x + MultiHeadLinformer(LayerNorm(x));
+      //     x := x + SwiGLU-FFN(LayerNorm(x))
+      //   PreNorm=False (post-norm):
+      //     x := LayerNorm(x + MultiHeadLinformer(x));
+      //     x := LayerNorm(x + SwiGLU-FFN(x))
+      // The attention sub-block projects the residual stream d_model -> 3*d_model
+      // (token-wise TNNetPointwiseConvLinear = QKV slab) and feeds
+      // AddMultiHeadLinformerAttention(Heads,k), which out-projects back to
+      // d_model. The FFN sub-block is the same token-wise SwiGLU FFN used by
+      // AddTransformerEncoderBlock (PointwiseConvLinear(2*d_ff) -> SwiGLU ->
+      // PointwiseConvLinear(d_model)). Every projection is token-wise (1x1 conv)
+      // so the (SeqLen,1,d_model) sequence axis is preserved and the output shape
+      // equals the input. Params: Heads = attention heads (d_model div Heads must
+      // divide evenly), d_ff = FFN hidden width, k = Linformer projection rank
+      // (1 <= k <= SeqLen, k << SeqLen for the speed-up). NormClass=nil defaults
+      // to TNNetLayerNorm. Requires a (SeqLen,1,d_model) input (SizeY=1) and a
+      // FIXED SeqLen. d_model is inferred from GetLastLayer().Output.Depth.
+      // Returns the last layer of the block.
+      function AddLinformerAttention(Heads, d_ff, k: integer;
         PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
       // Composite builder assembling a standard transformer DECODER block by
       // stacking three residual sub-blocks on the current decoder stream:
@@ -43937,6 +43979,43 @@ begin
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
 end;
 
+function TNNet.AddMultiHeadLinformerAttention(Heads, k: integer): TNNetLayer;
+var
+  SourceLayer: TNNetLayer;
+  d_model, d_k, HeadCnt: integer;
+  SliceLayers, HeadOutputs: array of TNNetLayer;
+begin
+  SourceLayer := GetLastLayer();
+  if Heads < 1 then
+    FErrorProc('AddMultiHeadLinformerAttention requires Heads >= 1. Heads=' +
+      IntToStr(Heads));
+  // Source is the Q|K|V slab, so its depth is 3*d_model.
+  if (SourceLayer.Output.Depth mod 3) <> 0 then
+    FErrorProc('AddMultiHeadLinformerAttention requires a 3*d_model Q|K|V slab. ' +
+      'Got depth=' + IntToStr(SourceLayer.Output.Depth));
+  d_model := SourceLayer.Output.Depth div 3;
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddMultiHeadLinformerAttention requires d_model divisible by ' +
+      'Heads. d_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  d_k := d_model div Heads;
+  // Per-head split of the [Q_all|K_all|V_all] slab into H [Q_h|K_h|V_h] packs
+  // (width 3*d_k), exactly as AddMultiHeadSelfAttention does.
+  SetLength(SliceLayers, Heads);
+  AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
+  // One independent Linformer head per slice (each with its own learnable E,F).
+  SetLength(HeadOutputs, Heads);
+  for HeadCnt := 0 to Heads - 1 do
+    HeadOutputs[HeadCnt] :=
+      AddLayerAfter(TNNetLinformerAttention.Create(d_k, k), SliceLayers[HeadCnt]);
+  // Concat the H (SeqLen,1,d_k) head outputs back to d_model.
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  // Token-wise linear out-projection (PointwiseConvLinear, NOT FullConnect -- see
+  // AddMultiHeadSelfAttention header).
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  SetLength(SliceLayers, 0);
+  SetLength(HeadOutputs, 0);
+end;
+
 function TNNet.AddTalkingHeadsAttention(Heads, d_model: integer;
   CausalMask: boolean = false;
   PreSoftmaxMix: boolean = true;
@@ -44891,6 +44970,43 @@ begin
   // which AddMultiHeadSelfAttention consumes and out-projects back to d_model.
   AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
   AddMultiHeadSelfAttention(Heads, CausalMask, UseRoPE);
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( NormClass.Create() );
+
+  // ---- Feed-forward sub-block: residual around a token-wise SwiGLU FFN. ----
+  BranchInput := GetLastLayer();
+  if PreNorm then AddLayer( NormClass.Create() );
+  // Token-wise FFN (1x1 convs preserve the sequence axis). TNNetSwiGLU halves
+  // the depth channel-wise, so the inner projection must be 2*d_ff.
+  AddLayer( TNNetPointwiseConvLinear.Create(2 * d_ff) );
+  AddLayer( TNNetSwiGLU.Create() );
+  AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  if not PreNorm then AddLayer( NormClass.Create() );
+
+  Result := GetLastLayer();
+end;
+
+function TNNet.AddLinformerAttention(Heads, d_ff, k: integer;
+  PreNorm: boolean = true; NormClass: TNNetLayerClass = nil): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+  d_model: integer;
+begin
+  if NormClass = nil then NormClass := TNNetLayerNorm;
+  if GetLastLayer().Output.SizeY <> 1 then
+    FErrorProc('AddLinformerAttention requires a (SeqLen,1,d_model) input ' +
+      '(SizeY=1). Got SizeY=' + IntToStr(GetLastLayer().Output.SizeY));
+  // ---- Attention sub-block: residual around multi-head Linformer attention. --
+  // Same inline residual idiom as AddTransformerEncoderBlock (the attention
+  // sublayer adds many layers and can't be expressed as an array of TNNetLayer).
+  BranchInput := GetLastLayer();
+  d_model := BranchInput.Output.Depth;  // inferred residual-stream width
+  if PreNorm then AddLayer( NormClass.Create() );
+  // Token-wise QKV slab projection d_model -> 3*d_model (1x1 conv per token),
+  // which AddMultiHeadLinformerAttention consumes and out-projects to d_model.
+  AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
+  AddMultiHeadLinformerAttention(Heads, k);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
   if not PreNorm then AddLayer( NormClass.Create() );
 
