@@ -1147,6 +1147,7 @@ type
     procedure TestBitProcessingShapeAndRoundTrip;
     procedure TestBitProcessingClippingGradient;
     procedure TestBitProcessingSerializationRoundTrip;
+    procedure TestPointwiseBitProcessingShapeRoundTripGradient;
   end;
 
 implementation
@@ -42890,6 +42891,105 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPointwiseBitProcessingShapeRoundTripGradient;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Bit, Prev: TNNetLayer;
+  Saved, Struct, Struct2: string;
+  X, Y, D, i: integer;
+  err, val: TNeuralFloat;
+  cnt, nonZero: integer;
+begin
+  // Pointwise/affine cross of the byte-processing family. Per (X,Y) position the
+  // ONE shared engine affine-encodes the Depth column to bytes, runs, and
+  // decodes back -> shape-preserving (SizeX,SizeY,Depth all unchanged, no x8).
+  // (a) shape, (b) untrained decode o encode ~= identity (~0.2 step) per
+  // position, (c) save-structure/load round-trip via CreateLayer with non-default
+  // affine endpoints, (d) gradient reaches the previous layer for in-range input.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // 3x2 spatial grid, Depth 4 -> 24 positions sharing one engine.
+  Input := TNNetVolume.Create(3, 2, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 2, 4));
+    // Non-default affine range to prove FFloatSt[0..1] round-trip.
+    Bit := NN.AddLayer(TNNetPointwiseBitProcessing.Create(1, 16, 100, 0, -12.8, 12.8));
+    Prev := NN.Layers[0];
+
+    // (a) shape-preserving.
+    AssertEquals('PointwiseBit output SizeX', Input.SizeX, Bit.Output.SizeX);
+    AssertEquals('PointwiseBit output SizeY', Input.SizeY, Bit.Output.SizeY);
+    AssertEquals('PointwiseBit output Depth (no x8 expansion)',
+      Input.Depth, Bit.Output.Depth);
+
+    // Fill with known in-range values that vary across positions.
+    for X := 0 to Input.SizeX - 1 do
+      for Y := 0 to Input.SizeY - 1 do
+        for D := 0 to Input.Depth - 1 do
+          Input[X, Y, D] := Sin((X*7 + Y*3 + D) * 0.4) * 8.0;
+
+    NN.Compute(Input);
+
+    // (b) untrained engine = decode o encode ~= identity within one step.
+    err := 0; cnt := 0;
+    for X := 0 to Input.SizeX - 1 do
+      for Y := 0 to Input.SizeY - 1 do
+        for D := 0 to Input.Depth - 1 do
+        begin
+          err := err + Abs(Bit.Output[X, Y, D] - Input[X, Y, D]);
+          Inc(cnt);
+        end;
+    AssertTrue('PointwiseBit untrained mean abs reconstruction error < 0.2',
+      (err / cnt) < 0.2);
+
+    // (c) save-structure-then-load round-trip recreates the layer + endpoints.
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('PointwiseBit round-trip class identity',
+        NN2.GetLastLayer is TNNetPointwiseBitProcessing);
+      Struct := NN.Layers[1].SaveStructureToString();
+      Struct2 := NN2.Layers[1].SaveStructureToString();
+      AssertTrue('PointwiseBit struct encodes non-default affine range',
+        Pos('12.8', Struct) > 0);
+      AssertEquals('PointwiseBit affine params round-trip via struct',
+        Struct, Struct2);
+    finally
+      NN2.Free;
+    end;
+
+    // (d) gradient reaches the previous layer for in-range input.
+    NN.SetBatchUpdate(True);
+    NN.Compute(Input);
+    Prev.OutputError.Resize(Prev.Output);
+    Prev.OutputError.Fill(0);
+    NN.ClearDeltas();
+    for i := 0 to Bit.OutputError.Size - 1 do Bit.OutputError.FData[i] := 1.0;
+    Bit.IncDepartingBranchesCnt();   // hoist above any reset (STE-test pattern)
+    Bit.Backpropagate();
+
+    nonZero := 0;
+    for X := 0 to Input.SizeX - 1 do
+      for Y := 0 to Input.SizeY - 1 do
+        for D := 0 to Input.Depth - 1 do
+        begin
+          val := Input[X, Y, D];
+          if (val >= -12.8) and (val <= 12.8) then
+          begin
+            AssertEquals('PointwiseBit STE passes gradient for in-range input',
+              1.0, Prev.OutputError[X, Y, D], 1e-6);
+            if Prev.OutputError[X, Y, D] <> 0 then Inc(nonZero);
+          end;
+        end;
+    AssertTrue('PointwiseBit gradient reaches previous layer', nonZero > 0);
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

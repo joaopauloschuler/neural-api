@@ -13865,6 +13865,42 @@ type
       procedure Backpropagate(); override;
   end;
 
+  // The pointwise/affine cross of the byte-processing family: it is to
+  // TNNetBitProcessing what TNNetPointwiseByteProcessing is to
+  // TNNetByteProcessing. A single SHARED symbolic byte engine is applied
+  // independently to the Depth vector at every (X,Y) position (weight sharing
+  // across spatial locations, like a 1x1 convolution), but using
+  // TNNetBitProcessing's 1:1 AFFINE scalar quantization (one input float -> one
+  // whole byte over [FAffineLo, FAffineHi], default -25.6 .. +25.6) instead of
+  // the 8-floats-into-a-bit-pattern packing of the pointwise BYTE sibling. So
+  // the layer is shape-preserving: output SizeX/SizeY/Depth equal the input's
+  // (ByteLen == Depth, no x8 expansion, no rounding to whole bytes). Each
+  // position is one training sample for the shared engine, so it generalizes
+  // across positions. The backward pass is a straight-through estimator: per
+  // position the gradient flows to the previous layer where the input is inside
+  // [FAffineLo, FAffineHi] (output channel D maps to input channel D) and is
+  // killed where the quantizer clips; the discrete engine is treated as the
+  // identity. Inherits the affine helpers (EncodeToBytes/DecodeToOutput),
+  // endpoints (FAffineLo/FAffineHi, persisted in FFloatSt[0..1]) and engine
+  // persistence (SaveDataToString/LoadDataFromString/CopyWeights) from its
+  // ancestors; only the spatial (per-position) wiring and scratch volumes
+  // differ. Experimental, like TNNetByteProcessing.
+  // Coded by Claude (AI).
+  TNNetPointwiseBitProcessing = class(TNNetBitProcessing)
+    private
+      FPosInput: TNNetVolume;   // scratch: one position's input Depth vector
+      FPosOutput: TNNetVolume;  // scratch: one position's decoded output vector
+      FByteLen: integer;
+      FInDepth: integer;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(CacheSize, NeuronCount, SearchBudget, AddSkipConnection: integer;
+        AffineLo: TNeuralFloat = -25.6; AffineHi: TNeuralFloat = 25.6); overload;
+      destructor Destroy; override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   // This class is very experimental - do not use it.
   TNNetForByteProcessing = class(TNNet)
     private
@@ -28599,6 +28635,134 @@ begin
   FOutputError.Add(FOutput);
   EncodeToBytes(FOutputError, FByteOutputFound);
   FByteLearning.newStateFound(FByteOutputFound);
+
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetPointwiseBitProcessing }
+
+procedure TNNetPointwiseBitProcessing.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FInDepth := pPrevLayer.Output.Depth;
+  // One byte per channel (affine 1:1), shared across spatial positions: the
+  // engine maps the Depth vector at each (X,Y) to a Depth vector, so ByteLen
+  // equals Depth (no x8 expansion, no rounding to whole bytes).
+  FByteLen := FInDepth;
+  FByteLearning.Initiate(FByteLen, FByteLen, False{pFullEqual},
+    FStruct[1]{NumNeuronGroups}, FStruct[2]{pNumberOfSearches},
+    (FStruct[0]>0){pUseCache}, FStruct[0]{CacheSize});
+  // Shape-preserving: same spatial grid and same Depth as the input.
+  FOutput.Resize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, FInDepth);
+  FOutputError.Resize(FOutput);
+  FPosInput.Resize(1, 1, FInDepth);
+  FPosOutput.Resize(1, 1, FInDepth);
+  SetLength(FByteInput, FByteLen);
+  SetLength(FByteOutput, FByteLen);
+  SetLength(FByteOutputFound, FByteLen);
+  FByteLearning.BytePred.FUseBelief := True;
+  FByteLearning.BytePred.FGeneralize := True;
+end;
+
+constructor TNNetPointwiseBitProcessing.Create(CacheSize, NeuronCount,
+  SearchBudget, AddSkipConnection: integer;
+  AffineLo: TNeuralFloat = -25.6; AffineHi: TNeuralFloat = 25.6);
+begin
+  inherited Create(CacheSize, NeuronCount, SearchBudget, AddSkipConnection,
+    AffineLo, AffineHi);
+  FPosInput := TNNetVolume.Create;
+  FPosOutput := TNNetVolume.Create;
+end;
+
+destructor TNNetPointwiseBitProcessing.Destroy;
+begin
+  FPosInput.Free;
+  FPosOutput.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetPointwiseBitProcessing.Compute();
+var
+  StartTime: double;
+  X, Y, D, MaxX, MaxY, InDepthM1: integer;
+begin
+  StartTime := Now();
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  InDepthM1 := FInDepth - 1;
+  // Apply the one shared engine to each (X,Y) Depth column independently, using
+  // the inherited affine 1:1 byte quantization (encode -> engine -> decode).
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      for D := 0 to InDepthM1 do
+        FPosInput.FData[D] := FPrevLayer.FOutput[X, Y, D];
+      EncodeToBytes(FPosInput, FByteInput);
+      FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
+      DecodeToOutput(FByteOutput, FPosOutput);
+      for D := 0 to InDepthM1 do
+        FOutput[X, Y, D] := FPosOutput.FData[D];
+    end;
+
+  // Symmetric range -> decoded mid-range byte ~= 0, so the skip is a residual
+  // nudge on top of the input (mirrors the parent's skip intent).
+  if FAddSkipConnection then FOutput.Add(FPrevLayer.Output);
+
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetPointwiseBitProcessing.Backpropagate();
+var
+  StartTime: double;
+  X, Y, D, MaxX, MaxY, InDepthM1: integer;
+  v: TNeuralFloat;
+  doPrev: boolean;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  InDepthM1 := FInDepth - 1;
+  doPrev := Assigned(FPrevLayer) and
+            (FPrevLayer.OutputError.Size > 0) and
+            (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size);
+
+  // For every position: (1) push the straight-through gradient to the previous
+  // layer (output channel D maps to input channel D; decode o encode ~= identity
+  // so the local slope is ~1 where the input is inside [FAffineLo, FAffineHi]
+  // and is killed where the quantizer clips - replacing the BYTE sibling's
+  // Abs(x)<=1 sign-saturation test), and (2) teach the shared engine this
+  // position's reconstructed target. We re-Predict per position to restore the
+  // engine's internal per-call state before newStateFound (Compute left it on
+  // the last position). FOutputError is never mutated (we use FPosOutput
+  // scratch), so both steps read the original dL/dOutput.
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      if doPrev then
+        for D := 0 to InDepthM1 do
+        begin
+          v := FPrevLayer.FOutput[X, Y, D];
+          if FAddSkipConnection or ((v >= FAffineLo) and (v <= FAffineHi)) then
+            FPrevLayer.FOutputError[X, Y, D] :=
+              FPrevLayer.FOutputError[X, Y, D] + FOutputError[X, Y, D];
+        end;
+
+      for D := 0 to InDepthM1 do
+        FPosInput.FData[D] := FPrevLayer.FOutput[X, Y, D];
+      EncodeToBytes(FPosInput, FByteInput);
+      FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
+      // target = FOutput - dL/dOutput, affine-encoded back to bytes to recover
+      // the "found" next state to learn.
+      for D := 0 to InDepthM1 do
+        FPosOutput.FData[D] := FOutput[X, Y, D] - FOutputError[X, Y, D];
+      EncodeToBytes(FPosOutput, FByteOutputFound);
+      FByteLearning.newStateFound(FByteOutputFound);
+    end;
 
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -80051,6 +80215,7 @@ begin
       'TNNetByteProcessing' :       Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]);
       'TNNetPointwiseByteProcessing' : Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]);
       'TNNetBitProcessing' :        Result := TNNetBitProcessing.Create(St[0], St[1], St[2], St[3], Ft[0], Ft[1]);
+      'TNNetPointwiseBitProcessing' : Result := TNNetPointwiseBitProcessing.Create(St[0], St[1], St[2], St[3], Ft[0], Ft[1]);
       'TNNetArcFace' :              Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]);
       'TNNetMixtureDensity' :       Result := TNNetMixtureDensity.Create(St[0], St[1]);
       'TNNetEvidentialRegression' : Result := TNNetEvidentialRegression.Create(St[0], Ft[0]);
@@ -80424,6 +80589,7 @@ begin
       if S[0] = 'TNNetByteProcessing' then Result := TNNetByteProcessing.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetPointwiseByteProcessing' then Result := TNNetPointwiseByteProcessing.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetBitProcessing' then Result := TNNetBitProcessing.Create(St[0], St[1], St[2], St[3], Ft[0], Ft[1]) else
+      if S[0] = 'TNNetPointwiseBitProcessing' then Result := TNNetPointwiseBitProcessing.Create(St[0], St[1], St[2], St[3], Ft[0], Ft[1]) else
       if S[0] = 'TNNetArcFace' then Result := TNNetArcFace.Create(St[0], Ft[0], Ft[1]) else
       if S[0] = 'TNNetMixtureDensity' then Result := TNNetMixtureDensity.Create(St[0], St[1]) else
       if S[0] = 'TNNetEvidentialRegression' then Result := TNNetEvidentialRegression.Create(St[0], Ft[0]) else
