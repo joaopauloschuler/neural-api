@@ -2528,6 +2528,52 @@ type
     property KeyValueSource: TNNetLayer read FKVLayer;
   end;
 
+  /// Forgetting-Transformer (FoX) data-dependent forget-gate score bias
+  // (Lin, Yang, Wang et al. 2025, "Forgetting Transformer: Softmax Attention
+  // with a Forget Gate", https://arxiv.org/abs/2503.02130). This layer puts a
+  // LEARNED, INPUT-CONDITIONED forget gate back inside softmax attention. From
+  // the per-position input x_t (SizeY=1, SizeX=SeqLen, Depth=Features) it
+  // computes a scalar forget value per position
+  //   f_t = sigmoid( w . x_t + b )   in (0,1)
+  // (ONE weight neuron: w is Features weights, b the neuron bias), accumulates
+  // the running log F_t = sum_{k<=t} ln f_k (a prefix sum), and EMITS the
+  // strictly-lower-triangular additive DECAY-BIAS matrix
+  //   D[i,j] = F_i - F_j   for j <= i   (0 on the diagonal),
+  //   D[i,j] = -1e9         for j >  i   (folds the causal mask in for free).
+  // Adding D to the raw Q.K^T/sqrt(d) scores BEFORE softmax multiplies each
+  // attention weight by prod_{k=j+1..i} f_k -- an input-conditioned exponential
+  // discount of older tokens (data-dependent ALiBi). This is the ONLY softmax-
+  // attention layer in the tree with a learned per-position decay, and the only
+  // forget gate acting on the O(L^2) score matrix rather than an O(d^2)
+  // recurrent state (contrast TNNetGatedLinearAttention / TNNetWKV / TNNetDeltaNet
+  // which gate a recurrent state, and the FIXED-slope ALiBi).
+  // Output shape: SizeX=SeqLen (key j), SizeY=SeqLen (query i), Depth=1, i.e.
+  // D[X=j, Y=i, 0] -- matching the [X=key, Y=query, 1] score-tensor layout used
+  // by TNNet.AddTalkingHeadsAttention / TNNet.AddForgettingAttention so it can be
+  // summed straight into a per-head QK^T score slab. Backward is the exact
+  // adjoint over the prefix sum: for D[i,j]=F_i-F_j (j<=i), F_i appears with +1
+  // in every D[i,j] (j<=i) and with -1 in every D[k,i] (k>=i), so
+  //   dL/dF_i = sum_{j<=i} dL/dD[i,j] - sum_{k>=i} dL/dD[k,i];
+  // the prefix sum then gives dL/d(ln f_t) = sum_{s>=t} dL/dF_s and
+  // df_t = dL/d(ln f_t) / f_t, chained through the sigmoid into w and b. d_k is
+  // NOT a parameter (the layer is feature-count agnostic; Features is read from
+  // the previous layer). No FStruct params to round-trip beyond the base neuron.
+  // Coded by Claude (AI).
+  TNNetForgetGateBias = class(TNNetLayer)
+  private
+    FFeatures: integer;
+    FF: TNNetVolume;    // f_t = sigmoid(w.x_t+b) per position, [SeqLen,1,1]
+    FLogF: TNNetVolume; // prefix sum F_t = sum_{k<=t} ln f_k,   [SeqLen,1,1]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    destructor Destroy(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // Read-only access to the per-position forget values f_t (in (0,1)).
+    property ForgetValues: TNNetVolume read FF;
+  end;
+
   /// Affine Grid Sampler -- the differentiable bilinear grid-sampling core of a
   // Spatial Transformer Network (Jaderberg, Simonyan, Zisserman & Kavukcuoglu
   // 2015). It warps an image-shaped source by a CONTINUOUS, input-conditioned
@@ -10560,6 +10606,26 @@ type
         CausalMask: boolean = false;
         PreSoftmaxMix: boolean = true;
         PostSoftmaxMix: boolean = true): TNNetLayer;
+      // Forgetting-Transformer (FoX) multi-head attention (Lin, Yang, Wang et al.
+      // 2025, "Forgetting Transformer", https://arxiv.org/abs/2503.02130) over a
+      // (SeqLen,1,d_in) sequence tensor. Standard softmax attention with a
+      // LEARNED, INPUT-CONDITIONED forget gate folded into the score matrix: each
+      // head gets its OWN per-position forget gate f_t^h = sigmoid(w_h.x_t+b_h),
+      // whose log-prefix-sum decay bias D_h[i,j]=F_i-F_j (j<=i) is ADDED to that
+      // head's Q.K^T/sqrt(d_k) logits BEFORE softmax (a DATA-DEPENDENT ALiBi;
+      // contrast a fixed-slope ALiBi). The bias also folds in the causal mask for
+      // free, so FoX attention is inherently causal (no CausalMask flag).
+      // Composed entirely from existing serializable layers (the new
+      // TNNetForgetGateBias plus the Talking-Heads-style real score-tensor path:
+      // TNNetDotProducts/TransposeYD score slab + TNNetSum + softmax over the key
+      // axis), so save/load just works -- no head-axis tensor, no new wiring.
+      // d_model must be divisible by Heads (d_k = d_model div Heads); requires
+      // SizeY=1. Q/K/V are per-token TNNetPointwiseConvLinear(d_model) projections
+      // (FullConnect would flatten the sequence -- see AddMultiHeadSelfAttention)
+      // and the heads are out-projected by a final TNNetPointwiseConvLinear(d_model).
+      // The per-head forget gates read the BLOCK INPUT x_t (not the Q/K/V
+      // projections). Returns the out-projection. Coded by Claude (AI).
+      function AddForgettingAttention(Heads, d_model: integer): TNNetLayer;
       // Multi-head Graph Attention (Velickovic et al. 2018, GAT) over a
       // (NumNodes,1,FeatureDim) node-feature tensor. There is NO head-axis
       // tensor in this tree, so multi-head GAT is built as Heads INDEPENDENT
@@ -20308,6 +20374,164 @@ begin
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetForgetGateBias }
+
+constructor TNNetForgetGateBias.Create();
+begin
+  inherited Create();
+  FF := TNNetVolume.Create();
+  FLogF := TNNetVolume.Create();
+end;
+
+destructor TNNetForgetGateBias.Destroy();
+begin
+  FLogF.Free;
+  FF.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetForgetGateBias.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  SeqLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetForgetGateBias requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  FFeatures := pPrevLayer.FOutput.Depth;
+  if FFeatures < 1 then
+    FErrorProc('TNNetForgetGateBias requires input Depth >= 1. Depth=' +
+      IntToStr(FFeatures));
+  SeqLen := pPrevLayer.FOutput.SizeX;
+  // Output is the additive decay-bias matrix D[X=key j, Y=query i, 1].
+  FOutput.ReSize(SeqLen, SeqLen, 1);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  FF.ReSize(SeqLen, 1, 1);
+  FLogF.ReSize(SeqLen, 1, 1);
+  // ONE weight neuron: w (FFeatures weights) + bias b, producing the scalar
+  // forget logit per position. Wired like a single-neuron FullConnect so it
+  // round-trips through the base per-neuron save/load and is stepped by the
+  // optimizer via UpdateWeights.
+  AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(FFeatures, 1, 1);
+  InitDefault();
+end;
+
+procedure TNNetForgetGateBias.Compute();
+var
+  StartTime: double;
+  SeqLen, t, i, j: integer;
+  Logit, FVal, RunF: TNeuralFloat;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  // 1) f_t = sigmoid(w . x_t + b) per position; prefix sum F_t = sum_{k<=t} ln f_k.
+  RunF := 0;
+  for t := 0 to SeqLen - 1 do
+  begin
+    // w . x_t is an AVX dot product over FFeatures (depth contiguous).
+    Logit := TNNetVolume.DotProduct(
+      FNeurons[0].FWeights.GetRawPtr(0, 0, 0), Prev.GetRawPtr(t, 0, 0),
+      FFeatures) + FNeurons[0].FBiasWeight;
+    FVal := Sigmoid(Logit);
+    FF.FData[t] := FVal;
+    RunF := RunF + Ln(FVal);
+    FLogF.FData[t] := RunF;
+  end;
+  // 2) D[j, i, 0] = F_i - F_j for j <= i (0 on diagonal); -1e9 for j > i so the
+  //    causal mask folds in for free (same additive sentinel as SDPA).
+  for i := 0 to SeqLen - 1 do
+  begin
+    for j := 0 to i do
+      FOutput[j, i, 0] := FLogF.FData[i] - FLogF.FData[j];
+    for j := i + 1 to SeqLen - 1 do
+      FOutput[j, i, 0] := -1e9;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetForgetGateBias.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, t, i, j, s: integer;
+  dF: array of TNeuralFloat;     // dL/dF_t (over the F prefix-sum nodes)
+  dLogf: array of TNeuralFloat;  // dL/d(ln f_t)
+  dLogit, FVal, RunSum: TNeuralFloat;
+  Prev, PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  SetLength(dF, SeqLen);
+  SetLength(dLogf, SeqLen);
+  // ---- adjoint over D[i,j]=F_i-F_j (j<=i): F_i appears with +1 in all D[i,j]
+  //      (j<=i) and -1 in all D[k,i] (k>=i). The upper triangle (j>i, the -1e9
+  //      mask sentinel) is a constant and carries NO gradient. Layout is
+  //      D[X=j, Y=i, 0]. ----
+  for i := 0 to SeqLen - 1 do
+  begin
+    dF[i] := 0;
+    for j := 0 to i do
+      dF[i] := dF[i] + FOutputError[j, i, 0];   // +F_i in D[i, j<=i]
+    for s := i to SeqLen - 1 do
+      dF[i] := dF[i] - FOutputError[i, s, 0];    // -F_i in D[k>=i, i]
+  end;
+  // ---- prefix sum: F_s = sum_{t<=s} ln f_t, so dL/d(ln f_t) = sum_{s>=t} dF_s.
+  //      Accumulate as a reverse running sum. ----
+  RunSum := 0;
+  for t := SeqLen - 1 downto 0 do
+  begin
+    RunSum := RunSum + dF[t];
+    dLogf[t] := RunSum;
+  end;
+  // ---- df_t = dL/d(ln f_t) / f_t; logit = w.x_t + b with f=sigmoid(logit),
+  //      so dL/dlogit = df_t * f_t*(1-f_t) = dLogf[t]*(1-f_t). Then
+  //      dw += dlogit * x_t, db += dlogit, dx_t += dlogit * w. ----
+  if FNeurons.Count > 0 then
+  begin
+    for t := 0 to SeqLen - 1 do
+    begin
+      FVal := FF.FData[t];
+      dLogit := dLogf[t] * (1.0 - FVal);
+      // weight grad: delta += -lr * dlogit * x_t (AVX MulAdd over FFeatures).
+      TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(0, 0, 0),
+        Prev.GetRawPtr(t, 0, 0), -FLearningRate * dLogit, FFeatures);
+      FNeurons[0].FBiasDelta := FNeurons[0].FBiasDelta +
+        (-FLearningRate) * dLogit;
+    end;
+    if (not FBatchUpdate) then
+    begin
+      FNeurons[0].UpdateWeights(FInertia);
+      AfterWeightUpdate();
+    end;
+  end;
+  // ---- gradient w.r.t the input x_t: dx_t += dlogit * w. ----
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) and
+     (FNeurons.Count > 0) then
+  begin
+    PrevErr := FPrevLayer.FOutputError;
+    for t := 0 to SeqLen - 1 do
+    begin
+      FVal := FF.FData[t];
+      dLogit := dLogf[t] * (1.0 - FVal);
+      if dLogit <> 0 then
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(t, 0, 0),
+          FNeurons[0].FWeights.GetRawPtr(0, 0, 0), dLogit, FFeatures);
+    end;
+  end;
+  SetLength(dF, 0);
+  SetLength(dLogf, 0);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -43785,6 +44009,76 @@ begin
       TNNetReshape.Create(PreviousSizeX, PreviousSizeY, d_model));
   SetLength(ScoreSlabs, 0);
   SetLength(WeightSlabs, 0);
+  SetLength(HeadOutputs, 0);
+end;
+
+function TNNet.AddForgettingAttention(Heads, d_model: integer): TNNetLayer;
+var
+  PreviousLayer, QGroup, KGroup, VGroup: TNNetLayer;
+  QHead, KHead, VHead, VTHead, ScoreHead, ForgetBias, WHead, OutHead: TNNetLayer;
+  PreviousDepth, PreviousSizeX, PreviousSizeY, d_k, HeadCnt: integer;
+  HeadOutputs: array of TNNetLayer;
+  InvSqrtDk: TNeuralFloat;
+begin
+  if Heads < 1 then
+    FErrorProc('AddForgettingAttention requires Heads >= 1. Heads=' +
+      IntToStr(Heads));
+  if (d_model mod Heads) <> 0 then
+    FErrorProc('AddForgettingAttention requires d_model divisible by Heads. ' +
+      'd_model=' + IntToStr(d_model) + ', Heads=' + IntToStr(Heads));
+  PreviousLayer := GetLastLayer();
+  PreviousDepth := PreviousLayer.Output.Depth;
+  PreviousSizeX := PreviousLayer.Output.SizeX;
+  PreviousSizeY := PreviousLayer.Output.SizeY;
+  if PreviousSizeY > 1 then
+    PreviousLayer := AddLayer(
+      TNNetReshape.Create(PreviousSizeX * PreviousSizeY, 1, PreviousDepth));
+  d_k := d_model div Heads;
+  InvSqrtDk := 1.0 / Sqrt(d_k);
+
+  // Per-token Q/K/V projections (PointwiseConvLinear = 1x1 conv; FullConnect
+  // would flatten the sequence axis -- see AddMultiHeadSelfAttention header).
+  QGroup := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), PreviousLayer);
+  KGroup := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), PreviousLayer);
+  VGroup := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), PreviousLayer);
+
+  SetLength(HeadOutputs, Heads);
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    QHead := AddLayerAfter(
+      TNNetSplitChannels.Create(HeadCnt * d_k, d_k), QGroup);
+    KHead := AddLayerAfter(
+      TNNetSplitChannels.Create(HeadCnt * d_k, d_k), KGroup);
+    // 1) Scaled logits as a real [X=key, Y=query, 1] graph tensor.
+    //    DotProducts(Q,K) -> [X=key, Y=1, D=query]; scale by 1/sqrt(d_k);
+    //    TransposeYD -> [key, query, 1].
+    ScoreHead := AddLayer(TNNetDotProducts.Create(QHead, KHead));
+    ScoreHead := AddLayer(TNNetMulByConstant.Create(InvSqrtDk));
+    ScoreHead := AddLayerAfter(TNNetTransposeYD.Create(), ScoreHead);
+    // 2) This head's data-dependent forget-gate decay bias D_h[key,query,1] read
+    //    from the BLOCK INPUT, then ADDED to the logits (folds the causal mask).
+    ForgetBias := AddLayerAfter(TNNetForgetGateBias.Create(), PreviousLayer);
+    WHead := AddLayer(TNNetSum.Create([ScoreHead, ForgetBias]));
+    // 3) Softmax over the KEY axis per query row: TransposeXD -> [1,query,key];
+    //    PointwiseSoftMax over Depth=key; TransposeXD back to [key,query,1].
+    WHead := AddLayerAfter(TNNetTransposeXD.Create(), WHead);
+    WHead := AddLayerAfter(TNNetPointwiseSoftMax.Create(), WHead);
+    WHead := AddLayerAfter(TNNetTransposeXD.Create(), WHead);
+    // 4) weights . V: back to [key,1,query] then DotProducts with V^T.
+    WHead := AddLayerAfter(TNNetTransposeYD.Create(), WHead);
+    VHead := AddLayerAfter(
+      TNNetSplitChannels.Create(HeadCnt * d_k, d_k), VGroup);
+    VTHead := AddLayerAfter(TNNetTransposeXD.Create(), VHead);
+    OutHead := AddLayer(TNNetDotProducts.Create(VTHead, WHead));
+    HeadOutputs[HeadCnt] := OutHead;
+  end;
+  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+
+  // Token-wise out-projection back to d_model.
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  if PreviousSizeY > 1 then
+    Result := AddLayer(
+      TNNetReshape.Create(PreviousSizeX, PreviousSizeY, d_model));
   SetLength(HeadOutputs, 0);
 end;
 
@@ -79334,6 +79628,7 @@ begin
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1);
+      'TNNetForgetGateBias' :       Result := TNNetForgetGateBias.Create();
       'TNNetModernHopfield' :       Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetInducedSetAttention' :  Result := TNNetInducedSetAttention.Create(St[0], St[1]);
       'TNNetAttentionPooling' :     Result := TNNetAttentionPooling.Create(St[0], St[1]);
@@ -79704,6 +79999,7 @@ begin
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1) else
+      if S[0] = 'TNNetForgetGateBias' then Result := TNNetForgetGateBias.Create() else
       if S[0] = 'TNNetModernHopfield' then Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetInducedSetAttention' then Result := TNNetInducedSetAttention.Create(St[0], St[1]) else
       if S[0] = 'TNNetAttentionPooling' then Result := TNNetAttentionPooling.Create(St[0], St[1]) else

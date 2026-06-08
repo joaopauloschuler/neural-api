@@ -766,6 +766,12 @@ type
     procedure TestTalkingHeadsAttentionShape;
     procedure TestTalkingHeadsAttentionInputGradientCheck;
     procedure TestTalkingHeadsAttentionSerializationRoundTrip;
+    procedure TestForgetGateBiasReferenceCheck;
+    procedure TestForgetGateBiasInputGradientCheck;
+    procedure TestForgetGateBiasWeightGradientCheck;
+    procedure TestForgetGateBiasSerializationRoundTrip;
+    procedure TestForgettingAttentionShape;
+    procedure TestForgettingAttentionInputGradientCheck;
     procedure TestCosineSimilarityAttentionForward;
     procedure TestCosineSimilarityAttentionGradientCheck;
     procedure TestCosineSimilarityAttentionCausalGradientCheck;
@@ -11101,6 +11107,395 @@ begin
     end;
   finally
     NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForgetGateBiasReferenceCheck;
+// Brute-force reference: the layer's emitted bias D[j,i,0] (lower triangle j<=i)
+// must equal F_i - F_j where F_t = sum_{k<=t} ln f_k and f_t = sigmoid(w.x_t+b).
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  FGB: TNNetForgetGateBias;
+  SeqLen, Feat, i, j, t, d: integer;
+  Logit, FVal, maxErr, refD: TNeuralFloat;
+  fRef, Fpre: array of TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 5; Feat := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Feat);
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Feat));
+    FGB := TNNetForgetGateBias.Create();
+    NN.AddLayer(FGB);
+    // Bounded distinct weights/bias and inputs.
+    for i := 0 to FGB.Neurons[0].Weights.Size - 1 do
+      FGB.Neurons[0].Weights.Raw[i] := 0.4 * Sin(i * 1.1 + 0.3);
+    FGB.Neurons[0].BiasWeight := 0.2;
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.1;
+    NN.Compute(Input);
+
+    // Reference f_t and prefix sum F_t.
+    SetLength(fRef, SeqLen);
+    SetLength(Fpre, SeqLen);
+    for t := 0 to SeqLen - 1 do
+    begin
+      Logit := FGB.Neurons[0].BiasWeight;
+      for d := 0 to Feat - 1 do
+        Logit := Logit + FGB.Neurons[0].Weights.Raw[d] * Input[t, 0, d];
+      FVal := 1.0 / (1.0 + Exp(-Logit));
+      fRef[t] := FVal;
+      if t = 0 then Fpre[t] := Ln(FVal) else Fpre[t] := Fpre[t - 1] + Ln(FVal);
+    end;
+    for i := 0 to SeqLen - 1 do
+      for j := 0 to i do
+      begin
+        refD := Fpre[i] - Fpre[j];
+        maxErr := Max(maxErr, Abs(FGB.Output[j, i, 0] - refD));
+      end;
+    AssertTrue('ForgetGateBias D matches sum-of-logs (maxErr=' +
+      FloatToStr(maxErr) + ')', maxErr < 1e-5);
+    // Diagonal must be exactly 0; strict upper triangle the -1e9 sentinel.
+    for i := 0 to SeqLen - 1 do
+      AssertTrue('ForgetGateBias diagonal is 0',
+        Abs(FGB.Output[i, i, 0]) < 1e-6);
+    AssertTrue('ForgetGateBias upper triangle masked',
+      FGB.Output[SeqLen - 1, 0, 0] < -1e8);
+    WriteLn('  ForgetGateBias reference max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForgetGateBiasInputGradientCheck;
+// FD vs analytic input gradient. Loss is taken ONLY over the strictly-lower-
+// triangular + diagonal region (j<=i); the -1e9 upper triangle is constant and
+// carries no gradient, so we never differentiate through it.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  SeqLen, Feat, i, ii, jj: integer;
+  epsilon, numericalGrad, analyticalGrad, maxErr, lossPlus, lossMinus: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var a, b: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for a := 0 to SeqLen - 1 do      // query i = Y
+      for b := 0 to a do             // key j = X, j<=a
+      begin
+        diff := NN.GetLastLayer.Output[b, a, 0] - Desired[b, a, 0];
+        Result := Result + 0.5 * diff * diff;
+      end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 4; Feat := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Feat);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, Feat);
+  Desired := TNNetVolume.Create(SeqLen, SeqLen, 1);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Feat, 1));
+    NN.AddLayer(TNNetForgetGateBias.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.1;
+    // Non-trivial targets over the lower triangle; upper triangle set to the
+    // -1e9 mask sentinel so the standard NN.Backpropagate sees ZERO error there
+    // (no gradient flows through the constant masked region).
+    NN.Compute(Input);
+    for ii := 0 to SeqLen - 1 do
+    begin
+      for jj := 0 to ii do
+        Desired[jj, ii, 0] := 0.1 * Sin(ii * 0.5 - jj * 0.7);
+      for jj := ii + 1 to SeqLen - 1 do
+        Desired[jj, ii, 0] := NN.GetLastLayer.Output[jj, ii, 0];
+    end;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ForgetGateBias input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  ForgetGateBias input gradient max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForgetGateBiasWeightGradientCheck;
+// FD vs analytic gradient on the gate weights w and bias b (lower-triangle loss).
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  FGB: TNNetForgetGateBias;
+  SeqLen, Feat, i, ii, jj, w: integer;
+  epsilon, numericalGrad, analyticalGrad, maxErr, lossPlus, lossMinus: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var a, b: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for a := 0 to SeqLen - 1 do
+      for b := 0 to a do
+      begin
+        diff := NN.GetLastLayer.Output[b, a, 0] - Desired[b, a, 0];
+        Result := Result + 0.5 * diff * diff;
+      end;
+  end;
+
+  procedure DoBackward();
+  begin
+    NN.Compute(Input);
+    FGB.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 5; Feat := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Feat);
+  Desired := TNNetVolume.Create(SeqLen, SeqLen, 1);
+  // epsilon kept large enough to lift the central-difference signal above the
+  // FP32 catastrophic-cancellation floor of the squared-error loss (do NOT
+  // loosen the tolerance; weights/inputs are bounded small instead).
+  epsilon := 0.001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Feat));
+    FGB := TNNetForgetGateBias.Create();
+    NN.AddLayer(FGB);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.3 + 0.05;
+    for i := 0 to FGB.Neurons[0].Weights.Size - 1 do
+      FGB.Neurons[0].Weights.Raw[i] := 0.2 * Sin(i * 1.1 + 0.3);
+    FGB.Neurons[0].BiasWeight := 0.1;
+    // Lower triangle = real targets; upper triangle = mask sentinel so the
+    // masked region contributes zero error/gradient under NN.Backpropagate.
+    NN.Compute(Input);
+    for ii := 0 to SeqLen - 1 do
+    begin
+      for jj := 0 to ii do
+        Desired[jj, ii, 0] := 0.1 * Sin(ii * 0.5 - jj * 0.7);
+      for jj := ii + 1 to SeqLen - 1 do
+        Desired[jj, ii, 0] := NN.GetLastLayer.Output[jj, ii, 0];
+    end;
+
+    // Weights.
+    for w := 0 to FGB.Neurons[0].Weights.Size - 1 do
+    begin
+      FGB.Neurons[0].Weights.Raw[w] := FGB.Neurons[0].Weights.Raw[w] + epsilon;
+      lossPlus := ComputeLoss();
+      FGB.Neurons[0].Weights.Raw[w] := FGB.Neurons[0].Weights.Raw[w] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      FGB.Neurons[0].Weights.Raw[w] := FGB.Neurons[0].Weights.Raw[w] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      DoBackward();
+      analyticalGrad := -FGB.Neurons[0].Delta.Raw[w]; // LR=1 => grad = -Delta
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ForgetGateBias weight grad w=' + IntToStr(w) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    // Bias.
+    FGB.Neurons[0].BiasWeight := FGB.Neurons[0].BiasWeight + epsilon;
+    lossPlus := ComputeLoss();
+    FGB.Neurons[0].BiasWeight := FGB.Neurons[0].BiasWeight - 2 * epsilon;
+    lossMinus := ComputeLoss();
+    FGB.Neurons[0].BiasWeight := FGB.Neurons[0].BiasWeight + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+    DoBackward();
+    analyticalGrad := -FGB.Neurons[0].BiasDelta;
+    maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+    AssertTrue('ForgetGateBias bias grad num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+    WriteLn('  ForgetGateBias weight gradient max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForgetGateBiasSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, SeqLen, Feat: integer;
+  maxDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 4; Feat := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Feat);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Feat));
+    NN.AddLayer(TNNetForgetGateBias.Create());
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.9) * 0.8;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ForgetGateBias SaveToString round-trip equality', Saved, Saved2);
+      AssertTrue('ForgetGateBias loaded layer is correct class',
+        NN2.GetLastLayer is TNNetForgetGateBias);
+      NN2.Compute(Input);
+      maxDiff := 0;
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        maxDiff := Max(maxDiff,
+          Abs(NN.GetLastLayer.Output.Raw[i] - NN2.GetLastLayer.Output.Raw[i]));
+      AssertTrue('ForgetGateBias loaded net reproduces forward (maxDiff=' +
+        FloatToStr(maxDiff) + ')', maxDiff < 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForgettingAttentionShape;
+// AddForgettingAttention (Heads=2, d_model=4) over (SeqLen,1,d_in) must preserve
+// the (SeqLen,1,d_model) shape, wire one ForgetGateBias per head, and train.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i, SeqLen, fgbCnt, smaxCnt: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 4);
+  Desired := TNNetVolume.Create(SeqLen, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 4));
+    NN.AddForgettingAttention(2, 4);
+    NN.SetLearningRate(0.01, 0.0);
+
+    AssertEquals('Forgetting output SizeX preserved', SeqLen,
+      NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Forgetting output Depth preserved', 4,
+      NN.GetLastLayer.Output.Depth);
+    AssertTrue('Forgetting last layer is out-projection',
+      NN.GetLastLayer is TNNetPointwiseConvLinear);
+
+    fgbCnt := 0; smaxCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+    begin
+      if NN.Layers[i] is TNNetForgetGateBias then Inc(fgbCnt);
+      if NN.Layers[i] is TNNetPointwiseSoftMax then Inc(smaxCnt);
+    end;
+    AssertEquals('Forgetting one forget-gate per head', 2, fgbCnt);
+    AssertEquals('Forgetting one softmax per head', 2, smaxCnt);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 1.1);
+      Desired.Raw[i] := Cos(i * 0.6) * 0.4;
+    end;
+    NN.Compute(Input);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 299 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('Forgetting training reduces loss (' + FloatToStr(LossBefore) +
+      ' -> ' + FloatToStr(LossAfter) + ')', LossAfter < LossBefore);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForgettingAttentionInputGradientCheck;
+// End-to-end FD input-gradient check on the AddForgettingAttention composite
+// (validates the ForgetGateBias backward chains through the Sum + softmax path).
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  InputPlus := TNNetVolume.Create(3, 1, 4);
+  Desired := TNNetVolume.Create(3, 1, 4);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddForgettingAttention(2, 4);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('Forgetting input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  ForgettingAttention input gradient max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
   end;
 end;
 
