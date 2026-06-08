@@ -227,6 +227,21 @@ rather than acted on.
 - [ ] Forward-Forward follow-up: deeper FF stack (4+ layers) — does
       accumulated-goodness accuracy keep improving with depth, or does the
       length-normalised signal saturate?
+- [ ] Predictive Coding Network experiment (`examples/PredictiveCoding/`) — a
+      backprop-free, biologically-plausible learning paradigm distinct from the
+      landed Forward-Forward (examples/ForwardForward/). Build a small MLP where
+      each layer carries an explicit value node + a local prediction-error node;
+      training alternates (a) an inference relaxation that iteratively settles the
+      value nodes to minimise summed squared prediction error (a few fixed-point
+      sweeps, top node clamped to the label), then (b) a purely *local* Hebbian-
+      style weight update using only the adjacent layer's settled error — no global
+      backward pass through the chain. Reuse existing TNNetVolume math + a custom
+      training loop (no core-layer changes needed, mirroring the FF/LotteryTicket
+      example structure). Headline to land: on a tiny synthetic/few-class task the
+      PCN matches a backprop MLP of the same shape within the <5-min CPU budget,
+      and the per-layer error energy demonstrably decreases over inference sweeps.
+      Distinct from backprop AND from FF's per-layer goodness objective; fills the
+      "alternative learning rules" gap alongside Forward-Forward.
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
 - [ ] Neural ODE follow-ups (builder `TNNet.AddNeuralODEBlock` + `examples/NeuralODE/`
       landed 2026-05-31, Euler-only, trains via stored-activation backprop through the
