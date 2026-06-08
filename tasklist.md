@@ -72,30 +72,15 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] `TNNetHolographicBinding` — a Holographic Reduced Representation (HRR)
-      vector-symbolic binding layer, the associative-binding sibling of the
-      exotic-algebra family (Complex / Quaternion / Octonion / Tropical /
-      Hyperbolic). It takes two equal-length Depth vectors `a` and `b` (packed
-      as adjacent halves of the input, like TNNetComplexLinear treats Re/Im) and
-      outputs their **circular convolution** `c = a ⊛ b` (`c[k] = Σ_j a[j]·b[(k-j) mod n]`),
-      the HRR *bind* operator that superposes/composes role–filler pairs into one
-      fixed-width trace. Why it is genuinely new (not a near-duplicate): nothing
-      in the repo does cyclic n-point convolution as a binding op — TNNetFourierMix /
-      FourierMixFFT do a learned spectral *mixing* of one tensor, not a bilinear
-      bind of two; circular convolution is exactly pointwise multiply in the DFT
-      domain, so the forward can reuse the verified FourierMixFFT FFT path
-      (FFT a, FFT b, complex-multiply, inverse-FFT) and the backward is the
-      classic correlation adjoint (`dL/da = dL/dc ⊛ involution(b)`,
-      symmetric for b), giving a cheap exact gradient. Ship it with an optional
-      `Unbind` flag (circular *correlation* `a ⊛ involution(b)`, the approximate
-      inverse used to query a bound trace) and the standard trio: forward,
-      numerical-gradient + serialization tests in tests/TestNeuralNumerical.pas,
-      and an `examples/HolographicMemory/` cleanup-memory demo that binds several
-      key→value pairs into ONE trace, unbinds by key, and shows nearest-codebook
-      recall accuracy degrade gracefully as more pairs are superposed (the HRR
-      capacity curve). Natural follow-ups: a learnable per-channel permutation
-      "protect" vector, and a `TNNet.AddHRRMemory` builder that pairs binding with
-      a TNNetVectorQuantizer codebook for discrete cleanup.
+- [ ] `TNNetHolographicBinding` follow-ups — the HRR vector-symbolic binding
+      layer LANDED (bind = circular convolution, optional `Unbind` = circular
+      correlation, weightless, exact bilinear backward, FStruct[6] flag;
+      forward/grad/unbind-grad/serialization tests + examples/HolographicMemory
+      capacity-curve demo all in). Still open: an optional FFT forward path
+      (pointwise-multiply in the DFT domain via the FourierMixFFT machinery) for
+      large n; a learnable per-channel permutation "protect" vector; and a
+      `TNNet.AddHRRMemory` builder pairing binding with a TNNetVectorQuantizer
+      codebook for discrete cleanup.
 - [ ] TNNetTensorTrain follow-ups (the layer + numerical-gradient/serialization
       tests in tests/TestNeuralNumerical.pas + examples/TensorTrainLinear/ all
       LANDED 2026-06-07 on a2, commit c78edd0; default d=2 auto-factored cores,

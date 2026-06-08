@@ -174,6 +174,11 @@ type
     procedure TestComplexLinearGradientCheck;
     procedure TestComplexLinearShape;
     procedure TestComplexLinearSerializationRoundTrip;
+    // TNNetHolographicBinding HRR circular-convolution binding layer
+    procedure TestHolographicBindingForwardKnownValue;
+    procedure TestHolographicBindingGradientCheck;
+    procedure TestHolographicBindingUnbindGradientCheck;
+    procedure TestHolographicBindingSerializationRoundTrip;
     // TNNetQuaternionLinear hypercomplex dense layer
     procedure TestQuaternionLinearGradientCheck;
     procedure TestQuaternionLinearSerializationRoundTrip;
@@ -44438,6 +44443,252 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHolographicBindingForwardKnownValue;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  HB: TNNetHolographicBinding;
+  a, b: array[0..2] of TNeuralFloat;
+  expConv, expCorr: array[0..2] of TNeuralFloat;
+  k, j, n, idx: integer;
+begin
+  // n=3. Verify both BIND (circular convolution) and UNBIND (circular
+  // correlation) against an independent direct reference computation.
+  n := 3;
+  a[0] := 1.0; a[1] := 2.0; a[2] := -0.5;
+  b[0] := 0.3; b[1] := -1.0; b[2] := 0.7;
+  // reference: conv c[k]=sum_j a[j]*b[(k-j) mod n]; corr c[k]=sum_j a[j]*b[(j-k) mod n]
+  for k := 0 to n - 1 do
+  begin
+    expConv[k] := 0; expCorr[k] := 0;
+    for j := 0 to n - 1 do
+    begin
+      idx := ((k - j) mod n + n) mod n;
+      expConv[k] := expConv[k] + a[j] * b[idx];
+      idx := ((j - k) mod n + n) mod n;
+      expCorr[k] := expCorr[k] + a[j] * b[idx];
+    end;
+  end;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 2 * n);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 2 * n, 1));
+    HB := TNNetHolographicBinding.Create(0); // bind
+    NN.AddLayer(HB);
+    for j := 0 to n - 1 do begin Input.Raw[j] := a[j]; Input.Raw[n + j] := b[j]; end;
+    AssertEquals('HolographicBinding output Depth = n', n, HB.Output.Size);
+    NN.Compute(Input);
+    for k := 0 to n - 1 do
+      AssertEquals('HolographicBinding bind c[' + IntToStr(k) + ']',
+        expConv[k], NN.GetLastLayer.Output.Raw[k], 1e-6);
+  finally
+    NN.Free; Input.Free;
+  end;
+
+  // unbind
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 2 * n);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 2 * n, 1));
+    HB := TNNetHolographicBinding.Create(1); // unbind
+    NN.AddLayer(HB);
+    for j := 0 to n - 1 do begin Input.Raw[j] := a[j]; Input.Raw[n + j] := b[j]; end;
+    NN.Compute(Input);
+    for k := 0 to n - 1 do
+      AssertEquals('HolographicBinding unbind c[' + IntToStr(k) + ']',
+        expCorr[k], NN.GetLastLayer.Output.Raw[k], 1e-6);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHolographicBindingGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  HB: TNNetHolographicBinding;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n, InSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var p: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for p := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[p] - Desired.Raw[p];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Finite-difference vs analytic INPUT gradient for BIND mode. Bilinear, so it
+  // matches FD tightly; inputs are bounded to keep FD truncation small.
+  RandSeed := 424242;
+  n := 4; InSize := 2 * n;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, InSize);
+  InputPlus := TNNetVolume.Create(1, 1, InSize);
+  Desired := TNNetVolume.Create(1, 1, n);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, InSize, 1)); // pError=1: see memory note
+    HB := TNNetHolographicBinding.Create(0);
+    NN.AddLayer(HB);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.5 + 0.1;
+    for i := 0 to n - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.4;
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('HolographicBinding bind input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  HolographicBinding bind gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHolographicBindingUnbindGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  HB: TNNetHolographicBinding;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, n, InSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var p: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for p := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[p] - Desired.Raw[p];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Same FD vs analytic INPUT gradient check for UNBIND mode (circular
+  // correlation), whose backward differs from bind -- verifies it independently.
+  RandSeed := 424242;
+  n := 4; InSize := 2 * n;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, InSize);
+  InputPlus := TNNetVolume.Create(1, 1, InSize);
+  Desired := TNNetVolume.Create(1, 1, n);
+  epsilon := 0.0001; maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, InSize, 1));
+    HB := TNNetHolographicBinding.Create(1); // unbind
+    NN.AddLayer(HB);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Cos(i * 0.6) * 0.5 - 0.05;
+    for i := 0 to n - 1 do
+      Desired.Raw[i] := Sin(i * 0.4) * 0.4;
+
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+
+      AssertTrue('HolographicBinding unbind input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  HolographicBinding unbind gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestHolographicBindingSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  HB: TNNetHolographicBinding;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, n, InSize: integer;
+begin
+  // HolographicBinding in the MIDDLE of a net with the NON-DEFAULT unbind flag:
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical, the
+  // unbind flag must round-trip, and Compute must match.
+  RandSeed := 424242;
+  n := 4; InSize := 2 * n;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, InSize);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, InSize, 1));
+    HB := TNNetHolographicBinding.Create(1); // non-default unbind mode
+    NN.AddLayer(HB);
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.1 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('HolographicBinding SaveToString round-trip byte-identical',
+        Saved, Saved2);
+      AssertTrue('HolographicBinding token present in serialized string',
+        Pos('TNNetHolographicBinding', Saved) > 0);
+      AssertEquals('HolographicBinding unbind flag round-trips', 1,
+        (NN2.Layers[1] as TNNetHolographicBinding).Unbind);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('HolographicBinding Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free;
   end;
 end;
 

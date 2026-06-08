@@ -7178,6 +7178,40 @@ type
     property OutComplex: integer read FOutComplex;
   end;
 
+  /// HOLOGRAPHIC REDUCED REPRESENTATION (HRR) vector-symbolic BINDING layer --
+  /// the associative-binding sibling of the exotic-algebra family (Complex /
+  /// Quaternion / Octonion / Tropical / Hyperbolic). It reads two equal-length
+  /// Depth vectors a and b packed as adjacent halves of the input (input Depth
+  /// must be even = 2n; first n channels = a, last n = b, mirroring how
+  /// TNNetComplexLinear treats adjacent Re/Im pairs) and outputs (Depth = n):
+  ///   BIND   (default): the circular CONVOLUTION  c = a (*) b,
+  ///                     c[k] = sum_j a[j]*b[(k-j) mod n]
+  ///   UNBIND (Unbind=1): the circular CORRELATION c = a (*) involution(b),
+  ///                     c[k] = sum_j a[j]*b[(j-k) mod n]
+  /// Bind superposes/composes role-filler pairs into one fixed-width trace; the
+  /// sum of several binds is a single noisy memory and unbind by a key recovers
+  /// an approximate copy of its bound value (the HRR query/inverse). Genuinely
+  /// new here: nothing else does cyclic n-point convolution as a bilinear bind of
+  /// TWO tensors (TNNetFourierMix / FourierMixFFT do a learned spectral mixing of
+  /// ONE tensor). This layer has NO trainable weights. The Unbind flag round-trips
+  /// via FStruct[6]. Forward is a direct O(n^2) cyclic sum (n is small in
+  /// practice); the exact bilinear backward packs (da|db) into the same 2n layout.
+  // Coded by Claude (AI).
+  TNNetHolographicBinding = class(TNNetLayer)
+  private
+    FN: integer;        // half the input Depth (vector length n)
+    FUnbind: integer;   // 0 = bind (convolution), 1 = unbind (correlation)
+    procedure ComputeCPU();
+    procedure ComputePreviousLayerErrorCPU();
+  public
+    constructor Create(pUnbind: integer = 0); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property N: integer read FN;
+    property Unbind: integer read FUnbind;
+  end;
+
   // EXACTLY-ORTHOGONAL dense (linear) layer. The n x n weight is parameterized
   // as a product of K Householder reflections
   //     Q = H_1 * H_2 * ... * H_K,   H_i = I - 2 * (v_i v_i^T) / (v_i^T v_i),
@@ -46696,6 +46730,140 @@ begin
   end;
 end;
 
+{ TNNetHolographicBinding }
+
+constructor TNNetHolographicBinding.Create(pUnbind: integer = 0);
+begin
+  inherited Create();
+  if pUnbind <> 0 then FUnbind := 1 else FUnbind := 0;
+  FStruct[6] := FUnbind;
+  // No trainable weights: drop the default neuron the base ctor may have added.
+  while FNeurons.Count > 0 do
+    FNeurons.Delete(FNeurons.Count - 1);
+  BuildArrNeurons();
+end;
+
+procedure TNNetHolographicBinding.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  InSize: integer;
+begin
+  FPrevLayer := pPrevLayer;
+  InSize := pPrevLayer.Output.Size;
+  if (InSize <= 0) or (InSize mod 2 <> 0) then
+    FErrorProc
+    (
+      'TNNetHolographicBinding requires an even, non-empty input Depth ' +
+      '(2n: first n = a, last n = b). Got ' + IntToStr(InSize) + '.'
+    );
+  FN := InSize div 2;
+  FOutput.ReSize(1, 1, FN);
+  FOutputError.ReSize(1, 1, FN);
+  FOutputErrorDeriv.ReSize(1, 1, FN);
+end;
+
+procedure TNNetHolographicBinding.Compute();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  ComputeCPU();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Forward. a = PrevOut[0..n-1], b = PrevOut[n..2n-1].
+//   BIND   : c[k] = sum_j a[j] * b[(k-j) mod n]      (circular convolution)
+//   UNBIND : c[k] = sum_j a[j] * b[(j-k) mod n]      (circular correlation)
+procedure TNNetHolographicBinding.ComputeCPU();
+var
+  k, j, idx, vn: integer;
+  acc: TNeuralFloat;
+  PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  vn := FN;
+  for k := 0 to vn - 1 do
+  begin
+    acc := 0;
+    for j := 0 to vn - 1 do
+    begin
+      if FUnbind = 0 then
+        idx := ((k - j) mod vn + vn) mod vn   // (k - j) mod vn
+      else
+        idx := ((j - k) mod vn + vn) mod vn;  // (j - k) mod vn
+      acc := acc + PrevOut.FData[j] * PrevOut.FData[vn + idx];
+    end;
+    FOutput.FData[k] := acc;
+  end;
+end;
+
+procedure TNNetHolographicBinding.Backpropagate();
+var
+  StartTime: double;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    ComputePreviousLayerErrorCPU();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+// Exact bilinear backward. Let e[k] = dL/dc[k]. Both modes are bilinear in
+// (a, b), so each input gradient is the same kind of cyclic sum.
+//   BIND  c[k] = sum_j a[j] b[(k-j) mod n]:
+//     dL/da[j] = sum_k e[k] b[(k-j) mod n]    (correlation of e with b)
+//     dL/db[m] = sum_k e[k] a[(k-m) mod n]    (correlation of e with a)
+//   UNBIND c[k] = sum_j a[j] b[(j-k) mod n]:
+//     dL/da[j] = sum_k e[k] b[(j-k) mod n]
+//     dL/db[m] = sum_k e[k] a[(m+k) mod n]
+// Input gradient is packed into the same 2n layout (first n = da, last n = db).
+procedure TNNetHolographicBinding.ComputePreviousLayerErrorCPU();
+var
+  k, j, m, idx, vn: integer;
+  e, daj, dbm: TNeuralFloat;
+  PrevOut, PrevErr: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.OutputError;
+  vn := FN;
+  // da
+  for j := 0 to vn - 1 do
+  begin
+    daj := 0;
+    for k := 0 to vn - 1 do
+    begin
+      e := FOutputError.FData[k];
+      if e = 0 then continue;
+      if FUnbind = 0 then
+        idx := ((k - j) mod vn + vn) mod vn
+      else
+        idx := ((j - k) mod vn + vn) mod vn;
+      daj := daj + e * PrevOut.FData[vn + idx];
+    end;
+    PrevErr.FData[j] := PrevErr.FData[j] + daj;
+  end;
+  // db
+  for m := 0 to vn - 1 do
+  begin
+    dbm := 0;
+    for k := 0 to vn - 1 do
+    begin
+      e := FOutputError.FData[k];
+      if e = 0 then continue;
+      if FUnbind = 0 then
+        idx := ((k - m) mod vn + vn) mod vn   // a[(k-m) mod vn]
+      else
+        idx := ((m + k) mod vn) mod vn;      // a[(m+k) mod vn]
+      dbm := dbm + e * PrevOut.FData[idx];
+    end;
+    PrevErr.FData[vn + m] := PrevErr.FData[vn + m] + dbm;
+  end;
+end;
+
 { TNNetComplexLinear }
 
 // Complex multiplication table, the 2-D base rung of the same Cayley-Dickson
@@ -79682,6 +79850,7 @@ begin
       'TNNetBitLinear' :            Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetCirculantLinear' :      Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]);
       'TNNetComplexLinear' :        Result := TNNetComplexLinear.Create(St[0], St[3]);
+      'TNNetHolographicBinding' :   Result := TNNetHolographicBinding.Create(St[6]);
       'TNNetQuaternionLinear' :     Result := TNNetQuaternionLinear.Create(St[0], St[3]);
       'TNNetOctonionLinear' :       Result := TNNetOctonionLinear.Create(St[0], St[3]);
       'TNNetSpectralConv1D' :       Result := TNNetSpectralConv1D.Create(St[0], St[5]);
@@ -80055,6 +80224,7 @@ begin
       if S[0] = 'TNNetBitLinear' then Result := TNNetBitLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetCirculantLinear' then Result := TNNetCirculantLinear.Create(St[0], St[1], St[2], St[3]) else
       if S[0] = 'TNNetComplexLinear' then Result := TNNetComplexLinear.Create(St[0], St[3]) else
+      if S[0] = 'TNNetHolographicBinding' then Result := TNNetHolographicBinding.Create(St[6]) else
       if S[0] = 'TNNetQuaternionLinear' then Result := TNNetQuaternionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetOctonionLinear' then Result := TNNetOctonionLinear.Create(St[0], St[3]) else
       if S[0] = 'TNNetSpectralConv1D' then Result := TNNetSpectralConv1D.Create(St[0], St[5]) else
