@@ -59,6 +59,14 @@ const
   csXor = 17;    // NextState[Base] := State[Op1] xor State[Op2];
   csInj = 18;    // NextState[Base] := State[Op1];
   csNot = 19;    // NextState[BASE] := not(PreviousState[BASE])
+  csShl = 20;    // NextState[Base] := (State[Op1] shl (State[Op2] and 7)) and 255;
+  csShr = 21;    // NextState[Base] := State[Op1] shr (State[Op2] and 7);
+  csMin = 22;    // NextState[Base] := min(State[Op1], State[Op2]);
+  csMax = 23;    // NextState[Base] := max(State[Op1], State[Op2]);
+  csAddS = 24;   // NextState[Base] := EnsureRange(State[Op1] + State[Op2], 0, 255); (saturating)
+  csSubS = 25;   // NextState[Base] := EnsureRange(State[Op1] - State[Op2], 0, 255); (saturating)
+  csAbsDiff = 26;// NextState[Base] := abs(Integer(State[Op1]) - Integer(State[Op2]));
+  csAvg = 27;    // NextState[Base] := (State[Op1] + State[Op2]) div 2;
 
 // An Operation type contains: an operation, 2 operands and boolean operand modifiers.
 type
@@ -108,7 +116,7 @@ function CreateValidBinaryTest(Val1, Val2: byte; pOp1, pOp2: integer; RelOp1, Re
 
 // number of available operations
 const
-  csMaxOperations = 20;
+  csMaxOperations = 28;
 
 // this array maps OpCode into its string representation
 const
@@ -116,7 +124,9 @@ const
     //0    1   2    3    4   5   6   7      8     9     10  11  12  13    14
     ('nop', '=', '=', '<>', '>', '<', 'V', ' := ', 'inc', 'dec', '+', '-', '*', 'div', 'mod',
     //15    16   17    18    19
-    'and', 'or', 'xor', 'inj', 'not');
+    'and', 'or', 'xor', 'inj', 'not',
+    //20    21    22     23     24    25    26      27
+    'shl', 'shr', 'min', 'max', '+s', '-s', 'absd', 'avg');
 
 // this type represents sets of operations
 type
@@ -131,11 +141,13 @@ const
   FirstImediatSet: TOperationSet = [csEqual];
 
   StateOperationSet: TOperationSet =
-    [csInc, csDec, csAdd, csSub, csMul, csDiv, csMod, csAnd, csXor, csOr, csNot, csInj];
+    [csInc, csDec, csAdd, csSub, csMul, csDiv, csMod, csAnd, csXor, csOr, csNot, csInj,
+    csShl, csShr, csMin, csMax, csAddS, csSubS, csAbsDiff, csAvg];
 
   BinaryOperationSet: TOperationSet =
     [csAdd, csSub, csMul, csDiv, csMod, csAnd, csXor, csOr, csEqual, csEqualM,
-    csDifer, csGreater, csLesser];
+    csDifer, csGreater, csLesser,
+    csShl, csShr, csMin, csMax, csAddS, csSubS, csAbsDiff, csAvg];
 
   NoArgSet: TOperationSet = [csInc, csDec, csNot, csInj];
 
@@ -677,8 +689,9 @@ end;
 const
   csUnitaryTests: array [0..0] of byte = (csEqual);
   csBinaryTests: array [0..3] of byte = (csEqualM, csDifer, csGreater, csLesser);
-  csBinaryOperations: array[0..7] of byte =
-    (csAdd, csSub, csMul, csDiv, csMod, csAnd, csXor, csOr);
+  csBinaryOperations: array[0..15] of byte =
+    (csAdd, csSub, csMul, csDiv, csMod, csAnd, csXor, csOr,
+    csShl, csShr, csMin, csMax, csAddS, csSubS, csAbsDiff, csAvg);
 
 function GetRandom2DDist(FeatureSize: byte): integer;
 begin
@@ -1153,6 +1166,14 @@ begin
       csXor:      NextState:=(Operand1Value xor Operand2Value) and 255{$R+};
       csInj:      NextState:=CurrentStates[BasePosition];
       csNot:      NextState:=not(CurrentStates[BasePosition]);
+      csShl:      {$R-}NextState:=(Operand1Value shl (Operand2Value and 7)) and 255{$R+};
+      csShr:      NextState:=Operand1Value shr (Operand2Value and 7);
+      csMin:      NextState:=Min(Operand1Value, Operand2Value);
+      csMax:      NextState:=Max(Operand1Value, Operand2Value);
+      csAddS:     {$R-}NextState:=EnsureRange(Operand1Value+Operand2Value, 0, 255){$R+};
+      csSubS:     {$R-}NextState:=EnsureRange(Operand1Value-Operand2Value, 0, 255){$R+};
+      csAbsDiff:  NextState:=Abs(Integer(Operand1Value)-Integer(Operand2Value));
+      csAvg:      NextState:=(Operand1Value+Operand2Value) div 2;
     else
       writeln('ERROR: invalid operation code:',Oper.OpCode);
     end;

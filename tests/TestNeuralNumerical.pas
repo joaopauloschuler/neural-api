@@ -5,7 +5,8 @@ unit TestNeuralNumerical;
 interface
 
 uses
-  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
+  neuralabfun;
 
 type
   TTestNeuralNumerical = class(TTestCase)
@@ -1142,6 +1143,7 @@ type
     procedure TestBlurPoolShiftInvariance;
     procedure TestPointwiseByteProcessingSerializationRoundTrip;
     procedure TestPointwiseByteProcessingTrainedRoundTrip;
+    procedure TestByteEngineNewBinaryOps;
     procedure TestBitProcessingShapeAndRoundTrip;
     procedure TestBitProcessingClippingGradient;
     procedure TestBitProcessingSerializationRoundTrip;
@@ -42536,6 +42538,61 @@ begin
   finally
     L.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestByteEngineNewBinaryOps;
+// Focused unit test for the 8 new binary state-vs-state opcodes added to the
+// symbolic byte engine (neuralabfun.pas): csShl..csAvg (opcodes 20..27).
+// Sets up a TRunOperation with a known CurrentStates vector, then runs each
+// op as State[Op1] (op) State[Op2] -> NextState and checks the exact byte,
+// including saturation/wrap-free corner cases.
+var
+  Engine: TRunOperation;
+  CS: TCreateOperationSettings;
+  States: array[0..7] of byte;
+  Actions: array[0..7] of byte;
+  NextStates: array[0..7] of byte;
+  Outv: byte;
+  i: integer;
+
+  procedure RunOp(OpCode: byte; P1, P2: integer; Expected: byte; const Name: string);
+  var
+    Op: TOperation;
+  begin
+    Op := CreateOperation(OpCode, P1, P2, False, False, False);
+    Outv := 0;
+    Engine.OperateAndTestOperation(Op, 0, Outv);
+    AssertEquals('byte engine ' + Name + ' (pos ' + IntToStr(P1) + ',' +
+      IntToStr(P2) + ')', Expected, Outv);
+  end;
+
+begin
+  // index:  0  1  2    3    4   5   6    7
+  States[0] := 1;
+  States[1] := 3;
+  States[2] := 8;
+  States[3] := 200;
+  States[4] := 100;
+  States[5] := 50;
+  States[6] := 80;
+  States[7] := 150;
+  for i := 0 to 7 do
+  begin
+    Actions[i] := States[i];
+    NextStates[i] := 0;
+  end;
+
+  CS := csCreateOpDefault;
+  Engine.Load(CS, Actions, States, NextStates);
+
+  RunOp(csShl,     0, 1, 8,   'shl  (1 shl 3)');        // 1 shl 3 = 8
+  RunOp(csShr,     2, 1, 1,   'shr  (8 shr 3)');        // 8 shr 3 = 1
+  RunOp(csMin,     3, 4, 100, 'min(200,100)');
+  RunOp(csMax,     3, 4, 200, 'max(200,100)');
+  RunOp(csAddS,    3, 4, 255, 'addS sat (200+100)');    // clamp, no wrap
+  RunOp(csSubS,    5, 4, 0,   'subS sat (50-100)');     // clamp at 0
+  RunOp(csAbsDiff, 5, 6, 30,  'absDiff |50-80|');
+  RunOp(csAvg,     3, 4, 150, 'avg (200+100) div 2');
 end;
 
 procedure TTestNeuralNumerical.TestPointwiseByteProcessingTrainedRoundTrip;
