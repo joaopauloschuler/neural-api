@@ -1304,6 +1304,40 @@ rather than acted on.
       window memory should beat a matched diagonal SSM) and the usual shape +
       input-gradient + save/load tests; verify the discretized `A_bar` against a
       brute-force matrix-exponential reference in the smoke test.
+- [ ] `TNNetForgetGateBias` + `TNNet.AddForgettingAttention` — the **Forgetting
+      Transformer (FoX)** of Lin et al. 2025 ("Forgetting Transformer: Softmax
+      Attention with a Forget Gate"). This is the missing piece between the two
+      families already in tree: the **data-independent** additive score biases
+      (`TNNetAddPositionalEmbedding` RoPE, ALiBi-style slopes) and the
+      **data-dependent forget gates** that today live ONLY on *linear*-attention
+      matrix states (`TNNetGatedLinearAttention` per-channel vector gate,
+      `TNNetWKV`/`TNNetRWKV` decay, `TNNetDeltaNet` β-gate). FoX puts a
+      data-dependent forget gate back inside *softmax* attention, where none of
+      our attention layers have one. Mechanism: from the per-position input
+      compute a scalar (per-head) forget value `f_t = sigmoid(w·x_t + b)` in
+      `(0,1)`, accumulate its log into a prefix sum `F_t = sum_{k<=t} log f_k`,
+      and form the strictly-lower-triangular **additive decay bias**
+      `D[i,j] = F_i - F_j` for `j<=i` (0 on the diagonal, `-inf` above — i.e. the
+      causal mask folds in for free). Adding `D` to the raw `Q·Kᵀ/sqrt(d)` scores
+      *before* softmax multiplies each attention weight by
+      `prod_{k=j+1..i} f_k` — an input-conditioned exponential discount of older
+      tokens, the softmax analogue of GLA's recurrence but with full
+      pairwise (non-Markovian) attention retained. New layer
+      `TNNetForgetGateBias` (one weight neuron per head producing `f_t`, emits the
+      `SeqLen×SeqLen` bias matrix; backward is a clean adjoint over the prefix
+      sum: `dL/dF_i = sum_j>=i dD - sum_j<=i dD`, then `df_t = dF_t / f_t`,
+      `dw/db` via the sigmoid). Builder `TNNet.AddForgettingAttention` composes
+      it with the existing SDPA primitives (project Q/K, compute scores, **add the
+      forget bias**, softmax, ×V, out-proj) so it slots into a decoder stack
+      exactly like `AddMultiHeadSelfAttention`. NOT a near-duplicate of anything:
+      it is the only softmax-attention layer with a learned per-position decay,
+      and the only forget gate in tree that acts on an O(L²) score matrix rather
+      than an O(d²) recurrent state. Ship with shape + input-gradient + save/load
+      tests (verify the prefix-sum bias against a brute-force
+      `sum log f` reference) and an `examples/ForgettingTransformer/` long-range
+      copy/recall bake-off where the data-dependent decay should beat both plain
+      SDPA and a fixed-slope ALiBi baseline. Optional follow-up flag: the paper's
+      "Pro" variant (per-head output-gate + QK-norm) once the base layer lands.
 - [ ] `TNNetTitansMemory` follow-up — a **gated-DeltaNet-style chunked parallel
       scan** forward for `TNNetTitansMemory`, replacing the sequential O(SeqLen)
       inner-gradient scan with a chunked associative/parallel recurrence (the
