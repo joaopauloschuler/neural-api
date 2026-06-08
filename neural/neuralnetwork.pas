@@ -5483,6 +5483,70 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetLegendreMemoryUnit: the Legendre Memory Unit (LMU, Voelker, Kajic &
+  // Eliasmith 2019, "Legendre Memory Units: Continuous-Time Representation in
+  // Recurrent Neural Networks", NeurIPS 2019) built on the HiPPO-LegS
+  // projection. Each input channel carries an ORDER-N memory vector m_t that
+  // holds the coefficients of an orthogonal shifted-Legendre-polynomial
+  // expansion of a sliding window of that channel's signal. The memory is driven
+  // by the DENSE, STRUCTURED, NON-DIAGONAL HiPPO-LegS transition matrix - this is
+  // what makes the LMU genuinely distinct from the diagonal / complex-diagonal /
+  // matrix-outer-product recurrent layers already in the tree (TNNetDiagonalSSM,
+  // TNNetLRU, TNNetDeltaNet, TNNetGatedLinearAttention): the state update mixes
+  // ALL N coefficients through a fixed polynomial-projection operator, and the
+  // memory cost is N numbers REGARDLESS of how long the window is.
+  //
+  // Operates over a (SeqLen,1,Depth) sequence laid out along SizeX exactly like
+  // the attention / TNNetDiagonalSSM / TNNetLRU layers (SizeY must be 1); output
+  // shape == input shape (one read-out Depth-vector per timestep).
+  //
+  // The continuous-time HiPPO-LegS operator (order N) is
+  //   A[i,j] = (2i+1) * ( -1            if i <  j
+  //                       (-1)^(i-j+1)  if i >= j )
+  //   B[i]   = (2i+1) * (-1)^i
+  // discretized ONCE at build time with a simple Euler step (dt=1, window theta):
+  //   Abar = I + (1/theta)*A      Bbar = (1/theta)*B
+  // Per channel d the linear recurrence is swept left-to-right along SizeX:
+  //   m_t[d] = Abar * m_{t-1}[d] + Bbar * u_t[d]      (m_{-1}=0, u_t = x_t[d])
+  // and a TRAINABLE per-channel read-out collapses the N coefficients back to one
+  // value per channel:
+  //   y_t[d] = sum_n Wout[d,n] * m_t[d,n]
+  // The HiPPO Abar/Bbar matrices are FIXED (no gradient) and stored as plain
+  // fields; theta is a fixed build-time constant for v1 (a learnable theta is a
+  // straightforward follow-up). Only Wout trains. Storage in Neurons[] (1 tensor):
+  //   [0]=Wout (Depth,1,Order)   per-channel read-out weights (init small random)
+  // FStruct[0]=Order, FStruct[1]=Depth (resolved in SetPrevLayer);
+  // FFloatSt[0]=theta. The order-N memory m_t is cached for the backward pass.
+  // FORWARD is a left-to-right scan (O(SeqLen*Depth*Order^2)). BACKWARD is the
+  // EXACT BPTT adjoint scan (right-to-left, carrying dL/dm_t[d], an N-vector per
+  // channel): the read-out scatters Gy into dL/dm_t and the Wout gradient, then
+  // dL/dm_{t-1} = Abar^T (dL/dm_t) and the input gradient picks up Bbar^T(dL/dm_t).
+  // Per-channel scalar/N-vector scan -> no AVX.
+  // Coded by Claude (AI).
+  TNNetLegendreMemoryUnit = class(TNNetLayer)
+    private
+      FOrder: integer;            // N, memory size per channel (resolved/serialized)
+      FDepth: integer;            // resolved in SetPrevLayer
+      FTheta: TNeuralFloat;       // fixed window length (build-time constant)
+      FAbar: TNNetVolume;         // discretized transition matrix, (Order,1,Order) [i,0,j]
+      FBbar: TNNetVolume;         // discretized input vector, Order-long
+      FM: TNNetVolume;            // cached memory m_t, (SeqLen,Depth,Order)
+      FMcur, FMprev: TNNetVolume; // running memory vectors, (Depth,1,Order) scratch
+      FGm, FGmNext: TNNetVolume;  // backward adjoint dL/dm vectors, (Depth,1,Order)
+      FGradWout: TNNetVolume;     // (Depth,1,Order) grad accumulator
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure BuildHiPPO();
+    public
+      constructor Create(Order: integer; Theta: TNeuralFloat); reintroduce; overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      // Read-only access to the discretized HiPPO matrices (testing/introspection).
+      property Abar: TNNetVolume read FAbar;
+      property Bbar: TNNetVolume read FBbar;
+  end;
+
   /// TNNetAffineCoupling: an invertible RealNVP/Glow-style AFFINE COUPLING layer
   // (Dinh et al. 2016 "Density estimation using Real NVP", arXiv:1605.08803;
   // Kingma & Dhariwal 2018 "Glow", arXiv:1807.03039). This is the library's
@@ -37147,6 +37211,243 @@ begin
     FNeurons[3].FWeights.FData[j] := FNeurons[3].FWeights.RandomGaussianValue() * 0.05; // w_beta
   // b_beta strongly negative -> beta_t ~= 0 at init (near-zero write strength).
   FNeurons[4].FWeights.FData[0] := -4.0;
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetLegendreMemoryUnit }
+constructor TNNetLegendreMemoryUnit.Create(Order: integer; Theta: TNeuralFloat);
+begin
+  inherited Create();
+  FOrder := Order;
+  FTheta := Theta;
+  if FOrder < 1 then
+    FErrorProc('TNNetLegendreMemoryUnit requires Order >= 1. Got ' +
+      IntToStr(FOrder));
+  if FTheta <= 0 then
+    FErrorProc('TNNetLegendreMemoryUnit requires Theta > 0. Got ' +
+      FloatToStr(FTheta));
+  FStruct[0] := FOrder;
+  FFloatSt[0] := FTheta;
+  FAbar := TNNetVolume.Create();
+  FBbar := TNNetVolume.Create();
+  FM := TNNetVolume.Create();
+  FMcur := TNNetVolume.Create();
+  FMprev := TNNetVolume.Create();
+  FGm := TNNetVolume.Create();
+  FGmNext := TNNetVolume.Create();
+  FGradWout := TNNetVolume.Create();
+  AddMissingNeurons(1);
+  BuildHiPPO();
+end;
+
+destructor TNNetLegendreMemoryUnit.Destroy();
+begin
+  FGradWout.Free;
+  FGmNext.Free;
+  FGm.Free;
+  FMprev.Free;
+  FMcur.Free;
+  FM.Free;
+  FBbar.Free;
+  FAbar.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetLegendreMemoryUnit.BuildHiPPO();
+var
+  i, j: integer;
+  aij, scale, sgn: TNeuralFloat;
+begin
+  // Continuous-time HiPPO-LegS A,B then a one-shot Euler discretization
+  //   Abar = I + (1/theta)*A      Bbar = (1/theta)*B   (dt=1).
+  FAbar.ReSize(FOrder, 1, FOrder);
+  FBbar.ReSize(FOrder, 1, 1);
+  scale := 1.0 / FTheta;
+  for i := 0 to FOrder - 1 do
+  begin
+    for j := 0 to FOrder - 1 do
+    begin
+      if i < j then
+        aij := (2 * i + 1) * (-1.0)
+      else
+      begin
+        // (-1)^(i-j+1)
+        if ((i - j + 1) and 1) = 0 then sgn := 1.0 else sgn := -1.0;
+        aij := (2 * i + 1) * sgn;
+      end;
+      FAbar.FData[i * FOrder + j] := scale * aij;
+    end;
+    // add identity
+    FAbar.FData[i * FOrder + i] := FAbar.FData[i * FOrder + i] + 1.0;
+    // B[i] = (2i+1)*(-1)^i  ->  Bbar = (1/theta)*B
+    if (i and 1) = 0 then sgn := 1.0 else sgn := -1.0;
+    FBbar.FData[i] := scale * (2 * i + 1) * sgn;
+  end;
+end;
+
+procedure TNNetLegendreMemoryUnit.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetLegendreMemoryUnit requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  FDepth := pPrevLayer.FOutput.Depth;
+  FStruct[1] := FDepth;
+  // LMU preserves the sequence layout: one read-out value per channel per step.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDepth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // [0]=Wout per-channel read-out weights, (Depth,1,Order) [d,0,n].
+  FNeurons[0].FWeights.ReSize(FDepth, 1, FOrder);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  FM.ReSize(FOutput.SizeX, FDepth, FOrder);
+  FMcur.ReSize(FDepth, 1, FOrder);
+  FMprev.ReSize(FDepth, 1, FOrder);
+  FGm.ReSize(FDepth, 1, FOrder);
+  FGmNext.ReSize(FDepth, 1, FOrder);
+  FGradWout.ReSize(FDepth, 1, FOrder);
+  BuildHiPPO();
+  InitDefault();
+end;
+
+procedure TNNetLegendreMemoryUnit.Compute();
+var
+  StartTime: double;
+  Wout: TNNetVolume;
+  SeqLen, t, d, n, mm, baseT, baseDN, baseW: integer;
+  acc, u, y: TNeuralFloat;
+  XtPtr, OutPtr: TNeuralFloatArrPtr;
+  AbarR: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Wout := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  for t := 0 to SeqLen - 1 do
+  begin
+    XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0, 0);
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    baseT := t * FDepth * FOrder;
+    for d := 0 to FDepth - 1 do
+    begin
+      u := XtPtr^[d];
+      baseDN := baseT + d * FOrder;
+      baseW := d * FOrder;
+      // m_t[d] = Abar * m_{t-1}[d] + Bbar * u
+      for n := 0 to FOrder - 1 do
+      begin
+        AbarR := FAbar.GetRawPtr(n, 0, 0);
+        acc := FBbar.FData[n] * u;
+        if t > 0 then
+          for mm := 0 to FOrder - 1 do
+            acc := acc + AbarR^[mm] *
+              FM.FData[baseDN - FDepth * FOrder + mm];
+        FM.FData[baseDN + n] := acc;
+      end;
+      // read-out y_t[d] = sum_n Wout[d,n]*m_t[d,n]
+      y := 0;
+      for n := 0 to FOrder - 1 do
+        y := y + Wout.FData[baseW + n] * FM.FData[baseDN + n];
+      OutPtr^[d] := y;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLegendreMemoryUnit.Backpropagate();
+var
+  StartTime: double;
+  Wout: TNNetVolume;
+  SeqLen, t, d, n, mm, baseT, baseDN, baseW: integer;
+  hasInputGrad: boolean;
+  GyPtr, PrevErrPtr: TNeuralFloatArrPtr;
+  AbarR: TNeuralFloatArrPtr;
+  gy, gin, gmn: TNeuralFloat;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Wout := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FPrevLayer.FOutput.Size > 0);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGm.Fill(0);
+  FGmNext.Fill(0);
+  FGradWout.Fill(0);
+  // Right-to-left BPTT. FGmNext carries dL/dm_t (per channel, N-vector) arriving
+  // as the carry from step t+1's m_t-as-m_{t-1} use; the read-out at step t adds
+  // its own contribution before propagating to dL/dm_{t-1} and the input.
+  for t := SeqLen - 1 downto 0 do
+  begin
+    GyPtr := FOutputError.GetRawPtr(t, 0, 0);
+    baseT := t * FDepth * FOrder;
+    if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
+    else PrevErrPtr := nil;
+    for d := 0 to FDepth - 1 do
+    begin
+      baseDN := baseT + d * FOrder;
+      baseW := d * FOrder;
+      gy := GyPtr^[d];
+      // dL/dm_t[d,n] = (carry from t+1) + Gy * Wout[d,n].
+      // Wout grad: dL/dWout[d,n] += Gy * m_t[d,n].
+      for n := 0 to FOrder - 1 do
+      begin
+        FGm.FData[d * FOrder + n] :=
+          FGmNext.FData[d * FOrder + n] + gy * Wout.FData[baseW + n];
+        FGradWout.FData[baseW + n] :=
+          FGradWout.FData[baseW + n] + gy * FM.FData[baseDN + n];
+      end;
+      // m_t[d] = Abar*m_{t-1}[d] + Bbar*u_t[d].
+      // Input grad: dL/du += Bbar . dL/dm_t.
+      gin := 0;
+      for n := 0 to FOrder - 1 do
+        gin := gin + FBbar.FData[n] * FGm.FData[d * FOrder + n];
+      if hasInputGrad then PrevErrPtr^[d] := PrevErrPtr^[d] + gin;
+      // Carry: dL/dm_{t-1}[d,nn] = sum_n Abar[n,nn] * dL/dm_t[d,n]  (= Abar^T g).
+      if t > 0 then
+        for mm := 0 to FOrder - 1 do
+        begin
+          gmn := 0;
+          for n := 0 to FOrder - 1 do
+          begin
+            AbarR := FAbar.GetRawPtr(n, 0, 0);
+            gmn := gmn + AbarR^[mm] * FGm.FData[d * FOrder + n];
+          end;
+          FGmNext.FData[d * FOrder + mm] := gmn;
+        end;
+    end;
+  end;
+  // Flush -FLearningRate-scaled grad into the read-out neuron delta.
+  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradWout.GetRawPtr(),
+    -FLearningRate, FNeurons[0].FWeights.Size);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetLegendreMemoryUnit.InitDefault();
+var
+  cnt, i, oldSeed: integer;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  cnt := FNeurons[0].FWeights.Size;
+  if cnt < 1 then exit;
+  oldSeed := RandSeed;
+  RandSeed := 314159;
+  for i := 0 to cnt - 1 do
+    FNeurons[0].FWeights.FData[i] :=
+      FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
   RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
@@ -79252,6 +79553,7 @@ begin
       'TNNetMinGRU':                Result := TNNetMinGRU.Create();
       'TNNetMinLSTM':               Result := TNNetMinLSTM.Create();
       'TNNetDeltaNet':              Result := TNNetDeltaNet.Create();
+      'TNNetLegendreMemoryUnit':    Result := TNNetLegendreMemoryUnit.Create(St[0], Ft[0]);
       'TNNetGatedLinearAttention':  Result := TNNetGatedLinearAttention.Create();
       'TNNetWKV':                   Result := TNNetWKV.Create();
       'TNNetLRU':                   Result := TNNetLRU.Create();
@@ -79623,6 +79925,7 @@ begin
       if S[0] = 'TNNetMinGRU' then Result := TNNetMinGRU.Create() else
       if S[0] = 'TNNetMinLSTM' then Result := TNNetMinLSTM.Create() else
       if S[0] = 'TNNetDeltaNet' then Result := TNNetDeltaNet.Create() else
+      if S[0] = 'TNNetLegendreMemoryUnit' then Result := TNNetLegendreMemoryUnit.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetGatedLinearAttention' then Result := TNNetGatedLinearAttention.Create() else
       if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
       if S[0] = 'TNNetLRU' then Result := TNNetLRU.Create() else

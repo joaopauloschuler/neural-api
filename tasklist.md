@@ -1291,6 +1291,12 @@ rather than acted on.
       window memory should beat a matched diagonal SSM) and the usual shape +
       input-gradient + save/load tests; verify the discretized `A_bar` against a
       brute-force matrix-exponential reference in the smoke test.
+  - [ ] LMU follow-up (layer landed on a2): make the window length `theta` a
+        LEARNABLE per-channel parameter (v1 keeps it a fixed build-time constant)
+        — store a raw scalar/vector, recompute `Abar/Bbar` (or fold `1/theta`
+        through the recurrence) so the discretization is differentiable, and add a
+        `dL/dtheta` term to the adjoint scan. Optional: a `TNNetHyperLMU` that
+        reads `theta` (or `Wout`) from a second input tensor like `TNNetHyperLinear`.
 - [ ] `TNNetForgetGateBias` + `TNNet.AddForgettingAttention` — the **Forgetting
       Transformer (FoX)** of Lin et al. 2025 ("Forgetting Transformer: Softmax
       Attention with a Forget Gate"). This is the missing piece between the two

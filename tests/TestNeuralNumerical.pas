@@ -425,6 +425,11 @@ type
     procedure TestDeltaNetWeightGradientCheck;
     procedure TestDeltaNetSerializationRoundTrip;
     procedure TestDeltaNetRecallSmokeTrain;
+    procedure TestLMUShapeInference;
+    procedure TestLMUDiscretizationReference;
+    procedure TestLMUInputGradientCheck;
+    procedure TestLMUWeightGradientCheck;
+    procedure TestLMUSerializationRoundTrip;
     procedure TestGLAShapeInference;
     procedure TestGLAInputGradientCheck;
     procedure TestGLAWeightGradientCheck;
@@ -28365,6 +28370,230 @@ begin
   finally
     NN.Free; Input.Free; Desired.Free;
   end;
+end;
+
+// --- TNNetLegendreMemoryUnit (LMU, HiPPO-LegS) -------------------------------
+
+procedure SeedLMU(L: TNNetLegendreMemoryUnit; Depth, Order: integer);
+var d, n: integer;
+begin
+  // Deterministic, bounded read-out weights.
+  for d := 0 to Depth - 1 do
+    for n := 0 to Order - 1 do
+      L.Neurons[0].Weights[d, 0, n] := Sin(d * 0.9 + n * 0.5) * 0.3;
+end;
+
+procedure TTestNeuralNumerical.TestLMUShapeInference;
+var
+  NN: TNNet;
+  L: TNNetLegendreMemoryUnit;
+begin
+  // Output sized like the input sequence; a single read-out neuron of Depth*Order.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 3)); // SeqLen=6, Depth=3
+    L := TNNetLegendreMemoryUnit.Create(4, 8.0); // Order=4, theta=8
+    NN.AddLayer(L);
+    AssertEquals('LMU output SizeX = SeqLen', 6, L.Output.SizeX);
+    AssertEquals('LMU output SizeY', 1, L.Output.SizeY);
+    AssertEquals('LMU output Depth preserved', 3, L.Output.Depth);
+    AssertEquals('LMU neuron count', 1, L.Neurons.Count);
+    AssertEquals('LMU Wout size = Depth*Order', 12, L.Neurons[0].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLMUDiscretizationReference;
+var
+  NN: TNNet;
+  L: TNNetLegendreMemoryUnit;
+  Order, i, j: integer;
+  theta, scale, aij, sgn, refA, refB: TNeuralFloat;
+  maxErr: TNeuralFloat;
+begin
+  // Smoke check: the layer's internally built Abar/Bbar match a brute-force
+  // reference of  Abar = I + (1/theta)*A,  Bbar = (1/theta)*B  on HiPPO-LegS.
+  RandSeed := 424242;
+  Order := 5;
+  theta := 7.0;
+  scale := 1.0 / theta;
+  maxErr := 0;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    L := TNNetLegendreMemoryUnit.Create(Order, theta);
+    NN.AddLayer(L);
+    for i := 0 to Order - 1 do
+    begin
+      for j := 0 to Order - 1 do
+      begin
+        if i < j then aij := (2 * i + 1) * (-1.0)
+        else
+        begin
+          if ((i - j + 1) and 1) = 0 then sgn := 1.0 else sgn := -1.0;
+          aij := (2 * i + 1) * sgn;
+        end;
+        refA := scale * aij;
+        if i = j then refA := refA + 1.0;
+        if Abs(refA - L.Abar.Raw[i * Order + j]) > maxErr then
+          maxErr := Abs(refA - L.Abar.Raw[i * Order + j]);
+        AssertEquals('LMU Abar[' + IntToStr(i) + ',' + IntToStr(j) + ']',
+          refA, L.Abar.Raw[i * Order + j], 1e-5);
+      end;
+      if (i and 1) = 0 then sgn := 1.0 else sgn := -1.0;
+      refB := scale * (2 * i + 1) * sgn;
+      AssertEquals('LMU Bbar[' + IntToStr(i) + ']', refB, L.Bbar.Raw[i], 1e-5);
+    end;
+    WriteLn('LMU discretization max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLMUInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetLegendreMemoryUnit;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var kk: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  InputPlus := TNNetVolume.Create(4, 1, 2);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1)); // SeqLen=4, Depth=2
+    L := TNNetLegendreMemoryUnit.Create(3, 6.0); // Order=3
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.5;
+    SeedLMU(L, 2, 3);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('LMU input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('LMU input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLMUWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetLegendreMemoryUnit;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var kk: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  Desired := TNNetVolume.Create(4, 1, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    L := TNNetLegendreMemoryUnit.Create(3, 6.0);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.6 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.5;
+    SeedLMU(L, 2, 3);
+
+    // The only trainable tensor is the read-out Wout (Depth*Order).
+    for i := 0 to L.Neurons[0].Weights.Size - 1 do
+    begin
+      L.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      L.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      L.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      L.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -L.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('LMU weight gradient check Wout[' + IntToStr(i) +
+        '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('LMU weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLMUSerializationRoundTrip;
+begin
+  // LMU stores one learnable read-out tensor (Depth*Order); the fixed HiPPO
+  // Abar/Bbar are rebuilt from FStruct[0]/FFloatSt[0] on load. Round trip checks
+  // both the Wout weights and the Order/theta hyperparameters survive.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetLegendreMemoryUnit.Create(4, 8.0), 'LMU', 5, 1, 3, 1e-5);
 end;
 
 // --- TNNetGatedLinearAttention (GLA) -----------------------------------------
