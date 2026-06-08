@@ -1265,8 +1265,13 @@ rather than acted on.
       worked example.
 
 ### Stretch / ambitious
-- [ ] `TNNetLegendreMemoryUnit` — the **HiPPO-LegS Legendre Memory Unit** (Voelker
-      et al. 2019). This fills a real structural gap in the SSM family: every
+- [X] `TNNetLegendreMemoryUnit` — the **HiPPO-LegS Legendre Memory Unit** (Voelker
+      et al. 2019). LANDED 2026-06-07 on a2 (commit 5b8c652): order-N HiPPO-LegS
+      memory vector, build-time Euler-discretized fixed A/B, per-token recurrence,
+      trainable per-channel readout, exact adjoint-scan backward; shape +
+      brute-force-discretization + input/weight-gradient + save/load tests; shipped
+      examples/LegendreMemoryUnit/ (beats a state-matched diagonal SSM). Open below.
+      This fills a real structural gap in the SSM family: every
       recurrent/state-space layer in tree today uses either a **real diagonal**
       transition (`TNNetDiagonalSSM`), a **complex diagonal** one (`TNNetLRU`), or a
       **matrix-memory linear-attention** update (`TNNetGatedLinearAttention`,
@@ -1297,9 +1302,15 @@ rather than acted on.
         through the recurrence) so the discretization is differentiable, and add a
         `dL/dtheta` term to the adjoint scan. Optional: a `TNNetHyperLMU` that
         reads `theta` (or `Wout`) from a second input tensor like `TNNetHyperLinear`.
-- [ ] `TNNetForgetGateBias` + `TNNet.AddForgettingAttention` — the **Forgetting
+- [X] `TNNetForgetGateBias` + `TNNet.AddForgettingAttention` — the **Forgetting
       Transformer (FoX)** of Lin et al. 2025 ("Forgetting Transformer: Softmax
-      Attention with a Forget Gate"). This is the missing piece between the two
+      Attention with a Forget Gate"). LANDED 2026-06-07 on a2 (commit 7975b6c):
+      data-dependent forget gate inside softmax attention — one weight neuron emits
+      the SeqLen×SeqLen additive decay bias D[j,i]=F_i-F_j (causal mask folds in),
+      exact prefix-sum adjoint backward; AddForgettingAttention per-head builder
+      (composed, no new class); brute-force-bias + input/weight-gradient + save/load
+      + builder smoke tests. Example deferred (see follow-up below). Details:
+      This is the missing piece between the two
       families already in tree: the **data-independent** additive score biases
       (`TNNetAddPositionalEmbedding` RoPE, ALiBi-style slopes) and the
       **data-dependent forget gates** that today live ONLY on *linear*-attention
