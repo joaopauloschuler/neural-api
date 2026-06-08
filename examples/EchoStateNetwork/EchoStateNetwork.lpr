@@ -259,6 +259,150 @@ begin
   Result := NN;
 end;
 
+// ----------------------------------------------------------------------------
+// Closed-form RIDGE (Tikhonov) readout - the CLASSIC ESN training.
+//
+// The readout is linear in the reservoir state, so the optimal weights are not
+// something we have to chase with SGD: they are the one-shot ridge-regression
+// solution. Collect the state matrix S (rows = timesteps, cols = N reservoir
+// units PLUS a bias/intercept column) and the target matrix Y (here a single
+// column x_{t+1}). The ridge readout minimises ||S*Wout - Y||^2 + lambda||Wout||^2,
+// whose normal equations are
+//
+//     (S^T S + lambda I) Wout = S^T Y          ->   A Wout = B
+//
+// We form A (size (N+1)x(N+1)) and B ((N+1)x1) and solve the small dense system
+// directly. neuralvolume.pas exposes no matrix solve/inverse helper (checked:
+// no Solve/Inverse/Cholesky/Gauss), so we hand-roll Gauss-Jordan elimination
+// with partial pivoting below - simple, deterministic and exact for this size.
+// No learning rate, no epochs, no shuffling: it is a single linear solve.
+// ----------------------------------------------------------------------------
+
+// Solve the dense linear system A*X = B in place by Gauss-Jordan elimination
+// with partial pivoting. A is n x n, B is n x m; on return B holds the solution
+// X (A is destroyed). Returns False if A is singular.
+function GaussJordanSolve(var A: array of TNeuralFloat;
+  var B: array of TNeuralFloat; n, m: integer): boolean;
+var
+  col, row, piv, k: integer;
+  maxAbs, v, factor, diag: TNeuralFloat;
+  tmp: TNeuralFloat;
+begin
+  Result := True;
+  for col := 0 to n - 1 do
+  begin
+    // Partial pivot: pick the row (>= col) with the largest |A[row,col]|.
+    piv := col;
+    maxAbs := Abs(A[col * n + col]);
+    for row := col + 1 to n - 1 do
+    begin
+      v := Abs(A[row * n + col]);
+      if v > maxAbs then begin maxAbs := v; piv := row; end;
+    end;
+    if maxAbs < 1e-30 then begin Result := False; Exit; end;
+
+    // Swap the pivot row into place (in both A and B).
+    if piv <> col then
+    begin
+      for k := 0 to n - 1 do
+      begin
+        tmp := A[col * n + k]; A[col * n + k] := A[piv * n + k]; A[piv * n + k] := tmp;
+      end;
+      for k := 0 to m - 1 do
+      begin
+        tmp := B[col * m + k]; B[col * m + k] := B[piv * m + k]; B[piv * m + k] := tmp;
+      end;
+    end;
+
+    // Normalise the pivot row so A[col,col] = 1.
+    diag := A[col * n + col];
+    for k := 0 to n - 1 do A[col * n + k] := A[col * n + k] / diag;
+    for k := 0 to m - 1 do B[col * m + k] := B[col * m + k] / diag;
+
+    // Eliminate the pivot column from every other row.
+    for row := 0 to n - 1 do
+    begin
+      if row = col then Continue;
+      factor := A[row * n + col];
+      if factor = 0 then Continue;
+      for k := 0 to n - 1 do
+        A[row * n + k] := A[row * n + k] - factor * A[col * n + k];
+      for k := 0 to m - 1 do
+        B[row * m + k] := B[row * m + k] - factor * B[col * m + k];
+    end;
+  end;
+end;
+
+// Build the trained readout via the closed-form ridge solve, reusing the SAME
+// reservoir/washout/training window as TrainReadout so the comparison is
+// apples-to-apples. The returned TNNet is the SAME Input(N)->FullConnectLinear(1)
+// shape as the SGD arm, with Wout[0..N-1] written into the neuron weights and
+// the intercept (bias column) into the neuron bias.
+function RidgeReadout(var R: TReservoir; Lambda: TNeuralFloat): TNNet;
+var
+  NN: TNNet;
+  t, i, j, d, rows: integer;
+  S: array of TNeuralFloat;   // rows x d   (d = N+1, last col = bias 1.0)
+  Y: array of TNeuralFloat;   // rows x 1
+  A: array of TNeuralFloat;   // d x d  normal-equations matrix
+  Bmat: array of TNeuralFloat; // d x 1  right-hand side (becomes Wout)
+  acc: TNeuralFloat;
+begin
+  d := cN + 1;                 // reservoir units + 1 bias/intercept column
+  rows := cTrainLen;
+
+  ResetState(R);
+  for t := 0 to cWarmup - 1 do
+    StepReservoir(R, Series(t));   // washout (same as SGD arm)
+
+  SetLength(S, rows * d);
+  SetLength(Y, rows * 1);
+  for i := 0 to rows - 1 do
+  begin
+    t := cWarmup + i;
+    StepReservoir(R, Series(t));
+    for j := 0 to cN - 1 do S[i * d + j] := R.H[j];
+    S[i * d + cN] := 1.0;             // bias/intercept column
+    Y[i] := Series(t + 1);
+  end;
+
+  // A = S^T S + lambda*I   (symmetric positive-definite for lambda>0).
+  SetLength(A, d * d);
+  for i := 0 to d - 1 do
+    for j := 0 to d - 1 do
+    begin
+      acc := 0;
+      for t := 0 to rows - 1 do acc := acc + S[t * d + i] * S[t * d + j];
+      if i = j then acc := acc + Lambda;
+      A[i * d + j] := acc;
+    end;
+
+  // B = S^T Y.
+  SetLength(Bmat, d * 1);
+  for i := 0 to d - 1 do
+  begin
+    acc := 0;
+    for t := 0 to rows - 1 do acc := acc + S[t * d + i] * Y[t];
+    Bmat[i] := acc;
+  end;
+
+  // Solve A * Wout = B in place; Bmat now holds Wout (length d).
+  if not GaussJordanSolve(A, Bmat, d, 1) then
+    WriteLn('    WARNING: ridge normal-equations matrix was singular.');
+
+  // Pack Wout into the SAME readout-net shape as the SGD arm.
+  NN := TNNet.Create();
+  NN.AddLayer([
+    TNNetInput.Create(cN),
+    TNNetFullConnectLinear.Create(1)
+  ]);
+  for j := 0 to cN - 1 do
+    NN.GetLastLayer().Neurons[0].Weights.FData[j] := Bmat[j];
+  NN.GetLastLayer().Neurons[0].BiasWeight := Bmat[cN]; // intercept
+
+  Result := NN;
+end;
+
 // NRMSE = RMSE / std(target). Scale-free, so "1.0" means "no better than
 // predicting the target mean".
 function NRMSE(const Pred, Truth: array of TNeuralFloat): TNeuralFloat;
@@ -411,12 +555,19 @@ begin
   end;
 end;
 
+const
+  cLambdaSweep: array[0..3] of TNeuralFloat = (0.0, 1e-6, 1e-4, 1e-2);
+
 var
   R: TReservoir;
-  NN: TNNet;
+  NN, RidgeNN: TNNet;
   TfModel, TfBaseline, FrGood, FrBad: TNeuralFloat;
+  RidgeTf, RidgeFr, BestRidgeTf, BestRidgeFr: TNeuralFloat;
+  RidgeTfDummy, BestLambda: TNeuralFloat;
   PredG, TruthG, PredB, TruthB: array of TNeuralFloat;
+  PredR, TruthR: array of TNeuralFloat;
   AllOK: boolean;
+  li: integer;
 
 begin
   SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
@@ -452,6 +603,47 @@ begin
   WriteLn;
   AsciiPlot(PredG, TruthG);
   NN.Free;
+
+  // ---- Closed-form RIDGE readout (one-shot) + lambda sweep ----------------
+  // SAME reservoir, SAME washout/training window, SAME error metric as the SGD
+  // arm above - the ONLY difference is how Wout is obtained: a single Tikhonov
+  // normal-equations solve instead of an SGD loop. No learning rate to tune.
+  WriteLn;
+  WriteLn(StringOfChar('-', 64));
+  WriteLn('[1b] Closed-form RIDGE readout  Wout = (S^T S + lambda I)^-1 S^T Y');
+  WriteLn('     one-shot solve (no LR, no epochs); lambda regularisation sweep:');
+  WriteLn('       lambda     teacher-NRMSE   free-run-NRMSE');
+  SetLength(PredR, cFreeRun);
+  SetLength(TruthR, cFreeRun);
+  BestRidgeTf := 1e30;
+  BestRidgeFr := 1e30;
+  BestLambda  := cLambdaSweep[0];
+  for li := 0 to High(cLambdaSweep) do
+  begin
+    RidgeNN := RidgeReadout(R, cLambdaSweep[li]);
+    TeacherForcedTest(R, RidgeNN, RidgeTf, RidgeTfDummy);
+    RidgeFr := FreeRun(R, RidgeNN, PredR, TruthR);
+    WriteLn(Format('       %-9.0e  %12.4f   %12.4f',
+      [cLambdaSweep[li], RidgeTf, RidgeFr]));
+    // Track the best lambda by FREE-RUN NRMSE: that is the metric that matters
+    // for autonomous generation, and it is exactly where ridge regularisation
+    // pays off - the lambda=0 fit nails the teacher-forced step but a tiny
+    // unregularised readout amplifies error catastrophically in the feedback
+    // loop, so the sweep is what reveals the right amount of damping.
+    if RidgeFr < BestRidgeFr then
+    begin
+      BestRidgeTf := RidgeTf;
+      BestRidgeFr := RidgeFr;
+      BestLambda  := cLambdaSweep[li];
+    end;
+    RidgeNN.Free;
+  end;
+  WriteLn;
+  WriteLn('     SGD-vs-ridge headline (same reservoir, same task):');
+  WriteLn(Format('       SGD readout   (%d epochs, LR=%.3g): teacher %.4f  free-run %.4f',
+    [cReadoutEpochs, cReadoutLR, TfModel, FrGood]));
+  WriteLn(Format('       ridge readout (one-shot, lambda=%.0e):  teacher %.4f  free-run %.4f',
+    [BestLambda, BestRidgeTf, BestRidgeFr]));
 
   // ---- Ablation: rho > 1 (echo-state property broken) --------------------
   WriteLn;

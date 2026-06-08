@@ -49,7 +49,48 @@ See the comments in `EchoStateNetwork.lpr`.
    collect each state `h_t` into a `TNNetVolumePair` (input = `h_t`,
    target = `x_{t+1}`).
 4. Train **only** a `TNNetFullConnectLinear(1)` readout on those collected
-   pairs with a tiny L2-regularised (ridge-style) SGD loop.
+   pairs. Two arms are trained and compared on the **same** reservoir, **same**
+   collected states and **same** error metric:
+   - an iterative, LR-sensitive **SGD** loop (a tiny L2-regularised linear fit);
+   - the classic **closed-form ridge (Tikhonov) solve** — one shot, no LR.
+
+### Closed-form ridge readout (the classic ESN training)
+
+Because the readout is *linear* in the reservoir state, its optimal weights are
+not something to chase with SGD — they are the one-shot ridge-regression
+solution. Collect the state matrix `S` (rows = training timesteps, columns = the
+`N` reservoir units **plus a bias/intercept column of 1s**) and the target
+matrix `Y` (one column, `x_{t+1}`). The ridge readout minimises
+`||S·Wout − Y||² + lambda·||Wout||²`, whose normal equations are
+
+```
+(Sᵀ S + lambda·I) · Wout = Sᵀ Y          ->   A · Wout = B
+```
+
+The example forms `A` (size `(N+1)×(N+1)`) and `B` (`(N+1)×1`) and solves the
+small dense system directly. `neuralvolume.pas` exposes **no** matrix
+solve/inverse/Cholesky helper (verified by grepping for `Solve`/`Inverse`/
+`Cholesky`/`Gauss`), so the example **hand-rolls** a `GaussJordanSolve` routine
+— Gauss-Jordan elimination with partial pivoting — clearly commented and exact
+for this reservoir size. The solved `Wout` is then packed back into the **same**
+`Input(N)→FullConnectLinear(1)` net shape as the SGD arm (reservoir weights into
+the neuron's `Weights`, the intercept into its `BiasWeight`), so both arms are
+evaluated by identical code. No learning rate, no epochs, no shuffling — it is a
+single linear solve, deterministic and not LR-sensitive.
+
+#### Lambda sweep
+
+The ridge arm runs a small regularisation sweep `lambda ∈ {0, 1e-6, 1e-4, 1e-2}`
+and prints the teacher-forced and free-run NRMSE for each. This shows the
+regularisation behaviour directly: at `lambda = 0` the readout nails the
+teacher-forced one-step prediction but a tiny unregularised readout *amplifies*
+error in the autonomous feedback loop, so its free-run NRMSE explodes; a modest
+`lambda` damps the readout and stabilises the free-run. The headline picks the
+lambda with the best **free-run** NRMSE (the metric that matters for autonomous
+generation) and contrasts it with the SGD arm:
+
+> **The closed-form ridge readout matches or beats the SGD readout in one shot,
+> with no learning rate to tune.**
 
 ### Headline task
 
@@ -118,6 +159,19 @@ Free-run waveform   ( . = true   o = predicted   * = overlap ):
      3 |                             o.                    |
      6 |                   o .                             |
     ...
+
+----------------------------------------------------------------
+[1b] Closed-form RIDGE readout  Wout = (S^T S + lambda I)^-1 S^T Y
+     one-shot solve (no LR, no epochs); lambda regularisation sweep:
+       lambda     teacher-NRMSE   free-run-NRMSE
+       0.0E+000         0.0037         9.0620
+       1.0E-006         0.0038         5.7713
+       1.0E-004         0.0368         5.4790
+       1.0E-002         0.0064         0.0583
+
+     SGD-vs-ridge headline (same reservoir, same task):
+       SGD readout   (600 epochs, LR=0.02): teacher 0.0214  free-run 0.0793
+       ridge readout (one-shot, lambda=1.0E-002):  teacher 0.0064  free-run 0.0583
 
 ================================================================
 [2] ABLATION - rebuilding reservoir at rho=1.80 (> 1, echo-state property BROKEN)
