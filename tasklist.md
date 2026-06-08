@@ -286,33 +286,20 @@ rather than acted on.
 
 ### Attention variants / siblings
 
-- [X] TNNetLinformerAttention low-rank linear-complexity attention (Wang et al. 2020,
-      arXiv:2006.04768) — single-head SDPA that projects K,V DOWN the sequence axis
-      from SeqLen to a fixed rank k via two learnable matrices E,F (k×SeqLen),
-      keeping softmax at O(SeqLen·k); same Q|K|V contract as TNNetLinearAttention,
-      fixed-SeqLen, E/F as trainable neurons with exact input+weight gradients;
-      tests + examples/Linformer/ — LANDED 2026-06-07 on a2, commit 4c6248b. Open:
+- [ ] TNNetLinformerAttention follow-ups (low-rank linear-complexity single-head SDPA
+      projecting K,V down the sequence axis via learnable E,F; landed 2026-06-07, commit 4c6248b):
       - [ ] TNNet.AddLinformerAttention block builder (pre/post-norm residual + FFN)
             and a multi-head Linformer (concat of H per-head E/F) for drop-in stacking.
       - [ ] Parameter-sharing variants (headwise / key-value shared E=F / layerwise),
             the paper's main param-budget knob; plus d_v != d_k support (v1 fixes d_v=d_k).
-- [X] TNNetPerformerAttention (Performer / FAVOR+, Choromanski et al. 2020,
-      arXiv:2009.14794) — positive random features φ(x)=exp(W·x−‖x‖²/2)/√m with a
-      FROZEN orthogonalized m×d_k projection W giving an UNBIASED estimate of the
-      softmax kernel exp(q·k) at O(SeqLen·m); same accumulate-S/Z structure as
-      TNNetLinearAttention but in m-dim feature space, backprop through φ, seed in
-      FStruct so W reloads bit-identically; tests + examples/Performer/ (RMS-vs-m
-      approximation curve) — LANDED 2026-06-07 on a2, commit eadcfb8. Open:
+- [ ] TNNetPerformerAttention follow-ups (Performer / FAVOR+ positive-random-feature
+      unbiased softmax-kernel estimate with a frozen m×d_k projection; landed 2026-06-07, commit eadcfb8):
       - [ ] Causal/autoregressive Performer (prefix-sum FAVOR+, sibling of
             TNNetCausalLinearAttention) and a TNNet.AddPerformerAttention multi-head builder.
       - [ ] Generalized random features (ReLU/trig kernels), redraw-W-per-step option,
             and AVX-vectorize the W·x projection loops in Compute (currently scalar).
-- [X] TNNet.AddConformerBlock (Conformer, Gulati et al. 2020, arXiv:2005.08100) —
-      macaron block x+=0.5·FFN; x+=MHSA; x+=Conv; x+=0.5·FFN; LayerNorm, composed
-      from existing serializable primitives (no new leaf class); shape-preserving so
-      blocks stack; conv module uses TNNetCausalConv1D as a stand-in for the paper's
-      depthwise conv; tests + examples/Conformer/ (conv⊕attention XOR task) — LANDED
-      2026-06-07 on a2, commit 0efc163. Open:
+- [ ] TNNet.AddConformerBlock follow-ups (macaron FFN–MHSA–Conv–FFN block composed
+      from existing primitives; landed 2026-06-07, commit 0efc163):
       - [ ] A true per-channel TNNetDepthwiseConv1D (depthwise over the SeqLen axis,
             Depth groups) so AddConformerBlock can use a faithful depthwise-separable
             conv module instead of the channel-mixing TNNetCausalConv1D stand-in.
