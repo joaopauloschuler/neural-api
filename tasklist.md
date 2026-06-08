@@ -1289,95 +1289,24 @@ rather than acted on.
       worked example.
 
 ### Stretch / ambitious
-- [X] `TNNetLegendreMemoryUnit` — the **HiPPO-LegS Legendre Memory Unit** (Voelker
-      et al. 2019). LANDED 2026-06-07 on a2 (commit 5b8c652): order-N HiPPO-LegS
-      memory vector, build-time Euler-discretized fixed A/B, per-token recurrence,
-      trainable per-channel readout, exact adjoint-scan backward; shape +
-      brute-force-discretization + input/weight-gradient + save/load tests; shipped
-      examples/LegendreMemoryUnit/ (beats a state-matched diagonal SSM). Open below.
-      This fills a real structural gap in the SSM family: every
-      recurrent/state-space layer in tree today uses either a **real diagonal**
-      transition (`TNNetDiagonalSSM`), a **complex diagonal** one (`TNNetLRU`), or a
-      **matrix-memory linear-attention** update (`TNNetGatedLinearAttention`,
-      `TNNetDeltaNet`, `TNNetTitansMemory`, `TNNetWKV`). The LMU is none of these —
-      it carries an order-`N` memory vector `m_t` that holds the coefficients of a
-      shifted-**Legendre-polynomial** projection of a sliding window of the input,
-      driven by the *dense, structured, NON-diagonal* HiPPO-LegS transition matrix
-      `A_ij = (2i+1)*(-1 if i<j else (-1)^(i-j+1))` with input matrix
-      `B_i = (2i+1)*(-1)^i`. Per channel: discretize `(A,B)` once at build time
-      (zero-order-hold or the paper's Euler step with a learnable/​fixed timescale
-      `theta`), run the linear recurrence `m_t = A_bar*m_{t-1} + B_bar*u_t` along the
-      time axis, then read out a learned linear combination of the `N` Legendre
-      coefficients (optionally concatenated with a learned hidden state, the full
-      LMU cell). Memory cost is `N` numbers regardless of window length — the
-      orthogonal-polynomial basis is what makes it a genuinely different compression
-      mechanism from the exponential-decay kernels of the diagonal SSMs. Distinct
-      enough that it is NOT a near-duplicate of anything in tree; the fixed HiPPO
-      matrices also need no gradient (only the readout + optional `theta` train, so
-      backward is a clean adjoint scan plus one `dtheta` term if `theta` is
-      learnable). Ship with a copy/recall example (`examples/LegendreMemoryUnit/`,
-      a delay-line / permuted-sequence-MNIST-style long-range task where the LMU's
-      window memory should beat a matched diagonal SSM) and the usual shape +
-      input-gradient + save/load tests; verify the discretized `A_bar` against a
-      brute-force matrix-exponential reference in the smoke test.
-  - [ ] LMU follow-up (layer landed on a2): make the window length `theta` a
-        LEARNABLE per-channel parameter (v1 keeps it a fixed build-time constant)
-        — store a raw scalar/vector, recompute `Abar/Bbar` (or fold `1/theta`
-        through the recurrence) so the discretization is differentiable, and add a
-        `dL/dtheta` term to the adjoint scan. Optional: a `TNNetHyperLMU` that
-        reads `theta` (or `Wout`) from a second input tensor like `TNNetHyperLinear`.
-- [X] `TNNetForgetGateBias` + `TNNet.AddForgettingAttention` — the **Forgetting
-      Transformer (FoX)** of Lin et al. 2025 ("Forgetting Transformer: Softmax
-      Attention with a Forget Gate"). LANDED 2026-06-07 on a2 (commit 7975b6c):
-      data-dependent forget gate inside softmax attention — one weight neuron emits
-      the SeqLen×SeqLen additive decay bias D[j,i]=F_i-F_j (causal mask folds in),
-      exact prefix-sum adjoint backward; AddForgettingAttention per-head builder
-      (composed, no new class); brute-force-bias + input/weight-gradient + save/load
-      + builder smoke tests. Example deferred (see follow-up below). Details:
-      This is the missing piece between the two
-      families already in tree: the **data-independent** additive score biases
-      (`TNNetAddPositionalEmbedding` RoPE, ALiBi-style slopes) and the
-      **data-dependent forget gates** that today live ONLY on *linear*-attention
-      matrix states (`TNNetGatedLinearAttention` per-channel vector gate,
-      `TNNetWKV`/`TNNetRWKV` decay, `TNNetDeltaNet` β-gate). FoX puts a
-      data-dependent forget gate back inside *softmax* attention, where none of
-      our attention layers have one. Mechanism: from the per-position input
-      compute a scalar (per-head) forget value `f_t = sigmoid(w·x_t + b)` in
-      `(0,1)`, accumulate its log into a prefix sum `F_t = sum_{k<=t} log f_k`,
-      and form the strictly-lower-triangular **additive decay bias**
-      `D[i,j] = F_i - F_j` for `j<=i` (0 on the diagonal, `-inf` above — i.e. the
-      causal mask folds in for free). Adding `D` to the raw `Q·Kᵀ/sqrt(d)` scores
-      *before* softmax multiplies each attention weight by
-      `prod_{k=j+1..i} f_k` — an input-conditioned exponential discount of older
-      tokens, the softmax analogue of GLA's recurrence but with full
-      pairwise (non-Markovian) attention retained. New layer
-      `TNNetForgetGateBias` (one weight neuron per head producing `f_t`, emits the
-      `SeqLen×SeqLen` bias matrix; backward is a clean adjoint over the prefix
-      sum: `dL/dF_i = sum_j>=i dD - sum_j<=i dD`, then `df_t = dF_t / f_t`,
-      `dw/db` via the sigmoid). Builder `TNNet.AddForgettingAttention` composes
-      it with the existing SDPA primitives (project Q/K, compute scores, **add the
-      forget bias**, softmax, ×V, out-proj) so it slots into a decoder stack
-      exactly like `AddMultiHeadSelfAttention`. NOT a near-duplicate of anything:
-      it is the only softmax-attention layer with a learned per-position decay,
-      and the only forget gate in tree that acts on an O(L²) score matrix rather
-      than an O(d²) recurrent state. Ship with shape + input-gradient + save/load
-      tests (verify the prefix-sum bias against a brute-force
-      `sum log f` reference) and an `examples/ForgettingTransformer/` long-range
-      copy/recall bake-off where the data-dependent decay should beat both plain
-      SDPA and a fixed-slope ALiBi baseline. Optional follow-up flag: the paper's
-      "Pro" variant (per-head output-gate + QK-norm) once the base layer lands.
-      - [ ] FoX follow-up (layer + builder + tests LANDED on a2): add
-        `examples/ForgettingTransformer/` once a CPU-cheap synthetic task is found
-        where the data-dependent decay reliably beats both plain SDPA and a
-        fixed-slope ALiBi baseline. First attempt (a gated post-reset-mean task)
-        confirmed the MECHANISM is correct — an attention diagnostic showed FoX's
-        learned gate drives `f~0` at the reset token and the query attends
-        UNIFORMLY over post-reset keys while zeroing pre-reset keys — but ALiBi's
-        recency prior was a hard-to-beat baseline on that particular setup, so the
-        example was deferred to avoid shipping a misleading "WARNING: FoX did not
-        beat baselines" headline. Also implement the paper's "Pro" variant
-        (per-head sigmoid output-gate + QK-norm) as opt-in flags on
-        `AddForgettingAttention`.
+- [ ] `TNNetLegendreMemoryUnit` follow-up: make the window length `theta` a
+      LEARNABLE per-channel parameter (v1 keeps it a fixed build-time constant)
+      — store a raw scalar/vector, recompute `Abar/Bbar` (or fold `1/theta`
+      through the recurrence) so the discretization is differentiable, and add a
+      `dL/dtheta` term to the adjoint scan. Optional: a `TNNetHyperLMU` that
+      reads `theta` (or `Wout`) from a second input tensor like `TNNetHyperLinear`.
+- [ ] `TNNet.AddForgettingAttention` (FoX) follow-up: add
+      `examples/ForgettingTransformer/` once a CPU-cheap synthetic task is found
+      where the data-dependent decay reliably beats both plain SDPA and a
+      fixed-slope ALiBi baseline. First attempt (a gated post-reset-mean task)
+      confirmed the MECHANISM is correct — an attention diagnostic showed FoX's
+      learned gate drives `f~0` at the reset token and the query attends
+      UNIFORMLY over post-reset keys while zeroing pre-reset keys — but ALiBi's
+      recency prior was a hard-to-beat baseline on that particular setup, so the
+      example was deferred to avoid shipping a misleading "WARNING: FoX did not
+      beat baselines" headline. Also implement the paper's "Pro" variant
+      (per-head sigmoid output-gate + QK-norm) as opt-in flags on
+      `AddForgettingAttention`.
 - [ ] `TNNetTitansMemory` follow-up — a **gated-DeltaNet-style chunked parallel
       scan** forward for `TNNetTitansMemory`, replacing the sequential O(SeqLen)
       inner-gradient scan with a chunked associative/parallel recurrence (the
