@@ -24532,26 +24532,13 @@ end;
 
 { TNNetSerf }
 
-// Abramowitz & Stegun 7.1.26 polynomial approximation to erf(x);
-// |abs error| < 1.5e-7 over the entire real line. FreePascal's Math
-// unit does not export erf.
+// erf(x), the Gauss error function. Delegates to pascoremath32's pcr_erff,
+// a near-correctly-rounded single-precision implementation, replacing the
+// former Abramowitz & Stegun 7.1.26 polynomial (|err| < 1.5e-7). FreePascal's
+// Math unit does not export erf.
 function SerfErf(x: TNeuralFloat): TNeuralFloat;
-const
-  a1 =  0.254829592;
-  a2 = -0.284496736;
-  a3 =  1.421413741;
-  a4 = -1.453152027;
-  a5 =  1.061405429;
-  p  =  0.3275911;
-var
-  sign: TNeuralFloat;
-  ax, t, y: TNeuralFloat;
 begin
-  if x < 0 then sign := -1.0 else sign := 1.0;
-  ax := Abs(x);
-  t := 1.0 / (1.0 + p * ax);
-  y := 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * pcr_expf(-ax * ax);
-  Result := sign * y;
+  Result := pcr_erff(x);
 end;
 
 procedure TNNetSerf.Compute();
@@ -52990,7 +52977,7 @@ begin
   begin
     // Clamp just inside the ball boundary so atanh stays finite.
     if t > 1.0 - HYPERBOLIC_EPS then t := 1.0 - HYPERBOLIC_EPS;
-    Result := ArcTanh(t) / t;
+    Result := pcr_atanhf(t) / t;
   end;
 end;
 
@@ -53010,7 +52997,7 @@ begin
   begin
     if t > 1.0 - HYPERBOLIC_EPS then t := 1.0 - HYPERBOLIC_EPS;
     // d alpha / dt = ( t/(1-t^2) - atanh(t) ) / t^2 ; d alpha/dn = s * that.
-    datanh := ( t / (1.0 - t * t) - ArcTanh(t) ) / (t * t);
+    datanh := ( t / (1.0 - t * t) - pcr_atanhf(t) ) / (t * t);
     Result := s * datanh / n;
   end;
 end;
@@ -53062,7 +53049,7 @@ begin
   else
   begin
     if t > 1.0 - HYPERBOLIC_EPS then t := 1.0 - HYPERBOLIC_EPS;
-    datanh := ( t / (1.0 - t * t) - ArcTanh(t) ) / (t * t);
+    datanh := ( t / (1.0 - t * t) - pcr_atanhf(t) ) / (t * t);
     Result := datanh * n / (2.0 * s);
   end;
 end;
@@ -53545,7 +53532,7 @@ begin
     else
     begin
       if t > 1.0 - HYPERBOLIC_EPS then t := 1.0 - HYPERBOLIC_EPS;
-      dist := (2.0 / s) * ArcTanh(t);
+      dist := (2.0 / s) * pcr_atanhf(t);
     end;
     FOutput.FData[kk] := dist;
   end;
@@ -78758,7 +78745,7 @@ begin
         if (pp <= cEps) or (pp >= 1.0 - cEps) then
           hh := 0
         else
-          hh := -pp * Ln(pp) / Ln(2.0) - (1.0 - pp) * Ln(1.0 - pp) / Ln(2.0);
+          hh := -pp * pcr_log2f(pp) - (1.0 - pp) * pcr_log2f(1.0 - pp);
         SumGateEntropy[i] := SumGateEntropy[i] + hh;
       end;
 
