@@ -4698,6 +4698,42 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetDepthwiseConv1D: a TRUE per-channel (depthwise) 1-D convolution along
+  // the SizeX (time) axis. The input is a (SeqLen, 1, Depth) sequence laid out
+  // along SizeX exactly like TNNetCausalConv1D / the attention layers (SizeY
+  // must be 1). Unlike TNNetCausalConv1D (which is a full channel-mixing conv:
+  // each output channel reads ALL input channels), this layer applies a SEPARATE
+  // length-K kernel to EACH of the Depth channels INDEPENDENTLY -- there is NO
+  // cross-channel mixing. The channel count (Depth) is therefore preserved and
+  // inferred from the previous layer (not a constructor argument), so the total
+  // weight count is Depth*K, not Depth*Depth*K. This is the depthwise conv of
+  // the Conformer convolution module. For channel c, output position t and
+  // kernel tap k (0..K-1, K = KernelSize):
+  //   CAUSAL (default): y[t,0,c] = bias[c] + sum_k W[c][k] * x[t-(K-1-k),0,c]
+  //     with x[<0]=0 (left-only zero pad, no future leakage), length preserved.
+  //   NON-CAUSAL (SAME): the window is centred -- tap k reads
+  //     x[t - (K div 2) + k, 0, c], out-of-range positions are zero-padded on
+  //     both sides; length preserved.
+  // One neuron per channel c holds a (K,1,1) weight volume plus a scalar bias,
+  // so weights/bias serialize automatically via the base neuron save/load.
+  // KernelSize is stored in FStruct[1], the causal flag in FStruct[2] (1=causal,
+  // 0=SAME) and the bias-suppression flag in FStruct[4] for round-tripping.
+  // Backward is the exact conv backward (gradient w.r.t. input, per-channel
+  // weights and bias) restricted to the valid window. Scalar (not AVX) because
+  // the per-channel kernel is not contiguous along the depth axis.
+  // Coded by Claude (AI).
+  TNNetDepthwiseConv1D = class(TNNetLayer)
+    private
+      FKernelSize: integer; // kernel size K
+      FCausal: boolean;     // true = left-only pad (causal); false = centred SAME
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pKernelSize: integer; pCausal: boolean = true; pSuppressBias: integer = 0); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetDiagonalSSM: a diagonal-state linear-recurrence ("SSM-lite")
   // sequence mixer - the first genuinely recurrent layer in the library and an
   // O(n) causal alternative to the O(n^2) attention head. The input is a
@@ -33056,6 +33092,143 @@ begin
   InitHeUniform(1);
 end;
 
+{ TNNetDepthwiseConv1D }
+constructor TNNetDepthwiseConv1D.Create(pKernelSize: integer; pCausal: boolean = true; pSuppressBias: integer = 0);
+begin
+  inherited Create();
+  FKernelSize := Max(pKernelSize, 1);
+  FCausal := pCausal;
+  FSuppressBias := pSuppressBias;
+  FStruct[1] := FKernelSize;
+  if FCausal then FStruct[2] := 1 else FStruct[2] := 0;
+  FStruct[4] := FSuppressBias;
+end;
+
+procedure TNNetDepthwiseConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  SeqLen, Channels: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetDepthwiseConv1D requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  SeqLen := pPrevLayer.FOutput.SizeX;
+  Channels := pPrevLayer.FOutput.Depth;
+  // Depthwise: one neuron (own length-K kernel + bias) per input channel; the
+  // channel count is preserved.
+  AddNeurons(Channels);
+  FStruct[0] := Channels;
+  FOutput.ReSize(SeqLen, 1, Channels);
+  FOutputError.ReSize(SeqLen, 1, Channels);
+  FOutputErrorDeriv.ReSize(SeqLen, 1, Channels);
+  // Each channel's kernel is a (K, 1, 1) weight volume.
+  SetNumWeightsForAllNeurons(FKernelSize, 1, 1);
+  InitDefault();
+  AfterWeightUpdate();
+end;
+
+procedure TNNetDepthwiseConv1D.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  SeqLen, Channels, Ksize, t, c, kk, srcT, off: integer;
+  W: TNNetVolume;
+  sum: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Channels := FNeurons.Count;
+  Ksize := FKernelSize;
+  // Offset of the first tap relative to t: causal reads [t-(K-1) .. t], SAME
+  // reads [t-(K div 2) .. t-(K div 2)+K-1].
+  if FCausal then off := Ksize - 1 else off := Ksize div 2;
+  for c := 0 to Channels - 1 do
+  begin
+    localNeuron := FNeurons[c];
+    W := localNeuron.FWeights;
+    for t := 0 to SeqLen - 1 do
+    begin
+      if FSuppressBias = 0
+        then sum := localNeuron.FBiasWeight
+        else sum := 0;
+      for kk := 0 to Ksize - 1 do
+      begin
+        srcT := t - off + kk;
+        if (srcT < 0) or (srcT >= SeqLen) then continue; // zero pad
+        sum := sum + W.FData[kk] * Prev[srcT, 0, c];
+      end;
+      FOutput[t, 0, c] := sum;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDepthwiseConv1D.Backpropagate();
+var
+  StartTime: double;
+  Prev, PrevErr: TNNetVolume;
+  SeqLen, Channels, Ksize, t, c, kk, srcT, off: integer;
+  W, GW: TNNetVolume;
+  gy: TNeuralFloat;
+  localNeuron: TNNetNeuron;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  Channels := FNeurons.Count;
+  Ksize := FKernelSize;
+  if FCausal then off := Ksize - 1 else off := Ksize div 2;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = Prev.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+
+  // Exact depthwise conv backward. For channel c, position t and tap kk reading
+  // srcT = t-off+kk (in range):
+  //   dL/dW[c][kk]   += OutErr[t,c] * x[srcT,c]
+  //   dL/dx[srcT,c]  += OutErr[t,c] * W[c][kk]
+  //   dL/dbias[c]    += OutErr[t,c]
+  // The -FLearningRate convention is applied to the accumulated weight/bias
+  // deltas (matching TNNetCausalConv1D).
+  for c := 0 to Channels - 1 do
+  begin
+    localNeuron := FNeurons[c];
+    W := localNeuron.FWeights;
+    GW := localNeuron.FDelta;
+    for t := 0 to SeqLen - 1 do
+    begin
+      gy := FOutputError[t, 0, c];
+      if gy = 0 then continue;
+      if FSuppressBias = 0 then
+        localNeuron.FBiasDelta := localNeuron.FBiasDelta + (-FLearningRate) * gy;
+      for kk := 0 to Ksize - 1 do
+      begin
+        srcT := t - off + kk;
+        if (srcT < 0) or (srcT >= SeqLen) then continue;
+        GW.FData[kk] := GW.FData[kk] + (-FLearningRate) * gy * Prev[srcT, 0, c];
+        if hasInputGrad then
+          PrevErr[srcT, 0, c] := PrevErr[srcT, 0, c] + gy * W.FData[kk];
+      end;
+    end;
+    if (not FBatchUpdate) then localNeuron.UpdateWeights(FInertia);
+  end;
+  if (not FBatchUpdate) then AfterWeightUpdate();
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetDepthwiseConv1D.InitDefault();
+begin
+  // He init, like the convolution layers.
+  InitHeUniform(1);
+end;
+
 { TNNetDiagonalSSM }
 constructor TNNetDiagonalSSM.Create();
 begin
@@ -45377,15 +45550,16 @@ begin
 
   // ---- (3) Convolution module. ----------------------------------------------
   // Pre-norm residual: LayerNorm -> pointwise expand to 2*d_model -> GLU gating
-  // (back to d_model) -> 1-D conv over the time axis (causal/SAME, length
-  // preserved) -> Swish -> pointwise projection back to d_model. See the header
-  // note: TNNetCausalConv1D is a full (channel-mixing) 1-D sequence conv used as
-  // the closest available stand-in for the paper's per-channel depthwise conv.
+  // (back to d_model) -> per-channel depthwise 1-D conv over the time axis
+  // (causal, length preserved) -> Swish -> pointwise projection back to d_model.
+  // TNNetDepthwiseConv1D is the paper-faithful depthwise conv: each of the
+  // d_model channels gets its OWN length-K time kernel with NO cross-channel
+  // mixing, so the channel count is preserved.
   BranchInput := GetLastLayer();
   AddLayer( TNNetLayerNorm.Create() );
   AddLayer( TNNetPointwiseConvLinear.Create(2 * d_model) );
   AddLayer( TNNetGLU.Create() );
-  AddLayer( TNNetCausalConv1D.Create(d_model, ConvKernelSize) );
+  AddLayer( TNNetDepthwiseConv1D.Create(ConvKernelSize, {pCausal=}true) );
   AddLayer( TNNetSwish.Create() );
   AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
@@ -79949,6 +80123,7 @@ begin
       'TNNetSquash' :               Result := TNNetSquash.Create(St[0]);
       'TNNetCapsuleRouting' :       Result := TNNetCapsuleRouting.Create(St[1], St[2], St[3], St[4], St[0]);
       'TNNetCausalConv1D' :         Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1));
+      'TNNetDepthwiseConv1D' :      Result := TNNetDepthwiseConv1D.Create(St[1], St[2] = 1, St[4]);
       'TNNetGaussianNoise' :        Result := TNNetGaussianNoise.Create(Ft[0]);
       'TNNetGaussianDropout' :      Result := TNNetGaussianDropout.Create(Ft[0]);
       'TNNetReshape' :              Result := TNNetReshape.Create(St[0], St[1], St[2]);
@@ -80321,6 +80496,7 @@ begin
       if S[0] = 'TNNetSquash' then Result := TNNetSquash.Create(St[0]) else
       if S[0] = 'TNNetCapsuleRouting' then Result := TNNetCapsuleRouting.Create(St[1], St[2], St[3], St[4], St[0]) else
       if S[0] = 'TNNetCausalConv1D' then Result := TNNetCausalConv1D.Create(St[0], St[1], St[4], Max(St[5], 1)) else
+      if S[0] = 'TNNetDepthwiseConv1D' then Result := TNNetDepthwiseConv1D.Create(St[1], St[2] = 1, St[4]) else
       if S[0] = 'TNNetGaussianNoise' then Result := TNNetGaussianNoise.Create(Ft[0]) else
       if S[0] = 'TNNetGaussianDropout' then Result := TNNetGaussianDropout.Create(Ft[0]) else
       if S[0] = 'TNNetReshape' then Result := TNNetReshape.Create(St[0], St[1], St[2]) else
