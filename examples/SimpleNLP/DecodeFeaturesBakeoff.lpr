@@ -18,7 +18,19 @@ of the budget for the decode benchmark itself.
            quo) and (b) token-at-a-time through a weight-copied 1-token step
            net with BeginIncrementalDecode + RoPE PositionOffset per step.
            HARD ASSERT: both arms emit the SAME tokens. Prints ms/token.
-  Phase 2 (commit 4d95378): MTP-heads self-speculative decode.   [stub]
+  Phase 2 (commit 4d95378): MTP-heads self-speculative decode. Trains the
+           SAME trunk as phase 1 but with TNNet.AddMultiTokenPrediction
+           (NumFuture=3): head 0 is the ordinary next-token head, heads 1..2
+           forecast t+2/t+3 and double as a built-in draft -- no second
+           network. Greedy self-speculative decoding: each full re-encode
+           forward verifies the pending drafts (accept-until-first-mismatch;
+           a rejection still commits head-0's corrected token; full
+           acceptance yields a bonus token) and drafts the next block from
+           heads 1..2 at the last committed row. KV-cache composition is NOT
+           attempted (drafts come from forwards a cache never saw after
+           rejection -- known open problem), so both arms re-encode fully and
+           the win measured is forwards/token and wall clock. HARD ASSERT:
+           self-speculative output == plain greedy from the same model.
   Phase 3 (commit 80dd830): DiagonalSSM O(1)-per-step decode.    [stub]
   Phase 4 (commit a8f3077): MLA decoupled-RoPE latent KV cache.  [stub]
   Phase 5 (commit 42dd5dd): speculative decoding COMPOSED with the KV cache
@@ -97,6 +109,7 @@ const
   csTotalBudgetSec   = 270;
   csBenchReserveSec  = 60;   // kept free for the decode benchmark
   csTrainCapSec      = 185;  // phase 1: never train longer than this
+  csTrainCapSecMTP   = 195;  // phase 2: MTP decode bench is cheap, train more
   csDraftCapSec      = 160;  // phase 5: draft training cap
   // ---- decode benchmark ----
   csGenTokens        = 40;   // tokens generated per prompt per arm
@@ -105,6 +118,8 @@ const
   // ---- phase 5 draft model ----
   csDraftEmbedDim    = 64;
   csDraftFFNDim      = 256;
+  // ---- phase 2 MTP heads ----
+  csNumFuture        = 3;    // t+1 (committed) + t+2,t+3 (the built-in draft)
 
 const
   csPrompts: array[0..1] of string = ('one day', 'once upon a time');
@@ -166,6 +181,7 @@ type
     FNN: TNNet;                       // the net currently being trained
     NFit: TNeuralDataLoadingFit;      // the fit currently running
     FTrainDeadlineMs: double;         // OnAfterStep raises ShouldQuit past this
+    FNumFuture: integer;              // >1 only in phase 2 (MTP target layout)
     procedure DoRun; override;
     // shared helpers
     procedure RequireDatasetFiles;
@@ -189,8 +205,19 @@ type
     procedure GreedySpecCached(var Step: TStepNet; Draft: TNNet;
       var Toks: TTokenBuf; PromptLen, MaxNew: integer; out OutLen: integer;
       out Ms: double; out TgtFwds, DraftFwds, Passes, Proposed, Accepted: integer);
+    // phase 2 (MTP heads as built-in draft; full re-encode arms)
+    function BuildModelMTP(ContextLen: integer): TNNet;
+    function MTPHeadArgmax(NN: TNNet; Row, Head: integer): integer;
+    procedure MTPGreedyFull(NN: TNNet; var Toks: TTokenBuf;
+      PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
+      out Fwds: integer);
+    procedure MTPSelfSpec(NN: TNNet; var Toks: TTokenBuf;
+      PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
+      out Fwds, Passes, Committed: integer;
+      var Verified, Accepted: array of integer);
     // phases
     procedure RunPhase1;
+    procedure RunPhase2;
     procedure RunPhase5;
     procedure RunStub(Phase: integer);
   public
@@ -280,6 +307,27 @@ begin
   Result.AddLayer(TNNetPointwiseSoftMax.Create(1));
 end;
 
+// Phase 2 model: the SAME trunk as BuildModel, but the single next-token head
+// is replaced by TNNet.AddMultiTokenPrediction(csNumFuture): NumFuture
+// parallel per-token (PointwiseConvLinear + softmax) heads tapping the shared
+// trunk, concatenated along depth. Output (ContextLen,1,csNumFuture*Vocab);
+// head h occupies depth slab [h*Vocab .. (h+1)*Vocab-1] and forecasts, at row
+// t, the token at position t+1+h.
+function TDecodeBakeoff.BuildModelMTP(ContextLen: integer): TNNet;
+var
+  B: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02));
+  for B := 1 to csBlocks do
+    Result.AddTransformerEncoderBlock(csHeads, csFFNDim,
+      {PreNorm=}true, {CausalMask=}true, {UseRoPE=}true,
+      {NormClass=}TNNetDyT);
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csEmbedDim));
+  Result.AddMultiTokenPrediction(csNumFuture, csModelVocabSize);
+end;
+
 // ---------------------------------------------------------------------------
 // Time-boxed training. TNeuralDataLoadingFit exposes a public ShouldQuit flag
 // that the training loop checks after every batch (and before validation /
@@ -292,11 +340,25 @@ begin
 end;
 
 procedure TDecodeBakeoff.OnAfterEpoch(Sender: TObject);
+var
+  Toks: TTokenBuf;
+  PLen, OLen, Fw: integer;
+  SampleMs: double;
 begin
   // Convergence clue after each completed epoch.
-  WriteLn('[t=', ElapsedSec():0:1, 's] sample: ',
-    GenerateStringFromCasualNN(NFit.NN, FDictionary, 'one day', nil,
-      csNeuralEncodingMethodIntChar), '.');
+  if FNumFuture > 1 then
+  begin
+    // MTP net: GenerateStringFromCasualNN would argmax over the WHOLE
+    // NumFuture*Vocab concat depth (token ids >= Vocab); sample head 0 only.
+    PLen := PromptToTokens('one day', Toks);
+    MTPGreedyFull(NFit.NN, Toks, PLen, 16, OLen, SampleMs, Fw);
+    WriteLn('[t=', ElapsedSec():0:1, 's] sample (head 0): one day ',
+      TokensToText(Toks, PLen, OLen - PLen), '.');
+  end
+  else
+    WriteLn('[t=', ElapsedSec():0:1, 's] sample: ',
+      GenerateStringFromCasualNN(NFit.NN, FDictionary, 'one day', nil,
+        csNeuralEncodingMethodIntChar), '.');
 end;
 
 procedure TDecodeBakeoff.TrainTimeBoxed(NN: TNNet; BudgetSec: double;
@@ -346,6 +408,7 @@ procedure TDecodeBakeoff.GetTrainingPair(Idx: integer; ThreadId: integer;
 var
   SampleId, SampleLen, SampleCutPosition, ExpectedTokenInt: integer;
   AIntegerArray: array of integer;
+  t, h, fut: integer;
 begin
   if FNN.GetFirstLayer().Output.Size <> pInput.Size then pInput.ReSize(FNN.GetFirstLayer().Output);
   if FNN.GetLastLayer().Output.Size <> pOutput.Size then pOutput.ReSize(FNN.GetLastLayer().Output);
@@ -356,8 +419,25 @@ begin
   AIntegerArray := Copy(FDataset[SampleId], 0, SampleCutPosition);
   pInput.Fill(0);
   pInput.CopyNoChecksIntArr(AIntegerArray);
-  AIntegerArray := Copy(FDataset[SampleId], 1, SampleCutPosition);
-  pOutput.OneHotEncoding(AIntegerArray);
+  if FNumFuture > 1 then
+  begin
+    // MTP targets: head h's slab at row t supervises the token at position
+    // t+1+h (reading past the input window into the same story is fine; rows
+    // past the story end carry no supervision).
+    pOutput.Fill(0);
+    for t := 0 to SampleCutPosition - 1 do
+      for h := 0 to FNumFuture - 1 do
+      begin
+        fut := t + 1 + h;
+        if fut < Length(FDataset[SampleId]) then
+          pOutput[t, 0, h * csModelVocabSize + FDataset[SampleId][fut]] := 1.0;
+      end;
+  end
+  else
+  begin
+    AIntegerArray := Copy(FDataset[SampleId], 1, SampleCutPosition);
+    pOutput.OneHotEncoding(AIntegerArray);
+  end;
   pOutput.Tag := ExpectedTokenInt;
 end;
 
@@ -366,6 +446,7 @@ procedure TDecodeBakeoff.GetValidationPair(Idx: integer; ThreadId: integer;
 var
   SampleId, SampleLen, SampleCutPosition, ExpectedTokenInt: integer;
   AIntegerArray: array of integer;
+  t, h, fut: integer;
 begin
   if FNN.GetFirstLayer().Output.Size <> pInput.Size then pInput.ReSize(FNN.GetFirstLayer().Output);
   if FNN.GetLastLayer().Output.Size <> pOutput.Size then pOutput.ReSize(FNN.GetLastLayer().Output);
@@ -376,8 +457,22 @@ begin
   AIntegerArray := Copy(FDataset[SampleId], 0, SampleCutPosition);
   pInput.Fill(0);
   pInput.CopyNoChecksIntArr(AIntegerArray);
-  AIntegerArray := Copy(FDataset[SampleId], 1, SampleCutPosition);
-  pOutput.OneHotEncoding(AIntegerArray);
+  if FNumFuture > 1 then
+  begin
+    pOutput.Fill(0);
+    for t := 0 to SampleCutPosition - 1 do
+      for h := 0 to FNumFuture - 1 do
+      begin
+        fut := t + 1 + h;
+        if fut < Length(FDataset[SampleId]) then
+          pOutput[t, 0, h * csModelVocabSize + FDataset[SampleId][fut]] := 1.0;
+      end;
+  end
+  else
+  begin
+    AIntegerArray := Copy(FDataset[SampleId], 1, SampleCutPosition);
+    pOutput.OneHotEncoding(AIntegerArray);
+  end;
   pOutput.Tag := ExpectedTokenInt;
 end;
 
@@ -752,6 +847,284 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Phase 2: MTP heads as a built-in draft -- self-speculative greedy decode
+// from ONE model (commit 4d95378; pattern from examples/SelfSpeculativeDecoding
+// ported to this real tokenized workload).
+//
+// Both decode arms below use FULL RE-ENCODE forwards on purpose: composing the
+// KV cache with MTP drafting is a known open problem (the drafts for the next
+// pass come from a forward whose window the cache never saw after a rejection),
+// so the win measured here is forwards/token and wall clock at equal
+// per-forward cost -- NOT a cache composition.
+// ---------------------------------------------------------------------------
+
+// Greedy argmax of head Head's softmax slab at row Row: the MTP model's
+// forecast for the token at position Row+1+Head.
+function TDecodeBakeoff.MTPHeadArgmax(NN: TNNet; Row, Head: integer): integer;
+var
+  v: integer;
+  p, bestP: TNeuralFloat;
+begin
+  Result := 0;
+  bestP := -1;
+  for v := 0 to csModelVocabSize - 1 do
+  begin
+    p := NN.GetLastLayer().Output[Row, 0, Head * csModelVocabSize + v];
+    if p > bestP then begin bestP := p; Result := v; end;
+  end;
+end;
+
+// Plain greedy from the MTP model: one full re-encode forward per token, head
+// 0 only (GreedyFull can't be reused -- GetClassOnPixel would argmax over the
+// WHOLE NumFuture*Vocab concat depth).
+procedure TDecodeBakeoff.MTPGreedyFull(NN: TNNet; var Toks: TTokenBuf;
+  PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
+  out Fwds: integer);
+var
+  InV: TNNetVolume;
+  t: integer;
+  T0: double;
+begin
+  InV := TNNetVolume.Create(csContextLen, 1, 1);
+  try
+    OutLen := PromptLen;
+    Fwds := 0;
+    T0 := NowMs();
+    while (OutLen - PromptLen < MaxNew) and (OutLen < csContextLen) do
+    begin
+      InV.Fill(0);
+      for t := 0 to OutLen - 1 do InV.FData[t] := Toks[t];
+      NN.Compute(InV);
+      Inc(Fwds);
+      Toks[OutLen] := MTPHeadArgmax(NN, OutLen - 1, 0);
+      Inc(OutLen);
+    end;
+    Ms := NowMs() - T0;
+  finally
+    InV.Free;
+  end;
+end;
+
+// SELF-SPECULATIVE greedy decode: ONE forward per pass; the same pass verifies
+// the previous block's drafts AND drafts the next block from heads 1..N-1.
+//   1. Forward the committed prefix PLUS the pending drafts (full re-encode).
+//   2. Verify drafts left-to-right: draft j (position len+j, proposed by head
+//      j+1 last pass) is accepted iff it equals head-0's argmax at row
+//      len+j-1 -- exactly plain greedy's token there, because every row left
+//      of the first mismatch sees only committed-or-accepted context.
+//   3. First mismatch: head-0's argmax at that row IS the correct greedy
+//      token, so commit it (a rejection still yields one token) and discard
+//      the rest. Full acceptance: head 0 at the last draft row yields a BONUS
+//      token from the same forward.
+//   4. New drafts come from heads 1..N-1 at the row that produced the LAST
+//      committed token -- a row whose causal context is fully committed, so
+//      the proposals are well-defined.
+// Every committed token is head-0's argmax over committed-only context =>
+// output is token-identical to plain greedy (the phase's HARD ASSERT).
+// Verified[j]/Accepted[j] count draft slot j (head j+1, distance t+2+j).
+procedure TDecodeBakeoff.MTPSelfSpec(NN: TNNet; var Toks: TTokenBuf;
+  PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
+  out Fwds, Passes, Committed: integer;
+  var Verified, Accepted: array of integer);
+var
+  InV: TNNetVolume;
+  len, m, j, h, lastRow, newLen, pos, g, t: integer;
+  mismatch: boolean;
+  T0: double;
+begin
+  InV := TNNetVolume.Create(csContextLen, 1, 1);
+  try
+    len := PromptLen;   // committed length
+    m := 0;             // pending drafts at positions len..len+m-1
+    Fwds := 0; Passes := 0; Committed := 0;
+    T0 := NowMs();
+    while (len - PromptLen < MaxNew) and (len < csContextLen) do
+    begin
+      // One forward over committed prefix + pending drafts.
+      InV.Fill(0);
+      for t := 0 to len + m - 1 do InV.FData[t] := Toks[t];
+      NN.Compute(InV);
+      Inc(Fwds);
+      Inc(Passes);
+
+      // Verify pending drafts left-to-right.
+      j := 0;
+      mismatch := false;
+      while (j < m) and (not mismatch) do
+      begin
+        g := MTPHeadArgmax(NN, len + j - 1, 0);
+        Inc(Verified[j]);
+        if g = Toks[len + j] then
+        begin
+          Inc(Accepted[j]);
+          Inc(j);
+        end
+        else
+        begin
+          Toks[len + j] := g;   // corrected token: still exact greedy
+          mismatch := true;
+        end;
+      end;
+
+      if mismatch then
+      begin
+        lastRow := len + j - 1; // row that produced the corrected token
+        newLen := len + j + 1;  // j accepted drafts + 1 corrected token
+      end
+      else
+      begin
+        // All m drafts accepted; bonus token from head 0 at the last draft
+        // row (with m=0 this is the plain first-pass commit).
+        lastRow := len + m - 1;
+        if len + m < csContextLen then
+        begin
+          Toks[len + m] := MTPHeadArgmax(NN, lastRow, 0);
+          newLen := len + m + 1;
+        end
+        else
+          newLen := len + m;
+      end;
+      Committed := Committed + (newLen - len);
+
+      // Draft the next block from heads 1..N-1 at the last committed row.
+      m := 0;
+      for h := 1 to csNumFuture - 1 do
+      begin
+        pos := lastRow + 1 + h;     // = newLen-1+h
+        if pos >= csContextLen then break;
+        Toks[pos] := MTPHeadArgmax(NN, lastRow, h);
+        Inc(m);
+      end;
+      len := newLen;
+    end;
+    // A fully-accepted final pass may overshoot MaxNew; trim so the exactness
+    // comparison and ms/token are over exactly MaxNew tokens.
+    if len > PromptLen + MaxNew then len := PromptLen + MaxNew;
+    OutLen := len;
+    Ms := NowMs() - T0;
+  finally
+    InV.Free;
+  end;
+end;
+
+procedure TDecodeBakeoff.RunPhase2;
+var
+  Trained: TNNet;
+  PlainToks, SpecToks: TTokenBuf;
+  Verified, Accepted: array[0..csNumFuture - 2] of integer;
+  PromptLen, PlainLen, SpecLen: integer;
+  PlainMs, SpecMs: double;
+  PlainFwds, SpecFwds, Passes, Committed: integer;
+  SumNew, SumPlainFwds, SumSpecFwds, SumPasses, SumCommitted: integer;
+  SumPlainMs, SumSpecMs: double;
+  p, t, h, NewToks: integer;
+  TrainSec: double;
+begin
+  WriteLn('=== Phase 2: MTP-heads self-speculative decode (4d95378) ===');
+  LoadDataset();
+
+  FNumFuture := csNumFuture; // switches Get*Pair + OnAfterEpoch to MTP layout
+  Trained := BuildModelMTP(csContextLen);
+  WriteLn('Model: ctx=', csContextLen, ' d_model=', csEmbedDim, ' blocks=',
+    csBlocks, ' heads=', csHeads, ' ffn=', csFFNDim, ' vocab=',
+    csModelVocabSize, ' NumFuture=', csNumFuture, '  params=',
+    Trained.CountWeights());
+
+  TrainSec := Min(csTrainCapSecMTP,
+    csTotalBudgetSec - ElapsedSec() - csBenchReserveSec);
+  if TrainSec < 10 then
+  begin
+    WriteLn('ERROR: no time left to train (data loading took too long).');
+    Halt(1);
+  end;
+  // lr=0.001 (vs phase 1's 0.0005): the 3-head MTP forward+backward is ~2x
+  // the cost of phase 1's single-head step, so fewer examples fit in the box;
+  // the higher rate recovers a comparable loss drop.
+  TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.001);
+
+  try
+    for h := 0 to csNumFuture - 2 do
+    begin
+      Verified[h] := 0;
+      Accepted[h] := 0;
+    end;
+    SumNew := 0; SumPlainFwds := 0; SumSpecFwds := 0;
+    SumPasses := 0; SumCommitted := 0;
+    SumPlainMs := 0; SumSpecMs := 0;
+
+    WriteLn;
+    WriteLn('Greedy decode showdown (', csGenTokens,
+      ' tokens per prompt; both arms full re-encode, same MTP model):');
+    for p := 0 to High(csPrompts) do
+    begin
+      PromptLen := PromptToTokens(csPrompts[p], PlainToks);
+      SpecToks := PlainToks;
+
+      MTPGreedyFull(Trained, PlainToks, PromptLen, csGenTokens,
+        PlainLen, PlainMs, PlainFwds);
+      MTPSelfSpec(Trained, SpecToks, PromptLen, csGenTokens,
+        SpecLen, SpecMs, SpecFwds, Passes, Committed, Verified, Accepted);
+
+      // HARD ASSERT: self-speculative output token-identical to plain greedy.
+      if SpecLen <> PlainLen then
+      begin
+        WriteLn('ASSERT FAILED: plain arm emitted ', PlainLen - PromptLen,
+          ' tokens but self-speculative arm emitted ', SpecLen - PromptLen, '.');
+        Halt(1);
+      end;
+      for t := PromptLen to PlainLen - 1 do
+        if SpecToks[t] <> PlainToks[t] then
+        begin
+          WriteLn('ASSERT FAILED: self-speculative diverges from plain greedy',
+            ' at position ', t, ' (greedy=', PlainToks[t], ' spec=',
+            SpecToks[t], ') for prompt "', csPrompts[p], '".');
+          Halt(1);
+        end;
+
+      NewToks := PlainLen - PromptLen;
+      Inc(SumNew, NewToks);
+      Inc(SumPlainFwds, PlainFwds); Inc(SumSpecFwds, SpecFwds);
+      Inc(SumPasses, Passes); Inc(SumCommitted, Committed);
+      SumPlainMs := SumPlainMs + PlainMs;
+      SumSpecMs := SumSpecMs + SpecMs;
+
+      WriteLn;
+      WriteLn('Prompt: "', csPrompts[p], '"  (both arms token-identical)');
+      WriteLn('  text: ', csPrompts[p], ' ',
+        TokensToText(PlainToks, PromptLen, NewToks));
+      WriteLn(Format('  plain greedy     : %8.2f ms total  %6.2f ms/token  (%d forwards)',
+        [PlainMs, PlainMs / Max(1, NewToks), PlainFwds]));
+      WriteLn(Format('  self-speculative : %8.2f ms total  %6.2f ms/token  (%d forwards)',
+        [SpecMs, SpecMs / Max(1, NewToks), SpecFwds]));
+    end;
+
+    WriteLn;
+    WriteLn('Aggregate over ', Length(csPrompts), ' prompts (', SumNew,
+      ' tokens):');
+    WriteLn('  accept rate per head distance (head h forecasts t+1+h):');
+    for h := 1 to csNumFuture - 1 do
+      WriteLn(Format('    head %d (t+%d): %5.1f%%  (%d/%d drafts verified)',
+        [h, h + 1, 100.0 * Accepted[h - 1] / Max(1, Verified[h - 1]),
+         Accepted[h - 1], Verified[h - 1]]));
+    WriteLn(Format('  mean committed tokens per verification pass: %.2f',
+      [SumCommitted / Max(1, SumPasses)]));
+    WriteLn('  arm                ms/token   target-fwd/token');
+    WriteLn(Format('  plain greedy       %8.2f   %16.2f',
+      [SumPlainMs / Max(1, SumNew), SumPlainFwds / Max(1, SumNew)]));
+    WriteLn(Format('  self-speculative   %8.2f   %16.2f',
+      [SumSpecMs / Max(1, SumNew), SumSpecFwds / Max(1, SumNew)]));
+    WriteLn(Format('  speedup            : %.2fx wall clock   %.2fx forwards',
+      [SumPlainMs / Max(SumSpecMs, 1e-9),
+       SumPlainFwds / Max(1.0, SumSpecFwds * 1.0)]));
+    WriteLn;
+    WriteLn('Phase 2: PASS (self-speculative decode is token-exact). [t=',
+      ElapsedSec():0:1, 's]');
+  finally
+    Trained.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
 // Phase 5: speculative decoding composed with the KV cache (commit 42dd5dd).
 // ---------------------------------------------------------------------------
 procedure TDecodeBakeoff.RunPhase5;
@@ -899,8 +1272,6 @@ end;
 procedure TDecodeBakeoff.RunStub(Phase: integer);
 begin
   case Phase of
-    2: WriteLn('phase 2: not yet implemented ',
-         '(MTP-heads self-speculative decode, commit 4d95378)');
     3: WriteLn('phase 3: not yet implemented ',
          '(DiagonalSSM O(1)-per-step decode variant, commit 80dd830)');
     4: WriteLn('phase 4: not yet implemented ',
@@ -937,7 +1308,7 @@ begin
   begin
     WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..5)');
     WriteLn('  1: KV-cache incremental decode vs full re-encode (2dacc95)');
-    WriteLn('  2: MTP-heads self-speculative decode (4d95378) [stub]');
+    WriteLn('  2: MTP-heads self-speculative decode (4d95378)');
     WriteLn('  3: DiagonalSSM O(1)-per-step decode (80dd830) [stub]');
     WriteLn('  4: MLA decoupled-RoPE latent KV cache (a8f3077) [stub]');
     WriteLn('  5: speculative decoding + KV cache rollback (42dd5dd)');
@@ -950,6 +1321,7 @@ begin
   try
     case Phase of
       1: RunPhase1;
+      2: RunPhase2;
       5: RunPhase5;
     else
       RunStub(Phase);
