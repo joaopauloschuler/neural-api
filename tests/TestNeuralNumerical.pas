@@ -868,6 +868,7 @@ type
     procedure TestTransformerEncoderBlockCustomNorm;
     procedure TestMultiTokenPredictionShapes;
     procedure TestMultiTokenPredictionGradientCheck;
+    procedure TestSelfSpeculativeDecodeGreedyExactness;
     procedure TestTransformerDecoderBlockGradientCheck;
     procedure TestHardConcreteGateLimits;
     procedure TestHardConcreteGradientCheck;
@@ -13892,6 +13893,126 @@ begin
     end;
   finally
     NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSelfSpeculativeDecodeGreedyExactness;
+// Self-speculative greedy decoding from an AddMultiTokenPrediction model
+// (see examples/SelfSpeculativeDecoding): heads 1..NumFuture-1 act as the
+// draft, one forward per pass verifies the previous block against head 0's
+// greedy argmax and drafts the next block. Greedy speculative decoding is
+// EXACT for ANY model, so an untrained (fixed-seed) net suffices: the
+// speculative token sequence must equal plain one-token-per-forward greedy
+// decoding, and must take no MORE passes than plain decoding takes forwards.
+const
+  Vocab = 5; SeqLen = 16; NumFuture = 3; PrefixLen = 3; GenTokens = 10;
+var
+  NN: TNNet;
+  InputV: TNNetVolume;
+  PlainSeq, SpecSeq: array[0..SeqLen - 1] of integer;
+  t, len, m, j, h, lastRow, newLen, pos, g, passes, plainFwd: integer;
+  mismatch: boolean;
+
+  procedure RunForward(const S: array of integer; ALen: integer);
+  var p: integer;
+  begin
+    InputV.Fill(0);
+    for p := 0 to ALen - 1 do InputV.FData[p] := S[p];
+    NN.Compute(InputV);
+  end;
+
+  function HeadArgmax(Row, Head: integer): integer;
+  var v: integer; p, bestP: TNeuralFloat;
+  begin
+    Result := 0; bestP := -1;
+    for v := 0 to Vocab - 1 do
+    begin
+      p := NN.GetLastLayer.Output[Row, 0, Head * Vocab + v];
+      if p > bestP then begin bestP := p; Result := v; end;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  InputV := TNNetVolume.Create(SeqLen, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(Vocab, 8, 1));
+    NN.AddLayer(TNNetSinusoidalPositionalEmbedding.Create());
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(3 * 8)); // Q|K|V slab
+    NN.AddMultiHeadSelfAttention(2, {CausalMask=}True);
+    NN.AddMultiTokenPrediction(NumFuture, Vocab);
+
+    for t := 0 to SeqLen - 1 do begin PlainSeq[t] := 0; SpecSeq[t] := 0; end;
+    PlainSeq[0] := 1; PlainSeq[1] := 3; PlainSeq[2] := 2;
+    for t := 0 to PrefixLen - 1 do SpecSeq[t] := PlainSeq[t];
+
+    // Plain greedy: one forward per token, head 0 argmax at the last row.
+    len := PrefixLen; plainFwd := 0;
+    while len - PrefixLen < GenTokens do
+    begin
+      RunForward(PlainSeq, len);
+      Inc(plainFwd);
+      PlainSeq[len] := HeadArgmax(len - 1, 0);
+      Inc(len);
+    end;
+
+    // Self-speculative greedy (mirrors examples/SelfSpeculativeDecoding).
+    len := PrefixLen; m := 0; passes := 0;
+    while (len - PrefixLen < GenTokens) and (len < SeqLen) do
+    begin
+      RunForward(SpecSeq, len + m);
+      Inc(passes);
+      j := 0;
+      mismatch := false;
+      while (j < m) and (not mismatch) do
+      begin
+        g := HeadArgmax(len + j - 1, 0);
+        if g = SpecSeq[len + j] then
+          Inc(j)
+        else
+        begin
+          SpecSeq[len + j] := g;
+          mismatch := true;
+        end;
+      end;
+      if mismatch then
+      begin
+        lastRow := len + j - 1;
+        newLen := len + j + 1;
+      end
+      else
+      begin
+        lastRow := len + m - 1;
+        if len + m < SeqLen then
+        begin
+          SpecSeq[len + m] := HeadArgmax(lastRow, 0);
+          newLen := len + m + 1;
+        end
+        else
+          newLen := len + m;
+      end;
+      m := 0;
+      for h := 1 to NumFuture - 1 do
+      begin
+        pos := lastRow + 1 + h;
+        if pos >= SeqLen then Break;
+        SpecSeq[pos] := HeadArgmax(lastRow, h);
+        Inc(m);
+      end;
+      len := newLen;
+    end;
+
+    AssertTrue('self-spec decode must take at least one pass', passes >= 1);
+    AssertTrue('self-spec passes must not exceed plain forwards (' +
+      IntToStr(passes) + ' vs ' + IntToStr(plainFwd) + ')', passes <= plainFwd);
+    for t := 0 to PrefixLen + GenTokens - 1 do
+      AssertTrue('self-speculative greedy must equal plain greedy at position ' +
+        IntToStr(t) + ' (plain=' + IntToStr(PlainSeq[t]) + ' spec=' +
+        IntToStr(SpecSeq[t]) + ')', PlainSeq[t] = SpecSeq[t]);
+  finally
+    NN.Free; InputV.Free;
   end;
 end;
 

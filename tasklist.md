@@ -94,10 +94,13 @@ rather than acted on.
             handle d cores but the example and tests exercise d=2 (with auto-factoring
             capped at 6). Add an explicit d=3 gradient-check arm and a d=3 example
             point so the multi-core chain is covered by a test, not just constructible.
-- [ ] Multi-Token Prediction follow-up (TNNet.AddMultiTokenPrediction landed
+- [x] Multi-Token Prediction follow-up (TNNet.AddMultiTokenPrediction landed
       2026-06-07, commit be16117): Inference-time self-speculative decode — reuse
       the extra future heads as a built-in draft (drop the SpeculativeDecoding
       example's second net); show accept-rate / wall-clock on a tiny corpus.
+      (DONE: examples/SelfSpeculativeDecoding — exact-greedy accept/verify loop,
+      accept rates 68.5/79.5/89.7% per head distance, 60.9% forwards saved,
+      2.04x wall-clock; smoke test TestSelfSpeculativeDecodeGreedyExactness.)
 - [ ] TNNetMinGRU / TNNetMinLSTM follow-up (landed 2026-06-07, commit 69f8d53):
       Parallel-prefix-scan forward (the paper's main systems win) so training is
       not a strict per-token left-to-right loop; gate behind an exact-vs-parallel
