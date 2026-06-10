@@ -305,7 +305,6 @@ type
     // shared helpers
     procedure RequireDatasetFiles;
     procedure LoadDataset;
-    function BuildModel(ContextLen: integer): TNNet;
     function BuildDraft(ContextLen: integer): TNNet;
     procedure TrainTimeBoxed(NN: TNNet; BudgetSec: double;
       SamplesPerEpoch: integer; LearningRate: TNeuralFloat);
@@ -325,17 +324,11 @@ type
     procedure GreedySpecCached(var Step: TStepNet; Draft: TNNet;
       var Toks: TTokenBuf; PromptLen, MaxNew: integer; out OutLen: integer;
       out Ms: double; out TgtFwds, DraftFwds, Passes, Proposed, Accepted: integer);
-    // phase 3 (DiagonalSSM recurrent mixer; O(1)-per-step incremental decode)
-    function BuildModelSSM(ContextLen: integer): TNNet;
     procedure CreateSSMStepNet(out Step: TSSMStepNet; Source: TNNet);
     procedure FreeSSMStepNet(var Step: TSSMStepNet);
     procedure GreedySSMCached(var Step: TSSMStepNet; var Toks: TTokenBuf;
       PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
       out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
-    // phase 4 (Multi-head Latent Attention with the decoupled-RoPE slice)
-    function BuildModelMLA(ContextLen: integer): TNNet;
-    // phase 6 (SSM-dominant hybrid with one MLA block; dual-family streaming)
-    function BuildModelHybrid(ContextLen: integer): TNNet;
     procedure CreateHybridStepNet(out Step: THybridStepNet; Source: TNNet);
     procedure FreeHybridStepNet(var Step: THybridStepNet);
     procedure GreedyHybridCached(var Step: THybridStepNet; var Toks: TTokenBuf;
@@ -343,8 +336,6 @@ type
       out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
     function CountRepeatedTrigrams(const Toks: TTokenBuf;
       StartIdx, Len: integer): integer;
-    // phase 2 (MTP heads as built-in draft; full re-encode arms)
-    function BuildModelMTP(ContextLen: integer): TNNet;
     function MTPHeadArgmax(NN: TNNet; Row, Head: integer): integer;
     procedure MTPGreedyFull(NN: TNNet; var Toks: TTokenBuf;
       PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
@@ -353,7 +344,20 @@ type
       PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
       out Fwds, Passes, Committed: integer;
       var Verified, Accepted: array of integer);
-    // phases
+
+    // build phases
+    // phase 1
+    function BuildModel(ContextLen: integer): TNNet;
+    // phase 2 (MTP heads as built-in draft; full re-encode arms)
+    function BuildModelMTP(ContextLen: integer): TNNet;
+    // phase 3 (DiagonalSSM recurrent mixer; O(1)-per-step incremental decode)
+    function BuildModelSSM(ContextLen: integer): TNNet;
+    // phase 4 (Multi-head Latent Attention with the decoupled-RoPE slice)
+    function BuildModelMLA(ContextLen: integer): TNNet;
+    // phase 6 (SSM-dominant hybrid with one MLA block; dual-family streaming)
+    function BuildModelHybrid(ContextLen: integer): TNNet;
+
+    // run phases
     procedure RunPhase1;
     procedure RunPhase2;
     procedure RunPhase3;
