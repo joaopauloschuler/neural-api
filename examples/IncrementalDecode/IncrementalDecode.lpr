@@ -35,6 +35,11 @@
 // QKV projection, encode each streamed token with its ABSOLUTE position
 // (= SDPA.CacheLength before the step), not position 0.
 //
+// The streamed arms run through TNNetStreamingDecoder (neuraldecode): the
+// session scans the step net once, switches every SDPA/SSM layer into
+// incremental mode, and StepForward(InV, AbsPos) handles the per-forward
+// bookkeeping (RoPE offsets, none here) that used to be hand-rolled.
+//
 // Pure CPU, no training, finishes in a few seconds.
 //
 // Coded by Claude (AI).
@@ -45,7 +50,7 @@ program IncrementalDecode;
 uses
   {$IFDEF UNIX}cthreads, BaseUnix, Unix,{$ENDIF}
   Classes, SysUtils, Math,
-  neuralnetwork, neuralvolume;
+  neuralnetwork, neuralvolume, neuraldecode;
 
 const
   cDk        = 64;    // head dimension
@@ -91,7 +96,7 @@ end;
 function RunFaithfulnessCheck(): boolean;
 var
   NNFull, NNStep: TNNet;
-  SDPAStep: TNNetScaledDotProductAttention;
+  Session: TNNetStreamingDecoder;
   FullIn, StepIn, FullOut, StepOut: TNNetVolume;
   T, D: integer;
   Diff, MaxDiff: TNeuralFloat;
@@ -101,8 +106,9 @@ begin
   NNFull.AddLayer(TNNetScaledDotProductAttention.Create(cDk, {CausalMask=}true));
   NNStep := TNNet.Create();
   NNStep.AddLayer(TNNetInput.Create(1, 1, 3 * cDk));
-  SDPAStep := TNNetScaledDotProductAttention.Create(cDk, {CausalMask=}true);
-  NNStep.AddLayer(SDPAStep);
+  NNStep.AddLayer(TNNetScaledDotProductAttention.Create(cDk, {CausalMask=}true));
+  // The session scans NNStep and switches its SDPA into the KV-cache path.
+  Session := TNNetStreamingDecoder.Create(NNStep, cCheckLen);
   FullIn := TNNetVolume.Create(cCheckLen, 1, 3 * cDk);
   StepIn := TNNetVolume.Create(1, 1, 3 * cDk);
   FullOut := TNNetVolume.Create();
@@ -114,13 +120,13 @@ begin
     NNFull.Compute(FullIn);
     NNFull.GetOutput(FullOut);
 
-    SDPAStep.BeginIncrementalDecode(cCheckLen);
+    Session.Reset();
     MaxDiff := 0;
     for T := 0 to cCheckLen - 1 do
     begin
       for D := 0 to 3 * cDk - 1 do
         StepIn[0, 0, D] := FullIn[T, 0, D];
-      NNStep.Compute(StepIn);
+      Session.StepForward(StepIn, T);
       NNStep.GetOutput(StepOut);
       for D := 0 to cDk - 1 do
       begin
@@ -140,6 +146,7 @@ begin
     FullOut.Free;
     StepIn.Free;
     FullIn.Free;
+    Session.Free;
     NNStep.Free;
     NNFull.Free;
   end;
@@ -187,7 +194,7 @@ end;
 procedure TimeCachedStream(var PerStepMs: array of double);
 var
   NN: TNNet;
-  SDPA: TNNetScaledDotProductAttention;
+  Session: TNNetStreamingDecoder;
   StepIn: TNNetVolume;
   T, D, C: integer;
   T0: double;
@@ -197,11 +204,11 @@ begin
     WindowStart[C] := cCheckpoints[C] - cWindow; // steps [start..chk-1]
   NN := TNNet.Create();
   NN.AddLayer(TNNetInput.Create(1, 1, 3 * cDk));
-  SDPA := TNNetScaledDotProductAttention.Create(cDk, true);
-  NN.AddLayer(SDPA);
+  NN.AddLayer(TNNetScaledDotProductAttention.Create(cDk, true));
+  Session := TNNetStreamingDecoder.Create(NN, cMaxLen);
   StepIn := TNNetVolume.Create(1, 1, 3 * cDk);
   try
-    SDPA.BeginIncrementalDecode(cMaxLen);
+    Session.Reset();
     T0 := 0;
     for T := 0 to cMaxLen - 1 do
     begin
@@ -209,13 +216,14 @@ begin
         StepIn[0, 0, D] := MasterSeq[T, 0, D];
       for C := 0 to High(cCheckpoints) do
         if T = WindowStart[C] then T0 := NowMs();
-      NN.Compute(StepIn);
+      Session.StepForward(StepIn, T);
       for C := 0 to High(cCheckpoints) do
         if T = cCheckpoints[C] - 1 then
           PerStepMs[C] := (NowMs() - T0) / cWindow;
     end;
   finally
     StepIn.Free;
+    Session.Free;
     NN.Free;
   end;
 end;
@@ -233,6 +241,7 @@ function RunSSMFaithfulnessCheck(): boolean;
 var
   NNFull, NNStep: TNNet;
   SSMFull, SSMStep: TNNetDiagonalSSM;
+  Session: TNNetStreamingDecoder;
   FullIn, StepIn, FullOut, StepOut: TNNetVolume;
   T, D: integer;
   Diff, MaxDiff: TNeuralFloat;
@@ -245,6 +254,9 @@ begin
   NNStep.AddLayer(TNNetInput.Create(1, 1, cSSMDepth));
   SSMStep := TNNetDiagonalSSM.Create();
   NNStep.AddLayer(SSMStep);
+  // The session switches the SSM onto the persisted-state path (the cache
+  // budget argument only matters for attention layers; there are none here).
+  Session := TNNetStreamingDecoder.Create(NNStep, cCheckLen);
   FullIn := TNNetVolume.Create(cCheckLen, 1, cSSMDepth);
   StepIn := TNNetVolume.Create(1, 1, cSSMDepth);
   FullOut := TNNetVolume.Create();
@@ -265,13 +277,13 @@ begin
     NNFull.Compute(FullIn);
     NNFull.GetOutput(FullOut);
 
-    SSMStep.BeginIncrementalDecode();
+    Session.Reset();
     MaxDiff := 0;
     for T := 0 to cCheckLen - 1 do
     begin
       for D := 0 to cSSMDepth - 1 do
         StepIn[0, 0, D] := FullIn[T, 0, D];
-      NNStep.Compute(StepIn);
+      Session.StepForward(StepIn, T);
       NNStep.GetOutput(StepOut);
       for D := 0 to cSSMDepth - 1 do
       begin
@@ -291,6 +303,7 @@ begin
     FullOut.Free;
     StepIn.Free;
     FullIn.Free;
+    Session.Free;
     NNStep.Free;
     NNFull.Free;
   end;
@@ -334,7 +347,7 @@ end;
 procedure TimeSSMIncrementalStream(var PerStepMs: array of double);
 var
   NN: TNNet;
-  SSM: TNNetDiagonalSSM;
+  Session: TNNetStreamingDecoder;
   StepIn: TNNetVolume;
   T, D, C: integer;
   T0: double;
@@ -344,11 +357,11 @@ begin
     WindowStart[C] := cCheckpoints[C] - cWindow; // steps [start..chk-1]
   NN := TNNet.Create();
   NN.AddLayer(TNNetInput.Create(1, 1, cSSMDepth));
-  SSM := TNNetDiagonalSSM.Create();
-  NN.AddLayer(SSM);
+  NN.AddLayer(TNNetDiagonalSSM.Create());
+  Session := TNNetStreamingDecoder.Create(NN, cMaxLen);
   StepIn := TNNetVolume.Create(1, 1, cSSMDepth);
   try
-    SSM.BeginIncrementalDecode();
+    Session.Reset();
     T0 := 0;
     for T := 0 to cMaxLen - 1 do
     begin
@@ -356,13 +369,14 @@ begin
         StepIn[0, 0, D] := MasterSeq[T, 0, D];
       for C := 0 to High(cCheckpoints) do
         if T = WindowStart[C] then T0 := NowMs();
-      NN.Compute(StepIn);
+      Session.StepForward(StepIn, T);
       for C := 0 to High(cCheckpoints) do
         if T = cCheckpoints[C] - 1 then
           PerStepMs[C] := (NowMs() - T0) / cWindow;
     end;
   finally
     StepIn.Free;
+    Session.Free;
     NN.Free;
   end;
 end;

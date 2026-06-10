@@ -79,6 +79,13 @@ equivalents:
   The two efficiency wins therefore **compose**: fewer big-model passes
   (speculation) × cheaper passes (KV cache).
 
+  The cache plumbing (per-head SDPA collection, `BeginIncrementalDecode`,
+  `ResetCache`, `TruncateCache`) is driven through the reusable
+  **`TNNetStreamingDecoder`** session from `neuraldecode`
+  (`Reset` / `StepForward(window, AbsPos)` / `TruncateTo(committed)`); only
+  the sinusoidal `PositionOffset` stays hand-rolled, because the session
+  manages rotary (RoPE) layers only.
+
 The **draft stays on the full-recompute path on purpose**: it is attention-free
 (`TNNetTokenShift`), so it has no KV cache to exploit, and its forwards are the
 cheap arm by design.

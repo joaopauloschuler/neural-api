@@ -48,6 +48,10 @@ ABSOLUTE positions — PositionOffset is set to the window start (the running
 cache length) before every cached forward. The draft stays on the simple
 full-recompute path: it is attention-free (TokenShift), so it has no KV cache
 to exploit, and its forwards are cheap by design.
+The cached plumbing (per-head SDPA collection, BeginIncrementalDecode,
+ResetCache, TruncateCache) is handled by the reusable TNNetStreamingDecoder
+session from neuraldecode; only the sinusoidal PositionOffset stays
+hand-rolled here, because the session manages rotary (RoPE) layers only.
 
 THE TOY (forked from examples/InductionHeads + TokenShiftBaseline). A small
 vocabulary V; a sequence is a random length-L string and the next-token target
@@ -135,7 +139,8 @@ Coded by Claude (AI).
 uses {$IFDEF UNIX} cthreads, BaseUnix, Unix, {$ENDIF}
   Classes, SysUtils, Math,
   neuralnetwork,
-  neuralvolume;
+  neuralvolume,
+  neuraldecode;
 
 const
   cVocab    = 8;        // small vocabulary
@@ -605,65 +610,47 @@ const
 type
   TStepTarget = record
     Net: TNNet;                                          // width-cStepWidth twin
-    SDPAs: array of TNNetScaledDotProductAttention;      // one per head
+    Session: TNNetStreamingDecoder;                      // KV-cache session
     SinPos: TNNetSinusoidalPositionalEmbedding;          // absolute positions
     StepIn: TNNetVolume;                                 // (cStepWidth,1,1) ids
   end;
 
 procedure CreateStepTarget(out Step: TStepTarget; Target: TNNet);
 var
-  i, n: integer;
+  i: integer;
 begin
   Step.Net := BuildTargetWithLen(cStepWidth);
   // Same architecture, so layer-by-layer weight copy is exact (all parameter
   // shapes are sequence-length independent).
   Step.Net.CopyWeights(Target);
-  SetLength(Step.SDPAs, 0);
+  // TNNetStreamingDecoder collects every per-head SDPA and switches it into
+  // the KV-cache path; the budget covers the worst transient cache load:
+  // (cSeqLen-1) committed + a full window. The sinusoidal positional layer is
+  // NOT a rotary layer, so the session does not manage its PositionOffset —
+  // we keep that one pointer ourselves (set before every cached forward).
+  Step.Session := TNNetStreamingDecoder.Create(Step.Net, cSeqLen + cStepWidth);
   Step.SinPos := nil;
   for i := 0 to Step.Net.Layers.Count - 1 do
-  begin
-    if Step.Net.Layers[i] is TNNetScaledDotProductAttention then
-    begin
-      n := Length(Step.SDPAs);
-      SetLength(Step.SDPAs, n + 1);
-      Step.SDPAs[n] := TNNetScaledDotProductAttention(Step.Net.Layers[i]);
-    end;
     if Step.Net.Layers[i] is TNNetSinusoidalPositionalEmbedding then
       Step.SinPos := TNNetSinusoidalPositionalEmbedding(Step.Net.Layers[i]);
-  end;
-  // Worst transient cache load: (cSeqLen-1) committed + a full window.
-  for i := 0 to High(Step.SDPAs) do
-    Step.SDPAs[i].BeginIncrementalDecode(cSeqLen + cStepWidth);
   Step.StepIn := TNNetVolume.Create(cStepWidth, 1, 1);
 end;
 
 procedure FreeStepTarget(var Step: TStepTarget);
 begin
   Step.StepIn.Free;
+  Step.Session.Free;
   Step.Net.Free;
-  SetLength(Step.SDPAs, 0);
-end;
-
-procedure StepCacheReset(var Step: TStepTarget);
-var i: integer;
-begin
-  for i := 0 to High(Step.SDPAs) do Step.SDPAs[i].ResetCache();
-end;
-
-// Rewind every head's KV cache to NewLength committed tokens — the rollback
-// that discards the stale K/V of rejected (or padding) positions.
-procedure StepCacheTruncate(var Step: TStepTarget; NewLength: integer);
-var i: integer;
-begin
-  for i := 0 to High(Step.SDPAs) do Step.SDPAs[i].TruncateCache(NewLength);
 end;
 
 // One cached window forward: tokens S[StartPos .. StartPos+NReal-1] fill the
 // window (zero padding after; pads come AFTER every real token, so the cached
 // causal path never lets a real query see a pad — pad K/V is dropped by the
-// caller's next StepCacheTruncate). The sinusoidal layer is shifted so the
+// caller's next TruncateTo). The sinusoidal layer is shifted so the
 // window is encoded at its ABSOLUTE positions (positional contract of the
-// cached path). Output row r is the softmax at absolute position StartPos+r.
+// cached path); StepForward would do the same for rotary layers, but the
+// sinusoidal layer is not collected by the session, so it is set here.
+// Output row r is the softmax at absolute position StartPos+r.
 procedure CachedWindowForward(var Step: TStepTarget; const S: TSeq;
   StartPos, NReal: integer);
 var
@@ -672,7 +659,7 @@ begin
   Step.StepIn.Fill(0);
   for t := 0 to NReal - 1 do Step.StepIn.FData[t] := S[StartPos + t];
   Step.SinPos.PositionOffset := StartPos;
-  Step.Net.Compute(Step.StepIn);
+  Step.Session.StepForward(Step.StepIn, StartPos);
   Inc(gTgtForwards);  // one SHORT cached target forward
 end;
 
@@ -706,14 +693,14 @@ begin
   // --- PREFILL (once): cache the K/V of tokens 0..PrefixLen-2. The LAST
   //     committed token is NOT cached — it is re-fed as the first window
   //     token of every pass, so its softmax row is fresh each pass.
-  StepCacheReset(Step);
+  Step.Session.Reset();
   done := 0;
   while done < PrefixLen - 1 do
   begin
     w := Min(cStepWidth, PrefixLen - 1 - done);
     CachedWindowForward(Step, OutSeq, done, w);
     done := done + w;
-    StepCacheTruncate(Step, done);  // drop pad K/V from a partial window
+    Step.Session.TruncateTo(done);  // drop pad K/V from a partial window
   end;
 
   while OutLen - PrefixLen < NTokens do
@@ -820,7 +807,7 @@ begin
     // --- 3. ROLLBACK: the caches transiently hold the whole window (pads and
     //        rejected drafts included). Keep exactly the committed prefix
     //        minus its last token (re-fed as the next window's first query).
-    StepCacheTruncate(Step, OutLen - 1);
+    Step.Session.TruncateTo(OutLen - 1);
 
     if OutLen >= cSeqLen then Break;
   end;

@@ -32,6 +32,13 @@ SDPA.EndIncrementalDecode();              // back to the normal training forward
   (`TNNetAddPositionalEmbedding`, RoPE, ...), encode each streamed token with
   its **absolute** position `t = SDPA.CacheLength` (read before the step), not
   with position 0 derived from the length-1 input.
+* **`TNNetStreamingDecoder` (in `neuraldecode`)** wraps all of this plumbing
+  into one reusable session, and is what this demo now uses: `Create(StepNet,
+  MaxContext)` scans the net and switches every SDPA (and `TNNetDiagonalSSM`)
+  into incremental mode, `Reset()` starts a fresh sequence,
+  `StepForward(InV, AbsPos)` sets every `TNNetRotaryEmbedding.PositionOffset`
+  to the window's absolute start before computing, and `Destroy` switches the
+  layers back out of incremental mode.
 
 ## What the demo does
 
@@ -72,8 +79,10 @@ SSM.EndIncrementalDecode();    // back to the normal training forward
 
 Same contract as the attention KV cache: inference only (calling
 `Backpropagate` in incremental mode is an error), and with the mode disabled
-(the default) the training forward/backward is bit-for-bit unchanged. The
-demo runs the same faithfulness + timing protocol (`Depth = 192`):
+(the default) the training forward/backward is bit-for-bit unchanged.
+`TNNetStreamingDecoder` collects SSM layers too (`Reset()` calls their
+`ResetState`), so the same session drives attention-only, SSM-only and hybrid
+stacks. The demo runs the same faithfulness + timing protocol (`Depth = 192`):
 
 ```
   prefix t | full re-encode (ms/token) | incremental (ms/token) | speedup

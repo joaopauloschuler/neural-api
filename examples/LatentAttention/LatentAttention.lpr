@@ -49,10 +49,12 @@ WHAT THIS PROGRAM SHOWS.
   3. KV-CACHE INCREMENTAL DECODE (the MLA headline win), two demonstrations:
      a) Cache-machinery decode: the SAME random-weight MLA stack (NoPE and
         decoupled-RoPE) is run once as a full causal forward and once token-at-
-        a-time through a weight-copied step net whose per-head SDPA layers use
-        BeginIncrementalDecode; for the RoPE arm each TNNetRotaryEmbedding gets
-        PositionOffset := t so a streamed length-1 token is rotated with its
-        ABSOLUTE position. Faithfulness asserted to < 1e-5.
+        a-time through a weight-copied step net driven by the reusable
+        TNNetStreamingDecoder session (neuraldecode), which switches every
+        per-head SDPA into BeginIncrementalDecode mode and, for the RoPE arm,
+        sets each TNNetRotaryEmbedding.PositionOffset := t per StepForward so
+        a streamed length-1 token is rotated with its ABSOLUTE position.
+        Faithfulness asserted to < 1e-5.
      b) TRUE LATENT-ONLY CACHING: a decode loop whose ONLY per-token state is
         the latent c_KV stream -- each step re-runs the K/V up-projections over
         the cached latents and performs one query row of attention manually.
@@ -94,7 +96,8 @@ uses {$IFDEF UNIX} {$IFDEF UseCThreads}
   cthreads, {$ENDIF} {$ENDIF}
   Classes, SysUtils, Math,
   neuralnetwork,
-  neuralvolume;
+  neuralvolume,
+  neuraldecode;
 
 const
   cVocab   = 6;        // small char vocabulary
@@ -349,20 +352,24 @@ begin
 end;
 
 // (a) Cache-machinery decode: one full causal forward vs token-at-a-time
-// through a weight-copied step net whose per-head SDPA layers run in
-// BeginIncrementalDecode mode. For RopeDim>0 every TNNetRotaryEmbedding gets
-// PositionOffset := t before each step (a streamed length-1 token must be
-// rotated with its ABSOLUTE position, not position 0). Returns max |diff|.
+// through a weight-copied step net driven by a TNNetStreamingDecoder session
+// (neuraldecode): Create scans the step net and switches every per-head SDPA
+// into BeginIncrementalDecode mode; StepForward(StepIn, T) sets every
+// TNNetRotaryEmbedding.PositionOffset := T before each step (a streamed
+// length-1 token must be rotated with its ABSOLUTE position, not position 0).
+// Returns max |diff|.
 function RunCachedDecode(RopeDim: integer): TNeuralFloat;
 var
   NNFull, NNStep: TNNet;
+  Session: TNNetStreamingDecoder;
   FullIn, StepIn: TNNetVolume;
-  T, D, LayerCnt: integer;
+  T, D: integer;
   Diff: TNeuralFloat;
 begin
   Result := 0;
   NNFull := BuildBareMLA(cDecLen, RopeDim);
   NNStep := BuildBareMLA(1, RopeDim);
+  Session := TNNetStreamingDecoder.Create(NNStep, cDecLen);
   FullIn := TNNetVolume.Create(cDecLen, 1, cDModel);
   StepIn := TNNetVolume.Create(1, 1, cDModel);
   try
@@ -372,19 +379,12 @@ begin
         FullIn[T, 0, D] := (Random(2000) - 1000) / 1000;
     NNFull.Compute(FullIn);
 
-    for LayerCnt := 0 to NNStep.Layers.Count - 1 do
-      if NNStep.Layers[LayerCnt] is TNNetScaledDotProductAttention then
-        TNNetScaledDotProductAttention(NNStep.Layers[LayerCnt]).
-          BeginIncrementalDecode(cDecLen);
-
+    Session.Reset();
     for T := 0 to cDecLen - 1 do
     begin
       for D := 0 to cDModel - 1 do
         StepIn[0, 0, D] := FullIn[T, 0, D];
-      for LayerCnt := 0 to NNStep.Layers.Count - 1 do
-        if NNStep.Layers[LayerCnt] is TNNetRotaryEmbedding then
-          TNNetRotaryEmbedding(NNStep.Layers[LayerCnt]).PositionOffset := T;
-      NNStep.Compute(StepIn);
+      Session.StepForward(StepIn, T);
       for D := 0 to cDModel - 1 do
       begin
         Diff := Abs(NNFull.GetLastLayer.Output[T, 0, D] -
@@ -395,6 +395,7 @@ begin
   finally
     StepIn.Free;
     FullIn.Free;
+    Session.Free;
     NNStep.Free;
     NNFull.Free;
   end;

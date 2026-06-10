@@ -106,11 +106,12 @@ The task is a fixed-offset **copy**: `target[t] = S[t-4]` for `t ≥ 4` (and
 After the bake-off, a random-weight causal MLA stack decodes 24 tokens one at
 a time, three ways, each checked against the full re-encode forward:
 
-1. **(a) SDPA cache machinery, NoPE and `RopeDim=4`:** the per-head
-   `TNNetScaledDotProductAttention` layers run in
-   `BeginIncrementalDecode(MaxContext)` mode. For the RoPE
-   arm every `TNNetRotaryEmbedding` gets `PositionOffset := t` before each step,
-   so the streamed length-1 token is rotated with its **absolute** position.
+1. **(a) SDPA cache machinery, NoPE and `RopeDim=4`:** the step net is driven
+   by the reusable **`TNNetStreamingDecoder`** session (`neuraldecode`), which
+   switches the per-head `TNNetScaledDotProductAttention` layers into
+   `BeginIncrementalDecode(MaxContext)` mode and, for the RoPE arm, sets every
+   `TNNetRotaryEmbedding.PositionOffset := t` per `StepForward`, so the
+   streamed length-1 token is rotated with its **absolute** position.
    This is the O(1)-per-step compute path, but it caches post-up-projection
    per-head K/V — MHA-sized memory.
 2. **(b) TRUE latent-only cache:** a decode loop whose *only* per-token state is
