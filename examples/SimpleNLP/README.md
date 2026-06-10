@@ -182,13 +182,19 @@ forward whose window a cache never saw — known open problem), so both phase-2 
 pay full re-encode forwards and the measured win is forwards/token at equal
 per-forward cost.
 Phase 3 swaps the sequence mixer: same residual skeleton (DyT pre-norm + SwiGLU FFN,
-same d_model/blocks/FFN/head), but the mixer is the recurrent `TNNetDiagonalSSM`
+same d_model/blocks/FFN/head), but the mixer is the recurrent `TNNetDiagonalSSM` —
+an SSM (State-Space Model, the S4/Mamba family): a linear per-channel recurrence
+`h_t = a·h_{t-1} + b·x_t` whose fixed-size hidden state carries the entire past, so
+order needs no positional embedding and decoding is O(1) per step with constant memory
 wrapped in token-wise in/out projections (~1.25M params), with NO RoPE and NO
 positional embedding — the recurrence carries order. Its decode benchmark is full
 re-encode vs the layer's `BeginIncrementalDecode`/`ResetState` O(1)-per-step path,
 where the ENTIRE past is a Depth-long state vector per SSM layer (no per-token cache
 growth), with step cost reported per prefix-length bucket to show flatness.
-Phase 4 swaps the attention: `TNNet.AddMultiHeadLatentAttention(128, 8, LatentDim=32,
+Phase 4 swaps the attention for MLA (Multi-head Latent Attention, DeepSeek-V2 — an
+attention variant that shrinks the per-token KV cache by factoring K/V through a tiny
+shared latent instead of caching full per-head K and V):
+`TNNet.AddMultiHeadLatentAttention(128, 8, LatentDim=32,
 CausalMask, RopeDim=8)` in the same pre-norm residual block (~1.29M params); K/V are
 low-rank-factored through a 32-wide per-token latent and position enters ONLY through
 the decoupled rotated rope slice (token-only embedding). Its cached decode arm uses

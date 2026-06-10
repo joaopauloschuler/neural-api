@@ -11,6 +11,24 @@ training is time-boxed INSIDE the program (TNeuralDataLoadingFit.ShouldQuit
 is raised from OnAfterStep when the train budget expires), leaving the rest
 of the budget for the decode benchmark itself.
 
+TWO ACRONYMS USED THROUGHOUT:
+  SSM = State-Space Model -- a LINEAR RECURRENT sequence mixer (the S4/Mamba
+        family; here TNNetDiagonalSSM): each layer carries a fixed-size
+        hidden state h updated per token (h_t = a*h_{t-1} + b*x_t per
+        channel), so word order comes from the recurrence itself (no
+        positional embedding) and the ENTIRE past is compressed into one
+        Depth-long state vector -- O(1) decode cost and CONSTANT memory,
+        at the price of imperfect long-range recall.
+  MLA = Multi-head Latent Attention (DeepSeek-V2; here
+        TNNet.AddMultiHeadLatentAttention): ordinary multi-head attention
+        must cache every past token's per-head K and V (2*d_model floats per
+        token); MLA low-rank-factors K/V through a tiny shared per-token
+        LATENT vector c_KV (LatentDim floats) and reconstructs per-head K/V
+        from it, shrinking the cacheable state per token to ~LatentDim --
+        full exact-attention recall at a fraction of the KV-cache memory.
+        Position rides on a small separate "decoupled RoPE" slice (RopeDim),
+        because rotations cannot be applied to the compressed latent.
+
   Phase 1: KV-cache incremental decode vs full re-encode.
            Trains a small RoPE transformer decoder, saves it to
            bakeoff-phase1.nn, then greedy-generates from fixed prompts two
@@ -2168,8 +2186,10 @@ begin
     WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..6)');
     WriteLn('  1: KV-cache incremental decode vs full re-encode');
     WriteLn('  2: MTP-heads self-speculative decode');
-    WriteLn('  3: DiagonalSSM O(1)-per-step decode');
-    WriteLn('  4: MLA decoupled-RoPE latent KV cache');
+    WriteLn('  3: DiagonalSSM O(1)-per-step decode  (SSM = State-Space Model,');
+    WriteLn('     a linear recurrent mixer with constant-size state)');
+    WriteLn('  4: MLA decoupled-RoPE latent KV cache  (MLA = Multi-head Latent');
+    WriteLn('     Attention, DeepSeek-V2: K/V factored through a tiny cached latent)');
     WriteLn('  5: speculative decoding + KV cache rollback');
     WriteLn('  6: hybrid 2xSSM + 1xMLA trunk, dual-family streamed decode');
     Terminate;
