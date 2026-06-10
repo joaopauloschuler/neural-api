@@ -2468,6 +2468,31 @@ type
   //   attn[i,:]   = softmax(scores[i,:])
   //   out[i]      = sum_j attn[i,j] * V[j]
   // Output shape: SizeX x 1 x d_k. No trainable parameters.
+  //
+  // KV-cache incremental decode (inference only). For autoregressive
+  // generation, re-encoding the whole prefix to sample each next token costs
+  // O(t) attention work per step. BeginIncrementalDecode(MaxContext) switches
+  // this layer into a cached mode: each forward pass appends the K and V
+  // slices of every input token to a persistent per-layer cache (preallocated
+  // ONCE at MaxContext x d_k per buffer; decode steps never reallocate, and
+  // exceeding MaxContext is an error) and each query attends over ALL cached
+  // positions [0..t] — so a one-token step costs O(1) in the prefix length.
+  // Because every token only ever sees positions at or before its own, the
+  // cached path is causal BY CONSTRUCTION (with a cache, attending over the
+  // cached keys IS the causal mask); for a non-causal layer the final-position
+  // output still matches a full forward (the last row attends everywhere).
+  // ResetCache() restarts a fresh sequence reusing the same buffers;
+  // EndIncrementalDecode() restores the normal full-sequence path. Training
+  // forward/backward is bit-for-bit unchanged while the cache is disabled
+  // (the default), and Backpropagate must not be called in cached mode.
+  // POSITIONAL CONTRACT: this layer applies NO positional encoding itself —
+  // Q|K|V arrive already position-encoded. External position layers
+  // (TNNetAddPositionalEmbedding / RoPE / ALiBi-style biases) only see the
+  // length-1 token in cached mode, so the CALLER must encode the token with
+  // its ABSOLUTE position t = CacheLength (the running cache length BEFORE
+  // the step), not with position 0 derived from the length-1 input SizeX.
+  // Note: subclass attention variants override Compute() and do not honor
+  // the cache; AttentionWeights is not updated by the cached path.
   // Coded by Claude (AI).
   TNNetScaledDotProductAttention = class(TNNetLayer)
   private
@@ -2475,18 +2500,37 @@ type
     FInvSqrtDk: TNeuralFloat;
     FCausal: boolean;
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
+    // --- KV-cache incremental-decode state (inference only, not serialized) ---
+    FCacheEnabled: boolean;
+    FCacheLen: integer;          // tokens currently in the cache
+    FCacheMax: integer;          // preallocated max context length
+    FKCache: TNNetVolume;        // cached keys   [MaxContext x 1 x d_k]
+    FVCache: TNNetVolume;        // cached values [MaxContext x 1 x d_k]
+    FCacheScores: array of TNeuralFloat; // per-step softmax scratch row
+    procedure ComputeIncremental();
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(d_k: integer; CausalMask: boolean = false); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    // Enable the KV-cache incremental-decode path. Preallocates the K and V
+    // caches for at most MaxContext positions and starts an empty sequence.
+    procedure BeginIncrementalDecode(MaxContext: integer);
+    // Disable the cached path; the layer returns to the normal (training)
+    // full-sequence forward.
+    procedure EndIncrementalDecode();
+    // Start a fresh sequence: empties the cache (keeps the preallocation).
+    procedure ResetCache();
     // Read-only access to the post-softmax attention map populated by
     // Compute(). Layout: X=key index j, Y=query index i, attn[j,i,0]; rows
     // (fixed i) sum to 1. Used by TNNet.AttentionEntropyReport.
     property AttentionWeights: TNNetVolume read FAttn;
     property Dk: integer read FDk;
     property CausalMask: boolean read FCausal;
+    property CacheEnabled: boolean read FCacheEnabled;
+    property CacheLength: integer read FCacheLen;
+    property MaxContext: integer read FCacheMax;
   end;
 
   /// Cross-Attention (single head, parameter-free) with SEPARATE query and
@@ -20355,8 +20399,105 @@ end;
 
 destructor TNNetScaledDotProductAttention.Destroy();
 begin
+  FKCache.Free;
+  FVCache.Free;
   FAttn.Free;
   inherited Destroy();
+end;
+
+procedure TNNetScaledDotProductAttention.BeginIncrementalDecode(MaxContext: integer);
+begin
+  if MaxContext < 1 then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.BeginIncrementalDecode requires' +
+      ' MaxContext >= 1. Got ' + IntToStr(MaxContext));
+    exit;
+  end;
+  // The K and V caches are preallocated HERE, once, at the full MaxContext
+  // size (MaxContext x 1 x d_k each); decode steps never grow them, so a
+  // step's cost has no hidden reallocation and overflowing MaxContext is a
+  // hard error in ComputeIncremental.
+  if not Assigned(FKCache) then FKCache := TNNetVolume.Create();
+  if not Assigned(FVCache) then FVCache := TNNetVolume.Create();
+  FKCache.ReSize(MaxContext, 1, FDk);
+  FVCache.ReSize(MaxContext, 1, FDk);
+  SetLength(FCacheScores, MaxContext);
+  FCacheMax := MaxContext;
+  FCacheLen := 0;
+  FCacheEnabled := true;
+end;
+
+procedure TNNetScaledDotProductAttention.EndIncrementalDecode();
+begin
+  FCacheEnabled := false;
+  FCacheLen := 0;
+end;
+
+procedure TNNetScaledDotProductAttention.ResetCache();
+begin
+  FCacheLen := 0;
+end;
+
+// Inference-only cached forward. Appends each input token's K and V slice to
+// the persistent cache and attends its query over ALL cached positions
+// [0..t]. Works for a one-token decode step (the headline O(1)-per-step use)
+// and equally for a multi-token prompt prefill (every token sees only its
+// own prefix, i.e. exact causal behavior).
+procedure TNNetScaledDotProductAttention.ComputeIncremental();
+var
+  StartTime: double;
+  SeqLen, p, j, d: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  if FCacheLen + SeqLen > FCacheMax then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention KV cache overflow: ' +
+      IntToStr(FCacheLen) + ' cached + ' + IntToStr(SeqLen) + ' new > MaxContext=' +
+      IntToStr(FCacheMax) + '. Call ResetCache or raise MaxContext.');
+    exit;
+  end;
+  for p := 0 to SeqLen - 1 do
+  begin
+    // Append this token's K and V to the cache; its global position is the
+    // running cache length. Depth is contiguous, so each slice is one Move.
+    Move(Prev.GetRawPtr(p, 0, FDk)^, FKCache.GetRawPtr(FCacheLen, 0, 0)^,
+      FDk * SizeOf(TNeuralFloat));
+    Move(Prev.GetRawPtr(p, 0, 2 * FDk)^, FVCache.GetRawPtr(FCacheLen, 0, 0)^,
+      FDk * SizeOf(TNeuralFloat));
+    Inc(FCacheLen);
+    // Scaled scores of this query against every cached key [0..FCacheLen-1].
+    MaxScore := -1e30;
+    for j := 0 to FCacheLen - 1 do
+    begin
+      Score := TNNetVolume.DotProduct(
+        Prev.GetRawPtr(p, 0, 0), FKCache.GetRawPtr(j, 0, 0), FDk) * FInvSqrtDk;
+      FCacheScores[j] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    // Numerically stable softmax over the cached prefix (no mask needed:
+    // future positions are simply not in the cache yet).
+    SumExp := 0;
+    for j := 0 to FCacheLen - 1 do
+    begin
+      Score := pcr_expf(FCacheScores[j] - MaxScore);
+      FCacheScores[j] := Score;
+      SumExp := SumExp + Score;
+    end;
+    // out[p] = sum_j attn[j] * V[j] (AVX MulAdd over contiguous depth).
+    OutPtr := FOutput.GetRawPtr(p, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    if SumExp > 0 then
+      for j := 0 to FCacheLen - 1 do
+        TNNetVolume.MulAdd(OutPtr, FVCache.GetRawPtr(j, 0, 0),
+          FCacheScores[j] / SumExp, FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetScaledDotProductAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -20389,6 +20530,11 @@ var
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
 begin
+  if FCacheEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;

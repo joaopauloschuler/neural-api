@@ -375,7 +375,7 @@ rather than acted on.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
-- [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
+- [x] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
       the single biggest efficiency gap for autoregressive generation with
       the downstream ../gpt-3-for-pascal model. Today, sampling the next
       token re-encodes the entire prefix every step, so generating N tokens

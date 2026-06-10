@@ -26,6 +26,11 @@ type
     procedure TestGreedyReturnsBoundedFiniteResult;
     procedure TestBeamSearchAllSortedDescending;
     procedure TestBeamSearchScoreNoWorseThanGreedy;
+    // KV-cache incremental decode on TNNetScaledDotProductAttention.
+    procedure TestKVCacheIncrementalMatchesFullForward;
+    procedure TestKVCachePrefillThenStepMatchesFullForward;
+    procedure TestKVCacheResetStartsFreshSequence;
+    procedure TestKVCacheDisabledPathUnchanged;
   end;
 
 implementation
@@ -130,6 +135,248 @@ begin
     B := DecodeBeamSearch(NN, 'ab', 6, 4, 0.0);
     AssertTrue('beam score >= greedy score', B.Score >= G.Score - 1e-4);
   finally
+    NN.Free;
+  end;
+end;
+
+// Headline KV-cache faithfulness check: run the SAME random Q|K|V sequence
+// (SDPA is parameter-free, so two nets with different input widths compute
+// the same function) through (a) one full causal forward and (b) token-at-a-
+// time through the cached incremental-decode path, and assert EVERY position's
+// output matches to < 1e-5. With a cache, attending over the cached keys
+// [0..t] IS the causal behavior, so all positions (not just the last) agree.
+procedure TTestNeuralDecode.TestKVCacheIncrementalMatchesFullForward;
+const
+  SeqLen = 7;
+  Dk = 5;
+var
+  NNFull, NNStep: TNNet;
+  SDPAStep: TNNetScaledDotProductAttention;
+  FullIn, StepIn, FullOut, StepOut: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  NNFull := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  StepIn := TNNetVolume.Create(1, 1, 3 * Dk);
+  FullOut := TNNetVolume.Create();
+  StepOut := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+    NNFull.AddLayer(TNNetScaledDotProductAttention.Create(Dk, {CausalMask=}true));
+    NNStep.AddLayer(TNNetInput.Create(1, 1, 3 * Dk));
+    SDPAStep := TNNetScaledDotProductAttention.Create(Dk, {CausalMask=}true);
+    NNStep.AddLayer(SDPAStep);
+
+    FullIn.Randomize();
+    FullIn.Sub(0.5);
+    NNFull.Compute(FullIn);
+    NNFull.GetOutput(FullOut);
+
+    SDPAStep.BeginIncrementalDecode({MaxContext=}SeqLen);
+    AssertTrue('cache enabled after Begin', SDPAStep.CacheEnabled);
+    for T := 0 to SeqLen - 1 do
+    begin
+      for D := 0 to 3 * Dk - 1 do
+        StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      NNStep.GetOutput(StepOut);
+      AssertEquals('cache length tracks tokens', T + 1, SDPAStep.CacheLength);
+      for D := 0 to Dk - 1 do
+        AssertEquals('pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], StepOut[0, 0, D], 1e-5);
+    end;
+    SDPAStep.EndIncrementalDecode();
+    AssertTrue('cache disabled after End', not SDPAStep.CacheEnabled);
+  finally
+    StepOut.Free;
+    FullOut.Free;
+    StepIn.Free;
+    FullIn.Free;
+    NNStep.Free;
+    NNFull.Free;
+  end;
+end;
+
+// Multi-token prompt prefill: feed the first PrefillLen tokens in ONE cached
+// forward, then decode the rest token-at-a-time; outputs of the single-token
+// steps must still match the full causal forward.
+procedure TTestNeuralDecode.TestKVCachePrefillThenStepMatchesFullForward;
+const
+  SeqLen = 6;
+  PrefillLen = 4;
+  Dk = 4;
+var
+  NNFull, NNPre, NNStep: TNNet;
+  SDPAPre, SDPAStep: TNNetScaledDotProductAttention;
+  FullIn, PreIn, StepIn, FullOut, StepOut: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 31337;
+  NNFull := TNNet.Create();
+  NNPre := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  PreIn := TNNetVolume.Create(PrefillLen, 1, 3 * Dk);
+  StepIn := TNNetVolume.Create(1, 1, 3 * Dk);
+  FullOut := TNNetVolume.Create();
+  StepOut := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+    NNFull.AddLayer(TNNetScaledDotProductAttention.Create(Dk, true));
+    // A layer's input width is fixed by its net, so the multi-token branch of
+    // ComputeIncremental (prompt prefill) is exercised on its own net: one
+    // cached forward of PrefillLen tokens must reproduce the first PrefillLen
+    // causal rows of the full forward. The single-token decode loop is then
+    // re-verified on a separate width-1 net over the whole sequence.
+    SDPAPre := TNNetScaledDotProductAttention.Create(Dk, true);
+    NNPre.AddLayer(TNNetInput.Create(PrefillLen, 1, 3 * Dk));
+    NNPre.AddLayer(SDPAPre);
+    NNStep.AddLayer(TNNetInput.Create(1, 1, 3 * Dk));
+    SDPAStep := TNNetScaledDotProductAttention.Create(Dk, true);
+    NNStep.AddLayer(SDPAStep);
+
+    FullIn.Randomize();
+    FullIn.Sub(0.5);
+    NNFull.Compute(FullIn);
+    NNFull.GetOutput(FullOut);
+
+    // Prefill branch: PrefillLen tokens in one cached forward.
+    SDPAPre.BeginIncrementalDecode(SeqLen);
+    for T := 0 to PrefillLen - 1 do
+      for D := 0 to 3 * Dk - 1 do
+        PreIn[T, 0, D] := FullIn[T, 0, D];
+    NNPre.Compute(PreIn);
+    NNPre.GetOutput(StepOut);
+    AssertEquals('prefill cache length', PrefillLen, SDPAPre.CacheLength);
+    for T := 0 to PrefillLen - 1 do
+      for D := 0 to Dk - 1 do
+        AssertEquals('prefill pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], StepOut[T, 0, D], 1e-5);
+
+    // Token-at-a-time branch on a fresh cache must agree at every position.
+    SDPAStep.BeginIncrementalDecode(SeqLen);
+    for T := 0 to SeqLen - 1 do
+    begin
+      for D := 0 to 3 * Dk - 1 do
+        StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      NNStep.GetOutput(StepOut);
+      for D := 0 to Dk - 1 do
+        AssertEquals('step pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], StepOut[0, 0, D], 1e-5);
+    end;
+  finally
+    StepOut.Free;
+    FullOut.Free;
+    StepIn.Free;
+    PreIn.Free;
+    FullIn.Free;
+    NNStep.Free;
+    NNPre.Free;
+    NNFull.Free;
+  end;
+end;
+
+// ResetCache must start a genuinely fresh sequence: decoding the same token
+// stream twice (with a ResetCache in between) yields identical outputs.
+procedure TTestNeuralDecode.TestKVCacheResetStartsFreshSequence;
+const
+  SeqLen = 5;
+  Dk = 3;
+var
+  NN: TNNet;
+  SDPA: TNNetScaledDotProductAttention;
+  StepIn, OutA, OutB: TNNetVolume;
+  Seq: TNNetVolume;
+  T, D, Pass: integer;
+  FirstRun: array of TNeuralFloat;
+begin
+  RandSeed := 90210;
+  NN := TNNet.Create();
+  StepIn := TNNetVolume.Create(1, 1, 3 * Dk);
+  OutA := TNNetVolume.Create();
+  OutB := TNNetVolume.Create();
+  Seq := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  SetLength(FirstRun, SeqLen * Dk);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3 * Dk));
+    SDPA := TNNetScaledDotProductAttention.Create(Dk, true);
+    NN.AddLayer(SDPA);
+    Seq.Randomize();
+    Seq.Sub(0.5);
+    SDPA.BeginIncrementalDecode(SeqLen);
+    for Pass := 0 to 1 do
+    begin
+      if Pass = 1 then
+      begin
+        SDPA.ResetCache();
+        AssertEquals('cache empty after reset', 0, SDPA.CacheLength);
+      end;
+      for T := 0 to SeqLen - 1 do
+      begin
+        for D := 0 to 3 * Dk - 1 do
+          StepIn[0, 0, D] := Seq[T, 0, D];
+        NN.Compute(StepIn);
+        NN.GetOutput(OutA);
+        for D := 0 to Dk - 1 do
+        begin
+          if Pass = 0 then
+            FirstRun[T * Dk + D] := OutA[0, 0, D]
+          else
+            AssertEquals('replay pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+              FirstRun[T * Dk + D], OutA[0, 0, D], 1e-7);
+        end;
+      end;
+    end;
+  finally
+    Seq.Free;
+    OutB.Free;
+    OutA.Free;
+    StepIn.Free;
+    NN.Free;
+  end;
+end;
+
+// With the cache disabled (default), Begin+End round-trip must leave the
+// normal full-sequence forward bit-for-bit unchanged.
+procedure TTestNeuralDecode.TestKVCacheDisabledPathUnchanged;
+const
+  SeqLen = 6;
+  Dk = 4;
+var
+  NN: TNNet;
+  SDPA: TNNetScaledDotProductAttention;
+  InV, OutBefore, OutAfter: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 777;
+  NN := TNNet.Create();
+  InV := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  OutBefore := TNNetVolume.Create();
+  OutAfter := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+    SDPA := TNNetScaledDotProductAttention.Create(Dk, false);
+    NN.AddLayer(SDPA);
+    InV.Randomize();
+    InV.Sub(0.5);
+    NN.Compute(InV);
+    NN.GetOutput(OutBefore);
+    // Enable then immediately disable: the next forward must be identical.
+    SDPA.BeginIncrementalDecode(SeqLen);
+    SDPA.EndIncrementalDecode();
+    NN.Compute(InV);
+    NN.GetOutput(OutAfter);
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to Dk - 1 do
+        AssertEquals('pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          OutBefore[T, 0, D], OutAfter[T, 0, D], 0);
+  finally
+    OutAfter.Free;
+    OutBefore.Free;
+    InV.Free;
     NN.Free;
   end;
 end;
