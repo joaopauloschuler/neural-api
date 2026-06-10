@@ -4,7 +4,7 @@ DecodeFeaturesBakeoff: benchmarks the recently-landed DECODE-EFFICIENCY
 features on a REAL tokenized NLP workload (TinyStories, 3k-token vocabulary),
 one phase per feature, selected by CLI argument:
 
-    ./DecodeFeaturesBakeoff --phase N        (N in 1..6)
+    ./DecodeFeaturesBakeoff --phase N        (N in 1..7)
 
 Each phase is self-budgeted to finish within 270 seconds of wall clock:
 training is time-boxed INSIDE the program (TNeuralDataLoadingFit.ShouldQuit
@@ -111,6 +111,26 @@ THREE ACRONYMS USED THROUGHOUT:
            a three-assumption verdict (convergence vs the pure-SSM/pure-MLA/
            transformer references, sample-looping, decode cost). NO
            speculation: plain greedy is the recommended config.
+  Phase 7: phase 6's hybrid with GROUPED pointwise convolutions. The trunk,
+           block order, decode benchmark and hard assert are IDENTICAL to
+           phase 6; the only change is that every large dense 1x1 projection
+           is swapped for its grouped alternative
+           (TNNetGroupedPointwiseConvLinear via AddAutoGroupedPointwiseConv,
+           MinChannelsPerGroup=16: block-diagonal weights, plus channel-
+           interleave intergroup remixing where input depth >= output depth):
+           the SSM in/out projections, the SwiGLU FFN projections, both
+           output-head projections, and -- through the new optional
+           MinChannelsPerGroupCount argument of AddMultiHeadLatentAttention
+           -- the MLA block's Q and output projections. The MLA latent path
+           stays DENSE on purpose: c_KV must compress the WHOLE token (a
+           block-diagonal down-projection would defeat the low-rank
+           factorization), and the tiny LatentDim->d_model up-projections
+           would get no intergroup remix (input depth < output depth).
+           Grouped pointwise convs are strictly per-token, so the phase-6
+           dual-family streamed decode applies unchanged -- the HARD ASSERT
+           proves grouped layers stream token-exactly. The verdict compares
+           weight count, convergence and decode cost against phase 6's dense
+           references.
 
 MODEL. All phases share one config (constants below): RoPE positional scheme
 everywhere -- TNNetEmbedding (token-only) + UseRoPE=true in
@@ -195,13 +215,21 @@ const
   csDraftFFNDim      = 256;
   // ---- phase 2 MTP heads ----
   csNumFuture        = 3;    // t+1 (committed) + t+2,t+3 (the built-in draft)
-  // ---- phase 4 MLA (phase 6 reuses both) ----
+  // ---- phase 4 MLA (phases 6/7 reuse both) ----
   csLatentDim        = 32;   // c_KV width; << per-token MHA K+V = 2*d_model = 256
   csRopeDim          = 8;    // decoupled-RoPE slice width (even, as RoPE requires)
+  // ---- phase 7 grouped pointwise convs ----
+  csMinChannelsPerGroup = 16; // floor on input channels per group (the
+                              // AddAutoGroupedPointwiseConv knob; group count
+                              // is the largest common divisor under it)
   // ---- phase 6 reference losses (measured by phases 1/3/4, see README) ----
   csRefLossTransformer = 2.87; // phase 1, loss 5.02 -> 2.87
   csRefLossSSM         = 2.34; // phase 3, loss 4.47 -> 2.34
   csRefLossMLA         = 2.53; // phase 4, loss 3.90 -> 2.53
+  // ---- phase 7 reference loss (measured by phase 6) ----
+  csRefLossHybrid      = 1.61; // phase 6 dense hybrid, loss 7.99 -> 1.61
+  csGroupedLossSlack   = 0.25; // grouping cuts capacity; this much extra final
+                               // loss vs the dense hybrid still counts as HOLDS
 
 const
   csPrompts: array[0..1] of string = ('one day', 'once upon a time');
@@ -329,7 +357,8 @@ type
     procedure GreedySSMCached(var Step: TSSMStepNet; var Toks: TTokenBuf;
       PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
       out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
-    procedure CreateHybridStepNet(out Step: THybridStepNet; Source: TNNet);
+    procedure CreateHybridStepNet(out Step: THybridStepNet; Source: TNNet;
+      Grouped: boolean = false);
     procedure FreeHybridStepNet(var Step: THybridStepNet);
     procedure GreedyHybridCached(var Step: THybridStepNet; var Toks: TTokenBuf;
       PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
@@ -356,6 +385,8 @@ type
     function BuildModelMLA(ContextLen: integer): TNNet;
     // phase 6 (SSM-dominant hybrid with one MLA block; dual-family streaming)
     function BuildModelHybrid(ContextLen: integer): TNNet;
+    // phase 7 (phase 6's hybrid with grouped pointwise convolutions)
+    function BuildModelHybridGrouped(ContextLen: integer): TNNet;
 
     // run phases
     procedure RunPhase1;
@@ -364,6 +395,7 @@ type
     procedure RunPhase4;
     procedure RunPhase5;
     procedure RunPhase6;
+    procedure RunPhase7;
   public
     procedure OnAfterStep(Sender: TObject);
     procedure OnAfterEpoch(Sender: TObject);
@@ -600,6 +632,67 @@ begin
     TNNetPointwiseConvLinear.Create(csModelVocabSize),
     TNNetPointwiseSoftMax.Create(1)
   ]);
+end;
+
+// Phase 7 model: BuildModelHybrid with every large dense pointwise projection
+// swapped for its grouped alternative (AddAutoGroupedPointwiseConv picks the
+// largest group count whose input slice is >= csMinChannelsPerGroup channels,
+// then -- where input depth >= output depth -- remixes across groups with
+// interleave + a second grouped conv + a residual sum). At this config every
+// 128-input projection gets 8 groups and the FFN's 512->128 gets 32. Inside
+// the MLA block the new MinChannelsPerGroupCount argument groups the Q and
+// output projections; the latent path stays dense (see the header). The
+// output head (128->3000, the single biggest weight block) is grouped WITHOUT
+// intergroup wiring: the interleave would only permute vocab logits (input
+// depth < output depth means no remixing conv), and the grouped pre-head
+// 128->128 already provides cross-group mixing. Grouped pointwise convs and
+// TNNetInterleaveChannels are strictly per-token, so streamed decode
+// exactness and the width-1 CopyWeights twin are unaffected.
+function TDecodeBakeoff.BuildModelHybridGrouped(ContextLen: integer): TNNet;
+var
+  B: integer;
+  BranchInput: TNNetLayer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02));
+  for B := 1 to 3 do
+  begin
+    BranchInput := Result.GetLastLayer();
+    Result.AddLayer(TNNetDyT.Create());
+    if B = 2 then
+    begin
+      // ---- block 2 mixer: x := x + MLA(DyT(x)), grouped Q/out projections --
+      Result.AddMultiHeadLatentAttention(csEmbedDim, csHeads, csLatentDim,
+        {CausalMask=}true, {RopeDim=}csRopeDim,
+        {MinChannelsPerGroupCount=}csMinChannelsPerGroup);
+    end
+    else
+    begin
+      // ---- blocks 1/3 mixer: x := x + OutProj(SSM(InProj(DyT(x)))) ----
+      Result.AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear,
+        csMinChannelsPerGroup, csEmbedDim, {HasNormalization=}false);
+      Result.AddLayer(TNNetDiagonalSSM.Create());
+      Result.AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear,
+        csMinChannelsPerGroup, csEmbedDim, {HasNormalization=}false);
+    end;
+    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), BranchInput]));
+    // ---- FFN sub-block: x := x + FFN(DyT(x)) ----
+    BranchInput := Result.GetLastLayer();
+    Result.AddLayer(TNNetDyT.Create());
+    Result.AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear,
+      csMinChannelsPerGroup, 2 * csFFNDim, {HasNormalization=}false);
+    Result.AddLayer(TNNetSwiGLU.Create());
+    Result.AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear,
+      csMinChannelsPerGroup, csEmbedDim, {HasNormalization=}false);
+    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), BranchInput]));
+  end;
+  Result.AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear,
+    csMinChannelsPerGroup, csEmbedDim, {HasNormalization=}false);
+  Result.AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear,
+    csMinChannelsPerGroup, csModelVocabSize, {HasNormalization=}false,
+    {pSuppressBias=}0, {HasIntergroup=}false);
+  Result.AddLayer(TNNetPointwiseSoftMax.Create(1));
 end;
 
 // ---------------------------------------------------------------------------
@@ -906,11 +999,16 @@ end;
 // KV cache (grows per token, ONE block's worth only) with the rope layers'
 // PositionOffset advanced to the absolute position before each forward.
 procedure TDecodeBakeoff.CreateHybridStepNet(out Step: THybridStepNet;
-  Source: TNNet);
+  Source: TNNet; Grouped: boolean = false);
 var
   i, n: integer;
 begin
-  Step.Net := BuildModelHybrid(1);
+  // Grouped (phase 7) swaps the twin's builder; the layer scan below is
+  // class-based, so the SSM/SDPA/RoPE collection is unchanged.
+  if Grouped then
+    Step.Net := BuildModelHybridGrouped(1)
+  else
+    Step.Net := BuildModelHybrid(1);
   Step.Net.CopyWeights(Source);
   SetLength(Step.SSMs, 0);
   SetLength(Step.SDPAs, 0);
@@ -2172,6 +2270,175 @@ begin
   end;
 end;
 
+// ---------------------------------------------------------------------------
+// Phase 7: phase 6's hybrid with grouped pointwise convolutions. Identical
+// trunk, decode benchmark and hard assert; the experiment is the projection
+// SWAP -- block-diagonal grouped 1x1 convs (with intergroup remixing) instead
+// of dense ones, including the MLA builder's new grouped Q/out projections.
+// The verdict compares weights, convergence and decode cost against phase 6's
+// dense hybrid references.
+// ---------------------------------------------------------------------------
+procedure TDecodeBakeoff.RunPhase7;
+var
+  Trained, DenseRef: TNNet;
+  Step: THybridStepNet;
+  FullToks, CachedToks: TTokenBuf;
+  PromptLen, FullLen, CachedLen: integer;
+  FullMs, CachedMs: double;
+  FullFwds, CachedFwds: integer;
+  BMs: TBucketMs;
+  BCnt: TBucketCnt;
+  p, t, b, NewToks, RepTri, SumRepTri, SumNew: integer;
+  GroupedParams, DenseParams: integer;
+  SumFullMs, SumCachedMs, StepMsMin, StepMsMax: double;
+  TrainSec: double;
+  ConvergeOK, FlatOK, RangeOK: boolean;
+begin
+  WriteLn('=== Phase 7: grouped hybrid -- phase 6''s trunk with grouped pointwise convs ===');
+  LoadDataset();
+
+  Trained := BuildModelHybridGrouped(csContextLen);
+  GroupedParams := Trained.CountWeights();
+  // Dense twin built only to count the weights the grouping saves.
+  DenseRef := BuildModelHybrid(csContextLen);
+  DenseParams := DenseRef.CountWeights();
+  DenseRef.Free;
+  WriteLn('Model: ctx=', csContextLen, ' d_model=', csEmbedDim,
+    ' blocks=3 (SSM, MLA, SSM) latent=', csLatentDim, ' ropeDim=', csRopeDim,
+    ' ffn=', csFFNDim, ' vocab=', csModelVocabSize,
+    ' minChannelsPerGroup=', csMinChannelsPerGroup);
+  WriteLn(Format('Params: %d grouped vs %d dense (%.1f%%, %.2fx smaller).',
+    [GroupedParams, DenseParams, 100.0 * GroupedParams / DenseParams,
+     DenseParams / GroupedParams]));
+  WriteLn('Every large dense 1x1 projection is grouped (SSM in/out, FFN, both');
+  WriteLn('head projections, MLA Q/out); the MLA latent path stays dense.');
+  WriteLn('(Phase 6 dense hybrid reference at this budget: loss 7.99 -> ',
+    csRefLossHybrid:0:2, '.)');
+
+  TrainSec := Min(csTrainCapSecHyb,
+    csTotalBudgetSec - ElapsedSec() - csBenchReserveSec);
+  if TrainSec < 10 then
+  begin
+    WriteLn('ERROR: no time left to train (data loading took too long).');
+    Halt(1);
+  end;
+  // Same lr and time box as phase 6: the comparison isolates the projection
+  // swap (the grouped step is cheaper, so more examples fit in the same box).
+  TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.001);
+
+  CreateHybridStepNet(Step, Trained, {Grouped=}true);
+  try
+    for b := 0 to 2 do
+    begin
+      BMs[b] := 0;
+      BCnt[b] := 0;
+    end;
+    SumRepTri := 0; SumNew := 0;
+    SumFullMs := 0; SumCachedMs := 0;
+    WriteLn;
+    WriteLn('Greedy decode showdown (', csGenTokens, ' tokens per prompt):');
+    for p := 0 to High(csPrompts) do
+    begin
+      PromptLen := PromptToTokens(csPrompts[p], FullToks);
+      CachedToks := FullToks;
+
+      GreedyFull(Trained, FullToks, PromptLen, csGenTokens,
+        FullLen, FullMs, FullFwds);
+      GreedyHybridCached(Step, CachedToks, PromptLen, csGenTokens,
+        CachedLen, CachedMs, CachedFwds, BMs, BCnt);
+
+      // HARD ASSERT: token-exact equality between the two arms (this is what
+      // proves grouped pointwise convs stream exactly).
+      if FullLen <> CachedLen then
+      begin
+        WriteLn('ASSERT FAILED: full arm emitted ', FullLen - PromptLen,
+          ' tokens but streamed arm emitted ', CachedLen - PromptLen, '.');
+        Halt(1);
+      end;
+      for t := PromptLen to FullLen - 1 do
+        if FullToks[t] <> CachedToks[t] then
+        begin
+          WriteLn('ASSERT FAILED: decode arms diverge at position ', t,
+            ' (full=', FullToks[t], ' streamed=', CachedToks[t],
+            ') for prompt "', csPrompts[p], '".');
+          Halt(1);
+        end;
+
+      NewToks := FullLen - PromptLen;
+      RepTri := CountRepeatedTrigrams(FullToks, PromptLen, NewToks);
+      Inc(SumRepTri, RepTri);
+      Inc(SumNew, NewToks);
+      SumFullMs := SumFullMs + FullMs;
+      SumCachedMs := SumCachedMs + CachedMs;
+      WriteLn;
+      WriteLn('Prompt: "', csPrompts[p], '"');
+      WriteLn('  text: ', csPrompts[p], ' ',
+        TokensToText(FullToks, PromptLen, NewToks));
+      WriteLn(Format('  full re-encode  : %8.2f ms total  %6.2f ms/token  (%d forwards)',
+        [FullMs, FullMs / Max(1, NewToks), FullFwds]));
+      WriteLn(Format('  dual-family step: %8.2f ms total  %6.2f ms/token  (%d forwards incl. prefill)',
+        [CachedMs, CachedMs / Max(1, NewToks), CachedFwds]));
+      WriteLn(Format('  speedup         : %6.2fx   tokens match: YES (%d/%d)   repeated trigrams: %d',
+        [FullMs / Max(CachedMs, 1e-9), NewToks, NewToks, RepTri]));
+    end;
+
+    WriteLn;
+    WriteLn('Step cost vs prefix length (near-flat: the SSM state is constant;');
+    WriteLn('only ONE MLA block''s KV cache grows per token):');
+    StepMsMin := 1e30; StepMsMax := 0;
+    for b := 0 to 2 do
+      if BCnt[b] > 0 then
+      begin
+        WriteLn(Format('  prefix %s tokens: %6.3f ms/step  (%d steps)',
+          [Copy('  <16 16-31  >=32', b * 6 + 1, 5), BMs[b] / BCnt[b], BCnt[b]]));
+        StepMsMin := Min(StepMsMin, BMs[b] / BCnt[b]);
+        StepMsMax := Max(StepMsMax, BMs[b] / BCnt[b]);
+      end;
+
+    // ---- the verdict vs phase 6's dense hybrid ----
+    WriteLn;
+    WriteLn('=== Phase 7 verdict (grouped vs phase 6''s dense hybrid) ===');
+    WriteLn(Format('1. Cost: %d weights vs %d dense (%.1f%%, %.2fx smaller).',
+      [GroupedParams, DenseParams, 100.0 * GroupedParams / DenseParams,
+       DenseParams / GroupedParams]));
+    ConvergeOK := (FLastLoss > 0)
+      and (FLastLoss <= csRefLossHybrid + csGroupedLossSlack);
+    WriteLn(Format('2. Convergence: grouped loss %.2f (first batch) -> %.2f '
+      + '(final)  vs dense hybrid 7.99 -> %.2f (phase 6).',
+      [FFirstLoss, FLastLoss, csRefLossHybrid]));
+    if ConvergeOK then
+      WriteLn(Format('   VERDICT: HOLDS (within the +%.2f slack of the dense'
+        + ' reference at a fraction of the weights).', [csGroupedLossSlack]))
+    else
+      WriteLn(Format('   VERDICT: NOT CONFIRMED at this budget (final loss'
+        + ' exceeds dense + %.2f; see numbers above).', [csGroupedLossSlack]));
+    WriteLn(Format('   Quality clue: %d repeated trigrams across %d generated'
+      + ' tokens.', [SumRepTri, SumNew]));
+    RangeOK := (StepMsMax > 0) and (SumCachedMs / Max(1, SumNew) <= 2.0);
+    FlatOK := (StepMsMax > 0) and (StepMsMax <= 2.0 * Max(StepMsMin, 1e-9));
+    WriteLn(Format('3. Decode cost: streamed %.2f ms/token aggregate; step '
+      + 'buckets %.3f..%.3f ms', [SumCachedMs / Max(1, SumNew), StepMsMin,
+       StepMsMax]));
+    WriteLn('   (phase 6 dense reference: 1.51 ms/token aggregate).');
+    if RangeOK and FlatOK then
+      WriteLn('   VERDICT: HOLDS (at-or-below the ~0.5-2 ms/token band and'
+        + ' near-flat in prefix length).')
+    else if RangeOK then
+      WriteLn('   VERDICT: PARTIAL (cheap per token, but bucket spread'
+        + ' exceeds 2x -- see buckets).')
+    else
+      WriteLn('   VERDICT: NOT CONFIRMED at this budget (see numbers above).');
+    WriteLn(Format('Aggregate speedup vs full re-encode: %.1fx.',
+      [SumFullMs / Max(SumCachedMs, 1e-9)]));
+    WriteLn;
+    WriteLn('Phase 7: PASS (grouped dual-family streamed decode is token-exact). [t=',
+      ElapsedSec():0:1, 's]');
+  finally
+    FreeHybridStepNet(Step);
+    Trained.Free;
+  end;
+end;
+
 procedure TDecodeBakeoff.DoRun;
 var
   Phase, i: integer;
@@ -2193,9 +2460,9 @@ begin
       if i < ParamCount then Phase := StrToIntDef(ParamStr(i + 1), 0);
     end;
   end;
-  if (Phase < 1) or (Phase > 6) then
+  if (Phase < 1) or (Phase > 7) then
   begin
-    WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..6)');
+    WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..7)');
     WriteLn('  1: KV-cache incremental decode vs full re-encode');
     WriteLn('  2: MTP-heads self-speculative decode  (MTP = Multi-Token Prediction:');
     WriteLn('     parallel future-token heads that double as a built-in draft)');
@@ -2205,6 +2472,8 @@ begin
     WriteLn('     Attention, DeepSeek-V2: K/V factored through a tiny cached latent)');
     WriteLn('  5: speculative decoding + KV cache rollback');
     WriteLn('  6: hybrid 2xSSM + 1xMLA trunk, dual-family streamed decode');
+    WriteLn('  7: phase 6''s hybrid with GROUPED pointwise convolutions');
+    WriteLn('     (block-diagonal grouped 1x1 convs incl. the MLA Q/out projections)');
     Terminate;
     ExitCode := 2;
     exit;
@@ -2219,6 +2488,7 @@ begin
       4: RunPhase4;
       5: RunPhase5;
       6: RunPhase6;
+      7: RunPhase7;
     end;
   finally
     FDictionary.Free;

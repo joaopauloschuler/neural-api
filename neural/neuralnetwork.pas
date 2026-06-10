@@ -11172,10 +11172,24 @@ type
       // head output is sliced back to its d_k content channels). The cached
       // per-token decode state becomes LatentDim + RopeDim (latent + the
       // single shared rotated rope-K slice; rope-V does not exist).
+      // MinChannelsPerGroupCount>0 swaps the two LARGE d_model->d_model
+      // projections (Q and the output projection) for grouped pointwise convs
+      // via AddAutoGroupedPointwiseConv (block-diagonal weights + interleaved
+      // intergroup mixing + residual sum -- the AddGroupedSelfAttentionCAI
+      // idiom), cutting their MACs/weights by roughly the group count. The
+      // latent path is KEPT DENSE on purpose: c_KV must compress the WHOLE
+      // token (grouping the down-projection block-diagonalizes the low-rank
+      // factorization MLA exists to provide) and the LatentDim->d_model
+      // up-projections get no intergroup remix (input depth < output depth),
+      // so head K/V would see only one latent group; both are tiny anyway.
+      // Grouped layers stay strictly per-token, so streamed/KV-cached decode
+      // exactness and width-1 CopyWeights twins are unaffected. The default 0
+      // keeps every projection dense (bit-for-bit the original builder).
       // Returns the (SeqLen,1,d_model) out-projection layer.
       function AddMultiHeadLatentAttention(d_model, Heads,
         LatentDim: integer; CausalMask: boolean = false;
-        RopeDim: integer = 0): TNNetLayer;
+        RopeDim: integer = 0;
+        MinChannelsPerGroupCount: integer = 0): TNNetLayer;
       // Standard transformer encoder block over a (SeqLen,1,d_model) tensor:
       //   PreNorm=True  (default):
       //     x := x + MHA(LayerNorm(x));  x := x + SwiGLU-FFN(LayerNorm(x))
@@ -45572,7 +45586,8 @@ end;
 
 function TNNet.AddMultiHeadLatentAttention(d_model, Heads,
   LatentDim: integer; CausalMask: boolean = false;
-  RopeDim: integer = 0): TNNetLayer;
+  RopeDim: integer = 0;
+  MinChannelsPerGroupCount: integer = 0): TNNetLayer;
 var
   d_k, HeadCnt, d: integer;
   SourceLayer, QProj, CKV, KProj, VProj: TNNetLayer;
@@ -45597,7 +45612,15 @@ begin
   d_k := d_model div Heads;             // per-head dim
   // Token-wise projections (1x1 conv preserves the sequence axis).
   // Q is projected directly from d_model to the full d_model width (as in MHA).
-  QProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), SourceLayer);
+  // MinChannelsPerGroupCount>0 swaps this d_model->d_model projection for a
+  // grouped pointwise conv stack (the per-head slices below cut a LEARNED
+  // projection, so the intergroup interleave/remix costs nothing semantically).
+  if MinChannelsPerGroupCount > 0 then
+    QProj := AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear,
+      MinChannelsPerGroupCount, d_model, {HasNormalization=}false,
+      {pSuppressBias=}0, {HasIntergroup=}true, SourceLayer)
+  else
+    QProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), SourceLayer);
   // Low-rank K/V factoring: down-project each token to the SHARED latent c_KV
   // (width LatentDim << d_model) -- the ONLY state a decoder would cache.
   CKV := AddLayerAfter(TNNetPointwiseConvLinear.Create(LatentDim), SourceLayer);
@@ -45677,8 +45700,14 @@ begin
   end;
   AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   // Token-wise linear out-projection (FullConnectLinear would flatten the
-  // sequence axis; see AddMultiHeadSelfAttention header note).
-  Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+  // sequence axis; see AddMultiHeadSelfAttention header note). Grouped when
+  // MinChannelsPerGroupCount>0, like the Q projection above.
+  if MinChannelsPerGroupCount > 0 then
+    Result := AddAutoGroupedPointwiseConv(TNNetGroupedPointwiseConvLinear,
+      MinChannelsPerGroupCount, d_model, {HasNormalization=}false,
+      {pSuppressBias=}0, {HasIntergroup=}true)
+  else
+    Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
   SetLength(HeadOutputs, 0);
   SetLength(QChannels, 0);
   SetLength(KVChannels, 0);

@@ -148,8 +148,8 @@ An advanced source code example can be found [here](https://github.com/joaopaulo
 features on this same TinyStories tokenized workload, one phase per feature:
 
 ```
-./DecodeFeaturesBakeoff --phase N      (N in 1..6)
-bash run_decode_bakeoff.sh             (all six phases, logs to decode_bakeoff_phaseN.log)
+./DecodeFeaturesBakeoff --phase N      (N in 1..7)
+bash run_decode_bakeoff.sh             (all seven phases, logs to decode_bakeoff_phaseN.log)
 ```
 
 | Phase | Feature | Status |
@@ -160,9 +160,10 @@ bash run_decode_bakeoff.sh             (all six phases, logs to decode_bakeoff_p
 | 4 | MLA decoupled-RoPE latent KV cache (`TNNet.AddMultiHeadLatentAttention`) | implemented |
 | 5 | Speculative decoding composed with the KV cache (`TruncateCache` rollback) | implemented |
 | 6 | Hybrid 2×DiagonalSSM + 1×MLA trunk, dual-family streamed decode (the configuration phases 1–5 recommend) | implemented |
+| 7 | Phase 6's hybrid with grouped pointwise convolutions (`TNNetGroupedPointwiseConvLinear` via `AddAutoGroupedPointwiseConv`, incl. the new `MinChannelsPerGroupCount` argument of `TNNet.AddMultiHeadLatentAttention`) | implemented |
 
 Every phase self-budgets to 270 s of wall clock: training is time-boxed inside the
-program (~185 s in phases 1/4, ~195 s in phases 2/3, ~190 s in phase 6, ~160 s draft
+program (~185 s in phases 1/4, ~195 s in phases 2/3, ~190 s in phases 6/7, ~160 s draft
 training in phase 5), leaving the rest for
 the decode benchmark. The model is a small RoPE transformer decoder
 (ctx=48, d_model=128, 2 blocks, 8 heads, FFN 512, 3k vocab, ~1.31M params) with
@@ -222,6 +223,18 @@ greedy only (phase 5 showed speculation does not pay on CPU; phase 2's extra MTP
 heads cost two more 128→3000 projections), and the phase ends with a printed
 three-assumption verdict (convergence vs the pure-mixer references, sample looping,
 decode cost/flatness/cache size).
+Phase 7 repeats phase 6 with every large dense 1×1 projection swapped for its grouped
+alternative (`TNNetGroupedPointwiseConvLinear` through `AddAutoGroupedPointwiseConv`,
+MinChannelsPerGroup=16: block-diagonal weights, plus interleave-based intergroup
+remixing where input depth ≥ output depth): the SSM in/out projections, the SwiGLU FFN
+projections, both output-head projections, and — through the optional
+`MinChannelsPerGroupCount` argument of `TNNet.AddMultiHeadLatentAttention` — the MLA
+block's Q and output projections. The MLA latent path stays dense on purpose (c_KV must
+compress the whole token; the tiny LatentDim→d_model up-projections would get no
+intergroup remix). Grouped pointwise convs are strictly per-token, so the phase-6
+dual-family streamed decode applies unchanged, and the hard assert doubles as proof
+that grouped layers stream token-exactly. Its verdict compares weight count,
+convergence and decode cost against phase 6's dense references.
 All implemented phases HARD-ASSERT token-exact equality of all
 decode arms.
 
@@ -339,3 +352,21 @@ The three-assumption verdict (printed by the phase itself):
 So the hybrid recommendation holds on this workload: 2×SSM + 1×MLA converges at-or-
 better than every pure stack, decodes at KV-cached-transformer speed or better with a
 quarter to one-tenth of the growing cache, and needs no speculation machinery.
+
+Phase 7 (greedy, 40 new tokens per prompt, both arms token-identical; same ~190 s box
+and lr=0.001 as phase 6; 541,574 params — 36.2% of the dense hybrid's 1,496,582,
+2.76× smaller):
+```
+Prompt "one day"          full re-encode 11.22 ms/token  dual-family step 0.30 ms/token  speedup 38.0x
+Prompt "once upon a time" full re-encode 10.97 ms/token  dual-family step 0.32 ms/token  speedup 34.3x
+step cost vs prefix length:  <16 tokens 0.275 ms/step   16-31 tokens 0.273 ms/step   >=32 tokens 0.275 ms/step
+```
+Its verdict (printed by the phase): **convergence HOLDS** — the grouped hybrid's loss
+fell 8.13 → 1.58, matching the dense reference's 1.61 at 2.76× fewer weights (the
+cheaper grouped step also fits more examples into the same time box: 9,600 seen vs
+phase 6's typical ~6,400); the samples carried 0 repeated trigrams across 80 generated
+tokens ("one day, there was a little girl named lily. she loved to play with her
+friends…"); and **decode cost HOLDS** — 0.31 ms/token streamed, flat across the
+prefix buckets (0.273–0.275 ms/step). The hard assert doubles as proof that grouped
+pointwise convolutions (block-diagonal weights + interleave intergroup remixing)
+stream token-exactly through the dual-family loop.
