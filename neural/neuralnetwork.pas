@@ -3421,15 +3421,24 @@ type
   //   gx0   =  cos(angle)*gy0 + sin(angle)*gy1
   //   gx1   = -sin(angle)*gy0 + cos(angle)*gy1
   // No trainable parameters. Output shape equals input shape.
+  // PositionOffset (default 0, NOT serialized) shifts every position:
+  //   angle = (pos + PositionOffset) * base^(-2k/d).
+  // It exists for KV-cache incremental decode: a streamed length-1 token has
+  // SizeX=1, so this layer would otherwise always rotate it with pos=0. Set
+  // PositionOffset to the token's ABSOLUTE position (the running cache length
+  // BEFORE the step) so the cached path matches a full forward. Training is
+  // bit-for-bit unchanged at the default 0.
   // Coded by Claude (AI).
   TNNetRotaryEmbedding = class(TNNetIdentity)
   private
+    FPositionOffset: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload;
     constructor Create(pBase: TNeuralFloat); overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+    property PositionOffset: integer read FPositionOffset write FPositionOffset;
   end;
 
   // Calculates Power(LocalPrevOutput.FData[OutputCnt], iPower).
@@ -11128,11 +11137,26 @@ type
       // axis is preserved (a TNNetFullConnect* would flatten/mix tokens; see the
       // AddMultiHeadSelfAttention header note). Cacheable-state saving vs plain
       // MHA (which caches full-width K AND V, total 2*d_model per token) is
-      // LatentDim / (2*d_model). v1 is NoPE (no positional encoding): the paper's
-      // decoupled RoPE slice on Q/K is NOT yet carried (follow-up). Returns the
-      // (SeqLen,1,d_model) out-projection layer.
+      // LatentDim / (2*d_model). The default RopeDim=0 is NoPE (no positional
+      // encoding) and is bit-for-bit the original builder.
+      // RopeDim>0 (must be EVEN) adds the paper's DECOUPLED-RoPE slice: RoPE
+      // cannot be applied to the compressed latent c_KV (the per-head
+      // up-projection would smear positions), so the content path above stays
+      // position-free and a small extra rope dimension carries position:
+      //   rope-Q: a PER-HEAD token-wise projection of x (width Heads*RopeDim),
+      //           each head's RopeDim slice rotated by TNNetRotaryEmbedding;
+      //   rope-K: ONE token-wise projection of x (width RopeDim) SHARED by all
+      //           heads, rotated ONCE and concatenated into every head.
+      // Each head then attends with concat(Q_h, ropeQ_h).concat(K_h, ropeK)
+      // over width d_k+RopeDim (V is zero-padded to match the SDPA equal-width
+      // Q|K|V pack via an exact x+(-x) zero block whose gradients cancel; the
+      // head output is sliced back to its d_k content channels). The cached
+      // per-token decode state becomes LatentDim + RopeDim (latent + the
+      // single shared rotated rope-K slice; rope-V does not exist).
+      // Returns the (SeqLen,1,d_model) out-projection layer.
       function AddMultiHeadLatentAttention(d_model, Heads,
-        LatentDim: integer; CausalMask: boolean = false): TNNetLayer;
+        LatentDim: integer; CausalMask: boolean = false;
+        RopeDim: integer = 0): TNNetLayer;
       // Standard transformer encoder block over a (SeqLen,1,d_model) tensor:
       //   PreNorm=True  (default):
       //     x := x + MHA(LayerNorm(x));  x := x + SwiGLU-FFN(LayerNorm(x))
@@ -24528,7 +24552,8 @@ begin
   begin
     for k := 0 to HalfD - 1 do
     begin
-      Angle := pos * pcr_expf(-2.0 * k * InvD * pcr_logf(Base));
+      Angle := (pos + FPositionOffset) *
+        pcr_expf(-2.0 * k * InvD * pcr_logf(Base));
       pcr_sincosf(Angle, s, c);
       x0 := Prev[pos, 0, 2 * k];
       x1 := Prev[pos, 0, 2 * k + 1];
@@ -24566,7 +24591,8 @@ begin
     begin
       for k := 0 to HalfD - 1 do
       begin
-        Angle := pos * pcr_expf(-2.0 * k * InvD * pcr_logf(Base));
+        Angle := (pos + FPositionOffset) *
+          pcr_expf(-2.0 * k * InvD * pcr_logf(Base));
         pcr_sincosf(Angle, s, c);
         gy0 := FOutputError[pos, 0, 2 * k];
         gy1 := FOutputError[pos, 0, 2 * k + 1];
@@ -45490,13 +45516,15 @@ begin
 end;
 
 function TNNet.AddMultiHeadLatentAttention(d_model, Heads,
-  LatentDim: integer; CausalMask: boolean = false): TNNetLayer;
+  LatentDim: integer; CausalMask: boolean = false;
+  RopeDim: integer = 0): TNNetLayer;
 var
   d_k, HeadCnt, d: integer;
   SourceLayer, QProj, CKV, KProj, VProj: TNNetLayer;
-  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  QRopeProj, KRopeShared, VZeroPad, NegRopeK: TNNetLayer;
+  QSlice, KSlice, VSlice, QRopeSlice, HeadPack, HeadAttn: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
-  QChannels, KVChannels: array of integer;
+  QChannels, KVChannels, RopeChannels: array of integer;
 begin
   if Heads < 1 then
     FErrorProc('AddMultiHeadLatentAttention requires Heads >= 1. Heads=' +
@@ -45507,6 +45535,9 @@ begin
   if LatentDim < 1 then
     FErrorProc('AddMultiHeadLatentAttention requires LatentDim >= 1.' +
       ' LatentDim=' + IntToStr(LatentDim));
+  if (RopeDim < 0) or (Odd(RopeDim)) then
+    FErrorProc('AddMultiHeadLatentAttention requires an even RopeDim >= 0' +
+      ' (RoPE rotates channel pairs). RopeDim=' + IntToStr(RopeDim));
   SourceLayer := GetLastLayer();
   d_k := d_model div Heads;             // per-head dim
   // Token-wise projections (1x1 conv preserves the sequence axis).
@@ -45518,9 +45549,37 @@ begin
   // Up-project the latent back to full-width K and V (d_model = Heads*d_k each).
   KProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), CKV);
   VProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), CKV);
+  QRopeProj := nil;
+  KRopeShared := nil;
+  VZeroPad := nil;
+  if RopeDim > 0 then
+  begin
+    // DECOUPLED-RoPE slice (DeepSeek-V2). RoPE cannot be applied to the
+    // compressed latent c_KV (the per-head up-projection would smear
+    // positions), so the content path stays position-free and a small extra
+    // rope dimension carries position instead.
+    // rope-Q: PER-HEAD token-wise projection of x (width Heads*RopeDim); each
+    // head's RopeDim slice is rotated below (after slicing, so the RoPE
+    // frequency schedule matches the RopeDim-wide rope-K).
+    QRopeProj := AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Heads * RopeDim), SourceLayer);
+    // rope-K: ONE token-wise projection of x (width RopeDim), rotated ONCE
+    // and SHARED across all heads (the paper's w_KR — per-token decode state
+    // grows by only RopeDim, independent of head count).
+    KRopeShared := AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(RopeDim), SourceLayer);
+    KRopeShared := AddLayerAfter(TNNetRotaryEmbedding.Create(), KRopeShared);
+    // SDPA packs equal-width Q|K|V, but V has no rope slice; pad it with an
+    // exact zero block built as x + (-x) (TNNetMulLearning forbids a literal
+    // 0 multiplier). Forward is exactly 0 and the two backward branches
+    // (+g and -g) cancel, so no spurious gradient reaches rope-K.
+    NegRopeK := AddLayerAfter(TNNetNegate.Create(), KRopeShared);
+    VZeroPad := AddLayer(TNNetSum.Create([KRopeShared, NegRopeK]));
+  end;
   SetLength(HeadOutputs, Heads);
   SetLength(QChannels, d_k);
   SetLength(KVChannels, d_k);
+  SetLength(RopeChannels, RopeDim);
   for HeadCnt := 0 to Heads - 1 do
   begin
     for d := 0 to d_k - 1 do
@@ -45531,11 +45590,35 @@ begin
     QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
     KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KProj);
     VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VProj);
-    // Pack [Q_h | K_h | V_h] (width 3*d_k) as SDPA expects.
-    HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
-    HeadOutputs[HeadCnt] :=
-      AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
+    if RopeDim > 0 then
+    begin
+      // This head's rope-Q slice, rotated; rope-K is the shared rotated slice.
+      for d := 0 to RopeDim - 1 do
+        RopeChannels[d] := HeadCnt * RopeDim + d;
+      QRopeSlice := AddLayerAfter(
+        TNNetSplitChannels.Create(RopeChannels), QRopeProj);
+      QRopeSlice := AddLayerAfter(TNNetRotaryEmbedding.Create(), QRopeSlice);
+      // Pack [Q_h|ropeQ_h | K_h|ropeK | V_h|0] (width 3*(d_k+RopeDim)).
+      HeadPack := AddLayer(TNNetDeepConcat.Create(
+        [QSlice, QRopeSlice, KSlice, KRopeShared, VSlice, VZeroPad]));
+      HeadAttn := AddLayerAfter(
+        TNNetScaledDotProductAttention.Create(d_k + RopeDim, CausalMask),
         HeadPack);
+      // The trailing RopeDim output channels are attention-weighted zeros
+      // (from the zero-padded V); keep only the d_k content channels.
+      for d := 0 to d_k - 1 do
+        QChannels[d] := d; // reuse the scratch array: channels [0..d_k-1]
+      HeadOutputs[HeadCnt] :=
+        AddLayerAfter(TNNetSplitChannels.Create(QChannels), HeadAttn);
+    end
+    else
+    begin
+      // Pack [Q_h | K_h | V_h] (width 3*d_k) as SDPA expects.
+      HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
+      HeadOutputs[HeadCnt] :=
+        AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
+          HeadPack);
+    end;
   end;
   AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   // Token-wise linear out-projection (FullConnectLinear would flatten the
@@ -45544,6 +45627,7 @@ begin
   SetLength(HeadOutputs, 0);
   SetLength(QChannels, 0);
   SetLength(KVChannels, 0);
+  SetLength(RopeChannels, 0);
 end;
 
 function TNNet.AddTransformerEncoderBlock(Heads, d_ff: integer;

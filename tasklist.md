@@ -332,14 +332,19 @@ rather than acted on.
       - [ ] PreNorm/NormClass/CausalMask params on AddConformerBlock (match
             AddTransformerEncoderBlock's flexibility); optional BatchNorm in the conv
             module (the paper uses BN between depthwise conv and activation, not LayerNorm).
-- [ ] TNNet.AddMultiHeadLatentAttention follow-up (builder + examples/LatentAttention/
+- [x] TNNet.AddMultiHeadLatentAttention follow-up (builder + examples/LatentAttention/
       landed 2026-06-05, NoPE; down-proj x->c_KV + per-head K/V up-projections +
       per-head SDPA + DeepConcat + out-proj, shape + input-gradient + save/load
       tests, MLA-vs-MHA copy bake-off): (a) the paper's DECOUPLED-RoPE slice — a
       separate rope-only Q/K slice concatenated to the content slice before the
       dot product (RoPE cannot be applied to the compressed latent because the
       up-projection would smear positions); (b) the headline KV-cache win, which
-      needs the open [[KV-cache incremental-decode]] path.
+      needs the open [[KV-cache incremental-decode]] path. DONE 2026-06-10: (a)
+      RopeDim param (default 0 = unchanged NoPE; per-head rotated rope-Q + ONE
+      shared rotated rope-K, zero-padded V via exact x+(-x)) + (b) incremental
+      decode demos in examples/LatentAttention/ (SDPA-cache path with
+      TNNetRotaryEmbedding.PositionOffset:=t per step, plus TRUE latent-only
+      caching at d_c floats/token, both faithful <1e-5) + 3 new tests.
 - [ ] GQA follow-up: wire AddMultiHeadGroupedQueryAttention into the downstream
       ../gpt-3-for-pascal decoder and compose with the open [[KV-cache
       incremental-decode]] task — the KV footprint shrinks by QueryHeads/KVHeads,
