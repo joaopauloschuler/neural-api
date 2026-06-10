@@ -31,8 +31,32 @@ of the budget for the decode benchmark itself.
            rejection -- known open problem), so both arms re-encode fully and
            the win measured is forwards/token and wall clock. HARD ASSERT:
            self-speculative output == plain greedy from the same model.
-  Phase 3 (commit 80dd830): DiagonalSSM O(1)-per-step decode.    [stub]
-  Phase 4 (commit a8f3077): MLA decoupled-RoPE latent KV cache.  [stub]
+  Phase 3 (commit 80dd830): DiagonalSSM O(1)-per-step incremental decode.
+           Same harness, but the sequence mixer is TNNetDiagonalSSM instead of
+           attention: 2 residual blocks of [DyT -> in-proj -> DiagonalSSM ->
+           out-proj] + [DyT -> SwiGLU FFN]. NO RoPE and NO positional
+           embedding anywhere -- a recurrence carries order by construction
+           (matching examples/DiagonalSSM). Decode benchmark: greedy full
+           re-encode per token vs the layer's Begin/Reset incremental-decode
+           API (prefill the prompt token-at-a-time, then one length-1 forward
+           per token; the ENTIRE past lives in a Depth-long state vector, so
+           the step cost is O(1) in the prefix length -- printed per prefix-
+           length bucket to show flatness, vs the KV cache whose state grows
+           per token). HARD ASSERT: both arms emit the SAME tokens.
+  Phase 4 (commit a8f3077): MLA decoupled-RoPE latent KV cache. Same harness,
+           but the mixer is TNNet.AddMultiHeadLatentAttention (LatentDim=32
+           << 2*d_model=256, RopeDim=8) wrapped in the same pre-norm
+           residual+FFN block structure as phase 1's encoder block. Position
+           enters ONLY through the decoupled rope slice (token-only
+           embedding). Decode benchmark mirrors phase 1: full re-encode vs
+           KV-cached step net (per-head SDPA BeginIncrementalDecode + RoPE
+           PositionOffset per step), HARD ASSERT token-exact, plus the MLA
+           cache-economics table -- bytes/token for latent-only caching
+           (LatentDim+RopeDim floats, the ANALYTIC paper number) vs
+           equivalent-MHA full K+V (2*d_model) vs the per-head SDPA caches
+           this arm actually runs (see examples/LatentAttention for the true
+           latent-only decode loop; here the SDPA-cache arm proves
+           faithfulness and the table carries the memory economics).
   Phase 5 (commit 42dd5dd): speculative decoding COMPOSED with the KV cache
            (TruncateCache rollback). Requires phase 1's checkpoint. Trains a
            cheap TokenShift draft briefly, then greedy speculative decoding
@@ -110,6 +134,8 @@ const
   csBenchReserveSec  = 60;   // kept free for the decode benchmark
   csTrainCapSec      = 185;  // phase 1: never train longer than this
   csTrainCapSecMTP   = 195;  // phase 2: MTP decode bench is cheap, train more
+  csTrainCapSecSSM   = 195;  // phase 3: SSM decode bench is the cheapest
+  csTrainCapSecMLA   = 185;  // phase 4: decode bench cost mirrors phase 1
   csDraftCapSec      = 160;  // phase 5: draft training cap
   // ---- decode benchmark ----
   csGenTokens        = 40;   // tokens generated per prompt per arm
@@ -120,6 +146,9 @@ const
   csDraftFFNDim      = 256;
   // ---- phase 2 MTP heads ----
   csNumFuture        = 3;    // t+1 (committed) + t+2,t+3 (the built-in draft)
+  // ---- phase 4 MLA ----
+  csLatentDim        = 32;   // c_KV width; << per-token MHA K+V = 2*d_model = 256
+  csRopeDim          = 8;    // decoupled-RoPE slice width (even, as RoPE requires)
 
 const
   csPrompts: array[0..1] of string = ('one day', 'once upon a time');
@@ -172,6 +201,21 @@ type
     InV: TNNetVolume;
   end;
 
+  // Phase 3 twin: a width-1 weight-copied SSM net whose TNNetDiagonalSSM
+  // layers run the O(1)-per-step incremental-decode path. Unlike the KV cache
+  // there is NO preallocation budget and NO per-token state growth: the
+  // entire past is a persisted Depth-long state vector h per SSM layer.
+  TSSMStepNet = record
+    Net: TNNet;
+    SSMs: array of TNNetDiagonalSSM;
+    InV: TNNetVolume;
+  end;
+
+  // Per-prefix-length-bucket step timing (phase 3 flatness evidence):
+  // bucket 0 = prefix < 16 tokens, 1 = 16..31, 2 = >= 32.
+  TBucketMs  = array[0..2] of double;
+  TBucketCnt = array[0..2] of integer;
+
   { TDecodeBakeoff }
   TDecodeBakeoff = class(TCustomApplication)
   protected
@@ -190,7 +234,8 @@ type
     function BuildDraft(ContextLen: integer): TNNet;
     procedure TrainTimeBoxed(NN: TNNet; BudgetSec: double;
       SamplesPerEpoch: integer; LearningRate: TNeuralFloat);
-    procedure CreateStepNet(out Step: TStepNet; Width: integer; Source: TNNet);
+    procedure CreateStepNet(out Step: TStepNet; Width: integer; Source: TNNet;
+      UseMLA: boolean = false);
     procedure FreeStepNet(var Step: TStepNet);
     procedure CachedWindowForward(var Step: TStepNet; const Seq: TTokenBuf;
       StartPos, NReal: integer);
@@ -205,6 +250,15 @@ type
     procedure GreedySpecCached(var Step: TStepNet; Draft: TNNet;
       var Toks: TTokenBuf; PromptLen, MaxNew: integer; out OutLen: integer;
       out Ms: double; out TgtFwds, DraftFwds, Passes, Proposed, Accepted: integer);
+    // phase 3 (DiagonalSSM recurrent mixer; O(1)-per-step incremental decode)
+    function BuildModelSSM(ContextLen: integer): TNNet;
+    procedure CreateSSMStepNet(out Step: TSSMStepNet; Source: TNNet);
+    procedure FreeSSMStepNet(var Step: TSSMStepNet);
+    procedure GreedySSMCached(var Step: TSSMStepNet; var Toks: TTokenBuf;
+      PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
+      out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
+    // phase 4 (Multi-head Latent Attention with the decoupled-RoPE slice)
+    function BuildModelMLA(ContextLen: integer): TNNet;
     // phase 2 (MTP heads as built-in draft; full re-encode arms)
     function BuildModelMTP(ContextLen: integer): TNNet;
     function MTPHeadArgmax(NN: TNNet; Row, Head: integer): integer;
@@ -218,8 +272,9 @@ type
     // phases
     procedure RunPhase1;
     procedure RunPhase2;
+    procedure RunPhase3;
+    procedure RunPhase4;
     procedure RunPhase5;
-    procedure RunStub(Phase: integer);
   public
     procedure OnAfterStep(Sender: TObject);
     procedure OnAfterEpoch(Sender: TObject);
@@ -326,6 +381,83 @@ begin
       {NormClass=}TNNetDyT);
   Result.AddLayer(TNNetPointwiseConvLinear.Create(csEmbedDim));
   Result.AddMultiTokenPrediction(csNumFuture, csModelVocabSize);
+end;
+
+// Phase 3 model: same residual skeleton (pre-norm DyT + SwiGLU FFN, same
+// d_model/FFN/blocks/head as BuildModel) but the sequence mixer is the
+// recurrent TNNetDiagonalSSM instead of attention. The SSM is per-channel, so
+// it is wrapped in token-wise in/out projections for channel mixing (the
+// examples/DiagonalSSM idiom). NO RoPE and NO positional embedding anywhere:
+// a left-to-right recurrence carries order by construction. Every layer is
+// per-token or recurrent-with-Begin/ResetState, so streamed decode is exact.
+function TDecodeBakeoff.BuildModelSSM(ContextLen: integer): TNNet;
+var
+  B: integer;
+  BranchInput: TNNetLayer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02));
+  for B := 1 to csBlocks do
+  begin
+    // ---- mixer sub-block: x := x + OutProj(SSM(InProj(DyT(x)))) ----
+    BranchInput := Result.GetLastLayer();
+    Result.AddLayer(TNNetDyT.Create());
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(csEmbedDim));
+    Result.AddLayer(TNNetDiagonalSSM.Create());
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(csEmbedDim));
+    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), BranchInput]));
+    // ---- FFN sub-block: x := x + FFN(DyT(x)) (same as the encoder block) --
+    BranchInput := Result.GetLastLayer();
+    Result.AddLayer(TNNetDyT.Create());
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(2 * csFFNDim));
+    Result.AddLayer(TNNetSwiGLU.Create());
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(csEmbedDim));
+    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), BranchInput]));
+  end;
+  Result.AddLayer([
+    TNNetPointwiseConvLinear.Create(csEmbedDim),
+    TNNetPointwiseConvLinear.Create(csModelVocabSize),
+    TNNetPointwiseSoftMax.Create(1)
+  ]);
+end;
+
+// Phase 4 model: same residual skeleton as phase 1's encoder block (pre-norm
+// DyT, SwiGLU FFN), but the attention is TNNet.AddMultiHeadLatentAttention:
+// K/V are low-rank-factored through a per-token latent c_KV of width
+// csLatentDim (the ONLY content state an incremental decoder must cache) and
+// position enters ONLY through the decoupled-RoPE slice (RopeDim=csRopeDim;
+// token-only embedding, no absolute positions). The residual wiring is inlined
+// because the MLA builder chains many layers from GetLastLayer().
+function TDecodeBakeoff.BuildModelMLA(ContextLen: integer): TNNet;
+var
+  B: integer;
+  BranchInput: TNNetLayer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02));
+  for B := 1 to csBlocks do
+  begin
+    // ---- attention sub-block: x := x + MLA(DyT(x)) ----
+    BranchInput := Result.GetLastLayer();
+    Result.AddLayer(TNNetDyT.Create());
+    Result.AddMultiHeadLatentAttention(csEmbedDim, csHeads, csLatentDim,
+      {CausalMask=}true, {RopeDim=}csRopeDim);
+    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), BranchInput]));
+    // ---- FFN sub-block: x := x + FFN(DyT(x)) ----
+    BranchInput := Result.GetLastLayer();
+    Result.AddLayer(TNNetDyT.Create());
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(2 * csFFNDim));
+    Result.AddLayer(TNNetSwiGLU.Create());
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(csEmbedDim));
+    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), BranchInput]));
+  end;
+  Result.AddLayer([
+    TNNetPointwiseConvLinear.Create(csEmbedDim),
+    TNNetPointwiseConvLinear.Create(csModelVocabSize),
+    TNNetPointwiseSoftMax.Create(1)
+  ]);
 end;
 
 // ---------------------------------------------------------------------------
@@ -487,12 +619,16 @@ end;
 // examples/SpeculativeDecoding extended with the RoPE PositionOffset contract).
 // ---------------------------------------------------------------------------
 procedure TDecodeBakeoff.CreateStepNet(out Step: TStepNet; Width: integer;
-  Source: TNNet);
+  Source: TNNet; UseMLA: boolean = false);
 var
   i, n: integer;
 begin
   Step.Width := Width;
-  Step.Net := BuildModel(Width);
+  // UseMLA (phase 4) swaps the twin's builder; default is phase 1/5's model.
+  if UseMLA then
+    Step.Net := BuildModelMLA(Width)
+  else
+    Step.Net := BuildModel(Width);
   // Same builder, so the layer-by-layer weight copy is exact (all parameter
   // shapes are sequence-length independent).
   Step.Net.CopyWeights(Source);
@@ -525,6 +661,79 @@ begin
   Step.Net.Free;
   SetLength(Step.SDPAs, 0);
   SetLength(Step.Ropes, 0);
+end;
+
+// Phase 3 twin: a width-1 weight-copied SSM net with every TNNetDiagonalSSM
+// switched into incremental-decode mode. No RoPE offsets to manage (the model
+// has no positional layers) and no preallocation budget: the persisted state
+// per SSM layer is a Depth-long vector regardless of how far decoding goes.
+procedure TDecodeBakeoff.CreateSSMStepNet(out Step: TSSMStepNet; Source: TNNet);
+var
+  i, n: integer;
+begin
+  Step.Net := BuildModelSSM(1);
+  Step.Net.CopyWeights(Source);
+  SetLength(Step.SSMs, 0);
+  for i := 0 to Step.Net.Layers.Count - 1 do
+    if Step.Net.Layers[i] is TNNetDiagonalSSM then
+    begin
+      n := Length(Step.SSMs);
+      SetLength(Step.SSMs, n + 1);
+      Step.SSMs[n] := TNNetDiagonalSSM(Step.Net.Layers[i]);
+      Step.SSMs[n].BeginIncrementalDecode();
+    end;
+  Step.InV := TNNetVolume.Create(1, 1, 1);
+end;
+
+procedure TDecodeBakeoff.FreeSSMStepNet(var Step: TSSMStepNet);
+begin
+  Step.InV.Free;
+  Step.Net.Free;
+  SetLength(Step.SSMs, 0);
+end;
+
+// Phase 3 incremental arm: ResetState (h := 0) starts the sequence, the
+// prompt is prefilled token-at-a-time (each forward folds one token into the
+// persisted state), then one length-1 forward per generated token. Each
+// decode step is additionally timed into a prefix-length bucket (BMs/BCnt) to
+// show the O(1)-in-prefix flatness: unlike a KV cache, the step never touches
+// anything whose size grows with the prefix.
+procedure TDecodeBakeoff.GreedySSMCached(var Step: TSSMStepNet;
+  var Toks: TTokenBuf; PromptLen, MaxNew: integer; out OutLen: integer;
+  out Ms: double; out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
+var
+  t, b: integer;
+  T0, S0, dt: double;
+begin
+  Fwds := 0;
+  T0 := NowMs();
+  for t := 0 to High(Step.SSMs) do Step.SSMs[t].ResetState();
+  // Prefill tokens 0..PromptLen-2; the LAST prompt token is the first decode
+  // step's input (its output row predicts the first new token).
+  for t := 0 to PromptLen - 2 do
+  begin
+    Step.InV.FData[0] := Toks[t];
+    Step.Net.Compute(Step.InV);
+    Inc(Fwds);
+  end;
+  OutLen := PromptLen;
+  while (OutLen - PromptLen < MaxNew) and (OutLen < csContextLen) do
+  begin
+    Step.InV.FData[0] := Toks[OutLen - 1];
+    S0 := NowMs();
+    Step.Net.Compute(Step.InV);
+    dt := NowMs() - S0;
+    Inc(Fwds);
+    // Bucket by the prefix length this step conditions on (= OutLen).
+    if OutLen < 16 then b := 0
+    else if OutLen < 32 then b := 1
+    else b := 2;
+    BMs[b] := BMs[b] + dt;
+    Inc(BCnt[b]);
+    Toks[OutLen] := Step.Net.GetLastLayer().Output.GetClassOnPixel(0, 0);
+    Inc(OutLen);
+  end;
+  Ms := NowMs() - T0;
 end;
 
 // One cached window forward: tokens Seq[StartPos..StartPos+NReal-1] fill the
@@ -1125,6 +1334,234 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// Phase 3: DiagonalSSM O(1)-per-step incremental decode (commit 80dd830).
+// The mixer swap is the experiment: at the SAME time budget, context, depth
+// and FFN as phase 1's transformer (reference: loss 5.02 -> 2.87 in its box),
+// how does a linear-recurrence mixer train -- and what does its O(1) decode
+// cost? The recurrence's state is a Depth-long vector per SSM layer, so the
+// step cost is FLAT in the prefix length (printed per bucket), while phase
+// 1's KV cache grows by 2*d_k floats per head per token.
+// ---------------------------------------------------------------------------
+procedure TDecodeBakeoff.RunPhase3;
+var
+  Trained: TNNet;
+  Step: TSSMStepNet;
+  FullToks, CachedToks: TTokenBuf;
+  PromptLen, FullLen, CachedLen: integer;
+  FullMs, CachedMs: double;
+  FullFwds, CachedFwds: integer;
+  BMs: TBucketMs;
+  BCnt: TBucketCnt;
+  p, t, b, NewToks: integer;
+  TrainSec: double;
+begin
+  WriteLn('=== Phase 3: DiagonalSSM O(1)-per-step incremental decode (80dd830) ===');
+  LoadDataset();
+
+  Trained := BuildModelSSM(csContextLen);
+  WriteLn('Model: ctx=', csContextLen, ' d_model=', csEmbedDim,
+    ' blocks=', csBlocks, ' mixer=DiagonalSSM ffn=', csFFNDim, ' vocab=',
+    csModelVocabSize, '  params=', Trained.CountWeights());
+  WriteLn('No RoPE / no positional embedding: the recurrence carries order.');
+  WriteLn('(Phase 1 transformer reference at this budget: loss 5.02 -> 2.87.)');
+
+  TrainSec := Min(csTrainCapSecSSM,
+    csTotalBudgetSec - ElapsedSec() - csBenchReserveSec);
+  if TrainSec < 10 then
+  begin
+    WriteLn('ERROR: no time left to train (data loading took too long).');
+    Halt(1);
+  end;
+  TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.0005);
+
+  CreateSSMStepNet(Step, Trained);
+  try
+    for b := 0 to 2 do
+    begin
+      BMs[b] := 0;
+      BCnt[b] := 0;
+    end;
+    WriteLn;
+    WriteLn('Greedy decode showdown (', csGenTokens, ' tokens per prompt):');
+    for p := 0 to High(csPrompts) do
+    begin
+      PromptLen := PromptToTokens(csPrompts[p], FullToks);
+      CachedToks := FullToks;
+
+      GreedyFull(Trained, FullToks, PromptLen, csGenTokens,
+        FullLen, FullMs, FullFwds);
+      GreedySSMCached(Step, CachedToks, PromptLen, csGenTokens,
+        CachedLen, CachedMs, CachedFwds, BMs, BCnt);
+
+      // HARD ASSERT: token-exact equality between the two arms.
+      if FullLen <> CachedLen then
+      begin
+        WriteLn('ASSERT FAILED: full arm emitted ', FullLen - PromptLen,
+          ' tokens but incremental arm emitted ', CachedLen - PromptLen, '.');
+        Halt(1);
+      end;
+      for t := PromptLen to FullLen - 1 do
+        if FullToks[t] <> CachedToks[t] then
+        begin
+          WriteLn('ASSERT FAILED: decode arms diverge at position ', t,
+            ' (full=', FullToks[t], ' incremental=', CachedToks[t],
+            ') for prompt "', csPrompts[p], '".');
+          Halt(1);
+        end;
+
+      NewToks := FullLen - PromptLen;
+      WriteLn;
+      WriteLn('Prompt: "', csPrompts[p], '"');
+      WriteLn('  text: ', csPrompts[p], ' ',
+        TokensToText(FullToks, PromptLen, NewToks));
+      WriteLn(Format('  full re-encode  : %8.2f ms total  %6.2f ms/token  (%d forwards)',
+        [FullMs, FullMs / Max(1, NewToks), FullFwds]));
+      WriteLn(Format('  O(1) SSM step   : %8.2f ms total  %6.2f ms/token  (%d forwards incl. prefill)',
+        [CachedMs, CachedMs / Max(1, NewToks), CachedFwds]));
+      WriteLn(Format('  speedup         : %6.2fx   tokens match: YES (%d/%d)',
+        [FullMs / Max(CachedMs, 1e-9), NewToks, NewToks]));
+    end;
+
+    WriteLn;
+    WriteLn('Step cost vs prefix length (flat = O(1) per step; the entire past');
+    WriteLn('is a Depth-long state vector per SSM layer, nothing grows per token):');
+    for b := 0 to 2 do
+      if BCnt[b] > 0 then
+        WriteLn(Format('  prefix %s tokens: %6.3f ms/step  (%d steps)',
+          [Copy('  <16 16-31  >=32', b * 6 + 1, 5), BMs[b] / BCnt[b], BCnt[b]]));
+    WriteLn;
+    WriteLn('Phase 3: PASS (O(1)-per-step SSM decode is token-exact). [t=',
+      ElapsedSec():0:1, 's]');
+  finally
+    FreeSSMStepNet(Step);
+    Trained.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// Phase 4: Multi-head Latent Attention with the decoupled-RoPE slice (commit
+// a8f3077). Same residual skeleton as phase 1; the headline is the KV-cache
+// ECONOMICS: an MLA decoder need cache only the per-token latent c_KV
+// (csLatentDim floats) plus the ONE shared rotated rope-K slice (csRopeDim
+// floats), vs 2*d_model floats for equivalent-MHA full K+V. The decode run
+// here uses the per-head SDPA cache machinery (which proves token-exact
+// faithfulness of streamed MLA decode incl. the rotated rope slice); the true
+// latent-only decode loop lives in examples/LatentAttention -- the table
+// below carries its ANALYTIC bytes/token.
+// ---------------------------------------------------------------------------
+procedure TDecodeBakeoff.RunPhase4;
+var
+  Trained: TNNet;
+  Step: TStepNet;
+  FullToks, CachedToks: TTokenBuf;
+  PromptLen, FullLen, CachedLen: integer;
+  FullMs, CachedMs: double;
+  FullFwds, CachedFwds: integer;
+  p, t, NewToks, d_k: integer;
+  TrainSec: double;
+begin
+  WriteLn('=== Phase 4: MLA decoupled-RoPE latent KV cache (a8f3077) ===');
+  LoadDataset();
+
+  d_k := csEmbedDim div csHeads;
+  Trained := BuildModelMLA(csContextLen);
+  WriteLn('Model: ctx=', csContextLen, ' d_model=', csEmbedDim, ' blocks=',
+    csBlocks, ' heads=', csHeads, ' latent=', csLatentDim, ' ropeDim=',
+    csRopeDim, ' ffn=', csFFNDim, ' vocab=', csModelVocabSize, '  params=',
+    Trained.CountWeights());
+  WriteLn('Position enters ONLY through the decoupled rope slice (token-only');
+  WriteLn('embedding; the content path K/V is reconstructed from the latent).');
+  WriteLn('(Phase 1 transformer reference at this budget: loss 5.02 -> 2.87.)');
+
+  TrainSec := Min(csTrainCapSecMLA,
+    csTotalBudgetSec - ElapsedSec() - csBenchReserveSec);
+  if TrainSec < 10 then
+  begin
+    WriteLn('ERROR: no time left to train (data loading took too long).');
+    Halt(1);
+  end;
+  // lr=0.001 (vs phase 1's 0.0005): the latent down/up projections + the
+  // decoupled rope-slice plumbing make an MLA step costlier than phase 1's
+  // MHA step, so fewer examples fit in the box; the higher rate recovers a
+  // comparable loss drop (same reasoning as phase 2).
+  TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.001);
+
+  CreateStepNet(Step, {Width=}1, Trained, {UseMLA=}true);
+  try
+    WriteLn;
+    WriteLn('Greedy decode showdown (', csGenTokens, ' tokens per prompt):');
+    for p := 0 to High(csPrompts) do
+    begin
+      PromptLen := PromptToTokens(csPrompts[p], FullToks);
+      CachedToks := FullToks;
+
+      GreedyFull(Trained, FullToks, PromptLen, csGenTokens,
+        FullLen, FullMs, FullFwds);
+      GreedyCached(Step, CachedToks, PromptLen, csGenTokens,
+        CachedLen, CachedMs, CachedFwds);
+
+      // HARD ASSERT: token-exact equality between the two arms.
+      if FullLen <> CachedLen then
+      begin
+        WriteLn('ASSERT FAILED: full arm emitted ', FullLen - PromptLen,
+          ' tokens but cached arm emitted ', CachedLen - PromptLen, '.');
+        Halt(1);
+      end;
+      for t := PromptLen to FullLen - 1 do
+        if FullToks[t] <> CachedToks[t] then
+        begin
+          WriteLn('ASSERT FAILED: decode arms diverge at position ', t,
+            ' (full=', FullToks[t], ' cached=', CachedToks[t],
+            ') for prompt "', csPrompts[p], '".');
+          Halt(1);
+        end;
+
+      NewToks := FullLen - PromptLen;
+      WriteLn;
+      WriteLn('Prompt: "', csPrompts[p], '"');
+      WriteLn('  text: ', csPrompts[p], ' ',
+        TokensToText(FullToks, PromptLen, NewToks));
+      WriteLn(Format('  full re-encode : %8.2f ms total  %6.2f ms/token  (%d forwards)',
+        [FullMs, FullMs / Max(1, NewToks), FullFwds]));
+      WriteLn(Format('  KV-cached step : %8.2f ms total  %6.2f ms/token  (%d forwards incl. prefill)',
+        [CachedMs, CachedMs / Max(1, NewToks), CachedFwds]));
+      WriteLn(Format('  speedup        : %6.2fx   tokens match: YES (%d/%d)',
+        [FullMs / Max(CachedMs, 1e-9), NewToks, NewToks]));
+    end;
+
+    // MLA cache-memory economics, per layer per token (4-byte floats). The
+    // latent-only row is the ANALYTIC paper number (c_KV + the shared rotated
+    // rope-K is provably sufficient decode state -- examples/LatentAttention
+    // runs that loop); the SDPA-cache row is what the arm above actually
+    // stored while proving streamed-MLA faithfulness.
+    WriteLn;
+    WriteLn('KV-cache memory per token per attention layer (4-byte floats):');
+    WriteLn(Format('  %-52s %4d floats = %5d bytes',
+      ['equivalent MHA full K+V (2*d_model):',
+       2 * csEmbedDim, 8 * csEmbedDim]));
+    WriteLn(Format('  %-52s %4d floats = %5d bytes',
+      [Format('MLA via per-head SDPA caches, run here (2*H*(d_k+%d)):',
+       [csRopeDim]),
+       2 * csHeads * (d_k + csRopeDim), 8 * csHeads * (d_k + csRopeDim)]));
+    WriteLn(Format('  %-52s %4d floats = %5d bytes',
+      [Format('MLA latent-only, analytic (latent+ropeK = %d+%d):',
+       [csLatentDim, csRopeDim]),
+       csLatentDim + csRopeDim, 4 * (csLatentDim + csRopeDim)]));
+    WriteLn(Format('Latent-only state is %.1f%% of the equivalent-MHA cache '
+      + '(%.1fx smaller),', [100.0 * (csLatentDim + csRopeDim) /
+      (2 * csEmbedDim), 2.0 * csEmbedDim / (csLatentDim + csRopeDim)]));
+    WriteLn('independent of head count; it costs an O(t) K/V up-projection');
+    WriteLn('recompute per step (see examples/LatentAttention for that loop).');
+    WriteLn;
+    WriteLn('Phase 4: PASS (cached MLA decode is token-exact). [t=',
+      ElapsedSec():0:1, 's]');
+  finally
+    FreeStepNet(Step);
+    Trained.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
 // Phase 5: speculative decoding composed with the KV cache (commit 42dd5dd).
 // ---------------------------------------------------------------------------
 procedure TDecodeBakeoff.RunPhase5;
@@ -1265,24 +1702,6 @@ begin
   end;
 end;
 
-// ---------------------------------------------------------------------------
-// Stubs for phases owned by later work. They exit 0 on purpose so the driver
-// script can run all five phases today.
-// ---------------------------------------------------------------------------
-procedure TDecodeBakeoff.RunStub(Phase: integer);
-begin
-  case Phase of
-    3: WriteLn('phase 3: not yet implemented ',
-         '(DiagonalSSM O(1)-per-step decode variant, commit 80dd830)');
-    4: WriteLn('phase 4: not yet implemented ',
-         '(MLA decoupled-RoPE latent KV-cache economics, commit a8f3077)');
-  end;
-  // TODO(phase owner): implement here. Reuse the shared helpers --
-  // LoadDataset, BuildModel, TrainTimeBoxed (raises NFit.ShouldQuit at the
-  // deadline), CreateStepNet/CachedWindowForward (KV cache + RoPE offsets),
-  // GreedyFull/GreedyCached (timed greedy arms), NowMs/ElapsedSec (timing).
-end;
-
 procedure TDecodeBakeoff.DoRun;
 var
   Phase, i: integer;
@@ -1309,8 +1728,8 @@ begin
     WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..5)');
     WriteLn('  1: KV-cache incremental decode vs full re-encode (2dacc95)');
     WriteLn('  2: MTP-heads self-speculative decode (4d95378)');
-    WriteLn('  3: DiagonalSSM O(1)-per-step decode (80dd830) [stub]');
-    WriteLn('  4: MLA decoupled-RoPE latent KV cache (a8f3077) [stub]');
+    WriteLn('  3: DiagonalSSM O(1)-per-step decode (80dd830)');
+    WriteLn('  4: MLA decoupled-RoPE latent KV cache (a8f3077)');
     WriteLn('  5: speculative decoding + KV cache rollback (42dd5dd)');
     Terminate;
     ExitCode := 2;
@@ -1322,9 +1741,9 @@ begin
     case Phase of
       1: RunPhase1;
       2: RunPhase2;
+      3: RunPhase3;
+      4: RunPhase4;
       5: RunPhase5;
-    else
-      RunStub(Phase);
     end;
   finally
     FDictionary.Free;

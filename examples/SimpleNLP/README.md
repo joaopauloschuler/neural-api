@@ -156,13 +156,13 @@ bash run_decode_bakeoff.sh             (all five phases, logs to decode_bakeoff_
 |-------|---------|--------|
 | 1 | KV-cache incremental decode (`TNNetScaledDotProductAttention.BeginIncrementalDecode` + `TNNetRotaryEmbedding.PositionOffset`) vs full re-encode | implemented |
 | 2 | MTP-heads self-speculative decode (`TNNet.AddMultiTokenPrediction` heads as a built-in draft) | implemented |
-| 3 | DiagonalSSM O(1)-per-step decode | stub |
-| 4 | MLA decoupled-RoPE latent KV cache | stub |
+| 3 | DiagonalSSM O(1)-per-step decode (`TNNetDiagonalSSM.BeginIncrementalDecode`) | implemented |
+| 4 | MLA decoupled-RoPE latent KV cache (`TNNet.AddMultiHeadLatentAttention`) | implemented |
 | 5 | Speculative decoding composed with the KV cache (`TruncateCache` rollback) | implemented |
 
 Every phase self-budgets to 270 s of wall clock: training is time-boxed inside the
-program (~185 s in phase 1, ~195 s in phase 2, ~160 s draft training in phase 5),
-leaving the rest for
+program (~185 s in phases 1/4, ~195 s in phases 2/3, ~160 s draft training in
+phase 5), leaving the rest for
 the decode benchmark. The model is a small RoPE transformer decoder
 (ctx=48, d_model=128, 2 blocks, 8 heads, FFN 512, 3k vocab, ~1.31M params) with
 `TNNetDyT` normalization — RoPE and DyT are chosen because both are exactly
@@ -179,7 +179,23 @@ drafts the next block from heads 1..2 at the last committed row. Composing the K
 cache with MTP drafting is NOT attempted (after a rejection the drafts come from a
 forward whose window a cache never saw — known open problem), so both phase-2 arms
 pay full re-encode forwards and the measured win is forwards/token at equal
-per-forward cost. All implemented phases HARD-ASSERT token-exact equality of all
+per-forward cost.
+Phase 3 swaps the sequence mixer: same residual skeleton (DyT pre-norm + SwiGLU FFN,
+same d_model/blocks/FFN/head), but the mixer is the recurrent `TNNetDiagonalSSM`
+wrapped in token-wise in/out projections (~1.25M params), with NO RoPE and NO
+positional embedding — the recurrence carries order. Its decode benchmark is full
+re-encode vs the layer's `BeginIncrementalDecode`/`ResetState` O(1)-per-step path,
+where the ENTIRE past is a Depth-long state vector per SSM layer (no per-token cache
+growth), with step cost reported per prefix-length bucket to show flatness.
+Phase 4 swaps the attention: `TNNet.AddMultiHeadLatentAttention(128, 8, LatentDim=32,
+CausalMask, RopeDim=8)` in the same pre-norm residual block (~1.29M params); K/V are
+low-rank-factored through a 32-wide per-token latent and position enters ONLY through
+the decoupled rotated rope slice (token-only embedding). Its cached decode arm uses
+the per-head SDPA caches + `PositionOffset` (proving streamed-MLA token-exactness,
+rope slice included); the latent-only bytes/token row in its economics table is the
+ANALYTIC paper number — the true latent-only decode loop is run in
+[examples/LatentAttention](../LatentAttention), not here.
+All implemented phases HARD-ASSERT token-exact equality of all
 decode arms.
 
 Dataset setup is the same as above (run from this directory):
@@ -215,6 +231,35 @@ forward costs more than a plain-head forward (phase 2's ~101 ms/token plain-gree
 baseline vs phase 1's ~34-46 ms/token is the price of the two extra 128→3000 head
 projections), which is why the comparison is plain vs self-speculative from the same
 model, not across models.
+
+Phase 3 (greedy, 40 new tokens per prompt, both arms token-identical; ~195 s training
+box, loss 4.47 → 2.34 — the recurrent mixer's O(n) forward fits more examples in the
+box than phase 1's O(n²) attention and lands at a comparable loss, though its samples
+loop sooner at this budget):
+```
+Prompt "one day"          full re-encode 35.78 ms/token  O(1) SSM step 1.59 ms/token  speedup 22.6x
+Prompt "once upon a time" full re-encode 29.22 ms/token  O(1) SSM step 0.45 ms/token  speedup 65.0x
+step cost vs prefix length:  <16 tokens 1.00 ms/step   16-31 tokens 1.05 ms/step   >=32 tokens 0.75 ms/step
+```
+The per-bucket step cost is FLAT in the prefix length (the whole past is a Depth-long
+state vector per SSM layer), whereas a KV-cached attention step grows with the cache.
+
+Phase 4 (greedy, 40 new tokens per prompt, both arms token-identical; ~185 s training
+box at lr=0.001 — the latent down/up projections and rope-slice plumbing make an MLA
+step costlier than phase 1's MHA step — loss 3.90 → 2.53):
+```
+Prompt "one day"          full re-encode  8.36 ms/token  KV-cached 0.33 ms/token  speedup 25.3x
+Prompt "once upon a time" full re-encode 10.03 ms/token  KV-cached 0.39 ms/token  speedup 25.8x
+
+KV-cache memory per token per attention layer (4-byte floats):
+  equivalent MHA full K+V (2*d_model):                  256 floats = 1024 bytes
+  MLA via per-head SDPA caches, run here (2*H*(d_k+8)): 384 floats = 1536 bytes
+  MLA latent-only, analytic (latent+ropeK = 32+8):       40 floats =  160 bytes
+```
+Latent-only state is 15.6% of the equivalent-MHA cache (6.4x smaller), independent of
+head count; the run above proves streamed-MLA faithfulness via the SDPA caches, and
+the latent-only row is the analytic number (that loop runs in examples/LatentAttention,
+paying an O(t) K/V up-projection recompute per step).
 
 Phase 5 (greedy, K=4 drafts/pass, all three arms token-identical; accept rate 25.2%,
 2.00 committed tokens/pass):
