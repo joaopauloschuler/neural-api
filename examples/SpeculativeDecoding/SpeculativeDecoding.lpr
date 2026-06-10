@@ -26,13 +26,28 @@ rule makes the committed token at every position an exact draw from p_target,
 for ANY draft distribution. This program makes that claim SELF-CHECKING two
 ways (see GATES below).
 
-THIS V1 IS FORWARD-ONLY. Both models are pretrained; generation only — no
-gradient surgery, so no SetBatchUpdate concerns. Each verification pass
-RECOMPUTES the prefix from scratch (correct and simple). KV-cache composition
-(reusing the target's prefix activations across passes) is the explicit
-follow-up — see the open KV-cache task in tasklist.md; speculative decoding is
-orthogonal to it (it cuts the NUMBER of big-model passes; a KV-cache flattens
-the per-pass cost) and the two compose.
+THIS PROGRAM IS FORWARD-ONLY. Both models are pretrained; generation only — no
+gradient surgery, so no SetBatchUpdate concerns. TWO speculative samplers are
+implemented and compared:
+  * v1 (SpeculativeSample): each verification pass RECOMPUTES the whole prefix
+    from scratch (correct and simple, but every pass costs O((t+K)^2)).
+  * KV-CACHED (SpeculativeSampleCached): the target's verification runs through
+    the TNNetScaledDotProductAttention KV-cache incremental-decode path. The
+    prompt is PREFILLED once; each pass then feeds ONLY the short window
+    [last committed token + the K drafts] as one multi-token cached forward
+    (each window token's K/V is appended and its query attends over the cache
+    so far — multi-token prefill semantics), so a pass costs O(K * t) instead
+    of O((t+K)^2). On a rejection the K/V entries already appended for the
+    rejected positions are STALE: TruncateCache(committed-1) rewinds the cache
+    to the committed prefix (a one-field rewind; the preallocated slots are
+    simply reused). The two efficiency wins therefore COMPOSE: fewer big-model
+    passes (speculation) x cheaper passes (KV cache).
+POSITIONAL CONTRACT: the step net sees only the short window, so its
+TNNetSinusoidalPositionalEmbedding must encode the window tokens at their
+ABSOLUTE positions — PositionOffset is set to the window start (the running
+cache length) before every cached forward. The draft stays on the simple
+full-recompute path: it is attention-free (TokenShift), so it has no KV cache
+to exploit, and its forwards are cheap by design.
 
 THE TOY (forked from examples/InductionHeads + TokenShiftBaseline). A small
 vocabulary V; a sequence is a random length-L string and the next-token target
@@ -76,9 +91,14 @@ end of a fully-accepted block is also an inverse-CDF p_target draw from gProp, s
 it too matches the next plain token. This collapse is the whole reason the
 two-stream split is designed the way it is.
 
-GATES (printed; the EXACTNESS one is mandatory and Halt(1)s on failure):
+GATES (printed; the EXACTNESS ones are mandatory and Halt(1) on failure):
   1. (MANDATORY) DEGENERATE EXACTNESS: with draft == target, the speculative
      and plain token sequences are identical element-for-element.
+  1b. (MANDATORY) KV-CACHE EXACTNESS: the cached speculative sampler produces
+     a token sequence IDENTICAL to the v1 full-recompute speculative sampler
+     under the same seeds (both with draft == target, where it must also
+     equal plain sampling, and with the genuinely different trained draft,
+     which exercises the TruncateCache rollback on real rejections).
   2. EMPIRICAL FAITHFULNESS: with a genuinely DIFFERENT trained draft, sample N
      tokens many times from a fixed prefix both ways and assert the two token
      histograms match within sampling noise (total-variation distance small).
@@ -86,6 +106,11 @@ GATES (printed; the EXACTNESS one is mandatory and Halt(1)s on failure):
      using draft snapshots from different training lengths), chart mean
      accepted-tokens-per-pass and big-model-calls saved; accept rate (hence
      speedup) rises with agreement.
+  4. COMPOSITION BENCHMARK: wall-clock ms/token and ACTUAL target-net forward
+     counts for (i) plain full-recompute, (ii) v1 speculative full-recompute,
+     (iii) speculative + KV cache. The headline is (iii) beating both: v1 cuts
+     the number of conceptual big-model PASSES but still pays full-prefix
+     forwards inside each pass; the cache makes each pass O(K * t).
 
 Pure CPU, single-threaded (MaxThreadNum := 1) for reproducibility. Trains both
 tiny models and runs all checks in well under the 5-minute budget.
@@ -107,7 +132,7 @@ Coded by Claude (AI).
 
 {$mode objfpc}{$H+}
 
-uses {$IFDEF UNIX} cthreads, {$ENDIF}
+uses {$IFDEF UNIX} cthreads, BaseUnix, Unix, {$ENDIF}
   Classes, SysUtils, Math,
   neuralnetwork,
   neuralvolume;
@@ -189,6 +214,43 @@ var
 var
   gTgtTemp: TNeuralFloat = 1.0;  // 1.0 = flat (original); <1 = peaked target
 
+// ACTUAL target-net forward count (every NN.Compute on target weights, full or
+// cached). Contrast with BigCalls, which counts conceptual batched PASSES: v1
+// counts one "pass" per verification block but still pays one full-prefix
+// forward per verified position, which this counter exposes.
+var
+  gTgtForwards: int64 = 0;
+
+// ---------------------------------------------------------------------------
+// Microsecond-resolution wall clock in milliseconds since the first call.
+// SysUtils.Now ticks at ~1 ms on Linux, too coarse for a short cached step.
+// Rebasing to the first call keeps the value small: FPC types the 1000.0
+// literal as SINGLE, and at an absolute Unix-epoch scale single-precision
+// quantization would freeze the clock. (Pattern from examples/IncrementalDecode.)
+// ---------------------------------------------------------------------------
+{$IFDEF UNIX}
+var
+  GBaseSec: int64 = -1;
+
+function NowMs(): double;
+var
+  tv: TTimeVal;
+begin
+  fpGetTimeOfDay(@tv, nil);
+  if GBaseSec < 0 then GBaseSec := tv.tv_sec;
+  Result := (tv.tv_sec - GBaseSec) * 1000.0 + tv.tv_usec / 1000.0;
+end;
+{$ELSE}
+var
+  GBaseMs: double = -1;
+
+function NowMs(): double;
+begin
+  if GBaseMs < 0 then GBaseMs := Now() * 24 * 3600 * 1000;
+  Result := Now() * 24 * 3600 * 1000 - GBaseMs;
+end;
+{$ENDIF}
+
 // ---------------------------------------------------------------------------
 // Toy task. A random string; the next-token target is a structured fixed-offset
 // copy. We make it learnable but imperfectly-so for a tiny draft.
@@ -225,10 +287,15 @@ end;
 // softmax over the vocabulary. TARGET uses multi-head causal attention; DRAFT
 // uses the cheap attention-free TokenShift mixer + a narrow MLP.
 // ---------------------------------------------------------------------------
-function BuildTarget(): TNNet;
+// The target architecture at an arbitrary input length. The training/full
+// net uses InputLen = cSeqLen; the KV-cached verification STEP net reuses the
+// SAME architecture (and, via CopyWeights, the SAME trained weights — every
+// layer's parameter shapes are independent of the sequence length) at the
+// short window width cK + 1 ([last committed token | K drafts]).
+function BuildTargetWithLen(InputLen: integer): TNNet;
 begin
   Result := TNNet.Create();
-  Result.AddLayer(TNNetInput.Create(cSeqLen, 1, 1));
+  Result.AddLayer(TNNetInput.Create(InputLen, 1, 1));
   Result.AddLayer(TNNetEmbedding.Create(cVocab, cTgtDModel, 1));
   Result.AddLayer(TNNetSinusoidalPositionalEmbedding.Create());
   Result.AddLayer(TNNetPointwiseConvLinear.Create(3 * cTgtDModel)); // Q|K|V slab
@@ -239,6 +306,11 @@ begin
   Result.AddLayer(TNNetPointwiseSoftMax.Create(1));
   Result.SetLearningRate(cLR, cInertia);
   Result.SetL2Decay(0.0);
+end;
+
+function BuildTarget(): TNNet;
+begin
+  Result := BuildTargetWithLen(cSeqLen);
 end;
 
 function BuildDraft(): TNNet;
@@ -296,17 +368,15 @@ end;
 // only the target's distribution, not the sampler -- the speculative loop draws
 // from whatever p_target NextDist returns, so exactness/faithfulness hold for
 // any temperature.
-procedure NextDist(NN: TNNet; const S: TSeq; Len: integer;
-  InputV: TNNetVolume; out P: TProbs; IsTarget: boolean = False);
-var d: integer; Row: integer; Sum, mx: TNeuralFloat;
+// Shared post-processing of one softmax row: clamp negatives, renormalise,
+// and (target only) apply the gTgtTemp re-softmax. Factored out so the
+// KV-cached verification path post-processes its rows EXACTLY like NextDist.
+procedure NormalizeAndTemper(var P: TProbs; IsTarget: boolean);
+var d: integer; Sum, mx: TNeuralFloat;
 begin
-  FillInput(S, Len, InputV);
-  NN.Compute(InputV);
-  Row := Len - 1;
   Sum := 0;
   for d := 0 to cVocab - 1 do
   begin
-    P[d] := NN.GetLastLayer.Output[Row, 0, d];
     if P[d] < 0 then P[d] := 0;
     Sum := Sum + P[d];
   end;
@@ -337,6 +407,19 @@ begin
     end;
     for d := 0 to cVocab - 1 do P[d] := P[d] / Sum;
   end;
+end;
+
+procedure NextDist(NN: TNNet; const S: TSeq; Len: integer;
+  InputV: TNNetVolume; out P: TProbs; IsTarget: boolean = False);
+var d: integer; Row: integer;
+begin
+  FillInput(S, Len, InputV);
+  NN.Compute(InputV);
+  if IsTarget then Inc(gTgtForwards);  // one FULL-prefix target forward
+  Row := Len - 1;
+  for d := 0 to cVocab - 1 do
+    P[d] := NN.GetLastLayer.Output[Row, 0, d];
+  NormalizeAndTemper(P, IsTarget);
 end;
 
 // Inverse-CDF categorical sample from distribution P using uniform u in [0,1).
@@ -507,6 +590,243 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// KV-CACHED verification. The target's verification runs on a STEP net: the
+// same architecture/weights at input width cK+1, with every per-head
+// TNNetScaledDotProductAttention switched into the KV-cache incremental-decode
+// path. A pass feeds only the short window [last committed token | drafts];
+// each window token's K/V is appended to the per-head caches and its query
+// attends over the cache so far (multi-token prefill semantics), so a pass
+// costs O(K * t_cached) instead of the v1 full re-encode O((t+K)^2).
+// On rejection, TruncateCache rewinds the caches to the committed prefix.
+// ---------------------------------------------------------------------------
+const
+  cStepWidth = cK + 1;  // [last committed token | up to K drafts]
+
+type
+  TStepTarget = record
+    Net: TNNet;                                          // width-cStepWidth twin
+    SDPAs: array of TNNetScaledDotProductAttention;      // one per head
+    SinPos: TNNetSinusoidalPositionalEmbedding;          // absolute positions
+    StepIn: TNNetVolume;                                 // (cStepWidth,1,1) ids
+  end;
+
+procedure CreateStepTarget(out Step: TStepTarget; Target: TNNet);
+var
+  i, n: integer;
+begin
+  Step.Net := BuildTargetWithLen(cStepWidth);
+  // Same architecture, so layer-by-layer weight copy is exact (all parameter
+  // shapes are sequence-length independent).
+  Step.Net.CopyWeights(Target);
+  SetLength(Step.SDPAs, 0);
+  Step.SinPos := nil;
+  for i := 0 to Step.Net.Layers.Count - 1 do
+  begin
+    if Step.Net.Layers[i] is TNNetScaledDotProductAttention then
+    begin
+      n := Length(Step.SDPAs);
+      SetLength(Step.SDPAs, n + 1);
+      Step.SDPAs[n] := TNNetScaledDotProductAttention(Step.Net.Layers[i]);
+    end;
+    if Step.Net.Layers[i] is TNNetSinusoidalPositionalEmbedding then
+      Step.SinPos := TNNetSinusoidalPositionalEmbedding(Step.Net.Layers[i]);
+  end;
+  // Worst transient cache load: (cSeqLen-1) committed + a full window.
+  for i := 0 to High(Step.SDPAs) do
+    Step.SDPAs[i].BeginIncrementalDecode(cSeqLen + cStepWidth);
+  Step.StepIn := TNNetVolume.Create(cStepWidth, 1, 1);
+end;
+
+procedure FreeStepTarget(var Step: TStepTarget);
+begin
+  Step.StepIn.Free;
+  Step.Net.Free;
+  SetLength(Step.SDPAs, 0);
+end;
+
+procedure StepCacheReset(var Step: TStepTarget);
+var i: integer;
+begin
+  for i := 0 to High(Step.SDPAs) do Step.SDPAs[i].ResetCache();
+end;
+
+// Rewind every head's KV cache to NewLength committed tokens — the rollback
+// that discards the stale K/V of rejected (or padding) positions.
+procedure StepCacheTruncate(var Step: TStepTarget; NewLength: integer);
+var i: integer;
+begin
+  for i := 0 to High(Step.SDPAs) do Step.SDPAs[i].TruncateCache(NewLength);
+end;
+
+// One cached window forward: tokens S[StartPos .. StartPos+NReal-1] fill the
+// window (zero padding after; pads come AFTER every real token, so the cached
+// causal path never lets a real query see a pad — pad K/V is dropped by the
+// caller's next StepCacheTruncate). The sinusoidal layer is shifted so the
+// window is encoded at its ABSOLUTE positions (positional contract of the
+// cached path). Output row r is the softmax at absolute position StartPos+r.
+procedure CachedWindowForward(var Step: TStepTarget; const S: TSeq;
+  StartPos, NReal: integer);
+var
+  t: integer;
+begin
+  Step.StepIn.Fill(0);
+  for t := 0 to NReal - 1 do Step.StepIn.FData[t] := S[StartPos + t];
+  Step.SinPos.PositionOffset := StartPos;
+  Step.Net.Compute(Step.StepIn);
+  Inc(gTgtForwards);  // one SHORT cached target forward
+end;
+
+// ---------------------------------------------------------------------------
+// SPECULATIVE sampling with KV-CACHED verification. Identical sampling logic
+// (and RNG stream discipline) to SpeculativeSample — only the way p_target is
+// obtained changes: the prompt is PREFILLED once, then each pass runs ONE
+// short cached window forward and, after accept/reject, the caches are
+// TRUNCATED back to the committed prefix. Greedy/seeded sampling is exact, so
+// the produced token sequence must be IDENTICAL to SpeculativeSample's.
+// ---------------------------------------------------------------------------
+procedure SpeculativeSampleCached(var Step: TStepTarget; Draft: TNNet;
+  const Prefix: TSeq; PrefixLen, NTokens: integer;
+  InputV: TNNetVolume;
+  out OutSeq: TSeq; out OutLen: integer;
+  out BigCalls, DraftCalls, AcceptedTokens, Passes: integer);
+var
+  Pd, Pt, Resid: TProbs;
+  DraftToks: array[0..cK - 1] of integer;
+  PdAtPos: array[0..cK - 1] of TProbs;  // p_draft used to PROPOSE each x_i
+  PtAtPos: array[0..cK] of TProbs;      // target rows 0..nProposed of one pass
+  i, d, r, tok, nProposed, accept: integer;
+  done, w: integer;
+  ratio, u, sresid, ptv, pdv: TNeuralFloat;
+  rejected: boolean;
+begin
+  OutSeq := Prefix;
+  OutLen := PrefixLen;
+  BigCalls := 0; DraftCalls := 0; AcceptedTokens := 0; Passes := 0;
+
+  // --- PREFILL (once): cache the K/V of tokens 0..PrefixLen-2. The LAST
+  //     committed token is NOT cached — it is re-fed as the first window
+  //     token of every pass, so its softmax row is fresh each pass.
+  StepCacheReset(Step);
+  done := 0;
+  while done < PrefixLen - 1 do
+  begin
+    w := Min(cStepWidth, PrefixLen - 1 - done);
+    CachedWindowForward(Step, OutSeq, done, w);
+    done := done + w;
+    StepCacheTruncate(Step, done);  // drop pad K/V from a partial window
+  end;
+
+  while OutLen - PrefixLen < NTokens do
+  begin
+    Inc(Passes);
+    // --- 1. DRAFT proposes up to K tokens (unchanged: the draft is
+    //        attention-free, its full recompute is the cheap arm by design).
+    nProposed := 0;
+    for i := 0 to cK - 1 do
+    begin
+      if OutLen + i >= cSeqLen then Break;          // no room for this position
+      NextDist(Draft, OutSeq, OutLen + i, InputV, PdAtPos[i]);  // draft call
+      Inc(DraftCalls);
+      DraftToks[i] := SampleCDF(PdAtPos[i], RngFloat(gProp));
+      OutSeq[OutLen + i] := DraftToks[i];
+      Inc(nProposed);
+    end;
+    if nProposed = 0 then Break;
+
+    // --- 2. TARGET scores the whole block in ONE short cached forward over
+    //        the window [S[OutLen-1] | x_1..x_nProposed]: row i is p_target at
+    //        context length OutLen+i (verification rows 0..nProposed-1 plus
+    //        the bonus row nProposed).
+    CachedWindowForward(Step, OutSeq, OutLen - 1, nProposed + 1);
+    Inc(BigCalls);
+    for r := 0 to nProposed do
+    begin
+      for d := 0 to cVocab - 1 do
+        PtAtPos[r][d] := Step.Net.GetLastLayer.Output[r, 0, d];
+      NormalizeAndTemper(PtAtPos[r], True);
+    end;
+
+    rejected := false;
+    i := 0;
+    while (i < nProposed) do
+    begin
+      Pt := PtAtPos[i];
+      Pd := PdAtPos[i];
+      tok := DraftToks[i];
+
+      ptv := Pt[tok];
+      pdv := Pd[tok];
+      if pdv <= 0 then ratio := 1.0
+      else ratio := ptv / pdv;
+      if ratio > 1.0 then ratio := 1.0;
+
+      u := RngFloat(gAcc);
+      if u < ratio then
+        accept := 1
+      else
+        accept := 0;
+
+      if accept = 1 then
+      begin
+        // commit x_i
+        OutSeq[OutLen + i] := tok;
+        Inc(AcceptedTokens);
+        Inc(i);
+      end
+      else
+      begin
+        // FIRST rejection: resample this position from norm(max(0,Pt-Pd)).
+        sresid := 0;
+        for d := 0 to cVocab - 1 do
+        begin
+          Resid[d] := Pt[d] - PdAtPos[i][d];
+          if Resid[d] < 0 then Resid[d] := 0;
+          sresid := sresid + Resid[d];
+        end;
+        if sresid <= 0 then
+        begin
+          // degenerate (p_draft dominates everywhere): fall back to p_target.
+          Resid := Pt;
+        end
+        else
+          for d := 0 to cVocab - 1 do Resid[d] := Resid[d] / sresid;
+        tok := SampleCDF(Resid, RngFloat(gProp));
+        OutSeq[OutLen + i] := tok;
+        Inc(i);          // this resampled token is committed
+        rejected := true;
+        Break;           // discard the rest of the block
+      end;
+    end;
+
+    if not rejected then
+    begin
+      // all `nProposed` draft tokens accepted; commit them and, if room, the
+      // BONUS token comes for free from row nProposed of the SAME forward.
+      OutLen := OutLen + nProposed;
+      if OutLen < cSeqLen then
+      begin
+        Pt := PtAtPos[nProposed];
+        tok := SampleCDF(Pt, RngFloat(gProp));
+        OutSeq[OutLen] := tok;
+        Inc(OutLen);
+      end;
+    end
+    else
+    begin
+      // committed i tokens (i-1 accepted draft + 1 resampled).
+      OutLen := OutLen + i;
+    end;
+
+    // --- 3. ROLLBACK: the caches transiently hold the whole window (pads and
+    //        rejected drafts included). Keep exactly the committed prefix
+    //        minus its last token (re-fed as the next window's first query).
+    StepCacheTruncate(Step, OutLen - 1);
+
+    if OutLen >= cSeqLen then Break;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
 // Metrics.
 // ---------------------------------------------------------------------------
 function SeqEqual(const A, B: TSeq; Len: integer): boolean;
@@ -635,21 +955,30 @@ end;
 
 var
   Target, Draft: TNNet;
+  Step: TStepTarget;
   InputV: TNNetVolume;
-  Prefix, PlainOut, SpecOut: TSeq;
-  PrefixLen, PlainLen, SpecLen: integer;
+  Prefix, PlainOut, SpecOut, CachedOut: TSeq;
+  PrefixLen, PlainLen, SpecLen, CachedLen: integer;
   bcP, bcS, dcS, accTok, passes: integer;
-  t: integer;
-  GateExact, GateFaithFlat, GateFaithPeak: boolean;
+  bcC, dcC, accTokC, passesC: integer;
+  t, run: integer;
+  GateExact, GateCachedExact, GateFaithFlat, GateFaithPeak: boolean;
   TVFlat, TVPeak: TNeuralFloat;
   // Side-by-side speedup results (weak = untrained draft, strong = fully trained).
   fWeakRate, fWeakSaved, fStrongRate, fStrongSaved: TNeuralFloat;
   pWeakRate, pWeakSaved, pStrongRate, pStrongSaved: TNeuralFloat;
+  // GATE 4 composition benchmark accumulators.
+  BenchSeq: TSeq;
+  T0, MsPlain, MsSpecV1, MsSpecKV: double;
+  ToksPlain, ToksSpecV1, ToksSpecKV: int64;
+  FwdPlain, FwdSpecV1, FwdSpecKV: int64;
+  PassesSpecV1, PassesSpecKV: int64;
 const
   cTokens   = 12;     // continuation length for exactness / sample checks
   cFaithN   = 4000;   // sampling runs for the faithfulness histogram
   cSweepRuns = 200;   // runs per draft stage in the speedup sweep
   cPeakTemp = 0.10;   // target softmax temperature for the PEAKED variant (<1)
+  cBenchRuns = 150;   // prefixes per arm in the composition benchmark
 begin
   // Mask FPU exceptions so transient early-training underflows don't abort
   // (matches sibling examples).
@@ -666,8 +995,10 @@ begin
   WriteLn('sampling, while calling the big TARGET far fewer times.');
   WriteLn('Accept x_i with prob min(1, p_target/p_draft); on first reject resample from');
   WriteLn('norm(max(0, p_target - p_draft)) and discard the rest of the block.');
-  WriteLn('v1 is FORWARD-ONLY and recomputes the prefix each pass; KV-cache is the');
-  WriteLn('explicit follow-up (orthogonal open task).');
+  WriteLn('TWO verification backends: v1 (recompute the whole prefix each pass) and');
+  WriteLn('KV-CACHED (prefill once; each pass feeds only [last token | K drafts] through');
+  WriteLn('the attention KV cache; TruncateCache rolls back rejected positions), so the');
+  WriteLn('two efficiency wins compose: fewer big-model passes x O(K*t) per pass.');
   WriteLn('Gates 2-3 run TWICE: a FLAT target (temp 1.0, the mod-sum map) and a PEAKED');
   WriteLn(Format('target (softmax temperature %.2f) that sharpens p_target so a WEAK draft''s',
     [cPeakTemp]));
@@ -692,6 +1023,10 @@ begin
   TrainEpochs(Draft, cDrfEpochs);
   WriteLn(' done.  params=', Draft.CountWeights());
   WriteLn;
+
+  // The KV-cached verification STEP net: same target weights at window width
+  // cK+1, with every attention head in incremental-decode (cached) mode.
+  CreateStepTarget(Step, Target);
 
   // A fixed prefix used by the exactness + faithfulness checks.
   RandSeed := cSeed + 99;
@@ -734,6 +1069,72 @@ begin
     WriteLn('  GATE 1 : PASS  (speculative == plain, bit-for-bit)')
   else
     WriteLn('  GATE 1 : FAIL  (sequences differ -- exactness broken!)');
+  WriteLn;
+
+  // =========================================================================
+  // GATE 1b (MANDATORY): KV-CACHE EXACTNESS. The cached sampler must produce
+  // a token sequence IDENTICAL to the v1 full-recompute sampler under the
+  // same seeds (seeded sampling is exact, so any cache bug shows up as a
+  // token mismatch). Checked three ways:
+  //   (a) draft == target, flat: cached == plain (chains through Gate 1);
+  //   (b) real draft, flat: cached == v1 (real rejections exercise the
+  //       TruncateCache rollback);
+  //   (c) real draft, peaked target: same, through the tempering path.
+  // =========================================================================
+  WriteLn(StringOfChar('=', 72));
+  WriteLn('GATE 1b Cached-verification exactness (KV cache + TruncateCache rollback)');
+  WriteLn(StringOfChar('=', 72));
+  GateCachedExact := true;
+
+  // (a) draft == target: cached speculative == plain, bit-for-bit.
+  gTgtTemp := 1.0;
+  RngSeed(gProp, 1234567); RngSeed(gAcc, 7654321);
+  SpeculativeSampleCached(Step, Target, Prefix, PrefixLen, cTokens, InputV,
+    CachedOut, CachedLen, bcC, dcC, accTokC, passesC);
+  if SeqEqual(PlainOut, CachedOut, PrefixLen + cTokens) then
+    WriteLn('  (a) draft==target : cached == plain, bit-for-bit       PASS')
+  else
+  begin
+    WriteLn('  (a) draft==target : cached != plain                    FAIL');
+    GateCachedExact := false;
+  end;
+
+  // (b) real draft, flat target: cached == v1 under the same seeds.
+  RngSeed(gProp, 24681357); RngSeed(gAcc, 13572468);
+  SpeculativeSample(Target, Draft, Prefix, PrefixLen, cTokens, InputV,
+    SpecOut, SpecLen, bcS, dcS, accTok, passes);
+  RngSeed(gProp, 24681357); RngSeed(gAcc, 13572468);
+  SpeculativeSampleCached(Step, Draft, Prefix, PrefixLen, cTokens, InputV,
+    CachedOut, CachedLen, bcC, dcC, accTokC, passesC);
+  if (SpecLen = CachedLen) and SeqEqual(SpecOut, CachedOut, SpecLen) then
+    WriteLn(Format('  (b) real draft     : cached == v1 (%d tokens, %d passes)  PASS',
+      [SpecLen - PrefixLen, passesC]))
+  else
+  begin
+    WriteLn('  (b) real draft     : cached != v1                      FAIL');
+    GateCachedExact := false;
+  end;
+
+  // (c) real draft, PEAKED target (more rejections -> more rollbacks).
+  gTgtTemp := cPeakTemp;
+  RngSeed(gProp, 9182736); RngSeed(gAcc, 6372819);
+  SpeculativeSample(Target, Draft, Prefix, PrefixLen, cTokens, InputV,
+    SpecOut, SpecLen, bcS, dcS, accTok, passes);
+  RngSeed(gProp, 9182736); RngSeed(gAcc, 6372819);
+  SpeculativeSampleCached(Step, Draft, Prefix, PrefixLen, cTokens, InputV,
+    CachedOut, CachedLen, bcC, dcC, accTokC, passesC);
+  gTgtTemp := 1.0;
+  if (SpecLen = CachedLen) and SeqEqual(SpecOut, CachedOut, SpecLen) then
+    WriteLn('  (c) peaked target  : cached == v1 under rejections     PASS')
+  else
+  begin
+    WriteLn('  (c) peaked target  : cached != v1                      FAIL');
+    GateCachedExact := false;
+  end;
+  if GateCachedExact then
+    WriteLn('  GATE 1b: PASS  (cached speculative output is exact)')
+  else
+    WriteLn('  GATE 1b: FAIL  (KV-cache verification broke exactness!)');
   WriteLn;
 
   // =========================================================================
@@ -798,6 +1199,94 @@ begin
   WriteLn('  at either temperature (Gate 1/2).');
   WriteLn;
 
+  // =========================================================================
+  // GATE 4: COMPOSITION BENCHMARK. Wall-clock and ACTUAL target-net forward
+  // counts for the three arms over the SAME cBenchRuns random prefixes:
+  //   (i)   plain target-only sampling      (one FULL forward per token)
+  //   (ii)  v1 speculative, full recompute  (one FULL forward per verified
+  //         position + bonus -- fewer conceptual passes, same forward cost)
+  //   (iii) speculative + KV cache          (prefill once; ONE short cached
+  //         forward per pass; TruncateCache rollback on rejection)
+  // The headline: (iii) beats both because the two wins compose.
+  // =========================================================================
+  WriteLn(StringOfChar('=', 72));
+  WriteLn('GATE 4  Composition benchmark  (', cBenchRuns, ' runs x ',
+    cTokens, ' tokens, trained draft, flat target)');
+  WriteLn(StringOfChar('=', 72));
+  gTgtTemp := 1.0;
+
+  // (i) plain full-recompute.
+  RandSeed := cSeed + 321;
+  gTgtForwards := 0; ToksPlain := 0;
+  T0 := NowMs();
+  for run := 1 to cBenchRuns do
+  begin
+    MakeSeq(BenchSeq);
+    RngSeed(gProp, QWord(21000000 + run)); RngSeed(gAcc, QWord(22000000 + run));
+    PlainSample(Target, BenchSeq, PrefixLen, cTokens, InputV,
+      PlainOut, PlainLen, bcP);
+    ToksPlain := ToksPlain + (PlainLen - PrefixLen);
+  end;
+  MsPlain := NowMs() - T0;
+  FwdPlain := gTgtForwards;
+
+  // (ii) v1 speculative full-recompute (same prefixes, same seeds).
+  RandSeed := cSeed + 321;
+  gTgtForwards := 0; ToksSpecV1 := 0; PassesSpecV1 := 0;
+  T0 := NowMs();
+  for run := 1 to cBenchRuns do
+  begin
+    MakeSeq(BenchSeq);
+    RngSeed(gProp, QWord(21000000 + run)); RngSeed(gAcc, QWord(22000000 + run));
+    SpeculativeSample(Target, Draft, BenchSeq, PrefixLen, cTokens, InputV,
+      SpecOut, SpecLen, bcS, dcS, accTok, passes);
+    ToksSpecV1 := ToksSpecV1 + (SpecLen - PrefixLen);
+    PassesSpecV1 := PassesSpecV1 + passes;
+  end;
+  MsSpecV1 := NowMs() - T0;
+  FwdSpecV1 := gTgtForwards;
+
+  // (iii) speculative + KV cache (same prefixes, same seeds).
+  RandSeed := cSeed + 321;
+  gTgtForwards := 0; ToksSpecKV := 0; PassesSpecKV := 0;
+  T0 := NowMs();
+  for run := 1 to cBenchRuns do
+  begin
+    MakeSeq(BenchSeq);
+    RngSeed(gProp, QWord(21000000 + run)); RngSeed(gAcc, QWord(22000000 + run));
+    SpeculativeSampleCached(Step, Draft, BenchSeq, PrefixLen, cTokens, InputV,
+      CachedOut, CachedLen, bcC, dcC, accTokC, passesC);
+    ToksSpecKV := ToksSpecKV + (CachedLen - PrefixLen);
+    PassesSpecKV := PassesSpecKV + passesC;
+  end;
+  MsSpecKV := NowMs() - T0;
+  FwdSpecKV := gTgtForwards;
+
+  WriteLn('  arm                        tokens  ms/token   tok/s   tgt-fwd  fwd/tok');
+  WriteLn('  -------------------------  ------  --------  ------  --------  -------');
+  WriteLn(Format('  (i)   plain full-recompute %7d  %8.3f  %6.0f  %8d  %7.3f',
+    [ToksPlain, MsPlain / Max(1, ToksPlain),
+     1000.0 * ToksPlain / Max(1e-9, MsPlain), FwdPlain,
+     FwdPlain / Max(1.0, ToksPlain)]));
+  WriteLn(Format('  (ii)  spec v1 (recompute)  %7d  %8.3f  %6.0f  %8d  %7.3f',
+    [ToksSpecV1, MsSpecV1 / Max(1, ToksSpecV1),
+     1000.0 * ToksSpecV1 / Max(1e-9, MsSpecV1), FwdSpecV1,
+     FwdSpecV1 / Max(1.0, ToksSpecV1)]));
+  WriteLn(Format('  (iii) spec + KV cache      %7d  %8.3f  %6.0f  %8d  %7.3f',
+    [ToksSpecKV, MsSpecKV / Max(1, ToksSpecKV),
+     1000.0 * ToksSpecKV / Max(1e-9, MsSpecKV), FwdSpecKV,
+     FwdSpecKV / Max(1.0, ToksSpecKV)]));
+  WriteLn(Format('  verification passes: v1=%d  cached=%d  (cached fwd = passes + prefill)',
+    [PassesSpecV1, PassesSpecKV]));
+  WriteLn(Format('  speedup (ms/token): (iii) vs (i) = %.2fx,  (iii) vs (ii) = %.2fx',
+    [(MsPlain / Max(1, ToksPlain)) / Max(1e-9, MsSpecKV / Max(1, ToksSpecKV)),
+     (MsSpecV1 / Max(1, ToksSpecV1)) / Max(1e-9, MsSpecKV / Max(1, ToksSpecKV))]));
+  WriteLn('  v1 cuts conceptual passes but still pays one FULL-prefix forward per');
+  WriteLn('  verified position (fwd/tok ~ 1, each over all ', cSeqLen, ' positions);');
+  WriteLn('  the cached arm pays ~1 SHORT (', cStepWidth, '-token) cached forward per PASS,');
+  WriteLn('  so both the count and the cost of big-model forwards drop.');
+  WriteLn;
+
   // ---- Summary / interpretation ------------------------------------------
   WriteLn(StringOfChar('=', 72));
   WriteLn('SUMMARY');
@@ -806,6 +1295,10 @@ begin
     WriteLn('  [PASS] EXACTNESS  : draft==target => speculative is bit-for-bit plain.')
   else
     WriteLn('  [FAIL] EXACTNESS  : degenerate case diverged.');
+  if GateCachedExact then
+    WriteLn('  [PASS] KV-CACHED  : cached verification == v1 full recompute, token-exact.')
+  else
+    WriteLn('  [FAIL] KV-CACHED  : cached verification diverged from v1.');
   if GateFaithFlat and GateFaithPeak then
     WriteLn(Format('  [PASS] FAITHFUL   : real-draft TV flat=%.4f peaked=%.4f within noise.',
       [TVFlat, TVPeak]))
@@ -821,13 +1314,15 @@ begin
   WriteLn('distribution at ANY peakedness (Gate 1 pins it bit-for-bit; Gate 2 confirms');
   WriteLn('empirically for both a flat and a peaked target) while committing 1..K+1 tokens');
   WriteLn('per big-model pass. A peaked target makes the speedup MORE sensitive to draft');
-  WriteLn('quality at NO change in what is sampled. v1 recomputes the prefix each pass;');
-  WriteLn('KV-cache reuse is the follow-up.');
+  WriteLn('quality at NO change in what is sampled. The KV-cached verifier removes the');
+  WriteLn('per-pass prefix recompute (prefill once, short cached window per pass,');
+  WriteLn('TruncateCache rollback on rejection), composing the two efficiency wins.');
 
+  FreeStepTarget(Step);
   Target.Free;
   Draft.Free;
   InputV.Free;
 
-  // Gate 1 (exactness) is the mandatory faithfulness anchor.
-  if not GateExact then Halt(1);
+  // Gate 1 (exactness) and Gate 1b (cached exactness) are mandatory.
+  if not (GateExact and GateCachedExact) then Halt(1);
 end.

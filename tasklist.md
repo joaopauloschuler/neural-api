@@ -408,10 +408,15 @@ rather than acted on.
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
-- [ ] SpeculativeDecoding follow-up: KV-cache composition — once the open
+- [x] SpeculativeDecoding follow-up: KV-cache composition — once the open
       KV-cache incremental-decode path lands, remove the per-verification-pass
       prefix recompute (the v1 demo recomputes the whole prefix each pass) so the
       two efficiency wins (fewer big-model calls x O(1)-per-step) compose.
+      (DONE: TNNetScaledDotProductAttention.TruncateCache rollback +
+      TNNetSinusoidalPositionalEmbedding.PositionOffset; SpeculativeSampleCached
+      prefills once, verifies via one short cached window per pass, truncates on
+      rejection; token-exact vs v1 (mandatory gate), 2.9x vs plain / 3.9x vs v1
+      at ctx 24; unit test TestKVCacheTruncateThenReappendMatchesFresh.)
 - [x] KV-cache / incremental-decode O(1)-per-step path for
       TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
       the SDPA incremental-decode notes above apply doubly here).

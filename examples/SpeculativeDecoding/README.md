@@ -46,13 +46,48 @@ the draft over-proposes a token (`p_draft > p_target`) the accept step thins it
 back down; the leftover probability mass `max(0, p_target - p_draft)` is exactly
 what the residual resample puts back. No bias, for any draft.
 
+## KV-cache composition (the v2 verifier)
+
+The demo ships **two** verification backends and proves they are token-exact
+equivalents:
+
+- **v1 (`SpeculativeSample`)** recomputes the whole prefix on every
+  verification pass — correct and simple, but each pass costs `O((t+K)^2)`
+  attention work, so v1 cuts the *number* of conceptual big-model passes
+  without cutting the actual forward cost.
+- **KV-cached (`SpeculativeSampleCached`)** runs the target's verification
+  through the `TNNetScaledDotProductAttention` KV-cache incremental-decode
+  path on a *step net*: the same architecture/weights rebuilt at input width
+  `K+1` (`CopyWeights` — all parameter shapes are sequence-length
+  independent), every per-head SDPA in `BeginIncrementalDecode` mode.
+  - **Prefill once.** The prompt's K/V is cached in one multi-token cached
+    forward (each input token's K/V is appended and its query attends over
+    the cache so far — exactly the prefill semantics of the cached path).
+  - **One short forward per pass.** Each pass feeds only the window
+    `[last committed token | x_1..x_K]`; row `i` of the per-position softmax
+    is `p_target` at context length `t+i`, covering all verification rows
+    *plus the bonus row* in one go. Per-pass cost: `O(K * t)` instead of
+    `O((t+K)^2)`.
+  - **Rollback on rejection.** Rejected (and padding) positions have already
+    appended stale K/V; **`TruncateCache(NewLength)`** (added with this
+    example) rewinds every head's cache to the committed prefix — a
+    one-field rewind, the preallocated slots are simply reused.
+  - **Positional contract.** The step net only sees the short window, so its
+    `TNNetSinusoidalPositionalEmbedding` is shifted via the new
+    `PositionOffset` property to the window's absolute start position before
+    every cached forward (the cached SDPA applies no positions itself).
+  The two efficiency wins therefore **compose**: fewer big-model passes
+  (speculation) × cheaper passes (KV cache).
+
+The **draft stays on the full-recompute path on purpose**: it is attention-free
+(`TNNetTokenShift`), so it has no KV cache to exploit, and its forwards are the
+cheap arm by design.
+
 ## Distinct from the neighbouring examples
 
-- **KV-cache (open task)** flattens the per-step cost of running **one** model;
-  speculative decoding cuts the **number** of big-model passes. They are
-  orthogonal and compose. This v1 is forward-only and recomputes the prefix each
-  pass (correct and simple); KV-cache reuse of the target's prefix activations is
-  the explicit follow-up.
+- **examples/IncrementalDecode** demonstrates the KV cache flattening the
+  per-step cost of running **one** model; speculative decoding cuts the
+  **number** of big-model passes. This example composes the two.
 - **DeepEnsembleUncertainty / KnowledgeDistillation** combine model *outputs* or
   transfer knowledge; they do **not** preserve the target's exact sampling law.
 - **EarlyExitNetwork** lets *one* model exit early; here two *separate* models
@@ -116,6 +151,12 @@ explicit RNG streams.
    `draft == target` the accept rule is always-accept, so the speculative and
    plain token sequences must be **identical element-for-element**. This is the
    pinnable faithfulness anchor.
+1b. **(MANDATORY) KV-cache exactness — `Halt(1)` on failure.** The cached
+   sampler must produce a token sequence **identical** to the v1 full-recompute
+   sampler under the same seeds, three ways: (a) `draft == target` (chains
+   through Gate 1 to plain sampling), (b) the real trained draft at the flat
+   target (real rejections exercise the `TruncateCache` rollback), and (c) the
+   real draft at the peaked target (more rejections, plus the tempering path).
 2. **Empirical faithfulness.** With a genuinely *different* trained draft, sample
    the next token many times (4000 draws) from a fixed prefix both ways and
    compare the token histograms; asserts the total-variation distance is within
@@ -125,6 +166,9 @@ explicit RNG streams.
    accepted-tokens-per-pass, accept-rate, big-model-calls-per-token, and
    big-model-calls-saved. Accept rate (hence calls saved) **rises monotonically**
    with draft/target agreement.
+4. **Composition benchmark (the headline).** Wall-clock ms/token and *actual*
+   target-net forward counts for the three arms over the same 150 random
+   prefixes × 12 tokens (trained draft, flat target).
 
 ## Flat vs PEAKED target (two-scenario speedup chart)
 
@@ -160,10 +204,12 @@ GATE 1  Degenerate exactness  (draft == target => always-accept)
   GATE 1 : PASS  (speculative == plain, bit-for-bit)
 
 ========================================================================
-GATE 2  Empirical faithfulness  (real draft != target; histogram match)
+GATE 1b Cached-verification exactness (KV cache + TruncateCache rollback)
 ========================================================================
-  total-variation distance = 0.0245  (small => same distribution)
-  GATE 2 : PASS  (histograms match within sampling noise)
+  (a) draft==target : cached == plain, bit-for-bit       PASS
+  (b) real draft     : cached == v1 (15 tokens, 3 passes)  PASS
+  (c) peaked target  : cached == v1 under rejections     PASS
+  GATE 1b: PASS  (cached speculative output is exact)
 
 ========================================================================
 GATE 2  Empirical faithfulness  (real draft != target; histogram match)
@@ -195,7 +241,31 @@ GATE 3  Speedup vs draft/target agreement  (block K=4)
                      weak-rate   strong-rate   weak-saved   strong-saved   gap(saved)
     FLAT target        0.585         0.969        70.1%         79.5%          9.4 pts
     PEAKED target      0.406         0.641        61.9%         71.9%         10.1 pts
+
+========================================================================
+GATE 4  Composition benchmark  (150 runs x 12 tokens, trained draft, flat target)
+========================================================================
+  arm                        tokens  ms/token   tok/s   tgt-fwd  fwd/tok
+  -------------------------  ------  --------  ------  --------  -------
+  (i)   plain full-recompute    1800     0.350    2855      1800    1.000
+  (ii)  spec v1 (recompute)     2220     0.480    2083      2220    1.000
+  (iii) spec + KV cache         2220     0.122    8207       623    0.281
+  verification passes: v1=473  cached=473  (cached fwd = passes + prefill)
+  speedup (ms/token): (iii) vs (i) = 2.87x,  (iii) vs (ii) = 3.94x
 ```
+
+Reading the benchmark: v1 (ii) is actually *slower* per token than plain (i) at
+this tiny scale — it makes the same number of full-prefix target forwards
+(fwd/tok = 1, one per verified position plus bonus) *plus* the draft passes.
+What speculation buys is fewer conceptual *passes* (473 passes for 2220
+tokens, 4.7 tokens committed per pass); what the KV cache buys is making each
+pass **one short 5-token cached forward** instead of K+1 full 24-token
+re-encodes. Composed, arm (iii) makes 0.281 forwards per token (623 = 473
+passes + 150 prefills) at a fraction of the per-forward cost: **2.9× faster
+than plain and 3.9× faster than v1 speculative**, with the token streams
+bit-identical across all three arms (Gates 1/1b). At a production context
+length (thousands of tokens, not 24) the per-pass gap is `O(K·t)` vs
+`O((t+K)²)`, so the composition widens further with `t`.
 
 Reading the contrast: under the FLAT target even an **untrained** draft accepts
 `58.5%` of the time (the `mod`-sum map spreads mass, so random proposals land on
@@ -215,16 +285,15 @@ draft token was accepted and each pass committed `K+1 = 5`.
 
 ## What did NOT fit the budget (honesty)
 
-- **v1 is forward-only and recomputes the prefix on every verification pass.**
-  That is correct but wasteful: a production implementation would keep a
-  **KV-cache** of the target's prefix activations and extend it, instead of
-  re-running the whole prefix each pass. KV-cache composition is the explicit
-  follow-up (see the open KV-cache task in `tasklist.md`); it is orthogonal to
-  the accept/reject machinery here and the two compose.
-- **The "batched" target scoring is emulated by per-position `NextDist` calls**
-  but counted as **one** big-model pass per block, reflecting the batched cost a
-  real implementation pays. The speculative loop's *correctness* does not depend
-  on how the K+1 scores are physically produced.
+- **The draft is not cached.** It is attention-free (`TNNetTokenShift`), so
+  there is no KV cache to exploit; a stateful TokenShift step path would be a
+  different (tiny) follow-up. Its full recomputes are the cheap arm by design
+  and dominate nothing.
+- **In the v1 arm the "batched" target scoring is emulated by per-position
+  `NextDist` calls** but counted as **one** big-model pass per block,
+  reflecting the batched cost a real implementation pays. The KV-cached arm
+  needs no such emulation: one short multi-token cached forward *physically*
+  produces all K+1 rows.
 - The toy target's `mod`-sum next-token distribution is fairly flat, so under the
   FLAT scenario the *absolute* accept rates are high even for a weak draft; there
   the load-bearing result is the **monotone rise** in accept rate with draft

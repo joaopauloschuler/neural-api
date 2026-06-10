@@ -2522,6 +2522,15 @@ type
     procedure EndIncrementalDecode();
     // Start a fresh sequence: empties the cache (keeps the preallocation).
     procedure ResetCache();
+    // Rewind the cache to NewLength tokens (0 <= NewLength <= CacheLength),
+    // discarding the K/V entries of every later position. Because the cache
+    // buffers are preallocated at MaxContext, this is a one-field rewind: the
+    // truncated slots are simply reused by the next append. This is the
+    // rollback primitive speculative decoding needs - when a drafted token is
+    // rejected, the K/V already appended for the rejected positions are stale
+    // and must be discarded before verification continues from the last
+    // committed token. TruncateCache(0) is equivalent to ResetCache().
+    procedure TruncateCache(NewLength: integer);
     // Read-only access to the post-softmax attention map populated by
     // Compute(). Layout: X=key index j, Y=query index i, attn[j,i,0]; rows
     // (fixed i) sum to 1. Used by TNNet.AttentionEntropyReport.
@@ -3642,10 +3651,19 @@ type
   // is identity (no trainable parameters), so input gradients pass through
   // unchanged. The "base" hyper-parameter (default 10000) is serialized via
   // FStruct[0], mirroring TNNetAddPositionalEmbedding.
+  // PositionOffset (default 0, NOT serialized) shifts every position by a
+  // constant: PE(pos + PositionOffset, i). Streamed/incremental decoding
+  // (e.g. the KV-cache path of TNNetScaledDotProductAttention) feeds a SHORT
+  // window of tokens through a narrow net, so the caller must set
+  // PositionOffset to the window's ABSOLUTE start position (the running
+  // cache length before the step) for the encoding to match a full forward.
+  // Setting it rebuilds the (cheap, parameter-free) table immediately.
   // Coded by Claude (AI).
   TNNetSinusoidalPositionalEmbedding = class(TNNetIdentity)
   private
     FPositionalEmbedding: TNNetVolume;
+    FPositionOffset: integer;
+    procedure SetPositionOffset(Value: integer);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload;
@@ -3653,6 +3671,7 @@ type
     destructor Destroy(); override;
 
     procedure Compute(); override;
+    property PositionOffset: integer read FPositionOffset write SetPositionOffset;
   end;
 
   { TNNetSinusoidalTimeEmbedding }
@@ -14638,7 +14657,23 @@ begin
   FPositionalEmbedding.ReSize(FOutput);
   Base := Round(FStruct[0]);
   if Base <= 0 then Base := 10000;
-  FPositionalEmbedding.PositionalEncoding(Base);
+  FPositionalEmbedding.PositionalEncoding(Base, FPositionOffset);
+end;
+
+procedure TNNetSinusoidalPositionalEmbedding.SetPositionOffset(Value: integer);
+var
+  Base: integer;
+begin
+  if Value = FPositionOffset then exit;
+  FPositionOffset := Value;
+  // Rebuild the fixed table at the shifted positions (only once the table has
+  // been allocated by SetPrevLayer; otherwise SetPrevLayer fills it later).
+  if FPositionalEmbedding.Size > 0 then
+  begin
+    Base := Round(FStruct[0]);
+    if Base <= 0 then Base := 10000;
+    FPositionalEmbedding.PositionalEncoding(Base, FPositionOffset);
+  end;
 end;
 
 constructor TNNetSinusoidalPositionalEmbedding.Create();
@@ -20492,6 +20527,26 @@ end;
 procedure TNNetScaledDotProductAttention.ResetCache();
 begin
   FCacheLen := 0;
+end;
+
+procedure TNNetScaledDotProductAttention.TruncateCache(NewLength: integer);
+begin
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.TruncateCache requires the ' +
+      'cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if (NewLength < 0) or (NewLength > FCacheLen) then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.TruncateCache requires ' +
+      '0 <= NewLength <= CacheLength. Got NewLength=' + IntToStr(NewLength) +
+      ', CacheLength=' + IntToStr(FCacheLen));
+    exit;
+  end;
+  // One-field rewind: the preallocated K/V buffers keep their storage and the
+  // truncated slots are overwritten by the next append.
+  FCacheLen := NewLength;
 end;
 
 // Inference-only cached forward. Appends each input token's K and V slice to

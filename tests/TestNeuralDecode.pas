@@ -30,6 +30,7 @@ type
     procedure TestKVCacheIncrementalMatchesFullForward;
     procedure TestKVCachePrefillThenStepMatchesFullForward;
     procedure TestKVCacheResetStartsFreshSequence;
+    procedure TestKVCacheTruncateThenReappendMatchesFresh;
     procedure TestKVCacheDisabledPathUnchanged;
     // O(1)-per-step incremental decode on TNNetDiagonalSSM (persisted state).
     procedure TestSSMIncrementalMatchesFullForward;
@@ -339,6 +340,105 @@ begin
     Seq.Free;
     OutB.Free;
     OutA.Free;
+    StepIn.Free;
+    NN.Free;
+  end;
+end;
+
+// TruncateCache must implement the speculative-decoding rollback exactly:
+// append CommitLen + DraftLen tokens, truncate back to CommitLen (discarding
+// the rejected drafts' K/V), append DIFFERENT replacement tokens, and the
+// outputs from the truncated cache must match a fresh-cache run over the
+// same final sequence at every kept position.
+procedure TTestNeuralDecode.TestKVCacheTruncateThenReappendMatchesFresh;
+const
+  CommitLen = 4;   // tokens committed before the speculative block
+  DraftLen = 3;    // speculatively appended, then all rejected
+  TailLen = 3;     // replacement tokens appended after the rollback
+  Dk = 4;
+var
+  NN: TNNet;
+  SDPA: TNNetScaledDotProductAttention;
+  StepIn, OutV: TNNetVolume;
+  Committed, Drafts, Tail: TNNetVolume;
+  T, D, Pass: integer;
+  FirstRun: array of TNeuralFloat;
+
+  procedure FeedToken(Source: TNNetVolume; Index: integer);
+  var
+    DD: integer;
+  begin
+    for DD := 0 to 3 * Dk - 1 do
+      StepIn[0, 0, DD] := Source[Index, 0, DD];
+    NN.Compute(StepIn);
+    NN.GetOutput(OutV);
+  end;
+
+begin
+  RandSeed := 55501;
+  NN := TNNet.Create();
+  StepIn := TNNetVolume.Create(1, 1, 3 * Dk);
+  OutV := TNNetVolume.Create();
+  Committed := TNNetVolume.Create(CommitLen, 1, 3 * Dk);
+  Drafts := TNNetVolume.Create(DraftLen, 1, 3 * Dk);
+  Tail := TNNetVolume.Create(TailLen, 1, 3 * Dk);
+  SetLength(FirstRun, (CommitLen + TailLen) * Dk);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 3 * Dk));
+    SDPA := TNNetScaledDotProductAttention.Create(Dk, true);
+    NN.AddLayer(SDPA);
+    Committed.Randomize(); Committed.Sub(0.5);
+    Drafts.Randomize(); Drafts.Sub(0.5);
+    Tail.Randomize(); Tail.Sub(0.5);
+
+    SDPA.BeginIncrementalDecode(CommitLen + DraftLen + TailLen);
+    // Pass 0: committed prefix + rejected drafts + truncate + real tail.
+    // Pass 1 (reference): fresh cache, committed prefix + real tail only.
+    for Pass := 0 to 1 do
+    begin
+      if Pass = 1 then SDPA.ResetCache();
+      for T := 0 to CommitLen - 1 do
+      begin
+        FeedToken(Committed, T);
+        if Pass = 0 then
+          for D := 0 to Dk - 1 do
+            FirstRun[T * Dk + D] := OutV[0, 0, D]
+        else
+          for D := 0 to Dk - 1 do
+            AssertEquals('prefix pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+              FirstRun[T * Dk + D], OutV[0, 0, D], 1e-7);
+      end;
+      if Pass = 0 then
+      begin
+        // Speculative block: append drafts, then reject them all.
+        for T := 0 to DraftLen - 1 do
+          FeedToken(Drafts, T);
+        AssertEquals('cache holds prefix+drafts',
+          CommitLen + DraftLen, SDPA.CacheLength);
+        SDPA.TruncateCache(CommitLen);
+        AssertEquals('cache rewound to the committed prefix',
+          CommitLen, SDPA.CacheLength);
+      end;
+      for T := 0 to TailLen - 1 do
+      begin
+        FeedToken(Tail, T);
+        if Pass = 0 then
+          for D := 0 to Dk - 1 do
+            FirstRun[(CommitLen + T) * Dk + D] := OutV[0, 0, D]
+        else
+          for D := 0 to Dk - 1 do
+            AssertEquals('tail pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+              FirstRun[(CommitLen + T) * Dk + D], OutV[0, 0, D], 1e-7);
+      end;
+    end;
+    // TruncateCache(0) behaves as ResetCache.
+    SDPA.TruncateCache(0);
+    AssertEquals('truncate to zero empties the cache', 0, SDPA.CacheLength);
+  finally
+    Tail.Free;
+    Drafts.Free;
+    Committed.Free;
+    OutV.Free;
     StepIn.Free;
     NN.Free;
   end;
