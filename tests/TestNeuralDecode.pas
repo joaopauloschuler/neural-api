@@ -29,6 +29,15 @@ type
     procedure AssertStreamMatchesFull(Full: TNNet;
       Session: TNNetStreamingDecoder; const Toks: array of integer;
       const MsgPrefix: string);
+    // Hand-rolled full-re-encode greedy reference loop (what a cache-less
+    // sampler pays): zero-pad the prefix into the full-width net, argmax the
+    // row at the last real position, append; same EOS rule (token < 2 is
+    // stored, then generation stops) as GenerateTokensStreamed.
+    procedure FullGreedyGenerate(Full: TNNet; var Toks: TNeuralIntegerArray;
+      PromptLen, MaxNew: integer; out OutLen: integer);
+    // Zeroes the last (logit head) layer's weights and biases and raises one
+    // token's bias so greedy argmax always emits exactly that token.
+    procedure RigHeadToConstantToken(NN: TNNet; Token: integer);
   published
     // Pure helper functions (no network needed).
     procedure TestLengthPenaltyAlphaZeroIsOne;
@@ -56,6 +65,14 @@ type
     procedure TestStreamingDecoderSSMMatchesFullForward;
     procedure TestStreamingDecoderResetStartsFreshSequence;
     procedure TestStreamingDecoderTruncateToRollsBack;
+    // GenerateTokensStreamed / GenerateStringStreamed: streamed generation.
+    procedure TestGenerateTokensStreamedTransformerMatchesFullGreedy;
+    procedure TestGenerateTokensStreamedSSMMatchesFullGreedy;
+    procedure TestGenerateTokensStreamedGreedySamplerMatchesNilPath;
+    procedure TestGenerateTokensStreamedStopsAtEOS;
+    procedure TestGenerateTokensStreamedRespectsCaps;
+    procedure TestGenerateTokensStreamedRejectsWideSession;
+    procedure TestGenerateStringStreamedMatchesTokenCore;
   end;
 
 implementation
@@ -1002,6 +1019,341 @@ begin
     StepIn.Free;
     FullOut.Free;
     FullIn.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// GenerateTokensStreamed / GenerateStringStreamed tests.
+// ---------------------------------------------------------------------------
+
+procedure TTestNeuralDecode.FullGreedyGenerate(Full: TNNet;
+  var Toks: TNeuralIntegerArray; PromptLen, MaxNew: integer;
+  out OutLen: integer);
+var
+  InV: TNNetVolume;
+  ContextLen, T, NextTok: integer;
+begin
+  ContextLen := Full.GetFirstLayer().Output.SizeX;
+  if Length(Toks) < ContextLen then SetLength(Toks, ContextLen);
+  InV := TNNetVolume.Create(ContextLen, 1, 1);
+  try
+    OutLen := PromptLen;
+    while (OutLen - PromptLen < MaxNew) and (OutLen < ContextLen) do
+    begin
+      // Full re-encode: the whole zero-padded prefix, every step. Trailing
+      // zero pads are invisible to the read row: every layer is per-token
+      // except the CAUSAL attention/SSM mixers, which never look right.
+      InV.Fill(0);
+      for T := 0 to OutLen - 1 do InV.FData[T] := Toks[T];
+      Full.Compute(InV);
+      NextTok := Full.GetLastLayer().Output.GetClassOnPixel(OutLen - 1, 0);
+      Toks[OutLen] := NextTok;
+      Inc(OutLen);
+      if NextTok < 2 then Break; // same EOS rule as the streamed core
+    end;
+  finally
+    InV.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.RigHeadToConstantToken(NN: TNNet; Token: integer);
+var
+  Head: TNNetLayer;
+  N: integer;
+begin
+  Head := NN.GetLastLayer();
+  for N := 0 to Head.Neurons.Count - 1 do
+  begin
+    Head.Neurons[N].Weights.Fill(0);
+    Head.Neurons[N].BiasWeight := 0;
+  end;
+  Head.Neurons[Token].BiasWeight := 5;
+end;
+
+// Streamed greedy generation from a width-1 RoPE-transformer twin must equal
+// a hand-rolled full-re-encode greedy loop token for token (and in length).
+procedure TTestNeuralDecode.TestGenerateTokensStreamedTransformerMatchesFullGreedy;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  FullToks, StreamToks: TNeuralIntegerArray;
+  FullLen, StreamLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(FullToks, SeqLen);
+    SetLength(StreamToks, PromptLen);
+    FullToks[0] := 3; FullToks[1] := 7; FullToks[2] := 5;
+    for T := 0 to PromptLen - 1 do StreamToks[T] := FullToks[T];
+
+    FullGreedyGenerate(Full, FullToks, PromptLen, SeqLen - PromptLen, FullLen);
+    StreamLen := GenerateTokensStreamed(Session, StreamToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+
+    AssertEquals('same generated length', FullLen, StreamLen);
+    for T := PromptLen to StreamLen - 1 do
+      AssertEquals('token at pos ' + IntToStr(T), FullToks[T], StreamToks[T]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Same token-for-token gate for the recurrent family (DiagonalSSM twin with
+// non-trivial per-channel recurrence weights).
+procedure TTestNeuralDecode.TestGenerateTokensStreamedSSMMatchesFullGreedy;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  SSMFull: TNNetDiagonalSSM;
+  FullToks, StreamToks: TNeuralIntegerArray;
+  FullLen, StreamLen, T, i, D: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    // Non-trivial recurrence weights (the defaults are uniform per channel).
+    SSMFull := nil;
+    for i := 0 to Full.Layers.Count - 1 do
+      if Full.Layers[i] is TNNetDiagonalSSM then
+        SSMFull := TNNetDiagonalSSM(Full.Layers[i]);
+    AssertTrue('SSM layer found', SSMFull <> nil);
+    for D := 0 to csStreamDim - 1 do
+    begin
+      SSMFull.Neurons[0].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+      SSMFull.Neurons[1].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[2].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[3].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+    end;
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(FullToks, SeqLen);
+    SetLength(StreamToks, PromptLen);
+    FullToks[0] := 5; FullToks[1] := 2; FullToks[2] := 9;
+    for T := 0 to PromptLen - 1 do StreamToks[T] := FullToks[T];
+
+    FullGreedyGenerate(Full, FullToks, PromptLen, SeqLen - PromptLen, FullLen);
+    StreamLen := GenerateTokensStreamed(Session, StreamToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+
+    AssertEquals('same generated length', FullLen, StreamLen);
+    for T := PromptLen to StreamLen - 1 do
+      AssertEquals('token at pos ' + IntToStr(T), FullToks[T], StreamToks[T]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// A TNNetSamplerGreedy (argmax sampler from neuralvolume) must produce the
+// exact same stream as the Sampler=nil internal greedy path.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedGreedySamplerMatchesNilPath;
+const
+  SeqLen = 9;
+  PromptLen = 2;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Sampler: TNNetSamplerGreedy;
+  NilToks, SamplerToks: TNeuralIntegerArray;
+  NilLen, SamplerLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  Sampler := TNNetSamplerGreedy.Create();
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(NilToks, PromptLen);
+    SetLength(SamplerToks, PromptLen);
+    NilToks[0] := 6; NilToks[1] := 11;
+    SamplerToks[0] := 6; SamplerToks[1] := 11;
+    // The routine Reset()s the session itself, so it can be reused.
+    NilLen := GenerateTokensStreamed(Session, NilToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    SamplerLen := GenerateTokensStreamed(Session, SamplerToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, Sampler);
+    AssertEquals('same generated length', NilLen, SamplerLen);
+    for T := PromptLen to NilLen - 1 do
+      AssertEquals('token at pos ' + IntToStr(T), NilToks[T], SamplerToks[T]);
+  finally
+    Sampler.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// EOS rule: rig the logit head so argmax is ALWAYS token 1 (EOS); generation
+// must stop after storing exactly that one token.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedStopsAtEOS;
+const
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Toks: TNeuralIntegerArray;
+  OutLen: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(16);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    RigHeadToConstantToken(Full, 1);
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, 16);
+    SetLength(Toks, PromptLen);
+    Toks[0] := 4; Toks[1] := 9; Toks[2] := 6;
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen, 10, 16);
+    AssertEquals('stopped right after EOS', PromptLen + 1, OutLen);
+    AssertEquals('EOS token stored', 1, Toks[PromptLen]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// MaxNewTokens / MaxTotalLen caps, made deterministic by rigging the head to
+// a constant non-special token (7) so EOS never fires.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedRespectsCaps;
+const
+  PromptLen = 2;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Toks: TNeuralIntegerArray;
+  OutLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(32);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    RigHeadToConstantToken(Full, 7);
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, 32);
+    // MaxNewTokens caps generation: 2 prompt + exactly 3 new tokens.
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 8;
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen, 3, 32);
+    AssertEquals('MaxNewTokens cap', PromptLen + 3, OutLen);
+    for T := PromptLen to OutLen - 1 do
+      AssertEquals('constant token at pos ' + IntToStr(T), 7, Toks[T]);
+    // MaxTotalLen clips even a generous MaxNewTokens budget.
+    SetLength(Toks, 0);
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 8;
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen, 50, 4);
+    AssertEquals('MaxTotalLen cap', 4, OutLen);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// v1 is width-1 only: a wider (speculative-verify-style) session must be
+// rejected with EArgumentException, not silently mis-decoded.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedRejectsWideSession;
+var
+  Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Toks: TNeuralIntegerArray;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyCausalLM(2); // width 2, not 1
+  Session := nil;
+  try
+    Session := TNNetStreamingDecoder.Create(Twin, 8);
+    SetLength(Toks, 2);
+    Toks[0] := 3; Toks[1] := 4;
+    Raised := false;
+    try
+      GenerateTokensStreamed(Session, Toks, 2, 4, 8);
+    except
+      on EArgumentException do Raised := true;
+    end;
+    AssertTrue('width-2 session rejected', Raised);
+  finally
+    Session.Free;
+    Twin.Free;
+  end;
+end;
+
+// String wrapper: tokenizing the prompt, running the core and detokenizing
+// the continuation (space-joined: TStringListInt.TokenizerHasSeparator=True;
+// display stops at the first token < 2) must match a manual run of
+// GenerateTokensStreamed + Dict.DeTokenize.
+procedure TTestNeuralDecode.TestGenerateStringStreamedMatchesTokenCore;
+const
+  SeqLen = 9;
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'apple', 'blue', 'cat',
+    'dog', 'egg', 'fox', 'gold', 'hat', 'ice', 'jam');
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Dict: TStringListInt;
+  Toks: TNeuralIntegerArray;
+  PromptLen, TotalLen, T: integer;
+  Got, Expected: string;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  Dict := TStringListInt.Create();
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition(); // token id = sorted index (0='<eos>',...)
+    AssertEquals('vocab matches the tiny LM', csStreamVocab,
+      Dict.GetVocabCount());
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    Got := GenerateStringStreamed(Session, Dict, 'cat dog egg',
+      SeqLen - 3, SeqLen);
+
+    // Manual reference: same prompt ids, same core, manual detokenize.
+    Dict.Tokenize('cat dog egg', Toks);
+    PromptLen := Length(Toks);
+    AssertEquals('prompt tokenizes to 3 ids', 3, PromptLen);
+    TotalLen := GenerateTokensStreamed(Session, Toks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    Expected := 'cat dog egg';
+    for T := PromptLen to TotalLen - 1 do
+    begin
+      if Toks[T] < 2 then Break;
+      Expected := Expected + ' ' + Dict.DeTokenize(Toks[T]);
+    end;
+    AssertEquals('wrapper equals token core + detokenize', Expected, Got);
+    AssertTrue('result preserves the prompt prefix',
+      Copy(Got, 1, Length('cat dog egg')) = 'cat dog egg');
+  finally
+    Dict.Free;
     Session.Free;
     Twin.Free;
     Full.Free;

@@ -23,8 +23,10 @@ Honest v1 scope notes ("what did NOT fit"):
       longer beams. See LengthPenaltyDenominator.
   (c) v1 RE-ENCODES each candidate prefix on every step (O(L^2) total forward
       passes). The KV-cache incremental-decode plumbing now lives in
-      TNNetStreamingDecoder below; wiring beam search onto it is the remaining
-      follow-up.
+      TNNetStreamingDecoder below, and GenerateTokensStreamed /
+      GenerateStringStreamed are the streamed (never-re-encode) greedy/sampled
+      generation routines built on it; wiring BEAM search onto the session is
+      the remaining follow-up.
   (d) A beam that emits the EOS token is moved to a finished pool and ranked
       there against still-growing beams; growth stops once enough finished
       beams dominate or MaxLen is reached.
@@ -183,6 +185,68 @@ function DecodeBeamSearchAll(NN: TNNet; const Prompt: string;
   MaxLen: integer; BeamWidth: integer;
   LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
 
+// ---------------------------------------------------------------------------
+// STREAMED GENERATION: the KV-cache / SSM-state counterpart of neuraldatasets'
+// GenerateStringFromCasualNN, driven by a TNNetStreamingDecoder session.
+//
+// CONTRACT (what the CALLER does, once):
+//   1. Build a WIDTH-1 twin of the trained causal next-token net (same Build*
+//      function at input width 1 - every parameter shape in a streamable
+//      model is sequence-length independent).
+//   2. Twin.CopyWeights(TrainedNet) - exact layer-by-layer copy.
+//   3. Session := TNNetStreamingDecoder.Create(Twin, MaxTotalLen) (the cache
+//      budget must cover the longest sequence ever generated).
+// The routines below then NEVER re-encode the prefix: Reset() starts the
+// sequence, the prompt is prefilled token-at-a-time (width-1 StepForward,
+// each token at its absolute position), and every generated token costs ONE
+// width-1 forward - O(cache) per token for attention (one query row over the
+// cached K/V), O(1) per token for an SSM - instead of the full O(prefix)
+// re-encode GenerateStringFromCasualNN pays per token.
+//
+// EXACTNESS. Per the TNNetStreamingDecoder header: streamed decode equals the
+// full forward exactly when every layer is either per-token (embedding,
+// pointwise convs, TNNetDyT) or a collected streamable mixer (SDPA KV cache,
+// DiagonalSSM state, RoPE offsets). With that, greedy streamed generation is
+// token-for-token identical to a full-re-encode greedy loop.
+//
+// INPUT ENCODING. The width-1 net must take RAW TOKEN IDS (a (1,1,1) input
+// feeding a TNNetEmbedding) - the same csNeuralEncodingMethodInt convention
+// GenerateStringFromCasualNN defaults to. One-hot front-ends are not
+// supported here (v1).
+//
+// TOKEN-LEVEL CORE. Tokens[0..PromptLen-1] hold the prompt ids; the array is
+// grown as needed and generated ids are appended in place. Per the
+// established prefill-then-step idiom, tokens 0..PromptLen-2 are prefilled
+// and the LAST prompt token is the first decode step's input (its output row
+// predicts the first new token). Greedy argmax when Sampler is nil, otherwise
+// Sampler.GetTokenOnPixel over the step's single output row (the model should
+// end in a softmax when using stochastic samplers - same caveat as
+// GenerateStringFromCasualNN). Generation stops after MaxNewTokens tokens,
+// when the total length reaches MaxTotalLen, or when an end-of-sequence token
+// is produced (the "NextTokenInt < 2" rule used across the codebase; the EOS
+// token IS stored and counted, mirroring GenerateStringFromCasualNN).
+// Returns the new TOTAL token count (prompt + generated, EOS included).
+// The session must be width-1 (v1); an EArgumentException is raised
+// otherwise, and when PromptLen < 1.
+// Coded by Claude (AI).
+function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase = nil): integer;
+
+// STRING-LEVEL WRAPPER mirroring GenerateStringFromCasualNN's shape
+// (dict/tokenizer + prompt + optional sampler; TNeuralTokenizer is a
+// TStringListInt subclass with virtual Tokenize/DeTokenize, so both word-dict
+// and BPE-tokenizer callers pass the same parameter type). Tokenizes the
+// prompt with Dict.Tokenize, runs GenerateTokensStreamed and detokenizes the
+// continuation appended to InputString. For display the continuation stops at
+// the first special token (< 2), and words are joined with a space only when
+// Dict.TokenizerHasSeparator (word-level dicts) - byte-pair vocabularies
+// concatenate directly, matching GenerateStringFromCasualNN.
+// Coded by Claude (AI).
+function GenerateStringStreamed(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase = nil): string;
+
 implementation
 
 uses
@@ -304,6 +368,92 @@ end;
 function TNNetStreamingDecoder.GetRopeCount(): integer;
 begin
   Result := Length(FRopes);
+end;
+
+{ Streamed generation }
+
+function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase): integer;
+var
+  InV: TNNetVolume;
+  Pos, CapLen, NextTokenInt: integer;
+begin
+  if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'GenerateTokensStreamed: the session net must be a WIDTH-1 twin ' +
+      '(input SizeX=1); got SizeX=' +
+      IntToStr(Session.Net.GetFirstLayer().Output.SizeX) + '.');
+  if PromptLen < 1 then
+    raise EArgumentException.Create(
+      'GenerateTokensStreamed: PromptLen must be >= 1 (the last prompt ' +
+      'token is the first decode step''s input); got ' +
+      IntToStr(PromptLen) + '.');
+  // The hard length ceiling: prompt + MaxNewTokens, clipped by MaxTotalLen
+  // (which should not exceed the session's cache budget).
+  CapLen := Min(PromptLen + MaxNewTokens, MaxTotalLen);
+  if Length(Tokens) < CapLen then SetLength(Tokens, CapLen);
+  InV := TNNetVolume.Create(Session.Net.GetFirstLayer().Output);
+  try
+    InV.Fill(0);
+    Session.Reset();
+    // Prefill tokens 0..PromptLen-2 one at a time; the LAST prompt token is
+    // the first decode step's input (its output row predicts the first new
+    // token) - the established prefill-then-step idiom.
+    for Pos := 0 to PromptLen - 2 do
+    begin
+      InV.FData[0] := Tokens[Pos];
+      Session.StepForward(InV, Pos);
+    end;
+    Pos := PromptLen;
+    while Pos < CapLen do
+    begin
+      InV.FData[0] := Tokens[Pos - 1];
+      Session.StepForward(InV, Pos - 1);
+      // The step net is width-1, so the (only) output row is pixel (0,0).
+      if Assigned(Sampler)
+      then NextTokenInt := Sampler.GetTokenOnPixel(Session.Output(), 0, 0)
+      else NextTokenInt := Session.Output().GetClassOnPixel(0, 0);
+      Tokens[Pos] := NextTokenInt;
+      Inc(Pos);
+      // End-of-sequence: the codebase-wide "NextTokenInt < 2" rule (the EOS
+      // token is stored and counted, like GenerateStringFromCasualNN).
+      if NextTokenInt < 2 then Break;
+    end;
+    Result := Pos;
+  finally
+    InV.Free;
+  end;
+end;
+
+function GenerateStringStreamed(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase): string;
+var
+  Tokens: TNeuralIntegerArray;
+  PromptLen, TotalLen, Pos, VocabCount: integer;
+begin
+  Result := InputString;
+  VocabCount := Dict.GetVocabCount();
+  Dict.Tokenize(InputString, Tokens);
+  PromptLen := Length(Tokens);
+  if PromptLen < 1 then Exit; // nothing to condition on
+  TotalLen := GenerateTokensStreamed(Session, Tokens, PromptLen,
+    MaxNewTokens, MaxTotalLen, oSampler);
+  // Detokenize the continuation; stop at the first special token (< 2) for
+  // display (the TokensToText convention) and join with a space only for
+  // separator vocabularies (word dicts; BPE vocabularies concatenate).
+  for Pos := PromptLen to TotalLen - 1 do
+  begin
+    if Tokens[Pos] < 2 then Break;
+    if Tokens[Pos] < VocabCount then
+    begin
+      if Dict.TokenizerHasSeparator
+      then Result := Result + ' ' + Dict.DeTokenize(Tokens[Pos])
+      else Result := Result + Dict.DeTokenize(Tokens[Pos]);
+    end;
+  end;
+  SetLength(Tokens, 0);
 end;
 
 // Forward pass: encode (Prompt + Generated) and return the next-token
