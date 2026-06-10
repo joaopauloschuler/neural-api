@@ -42,7 +42,9 @@ THREE ACRONYMS USED THROUGHOUT:
            bakeoff-phase1.nn, then greedy-generates from fixed prompts two
            ways -- (a) full re-encode of the whole prefix per token (status
            quo) and (b) token-at-a-time through a weight-copied 1-token step
-           net with BeginIncrementalDecode + RoPE PositionOffset per step.
+           net driven by a TNNetStreamingDecoder session (neuraldecode), which
+           owns the BeginIncrementalDecode/ResetCache/ResetState/RoPE
+           PositionOffset bookkeeping for every streamed arm in this program.
            HARD ASSERT: both arms emit the SAME tokens. Prints ms/token.
   Phase 2: MTP-heads self-speculative decode. Trains the
            SAME trunk as phase 1 but with TNNet.AddMultiTokenPrediction
@@ -176,6 +178,7 @@ uses {$IFDEF UNIX} cthreads, BaseUnix, Unix, {$ENDIF}
   neuralthread,
   neuraldatasets,
   neuralab,
+  neuraldecode,
   neuraltokenizer,
   CustApp,
   Math,
@@ -278,38 +281,19 @@ type
     function RunningLoss(): TNeuralFloat;
   end;
 
-  // A weight-copied twin of the trained net at a short input width, with every
-  // per-head SDPA in KV-cache incremental-decode mode and every per-head RoPE
-  // layer collected so PositionOffset can be set to the ABSOLUTE position of
-  // the streamed window before each cached forward.
+  // A weight-copied twin of the trained net at a short input width, driven by
+  // a TNNetStreamingDecoder session. The session (Create-time layer scan)
+  // switches every per-head SDPA into KV-cache incremental-decode mode and
+  // every TNNetDiagonalSSM into the O(1)-per-step persisted-state path, and
+  // collects every TNNetRotaryEmbedding so StepForward can set PositionOffset
+  // to the ABSOLUTE position of the streamed window before each forward --
+  // so ONE record serves the attention-only (phases 1/4/5), SSM-only
+  // (phase 3) and dual-family hybrid (phases 6/7) twins alike. Width > 1 only
+  // for phase 5's speculative width-(K+1) verify windows.
   TStepNet = record
     Net: TNNet;
     Width: integer;
-    SDPAs: array of TNNetScaledDotProductAttention;
-    Ropes: array of TNNetRotaryEmbedding;
-    InV: TNNetVolume;
-  end;
-
-  // Phase 3 twin: a width-1 weight-copied SSM net whose TNNetDiagonalSSM
-  // layers run the O(1)-per-step incremental-decode path. Unlike the KV cache
-  // there is NO preallocation budget and NO per-token state growth: the
-  // entire past is a persisted Depth-long state vector h per SSM layer.
-  TSSMStepNet = record
-    Net: TNNet;
-    SSMs: array of TNNetDiagonalSSM;
-    InV: TNNetVolume;
-  end;
-
-  // Phase 6 twin: a width-1 weight-copied HYBRID net streaming BOTH mixer
-  // families at once -- the TNNetDiagonalSSM layers run the O(1)-per-step
-  // incremental state path while the MLA block's per-head SDPAs run the
-  // KV-cache path with TNNetRotaryEmbedding.PositionOffset set to the
-  // absolute position before every single-token forward.
-  THybridStepNet = record
-    Net: TNNet;
-    SSMs: array of TNNetDiagonalSSM;
-    SDPAs: array of TNNetScaledDotProductAttention;
-    Ropes: array of TNNetRotaryEmbedding;
+    Session: TNNetStreamingDecoder;
     InV: TNNetVolume;
   end;
 
@@ -336,8 +320,7 @@ type
     function BuildDraft(ContextLen: integer): TNNet;
     procedure TrainTimeBoxed(NN: TNNet; BudgetSec: double;
       SamplesPerEpoch: integer; LearningRate: TNeuralFloat);
-    procedure CreateStepNet(out Step: TStepNet; Width: integer; Source: TNNet;
-      UseMLA: boolean = false);
+    procedure CreateStepNet(out Step: TStepNet; Twin, Source: TNNet);
     procedure FreeStepNet(var Step: TStepNet);
     procedure CachedWindowForward(var Step: TStepNet; const Seq: TTokenBuf;
       StartPos, NReal: integer);
@@ -352,15 +335,7 @@ type
     procedure GreedySpecCached(var Step: TStepNet; Draft: TNNet;
       var Toks: TTokenBuf; PromptLen, MaxNew: integer; out OutLen: integer;
       out Ms: double; out TgtFwds, DraftFwds, Passes, Proposed, Accepted: integer);
-    procedure CreateSSMStepNet(out Step: TSSMStepNet; Source: TNNet);
-    procedure FreeSSMStepNet(var Step: TSSMStepNet);
-    procedure GreedySSMCached(var Step: TSSMStepNet; var Toks: TTokenBuf;
-      PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
-      out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
-    procedure CreateHybridStepNet(out Step: THybridStepNet; Source: TNNet;
-      Grouped: boolean = false);
-    procedure FreeHybridStepNet(var Step: THybridStepNet);
-    procedure GreedyHybridCached(var Step: THybridStepNet; var Toks: TTokenBuf;
+    procedure GreedyStreamCached(var Step: TStepNet; var Toks: TTokenBuf;
       PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
       out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
     function CountRepeatedTrigrams(const Toks: TTokenBuf;
@@ -872,90 +847,43 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Step-net plumbing (KV-cache incremental decode; pattern from
-// examples/SpeculativeDecoding extended with the RoPE PositionOffset contract).
+// Step-net plumbing. All cache/state bookkeeping (BeginIncrementalDecode,
+// ResetCache/ResetState, RoPE PositionOffset, TruncateCache) goes through one
+// TNNetStreamingDecoder session per twin; the example only builds the twin at
+// the short width and copies the weights.
 // ---------------------------------------------------------------------------
-procedure TDecodeBakeoff.CreateStepNet(out Step: TStepNet; Width: integer;
-  Source: TNNet; UseMLA: boolean = false);
-var
-  i, n: integer;
+// Twin is an already-built short-width net from the same Build* function as
+// Source, so the layer-by-layer weight copy is exact (all parameter shapes
+// are sequence-length independent). The session's Create scans the twin once
+// and switches every SDPA (KV cache) and DiagonalSSM (persisted state) into
+// incremental-decode mode; csContextLen + Width covers the worst transient
+// cache load (full context committed + one whole window).
+procedure TDecodeBakeoff.CreateStepNet(out Step: TStepNet; Twin, Source: TNNet);
 begin
-  Step.Width := Width;
-  // UseMLA (phase 4) swaps the twin's builder; default is phase 1/5's model.
-  if UseMLA then
-    Step.Net := BuildModelMLA(Width)
-  else
-    Step.Net := BuildModel(Width);
-  // Same builder, so the layer-by-layer weight copy is exact (all parameter
-  // shapes are sequence-length independent).
+  Step.Net := Twin;
+  Step.Width := Twin.GetFirstLayer().Output.SizeX;
   Step.Net.CopyWeights(Source);
-  SetLength(Step.SDPAs, 0);
-  SetLength(Step.Ropes, 0);
-  for i := 0 to Step.Net.Layers.Count - 1 do
-  begin
-    if Step.Net.Layers[i] is TNNetScaledDotProductAttention then
-    begin
-      n := Length(Step.SDPAs);
-      SetLength(Step.SDPAs, n + 1);
-      Step.SDPAs[n] := TNNetScaledDotProductAttention(Step.Net.Layers[i]);
-    end;
-    if Step.Net.Layers[i] is TNNetRotaryEmbedding then
-    begin
-      n := Length(Step.Ropes);
-      SetLength(Step.Ropes, n + 1);
-      Step.Ropes[n] := TNNetRotaryEmbedding(Step.Net.Layers[i]);
-    end;
-  end;
-  // Worst transient cache load: full context committed + one whole window.
-  for i := 0 to High(Step.SDPAs) do
-    Step.SDPAs[i].BeginIncrementalDecode(csContextLen + Width);
-  Step.InV := TNNetVolume.Create(Width, 1, 1);
+  Step.Session := TNNetStreamingDecoder.Create(Step.Net,
+    csContextLen + Step.Width);
+  Step.InV := TNNetVolume.Create(Step.Width, 1, 1);
 end;
 
 procedure TDecodeBakeoff.FreeStepNet(var Step: TStepNet);
 begin
+  Step.Session.Free; // switches the layers out of incremental mode
   Step.InV.Free;
   Step.Net.Free;
-  SetLength(Step.SDPAs, 0);
-  SetLength(Step.Ropes, 0);
 end;
 
-// Phase 3 twin: a width-1 weight-copied SSM net with every TNNetDiagonalSSM
-// switched into incremental-decode mode. No RoPE offsets to manage (the model
-// has no positional layers) and no preallocation budget: the persisted state
-// per SSM layer is a Depth-long vector regardless of how far decoding goes.
-procedure TDecodeBakeoff.CreateSSMStepNet(out Step: TSSMStepNet; Source: TNNet);
-var
-  i, n: integer;
-begin
-  Step.Net := BuildModelSSM(1);
-  Step.Net.CopyWeights(Source);
-  SetLength(Step.SSMs, 0);
-  for i := 0 to Step.Net.Layers.Count - 1 do
-    if Step.Net.Layers[i] is TNNetDiagonalSSM then
-    begin
-      n := Length(Step.SSMs);
-      SetLength(Step.SSMs, n + 1);
-      Step.SSMs[n] := TNNetDiagonalSSM(Step.Net.Layers[i]);
-      Step.SSMs[n].BeginIncrementalDecode();
-    end;
-  Step.InV := TNNetVolume.Create(1, 1, 1);
-end;
-
-procedure TDecodeBakeoff.FreeSSMStepNet(var Step: TSSMStepNet);
-begin
-  Step.InV.Free;
-  Step.Net.Free;
-  SetLength(Step.SSMs, 0);
-end;
-
-// Phase 3 incremental arm: ResetState (h := 0) starts the sequence, the
-// prompt is prefilled token-at-a-time (each forward folds one token into the
-// persisted state), then one length-1 forward per generated token. Each
-// decode step is additionally timed into a prefix-length bucket (BMs/BCnt) to
-// show the O(1)-in-prefix flatness: unlike a KV cache, the step never touches
-// anything whose size grows with the prefix.
-procedure TDecodeBakeoff.GreedySSMCached(var Step: TSSMStepNet;
+// Streamed greedy arm shared by phase 3 (SSM-only twin) and phases 6/7
+// (dual-family hybrid twin): Session.Reset starts the sequence (h := 0 on
+// every SSM, empty KV cache on every SDPA), the prompt is prefilled
+// token-at-a-time, then one length-1 StepForward per generated token (which
+// also shifts any rope layers to the token's ABSOLUTE position; the SSMs need
+// no positions -- their state carries order). Each decode step is bucket-
+// timed (BMs/BCnt) to show the O(1)-in-prefix (near-)flatness: the SSM state
+// never grows, and at most ONE MLA block's KV cache grows per token.
+procedure TDecodeBakeoff.GreedyStreamCached(var Step: TStepNet;
   var Toks: TTokenBuf; PromptLen, MaxNew: integer; out OutLen: integer;
   out Ms: double; out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
 var
@@ -964,21 +892,19 @@ var
 begin
   Fwds := 0;
   T0 := NowMs();
-  for t := 0 to High(Step.SSMs) do Step.SSMs[t].ResetState();
+  Step.Session.Reset();
   // Prefill tokens 0..PromptLen-2; the LAST prompt token is the first decode
   // step's input (its output row predicts the first new token).
   for t := 0 to PromptLen - 2 do
   begin
-    Step.InV.FData[0] := Toks[t];
-    Step.Net.Compute(Step.InV);
+    CachedWindowForward(Step, Toks, t, 1);
     Inc(Fwds);
   end;
   OutLen := PromptLen;
   while (OutLen - PromptLen < MaxNew) and (OutLen < csContextLen) do
   begin
-    Step.InV.FData[0] := Toks[OutLen - 1];
     S0 := NowMs();
-    Step.Net.Compute(Step.InV);
+    CachedWindowForward(Step, Toks, OutLen - 1, 1);
     dt := NowMs() - S0;
     Inc(Fwds);
     // Bucket by the prefix length this step conditions on (= OutLen).
@@ -987,111 +913,7 @@ begin
     else b := 2;
     BMs[b] := BMs[b] + dt;
     Inc(BCnt[b]);
-    Toks[OutLen] := Step.Net.GetLastLayer().Output.GetClassOnPixel(0, 0);
-    Inc(OutLen);
-  end;
-  Ms := NowMs() - T0;
-end;
-
-// Phase 6 twin: a width-1 weight-copied hybrid net streaming BOTH mixer
-// families. The TNNetDiagonalSSM layers persist a Depth-long state vector
-// each (constant, O(1) per step) while the MLA block's per-head SDPAs run the
-// KV cache (grows per token, ONE block's worth only) with the rope layers'
-// PositionOffset advanced to the absolute position before each forward.
-procedure TDecodeBakeoff.CreateHybridStepNet(out Step: THybridStepNet;
-  Source: TNNet; Grouped: boolean = false);
-var
-  i, n: integer;
-begin
-  // Grouped (phase 7) swaps the twin's builder; the layer scan below is
-  // class-based, so the SSM/SDPA/RoPE collection is unchanged.
-  if Grouped then
-    Step.Net := BuildModelHybridGrouped(1)
-  else
-    Step.Net := BuildModelHybrid(1);
-  Step.Net.CopyWeights(Source);
-  SetLength(Step.SSMs, 0);
-  SetLength(Step.SDPAs, 0);
-  SetLength(Step.Ropes, 0);
-  for i := 0 to Step.Net.Layers.Count - 1 do
-  begin
-    if Step.Net.Layers[i] is TNNetDiagonalSSM then
-    begin
-      n := Length(Step.SSMs);
-      SetLength(Step.SSMs, n + 1);
-      Step.SSMs[n] := TNNetDiagonalSSM(Step.Net.Layers[i]);
-      Step.SSMs[n].BeginIncrementalDecode();
-    end;
-    if Step.Net.Layers[i] is TNNetScaledDotProductAttention then
-    begin
-      n := Length(Step.SDPAs);
-      SetLength(Step.SDPAs, n + 1);
-      Step.SDPAs[n] := TNNetScaledDotProductAttention(Step.Net.Layers[i]);
-      Step.SDPAs[n].BeginIncrementalDecode(csContextLen + 1);
-    end;
-    if Step.Net.Layers[i] is TNNetRotaryEmbedding then
-    begin
-      n := Length(Step.Ropes);
-      SetLength(Step.Ropes, n + 1);
-      Step.Ropes[n] := TNNetRotaryEmbedding(Step.Net.Layers[i]);
-    end;
-  end;
-  Step.InV := TNNetVolume.Create(1, 1, 1);
-end;
-
-procedure TDecodeBakeoff.FreeHybridStepNet(var Step: THybridStepNet);
-begin
-  Step.InV.Free;
-  Step.Net.Free;
-  SetLength(Step.SSMs, 0);
-  SetLength(Step.SDPAs, 0);
-  SetLength(Step.Ropes, 0);
-end;
-
-// Phase 6 streamed arm: ONE single-token forward per position drives BOTH
-// state machineries at once -- ResetState/ResetCache start the sequence, the
-// prompt is prefilled token-at-a-time, then one length-1 forward per new
-// token. Before every forward the rope layers are shifted to the token's
-// ABSOLUTE position (the SSMs need no positions: their state carries order).
-// Decode steps are bucket-timed like phase 3 to show near-flatness (the only
-// per-step growth left is ONE MLA block's KV cache).
-procedure TDecodeBakeoff.GreedyHybridCached(var Step: THybridStepNet;
-  var Toks: TTokenBuf; PromptLen, MaxNew: integer; out OutLen: integer;
-  out Ms: double; out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
-var
-  t, b: integer;
-  T0, S0, dt: double;
-begin
-  Fwds := 0;
-  T0 := NowMs();
-  for t := 0 to High(Step.SSMs) do Step.SSMs[t].ResetState();
-  for t := 0 to High(Step.SDPAs) do Step.SDPAs[t].ResetCache();
-  // Prefill tokens 0..PromptLen-2; the LAST prompt token is the first decode
-  // step's input (its output row predicts the first new token).
-  for t := 0 to PromptLen - 2 do
-  begin
-    Step.InV.FData[0] := Toks[t];
-    for b := 0 to High(Step.Ropes) do Step.Ropes[b].PositionOffset := t;
-    Step.Net.Compute(Step.InV);
-    Inc(Fwds);
-  end;
-  OutLen := PromptLen;
-  while (OutLen - PromptLen < MaxNew) and (OutLen < csContextLen) do
-  begin
-    Step.InV.FData[0] := Toks[OutLen - 1];
-    for b := 0 to High(Step.Ropes) do
-      Step.Ropes[b].PositionOffset := OutLen - 1;
-    S0 := NowMs();
-    Step.Net.Compute(Step.InV);
-    dt := NowMs() - S0;
-    Inc(Fwds);
-    // Bucket by the prefix length this step conditions on (= OutLen).
-    if OutLen < 16 then b := 0
-    else if OutLen < 32 then b := 1
-    else b := 2;
-    BMs[b] := BMs[b] + dt;
-    Inc(BCnt[b]);
-    Toks[OutLen] := Step.Net.GetLastLayer().Output.GetClassOnPixel(0, 0);
+    Toks[OutLen] := Step.Session.Output().GetClassOnPixel(0, 0);
     Inc(OutLen);
   end;
   Ms := NowMs() - T0;
@@ -1116,11 +938,12 @@ begin
       end;
 end;
 
-// One cached window forward: tokens Seq[StartPos..StartPos+NReal-1] fill the
-// window (zero padding AFTER every real token, so the cached causal path never
-// lets a real query see a pad; pad K/V is discarded by the caller's next
-// TruncateCache). Every RoPE layer is shifted so the window is rotated at its
-// ABSOLUTE positions. Output row r is the softmax at position StartPos+r.
+// One streamed window forward: tokens Seq[StartPos..StartPos+NReal-1] fill
+// the window (zero padding AFTER every real token, so the cached causal path
+// never lets a real query see a pad; pad K/V is discarded by the caller's
+// next TruncateTo), then Session.StepForward computes it with every RoPE
+// layer shifted so the window is rotated at its ABSOLUTE positions. Output
+// row r is the softmax at position StartPos+r.
 procedure TDecodeBakeoff.CachedWindowForward(var Step: TStepNet;
   const Seq: TTokenBuf; StartPos, NReal: integer);
 var
@@ -1128,8 +951,7 @@ var
 begin
   Step.InV.Fill(0);
   for t := 0 to NReal - 1 do Step.InV.FData[t] := Seq[StartPos + t];
-  for t := 0 to High(Step.Ropes) do Step.Ropes[t].PositionOffset := StartPos;
-  Step.Net.Compute(Step.InV);
+  Step.Session.StepForward(Step.InV, StartPos);
 end;
 
 // ---------------------------------------------------------------------------
@@ -1215,7 +1037,7 @@ var
 begin
   Fwds := 0;
   T0 := NowMs();
-  for t := 0 to High(Step.SDPAs) do Step.SDPAs[t].ResetCache();
+  Step.Session.Reset();
   // Prefill tokens 0..PromptLen-2; the LAST prompt token is the first decode
   // step's input (its output row predicts the first new token).
   for t := 0 to PromptLen - 2 do
@@ -1228,7 +1050,7 @@ begin
   begin
     CachedWindowForward(Step, Toks, OutLen - 1, 1);
     Inc(Fwds);
-    Toks[OutLen] := Step.Net.GetLastLayer().Output.GetClassOnPixel(0, 0);
+    Toks[OutLen] := Step.Session.Output().GetClassOnPixel(0, 0);
     Inc(OutLen);
   end;
   Ms := NowMs() - T0;
@@ -1254,7 +1076,7 @@ procedure TDecodeBakeoff.GreedySpecCached(var Step: TStepNet; Draft: TNNet;
 var
   DraftIn: TNNetVolume;
   DraftToks: array[0..csSpecK - 1] of integer;
-  i, t, nP, tgt, done, w: integer;
+  i, nP, tgt, done, w: integer;
   rejected: boolean;
   T0: double;
 begin
@@ -1265,7 +1087,7 @@ begin
     // PREFILL once: cache the K/V of tokens 0..PromptLen-2 in short windows
     // (the last committed token is always re-fed as the next window's first
     // query, so its softmax row is fresh each pass).
-    for t := 0 to High(Step.SDPAs) do Step.SDPAs[t].ResetCache();
+    Step.Session.Reset();
     done := 0;
     while done < PromptLen - 1 do
     begin
@@ -1273,7 +1095,7 @@ begin
       CachedWindowForward(Step, Toks, done, w);
       Inc(TgtFwds);
       done := done + w;
-      for t := 0 to High(Step.SDPAs) do Step.SDPAs[t].TruncateCache(done);
+      Step.Session.TruncateTo(done);
     end;
 
     OutLen := PromptLen;
@@ -1308,7 +1130,7 @@ begin
       i := 0;
       while i < nP do
       begin
-        tgt := Step.Net.GetLastLayer().Output.GetClassOnPixel(i, 0);
+        tgt := Step.Session.Output().GetClassOnPixel(i, 0);
         if tgt = DraftToks[i] then
         begin
           Inc(Accepted);
@@ -1329,7 +1151,7 @@ begin
         if OutLen < csContextLen then
         begin
           // bonus token: free from row nP of the same cached forward.
-          Toks[OutLen] := Step.Net.GetLastLayer().Output.GetClassOnPixel(nP, 0);
+          Toks[OutLen] := Step.Session.Output().GetClassOnPixel(nP, 0);
           Inc(OutLen);
         end;
       end
@@ -1339,7 +1161,7 @@ begin
       // 4. ROLLBACK: the caches transiently hold the whole window (pads and
       //    rejected drafts included). Keep exactly the committed prefix minus
       //    its last token (re-fed as the next window's first query).
-      for t := 0 to High(Step.SDPAs) do Step.SDPAs[t].TruncateCache(OutLen - 1);
+      Step.Session.TruncateTo(OutLen - 1);
     end;
     // A fully-accepted final pass may overshoot MaxNew by up to K; trim so the
     // exactness comparison and ms/token are over exactly MaxNew tokens.
@@ -1384,7 +1206,7 @@ begin
   Trained.SaveToFile(csCheckpointFile);
   WriteLn('Checkpoint saved: ', csCheckpointFile);
 
-  CreateStepNet(Step, {Width=}1, Trained);
+  CreateStepNet(Step, BuildModel(1), Trained);
   try
     WriteLn;
     WriteLn('Greedy decode showdown (', csGenTokens, ' tokens per prompt):');
@@ -1725,7 +1547,7 @@ end;
 procedure TDecodeBakeoff.RunPhase3;
 var
   Trained: TNNet;
-  Step: TSSMStepNet;
+  Step: TStepNet;
   FullToks, CachedToks: TTokenBuf;
   PromptLen, FullLen, CachedLen: integer;
   FullMs, CachedMs: double;
@@ -1754,7 +1576,7 @@ begin
   end;
   TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.0005);
 
-  CreateSSMStepNet(Step, Trained);
+  CreateStepNet(Step, BuildModelSSM(1), Trained);
   try
     for b := 0 to 2 do
     begin
@@ -1770,7 +1592,7 @@ begin
 
       GreedyFull(Trained, FullToks, PromptLen, csGenTokens,
         FullLen, FullMs, FullFwds);
-      GreedySSMCached(Step, CachedToks, PromptLen, csGenTokens,
+      GreedyStreamCached(Step, CachedToks, PromptLen, csGenTokens,
         CachedLen, CachedMs, CachedFwds, BMs, BCnt);
 
       // HARD ASSERT: token-exact equality between the two arms.
@@ -1813,7 +1635,7 @@ begin
     WriteLn('Phase 3: PASS (O(1)-per-step SSM decode is token-exact). [t=',
       ElapsedSec():0:1, 's]');
   finally
-    FreeSSMStepNet(Step);
+    FreeStepNet(Step);
     Trained.Free;
   end;
 end;
@@ -1866,7 +1688,7 @@ begin
   // comparable loss drop (same reasoning as phase 2).
   TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.001);
 
-  CreateStepNet(Step, {Width=}1, Trained, {UseMLA=}true);
+  CreateStepNet(Step, BuildModelMLA(1), Trained);
   try
     WriteLn;
     WriteLn('Greedy decode showdown (', csGenTokens, ' tokens per prompt):');
@@ -1991,8 +1813,8 @@ begin
   DraftStep := BuildDraft(2);
   DraftStep.CopyWeights(Draft);
 
-  CreateStepNet(Step1, {Width=}1, Target);          // plain-cached arm
-  CreateStepNet(StepK, {Width=}csSpecK + 1, Target); // speculative verify arm
+  CreateStepNet(Step1, BuildModel(1), Target);            // plain-cached arm
+  CreateStepNet(StepK, BuildModel(csSpecK + 1), Target);  // speculative verify arm
   try
     SumNew := 0; SumPasses := 0; SumProposed := 0; SumAccepted := 0;
     SumFullMs := 0; SumCachedMs := 0; SumSpecMs := 0;
@@ -2093,7 +1915,7 @@ end;
 procedure TDecodeBakeoff.RunPhase6;
 var
   Trained: TNNet;
-  Step: THybridStepNet;
+  Step: TStepNet;
   FullToks, CachedToks: TTokenBuf;
   PromptLen, FullLen, CachedLen: integer;
   FullMs, CachedMs: double;
@@ -2133,7 +1955,7 @@ begin
   // the box; the higher rate recovers a comparable loss drop.
   TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.001);
 
-  CreateHybridStepNet(Step, Trained);
+  CreateStepNet(Step, BuildModelHybrid(1), Trained);
   try
     for b := 0 to 2 do
     begin
@@ -2151,7 +1973,7 @@ begin
 
       GreedyFull(Trained, FullToks, PromptLen, csGenTokens,
         FullLen, FullMs, FullFwds);
-      GreedyHybridCached(Step, CachedToks, PromptLen, csGenTokens,
+      GreedyStreamCached(Step, CachedToks, PromptLen, csGenTokens,
         CachedLen, CachedMs, CachedFwds, BMs, BCnt);
 
       // HARD ASSERT: token-exact equality between the two arms.
@@ -2265,7 +2087,7 @@ begin
     WriteLn('Phase 6: PASS (dual-family streamed decode is token-exact). [t=',
       ElapsedSec():0:1, 's]');
   finally
-    FreeHybridStepNet(Step);
+    FreeStepNet(Step);
     Trained.Free;
   end;
 end;
@@ -2281,7 +2103,7 @@ end;
 procedure TDecodeBakeoff.RunPhase7;
 var
   Trained, DenseRef: TNNet;
-  Step: THybridStepNet;
+  Step: TStepNet;
   FullToks, CachedToks: TTokenBuf;
   PromptLen, FullLen, CachedLen: integer;
   FullMs, CachedMs: double;
@@ -2326,7 +2148,7 @@ begin
   // swap (the grouped step is cheaper, so more examples fit in the same box).
   TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.001);
 
-  CreateHybridStepNet(Step, Trained, {Grouped=}true);
+  CreateStepNet(Step, BuildModelHybridGrouped(1), Trained);
   try
     for b := 0 to 2 do
     begin
@@ -2344,7 +2166,7 @@ begin
 
       GreedyFull(Trained, FullToks, PromptLen, csGenTokens,
         FullLen, FullMs, FullFwds);
-      GreedyHybridCached(Step, CachedToks, PromptLen, csGenTokens,
+      GreedyStreamCached(Step, CachedToks, PromptLen, csGenTokens,
         CachedLen, CachedMs, CachedFwds, BMs, BCnt);
 
       // HARD ASSERT: token-exact equality between the two arms (this is what
@@ -2434,7 +2256,7 @@ begin
     WriteLn('Phase 7: PASS (grouped dual-family streamed decode is token-exact). [t=',
       ElapsedSec():0:1, 's]');
   finally
-    FreeHybridStepNet(Step);
+    FreeStepNet(Step);
     Trained.Free;
   end;
 end;

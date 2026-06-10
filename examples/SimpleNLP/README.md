@@ -236,7 +236,11 @@ dual-family streamed decode applies unchanged, and the hard assert doubles as pr
 that grouped layers stream token-exactly. Its verdict compares weight count,
 convergence and decode cost against phase 6's dense references.
 All implemented phases HARD-ASSERT token-exact equality of all
-decode arms.
+decode arms. Every streamed arm drives its weight-copied short-width twin
+through a `TNNetStreamingDecoder` session (`neural/neuraldecode.pas`), which
+owns the incremental-mode switching, `ResetCache`/`ResetState`, per-forward
+RoPE `PositionOffset`, and the speculative `TruncateTo` rollback — one session
+class covers the attention-only, SSM-only and dual-family hybrid twins alike.
 
 Dataset setup is the same as above (run from this directory):
 ```
