@@ -4,7 +4,7 @@ DecodeFeaturesBakeoff: benchmarks the recently-landed DECODE-EFFICIENCY
 features on a REAL tokenized NLP workload (TinyStories, 3k-token vocabulary),
 one phase per feature, selected by CLI argument:
 
-    ./DecodeFeaturesBakeoff --phase N        (N in 1..5)
+    ./DecodeFeaturesBakeoff --phase N        (N in 1..6)
 
 Each phase is self-budgeted to finish within 270 seconds of wall clock:
 training is time-boxed INSIDE the program (TNeuralDataLoadingFit.ShouldQuit
@@ -65,6 +65,26 @@ of the budget for the decode benchmark itself.
            output == plain greedy output. Prints accept rate, tokens/pass,
            target-forwards/token and a three-way ms/token comparison
            (plain-full vs plain-cached vs speculative-cached).
+  Phase 6: the HYBRID configuration phases 1-5 pointed to as ideal for
+           constrained CPU hardware: a DiagonalSSM-dominant trunk with a
+           single MLA block. Three blocks -- SSM, MLA, SSM (attention in the
+           MIDDLE, the Jamba/Zamba interleaving default: the first recurrent
+           block gives the lone attention layer globally-mixed inputs, and a
+           recurrence -- not a cache-hungry attention -- closes the trunk),
+           each keeping the same [DyT -> mixer -> residual] + [DyT -> SwiGLU
+           FFN -> residual] skeleton as phases 3/4 so comparisons stay fair.
+           Token-only embedding, NO absolute positions: order enters through
+           the SSM recurrences plus the MLA decoupled-rope slice. The decode
+           benchmark is the novel part -- no other example streams BOTH mixer
+           families in one loop: greedy full re-encode per token vs ONE
+           streamed step per token driving SIMULTANEOUSLY the DiagonalSSM
+           layers' O(1) incremental state AND the MLA heads' SDPA caches +
+           rope PositionOffset. HARD ASSERT: both arms emit the SAME tokens.
+           Prints ms/token both ways, per-prefix-bucket flatness, the cache
+           bytes/token table (constant SSM state + ONE MLA block growing) and
+           a three-assumption verdict (convergence vs the pure-SSM/pure-MLA/
+           transformer references, sample-looping, decode cost). NO
+           speculation: plain greedy is the recommended config.
 
 MODEL. All phases share one config (constants below): RoPE positional scheme
 everywhere -- TNNetEmbedding (token-only) + UseRoPE=true in
@@ -136,6 +156,9 @@ const
   csTrainCapSecMTP   = 195;  // phase 2: MTP decode bench is cheap, train more
   csTrainCapSecSSM   = 195;  // phase 3: SSM decode bench is the cheapest
   csTrainCapSecMLA   = 185;  // phase 4: decode bench cost mirrors phase 1
+  csTrainCapSecHyb   = 190;  // phase 6: hybrid bench is cheap (streamed arm
+                             // O(1)-ish), but the 3-block full re-encode arm
+                             // costs more than phase 3's 2 blocks
   csDraftCapSec      = 160;  // phase 5: draft training cap
   // ---- decode benchmark ----
   csGenTokens        = 40;   // tokens generated per prompt per arm
@@ -146,9 +169,13 @@ const
   csDraftFFNDim      = 256;
   // ---- phase 2 MTP heads ----
   csNumFuture        = 3;    // t+1 (committed) + t+2,t+3 (the built-in draft)
-  // ---- phase 4 MLA ----
+  // ---- phase 4 MLA (phase 6 reuses both) ----
   csLatentDim        = 32;   // c_KV width; << per-token MHA K+V = 2*d_model = 256
   csRopeDim          = 8;    // decoupled-RoPE slice width (even, as RoPE requires)
+  // ---- phase 6 reference losses (measured by phases 1/3/4, see README) ----
+  csRefLossTransformer = 2.87; // phase 1, loss 5.02 -> 2.87
+  csRefLossSSM         = 2.34; // phase 3, loss 4.47 -> 2.34
+  csRefLossMLA         = 2.53; // phase 4, loss 3.90 -> 2.53
 
 const
   csPrompts: array[0..1] of string = ('one day', 'once upon a time');
@@ -189,6 +216,14 @@ end;
 type
   TTokenBuf = array[0..csContextLen - 1] of integer;
 
+  // TNeuralDataLoadingFit twin that only EXPOSES the protected running-loss
+  // accumulators (no behavior change for phases 1-5; phase 6's verdict needs
+  // the in-program loss trajectory instead of grepping the training log).
+  TBakeoffFit = class(TNeuralDataLoadingFit)
+  public
+    function RunningLoss(): TNeuralFloat;
+  end;
+
   // A weight-copied twin of the trained net at a short input width, with every
   // per-head SDPA in KV-cache incremental-decode mode and every per-head RoPE
   // layer collected so PositionOffset can be set to the ABSOLUTE position of
@@ -211,7 +246,20 @@ type
     InV: TNNetVolume;
   end;
 
-  // Per-prefix-length-bucket step timing (phase 3 flatness evidence):
+  // Phase 6 twin: a width-1 weight-copied HYBRID net streaming BOTH mixer
+  // families at once -- the TNNetDiagonalSSM layers run the O(1)-per-step
+  // incremental state path while the MLA block's per-head SDPAs run the
+  // KV-cache path with TNNetRotaryEmbedding.PositionOffset set to the
+  // absolute position before every single-token forward.
+  THybridStepNet = record
+    Net: TNNet;
+    SSMs: array of TNNetDiagonalSSM;
+    SDPAs: array of TNNetScaledDotProductAttention;
+    Ropes: array of TNNetRotaryEmbedding;
+    InV: TNNetVolume;
+  end;
+
+  // Per-prefix-length-bucket step timing (phase 3/6 flatness evidence):
   // bucket 0 = prefix < 16 tokens, 1 = 16..31, 2 = >= 32.
   TBucketMs  = array[0..2] of double;
   TBucketCnt = array[0..2] of integer;
@@ -223,9 +271,10 @@ type
     FDatasetSize: integer;
     FDictionary: TNeuralTokenizer;
     FNN: TNNet;                       // the net currently being trained
-    NFit: TNeuralDataLoadingFit;      // the fit currently running
+    NFit: TBakeoffFit;                // the fit currently running
     FTrainDeadlineMs: double;         // OnAfterStep raises ShouldQuit past this
     FNumFuture: integer;              // >1 only in phase 2 (MTP target layout)
+    FFirstLoss, FLastLoss: double;    // running-loss trajectory (phase 6 verdict)
     procedure DoRun; override;
     // shared helpers
     procedure RequireDatasetFiles;
@@ -259,6 +308,15 @@ type
       out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
     // phase 4 (Multi-head Latent Attention with the decoupled-RoPE slice)
     function BuildModelMLA(ContextLen: integer): TNNet;
+    // phase 6 (SSM-dominant hybrid with one MLA block; dual-family streaming)
+    function BuildModelHybrid(ContextLen: integer): TNNet;
+    procedure CreateHybridStepNet(out Step: THybridStepNet; Source: TNNet);
+    procedure FreeHybridStepNet(var Step: THybridStepNet);
+    procedure GreedyHybridCached(var Step: THybridStepNet; var Toks: TTokenBuf;
+      PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
+      out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
+    function CountRepeatedTrigrams(const Toks: TTokenBuf;
+      StartIdx, Len: integer): integer;
     // phase 2 (MTP heads as built-in draft; full re-encode arms)
     function BuildModelMTP(ContextLen: integer): TNNet;
     function MTPHeadArgmax(NN: TNNet; Row, Head: integer): integer;
@@ -275,6 +333,7 @@ type
     procedure RunPhase3;
     procedure RunPhase4;
     procedure RunPhase5;
+    procedure RunPhase6;
   public
     procedure OnAfterStep(Sender: TObject);
     procedure OnAfterEpoch(Sender: TObject);
@@ -460,13 +519,86 @@ begin
   ]);
 end;
 
+// Phase 6 model: the SSM-dominant hybrid phases 1-5 pointed to. Three blocks
+// -- DiagonalSSM, MLA, DiagonalSSM (attention in the MIDDLE, the Jamba/Zamba
+// interleaving default: block 1's recurrence hands the lone attention layer
+// globally-mixed inputs, and the trunk closes with a cheap recurrence instead
+// of a second cache-growing attention). Each block is BYTE-IDENTICAL in
+// skeleton to its phase-3 (SSM) / phase-4 (MLA) counterpart -- same DyT
+// pre-norm, same in/out projections around the SSM, same
+// AddMultiHeadLatentAttention(LatentDim=32, RopeDim=8), same SwiGLU FFN --
+// so the comparison isolates the block MIX, not the block design. Token-only
+// embedding, NO absolute positions: order enters through the two recurrences
+// plus the MLA decoupled-rope slice. Every layer is per-token, recurrent-with-
+// Begin/ResetState, or KV-cacheable, so dual-family streamed decode is exact.
+function TDecodeBakeoff.BuildModelHybrid(ContextLen: integer): TNNet;
+var
+  B: integer;
+  BranchInput: TNNetLayer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02));
+  for B := 1 to 3 do
+  begin
+    BranchInput := Result.GetLastLayer();
+    Result.AddLayer(TNNetDyT.Create());
+    if B = 2 then
+    begin
+      // ---- block 2 mixer: x := x + MLA(DyT(x)) (phase-4 sub-block) ----
+      Result.AddMultiHeadLatentAttention(csEmbedDim, csHeads, csLatentDim,
+        {CausalMask=}true, {RopeDim=}csRopeDim);
+    end
+    else
+    begin
+      // ---- blocks 1/3 mixer: x := x + OutProj(SSM(InProj(DyT(x)))) ----
+      Result.AddLayer(TNNetPointwiseConvLinear.Create(csEmbedDim));
+      Result.AddLayer(TNNetDiagonalSSM.Create());
+      Result.AddLayer(TNNetPointwiseConvLinear.Create(csEmbedDim));
+    end;
+    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), BranchInput]));
+    // ---- FFN sub-block: x := x + FFN(DyT(x)) (same in every phase) ----
+    BranchInput := Result.GetLastLayer();
+    Result.AddLayer(TNNetDyT.Create());
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(2 * csFFNDim));
+    Result.AddLayer(TNNetSwiGLU.Create());
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(csEmbedDim));
+    Result.AddLayer(TNNetSum.Create([Result.GetLastLayer(), BranchInput]));
+  end;
+  Result.AddLayer([
+    TNNetPointwiseConvLinear.Create(csEmbedDim),
+    TNNetPointwiseConvLinear.Create(csModelVocabSize),
+    TNNetPointwiseSoftMax.Create(1)
+  ]);
+end;
+
 // ---------------------------------------------------------------------------
 // Time-boxed training. TNeuralDataLoadingFit exposes a public ShouldQuit flag
 // that the training loop checks after every batch (and before validation /
 // test), so a clean mid-fit abort is just "raise it from OnAfterStep".
 // ---------------------------------------------------------------------------
-procedure TDecodeBakeoff.OnAfterStep(Sender: TObject);
+// Mean training loss accumulated so far in the CURRENT epoch (-1 before the
+// first batch lands). Read-only view of protected accumulators.
+function TBakeoffFit.RunningLoss(): TNeuralFloat;
 begin
+  if FGlobalTotal > 0 then
+    Result := FGlobalTotalLoss / FGlobalTotal
+  else
+    Result := -1;
+end;
+
+procedure TDecodeBakeoff.OnAfterStep(Sender: TObject);
+var
+  L: TNeuralFloat;
+begin
+  // Track the loss trajectory (first observed batch loss -> latest running
+  // mean) for phase 6's convergence verdict; harmless for the other phases.
+  L := NFit.RunningLoss();
+  if L > 0 then
+  begin
+    if FFirstLoss < 0 then FFirstLoss := L;
+    FLastLoss := L;
+  end;
   if NowMs() > FTrainDeadlineMs then
     NFit.ShouldQuit := true;
 end;
@@ -501,8 +633,10 @@ begin
   WriteLn('Training time box: ', BudgetSec:0:0, 's  (', SamplesPerEpoch,
     ' samples/epoch, batch ', csBatchSize, ', Adam lr=', LearningRate:0:5, ')');
   FNN := NN; // GetTrainingPair sizes its volumes from FNN
+  FFirstLoss := -1;
+  FLastLoss := -1;
   Opt := TNeuralOptimizerAdam.Create(0.9, 0.98);
-  NFit := TNeuralDataLoadingFit.Create();
+  NFit := TBakeoffFit.Create();
   try
     NFit.LogEveryBatches := 25;
     NFit.InitialLearningRate := LearningRate;
@@ -734,6 +868,124 @@ begin
     Inc(OutLen);
   end;
   Ms := NowMs() - T0;
+end;
+
+// Phase 6 twin: a width-1 weight-copied hybrid net streaming BOTH mixer
+// families. The TNNetDiagonalSSM layers persist a Depth-long state vector
+// each (constant, O(1) per step) while the MLA block's per-head SDPAs run the
+// KV cache (grows per token, ONE block's worth only) with the rope layers'
+// PositionOffset advanced to the absolute position before each forward.
+procedure TDecodeBakeoff.CreateHybridStepNet(out Step: THybridStepNet;
+  Source: TNNet);
+var
+  i, n: integer;
+begin
+  Step.Net := BuildModelHybrid(1);
+  Step.Net.CopyWeights(Source);
+  SetLength(Step.SSMs, 0);
+  SetLength(Step.SDPAs, 0);
+  SetLength(Step.Ropes, 0);
+  for i := 0 to Step.Net.Layers.Count - 1 do
+  begin
+    if Step.Net.Layers[i] is TNNetDiagonalSSM then
+    begin
+      n := Length(Step.SSMs);
+      SetLength(Step.SSMs, n + 1);
+      Step.SSMs[n] := TNNetDiagonalSSM(Step.Net.Layers[i]);
+      Step.SSMs[n].BeginIncrementalDecode();
+    end;
+    if Step.Net.Layers[i] is TNNetScaledDotProductAttention then
+    begin
+      n := Length(Step.SDPAs);
+      SetLength(Step.SDPAs, n + 1);
+      Step.SDPAs[n] := TNNetScaledDotProductAttention(Step.Net.Layers[i]);
+      Step.SDPAs[n].BeginIncrementalDecode(csContextLen + 1);
+    end;
+    if Step.Net.Layers[i] is TNNetRotaryEmbedding then
+    begin
+      n := Length(Step.Ropes);
+      SetLength(Step.Ropes, n + 1);
+      Step.Ropes[n] := TNNetRotaryEmbedding(Step.Net.Layers[i]);
+    end;
+  end;
+  Step.InV := TNNetVolume.Create(1, 1, 1);
+end;
+
+procedure TDecodeBakeoff.FreeHybridStepNet(var Step: THybridStepNet);
+begin
+  Step.InV.Free;
+  Step.Net.Free;
+  SetLength(Step.SSMs, 0);
+  SetLength(Step.SDPAs, 0);
+  SetLength(Step.Ropes, 0);
+end;
+
+// Phase 6 streamed arm: ONE single-token forward per position drives BOTH
+// state machineries at once -- ResetState/ResetCache start the sequence, the
+// prompt is prefilled token-at-a-time, then one length-1 forward per new
+// token. Before every forward the rope layers are shifted to the token's
+// ABSOLUTE position (the SSMs need no positions: their state carries order).
+// Decode steps are bucket-timed like phase 3 to show near-flatness (the only
+// per-step growth left is ONE MLA block's KV cache).
+procedure TDecodeBakeoff.GreedyHybridCached(var Step: THybridStepNet;
+  var Toks: TTokenBuf; PromptLen, MaxNew: integer; out OutLen: integer;
+  out Ms: double; out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
+var
+  t, b: integer;
+  T0, S0, dt: double;
+begin
+  Fwds := 0;
+  T0 := NowMs();
+  for t := 0 to High(Step.SSMs) do Step.SSMs[t].ResetState();
+  for t := 0 to High(Step.SDPAs) do Step.SDPAs[t].ResetCache();
+  // Prefill tokens 0..PromptLen-2; the LAST prompt token is the first decode
+  // step's input (its output row predicts the first new token).
+  for t := 0 to PromptLen - 2 do
+  begin
+    Step.InV.FData[0] := Toks[t];
+    for b := 0 to High(Step.Ropes) do Step.Ropes[b].PositionOffset := t;
+    Step.Net.Compute(Step.InV);
+    Inc(Fwds);
+  end;
+  OutLen := PromptLen;
+  while (OutLen - PromptLen < MaxNew) and (OutLen < csContextLen) do
+  begin
+    Step.InV.FData[0] := Toks[OutLen - 1];
+    for b := 0 to High(Step.Ropes) do
+      Step.Ropes[b].PositionOffset := OutLen - 1;
+    S0 := NowMs();
+    Step.Net.Compute(Step.InV);
+    dt := NowMs() - S0;
+    Inc(Fwds);
+    // Bucket by the prefix length this step conditions on (= OutLen).
+    if OutLen < 16 then b := 0
+    else if OutLen < 32 then b := 1
+    else b := 2;
+    BMs[b] := BMs[b] + dt;
+    Inc(BCnt[b]);
+    Toks[OutLen] := Step.Net.GetLastLayer().Output.GetClassOnPixel(0, 0);
+    Inc(OutLen);
+  end;
+  Ms := NowMs() - T0;
+end;
+
+// Quality clue for phase 6's verdict: how many of the trigrams in the
+// GENERATED window already appeared earlier in the same window (phase 3's
+// "there was a time, there was a time..." loop scores high here).
+function TDecodeBakeoff.CountRepeatedTrigrams(const Toks: TTokenBuf;
+  StartIdx, Len: integer): integer;
+var
+  i, j: integer;
+begin
+  Result := 0;
+  for i := StartIdx + 3 to StartIdx + Len - 3 do
+    for j := StartIdx to i - 1 do
+      if (Toks[j] = Toks[i]) and (Toks[j + 1] = Toks[i + 1])
+        and (Toks[j + 2] = Toks[i + 2]) then
+      begin
+        Inc(Result);
+        break;
+      end;
 end;
 
 // One cached window forward: tokens Seq[StartPos..StartPos+NReal-1] fill the
@@ -1702,6 +1954,194 @@ begin
   end;
 end;
 
+// ---------------------------------------------------------------------------
+// Phase 6: the hybrid configuration phases 1-5 pointed to -- a DiagonalSSM-
+// dominant trunk (2 recurrent blocks: O(1) decode state, fastest convergence
+// in the box) with ONE MLA block (precise content addressing at 40 analytic
+// floats/token of cache) and plain greedy decode (phase 5 showed speculation
+// does not pay on CPU; phase 2's MTP heads cost two extra 128->3000 heads).
+// The streamed arm is the novel bit: one loop drives BOTH mixer families.
+// ---------------------------------------------------------------------------
+procedure TDecodeBakeoff.RunPhase6;
+var
+  Trained: TNNet;
+  Step: THybridStepNet;
+  FullToks, CachedToks: TTokenBuf;
+  PromptLen, FullLen, CachedLen: integer;
+  FullMs, CachedMs: double;
+  FullFwds, CachedFwds: integer;
+  BMs: TBucketMs;
+  BCnt: TBucketCnt;
+  p, t, b, NewToks, d_k, RepTri, SumRepTri, SumNew: integer;
+  SumFullMs, SumCachedMs, StepMsMin, StepMsMax: double;
+  TrainSec: double;
+  ConvergeOK, FlatOK, RangeOK: boolean;
+begin
+  WriteLn('=== Phase 6: hybrid -- SSM-dominant trunk + one MLA block (dual-family streaming) ===');
+  LoadDataset();
+
+  d_k := csEmbedDim div csHeads;
+  Trained := BuildModelHybrid(csContextLen);
+  WriteLn('Model: ctx=', csContextLen, ' d_model=', csEmbedDim,
+    ' blocks=3 (SSM, MLA, SSM) latent=', csLatentDim, ' ropeDim=', csRopeDim,
+    ' ffn=', csFFNDim, ' vocab=', csModelVocabSize, '  params=',
+    Trained.CountWeights());
+  WriteLn('Block order SSM->MLA->SSM (attention in the middle, the Jamba/Zamba');
+  WriteLn('default): the first recurrence feeds the lone attention layer');
+  WriteLn('globally-mixed inputs; a recurrence, not a cache, closes the trunk.');
+  WriteLn('Token-only embedding; position = SSM recurrences + MLA rope slice.');
+  WriteLn('(References at this budget: SSM 4.47->2.34, MLA 3.90->2.53,');
+  WriteLn(' transformer 5.02->2.87.)');
+
+  TrainSec := Min(csTrainCapSecHyb,
+    csTotalBudgetSec - ElapsedSec() - csBenchReserveSec);
+  if TrainSec < 10 then
+  begin
+    WriteLn('ERROR: no time left to train (data loading took too long).');
+    Halt(1);
+  end;
+  // lr=0.001 (phase 2/4 reasoning): the 3-block trunk with an MLA block makes
+  // a step costlier than phase 3's 2-block SSM step, so fewer examples fit in
+  // the box; the higher rate recovers a comparable loss drop.
+  TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.001);
+
+  CreateHybridStepNet(Step, Trained);
+  try
+    for b := 0 to 2 do
+    begin
+      BMs[b] := 0;
+      BCnt[b] := 0;
+    end;
+    SumRepTri := 0; SumNew := 0;
+    SumFullMs := 0; SumCachedMs := 0;
+    WriteLn;
+    WriteLn('Greedy decode showdown (', csGenTokens, ' tokens per prompt):');
+    for p := 0 to High(csPrompts) do
+    begin
+      PromptLen := PromptToTokens(csPrompts[p], FullToks);
+      CachedToks := FullToks;
+
+      GreedyFull(Trained, FullToks, PromptLen, csGenTokens,
+        FullLen, FullMs, FullFwds);
+      GreedyHybridCached(Step, CachedToks, PromptLen, csGenTokens,
+        CachedLen, CachedMs, CachedFwds, BMs, BCnt);
+
+      // HARD ASSERT: token-exact equality between the two arms.
+      if FullLen <> CachedLen then
+      begin
+        WriteLn('ASSERT FAILED: full arm emitted ', FullLen - PromptLen,
+          ' tokens but streamed arm emitted ', CachedLen - PromptLen, '.');
+        Halt(1);
+      end;
+      for t := PromptLen to FullLen - 1 do
+        if FullToks[t] <> CachedToks[t] then
+        begin
+          WriteLn('ASSERT FAILED: decode arms diverge at position ', t,
+            ' (full=', FullToks[t], ' streamed=', CachedToks[t],
+            ') for prompt "', csPrompts[p], '".');
+          Halt(1);
+        end;
+
+      NewToks := FullLen - PromptLen;
+      RepTri := CountRepeatedTrigrams(FullToks, PromptLen, NewToks);
+      Inc(SumRepTri, RepTri);
+      Inc(SumNew, NewToks);
+      SumFullMs := SumFullMs + FullMs;
+      SumCachedMs := SumCachedMs + CachedMs;
+      WriteLn;
+      WriteLn('Prompt: "', csPrompts[p], '"');
+      WriteLn('  text: ', csPrompts[p], ' ',
+        TokensToText(FullToks, PromptLen, NewToks));
+      WriteLn(Format('  full re-encode  : %8.2f ms total  %6.2f ms/token  (%d forwards)',
+        [FullMs, FullMs / Max(1, NewToks), FullFwds]));
+      WriteLn(Format('  dual-family step: %8.2f ms total  %6.2f ms/token  (%d forwards incl. prefill)',
+        [CachedMs, CachedMs / Max(1, NewToks), CachedFwds]));
+      WriteLn(Format('  speedup         : %6.2fx   tokens match: YES (%d/%d)   repeated trigrams: %d',
+        [FullMs / Max(CachedMs, 1e-9), NewToks, NewToks, RepTri]));
+    end;
+
+    WriteLn;
+    WriteLn('Step cost vs prefix length (near-flat: the SSM state is constant;');
+    WriteLn('only ONE MLA block''s KV cache grows per token):');
+    StepMsMin := 1e30; StepMsMax := 0;
+    for b := 0 to 2 do
+      if BCnt[b] > 0 then
+      begin
+        WriteLn(Format('  prefix %s tokens: %6.3f ms/step  (%d steps)',
+          [Copy('  <16 16-31  >=32', b * 6 + 1, 5), BMs[b] / BCnt[b], BCnt[b]]));
+        StepMsMin := Min(StepMsMin, BMs[b] / BCnt[b]);
+        StepMsMax := Max(StepMsMax, BMs[b] / BCnt[b]);
+      end;
+
+    // Streamed-decode cache memory: the SSM blocks' state is CONSTANT (one
+    // Depth-long vector each); only the MLA block adds per-token state, and
+    // only one block's worth (vs csBlocks attention layers in phases 1/4).
+    WriteLn;
+    WriteLn('Streamed-decode cache memory (4-byte floats):');
+    WriteLn(Format('  %-58s %4d floats = %5d bytes  (CONSTANT)',
+      ['SSM state, 2 layers x Depth (total, independent of length):',
+       2 * csEmbedDim, 8 * csEmbedDim]));
+    WriteLn(Format('  %-58s %4d floats = %5d bytes',
+      [Format('MLA block via per-head SDPA caches, run here (2*H*(d_k+%d)):',
+       [csRopeDim]),
+       2 * csHeads * (d_k + csRopeDim), 8 * csHeads * (d_k + csRopeDim)])
+      + '  per token');
+    WriteLn(Format('  %-58s %4d floats = %5d bytes',
+      [Format('MLA block latent-only, analytic (latent+ropeK = %d+%d):',
+       [csLatentDim, csRopeDim]),
+       csLatentDim + csRopeDim, 4 * (csLatentDim + csRopeDim)])
+      + '  per token');
+    WriteLn(Format('  %-58s %4d floats = %5d bytes',
+      ['phase-1 transformer reference, 2 layers x 2*d_model:',
+       2 * 2 * csEmbedDim, 16 * csEmbedDim]) + '  per token');
+
+    // ---- the three-assumption verdict ----
+    WriteLn;
+    WriteLn('=== Phase 6 verdict (the three assumptions) ===');
+    ConvergeOK := (FLastLoss > 0) and (FLastLoss <= csRefLossSSM + 0.05)
+      and (FLastLoss < csRefLossMLA) and (FLastLoss < csRefLossTransformer);
+    WriteLn(Format('1. Convergence: hybrid loss %.2f (first batch) -> %.2f '
+      + '(final)  vs final pure SSM %.2f, pure MLA %.2f, transformer %.2f.',
+      [FFirstLoss, FLastLoss, csRefLossSSM, csRefLossMLA,
+       csRefLossTransformer]));
+    if ConvergeOK then
+      WriteLn('   VERDICT: HOLDS (at-or-better than pure SSM, clearly better'
+        + ' than MLA and transformer).')
+    else
+      WriteLn('   VERDICT: NOT CONFIRMED at this budget (see numbers above).');
+    WriteLn(Format('2. Quality clue: %d repeated trigrams across %d generated '
+      + 'tokens (lower = less looping;', [SumRepTri, SumNew]));
+    WriteLn('   compare the samples above against phase 3''s "there was a'
+      + ' time, there was a time..." loop).');
+    RangeOK := (StepMsMax > 0) and (SumCachedMs / Max(1, SumNew) <= 2.0);
+    FlatOK := (StepMsMax > 0) and (StepMsMax <= 2.0 * Max(StepMsMin, 1e-9));
+    WriteLn(Format('3. Decode cost: streamed %.2f ms/token aggregate; step '
+      + 'buckets %.3f..%.3f ms;', [SumCachedMs / Max(1, SumNew), StepMsMin,
+       StepMsMax]));
+    WriteLn(Format('   cache = constant %d-float SSM state + one MLA block'
+      + ' (%d floats/token cached here,', [2 * csEmbedDim,
+       2 * csHeads * (d_k + csRopeDim)]));
+    WriteLn(Format('   %d floats/token analytic latent-only).',
+      [csLatentDim + csRopeDim]));
+    if RangeOK and FlatOK then
+      WriteLn('   VERDICT: HOLDS (at-or-below the ~0.5-2 ms/token band and'
+        + ' near-flat in prefix length).')
+    else if RangeOK then
+      WriteLn('   VERDICT: PARTIAL (cheap per token, but bucket spread'
+        + ' exceeds 2x -- see buckets).')
+    else
+      WriteLn('   VERDICT: NOT CONFIRMED at this budget (see numbers above).');
+    WriteLn(Format('Aggregate speedup vs full re-encode: %.1fx.',
+      [SumFullMs / Max(SumCachedMs, 1e-9)]));
+    WriteLn;
+    WriteLn('Phase 6: PASS (dual-family streamed decode is token-exact). [t=',
+      ElapsedSec():0:1, 's]');
+  finally
+    FreeHybridStepNet(Step);
+    Trained.Free;
+  end;
+end;
+
 procedure TDecodeBakeoff.DoRun;
 var
   Phase, i: integer;
@@ -1723,14 +2163,15 @@ begin
       if i < ParamCount then Phase := StrToIntDef(ParamStr(i + 1), 0);
     end;
   end;
-  if (Phase < 1) or (Phase > 5) then
+  if (Phase < 1) or (Phase > 6) then
   begin
-    WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..5)');
+    WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..6)');
     WriteLn('  1: KV-cache incremental decode vs full re-encode (2dacc95)');
     WriteLn('  2: MTP-heads self-speculative decode (4d95378)');
     WriteLn('  3: DiagonalSSM O(1)-per-step decode (80dd830)');
     WriteLn('  4: MLA decoupled-RoPE latent KV cache (a8f3077)');
     WriteLn('  5: speculative decoding + KV cache rollback (42dd5dd)');
+    WriteLn('  6: hybrid 2xSSM + 1xMLA trunk, dual-family streamed decode');
     Terminate;
     ExitCode := 2;
     exit;
@@ -1744,6 +2185,7 @@ begin
       3: RunPhase3;
       4: RunPhase4;
       5: RunPhase5;
+      6: RunPhase6;
     end;
   finally
     FDictionary.Free;

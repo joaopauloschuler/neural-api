@@ -22,7 +22,7 @@ if [ ! -x "$BIN" ]; then
 fi
 
 declare -A RESULT
-for N in 1 2 3 4 5; do
+for N in 1 2 3 4 5 6; do
   LOG="decode_bakeoff_phase${N}.log"
   echo "==================================================================="
   echo "=== Phase $N (cap: 270 s)  ->  $LOG"
@@ -42,7 +42,7 @@ done
 
 echo
 echo "==================== decode bakeoff summary ===================="
-for N in 1 2 3 4 5; do
+for N in 1 2 3 4 5 6; do
   printf "  phase %d : %s\n" "$N" "${RESULT[$N]}"
 done
-echo "Per-phase output: decode_bakeoff_phase{1..5}.log"
+echo "Per-phase output: decode_bakeoff_phase{1..6}.log"

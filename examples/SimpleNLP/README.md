@@ -148,8 +148,8 @@ An advanced source code example can be found [here](https://github.com/joaopaulo
 features on this same TinyStories tokenized workload, one phase per feature:
 
 ```
-./DecodeFeaturesBakeoff --phase N      (N in 1..5)
-bash run_decode_bakeoff.sh             (all five phases, logs to decode_bakeoff_phaseN.log)
+./DecodeFeaturesBakeoff --phase N      (N in 1..6)
+bash run_decode_bakeoff.sh             (all six phases, logs to decode_bakeoff_phaseN.log)
 ```
 
 | Phase | Feature | Status |
@@ -159,10 +159,11 @@ bash run_decode_bakeoff.sh             (all five phases, logs to decode_bakeoff_
 | 3 | DiagonalSSM O(1)-per-step decode (`TNNetDiagonalSSM.BeginIncrementalDecode`) | implemented |
 | 4 | MLA decoupled-RoPE latent KV cache (`TNNet.AddMultiHeadLatentAttention`) | implemented |
 | 5 | Speculative decoding composed with the KV cache (`TruncateCache` rollback) | implemented |
+| 6 | Hybrid 2×DiagonalSSM + 1×MLA trunk, dual-family streamed decode (the configuration phases 1–5 recommend) | implemented |
 
 Every phase self-budgets to 270 s of wall clock: training is time-boxed inside the
-program (~185 s in phases 1/4, ~195 s in phases 2/3, ~160 s draft training in
-phase 5), leaving the rest for
+program (~185 s in phases 1/4, ~195 s in phases 2/3, ~190 s in phase 6, ~160 s draft
+training in phase 5), leaving the rest for
 the decode benchmark. The model is a small RoPE transformer decoder
 (ctx=48, d_model=128, 2 blocks, 8 heads, FFN 512, 3k vocab, ~1.31M params) with
 `TNNetDyT` normalization — RoPE and DyT are chosen because both are exactly
@@ -195,6 +196,24 @@ the per-head SDPA caches + `PositionOffset` (proving streamed-MLA token-exactnes
 rope slice included); the latent-only bytes/token row in its economics table is the
 ANALYTIC paper number — the true latent-only decode loop is run in
 [examples/LatentAttention](../LatentAttention), not here.
+Phase 6 builds the hybrid that phases 1–5 point to as the constrained-CPU
+recommendation: a 3-block trunk of TWO phase-3 DiagonalSSM blocks and ONE phase-4 MLA
+block (LatentDim 32, RopeDim 8), each block keeping the identical
+[DyT → mixer → residual] + [DyT → SwiGLU FFN 512 → residual] skeleton, token-only
+embedding (order = the SSM recurrences + the MLA rope slice), d_model 128, ctx 48,
+~1.50M params (3 blocks vs 2 elsewhere). Block order is SSM → MLA → SSM — attention
+in the middle, the Jamba/Zamba interleaving default: the first recurrent block hands
+the lone attention layer globally-mixed inputs, and a constant-state recurrence (not
+a second cache-growing attention) closes the trunk. Trained at lr=0.001 (phase-2/4
+reasoning: the 3-block step is costlier than phase 3's 2-block step, so fewer
+examples fit in the box). Its decode benchmark is the novel part — no other example
+streams BOTH mixer families in one loop: greedy full re-encode per token vs ONE
+streamed single-token step per token driving SIMULTANEOUSLY the DiagonalSSM layers'
+O(1) incremental state AND the MLA heads' SDPA caches + rope `PositionOffset`. Plain
+greedy only (phase 5 showed speculation does not pay on CPU; phase 2's extra MTP
+heads cost two more 128→3000 projections), and the phase ends with a printed
+three-assumption verdict (convergence vs the pure-mixer references, sample looping,
+decode cost/flatness/cache size).
 All implemented phases HARD-ASSERT token-exact equality of all
 decode arms.
 
@@ -277,3 +296,38 @@ verify forward costs ~5x a width-1 step here (compute-bound); speculative decodi
 off when single-token steps are memory-bandwidth-bound (GPUs/batch-1 LLM serving), and
 this phase demonstrates the exactness and the forward-count economics of composing it
 with the cache.
+
+Phase 6 (greedy, 40 new tokens per prompt, both arms token-identical; ~190 s training
+box at lr=0.001, 1,496,582 params; first-logged loss 3.44 → 1.39 final running mean,
+three epochs on an idle machine):
+```
+Prompt "one day"          full re-encode 10.35 ms/token  dual-family step 0.34 ms/token  speedup 30.9x
+Prompt "once upon a time" full re-encode 11.57 ms/token  dual-family step 0.37 ms/token  speedup 31.5x
+step cost vs prefix length:  <16 tokens 0.304 ms/step   16-31 tokens 0.306 ms/step   >=32 tokens 0.303 ms/step
+
+Streamed-decode cache memory (4-byte floats):
+  SSM state, 2 layers x Depth (total, independent of length):  256 floats = 1024 bytes  (CONSTANT)
+  MLA block via per-head SDPA caches, run here (2*H*(d_k+8)):  384 floats = 1536 bytes  per token
+  MLA block latent-only, analytic (latent+ropeK = 32+8):        40 floats =  160 bytes  per token
+  phase-1 transformer reference, 2 layers x 2*d_model:         512 floats = 2048 bytes  per token
+```
+The three-assumption verdict (printed by the phase itself):
+1. **Convergence: HOLDS.** The hybrid's final loss (~1.39–1.61 across runs, machine-load
+   dependent) lands clearly BELOW pure SSM (2.34), pure MLA (2.53) and the transformer
+   (2.87) at the same time budget — the single attention block does not slow the
+   SSM-dominant trunk down; it helps.
+2. **Quality clue: improved but not eliminated.** Samples like "she loved to play with
+   her mom and her mom and her" still drift into short loops at this budget, but less
+   than phase 3's "there was a time, there was a time…" (the phase prints a repeated-
+   trigram count per prompt as a cheap loop metric: 11/80 generated tokens here vs the
+   pure-SSM run's tighter immediate loops).
+3. **Decode cost: HOLDS.** The streamed dual-family step lands at ~0.35 ms/token on an
+   idle machine (~1.2–1.9 ms/token under heavy load), flat in prefix length
+   (0.303/0.306/0.303 ms across the <16/16–31/≥32 buckets) — the SSM state is a
+   constant 256 floats TOTAL and only ONE MLA block's cache grows per token (1536
+   bytes/token as run via per-head SDPA caches; 160 bytes/token analytic latent-only),
+   vs 2048 bytes/token for the phase-1 transformer.
+
+So the hybrid recommendation holds on this workload: 2×SSM + 1×MLA converges at-or-
+better than every pure stack, decodes at KV-cached-transformer speed or better with a
+quarter to one-tenth of the growing cache, and needs no speculation machinery.
