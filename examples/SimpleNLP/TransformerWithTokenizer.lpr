@@ -1,4 +1,4 @@
-program TrasformerDecodersWithTokenizer;
+program TransformerWithTokenizer;
 (*
 Copyright (C) 2023 Joao Paulo Schwarz Schuler
 
@@ -109,31 +109,6 @@ type
     WriteLn('Loaded dataset with ', FDatasetSize, ' rows');
   end;
 
-  function CyclicalAdvLRScheduler25b(Epoch: integer): single;
-  var
-    BaseLearning: single;
-    LocalEpoch: integer;
-  begin
-    BaseLearning := 0.0005;
-    LocalEpoch := Epoch mod 25;
-    Result := BaseLearning;
-    if Epoch < 25 then
-    begin
-      if LocalEpoch < 7 then
-      begin
-        Result := BaseLearning * (1 + 0.5 * LocalEpoch);
-      end
-      else
-      begin
-        Result := (BaseLearning * 4) * Power(0.90, (LocalEpoch - 7));
-      end;
-    end
-    else
-    begin
-      Result := 0.0001;
-    end;
-  end;
-
   procedure TTestFitLoading.DoRun;
   var
     W: TNNetLayer;
@@ -177,7 +152,7 @@ type
 
     WriteLn('Computing...');
     NFit.LogEveryBatches := 1;
-    NFit.CustomLearningRateScheduleFn:=@CyclicalAdvLRScheduler25b;
+    NFit.InitialLearningRate := 0.0001;
     NFit.Optimizer := Opt;
     NFit.LearningRateDecay := 0.00;
     NFit.StaircaseEpochs := 1;

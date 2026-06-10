@@ -21,14 +21,15 @@ fixed random recurrence usable as a feature generator.
 Pipeline:
   1. Build W_in and a sparse W with hand-rolled arrays.
   2. RESCALE W to the target spectral radius. We reuse the library's
-     power-iteration helper TNNet.EstimateSpectralNorm to MEASURE the current
-     scale instead of running a full eigensolve. NOTE: that helper returns the
-     largest SINGULAR value (spectral NORM), not the largest eigenvalue
-     MAGNITUDE (spectral RADIUS). For a general non-symmetric W they differ,
-     but the singular value is always an UPPER BOUND on |lambda|_max, so
-     rescaling W := W * (rho_target / sigma_1) leaves the true spectral radius
-     <= rho_target. That is exactly the safe side for the echo-state property,
-     so it is an acceptable - and conservative - proxy here.
+     power-iteration helper TNNet.EstimateSpectralRadius to MEASURE the current
+     largest eigenvalue MAGNITUDE rho = |lambda|_max directly (W*v iteration,
+     no transpose step) instead of running a full eigensolve. The echo-state
+     property is governed by rho, so rescaling W := W * (rho_target / rho)
+     targets the TRUE spectral radius exactly: with rho_target < 1 the reservoir
+     forgets its initial state (rich, well-tuned memory) without the conservative
+     under-scaling that EstimateSpectralNorm's singular-value upper bound (rho <=
+     sigma_1) would give. For comparison we also print the spectral NORM sigma_1
+     via EstimateSpectralNorm to show rho <= sigma_1 on this non-symmetric W.
   3. Run the reservoir FORWARD (no gradient) over a training sequence, collect
      each state h_t into a TNNetVolumePair (input = h_t, target = x_{t+1}).
   4. Train ONLY a TNNetFullConnectLinear(1) readout on those collected pairs
@@ -80,14 +81,12 @@ const
   cN         = 100;    // reservoir size (units). Tiny: 50-150 is plenty.
   cLeak      = 0.3;    // leak rate `a` in the state update.
   cSparsity  = 0.1;    // fraction of W entries that are non-zero.
-  // NOTE on the two rho settings: EstimateSpectralNorm returns the spectral
-  // NORM (largest singular value sigma_1), an UPPER bound on the spectral
-  // RADIUS |lambda|_max. So rescaling W to "rho" via sigma_1 leaves the true
-  // radius <= rho - conservatively short memory. We therefore set the working
-  // target near 1.25 (true radius still < 1, rich memory) and the ablation
-  // target well above it so even the looser true radius exceeds 1.
-  cRhoGood   = 1.5;    // echo-state working case (true radius stays < 1).
-  cRhoBad    = 3.0;    // ablation case (true radius driven > 1, ESP broken).
+  // NOTE on the two rho settings: EstimateSpectralRadius returns the TRUE
+  // spectral RADIUS rho = |lambda|_max, so we can target it directly. The
+  // echo-state property holds iff rho < 1, so the working case sets rho just
+  // below 1 (rich memory, still contractive) and the ablation drives rho > 1.
+  cRhoGood   = 0.9;    // echo-state working case (true radius < 1, ESP holds).
+  cRhoBad    = 1.8;    // ablation case (true radius > 1, ESP broken).
   cInScale   = 1.0;    // input weight scale.
   cWarmup    = 100;    // washout steps (reservoir forgets its zero init).
   cTrainLen  = 600;    // teacher-forced training steps after washout.
@@ -96,7 +95,7 @@ const
   cReadoutEpochs = 600;
   cReadoutLR     = 0.02;
   cReadoutL2     = 1e-5; // ridge-style regularisation on the readout.
-  cPowerIters    = 50;   // power-iteration steps for EstimateSpectralNorm.
+  cPowerIters    = 200;  // power-iteration steps for the spectral helpers.
 
 type
   // The fixed random reservoir. W_in and W are plain arrays - the recurrence
@@ -105,7 +104,8 @@ type
     Win: array of TNeuralFloat;            // [N]   input weights
     W:   array of array of TNeuralFloat;   // [N,N] sparse recurrent matrix
     H:   array of TNeuralFloat;            // [N]   current state h_t
-    Sigma: TNeuralFloat;                   // measured spectral norm after init
+    Rho:   TNeuralFloat;                  // measured spectral RADIUS of raw W
+    Sigma: TNeuralFloat;                  // measured spectral NORM of raw W
   end;
 
 // The deterministic target series x_t = sin(0.2 t) + 0.3 sin(0.31 t).
@@ -116,7 +116,7 @@ end;
 
 // Build W_in (uniform in [-cInScale, cInScale]) and a sparse W (uniform in
 // [-1,1] on a cSparsity fraction of entries), then rescale W to TargetRho
-// using the library power-iteration spectral-norm helper (see file header).
+// using the library power-iteration spectral-RADIUS helper (see file header).
 procedure BuildReservoir(var R: TReservoir; TargetRho: TNeuralFloat);
 var
   i, j: integer;
@@ -141,11 +141,12 @@ begin
     end;
   end;
 
-  // Measure the current spectral norm of W by stuffing its rows into a
+  // Measure the current spectral RADIUS of W by stuffing its rows into a
   // throwaway Input(N)->FullConnectLinear(N) network (building the net sizes
   // each neuron's Weights to fan-in N, so Neurons[i].Weights = row i of W) and
   // calling the reusable power-iteration helper. No training, no gradients -
-  // we only read sigma_1 back out.
+  // we read both rho (the echo-state-relevant radius) and, for comparison,
+  // sigma_1 (the conservative spectral-norm upper bound) back out.
   ProbeNN := TNNet.Create();
   try
     ProbeNN.AddLayer([
@@ -156,14 +157,17 @@ begin
     for i := 0 to cN - 1 do
       for j := 0 to cN - 1 do
         ProbeLayer.Neurons[i].Weights.FData[j] := R.W[i][j];
+    R.Rho   := TNNet.EstimateSpectralRadius(ProbeLayer, cPowerIters);
     R.Sigma := TNNet.EstimateSpectralNorm(ProbeLayer, cPowerIters);
   finally
     ProbeNN.Free;
   end;
 
-  if R.Sigma > 1e-12 then
+  // Rescale to the TRUE target spectral radius (rho_target). Because rho is the
+  // exact echo-state quantity, TargetRho < 1 directly guarantees ESP.
+  if R.Rho > 1e-12 then
   begin
-    Scale := TargetRho / R.Sigma;
+    Scale := TargetRho / R.Rho;
     for i := 0 to cN - 1 do
       for j := 0 to cN - 1 do
         R.W[i][j] := R.W[i][j] * Scale;
@@ -252,6 +256,150 @@ begin
   end;
 
   Pairs.Free;
+  Result := NN;
+end;
+
+// ----------------------------------------------------------------------------
+// Closed-form RIDGE (Tikhonov) readout - the CLASSIC ESN training.
+//
+// The readout is linear in the reservoir state, so the optimal weights are not
+// something we have to chase with SGD: they are the one-shot ridge-regression
+// solution. Collect the state matrix S (rows = timesteps, cols = N reservoir
+// units PLUS a bias/intercept column) and the target matrix Y (here a single
+// column x_{t+1}). The ridge readout minimises ||S*Wout - Y||^2 + lambda||Wout||^2,
+// whose normal equations are
+//
+//     (S^T S + lambda I) Wout = S^T Y          ->   A Wout = B
+//
+// We form A (size (N+1)x(N+1)) and B ((N+1)x1) and solve the small dense system
+// directly. neuralvolume.pas exposes no matrix solve/inverse helper (checked:
+// no Solve/Inverse/Cholesky/Gauss), so we hand-roll Gauss-Jordan elimination
+// with partial pivoting below - simple, deterministic and exact for this size.
+// No learning rate, no epochs, no shuffling: it is a single linear solve.
+// ----------------------------------------------------------------------------
+
+// Solve the dense linear system A*X = B in place by Gauss-Jordan elimination
+// with partial pivoting. A is n x n, B is n x m; on return B holds the solution
+// X (A is destroyed). Returns False if A is singular.
+function GaussJordanSolve(var A: array of TNeuralFloat;
+  var B: array of TNeuralFloat; n, m: integer): boolean;
+var
+  col, row, piv, k: integer;
+  maxAbs, v, factor, diag: TNeuralFloat;
+  tmp: TNeuralFloat;
+begin
+  Result := True;
+  for col := 0 to n - 1 do
+  begin
+    // Partial pivot: pick the row (>= col) with the largest |A[row,col]|.
+    piv := col;
+    maxAbs := Abs(A[col * n + col]);
+    for row := col + 1 to n - 1 do
+    begin
+      v := Abs(A[row * n + col]);
+      if v > maxAbs then begin maxAbs := v; piv := row; end;
+    end;
+    if maxAbs < 1e-30 then begin Result := False; Exit; end;
+
+    // Swap the pivot row into place (in both A and B).
+    if piv <> col then
+    begin
+      for k := 0 to n - 1 do
+      begin
+        tmp := A[col * n + k]; A[col * n + k] := A[piv * n + k]; A[piv * n + k] := tmp;
+      end;
+      for k := 0 to m - 1 do
+      begin
+        tmp := B[col * m + k]; B[col * m + k] := B[piv * m + k]; B[piv * m + k] := tmp;
+      end;
+    end;
+
+    // Normalise the pivot row so A[col,col] = 1.
+    diag := A[col * n + col];
+    for k := 0 to n - 1 do A[col * n + k] := A[col * n + k] / diag;
+    for k := 0 to m - 1 do B[col * m + k] := B[col * m + k] / diag;
+
+    // Eliminate the pivot column from every other row.
+    for row := 0 to n - 1 do
+    begin
+      if row = col then Continue;
+      factor := A[row * n + col];
+      if factor = 0 then Continue;
+      for k := 0 to n - 1 do
+        A[row * n + k] := A[row * n + k] - factor * A[col * n + k];
+      for k := 0 to m - 1 do
+        B[row * m + k] := B[row * m + k] - factor * B[col * m + k];
+    end;
+  end;
+end;
+
+// Build the trained readout via the closed-form ridge solve, reusing the SAME
+// reservoir/washout/training window as TrainReadout so the comparison is
+// apples-to-apples. The returned TNNet is the SAME Input(N)->FullConnectLinear(1)
+// shape as the SGD arm, with Wout[0..N-1] written into the neuron weights and
+// the intercept (bias column) into the neuron bias.
+function RidgeReadout(var R: TReservoir; Lambda: TNeuralFloat): TNNet;
+var
+  NN: TNNet;
+  t, i, j, d, rows: integer;
+  S: array of TNeuralFloat;   // rows x d   (d = N+1, last col = bias 1.0)
+  Y: array of TNeuralFloat;   // rows x 1
+  A: array of TNeuralFloat;   // d x d  normal-equations matrix
+  Bmat: array of TNeuralFloat; // d x 1  right-hand side (becomes Wout)
+  acc: TNeuralFloat;
+begin
+  d := cN + 1;                 // reservoir units + 1 bias/intercept column
+  rows := cTrainLen;
+
+  ResetState(R);
+  for t := 0 to cWarmup - 1 do
+    StepReservoir(R, Series(t));   // washout (same as SGD arm)
+
+  SetLength(S, rows * d);
+  SetLength(Y, rows * 1);
+  for i := 0 to rows - 1 do
+  begin
+    t := cWarmup + i;
+    StepReservoir(R, Series(t));
+    for j := 0 to cN - 1 do S[i * d + j] := R.H[j];
+    S[i * d + cN] := 1.0;             // bias/intercept column
+    Y[i] := Series(t + 1);
+  end;
+
+  // A = S^T S + lambda*I   (symmetric positive-definite for lambda>0).
+  SetLength(A, d * d);
+  for i := 0 to d - 1 do
+    for j := 0 to d - 1 do
+    begin
+      acc := 0;
+      for t := 0 to rows - 1 do acc := acc + S[t * d + i] * S[t * d + j];
+      if i = j then acc := acc + Lambda;
+      A[i * d + j] := acc;
+    end;
+
+  // B = S^T Y.
+  SetLength(Bmat, d * 1);
+  for i := 0 to d - 1 do
+  begin
+    acc := 0;
+    for t := 0 to rows - 1 do acc := acc + S[t * d + i] * Y[t];
+    Bmat[i] := acc;
+  end;
+
+  // Solve A * Wout = B in place; Bmat now holds Wout (length d).
+  if not GaussJordanSolve(A, Bmat, d, 1) then
+    WriteLn('    WARNING: ridge normal-equations matrix was singular.');
+
+  // Pack Wout into the SAME readout-net shape as the SGD arm.
+  NN := TNNet.Create();
+  NN.AddLayer([
+    TNNetInput.Create(cN),
+    TNNetFullConnectLinear.Create(1)
+  ]);
+  for j := 0 to cN - 1 do
+    NN.GetLastLayer().Neurons[0].Weights.FData[j] := Bmat[j];
+  NN.GetLastLayer().Neurons[0].BiasWeight := Bmat[cN]; // intercept
+
   Result := NN;
 end;
 
@@ -407,12 +555,19 @@ begin
   end;
 end;
 
+const
+  cLambdaSweep: array[0..3] of TNeuralFloat = (0.0, 1e-6, 1e-4, 1e-2);
+
 var
   R: TReservoir;
-  NN: TNNet;
+  NN, RidgeNN: TNNet;
   TfModel, TfBaseline, FrGood, FrBad: TNeuralFloat;
+  RidgeTf, RidgeFr, BestRidgeTf, BestRidgeFr: TNeuralFloat;
+  RidgeTfDummy, BestLambda: TNeuralFloat;
   PredG, TruthG, PredB, TruthB: array of TNeuralFloat;
+  PredR, TruthR: array of TNeuralFloat;
   AllOK: boolean;
+  li: integer;
 
 begin
   SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
@@ -430,8 +585,9 @@ begin
   WriteLn;
   WriteLn('[1] Building reservoir at rho=', cRhoGood:0:2, ' ...');
   BuildReservoir(R, cRhoGood);
-  WriteLn('    measured spectral norm sigma_1 of raw W = ', R.Sigma:0:4,
-    '  -> W rescaled so rho <= ', cRhoGood:0:2);
+  WriteLn('    measured raw W: spectral RADIUS rho = ', R.Rho:0:4,
+    '   spectral NORM sigma_1 = ', R.Sigma:0:4, '  (rho <= sigma_1)');
+  WriteLn('    -> W rescaled so its true spectral radius = ', cRhoGood:0:2);
 
   WriteLn('    training the linear readout (', cReadoutEpochs, ' epochs)...');
   NN := TrainReadout(R);
@@ -448,13 +604,55 @@ begin
   AsciiPlot(PredG, TruthG);
   NN.Free;
 
+  // ---- Closed-form RIDGE readout (one-shot) + lambda sweep ----------------
+  // SAME reservoir, SAME washout/training window, SAME error metric as the SGD
+  // arm above - the ONLY difference is how Wout is obtained: a single Tikhonov
+  // normal-equations solve instead of an SGD loop. No learning rate to tune.
+  WriteLn;
+  WriteLn(StringOfChar('-', 64));
+  WriteLn('[1b] Closed-form RIDGE readout  Wout = (S^T S + lambda I)^-1 S^T Y');
+  WriteLn('     one-shot solve (no LR, no epochs); lambda regularisation sweep:');
+  WriteLn('       lambda     teacher-NRMSE   free-run-NRMSE');
+  SetLength(PredR, cFreeRun);
+  SetLength(TruthR, cFreeRun);
+  BestRidgeTf := 1e30;
+  BestRidgeFr := 1e30;
+  BestLambda  := cLambdaSweep[0];
+  for li := 0 to High(cLambdaSweep) do
+  begin
+    RidgeNN := RidgeReadout(R, cLambdaSweep[li]);
+    TeacherForcedTest(R, RidgeNN, RidgeTf, RidgeTfDummy);
+    RidgeFr := FreeRun(R, RidgeNN, PredR, TruthR);
+    WriteLn(Format('       %-9.0e  %12.4f   %12.4f',
+      [cLambdaSweep[li], RidgeTf, RidgeFr]));
+    // Track the best lambda by FREE-RUN NRMSE: that is the metric that matters
+    // for autonomous generation, and it is exactly where ridge regularisation
+    // pays off - the lambda=0 fit nails the teacher-forced step but a tiny
+    // unregularised readout amplifies error catastrophically in the feedback
+    // loop, so the sweep is what reveals the right amount of damping.
+    if RidgeFr < BestRidgeFr then
+    begin
+      BestRidgeTf := RidgeTf;
+      BestRidgeFr := RidgeFr;
+      BestLambda  := cLambdaSweep[li];
+    end;
+    RidgeNN.Free;
+  end;
+  WriteLn;
+  WriteLn('     SGD-vs-ridge headline (same reservoir, same task):');
+  WriteLn(Format('       SGD readout   (%d epochs, LR=%.3g): teacher %.4f  free-run %.4f',
+    [cReadoutEpochs, cReadoutLR, TfModel, FrGood]));
+  WriteLn(Format('       ridge readout (one-shot, lambda=%.0e):  teacher %.4f  free-run %.4f',
+    [BestLambda, BestRidgeTf, BestRidgeFr]));
+
   // ---- Ablation: rho > 1 (echo-state property broken) --------------------
   WriteLn;
   WriteLn(StringOfChar('=', 64));
   WriteLn('[2] ABLATION - rebuilding reservoir at rho=', cRhoBad:0:2,
     ' (> 1, echo-state property BROKEN)');
   BuildReservoir(R, cRhoBad);
-  WriteLn('    measured spectral norm sigma_1 of raw W = ', R.Sigma:0:4);
+  WriteLn('    measured raw W: spectral RADIUS rho = ', R.Rho:0:4,
+    '   spectral NORM sigma_1 = ', R.Sigma:0:4);
   NN := TrainReadout(R);
   SetLength(PredB, cFreeRun);
   SetLength(TruthB, cFreeRun);

@@ -27,7 +27,8 @@ unit neuralfit;
 interface
 
 uses
-  Classes, SysUtils, neuralnetwork, neuralvolume, neuralthread, neuraldatasets
+  Classes, SysUtils, neuralnetwork, neuralvolume, neuralthread, neuraldatasets,
+  neuralscheduler
   {$IFDEF OpenCL}, cl
   {$IFNDEF FPC}, neuralopencl {$ENDIF}
   {$ENDIF}
@@ -124,6 +125,7 @@ type
       FFileNameBase: string;
       FClipDelta: single;
       FClipNorm: single;
+      FClipValue: single;
       FNaNGuard: boolean;
       FTargetAccuracy: single;
       FOnAfterStep, FOnAfterEpoch, FOnStart: TNotifyEvent;
@@ -142,6 +144,7 @@ type
       FProcs: TNeuralThreadList;
       FOptimizer: TNeuralOptimizer;
       FOptimizerOwned: boolean;
+      FScheduler: TNeuralLRScheduler;
       procedure CheckLearningRate(iEpochCount: integer);
       procedure Optimize();
       procedure SetOptimizer(pOptimizer: TNeuralOptimizer);
@@ -162,6 +165,9 @@ type
       // This is useful for This is useful for making SGD numerically stable.
       property ClipDelta: single read FClipDelta write SetClipDelta;
       property ClipNorm: single read FClipNorm write SetClipNorm;
+      /// ClipValue clamps every weight gradient element-wise to [-ClipValue, +ClipValue]
+      // before the optimizer step. 0 (default) disables it. Independent of ClipNorm.
+      property ClipValue: single read FClipValue write FClipValue;
       property CurrentEpoch: integer read FCurrentEpoch;
       property CurrentStep: integer read FCurrentStep;
       property CurrentLearningRate: single read FCurrentLearningRate;
@@ -193,6 +199,12 @@ type
       property OnStart: TNotifyEvent read FOnStart write FOnStart;
       property Optimizer: TNeuralOptimizer read FOptimizer write SetOptimizer;
       property SaveBest: TNeuralSaveBest read FSaveBest write FSaveBest;
+      // Optional learning-rate scheduler (neuralscheduler.pas). Defaults to nil.
+      // When assigned, CheckLearningRate calls Scheduler.NextLR(Epoch, Step)
+      // each epoch and OVERRIDES the built-in fixed/decay/cyclical/custom LR
+      // logic. When nil, the legacy LR code path is byte-for-byte unchanged.
+      // The caller retains ownership of the scheduler instance.
+      property Scheduler: TNeuralLRScheduler read FScheduler write FScheduler;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
@@ -943,6 +955,7 @@ begin
     MessageProc(
       'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffFixed,8,6) +
       ' Clip norm:' + FloatToStrF(FClipNorm,ffFixed,8,6) +
+      ' Clip value:' + FloatToStrF(FClipValue,ffFixed,8,6) +
       ' Clip delta:' + FloatToStrF(FClipDelta,ffFixed,8,6) +
       ' L2 decay:' + FloatToStrF(FL2Decay,ffFixed,8,6) +
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +
@@ -1884,6 +1897,8 @@ procedure TNeuralOptimizer.ForceDeltaLimists();
 var
   MaxDelta: TNeuralFloat;
 begin
+  if FFit.ClipValue > 0 then
+    FNN.ClipWeightGradientsToValue(FFit.ClipValue);
   if FFit.ClipNorm > 0 then
   begin
     FNN.NormalizeNormPerLayer(FFit.ClipNorm);
@@ -1999,6 +2014,7 @@ begin
   FInertia := 0.9;
   FClipDelta := 0.0;
   FClipNorm := 1.0;
+  FClipValue := 0.0;
   FNaNGuard := false;
   FFileNameBase := 'autosave';
   FL2Decay := 0.0000001;
@@ -2077,7 +2093,15 @@ begin
       'Learning rate decay set to:'+FloatToStrF(FLearningRateDecay,ffFixed,7,5)
     );
   end;
-  if Assigned(FCustomLearningRateScheduleFn) then
+  if Assigned(FScheduler) then
+  begin
+    // Scheduler overrides the built-in fixed/decay/cyclical/custom LR logic.
+    // It keys on the global step counter (see neuralscheduler.pas); Epoch is
+    // passed for interface compatibility. iEpochCount already reflects any
+    // cyclical wrap applied above.
+    fNewLearningRate := FScheduler.NextLR(iEpochCount, FCurrentStep);
+  end
+  else if Assigned(FCustomLearningRateScheduleFn) then
   begin
     fNewLearningRate := FCustomLearningRateScheduleFn(iEpochCount);
   end
@@ -2127,6 +2151,7 @@ procedure TNeuralFitBase.SetClipDelta(Value: TNeuralFloat);
 begin
   FClipDelta := Value;
   FClipNorm  := 0.0;
+  FClipValue := 0.0;
 end;
 
 procedure TNeuralFitBase.SetClipNorm(Value: TNeuralFloat);
@@ -2295,6 +2320,7 @@ begin
     MessageProc(
       'Learning rate:' + FloatToStrF(FCurrentLearningRate,ffFixed,8,6) +
       ' Clip norm:' + FloatToStrF(FClipNorm,ffFixed,8,6) +
+      ' Clip value:' + FloatToStrF(FClipValue,ffFixed,8,6) +
       ' Clip delta:' + FloatToStrF(FClipDelta,ffFixed,8,6) +
       ' L2 decay:' + FloatToStrF(FL2Decay,ffFixed,8,6) +
       ' Inertia:' + FloatToStrF(FInertia,ffFixed,8,6) +

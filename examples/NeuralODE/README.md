@@ -23,8 +23,15 @@ property.
 ## The builder
 
 ```pascal
+// Explicit Euler (backward-compatible 3-arg form):
 function TNNet.AddNeuralODEBlock(InputLayer: TNNetLayer;
-  HiddenDim, Steps: integer): TNNetLayer;
+  HiddenDim, Steps: integer): TNNetLayer; overload;
+
+// Integrator-selecting 4-arg form:
+function TNNet.AddNeuralODEBlock(InputLayer: TNNetLayer;
+  HiddenDim, Steps: integer; Method: TNNetODEMethod): TNNetLayer; overload;
+
+TNNetODEMethod = (odeEuler, odeMidpoint);
 ```
 
 - `f` is a shape-preserving pointwise 2-layer residual function over Depth:
@@ -40,10 +47,27 @@ function TNNet.AddNeuralODEBlock(InputLayer: TNNetLayer;
   residual stack with `Steps`-many distinct weight sets.
 - Each Euler step scales `f`'s output by `h = 1/Steps`
   (`TNNetMulByConstant(h)`) and adds it residually (`TNNetSum`).
-- v1 is **Euler-only**; an RK2/midpoint integrator and the O(1)-memory
-  adjoint-sensitivity backward pass are logged as follow-ups (see the builder
-  doc-comment and `tasklist.md`). Training here uses ordinary stored-activation
-  backprop through the unrolled steps.
+
+### Integrator (`Method`)
+
+The 4-arg overload selects the integration scheme via `TNNetODEMethod`:
+
+| `Method`      | Update per step                                            | f-evals/step | Order |
+|---------------|-----------------------------------------------------------|--------------|-------|
+| `odeEuler`    | `y := y + h*f(y)`                                          | 1            | 1st   |
+| `odeMidpoint` | `k1 := f(y); k2 := f(y + (h/2)*k1); y := y + h*k2`        | 2            | 2nd   |
+
+The 3-arg overload is exactly `odeEuler` (bit-for-bit unchanged). **Midpoint /
+RK2** is second-order accurate, so it tracks the continuous trajectory more
+faithfully for the same number of steps. Crucially, **every** `f`-evaluation —
+`k1` *and* `k2`, in *every* step — reuses the step-1 weights via
+`TNNetConvolutionSharedWeights`. Midpoint therefore just *doubles the number of
+shared-weight conv pairs*; it adds **zero** new trainable weights. The parameter
+count stays **independent of both `Steps` and `Method`**.
+
+- The O(1)-memory adjoint-sensitivity backward pass is still logged as a
+  follow-up (see the builder doc-comment and `tasklist.md`). Training here uses
+  ordinary stored-activation backprop through the unrolled steps.
 
 ## What this example shows
 
@@ -112,3 +136,88 @@ The parameter count (34 neurons / 288 weights) is **identical** for every
 `Steps`, and validation accuracy stays high and roughly flat as the integration
 depth grows — continuous depth at a fixed parameter budget, the Neural ODE
 "depth for free" point. Exact numbers vary a little with platform / float build.
+
+## 2-D trajectory visualisation (midpoint integrator)
+
+After the sweep, the program runs a second demo that makes the continuous-depth
+deformation **visible**. It trains a tiny classifier whose ODE state is
+genuinely 2-D (`d_model = 2`, integrated with **`odeMidpoint`**) on two
+**interleaving half-moons** — a classic non-linearly-separable toy that, unlike
+concentric rings, *can* be untangled by a 2-D diffeomorphism (the flow of a
+Neural ODE). Because the state is 2-D it can be scattered directly as `(x, y)`,
+so we replay the validation points through the trunk and render an **ASCII
+frame** of where the two classes sit at *each* integration step. The window is
+auto-scaled per frame (the integrated state can grow/shrink). It is fully
+dependency-free (pure `stdout` ASCII), single-threaded, and runs in ~15–20 s.
+
+At `t = 0` the two moons interleave and overlap; as `t` advances the single
+shared flow `f` pulls them apart into two linearly-separable clusters:
+
+```
+--- step 0/5   (t = 0.00)   o = class 0   # = class 1 ---
+  |                                         |
+  |          ooooooooo                      |
+  |        ooooo    ooooo                   |
+  |      oooo           oo                  |
+  |     oo               oo                 |
+  |    oo                  oo               |
+  |    o         #          o           #   |
+  |   o          ##         oo          ##  |
+  |   o          ##          o          ##  |
+  |  oo          ##         oo          #   |
+  |  o            #          o         ##   |
+  |               ###                ###    |
+  |                 ##               ##     |
+  |                   #             ##      |
+  |                   #####      ## #       |
+  |                     #  ######           |
+  |                                         |
+
+--- step 1/5   (t = 0.20)   o = class 0   # = class 1 ---
+  |                                         |
+  |                                    ooo  |
+  |                                  ooo    |
+  |                               ooo       |
+  |                             ooo         |
+  |                          ooo            |
+  |                        ooo              |
+  |                     ooo                 |
+  |                   o o                   |
+  |                 o                       |
+  |              oo                         |
+  |            oo                           |
+  |         ##o                             |
+  |      ###                                |
+  |    ###                                  |
+  |  ###                                    |
+  |                                         |
+
+   ... (steps 2-5 hold the separated configuration; the flow does most of
+       its untangling in the first step and then settles) ...
+
+--- step 5/5   (t = 1.00)   o = class 0   # = class 1 ---
+  |                                         |
+  |                                     oo  |
+  |                                  ooo    |
+  |                               ooo       |
+  |                             ooo         |
+  |                          ooo            |
+  |                        ooo              |
+  |                     ooo                 |
+  |                   o o                   |
+  |                 o o                     |
+  |              oo                         |
+  |            oo                           |
+  |         ##o                             |
+  |      ####                               |
+  |    ###                                  |
+  |  ###                                    |
+  |                                         |
+```
+
+In frame 0 the `o` and `#` classes are clearly **tangled** (both occupy the
+central band); by frame 1 the flow has rotated/sheared the plane so the `o`
+cluster (upper-right) and the `#` cluster (lower-left) are **separated** by a
+straight line. That is the textbook Neural-ODE "untangling" picture, produced
+here entirely in ASCII. Validation accuracy for the visualised run is ≈ 0.83
+(exact frames/accuracy vary a little with platform / float build).

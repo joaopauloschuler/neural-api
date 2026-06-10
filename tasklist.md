@@ -72,51 +72,152 @@ references these removed layers is obsolete and should be ignored
 rather than acted on.
 
 ## New layer types
-- [ ] TNNetCapsule + routing-by-agreement (Sabour/Hinton/Frosst 2017, "Dynamic
-      Routing Between Capsules") — genuinely distinct from everything in tree:
-      attention routes by scaled dot-product, MoE routes by a softmax gate, the
-      open Modern-Hopfield entry retrieves by energy; capsules route by *iterative
-      agreement* between vector-valued units, which nothing here does. Two pieces:
-      (1) a `squash` nonlinearity `v = (||s||^2 / (1+||s||^2)) * (s/||s||)` that
-      compresses a capsule VECTOR's length into [0,1) while preserving its
-      orientation (new — the existing length-based code at neuralnetwork.pas only
-      squashes scalar margins, not vectors); and (2) a `TNNetCapsuleRouting` layer
-      that, given lower-level capsules, applies the per-pair transform matrices and
-      runs the fixed 3-iteration routing loop (softmax over coupling coefficients
-      `c_ij`, weighted sum, squash, update logits by agreement `u_hat . v`). Train
-      a tiny `CapsNet` on a small MNIST/Fashion-MNIST subset with the paper's
-      MARGIN loss (`T_k*max(0,m+-||v_k||)^2 + lambda*(1-T_k)*max(0,||v_k||-m-)^2`)
-      and report digit accuracy vs a param-matched plain CNN; stretch goal is the
-      capsule's headline property — perturb one dimension of the winning capsule's
-      output vector and show it varies an interpretable pose factor (stroke
-      thickness / skew) when fed to a small reconstruction decoder. Feasibility
-      risks to settle in v1, in the honest "what did NOT fit the CPU budget" style
-      the Grokking/CA entries use: the routing loop's softmax-over-coupling is an
-      INNER iteration that is NOT a gradient step, so the coupling logits `b_ij`
-      must be reset per forward pass and only the transform-matrix weights carry
-      gradients — verify the backward path under the `SetBatchUpdate(True)` idiom
-      from [[manual-gradient-and-snapshot-gotchas]], and keep the capsule count /
-      iteration count tiny (e.g. 8 primary-capsule types, 10 digit capsules, 3
-      routing iters) so a full forward/backward stays inside the <5-min pure-CPU
-      budget. Distinct from AttentionCopyTask/InductionHeads (dot-product
-      attention), GatherChannelsRouting (static channel gather), the landed
-      TNNet.AddMixtureOfExperts (scalar gate) and the landed Modern-Hopfield retrieval.
+- [ ] `TNNetHolographicBinding` follow-ups — the HRR vector-symbolic binding
+      layer LANDED (bind = circular convolution, optional `Unbind` = circular
+      correlation, weightless, exact bilinear backward, FStruct[6] flag;
+      forward/grad/unbind-grad/serialization tests + examples/HolographicMemory
+      capacity-curve demo all in). Still open: an optional FFT forward path
+      (pointwise-multiply in the DFT domain via the FourierMixFFT machinery) for
+      large n; a learnable per-channel permutation "protect" vector; and a
+      `TNNet.AddHRRMemory` builder pairing binding with a TNNetVectorQuantizer
+      codebook for discrete cleanup.
+- [ ] TNNetTensorTrain follow-ups (the layer + numerical-gradient/serialization
+      tests in tests/TestNeuralNumerical.pas + examples/TensorTrainLinear/ all
+      LANDED 2026-06-07 on a2, commit c78edd0; default d=2 auto-factored cores,
+      interior rank r, exact left→right MPO-vector contraction, square map infers
+      n from the previous layer, d/r/suppress-bias round-trip via FStruct[1..3]):
+      - [ ] examples/TensorTrainLinear/ TT-RANK SWEEP table — sweep the interior
+            rank r ∈ {1,2,4,8} (and/or d ∈ {2,3}) on the same teacher and chart
+            weight-count vs accuracy, making the "smooth compression↔capacity dial"
+            claim land on data (the v1 example reports a single d=2 point).
+      - [ ] Validate / harden the GENERAL d>2 core path: the landed forward/backward
+            handle d cores but the example and tests exercise d=2 (with auto-factoring
+            capped at 6). Add an explicit d=3 gradient-check arm and a d=3 example
+            point so the multi-core chain is covered by a test, not just constructible.
+- [x] Multi-Token Prediction follow-up (TNNet.AddMultiTokenPrediction landed
+      2026-06-07, commit be16117): Inference-time self-speculative decode — reuse
+      the extra future heads as a built-in draft (drop the SpeculativeDecoding
+      example's second net); show accept-rate / wall-clock on a tiny corpus.
+      (DONE: examples/SelfSpeculativeDecoding — exact-greedy accept/verify loop,
+      accept rates 68.5/79.5/89.7% per head distance, 60.9% forwards saved,
+      2.04x wall-clock; smoke test TestSelfSpeculativeDecodeGreedyExactness.)
+- [ ] TNNetMinGRU / TNNetMinLSTM follow-up (landed 2026-06-07, commit 69f8d53):
+      Parallel-prefix-scan forward (the paper's main systems win) so training is
+      not a strict per-token left-to-right loop; gate behind an exact-vs-parallel
+      equivalence assert (mirrors the open DeltaNet/WKV chunked-forward tasks).
+- [ ] TNNetLRU follow-ups (landed 2026-06-07, commit 444e813):
+      - [ ] Parallel/associative-scan forward (LTI recurrence → parallelizable)
+            gated behind an exact-vs-scan equivalence assert.
+- [ ] TNNetGatedLinearAttention follow-ups (Gated Linear Attention, Yang et al.
+      2023, arXiv:2312.06635 — matrix-state (d x d) linear-attention recurrence
+      with a data-dependent per-channel diagonal forget gate
+      alpha_t = sigmoid(W_a x_t): S_t = diag(alpha_t)*S_{t-1} + k_t v_t^T,
+      y_t = q_t^T S_t; exact per-token forward + dL/dS BPTT, numerical-gradient +
+      serialization tests, examples/GatedLinearAttention/ — LANDED 2026-06-07 on a2,
+      commit 6009de8):
+      - [ ] Chunked/parallel hardware-efficient forward (the paper's main systems
+            contribution; v1 ships the exact per-token scan only) — gate behind an
+            exact-vs-chunked equivalence assert (mirrors open DeltaNet/WKV chunked tasks).
+      - [ ] Wire AddGatedLinearAttention into the downstream ../gpt-3-for-pascal
+            decoder as a mixer arm (mirrors the open AddRWKVTimeMix gpt-3 wiring task).
+      - [ ] Rectangular d_k != d_v state variant (FStruct[0]/[1] already carry both).
+- [ ] TNNetKANConv follow-ups (the convolutional Kolmogorov-Arnold layer LANDED
+      2026-06-07 on a2, commit fbe7c1a — conv sibling of the dense TNNetKANLayer:
+      sum of learned univariate Chebyshev edge functions per receptive-field patch,
+      subclasses TNNetConvolutionLinear, degree K via FStruct[5], numerical-gradient +
+      serialization tests, examples/KANConv/; B-spline fixed-knot basis variant
+      also landed, commit 6dc49f5):
+      - [ ] examples/KANConv/ on a real tiny-image task (CIFAR/MNIST stub) vs a plain
+            conv at matched weight budget, to show the headline param-efficiency on data.
+- [ ] TNNetDeltaNet chunked/parallel forward (the paper's WY-matrix
+      reformulation of Yang et al. 2024, arXiv:2406.06484) so training is
+      sub-quadratic instead of the current strict per-token left-to-right scan in
+      TNNetDeltaNet; gate it behind an exact-vs-chunked equivalence assert. (The
+      base TNNetDeltaNet delta-rule layer — matrix state S updated by
+      S_t = S_{t-1} + beta_t k_t ⊗ (v_t - S_{t-1}ᵀ k_t), read-out y_t = S_tᵀ q_t,
+      L2-normalized keys, sigmoid beta gate, exact dL/dS BPTT, serialization,
+      input+weight gradient tests and examples/DeltaNet/ recall demo — has landed;
+      see [[mlstm-cell-layer]] / [[ntm-memory-layer]] for the BPTT pattern.)
+- [ ] TNNetSpectralConv2D follow-ups (the 2-D Fourier Neural Operator leaf layer
+      + examples/SpectralConv2D/ resolution-invariance demo + numerical-gradient/
+      shape/save-load tests all LANDED 2026-06-06 on a2; separable 2-D radix-2 FFT
+      reusing FourierMixFFT, ModesX*ModesY low-pass truncation, exact complex
+      adjoint backward): the PDE-surrogate example LANDED 2026-06-07 on a2
+      (commit 47b93ea, examples/DarcyFlowFNO/) — coefficient→solution map for the
+      LINEAR Poisson member of the Darcy family (-Δu = (a-1), a=exp(band-limited
+      field), Jacobi-solved target, h² folded into the source so the same continuous
+      operator holds at any resolution); lift→AddFourierNeuralOperator2D(width=8,
+      6×6 modes)→project trains relL2 ≈0.64→0.025 at 16×16 and the SAME weights
+      (CopyWeights) hold 0.0284 on an unseen 32×32 grid (resolution invariance).
+      Open follow-ups:
+      - [ ] The FULLY NONLINEAR -div(a grad u)=f Darcy operator does NOT converge
+            under plain SGD within the CPU budget (single linear spectral conv can't
+            represent it; deeper/ReLU FNO stacks freeze at ~zero or destabilize).
+            Revisit with a better optimizer / normalization / curriculum, or a
+            deeper FNO stack tuned to actually fit the non-diagonal operator.
+      - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
+            example-side SetExceptionMask workaround — consider masking/guarding the
+            denormals inside the layer's FFT so callers don't have to.
+- [ ] TNNetImplicitLongConv / AddHyenaOperator follow-ups (the leaf layer,
+      order-2 builder, numerical-gradient + save/load tests, and the
+      examples/HyenaOperator/ recall bake-off all LANDED 2026-06-05):
+      (a) FFT-based O(L log L) forward/backward path as an opt-in fast mode for
+          long sequences — the current forward is the direct O(L^2) causal
+          time-domain sum, fine for small sizes but quadratic in SeqLen. Gate it
+          so the exact time-domain path stays the default and assert FFT-vs-direct
+          equivalence to <1e-5.
+      (b) wire AddHyenaOperator into the downstream ../gpt-3-for-pascal decoder as
+          an attention-free block option and contrast its loss / wall-clock vs the
+          attention decoder on the existing tiny corpus.
 
-- [ ] DropBlock follow-up (TNNetDropBlock landed 2026-05-31): the STRETCH bake-off
-      is still open — a tiny CIFAR-stub train comparing TNNetDropBlock vs plain
-      TNNetDropout at matched drop rate, charting the train/val gap to show the
-      localized-patch regularizer helps a conv net generalize where scattered-pixel
-      dropout does not. Keep it <5-min CPU.
+- [ ] TNNet.AddDeepEquilibriumBlock follow-up (builder + examples/DeepEquilibrium/
+      landed 2026-06-05; weight-tied f iterated to its fixed point, jacobian-free
+      PHANTOM backward, TNNetDeepEquilibriumSharedConv per-forward weight cache,
+      and shape/convergence/gradient/save-load tests): (a) the EXACT
+      implicit-function-theorem gradient (inverse-Jacobian solve via a second
+      fixed-point iteration) vs the phantom approximation; (b) spectral /
+      contraction constraints so convergence is guaranteed at arbitrary init
+      (v1 uses damped Picard + output bounding, not guaranteed).
+
+- [ ] TNNetRetention follow-up (layer + TNNet.AddRetention builder +
+      examples/RetentionDualForm/ all landed; learnable-gamma variant
+      TNNetRetention.Create(d_k, gamma, LearnGamma:=true) — gamma=sigmoid(raw)
+      trained scalar — LANDED 2026-06-06 with gradient + serialization tests and
+      a learnable-gamma example arm). Remaining: the chunkwise-recurrent hybrid
+      form (a throughput optimisation skipped in v1 — the parallel and
+      naive-recurrent forms both landed).
+
+- [ ] TNNetHyperLinear follow-ups (weightless context-generated-weights leaf layer
+      + examples/HyperNetwork/ + two-path gradient tests + the
+      TNNet.AddHyperLinear(Din, Dout, ContextLayer) generator+HyperLinear builder
+      all LANDED 2026-06-05; first layer in the fork that owns zero trainable
+      weights — reads its W from a second input tensor). Deferred follow-up:
+      CHUNKED weight generation so the main layer can be larger than the
+      generator's output width (generate W in tiles) — the landed layer
+      generates the whole Din*Dout matrix in one shot, which caps main-layer
+      size; document the memory/param trade-off.
+
+- [ ] TNNetWKV follow-ups (the RWKV-4 time-mixing recurrence base layer +
+      AddRWKVTimeMix builder + numerical-gradient/serialization tests + examples/RWKV/
+      WKV-vs-DeltaNet recall demo landed 2026-06-07 on a2, commits 2d4473b/1523a45). Open:
+      - [ ] Wire AddRWKVTimeMix into the downstream ../gpt-3-for-pascal decoder as an
+            attention-free block option and contrast its loss / wall-clock vs the attention
+            decoder on the existing tiny corpus (mirrors the open AddHyenaOperator wiring task).
+      - [ ] Chunked/parallel forward (RWKV-5/6 style) so training is not a strict
+            per-token left-to-right scan; gate behind an exact-vs-chunked equivalence assert
+            (mirrors the open TNNetDeltaNet chunked-forward task).
+
+- [ ] Mini-batch / chunked Test-Time Training — follow-up to the landed
+      TNNetTestTimeTraining (both TTT-Linear and TTT-MLP arms, with exact
+      second-order BPTT through the inner update, shipped with tests + the
+      examples/TestTimeTraining parity-binding recall demo). Apply ONE inner
+      gradient-descent step per CHUNK of b tokens (mini-batch the inner SGD)
+      instead of per token, for the same sub-quadratic-training motive as the
+      open DeltaNet/WKV chunked-forward tasks. Optional second follow-up: a
+      learnable PER-CHANNEL inner LR eta (currently a single learnable per-layer
+      scalar via softplus(eta_raw)).
 
 ## Interesting applications / examples
-- [ ] MahalanobisOOD follow-up (landed 2026-05-31): the easy synthetic split is
-      SEPARABLE so AUROC pins at exactly 1.0 — the score distributions don't
-      overlap. Add a HARDER near-OOD variant (OOD blobs closer to the in-dist
-      manifold, or a held-out-CLASS split rather than a far-away region) so the
-      AUROC lands in a discriminating 0.8–0.99 band and the curve actually moves.
-- [ ] MahalanobisOOD follow-up: contrast TIED (single pooled) covariance vs
-      PER-CLASS (untied) covariance and chart the AUROC delta — the tied form is
-      the paper's default but the untied form is the obvious ablation.
 - [ ] MahalanobisOOD follow-up: the AUROC / Mann-Whitney-U rank helper currently
       lives LOCAL to the example. If a second consumer appears (calibration ECE
       report, anomaly autoencoder, etc.), promote it to a public function in
@@ -129,86 +230,41 @@ rather than acted on.
 - [ ] Forward-Forward follow-up: deeper FF stack (4+ layers) — does
       accumulated-goodness accuracy keep improving with depth, or does the
       length-normalised signal saturate?
-- [ ] Reinforcement learning: minimal DQN solving CartPole or a grid world
+- [ ] Predictive Coding Network experiment (`examples/PredictiveCoding/`) — a
+      backprop-free, biologically-plausible learning paradigm distinct from the
+      landed Forward-Forward (examples/ForwardForward/). Build a small MLP where
+      each layer carries an explicit value node + a local prediction-error node;
+      training alternates (a) an inference relaxation that iteratively settles the
+      value nodes to minimise summed squared prediction error (a few fixed-point
+      sweeps, top node clamped to the label), then (b) a purely *local* Hebbian-
+      style weight update using only the adjacent layer's settled error — no global
+      backward pass through the chain. Reuse existing TNNetVolume math + a custom
+      training loop (no core-layer changes needed, mirroring the FF/LotteryTicket
+      example structure). Headline to land: on a tiny synthetic/few-class task the
+      PCN matches a backprop MLP of the same shape within the <5-min CPU budget,
+      and the per-layer error energy demonstrably decreases over inference sweeps.
+      Distinct from backprop AND from FF's per-layer goodness objective; fills the
+      "alternative learning rules" gap alongside Forward-Forward.
 - [ ] Style transfer or diffusion-lite denoiser (building on SuperResolution / VisualGAN)
-- [ ] Growing Neural Cellular Automata demo (`examples/NeuralCellularAutomata/`) —
-      reproduce Mordvintsev et al. 2020 "Growing Neural CA" on a TINY pure-CPU
-      target (e.g. a 16x16 RGBA emoji-like glyph, channels = 4 visible RGBA +
-      ~8 hidden state = 12-deep grid). One CA "rule" step is a shared-weight
-      conv stack applied in place: per-cell perceive (fixed 3x3 Sobel-x/Sobel-y/
-      identity depthwise filters, or a small learned 3x3 conv) -> 1x1
-      TNNetPointwiseConvReLU -> 1x1 TNNetPointwiseConvLinear update added
-      residually to the grid, with a stochastic per-cell update mask and an
-      alpha>0.1 "alive" mask. Train by UNROLLING T in {48..64} steps sharing one
-      rule via TNNetConvolutionSharedWeights (the SharedWeights layer is the key
-      enabler — without it each step would learn separate weights), L2 loss to the
-      target RGBA at the final step, pool-based sample replacement for
-      persistence. Headline payoff: a net that GROWS the target from a single
-      seed pixel and (stretch) REGENERATES after the grid is damaged — visually
-      striking and conceptually unlike anything in the suite (it is recurrent-in-
-      space self-organisation, not a feed-forward classifier or a diagnostic
-      report). Render frames as ASCII/ppm so it stays dependency-free. Feasibility
-      risk to settle in the first version: confirm the unrolled shared-weight
-      gradient flows correctly under the SetBatchUpdate(True) idiom across T steps
-      (the manual-gradient gotcha noted in [[manual-gradient-and-snapshot-gotchas]]);
-      if full backprop-through-time over 48+ steps blows the CPU budget, fall back
-      to a shorter T or truncated BPTT and document it (the same "what did NOT fit
-      the budget" honesty the Grokking entry uses). Distinct from VisualGAN
-      (adversarial image synthesis), SuperResolution (feed-forward upscaler) and
-      DiagonalSSM (1-D sequence state space, not a 2-D self-organising grid).
 - [ ] Neural ODE follow-ups (builder `TNNet.AddNeuralODEBlock` + `examples/NeuralODE/`
       landed 2026-05-31, Euler-only, trains via stored-activation backprop through the
       unrolled steps). Deferred:
-        - [ ] RK2/midpoint integrator behind an optional `Method` param (v1 Euler-only).
         - [ ] Adjoint-sensitivity O(1)-in-Steps backward (integrate the adjoint ODE
               backwards using the `SetBatchUpdate(True)` weight-accumulation idiom).
               Shares the O(1)-memory goal with the open `TNNetReversibleBlock`
               recompute path and the "Gradient checkpointing" infra task.
-        - [ ] 2-D trajectory ASCII-frame visualisation of the learned flow untangling
-              the two classes (the textbook Neural-ODE picture).
-- [ ] HyperNetwork demo + `TNNetHyperLinear` weight-generating layer
-      (`examples/HyperNetwork/`) — reproduce the core Ha et al. 2016 "HyperNetworks"
-      idea on a TINY pure-CPU multi-task target: a small "generator" net consumes a
-      per-task CONTEXT vector (a learned task/class embedding) and EMITS the weights
-      of a "main" layer, which then applies those generated weights to the actual
-      input. One shared main network thus implements a whole FAMILY of input->output
-      maps, with the per-task behaviour carried entirely by the context-conditioned
-      generated weights. This is a genuinely new mechanism for this repo: every
-      existing layer OWNS its weights in `Neurons[].Weights` (fixed at construction),
-      so the headline engineering piece is a `TNNetHyperLinear` whose forward reads
-      its weight matrix from a LINKED generator layer's output volume each forward
-      pass (a runtime tensor, not stored Neuron weights) and whose backward scatters
-      the weight-gradient `dL/dW = outer(inputError-side, input)` back into that
-      generator's `OutputError` so the generator trains end-to-end. Headline payoff,
-      visibly distinct from the suite: on a multi-task toy (e.g. K in {3,4} different
-      target functions y=f_k(x), or K rotated/shifted classification tasks) show the
-      single shared main net + context-conditioned generated weights fits ALL tasks,
-      and contrast against a FiLM-conditioned baseline (`TNNetFiLM`/AddFiLMConditioned)
-      of matched budget — FiLM can only per-channel scale/shift activations, so it
-      should LOSE on tasks that need a genuinely different linear map per task, making
-      the "generate the weights, don't just modulate the features" point concrete.
-      Feasibility risks to settle honestly in v1, in the "what did NOT fit the budget"
-      style the Grokking entry uses: (1) the generated-weight forward/backward is a
-      hand-rolled gradient surgery path, so it needs the `SetBatchUpdate(True)` weight-
-      accumulation idiom and the layer-index-capture discipline from
-      [[manual-gradient-and-snapshot-gotchas]] — pin it with a finite-difference check
-      that perturbs a GENERATOR weight and central-differences the main-net loss
-      against the scattered generator delta (mirror the TNNetVectorQuantizer codebook-
-      delta and TNNetCenterLoss center-delta tests); (2) generating a FULL weight
-      matrix is O(in*out) generator outputs — keep the main layer tiny (e.g. 4->4) so
-      the generator stays small and the whole multi-task train fits the <5-min pure-CPU
-      budget; if a full matrix is too big, fall back to generating a low-rank or
-      per-channel-scaled weight factorisation and document it (Ha et al.'s own scaling
-      trick). A `TestHyperLinearSmoke` following the [[introspection-report-pattern]]
-      / [[loss-layer-pattern]] recipe should pin: a constant generator output makes
-      `TNNetHyperLinear` bit-for-bit equal to a plain `TNNetFullConnectLinear` with
-      those weights (the correctness anchor), plus the LoadFromString round-trip of the
-      generator-link wiring. Distinct from `TNNetFiLM`/AddFiLMConditioned (modulates
-      ACTIVATIONS per channel, does not synthesise weights), from AddLoRAAdapter (adds
-      a FIXED trained low-rank bypass, not a context-GENERATED weight), from the open
-      TNNetMixtureOfExperts (SELECTS among N fixed expert weight sets via a gate rather
-      than GENERATING a fresh weight set), and from the Neural-ODE/Growing-CA entries
-      (shared-weight time/space recurrence, weights still owned by the layer).
+- [ ] Reptile follow-up (TNNetReptileMetaTrainer + examples/MetaLearningReptile/
+      landed 2026-06-01, sine-regression task distribution, manual inner-loop
+      Compute/Backpropagate/UpdateWeights path): (a) a CLASSIFICATION task
+      distribution (e.g. rotated/shifted 2-D blob few-shot tasks) so the
+      meta-init claim is shown on more than 1-D regression; (b) the tiny ReLU
+      net proved numerically delicate under the summed full-batch gradient —
+      ForceMaxAbsoluteDelta was a no-op on the manual path, so it needed input
+      normalisation + a small stable LR. Worth a short note in
+      docs/ (or the example README) on why the manual UpdateWeights path
+      bypasses the clip and what the stable-training recipe is, so the next
+      manual-inner-loop example (HyperNetwork, MAML, Growing-CA) doesn't
+      rediscover the divergence the hard way.
 
 ## Infrastructure / dev experience
 - [ ] **Gradient-verification coverage audit.** For a *scientific-discovery*
@@ -246,55 +302,6 @@ rather than acted on.
       sibling demo (or extend it) that runs with `MaxThreadNum := 4` twice
       and prints which weights diverge first — useful starting point for any
       future "make TNeuralFit deterministic under parallelism" work.
-- [ ] CumSumPositionEncoding follow-up: actually train a tiny position-
-      dependent model with and without the CumSum feature concatenated and
-      chart loss delta. Forward-only demo landed; the bake-off is still open.
-- [ ] Quick-start example: tiny char-level sequence model (XOR-of-bits or
-      counting task) that trains in well under a minute on CPU.
-### Added ideas
-- [ ] TNNetMaskedFill currently hard-codes the upper-triangle (strictly causal)
-      pattern. Consider a follow-up that allows masking the lower triangle or a
-      configurable offset, if a non-causal masking use case shows up.
-- [ ] `TNNet.TracInReport` + `examples/TracInfluence/` — TRAINING-DATA
-      attribution via TracIn-CP (Pruthi et al. 2020, "Estimating Training Data
-      Influence by Tracing Gradient Descent"). Answers a question NOTHING in the
-      tree currently answers: "which TRAINING examples are most responsible for
-      THIS test prediction?" — i.e. attribution back to the *data*, not to
-      activations (ActivationPatchingReport is causal tracing over layers at
-      inference) and not to the input pixels (SaliencyReport is input-space
-      gradient). TracIn is the CPU-friendly form of influence functions: it
-      needs NO Hessian inverse (unlike Koh & Liang 2017), only first-order
-      gradient dot products, which this API already computes per sample during
-      Backpropagate. Influence of a training point `z_train` on a test point
-      `z_test` is `I(z_train, z_test) = sum over saved checkpoints k of
-      eta_k * <grad_loss(z_train; theta_k), grad_loss(z_test; theta_k)>`
-      (TracIn-CP — one term per checkpoint, scaled by that interval's LR).
-      Mechanics in this library: run a single backward pass per example with
-      `SetBatchUpdate(True)` so per-sample weight gradients are NOT zeroed
-      (the [[manual-gradient-and-snapshot-gotchas]] idiom), read the flattened
-      gradient out of each trainable layer (`Neurons[].Delta`-derived weight
-      grads / the layer delta volumes), and take the dot product against the
-      cached test-point gradient — summed over a handful of `.nn` checkpoints
-      saved across training. Report: top-k PROPONENTS (most positive influence,
-      "examples that pushed the model toward this prediction") and top-k
-      OPPONENTS (most negative). The example should be GRADED by construction so
-      it is self-checking in the house style: train a tiny classifier on a 2-D
-      blob task where each test point has an obvious same-class cluster, then
-      mislabel ONE planted training example and show TracIn ranks that planted
-      mislabel as the top OPPONENT of test points it corrupts — the textbook
-      "TracIn surfaces mislabelled data" result (the paper's headline
-      self-influence application). Feasibility notes to settle in v1, honestly
-      logged like the Grokking/Capsule entries: (a) checkpoint storage — start
-      with the FINAL weights only (1-checkpoint TracIn ≈ a single gradient-dot
-      similarity / "TracInLast") and ADD multi-checkpoint summation only if the
-      single-checkpoint ranking is too noisy on the toy; (b) cost is O(N_train)
-      backward passes per test point, so cap N_train small (a few hundred) and
-      say so; (c) confirm reading per-sample weight gradients out of a layer
-      after one backward pass actually works under `SetBatchUpdate(True)` before
-      committing to the full report — that is the one true unknown. Distinct
-      from every existing `TNNet.*Report` (none touch the training set) and a
-      natural companion to the landed Mahalanobis-OOD / ConformalPrediction
-      data-quality tooling.
 
 ### Ideas from JP
 - [ ] Better integrate TBytePredictionViaNNet and TEasyBytePredictionViaNNet with
@@ -306,93 +313,66 @@ rather than acted on.
 
 ### Attention variants / siblings
 
-- [ ] GQA follow-up: exact KVHeads=QueryHeads vs AddMultiHeadSelfAttention
-      equivalence to <1e-5 by copying identical weights. Deferred because
-      AddMultiHeadSelfAttention consumes a pre-projected 3*d_model slab (one
-      external projection) whereas AddMultiHeadGroupedQueryAttention does its own
-      three Q/K/V projections from a d_model input, so a weight-for-weight wiring
-      is fiddly; the landed test asserts equal output shape + the exact K/V
-      projection param saving instead.
+- [ ] TNNetLinformerAttention follow-ups (low-rank linear-complexity single-head SDPA
+      projecting K,V down the sequence axis via learnable E,F; landed 2026-06-07, commit 4c6248b;
+      AddLinformerAttention block builder + multi-head Linformer also landed, commit c3ff173):
+      - [ ] Parameter-sharing variants (headwise / key-value shared E=F / layerwise),
+            the paper's main param-budget knob; plus d_v != d_k support (v1 fixes d_v=d_k).
+- [ ] TNNetPerformerAttention follow-ups (Performer / FAVOR+ positive-random-feature
+      unbiased softmax-kernel estimate with a frozen m×d_k projection; landed 2026-06-07, commit eadcfb8):
+      - [ ] Causal/autoregressive Performer (prefix-sum FAVOR+, sibling of
+            TNNetCausalLinearAttention) and a TNNet.AddPerformerAttention multi-head builder.
+      - [ ] Generalized random features (ReLU/trig kernels), redraw-W-per-step option,
+            and AVX-vectorize the W·x projection loops in Compute (currently scalar).
+- [ ] TNNet.AddConformerBlock follow-ups (macaron FFN–MHSA–Conv–FFN block composed
+      from existing primitives; landed 2026-06-07, commit 0efc163):
+      - [ ] A true per-channel TNNetDepthwiseConv1D (depthwise over the SeqLen axis,
+            Depth groups) so AddConformerBlock can use a faithful depthwise-separable
+            conv module instead of the channel-mixing TNNetCausalConv1D stand-in.
+      - [ ] PreNorm/NormClass/CausalMask params on AddConformerBlock (match
+            AddTransformerEncoderBlock's flexibility); optional BatchNorm in the conv
+            module (the paper uses BN between depthwise conv and activation, not LayerNorm).
+- [x] TNNet.AddMultiHeadLatentAttention follow-up (builder + examples/LatentAttention/
+      landed 2026-06-05, NoPE; down-proj x->c_KV + per-head K/V up-projections +
+      per-head SDPA + DeepConcat + out-proj, shape + input-gradient + save/load
+      tests, MLA-vs-MHA copy bake-off): (a) the paper's DECOUPLED-RoPE slice — a
+      separate rope-only Q/K slice concatenated to the content slice before the
+      dot product (RoPE cannot be applied to the compressed latent because the
+      up-projection would smear positions); (b) the headline KV-cache win, which
+      needs the open [[KV-cache incremental-decode]] path. DONE 2026-06-10: (a)
+      RopeDim param (default 0 = unchanged NoPE; per-head rotated rope-Q + ONE
+      shared rotated rope-K, zero-padded V via exact x+(-x)) + (b) incremental
+      decode demos in examples/LatentAttention/ (SDPA-cache path with
+      TNNetRotaryEmbedding.PositionOffset:=t per step, plus TRUE latent-only
+      caching at d_c floats/token, both faithful <1e-5) + 3 new tests.
 - [ ] GQA follow-up: wire AddMultiHeadGroupedQueryAttention into the downstream
       ../gpt-3-for-pascal decoder and compose with the open [[KV-cache
       incremental-decode]] task — the KV footprint shrinks by QueryHeads/KVHeads,
       exactly the bottleneck that task fights.
 
-- [ ] TNNetDifferentialAttention follow-up: fold differential heads into the
-      MHA breakdown ([[TNNetMultiHeadSelfAttention]] /
-      TNNetTransformerDecoderBlock) behind a flag, so a decoder block can opt
-      into differential attention per head — a natural drop-in for the
-      downstream ../gpt-3-for-pascal long-context retrieval.
-- [ ] TNNetSinkAttention follow-up: fold sink slots into the MHA breakdown
-      ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock) so a
-      decoder block can opt into sinks per head behind a flag.
-- [ ] TNNetTalkingHeadsProjection — pre/post-softmax linear mix across
-      heads (Shazeer et al.). A tiny learnable HxH multiply applied to
-      attention logits along the head axis. NOTE (2026-05-31): this repo has
-      NO single head-axis tensor — multi-head attention is built from H
-      SEPARATE TNNetScaledDotProductAttention layers (each FAttn is
-      [key,query,1]) concatenated along Depth. So a clean standalone HxH-mix
-      layer has nothing to operate on. To do this properly, either (a) add an
-      explicit multi-head SDPA tensor representation first, or (b) scope it as
-      a BUILDER that inserts the HxH mix between the per-head logit slabs
-      inside AddMultiHeadSDPAConcat / AddSplitQKVHeads — not a drop-in layer.
-      Re-scope before attempting.
-- [ ] TNNetSlidingWindowMaskedFill follow-up (landed 2026-05-31): a tiny
-      next-token bake-off — full causal (TNNetMaskedFill / TriangularCausalMask)
-      vs sliding-window at W in {2, 4, full} on a task whose answer lives within
-      the window, charting loss + per-query key count. Shows the long-context
-      cost/quality trade the layer enables. Fork PositionEncodingBakeoff's
-      tiny next-token harness.
-- [ ] TNNetCosineSimilarityAttention follow-up: bake-off vs plain SDPA and vs
-      SDPA+TNNetSoftCapping on a tiny next-token task — does the bounded
-      `[-scale,+scale]` logit actually remove the NaN/overflow events SoftCapping
-      targets, at matched final loss?
-- [ ] TNNetCosineSimilarityAttention follow-up: make `scale` a learnable scalar
-      (sibling to ReZero's single-weight pattern) instead of a fixed FFloatSt[0]
-      constant, and check whether training drives it toward the cargo-culted
-      `1/τ` temperatures used in cosine-attention papers.
-- [ ] SDPA all-masked-row policy decision and test: currently a row where
-      every key is masked produces NaN (softmax of all -inf). Concrete
-      proposal: detect the all-masked row in Compute, output a zero row,
-      skip the softmax for that row (what JAX/Flax MHA does). Document
-      the choice in code and add the pinning test.
-- [ ] "Attention numerical-gradient stress test" running the SDPA grad check
-      across SeqLen ∈ {1, 2, 3, 5, 8} and asserting the max error vs
-      tolerance at each. Pins shape-edge behavior the existing single-shape
-      test can't see.
-
+- [ ] Per-head attention-variant follow-ups (the avSDPA/avDifferential/avSink
+      enum + optional Variant/NumSinks params on AddMultiHeadSelfAttention &
+      AddMultiHeadSDPAConcat landed on a2, commit fcc6ba8): (a) forward the
+      variant through TNNetTransformerDecoderBlock / AddTransformerEncoderBlock —
+      only the raw MHA breakdown takes it today, so a decoder-block-level flag is
+      the next rung; (b) persist the variant choice in a one-arg rebuild helper
+      (the composed layers serialize themselves, so load already works).
 ### Bake-off / experiment follow-ups
-- [ ] Position-encoding bake-off follow-up: the landed bake-off uses a
-      predict-the-PREVIOUS-token task on which ALiBi lands just above the
-      no-position baseline — a single head's `2^-8` slope is a weak recency
-      bias that under the causal mask favours the query's own position and
-      injects NO positional content into the values, so it cannot do
-      fixed-offset (-1) retrieval. Add an ALiBi-FAVOURABLE second task
-      (a long-context recency / "attend-to-the-nearest-recent-match" task)
-      and/or a multi-head variant with per-head slopes `2^(-8h/H)`, so the
-      arm where ALiBi's locality prior actually wins is also demonstrated.
-      Pairs with the open "ALiBi slope-base sweep" entry.
 - [ ] Numerical-precision study: re-run the activation bake-off using FP32
       vs a simulated-FP16 path (round-trip volumes through fewer mantissa
       bits) and report the convergence-quality gap. Useful baseline for
       any future mixed-precision work.
-- [ ] SoftCapping logit-stability micro-experiment: train a tiny classifier
-      with and without a `TNNetSoftCapping(c)` before the final softmax,
-      and print the rate of NaN/overflow events under an aggressive LR.
 - [ ] DropPath schedule study: linearly increasing drop probability with
       depth (Stochastic-Depth schedule) vs constant `p`.
-- [ ] RoPE base-frequency sweep: same tiny next-token model, sweep
-      `base ∈ {1e2, 1e3, 1e4, 1e5}`, chart loss and qualitative sample
-      quality.
-- [ ] ALiBi slope-base sweep: vary slope from `2^(-8h/H)` to `2^(-kh/H)` for
-      `k ∈ {4, 6, 8, 12}` on a tiny next-token task and chart loss.
-      Empirical check of the cargo-culted "8" constant.
-- [ ] Causal-mask + SoftCapping interaction study: with logits clipped via
-      `TNNetSoftCapping(c)`, sweep `c ∈ {5, 10, 20, 30, ∞}` on a tiny
-      next-token task and chart loss + max-logit-norm.
-- [ ] "Lottery-ticket"-flavored experiment: train a small dense net,
-      magnitude-prune the bottom X% of weights, retrain from the original
-      init, and compare. Pure CPU, finishes in seconds.
+- [ ] Lottery-ticket IMP follow-up (make the headline land): the landed
+      examples/LotteryTicketIMP showed NO IMP advantage because the toy is too
+      easy and the budget too generous (one-shot never collapses). Build the
+      regime where IMP provably wins: either (a) STARVE the per-arm epoch budget
+      (e.g. ~100 epochs/arm, matching the sibling that collapses) so one-shot
+      buckles at 95% while IMP's rewind+retrain recovers, or (b) a harder task
+      (overlapping/noisier classes or a deeper net) where the extreme-sparsity
+      ticket is genuinely hard to find one-shot. Reuse the existing IMP harness;
+      just swap the dataset/budget and re-grade. Pure CPU, <5 min.
 - [ ] Init-scheme × depth heatmap: for depths {2, 4, 8, 16} and inits
       {Glorot, He, LeCun, plain N(0, 0.01)}, plot first-step gradient norm
       at the deepest layer.
@@ -400,31 +380,10 @@ rather than acted on.
       × activation functions on a fixed tiny MLP, report epochs-to-converge.
 - [ ] First-batch gradient-norm heatmap across (depth, width, init):
       enumerate a small grid, print one number per cell.
-- [ ] Train-time vs inference-time delta sweep for the noise layers
-      (TNNetDropout, TNNetDropPath, TNNetSpatialDropout1D/2D): same tiny
-      classifier, sweep `p ∈ {0.0, 0.1, 0.2, 0.4}`, chart train vs val loss.
-- [ ] Numerical-gradient eps sweep: pick one well-tested layer, run the
-      gradient check with `eps ∈ {1e-2, 1e-3, 1e-4, 1e-5, 1e-6}` and print
-      max-error vs eps.
-- [ ] Random-label memorization STRETCH follow-up: the landed
-      examples/RandomLabelMemorization/ does the binary true-vs-fully-shuffled
-      contrast; add the label-corruption-fraction sweep `p ∈ {0.0, 0.25, 0.5,
-      1.0}` and chart epochs-to-fit-train (rises with p) against the test gap
-      (widens with p) — the smooth interpolation between "real structure" and
-      "pure memorization". Fork the landed demo's net/data/training loop and add
-      a per-p corruption knob + an epochs-to-train>=0.99 counter. Keep dims tiny
-      so 4 corruption levels still fit the <5-min budget.
 ### Composite blocks / builders I'd enjoy shipping
 
 #### Attention / sequence
-- [ ] TNNetCausalConv1D follow-ups (layer landed 2026-05-31): (a) a DILATED
-      variant (WaveNet-style exponentially-growing receptive field via a
-      `Dilation` ctor param — left-pad by `Dilation*(K-1)`, skip taps at
-      `srcT<0` exactly as the dense form does); (b) it is now the ready 4th
-      contender for the open "causal-conv vs token-shift vs SDPA on the same
-      toy next-token task" experiment below — wire it in and chart loss +
-      per-step cost (its selling point is O(n*K) attention-free mixing).
-- [ ] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
+- [x] KV-cache incremental-decode path for TNNetScaledDotProductAttention —
       the single biggest efficiency gap for autoregressive generation with
       the downstream ../gpt-3-for-pascal model. Today, sampling the next
       token re-encodes the entire prefix every step, so generating N tokens
@@ -449,22 +408,16 @@ rather than acted on.
       AttentionWeights accessor and the MHA breakdown above
       ([[TNNetMultiHeadSelfAttention]] / TNNetTransformerDecoderBlock); a
       genuinely new capability, not a re-skin of an existing layer.
-- [ ] SpeculativeDecoding follow-up: the toy `mod`-sum target distribution is
-      fairly FLAT, so absolute accept rates are high even for a weak draft and
-      the speedup headline is carried by the monotone accept-rate RISE, not the
-      absolute %. Add a PEAKED-target variant (sharper next-token distribution,
-      e.g. a near-deterministic rule + low-temperature target) so the
-      weak-draft accept rate drops well below 1 and the calls-saved gap between
-      a good and bad draft widens — a more discriminating speedup chart.
-- [ ] SpeculativeDecoding follow-up: KV-cache composition — once the open
+- [x] SpeculativeDecoding follow-up: KV-cache composition — once the open
       KV-cache incremental-decode path lands, remove the per-verification-pass
       prefix recompute (the v1 demo recomputes the whole prefix each pass) so the
       two efficiency wins (fewer big-model calls x O(1)-per-step) compose.
-- [ ] TNNetDiagonalSSM follow-up: add it as the fourth contender in the
-      open "causal-conv vs token-shift vs SDPA on the same toy next-token
-      task" experiment — its selling point is matching attention quality
-      at linear cost.
-- [ ] KV-cache / incremental-decode O(1)-per-step path for
+      (DONE: TNNetScaledDotProductAttention.TruncateCache rollback +
+      TNNetSinusoidalPositionalEmbedding.PositionOffset; SpeculativeSampleCached
+      prefills once, verifies via one short cached window per pass, truncates on
+      rejection; token-exact vs v1 (mandatory gate), 2.9x vs plain / 3.9x vs v1
+      at ctx 24; unit test TestKVCacheTruncateThenReappendMatchesFresh.)
+- [x] KV-cache / incremental-decode O(1)-per-step path for
       TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
       the SDPA incremental-decode notes above apply doubly here).
 - [ ] TNNetTokenHistoryPenalty follow-up: wire it into the downstream
@@ -483,23 +436,20 @@ rather than acted on.
 - [ ] TNNetReversibleBlock follow-up: stack N reversible blocks into a deep net
       and show constant activation memory vs a plain residual stack of equal depth
       (the headline RevNet scaling claim) — depends on the recompute path above.
-- [ ] TNNetWeightStandardization follow-up: a CONVOLUTION variant
-      (standardize a conv layer's filters per output channel). The dense
-      form landed; the conv form is the headline WS use case (Qiao et al.
-      pair it with GroupNorm in a conv stack). Mirror the dense Jacobian
-      per output-channel filter. Pairs with a tiny WS+GroupNorm vs
-      BatchNorm CIFAR-stub bake-off.
-- [ ] TNNetSpectralNorm — CONVOLUTION variant (still open). The dense wrapper
-      landed; add a convolution-layer spectral-norm wrapper (largest singular
-      value of the flattened conv weight matrix per output channel / full
-      kernel) on top of `TNNet.EstimateSpectralNorm`, mirroring the dense
-      forward/backward (scale by 1/sigma, sigma treated constant in backward).
-- [ ] TNNetStochasticPool follow-up: a bake-off vs TNNetMaxPool / TNNetAvgPool /
-      TNNetSoftPool on a tiny image-classifier stub — does the stochastic
-      regularisation lower the train/val gap at matched architecture? Fork an
-      existing pooling example (examples/PoolingBakeoff/) and add the new arm.
-- [ ] TNNetShakeShake / TNNetShakeDrop — Shake-Shake regularization and
-      its single-branch ShakeDrop generalization.
+- [ ] TNNetSpectralNormConv follow-up: the landed wrapper normalizes by sigma_1
+      of the FLATTENED kernel matrix (out_channels x in*kx*ky), a single scalar
+      that BOUNDS but does not equal the true conv-OPERATOR spectral norm. Add a
+      true-operator variant (Sedghi et al. 2019 FFT-based conv spectral norm, or
+      a per-output-channel sigma) plus a small conv-SN bake-off / example vs the
+      flattened-matrix version.
+- [ ] ShakeShake follow-up (a): PER-SAMPLE alpha/beta grain — the landed
+      TNNetShakeShakeMerge / TNNetShakeDropMerge sample one alpha/beta/b_l per
+      forward/backward PASS (per-batch). Sample an independent coefficient per
+      batch-item instead (the paper's "Shake-Shake-Image" best variant). Needs a
+      per-sample scalar broadcast in Compute/Backpropagate and the
+      SetBatchUpdate(True) idiom from [[manual-gradient-and-snapshot-gotchas]];
+      keep eval deterministic. Add a test that two samples in one batch get
+      different effective scales.
 
 #### Channel attention / conditioning
 - [ ] TNNetCBAM follow-up: the landed AddCBAM uses TWO SEPARATE channel MLPs
@@ -545,82 +495,21 @@ rather than acted on.
       sub-block inside the layer (or a builder that wires an SE-style squeeze
       into the β path) and is NOT a per-channel-transform shape, so scope it as
       its own layer/builder rather than a ChannelTransformBase descendant.
-- [ ] TNNetBitLinear follow-up: activation-quantization variant — BitNet b1.58
-      also quantizes the *activations* to int8 (absmax per-token). Consider a flag
-      or sibling that rounds the layer INPUT through an absmax STE before the
-      ternary matmul, so the "fully-quantized linear" path is reachable. Scope as
-      its own flag on TNNetBitLinear (forward adds an input absmax-round; backward
-      STE-passes the input gradient unchanged).
-- [ ] TNNetAPL follow-up: APL-vs-PReLU-vs-ReLU bake-off on the hypotenuse toy
-      (or a tiny CIFAR stub) at matched param count, sweeping the hinge count
-      S ∈ {1, 2, 4} — does the extra piecewise capacity buy lower final loss?
-      This is a ~30-line activation swap.
 #### Probability projections / sparsity
-- [ ] TNNetGumbelSoftmax follow-up: temperature-annealing
-      micro-experiment — train a tiny discrete-latent autoencoder whose
-      bottleneck is a `TNNetGumbelSoftmax`, anneal `tau` from ~2.0 down to
-      ~0.1 over training, and chart reconstruction loss vs `tau` plus the
-      bottleneck's output entropy (the categorical sharpens as tau drops).
-      The layer + its soft/hard modes are in tree; this is the headline
-      use case. Pairs with the open hard-top-k MoE routing gate.
-- [ ] Hard top-k MoE routing + load-balancing auxiliary loss (follow-up to the
-      soft `TNNet.AddMixtureOfExperts` block) — run only the k highest-gated experts per token (sparse
-      dispatch) plus a load-balancing auxiliary loss so the gate does not collapse
-      onto one expert. Needs a top-k masking/dispatch mechanism on the gate plus
-      an aux-loss head; left out of v1 to avoid shipping an untested router. (The
-      TNNetGumbelSoftmax is the natural differentiable hard-routing gate.)
-- [ ] Mixture-of-Depths conditional-compute block (`TNNet.AddMixtureOfDepths` +
-      `examples/MixtureOfDepths/`) — reproduce the Raposo et al. 2024
-      "Mixture-of-Depths: Dynamically Allocating Compute in Transformer-Based
-      Language Models" idea on a TINY pure-CPU next-token target. MoD routes a
-      DIFFERENT axis than everything in tree: a per-token learned scalar router
-      decides WHETHER each sequence position is PROCESSED by a given block or
-      SKIPS it via the identity/residual path, under a fixed per-block CAPACITY
-      (only the top-C of SeqLen tokens by router score enter the block; the rest
-      bypass it unchanged). Compute is thus allocated dynamically per-token-
-      per-layer, and total FLOPs drop by `(SeqLen - C)/SeqLen` per wrapped block
-      at a STATIC, known cost (capacity is fixed, so the tensor shapes stay
-      static — the paper's key trick vs dynamic-shape sparse routing). Scope a
-      `TNNet.AddMixtureOfDepths(InputLayer, BlockBuilder, Capacity)` builder that:
-      (1) computes a per-token router logit (PointwiseConvLinear over Depth ->
-      (SeqLen,1,1), per the [[mha-builder-and-seq-projection]] rule that
-      per-token projection must be Pointwise, not FullConnect); (2) selects the
-      top-`Capacity` tokens (reuse the landed `TNNetTopK` masking primitive) and
-      multiplies the chosen tokens by the router's sigmoid/softmax WEIGHT so the
-      router stays on the gradient path (the paper's "router output multiplies
-      the block output" trick — without it the discrete top-k choice has no
-      gradient); (3) runs the wrapped shape-preserving block ONLY on selected
-      positions and adds it residually, leaving skipped positions at their input
-      value. Headline payoffs, both visible on the terminal and distinct from the
-      suite: (a) a FLOP/accuracy trade — sweep `Capacity in {SeqLen, SeqLen/2,
-      SeqLen/4}` on a tiny next-token task and chart final loss vs
-      processed-token fraction, showing graceful degradation as compute is cut
-      (the MoD selling point); (b) an INTERPRETABILITY view — print which token
-      POSITIONS the router consistently chooses to spend compute on, showing it
-      learns to skip "easy"/predictable positions. Built-in correctness anchor:
-      with `Capacity = SeqLen` the block is forced to process every token and the
-      net must be bit-for-bit equal to the same block wired WITHOUT the MoD
-      wrapper (router weight folds to a learned scalar gate per token) — pin that
-      degenerate case exactly, plus the LoadFromString round-trip of the wrapper
-      wiring, following the [[introspection-report-pattern]] test recipe.
-      Feasibility risks to settle honestly in v1, in the "what did NOT fit the
-      budget" style the [[Grokking]] entry uses: the top-k selection is a hard
-      discrete choice, so verify the router-weight-multiply path actually carries
-      gradient under the `SetBatchUpdate(True)` weight-accumulation idiom from
-      [[manual-gradient-and-snapshot-gotchas]] — pin it with a finite-difference
-      check that perturbs a router weight and central-differences the loss
-      against the scattered router delta (mirror the TNNetVectorQuantizer
-      codebook-delta test). Keep SeqLen/Depth tiny so the sweep fits the <5-min
-      pure-CPU budget. Genuinely DISTINCT from the open Hard-top-k MoE entry
-      above (MoE routes among N parallel EXPERT weight sets — "which expert
-      processes this token"; MoD routes a SINGLE block along the SEQUENCE axis —
-      "is this token processed at all", a conditional-compute / FLOP-saving
-      mechanism, not expert specialization), from `EarlyExitNetwork` (one whole
-      SAMPLE exits the net early at a fixed depth; MoD skips INDIVIDUAL TOKENS at
-      INDIVIDUAL blocks while the sample continues to the end), from
-      `TNNetDropPath` (STOCHASTIC whole-block drop, not a LEARNED capacity-limited
-      per-token route), and from the soft `AddMixtureOfExperts` (dense blend of
-      all experts, no token is ever skipped).
+- [ ] TNNetGumbelSoftmax / annealing follow-up: re-run the annealing AE on a
+      LESS-separated (overlapping) cluster set so the high-tau bottleneck entropy
+      actually starts near uniform (~ln K) and the sharpening sweep spans the full
+      entropy range — the current well-separated toy lives in the confident-routing
+      regime where even tau=2.0 is already near one-hot (honest caveat in its README).
+      Pure CPU, ~2 s.
+- [ ] AddMixtureOfDepths follow-up (builder + examples/MixtureOfDepths/ landed
+      2026-06-01): (a) add a load-balancing / capacity-utilisation auxiliary loss so
+      the router spreads its budget instead of fixating on a few positions; (b) a
+      Gumbel/learned-threshold router variant (the v1 uses a sigmoid + the existing
+      TNNetTopK top-Capacity mask); (c) the v1 example's learned allocation came out
+      mostly POSITIONAL on the test seed rather than a sharp hard-vs-easy content
+      split — design a next-token task where the triage provably tracks "hard"
+      tokens to make the interpretability headline land.
 #### Normalization primitives
 - [ ] TNNetUnitNormConstraint hard-projection variant: a true *post-step hard
       projection* (renormalize the previous layer's weights after each update,
@@ -628,40 +517,17 @@ rather than acted on.
       differentiable reparametrization (TNNetWeightNormLinear, landed) already
       covers the headline use case.
 
-#### Reduction / shape
-- [ ] TNNetUpsampleNearest backward consistency: assert summing the
-      per-block output errors equals the input error.
 ### Loss layers
-- [ ] TNNetQuantileLoss follow-up (landed 2026-05-31, head + examples/QuantileRegression/):
-      a SINGLE-model multi-quantile head — emit a 3-wide output and train all three
-      quantiles q in {0.1,0.5,0.9} jointly (per-channel q) in one forward pass instead
-      of three separate models, then add the monotonicity guard (sort/penalize so the
-      q=0.1 prediction never exceeds q=0.9 — "quantile crossing"). The landed example
-      uses three independent tiny MLPs; the joint head is the headline production form.
 - [ ] ArcFaceEmbedding follow-up: contrast the landed examples/ArcFaceEmbedding/
       against an actual plain-softmax head arm side by side — the demo currently
       shows the separation trend WITHIN ArcFace across margins m in {0,0.3,0.5},
       not ArcFace-vs-softmax head to head. Pairs with [[FeatureSeparability]] and
-      the open TNNetCenterLoss SOFTMAX-JOINT follow-up.
+      the landed examples/CenterLossSoftmaxJoint/ (softmax-only vs softmax+center
+      head-to-head).
 - [ ] TNNetKLDivergence distillation follow-up
       (examples/KnowledgeDistillation/): temperature sweep T in {1,2,4,8} on this
       example — chart how soft-target sharpness changes the distilled student's
       accuracy/agreement.
-- [X] Tversky α/β asymmetry sweep on the segmentation micro-example: with a
-      deliberately class-imbalanced mask, sweep `(α,β) ∈ {(0.5,0.5),(0.3,0.7),
-      (0.7,0.3)}` and show how β>α trades precision for recall (fewer false
-      negatives). Pure α/β knob study on the landed TNNetTverskyLoss.
-      Fork examples/DiceSegmentation/ and swap the head for TNNetTverskyLoss
-      with the three (α,β) pairs.
-- [ ] LabelSmoothing calibration check: train SimpleImageClassifier with
-      `TNNetLabelSmoothingLoss(eps)` at `eps ∈ {0, 0.05, 0.1, 0.2}` and feed
-      each into the `neuralcalibration` ECE/Brier report — the textbook claim
-      is smoothing improves calibration at a small accuracy cost.
-- [ ] TNNetCenterLoss follow-up: a true SOFTMAX-JOINT variant (or an example)
-      that wires the landed penalty head alongside a classification head and
-      shows the headline Wen et al. result — center loss tightens intra-class
-      feature clusters (visualise a 2-D embedding before/after). Pairs with the
-      [[FeatureSeparability]] example.
 - [ ] TNNetCenterLoss follow-up: cross-batch EMA-updated centers — needs a
       batch-aware loss hook (the per-sample FOutputError path is blind to other
       minibatch samples, the same limitation logged for a true cross-batch
@@ -671,23 +537,7 @@ rather than acted on.
       cross-batch EMA of assigned encoder vectors per code. Needs the same
       batch-aware loss hook logged for cross-batch InfoNCE / CenterLoss-EMA; track
       alongside those.
-- [ ] TNNetVectorQuantizer follow-up: report active-codebook usage (count of codes
-      selected at least once over a probe batch) to expose codebook collapse — the
-      headline VQ-VAE failure mode. Pairs with the open "VQ codebook collapse stress
-      test" experiment and the `examples/VQAutoencoder/` demo below.
-
 ### Training infrastructure (the "missing plumbing")
-- [ ] TNeuralLRScheduler follow-up: WIRE the scheduler into the training loop —
-      have TNeuralFit/TNeuralImageFit call `NextLR(Epoch, Step)` each
-      epoch/step (gated behind an optional Scheduler property so the default
-      fixed-LR path is byte-for-byte unchanged), plus a regression test that a
-      net trained under a constant-valued scheduler matches the fixed-LR run.
-      The classes + math are landed; this is the integration the "missing
-      plumbing" entry ultimately wants.
-- [X] StochasticWeightAveraging helper — TNNet wrapper maintaining a running
-      average of live weights every N steps after epoch W.
-- [X] TNNetEMAWrapper / SetEmaShadow — exponential moving average of network
-      weights for inference, sibling to SWA.
 - [ ] SWA/EMA integration follow-up: the landed TNNetSWAWrapper / TNNetEMAWrapper
       (neuralnetwork.pas) are standalone wrappers the CALLER must drive — nothing in
       TNeuralFit calls them yet. Wire an optional hook into the training loop (call
@@ -698,23 +548,15 @@ rather than acted on.
       win is a flatter, better-generalising averaged solution). Mirror the open
       TNeuralLRScheduler-wiring follow-up's "opt-in, regression-test the default is
       unchanged" discipline.
-- [ ] Lookahead optimizer wrapper — every k inner SGD steps, set slow weights
-      `φ ← φ + α·(θ - φ)` and rewind fast weights to φ.
-- [ ] GradientClipping options on TNeuralFit — the global `clip_norm` path
-      already exists (TNeuralFitBase.ClipNorm -> NormalizeNormPerLayer in
-      neuralfit.pas). Remaining piece: an element-wise `clip_value` option that
-      clamps each weight gradient to [-v, v] before the optimizer step (a separate
-      knob from per-layer norm clipping), with a regression test that clip_value=0
-      leaves the fixed-LR path byte-for-byte unchanged.
+- [ ] TNNetGrokfastWrapper follow-up (caller-driven slow-gradient amplifier in
+      the SWA/EMA/Lookahead wrapper family landed 2026-06-05; per-weight gradient
+      EMA mu := beta*mu + (1-beta)*g rewriting live gradients g := g + lambda*mu,
+      three tests in TestNeuralTraining.pas): wire it into the still-open
+      examples/Grokking/ demo as the Grokfast-on vs -off grok-epoch contrast (the
+      published fix for that demo's <5-min pure-CPU budget). Also ship the paper's
+      cheaper Grokfast-MA (windowed moving average) variant alongside the EMA form.
 - [ ] Layerwise learning-rate multipliers — per-layer `LRMult` field that
       the optimizer respects. Unlocks discriminative fine-tuning.
-- [ ] NaN/Inf guard follow-up: the regression tests cover the ISOLATED
-      detector helper, not the in-LOOP abort. Add an end-to-end test that runs
-      a short TNeuralFit with `NaNGuard := True` on a net rigged to produce a
-      non-finite activation (e.g. an aggressive LR / a planted Inf weight) and
-      assert training aborts (FShouldQuit set / FErrorProc fired) rather than
-      running to the epoch budget.
-- [X] Mixup data augmentation helper.
 - [ ] Mixup follow-up: the landed examples/Mixup/ toy is LINEARLY SEPARABLE so both
       the plain and mixup-augmented arms hit ~100% val accuracy — the helper is
       pinned by unit tests but the demo does not yet SHOW mixup winning. Add a
@@ -767,54 +609,11 @@ rather than acted on.
       the natural precursor to gradient-surgery / PCGrad — add an experiment that
       reweights or projects out the most-conflicting class pair's gradient and
       charts the batch-loss delta.
-- [ ] EffectiveReceptiveFieldReport follow-up: add the optional `(radius, mass-
-      fraction)` CSV side-output so the cumulative-mass curve can be plotted
-      outside the terminal (~10 lines, mirrors the CSV side-output in
-      DecisionBoundaryReport / the AdversarialRobustnessReport CSV follow-up).
-- [ ] EffectiveReceptiveFieldReport follow-up: sweep dilation / kernel size on
-      the stem and chart effective-RF growth vs theoretical-RF growth — the
-      headline Luo et al. 2016 "effective RF grows sub-linearly" curve.
-- [ ] NeuralTangentKernelReport follow-up: the fresh-init-vs-trained NTK-DRIFT
-      contrast deliberately left out of the first landing (commit 857f679). Add an
-      optional second-net / snapshot argument (mirror `ModeConnectivityReport`'s
-      `SnapshotB` or `RepresentationSimilarityReport`'s `OtherNet`) so the report
-      quantifies how far the empirical NTK moved between two checkpoints — e.g. the
-      relative Frobenius drift `||K_trained - K_init||_F / ||K_init||_F` and the
-      change in kernel-target alignment. Headline payoff: ≈0 drift = the
-      infinite-width "lazy / kernel" regime, large drift = "rich" feature learning
-      (the lazy-vs-rich question made visible). Then extend the existing
+- [ ] NeuralTangentKernelReport follow-up: extend the existing
       `examples/NeuralTangentKernelReport/` to contrast a WIDE vs NARROW hidden
-      layer and show the wide net's NTK drifts less. Reuse the snapshot machinery
-      already proven in ModeConnectivity/PermutationAlign.
-- [ ] `TNNet.TunedLensReport` — the *learned* sibling of the already-landed
-      zero-parameter `LogitLensReport` (Belrose et al. 2023, "Eliciting Latent
-      Predictions with the Tuned Lens"). The logit lens splices a raw hidden
-      activation straight into the model's OWN frozen head; the tuned lens first
-      runs each layer's activation through a small per-layer learned AFFINE
-      "translator" (`TNNetFullConnectLinear(headInputDim)`, one per lens-
-      compatible layer) that is TRAINED to map that layer's residual state into
-      the final-layer basis BEFORE the frozen head decodes it — correcting the
-      representation drift / basis-mismatch that makes the raw logit lens biased
-      and over/under-confident at early depths. Scope: (a) freeze the trunk +
-      head, attach one translator per lens-compatible layer, train only the
-      translators by minimising each layer's KL to the model's final output
-      distribution on an UNLABELLED probe batch (the distillation-to-self target,
-      reusing the frozen-body + downstream-recompute splice idiom from
-      `LogitLensReport` / `ActivationPatchingReport`); (b) emit the per-layer
-      tuned-lens distribution, its entropy, and its KL-to-final, side by side
-      with the raw logit-lens columns so the headline Belrose result is visible —
-      the tuned curve commits EARLIER and tracks the final answer more faithfully
-      (lower KL-to-final, monotone-ish) than the raw lens. Built-in correctness
-      signals: at the LAST layer the translator collapses to identity and tuned
-      == logit == final (max |Δp| ≈ 0); an UNTRAINED translator must do no better
-      than the raw logit lens (KL-to-final not lower) — only after fitting does it
-      win. Ship `examples/TunedLens/` forking the existing LogitLens net/task
-      (constant-width `6 -> FC10+ReLU x4 -> FC4 -> SoftMax`) so the two lenses are
-      directly comparable on the SAME probe batch, plus a `TestTunedLensSmoke`
-      following the introspection-report test recipe. Distinct from LogitLens
-      (zero params, no fitting), LinearProbeReport (probes for an EXTERNAL label,
-      not the model's own next-layer basis), and ActivationSteering (edits
-      activations, doesn't decode them). See [[introspection-report-pattern]].
+      layer and show the wide net's NTK drifts less (lazy vs rich regime made
+      visible) — the report machinery (incl. the landed `SnapshotB` drift arg) is
+      in place, only the example arm remains.
 
 ### Bugs surfaced by the introspection-report batch
 - [ ] `TNNetFlipX.Backpropagate` (and likely `TNNetFlipY`) range-check
@@ -1004,14 +803,6 @@ rather than acted on.
       Subsumes the long-pinned Volume micro-benchmark and extends it to
       layers.
 ### Examples I'd enjoy writing
-- [ ] `examples/TinyGPT/` — char-level transformer end-to-end demo on
-      a short text snippet (Tiny Shakespeare or repeated arithmetic).
-      Highest-value example missing from the repo; natural capstone for
-      the transformer-building-blocks line of work.
-- [ ] EchoStateNetwork follow-up: add a `TNNetSpectralRadius` helper (power
-      iteration on W·v only, no W^T step) so reservoirs can target the true
-      spectral RADIUS rather than the conservative spectral-norm upper bound
-      EstimateSpectralNorm gives — would let rho_target be set directly <1.
 - [ ] EchoStateNetwork follow-up: an optional ridge closed-form readout solve
       (normal equations) as a deterministic alternative to the SGD readout loop,
       showing the classic ESN one-shot linear fit (the SGD loop is LR-sensitive).
@@ -1027,14 +818,11 @@ rather than acted on.
       stops climbing cleanly (bounces ~14% at LR=1.0). A finer high-LR grid with
       a few seeds (mean +/- std) would show whether the bounce is a seed artifact
       or a real saturation/recovery transition.
-- [ ] `examples/AnomalyAutoencoder/` — train an autoencoder on MNIST
-      digit "0", evaluate reconstruction error on all 10 digits, print
-      AUROC.
+- [ ] `examples/AnomalyAutoencoder/` MNIST follow-up: an MNIST digit-"0"
+      variant with per-digit AUROC (the landed synthetic demo is reliable/fast,
+      but a real-image arm is still open).
 - [ ] `examples/SpokenDigitKWS/` — 1D-conv keyword-spotting on FSDD:
       MFCCs → 1D conv stack → classification.
-- [ ] `examples/TimeSeriesForecast/` — one-screen forecasting demo on a
-      synthetic seasonal+trend series with a 1D-conv or tiny attention
-      model.
 - [ ] `examples/GradientFlowVisualizer/` — train a deep MLP with and
       without LayerNorm/RMSNorm and print per-layer gradient-norm tables
       across steps.
@@ -1111,44 +899,95 @@ rather than acted on.
       agree with their textbook formula.
 
 ### Experiments I'm curious about (additional)
-- [ ] `examples/InformationPlane/` (optionally backed by a
-      `TNNet.InformationPlaneReport` introspection method, [[introspection-report-pattern]])
-      — reproduce the **information-plane trajectory** of the Information
-      Bottleneck story (Tishby & Zaslavsky 2015; Shwartz-Ziv & Tishby 2017,
-      "Opening the Black Box of Deep Neural Networks via Information"): for a
-      tiny fully-connected classifier on a small synthetic binary task, track
-      the mutual information pair `(I(X;T), I(T;Y))` of EACH hidden layer `T`
-      across training epochs and plot every layer's path through the 2-D
-      information plane as an ASCII scatter. The narrative target is the two
-      reported phases — a fast **fitting/ERM** phase where both `I(X;T)` and
-      `I(T;Y)` rise, followed by a slow **compression** phase where `I(X;T)`
-      DROPS while `I(T;Y)` stays high (the layer forgets input detail
-      irrelevant to the label). MI is estimated with the original *binning*
-      estimator: discretize each neuron's bounded activation into B equal-width
-      bins, treat the per-sample bin-tuple as a discrete code, and compute
-      plug-in entropies `I(X;T)=H(T)-H(T|X)` and `I(T;Y)=H(T)-H(T|Y)` from
-      empirical histograms — no new gradient machinery, only forward-pass
-      activation collection over the full dataset at each logged epoch. This is
-      a DIFFERENT axis from everything already shipped: [[RepresentationSimilarity]]
-      (CKA = representation geometry, not MI), IntrinsicDimension /
-      PredictionDepth (per-example geometry), and the SLT/curvature reports
-      (LocalLearningCoefficient, HessianCurvature, FisherImportance — posterior
-      volume & 2nd-order curvature, never input/label MI). HONEST headline in
-      the house "what did NOT reproduce" style: the binning estimator REQUIRES
-      a saturating activation to show compression — use `TNNetFullConnect`
-      (tanh, bounded -> bins are meaningful) for the headline run, and document
-      Saxe et al. 2018 ("On the Information Bottleneck Theory of Deep
-      Learning") which showed the compression phase is largely an artifact of
-      double-saturating nonlinearities and binning: ship a built-in
-      contrast arm with a ReLU trunk (`TNNetFullConnectReLU`, unbounded ->
-      fixed-width binning is ill-defined and the clean compression bend
-      vanishes), so the example itself demonstrates the controversy rather than
-      overclaiming. Document the known pitfalls: MI is upper-bounded by
-      `log2(#samples)` and by `B^width`, so keep width/B/sample-count balanced
-      (e.g. B=30, hidden width ~4-6, a few thousand samples) and state that the
-      absolute MI values are estimator-dependent — the robust, reproducible
-      signal is the SHAPE of the trajectory and the tanh-vs-ReLU difference,
-      not the nats. Pure CPU, tiny MLP, <5-min budget.
+- [ ] TNNetInformationPlaneReport follow-up: examples/InformationPlane/ LANDED
+      2026-06-07 on a2 (commit dd5e983) — tiny tanh FC classifier whose binning-MI
+      information-plane trajectory reproduces the compression bend (tanh arm) while
+      a ReLU arm stays flat (the Saxe et al. 2018 contrast); MI is computed inline.
+      The optional `TNNet.InformationPlaneReport` introspection method
+      ([[introspection-report-pattern]]) was NOT added — promote the binning-MI
+      collector to a report method if a second consumer appears.
+- [ ] `examples/CurriculumLearning/` — does **sample ordering by difficulty**
+      help? Reproduce the curriculum-learning effect (Bengio et al. 2009,
+      "Curriculum Learning") on a tiny self-contained task and, crucially, ship
+      the contrast arm that shows when it does NOT, in the house "what did NOT
+      reproduce" style. Pipeline, no new layer/gradient machinery: (1) build a
+      small synthetic classification set with a controllable difficulty signal
+      per sample — e.g. 2-D two-spirals or concentric-rings where difficulty =
+      radius / closeness to the decision boundary, OR a noisy-label task where a
+      known fraction of labels are corrupted (corrupted = hardest). (2) Score
+      every training sample's difficulty ONCE up front with a cheap proxy
+      already in the library: the per-sample loss / classification margin from a
+      brief warm-up model (reuse the margin/difficulty scoring that
+      [[MarginReport]] and the "hardest examples" pool already compute — do NOT
+      invent a new scorer). (3) Train four arms from the SAME seed/init/budget,
+      differing only in the order/schedule in which samples enter the minibatch
+      stream: **easy->hard** (curriculum, difficulty threshold relaxed over
+      epochs — "baby steps" pacing), **hard->easy** (anti-curriculum),
+      **random** (the honest baseline), and **easy-only** (drop the hardest
+      tail entirely — a difficulty-based data-pruning control). Headline plot is
+      an ASCII val-accuracy-vs-epoch curve per arm plus final test accuracy, so
+      the reader sees both the convergence-SPEED story (curriculum's main
+      documented win is faster early progress / better optimization on hard,
+      structured tasks) and the final-accuracy story (often a wash on easy
+      tasks). HONEST framing, because the literature is genuinely mixed: cite
+      Hacohen & Weinshall 2019 ("On the Power of Curriculum Learning") for when
+      ordering helps, and state plainly that on a clean, easily-separable task
+      random order frequently ties or beats curriculum — the robust,
+      reproducible signal here is (a) curriculum's faster EARLY epochs and (b)
+      anti-curriculum's reliably WORSE early epochs, not a final-accuracy
+      miracle. On the noisy-label variant, the expected and most useful result
+      is the opposite-of-naive one: feeding the hardest (mislabeled) samples
+      first hurts, and easy-only data-pruning can match full-data training —
+      tying this experiment to the label-noise / [[FisherImportance]] /
+      RandomLabelMemorization thread already in the repo. This is a DIFFERENT
+      axis from everything shipped: it varies the DATA ORDER at fixed
+      architecture/optimizer, whereas the scheduler/optimizer bake-offs vary the
+      training rule and the pruning experiments vary the weights. Pure CPU, tiny
+      MLP, deterministic seed, <5-min budget.
+- [ ] `examples/MaximalUpdateParametrization/` (optionally backed by a
+      `TNNet.CoordinateCheckReport` introspection method,
+      [[introspection-report-pattern]]) — demonstrate **muP / hyperparameter
+      transfer across width** (Yang & Hu 2021, "Tensor Programs V: Tuning Large
+      Neural Networks via Zero-Shot Hyperparameter Transfer"). Train the SAME
+      tiny MLP at a ladder of hidden widths (e.g. 32 / 128 / 512 / 2048) and
+      sweep the learning rate at each width, under two parametrizations:
+      (a) standard parametrization (SP) — the usual `1/sqrt(fan_in)` init the
+      library already uses, plain global LR; (b) muP — input/output-layer and
+      hidden-layer init variances and per-layer LR multipliers rescaled by
+      width per the muP table (hidden LR scaled `1/width`, output logits scaled
+      `1/width`, input untouched). The headline is the LR-vs-loss curve: under
+      SP the loss-minimizing LR DRIFTS leftward as width grows (the optimum you
+      tuned on the narrow net is wrong for the wide one), while under muP the
+      curves' minima stay ALIGNED at a single width-invariant LR — so you can
+      tune on width-32 and transfer the winner straight to width-2048 with no
+      re-tuning. Ship the *coordinate check* as the mechanistic diagnostic that
+      explains WHY: log each layer's mean absolute activation (`GetAvgAbs`) at
+      init and after a handful of SGD steps across the width ladder (mean abs =
+      `GetSumAbs/Size` on each layer's `Output`) — under muP
+      every layer's coordinate magnitude stays O(1) / flat vs width, under SP
+      the pre-logit activations grow (or the updates do), which is exactly the
+      mechanism that shifts the stable LR. This is a DIFFERENT axis from
+      everything shipped: it's about *parametrization & width-scaling of
+      training dynamics*, not representation geometry
+      ([[RepresentationSimilarity]]), posterior degeneracy / curvature
+      (LocalLearningCoefficient, HessianCurvature, FisherImportance), or the
+      single-width LR-stability threshold of [[EdgeOfStability]] (EoS asks "how
+      large can LR be before divergence at ONE width"; muP asks "does the GOOD
+      LR stay put as width changes" — orthogonal questions). HONEST headline in
+      the house "what did NOT fit the budget" style: the clean transfer needs
+      the full muP recipe (init scaling AND per-layer LR multipliers AND the
+      `1/width` output scaling) — ship a built-in ablation arm that applies only
+      the init half and show the minima still drift, so the example proves all
+      three pieces are load-bearing rather than overclaiming from a partial
+      implementation. Note the pitfall to document: the alignment is most
+      visible when the narrowest rung is already wide enough to be in the
+      asymptotic regime (width >= 32) and the LR grid is logarithmic and shared
+      across widths; state that the robust, reproducible signal is the
+      *alignment of the minima* and the flat coordinate-check, not the absolute
+      loss values. Pure CPU, tiny MLPs, no new gradient machinery — only
+      per-layer LR/init scaling (the per-layer `TNNetLayer.LearningRate`
+      property and weight-init knobs already exist) plus forward-pass
+      `GetSumAbs` activation collection.
 - [ ] LogSoftMax+NLL vs SoftMax+CE convergence parity test: same seed,
       same tiny classifier, plot val-loss curves.
 - [ ] Shrink-activation sparsity sweep: ReLU / SoftShrink / HardShrink as
@@ -1183,7 +1022,6 @@ rather than acted on.
       attention skeleton.
 - [ ] DyT-vs-LayerNorm bake-off — a 30-line swap in the existing normalization
       bake-off harness (or a small standalone synthetic-regression A/B).
-- [ ] Causal-conv vs token-shift vs SDPA on the same toy next-token task.
 - [ ] GRN-as-drop-in: take SimpleImage CIFAR, swap each
       TNNetMovingStdNormalization for TNNetGRN and chart accuracy.
 - [ ] TNNetChannelBias-vs-TNNetChannelMul ablation: train a small
@@ -1206,12 +1044,9 @@ rather than acted on.
       — (a) no attention, (b) SE, (c) CBAM, (d) hand-rolled "1x1 + sigmoid".
 - [ ] FiLM-vs-concat conditioning bake-off on a class-conditional MNIST
       decoder.
-- [ ] VQ codebook collapse stress test: K in {16, 64, 256} and a few
-      commitment-loss weights, report per-run active codebook entries.
 - [ ] "Memorize a sentence" demo: train a 1-layer SDPA+RoPE model to
       perfectly memorize a 32-token sequence, print training loss curve
       and reconstructed sample.
-- [ ] "Learn to reverse" toy: SeqLen=8 input → output the reversed sequence.
 - [ ] "Smallest net that can learn parity-N" study — sweep N ∈ {2, 4, 6, 8}.
 - [ ] Grokking demo (`examples/Grokking/`) — reproduce delayed generalization
       (Power et al. 2022) on a pure-CPU toy. Train a tiny MLP on modular
@@ -1403,11 +1238,9 @@ rather than acted on.
       TNNetCharbonnierLoss.
 - [ ] "Learning-rate schedulers" README subsection — one paragraph per
       schedule with a snippet showing how to wire it into TNeuralImageFit.
-      The scheduler classes (TNeuralLRScheduler family) have landed; the
-      Fit-integration is still the open follow-up under "Training infrastructure".
-- [ ] "Introspection" README subsection — group CountLayers/Neurons/Weights
-      with the new PrintSummary / FLOPs / WeightHistogram / DeadNeuronReport
-      utilities.
+      The scheduler classes (TNeuralLRScheduler family) and the TNeuralFit
+      integration (the optional Scheduler property driving NextLR each epoch)
+      have both landed; this is the remaining README write-up.
 - [ ] "Layer index by family" README appendix — alphabetical-within-family
       table (Convolution / Pooling / Activation / Normalization / Attention
       / Loss / Shape / Regularization).
@@ -1468,6 +1301,33 @@ rather than acted on.
       worked example.
 
 ### Stretch / ambitious
+- [ ] `TNNetLegendreMemoryUnit` follow-up: make the window length `theta` a
+      LEARNABLE per-channel parameter (v1 keeps it a fixed build-time constant)
+      — store a raw scalar/vector, recompute `Abar/Bbar` (or fold `1/theta`
+      through the recurrence) so the discretization is differentiable, and add a
+      `dL/dtheta` term to the adjoint scan. Optional: a `TNNetHyperLMU` that
+      reads `theta` (or `Wout`) from a second input tensor like `TNNetHyperLinear`.
+- [ ] `TNNet.AddForgettingAttention` (FoX) follow-up: add
+      `examples/ForgettingTransformer/` once a CPU-cheap synthetic task is found
+      where the data-dependent decay reliably beats both plain SDPA and a
+      fixed-slope ALiBi baseline. First attempt (a gated post-reset-mean task)
+      confirmed the MECHANISM is correct — an attention diagnostic showed FoX's
+      learned gate drives `f~0` at the reset token and the query attends
+      UNIFORMLY over post-reset keys while zeroing pre-reset keys — but ALiBi's
+      recency prior was a hard-to-beat baseline on that particular setup, so the
+      example was deferred to avoid shipping a misleading "WARNING: FoX did not
+      beat baselines" headline. Also implement the paper's "Pro" variant
+      (per-head sigmoid output-gate + QK-norm) as opt-in flags on
+      `AddForgettingAttention`.
+- [ ] `TNNetTitansMemory` follow-up — a **gated-DeltaNet-style chunked parallel
+      scan** forward for `TNNetTitansMemory`, replacing the sequential O(SeqLen)
+      inner-gradient scan with a chunked associative/parallel recurrence (the
+      hardware-efficient training path Titans/Gated-DeltaNet use); must keep the
+      exact second-order BPTT semantics and pass the existing gradient checks.
+- [ ] `TNNet.AddTitansMemory` builder — a **MAC residual builder** wrapping
+      `TNNetTitansMemory` (token-shift + per-token k/v/q projections + the neural
+      memory leaf + residual/out-projection), the drop-in Memory-as-Context block,
+      mirroring `AddGatedLinearAttention` / `AddRWKVTimeMix`.
 - [ ] `examples/TinyDiffusion/` — a 20-step denoising-diffusion model on
       8x8 grayscale MNIST patches using a tiny FiLM-conditioned U-Net with
       TNNetSinusoidalTimeEmbedding (FiLM and the timestep embedding are both
@@ -1478,6 +1338,20 @@ rather than acted on.
       1e-2.
 
 ### Introspection (added)
+- [ ] LRPReport follow-up (landed 2026-06-05): the shipped epsilon-rule only
+      back-distributes through the DENSE (TNNetFullConnect family) + activation
+      stack — conv / pointwise-conv layers are honestly SKIPPED. Add a CONV
+      relevance rule (epsilon-rule over the conv receptive field, distributing
+      R_j across the input patch that produced output j) so the report works
+      end-to-end on a real SimpleImage-style CNN, not just an MLP. Reuse the
+      conv Compute's patch-iteration; assert conservation residual stays O(eps)
+      on a tiny conv probe in the smoke test.
+- [ ] TNNetCosineSimilarityAttention bake-off (now easier — learnable scale
+      landed 2026-06-05): plain SDPA vs cosine-attn (fixed scale) vs cosine-attn
+      (learnable scale) vs SDPA+TNNetSoftCapping on the PositionEncodingBakeoff
+      tiny next-token harness — does the bounded `[-scale,+scale]` logit remove
+      the NaN/overflow events SoftCapping targets, at matched final loss, and
+      does the learnable scale beat the fixed one?
 - [ ] FeatureSeparabilityReport follow-up: the scatter-
       decomposition identity `tr(Stot)=tr(Sw)+tr(Sb)` is only exact for
       class-balanced batches (the report uses class-balanced `mean_c`
@@ -1489,34 +1363,12 @@ rather than acted on.
       calls the report every N epochs on a fixed probe set and charts
       `tr(Sw)` collapse + Fisher-ratio climb over training — the cleanest
       single-number window into the terminal phase / neural collapse. Pairs
-      with the open grokking / lottery-ticket experiments
+      with the open grokking experiment and the landed lottery-ticket experiment
       ([[WeightSpectrumReport]]).
-- [ ] `TNNet.NeuralCollapseReport` + `examples/NeuralCollapse/` — measure the
-      four canonical Neural-Collapse metrics (Papyan, Han & Donoho 2020, "Prevalence
-      of neural collapse during the terminal phase of deep learning training") on a
-      probe set of penultimate-layer features. Genuinely distinct from the existing
-      `FeatureSeparabilityReport` and its line-1415 trajectory follow-up: those stop
-      at the `tr(Sw)` collapse + Fisher-ratio *magnitude* (a partial NC1), whereas the
-      headline NC result is the *simplex-ETF geometry* (NC2), which nothing in the tree
-      computes. Report all four: NC1 = within-class variability collapse
-      `tr(Sw·Sb^+)/C` → 0 (reuse FeatureSeparability's class-mean / scatter machinery,
-      do NOT re-derive it); NC2 = convergence to a simplex equiangular tight frame —
-      the centered class means become EQUINORM (coefficient of variation of `||mean_c −
-      global_mean||` → 0) and EQUIANGULAR (every pair's cosine → `−1/(C−1)`, so print
-      the mean and max deviation from that target — this angle check is the novel,
-      visually striking piece); NC3 = self-duality, cosine alignment between the
-      centered class-mean matrix and the final classifier weight rows (skip honestly,
-      flagged, if the head is not a width-matched `TNNetFullConnectLinear` /
-      `TNNetPointwiseConvLinear`); NC4 = classifier collapses to nearest-class-mean,
-      i.e. fraction of probe points whose argmax logit equals their nearest centered
-      class mean. The example trains a small classifier WELL past zero train-error
-      (the "terminal phase") and calls the report every N epochs on a fixed probe to
-      chart the C−1 pairwise cosines converging onto the `−1/(C−1)` line as an ASCII
-      trajectory — the simplex assembling itself. Pure CPU, no dataset download (a
-      synthetic few-class Gaussian-blob task is enough to exhibit collapse). Follow the
-      introspection-report recipe ([[introspection-report-pattern]]): decl + impl +
-      smoke test (pin NC2's equiangular target on a hand-built exact-simplex feature
-      set so the cosine math is verified independent of training) + README + docs row.
+- [ ] NeuralCollapseReport follow-up: the landed NC1 uses the diagonal trace-ratio
+      surrogate `tr(Sw)/tr(Sb)`. A true `tr(Sw·Sb^+)/C` NC1 (full matrix
+      pseudo-inverse) would need an eigensolver/SVD helper — track if a second
+      consumer wants it.
 - [ ] ModeConnectivityReport follow-up: make the connected/weak-barrier/
       separated verdict robust when the endpoint losses are near zero. As
       landed, the verdict uses a barrier-relative-to-endpoint-loss ratio, so
@@ -1536,7 +1388,7 @@ rather than acted on.
       knee to ~1% resolution instead of the 10%-grid step. ~20 lines on top of the
       landed sweep; the curve already brackets the knee.
 - [ ] MagnitudePruningReport follow-up: this is the no-retrain precursor to the
-      open "Lottery-ticket"-flavored experiment — wire the two together so the
+      landed "Lottery-ticket" experiment (examples/LotteryTicket) — wire the two together so the
       knee found here seeds the prune level, then RETRAIN from the original init
       and chart whether the pruned-then-retrained net recovers the baseline
       accuracy (the lottery-ticket claim). The report already snapshots/restores
@@ -1565,8 +1417,8 @@ rather than acted on.
 - [ ] IntrinsicDimensionReport follow-up: a training-trajectory variant that
       calls the report every N epochs on a fixed probe set and charts the
       final-layer ID dropping over training — a single-number window into
-      representation compression. Pairs with the open grokking / lottery-ticket
-      experiments ([[WeightSpectrumReport]]) and mirrors the open
+      representation compression. Pairs with the open grokking experiment and the
+      landed lottery-ticket experiment ([[WeightSpectrumReport]]) and mirrors the open
       FeatureSeparabilityReport training-trajectory follow-up.
 - [ ] WeightSpectralTailReport follow-up: the spec's 3-way example (fresh /
       well-trained / over-fit nets ranked by held-out accuracy, validating
@@ -1613,45 +1465,29 @@ rather than acted on.
       a built-in sanity check. Gate behind a `Steps` parameter (Steps=1 ==
       today's FGSM).
 
-### Parameter importance (continual learning / pruning)
-- [ ] EWC two-task experiment building on the landed
-      TNNet.FisherImportanceReport: train on task A, snapshot the diagonal
-      Fisher, then train on task B with an L2 penalty pulling high-Fisher
-      params back toward their task-A values; chart task-A retention with and
-      without the penalty.
-
 ### Loss-landscape degeneracy (Singular Learning Theory)
-- [ ] `TNNet.LocalLearningCoefficientReport` + `examples/LocalLearningCoefficient/`
-      — estimate the *local learning coefficient* (LLC, an empirical
-      RLCT) of a trained network from Singular Learning Theory (Watanabe;
-      Lau, Murfet, Wei et al. 2023, "Quantifying Degeneracy in Singular
-      Models via the LLC"). This measures the volume-scaling /
-      effective-dimensionality of the minimum the optimizer settled into —
-      a fundamentally DIFFERENT quantity from the already-landed
-      `HessianCurvatureReport` / [[EdgeOfStability]] top-eigenvalue (which
-      is purely 2nd-order and blind to flat, degenerate directions that the
-      LLC is precisely designed to count). Estimator is the SGLD-based
-      WBIC/free-energy form: from the trained weights `w*`, run a short
-      tempered SGLD chain that samples the local posterior with a Gaussian
-      anchor `gamma/2 * ||w - w*||^2` pinning it to the basin, then
-      `LLC_hat = n*beta * ( mean_chain[ L(w) ] - L(w*) )` where `L` is the
-      average training NLL, `n` the sample count, and `beta = 1/log(n)` the
-      WBIC inverse-temperature. Pure CPU, tiny MLP. The honest headline (in
-      the "what did NOT fit the budget" style the [[Grokking]] entry uses):
-      report the LLC and contrast it with the raw parameter count to show
-      `LLC_hat << dim(w)` — the network uses far fewer *effective* degrees
-      of freedom than it has weights. A clean built-in sanity check: a
-      deliberately over-parameterised net (duplicate-then-halve a hidden
-      layer so two units are forced redundant) should have a LOWER LLC than
-      a minimal net fitting the same function, because the duplicated
-      directions are flat/degenerate. The SGLD chain reuses the existing
-      backward pass (no new gradient machinery); the only new infrastructure
-      is the anchored-Langevin weight update + chain averaging, which can
-      live entirely inside the report method. NOTE the known pitfall to call
-      out in the README: LLC estimates are sensitive to the SGLD step size
-      `epsilon` and localisation `gamma` — ship a fixed, documented
-      (epsilon, gamma, chain-length) and a one-line caveat that the absolute
-      value is calibration-dependent but the *ordering* (minimal < redundant
-      < random-init) is the robust, reproducible signal. Pairs with
-      [[FisherImportance]] (Fisher = local 2nd-order curvature; LLC = the
-      degeneracy-aware generalization of "effective parameter count").
+- [ ] `TNNet.LocalLearningCoefficientReport` follow-up (the empirical local learning
+      coefficient / RLCT report from Singular Learning Theory — anchored tempered SGLD
+      `LLC_hat = n*beta*(mean_chain[L(w)] - L(w*))` — LANDED 2026-06-07 on a2, commit
+      be56591: signature `LocalLearningCoefficientReport(NN, Samples; ChainLen=40,
+      Eps=1e-5, Gamma=1.0)`, non-destructive w* snapshot/restore, smoke test in
+      TestNeuralLayersExtra.pas, examples/LocalLearningCoefficient/. HONEST FINDING: at
+      CPU-toy chain length the reproducible signal is trained-vs-untrained, not the fine
+      minimal-vs-over-parameterised ordering — see [[local-learning-coefficient-report]]):
+      - [ ] longer/multi-chain averaging (or a calibrated eps/gamma sweep) to recover
+            the minimal < redundant ordering reproducibly within budget.
+
+
+### Normalizing flows (exact-likelihood generative density)
+- [ ] Glow full-step example follow-up (the three flow primitives ActNorm ->
+      TNNetInvertible1x1Conv -> TNNetAffineCoupling have all landed): upgrade
+      examples/NormalizingFlow/ to the FULL Glow step
+      (ActNorm -> Invertible1x1Conv -> AffineCoupling). BLOCKER: that harness
+      computes one sample at a time (input (1,1,2), a single spatial position per
+      forward), so ActNorm's minibatch data-dependent init sees std~0 and logs
+      blows up. Needs a batched/multi-position warm-up forward before training;
+      keep it under the <5-min / numerical-stability budget. Show the added
+      data-dependent normalization improves training stability / mean
+      log-likelihood over the current two-layer flow (the Invertible1x1Conv note
+      records "glow training unstable at coupling LR" — ActNorm is the paper's
+      fix for that instability).

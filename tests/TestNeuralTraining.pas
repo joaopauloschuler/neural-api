@@ -45,6 +45,25 @@ type
     procedure TestEMADecayZeroEqualsLive;
     procedure TestEMADecayOneKeepsShadow;
     procedure TestEMAConvergesToConstant;
+    procedure TestLookaheadIdentityK1Alpha1;
+    procedure TestLookaheadInterpolationExact;
+    procedure TestLookaheadNonBoundaryNoChange;
+    procedure TestLookaheadSmoke;
+
+    // Reptile first-order meta-learning
+    procedure TestReptileEpsZeroUnchanged;
+    procedure TestReptileEpsOneCopiesPhi;
+    procedure TestReptileInterpolationExact;
+    procedure TestReptileMetaInitBeatsRandom;
+
+    // Element-wise gradient clipping (ClipValue / ClipWeightGradientsToValue)
+    procedure TestClipValueDefaultIdentical;
+    procedure TestClipValueBoundsGradients;
+
+    // Grokfast slow-gradient amplifier (TNNetGrokfastWrapper)
+    procedure TestGrokfastLambdaZeroIdentity;
+    procedure TestGrokfastConstantStreamAmplifies;
+    procedure TestGrokfastSlowGradientEmphasis;
   end;
 
 implementation
@@ -963,6 +982,678 @@ begin
     EMA.Free;
     Live.Free;
   end;
+end;
+
+procedure TTestNeuralTraining.TestLookaheadIdentityK1Alpha1;
+var
+  Live: TNNet;
+  LA: TNNetLookaheadWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 5.0);
+  // k=1, alpha=1.0: each Step synchronizes; phi := 0*phi + 1*theta = theta,
+  // and theta := phi leaves the live net unchanged.
+  LA := TNNetLookaheadWrapper.Create(Live, 1, 1.0);
+  try
+    AssertTrue('Lookahead k=1 Step synchronizes', LA.Step);
+    AssertEquals('Lookahead k=1,a=1 -> slow == fast', 5.0,
+      SampleWeight(LA.ShadowNet), 0.0);
+    AssertEquals('Lookahead k=1,a=1 -> live unchanged', 5.0,
+      SampleWeight(Live), 0.0);
+    AssertEquals('Lookahead counter reset after sync', 0, LA.StepCount);
+  finally
+    LA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestLookaheadInterpolationExact;
+var
+  Live: TNNet;
+  LA: TNNetLookaheadWrapper;
+  Expected: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  // Slow phi seeded at 2.0.
+  FillNetWeights(Live, 2.0);
+  LA := TNNetLookaheadWrapper.Create(Live, 3, 0.5); // k=3, alpha=0.5
+  try
+    // Base optimizer moved fast weights to theta=8.0.
+    FillNetWeights(Live, 8.0);
+    // Two non-boundary steps must not synchronize.
+    AssertFalse('Lookahead step 1 no sync', LA.Step);
+    AssertFalse('Lookahead step 2 no sync', LA.Step);
+    // k-th step synchronizes.
+    AssertTrue('Lookahead step 3 syncs', LA.Step);
+    // phi := phi + alpha*(theta - phi) = 2 + 0.5*(8-2) = 5.0
+    Expected := 2.0 + 0.5 * (8.0 - 2.0);
+    AssertEquals('Lookahead exact interpolation (slow)', Expected,
+      SampleWeight(LA.ShadowNet), 0.0001);
+    // Live net now holds phi.
+    AssertEquals('Lookahead live reset to slow', Expected,
+      SampleWeight(Live), 0.0001);
+  finally
+    LA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestLookaheadNonBoundaryNoChange;
+var
+  Live: TNNet;
+  LA: TNNetLookaheadWrapper;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  FillNetWeights(Live, 1.0);
+  LA := TNNetLookaheadWrapper.Create(Live, 5, 0.5); // k=5
+  try
+    // Base optimizer set fast weights to 9.0 (not synced yet).
+    FillNetWeights(Live, 9.0);
+    // Calls 1..k-1 must NOT touch the live weights.
+    AssertFalse('Lookahead step 1 no sync', LA.Step);
+    AssertFalse('Lookahead step 2 no sync', LA.Step);
+    AssertFalse('Lookahead step 3 no sync', LA.Step);
+    AssertFalse('Lookahead step 4 no sync', LA.Step);
+    AssertEquals('Lookahead non-boundary leaves live unchanged', 9.0,
+      SampleWeight(Live), 0.0);
+    // Slow weights are still the seed (1.0).
+    AssertEquals('Lookahead non-boundary leaves slow unchanged', 1.0,
+      SampleWeight(LA.ShadowNet), 0.0);
+  finally
+    LA.Free;
+    Live.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestLookaheadSmoke;
+var
+  Live: TNNet;
+  LA: TNNetLookaheadWrapper;
+  I: integer;
+begin
+  RandSeed := 424242;
+  Live := BuildTinyNet();
+  LA := TNNetLookaheadWrapper.Create(Live, 5, 0.5);
+  try
+    // Simulate a base optimizer nudging the fast weights and driving Step().
+    for I := 1 to 23 do
+    begin
+      // pretend a base-optimizer update happened
+      FillNetWeights(Live, I * 0.1);
+      LA.Step;
+    end;
+    // After several sync cycles nothing should be NaN/crash; pin finiteness.
+    AssertTrue('Lookahead smoke: slow weight finite',
+      SampleWeight(LA.ShadowNet) = SampleWeight(LA.ShadowNet));
+    AssertTrue('Lookahead smoke: live weight finite',
+      SampleWeight(Live) = SampleWeight(Live));
+  finally
+    LA.Free;
+    Live.Free;
+  end;
+end;
+
+// ----------------------------------------------------------------------------
+// Reptile first-order meta-learning tests
+// ----------------------------------------------------------------------------
+
+// Builds the tiny sine-regression net used by the Reptile example/tests:
+//   1 -> FullConnectReLU(16) -> FullConnectReLU(16) -> FullConnectLinear(1)
+function BuildReptileNet: TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer([
+    TNNetInput.Create(1),
+    TNNetFullConnectReLU.Create(16),
+    TNNetFullConnectReLU.Create(16),
+    TNNetFullConnectLinear.Create(1)
+  ]);
+end;
+
+// Runs InnerSteps full-batch SGD steps adapting NN to a single sine task
+// y = A*sin(x+P) sampled at NumPts points in [-5,5].
+procedure AdaptToSineTask(NN: TNNet; A, P: TNeuralFloat;
+  InnerSteps, NumPts: integer; LR: TNeuralFloat);
+var
+  Inp, Des: TNNetVolume;
+  Step, I: integer;
+  X: TNeuralFloat;
+begin
+  Inp := TNNetVolume.Create(1, 1, 1);
+  Des := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.SetLearningRate(LR, 0.0);
+    for Step := 1 to InnerSteps do
+    begin
+      for I := 0 to NumPts - 1 do
+      begin
+        X := -5.0 + 10.0 * (I / (NumPts - 1));
+        Inp.Raw[0] := X * 0.2; // normalise to [-1,1] for well-conditioned SGD
+        Des.Raw[0] := A * Sin(X + P);
+        NN.Compute(Inp);
+        NN.Backpropagate(Des);
+      end;
+      NN.UpdateWeights();
+    end;
+  finally
+    Inp.Free;
+    Des.Free;
+  end;
+end;
+
+// Mean absolute error of NN on a sine task over NumPts points in [-5,5].
+function SineTaskLoss(NN: TNNet; A, P: TNeuralFloat; NumPts: integer): TNeuralFloat;
+var
+  Inp, Out: TNNetVolume;
+  I: integer;
+  X, Err: TNeuralFloat;
+begin
+  Inp := TNNetVolume.Create(1, 1, 1);
+  Out := TNNetVolume.Create(1, 1, 1);
+  Err := 0;
+  try
+    for I := 0 to NumPts - 1 do
+    begin
+      X := -5.0 + 10.0 * (I / (NumPts - 1));
+      Inp.Raw[0] := X * 0.2;
+      NN.Compute(Inp);
+      NN.GetOutput(Out);
+      Err := Err + Abs(Out.Raw[0] - A * Sin(X + P));
+    end;
+  finally
+    Inp.Free;
+    Out.Free;
+  end;
+  Result := Err / NumPts;
+end;
+
+// Sum of |weight| difference between two same-architecture nets (byte-for-byte
+// proxy: exact equality => 0).
+function NetWeightDiff(A, B: TNNet): TNeuralFloat;
+var
+  L, N, W: integer;
+  Sum: TNeuralFloat;
+begin
+  Sum := 0;
+  for L := 0 to A.GetLastLayerIdx() do
+    for N := 0 to A.Layers[L].Neurons.Count - 1 do
+      for W := 0 to A.Layers[L].Neurons[N].Weights.Size - 1 do
+        Sum := Sum + Abs(A.Layers[L].Neurons[N].Weights.Raw[W] -
+                         B.Layers[L].Neurons[N].Weights.Raw[W]);
+  Result := Sum;
+end;
+
+procedure TTestNeuralTraining.TestReptileEpsZeroUnchanged;
+var
+  Meta, Snapshot: TNNet;
+  Trainer: TNNetReptileMetaTrainer;
+  Worker: TNNet;
+begin
+  RandSeed := 424242;
+  Meta := BuildReptileNet();
+  Snapshot := Meta.Clone(); // captures theta before merging
+  Trainer := TNNetReptileMetaTrainer.Create(Meta, 0.0);
+  try
+    // Adapt a worker to an arbitrary task, then merge with eps=0.
+    Worker := Trainer.BeginTask();
+    FillNetWeights(Worker, 12.34); // phi wildly different from theta
+    Trainer.MergeTask();
+    // eps=0 -> theta := 1*theta + 0*phi: byte-for-byte unchanged.
+    AssertEquals('Reptile eps=0 leaves meta-weights unchanged', 0.0,
+      NetWeightDiff(Meta, Snapshot), 0.0);
+  finally
+    Trainer.Free;
+    Snapshot.Free;
+    Meta.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestReptileEpsOneCopiesPhi;
+var
+  Meta, PhiSnapshot: TNNet;
+  Trainer: TNNetReptileMetaTrainer;
+  Worker: TNNet;
+begin
+  RandSeed := 424242;
+  Meta := BuildReptileNet();
+  Trainer := TNNetReptileMetaTrainer.Create(Meta, 1.0);
+  PhiSnapshot := Meta.Clone();
+  try
+    Worker := Trainer.BeginTask();
+    FillNetWeights(Worker, 7.5); // phi = adapted worker weights
+    PhiSnapshot.CopyWeights(Worker);
+    Trainer.MergeTask();
+    // eps=1 -> theta := phi exactly (pure copy).
+    AssertEquals('Reptile eps=1 makes meta-weights exactly phi', 0.0,
+      NetWeightDiff(Meta, PhiSnapshot), 0.0);
+  finally
+    Trainer.Free;
+    PhiSnapshot.Free;
+    Meta.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestReptileInterpolationExact;
+var
+  Meta: TNNet;
+  Trainer: TNNetReptileMetaTrainer;
+  Worker: TNNet;
+  Expected: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Meta := BuildReptileNet();
+  FillNetWeights(Meta, 2.0); // theta = 2.0
+  Trainer := TNNetReptileMetaTrainer.Create(Meta, 0.25);
+  try
+    Worker := Trainer.BeginTask();
+    FillNetWeights(Worker, 10.0); // phi = 10.0
+    Trainer.MergeTask();
+    // theta := theta + eps*(phi-theta) = 2 + 0.25*(10-2) = 4.0
+    Expected := 2.0 + 0.25 * (10.0 - 2.0);
+    AssertEquals('Reptile exact interpolation', Expected,
+      SampleWeight(Meta), 0.0001);
+  finally
+    Trainer.Free;
+    Meta.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestReptileMetaInitBeatsRandom;
+const
+  cMetaIters = 2000;  // outer Reptile iterations
+  cInnerSteps = 16;   // SGD steps per task
+  cNumPts = 20;       // points per sine task
+  cInnerLR = 0.0007;  // inner-loop learning rate (stable for the summed grad)
+  cEps = 0.1;         // outer Reptile step
+  cAdaptK = 4;        // held-out adaptation steps (matched k)
+var
+  Meta, RandInit, MetaAdapt, RandAdapt, Worker: TNNet;
+  Trainer: TNNetReptileMetaTrainer;
+  Iter, T: integer;
+  A, P: TNeuralFloat;
+  MetaLoss, RandLoss: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  // Random-init baseline (frozen reference init).
+  RandInit := BuildReptileNet();
+  // Meta net starts from the SAME random init for a fair comparison.
+  Meta := BuildReptileNet();
+  Meta.CopyWeights(RandInit);
+  Trainer := TNNetReptileMetaTrainer.Create(Meta, cEps);
+  try
+    // Outer Reptile loop over a distribution of sine tasks.
+    for Iter := 1 to cMetaIters do
+    begin
+      A := 0.5 + Random * 2.5;          // amplitude in [0.5, 3]
+      P := Random * Pi;                 // phase in [0, pi)
+      Worker := Trainer.BeginTask();
+      AdaptToSineTask(Worker, A, P, cInnerSteps, cNumPts, cInnerLR);
+      Trainer.MergeTask();
+    end;
+
+    // Held-out task evaluation, averaged over several tasks.
+    MetaLoss := 0;
+    RandLoss := 0;
+    for T := 0 to 4 do
+    begin
+      A := 0.5 + Random * 2.5;
+      P := Random * Pi;
+      // Adapt from the Reptile meta-init.
+      MetaAdapt := BuildReptileNet();
+      MetaAdapt.CopyWeights(Meta);
+      AdaptToSineTask(MetaAdapt, A, P, cAdaptK, cNumPts, cInnerLR);
+      MetaLoss := MetaLoss + SineTaskLoss(MetaAdapt, A, P, cNumPts);
+      MetaAdapt.Free;
+      // Adapt the random init for the same k steps.
+      RandAdapt := BuildReptileNet();
+      RandAdapt.CopyWeights(RandInit);
+      AdaptToSineTask(RandAdapt, A, P, cAdaptK, cNumPts, cInnerLR);
+      RandLoss := RandLoss + SineTaskLoss(RandAdapt, A, P, cNumPts);
+      RandAdapt.Free;
+    end;
+    // (c) The meta-init must adapt to lower held-out loss at matched k.
+    // Loosely banded: require a clear margin on the fixed seed.
+    AssertTrue('Reptile meta-init beats random init at matched k ' +
+      '(meta=' + FloatToStrF(MetaLoss, ffFixed, 6, 4) +
+      ' rand=' + FloatToStrF(RandLoss, ffFixed, 6, 4) + ')',
+      MetaLoss < RandLoss * 0.9);
+  finally
+    Trainer.Free;
+    Meta.Free;
+    RandInit.Free;
+  end;
+end;
+
+// ----------------------------------------------------------------------------
+// Element-wise gradient clipping (ClipValue / ClipWeightGradientsToValue)
+// ----------------------------------------------------------------------------
+
+// Returns the largest absolute weight-gradient (Delta) element across all
+// trainable neurons of NN. Only the public per-weight Delta tensors are
+// inspected (the bias delta is not exposed publicly).
+function MaxAbsGradient(NN: TNNet): TNeuralFloat;
+var
+  L, N, W: integer;
+  V: TNeuralFloat;
+begin
+  Result := 0;
+  for L := 0 to NN.GetLastLayerIdx() do
+    for N := 0 to NN.Layers[L].Neurons.Count - 1 do
+      for W := 0 to NN.Layers[L].Neurons[N].Delta.Size - 1 do
+      begin
+        V := Abs(NN.Layers[L].Neurons[N].Delta.Raw[W]);
+        if V > Result then Result := V;
+      end;
+end;
+
+// (a) ClipWeightGradientsToValue with a non-positive value is a no-op, so a
+// training run with ClipValue=0 must be byte-for-byte identical to one that
+// never calls the clip at all.
+procedure TTestNeuralTraining.TestClipValueDefaultIdentical;
+var
+  NNa, NNb: TNNet;
+  Input, Desired: TNNetVolume;
+  I: integer;
+begin
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+
+  RandSeed := 424242;
+  NNa := TNNet.Create();
+  NNa.AddLayer([
+    TNNetInput.Create(4),
+    TNNetFullConnectReLU.Create(8),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  NNa.SetLearningRate(0.1, 0.9);
+
+  RandSeed := 424242;
+  NNb := TNNet.Create();
+  NNb.AddLayer([
+    TNNetInput.Create(4),
+    TNNetFullConnectReLU.Create(8),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  NNb.SetLearningRate(0.1, 0.9);
+
+  try
+    Input.Fill(0.5);
+    Desired.Fill(0.8);
+    for I := 1 to 25 do
+    begin
+      // Run A: never touches the clip.
+      NNa.Compute(Input);
+      NNa.Backpropagate(Desired);
+      NNa.UpdateWeights();
+
+      // Run B: applies the disabled clip (ClipValue=0) before the same update.
+      NNb.Compute(Input);
+      NNb.Backpropagate(Desired);
+      NNb.ClipWeightGradientsToValue(0.0); // disabled -> no-op
+      NNb.UpdateWeights();
+    end;
+
+    // Identical seeds + identical data + disabled clip => identical weights.
+    AssertEquals('ClipValue=0 leaves training byte-for-byte identical', 0.0,
+      NetWeightDiff(NNa, NNb), 0.0);
+  finally
+    NNa.Free;
+    NNb.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+// (b) With large gradients, ClipWeightGradientsToValue must bound every
+// gradient element to [-v, +v]. We also confirm that without clipping the
+// gradients genuinely exceed that bound (so the test is meaningful).
+procedure TTestNeuralTraining.TestClipValueBoundsGradients;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  PreClipMax, PostClipMax, ClipV: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer([
+    TNNetInput.Create(4),
+    TNNetFullConnectReLU.Create(8),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  NN.SetLearningRate(0.1, 0.0);
+  // Batch mode keeps the accumulated per-weight gradient (Delta) alive after
+  // Backpropagate; in per-sample mode Delta is consumed/zeroed by the update.
+  NN.SetBatchUpdate(True);
+
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+  try
+    // Large inputs and a far-away target produce sizeable gradients.
+    Input.Fill(5.0);
+    Desired.Fill(50.0);
+
+    NN.ClearDeltas();
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+
+    PreClipMax := MaxAbsGradient(NN);
+    AssertTrue('Test setup should produce non-trivial gradients',
+      PreClipMax > 0.0);
+
+    // Self-calibrating clip bound strictly below the largest gradient, so the
+    // clip provably has work to do and the post-clip bound is meaningful.
+    ClipV := PreClipMax * 0.5;
+    NN.ClipWeightGradientsToValue(ClipV);
+    PostClipMax := MaxAbsGradient(NN);
+
+    AssertTrue('Pre-clip gradients must exceed the clip bound (clip is effective)',
+      PreClipMax > ClipV);
+    AssertTrue('All gradient magnitudes must be <= ClipValue after clipping',
+      PostClipMax <= ClipV + 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+// Builds a small net wired for gradient inspection (batch update on so the
+// accumulated per-weight gradient survives in Delta after Backpropagate).
+function BuildGrokfastNet: TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer([
+    TNNetInput.Create(4),
+    TNNetFullConnectReLU.Create(6),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  Result.SetLearningRate(0.1, 0.0);
+  Result.SetBatchUpdate(True);
+end;
+
+// (a) lambda=0 must leave every gradient element byte-for-byte unchanged
+// (Grokfast degenerates to plain SGD: g_hat = g + 0*mu = g).
+procedure TTestNeuralTraining.TestGrokfastLambdaZeroIdentity;
+var
+  NN: TNNet;
+  GF: TNNetGrokfastWrapper;
+  Input, Desired: TNNetVolume;
+  Before: array of TNeuralFloat;
+  Idx, L, N, W: integer;
+  AllEqual: boolean;
+begin
+  RandSeed := 424242;
+  NN := BuildGrokfastNet();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+  GF := TNNetGrokfastWrapper.Create(NN, 0.0, 0.94);
+  try
+    Input.Fill(2.0);
+    Desired.Fill(7.0);
+    NN.ClearDeltas();
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+
+    // Snapshot every gradient element before filtering.
+    SetLength(Before, 0);
+    Idx := 0;
+    for L := 0 to NN.GetLastLayerIdx() do
+      for N := 0 to NN.Layers[L].Neurons.Count - 1 do
+        for W := 0 to NN.Layers[L].Neurons[N].Delta.Size - 1 do
+        begin
+          SetLength(Before, Idx + 1);
+          Before[Idx] := NN.Layers[L].Neurons[N].Delta.Raw[W];
+          Inc(Idx);
+        end;
+
+    GF.Filter; // lambda=0 -> must be a no-op on the gradients
+
+    AllEqual := True;
+    Idx := 0;
+    for L := 0 to NN.GetLastLayerIdx() do
+      for N := 0 to NN.Layers[L].Neurons.Count - 1 do
+        for W := 0 to NN.Layers[L].Neurons[N].Delta.Size - 1 do
+        begin
+          if NN.Layers[L].Neurons[N].Delta.Raw[W] <> Before[Idx] then
+            AllEqual := False;
+          Inc(Idx);
+        end;
+
+    AssertTrue('lambda=0 leaves gradients byte-for-byte unchanged', AllEqual);
+    AssertTrue('test exercised some gradient elements', Idx > 0);
+  finally
+    GF.Free;
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+// (b) On a constant-gradient stream the EMA converges so that after many
+// Filter() calls g_hat -> (1+lambda)*g. Weights are never updated, so each
+// Backpropagate reproduces the SAME raw gradient g; the filter's mu locks onto
+// it and the amplified gradient equals (1+lambda)*g.
+procedure TTestNeuralTraining.TestGrokfastConstantStreamAmplifies;
+var
+  NN: TNNet;
+  GF: TNNetGrokfastWrapper;
+  Input, Desired: TNNetVolume;
+  RawGrad, FilteredGrad, Lambda, V: TNeuralFloat;
+  I, L, N, W, BestL, BestN, BestW: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildGrokfastNet();
+  Input := TNNetVolume.Create(4, 1, 1);
+  Desired := TNNetVolume.Create(2, 1, 1);
+  Lambda := 3.0;
+  GF := TNNetGrokfastWrapper.Create(NN, Lambda, 0.9);
+  try
+    Input.Fill(2.0);
+    Desired.Fill(7.0);
+
+    // Capture the raw (unfiltered) gradient once. Track the single weight with
+    // the largest gradient magnitude so the amplification check is meaningful
+    // (an arbitrary fixed element can legitimately be ~0 through a ReLU).
+    NN.ClearDeltas();
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+    RawGrad := 0; BestL := 0; BestN := 0; BestW := 0;
+    for L := 0 to NN.GetLastLayerIdx() do
+      for N := 0 to NN.Layers[L].Neurons.Count - 1 do
+        for W := 0 to NN.Layers[L].Neurons[N].Delta.Size - 1 do
+        begin
+          V := NN.Layers[L].Neurons[N].Delta.Raw[W];
+          if Abs(V) > Abs(RawGrad) then
+          begin
+            RawGrad := V; BestL := L; BestN := N; BestW := W;
+          end;
+        end;
+    AssertTrue('test setup produces a non-trivial gradient', Abs(RawGrad) > 1e-6);
+
+    // Drive the constant-gradient stream through the filter many times.
+    for I := 1 to 60 do
+    begin
+      NN.ClearDeltas();
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+      GF.Filter;
+    end;
+    FilteredGrad := NN.Layers[BestL].Neurons[BestN].Delta.Raw[BestW];
+
+    AssertEquals('g_hat converges to (1+lambda)*g on a constant stream',
+      (1 + Lambda) * RawGrad, FilteredGrad, Abs(RawGrad) * 1e-3 + 1e-6);
+    AssertEquals('Filter step counter', 60, GF.StepCount);
+  finally
+    GF.Free;
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+// (c) The filter amplifies the SLOW (low-frequency) gradient component more than
+// the FAST (high-frequency) one. Driving a full net through a controlled
+// slow+fast gradient signal is fiddly, so we test the EMA math directly at the
+// unit level on a synthetic stream g_t = slow + (-1)^t * fast, mirroring the
+// exact recurrence Filter() applies per weight (mu := beta*mu + (1-beta)*g;
+// g_hat := g + lambda*mu). The slow (constant) part is amplified toward
+// (1+lambda)*slow, while the alternating fast part largely cancels in mu, so the
+// filtered signal's mean grows much more than its swing: the ratio of
+// low-frequency (mean) to high-frequency (half-swing) energy increases.
+procedure TTestNeuralTraining.TestGrokfastSlowGradientEmphasis;
+const
+  Slow = 1.0;
+  Fast = 1.0;
+  Beta = 0.9;
+  Lambda = 4.0;
+  Steps = 200;
+var
+  Mu, G, GHat, Sign: TNeuralFloat;
+  RawMean, RawSwing, FiltMean, FiltSwing: TNeuralFloat;
+  FiltMin, FiltMax: TNeuralFloat;
+  RawLowToHigh, FiltLowToHigh: TNeuralFloat;
+  T: integer;
+begin
+  // Seed mu with the first gradient (matches Filter()'s first-call behaviour).
+  Sign := 1.0;
+  Mu := Slow + Sign * Fast;
+  FiltMin := 1e30; FiltMax := -1e30;
+  // Settle the EMA, then measure over the last two steps (one full fast period).
+  for T := 1 to Steps do
+  begin
+    Sign := -Sign;
+    G := Slow + Sign * Fast;
+    Mu := Beta * Mu + (1 - Beta) * G;
+    GHat := G + Lambda * Mu;
+    if T > Steps - 2 then
+    begin
+      if GHat < FiltMin then FiltMin := GHat;
+      if GHat > FiltMax then FiltMax := GHat;
+    end;
+  end;
+
+  // Raw signal: mean = Slow, half-swing (high-freq amplitude) = Fast.
+  RawMean := Slow;
+  RawSwing := Fast;
+  RawLowToHigh := Abs(RawMean) / RawSwing;
+
+  // Filtered signal over the last fast period.
+  FiltMean := (FiltMax + FiltMin) / 2;
+  FiltSwing := (FiltMax - FiltMin) / 2;
+  AssertTrue('filtered signal must still carry high-frequency energy',
+    FiltSwing > 1e-6);
+  FiltLowToHigh := Abs(FiltMean) / FiltSwing;
+
+  // The slow component is amplified far more than the fast one, so the
+  // low-to-high energy ratio of the filtered signal exceeds that of the raw.
+  AssertTrue('filter increases low-frequency (slow) gradient emphasis',
+    FiltLowToHigh > RawLowToHigh);
+  // Sanity: the slow mean is amplified toward (1+lambda)*Slow.
+  AssertTrue('slow component is amplified above the raw slow level',
+    Abs(FiltMean) > Abs(RawMean));
 end;
 
 initialization

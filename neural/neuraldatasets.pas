@@ -338,6 +338,7 @@ function GenerateStringFromCasualCharNN(NN: TNNet;
   InputString: string; oSampler: TNNetSamplerBase = nil;
   EncodingMethod: integer = csNeuralEncodingMethodInt; EncodingMethod2: integer = 0): string;
 
+// Re-encodes the whole prefix per token; for the streamed KV-cache/SSM-state sibling see GenerateTokensStreamed/GenerateStringStreamed in neuraldecode.
 function GenerateStringFromCasualNN(NN: TNNet; Dict:TStringListInt;
   InputString: string; oSampler: TNNetSamplerBase = nil;
   EncodingMethod: integer = csNeuralEncodingMethodInt; EncodingMethod2: integer = 0): string;

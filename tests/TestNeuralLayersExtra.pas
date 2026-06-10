@@ -26,6 +26,7 @@ type
     // Upsample tests
     procedure TestUpsampleForward;
     procedure TestUpsampleDepthToSpace;
+    procedure TestUpsampleBackwardErrorSum;
     
     // Power and transformation layers
     procedure TestPowerLayer;
@@ -77,6 +78,7 @@ type
     procedure TestAddAutoGroupedPointwiseConv2UsesInstanceNorm;
     procedure TestAddChannelMovingNormUsesInstanceNorm;
     procedure TestAddMovingNormShapeAndForward;
+    procedure TestAddWaveletPacketTransformShapeAndForward;
 
     // Introspection
     procedure TestPrintSummary;
@@ -92,6 +94,7 @@ type
     procedure TestWeightSpectrumReportRank1Matrix;
     procedure TestWeightSpectrumReportStructureAndFlags;
     procedure TestWeightSpectralTailReportSmoke;
+    procedure TestEstimateSpectralRadiusKnownMatrix;
     procedure TestTopLogitMarginReportSmoke;
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
@@ -101,12 +104,15 @@ type
     procedure TestTTAReportSmoke;
     procedure TestSaliencyReportSmoke;
     procedure TestGradCAMReportSmoke;
+    procedure TestLRPReportSmoke;
     procedure TestDecisionBoundaryReportSmoke;
     procedure TestCalibrationReportSmoke;
     procedure TestFisherImportanceReportSmoke;
     procedure TestLinearProbeReportSmoke;
     procedure TestLogitLensReportSmoke;
+    procedure TestTunedLensReportSmoke;
     procedure TestFeatureSeparabilityReportSmoke;
+    procedure TestNeuralCollapseReportSmoke;
     procedure TestRepresentationSimilarityReportSmoke;
     procedure TestEnableInputGradient;
     procedure TestAdversarialRobustnessReportSmoke;
@@ -123,7 +129,14 @@ type
     procedure TestToGraphvizDotSmoke;
     procedure TestLayerTimingReportSmoke;
     procedure TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
+    procedure TestMixtureOfDepthsShapeDegenerateAndRoundTrip;
     procedure TestDropBlockSmokeAndRoundTrip;
+    procedure TestShakeShakeEvalDeterministicCombination;
+    procedure TestShakeShakeRoundTrip;
+    procedure TestShakeShakeTrainSmoke;
+    procedure TestShakeDropEvalAndRoundTrip;
+    procedure TestRoutingEntropyReportSmoke;
+    procedure TestLocalLearningCoefficientReportSmoke;
   end;
 
 implementation
@@ -350,6 +363,104 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestUpsampleBackwardErrorSum;
+var
+  NN: TNNet;
+  Input, Target, DesiredErr: TNNetVolume;
+  UpLayer, InLayer: TNNetLayer;
+  CntX, CntY, OutD, OutX, OutY, Gi: integer;
+  BlockSum, InSum, OutSum, ExpInputErr: TNeuralFloat;
+begin
+  // TNNetUpsample (depth-to-space) maps each input position bijectively
+  // into a 2x2 output block at a single output channel. Backward must route
+  // each output-block error back to exactly its source input element, so:
+  //   (a) total input error == total output error (no error created/lost),
+  //   (b) the sum of a 2x2 output block at channel OutD equals the sum of
+  //       the 4 source input channels (4*OutD..4*OutD+3) at (CntX, CntY).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 8); // 2x2x8 -> 4x4x2
+  Target := TNNetVolume.Create(4, 4, 2);
+  DesiredErr := TNNetVolume.Create(4, 4, 2);
+  try
+    InLayer := NN.AddLayer(TNNetInput.Create(2, 2, 8));
+    UpLayer := NN.AddLayer(TNNetUpsample.Create());
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    // The input layer normally keeps a size-1 error buffer (inputs don't
+    // backprop). Give it a full-size buffer so TNNetUpsample's backward
+    // (guarded by FPrevLayer.OutputError.Size = FPrevLayer.Output.Size)
+    // actually routes the error into it and we can inspect the result.
+    InLayer.OutputError.ReSize(InLayer.Output);
+
+    AssertEquals('Upsample output SizeX', 4, UpLayer.Output.SizeX);
+    AssertEquals('Upsample output SizeY', 4, UpLayer.Output.SizeY);
+    AssertEquals('Upsample output Depth', 2, UpLayer.Output.Depth);
+
+    // Drive backprop through the public TNNet.Backpropagate path. The last
+    // layer's error is computed as (Output - Target), so pick a Target that
+    // yields a distinct, known error in every output cell.
+    DesiredErr.FillForDebug();
+    Target.Copy(UpLayer.Output);
+    Target.Sub(DesiredErr); // Target = Output - DesiredErr => error = DesiredErr
+    NN.Backpropagate(Target);
+
+    // Confirm the last-layer error matches what we asked for.
+    for Gi := 0 to UpLayer.OutputError.Size - 1 do
+      AssertEquals('Upsample seeded output error at ' + IntToStr(Gi),
+        DesiredErr.Raw[Gi], UpLayer.OutputError.Raw[Gi], 0.0001);
+
+    // (a) Total error is preserved.
+    OutSum := UpLayer.OutputError.GetSum();
+    InSum := InLayer.OutputError.GetSum();
+    AssertEquals('Upsample backward preserves total error',
+      OutSum, InSum, 0.0001);
+
+    // (b) Per-block error sum equals the source input-channel error sum, and
+    //     each input element equals exactly its mapped output-block cell.
+    for OutD := 0 to UpLayer.Output.Depth - 1 do
+      for CntX := 0 to 1 do
+        for CntY := 0 to 1 do
+        begin
+          OutX := CntX * 2;
+          OutY := CntY * 2;
+          BlockSum :=
+            UpLayer.OutputError[OutX,   OutY,   OutD] +
+            UpLayer.OutputError[OutX+1, OutY,   OutD] +
+            UpLayer.OutputError[OutX,   OutY+1, OutD] +
+            UpLayer.OutputError[OutX+1, OutY+1, OutD];
+          ExpInputErr :=
+            InLayer.OutputError[CntX, CntY, OutD*4]   +
+            InLayer.OutputError[CntX, CntY, OutD*4+1] +
+            InLayer.OutputError[CntX, CntY, OutD*4+2] +
+            InLayer.OutputError[CntX, CntY, OutD*4+3];
+          AssertEquals('Upsample block error sum == input error sum at CntX=' +
+            IntToStr(CntX) + ' CntY=' + IntToStr(CntY) + ' OutD=' +
+            IntToStr(OutD), BlockSum, ExpInputErr, 0.0001);
+
+          // Exact bijective routing (matches Compute's index mapping).
+          AssertEquals('Upsample back routes cell 0',
+            UpLayer.OutputError[OutX, OutY, OutD],
+            InLayer.OutputError[CntX, CntY, OutD*4], 0.0001);
+          AssertEquals('Upsample back routes cell 1',
+            UpLayer.OutputError[OutX+1, OutY, OutD],
+            InLayer.OutputError[CntX, CntY, OutD*4+1], 0.0001);
+          AssertEquals('Upsample back routes cell 2',
+            UpLayer.OutputError[OutX, OutY+1, OutD],
+            InLayer.OutputError[CntX, CntY, OutD*4+2], 0.0001);
+          AssertEquals('Upsample back routes cell 3',
+            UpLayer.OutputError[OutX+1, OutY+1, OutD],
+            InLayer.OutputError[CntX, CntY, OutD*4+3], 0.0001);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+    DesiredErr.Free;
   end;
 end;
 
@@ -1174,6 +1285,37 @@ begin
   end;
 end;
 
+procedure TTestNeuralLayersExtra.TestAddWaveletPacketTransformShapeAndForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // AddWaveletPacketTransform stacks Levels single-level DWTs into a balanced
+  // packet tree: each level halves SeqLen and doubles Depth, transforming every
+  // channel. From (16,1,3): L1 -> (8,1,6), L2 -> (4,1,12), L3 -> (2,1,24).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(16, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(16, 1, 3));
+    NN.AddWaveletPacketTransform({Levels=}3, {Filter=}csDWT1DCDF53);
+
+    AssertEquals('Packet transform halves SeqLen per level (16/2^3)',
+      2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Packet transform keeps SizeY=1',
+      1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Packet transform doubles Depth per level (3*2^3)',
+      24, NN.GetLastLayer.Output.Depth);
+
+    Input.RandomizeGaussian();
+    NN.Compute(Input);
+    AssertTrue('Packet transform forward produces finite output',
+      NN.GetLastLayer.Output.GetSum() = NN.GetLastLayer.Output.GetSum());
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralLayersExtra.TestPrintSummary;
 var
   NN: TNNet;
@@ -1783,6 +1925,94 @@ begin
       Report = TNNet.WeightSpectralTailReport(NN));
   finally
     Lines.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestEstimateSpectralRadiusKnownMatrix;
+var
+  NN: TNNet;
+  Layer: TNNetLayer;
+  N, K, Dim: integer;
+  Rho, Sigma, Expected: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  Dim := 5;
+
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(Dim, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(Dim));
+    NN.InitWeights();
+    Layer := NN.Layers[1];
+    AssertTrue('square layer neuron count', Layer.Neurons.Count = Dim);
+    AssertTrue('square layer fan-in', Layer.Neurons[0].Weights.Size = Dim);
+
+    // (1) Lower-TRIANGULAR matrix: eigenvalues are exactly the diagonal, so the
+    // spectral radius = max |diagonal|. Strictly-lower entries don't change the
+    // spectrum but do make W non-symmetric (so radius < norm below).
+    // Diagonal = (0.2, -0.9, 0.5, 0.7, -0.4)  => rho = 0.9.
+    for N := 0 to Dim - 1 do
+      for K := 0 to Dim - 1 do
+      begin
+        if K < N then
+          Layer.Neurons[N].Weights.FData[K] := 0.6 + 0.1 * (N - K) // sub-diag
+        else if K = N then
+          Layer.Neurons[N].Weights.FData[K] := 0.0
+        else
+          Layer.Neurons[N].Weights.FData[K] := 0.0;
+      end;
+    Layer.Neurons[0].Weights.FData[0] :=  0.2;
+    Layer.Neurons[1].Weights.FData[1] := -0.9;
+    Layer.Neurons[2].Weights.FData[2] :=  0.5;
+    Layer.Neurons[3].Weights.FData[3] :=  0.7;
+    Layer.Neurons[4].Weights.FData[4] := -0.4;
+    Expected := 0.9; // max |diagonal|
+
+    Rho := TNNet.EstimateSpectralRadius(Layer, 300);
+    AssertTrue(Format(
+      'EstimateSpectralRadius of triangular matrix should be ~%.4f, got %.4f',
+      [Expected, Rho]), Abs(Rho - Expected) < 1e-2);
+
+    // (2) Radius is the TIGHTER bound: rho <= sigma_1 for this non-symmetric
+    // (strictly-triangular off-diagonal) matrix, and strictly less here.
+    Sigma := TNNet.EstimateSpectralNorm(Layer, 300);
+    AssertTrue(Format('radius %.4f must be <= norm %.4f', [Rho, Sigma]),
+      Rho <= Sigma + 1e-4);
+    AssertTrue(Format('radius %.4f should be strictly < norm %.4f here',
+      [Rho, Sigma]), Rho < Sigma - 1e-3);
+
+    // (3) Symmetric diagonal matrix: radius == norm == max |diagonal|.
+    for N := 0 to Dim - 1 do
+      for K := 0 to Dim - 1 do
+        Layer.Neurons[N].Weights.FData[K] := 0.0;
+    Layer.Neurons[0].Weights.FData[0] :=  0.3;
+    Layer.Neurons[1].Weights.FData[1] := -1.4; // dominant
+    Layer.Neurons[2].Weights.FData[2] :=  0.8;
+    Layer.Neurons[3].Weights.FData[3] :=  0.1;
+    Layer.Neurons[4].Weights.FData[4] := -0.6;
+    Rho := TNNet.EstimateSpectralRadius(Layer, 300);
+    Sigma := TNNet.EstimateSpectralNorm(Layer, 300);
+    AssertTrue(Format('diagonal radius should be ~1.4, got %.4f', [Rho]),
+      Abs(Rho - 1.4) < 1e-3);
+    AssertTrue(Format('diagonal radius %.4f == norm %.4f', [Rho, Sigma]),
+      Abs(Rho - Sigma) < 1e-3);
+
+    // (4) Edge cases mirror EstimateSpectralNorm: nil layer => 0.
+    AssertTrue('nil layer => 0', TNNet.EstimateSpectralRadius(nil) = 0);
+  finally
+    NN.Free;
+  end;
+
+  // (5) Non-square layer has no eigenvalues => returns 0.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(6));
+    NN.InitWeights();
+    AssertTrue('non-square layer => 0',
+      TNNet.EstimateSpectralRadius(NN.Layers[1]) = 0);
+  finally
     NN.Free;
   end;
 end;
@@ -2906,6 +3136,137 @@ begin
   end;
 end;
 
+procedure TTestNeuralLayersExtra.TestTunedLensReportSmoke;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  X, Y: TNNetVolume;
+  Report: string;
+  I, C, Ep, B, Cls: integer;
+  PStart, PEnd: integer;
+  KLPreStr, KLPostStr: string;
+  KLPre, KLPost: TNeuralFloat;
+  FS: TFormatSettings;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-1.5, -1.5), (1.5, 1.5), (1.5, -1.5));
+begin
+  // Shared-RNG safety (this unit reseeds before order-sensitive tests).
+  RandSeed := 424242;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+
+  // nil NN / empty probes handled gracefully.
+  Report := TNNet.TunedLensReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    Report := TNNet.TunedLensReport(NN, Probes);
+    AssertTrue('empty probes reported gracefully',
+      Pos('nil or empty', Report) > 0);
+
+    // Train so the early layers genuinely differ from the final answer (gives
+    // the tuned lens room to win).
+    for Ep := 1 to 60 do
+      for B := 1 to 40 do
+      begin
+        Cls := Random(3);
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        Y.Fill(0); Y.Raw[Cls] := 1.0;
+        X.FData[0] := Centers[Cls][0] + (Random - 0.5);
+        X.FData[1] := Centers[Cls][1] + (Random - 0.5);
+        NN.Compute(X);
+        NN.Backpropagate(Y);
+        X.Free; Y.Free;
+      end;
+
+    // Unlabelled probe batch.
+    for C := 0 to 2 do
+      for I := 1 to 30 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5);
+        X.FData[1] := Centers[C][1] + (Random - 0.5);
+        Probes.Add(X);
+      end;
+
+    Report := TNNet.TunedLensReport(NN, Probes, -1, 600, 0.005);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('TunedLensReport', Report) > 0);
+    AssertTrue('side-by-side table present', Pos('tunedKL', Report) > 0);
+    AssertTrue('KL curve present', Pos('logit lens (.) vs TUNED', Report) > 0);
+    AssertTrue('SKIPPED section present', Pos('SKIPPED layers', Report) > 0);
+    AssertTrue('input layer reported as SKIPPED', Pos('TNNetInput', Report) > 0);
+
+    // CORRECTNESS SIGNAL 1: an UNTRAINED translator does NO better than the raw
+    // logit lens (check 1 PASSes).
+    AssertTrue('correctness check 1 present',
+      Pos('Correctness check 1', Report) > 0);
+    AssertTrue('untrained translator ties the raw lens (no free lunch)',
+      Pos('no free lunch before fitting', Report) > 0);
+
+    // CORRECTNESS SIGNAL: KL-to-final DECREASES after training (check 2 PASSes).
+    AssertTrue('correctness check 2 present',
+      Pos('Correctness check 2', Report) > 0);
+    AssertTrue('training lowered mean KL-to-final',
+      Pos('fitting the translators reduced', Report) > 0);
+
+    // Parse the untrained vs trained mean KL-to-final and assert trained <= pre.
+    PStart := Pos('UNTRAINED (identity) = ', Report);
+    AssertTrue('untrained mean KL token found', PStart > 0);
+    PStart := PStart + Length('UNTRAINED (identity) = ');
+    PEnd := PosEx(';', Report, PStart);
+    AssertTrue('untrained KL terminator found', PEnd > PStart);
+    KLPreStr := Trim(Copy(Report, PStart, PEnd - PStart));
+    KLPre := StrToFloatDef(KLPreStr, -1, FS);
+    AssertTrue('untrained mean KL parsed', KLPre >= 0);
+
+    PStart := Pos('tuned lens TRAINED = ', Report);
+    AssertTrue('trained mean KL token found', PStart > 0);
+    PStart := PStart + Length('tuned lens TRAINED = ');
+    PEnd := PosEx('.', Report, PStart);
+    // grab the full float (digits + one dot + digits)
+    PEnd := PosEx(' ', Report, PStart);
+    if PEnd <= PStart then PEnd := Length(Report);
+    KLPostStr := Trim(Copy(Report, PStart, PEnd - PStart));
+    while (Length(KLPostStr) > 0) and
+          not (KLPostStr[Length(KLPostStr)] in ['0'..'9']) do
+      KLPostStr := Copy(KLPostStr, 1, Length(KLPostStr) - 1);
+    KLPost := StrToFloatDef(KLPostStr, -1, FS);
+    AssertTrue('trained mean KL parsed', KLPost >= 0);
+    AssertTrue('trained KL-to-final <= untrained KL-to-final',
+      KLPost <= KLPre + 1e-6);
+    AssertTrue('training strictly lowered KL on a trained net (tuned wins)',
+      KLPost < KLPre);
+
+    // CORRECTNESS SIGNAL 2: at the LAST compatible layer (head input) the
+    // translator collapses to identity => tuned == logit == final (check 3).
+    AssertTrue('correctness check 3 present',
+      Pos('Correctness check 3', Report) > 0);
+    AssertTrue('head-input tuned==logit==final (identity translator)',
+      Pos('reproduces the final distribution exactly', Report) > 0);
+
+    // Headline Belrose verdict must hold on a trained net.
+    AssertTrue('HEADLINE: tuned lens beats the raw lens',
+      Pos('the Belrose result', Report) > 0);
+  finally
+    Probes.Free;
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralLayersExtra.TestFeatureSeparabilityReportSmoke;
 var
   NN: TNNet;
@@ -3066,6 +3427,157 @@ begin
     Samples.Free;
     SingleCls.Free;
     Identical.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestNeuralCollapseReportSmoke;
+const
+  cC = 4;   // number of classes / feature dim for the exact-simplex pin
+  cReps = 8; // identical copies per class
+var
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  Report: string;
+  I, J, C, Rep: integer;
+  Vert: array[0..cC - 1, 0..cC - 1] of TNeuralFloat;
+  Scale, DevMean, DevMax, NormCV: TNeuralFloat;
+  FS: TFormatSettings;
+
+  function ExtractAfter(const REp, Marker: string): TNeuralFloat;
+  var
+    A, B: integer;
+    S: string;
+  begin
+    Result := -999;
+    A := Pos(Marker, Rep);
+    if A <= 0 then Exit;
+    A := A + Length(Marker);
+    while (A <= Length(Rep)) and (Rep[A] = ' ') do Inc(A);
+    B := A;
+    while (B <= Length(Rep)) and
+          (Rep[B] in ['0'..'9', '.', '-', '+', 'e', 'E']) do Inc(B);
+    S := Trim(Copy(Rep, A, B - A));
+    Result := StrToFloatDef(S, -999, FS);
+  end;
+
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  FS.ThousandSeparator := #0;
+
+  // nil NN / empty / NumClasses<2 handled gracefully.
+  Report := TNNet.NeuralCollapseReport(nil, nil, cC);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  // --- EXACT SIMPLEX-ETF PIN (verifies NC2 cosine math independent of any
+  //     training). Construct cC class means that form a perfect simplex ETF:
+  //     rows of sqrt(C/(C-1)) * (I - (1/C) J). Their pairwise cosine is EXACTLY
+  //     -1/(C-1) and they sum to zero (so the global mean is 0 and the centered
+  //     means equal the vertices). Feed them through an IDENTITY linear feature
+  //     layer so the penultimate features equal the vertices exactly. ---
+  Scale := Sqrt(cC / (cC - 1.0));
+  for I := 0 to cC - 1 do
+    for J := 0 to cC - 1 do
+      if I = J then Vert[I][J] := Scale * (1.0 - 1.0 / cC)
+      else Vert[I][J] := Scale * (-1.0 / cC);
+
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    // Input(cC) -> FCLinear(cC) [identity feature layer] -> FCLinear(cC) [head]
+    // -> SoftMax. The first FCLinear is the auto-selected feature layer.
+    NN.AddLayer(TNNetInput.Create(cC, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(cC));
+    NN.AddLayer(TNNetFullConnectLinear.Create(cC));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    // make layer 1 the identity map (weights = I, bias = 0).
+    for I := 0 to cC - 1 do
+    begin
+      for J := 0 to cC - 1 do
+        if I = J then NN.Layers[1].Neurons[I].Weights.FData[J] := 1.0
+        else NN.Layers[1].Neurons[I].Weights.FData[J] := 0.0;
+      NN.Layers[1].Neurons[I].BiasWeight := 0.0;
+    end;
+
+    // class-balanced batch: each class fed its exact simplex vertex (repeated).
+    for C := 0 to cC - 1 do
+      for Rep := 1 to cReps do
+      begin
+        X := TNNetVolume.Create(cC, 1, 1);
+        Y := TNNetVolume.Create(cC, 1, 1);
+        for J := 0 to cC - 1 do X.FData[J] := Vert[C][J];
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    Report := TNNet.NeuralCollapseReport(NN, Samples, cC);
+    AssertTrue('Report non-empty', Length(Report) > 0);
+    AssertTrue('header present', Pos('NeuralCollapseReport', Report) > 0);
+    AssertTrue('NC1 line present', Pos('NC1 within-class', Report) > 0);
+    AssertTrue('NC2 line present', Pos('NC2 simplex-ETF', Report) > 0);
+    AssertTrue('NC3 line present', Pos('NC3 self-duality', Report) > 0);
+    AssertTrue('NC4 line present',
+      Pos('NC4 classifier -> nearest-class-mean', Report) > 0);
+    AssertTrue('heatmap present', Pos('pairwise-cosine heatmap', Report) > 0);
+
+    // PIN: mean pairwise cosine == -1/(C-1) within tight tolerance.
+    AssertTrue('mean pairwise cosine == -1/(C-1) (exact simplex)',
+      Abs(ExtractAfter(Report, 'mean pairwise cosine=') -
+          (-1.0 / (cC - 1))) < 1e-4);
+    // PIN: NC2 equiangular deviations ~ 0 on the exact simplex.
+    DevMean := ExtractAfter(Report, 'mean|dev|=');
+    DevMax := ExtractAfter(Report, 'max|dev|=');
+    AssertTrue('NC2 mean|dev| ~ 0 on exact simplex', Abs(DevMean) < 1e-4);
+    AssertTrue('NC2 max|dev| ~ 0 on exact simplex', Abs(DevMax) < 1e-4);
+    // PIN: equinorm CV ~ 0 (all vertices have equal norm).
+    NormCV := ExtractAfter(Report, 'CV(||mu_c-mu||)=');
+    AssertTrue('NC2 equinorm CV ~ 0 on exact simplex', Abs(NormCV) < 1e-4);
+    // The identity feature layer means tr(Sw)=0 (identical per-class inputs):
+    // NC1 -> 0.
+    AssertTrue('NC1 ~ 0 (identical per-class features)',
+      Abs(ExtractAfter(Report, 'tr(Sw)/tr(Sb) = ')) < 1e-4);
+
+    // NC3 here: the SoftMax-terminated head IS a width-matched FCLinear, so NC3
+    // is COMPUTED (not skipped). Verify the computed-branch text appears.
+    AssertTrue('NC3 computed (width-matched linear head)',
+      Pos('mean |cos(mu_c-mu, w_c)|', Report) > 0);
+  finally
+    Samples.Free;
+    NN.Free;
+  end;
+
+  // --- NC3 HONEST SKIP: a head that is NOT a width-matched linear classifier.
+  //     TNNetFullConnect (non-linear base, NOT a TNNetFullConnectLinear
+  //     descendant) as the head triggers the honest skip branch. ---
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(cC, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnect.Create(cC)); // non-linear head -> not linear
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    for C := 0 to cC - 1 do
+      for Rep := 1 to cReps do
+      begin
+        X := TNNetVolume.Create(cC, 1, 1);
+        Y := TNNetVolume.Create(cC, 1, 1);
+        for J := 0 to cC - 1 do X.FData[J] := Vert[C][J];
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+    Report := TNNet.NeuralCollapseReport(NN, Samples, cC);
+    AssertTrue('NC3 honestly skipped on non-linear head',
+      Pos('NC3 self-duality: SKIPPED', Report) > 0);
+  finally
+    Samples.Free;
     NN.Free;
   end;
 end;
@@ -3782,7 +4294,12 @@ var
   RatioStr: string;
   Ratio: TNeuralFloat;
   FS: TFormatSettings;
+  CsvName: string;
+  CsvLines: TStringList;
+  PrevMass, CurMass: TNeuralFloat;
+  CommaPos: integer;
 begin
+  RandSeed := 424242;
   FS := DefaultFormatSettings;
   FS.DecimalSeparator := '.';
   FS.ThousandSeparator := #0;
@@ -3863,6 +4380,42 @@ begin
       Ratio <= 1.01);
     AssertTrue('effective RF is a real fraction of theoretical (ratio > 0)',
       Ratio > 0);
+
+    // --- CSV side-output: file created, header + one row per radius bin, and
+    // the cumulative mass_fraction column is monotonically non-decreasing and
+    // ends at ~1.0. Input plane is 13x13 so MaxR=13 => 14 radius rows (0..13)
+    // plus the header line = 15 lines. ---
+    CsvName := GetTempDir(False) + 'erf_report_test.csv';
+    if FileExists(CsvName) then DeleteFile(CsvName);
+    Report := TNNet.EffectiveReceptiveFieldReport(NN, Probes, 0.9, 64, CsvName);
+    AssertTrue('CSV file created', FileExists(CsvName));
+    AssertTrue('CSV mention in terminal report',
+      Pos('CSV side-output', Report) > 0);
+    CsvLines := TStringList.Create();
+    try
+      CsvLines.LoadFromFile(CsvName);
+      AssertTrue('CSV header present', CsvLines[0] = 'radius,mass_fraction');
+      // 13x13 input => MaxR = 13 => radii 0..13 => 14 data rows + header.
+      AssertEquals('CSV row count (header + 14 radius bins)', 15, CsvLines.Count);
+      PrevMass := -1;
+      CurMass := 0;
+      for I := 1 to CsvLines.Count - 1 do
+      begin
+        CommaPos := Pos(',', CsvLines[I]);
+        AssertTrue('CSV row has a comma', CommaPos > 0);
+        CurMass := StrToFloatDef(
+          Copy(CsvLines[I], CommaPos + 1, Length(CsvLines[I])), -1, FS);
+        AssertTrue('CSV mass_fraction parsed', CurMass >= 0);
+        AssertTrue('CSV cumulative mass non-decreasing',
+          CurMass >= PrevMass - 1e-6);
+        PrevMass := CurMass;
+      end;
+      // Final radius encloses the whole plane => mass fraction ~ 1.0.
+      AssertTrue('CSV final mass_fraction ~ 1.0', Abs(CurMass - 1.0) < 1e-4);
+    finally
+      CsvLines.Free;
+      if FileExists(CsvName) then DeleteFile(CsvName);
+    end;
   finally
     Probes.Free;
     NN.Free;
@@ -4011,6 +4564,96 @@ begin
     NN.Free;
     LinNN.Free;
     RandSeed := SavedSeed;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestLocalLearningCoefficientReportSmoke;
+var
+  NN: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  NilReport, EmptyReport, Report, SnapBefore, SnapAfter: string;
+  Ep, I, C: integer;
+  SavedSeed: longword;
+  Centers: array[0..2, 0..1] of TNeuralFloat =
+    ((-2.0, -2.0), (2.0, 2.0), (2.0, -2.0));
+begin
+  SavedSeed := RandSeed;
+
+  // nil NN handled gracefully.
+  NilReport := TNNet.LocalLearningCoefficientReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', NilReport) > 0);
+
+  NN := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.05, 0.9);
+    NN.InitWeights();
+
+    // empty sample list handled gracefully (on a valid net).
+    EmptyReport := TNNet.LocalLearningCoefficientReport(NN, Samples);
+    AssertTrue('empty samples reported gracefully',
+      Pos('nil or empty', EmptyReport) > 0);
+
+    // Train briefly on a separable 3-cluster problem.
+    RandSeed := 4321;
+    for Ep := 1 to 40 do
+      for I := 1 to 60 do
+      begin
+        C := Random(3);
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        try
+          X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+          X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+          Y.Fill(0);
+          Y.FData[C] := 1.0;
+          NN.Compute(X);
+          NN.Backpropagate(Y);
+        finally
+          X.Free;
+          Y.Free;
+        end;
+      end;
+
+    for C := 0 to 2 do
+      for I := 1 to 8 do
+      begin
+        X := TNNetVolume.Create(2, 1, 1);
+        Y := TNNetVolume.Create(3, 1, 1);
+        X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
+        X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
+        Y.Fill(0);
+        Y.FData[C] := 1.0;
+        Samples.Add(TNNetVolumePair.Create(X, Y));
+      end;
+
+    // Non-destructiveness: weights must be bit-identical after the report.
+    SnapBefore := NN.SaveDataToString();
+    Report := TNNet.LocalLearningCoefficientReport(NN, Samples, 16);
+    SnapAfter := NN.SaveDataToString();
+
+    AssertTrue('report non-empty', Length(Report) > 0);
+    AssertTrue('header present',
+      Pos('LocalLearningCoefficientReport', Report) > 0);
+    AssertTrue('LLC_hat line present', Pos('LLC_hat', Report) > 0);
+    AssertTrue('dim(w) line present', Pos('dim(w)', Report) > 0);
+    AssertTrue('ratio line present', Pos('LLC_hat / dim(w)', Report) > 0);
+    AssertTrue('verdict present', Pos('Verdict:', Report) > 0);
+    AssertTrue('weights restored bit-for-bit', SnapBefore = SnapAfter);
+  finally
+    Samples.Free;
+    NN.Free;
+    // Restore a FIXED global RNG seed (not just SavedSeed): a later
+    // order-sensitive test (TTestNeuralTraining.TestClipValueDefaultIdentical)
+    // reads the leftover stream, and this smoke test consumes a different
+    // number of Random() draws than the suite was tuned for. See the
+    // numerical-test RNG-ordering note.
+    RandSeed := 424242;
   end;
 end;
 
@@ -4510,14 +5153,42 @@ procedure TTestNeuralLayersExtra.TestNeuralTangentKernelReportSmoke;
 var
   NN: TNNet;
   Probes: TNNetVolumeList;
-  V: TNNetVolume;
+  TrainPairs: TNNetVolumePairList;
+  V, TV: TNNetVolume;
   Report, NilReport, TooSmallReport: string;
+  SnapFresh, SnapStepped: string;
+  DriftSame, DriftStep: TNeuralFloat;
   I, J: integer;
   SavedSeed: longword;
 const
   cInDim  = 8;
   cProbeN = 8;
+
+  // Pull the relative-Frobenius-drift scalar off the
+  // "relative Frobenius drift ... = <value>" line. -1 if not found.
+  function ReadDrift(const S: string): TNeuralFloat;
+  var
+    P, E: integer;
+    FSL: TFormatSettings;
+  begin
+    Result := -1;
+    P := Pos('relative Frobenius drift', S);
+    if P <= 0 then Exit;
+    P := Pos('=', Copy(S, P, Length(S))) + P - 1;
+    if P <= 0 then Exit;
+    Inc(P);
+    while (P <= Length(S)) and (S[P] = ' ') do Inc(P);
+    E := P;
+    while (E <= Length(S)) and (S[E] <> ' ') and (S[E] <> #10) and
+          (S[E] <> #13) do Inc(E);
+    FSL := DefaultFormatSettings;
+    FSL.DecimalSeparator := '.';
+    FSL.ThousandSeparator := #0;
+    Result := StrToFloatDef(Trim(Copy(S, P, E - P)), -1, FSL);
+  end;
+
 begin
+  RandSeed := 424242;
   SavedSeed := RandSeed;
 
   // nil NN handled gracefully.
@@ -4558,6 +5229,52 @@ begin
     AssertTrue('Condition number present', Pos('Condition number', Report) > 0);
     // built-in correctness lines must be present (symmetry == 0, diagonal > 0).
     AssertTrue('Correctness check present', Pos('Correctness:', Report) > 0);
+
+    // --- NTK drift: comparing the net against an IDENTICAL copy of its own
+    // weights must give ~0 drift; comparing fresh-init against a one-step
+    // update must give a finite drift > 0. ---
+    SnapFresh := NN.SaveDataToString();
+    Report := TNNet.NeuralTangentKernelReport(NN, Probes, -1, SnapFresh);
+    AssertTrue('Drift section present', Pos('NTK drift vs SnapshotB', Report) > 0);
+    DriftSame := ReadDrift(Report);
+    AssertTrue('drift scalar parsed (identical copy)', DriftSame >= 0);
+    AssertTrue('drift ~0 for identical weights', DriftSame < 1e-4);
+
+    // Take ONE training step so the weights (and hence the empirical NTK) move.
+    TrainPairs := TNNetVolumePairList.Create(True);
+    try
+      for I := 0 to cProbeN - 1 do
+      begin
+        TV := TNNetVolume.Create(3, 1, 1);
+        TV.Fill(0);
+        TV.Raw[I mod 3] := 1.0;
+        V := TNNetVolume.Create(cInDim, 1, 1);
+        V.Copy(Probes[I]);
+        TrainPairs.Add(TNNetVolumePair.Create(V, TV));
+      end;
+      for I := 0 to TrainPairs.Count - 1 do
+      begin
+        NN.Compute(TrainPairs[I].I);
+        NN.Backpropagate(TrainPairs[I].O);
+      end;
+      NN.UpdateWeights();
+    finally
+      TrainPairs.Free;
+    end;
+    SnapStepped := NN.SaveDataToString();
+
+    // Drift between the FRESH snapshot and the now-stepped live net must be
+    // finite and strictly positive (the kernel moved).
+    Report := TNNet.NeuralTangentKernelReport(NN, Probes, -1, SnapFresh);
+    DriftStep := ReadDrift(Report);
+    AssertTrue('drift scalar parsed (post-step)', DriftStep >= 0);
+    AssertTrue('drift is finite', DriftStep < 1e30);
+    AssertTrue('drift > 0 after a training step', DriftStep > 1e-6);
+
+    // Re-snapshotting the stepped net against ITSELF is again ~0 drift.
+    Report := TNNet.NeuralTangentKernelReport(NN, Probes, -1, SnapStepped);
+    DriftSame := ReadDrift(Report);
+    AssertTrue('drift ~0 for identical stepped copy', DriftSame < 1e-4);
   finally
     Probes.Free;
     NN.Free;
@@ -4962,6 +5679,91 @@ begin
   end;
 end;
 
+// Parses the "Max conservation residual ... = <value> (..." line out of an
+// LRPReport string. Returns -1 if the line/value is absent. The gamma- and
+// alpha-beta-rules (alpha-beta=1) conserve relevance up to the eps stabiliser.
+function LRPResidual(const Report: string): Extended;
+var
+  P, Q: integer;
+  NumStr: string;
+  FS: TFormatSettings;
+begin
+  Result := -1;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  P := Pos('Max conservation residual', Report);
+  if P <= 0 then Exit;
+  P := PosEx('=', Report, P);
+  if P <= 0 then Exit;
+  Inc(P);
+  while (P <= Length(Report)) and (Report[P] = ' ') do Inc(P);
+  Q := P;
+  while (Q <= Length(Report)) and (Report[Q] <> ' ') and (Report[Q] <> '(') do
+    Inc(Q);
+  NumStr := Trim(Copy(Report, P, Q - P));
+  Result := StrToFloatDef(NumStr, -1, FS);
+end;
+
+procedure TTestNeuralLayersExtra.TestLRPReportSmoke;
+var
+  NN: TNNet;
+  vInput: TNNetVolume;
+  Report: string;
+  ResVal: Extended;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.LRPReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  vInput := nil;
+  try
+    NN.AddLayer(TNNetInput.Create(6, 6, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+
+    // nil probe handled gracefully.
+    Report := TNNet.LRPReport(NN, nil);
+    AssertTrue('nil probe reported gracefully', Pos('nil or empty', Report) > 0);
+
+    vInput := TNNetVolume.Create(6, 6, 1);
+    vInput.FillForDebug();
+    Report := TNNet.LRPReport(NN, vInput);
+    AssertTrue('non-empty result', Length(Report) > 0);
+    AssertTrue('header present', Pos('LRPReport', Report) > 0);
+    AssertTrue('conservation residual present',
+      Pos('conservation residual', Report) > 0);
+    AssertTrue('top-k positions present',
+      Pos('most-relevant input positions', Report) > 0);
+    // Default call selects the epsilon-rule (unchanged behaviour).
+    AssertTrue('default is epsilon-rule', Pos('epsilon-rule', Report) > 0);
+
+    // gamma-rule variant runs end-to-end and conserves relevance tightly.
+    Report := TNNet.LRPReport(NN, vInput, -1, 8, 1e-2, lrpGamma, 0.25);
+    AssertTrue('gamma header present', Pos('gamma-rule', Report) > 0);
+    AssertTrue('gamma top-k positions present',
+      Pos('most-relevant input positions', Report) > 0);
+    ResVal := LRPResidual(Report);
+    AssertTrue('gamma residual parsed', ResVal >= 0);
+    AssertTrue('gamma relevance conserved', ResVal < 0.1);
+
+    // alpha-beta variant (alpha=2, beta=1) runs end-to-end and conserves.
+    Report := TNNet.LRPReport(NN, vInput, -1, 8, 1e-2, lrpAlphaBeta, 0.25, 2.0);
+    AssertTrue('alpha-beta header present', Pos('alpha-beta-rule', Report) > 0);
+    AssertTrue('alpha-beta top-k positions present',
+      Pos('most-relevant input positions', Report) > 0);
+    ResVal := LRPResidual(Report);
+    AssertTrue('alpha-beta residual parsed', ResVal >= 0);
+    AssertTrue('alpha-beta relevance conserved', ResVal < 0.1);
+  finally
+    if vInput <> nil then vInput.Free;
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralLayersExtra.TestLayerTimingReportSmoke;
 var
   NN: TNNet;
@@ -5041,6 +5843,105 @@ begin
   Output.Free;
   Target.Free;
   NN.Free;
+end;
+
+// TNNet.AddMixtureOfDepths conditional-compute block. Asserts:
+//  1) the block is shape-preserving (drop-in residual over the sequence);
+//  2) DEGENERATE ANCHOR: with Capacity = SeqLen the top-K keeps every token, so
+//     the wrapper reduces EXACTLY to a per-token scalar-gated residual block
+//     y = x + Sigmoid(router)*Block(x). We build a reference net with the SAME
+//     ordered layers but the TopK replaced by a plain TNNetIdentity (which is
+//     exactly what TopK does when K >= Depth: it early-exits as a passthrough),
+//     copy the MoD weights into it, and assert bit-for-bit equal output;
+//  3) the wrapper wiring round-trips through SaveToString -> LoadFromString and
+//     reproduces the output exactly.
+procedure TTestNeuralLayersExtra.TestMixtureOfDepthsShapeDegenerateAndRoundTrip;
+const
+  cSeqLen = 5;
+  cDModel = 4;
+  cHidden = 6;
+
+  // Wire the SAME layer sequence the AddMixtureOfDepths builder uses, but with
+  // the TopK swapped for an identity passthrough. With Capacity = SeqLen the
+  // real TopK is itself an identity passthrough, so this is an exact reference.
+  procedure BuildReference(ANN: TNNet);
+  var
+    Inp, Masked, Block, Gate, Gated: TNNetLayer;
+  begin
+    Inp := ANN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    ANN.AddLayerAfter(TNNetPointwiseConvLinear.Create(1), Inp);
+    ANN.AddLayer(TNNetSigmoid.Create());
+    ANN.AddLayer(TNNetTransposeXD.Create());
+    ANN.AddLayer(TNNetIdentity.Create()); // stands in for TopK(Capacity=SeqLen)
+    Masked := ANN.AddLayer(TNNetTransposeXD.Create());
+    ANN.AddLayerAfter(TNNetPointwiseConvReLU.Create(cHidden), Inp);
+    Block := ANN.AddLayer(TNNetPointwiseConvLinear.Create(cDModel));
+    Gate := ANN.AddLayer(TNNetDeepConcat.Replicate(cDModel, Masked));
+    Gated := ANN.AddLayer(TNNetCellMulByCell.Create(Block, Gate));
+    ANN.AddLayer(TNNetSum.Create([Inp, Gated]));
+  end;
+
+var
+  NN, Ref: TNNet;
+  Saved: string;
+  NN2: TNNet;
+  Input: TNNetVolume;
+  MoDOut: TNNetLayer;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSeqLen, 1, cDModel);
+  try
+    NN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    MoDOut := NN.AddMixtureOfDepths(nil,
+      [ TNNetPointwiseConvReLU.Create(cHidden),
+        TNNetPointwiseConvLinear.Create(cDModel) ], cSeqLen);
+
+    // 1) Shape-preserving.
+    AssertEquals('MoD output SizeX preserved', cSeqLen, MoDOut.Output.SizeX);
+    AssertEquals('MoD output SizeY preserved', 1, MoDOut.Output.SizeY);
+    AssertEquals('MoD output depth matches d_model', cDModel, MoDOut.Output.Depth);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.61) * 1.3 + 0.4;
+
+    // 2) Degenerate equality anchor (Capacity = SeqLen).
+    Ref := TNNet.Create();
+    try
+      BuildReference(Ref);
+      AssertEquals('MoD reference has same layer count',
+        NN.CountLayers(), Ref.CountLayers());
+      Ref.CopyWeights(NN); // copy router + block weights layer-by-layer
+      NN.Compute(Input);
+      Ref.Compute(Input);
+      AssertEquals('MoD degenerate output size matches reference',
+        NN.GetLastLayer.Output.Size, Ref.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('MoD Capacity=SeqLen == gated residual block at ' + IntToStr(i),
+          Ref.GetLastLayer.Output.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      Ref.Free;
+    end;
+
+    // 3) SaveToString -> LoadFromString round-trip reproduces the output.
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('MoD round-trip layer count',
+        NN.CountLayers(), NN2.CountLayers());
+      NN.Compute(Input);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('MoD round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 // TNNetDropBlock (Ghiasi et al. 2018) structured spatial dropout. Asserts:
@@ -5135,6 +6036,222 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// Shake-Shake (a): in EVAL mode the block reduces to the deterministic
+// 0.5/0.5 combination. With constant branches B1=2x, B2=3x and skip=x the
+// output must equal x + 0.5*2x + 0.5*3x = 3.5x exactly, independent of RNG.
+procedure TTestNeuralLayersExtra.TestShakeShakeEvalDeterministicCombination;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, B1, B2: TNNetLayer;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    // B1 = 2*x, B2 = 3*x, both shape-preserving branches off the input.
+    B1 := NN.AddLayerAfter(TNNetMulByConstant.Create(2.0), InputLayer);
+    B2 := NN.AddLayerAfter(TNNetMulByConstant.Create(3.0), InputLayer);
+    NN.AddLayer(TNNetShakeShakeMerge.Create([B1, B2, InputLayer]));
+    NN.EnableDropouts(false); // inference: deterministic 0.5/0.5
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.9;
+    // Run several times: eval output is deterministic regardless of RandSeed.
+    RandSeed := 7;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ShakeShake eval = x + 0.5*2x + 0.5*3x = 3.5x at ' + IntToStr(i),
+        3.5 * Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Shake-Shake (b): LoadFromString round-trip of a net containing the block is
+// bit-for-bit stable (save, load, save again, assert equal string).
+procedure TTestNeuralLayersExtra.TestShakeShakeRoundTrip;
+var
+  NN, NN2: TNNet;
+  Saved, Saved2: string;
+  MergeIdx: integer;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(3, 3, 4, 1));
+    NN.AddShakeShakeBlock(8); // builder: two pointwise branches + merge
+    MergeIdx := NN.GetLastLayerIdx();
+    AssertTrue('AddShakeShakeBlock last layer is TNNetShakeShakeMerge',
+      NN.Layers[MergeIdx] is TNNetShakeShakeMerge);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ShakeShake save/load/save is bit-for-bit stable',
+        Saved, Saved2);
+      AssertTrue('ShakeShake reloaded merge is TNNetShakeShakeMerge',
+        NN2.Layers[MergeIdx] is TNNetShakeShakeMerge);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+// Shake-Shake (c): a tiny net with a ShakeShake block trains a few steps
+// without NaN/Inf and the loss stays finite (and typically decreases).
+procedure TTestNeuralLayersExtra.TestShakeShakeTrainSmoke;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  Step, i: integer;
+  LossFirst, LossLast, Err: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  Target := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddShakeShakeBlock(6);
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+    NN.SetLearningRate(0.01, 0.9);
+    NN.EnableDropouts(true);
+
+    for i := 0 to 3 do
+    begin
+      Input.Raw[i] := Sin(i * 0.5) * 0.5;
+      Target.Raw[i] := Cos(i * 0.5) * 0.5;
+    end;
+
+    LossFirst := 0;
+    LossLast := 0;
+    for Step := 0 to 49 do
+    begin
+      NN.Compute(Input);
+      NN.GetLastLayer.Output.Sub(Target);
+      Err := NN.GetLastLayer.Output.GetSumSqr();
+      AssertFalse('ShakeShake train loss must be finite at step ' + IntToStr(Step),
+        IsNan(Err) or IsInfinite(Err));
+      if Step = 0 then LossFirst := Err;
+      LossLast := Err;
+      NN.Backpropagate(Target);
+    end;
+    AssertTrue('ShakeShake final loss must be finite',
+      (not IsNan(LossLast)) and (not IsInfinite(LossLast)));
+    // Loss should not blow up relative to the start.
+    AssertTrue('ShakeShake training should not diverge (lossLast <= 5*lossFirst+1)',
+      LossLast <= 5 * LossFirst + 1);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+// ShakeDrop: eval reduces to y = x + p_l*B (deterministic), and a net with the
+// block round-trips bit-for-bit (save/load/save), preserving p_l (FFloatSt[0]).
+procedure TTestNeuralLayersExtra.TestShakeDropEvalAndRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  InputLayer, B: TNNetLayer;
+  Saved, Saved2: string;
+  i, MergeIdx: integer;
+  KeepProb: TNeuralFloat;
+begin
+  KeepProb := 0.75;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 3);
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 2, 3, 1));
+    B := NN.AddLayerAfter(TNNetMulByConstant.Create(2.0), InputLayer); // B = 2x
+    NN.AddLayer(TNNetShakeDropMerge.Create(KeepProb, [B, InputLayer]));
+    MergeIdx := NN.GetLastLayerIdx();
+    NN.EnableDropouts(false); // inference: y = x + p_l*B = x + 0.75*2x = 2.5x
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.33) * 0.6 + 0.8;
+    RandSeed := 11;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('ShakeDrop eval = x + 0.75*2x = 2.5x at ' + IntToStr(i),
+        2.5 * Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ShakeDrop save/load/save is bit-for-bit stable',
+        Saved, Saved2);
+      AssertTrue('ShakeDrop reloaded merge is TNNetShakeDropMerge',
+        NN2.Layers[MergeIdx] is TNNetShakeDropMerge);
+      AssertEquals('ShakeDrop round-trip structure (keep prob)',
+        NN.Layers[MergeIdx].SaveStructureToString(),
+        NN2.Layers[MergeIdx].SaveStructureToString());
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestRoutingEntropyReportSmoke;
+var
+  NN: TNNet;
+  Probe: TNNetVolumeList;
+  V: TNNetVolume;
+  Report: string;
+  I: integer;
+begin
+  // nil NN handled gracefully.
+  Report := TNNet.RoutingEntropyReport(nil, nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Probe := TNNetVolumeList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetSoftDecisionTree.Create(2, 3)); // depth 2 -> 4 leaves
+    NN.InitWeights();
+
+    // empty probe handled gracefully.
+    Report := TNNet.RoutingEntropyReport(NN, Probe);
+    AssertTrue('empty probe reported gracefully',
+      Pos('Probe is nil or empty', Report) > 0);
+
+    for I := 0 to 7 do
+    begin
+      V := TNNetVolume.Create(4, 1, 1);
+      V.FData[0] := (I mod 2) * 1.0;
+      V.FData[1] := -(I mod 3) * 0.5;
+      V.FData[2] := I * 0.1;
+      V.FData[3] := 1.0 - I * 0.1;
+      Probe.Add(V);
+    end;
+
+    Report := TNNet.RoutingEntropyReport(NN, Probe);
+    AssertTrue('Report is non-empty', Length(Report) > 0);
+    AssertTrue('Header present', Pos('RoutingEntropyReport', Report) > 0);
+    AssertTrue('Occupancy section present', Pos('OCCUPANCY', Report) > 0);
+    AssertTrue('Gate-entropy section present', Pos('BINARY ENTROPY', Report) > 0);
+    AssertTrue('Effective-leaf-count section present',
+      Pos('EFFECTIVE-LEAF-COUNT', Report) > 0);
+  finally
+    Probe.Free;
+    NN.Free;
   end;
 end;
 

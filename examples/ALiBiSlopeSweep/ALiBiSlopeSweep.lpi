@@ -1,17 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <CONFIG>
   <ProjectOptions>
-    <Version Value="12"/>
+    <Version Value="11"/>
     <PathDelim Value="\"/>
     <General>
       <Flags>
         <MainUnitHasCreateFormStatements Value="False"/>
-        <MainUnitHasTitleStatement Value="False"/>
-        <MainUnitHasScaledStatement Value="False"/>
-        <CompatibilityMode Value="True"/>
       </Flags>
       <SessionStorage Value="InProjectDir"/>
-      <Title Value="Transformer decoder with tokenizer"/>
+      <MainUnit Value="0"/>
+      <Title Value="ALiBiSlopeSweep Example"/>
       <UseAppBundle Value="False"/>
       <ResourceType Value="res"/>
     </General>
@@ -25,7 +23,7 @@
           <Version Value="11"/>
           <PathDelim Value="\"/>
           <Target>
-            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\TrasformerDecodersWithTokenizer"/>
+            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\ALiBiSlopeSweep"/>
           </Target>
           <SearchPaths>
             <IncludeFiles Value="..\neural;$(ProjOutDir)"/>
@@ -56,10 +54,9 @@
           <Other>
             <CustomOptions Value="-dDebug
 -dAVX2"/>
-            <OtherDefines Count="3">
+            <OtherDefines Count="2">
               <Define0 Value="Debug"/>
               <Define1 Value="AVX2"/>
-              <Define2 Value="OpenCL"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>
@@ -69,7 +66,7 @@
           <Version Value="11"/>
           <PathDelim Value="\"/>
           <Target>
-            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\TrasformerDecodersWithTokenizer"/>
+            <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\ALiBiSlopeSweep"/>
           </Target>
           <SearchPaths>
             <IncludeFiles Value="..\..\neural;$(ProjOutDir)"/>
@@ -85,19 +82,17 @@
           <Linking>
             <Debugging>
               <GenerateDebugInfo Value="False"/>
-              <DebugInfoType Value="dsDwarf2Set"/>
             </Debugging>
             <LinkSmart Value="True"/>
           </Linking>
           <Other>
             <CustomOptions Value="-dRelease
 -dAVX2"/>
-            <OtherDefines Count="5">
+            <OtherDefines Count="4">
               <Define0 Value="Release"/>
               <Define1 Value="Debug"/>
               <Define2 Value="CheckRange"/>
               <Define3 Value="AVX2"/>
-              <Define4 Value="OpenCL"/>
             </OtherDefines>
           </Other>
         </CompilerOptions>
@@ -112,9 +107,14 @@
         <Mode0 Name="default"/>
       </Modes>
     </RunParams>
+    <RequiredPackages Count="1">
+      <Item1>
+        <PackageName Value="multithreadprocslaz"/>
+      </Item1>
+    </RequiredPackages>
     <Units Count="1">
       <Unit0>
-        <Filename Value="TrasformerDecodersWithTokenizer.lpr"/>
+        <Filename Value="ALiBiSlopeSweep.lpr"/>
         <IsPartOfProject Value="True"/>
       </Unit0>
     </Units>
@@ -123,7 +123,7 @@
     <Version Value="11"/>
     <PathDelim Value="\"/>
     <Target>
-      <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\TrasformerDecodersWithTokenizer"/>
+      <Filename Value="..\..\bin\$(TargetCPU)-$(TargetOS)\bin\ALiBiSlopeSweep"/>
     </Target>
     <SearchPaths>
       <IncludeFiles Value="..\..\experiments\neural;$(ProjOutDir)"/>
@@ -138,12 +138,15 @@
     <Linking>
       <Debugging>
         <GenerateDebugInfo Value="False"/>
-        <DebugInfoType Value="dsDwarf3"/>
       </Debugging>
     </Linking>
     <Other>
       <CustomOptions Value="-dAVX2
 -dRelease"/>
+      <OtherDefines Count="2">
+        <Define0 Value="AVX2"/>
+        <Define1 Value="Release"/>
+      </OtherDefines>
     </Other>
   </CompilerOptions>
   <Debugging>

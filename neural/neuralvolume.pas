@@ -324,7 +324,12 @@ type
     procedure OneHotEncodingReversed(var aTokens: array of integer); overload;
     // Sets positional embedding as per paper "Attention Is All You Need".
     // https://arxiv.org/abs/1706.03762 .
-    procedure PositionalEncoding(n: integer = 10000);
+    // Fills the volume with the Vaswani sin/cos positional-encoding table.
+    // PositionOffset (default 0, additive API) shifts every position by a
+    // constant: PE(pos + PositionOffset, i). Used by streamed/incremental
+    // decoding, where a short window of tokens must be encoded at their
+    // ABSOLUTE sequence positions rather than at window-local positions.
+    procedure PositionalEncoding(n: integer = 10000; PositionOffset: integer = 0);
 
     // Color Encoding Functions
     procedure RgbToHsv(); {$IFDEF Release} inline; {$ENDIF}
@@ -6920,7 +6925,7 @@ begin
   end;
 end;
 
-procedure TVolume.PositionalEncoding(n: integer);
+procedure TVolume.PositionalEncoding(n: integer; PositionOffset: integer);
 var
   Position: Integer;
   divTerm: Double;
@@ -6939,7 +6944,7 @@ begin
     begin
       for CntY := 0 to MaxY do
       begin
-        Position := CntY*FSizeX + CntX;
+        Position := CntY*FSizeX + CntX + PositionOffset;
         if CntDepth mod 2 = 0
           then Self[CntX, CntY, CntDepth] := pcr_sinf(Position / divTerm)
           else Self[CntX, CntY, CntDepth] := pcr_cosf(Position / divTerm);
