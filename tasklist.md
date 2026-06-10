@@ -407,7 +407,7 @@ rather than acted on.
       KV-cache incremental-decode path lands, remove the per-verification-pass
       prefix recompute (the v1 demo recomputes the whole prefix each pass) so the
       two efficiency wins (fewer big-model calls x O(1)-per-step) compose.
-- [ ] KV-cache / incremental-decode O(1)-per-step path for
+- [x] KV-cache / incremental-decode O(1)-per-step path for
       TNNetDiagonalSSM (a linear recurrence is O(1)-per-step by nature;
       the SDPA incremental-decode notes above apply doubly here).
 - [ ] TNNetTokenHistoryPenalty follow-up: wire it into the downstream

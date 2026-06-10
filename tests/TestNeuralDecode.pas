@@ -31,6 +31,11 @@ type
     procedure TestKVCachePrefillThenStepMatchesFullForward;
     procedure TestKVCacheResetStartsFreshSequence;
     procedure TestKVCacheDisabledPathUnchanged;
+    // O(1)-per-step incremental decode on TNNetDiagonalSSM (persisted state).
+    procedure TestSSMIncrementalMatchesFullForward;
+    procedure TestSSMPrefillThenStepMatchesFullForward;
+    procedure TestSSMResetStateStartsFreshSequence;
+    procedure TestSSMDisabledPathUnchanged;
   end;
 
 implementation
@@ -371,6 +376,244 @@ begin
     NN.GetOutput(OutAfter);
     for T := 0 to SeqLen - 1 do
       for D := 0 to Dk - 1 do
+        AssertEquals('pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          OutBefore[T, 0, D], OutAfter[T, 0, D], 0);
+  finally
+    OutAfter.Free;
+    OutBefore.Free;
+    InV.Free;
+    NN.Free;
+  end;
+end;
+
+// Headline SSM faithfulness check: run the SAME random sequence through the
+// SAME weights two ways - (a) one full forward over SeqLen tokens and (b)
+// token-at-a-time through the incremental path (persisted state h carried
+// across single-token forwards) - and assert EVERY position's output matches
+// to < 1e-5. A linear recurrence summarises the entire past in its state, so
+// the incremental sweep is mathematically identical to the full one.
+procedure TTestNeuralDecode.TestSSMIncrementalMatchesFullForward;
+const
+  SeqLen = 9;
+  Depth = 6;
+var
+  NNFull, NNStep: TNNet;
+  SSMFull, SSMStep: TNNetDiagonalSSM;
+  FullIn, StepIn, FullOut, StepOut: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  NNFull := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, Depth);
+  StepIn := TNNetVolume.Create(1, 1, Depth);
+  FullOut := TNNetVolume.Create();
+  StepOut := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    SSMFull := TNNetDiagonalSSM.Create();
+    NNFull.AddLayer(SSMFull);
+    NNStep.AddLayer(TNNetInput.Create(1, 1, Depth));
+    SSMStep := TNNetDiagonalSSM.Create();
+    NNStep.AddLayer(SSMStep);
+    // Non-trivial weights: randomize a_raw / b / c / e per channel, then copy
+    // the exact values to the single-token net so both compute one function.
+    for D := 0 to Depth - 1 do
+    begin
+      SSMFull.Neurons[0].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+      SSMFull.Neurons[1].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[2].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[3].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+    end;
+    SSMStep.CopyWeights(SSMFull);
+
+    FullIn.Randomize();
+    FullIn.Sub(0.5);
+    NNFull.Compute(FullIn);
+    NNFull.GetOutput(FullOut);
+
+    SSMStep.BeginIncrementalDecode();
+    AssertTrue('decode enabled after Begin', SSMStep.DecodeEnabled);
+    for T := 0 to SeqLen - 1 do
+    begin
+      for D := 0 to Depth - 1 do
+        StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      NNStep.GetOutput(StepOut);
+      AssertEquals('decode steps track tokens', T + 1, SSMStep.DecodeSteps);
+      for D := 0 to Depth - 1 do
+        AssertEquals('pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], StepOut[0, 0, D], 1e-5);
+    end;
+    SSMStep.EndIncrementalDecode();
+    AssertTrue('decode disabled after End', not SSMStep.DecodeEnabled);
+  finally
+    StepOut.Free;
+    FullOut.Free;
+    StepIn.Free;
+    FullIn.Free;
+    NNStep.Free;
+    NNFull.Free;
+  end;
+end;
+
+// Multi-token prompt prefill: feed the first PrefillLen tokens in ONE
+// incremental forward (on a width-PrefillLen net), then verify they match the
+// first PrefillLen rows of the full forward - the persisted-state sweep
+// handles any number of tokens per call, not just one.
+procedure TTestNeuralDecode.TestSSMPrefillThenStepMatchesFullForward;
+const
+  SeqLen = 8;
+  PrefillLen = 5;
+  Depth = 4;
+var
+  NNFull, NNPre: TNNet;
+  SSMFull, SSMPre: TNNetDiagonalSSM;
+  FullIn, PreIn, FullOut, PreOut: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 31337;
+  NNFull := TNNet.Create();
+  NNPre := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, Depth);
+  PreIn := TNNetVolume.Create(PrefillLen, 1, Depth);
+  FullOut := TNNetVolume.Create();
+  PreOut := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    SSMFull := TNNetDiagonalSSM.Create();
+    NNFull.AddLayer(SSMFull);
+    NNPre.AddLayer(TNNetInput.Create(PrefillLen, 1, Depth));
+    SSMPre := TNNetDiagonalSSM.Create();
+    NNPre.AddLayer(SSMPre);
+    for D := 0 to Depth - 1 do
+    begin
+      SSMFull.Neurons[0].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+      SSMFull.Neurons[1].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[2].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[3].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+    end;
+    SSMPre.CopyWeights(SSMFull);
+
+    FullIn.Randomize();
+    FullIn.Sub(0.5);
+    NNFull.Compute(FullIn);
+    NNFull.GetOutput(FullOut);
+
+    SSMPre.BeginIncrementalDecode();
+    for T := 0 to PrefillLen - 1 do
+      for D := 0 to Depth - 1 do
+        PreIn[T, 0, D] := FullIn[T, 0, D];
+    NNPre.Compute(PreIn);
+    NNPre.GetOutput(PreOut);
+    AssertEquals('prefill decode steps', PrefillLen, SSMPre.DecodeSteps);
+    for T := 0 to PrefillLen - 1 do
+      for D := 0 to Depth - 1 do
+        AssertEquals('prefill pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], PreOut[T, 0, D], 1e-5);
+  finally
+    PreOut.Free;
+    FullOut.Free;
+    PreIn.Free;
+    FullIn.Free;
+    NNPre.Free;
+    NNFull.Free;
+  end;
+end;
+
+// ResetState must start a genuinely fresh sequence: streaming the same token
+// stream twice (with a ResetState in between) yields identical outputs.
+procedure TTestNeuralDecode.TestSSMResetStateStartsFreshSequence;
+const
+  SeqLen = 6;
+  Depth = 3;
+var
+  NN: TNNet;
+  SSM: TNNetDiagonalSSM;
+  StepIn, OutV, Seq: TNNetVolume;
+  T, D, Pass: integer;
+  FirstRun: array of TNeuralFloat;
+begin
+  RandSeed := 90210;
+  NN := TNNet.Create();
+  StepIn := TNNetVolume.Create(1, 1, Depth);
+  OutV := TNNetVolume.Create();
+  Seq := TNNetVolume.Create(SeqLen, 1, Depth);
+  SetLength(FirstRun, SeqLen * Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, Depth));
+    SSM := TNNetDiagonalSSM.Create();
+    NN.AddLayer(SSM);
+    for D := 0 to Depth - 1 do
+      SSM.Neurons[0].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+    Seq.Randomize();
+    Seq.Sub(0.5);
+    SSM.BeginIncrementalDecode();
+    for Pass := 0 to 1 do
+    begin
+      if Pass = 1 then
+      begin
+        SSM.ResetState();
+        AssertEquals('steps zero after reset', 0, SSM.DecodeSteps);
+      end;
+      for T := 0 to SeqLen - 1 do
+      begin
+        for D := 0 to Depth - 1 do
+          StepIn[0, 0, D] := Seq[T, 0, D];
+        NN.Compute(StepIn);
+        NN.GetOutput(OutV);
+        for D := 0 to Depth - 1 do
+        begin
+          if Pass = 0 then
+            FirstRun[T * Depth + D] := OutV[0, 0, D]
+          else
+            AssertEquals('replay pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+              FirstRun[T * Depth + D], OutV[0, 0, D], 1e-7);
+        end;
+      end;
+    end;
+  finally
+    Seq.Free;
+    OutV.Free;
+    StepIn.Free;
+    NN.Free;
+  end;
+end;
+
+// With incremental decode disabled (default), Begin+End round-trip must leave
+// the normal full-sequence forward bit-for-bit unchanged.
+procedure TTestNeuralDecode.TestSSMDisabledPathUnchanged;
+const
+  SeqLen = 7;
+  Depth = 5;
+var
+  NN: TNNet;
+  SSM: TNNetDiagonalSSM;
+  InV, OutBefore, OutAfter: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 777;
+  NN := TNNet.Create();
+  InV := TNNetVolume.Create(SeqLen, 1, Depth);
+  OutBefore := TNNetVolume.Create();
+  OutAfter := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    SSM := TNNetDiagonalSSM.Create();
+    NN.AddLayer(SSM);
+    for D := 0 to Depth - 1 do
+      SSM.Neurons[0].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+    InV.Randomize();
+    InV.Sub(0.5);
+    NN.Compute(InV);
+    NN.GetOutput(OutBefore);
+    // Enable then immediately disable: the next forward must be identical.
+    SSM.BeginIncrementalDecode();
+    SSM.EndIncrementalDecode();
+    NN.Compute(InV);
+    NN.GetOutput(OutAfter);
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to Depth - 1 do
         AssertEquals('pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
           OutBefore[T, 0, D], OutAfter[T, 0, D], 0);
   finally

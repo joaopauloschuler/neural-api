@@ -1,4 +1,4 @@
-# IncrementalDecode: KV-cache decoding with TNNetScaledDotProductAttention
+# IncrementalDecode: KV-cache decoding with TNNetScaledDotProductAttention (+ TNNetDiagonalSSM persisted state)
 
 Autoregressive generation with a vanilla attention stack re-encodes the
 **entire prefix** to sample every next token: the step at prefix length `t`
@@ -54,6 +54,39 @@ Sample run (2-core CPU):
 
 The full re-encode column grows ~quadratically with the prefix; the cached
 column stays nearly flat, so the speedup keeps widening with `t`.
+
+## TNNetDiagonalSSM: O(1)-per-step incremental decode
+
+A linear recurrence is the easy case: the **entire past is summarised by one
+Depth-long state vector `h`**, so incremental decode needs no cache and no
+preallocation budget at all — just carry `h` across single-token forwards.
+
+```pascal
+SSM.BeginIncrementalDecode();  // stateful mode, h := 0 (no MaxContext needed)
+// ... feed tokens one at a time (or a multi-token prompt prefill):
+//     every forward resumes from the persisted h and updates it
+SSM.ResetState();              // start a fresh sequence (h := 0)
+SSM.EndIncrementalDecode();    // back to the normal training forward
+// Introspection: SSM.DecodeEnabled, SSM.DecodeSteps
+```
+
+Same contract as the attention KV cache: inference only (calling
+`Backpropagate` in incremental mode is an error), and with the mode disabled
+(the default) the training forward/backward is bit-for-bit unchanged. The
+demo runs the same faithfulness + timing protocol (`Depth = 192`):
+
+```
+  prefix t | full re-encode (ms/token) | incremental (ms/token) | speedup
+        64 |                     0.0298 |                 0.0082 |    3.6x
+       128 |                     0.0353 |                 0.0334 |    1.1x
+       256 |                     0.0665 |                 0.0081 |    8.2x
+       512 |                     0.1444 |                 0.0082 |   17.7x
+      1024 |                     0.6997 |                 0.0032 |  216.4x
+```
+
+For an SSM the full re-encode column grows **linearly** with the prefix (each
+step re-sweeps the `t`-token recurrence); the incremental column is **flat by
+construction** — a step costs `O(Depth)` regardless of `t`.
 
 ## Build
 

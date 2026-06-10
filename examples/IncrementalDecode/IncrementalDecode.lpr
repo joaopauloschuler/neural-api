@@ -1,6 +1,7 @@
 // IncrementalDecode example
 //
-// KV-cache incremental decode on TNNetScaledDotProductAttention.
+// KV-cache incremental decode on TNNetScaledDotProductAttention, plus the
+// O(1)-per-step persisted-state incremental decode on TNNetDiagonalSSM.
 //
 // Autoregressive generation with a vanilla attention stack re-encodes the
 // ENTIRE prefix to sample every next token: the step at prefix length t pays
@@ -20,6 +21,14 @@
 //      both arms and prints the table — the full re-encode column grows
 //      ~quadratically with the prefix while the cached column stays nearly
 //      flat, so the speedup ratio keeps widening with t.
+//
+// The TNNetDiagonalSSM section shows the recurrent counterpart: a linear
+// recurrence summarises the ENTIRE past in one Depth-long state vector h, so
+// BeginIncrementalDecode() needs no preallocation budget at all - each
+// single-token forward resumes from the persisted h and updates it, costing
+// O(Depth) per step REGARDLESS of the prefix length. Without it, a cache-less
+// sampler re-runs the whole prefix every step (O(t) per token for an SSM,
+// i.e. O(N^2) total); with it the per-token cost is flat.
 //
 // Positional contract reminder: the SDPA layer applies no positional encoding
 // itself. If your stack uses TNNetAddPositionalEmbedding / RoPE before the
@@ -211,6 +220,153 @@ begin
   end;
 end;
 
+// ---------------------------------------------------------------------------
+// 3) TNNetDiagonalSSM: persisted-state incremental decode.
+// ---------------------------------------------------------------------------
+
+const
+  cSSMDepth = 3 * cDk; // reuse the master sequence stream as (t,1,Depth) input
+
+// Faithfulness: same random weights, same input stream; one full forward over
+// cCheckLen tokens vs token-at-a-time through the persisted-state path.
+function RunSSMFaithfulnessCheck(): boolean;
+var
+  NNFull, NNStep: TNNet;
+  SSMFull, SSMStep: TNNetDiagonalSSM;
+  FullIn, StepIn, FullOut, StepOut: TNNetVolume;
+  T, D: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  NNFull := TNNet.Create();
+  NNFull.AddLayer(TNNetInput.Create(cCheckLen, 1, cSSMDepth));
+  SSMFull := TNNetDiagonalSSM.Create();
+  NNFull.AddLayer(SSMFull);
+  NNStep := TNNet.Create();
+  NNStep.AddLayer(TNNetInput.Create(1, 1, cSSMDepth));
+  SSMStep := TNNetDiagonalSSM.Create();
+  NNStep.AddLayer(SSMStep);
+  FullIn := TNNetVolume.Create(cCheckLen, 1, cSSMDepth);
+  StepIn := TNNetVolume.Create(1, 1, cSSMDepth);
+  FullOut := TNNetVolume.Create();
+  StepOut := TNNetVolume.Create();
+  try
+    // Non-trivial weights (decay/in/out/feedthrough), shared by both nets.
+    for D := 0 to cSSMDepth - 1 do
+    begin
+      SSMFull.Neurons[0].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+      SSMFull.Neurons[1].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[2].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[3].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+    end;
+    SSMStep.CopyWeights(SSMFull);
+    for T := 0 to cCheckLen - 1 do
+      for D := 0 to cSSMDepth - 1 do
+        FullIn[T, 0, D] := MasterSeq[T, 0, D];
+    NNFull.Compute(FullIn);
+    NNFull.GetOutput(FullOut);
+
+    SSMStep.BeginIncrementalDecode();
+    MaxDiff := 0;
+    for T := 0 to cCheckLen - 1 do
+    begin
+      for D := 0 to cSSMDepth - 1 do
+        StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      NNStep.GetOutput(StepOut);
+      for D := 0 to cSSMDepth - 1 do
+      begin
+        Diff := Abs(FullOut[T, 0, D] - StepOut[0, 0, D]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    WriteLn('Faithfulness: max |full - incremental| over all ', cCheckLen,
+      ' positions x ', cSSMDepth, ' dims = ', MaxDiff: 12: 9);
+    Result := MaxDiff < 1e-5;
+    if Result then
+      WriteLn('Faithfulness: PASS (< 1e-5)')
+    else
+      WriteLn('Faithfulness: FAIL (>= 1e-5)');
+  finally
+    StepOut.Free;
+    FullOut.Free;
+    StepIn.Free;
+    FullIn.Free;
+    NNStep.Free;
+    NNFull.Free;
+  end;
+end;
+
+// Full re-encode arm: per-token cost at prefix length Len = one full SSM
+// forward over Len tokens (what a state-less sampler pays per generated
+// token). Grows LINEARLY with the prefix for an SSM (contrast the attention
+// arm's quadratic growth).
+function TimeSSMFullForwardPerStep(Len: integer): double;
+var
+  NN: TNNet;
+  InV: TNNetVolume;
+  T, D, Rep, Reps: integer;
+  T0: double;
+begin
+  Reps := Max(8, 4096 div Len);
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(Len, 1, cSSMDepth));
+  NN.AddLayer(TNNetDiagonalSSM.Create());
+  InV := TNNetVolume.Create(Len, 1, cSSMDepth);
+  try
+    for T := 0 to Len - 1 do
+      for D := 0 to cSSMDepth - 1 do
+        InV[T, 0, D] := MasterSeq[T, 0, D];
+    NN.Compute(InV); // warm-up
+    T0 := NowMs();
+    for Rep := 1 to Reps do
+      NN.Compute(InV);
+    Result := (NowMs() - T0) / Reps; // ms per step
+  finally
+    InV.Free;
+    NN.Free;
+  end;
+end;
+
+// Incremental arm: stream the master sequence token-at-a-time through ONE
+// step net carrying its state and record, for each checkpoint t, the average
+// wall-clock of the cWindow single-token steps ending at step count t. The
+// state is O(Depth), so the cost is flat in t by construction.
+procedure TimeSSMIncrementalStream(var PerStepMs: array of double);
+var
+  NN: TNNet;
+  SSM: TNNetDiagonalSSM;
+  StepIn: TNNetVolume;
+  T, D, C: integer;
+  T0: double;
+  WindowStart: array[0..High(cCheckpoints)] of integer;
+begin
+  for C := 0 to High(cCheckpoints) do
+    WindowStart[C] := cCheckpoints[C] - cWindow; // steps [start..chk-1]
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(1, 1, cSSMDepth));
+  SSM := TNNetDiagonalSSM.Create();
+  NN.AddLayer(SSM);
+  StepIn := TNNetVolume.Create(1, 1, cSSMDepth);
+  try
+    SSM.BeginIncrementalDecode();
+    T0 := 0;
+    for T := 0 to cMaxLen - 1 do
+    begin
+      for D := 0 to cSSMDepth - 1 do
+        StepIn[0, 0, D] := MasterSeq[T, 0, D];
+      for C := 0 to High(cCheckpoints) do
+        if T = WindowStart[C] then T0 := NowMs();
+      NN.Compute(StepIn);
+      for C := 0 to High(cCheckpoints) do
+        if T = cCheckpoints[C] - 1 then
+          PerStepMs[C] := (NowMs() - T0) / cWindow;
+    end;
+  finally
+    StepIn.Free;
+    NN.Free;
+  end;
+end;
+
 var
   T, D, C: integer;
   CachedMs: array[0..High(cCheckpoints)] of double;
@@ -248,5 +404,32 @@ begin
   WriteLn('The full re-encode column grows ~quadratically with the prefix');
   WriteLn('(every step re-runs t x t attention); the cached column stays nearly');
   WriteLn('flat (one query row over the cached K/V), so the speedup widens with t.');
+  WriteLn;
+
+  WriteLn('Persisted-state incremental decode: TNNetDiagonalSSM');
+  WriteLn('Depth=', cSSMDepth, '  timing window=', cWindow, ' steps',
+    '  (no preallocation budget: the state is one Depth-long vector)');
+  WriteLn;
+  if not RunSSMFaithfulnessCheck() then
+  begin
+    MasterSeq.Free;
+    WriteLn('ERROR: SSM incremental path does not match the full forward.');
+    Halt(1);
+  end;
+  WriteLn;
+  TimeSSMIncrementalStream(CachedMs);
+  WriteLn('Per-token wall-clock vs prefix length t:');
+  WriteLn('  prefix t | full re-encode (ms/token) | incremental (ms/token) | speedup');
+  for C := 0 to High(cCheckpoints) do
+  begin
+    FullMs := TimeSSMFullForwardPerStep(cCheckpoints[C]);
+    WriteLn(Format('  %8d | %26.4f | %22.4f | %6.1fx',
+      [cCheckpoints[C], FullMs, CachedMs[C], FullMs / Max(CachedMs[C], 1e-9)]));
+  end;
+  WriteLn;
+  WriteLn('For an SSM the full re-encode column grows LINEARLY with the prefix');
+  WriteLn('(each step re-sweeps the t-token recurrence); the incremental column');
+  WriteLn('is flat by construction - the whole past lives in one Depth-long');
+  WriteLn('state vector h, so a step costs O(Depth) regardless of t.');
   MasterSeq.Free;
 end.

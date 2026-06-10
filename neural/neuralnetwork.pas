@@ -4805,6 +4805,22 @@ type
   //   dL/dh_t = c[d]*dL/dy_t + a[d]*dL/dh_{t+1}
   // which is then scattered into the input gradient and the four weight
   // gradients (a_raw via da/da_raw = a*(1-a)).
+  //
+  // Incremental decode (inference only). A linear recurrence is O(1) per step
+  // by nature: the ENTIRE past is summarised by the Depth-long state vector h,
+  // so autoregressive generation never needs to re-run the prefix.
+  // BeginIncrementalDecode() switches the layer into a stateful mode (no
+  // preallocation budget needed - the state is O(Depth) regardless of sequence
+  // length, unlike the attention KV cache): each forward pass STARTS from the
+  // persisted h (instead of h_{-1} = 0), sweeps the supplied tokens (a
+  // length-1 decode step or a multi-token prompt prefill), produces outputs
+  // for just those tokens and persists the updated h for the next call.
+  // ResetState() restarts a fresh sequence (h := 0); EndIncrementalDecode()
+  // restores the normal full-sequence path. Mirrors the
+  // TNNetScaledDotProductAttention Begin/End/Reset KV-cache API so callers can
+  // drive both layer types uniformly. Training forward/backward is bit-for-bit
+  // unchanged while disabled (the default); Backpropagate must not be called
+  // in incremental mode (the BPTT state cache FState is not populated by it).
   // Coded by Claude (AI).
   TNNetDiagonalSSM = class(TNNetChannelTransformBase)
     private
@@ -4814,6 +4830,11 @@ type
       FTmp: TNNetVolume;       // Depth-long temporary for vectorized recurrence
       FGh: TNNetVolume;        // backward state-gradient vector gh, Depth-long
       FGradA, FGradB, FGradC, FGradE: TNNetVolume; // Depth-long grad accumulators
+      // --- incremental-decode state (inference only, not serialized) ---
+      FDecodeEnabled: boolean;
+      FDecodeSteps: integer;   // tokens consumed since Begin/ResetState
+      FDecodeH: TNNetVolume;   // persisted recurrent state h, Depth-long
+      procedure ComputeIncremental();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -4821,6 +4842,17 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      // Enable the O(1)-per-step incremental-decode path. The recurrent state
+      // is a fixed Depth-long vector, so no preallocation budget (MaxContext)
+      // is needed; the sequence starts fresh (h = 0).
+      procedure BeginIncrementalDecode();
+      // Disable the incremental path; the layer returns to the normal
+      // (training) full-sequence forward.
+      procedure EndIncrementalDecode();
+      // Start a fresh sequence: zeroes the persisted state h.
+      procedure ResetState();
+      property DecodeEnabled: boolean read FDecodeEnabled;
+      property DecodeSteps: integer read FDecodeSteps;
   end;
 
   /// TNNetClosedFormContinuous: a CfC ("Closed-form Continuous-time", Hasani
@@ -33539,12 +33571,16 @@ begin
   FGradB := TNNetVolume.Create();
   FGradC := TNNetVolume.Create();
   FGradE := TNNetVolume.Create();
+  FDecodeH := TNNetVolume.Create();
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
   // Depth-dependent weight buffers are (re)allocated in SetPrevLayer.
   InitDefault();
 end;
 
 destructor TNNetDiagonalSSM.Destroy();
 begin
+  FDecodeH.Free;
   FGradE.Free;
   FGradC.Free;
   FGradB.Free;
@@ -33576,6 +33612,8 @@ begin
   FGradB.ReSize(1, 1, FOutput.Depth);
   FGradC.ReSize(1, 1, FOutput.Depth);
   FGradE.ReSize(1, 1, FOutput.Depth);
+  FDecodeH.ReSize(1, 1, FOutput.Depth);
+  FDecodeH.Fill(0);
   InitDefault();
 end;
 
@@ -33586,6 +33624,11 @@ var
   SeqLen, Depth, t, d: integer;
   HPtr, TmpPtr, XtPtr, OutPtr, StatePtr, APtr, BPtr, CPtr, EPtr: TNeuralFloatArrPtr;
 begin
+  if FDecodeEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
   StartTime := Now();
   // Do NOT call inherited Compute (it would copy the input into FOutput); we
   // produce FOutput directly from the recurrence over FPrevLayer.FOutput.
@@ -33637,6 +33680,80 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+// Inference-only stateful forward. Identical per-token recurrence to
+// Compute(), but the running state h is the PERSISTED FDecodeH (carried
+// across calls) instead of starting at zero, and the BPTT state cache FState
+// is not written. Works for a one-token decode step (the headline
+// O(1)-per-step use) and equally for a multi-token prompt prefill.
+procedure TNNetDiagonalSSM.ComputeIncremental();
+var
+  StartTime: double;
+  Wa, Wb, Wc, We, Prev: TNNetVolume;
+  SeqLen, Depth, t, d: integer;
+  HPtr, TmpPtr, XtPtr, OutPtr, APtr, BPtr, CPtr, EPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Wa := FNeurons[0].FWeights;
+  Wb := FNeurons[1].FWeights;
+  Wc := FNeurons[2].FWeights;
+  We := FNeurons[3].FWeights;
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  // Precompute per-channel a = sigmoid(a_raw) once over the contiguous run.
+  for d := 0 to Depth - 1 do
+    FA.FData[d] := Sigmoid(Wa.FData[d]);
+  // Same vectorized timestep-outer sweep as Compute(), but h resumes from
+  // the persisted state and is persisted back (it lives in FDecodeH).
+  HPtr := FDecodeH.GetRawPtr();
+  TmpPtr := FTmp.GetRawPtr();
+  APtr := FA.GetRawPtr();
+  BPtr := Wb.GetRawPtr();
+  CPtr := Wc.GetRawPtr();
+  EPtr := We.GetRawPtr();
+  for t := 0 to SeqLen - 1 do
+  begin
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    // h := a (.*) h + b (.*) x_t
+    TNNetVolume.Mul(HPtr, APtr, Depth);          // h *= a
+    system.Move(BPtr^, TmpPtr^, Depth * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(TmpPtr, XtPtr, Depth);       // tmp = b .* x_t
+    TNNetVolume.Add(HPtr, TmpPtr, Depth);        // h += tmp
+    // out_t := c (.*) h + e (.*) x_t
+    system.Move(CPtr^, OutPtr^, Depth * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(OutPtr, HPtr, Depth);        // out = c .* h
+    system.Move(EPtr^, TmpPtr^, Depth * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(TmpPtr, XtPtr, Depth);       // tmp = e .* x_t
+    TNNetVolume.Add(OutPtr, TmpPtr, Depth);      // out += tmp
+  end;
+  Inc(FDecodeSteps, SeqLen);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDiagonalSSM.BeginIncrementalDecode();
+begin
+  // The persisted state is one Depth-long vector; no MaxContext budget is
+  // needed (contrast the attention KV cache). FDecodeH is already sized by
+  // SetPrevLayer; the ReSize is a no-op safety net for layers wired manually.
+  FDecodeH.ReSize(1, 1, FOutput.Depth);
+  FDecodeH.Fill(0);
+  FDecodeSteps := 0;
+  FDecodeEnabled := true;
+end;
+
+procedure TNNetDiagonalSSM.EndIncrementalDecode();
+begin
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetDiagonalSSM.ResetState();
+begin
+  FDecodeH.Fill(0);
+  FDecodeSteps := 0;
+end;
+
 procedure TNNetDiagonalSSM.Backpropagate();
 var
   StartTime: double;
@@ -33651,6 +33768,14 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  if FDecodeEnabled then
+  begin
+    // The incremental path does not populate the BPTT state cache FState, so
+    // backward would compute garbage gradients. Inference-only contract.
+    FErrorProc('TNNetDiagonalSSM.Backpropagate must not be called in ' +
+      'incremental-decode mode. Call EndIncrementalDecode first.');
+    exit;
+  end;
   StartTime := Now();
   Na := FNeurons[0];
   Nb := FNeurons[1];
