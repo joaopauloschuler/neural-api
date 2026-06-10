@@ -28,3 +28,9 @@ autosave.nn
 
 # Claude Code (created at repo root)
 .claude/
+
+# SimpleNLP decode bakeoff: dataset, cached filter output, checkpoints, logs
+examples/SimpleNLP/datasets/
+examples/SimpleNLP/temp.csv
+examples/SimpleNLP/*.nn
+examples/SimpleNLP/decode_bakeoff_phase*.log
