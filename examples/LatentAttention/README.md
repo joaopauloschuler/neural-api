@@ -108,7 +108,7 @@ a time, three ways, each checked against the full re-encode forward:
 
 1. **(a) SDPA cache machinery, NoPE and `RopeDim=4`:** the per-head
    `TNNetScaledDotProductAttention` layers run in
-   `BeginIncrementalDecode(MaxContext)` mode (commit `2dacc95`). For the RoPE
+   `BeginIncrementalDecode(MaxContext)` mode. For the RoPE
    arm every `TNNetRotaryEmbedding` gets `PositionOffset := t` before each step,
    so the streamed length-1 token is rotated with its **absolute** position.
    This is the O(1)-per-step compute path, but it caches post-up-projection

@@ -11,14 +11,14 @@ training is time-boxed INSIDE the program (TNeuralDataLoadingFit.ShouldQuit
 is raised from OnAfterStep when the train budget expires), leaving the rest
 of the budget for the decode benchmark itself.
 
-  Phase 1 (commit 2dacc95): KV-cache incremental decode vs full re-encode.
+  Phase 1: KV-cache incremental decode vs full re-encode.
            Trains a small RoPE transformer decoder, saves it to
            bakeoff-phase1.nn, then greedy-generates from fixed prompts two
            ways -- (a) full re-encode of the whole prefix per token (status
            quo) and (b) token-at-a-time through a weight-copied 1-token step
            net with BeginIncrementalDecode + RoPE PositionOffset per step.
            HARD ASSERT: both arms emit the SAME tokens. Prints ms/token.
-  Phase 2 (commit 4d95378): MTP-heads self-speculative decode. Trains the
+  Phase 2: MTP-heads self-speculative decode. Trains the
            SAME trunk as phase 1 but with TNNet.AddMultiTokenPrediction
            (NumFuture=3): head 0 is the ordinary next-token head, heads 1..2
            forecast t+2/t+3 and double as a built-in draft -- no second
@@ -31,7 +31,7 @@ of the budget for the decode benchmark itself.
            rejection -- known open problem), so both arms re-encode fully and
            the win measured is forwards/token and wall clock. HARD ASSERT:
            self-speculative output == plain greedy from the same model.
-  Phase 3 (commit 80dd830): DiagonalSSM O(1)-per-step incremental decode.
+  Phase 3: DiagonalSSM O(1)-per-step incremental decode.
            Same harness, but the sequence mixer is TNNetDiagonalSSM instead of
            attention: 2 residual blocks of [DyT -> in-proj -> DiagonalSSM ->
            out-proj] + [DyT -> SwiGLU FFN]. NO RoPE and NO positional
@@ -43,7 +43,7 @@ of the budget for the decode benchmark itself.
            the step cost is O(1) in the prefix length -- printed per prefix-
            length bucket to show flatness, vs the KV cache whose state grows
            per token). HARD ASSERT: both arms emit the SAME tokens.
-  Phase 4 (commit a8f3077): MLA decoupled-RoPE latent KV cache. Same harness,
+  Phase 4: MLA decoupled-RoPE latent KV cache. Same harness,
            but the mixer is TNNet.AddMultiHeadLatentAttention (LatentDim=32
            << 2*d_model=256, RopeDim=8) wrapped in the same pre-norm
            residual+FFN block structure as phase 1's encoder block. Position
@@ -57,7 +57,7 @@ of the budget for the decode benchmark itself.
            this arm actually runs (see examples/LatentAttention for the true
            latent-only decode loop; here the SDPA-cache arm proves
            faithfulness and the table carries the memory economics).
-  Phase 5 (commit 42dd5dd): speculative decoding COMPOSED with the KV cache
+  Phase 5: speculative decoding COMPOSED with the KV cache
            (TruncateCache rollback). Requires phase 1's checkpoint. Trains a
            cheap TokenShift draft briefly, then greedy speculative decoding
            with cached verification: prefill once, short multi-token verify
@@ -1223,7 +1223,7 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Phase 1: KV-cache incremental decode vs full re-encode (commit 2dacc95).
+// Phase 1: KV-cache incremental decode vs full re-encode.
 // ---------------------------------------------------------------------------
 procedure TDecodeBakeoff.RunPhase1;
 var
@@ -1236,7 +1236,7 @@ var
   p, t, NewToks: integer;
   TrainSec: double;
 begin
-  WriteLn('=== Phase 1: KV-cache incremental decode vs full re-encode (2dacc95) ===');
+  WriteLn('=== Phase 1: KV-cache incremental decode vs full re-encode ===');
   LoadDataset();
 
   Trained := BuildModel(csContextLen);
@@ -1309,7 +1309,7 @@ end;
 
 // ---------------------------------------------------------------------------
 // Phase 2: MTP heads as a built-in draft -- self-speculative greedy decode
-// from ONE model (commit 4d95378; pattern from examples/SelfSpeculativeDecoding
+// from ONE model (pattern from examples/SelfSpeculativeDecoding
 // ported to this real tokenized workload).
 //
 // Both decode arms below use FULL RE-ENCODE forwards on purpose: composing the
@@ -1481,7 +1481,7 @@ var
   p, t, h, NewToks: integer;
   TrainSec: double;
 begin
-  WriteLn('=== Phase 2: MTP-heads self-speculative decode (4d95378) ===');
+  WriteLn('=== Phase 2: MTP-heads self-speculative decode ===');
   LoadDataset();
 
   FNumFuture := csNumFuture; // switches Get*Pair + OnAfterEpoch to MTP layout
@@ -1586,7 +1586,7 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Phase 3: DiagonalSSM O(1)-per-step incremental decode (commit 80dd830).
+// Phase 3: DiagonalSSM O(1)-per-step incremental decode.
 // The mixer swap is the experiment: at the SAME time budget, context, depth
 // and FFN as phase 1's transformer (reference: loss 5.02 -> 2.87 in its box),
 // how does a linear-recurrence mixer train -- and what does its O(1) decode
@@ -1607,7 +1607,7 @@ var
   p, t, b, NewToks: integer;
   TrainSec: double;
 begin
-  WriteLn('=== Phase 3: DiagonalSSM O(1)-per-step incremental decode (80dd830) ===');
+  WriteLn('=== Phase 3: DiagonalSSM O(1)-per-step incremental decode ===');
   LoadDataset();
 
   Trained := BuildModelSSM(csContextLen);
@@ -1691,8 +1691,8 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Phase 4: Multi-head Latent Attention with the decoupled-RoPE slice (commit
-// a8f3077). Same residual skeleton as phase 1; the headline is the KV-cache
+// Phase 4: Multi-head Latent Attention with the decoupled-RoPE slice.
+// Same residual skeleton as phase 1; the headline is the KV-cache
 // ECONOMICS: an MLA decoder need cache only the per-token latent c_KV
 // (csLatentDim floats) plus the ONE shared rotated rope-K slice (csRopeDim
 // floats), vs 2*d_model floats for equivalent-MHA full K+V. The decode run
@@ -1712,7 +1712,7 @@ var
   p, t, NewToks, d_k: integer;
   TrainSec: double;
 begin
-  WriteLn('=== Phase 4: MLA decoupled-RoPE latent KV cache (a8f3077) ===');
+  WriteLn('=== Phase 4: MLA decoupled-RoPE latent KV cache ===');
   LoadDataset();
 
   d_k := csEmbedDim div csHeads;
@@ -1814,7 +1814,7 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Phase 5: speculative decoding composed with the KV cache (commit 42dd5dd).
+// Phase 5: speculative decoding composed with the KV cache.
 // ---------------------------------------------------------------------------
 procedure TDecodeBakeoff.RunPhase5;
 var
@@ -1831,7 +1831,7 @@ var
   p, t, NewToks: integer;
   DraftSec: double;
 begin
-  WriteLn('=== Phase 5: speculative decoding + KV cache (TruncateCache rollback) (42dd5dd) ===');
+  WriteLn('=== Phase 5: speculative decoding + KV cache (TruncateCache rollback) ===');
   if not FileExists(csCheckpointFile) then
   begin
     WriteLn('ERROR: checkpoint ', csCheckpointFile, ' not found.');
@@ -2166,11 +2166,11 @@ begin
   if (Phase < 1) or (Phase > 6) then
   begin
     WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..6)');
-    WriteLn('  1: KV-cache incremental decode vs full re-encode (2dacc95)');
-    WriteLn('  2: MTP-heads self-speculative decode (4d95378)');
-    WriteLn('  3: DiagonalSSM O(1)-per-step decode (80dd830)');
-    WriteLn('  4: MLA decoupled-RoPE latent KV cache (a8f3077)');
-    WriteLn('  5: speculative decoding + KV cache rollback (42dd5dd)');
+    WriteLn('  1: KV-cache incremental decode vs full re-encode');
+    WriteLn('  2: MTP-heads self-speculative decode');
+    WriteLn('  3: DiagonalSSM O(1)-per-step decode');
+    WriteLn('  4: MLA decoupled-RoPE latent KV cache');
+    WriteLn('  5: speculative decoding + KV cache rollback');
     WriteLn('  6: hybrid 2xSSM + 1xMLA trunk, dual-family streamed decode');
     Terminate;
     ExitCode := 2;
