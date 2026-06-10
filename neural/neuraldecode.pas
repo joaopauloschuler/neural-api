@@ -22,7 +22,9 @@ Honest v1 scope notes ("what did NOT fit"):
       alpha = 0 reproduces the raw, short-sequence-biased sum; alpha > 0 lifts
       longer beams. See LengthPenaltyDenominator.
   (c) v1 RE-ENCODES each candidate prefix on every step (O(L^2) total forward
-      passes). KV-cache incremental decode is the logged follow-up.
+      passes). The KV-cache incremental-decode plumbing now lives in
+      TNNetStreamingDecoder below; wiring beam search onto it is the remaining
+      follow-up.
   (d) A beam that emits the EOS token is moved to a finished pool and ranked
       there against still-growing beams; growth stops once enough finished
       beams dominate or MaxLen is reached.
@@ -54,6 +56,100 @@ type
   end;
 
   TNNetDecodeResultArray = array of TNNetDecodeResult;
+
+  // TNNetStreamingDecoder: a reusable incremental-decode "streaming session"
+  // over a causal next-token net, replacing the hand-rolled step-net plumbing
+  // every streaming example repeats (build a short-width twin, CopyWeights,
+  // scan layers by class, switch caches/state into incremental mode, set RoPE
+  // offsets before every forward).
+  //
+  // OWNERSHIP. The session does NOT build and does NOT own the net. The
+  // caller typically builds the SAME architecture at a short input width
+  // (1 for plain token-at-a-time decode, K+1 for a speculative verify
+  // window), calls ShortNet.CopyWeights(TrainedNet) - every parameter shape
+  // in a streamable model is sequence-length independent, so the layer-by-
+  // layer copy is exact - and hands the twin to Create. Destroy switches the
+  // collected layers back out of incremental mode but never frees the net.
+  //
+  // WHAT IS COLLECTED. Create scans pNet.Layers once and collects
+  //   - every TNNetScaledDotProductAttention: BeginIncrementalDecode(
+  //     pMaxCacheLen) switches it onto the KV-cache path (pMaxCacheLen must
+  //     cover the worst transient load: committed context + one whole
+  //     window);
+  //   - every TNNetDiagonalSSM: BeginIncrementalDecode() switches it onto the
+  //     O(1)-per-step persisted-state path (no preallocation budget - the
+  //     entire past is one Depth-long state vector h);
+  //   - every TNNetRotaryEmbedding: kept so PositionOffset can be advanced
+  //     before each forward (below).
+  // A net may contain any mix (attention-only, SSM-only, hybrid); the counts
+  // are exposed for diagnostics.
+  //
+  // RoPE EXACTNESS CONTRACT. A streamed window has SizeX = window width, so a
+  // rope layer would otherwise always rotate it starting at position 0.
+  // StepForward therefore sets PositionOffset := AbsPos on EVERY collected
+  // rope layer before EVERY pNet.Compute, where AbsPos is the ABSOLUTE
+  // position of the FIRST token in the window (the running committed length).
+  // This single rule makes width-1 decode steps and width-K speculative
+  // verify windows rotate exactly as the full forward would; skip it and the
+  // cached path silently diverges from the full forward.
+  //
+  // WHICH NORM LAYERS ARE STREAMABLE. TNNetDyT is per-element (tanh of a
+  // scaled activation, no cross-token statistics), so cached/streamed decode
+  // is exact. TNNetLayerNorm and TNNetRMSNorm normalize over the WHOLE sample
+  // INCLUDING the sequence axis: a width-1 window sees different statistics
+  // than the same token inside a full-width forward, breaking full-vs-
+  // incremental exactness. Build streaming models with TNNetDyT (e.g.
+  // AddTransformerEncoderBlock(..., NormClass=TNNetDyT)).
+  //
+  // TYPICAL LOOP (greedy decode):
+  //   Session := TNNetStreamingDecoder.Create(ShortNet, ContextLen + Width);
+  //   Session.Reset();
+  //   for t := 0 to PromptLen - 2 do            // prefill
+  //     begin InV.FData[0] := Toks[t]; Session.StepForward(InV, t); end;
+  //   while generating do
+  //   begin
+  //     InV.FData[0] := Toks[Pos - 1];
+  //     Session.StepForward(InV, Pos - 1);
+  //     Toks[Pos] := Session.Output().GetClassOnPixel(0, 0); Inc(Pos);
+  //   end;
+  // Speculative decoding additionally calls TruncateTo(CommittedLen) to roll
+  // the KV caches back past rejected draft tokens (pad/draft K/V appended by
+  // a verify window is discarded the same way). SSM state cannot be rolled
+  // back (it is a folded summary, not a list), so TruncateTo only touches the
+  // attention caches - speculative decoding is an attention-family feature.
+  // Coded by Claude (AI).
+  TNNetStreamingDecoder = class(TObject)
+  private
+    FNet: TNNet;
+    FSDPAs: array of TNNetScaledDotProductAttention;
+    FSSMs: array of TNNetDiagonalSSM;
+    FRopes: array of TNNetRotaryEmbedding;
+    function GetSDPACount(): integer;
+    function GetSSMCount(): integer;
+    function GetRopeCount(): integer;
+  public
+    constructor Create(pNet: TNNet; pMaxCacheLen: integer);
+    destructor Destroy(); override;
+    // Start a fresh sequence: ResetCache on every attention layer, ResetState
+    // on every SSM layer. Call before the first prefill token of a sequence.
+    procedure Reset();
+    // One streamed forward of the window in InV. AbsPos is the absolute
+    // position of the FIRST token in the window; it is written to every rope
+    // layer's PositionOffset before pNet.Compute (see the exactness contract
+    // above).
+    procedure StepForward(InV: TNNetVolume; AbsPos: integer);
+    // Speculative-decode rollback: TruncateCache(CommittedLen) on every
+    // attention layer, discarding the K/V of rejected/pad tokens. No-op when
+    // the net has no attention layers.
+    procedure TruncateTo(CommittedLen: integer);
+    // Convenience: the net's last layer output (e.g. the softmax row(s) of
+    // the window just computed).
+    function Output(): TNNetVolume;
+    property Net: TNNet read FNet;
+    property SDPACount: integer read GetSDPACount;
+    property SSMCount: integer read GetSSMCount;
+    property RopeCount: integer read GetRopeCount;
+  end;
 
 const
   csDecodeEOSToken = 1; // chr(1), the codebase end-of-sequence marker.
@@ -106,6 +202,108 @@ const
 begin
   if P < csTinyProb then P := csTinyProb;
   Result := Ln(P);
+end;
+
+{ TNNetStreamingDecoder }
+
+constructor TNNetStreamingDecoder.Create(pNet: TNNet; pMaxCacheLen: integer);
+var
+  i, n: integer;
+  Layer: TNNetLayer;
+begin
+  inherited Create();
+  FNet := pNet;
+  SetLength(FSDPAs, 0);
+  SetLength(FSSMs, 0);
+  SetLength(FRopes, 0);
+  // One class-based scan collects every streamable state holder; the scan is
+  // builder-agnostic, so any mix of attention/SSM/hybrid models works.
+  for i := 0 to FNet.Layers.Count - 1 do
+  begin
+    Layer := FNet.Layers[i];
+    if Layer is TNNetScaledDotProductAttention then
+    begin
+      n := Length(FSDPAs);
+      SetLength(FSDPAs, n + 1);
+      FSDPAs[n] := TNNetScaledDotProductAttention(Layer);
+      FSDPAs[n].BeginIncrementalDecode(pMaxCacheLen);
+    end;
+    if Layer is TNNetDiagonalSSM then
+    begin
+      n := Length(FSSMs);
+      SetLength(FSSMs, n + 1);
+      FSSMs[n] := TNNetDiagonalSSM(Layer);
+      FSSMs[n].BeginIncrementalDecode();
+    end;
+    if Layer is TNNetRotaryEmbedding then
+    begin
+      n := Length(FRopes);
+      SetLength(FRopes, n + 1);
+      FRopes[n] := TNNetRotaryEmbedding(Layer);
+    end;
+  end;
+end;
+
+destructor TNNetStreamingDecoder.Destroy();
+var
+  i: integer;
+begin
+  // Switch the collected layers back onto the normal full-sequence path and
+  // restore the default rope offset; the net itself is NOT owned/freed.
+  for i := 0 to High(FSDPAs) do FSDPAs[i].EndIncrementalDecode();
+  for i := 0 to High(FSSMs) do FSSMs[i].EndIncrementalDecode();
+  for i := 0 to High(FRopes) do FRopes[i].PositionOffset := 0;
+  SetLength(FSDPAs, 0);
+  SetLength(FSSMs, 0);
+  SetLength(FRopes, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetStreamingDecoder.Reset();
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].ResetCache();
+  for i := 0 to High(FSSMs) do FSSMs[i].ResetState();
+end;
+
+procedure TNNetStreamingDecoder.StepForward(InV: TNNetVolume; AbsPos: integer);
+var
+  i: integer;
+begin
+  // The exactness contract: every rope layer is shifted to the window's
+  // ABSOLUTE start position before every forward, so a width-1 step and a
+  // width-K speculative verify window both rotate exactly like the full
+  // forward.
+  for i := 0 to High(FRopes) do FRopes[i].PositionOffset := AbsPos;
+  FNet.Compute(InV);
+end;
+
+procedure TNNetStreamingDecoder.TruncateTo(CommittedLen: integer);
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].TruncateCache(CommittedLen);
+end;
+
+function TNNetStreamingDecoder.Output(): TNNetVolume;
+begin
+  Result := FNet.GetLastLayer().Output;
+end;
+
+function TNNetStreamingDecoder.GetSDPACount(): integer;
+begin
+  Result := Length(FSDPAs);
+end;
+
+function TNNetStreamingDecoder.GetSSMCount(): integer;
+begin
+  Result := Length(FSSMs);
+end;
+
+function TNNetStreamingDecoder.GetRopeCount(): integer;
+begin
+  Result := Length(FRopes);
 end;
 
 // Forward pass: encode (Prompt + Generated) and return the next-token

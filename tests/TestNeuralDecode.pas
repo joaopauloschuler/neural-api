@@ -15,6 +15,20 @@ type
     // FC ReLU -> FC Linear(Vocab) -> SoftMax. Random init is fine; the decode
     // routines only need a valid SoftMax head of size = Vocab.
     function BuildTinyNet(ContextLen, Vocab: integer): TNNet;
+    // Streamable tiny causal LMs for the TNNetStreamingDecoder tests. All
+    // parameter shapes are sequence-length independent, so a width-1 twin can
+    // CopyWeights() from the full-width net. Norms are TNNetDyT on purpose
+    // (per-element, no cross-token statistics -> streamed decode is exact;
+    // TNNetLayerNorm/TNNetRMSNorm normalize over the whole sample including
+    // the sequence axis and would break full-vs-incremental equality).
+    function BuildTinyCausalLM(ContextLen: integer): TNNet;   // RoPE attention
+    function BuildTinySSMLM(ContextLen: integer): TNNet;      // DiagonalSSM
+    function BuildTinyHybridLM(ContextLen: integer): TNNet;   // SSM + attention
+    // Streams Toks token-at-a-time through Session and asserts every step's
+    // output row matches the corresponding row of Full's causal forward.
+    procedure AssertStreamMatchesFull(Full: TNNet;
+      Session: TNNetStreamingDecoder; const Toks: array of integer;
+      const MsgPrefix: string);
   published
     // Pure helper functions (no network needed).
     procedure TestLengthPenaltyAlphaZeroIsOne;
@@ -37,6 +51,11 @@ type
     procedure TestSSMPrefillThenStepMatchesFullForward;
     procedure TestSSMResetStateStartsFreshSequence;
     procedure TestSSMDisabledPathUnchanged;
+    // TNNetStreamingDecoder: the reusable incremental-decode session.
+    procedure TestStreamingDecoderTransformerMatchesFullForward;
+    procedure TestStreamingDecoderSSMMatchesFullForward;
+    procedure TestStreamingDecoderResetStartsFreshSequence;
+    procedure TestStreamingDecoderTruncateToRollsBack;
   end;
 
 implementation
@@ -721,6 +740,271 @@ begin
     OutBefore.Free;
     InV.Free;
     NN.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// TNNetStreamingDecoder tests. Shared tiny-LM shape: token ids in (W,1,1),
+// TNNetEmbedding(Vocab=12, Dim=8), a streamable mixer, PointwiseConvLinear
+// head (raw logits - matching pre-softmax outputs is the stronger check).
+// ---------------------------------------------------------------------------
+const
+  csStreamVocab = 12;
+  csStreamDim = 8;
+
+function TTestNeuralDecode.BuildTinyCausalLM(ContextLen: integer): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  // Token-only embedding: position is injected by RoPE inside attention.
+  Result.AddLayer(TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddTransformerEncoderBlock({Heads=}2, {d_ff=}8,
+    {PreNorm=}true, {CausalMask=}true, {UseRoPE=}true, {NormClass=}TNNetDyT);
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
+function TTestNeuralDecode.BuildTinySSMLM(ContextLen: integer): TNNet;
+begin
+  // No RoPE and no positional embedding: the left-to-right recurrence carries
+  // order by construction.
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamDim));
+  Result.AddLayer(TNNetDiagonalSSM.Create());
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
+function TTestNeuralDecode.BuildTinyHybridLM(ContextLen: integer): TNNet;
+begin
+  // Both streamable mixer families in ONE net, so a single Reset() must
+  // clear BOTH the SSM state and the attention KV caches.
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddLayer(TNNetDiagonalSSM.Create());
+  Result.AddTransformerEncoderBlock({Heads=}2, {d_ff=}8,
+    {PreNorm=}true, {CausalMask=}true, {UseRoPE=}true, {NormClass=}TNNetDyT);
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
+procedure TTestNeuralDecode.AssertStreamMatchesFull(Full: TNNet;
+  Session: TNNetStreamingDecoder; const Toks: array of integer;
+  const MsgPrefix: string);
+var
+  FullIn, FullOut, StepIn: TNNetVolume;
+  T, D, SeqLen, Depth: integer;
+begin
+  SeqLen := Length(Toks);
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  FullOut := TNNetVolume.Create();
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    for T := 0 to SeqLen - 1 do FullIn.FData[T] := Toks[T];
+    Full.Compute(FullIn);
+    Full.GetOutput(FullOut);
+    Depth := FullOut.Depth;
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session.StepForward(StepIn, T);
+      for D := 0 to Depth - 1 do
+        AssertEquals(MsgPrefix + ' pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], Session.Output()[0, 0, D], 1e-5);
+    end;
+  finally
+    StepIn.Free;
+    FullOut.Free;
+    FullIn.Free;
+  end;
+end;
+
+// Headline session test: a width-1 weight-copied twin of a RoPE causal
+// transformer streamed token-at-a-time through TNNetStreamingDecoder must
+// reproduce every per-position output of the full-width causal forward.
+procedure TTestNeuralDecode.TestStreamingDecoderTransformerMatchesFullForward;
+const
+  SeqLen = 7;
+  Toks: array[0..6] of integer = (3, 7, 1, 9, 4, 11, 2);
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertEquals('one SDPA per head', 2, Session.SDPACount);
+    AssertTrue('RoPE layers collected', Session.RopeCount > 0);
+    AssertEquals('no SSM layers in a transformer', 0, Session.SSMCount);
+    AssertTrue('session exposes the twin', Session.Net = Twin);
+    Session.Reset();
+    AssertStreamMatchesFull(Full, Session, Toks, 'transformer');
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Same exactness gate for the recurrent family: a width-1 DiagonalSSM twin
+// (no RoPE, no positional embedding - the state carries order) must stream
+// exactly.
+procedure TTestNeuralDecode.TestStreamingDecoderSSMMatchesFullForward;
+const
+  SeqLen = 8;
+  Toks: array[0..7] of integer = (5, 2, 9, 9, 1, 7, 3, 10);
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  SSMFull: TNNetDiagonalSSM;
+  i, D: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    // Non-trivial per-channel recurrence (the defaults are uniform across
+    // channels); the twin still copies the exact values below.
+    SSMFull := nil;
+    for i := 0 to Full.Layers.Count - 1 do
+      if Full.Layers[i] is TNNetDiagonalSSM then
+        SSMFull := TNNetDiagonalSSM(Full.Layers[i]);
+    AssertTrue('SSM layer found in full net', SSMFull <> nil);
+    for D := 0 to csStreamDim - 1 do
+    begin
+      SSMFull.Neurons[0].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+      SSMFull.Neurons[1].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[2].Weights.FData[D] := 0.5 + Random(1000) / 1000;
+      SSMFull.Neurons[3].Weights.FData[D] := (Random(2000) - 1000) / 1000;
+    end;
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertEquals('one SSM layer', 1, Session.SSMCount);
+    AssertEquals('no attention layers', 0, Session.SDPACount);
+    AssertEquals('no rope layers', 0, Session.RopeCount);
+    Session.Reset();
+    AssertStreamMatchesFull(Full, Session, Toks, 'ssm');
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Reset() must start a genuinely fresh sequence in BOTH state machineries at
+// once: stream sequence A through a hybrid (SSM + RoPE attention) twin, then
+// Reset() and stream a DIFFERENT sequence B - B's outputs must match B's own
+// full forward (no state leaked from A through either the SSM state vector
+// or the KV caches).
+procedure TTestNeuralDecode.TestStreamingDecoderResetStartsFreshSequence;
+const
+  SeqLen = 6;
+  ToksA: array[0..5] of integer = (4, 8, 2, 11, 6, 1);
+  ToksB: array[0..5] of integer = (9, 3, 10, 5, 7, 2);
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  StepIn: TNNetVolume;
+  T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyHybridLM(SeqLen);
+  Twin := BuildTinyHybridLM(1);
+  Session := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertTrue('hybrid has SSM layers', Session.SSMCount > 0);
+    AssertTrue('hybrid has attention layers', Session.SDPACount > 0);
+    // Pollute the session state with sequence A...
+    Session.Reset();
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := ToksA[T];
+      Session.StepForward(StepIn, T);
+    end;
+    // ...then Reset and require sequence B to stream exactly.
+    Session.Reset();
+    AssertStreamMatchesFull(Full, Session, ToksB, 'after reset');
+  finally
+    StepIn.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// TruncateTo() must implement the speculative-decoding rollback: stream the
+// first CommitLen clean tokens, append two GARBAGE tokens (a rejected draft),
+// TruncateTo(CommitLen) to discard their K/V, then continue with the clean
+// sequence - every continued step must still match the clean sequence's full
+// causal forward (note the continued steps' AbsPos resumes at CommitLen).
+procedure TTestNeuralDecode.TestStreamingDecoderTruncateToRollsBack;
+const
+  SeqLen = 6;
+  CommitLen = 4;
+  Toks: array[0..5] of integer = (2, 10, 5, 8, 3, 7);
+  Garbage: array[0..1] of integer = (11, 1);
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  FullIn, FullOut, StepIn: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  FullOut := TNNetVolume.Create();
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Twin.CopyWeights(Full);
+    // Cache budget covers the worst transient: clean prefix + draft block.
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen + Length(Garbage));
+    for T := 0 to SeqLen - 1 do FullIn.FData[T] := Toks[T];
+    Full.Compute(FullIn);
+    Full.GetOutput(FullOut);
+    Session.Reset();
+    // Clean committed prefix.
+    for T := 0 to CommitLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session.StepForward(StepIn, T);
+      for D := 0 to FullOut.Depth - 1 do
+        AssertEquals('prefix pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], Session.Output()[0, 0, D], 1e-5);
+    end;
+    // Speculative block: two garbage tokens at positions CommitLen and
+    // CommitLen+1, then reject them all.
+    for T := 0 to High(Garbage) do
+    begin
+      StepIn.FData[0] := Garbage[T];
+      Session.StepForward(StepIn, CommitLen + T);
+    end;
+    Session.TruncateTo(CommitLen);
+    // Continue with the clean sequence; positions resume at CommitLen.
+    for T := CommitLen to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session.StepForward(StepIn, T);
+      for D := 0 to FullOut.Depth - 1 do
+        AssertEquals('resumed pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], Session.Output()[0, 0, D], 1e-5);
+    end;
+  finally
+    StepIn.Free;
+    FullOut.Free;
+    FullIn.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
   end;
 end;
 
