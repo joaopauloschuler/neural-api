@@ -11,7 +11,15 @@ training is time-boxed INSIDE the program (TNeuralDataLoadingFit.ShouldQuit
 is raised from OnAfterStep when the train budget expires), leaving the rest
 of the budget for the decode benchmark itself.
 
-TWO ACRONYMS USED THROUGHOUT:
+THREE ACRONYMS USED THROUGHOUT:
+  MTP = Multi-Token Prediction (Gloeckle et al. 2024; deployed at scale by
+        DeepSeek-V3; here TNNet.AddMultiTokenPrediction): instead of a single
+        next-token head, the shared trunk gets NumFuture PARALLEL heads, head
+        h forecasting the token at position t+1+h. Training: every position
+        carries NumFuture losses instead of one (a denser training signal).
+        Inference: the extra future heads double as a built-in DRAFT for
+        self-speculative decoding -- propose several tokens in one forward,
+        verify them in the next -- with no second draft network.
   SSM = State-Space Model -- a LINEAR RECURRENT sequence mixer (the S4/Mamba
         family; here TNNetDiagonalSSM): each layer carries a fixed-size
         hidden state h updated per token (h_t = a*h_{t-1} + b*x_t per
@@ -2185,7 +2193,8 @@ begin
   begin
     WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..6)');
     WriteLn('  1: KV-cache incremental decode vs full re-encode');
-    WriteLn('  2: MTP-heads self-speculative decode');
+    WriteLn('  2: MTP-heads self-speculative decode  (MTP = Multi-Token Prediction:');
+    WriteLn('     parallel future-token heads that double as a built-in draft)');
     WriteLn('  3: DiagonalSSM O(1)-per-step decode  (SSM = State-Space Model,');
     WriteLn('     a linear recurrent mixer with constant-size state)');
     WriteLn('  4: MLA decoupled-RoPE latent KV cache  (MLA = Multi-head Latent');

@@ -171,7 +171,9 @@ streamable token-at-a-time (learned absolute positions and sequence-wide LayerNo
 statistics are not). Phase 1 saves `bakeoff-phase1.nn`; phase 5 loads it and trains a
 cheap attention-free TokenShift draft (d=64, FFN 256), then runs greedy speculative
 decoding with cached verification and `TruncateCache` rollback on rejection.
-Phase 2 trains the same trunk with `TNNet.AddMultiTokenPrediction(NumFuture=3)`
+Phase 2 uses MTP (Multi-Token Prediction, Gloeckle et al. 2024 / DeepSeek-V3 —
+parallel heads that forecast several future tokens at once instead of only the next
+one): it trains the same trunk with `TNNet.AddMultiTokenPrediction(NumFuture=3)`
 (~2.08M params): head 0 is the ordinary next-token head, heads 1..2 forecast t+2/t+3
 and double as a built-in draft — no second network. Each self-speculative pass is one
 forward that verifies the pending drafts (accept-until-first-mismatch; a rejection
