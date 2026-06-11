@@ -1495,3 +1495,12 @@ rather than acted on.
       log-likelihood over the current two-layer flow (the Invertible1x1Conv note
       records "glow training unstable at coupling LR" — ActNorm is the paper's
       fix for that instability).
+
+### Sequence packing (LM pretraining data pipeline)
+- [ ] Cross-document attention masking inside packed windows: TNNetSequencePacker
+      (neuraldatasets.pas) deliberately lets attention cross document boundaries
+      (standard GPT-2/GPT-3 packing) because TNNetScaledDotProductAttention only
+      supports a static causal flag / static sliding window, not per-sample dynamic
+      masks. Follow-up: per-sample block-diagonal (document-boundary) attention
+      masks fed from the data pipeline, plus an optional packer output exposing the
+      per-window document-segment ids to drive them.
