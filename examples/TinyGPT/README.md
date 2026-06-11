@@ -116,7 +116,10 @@ shows the loss clearly and steadily falling, which is the headline.
 ## Generated sample
 
 After training, the program autoregressively continues several seed prompts,
-e.g. `"the quick"`, `"the lazy"`, `"in the for"`, sampling with `TNNetSamplerTopP(0.6)`.
+e.g. `"the quick"`, `"the lazy"`, `"in the for"`, sampling with `TNNetSamplerTopP(0.6)`,
+plus one continuation with `TNNetSamplerMinP(0.15)` (min-p sampling: keep tokens
+with `p >= MinP * max(p)`, renormalize, weighted draw — the candidate set adapts
+to the model's confidence).
 At the budgeted 8-epoch checkpoint the continuations are still rough but already
 reproduce corpus character n-grams (`og`, `ox`, `fog`, `for`, `and`), e.g.:
 

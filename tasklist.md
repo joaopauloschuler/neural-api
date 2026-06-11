@@ -425,7 +425,11 @@ rather than acted on.
       and `RegisterToken` after each emit, `ResetHistory` per sequence) and
       show a qualitative before/after on a repetition-prone prompt — the
       class landed this lucky-day batch (neuralvolume.pas, 7 tests in
-      tests/TestNeuralSamplers.pas) but no in-tree generator calls it yet.
+      tests/TestNeuralSamplers.pas). In-tree wiring DONE: the extended
+      GenerateTokensStreamed/GenerateStringStreamed overloads in
+      neuraldecode.pas accept an optional penalty (applied via
+      ApplyToProbabilities, post-softmax); the downstream repo wiring
+      remains open.
 - [ ] TNNetReversibleBlock follow-up: the MEMORY-SAVING recompute path (the
       actual point of RevNet — discard activations in forward, RECONSTRUCT them in
       backward via the analytic inverse instead of storing them). The landed

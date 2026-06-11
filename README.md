@@ -1383,8 +1383,9 @@ Beyond the runnable examples above, `TNNet` exposes a family of in-process intro
 This [NLP source code example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/SimpleNLP) shows a (hello world) small neural network trained on the [Tiny Stories](https://huggingface.co/datasets/schuler/TinyStories4Pascal-Tokenized-v2) dataset. A more [complex NLP example showing the implementation of the GPT-3 Small architecture](https://github.com/joaopauloschuler/gpt-3-for-pascal) is also available.
 
 In short, this API supports:
-* Samplers: `TNNetSamplerGreedy`, `TNNetSamplerTopK` and `TNNetSamplerTopP`.
-* A logit processor for repetition control: `TNNetTokenHistoryPenalty` — a stateful pre-sampler that reshapes the next-token logits in place using generation history, with three standard knobs (repetition penalty in the sign-correct CTRL form, frequency penalty, and presence penalty). Use it as `Penalty.Apply(Logits); tok := Sampler.GetToken(Logits); Penalty.RegisterToken(tok);`.
+* Samplers: `TNNetSamplerGreedy`, `TNNetSamplerTopK`, `TNNetSamplerTopP` and `TNNetSamplerMinP` (min-p sampling, Nguyen et al. 2024: keep tokens with `p >= MinP * max(p)`, renormalize, weighted draw).
+* A logit processor for repetition control: `TNNetTokenHistoryPenalty` — a stateful pre-sampler that reshapes the next-token logits in place using generation history, with three standard knobs (repetition penalty in the sign-correct CTRL form, frequency penalty, and presence penalty). Use it as `Penalty.Apply(Logits); tok := Sampler.GetToken(Logits); Penalty.RegisterToken(tok);`. For post-softmax probability volumes use `Penalty.ApplyToProbabilities(Probs)` instead (`p^r` plus `exp()` factors, then renormalize); the streamed generation routines in `neuraldecode` accept an optional penalty and apply/track it automatically.
+* Stop sequences: `GenerateTokensStreamed` accepts token-id stop sequences and `GenerateStringStreamed`/`DecodeGreedy` accept stop strings — generation terminates when a stop is emitted and the stop tokens/text are trimmed from the output.
 * A tokenizer: `TNeuralTokenizer`.
 * A transformer decoder: `AddTransformerBlockCAI`.
 

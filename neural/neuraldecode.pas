@@ -37,6 +37,26 @@ OneHotEncodingReversed, NN.Compute produces a single SoftMax distribution over
 the vocabulary, and EOS is token 1 (chr(1)), terminating like the
 "NextTokenInt < 2" rule used elsewhere in the codebase.
 
+MODERN SAMPLING CONTROLS. The high-level generation routines also expose:
+  - Repetition / frequency / presence penalties via an optional
+    TNNetTokenHistoryPenalty (neuralvolume). The streamed routines see the
+    model's POST-SOFTMAX probabilities, so they call ApplyToProbabilities
+    (the probability-domain image of the CTRL logit rule: p := p^r, then
+    p := p * exp(-alpha_f*count - alpha_p), then renormalize) before the
+    sampler runs; the routine resets the history and registers the prompt
+    tokens, then registers every emitted token.
+  - Min-p sampling via TNNetSamplerMinP (neuralvolume): keep tokens with
+    p >= MinP * max(p), renormalize, weighted draw. It is a plain
+    TNNetSamplerBase, so it plugs into the existing Sampler arguments.
+  - Stop sequences: GenerateTokensStreamed accepts token-id stop sequences
+    (TNNetTokenSequences) matched against the tail of the GENERATED region;
+    on a match generation terminates and the stop tokens are trimmed from
+    the returned length. GenerateStringStreamed and DecodeGreedy accept stop
+    STRINGS (tokenized for early termination in the streamed wrapper, plus a
+    string-level scan that trims even when token boundaries differ).
+All of these default to "off", leaving the original behavior bit-for-bit
+unchanged.
+
 Coded by Claude (AI).
 *)
 
@@ -58,6 +78,11 @@ type
   end;
 
   TNNetDecodeResultArray = array of TNNetDecodeResult;
+
+  // A list of token-id stop sequences for GenerateTokensStreamed: generation
+  // terminates (and the matched tokens are trimmed) as soon as the tail of
+  // the GENERATED region equals one of the entries.
+  TNNetTokenSequences = array of TNeuralIntegerArray;
 
   // TNNetStreamingDecoder: a reusable incremental-decode "streaming session"
   // over a causal next-token net, replacing the hand-rolled step-net plumbing
@@ -168,7 +193,15 @@ function SafeLogProb(P: TNeuralFloat): TNeuralFloat;
 // convention as DecodeBeamSearch. Returned as a single-element result so its
 // SumLogProb is directly comparable to a beam result.
 function DecodeGreedy(NN: TNNet; const Prompt: string;
-  MaxLen: integer): TNNetDecodeResult;
+  MaxLen: integer): TNNetDecodeResult; overload;
+
+// DecodeGreedy with STOP STRINGS: generation additionally terminates as soon
+// as the generated text ends with any entry of StopStrings; the stop string
+// is trimmed from Result.Text and Result.Finished is set True (deliberate
+// termination, like EOS). Empty StopStrings reproduces the plain overload
+// bit-for-bit (the plain overload delegates here).
+function DecodeGreedy(NN: TNNet; const Prompt: string; MaxLen: integer;
+  const StopStrings: array of string): TNNetDecodeResult; overload;
 
 // Beam search. Keeps BeamWidth partial sequences ranked by length-penalised
 // cumulative log-prob. Returns the single best (highest Score) result.
@@ -231,7 +264,26 @@ function DecodeBeamSearchAll(NN: TNNet; const Prompt: string;
 // Coded by Claude (AI).
 function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
   var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
-  MaxTotalLen: integer; Sampler: TNNetSamplerBase = nil): integer;
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase = nil): integer; overload;
+
+// GenerateTokensStreamed with MODERN SAMPLING CONTROLS. Same contract as the
+// overload above plus:
+//  - Penalty (may be nil): a TNNetTokenHistoryPenalty applied to the step's
+//    POST-SOFTMAX probability row via ApplyToProbabilities BEFORE the
+//    sampler/argmax reads it. The routine resets the penalty history,
+//    registers the prompt tokens (the whole context is penalized, the usual
+//    convention), then registers every emitted token.
+//  - StopSequences (may be nil/empty): token-id sequences; as soon as the
+//    tail of the GENERATED region (never spanning into the prompt) equals an
+//    entry, generation stops and the matched tokens are TRIMMED from the
+//    returned length. When several entries match, the longest is trimmed.
+// Penalty=nil with empty StopSequences is bit-for-bit the plain overload
+// (which delegates here).
+function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase;
+  Penalty: TNNetTokenHistoryPenalty;
+  const StopSequences: TNNetTokenSequences): integer; overload;
 
 // STRING-LEVEL WRAPPER mirroring GenerateStringFromCasualNN's shape
 // (dict/tokenizer + prompt + optional sampler; TNeuralTokenizer is a
@@ -245,7 +297,24 @@ function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
 // Coded by Claude (AI).
 function GenerateStringStreamed(Session: TNNetStreamingDecoder;
   Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
-  oSampler: TNNetSamplerBase = nil): string;
+  oSampler: TNNetSamplerBase = nil): string; overload;
+
+// GenerateStringStreamed with MODERN SAMPLING CONTROLS. Same contract as the
+// overload above plus:
+//  - Penalty (may be nil): forwarded to the token core (probability-domain
+//    application; see GenerateTokensStreamed).
+//  - StopStrings (may be empty): each entry is tokenized with Dict.Tokenize
+//    and passed to the token core for EARLY TERMINATION; additionally the
+//    detokenized continuation is scanned for the earliest occurrence of any
+//    stop string and truncated there - a safety net for vocabularies where
+//    the stop text can be emitted across different token boundaries. The
+//    stop text never appears in the returned string.
+// Penalty=nil with empty StopStrings is bit-for-bit the plain overload
+// (which delegates here).
+function GenerateStringStreamed(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
+  const StopStrings: array of string): string; overload;
 
 implementation
 
@@ -375,9 +444,47 @@ end;
 function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
   var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
   MaxTotalLen: integer; Sampler: TNNetSamplerBase): integer;
+begin
+  // Bit-for-bit the original behavior: no penalty, no stop sequences.
+  Result := GenerateTokensStreamed(Session, Tokens, PromptLen, MaxNewTokens,
+    MaxTotalLen, Sampler, nil, nil);
+end;
+
+// Returns the length of the LONGEST StopSequences entry matching the tail
+// Tokens[Pos-L..Pos-1], with the whole match inside the generated region
+// (start index >= PromptLen, never spanning into the prompt); 0 if none.
+function MatchStopSuffix(const Tokens: TNeuralIntegerArray;
+  Pos, PromptLen: integer; const StopSequences: TNNetTokenSequences): integer;
+var
+  S, I, L: integer;
+  Match: boolean;
+begin
+  Result := 0;
+  for S := 0 to High(StopSequences) do
+  begin
+    L := Length(StopSequences[S]);
+    if (L > Result) and (L >= 1) and (Pos - L >= PromptLen) then
+    begin
+      Match := true;
+      for I := 0 to L - 1 do
+        if Tokens[Pos - L + I] <> StopSequences[S][I] then
+        begin
+          Match := false;
+          Break;
+        end;
+      if Match then Result := L;
+    end;
+  end;
+end;
+
+function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase;
+  Penalty: TNNetTokenHistoryPenalty;
+  const StopSequences: TNNetTokenSequences): integer;
 var
   InV: TNNetVolume;
-  Pos, CapLen, NextTokenInt: integer;
+  Pos, CapLen, NextTokenInt, StopLen: integer;
 begin
   if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
     raise EArgumentException.Create(
@@ -397,6 +504,13 @@ begin
   try
     InV.Fill(0);
     Session.Reset();
+    // A fresh sequence: clear the penalty history and register the prompt
+    // tokens, so the penalties see the WHOLE context (usual convention).
+    if Assigned(Penalty) then
+    begin
+      Penalty.ResetHistory();
+      for Pos := 0 to PromptLen - 1 do Penalty.RegisterToken(Tokens[Pos]);
+    end;
     // Prefill tokens 0..PromptLen-2 one at a time; the LAST prompt token is
     // the first decode step's input (its output row predicts the first new
     // token) - the established prefill-then-step idiom.
@@ -410,12 +524,29 @@ begin
     begin
       InV.FData[0] := Tokens[Pos - 1];
       Session.StepForward(InV, Pos - 1);
+      // The streamed step ends in a SoftMax, so the output row holds
+      // PROBABILITIES - hence ApplyToProbabilities (p^r + exp() factors +
+      // renormalize), not the logit-domain Apply. Mutating the net's output
+      // volume in place is safe: the next StepForward recomputes it.
+      if Assigned(Penalty) then Penalty.ApplyToProbabilities(Session.Output());
       // The step net is width-1, so the (only) output row is pixel (0,0).
       if Assigned(Sampler)
       then NextTokenInt := Sampler.GetTokenOnPixel(Session.Output(), 0, 0)
       else NextTokenInt := Session.Output().GetClassOnPixel(0, 0);
       Tokens[Pos] := NextTokenInt;
+      if Assigned(Penalty) then Penalty.RegisterToken(NextTokenInt);
       Inc(Pos);
+      // Stop sequences: if the GENERATED tail now equals one of the entries,
+      // terminate and TRIM the matched tokens from the returned length.
+      if Length(StopSequences) > 0 then
+      begin
+        StopLen := MatchStopSuffix(Tokens, Pos, PromptLen, StopSequences);
+        if StopLen > 0 then
+        begin
+          Pos := Pos - StopLen;
+          Break;
+        end;
+      end;
       // End-of-sequence: the codebase-wide "NextTokenInt < 2" rule (the EOS
       // token is stored and counted, like GenerateStringFromCasualNN).
       if NextTokenInt < 2 then Break;
@@ -429,30 +560,68 @@ end;
 function GenerateStringStreamed(Session: TNNetStreamingDecoder;
   Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
   oSampler: TNNetSamplerBase): string;
+begin
+  // Bit-for-bit the original behavior: no penalty, no stop strings.
+  Result := GenerateStringStreamed(Session, Dict, InputString, MaxNewTokens,
+    MaxTotalLen, oSampler, nil, []);
+end;
+
+function GenerateStringStreamed(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
+  const StopStrings: array of string): string;
 var
-  Tokens: TNeuralIntegerArray;
-  PromptLen, TotalLen, Pos, VocabCount: integer;
+  Tokens, StopToks: TNeuralIntegerArray;
+  TokenStops: TNNetTokenSequences;
+  PromptLen, TotalLen, Pos, VocabCount, S, CutAt: integer;
+  Continuation: string;
 begin
   Result := InputString;
   VocabCount := Dict.GetVocabCount();
   Dict.Tokenize(InputString, Tokens);
   PromptLen := Length(Tokens);
   if PromptLen < 1 then Exit; // nothing to condition on
+  // Tokenize each stop string into a token-id stop sequence so the token
+  // core terminates early; entries that tokenize to nothing are skipped.
+  SetLength(TokenStops, 0);
+  for S := 0 to High(StopStrings) do
+  begin
+    if StopStrings[S] = '' then continue;
+    Dict.Tokenize(StopStrings[S], StopToks);
+    if Length(StopToks) > 0 then
+    begin
+      SetLength(TokenStops, Length(TokenStops) + 1);
+      TokenStops[High(TokenStops)] := Copy(StopToks, 0, Length(StopToks));
+    end;
+  end;
   TotalLen := GenerateTokensStreamed(Session, Tokens, PromptLen,
-    MaxNewTokens, MaxTotalLen, oSampler);
+    MaxNewTokens, MaxTotalLen, oSampler, Penalty, TokenStops);
   // Detokenize the continuation; stop at the first special token (< 2) for
   // display (the TokensToText convention) and join with a space only for
   // separator vocabularies (word dicts; BPE vocabularies concatenate).
+  Continuation := '';
   for Pos := PromptLen to TotalLen - 1 do
   begin
     if Tokens[Pos] < 2 then Break;
     if Tokens[Pos] < VocabCount then
     begin
       if Dict.TokenizerHasSeparator
-      then Result := Result + ' ' + Dict.DeTokenize(Tokens[Pos])
-      else Result := Result + Dict.DeTokenize(Tokens[Pos]);
+      then Continuation := Continuation + ' ' + Dict.DeTokenize(Tokens[Pos])
+      else Continuation := Continuation + Dict.DeTokenize(Tokens[Pos]);
     end;
   end;
+  // String-level safety net: even when the stop text was emitted across
+  // token boundaries the token core could not match, truncate the
+  // continuation at the EARLIEST occurrence of any stop string.
+  CutAt := 0;
+  for S := 0 to High(StopStrings) do
+  begin
+    if StopStrings[S] = '' then continue;
+    Pos := system.Pos(StopStrings[S], Continuation);
+    if (Pos > 0) and ((CutAt = 0) or (Pos < CutAt)) then CutAt := Pos;
+  end;
+  if CutAt > 0 then Continuation := Copy(Continuation, 1, CutAt - 1);
+  Result := Result + Continuation;
   SetLength(Tokens, 0);
 end;
 
@@ -476,10 +645,34 @@ end;
 
 function DecodeGreedy(NN: TNNet; const Prompt: string;
   MaxLen: integer): TNNetDecodeResult;
+begin
+  // Bit-for-bit the original behavior: no stop strings.
+  Result := DecodeGreedy(NN, Prompt, MaxLen, []);
+end;
+
+// Returns the length of the longest StopStrings entry that is a suffix of
+// Text; 0 when none matches.
+function MatchStopStringSuffix(const Text: string;
+  const StopStrings: array of string): integer;
+var
+  S, L: integer;
+begin
+  Result := 0;
+  for S := 0 to High(StopStrings) do
+  begin
+    L := Length(StopStrings[S]);
+    if (L > Result) and (L >= 1) and (L <= Length(Text)) and
+      (Copy(Text, Length(Text) - L + 1, L) = StopStrings[S]) then
+      Result := L;
+  end;
+end;
+
+function DecodeGreedy(NN: TNNet; const Prompt: string; MaxLen: integer;
+  const StopStrings: array of string): TNNetDecodeResult;
 var
   InputVolume, OutputVolume: TNNetVolume;
   LogProbs: array of TNeuralFloat;
-  VocabSize, Step, Best, I: integer;
+  VocabSize, Step, Best, I, StopLen: integer;
   Context: string;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
@@ -505,6 +698,18 @@ begin
       end;
       Result.Text := Result.Text + Chr(Best);
       Context := Context + Chr(Best);
+      // Stop strings: terminate when the generated text ends with one and
+      // TRIM it from the output (deliberate termination, like EOS).
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
     end;
   finally
     InputVolume.Free;

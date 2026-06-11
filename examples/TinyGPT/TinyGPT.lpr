@@ -65,6 +65,7 @@ type
     FNN: TNNet;
     NFit: TNeuralDataLoadingFit;
     FSampler: TNNetSamplerBase;
+    FMinPSampler: TNNetSamplerBase;
     procedure BuildCorpus;
     procedure DoRun; override;
   public
@@ -112,6 +113,10 @@ type
     NFit := TNeuralDataLoadingFit.Create();
     // TopP sampling adds a little variety while staying close to the corpus.
     FSampler := TNNetSamplerTopP.Create(0.6);
+    // Min-p sampling (Nguyen et al. 2024): keep tokens with
+    // p >= MinP * max(p), renormalize and draw proportionally - the kept set
+    // adapts to the model's confidence (narrow when peaked, wide when flat).
+    FMinPSampler := TNNetSamplerMinP.Create(0.15);
 
     // ---- Decoder-only (GPT) architecture ----
     // One-hot char input -> project to d_model -> absolute positional
@@ -171,6 +176,7 @@ type
     WriteLn('==== Final autoregressive samples (seed -> generated) ====');
     OnAfterEpoch(Self);
 
+    FMinPSampler.Free;
     FSampler.Free;
     NFit.Free;
     FNN.Free;
@@ -186,6 +192,8 @@ type
       GenerateStringFromChars(NFit.NN, 'the lazy', FSampler));
     WriteLn('  "in the for"-> ',
       GenerateStringFromChars(NFit.NN, 'in the for', FSampler));
+    WriteLn('  "the quick" -> (min-p) ',
+      GenerateStringFromChars(NFit.NN, 'the quick', FMinPSampler));
   end;
 
   procedure TTinyGPT.GetTrainingPair(Idx: integer; ThreadId: integer;

@@ -75,6 +75,13 @@ type
     procedure TestGenerateTokensStreamedRespectsCaps;
     procedure TestGenerateTokensStreamedRejectsWideSession;
     procedure TestGenerateStringStreamedMatchesTokenCore;
+    // Modern sampling controls: penalties, stop sequences, stop strings.
+    procedure TestGenerateTokensStreamedExtendedOverloadDefaultsMatchPlain;
+    procedure TestGenerateTokensStreamedStopSequenceTrims;
+    procedure TestGenerateTokensStreamedStopSequenceStaysInGeneratedRegion;
+    procedure TestGenerateTokensStreamedPenaltyAvoidsRepetition;
+    procedure TestDecodeGreedyStopStringTrimsAndFinishes;
+    procedure TestGenerateStringStreamedStopStringTrims;
   end;
 
 implementation
@@ -1483,6 +1490,275 @@ begin
     AssertEquals('wrapper equals token core + detokenize', Expected, Got);
     AssertTrue('result preserves the prompt prefix',
       Copy(Got, 1, Length('cat dog egg')) = 'cat dog egg');
+  finally
+    Dict.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// The extended overload with Penalty=nil and no stop sequences must produce
+// exactly the same stream (length and tokens) as the plain overload.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedExtendedOverloadDefaultsMatchPlain;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  PlainToks, ExtToks: TNeuralIntegerArray;
+  PlainLen, ExtLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(PlainToks, PromptLen);
+    SetLength(ExtToks, PromptLen);
+    PlainToks[0] := 5; PlainToks[1] := 2; PlainToks[2] := 9;
+    for T := 0 to PromptLen - 1 do ExtToks[T] := PlainToks[T];
+
+    PlainLen := GenerateTokensStreamed(Session, PlainToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    ExtLen := GenerateTokensStreamed(Session, ExtToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, nil, nil);
+
+    AssertEquals('same length with default extended args', PlainLen, ExtLen);
+    for T := PromptLen to PlainLen - 1 do
+      AssertEquals('token at pos ' + IntToStr(T), PlainToks[T], ExtToks[T]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// A matched stop sequence terminates generation and is TRIMMED from the
+// returned length. Deterministic via a head rigged to a constant token 7:
+// a [7] stop trims immediately; a [7,7] stop trims after two emissions.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedStopSequenceTrims;
+const
+  PromptLen = 2;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Toks: TNeuralIntegerArray;
+  Stops: TNNetTokenSequences;
+  OutLen: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(16);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    RigHeadToConstantToken(Full, 7);
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, 16);
+
+    // Single-token stop [7]: the first emitted 7 matches and is trimmed.
+    SetLength(Stops, 1);
+    SetLength(Stops[0], 1);
+    Stops[0][0] := 7;
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 8;
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen, 10, 16,
+      nil, nil, Stops);
+    AssertEquals('single-token stop trims to the prompt', PromptLen, OutLen);
+
+    // Two-token stop [7,7]: emitted 7,7 then both trimmed.
+    SetLength(Stops[0], 2);
+    Stops[0][0] := 7; Stops[0][1] := 7;
+    SetLength(Toks, 0);
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 8;
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen, 10, 16,
+      nil, nil, Stops);
+    AssertEquals('two-token stop trims both matched tokens',
+      PromptLen, OutLen);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// A stop sequence must match entirely inside the GENERATED region: with a
+// prompt ENDING in 7 and a [7,7] stop, the first generated 7 must NOT match
+// (it would span the prompt boundary); only the second generated 7 completes
+// a legal match, trimming back exactly to the prompt.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedStopSequenceStaysInGeneratedRegion;
+const
+  PromptLen = 2;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Toks: TNeuralIntegerArray;
+  Stops: TNNetTokenSequences;
+  OutLen: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(16);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    RigHeadToConstantToken(Full, 7);
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, 16);
+    SetLength(Stops, 1);
+    SetLength(Stops[0], 2);
+    Stops[0][0] := 7; Stops[0][1] := 7;
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 7; // prompt ENDS in 7
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen, 10, 16,
+      nil, nil, Stops);
+    // A boundary-spanning (buggy) match after the FIRST generated 7 would
+    // trim into the prompt (OutLen = PromptLen - 1). The correct match needs
+    // TWO generated 7s and trims back exactly to the prompt.
+    AssertEquals('match confined to the generated region', PromptLen, OutLen);
+    AssertEquals('prompt left untouched', 7, Toks[PromptLen - 1]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// With a SOFTMAX-headed LM and a huge frequency penalty, every seen token's
+// probability collapses to ~0, so greedy decode can never emit the same
+// token twice (nor re-emit a prompt token): the whole stream is pairwise
+// distinct. This also exercises the probability-domain penalty path inside
+// the generation loop end to end.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedPenaltyAvoidsRepetition;
+const
+  SeqLen = 12;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Penalty: TNNetTokenHistoryPenalty;
+  Toks: TNeuralIntegerArray;
+  OutLen, I, J: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  // The streamed penalty path expects POST-SOFTMAX probabilities: cap both
+  // twins with a per-position softmax (weightless, so CopyWeights is exact).
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, {Frequency=}100.0, 0.0);
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(Toks, PromptLen);
+    Toks[0] := 4; Toks[1] := 9; Toks[2] := 6; // distinct prompt tokens
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, Penalty, nil);
+    AssertTrue('something was generated', OutLen > PromptLen);
+    for I := 0 to OutLen - 2 do
+      for J := I + 1 to OutLen - 1 do
+        AssertTrue('tokens at ' + IntToStr(I) + ' and ' + IntToStr(J) +
+          ' must differ under a huge frequency penalty',
+          Toks[I] <> Toks[J]);
+  finally
+    Penalty.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// DecodeGreedy stop strings: with the logit layer rigged to a constant
+// char, a matching stop string terminates generation, is trimmed from the
+// text and marks the result Finished; a non-occurring stop string leaves
+// the output identical to the plain overload.
+procedure TTestNeuralDecode.TestDecodeGreedyStopStringTrimsAndFinishes;
+const
+  Vocab = 16;
+  MaxLen = 6;
+var
+  NN: TNNet;
+  Logit: TNNetLayer;
+  Plain, Stopped, Unmatched: TNNetDecodeResult;
+  N: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildTinyNet(8, Vocab);
+  try
+    // Rig the LOGIT layer (the SoftMax head has no neurons) to constant 7.
+    Logit := NN.Layers[NN.Layers.Count - 2];
+    for N := 0 to Logit.Neurons.Count - 1 do
+    begin
+      Logit.Neurons[N].Weights.Fill(0);
+      Logit.Neurons[N].BiasWeight := 0;
+    end;
+    Logit.Neurons[7].BiasWeight := 5;
+
+    Plain := DecodeGreedy(NN, 'ab', MaxLen);
+    AssertEquals('rigged plain decode emits MaxLen constant chars',
+      StringOfChar(Chr(7), MaxLen), Plain.Text);
+    AssertEquals('plain decode does not finish', False, Plain.Finished);
+
+    Stopped := DecodeGreedy(NN, 'ab', MaxLen, [Chr(7) + Chr(7)]);
+    AssertEquals('stop string trimmed from the output', '', Stopped.Text);
+    AssertEquals('stop string marks the result finished',
+      True, Stopped.Finished);
+
+    Unmatched := DecodeGreedy(NN, 'ab', MaxLen, [Chr(9)]);
+    AssertEquals('non-occurring stop leaves the text unchanged',
+      Plain.Text, Unmatched.Text);
+    AssertEquals('non-occurring stop does not finish',
+      False, Unmatched.Finished);
+  finally
+    NN.Free;
+  end;
+end;
+
+// String-level wrapper: a stop string is tokenized for early termination and
+// never appears in the returned string; without stops the rigged net keeps
+// appending the constant word.
+procedure TTestNeuralDecode.TestGenerateStringStreamedStopStringTrims;
+const
+  SeqLen = 9;
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'apple', 'blue', 'cat',
+    'dog', 'egg', 'fox', 'gold', 'hat', 'ice', 'jam');
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Dict: TStringListInt;
+  DogToks: TNeuralIntegerArray;
+  T: integer;
+  NoStops, WithStops: string;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  Dict := TStringListInt.Create();
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+    Dict.Tokenize('dog', DogToks);
+    AssertEquals('stop word tokenizes to one id', 1, Length(DogToks));
+    RigHeadToConstantToken(Full, DogToks[0]);
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    NoStops := GenerateStringStreamed(Session, Dict, 'cat egg',
+      SeqLen - 2, SeqLen);
+    AssertEquals('rigged net keeps emitting the constant word',
+      'cat egg dog dog dog dog dog dog dog', NoStops);
+
+    WithStops := GenerateStringStreamed(Session, Dict, 'cat egg',
+      SeqLen - 2, SeqLen, nil, nil, ['dog']);
+    AssertEquals('stop string trimmed: prompt returned unchanged',
+      'cat egg', WithStops);
   finally
     Dict.Free;
     Session.Free;
