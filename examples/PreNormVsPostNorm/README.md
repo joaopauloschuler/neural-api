@@ -120,3 +120,15 @@ worse — the textbook deep-residual pre-norm-vs-post-norm stability gap. Exact
 numbers vary a little with the platform / float build, but the ordering
 (pre-norm ≈ RMSNorm ≪ post-norm) is stable. Increase `NUM_BLOCKS` or the
 learning rate to push post-norm all the way to divergence (`diverged = YES`).
+
+## Related: parallel attention+FFN blocks
+
+Beyond the sequential pre-norm vs post-norm placement compared above, the
+library also offers the PARALLEL block formulation used by GPT-J, PaLM and
+Falcon: `TNNet.AddParallelTransformerBlock` computes the attention and FFN
+branches from ONE shared pre-norm and fuses the residual in a single sum,
+`y = x + Attn(Norm(x)) + FFN(Norm(x))`, instead of the sequential
+`x := x + Attn(Norm(x)); x := x + FFN(Norm(x))` of
+`AddTransformerEncoderBlock`. It takes the same heads / `d_ff` / causal /
+RoPE / `NormClass` options (plus the attention `Variant` enum), so the two
+builders are drop-in comparable in a bake-off like this one.

@@ -4,7 +4,7 @@ DecodeFeaturesBakeoff: benchmarks the recently-landed DECODE-EFFICIENCY
 features on a REAL tokenized NLP workload (TinyStories, 3k-token vocabulary),
 one phase per feature, selected by CLI argument:
 
-    ./DecodeFeaturesBakeoff --phase N        (N in 1..7)
+    ./DecodeFeaturesBakeoff --phase N        (N in 1..9)
 
 Each phase is self-budgeted to finish within 270 seconds of wall clock:
 training is time-boxed INSIDE the program (TNeuralDataLoadingFit.ShouldQuit
@@ -133,6 +133,41 @@ THREE ACRONYMS USED THROUGHOUT:
            proves grouped layers stream token-exactly. The verdict compares
            weight count, convergence and decode cost against phase 6's dense
            references.
+  Phase 8: Gemma-2 ALTERNATING local/global attention with a windowed KV
+           cache. The trunk is phase 1's transformer skeleton EXACTLY --
+           built via TNNet.AddAlternatingLocalGlobalBlocks(csBlocks, csHeads,
+           csFFNDim, csWindowSize, LocalPerGlobal=1, CausalMask=true,
+           PreNorm=true, UseRoPE=true, NormClass=TNNetDyT), which with these
+           arguments expands to the SAME AddTransformerEncoderBlock calls as
+           BuildModel (same DyT pre-norm, RoPE, SwiGLU FFN), only with block
+           1 LOCAL (sliding-window attention of csWindowSize=12 keys, ctx/4)
+           and block 2 GLOBAL (full attention) -- so the comparison against
+           phase 1 isolates the attention MASKING pattern alone. Decode
+           benchmark mirrors phase 1 (full re-encode vs KV-cached step net,
+           HARD ASSERT token-exact -- proving the windowed SDPA path streams
+           exactly through the cache), and the headline is the KV-cache
+           MEMORY table: a local layer's decode state is BOUNDED at
+           2*d_model*W floats (the last W positions are provably sufficient
+           -- the window mask discards everything older) while a global
+           layer's grows linearly, printed at several prefix lengths next to
+           phase 1's all-global reference. The quality cost of windowing is
+           visible against phase 1's csRefLossTransformer.
+  Phase 9: PARALLEL attention+FFN block (GPT-J/PaLM) step-cost bake-off.
+           The trunk is phase 1's EXCEPT each sequential encoder block
+           (x := x + Attn(Norm(x)); x := x + FFN(Norm(x))) is replaced by
+           TNNet.AddParallelTransformerBlock(csHeads, csFFNDim,
+           CausalMask=true, UseRoPE=true, NormClass=TNNetDyT):
+           y = x + Attn(Norm(x)) + FFN(Norm(x)) with ONE shared pre-norm --
+           same d_model/heads/FFN/RoPE/DyT, one norm layer fewer per block
+           (both weight counts are printed). The phase measures (a) the
+           parallel block's selling point, wall clock per step: a timed
+           full-context forward comparison of the sequential and parallel
+           nets plus examples-seen inside the SAME 185 s box as phase 1,
+           (b) final loss vs csRefLossTransformer at the same budget, and
+           (c) the decode showdown: full re-encode vs KV-cached step net --
+           the parallel block composes the same per-head SDPA layers, so the
+           TNNetStreamingDecoder cache path applies unchanged. HARD ASSERT:
+           cached decode token-exact vs full re-encode.
 
 MODEL. All phases share one config (constants below): RoPE positional scheme
 everywhere -- TNNetEmbedding (token-only) + UseRoPE=true in
@@ -208,6 +243,9 @@ const
   csTrainCapSecHyb   = 190;  // phase 6: hybrid bench is cheap (streamed arm
                              // O(1)-ish), but the 3-block full re-encode arm
                              // costs more than phase 3's 2 blocks
+  csTrainCapSecLG    = 185;  // phase 8: decode bench cost mirrors phase 1
+  csTrainCapSecPar   = 180;  // phase 9: train box minus the pre-train timed
+                             // forward comparison (a few seconds)
   csDraftCapSec      = 160;  // phase 5: draft training cap
   // ---- decode benchmark ----
   csGenTokens        = 40;   // tokens generated per prompt per arm
@@ -221,6 +259,10 @@ const
   // ---- phase 4 MLA (phases 6/7 reuse both) ----
   csLatentDim        = 32;   // c_KV width; << per-token MHA K+V = 2*d_model = 256
   csRopeDim          = 8;    // decoupled-RoPE slice width (even, as RoPE requires)
+  // ---- phase 8 sliding window (local blocks) ----
+  csWindowSize       = csContextLen div 4; // 12 keys: small enough to matter
+                                           // at ctx=48 (a global layer sees
+                                           // up to 4x more positions)
   // ---- phase 7 grouped pointwise convs ----
   csMinChannelsPerGroup = 16; // floor on input channels per group (the
                               // AddAutoGroupedPointwiseConv knob; group count
@@ -313,6 +355,7 @@ type
     FTrainDeadlineMs: double;         // OnAfterStep raises ShouldQuit past this
     FNumFuture: integer;              // >1 only in phase 2 (MTP target layout)
     FFirstLoss, FLastLoss: double;    // running-loss trajectory (phase 6 verdict)
+    FStepCount: integer;              // batches seen in the box (phase 9 throughput)
     procedure DoRun; override;
     // shared helpers
     procedure RequireDatasetFiles;
@@ -362,6 +405,10 @@ type
     function BuildModelHybrid(ContextLen: integer): TNNet;
     // phase 7 (phase 6's hybrid with grouped pointwise convolutions)
     function BuildModelHybridGrouped(ContextLen: integer): TNNet;
+    // phase 8 (alternating local/global attention, windowed KV cache)
+    function BuildModelLocalGlobal(ContextLen: integer): TNNet;
+    // phase 9 (parallel attention+FFN blocks, GPT-J/PaLM)
+    function BuildModelParallel(ContextLen: integer): TNNet;
 
     // run phases
     procedure RunPhase1;
@@ -371,6 +418,8 @@ type
     procedure RunPhase5;
     procedure RunPhase6;
     procedure RunPhase7;
+    procedure RunPhase8;
+    procedure RunPhase9;
   public
     procedure OnAfterStep(Sender: TObject);
     procedure OnAfterEpoch(Sender: TObject);
@@ -670,6 +719,56 @@ begin
   Result.AddLayer(TNNetPointwiseSoftMax.Create(1));
 end;
 
+// Phase 8 model: phase 1's transformer skeleton EXACTLY, only the attention
+// MASKING pattern changes. AddAlternatingLocalGlobalBlocks with these
+// arguments expands to the same AddTransformerEncoderBlock(csHeads, csFFNDim,
+// PreNorm=true, CausalMask=true, UseRoPE=true, TNNetDyT) calls as BuildModel,
+// with block 1 LOCAL (sliding-window attention: every query sees at most the
+// csWindowSize most recent keys, the Gemma-2 local-first interleave) and
+// block 2 GLOBAL (Window=0, full attention) -- so the builder IS phase 1's
+// skeleton and no inline reconstruction is needed for a fair comparison.
+// The window mask makes the last csWindowSize positions provably sufficient
+// decode state for the local layer: its KV cache is BOUNDED instead of
+// growing with the prefix (the phase prints that table).
+function TDecodeBakeoff.BuildModelLocalGlobal(ContextLen: integer): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02));
+  Result.AddAlternatingLocalGlobalBlocks(csBlocks, csHeads, csFFNDim,
+    csWindowSize, {LocalPerGlobal=}1, {CausalMask=}true, {PreNorm=}true,
+    {UseRoPE=}true, {NormClass=}TNNetDyT);
+  Result.AddLayer([
+    TNNetPointwiseConvLinear.Create(csEmbedDim),
+    TNNetPointwiseConvLinear.Create(csModelVocabSize),
+    TNNetPointwiseSoftMax.Create(1)
+  ]);
+end;
+
+// Phase 9 model: phase 1's trunk with each SEQUENTIAL encoder block swapped
+// for the PARALLEL formulation (GPT-J/PaLM): y = x + Attn(DyT(x)) +
+// FFN(DyT(x)) with ONE shared pre-norm. AddParallelTransformerBlock composes
+// the same primitives as AddTransformerEncoderBlock (token-wise QKV slab ->
+// AddMultiHeadSelfAttention with RoPE -> out-projection; SwiGLU FFN), so the
+// parameter count matches phase 1's to within the norm layers (one DyT fewer
+// per block) and the KV-cached streamed decode path applies unchanged.
+function TDecodeBakeoff.BuildModelParallel(ContextLen: integer): TNNet;
+var
+  B: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csModelVocabSize, csEmbedDim, 0, 0.02));
+  for B := 1 to csBlocks do
+    Result.AddParallelTransformerBlock(csHeads, csFFNDim,
+      {CausalMask=}true, {UseRoPE=}true, {NormClass=}TNNetDyT);
+  Result.AddLayer([
+    TNNetPointwiseConvLinear.Create(csEmbedDim),
+    TNNetPointwiseConvLinear.Create(csModelVocabSize),
+    TNNetPointwiseSoftMax.Create(1)
+  ]);
+end;
+
 // ---------------------------------------------------------------------------
 // Time-boxed training. TNeuralDataLoadingFit exposes a public ShouldQuit flag
 // that the training loop checks after every batch (and before validation /
@@ -690,7 +789,9 @@ var
   L: TNeuralFloat;
 begin
   // Track the loss trajectory (first observed batch loss -> latest running
-  // mean) for phase 6's convergence verdict; harmless for the other phases.
+  // mean) for phase 6's convergence verdict, and the batch count for phase
+  // 9's throughput comparison; harmless for the other phases.
+  Inc(FStepCount);
   L := NFit.RunningLoss();
   if L > 0 then
   begin
@@ -733,6 +834,7 @@ begin
   FNN := NN; // GetTrainingPair sizes its volumes from FNN
   FFirstLoss := -1;
   FLastLoss := -1;
+  FStepCount := 0;
   Opt := TNeuralOptimizerAdam.Create(0.9, 0.98);
   NFit := TBakeoffFit.Create();
   try
@@ -2263,6 +2365,273 @@ begin
   end;
 end;
 
+// ---------------------------------------------------------------------------
+// Phase 8: Gemma-2 alternating local/global attention, windowed KV cache.
+// Phase 1's trunk with only the masking pattern changed (block 1 local with a
+// 12-key sliding window, block 2 global); the headline is the MEMORY table:
+// a windowed layer's decode state is BOUNDED at 2*d_model*W floats while a
+// global layer's grows linearly with the prefix.
+// ---------------------------------------------------------------------------
+procedure TDecodeBakeoff.RunPhase8;
+const
+  // Prefix lengths for the cache table; entries beyond csContextLen are the
+  // analytic extrapolation (this run itself caps at ctx=48).
+  csPrefixes: array[0..3] of integer = (12, 24, 48, 192);
+var
+  Trained: TNNet;
+  Step: TStepNet;
+  FullToks, CachedToks: TTokenBuf;
+  PromptLen, FullLen, CachedLen: integer;
+  FullMs, CachedMs: double;
+  FullFwds, CachedFwds: integer;
+  p, t, NewToks, i, P8Floats, P1Floats: integer;
+  TrainSec: double;
+begin
+  WriteLn('=== Phase 8: alternating local/global attention (Gemma-2), windowed KV cache ===');
+  LoadDataset();
+
+  Trained := BuildModelLocalGlobal(csContextLen);
+  WriteLn('Model: ctx=', csContextLen, ' d_model=', csEmbedDim, ' blocks=',
+    csBlocks, ' (local W=', csWindowSize, ', global) heads=', csHeads,
+    ' ffn=', csFFNDim, ' vocab=', csModelVocabSize, '  params=',
+    Trained.CountWeights());
+  WriteLn('Phase 1''s skeleton exactly (DyT pre-norm, RoPE, SwiGLU FFN); only');
+  WriteLn('the attention masking changes: block 1 sees at most the ',
+    csWindowSize, ' most');
+  WriteLn('recent keys (Gemma-2 local-first), block 2 keeps full attention.');
+  WriteLn('(Phase 1 all-global reference at this budget: loss 5.02 -> ',
+    csRefLossTransformer:0:2, '.)');
+
+  TrainSec := Min(csTrainCapSecLG,
+    csTotalBudgetSec - ElapsedSec() - csBenchReserveSec);
+  if TrainSec < 10 then
+  begin
+    WriteLn('ERROR: no time left to train (data loading took too long).');
+    Halt(1);
+  end;
+  // Same lr and box as phase 1: the comparison isolates the masking pattern.
+  TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.0005);
+
+  CreateStepNet(Step, BuildModelLocalGlobal(1), Trained);
+  try
+    WriteLn;
+    WriteLn('Greedy decode showdown (', csGenTokens, ' tokens per prompt):');
+    for p := 0 to High(csPrompts) do
+    begin
+      PromptLen := PromptToTokens(csPrompts[p], FullToks);
+      CachedToks := FullToks;
+
+      GreedyFull(Trained, FullToks, PromptLen, csGenTokens,
+        FullLen, FullMs, FullFwds);
+      GreedyCached(Step, CachedToks, PromptLen, csGenTokens,
+        CachedLen, CachedMs, CachedFwds);
+
+      // HARD ASSERT: token-exact equality between the two arms (this is what
+      // proves the sliding-window mask streams exactly through the cache).
+      if FullLen <> CachedLen then
+      begin
+        WriteLn('ASSERT FAILED: full arm emitted ', FullLen - PromptLen,
+          ' tokens but cached arm emitted ', CachedLen - PromptLen, '.');
+        Halt(1);
+      end;
+      for t := PromptLen to FullLen - 1 do
+        if FullToks[t] <> CachedToks[t] then
+        begin
+          WriteLn('ASSERT FAILED: decode arms diverge at position ', t,
+            ' (full=', FullToks[t], ' cached=', CachedToks[t],
+            ') for prompt "', csPrompts[p], '".');
+          Halt(1);
+        end;
+
+      NewToks := FullLen - PromptLen;
+      WriteLn;
+      WriteLn('Prompt: "', csPrompts[p], '"');
+      WriteLn('  text: ', csPrompts[p], ' ',
+        TokensToText(FullToks, PromptLen, NewToks));
+      WriteLn(Format('  full re-encode : %8.2f ms total  %6.2f ms/token  (%d forwards)',
+        [FullMs, FullMs / Max(1, NewToks), FullFwds]));
+      WriteLn(Format('  KV-cached step : %8.2f ms total  %6.2f ms/token  (%d forwards incl. prefill)',
+        [CachedMs, CachedMs / Max(1, NewToks), CachedFwds]));
+      WriteLn(Format('  speedup        : %6.2fx   tokens match: YES (%d/%d)',
+        [FullMs / Max(CachedMs, 1e-9), NewToks, NewToks]));
+    end;
+
+    // The headline: bounded vs linear KV-cache state. A windowed SDPA layer's
+    // mask discards every key older than csWindowSize positions, so the last
+    // min(t, W) positions are provably sufficient decode state (ANALYTIC
+    // number; the arm above appends and masks, proving exactness): per layer
+    // 2*d_model floats per CACHED position. Phase 1's all-global reference
+    // grows 2 full layers linearly; here only the global layer grows.
+    WriteLn;
+    WriteLn('KV-cache state by prefix length (4-byte floats; analytic bounded-');
+    WriteLn('window state; entries past ctx=', csContextLen,
+      ' extrapolate the design point):');
+    WriteLn(Format('  %-8s %22s %22s %9s', ['prefix',
+      'phase-1: 2 global', 'phase-8: local+global', 'saved']));
+    for i := 0 to High(csPrefixes) do
+    begin
+      P1Floats := 2 * (2 * csEmbedDim) * csPrefixes[i];
+      P8Floats := (2 * csEmbedDim) * Min(csPrefixes[i], csWindowSize)
+        + (2 * csEmbedDim) * csPrefixes[i];
+      WriteLn(Format('  %-8d %15d floats %15d floats %8.1f%%',
+        [csPrefixes[i], P1Floats, P8Floats, 100.0 * (P1Floats - P8Floats) / P1Floats]));
+    end;
+    WriteLn(Format('Local-layer state is BOUNDED at 2*d_model*W = %d floats '
+      + '(%d bytes); each', [2 * csEmbedDim * csWindowSize,
+       8 * csEmbedDim * csWindowSize]));
+    WriteLn('global layer still grows by ', 2 * csEmbedDim,
+      ' floats/token -- with half the stack');
+    WriteLn('local (Gemma-2''s 1:1; Gemma 3 runs 5:1) the cache asymptote is half');
+    WriteLn('of phase 1''s, at the quality cost shown above.');
+    WriteLn(Format('Quality cost of windowing: final loss %.2f vs phase 1''s '
+      + 'all-global %.2f.', [FLastLoss, csRefLossTransformer]));
+    WriteLn;
+    WriteLn('Phase 8: PASS (windowed local/global cached decode is token-exact). [t=',
+      ElapsedSec():0:1, 's]');
+  finally
+    FreeStepNet(Step);
+    Trained.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// Phase 9: parallel attention+FFN blocks (GPT-J/PaLM) step-cost bake-off.
+// Phase 1's trunk with the sequential encoder block swapped for the parallel
+// y = x + Attn(Norm(x)) + FFN(Norm(x)) formulation; the headline is wall
+// clock per step (timed forward comparison + examples seen in the same box)
+// at the same parameter count to within the norm layers.
+// ---------------------------------------------------------------------------
+procedure TDecodeBakeoff.RunPhase9;
+const
+  csTimedFwds = 12; // timed full-context forwards per net (after 2 warmups)
+var
+  Trained, SeqRef: TNNet;
+  Step: TStepNet;
+  FullToks, CachedToks: TTokenBuf;
+  PromptLen, FullLen, CachedLen: integer;
+  FullMs, CachedMs: double;
+  FullFwds, CachedFwds: integer;
+  p, t, NewToks, i, ParParams, SeqParams, Examples: integer;
+  TrainSec, T0, SeqFwdMs, ParFwdMs, TrainT0, TrainWall: double;
+  InV: TNNetVolume;
+begin
+  WriteLn('=== Phase 9: parallel attention+FFN blocks (GPT-J/PaLM) step-cost bake-off ===');
+  LoadDataset();
+
+  Trained := BuildModelParallel(csContextLen);
+  ParParams := Trained.CountWeights();
+  SeqRef := BuildModel(csContextLen); // phase 1's sequential reference
+  SeqParams := SeqRef.CountWeights();
+  WriteLn('Model: ctx=', csContextLen, ' d_model=', csEmbedDim, ' blocks=',
+    csBlocks, ' (parallel attn+FFN) heads=', csHeads, ' ffn=', csFFNDim,
+    ' vocab=', csModelVocabSize);
+  WriteLn(Format('Params: %d parallel vs %d sequential (phase 1) -- equal to '
+    + 'within the norm layers (%d).', [ParParams, SeqParams,
+     SeqParams - ParParams]));
+  WriteLn('One shared DyT pre-norm feeds BOTH branches; the residual is one');
+  WriteLn('3-input sum: y = x + Attn(DyT(x)) + FFN(DyT(x)).');
+  WriteLn('(Phase 1 sequential reference at this budget: loss 5.02 -> ',
+    csRefLossTransformer:0:2, '.)');
+
+  // (a) The parallel block's selling point: wall clock per step. Timed
+  // full-context forward comparison of the two UNtrained nets (forward cost
+  // is shape-determined, not weight-determined).
+  InV := TNNetVolume.Create(csContextLen, 1, 1);
+  try
+    for t := 0 to csContextLen - 1 do InV.FData[t] := 2 + (t mod 100);
+    for i := 1 to 2 do SeqRef.Compute(InV);  // warmup
+    T0 := NowMs();
+    for i := 1 to csTimedFwds do SeqRef.Compute(InV);
+    SeqFwdMs := (NowMs() - T0) / csTimedFwds;
+    for i := 1 to 2 do Trained.Compute(InV);  // warmup
+    T0 := NowMs();
+    for i := 1 to csTimedFwds do Trained.Compute(InV);
+    ParFwdMs := (NowMs() - T0) / csTimedFwds;
+  finally
+    InV.Free;
+    SeqRef.Free;
+  end;
+  WriteLn;
+  WriteLn('Timed full-context forward (', csTimedFwds, ' forwards each):');
+  WriteLn(Format('  sequential (phase 1) : %7.2f ms/forward', [SeqFwdMs]));
+  WriteLn(Format('  parallel  (phase 9)  : %7.2f ms/forward', [ParFwdMs]));
+  WriteLn(Format('  parallel/sequential  : %6.3fx', [ParFwdMs / Max(SeqFwdMs, 1e-9)]));
+
+  TrainSec := Min(csTrainCapSecPar,
+    csTotalBudgetSec - ElapsedSec() - csBenchReserveSec);
+  if TrainSec < 10 then
+  begin
+    WriteLn('ERROR: no time left to train (data loading took too long).');
+    Halt(1);
+  end;
+  // Same lr and samples/epoch as phase 1: the comparison isolates the block
+  // wiring (sequential vs parallel) at the same time budget.
+  TrainT0 := ElapsedSec();
+  TrainTimeBoxed(Trained, TrainSec, {SamplesPerEpoch=}3200, {lr=}0.0005);
+  TrainWall := ElapsedSec() - TrainT0;
+
+  Examples := FStepCount * csBatchSize;
+  WriteLn(Format('Throughput in the box: %d batches = %d examples in %.0f s '
+    + '(%.1f examples/s).', [FStepCount, Examples, TrainWall,
+     Examples / Max(TrainWall, 1e-9)]));
+  WriteLn(Format('Final loss %.2f vs phase 1''s sequential %.2f at the same '
+    + 'budget.', [FLastLoss, csRefLossTransformer]));
+
+  // (c) Decode showdown. The parallel block composes the same per-head SDPA
+  // layers as phase 1, so the TNNetStreamingDecoder KV-cache path applies
+  // unchanged -- the hard assert proves it through the 3-input-sum wiring.
+  CreateStepNet(Step, BuildModelParallel(1), Trained);
+  try
+    WriteLn;
+    WriteLn('Greedy decode showdown (', csGenTokens, ' tokens per prompt):');
+    for p := 0 to High(csPrompts) do
+    begin
+      PromptLen := PromptToTokens(csPrompts[p], FullToks);
+      CachedToks := FullToks;
+
+      GreedyFull(Trained, FullToks, PromptLen, csGenTokens,
+        FullLen, FullMs, FullFwds);
+      GreedyCached(Step, CachedToks, PromptLen, csGenTokens,
+        CachedLen, CachedMs, CachedFwds);
+
+      // HARD ASSERT: token-exact equality between the two arms (this is what
+      // proves the parallel block's attention streams through the KV cache).
+      if FullLen <> CachedLen then
+      begin
+        WriteLn('ASSERT FAILED: full arm emitted ', FullLen - PromptLen,
+          ' tokens but cached arm emitted ', CachedLen - PromptLen, '.');
+        Halt(1);
+      end;
+      for t := PromptLen to FullLen - 1 do
+        if FullToks[t] <> CachedToks[t] then
+        begin
+          WriteLn('ASSERT FAILED: decode arms diverge at position ', t,
+            ' (full=', FullToks[t], ' cached=', CachedToks[t],
+            ') for prompt "', csPrompts[p], '".');
+          Halt(1);
+        end;
+
+      NewToks := FullLen - PromptLen;
+      WriteLn;
+      WriteLn('Prompt: "', csPrompts[p], '"');
+      WriteLn('  text: ', csPrompts[p], ' ',
+        TokensToText(FullToks, PromptLen, NewToks));
+      WriteLn(Format('  full re-encode : %8.2f ms total  %6.2f ms/token  (%d forwards)',
+        [FullMs, FullMs / Max(1, NewToks), FullFwds]));
+      WriteLn(Format('  KV-cached step : %8.2f ms total  %6.2f ms/token  (%d forwards incl. prefill)',
+        [CachedMs, CachedMs / Max(1, NewToks), CachedFwds]));
+      WriteLn(Format('  speedup        : %6.2fx   tokens match: YES (%d/%d)',
+        [FullMs / Max(CachedMs, 1e-9), NewToks, NewToks]));
+    end;
+    WriteLn;
+    WriteLn('Phase 9: PASS (parallel-block cached decode is token-exact). [t=',
+      ElapsedSec():0:1, 's]');
+  finally
+    FreeStepNet(Step);
+    Trained.Free;
+  end;
+end;
+
 procedure TDecodeBakeoff.DoRun;
 var
   Phase, i: integer;
@@ -2284,9 +2653,9 @@ begin
       if i < ParamCount then Phase := StrToIntDef(ParamStr(i + 1), 0);
     end;
   end;
-  if (Phase < 1) or (Phase > 7) then
+  if (Phase < 1) or (Phase > 9) then
   begin
-    WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..7)');
+    WriteLn('Usage: DecodeFeaturesBakeoff --phase N   (N in 1..9)');
     WriteLn('  1: KV-cache incremental decode vs full re-encode');
     WriteLn('  2: MTP-heads self-speculative decode  (MTP = Multi-Token Prediction:');
     WriteLn('     parallel future-token heads that double as a built-in draft)');
@@ -2298,6 +2667,10 @@ begin
     WriteLn('  6: hybrid 2xSSM + 1xMLA trunk, dual-family streamed decode');
     WriteLn('  7: phase 6''s hybrid with GROUPED pointwise convolutions');
     WriteLn('     (block-diagonal grouped 1x1 convs incl. the MLA Q/out projections)');
+    WriteLn('  8: alternating local/global attention (Gemma-2 sliding window),');
+    WriteLn('     bounded windowed KV cache vs phase 1''s all-global cache');
+    WriteLn('  9: parallel attention+FFN blocks (GPT-J/PaLM single shared pre-norm),');
+    WriteLn('     step-cost bake-off vs phase 1''s sequential blocks');
     Terminate;
     ExitCode := 2;
     exit;
@@ -2313,6 +2686,8 @@ begin
       5: RunPhase5;
       6: RunPhase6;
       7: RunPhase7;
+      8: RunPhase8;
+      9: RunPhase9;
     end;
   finally
     FDictionary.Free;
