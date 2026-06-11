@@ -674,6 +674,12 @@ type
     procedure TestExpertChoiceGateGradientCheck;
     procedure TestExpertChoiceGateLoadFromString;
     procedure TestExpertChoiceMoEBalancedLoad;
+    procedure TestBiasBalancedGateSelectionVsCombine;
+    procedure TestBiasBalancedGateReducesLoadSkew;
+    procedure TestBiasBalancedGateLoadFromString;
+    procedure TestDeepSeekMoESharedAlwaysActive;
+    procedure TestDeepSeekMoEInputGradient;
+    procedure TestDeepSeekMoESmoke;
     procedure TestArcFaceForwardPassthrough;
     procedure TestArcFaceFeatureGradient;
     procedure TestArcFaceDegenerateIsCosineSoftmax;
@@ -54787,6 +54793,518 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// ===========================================================================
+//  DeepSeekMoE: TNNet.AddDeepSeekMoE (shared + fine-grained routed experts)
+//  + TNNetBiasBalancedTopKGate (DeepSeek-V3 aux-loss-free load balancing)
+// ===========================================================================
+
+procedure TTestNeuralNumerical.TestBiasBalancedGateSelectionVsCombine;
+const
+  cE = 4;
+var
+  NN, NNRef: TNNet;
+  Gate: TNNetBiasBalancedTopKGate;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // (a) With zero bias the layer is bit-for-bit TNNetTopKGate.
+  // (b) A hand-set bias CHANGES the top-k SELECTION (g+b argmax) but the
+  //     surviving COMBINE weights are still the UNBIASED g renormalized.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cE);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cE, 1));
+    Gate := TNNetBiasBalancedTopKGate.Create(2, 0.1);
+    NN.AddLayer(Gate);
+    NNRef.AddLayer(TNNetInput.Create(1, 1, cE, 1));
+    NNRef.AddLayer(TNNetTopKGate.Create(2));
+
+    Input[0, 0, 0] := 0.40;
+    Input[0, 0, 1] := 0.30;
+    Input[0, 0, 2] := 0.20;
+    Input[0, 0, 3] := 0.10;
+
+    // Zero bias: identical to the plain top-k gate (hand numbers: keep {0,1},
+    // renorm 0.4/0.7 and 0.3/0.7).
+    NN.Compute(Input);
+    NNRef.Compute(Input);
+    for i := 0 to cE - 1 do
+      AssertEquals('Zero-bias gate matches plain TopKGate at ' + IntToStr(i),
+        NNRef.GetLastLayer.Output.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-7);
+    AssertEquals('Zero-bias renorm value chan0', 0.4 / 0.7,
+      NN.GetLastLayer.Output[0, 0, 0], 1e-5);
+    AssertEquals('Zero-bias renorm value chan1', 0.3 / 0.7,
+      NN.GetLastLayer.Output[0, 0, 1], 1e-5);
+
+    // Hand-set bias b = [0, -0.5, 0, +0.25]: biased affinities become
+    // [0.40, -0.20, 0.20, 0.35] -> SELECTION flips to {0, 3}; the combine
+    // weights must come from the UNBIASED g: 0.40/0.50=0.8 and 0.10/0.50=0.2.
+    Gate.Neurons[0].Weights.Raw[0] := 0.0;
+    Gate.Neurons[0].Weights.Raw[1] := -0.5;
+    Gate.Neurons[0].Weights.Raw[2] := 0.0;
+    Gate.Neurons[0].Weights.Raw[3] := 0.25;
+    NN.Compute(Input);
+    AssertEquals('Biased selection keeps chan0, unbiased weight', 0.8,
+      NN.GetLastLayer.Output[0, 0, 0], 1e-5);
+    AssertEquals('Biased selection drops chan1', 0.0,
+      NN.GetLastLayer.Output[0, 0, 1], 1e-6);
+    AssertEquals('Biased selection drops chan2', 0.0,
+      NN.GetLastLayer.Output[0, 0, 2], 1e-6);
+    AssertEquals('Biased selection keeps chan3, unbiased weight', 0.2,
+      NN.GetLastLayer.Output[0, 0, 3], 1e-5);
+    // Load accumulator counted both forwards: {0,1} then {0,3}.
+    AssertEquals('Load acc expert0', 2.0, Gate.GetExpertLoad(0), 1e-6);
+    AssertEquals('Load acc expert1', 1.0, Gate.GetExpertLoad(1), 1e-6);
+    AssertEquals('Load acc expert2', 0.0, Gate.GetExpertLoad(2), 1e-6);
+    AssertEquals('Load acc expert3', 1.0, Gate.GetExpertLoad(3), 1e-6);
+  finally
+    NN.Free;
+    NNRef.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBiasBalancedGateReducesLoadSkew;
+const
+  cE = 4;
+  cTok = 8;
+  cBatches = 20;
+var
+  NNB, NN0: TNNet;
+  GateB, Gate0: TNNetBiasBalancedTopKGate;
+  Input: TNNetVolume;
+  t, Batch: integer;
+  g0, rest: TNeuralFloat;
+  MinL, MaxL, SpreadB, Spread0, FirstB, First0, SumLast: TNeuralFloat;
+
+  function SpreadOf(G: TNNetBiasBalancedTopKGate): TNeuralFloat;
+  var d: integer;
+  begin
+    MinL := G.GetExpertLoad(0); MaxL := MinL;
+    for d := 1 to cE - 1 do
+    begin
+      if G.GetExpertLoad(d) < MinL then MinL := G.GetExpertLoad(d);
+      if G.GetExpertLoad(d) > MaxL then MaxL := G.GetExpertLoad(d);
+    end;
+    Result := MaxL - MinL;
+  end;
+
+begin
+  // Skewed gate distribution: every token prefers expert 0 (with varying
+  // margins), so top-1 routing collapses onto expert 0 (per-batch load spread
+  // = cTok). With bias balancing the spread must come down over batches; the
+  // no-bias baseline (BiasSpeed=0) stays collapsed forever.
+  RandSeed := 424242;
+  NNB := TNNet.Create();
+  NN0 := TNNet.Create();
+  Input := TNNetVolume.Create(cTok, 1, cE);
+  try
+    NNB.AddLayer(TNNetInput.Create(cTok, 1, cE, 1));
+    GateB := TNNetBiasBalancedTopKGate.Create(1, 0.05);
+    NNB.AddLayer(GateB);
+    NN0.AddLayer(TNNetInput.Create(cTok, 1, cE, 1));
+    Gate0 := TNNetBiasBalancedTopKGate.Create(1, 0.0);
+    NN0.AddLayer(Gate0);
+
+    // Token t: g[0] = 0.28 + 0.01*t (always the max); the other three split
+    // the rest with small (non-tied) offsets.
+    for t := 0 to cTok - 1 do
+    begin
+      g0 := 0.28 + 0.01 * t;
+      rest := (1.0 - g0) / 3.0;
+      Input[t, 0, 0] := g0;
+      Input[t, 0, 1] := rest + 0.01;
+      Input[t, 0, 2] := rest;
+      Input[t, 0, 3] := rest - 0.01;
+    end;
+
+    FirstB := -1; First0 := -1; SumLast := 0;
+    for Batch := 1 to cBatches do
+    begin
+      NNB.Compute(Input);
+      NN0.Compute(Input);
+      SpreadB := SpreadOf(GateB);
+      Spread0 := SpreadOf(Gate0);
+      if Batch = 1 then
+      begin
+        FirstB := SpreadB;
+        First0 := Spread0;
+      end;
+      if Batch > cBatches - 10 then SumLast := SumLast + SpreadB;
+      // The per-batch bias update (no-op for the BiasSpeed=0 baseline; the
+      // baseline accumulator is reset by hand so spreads stay per-batch).
+      GateB.UpdateRoutingBias();
+      Gate0.UpdateRoutingBias();
+      Gate0.ResetExpertLoad();
+      if Batch = 1 then
+      begin
+        // Right after the first update the direction is unambiguous: down for
+        // the overloaded expert 0, up for the starved expert 3. (Later batches
+        // oscillate around balance, so the sign is only checked here.)
+        AssertTrue('Bias of overloaded expert decreased after batch 1',
+          GateB.Neurons[0].Weights.Raw[0] < 0);
+        AssertTrue('Bias of underloaded expert increased after batch 1',
+          GateB.Neurons[0].Weights.Raw[3] > 0);
+      end;
+    end;
+
+    AssertEquals('Skewed routing collapses on batch 1 (balanced net)',
+      1.0 * cTok, FirstB, 1e-6);
+    AssertEquals('Skewed routing collapses on batch 1 (baseline)',
+      1.0 * cTok, First0, 1e-6);
+    AssertEquals('No-bias baseline stays collapsed at the last batch',
+      1.0 * cTok, Spread0, 1e-6);
+    AssertTrue('Bias balancing strictly reduces the mean load spread (got ' +
+      FloatToStr(SumLast / 10) + ' vs baseline ' + FloatToStr(1.0 * cTok) + ')',
+      SumLast / 10 < cTok - 0.5);
+  finally
+    NNB.Free;
+    NN0.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestBiasBalancedGateLoadFromString;
+const
+  cE = 4;
+var
+  NN, NN2: TNNet;
+  Gate: TNNetBiasBalancedTopKGate;
+  Input: TNNetVolume;
+  Saved, Resaved: string;
+  i: integer;
+begin
+  // The routing bias is STATE: it must round-trip through save/load and
+  // reproduce the same (bias-dependent) routing decision.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, cE);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, cE, 1));
+    Gate := TNNetBiasBalancedTopKGate.Create(2, 0.1);
+    NN.AddLayer(Gate);
+    Gate.Neurons[0].Weights.Raw[0] := 0.0;
+    Gate.Neurons[0].Weights.Raw[1] := -0.5;
+    Gate.Neurons[0].Weights.Raw[2] := 0.0;
+    Gate.Neurons[0].Weights.Raw[3] := 0.25;
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+    Resaved := NN2.SaveToString();
+    AssertEquals('BiasBalancedGate save->load->save round-trip', Saved, Resaved);
+    AssertTrue('Loaded last layer is TNNetBiasBalancedTopKGate',
+      NN2.GetLastLayer is TNNetBiasBalancedTopKGate);
+    AssertEquals('Round-trip preserves TopCnt + BiasSpeed',
+      NN.GetLastLayer.SaveStructureToString(),
+      NN2.GetLastLayer.SaveStructureToString());
+    for i := 0 to cE - 1 do
+      AssertEquals('Round-trip preserves bias ' + IntToStr(i),
+        Gate.Neurons[0].Weights.Raw[i],
+        NN2.GetLastLayer.Neurons[0].Weights.Raw[i], 1e-7);
+
+    // Identical (bias-dependent) routing: selection {0,3} only happens if the
+    // loaded bias is in effect.
+    Input[0, 0, 0] := 0.40;
+    Input[0, 0, 1] := 0.30;
+    Input[0, 0, 2] := 0.20;
+    Input[0, 0, 3] := 0.10;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to cE - 1 do
+      AssertEquals('Round-trip routing output ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-7);
+    AssertEquals('Loaded gate routes with the bias (keeps chan3)', 0.2,
+      NN2.GetLastLayer.Output[0, 0, 3], 1e-5);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeepSeekMoESharedAlwaysActive;
+const
+  cTok = 2;
+  cD = 3;          // d_model
+  cShared = 1;
+  cRouted = 3;
+  cActive = 1;     // top-1: 2 tokens can touch at most 2 of the 3 routed experts
+  cHidden = 2;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  Block, GateL, RoutedLin, SharedLin: TNNetLayer;
+  e, x, i: integer;
+  Selected: boolean;
+  DSum: TNeuralFloat;
+
+  function LayerDeltaAbsSum(L: TNNetLayer): TNeuralFloat;
+  var n, w: integer;
+  begin
+    Result := 0;
+    for n := 0 to L.Neurons.Count - 1 do
+    begin
+      for w := 0 to L.Neurons[n].Delta.Size - 1 do
+        Result := Result + Abs(L.Neurons[n].Delta.Raw[w]);
+      Result := Result + Abs(L.Neurons[n].BiasDelta);
+    end;
+  end;
+
+begin
+  // Shared experts are ALWAYS active: they receive gradient on every sample,
+  // while a routed expert only receives gradient when the top-k gate selects
+  // it for at least one token (unselected experts get an exactly-zero delta).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cTok, 1, cD);
+  Target := TNNetVolume.Create(cTok, 1, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(cTok, 1, cD, 1));
+    Block := NN.AddDeepSeekMoE(nil, cShared, cRouted, cActive, cHidden);
+    AssertTrue('AddDeepSeekMoE returns a layer', Block <> nil);
+    AssertEquals('Block output Depth = d_model', cD, Block.Output.Depth);
+    AssertEquals('Block output SeqLen preserved', cTok, Block.Output.SizeX);
+
+    // Manual gradient surgery: batch mode so per-sample updates do not zero
+    // the deltas we are about to inspect.
+    NN.SetBatchUpdate(True);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Random() - 0.5;
+    Target.Fill(0);
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    // Locate the hard gate (documented builder layer order: gate conv,
+    // softmax, gate at index 3; routed expert e occupies 4+5e..8+5e with its
+    // output ConvLinear at 5+5e; shared expert ConvLinear is last-1).
+    GateL := NN.Layers[3];
+    AssertTrue('Layer 3 is the top-k gate', GateL is TNNetTopKGate);
+    SharedLin := NN.Layers[NN.CountLayers - 2];
+    AssertTrue('Layer last-1 is the shared expert output conv',
+      SharedLin is TNNetPointwiseConvLinear);
+    AssertTrue('Shared expert gets gradient on every sample',
+      LayerDeltaAbsSum(SharedLin) > 0);
+
+    Selected := False;
+    for e := 0 to cRouted - 1 do
+    begin
+      RoutedLin := NN.Layers[5 + 5 * e];
+      AssertTrue('Layer ' + IntToStr(5 + 5 * e) + ' is routed expert conv',
+        RoutedLin is TNNetPointwiseConvLinear);
+      // Expert e is selected iff its gate channel is non-zero for some token.
+      Selected := False;
+      for x := 0 to cTok - 1 do
+        if GateL.Output[x, 0, e] <> 0 then Selected := True;
+      DSum := LayerDeltaAbsSum(RoutedLin);
+      if Selected
+        then AssertTrue('Selected routed expert ' + IntToStr(e) +
+          ' gets gradient', DSum > 0)
+        else AssertEquals('Unselected routed expert ' + IntToStr(e) +
+          ' gets exactly zero gradient', 0.0, DSum, 0.0);
+    end;
+    // With top-1 over 2 tokens and 3 routed experts at least one expert is
+    // unselected, so the zero-gradient branch above was really exercised.
+    Selected := True;
+    for e := 0 to cRouted - 1 do
+    begin
+      Selected := False;
+      for x := 0 to cTok - 1 do
+        if GateL.Output[x, 0, e] <> 0 then Selected := True;
+      if not Selected then break;
+    end;
+    AssertTrue('At least one routed expert was unselected', not Selected);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeepSeekMoEInputGradient;
+const
+  cEps = 1e-3;
+  cTok = 2;
+  cD = 3;          // d_model
+  cShared = 1;
+  cRouted = 3;
+  cActive = 2;     // top-2 so the survivor renorm Jacobian is non-trivial
+  cHidden = 2;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LMid: TNNetIdentity;
+  GateConv: TNNetLayer;
+  W: array of TNeuralFloat;
+  AnaGrad, NumGrad, OldV: TNeuralFloat;
+  LossP, LossM: Double;
+  i, n: integer;
+
+  function LossAt(): Double;
+  var j: integer;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for j := 0 to NN.GetLastLayer.Output.Size - 1 do
+      Result := Result + W[j] * NN.GetLastLayer.Output.Raw[j];
+  end;
+
+begin
+  // Numerical input-gradient check through the FULL DeepSeekMoE block
+  // (router conv + softmax + top-k renorm gate + routed/shared expert MLPs +
+  // broadcast-multiply + sum). The gate conv is hand-set with dominant biases
+  // so the top-2 active set {e0,e1} is stable under the +/-eps probes (the
+  // top-k boundary is non-differentiable; keep margins large).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cTok, 1, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(cTok, 1, cD, 1));
+    LMid := TNNetIdentity.Create();
+    NN.AddLayer(LMid);
+    NN.AddDeepSeekMoE(nil, cShared, cRouted, cActive, cHidden);
+    // Freeze weights during the manual backprop call (batch mode).
+    NN.SetBatchUpdate(True);
+
+    // Gate conv is layer 2 (input, LMid, gate conv, softmax, gate, ...).
+    GateConv := NN.Layers[2];
+    AssertTrue('Layer 2 is the gate conv', GateConv is TNNetPointwiseConvLinear);
+    for n := 0 to GateConv.Neurons.Count - 1 do
+      for i := 0 to GateConv.Neurons[n].Weights.Size - 1 do
+        case n of
+          0: GateConv.Neurons[n].Weights.Raw[i] := 0.05;
+          1: GateConv.Neurons[n].Weights.Raw[i] := -0.05;
+          else GateConv.Neurons[n].Weights.Raw[i] := 0.02;
+        end;
+    GateConv.Neurons[0].BiasWeight := 1.2;
+    GateConv.Neurons[1].BiasWeight := 0.6;
+    GateConv.Neurons[2].BiasWeight := -1.5;
+    // Push every expert ReLU firmly into its linear (active) region so the
+    // +/-eps probes never cross a ReLU kink (which would make the numerical
+    // gradient disagree with the analytic one at the kink); bound inputs
+    // instead of loosening the tolerance.
+    for n := 0 to NN.CountLayers - 1 do
+      if NN.Layers[n] is TNNetPointwiseConvReLU then
+        for i := 0 to NN.Layers[n].Neurons.Count - 1 do
+          NN.Layers[n].Neurons[i].BiasWeight := 2.0;
+    // Refresh the packed/interleaved conv weight caches after the hand-edits
+    // (deltas are zero, so this only re-packs; without it the analytic
+    // backward would use the stale pre-edit weights).
+    NN.UpdateWeights();
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Random() - 0.5;
+    SetLength(W, cTok * cD);
+    for i := 0 to High(W) do
+      if Odd(i) then W[i] := -0.07 * (i + 1) else W[i] := 0.07 * (i + 1);
+
+    // Analytic gradient: seed dL/dy = W at the block output and backprop.
+    NN.Compute(Input);
+    NN.GetLastLayer.IncDepartingBranchesCnt();
+    NN.GetLastLayer.OutputError.Fill(0);
+    for i := 0 to High(W) do NN.GetLastLayer.OutputError.Raw[i] := W[i];
+    NN.GetLastLayer.Backpropagate();
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      AnaGrad := LMid.OutputError.Raw[i];
+      OldV := Input.Raw[i];
+      Input.Raw[i] := OldV + cEps; LossP := LossAt();
+      Input.Raw[i] := OldV - cEps; LossM := LossAt();
+      Input.Raw[i] := OldV;
+      NumGrad := (LossP - LossM) / (2 * cEps);
+      AssertEquals('DeepSeekMoE input grad at ' + IntToStr(i),
+        NumGrad, AnaGrad, 2e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDeepSeekMoESmoke;
+const
+  cTok = 4;
+  cD = 3;
+  cShared = 1;
+  cRouted = 4;
+  cActive = 2;
+  cHidden = 3;
+  cSteps = 40;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  Block: TNNetLayer;
+  Gate: TNNetBiasBalancedTopKGate;
+  i, Step: integer;
+  AllFinite: boolean;
+  MSEBefore, MSEAfter: TNeuralFloat;
+
+  function CurrentMSE(): TNeuralFloat;
+  var j: integer; d: TNeuralFloat;
+  begin
+    Result := 0;
+    for j := 0 to Target.Size - 1 do
+    begin
+      d := Block.Output.Raw[j] - Target.Raw[j];
+      Result := Result + d * d;
+    end;
+    Result := Result / Target.Size;
+  end;
+
+begin
+  // Builder smoke test with the bias-balanced gate wired in: forward is
+  // finite, shapes are preserved, and a few SGD steps (with the per-batch
+  // UpdateRoutingBias call the training loop is responsible for) reduce the
+  // loss on a toy regression task.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cTok, 1, cD);
+  Target := TNNetVolume.Create(cTok, 1, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(cTok, 1, cD, 1));
+    Block := NN.AddDeepSeekMoE(nil, cShared, cRouted, cActive, cHidden, 0.02);
+    AssertEquals('Smoke: output SeqLen preserved', cTok, Block.Output.SizeX);
+    AssertEquals('Smoke: output SizeY preserved', 1, Block.Output.SizeY);
+    AssertEquals('Smoke: output Depth = d_model', cD, Block.Output.Depth);
+
+    // BalanceBiasSpeed > 0 wires the DeepSeek-V3 bias-balanced gate in.
+    Gate := nil;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetBiasBalancedTopKGate then
+        Gate := TNNetBiasBalancedTopKGate(NN.Layers[i]);
+    AssertTrue('BiasBalancedTopKGate present in block', Gate <> nil);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Random() - 0.5;
+    for i := 0 to Target.Size - 1 do Target.Raw[i] := 0.5 * (Random() - 0.5);
+
+    NN.SetLearningRate(0.05, 0.0);
+    NN.Compute(Input);
+    AllFinite := True;
+    for i := 0 to Block.Output.Size - 1 do
+      if (IsNan(Block.Output.Raw[i])) or (Abs(Block.Output.Raw[i]) > 1e6) then
+        AllFinite := False;
+    AssertTrue('Smoke: forward output is finite', AllFinite);
+    MSEBefore := CurrentMSE();
+
+    for Step := 1 to cSteps do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Target);
+      // The aux-loss-free balancing hook: once per batch.
+      Gate.UpdateRoutingBias();
+    end;
+    NN.Compute(Input);
+    MSEAfter := CurrentMSE();
+    AssertTrue('Smoke: SGD reduces loss (before=' + FloatToStr(MSEBefore) +
+      ' after=' + FloatToStr(MSEAfter) + ')', MSEAfter < MSEBefore);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
   end;
 end;
 

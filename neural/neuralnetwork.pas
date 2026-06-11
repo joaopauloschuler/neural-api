@@ -8117,6 +8117,50 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Auxiliary-loss-FREE bias-balanced top-k MoE routing gate (Wang et al.
+  /// 2024, "Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-
+  /// Experts", arXiv:2408.15664; the load-balancing strategy deployed in
+  /// DeepSeek-V3). Subclasses TNNetTopKGate with ONE twist: per spatial cell
+  /// the TopCnt surviving experts are SELECTED by the BIASED affinity
+  /// g_e + b_e, but the surviving COMBINE weights are still the UNBIASED g_e
+  /// renormalized to sum to 1 -- the per-expert bias b steers WHICH experts
+  /// fire, never HOW MUCH a selected expert contributes. The bias is STATE,
+  /// not a trainable parameter: it receives NO gradient and is updated
+  /// out-of-band by UpdateRoutingBias(),
+  ///   b_e := b_e - BiasSpeed * sign(load_e - mean_load)
+  /// (overloaded experts become less selectable, underloaded ones more), where
+  /// load_e counts how often expert e was selected since the last update.
+  /// Forward passes accumulate the per-expert selection counts; training loops
+  /// call UpdateRoutingBias() ONCE PER BATCH (it consumes and resets the
+  /// accumulator). This replaces the Switch-style TNNetLoadBalanceLoss aux
+  /// gradient -- no interference with the language-model loss.
+  /// TopCnt lives in FStruct[0] (inherited); BiasSpeed (gamma) in FFloatSt[0].
+  /// The bias vector is persistent state held in neuron 0's weights
+  /// ((NumExperts,1,1), zero-initialized, untouched by backprop) so it
+  /// round-trips through the standard per-neuron save/load. With b == 0 the
+  /// layer is bit-for-bit TNNetTopKGate; Backpropagate() is inherited
+  /// unchanged (survivors are recovered from FOutput<>0 and the renorm
+  /// Jacobian only involves the unbiased weights). The load accumulator is
+  /// transient (not serialized).
+  // Coded by Claude (AI).
+  TNNetBiasBalancedTopKGate = class(TNNetTopKGate)
+    private
+      FLoadAcc: array of TNeuralFloat;  // per-expert selection counts (transient)
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(TopCnt: integer; BiasSpeed: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure InitDefault(); override;
+      // Bias update rule (call once per batch): b_e -= BiasSpeed*sign(load_e -
+      // mean_load); consumes and resets the per-expert load accumulator. A
+      // no-op when no load has been accumulated or BiasSpeed = 0.
+      procedure UpdateRoutingBias();
+      // Selection count of expert ExpertIdx accumulated since the last
+      // UpdateRoutingBias()/ResetExpertLoad() (0 when out of range).
+      function GetExpertLoad(ExpertIdx: integer): TNeuralFloat;
+      procedure ResetExpertLoad();
+  end;
+
   TNNetLayerFullConnect = class(TNNetFullConnect);
   TNNetLayerFullConnectReLU = class(TNNetFullConnectReLU);
   TNNetLayerSoftMax = class(TNNetSoftMax);
@@ -10493,6 +10537,56 @@ type
       // output.
       function AddExpertChoiceMixtureOfExperts(InputLayer: TNNetLayer;
         NumExperts, ExpertHiddenDim, Capacity: integer): TNNetLayer;
+      // DeepSeekMoE block (Dai et al. 2024, "DeepSeekMoE: Towards Ultimate
+      // Expert Specialization in Mixture-of-Experts Language Models",
+      // arXiv:2401.06066) with optional DeepSeek-V3 auxiliary-loss-free
+      // bias-based load balancing (Wang et al. 2024, arXiv:2408.15664).
+      // Two ideas vs the vanilla top-k MoE (AddTopKMixtureOfExperts):
+      //
+      //  1. SHARED EXPERTS: NumSharedExperts expert MLPs are ALWAYS active --
+      //     their outputs are added unconditionally with NO routing weight.
+      //     They capture common knowledge so the routed experts can specialize.
+      //  2. FINE-GRAINED ROUTED EXPERTS: instead of N conventional experts of
+      //     hidden width H routed top-k, split each into m smaller ones and
+      //     route top-(k*m) over (N*m). The CALLER expresses the m-split by
+      //     passing  NumRoutedExperts = N*m,  ExpertHiddenDim = H div m,
+      //     ActiveRouted = k*m  -- same FLOP budget, far more combinations
+      //     (e.g. N=4,H=8,k=2 fine-grained by m=4 -> NumRoutedExperts=16,
+      //     ExpertHiddenDim=2, ActiveRouted=8).
+      //
+      //  Output:  y = Sum_s Shared_s(x) + Sum_e gTopK[e] * Routed_e(x),
+      // where gTopK is the renormalized top-ActiveRouted gate over the routed
+      // experts only (shared experts bypass the router entirely). Everything
+      // is token-wise (pointwise/1x1 convs over Depth) so a (SeqLen,1,d_model)
+      // sequence keeps its sequence axis; output shape == InputLayer shape
+      // (drop-in FFN replacement, wrappable in AddPreNormResidual([...])).
+      //
+      // LOAD BALANCING is auxiliary-loss-free (DeepSeek-V3 style): there is NO
+      // TNNetLoadBalanceLoss head. When BalanceBiasSpeed > 0 the gate is a
+      // TNNetBiasBalancedTopKGate -- a per-expert bias added to the affinity
+      // scores FOR TOP-K SELECTION ONLY (combine weights stay unbiased) and
+      // nudged against load violations by BalanceBiasSpeed per batch. The
+      // training loop must call UpdateRoutingBias() on that gate once per
+      // batch (find it by scanning Layers for a TNNetBiasBalancedTopKGate;
+      // see examples/DeepSeekMoE). When BalanceBiasSpeed = 0 (the
+      // default) a plain TNNetTopKGate is used and routing is unbalanced.
+      //
+      // LIMITATION (inherited from AddTopKMixtureOfExperts v1): ALL routed
+      // experts are evaluated on every token and then masked by the gate, so
+      // the sparsity saves no compute -- fine on CPU at these sizes; the
+      // savings of hard dispatch would need a gather/scatter executor.
+      //
+      // Layer construction order (relied upon by tests): gate conv, softmax,
+      // gate; then per routed expert e: [ConvReLU, ConvLinear, SplitChannels,
+      // Replicate, CellMulByCell]; then per shared expert s: [ConvReLU,
+      // ConvLinear]; final Sum. InputLayer defaults to GetLastLayer() when
+      // nil. NumSharedExperts is clamped to >= 0; NumRoutedExperts and
+      // ExpertHiddenDim to >= 1; ActiveRouted to 1..NumRoutedExperts. Returns
+      // the block output.
+      function AddDeepSeekMoE(InputLayer: TNNetLayer;
+        NumSharedExperts, NumRoutedExperts, ActiveRouted,
+        ExpertHiddenDim: integer;
+        BalanceBiasSpeed: TNeuralFloat = 0): TNNetLayer;
       // Pre-norm residual block:  y = x + Sublayer(Norm(x)).
       // pSublayers is the caller-provided sublayer stack; its output shape MUST
       // match the block input shape so the residual sum is valid. Returns the
@@ -62212,6 +62306,153 @@ begin
   FPrevLayer.Backpropagate();
 end;
 
+{ TNNetBiasBalancedTopKGate }
+
+constructor TNNetBiasBalancedTopKGate.Create(TopCnt: integer;
+  BiasSpeed: TNeuralFloat);
+begin
+  inherited Create(TopCnt);
+  if BiasSpeed < 0 then BiasSpeed := 0;
+  FFloatSt[0] := BiasSpeed;
+end;
+
+procedure TNNetBiasBalancedTopKGate.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Neuron 0 carries the persistent routing-bias vector b (NumExperts,1,1).
+  // It is state, not a trainable parameter: backprop never writes its delta
+  // and UpdateRoutingBias() is the only writer.
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  FNeurons[0].FWeights.ReSize(pPrevLayer.FOutput.Depth, 1, 1);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  InitDefault();
+  SetLength(FLoadAcc, pPrevLayer.FOutput.Depth);
+  ResetExpertLoad();
+end;
+
+procedure TNNetBiasBalancedTopKGate.InitDefault();
+begin
+  // Bias starts at exactly zero (= plain TNNetTopKGate routing); it must NOT
+  // be randomized. A loaded model overwrites it via the standard neuron load.
+  if FNeurons.Count > 0 then
+  begin
+    FNeurons[0].FWeights.Fill(0);
+    FNeurons[0].FDelta.Fill(0);
+    FNeurons[0].FBackInertia.Fill(0);
+  end;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetBiasBalancedTopKGate.Compute;
+var
+  StartTime: double;
+  CntX, CntY, CntD, CntK, MaxX, MaxY, MaxD, StartPos, TopCnt, BestIdx: integer;
+  BestVal, Val, SurvSum: TNeuralFloat;
+  Kept: array of boolean;
+  BiasPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  TopCnt := FStruct[0];
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := FOutput.Depth - 1;
+  if Length(FLoadAcc) <> FOutput.Depth then
+  begin
+    SetLength(FLoadAcc, FOutput.Depth);
+    ResetExpertLoad();
+  end;
+  if TopCnt >= FOutput.Depth then
+  begin
+    // Identity path: every expert is selected by every cell.
+    for CntD := 0 to MaxD do
+      FLoadAcc[CntD] := FLoadAcc[CntD] + (MaxX + 1) * (MaxY + 1);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  BiasPtr := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
+  SetLength(Kept, FOutput.Depth);
+  for CntX := 0 to MaxX do
+    for CntY := 0 to MaxY do
+    begin
+      StartPos := FOutput.GetRawPos(CntX, CntY, 0);
+      for CntD := 0 to MaxD do Kept[CntD] := False;
+      // SELECTION uses the BIASED affinity g + b (first occurrence wins ties).
+      for CntK := 1 to TopCnt do
+      begin
+        BestIdx := -1;
+        BestVal := 0;
+        for CntD := 0 to MaxD do
+        begin
+          if Kept[CntD] then continue;
+          Val := FOutput.FData[StartPos + CntD] + BiasPtr^[CntD];
+          if (BestIdx = -1) or (Val > BestVal) then
+          begin
+            BestIdx := CntD;
+            BestVal := Val;
+          end;
+        end;
+        if BestIdx >= 0 then Kept[BestIdx] := True;
+      end;
+      // COMBINE weights stay UNBIASED: renormalize the surviving raw g values
+      // so they sum to 1; zero the rest. Accumulate per-expert load counts.
+      SurvSum := 0;
+      for CntD := 0 to MaxD do
+        if Kept[CntD] then SurvSum := SurvSum + FOutput.FData[StartPos + CntD];
+      if SurvSum = 0 then SurvSum := 1;
+      for CntD := 0 to MaxD do
+        if Kept[CntD] then
+        begin
+          FOutput.FData[StartPos + CntD] := FOutput.FData[StartPos + CntD] / SurvSum;
+          FLoadAcc[CntD] := FLoadAcc[CntD] + 1;
+        end
+        else FOutput.FData[StartPos + CntD] := 0;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBiasBalancedTopKGate.UpdateRoutingBias();
+var
+  CntD, MaxD: integer;
+  Speed, Total, MeanLoad: TNeuralFloat;
+  BiasPtr: TNeuralFloatArrPtr;
+begin
+  Speed := FFloatSt[0];
+  MaxD := Length(FLoadAcc) - 1;
+  if (Speed = 0) or (MaxD < 0) or (FNeurons.Count < 1) then exit;
+  Total := 0;
+  for CntD := 0 to MaxD do Total := Total + FLoadAcc[CntD];
+  if Total = 0 then exit;  // no forward since the last update
+  MeanLoad := Total / (MaxD + 1);
+  BiasPtr := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
+  // b_e := b_e - Speed * sign(load_e - mean_load): overloaded experts become
+  // less selectable, underloaded ones more. The bias receives NO gradient.
+  for CntD := 0 to MaxD do
+  begin
+    if FLoadAcc[CntD] > MeanLoad
+      then BiasPtr^[CntD] := BiasPtr^[CntD] - Speed
+      else if FLoadAcc[CntD] < MeanLoad
+        then BiasPtr^[CntD] := BiasPtr^[CntD] + Speed;
+  end;
+  AfterWeightUpdate();
+  ResetExpertLoad();
+end;
+
+function TNNetBiasBalancedTopKGate.GetExpertLoad(ExpertIdx: integer): TNeuralFloat;
+begin
+  if (ExpertIdx >= 0) and (ExpertIdx < Length(FLoadAcc))
+    then Result := FLoadAcc[ExpertIdx]
+    else Result := 0;
+end;
+
+procedure TNNetBiasBalancedTopKGate.ResetExpertLoad();
+var
+  CntD: integer;
+begin
+  for CntD := 0 to Length(FLoadAcc) - 1 do FLoadAcc[CntD] := 0;
+end;
+
 { TNNetConvolutionReLU }
 constructor TNNetConvolutionReLU.Create(pNumFeatures, pFeatureSize,
   pInputPadding, pStride: integer; pSuppressBias: integer = 0);
@@ -81070,6 +81311,7 @@ begin
       'TNNetLogSoftMax' :           Result := TNNetLogSoftMax.Create();
       'TNNetTopK' :                 Result := TNNetTopK.Create(St[0]);
       'TNNetTopKGate' :             Result := TNNetTopKGate.Create(St[0]);
+      'TNNetBiasBalancedTopKGate' : Result := TNNetBiasBalancedTopKGate.Create(St[0], Ft[0]);
       'TNNetExpertChoiceGate' :     Result := TNNetExpertChoiceGate.Create(St[0]);
       'TNNetPointwiseNorm' :        Result := TNNetPointwiseNorm.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -81447,6 +81689,7 @@ begin
       if S[0] = 'TNNetLogSoftMax' then Result := TNNetLogSoftMax.Create() else
       if S[0] = 'TNNetTopK' then Result := TNNetTopK.Create(St[0]) else
       if S[0] = 'TNNetTopKGate' then Result := TNNetTopKGate.Create(St[0]) else
+      if S[0] = 'TNNetBiasBalancedTopKGate' then Result := TNNetBiasBalancedTopKGate.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetExpertChoiceGate' then Result := TNNetExpertChoiceGate.Create(St[0]) else
       if S[0] = 'TNNetPointwiseNorm' then Result := TNNetPointwiseNorm.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
@@ -82288,6 +82531,73 @@ begin
     then Result := WeightedExperts[0]
     else Result := AddLayer( TNNetSum.Create(WeightedExperts) );
   SetLength(WeightedExperts, 0);
+end;
+
+function TNNet.AddDeepSeekMoE(InputLayer: TNNetLayer;
+  NumSharedExperts, NumRoutedExperts, ActiveRouted,
+  ExpertHiddenDim: integer;
+  BalanceBiasSpeed: TNeuralFloat = 0): TNNetLayer;
+var
+  d_model, e: integer;
+  GateSoft, GateTopK: TNNetLayer;
+  ExpertOut, GateE, GateEBroadcast: TNNetLayer;
+  Branches: array of TNNetLayer;
+begin
+  if InputLayer = nil then InputLayer := GetLastLayer();
+  if NumSharedExperts < 0 then NumSharedExperts := 0;
+  if NumRoutedExperts < 1 then NumRoutedExperts := 1;
+  if ExpertHiddenDim < 1 then ExpertHiddenDim := 1;
+  if ActiveRouted < 1 then ActiveRouted := 1;
+  if ActiveRouted > NumRoutedExperts then ActiveRouted := NumRoutedExperts;
+  if BalanceBiasSpeed < 0 then BalanceBiasSpeed := 0;
+  d_model := InputLayer.Output.Depth;
+
+  // --- ROUTER (routed experts only; shared experts bypass it) --------------
+  // Token-wise linear projection -> NumRoutedExperts logits, then a PER-TOKEN
+  // softmax over the expert (Depth) axis so each token's affinities sum to 1
+  // (TNNetPointwiseSoftMax, NOT the whole-volume TNNetSoftMax: per-token
+  // affinity magnitudes must not shrink with sequence length, or the
+  // balancing bias scale would depend on SeqLen).
+  AddLayerAfter( TNNetPointwiseConvLinear.Create(NumRoutedExperts), InputLayer );
+  GateSoft := AddLayer( TNNetPointwiseSoftMax.Create() );
+  // NO TNNetLoadBalanceLoss aux head: balancing (when requested) is the
+  // DeepSeek-V3 auxiliary-loss-free bias mechanism inside the gate itself.
+  if BalanceBiasSpeed > 0
+    then GateTopK := AddLayerAfter(
+      TNNetBiasBalancedTopKGate.Create(ActiveRouted, BalanceBiasSpeed), GateSoft )
+    else GateTopK := AddLayerAfter(
+      TNNetTopKGate.Create(ActiveRouted), GateSoft );
+
+  // --- ROUTED EXPERTS + GATE-WEIGHTED COMBINE -------------------------------
+  // (Same wiring as AddTopKMixtureOfExperts; fine-grained specialization is
+  // expressed by passing many small experts -- see the declaration comment.)
+  SetLength(Branches, NumRoutedExperts + NumSharedExperts);
+  for e := 0 to NumRoutedExperts - 1 do
+  begin
+    // Shape-preserving 2-layer expert MLP over Depth (1x1 convs keep the
+    // sequence axis; FullConnect would flatten it and break per-token blocks).
+    AddLayerAfter( TNNetPointwiseConvReLU.Create(ExpertHiddenDim), InputLayer );
+    ExpertOut := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+    // Slice this expert's renormalized top-k gate weight g[e], broadcast it
+    // across the d_model channels and cell-multiply it in.
+    GateE := AddLayerAfter( TNNetSplitChannels.Create(e, 1), GateTopK );
+    GateEBroadcast := AddLayer( TNNetDeepConcat.Replicate(d_model, GateE) );
+    Branches[e] := AddLayer( TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+  end;
+
+  // --- SHARED EXPERTS (always active, NO routing weight) --------------------
+  for e := 0 to NumSharedExperts - 1 do
+  begin
+    AddLayerAfter( TNNetPointwiseConvReLU.Create(ExpertHiddenDim), InputLayer );
+    Branches[NumRoutedExperts + e] :=
+      AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+  end;
+
+  // y = Sum_s Shared_s(x) + Sum_e gTopK[e] * Routed_e(x).
+  if Length(Branches) = 1
+    then Result := Branches[0]
+    else Result := AddLayer( TNNetSum.Create(Branches) );
+  SetLength(Branches, 0);
 end;
 
 function TNNet.AddPreNormResidual(pSublayers: array of TNNetLayer;
