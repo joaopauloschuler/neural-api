@@ -11313,6 +11313,37 @@ type
       function AddTransformerEncoderBlock(Heads, d_ff: integer;
         PreNorm: boolean = true; CausalMask: boolean = false;
         UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
+      // PARALLEL attention+FFN transformer block (GPT-J, Wang & Komatsuzaki
+      // 2021; PaLM, Chowdhery et al. 2022; Falcon) over a (SeqLen,1,d_model)
+      // tensor. Unlike the SEQUENTIAL pre-norm block above
+      //   (x := x + MHA(Norm(x)); x := x + FFN(Norm(x)))
+      // the parallel formulation computes BOTH sub-layers from the SAME
+      // normalized input and sums the residual once:
+      //   y = x + MHA(Norm(x)) + FFN(Norm(x))
+      // following PaLM, which shares ONE norm for both branches (~15% faster
+      // in large models since the two branches can run concurrently, with
+      // comparable quality). The parallel form is inherently pre-norm, so
+      // there is no PreNorm flag. Wiring mirrors AddTransformerEncoderBlock:
+      // the attention branch is a token-wise QKV slab projection d_model ->
+      // 3*d_model (TNNetPointwiseConvLinear) feeding AddMultiHeadSelfAttention
+      // (which out-projects back to d_model); the FFN branch is the same
+      // token-wise SwiGLU FFN (PointwiseConvLinear(2*d_ff) -> TNNetSwiGLU ->
+      // PointwiseConvLinear(d_model)), attached to the shared norm via
+      // AddLayerAfter; the block ends in a single 3-input
+      // TNNetSum([x, AttnOut, FFNOut]). All projections are token-wise (1x1
+      // convs preserve the sequence axis -- see AddMultiHeadSelfAttention
+      // header), output shape (SeqLen,1,d_model) matches the input, so blocks
+      // stack and are drop-in comparable with AddTransformerEncoderBlock.
+      // d_model is inferred from the input depth. CausalMask/UseRoPE/Variant/
+      // NumSinks are forwarded to AddMultiHeadSelfAttention (same UseRoPE
+      // caveat: pair with a TOKEN-ONLY embedding). NormClass=nil defaults to
+      // TNNetLayerNorm (e.g. TNNetRMSNorm, TNNetDyT also fit). Returns the
+      // TNNetSum output layer of the block.
+      function AddParallelTransformerBlock(Heads, d_ff: integer;
+        CausalMask: boolean = false; UseRoPE: boolean = false;
+        NormClass: TNNetLayerClass = nil;
+        Variant: TNNetAttentionVariant = avSDPA;
+        NumSinks: integer = 1): TNNetLayer;
       // Composite builder: interleaves weightless Token Merging (ToMe) BETWEEN
       // transformer encoder blocks following the paper's per-block schedule.
       // Stacks Blocks encoder blocks; after each of the first Blocks-1 blocks it
@@ -45969,6 +46000,40 @@ begin
   if not PreNorm then AddLayer( NormClass.Create() );
 
   Result := GetLastLayer();
+end;
+
+function TNNet.AddParallelTransformerBlock(Heads, d_ff: integer;
+  CausalMask: boolean = false; UseRoPE: boolean = false;
+  NormClass: TNNetLayerClass = nil;
+  Variant: TNNetAttentionVariant = avSDPA;
+  NumSinks: integer = 1): TNNetLayer;
+var
+  BlockInput, SharedNorm, AttnOut, FFNOut: TNNetLayer;
+  d_model: integer;
+begin
+  if NormClass = nil then NormClass := TNNetLayerNorm;
+  BlockInput := GetLastLayer();
+  d_model := BlockInput.Output.Depth;  // inferred residual-stream width
+  // ONE shared pre-norm feeding BOTH branches (the PaLM formulation):
+  //   y = x + MHA(Norm(x)) + FFN(Norm(x))
+  SharedNorm := AddLayer( NormClass.Create() );
+
+  // ---- Attention branch (chained off SharedNorm). Token-wise QKV slab ----
+  // projection d_model -> 3*d_model (1x1 conv per token), which
+  // AddMultiHeadSelfAttention consumes and out-projects back to d_model.
+  AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
+  AttnOut := AddMultiHeadSelfAttention(Heads, CausalMask, UseRoPE,
+    Variant, NumSinks);
+
+  // ---- FFN branch (attached to the SAME SharedNorm via AddLayerAfter). ----
+  // Token-wise SwiGLU FFN (1x1 convs preserve the sequence axis). TNNetSwiGLU
+  // halves the depth channel-wise, so the inner projection must be 2*d_ff.
+  AddLayerAfter( TNNetPointwiseConvLinear.Create(2 * d_ff), SharedNorm );
+  AddLayer( TNNetSwiGLU.Create() );
+  FFNOut := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
+
+  // ---- Single fused residual: y = x + Attn + FFN (3-input TNNetSum). ----
+  Result := AddLayer( TNNetSum.Create([BlockInput, AttnOut, FFNOut]) );
 end;
 
 function TNNet.AddLinformerAttention(Heads, d_ff, k: integer;

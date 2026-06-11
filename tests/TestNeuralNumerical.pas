@@ -878,6 +878,8 @@ type
     procedure TestMultiHeadLatentAttentionIncrementalDecode;
     procedure TestTransformerEncoderBlockGradientCheck;
     procedure TestTransformerEncoderBlockCustomNorm;
+    procedure TestParallelTransformerBlockShapeAndGradFlow;
+    procedure TestParallelTransformerBlockTrainsAndVariants;
     procedure TestMultiTokenPredictionShapes;
     procedure TestMultiTokenPredictionGradientCheck;
     procedure TestSelfSpeculativeDecodeGreedyExactness;
@@ -14451,6 +14453,165 @@ begin
       'LayerNorm layers', 0, lnCount);
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestParallelTransformerBlockShapeAndGradFlow;
+// AddParallelTransformerBlock (GPT-J / PaLM parallel formulation,
+// y = x + MHA(Norm(x)) + FFN(Norm(x)) with ONE shared norm): (a) output shape
+// must match the (SeqLen,1,d_model) input so blocks stack; (b) forward+backward
+// run without error and the forward output is finite; (c) after ONE backward
+// pass under SetBatchUpdate(True), gradient must reach BOTH parallel branches:
+// the attention QKV projection weights AND both FFN projection weights all
+// accumulate nonzero Neurons[].Delta.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  QKVProj, FFNIn, FFNOut: TNNetLayer;
+  i, SeqLen, d_model, d_ff: integer;
+
+  function SumAbsDelta(L: TNNetLayer): TNeuralFloat;
+  var n: integer;
+  begin
+    Result := 0;
+    for n := 0 to L.Neurons.Count - 1 do
+      Result := Result + L.Neurons[n].Delta.GetSumAbs();
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 5; d_model := 8; d_ff := 16;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model));
+    NN.AddParallelTransformerBlock({Heads=}2, d_ff, {CausalMask=}true);
+    NN.SetLearningRate(0.01, 0.0);
+    NN.SetBatchUpdate(true); // per-sample default zeroes Neurons[].Delta
+
+    // (a) Shape preservation: output (SeqLen,1,d_model) = input.
+    AssertEquals('Parallel block output SizeX', SeqLen,
+      NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Parallel block output SizeY', 1,
+      NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Parallel block output Depth', d_model,
+      NN.GetLastLayer.Output.Depth);
+    AssertTrue('Parallel block ends in the fused 3-input TNNetSum',
+      NN.GetLastLayer is TNNetSum);
+
+    // Locate the branch projections by construction order:
+    // Input(0) -> SharedNorm(1) -> QKV proj(2) -> ...MHA... ->
+    // FFN in-proj(Count-4) -> SwiGLU(Count-3) -> FFN out-proj(Count-2) ->
+    // Sum(Count-1).
+    QKVProj := NN.Layers[2];
+    FFNIn := NN.Layers[NN.CountLayers - 4];
+    FFNOut := NN.Layers[NN.CountLayers - 2];
+    AssertTrue('QKV slab projection layer (attention branch)',
+      (QKVProj is TNNetPointwiseConvLinear) and
+      (QKVProj.Output.Depth = 3 * d_model));
+    AssertTrue('FFN inner projection layer (2*d_ff wide)',
+      (FFNIn is TNNetPointwiseConvLinear) and
+      (FFNIn.Output.Depth = 2 * d_ff));
+    AssertTrue('FFN out projection layer (back to d_model)',
+      (FFNOut is TNNetPointwiseConvLinear) and
+      (FFNOut.Output.Depth = d_model));
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+      Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+    end;
+
+    // (b) Forward+backward smoke; forward must be finite.
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('Parallel block finite forward at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+    NN.Backpropagate(Desired);
+
+    // (c) Gradient must flow into BOTH parallel branches.
+    AssertTrue('Gradient reaches the attention QKV projection',
+      SumAbsDelta(QKVProj) > 0);
+    AssertTrue('Gradient reaches the FFN inner projection',
+      SumAbsDelta(FFNIn) > 0);
+    AssertTrue('Gradient reaches the FFN out projection',
+      SumAbsDelta(FFNOut) > 0);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestParallelTransformerBlockTrainsAndVariants;
+// (d) Training smoke: a few SGD steps on a tiny fixed next-token-style
+// regression (causal parallel block + token-wise linear head; target at each
+// position is the NEXT position's input vector) must reduce the loss.
+// (e) The builder must compose with a non-default attention Variant
+// (avQKNorm) and a non-default NormClass (TNNetRMSNorm) without error and
+// produce a finite forward pass of the right shape.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i, SeqLen, d_model: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 5; d_model := 8;
+
+  // ---- (d) training smoke ----
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model));
+    NN.AddParallelTransformerBlock({Heads=}2, {d_ff=}16, {CausalMask=}true);
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(d_model)); // next-token head
+    NN.SetLearningRate(0.01, 0.0);
+
+    // Toy next-token task: predict at position t the input vector of t+1
+    // (last position predicts zeros).
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.7) * 0.8;
+    Desired.Fill(0);
+    for i := 0 to Input.Size - d_model - 1 do
+      Desired.Raw[i] := Input.Raw[i + d_model];
+
+    NN.Compute(Input);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('Parallel block training reduces next-token loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+
+  // ---- (e) non-default Variant + NormClass compose ----
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model));
+    NN.AddParallelTransformerBlock({Heads=}2, {d_ff=}16, {CausalMask=}true,
+      {UseRoPE=}false, {NormClass=}TNNetRMSNorm, {Variant=}avQKNorm);
+    AssertEquals('Parallel avQKNorm block output SizeX', SeqLen,
+      NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Parallel avQKNorm block output Depth', d_model,
+      NN.GetLastLayer.Output.Depth);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Cos(i * 0.9) * 0.7;
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('Parallel avQKNorm finite forward at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+  finally
+    NN.Free; Input.Free;
   end;
 end;
 
