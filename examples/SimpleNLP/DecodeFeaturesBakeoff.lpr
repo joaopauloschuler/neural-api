@@ -883,6 +883,7 @@ end;
 // no positions -- their state carries order). Each decode step is bucket-
 // timed (BMs/BCnt) to show the O(1)-in-prefix (near-)flatness: the SSM state
 // never grows, and at most ONE MLA block's KV cache grows per token.
+// Plain (uninstrumented) usage of this pattern = GenerateTokensStreamed in neuraldecode.
 procedure TDecodeBakeoff.GreedyStreamCached(var Step: TStepNet;
   var Toks: TTokenBuf; PromptLen, MaxNew: integer; out OutLen: integer;
   out Ms: double; out Fwds: integer; var BMs: TBucketMs; var BCnt: TBucketCnt);
@@ -1028,6 +1029,7 @@ end;
 // (b) KV cache: prefill the prompt token-at-a-time through a width-1 step net
 // (each step's RoPE offset = its absolute position = the running cache
 // length), then decode one token per single-token cached forward.
+// Plain (uninstrumented) usage of this pattern = GenerateTokensStreamed in neuraldecode.
 procedure TDecodeBakeoff.GreedyCached(var Step: TStepNet; var Toks: TTokenBuf;
   PromptLen, MaxNew: integer; out OutLen: integer; out Ms: double;
   out Fwds: integer);
