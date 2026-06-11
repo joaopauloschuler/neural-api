@@ -77,6 +77,37 @@ ceiling 1e-3). The same test unit covers F16/BF16 decoding against
 hand-computed bit patterns, rejection of truncated/garbage safetensors
 files, and the loud failure on missing tensors.
 
+## Real-weight parity vs HuggingFace transformers
+
+The fixture test above proves the import math on a random tiny checkpoint.
+For the **real pretrained weights** there is a manual end-to-end check
+against `transformers.GPT2LMHeadModel` (PyTorch), built from three tools in
+this folder:
+
+* `slice_gpt2.py <src> <dst> [layers] [vocab]` — slices a real checkpoint
+  into a smaller-but-genuine one: keeps the first N transformer blocks and
+  the first V rows of `wte` (a row-major prefix slice), drops the tied
+  `lm_head.weight` and mask buffers. Lets RAM-limited machines load real
+  weights (the importer triples weight memory with `Delta`/`BackInertia`).
+* `GPT2LogitsDump` — imports a checkpoint and prints per-position
+  full-vocab logits as JSON for a given token-id prompt.
+* `compare_hf_logits.py <model.safetensors> <cai_logits.json>` — loads the
+  **same** checkpoint into `GPT2LMHeadModel` (config inferred from tensor
+  shapes, `tie_weights()` mirroring the importer's wte copy) and diffs
+  every logit of every position. Needs `torch`, `transformers`,
+  `safetensors`.
+
+```
+python3 slice_gpt2.py /tmp/gpt2.safetensors /tmp/gpt2_12L.safetensors 12 8192
+GPT2LogitsDump /tmp/gpt2_12L.safetensors 16 0 464 262 976 ... > /tmp/cai.json
+python3 compare_hf_logits.py /tmp/gpt2_12L.safetensors /tmp/cai.json
+```
+
+Measured on the real GPT-2 124M weights (12-token prompt, 8192-vocab
+slices): full-depth 12-layer max |logit diff| = **2.7e-4** with logits
+spanning down to −285 (relative ≈ 1e-6, plain f32 accumulation), 2-layer
+slice **3.2e-5**; the greedy argmax of every position agrees. Gate: 1e-3.
+
 ## Architecture mapping notes
 
 * Per-token LayerNorm uses the new `TNNetTokenLayerNorm` (normalizes each
