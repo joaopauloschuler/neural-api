@@ -103,10 +103,20 @@ GPT2LogitsDump /tmp/gpt2_12L.safetensors 16 0 464 262 976 ... > /tmp/cai.json
 python3 compare_hf_logits.py /tmp/gpt2_12L.safetensors /tmp/cai.json
 ```
 
-Measured on the real GPT-2 124M weights (12-token prompt, 8192-vocab
-slices): full-depth 12-layer max |logit diff| = **2.7e-4** with logits
-spanning down to −285 (relative ≈ 1e-6, plain f32 accumulation), 2-layer
-slice **3.2e-5**; the greedy argmax of every position agrees. Gate: 1e-3.
+Measured on the real GPT-2 124M weights (12-token prompt): the FULL
+unsliced model max |logit diff| = **2.7e-4** over all 603,084 logits with
+logits spanning down to −287 (relative ≈ 1e-6, plain f32 accumulation),
+2-layer/8192-vocab slice **3.2e-5**; the greedy argmax of every position
+agrees, and 16-step greedy generation from "The" is token-for-token
+identical to HF's. Gate: 1e-3.
+
+Both example programs pass `pInferenceOnly=True` to the importer, which
+calls `TNNet.MakeInferenceOnly` while building: every neuron's
+`Delta`/`BackInertia` training volumes are shrunk to one element, cutting
+weight memory to ~1/3. That is what lets the full 124M checkpoint run in
+~2.3 GB peak RSS (it needed >3.8 GB before and OOM'd small machines); the
+returned net can only `Compute()`, never train. Slicing remains useful for
+fast iteration (82 MB / ~6 s vs 523 MB / ~16 s).
 
 ## Architecture mapping notes
 

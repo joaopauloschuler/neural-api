@@ -151,6 +151,14 @@ type
       function SaveToString(): string;
       procedure LoadFromString(strData: string);
       procedure ClearDelta; {$IFDEF Release} inline; {$ENDIF}
+      // Frees the training-only volumes (Delta/BackInertia and their Adam
+      // siblings) by shrinking them to a single element, reclaiming ~2/3 of
+      // the neuron's memory. INFERENCE-ONLY CONTRACT: after this call only
+      // Compute() is valid - Backpropagate/UpdateWeights would read and
+      // write out-of-range training buffers. The weight initializers and
+      // InitAdam do NOT restore the buffers; to train again, rebuild or
+      // reload the network.
+      procedure MakeInferenceOnly(); // Coded by Claude (AI).
 
       // Initializers
 
@@ -408,6 +416,9 @@ type
       function InitSELU(Value: TNeuralFloat = 1): TNNetLayer;
       // Memory Initializer for Adam optimizer
       function InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
+      // Frees every neuron's training-only volumes (see
+      // TNNetNeuron.MakeInferenceOnly). Forward-only contract afterwards.
+      function MakeInferenceOnly(): TNNetLayer; // Coded by Claude (AI).
 
       procedure InitDefault(); virtual;
 
@@ -11985,6 +11996,13 @@ type
       procedure CalcAdamDelta();
       procedure UpdateWeightsAdam(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
+      // Frees the training-only volumes (Delta/BackInertia + Adam siblings)
+      // of every neuron in every layer, reclaiming ~2/3 of weight memory.
+      // INFERENCE-ONLY CONTRACT: only Compute() is valid afterwards; to
+      // train again, rebuild or reload the network. Idempotent - safe to
+      // call repeatedly while a network is still being built (used by the
+      // GPT-2 importer to bound peak memory during construction).
+      procedure MakeInferenceOnly(); // Coded by Claude (AI).
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2Decay(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2DecayToConvolutionalLayers(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -85151,6 +85169,16 @@ begin
   end;
 end;
 
+procedure TNNet.MakeInferenceOnly();
+var
+  LayerCnt: integer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    FLayers[LayerCnt].MakeInferenceOnly();
+  end;
+end;
+
 procedure TNNet.ResetBackpropCallCurrCnt();
 var
   LayerCnt: integer;
@@ -86534,6 +86562,17 @@ begin
   Result := Self;
 end;
 
+function TNNetLayer.MakeInferenceOnly(): TNNetLayer;
+var
+  Cnt: integer;
+begin
+  for Cnt := 0 to FNeurons.Count - 1 do
+  begin
+    FNeurons[Cnt].MakeInferenceOnly();
+  end;
+  Result := Self;
+end;
+
 procedure TNNetLayer.InitDefault();
 begin
   InitGlorotBengioUniform();
@@ -87879,6 +87918,23 @@ begin
   FDelta.Fill(0);
   // So far, there is no need to ClearDelta2.
   FBiasDelta := 0;
+end;
+
+procedure TNNetNeuron.MakeInferenceOnly();
+begin
+  // (1,1,1) matches the constructor's pre-SetNumWeights state; SetLength
+  // inside ReSize genuinely shrinks the heap allocation.
+  FDelta.ReSize(1, 1, 1);
+  FDelta2.ReSize(1, 1, 1);
+  FBackInertia.ReSize(1, 1, 1);
+  FBackInertia2.ReSize(1, 1, 1);
+  FDelta.Fill(0);
+  FDelta2.Fill(0);
+  FBackInertia.Fill(0);
+  FBackInertia2.Fill(0);
+  FBiasDelta := 0;
+  FBiasInertia := 0;
+  FBiasInertia2 := 0;
 end;
 
 constructor TEasyBytePredictionViaNNet.Create(pActionByteLen,

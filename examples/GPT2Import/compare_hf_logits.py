@@ -35,6 +35,11 @@ def main():
     # carry "transformer.". Normalize to unprefixed GPT2Model keys.
     state = {(k[len('transformer.'):] if k.startswith('transformer.') else k): v
              for k, v in state.items() if k != 'lm_head.weight'}
+    # The original openai-community file serializes the causal-mask buffers;
+    # modern transformers keeps them non-persistent, so drop them (the Pascal
+    # importer ignores them too - the mask is structural on both sides).
+    state = {k: v for k, v in state.items()
+             if '.attn.bias' not in k and '.attn.masked_bias' not in k}
 
     vocab, n_embd = state['wte.weight'].shape
     n_ctx = state['wpe.weight'].shape[0]

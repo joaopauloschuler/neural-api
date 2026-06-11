@@ -61,7 +61,9 @@ begin
   for ParamCnt := 4 to ParamCount do
     Prompt[ParamCnt - 4] := StrToIntDef(ParamStr(ParamCnt), -1);
 
-  NN := BuildGPT2FromSafeTensorsEx(ParamStr(1), Config, SeqLen, NumHeads);
+  // Dump-only tool: free training volumes during construction (~1/3 memory).
+  NN := BuildGPT2FromSafeTensorsEx(ParamStr(1), Config, SeqLen, NumHeads,
+    {pInferenceOnly=}true);
   try
     if SeqLen <= 0 then SeqLen := Config.NCtx;
     if Length(Prompt) > SeqLen then

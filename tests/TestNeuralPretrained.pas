@@ -37,6 +37,7 @@ type
     procedure TestImporterFailsOnMissingTensor;
     procedure TestGPT2ConfigFromFixture;
     procedure TestGPT2LogitParity;
+    procedure TestMakeInferenceOnlyKeepsOutputs;
   end;
 
 implementation
@@ -487,6 +488,55 @@ begin
     Input.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// MakeInferenceOnly shrinks every neuron's Delta/BackInertia training
+// volumes; the forward pass must be bit-for-bit unaffected, whether the
+// shrink happens during construction (pInferenceOnly=True) or on an
+// already-built net (TNNet.MakeInferenceOnly).
+procedure TTestNeuralPretrained.TestMakeInferenceOnlyKeepsOutputs;
+var
+  NNTrain, NNInfer: TNNet;
+  Config: TGPT2Config;
+  Input, OutTrain, OutInfer: TNNetVolume;
+  i: integer;
+begin
+  NNTrain := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
+    Config, {SeqLen=}0, {NumHeads=}2);
+  NNInfer := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
+    Config, {SeqLen=}0, {NumHeads=}2, {pInferenceOnly=}true);
+  Input := TNNetVolume.Create(Config.NCtx, 1, 1);
+  OutTrain := TNNetVolume.Create;
+  OutInfer := TNNetVolume.Create;
+  try
+    for i := 0 to Config.NCtx - 1 do
+      Input.FData[i] := (i * 3 + 1) mod Config.VocabSize;
+    NNTrain.Compute(Input);
+    NNTrain.GetOutput(OutTrain);
+    NNInfer.Compute(Input);
+    NNInfer.GetOutput(OutInfer);
+    AssertEquals('output size', OutTrain.Size, OutInfer.Size);
+    for i := 0 to OutTrain.Size - 1 do
+      AssertEquals('pInferenceOnly logit ' + IntToStr(i),
+        OutTrain.FData[i], OutInfer.FData[i], 0);
+    // Shrinking a finished net must not change its outputs either.
+    NNTrain.MakeInferenceOnly();
+    NNTrain.Compute(Input);
+    NNTrain.GetOutput(OutInfer);
+    for i := 0 to OutTrain.Size - 1 do
+      AssertEquals('post-build MakeInferenceOnly logit ' + IntToStr(i),
+        OutTrain.FData[i], OutInfer.FData[i], 0);
+    AssertEquals('delta volume shrunk', 1,
+      NNTrain.Layers[1].Neurons[0].Delta.Size);
+    AssertEquals('inertia volume shrunk', 1,
+      NNTrain.Layers[1].Neurons[0].BackInertia.Size);
+  finally
+    OutInfer.Free;
+    OutTrain.Free;
+    Input.Free;
+    NNInfer.Free;
+    NNTrain.Free;
   end;
 end;
 

@@ -77,13 +77,18 @@ function GPT2ConfigToString(const Config: TGPT2Config): string;
 // volume of token ids (as floats) and outputs (SeqLen,1,vocab) logits, one
 // row per input position. pSeqLen = 0 uses the full n_ctx context;
 // pNumHeads = 0 applies the n_embd/64 rule (see ReadGPT2Config).
+// pInferenceOnly = True frees every layer's Delta/BackInertia training
+// volumes DURING construction (TNNet.MakeInferenceOnly after each block),
+// cutting peak and resident memory to ~1/3 - the returned net can only
+// Compute(), never train. The full 124M GPT-2 then fits in well under 2 GB.
 function BuildGPT2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pNumHeads: integer = 0): TNNet;
+  pSeqLen: integer = 0; pNumHeads: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
 
 // Same, also returning the inferred config.
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
-  pNumHeads: integer = 0): TNNet;
+  pNumHeads: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
 implementation
 
@@ -241,7 +246,7 @@ end;
 
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
-  pNumHeads: integer = 0): TNNet;
+  pNumHeads: integer = 0; pInferenceOnly: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -280,6 +285,12 @@ begin
         Config.VocabSize, Config.NEmbd, {EncodeZero=}1) );
       PosLayer := NN.AddLayer(
         TNNetLearnedPositionalEmbedding.Create(Config.NCtx) );
+      // pInferenceOnly: shrink training volumes as soon as each chunk of
+      // layers exists - peak memory then carries the training volumes of at
+      // most one block (plus the LM head's, briefly) instead of the whole
+      // net's. MakeInferenceOnly is idempotent, so re-sweeping all layers
+      // each time is cheap and keeps this code simple.
+      if pInferenceOnly then NN.MakeInferenceOnly();
       SetLength(Blocks, Config.NLayers);
       for BlockCnt := 0 to Config.NLayers - 1 do
       begin
@@ -303,6 +314,7 @@ begin
         Blocks[BlockCnt].MlpProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.NEmbd) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
       end;
       FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5) );
       // LM head tied to wte: logits = h . wte^T. Implemented as an untied
@@ -310,6 +322,7 @@ begin
       // unit header). Bias-free in GPT-2: biases stay 0.
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -415,12 +428,13 @@ begin
 end;
 
 function BuildGPT2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pNumHeads: integer = 0): TNNet;
+  pSeqLen: integer = 0; pNumHeads: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
 var
   IgnoredConfig: TGPT2Config;
 begin
   Result := BuildGPT2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pNumHeads);
+    pNumHeads, pInferenceOnly);
 end;
 
 end.

@@ -88,7 +88,10 @@ begin
   end;
 
   WriteLn('Loading ', FileName, ' ...');
-  NN := BuildGPT2FromSafeTensorsEx(FileName, Config, SeqLen, NumHeads);
+  // This program only generates (never trains), so free the training
+  // volumes during construction: ~1/3 the memory, full GPT-2 fits in RAM.
+  NN := BuildGPT2FromSafeTensorsEx(FileName, Config, SeqLen, NumHeads,
+    {pInferenceOnly=}true);
   try
     WriteLn(GPT2ConfigToString(Config));
     if SeqLen <= 0 then SeqLen := Config.NCtx;
