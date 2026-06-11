@@ -798,6 +798,10 @@ type
     procedure TestCosineSimilarityAttentionLearnableScaleSerializationRoundTrip;
     procedure TestQKNormAttentionGradientCheck;
     procedure TestQKNormAttentionSerializationRoundTrip;
+    procedure TestT5RelPosBucketingMatchesReference;
+    procedure TestT5RelPosBiasAttentionGradientCheck;
+    procedure TestT5RelPosBiasAttentionZeroBiasMatchesSDPA;
+    procedure TestT5RelPosBiasAttentionSerializationRoundTrip;
     procedure TestSinkAttentionGradientCheck;
     procedure TestSinkAttentionSinkParamGradientCheck;
     procedure TestSinkAttentionSerializationRoundTrip;
@@ -858,6 +862,7 @@ type
     procedure TestMultiHeadSelfAttentionSinkGradientCheck;
     procedure TestMultiHeadSelfAttentionCosineSimilarityShapes;
     procedure TestMultiHeadSelfAttentionQKNormShapes;
+    procedure TestMultiHeadSelfAttentionT5RelPosBiasShapes;
     procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestCrossAttentionLoadFromString;
     procedure TestAffineGridSampleIdentity;
@@ -17599,6 +17604,355 @@ begin
     NN.Free;
     if Assigned(NN2) then NN2.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestT5RelPosBucketingMatchesReference;
+// Exercises TNNetT5RelPosBiasAttention.RelativePositionBucket against
+// hand-computed values from the T5 reference relative_position_bucket
+// (relative_position = j - i). Covers the exact region, the logarithmic
+// region and the far-distance cap, in BOTH the causal (unidirectional) and
+// bidirectional schemes, plus a small NumBuckets=8/MaxDistance=16 table and
+// the shift invariance bucket(i,j) = bucket(i+s, j+s).
+var
+  i, j, s: integer;
+
+  function Bucket(RelPos: integer; Bidir: boolean; NB, MD: integer): integer;
+  begin
+    Result := TNNetT5RelPosBiasAttention.RelativePositionBucket(
+      RelPos, Bidir, NB, MD);
+  end;
+
+begin
+  RandSeed := 424242;
+  // ---- Causal (bidirectional=False), NumBuckets=32, MaxDistance=128 ----
+  // Future/diagonal pairs clamp to distance 0.
+  AssertEquals('causal relpos 0', 0, Bucket(0, false, 32, 128));
+  AssertEquals('causal relpos +5 (future clamps)', 0, Bucket(5, false, 32, 128));
+  // Exact region: n = i - j < 16 maps to bucket n.
+  AssertEquals('causal relpos -1', 1, Bucket(-1, false, 32, 128));
+  AssertEquals('causal relpos -7', 7, Bucket(-7, false, 32, 128));
+  AssertEquals('causal relpos -15 (last exact)', 15, Bucket(-15, false, 32, 128));
+  // Log region: bucket = 16 + floor(ln(n/16)/ln(128/16)*16).
+  AssertEquals('causal relpos -16 (first log)', 16, Bucket(-16, false, 32, 128));
+  AssertEquals('causal relpos -17', 16, Bucket(-17, false, 32, 128));
+  AssertEquals('causal relpos -24', 19, Bucket(-24, false, 32, 128));
+  AssertEquals('causal relpos -32', 21, Bucket(-32, false, 32, 128));
+  AssertEquals('causal relpos -64', 26, Bucket(-64, false, 32, 128));
+  AssertEquals('causal relpos -127', 31, Bucket(-127, false, 32, 128));
+  // Cap: n >= MaxDistance saturates at NumBuckets-1.
+  AssertEquals('causal relpos -128 (cap)', 31, Bucket(-128, false, 32, 128));
+  AssertEquals('causal relpos -10000 (cap)', 31, Bucket(-10000, false, 32, 128));
+  // ---- Bidirectional, NumBuckets=32, MaxDistance=128 ----
+  // Buckets [0..15] for j <= i, [16..31] for j > i; max_exact = 8 per half.
+  AssertEquals('bidir relpos 0', 0, Bucket(0, true, 32, 128));
+  AssertEquals('bidir relpos -1', 1, Bucket(-1, true, 32, 128));
+  AssertEquals('bidir relpos +1', 17, Bucket(1, true, 32, 128));
+  AssertEquals('bidir relpos -7 (last exact)', 7, Bucket(-7, true, 32, 128));
+  AssertEquals('bidir relpos +7 (last exact)', 23, Bucket(7, true, 32, 128));
+  AssertEquals('bidir relpos -8 (first log)', 8, Bucket(-8, true, 32, 128));
+  AssertEquals('bidir relpos +8 (first log)', 24, Bucket(8, true, 32, 128));
+  // 8 + floor(ln(17/8)/ln(128/8)*8) = 8 + floor(2.1749) = 10.
+  AssertEquals('bidir relpos -17', 10, Bucket(-17, true, 32, 128));
+  AssertEquals('bidir relpos +17', 26, Bucket(17, true, 32, 128));
+  // 8 + floor(ln(63/8)/ln(16)*8) = 8 + floor(5.9545) = 13.
+  AssertEquals('bidir relpos -63', 13, Bucket(-63, true, 32, 128));
+  AssertEquals('bidir relpos +63', 29, Bucket(63, true, 32, 128));
+  AssertEquals('bidir relpos -127', 15, Bucket(-127, true, 32, 128));
+  AssertEquals('bidir relpos +127', 31, Bucket(127, true, 32, 128));
+  AssertEquals('bidir relpos -128 (cap)', 15, Bucket(-128, true, 32, 128));
+  AssertEquals('bidir relpos +500 (cap)', 31, Bucket(500, true, 32, 128));
+  // ---- Small causal table: NumBuckets=8, MaxDistance=16 (max_exact=4) ----
+  AssertEquals('small causal -3 (exact)', 3, Bucket(-3, false, 8, 16));
+  AssertEquals('small causal -4 (first log)', 4, Bucket(-4, false, 8, 16));
+  AssertEquals('small causal -5', 4, Bucket(-5, false, 8, 16));
+  // 4 + floor(ln(7/4)/ln(4)*4) = 4 + floor(1.6147) = 5.
+  AssertEquals('small causal -7', 5, Bucket(-7, false, 8, 16));
+  // 4 + floor(ln(15/4)/ln(4)*4) = 4 + floor(3.8138) = 7.
+  AssertEquals('small causal -15', 7, Bucket(-15, false, 8, 16));
+  AssertEquals('small causal -16 (cap)', 7, Bucket(-16, false, 8, 16));
+  AssertEquals('small causal -100 (cap)', 7, Bucket(-100, false, 8, 16));
+  // ---- Translation invariance: the bucket of pair (i,j) depends only on
+  // j - i, so it equals the bucket of the shifted pair (i+s, j+s). ----
+  for i := 0 to 5 do
+    for j := 0 to 5 do
+      for s := 1 to 3 do
+      begin
+        AssertEquals('causal shift invariance',
+          Bucket(j - i, false, 32, 128),
+          Bucket((j + s) - (i + s), false, 32, 128));
+        AssertEquals('bidir shift invariance',
+          Bucket(j - i, true, 32, 128),
+          Bucket((j + s) - (i + s), true, 32, 128));
+      end;
+end;
+
+procedure TTestNeuralNumerical.TestT5RelPosBiasAttentionGradientCheck;
+// Central-difference check of BOTH the bias-table gradient and the input
+// gradient of a causal TNNetT5RelPosBiasAttention (d_k=4, SeqLen=5,
+// NumBuckets=8, MaxDistance=16). With learning rate 1 and batch update the
+// analytical gradient is -Neurons[0].Delta (Delta accumulates -lr*grad),
+// matching the sign convention of the sibling attention weight-grad tests.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetT5RelPosBiasAttention;
+  SeqLen, Dk, NB: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, w: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var idx: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for idx := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[idx] - Desired.Raw[idx];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 5;
+  Dk := 4;
+  NB := 8;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetT5RelPosBiasAttention.Create(Dk, true, NB, 16);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    AssertEquals('T5 bias table has NumBuckets weights',
+      NB, Attn.Neurons[0].Weights.Size);
+
+    // Deterministic NON-zero bias table so the bias genuinely shapes the
+    // softmax (a zero table would test a degenerate path).
+    for w := 0 to NB - 1 do
+      Attn.Neurons[0].Weights.Raw[w] := Sin((w + 1) * 0.61) * 0.4;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    // ---- Bias-table gradient (every bucket; far buckets unused by this
+    // SeqLen legitimately get zero gradient on both sides). ----
+    for w := 0 to NB - 1 do
+    begin
+      Attn.Neurons[0].Weights.Raw[w] := Attn.Neurons[0].Weights.Raw[w] + epsilon;
+      lossPlus := ComputeLoss;
+      Attn.Neurons[0].Weights.Raw[w] := Attn.Neurons[0].Weights.Raw[w] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      Attn.Neurons[0].Weights.Raw[w] := Attn.Neurons[0].Weights.Raw[w] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      Attn.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -Attn.Neurons[0].Delta.Raw[w];
+
+      AssertTrue('T5 bias gradient bucket[' + IntToStr(w) +
+        '] num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Input gradient ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('T5 input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestT5RelPosBiasAttentionZeroBiasMatchesSDPA;
+// Strong equivalence anchor: with the (default, zero-initialised) bias table
+// the layer must reproduce a plain TNNetScaledDotProductAttention EXACTLY
+// (same causal mask AND same sliding window) -- both layers are otherwise
+// parameter-free, so the same Q|K|V input must give bit-identical outputs.
+var
+  NNBias, NNPlain: TNNet;
+  Input: TNNetVolume;
+  Attn: TNNetT5RelPosBiasAttention;
+  SeqLen, Dk, i, w: integer;
+begin
+  RandSeed := 424242;
+  SeqLen := 6;
+  Dk := 4;
+  NNBias := TNNet.Create();
+  NNPlain := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  try
+    NNBias.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetT5RelPosBiasAttention.Create(Dk, true, 32, 128, {Window=}3);
+    NNBias.AddLayer(Attn);
+    NNPlain.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    NNPlain.AddLayer(TNNetScaledDotProductAttention.Create(Dk, true, {Window=}3));
+
+    // The bias table must START at zero (untrained layer == plain SDPA).
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+      AssertEquals('T5 bias table zero-initialised at ' + IntToStr(w),
+        0.0, Attn.Neurons[0].Weights.Raw[w]);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.9 - 0.15;
+    NNBias.Compute(Input);
+    NNPlain.Compute(Input);
+    for i := 0 to NNPlain.GetLastLayer.Output.Size - 1 do
+      AssertEquals('zero-bias T5 == plain SDPA at ' + IntToStr(i),
+        NNPlain.GetLastLayer.Output.Raw[i],
+        NNBias.GetLastLayer.Output.Raw[i]);
+  finally
+    NNBias.Free;
+    NNPlain.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestT5RelPosBiasAttentionSerializationRoundTrip;
+// SaveToString/LoadFromString must reconstruct a TNNetT5RelPosBiasAttention
+// (the class is registered in BOTH dispatch tables) with NON-default
+// hyperparams (NumBuckets=8, MaxDistance=20, causal, Window=2), round-trip
+// the TRAINED bias table and reproduce Compute exactly. Also checks
+// save->load->save string equality.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn, Attn2: TNNetT5RelPosBiasAttention;
+  S, S2: string;
+  i, w: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := nil;
+  Input := TNNetVolume.Create(5, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 12, 1));
+    Attn := TNNetT5RelPosBiasAttention.Create(4, true, 8, 20, 2);
+    NN.AddLayer(Attn);
+    // Simulate a trained bias table so the round-trip has to carry it.
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+      Attn.Neurons[0].Weights.Raw[w] := Sin((w + 1) * 0.43) * 0.7;
+
+    S := NN.SaveToString();
+    NN2 := TNNet.Create();
+    NN2.LoadFromString(S);
+
+    AssertTrue('Loaded layer is TNNetT5RelPosBiasAttention',
+      NN2.Layers[1] is TNNetT5RelPosBiasAttention);
+    Attn2 := NN2.Layers[1] as TNNetT5RelPosBiasAttention;
+    AssertEquals('T5 NumBuckets round-trips', 8, Attn2.NumBuckets);
+    AssertEquals('T5 MaxDistance round-trips', 20, Attn2.MaxDistance);
+    AssertTrue('T5 causal flag round-trips', Attn2.CausalMask);
+    AssertEquals('T5 window round-trips', 2, Attn2.Window);
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+      AssertEquals('T5 trained bias round-trips at ' + IntToStr(w),
+        Attn.Neurons[0].Weights.Raw[w], Attn2.Neurons[0].Weights.Raw[w], 1e-5);
+
+    // Compute must match after the round-trip.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.29) * 0.8 - 0.1;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('T5 save/load Compute match at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+
+    S2 := NN2.SaveToString();
+    AssertEquals('T5 save->load->save string equality', S, S2);
+  finally
+    NN.Free;
+    if Assigned(NN2) then NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionT5RelPosBiasShapes;
+// AddMultiHeadSelfAttention with Variant=avT5RelPosBias swaps each head's
+// plain SDPA for a TNNetT5RelPosBiasAttention with its OWN bias table
+// (per-head bias, exactly like T5). Asserts output shape preserved, Heads
+// per-head layers built with the requested bucketing hyperparams, and a
+// finite forward AND backward pass.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  d_model, Heads, SeqLen, i, headCnt: integer;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}true, false,
+      avT5RelPosBias, {NumSinks=}1, {Window=}0,
+      {RelPosNumBuckets=}8, {RelPosMaxDistance=}16);
+    NN.SetLearningRate(0.01, 0.0);
+    NN.SetBatchUpdate(true);
+
+    AssertEquals('MHSA-T5 out SizeX', SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MHSA-T5 out SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('MHSA-T5 out Depth', d_model, NN.GetLastLayer.Output.Depth);
+
+    headCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetT5RelPosBiasAttention then
+      begin
+        Inc(headCnt);
+        AssertEquals('MHSA-T5 head NumBuckets',
+          8, TNNetT5RelPosBiasAttention(NN.Layers[i]).NumBuckets);
+        AssertEquals('MHSA-T5 head MaxDistance',
+          16, TNNetT5RelPosBiasAttention(NN.Layers[i]).MaxDistance);
+        AssertEquals('MHSA-T5 head bias table size', 8,
+          TNNetT5RelPosBiasAttention(NN.Layers[i]).Neurons[0].Weights.Size);
+      end;
+    AssertEquals('MHSA-T5 has Heads per-head bias layers', Heads, headCnt);
+
+    // Finite forward and backward.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('MHSA-T5 finite forward at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+    NN.Backpropagate(Desired);
+    for i := 0 to NN.Layers[0].OutputError.Size - 1 do
+      AssertTrue('MHSA-T5 finite input gradient at ' + IntToStr(i),
+        not IsNan(NN.Layers[0].OutputError.Raw[i]) and
+        not IsInfinite(NN.Layers[0].OutputError.Raw[i]));
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 

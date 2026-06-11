@@ -1,13 +1,13 @@
 # PositionEncodingBakeoff
 
-Train the **same** tiny attention-based next-token model **four times**,
+Train the **same** tiny attention-based next-token model **five times**,
 differing only in the position-encoding scheme, and print a side-by-side
 comparison. One `BuildNet(scheme)` helper assembles an identical
 embedding -> attention -> head stack and switches only the position
-component, so the four runs (same seed, epochs, learning rate and data)
+component, so the five runs (same seed, epochs, learning rate and data)
 are apples-to-apples.
 
-The four schemes:
+The five schemes:
 
 - **(a) NONE** - attention only, no positional layer at all.
 - **(b) SINUSOIDAL** - fixed sin/cos additive position embedding
@@ -16,6 +16,11 @@ The four schemes:
   applied to the embedded sequence before the Q/K/V projection.
 - **(d) ALiBi** - attention with linear biases (`TNNetALiBi`): a
   per-distance bias added to the raw attention scores.
+- **(e) T5 REL-POS** - T5 bucketed relative position bias
+  (`TNNetT5RelPosBiasAttention`): a **learnable** scalar `b[bucket(j-i)]`
+  added to the pre-softmax scores. This arm swaps the hand-rolled
+  attention block for the equivalent in-tree layer (same SDPA core,
+  verified to match, plus the trained bias table).
 
 ## The task (position matters)
 
@@ -27,7 +32,7 @@ tell which key is "the previous one" and must fail. This makes the
 no-position arm the clear loser - the teaching point of the bake-off.
 
 Vocabulary 8, sequence length 12, embedding dim 32 (even, as RoPE
-requires). Tiny enough that all four runs finish in well under half a
+requires). Tiny enough that all five runs finish in well under half a
 minute on a single CPU thread, with no external dataset.
 
 ## The shared stack
@@ -64,7 +69,7 @@ lazbuild PositionEncodingBakeoff.lpi --build-mode=Default
 ../../bin/x86_64-linux/bin/PositionEncodingBakeoff
 ```
 
-Pure CPU, all four arms combined finish in ~12-16 seconds.
+Pure CPU, all five arms combined finish in ~20-30 seconds.
 
 ## Expected output sketch (actual numbers from a run)
 
@@ -74,6 +79,7 @@ COMPARISON TABLE (final training cross-entropy, lower is better):
   SINUSOIDAL (sin/cos add)    final-CE=0.00026   sample-acc=12/12
   RoPE (rotary)               final-CE=0.00018   sample-acc=12/12
   ALiBi (score bias)          final-CE=1.69751   sample-acc=5/12
+  T5 REL-POS (learned bias)   final-CE=0.30360   sample-acc=11/12
 
 SAMPLE PREDICTIONS (same probe sequence for every scheme):
   [SINUSOIDAL (sin/cos add)]
@@ -104,3 +110,11 @@ SAMPLE PREDICTIONS (same probe sequence for every scheme):
   bias for "attend to nearby tokens", the wrong one for "fetch exactly
   the token one step back". This is itself the instructive result of the
   bake-off.
+- **T5 REL-POS nearly wins (11/12)** despite ALSO being a score-only
+  bias: because its per-distance bias is *learned*, the head simply puts
+  a large bias on the distance-1 bucket and concentrates the softmax on
+  the previous token. Only the special position-0 begin token stays out
+  of reach (score-bias schemes put no positional content into the
+  *values*, so position 0 cannot signal "I am first"), which is exactly
+  the residual CE the table shows. Learned relative bias = precise
+  offset addressing; fixed slope = recency prior only.

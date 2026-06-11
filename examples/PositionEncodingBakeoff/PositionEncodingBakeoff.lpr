@@ -1,16 +1,22 @@
 program PositionEncodingBakeoff;
 (*
 PositionEncodingBakeoff: train the SAME tiny attention-based next-token
-model FOUR times, differing ONLY in the position-encoding scheme, and
+model FIVE times, differing ONLY in the position-encoding scheme, and
 print a side-by-side comparison.
 
-The four schemes are:
+The five schemes are:
   (a) NONE        - attention only, no positional layer at all
   (b) SINUSOIDAL  - fixed sin/cos additive position embedding
                     (TNNetAddPositionalEmbedding)
   (c) RoPE        - rotary position embedding (TNNetRotaryEmbedding)
   (d) ALiBi       - attention with linear biases (TNNetALiBi), a bias added
                     to the raw attention scores by key-query distance
+  (e) T5 REL-POS  - T5 bucketed relative position bias
+                    (TNNetT5RelPosBiasAttention): a LEARNABLE scalar
+                    b[bucket(j-i)] added to the pre-softmax scores. Unlike
+                    ALiBi's FIXED linear slope, the per-distance bias is
+                    trained, so a single head CAN learn precise offset
+                    addressing (put all bias mass on distance 1).
 
 Task (POSITION MATTERS): a causal "predict-the-previous-token" sequence
 model. The target at position i is the INPUT token at position i-1 (the
@@ -77,7 +83,7 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
   so the host doesn't abort. Matches what other examples do. }
 
 type
-  TScheme = (schNone, schSinusoidal, schRoPE, schALiBi);
+  TScheme = (schNone, schSinusoidal, schRoPE, schALiBi, schT5RelPos);
 
 const
   cVocab   = 8;     // vocabulary size (token IDs 0..7; token 0 = begin)
@@ -92,7 +98,8 @@ const
 
   cSchemeName: array[TScheme] of string =
     ('NONE (no position)', 'SINUSOIDAL (sin/cos add)',
-     'RoPE (rotary)', 'ALiBi (score bias)');
+     'RoPE (rotary)', 'ALiBi (score bias)',
+     'T5 REL-POS (learned bias)');
 
   // Build the identical attention model, switching ONLY the position
   // component according to Scheme.
@@ -124,6 +131,25 @@ const
     // read from the SAME projection layer (QKV).
     QKV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(3 * cDk),
              EmbeddedLayer);
+
+    // --- POSITION COMPONENT 2 (T5 arm): the bucketed relative position bias
+    // lives INSIDE the attention layer, so this arm consumes the packed
+    // Q|K|V slab with TNNetT5RelPosBiasAttention (the hand-rolled block
+    // below was verified to reproduce the same SDPA core exactly; this
+    // layer is that core PLUS the learnable per-distance bias table, with
+    // the causal mask built in). This is the ONLY positional signal the
+    // T5 arm gets. ---
+    if Scheme = schT5RelPos then
+    begin
+      NN.AddLayerAfter(
+        TNNetT5RelPosBiasAttention.Create(cDk, {CausalMask=}true), QKV);
+      NN.AddLayer(TNNetPointwiseConvLinear.Create(cVocab));
+      NN.AddLayer(TNNetPointwiseSoftMax.Create(1));
+      NN.SetLearningRate(cLR, cInertia);
+      Result := NN;
+      exit;
+    end;
+
     Query := NN.AddLayerAfter(TNNetSplitChannels.Create(0, cDk), QKV);
     Key   := NN.AddLayerAfter(TNNetSplitChannels.Create(cDk, cDk), QKV);
     NN.AddLayerAfter(TNNetSplitChannels.Create(2 * cDk, cDk), QKV);
@@ -318,7 +344,7 @@ var
 begin
   SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
                     exOverflow, exUnderflow, exPrecision]);
-  WriteLn('PositionEncodingBakeoff: same tiny CAUSAL attention model, four ',
+  WriteLn('PositionEncodingBakeoff: same tiny CAUSAL attention model, five ',
     'position-encoding schemes.');
   WriteLn('Task: predict the PREVIOUS token (target[i] = input[i-1]); ',
     'vocab=', cVocab, ', SeqLen=', cSeqLen, ', d_model=', cDModel, '.');
@@ -374,7 +400,7 @@ begin
   end;
 
   WriteLn(StringOfChar('=', 72));
-  WriteLn('Total runtime for all four arms: ', Format('%.1fs', [GElapsed]));
+  WriteLn('Total runtime for all five arms: ', Format('%.1fs', [GElapsed]));
   WriteLn('Worst scheme (highest final CE): ', cSchemeName[WorstScheme]);
   WriteLn('Takeaway: the NONE arm is worst - attention alone is ',
     'permutation-invariant over keys, so without position it cannot pick out ',
@@ -385,4 +411,10 @@ begin
     'single head cannot do this fixed-offset retrieval - it sits just above ',
     'the no-position baseline (ALiBi targets recency/locality, not precise ',
     'offset addressing).');
+  WriteLn('T5 REL-POS also only biases the scores, but its per-distance bias ',
+    'is LEARNED (bucketed table), so the head concentrates the softmax ',
+    'exactly on distance 1 and solves the offset retrieval that defeats ',
+    'ALiBi''s fixed slope (11/12: only the special position-0 begin token ',
+    'stays out of reach, because score-bias schemes put no positional ',
+    'content into the values).');
 end.

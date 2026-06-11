@@ -52,6 +52,7 @@ type
     // KV-cache incremental decode on TNNetScaledDotProductAttention.
     procedure TestKVCacheIncrementalMatchesFullForward;
     procedure TestKVCacheSlidingWindowMatchesFullForward;
+    procedure TestKVCacheT5RelPosBiasMatchesFullForward;
     procedure TestKVCachePrefillThenStepMatchesFullForward;
     procedure TestKVCacheResetStartsFreshSequence;
     procedure TestKVCacheTruncateThenReappendMatchesFresh;
@@ -290,6 +291,77 @@ begin
           FullOut[T, 0, D], StepOut[0, 0, D], 1e-5);
     end;
     SDPAStep.EndIncrementalDecode();
+  finally
+    StepOut.Free;
+    FullOut.Free;
+    StepIn.Free;
+    FullIn.Free;
+    NNStep.Free;
+    NNFull.Free;
+  end;
+end;
+
+// TNNetT5RelPosBiasAttention supports the KV-cache incremental decode path:
+// the relative position bias depends only on j - i, so adding b[bucket(j-t)]
+// at the current absolute position t over the cached keys must reproduce the
+// full causal forward token-exactly. Uses a NON-zero trained bias table, a
+// sliding window AND a small NumBuckets/MaxDistance so the exact, log and
+// cap bucket regions all participate.
+procedure TTestNeuralDecode.TestKVCacheT5RelPosBiasMatchesFullForward;
+const
+  SeqLen = 9;
+  Dk = 5;
+  Window = 4;
+  NumBuckets = 8;
+  MaxDistance = 6;
+var
+  NNFull, NNStep: TNNet;
+  AttnFull, AttnStep: TNNetT5RelPosBiasAttention;
+  FullIn, StepIn, FullOut, StepOut: TNNetVolume;
+  T, D, W: integer;
+begin
+  RandSeed := 424242;
+  NNFull := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  StepIn := TNNetVolume.Create(1, 1, 3 * Dk);
+  FullOut := TNNetVolume.Create();
+  StepOut := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+    AttnFull := TNNetT5RelPosBiasAttention.Create(Dk, {CausalMask=}true,
+      NumBuckets, MaxDistance, Window);
+    NNFull.AddLayer(AttnFull);
+    NNStep.AddLayer(TNNetInput.Create(1, 1, 3 * Dk));
+    AttnStep := TNNetT5RelPosBiasAttention.Create(Dk, {CausalMask=}true,
+      NumBuckets, MaxDistance, Window);
+    NNStep.AddLayer(AttnStep);
+
+    // Identical NON-zero bias tables in both layers (a zero table would not
+    // exercise the bias term of the cached path at all).
+    for W := 0 to NumBuckets - 1 do
+    begin
+      AttnFull.Neurons[0].Weights.Raw[W] := Sin((W + 1) * 0.57) * 0.6;
+      AttnStep.Neurons[0].Weights.Raw[W] := AttnFull.Neurons[0].Weights.Raw[W];
+    end;
+
+    FullIn.Randomize();
+    FullIn.Sub(0.5);
+    NNFull.Compute(FullIn);
+    NNFull.GetOutput(FullOut);
+
+    AttnStep.BeginIncrementalDecode({MaxContext=}SeqLen);
+    for T := 0 to SeqLen - 1 do
+    begin
+      for D := 0 to 3 * Dk - 1 do
+        StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      NNStep.GetOutput(StepOut);
+      for D := 0 to Dk - 1 do
+        AssertEquals('T5 rel-pos cached pos ' + IntToStr(T) + ' dim ' +
+          IntToStr(D), FullOut[T, 0, D], StepOut[0, 0, D], 1e-5);
+    end;
+    AttnStep.EndIncrementalDecode();
   finally
     StepOut.Free;
     FullOut.Free;
