@@ -884,6 +884,10 @@ type
     procedure TestMultiHeadLatentAttentionIncrementalDecode;
     procedure TestTransformerEncoderBlockGradientCheck;
     procedure TestTransformerEncoderBlockCustomNorm;
+    procedure TestSlidingWindowAttentionLocality;
+    procedure TestSlidingWindowAttentionSaveLoad;
+    procedure TestAlternatingLocalGlobalBlocksPattern;
+    procedure TestAlternatingLocalGlobalBlocksGradFlow;
     procedure TestParallelTransformerBlockShapeAndGradFlow;
     procedure TestParallelTransformerBlockTrainsAndVariants;
     procedure TestMultiTokenPredictionShapes;
@@ -14208,6 +14212,343 @@ begin
   d_ff := 16;
   RunOne(true);
   RunOne(false);
+end;
+
+procedure TTestNeuralNumerical.TestSlidingWindowAttentionLocality;
+// Functional mask-semantics check for the sliding-window (Window > 0) option
+// threaded through AddMultiHeadSelfAttention into
+// TNNetScaledDotProductAttention. Two nets over (SeqLen=6,1,d_model=4) with
+// causal attention: a LOCAL net (Window=2) and a GLOBAL net (Window=0).
+// Perturbing input token p and reading the output at query q (the QKV
+// projection is token-wise, so token p only enters attention through its own
+// Q/K/V) must show:
+//   - local:  p far OUTSIDE the window of q (q-p >= Window) -> output at q
+//             UNCHANGED; p INSIDE the window -> output at q CHANGES.
+//   - global: the same distant (but causal-valid) p DOES change output at q.
+//   - causality (both): a FUTURE p never changes the output at an earlier q.
+var
+  SeqLen, d_model, Window, q, d, i: integer;
+
+  procedure FillInput(V: TNNetVolume);
+  var idx: integer;
+  begin
+    for idx := 0 to V.Size - 1 do
+      V.Raw[idx] := Sin(idx * 0.47) * 0.8 + 0.1;
+  end;
+
+  // Max abs output difference at token position Pos between a baseline
+  // forward and a forward with input token PerturbPos perturbed.
+  function DiffAtToken(NN: TNNet; Pos, PerturbPos: integer): TNeuralFloat;
+  var
+    Input: TNNetVolume;
+    Base: TNNetVolume;
+    idx: integer;
+    diff: TNeuralFloat;
+  begin
+    Input := TNNetVolume.Create(SeqLen, 1, d_model, 1);
+    Base := TNNetVolume.Create();
+    try
+      FillInput(Input);
+      NN.Compute(Input);
+      Base.Copy(NN.GetLastLayer.Output);
+      for idx := 0 to d_model - 1 do
+        Input[PerturbPos, 0, idx] := Input[PerturbPos, 0, idx] + 0.5;
+      NN.Compute(Input);
+      Result := 0;
+      for idx := 0 to d_model - 1 do
+      begin
+        diff := Abs(NN.GetLastLayer.Output[Pos, 0, idx] - Base[Pos, 0, idx]);
+        if diff > Result then Result := diff;
+      end;
+    finally
+      Base.Free;
+      Input.Free;
+    end;
+  end;
+
+  function BuildNet(pWindow: integer): TNNet;
+  begin
+    RandSeed := 424242;
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    // Token-wise QKV slab projection (PointwiseConvLinear keeps each token
+    // independent before attention) feeding single-head causal attention.
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(3 * d_model));
+    Result.AddMultiHeadSelfAttention({Heads=}1, {CausalMask=}true,
+      {UseRoPE=}false, avSDPA, {NumSinks=}1, pWindow);
+  end;
+
+var
+  LocalNN, GlobalNN: TNNet;
+begin
+  SeqLen := 6;
+  d_model := 4;
+  Window := 2;
+  q := SeqLen - 1; // query position 5; its window covers keys {4, 5}
+  LocalNN := BuildNet(Window);
+  GlobalNN := BuildNet(0);
+  try
+    // Distant past token (p=0, q-p=5 >= Window): masked out by the window.
+    AssertTrue('local: token outside window must NOT change output at q',
+      DiffAtToken(LocalNN, q, 0) < 1e-12);
+    // Token inside the window (p=4, q-p=1 < Window): attended.
+    AssertTrue('local: token inside window must change output at q',
+      DiffAtToken(LocalNN, q, q - 1) > 1e-8);
+    // Same distant token under full attention: attended (causal-valid).
+    AssertTrue('global: distant causal-valid token must change output at q',
+      DiffAtToken(GlobalNN, q, 0) > 1e-8);
+    // Causality in both: a FUTURE token never affects an earlier position.
+    AssertTrue('local: future token must not change output at position 0',
+      DiffAtToken(LocalNN, 0, SeqLen - 1) < 1e-12);
+    AssertTrue('global: future token must not change output at position 0',
+      DiffAtToken(GlobalNN, 0, SeqLen - 1) < 1e-12);
+  finally
+    GlobalNN.Free;
+    LocalNN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSlidingWindowAttentionSaveLoad;
+// The sliding window W is serialized in TNNetScaledDotProductAttention's
+// FStruct[2]: a net with Window=2 attention round-trips through
+// SaveToString -> LoadFromString with the Window restored and an identical
+// forward output. Also pins backward compatibility: the DEFAULT path (no
+// Window arg, e.g. plain AddTransformerEncoderBlock) still produces SDPA
+// layers with Window=0 (FStruct[2]=0, the value old saved models carry).
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  SeqLen, d_model, i: integer;
+  SDPA: TNNetScaledDotProductAttention;
+  FoundSDPA: integer;
+begin
+  RandSeed := 424242;
+  SeqLen := 5;
+  d_model := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(3 * d_model));
+    NN.AddMultiHeadSelfAttention({Heads=}1, {CausalMask=}true,
+      {UseRoPE=}false, avSDPA, {NumSinks=}1, {Window=}2);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.8 + 0.2;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      // The reloaded attention layer must carry Window=2 and the causal flag.
+      FoundSDPA := 0;
+      for i := 0 to NN2.CountLayers() - 1 do
+        if NN2.Layers[i].ClassType = TNNetScaledDotProductAttention then
+        begin
+          Inc(FoundSDPA);
+          SDPA := TNNetScaledDotProductAttention(NN2.Layers[i]);
+          AssertTrue('reloaded SDPA Window=2', SDPA.Window = 2);
+          AssertTrue('reloaded SDPA causal', SDPA.CausalMask);
+        end;
+      AssertTrue('round-trip finds the SDPA layer', FoundSDPA = 1);
+      NN2.Compute(Input);
+      AssertTrue('round-trip output size matches',
+        NN.GetLastLayer.Output.Size = NN2.GetLastLayer.Output.Size);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('round-trip forward output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  // Default-arg regression: a plain AddTransformerEncoderBlock (no Window
+  // argument) must still configure every per-head SDPA with Window=0 --
+  // identical layer config to before the Window parameter existed.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddTransformerEncoderBlock({Heads=}2, {d_ff=}8, {PreNorm=}true,
+      {CausalMask=}true);
+    FoundSDPA := 0;
+    for i := 0 to NN.CountLayers() - 1 do
+      if NN.Layers[i].ClassType = TNNetScaledDotProductAttention then
+      begin
+        Inc(FoundSDPA);
+        AssertTrue('default encoder block SDPA has Window=0',
+          TNNetScaledDotProductAttention(NN.Layers[i]).Window = 0);
+      end;
+    AssertTrue('default encoder block has 2 SDPA heads', FoundSDPA = 2);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAlternatingLocalGlobalBlocksPattern;
+// AddAlternatingLocalGlobalBlocks must lay out the Gemma-2 LOCAL-FIRST
+// interleave: with LocalPerGlobal=1 and NumBlocks=4 the blocks are
+// local, global, local, global -- i.e. walking the net's SDPA layers in
+// order, the first Heads of them carry Window=WindowSize, the next Heads
+// carry Window=0, and so on. Also checks the Gemma-3-style 2:1 ratio
+// (NumBlocks=3 -> local, local, global), the causal default, and that the
+// stack preserves the (SeqLen,1,d_model) shape.
+var
+  NN: TNNet;
+  i, idx, BlockOfLayer: integer;
+  SDPA: TNNetScaledDotProductAttention;
+  Windows: array of integer;
+  SeqLen, d_model, Heads, WindowSize, NumBlocks: integer;
+  ExpectLocal: boolean;
+begin
+  RandSeed := 424242;
+  SeqLen := 7;
+  d_model := 4;
+  Heads := 2;
+  WindowSize := 3;
+  NumBlocks := 4;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddAlternatingLocalGlobalBlocks(NumBlocks, Heads, {d_ff=}8, WindowSize);
+    // Shape is preserved so the stack composes like encoder blocks.
+    AssertTrue('ALG stack output SizeX', NN.GetLastLayer.Output.SizeX = SeqLen);
+    AssertTrue('ALG stack output SizeY', NN.GetLastLayer.Output.SizeY = 1);
+    AssertTrue('ALG stack output Depth', NN.GetLastLayer.Output.Depth = d_model);
+    // Collect the per-head SDPA Window values in network order.
+    SetLength(Windows, 0);
+    for i := 0 to NN.CountLayers() - 1 do
+      if NN.Layers[i].ClassType = TNNetScaledDotProductAttention then
+      begin
+        SDPA := TNNetScaledDotProductAttention(NN.Layers[i]);
+        AssertTrue('ALG SDPA layers are causal (default)', SDPA.CausalMask);
+        SetLength(Windows, Length(Windows) + 1);
+        Windows[High(Windows)] := SDPA.Window;
+      end;
+    AssertTrue('ALG stack has NumBlocks*Heads SDPA layers, got ' +
+      IntToStr(Length(Windows)), Length(Windows) = NumBlocks * Heads);
+    // Local-first 1:1 pattern: blocks 0 and 2 local, blocks 1 and 3 global.
+    for idx := 0 to High(Windows) do
+    begin
+      BlockOfLayer := idx div Heads;
+      ExpectLocal := (BlockOfLayer mod 2) = 0;
+      if ExpectLocal then
+        AssertTrue('ALG block ' + IntToStr(BlockOfLayer) + ' must be LOCAL',
+          Windows[idx] = WindowSize)
+      else
+        AssertTrue('ALG block ' + IntToStr(BlockOfLayer) + ' must be GLOBAL',
+          Windows[idx] = 0);
+    end;
+    SetLength(Windows, 0);
+  finally
+    NN.Free;
+  end;
+
+  // LocalPerGlobal=2 over 3 blocks: local, local, global.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddAlternatingLocalGlobalBlocks({NumBlocks=}3, Heads, {d_ff=}8,
+      WindowSize, {LocalPerGlobal=}2);
+    SetLength(Windows, 0);
+    for i := 0 to NN.CountLayers() - 1 do
+      if NN.Layers[i].ClassType = TNNetScaledDotProductAttention then
+      begin
+        SetLength(Windows, Length(Windows) + 1);
+        Windows[High(Windows)] :=
+          TNNetScaledDotProductAttention(NN.Layers[i]).Window;
+      end;
+    AssertTrue('ALG 2:1 stack has 3*Heads SDPA layers',
+      Length(Windows) = 3 * Heads);
+    for idx := 0 to High(Windows) do
+    begin
+      BlockOfLayer := idx div Heads;
+      if BlockOfLayer < 2 then
+        AssertTrue('ALG 2:1 block ' + IntToStr(BlockOfLayer) + ' local',
+          Windows[idx] = WindowSize)
+      else
+        AssertTrue('ALG 2:1 block ' + IntToStr(BlockOfLayer) + ' global',
+          Windows[idx] = 0);
+    end;
+    SetLength(Windows, 0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAlternatingLocalGlobalBlocksGradFlow;
+// Forward + backward smoke over a 2-block alternating stack (block 0 LOCAL
+// with Window=2 over SeqLen=5 > Window, block 1 GLOBAL): the forward output
+// is finite, and after one Backpropagate the gradient reaches the trainable
+// projections of BOTH block types (every PointwiseConvLinear in the net
+// accumulates a nonzero batch delta) and flows back to the input.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  SeqLen, d_model, i, n, PointwiseCnt: integer;
+  HasInputGrad, HasDelta: boolean;
+  Conv: TNNetPointwiseConvLinear;
+begin
+  RandSeed := 424242;
+  SeqLen := 5;
+  d_model := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model, 1);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddAlternatingLocalGlobalBlocks({NumBlocks=}2, {Heads=}2, {d_ff=}8,
+      {WindowSize=}2);
+    NN.SetLearningRate(0.01, 0.0);
+    NN.SetBatchUpdate(true); // keep per-neuron Delta for inspection
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('ALG finite forward at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    // Gradient reaches the input through both block types.
+    HasInputGrad := false;
+    for i := 0 to NN.Layers[0].OutputError.Size - 1 do
+      if Abs(NN.Layers[0].OutputError.Raw[i]) > 1e-12 then HasInputGrad := true;
+    AssertTrue('ALG gradient flows back to the input', HasInputGrad);
+
+    // Every token-wise projection (QKV slabs, attention out-projections and
+    // FFN convs of BOTH the local and the global block) gets a weight grad.
+    PointwiseCnt := 0;
+    for i := 0 to NN.CountLayers() - 1 do
+      if NN.Layers[i] is TNNetPointwiseConvLinear then
+      begin
+        Inc(PointwiseCnt);
+        Conv := TNNetPointwiseConvLinear(NN.Layers[i]);
+        HasDelta := false;
+        for n := 0 to Conv.Neurons.Count - 1 do
+          if Conv.Neurons[n].Delta.GetSumAbs() > 1e-12 then HasDelta := true;
+        AssertTrue('ALG weight gradient in projection layer ' + IntToStr(i),
+          HasDelta);
+      end;
+    // 2 blocks x (QKV proj + attn out-proj + 2 FFN convs) = 8 projections.
+    AssertTrue('ALG stack has 8 token-wise projections, got ' +
+      IntToStr(PointwiseCnt), PointwiseCnt = 8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestMultiTokenPredictionShapes;

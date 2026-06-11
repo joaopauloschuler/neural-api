@@ -51,6 +51,7 @@ type
     procedure TestBeamSearchScoreNoWorseThanGreedy;
     // KV-cache incremental decode on TNNetScaledDotProductAttention.
     procedure TestKVCacheIncrementalMatchesFullForward;
+    procedure TestKVCacheSlidingWindowMatchesFullForward;
     procedure TestKVCachePrefillThenStepMatchesFullForward;
     procedure TestKVCacheResetStartsFreshSequence;
     procedure TestKVCacheTruncateThenReappendMatchesFresh;
@@ -231,6 +232,64 @@ begin
     end;
     SDPAStep.EndIncrementalDecode();
     AssertTrue('cache disabled after End', not SDPAStep.CacheEnabled);
+  finally
+    StepOut.Free;
+    FullOut.Free;
+    StepIn.Free;
+    FullIn.Free;
+    NNStep.Free;
+    NNFull.Free;
+  end;
+end;
+
+// Sliding-window (Gemma-2 / Mistral local) attention: the KV-cache
+// incremental path must reproduce the full windowed causal forward -- each
+// decode step only attends over the last Window cached positions, matching
+// the banded mask of the non-cached Compute.
+procedure TTestNeuralDecode.TestKVCacheSlidingWindowMatchesFullForward;
+const
+  SeqLen = 7;
+  Dk = 5;
+  Window = 3;
+var
+  NNFull, NNStep: TNNet;
+  SDPAStep: TNNetScaledDotProductAttention;
+  FullIn, StepIn, FullOut, StepOut: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  NNFull := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  StepIn := TNNetVolume.Create(1, 1, 3 * Dk);
+  FullOut := TNNetVolume.Create();
+  StepOut := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+    NNFull.AddLayer(TNNetScaledDotProductAttention.Create(Dk,
+      {CausalMask=}true, Window));
+    NNStep.AddLayer(TNNetInput.Create(1, 1, 3 * Dk));
+    SDPAStep := TNNetScaledDotProductAttention.Create(Dk,
+      {CausalMask=}true, Window);
+    NNStep.AddLayer(SDPAStep);
+
+    FullIn.Randomize();
+    FullIn.Sub(0.5);
+    NNFull.Compute(FullIn);
+    NNFull.GetOutput(FullOut);
+
+    SDPAStep.BeginIncrementalDecode({MaxContext=}SeqLen);
+    for T := 0 to SeqLen - 1 do
+    begin
+      for D := 0 to 3 * Dk - 1 do
+        StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      NNStep.GetOutput(StepOut);
+      for D := 0 to Dk - 1 do
+        AssertEquals('windowed pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], StepOut[0, 0, D], 1e-5);
+    end;
+    SDPAStep.EndIncrementalDecode();
   finally
     StepOut.Free;
     FullOut.Free;

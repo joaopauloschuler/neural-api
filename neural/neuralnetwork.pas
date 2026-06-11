@@ -2504,6 +2504,7 @@ type
     FDk: integer;
     FInvSqrtDk: TNeuralFloat;
     FCausal: boolean;
+    FWindow: integer; // 0 = full attention; W>0 = sliding window of W keys
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     // --- KV-cache incremental-decode state (inference only, not serialized) ---
     FCacheEnabled: boolean;
@@ -2515,7 +2516,19 @@ type
     procedure ComputeIncremental();
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
-    constructor Create(d_k: integer; CausalMask: boolean = false); overload;
+    // pWindow = 0 (default) keeps the original full-attention behavior.
+    // pWindow = W >= 1 applies a Mistral / Gemma-2-style SLIDING-WINDOW mask:
+    // query position i may only attend to keys j with i - j < W (i.e. the W
+    // most recent positions up to and including i; keys with i - j >= W are
+    // masked with the same -1e9 additive sentinel as the causal mask).
+    // Combine with CausalMask=True for the standard banded causal pattern
+    // (the window only limits the PAST; the future is masked by CausalMask).
+    // W is serialized in FStruct[2] (old saved models load with W=0, i.e.
+    // bit-identical to the previous behavior). The KV-cache incremental
+    // decode path honors the window too (attends over the last W cached
+    // positions only).
+    constructor Create(d_k: integer; CausalMask: boolean = false;
+      pWindow: integer = 0); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -2542,6 +2555,7 @@ type
     property AttentionWeights: TNNetVolume read FAttn;
     property Dk: integer read FDk;
     property CausalMask: boolean read FCausal;
+    property Window: integer read FWindow;
     property CacheEnabled: boolean read FCacheEnabled;
     property CacheLength: integer read FCacheLen;
     property MaxContext: integer read FCacheMax;
@@ -10907,11 +10921,17 @@ type
       // logits) or avQKNorm (TNNetQKNormAttention, L2-normalised Q/K with a
       // learnable temperature initialised to sqrt(d_k)). See
       // TNNetAttentionVariant. NumSinks is only consulted for avSink.
+      // Window (default 0 = full attention, the previous behavior) applies a
+      // Mistral / Gemma-2-style sliding-window mask of Window keys inside
+      // every per-head SDPA (see TNNetScaledDotProductAttention.Create).
+      // Window > 0 requires Variant = avSDPA (the drop-in variants do not
+      // implement the window).
       function AddMultiHeadSDPAConcat(Heads: integer;
         CausalMask: boolean = false; SourceLayer: TNNetLayer = nil;
         UseRoPE: boolean = false;
         Variant: TNNetAttentionVariant = avSDPA;
-        NumSinks: integer = 1): TNNetLayer;
+        NumSinks: integer = 1;
+        Window: integer = 0): TNNetLayer;
       // Full multi-head self-attention block over a (SeqLen,1,3*d_model) Q|K|V
       // slab: per-head split -> per-head SDPA -> concat -> token-wise linear
       // out-projection to depth d_model. Returns the out-projection layer.
@@ -10939,10 +10959,14 @@ type
       // avDifferential additionally requires an EVEN per-head dim d_k. NumSinks
       // is only consulted for avSink. The out-projection is identical for all
       // variants (each head still emits depth d_k).
+      // Window (default 0 = full attention, the previous behavior) applies a
+      // Mistral / Gemma-2-style sliding-window mask of Window keys inside
+      // every per-head SDPA; requires Variant = avSDPA when > 0.
       function AddMultiHeadSelfAttention(Heads: integer;
         CausalMask: boolean = false; UseRoPE: boolean = false;
         Variant: TNNetAttentionVariant = avSDPA;
-        NumSinks: integer = 1): TNNetLayer;
+        NumSinks: integer = 1;
+        Window: integer = 0): TNNetLayer;
       // Multi-head LINFORMER self-attention (Wang et al. 2020, arXiv:2006.04768)
       // over a (SeqLen,1,3*d_model) Q|K|V slab. Linformer keeps the softmax but
       // projects K and V DOWN the sequence axis to a fixed rank k (k << SeqLen)
@@ -11404,9 +11428,39 @@ type
       // NormClass selects the normalization layer class used at every norm slot
       // in the block (nil defaults to TNNetLayerNorm; e.g. TNNetRMSNorm,
       // TNNetDyT). It must be a shape-preserving, parameterless-Create norm.
+      // Window (default 0 = full attention, the previous behavior) applies a
+      // Mistral / Gemma-2-style sliding-window mask of Window keys inside the
+      // block's multi-head self-attention (each query sees at most the Window
+      // most recent positions; see TNNetScaledDotProductAttention.Create).
       function AddTransformerEncoderBlock(Heads, d_ff: integer;
         PreNorm: boolean = true; CausalMask: boolean = false;
-        UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
+        UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil;
+        Window: integer = 0): TNNetLayer;
+      // Gemma-2-style ALTERNATING local/global attention stack (Gemma Team
+      // 2024, "Gemma 2: Improving Open Language Models at a Practical Size").
+      // Stacks NumBlocks AddTransformerEncoderBlock blocks where every
+      // (LocalPerGlobal+1)-th block uses FULL (global) attention and all
+      // other blocks use SLIDING-WINDOW (local) attention of WindowSize keys.
+      // The pattern is LOCAL-FIRST, matching Gemma 2: for LocalPerGlobal=1
+      // the stack is local, global, local, global, ...; Gemma 3's 5:1 ratio
+      // is LocalPerGlobal=5 (local x5, global, local x5, global, ...).
+      // Rationale: a local layer's attention compute and KV cache scale with
+      // WindowSize instead of the full sequence length, while the periodic
+      // global layers preserve unrestricted long-range token mixing - so most
+      // of the stack runs at sliding-window cost without capping the model's
+      // effective receptive field.
+      // CausalMask defaults to TRUE (the decoder-style Gemma setting; the
+      // window band then covers the WindowSize most recent positions).
+      // PreNorm/UseRoPE/NormClass are forwarded unchanged to every
+      // AddTransformerEncoderBlock (same UseRoPE caveat: pair with a
+      // TOKEN-ONLY embedding). Output shape is (SeqLen,1,d_model) like any
+      // encoder-block stack. Returns the last layer of the final block.
+      // (Coded by Claude (AI).)
+      function AddAlternatingLocalGlobalBlocks(NumBlocks, Heads, d_ff,
+        WindowSize: integer; LocalPerGlobal: integer = 1;
+        CausalMask: boolean = true; PreNorm: boolean = true;
+        UseRoPE: boolean = false;
+        NormClass: TNNetLayerClass = nil): TNNetLayer;
       // PARALLEL attention+FFN transformer block (GPT-J, Wang & Komatsuzaki
       // 2021; PaLM, Chowdhery et al. 2022; Falcon) over a (SeqLen,1,d_model)
       // tensor. Unlike the SEQUENTIAL pre-norm block above
@@ -20711,16 +20765,22 @@ end;
 
 { TNNetScaledDotProductAttention }
 
-constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: boolean);
+constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: boolean;
+  pWindow: integer);
 begin
   inherited Create();
   FDk := d_k;
   FCausal := CausalMask;
+  FWindow := pWindow;
   if FDk < 1 then
     FErrorProc('TNNetScaledDotProductAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
+  if FWindow < 0 then
+    FErrorProc('TNNetScaledDotProductAttention requires Window >= 0 ' +
+      '(0 = full attention). Window=' + IntToStr(FWindow));
   FInvSqrtDk := pcr_rsqrtf(FDk);
   FStruct[0] := FDk;
   if FCausal then FStruct[1] := 1 else FStruct[1] := 0;
+  FStruct[2] := FWindow;
   FAttn := TNNetVolume.Create();
 end;
 
@@ -20793,7 +20853,7 @@ end;
 procedure TNNetScaledDotProductAttention.ComputeIncremental();
 var
   StartTime: double;
-  SeqLen, p, j, d: integer;
+  SeqLen, p, j, d, jStart: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
@@ -20817,9 +20877,16 @@ begin
     Move(Prev.GetRawPtr(p, 0, 2 * FDk)^, FVCache.GetRawPtr(FCacheLen, 0, 0)^,
       FDk * SizeOf(TNeuralFloat));
     Inc(FCacheLen);
-    // Scaled scores of this query against every cached key [0..FCacheLen-1].
+    // Scaled scores of this query against every cached key [jStart..FCacheLen-1].
+    // Full attention starts at 0; a sliding window (FWindow > 0) attends only
+    // over the FWindow most recent cached positions (the same band the
+    // non-cached forward keeps; older keys are simply skipped).
+    if (FWindow > 0) and (FCacheLen > FWindow) then
+      jStart := FCacheLen - FWindow
+    else
+      jStart := 0;
     MaxScore := -1e30;
-    for j := 0 to FCacheLen - 1 do
+    for j := jStart to FCacheLen - 1 do
     begin
       Score := TNNetVolume.DotProduct(
         Prev.GetRawPtr(p, 0, 0), FKCache.GetRawPtr(j, 0, 0), FDk) * FInvSqrtDk;
@@ -20829,7 +20896,7 @@ begin
     // Numerically stable softmax over the cached prefix (no mask needed:
     // future positions are simply not in the cache yet).
     SumExp := 0;
-    for j := 0 to FCacheLen - 1 do
+    for j := jStart to FCacheLen - 1 do
     begin
       Score := pcr_expf(FCacheScores[j] - MaxScore);
       FCacheScores[j] := Score;
@@ -20840,7 +20907,7 @@ begin
     for d := 0 to FDk - 1 do
       OutPtr^[d] := 0;
     if SumExp > 0 then
-      for j := 0 to FCacheLen - 1 do
+      for j := jStart to FCacheLen - 1 do
         TNNetVolume.MulAdd(OutPtr, FVCache.GetRawPtr(j, 0, 0),
           FCacheScores[j] / SumExp, FDk);
   end;
@@ -20894,8 +20961,10 @@ begin
     MaxScore := -1e30;
     for j := 0 to SeqLen - 1 do
     begin
-      if FCausal and (j > i) then
+      if (FCausal and (j > i)) or ((FWindow > 0) and (i - j >= FWindow)) then
       begin
+        // Masked: strict future (causal) or a key beyond the sliding window
+        // (more than Window-1 positions in the past). Same -1e9 sentinel.
         FAttn[j, i, 0] := -1e9;
       end
       else
@@ -44912,7 +44981,8 @@ function TNNet.AddMultiHeadSDPAConcat(Heads: integer;
   CausalMask: boolean = false; SourceLayer: TNNetLayer = nil;
   UseRoPE: boolean = false;
   Variant: TNNetAttentionVariant = avSDPA;
-  NumSinks: integer = 1): TNNetLayer;
+  NumSinks: integer = 1;
+  Window: integer = 0): TNNetLayer;
 var
   d_model, d_k, HeadCnt, d: integer;
   SliceLayers, HeadOutputs: array of TNNetLayer;
@@ -44939,7 +45009,8 @@ var
           TNNetQKNormAttention.Create(d_k, CausalMask), AfterLayer);
     else
       Result := AddLayerAfter(
-        TNNetScaledDotProductAttention.Create(d_k, CausalMask), AfterLayer);
+        TNNetScaledDotProductAttention.Create(d_k, CausalMask, Window),
+        AfterLayer);
     end;
   end;
 
@@ -44959,6 +45030,13 @@ begin
   if (Variant = avSink) and (NumSinks < 1) then
     FErrorProc('AddMultiHeadSDPAConcat with avSink requires NumSinks >= 1. ' +
       'NumSinks=' + IntToStr(NumSinks));
+  if (Window > 0) and (Variant <> avSDPA) then
+    FErrorProc('AddMultiHeadSDPAConcat with Window > 0 requires Variant = ' +
+      'avSDPA (the sliding window is only implemented by the plain SDPA ' +
+      'layer). Window=' + IntToStr(Window));
+  if Window < 0 then
+    FErrorProc('AddMultiHeadSDPAConcat requires Window >= 0 (0 = full ' +
+      'attention). Window=' + IntToStr(Window));
   SetLength(SliceLayers, Heads);
   AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
   SetLength(HeadOutputs, Heads);
@@ -45002,14 +45080,15 @@ end;
 function TNNet.AddMultiHeadSelfAttention(Heads: integer;
   CausalMask: boolean = false; UseRoPE: boolean = false;
   Variant: TNNetAttentionVariant = avSDPA;
-  NumSinks: integer = 1): TNNetLayer;
+  NumSinks: integer = 1;
+  Window: integer = 0): TNNetLayer;
 var
   d_model: integer;
 begin
   // Input is the Q|K|V slab, so its depth is 3*d_model.
   d_model := GetLastLayer().Output.Depth div 3;
   AddMultiHeadSDPAConcat(Heads, CausalMask, GetLastLayer(), UseRoPE,
-    Variant, NumSinks);
+    Variant, NumSinks, Window);
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
@@ -46062,7 +46141,8 @@ end;
 
 function TNNet.AddTransformerEncoderBlock(Heads, d_ff: integer;
   PreNorm: boolean = true; CausalMask: boolean = false;
-  UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil): TNNetLayer;
+  UseRoPE: boolean = false; NormClass: TNNetLayerClass = nil;
+  Window: integer = 0): TNNetLayer;
 var
   BranchInput: TNNetLayer;
   d_model: integer;
@@ -46078,7 +46158,7 @@ begin
   // Token-wise QKV slab projection d_model -> 3*d_model (1x1 conv per token),
   // which AddMultiHeadSelfAttention consumes and out-projects back to d_model.
   AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
-  AddMultiHeadSelfAttention(Heads, CausalMask, UseRoPE);
+  AddMultiHeadSelfAttention(Heads, CausalMask, UseRoPE, avSDPA, 1, Window);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
   if not PreNorm then AddLayer( NormClass.Create() );
 
@@ -46093,6 +46173,40 @@ begin
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
   if not PreNorm then AddLayer( NormClass.Create() );
 
+  Result := GetLastLayer();
+end;
+
+function TNNet.AddAlternatingLocalGlobalBlocks(NumBlocks, Heads, d_ff,
+  WindowSize: integer; LocalPerGlobal: integer = 1;
+  CausalMask: boolean = true; PreNorm: boolean = true;
+  UseRoPE: boolean = false;
+  NormClass: TNNetLayerClass = nil): TNNetLayer;
+var
+  BlockCnt: integer;
+begin
+  if NumBlocks < 1 then
+    FErrorProc('AddAlternatingLocalGlobalBlocks requires NumBlocks >= 1. ' +
+      'NumBlocks=' + IntToStr(NumBlocks));
+  if WindowSize < 1 then
+    FErrorProc('AddAlternatingLocalGlobalBlocks requires WindowSize >= 1. ' +
+      'WindowSize=' + IntToStr(WindowSize));
+  if LocalPerGlobal < 1 then
+    FErrorProc('AddAlternatingLocalGlobalBlocks requires LocalPerGlobal >= 1. ' +
+      'LocalPerGlobal=' + IntToStr(LocalPerGlobal));
+  // Gemma-2 local-first interleave: within every group of (LocalPerGlobal+1)
+  // consecutive blocks, the first LocalPerGlobal blocks are LOCAL
+  // (sliding-window attention of WindowSize keys) and the LAST one is GLOBAL
+  // (full attention, Window=0). LocalPerGlobal=1 gives the Gemma 2 1:1
+  // pattern local, global, local, global, ...
+  for BlockCnt := 0 to NumBlocks - 1 do
+  begin
+    if (BlockCnt mod (LocalPerGlobal + 1)) = LocalPerGlobal then
+      AddTransformerEncoderBlock(Heads, d_ff, PreNorm, CausalMask, UseRoPE,
+        NormClass) // global: full attention
+    else
+      AddTransformerEncoderBlock(Heads, d_ff, PreNorm, CausalMask, UseRoPE,
+        NormClass, WindowSize); // local: sliding-window attention
+  end;
   Result := GetLastLayer();
 end;
 
@@ -81195,7 +81309,7 @@ begin
       'TNNetFourierMix' :           Result := TNNetFourierMix.Create(St[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
-      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1);
+      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
@@ -81571,7 +81685,7 @@ begin
       if S[0] = 'TNNetFourierMix' then Result := TNNetFourierMix.Create(St[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
-      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1) else
+      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else
