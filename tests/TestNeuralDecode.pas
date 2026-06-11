@@ -24,6 +24,7 @@ type
     function BuildTinyCausalLM(ContextLen: integer): TNNet;   // RoPE attention
     function BuildTinySSMLM(ContextLen: integer): TNNet;      // DiagonalSSM
     function BuildTinyHybridLM(ContextLen: integer): TNNet;   // SSM + attention
+    function BuildTinyGQALM(ContextLen: integer): TNNet;      // grouped-query
     // Streams Toks token-at-a-time through Session and asserts every step's
     // output row matches the corresponding row of Full's causal forward.
     procedure AssertStreamMatchesFull(Full: TNNet;
@@ -64,6 +65,7 @@ type
     procedure TestSSMDisabledPathUnchanged;
     // TNNetStreamingDecoder: the reusable incremental-decode session.
     procedure TestStreamingDecoderTransformerMatchesFullForward;
+    procedure TestStreamingDecoderGQAMatchesFullForward;
     procedure TestStreamingDecoderSSMMatchesFullForward;
     procedure TestStreamingDecoderResetStartsFreshSequence;
     procedure TestStreamingDecoderTruncateToRollsBack;
@@ -943,6 +945,21 @@ begin
   Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
 end;
 
+function TTestNeuralDecode.BuildTinyGQALM(ContextLen: integer): TNNet;
+begin
+  // Grouped-Query Attention mixer (4 query heads sharing 2 K/V heads). The
+  // builder composes token-wise projections + plain SDPA heads, all
+  // sequence-length independent, so it must stream through the same KV-cache
+  // path as standard MHA. No RoPE/positional signal on purpose (keeps the
+  // exactness check focused on the GQA wiring itself).
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddMultiHeadGroupedQueryAttention({QueryHeads=}4, {KVHeads=}2,
+    {CausalMask=}true);
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
 procedure TTestNeuralDecode.AssertStreamMatchesFull(Full: TNNet;
   Session: TNNetStreamingDecoder; const Toks: array of integer;
   const MsgPrefix: string);
@@ -998,6 +1015,38 @@ begin
     AssertTrue('session exposes the twin', Session.Net = Twin);
     Session.Reset();
     AssertStreamMatchesFull(Full, Session, Toks, 'transformer');
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Grouped-Query Attention nets must stream exactly through the same KV-cache
+// path: GQA emits one plain TNNetScaledDotProductAttention per QUERY head (the
+// K/V projection weights are shared per group), so the session collects all
+// 4 of them and a width-1 weight-copied twin must reproduce every
+// per-position output of the full-width causal forward.
+procedure TTestNeuralDecode.TestStreamingDecoderGQAMatchesFullForward;
+const
+  SeqLen = 7;
+  Toks: array[0..6] of integer = (6, 2, 10, 3, 8, 1, 5);
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyGQALM(SeqLen);
+  Twin := BuildTinyGQALM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertEquals('one SDPA per QUERY head (KV sharing is in the projections)',
+      4, Session.SDPACount);
+    AssertEquals('no SSM layers in a GQA transformer', 0, Session.SSMCount);
+    Session.Reset();
+    AssertStreamMatchesFull(Full, Session, Toks, 'gqa');
   finally
     Session.Free;
     Twin.Free;

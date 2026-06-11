@@ -882,6 +882,9 @@ type
     procedure TestScatterToAffineLoadFromString;
     procedure TestMultiHeadGroupedQueryAttentionGradientCheck;
     procedure TestMultiHeadGroupedQueryAttentionMHAEquivalence;
+    procedure TestMultiHeadGroupedQueryAttentionMHAWeightCopyEquivalence;
+    procedure TestMultiHeadGroupedQueryAttentionKVSharing;
+    procedure TestMultiHeadGroupedQueryAttentionSerializationRoundTrip;
     procedure TestMultiHeadLatentAttentionGradientCheck;
     procedure TestMultiHeadLatentAttentionLoadFromString;
     procedure TestMultiHeadLatentAttentionRopeGradientCheck;
@@ -16981,6 +16984,208 @@ begin
   finally
     NNFull.Free;
     NNMQA.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadGroupedQueryAttentionMHAWeightCopyEquivalence;
+// True numerical degeneracy check: GQA with KVHeads=QueryHeads must reproduce
+// AddMultiHeadSelfAttention EXACTLY (same attention core) when the projection
+// weights match. AddMultiHeadSelfAttention consumes a pre-projected Q|K|V slab,
+// so the reference net builds that slab from THREE separate d_model-wide
+// PointwiseConvLinear projections (Q|K|V order, DeepConcat) -- the exact same
+// projection structure AddMultiHeadGroupedQueryAttention creates internally.
+// Copying the three projection layers plus the out-projection layer-for-layer
+// must then make both forward passes agree to float tolerance, masked and
+// unmasked.
+var
+  NNRef, NNGQA: TNNet;
+  InputLayer, QP, KP, VP: TNNetLayer;
+  Input: TNNetVolume;
+  d_model, QueryHeads, SeqLen, i, MaskPass: integer;
+  CausalMask: boolean;
+  maxDiff: TNeuralFloat;
+begin
+  d_model := 8;
+  QueryHeads := 4;
+  SeqLen := 5;
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.8 - 0.1;
+    for MaskPass := 0 to 1 do
+    begin
+      CausalMask := (MaskPass = 1);
+      RandSeed := 424242;
+      // Reference: explicit Q/K/V projections -> [Q|K|V] slab -> standard MHA.
+      NNRef := TNNet.Create();
+      NNGQA := TNNet.Create();
+      try
+        InputLayer := NNRef.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+        QP := NNRef.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(d_model), InputLayer);
+        KP := NNRef.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(d_model), InputLayer);
+        VP := NNRef.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(d_model), InputLayer);
+        NNRef.AddLayer(TNNetDeepConcat.Create([QP, KP, VP]));
+        NNRef.AddMultiHeadSelfAttention(QueryHeads, CausalMask);
+
+        // GQA with KVHeads=QueryHeads: layers 1..3 are its own Q/K/V
+        // projections; the last layer is the out-projection.
+        NNGQA.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+        NNGQA.AddMultiHeadGroupedQueryAttention(QueryHeads, QueryHeads,
+          CausalMask);
+
+        // Match the four parameterized layers (Q, K, V, out-projection);
+        // everything else (split/concat/SDPA) is weightless.
+        NNGQA.Layers[1].CopyWeights(QP);
+        NNGQA.Layers[2].CopyWeights(KP);
+        NNGQA.Layers[3].CopyWeights(VP);
+        NNGQA.GetLastLayer.CopyWeights(NNRef.GetLastLayer);
+
+        NNRef.Compute(Input);
+        NNGQA.Compute(Input);
+        AssertEquals('GQA/MHA equivalence output size',
+          NNRef.GetLastLayer.Output.Size, NNGQA.GetLastLayer.Output.Size);
+        maxDiff := 0;
+        for i := 0 to NNRef.GetLastLayer.Output.Size - 1 do
+          if Abs(NNRef.GetLastLayer.Output.Raw[i] -
+                 NNGQA.GetLastLayer.Output.Raw[i]) > maxDiff then
+            maxDiff := Abs(NNRef.GetLastLayer.Output.Raw[i] -
+                           NNGQA.GetLastLayer.Output.Raw[i]);
+        AssertTrue('GQA(KVHeads=QueryHeads) equals MHA, CausalMask=' +
+          BoolToStr(CausalMask, true) + ' (maxDiff=' + FloatToStr(maxDiff) +
+          ')', maxDiff < 1e-5);
+      finally
+        NNGQA.Free;
+        NNRef.Free;
+      end;
+    end;
+  finally
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadGroupedQueryAttentionKVSharing;
+// The K/V projections must be GENUINELY shared: with QueryHeads=2, KVHeads=1
+// (MQA) both query heads read the SAME single K head. Re-randomizing the K
+// projection layer must therefore change the output of BOTH per-head SDPA
+// layers (with per-head K projections, perturbing one head's K could never
+// move the other head). Also pins the structural fact that the K and V
+// projections are only KVHeads*d_k channels wide.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Head0Before, Head1Before: TNNetVolume;
+  SDPAs: array[0..1] of TNNetLayer;
+  d_model, SeqLen, i, SDPACnt: integer;
+  diff0, diff1: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  SeqLen := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  Head0Before := TNNetVolume.Create();
+  Head1Before := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
+    NN.AddMultiHeadGroupedQueryAttention({QueryHeads=}2, {KVHeads=}1, false);
+
+    // Structural sharing: K (layer 2) and V (layer 3) projections are a single
+    // d_k = d_model/QueryHeads = 4 channel head, not the full d_model.
+    AssertEquals('MQA K projection width (KVHeads*d_k)',
+      d_model div 2, NN.Layers[2].Output.Depth);
+    AssertEquals('MQA V projection width (KVHeads*d_k)',
+      d_model div 2, NN.Layers[3].Output.Depth);
+
+    // Collect the two per-head attention layers.
+    SDPACnt := 0;
+    for i := 0 to NN.Layers.Count - 1 do
+      if (NN.Layers[i] is TNNetScaledDotProductAttention) and (SDPACnt < 2) then
+      begin
+        SDPAs[SDPACnt] := NN.Layers[i];
+        Inc(SDPACnt);
+      end;
+    AssertEquals('MQA has one SDPA per query head', 2, SDPACnt);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Cos(i * 0.61) * 0.7 + 0.2;
+    NN.Compute(Input);
+    Head0Before.Copy(SDPAs[0].Output);
+    Head1Before.Copy(SDPAs[1].Output);
+
+    // Perturb ONLY the shared K projection (layer 2) and recompute.
+    NN.Layers[2].InitUniform(2.0);
+    NN.Compute(Input);
+
+    diff0 := 0;
+    diff1 := 0;
+    for i := 0 to Head0Before.Size - 1 do
+    begin
+      if Abs(SDPAs[0].Output.Raw[i] - Head0Before.Raw[i]) > diff0 then
+        diff0 := Abs(SDPAs[0].Output.Raw[i] - Head0Before.Raw[i]);
+      if Abs(SDPAs[1].Output.Raw[i] - Head1Before.Raw[i]) > diff1 then
+        diff1 := Abs(SDPAs[1].Output.Raw[i] - Head1Before.Raw[i]);
+    end;
+    AssertTrue('shared K perturbation moves query head 0 (diff=' +
+      FloatToStr(diff0) + ')', diff0 > 1e-6);
+    AssertTrue('shared K perturbation moves query head 1 (diff=' +
+      FloatToStr(diff1) + ')', diff1 > 1e-6);
+  finally
+    Head1Before.Free;
+    Head0Before.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadGroupedQueryAttentionSerializationRoundTrip;
+// The GQA block is composed entirely of existing serializable layers (no new
+// class), so SaveToString -> LoadFromString -> SaveToString must be a
+// byte-for-byte round-trip and the loaded net must reproduce the forward pass.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i, SeqLen: integer;
+  maxDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 8));
+    NN.AddMultiHeadGroupedQueryAttention({QueryHeads=}4, {KVHeads=}2,
+      {CausalMask=}true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.9) * 0.8;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GQA SaveToString round-trip equality', Saved, Saved2);
+
+      // Same weights -> identical forward pass.
+      NN2.Compute(Input);
+      maxDiff := 0;
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        if Abs(NN.GetLastLayer.Output.Raw[i] -
+               NN2.GetLastLayer.Output.Raw[i]) > maxDiff then
+          maxDiff := Abs(NN.GetLastLayer.Output.Raw[i] -
+                         NN2.GetLastLayer.Output.Raw[i]);
+      AssertTrue('GQA loaded net reproduces forward (maxDiff=' +
+        FloatToStr(maxDiff) + ')', maxDiff < 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 
