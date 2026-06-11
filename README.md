@@ -26,25 +26,25 @@ Clone this project, add the [**neural**](https://github.com/joaopauloschuler/neu
 
 ## A.I. Powered Support
 You can get A.I. powered help from these tools:
-* [CAI Neural API support at Poe (free)](https://poe.com/CAI-NEURAL-API-FREE).
-* [CAI Neural API support at Poe](https://poe.com/CAI-NEURAL-API).
-* [CAI Neural API support at ChatGPT4](https://chatgpt.com/g/g-6BrAwhTQ9-free-pascal-developer-neural-api).
+* [CAI Neural API support at Poe (free)](https://poe.com/CAI-NEURAL-API-FREE)
+* [CAI Neural API support at Poe](https://poe.com/CAI-NEURAL-API)
+* [CAI Neural API support at ChatGPT4](https://chatgpt.com/g/g-6BrAwhTQ9-free-pascal-developer-neural-api)
  
 ## Documentation
 The documentation covers: 
-* [Easy examples](#easy-examples-first-please).
-* [Simple image classification examples](#simple-image-classification-examples).
-* [Youtube videos](#youtube-videos).
-* [Advanced examples](#advanced-examples).
-* [Data structures (Volumes)](#volumes).
-* [Neural network layers](#neural-network-layers).
-* [Dataset support](#dataset-support).
-* [Training (fitting) your neural network](#fitting-your-neural-network).
-* [Parallel computing](#parallel-computing---the-neuralthreadpas).
-* [Full set of examples](examples/README.md).
-* [Normalization Cheat Sheet](docs/normalization.md).
-* [Layer Authoring Guide](docs/layer-authoring.md) — checklist for adding a new layer plus mini-guides on reading numerical-gradient failures and picking a tolerance.
-* [Other scientific publications from the same author](#publications-from-the-author).
+* [Easy examples](#easy-examples-first-please)
+* [Simple image classification examples](#simple-image-classification-examples)
+* [Youtube videos](#youtube-videos)
+* [Advanced examples](#advanced-examples)
+* [Data structures (Volumes)](#volumes)
+* [Neural network layers](#neural-network-layers)
+* [Dataset support](#dataset-support)
+* [Training (fitting) your neural network](#fitting-your-neural-network)
+* [Parallel computing](#parallel-computing---the-neuralthreadpas)
+* [Full set of examples](examples/README.md)
+* [Normalization Cheat Sheet](docs/normalization.md)
+* [Layer Authoring Guide](docs/layer-authoring.md) — checklist for adding a new layer plus mini-guides on reading numerical-gradient failures and picking a tolerance
+* [Other scientific publications from the same author](#publications-from-the-author)
 
 ### Easy Examples First Please!
 [![Watch the video](https://img.youtube.com/vi/PdNTgI_qSyo/0.jpg)](https://youtu.be/PdNTgI_qSyo)
@@ -63,7 +63,7 @@ Assuming that you would like to train a neural network to learn a function that 
 The example above has 2 inputs (`TNNetInput`), 2 dense layers (`TNNetFullConnectReLU`) with 32 neurons each and one output (`TNNetFullConnectLinear`).
 
 You can learn more about how to build and train simple neural networks at the following source code examples:
-* [Only one neuron](https://github.com/joaopauloschuler/neural-api/tree/master/examples/OnlyOneNeuron).
+* [Only one neuron](https://github.com/joaopauloschuler/neural-api/tree/master/examples/OnlyOneNeuron)
 * [Training a neural network to learn the hypotenuse function](https://github.com/joaopauloschuler/neural-api/tree/master/examples/Hypotenuse)
 * [Training a neural network to learn the hypotenuse function with FitLoading](https://github.com/joaopauloschuler/neural-api/tree/master/examples/HypotenuseFitLoading)
 * [Training a neural network to learn boolean functions AND, OR and XOR with neuralfit unit](https://github.com/joaopauloschuler/neural-api/tree/master/examples/XorAndOr)
