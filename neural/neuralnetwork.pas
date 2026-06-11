@@ -327,6 +327,14 @@ type
       procedure ClearBias(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearDeltas(); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearInertia(); {$IFDEF Release} inline; {$ENDIF}
+      // Rebuilds the internal caches some layers derive from their neuron
+      // weights (public wrapper for the protected AfterWeightUpdate; e.g.
+      // convolution layers cache concatenated/interleaved weight copies that
+      // the forward pass reads). Call this after directly mutating
+      // Neurons[].Weights / BiasWeight from OUTSIDE the layer - for example
+      // the pretrained-checkpoint importer in neuralpretrained.pas.
+      // (Coded by Claude (AI).)
+      procedure FlushWeightCache();
       procedure ClearTimes(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
@@ -3819,6 +3827,39 @@ type
     procedure Compute(); override;
   end;
 
+  { TNNetLearnedPositionalEmbedding }
+  // Adds a LEARNED absolute positional embedding to its input (the GPT-2 /
+  // BERT "wpe" convention), in contrast with the fixed sinusoidal tables of
+  // TNNetAddPositionalEmbedding / TNNetSinusoidalPositionalEmbedding and the
+  // fixed positional half of TNNetTokenAndPositionalEmbedding. The layer owns
+  // a trainable table of MaxPosition rows of Depth values (FNeurons[0],
+  // shaped MaxPosition x 1 x Depth, row p = the embedding of absolute
+  // position p) and computes
+  //   Out[x, y, c] = In[x, y, c] + Table[x, c]
+  // i.e. position runs along the X axis (token index of a (SeqLen,1,Depth)
+  // sequence tensor) and the same row is broadcast over Y. The input SizeX
+  // must be <= MaxPosition (checked at wiring time); when SizeX <
+  // MaxPosition only the first SizeX rows participate (exactly how GPT-2
+  // slices wpe[:seq_len]). Backward is an identity pass-through to the
+  // previous layer plus dTable[x] += sum_y dOut[x, y] for the used rows.
+  // MaxPosition is serialized in FStruct[0] and the init scale (default
+  // 0.02) in FFloatSt[0]. Used by the pretrained-checkpoint importer in
+  // neuralpretrained.pas to hold GPT-2's wpe weights.
+  // Coded by Claude (AI).
+  TNNetLearnedPositionalEmbedding = class(TNNetIdentityWithoutL2)
+  private
+    FMaxPosition: integer;
+    FScaleEmbedding: TNeuralFloat;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pMaxPosition: integer;
+      ScaleEmbedding: TNeuralFloat = 0.02); overload;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property MaxPosition: integer read FMaxPosition;
+  end;
+
   { TNNetSinusoidalPositionalEmbedding }
   // Parameter-free additive sinusoidal positional encoding per Vaswani et al.
   // (Attention Is All You Need, https://arxiv.org/abs/1706.03762).
@@ -4132,6 +4173,41 @@ type
       constructor Create(); override;
       destructor Destroy(); override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
+  /// Per-TOKEN layer normalization (the transformer convention used by
+  // GPT-2 / BERT / HuggingFace nn.LayerNorm(d_model)). The input is treated
+  // as a sequence of tokens laid out along the X (and Y) axes with the token
+  // feature vector on the Depth axis: each (x, y) position is INDEPENDENTLY
+  // normalized to zero mean and unit variance over its Depth elements, then a
+  // learnable per-CHANNEL scale (gamma, FNeurons[0], Depth weights) and bias
+  // (beta, FNeurons[1], Depth weights) are applied:
+  //   y[x,y,c] = gamma[c] * (x[x,y,c] - mean_xy) / sqrt(var_xy + eps) + beta[c]
+  // This differs from TNNetLayerNorm, which normalizes over the WHOLE volume
+  // (all SizeX*SizeY*Depth elements share one mean/variance and gamma/beta
+  // are per-element): on a (SeqLen,1,d_model) sequence tensor TNNetLayerNorm
+  // couples statistics across tokens, while this layer matches the
+  // frameworks' LayerNorm(d_model) exactly - required for importing
+  // pretrained transformer checkpoints (see neuralpretrained.pas).
+  // TNNetLayerNorm is intentionally left untouched for backward
+  // compatibility with existing saved models. Epsilon (default 1e-5, the
+  // PyTorch default) is serialized in FFloatSt[0]. Backward applies the
+  // exact per-token LayerNorm Jacobian and accumulates gamma/beta gradients
+  // over all tokens.
+  // Coded by Claude (AI).
+  TNNetTokenLayerNorm = class(TNNetIdentityWithoutL2)
+    private
+      FTokenLNEpsilon: TNeuralFloat;
+      FNormalized: TNNetVolume;   // x_hat, same shape as the input
+      FInvStd: TNNetVolume;       // per-token 1/sqrt(var+eps), SizeX x SizeY x 1
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pEpsilon: TNeuralFloat); overload;
+      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -42595,6 +42671,168 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetTokenLayerNorm }
+constructor TNNetTokenLayerNorm.Create();
+begin
+  inherited Create();
+  FTokenLNEpsilon := 1e-5;
+  FFloatSt[0] := FTokenLNEpsilon;
+  FNormalized := TNNetVolume.Create();
+  FInvStd := TNNetVolume.Create();
+end;
+
+constructor TNNetTokenLayerNorm.Create(pEpsilon: TNeuralFloat);
+begin
+  Create();
+  if pEpsilon > 0 then FTokenLNEpsilon := pEpsilon;
+  FFloatSt[0] := FTokenLNEpsilon;
+end;
+
+destructor TNNetTokenLayerNorm.Destroy();
+begin
+  FInvStd.Free;
+  FNormalized.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetTokenLayerNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FNeurons.Count < 2 then AddMissingNeurons(2);
+  // FNeurons[0] holds gamma (per-channel scale, Depth weights),
+  // FNeurons[1] holds beta (per-channel bias, Depth weights).
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  FNormalized.ReSize(FOutput);
+  FInvStd.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  InitDefault();
+end;
+
+procedure TNNetTokenLayerNorm.Compute();
+var
+  StartTime: double;
+  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx: integer;
+  Mean, Variance, InvStdDev, Diff: TNeuralFloat;
+  Gamma, Beta: TNNetVolume;
+begin
+  StartTime := Now();
+  inherited Compute;
+  Depth := FOutput.Depth;
+  // Token index runs over the flattened (X, Y) positions; the Depth axis is
+  // contiguous in memory, so token t occupies FData[t*Depth .. t*Depth+Depth-1].
+  TokenMax := (FOutput.Size div Depth) - 1;
+  Gamma := FNeurons[0].FWeights;
+  Beta := FNeurons[1].FWeights;
+  for TokenCnt := 0 to TokenMax do
+  begin
+    BaseIdx := TokenCnt * Depth;
+    Mean := 0;
+    for ChannelCnt := 0 to Depth - 1 do
+      Mean := Mean + FOutput.FData[BaseIdx + ChannelCnt];
+    Mean := Mean / Depth;
+    Variance := 0;
+    for ChannelCnt := 0 to Depth - 1 do
+    begin
+      Diff := FOutput.FData[BaseIdx + ChannelCnt] - Mean;
+      Variance := Variance + Diff * Diff;
+    end;
+    Variance := Variance / Depth;
+    InvStdDev := 1 / Sqrt(Variance + FTokenLNEpsilon);
+    FInvStd.FData[TokenCnt] := InvStdDev;
+    for ChannelCnt := 0 to Depth - 1 do
+    begin
+      Diff := (FOutput.FData[BaseIdx + ChannelCnt] - Mean) * InvStdDev;
+      FNormalized.FData[BaseIdx + ChannelCnt] := Diff;
+      FOutput.FData[BaseIdx + ChannelCnt] :=
+        Gamma.FData[ChannelCnt] * Diff + Beta.FData[ChannelCnt];
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTokenLayerNorm.Backpropagate();
+var
+  StartTime: double;
+  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx: integer;
+  SumDxHat, SumDxHatXHat, DxHat, InvStdDev: TNeuralFloat;
+  Gamma: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Depth := FOutput.Depth;
+  TokenMax := (FOutput.Size div Depth) - 1;
+  Gamma := FNeurons[0].FWeights;
+  // Gradients with respect to gamma and beta accumulate over all tokens:
+  //   d(gamma)[c] = sum_t OutputError[t,c] * x_hat[t,c]
+  //   d(beta)[c]  = sum_t OutputError[t,c]
+  for TokenCnt := 0 to TokenMax do
+  begin
+    BaseIdx := TokenCnt * Depth;
+    for ChannelCnt := 0 to Depth - 1 do
+    begin
+      FNeurons[0].FDelta.FData[ChannelCnt] :=
+        FNeurons[0].FDelta.FData[ChannelCnt] - FLearningRate *
+        FOutputError.FData[BaseIdx + ChannelCnt] *
+        FNormalized.FData[BaseIdx + ChannelCnt];
+      FNeurons[1].FDelta.FData[ChannelCnt] :=
+        FNeurons[1].FDelta.FData[ChannelCnt] - FLearningRate *
+        FOutputError.FData[BaseIdx + ChannelCnt];
+    end;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    FNeurons[1].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // Exact per-token LayerNorm Jacobian:
+    //   dxhat = OutputError * gamma
+    //   dx = invStd * ( dxhat - mean_c(dxhat) - xhat * mean_c(dxhat*xhat) )
+    for TokenCnt := 0 to TokenMax do
+    begin
+      BaseIdx := TokenCnt * Depth;
+      InvStdDev := FInvStd.FData[TokenCnt];
+      SumDxHat := 0;
+      SumDxHatXHat := 0;
+      for ChannelCnt := 0 to Depth - 1 do
+      begin
+        DxHat := FOutputError.FData[BaseIdx + ChannelCnt] *
+          Gamma.FData[ChannelCnt];
+        FOutputErrorDeriv.FData[BaseIdx + ChannelCnt] := DxHat;
+        SumDxHat := SumDxHat + DxHat;
+        SumDxHatXHat := SumDxHatXHat +
+          DxHat * FNormalized.FData[BaseIdx + ChannelCnt];
+      end;
+      SumDxHat := SumDxHat / Depth;
+      SumDxHatXHat := SumDxHatXHat / Depth;
+      for ChannelCnt := 0 to Depth - 1 do
+      begin
+        FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] :=
+          FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] +
+          InvStdDev * ( FOutputErrorDeriv.FData[BaseIdx + ChannelCnt] -
+            SumDxHat -
+            FNormalized.FData[BaseIdx + ChannelCnt] * SumDxHatXHat );
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetTokenLayerNorm.InitDefault();
+begin
+  if FNeurons.Count < 2 then AddMissingNeurons(2);
+  FNeurons[0].FWeights.Fill(1); // gamma
+  FNeurons[1].FWeights.Fill(0); // beta
+  AfterWeightUpdate();
+end;
+
 { TNNetRMSNorm }
 constructor TNNetRMSNorm.Create();
 begin
@@ -65156,6 +65394,92 @@ begin
   FBackwardTime := FBackwardTime + (Now() - StartTime);
 end;
 
+{ TNNetLearnedPositionalEmbedding }
+
+constructor TNNetLearnedPositionalEmbedding.Create(pMaxPosition: integer;
+  ScaleEmbedding: TNeuralFloat = 0.02);
+begin
+  inherited Create();
+  if pMaxPosition < 1 then
+  begin
+    FErrorProc('TNNetLearnedPositionalEmbedding requires MaxPosition >= 1. ' +
+      'Got: ' + IntToStr(pMaxPosition));
+    pMaxPosition := 1;
+  end;
+  FMaxPosition := pMaxPosition;
+  FScaleEmbedding := ScaleEmbedding;
+  FStruct[0] := pMaxPosition;
+  FFloatSt[0] := ScaleEmbedding;
+end;
+
+procedure TNNetLearnedPositionalEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FOutput.SizeX > FMaxPosition then
+    FErrorProc('TNNetLearnedPositionalEmbedding: input SizeX ' +
+      IntToStr(FOutput.SizeX) + ' exceeds MaxPosition ' +
+      IntToStr(FMaxPosition) + '.');
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // FNeurons[0] holds the position table: row p (of FMaxPosition rows) is the
+  // Depth-wide embedding of absolute position p.
+  SetNumWeightsForAllNeurons(FMaxPosition, 1, FOutput.Depth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  InitDefault();
+end;
+
+procedure TNNetLearnedPositionalEmbedding.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  InitUniform(FScaleEmbedding);
+end;
+
+procedure TNNetLearnedPositionalEmbedding.Compute();
+var
+  StartTime: double;
+  CntX, CntY: integer;
+  LocalWeights: TNNetVolume;
+begin
+  StartTime := Now();
+  inherited Compute;
+  LocalWeights := FNeurons[0].FWeights;
+  // Out[x, y, :] += Table[x, :]; the same row is broadcast over Y.
+  for CntX := 0 to FOutput.SizeX - 1 do
+    for CntY := 0 to FOutput.SizeY - 1 do
+      TNNetVolume.MulAdd(FOutput.GetRawPtr(CntX, CntY, 0),
+        LocalWeights.GetRawPtr(CntX, 0, 0), 1, FOutput.Depth);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLearnedPositionalEmbedding.Backpropagate();
+var
+  StartTime: double;
+  CntX, CntY: integer;
+  DestPtr: TNeuralFloatArrPtr;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  // dTable[x, :] += sum_y dOut[x, y, :] (scaled by -LearningRate into Delta
+  // following the repo's delta convention).
+  for CntX := 0 to FOutput.SizeX - 1 do
+  begin
+    if FBatchUpdate
+      then DestPtr := FNeurons[0].FDelta.GetRawPtr(CntX, 0, 0)
+      else DestPtr := FNeurons[0].FWeights.GetRawPtr(CntX, 0, 0);
+    for CntY := 0 to FOutput.SizeY - 1 do
+      TNNetVolume.MulAdd(DestPtr, FOutputError.GetRawPtr(CntX, CntY, 0),
+        -FLearningRate, FOutput.Depth);
+  end;
+  // Identity pass-through of the error to the previous layer.
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+    FPrevLayer.FOutputError.Add(FOutputError);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetTokenAndPositionalEmbedding }
 
 procedure TNNetTokenAndPositionalEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -81922,6 +82246,7 @@ begin
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
+      'TNNetTokenLayerNorm':        Result := TNNetTokenLayerNorm.Create(Ft[0]);
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
       'TNNetRMSNormGated':          Result := TNNetRMSNormGated.Create();
       'TNNetSwitchableNorm':        Result := TNNetSwitchableNorm.Create();
@@ -81983,6 +82308,7 @@ begin
       'TNNetLocalResponseNormDepth':Result := TNNetLocalResponseNormDepth.Create(St[0]);
       'TNNetAddAndDiv'             :Result := TNNetAddAndDiv.Create(St[0], St[1]);
       'TNNetAddPositionalEmbedding':Result := TNNetAddPositionalEmbedding.Create(St[0]);
+      'TNNetLearnedPositionalEmbedding':Result := TNNetLearnedPositionalEmbedding.Create(St[0], Ft[0]);
       'TNNetSinusoidalPositionalEmbedding': Result := TNNetSinusoidalPositionalEmbedding.Create(St[0]);
       'TNNetSinusoidalTimeEmbedding': Result := TNNetSinusoidalTimeEmbedding.Create(St[0], St[1]);
       'TNNetEmbedding':             Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]);
@@ -82301,6 +82627,7 @@ begin
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
+      if S[0] = 'TNNetTokenLayerNorm' then Result := TNNetTokenLayerNorm.Create(Ft[0]) else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
       if S[0] = 'TNNetRMSNormGated' then Result := TNNetRMSNormGated.Create() else
       if S[0] = 'TNNetSwitchableNorm' then Result := TNNetSwitchableNorm.Create() else
@@ -82362,6 +82689,7 @@ begin
       if S[0] = 'TNNetLocalResponseNormDepth' then Result := TNNetLocalResponseNormDepth.Create(St[0]) else
       if S[0] = 'TNNetAddAndDiv' then Result := TNNetAddAndDiv.Create(St[0], St[1]) else
       if S[0] = 'TNNetAddPositionalEmbedding' then Result := TNNetAddPositionalEmbedding.Create(St[0]) else
+      if S[0] = 'TNNetLearnedPositionalEmbedding' then Result := TNNetLearnedPositionalEmbedding.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetSinusoidalPositionalEmbedding' then Result := TNNetSinusoidalPositionalEmbedding.Create(St[0]) else
       if S[0] = 'TNNetSinusoidalTimeEmbedding' then Result := TNNetSinusoidalTimeEmbedding.Create(St[0], St[1]) else
       if S[0] = 'TNNetEmbedding' then Result := TNNetEmbedding.Create(St[0], St[1], St[2], Ft[0]) else
@@ -86658,6 +86986,11 @@ begin
       FNeurons[Cnt].FBiasInertia2:= 0;
     end;
   end
+end;
+
+procedure TNNetLayer.FlushWeightCache();
+begin
+  AfterWeightUpdate();
 end;
 
 procedure TNNetLayer.ClearTimes();
