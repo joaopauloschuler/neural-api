@@ -77,6 +77,32 @@ type
     procedure ReSet(); override;
   end;
 
+  // AdamW optimization method (Loshchilov & Hutter, "Decoupled Weight Decay
+  // Regularization", 2019). Runs exactly the same Adam step as
+  // TNeuralOptimizerAdam and then applies the weight decay DIRECTLY to the
+  // weights: W := W * (1 - CurrentLearningRate * WeightDecay). The decay
+  // term never passes through the Adam moment estimates - that is the
+  // difference vs adding an L2 term to the gradient. Biases are never
+  // decayed and normalization layers (TNNetLayerNorm, TNNetTokenLayerNorm,
+  // TNNetRMSNorm, TNNetGroupNorm, channel normalizations, ...) are skipped;
+  // see TNNet.ApplyDecoupledWeightDecay. With WeightDecay = 0 this optimizer
+  // behaves exactly like TNeuralOptimizerAdam.
+  // Coded by Claude (AI).
+  TNeuralOptimizerAdamW = class(TNeuralOptimizerAdam)
+  protected
+    FWeightDecay: TNeuralFloat;
+  public
+    constructor Create(
+      Beta1: TNeuralFloat = 0.9;
+      Beta2: TNeuralFloat = 0.98;
+      Epsilon: TNeuralFloat = 1e-07;
+      WeightDecay: TNeuralFloat = 0.01); overload;
+
+    procedure Optimize(); override;
+
+    property WeightDecay: TNeuralFloat read FWeightDecay write FWeightDecay;
+  end;
+
   TCustomLearningRateScheduleFn = function(Epoch: integer): single;
   TCustomLearningRateScheduleObjFn = function(Epoch: integer): single of object;
 
@@ -135,6 +161,7 @@ type
       FValidationError, FValidationLoss: TNeuralFloat;
       FMinBackpropagationError: TNeuralFloat;
       FMinBackpropagationErrorProportion: TNeuralFloat;
+      FLabelSmoothing: single;
       FLoadBestAdEnd: boolean;
       FTestBestAtEnd: boolean;
       {$IFDEF OpenCL}
@@ -154,6 +181,14 @@ type
       constructor Create(); override;
       destructor Destroy(); override;
       procedure WaitUntilFinished;
+      // Applies label smoothing in place to a classification target volume:
+      // Target := (1 - LabelSmoothing) * Target + LabelSmoothing / NumClasses
+      // where NumClasses = TargetVolume.Size. With LabelSmoothing = 0 (the
+      // default) the volume is left bit-for-bit untouched. Called by the
+      // classification training paths (e.g. TNeuralImageFit) right after the
+      // one-hot target is built; public so custom GetTrainingPair/Proc
+      // implementations can reuse it.
+      procedure ApplyLabelSmoothing(TargetVolume: TNNetVolume);
       {$IFDEF OpenCL}
       procedure DisableOpenCL();
       procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
@@ -180,6 +215,11 @@ type
       property InitialEpoch: integer read FInitialEpoch write FInitialEpoch;
       property InitialLearningRate: single read FInitialLearningRate write FInitialLearningRate;
       property LearningRateDecay: single read FLearningRateDecay write FLearningRateDecay;
+      /// Label smoothing epsilon for classification training targets.
+      // 0 (default) keeps targets exactly as today (pure one-hot). When > 0,
+      // training targets become (1-eps)*onehot + eps/NumClasses. Applied at
+      // training time only (validation/test targets stay hard one-hot).
+      property LabelSmoothing: single read FLabelSmoothing write FLabelSmoothing;
       property LoadBestAtEnd: boolean read FLoadBestAdEnd write FLoadBestAdEnd;
       property LogEveryBatches: integer read FLogEveryBatches write FLogEveryBatches;
       property L2Decay: single read FL2Decay write FL2Decay;
@@ -1978,6 +2018,28 @@ begin
   InitAdam(FBeta1, FBeta2, FEpsilon);
 end;
 
+{ TNeuralOptimizerAdamW }
+
+constructor TNeuralOptimizerAdamW.Create(Beta1: TNeuralFloat;
+  Beta2: TNeuralFloat; Epsilon: TNeuralFloat; WeightDecay: TNeuralFloat);
+begin
+  inherited Create(Beta1, Beta2, Epsilon);
+  FWeightDecay := WeightDecay;
+end;
+
+procedure TNeuralOptimizerAdamW.Optimize();
+begin
+  // Exactly the plain Adam step...
+  inherited Optimize();
+  // ...followed by the decoupled weight decay step. The decay is applied
+  // directly to the weights (scaled by the current learning rate, as in the
+  // original AdamW schedule) and never enters the Adam moment estimates.
+  if FWeightDecay > 0 then
+  begin
+    FNN.ApplyDecoupledWeightDecay(FFit.CurrentLearningRate * FWeightDecay);
+  end;
+end;
+
 { TNeuralFitBase }
 constructor TNeuralFitBase.Create();
 begin
@@ -2011,6 +2073,7 @@ begin
   FInitialEpoch := 0;
   FMinBackpropagationError := 0;
   FMinBackpropagationErrorProportion := 0.25;
+  FLabelSmoothing := 0;
   FInertia := 0.9;
   FClipDelta := 0.0;
   FClipNorm := 1.0;
@@ -2055,6 +2118,17 @@ begin
   while FRunning do
   begin
     Sleep(1);
+  end;
+end;
+
+procedure TNeuralFitBase.ApplyLabelSmoothing(TargetVolume: TNNetVolume);
+begin
+  // With FLabelSmoothing = 0, the target volume is not touched at all so
+  // the produced targets are bit-for-bit identical to the unsmoothed path.
+  if (FLabelSmoothing > 0) and (TargetVolume.Size > 0) then
+  begin
+    TargetVolume.Mul(1 - FLabelSmoothing);
+    TargetVolume.Add(FLabelSmoothing / TargetVolume.Size);
   end;
 end;
 
@@ -2740,6 +2814,9 @@ begin
     if FIsSoftmax
       then vOutput.SetClassForSoftMax( ImgInput.Tag )
       else vOutput.SetClass( ImgInput.Tag, +0.9, -0.1);
+    // Optional label smoothing on the TRAINING target only (no-op when
+    // LabelSmoothing = 0). Validation/test targets stay hard one-hot.
+    ApplyLabelSmoothing( vOutput );
 
     CurrentError := vOutput.SumDiff( pOutput );
     LocalErrorSum := LocalErrorSum + CurrentError;

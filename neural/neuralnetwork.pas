@@ -12000,6 +12000,15 @@ type
       procedure MulAddWeights(Value: TNeuralFloat; Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure MulAddInertia(Value: TNeuralFloat; Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure MulWeights(V: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      // AdamW-style decoupled weight decay (Loshchilov & Hutter, 2019):
+      // multiplies every decayable weight by (1 - DecayRate), directly on
+      // the weights so the decay never flows through optimizer moment
+      // estimates. Biases are never decayed. Skips normalization layers
+      // (TNNetIdentityWithoutL2 descendants such as TNNetLayerNorm,
+      // TNNetTokenLayerNorm, TNNetRMSNorm, TNNetGroupNorm, and
+      // TNNetChannelZeroCenter descendants) and layers with linked
+      // (shared) neurons.
+      procedure ApplyDecoupledWeightDecay(DecayRate: TNeuralFloat);
       procedure MulDeltas(V: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SumWeights(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
       procedure SumInertia(Origin: TNNet); {$IFDEF Release} inline; {$ENDIF}
@@ -84485,6 +84494,38 @@ begin
     begin
       if not(FLayers[LayerCnt].LinkedNeurons) then FLayers[LayerCnt].MulWeights( V );
     end;
+  end;
+end;
+
+// Implements the decoupled weight decay step from AdamW (Loshchilov &
+// Hutter, "Decoupled Weight Decay Regularization", 2019). Multiplies the
+// weights (not the biases) of decayable layers by (1 - DecayRate) directly,
+// so the decay term does NOT pass through Adam moment estimates. Skipped:
+// per-neuron biases; layers with linked/shared neurons (weights owned by
+// another layer); TNNetIdentityWithoutL2 descendants (normalization gains
+// and biases such as TNNetLayerNorm/TNNetTokenLayerNorm/TNNetRMSNorm/
+// TNNetGroupNorm, positional embeddings, channel transforms); and
+// TNNetChannelZeroCenter descendants (channel normalization family).
+procedure TNNet.ApplyDecoupledWeightDecay(DecayRate: TNeuralFloat);
+var
+  LayerCnt, NeuronCnt: integer;
+  CurrentLayer: TNNetLayer;
+  Factor: TNeuralFloat;
+begin
+  if DecayRate = 0 then exit;
+  Factor := 1 - DecayRate;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    CurrentLayer := FLayers[LayerCnt];
+    if CurrentLayer.LinkedNeurons then Continue;
+    if CurrentLayer is TNNetIdentityWithoutL2 then Continue;
+    if CurrentLayer is TNNetChannelZeroCenter then Continue;
+    if CurrentLayer.Neurons.Count = 0 then Continue;
+    for NeuronCnt := 0 to CurrentLayer.Neurons.Count - 1 do
+    begin
+      CurrentLayer.Neurons[NeuronCnt].Weights.Mul(Factor);
+    end;
+    CurrentLayer.AfterWeightUpdate();
   end;
 end;
 
