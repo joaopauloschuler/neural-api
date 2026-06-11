@@ -1388,6 +1388,7 @@ In short, this API supports:
 * Stop sequences: `GenerateTokensStreamed` accepts token-id stop sequences and `GenerateStringStreamed`/`DecodeGreedy` accept stop strings — generation terminates when a stop is emitted and the stop tokens/text are trimmed from the output.
 * A tokenizer: `TNeuralTokenizer`.
 * A transformer decoder: `AddTransformerBlockCAI`.
+* Preference alignment with Direct Preference Optimization (DPO, Rafailov et al. 2023): `TNeuralDPOTrainer` in `neural/neuraldpo.pas` fine-tunes a next-token LM on (prompt, chosen, rejected) preference pairs against a frozen reference clone — `loss = -ln sigmoid(beta*((logpi_c-logref_c)-(logpi_r-logref_r)))`, no reward model, no RL. See the [DPO fine-tuning example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/DPOFineTune).
 
 ## Publications from the Author
 In the case that you would like to know more about what the CAI's author is working at, here we go.
