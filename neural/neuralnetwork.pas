@@ -3457,6 +3457,37 @@ type
     property ProjDim: integer read FProjDim;
   end;
 
+  /// Long-context scaling modes for TNNetRotaryEmbedding (all opt-in;
+  // rsmNone is the default and keeps the layer bit-for-bit identical to the
+  // original unscaled RoPE):
+  //   rsmNone                  - no scaling (original RoPE).
+  //   rsmPositionInterpolation - Position Interpolation (Chen et al. 2023):
+  //     the angle uses position m/s instead of m, where s >= 1 is the
+  //     context-extension factor (TargetLen/TrainLen). Implemented by
+  //     dividing every theta_i by s.
+  //   rsmNTKAware              - NTK-aware scaling (bloc97 2023): positions
+  //     are unchanged; the base is rescaled to base' = base * s^(d/(d-2))
+  //     where d is the rotary dimension count, so high-frequency dims are
+  //     barely touched (theta_0 = 1 exactly for any base) while
+  //     low-frequency dims are slowed roughly as in interpolation.
+  //   rsmYaRN                  - YaRN (Peng et al. 2023): per-frequency-band
+  //     ramp. With wavelength lambda_i = 2*pi/theta_i and ratio
+  //     r_i = TrainLen/lambda_i, dims with r_i >= beta (default 32) keep
+  //     their original theta_i; dims with r_i <= alpha (default 1) are fully
+  //     interpolated (theta_i/s); in between the two are linearly blended:
+  //     theta'_i = (1-gamma_i)*theta_i/s + gamma_i*theta_i with
+  //     gamma_i = clamp((r_i - alpha)/(beta - alpha), 0, 1). YaRN also
+  //     applies the attention-temperature correction t = 0.1*ln(s) + 1 by
+  //     multiplying the rotated output by sqrt(1/t). NOTE: this assumes the
+  //     layer is applied to BOTH the q and the k streams (which is how the
+  //     builders in this unit use it - AddMultiHeadSDPAConcat and the
+  //     DeepSeek-MLA builder each insert one TNNetRotaryEmbedding on the Q
+  //     slice and one on the K slice), so attention logits q.k pick up the
+  //     full 1/t factor.
+  // Coded by Claude (AI).
+  TNNetRoPEScalingMode = (rsmNone, rsmPositionInterpolation, rsmNTKAware,
+    rsmYaRN);
+
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
   // Parameter-free, applies a fixed position-dependent 2D rotation to
   // consecutive pairs of channels.
@@ -3476,14 +3507,38 @@ type
   // PositionOffset to the token's ABSOLUTE position (the running cache length
   // BEFORE the step) so the cached path matches a full forward. Training is
   // bit-for-bit unchanged at the default 0.
+  // Long-context scaling (see TNNetRoPEScalingMode): the appended optional
+  // constructor arguments select Position Interpolation, NTK-aware or YaRN
+  // scaling. The default (rsmNone) is bit-for-bit identical to the original
+  // layer. Serialization: FFloatSt[0]=base (as before); when a scaling mode
+  // is active, FStruct[0]=Ord(mode), FStruct[1]=OriginalContextLen,
+  // FFloatSt[1]=ScaleFactor, FFloatSt[2]=YarnAlpha, FFloatSt[3]=YarnBeta.
+  // With rsmNone those slots stay 0 so the saved format is unchanged and
+  // OLD files (zeros in the slots) load as "no scaling".
   // Coded by Claude (AI).
   TNNetRotaryEmbedding = class(TNNetIdentity)
   private
     FPositionOffset: integer;
+    // Cached per-pair effective theta values (FTheta[pairIdx]) and the YaRN
+    // output scale sqrt(1/t); rebuilt from FStruct/FFloatSt by
+    // BuildThetaCache whenever the depth changes.
+    FTheta: array of TNeuralFloat;
+    FOutScale: TNeuralFloat;
+    procedure BuildThetaCache(pDepth: integer);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload;
-    constructor Create(pBase: TNeuralFloat); overload;
+    constructor Create(pBase: TNeuralFloat;
+      pScalingMode: TNNetRoPEScalingMode = rsmNone;
+      pScaleFactor: TNeuralFloat = 1.0;
+      pOriginalContextLen: integer = 0;
+      pYarnAlpha: TNeuralFloat = 1.0;
+      pYarnBeta: TNeuralFloat = 32.0); overload;
+    function GetScalingMode(): TNNetRoPEScalingMode;
+    function GetScaleFactor(): TNeuralFloat;
+    function GetOriginalContextLen(): integer;
+    function GetYarnAlpha(): TNeuralFloat;
+    function GetYarnBeta(): TNeuralFloat;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     property PositionOffset: integer read FPositionOffset write FPositionOffset;
@@ -24635,13 +24690,122 @@ begin
   Create(10000.0);
 end;
 
-constructor TNNetRotaryEmbedding.Create(pBase: TNeuralFloat);
+constructor TNNetRotaryEmbedding.Create(pBase: TNeuralFloat;
+  pScalingMode: TNNetRoPEScalingMode; pScaleFactor: TNeuralFloat;
+  pOriginalContextLen: integer; pYarnAlpha: TNeuralFloat;
+  pYarnBeta: TNeuralFloat);
 begin
   inherited Create();
   if pBase <= 0 then
     FErrorProc('TNNetRotaryEmbedding base must be positive. Got base=' +
       FloatToStr(pBase));
   FFloatSt[0] := pBase;
+  FOutScale := 1.0;
+  // Only write the scaling slots when a mode is active so a default-mode
+  // layer serializes exactly as before (and old files with zeros in these
+  // slots load as "no scaling").
+  if pScalingMode <> rsmNone then
+  begin
+    if pScaleFactor < 1 then
+      FErrorProc('TNNetRotaryEmbedding scaling requires ScaleFactor >= 1. ' +
+        'Got ScaleFactor=' + FloatToStr(pScaleFactor));
+    if pScalingMode = rsmYaRN then
+    begin
+      if pOriginalContextLen <= 0 then
+        FErrorProc('TNNetRotaryEmbedding YaRN requires OriginalContextLen > 0. ' +
+          'Got OriginalContextLen=' + IntToStr(pOriginalContextLen));
+      if pYarnBeta <= pYarnAlpha then
+        FErrorProc('TNNetRotaryEmbedding YaRN requires beta > alpha. Got alpha=' +
+          FloatToStr(pYarnAlpha) + ' beta=' + FloatToStr(pYarnBeta));
+    end;
+    FStruct[0] := Ord(pScalingMode);
+    FStruct[1] := pOriginalContextLen;
+    FFloatSt[1] := pScaleFactor;
+    FFloatSt[2] := pYarnAlpha;
+    FFloatSt[3] := pYarnBeta;
+  end;
+end;
+
+function TNNetRotaryEmbedding.GetScalingMode(): TNNetRoPEScalingMode;
+begin
+  Result := TNNetRoPEScalingMode(FStruct[0]);
+end;
+
+function TNNetRotaryEmbedding.GetScaleFactor(): TNeuralFloat;
+begin
+  Result := FFloatSt[1];
+  if Result <= 0 then Result := 1.0;
+end;
+
+function TNNetRotaryEmbedding.GetOriginalContextLen(): integer;
+begin
+  Result := FStruct[1];
+end;
+
+function TNNetRotaryEmbedding.GetYarnAlpha(): TNeuralFloat;
+begin
+  Result := FFloatSt[2];
+end;
+
+function TNNetRotaryEmbedding.GetYarnBeta(): TNeuralFloat;
+begin
+  Result := FFloatSt[3];
+end;
+
+procedure TNNetRotaryEmbedding.BuildThetaCache(pDepth: integer);
+var
+  HalfD, pairIdx: integer;
+  Base, InvD, Theta, Scale, Alpha, Beta, TrainLen: TNeuralFloat;
+  Lambda, Ratio, Gamma, Temperature: TNeuralFloat;
+  Mode: TNNetRoPEScalingMode;
+begin
+  HalfD := pDepth div 2;
+  SetLength(FTheta, HalfD);
+  Base := FFloatSt[0];
+  if Base <= 0 then Base := 10000.0;
+  Mode := TNNetRoPEScalingMode(FStruct[0]);
+  Scale := GetScaleFactor();
+  Alpha := FFloatSt[2];
+  Beta := FFloatSt[3];
+  if Beta <= Alpha then
+  begin
+    Alpha := 1.0;
+    Beta := 32.0;
+  end;
+  TrainLen := FStruct[1];
+  FOutScale := 1.0;
+  // NTK-aware scaling: positions unchanged, base' = base * s^(d/(d-2)).
+  if (Mode = rsmNTKAware) and (pDepth > 2) then
+    Base := Base * pcr_expf((pDepth / (pDepth - 2)) * pcr_logf(Scale));
+  InvD := 1.0 / pDepth;
+  for pairIdx := 0 to HalfD - 1 do
+  begin
+    Theta := pcr_expf(-2.0 * pairIdx * InvD * pcr_logf(Base));
+    case Mode of
+      // Position Interpolation: angle uses m/s, i.e. theta' = theta/s.
+      rsmPositionInterpolation: Theta := Theta / Scale;
+      rsmYaRN:
+        begin
+          // gamma=1 (r >= beta, short wavelength) keeps theta; gamma=0
+          // (r <= alpha) fully interpolates to theta/s; blend in between.
+          Lambda := 2.0 * Pi / Theta;
+          Ratio := TrainLen / Lambda;
+          Gamma := (Ratio - Alpha) / (Beta - Alpha);
+          if Gamma < 0 then Gamma := 0;
+          if Gamma > 1 then Gamma := 1;
+          Theta := (1.0 - Gamma) * (Theta / Scale) + Gamma * Theta;
+        end;
+    end;
+    FTheta[pairIdx] := Theta;
+  end;
+  // YaRN attention temperature t = 0.1*ln(s)+1: the rotated output is
+  // multiplied by sqrt(1/t). Applied to BOTH q and k (the builders insert
+  // this layer on both streams), attention logits gain the full 1/t.
+  if Mode = rsmYaRN then
+  begin
+    Temperature := 0.1 * pcr_logf(Scale) + 1.0;
+    FOutScale := Sqrt(1.0 / Temperature);
+  end;
 end;
 
 procedure TNNetRotaryEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -24654,6 +24818,7 @@ begin
   if pPrevLayer.FOutput.SizeY <> 1 then
     FErrorProc('TNNetRotaryEmbedding requires SizeY=1, got SizeY=' +
       IntToStr(pPrevLayer.FOutput.SizeY));
+  BuildThetaCache(pPrevLayer.FOutput.Depth);
 end;
 
 procedure TNNetRotaryEmbedding.Compute();
@@ -24661,7 +24826,7 @@ var
   StartTime: double;
   SeqLen, Depth, HalfD: integer;
   pos, k: integer;
-  Base, InvD, Angle, c, s, x0, x1: TNeuralFloat;
+  Angle, c, s, x0, x1: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   StartTime := Now();
@@ -24669,20 +24834,19 @@ begin
   SeqLen := Prev.SizeX;
   Depth := Prev.Depth;
   HalfD := Depth div 2;
-  Base := FFloatSt[0];
-  if Base <= 0 then Base := 10000.0;
-  InvD := 1.0 / Depth;
+  if Length(FTheta) <> HalfD then BuildThetaCache(Depth);
   for pos := 0 to SeqLen - 1 do
   begin
     for k := 0 to HalfD - 1 do
     begin
-      Angle := (pos + FPositionOffset) *
-        pcr_expf(-2.0 * k * InvD * pcr_logf(Base));
+      Angle := (pos + FPositionOffset) * FTheta[k];
       pcr_sincosf(Angle, s, c);
       x0 := Prev[pos, 0, 2 * k];
       x1 := Prev[pos, 0, 2 * k + 1];
-      FOutput[pos, 0, 2 * k]     := c * x0 - s * x1;
-      FOutput[pos, 0, 2 * k + 1] := s * x0 + c * x1;
+      // FOutScale is exactly 1.0 except in YaRN mode (sqrt(1/t)), so the
+      // default path is bit-for-bit unchanged.
+      FOutput[pos, 0, 2 * k]     := FOutScale * (c * x0 - s * x1);
+      FOutput[pos, 0, 2 * k + 1] := FOutScale * (s * x0 + c * x1);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -24693,7 +24857,7 @@ var
   StartTime: double;
   SeqLen, Depth, HalfD: integer;
   pos, k: integer;
-  Base, InvD, Angle, c, s, gy0, gy1: TNeuralFloat;
+  Angle, c, s, gy0, gy1: TNeuralFloat;
   PrevErr: TNNetVolume;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -24708,22 +24872,21 @@ begin
     SeqLen := FOutput.SizeX;
     Depth := FOutput.Depth;
     HalfD := Depth div 2;
-    Base := FFloatSt[0];
-    if Base <= 0 then Base := 10000.0;
-    InvD := 1.0 / Depth;
+    if Length(FTheta) <> HalfD then BuildThetaCache(Depth);
     for pos := 0 to SeqLen - 1 do
     begin
       for k := 0 to HalfD - 1 do
       begin
-        Angle := (pos + FPositionOffset) *
-          pcr_expf(-2.0 * k * InvD * pcr_logf(Base));
+        Angle := (pos + FPositionOffset) * FTheta[k];
         pcr_sincosf(Angle, s, c);
         gy0 := FOutputError[pos, 0, 2 * k];
         gy1 := FOutputError[pos, 0, 2 * k + 1];
-        // Transpose rotation: gx0 =  c*gy0 + s*gy1
-        //                     gx1 = -s*gy0 + c*gy1
-        PrevErr.Add(pos, 0, 2 * k,      c * gy0 + s * gy1);
-        PrevErr.Add(pos, 0, 2 * k + 1, -s * gy0 + c * gy1);
+        // Transpose rotation (times FOutScale, the YaRN sqrt(1/t) factor;
+        // exactly 1.0 outside YaRN mode):
+        //   gx0 = FOutScale * ( c*gy0 + s*gy1)
+        //   gx1 = FOutScale * (-s*gy0 + c*gy1)
+        PrevErr.Add(pos, 0, 2 * k,      FOutScale * (c * gy0 + s * gy1));
+        PrevErr.Add(pos, 0, 2 * k + 1,  FOutScale * (-s * gy0 + c * gy1));
       end;
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -80745,7 +80908,7 @@ begin
       'TNNetPerformerAttention' :   Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
-      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0]);
+      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -81120,7 +81283,7 @@ begin
       if S[0] = 'TNNetPerformerAttention' then Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
-      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0]) else
+      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else

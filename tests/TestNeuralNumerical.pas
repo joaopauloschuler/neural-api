@@ -825,6 +825,12 @@ type
     procedure TestRotaryEmbeddingInverse;
     procedure TestRotaryEmbeddingInverseSeqLen5;
     procedure TestRotaryEmbeddingOddDepthGuard;
+    procedure TestRoPEScalingNoneBitIdentical;
+    procedure TestRoPEScalingPIHalfPositions;
+    procedure TestRoPEScalingNTKDimSelective;
+    procedure TestRoPEScalingYaRNBands;
+    procedure TestRoPEScalingSerializationRoundTrip;
+    procedure TestRoPEScalingGradientChecks;
     procedure TestDropPathPZeroBoundary;
     procedure TestDropPathPOneBoundary;
     procedure TestDropPathDeterminismFixedSeed;
@@ -12667,6 +12673,401 @@ begin
     NN.Free;
     Capture.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEScalingNoneBitIdentical;
+var
+  NNNone, NNPI: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Depth, pos, d, pairIdx: integer;
+  Base, theta, angle, c, s, x0, x1: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  // (a) The default (rsmNone) layer must reproduce the pre-change baseline
+  // formula angle = pos * base^(-2k/d), and a Position-Interpolation layer
+  // with ScaleFactor=1 must match the rsmNone output exactly.
+  SeqLen := 5;
+  Depth := 6;
+  Base := 10000.0;
+  NNNone := TNNet.Create();
+  NNPI := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NNNone.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNNone.AddLayer(TNNetRotaryEmbedding.Create(Base));
+    NNPI.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNPI.AddLayer(TNNetRotaryEmbedding.Create(Base,
+      rsmPositionInterpolation, 1.0, 128));
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := Sin((pos * Depth + d) * 0.53) * 0.9 + 0.05;
+
+    NNNone.Compute(Input);
+    NNPI.Compute(Input);
+
+    // Baseline formula check (frozen pre-change semantics).
+    for pos := 0 to SeqLen - 1 do
+      for pairIdx := 0 to (Depth div 2) - 1 do
+      begin
+        theta := Exp(-2.0 * pairIdx / Depth * Ln(Base));
+        angle := pos * theta;
+        c := Cos(angle);
+        s := Sin(angle);
+        x0 := Input[pos, 0, 2 * pairIdx];
+        x1 := Input[pos, 0, 2 * pairIdx + 1];
+        AssertEquals('RoPE none baseline y0 pos=' + IntToStr(pos) +
+          ' k=' + IntToStr(pairIdx),
+          c * x0 - s * x1, NNNone.GetLastLayer.Output[pos, 0, 2 * pairIdx], 1e-5);
+        AssertEquals('RoPE none baseline y1 pos=' + IntToStr(pos) +
+          ' k=' + IntToStr(pairIdx),
+          s * x0 + c * x1, NNNone.GetLastLayer.Output[pos, 0, 2 * pairIdx + 1], 1e-5);
+      end;
+
+    // PI with s=1 must equal rsmNone output.
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        AssertEquals('RoPE PI s=1 equals none pos=' + IntToStr(pos) +
+          ' d=' + IntToStr(d),
+          NNNone.GetLastLayer.Output[pos, 0, d],
+          NNPI.GetLastLayer.Output[pos, 0, d], 1e-7);
+  finally
+    NNNone.Free;
+    NNPI.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEScalingPIHalfPositions;
+var
+  NNNone, NNPI: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Depth, pos, d: integer;
+begin
+  RandSeed := 424242;
+  // (b) Position Interpolation with s=2 rotates position m by the angle the
+  // unscaled layer uses at position m/2. With a position-CONSTANT input
+  // (every token carries the same vector), the PI output at even position m
+  // must therefore equal the unscaled output at position m/2 exactly.
+  SeqLen := 8;
+  Depth := 4;
+  NNNone := TNNet.Create();
+  NNPI := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NNNone.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNNone.AddLayer(TNNetRotaryEmbedding.Create(10000.0));
+    NNPI.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNPI.AddLayer(TNNetRotaryEmbedding.Create(10000.0,
+      rsmPositionInterpolation, 2.0, 256));
+
+    // Same vector at every position.
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := Cos(d * 0.91) * 0.8 - 0.15;
+
+    NNNone.Compute(Input);
+    NNPI.Compute(Input);
+
+    pos := 0;
+    while pos < SeqLen do
+    begin
+      for d := 0 to Depth - 1 do
+        AssertEquals('RoPE PI s=2 pos=' + IntToStr(pos) + ' equals none pos=' +
+          IntToStr(pos div 2) + ' d=' + IntToStr(d),
+          NNNone.GetLastLayer.Output[pos div 2, 0, d],
+          NNPI.GetLastLayer.Output[pos, 0, d], 1e-5);
+      pos := pos + 2;
+    end;
+  finally
+    NNNone.Free;
+    NNPI.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEScalingNTKDimSelective;
+var
+  NNNone, NNPI, NNNTK: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Depth, HalfD, pos, pairIdx: integer;
+  ExpBase, ExpTheta, Scale: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  // (c) NTK-aware scaling rescales the base, not the positions: the
+  // highest-frequency pair (k=0, theta=base^0=1 for ANY base) is untouched,
+  // unlike uniform PI which slows every dim by 1/s. Low-frequency pairs DO
+  // change. Input is (1,0) in every pair so output[2k+1] = sin(angle_k).
+  SeqLen := 8;
+  Depth := 8;
+  HalfD := Depth div 2;
+  Scale := 4.0;
+  NNNone := TNNet.Create();
+  NNPI := TNNet.Create();
+  NNNTK := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NNNone.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNNone.AddLayer(TNNetRotaryEmbedding.Create(10000.0));
+    NNPI.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNPI.AddLayer(TNNetRotaryEmbedding.Create(10000.0,
+      rsmPositionInterpolation, Scale, 512));
+    NNNTK.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNNTK.AddLayer(TNNetRotaryEmbedding.Create(10000.0,
+      rsmNTKAware, Scale, 512));
+
+    Input.Fill(0);
+    for pos := 0 to SeqLen - 1 do
+      for pairIdx := 0 to HalfD - 1 do
+        Input[pos, 0, 2 * pairIdx] := 1.0;
+
+    NNNone.Compute(Input);
+    NNPI.Compute(Input);
+    NNNTK.Compute(Input);
+
+    // Pair 0: NTK identical to unscaled at every position...
+    for pos := 0 to SeqLen - 1 do
+    begin
+      AssertEquals('NTK pair0 y0 unchanged pos=' + IntToStr(pos),
+        NNNone.GetLastLayer.Output[pos, 0, 0],
+        NNNTK.GetLastLayer.Output[pos, 0, 0], 1e-6);
+      AssertEquals('NTK pair0 y1 unchanged pos=' + IntToStr(pos),
+        NNNone.GetLastLayer.Output[pos, 0, 1],
+        NNNTK.GetLastLayer.Output[pos, 0, 1], 1e-6);
+    end;
+    // ...while uniform PI visibly changes pair 0 (sin(1) vs sin(0.25)).
+    AssertTrue('PI changes pair0 at pos=1',
+      Abs(NNPI.GetLastLayer.Output[1, 0, 1] -
+          NNNone.GetLastLayer.Output[1, 0, 1]) > 1e-3);
+
+    // The lowest-frequency pair IS changed by NTK
+    // (sin(7*1e-3) vs sin(7*base'^(-3/4)), base' = base*4^(8/6)).
+    AssertTrue('NTK changes last pair at pos=7',
+      Abs(NNNTK.GetLastLayer.Output[7, 0, 2 * (HalfD - 1) + 1] -
+          NNNone.GetLastLayer.Output[7, 0, 2 * (HalfD - 1) + 1]) > 1e-3);
+
+    // Exact formula check: theta'_k = (base * s^(d/(d-2)))^(-2k/d).
+    ExpBase := 10000.0 * Exp((Depth / (Depth - 2)) * Ln(Scale));
+    for pos := 0 to SeqLen - 1 do
+      for pairIdx := 0 to HalfD - 1 do
+      begin
+        ExpTheta := Exp(-2.0 * pairIdx / Depth * Ln(ExpBase));
+        AssertEquals('NTK formula y1 pos=' + IntToStr(pos) +
+          ' k=' + IntToStr(pairIdx),
+          Sin(pos * ExpTheta),
+          NNNTK.GetLastLayer.Output[pos, 0, 2 * pairIdx + 1], 1e-5);
+      end;
+  finally
+    NNNone.Free;
+    NNPI.Free;
+    NNNTK.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEScalingYaRNBands;
+var
+  NNNone, NNPI, NNYaRN: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Depth, pos, d: integer;
+  Scale, Temperature, OutScale: TNeuralFloat;
+  InNormSq, OutNormSq, yNone, yPI, yYaRN: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  // (d) YaRN per-band ramp with base=10000, d=8, TrainLen=512, s=2,
+  // alpha=1, beta=32. Per-pair wavelength ratios r = 512/(2*pi*base^(2k/8)):
+  //   k=0: r=81.5  >= beta  -> theta unchanged (matches unscaled angles)
+  //   k=1: r=8.15  in (1,32)-> blended, strictly between PI and unscaled
+  //   k=2: r=0.815 <= alpha -> fully interpolated (matches PI angles)
+  //   k=3: r=0.081 <= alpha -> fully interpolated
+  // plus the attention temperature t = 0.1*ln(s)+1 applied as sqrt(1/t) on
+  // the output (this layer sits on BOTH q and k streams in the builders).
+  SeqLen := 4;
+  Depth := 8;
+  Scale := 2.0;
+  Temperature := 0.1 * Ln(Scale) + 1.0;
+  OutScale := Sqrt(1.0 / Temperature);
+  NNNone := TNNet.Create();
+  NNPI := TNNet.Create();
+  NNYaRN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NNNone.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNNone.AddLayer(TNNetRotaryEmbedding.Create(10000.0));
+    NNPI.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNPI.AddLayer(TNNetRotaryEmbedding.Create(10000.0,
+      rsmPositionInterpolation, Scale, 512));
+    NNYaRN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNYaRN.AddLayer(TNNetRotaryEmbedding.Create(10000.0,
+      rsmYaRN, Scale, 512, 1.0, 32.0));
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := Sin((pos * Depth + d) * 0.47) * 0.9 + 0.1;
+
+    NNNone.Compute(Input);
+    NNPI.Compute(Input);
+    NNYaRN.Compute(Input);
+
+    for pos := 0 to SeqLen - 1 do
+    begin
+      // k=0 (r >= beta): YaRN angle == unscaled angle (output only differs
+      // by the temperature factor).
+      for d := 0 to 1 do
+        AssertEquals('YaRN k=0 matches unscaled pos=' + IntToStr(pos) +
+          ' d=' + IntToStr(d),
+          OutScale * NNNone.GetLastLayer.Output[pos, 0, d],
+          NNYaRN.GetLastLayer.Output[pos, 0, d], 1e-5);
+      // k=2,3 (r <= alpha): YaRN angle == PI angle.
+      for d := 4 to Depth - 1 do
+        AssertEquals('YaRN k>=2 matches PI pos=' + IntToStr(pos) +
+          ' d=' + IntToStr(d),
+          OutScale * NNPI.GetLastLayer.Output[pos, 0, d],
+          NNYaRN.GetLastLayer.Output[pos, 0, d], 1e-5);
+    end;
+
+    // k=1 blend: the effective angle pos*theta'_1 is strictly between the PI
+    // angle pos*theta_1/2 and the unscaled angle pos*theta_1. With
+    // theta_1=0.1 and pos<=3 all angles are < pi/2 where sin is strictly
+    // increasing, so compare the sin components (input pair (x0,x1) fixed
+    // per position; y1 = sin(a)*x0 + cos(a)*x1 is monotonic in a only for
+    // the pure-sin part, so use a (1,0) probe computed analytically instead:
+    // y1 difference dominated by sin'(a)>0 here). Simplest robust check:
+    // angle recovered via the rotation applied to the actual pair must be
+    // strictly between. We verify via the (rescaled) outputs at pos=1 with
+    // analytic angles.
+    for pos := 1 to SeqLen - 1 do
+    begin
+      yNone := pos * 0.1;                      // unscaled angle, k=1
+      yPI := pos * 0.05;                       // fully interpolated angle
+      // expected blended angle: gamma=(8.149-1)/31
+      yYaRN := pos * (((1.0 - (512.0 / (2.0 * Pi / 0.1) - 1.0) / 31.0) * 0.05 +
+        ((512.0 / (2.0 * Pi / 0.1) - 1.0) / 31.0) * 0.1));
+      AssertTrue('YaRN k=1 blended angle strictly between pos=' + IntToStr(pos),
+        (yYaRN > yPI) and (yYaRN < yNone));
+      AssertEquals('YaRN k=1 blended y0 pos=' + IntToStr(pos),
+        OutScale * (Cos(yYaRN) * Input[pos, 0, 2] - Sin(yYaRN) * Input[pos, 0, 3]),
+        NNYaRN.GetLastLayer.Output[pos, 0, 2], 1e-5);
+      AssertEquals('YaRN k=1 blended y1 pos=' + IntToStr(pos),
+        OutScale * (Sin(yYaRN) * Input[pos, 0, 2] + Cos(yYaRN) * Input[pos, 0, 3]),
+        NNYaRN.GetLastLayer.Output[pos, 0, 3], 1e-5);
+    end;
+
+    // Temperature norm check: rotations preserve norm, so
+    // ||out||^2 = (1/t) * ||in||^2.
+    InNormSq := Input.GetSumSqr();
+    OutNormSq := 0;
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        OutNormSq := OutNormSq + Sqr(NNYaRN.GetLastLayer.Output[pos, 0, d]);
+    AssertEquals('YaRN temperature norm ratio',
+      InNormSq / Temperature, OutNormSq, 1e-3);
+  finally
+    NNNone.Free;
+    NNPI.Free;
+    NNYaRN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEScalingSerializationRoundTrip;
+var
+  NN, NN2, NNDefault: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Depth, pos, d: integer;
+  Saved: string;
+  Loaded: TNNetRotaryEmbedding;
+begin
+  RandSeed := 424242;
+  // (e) Save/load round-trip preserves mode + params and reproduces the
+  // output; a default-mode net serializes with zeros in the scaling slots
+  // (the OLD format) and still loads as "no scaling".
+  SeqLen := 4;
+  Depth := 8;
+  NN := TNNet.Create();
+  NNDefault := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NN.AddLayer(TNNetRotaryEmbedding.Create(10000.0,
+      rsmYaRN, 2.0, 512, 1.0, 32.0));
+    NNDefault.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNDefault.AddLayer(TNNetRotaryEmbedding.Create(10000.0));
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := Sin((pos * Depth + d) * 0.31) * 0.7 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Loaded := TNNetRotaryEmbedding(NN2.Layers[1]);
+      AssertTrue('round-trip preserves ScalingMode',
+        Loaded.GetScalingMode() = rsmYaRN);
+      AssertEquals('round-trip preserves ScaleFactor',
+        2.0, Loaded.GetScaleFactor(), 1e-6);
+      AssertEquals('round-trip preserves OriginalContextLen',
+        512, Loaded.GetOriginalContextLen());
+      AssertEquals('round-trip preserves YarnAlpha',
+        1.0, Loaded.GetYarnAlpha(), 1e-6);
+      AssertEquals('round-trip preserves YarnBeta',
+        32.0, Loaded.GetYarnBeta(), 1e-6);
+      NN2.Compute(Input);
+      for pos := 0 to SeqLen - 1 do
+        for d := 0 to Depth - 1 do
+          AssertEquals('YaRN round-trip output pos=' + IntToStr(pos) +
+            ' d=' + IntToStr(d),
+            NN.GetLastLayer.Output[pos, 0, d],
+            NN2.GetLastLayer.Output[pos, 0, d], 1e-6);
+    finally
+      NN2.Free;
+    end;
+
+    // Old-format compatibility: a default-mode layer writes ZEROS in the
+    // scaling slots (identical to files saved before scaling existed), and
+    // loading it must mean "no scaling" with output unchanged.
+    NNDefault.Compute(Input);
+    Saved := NNDefault.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Loaded := TNNetRotaryEmbedding(NN2.Layers[1]);
+      AssertTrue('old-format load means no scaling',
+        Loaded.GetScalingMode() = rsmNone);
+      NN2.Compute(Input);
+      for pos := 0 to SeqLen - 1 do
+        for d := 0 to Depth - 1 do
+          AssertEquals('old-format output pos=' + IntToStr(pos) +
+            ' d=' + IntToStr(d),
+            NNDefault.GetLastLayer.Output[pos, 0, d],
+            NN2.GetLastLayer.Output[pos, 0, d], 1e-7);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    NNDefault.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEScalingGradientChecks;
+begin
+  RandSeed := 424242;
+  // (f) Backward is the transpose rotation (times sqrt(1/t) in YaRN mode);
+  // central-difference gradient check in every scaled mode. YaRN is the
+  // important one: it adds the temperature factor to both passes.
+  LayerInputGradientCheck(Self, TNNetRotaryEmbedding.Create(10000.0,
+    rsmPositionInterpolation, 2.0, 256),
+    'RotaryEmbeddingPI', 3, 1, 4, 0.01);
+  LayerInputGradientCheck(Self, TNNetRotaryEmbedding.Create(10000.0,
+    rsmNTKAware, 4.0, 256),
+    'RotaryEmbeddingNTK', 3, 1, 4, 0.01);
+  LayerInputGradientCheck(Self, TNNetRotaryEmbedding.Create(10000.0,
+    rsmYaRN, 2.0, 512, 1.0, 32.0),
+    'RotaryEmbeddingYaRN', 3, 1, 4, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestDropPathPZeroBoundary;
