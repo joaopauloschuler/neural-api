@@ -12,7 +12,7 @@ uses
   TestNeuralFit, TestNeuralVolumePairs, TestNeuralSamplers,
   TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical,
   TestNeuralScheduler, TestNeuralDecode, TestNeuralPretrained,
-  TestNeuralDPO;
+  TestNeuralDPO, TestNeuralNLPMetrics;
 
 type
   TMyTestRunner = class(TTestRunner)

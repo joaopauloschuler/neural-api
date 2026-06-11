@@ -1389,6 +1389,7 @@ In short, this API supports:
 * A tokenizer: `TNeuralTokenizer`.
 * A transformer decoder: `AddTransformerBlockCAI`.
 * Preference alignment with Direct Preference Optimization (DPO, Rafailov et al. 2023): `TNeuralDPOTrainer` in `neural/neuraldpo.pas` fine-tunes a next-token LM on (prompt, chosen, rejected) preference pairs against a frozen reference clone — `loss = -ln sigmoid(beta*((logpi_c-logref_c)-(logpi_r-logref_r)))`, no reward model, no RL. See the [DPO fine-tuning example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/DPOFineTune).
+* NLP evaluation metrics in `neural/neuralnlpmetrics.pas` (pure forward-pass/counting code, no training dependencies): teacher-forced held-out **perplexity** — `Perplexity(NN, Dict, Corpus)` for token models (auto-detects per-position vs single next-token heads) and `PerplexityFromChars(NN, Corpus)` for char models — returning perplexity, mean NLL (nats) and bits-per-token, with pad/special targets (`< 2`) excluded; corpus-level **BLEU** (`CorpusBLEU`, Papineni 2002: clipped n-gram precision up to 4-grams, brevity penalty, Lin & Och smoothing-1); and **ROUGE-1/2/L** (`RougeN`/`RougeL`/`CorpusRougeN`/`CorpusRougeL`, precision/recall/F1). BLEU/ROUGE accept token-id arrays or plain strings (whitespace-tokenized). The [TinyGPT example](https://github.com/joaopauloschuler/neural-api/tree/master/examples/TinyGPT) prints its corpus perplexity after training.
 
 ## Publications from the Author
 In the case that you would like to know more about what the CAI's author is working at, here we go.
