@@ -148,8 +148,8 @@ An advanced source code example can be found [here](https://github.com/joaopaulo
 features on this same TinyStories tokenized workload, one phase per feature:
 
 ```
-./DecodeFeaturesBakeoff --phase N      (N in 1..7)
-bash run_decode_bakeoff.sh             (all seven phases, logs to decode_bakeoff_phaseN.log)
+./DecodeFeaturesBakeoff --phase N      (N in 1..9)
+bash run_decode_bakeoff.sh             (all nine phases, logs to decode_bakeoff_phaseN.log)
 ```
 
 | Phase | Feature | Status |
@@ -161,9 +161,12 @@ bash run_decode_bakeoff.sh             (all seven phases, logs to decode_bakeoff
 | 5 | Speculative decoding composed with the KV cache (`TruncateCache` rollback) | implemented |
 | 6 | Hybrid 2×DiagonalSSM + 1×MLA trunk, dual-family streamed decode (the configuration phases 1–5 recommend) | implemented |
 | 7 | Phase 6's hybrid with grouped pointwise convolutions (`TNNetGroupedPointwiseConvLinear` via `AddAutoGroupedPointwiseConv`, incl. the new `MinChannelsPerGroupCount` argument of `TNNet.AddMultiHeadLatentAttention`) | implemented |
+| 8 | Gemma-2 alternating local/global attention with a windowed KV cache (`TNNet.AddAlternatingLocalGlobalBlocks`, the sliding-window `Window` argument of `TNNetScaledDotProductAttention`) | implemented |
+| 9 | Parallel attention+FFN block step-cost bake-off (`TNNet.AddParallelTransformerBlock`, GPT-J/PaLM single shared pre-norm) | implemented |
 
 Every phase self-budgets to 270 s of wall clock: training is time-boxed inside the
-program (~185 s in phases 1/4, ~195 s in phases 2/3, ~190 s in phases 6/7, ~160 s draft
+program (~185 s in phases 1/4/8, ~195 s in phases 2/3, ~190 s in phases 6/7, ~180 s in
+phase 9 — its box pays for a pre-train timed forward comparison — and ~160 s draft
 training in phase 5), leaving the rest for
 the decode benchmark. The model is a small RoPE transformer decoder
 (ctx=48, d_model=128, 2 blocks, 8 heads, FFN 512, 3k vocab, ~1.31M params) with
@@ -235,6 +238,28 @@ intergroup remix). Grouped pointwise convs are strictly per-token, so the phase-
 dual-family streamed decode applies unchanged, and the hard assert doubles as proof
 that grouped layers stream token-exactly. Its verdict compares weight count,
 convergence and decode cost against phase 6's dense references.
+Phase 8 is phase 1's transformer skeleton EXACTLY — `TNNet.AddAlternatingLocalGlobalBlocks`
+with phase 1's arguments (DyT pre-norm, RoPE, SwiGLU FFN 512, CausalMask) expands to the
+same `AddTransformerEncoderBlock` calls — with only the attention MASKING changed: block 1
+is LOCAL (Gemma-2-style sliding window of 12 keys = ctx/4, the new `Window` argument of
+`TNNetScaledDotProductAttention`) and block 2 stays GLOBAL (full attention), the Gemma 2
+local-first 1:1 interleave. The decode benchmark mirrors phase 1 (full re-encode vs
+KV-cached step net) and the hard assert proves the windowed SDPA path streams token-exactly
+through the cache. The headline is the MEMORY table: the window mask makes the last
+min(t, W) positions provably sufficient decode state, so a local layer's KV cache is
+BOUNDED at 2·d_model·W floats while every global layer grows by 2·d_model floats/token —
+printed at several prefix lengths against phase 1's all-global two-layer reference,
+together with the quality cost of windowing vs phase 1's reference loss.
+Phase 9 swaps phase 1's SEQUENTIAL encoder blocks for the PARALLEL attention+FFN
+formulation (GPT-J / PaLM / Falcon, `TNNet.AddParallelTransformerBlock`):
+y = x + Attn(DyT(x)) + FFN(DyT(x)) with ONE shared pre-norm and a single 3-input residual
+sum — same d_model/heads/FFN/RoPE, one DyT fewer per block, so the weight counts match to
+within the norm layers (both are printed). The phase measures the parallel block's selling
+point — wall clock per step — with a timed full-context forward comparison of the two nets
+plus examples-seen inside the same 185 s-style box, compares final loss against phase 1's
+reference, and runs the phase-1 decode showdown (the parallel block composes the same
+per-head SDPA layers, so the `TNNetStreamingDecoder` KV-cache path applies unchanged; the
+hard assert proves cached decode stays token-exact through the 3-input-sum wiring).
 All implemented phases HARD-ASSERT token-exact equality of all
 decode arms. Every streamed arm drives its weight-copied short-width twin
 through a `TNNetStreamingDecoder` session (`neural/neuraldecode.pas`), which
@@ -374,3 +399,46 @@ friends…"); and **decode cost HOLDS** — 0.31 ms/token streamed, flat across 
 prefix buckets (0.273–0.275 ms/step). The hard assert doubles as proof that grouped
 pointwise convolutions (block-diagonal weights + interleave intergroup remixing)
 stream token-exactly through the dual-family loop.
+
+Phase 8 (greedy, 40 new tokens per prompt, both arms token-identical; same ~185 s box
+and lr=0.0005 as phase 1; loss 5.01 → 2.50 vs phase 1's all-global 2.87 — at ctx=48
+the 12-key window costs nothing at this budget; longer contexts are where the
+local/global trade-off bites):
+```
+Prompt "one day"          full re-encode 67.46 ms/token  KV-cached 1.13 ms/token  speedup 59.8x
+Prompt "once upon a time" full re-encode 68.81 ms/token  KV-cached 2.99 ms/token  speedup 23.1x
+
+KV-cache state by prefix length (4-byte floats; analytic bounded-window state):
+  prefix        phase-1: 2 global  phase-8: local+global     saved
+  12                  6144 floats            6144 floats      0.0%
+  24                 12288 floats            9216 floats     25.0%
+  48                 24576 floats           15360 floats     37.5%
+  192                98304 floats           52224 floats     46.9%
+```
+The local layer's decode state is BOUNDED at 2·d_model·W = 3072 floats (12 KiB): the
+sliding-window mask discards every key older than 12 positions, so the table's
+local+global column converges to HALF of the all-global reference as the prefix grows
+(Gemma 2's 1:1 interleave; Gemma 3's 5:1 saves ~5/6 of the growing cache). The hard
+assert proves the windowed SDPA streams token-exactly through the KV cache.
+
+Phase 9 (greedy, 40 new tokens per prompt, both arms token-identical; ~180 s box at
+lr=0.0005; 1,309,186 params vs the sequential reference's 1,309,700 — equal to within
+the 514 norm-layer params; loss 4.70 → 2.82 vs phase 1's sequential 2.87 at the same
+budget):
+```
+Timed full-context forward (12 forwards each, same shapes, untrained):
+  sequential (phase 1) : 58.36 ms/forward
+  parallel  (phase 9)  : 64.21 ms/forward   (1.10x)
+Throughput in the box: 149 batches = 4768 examples in 193 s (24.7 examples/s).
+
+Prompt "one day"          full re-encode 70.64 ms/token  KV-cached 2.71 ms/token  speedup 26.1x
+Prompt "once upon a time" full re-encode 82.71 ms/token  KV-cached 3.70 ms/token  speedup 22.4x
+```
+Quality matches the sequential block at the same budget (2.82 vs 2.87), and the cached
+decode stays token-exact through the parallel wiring (the same per-head SDPA layers, so
+the `TNNetStreamingDecoder` path applies unchanged). The honest step-cost finding: on
+THIS CPU library the parallel block is ~10% SLOWER per forward, not faster — the two
+branches execute serially layer-by-layer, so PaLM's ~15% step win (which comes from
+running the attention and FFN branches CONCURRENTLY on parallel hardware) does not
+materialize; what the parallel form buys here is one norm layer fewer per block at
+equal quality.
