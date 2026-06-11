@@ -790,6 +790,8 @@ type
     procedure TestCosineSimilarityAttentionSerializationRoundTrip;
     procedure TestCosineSimilarityAttentionLearnableScaleGradientCheck;
     procedure TestCosineSimilarityAttentionLearnableScaleSerializationRoundTrip;
+    procedure TestQKNormAttentionGradientCheck;
+    procedure TestQKNormAttentionSerializationRoundTrip;
     procedure TestSinkAttentionGradientCheck;
     procedure TestSinkAttentionSinkParamGradientCheck;
     procedure TestSinkAttentionSerializationRoundTrip;
@@ -843,6 +845,7 @@ type
     procedure TestMultiHeadSelfAttentionSinkShapes;
     procedure TestMultiHeadSelfAttentionSinkGradientCheck;
     procedure TestMultiHeadSelfAttentionCosineSimilarityShapes;
+    procedure TestMultiHeadSelfAttentionQKNormShapes;
     procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestCrossAttentionLoadFromString;
     procedure TestAffineGridSampleIdentity;
@@ -14860,6 +14863,81 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionQKNormShapes;
+// AddMultiHeadSelfAttention with Variant=avQKNorm swaps each head's plain
+// SDPA for a TNNetQKNormAttention (L2-normalised Q/K, learnable temperature
+// initialised to sqrt(d_k)). Asserts: output shape preserved, Heads QK-Norm
+// heads built (each with temperature sqrt(d_k)), forward is finite, a full
+// forward+backward pass runs without error, and SaveToString/LoadFromString
+// reproduces Compute bit-for-bit.
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  NetStr: string;
+  d_model, Heads, d_k, SeqLen, i, qkCnt: integer;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  d_k := d_model div Heads;
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}true, false, avQKNorm);
+    NN.SetLearningRate(0.01, 0.0);
+
+    AssertEquals('MHSA-qknorm out SizeX', SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MHSA-qknorm out SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('MHSA-qknorm out Depth', d_model, NN.GetLastLayer.Output.Depth);
+
+    qkCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetQKNormAttention then
+      begin
+        Inc(qkCnt);
+        AssertEquals('MHSA-qknorm head temperature init sqrt(d_k)', Sqrt(d_k),
+          (NN.Layers[i] as TNNetQKNormAttention).Scale, 1e-6);
+      end;
+    AssertEquals('MHSA-qknorm has Heads QK-Norm heads', Heads, qkCnt);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('MHSA-qknorm finite output at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+
+    // Save/load round-trip BEFORE backward (backward updates the weights):
+    // Compute must match bit-for-bit.
+    NetStr := NN.SaveToString();
+    NN2.LoadFromString(NetStr);
+    NN2.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('MHSA-qknorm save/load Compute match at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i]);
+
+    // Full backward smoke: must run without error and keep weights finite.
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+    NN.Backpropagate(Desired);
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('MHSA-qknorm finite output after backward at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestMultiHeadCrossAttentionGradientCheck;
 // Encoder-decoder cross-attention: Query from a decoder branch (QSeqLen=3),
 // Keys+Values from a SEPARATE encoder branch (KVSeqLen=4 -- deliberately a
@@ -16460,6 +16538,158 @@ begin
   finally
     NN.Free;
     if Assigned(NN2) then NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestQKNormAttentionGradientCheck;
+// QK-Norm attention (Henry et al. 2020): L2-normalised Q/K rows with a
+// LEARNABLE scalar temperature initialised to sqrt(d_k). Central-difference
+// checks BOTH the temperature gradient and the input gradient. With
+// learning rate 1 and batch update, the analytical temperature gradient is
+// -Neurons[0].Delta.Raw[0] (Delta accumulates -lr*grad), matching the sign
+// convention of the sibling cosine/sink attention weight-gradient tests.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetQKNormAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, scale0: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AScale: TNeuralFloat): TNeuralFloat;
+  var idx: integer; diff: TNeuralFloat;
+  begin
+    // Set the (single) learnable temperature weight then forward.
+    Attn.Neurons[0].Weights.Raw[0] := AScale;
+    NN.Compute(Input);
+    Result := 0;
+    for idx := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[idx] - Desired.Raw[idx];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Shared-RNG ordering safety: reseed (do not loosen tolerances).
+  RandSeed := 424242;
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetQKNormAttention.Create(Dk, false);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // QK-Norm is DEFINED by the learnable temperature: the flag must be on
+    // by default and the init must be sqrt(d_k) = 2.
+    AssertTrue('QKNorm attn has learnable temperature by default',
+      Attn.LearnableScale);
+    AssertTrue('QKNorm attn allocates one temperature weight',
+      Attn.Neurons[0].Weights.Size = 1);
+    AssertEquals('QKNorm temperature initialised to sqrt(d_k)', Sqrt(Dk),
+      Attn.Neurons[0].Weights.Raw[0], 1e-6);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    scale0 := Sqrt(Dk);
+    // ---- Numerical gradient of loss w.r.t. the temperature scalar ----
+    lossPlus := ComputeLoss(scale0 + epsilon);
+    lossMinus := ComputeLoss(scale0 - epsilon);
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+    // ---- Analytical gradient: BatchUpdate keeps Delta = -lr*grad; lr=1 ----
+    ComputeLoss(scale0);
+    Attn.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -Attn.Neurons[0].Delta.Raw[0];
+
+    AssertTrue('QKNorm temperature gradient num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+
+    // ---- Input gradient (temperature held at scale0) ----
+    Attn.Neurons[0].Weights.Raw[0] := scale0;
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(scale0);
+      Input.Raw[i] := Input.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss(scale0);
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      Attn.Neurons[0].Weights.Raw[0] := scale0;
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      AssertTrue('QKNorm input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestQKNormAttentionSerializationRoundTrip;
+// SaveToString/LoadFromString must reconstruct a TNNetQKNormAttention (the
+// class is registered in BOTH dispatch tables), keep the learnable flag,
+// round-trip the TRAINED temperature weight and reproduce Compute exactly.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn, Attn2: TNNetQKNormAttention;
+  S: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := nil;
+  Input := TNNetVolume.Create(3, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 12, 1));
+    Attn := TNNetQKNormAttention.Create(4, true);
+    NN.AddLayer(Attn);
+    // Simulate a trained temperature so we verify the WEIGHT (not the init).
+    Attn.Neurons[0].Weights.Raw[0] := 3.75;
+
+    S := NN.SaveToString();
+    NN2 := TNNet.Create();
+    NN2.LoadFromString(S);
+
+    AssertTrue('Loaded layer is TNNetQKNormAttention',
+      NN2.Layers[1] is TNNetQKNormAttention);
+    Attn2 := NN2.Layers[1] as TNNetQKNormAttention;
+    AssertTrue('QKNorm learnable flag round-trips', Attn2.LearnableScale);
+    AssertEquals('QKNorm trained temperature round-trips', 3.75,
+      Attn2.Neurons[0].Weights.Raw[0], 1e-5);
+    AssertEquals('QKNorm live Scale property reflects weight', 3.75,
+      Attn2.Scale, 1e-5);
+
+    // Compute must match exactly after the round-trip.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.8 - 0.1;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('QKNorm save/load Compute match at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i]);
+  finally
+    NN.Free;
+    if Assigned(NN2) then NN2.Free;
+    Input.Free;
   end;
 end;
 

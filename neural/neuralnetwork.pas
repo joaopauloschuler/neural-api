@@ -111,7 +111,12 @@ type
   //   avCosineSimilarity : TNNetCosineSimilarityAttention (cosine-normalised
   //                    Q.K logits with a fixed scale; decouples attention weights
   //                    from the magnitude of the query/key vectors).
-  TNNetAttentionVariant = (avSDPA, avDifferential, avSink, avCosineSimilarity);
+  //   avQKNorm       : TNNetQKNormAttention (QK-Norm, Henry et al. 2020;
+  //                    L2-normalised Q and K with a LEARNABLE scalar
+  //                    temperature initialised to sqrt(d_k); ViT-22B/OLMo 2/
+  //                    Qwen 3 style).
+  TNNetAttentionVariant = (avSDPA, avDifferential, avSink, avCosineSimilarity,
+    avQKNorm);
 
   { TNNetNeuron }
   TNNetNeuron = class(TMObject)
@@ -3106,6 +3111,40 @@ type
     // returns that, else the fixed FScale.
     property Scale: TNeuralFloat read CurrentScale;
     property LearnableScale: boolean read FLearnableScale;
+  end;
+
+  /// QK-Norm Attention (single head). Query-Key Normalization for
+  // Transformers (Henry et al. 2020, https://arxiv.org/abs/2010.04245), as
+  // adopted by ViT-22B, OLMo 2 and Qwen 3: the projected query and key rows
+  // are L2-normalised (per position, over the d_k head dimension) BEFORE the
+  // dot product, and the fixed 1/sqrt(d_k) score scaling is replaced by a
+  // single LEARNABLE scalar temperature. This bounds the raw logits (no
+  // attention-entropy collapse from exploding Q.K magnitudes) while letting
+  // the model learn how sharp the softmax should be.
+  // Honest positioning vs TNNetCosineSimilarityAttention: the normalisation
+  // is the SAME cosine-similarity score; the difference is that the cosine
+  // layer defaults to a FIXED scale (learnable only as an opt-in flag with a
+  // caller-chosen init), whereas QK-Norm is DEFINED by the learnable
+  // temperature -- this subclass reuses the parent's verified forward/backward
+  // (exact d/dx of x/||x|| Jacobian and d(loss)/d(scale)) and simply forces
+  // LearnableScale = True with the QK-Norm init: scale0 = sqrt(d_k) by
+  // default (so the very first forward pass scores match a plain SDPA whose
+  // Q,K rows have unit norm), or any caller-supplied positive init (e.g. the
+  // paper's g0 = ln(SeqLen^2 - SeqLen)).
+  // Input layout (same as SDPA): SizeY = 1, SizeX = sequence length,
+  // Depth = 3 * d_k (the depth axis is the concatenation Q | K | V).
+  // Output shape: SizeX x 1 x d_k.
+  // Serialization: the temperature lives in the single weight of FNeurons[0]
+  // (round-trips with the weights); the init scale is mirrored in FFloatSt[0]
+  // and the learnable flag in FStruct[2], exactly like the parent.
+  // Coded by Claude (AI).
+  TNNetQKNormAttention = class(TNNetCosineSimilarityAttention)
+  public
+    // pInitialScale <= 0 (the default) selects the canonical QK-Norm init
+    // sqrt(d_k); any positive value is used as-is (e.g. Henry et al.'s
+    // g0 = ln(SeqLen^2 - SeqLen)).
+    constructor Create(d_k: integer; pCausalMask: boolean = false;
+      pInitialScale: TNeuralFloat = 0); overload;
   end;
 
   /// Attention with learnable "attention sink" slots (StreamingLLM,
@@ -10716,7 +10755,9 @@ type
       // (TNNetDifferentialAttention, requires even d_k), avSink
       // (TNNetSinkAttention, NumSinks learnable sink slots/head) or
       // avCosineSimilarity (TNNetCosineSimilarityAttention, cosine-normalised
-      // logits). See TNNetAttentionVariant. NumSinks is only consulted for avSink.
+      // logits) or avQKNorm (TNNetQKNormAttention, L2-normalised Q/K with a
+      // learnable temperature initialised to sqrt(d_k)). See
+      // TNNetAttentionVariant. NumSinks is only consulted for avSink.
       function AddMultiHeadSDPAConcat(Heads: integer;
         CausalMask: boolean = false; SourceLayer: TNNetLayer = nil;
         UseRoPE: boolean = false;
@@ -10743,8 +10784,9 @@ type
       // Variant (default avSDPA) lets every head opt into a drop-in SDPA
       // subclass instead of plain SDPA: avDifferential
       // (TNNetDifferentialAttention), avSink (TNNetSinkAttention with
-      // NumSinks learnable sink slots per head) or avCosineSimilarity
-      // (TNNetCosineSimilarityAttention). See TNNetAttentionVariant.
+      // NumSinks learnable sink slots per head), avCosineSimilarity
+      // (TNNetCosineSimilarityAttention) or avQKNorm (TNNetQKNormAttention,
+      // learnable-temperature QK-Norm). See TNNetAttentionVariant.
       // avDifferential additionally requires an EVEN per-head dim d_k. NumSinks
       // is only consulted for avSink. The out-projection is identical for all
       // variants (each head still emits depth d_k).
@@ -23856,6 +23898,19 @@ begin
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetQKNormAttention }
+
+constructor TNNetQKNormAttention.Create(d_k: integer; pCausalMask: boolean;
+  pInitialScale: TNeuralFloat);
+begin
+  // QK-Norm = cosine-normalised Q.K scores with a LEARNABLE temperature.
+  // Default init sqrt(d_k) makes the first forward pass equivalent to plain
+  // SDPA scoring of unit-norm Q,K rows; training then adapts the sharpness.
+  if (pInitialScale <= 0) and (d_k >= 1) then pInitialScale := Sqrt(d_k);
+  if pInitialScale <= 0 then pInitialScale := 1;
+  inherited Create(d_k, pCausalMask, pInitialScale, {pLearnableScale=}true);
 end;
 
 { TNNetSinkAttention }
@@ -44591,6 +44646,9 @@ var
       avCosineSimilarity:
         Result := AddLayerAfter(
           TNNetCosineSimilarityAttention.Create(d_k, CausalMask), AfterLayer);
+      avQKNorm:
+        Result := AddLayerAfter(
+          TNNetQKNormAttention.Create(d_k, CausalMask), AfterLayer);
     else
       Result := AddLayerAfter(
         TNNetScaledDotProductAttention.Create(d_k, CausalMask), AfterLayer);
@@ -80674,6 +80732,7 @@ begin
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
       'TNNetHyperConv' :            Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
+      'TNNetQKNormAttention' :      Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1);
@@ -81048,6 +81107,7 @@ begin
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetHyperConv' then Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
+      if S[0] = 'TNNetQKNormAttention' then Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1) else
