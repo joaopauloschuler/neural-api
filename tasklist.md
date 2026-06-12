@@ -406,7 +406,7 @@ rather than acted on.
       easier first Pascal→Python round-trip than the listed safetensors
       writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
-- [ ] Gemma 3 - per-head QK-norm composition: Gemma-3 replaces soft-capping
+- [X] Gemma 3 - per-head QK-norm composition: Gemma-3 replaces soft-capping
       with RMSNorm applied per-head to q and k before attention (distinct
       from the landed avQKNorm / TNNetQKNormAttention, which L2-normalises
       q/k with a learnable temperature — Gemma needs a learnable-scale
@@ -423,7 +423,18 @@ rather than acted on.
       BEFORE RoPE there (the verified Qwen3 ordering). Gemma-3 still needs
       its own placement verification vs HF Gemma3 (norm-vs-RoPE order
       differs across implementations) + the MHA-builder flag.
-- [ ] Gemma 3 - BuildGemma3FromSafeTensors importer, TEXT-ONLY (the Gemma-2
+      LANDED 2026-06-12: Gemma-3's placement verified against HF
+      modeling_gemma3.Gemma3Attention.forward - q_norm/k_norm BEFORE
+      apply_rotary_pos_emb, the SAME ordering as Qwen3, so the landed
+      composition reuses directly (with Gemma's zero-centered 1+w gains via
+      a new GainOffset arg on LoadLlamaHeadRMSNormWeights, and the
+      query_pre_attn_scalar fold moved into the q_norm GAINS - a W_q fold
+      would be erased by the norm). MHA-builder flag: QKRMSNorm boolean on
+      AddMultiHeadSDPAConcat / AddMultiHeadSelfAttention inserts a
+      learnable-scale per-head TNNetTokenRMSNorm on each Q/K slice before
+      RoPE; input-gradient finite-difference check in
+      TestMultiHeadSelfAttentionQKRMSNormGradientCheck (max err 4.3e-4).
+- [X] Gemma 3 - BuildGemma3FromSafeTensors importer, TEXT-ONLY (the Gemma-2
       importer landed 2026-06-12 — BuildGemma2FromSafeTensors with the SDPA
       score soft-cap + sandwich norms; still depends on the Gemma-3 QK-norm
       placement task above): 5:1 local:global layer
@@ -434,6 +445,19 @@ rather than acted on.
       per-layer override). The 4B+ multimodal vision tower is explicitly
       OUT OF SCOPE (separate project). Parity fixture vs
       Gemma3ForCausalLM on a sliced text-only checkpoint.
+      LANDED 2026-06-12: BuildGemma3FromSafeTensors(Ex) (model_type
+      "gemma3_text") - per-head QK-norm replaces the soft-caps (both
+      default None, still honored if non-null), SlidingWindowPattern
+      config field (sliding_window_pattern, default 6: every Nth layer
+      global - the 5:1 ratio) and RopeLocalTheta (rope_local_base_freq,
+      default 10k local vs rope_theta 1M global) wired per-layer through
+      the existing alternating machinery; .bin rides
+      CreatePretrainedTensorReader like the rest of the Llama family;
+      BuildFromPretrained dispatches gemma3_text. Parity fixture
+      tests/fixtures/tiny_gemma3.* (tools/gemma3_tiny_fixture.py, random
+      pico Gemma3ForCausalLM, all five deltas asserted non-vacuous);
+      TestGemma3LogitParity passes the 1e-4 gate with max |logit diff|
+      9.6e-8.
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
       the GPT-Neo route; the published pytorch_model.bin-only checkpoints

@@ -876,6 +876,7 @@ type
     procedure TestMultiHeadSelfAttentionSinkGradientCheck;
     procedure TestMultiHeadSelfAttentionCosineSimilarityShapes;
     procedure TestMultiHeadSelfAttentionQKNormShapes;
+    procedure TestMultiHeadSelfAttentionQKRMSNormGradientCheck;
     procedure TestMultiHeadSelfAttentionT5RelPosBiasShapes;
     procedure TestMultiHeadCrossAttentionGradientCheck;
     procedure TestCrossAttentionLoadFromString;
@@ -16162,6 +16163,105 @@ begin
     NN.Free;
     NN2.Free;
     Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionQKRMSNormGradientCheck;
+// AddMultiHeadSelfAttention with QKRMSNorm=True inserts a learnable-scale
+// per-head TNNetTokenRMSNorm on each head's Q and K slices BEFORE RoPE -
+// the Gemma-3 / Qwen3 per-head QK-norm composition (verified against HF
+// modeling_gemma3 / modeling_qwen3: q_norm(q_proj(x)) then
+// apply_rotary_pos_emb). Asserts: output shape preserved, 2*Heads per-head
+// norms built, and the analytical input gradient matches a central finite
+// difference (the QK-norm + RoPE + SDPA chain backpropagates correctly).
+var
+  NN: TNNet;
+  InputLayer: TNNetLayer;
+  InData, InPlus, Desired: TNNetVolume;
+  d_model, Heads, SeqLen, i, NormCnt: integer;
+  epsilon, lossPlus, lossMinus: TNeuralFloat;
+  numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  InData := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  InPlus := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  epsilon := 0.001;
+  maxErr := 0;
+  try
+    // pError=1 on the input: the test reads the INPUT gradient.
+    InputLayer := NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}true, {UseRoPE=}true,
+      avSDPA, {NumSinks=}1, {Window=}0, {RelPosNumBuckets=}32,
+      {RelPosMaxDistance=}128, {QKRMSNorm=}true);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    AssertEquals('MHSA-qkrmsnorm out SizeX', SeqLen,
+      NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MHSA-qkrmsnorm out Depth', d_model,
+      NN.GetLastLayer.Output.Depth);
+    NormCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetTokenRMSNorm then Inc(NormCnt);
+    AssertEquals('MHSA-qkrmsnorm per-head q+k norms', 2 * Heads, NormCnt);
+
+    for i := 0 to InData.Size - 1 do
+      InData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+
+    NN.Compute(InData);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('MHSA-qkrmsnorm finite forward at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+
+    for i := 0 to InData.Size - 1 do
+    begin
+      InPlus.Copy(InData);
+      InPlus.Raw[i] := InData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InPlus);
+      InPlus.Raw[i] := InData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(InData);
+      InputLayer.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := InputLayer.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('MHSA-qkrmsnorm input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestMultiHeadSelfAttentionQKRMSNormGradientCheck max ',
+      'gradient error: ', FloatToStr(maxErr));
+  finally
+    NN.Free;
+    InData.Free;
+    InPlus.Free;
     Desired.Free;
   end;
 end;

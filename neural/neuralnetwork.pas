@@ -11172,6 +11172,14 @@ type
       // every per-head SDPA (see TNNetScaledDotProductAttention.Create).
       // Window > 0 requires Variant = avSDPA or avT5RelPosBias (the other
       // drop-in variants do not implement the window).
+      // QKRMSNorm=True inserts a LEARNABLE-SCALE per-head RMSNorm
+      // (TNNetTokenRMSNorm) on each head's Q and K slices AFTER the per-head
+      // split and BEFORE RoPE - the Gemma-3 / Qwen3 per-head QK-norm (HF
+      // modeling_gemma3 / modeling_qwen3 ordering: q_norm(q_proj(x)) then
+      // apply_rotary_pos_emb; verified against both references). Distinct
+      // from avQKNorm, which L2-normalises q/k with a single learnable
+      // temperature inside the attention layer: QKRMSNorm carries a gain
+      // VECTOR of d_k weights per norm and keeps plain SDPA scaling.
       function AddMultiHeadSDPAConcat(Heads: integer;
         CausalMask: boolean = false; SourceLayer: TNNetLayer = nil;
         UseRoPE: boolean = false;
@@ -11179,7 +11187,8 @@ type
         NumSinks: integer = 1;
         Window: integer = 0;
         RelPosNumBuckets: integer = 32;
-        RelPosMaxDistance: integer = 128): TNNetLayer;
+        RelPosMaxDistance: integer = 128;
+        QKRMSNorm: boolean = false): TNNetLayer;
       // Full multi-head self-attention block over a (SeqLen,1,3*d_model) Q|K|V
       // slab: per-head split -> per-head SDPA -> concat -> token-wise linear
       // out-projection to depth d_model. Returns the out-projection layer.
@@ -11215,13 +11224,17 @@ type
       // Mistral / Gemma-2-style sliding-window mask of Window keys inside
       // every per-head SDPA; requires Variant = avSDPA or avT5RelPosBias
       // when > 0.
+      // QKRMSNorm=True inserts a learnable-scale per-head RMSNorm on each
+      // head's Q and K slices BEFORE RoPE (Gemma-3 / Qwen3 per-head QK-norm;
+      // see AddMultiHeadSDPAConcat).
       function AddMultiHeadSelfAttention(Heads: integer;
         CausalMask: boolean = false; UseRoPE: boolean = false;
         Variant: TNNetAttentionVariant = avSDPA;
         NumSinks: integer = 1;
         Window: integer = 0;
         RelPosNumBuckets: integer = 32;
-        RelPosMaxDistance: integer = 128): TNNetLayer;
+        RelPosMaxDistance: integer = 128;
+        QKRMSNorm: boolean = false): TNNetLayer;
       // Multi-head LINFORMER self-attention (Wang et al. 2020, arXiv:2006.04768)
       // over a (SeqLen,1,3*d_model) Q|K|V slab. Linformer keeps the softmax but
       // projects K and V DOWN the sequence axis to a fixed rank k (k << SeqLen)
@@ -46203,7 +46216,8 @@ function TNNet.AddMultiHeadSDPAConcat(Heads: integer;
   NumSinks: integer = 1;
   Window: integer = 0;
   RelPosNumBuckets: integer = 32;
-  RelPosMaxDistance: integer = 128): TNNetLayer;
+  RelPosMaxDistance: integer = 128;
+  QKRMSNorm: boolean = false): TNNetLayer;
 var
   d_model, d_k, HeadCnt, d: integer;
   SliceLayers, HeadOutputs: array of TNNetLayer;
@@ -46266,10 +46280,13 @@ begin
   SetLength(SliceLayers, Heads);
   AddSplitQKVHeads(d_model, Heads, SliceLayers, SourceLayer);
   SetLength(HeadOutputs, Heads);
-  if UseRoPE then
+  if UseRoPE or QKRMSNorm then
   begin
-    // Each SliceLayers[h] is a [Q_h | K_h | V_h] pack of width 3*d_k. Rotate the
-    // Q_h and K_h sub-blocks (RoPE) but leave V_h, then re-pack and run SDPA.
+    // Each SliceLayers[h] is a [Q_h | K_h | V_h] pack of width 3*d_k.
+    // Optionally RMS-normalise (QKRMSNorm, the Gemma-3/Qwen3 per-head
+    // QK-norm - applied BEFORE RoPE, the HF modeling_gemma3/modeling_qwen3
+    // ordering) and rotate (RoPE) the Q_h and K_h sub-blocks but leave V_h,
+    // then re-pack and run SDPA.
     SetLength(QChannels, d_k);
     SetLength(KChannels, d_k);
     SetLength(VChannels, d_k);
@@ -46282,9 +46299,15 @@ begin
     for HeadCnt := 0 to Heads - 1 do
     begin
       QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), SliceLayers[HeadCnt]);
-      QSlice := AddLayerAfter(TNNetRotaryEmbedding.Create(), QSlice);
+      if QKRMSNorm then
+        QSlice := AddLayerAfter(TNNetTokenRMSNorm.Create(), QSlice);
+      if UseRoPE then
+        QSlice := AddLayerAfter(TNNetRotaryEmbedding.Create(), QSlice);
       KSlice := AddLayerAfter(TNNetSplitChannels.Create(KChannels), SliceLayers[HeadCnt]);
-      KSlice := AddLayerAfter(TNNetRotaryEmbedding.Create(), KSlice);
+      if QKRMSNorm then
+        KSlice := AddLayerAfter(TNNetTokenRMSNorm.Create(), KSlice);
+      if UseRoPE then
+        KSlice := AddLayerAfter(TNNetRotaryEmbedding.Create(), KSlice);
       VSlice := AddLayerAfter(TNNetSplitChannels.Create(VChannels), SliceLayers[HeadCnt]);
       AttnInput := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
       HeadOutputs[HeadCnt] := AddHeadAttention(AttnInput);
@@ -46309,14 +46332,16 @@ function TNNet.AddMultiHeadSelfAttention(Heads: integer;
   NumSinks: integer = 1;
   Window: integer = 0;
   RelPosNumBuckets: integer = 32;
-  RelPosMaxDistance: integer = 128): TNNetLayer;
+  RelPosMaxDistance: integer = 128;
+  QKRMSNorm: boolean = false): TNNetLayer;
 var
   d_model: integer;
 begin
   // Input is the Q|K|V slab, so its depth is 3*d_model.
   d_model := GetLastLayer().Output.Depth div 3;
   AddMultiHeadSDPAConcat(Heads, CausalMask, GetLastLayer(), UseRoPE,
-    Variant, NumSinks, Window, RelPosNumBuckets, RelPosMaxDistance);
+    Variant, NumSinks, Window, RelPosNumBuckets, RelPosMaxDistance,
+    QKRMSNorm);
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));

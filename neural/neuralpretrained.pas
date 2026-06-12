@@ -29,6 +29,14 @@ unit neuralpretrained;
 //     final-logit soft-capping via TNNetSoftCapping; sandwich norms - 4
 //     RMSNorms per block with the post-norms inside the residual
 //     branches) - BuildGemma2FromSafeTensors.
+//   - Gemma 3 TEXT-ONLY (model_type "gemma3_text", e.g. gemma-3-1b-it; the
+//     Gemma-2 skeleton with the soft-caps REPLACED by a per-head
+//     learnable-scale RMSNorm on q/k BEFORE RoPE - the Qwen3 QKNorm
+//     composition with Gemma's 1+w gains; a 5:1 local:global layer ratio
+//     (every 6th layer attends globally) and PER-LAYER-TYPE RoPE theta:
+//     rope_local_base_freq (10k) on sliding layers, rope_theta (1M) on
+//     global layers. The 4B+ multimodal vision tower is OUT OF SCOPE) -
+//     BuildGemma3FromSafeTensors.
 //   - GPT-Neo (EleutherAI's GPT-3 replica; the roneneldan/TinyStories
 //     checkpoints share this architecture) - BuildGPTNeoFromSafeTensors.
 //     See the GPT-NEO IMPORT section below.
@@ -552,6 +560,16 @@ type
     AltSlidingWindow: boolean; // alternating local/global attention: the
                                // sliding window applies to EVEN layers
                                // (0, 2, ...) only; odd layers attend fully
+    // ---- Gemma-3 deltas (all default off/0 for the other families) ----
+    SlidingWindowPattern: integer; // every Nth layer ((i+1) mod N = 0)
+                               // attends GLOBALLY, the rest carry the
+                               // sliding window (Gemma-3: 6, a 5:1
+                               // local:global ratio); 0/1 = off (takes
+                               // precedence over AltSlidingWindow when set)
+    RopeLocalTheta: TNeuralFloat; // RoPE base for the SLIDING (local)
+                               // layers (rope_local_base_freq, Gemma-3
+                               // default 10000); global layers keep
+                               // RopeTheta (1e6); 0 = single theta
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -583,6 +601,16 @@ type
 //            rows at load, NOT into the tied LM head); tie_word_embeddings
 //            defaults TRUE (Gemma always ties); QKVBias := attention_bias
 //            (default false);
+//   gemma2:  the gemma deltas + SandwichNorm, AltSlidingWindow (1:1
+//            local:global), SlidingWindow (default 4096),
+//            QueryPreAttnScalar (default 256) and the two soft-caps
+//            (defaults 50/30);
+//   gemma3_text: the gemma2 deltas with the soft-caps defaulting OFF
+//            (None in Gemma3TextConfig), QKNorm := true (per-head 1+w
+//            RMSNorm on q/k BEFORE RoPE), SlidingWindowPattern
+//            (sliding_window_pattern, default 6 - every 6th layer global),
+//            RopeTheta default 1e6 and RopeLocalTheta
+//            (rope_local_base_freq, default 10000) for the sliding layers;
 //   llama:   QKVBias := attention_bias (default false).
 // Fails on an unsupported model_type and on a non-null rope_scaling
 // (long-context scaling is not wired here yet).
@@ -690,6 +718,34 @@ function BuildGemma2FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildGemma2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+// Gemma 3 TEXT-ONLY (model_type "gemma3_text", architectures
+// ["Gemma3ForCausalLM"], e.g. google/gemma-3-1b-it; the 4B+ multimodal
+// vision tower is OUT OF SCOPE): the Gemma-2 skeleton (GeGLU MLP,
+// zero-centered RMSNorm, sqrt(d) embedding scale, tied head, sandwich
+// norms, query_pre_attn_scalar) with three deltas:
+// (a) the attention/final logit soft-caps are REPLACED by a per-head
+//     learnable-scale RMSNorm on q and k - applied AFTER the projection and
+//     BEFORE RoPE, the HF modeling_gemma3 ordering (q_norm(q_proj(x)) then
+//     apply_rotary_pos_emb - the SAME placement as Qwen3); the shared
+//     [head_dim] q_norm/k_norm gains are zero-centered (1+w) like every
+//     Gemma norm. Because an RMSNorm erases any scale folded into W_q, the
+//     query_pre_attn_scalar fold moves into the q_norm GAINS here;
+// (b) a 5:1 local:global layer ratio - layer_types: every 6th layer
+//     ((i+1) mod sliding_window_pattern = 0, HF default pattern 6) attends
+//     globally, the rest carry the sliding window (default 4096);
+// (c) PER-LAYER-TYPE RoPE theta - sliding layers use rope_local_base_freq
+//     (default 10000), global layers use rope_theta (default 1e6).
+// Soft-capping configs are still honored if non-null (Gemma3TextConfig
+// keeps the fields, defaulting to None). Thin wrappers over the Llama path
+// that ASSERT model_type is 'gemma3_text'.
+function BuildGemma3FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildGemma3FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
 type
@@ -1480,8 +1536,8 @@ function BuildMambaFromSafeTensors(const FileName: string;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, rwkv, mamba,
-// bert, distilbert, roberta. Anything else
+// gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, gemma,
+// gemma2, gemma3_text, rwkv, mamba, bert, distilbert, roberta. Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
 // choice. OUTPUT SEMANTICS DIFFER BY model_type: the decoder families
@@ -1988,11 +2044,14 @@ begin
     ModelType := Obj.Get('model_type', 'llama');
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
-       (ModelType <> 'gemma') and (ModelType <> 'gemma2') then
+       (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
+       (ModelType <> 'gemma3_text') then
       ImportError('Llama import: config model_type is "' + ModelType +
-        '" - only "llama", "mistral", "qwen2", "qwen3", "gemma" and ' +
-        '"gemma2" are supported here (see BuildFromPretrained for the ' +
-        'full dispatch).');
+        '" - only "llama", "mistral", "qwen2", "qwen3", "gemma", ' +
+        '"gemma2" and "gemma3_text" are supported here (see ' +
+        'BuildFromPretrained for the full dispatch; multimodal "gemma3" ' +
+        'configs are out of scope - use a TEXT-ONLY gemma3_text ' +
+        'checkpoint).');
     RopeScaling := Obj.Find('rope_scaling');
     if (RopeScaling <> nil) and not RopeScaling.IsNull then
       ImportError('Llama import: config carries a non-null "rope_scaling" - ' +
@@ -2011,7 +2070,8 @@ begin
     // Gemma2Config default is tie_word_embeddings=true); the other families
     // default off.
     Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings',
-      (ModelType = 'gemma') or (ModelType = 'gemma2'));
+      (ModelType = 'gemma') or (ModelType = 'gemma2') or
+      (ModelType = 'gemma3_text'));
     // An explicit head_dim is honored even when it is DECOUPLED from
     // hidden_size/num_attention_heads (Qwen3-0.6B: head_dim=128 with
     // hidden=1024, heads=16). Absent/null leaves HeadDim=0 and the builder
@@ -2037,6 +2097,8 @@ begin
     Result.FinalLogitSoftCap := 0;
     Result.SandwichNorm := False;
     Result.AltSlidingWindow := False;
+    Result.SlidingWindowPattern := 0;
+    Result.RopeLocalTheta := 0;
     if ModelType = 'mistral' then
     begin
       // Many Mistral configs ship sliding_window=null (full attention).
@@ -2066,7 +2128,8 @@ begin
         ImportError('Llama import: Qwen3 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
     end
-    else if (ModelType = 'gemma') or (ModelType = 'gemma2') then
+    else if (ModelType = 'gemma') or (ModelType = 'gemma2') or
+            (ModelType = 'gemma3_text') then
     begin
       // Gemma-1 deltas (all load-time; see the BuildGemmaFromSafeTensors
       // interface comment): gated-GELU MLP, zero-centered RMSNorm and the
@@ -2089,7 +2152,7 @@ begin
         ImportError('Llama import: Gemma hidden activation "' + HiddenAct +
           '" is not supported - expected gelu / gelu_new / ' +
           'gelu_pytorch_tanh (Gemma''s MLP is gated GELU).');
-      if ModelType = 'gemma2' then
+      if (ModelType = 'gemma2') or (ModelType = 'gemma3_text') then
       begin
         // Gemma-2 deltas on top of the Gemma-1 skeleton:
         // (a) alternating local/global attention - sliding_window (HF
@@ -2104,8 +2167,13 @@ begin
         //     default 30.0; null = off) on the LM-head logits;
         // (e) sandwich norms - post_attention_layernorm and
         //     post_feedforward_layernorm INSIDE the residual branches.
+        // Gemma-3 (gemma3_text) keeps (b), (e) and the sliding window but
+        // REPLACES the soft-caps (c)/(d) with the per-head q/k RMSNorm
+        // (QKNorm, defaults below the shared block) and changes the
+        // local/global pattern from 1:1 to 5:1 with per-layer-type RoPE
+        // theta.
         Result.SandwichNorm := True;
-        Result.AltSlidingWindow := True;
+        Result.AltSlidingWindow := (ModelType = 'gemma2');
         Result.SlidingWindow := 4096;
         SlidingWindowField := Obj.Find('sliding_window');
         if (SlidingWindowField <> nil) and not SlidingWindowField.IsNull then
@@ -2125,7 +2193,13 @@ begin
             ImportError('Llama import: config query_pre_attn_scalar must ' +
               'be positive, got ' + FloatField.AsJSON + '.');
         end;
-        Result.AttnLogitSoftCap := 50.0;
+        // Soft-cap defaults: Gemma-2 ships 50/30; Gemma3TextConfig keeps
+        // the fields but defaults BOTH to None (the QK-norm replaces them).
+        // A non-null Gemma-3 value is still honored.
+        if ModelType = 'gemma2' then
+          Result.AttnLogitSoftCap := 50.0
+        else
+          Result.AttnLogitSoftCap := 0;
         FloatField := Obj.Find('attn_logit_softcapping');
         if FloatField <> nil then
         begin
@@ -2135,7 +2209,10 @@ begin
             ImportError('Llama import: config attn_logit_softcapping must ' +
               'be positive or null, got ' + FloatField.AsJSON + '.');
         end;
-        Result.FinalLogitSoftCap := 30.0;
+        if ModelType = 'gemma2' then
+          Result.FinalLogitSoftCap := 30.0
+        else
+          Result.FinalLogitSoftCap := 0;
         FloatField := Obj.Find('final_logit_softcapping');
         if FloatField <> nil then
         begin
@@ -2144,6 +2221,30 @@ begin
           if Result.FinalLogitSoftCap < 0 then
             ImportError('Llama import: config final_logit_softcapping ' +
               'must be positive or null, got ' + FloatField.AsJSON + '.');
+        end;
+        if ModelType = 'gemma3_text' then
+        begin
+          // Gemma-3 deltas on top of the shared Gemma-2 machinery:
+          // (a) per-head learnable-scale RMSNorm on q/k AFTER the
+          //     projection and BEFORE RoPE (HF modeling_gemma3:
+          //     q_norm(q_proj(x)) then apply_rotary_pos_emb - the same
+          //     placement as Qwen3); the [head_dim] gains are
+          //     zero-centered (1+w) like every Gemma norm;
+          // (b) layer_types pattern: every Nth layer ((i+1) mod N = 0,
+          //     sliding_window_pattern, HF default 6) attends GLOBALLY,
+          //     the rest carry the sliding window (5:1 local:global);
+          // (c) per-layer-type RoPE theta: rope_theta (default 1e6) on
+          //     global layers, rope_local_base_freq (default 10000) on
+          //     sliding layers.
+          Result.QKNorm := True;
+          Result.RopeTheta := Obj.Get('rope_theta', 1000000.0);
+          Result.RopeLocalTheta := Obj.Get('rope_local_base_freq', 10000.0);
+          Result.SlidingWindowPattern :=
+            Obj.Get('sliding_window_pattern', 6);
+          if Result.SlidingWindowPattern < 1 then
+            ImportError('Llama import: config sliding_window_pattern must ' +
+              'be a positive integer, got ' +
+              IntToStr(Result.SlidingWindowPattern) + '.');
         end;
       end;
     end
@@ -2196,6 +2297,12 @@ begin
     Result := Result + ', sandwich_norm=true';
   if Config.AltSlidingWindow then
     Result := Result + ', alt_sliding_window=true';
+  if Config.SlidingWindowPattern > 0 then
+    Result := Result + ', sliding_window_pattern=' +
+      IntToStr(Config.SlidingWindowPattern);
+  if Config.RopeLocalTheta > 0 then
+    Result := Result + ', rope_local_theta=' +
+      FloatToStr(Config.RopeLocalTheta);
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -2332,9 +2439,16 @@ end;
 // permuted the same way: target channel 2k <- HF position k, target
 // channel 2k+1 <- HF position k + HeadDim/2. The RMS denominator itself is
 // permutation-invariant (mean of squares over the whole head).
+// GainOffset is added to every gain BEFORE scaling (Gemma-3's zero-centered
+// norms store w with gain 1+w, so GainOffset=1 there; Qwen3 uses 0).
+// Scale multiplies the resulting gain: the Gemma-3 query_pre_attn_scalar
+// fold lands HERE (stored gain = Scale*(GainOffset+w)) because a scale
+// folded into W_q would be ERASED by the q-side RMSNorm; the scalar
+// commutes with RoPE (a rotation), so scaling the norm gain is exact.
 procedure LoadLlamaHeadRMSNormWeights(Reader: TNNetSafeTensorsReader;
   const NormLayers: array of TNNetLayer; const WName: string;
-  HeadDim: integer);
+  HeadDim: integer; GainOffset: TNeuralFloat = 0;
+  Scale: TNeuralFloat = 1.0);
 var
   Tmp: TNNetVolume;
   HeadCnt, j, TargetIdx, HalfDim: integer;
@@ -2358,7 +2472,7 @@ begin
         else
           TargetIdx := 2 * (j - HalfDim) + 1;
         NormLayers[HeadCnt].Neurons[0].Weights.FData[TargetIdx] :=
-          Tmp.FData[j]; // gain
+          Scale * (GainOffset + Tmp.FData[j]); // gain
       end;
       NormLayers[HeadCnt].FlushWeightCache();
     end;
@@ -2391,7 +2505,8 @@ var
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, LayerWindow, i, j, d: integer;
-  NormGainOffset, QScale: TNeuralFloat;
+  LayerIsLocal: boolean;
+  NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr, LMHeadName: string;
   QBiasName, KBiasName, VBiasName: string;
@@ -2489,6 +2604,32 @@ begin
         // Wired from primitives exactly like AddMultiHeadGroupedQueryAttention
         // with TNNetRotaryEmbedding(rope_theta) on each per-head Q/K slice
         // (depth = head_dim so the frequency schedule matches HF).
+        // Per-layer attention type:
+        //  - Config.SlidingWindowPattern > 1 (Gemma-3): every Nth layer
+        //    ((BlockCnt+1) mod N = 0, transformers' Gemma3TextConfig
+        //    layer_types default) attends GLOBALLY; the rest carry the
+        //    sliding window (5:1 local:global at the default pattern 6);
+        //  - Config.AltSlidingWindow (Gemma-2): the window applies to EVEN
+        //    layers (transformers' layer_types default: "sliding_attention"
+        //    for layers 0, 2, ...); odd layers attend over the full context;
+        //  - otherwise (Mistral) every layer is local iff SlidingWindow > 0.
+        // Config.RopeLocalTheta > 0 (Gemma-3) selects a PER-LAYER-TYPE RoPE
+        // base: sliding layers rotate with rope_local_base_freq (10k),
+        // global layers with rope_theta (1e6).
+        if Config.SlidingWindowPattern > 1 then
+          LayerIsLocal := ((BlockCnt + 1) mod Config.SlidingWindowPattern) <> 0
+        else if Config.AltSlidingWindow then
+          LayerIsLocal := not Odd(BlockCnt)
+        else
+          LayerIsLocal := Config.SlidingWindow > 0;
+        if LayerIsLocal then
+          LayerWindow := Config.SlidingWindow
+        else
+          LayerWindow := 0;
+        if LayerIsLocal and (Config.RopeLocalTheta > 0) then
+          LayerTheta := Config.RopeLocalTheta
+        else
+          LayerTheta := Config.RopeTheta;
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].AttnNorm :=
           NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
@@ -2499,8 +2640,9 @@ begin
           TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
-        // Config.QKNorm (Qwen3): per-head RMSNorm on each q/k slice AFTER
-        // the projection and BEFORE RoPE (the HF modeling_qwen3 ordering:
+        // Config.QKNorm (Qwen3, Gemma-3): per-head RMSNorm on each q/k
+        // slice AFTER the projection and BEFORE RoPE (the HF
+        // modeling_qwen3 AND modeling_gemma3 ordering, both verified:
         // q_norm(q_proj(x)) then apply_rotary_pos_emb). One
         // TNNetTokenRMSNorm copy per head; the shared [head_dim] gain is
         // loaded into every copy below.
@@ -2523,7 +2665,7 @@ begin
             KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
           end;
           KRotated[KVHeadCnt] := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(Config.RopeTheta), KSlice);
+            TNNetRotaryEmbedding.Create(LayerTheta), KSlice);
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
         end;
@@ -2541,22 +2683,17 @@ begin
             QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
           end;
           QSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(Config.RopeTheta), QSlice);
+            TNNetRotaryEmbedding.Create(LayerTheta), QSlice);
           // Pack [Q_h | K_group | V_group] (width 3*head_dim) for SDPA.
           HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
             [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
-          // Config.SlidingWindow > 0 (Mistral) applies the same banded
-          // causal sliding-window mask HF uses: query i attends keys j with
-          // i - j < W (and j <= i from the causal mask). 0 = full attention.
-          // Config.AltSlidingWindow (Gemma-2) restricts the window to EVEN
-          // layers (transformers' layer_types default: "sliding_attention"
-          // for layers 0, 2, ...); odd layers attend over the full context.
+          // LayerWindow > 0 applies the same banded causal sliding-window
+          // mask HF uses: query i attends keys j with i - j < W (and j <= i
+          // from the causal mask); 0 = full attention. The per-layer value
+          // is computed at the top of the block loop (Mistral: every layer;
+          // Gemma-2: even layers; Gemma-3: all but every Nth layer).
           // Config.AttnLogitSoftCap > 0 (Gemma-2) enables the pre-softmax
           // attention-logit soft-cap cap*tanh(s/cap) inside every head.
-          if Config.AltSlidingWindow and Odd(BlockCnt) then
-            LayerWindow := 0
-          else
-            LayerWindow := Config.SlidingWindow;
           HeadOutputs[HeadCnt] := NN.AddLayerAfter(
             TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true,
               {pWindow=}LayerWindow,
@@ -2621,12 +2758,19 @@ begin
       // attention trick): scaling every q row by sqrt(head_dim/scalar)
       // turns SDPA's 1/sqrt(head_dim) into the desired 1/sqrt(scalar).
       // The fold commutes with the per-head rotate_half permutation and
-      // with RoPE (a rotation); it would NOT commute with a q-side RMSNorm,
-      // but no family combines QKNorm with QueryPreAttnScalar.
+      // with RoPE (a rotation); it would NOT commute with a q-side RMSNorm
+      // (the norm ERASES any scale folded into W_q), so when QKNorm is on
+      // (Gemma-3 combines it with QueryPreAttnScalar) the fold moves into
+      // the per-head q_norm GAINS instead (still ahead of RoPE, which
+      // commutes with a scalar).
       if Config.QueryPreAttnScalar > 0 then
         QScale := Sqrt(HeadDim / Config.QueryPreAttnScalar)
       else
         QScale := 1.0;
+      if Config.QKNorm then
+        QProjScale := 1.0
+      else
+        QProjScale := QScale;
       Tmp := TNNetVolume.Create;
       try
         // embed_tokens -> embedding table (vocab rows of d floats,
@@ -2694,19 +2838,24 @@ begin
         end;
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
           BlockPrefix + 'self_attn.q_proj.weight',
-          Config.HiddenSize, QWidth, 0, -1, HeadDim, QBiasName, QScale);
+          Config.HiddenSize, QWidth, 0, -1, HeadDim, QBiasName, QProjScale);
         MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
         if QBiasName <> '' then MarkConsumed(QBiasName);
-        // Qwen3 per-head q/k RMSNorm: one shared [head_dim] gain per block,
-        // copied into every per-head norm (rotate_half-permuted to match
-        // the permuted q/k channel order).
+        // Qwen3/Gemma-3 per-head q/k RMSNorm: one shared [head_dim] gain
+        // per block, copied into every per-head norm (rotate_half-permuted
+        // to match the permuted q/k channel order). Gemma-3's zero-centered
+        // gains get the +1 offset (NormGainOffset), and the
+        // query_pre_attn_scalar fold rides the q-side gains (QScale; see
+        // above - a W_q fold would be erased by the norm).
         if Config.QKNorm then
         begin
           LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].QNorms,
-            BlockPrefix + 'self_attn.q_norm.weight', HeadDim);
+            BlockPrefix + 'self_attn.q_norm.weight', HeadDim,
+            NormGainOffset, QScale);
           MarkConsumed(BlockPrefix + 'self_attn.q_norm.weight');
           LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].KNorms,
-            BlockPrefix + 'self_attn.k_norm.weight', HeadDim);
+            BlockPrefix + 'self_attn.k_norm.weight', HeadDim,
+            NormGainOffset);
           MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
         end;
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
@@ -5700,6 +5849,24 @@ begin
     pInferenceOnly);
 end;
 
+function BuildGemma3FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'gemma3_text', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName);
+end;
+
+function BuildGemma3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildGemma3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly);
+end;
+
 function LoadPretrainedEmbedding(const FileName: string;
   Embedding: TNNetEmbedding; Tokenizer: TStringListInt;
   FreezeEmbedding: boolean = false): integer;
@@ -7998,13 +8165,17 @@ begin
       pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
-          (ModelType = 'gemma') or (ModelType = 'gemma2') then
+          (ModelType = 'gemma') or (ModelType = 'gemma2') or
+          (ModelType = 'gemma3_text') then
     // 'gemma' (architectures ["GemmaForCausalLM"]) rides the same path: the
     // config reader raises the Gemma flags (GeGLU FFN, zero-centered
     // RMSNorm, sqrt(d) embedding scale) from model_type alone. 'gemma2'
     // (["Gemma2ForCausalLM"]) adds the Gemma-2 deltas (alternating
     // local/global attention, query_pre_attn_scalar, attention- and
     // final-logit soft-capping, sandwich norms) the same way.
+    // 'gemma3_text' (["Gemma3ForCausalLM"], TEXT-ONLY) swaps the soft-caps
+    // for the per-head q/k RMSNorm and adds the 5:1 local:global pattern
+    // with per-layer-type RoPE theta.
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
@@ -8055,8 +8226,8 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
-      'qwen2, qwen3, gemma, gemma2, rwkv, mamba, bert, distilbert, ' +
-      'roberta.');
+      'qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, mamba, bert, ' +
+      'distilbert, roberta.');
   end;
 end;
 
