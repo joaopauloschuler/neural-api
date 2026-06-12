@@ -537,6 +537,35 @@ rather than acted on.
       transformers WhisperModel on a sliced pico fixture with a pinned
       mel input; headline demo: examples/WhisperTranscribe transcribing a
       short WAV to text on CPU.
+- [ ] DeepSeek-V2 importer (model_type "deepseek_v2"; DeepSeek-V2-Lite is
+      the reference checkpoint) — the FIRST importer to exercise the two
+      most distinctive landed-but-never-imported blocks:
+      AddMultiHeadLatentAttention (low-rank compressed KV latent +
+      decoupled RoPE keys) and AddDeepSeekMoE (shared + routed experts).
+      Every other importer family in neuralpretrained.pas maps onto plain
+      SDPA/GQA + dense FFN or classic MoE-free blocks, so MLA weight
+      loading is genuinely new plumbing, not a Llama-path clone. Work:
+      (1) config.json reader for the deepseek_v2 keys — kv_lora_rank,
+      q_lora_rank (null in -Lite → full W_q), qk_nope_head_dim,
+      qk_rope_head_dim (decoupled RoPE width), v_head_dim,
+      n_shared_experts / n_routed_experts / num_experts_per_tok,
+      first_k_dense_replace (layer 0 keeps a dense MLP), moe_intermediate
+      vs dense intermediate sizes; (2) weight map onto the MLA builder:
+      kv_a_proj_with_mqa packs [compressed_kv | k_rope] and needs the
+      same rotate_half row-permutation treatment as the Llama path but
+      only on the rope slice, kv_a_layernorm onto the latent RMSNorm,
+      kv_b_proj split into per-head k_nope|v halves; (3) MoE block map:
+      per-expert gate/up/down (SwiGLU packing as in Llama), shared-expert
+      branch added to the routed sum, gate weights onto TNNetTopKGate
+      (V2 softmax gating; the landed TNNetBiasBalancedTopKGate covers a
+      later V3-style variant behind the same map); (4) BuildFromPretrained
+      dispatch + .bin fallback as in every other family. Full -Lite is
+      15.7B so the runnable proof is a make_pico_deepseek_fixture.py
+      sliced/re-randomized pico checkpoint (reuse the ModernBERT
+      O(1)-scale re-randomization lesson) with hidden-state parity vs the
+      HF float64 oracle, plus non-vacuity asserts on kv_lora_rank, the
+      decoupled-rope slice, shared-expert contribution, and the layer-0
+      dense-vs-MoE split.
 - [X] BLOOM importer (bigscience/bloom-560m / bloomz-560m) — the ALiBi
       architecture family, the one positional scheme NO landed importer
       exercises (GPT-2 learned, Llama/NeoX/Qwen RoPE, T5 relative bias,
