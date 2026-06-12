@@ -111,6 +111,43 @@ rather than acted on.
       parse HF tokenizer.json (BPE/Unigram vocab + merges + byte-fallback) or
       the sentencepiece .model protobuf into a TNeuralTokenizer-compatible
       encoder/decoder so LlamaImport can take text prompts end to end.
+- [ ] Sampling decoders + logits-processor chain in neural/neuraldecode.pas
+      (transformers GenerationMixin port): temperature, top-k, top-p, min-p,
+      repetition/frequency/presence penalties as a `DecodeSample` sibling of
+      DecodeGreedy/DecodeBeamSearch. Generalize TNNetTokenConstraint from
+      "mask allowed tokens" into a chainable logits-processor abstraction
+      (transform the logit vector in order) so penalties, temperature and
+      the existing JSON/forced-sequence constraints compose in one pipeline.
+      Add a small TGenerationConfig record plus stopping criteria (EOS-id
+      list, stop strings, max new tokens).
+- [ ] LoRA adapters (PEFT port): freeze a base PointwiseConvLinear /
+      FullConnect layer's weights and add a parallel low-rank B·A path
+      (rank r, scaling alpha/r, B zero-init so the start is a no-op) with
+      its own learning rate; provide MergeLoRA to fold B·A into W for
+      inference and a builder that wraps existing projection layers.
+      Killer combo with the Llama safetensors importer: cheap fine-tuning
+      of imported pretrained models. Follow-up: load HF PEFT adapter
+      safetensors files onto an imported base model.
+- [ ] Gradient accumulation in neuralfit.pas: accumulate deltas over N
+      micro-batches before the optimizer step (large effective batch
+      without the memory), scaling the loss/deltas by 1/N so results match
+      a true big batch.
+- [ ] EMA (exponential moving average) shadow weights in neuralfit.pas:
+      maintain decay-averaged copies of all weights during training and
+      allow swapping them in for eval/save; classic free eval-quality win.
+- [ ] Parameter groups for the optimizer (PyTorch param_groups port):
+      per-group learning-rate multipliers and weight-decay exclusion for
+      norm/bias parameters (AdamW currently decays everything uniformly).
+- [ ] Speculative decoding in neural/neuraldecode.pas: small draft model
+      proposes K tokens greedily, target model verifies them in one
+      forward pass with the standard accept/resample rule; output
+      distribution provably identical to target-only sampling. Both nets
+      are plain TNNets (the DPO trainer already holds two models), and
+      TNNetStreamingDecoder gives the harness.
+- [ ] safetensors WRITER (neural/neuralsafetensors.pas has only the
+      reader): export named tensors so Pascal-trained models round-trip
+      into PyTorch/transformers. Doubles as a cross-framework correctness
+      check for the GPT-2/Llama importers (export → reload → compare).
 
 ## Layer follow-ups that fix real limitations
 
