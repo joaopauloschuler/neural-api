@@ -94,13 +94,23 @@ rather than acted on.
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
       out-of-scope for v1.
-- [ ] Llama-architecture safetensors importer (sibling of the landed GPT-2
+- [x] Llama-architecture safetensors importer (sibling of the landed GPT-2
       HuggingFace import in neural/neuralpretrained.pas): RMSNorm + SwiGLU FFN +
       RoPE + GQA are all available as building blocks, so a TinyLlama/Llama-style
       checkpoint loader is mostly weight-mapping work (untied embeddings, no
       biases, per-layer q/k/v/o + gate/up/down proj names). Reuse the GPT-2
       parity tooling (slicer + logit dump + compare, commit aff96f5) to verify
       logit parity against HF transformers on a sliced tiny checkpoint.
+      DONE: BuildLlamaFromSafeTensors[Ex/WithConfig] + TNNetTokenRMSNorm +
+      ReadLlamaConfigFromJSONFile (rotate_half q/k row permutation, tied or
+      untied LM head); verified vs transformers' LlamaForCausalLM at ~2e-7
+      max |logit diff| (untied / tied / sliced) via examples/LlamaImport;
+      committed pure-Python-oracle fixture test TestLlamaLogitParity.
+- [ ] SentencePiece / tokenizer.json tokenizer loading for the Llama importer
+      (examples/LlamaImport currently drives the net with raw token ids):
+      parse HF tokenizer.json (BPE/Unigram vocab + merges + byte-fallback) or
+      the sentencepiece .model protobuf into a TNeuralTokenizer-compatible
+      encoder/decoder so LlamaImport can take text prompts end to end.
 
 ## Layer follow-ups that fix real limitations
 

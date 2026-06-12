@@ -4244,6 +4244,36 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// This layer does PER-TOKEN root-mean-square normalization over the
+  // Depth (channel) axis with a learnable per-channel gain - exactly the
+  // RMSNorm used by Llama-family transformers (HF LlamaRMSNorm / T5
+  // LayerNorm): for each (x, y) position the Depth-wide feature vector is
+  // divided by sqrt(mean(v^2) + eps) (NO mean subtraction) and then
+  // multiplied by the per-channel weight (no bias). This differs from
+  // TNNetRMSNorm, which normalizes over the WHOLE (SizeX*SizeY*Depth)
+  // volume and would couple statistics across the tokens of a
+  // (SeqLen,1,d_model) sequence tensor - per-token statistics are required
+  // for importing pretrained Llama checkpoints (see neuralpretrained.pas).
+  // FNeurons[0] holds the Depth gain weights. Epsilon (default 1e-6, the
+  // HF Llama default) is serialized in FFloatSt[0]. Backward applies the
+  // exact per-token RMSNorm Jacobian and accumulates the gain gradient
+  // over all tokens.
+  // Coded by Claude (AI).
+  TNNetTokenRMSNorm = class(TNNetIdentityWithoutL2)
+    private
+      FTokenRMSEpsilon: TNeuralFloat;
+      FNormalized: TNNetVolume;   // x_hat = x * invRMS, same shape as input
+      FInvRMS: TNNetVolume;       // per-token 1/sqrt(mean(x^2)+eps), X x Y x 1
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pEpsilon: TNeuralFloat); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// Unparameterised per-sample z-score normalization — the core of
   // TNNetLayerNorm without the learnable gamma/beta. Each input sample
   // (all elements across SizeX*SizeY*Depth) is shifted to zero mean and
@@ -42958,6 +42988,147 @@ procedure TNNetRMSNorm.InitDefault();
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   FNeurons[0].FWeights.Fill(1); // gamma
+  AfterWeightUpdate();
+end;
+
+{ TNNetTokenRMSNorm }
+constructor TNNetTokenRMSNorm.Create();
+begin
+  inherited Create();
+  FTokenRMSEpsilon := 1e-6; // the HF Llama default
+  FFloatSt[0] := FTokenRMSEpsilon;
+  FNormalized := TNNetVolume.Create();
+  FInvRMS := TNNetVolume.Create();
+end;
+
+constructor TNNetTokenRMSNorm.Create(pEpsilon: TNeuralFloat);
+begin
+  Create();
+  if pEpsilon > 0 then FTokenRMSEpsilon := pEpsilon;
+  FFloatSt[0] := FTokenRMSEpsilon;
+end;
+
+destructor TNNetTokenRMSNorm.Destroy();
+begin
+  FInvRMS.Free;
+  FNormalized.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetTokenRMSNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // FNeurons[0] holds the per-channel gain (Depth weights, no bias).
+  SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  FNormalized.ReSize(FOutput);
+  FInvRMS.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  InitDefault();
+end;
+
+procedure TNNetTokenRMSNorm.Compute();
+var
+  StartTime: double;
+  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx: integer;
+  MeanSqr, InvRMSV, XHat: TNeuralFloat;
+  Gain: TNNetVolume;
+begin
+  StartTime := Now();
+  inherited Compute;
+  Depth := FOutput.Depth;
+  // Token index runs over the flattened (X, Y) positions; the Depth axis is
+  // contiguous in memory, so token t occupies FData[t*Depth .. t*Depth+Depth-1].
+  TokenMax := (FOutput.Size div Depth) - 1;
+  Gain := FNeurons[0].FWeights;
+  for TokenCnt := 0 to TokenMax do
+  begin
+    BaseIdx := TokenCnt * Depth;
+    MeanSqr := 0;
+    for ChannelCnt := 0 to Depth - 1 do
+      MeanSqr := MeanSqr +
+        FOutput.FData[BaseIdx + ChannelCnt] * FOutput.FData[BaseIdx + ChannelCnt];
+    MeanSqr := MeanSqr / Depth;
+    InvRMSV := 1 / Sqrt(MeanSqr + FTokenRMSEpsilon);
+    FInvRMS.FData[TokenCnt] := InvRMSV;
+    for ChannelCnt := 0 to Depth - 1 do
+    begin
+      XHat := FOutput.FData[BaseIdx + ChannelCnt] * InvRMSV;
+      FNormalized.FData[BaseIdx + ChannelCnt] := XHat;
+      FOutput.FData[BaseIdx + ChannelCnt] := Gain.FData[ChannelCnt] * XHat;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTokenRMSNorm.Backpropagate();
+var
+  StartTime: double;
+  Depth, TokenCnt, TokenMax, ChannelCnt, BaseIdx: integer;
+  SumDxHatXHat, DxHat, InvRMSV: TNeuralFloat;
+  Gain: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Depth := FOutput.Depth;
+  TokenMax := (FOutput.Size div Depth) - 1;
+  Gain := FNeurons[0].FWeights;
+  // Gain gradient accumulates over all tokens:
+  //   d(gain)[c] = sum_t OutputError[t,c] * x_hat[t,c]
+  for TokenCnt := 0 to TokenMax do
+  begin
+    BaseIdx := TokenCnt * Depth;
+    for ChannelCnt := 0 to Depth - 1 do
+      FNeurons[0].FDelta.FData[ChannelCnt] :=
+        FNeurons[0].FDelta.FData[ChannelCnt] - FLearningRate *
+        FOutputError.FData[BaseIdx + ChannelCnt] *
+        FNormalized.FData[BaseIdx + ChannelCnt];
+  end;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FOutputError.Size) then
+  begin
+    // Exact per-token RMSNorm Jacobian (no mean subtraction):
+    //   dxhat = OutputError * gain
+    //   dx = invRMS * ( dxhat - xhat * mean_c(dxhat * xhat) )
+    for TokenCnt := 0 to TokenMax do
+    begin
+      BaseIdx := TokenCnt * Depth;
+      InvRMSV := FInvRMS.FData[TokenCnt];
+      SumDxHatXHat := 0;
+      for ChannelCnt := 0 to Depth - 1 do
+      begin
+        DxHat := FOutputError.FData[BaseIdx + ChannelCnt] *
+          Gain.FData[ChannelCnt];
+        FOutputErrorDeriv.FData[BaseIdx + ChannelCnt] := DxHat;
+        SumDxHatXHat := SumDxHatXHat +
+          DxHat * FNormalized.FData[BaseIdx + ChannelCnt];
+      end;
+      SumDxHatXHat := SumDxHatXHat / Depth;
+      for ChannelCnt := 0 to Depth - 1 do
+      begin
+        FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] :=
+          FPrevLayer.FOutputError.FData[BaseIdx + ChannelCnt] +
+          InvRMSV * ( FOutputErrorDeriv.FData[BaseIdx + ChannelCnt] -
+            FNormalized.FData[BaseIdx + ChannelCnt] * SumDxHatXHat );
+      end;
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetTokenRMSNorm.InitDefault();
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  FNeurons[0].FWeights.Fill(1); // gain
   AfterWeightUpdate();
 end;
 
@@ -82275,6 +82446,7 @@ begin
       'TNNetLayerNorm':             Result := TNNetLayerNorm.Create();
       'TNNetTokenLayerNorm':        Result := TNNetTokenLayerNorm.Create(Ft[0]);
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
+      'TNNetTokenRMSNorm':          Result := TNNetTokenRMSNorm.Create(Ft[0]);
       'TNNetRMSNormGated':          Result := TNNetRMSNormGated.Create();
       'TNNetSwitchableNorm':        Result := TNNetSwitchableNorm.Create();
       'TNNetZScore':                Result := TNNetZScore.Create();
@@ -82656,6 +82828,7 @@ begin
       if S[0] = 'TNNetLayerNorm' then Result := TNNetLayerNorm.Create() else
       if S[0] = 'TNNetTokenLayerNorm' then Result := TNNetTokenLayerNorm.Create(Ft[0]) else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
+      if S[0] = 'TNNetTokenRMSNorm' then Result := TNNetTokenRMSNorm.Create(Ft[0]) else
       if S[0] = 'TNNetRMSNormGated' then Result := TNNetRMSNormGated.Create() else
       if S[0] = 'TNNetSwitchableNorm' then Result := TNNetSwitchableNorm.Create() else
       if S[0] = 'TNNetZScore' then Result := TNNetZScore.Create() else
