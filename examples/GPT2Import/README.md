@@ -62,6 +62,25 @@ dimension-sliced by `make_pico_gpt2_fixture.py` — 2 of 6 layers, 2 heads × 4
 dims, d_model 8, vocab 12, reference logits from `GPT2LMHeadModel` in
 float64) is asserted by `TestDistilGPT2LogitParity` in every test run.
 
+## GPT-Neo / TinyStories
+
+`neuralpretrained.pas` also imports **GPT-Neo** checkpoints
+(`BuildGPTNeoFromSafeTensors`, or `BuildFromPretrained` on a config with
+`model_type: "gpt_neo"`): the GPT-2 skeleton with ALTERNATING global /
+locally-banded (window_size) causal attention, UNSCALED attention scores
+(folded into `W_q` at load) and plain `nn.Linear` weight orientation. The
+**roneneldan/TinyStories-1M..33M** reference checkpoints are GPT-Neo and
+load through this path — verified 2026-06 on the real TinyStories-1M
+weights: max |logit diff| **6.3e-5** vs HF transformers float64, and a
+10-token greedy continuation of "Once upon a time there was a little girl
+named" is token-for-token identical to HF's (" Lily. She loved to play
+outside in the sunshine"). Note these repos ship `pytorch_model.bin` only;
+convert once with
+`save_file({k: v.contiguous() for k, v in model.state_dict().items()}, 'model.safetensors')`
+(safetensors.torch) next to the repo's `config.json`. The pico parity
+fixture is pinned by `tools/gptneo_tiny_fixture.py` →
+`TestGPTNeoLogitParity`.
+
 With a HuggingFace `tokenizer.json` sitting next to the checkpoint (every
 GPT-2-family repo ships one), prompts can be plain text instead of ids:
 

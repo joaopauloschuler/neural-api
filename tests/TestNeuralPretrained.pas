@@ -62,6 +62,8 @@ type
     procedure TestSmolLM2LogitParity;
     procedure TestMistralLogitParity;
     procedure TestQwen2LogitParity;
+    procedure TestGPTNeoConfigFromJSONFile;
+    procedure TestGPTNeoLogitParity;
     procedure TestBuildFromPretrainedDispatch;
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
   end;
@@ -1183,6 +1185,63 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestGPTNeoConfigFromJSONFile;
+var
+  Config: TGPTNeoConfig;
+begin
+  RandSeed := 424242;
+  Config := ReadGPTNeoConfigFromJSONFile(
+    FixturePath('tiny_gptneo_config.json'));
+  AssertEquals('hidden_size', 8, Config.HiddenSize);
+  // intermediate_size is null in the config: the 4*hidden default applies.
+  AssertEquals('intermediate_size', 32, Config.IntermediateSize);
+  AssertEquals('num_layers', 2, Config.NumLayers);
+  AssertEquals('num_heads', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('max_position_embeddings', 16, Config.MaxPositions);
+  AssertEquals('window_size', 4, Config.WindowSize);
+  AssertEquals('layer_norm_epsilon', 1e-5, Config.LayerNormEps, 1e-9);
+  AssertTrue('tie_word_embeddings', Config.TieWordEmbeddings);
+  AssertEquals('attention pattern length', 2, Length(Config.LayerIsLocal));
+  AssertFalse('layer 0 is global', Config.LayerIsLocal[0]);
+  AssertTrue('layer 1 is local', Config.LayerIsLocal[1]);
+end;
+
+// Verifies the GPT-Neo import target: tests/fixtures/tiny_gptneo.* is a pico
+// randomly-initialized HF GPTNeoForCausalLM (2 layers, 2 heads x 4 dims,
+// hidden 8, vocab 11, tied lm_head) covering all three GPT-Neo quirks:
+// ALTERNATING ["global", "local"] attention with window_size=4 SMALLER than
+// the 16-token test sequences (the generator tools/gptneo_tiny_fixture.py
+// asserts the band changes the logits by ~1.4e-2 vs a sequence-wide window),
+// UNSCALED attention (the generator asserts that pretending GPT-Neo scaled
+// by 1/sqrt(d_head) changes the logits by ~8e-3; the importer folds
+// sqrt(d_head) into W_q), and separate bias-free nn.Linear q/k/v ([out, in]
+// orientation, NOT GPT-2's transposed Conv1D; out_proj and the MLP carry
+// biases). Reference logits come from HF transformers in float64.
+procedure TTestNeuralPretrained.TestGPTNeoLogitParity;
+var
+  NN: TNNet;
+  Config: TGPTNeoConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildGPTNeoFromSafeTensorsEx(FixturePath('tiny_gptneo.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gptneo_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertEquals('window_size', 4, Config.WindowSize);
+    AssertTrue('tie_word_embeddings', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'transformer.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gptneo_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
 // BuildFromPretrained must route on config.json's model_type:
 //   - gpt2 via a HF-style checkpoint DIRECTORY (config.json +
 //     model.safetensors; n_head read from the config),
@@ -1249,6 +1308,15 @@ begin
   finally
     NN.Free;
   end;
+  // ---- gpt_neo through the file route ----
+  NN := BuildFromPretrained(FixturePath('tiny_gptneo.safetensors'), 0, false,
+    FixturePath('tiny_gptneo_config.json'));
+  try
+    AssertLogitParityWithFixture(NN, FixturePath('tiny_gptneo_logits.json'),
+      16, 11);
+  finally
+    NN.Free;
+  end;
 end;
 
 // An unsupported model_type must raise EPretrainedImportError with a
@@ -1289,8 +1357,9 @@ begin
   AssertTrue('error names the offending type: ' + Msg,
     Pos('"t5"', Msg) > 0);
   AssertTrue('error lists the supported types: ' + Msg,
-    (Pos('gpt2', Msg) > 0) and (Pos('llama', Msg) > 0) and
-    (Pos('mistral', Msg) > 0) and (Pos('qwen2', Msg) > 0));
+    (Pos('gpt2', Msg) > 0) and (Pos('gpt_neo', Msg) > 0) and
+    (Pos('llama', Msg) > 0) and (Pos('mistral', Msg) > 0) and
+    (Pos('qwen2', Msg) > 0));
 end;
 
 initialization

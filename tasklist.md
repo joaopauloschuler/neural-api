@@ -516,16 +516,16 @@ rather than acted on.
       sliced parity fixture. The cheapest credible answer to "import a
       trained GPT-3-class model"; doc cross-link target for
       ../gpt-3-for-pascal.
-- [ ] GPT-Neo importer (EleutherAI's GPT-3 replica — the open
+- [X] GPT-Neo importer (EleutherAI's GPT-3 replica — the open
       implementation of GPT-3's ALTERNATING dense / locally-banded sparse
-      attention): odd layers use a 256-key local window, which the landed
-      sliding-window SDPA (FWindow / TNNetSlidingWindowMaskedFill) already
-      covers. Two quirks: attention is UNSCALED (no 1/sqrt(d) — fold the
-      compensating factor into W_q at load time, zero layer changes), and
-      weights are plain Linear orientation rather than GPT-2's transposed
-      Conv1D. Adds the "gpt_neo" route to the AutoModel-dispatch task.
-      Verify with the HF-parity fixture tooling against GPTNeoForCausalLM
-      (EleutherAI/gpt-neo-125m is CPU-sized).
+      attention): BuildGPTNeoFromSafeTensors + "gpt_neo" BuildFromPretrained
+      route. HF's local band (bias ^ tril(bias, -window) keeps exactly
+      window_size keys, i-j < W) matches the landed SDPA pWindow convention
+      — verified numerically; UNSCALED attention folded into W_q
+      (x sqrt(d_head)) at load; plain bias-free nn.Linear q/k/v + biased
+      out_proj/MLP. Parity fixture tools/gptneo_tiny_fixture.py asserts the
+      window AND the no-scale quirk both change the logits non-vacuously;
+      also verified on real TinyStories-1M weights (see the rider below).
 - [ ] GPT-J / GPT-NeoX (Pythia) importer — the workhorse open GPT-3-class
       science suite (Pythia: 70M..12B with many training-step snapshots,
       untied embeddings; the untied-head path landed with the Llama
@@ -609,15 +609,25 @@ rather than acted on.
       per-layer override). The 4B+ multimodal vision tower is explicitly
       OUT OF SCOPE (separate project). Parity fixture vs
       Gemma3ForCausalLM on a sliced text-only checkpoint.
-- [ ] TinyStories reference-checkpoint import (rider on the GPT-Neo
-      importer task above): roneneldan/TinyStories-1M..33M are GPT-NEO
-      architecture, so they load with zero extra work once that importer
-      lands. Special fit: the repo's NLP examples already train on the
-      TinyStories dataset, so this gives a direct "our from-scratch
-      training vs the published reference checkpoint" bake-off (compare
-      with neuralnlpmetrics perplexity at matched vocab), and at 1M-33M
-      params the parity tests run against FULL checkpoints instead of
-      sliced fixtures — the only importer family where that is true.
+- [X] TinyStories reference-checkpoint import (rider on the landed GPT-Neo
+      importer): VERIFIED on the real roneneldan/TinyStories-1M checkpoint
+      (8 alternating global/local layers, window 256, tied head, vocab
+      50257) — pytorch_model.bin converted to safetensors, loaded via
+      BuildFromPretrained, max |logit diff| 6.3e-5 vs HF transformers
+      float64, 10 greedy tokens token-for-token identical to HF ("Once
+      upon a time there was a little girl named" -> " Lily. She loved to
+      play outside in the sunshine"). NOTE: the published checkpoints ship
+      pytorch_model.bin only — a one-line torch state_dict -> safetensors
+      save_file conversion is needed first (see examples/GPT2Import/
+      README.md).
+- [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
+      to the verified import above): the repo's NLP examples already train
+      on the TinyStories dataset — compare neuralnlpmetrics perplexity of
+      a from-scratch CAI training run against the imported
+      roneneldan/TinyStories-1M..33M reference at matched vocab/context;
+      at 1M-33M params the comparison runs against FULL checkpoints
+      instead of sliced fixtures, the only importer family where that is
+      true.
 - [ ] RWKV-4 checkpoint importer (RWKV-4-Pile-169M/430M) — the first
       NON-TRANSFORMER importer, and the most distinctive: recurrent
       inference with CONSTANT memory and no KV cache, exactly the right

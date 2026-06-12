@@ -12,6 +12,9 @@ unit neuralpretrained;
 //     BuildMistralFromSafeTensors.
 //   - Qwen2 (the Llama skeleton + q/k/v projection biases; o_proj and the
 //     MLP stay bias-free) - BuildQwen2FromSafeTensors.
+//   - GPT-Neo (EleutherAI's GPT-3 replica; the roneneldan/TinyStories
+//     checkpoints share this architecture) - BuildGPTNeoFromSafeTensors.
+//     See the GPT-NEO IMPORT section below.
 //   - AutoModel-style dispatch on config.json's model_type -
 //     BuildFromPretrained (directory or .safetensors/.index.json path).
 //
@@ -102,7 +105,41 @@ unit neuralpretrained;
 // explicit path / record). Tokenizer loading (SentencePiece /
 // tokenizer.json) is OUT OF SCOPE here: drive the net with raw token ids.
 //
-// Both importers FAIL LOUDLY (EPretrainedImportError) on missing tensors,
+// ============================ GPT-NEO IMPORT ===============================
+// BuildGPTNeoFromSafeTensors rebuilds EleutherAI's GPT-Neo decoder - the
+// GPT-2 skeleton (learned absolute wpe positions, pre-LN blocks, gelu_new
+// MLP, final ln_f, tied LM head) with three architectural quirks:
+//
+// 1. ALTERNATING ATTENTION: config attention_layers (or the packed
+//    attention_types form) marks each layer "global" (full causal) or
+//    "local" (causally banded). HF's local mask
+//    bias ^ tril(bias, -window_size) keeps keys j with i - j < window_size
+//    (exactly window_size keys including the query itself) - the SAME band
+//    TNNetScaledDotProductAttention's pWindow applies (it masks
+//    i - j >= Window), so local layers simply pass Window = window_size to
+//    AddMultiHeadSelfAttention and global layers pass 0.
+//
+// 2. UNSCALED ATTENTION: GPT-Neo does NOT divide the scores by
+//    sqrt(d_head). Rather than a new layer flag, the importer FOLDS the
+//    compensating factor into the query projection at load time:
+//    W_q (and a q bias, were one present - GPT-Neo's q_proj is bias-free)
+//    are multiplied by sqrt(d_head), so the standard scaled SDPA computes
+//    softmax((sqrt(d)q).k / sqrt(d)) = softmax(q.k) - identical scores
+//    with zero layer changes.
+//
+// 3. WEIGHT ORIENTATION: plain nn.Linear [out, in] storage (like Llama,
+//    NOT GPT-2's transposed Conv1D), with SEPARATE q/k/v projections.
+//    q/k/v carry NO bias; out_proj and the two MLP linears do. The
+//    separate projections are loaded into the fused Q|K|V slab the
+//    multi-head builder expects (q -> neurons 0..d-1, k -> d..2d-1,
+//    v -> 2d..3d-1; per-head slicing then matches HF's _split_heads).
+//
+// intermediate_size is null in every GPT-Neo config observed in the wild:
+// the HF default 4 * hidden_size applies. The LM head is tied to wte
+// (copied, like the GPT-2 path). The roneneldan/TinyStories-1M..33M
+// reference checkpoints are GPT-Neo and load through this path unchanged.
+//
+// All importers FAIL LOUDLY (EPretrainedImportError) on missing tensors,
 // unexpected tensors and shape mismatches.
 //
 // This unit is coded by Claude (AI).
@@ -236,6 +273,55 @@ function BuildQwen2FromSafeTensorsEx(const FileName: string;
 function BuildQwen2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
+type
+  TGPTNeoConfig = record
+    HiddenSize: integer;       // d_model (hidden_size)
+    IntermediateSize: integer; // MLP width (intermediate_size; null = 4*d)
+    NumLayers: integer;        // decoder blocks (num_layers)
+    NumHeads: integer;         // attention heads (num_heads)
+    VocabSize: integer;        // vocab_size
+    MaxPositions: integer;     // max_position_embeddings (wpe rows)
+    WindowSize: integer;       // local-attention band width (window_size)
+    LayerNormEps: TNeuralFloat;// layer_norm_epsilon
+    TieWordEmbeddings: boolean;// tie_word_embeddings (lm_head := wte)
+    LayerIsLocal: array of boolean; // per-layer attention type (local=true)
+    Prefix: string;            // tensor-name prefix ('transformer.' or '')
+  end;
+
+// Reads a HF GPT-Neo config.json (model_type 'gpt_neo'). Required:
+// hidden_size, num_layers, num_heads, vocab_size, max_position_embeddings.
+// Defaults: window_size = 256, layer_norm_epsilon = 1e-5,
+// intermediate_size = 4 * hidden_size (when null/absent),
+// tie_word_embeddings = true (the GPT-Neo convention). The per-layer
+// global/local pattern is read from "attention_layers" (a flat list of
+// 'global'/'local' strings) when present, else expanded from the packed
+// "attention_types" form [[[types...], count], ...]; its length must equal
+// num_layers. Prefix is left '' - the builder detects it.
+function ReadGPTNeoConfigFromJSONFile(const FileName: string): TGPTNeoConfig;
+
+function GPTNeoConfigToString(const Config: TGPTNeoConfig): string;
+
+// Builds a TNNet with the GPT-Neo architecture described by the config and
+// loads every weight from the safetensors checkpoint at FileName (see the
+// GPT-NEO IMPORT section of the unit header). The net takes a (SeqLen,1,1)
+// volume of token ids and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses
+// the full max_position_embeddings context. pInferenceOnly = True frees
+// training volumes during construction (Compute()-only afterwards).
+// Config.Prefix is detected from the checkpoint and written back.
+function BuildGPTNeoFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGPTNeoConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildGPTNeoFromSafeTensorsEx(const FileName: string;
+  out Config: TGPTNeoConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildGPTNeoFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -244,7 +330,7 @@ function BuildQwen2FromSafeTensors(const FileName: string;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// llama, mistral, qwen2. Anything else raises EPretrainedImportError
+// gpt_neo, llama, mistral, qwen2. Anything else raises EPretrainedImportError
 // listing the supported types. The explicit builders stay public for
 // callers that want a compile-time architecture choice.
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
@@ -759,10 +845,13 @@ end;
 // (even/odd) pair layout (see the unit header):
 //   target channel (h*hd + 2k)     <- HF row (h*hd + k)
 //   target channel (h*hd + 2k + 1) <- HF row (h*hd + k + hd/2)
+// Scale multiplies every loaded weight (and bias): the GPT-Neo importer
+// folds the missing 1/sqrt(d_head) attention scaling into W_q with it.
 procedure LoadLlamaLinearWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
   NeuronBase: integer = 0; ExpectedNeurons: integer = -1;
-  RotaryHeadDim: integer = 0; const BiasName: string = '');
+  RotaryHeadDim: integer = 0; const BiasName: string = '';
+  Scale: TNeuralFloat = 1.0);
 var
   W, B: TNNetVolume;
   i, j, TargetIdx, HeadIdx, RowInHead, HalfDim: integer;
@@ -824,9 +913,10 @@ begin
           IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
       for i := 0 to InDim - 1 do
-        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[j * InDim + i];
+        Layer.Neurons[TargetIdx].Weights.FData[i] :=
+          Scale * W.FData[j * InDim + i];
       if B <> nil then
-        Layer.Neurons[TargetIdx].BiasWeight := B.FData[j] // Qwen2 q/k/v bias
+        Layer.Neurons[TargetIdx].BiasWeight := Scale * B.FData[j]
       else
         Layer.Neurons[TargetIdx].BiasWeight := 0; // bias-free Linear
     end;
@@ -1162,6 +1252,434 @@ begin
     pInferenceOnly);
 end;
 
+// ============================ GPT-NEO IMPORT ===============================
+
+function ReadGPTNeoConfigFromJSONFile(const FileName: string): TGPTNeoConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, TypeName: string;
+  Field, TypesField: TJSONData;
+  LayersArr, TypesArr, PairArr, NamesArr: TJSONArray;
+  i, i2, j, RepeatCnt, LayerCnt: integer;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('GPT-Neo import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('GPT-Neo import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+  procedure AddLayerType(const AName: string);
+  begin
+    if (AName <> 'global') and (AName <> 'local') then
+      ImportError('GPT-Neo import: config attention layer type "' + AName +
+        '" is not supported - only "global" and "local" exist.');
+    if LayerCnt >= Result.NumLayers then
+      ImportError('GPT-Neo import: config lists more attention layer ' +
+        'types than num_layers=' + IntToStr(Result.NumLayers) + '.');
+    Result.LayerIsLocal[LayerCnt] := (AName = 'local');
+    Inc(LayerCnt);
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('GPT-Neo import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('GPT-Neo import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('GPT-Neo import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'gpt_neo');
+    if ModelType <> 'gpt_neo' then
+      ImportError('GPT-Neo import: config model_type is "' + ModelType +
+        '" - expected "gpt_neo" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_layers');
+    Result.NumHeads := RequiredInt('num_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.WindowSize := Obj.Get('window_size', 256);
+    if Result.WindowSize < 1 then
+      ImportError('GPT-Neo import: config window_size must be >= 1, got ' +
+        IntToStr(Result.WindowSize) + '.');
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    // intermediate_size is null in every GPT-Neo config in the wild: the
+    // HF default 4 * hidden_size applies.
+    Field := Obj.Find('intermediate_size');
+    if (Field = nil) or Field.IsNull then
+      Result.IntermediateSize := 4 * Result.HiddenSize
+    else
+      Result.IntermediateSize := RequiredInt('intermediate_size');
+    // Per-layer global/local pattern: the flat "attention_layers" list
+    // when present, else the packed "attention_types" [[[t..], n], ...].
+    SetLength(Result.LayerIsLocal, Result.NumLayers);
+    LayerCnt := 0;
+    Field := Obj.Find('attention_layers');
+    if (Field <> nil) and (Field is TJSONArray) then
+    begin
+      LayersArr := TJSONArray(Field);
+      for i := 0 to LayersArr.Count - 1 do
+        AddLayerType(LayersArr.Items[i].AsString);
+    end
+    else
+    begin
+      TypesField := Obj.Find('attention_types');
+      if (TypesField = nil) or not (TypesField is TJSONArray) then
+        ImportError('GPT-Neo import: config "' + FileName + '" carries ' +
+          'neither "attention_layers" nor "attention_types".');
+      TypesArr := TJSONArray(TypesField);
+      for i := 0 to TypesArr.Count - 1 do
+      begin
+        if not (TypesArr.Items[i] is TJSONArray) or
+           (TJSONArray(TypesArr.Items[i]).Count <> 2) then
+          ImportError('GPT-Neo import: malformed attention_types entry ' +
+            TypesArr.Items[i].AsJSON + ' (expected [[types...], count]).');
+        PairArr := TJSONArray(TypesArr.Items[i]);
+        if not (PairArr.Items[0] is TJSONArray) then
+          ImportError('GPT-Neo import: malformed attention_types entry ' +
+            PairArr.AsJSON + ' (expected [[types...], count]).');
+        NamesArr := TJSONArray(PairArr.Items[0]);
+        RepeatCnt := PairArr.Items[1].AsInteger;
+        if RepeatCnt < 1 then
+          ImportError('GPT-Neo import: attention_types repeat count must ' +
+            'be >= 1, got ' + PairArr.Items[1].AsJSON + '.');
+        for i2 := 1 to RepeatCnt do
+          for j := 0 to NamesArr.Count - 1 do
+            AddLayerType(NamesArr.Items[j].AsString);
+      end;
+    end;
+    if LayerCnt <> Result.NumLayers then
+      ImportError('GPT-Neo import: config lists ' + IntToStr(LayerCnt) +
+        ' attention layer types but num_layers=' +
+        IntToStr(Result.NumLayers) + '.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function GPTNeoConfigToString(const Config: TGPTNeoConfig): string;
+var
+  i: integer;
+begin
+  Result := 'gpt_neo config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', window=' + IntToStr(Config.WindowSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true) +
+    ', attention=[';
+  for i := 0 to High(Config.LayerIsLocal) do
+  begin
+    if i > 0 then Result := Result + ',';
+    if Config.LayerIsLocal[i] then Result := Result + 'local'
+    else Result := Result + 'global';
+  end;
+  Result := Result + ']';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TGPTNeoBlockLayers = record
+    LN1, QKV, AttnProj, LN2, CFc, MlpProj: TNNetLayer;
+  end;
+
+function BuildGPTNeoFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGPTNeoConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TGPTNeoBlockLayers;
+  EmbeddingLayer, PosLayer, FinalLN, LMHead: TNNetLayer;
+  BranchInput: TNNetLayer;
+  BlockCnt, SeqLen, HeadDim, Window, i, j: integer;
+  QScale: TNeuralFloat;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+begin
+  Reader := TNNetSafeTensorsReader.Create(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('GPT-Neo import: num_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('GPT-Neo import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by num_heads=' +
+          IntToStr(Config.NumHeads) + '.');
+      if Length(Config.LayerIsLocal) <> Config.NumLayers then
+        ImportError('GPT-Neo import: LayerIsLocal lists ' +
+          IntToStr(Length(Config.LayerIsLocal)) +
+          ' attention types but num_layers=' +
+          IntToStr(Config.NumLayers) + '.');
+      if Config.WindowSize < 1 then
+        ImportError('GPT-Neo import: window_size must be >= 1.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      // The 1/sqrt(d_head) the scaled SDPA applies is folded back out of
+      // the scores by pre-scaling W_q (see the unit header).
+      QScale := Sqrt(HeadDim);
+      if Reader.HasTensor('transformer.wte.weight') then
+        Config.Prefix := 'transformer.'
+      else if Reader.HasTensor('wte.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('GPT-Neo import: neither "transformer.wte.weight" nor ' +
+          '"wte.weight" found in ' + Reader.FileName +
+          ' - not a GPT-Neo checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'wte.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'wte.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'wte.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('GPT-Neo import: wte.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' + Reader.ShapeAsString(Config.Prefix + 'wte.weight'));
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('lm_head.weight')) then
+        ImportError('GPT-Neo import: config says tie_word_embeddings=false ' +
+          'but "lm_head.weight" is missing from ' + Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('GPT-Neo import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real BPE token, not padding.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      PosLayer := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // Attention sub-block: x := x + out_proj(MHA(qkv(ln_1(x)))).
+        // The separate HF q/k/v projections are fused into one Q|K|V slab;
+        // local layers pass the GPT-Neo band as the SDPA sliding window
+        // (identical mask, see the unit header), global layers pass 0.
+        if Config.LayerIsLocal[BlockCnt] then Window := Config.WindowSize
+        else Window := 0;
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN1 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].QKV := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        Blocks[BlockCnt].AttnProj := NN.AddMultiHeadSelfAttention(
+          Config.NumHeads, {CausalMask=}true, {UseRoPE=}false,
+          {Variant=}avSDPA, {NumSinks=}1, Window);
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // MLP sub-block: x := x + c_proj(gelu_new(c_fc(ln_2(x)))).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN2 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].CFc := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        NN.AddLayer( TNNetGELU.Create() ); // tanh approximation = gelu_new
+        Blocks[BlockCnt].MlpProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        // wte -> embedding table (vocab rows of d floats).
+        Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('GPT-Neo import: wte.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'wte.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          // Tied LM head: logits = h . wte^T (rows copied, bias-free).
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          // A redundant serialized lm_head.weight is ignorable when tied.
+          if Reader.HasTensor('lm_head.weight') then
+            MarkConsumed('lm_head.weight');
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+            Config.HiddenSize, Config.VocabSize);
+          MarkConsumed('lm_head.weight');
+        end;
+        // wpe -> learned positional table (max_pos rows of d floats).
+        if not Reader.HasTensor(Config.Prefix + 'wpe.weight') then
+          ImportError('GPT-Neo import: missing tensor "' + Config.Prefix +
+            'wpe.weight" in ' + Reader.FileName);
+        Reader.LoadTensorFlat(Config.Prefix + 'wpe.weight', Tmp);
+        if PosLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('GPT-Neo import: wpe.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the positional table ' +
+            'size ' + IntToStr(PosLayer.Neurons[0].Weights.Size) + '.');
+        PosLayer.Neurons[0].Weights.Copy(Tmp);
+        PosLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'wpe.weight');
+      finally
+        Tmp.Free;
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'attn.attention.';
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN1,
+          BlockPrefix + 'ln_1.weight', BlockPrefix + 'ln_1.bias',
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'ln_1.weight');
+        MarkConsumed(BlockPrefix + 'ln_1.bias');
+        // Separate bias-free nn.Linear q/k/v -> fused Q|K|V slab. W_q is
+        // multiplied by sqrt(d_head) to cancel the SDPA's 1/sqrt(d_head)
+        // (GPT-Neo attention is UNSCALED; q_proj has no bias to scale).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'q_proj.weight', Config.HiddenSize, Config.HiddenSize,
+          0, 3 * Config.HiddenSize, 0, '', QScale);
+        MarkConsumed(AttnPrefix + 'q_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'k_proj.weight', Config.HiddenSize, Config.HiddenSize,
+          Config.HiddenSize, 3 * Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'k_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'v_proj.weight', Config.HiddenSize, Config.HiddenSize,
+          2 * Config.HiddenSize, 3 * Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'v_proj.weight');
+        // out_proj carries a bias (the only biased attention linear).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnProj,
+          AttnPrefix + 'out_proj.weight', Config.HiddenSize,
+          Config.HiddenSize, 0, -1, 0, AttnPrefix + 'out_proj.bias');
+        MarkConsumed(AttnPrefix + 'out_proj.weight');
+        MarkConsumed(AttnPrefix + 'out_proj.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN2,
+          BlockPrefix + 'ln_2.weight', BlockPrefix + 'ln_2.bias',
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'ln_2.weight');
+        MarkConsumed(BlockPrefix + 'ln_2.bias');
+        // MLP: plain nn.Linear [out, in] WITH biases (NOT GPT-2's
+        // transposed Conv1D).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CFc,
+          BlockPrefix + 'mlp.c_fc.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, -1, 0, BlockPrefix + 'mlp.c_fc.bias');
+        MarkConsumed(BlockPrefix + 'mlp.c_fc.weight');
+        MarkConsumed(BlockPrefix + 'mlp.c_fc.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].MlpProj,
+          BlockPrefix + 'mlp.c_proj.weight', Config.IntermediateSize,
+          Config.HiddenSize, 0, -1, 0, BlockPrefix + 'mlp.c_proj.bias');
+        MarkConsumed(BlockPrefix + 'mlp.c_proj.weight');
+        MarkConsumed(BlockPrefix + 'mlp.c_proj.bias');
+      end;
+      LoadLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'ln_f.weight', Config.Prefix + 'ln_f.bias',
+        Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'ln_f.weight');
+      MarkConsumed(Config.Prefix + 'ln_f.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      // Every tensor must be consumed or be a known ignorable buffer:
+      // h.N.attn.attention.bias / .masked_bias are the causal/banded mask
+      // buffers older PyTorch exports serialize (structural here).
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if (Pos('.attn.attention.bias', TensorNameStr) > 0) or
+           (Pos('.attn.attention.masked_bias', TensorNameStr) > 0) then
+          continue;
+        ImportError('GPT-Neo import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildGPTNeoFromSafeTensorsEx(const FileName: string;
+  out Config: TGPTNeoConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadGPTNeoConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildGPTNeoFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildGPTNeoFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TGPTNeoConfig;
+begin
+  Result := BuildGPTNeoFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly);
+end;
+
 // ===================== MISTRAL / QWEN2 / DISPATCH ==========================
 
 // Shared wrapper: builds via the Llama path and asserts the config's
@@ -1228,6 +1746,7 @@ var
   Root: TJSONData;
   NumHeads: integer;
   IgnoredLlamaConfig: TLlamaConfig;
+  IgnoredGPTNeoConfig: TGPTNeoConfig;
 begin
   // ---- resolve the weights file and the config.json ----
   if DirectoryExists(Path) then
@@ -1280,6 +1799,9 @@ begin
   if ModelType = 'gpt2' then
     Result := BuildGPT2FromSafeTensors(WeightsPath, pSeqLen, NumHeads,
       pInferenceOnly)
+  else if ModelType = 'gpt_neo' then
+    Result := BuildGPTNeoFromSafeTensorsEx(WeightsPath, IgnoredGPTNeoConfig,
+      pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') then
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
@@ -1289,7 +1811,7 @@ begin
     Result := nil;
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
-      'model_types: gpt2, llama, mistral, qwen2.');
+      'model_types: gpt2, gpt_neo, llama, mistral, qwen2.');
   end;
 end;
 
