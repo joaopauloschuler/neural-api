@@ -104,7 +104,7 @@ rather than acted on.
       head + window + partial rotary all asserted non-vacuous) verified at
       max |logit diff| 1.7e-6 vs HF float64 (TestPhi3LogitParity, both the
       direct and the BuildFromPretrained dispatch routes).
-- [ ] CLIP import — first VISION-LANGUAGE importer: BuildClipFromSafeTensors
+- [X] CLIP import — first VISION-LANGUAGE importer: BuildClipFromSafeTensors
       for openai/clip-vit-base-patch32 (or SigLIP, whichever maps cleaner).
       Both towers are plain pre-norm transformer encoders the library already
       has every primitive for: text side = embedding + causal SDPA blocks +
@@ -119,6 +119,29 @@ rather than acted on.
       mean-pool helper in neuralpretrained.pas is the in-repo precedent), and
       a zero-shot image classification example (CIFAR-10 class-name prompts,
       no training) — ties the library's CV roots to the NLP/importer stack.
+      LANDED: BuildClipFromSafeTensors returns the dual encoder as TWO
+      independent nets (the T5/Marian two-net convention, as peers — no
+      cross-attention, RunT5 does not apply). quick_gelu =
+      TNNetSwishLearnable(1.702) (x*sigmoid(1.702x) exactly — no new
+      layer); the vision class token is folded into row 0 of the learned
+      position table over a zero left-pad slot (PadXY+Crop, exact); the
+      vision tower is the reusable BuildClipVisionTower (post_layernorm +
+      bias-free projection applied PER TOKEN — exact for the pooled row 0).
+      ClipTextEosPosition implements BOTH modeling_clip pooling branches
+      (legacy eos_token_id=2 ARGMAX-of-ids + fixed first-eos);
+      ClipExtractEmbedding/ClipSimilarity give the L2-normalized cosine
+      head, exp(Config.LogitScale)*cosine reproduces HF logits_per_image.
+      Pico fixture tests/fixtures/tiny_clip.* (tools/clip_tiny_fixture.py;
+      quick_gelu-vs-gelu, causal text, argmax-pooling position,
+      class-embedding/positions/pre_layrnorm all asserted non-vacuous):
+      text embeds 7.0e-7 / image embeds 4.9e-7 / logits 7.7e-7 vs HF
+      float64 (TestClipParity + TestClipConfigFromJSONFile).
+      BuildFromPretrained dispatches "clip" to a redirect error; .bin
+      works via CreatePretrainedTensorReader. examples/ClipZeroShot runs
+      the zero-shot softmax OFFLINE on the fixture (real CIFAR-10
+      class-name prompts need the CLIP BPE tokenizer wiring + image
+      preprocessing — a follow-up; neuralhftokenizer already reads the
+      tokenizer.json).
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are

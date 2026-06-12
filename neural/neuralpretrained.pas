@@ -130,6 +130,16 @@ unit neuralpretrained;
 //     blocks (shared + routed SwiGLU experts, per-token softmax top-k
 //     gating; layers below first_k_dense_replace keep a dense MLP).
 //     Causal-LM contract. See the DEEPSEEK-V2 IMPORT section below.
+//   - CLIP (model_type "clip": openai/clip-vit-base-patch32 and siblings)
+//     - BuildClipFromSafeTensors, the FIRST VISION-LANGUAGE importer and
+//     the first ViT: returns TWO independent nets (the contrastive
+//     dual-encoder - a CAUSAL pre-LN quick_gelu TEXT tower with learned
+//     positions, eot-pooled + text_projection, and a BIDIRECTIONAL ViT
+//     VISION tower - bias-free patch conv, class token folded into the
+//     position table, pre_layrnorm/post_layernorm + visual_projection,
+//     factored as the reusable BuildClipVisionTower). L2-normalized
+//     cosine scoring via ClipExtractEmbedding/ClipSimilarity +
+//     exp(logit_scale). See the CLIP IMPORT section below.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -2074,6 +2084,175 @@ function BuildDeepSeekV2FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 function BuildDeepSeekV2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+// ---------------------------------------------------------------------------
+// CLIP IMPORT (model_type "clip": openai/clip-vit-base-patch32/-patch16,
+// -large-patch14 and the laion CLIP family) - the FIRST VISION-LANGUAGE
+// importer and the FIRST ViT (vision transformer) in this unit. Radford et
+// al. 2021, arXiv:2103.00020. CLIP is a contrastive DUAL-ENCODER: two
+// independent towers projected into one shared embedding space, so the
+// import returns TWO nets (the T5/Marian two-net convention - but here the
+// nets are independent peers, not an encoder feeding a decoder; there is
+// no cross-attention and RunT5 does not apply):
+//   - the TEXT net: (SeqLen,1,1) token ids in -> (SeqLen,1,projection_dim)
+//     PROJECTED per-token features out. Architecture: token embedding +
+//     LEARNED absolute positions (GPT-2-style wpe), num_hidden_layers x
+//     CAUSAL pre-LN blocks [x += out(MHA(q|k|v(LN1(x)))); x +=
+//     fc2(quick_gelu(fc1(LN2(x))))] with biased q/k/v/out projections and
+//     standard 1/sqrt(head_dim) scaling, final_layer_norm, then the
+//     bias-free text_projection applied PER TOKEN. HF's text_embeds is the
+//     ROW AT THE EOT POSITION (ClipTextEosPosition + ClipExtractEmbedding
+//     below);
+//   - the VISION net: (image_size,image_size,num_channels) pixel values in
+//     (CLIP-preprocessed floats: resized/cropped, scaled to [0,1], then
+//     channel-normalized with the published CLIP mean/std - preprocessing
+//     itself is out of scope) -> (num_patches+1,1,projection_dim)
+//     PROJECTED per-token features out. Architecture: bias-FREE
+//     patch_embedding conv (TNNetConvolutionLinear, kernel = stride =
+//     patch_size) -> flatten to a (num_patches,1,hidden) row-major patch
+//     sequence -> the learned class_embedding PREPENDED as token 0 ->
+//     learned absolute positions -> pre_layrnorm (the historical HF
+//     spelling; "pre_layernorm" is accepted too) -> BIDIRECTIONAL pre-LN
+//     blocks (same shape as the text blocks) -> post_layernorm ->
+//     bias-free visual_projection, both applied PER TOKEN. HF applies
+//     post_layernorm + projection only to the pooled CLASS token; per-token
+//     application is exact for ROW 0, which is HF's image_embeds
+//     (ClipExtractEmbedding(Output, 0, ...)).
+// Import notes:
+//   - quick_gelu (x * sigmoid(1.702 x), HF QuickGELUActivation) is built
+//     as TNNetSwishLearnable(beta = 1.702) - y = x*sigmoid(beta*x) exactly;
+//     hidden_act "gelu" (exact erf, the laion/SigLIP-adjacent configs) and
+//     "gelu_new"/"gelu_pytorch_tanh" are also accepted;
+//   - the CLASS token is wired WITHOUT a dedicated layer: the patch
+//     sequence is left-padded with one ZERO row (TNNetPadXY + TNNetCrop)
+//     and class_embedding is FOLDED into row 0 of the learned position
+//     table (exact: the class slot's pre-position content is identically
+//     zero, so row0 = class_embedding + position_row0);
+//   - EOS pooling follows modeling_clip exactly: eos_token_id == 2 (the
+//     legacy pre-#24773 id every published OpenAI CLIP config carries)
+//     pools at ARGMAX(input_ids) - the first occurrence of the HIGHEST
+//     token id, the eot token in the CLIP vocab - while any other
+//     eos_token_id pools at the FIRST position equal to it
+//     (ClipTextEosPosition implements both branches);
+//   - logit_scale (a 0-dim learned scalar) is loaded into
+//     Config.LogitScale; HF's logits_per_image = exp(logit_scale) *
+//     cosine(image, text) - see ClipSimilarity;
+//   - the VISION tower is factored as the reusable BuildClipVisionTower
+//     (a plain pre-LN ViT-with-class-token: a future ViT/DINO/SigLIP
+//     import can reuse it with different prefixes/projection).
+// Tensor names: text_model.embeddings.{token,position}_embedding.weight,
+// text_model.encoder.layers.N.{layer_norm1,layer_norm2}.{weight,bias},
+// ...self_attn.{q,k,v,out}_proj.{weight,bias}, ...mlp.{fc1,fc2}.{weight,
+// bias}, text_model.final_layer_norm.{weight,bias}, text_projection.weight,
+// vision_model.embeddings.{class_embedding,patch_embedding.weight,
+// position_embedding.weight}, vision_model.{pre_layrnorm,post_layernorm}.
+// {weight,bias}, vision_model.encoder.layers.N.* (text names),
+// visual_projection.weight, logit_scale.
+// BuildFromPretrained does NOT dispatch "clip" (it returns ONE net); it
+// raises an error pointing here instead. TOKENIZER NOTE: CLIP ships a
+// byte-level BPE tokenizer.json (lowercasing + </w> word markers) readable
+// by neuralhftokenizer.pas; the importer itself is tokenizer-independent.
+// See examples/ClipZeroShot for the zero-shot classification recipe.
+
+type
+  // hidden_act of one CLIP tower: quick_gelu (x*sigmoid(1.702x), every
+  // published OpenAI CLIP), the exact erf gelu, or the tanh approximation.
+  TClipHiddenAct = (chaQuickGelu, chaGeluExact, chaGeluTanh);
+
+  // One CLIP transformer tower (the text/vision halves share this shape).
+  TClipTowerConfig = record
+    HiddenSize: integer;        // hidden_size
+    IntermediateSize: integer;  // intermediate_size (fc1 width)
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-5 in published CLIPs)
+    HiddenAct: TClipHiddenAct;  // hidden_act
+  end;
+
+  TClipConfig = record
+    Text: TClipTowerConfig;     // text_config
+    Vision: TClipTowerConfig;   // vision_config
+    TextVocabSize: integer;     // text_config.vocab_size (49408)
+    TextMaxPositions: integer;  // text_config.max_position_embeddings (77)
+    EosTokenId: integer;        // text_config.eos_token_id (2 = legacy
+                                // ARGMAX pooling; see ClipTextEosPosition)
+    ImageSize: integer;         // vision_config.image_size (224)
+    PatchSize: integer;         // vision_config.patch_size (32/16/14)
+    NumChannels: integer;       // vision_config.num_channels (3)
+    ProjectionDim: integer;     // projection_dim (the shared space, 512)
+    LogitScale: TNeuralFloat;   // logit_scale_init_value from the config,
+                                // REPLACED by the checkpoint's learned
+                                // logit_scale tensor when present (RAW,
+                                // i.e. pre-exp)
+    ModelType: string;          // 'clip'
+  end;
+
+// Reads a HF CLIP config.json (model_type "clip"). Required per tower
+// (text_config / vision_config sub-objects): hidden_size,
+// intermediate_size, num_hidden_layers, num_attention_heads, plus
+// vocab_size + max_position_embeddings (text) and image_size + patch_size
+// (vision). Defaults follow CLIPTextConfig/CLIPVisionConfig: hidden_act =
+// "quick_gelu", layer_norm_eps = 1e-5, eos_token_id = 2, num_channels = 3,
+// projection_dim = 512, logit_scale_init_value = 2.6592. hidden_act other
+// than quick_gelu / gelu / gelu_new / gelu_pytorch_tanh is rejected.
+function ReadClipConfigFromJSONFile(const FileName: string): TClipConfig;
+
+function ClipConfigToString(const Config: TClipConfig): string;
+
+// Builds the CLIP TEXT and VISION nets described by Config and loads every
+// weight from the checkpoint at FileName (.safetensors / sharded index /
+// pytorch_model.bin via CreatePretrainedTensorReader; see the CLIP IMPORT
+// section above for shapes). TextSeqLen <= 0 uses the full
+// text max_position_embeddings context. Both nets are owned by the caller.
+// pInferenceOnly = True frees training volumes during construction
+// (Compute()-only afterwards). Config.LogitScale is updated from the
+// checkpoint's logit_scale tensor.
+procedure BuildClipFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TClipConfig; out TextNet, VisionNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildClipFromSafeTensors(const FileName: string;
+  out TextNet, VisionNet: TNNet; out Config: TClipConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Builds + loads the CLIP ViT VISION tower alone (the reusable half: a
+// plain pre-LN ViT with a class token). Prefix is the tensor-name prefix
+// ('vision_model.' for CLIP checkpoints); ProjectionTensorName names the
+// bias-free [ProjectionDim, hidden] projection applied per token after the
+// post LayerNorm ('visual_projection.weight' for CLIP; '' skips the
+// projection and the net outputs (num_patches+1,1,hidden) post-LN hidden
+// states - the plain ViT contract). The CLASS-token row is row 0.
+function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
+  const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
+  ProjectionDim: integer; const Prefix: string;
+  const ProjectionTensorName: string = '';
+  pInferenceOnly: boolean = false): TNNet;
+
+// The text-pooling position of modeling_clip: EosTokenId = 2 (the legacy
+// id of every published OpenAI CLIP) returns the position of the FIRST
+// occurrence of the HIGHEST id in TokenIds (HF input_ids.argmax(-1) - the
+// eot token, which carries the top id in the CLIP vocab); any other
+// EosTokenId returns the first position whose id equals it (fails loudly
+// when absent). TokenIds is the (SeqLen,1,1) text-net input volume.
+function ClipTextEosPosition(TokenIds: TNNetVolume;
+  EosTokenId: integer): integer;
+
+// Copies the depth column at TokenPos of a (SeqLen,1,Depth) net output
+// into Embedding ((1,1,Depth)) and L2-normalizes it - the CLIP embedding
+// head (mirrors BertPoolSentenceEmbedding's normalize-for-cosine
+// convention). TEXT net: TokenPos = ClipTextEosPosition(...); VISION net:
+// TokenPos = 0 (the class token). After normalization cosine similarity is
+// a plain dot product (ClipSimilarity); HF's logits_per_image =
+// exp(Config.LogitScale) * ClipSimilarity(ImageEmb, TextEmb).
+procedure ClipExtractEmbedding(NetOutput: TNNetVolume; TokenPos: integer;
+  Embedding: TNNetVolume);
+
+// Dot product of two same-size embedding volumes = cosine similarity of
+// ClipExtractEmbedding outputs (both are unit-L2).
+function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
@@ -11425,6 +11604,633 @@ begin
     pSeqLen, pInferenceOnly);
 end;
 
+// ============================ CLIP IMPORT ==================================
+
+type
+  // The per-block layer handles of one CLIP pre-LN encoder block (shared
+  // by the text and vision towers; mirrors TBertBlockLayers).
+  TClipBlockLayers = record
+    LN1, QKV, AttnDense, LN2, Inter, OutDense: TNNetLayer;
+  end;
+  TClipBlockLayersArray = array of TClipBlockLayers;
+
+function ClipHiddenActFromString(const ActStr: string): TClipHiddenAct;
+begin
+  Result := chaQuickGelu;
+  if ActStr = 'quick_gelu' then Result := chaQuickGelu
+  else if ActStr = 'gelu' then Result := chaGeluExact
+  else if (ActStr = 'gelu_new') or (ActStr = 'gelu_pytorch_tanh') then
+    Result := chaGeluTanh
+  else
+    ImportError('CLIP import: hidden_act "' + ActStr + '" is not ' +
+      'supported - expected "quick_gelu" (every published OpenAI CLIP), ' +
+      '"gelu", "gelu_new" or "gelu_pytorch_tanh".');
+end;
+
+function ClipHiddenActToString(HiddenAct: TClipHiddenAct): string;
+begin
+  case HiddenAct of
+    chaQuickGelu: Result := 'quick_gelu';
+    chaGeluExact: Result := 'gelu';
+    else Result := 'gelu_tanh';
+  end;
+end;
+
+// Appends Config's hidden activation to the net:
+//   quick_gelu: x * sigmoid(1.702 x) = TNNetSwishLearnable(beta=1.702)
+//     (y = x*sigmoid(beta*x) exactly; beta initialized to 1.702);
+//   gelu (exact erf): the side-branch Phi composition of the BERT path;
+//   gelu_new / gelu_pytorch_tanh: TNNetGELU (the tanh approximation).
+procedure AddClipHiddenAct(NN: TNNet; HiddenAct: TClipHiddenAct);
+var
+  HiddenIn, PhiBranch: TNNetLayer;
+begin
+  case HiddenAct of
+    chaQuickGelu:
+      NN.AddLayer( TNNetSwishLearnable.Create(1.702) );
+    chaGeluTanh:
+      NN.AddLayer( TNNetGELU.Create() );
+    else
+    begin
+      // EXACT erf GELU x*Phi(x) composed from existing layers (see the
+      // BERT path): Phi = 0.5*(1 + erf(x/sqrt(2))) on a side branch, then
+      // ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x since Phi is in (0,1).
+      HiddenIn := NN.GetLastLayer();
+      NN.AddLayerAfter(
+        TNNetMulByConstant.Create(0.7071067811865476), HiddenIn);
+      NN.AddLayer( TNNetErf.Create() );
+      NN.AddLayer( TNNetAddConstant.Create(1.0) );
+      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenIn]) );
+      NN.AddLayer( TNNetReGLU.Create() );
+    end;
+  end;
+end;
+
+// One CLIP pre-LN encoder block (HF CLIPEncoderLayer):
+//   x := x + out_proj( MHA( q|k|v( layer_norm1(x) ) ) )
+//   x := x + fc2( act( fc1( layer_norm2(x) ) ) )
+// Standard 1/sqrt(head_dim)-scaled SDPA, causal only in the text tower.
+procedure AddClipEncoderBlock(NN: TNNet; const Tower: TClipTowerConfig;
+  CausalMask: boolean; var Block: TClipBlockLayers;
+  pInferenceOnly: boolean);
+var
+  BranchInput: TNNetLayer;
+begin
+  BranchInput := NN.GetLastLayer();
+  Block.LN1 := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+  Block.QKV := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(3 * Tower.HiddenSize) );
+  Block.AttnDense := NN.AddMultiHeadSelfAttention(Tower.NumHeads,
+    CausalMask);
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  BranchInput := NN.GetLastLayer();
+  Block.LN2 := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+  Block.Inter := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Tower.IntermediateSize) );
+  AddClipHiddenAct(NN, Tower.HiddenAct);
+  Block.OutDense := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Tower.HiddenSize) );
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  if pInferenceOnly then NN.MakeInferenceOnly();
+end;
+
+// Loads one CLIP encoder block: separate biased nn.Linear q/k/v into the
+// fused Q|K|V slab (query -> neurons 0..d-1, key -> d..2d-1, value ->
+// 2d..3d-1; the builder's per-head slicing then matches HF's per-head
+// reshape), biased out_proj/fc1/fc2 and the two biased LayerNorms.
+procedure LoadClipEncoderBlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TClipBlockLayers; const BlockPrefix: string;
+  const Tower: TClipTowerConfig);
+var
+  d: integer;
+begin
+  d := Tower.HiddenSize;
+  LoadLayerNormWeights(Reader, Block.LN1,
+    BlockPrefix + 'layer_norm1.weight',
+    BlockPrefix + 'layer_norm1.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    BlockPrefix + 'self_attn.q_proj.weight', d, d, 0, 3 * d, 0,
+    BlockPrefix + 'self_attn.q_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    BlockPrefix + 'self_attn.k_proj.weight', d, d, d, 3 * d, 0,
+    BlockPrefix + 'self_attn.k_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    BlockPrefix + 'self_attn.v_proj.weight', d, d, 2 * d, 3 * d, 0,
+    BlockPrefix + 'self_attn.v_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.AttnDense,
+    BlockPrefix + 'self_attn.out_proj.weight', d, d, 0, -1, 0,
+    BlockPrefix + 'self_attn.out_proj.bias');
+  LoadLayerNormWeights(Reader, Block.LN2,
+    BlockPrefix + 'layer_norm2.weight',
+    BlockPrefix + 'layer_norm2.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.Inter,
+    BlockPrefix + 'mlp.fc1.weight', d, Tower.IntermediateSize, 0, -1, 0,
+    BlockPrefix + 'mlp.fc1.bias');
+  LoadLlamaLinearWeights(Reader, Block.OutDense,
+    BlockPrefix + 'mlp.fc2.weight', Tower.IntermediateSize, d, 0, -1, 0,
+    BlockPrefix + 'mlp.fc2.bias');
+end;
+
+// Loads a [Rows, Cols] embedding table straight into the single-neuron
+// weight volume of a TNNetEmbedding / TNNetLearnedPositionalEmbedding
+// (row-major in both the checkpoint and the layer) - the BERT path's
+// loader without the row offset.
+procedure LoadClipEmbeddingTable(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const TName: string; Rows, Cols: integer);
+var
+  Tmp: TNNetVolume;
+begin
+  if not Reader.HasTensor(TName) then
+    ImportError('CLIP import: missing tensor "' + TName + '".');
+  if (Reader.DimCount(TName) <> 2) or
+     (Reader.DimSize(TName, 0) <> Rows) or
+     (Reader.DimSize(TName, 1) <> Cols) then
+    ImportError('CLIP import: "' + TName + '" must have shape [' +
+      IntToStr(Rows) + ', ' + IntToStr(Cols) + '], got ' +
+      Reader.ShapeAsString(TName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Layer.Neurons[0].Weights.Size <> Rows * Cols then
+      ImportError('CLIP import: "' + TName + '" element count ' +
+        IntToStr(Rows * Cols) + ' does not match the table size ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + '.');
+    Layer.Neurons[0].Weights.Copy(Tmp);
+    Layer.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+end;
+
+// Loads the bias-FREE CLIP patch embedding (HF nn.Conv2d, weight
+// [Hidden, NumChannels, Patch, Patch], stride = kernel = Patch) into a
+// TNNetConvolutionLinear built with a (Patch,Patch) kernel on the
+// (ImageSize, ImageSize, NumChannels) pixel grid. CAI neuron weights are
+// (x, y, depth)-indexed ((y*Patch + x)*NumChannels + c), HF kernels
+// [o, c, ky, kx]-indexed.
+procedure LoadClipPatchConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string;
+  NumChannels, Patch, Hidden: integer);
+var
+  W: TNNetVolume;
+  o, c, ky, kx: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('CLIP import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> Hidden) or
+     (Reader.DimSize(WName, 1) <> NumChannels) or
+     (Reader.DimSize(WName, 2) <> Patch) or
+     (Reader.DimSize(WName, 3) <> Patch) then
+    ImportError('CLIP import: "' + WName + '" must have shape [' +
+      IntToStr(Hidden) + ', ' + IntToStr(NumChannels) + ', ' +
+      IntToStr(Patch) + ', ' + IntToStr(Patch) + '] (nn.Conv2d stores ' +
+      '[out, in, kh, kw]), got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> Hidden then
+    ImportError('CLIP import: internal error - patch conv has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(Hidden) + '.');
+  if Layer.Neurons[0].Weights.Size <> Patch * Patch * NumChannels then
+    ImportError('CLIP import: internal error - patch conv neuron has ' +
+      IntToStr(Layer.Neurons[0].Weights.Size) + ' weights, expected ' +
+      IntToStr(Patch * Patch * NumChannels) + '.');
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for o := 0 to Hidden - 1 do
+    begin
+      for ky := 0 to Patch - 1 do
+        for kx := 0 to Patch - 1 do
+          for c := 0 to NumChannels - 1 do
+            Layer.Neurons[o].Weights.FData[
+              (ky * Patch + kx) * NumChannels + c] :=
+              W.FData[((o * NumChannels + c) * Patch + ky) * Patch + kx];
+      Layer.Neurons[o].BiasWeight := 0; // bias=False in CLIP's patch conv
+    end;
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
+  const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
+  ProjectionDim: integer; const Prefix: string;
+  const ProjectionTensorName: string = '';
+  pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  PatchConv, PosEmb, PreLN, PostLN, Proj: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  Tbl: TNNetVolume;
+  Grid, NumPatches, BlockCnt, ChanCnt: integer;
+  PreLNName: string;
+begin
+  if (Tower.NumHeads < 1) or
+     ((Tower.HiddenSize mod Tower.NumHeads) <> 0) then
+    ImportError('CLIP import: vision hidden_size=' +
+      IntToStr(Tower.HiddenSize) + ' is not divisible by ' +
+      'num_attention_heads=' + IntToStr(Tower.NumHeads) + '.');
+  if (PatchSize < 1) or ((ImageSize mod PatchSize) <> 0) then
+    ImportError('CLIP import: image_size=' + IntToStr(ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(PatchSize) + '.');
+  Grid := ImageSize div PatchSize;
+  NumPatches := Grid * Grid;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(ImageSize, ImageSize, NumChannels) );
+    // Bias-free patch embedding: kernel = stride = patch_size, no padding
+    // -> a (Grid, Grid, hidden) patch grid ...
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Tower.HiddenSize, PatchSize, {pInputPadding=}0, {pStride=}PatchSize,
+      {pSuppressBias=}1) );
+    // ... flattened row-major (the volume layout IS row-major over (y,x),
+    // exactly HF's flatten(2).transpose(1,2) patch order) ...
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, Tower.HiddenSize) );
+    // ... with one ZERO row prepended as the class-token slot (PadXY pads
+    // both ends; Crop drops the right pad). class_embedding itself is
+    // folded into row 0 of the position table below - exact, since this
+    // slot's pre-position content is identically zero.
+    NN.AddLayer( TNNetPadXY.Create(1, 0) );
+    NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1) );
+    PreLN := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(Blocks, Tower.NumLayers);
+    for BlockCnt := 0 to Tower.NumLayers - 1 do
+      AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
+        Blocks[BlockCnt], pInferenceOnly);
+    // HF applies post_layernorm (and the projection) only to the pooled
+    // class token; applying them PER TOKEN is exact for row 0.
+    PostLN := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    Proj := nil;
+    if ProjectionTensorName <> '' then
+      Proj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(ProjectionDim) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadClipPatchConv(Reader, PatchConv,
+      Prefix + 'embeddings.patch_embedding.weight',
+      NumChannels, PatchSize, Tower.HiddenSize);
+    LoadClipEmbeddingTable(Reader, PosEmb,
+      Prefix + 'embeddings.position_embedding.weight',
+      NumPatches + 1, Tower.HiddenSize);
+    // class_embedding [hidden] folded into position row 0 (see above).
+    if not Reader.HasTensor(Prefix + 'embeddings.class_embedding') then
+      ImportError('CLIP import: missing tensor "' + Prefix +
+        'embeddings.class_embedding".');
+    Tbl := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Prefix + 'embeddings.class_embedding', Tbl);
+      if Tbl.Size <> Tower.HiddenSize then
+        ImportError('CLIP import: "' + Prefix +
+          'embeddings.class_embedding" must have ' +
+          IntToStr(Tower.HiddenSize) + ' elements, got ' +
+          IntToStr(Tbl.Size) + '.');
+      for ChanCnt := 0 to Tower.HiddenSize - 1 do
+        PosEmb.Neurons[0].Weights.FData[ChanCnt] :=
+          PosEmb.Neurons[0].Weights.FData[ChanCnt] + Tbl.FData[ChanCnt];
+      PosEmb.FlushWeightCache();
+    finally
+      Tbl.Free;
+    end;
+    // modeling_clip's historical "pre_layrnorm" spelling; accept the
+    // fixed spelling too in case an exporter normalizes it.
+    PreLNName := Prefix + 'pre_layrnorm';
+    if not Reader.HasTensor(PreLNName + '.weight') then
+      PreLNName := Prefix + 'pre_layernorm';
+    LoadLayerNormWeights(Reader, PreLN, PreLNName + '.weight',
+      PreLNName + '.bias', Tower.HiddenSize);
+    for BlockCnt := 0 to Tower.NumLayers - 1 do
+      LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
+        Prefix + 'encoder.layers.' + IntToStr(BlockCnt) + '.', Tower);
+    LoadLayerNormWeights(Reader, PostLN,
+      Prefix + 'post_layernorm.weight',
+      Prefix + 'post_layernorm.bias', Tower.HiddenSize);
+    if Proj <> nil then
+      LoadLlamaLinearWeights(Reader, Proj, ProjectionTensorName,
+        Tower.HiddenSize, ProjectionDim); // bias-free: CAI biases zeroed
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+procedure BuildClipFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TClipConfig; out TextNet, VisionNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  TokEmb, PosEmb, FinalLN, Proj: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  Tmp: TNNetVolume;
+  SeqLen, BlockCnt: integer;
+begin
+  TextNet := nil;
+  VisionNet := nil;
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  try
+    try
+      if (Config.Text.NumHeads < 1) or
+         ((Config.Text.HiddenSize mod Config.Text.NumHeads) <> 0) then
+        ImportError('CLIP import: text hidden_size=' +
+          IntToStr(Config.Text.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.Text.NumHeads) + '.');
+      if TextSeqLen <= 0 then SeqLen := Config.TextMaxPositions
+      else SeqLen := TextSeqLen;
+      if SeqLen > Config.TextMaxPositions then
+        ImportError('CLIP import: requested TextSeqLen=' +
+          IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
+          IntToStr(Config.TextMaxPositions) + '.');
+
+      // ---------------- TEXT tower architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
+      // EncodeZero=1: token id 0 (<|startoftext|>) is a REAL vocab row.
+      TokEmb := NN.AddLayer( TNNetEmbedding.Create(
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1) );
+      PosEmb := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.Text.NumLayers);
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+        AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
+          Blocks[BlockCnt], pInferenceOnly);
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      // text_projection applied PER TOKEN; HF's text_embeds is the row at
+      // the eot position (ClipTextEosPosition).
+      Proj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- TEXT tower weights ----------------
+      LoadClipEmbeddingTable(Reader, TokEmb,
+        'text_model.embeddings.token_embedding.weight',
+        Config.TextVocabSize, Config.Text.HiddenSize);
+      LoadClipEmbeddingTable(Reader, PosEmb,
+        'text_model.embeddings.position_embedding.weight',
+        Config.TextMaxPositions, Config.Text.HiddenSize);
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+        LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
+          'text_model.encoder.layers.' + IntToStr(BlockCnt) + '.',
+          Config.Text);
+      LoadLayerNormWeights(Reader, FinalLN,
+        'text_model.final_layer_norm.weight',
+        'text_model.final_layer_norm.bias', Config.Text.HiddenSize);
+      LoadLlamaLinearWeights(Reader, Proj, 'text_projection.weight',
+        Config.Text.HiddenSize, Config.ProjectionDim); // bias-free
+      TextNet := NN;
+      NN := nil;
+
+      // ---------------- VISION tower ----------------
+      VisionNet := BuildClipVisionTower(Reader, Config.Vision,
+        Config.ImageSize, Config.PatchSize, Config.NumChannels,
+        Config.ProjectionDim, 'vision_model.',
+        'visual_projection.weight', pInferenceOnly);
+
+      // ---------------- logit_scale ----------------
+      if Reader.HasTensor('logit_scale') then
+      begin
+        Tmp := TNNetVolume.Create;
+        try
+          Reader.LoadTensorFlat('logit_scale', Tmp);
+          if Tmp.Size >= 1 then Config.LogitScale := Tmp.FData[0];
+        finally
+          Tmp.Free;
+        end;
+      end;
+    except
+      NN.Free;
+      TextNet.Free;
+      TextNet := nil;
+      VisionNet.Free;
+      VisionNet := nil;
+      raise;
+    end;
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure BuildClipFromSafeTensors(const FileName: string;
+  out TextNet, VisionNet: TNNet; out Config: TClipConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadClipConfigFromJSONFile(ConfigPath);
+  BuildClipFromSafeTensorsWithConfig(FileName, Config, TextNet, VisionNet,
+    TextSeqLen, pInferenceOnly);
+end;
+
+function ReadClipConfigFromJSONFile(const FileName: string): TClipConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, TowerObj: TJSONObject;
+  ModelType: string;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(FieldName);
+    if (Data = nil) or not (Data is TJSONObject) then
+      ImportError('CLIP import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(Data);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('CLIP import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('CLIP import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        O.Find(FieldName).AsJSON + '.');
+  end;
+
+  procedure ReadTower(O: TJSONObject; var Tower: TClipTowerConfig);
+  begin
+    Tower.HiddenSize := RequiredInt(O, 'hidden_size');
+    Tower.IntermediateSize := RequiredInt(O, 'intermediate_size');
+    Tower.NumLayers := RequiredInt(O, 'num_hidden_layers');
+    Tower.NumHeads := RequiredInt(O, 'num_attention_heads');
+    Tower.LayerNormEps := O.Get('layer_norm_eps', 0.00001);
+    Tower.HiddenAct := ClipHiddenActFromString(
+      O.Get('hidden_act', 'quick_gelu'));
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('CLIP import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('CLIP import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('CLIP import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'clip');
+    if ModelType <> 'clip' then
+      ImportError('CLIP import: config model_type is "' + ModelType +
+        '" - only "clip" is supported here (see BuildFromPretrained ' +
+        'for the full dispatch).');
+    Result.ModelType := ModelType;
+    TowerObj := RequiredSubObject('text_config');
+    ReadTower(TowerObj, Result.Text);
+    Result.TextVocabSize := RequiredInt(TowerObj, 'vocab_size');
+    Result.TextMaxPositions :=
+      RequiredInt(TowerObj, 'max_position_embeddings');
+    // eos_token_id = 2 is the legacy pre-#24773 id every published OpenAI
+    // CLIP config carries; it selects the ARGMAX pooling branch (see
+    // ClipTextEosPosition).
+    Result.EosTokenId := TowerObj.Get('eos_token_id', 2);
+    TowerObj := RequiredSubObject('vision_config');
+    ReadTower(TowerObj, Result.Vision);
+    Result.ImageSize := RequiredInt(TowerObj, 'image_size');
+    Result.PatchSize := RequiredInt(TowerObj, 'patch_size');
+    Result.NumChannels := TowerObj.Get('num_channels', 3);
+    Result.ProjectionDim := Obj.Get('projection_dim', 512);
+    Result.LogitScale := Obj.Get('logit_scale_init_value', 2.6592);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ClipConfigToString(const Config: TClipConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'clip'
+  else Result := Config.ModelType;
+  Result := Result + ' config: text(d=' + IntToStr(Config.Text.HiddenSize) +
+    ', layers=' + IntToStr(Config.Text.NumLayers) +
+    ', heads=' + IntToStr(Config.Text.NumHeads) +
+    ', ffn=' + IntToStr(Config.Text.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.TextVocabSize) +
+    ', max_pos=' + IntToStr(Config.TextMaxPositions) +
+    ', act=' + ClipHiddenActToString(Config.Text.HiddenAct) +
+    ', eos=' + IntToStr(Config.EosTokenId) +
+    '), vision(d=' + IntToStr(Config.Vision.HiddenSize) +
+    ', layers=' + IntToStr(Config.Vision.NumLayers) +
+    ', heads=' + IntToStr(Config.Vision.NumHeads) +
+    ', ffn=' + IntToStr(Config.Vision.IntermediateSize) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', act=' + ClipHiddenActToString(Config.Vision.HiddenAct) +
+    '), proj_dim=' + IntToStr(Config.ProjectionDim) +
+    ', logit_scale=' + FloatToStrF(Config.LogitScale, ffGeneral, 6, 0);
+end;
+
+function ClipTextEosPosition(TokenIds: TNNetVolume;
+  EosTokenId: integer): integer;
+var
+  PosCnt, TokenId, BestId: integer;
+begin
+  Result := 0;
+  if (TokenIds.SizeY <> 1) or (TokenIds.Depth <> 1) or
+     (TokenIds.SizeX < 1) then
+    ImportError('ClipTextEosPosition: expected a (SeqLen,1,1) token-id ' +
+      'volume, got ' + IntToStr(TokenIds.SizeX) + 'x' +
+      IntToStr(TokenIds.SizeY) + 'x' + IntToStr(TokenIds.Depth) + '.');
+  if EosTokenId = 2 then
+  begin
+    // The legacy pre-#24773 branch of modeling_clip: pool at
+    // input_ids.argmax(-1) - the FIRST occurrence of the highest id
+    // (the eot token carries the top id in the CLIP vocab).
+    BestId := Round(TokenIds.FData[0]);
+    for PosCnt := 1 to TokenIds.SizeX - 1 do
+    begin
+      TokenId := Round(TokenIds.FData[PosCnt]);
+      if TokenId > BestId then
+      begin
+        BestId := TokenId;
+        Result := PosCnt;
+      end;
+    end;
+  end
+  else
+  begin
+    // The fixed branch: the FIRST position equal to eos_token_id.
+    Result := -1;
+    for PosCnt := 0 to TokenIds.SizeX - 1 do
+      if Round(TokenIds.FData[PosCnt]) = EosTokenId then
+      begin
+        Result := PosCnt;
+        break;
+      end;
+    if Result < 0 then
+      ImportError('ClipTextEosPosition: no eos token (id ' +
+        IntToStr(EosTokenId) + ') in the sequence - CLIP text pooling ' +
+        'requires one (append it like the CLIP tokenizer does).');
+  end;
+end;
+
+procedure ClipExtractEmbedding(NetOutput: TNNetVolume; TokenPos: integer;
+  Embedding: TNNetVolume);
+var
+  Depth, ChanCnt: integer;
+  Norm: TNeuralFloat;
+begin
+  Depth := NetOutput.Depth;
+  if (NetOutput.SizeY <> 1) or (NetOutput.SizeX < 1) or (Depth < 1) then
+    ImportError('ClipExtractEmbedding: expected a (SeqLen,1,depth) ' +
+      'volume, got ' + IntToStr(NetOutput.SizeX) + 'x' +
+      IntToStr(NetOutput.SizeY) + 'x' + IntToStr(Depth) + '.');
+  if (TokenPos < 0) or (TokenPos >= NetOutput.SizeX) then
+    ImportError('ClipExtractEmbedding: TokenPos ' + IntToStr(TokenPos) +
+      ' out of range 0..' + IntToStr(NetOutput.SizeX - 1) + '.');
+  Embedding.ReSize(1, 1, Depth);
+  Norm := 0;
+  for ChanCnt := 0 to Depth - 1 do
+  begin
+    Embedding.FData[ChanCnt] := NetOutput.FData[TokenPos * Depth + ChanCnt];
+    Norm := Norm + Embedding.FData[ChanCnt] * Embedding.FData[ChanCnt];
+  end;
+  Norm := Sqrt(Norm);
+  if Norm > 0 then
+    for ChanCnt := 0 to Depth - 1 do
+      Embedding.FData[ChanCnt] := Embedding.FData[ChanCnt] / Norm;
+end;
+
+function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
+var
+  ChanCnt: integer;
+begin
+  Result := 0;
+  if EmbA.Size <> EmbB.Size then
+    ImportError('ClipSimilarity: embedding sizes differ (' +
+      IntToStr(EmbA.Size) + ' vs ' + IntToStr(EmbB.Size) + ').');
+  for ChanCnt := 0 to EmbA.Size - 1 do
+    Result := Result + EmbA.FData[ChanCnt] * EmbB.FData[ChanCnt];
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -11650,6 +12456,17 @@ begin
       'both nets; run them with RunT5, mel input from ' +
       'neuralaudio.ComputeWhisperLogMel) instead of this single-net ' +
       'dispatch.');
+  end
+  else if ModelType = 'clip' then
+  begin
+    // CLIP is a dual encoder: the import builds TWO independent nets
+    // (text + vision), which this single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "clip" builds a ' +
+      'TWO-net dual encoder (text + vision) - call ' +
+      'BuildClipFromSafeTensors (returns both nets; pool/score with ' +
+      'ClipTextEosPosition, ClipExtractEmbedding and ClipSimilarity) ' +
+      'instead of this single-net dispatch.');
   end
   else
   begin

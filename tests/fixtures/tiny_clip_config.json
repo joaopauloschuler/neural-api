@@ -1,0 +1,92 @@
+{
+ "transformers_version": "5.11.0",
+ "architectures": null,
+ "output_hidden_states": false,
+ "return_dict": true,
+ "dtype": null,
+ "chunk_size_feed_forward": 0,
+ "is_encoder_decoder": false,
+ "id2label": {
+  "0": "LABEL_0",
+  "1": "LABEL_1"
+ },
+ "label2id": {
+  "LABEL_0": 0,
+  "LABEL_1": 1
+ },
+ "problem_type": null,
+ "text_config": {
+  "architectures": null,
+  "output_hidden_states": false,
+  "return_dict": true,
+  "dtype": null,
+  "chunk_size_feed_forward": 0,
+  "is_encoder_decoder": false,
+  "id2label": {
+   "0": "LABEL_0",
+   "1": "LABEL_1"
+  },
+  "label2id": {
+   "LABEL_0": 0,
+   "LABEL_1": 1
+  },
+  "problem_type": null,
+  "vocab_size": 33,
+  "hidden_size": 16,
+  "intermediate_size": 32,
+  "projection_dim": 512,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 4,
+  "max_position_embeddings": 12,
+  "hidden_act": "quick_gelu",
+  "layer_norm_eps": 1e-05,
+  "attention_dropout": 0.0,
+  "initializer_range": 0.02,
+  "initializer_factor": 1.0,
+  "pad_token_id": 1,
+  "bos_token_id": 0,
+  "eos_token_id": 2,
+  "_name_or_path": "",
+  "model_type": "clip_text_model",
+  "output_attentions": false
+ },
+ "vision_config": {
+  "architectures": null,
+  "output_hidden_states": false,
+  "return_dict": true,
+  "dtype": null,
+  "chunk_size_feed_forward": 0,
+  "is_encoder_decoder": false,
+  "id2label": {
+   "0": "LABEL_0",
+   "1": "LABEL_1"
+  },
+  "label2id": {
+   "LABEL_0": 0,
+   "LABEL_1": 1
+  },
+  "problem_type": null,
+  "hidden_size": 16,
+  "intermediate_size": 32,
+  "projection_dim": 512,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 4,
+  "num_channels": 3,
+  "image_size": 16,
+  "patch_size": 8,
+  "hidden_act": "quick_gelu",
+  "layer_norm_eps": 1e-05,
+  "attention_dropout": 0.0,
+  "initializer_range": 0.02,
+  "initializer_factor": 1.0,
+  "_name_or_path": "",
+  "model_type": "clip_vision_model",
+  "output_attentions": false
+ },
+ "projection_dim": 8,
+ "logit_scale_init_value": 2.6592,
+ "initializer_factor": 1.0,
+ "_name_or_path": "",
+ "model_type": "clip",
+ "output_attentions": false
+}

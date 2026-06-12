@@ -140,6 +140,8 @@ type
     procedure TestMarianParity;
     procedure TestWhisperConfigFromJSONFile;
     procedure TestWhisperParity;
+    procedure TestClipConfigFromJSONFile;
+    procedure TestClipParity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -4370,6 +4372,238 @@ end;
 // frames (the signal region incl. the reflect-pad onset), the GLOBAL max
 // (which sets the max-8 clamp) and the constant padding-tail plateau -
 // together they pin the whole 3000-frame normalization.
+// Verifies ReadClipConfigFromJSONFile on the committed CLIP pico config
+// plus the BuildFromPretrained "clip" rejection (a dual encoder cannot be
+// returned by the single-net dispatch; the error must redirect to
+// BuildClipFromSafeTensors) and the ClipTextEosPosition pooling rules.
+procedure TTestNeuralPretrained.TestClipConfigFromJSONFile;
+var
+  Config: TClipConfig;
+  NN: TNNet;
+  Ids: TNNetVolume;
+begin
+  Config := ReadClipConfigFromJSONFile(
+    FixturePath('tiny_clip_config.json'));
+  AssertEquals('model_type', 'clip', Config.ModelType);
+  AssertEquals('text hidden_size', 16, Config.Text.HiddenSize);
+  AssertEquals('text intermediate_size', 32, Config.Text.IntermediateSize);
+  AssertEquals('text num_hidden_layers', 2, Config.Text.NumLayers);
+  AssertEquals('text num_attention_heads', 4, Config.Text.NumHeads);
+  AssertEquals('text vocab_size', 33, Config.TextVocabSize);
+  AssertEquals('text max_position_embeddings', 12,
+    Config.TextMaxPositions);
+  AssertEquals('text eos_token_id (legacy argmax)', 2, Config.EosTokenId);
+  AssertTrue('text hidden_act quick_gelu',
+    Config.Text.HiddenAct = chaQuickGelu);
+  AssertEquals('vision hidden_size', 16, Config.Vision.HiddenSize);
+  AssertEquals('vision num_hidden_layers', 2, Config.Vision.NumLayers);
+  AssertEquals('image_size', 16, Config.ImageSize);
+  AssertEquals('patch_size', 8, Config.PatchSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('projection_dim', 8, Config.ProjectionDim);
+  AssertTrue('vision hidden_act quick_gelu',
+    Config.Vision.HiddenAct = chaQuickGelu);
+
+  // The text-pooling helper: eos_token_id = 2 pools at the ARGMAX (first
+  // occurrence of the highest id); any other id pools at its first
+  // occurrence and fails loudly when absent.
+  Ids := TNNetVolume.Create;
+  try
+    Ids.ReSize(5, 1, 1);
+    Ids.FData[0] := 0; Ids.FData[1] := 7; Ids.FData[2] := 32;
+    Ids.FData[3] := 5; Ids.FData[4] := 32;
+    AssertEquals('argmax pooling: first highest-id position', 2,
+      ClipTextEosPosition(Ids, 2));
+    AssertEquals('explicit-eos pooling: first eos position', 1,
+      ClipTextEosPosition(Ids, 7));
+    try
+      ClipTextEosPosition(Ids, 9);
+      Fail('a missing explicit eos token must be rejected');
+    except
+      on E: EPretrainedImportError do ; // expected
+    end;
+  finally
+    Ids.Free;
+  end;
+
+  NN := nil;
+  try
+    NN := BuildFromPretrained(FixturePath('tiny_clip.safetensors'),
+      {pSeqLen=}8, {pInferenceOnly=}false,
+      FixturePath('tiny_clip_config.json'));
+    Fail('BuildFromPretrained must reject model_type "clip"');
+  except
+    on E: EPretrainedImportError do
+      AssertTrue('clip rejection must point at ' +
+        'BuildClipFromSafeTensors, got: ' + E.Message,
+        Pos('BuildClipFromSafeTensors', E.Message) > 0);
+  end;
+  NN.Free;
+end;
+
+// Verifies the CLIP import target - the FIRST VISION-LANGUAGE parity test:
+// tests/fixtures/tiny_clip.* is a pico randomly-initialized HF CLIPModel
+// (text: 2 layers, 4 heads, d 16, vocab 33 with eot = 32 the HIGHEST id,
+// max_pos 12, CAUSAL; vision: image 16, patch 8 -> 4 patches + class
+// token, 2 layers, d 16, BIDIRECTIONAL; projection_dim 8; quick_gelu in
+// both towers - the generator tools/clip_tiny_fixture.py asserts the
+// erf/tanh gelus would FAIL the gate, that pooling at the wrong text
+// position FAILS, and that the class embedding / position tables /
+// pre_layrnorm all move the float64 oracle). Compares both towers'
+// UNNORMALIZED projected embeddings (HF get_text_features /
+// get_image_features) at the HF pooling rows - ClipTextEosPosition for
+// text (sequence 0 carries its eot MID-sequence), row 0 for vision - plus
+// the L2-normalized cosine scoring path: exp(logit_scale) *
+// ClipSimilarity must reproduce HF's logits_per_image.
+procedure TTestNeuralPretrained.TestClipParity;
+var
+  TextNet, VisionNet: TNNet;
+  Config: TClipConfig;
+  RefRoot: TJSONData;
+  TextSeqs, TextEmbeds, ImageEmbeds, LogitsPerImage: TJSONArray;
+  Pixels, RowArr, ChanArr, SeqArr: TJSONArray;
+  TextInput, ImageInput, TextEmb, ImageEmb: TNNetVolume;
+  RefJson: TStringList;
+  SeqCnt, PosCnt, ChanCnt, YCnt, XCnt, EosPos: integer;
+  Diff, MaxTextDiff, MaxImageDiff, MaxLogitDiff: double;
+  RefLogitScale, Logit: double;
+const
+  SeqLen = 8;
+begin
+  RandSeed := 424242;
+  BuildClipFromSafeTensors(FixturePath('tiny_clip.safetensors'),
+    TextNet, VisionNet, Config, {TextSeqLen=}SeqLen,
+    {pInferenceOnly=}false, FixturePath('tiny_clip_config.json'));
+  RefJson := TStringList.Create;
+  TextInput := TNNetVolume.Create;
+  ImageInput := TNNetVolume.Create;
+  TextEmb := TNNetVolume.Create;
+  ImageEmb := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('text net built', TextNet <> nil);
+    AssertTrue('vision net built', VisionNet <> nil);
+    // Two INDEPENDENT towers projected into one shared space.
+    AssertEquals('text input length', SeqLen,
+      TextNet.Layers[0].Output.SizeX);
+    AssertEquals('text output rows', SeqLen,
+      TextNet.GetLastLayer().Output.SizeX);
+    AssertEquals('text output depth = projection_dim',
+      Config.ProjectionDim, TextNet.GetLastLayer().Output.Depth);
+    AssertEquals('vision input grid', Config.ImageSize,
+      VisionNet.Layers[0].Output.SizeX);
+    AssertEquals('vision input channels', Config.NumChannels,
+      VisionNet.Layers[0].Output.Depth);
+    AssertEquals('vision output rows = patches + class token',
+      Sqr(Config.ImageSize div Config.PatchSize) + 1,
+      VisionNet.GetLastLayer().Output.SizeX);
+    AssertEquals('vision output depth = projection_dim',
+      Config.ProjectionDim, VisionNet.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_clip_embeds.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    TextSeqs := TJSONArray(TJSONObject(RefRoot).Find('text_sequences'));
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    TextEmbeds := TJSONArray(TJSONObject(RefRoot).Find('text_embeds'));
+    ImageEmbeds := TJSONArray(TJSONObject(RefRoot).Find('image_embeds'));
+    LogitsPerImage :=
+      TJSONArray(TJSONObject(RefRoot).Find('logits_per_image'));
+    RefLogitScale := TJSONObject(RefRoot).Get('logit_scale', 0.0);
+    AssertTrue('text_sequences present', TextSeqs <> nil);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertTrue('text_embeds present', TextEmbeds <> nil);
+    AssertTrue('image_embeds present', ImageEmbeds <> nil);
+    AssertTrue('logits_per_image present', LogitsPerImage <> nil);
+    AssertTrue('at least 2 text sequences', TextSeqs.Count >= 2);
+    // The checkpoint's learned logit_scale must reach the config record.
+    AssertTrue('logit_scale loaded from the checkpoint, |' +
+      FloatToStr(Config.LogitScale) + ' - ' + FloatToStr(RefLogitScale) +
+      '| < 1e-6', Abs(Config.LogitScale - RefLogitScale) < 1e-6);
+
+    // ---- VISION tower parity ----
+    // The fixture stores the HF (channels, H, W) layout; the vision input
+    // volume is (W, H, channels).
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels);
+    AssertEquals('pixel channels', Config.NumChannels, Pixels.Count);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      AssertEquals('pixel rows', Config.ImageSize, RowArr.Count);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    VisionNet.Compute(ImageInput);
+    MaxImageDiff := 0;
+    RowArr := TJSONArray(ImageEmbeds.Items[0]);
+    AssertEquals('image embed width', Config.ProjectionDim, RowArr.Count);
+    for ChanCnt := 0 to Config.ProjectionDim - 1 do
+    begin
+      // Row 0 = the class token: HF's image_embeds (UNnormalized).
+      Diff := Abs(VisionNet.GetLastLayer().Output.FData[ChanCnt] -
+        RowArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxImageDiff then MaxImageDiff := Diff;
+    end;
+    AssertTrue('image embeds: max |diff| = ' + FloatToStr(MaxImageDiff) +
+      ' must be < 1e-4', MaxImageDiff < 1e-4);
+    ClipExtractEmbedding(VisionNet.GetLastLayer().Output, 0, ImageEmb);
+
+    // ---- TEXT tower parity + the cosine scoring path ----
+    MaxTextDiff := 0;
+    MaxLogitDiff := 0;
+    TextInput.ReSize(SeqLen, 1, 1);
+    for SeqCnt := 0 to TextSeqs.Count - 1 do
+    begin
+      SeqArr := TJSONArray(TextSeqs.Items[SeqCnt]);
+      AssertEquals('text sequence length', SeqLen, SeqArr.Count);
+      for PosCnt := 0 to SeqLen - 1 do
+        TextInput.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+      TextNet.Compute(TextInput);
+      EosPos := ClipTextEosPosition(TextInput, Config.EosTokenId);
+      // Sequence 0 carries its eot MID-sequence (position 4): pooling at
+      // the last row instead would FAIL parity (generator self-check).
+      if SeqCnt = 0 then
+        AssertEquals('sequence 0 pools mid-sequence', 4, EosPos);
+      RowArr := TJSONArray(TextEmbeds.Items[SeqCnt]);
+      AssertEquals('text embed width', Config.ProjectionDim,
+        RowArr.Count);
+      for ChanCnt := 0 to Config.ProjectionDim - 1 do
+      begin
+        Diff := Abs(TextNet.GetLastLayer().Output.FData[
+          EosPos * Config.ProjectionDim + ChanCnt] -
+          RowArr.Items[ChanCnt].AsFloat);
+        if Diff > MaxTextDiff then MaxTextDiff := Diff;
+      end;
+      // exp(logit_scale) * cosine must reproduce HF's logits_per_image.
+      ClipExtractEmbedding(TextNet.GetLastLayer().Output, EosPos,
+        TextEmb);
+      Logit := Exp(Config.LogitScale) * ClipSimilarity(ImageEmb, TextEmb);
+      Diff := Abs(Logit - TJSONArray(LogitsPerImage.Items[0])
+        .Items[SeqCnt].AsFloat);
+      if Diff > MaxLogitDiff then MaxLogitDiff := Diff;
+    end;
+    AssertTrue('text embeds: max |diff| = ' + FloatToStr(MaxTextDiff) +
+      ' must be < 1e-4', MaxTextDiff < 1e-4);
+    AssertTrue('logits_per_image: max |diff| = ' +
+      FloatToStr(MaxLogitDiff) + ' must be < 1e-4', MaxLogitDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageEmb.Free;
+    TextEmb.Free;
+    ImageInput.Free;
+    TextInput.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    TextNet.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestWhisperLogMelFrontend;
 var
   Samples, Mel: TNNetVolume;
