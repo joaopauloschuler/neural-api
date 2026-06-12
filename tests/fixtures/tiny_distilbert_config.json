@@ -1,0 +1,14 @@
+{
+ "architectures": [
+  "DistilBertModel"
+ ],
+ "model_type": "distilbert",
+ "dim": 8,
+ "n_layers": 2,
+ "n_heads": 2,
+ "hidden_dim": 16,
+ "vocab_size": 11,
+ "max_position_embeddings": 16,
+ "activation": "gelu",
+ "sinusoidal_pos_embds": false
+}

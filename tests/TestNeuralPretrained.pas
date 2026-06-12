@@ -80,6 +80,8 @@ type
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
+    procedure TestDistilBertConfigFromJSONFile;
+    procedure TestDistilBertHiddenStateParity;
     procedure TestBertPoolSentenceEmbedding;
     procedure TestBertTokenizeSentence;
     procedure TestBuildFromPretrainedDispatch;
@@ -1405,6 +1407,71 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestDistilBertConfigFromJSONFile;
+var
+  Config: TBertConfig;
+begin
+  Config := ReadBertConfigFromJSONFile(
+    FixturePath('tiny_distilbert_config.json'));
+  AssertTrue('family is distilbert', Config.Family = bfDistilBert);
+  AssertEquals('dim', 8, Config.HiddenSize);
+  AssertEquals('hidden_dim', 16, Config.IntermediateSize);
+  AssertEquals('n_layers', 2, Config.NumLayers);
+  AssertEquals('n_heads', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('max_position_embeddings', 16, Config.MaxPositions);
+  AssertEquals('no token-type embeddings', 0, Config.TypeVocabSize);
+  AssertTrue('layer_norm_eps = 1e-12 (hardcoded by modeling_distilbert)',
+    Abs(Config.LayerNormEps - 1e-12) < 1e-18);
+  AssertFalse('activation gelu = exact erf form', Config.HiddenActTanh);
+end;
+
+// The imported DistilBertModel's final hidden states must match HF
+// transformers' float64 last_hidden_state: same post-LN math as BERT but
+// loaded through the DistilBERT tensor-name map (transformer.layer.N.
+// attention.q_lin/k_lin/v_lin/out_lin, sa_layer_norm, ffn.lin1/lin2,
+// output_layer_norm), with NO token-type branch (input channel 1 is fed
+// zeros and ignored) and no pooler - which pIncludePooler must REJECT.
+procedure TTestNeuralPretrained.TestDistilBertHiddenStateParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  Rejected: boolean;
+begin
+  RandSeed := 424242;
+  NN := BuildBertFromSafeTensorsEx(
+    FixturePath('tiny_distilbert.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}false,
+    FixturePath('tiny_distilbert_config.json'));
+  try
+    AssertTrue('family', Config.Family = bfDistilBert);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('prefix (DistilBertModel exports unprefixed)', '',
+      Config.Prefix);
+    AssertBertParityWithFixture(NN,
+      FixturePath('tiny_distilbert_hidden.json'),
+      Config.MaxPositions, Config.HiddenSize, {PoolerRow0Only=}false);
+  finally
+    NN.Free;
+  end;
+  // DistilBERT has no pooler head: asking for one must fail loudly.
+  Rejected := false;
+  NN := nil;
+  try
+    try
+      NN := BuildBertFromSafeTensorsEx(
+        FixturePath('tiny_distilbert.safetensors'),
+        Config, 0, false, {pIncludePooler=}true,
+        FixturePath('tiny_distilbert_config.json'));
+    except
+      on E: EPretrainedImportError do Rejected := true;
+    end;
+  finally
+    NN.Free;
+  end;
+  AssertTrue('pIncludePooler rejected for distilbert', Rejected);
+end;
+
 // BuildFromPretrained must route on config.json's model_type:
 //   - gpt2 via a HF-style checkpoint DIRECTORY (config.json +
 //     model.safetensors; n_head read from the config),
@@ -1486,6 +1553,17 @@ begin
   try
     AssertBertParityWithFixture(NN, FixturePath('tiny_bert_hidden.json'),
       16, 8, {PoolerRow0Only=}false);
+  finally
+    NN.Free;
+  end;
+  // ---- distilbert through the file route (the bert-family dispatch must
+  // pick the DistilBERT tensor-name map from model_type) ----
+  NN := BuildFromPretrained(FixturePath('tiny_distilbert.safetensors'), 0,
+    false, FixturePath('tiny_distilbert_config.json'));
+  try
+    AssertBertParityWithFixture(NN,
+      FixturePath('tiny_distilbert_hidden.json'), 16, 8,
+      {PoolerRow0Only=}false);
   finally
     NN.Free;
   end;

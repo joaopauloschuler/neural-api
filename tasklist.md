@@ -431,7 +431,7 @@ rather than acted on.
       (token-type branch degenerates to a constant row), and lm_head-less
       RobertaModel exports. Parity fixture vs RobertaModel hidden states
       (the offset is THE bug to catch: assert positions 0/1 rows unused).
-- [ ] DistilBERT importer delta on BuildBertFromSafeTensors: same post-LN
+- [X] DistilBERT importer delta on BuildBertFromSafeTensors: same post-LN
       encoder math but different tensor names (distilbert.embeddings.*,
       transformer.layer.N.attention.q_lin/k_lin/v_lin/out_lin,
       sa_layer_norm, ffn.lin1/lin2, output_layer_norm), NO token-type
