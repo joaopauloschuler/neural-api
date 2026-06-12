@@ -39,6 +39,9 @@ type
     // Zeroes the last (logit head) layer's weights and biases and raises one
     // token's bias so greedy argmax always emits exactly that token.
     procedure RigHeadToConstantToken(NN: TNNet; Token: integer);
+    // Locates the committed encoder-decoder fixtures (same probing as
+    // TestNeuralPretrained.FixturePath: RunAll.sh runs from tests/).
+    function FixturePath(const FileName: string): string;
   published
     // Pure helper functions (no network needed).
     procedure TestLengthPenaltyAlphaZeroIsOne;
@@ -101,11 +104,17 @@ type
     // Model-integration: constrained generation emits parseable JSON.
     procedure TestGenerateTokensStreamedJSONConstraintEmitsParseableJSON;
     procedure TestDecodeGreedyJSONConstraintEmitsParseableJSON;
+    // Seq2seq (encoder-decoder) generation on the committed T5/Marian pico
+    // fixture pairs (BuildT5FromSafeTensors / BuildMarianFromSafeTensors).
+    procedure TestDecodeSeq2SeqGreedyT5DeterministicEOSAndOracle;
+    procedure TestDecodeSeq2SeqSampledTempZeroMatchesGreedy;
+    procedure TestDecodeSeq2SeqGreedyMarianPairAndCapacity;
+    procedure TestDecodeSeq2SeqRejectsInvalidArguments;
   end;
 
 implementation
 
-uses Math, fpjson, jsonparser;
+uses Math, fpjson, jsonparser, neuralpretrained;
 
 function TTestNeuralDecode.BuildTinyNet(ContextLen, Vocab: integer): TNNet;
 begin
@@ -2478,6 +2487,250 @@ begin
   finally
     Constraint.Free;
     NN.Free;
+  end;
+end;
+
+function TTestNeuralDecode.FixturePath(const FileName: string): string;
+begin
+  Result := 'fixtures' + DirectorySeparator + FileName;
+  if not FileExists(Result) then
+    Result := 'tests' + DirectorySeparator + 'fixtures' + DirectorySeparator +
+      FileName;
+  if not FileExists(Result) then
+    Fail('Fixture not found: ' + FileName +
+      ' (run python3 tools/t5_tiny_fixture.py from the repo root).');
+end;
+
+// Greedy seq2seq decode on the committed T5 v1.0 pico pair: (a) two runs
+// produce identical token ids (deterministic) within the caps and the vocab;
+// (b) EOS may only ever be the LAST emitted token, and rigging EOS to the
+// run's own first token forces an immediate single-token EOS stop; (c) the
+// first generated token equals the argmax of row 0 of a single RunT5 call
+// whose decoder input is the start token (the consistency oracle - causal
+// self-attention makes the padded suffix invisible to row 0).
+procedure TTestNeuralDecode.TestDecodeSeq2SeqGreedyT5DeterministicEOSAndOracle;
+const
+  Src: array[0..9] of integer = (3, 7, 1, 11, 4, 9, 2, 8, 5, 12);
+  StartId = 0; // T5 decoder_start_token_id
+  EOSId = 1;   // T5 eos_token_id
+var
+  Enc, Dec: TNNet;
+  Config: TT5Config;
+  G1, G2, ForcedEOS: TNeuralIntegerArray;
+  EncToks, DecToks, Logits: TNNetVolume;
+  I, OracleArgmax: integer;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  EncToks := TNNetVolume.Create(10, 1, 1);
+  DecToks := TNNetVolume.Create(6, 1, 1);
+  Logits := TNNetVolume.Create();
+  try
+    G1 := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, EOSId, 5);
+    G2 := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, EOSId, 5);
+    AssertTrue('greedy generated something', Length(G1) >= 1);
+    AssertTrue('greedy respects MaxNewTokens', Length(G1) <= 5);
+    AssertEquals('greedy is deterministic (length)', Length(G1), Length(G2));
+    for I := 0 to High(G1) do
+    begin
+      AssertEquals('greedy is deterministic (token ' + IntToStr(I) + ')',
+        G1[I], G2[I]);
+      AssertTrue('token id in vocab',
+        (G1[I] >= 0) and (G1[I] < Config.VocabSize));
+      // EOS terminates generation, so it can only be the last element.
+      if G1[I] = EOSId then
+        AssertEquals('EOS only at the last position', High(G1), I);
+    end;
+    AssertTrue('stops at EOS or MaxNewTokens',
+      (G1[High(G1)] = EOSId) or (Length(G1) = 5));
+    // (b) Forced EOS stop: declare the run's own first token to be EOS - the
+    // decode must emit exactly that one token and stop.
+    ForcedEOS := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, G1[0], 5);
+    AssertEquals('EOS-on-first-token stops immediately', 1, Length(ForcedEOS));
+    AssertEquals('the EOS token is appended', G1[0], ForcedEOS[0]);
+    // (c) Consistency oracle: one RunT5 call with the start-token-padded
+    // decoder input; row 0's argmax must equal the first generated token.
+    for I := 0 to 9 do EncToks.FData[I] := Src[I];
+    for I := 0 to 5 do DecToks.FData[I] := StartId;
+    RunT5(Enc, Dec, EncToks, DecToks, Logits);
+    OracleArgmax := 0;
+    for I := 1 to Config.VocabSize - 1 do
+      if Logits.FData[I] > Logits.FData[OracleArgmax] then OracleArgmax := I;
+    AssertEquals('first greedy step matches the RunT5 row-0 argmax oracle',
+      OracleArgmax, G1[0]);
+  finally
+    Logits.Free;
+    DecToks.Free;
+    EncToks.Free;
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Sampling at Temperature -> 0 turns the softmaxed row into a one-hot at the
+// argmax, so probability-weighted samplers must reproduce the greedy
+// sequence token for token (the "temperature ~0 matches greedy" gate): TopP
+// falls back to the argmax once the top token alone exceeds P, and MinP's
+// weighted draw collapses onto the one-hot. TNNetSamplerTopK draws UNIFORMLY
+// among the top K (not probability-weighted), so only K=1 matches greedy -
+// covered as the degenerate deterministic case. A nil sampler must equal
+// greedy at ANY temperature (pure argmax path, no softmax computed).
+procedure TTestNeuralDecode.TestDecodeSeq2SeqSampledTempZeroMatchesGreedy;
+const
+  Src: array[0..9] of integer = (3, 7, 1, 11, 4, 9, 2, 8, 5, 12);
+var
+  Enc, Dec: TNNet;
+  Config: TT5Config;
+  Greedy, Sampled: TNeuralIntegerArray;
+  Sampler: TNNetSamplerBase;
+  I: integer;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  try
+    Greedy := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 5);
+    Sampler := TNNetSamplerTopK.Create(1);
+    try
+      Sampled := DecodeSeq2SeqSampled(Enc, Dec, Src, 0, 1, 5, Sampler, 1.0);
+    finally
+      Sampler.Free;
+    end;
+    AssertEquals('TopK(1) length matches greedy',
+      Length(Greedy), Length(Sampled));
+    for I := 0 to High(Greedy) do
+      AssertEquals('TopK(1) token ' + IntToStr(I), Greedy[I], Sampled[I]);
+    Sampler := TNNetSamplerTopP.Create(0.9);
+    try
+      Sampled := DecodeSeq2SeqSampled(Enc, Dec, Src, 0, 1, 5, Sampler, 1e-8);
+    finally
+      Sampler.Free;
+    end;
+    AssertEquals('TopP temp~0 length matches greedy',
+      Length(Greedy), Length(Sampled));
+    for I := 0 to High(Greedy) do
+      AssertEquals('TopP temp~0 token ' + IntToStr(I), Greedy[I], Sampled[I]);
+    Sampler := TNNetSamplerMinP.Create(0.5);
+    try
+      Sampled := DecodeSeq2SeqSampled(Enc, Dec, Src, 0, 1, 5, Sampler, 1e-8);
+    finally
+      Sampler.Free;
+    end;
+    AssertEquals('MinP temp~0 length matches greedy',
+      Length(Greedy), Length(Sampled));
+    for I := 0 to High(Greedy) do
+      AssertEquals('MinP temp~0 token ' + IntToStr(I), Greedy[I], Sampled[I]);
+    // nil sampler = greedy at any temperature (the argmax path ignores it).
+    Sampled := DecodeSeq2SeqSampled(Enc, Dec, Src, 0, 1, 5, nil, 7.5);
+    AssertEquals('nil sampler length matches greedy',
+      Length(Greedy), Length(Sampled));
+    for I := 0 to High(Greedy) do
+      AssertEquals('nil sampler token ' + IntToStr(I), Greedy[I], Sampled[I]);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// The harness is GENERIC over the two-net convention: the post-norm Marian
+// pico pair (decoder_start = pad = 12, eos = 0) decodes deterministically,
+// matches the same RunT5 row-0 argmax oracle, and a MaxNewTokens larger
+// than the decoder's build-time DecSeqLen is capped by the capacity.
+procedure TTestNeuralDecode.TestDecodeSeq2SeqGreedyMarianPairAndCapacity;
+const
+  Src: array[0..9] of integer = (5, 2, 9, 0, 7, 11, 3, 8, 1, 10);
+  StartId = 12; // Marian decoder_start_token_id = pad_token_id
+  EOSId = 0;    // Marian eos_token_id
+var
+  Enc, Dec: TNNet;
+  Config: TMarianConfig;
+  G1, G2: TNeuralIntegerArray;
+  EncToks, DecToks, Logits: TNNetVolume;
+  I, OracleArgmax: integer;
+begin
+  RandSeed := 424242;
+  BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_marian_config.json'));
+  EncToks := TNNetVolume.Create(10, 1, 1);
+  DecToks := TNNetVolume.Create(6, 1, 1);
+  Logits := TNNetVolume.Create();
+  try
+    // MaxNewTokens 99 >> DecSeqLen 6: capped by the build-time capacity
+    // (6 tokens at most - the 6th is generated from the full-width prefix).
+    G1 := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, EOSId, 99);
+    G2 := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, EOSId, 99);
+    AssertTrue('marian greedy generated something', Length(G1) >= 1);
+    AssertTrue('capacity caps generation at DecSeqLen', Length(G1) <= 6);
+    AssertEquals('marian greedy deterministic (length)',
+      Length(G1), Length(G2));
+    for I := 0 to High(G1) do
+    begin
+      AssertEquals('marian greedy deterministic (token ' + IntToStr(I) + ')',
+        G1[I], G2[I]);
+      AssertTrue('marian token id in vocab',
+        (G1[I] >= 0) and (G1[I] < Config.VocabSize));
+      if G1[I] = EOSId then
+        AssertEquals('marian EOS only at the last position', High(G1), I);
+    end;
+    // Same consistency oracle as the T5 test, through the shared RunT5 path.
+    for I := 0 to 9 do EncToks.FData[I] := Src[I];
+    for I := 0 to 5 do DecToks.FData[I] := StartId;
+    RunT5(Enc, Dec, EncToks, DecToks, Logits);
+    OracleArgmax := 0;
+    for I := 1 to Config.VocabSize - 1 do
+      if Logits.FData[I] > Logits.FData[OracleArgmax] then OracleArgmax := I;
+    AssertEquals('marian first greedy step matches the RunT5 oracle',
+      OracleArgmax, G1[0]);
+  finally
+    Logits.Free;
+    DecToks.Free;
+    EncToks.Free;
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Validation: a wrong source length and a decoder without a second
+// TNNetInput raise EArgumentException; MaxNewTokens < 1 returns empty.
+procedure TTestNeuralDecode.TestDecodeSeq2SeqRejectsInvalidArguments;
+const
+  Src: array[0..9] of integer = (3, 7, 1, 11, 4, 9, 2, 8, 5, 12);
+var
+  Enc, Dec, SingleInput: TNNet;
+  Config: TT5Config;
+  G: TNeuralIntegerArray;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  try
+    try
+      DecodeSeq2SeqGreedy(Enc, Dec, [3, 7, 1], 0, 1, 5);
+      Fail('a 3-token source must be rejected (encoder built at 10)');
+    except
+      on EArgumentException do ; // expected
+    end;
+    SingleInput := BuildTinyNet(4, 8);
+    try
+      try
+        DecodeSeq2SeqGreedy(Enc, SingleInput, Src, 0, 1, 5);
+        Fail('a decoder without a second TNNetInput must be rejected');
+      except
+        on EArgumentException do ; // expected
+      end;
+    finally
+      SingleInput.Free;
+    end;
+    G := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 0);
+    AssertEquals('MaxNewTokens=0 returns empty', 0, Length(G));
+  finally
+    Dec.Free;
+    Enc.Free;
   end;
 end;
 

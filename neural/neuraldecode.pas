@@ -559,6 +559,63 @@ function GenerateStringStreamed(Session: TNNetStreamingDecoder;
   const StopStrings: array of string;
   Constraint: TNNetTokenConstraint): string; overload;
 
+// ---------------------------------------------------------------------------
+// SEQ2SEQ (ENCODER-DECODER) GENERATION: the T5/BART-style counterpart of the
+// decoder-only routines above, for the two-net pairs returned by
+// BuildT5FromSafeTensors / BuildMarianFromSafeTensors (neuralpretrained):
+//   - the ENCODER net maps (EncSeqLen,1,1) source token ids to
+//     (EncSeqLen,1,d_model) hidden states;
+//   - the DECODER net has TWO TNNetInput layers: Layers[0] takes the
+//     (DecSeqLen,1,1) target token ids and a SECOND TNNetInput takes the
+//     encoder hidden states, read by every block's cross-attention.
+// The loop encodes the source ONCE, copies the hidden states into the
+// decoder's second input ONCE (they are constant across decode steps), then
+// autoregresses the target from StartTokenId (decoder_start_token_id):
+// each step re-runs the FULL decoder forward on the growing prefix (no KV
+// cache - the decoder was built at a FIXED DecSeqLen; positions past the
+// prefix are padded with StartTokenId, which causal self-attention makes
+// invisible to the rows actually read) and reads the LOGITS row at the last
+// prefix position. Greedy takes the argmax; the sampled variant softmaxes
+// the row at Temperature and draws with the usual TNNetSamplerBase family
+// (TopK / TopP / MinP / Greedy).
+//
+// STOPPING. Generation stops when EOSTokenId is emitted (it IS appended to
+// the result, mirroring GenerateTokensStreamed's EOS handling), after
+// MaxNewTokens tokens, or when the decoder's build-time capacity DecSeqLen
+// is exhausted (the last generated token then used every input slot).
+// The returned array holds the GENERATED ids only - StartTokenId excluded.
+//
+// VALIDATION. Length(SourceTokens) must equal the encoder's build-time
+// EncSeqLen, the encoder output must match the decoder's second-input size,
+// and the decoder must actually have a second TNNetInput - violations raise
+// EArgumentException. Beam search is NOT provided here: the existing
+// DecodeBeamSearch is char-level/string-based and does not compose with the
+// two-net token-id convention (a seq2seq beam is a separate follow-up).
+// Coded by Claude (AI).
+
+// Returns the decoder net's SECOND TNNetInput - the encoder-hidden-states
+// input of a BuildT5FromSafeTensors / BuildMarianFromSafeTensors decoder
+// (same convention as neuralpretrained's T5EncoderStatesInput, duplicated
+// here so neuraldecode does not depend on the importer unit). Raises
+// EArgumentException when the net has no second TNNetInput.
+function Seq2SeqEncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
+
+// Deterministic greedy argmax seq2seq decode (see the section header above).
+function DecodeSeq2SeqGreedy(EncoderNet, DecoderNet: TNNet;
+  const SourceTokens: array of integer;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+
+// Stochastic seq2seq decode: the step's logits row is divided by Temperature
+// (clamped to >= 1e-6; Temperature -> 0 degenerates to greedy argmax) and
+// softmaxed, then Sampler draws from the resulting distribution. Sampler =
+// nil is bit-for-bit DecodeSeq2SeqGreedy (which delegates here - argmax over
+// logits is Temperature-invariant, so no softmax is computed on that path).
+function DecodeSeq2SeqSampled(EncoderNet, DecoderNet: TNNet;
+  const SourceTokens: array of integer;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer;
+  Sampler: TNNetSamplerBase;
+  Temperature: TNeuralFloat = 1.0): TNeuralIntegerArray;
+
 implementation
 
 uses
@@ -1662,6 +1719,135 @@ begin
     Result.SumLogProb := 0;
     Result.Score := 0;
     Result.Finished := False;
+  end;
+end;
+
+{ Seq2seq (encoder-decoder) generation }
+
+function Seq2SeqEncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
+var
+  LayerCnt, InputCnt: integer;
+begin
+  Result := nil;
+  InputCnt := 0;
+  for LayerCnt := 0 to DecoderNet.Layers.Count - 1 do
+    if DecoderNet.Layers[LayerCnt] is TNNetInput then
+    begin
+      Inc(InputCnt);
+      if InputCnt = 2 then
+      begin
+        Result := DecoderNet.Layers[LayerCnt];
+        exit;
+      end;
+    end;
+  raise EArgumentException.Create('Seq2SeqEncoderStatesInput: the net has ' +
+    'no second TNNetInput - not an encoder-decoder pair''s decoder?');
+end;
+
+function DecodeSeq2SeqGreedy(EncoderNet, DecoderNet: TNNet;
+  const SourceTokens: array of integer;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer): TNeuralIntegerArray;
+begin
+  // Bit-for-bit the Sampler = nil sampled path (pure argmax over logits, so
+  // the Temperature argument is irrelevant there).
+  Result := DecodeSeq2SeqSampled(EncoderNet, DecoderNet, SourceTokens,
+    StartTokenId, EOSTokenId, MaxNewTokens, nil);
+end;
+
+function DecodeSeq2SeqSampled(EncoderNet, DecoderNet: TNNet;
+  const SourceTokens: array of integer;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer;
+  Sampler: TNNetSamplerBase;
+  Temperature: TNeuralFloat = 1.0): TNeuralIntegerArray;
+const
+  csMinTemperature = 1e-6;
+var
+  EncStates: TNNetLayer;
+  EncToks, DecToks, Probs: TNNetVolume;
+  Logits: TNNetVolume;          // the decoder's own output volume (not owned)
+  Targets: TNeuralIntegerArray; // StartTokenId + generated prefix
+  EncSeqLen, DecSeqLen, VocabSize: integer;
+  CurLen, Pos, T, Next, Base: integer;
+  MaxLogit, SumExp: TNeuralFloat;
+begin
+  SetLength(Result, 0);
+  if MaxNewTokens < 1 then exit;
+  EncSeqLen := EncoderNet.GetFirstLayer().Output.Size;
+  if Length(SourceTokens) <> EncSeqLen then
+    raise EArgumentException.Create('DecodeSeq2SeqSampled: ' +
+      IntToStr(Length(SourceTokens)) + ' source tokens but the encoder was ' +
+      'built at EncSeqLen ' + IntToStr(EncSeqLen) + '.');
+  EncStates := Seq2SeqEncoderStatesInput(DecoderNet);
+  if EncoderNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+    raise EArgumentException.Create('DecodeSeq2SeqSampled: encoder output ' +
+      'size ' + IntToStr(EncoderNet.GetLastLayer().Output.Size) +
+      ' does not match the decoder''s encoder-states input size ' +
+      IntToStr(EncStates.Output.Size) + ' (EncSeqLen/d_model mismatch?).');
+  DecSeqLen := DecoderNet.GetFirstLayer().Output.Size;
+  Logits := DecoderNet.GetLastLayer().Output;
+  VocabSize := Logits.Depth;
+  if Temperature < csMinTemperature then Temperature := csMinTemperature;
+  EncToks := TNNetVolume.Create(EncSeqLen, 1, 1);
+  DecToks := TNNetVolume.Create(DecSeqLen, 1, 1);
+  Probs := TNNetVolume.Create(VocabSize, 1, 1);
+  try
+    // (1) Encode the source ONCE and cache the hidden states in the
+    // decoder's second input - they are constant across decode steps.
+    for Pos := 0 to EncSeqLen - 1 do EncToks.FData[Pos] := SourceTokens[Pos];
+    EncoderNet.Compute(EncToks);
+    EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
+    // (2) Autoregress the target from StartTokenId. Positions past the
+    // prefix are padded with StartTokenId: causal self-attention makes them
+    // invisible to the rows at < CurLen, so row CurLen-1 is exactly what a
+    // longer real prefix would produce there.
+    SetLength(Targets, DecSeqLen);
+    Targets[0] := StartTokenId;
+    CurLen := 1;
+    while True do
+    begin
+      for Pos := 0 to DecSeqLen - 1 do
+        if Pos < CurLen
+        then DecToks.FData[Pos] := Targets[Pos]
+        else DecToks.FData[Pos] := StartTokenId;
+      DecoderNet.Compute(DecToks);
+      if Sampler = nil then
+        // Greedy: argmax over the logits row (Temperature-invariant).
+        Next := Logits.GetClassOnPixel(CurLen - 1, 0)
+      else
+      begin
+        // Stable softmax of the row at Temperature, then the sampler draws.
+        Base := (CurLen - 1) * VocabSize;
+        MaxLogit := Logits.FData[Base];
+        for T := 1 to VocabSize - 1 do
+          if Logits.FData[Base + T] > MaxLogit then
+            MaxLogit := Logits.FData[Base + T];
+        SumExp := 0;
+        for T := 0 to VocabSize - 1 do
+        begin
+          Probs.FData[T] := Exp((Logits.FData[Base + T] - MaxLogit) /
+            Temperature);
+          SumExp := SumExp + Probs.FData[T];
+        end;
+        if SumExp <= 0 then SumExp := 1.0;
+        for T := 0 to VocabSize - 1 do
+          Probs.FData[T] := Probs.FData[T] / SumExp;
+        Next := Sampler.GetToken(Probs);
+      end;
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Next;
+      // EOS is appended and counted (mirroring GenerateTokensStreamed).
+      if Next = EOSTokenId then break;
+      if Length(Result) >= MaxNewTokens then break;
+      // Build-time decoder capacity reached: the token just generated cannot
+      // be fed back as input.
+      if CurLen >= DecSeqLen then break;
+      Targets[CurLen] := Next;
+      Inc(CurLen);
+    end;
+  finally
+    Probs.Free;
+    DecToks.Free;
+    EncToks.Free;
   end;
 end;
 

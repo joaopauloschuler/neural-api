@@ -289,16 +289,18 @@ rather than acted on.
       in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
       (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real rewards.
-- [ ] Seq2seq (encoder-decoder) generation harness in
-      neural/neuraldecode.pas: every decode path today is decoder-only.
-      TNNetCrossAttention and TNNetCrossWKV (asymmetric mode) already exist
-      as layers, and the landed T5 importer (BuildT5FromSafeTensors)
-      returns the encoder + two-input decoder net pair with a single-pass
-      RunT5 helper — add a T5/BART-style loop that encodes the source ONCE,
-      caches the encoder output, feeds it as the K|V side of the cross
-      layers, and autoregresses the target with the usual greedy/beam/sample
-      machinery. Unlocks translation/summarization examples that the landed
-      BLEU/ROUGE metrics in neuralnlpmetrics.pas are waiting for.
+- [ ] Seq2seq BEAM SEARCH on the landed encoder-decoder harness: greedy +
+      temperature/top-k/top-p sampling landed in neural/neuraldecode.pas
+      (DecodeSeq2SeqGreedy / DecodeSeq2SeqSampled over the
+      BuildT5FromSafeTensors / BuildMarianFromSafeTensors two-net pairs -
+      encode-once cached encoder states, per-step full decoder re-forward,
+      EOS/MaxLen/capacity stops). The remaining slice is a token-id beam:
+      the existing DecodeBeamSearch is char-level/string-based and does not
+      compose with the two-net convention, so a seq2seq beam needs its own
+      candidate loop (reuse LengthPenaltyDenominator/SafeLogProb and the
+      finished-pool pruning idiom). Unlocks translation/summarization
+      examples that the landed BLEU/ROUGE metrics in neuralnlpmetrics.pas
+      are waiting for, once the Unigram tokenizer lands.
 - [ ] Masked-LM data collator (transformers DataCollatorForLanguageModeling
       port): BERT-style dynamic masking — pick 15% of tokens, replace 80%
       with [MASK] / 10% random / 10% unchanged, loss only on masked
