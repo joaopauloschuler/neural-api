@@ -10826,6 +10826,23 @@ type
       // normalization layer class (nil defaults to TNNetLayerNorm).
       function AddPostNormResidual(pSublayers: array of TNNetLayer;
         NormClass: TNNetLayerClass = nil): TNNetLayer;
+      // Sandwich-norm residual block (Gemma-2-style):
+      //   y = x + Norm(Sublayer(Norm(x)))
+      // i.e. the sublayer stack is normalized BOTH on entry (pre-norm) AND on
+      // exit (post-norm), with the post-norm INSIDE the residual branch (the
+      // sublayer output is normalized BEFORE the residual add, unlike
+      // AddPostNormResidual which normalizes the sum). A Gemma-2 transformer
+      // block is two of these in sequence (attention then FFN), giving the
+      // characteristic 4 norms per block (input_layernorm /
+      // post_attention_layernorm / pre_feedforward_layernorm /
+      // post_feedforward_layernorm). pSublayers is the caller-provided
+      // sublayer stack; its output shape MUST match the block input shape so
+      // the residual sum is valid. Returns the residual-sum layer. NormClass
+      // selects the normalization layer class; nil defaults to TNNetRMSNorm
+      // (the sandwich-norm convention in Gemma-2 and friends; pass
+      // TNNetLayerNorm for the LayerNorm variant).
+      function AddSandwichNormResidual(pSublayers: array of TNNetLayer;
+        NormClass: TNNetLayerClass = nil): TNNetLayer;
       // Gated residual block:  y = x + GatedResidual(Sublayer(x)).
       // Unlike the norm-based siblings above, this block applies NO
       // normalization. Instead it inserts a TNNetGatedResidual after the
@@ -83753,6 +83770,21 @@ begin
   AddLayer(pSublayers);
   AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
   Result := AddLayer( NormClass.Create() );
+end;
+
+function TNNet.AddSandwichNormResidual(pSublayers: array of TNNetLayer;
+  NormClass: TNNetLayerClass = nil): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  // y = x + Norm(Sublayer(Norm(x)))  (sandwich norm, Gemma-2-style: the
+  // post-norm sits INSIDE the residual branch, before the residual add).
+  if NormClass = nil then NormClass := TNNetRMSNorm;
+  BranchInput := GetLastLayer();
+  AddLayer( NormClass.Create() );
+  AddLayer(pSublayers);
+  AddLayer( NormClass.Create() );
+  Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
 end;
 
 function TNNet.AddGatedResidual(pSublayers: array of TNNetLayer): TNNetLayer;

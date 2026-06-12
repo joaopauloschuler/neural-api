@@ -442,7 +442,7 @@ rather than acted on.
       bit-identical), with the tanh' factor in backward. Gradient-check
       with the cap on, and assert cap=0/off matches the landed path
       exactly.
-- [ ] Gemma 2 - sandwich-norm block builder: pre AND post RMSNorm around
+- [X] Gemma 2 - sandwich-norm block builder: pre AND post RMSNorm around
       both the attention and FFN sublayers (4 norms per block, vs the
       landed pre-norm-only residual helpers). Pure composition — a builder
       variant beside AddPreNormResidual/AddRMSNormResidual; the post-norm

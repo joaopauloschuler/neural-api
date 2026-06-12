@@ -330,6 +330,8 @@ type
     procedure TestRMSNormResidualGradientCheck;
     procedure TestPostNormResidualGradientCheck;
     procedure TestPreNormResidualForwardWiring;
+    procedure TestSandwichNormResidualGradientCheck;
+    procedure TestSandwichNormResidualForwardWiring;
     procedure TestGatedResidualGradientCheck;
     procedure TestGatedResidualForwardWiring;
     // AddReversibleBlock builder (RevNet additive coupling + analytic inverse)
@@ -3385,6 +3387,137 @@ begin
     Input.Free;
     Out1.Free;
     Out2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSandwichNormResidualGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // End-to-end input gradient check of AddSandwichNormResidual (Gemma-2-style):
+  // y = x + RMSNorm(Sublayer(RMSNorm(x))). Reseed so the random weight init is
+  // deterministic and independent of earlier tests in the shared-RNG suite.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  InputPlus := TNNetVolume.Create(3, 1, 2);
+  Desired := TNNetVolume.Create(3, 1, 2);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2, 1));
+    NN.AddSandwichNormResidual([ TNNetPointwiseConvLinear.Create(2) ]);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SandwichNormResidual input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSandwichNormResidualForwardWiring;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  ResidualOut, PostNormOut: TNNetLayer;
+  i: integer;
+  maxDiffVsBranch: TNeuralFloat;
+begin
+  // Forward sanity: AddSandwichNormResidual must produce
+  //   y = x + RMSNorm(Sublayer(RMSNorm(x)))
+  // with the post-norm INSIDE the residual branch: the residual sum adds the
+  // POST-NORM output (not the raw sublayer output) to the block input.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 2));
+    ResidualOut := NN.AddSandwichNormResidual([ TNNetPointwiseConvLinear.Create(2) ]);
+
+    // Layer structure: [0]=Input, [1]=RMSNorm (pre), [2]=PointwiseConvLinear,
+    // [3]=RMSNorm (post, inside the branch), [4]=Sum.
+    AssertEquals('SandwichNormResidual layer count', 5, NN.CountLayers());
+    AssertTrue('SandwichNormResidual pre-norm is RMSNorm',
+      NN.Layers[1] is TNNetRMSNorm);
+    AssertTrue('SandwichNormResidual sublayer is PointwiseConvLinear',
+      NN.Layers[2] is TNNetPointwiseConvLinear);
+    AssertTrue('SandwichNormResidual post-norm is RMSNorm',
+      NN.Layers[3] is TNNetRMSNorm);
+    AssertTrue('SandwichNormResidual block output is the residual Sum',
+      ResidualOut is TNNetSum);
+    PostNormOut := NN.Layers[3];
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.9) * 1.7 - 0.4;
+
+    NN.Compute(Input);
+
+    // Output shape must match the input shape (residual add validity).
+    AssertEquals('SandwichNormResidual output SizeX', 3, ResidualOut.Output.SizeX);
+    AssertEquals('SandwichNormResidual output SizeY', 1, ResidualOut.Output.SizeY);
+    AssertEquals('SandwichNormResidual output Depth', 2, ResidualOut.Output.Depth);
+
+    // out == input + POST-NORM output (the post-norm sits before the add).
+    maxDiffVsBranch := 0;
+    for i := 0 to ResidualOut.Output.Size - 1 do
+    begin
+      AssertEquals('SandwichNormResidual residual sum at ' + IntToStr(i),
+        Input.Raw[i] + PostNormOut.Output.Raw[i], ResidualOut.Output.Raw[i], 1e-4);
+      AssertTrue('SandwichNormResidual output must be finite at ' + IntToStr(i),
+        not IsNan(ResidualOut.Output.Raw[i]) and not IsInfinite(ResidualOut.Output.Raw[i]));
+      maxDiffVsBranch := Max(maxDiffVsBranch,
+        Abs(ResidualOut.Output.Raw[i] - PostNormOut.Output.Raw[i]));
+    end;
+    // The block output must differ from the bare branch output: proves the
+    // skip is actually summed in (Input is non-zero by construction).
+    AssertTrue('SandwichNormResidual must differ from bare branch output (skip wired)',
+      maxDiffVsBranch > 1e-3);
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 
