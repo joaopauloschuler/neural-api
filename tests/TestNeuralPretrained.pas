@@ -81,6 +81,9 @@ type
     procedure TestReaderReadsF16AndBF16Tensors;
     procedure TestReaderRejectsGarbage;
     procedure TestReaderReadsTinyFixture;
+    procedure TestSafeTensorsWriterRoundTrip;
+    procedure TestSafeTensorsWriterRejectsBadInput;
+    procedure TestSaveLoadNNetToSafeTensors;
     procedure TestImporterFailsOnMissingTensor;
     procedure TestGPT2ConfigFromFixture;
     procedure TestGPT2LogitParity;
@@ -758,6 +761,269 @@ begin
     AssertTrue('block 2 absent', not Reader.HasTensor('h.2.ln_1.weight'));
   finally
     Reader.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSafeTensorsWriterRoundTrip;
+var
+  StPath, SidecarPath: string;
+  Writer: TNNetSafeTensorsWriter;
+  Reader: TNNetSafeTensorsReader;
+  Src, Dst: TNNetVolume;
+  Sidecar: TStringList;
+  FS: TFormatSettings;
+  Json: string;
+  i, t: integer;
+  // Five tensors with varied shapes (incl. a 0-dim scalar) and
+  // deterministic values; tensor t element i = TensorValue(t, i).
+  TensorNames: array[0..4] of string;
+  TensorElements: array[0..4] of integer;
+  TensorShapesJson: array[0..4] of string;
+
+  function TensorValue(pTensor, pElement: integer): single;
+  begin
+    case pTensor of
+      0: Result := -3.25;                          // scalar, exact binary
+      1: Result := pElement * 0.5 - 1.75;          // exact binary
+      2: Result := (pElement * pElement - 5) / 8;  // exact binary
+      3: Result := pElement * 0.125 - 1.0;         // exact binary
+      else Result := 1.0 / (pElement + 3);         // NOT exact in decimal
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  // Fixed file names (NOT deleted): tools/verify_safetensors_writer.py
+  // loads this pair with the Python "safetensors" library to verify the
+  // writer cross-framework. Run this suite first, then the script.
+  StPath := GetTempDir(false) + 'cai_safetensors_writer_demo.safetensors';
+  SidecarPath := GetTempDir(false) + 'cai_safetensors_writer_demo.json';
+  TensorNames[0] := 'demo.scalar';
+  TensorNames[1] := 'demo.vec7';
+  TensorNames[2] := 'demo.mat3x4';
+  TensorNames[3] := 'demo.cube2x3x4';
+  TensorNames[4] := 'demo.col5x1';
+  TensorElements[0] := 1; TensorElements[1] := 7; TensorElements[2] := 12;
+  TensorElements[3] := 24; TensorElements[4] := 5;
+  TensorShapesJson[0] := '[]'; TensorShapesJson[1] := '[7]';
+  TensorShapesJson[2] := '[3,4]'; TensorShapesJson[3] := '[2,3,4]';
+  TensorShapesJson[4] := '[5,1]';
+
+  Src := TNNetVolume.Create;
+  Writer := TNNetSafeTensorsWriter.Create(StPath);
+  try
+    Writer.SetMetadata('format', 'cai-neural-api/v1');
+    Writer.SetMetadata('purpose', 'writer round-trip test');
+    for t := 0 to 4 do
+    begin
+      Src.ReSize(TensorElements[t], 1, 1);
+      for i := 0 to TensorElements[t] - 1 do
+        Src.FData[i] := TensorValue(t, i);
+      case t of
+        0: Writer.AddTensorFlat(TensorNames[0], [], Src);
+        1: Writer.AddTensorFlat(TensorNames[1], [7], Src);
+        2: Writer.AddTensorFlat(TensorNames[2], [3, 4], Src);
+        3: Writer.AddTensorFlat(TensorNames[3], [2, 3, 4], Src);
+        4: Writer.AddTensorFlat(TensorNames[4], [5, 1], Src);
+      end;
+    end;
+    AssertEquals('queued tensor count', 5, Writer.Count);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+
+  // Read everything back with the reader from the same unit: names,
+  // dtypes, shapes and BIT-EXACT values.
+  Reader := TNNetSafeTensorsReader.Create(StPath);
+  Dst := TNNetVolume.Create;
+  try
+    AssertEquals('tensor count', 5, Reader.Count);
+    AssertEquals('scalar dims', 0, Reader.DimCount('demo.scalar'));
+    AssertEquals('vec7 shape', '[7]', Reader.ShapeAsString('demo.vec7'));
+    AssertEquals('mat shape', '[3, 4]',
+      Reader.ShapeAsString('demo.mat3x4'));
+    AssertEquals('cube shape', '[2, 3, 4]',
+      Reader.ShapeAsString('demo.cube2x3x4'));
+    AssertEquals('col shape', '[5, 1]',
+      Reader.ShapeAsString('demo.col5x1'));
+    for t := 0 to 4 do
+    begin
+      AssertEquals(TensorNames[t] + ' dtype', 'F32',
+        Reader.GetDType(TensorNames[t]));
+      Reader.LoadTensorFlat(TensorNames[t], Dst);
+      AssertEquals(TensorNames[t] + ' size', TensorElements[t], Dst.Size);
+      for i := 0 to TensorElements[t] - 1 do
+        AssertEquals(TensorNames[t] + '[' + IntToStr(i) + ']',
+          TensorValue(t, i), Dst.FData[i], 0); // delta 0 = bit-exact
+    end;
+  finally
+    Dst.Free;
+    Reader.Free;
+    Src.Free;
+  end;
+
+  // Emit the JSON sidecar for the Python cross-check (9 significant
+  // digits round-trip any float32 exactly; '.' decimal separator).
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  Json := '{"file":"' + StringReplace(StPath, '\', '/', [rfReplaceAll]) +
+    '","metadata":{"format":"cai-neural-api/v1",' +
+    '"purpose":"writer round-trip test"},"tensors":{';
+  for t := 0 to 4 do
+  begin
+    if t > 0 then Json := Json + ',';
+    Json := Json + '"' + TensorNames[t] + '":{"shape":' +
+      TensorShapesJson[t] + ',"values":[';
+    for i := 0 to TensorElements[t] - 1 do
+    begin
+      if i > 0 then Json := Json + ',';
+      Json := Json + FloatToStrF(TensorValue(t, i), ffGeneral, 9, 0, FS);
+    end;
+    Json := Json + ']}';
+  end;
+  Json := Json + '}}';
+  Sidecar := TStringList.Create;
+  try
+    Sidecar.Text := Json;
+    Sidecar.SaveToFile(SidecarPath);
+  finally
+    Sidecar.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSafeTensorsWriterRejectsBadInput;
+var
+  Path: string;
+  Writer: TNNetSafeTensorsWriter;
+  V: TNNetVolume;
+  Failed: boolean;
+begin
+  RandSeed := 424242;
+  Path := GetTempDir(false) + 'cai_st_writer_reject.safetensors';
+  V := TNNetVolume.Create;
+  V.ReSize(6, 1, 1);
+  Writer := TNNetSafeTensorsWriter.Create(Path);
+  try
+    Writer.AddTensorFlat('a', [2, 3], V);
+
+    // (a) Duplicate tensor name.
+    Failed := false;
+    try
+      Writer.AddTensorFlat('a', [6], V);
+    except
+      on ESafeTensorsError do Failed := true;
+    end;
+    AssertTrue('duplicate name must be rejected', Failed);
+
+    // (b) Shape element count disagreeing with the source volume.
+    Failed := false;
+    try
+      Writer.AddTensorFlat('b', [2, 2], V);
+    except
+      on ESafeTensorsError do Failed := true;
+    end;
+    AssertTrue('shape/size mismatch must be rejected', Failed);
+
+    // (c) The reserved "__metadata__" name.
+    Failed := false;
+    try
+      Writer.AddTensorFlat('__metadata__', [6], V);
+    except
+      on ESafeTensorsError do Failed := true;
+    end;
+    AssertTrue('__metadata__ as a tensor name must be rejected', Failed);
+
+    // (d) Writing twice.
+    Writer.SaveToFile;
+    Failed := false;
+    try
+      Writer.SaveToFile;
+    except
+      on ESafeTensorsError do Failed := true;
+    end;
+    AssertTrue('second SaveToFile must be rejected', Failed);
+  finally
+    Writer.Free;
+    V.Free;
+    DeleteFile(Path);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSaveLoadNNetToSafeTensors;
+var
+  Path: string;
+  NN1, NN2, NNOther: TNNet;
+  Input, Out1, Out2: TNNetVolume;
+  i: integer;
+  MaxDiff: TNeuralFloat;
+  Failed: boolean;
+
+  function SmallNet: TNNet;
+  begin
+    Result := TNNet.Create;
+    Result.AddLayer([
+      TNNetInput.Create(6, 6, 3),
+      TNNetConvolutionReLU.Create(4, 3, 1, 1, 1),
+      TNNetMaxPool.Create(2),
+      TNNetFullConnectLinear.Create(5)
+    ]);
+  end;
+
+begin
+  RandSeed := 424242;
+  Path := GetTempDir(false) + 'cai_st_nnet_roundtrip.safetensors';
+  NN1 := SmallNet;
+  NN2 := SmallNet; // same structure, DIFFERENT random init (RNG advanced)
+  Input := TNNetVolume.Create(6, 6, 3);
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  NNOther := nil;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := 0.05 * i - 2.5;
+    NN1.Compute(Input);
+    NN1.GetOutput(Out1);
+    NN2.Compute(Input);
+    NN2.GetOutput(Out2);
+    MaxDiff := 0;
+    for i := 0 to Out1.Size - 1 do
+      if Abs(Out1.FData[i] - Out2.FData[i]) > MaxDiff then
+        MaxDiff := Abs(Out1.FData[i] - Out2.FData[i]);
+    AssertTrue('fresh nets must disagree before loading (max diff ' +
+      FloatToStr(MaxDiff) + ')', MaxDiff > 1e-4);
+
+    // save NN1 -> load into NN2 -> forward outputs must be BIT-exact.
+    SaveNNetToSafeTensors(NN1, Path);
+    LoadNNetFromSafeTensors(NN2, Path);
+    NN2.Compute(Input);
+    NN2.GetOutput(Out2);
+    AssertEquals('output size', Out1.Size, Out2.Size);
+    for i := 0 to Out1.Size - 1 do
+      AssertEquals('output[' + IntToStr(i) + ']', Out1.FData[i],
+        Out2.FData[i], 0); // delta 0 = bit-exact
+
+    // Loading into a structurally DIFFERENT net must fail loudly.
+    NNOther := TNNet.Create;
+    NNOther.AddLayer([
+      TNNetInput.Create(6, 6, 3),
+      TNNetFullConnectLinear.Create(5)
+    ]);
+    Failed := false;
+    try
+      LoadNNetFromSafeTensors(NNOther, Path);
+    except
+      on ESafeTensorsError do Failed := true;
+    end;
+    AssertTrue('structure mismatch must abort the load', Failed);
+  finally
+    NNOther.Free;
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
+    NN1.Free;
+    DeleteFile(Path);
   end;
 end;
 

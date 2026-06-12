@@ -199,10 +199,24 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [ ] safetensors WRITER (neural/neuralsafetensors.pas has only the
+- [X] safetensors WRITER (neural/neuralsafetensors.pas has only the
       reader): export named tensors so Pascal-trained models round-trip
       into PyTorch/transformers. Doubles as a cross-framework correctness
       check for the GPT-2/Llama importers (export → reload → compare).
+      LANDED: TNNetSafeTensorsWriter (F32, manual ASCII JSON header,
+      8-byte-aligned) + SaveNNetToSafeTensors/LoadNNetFromSafeTensors
+      (layer_<idx>.<ClassName>.weights/.biases naming) in
+      neuralsafetensors.pas; Pascal round-trip + bit-exact forward tests
+      in TestNeuralPretrained; tools/verify_safetensors_writer.py
+      validated against Python safetensors 0.8.0.
+- [ ] safetensors writer F16/BF16 output: TNNetSafeTensorsWriter only
+      emits F32; add encode-on-write halves (EncodeF16/EncodeBF16 mirroring
+      the existing decoders) for smaller exported checkpoints.
+- [ ] HF-names safetensors exporter: export an imported pico-GPT-2 back to
+      HF tensor names (wte.weight, h.N.attn.c_attn.weight, ...), reload via
+      BuildGPT2FromSafeTensors and compare logits; generalize per-importer
+      name maps later. The generic writer landed; only the naming/transpose
+      mapping (Pascal neuron-major vs HF [in,out] Conv1D) is missing.
 - [ ] Knowledge distillation trainer (transformers DistillationTrainer /
       classic Hinton KD): temperature-softened KL between a frozen teacher's
       logits and the student's, blended with the hard-label loss
