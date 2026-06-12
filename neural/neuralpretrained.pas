@@ -50,6 +50,13 @@ unit neuralpretrained;
 //     OFFSET by padding_idx+1 = 2 and a degenerate 1-row token-type
 //     table) - also the SAME BuildBertFromSafeTensors entry points. See
 //     the BERT IMPORT section.
+//   - T5 / Flan-T5 (model_type "t5") - the FIRST ENCODER-DECODER import:
+//     BuildT5FromSafeTensors returns TWO nets (encoder + two-input decoder
+//     whose cross-attentions read the encoder hidden states from a second
+//     TNNetInput); RunT5 runs the pair end-to-end. Supports both the
+//     original v1.0 recipe (ReLU FFN, tied + d_model^-0.5-scaled head) and
+//     the v1.1/Flan recipe (gated-GELU FFN, untied head). See the T5
+//     IMPORT section below.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -1008,6 +1015,128 @@ function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
 function BuildGPT2ForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0; pNumHeads: integer = 0;
   pInferenceOnly: boolean = false): TNNet;
+
+// ---------------------------------------------------------------------------
+// T5 / FLAN-T5 IMPORT (model_type "t5") - the FIRST ENCODER-DECODER import.
+// ---------------------------------------------------------------------------
+// A TNNet is a DAG grown from one primary input, so the seq2seq stack is
+// built as TWO nets returned together by BuildT5FromSafeTensors:
+//   - the ENCODER net: (EncSeqLen,1,1) token ids in ->
+//     (EncSeqLen,1,d_model) final hidden states out (the bidirectional T5
+//     encoder stack including its final RMSNorm);
+//   - the DECODER net with TWO TNNetInput layers: Layers[0] takes the
+//     (DecSeqLen,1,1) decoder token ids (rows usually start with the
+//     decoder_start_token_id 0) and a SECOND TNNetInput (locate it with
+//     T5EncoderStatesInput; fill its Output manually before Compute) takes
+//     the (EncSeqLen,1,d_model) ENCODER hidden states, consumed by every
+//     decoder block's cross-attention. Output: (DecSeqLen,1,vocab) logits.
+// RunT5 runs the pair end-to-end (encoder Compute -> copy the hidden
+// states into the decoder's second input -> decoder Compute).
+//
+// Per encoder block (pre-norm, residual adds AFTER the sublayer, NO biases
+// in any linear):
+//   x := x + o( SelfAttn_relpos( RMSNorm(x) ) )
+//   x := x + FFN( RMSNorm(x) )
+// Per decoder block:
+//   x := x + o( CausalSelfAttn_relpos( RMSNorm(x) ) )
+//   x := x + o( CrossAttn( RMSNorm(x), EncoderStates ) )
+//   x := x + FFN( RMSNorm(x) )
+// T5LayerNorm is scale-only RMSNorm (x/sqrt(mean(x^2)+eps)*w, no mean
+// subtraction, no bias) = TNNetTokenRMSNorm, exactly.
+//
+// T5 quirks handled here:
+//   - NO positional embedding; position enters ONLY through the BUCKETED
+//     relative-position bias (TNNetT5RelPosBiasAttention, an exact port of
+//     HF's relative_position_bucket). The bias table lives in block 0 of
+//     each stack ([num_buckets, num_heads]) and is SHARED by all the
+//     stack's layers: the loader copies column h of the stack's single
+//     table into head h of EVERY layer (bidirectional buckets in the
+//     encoder, causal buckets in the decoder; the decoder's
+//     cross-attention has NO bias).
+//   - attention WITHOUT the 1/sqrt(d_k) scaling (T5 folds it into the
+//     pretraining init). TNNetT5RelPosBiasAttention / TNNetCrossAttention
+//     scale by 1/sqrt(d_k), so the loader multiplies every q.weight by
+//     sqrt(d_kv) to compensate (the GPT-Neo trick, in reverse).
+//   - d_kv may be DECOUPLED from d_model/num_heads (inner_dim =
+//     num_heads*d_kv need not equal d_model).
+//   - FFN: feed_forward_proj "gated-gelu" (T5 v1.1 / Flan-T5) is
+//     act(wi_0(x)) * wi_1(x) with the gelu_new TANH approximation - the
+//     fused TNNetGEGLU projection holds wi_1 in neurons 0..d_ff-1 (linear
+//     half) and wi_0 in neurons d_ff..2*d_ff-1 (gated half);
+//     feed_forward_proj "relu" (the original T5 v1.0) is wo(relu(wi(x))).
+//   - LM head: T5 v1.0 TIES lm_head to the shared embedding and scales
+//     the decoder output by d_model^-0.5 before the head - the loader
+//     folds the scale into the copied head rows. Flan-T5 / v1.1 does NOT
+//     tie (config tie_word_embeddings=false) and loads lm_head.weight.
+//   - encoder.embed_tokens / decoder.embed_tokens always alias
+//     "shared.weight" (HF drops the duplicates from saved checkpoints;
+//     legacy exports that still carry them are accepted and ignored).
+// BuildFromPretrained does NOT dispatch "t5" (it returns ONE net); it
+// raises an error pointing here instead. TOKENIZER NOTE: T5 ships a
+// SentencePiece UNIGRAM tokenizer, which neuralhftokenizer.pas does not
+// cover yet - end-to-end text use needs the Unigram tokenizer task; the
+// importer itself is tokenizer-independent (token ids in, logits out).
+
+type
+  TT5Config = record
+    DModel: integer;            // d_model (hidden width)
+    DKV: integer;               // d_kv (per-head width; may be decoupled)
+    DFF: integer;               // d_ff (FFN inner width)
+    NumLayers: integer;         // num_layers (encoder blocks)
+    NumDecoderLayers: integer;  // num_decoder_layers
+    NumHeads: integer;          // num_heads
+    VocabSize: integer;         // vocab_size
+    RelPosNumBuckets: integer;  // relative_attention_num_buckets
+    RelPosMaxDistance: integer; // relative_attention_max_distance
+    LayerNormEps: TNeuralFloat; // layer_norm_epsilon
+    GatedFFN: boolean;          // feed_forward_proj "gated-gelu" (Flan/v1.1)
+    TieWordEmbeddings: boolean; // tie_word_embeddings (v1.0 ties + scales)
+    ModelType: string;          // 't5'
+  end;
+
+// Reads a HF T5 config.json (model_type "t5"). Required: d_model, d_kv,
+// d_ff, num_layers, num_heads, vocab_size. Defaults: num_decoder_layers =
+// num_layers, relative_attention_num_buckets = 32,
+// relative_attention_max_distance = 128, layer_norm_epsilon = 1e-6,
+// feed_forward_proj = "relu", tie_word_embeddings = TRUE (the HF default -
+// the original T5 ties; Flan-T5/v1.1 configs say false). Only
+// feed_forward_proj "relu" and "gated-gelu" are supported (the two shipped
+// T5 recipes).
+function ReadT5ConfigFromJSONFile(const FileName: string): TT5Config;
+
+function T5ConfigToString(const Config: TT5Config): string;
+
+// Builds the T5 ENCODER and DECODER nets described by Config and loads
+// every weight from the safetensors checkpoint at FileName (see the T5
+// IMPORT section above for shapes and the two-input decoder convention).
+// EncSeqLen/DecSeqLen fix the two sequence lengths at build time (T5 has
+// no positional table, so any positive lengths are valid). Both nets are
+// owned by the caller. pInferenceOnly = True frees training volumes during
+// construction (Compute()-only afterwards).
+procedure BuildT5FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TT5Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildT5FromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TT5Config;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Returns the decoder net's SECOND TNNetInput - the (EncSeqLen,1,d_model)
+// encoder-hidden-states input every cross-attention reads. Fill its
+// Output with the encoder net's final output before DecoderNet.Compute
+// (RunT5 does exactly that).
+function T5EncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
+
+// Runs the encoder-decoder pair end-to-end: EncoderNet.Compute on the
+// (EncSeqLen,1,1) EncoderTokens ids, copies the (EncSeqLen,1,d_model)
+// hidden states into DecoderNet's second input, DecoderNet.Compute on the
+// (DecSeqLen,1,1) DecoderTokens ids, and copies the (DecSeqLen,1,vocab)
+// logits into Logits (resized as needed).
+procedure RunT5(EncoderNet, DecoderNet: TNNet;
+  EncoderTokens, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
 
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
@@ -5234,6 +5363,603 @@ begin
   end;
 end;
 
+// ---------------------------------------------------------------------------
+// T5 / FLAN-T5 IMPORT implementation (see the interface section).
+// ---------------------------------------------------------------------------
+
+function ReadT5ConfigFromJSONFile(const FileName: string): TT5Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, FFProj: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('T5 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('T5 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('T5 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('T5 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('T5 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 't5');
+    if ModelType <> 't5' then
+      ImportError('T5 import: config model_type is "' + ModelType +
+        '" - only "t5" is supported here (see BuildFromPretrained for ' +
+        'the full dispatch).');
+    Result.ModelType := ModelType;
+    Result.DModel := RequiredInt('d_model');
+    Result.DKV := RequiredInt('d_kv');
+    Result.DFF := RequiredInt('d_ff');
+    Result.NumLayers := RequiredInt('num_layers');
+    Result.NumHeads := RequiredInt('num_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumDecoderLayers :=
+      Obj.Get('num_decoder_layers', Result.NumLayers);
+    Result.RelPosNumBuckets :=
+      Obj.Get('relative_attention_num_buckets', 32);
+    Result.RelPosMaxDistance :=
+      Obj.Get('relative_attention_max_distance', 128);
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-6);
+    // The HF T5Config default is TRUE: the original T5 ties the head (and
+    // scales the decoder output by d_model^-0.5); Flan-T5/v1.1 say false.
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    // Only the two shipped T5 FFN recipes are supported: "relu" (v1.0,
+    // wo(relu(wi(x)))) and "gated-gelu" (v1.1/Flan, gelu_new(wi_0)*wi_1).
+    // HF's plain "gelu" would be the EXACT erf form (dense_act_fn stays
+    // "gelu"), which no released T5 uses - rejected to avoid a silent
+    // erf-vs-tanh mismatch.
+    FFProj := Obj.Get('feed_forward_proj', 'relu');
+    if FFProj = 'relu' then
+      Result.GatedFFN := False
+    else if FFProj = 'gated-gelu' then
+      Result.GatedFFN := True
+    else
+      ImportError('T5 import: feed_forward_proj "' + FFProj +
+        '" is not supported - expected "relu" (T5 v1.0) or "gated-gelu" ' +
+        '(T5 v1.1 / Flan-T5).');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function T5ConfigToString(const Config: TT5Config): string;
+begin
+  if Config.ModelType = '' then Result := 't5' else Result := Config.ModelType;
+  Result := Result + ' config: enc_layers=' + IntToStr(Config.NumLayers) +
+    ', dec_layers=' + IntToStr(Config.NumDecoderLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', d_model=' + IntToStr(Config.DModel) +
+    ', d_kv=' + IntToStr(Config.DKV) +
+    ', d_ff=' + IntToStr(Config.DFF) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', rel_buckets=' + IntToStr(Config.RelPosNumBuckets) +
+    ', rel_max_dist=' + IntToStr(Config.RelPosMaxDistance) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.GatedFFN then
+    Result := Result + ', gated_ffn=true';
+end;
+
+type
+  TT5AttnLayers = record
+    Norm, QProj, KProj, VProj, OProj: TNNetLayer;
+    Heads: array of TNNetLayer; // per-head attention leaves
+  end;
+  TT5BlockLayers = record
+    SelfAttn: TT5AttnLayers;
+    CrossAttn: TT5AttnLayers;   // decoder blocks only
+    FFNNorm, Wi, Wo: TNNetLayer;
+  end;
+  TT5BlockArray = array of TT5BlockLayers;
+
+// Grows one T5 stack (encoder or decoder) onto NN after the embedding.
+// IsDecoder adds the causal mask on self-attention plus the cross-attention
+// sub-block reading Keys|Values from EncStates (the decoder net's second
+// TNNetInput). Layer handles for the weight loader are returned in Blocks.
+procedure BuildT5StackBlocks(NN: TNNet; const Config: TT5Config;
+  NumBlocks: integer; IsDecoder: boolean; EncStates: TNNetLayer;
+  var Blocks: TT5BlockArray; pInferenceOnly: boolean);
+var
+  InnerDim, BlockCnt, HeadCnt, d: integer;
+  BranchInput, NormedSource: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
+  SliceChannels: array of integer;
+begin
+  InnerDim := Config.NumHeads * Config.DKV;
+  SetLength(Blocks, NumBlocks);
+  SetLength(SliceChannels, Config.DKV);
+  for BlockCnt := 0 to NumBlocks - 1 do
+  begin
+    // ---- self-attention sub-block (pre-norm, residual after) ----
+    // Wired from primitives like the Llama importer; the per-head leaf is
+    // TNNetT5RelPosBiasAttention so every head carries its own copy of the
+    // stack's SHARED bias table column (loaded below). The decoder is
+    // causal (= HF bidirectional=False bucketing); the encoder is not.
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].SelfAttn.Norm :=
+      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+    NormedSource := NN.GetLastLayer();
+    Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(InnerDim), NormedSource);
+    Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(InnerDim), NormedSource);
+    Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(InnerDim), NormedSource);
+    SetLength(Blocks[BlockCnt].SelfAttn.Heads, Config.NumHeads);
+    for HeadCnt := 0 to Config.NumHeads - 1 do
+    begin
+      for d := 0 to Config.DKV - 1 do
+        SliceChannels[d] := HeadCnt * Config.DKV + d;
+      QSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.QProj);
+      KSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.KProj);
+      VSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.VProj);
+      HeadPack := NN.AddLayer(
+        TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+      Blocks[BlockCnt].SelfAttn.Heads[HeadCnt] := NN.AddLayerAfter(
+        TNNetT5RelPosBiasAttention.Create(Config.DKV,
+          {pCausalMask=}IsDecoder, Config.RelPosNumBuckets,
+          Config.RelPosMaxDistance), HeadPack);
+    end;
+    NN.AddLayer( TNNetDeepConcat.Create(Blocks[BlockCnt].SelfAttn.Heads) );
+    Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+
+    // ---- cross-attention sub-block (decoder only) ----
+    // Queries from the (normed) decoder stream; Keys|Values projected from
+    // EncStates - the two grids may have DIFFERENT lengths, so the per-head
+    // leaf is TNNetCrossAttention (rectangular DecSeqLen x EncSeqLen
+    // scores; a Q|K|V DeepConcat would be illegal across unequal SizeX).
+    // NO relative-position bias here (the T5 cross-attention has none).
+    if IsDecoder then
+    begin
+      BranchInput := NN.GetLastLayer();
+      Blocks[BlockCnt].CrossAttn.Norm :=
+        NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+      NormedSource := NN.GetLastLayer();
+      Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(InnerDim), NormedSource);
+      Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(InnerDim), EncStates);
+      Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(InnerDim), EncStates);
+      SetLength(Blocks[BlockCnt].CrossAttn.Heads, Config.NumHeads);
+      for HeadCnt := 0 to Config.NumHeads - 1 do
+      begin
+        for d := 0 to Config.DKV - 1 do
+          SliceChannels[d] := HeadCnt * Config.DKV + d;
+        QSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.QProj);
+        KSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.KProj);
+        VSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.VProj);
+        KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+        Blocks[BlockCnt].CrossAttn.Heads[HeadCnt] := NN.AddLayerAfter(
+          TNNetCrossAttention.Create(Config.DKV, {CausalMask=}false,
+            KVPack), QSlice);
+      end;
+      NN.AddLayer( TNNetDeepConcat.Create(Blocks[BlockCnt].CrossAttn.Heads) );
+      Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.DModel) );
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    end;
+
+    // ---- FFN sub-block ----
+    // "gated-gelu": h = gelu_new(wi_0(x)) * wi_1(x) - TNNetGEGLU computes
+    // FIRSTHALF * GELU(SECONDHALF) with the tanh approximation (= HF
+    // gelu_new), so the fused projection holds wi_1 in neurons 0..d_ff-1
+    // and wi_0 in neurons d_ff..2*d_ff-1 (see the weight loader).
+    // "relu": h = relu(wi(x)). Both end with wo back to d_model.
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].FFNNorm :=
+      NN.AddLayer( TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+    if Config.GatedFFN then
+    begin
+      Blocks[BlockCnt].Wi := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(2 * Config.DFF) );
+      NN.AddLayer( TNNetGEGLU.Create() );
+    end
+    else
+    begin
+      Blocks[BlockCnt].Wi := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.DFF) );
+      NN.AddLayer( TNNetReLU.Create() );
+    end;
+    Blocks[BlockCnt].Wo := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+  end;
+  SetLength(SliceChannels, 0);
+end;
+
+// Copies the stack's SHARED relative-position bias table
+// ([NumBuckets, NumHeads], stored only in block 0 in HF checkpoints) into
+// head h of EVERY layer of the stack: bias[bucket] = T[bucket, h]. The
+// per-layer-per-head copies strictly generalize T5's sharing, so loading
+// the same column everywhere reproduces it exactly.
+procedure LoadT5RelPosBias(Reader: TNNetSafeTensorsReader;
+  const Blocks: TT5BlockArray; const WName: string; const Config: TT5Config);
+var
+  Tmp: TNNetVolume;
+  BlockCnt, HeadCnt, BucketCnt: integer;
+  HeadLayer: TNNetLayer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('T5 import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> Config.RelPosNumBuckets) or
+     (Reader.DimSize(WName, 1) <> Config.NumHeads) then
+    ImportError('T5 import: "' + WName + '" must have shape [' +
+      IntToStr(Config.RelPosNumBuckets) + ', ' +
+      IntToStr(Config.NumHeads) + '], got ' + Reader.ShapeAsString(WName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for BlockCnt := 0 to High(Blocks) do
+      for HeadCnt := 0 to Config.NumHeads - 1 do
+      begin
+        HeadLayer := Blocks[BlockCnt].SelfAttn.Heads[HeadCnt];
+        if HeadLayer.Neurons[0].Weights.Size <> Config.RelPosNumBuckets then
+          ImportError('T5 import: internal error - relpos head neuron for "' +
+            WName + '" has ' +
+            IntToStr(HeadLayer.Neurons[0].Weights.Size) +
+            ' weights, expected ' + IntToStr(Config.RelPosNumBuckets) + '.');
+        for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
+          HeadLayer.Neurons[0].Weights.FData[BucketCnt] :=
+            Tmp.FData[BucketCnt * Config.NumHeads + HeadCnt];
+        HeadLayer.FlushWeightCache();
+      end;
+  finally
+    Tmp.Free;
+  end;
+end;
+
+// Loads one attention sub-block's q/k/v/o (HF nn.Linear [out, in],
+// bias-free). q gets the sqrt(d_kv) compensation folded in: T5 computes
+// UNSCALED q.k scores while the CAI attention leaves scale by 1/sqrt(d_k).
+procedure LoadT5AttnLinears(Reader: TNNetSafeTensorsReader;
+  const Attn: TT5AttnLayers; const AttnPrefix: string;
+  const Config: TT5Config; Consumed: TStringList);
+var
+  InnerDim: integer;
+begin
+  InnerDim := Config.NumHeads * Config.DKV;
+  LoadLlamaLinearWeights(Reader, Attn.QProj, AttnPrefix + 'q.weight',
+    Config.DModel, InnerDim, 0, -1, 0, '', Sqrt(Config.DKV));
+  Consumed.Add(AttnPrefix + 'q.weight');
+  LoadLlamaLinearWeights(Reader, Attn.KProj, AttnPrefix + 'k.weight',
+    Config.DModel, InnerDim);
+  Consumed.Add(AttnPrefix + 'k.weight');
+  LoadLlamaLinearWeights(Reader, Attn.VProj, AttnPrefix + 'v.weight',
+    Config.DModel, InnerDim);
+  Consumed.Add(AttnPrefix + 'v.weight');
+  LoadLlamaLinearWeights(Reader, Attn.OProj, AttnPrefix + 'o.weight',
+    InnerDim, Config.DModel);
+  Consumed.Add(AttnPrefix + 'o.weight');
+end;
+
+// Loads one full T5 stack: per-block sublayer norms + attention linears +
+// FFN linears, plus the stack's single shared relative-position bias table.
+// The decoder's sublayer indices are 0=self-attn, 1=cross-attn, 2=FFN; the
+// encoder's are 0=self-attn, 1=FFN.
+procedure LoadT5Stack(Reader: TNNetSafeTensorsReader;
+  const Blocks: TT5BlockArray; const StackPrefix: string;
+  const Config: TT5Config; IsDecoder: boolean; Consumed: TStringList);
+var
+  BlockCnt, FFNIdx: integer;
+  BP, FFNPrefix: string;
+begin
+  if IsDecoder then FFNIdx := 2 else FFNIdx := 1;
+  for BlockCnt := 0 to High(Blocks) do
+  begin
+    BP := StackPrefix + 'block.' + IntToStr(BlockCnt) + '.';
+    LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].SelfAttn.Norm,
+      BP + 'layer.0.layer_norm.weight', Config.DModel);
+    Consumed.Add(BP + 'layer.0.layer_norm.weight');
+    LoadT5AttnLinears(Reader, Blocks[BlockCnt].SelfAttn,
+      BP + 'layer.0.SelfAttention.', Config, Consumed);
+    if IsDecoder then
+    begin
+      LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].CrossAttn.Norm,
+        BP + 'layer.1.layer_norm.weight', Config.DModel);
+      Consumed.Add(BP + 'layer.1.layer_norm.weight');
+      LoadT5AttnLinears(Reader, Blocks[BlockCnt].CrossAttn,
+        BP + 'layer.1.EncDecAttention.', Config, Consumed);
+    end;
+    FFNPrefix := BP + 'layer.' + IntToStr(FFNIdx) + '.';
+    LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].FFNNorm,
+      FFNPrefix + 'layer_norm.weight', Config.DModel);
+    Consumed.Add(FFNPrefix + 'layer_norm.weight');
+    if Config.GatedFFN then
+    begin
+      // TNNetGEGLU = FIRSTHALF * GELU(SECONDHALF); HF gated-gelu =
+      // gelu_new(wi_0) * wi_1 -> wi_1 into neurons 0..d_ff-1 (linear
+      // half), wi_0 into neurons d_ff..2*d_ff-1 (gated half).
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Wi,
+        FFNPrefix + 'DenseReluDense.wi_1.weight',
+        Config.DModel, Config.DFF, 0, 2 * Config.DFF);
+      Consumed.Add(FFNPrefix + 'DenseReluDense.wi_1.weight');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Wi,
+        FFNPrefix + 'DenseReluDense.wi_0.weight',
+        Config.DModel, Config.DFF, Config.DFF, 2 * Config.DFF);
+      Consumed.Add(FFNPrefix + 'DenseReluDense.wi_0.weight');
+    end
+    else
+    begin
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Wi,
+        FFNPrefix + 'DenseReluDense.wi.weight', Config.DModel, Config.DFF);
+      Consumed.Add(FFNPrefix + 'DenseReluDense.wi.weight');
+    end;
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Wo,
+      FFNPrefix + 'DenseReluDense.wo.weight', Config.DFF, Config.DModel);
+    Consumed.Add(FFNPrefix + 'DenseReluDense.wo.weight');
+  end;
+  // The stack's ONE shared bias table (block 0 only in the checkpoint),
+  // copied into every layer's heads.
+  LoadT5RelPosBias(Reader, Blocks,
+    StackPrefix + 'block.0.layer.0.SelfAttention.' +
+    'relative_attention_bias.weight', Config);
+  Consumed.Add(StackPrefix + 'block.0.layer.0.SelfAttention.' +
+    'relative_attention_bias.weight');
+end;
+
+procedure BuildT5FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TT5Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TT5BlockArray;
+  EncEmbed, DecEmbed, EncFinalNorm, DecFinalNorm: TNNetLayer;
+  DecTokenInput, EncStates, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j: integer;
+  TieScale: TNeuralFloat;
+  TensorNameStr: string;
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  // ---------------- Config validation ----------------
+  if EncSeqLen < 1 then
+    ImportError('T5 import: EncSeqLen must be >= 1, got ' +
+      IntToStr(EncSeqLen) + '.');
+  if DecSeqLen < 1 then
+    ImportError('T5 import: DecSeqLen must be >= 1, got ' +
+      IntToStr(DecSeqLen) + '.');
+  if Config.NumHeads < 1 then
+    ImportError('T5 import: num_heads must be >= 1.');
+  if Config.DKV < 1 then
+    ImportError('T5 import: d_kv must be >= 1.');
+  if (Config.RelPosNumBuckets < 4) or Odd(Config.RelPosNumBuckets) then
+    ImportError('T5 import: relative_attention_num_buckets must be an ' +
+      'EVEN integer >= 4, got ' + IntToStr(Config.RelPosNumBuckets) + '.');
+  if Config.RelPosMaxDistance <= Config.RelPosNumBuckets div 2 then
+    ImportError('T5 import: relative_attention_max_distance must exceed ' +
+      'num_buckets/2, got ' + IntToStr(Config.RelPosMaxDistance) + '.');
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if not Reader.HasTensor('shared.weight') then
+        ImportError('T5 import: "shared.weight" not found in ' +
+          Reader.FileName + ' - not a T5 checkpoint?');
+      if (Reader.DimCount('shared.weight') <> 2) or
+         (Reader.DimSize('shared.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize('shared.weight', 1) <> Config.DModel) then
+        ImportError('T5 import: shared.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.DModel) +
+          '], got ' + Reader.ShapeAsString('shared.weight'));
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('lm_head.weight')) then
+        ImportError('T5 import: config says tie_word_embeddings=false ' +
+          'but "lm_head.weight" is missing from ' + Reader.FileName + '.');
+
+      // ---------------- Encoder architecture ----------------
+      Enc := TNNet.Create();
+      Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
+      // EncodeZero=1: token id 0 (<pad>, also the decoder start token) is
+      // a real embedding row.
+      EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      BuildT5StackBlocks(Enc, Config, Config.NumLayers, {IsDecoder=}false,
+        nil, EncBlocks, pInferenceOnly);
+      EncFinalNorm := Enc.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+
+      // ---------------- Decoder architecture ----------------
+      // TWO inputs: Layers[0] = decoder token ids (what Compute feeds);
+      // the second TNNetInput holds the encoder hidden states and is
+      // filled MANUALLY before Compute (the TNNetCrossAttention two-source
+      // convention - see TestMultiHeadCrossAttentionGradientCheck).
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      BuildT5StackBlocks(Dec, Config, Config.NumDecoderLayers,
+        {IsDecoder=}true, EncStates, DecBlocks, pInferenceOnly);
+      DecFinalNorm := Dec.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('shared.weight', Tmp);
+        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('T5 import: shared.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+        EncEmbed.Neurons[0].Weights.Copy(Tmp);
+        EncEmbed.FlushWeightCache();
+        DecEmbed.Neurons[0].Weights.Copy(Tmp);
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('shared.weight');
+        // Legacy exports may still carry the tied embed_tokens aliases.
+        if Reader.HasTensor('encoder.embed_tokens.weight') then
+          Consumed.Add('encoder.embed_tokens.weight');
+        if Reader.HasTensor('decoder.embed_tokens.weight') then
+          Consumed.Add('decoder.embed_tokens.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          // T5 v1.0 tied head: logits = (h * d_model^-0.5) . shared^T -
+          // the scale is folded into the copied rows (bias-free).
+          TieScale := 1.0 / Sqrt(Config.DModel);
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.DModel - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                TieScale * Tmp.FData[j * Config.DModel + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          // A redundant serialized lm_head.weight is ignorable when tied.
+          if Reader.HasTensor('lm_head.weight') then
+            Consumed.Add('lm_head.weight');
+        end
+        else
+        begin
+          // Flan-T5 / v1.1: separate head, NO d_model^-0.5 scaling.
+          LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+            Config.DModel, Config.VocabSize);
+          Consumed.Add('lm_head.weight');
+        end;
+      finally
+        Tmp.Free;
+      end;
+      LoadT5Stack(Reader, EncBlocks, 'encoder.', Config,
+        {IsDecoder=}false, Consumed);
+      LoadT5Stack(Reader, DecBlocks, 'decoder.', Config,
+        {IsDecoder=}true, Consumed);
+      LoadLlamaRMSNormWeights(Reader, EncFinalNorm,
+        'encoder.final_layer_norm.weight', Config.DModel);
+      Consumed.Add('encoder.final_layer_norm.weight');
+      LoadLlamaRMSNormWeights(Reader, DecFinalNorm,
+        'decoder.final_layer_norm.weight', Config.DModel);
+      Consumed.Add('decoder.final_layer_norm.weight');
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('T5 import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil; // ownership transferred to the caller
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free; // non-nil only if an exception unwound the build
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildT5FromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TT5Config;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadT5ConfigFromJSONFile(ConfigPath);
+  BuildT5FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly);
+end;
+
+function T5EncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
+var
+  LayerCnt, InputCnt: integer;
+begin
+  Result := nil;
+  InputCnt := 0;
+  for LayerCnt := 0 to DecoderNet.Layers.Count - 1 do
+    if DecoderNet.Layers[LayerCnt] is TNNetInput then
+    begin
+      Inc(InputCnt);
+      if InputCnt = 2 then
+      begin
+        Result := DecoderNet.Layers[LayerCnt];
+        exit;
+      end;
+    end;
+  ImportError('T5EncoderStatesInput: the net has no second TNNetInput - ' +
+    'not a BuildT5FromSafeTensors decoder?');
+end;
+
+procedure RunT5(EncoderNet, DecoderNet: TNNet;
+  EncoderTokens, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
+var
+  EncStates: TNNetLayer;
+begin
+  EncStates := T5EncoderStatesInput(DecoderNet);
+  EncoderNet.Compute(EncoderTokens);
+  if EncoderNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+    ImportError('RunT5: encoder output size ' +
+      IntToStr(EncoderNet.GetLastLayer().Output.Size) +
+      ' does not match the decoder''s encoder-states input size ' +
+      IntToStr(EncStates.Output.Size) + ' (EncSeqLen/d_model mismatch?).');
+  EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
+  DecoderNet.Compute(DecoderTokens);
+  DecoderNet.GetOutput(Logits);
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -5372,6 +6098,15 @@ begin
     // include it (bert/roberta - distilbert has none).
     Result := BuildBertFromSafeTensorsEx(WeightsPath, IgnoredBertConfig,
       pSeqLen, pInferenceOnly, {pIncludePooler=}false, ConfigPath)
+  else if ModelType = 't5' then
+  begin
+    // T5 is an encoder-decoder: the import builds TWO nets, which this
+    // single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "t5" builds an ' +
+      'ENCODER-DECODER pair - call BuildT5FromSafeTensors (returns both ' +
+      'nets; run them with RunT5) instead of this single-net dispatch.');
+  end
   else
   begin
     Result := nil;

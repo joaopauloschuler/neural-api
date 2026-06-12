@@ -61,6 +61,15 @@ type
     procedure AssertSeqClsParityWithFixture(NN: TNNet;
       const LogitsFileName: string; SeqLen: integer; BertStyle: boolean;
       Id2Label: TStringList);
+    // T5 encoder-decoder parity loop: for every fixture row (JSON
+    // {"enc_sequences", "dec_sequences", "enc_hidden", "logits"}) runs the
+    // ENCODER net alone and compares its (EncSeqLen,1,DModel) final hidden
+    // states against "enc_hidden", then runs the full pair through RunT5
+    // and compares the (DecSeqLen,1,Vocab) logits against "logits". Both
+    // gates < 1e-4 (the float64-oracle convention; NEVER loosen past 1e-3).
+    procedure AssertT5ParityWithFixture(EncoderNet, DecoderNet: TNNet;
+      const FixtureFileName: string; EncSeqLen, DecSeqLen, DModel,
+      Vocab: integer);
   published
     procedure TestTokenLayerNormForwardAndSaveLoad;
     procedure TestLearnedPositionalEmbeddingForwardAndSaveLoad;
@@ -108,6 +117,9 @@ type
     procedure TestRobertaConfigFromJSONFile;
     procedure TestRobertaHiddenStateParity;
     procedure TestRobertaPoolerParity;
+    procedure TestT5ConfigFromJSONFile;
+    procedure TestFlanT5Parity;
+    procedure TestT5V10Parity;
     procedure TestBertSeqClsLogitParity;
     procedure TestDistilBertSeqClsLogitParity;
     procedure TestRobertaSeqClsLogitParity;
@@ -2572,13 +2584,13 @@ var
 begin
   RandSeed := 424242;
   ConfigPath := IncludeTrailingPathDelimiter(GetTempDir(false)) +
-    'cai_bfp_t5_config_' + IntToStr(Random(1000000)) + '.json';
+    'cai_bfp_madeup_config_' + IntToStr(Random(1000000)) + '.json';
   ConfigJson := TStringList.Create;
   NN := nil;
   Msg := '';
   Failed := false;
   try
-    ConfigJson.Text := '{"model_type": "t5"}';
+    ConfigJson.Text := '{"model_type": "made_up"}';
     ConfigJson.SaveToFile(ConfigPath);
     try
       NN := BuildFromPretrained(FixturePath('tiny_llama.safetensors'), 0,
@@ -2597,7 +2609,7 @@ begin
   end;
   AssertTrue('unsupported model_type must raise', Failed);
   AssertTrue('error names the offending type: ' + Msg,
-    Pos('"t5"', Msg) > 0);
+    Pos('"made_up"', Msg) > 0);
   AssertTrue('error lists the supported types: ' + Msg,
     (Pos('gpt2', Msg) > 0) and (Pos('gpt_neo', Msg) > 0) and
     (Pos('llama', Msg) > 0) and (Pos('mistral', Msg) > 0) and
@@ -2680,6 +2692,201 @@ end;
 // tests/fixtures/tiny_glove.txt pins 4 GloVe-style lines (no header) of
 // 4-dim vectors - "the", "cat", "dog" plus "zebra", which is NOT in the
 // vocabulary and must be skipped. The vocabulary {cat, dog, fish, the}
+procedure TTestNeuralPretrained.AssertT5ParityWithFixture(EncoderNet,
+  DecoderNet: TNNet; const FixtureFileName: string; EncSeqLen, DecSeqLen,
+  DModel, Vocab: integer);
+var
+  RefRoot: TJSONData;
+  EncSeqs, DecSeqs, EncHidden, LogitsArr: TJSONArray;
+  SeqArr, PosArr, RowArr: TJSONArray;
+  EncInput, DecInput, Logits: TNNetVolume;
+  RefJson: TStringList;
+  SeqCnt, PosCnt, ChCnt: integer;
+  Diff, MaxHiddenDiff, MaxLogitDiff: double;
+begin
+  RefJson := TStringList.Create;
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixtureFileName);
+    RefRoot := GetJSON(RefJson.Text);
+    EncSeqs := TJSONArray(TJSONObject(RefRoot).Find('enc_sequences'));
+    DecSeqs := TJSONArray(TJSONObject(RefRoot).Find('dec_sequences'));
+    EncHidden := TJSONArray(TJSONObject(RefRoot).Find('enc_hidden'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    AssertTrue('enc_sequences present', EncSeqs <> nil);
+    AssertTrue('dec_sequences present', DecSeqs <> nil);
+    AssertTrue('enc_hidden present', EncHidden <> nil);
+    AssertTrue('logits present', LogitsArr <> nil);
+    AssertTrue('at least 2 sequences', EncSeqs.Count >= 2);
+    AssertEquals('row counts match', EncSeqs.Count, DecSeqs.Count);
+    MaxHiddenDiff := 0;
+    MaxLogitDiff := 0;
+    EncInput.ReSize(EncSeqLen, 1, 1);
+    DecInput.ReSize(DecSeqLen, 1, 1);
+    for SeqCnt := 0 to EncSeqs.Count - 1 do
+    begin
+      SeqArr := TJSONArray(EncSeqs.Items[SeqCnt]);
+      AssertEquals('enc sequence length', EncSeqLen, SeqArr.Count);
+      for PosCnt := 0 to EncSeqLen - 1 do
+        EncInput.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+      SeqArr := TJSONArray(DecSeqs.Items[SeqCnt]);
+      AssertEquals('dec sequence length', DecSeqLen, SeqArr.Count);
+      for PosCnt := 0 to DecSeqLen - 1 do
+        DecInput.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+      // Encoder-only parity: final hidden states vs HF
+      // encoder.last_hidden_state (float64 oracle).
+      EncoderNet.Compute(EncInput);
+      AssertEquals('encoder output size', EncSeqLen * DModel,
+        EncoderNet.GetLastLayer().Output.Size);
+      PosArr := TJSONArray(EncHidden.Items[SeqCnt]);
+      for PosCnt := 0 to EncSeqLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChCnt := 0 to DModel - 1 do
+        begin
+          Diff := Abs(EncoderNet.GetLastLayer().Output.FData[
+            PosCnt * DModel + ChCnt] - RowArr.Items[ChCnt].AsFloat);
+          if Diff > MaxHiddenDiff then MaxHiddenDiff := Diff;
+        end;
+      end;
+      // Full encoder-decoder parity through RunT5 (recomputes the encoder
+      // and feeds its output into the decoder's second input).
+      RunT5(EncoderNet, DecoderNet, EncInput, DecInput, Logits);
+      AssertEquals('logits size', DecSeqLen * Vocab, Logits.Size);
+      PosArr := TJSONArray(LogitsArr.Items[SeqCnt]);
+      for PosCnt := 0 to DecSeqLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChCnt := 0 to Vocab - 1 do
+        begin
+          Diff := Abs(Logits.FData[PosCnt * Vocab + ChCnt] -
+            RowArr.Items[ChCnt].AsFloat);
+          if Diff > MaxLogitDiff then MaxLogitDiff := Diff;
+        end;
+      end;
+    end;
+    // f32 end-to-end vs the float64 oracle on f32-rounded weights. NEVER
+    // loosen the gates past 1e-3 - fix the model, don't widen tolerance.
+    AssertTrue('T5 encoder hidden-state parity vs ' + FixtureFileName +
+      ': max |diff| = ' + FloatToStr(MaxHiddenDiff) + ' must be < 1e-4',
+      MaxHiddenDiff < 1e-4);
+    AssertTrue('T5 logit parity vs ' + FixtureFileName +
+      ': max |diff| = ' + FloatToStr(MaxLogitDiff) + ' must be < 1e-4',
+      MaxLogitDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    DecInput.Free;
+    EncInput.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Verifies ReadT5ConfigFromJSONFile on the committed Flan-T5 pico config
+// (gated-gelu + untied) and the v1.0 config (relu + tied via the HF
+// DEFAULT - the fixture file pins tie_word_embeddings explicitly), plus
+// the BuildFromPretrained "t5" rejection (an encoder-decoder cannot come
+// back as one net; the error must point at BuildT5FromSafeTensors).
+procedure TTestNeuralPretrained.TestT5ConfigFromJSONFile;
+var
+  Config: TT5Config;
+begin
+  RandSeed := 424242;
+  Config := ReadT5ConfigFromJSONFile(FixturePath('tiny_flan_t5_config.json'));
+  AssertEquals('model_type', 't5', Config.ModelType);
+  AssertEquals('d_model', 8, Config.DModel);
+  AssertEquals('d_kv (decoupled)', 3, Config.DKV);
+  AssertEquals('d_ff', 16, Config.DFF);
+  AssertEquals('enc layers', 2, Config.NumLayers);
+  AssertEquals('dec layers', 2, Config.NumDecoderLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('vocab', 13, Config.VocabSize);
+  AssertEquals('rel buckets', 8, Config.RelPosNumBuckets);
+  AssertEquals('rel max distance', 8, Config.RelPosMaxDistance);
+  AssertEquals('ln eps', 1e-6, Config.LayerNormEps, 1e-12);
+  AssertTrue('flan: gated ffn', Config.GatedFFN);
+  AssertFalse('flan: untied', Config.TieWordEmbeddings);
+  Config := ReadT5ConfigFromJSONFile(FixturePath('tiny_t5v10_config.json'));
+  AssertFalse('v1.0: relu ffn', Config.GatedFFN);
+  AssertTrue('v1.0: tied', Config.TieWordEmbeddings);
+  try
+    BuildFromPretrained(FixturePath('tiny_flan_t5.safetensors'),
+      {SeqLen=}0, {pInferenceOnly=}false,
+      FixturePath('tiny_flan_t5_config.json'));
+    Fail('BuildFromPretrained must reject model_type "t5"');
+  except
+    on E: EPretrainedImportError do
+      AssertTrue('t5 rejection must point at BuildT5FromSafeTensors, got: '
+        + E.Message, Pos('BuildT5FromSafeTensors', E.Message) > 0);
+  end;
+end;
+
+// Verifies the Flan-T5 / T5-v1.1 import target - the FIRST encoder-decoder
+// parity test: tests/fixtures/tiny_flan_t5.* is a pico randomly-initialized
+// HF T5ForConditionalGeneration (2+2 layers, 2 heads, DECOUPLED d_kv=3 so
+// inner_dim 6 != d_model 8, vocab 13, gated-GELU FFN, UNTIED lm_head,
+// relative_attention_num_buckets=8 / max_distance=8 so the EncSeqLen=10
+// inputs exercise the exact, logarithmic AND clamped relpos buckets in
+// both the encoder's bidirectional and the decoder's causal scheme).
+// The generator tools/t5_tiny_fixture.py asserts every quirk moves the
+// oracle: zeroed relpos tables (6.07), swapped gelu_new->erf (1.4e-3 -
+// above the 1e-4 gate, so the wrong GELU FAILS), encoder ids reaching the
+// logits through cross-attention (3.19) and decoder causality. Reference
+// encoder hidden states + logits come from HF transformers in float64.
+procedure TTestNeuralPretrained.TestFlanT5Parity;
+var
+  Enc, Dec: TNNet;
+  Config: TT5Config;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_flan_t5.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_flan_t5_config.json'));
+  try
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    // The decoder must expose its second (encoder-states) input.
+    AssertTrue('decoder second input is TNNetInput',
+      T5EncoderStatesInput(Dec) is TNNetInput);
+    AssertEquals('encoder-states input size', 10 * Config.DModel,
+      T5EncoderStatesInput(Dec).Output.Size);
+    AssertT5ParityWithFixture(Enc, Dec,
+      FixturePath('tiny_flan_t5_logits.json'), 10, 6, Config.DModel,
+      Config.VocabSize);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Verifies the ORIGINAL T5 v1.0 recipe on the same pico shape: plain-ReLU
+// FFN (single wi) and the TIED lm_head with the d_model^-0.5 decoder
+// output scaling folded into the copied head rows (the generator asserts
+// dropping the scale moves the logits by 4.76 - a no-scale import FAILS).
+procedure TTestNeuralPretrained.TestT5V10Parity;
+var
+  Enc, Dec: TNNet;
+  Config: TT5Config;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  try
+    AssertFalse('v1.0 relu ffn', Config.GatedFFN);
+    AssertTrue('v1.0 tied head', Config.TieWordEmbeddings);
+    AssertT5ParityWithFixture(Enc, Dec,
+      FixturePath('tiny_t5v10_logits.json'), 10, 6, Config.DModel,
+      Config.VocabSize);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
 // (sorted: cat=0, dog=1, fish=2, the=3) covers the round-trip (matched
 // rows load EXACTLY), the mean-init miss ("fish" gets the mean of the 3
 // matched vectors - all values dyadic, so f32-exact), the optional
