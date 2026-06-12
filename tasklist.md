@@ -118,44 +118,6 @@ rather than acted on.
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
       Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
       punctuation class of the GPT-2 regex).
-- [X] `Split`-regex + `Metaspace` pre_tokenizer support in
-      (DONE: AddPreTokenizer now accepts Metaspace — replacement /
-      prepend_scheme always|first|never / legacy add_prefix_space / split,
-      routed onto the metaspace BPE machinery with HF first-segment-only
-      prepend semantics — and Split, matching the shipped pattern VERBATIM
-      against the Qwen2 (\p{N}) and Llama-3/cl100k (\p{N}{1,3}) literals
-      and dispatching to a hand-written SplitCl100kPieces ordered-
-      alternation splitter (case-insensitive contractions, optional
-      non-letter lead char, capped digit runs, punct+[\r\n]*, \s*[\r\n]+,
-      \s+(?!\S) trailing-space rule); unknown patterns/behaviors still
-      raise EHFTokenizerError. Metaspace decoder branch maps onto
-      Replace(▁→' ')+strip-left. 3 new tiny fixtures + parity batteries
-      (tools/hf_pretok_fixture.py, exact id+decode parity vs HF tokenizers
-      0.22) + unknown-pattern rejection test in
-      tests/TestNeuralHFTokenizer.pas.)
-      neural/neuralhftokenizer.pas: AddPreTokenizer hard-rejects every type
-      except Sequence/ByteLevel/BertPreTokenizer, so the tokenizer.json
-      shipped with the ALREADY-IMPORTABLE Llama-family checkpoints fails to
-      load — Qwen2/Qwen3 and Llama-3-style tokenizers use
-      Sequence[Split(pattern=cl100k-style regex, behavior=isolated),
-      ByteLevel(use_regex=false)], and Llama-2/Mistral-v0.1
-      SentencePiece-BPE tokenizers use Metaspace (U+2581 prefix-space
-      replacement). Net effect: BuildQwen2/BuildMistralFromSafeTensors load
-      weights that nothing in the repo can tokenize for end-to-end. v1:
-      (a) Metaspace — space→▁ replacement with prepend/add_prefix_space
-      handling plus the matching Metaspace decoder branch; (b) Split —
-      interpret the shipped pattern against the handful of regex idioms
-      these tokenizers actually use rather than vendoring a full regex
-      engine (SplitGPT2 already implements the contraction/\p{L}/\p{N}
-      machinery; generalize for the cl100k deltas: case-insensitive
-      contractions, \p{N}{1,3} digit-run capping, optional non-letter
-      leading char), rejecting genuinely unknown patterns loudly as today.
-      Test: per-family parity fixtures (tiny tokenizer.json + reference
-      token ids from transformers AutoTokenizer covering numbers,
-      punctuation, CJK, newlines, leading spaces), same pattern as the
-      existing GPT-2/BERT tokenizer tests. Distinct from the
-      Unigram/.model-protobuf follow-ups task above: these checkpoints DO
-      ship a tokenizer.json — only the pre_tokenizer kind is unsupported.
 - [ ] neuralhftokenizer.pas pre_tokenizer leftovers from the Split/Metaspace
       batch: (a) a STANDALONE ByteLevel pre_tokenizer with use_regex=false
       silently applies the GPT-2 regex anyway (the flag is only honored
@@ -270,10 +232,12 @@ rather than acted on.
       de-facto checkpoint format, and it ships PRE-quantized weights —
       dovetails with the int8 quantized-inference task (read Q8_0 blocks
       directly instead of quantizing FP32 yourself).
-- [ ] Magnitude pruning (torch.nn.utils.prune port): global or per-layer
-      magnitude masks with a sparsity report (the introspection-report
-      pattern covers the diagnostics half); optional fine-tune-after-prune
-      example showing accuracy recovery.
+- [ ] Magnitude pruning (torch.nn.utils.prune port): PERSISTENT global or
+      per-layer magnitude masks applied during training/inference — the
+      diagnostics half is landed (TNNet.MagnitudePruningReport +
+      examples/MagnitudePruning prune-and-restore sweep); still open are
+      masks that stay applied (instead of restoring weights after the
+      sweep) and a fine-tune-after-prune example showing accuracy recovery.
 - [ ] Anomaly detection mode (autograd.set_detect_anomaly port): a debug
       flag that checks every layer's Output/OutputError for NaN/Inf during
       forward AND backward and names the FIRST offending layer + phase.
@@ -328,7 +292,9 @@ rather than acted on.
 - [ ] Seq2seq (encoder-decoder) generation harness in
       neural/neuraldecode.pas: every decode path today is decoder-only.
       TNNetCrossAttention and TNNetCrossWKV (asymmetric mode) already exist
-      as layers — add a T5/BART-style loop that encodes the source ONCE,
+      as layers, and the landed T5 importer (BuildT5FromSafeTensors)
+      returns the encoder + two-input decoder net pair with a single-pass
+      RunT5 helper — add a T5/BART-style loop that encodes the source ONCE,
       caches the encoder output, feeds it as the K|V side of the cross
       layers, and autoregresses the target with the usual greedy/beam/sample
       machinery. Unlocks translation/summarization examples that the landed
@@ -411,33 +377,6 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [X] PyTorch pytorch_model.bin loader: a RESTRICTED unpickler for the
-      torch.save zip format — the long tail of older/fine-tuned checkpoints
-      never got converted to safetensors. State_dicts use a small pickle
-      subset (a dozen opcodes + persistent-id storage references into the
-      zip's per-tensor data files); implement exactly that whitelist and
-      reject everything else by design, which makes the Pascal loader
-      immune to the arbitrary-code-execution hazard that motivated
-      safetensors. Expose the same named-tensor API as
-      TNNetSafeTensorsReader so the GPT-2/Llama builders take either
-      format. Test: torch.save a pico state_dict in Python, assert every
-      tensor matches its safetensors twin bit-for-bit. Concrete consumers
-      verified 2026-06-12: cerebras/Cerebras-GPT-* and the
-      roneneldan/TinyStories-* checkpoints ship pytorch_model.bin ONLY
-      (the Cerebras parity work converted via Python as a stopgap).
-      DONE 2026-06-12: TNNetTorchBinReader in neural/neuraltorchbin.pas —
-      own zip central-directory parser (incl. zip64, STORED entries read
-      at absolute offsets) + restricted protocol-2 unpickler (whitelisted
-      GLOBALs: collections OrderedDict, torch._utils
-      _rebuild_tensor_v2/_rebuild_parameter, torch *Storage dtypes; any
-      other GLOBAL/opcode/REDUCE hard-fails, e.g. the fixture's `posix
-      system` payload). Subclasses TNNetSafeTensorsReader and fills the
-      same tensor table, so EVERY importer takes .bin transparently via
-      CreatePretrainedTensorReader extension dispatch (all 7 Build*
-      families + BuildFromPretrained directory probe of
-      pytorch_model.bin). Tests: bit-for-bit twin parity
-      (tools/torch_bin_fixture.py f32/f16/bf16/i64 + 3-D + scalar),
-      malicious-pickle rejection, GPT-2 logit parity through tiny_gpt2.bin.
 - [ ] Sharded pytorch_model.bin checkpoints: support
       pytorch_model.bin.index.json (same weight_map shape as the landed
       safetensors index) by opening every referenced .bin shard behind the
@@ -447,21 +386,12 @@ rather than acted on.
       the pre-torch-1.6 non-zip legacy format, DEFLATE-compressed zip
       entries, and non-contiguous (stride-permuted) state_dict tensors —
       all currently rejected with descriptive ETorchBinError messages.
-- [ ] T5/Flan-T5 (encoder-decoder) importer: the natural companion to the
-      seq2seq generation harness task above. T5's relative-position bias
-      buckets are landed (TNNetT5RelPosBiasAttention / avT5RelPosBias), and
-      RMSNorm-style scale-only norm and gated FFN map onto landed blocks, so
-      the work is the importer weight mapping (bias shared across layers,
-      separate enc/dec). Flan-T5-small is 80M params — genuinely CPU-friendly and
-      instruction-tuned, so it doubles as the first imported model the
-      BLEU/ROUGE metrics can score out of the box. Same HF-parity fixture
-      verification as GPT-2/Llama.
 - [ ] Marian / OPUS-MT translation importer (Helsinki-NLP/opus-mt-en-de
       etc., ~77M params per language pair, 1000+ published pairs — the
       de-facto open machine-translation checkpoints and the first
       DEDICATED-translation family; MT is a headline NLP capability the
       repo has zero coverage of today). Architecturally distinct from the
-      in-flight T5 importer, not a re-skin: POST-norm encoder-decoder
+      landed T5 importer, not a re-skin: POST-norm encoder-decoder
       blocks (norm after the residual add, vs T5's pre-RMSNorm), STATIC
       sinusoidal positions (TNNetSinusoidalPositionalEmbedding is landed;
       no learned/relative positions), swish/SiLU FFN, plain biased
@@ -483,24 +413,6 @@ rather than acted on.
       generation-harness task, and the first checkpoint the landed
       CorpusBLEU can score on REAL translation; headline demo once the
       tokenizer lands: examples/TranslateOffline EN→DE on CPU.
-- [X] DistilBERT / RoBERTa ForSequenceClassification head deltas: the
-      landed BuildBertForSequenceClassificationFromSafeTensors (4f0e2c1)
-      explicitly rejects non-bfBert families because their classifier
-      stacks differ — DistilBERT uses pre_classifier dense + ReLU on the
-      [CLS] hidden (no pooler), RoBERTa uses classifier.dense + tanh +
-      classifier.out_proj on the <s> token (also no pooler). Both trunks
-      are already landed as deltas on the BERT encoder builder, so each is
-      a small head-mapping case on the same pSeqClsHead option. Same
-      fixture/parity-test pattern as tiny_bert_seqcls (id2label included).
-      DONE: pSeqClsHead now maps the family-specific head (bert keeps the
-      forced pooler; distilbert = pre_classifier+ReLU+classifier; roberta
-      = classifier.dense+tanh+classifier.out_proj, no pooler in either);
-      BuildFromPretrained dispatches DistilBert/Roberta-
-      ForSequenceClassification architectures. Fixtures
-      tiny_{distilbert,roberta}_seqcls (tools/*_seqcls_tiny_fixture.py,
-      self-checked oracle paths: ReLU clips / tanh bends / offset
-      positions) + parity tests TestDistilBertSeqClsLogitParity,
-      TestRobertaSeqClsLogitParity + both dispatch routes.
 - [ ] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate
@@ -519,30 +431,6 @@ rather than acted on.
       easier first Pascal→Python round-trip than the listed safetensors
       writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
-- [X] Gemma 1 - GeGLU FFN wiring: DONE 2026-06-12 — no new layer: the
-      existing TNNetGEGLU (A * tanh-GELU(B), same up|gate half packing as
-      TNNetSwiGLU) is selected by the new TLlamaConfig.GegluFFN flag in
-      BuildLlamaFromSafeTensorsWithConfig; the config reader raises it for
-      model_type "gemma" and accepts gelu / gelu_new / gelu_pytorch_tanh
-      (legacy "gelu" maps to the tanh approx, matching transformers'
-      Gemma special-case). Tested via the tiny_gemma parity fixture, whose
-      generator amplifies the gate pre-activations and asserts GeGLU-vs-SiLU
-      moves the logits ~2.6e-3 (above the 1e-4 parity gate), plus a
-      structural TNNetGEGLU-present assert in TestGemmaLogitParity.
-- [X] Gemma 1 - BuildGemmaFromSafeTensors importer: DONE 2026-06-12 —
-      BuildGemmaFromSafeTensors(Ex) wrappers on the Llama path
-      (model_type "gemma" in the config reader + BuildFromPretrained
-      dispatch). Load-time deltas exactly as planned: (a) sqrt(d_model)
-      folded into the embedding ROWS only (TLlamaConfig.EmbedScale; the
-      tied LM head keeps the unscaled rows — Gemma always ties, reader
-      default flipped for gemma); (b) zero-centered RMSNorm via
-      LoadLlamaRMSNormWeights' new GainOffset=1 (stores 1+w, zero layer
-      changes; TLlamaConfig.RMSNormAddOne); (c) MQA (KVHeads=1) and
-      Gemma-7B's decoupled head_dim ride the landed paths. Verified by
-      tools/gemma_tiny_fixture.py (pico GemmaForCausalLM: MQA, decoupled
-      head_dim=6, tied head, re-randomized norm gains) +
-      TestGemmaLogitParity (direct builder + BuildFromPretrained routes,
-      float64 HF oracle, <1e-4 logit parity).
 - [ ] Gemma 2 - SDPA attention-logit soft-cap hook: the one real LAYER
       change in the Gemma track — Gemma-2 applies cap*tanh(scores/cap)
       (cap 50) to attention logits PRE-softmax, but scores live inside
@@ -650,9 +538,9 @@ rather than acted on.
       sentence-embedding heads as the landed BERT importer. Parity fixture vs
       ModernBertModel hidden states.
 - [ ] Whisper-tiny importer (openai/whisper-tiny, 39M) — the FIRST speech
-      model and the first real ENCODER-DECODER checkpoint import (the T5
-      task above is text-to-text; this one exercises cross-attention from
-      a non-text modality). Every hard ingredient is already landed:
+      model import (the landed T5 importer is text-to-text; this one
+      exercises cross-attention from a non-text modality). Every hard
+      ingredient is already landed:
       TNNetCrossAttention asymmetric mode (QSeqLen != KVSeqLen) for the
       decoder reading the 1500-frame encoder output, the GPT-2 byte-level
       BPE tokenizer.json path for Whisper's vocabulary, and FFT machinery
