@@ -102,6 +102,7 @@ type
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestRWKVLogitParity;
+    procedure TestMambaLogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
     procedure TestGPTNeoXConfigFromJSONFile;
@@ -1903,6 +1904,97 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_rwkv_logits.json'), 8, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Mamba import target - the suite's SECOND NON-TRANSFORMER
+// importer (HF model_type "mamba", architectures ["MambaForCausalLM"], the
+// state-spaces/mamba-130m-hf family): tests/fixtures/tiny_mamba.* is a pico
+// randomly-initialized HF MambaForCausalLM (2 layers, hidden 8, d_inner 16,
+// d_state 4, dt_rank 2, conv_kernel 4, vocab 13, tied head). The generator
+// tools/mamba_tiny_fixture.py ASSERTS each quirk is non-vacuous by re-running
+// the float64 slow-path oracle with that single quirk disabled (max logit
+// |diff|s: d_state>1 15.3, conv bias 5.3, dt bias 2.6, dt softplus 12.4,
+// D skip 2.8, SiLU(z) gate 11.8 - all far above the 1e-4 parity gate, so a
+// missing or misconverted piece FAILS this test):
+// (a) the A_log convention: A_raw = A_log copied RAW (the layer's
+//     a = exp(-delta*exp(A_raw)) IS HF's abar = exp(delta*(-exp(A_log))) -
+//     the generator asserts the formulas agree bit-tight);
+// (b) the LOW-RANK delta path folded exactly: W_d = dt_proj.weight @
+//     x_proj.weight[0:dt_rank] (double accumulation) + dt_proj.bias -> b_d,
+//     delta = softplus(.);
+// (c) d_state = 4 > 1 states per channel with B_t/C_t SHARED across
+//     channels (x_proj rows [dt_rank | d_state | d_state]);
+// (d) depthwise CAUSAL conv1d WITH bias + SiLU before the scan, the D skip
+//     and the SiLU(z) gate from the in_proj x|z split;
+// (e) per-token RMSNorms (norm/norm_f, gain only), bias-free
+//     in_proj/out_proj (use_bias false) and the TIED lm_head (no
+//     lm_head.weight tensor in the checkpoint).
+// Reference logits come from HF transformers' CPU slow_forward in float64.
+// The BuildFromPretrained model_type "mamba" dispatch route is covered too.
+procedure TTestNeuralPretrained.TestMambaLogitParity;
+var
+  NN: TNNet;
+  Config: TMambaConfig;
+  LayerCnt, ScanCnt, ConvCnt, SiLUCnt, NormCnt, SplitCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildMambaFromSafeTensorsEx(FixturePath('tiny_mamba.safetensors'),
+    Config, {SeqLen=}8, {pInferenceOnly=}false,
+    FixturePath('tiny_mamba_config.json'));
+  try
+    AssertEquals('model_type', 'mamba', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('hidden', 8, Config.HiddenSize);
+    AssertEquals('d_inner (expand*hidden)', 16, Config.DInner);
+    AssertEquals('d_state', 4, Config.StateSize);
+    AssertEquals('dt_rank', 2, Config.TimeStepRank);
+    AssertEquals('conv_kernel', 4, Config.ConvKernel);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('layer_norm_epsilon', 1e-5, Config.LayerNormEps, 1e-9);
+    AssertTrue('use_conv_bias', Config.UseConvBias);
+    AssertFalse('use_bias (in/out_proj)', Config.UseBias);
+    AssertTrue('tied head', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'backbone.', Config.Prefix);
+    // Structure: one TNNetSelectiveSSM scan + one depthwise causal conv +
+    // two SiLUs (conv path + z gate) + two TNNetSplitChannels (x|z) per
+    // block; per-token RMSNorms = 1 per block + the final norm_f = 3. And
+    // NOT A SINGLE attention layer - constant-memory decode by design.
+    ScanCnt := 0;
+    ConvCnt := 0;
+    SiLUCnt := 0;
+    NormCnt := 0;
+    SplitCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetSelectiveSSM then Inc(ScanCnt);
+      if NN.Layers[LayerCnt] is TNNetDepthwiseConv1D then Inc(ConvCnt);
+      if NN.Layers[LayerCnt] is TNNetSiLU then Inc(SiLUCnt);
+      if NN.Layers[LayerCnt] is TNNetTokenRMSNorm then Inc(NormCnt);
+      if NN.Layers[LayerCnt] is TNNetSplitChannels then Inc(SplitCnt);
+      AssertFalse('no attention layer in a Mamba net',
+        NN.Layers[LayerCnt] is TNNetScaledDotProductAttention);
+    end;
+    AssertEquals('TNNetSelectiveSSM count (1 per block)', 2, ScanCnt);
+    AssertEquals('TNNetDepthwiseConv1D count (1 per block)', 2, ConvCnt);
+    AssertEquals('TNNetSiLU count (2 per block)', 4, SiLUCnt);
+    AssertEquals('per-token RMSNorm count (1/block + norm_f)', 3, NormCnt);
+    AssertEquals('TNNetSplitChannels count (x|z per block)', 4, SplitCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_mamba_logits.json'), 8, Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "mamba" (architectures ["MambaForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_mamba.safetensors'),
+    {SeqLen=}8, {pInferenceOnly=}false,
+    FixturePath('tiny_mamba_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_mamba_logits.json'), 8, 13);
   finally
     NN.Free;
   end;

@@ -74,6 +74,13 @@ unit neuralpretrained;
 //     decode memory and no KV cache - token-shift lerps, squared-ReLU
 //     channel mix, biased LayerNorms incl. the block-0 pre_ln, and the
 //     exp/softplus decay-convention bridge. See the RWKV-4 IMPORT section.
+//   - Mamba (model_type "mamba": state-spaces/mamba-130m-hf and siblings)
+//     - BuildMambaFromSafeTensors, the SECOND NON-TRANSFORMER import: a
+//     selective-SSM (S6) mixer (TNNetSelectiveSSM with d_state states per
+//     channel) with constant decode memory and no KV cache - depthwise
+//     causal conv1d + SiLU, the low-rank dt_proj folded into the scan's
+//     delta projection, A_raw = A_log raw (identical discretizations),
+//     SiLU(z) gating and per-token RMSNorms. See the MAMBA IMPORT section.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -1379,6 +1386,92 @@ function BuildRWKVFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
 
+// ============================ MAMBA IMPORT =================================
+// Mamba (model_type "mamba": state-spaces/mamba-130m-hf and siblings,
+// architectures ["MambaForCausalLM"]) - the SECOND NON-TRANSFORMER importer
+// after RWKV-4: a selective-SSM (S6, Gu & Dao 2023) mixer that decodes with
+// CONSTANT memory (a (d_inner, d_state) recurrent state per block, no KV
+// cache). Rebuilt from existing CAI layers:
+//
+//   Input(SeqLen) -> TNNetEmbedding (backbone.embeddings)
+//     -> num_hidden_layers x [ x := x + Mixer(TokenRMSNorm(x)) ]
+//     -> TNNetTokenRMSNorm (backbone.norm_f)
+//     -> TNNetPointwiseConvLinear(vocab) LM head (tied to the embedding
+//        rows when lm_head.weight is absent - the published checkpoints)
+//
+// Per mixer (HF MambaMixer slow path, d_inner = expand * hidden_size):
+//   x|z   = split(in_proj(h))                  [2*d_inner; x first]
+//   x     = SiLU(causal depthwise conv1d_k(x)) [k = conv_kernel, with bias]
+//   y     = SelectiveScan(x)                   [TNNetSelectiveSSM(d_state)]
+//   out   = out_proj( y (*) SiLU(z) )
+// The scan leaf owns its delta/B/C projections, so the checkpoint maps:
+//   - W_d (Neurons[0]) <- dt_proj.weight @ x_proj.weight[0:dt_rank] - the
+//     LOW-RANK delta path folded EXACTLY into one d_inner x d_inner matrix
+//     (double accumulation; mathematically identical, dt_rank =
+//     time_step_rank, "auto" = ceil(hidden_size/16));
+//   - W_B/W_C (Neurons[1]/[2]) <- x_proj.weight rows [dt_rank | d_state |
+//     d_state] (B_t/C_t in R^d_state SHARED across channels);
+//   - b_d (Neurons[3]) <- dt_proj.bias (delta = softplus(W_d.x + b_d));
+//   - A_raw (Neurons[4]) <- A_log RAW: HF discretizes abar = exp(delta*A)
+//     with A = -exp(A_log) and the layer computes a = exp(-delta*
+//     exp(A_raw)) - the SAME formula, no convention bridge needed (the
+//     fixture generator asserts this bit-tight);
+//   - e (Neurons[5]) <- D (the y += D*x skip).
+// Tensor names: backbone.embeddings.weight, backbone.layers.N.norm.weight,
+// backbone.layers.N.mixer.{A_log, D, conv1d.weight, conv1d.bias,
+// in_proj.weight, x_proj.weight, dt_proj.weight, dt_proj.bias,
+// out_proj.weight}, backbone.norm_f.weight (+ in_proj.bias/out_proj.bias
+// when use_bias, lm_head.weight when untied). BuildFromPretrained
+// dispatches model_type "mamba" here. Mamba has NO positional limit (and
+// no context_length config field): pSeqLen <= 0 defaults to 1024.
+
+type
+  TMambaConfig = record
+    HiddenSize: integer;          // hidden_size (d_model)
+    NumLayers: integer;           // num_hidden_layers
+    StateSize: integer;           // state_size (d_state, default 16)
+    TimeStepRank: integer;        // time_step_rank ("auto" = ceil(hidden/16))
+    VocabSize: integer;           // vocab_size
+    Expand: integer;              // expand (default 2)
+    DInner: integer;              // intermediate_size (default expand*hidden)
+    ConvKernel: integer;          // conv_kernel (default 4)
+    UseConvBias: boolean;         // use_conv_bias (default true)
+    UseBias: boolean;             // use_bias - in/out_proj (default false)
+    LayerNormEps: double;         // layer_norm_epsilon (default 1e-5)
+    TieWordEmbeddings: boolean;   // tie_word_embeddings (default true)
+    ModelType: string;            // 'mamba'
+    Prefix: string;               // 'backbone.' or '' (detected from the file)
+  end;
+
+// Reads a HF Mamba config.json (model_type "mamba"). Required: hidden_size,
+// num_hidden_layers, vocab_size. Defaults follow MambaConfig: state_size =
+// 16, time_step_rank = "auto" = ceil(hidden_size/16), expand = 2,
+// intermediate_size = expand*hidden_size, conv_kernel = 4, use_conv_bias
+// true, use_bias false, layer_norm_epsilon = 1e-5, tie_word_embeddings true.
+function ReadMambaConfigFromJSONFile(const FileName: string): TMambaConfig;
+
+function MambaConfigToString(const Config: TMambaConfig): string;
+
+// Builds the Mamba causal-LM net described by Config ((SeqLen,1,1) token
+// ids in, (SeqLen,1,vocab) logits out, like the decoder families) and loads
+// every weight from the checkpoint at FileName (see the MAMBA IMPORT
+// section above). pSeqLen <= 0 uses 1024 (Mamba has no positional limit).
+// pInferenceOnly = True frees training volumes during construction.
+function BuildMambaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildMambaFromSafeTensorsEx(const FileName: string;
+  out Config: TMambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildMambaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -1387,8 +1480,8 @@ function BuildRWKVFromSafeTensors(const FileName: string;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, rwkv, bert,
-// distilbert, roberta. Anything else
+// gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, rwkv, mamba,
+// bert, distilbert, roberta. Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
 // choice. OUTPUT SEMANTICS DIFFER BY model_type: the decoder families
@@ -7327,6 +7420,459 @@ begin
     pInferenceOnly, ConfigFileName);
 end;
 
+function ReadMambaConfigFromJSONFile(const FileName: string): TMambaConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+  Field: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Mamba import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Mamba import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Mamba import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Mamba import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Mamba import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'mamba');
+    if ModelType <> 'mamba' then
+      ImportError('Mamba import: config model_type is "' + ModelType +
+        '" - expected "mamba" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.StateSize := Obj.Get('state_size', 16);
+    if Result.StateSize < 1 then
+      ImportError('Mamba import: config state_size must be >= 1, got ' +
+        IntToStr(Result.StateSize) + '.');
+    // time_step_rank is "auto" (= ceil(hidden_size/16), the HF default and
+    // the published-checkpoint value) or an explicit integer.
+    Field := Obj.Find('time_step_rank');
+    if (Field = nil) or Field.IsNull or
+       ((Field is TJSONString) and (Field.AsString = 'auto')) then
+      Result.TimeStepRank := (Result.HiddenSize + 15) div 16
+    else
+      Result.TimeStepRank := RequiredInt('time_step_rank');
+    Result.Expand := Obj.Get('expand', 2);
+    if Result.Expand < 1 then
+      ImportError('Mamba import: config expand must be >= 1, got ' +
+        IntToStr(Result.Expand) + '.');
+    // intermediate_size (= d_inner) is derived in MambaConfig; honor an
+    // explicit value when present.
+    Field := Obj.Find('intermediate_size');
+    if (Field = nil) or Field.IsNull then
+      Result.DInner := Result.Expand * Result.HiddenSize
+    else
+      Result.DInner := RequiredInt('intermediate_size');
+    Result.ConvKernel := Obj.Get('conv_kernel', 4);
+    if Result.ConvKernel < 1 then
+      ImportError('Mamba import: config conv_kernel must be >= 1, got ' +
+        IntToStr(Result.ConvKernel) + '.');
+    Result.UseConvBias := Obj.Get('use_conv_bias', True);
+    Result.UseBias := Obj.Get('use_bias', False);
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MambaConfigToString(const Config: TMambaConfig): string;
+begin
+  Result := 'mamba config: layers=' + IntToStr(Config.NumLayers) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', d_inner=' + IntToStr(Config.DInner) +
+    ', d_state=' + IntToStr(Config.StateSize) +
+    ', dt_rank=' + IntToStr(Config.TimeStepRank) +
+    ', conv_kernel=' + IntToStr(Config.ConvKernel) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', conv_bias=' + BoolToStr(Config.UseConvBias, true) +
+    ', bias=' + BoolToStr(Config.UseBias, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TMambaBlockLayers = record
+    Norm, InProj, Conv, Scan, OutProj: TNNetLayer;
+  end;
+
+function BuildMambaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TMambaBlockLayers;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, ScanL, ZGate, Gated: TNNetLayer;
+  BlockCnt, SeqLen, i, j: integer;
+  Tmp: TNNetVolume;
+  MixPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+  ConvBiasSuppress: integer;
+  InBias, OutBias: string;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  procedure RequireShape2(const TName: string; Rows, Cols: integer);
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('Mamba import: missing tensor "' + TName + '" in ' +
+        Reader.FileName);
+    if (Reader.DimCount(TName) <> 2) or
+       (Reader.DimSize(TName, 0) <> Rows) or
+       (Reader.DimSize(TName, 1) <> Cols) then
+      ImportError('Mamba import: "' + TName + '" must have shape [' +
+        IntToStr(Rows) + ', ' + IntToStr(Cols) + '], got ' +
+        Reader.ShapeAsString(TName));
+  end;
+
+  // Loads a per-channel vector tensor into neuron NeuronIdx of Layer.
+  procedure LoadChannelVector(Layer: TNNetLayer; NeuronIdx: integer;
+    const TName: string; Channels: integer);
+  var
+    d: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('Mamba import: missing tensor "' + TName + '" in ' +
+        Reader.FileName);
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Tmp.Size <> Channels then
+      ImportError('Mamba import: "' + TName + '" must carry ' +
+        IntToStr(Channels) + ' elements, got ' +
+        Reader.ShapeAsString(TName));
+    for d := 0 to Channels - 1 do
+      Layer.Neurons[NeuronIdx].Weights.FData[d] := Tmp.FData[d];
+    Layer.FlushWeightCache();
+    MarkConsumed(TName);
+  end;
+
+  // conv1d.weight [d_inner, 1, k] (depthwise: one k-tap filter per
+  // channel) + optional conv1d.bias [d_inner] into TNNetDepthwiseConv1D.
+  // Tap order maps DIRECTLY: HF pads k-1 zeros on the left and truncates
+  // to seq_len, so output[t] = sum_kk w[kk]*x[t-(k-1)+kk] - exactly the
+  // layer's causal read.
+  procedure LoadDepthwiseConv(Layer: TNNetLayer; const WName, BName: string);
+  var
+    d, kk: integer;
+  begin
+    if not Reader.HasTensor(WName) then
+      ImportError('Mamba import: missing tensor "' + WName + '" in ' +
+        Reader.FileName);
+    if (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> Config.DInner) or
+       (Reader.DimSize(WName, 1) <> 1) or
+       (Reader.DimSize(WName, 2) <> Config.ConvKernel) then
+      ImportError('Mamba import: "' + WName + '" must have shape [' +
+        IntToStr(Config.DInner) + ', 1, ' + IntToStr(Config.ConvKernel) +
+        '], got ' + Reader.ShapeAsString(WName));
+    Reader.LoadTensorFlat(WName, Tmp);
+    for d := 0 to Config.DInner - 1 do
+      for kk := 0 to Config.ConvKernel - 1 do
+        Layer.Neurons[d].Weights.FData[kk] :=
+          Tmp.FData[d * Config.ConvKernel + kk];
+    MarkConsumed(WName);
+    if Config.UseConvBias then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('Mamba import: config says use_conv_bias=true but "' +
+          BName + '" is missing from ' + Reader.FileName + '.');
+      Reader.LoadTensorFlat(BName, Tmp);
+      if Tmp.Size <> Config.DInner then
+        ImportError('Mamba import: "' + BName + '" must carry ' +
+          IntToStr(Config.DInner) + ' elements, got ' +
+          Reader.ShapeAsString(BName));
+      for d := 0 to Config.DInner - 1 do
+        Layer.Neurons[d].BiasWeight := Tmp.FData[d];
+      MarkConsumed(BName);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+  // The selective-scan parameter bundle: x_proj.weight rows split
+  // [dt_rank | d_state | d_state] into the folded W_d (with dt_proj),
+  // W_B and W_C; dt_proj.bias -> b_d; A_log -> A_raw RAW (identical
+  // discretizations, see the MAMBA IMPORT section); D -> e.
+  procedure LoadScanWeights(Layer: TNNetLayer; const MixP: string);
+  var
+    XW, DtW: TNNetVolume;
+    d, s, r, j, NS, DI, RK: integer;
+    Acc: double;
+  begin
+    NS := Config.StateSize;
+    DI := Config.DInner;
+    RK := Config.TimeStepRank;
+    RequireShape2(MixP + 'x_proj.weight', RK + 2 * NS, DI);
+    RequireShape2(MixP + 'dt_proj.weight', DI, RK);
+    XW := TNNetVolume.Create;
+    DtW := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(MixP + 'x_proj.weight', XW);
+      Reader.LoadTensorFlat(MixP + 'dt_proj.weight', DtW);
+      // W_d = dt_proj.weight @ x_proj.weight[0:dt_rank] - the low-rank
+      // delta path folded exactly (double accumulation).
+      for d := 0 to DI - 1 do
+        for j := 0 to DI - 1 do
+        begin
+          Acc := 0;
+          for r := 0 to RK - 1 do
+            Acc := Acc + DtW.FData[d * RK + r] * XW.FData[r * DI + j];
+          Layer.Neurons[0].Weights.FData[d * DI + j] := Acc;
+        end;
+      // W_B / W_C: the next d_state + d_state x_proj rows (shared across
+      // channels - TNNetSelectiveSSM's (NS,1,Depth) projections).
+      for s := 0 to NS - 1 do
+        for j := 0 to DI - 1 do
+        begin
+          Layer.Neurons[1].Weights.FData[s * DI + j] :=
+            XW.FData[(RK + s) * DI + j];
+          Layer.Neurons[2].Weights.FData[s * DI + j] :=
+            XW.FData[(RK + NS + s) * DI + j];
+        end;
+    finally
+      DtW.Free;
+      XW.Free;
+    end;
+    MarkConsumed(MixP + 'x_proj.weight');
+    MarkConsumed(MixP + 'dt_proj.weight');
+    LoadChannelVector(Layer, 3, MixP + 'dt_proj.bias', DI);
+    // A_log [d_inner, d_state] row-major matches A_raw's (Depth,1,NS)
+    // [d*NS + s] layout - a raw copy.
+    LoadChannelVector(Layer, 4, MixP + 'A_log', DI * NS);
+    LoadChannelVector(Layer, 5, MixP + 'D', DI);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumLayers < 1 then
+        ImportError('Mamba import: num_hidden_layers must be >= 1.');
+      if Reader.HasTensor('backbone.embeddings.weight') then
+        Config.Prefix := 'backbone.'
+      else if Reader.HasTensor('embeddings.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Mamba import: neither "backbone.embeddings.weight" ' +
+          'nor "embeddings.weight" found in ' + Reader.FileName +
+          ' - not a Mamba checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embeddings.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Mamba import: embeddings.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embeddings.weight'));
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('lm_head.weight')) then
+        ImportError('Mamba import: config says tie_word_embeddings=false ' +
+          'but "lm_head.weight" is missing from ' + Reader.FileName + '.');
+      // Mamba has no positional limit (and no context_length field).
+      if pSeqLen <= 0 then SeqLen := 1024
+      else SeqLen := pSeqLen;
+      if Config.UseConvBias then ConvBiasSuppress := 0
+      else ConvBiasSuppress := 1;
+
+      // ---------------- Architecture ----------------
+      // No positional embedding: order enters only through the causal
+      // conv1d and the selective scan recurrence.
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real token, not padding.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // x := x + Mixer(TokenRMSNorm(x)) - the AddMambaBlock wiring,
+        // inlined with the checkpoint's PER-TOKEN RMSNorm (HF
+        // MambaRMSNorm; the builder's TNNetRMSNorm normalizes the whole
+        // volume) and the use_bias/use_conv_bias flags.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].Norm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        // (1) in_proj to 2*d_inner, then the x|z split (x first).
+        Blocks[BlockCnt].InProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(2 * Config.DInner, 1) );
+        NN.AddLayerAfter( TNNetSplitChannels.Create(0, Config.DInner),
+          Blocks[BlockCnt].InProj );
+        // (2) x path: depthwise causal conv1d + SiLU.
+        Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
+          Config.ConvKernel, {pCausal=}true, ConvBiasSuppress) );
+        NN.AddLayer( TNNetSiLU.Create() );
+        // (3) the selective scan (owns the delta/B/C projections + D skip).
+        Blocks[BlockCnt].Scan := NN.AddLayer(
+          TNNetSelectiveSSM.Create(Config.StateSize) );
+        ScanL := Blocks[BlockCnt].Scan;
+        // (4) z path: SiLU gate, cell-multiplied into the scan output.
+        NN.AddLayerAfter(
+          TNNetSplitChannels.Create(Config.DInner, Config.DInner),
+          Blocks[BlockCnt].InProj );
+        ZGate := NN.AddLayer( TNNetSiLU.Create() );
+        Gated := NN.AddLayer( TNNetCellMulByCell.Create(ScanL, ZGate) );
+        // (5) out_proj back to hidden + residual sum.
+        Blocks[BlockCnt].OutProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1), Gated );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
+      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        ImportError('Mamba import: embeddings.weight element count ' +
+          IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+          'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(Config.Prefix + 'embeddings.weight');
+      if Config.TieWordEmbeddings then
+      begin
+        // Tied LM head: logits = h . E^T (rows copied, bias-free) - the
+        // published Mamba checkpoints carry no lm_head.weight tensor.
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then
+          MarkConsumed('lm_head.weight');
+      end
+      else
+      begin
+        LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+          Config.HiddenSize, Config.VocabSize);
+        MarkConsumed('lm_head.weight');
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        MixPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) +
+          '.mixer.';
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].Norm,
+          Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.norm.weight',
+          Config.HiddenSize);
+        MarkConsumed(Config.Prefix + 'layers.' + IntToStr(BlockCnt) +
+          '.norm.weight');
+        if Config.UseBias then InBias := MixPrefix + 'in_proj.bias'
+        else InBias := '';
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].InProj,
+          MixPrefix + 'in_proj.weight', Config.HiddenSize,
+          2 * Config.DInner, 0, -1, 0, InBias);
+        MarkConsumed(MixPrefix + 'in_proj.weight');
+        if InBias <> '' then MarkConsumed(InBias);
+        LoadDepthwiseConv(Blocks[BlockCnt].Conv,
+          MixPrefix + 'conv1d.weight', MixPrefix + 'conv1d.bias');
+        LoadScanWeights(Blocks[BlockCnt].Scan, MixPrefix);
+        if Config.UseBias then OutBias := MixPrefix + 'out_proj.bias'
+        else OutBias := '';
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutProj,
+          MixPrefix + 'out_proj.weight', Config.DInner,
+          Config.HiddenSize, 0, -1, 0, OutBias);
+        MarkConsumed(MixPrefix + 'out_proj.weight');
+        if OutBias <> '' then MarkConsumed(OutBias);
+      end;
+      LoadLlamaRMSNormWeights(Reader, FinalNorm,
+        Config.Prefix + 'norm_f.weight', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'norm_f.weight');
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Mamba import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildMambaFromSafeTensorsEx(const FileName: string;
+  out Config: TMambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMambaConfigFromJSONFile(ConfigPath);
+  Result := BuildMambaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildMambaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  IgnoredConfig: TMambaConfig;
+begin
+  Result := BuildMambaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName);
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -7345,6 +7891,7 @@ var
   IgnoredPhiConfig: TPhiConfig;
   IgnoredBertConfig: TBertConfig;
   IgnoredRWKVConfig: TRWKVConfig;
+  IgnoredMambaConfig: TMambaConfig;
 begin
   // ---- resolve the weights file and the config.json ----
   if DirectoryExists(Path) then
@@ -7476,6 +8023,13 @@ begin
     // logits out). See the RWKV-4 IMPORT section.
     Result := BuildRWKVFromSafeTensorsEx(WeightsPath, IgnoredRWKVConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
+  else if ModelType = 'mamba' then
+    // The second non-transformer route: Mamba (architectures
+    // ["MambaForCausalLM"]), a selective-SSM mixer - causal-LM contract
+    // like the decoder families ((SeqLen,1,1) ids in, (SeqLen,1,vocab)
+    // logits out). See the MAMBA IMPORT section.
+    Result := BuildMambaFromSafeTensorsEx(WeightsPath, IgnoredMambaConfig,
+      pSeqLen, pInferenceOnly, ConfigPath)
   else if ModelType = 't5' then
   begin
     // T5 is an encoder-decoder: the import builds TWO nets, which this
@@ -7501,7 +8055,8 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
-      'qwen2, qwen3, gemma, gemma2, rwkv, bert, distilbert, roberta.');
+      'qwen2, qwen3, gemma, gemma2, rwkv, mamba, bert, distilbert, ' +
+      'roberta.');
   end;
 end;
 
