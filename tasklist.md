@@ -163,6 +163,96 @@ rather than acted on.
       reader): export named tensors so Pascal-trained models round-trip
       into PyTorch/transformers. Doubles as a cross-framework correctness
       check for the GPT-2/Llama importers (export → reload → compare).
+- [ ] Knowledge distillation trainer (transformers DistillationTrainer /
+      classic Hinton KD): temperature-softened KL between a frozen teacher's
+      logits and the student's, blended with the hard-label loss
+      (L = alpha*CE(hard) + (1-alpha)*T^2*KL(soft)). The DPO trainer already
+      holds two TNNets simultaneously, so the two-model plumbing exists.
+      Killer combo with the Llama/GPT-2 importers: distill an imported
+      pretrained teacher into a small Pascal-trained student.
+- [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
+      running average of checkpoints over the schedule tail + a constant or
+      cyclic SWA learning rate phase; swap averaged weights in for eval/save.
+      Distinct from the EMA task above (running decay average) but should
+      share the shadow-weights machinery — consider landing both on one
+      shadow-copy mechanism.
+- [ ] Optimizer zoo expansion (only SGD/Adam/AdamW exist today):
+      Adafactor (factored second-moment estimate, drastically less optimizer
+      state — pairs with the "run big imported models on commodity RAM"
+      quantization theme), Lion (sign-based update, single momentum buffer,
+      half of Adam's state), and optionally Muon for 2-D weight matrices.
+      Each is a small TNeuralOptimizer subclass in neuralfit.pas.
+- [ ] ReduceLROnPlateau + OneCycle / cyclical LR schedulers
+      (neural/neuralscheduler.pas has Step/CosineAnnealing/WarmupCosine/Poly):
+      plateau-driven decay needs a hook feeding the validation metric into
+      NextLR — that wiring is the interesting part; OneCycle/CyclicLR are
+      straightforward NextLR formulas.
+- [ ] Trainer callbacks API (transformers TrainerCallback port): a
+      TNeuralFitCallback with OnEpochBegin/End, OnStepEnd, OnEvaluate hooks
+      registered on TNeuralFitBase. Early stopping, custom logging, and the
+      EMA/SWA tasks become small callbacks instead of ever more
+      TNeuralFitBase fields.
+- [ ] NEFTune noisy embedding fine-tuning: uniform noise scaled by
+      alpha/sqrt(L*d) added to embedding-layer outputs during TRAINING only
+      (off at eval); famously a ~5-line instruction-tuning quality win.
+      Trivially testable: assert eval forward is noise-free and train
+      forward differs.
+- [ ] Mixup / CutMix training augmentation (torchvision transforms-v2
+      staples): sample-pair convex interpolation of inputs AND targets
+      (Beta-distributed lambda) in the fit loop; CutMix patches a rectangle
+      instead. The CIFAR image-classification examples give an instant
+      bake-off harness.
+- [ ] Contrastive search decoding (transformers penalty_alpha): degeneration
+      penalty re-ranking each candidate token by max cosine similarity
+      between its hidden state and all previous tokens' hidden states;
+      needs hidden-state capture during decode — a different beast from the
+      sampling/logits-processor chain task above and strong for
+      greedy-quality open-ended text.
+- [ ] Diverse beam search (Hamming-diversity groups) + constrained beam
+      search (force_words_ids: force given phrases to APPEAR anywhere in the
+      output — stronger than the existing TNNetTokenConstraint prefix/mask
+      machinery) in neural/neuraldecode.pas as DecodeBeamSearch variants.
+- [ ] Batched generation with left-padding in neural/neuraldecode.pas:
+      generate for N prompts in one forward pass per step (today's decode
+      paths look single-sample). Makes evaluation sweeps cheap and is a
+      prerequisite for an efficient speculative-decoding verify step.
+- [ ] Chat templates (transformers apply_chat_template): follow-up of the
+      tokenizer.json task above — parse the chat template from
+      tokenizer_config.json (or hardcode the common Llama/ChatML/Zephyr
+      formats) so an imported instruct checkpoint can be prompted with a
+      correctly formatted conversation end to end.
+- [ ] resize_token_embeddings equivalent: grow/shrink the token embedding +
+      LM-head vocab of an imported model (mean-init new rows, keep tied
+      heads consistent, update FStruct vocab sizes). Needed the moment
+      anyone adds special tokens to fine-tune on top of the Llama/GPT-2
+      importers.
+- [ ] More importer architectures: Mistral / Qwen2 are ~weight-mapping
+      deltas on the landed Llama path (sliding-window attention and QKV
+      biases already exist as building blocks); Phi / Gemma slightly more
+      work. Each reuses the HF-parity fixture tooling (slicer + logit dump
+      + compare).
+- [ ] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
+      de-facto checkpoint format, and it ships PRE-quantized weights —
+      dovetails with the int8 quantized-inference task (read Q8_0 blocks
+      directly instead of quantizing FP32 yourself).
+- [ ] Magnitude pruning (torch.nn.utils.prune port): global or per-layer
+      magnitude masks with a sparsity report (the introspection-report
+      pattern covers the diagnostics half); optional fine-tune-after-prune
+      example showing accuracy recovery.
+- [ ] Anomaly detection mode (autograd.set_detect_anomaly port): a debug
+      flag that checks every layer's Output/OutputError for NaN/Inf during
+      forward AND backward and names the FIRST offending layer + phase.
+      The random-architecture NaN fuzz task elsewhere in this list finds
+      such failures; this is the runtime tool that makes them diagnosable.
+      Probably the highest value-to-effort diagnostic on this list.
+- [ ] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
+      with forward/backward wall-time and parameter/activation memory per
+      layer (introspection-report pattern). Directly serves the open
+      chunked-forward throughput tasks by showing where time actually goes.
+- [ ] FlashAttention-style tiled online-softmax SDPA forward: opt-in fast
+      mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
+      MEMORY on long sequences; gate behind an exact-vs-naive equivalence
+      assert, same pattern as the chunked-forward recurrence family.
 
 ## Layer follow-ups that fix real limitations
 
