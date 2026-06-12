@@ -436,9 +436,13 @@ function GPT2ConfigToString(const Config: TGPT2Config): string;
 // volumes DURING construction (TNNet.MakeInferenceOnly after each block),
 // cutting peak and resident memory to ~1/3 - the returned net can only
 // Compute(), never train. The full 124M GPT-2 then fits in well under 2 GB.
+// pExactGelu = True swaps the MLP's gelu_new (the tanh approximation, the
+// OpenAI GPT-2 activation_function) for the EXACT erf "gelu" composition -
+// the Cerebras-GPT family (model_type "gpt2", the open GPT-3 reproduction)
+// trains with activation_function "gelu" and needs it for logit parity.
 function BuildGPT2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pExactGelu: boolean = false): TNNet;
 
 // Same, also returning the inferred config.
 // pSeqClsHead = True builds the GPT2ForSequenceClassification variant:
@@ -450,7 +454,7 @@ function BuildGPT2FromSafeTensors(const FileName: string;
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
   pNumHeads: integer = 0; pInferenceOnly: boolean = false;
-  pSeqClsHead: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pExactGelu: boolean = false): TNNet;
 
 type
   TLlamaConfig = record
@@ -1125,8 +1129,9 @@ end;
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
   pNumHeads: integer = 0; pInferenceOnly: boolean = false;
-  pSeqClsHead: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pExactGelu: boolean = false): TNNet;
 var
+  GELUSource, PhiBranch: TNNetLayer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TGPT2BlockLayers;
@@ -1184,12 +1189,27 @@ begin
         Blocks[BlockCnt].AttnProj := NN.AddMultiHeadSelfAttention(
           Config.NHeads, {CausalMask=}true);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        // MLP sub-block: x := x + c_proj(gelu_new(c_fc(ln_2(x)))).
+        // MLP sub-block: x := x + c_proj(act(c_fc(ln_2(x)))), where act is
+        // gelu_new (OpenAI GPT-2) or, with pExactGelu, the EXACT erf gelu
+        // composed from existing layers like the BERT/GPT-NeoX paths
+        // (Cerebras-GPT's activation_function "gelu").
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5) );
         Blocks[BlockCnt].CFc := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(4 * Config.NEmbd) );
-        NN.AddLayer( TNNetGELU.Create() ); // tanh approximation = gelu_new
+        if pExactGelu then
+        begin
+          GELUSource := NN.GetLastLayer();
+          NN.AddLayerAfter(
+            TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
+          NN.AddLayer( TNNetErf.Create() );
+          NN.AddLayer( TNNetAddConstant.Create(1.0) );
+          PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+          NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
+          NN.AddLayer( TNNetReGLU.Create() );
+        end
+        else
+          NN.AddLayer( TNNetGELU.Create() ); // tanh approximation = gelu_new
         Blocks[BlockCnt].MlpProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.NEmbd) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
@@ -1352,12 +1372,12 @@ end;
 
 function BuildGPT2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pExactGelu: boolean = false): TNNet;
 var
   IgnoredConfig: TGPT2Config;
 begin
   Result := BuildGPT2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pNumHeads, pInferenceOnly);
+    pNumHeads, pInferenceOnly, {pSeqClsHead=}false, pExactGelu);
 end;
 
 // ============================ LLAMA IMPORT =================================
@@ -4840,7 +4860,7 @@ var
   JsonText: TStringList;
   Root, ArchData: TJSONData;
   NumHeads, ArchCnt: integer;
-  BertSeqCls, GPT2SeqCls: boolean;
+  BertSeqCls, GPT2SeqCls, GPT2ExactGelu: boolean;
   IgnoredGPT2Config: TGPT2Config;
   IgnoredId2Label: TStringList;
   IgnoredLlamaConfig: TLlamaConfig;
@@ -4892,6 +4912,11 @@ begin
         '" is not a JSON object.');
     ModelType := TJSONObject(Root).Get('model_type', '');
     NumHeads := TJSONObject(Root).Get('n_head', 0); // GPT-2 family key
+    // GPT-2 family activation: OpenAI checkpoints say "gelu_new" (the tanh
+    // approximation, the builder default); Cerebras-GPT - model_type "gpt2",
+    // the open GPT-3 reproduction - says "gelu", the EXACT erf form.
+    GPT2ExactGelu :=
+      TJSONObject(Root).Get('activation_function', 'gelu_new') = 'gelu';
     // "architectures" disambiguates a fine-tuned classifier head from the
     // base LM/encoder of the same model_type (the LM stays the default).
     BertSeqCls := false;
@@ -4921,7 +4946,7 @@ begin
   end
   else if ModelType = 'gpt2' then
     Result := BuildGPT2FromSafeTensors(WeightsPath, pSeqLen, NumHeads,
-      pInferenceOnly)
+      pInferenceOnly, GPT2ExactGelu)
   else if (ModelType = 'bert') and BertSeqCls then
   begin
     IgnoredId2Label := nil;

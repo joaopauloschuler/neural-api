@@ -1,0 +1,16 @@
+{
+ "model_type": "gpt2",
+ "attn_pdrop": 0.0,
+ "scale_attn_weights": true,
+ "resid_pdrop": 0.0,
+ "n_inner": 32,
+ "n_embd": 8,
+ "layer_norm_epsilon": 1e-05,
+ "n_positions": 16,
+ "activation_function": "gelu",
+ "n_head": 2,
+ "n_layer": 2,
+ "tie_word_embeddings": true,
+ "vocab_size": 12,
+ "embd_pdrop": 0.0
+}

@@ -82,6 +82,7 @@ type
     procedure TestShardedReaderMatchesSingleFile;
     procedure TestShardedLlamaLogitsBitIdentical;
     procedure TestDistilGPT2LogitParity;
+    procedure TestCerebrasGPTLogitParity;
     procedure TestSmolLM2LogitParity;
     procedure TestMistralLogitParity;
     procedure TestQwen2LogitParity;
@@ -1303,6 +1304,65 @@ begin
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_distilgpt2_logits.json'), Config.NCtx,
       Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the cerebras/Cerebras-GPT-111M import target - the truest open
+// GPT-3 reproduction (exact GPT-3 recipe: dense attention, learned absolute
+// positions, GPT-2 BPE, Chinchilla-scaled), shipped as model_type "gpt2" in
+// GPT2LMHeadModel format - on REAL pretrained weights:
+// tests/fixtures/tiny_cerebras_gpt.safetensors is a dimension-sliced
+// sub-slab of the genuine checkpoint (2 of 10 layers, 2 of 12 heads x 4 of
+// 64 dims, d_model 8, vocab 12, ctx 16 of 2048 - see
+// tools/cerebras_gpt_fixture.py; upstream ships only pytorch_model.bin, the
+// script converts) and the reference logits come from HF transformers'
+// GPT2LMHeadModel in float64 on the same slice. Cerebras' ONE deviation
+// from the OpenAI GPT-2 checkpoints: activation_function is "gelu" (the
+// EXACT erf form), not "gelu_new" - covered both by the explicit pExactGelu
+// flag and by the config-driven BuildFromPretrained route, which is pinned
+// STRUCTURALLY (the built net must contain TNNetErf) because at pico width
+// gelu-vs-gelu_new moves the logits by only ~6e-7 (on the FULL 111M it is
+// 0.040, far above the 1e-4 gate - see the fixture script's assert).
+procedure TTestNeuralPretrained.TestCerebrasGPTLogitParity;
+var
+  NN: TNNet;
+  Config: TGPT2Config;
+  LayerCnt: integer;
+  HasErf: boolean;
+begin
+  RandSeed := 424242;
+  // Direct builder route with the explicit exact-gelu flag.
+  NN := BuildGPT2FromSafeTensorsEx(
+    FixturePath('tiny_cerebras_gpt.safetensors'), Config, {SeqLen=}0,
+    {NumHeads=}2, {pInferenceOnly=}false, {pSeqClsHead=}false,
+    {pExactGelu=}true);
+  try
+    AssertEquals('n_layer', 2, Config.NLayers);
+    AssertEquals('n_embd', 8, Config.NEmbd);
+    AssertEquals('n_ctx', 16, Config.NCtx);
+    AssertEquals('vocab', 12, Config.VocabSize);
+    AssertEquals('prefix', 'transformer.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_cerebras_gpt_logits.json'), Config.NCtx,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must pick up n_head=2 AND
+  // activation_function "gelu" from the real (sliced) Cerebras config.
+  NN := BuildFromPretrained(FixturePath('tiny_cerebras_gpt.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_cerebras_gpt_config.json'));
+  try
+    HasErf := false;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt] is TNNetErf then HasErf := true;
+    AssertTrue('activation_function "gelu" must select the exact erf ' +
+      'composition (TNNetErf layer present)', HasErf);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_cerebras_gpt_logits.json'), 16, 12);
   finally
     NN.Free;
   end;

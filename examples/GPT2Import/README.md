@@ -62,6 +62,19 @@ dimension-sliced by `make_pico_gpt2_fixture.py` — 2 of 6 layers, 2 heads × 4
 dims, d_model 8, vocab 12, reference logits from `GPT2LMHeadModel` in
 float64) is asserted by `TestDistilGPT2LogitParity` in every test run.
 
+**Cerebras-GPT** (the truest open GPT-3 reproduction — exact GPT-3 recipe,
+Chinchilla-scaled, `model_type: "gpt2"`) also loads via this GPT-2 path:
+`cerebras/Cerebras-GPT-111M` verified 2026-06 with max |logit diff|
+**7.5e-5** vs HF transformers float64 and identical argmax at every
+position. Two deviations from the OpenAI checkpoints: `activation_function`
+is `"gelu"` (the EXACT erf form — pass `pExactGelu=true` to
+`BuildGPT2FromSafeTensors`, or use `BuildFromPretrained` with the
+checkpoint's `config.json`, which reads it), and upstream ships only
+`pytorch_model.bin` (convert to safetensors via torch — see
+`tools/cerebras_gpt_fixture.py`, which also pins the committed real-weight
+pico fixture `tests/fixtures/tiny_cerebras_gpt.*` asserted by
+`TestCerebrasGPTLogitParity`).
+
 ## GPT-Neo / TinyStories
 
 `neuralpretrained.pas` also imports **GPT-Neo** checkpoints

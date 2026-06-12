@@ -445,7 +445,7 @@ rather than acted on.
       easier first Pascal→Python round-trip than the listed safetensors
       writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
-- [ ] Cerebras-GPT parity verification (possibly ZERO-code "GPT-3 import"):
+- [X] Cerebras-GPT parity verification (possibly ZERO-code "GPT-3 import"):
       Cerebras-GPT is the truest open GPT-3 reproduction (exact GPT-3
       recipe — dense attention, learned absolute positions, GPT-2 BPE,
       Chinchilla-scaled) and its HF checkpoints ship as model_type "gpt2"
@@ -456,6 +456,16 @@ rather than acted on.
       sliced parity fixture. The cheapest credible answer to "import a
       trained GPT-3-class model"; doc cross-link target for
       ../gpt-3-for-pascal.
+      DONE: NOT zero-code after all - two real deviations: the
+      activation_function is "gelu" (the EXACT erf form, not gelu_new;
+      added pExactGelu to the GPT-2 builders + the config-driven
+      BuildFromPretrained route reads activation_function) and upstream
+      ships only pytorch_model.bin (no safetensors; convert via torch).
+      Sliced REAL-weight fixture tests/fixtures/tiny_cerebras_gpt.*
+      (tools/cerebras_gpt_fixture.py) + TestCerebrasGPTLogitParity. Full
+      111M verified: max |logit diff| 7.5e-5 vs the HF float64 oracle,
+      argmax identical at all 16 positions, sane greedy text, loads in
+      under 3 GB. See examples/GPT2Import/README.md.
 - [X] GPT-J importer — the gptj sibling of the landed gpt_neox path:
       SHARED-LN parallel residual (AddParallelTransformerBlock's default
       form, already landed), FULL-but-partial rotary (rotary_dim=64 of
