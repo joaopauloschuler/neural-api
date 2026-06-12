@@ -511,7 +511,7 @@ rather than acted on.
       transformers WhisperModel on a sliced pico fixture with a pinned
       mel input; headline demo: examples/WhisperTranscribe transcribing a
       short WAV to text on CPU.
-- [ ] BLOOM importer (bigscience/bloom-560m / bloomz-560m) — the ALiBi
+- [X] BLOOM importer (bigscience/bloom-560m / bloomz-560m) — the ALiBi
       architecture family, the one positional scheme NO landed importer
       exercises (GPT-2 learned, Llama/NeoX/Qwen RoPE, T5 relative bias,
       BERT learned): no positional embeddings at all, per-head linear
@@ -534,6 +534,27 @@ rather than acted on.
       checkpoint (46 languages) — also the first importer whose tokenizer
       stresses non-Latin scripts end-to-end (the fpjson \uXXXX pre-decode
       path).
+      NOTE 2026-06-12: LANDED. TNNetALiBiAttention (SDPA subclass, fixed
+      per-head slope in FFloatSt[1], exact HF build_alibi_tensor slope
+      recipe incl. the non-power-of-two branch, cached incremental decode,
+      inherited backward stays exact since the bias is an additive
+      constant) + avALiBi variant through AddMultiHeadSDPAConcat /
+      AddMultiHeadSelfAttention (per-head ALiBiSlope(h, Heads), Window
+      honoured); FD input-gradient check + slope-reference + zero-slope==
+      SDPA + serialization + builder-shape tests in TestNeuralNumerical.
+      BuildBloomFromSafeTensors in neuralpretrained.pas (per-head [q|k|v]
+      de-interleave with the NeoX-contrast comment — same h-major layout,
+      NO rotary permutation; word_embeddings_layernorm; sequential pre-LN
+      tanh-GELU blocks; always-tied head + ln_f; legacy config spellings
+      n_embed/num_attention_heads/n_layer, n_inner null = 4*hidden; .bin
+      dispatch via CreatePretrainedTensorReader; BuildFromPretrained
+      "bloom" route). tests/fixtures/tiny_bloom.* sliced from the REAL
+      bloom-560m (tools/bloom_tiny_fixture.py; 3 heads = non-power-of-two
+      slopes on the parity path, FP16 preserved, zero-ALiBi non-vacuity
+      assert); TestBloomLogitParity max |logit diff| 5.2e-7 vs the float64
+      HF oracle. Non-Latin tokenizer round-trip cases (CJK/Arabic/
+      Devanagari/Cyrillic) added to hf_tokenizer_cases.json (byte_level/
+      metaspace/wordpiece families).
 - [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
       decode docs explicitly note only greedy/sampled streamed generation

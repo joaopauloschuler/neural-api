@@ -89,6 +89,14 @@ unit neuralpretrained;
 //     causal conv1d + SiLU, the low-rank dt_proj folded into the scan's
 //     delta projection, A_raw = A_log raw (identical discretizations),
 //     SiLU(z) gating and per-token RMSNorms. See the MAMBA IMPORT section.
+//   - BLOOM (model_type "bloom": bigscience/bloom-560m..bloom and the
+//     instruction-tuned bloomz family) - BuildBloomFromSafeTensors, the
+//     FIRST ALiBi importer: NO positional embeddings at all, per-head
+//     FIXED linear attention biases (TNNetALiBiAttention with the
+//     geometric HF build_alibi_tensor slopes); embedding LayerNorm right
+//     after the word embeddings, sequential pre-LN GELU(tanh) blocks,
+//     fused per-head [q|k|v] query_key_value, ALWAYS-tied LM head + ln_f.
+//     See the BLOOM IMPORT section below.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -1528,6 +1536,98 @@ function BuildMambaFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
 
+// ============================ BLOOM IMPORT =================================
+// BuildBloomFromSafeTensors rebuilds BigScience's BLOOM decoder (model_type
+// "bloom": bigscience/bloom-560m .. bloom-176B and the instruction-tuned
+// bloomz family) - the FIRST ALiBi-positional importer (GPT-2/BERT use
+// learned positions, the Llama/NeoX/Qwen/Gemma families RoPE, T5 a bucketed
+// relative bias): BLOOM has NO positional embeddings AT ALL; position
+// enters ONLY as a fixed per-head linear bias slope_h*(j-i) on the
+// pre-softmax attention logits (TNNetALiBiAttention, slopes from the exact
+// HF build_alibi_tensor geometric recipe - see TNNetALiBiAttention.
+// ALiBiSlope). Architecture per checkpoint:
+//
+//   Input(SeqLen) -> TNNetEmbedding (word_embeddings)
+//     -> TNNetTokenLayerNorm (word_embeddings_layernorm - BLOOM
+//        normalises the embeddings BEFORE the first block, a Megatron
+//        bf16-stability artifact no other family here carries)
+//     -> n_layer x [ x := x + Dense(MHA_ALiBi(LN_1(x)));
+//                    x := x + MLP(LN_2(x)) ]      (sequential pre-LN)
+//     -> TNNetTokenLayerNorm (ln_f)
+//     -> TNNetPointwiseConvLinear(vocab) LM head, ALWAYS tied to the
+//        word_embeddings rows (BLOOM ships no separate lm_head tensor)
+//
+// The attention projection is ONE fused query_key_value nn.Linear
+// [3*hidden, hidden] WITH bias. Its row layout interleaves PER HEAD: head h
+// occupies rows h*3*head_dim..(h+1)*3*head_dim-1, the first head_dim being
+// q, then k, then v (HF view(.., heads, 3, head_dim) then index the middle
+// axis). NOTE the contrast with the siblings: GPT-2's c_attn is q|k|v WHOLE
+// thirds (no per-head interleave); GPT-NeoX uses the SAME h-major per-head
+// [q|k|v] interleave as BLOOM (HF view(.., heads, 3*head_dim) then thirds -
+// identical bytes, different idiom) but additionally needs the rotate_half
+// RoPE row permutation composed into the de-interleave. BLOOM has no rotary
+// at all, so its rows load STRAIGHT - the de-interleave into the Q|K|V slab
+// is the whole job. attention.dense and both MLP linears (mlp.dense_h_to_4h
+// / dense_4h_to_h, intermediate = 4*hidden) are plain nn.Linear [out, in]
+// WITH biases. Attention is standard scaled (1/sqrt(head_dim)) + the ALiBi
+// bias; the MLP activation is BLOOM's Megatron GELU
+// x*0.5*(1+tanh(0.79788456*x*(1+0.044715*x^2))) = the tanh GELU
+// (TNNetGELU) exactly.
+// config.json uses the LEGACY GPT-2-style names n_head / n_layer and
+// hidden_size (older exports spell it n_embed); layer_norm_epsilon;
+// intermediate is n_inner (null = 4*hidden in every released checkpoint).
+// There is NO max_position_embeddings (ALiBi extrapolates): pSeqLen <= 0
+// uses the config's seq_length when present, else 2048.
+// apply_residual_connection_post_layernorm=true (a pretraining-only
+// Megatron variant no released HF checkpoint uses) is REJECTED explicitly
+// rather than silently mis-wired.
+// The byte-level BPE tokenizer (250880-entry multilingual vocab, 46
+// languages) is the existing TNeuralHFTokenizer tokenizer.json path - no
+// new tokenizer machinery.
+
+type
+  TBloomConfig = record
+    HiddenSize: integer;          // hidden_size (legacy alias n_embed)
+    NumLayers: integer;           // n_layer
+    NumHeads: integer;            // n_head
+    IntermediateSize: integer;    // n_inner (null/absent = 4*hidden)
+    VocabSize: integer;           // vocab_size
+    SeqLength: integer;           // seq_length (informational; 0 if absent)
+    LayerNormEps: double;         // layer_norm_epsilon
+    ModelType: string;            // 'bloom'
+    Prefix: string;               // 'transformer.' or '' (detected)
+  end;
+
+// Reads a HF BLOOM config.json (model_type "bloom"). Required: n_head,
+// n_layer, vocab_size and hidden_size (or its legacy alias n_embed).
+// Defaults follow BloomConfig: n_inner null = 4*hidden_size,
+// layer_norm_epsilon = 1e-5. apply_residual_connection_post_layernorm=true
+// is rejected (see the BLOOM IMPORT section above).
+function ReadBloomConfigFromJSONFile(const FileName: string): TBloomConfig;
+
+function BloomConfigToString(const Config: TBloomConfig): string;
+
+// Builds the BLOOM causal-LM net described by Config ((SeqLen,1,1) token
+// ids in, (SeqLen,1,vocab) logits out, like the other decoder families) and
+// loads every weight from the checkpoint at FileName (see the BLOOM IMPORT
+// section above). pSeqLen <= 0 uses Config.SeqLength (2048 when the config
+// does not carry seq_length; ALiBi imposes no hard positional limit).
+// pInferenceOnly = True frees training volumes during construction.
+function BuildBloomFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBloomConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildBloomFromSafeTensorsEx(const FileName: string;
+  out Config: TBloomConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildBloomFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -1537,7 +1637,8 @@ function BuildMambaFromSafeTensors(const FileName: string;
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
 // gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, gemma,
-// gemma2, gemma3_text, rwkv, mamba, bert, distilbert, roberta. Anything else
+// gemma2, gemma3_text, rwkv, mamba, bloom, bert, distilbert, roberta.
+// Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
 // choice. OUTPUT SEMANTICS DIFFER BY model_type: the decoder families
@@ -8040,6 +8141,437 @@ begin
     pInferenceOnly, ConfigFileName);
 end;
 
+// ============================ BLOOM IMPORT =================================
+
+function ReadBloomConfigFromJSONFile(const FileName: string): TBloomConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  Field: TJSONData;
+
+  function RequiredInt(const Key: string): integer;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(Key);
+    if (Data = nil) or Data.IsNull then
+      ImportError('BLOOM import: config "' + FileName +
+        '" is missing required key "' + Key + '".');
+    Result := Data.AsInteger;
+  end;
+
+begin
+  Result := Default(TBloomConfig);
+  if not FileExists(FileName) then
+    ImportError('BLOOM import: config file "' + FileName + '" not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('BLOOM import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('BLOOM import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'bloom');
+    if Result.ModelType <> 'bloom' then
+      ImportError('BLOOM import: config model_type is "' + Result.ModelType +
+        '" - expected "bloom" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    // hidden_size is the modern key; the original BigScience exports spell
+    // it n_embed (the legacy GPT-2-style name). Likewise n_head /
+    // num_attention_heads and n_layer / num_hidden_layers (HF BloomConfig's
+    // attribute_map accepts both spellings; bloom-560m's config.json ships
+    // n_embed + num_attention_heads + n_layer).
+    Field := Obj.Find('hidden_size');
+    if (Field <> nil) and not Field.IsNull then
+      Result.HiddenSize := Field.AsInteger
+    else
+      Result.HiddenSize := RequiredInt('n_embed');
+    Field := Obj.Find('n_layer');
+    if (Field <> nil) and not Field.IsNull then
+      Result.NumLayers := Field.AsInteger
+    else
+      Result.NumLayers := RequiredInt('num_hidden_layers');
+    Field := Obj.Find('n_head');
+    if (Field <> nil) and not Field.IsNull then
+      Result.NumHeads := Field.AsInteger
+    else
+      Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    // n_inner is null in every released checkpoint = 4*hidden (HF
+    // BloomMLP hardcodes dense_h_to_4h to 4*hidden_size).
+    Field := Obj.Find('n_inner');
+    if (Field <> nil) and not Field.IsNull then
+      Result.IntermediateSize := Field.AsInteger
+    else
+      Result.IntermediateSize := 4 * Result.HiddenSize;
+    Result.SeqLength := Obj.Get('seq_length', 0);
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    if Obj.Get('apply_residual_connection_post_layernorm', False) then
+      ImportError('BLOOM import: config has ' +
+        'apply_residual_connection_post_layernorm=true (a pretraining-only ' +
+        'Megatron variant) - this importer only wires the released ' +
+        'pre-LN residual form.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BloomConfigToString(const Config: TBloomConfig): string;
+begin
+  Result := 'bloom config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps);
+  if Config.SeqLength > 0 then
+    Result := Result + ', seq_length=' + IntToStr(Config.SeqLength);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+// Loads the fused BLOOM query_key_value nn.Linear ([3*hidden, hidden]
+// weight + [3*hidden] bias) into a TNNetPointwiseConvLinear Q|K|V slab
+// (q -> neurons 0..hidden-1, k -> hidden..2*hidden-1, v -> 2*hidden..).
+// LAYOUT CONTRAST (the per-head [q|k|v] interleave families):
+//   - GPT-2 c_attn: q|k|v WHOLE thirds of the 3*hidden axis, NO per-head
+//     interleave at all (row r of the q third is q channel r).
+//   - GPT-NeoX query_key_value: PER-HEAD interleave - head h owns rows
+//     h*3*head_dim..(h+1)*3*head_dim-1, the first head_dim of them q, then
+//     k, then v (HF view(.., heads, 3*head_dim) then chunk into thirds) -
+//     AND the loader must compose the rotate_half RoPE row permutation
+//     into the de-interleave (LoadGPTNeoXQKVWeights).
+//   - BLOOM query_key_value: the SAME h-major per-head [q|k|v] byte layout
+//     (HF spells it view(.., heads, 3, head_dim) and indexes the middle
+//     axis - a different idiom for identical bytes), but BLOOM has NO
+//     rotary at all (position lives in the ALiBi score bias), so every row
+//     loads STRAIGHT: the de-interleave into the slab is the whole job.
+procedure LoadBloomQKVWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  Hidden, HeadDim: integer);
+var
+  W, B: TNNetVolume;
+  r, i, HeadIdx, Third, RowInHead, TargetIdx: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('BLOOM import: missing tensor "' + WName + '".');
+  if not Reader.HasTensor(BName) then
+    ImportError('BLOOM import: missing tensor "' + BName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> 3 * Hidden) or
+     (Reader.DimSize(WName, 1) <> Hidden) then
+    ImportError('BLOOM import: "' + WName + '" must have shape [' +
+      IntToStr(3 * Hidden) + ', ' + IntToStr(Hidden) + '] (nn.Linear ' +
+      'stores [out, in]), got ' + Reader.ShapeAsString(WName));
+  if (Reader.DimCount(BName) <> 1) or
+     (Reader.DimSize(BName, 0) <> 3 * Hidden) then
+    ImportError('BLOOM import: "' + BName + '" must have shape [' +
+      IntToStr(3 * Hidden) + '], got ' + Reader.ShapeAsString(BName));
+  if Layer.Neurons.Count <> 3 * Hidden then
+    ImportError('BLOOM import: internal error - layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(3 * Hidden) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    for r := 0 to 3 * Hidden - 1 do
+    begin
+      HeadIdx := r div (3 * HeadDim);
+      Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
+      RowInHead := r mod HeadDim;
+      TargetIdx := Third * Hidden + HeadIdx * HeadDim + RowInHead;
+      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+        ImportError('BLOOM import: internal error - neuron ' +
+          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
+          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          ' weights, expected ' + IntToStr(Hidden) + '.');
+      for i := 0 to Hidden - 1 do
+        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      Layer.Neurons[TargetIdx].BiasWeight := B.FData[r];
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+type
+  TBloomBlockLayers = record
+    LN1, QKV, AttnDense, LN2, HTo4H, FourHToH: TNNetLayer;
+  end;
+
+function BuildBloomFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBloomConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TBloomBlockLayers;
+  EmbeddingLayer, EmbeddingLN, FinalLN, LMHead: TNNetLayer;
+  BranchInput, AttnOut, QKVLayer, HeadPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  Channels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, HeadDim, i, j, d: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('BLOOM import: n_head must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('BLOOM import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by n_head=' +
+          IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if Reader.HasTensor('transformer.word_embeddings.weight') then
+        Config.Prefix := 'transformer.'
+      else if Reader.HasTensor('word_embeddings.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('BLOOM import: neither ' +
+          '"transformer.word_embeddings.weight" nor ' +
+          '"word_embeddings.weight" found in ' + Reader.FileName +
+          ' - not a BLOOM checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'word_embeddings.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'word_embeddings.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'word_embeddings.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('BLOOM import: word_embeddings.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'word_embeddings.weight'));
+      // ALiBi imposes no positional table limit; default to the config's
+      // (informational) pretraining seq_length, else 2048.
+      if pSeqLen > 0 then SeqLen := pSeqLen
+      else if Config.SeqLength > 0 then SeqLen := Config.SeqLength
+      else SeqLen := 2048;
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real BPE token (<unk>), not padding.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      // word_embeddings_layernorm: BLOOM normalises the embedding output
+      // BEFORE the first block (no positional embedding is added - ALiBi
+      // is the only position signal, inside the attention scores).
+      EmbeddingLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(Channels, 3 * HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // Attention branch: dense(MHA_ALiBi(LN_1(x))).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN1 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        QKVLayer := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        Blocks[BlockCnt].QKV := QKVLayer;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          // Pack [Q_h | K_h | V_h] (width 3*head_dim) straight off the slab
+          // (no rotary: BLOOM's only position signal is the ALiBi bias).
+          for d := 0 to HeadDim - 1 do
+          begin
+            Channels[d]               := HeadCnt * HeadDim + d;
+            Channels[HeadDim + d]     :=
+              Config.HiddenSize + HeadCnt * HeadDim + d;
+            Channels[2 * HeadDim + d] :=
+              2 * Config.HiddenSize + HeadCnt * HeadDim + d;
+          end;
+          HeadPack := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(Channels), QKVLayer);
+          // Standard 1/sqrt(head_dim) scaling + the per-head geometric
+          // ALiBi slope (exact HF build_alibi_tensor recipe; HF adds
+          // slope*j, this layer slope*(j-i) - identical softmax, see
+          // TNNetALiBiAttention).
+          HeadOutputs[HeadCnt] := NN.AddLayer(
+            TNNetALiBiAttention.Create(HeadDim, {CausalMask=}true,
+              TNNetALiBiAttention.ALiBiSlope(HeadCnt, Config.NumHeads)) );
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].AttnDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        // Sequential pre-LN residuals (apply_residual_connection_post_
+        // layernorm=false, the released form):
+        //   x := x + Attn(LN_1(x)); x := x + MLP(LN_2(x))
+        AttnOut := NN.AddLayer(
+          TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].LN2 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].HTo4H := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        // BLOOM's Megatron GELU is the tanh approximation
+        // x*0.5*(1+tanh(0.79788456*x*(1+0.044715*x^2))) = TNNetGELU.
+        NN.AddLayer( TNNetGELU.Create() );
+        Blocks[BlockCnt].FourHToH := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), AttnOut]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        // word_embeddings -> embedding table AND the ALWAYS-tied LM head
+        // (BloomForCausalLM ships no separate lm_head tensor; logits =
+        // h . word_embeddings^T, bias-free).
+        Reader.LoadTensorFlat(Config.Prefix + 'word_embeddings.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('BLOOM import: word_embeddings.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'word_embeddings.weight');
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then
+          MarkConsumed('lm_head.weight'); // redundant tied copy, if present
+      finally
+        Tmp.Free;
+      end;
+      LoadLayerNormWeights(Reader, EmbeddingLN,
+        Config.Prefix + 'word_embeddings_layernorm.weight',
+        Config.Prefix + 'word_embeddings_layernorm.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'word_embeddings_layernorm.weight');
+      MarkConsumed(Config.Prefix + 'word_embeddings_layernorm.bias');
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'self_attention.';
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN1,
+          BlockPrefix + 'input_layernorm.weight',
+          BlockPrefix + 'input_layernorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        MarkConsumed(BlockPrefix + 'input_layernorm.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN2,
+          BlockPrefix + 'post_attention_layernorm.weight',
+          BlockPrefix + 'post_attention_layernorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+        MarkConsumed(BlockPrefix + 'post_attention_layernorm.bias');
+        // Fused per-head-interleaved query_key_value -> Q|K|V slab (rows
+        // load straight - no rotary permutation, see LoadBloomQKVWeights).
+        LoadBloomQKVWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'query_key_value.weight',
+          AttnPrefix + 'query_key_value.bias',
+          Config.HiddenSize, HeadDim);
+        MarkConsumed(AttnPrefix + 'query_key_value.weight');
+        MarkConsumed(AttnPrefix + 'query_key_value.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
+          AttnPrefix + 'dense.weight', Config.HiddenSize,
+          Config.HiddenSize, 0, -1, 0, AttnPrefix + 'dense.bias');
+        MarkConsumed(AttnPrefix + 'dense.weight');
+        MarkConsumed(AttnPrefix + 'dense.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].HTo4H,
+          BlockPrefix + 'mlp.dense_h_to_4h.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'mlp.dense_h_to_4h.bias');
+        MarkConsumed(BlockPrefix + 'mlp.dense_h_to_4h.weight');
+        MarkConsumed(BlockPrefix + 'mlp.dense_h_to_4h.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].FourHToH,
+          BlockPrefix + 'mlp.dense_4h_to_h.weight', Config.IntermediateSize,
+          Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'mlp.dense_4h_to_h.bias');
+        MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.weight');
+        MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.bias');
+      end;
+      LoadLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'ln_f.weight',
+        Config.Prefix + 'ln_f.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'ln_f.weight');
+      MarkConsumed(Config.Prefix + 'ln_f.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('BLOOM import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildBloomFromSafeTensorsEx(const FileName: string;
+  out Config: TBloomConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBloomConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildBloomFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildBloomFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  IgnoredConfig: TBloomConfig;
+begin
+  Result := BuildBloomFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName);
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -8059,6 +8591,7 @@ var
   IgnoredBertConfig: TBertConfig;
   IgnoredRWKVConfig: TRWKVConfig;
   IgnoredMambaConfig: TMambaConfig;
+  IgnoredBloomConfig: TBloomConfig;
 begin
   // ---- resolve the weights file and the config.json ----
   if DirectoryExists(Path) then
@@ -8201,6 +8734,13 @@ begin
     // logits out). See the MAMBA IMPORT section.
     Result := BuildMambaFromSafeTensorsEx(WeightsPath, IgnoredMambaConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
+  else if ModelType = 'bloom' then
+    // The ALiBi route: BLOOM (architectures ["BloomForCausalLM"]), no
+    // positional embeddings - per-head fixed linear attention biases
+    // (TNNetALiBiAttention). Causal-LM contract like the other decoder
+    // families. See the BLOOM IMPORT section.
+    Result := BuildBloomFromSafeTensorsEx(WeightsPath, IgnoredBloomConfig,
+      pSeqLen, pInferenceOnly, ConfigPath)
   else if ModelType = 't5' then
   begin
     // T5 is an encoder-decoder: the import builds TWO nets, which this
@@ -8226,8 +8766,8 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
-      'qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, mamba, bert, ' +
-      'distilbert, roberta.');
+      'qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, mamba, bloom, ' +
+      'bert, distilbert, roberta.');
   end;
 end;
 

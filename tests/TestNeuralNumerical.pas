@@ -816,6 +816,11 @@ type
     procedure TestT5RelPosBiasAttentionGradientCheck;
     procedure TestT5RelPosBiasAttentionZeroBiasMatchesSDPA;
     procedure TestT5RelPosBiasAttentionSerializationRoundTrip;
+    procedure TestALiBiSlopeMatchesReference;
+    procedure TestALiBiAttentionGradientCheck;
+    procedure TestALiBiAttentionZeroSlopeMatchesSDPA;
+    procedure TestALiBiAttentionSerializationRoundTrip;
+    procedure TestMultiHeadSelfAttentionALiBiShapes;
     procedure TestSinkAttentionGradientCheck;
     procedure TestSinkAttentionSinkParamGradientCheck;
     procedure TestSinkAttentionSerializationRoundTrip;
@@ -18503,6 +18508,268 @@ begin
     NN.Free;
     if Assigned(NN2) then NN2.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestALiBiSlopeMatchesReference;
+// TNNetALiBiAttention.ALiBiSlope must be an EXACT port of HF transformers'
+// build_alibi_tensor per-head slope recipe (modeling_bloom). Reference
+// values computed with transformers' build_alibi_tensor (torch float32):
+//   H=8  (power of two):  2^-1, 2^-2, ..., 2^-8
+//   H=6  (non-power-of-two; cp2=4): heads 0..3 from the cp2=4 table
+//        (0.25^1..0.25^4) then the ODD powers of the doubled (cp2=8) base
+//        0.5: 0.5^1, 0.5^3
+//   H=16: powers of 2^-0.5
+//   H=12: cp2=8 table then odd powers of the cp2=16 base 2^-0.5
+//   H=1:  2^-8 (cp2=1 -> base 2^-8)
+const
+  cSlopes8: array[0..7] of TNeuralFloat =
+    (0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0.00390625);
+  cSlopes6: array[0..5] of TNeuralFloat =
+    (0.25, 0.0625, 0.015625, 0.00390625, 0.5, 0.125);
+  cSlopes12: array[0..11] of TNeuralFloat =
+    (0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625, 0.0078125, 0.00390625,
+     0.7071067690849304, 0.3535533845424652, 0.1767766773700714,
+     0.0883883386850357);
+var
+  h: integer;
+begin
+  for h := 0 to 7 do
+    AssertEquals('ALiBi slope H=8 head ' + IntToStr(h),
+      cSlopes8[h], TNNetALiBiAttention.ALiBiSlope(h, 8), 1e-7);
+  for h := 0 to 5 do
+    AssertEquals('ALiBi slope H=6 head ' + IntToStr(h),
+      cSlopes6[h], TNNetALiBiAttention.ALiBiSlope(h, 6), 1e-7);
+  for h := 0 to 11 do
+    AssertEquals('ALiBi slope H=12 head ' + IntToStr(h),
+      cSlopes12[h], TNNetALiBiAttention.ALiBiSlope(h, 12), 1e-7);
+  AssertEquals('ALiBi slope H=1 head 0',
+    0.00390625, TNNetALiBiAttention.ALiBiSlope(0, 1), 1e-9);
+  AssertEquals('ALiBi slope H=16 head 0',
+    0.7071067690849304, TNNetALiBiAttention.ALiBiSlope(0, 16), 1e-7);
+  AssertEquals('ALiBi slope H=16 head 15',
+    0.0039062488358467817, TNNetALiBiAttention.ALiBiSlope(15, 16), 1e-9);
+end;
+
+procedure TTestNeuralNumerical.TestALiBiAttentionGradientCheck;
+// Central-difference check of the input gradient of a causal
+// TNNetALiBiAttention (d_k=4, SeqLen=5, slope=0.25). The slope is FIXED
+// (no parameter gradient to check); the additive bias reshapes the softmax,
+// so the input gradient flows through a genuinely biased attention map -
+// the inherited SDPA backward must still be exact.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var idx: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for idx := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[idx] - Desired.Raw[idx];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 5;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    NN.AddLayer(TNNetALiBiAttention.Create(Dk, true, {Slope=}0.25));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('ALiBi input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestALiBiAttentionZeroSlopeMatchesSDPA;
+// Equivalence anchor: with Slope=0 the layer must reproduce a plain
+// TNNetScaledDotProductAttention EXACTLY (same causal mask AND same sliding
+// window) - both layers are parameter-free, so the same Q|K|V input must
+// give bit-identical outputs.
+var
+  NNALiBi, NNPlain: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Dk, i: integer;
+begin
+  RandSeed := 424242;
+  SeqLen := 6;
+  Dk := 4;
+  NNALiBi := TNNet.Create();
+  NNPlain := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  try
+    NNALiBi.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    NNALiBi.AddLayer(TNNetALiBiAttention.Create(Dk, true, {Slope=}0, {Window=}3));
+    NNPlain.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    NNPlain.AddLayer(TNNetScaledDotProductAttention.Create(Dk, true, {Window=}3));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 0.9 - 0.15;
+    NNALiBi.Compute(Input);
+    NNPlain.Compute(Input);
+    for i := 0 to NNPlain.GetLastLayer.Output.Size - 1 do
+      AssertEquals('zero-slope ALiBi == plain SDPA at ' + IntToStr(i),
+        NNPlain.GetLastLayer.Output.Raw[i],
+        NNALiBi.GetLastLayer.Output.Raw[i]);
+  finally
+    NNALiBi.Free;
+    NNPlain.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestALiBiAttentionSerializationRoundTrip;
+// SaveToString/LoadFromString must reconstruct a TNNetALiBiAttention (the
+// class is registered in BOTH dispatch tables) with NON-default hyperparams
+// (slope=0.0883883386850357, causal, Window=2) and reproduce Compute
+// exactly. Also checks save->load->save string equality.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn2: TNNetALiBiAttention;
+  S, S2: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := nil;
+  Input := TNNetVolume.Create(5, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 12, 1));
+    NN.AddLayer(TNNetALiBiAttention.Create(4, true,
+      {Slope=}0.0883883386850357, {Window=}2));
+
+    S := NN.SaveToString();
+    NN2 := TNNet.Create();
+    NN2.LoadFromString(S);
+
+    AssertTrue('Loaded layer is TNNetALiBiAttention',
+      NN2.Layers[1] is TNNetALiBiAttention);
+    Attn2 := NN2.Layers[1] as TNNetALiBiAttention;
+    AssertEquals('ALiBi slope round-trips',
+      0.0883883386850357, Attn2.Slope, 1e-7);
+    AssertTrue('ALiBi causal flag round-trips', Attn2.CausalMask);
+    AssertEquals('ALiBi window round-trips', 2, Attn2.Window);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.29) * 0.8 - 0.1;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('ALiBi save/load Compute match at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+
+    S2 := NN2.SaveToString();
+    AssertEquals('ALiBi save->load->save string equality', S, S2);
+  finally
+    NN.Free;
+    if Assigned(NN2) then NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMultiHeadSelfAttentionALiBiShapes;
+// AddMultiHeadSelfAttention with Variant=avALiBi swaps each head's plain
+// SDPA for a TNNetALiBiAttention carrying that head's geometric slope
+// (ALiBiSlope(h, Heads), the HF/BLOOM recipe). Asserts output shape
+// preserved, Heads per-head layers built with the RIGHT slopes (in head
+// order), and a finite forward AND backward pass.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  d_model, Heads, SeqLen, i, headCnt: integer;
+begin
+  RandSeed := 424242;
+  d_model := 8;
+  Heads := 2;
+  SeqLen := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * d_model);
+  Desired := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_model, 1));
+    NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}true, false, avALiBi);
+    NN.SetLearningRate(0.01, 0.0);
+    NN.SetBatchUpdate(true);
+
+    AssertEquals('MHSA-ALiBi out SizeX', SeqLen, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('MHSA-ALiBi out SizeY', 1, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('MHSA-ALiBi out Depth', d_model, NN.GetLastLayer.Output.Depth);
+
+    // H=2: slopes 2^-4, 2^-8 (base = 2^(-(2^-(1-3))) = 2^-4).
+    headCnt := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetALiBiAttention then
+      begin
+        AssertEquals('MHSA-ALiBi head ' + IntToStr(headCnt) + ' slope',
+          TNNetALiBiAttention.ALiBiSlope(headCnt, Heads),
+          TNNetALiBiAttention(NN.Layers[i]).Slope, 1e-9);
+        Inc(headCnt);
+      end;
+    AssertEquals('MHSA-ALiBi has Heads per-head layers', Heads, headCnt);
+    AssertEquals('MHSA-ALiBi head 0 slope value', 0.0625,
+      TNNetALiBiAttention.ALiBiSlope(0, 2), 1e-9);
+    AssertEquals('MHSA-ALiBi head 1 slope value', 0.00390625,
+      TNNetALiBiAttention.ALiBiSlope(1, 2), 1e-9);
+
+    // Finite forward and backward.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('MHSA-ALiBi finite forward at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+    NN.Backpropagate(Desired);
+    for i := 0 to NN.Layers[0].OutputError.Size - 1 do
+      AssertTrue('MHSA-ALiBi finite input gradient at ' + IntToStr(i),
+        not IsNan(NN.Layers[0].OutputError.Raw[i]) and
+        not IsInfinite(NN.Layers[0].OutputError.Raw[i]));
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 

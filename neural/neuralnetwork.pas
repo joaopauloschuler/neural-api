@@ -119,8 +119,14 @@ type
   //                    position bias, Raffel et al. 2020; a learnable scalar
   //                    b[bucket(j-i)] is ADDED to every pre-softmax logit.
   //                    Each head gets its OWN bias table, exactly like T5).
+  //   avALiBi        : TNNetALiBiAttention (ALiBi, Press et al. 2022; a FIXED
+  //                    per-head linear bias slope*(j-i) is ADDED to every
+  //                    pre-softmax logit - no positional embedding at all and
+  //                    zero extra parameters. Head h of H gets the standard
+  //                    geometric slope TNNetALiBiAttention.ALiBiSlope(h, H),
+  //                    the exact HF build_alibi_tensor recipe; BLOOM family).
   TNNetAttentionVariant = (avSDPA, avDifferential, avSink, avCosineSimilarity,
-    avQKNorm, avT5RelPosBias);
+    avQKNorm, avT5RelPosBias, avALiBi);
 
   { TNNetNeuron }
   TNNetNeuron = class(TMObject)
@@ -3266,6 +3272,58 @@ type
       Bidirectional: boolean; pNumBuckets, pMaxDistance: integer): integer;
     property NumBuckets: integer read FNumBuckets;
     property MaxDistance: integer read FMaxDistance;
+  end;
+
+  /// ALiBi attention (Press et al. 2022, "Train Short, Test Long: Attention
+  // with Linear Biases Enables Input Length Extrapolation",
+  // https://arxiv.org/abs/2108.12409).
+  // A drop-in variant of TNNetScaledDotProductAttention that ADDS a FIXED
+  // (non-learnable) linear bias to every pre-softmax logit:
+  //   scores[i,j] = (Q[i].K[j]) / sqrt(d_k) + Slope * (j - i)
+  // There is NO positional embedding at all in an ALiBi stack - the bias is
+  // the only position signal - and the layer adds ZERO parameters. Because
+  // the bias depends only on j - i it is translation invariant, which is what
+  // gives ALiBi its length-extrapolation property (train short, decode long).
+  // In a multi-head stack each head h of H gets its own slope from the
+  // standard geometric recipe (ALiBiSlope below, an EXACT port of HF
+  // transformers' build_alibi_tensor used by the BLOOM family): for H a power
+  // of two, slope_h = 2^(-8(h+1)/H); otherwise the slopes of the closest
+  // lower power of two are extended with the odd-indexed slopes of the next
+  // power of two. NOTE on the sign convention: HF adds slope*j (key position
+  // only); softmax is invariant to a per-row constant, so slope*(j-i) (the
+  // paper's form, used here) yields IDENTICAL attention weights while keeping
+  // the bias bounded for long sequences.
+  // The bias is added only on UNMASKED logits, so causal / sliding-window
+  // masked positions stay masked (-1e9 sentinel); the parent's sliding window
+  // (Window > 0) is honoured. The backward pass is the parent's unchanged:
+  // an additive CONSTANT bias does not alter dL/dQ, dL/dK or dL/dV given the
+  // cached post-softmax weights (the attention-logit soft-cap is NOT exposed
+  // here precisely so the parent's backward stays exact).
+  // KV-cache incremental decode IS supported: the cached path adds
+  // Slope*(j - t) for the current absolute position t, token-exact vs the
+  // full causal forward.
+  // Input layout (same as SDPA): SizeY = 1, SizeX = sequence length,
+  // Depth = 3 * d_k (depth axis = concatenation Q | K | V). Output shape:
+  // SizeX x 1 x d_k. The slope is persisted in FFloatSt[1] (FFloatSt[0] is
+  // the parent's soft-cap slot), so the layer round-trips through
+  // SaveStructureToString / LoadFromString.
+  // Coded by Claude (AI).
+  TNNetALiBiAttention = class(TNNetScaledDotProductAttention)
+  private
+    FSlope: TNeuralFloat;
+    procedure ComputeIncrementalALiBi();
+  public
+    constructor Create(d_k: integer; pCausalMask: boolean = false;
+      pSlope: TNeuralFloat = 0.0625; pWindow: integer = 0); overload;
+    procedure Compute(); override;
+    // EXACT port of the per-head slope recipe in HF transformers'
+    // build_alibi_tensor (modeling_bloom; itself the fairseq/paper recipe).
+    // Head is 0-based (0..NumHeads-1). For NumHeads a power of two this is
+    // 2^(-8(Head+1)/NumHeads); for other head counts the slopes of the
+    // closest LOWER power of two are extended with every other slope of the
+    // doubled table (the odd powers of the doubled base).
+    class function ALiBiSlope(Head, NumHeads: integer): TNeuralFloat;
+    property Slope: TNeuralFloat read FSlope;
   end;
 
   /// Attention with learnable "attention sink" slots (StreamingLLM,
@@ -11164,14 +11222,17 @@ type
       // learnable temperature initialised to sqrt(d_k)) or avT5RelPosBias
       // (TNNetT5RelPosBiasAttention, T5 bucketed relative position bias with
       // ONE learnable bias table PER HEAD, RelPosNumBuckets buckets out to
-      // RelPosMaxDistance). See TNNetAttentionVariant. NumSinks is only
-      // consulted for avSink; RelPosNumBuckets/RelPosMaxDistance only for
-      // avT5RelPosBias.
+      // RelPosMaxDistance) or avALiBi (TNNetALiBiAttention, FIXED per-head
+      // linear bias slope*(j-i) on every logit - no positional embedding at
+      // all, zero parameters; head h of Heads gets the standard geometric
+      // slope ALiBiSlope(h, Heads), the exact HF/BLOOM recipe). See
+      // TNNetAttentionVariant. NumSinks is only consulted for avSink;
+      // RelPosNumBuckets/RelPosMaxDistance only for avT5RelPosBias.
       // Window (default 0 = full attention, the previous behavior) applies a
       // Mistral / Gemma-2-style sliding-window mask of Window keys inside
       // every per-head SDPA (see TNNetScaledDotProductAttention.Create).
-      // Window > 0 requires Variant = avSDPA or avT5RelPosBias (the other
-      // drop-in variants do not implement the window).
+      // Window > 0 requires Variant = avSDPA, avT5RelPosBias or avALiBi (the
+      // other drop-in variants do not implement the window).
       // QKRMSNorm=True inserts a LEARNABLE-SCALE per-head RMSNorm
       // (TNNetTokenRMSNorm) on each head's Q and K slices AFTER the per-head
       // split and BEFORE RoPE - the Gemma-3 / Qwen3 per-head QK-norm (HF
@@ -11215,15 +11276,18 @@ type
       // learnable-temperature QK-Norm) or avT5RelPosBias
       // (TNNetT5RelPosBiasAttention, T5 bucketed relative position bias; ONE
       // learnable bias table per head exactly like T5, RelPosNumBuckets
-      // buckets out to RelPosMaxDistance). See TNNetAttentionVariant.
+      // buckets out to RelPosMaxDistance) or avALiBi (TNNetALiBiAttention,
+      // FIXED per-head linear bias slope*(j-i); the standard geometric
+      // per-head slopes, the exact HF/BLOOM recipe; the ALiBi stack carries
+      // NO positional embedding at all). See TNNetAttentionVariant.
       // avDifferential additionally requires an EVEN per-head dim d_k. NumSinks
       // is only consulted for avSink; RelPosNumBuckets/RelPosMaxDistance only
       // for avT5RelPosBias. The out-projection is identical for all
       // variants (each head still emits depth d_k).
       // Window (default 0 = full attention, the previous behavior) applies a
       // Mistral / Gemma-2-style sliding-window mask of Window keys inside
-      // every per-head SDPA; requires Variant = avSDPA or avT5RelPosBias
-      // when > 0.
+      // every per-head SDPA; requires Variant = avSDPA, avT5RelPosBias or
+      // avALiBi when > 0.
       // QKRMSNorm=True inserts a learnable-scale per-head RMSNorm on each
       // head's Q and K slices BEFORE RoPE (Gemma-3 / Qwen3 per-head QK-norm;
       // see AddMultiHeadSDPAConcat).
@@ -24843,6 +24907,181 @@ begin
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetALiBiAttention }
+
+constructor TNNetALiBiAttention.Create(d_k: integer; pCausalMask: boolean;
+  pSlope: TNeuralFloat; pWindow: integer);
+begin
+  inherited Create(d_k, pCausalMask, pWindow);
+  FSlope := pSlope;
+  if FSlope < 0 then
+    FErrorProc('TNNetALiBiAttention requires Slope >= 0 (the bias is ' +
+      'Slope*(j-i), a PENALTY on distant keys). Slope=' + FloatToStr(FSlope));
+  // FFloatSt[0] is the parent's ScoreSoftCap slot (always 0 here); the slope
+  // persists in FFloatSt[1] so SaveStructureToString round-trips.
+  FFloatSt[1] := FSlope;
+end;
+
+class function TNNetALiBiAttention.ALiBiSlope(Head,
+  NumHeads: integer): TNeuralFloat;
+var
+  ClosestPow2: integer;
+  Base: TNeuralFloat;
+begin
+  if (NumHeads < 1) or (Head < 0) or (Head >= NumHeads) then
+  begin
+    Result := 0;
+    exit;
+  end;
+  // closest_power_of_2 = 2^floor(log2(num_heads))
+  ClosestPow2 := 1;
+  while 2 * ClosestPow2 <= NumHeads do ClosestPow2 := 2 * ClosestPow2;
+  if Head < ClosestPow2 then
+  begin
+    // base = 2^(-(2^-(log2(closest_power_of_2) - 3))); slope = base^(Head+1).
+    Base := Power(2, -Power(2, -(Log2(ClosestPow2) - 3)));
+    Result := Power(Base, Head + 1);
+  end
+  else
+  begin
+    // Extra heads take EVERY OTHER slope of the doubled table: the odd
+    // powers 1, 3, 5, ... of extra_base = 2^(-(2^-(log2(2*cp2) - 3))).
+    Base := Power(2, -Power(2, -(Log2(2 * ClosestPow2) - 3)));
+    Result := Power(Base, 2 * (Head - ClosestPow2) + 1);
+  end;
+end;
+
+procedure TNNetALiBiAttention.Compute();
+const
+  cMaskFloor = -1e8; // same all-masked-row floor as the parent
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  if FCacheEnabled then
+  begin
+    ComputeIncrementalALiBi();
+    exit;
+  end;
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  // Same forward as the parent except that the fixed linear position bias
+  // Slope*(j-i) is ADDED to every unmasked scaled logit (masked logits keep
+  // the -1e9 sentinel so masked positions stay masked).
+  for i := 0 to SeqLen - 1 do
+  begin
+    MaxScore := -1e30;
+    for j := 0 to SeqLen - 1 do
+    begin
+      if (FCausal and (j > i)) or ((FWindow > 0) and (i - j >= FWindow)) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        Score := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
+        Score := Score * FInvSqrtDk + FSlope * (j - i);
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    // Softmax with the parent's all-masked-row policy (zero row, no NaN).
+    if MaxScore <= cMaskFloor then
+    begin
+      for j := 0 to SeqLen - 1 do
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqLen - 1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqLen - 1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Cached incremental decode WITH the linear position bias. The bias depends
+// only on the relative distance j - t (t = the query token's absolute
+// position = its cache slot), so the cached path stays token-exact vs the
+// full causal forward: Slope*(j - t) <= 0 is added to each cached-key score.
+procedure TNNetALiBiAttention.ComputeIncrementalALiBi();
+var
+  StartTime: double;
+  SeqLen, p, j, d, jStart, QPos: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  if FCacheLen + SeqLen > FCacheMax then
+  begin
+    FErrorProc('TNNetALiBiAttention KV cache overflow: ' +
+      IntToStr(FCacheLen) + ' cached + ' + IntToStr(SeqLen) + ' new > MaxContext=' +
+      IntToStr(FCacheMax) + '. Call ResetCache or raise MaxContext.');
+    exit;
+  end;
+  for p := 0 to SeqLen - 1 do
+  begin
+    Move(Prev.GetRawPtr(p, 0, FDk)^, FKCache.GetRawPtr(FCacheLen, 0, 0)^,
+      FDk * SizeOf(TNeuralFloat));
+    Move(Prev.GetRawPtr(p, 0, 2 * FDk)^, FVCache.GetRawPtr(FCacheLen, 0, 0)^,
+      FDk * SizeOf(TNeuralFloat));
+    Inc(FCacheLen);
+    QPos := FCacheLen - 1; // this token's absolute position
+    if (FWindow > 0) and (FCacheLen > FWindow) then
+      jStart := FCacheLen - FWindow
+    else
+      jStart := 0;
+    MaxScore := -1e30;
+    for j := jStart to FCacheLen - 1 do
+    begin
+      // Cached keys are all at or before the query (j <= QPos), exactly the
+      // pairs the full forward leaves unmasked.
+      Score := TNNetVolume.DotProduct(
+        Prev.GetRawPtr(p, 0, 0), FKCache.GetRawPtr(j, 0, 0), FDk) * FInvSqrtDk
+        + FSlope * (j - QPos);
+      FCacheScores[j] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    SumExp := 0;
+    for j := jStart to FCacheLen - 1 do
+    begin
+      Score := pcr_expf(FCacheScores[j] - MaxScore);
+      FCacheScores[j] := Score;
+      SumExp := SumExp + Score;
+    end;
+    OutPtr := FOutput.GetRawPtr(p, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    if SumExp > 0 then
+      for j := jStart to FCacheLen - 1 do
+        TNNetVolume.MulAdd(OutPtr, FVCache.GetRawPtr(j, 0, 0),
+          FCacheScores[j] / SumExp, FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetSinkAttention }
@@ -46226,8 +46465,10 @@ var
 
   // Builds one per-head attention layer (the selected SDPA-family variant)
   // after AfterLayer. All variants share the (SeqLen,1,3*d_k) Q|K|V input and
-  // (SeqLen,1,d_k) output contract, so they are drop-in per head.
-  function AddHeadAttention(AfterLayer: TNNetLayer): TNNetLayer;
+  // (SeqLen,1,d_k) output contract, so they are drop-in per head. HeadIdx is
+  // only consulted by avALiBi (each head gets its own geometric slope).
+  function AddHeadAttention(AfterLayer: TNNetLayer;
+    HeadIdx: integer): TNNetLayer;
   begin
     case Variant of
       avDifferential:
@@ -46247,6 +46488,13 @@ var
         Result := AddLayerAfter(
           TNNetT5RelPosBiasAttention.Create(d_k, CausalMask,
             RelPosNumBuckets, RelPosMaxDistance, Window), AfterLayer);
+      avALiBi:
+        // FIXED per-head slope, the standard geometric ALiBi recipe (exact
+        // HF build_alibi_tensor port; head HeadIdx of Heads).
+        Result := AddLayerAfter(
+          TNNetALiBiAttention.Create(d_k, CausalMask,
+            TNNetALiBiAttention.ALiBiSlope(HeadIdx, Heads), Window),
+          AfterLayer);
     else
       Result := AddLayerAfter(
         TNNetScaledDotProductAttention.Create(d_k, CausalMask, Window),
@@ -46270,10 +46518,11 @@ begin
   if (Variant = avSink) and (NumSinks < 1) then
     FErrorProc('AddMultiHeadSDPAConcat with avSink requires NumSinks >= 1. ' +
       'NumSinks=' + IntToStr(NumSinks));
-  if (Window > 0) and (Variant <> avSDPA) and (Variant <> avT5RelPosBias) then
+  if (Window > 0) and (Variant <> avSDPA) and (Variant <> avT5RelPosBias) and
+     (Variant <> avALiBi) then
     FErrorProc('AddMultiHeadSDPAConcat with Window > 0 requires Variant = ' +
-      'avSDPA or avT5RelPosBias (the other drop-in variants do not ' +
-      'implement the sliding window). Window=' + IntToStr(Window));
+      'avSDPA, avT5RelPosBias or avALiBi (the other drop-in variants do ' +
+      'not implement the sliding window). Window=' + IntToStr(Window));
   if Window < 0 then
     FErrorProc('AddMultiHeadSDPAConcat requires Window >= 0 (0 = full ' +
       'attention). Window=' + IntToStr(Window));
@@ -46310,7 +46559,7 @@ begin
         KSlice := AddLayerAfter(TNNetRotaryEmbedding.Create(), KSlice);
       VSlice := AddLayerAfter(TNNetSplitChannels.Create(VChannels), SliceLayers[HeadCnt]);
       AttnInput := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
-      HeadOutputs[HeadCnt] := AddHeadAttention(AttnInput);
+      HeadOutputs[HeadCnt] := AddHeadAttention(AttnInput, HeadCnt);
     end;
     SetLength(QChannels, 0);
     SetLength(KChannels, 0);
@@ -46319,7 +46568,7 @@ begin
   else
   begin
     for HeadCnt := 0 to Heads - 1 do
-      HeadOutputs[HeadCnt] := AddHeadAttention(SliceLayers[HeadCnt]);
+      HeadOutputs[HeadCnt] := AddHeadAttention(SliceLayers[HeadCnt], HeadCnt);
   end;
   Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   SetLength(SliceLayers, 0);
@@ -82743,6 +82992,7 @@ begin
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetQKNormAttention' :      Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetT5RelPosBiasAttention' : Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
+      'TNNetALiBiAttention' :       Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1);
@@ -83123,6 +83373,7 @@ begin
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetQKNormAttention' then Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetT5RelPosBiasAttention' then Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
+      if S[0] = 'TNNetALiBiAttention' then Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1) else

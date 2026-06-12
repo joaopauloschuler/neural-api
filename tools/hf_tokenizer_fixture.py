@@ -58,6 +58,14 @@ CASES = [
     "café naïve résumé",
     "emoji \U0001f600 test",
     "mixed: café 42 \U0001f680!",
+    # Non-Latin scripts (the BLOOM importer's multilingual byte-level BPE
+    # stresses these end-to-end; byte-level and byte-fallback tokenizers
+    # must round-trip them exactly, and the JSON path must survive
+    # fpjson's \uXXXX handling - see the HF tokenizer notes):
+    "你好，世界！",                 # Chinese
+    "مرحبا بالعالم",                # Arabic (RTL)
+    "नमस्ते दुनिया",                  # Hindi (Devanagari, combining marks)
+    "Привет, мир: 多语言 café",     # mixed Cyrillic + CJK + Latin accent
     "",
 ]
 
@@ -161,15 +169,20 @@ def main():
     ms_path, ms_cases = build_reusing(build_metaspace,
                                       'tiny_bpe_metaspace_tokenizer.json')
     wp_path, wp_cases = build_wordpiece()
-    out = {
-        "byte_level": {"tokenizer": os.path.basename(bl_path),
-                       "cases": bl_cases},
-        "metaspace": {"tokenizer": os.path.basename(ms_path),
-                      "cases": ms_cases},
-        "wordpiece": {"tokenizer": os.path.basename(wp_path),
-                      "cases": wp_cases},
-    }
     cases_path = os.path.join(FIXDIR, 'hf_tokenizer_cases.json')
+    # Merge into the existing fixture so families pinned by OTHER
+    # generators (tools/hf_pretok_fixture.py: split_qwen2, split_cl100k,
+    # metaspace_pretok) survive a re-run of this script.
+    out = {}
+    if os.path.exists(cases_path):
+        with open(cases_path) as f:
+            out = json.load(f)
+    out["byte_level"] = {"tokenizer": os.path.basename(bl_path),
+                         "cases": bl_cases}
+    out["metaspace"] = {"tokenizer": os.path.basename(ms_path),
+                        "cases": ms_cases}
+    out["wordpiece"] = {"tokenizer": os.path.basename(wp_path),
+                        "cases": wp_cases}
     with open(cases_path, 'w') as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
     for p in (bl_path, ms_path, wp_path, cases_path):

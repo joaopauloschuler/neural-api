@@ -104,6 +104,7 @@ type
     procedure TestGemma3LogitParity;
     procedure TestRWKVLogitParity;
     procedure TestMambaLogitParity;
+    procedure TestBloomLogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
     procedure TestGPTNeoXConfigFromJSONFile;
@@ -2107,6 +2108,101 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_mamba_logits.json'), 8, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the BLOOM import target - the suite's FIRST ALiBi importer (HF
+// model_type "bloom", architectures ["BloomForCausalLM"], the
+// bigscience/bloom-560m..bloomz family): tests/fixtures/tiny_bloom.* is a
+// pico SLICE of the REAL bigscience/bloom-560m checkpoint (the make_pico
+// recipe; every kept value is a genuine pretrained FP16 weight - the
+// fixture also exercises the reader's FP16 decode): first 2 layers, first
+// 3 heads x first 4 dims (head count deliberately NON-power-of-two, so the
+// extra-slope branch of the HF build_alibi_tensor recipe is on the parity
+// path: slopes 0.0625, 0.00390625 from the closest-power-of-two=2 table,
+// then 0.25 from the doubled table's odd powers), hidden 12, vocab 12,
+// always-tied head. The generator tools/bloom_tiny_fixture.py ASSERTS
+// ALiBi is non-vacuous (zeroing build_alibi_tensor moves the logits ~1e-3,
+// above the 1e-4 parity gate, so wrong/missing slopes FAIL this test).
+// Covered quirks: (a) NO positional embedding anywhere - position enters
+// ONLY as the per-head TNNetALiBiAttention slope; (b) the embedding
+// LayerNorm (word_embeddings_layernorm) BEFORE the first block; (c) the
+// fused per-head [q|k|v] query_key_value de-interleave (same h-major
+// layout as GPT-NeoX, NO rotary permutation); (d) sequential pre-LN
+// residuals with the Megatron tanh GELU; (e) the always-tied LM head +
+// ln_f; (f) the legacy config spellings (n_embed / num_attention_heads /
+// n_layer, n_inner null = 4*hidden). Reference logits come from HF
+// transformers in float64. The BuildFromPretrained model_type "bloom"
+// dispatch route is covered too.
+procedure TTestNeuralPretrained.TestBloomLogitParity;
+var
+  NN: TNNet;
+  Config: TBloomConfig;
+  LayerCnt, ALiBiCnt, LNCnt: integer;
+  HeadIdx: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildBloomFromSafeTensorsEx(FixturePath('tiny_bloom.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_bloom_config.json'));
+  try
+    AssertEquals('model_type', 'bloom', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads (non-power-of-two)', 3, Config.NumHeads);
+    AssertEquals('hidden', 12, Config.HiddenSize);
+    AssertEquals('intermediate (n_inner null = 4*hidden)', 48,
+      Config.IntermediateSize);
+    AssertEquals('vocab', 12, Config.VocabSize);
+    AssertEquals('seq_length', 16, Config.SeqLength);
+    AssertEquals('layer_norm_epsilon', 1e-5, Config.LayerNormEps, 1e-9);
+    AssertEquals('prefix', 'transformer.', Config.Prefix);
+    // Structure: NumHeads TNNetALiBiAttention per block, each carrying the
+    // EXACT HF build_alibi_tensor slope for its head index (the H=3
+    // non-power-of-two recipe: 0.0625, 0.00390625 from the cp2=2 table,
+    // 0.25 from the doubled table); LayerNorms = embedding LN + 2 per
+    // block + ln_f = 6; NO positional embedding and NO RoPE anywhere.
+    ALiBiCnt := 0;
+    LNCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetALiBiAttention then
+      begin
+        HeadIdx := ALiBiCnt mod Config.NumHeads;
+        AssertEquals('ALiBi head ' + IntToStr(ALiBiCnt) + ' slope',
+          TNNetALiBiAttention.ALiBiSlope(HeadIdx, Config.NumHeads),
+          TNNetALiBiAttention(NN.Layers[LayerCnt]).Slope, 1e-9);
+        Inc(ALiBiCnt);
+      end;
+      if NN.Layers[LayerCnt] is TNNetTokenLayerNorm then Inc(LNCnt);
+      AssertFalse('no RoPE in a BLOOM net (ALiBi is the position signal)',
+        NN.Layers[LayerCnt] is TNNetRotaryEmbedding);
+      AssertFalse('no positional embedding in a BLOOM net',
+        NN.Layers[LayerCnt] is TNNetAddPositionalEmbedding);
+    end;
+    AssertEquals('TNNetALiBiAttention count (heads per block)',
+      Config.NumLayers * Config.NumHeads, ALiBiCnt);
+    AssertEquals('LayerNorm count (embedding LN + 2/block + ln_f)', 6, LNCnt);
+    // Pin two slope values against the H=3 HF recipe explicitly.
+    AssertEquals('H=3 head 0 slope', 0.0625,
+      TNNetALiBiAttention.ALiBiSlope(0, 3), 1e-9);
+    AssertEquals('H=3 head 2 slope (doubled-table odd power)', 0.25,
+      TNNetALiBiAttention.ALiBiSlope(2, 3), 1e-9);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_bloom_logits.json'), Config.SeqLength,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "bloom" (architectures ["BloomForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_bloom.safetensors'),
+    {SeqLen=}16, {pInferenceOnly=}false,
+    FixturePath('tiny_bloom_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_bloom_logits.json'), 16, 12);
   finally
     NN.Free;
   end;
