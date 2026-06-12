@@ -415,7 +415,7 @@ rather than acted on.
       landed BuildMambaFromSafeTensors importer; needs an incremental
       TNNetSelectiveSSM state-carry path, the sibling of the RWKV-4
       decode demo task above).
-- [ ] Whisper-tiny importer (openai/whisper-tiny, 39M) — the FIRST speech
+- [X] Whisper-tiny importer (openai/whisper-tiny, 39M) — the FIRST speech
       model import (the landed T5 importer is text-to-text; this one
       exercises cross-attention from a non-text modality). Every hard
       ingredient is already landed:
@@ -439,6 +439,17 @@ rather than acted on.
       transformers WhisperModel on a sliced pico fixture with a pinned
       mel input; headline demo: examples/WhisperTranscribe transcribing a
       short WAV to text on CPU.
+      LANDED: neural/neuralaudio.pas (WAV reader + exact HF
+      WhisperFeatureExtractor log-mel, direct 400-pt rDFT since 400 is
+      not a power of two; frontend parity 1.1e-5 vs the float64 oracle),
+      BuildWhisperFromSafeTensors in neuralpretrained.pas (two-net RunT5
+      convention; conv frontend via TNNetPadXY+TNNetConvolutionLinear,
+      pre-norm blocks, bias-free k_proj, exact erf GELU, tied head,
+      sinusoidal-encoder/learned-decoder positions), pico fixture
+      tools/whisper_tiny_fixture.py + tests (encoder hidden 2.7e-6,
+      decoder logits 4.8e-6); examples/WhisperTranscribe transcribes
+      jfk.wav correctly with the real 39M checkpoint on CPU (~5 min,
+      2.5 GB RSS).
 - [X] DeepSeek-V2 importer (model_type "deepseek_v2"; DeepSeek-V2-Lite is
       the reference checkpoint) — the FIRST importer to exercise the two
       most distinctive landed-but-never-imported blocks:

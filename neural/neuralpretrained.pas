@@ -76,6 +76,14 @@ unit neuralpretrained;
 //     encoder-decoder import (POST-norm blocks, static sinusoidal
 //     positions, swish FFN, tied head + final_logits_bias). Runs through
 //     the same RunT5 two-net convention. See the MARIAN IMPORT section.
+//   - Whisper (model_type "whisper": the openai/whisper-* speech-to-text
+//     checkpoints) - BuildWhisperFromSafeTensors, the FIRST SPEECH import
+//     and the third encoder-decoder: log-mel spectrogram input (computed
+//     by neural/neuralaudio.pas), conv1d+GELU frontend with a stride-2
+//     halving, fixed sinusoidal encoder positions, learned decoder
+//     positions, PRE-norm blocks with final stack norms, bias-free
+//     k_proj, exact erf GELU, tied head. Runs through the same RunT5
+//     two-net convention. See the WHISPER IMPORT section.
 //   - RWKV-4 (model_type "rwkv": RWKV/rwkv-4-169m-pile and siblings) -
 //     BuildRWKVFromSafeTensors, the FIRST NON-TRANSFORMER import: a
 //     recurrent WKV mixer (TNNetWKV + TNNetTokenShift) with constant
@@ -1414,6 +1422,113 @@ procedure BuildMarianFromSafeTensorsWithConfig(const FileName: string;
 procedure BuildMarianFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TMarianConfig;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// ---------------------------------------------------------------------------
+// WHISPER IMPORT (model_type "whisper": the openai/whisper-* speech-to-text
+// checkpoints; architectures ["WhisperForConditionalGeneration"]) - the
+// FIRST SPEECH importer and the THIRD encoder-decoder import after T5 and
+// Marian (same two-net + RunT5 convention). Radford et al. 2022,
+// arXiv:2212.04356. Differences from the text encoder-decoders:
+//   - the ENCODER input is NOT token ids but a LOG-MEL SPECTROGRAM volume
+//     (2*max_source_positions frames, 1, num_mel_bins) - produced by
+//     ComputeWhisperLogMel / WhisperLogMelFromWavFile in
+//     neural/neuralaudio.pas (the exact HF WhisperFeatureExtractor recipe:
+//     400-pt periodic-hann STFT, hop 160, slaney mel bank, log10,
+//     global max-8 clamp, (x+4)/4); 30 s of 16 kHz audio = 3000 frames;
+//   - conv frontend instead of an embedding: Conv1d(num_mel_bins ->
+//     d_model, k=3, s=1, p=1) + EXACT erf GELU, then Conv1d(d_model ->
+//     d_model, k=3, s=2, p=1) + GELU - the stride-2 conv HALVES the frames
+//     to max_source_positions (1500 for the published checkpoints), the
+//     encoder grid the decoder cross-attends to. Each conv is built as
+//     TNNetPadXY(1,0) + TNNetConvolutionLinear (kernel Y clamps to the
+//     sequence's SizeY=1, so the (3,1) kernel + X-only pad reproduce
+//     nn.Conv1d's SAME padding exactly);
+//   - FIXED sinusoidal encoder positions in the WHISPER layout - concat
+//     sin|cos halves with timescale exponent c/(d/2 - 1), NOT the
+//     interleaved Vaswani layout and NOT Marian's 2c/d exponent - added
+//     AFTER the conv frontend. Real checkpoints SAVE the table
+//     (model.encoder.embed_positions.weight) and it is loaded when
+//     present; otherwise it is regenerated from the formula. Decoder
+//     positions are LEARNED (model.decoder.embed_positions.weight) like
+//     GPT-2's wpe;
+//   - PRE-norm blocks (biased nn.LayerNorm eps 1e-5 BEFORE each sublayer,
+//     residual adds the raw stream) with a FINAL stack LayerNorm in BOTH
+//     stacks - vs Marian's post-norm;
+//   - attention: q/v/out projections biased, k_proj BIAS-FREE, standard
+//     1/sqrt(head_dim) scaling; decoder self-attention causal;
+//     cross-attention reads the encoder states through TNNetCrossAttention
+//     (rectangular DecSeqLen x max_source_positions scores);
+//   - EXACT erf GELU FFNs (activation_function "gelu" in every published
+//     Whisper config) - composed from existing layers like the BERT path;
+//   - tied LM head (proj_out = decoder.embed_tokens, bias-free; the
+//     proj_out.weight tensor is absent from real checkpoints).
+// Tensor names: model.encoder.{conv1,conv2}.{weight,bias},
+// model.{encoder,decoder}.embed_positions.weight (encoder's optional),
+// model.decoder.embed_tokens.weight, model.{encoder,decoder}.layers.N.
+// {self_attn,encoder_attn (decoder only)}.{q,k,v}_proj/out_proj,
+// ...{self_attn,encoder_attn,final}_layer_norm.{weight,bias},
+// ...{fc1,fc2}.{weight,bias}, model.{encoder,decoder}.layer_norm.
+// BuildFromPretrained does NOT dispatch "whisper" (it returns ONE net); it
+// raises an error pointing here instead. Decoding starts from the prologue
+// <|startoftranscript|>[<|lang|>]<|transcribe|><|notimestamps|> (token ids
+// from generation_config.json / the GPT-2-style byte-level BPE
+// tokenizer.json, which neuralhftokenizer.pas reads); see
+// examples/WhisperTranscribe.
+
+type
+  TWhisperConfig = record
+    DModel: integer;            // d_model (must be EVEN and >= 4)
+    EncoderLayers: integer;     // encoder_layers
+    DecoderLayers: integer;     // decoder_layers
+    EncoderHeads: integer;      // encoder_attention_heads
+    DecoderHeads: integer;      // decoder_attention_heads
+    EncoderFFNDim: integer;     // encoder_ffn_dim
+    DecoderFFNDim: integer;     // decoder_ffn_dim
+    VocabSize: integer;         // vocab_size (51865 in whisper-tiny)
+    NumMelBins: integer;        // num_mel_bins (80; the encoder input depth)
+    MaxSourcePositions: integer; // max_source_positions (1500): the FIXED
+                                // encoder length; mel input = 2x frames
+    MaxTargetPositions: integer; // max_target_positions (448)
+    PadTokenId: integer;        // pad_token_id
+    EosTokenId: integer;        // eos_token_id (<|endoftext|>)
+    DecoderStartTokenId: integer; // decoder_start_token_id
+                                // (<|startoftranscript|>)
+    ScaleEmbedding: boolean;    // scale_embedding (false in every release)
+    ModelType: string;          // 'whisper'
+  end;
+
+// Reads a HF Whisper config.json (model_type "whisper"). Required: d_model,
+// encoder_layers, decoder_layers, encoder_attention_heads,
+// decoder_attention_heads, encoder_ffn_dim, decoder_ffn_dim, vocab_size,
+// num_mel_bins, max_source_positions, max_target_positions. Defaults follow
+// WhisperConfig: pad 50256, eos 50256, decoder_start 50257,
+// scale_embedding false. activation_function must be "gelu" (the exact erf
+// form; every published Whisper pins it).
+function ReadWhisperConfigFromJSONFile(const FileName: string): TWhisperConfig;
+
+function WhisperConfigToString(const Config: TWhisperConfig): string;
+
+// Builds the Whisper ENCODER ((2*max_source_positions,1,num_mel_bins)
+// log-mel volume -> (max_source_positions,1,d_model) final hidden states)
+// and the two-input DECODER ((DecSeqLen,1,1) token ids +
+// (max_source_positions,1,d_model) encoder-states second TNNetInput ->
+// (DecSeqLen,1,vocab) logits) and loads every weight from the checkpoint
+// at FileName (.safetensors, sharded index or pytorch_model.bin). The
+// encoder length is FIXED by the config (like HF, which rejects any other
+// mel length); only DecSeqLen is chosen at build time (1..
+// max_target_positions). Both nets are owned by the caller. pInferenceOnly
+// = True frees training volumes during construction. Run the pair with
+// RunT5 (the generic two-net runner).
+procedure BuildWhisperFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TWhisperConfig; out EncoderNet, DecoderNet: TNNet;
+  DecSeqLen: integer; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildWhisperFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TWhisperConfig;
+  DecSeqLen: integer; pInferenceOnly: boolean = false;
   const ConfigFileName: string = '');
 
 // ---------------------------------------------------------------------------
@@ -7714,6 +7829,652 @@ begin
     DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly);
 end;
 
+function ReadWhisperConfigFromJSONFile(const FileName: string): TWhisperConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Whisper import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Whisper import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Whisper import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Whisper import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Whisper import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'whisper');
+    if ModelType <> 'whisper' then
+      ImportError('Whisper import: config model_type is "' + ModelType +
+        '" - only "whisper" is supported here (see BuildFromPretrained ' +
+        'for the full dispatch).');
+    Result.ModelType := ModelType;
+    Result.DModel := RequiredInt('d_model');
+    Result.EncoderLayers := RequiredInt('encoder_layers');
+    Result.DecoderLayers := RequiredInt('decoder_layers');
+    Result.EncoderHeads := RequiredInt('encoder_attention_heads');
+    Result.DecoderHeads := RequiredInt('decoder_attention_heads');
+    Result.EncoderFFNDim := RequiredInt('encoder_ffn_dim');
+    Result.DecoderFFNDim := RequiredInt('decoder_ffn_dim');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumMelBins := RequiredInt('num_mel_bins');
+    Result.MaxSourcePositions := RequiredInt('max_source_positions');
+    Result.MaxTargetPositions := RequiredInt('max_target_positions');
+    // The HF WhisperConfig defaults (the released checkpoints pin their
+    // own special-token ids explicitly - tiny: pad/eos 50257-region ids).
+    Result.PadTokenId := Obj.Get('pad_token_id', 50256);
+    Result.EosTokenId := Obj.Get('eos_token_id', 50256);
+    Result.DecoderStartTokenId := Obj.Get('decoder_start_token_id', 50257);
+    Result.ScaleEmbedding := Obj.Get('scale_embedding', False);
+    // Every published Whisper recipe uses "gelu" - the EXACT erf form.
+    // Anything else is rejected to avoid a silent activation mismatch.
+    ActFn := Obj.Get('activation_function', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('Whisper import: activation_function "' + ActFn +
+        '" is not supported - every published Whisper uses "gelu".');
+    if not Obj.Get('tie_word_embeddings', True) then
+      ImportError('Whisper import: tie_word_embeddings=false is not ' +
+        'supported - Whisper ties proj_out to the decoder embedding.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function WhisperConfigToString(const Config: TWhisperConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'whisper'
+  else Result := Config.ModelType;
+  Result := Result + ' config: enc_layers=' + IntToStr(Config.EncoderLayers) +
+    ', dec_layers=' + IntToStr(Config.DecoderLayers) +
+    ', enc_heads=' + IntToStr(Config.EncoderHeads) +
+    ', dec_heads=' + IntToStr(Config.DecoderHeads) +
+    ', d_model=' + IntToStr(Config.DModel) +
+    ', enc_ffn=' + IntToStr(Config.EncoderFFNDim) +
+    ', dec_ffn=' + IntToStr(Config.DecoderFFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', mel_bins=' + IntToStr(Config.NumMelBins) +
+    ', max_src=' + IntToStr(Config.MaxSourcePositions) +
+    ', max_tgt=' + IntToStr(Config.MaxTargetPositions) +
+    ', pad=' + IntToStr(Config.PadTokenId) +
+    ', eos=' + IntToStr(Config.EosTokenId) +
+    ', dec_start=' + IntToStr(Config.DecoderStartTokenId) +
+    ', scale_embedding=' + BoolToStr(Config.ScaleEmbedding, true);
+end;
+
+// Appends the EXACT erf GELU 0.5*x*(1+erf(x/sqrt(2))) after the current
+// last layer - the same composition the BERT/GPT-NeoX importers use:
+// Phi(x) = MulByConstant(1/sqrt(2)) -> Erf -> AddConstant(1) ->
+// MulByConstant(0.5), then DeepConcat([Phi, x]) -> ReGLU multiplies the
+// two halves (Phi is always positive, so the ReLU inside ReGLU is a
+// pass-through on it).
+procedure AddWhisperExactGelu(NN: TNNet);
+var
+  GELUSource, PhiBranch: TNNetLayer;
+begin
+  GELUSource := NN.GetLastLayer();
+  NN.AddLayerAfter(
+    TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
+  NN.AddLayer( TNNetErf.Create() );
+  NN.AddLayer( TNNetAddConstant.Create(1.0) );
+  PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+  NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
+  NN.AddLayer( TNNetReGLU.Create() );
+end;
+
+// Grows one Whisper stack (encoder or decoder) onto NN after the frontend
+// (conv+positions / embedding+positions). PRE-norm wiring: every sublayer
+// norms FIRST (self_attn_layer_norm / encoder_attn_layer_norm /
+// final_layer_norm), the residual adds the RAW stream - the opposite of
+// Marian's post-norm; the caller appends the FINAL stack LayerNorm.
+// IsDecoder adds the causal mask on self-attention plus the
+// cross-attention sub-block reading Keys|Values from EncStates (the
+// decoder net's second TNNetInput) - TNNetCrossAttention forms the
+// rectangular DecSeqLen x EncSeqLen scores. The layer-handle records are
+// shared with the Marian loader types; .Norm holds each sublayer's PRE
+// norm here.
+procedure BuildWhisperStackBlocks(NN: TNNet; const Config: TWhisperConfig;
+  NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
+  EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
+  pInferenceOnly: boolean);
+var
+  HeadDim, BlockCnt, HeadCnt, d: integer;
+  BranchInput, NormOut: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
+  Heads: array of TNNetLayer;
+  SliceChannels: array of integer;
+begin
+  HeadDim := Config.DModel div NumHeads;
+  SetLength(Blocks, NumBlocks);
+  SetLength(SliceChannels, HeadDim);
+  SetLength(Heads, NumHeads);
+  for BlockCnt := 0 to NumBlocks - 1 do
+  begin
+    // ---- self-attention sub-block (norm FIRST, then residual add) ----
+    // Standard softmax(QK^T/sqrt(head_dim)) per head - exactly what
+    // TNNetScaledDotProductAttention computes, so the q/k/v weights load
+    // unmodified.
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+    NormOut := NN.GetLastLayer();
+    Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), NormOut);
+    Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), NormOut);
+    Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), NormOut);
+    for HeadCnt := 0 to NumHeads - 1 do
+    begin
+      for d := 0 to HeadDim - 1 do
+        SliceChannels[d] := HeadCnt * HeadDim + d;
+      QSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.QProj);
+      KSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.KProj);
+      VSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.VProj);
+      HeadPack := NN.AddLayer(
+        TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+      Heads[HeadCnt] := NN.AddLayerAfter(
+        TNNetScaledDotProductAttention.Create(HeadDim,
+          {CausalMask=}IsDecoder), HeadPack);
+    end;
+    NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+    Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+
+    // ---- cross-attention sub-block (decoder only) ----
+    // Queries from the pre-normed decoder stream; Keys|Values projected
+    // from EncStates - the two grids have DIFFERENT lengths, so the
+    // per-head leaf is TNNetCrossAttention (rectangular DecSeqLen x
+    // EncSeqLen scores; a Q|K|V DeepConcat would be illegal across
+    // unequal SizeX).
+    if IsDecoder then
+    begin
+      BranchInput := NN.GetLastLayer();
+      Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+      NormOut := NN.GetLastLayer();
+      Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), NormOut);
+      Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+      Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+      for HeadCnt := 0 to NumHeads - 1 do
+      begin
+        for d := 0 to HeadDim - 1 do
+          SliceChannels[d] := HeadCnt * HeadDim + d;
+        QSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.QProj);
+        KSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.KProj);
+        VSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.VProj);
+        KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+        Heads[HeadCnt] := NN.AddLayerAfter(
+          TNNetCrossAttention.Create(HeadDim, {CausalMask=}false,
+            KVPack), QSlice);
+      end;
+      NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+      Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.DModel) );
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    end;
+
+    // ---- FFN sub-block: x := x + fc2(gelu(fc1(final_layer_norm(x)))) ----
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].FFNNorm := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+    Blocks[BlockCnt].Fc1 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(FFNDim) );
+    AddWhisperExactGelu(NN);
+    Blocks[BlockCnt].Fc2 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+  end;
+  SetLength(SliceChannels, 0);
+  SetLength(Heads, 0);
+end;
+
+// Fills a TNNetLearnedPositionalEmbedding table (SeqLen rows of DModel)
+// with the WHISPER sinusoids (modeling_whisper.sinusoids - the original
+// OpenAI formula):
+//   inv_timescale[c]      = exp(-ln(10000) * c / (DModel/2 - 1))
+//   table[pos, c]          = sin(pos * inv_timescale[c])  for c < DModel/2
+//   table[pos, DModel/2+c] = cos(pos * inv_timescale[c])
+// Same concat-sin|cos layout as Marian but a DIFFERENT timescale exponent:
+// c/(half-1) (the LAST column pair reaches 1/10000 exactly) vs Marian's
+// 2c/DModel. Real checkpoints carry the tensor; this is the fallback when
+// it is absent. HF builds it in float32; these doubles round to the same
+// float32 values.
+procedure FillWhisperSinusoidalPositions(Layer: TNNetLayer;
+  SeqLen, DModel: integer);
+var
+  PosCnt, ChCnt, Half: integer;
+  Angle: double;
+begin
+  Half := DModel div 2;
+  for PosCnt := 0 to SeqLen - 1 do
+    for ChCnt := 0 to Half - 1 do
+    begin
+      Angle := PosCnt * Exp(-Ln(10000.0) * ChCnt / (Half - 1));
+      Layer.Neurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
+      Layer.Neurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
+        Cos(Angle);
+    end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads one Whisper attention sub-block's q/k/v/out projections (HF
+// nn.Linear [d_model, d_model]; q/v/out BIASED, k_proj BIAS-FREE) plus its
+// PRE-LayerNorm (NormPrefix, weight+bias).
+procedure LoadWhisperAttn(Reader: TNNetSafeTensorsReader;
+  const Attn: TMarianAttnLayers; const AttnPrefix, NormPrefix: string;
+  const Config: TWhisperConfig; Consumed: TStringList);
+begin
+  LoadLlamaLinearWeights(Reader, Attn.QProj, AttnPrefix + 'q_proj.weight',
+    Config.DModel, Config.DModel, 0, -1, 0, AttnPrefix + 'q_proj.bias');
+  Consumed.Add(AttnPrefix + 'q_proj.weight');
+  Consumed.Add(AttnPrefix + 'q_proj.bias');
+  // k_proj has NO bias in Whisper (the loader zeroes the layer's bias).
+  LoadLlamaLinearWeights(Reader, Attn.KProj, AttnPrefix + 'k_proj.weight',
+    Config.DModel, Config.DModel, 0, -1, 0, '');
+  Consumed.Add(AttnPrefix + 'k_proj.weight');
+  LoadLlamaLinearWeights(Reader, Attn.VProj, AttnPrefix + 'v_proj.weight',
+    Config.DModel, Config.DModel, 0, -1, 0, AttnPrefix + 'v_proj.bias');
+  Consumed.Add(AttnPrefix + 'v_proj.weight');
+  Consumed.Add(AttnPrefix + 'v_proj.bias');
+  LoadLlamaLinearWeights(Reader, Attn.OProj, AttnPrefix + 'out_proj.weight',
+    Config.DModel, Config.DModel, 0, -1, 0, AttnPrefix + 'out_proj.bias');
+  Consumed.Add(AttnPrefix + 'out_proj.weight');
+  Consumed.Add(AttnPrefix + 'out_proj.bias');
+  LoadLayerNormWeights(Reader, Attn.Norm, NormPrefix + '.weight',
+    NormPrefix + '.bias', Config.DModel);
+  Consumed.Add(NormPrefix + '.weight');
+  Consumed.Add(NormPrefix + '.bias');
+end;
+
+// Loads one full Whisper stack: per-block self-attention (+
+// cross-attention in the decoder) with their pre-norms, plus fc1/fc2 and
+// the block's final_layer_norm (the FFN's pre-norm).
+procedure LoadWhisperStack(Reader: TNNetSafeTensorsReader;
+  const Blocks: TMarianBlockArray; const StackPrefix: string;
+  const Config: TWhisperConfig; FFNDim: integer; IsDecoder: boolean;
+  Consumed: TStringList);
+var
+  BlockCnt: integer;
+  BP: string;
+begin
+  for BlockCnt := 0 to High(Blocks) do
+  begin
+    BP := StackPrefix + IntToStr(BlockCnt) + '.';
+    LoadWhisperAttn(Reader, Blocks[BlockCnt].SelfAttn, BP + 'self_attn.',
+      BP + 'self_attn_layer_norm', Config, Consumed);
+    if IsDecoder then
+      LoadWhisperAttn(Reader, Blocks[BlockCnt].CrossAttn,
+        BP + 'encoder_attn.', BP + 'encoder_attn_layer_norm', Config,
+        Consumed);
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc1,
+      BP + 'fc1.weight', Config.DModel, FFNDim, 0, -1, 0, BP + 'fc1.bias');
+    Consumed.Add(BP + 'fc1.weight');
+    Consumed.Add(BP + 'fc1.bias');
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
+      BP + 'fc2.weight', FFNDim, Config.DModel, 0, -1, 0, BP + 'fc2.bias');
+    Consumed.Add(BP + 'fc2.weight');
+    Consumed.Add(BP + 'fc2.bias');
+    LoadLayerNormWeights(Reader, Blocks[BlockCnt].FFNNorm,
+      BP + 'final_layer_norm.weight', BP + 'final_layer_norm.bias',
+      Config.DModel);
+    Consumed.Add(BP + 'final_layer_norm.weight');
+    Consumed.Add(BP + 'final_layer_norm.bias');
+  end;
+end;
+
+// Loads one Whisper frontend conv (HF nn.Conv1d, weight [OutDim, InDim, 3],
+// biased) into a TNNetConvolutionLinear built with a (3,1) kernel on the
+// (SeqLen, 1, InDim) sequence grid. Tap k of HF's kernel multiplies the
+// SAME padded input frame as tap x=k of the (3,1) kernel, so the layout
+// map is Neurons[o].Weights[x*InDim + i] = W[o, i, x].
+procedure LoadWhisperConv1D(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; InDim, OutDim: integer;
+  Consumed: TStringList);
+var
+  W, B: TNNetVolume;
+  o, i, kk: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Whisper import: missing tensor "' + WName + '".');
+  if not Reader.HasTensor(BName) then
+    ImportError('Whisper import: missing tensor "' + BName + '".');
+  if (Reader.DimCount(WName) <> 3) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) or
+     (Reader.DimSize(WName, 2) <> 3) then
+    ImportError('Whisper import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + ', 3] (nn.Conv1d ' +
+      'stores [out, in, kernel]), got ' + Reader.ShapeAsString(WName));
+  if (Reader.DimCount(BName) <> 1) or
+     (Reader.DimSize(BName, 0) <> OutDim) then
+    ImportError('Whisper import: "' + BName + '" must have shape [' +
+      IntToStr(OutDim) + '], got ' + Reader.ShapeAsString(BName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('Whisper import: internal error - conv layer for "' +
+      WName + '" has ' + IntToStr(Layer.Neurons.Count) +
+      ' neurons, expected ' + IntToStr(OutDim) + '.');
+  if Layer.Neurons[0].Weights.Size <> 3 * InDim then
+    ImportError('Whisper import: internal error - conv neuron for "' +
+      WName + '" has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(3 * InDim) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    for o := 0 to OutDim - 1 do
+    begin
+      for kk := 0 to 2 do
+        for i := 0 to InDim - 1 do
+          Layer.Neurons[o].Weights.FData[kk * InDim + i] :=
+            W.FData[(o * InDim + i) * 3 + kk];
+      Layer.Neurons[o].BiasWeight := B.FData[o];
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+  Consumed.Add(WName);
+  Consumed.Add(BName);
+end;
+
+procedure BuildWhisperFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TWhisperConfig; out EncoderNet, DecoderNet: TNNet;
+  DecSeqLen: integer; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TMarianBlockArray;
+  DecEmbed, EncPos, DecPos: TNNetLayer;
+  Conv1, Conv2: TNNetLayer;
+  EncFinalNorm, DecFinalNorm: TNNetLayer;
+  DecTokenInput, EncStates, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j, NumInputFrames: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  // ---------------- Config validation ----------------
+  if DecSeqLen < 1 then
+    ImportError('Whisper import: DecSeqLen must be >= 1, got ' +
+      IntToStr(DecSeqLen) + '.');
+  if DecSeqLen > Config.MaxTargetPositions then
+    ImportError('Whisper import: DecSeqLen must not exceed ' +
+      'max_target_positions = ' + IntToStr(Config.MaxTargetPositions) + '.');
+  if Odd(Config.DModel) or (Config.DModel < 4) then
+    ImportError('Whisper import: d_model must be EVEN and >= 4 (the ' +
+      'concat sin|cos sinusoidal table), got ' +
+      IntToStr(Config.DModel) + '.');
+  if (Config.EncoderHeads < 1) or
+     ((Config.DModel mod Config.EncoderHeads) <> 0) then
+    ImportError('Whisper import: encoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.EncoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  if (Config.DecoderHeads < 1) or
+     ((Config.DModel mod Config.DecoderHeads) <> 0) then
+    ImportError('Whisper import: decoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.DecoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  if Config.MaxSourcePositions < 2 then
+    ImportError('Whisper import: max_source_positions must be >= 2, got ' +
+      IntToStr(Config.MaxSourcePositions) + '.');
+  NumInputFrames := 2 * Config.MaxSourcePositions;
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if not Reader.HasTensor('model.decoder.embed_tokens.weight') then
+        ImportError('Whisper import: "model.decoder.embed_tokens.weight" ' +
+          'not found in ' + Reader.FileName + ' - not a Whisper checkpoint?');
+      if (Reader.DimCount('model.decoder.embed_tokens.weight') <> 2) or
+         (Reader.DimSize('model.decoder.embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize('model.decoder.embed_tokens.weight', 1) <>
+          Config.DModel) then
+        ImportError('Whisper import: model.decoder.embed_tokens.weight ' +
+          'must have shape [' + IntToStr(Config.VocabSize) + ', ' +
+          IntToStr(Config.DModel) + '], got ' +
+          Reader.ShapeAsString('model.decoder.embed_tokens.weight'));
+      if not Reader.HasTensor('model.decoder.embed_positions.weight') then
+        ImportError('Whisper import: ' +
+          '"model.decoder.embed_positions.weight" (the LEARNED decoder ' +
+          'positions) not found in ' + Reader.FileName + '.');
+      if (Reader.DimCount('model.decoder.embed_positions.weight') <> 2) or
+         (Reader.DimSize('model.decoder.embed_positions.weight', 0) <>
+          Config.MaxTargetPositions) or
+         (Reader.DimSize('model.decoder.embed_positions.weight', 1) <>
+          Config.DModel) then
+        ImportError('Whisper import: model.decoder.embed_positions.weight ' +
+          'must have shape [' + IntToStr(Config.MaxTargetPositions) + ', ' +
+          IntToStr(Config.DModel) + '], got ' +
+          Reader.ShapeAsString('model.decoder.embed_positions.weight'));
+
+      // ---------------- Encoder architecture ----------------
+      // Input: the log-mel volume (2*max_source_positions frames along
+      // SizeX, num_mel_bins along Depth) from ComputeWhisperLogMel. The
+      // conv frontend (SAME padding via X-only TNNetPadXY; the (3,1)
+      // kernel clamps to the sequence's SizeY=1) halves the frames with
+      // conv2's stride 2, then the FIXED sinusoidal positions are added.
+      Enc := TNNet.Create();
+      Enc.AddLayer( TNNetInput.Create(NumInputFrames, 1,
+        Config.NumMelBins, 1) );
+      Enc.AddLayer( TNNetPadXY.Create(1, 0) );
+      Conv1 := Enc.AddLayer( TNNetConvolutionLinear.Create(
+        Config.DModel, 3, {Padding=}0, {Stride=}1) );
+      AddWhisperExactGelu(Enc);
+      Enc.AddLayer( TNNetPadXY.Create(1, 0) );
+      Conv2 := Enc.AddLayer( TNNetConvolutionLinear.Create(
+        Config.DModel, 3, {Padding=}0, {Stride=}2) );
+      AddWhisperExactGelu(Enc);
+      EncPos := Enc.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxSourcePositions) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      BuildWhisperStackBlocks(Enc, Config, Config.EncoderLayers,
+        Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
+        nil, EncBlocks, pInferenceOnly);
+      // PRE-norm stack: the FINAL LayerNorm closes the encoder.
+      EncFinalNorm := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+
+      // ---------------- Decoder architecture ----------------
+      // TWO inputs: Layers[0] = decoder token ids (what Compute feeds);
+      // the second TNNetInput holds the encoder hidden states and is
+      // filled MANUALLY before Compute (RunT5 does it - the convention is
+      // shared with the T5/Marian importers).
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(Config.MaxSourcePositions, 1, Config.DModel, 1),
+        0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      BuildWhisperStackBlocks(Dec, Config, Config.DecoderLayers,
+        Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pInferenceOnly);
+      DecFinalNorm := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      LoadWhisperConv1D(Reader, Conv1, 'model.encoder.conv1.weight',
+        'model.encoder.conv1.bias', Config.NumMelBins, Config.DModel,
+        Consumed);
+      LoadWhisperConv1D(Reader, Conv2, 'model.encoder.conv2.weight',
+        'model.encoder.conv2.bias', Config.DModel, Config.DModel,
+        Consumed);
+      Tmp := TNNetVolume.Create;
+      try
+        // Token embedding (+ the tied, UNSCALED head). scale_embedding
+        // folds sqrt(d_model) into the embedding rows like Marian; every
+        // released Whisper has it false.
+        Reader.LoadTensorFlat('model.decoder.embed_tokens.weight', Tmp);
+        if DecEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Whisper import: embed_tokens element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(DecEmbed.Neurons[0].Weights.Size) + '.');
+        if Config.ScaleEmbedding then
+          EmbedScale := Sqrt(Config.DModel)
+        else
+          EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('model.decoder.embed_tokens.weight');
+        // Tied head: logits = h . embed_tokens^T (proj_out is bias-free
+        // and its tensor is absent from real checkpoints).
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.DModel - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.DModel + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('proj_out.weight') then
+          Consumed.Add('proj_out.weight');
+        // LEARNED decoder positions: the first DecSeqLen rows of the
+        // [max_target_positions, d_model] table.
+        Reader.LoadTensorFlat('model.decoder.embed_positions.weight', Tmp);
+        for i := 0 to DecSeqLen * Config.DModel - 1 do
+          DecPos.Neurons[0].Weights.FData[i] := Tmp.FData[i];
+        DecPos.FlushWeightCache();
+        Consumed.Add('model.decoder.embed_positions.weight');
+        // FIXED sinusoidal encoder positions: real checkpoints save the
+        // table - load it when present, regenerate it otherwise.
+        if Reader.HasTensor('model.encoder.embed_positions.weight') then
+        begin
+          if (Reader.DimCount('model.encoder.embed_positions.weight') <> 2)
+             or (Reader.DimSize('model.encoder.embed_positions.weight', 0)
+                 <> Config.MaxSourcePositions)
+             or (Reader.DimSize('model.encoder.embed_positions.weight', 1)
+                 <> Config.DModel) then
+            ImportError('Whisper import: ' +
+              'model.encoder.embed_positions.weight must have shape [' +
+              IntToStr(Config.MaxSourcePositions) + ', ' +
+              IntToStr(Config.DModel) + '], got ' + Reader.ShapeAsString(
+              'model.encoder.embed_positions.weight'));
+          Reader.LoadTensorFlat('model.encoder.embed_positions.weight',
+            Tmp);
+          for i := 0 to Config.MaxSourcePositions * Config.DModel - 1 do
+            EncPos.Neurons[0].Weights.FData[i] := Tmp.FData[i];
+          EncPos.FlushWeightCache();
+          Consumed.Add('model.encoder.embed_positions.weight');
+        end
+        else
+          FillWhisperSinusoidalPositions(EncPos,
+            Config.MaxSourcePositions, Config.DModel);
+      finally
+        Tmp.Free;
+      end;
+      LoadWhisperStack(Reader, EncBlocks, 'model.encoder.layers.', Config,
+        Config.EncoderFFNDim, {IsDecoder=}false, Consumed);
+      LoadWhisperStack(Reader, DecBlocks, 'model.decoder.layers.', Config,
+        Config.DecoderFFNDim, {IsDecoder=}true, Consumed);
+      LoadLayerNormWeights(Reader, EncFinalNorm,
+        'model.encoder.layer_norm.weight', 'model.encoder.layer_norm.bias',
+        Config.DModel);
+      Consumed.Add('model.encoder.layer_norm.weight');
+      Consumed.Add('model.encoder.layer_norm.bias');
+      LoadLayerNormWeights(Reader, DecFinalNorm,
+        'model.decoder.layer_norm.weight', 'model.decoder.layer_norm.bias',
+        Config.DModel);
+      Consumed.Add('model.decoder.layer_norm.weight');
+      Consumed.Add('model.decoder.layer_norm.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Whisper import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil; // ownership transferred to the caller
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free; // non-nil only if an exception unwound the build
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildWhisperFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TWhisperConfig;
+  DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadWhisperConfigFromJSONFile(ConfigPath);
+  BuildWhisperFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, DecSeqLen, pInferenceOnly);
+end;
+
 function ReadRWKVConfigFromJSONFile(const FileName: string): TRWKVConfig;
 var
   JsonText: TStringList;
@@ -10611,6 +11372,17 @@ begin
     ImportError('BuildFromPretrained: model_type "marian" builds an ' +
       'ENCODER-DECODER pair - call BuildMarianFromSafeTensors (returns ' +
       'both nets; run them with RunT5) instead of this single-net ' +
+      'dispatch.');
+  end
+  else if ModelType = 'whisper' then
+  begin
+    // Whisper is an encoder-decoder: the import builds TWO nets, which
+    // this single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "whisper" builds an ' +
+      'ENCODER-DECODER pair - call BuildWhisperFromSafeTensors (returns ' +
+      'both nets; run them with RunT5, mel input from ' +
+      'neuralaudio.ComputeWhisperLogMel) instead of this single-net ' +
       'dispatch.');
   end
   else
