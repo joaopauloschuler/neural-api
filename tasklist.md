@@ -375,6 +375,104 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
+- [ ] Sharded safetensors support (model.safetensors.index.json):
+      TNNetSafeTensorsReader opens exactly ONE TFileStream, but anything
+      above ~2B params (and many smaller repos) ships as
+      model-00001-of-000NN.safetensors + an index file. Parse the index
+      JSON, map tensor name → shard file, keep a stream pool behind the
+      existing GetDType/read API so BuildGPT2/BuildLlamaFromSafeTensors
+      (and the listed Mistral/Qwen2 importer task, which silently depends
+      on this) need no changes. Test: split the pico-Llama parity fixture
+      into two shards + index, assert logits bit-identical to the
+      single-file load.
+- [ ] HF Hub download helper: there is no HTTP anywhere in the import path —
+      users must hand-download checkpoint files. A small fphttpclient-based
+      resolver (https://huggingface.co/{repo}/resolve/{rev}/{file}, local
+      cache dir, skip-if-present, optional token header for gated repos) so
+      BuildLlamaFromSafeTensors('TinyLlama/TinyLlama-1.1B-Chat-v1.0') works
+      end to end. Pairs with the sharded-safetensors task (the index file
+      says which shards to fetch) and the tokenizer.json / chat-template
+      tasks (same repo, same fetch). Keep it a separate opt-in unit so the
+      core importers stay offline-only.
+- [ ] PyTorch pytorch_model.bin loader: a RESTRICTED unpickler for the
+      torch.save zip format — the long tail of older/fine-tuned checkpoints
+      never got converted to safetensors. State_dicts use a small pickle
+      subset (a dozen opcodes + persistent-id storage references into the
+      zip's per-tensor data files); implement exactly that whitelist and
+      reject everything else by design, which makes the Pascal loader
+      immune to the arbitrary-code-execution hazard that motivated
+      safetensors. Expose the same named-tensor API as
+      TNNetSafeTensorsReader so the GPT-2/Llama builders take either
+      format. Test: torch.save a pico state_dict in Python, assert every
+      tensor matches its safetensors twin bit-for-bit.
+- [ ] BERT/encoder-family importer (BERT / RoBERTa / DistilBERT / MiniLM):
+      neural/neuralpretrained.pas is decoder-only and the importer task
+      above (Mistral/Qwen2/Phi/Gemma) is also all-decoder. Encoders are a
+      different skeleton: learned absolute + token-type (segment)
+      embeddings, post-LN blocks, GELU, optional pooler head — all existing
+      building blocks. Highest-leverage importer on this list: it feeds the
+      token-classification head, the QA span head, and (via
+      sentence-transformers MiniLM) real pretrained sentence embeddings for
+      the InfoNCE/retrieval side. Verify with the HF-parity fixture tooling
+      (slicer + hidden-state dump + compare) against BertModel.
+- [ ] T5/Flan-T5 (encoder-decoder) importer: the natural companion to the
+      seq2seq generation harness task above. New ingredient is T5's
+      relative-position bias buckets (shared across layers, separate
+      enc/dec); RMSNorm-style scale-only norm and gated FFN map onto landed
+      blocks. Flan-T5-small is 80M params — genuinely CPU-friendly and
+      instruction-tuned, so it doubles as the first imported model the
+      BLEU/ROUGE metrics can score out of the box. Same HF-parity fixture
+      verification as GPT-2/Llama.
+- [ ] ForSequenceClassification checkpoint import: load FINE-TUNED
+      classifier checkpoints (sentiment / NLI / toxicity), not just base
+      LMs — classifier-head weight mapping plus id2label from config.json
+      so predictions come out as label strings. Cheap delta on the
+      BERT-family importer above; also applies to decoder classifiers
+      (GPT2ForSequenceClassification uses the LAST non-pad token's hidden
+      state — document the pooling difference). Test: parity fixture
+      asserting class logits match transformers.
+- [ ] CLIP importer (dual text/image encoder): the image side is a
+      patch-embedding conv + the same pre-LN transformer blocks; text side
+      is a small causal encoder; both end in a learned projection to a
+      shared space + temperature. Flagship demo potential: ZERO-SHOT CIFAR
+      classification via the repo's existing image pipeline with no
+      training at all (encode class-name prompts, cosine-match image
+      embeddings). Verify embedding parity per tower against transformers'
+      CLIPModel on the sliced-fixture pattern.
+- [ ] AutoModel-style dispatch (BuildFromPretrained): read config.json's
+      model_type and route to the right Build*FromSafeTensors builder —
+      two exist today (gpt2, llama) and the importer tasks above add more;
+      one entry point stops every example from hardcoding the family, and
+      is the natural place for a clear "model_type X unsupported, supported
+      are: ..." error. Trivial once a third importer lands; keep the
+      explicit builders public for callers that want compile-time choice.
+- [ ] Streaming/lazy tensor materialization with load-time quantization:
+      the import path materializes full FP32 tensor buffers before copying
+      into layers, so PEAK import memory, not steady-state, can be the gate
+      on commodity RAM (the TinyLlama ~4.4GB case the quantized-inference
+      task documents). Read one tensor at a time from the (seekable)
+      safetensors stream straight into the destination layer — or straight
+      into int8 storage once the quantized-inference task lands — keeping
+      only one tensor-sized scratch buffer. Assert peak RSS during import
+      stays within tensor-size + model-size on the parity fixture.
+- [ ] GloVe / word2vec / fastText pretrained-embedding loader into
+      TNNetEmbedding: the classical-NLP counterpart of the checkpoint
+      importers — examples/Word2VecSkipGram TRAINS embeddings, loading
+      published pretrained ones is the missing half. Parse the standard
+      text format ("word v1 v2 ... vD" lines, optional count/dim header for
+      .vec), match rows against a TNeuralTokenizer vocab (mean-init
+      misses), optional freeze flag. ~50 lines of parser that instantly
+      upgrades every small-model NLP example. Test: pinned 3-word file
+      round-trips into embedding rows exactly.
+- [ ] NumPy .npy/.npz reader + writer: the universal interchange escape
+      hatch — ANY framework can np.savez(**state_dict), and the format is
+      trivial (magic + header dict + raw bytes; npz is a zip of npy).
+      Reader gives a generic named-tensor import path for frameworks with
+      no safetensors export; WRITER doubles as fixture tooling for parity
+      tests (dump Pascal tensors, compare in Python) and is arguably an
+      easier first Pascal→Python round-trip than the listed safetensors
+      writer. Support F32/F64/F16 + int dtypes, C-order only, reject
+      Fortran-order/pickled-object arrays explicitly.
 
 ## Layer follow-ups that fix real limitations
 
