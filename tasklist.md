@@ -388,33 +388,6 @@ rather than acted on.
       the pre-torch-1.6 non-zip legacy format, DEFLATE-compressed zip
       entries, and non-contiguous (stride-permuted) state_dict tensors —
       all currently rejected with descriptive ETorchBinError messages.
-- [X] Marian / OPUS-MT translation importer (Helsinki-NLP/opus-mt-en-de
-      etc., ~77M params per language pair, 1000+ published pairs — the
-      de-facto open machine-translation checkpoints and the first
-      DEDICATED-translation family; MT is a headline NLP capability the
-      repo has zero coverage of today). Architecturally distinct from the
-      landed T5 importer, not a re-skin: POST-norm encoder-decoder
-      blocks (norm after the residual add, vs T5's pre-RMSNorm), STATIC
-      sinusoidal positions (TNNetSinusoidalPositionalEmbedding is landed;
-      no learned/relative positions), swish/SiLU FFN, plain biased
-      LayerNorm, shared source/target embedding matrix tied to the LM
-      head PLUS Marian's final_logits_bias vector folded into the head
-      bias, and decoder_start_token_id = pad. Cross-attention rides the
-      landed TNNetCrossAttention asymmetric mode. Work is the
-      BuildMarianFromSafeTensors weight map in
-      neural/neuralpretrained.pas (config.json: d_model /
-      encoder_layers / decoder_layers / decoder_start_token_id) +
-      BuildFromPretrained dispatch for MarianMTModel. Tokenizer caveat:
-      opus-mt pairs ship source.spm/target.spm SentencePiece-Unigram
-      files without tokenizer.json, so END-TO-END text translation
-      depends on the open Unigram/.spm-protobuf tokenizer task — but the
-      importer + parity fixture work today with pinned token ids
-      (sliced pico fixture vs transformers MarianMTModel float64 oracle,
-      same make-pico recipe as GPT-2/Llama: encoder hidden states +
-      decoder logits). Natural consumer of the open seq2seq
-      generation-harness task, and the first checkpoint the landed
-      CorpusBLEU can score on REAL translation; headline demo once the
-      tokenizer lands: examples/TranslateOffline EN→DE on CPU.
 - [ ] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate
@@ -433,33 +406,6 @@ rather than acted on.
       easier first Pascal→Python round-trip than the listed safetensors
       writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
-- [X] Gemma 2 - SDPA attention-logit soft-cap hook: the one real LAYER
-      change in the Gemma track — Gemma-2 applies cap*tanh(scores/cap)
-      (cap 50) to attention logits PRE-softmax, but scores live inside
-      TNNetScaledDotProductAttention, so the standalone TNNetSoftCapping
-      cannot reach them. Add an optional score-softcap parameter to SDPA
-      (same opt-in pattern as the causal/window flags; default off =
-      bit-identical), with the tanh' factor in backward. Gradient-check
-      with the cap on, and assert cap=0/off matches the landed path
-      exactly.
-- [X] Gemma 2 - sandwich-norm block builder: pre AND post RMSNorm around
-      both the attention and FFN sublayers (4 norms per block, vs the
-      landed pre-norm-only residual helpers). Pure composition — a builder
-      variant beside AddPreNormResidual/AddRMSNormResidual; the post-norm
-      sits INSIDE the residual branch (normalize sublayer output before
-      the add). Reusable beyond Gemma (several recent models adopt
-      sandwich norms).
-- [X] Gemma 2 - BuildGemma2FromSafeTensors importer (the Gemma-1 importer
-      landed 2026-06-12 — BuildGemmaFromSafeTensors; still depends on the
-      two Gemma-2 tasks above): alternating local(4096)/
-      global attention via the landed sliding-window SDPA (same alternating
-      pattern as the landed GPT-Neo importer); query_pre_attn_scalar (e.g. 224 on 27B)
-      folded into W_q at load (same trick as GPT-Neo's unscaled attention);
-      final-logit soft-capping as a plain TNNetSoftCapping.Create(30)
-      before the softmax head — zero new code. Note the 256k vocab makes
-      embedding+head the FP32 memory hot spot (quantized-inference task
-      dependency for the larger sizes). Parity fixture vs
-      Gemma2ForCausalLM.
 - [ ] Gemma 3 - per-head QK-norm composition: Gemma-3 replaces soft-capping
       with RMSNorm applied per-head to q and k before attention (distinct
       from the landed avQKNorm / TNNetQKNormAttention, which L2-normalises
@@ -500,38 +446,15 @@ rather than acted on.
       at 1M-33M params the comparison runs against FULL checkpoints
       instead of sliced fixtures, the only importer family where that is
       true.
-- [x] RWKV-4 checkpoint importer (RWKV-4-Pile-169M/430M) — DONE: the first
-      NON-TRANSFORMER importer. BuildRWKVFromSafeTensors in
-      neural/neuralpretrained.pas (model_type "rwkv" wired into
-      BuildFromPretrained) + TNNet.AddRWKVChannelMix / AddRWKVBlock
-      builders. Decay convention resolved EXACTLY: the checkpoint's
-      per-step factor exp(-exp(time_decay)) maps onto TNNetWKV's
-      exp(-softplus(w_raw)) via w_raw = invsoftplus(exp(time_decay))
-      (bijection onto the positives; >30 shortcut matches the layer
-      bit-for-bit), time_first -> bonus u unchanged. Parity 1.8e-6 vs the
-      HF float64 oracle on tests/fixtures/tiny_rwkv.* (generator
-      tools/rwkv_tiny_fixture.py self-checks every quirk: decay
-      convention, squared-ReLU, token-shift, ln0, bonus, LN biases).
 - [ ] RWKV-4 decode-side demo: flat-memory recurrent decoding vs a
-      transformer of equal size (constant-memory headline of the importer
-      above; needs an incremental TNNetWKV state-carry path).
-- [X] Mamba checkpoint importer (state-spaces/mamba-130m-hf) — the
-      selective-SSM sibling of the RWKV-4 importer and the second
-      non-transformer family. Landed: (1) TNNetSelectiveSSM generalized
-      with a DState argument (FStruct[0], default 1 bit-for-bit,
-      gradient-checked for DState>1); (2) TNNet.AddMambaBlock builder;
-      (3) BuildMambaFromSafeTensors in neural/neuralpretrained.pas
-      (low-rank dt_proj folded into W_d, A_raw = A_log raw, x_proj
-      [dt_rank|d_state|d_state] split, depthwise causal conv1d+bias,
-      SiLU(z) gate, tied LM head, BuildFromPretrained "mamba" dispatch).
-      Logit parity 3.3e-6 vs the HF float64 slow-path oracle on
-      tests/fixtures/tiny_mamba.* (generator tools/mamba_tiny_fixture.py
-      self-checks every quirk: d_state>1, conv bias, dt softplus+bias,
-      D skip, SiLU(z) gate).
+      transformer of equal size (constant-memory headline of the landed
+      BuildRWKVFromSafeTensors importer; needs an incremental TNNetWKV
+      state-carry path).
 - [ ] Mamba decode-side demo: tokens/sec flat in context length where a
       transformer of equal size slows (constant-memory headline of the
-      importer above; needs an incremental TNNetSelectiveSSM state-carry
-      path, the sibling of the RWKV-4 decode demo task above).
+      landed BuildMambaFromSafeTensors importer; needs an incremental
+      TNNetSelectiveSSM state-carry path, the sibling of the RWKV-4
+      decode demo task above).
 - [ ] ModernBERT importer (answer.ai, 139M) — the encoder worth targeting
       BEYOND vanilla BERT now that BuildBertFromSafeTensors has landed:
       RoPE instead of learned positions, GeGLU, alternating local/global
