@@ -80,7 +80,7 @@ unit neuralhftokenizer;
 interface
 
 uses
-  Classes, SysUtils, neuralvolume;
+  Classes, SysUtils, fpjson, neuralvolume;
 
 type
   EHFTokenizerError = class(Exception);
@@ -189,10 +189,21 @@ type
       property IsWordPiece: boolean read FWordPiece;
   end;
 
+// fpjson portability helpers, exported for the other HF-JSON readers
+// (neuralchat.pas reads tokenizer_config.json with them):
+//   * HFDecodeUnicodeEscapes decodes \uXXXX escapes (incl. surrogate
+//     pairs) to raw UTF-8 up front, because fpjson pipes them through the
+//     widestring manager and mangles non-ASCII to '?' in programs without
+//     LazUTF8/cwstring.
+//   * HFParseJSONRaw parses WITHOUT joUTF8 (TJSONParser.Create(S, [])),
+//     so string values keep their raw UTF-8 bytes.
+function HFDecodeUnicodeEscapes(const S: string): string;
+function HFParseJSONRaw(const S: string): TJSONData;
+
 implementation
 
 uses
-  fpjson, jsonparser, Math;
+  jsonparser, Math;
 
 const
   csMergeSep = #1;
@@ -528,6 +539,11 @@ begin
   SetLength(Result, OutPos);
 end;
 
+function HFDecodeUnicodeEscapes(const S: string): string;
+begin
+  Result := DecodeUnicodeEscapes(S);
+end;
+
 { ---------------------------------------------------------------- }
 { TNeuralHFTokenizer                                                }
 { ---------------------------------------------------------------- }
@@ -636,6 +652,11 @@ begin
   finally
     Parser.Free;
   end;
+end;
+
+function HFParseJSONRaw(const S: string): TJSONData;
+begin
+  Result := ParseJSONRaw(S);
 end;
 
 procedure TNeuralHFTokenizer.DetectKeyMangling();

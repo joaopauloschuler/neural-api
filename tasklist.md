@@ -303,12 +303,31 @@ rather than acted on.
       generate for N prompts in one forward pass per step (today's decode
       paths look single-sample). Makes evaluation sweeps cheap and is a
       prerequisite for an efficient speculative-decoding verify step.
-- [ ] Chat templates (transformers apply_chat_template): follow-up of the
+- [X] Chat templates (transformers apply_chat_template): follow-up of the
       landed tokenizer.json loader (neural/neuralhftokenizer.pas) — parse
       the chat template from
       tokenizer_config.json (or hardcode the common Llama/ChatML/Zephyr
       formats) so an imported instruct checkpoint can be prompted with a
       correctly formatted conversation end to end.
+      LANDED: neural/neuralchat.pas — TChatMessage + ApplyChatTemplate
+      with seven hardcoded formats (cfChatML, cfLlama2, cfLlama3,
+      cfZephyr, cfGemma, cfPhi3, cfMistral), DetectChatFormat substring
+      fingerprinting of the chat_template string read from
+      tokenizer_config.json (string and list-of-named-templates forms),
+      and EncodeChat (template -> TNeuralHFTokenizer.Encode; control
+      tokens ride the added-tokens verbatim matcher). HF-raise parity
+      (Gemma system turn, Llama-2/Gemma/Mistral alternation). Pinned byte
+      for byte against the authentic published Jinja templates rendered
+      with the exact transformers Jinja env (tools/
+      chat_template_fixture.py -> tests/fixtures/chat_template_cases.json,
+      TTestNeuralChat in tests/TestNeuralHFTokenizer.pas).
+- [ ] Chat templates v2: a mini-Jinja subset interpreter for unrecognized
+      chat_template strings (must pass ground truth for all bundled
+      templates and raise cleanly on unsupported constructs); more
+      formats (DeepSeek, Phi-4-mini's tool-aware ChatML variant, Qwen's
+      default-system injection); read the separate chat_template.jinja
+      file newer transformers exports alongside tokenizer_config.json;
+      continue_final_message / return_assistant_tokens_mask equivalents.
 - [ ] resize_token_embeddings equivalent: grow/shrink the token embedding +
       LM-head vocab of an imported model (mean-init new rows, keep tied
       heads consistent, update FStruct vocab sizes). Needed the moment
