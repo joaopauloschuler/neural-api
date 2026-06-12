@@ -118,7 +118,21 @@ rather than acted on.
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
       Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
       punctuation class of the GPT-2 regex).
-- [ ] `Split`-regex + `Metaspace` pre_tokenizer support in
+- [X] `Split`-regex + `Metaspace` pre_tokenizer support in
+      (DONE: AddPreTokenizer now accepts Metaspace — replacement /
+      prepend_scheme always|first|never / legacy add_prefix_space / split,
+      routed onto the metaspace BPE machinery with HF first-segment-only
+      prepend semantics — and Split, matching the shipped pattern VERBATIM
+      against the Qwen2 (\p{N}) and Llama-3/cl100k (\p{N}{1,3}) literals
+      and dispatching to a hand-written SplitCl100kPieces ordered-
+      alternation splitter (case-insensitive contractions, optional
+      non-letter lead char, capped digit runs, punct+[\r\n]*, \s*[\r\n]+,
+      \s+(?!\S) trailing-space rule); unknown patterns/behaviors still
+      raise EHFTokenizerError. Metaspace decoder branch maps onto
+      Replace(▁→' ')+strip-left. 3 new tiny fixtures + parity batteries
+      (tools/hf_pretok_fixture.py, exact id+decode parity vs HF tokenizers
+      0.22) + unknown-pattern rejection test in
+      tests/TestNeuralHFTokenizer.pas.)
       neural/neuralhftokenizer.pas: AddPreTokenizer hard-rejects every type
       except Sequence/ByteLevel/BertPreTokenizer, so the tokenizer.json
       shipped with the ALREADY-IMPORTABLE Llama-family checkpoints fails to
@@ -142,6 +156,17 @@ rather than acted on.
       existing GPT-2/BERT tokenizer tests. Distinct from the
       Unigram/.model-protobuf follow-ups task above: these checkpoints DO
       ship a tokenizer.json — only the pre_tokenizer kind is unsupported.
+- [ ] neuralhftokenizer.pas pre_tokenizer leftovers from the Split/Metaspace
+      batch: (a) a STANDALONE ByteLevel pre_tokenizer with use_regex=false
+      silently applies the GPT-2 regex anyway (the flag is only honored
+      implicitly inside the Sequence[Split, ByteLevel] path, which bypasses
+      ByteLevelPieces; parse use_regex and skip the regex split when false);
+      (b) only the Qwen2 and Llama-3/cl100k Split pattern literals are
+      recognized — the o200k (GPT-4o-family) and DeepSeek pattern strings
+      raise EHFTokenizerError; add them to the verbatim-match table with a
+      hand-written splitter variant when those checkpoint families become
+      importable. Test: per-pattern parity fixtures like
+      tools/hf_pretok_fixture.py.
 - [ ] Logits-processor chain + generation config in neural/neuraldecode.pas
       (the remaining half of the transformers GenerationMixin port):
       top-k/top-p/min-p sampling, repetition/frequency/presence penalties

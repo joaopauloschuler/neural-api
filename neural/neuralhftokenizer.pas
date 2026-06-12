@@ -29,10 +29,19 @@ Coded by Claude (AI).
 //     bytes-to-unicode alphabet, the GPT-2 pre-tokenization regex
 //     ('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|
 //      \s+(?!\S)|\s+) and ranked merges.
-//   * Metaspace BPE with byte fallback (Llama / TinyLlama): the
+//   * Metaspace BPE with byte fallback (Llama / TinyLlama / Mistral): the
 //     Prepend("▁") + Replace(" "->"▁") normalizer chain, whole-segment BPE
 //     (no pre-tokenizer), <0xNN> byte-fallback tokens and the
-//     Replace/ByteFallback/Fuse/Strip decoder chain.
+//     Replace/ByteFallback/Fuse/Strip decoder chain. The Metaspace
+//     PRE_TOKENIZER variant (Mistral-v0.x / legacy=false Llama exports:
+//     replacement, prepend_scheme always/first/never, split) and the
+//     Metaspace decoder are supported too.
+//   * Split-regex byte-level BPE (Qwen2/Qwen3, Llama-3 style):
+//     Sequence[Split(pattern, behavior=Isolated), ByteLevel(use_regex=
+//     false)]. No regex engine is vendored -- the shipped pattern string
+//     is matched verbatim against the known Qwen2 (\p{N}) and
+//     Llama-3/cl100k (\p{N}{1,3}) pattern literals and dispatched to a
+//     hand-written splitter; unknown patterns raise EHFTokenizerError.
 //   * WordPiece (BERT / MiniLM / all-MiniLM-L6-v2): BertNormalizer
 //     (clean_text, handle_chinese_chars, strip_accents, lowercase),
 //     BertPreTokenizer (whitespace split + isolated punctuation), greedy
@@ -108,6 +117,14 @@ type
       // pre-tokenizer / normalizer
       FByteLevel: boolean;        // ByteLevel pre-tokenizer present
       FAddPrefixSpace: boolean;
+      // Split pre-tokenizer (Qwen2 / Llama-3 cl100k-style pattern)
+      FSplitPreTok: boolean;
+      FSplitDigitsMax: integer;   // 1 (Qwen2 \p{N}) or 3 (cl100k \p{N}{1,3})
+      // Metaspace pre-tokenizer (Llama-2 / Mistral SentencePiece-BPE)
+      FMetaspacePreTok: boolean;
+      FMSReplacement: string;     // usually U+2581
+      FMSPrependScheme: string;   // 'always' | 'first' | 'never'
+      FMSSplit: boolean;          // split before each replacement char
       FNormPrepend: string;       // Prepend normalizer content ('' = none)
       FNormReplaceFrom: array of string; // Replace normalizers, in order
       FNormReplaceTo: array of string;
@@ -130,8 +147,11 @@ type
       function BertNormalize(const Segment: string): string;
       procedure BertPieces(const Segment: string; Pieces: TStringList);
       procedure WordPieceWord(const WordText: string; Ids: TIntegerList);
-      procedure EncodeSegment(const Segment: string; Ids: TIntegerList);
+      procedure EncodeSegment(const Segment: string; Ids: TIntegerList;
+        IsFirstSegment: boolean);
       procedure ByteLevelPieces(const Segment: string; Pieces: TStringList);
+      procedure SplitCl100kPieces(const Segment: string;
+        Pieces: TStringList);
       function MapPieceToByteLevel(const Piece: string): TStringList;
       function FindAddedToken(const Text: string; Position: integer;
         out TokenIndex: integer): boolean;
@@ -177,6 +197,17 @@ uses
 const
   csMergeSep = #1;
   csMetaspace = #$E2#$96#$81; // '▁' U+2581 in UTF-8
+  // The two cl100k-style Split pre_tokenizer patterns shipped with the
+  // already-importable checkpoint families (matched VERBATIM; anything
+  // else raises EHFTokenizerError -- no regex engine is vendored).
+  // Qwen2/Qwen2.5/Qwen3: single-digit \p{N}.
+  csQwen2SplitPattern =
+    '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|' +
+    ' ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  // Llama-3 / cl100k / GPT-4 style: digit runs capped at 3.
+  csCl100kSplitPattern =
+    '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|' +
+    '\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
 
 { ---------------------------------------------------------------- }
 { UTF-8 helpers                                                     }
@@ -270,6 +301,14 @@ begin
     ((CP >= $6F0) and (CP <= $6F9)) or
     ((CP >= $966) and (CP <= $96F)) or           // Devanagari
     ((CP >= $FF10) and (CP <= $FF19));           // Fullwidth
+end;
+
+// [^\s\p{L}\p{N}] -- the "other"/punctuation class of the byte-level
+// pre-tokenization regexes.
+function IsOtherCP(CP: cardinal): boolean;
+begin
+  Result := (not IsWhitespaceCP(CP)) and (not IsLetterCP(CP)) and
+    (not IsNumberCP(CP));
 end;
 
 // Punctuation for the BERT pre-tokenizer: HF treats every ASCII
@@ -532,6 +571,12 @@ begin
   FIgnoreMerges := false;
   FByteLevel := false;
   FAddPrefixSpace := false;
+  FSplitPreTok := false;
+  FSplitDigitsMax := 1;
+  FMetaspacePreTok := false;
+  FMSReplacement := csMetaspace;
+  FMSPrependScheme := 'always';
+  FMSSplit := true;
   FWordPiece := false;
   FWPPrefix := '##';
   FWPMaxChars := 100;
@@ -701,9 +746,10 @@ var
 
   procedure AddPreTokenizer(PreObj: TJSONObject);
   var
-    Kind: string;
+    Kind, Pattern: string;
     InnerArr: TJSONArray;
     InnerCnt: integer;
+    SubNode: TJSONData;
   begin
     Kind := PreObj.Get('type', '');
     if Kind = 'Sequence' then
@@ -720,6 +766,50 @@ var
     else if Kind = 'BertPreTokenizer' then
       // whitespace split + isolated punctuation; keyed off FWordPiece in
       // EncodeSegment (BertPieces), nothing else to configure
+    else if Kind = 'Metaspace' then
+    begin
+      // Llama-2/Mistral SentencePiece-BPE: space -> U+2581 replacement,
+      // optional prepend, optional split before each replacement.
+      FMetaspacePreTok := true;
+      FMSReplacement := PreObj.Get('replacement', csMetaspace);
+      SubNode := PreObj.Find('prepend_scheme');
+      if (SubNode <> nil) and not SubNode.IsNull then
+        FMSPrependScheme := SubNode.AsString
+      // legacy serialization (tokenizers < 0.14): add_prefix_space
+      else if PreObj.Get('add_prefix_space', true) then
+        FMSPrependScheme := 'always'
+      else
+        FMSPrependScheme := 'never';
+      FMSSplit := PreObj.Get('split', true);
+    end
+    else if Kind = 'Split' then
+    begin
+      // No regex engine is vendored: the shipped pattern is matched
+      // verbatim against the known cl100k-family literals and dispatched
+      // to the hand-written splitter (SplitCl100kPieces).
+      Pattern := '';
+      SubNode := PreObj.Find('pattern');
+      if (SubNode <> nil) and (SubNode is TJSONObject) then
+      begin
+        Pattern := TJSONObject(SubNode).Get('Regex', '');
+        if Pattern = '' then
+          Pattern := TJSONObject(SubNode).Get('String', '');
+      end;
+      if (PreObj.Get('behavior', '') <> 'Isolated') or
+        PreObj.Get('invert', false) then
+        raise EHFTokenizerError.Create(
+          'Unsupported Split pre_tokenizer behavior "' +
+          PreObj.Get('behavior', '') + '" (only Isolated, invert=false)');
+      if Pattern = csQwen2SplitPattern then
+        FSplitDigitsMax := 1
+      else if Pattern = csCl100kSplitPattern then
+        FSplitDigitsMax := 3
+      else
+        raise EHFTokenizerError.Create(
+          'Unsupported Split pre_tokenizer pattern (only the Qwen2 and ' +
+          'Llama-3/cl100k patterns are recognized): ' + Pattern);
+      FSplitPreTok := true;
+    end
     else
       raise EHFTokenizerError.Create(
         'Unsupported pre_tokenizer type: ' + Kind);
@@ -748,6 +838,23 @@ var
     end
     else if Kind = 'Strip' then
       FDecStripLeft := DecObj.Get('start', 0)
+    else if Kind = 'Metaspace' then
+    begin
+      // replacement -> ' ' on every token, then strip the prepended
+      // leading space (unless prepend_scheme/add_prefix_space says never).
+      SetLength(FDecReplaceFrom, Length(FDecReplaceFrom) + 1);
+      SetLength(FDecReplaceTo, Length(FDecReplaceTo) + 1);
+      FDecReplaceFrom[High(FDecReplaceFrom)] :=
+        DecObj.Get('replacement', csMetaspace);
+      FDecReplaceTo[High(FDecReplaceTo)] := ' ';
+      Node := DecObj.Find('prepend_scheme');
+      if (Node <> nil) and not Node.IsNull then
+      begin
+        if Node.AsString <> 'never' then FDecStripLeft := 1;
+      end
+      else if DecObj.Get('add_prefix_space', true) then
+        FDecStripLeft := 1;
+    end
     else if Kind = 'WordPiece' then
     begin
       FWPPrefix := DecObj.Get('prefix', '##');
@@ -956,12 +1063,6 @@ var
     end;
   end;
 
-  function IsOtherCP(CP: cardinal): boolean; // [^\s\p{L}\p{N}]
-  begin
-    Result := (not IsWhitespaceCP(CP)) and (not IsLetterCP(CP)) and
-      (not IsNumberCP(CP));
-  end;
-
 begin
   // decode UTF-8 into codepoint arrays
   SetLength(CPs, Length(Segment));
@@ -1055,6 +1156,156 @@ begin
       begin
         Pieces.Add(Collect(Idx, RunEnd));
         Idx := RunEnd + 1;
+      end;
+    end;
+  end;
+end;
+
+// Splits a segment with the cl100k-style Split pre_tokenizer pattern
+// (Qwen2 with \p{N}, Llama-3/cl100k with \p{N}{1,3}):
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?\p{L}+ |
+//   \p{N}{1,FSplitDigitsMax} | ?[^\s\p{L}\p{N}]+[\r\n]* | \s*[\r\n]+ |
+//   \s+(?!\S) | \s+
+// Hand-written ordered-alternation matcher (no regex engine), validated
+// against HF `tokenizers` Split(behavior=Isolated, invert=false).
+procedure TNeuralHFTokenizer.SplitCl100kPieces(const Segment: string;
+  Pieces: TStringList);
+var
+  CPs: array of cardinal;
+  CPStr: array of string;
+  Total, Position, Idx, RunStart, RunEnd, LastNL, DigitCnt: integer;
+
+  function Collect(StartIdx, EndIdx: integer): string;
+  var
+    J: integer;
+  begin
+    Result := '';
+    for J := StartIdx to EndIdx do Result := Result + CPStr[J];
+  end;
+
+  function LowerAscii(CP: cardinal): cardinal;
+  begin
+    if (CP >= Ord('A')) and (CP <= Ord('Z')) then Result := CP + 32
+    else Result := CP;
+  end;
+
+  // (?i:'s|'t|'re|'ve|'m|'ll|'d) -- returns the match length or 0.
+  function MatchContractionCI(StartIdx: integer): integer;
+  var
+    C1, C2: cardinal;
+  begin
+    Result := 0;
+    if CPs[StartIdx] <> Ord('''') then Exit;
+    if StartIdx + 1 > High(CPs) then Exit;
+    C1 := LowerAscii(CPs[StartIdx + 1]);
+    if (C1 = Ord('s')) or (C1 = Ord('t')) or (C1 = Ord('m')) or
+      (C1 = Ord('d')) then Exit(2);
+    if StartIdx + 2 > High(CPs) then Exit;
+    C2 := LowerAscii(CPs[StartIdx + 2]);
+    if ((C1 = Ord('r')) and (C2 = Ord('e'))) or
+      ((C1 = Ord('v')) and (C2 = Ord('e'))) or
+      ((C1 = Ord('l')) and (C2 = Ord('l'))) then Exit(3);
+  end;
+
+  function IsNewlineCP(CP: cardinal): boolean;
+  begin
+    Result := (CP = 10) or (CP = 13);
+  end;
+
+begin
+  // decode UTF-8 into codepoint arrays
+  SetLength(CPs, Length(Segment));
+  SetLength(CPStr, Length(Segment));
+  Total := 0;
+  Position := 1;
+  while Position <= Length(Segment) do
+  begin
+    RunStart := Position;
+    CPs[Total] := NextCodePoint(Segment, Position);
+    CPStr[Total] := Copy(Segment, RunStart, Position - RunStart);
+    Inc(Total);
+  end;
+  SetLength(CPs, Total);
+  SetLength(CPStr, Total);
+
+  Idx := 0;
+  while Idx < Total do
+  begin
+    // 1. case-insensitive contractions
+    RunEnd := MatchContractionCI(Idx);
+    if RunEnd > 0 then
+    begin
+      Pieces.Add(Collect(Idx, Idx + RunEnd - 1));
+      Inc(Idx, RunEnd);
+      continue;
+    end;
+    // 2. [^\r\n\p{L}\p{N}]?\p{L}+  (optional ONE non-CR/LF non-letter
+    //    non-number char glued to a letter run)
+    if IsLetterCP(CPs[Idx]) or ((not IsNewlineCP(CPs[Idx])) and
+      (not IsNumberCP(CPs[Idx])) and (Idx + 1 < Total) and
+      IsLetterCP(CPs[Idx + 1])) then
+    begin
+      RunEnd := Idx;
+      if not IsLetterCP(CPs[Idx]) then Inc(RunEnd); // the optional char
+      while (RunEnd + 1 < Total) and IsLetterCP(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
+    end
+    // 3. \p{N}{1,DigitsMax}
+    else if IsNumberCP(CPs[Idx]) then
+    begin
+      RunEnd := Idx;
+      DigitCnt := 1;
+      while (RunEnd + 1 < Total) and (DigitCnt < FSplitDigitsMax) and
+        IsNumberCP(CPs[RunEnd + 1]) do
+      begin
+        Inc(RunEnd);
+        Inc(DigitCnt);
+      end;
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
+    end
+    // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
+    else if IsOtherCP(CPs[Idx]) or ((CPs[Idx] = 32) and (Idx + 1 < Total)
+      and IsOtherCP(CPs[Idx + 1])) then
+    begin
+      RunEnd := Idx; // the optional leading space or the first punct char
+      while (RunEnd + 1 < Total) and IsOtherCP(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      while (RunEnd + 1 < Total) and IsNewlineCP(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
+    end
+    else
+    begin // whitespace alternatives over the run [Idx..RunEnd]
+      RunEnd := Idx;
+      while (RunEnd + 1 < Total) and IsWhitespaceCP(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      // 5. \s*[\r\n]+ : up to (and including) the LAST newline in the run
+      LastNL := -1;
+      for Position := Idx to RunEnd do
+        if IsNewlineCP(CPs[Position]) then LastNL := Position;
+      if LastNL >= 0 then
+      begin
+        Pieces.Add(Collect(Idx, LastNL));
+        Idx := LastNL + 1;
+      end
+      else if RunEnd + 1 >= Total then
+      begin // 6. \s+(?!\S) : trailing whitespace takes the whole run
+        Pieces.Add(Collect(Idx, RunEnd));
+        Idx := RunEnd + 1;
+      end
+      else if RunEnd > Idx then
+      begin // 6. \s+(?!\S) : leave the last char to attach to what follows
+        Pieces.Add(Collect(Idx, RunEnd - 1));
+        Idx := RunEnd;
+      end
+      else
+      begin // 7. \s+ : a single whitespace char before non-space
+        Pieces.Add(CPStr[Idx]);
+        Inc(Idx);
       end;
     end;
   end;
@@ -1278,11 +1529,33 @@ begin
 end;
 
 procedure TNeuralHFTokenizer.EncodeSegment(const Segment: string;
-  Ids: TIntegerList);
+  Ids: TIntegerList; IsFirstSegment: boolean);
 var
   Pieces, Symbols: TStringList;
-  Cnt, Position, RunStart: integer;
+  Cnt, Position, RunStart, PieceStart: integer;
   Normalized: string;
+
+  // BPEs Normalized[PieceFrom..PieceTo] (1-based bytes) over codepoints.
+  procedure BPECodePoints(PieceFrom, PieceTo: integer);
+  var
+    CPSyms: TStringList;
+    BytePos, CPStart: integer;
+  begin
+    CPSyms := TStringList.Create();
+    try
+      BytePos := PieceFrom;
+      while BytePos <= PieceTo do
+      begin
+        CPStart := BytePos;
+        NextCodePoint(Normalized, BytePos);
+        CPSyms.Add(Copy(Normalized, CPStart, BytePos - CPStart));
+      end;
+      BPEWord(CPSyms, Ids);
+    finally
+      CPSyms.Free;
+    end;
+  end;
+
 begin
   if Segment = '' then exit;
   if FWordPiece then
@@ -1292,6 +1565,27 @@ begin
       BertPieces(BertNormalize(Segment), Pieces);
       for Cnt := 0 to Pieces.Count - 1 do
         WordPieceWord(Pieces[Cnt], Ids);
+    finally
+      Pieces.Free;
+    end;
+  end
+  else if FSplitPreTok then
+  begin
+    // Sequence[Split(cl100k-style), ByteLevel(use_regex=false)]:
+    // hand-written splitter, then byte-level alphabet + BPE per piece
+    // (NO GPT-2 regex pass).
+    Pieces := TStringList.Create();
+    try
+      SplitCl100kPieces(Segment, Pieces);
+      for Cnt := 0 to Pieces.Count - 1 do
+      begin
+        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
+        try
+          BPEWord(Symbols, Ids);
+        finally
+          Symbols.Free;
+        end;
+      end;
     finally
       Pieces.Free;
     end;
@@ -1319,24 +1613,46 @@ begin
   end
   else
   begin
-    // metaspace family: normalize, then whole-segment BPE over codepoints
+    // metaspace family: normalizer chain first (Prepend/Replace --
+    // Llama-2 style files do metaspace HERE and have no pre_tokenizer)
     Normalized := FNormPrepend + Segment;
     for Cnt := 0 to High(FNormReplaceFrom) do
       Normalized := StringReplace(Normalized, FNormReplaceFrom[Cnt],
         FNormReplaceTo[Cnt], [rfReplaceAll]);
-    Symbols := TStringList.Create();
-    try
-      Position := 1;
-      while Position <= Length(Normalized) do
+    if FMetaspacePreTok then
+    begin
+      // Metaspace pre_tokenizer (Mistral / legacy=false Llama style):
+      // space -> replacement, prepend per scheme (never doubled; 'first'
+      // only on the segment starting at input offset 0 -- HF semantics),
+      // then optionally split before each replacement.
+      Normalized := StringReplace(Normalized, ' ', FMSReplacement,
+        [rfReplaceAll]);
+      if (FMSPrependScheme = 'always') or
+        ((FMSPrependScheme = 'first') and IsFirstSegment) then
+        if Copy(Normalized, 1, Length(FMSReplacement)) <> FMSReplacement
+        then Normalized := FMSReplacement + Normalized;
+      if FMSSplit then
       begin
-        RunStart := Position;
-        NextCodePoint(Normalized, Position);
-        Symbols.Add(Copy(Normalized, RunStart, Position - RunStart));
+        PieceStart := 1;
+        Position := 1;
+        while Position <= Length(Normalized) do
+        begin
+          RunStart := Position;
+          NextCodePoint(Normalized, Position);
+          if (RunStart > PieceStart) and
+            (Copy(Normalized, RunStart, Length(FMSReplacement)) =
+             FMSReplacement) then
+          begin // new piece starts at each replacement (MergedWithNext)
+            BPECodePoints(PieceStart, RunStart - 1);
+            PieceStart := RunStart;
+          end;
+        end;
+        BPECodePoints(PieceStart, Length(Normalized));
+        exit;
       end;
-      BPEWord(Symbols, Ids);
-    finally
-      Symbols.Free;
     end;
+    // whole-segment BPE over codepoints
+    BPECodePoints(1, Length(Normalized));
   end;
 end;
 
@@ -1353,7 +1669,8 @@ begin
     if FindAddedToken(Text, Position, TokenIndex) then
     begin
       if Position > SegStart then
-        EncodeSegment(Copy(Text, SegStart, Position - SegStart), Ids);
+        EncodeSegment(Copy(Text, SegStart, Position - SegStart), Ids,
+          SegStart = 1);
       Ids.Add(FAddedTokens[TokenIndex].Id);
       Inc(Position, Length(FAddedTokens[TokenIndex].Content));
       SegStart := Position;
@@ -1362,7 +1679,8 @@ begin
       Inc(Position);
   end;
   if Position > SegStart then
-    EncodeSegment(Copy(Text, SegStart, Position - SegStart), Ids);
+    EncodeSegment(Copy(Text, SegStart, Position - SegStart), Ids,
+      SegStart = 1);
 end;
 
 function TNeuralHFTokenizer.Encode(const Text: string): TNeuralIntegerArray;
