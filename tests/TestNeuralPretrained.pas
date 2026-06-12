@@ -114,6 +114,7 @@ type
     procedure TestMambaLogitParity;
     procedure TestBloomLogitParity;
     procedure TestModernBertHiddenStateParity;
+    procedure TestDeepSeekV2LogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
     procedure TestGPTNeoXConfigFromJSONFile;
@@ -2675,6 +2676,180 @@ begin
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_modernbert_logits.json'), 16, 8);
   finally
+    NN.Free;
+  end;
+end;
+
+// DeepSeek-V2 logit parity (model_type "deepseek_v2"; DeepSeek-V2-Lite is
+// the reference checkpoint): tests/fixtures/tiny_deepseek_v2.* is a RANDOM
+// pico DeepseekV2ForCausalLM (tools/deepseek_v2_tiny_fixture.py - float64
+// transformers oracle, O(1)-scale re-randomized weights, hub-layout
+// per-expert tensors verified to round-trip through from_pretrained, and
+// a checked top-k routing-probability gap so float32 cannot flip the
+// expert selection). The fixture exercises BOTH per-layer paths
+// (first_k_dense_replace=1: layer 0 dense SwiGLU MLP, layer 1 DeepSeekMoE)
+// and full MLA (kv_lora_rank=5 latent + kv_a_layernorm, decoupled rope
+// dr=4, qk_nope_head_dim 6 != hidden/heads 4 - the MLA head width is NOT
+// tied to the residual width). Beyond raw parity, NON-VACUITY is asserted
+// structurally on the built net:
+//  (a) the kv_lora_rank latent path is real - one width-5 TNNetTokenRMSNorm
+//      (kv_a_layernorm) per layer with a nonzero output;
+//  (b) the decoupled-rope slice is nonzero - (Heads+1) TNNetRotaryEmbedding
+//      layers per block (Heads rope-Q + 1 shared rope-K), all of depth
+//      qk_rope_head_dim, nonzero outputs;
+//  (c) the layer-0-dense vs layer-1-MoE split - exactly ONE TNNetTopKGate
+//      in the whole net;
+//  (d) norm_topk_prob=false routing - per token exactly top_k nonzero gate
+//      weights whose sum is NOT renormalized to 1 (raw softmax survivors);
+//  (e) the shared-expert branch contributes - the unique width-10 SwiGLU
+//      (n_shared*moe_intermediate) feeds a down-projection with a nonzero
+//      output.
+// The routed_scaling_factor=1.5 down_proj fold and the NO-permutation rope
+// row convention (DeepSeek checkpoints store INTERLEAVED pairs, unlike
+// Llama's rotate_half halves) are covered by the parity gate itself. The
+// BuildFromPretrained "deepseek_v2" route must match bit-for-bit.
+procedure TTestNeuralPretrained.TestDeepSeekV2LogitParity;
+var
+  NN, NN2: TNNet;
+  Config: TDeepSeekV2Config;
+  Input, Output, Output2: TNNetVolume;
+  PosCnt, LayerCnt, i: integer;
+  TopKGateCnt, RopeCnt, LatentNormCnt, SharedSwiGLUCnt, NonZeroCnt: integer;
+  GateSum, AbsSum: TNeuralFloat;
+  RawGateSeen: boolean;
+  GateLayer, SharedDownLayer: TNNetLayer;
+begin
+  RandSeed := 424242;
+  NN := BuildDeepSeekV2FromSafeTensorsEx(
+    FixturePath('tiny_deepseek_v2.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_deepseek_v2_config.json'));
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  try
+    AssertEquals('model_type', 'deepseek_v2', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertEquals('kv_lora_rank', 5, Config.KVLoraRank);
+    AssertEquals('qk_nope_head_dim', 6, Config.QKNopeHeadDim);
+    AssertEquals('qk_rope_head_dim', 4, Config.QKRopeHeadDim);
+    AssertEquals('v_head_dim', 6, Config.VHeadDim);
+    AssertEquals('routed experts', 4, Config.NRoutedExperts);
+    AssertEquals('shared experts', 2, Config.NSharedExperts);
+    AssertEquals('experts per tok', 2, Config.NumExpertsPerTok);
+    AssertEquals('first_k_dense_replace', 1, Config.FirstKDenseReplace);
+    AssertFalse('norm_topk_prob', Config.NormTopKProb);
+    AssertEquals('routed_scaling_factor', 1.5,
+      Config.RoutedScalingFactor, 1e-6);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_deepseek_v2_logits.json'),
+      Config.MaxPositions, Config.VocabSize);
+
+    // Fixed input for the structural checks (layer outputs are inspected
+    // after this Compute) and the dispatch-route comparison below.
+    Input.ReSize(Config.MaxPositions, 1, 1);
+    for PosCnt := 0 to Config.MaxPositions - 1 do
+      Input.FData[PosCnt] := (PosCnt * 5 + 3) mod Config.VocabSize;
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+
+    // ---- structural non-vacuity ----
+    TopKGateCnt := 0;
+    RopeCnt := 0;
+    LatentNormCnt := 0;
+    SharedSwiGLUCnt := 0;
+    GateLayer := nil;
+    SharedDownLayer := nil;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetTopKGate then
+      begin
+        Inc(TopKGateCnt);
+        GateLayer := NN.Layers[LayerCnt];
+      end;
+      if NN.Layers[LayerCnt] is TNNetRotaryEmbedding then
+      begin
+        Inc(RopeCnt);
+        AssertEquals('rope slice depth', Config.QKRopeHeadDim,
+          NN.Layers[LayerCnt].Output.Depth);
+        AbsSum := 0;
+        for i := 0 to NN.Layers[LayerCnt].Output.Size - 1 do
+          AbsSum := AbsSum + Abs(NN.Layers[LayerCnt].Output.FData[i]);
+        AssertTrue('decoupled-rope slice output is nonzero', AbsSum > 0.1);
+      end;
+      if (NN.Layers[LayerCnt] is TNNetTokenRMSNorm) and
+         (NN.Layers[LayerCnt].Output.Depth = Config.KVLoraRank) then
+      begin
+        Inc(LatentNormCnt);
+        AbsSum := 0;
+        for i := 0 to NN.Layers[LayerCnt].Output.Size - 1 do
+          AbsSum := AbsSum + Abs(NN.Layers[LayerCnt].Output.FData[i]);
+        AssertTrue('kv latent output is nonzero', AbsSum > 0.1);
+      end;
+      if (NN.Layers[LayerCnt] is TNNetSwiGLU) and
+         (NN.Layers[LayerCnt].Output.Depth =
+          Config.NSharedExperts * Config.MoEIntermediateSize) then
+      begin
+        Inc(SharedSwiGLUCnt);
+        // The next layer is the shared-expert down-projection (the
+        // importer appends them consecutively).
+        SharedDownLayer := NN.Layers[LayerCnt + 1];
+      end;
+    end;
+    // (c) exactly one MoE block: layer 0 is dense, layer 1 routed.
+    AssertEquals('exactly one TopK gate (dense/MoE split)', 1, TopKGateCnt);
+    // (b) Heads rope-Q + 1 shared rope-K rotary layers per block.
+    AssertEquals('rotary layer count',
+      Config.NumLayers * (Config.NumHeads + 1), RopeCnt);
+    // (a) one kv_a_layernorm per layer on the width-kv_lora_rank latent.
+    AssertEquals('latent RMSNorm count', Config.NumLayers, LatentNormCnt);
+    // (e) the shared-expert branch exists and contributes.
+    AssertEquals('one shared-expert SwiGLU', 1, SharedSwiGLUCnt);
+    AssertTrue('shared-expert down conv',
+      SharedDownLayer is TNNetPointwiseConvLinear);
+    AbsSum := 0;
+    for i := 0 to SharedDownLayer.Output.Size - 1 do
+      AbsSum := AbsSum + Abs(SharedDownLayer.Output.FData[i]);
+    AssertTrue('shared-expert contribution is nonzero', AbsSum > 0.1);
+    // (d) raw (norm_topk_prob=false) routing: per token exactly top_k
+    // nonzero gate weights; at least one token's survivor sum stays below
+    // 1 (a renormalizing gate would make every sum exactly 1.0).
+    RawGateSeen := false;
+    for PosCnt := 0 to GateLayer.Output.SizeX - 1 do
+    begin
+      NonZeroCnt := 0;
+      GateSum := 0;
+      for i := 0 to GateLayer.Output.Depth - 1 do
+        if GateLayer.Output[PosCnt, 0, i] <> 0 then
+        begin
+          Inc(NonZeroCnt);
+          GateSum := GateSum + GateLayer.Output[PosCnt, 0, i];
+        end;
+      AssertEquals('top-k nonzero gate weights per token',
+        Config.NumExpertsPerTok, NonZeroCnt);
+      if GateSum < 0.999 then RawGateSeen := true;
+    end;
+    AssertTrue('raw (non-renormalized) gate weights seen', RawGateSeen);
+
+    // ---- BuildFromPretrained dispatch route: bit-identical logits ----
+    NN2 := BuildFromPretrained(FixturePath('tiny_deepseek_v2.safetensors'),
+      {pSeqLen=}0, {pInferenceOnly=}false,
+      FixturePath('tiny_deepseek_v2_config.json'));
+    Output2 := TNNetVolume.Create;
+    try
+      NN2.Compute(Input);
+      NN2.GetOutput(Output2);
+      AssertEquals('dispatch output size', Output.Size, Output2.Size);
+      for i := 0 to Output.Size - 1 do
+        if Output.FData[i] <> Output2.FData[i] then
+          Fail('BuildFromPretrained deepseek_v2 route differs at element ' +
+            IntToStr(i));
+    finally
+      Output2.Free;
+      NN2.Free;
+    end;
+  finally
+    Output.Free;
+    Input.Free;
     NN.Free;
   end;
 end;

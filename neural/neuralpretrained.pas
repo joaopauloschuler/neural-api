@@ -106,6 +106,13 @@ unit neuralpretrained;
 //     (layer 0 skips attn_norm), exact-erf GeGLU MLPs (TNNetGEGLUErf) and
 //     a final_norm. Outputs hidden states like the BERT family. See the
 //     MODERNBERT IMPORT section below.
+//   - DeepSeek-V2 (model_type "deepseek_v2"; DeepSeek-V2-Lite is the
+//     reference checkpoint) - BuildDeepSeekV2FromSafeTensors, the first
+//     family with Multi-head Latent Attention (low-rank compressed KV
+//     latent + decoupled RoPE keys shared across heads) and DeepSeekMoE
+//     blocks (shared + routed SwiGLU experts, per-token softmax top-k
+//     gating; layers below first_k_dense_replace keep a dense MLP).
+//     Causal-LM contract. See the DEEPSEEK-V2 IMPORT section below.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -1781,6 +1788,118 @@ function BuildModernBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
 
+// ---------------------------------------------------------------------------
+// DEEPSEEK-V2 IMPORT (model_type "deepseek_v2"; DeepSeek-V2-Lite is the
+// reference checkpoint) - the first importer to carry the two DeepSeek-V2
+// signature blocks: Multi-head Latent Attention (MLA: a low-rank compressed
+// KV latent c_KV plus a DECOUPLED RoPE key slice shared by all heads; the
+// AddMultiHeadLatentAttention wiring, extended with the checkpoint's
+// kv_a_layernorm RMSNorm on the latent) and DeepSeekMoE (shared + routed
+// experts with softmax top-k gating; the AddDeepSeekMoE wiring with SwiGLU
+// expert MLPs and TNNetTopKGate, raw weights when norm_topk_prob=false).
+//
+// Per layer: x := x + o_proj(MLA(RMSNorm(x))); x := x + MLP(RMSNorm(x)).
+// MLA from primitives (all token-wise 1x1 convs, mirroring the
+// AddMultiHeadLatentAttention builder; dn := qk_nope_head_dim,
+// dr := qk_rope_head_dim, dv := v_head_dim, r := kv_lora_rank):
+//   q       := q_proj(x), per head packed [q_nope(dn) | q_rope(dr)] - split
+//              at LOAD time into a content projection (Heads*dn) and a
+//              per-head rope projection (Heads*dr);
+//   kv_a_proj_with_mqa(x) packs [c_KV(r) | k_rope(dr)] - split at load into
+//              the latent down-projection (r) and ONE shared rope-K
+//              projection (dr);
+//   c_KV    := RMSNorm_{kv_a_layernorm}(c_KV)  - the latent norm;
+//   kv_b_proj(c_KV) packs per head [k_nope(dn) | v(dv)] - split at load
+//              into K (Heads*dn) and V (Heads*dv) up-projections;
+//   per head: SDPA over [q_nope|RoPE(q_rope_h)] . [k_nope|RoPE(k_rope)]
+//              with scale 1/sqrt(dn+dr); the rope-K slice is rotated ONCE
+//              and shared by every head; V is zero-padded by dr channels
+//              (the exact x+(-x) block of the MLA builder) and the head
+//              output sliced back to its dv content channels.
+// RoPE convention note: DeepSeek's checkpoints store the rope slices in
+// INTERLEAVED (even/odd) pair order - the HF remote code de-interleaves
+// before rotate_half; transformers' builtin port multiplies consecutive
+// pairs as complex numbers - which is exactly TNNetRotaryEmbedding's
+// layout, so unlike the Llama path the rope rows load with NO permutation.
+// MLP: layers with index < first_k_dense_replace (layer 0 in -Lite) keep a
+// DENSE SwiGLU MLP of intermediate_size; the rest are DeepSeekMoE blocks:
+//   gate logits -> per-token softmax -> TNNetTopKGate(num_experts_per_tok,
+//   pRenormalize=norm_topk_prob); per routed expert a SwiGLU MLP of
+//   moe_intermediate_size combined with its gate weight; ONE fused shared-
+//   expert SwiGLU MLP (width n_shared_experts*moe_intermediate_size) added
+//   UNGATED; routed_scaling_factor is folded into every routed expert's
+//   down_proj at load (it scales only the routed sum, never the shared
+//   branch - linear, so the fold is exact).
+// LIMITATIONS (all checked, with clear errors): q_lora_rank must be null
+// (the -Lite case; the full 236B V2 uses a low-rank W_q, not wired),
+// qk_nope_head_dim must equal v_head_dim (true for -Lite AND full V2; the
+// zero-pad trick reuses the dr-wide rope-K block), rope_scaling must be
+// null (DeepSeek's YaRN carries mscale/mscale_all_dim attention-scale
+// overrides that the rope-scaling support deliberately rejects),
+// topk_method must be "greedy" (group_limited_greedy routing is a full-V2
+// feature), scoring_func "softmax", moe_layer_freq 1, attention_bias and
+// mlp_bias false.
+// Causal-LM contract like the other decoder families: input (SeqLen,1,1)
+// token ids, output (SeqLen,1,vocab_size) logits.
+// ---------------------------------------------------------------------------
+
+type
+  TDeepSeekV2Config = record
+    VocabSize: integer;
+    HiddenSize: integer;        // d_model
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    IntermediateSize: integer;  // DENSE MLP width (first_k_dense_replace)
+    MoEIntermediateSize: integer; // per routed/shared expert MLP width
+    KVLoraRank: integer;        // r: latent c_KV width
+    QKNopeHeadDim: integer;     // dn: per-head content q/k width
+    QKRopeHeadDim: integer;     // dr: decoupled rope width (shared k_rope)
+    VHeadDim: integer;          // dv: per-head value width (= dn, checked)
+    NSharedExperts: integer;    // 0 = no shared-expert branch
+    NRoutedExperts: integer;
+    NumExpertsPerTok: integer;  // top-k over the routed experts
+    FirstKDenseReplace: integer; // layers [0..k) keep a dense MLP
+    NormTopKProb: boolean;      // false in -Lite: RAW survivor weights
+    RoutedScalingFactor: TNeuralFloat; // folded into routed down_proj
+    MaxPositions: integer;      // max_position_embeddings
+    RmsNormEps: TNeuralFloat;
+    RopeTheta: TNeuralFloat;
+    TieWordEmbeddings: boolean;
+    ModelType: string;          // 'deepseek_v2'
+    Prefix: string;             // detected: 'model.' or ''
+  end;
+
+// Reads a HF DeepSeek-V2 config.json (model_type "deepseek_v2"). Required:
+// hidden_size, intermediate_size, moe_intermediate_size, num_hidden_layers,
+// num_attention_heads, vocab_size, max_position_embeddings, kv_lora_rank,
+// qk_nope_head_dim, qk_rope_head_dim, v_head_dim, n_routed_experts,
+// num_experts_per_tok. Optional: n_shared_experts (null/absent = 0),
+// first_k_dense_replace (default 0), norm_topk_prob (default false),
+// routed_scaling_factor (default 1.0), rms_norm_eps (1e-6), rope_theta
+// (10000), tie_word_embeddings (false). Fails with a clear message on the
+// unsupported variants listed in the section header (q_lora_rank,
+// rope_scaling, group_limited_greedy, ...).
+function ReadDeepSeekV2ConfigFromJSONFile(
+  const FileName: string): TDeepSeekV2Config;
+// One-line human-readable summary (mirrors LlamaConfigToString).
+function DeepSeekV2ConfigToString(const Config: TDeepSeekV2Config): string;
+
+// Core DeepSeek-V2 builder. FileName accepts .safetensors,
+// .safetensors.index.json (sharded), pytorch_model.bin or
+// pytorch_model.bin.index.json (CreatePretrainedTensorReader dispatch, like
+// every other family). pSeqLen <= 0 uses max_position_embeddings.
+// Config.Prefix is detected from the checkpoint (var parameter).
+function BuildDeepSeekV2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TDeepSeekV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+// Reads ConfigFileName (default: config.json next to FileName), then builds.
+function BuildDeepSeekV2FromSafeTensorsEx(const FileName: string;
+  out Config: TDeepSeekV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+function BuildDeepSeekV2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -1790,7 +1909,8 @@ function BuildModernBertFromSafeTensors(const FileName: string;
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
 // gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, gemma,
-// gemma2, gemma3_text, rwkv, mamba, bloom, bert, distilbert, roberta.
+// gemma2, gemma3_text, rwkv, mamba, bloom, bert, distilbert, roberta,
+// modernbert, deepseek_v2.
 // Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
@@ -9575,6 +9695,712 @@ begin
     pSeqLen, pInferenceOnly, ConfigFileName);
 end;
 
+// ========================= DEEPSEEK-V2 IMPORT ==============================
+// (See the interface section comment for the architecture map.)
+
+function ReadDeepSeekV2ConfigFromJSONFile(
+  const FileName: string): TDeepSeekV2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  Field: TJSONData;
+  ModelType, StrVal: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('DeepSeek-V2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('DeepSeek-V2 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+  // True when the field is present AND non-null (HF configs ship many
+  // explicit nulls, e.g. q_lora_rank: null in DeepSeek-V2-Lite).
+  function HasNonNull(const FieldName: string): boolean;
+  begin
+    Field := Obj.Find(FieldName);
+    Result := (Field <> nil) and (not Field.IsNull);
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('DeepSeek-V2 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('DeepSeek-V2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('DeepSeek-V2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'deepseek_v2');
+    if ModelType <> 'deepseek_v2' then
+      ImportError('DeepSeek-V2 import: config model_type is "' + ModelType +
+        '" - only "deepseek_v2" is supported here (see BuildFromPretrained ' +
+        'for the full dispatch).');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.MoEIntermediateSize := RequiredInt('moe_intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.KVLoraRank := RequiredInt('kv_lora_rank');
+    Result.QKNopeHeadDim := RequiredInt('qk_nope_head_dim');
+    Result.QKRopeHeadDim := RequiredInt('qk_rope_head_dim');
+    Result.VHeadDim := RequiredInt('v_head_dim');
+    Result.NRoutedExperts := RequiredInt('n_routed_experts');
+    Result.NumExpertsPerTok := RequiredInt('num_experts_per_tok');
+    Result.NSharedExperts := 0;
+    if HasNonNull('n_shared_experts') then
+      Result.NSharedExperts := Obj.Get('n_shared_experts', 0);
+    if Result.NSharedExperts < 0 then
+      ImportError('DeepSeek-V2 import: config n_shared_experts must be ' +
+        '>= 0 or null, got ' + IntToStr(Result.NSharedExperts) + '.');
+    Result.FirstKDenseReplace := Obj.Get('first_k_dense_replace', 0);
+    if Result.FirstKDenseReplace < 0 then
+      ImportError('DeepSeek-V2 import: config first_k_dense_replace must ' +
+        'be >= 0, got ' + IntToStr(Result.FirstKDenseReplace) + '.');
+    Result.NormTopKProb := Obj.Get('norm_topk_prob', False);
+    Result.RoutedScalingFactor := Obj.Get('routed_scaling_factor', 1.0);
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    Result.Prefix := 'model.'; // detected from the checkpoint by the builder
+    // ---- structural checks ----
+    if Odd(Result.QKRopeHeadDim) then
+      ImportError('DeepSeek-V2 import: qk_rope_head_dim must be even ' +
+        '(RoPE rotates channel pairs), got ' +
+        IntToStr(Result.QKRopeHeadDim) + '.');
+    if Result.VHeadDim <> Result.QKNopeHeadDim then
+      ImportError('DeepSeek-V2 import: v_head_dim=' +
+        IntToStr(Result.VHeadDim) + ' must equal qk_nope_head_dim=' +
+        IntToStr(Result.QKNopeHeadDim) + ' (true for DeepSeek-V2/-Lite; ' +
+        'the per-head V zero-padding reuses the qk_rope_head_dim-wide ' +
+        'rope-K block, see the section header).');
+    if Result.NumExpertsPerTok > Result.NRoutedExperts then
+      ImportError('DeepSeek-V2 import: num_experts_per_tok=' +
+        IntToStr(Result.NumExpertsPerTok) + ' exceeds n_routed_experts=' +
+        IntToStr(Result.NRoutedExperts) + '.');
+    // ---- unsupported variants (fail loudly, never silently) ----
+    if HasNonNull('q_lora_rank') then
+      ImportError('DeepSeek-V2 import: q_lora_rank=' + Field.AsJSON +
+        ' is not supported - only the full-W_q variant (q_lora_rank: ' +
+        'null, the DeepSeek-V2-Lite case) is wired. The low-rank ' +
+        'q_a_proj/q_a_layernorm/q_b_proj query path of the full 236B V2 ' +
+        'is not implemented.');
+    if HasNonNull('rope_scaling') then
+      ImportError('DeepSeek-V2 import: rope_scaling is not supported - ' +
+        'DeepSeek''s YaRN configs carry mscale/mscale_all_dim ' +
+        'attention-scale overrides that the rope-scaling support ' +
+        'deliberately rejects. Use a checkpoint with rope_scaling: null.');
+    StrVal := Obj.Get('topk_method', 'greedy');
+    if StrVal <> 'greedy' then
+      ImportError('DeepSeek-V2 import: topk_method "' + StrVal +
+        '" is not supported - only "greedy" (group_limited_greedy ' +
+        'device-grouped routing is a full-V2 feature).');
+    StrVal := Obj.Get('scoring_func', 'softmax');
+    if StrVal <> 'softmax' then
+      ImportError('DeepSeek-V2 import: scoring_func "' + StrVal +
+        '" is not supported - only "softmax" (V2 gating; sigmoid is V3).');
+    if Obj.Get('moe_layer_freq', 1) <> 1 then
+      ImportError('DeepSeek-V2 import: moe_layer_freq must be 1 (every ' +
+        'layer past first_k_dense_replace is MoE), got ' +
+        IntToStr(Obj.Get('moe_layer_freq', 1)) + '.');
+    if Obj.Get('attention_bias', False) then
+      ImportError('DeepSeek-V2 import: attention_bias=true is not wired ' +
+        '(DeepSeek-V2 checkpoints are bias-free).');
+    if Obj.Get('mlp_bias', False) then
+      ImportError('DeepSeek-V2 import: mlp_bias=true is not wired ' +
+        '(DeepSeek-V2 checkpoints are bias-free).');
+    StrVal := Obj.Get('hidden_act', 'silu');
+    if StrVal <> 'silu' then
+      ImportError('DeepSeek-V2 import: hidden_act "' + StrVal +
+        '" is not supported - only "silu" (SwiGLU).');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function DeepSeekV2ConfigToString(const Config: TDeepSeekV2Config): string;
+begin
+  Result := 'model_type=' + Config.ModelType +
+    ', hidden_size=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_lora_rank=' + IntToStr(Config.KVLoraRank) +
+    ', qk_nope_head_dim=' + IntToStr(Config.QKNopeHeadDim) +
+    ', qk_rope_head_dim=' + IntToStr(Config.QKRopeHeadDim) +
+    ', v_head_dim=' + IntToStr(Config.VHeadDim) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', moe_intermediate=' + IntToStr(Config.MoEIntermediateSize) +
+    ', shared_experts=' + IntToStr(Config.NSharedExperts) +
+    ', routed_experts=' + IntToStr(Config.NRoutedExperts) +
+    ', experts_per_tok=' + IntToStr(Config.NumExpertsPerTok) +
+    ', first_k_dense=' + IntToStr(Config.FirstKDenseReplace) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', rms_eps=' + FloatToStr(Config.RmsNormEps);
+  if Config.NormTopKProb then
+    Result := Result + ', norm_topk_prob=true';
+  if Config.RoutedScalingFactor <> 1.0 then
+    Result := Result + ', routed_scaling_factor=' +
+      FloatToStr(Config.RoutedScalingFactor);
+  if Config.TieWordEmbeddings then
+    Result := Result + ', tied_embeddings=true';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TDeepSeekV2BlockLayers = record
+    AttnNorm: TNNetLayer;       // input_layernorm
+    QContent: TNNetLayer;       // q_proj content rows (Heads*dn)
+    QRope: TNNetLayer;          // q_proj rope rows (Heads*dr)
+    CKV: TNNetLayer;            // kv_a_proj_with_mqa latent rows (r)
+    KRope: TNNetLayer;          // kv_a_proj_with_mqa rope rows (dr, shared)
+    LatentNorm: TNNetLayer;     // kv_a_layernorm (RMSNorm on c_KV)
+    KContent: TNNetLayer;       // kv_b_proj k_nope rows (Heads*dn)
+    VProj: TNNetLayer;          // kv_b_proj v rows (Heads*dv)
+    OProj: TNNetLayer;          // o_proj
+    MlpNorm: TNNetLayer;        // post_attention_layernorm
+    // dense MLP path (BlockCnt < first_k_dense_replace)
+    GateUp, Down: TNNetLayer;
+    // MoE path
+    GateConv: TNNetLayer;       // router (mlp.gate.weight)
+    ExpertGateUp, ExpertDown: array of TNNetLayer;
+    SharedGateUp, SharedDown: TNNetLayer;
+  end;
+
+function BuildDeepSeekV2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TDeepSeekV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TDeepSeekV2BlockLayers;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSource, MoESource: TNNetLayer;
+  KRopeRot, NegRopeK, VZeroPad: TNNetLayer;
+  QSlice, KSlice, VSlice, QRopeSlice, HeadPack, HeadAttn: TNNetLayer;
+  GateTopK, ExpertOut, GateE, GateEBroadcast: TNNetLayer;
+  MoEBranches, HeadOutputs: array of TNNetLayer;
+  BlockCnt, SeqLen, HeadCnt, ExpertCnt, i, j: integer;
+  dn, dr, dv, LatentRank, SharedWidth: integer;
+  LayerIsMoE: boolean;
+  Tmp: TNNetVolume;
+  BlockPrefix, TensorNameStr, LMHeadName, AttnPrefix: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // Shape-checks a [OutDim, InDim] nn.Linear tensor (HF stores [out, in]).
+  procedure CheckLinearShape(const WName: string; OutDim, InDim: integer);
+  begin
+    if not Reader.HasTensor(WName) then
+      ImportError('DeepSeek-V2 import: missing tensor "' + WName + '".');
+    if (Reader.DimCount(WName) <> 2) or
+       (Reader.DimSize(WName, 0) <> OutDim) or
+       (Reader.DimSize(WName, 1) <> InDim) then
+      ImportError('DeepSeek-V2 import: "' + WName + '" must have shape [' +
+        IntToStr(OutDim) + ', ' + IntToStr(InDim) + '] (nn.Linear stores ' +
+        '[out, in]), got ' + Reader.ShapeAsString(WName));
+  end;
+
+  // Copies RowCount consecutive rows of a flat-loaded [*, InDim] tensor W
+  // (starting at SrcRowBase) into Layer neurons DstBase..DstBase+RowCount-1
+  // (bias-free). The caller flushes the layer's weight cache afterwards.
+  // Used to UNPACK DeepSeek's fused projections: q_proj's per-head
+  // [q_nope|q_rope], kv_a_proj_with_mqa's [c_KV|k_rope] and kv_b_proj's
+  // per-head [k_nope|v] row blocks each land in their own token-wise conv.
+  // NO rotate_half permutation anywhere: the checkpoint rope rows are
+  // already in TNNetRotaryEmbedding's interleaved pair order (see the
+  // interface section header).
+  procedure LoadRows(Layer: TNNetLayer; const W: TNNetVolume;
+    InDim, SrcRowBase, RowCount, DstBase: integer);
+  var
+    RowCnt, ColCnt: integer;
+  begin
+    for RowCnt := 0 to RowCount - 1 do
+    begin
+      if Layer.Neurons[DstBase + RowCnt].Weights.Size <> InDim then
+        ImportError('DeepSeek-V2 import: internal error - neuron ' +
+          IntToStr(DstBase + RowCnt) + ' has ' +
+          IntToStr(Layer.Neurons[DstBase + RowCnt].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for ColCnt := 0 to InDim - 1 do
+        Layer.Neurons[DstBase + RowCnt].Weights.FData[ColCnt] :=
+          W.FData[(SrcRowBase + RowCnt) * InDim + ColCnt];
+      Layer.Neurons[DstBase + RowCnt].BiasWeight := 0;
+    end;
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Checkpoint validation & prefix detection ---------
+      dn := Config.QKNopeHeadDim;
+      dr := Config.QKRopeHeadDim;
+      dv := Config.VHeadDim;
+      LatentRank := Config.KVLoraRank;
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('DeepSeek-V2 import: neither ' +
+          '"model.embed_tokens.weight" nor "embed_tokens.weight" found in ' +
+          Reader.FileName + ' - not a DeepSeek-V2 checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embed_tokens.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('DeepSeek-V2 import: embed_tokens.weight must have ' +
+          'shape [' + IntToStr(Config.VocabSize) + ', ' +
+          IntToStr(Config.HiddenSize) + '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+      LMHeadName := 'lm_head.weight';
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor(LMHeadName)) then
+        ImportError('DeepSeek-V2 import: config says ' +
+          'tie_word_embeddings=false but "' + LMHeadName +
+          '" is missing from ' + Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('DeepSeek-V2 import: requested SeqLen=' +
+          IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real token, not padding.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        LayerIsMoE := BlockCnt >= Config.FirstKDenseReplace;
+        // ---- MLA sub-block: x := x + o_proj(MLA(RMSNorm(x))). Wired ----
+        // from primitives exactly like AddMultiHeadLatentAttention with the
+        // checkpoint's kv_a_layernorm RMSNorm inserted on the latent c_KV.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].AttnNorm :=
+          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        NormedSource := NN.GetLastLayer();
+        // q_proj content/rope split (the per-head [q_nope|q_rope] row
+        // packing is undone at LOAD time; see LoadRows).
+        Blocks[BlockCnt].QContent := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn),
+          NormedSource);
+        Blocks[BlockCnt].QRope := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dr),
+          NormedSource);
+        // kv_a_proj_with_mqa = [c_KV(r) | k_rope(dr)]: the latent down-
+        // projection + ONE shared rope-K projection, both from x.
+        Blocks[BlockCnt].CKV := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(LatentRank), NormedSource);
+        // kv_a_layernorm: the latent RMSNorm (only c_KV is normalized,
+        // never the rope slice - the HF ordering). NOTE the eps: HF
+        // constructs DeepseekV2RMSNorm(kv_lora_rank) WITHOUT an eps
+        // argument, so the latent norm uses the class default 1e-6 - NOT
+        // config.rms_norm_eps like every other norm (a real, measurable
+        // parity difference at rms_norm_eps=1e-5).
+        Blocks[BlockCnt].LatentNorm := NN.AddLayerAfter(
+          TNNetTokenRMSNorm.Create(1.0e-6), Blocks[BlockCnt].CKV);
+        // kv_b_proj = per-head [k_nope|v] up-projections from the latent.
+        Blocks[BlockCnt].KContent := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dn),
+          Blocks[BlockCnt].LatentNorm);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.NumHeads * dv),
+          Blocks[BlockCnt].LatentNorm);
+        // Shared rope-K: projected from x, rotated ONCE, shared by every
+        // head (the paper's w_KR; per-token decode state grows by only dr).
+        Blocks[BlockCnt].KRope := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(dr), NormedSource);
+        KRopeRot := NN.AddLayerAfter(
+          CreateRoPEFromScaling(Config.RopeTheta, DefaultRoPEScaling()),
+          Blocks[BlockCnt].KRope);
+        // SDPA packs equal-width Q|K|V; V (width dv = dn) has no rope
+        // slice, so it is padded with an exact dr-wide zero block built as
+        // ropeK + (-ropeK) - forward is exactly 0 and the two backward
+        // branches cancel (the MLA builder's trick).
+        NegRopeK := NN.AddLayerAfter( TNNetNegate.Create(), KRopeRot );
+        VZeroPad := NN.AddLayer( TNNetSum.Create([KRopeRot, NegRopeK]) );
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          QSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(HeadCnt * dn, dn),
+            Blocks[BlockCnt].QContent);
+          KSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(HeadCnt * dn, dn),
+            Blocks[BlockCnt].KContent);
+          VSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(HeadCnt * dv, dv),
+            Blocks[BlockCnt].VProj);
+          // This head's rope-Q slice, rotated AFTER slicing so the RoPE
+          // frequency schedule runs over dr channels (matching rope-K).
+          QRopeSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(HeadCnt * dr, dr),
+            Blocks[BlockCnt].QRope);
+          QRopeSlice := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, DefaultRoPEScaling()),
+            QRopeSlice);
+          // Pack [Q_h|ropeQ_h | K_h|ropeK | V_h|0] (width 3*(dn+dr)).
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+            [QSlice, QRopeSlice, KSlice, KRopeRot, VSlice, VZeroPad]) );
+          // Scale 1/sqrt(dn+dr) = HF's qk_head_dim^-0.5.
+          HeadAttn := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(dn + dr,
+              {CausalMask=}true), HeadPack);
+          // The trailing dr output channels are attention-weighted zeros
+          // (from the zero-padded V); keep the dv content channels.
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(0, dv), HeadAttn);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // ---- MLP sub-block: dense SwiGLU (BlockCnt < ----
+        // first_k_dense_replace) or DeepSeekMoE (the AddDeepSeekMoE wiring
+        // with SwiGLU experts; shared experts bypass the router).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].MlpNorm :=
+          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        if not LayerIsMoE then
+        begin
+          // Dense path: TNNetSwiGLU computes FIRSTHALF * act(SECONDHALF),
+          // so the fused projection holds up_proj in neurons 0..I-1 and
+          // gate_proj in neurons I..2I-1 (the Llama-path convention).
+          Blocks[BlockCnt].GateUp := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+          NN.AddLayer( TNNetSwiGLU.Create() );
+          Blocks[BlockCnt].Down := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        end
+        else
+        begin
+          MoESource := NN.GetLastLayer(); // the normalized x
+          SetLength(Blocks[BlockCnt].ExpertGateUp, Config.NRoutedExperts);
+          SetLength(Blocks[BlockCnt].ExpertDown, Config.NRoutedExperts);
+          if Config.NSharedExperts > 0 then
+            SetLength(MoEBranches, Config.NRoutedExperts + 1)
+          else
+            SetLength(MoEBranches, Config.NRoutedExperts);
+          // Router: token-wise linear -> PER-TOKEN softmax (the whole-
+          // volume TNNetSoftMax would couple tokens) -> hard top-k gate.
+          // norm_topk_prob=false (DeepSeek-V2/-Lite) keeps the RAW softmax
+          // weights of the survivors (pRenormalize=false).
+          Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.NRoutedExperts),
+            MoESource);
+          NN.AddLayer( TNNetPointwiseSoftMax.Create() );
+          GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+            Config.NumExpertsPerTok,
+            {pRenormalize=}Config.NormTopKProb) );
+          for ExpertCnt := 0 to Config.NRoutedExperts - 1 do
+          begin
+            Blocks[BlockCnt].ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(
+                2 * Config.MoEIntermediateSize), MoESource);
+            NN.AddLayer( TNNetSwiGLU.Create() );
+            Blocks[BlockCnt].ExpertDown[ExpertCnt] := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+            ExpertOut := NN.GetLastLayer();
+            // Slice this expert's gate weight g[e], broadcast across
+            // d_model and cell-multiply in (the AddDeepSeekMoE combine).
+            GateE := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(ExpertCnt, 1), GateTopK);
+            GateEBroadcast := NN.AddLayer(
+              TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
+            MoEBranches[ExpertCnt] := NN.AddLayer(
+              TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+          end;
+          if Config.NSharedExperts > 0 then
+          begin
+            // ONE fused shared-expert MLP (HF stores mlp.shared_experts as
+            // a single SwiGLU MLP of width n_shared*moe_intermediate_size),
+            // added UNGATED to the routed sum.
+            SharedWidth :=
+              Config.NSharedExperts * Config.MoEIntermediateSize;
+            Blocks[BlockCnt].SharedGateUp := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(2 * SharedWidth), MoESource);
+            NN.AddLayer( TNNetSwiGLU.Create() );
+            Blocks[BlockCnt].SharedDown := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+            MoEBranches[Config.NRoutedExperts] := NN.GetLastLayer();
+          end;
+          // y = Sum_s Shared_s(x) + Sum_e g[e] * Routed_e(x).
+          if Length(MoEBranches) > 1 then
+            NN.AddLayer( TNNetSum.Create(MoEBranches) );
+        end;
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('DeepSeek-V2 import: embed_tokens.weight element ' +
+            'count ' + IntToStr(Tmp.Size) + ' does not match the ' +
+            'embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          // Tied LM head: logits = h . embed^T (rows copied, bias-free).
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+            Config.HiddenSize, Config.VocabSize);
+          MarkConsumed(LMHeadName);
+        end;
+        for BlockCnt := 0 to Config.NumLayers - 1 do
+        begin
+          LayerIsMoE := BlockCnt >= Config.FirstKDenseReplace;
+          BlockPrefix := Config.Prefix + 'layers.' +
+            IntToStr(BlockCnt) + '.';
+          AttnPrefix := BlockPrefix + 'self_attn.';
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].AttnNorm,
+            BlockPrefix + 'input_layernorm.weight', Config.HiddenSize);
+          MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+          // q_proj: per-head [q_nope(dn)|q_rope(dr)] rows split into the
+          // content and rope projections.
+          CheckLinearShape(AttnPrefix + 'q_proj.weight',
+            Config.NumHeads * (dn + dr), Config.HiddenSize);
+          Reader.LoadTensorFlat(AttnPrefix + 'q_proj.weight', Tmp);
+          for HeadCnt := 0 to Config.NumHeads - 1 do
+          begin
+            LoadRows(Blocks[BlockCnt].QContent, Tmp, Config.HiddenSize,
+              HeadCnt * (dn + dr), dn, HeadCnt * dn);
+            LoadRows(Blocks[BlockCnt].QRope, Tmp, Config.HiddenSize,
+              HeadCnt * (dn + dr) + dn, dr, HeadCnt * dr);
+          end;
+          Blocks[BlockCnt].QContent.FlushWeightCache();
+          Blocks[BlockCnt].QRope.FlushWeightCache();
+          MarkConsumed(AttnPrefix + 'q_proj.weight');
+          // kv_a_proj_with_mqa: [c_KV(r) | k_rope(dr)] rows.
+          CheckLinearShape(AttnPrefix + 'kv_a_proj_with_mqa.weight',
+            LatentRank + dr, Config.HiddenSize);
+          Reader.LoadTensorFlat(AttnPrefix + 'kv_a_proj_with_mqa.weight',
+            Tmp);
+          LoadRows(Blocks[BlockCnt].CKV, Tmp, Config.HiddenSize,
+            0, LatentRank, 0);
+          LoadRows(Blocks[BlockCnt].KRope, Tmp, Config.HiddenSize,
+            LatentRank, dr, 0);
+          Blocks[BlockCnt].CKV.FlushWeightCache();
+          Blocks[BlockCnt].KRope.FlushWeightCache();
+          MarkConsumed(AttnPrefix + 'kv_a_proj_with_mqa.weight');
+          // kv_a_layernorm -> the latent RMSNorm (gain width r).
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].LatentNorm,
+            AttnPrefix + 'kv_a_layernorm.weight', LatentRank);
+          MarkConsumed(AttnPrefix + 'kv_a_layernorm.weight');
+          // kv_b_proj: per-head [k_nope(dn)|v(dv)] rows split into the K
+          // and V up-projections.
+          CheckLinearShape(AttnPrefix + 'kv_b_proj.weight',
+            Config.NumHeads * (dn + dv), LatentRank);
+          Reader.LoadTensorFlat(AttnPrefix + 'kv_b_proj.weight', Tmp);
+          for HeadCnt := 0 to Config.NumHeads - 1 do
+          begin
+            LoadRows(Blocks[BlockCnt].KContent, Tmp, LatentRank,
+              HeadCnt * (dn + dv), dn, HeadCnt * dn);
+            LoadRows(Blocks[BlockCnt].VProj, Tmp, LatentRank,
+              HeadCnt * (dn + dv) + dn, dv, HeadCnt * dv);
+          end;
+          Blocks[BlockCnt].KContent.FlushWeightCache();
+          Blocks[BlockCnt].VProj.FlushWeightCache();
+          MarkConsumed(AttnPrefix + 'kv_b_proj.weight');
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+            AttnPrefix + 'o_proj.weight',
+            Config.NumHeads * dv, Config.HiddenSize);
+          MarkConsumed(AttnPrefix + 'o_proj.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].MlpNorm,
+            BlockPrefix + 'post_attention_layernorm.weight',
+            Config.HiddenSize);
+          MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+          if not LayerIsMoE then
+          begin
+            // Dense MLP: fused up (neurons 0..I-1) | gate (I..2I-1).
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+              BlockPrefix + 'mlp.up_proj.weight',
+              Config.HiddenSize, Config.IntermediateSize,
+              0, 2 * Config.IntermediateSize);
+            MarkConsumed(BlockPrefix + 'mlp.up_proj.weight');
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+              BlockPrefix + 'mlp.gate_proj.weight',
+              Config.HiddenSize, Config.IntermediateSize,
+              Config.IntermediateSize, 2 * Config.IntermediateSize);
+            MarkConsumed(BlockPrefix + 'mlp.gate_proj.weight');
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
+              BlockPrefix + 'mlp.down_proj.weight',
+              Config.IntermediateSize, Config.HiddenSize);
+            MarkConsumed(BlockPrefix + 'mlp.down_proj.weight');
+          end
+          else
+          begin
+            // Router gate (bias-free [n_routed, hidden] nn.Linear).
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateConv,
+              BlockPrefix + 'mlp.gate.weight',
+              Config.HiddenSize, Config.NRoutedExperts);
+            MarkConsumed(BlockPrefix + 'mlp.gate.weight');
+            // Routed experts: per-expert SwiGLU MLPs.
+            // routed_scaling_factor is folded into down_proj - exact,
+            // since the scale is linear, it multiplies ONLY the routed
+            // contributions, and the shared branch bypasses it. (HF
+            // multiplies the top-k gate weights instead; same product.)
+            for ExpertCnt := 0 to Config.NRoutedExperts - 1 do
+            begin
+              TensorNameStr := BlockPrefix + 'mlp.experts.' +
+                IntToStr(ExpertCnt) + '.';
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].ExpertGateUp[ExpertCnt],
+                TensorNameStr + 'up_proj.weight',
+                Config.HiddenSize, Config.MoEIntermediateSize,
+                0, 2 * Config.MoEIntermediateSize);
+              MarkConsumed(TensorNameStr + 'up_proj.weight');
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].ExpertGateUp[ExpertCnt],
+                TensorNameStr + 'gate_proj.weight',
+                Config.HiddenSize, Config.MoEIntermediateSize,
+                Config.MoEIntermediateSize,
+                2 * Config.MoEIntermediateSize);
+              MarkConsumed(TensorNameStr + 'gate_proj.weight');
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].ExpertDown[ExpertCnt],
+                TensorNameStr + 'down_proj.weight',
+                Config.MoEIntermediateSize, Config.HiddenSize,
+                0, -1, 0, '', Config.RoutedScalingFactor);
+              MarkConsumed(TensorNameStr + 'down_proj.weight');
+            end;
+            if Config.NSharedExperts > 0 then
+            begin
+              SharedWidth :=
+                Config.NSharedExperts * Config.MoEIntermediateSize;
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].SharedGateUp,
+                BlockPrefix + 'mlp.shared_experts.up_proj.weight',
+                Config.HiddenSize, SharedWidth, 0, 2 * SharedWidth);
+              MarkConsumed(
+                BlockPrefix + 'mlp.shared_experts.up_proj.weight');
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].SharedGateUp,
+                BlockPrefix + 'mlp.shared_experts.gate_proj.weight',
+                Config.HiddenSize, SharedWidth, SharedWidth,
+                2 * SharedWidth);
+              MarkConsumed(
+                BlockPrefix + 'mlp.shared_experts.gate_proj.weight');
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].SharedDown,
+                BlockPrefix + 'mlp.shared_experts.down_proj.weight',
+                SharedWidth, Config.HiddenSize);
+              MarkConsumed(
+                BlockPrefix + 'mlp.shared_experts.down_proj.weight');
+            end;
+          end;
+        end;
+        LoadLlamaRMSNormWeights(Reader, FinalNorm,
+          Config.Prefix + 'norm.weight', Config.HiddenSize);
+        MarkConsumed(Config.Prefix + 'norm.weight');
+      finally
+        Tmp.Free;
+      end;
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if Pos('rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
+        ImportError('DeepSeek-V2 import: unexpected tensor "' +
+          TensorNameStr + '" (shape ' +
+          Reader.ShapeAsString(TensorNameStr) + ') in ' + FileName +
+          ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildDeepSeekV2FromSafeTensorsEx(const FileName: string;
+  out Config: TDeepSeekV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDeepSeekV2ConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildDeepSeekV2FromSafeTensorsWithConfig(FileName, Config,
+    pSeqLen, pInferenceOnly);
+end;
+
+function BuildDeepSeekV2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TDeepSeekV2Config;
+begin
+  Result := BuildDeepSeekV2FromSafeTensorsEx(FileName, IgnoredConfig,
+    pSeqLen, pInferenceOnly);
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -9596,6 +10422,7 @@ var
   IgnoredMambaConfig: TMambaConfig;
   IgnoredBloomConfig: TBloomConfig;
   IgnoredModernBertConfig: TModernBertConfig;
+  IgnoredDeepSeekV2Config: TDeepSeekV2Config;
 begin
   // ---- resolve the weights file and the config.json ----
   if DirectoryExists(Path) then
@@ -9756,6 +10583,17 @@ begin
     // final hidden states. See the MODERNBERT IMPORT section.
     Result := BuildModernBertFromSafeTensorsEx(WeightsPath,
       IgnoredModernBertConfig, pSeqLen, pInferenceOnly, ConfigPath)
+  else if ModelType = 'deepseek_v2' then
+    // DeepSeek-V2 (architectures ["DeepseekV2ForCausalLM"];
+    // DeepSeek-V2-Lite is the reference checkpoint): Multi-head Latent
+    // Attention (compressed KV latent + decoupled RoPE keys) and
+    // DeepSeekMoE (shared + routed experts, softmax top-k gating) layers.
+    // Causal-LM contract like the other decoder families. See the
+    // DEEPSEEK-V2 IMPORT section for the wiring and the unsupported
+    // full-V2 variants (q_lora_rank, YaRN-with-mscale rope_scaling,
+    // group_limited_greedy).
+    Result := BuildDeepSeekV2FromSafeTensorsEx(WeightsPath,
+      IgnoredDeepSeekV2Config, pSeqLen, pInferenceOnly, ConfigPath)
   else if ModelType = 't5' then
   begin
     // T5 is an encoder-decoder: the import builds TWO nets, which this
@@ -9782,7 +10620,7 @@ begin
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
       'qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, mamba, bloom, ' +
-      'bert, distilbert, roberta, modernbert.');
+      'bert, distilbert, roberta, modernbert, deepseek_v2.');
   end;
 end;
 

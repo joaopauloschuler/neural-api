@@ -8425,11 +8425,19 @@ type
   /// Non-survivors receive zero gradient (the hard top-k boundary is treated as
   /// locally constant, like TNNetTopK / MaxPool argmax routing). TopCnt is
   /// stored in FStruct[0]; if TopCnt >= NumExperts the layer is the identity.
+  /// pRenormalize=false (DeepSeek-V2's norm_topk_prob=false routing) SKIPS
+  /// the survivor renormalization: survivors keep their RAW input gate
+  /// weights (y_i = g_i for i in S) and the backward becomes a hard 0/1
+  /// straight-through mask (no renorm Jacobian), exactly like
+  /// TNNetExpertChoiceGate's combine. The flag is stored INVERTED in
+  /// FStruct[1] (1 = raw/no-renorm) so previously serialized gates -- which
+  /// carry 0 there -- keep renormalizing after a load.
   /// No trainable parameters; output shape equals input shape.
   // Coded by Claude (AI).
   TNNetTopKGate = class(TNNetIdentity)
     public
-      constructor Create(TopCnt: integer); overload;
+      constructor Create(TopCnt: integer;
+        pRenormalize: boolean = true); overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -63974,11 +63982,16 @@ end;
 
 { TNNetTopKGate }
 
-constructor TNNetTopKGate.Create(TopCnt: integer);
+constructor TNNetTopKGate.Create(TopCnt: integer;
+  pRenormalize: boolean = true);
 begin
   inherited Create();
   if TopCnt < 1 then TopCnt := 1;
   FStruct[0] := TopCnt;
+  // INVERTED storage (1 = raw / no renormalization) so old serialized
+  // layers (FStruct[1] = 0) keep the original renormalizing behavior.
+  if pRenormalize then FStruct[1] := 0
+  else FStruct[1] := 1;
 end;
 
 procedure TNNetTopKGate.Compute;
@@ -64022,15 +64035,25 @@ begin
         end;
         if BestIdx >= 0 then Kept[BestIdx] := True;
       end;
-      // Renormalize survivors so they sum to 1; zero the rest.
-      SurvSum := 0;
-      for CntD := 0 to MaxD do
-        if Kept[CntD] then SurvSum := SurvSum + FOutput.FData[StartPos + CntD];
-      if SurvSum = 0 then SurvSum := 1;
-      for CntD := 0 to MaxD do
-        if Kept[CntD]
-          then FOutput.FData[StartPos + CntD] := FOutput.FData[StartPos + CntD] / SurvSum
-          else FOutput.FData[StartPos + CntD] := 0;
+      if FStruct[1] = 1 then
+      begin
+        // Raw mode (norm_topk_prob=false): survivors keep their input gate
+        // weights; only the non-survivors are zeroed.
+        for CntD := 0 to MaxD do
+          if not Kept[CntD] then FOutput.FData[StartPos + CntD] := 0;
+      end
+      else
+      begin
+        // Renormalize survivors so they sum to 1; zero the rest.
+        SurvSum := 0;
+        for CntD := 0 to MaxD do
+          if Kept[CntD] then SurvSum := SurvSum + FOutput.FData[StartPos + CntD];
+        if SurvSum = 0 then SurvSum := 1;
+        for CntD := 0 to MaxD do
+          if Kept[CntD]
+            then FOutput.FData[StartPos + CntD] := FOutput.FData[StartPos + CntD] / SurvSum
+            else FOutput.FData[StartPos + CntD] := 0;
+      end;
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -64060,6 +64083,19 @@ begin
       for CntD := 0 to FOutput.Size - 1 do
         FPrevLayer.OutputError.FData[CntD] :=
           FPrevLayer.OutputError.FData[CntD] + FOutputError.FData[CntD];
+      FBackwardTime := FBackwardTime + (Now() - StartTime);
+      FPrevLayer.Backpropagate();
+      exit;
+    end;
+    if FStruct[1] = 1 then
+    begin
+      // Raw mode: y_j = g_j on survivors, so the backward is a hard 0/1
+      // straight-through mask (no renorm Jacobian), like
+      // TNNetExpertChoiceGate. Survivors are exactly the FOutput<>0 cells.
+      for CntD := 0 to FOutput.Size - 1 do
+        if FOutput.FData[CntD] <> 0 then
+          FPrevLayer.OutputError.FData[CntD] :=
+            FPrevLayer.OutputError.FData[CntD] + FOutputError.FData[CntD];
       FBackwardTime := FBackwardTime + (Now() - StartTime);
       FPrevLayer.Backpropagate();
       exit;

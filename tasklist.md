@@ -436,7 +436,7 @@ rather than acted on.
       transformers WhisperModel on a sliced pico fixture with a pinned
       mel input; headline demo: examples/WhisperTranscribe transcribing a
       short WAV to text on CPU.
-- [ ] DeepSeek-V2 importer (model_type "deepseek_v2"; DeepSeek-V2-Lite is
+- [X] DeepSeek-V2 importer (model_type "deepseek_v2"; DeepSeek-V2-Lite is
       the reference checkpoint) — the FIRST importer to exercise the two
       most distinctive landed-but-never-imported blocks:
       AddMultiHeadLatentAttention (low-rank compressed KV latent +
@@ -465,6 +465,23 @@ rather than acted on.
       HF float64 oracle, plus non-vacuity asserts on kv_lora_rank, the
       decoupled-rope slice, shared-expert contribution, and the layer-0
       dense-vs-MoE split.
+      DONE: BuildDeepSeekV2FromSafeTensors[Ex/WithConfig] +
+      ReadDeepSeekV2ConfigFromJSONFile + BuildFromPretrained dispatch in
+      neural/neuralpretrained.pas (MLA + DeepSeekMoE wired from primitives
+      mirroring the two builders; TNNetTopKGate gained an optional
+      pRenormalize=false raw mode for norm_topk_prob=false, serialized
+      INVERTED in FStruct[1] so old files keep renormalizing);
+      tools/deepseek_v2_tiny_fixture.py (float64 transformers 5.x builtin
+      DeepseekV2 oracle, hub-layout per-expert export verified to
+      round-trip through from_pretrained) + tiny_deepseek_v2.* fixtures;
+      TestDeepSeekV2LogitParity (max |logit diff| ~1e-6, plus the four
+      non-vacuity asserts). Parity gotcha found: HF's kv_a_layernorm is
+      constructed WITHOUT eps (fixed 1e-6, NOT rms_norm_eps). Rope rows
+      load with NO permutation (DeepSeek stores interleaved pairs).
+      Deliberately skipped: q_lora_rank low-rank query path (null in
+      -Lite; full 236B V2 only), group_limited_greedy routing, YaRN
+      rope_scaling with mscale, scoring_func sigmoid (V3) - all rejected
+      with clear errors.
 - [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
       decode docs explicitly note only greedy/sampled streamed generation
