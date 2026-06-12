@@ -253,6 +253,128 @@ rather than acted on.
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
       assert, same pattern as the chunked-forward recurrence family.
+- [ ] RoPE scaling for context extension (linear / NTK-aware / YaRN /
+      dynamic-NTK): neural/neuralpretrained.pas already PARSES the
+      rope_scaling config key and then ignores it ("long-context scaling is
+      not wired here yet", ~line 172). Wire a scaling mode + factor into the
+      RoPE layer so imported Llama-family checkpoints run past their trained
+      context. Linear ("position interpolation") and NTK-aware are pure
+      frequency-remap formulas; YaRN adds per-band interpolation + an
+      attention-temperature factor. Verify: HF parity fixture with a
+      rope_scaling config (transformers applies the same remap), plus a
+      sanity check that factor=1 stays bit-identical to the landed path.
+- [ ] KV-cache eviction for unbounded streaming: attention sinks + rolling
+      window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder
+      — today the per-SDPA-layer cache grows without bound. Keep the first
+      NumSinks tokens plus a fixed window, evicting the middle, so streamed
+      generation runs forever in constant memory. Note TNNetSinkAttention is
+      the TRAINING-side cousin (learnable sink logits); this is the
+      decode-side cache policy and needs care with RoPE positions after
+      eviction (re-rotate or cache pre-RoPE K). Assert: while output length
+      <= window the streamed tokens are bit-identical to the unbounded
+      cache, and memory stays flat past it.
+- [ ] KV-cache quantization (int8 cache with per-channel scales): the
+      quantized-inference task above covers WEIGHT storage; for long-context
+      decode the KV cache dominates memory instead. Quantize cached K/V
+      blocks to int8 on append, dequantize on read inside
+      TNNetStreamingDecoder; assert logit drift vs the FP32 cache stays
+      within a documented tolerance on the pico-Llama parity fixture.
+- [ ] GRPO trainer (DeepSeekMath/R1-style group-relative policy
+      optimization) in neural/neuraldpo.pas or a sibling unit: sample N
+      completions per prompt, advantage = (reward - group mean)/group std,
+      policy-gradient step with a KL penalty against the reference — no
+      value network, so it is the one RL-from-feedback method that fits this
+      framework. The DPO trainer already holds policy+reference and computes
+      per-sequence logprobs, and the sampling-decoder task above provides
+      generation. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
+      (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
+      reward-model trainer to feed GRPO real rewards.
+- [ ] Seq2seq (encoder-decoder) generation harness in
+      neural/neuraldecode.pas: every decode path today is decoder-only.
+      TNNetCrossAttention and TNNetCrossWKV (asymmetric mode) already exist
+      as layers — add a T5/BART-style loop that encodes the source ONCE,
+      caches the encoder output, feeds it as the K|V side of the cross
+      layers, and autoregresses the target with the usual greedy/beam/sample
+      machinery. Unlocks translation/summarization examples that the landed
+      BLEU/ROUGE metrics in neuralnlpmetrics.pas are waiting for.
+- [ ] Masked-LM data collator (transformers DataCollatorForLanguageModeling
+      port): BERT-style dynamic masking — pick 15% of tokens, replace 80%
+      with [MASK] / 10% random / 10% unchanged, loss only on masked
+      positions — plus whole-word masking and, as a stretch, T5 span
+      corruption (sentinel tokens). Everything in the current NLP stack is
+      causal-LM; one collator unit unlocks encoder pretraining with the
+      existing AddTransformerEncoderBlock, no new layers. Test: masked
+      fraction and 80/10/10 split within tolerance at fixed seed; loss
+      ignores unmasked positions exactly.
+- [ ] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
+      above): K learnable virtual-token embeddings prepended to the
+      embedding-layer output, base model frozen — K*d_model trainable
+      params, the cheapest fine-tune of an imported checkpoint. Mostly
+      composes existing pieces (a learnable bank + sequence-axis concat);
+      decode side must skip the K virtual positions when detokenizing.
+      Test: base weights bit-unchanged after a training step, soft-prompt
+      gradient nonzero, eval forward deterministic.
+- [ ] Token-classification head + entity-level metrics (transformers
+      ForTokenClassification + seqeval port): per-token PointwiseConvLinear
+      head over the sequence axis plus span-aware precision/recall/F1
+      (BIO/IOB2 decoding, entity-level not token-level) in
+      neuralnlpmetrics.pas. Needs tokenizer offset-mapping / word-id
+      alignment (subword → word labels, return_offsets_mapping equivalent in
+      neuraltokenizer.pas) — that alignment utility is reusable beyond NER.
+      Test: pinned BIO sequences with known entity P/R/F1, including the
+      classic boundary-error cases.
+- [ ] QA span-extraction head (transformers ForQuestionAnswering port):
+      two per-token logit heads (start/end) over the sequence axis +
+      SQuAD-style postprocessing (top-k start×end pairs, end>=start, max
+      answer length, n-best list). Pure composition over existing per-token
+      projections; pairs with the offset-mapping utility from the
+      token-classification task to map spans back to text. Test: pinned
+      logits → pinned extracted span.
+- [ ] chrF metric in neural/neuralnlpmetrics.pas: character n-gram F-score
+      (Popović 2015) — tokenizer-independent so it sidesteps the BLEU
+      tokenization sensitivity, ~100 lines beside the landed BLEU/ROUGE.
+      Optional chrF++ (adds word unigrams+bigrams). Test against pinned
+      values from sacrebleu on a couple of sentence pairs.
+- [ ] Strided sliding-window perplexity in neural/neuralnlpmetrics.pas
+      (the HF-docs-standard evaluation): for corpora longer than the model
+      context, slide a window with stride < window and score only the
+      non-overlapping tail tokens, so every token gets (bounded) left
+      context instead of the chop-into-disjoint-windows underestimate the
+      landed Perplexity() implies. Test: stride = window reproduces the
+      disjoint baseline exactly; smaller stride gives <= NLL on a model
+      with real long-range structure.
+- [ ] Length-grouped batching + dynamic padding collator (transformers
+      LengthGroupedSampler + DataCollatorWithPadding port) in neuralfit:
+      sort/bucket variable-length text by length, batch neighbors, pad each
+      batch only to its own max (not the global max) — a large real-world
+      throughput win. Complements (distinct from) the per-sample-attention-
+      mask and left-padded-generation tasks: this is the TRAINING data-side
+      half. Test: identical loss trajectory vs naive padding at fixed seed
+      modulo batch order, plus a padded-token-count reduction assert.
+- [ ] Classifier-free guidance for text generation (transformers
+      UnbatchedClassifierFreeGuidanceLogitsProcessor port): run the model
+      with and without the prompt (or with a negative prompt), combine
+      l_uncond + g*(l_cond - l_uncond) before sampling. Two forward passes
+      per step, no training; slots into the logits-processor chain task
+      above as just another processor once that lands. Test: g=1 is
+      bit-identical to normal decoding; g=0 ignores the prompt.
+- [ ] Best-of-N / self-consistency reranking utility in
+      neural/neuraldecode.pas: sample N completions, rerank by
+      length-normalized sequence logprob (LengthPenaltyDenominator already
+      exists) or by an external scorer callback — the standard
+      test-time-compute baseline, and the natural consumer of the
+      Bradley-Terry reward model from the GRPO task. Self-consistency
+      variant: majority-vote over extracted answers. Trivial once the
+      sampling-decoder task lands; worth its own entry as the canonical
+      harness.
+- [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
+      context first and grow SeqLen on a schedule (the rebuild-same-
+      architecture-at-a-new-width idiom this list already notes near the
+      variable-context trick) — large early-epoch throughput win for LM
+      pretraining. Needs CopyWeights across width rebuilds + a schedule
+      hook; the Trainer-callbacks task above is the natural home. Test:
+      weights survive a width hop bit-for-bit, loss continuous across the
+      hop.
 
 ## Layer follow-ups that fix real limitations
 
