@@ -91,7 +91,6 @@ rather than acted on.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] ONNX import
 - [ ] Gemma 4 import
-- [X] Qwen 3 import
 - [ ] Qwen 3.5 import
 - [ ] Phi-4-mini import
 - [ ] CLIP import — first VISION-LANGUAGE importer: BuildClipFromSafeTensors
@@ -145,20 +144,10 @@ rather than acted on.
       (b) only the Qwen2 and Llama-3/cl100k Split pattern literals are
       recognized — the o200k (GPT-4o-family) and DeepSeek pattern strings
       raise EHFTokenizerError; add them to the verbatim-match table with a
-      hand-written splitter variant when those checkpoint families become
-      importable. Test: per-pattern parity fixtures like
-      tools/hf_pretok_fixture.py.
-- [X] Logits-processor chain + generation config in neural/neuraldecode.pas
-      (the remaining half of the transformers GenerationMixin port):
-      top-k/top-p/min-p sampling, repetition/frequency/presence penalties
-      (TNNetTokenHistoryPenalty) and stop sequences/strings are all landed —
-      still missing are a temperature knob and a chainable logits-processor
-      abstraction (generalize TNNetTokenConstraint from "mask allowed
-      tokens" into processors that transform the logit vector in order) so
-      penalties, temperature and the existing JSON/forced-sequence
-      constraints compose in one pipeline. Add a small TGenerationConfig
-      record bundling sampler + penalties + stopping criteria (EOS-id list,
-      stop strings, max new tokens).
+      hand-written splitter variant — the DeepSeek family is now importable
+      (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap; add
+      o200k when a GPT-4o-family checkpoint matters. Test: per-pattern
+      parity fixtures like tools/hf_pretok_fixture.py.
 - [ ] LoRA follow-ups (the adapter itself is landed: TNNet.AddLoRAAdapter
       low-rank B·A bypass + examples/LoRAFineTune, commit 34511c0):
       (a) MergeLoRA — fold the trained B·A (scaled by alpha/r) into the
@@ -226,8 +215,8 @@ rather than acted on.
       penalty re-ranking each candidate token by max cosine similarity
       between its hidden state and all previous tokens' hidden states;
       needs hidden-state capture during decode — a different beast from the
-      sampling/logits-processor chain task above and strong for
-      greedy-quality open-ended text.
+      landed sampling/logits-processor chain and strong for greedy-quality
+      open-ended text.
 - [ ] Diverse beam search (Hamming-diversity groups) + constrained beam
       search (force_words_ids: force given phrases to APPEAR anywhere in the
       output — stronger than the existing TNNetTokenConstraint prefix/mask
@@ -271,21 +260,6 @@ rather than acted on.
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
       assert, same pattern as the chunked-forward recurrence family.
-- [X] RoPE scaling config wiring for context extension: the RoPE layer
-      already implements Position Interpolation, NTK-aware and YaRN
-      (TNNetRoPEScalingMode, including YaRN's per-band interpolation +
-      attention-temperature factor), but neural/neuralpretrained.pas still
-      PARSES the rope_scaling config key and then rejects it ("long-context
-      scaling is not wired here yet", ~line 172). Map the config (type +
-      factor + YaRN params) onto the layer's scaling-mode constructor
-      arguments so imported Llama-family checkpoints run past their trained
-      context. Verify: HF parity fixture with a rope_scaling config
-      (transformers applies the same remap), plus a sanity check that an
-      unscaled config stays bit-identical to the landed path.
-      LANDED (7e74fee): linear/dynamic-NTK/yarn/llama3 wired into the
-      Llama-family, GPT-NeoX and Phi importers via TRoPEScalingConfig +
-      new rsmLlama3 mode; HF-exact YaRN fixes (attention temperature was
-      inverted, band blend now HF's truncate=true dim-index ramp).
 - [ ] rope_scaling follow-ups to the landed wiring (7e74fee): (a) longrope
       (Phi-3 family — per-dim short/long factor arrays + two attention
       factors) is parsed and rejected; map it onto a new scaling mode when
@@ -383,9 +357,9 @@ rather than acted on.
       UnbatchedClassifierFreeGuidanceLogitsProcessor port): run the model
       with and without the prompt (or with a negative prompt), combine
       l_uncond + g*(l_cond - l_uncond) before sampling. Two forward passes
-      per step, no training; slots into the logits-processor chain task
-      above as just another processor once that lands. Test: g=1 is
-      bit-identical to normal decoding; g=0 ignores the prompt.
+      per step, no training; slots into the landed logits-processor chain
+      as just another processor. Test: g=1 is bit-identical to normal
+      decoding; g=0 ignores the prompt.
 - [ ] Best-of-N / self-consistency reranking utility in
       neural/neuraldecode.pas: sample N completions, rerank by
       length-normalized sequence logprob (LengthPenaltyDenominator already
@@ -442,41 +416,6 @@ rather than acted on.
       landed BuildMambaFromSafeTensors importer; needs an incremental
       TNNetSelectiveSSM state-carry path, the sibling of the RWKV-4
       decode demo task above).
-- [X] Whisper-tiny importer (openai/whisper-tiny, 39M) — the FIRST speech
-      model import (the landed T5 importer is text-to-text; this one
-      exercises cross-attention from a non-text modality). Every hard
-      ingredient is already landed:
-      TNNetCrossAttention asymmetric mode (QSeqLen != KVSeqLen) for the
-      decoder reading the 1500-frame encoder output, the GPT-2 byte-level
-      BPE tokenizer.json path for Whisper's vocabulary, and FFT machinery
-      (FourierMixFFT) for the frontend. Work: (1) log-mel spectrogram
-      frontend — 80 mel bins, 400-sample STFT window / 160 hop, the fixed
-      HF mel filterbank — as a preprocessing helper (plus a ~40-line
-      16-bit PCM WAV reader) in neuraldatasets.pas or a small
-      neuralaudio.pas; (2) encoder builder: Conv1D(k=3,s=1)+GELU,
-      Conv1D(k=3,s=2)+GELU, FIXED sinusoidal positions, pre-norm
-      transformer blocks; (3) decoder builder: learned positions, causal
-      self-attention + cross-attention per block, tied LM head, and the
-      <|startoftranscript|><|en|><|transcribe|><|notimestamps|> decode
-      prologue; (4) BuildWhisperFromSafeTensors weight map in
-      neural/neuralpretrained.pas (config.json: d_model/encoder_layers/
-      decoder_layers/num_mel_bins). Pairs naturally with the landed seq2seq
-      generation harness (encode once, autoregress the
-      decoder). Verify encoder hidden states + decoder logits vs
-      transformers WhisperModel on a sliced pico fixture with a pinned
-      mel input; headline demo: examples/WhisperTranscribe transcribing a
-      short WAV to text on CPU.
-      LANDED: neural/neuralaudio.pas (WAV reader + exact HF
-      WhisperFeatureExtractor log-mel, direct 400-pt rDFT since 400 is
-      not a power of two; frontend parity 1.1e-5 vs the float64 oracle),
-      BuildWhisperFromSafeTensors in neuralpretrained.pas (two-net RunT5
-      convention; conv frontend via TNNetPadXY+TNNetConvolutionLinear,
-      pre-norm blocks, bias-free k_proj, exact erf GELU, tied head,
-      sinusoidal-encoder/learned-decoder positions), pico fixture
-      tools/whisper_tiny_fixture.py + tests (encoder hidden 2.7e-6,
-      decoder logits 4.8e-6); examples/WhisperTranscribe transcribes
-      jfk.wav correctly with the real 39M checkpoint on CPU (~5 min,
-      2.5 GB RSS).
 - [ ] Forced-prefix seq2seq decode + KV cache for Whisper-style decoders:
       DecodeSeq2SeqGreedy/Sampled assume a text encoder input and a
       single BOS start token, so examples/WhisperTranscribe hand-rolls
@@ -491,52 +430,6 @@ rather than acted on.
       substantially. Note: the WhisperTranscribe example needs ~4 GB
       VIRTUAL memory (ulimit -v 4000000; the 3 GB test cap aborts during
       build).
-- [X] DeepSeek-V2 importer (model_type "deepseek_v2"; DeepSeek-V2-Lite is
-      the reference checkpoint) — the FIRST importer to exercise the two
-      most distinctive landed-but-never-imported blocks:
-      AddMultiHeadLatentAttention (low-rank compressed KV latent +
-      decoupled RoPE keys) and AddDeepSeekMoE (shared + routed experts).
-      Every other importer family in neuralpretrained.pas maps onto plain
-      SDPA/GQA + dense FFN or classic MoE-free blocks, so MLA weight
-      loading is genuinely new plumbing, not a Llama-path clone. Work:
-      (1) config.json reader for the deepseek_v2 keys — kv_lora_rank,
-      q_lora_rank (null in -Lite → full W_q), qk_nope_head_dim,
-      qk_rope_head_dim (decoupled RoPE width), v_head_dim,
-      n_shared_experts / n_routed_experts / num_experts_per_tok,
-      first_k_dense_replace (layer 0 keeps a dense MLP), moe_intermediate
-      vs dense intermediate sizes; (2) weight map onto the MLA builder:
-      kv_a_proj_with_mqa packs [compressed_kv | k_rope] and needs the
-      same rotate_half row-permutation treatment as the Llama path but
-      only on the rope slice, kv_a_layernorm onto the latent RMSNorm,
-      kv_b_proj split into per-head k_nope|v halves; (3) MoE block map:
-      per-expert gate/up/down (SwiGLU packing as in Llama), shared-expert
-      branch added to the routed sum, gate weights onto TNNetTopKGate
-      (V2 softmax gating; the landed TNNetBiasBalancedTopKGate covers a
-      later V3-style variant behind the same map); (4) BuildFromPretrained
-      dispatch + .bin fallback as in every other family. Full -Lite is
-      15.7B so the runnable proof is a make_pico_deepseek_fixture.py
-      sliced/re-randomized pico checkpoint (reuse the ModernBERT
-      O(1)-scale re-randomization lesson) with hidden-state parity vs the
-      HF float64 oracle, plus non-vacuity asserts on kv_lora_rank, the
-      decoupled-rope slice, shared-expert contribution, and the layer-0
-      dense-vs-MoE split.
-      DONE: BuildDeepSeekV2FromSafeTensors[Ex/WithConfig] +
-      ReadDeepSeekV2ConfigFromJSONFile + BuildFromPretrained dispatch in
-      neural/neuralpretrained.pas (MLA + DeepSeekMoE wired from primitives
-      mirroring the two builders; TNNetTopKGate gained an optional
-      pRenormalize=false raw mode for norm_topk_prob=false, serialized
-      INVERTED in FStruct[1] so old files keep renormalizing);
-      tools/deepseek_v2_tiny_fixture.py (float64 transformers 5.x builtin
-      DeepseekV2 oracle, hub-layout per-expert export verified to
-      round-trip through from_pretrained) + tiny_deepseek_v2.* fixtures;
-      TestDeepSeekV2LogitParity (max |logit diff| ~1e-6, plus the four
-      non-vacuity asserts). Parity gotcha found: HF's kv_a_layernorm is
-      constructed WITHOUT eps (fixed 1e-6, NOT rms_norm_eps). Rope rows
-      load with NO permutation (DeepSeek stores interleaved pairs).
-      Deliberately skipped: q_lora_rank low-rank query path (null in
-      -Lite; full 236B V2 only), group_limited_greedy routing, YaRN
-      rope_scaling with mscale, scoring_func sigmoid (V3) - all rejected
-      with clear errors.
 - [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
       decode docs explicitly note only greedy/sampled streamed generation
@@ -599,22 +492,13 @@ rather than acted on.
       disproportionate quality win for completion-style prompts. Test: a
       pinned vocab where the healed and unhealed first-token distributions
       provably differ.
-- [X] Token-level logprob scoring + mini lm-eval harness: ScoreSequence
-      (NN, tokens) returning per-token logprobs (one forward, no
-      generation), then multiple-choice evaluation by length-normalized
-      answer logprob — the HellaSwag/ARC/PIQA pattern. NOT the existing
-      forced-sequence constraint (that FORCES generation; this SCORES
-      candidates). This is what makes the importer program measurable:
-      "imported SmolLM2 scores X on HellaSwag" is the end-to-end proof.
-      Reuses the perplexity NLL plumbing in neuralnlpmetrics.pas; ship
-      with a tiny pinned multiple-choice fixture for the harness itself.
 - [ ] HellaSwag-style eval example on an imported checkpoint: a small
       example program that loads a real imported model (e.g. SmolLM2 /
       pythia via the safetensors importers), tokenizes a handful of
       multiple-choice items with TNeuralHFTokenizer and reports acc /
       acc_norm through EvaluateMultipleChoice (neuralnlpmetrics.pas) —
-      the end-to-end "imported model scores X" demo the scoring API
-      (landed above) was built for. Follow-ups: batch candidates sharing
+      the end-to-end "imported model scores X" demo the landed scoring
+      API was built for. Follow-ups: batch candidates sharing
       a context prefix; optional last-window scoring for over-context
       sequences (v1 raises).
 - [ ] Generation-quality / degeneration metrics in neuralnlpmetrics.pas:
@@ -626,8 +510,8 @@ rather than acted on.
 - [ ] Needle-in-a-haystack long-context eval harness: place a fact at
       varying depths in a synthetic long context, measure retrieval
       accuracy vs (depth, context length) as a small grid report. The
-      RoPE-scaling and KV-cache-eviction tasks elsewhere in this list both
-      NEED this to demonstrate they work — neither lists an eval. Works
+      landed RoPE-scaling wiring and the open KV-cache-eviction task both
+      NEED this to demonstrate they work — neither has an eval. Works
       with the char-level/TinyStories-scale models the repo can actually
       run, not just imported LLMs.
 - [ ] Streaming corpus loader with shuffle buffer: the landed packing
