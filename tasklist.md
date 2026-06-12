@@ -241,24 +241,6 @@ rather than acted on.
       heads consistent, update FStruct vocab sizes). Needed the moment
       anyone adds special tokens to fine-tune on top of the Llama/GPT-2
       importers.
-- [X] Phi importer: partial-rotary (rotary_pct) attention + parallel
-      attention/MLP residual layout — more than a weight-mapping delta on
-      the Llama path; reuses the HF-parity fixture tooling.
-- [X] Qwen3 importer (0.6B is the most-used small instruct model): a small
-      delta ON the landed Qwen2 path — dropped QKV biases + per-head
-      QK-norm, the SAME ingredient as the "Gemma 3 - per-head QK-norm"
-      task below, so land that once and both importers consume it.
-      Gemma stays broken out in its own per-generation task track below
-      (gap analysis 2026-06-11: Gemma-1 is ~80% load-time weight folding
-      on the Llama path).
-      DONE 2026-06-12: BuildQwen3FromSafeTensors(Ex) + "qwen3" dispatch;
-      per-head q/k TNNetTokenRMSNorm composed BEFORE RoPE (verified against
-      transformers 5.11 modeling_qwen3.py: q_norm(q_proj(x)) then
-      apply_rotary_pos_emb), shared [head_dim] gain loaded
-      rotate_half-permuted into every head copy
-      (LoadLlamaHeadRMSNormWeights); decoupled config head_dim honored
-      (num_heads*head_dim != hidden_size, div fallback when absent);
-      tiny_qwen3 fixture + parity/dispatch tests.
 - [ ] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
       de-facto checkpoint format, and it ships PRE-quantized weights —
       dovetails with the int8 quantized-inference task (read Q8_0 blocks
@@ -427,16 +409,6 @@ rather than acted on.
       instruction-tuned, so it doubles as the first imported model the
       BLEU/ROUGE metrics can score out of the box. Same HF-parity fixture
       verification as GPT-2/Llama.
-- [X] ForSequenceClassification checkpoint import: load FINE-TUNED
-      classifier checkpoints (sentiment / NLI / toxicity), not just base
-      LMs — classifier-head weight mapping plus id2label from config.json
-      so predictions come out as label strings. Cheap delta on the now-landed
-      BuildBertFromSafeTensors (dependency met: take the (SeqLen,1,hidden)
-      output, classifier = dense(tanh-pooled or [CLS] hidden) per family);
-      also applies to decoder classifiers
-      (GPT2ForSequenceClassification uses the LAST non-pad token's hidden
-      state — document the pooling difference). Test: parity fixture
-      asserting class logits match transformers.
 - [ ] DistilBERT / RoBERTa ForSequenceClassification head deltas: the
       landed BuildBertForSequenceClassificationFromSafeTensors (4f0e2c1)
       explicitly rejects non-bfBert families because their classifier
@@ -446,13 +418,6 @@ rather than acted on.
       are already landed as deltas on the BERT encoder builder, so each is
       a small head-mapping case on the same pSeqClsHead option. Same
       fixture/parity-test pattern as tiny_bert_seqcls (id2label included).
-      patch-embedding conv + the same pre-LN transformer blocks; text side
-      is a small causal encoder; both end in a learned projection to a
-      shared space + temperature. Flagship demo potential: ZERO-SHOT CIFAR
-      classification via the repo's existing image pipeline with no
-      training at all (encode class-name prompts, cosine-match image
-      embeddings). Verify embedding parity per tower against transformers'
-      CLIPModel on the sliced-fixture pattern.
 - [ ] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate
@@ -462,22 +427,6 @@ rather than acted on.
       into int8 storage once the quantized-inference task lands — keeping
       only one tensor-sized scratch buffer. Assert peak RSS during import
       stays within tensor-size + model-size on the parity fixture.
-- [X] GloVe / word2vec / fastText pretrained-embedding loader into
-      TNNetEmbedding: the classical-NLP counterpart of the checkpoint
-      importers — examples/Word2VecSkipGram TRAINS embeddings, loading
-      published pretrained ones is the missing half. Parse the standard
-      text format ("word v1 v2 ... vD" lines, optional count/dim header for
-      .vec), match rows against a TNeuralTokenizer vocab (mean-init
-      misses), optional freeze flag. ~50 lines of parser that instantly
-      upgrades every small-model NLP example. Test: pinned 3-word file
-      round-trips into embedding rows exactly.
-      DONE: LoadPretrainedEmbedding in neural/neuralpretrained.pas
-      (optional "count dim" .vec header, case-sensitive WordToIndex match,
-      mean-init misses, FreezeEmbedding = per-layer LearningRate := 0 as
-      in examples/LoRAFineTune); TNNetEmbedding gained public VocabSize /
-      EmbeddingSize accessors; fixture tests/fixtures/tiny_glove.txt +
-      TestLoadPretrainedEmbedding (exact round-trip, mean miss, header,
-      width rejection, freeze).
 - [ ] NumPy .npy/.npz reader + writer: the universal interchange escape
       hatch — ANY framework can np.savez(**state_dict), and the format is
       trivial (magic + header dict + raw bytes; npz is a zip of npy).
@@ -487,45 +436,6 @@ rather than acted on.
       easier first Pascal→Python round-trip than the listed safetensors
       writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
-- [X] Cerebras-GPT parity verification (possibly ZERO-code "GPT-3 import"):
-      Cerebras-GPT is the truest open GPT-3 reproduction (exact GPT-3
-      recipe — dense attention, learned absolute positions, GPT-2 BPE,
-      Chinchilla-scaled) and its HF checkpoints ship as model_type "gpt2"
-      in GPT2LMHeadModel format, so BuildGPT2FromSafeTensors may load
-      cerebras/Cerebras-GPT-111M TODAY. Task: run the existing GPT-2
-      parity tooling (slicer + logit dump + compare) against it, fix
-      whatever config tolerance breaks (n_positions=2048 etc.), and pin a
-      sliced parity fixture. The cheapest credible answer to "import a
-      trained GPT-3-class model"; doc cross-link target for
-      ../gpt-3-for-pascal.
-      DONE: NOT zero-code after all - two real deviations: the
-      activation_function is "gelu" (the EXACT erf form, not gelu_new;
-      added pExactGelu to the GPT-2 builders + the config-driven
-      BuildFromPretrained route reads activation_function) and upstream
-      ships only pytorch_model.bin (no safetensors; convert via torch).
-      Sliced REAL-weight fixture tests/fixtures/tiny_cerebras_gpt.*
-      (tools/cerebras_gpt_fixture.py) + TestCerebrasGPTLogitParity. Full
-      111M verified: max |logit diff| 7.5e-5 vs the HF float64 oracle,
-      argmax identical at all 16 positions, sane greedy text, loads in
-      under 3 GB. See examples/GPT2Import/README.md.
-- [X] GPT-J importer — the gptj sibling of the landed gpt_neox path:
-      SHARED-LN parallel residual (AddParallelTransformerBlock's default
-      form, already landed), FULL-but-partial rotary (rotary_dim=64 of
-      head_dim 256 for GPT-J-6B) with the INTERLEAVED (GPT-J) RoPE pair
-      layout — i.e. NO rotate_half permutation when loading q/k, unlike
-      gpt_neox/llama, the partial-rotary split wiring is already in the
-      gpt_neox builder to crib from. Separate q/k/v projections (bias-free)
-      + out_proj, lm_head WITH bias, tied=false. GPT-J-6B is too big for
-      CI: pin a pico GPTJForCausalLM fixture (tools/ script convention).
-- [ ] Gemma 1 - head_dim config override in the Llama import path: the ONE
-      structural gap for Gemma-1 — neural/neuralpretrained.pas (~line 771)
-      hardcodes HeadDim := HiddenSize div NumHeads, but Gemma-7B has
-      head_dim=256 != 3072/16=192. Read head_dim from config.json when
-      present, size the q/o projections as NumHeads*HeadDim != hidden_size
-      (o_proj maps back to hidden_size), and keep the div fallback so all
-      landed Llama fixtures stay bit-identical. Prerequisite for every
-      Gemma task below; also future-proofs other head_dim-decoupled
-      architectures.
 - [ ] Gemma 1 - GeGLU FFN wiring: Gemma's MLP is gated GELU, not SwiGLU.
       TNNetGELU already implements the exact tanh approximation Gemma
       specifies (gelu_pytorch_tanh), so this is letting the importer's
@@ -533,8 +443,9 @@ rather than acted on.
       (GELU vs SiLU) rather than any new layer. Test: gated-FFN forward
       parity against transformers' GemmaMLP on a pinned tensor.
 - [ ] Gemma 1 - BuildGemmaFromSafeTensors importer (load-time weight
-      folding on the landed Llama path; depends on the head_dim + GeGLU
-      tasks above): (a) embedding output scaled by sqrt(d_model) — fold
+      folding on the landed Llama path; depends on the GeGLU task above —
+      the decoupled head_dim config override Gemma-7B needs is already
+      landed on the Llama config reader via the Qwen3 work): (a) embedding output scaled by sqrt(d_model) — fold
       sqrt(d) into the embedding ROWS at load since TNNetEmbedding's
       ScaleEmbedding is init-only, and scale ONLY the embedding copy, not
       the tied LM-head copy (Gemma always ties); (b) zero-centered RMSNorm
@@ -1004,5 +915,3 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       with loss-difference direction >90% of the time across a small grid.
 - [ ] Coverage matrix at the top of TestNeuralNumerical.pas: per-class
       `[grad] [serialize]` block, written by a small script.
-- [ ] LoadFromString round-trip for the entire activation menagerie — one
-      parameterised test walking every TNNetReLUBase descendant.
