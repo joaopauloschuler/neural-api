@@ -390,7 +390,10 @@ rather than acted on.
       safetensors. Expose the same named-tensor API as
       TNNetSafeTensorsReader so the GPT-2/Llama builders take either
       format. Test: torch.save a pico state_dict in Python, assert every
-      tensor matches its safetensors twin bit-for-bit.
+      tensor matches its safetensors twin bit-for-bit. Concrete consumers
+      verified 2026-06-12: cerebras/Cerebras-GPT-* and the
+      roneneldan/TinyStories-* checkpoints ship pytorch_model.bin ONLY
+      (the Cerebras parity work converted via Python as a stopgap).
 - [ ] T5/Flan-T5 (encoder-decoder) importer: the natural companion to the
       seq2seq generation harness task above. T5's relative-position bias
       buckets are landed (TNNetT5RelPosBiasAttention / avT5RelPosBias), and
@@ -410,7 +413,15 @@ rather than acted on.
       (GPT2ForSequenceClassification uses the LAST non-pad token's hidden
       state — document the pooling difference). Test: parity fixture
       asserting class logits match transformers.
-- [ ] CLIP importer (dual text/image encoder): the image side is a
+- [ ] DistilBERT / RoBERTa ForSequenceClassification head deltas: the
+      landed BuildBertForSequenceClassificationFromSafeTensors (4f0e2c1)
+      explicitly rejects non-bfBert families because their classifier
+      stacks differ — DistilBERT uses pre_classifier dense + ReLU on the
+      [CLS] hidden (no pooler), RoBERTa uses classifier.dense + tanh +
+      classifier.out_proj on the <s> token (also no pooler). Both trunks
+      are already landed as deltas on the BERT encoder builder, so each is
+      a small head-mapping case on the same pSeqClsHead option. Same
+      fixture/parity-test pattern as tiny_bert_seqcls (id2label included).
       patch-embedding conv + the same pre-LN transformer blocks; text side
       is a small causal encoder; both end in a learned projection to a
       shared space + temperature. Flagship demo potential: ZERO-SHOT CIFAR
