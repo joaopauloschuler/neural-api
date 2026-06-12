@@ -24,7 +24,7 @@ Coded by Claude (AI).
 // neuralpretrained.pas (examples/GPT2Import, examples/LlamaImport) can take
 // text prompts end to end instead of raw token ids.
 //
-// Supported (the two families the importers need):
+// Supported (the three families the importers need):
 //   * Byte-level BPE (GPT-2 / distilgpt2 / SmolLM2): the GPT-2
 //     bytes-to-unicode alphabet, the GPT-2 pre-tokenization regex
 //     ('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|
@@ -33,10 +33,21 @@ Coded by Claude (AI).
 //     Prepend("▁") + Replace(" "->"▁") normalizer chain, whole-segment BPE
 //     (no pre-tokenizer), <0xNN> byte-fallback tokens and the
 //     Replace/ByteFallback/Fuse/Strip decoder chain.
+//   * WordPiece (BERT / MiniLM / all-MiniLM-L6-v2): BertNormalizer
+//     (clean_text, handle_chinese_chars, strip_accents, lowercase),
+//     BertPreTokenizer (whitespace split + isolated punctuation), greedy
+//     longest-match-first WordPiece with the "##" continuation prefix and
+//     the WordPiece decoder (space join, "##" strip, cleanup). Strip-accents
+//     covers Latin-1 Supplement and Latin Extended-A (cafe/naive/resume
+//     class); marks on exotic scripts pass through -- same approximation
+//     stance as the \p{L} tables below. Like the BPE families, special
+//     tokens ([CLS]/[SEP]/...) are NEVER auto-injected: BERT-style callers
+//     add them via TokenToId('[CLS]') / TokenToId('[SEP]') (see
+//     BertTokenizeSentence in neuralpretrained.pas).
 //
 // NOT supported (raises EHFTokenizerError with a clear message):
-//   * model.type <> "BPE" (e.g. Unigram, WordPiece) -- the HF conversion of
-//     SentencePiece Llama tokenizers is BPE, which is what ships in
+//   * model.type <> "BPE"/"WordPiece" (e.g. Unigram) -- the HF conversion
+//     of SentencePiece Llama tokenizers is BPE, which is what ships in
 //     TinyLlama / Llama-2 / SmolLM2 tokenizer.json files.
 //   * The raw SentencePiece .model protobuf (use tokenizer.json instead).
 //
@@ -73,7 +84,8 @@ type
 
   { TNeuralHFTokenizer }
   // Encoder/decoder for the HuggingFace tokenizer.json fast-tokenizer
-  // format (byte-level BPE and metaspace/byte-fallback BPE).
+  // format (byte-level BPE, metaspace/byte-fallback BPE and BERT
+  // WordPiece).
   // Coded by Claude (AI).
   TNeuralHFTokenizer = class(TObject)
     private
@@ -84,6 +96,15 @@ type
       // model flags
       FByteFallback, FFuseUnk, FIgnoreMerges: boolean;
       FUnkId, FBosId, FEosId: integer;
+      // WordPiece (BERT) family
+      FWordPiece: boolean;        // model.type = WordPiece
+      FWPPrefix: string;          // continuing_subword_prefix ('##')
+      FWPMaxChars: integer;       // max_input_chars_per_word
+      FBertLowercase: boolean;    // BertNormalizer lowercase
+      FBertStripAccents: boolean; // BertNormalizer strip_accents (resolved)
+      FBertCleanText: boolean;    // BertNormalizer clean_text
+      FBertHandleChinese: boolean;// BertNormalizer handle_chinese_chars
+      FDecWordPieceCleanup: boolean; // WordPiece decoder cleanup flag
       // pre-tokenizer / normalizer
       FByteLevel: boolean;        // ByteLevel pre-tokenizer present
       FAddPrefixSpace: boolean;
@@ -106,6 +127,9 @@ type
       function MergeRank(const A, B: string): integer;  // rank or MaxInt
       procedure BPEWord(const Symbols: TStringList; Ids: TIntegerList);
       procedure EmitTokenOrFallback(const Symbol: string; Ids: TIntegerList);
+      function BertNormalize(const Segment: string): string;
+      procedure BertPieces(const Segment: string; Pieces: TStringList);
+      procedure WordPieceWord(const WordText: string; Ids: TIntegerList);
       procedure EncodeSegment(const Segment: string; Ids: TIntegerList);
       procedure ByteLevelPieces(const Segment: string; Pieces: TStringList);
       function MapPieceToByteLevel(const Piece: string): TStringList;
@@ -142,6 +166,7 @@ type
       property BosId: integer read FBosId; // -1 if none
       property EosId: integer read FEosId; // -1 if none
       property IsByteLevel: boolean read FByteLevel;
+      property IsWordPiece: boolean read FWordPiece;
   end;
 
 implementation
@@ -247,6 +272,132 @@ begin
     ((CP >= $FF10) and (CP <= $FF19));           // Fullwidth
 end;
 
+// Punctuation for the BERT pre-tokenizer: HF treats every ASCII
+// non-alphanumeric printable as punctuation (33-47, 58-64, 91-96, 123-126)
+// plus Unicode category P. The category-P part is approximated over the
+// common blocks (Latin-1 punctuation, General Punctuation, CJK symbols,
+// fullwidth forms) -- same stance as IsLetterCP above.
+function IsBertPunctuationCP(CP: cardinal): boolean;
+begin
+  Result :=
+    ((CP >= 33) and (CP <= 47)) or
+    ((CP >= 58) and (CP <= 64)) or
+    ((CP >= 91) and (CP <= 96)) or
+    ((CP >= 123) and (CP <= 126)) or
+    (CP = $A1) or (CP = $A7) or (CP = $AB) or (CP = $B6) or (CP = $B7) or
+    (CP = $BB) or (CP = $BF) or
+    ((CP >= $2010) and (CP <= $2027)) or       // General Punctuation
+    ((CP >= $2030) and (CP <= $205E)) or
+    ((CP >= $3001) and (CP <= $3003)) or       // CJK punctuation
+    ((CP >= $3008) and (CP <= $3011)) or
+    ((CP >= $FF01) and (CP <= $FF0F)) or       // fullwidth ASCII punct
+    ((CP >= $FF1A) and (CP <= $FF20)) or
+    ((CP >= $FF3B) and (CP <= $FF40)) or
+    ((CP >= $FF5B) and (CP <= $FF65));
+end;
+
+// CJK ideographs for BertNormalizer handle_chinese_chars (HF's
+// _is_chinese_char ranges).
+function IsCJKIdeographCP(CP: cardinal): boolean;
+begin
+  Result :=
+    ((CP >= $4E00) and (CP <= $9FFF)) or
+    ((CP >= $3400) and (CP <= $4DBF)) or
+    ((CP >= $F900) and (CP <= $FAFF)) or
+    ((CP >= $20000) and (CP <= $2A6DF)) or
+    ((CP >= $2A700) and (CP <= $2B73F)) or
+    ((CP >= $2B740) and (CP <= $2B81F)) or
+    ((CP >= $2B820) and (CP <= $2CEAF)) or
+    ((CP >= $2F800) and (CP <= $2FA1F));
+end;
+
+// NFD base letter for strip_accents over Latin-1 Supplement and Latin
+// Extended-A: returns the unaccented base codepoint, or 0 when the
+// character has no canonical decomposition (ae/oe ligatures, stroked
+// letters, thorn, eth, dotless i, ...) or is outside the covered blocks.
+// Combining marks themselves (U+0300..U+036F) return 1 meaning "drop".
+function StripAccentBaseCP(CP: cardinal): cardinal;
+begin
+  Result := 0;
+  if (CP >= $300) and (CP <= $36F) then Exit(1); // bare combining mark
+  case CP of
+    // Latin-1 Supplement
+    $C0..$C5: Result := Ord('A');
+    $C7: Result := Ord('C');
+    $C8..$CB: Result := Ord('E');
+    $CC..$CF: Result := Ord('I');
+    $D1: Result := Ord('N');
+    $D2..$D6: Result := Ord('O');
+    $D9..$DC: Result := Ord('U');
+    $DD: Result := Ord('Y');
+    $E0..$E5: Result := Ord('a');
+    $E7: Result := Ord('c');
+    $E8..$EB: Result := Ord('e');
+    $EC..$EF: Result := Ord('i');
+    $F1: Result := Ord('n');
+    $F2..$F6: Result := Ord('o');
+    $F9..$FC: Result := Ord('u');
+    $FD, $FF: Result := Ord('y');
+    // Latin Extended-A (pairs upper/lower; gaps = no decomposition)
+    $100, $102, $104: Result := Ord('A');
+    $101, $103, $105: Result := Ord('a');
+    $106, $108, $10A, $10C: Result := Ord('C');
+    $107, $109, $10B, $10D: Result := Ord('c');
+    $10E: Result := Ord('D');
+    $10F: Result := Ord('d');
+    $112, $114, $116, $118, $11A: Result := Ord('E');
+    $113, $115, $117, $119, $11B: Result := Ord('e');
+    $11C, $11E, $120, $122: Result := Ord('G');
+    $11D, $11F, $121, $123: Result := Ord('g');
+    $124: Result := Ord('H');
+    $125: Result := Ord('h');
+    $128, $12A, $12C, $12E, $130: Result := Ord('I');
+    $129, $12B, $12D, $12F: Result := Ord('i');
+    $134: Result := Ord('J');
+    $135: Result := Ord('j');
+    $136: Result := Ord('K');
+    $137: Result := Ord('k');
+    $139, $13B, $13D: Result := Ord('L');
+    $13A, $13C, $13E: Result := Ord('l');
+    $143, $145, $147: Result := Ord('N');
+    $144, $146, $148: Result := Ord('n');
+    $14C, $14E, $150: Result := Ord('O');
+    $14D, $14F, $151: Result := Ord('o');
+    $154, $156, $158: Result := Ord('R');
+    $155, $157, $159: Result := Ord('r');
+    $15A, $15C, $15E, $160: Result := Ord('S');
+    $15B, $15D, $15F, $161: Result := Ord('s');
+    $162, $164: Result := Ord('T');
+    $163, $165: Result := Ord('t');
+    $168, $16A, $16C, $16E, $170, $172: Result := Ord('U');
+    $169, $16B, $16D, $16F, $171, $173: Result := Ord('u');
+    $174: Result := Ord('W');
+    $175: Result := Ord('w');
+    $176, $178: Result := Ord('Y');
+    $177: Result := Ord('y');
+    $179, $17B, $17D: Result := Ord('Z');
+    $17A, $17C, $17E: Result := Ord('z');
+  end;
+end;
+
+// Lowercase for the BertNormalizer over ASCII, Latin-1 and Latin
+// Extended-A (after strip_accents most input is ASCII anyway).
+function LowercaseCP(CP: cardinal): cardinal;
+begin
+  Result := CP;
+  if (CP >= Ord('A')) and (CP <= Ord('Z')) then Exit(CP + 32);
+  if ((CP >= $C0) and (CP <= $DE)) and (CP <> $D7) then Exit(CP + 32);
+  if CP = $178 then Exit($FF); // Y diaeresis
+  // Latin Extended-A: upper/lower alternate in pairs.
+  if (CP >= $100) and (CP <= $177) then
+  begin
+    if ((CP <= $137) or ((CP >= $14A) and (CP <= $177))) and
+      ((CP and 1) = 0) then Exit(CP + 1);
+    if (CP >= $139) and (CP <= $148) and ((CP and 1) = 1) then Exit(CP + 1);
+  end;
+  if (CP >= $179) and (CP <= $17E) and ((CP and 1) = 1) then Exit(CP + 1);
+end;
+
 { ---------------------------------------------------------------- }
 { fpjson portability helpers                                        }
 { ---------------------------------------------------------------- }
@@ -282,9 +433,27 @@ var
     end;
   end;
 
+var
+  OutPos, ByteCnt: integer;
+  Encoded: string;
+
+  // Writes into the preallocated Result buffer. Plain Result := Result + c
+  // is QUADRATIC in this unit: {$CODEPAGE UTF8} (via neuralnetwork.inc)
+  // defeats FPC's in-place append optimization, so every concat copies the
+  // whole accumulated string -- a 466 KB BERT tokenizer.json then takes
+  // minutes instead of milliseconds. Escapes never grow the text (6 or 12
+  // escape bytes become at most 4 UTF-8 bytes), so Length(S) is a safe
+  // upper bound for the output size.
+  procedure AppendChar(C: char); inline;
+  begin
+    Inc(OutPos);
+    Result[OutPos] := C;
+  end;
+
 begin
-  Result := '';
   Total := Length(S);
+  SetLength(Result, Total);
+  OutPos := 0;
   Position := 1;
   while Position <= Total do
   begin
@@ -301,20 +470,23 @@ begin
           CP := $10000 + ((CP - $D800) shl 10) + (LowCP - $DC00);
           Inc(Position, 6);
         end;
-        Result := Result + CodePointToUTF8(CP);
+        Encoded := CodePointToUTF8(CP);
+        for ByteCnt := 1 to Length(Encoded) do AppendChar(Encoded[ByteCnt]);
       end
       else
       begin // any other escape: copy verbatim, never reinterpret char 2
-        Result := Result + S[Position] + S[Position + 1];
+        AppendChar(S[Position]);
+        AppendChar(S[Position + 1]);
         Inc(Position, 2);
       end;
     end
     else
     begin
-      Result := Result + S[Position];
+      AppendChar(S[Position]);
       Inc(Position);
     end;
   end;
+  SetLength(Result, OutPos);
 end;
 
 { ---------------------------------------------------------------- }
@@ -360,6 +532,14 @@ begin
   FIgnoreMerges := false;
   FByteLevel := false;
   FAddPrefixSpace := false;
+  FWordPiece := false;
+  FWPPrefix := '##';
+  FWPMaxChars := 100;
+  FBertLowercase := false;
+  FBertStripAccents := false;
+  FBertCleanText := false;
+  FBertHandleChinese := false;
+  FDecWordPieceCleanup := false;
   FNormPrepend := '';
   FDecStripLeft := 0;
   FUnkId := -1;
@@ -503,6 +683,18 @@ var
         NormObj.Objects['pattern'].Get('String', '');
       FNormReplaceTo[High(FNormReplaceTo)] := NormObj.Get('content', '');
     end
+    else if Kind = 'BertNormalizer' then
+    begin
+      FBertCleanText := NormObj.Get('clean_text', true);
+      FBertHandleChinese := NormObj.Get('handle_chinese_chars', true);
+      FBertLowercase := NormObj.Get('lowercase', true);
+      // strip_accents: null means "follow lowercase" (HF semantics)
+      Node := NormObj.Find('strip_accents');
+      if (Node = nil) or Node.IsNull then
+        FBertStripAccents := FBertLowercase
+      else
+        FBertStripAccents := Node.AsBoolean;
+    end
     else
       raise EHFTokenizerError.Create('Unsupported normalizer type: ' + Kind);
   end;
@@ -525,6 +717,9 @@ var
       FByteLevel := true;
       FAddPrefixSpace := PreObj.Get('add_prefix_space', false);
     end
+    else if Kind = 'BertPreTokenizer' then
+      // whitespace split + isolated punctuation; keyed off FWordPiece in
+      // EncodeSegment (BertPieces), nothing else to configure
     else
       raise EHFTokenizerError.Create(
         'Unsupported pre_tokenizer type: ' + Kind);
@@ -553,6 +748,11 @@ var
     end
     else if Kind = 'Strip' then
       FDecStripLeft := DecObj.Get('start', 0)
+    else if Kind = 'WordPiece' then
+    begin
+      FWPPrefix := DecObj.Get('prefix', '##');
+      FDecWordPieceCleanup := DecObj.Get('cleanup', true);
+    end
     else if (Kind = 'ByteLevel') or (Kind = 'ByteFallback') or
       (Kind = 'Fuse') then
       // ByteLevel/ByteFallback decoding is keyed off the model flags;
@@ -582,13 +782,19 @@ begin
 
     // ---- model -------------------------------------------------
     ModelObj := RootObj.Objects['model'];
-    if ModelObj.Get('type', '') <> 'BPE' then
+    FWordPiece := ModelObj.Get('type', '') = 'WordPiece';
+    if (not FWordPiece) and (ModelObj.Get('type', '') <> 'BPE') then
       raise EHFTokenizerError.Create('Unsupported model.type "' +
         ModelObj.Get('type', '') +
-        '" (only BPE is supported; Unigram is not)');
+        '" (only BPE and WordPiece are supported; Unigram is not)');
     FByteFallback := ModelObj.Get('byte_fallback', false);
     FFuseUnk := ModelObj.Get('fuse_unk', false);
     FIgnoreMerges := ModelObj.Get('ignore_merges', false);
+    if FWordPiece then
+    begin
+      FWPPrefix := ModelObj.Get('continuing_subword_prefix', '##');
+      FWPMaxChars := ModelObj.Get('max_input_chars_per_word', 100);
+    end;
 
     // vocab: token -> id
     VocabObj := ModelObj.Objects['vocab'];
@@ -604,8 +810,13 @@ begin
       FIdToToken[TokenId] := Content;
     end;
 
-    // merges: ["a b", ...] (old) or [["a","b"], ...] (new)
-    MergesArr := ModelObj.Arrays['merges'];
+    // merges: ["a b", ...] (old) or [["a","b"], ...] (new).
+    // WordPiece has no merges (greedy longest-match over the vocab).
+    if FWordPiece then
+      MergesArr := nil
+    else
+      MergesArr := ModelObj.Arrays['merges'];
+    if MergesArr <> nil then
     for Cnt := 0 to MergesArr.Count - 1 do
     begin
       Node := MergesArr.Items[Cnt];
@@ -935,6 +1146,137 @@ begin
     EmitTokenOrFallback(Symbols[Cnt], Ids);
 end;
 
+// BertNormalizer: clean_text -> handle_chinese_chars -> strip_accents ->
+// lowercase (HF order). clean_text drops control chars and canonicalizes
+// \t\n\r to spaces; handle_chinese_chars pads CJK ideographs with spaces.
+function TNeuralHFTokenizer.BertNormalize(const Segment: string): string;
+var
+  Position: integer;
+  CP, Base: cardinal;
+begin
+  Result := '';
+  Position := 1;
+  while Position <= Length(Segment) do
+  begin
+    CP := NextCodePoint(Segment, Position);
+    if FBertCleanText then
+    begin
+      if (CP = 0) or (CP = $FFFD) then continue;
+      if (CP = 9) or (CP = 10) or (CP = 13) then CP := 32
+      else if (CP < 32) or (CP = 127) then continue; // other control chars
+    end;
+    if FBertHandleChinese and IsCJKIdeographCP(CP) then
+    begin
+      Result := Result + ' ' + CodePointToUTF8(CP) + ' ';
+      continue;
+    end;
+    if FBertStripAccents then
+    begin
+      Base := StripAccentBaseCP(CP);
+      if Base = 1 then continue; // bare combining mark: drop
+      if Base <> 0 then CP := Base;
+    end;
+    if FBertLowercase then CP := LowercaseCP(CP);
+    Result := Result + CodePointToUTF8(CP);
+  end;
+end;
+
+// BertPreTokenizer: split on whitespace, then isolate every punctuation
+// character as its own piece.
+procedure TNeuralHFTokenizer.BertPieces(const Segment: string;
+  Pieces: TStringList);
+var
+  Position, RunStart: integer;
+  CP: cardinal;
+  Current: string;
+begin
+  Current := '';
+  Position := 1;
+  while Position <= Length(Segment) do
+  begin
+    RunStart := Position;
+    CP := NextCodePoint(Segment, Position);
+    if IsWhitespaceCP(CP) then
+    begin
+      if Current <> '' then Pieces.Add(Current);
+      Current := '';
+    end
+    else if IsBertPunctuationCP(CP) then
+    begin
+      if Current <> '' then Pieces.Add(Current);
+      Current := '';
+      Pieces.Add(Copy(Segment, RunStart, Position - RunStart));
+    end
+    else
+      Current := Current + Copy(Segment, RunStart, Position - RunStart);
+  end;
+  if Current <> '' then Pieces.Add(Current);
+end;
+
+// Greedy longest-match-first WordPiece over one pre-tokenized word:
+// repeatedly take the LONGEST vocab entry matching a prefix of what is
+// left ('##' + suffix when not at the word start); any failure marks the
+// WHOLE word as [UNK] (HF semantics).
+procedure TNeuralHFTokenizer.WordPieceWord(const WordText: string;
+  Ids: TIntegerList);
+var
+  CPStr: array of string;
+  Total, Position, RunStart: integer;
+  StartIdx, EndIdx, TokenId, Found, Cnt: integer;
+  Sub: string;
+  Matched: TIntegerList;
+begin
+  // split the word into codepoints
+  SetLength(CPStr, Length(WordText));
+  Total := 0;
+  Position := 1;
+  while Position <= Length(WordText) do
+  begin
+    RunStart := Position;
+    NextCodePoint(WordText, Position);
+    CPStr[Total] := Copy(WordText, RunStart, Position - RunStart);
+    Inc(Total);
+  end;
+  if Total = 0 then exit;
+  if Total > FWPMaxChars then
+  begin
+    if FUnkId >= 0 then Ids.Add(FUnkId);
+    exit;
+  end;
+  Matched := TIntegerList.Create();
+  try
+    StartIdx := 0;
+    while StartIdx < Total do
+    begin
+      Found := -1;
+      EndIdx := Total;
+      while EndIdx > StartIdx do
+      begin
+        Sub := '';
+        for Cnt := StartIdx to EndIdx - 1 do Sub := Sub + CPStr[Cnt];
+        if StartIdx > 0 then Sub := FWPPrefix + Sub;
+        TokenId := VocabFind(Sub);
+        if TokenId >= 0 then
+        begin
+          Found := TokenId;
+          break;
+        end;
+        Dec(EndIdx);
+      end;
+      if Found < 0 then
+      begin // whole word becomes [UNK]
+        if FUnkId >= 0 then Ids.Add(FUnkId);
+        exit;
+      end;
+      Matched.Add(Found);
+      StartIdx := EndIdx;
+    end;
+    for Cnt := 0 to Matched.Count - 1 do Ids.Add(Matched[Cnt]);
+  finally
+    Matched.Free;
+  end;
+end;
+
 procedure TNeuralHFTokenizer.EncodeSegment(const Segment: string;
   Ids: TIntegerList);
 var
@@ -943,7 +1285,18 @@ var
   Normalized: string;
 begin
   if Segment = '' then exit;
-  if FByteLevel then
+  if FWordPiece then
+  begin
+    Pieces := TStringList.Create();
+    try
+      BertPieces(BertNormalize(Segment), Pieces);
+      for Cnt := 0 to Pieces.Count - 1 do
+        WordPieceWord(Pieces[Cnt], Ids);
+    finally
+      Pieces.Free;
+    end;
+  end
+  else if FByteLevel then
   begin
     Normalized := Segment;
     if FAddPrefixSpace and (Normalized[1] <> ' ') then
@@ -1069,6 +1422,7 @@ function TNeuralHFTokenizer.Decode(const Ids: array of integer;
   SkipSpecialTokens: boolean = true): string;
 var
   Cnt, TokenIndex, Stripped: integer;
+  Piece: string;
 begin
   Result := '';
   for Cnt := 0 to High(Ids) do
@@ -1076,10 +1430,39 @@ begin
     if IsAddedTokenId(Ids[Cnt], TokenIndex) then
     begin
       if not (SkipSpecialTokens and FAddedTokens[TokenIndex].Special) then
+      begin
+        if FWordPiece and (Result <> '') then Result := Result + ' ';
         Result := Result + FAddedTokens[TokenIndex].Content;
+      end;
+    end
+    else if FWordPiece then
+    begin
+      // WordPiece decoder: join with spaces, gluing '##' continuations.
+      Piece := DecodeToken(Ids[Cnt]);
+      if (FWPPrefix <> '') and
+        (Copy(Piece, 1, Length(FWPPrefix)) = FWPPrefix) then
+        Result := Result + Copy(Piece, Length(FWPPrefix) + 1, MaxInt)
+      else
+      begin
+        if Result <> '' then Result := Result + ' ';
+        Result := Result + Piece;
+      end;
     end
     else
       Result := Result + DecodeToken(Ids[Cnt]);
+  end;
+  if FWordPiece and FDecWordPieceCleanup then
+  begin
+    // HF WordPiece decoder cleanup: re-attach punctuation/contractions.
+    Result := StringReplace(Result, ' .', '.', [rfReplaceAll]);
+    Result := StringReplace(Result, ' ?', '?', [rfReplaceAll]);
+    Result := StringReplace(Result, ' !', '!', [rfReplaceAll]);
+    Result := StringReplace(Result, ' ,', ',', [rfReplaceAll]);
+    Result := StringReplace(Result, ' n''t', 'n''t', [rfReplaceAll]);
+    Result := StringReplace(Result, ' ''m', '''m', [rfReplaceAll]);
+    Result := StringReplace(Result, ' ''s', '''s', [rfReplaceAll]);
+    Result := StringReplace(Result, ' ''ve', '''ve', [rfReplaceAll]);
+    Result := StringReplace(Result, ' ''re', '''re', [rfReplaceAll]);
   end;
   // decoder Strip(' ', start, 0): drop up to N leading spaces
   Stripped := 0;

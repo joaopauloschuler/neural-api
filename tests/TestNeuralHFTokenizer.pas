@@ -28,6 +28,8 @@ type
   published
     procedure TestByteLevelParityWithHF;
     procedure TestMetaspaceParityWithHF;
+    procedure TestWordPieceParityWithHF;
+    procedure TestWordPieceSpecialTokenIds;
     procedure TestByteLevelSpecialTokenIds;
     procedure TestMetaspaceSpecialTokenIds;
     procedure TestDecodeKeepsSpecialsWhenAsked;
@@ -106,6 +108,33 @@ end;
 procedure TTestNeuralHFTokenizer.TestMetaspaceParityWithHF;
 begin
   RunParityBattery('metaspace');
+end;
+
+procedure TTestNeuralHFTokenizer.TestWordPieceParityWithHF;
+begin
+  RunParityBattery('wordpiece');
+end;
+
+// The WordPiece (BERT-family) fixture: [PAD]/[UNK]/[CLS]/[SEP]/[MASK]
+// specials, no BOS/EOS convention. BERT callers fetch [CLS]/[SEP] via
+// TokenToId (BertTokenizeSentence in neuralpretrained.pas).
+procedure TTestNeuralHFTokenizer.TestWordPieceSpecialTokenIds;
+var
+  Tok: TNeuralHFTokenizer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    AssertTrue('wordpiece flag', Tok.IsWordPiece);
+    AssertTrue('not byte-level', not Tok.IsByteLevel);
+    AssertEquals('pad', 0, Tok.TokenToId('[PAD]'));
+    AssertEquals('unk', 1, Tok.UnkId);
+    AssertEquals('cls', 2, Tok.TokenToId('[CLS]'));
+    AssertEquals('sep', 3, Tok.TokenToId('[SEP]'));
+    AssertEquals('mask', 4, Tok.TokenToId('[MASK]'));
+  finally
+    Tok.Free;
+  end;
 end;
 
 procedure TTestNeuralHFTokenizer.TestByteLevelSpecialTokenIds;

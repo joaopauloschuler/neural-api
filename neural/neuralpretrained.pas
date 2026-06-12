@@ -199,7 +199,7 @@ interface
 
 uses
   Classes, SysUtils, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralsafetensors;
+  neuralvolume, neuralnetwork, neuralsafetensors, neuralhftokenizer;
 
 type
   EPretrainedImportError = class(Exception);
@@ -427,6 +427,42 @@ function BuildBertFromSafeTensorsEx(const FileName: string;
 function BuildBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pIncludePooler: boolean = false): TNNet;
+
+// ======================= SENTENCE EMBEDDINGS ===============================
+// sentence-transformers style sentence vectors on top of the BERT encoder
+// (e.g. sentence-transformers/all-MiniLM-L6-v2): tokenize, run the net,
+// MEAN-pool the final hidden states over the REAL tokens only, L2-normalize.
+
+// Tokenizes Text for the BERT encoder: WordPiece content ids wrapped in
+// [CLS] ... [SEP] (matching HF encode(add_special_tokens=True) for a single
+// segment). MaxTokens > 0 truncates the CONTENT so the result is at most
+// MaxTokens ids ([CLS]/[SEP] always kept), like HF truncation. Raises
+// EPretrainedImportError when the tokenizer has no [CLS]/[SEP] tokens.
+function BertTokenizeSentence(Tokenizer: TNeuralHFTokenizer;
+  const Text: string; MaxTokens: integer = 0): TNeuralIntegerArray;
+
+// Attention-mask-aware pooling: Embedding := L2normalize(
+// mean(HiddenStates rows 0..RealTokens-1) ), exactly the
+// sentence-transformers "mean pooling + normalize" head. HiddenStates is
+// the (SeqLen,1,hidden) output of a BuildBertFromSafeTensors net;
+// RealTokens counts the non-[PAD] positions (incl. [CLS]/[SEP]), so [PAD]
+// rows contribute NOTHING (deliberately NOT TNNetAvgChannel, which would
+// average all SeqLen rows including pads). Embedding becomes (1,1,hidden),
+// unit L2 norm (cosine similarity = plain dot product).
+procedure BertPoolSentenceEmbedding(HiddenStates: TNNetVolume;
+  RealTokens: integer; Embedding: TNNetVolume);
+
+// Full pipeline: BertTokenizeSentence -> pad with [PAD] to the net's
+// SeqLen (token-type channel all zeros) -> Net.Compute -> mean pooling
+// over the real tokens -> L2 normalize into Embedding (1,1,hidden).
+// IMPORTANT: the imported encoder carries NO attention padding mask, so
+// real tokens DO attend to [PAD] rows when the sentence is shorter than
+// the net. For exact sentence-transformers parity build the net with
+// pSeqLen equal to the token count of THIS sentence (see
+// examples/SemanticSearch, which caches one net per sentence length);
+// padded calls return an approximation.
+procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Text: string; Embedding: TNNetVolume);
 
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
@@ -2184,6 +2220,99 @@ var
 begin
   Result := BuildBertFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, pIncludePooler);
+end;
+
+// ======================= SENTENCE EMBEDDINGS ===============================
+
+function BertTokenizeSentence(Tokenizer: TNeuralHFTokenizer;
+  const Text: string; MaxTokens: integer = 0): TNeuralIntegerArray;
+var
+  ContentIds: TNeuralIntegerArray;
+  ClsId, SepId, ContentLen, Cnt: integer;
+begin
+  ClsId := Tokenizer.TokenToId('[CLS]');
+  SepId := Tokenizer.TokenToId('[SEP]');
+  if (ClsId < 0) or (SepId < 0) then
+    ImportError('BertTokenizeSentence: tokenizer has no [CLS]/[SEP] ' +
+      'special tokens (not a BERT-family tokenizer.json?).');
+  if MaxTokens = 1 then
+    ImportError('BertTokenizeSentence: MaxTokens must be 0 or >= 2 ' +
+      '([CLS] and [SEP] alone need two positions).');
+  ContentIds := Tokenizer.Encode(Text);
+  ContentLen := Length(ContentIds);
+  if (MaxTokens > 0) and (ContentLen > MaxTokens - 2) then
+    ContentLen := MaxTokens - 2; // truncate, keep [CLS]/[SEP]
+  SetLength(Result, ContentLen + 2);
+  Result[0] := ClsId;
+  for Cnt := 0 to ContentLen - 1 do Result[Cnt + 1] := ContentIds[Cnt];
+  Result[ContentLen + 1] := SepId;
+end;
+
+procedure BertPoolSentenceEmbedding(HiddenStates: TNNetVolume;
+  RealTokens: integer; Embedding: TNNetVolume);
+var
+  SeqLen, Depth, PosCnt, ChanCnt: integer;
+  Sum, Norm: TNeuralFloat;
+begin
+  SeqLen := HiddenStates.SizeX;
+  Depth := HiddenStates.Depth;
+  if (HiddenStates.SizeY <> 1) or (SeqLen < 1) or (Depth < 1) then
+    ImportError('BertPoolSentenceEmbedding: expected a (SeqLen,1,hidden) ' +
+      'volume, got ' + IntToStr(SeqLen) + 'x' +
+      IntToStr(HiddenStates.SizeY) + 'x' + IntToStr(Depth) + '.');
+  if (RealTokens < 1) or (RealTokens > SeqLen) then
+    ImportError('BertPoolSentenceEmbedding: RealTokens ' +
+      IntToStr(RealTokens) + ' out of range 1..' + IntToStr(SeqLen) + '.');
+  Embedding.ReSize(1, 1, Depth);
+  // manual sum/count over the REAL rows only (never TNNetAvgChannel: it
+  // averages all SeqLen rows, pads included)
+  for ChanCnt := 0 to Depth - 1 do
+  begin
+    Sum := 0;
+    for PosCnt := 0 to RealTokens - 1 do
+      Sum := Sum + HiddenStates.FData[PosCnt * Depth + ChanCnt];
+    Embedding.FData[ChanCnt] := Sum / RealTokens;
+  end;
+  Norm := 0;
+  for ChanCnt := 0 to Depth - 1 do
+    Norm := Norm + Embedding.FData[ChanCnt] * Embedding.FData[ChanCnt];
+  Norm := Sqrt(Norm);
+  if Norm > 0 then
+    for ChanCnt := 0 to Depth - 1 do
+      Embedding.FData[ChanCnt] := Embedding.FData[ChanCnt] / Norm;
+end;
+
+procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Text: string; Embedding: TNNetVolume);
+var
+  TokenIds: TNeuralIntegerArray;
+  Input, Hidden: TNNetVolume;
+  SeqLen, PadId, PosCnt: integer;
+begin
+  SeqLen := Net.Layers[0].Output.SizeX;
+  if Net.Layers[0].Output.Depth <> 2 then
+    ImportError('BertEncodeSentence: net input is not (SeqLen,1,2) - not ' +
+      'a BuildBertFromSafeTensors encoder?');
+  TokenIds := BertTokenizeSentence(Tokenizer, Text, SeqLen);
+  PadId := Tokenizer.TokenToId('[PAD]');
+  if PadId < 0 then PadId := 0; // BERT-family [PAD] is id 0 anyway
+  Input := TNNetVolume.Create();
+  Hidden := TNNetVolume.Create();
+  try
+    Input.ReSize(SeqLen, 1, 2);
+    Input.Fill(0); // token-type channel: single segment = all zeros
+    for PosCnt := 0 to SeqLen - 1 do
+      if PosCnt < Length(TokenIds) then
+        Input.FData[PosCnt * 2] := TokenIds[PosCnt]
+      else
+        Input.FData[PosCnt * 2] := PadId;
+    Net.Compute(Input);
+    Net.GetOutput(Hidden);
+    BertPoolSentenceEmbedding(Hidden, Length(TokenIds), Embedding);
+  finally
+    Hidden.Free;
+    Input.Free;
+  end;
 end;
 
 // ===================== MISTRAL / QWEN2 / DISPATCH ==========================

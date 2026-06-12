@@ -17,7 +17,8 @@ interface
 
 uses
   Classes, SysUtils, fpcunit, testregistry, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralsafetensors, neuralpretrained;
+  neuralvolume, neuralnetwork, neuralsafetensors, neuralpretrained,
+  neuralhftokenizer;
 
 type
   TTestNeuralPretrained = class(TTestCase)
@@ -79,6 +80,8 @@ type
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
+    procedure TestBertPoolSentenceEmbedding;
+    procedure TestBertTokenizeSentence;
     procedure TestBuildFromPretrainedDispatch;
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
   end;
@@ -1529,6 +1532,78 @@ begin
     (Pos('gpt2', Msg) > 0) and (Pos('gpt_neo', Msg) > 0) and
     (Pos('llama', Msg) > 0) and (Pos('mistral', Msg) > 0) and
     (Pos('qwen2', Msg) > 0));
+end;
+
+// The sentence-transformers pooling head: mean over the REAL token rows
+// only (pads excluded), then L2 normalize. Pinned by hand on a (4,1,2)
+// hidden volume where the pad rows carry large garbage that MUST NOT leak
+// into the embedding.
+procedure TTestNeuralPretrained.TestBertPoolSentenceEmbedding;
+var
+  Hidden, Embedding: TNNetVolume;
+  Norm: double;
+begin
+  Hidden := TNNetVolume.Create();
+  Embedding := TNNetVolume.Create();
+  try
+    Hidden.ReSize(4, 1, 2);
+    // row 0: (1, 2); row 1: (3, 10); rows 2-3: pad garbage
+    Hidden.FData[0] := 1; Hidden.FData[1] := 2;
+    Hidden.FData[2] := 3; Hidden.FData[3] := 10;
+    Hidden.FData[4] := 1000; Hidden.FData[5] := -1000;
+    Hidden.FData[6] := -777; Hidden.FData[7] := 777;
+    BertPoolSentenceEmbedding(Hidden, 2, Embedding);
+    AssertEquals('embedding depth', 2, Embedding.Size);
+    // mean of rows 0..1 = (2, 6); L2 norm = sqrt(40)
+    AssertEquals('channel 0', 2 / Sqrt(40), Embedding.FData[0], 1e-6);
+    AssertEquals('channel 1', 6 / Sqrt(40), Embedding.FData[1], 1e-6);
+    Norm := Sqrt(Sqr(Embedding.FData[0]) + Sqr(Embedding.FData[1]));
+    AssertEquals('unit L2 norm', 1.0, Norm, 1e-6);
+    // all four rows real: pads now included by design
+    BertPoolSentenceEmbedding(Hidden, 4, Embedding);
+    AssertEquals('full-length mean ch0',
+      (1 + 3 + 1000 - 777) / 4.0 / Sqrt(Sqr((1 + 3 + 1000 - 777) / 4.0) +
+      Sqr((2 + 10 - 1000 + 777) / 4.0)), Embedding.FData[0], 1e-6);
+  finally
+    Embedding.Free;
+    Hidden.Free;
+  end;
+end;
+
+// BertTokenizeSentence must wrap the WordPiece content ids in [CLS]/[SEP]
+// (ids 2/3 in the tiny fixture) and truncate the CONTENT to MaxTokens-2,
+// matching HF encode(add_special_tokens=True) + truncation.
+procedure TTestNeuralPretrained.TestBertTokenizeSentence;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids, Truncated: TNeuralIntegerArray;
+  ContentIds: TNeuralIntegerArray;
+  Cnt: integer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    Ids := BertTokenizeSentence(Tok, 'the quick brown fox');
+    AssertTrue('has content', Length(Ids) > 2);
+    AssertEquals('starts with [CLS]', Tok.TokenToId('[CLS]'), Ids[0]);
+    AssertEquals('ends with [SEP]', Tok.TokenToId('[SEP]'),
+      Ids[High(Ids)]);
+    ContentIds := Tok.Encode('the quick brown fox');
+    AssertEquals('content length', Length(ContentIds), Length(Ids) - 2);
+    for Cnt := 0 to High(ContentIds) do
+      AssertEquals('content id ' + IntToStr(Cnt), ContentIds[Cnt],
+        Ids[Cnt + 1]);
+    // truncation: keep [CLS] + first (MaxTokens-2) content ids + [SEP]
+    Truncated := BertTokenizeSentence(Tok, 'the quick brown fox', 4);
+    AssertEquals('truncated to MaxTokens', 4, Length(Truncated));
+    AssertEquals('truncated [CLS]', Ids[0], Truncated[0]);
+    AssertEquals('truncated content 0', Ids[1], Truncated[1]);
+    AssertEquals('truncated content 1', Ids[2], Truncated[2]);
+    AssertEquals('truncated [SEP]', Tok.TokenToId('[SEP]'),
+      Truncated[3]);
+  finally
+    Tok.Free;
+  end;
 end;
 
 initialization

@@ -478,5 +478,271 @@
     "decoded": "hello"
    }
   ]
+ },
+ "wordpiece": {
+  "tokenizer": "tiny_wordpiece_tokenizer.json",
+  "cases": [
+   {
+    "text": "Hello world",
+    "ids": [
+     25,
+     45,
+     67,
+     67,
+     49,
+     40,
+     173,
+     67,
+     68
+    ],
+    "decoded": "hello world"
+   },
+   {
+    "text": "Hello, world!",
+    "ids": [
+     25,
+     45,
+     67,
+     67,
+     49,
+     7,
+     40,
+     173,
+     67,
+     68,
+     5
+    ],
+    "decoded": "hello, world!"
+   },
+   {
+    "text": "the cat sat on the mat",
+    "ids": [
+     76,
+     136,
+     101,
+     99,
+     76,
+     149
+    ],
+    "decoded": "the cat sat on the mat"
+   },
+   {
+    "text": "  leading and  multiple   spaces",
+    "ids": [
+     29,
+     45,
+     51,
+     68,
+     184,
+     87,
+     30,
+     58,
+     67,
+     175,
+     56,
+     193,
+     36,
+     56,
+     51,
+     53,
+     169
+    ],
+    "decoded": "leading and multiple spaces"
+   },
+   {
+    "text": "trailing space ",
+    "ids": [
+     37,
+     47,
+     51,
+     62,
+     67,
+     184,
+     36,
+     56,
+     51,
+     53,
+     45
+    ],
+    "decoded": "trailing space"
+   },
+   {
+    "text": "tabs\tand\nnewlines",
+    "ids": [
+     37,
+     51,
+     60,
+     61,
+     87,
+     151,
+     50,
+     67,
+     62,
+     44,
+     169
+    ],
+    "decoded": "tabs and newlines"
+   },
+   {
+    "text": "Don't stop, don't ever stop!",
+    "ids": [
+     200,
+     6,
+     37,
+     36,
+     52,
+     49,
+     56,
+     7,
+     200,
+     6,
+     37,
+     22,
+     117,
+     36,
+     52,
+     49,
+     56,
+     5
+    ],
+    "decoded": "don ' t stop, don ' t ever stop!"
+   },
+   {
+    "text": "numbers 12345 and 3.14",
+    "ids": [
+     251,
+     121,
+     73,
+     48,
+     72,
+     87,
+     12,
+     8,
+     10,
+     48
+    ],
+    "decoded": "numbers 12345 and 3. 14"
+   },
+   {
+    "text": "café naïve résumé",
+    "ids": [
+     225,
+     235,
+     35,
+     169,
+     58,
+     59,
+     45
+    ],
+    "decoded": "cafe naive resume"
+   },
+   {
+    "text": "emoji 😀 test",
+    "ids": [
+     1,
+     1,
+     37,
+     169,
+     52
+    ],
+    "decoded": "test"
+   },
+   {
+    "text": "mixed: café 42 🚀!",
+    "ids": [
+     30,
+     62,
+     66,
+     45,
+     68,
+     1,
+     225,
+     13,
+     69,
+     1,
+     5
+    ],
+    "decoded": "mixed cafe 42!"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   },
+   {
+    "text": "[CLS] hello world [SEP]",
+    "ids": [
+     2,
+     25,
+     45,
+     67,
+     67,
+     49,
+     40,
+     173,
+     67,
+     68,
+     3
+    ],
+    "decoded": "hello world"
+   },
+   {
+    "text": "supercalifragilisticexpialidocious",
+    "ids": [
+     158,
+     110,
+     47,
+     53,
+     51,
+     67,
+     62,
+     65,
+     47,
+     51,
+     57,
+     62,
+     67,
+     62,
+     61,
+     175,
+     53,
+     45,
+     66,
+     56,
+     62,
+     51,
+     67,
+     62,
+     68,
+     49,
+     53,
+     62,
+     94,
+     61
+    ],
+    "decoded": "supercalifragilisticexpialidocious"
+   },
+   {
+    "text": "UPPER Case AND aCCenTs: CAFÉ",
+    "ids": [
+     38,
+     56,
+     110,
+     47,
+     133,
+     183,
+     87,
+     18,
+     53,
+     53,
+     104,
+     52,
+     61,
+     1,
+     225
+    ],
+    "decoded": "upper case and accents cafe"
+   }
+  ]
  }
 }

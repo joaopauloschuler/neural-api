@@ -395,7 +395,7 @@ rather than acted on.
       TNNetSafeTensorsReader so the GPT-2/Llama builders take either
       format. Test: torch.save a pico state_dict in Python, assert every
       tensor matches its safetensors twin bit-for-bit.
-- [ ] Sentence-embedding pipeline + semantic-search example on the landed
+- [X] Sentence-embedding pipeline + semantic-search example on the landed
       BERT/MiniLM import: the importer is parity-verified against
       sentence-transformers/all-MiniLM-L6-v2 but nothing turns its
       (SeqLen,1,hidden) output into a sentence VECTOR — add the
