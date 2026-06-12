@@ -90,6 +90,7 @@ rather than acted on.
 
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] ONNX import
+- [ ] Gemma 4 import
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
