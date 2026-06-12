@@ -419,7 +419,10 @@ rather than acted on.
       end to end. Pairs with the (landed) sharded-safetensors support (the
       index file says which shards to fetch) and the tokenizer.json / chat-template
       tasks (same repo, same fetch). Keep it a separate opt-in unit so the
-      core importers stay offline-only.
+      core importers stay offline-only. NOTE 2026-06-12: this dev
+      environment HAS live network access to huggingface.co (TinyStories-1M
+      and bert-tiny/MiniLM-L6-v2 were downloaded during importer
+      verification), so the helper can be developed and tested end to end.
 - [ ] PyTorch pytorch_model.bin loader: a RESTRICTED unpickler for the
       torch.save zip format — the long tail of older/fine-tuned checkpoints
       never got converted to safetensors. State_dicts use a small pickle
