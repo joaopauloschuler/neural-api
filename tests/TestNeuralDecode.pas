@@ -84,11 +84,28 @@ type
     procedure TestGenerateTokensStreamedPenaltyAvoidsRepetition;
     procedure TestDecodeGreedyStopStringTrimsAndFinishes;
     procedure TestGenerateStringStreamedStopStringTrims;
+    // Constrained (structured) decoding: TNNetTokenConstraint and friends.
+    procedure TestAllowedTokensConstraintMasksAndRenormalizes;
+    procedure TestConstraintMaskFallbackLeavesRowUntouched;
+    procedure TestGenerateTokensStreamedNilConstraintMatchesPlain;
+    procedure TestGenerateTokensStreamedWhitelistOnlyEmitsAllowed;
+    procedure TestForcedSequenceConstraintFollowsCandidate;
+    // JSON automaton unit tests (no model).
+    procedure TestJSONStateMachineObjectTransitions;
+    procedure TestJSONStateMachineStringAndEscapes;
+    procedure TestJSONStateMachineNumbers;
+    procedure TestJSONStateMachineTopLevelCompletionAllowsOnlyWS;
+    procedure TestJSONStateMachineBalancedStackClosing;
+    procedure TestJSONConstraintValidatesMultiCharTokens;
+    procedure TestJSONStateMachineFuzzRandomWalksStayValid;
+    // Model-integration: constrained generation emits parseable JSON.
+    procedure TestGenerateTokensStreamedJSONConstraintEmitsParseableJSON;
+    procedure TestDecodeGreedyJSONConstraintEmitsParseableJSON;
   end;
 
 implementation
 
-uses Math;
+uses Math, fpjson, jsonparser;
 
 function TTestNeuralDecode.BuildTinyNet(ContextLen, Vocab: integer): TNNet;
 begin
@@ -1258,6 +1275,11 @@ begin
     Head.Neurons[N].BiasWeight := 0;
   end;
   Head.Neurons[Token].BiasWeight := 5;
+  // MulWeights(1.0) is a no-op on the values but runs AfterWeightUpdate, so
+  // layers with packed/prepared weight copies see the hand-edited neurons
+  // even when the rigged net is computed directly (without a CopyWeights
+  // refresh on a twin).
+  Head.MulWeights(1.0);
 end;
 
 // Streamed greedy generation from a width-1 RoPE-transformer twin must equal
@@ -1813,6 +1835,649 @@ begin
     Session.Free;
     Twin.Free;
     Full.Free;
+  end;
+end;
+
+// MaskAllowed must zero every disallowed token and renormalize the allowed
+// ones to sum 1, preserving their relative proportions.
+procedure TTestNeuralDecode.TestAllowedTokensConstraintMasksAndRenormalizes;
+var
+  V: TNNetVolume;
+  C: TNNetAllowedTokensConstraint;
+  I: integer;
+  Total: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(8, 1, 1);
+  C := TNNetAllowedTokensConstraint.Create([1, 2]);
+  try
+    for I := 0 to 7 do V.Raw[I] := 0.125;
+    V.Raw[1] := 0.1; V.Raw[2] := 0.2; // allowed mass 0.3 before masking
+    C.MaskAllowed(V);
+    for I := 0 to 7 do
+      if (I <> 1) and (I <> 2) then
+        AssertEquals('disallowed token ' + IntToStr(I) + ' zeroed',
+          0.0, V.Raw[I], 1e-9);
+    AssertEquals('allowed token 1 renormalized', 0.1 / 0.3, V.Raw[1], 1e-6);
+    AssertEquals('allowed token 2 renormalized', 0.2 / 0.3, V.Raw[2], 1e-6);
+    Total := 0;
+    for I := 0 to 7 do Total := Total + V.Raw[I];
+    AssertEquals('row sums to 1 after masking', 1.0, Total, 1e-6);
+    AssertTrue('whitelist membership', C.TokenAllowed(2));
+    AssertTrue('out-of-whitelist id', not C.TokenAllowed(5));
+    AssertTrue('out-of-range id', not C.TokenAllowed(123));
+  finally
+    C.Free;
+    V.Free;
+  end;
+end;
+
+// The documented fallback: when the allowed probability mass is zero (no
+// token allowed, or every allowed token at probability 0), the row is left
+// UNTOUCHED rather than zeroed (whose argmax would degenerate to token 0).
+procedure TTestNeuralDecode.TestConstraintMaskFallbackLeavesRowUntouched;
+var
+  V: TNNetVolume;
+  CEmpty, CZeroMass: TNNetAllowedTokensConstraint;
+  I: integer;
+begin
+  V := TNNetVolume.Create(6, 1, 1);
+  CEmpty := TNNetAllowedTokensConstraint.Create([]);
+  CZeroMass := TNNetAllowedTokensConstraint.Create([5]);
+  try
+    for I := 0 to 4 do V.Raw[I] := 0.2;
+    V.Raw[5] := 0; // the only whitelisted token has zero probability
+    CEmpty.MaskAllowed(V);
+    for I := 0 to 4 do
+      AssertEquals('empty whitelist leaves element ' + IntToStr(I),
+        0.2, V.Raw[I], 1e-6);
+    CZeroMass.MaskAllowed(V);
+    for I := 0 to 4 do
+      AssertEquals('zero allowed mass leaves element ' + IntToStr(I),
+        0.2, V.Raw[I], 1e-6);
+    AssertEquals('zero allowed mass leaves the allowed element too',
+      0.0, V.Raw[5], 1e-9);
+  finally
+    CZeroMass.Free;
+    CEmpty.Free;
+    V.Free;
+  end;
+end;
+
+// The constrained overload with Constraint=nil must produce exactly the same
+// stream (length and tokens) as the plain overload - fixed seed, same net.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedNilConstraintMatchesPlain;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  PlainToks, ConToks: TNeuralIntegerArray;
+  PlainLen, ConLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(PlainToks, PromptLen);
+    SetLength(ConToks, PromptLen);
+    PlainToks[0] := 5; PlainToks[1] := 2; PlainToks[2] := 9;
+    for T := 0 to PromptLen - 1 do ConToks[T] := PlainToks[T];
+
+    PlainLen := GenerateTokensStreamed(Session, PlainToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    ConLen := GenerateTokensStreamed(Session, ConToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, nil, nil, nil);
+
+    AssertEquals('same length with nil constraint', PlainLen, ConLen);
+    for T := PromptLen to PlainLen - 1 do
+      AssertEquals('token at pos ' + IntToStr(T), PlainToks[T], ConToks[T]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// A static whitelist on the streamed path: every generated token must come
+// from the whitelist; EOS is NOT whitelisted, so generation runs to the cap.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedWhitelistOnlyEmitsAllowed;
+const
+  SeqLen = 12;
+  PromptLen = 2;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Whitelist: TNNetAllowedTokensConstraint;
+  Toks: TNeuralIntegerArray;
+  OutLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  // The constraint path expects POST-SOFTMAX probabilities (the masking
+  // renormalizes a probability row): cap both twins with a per-position
+  // softmax, exactly like the penalty test.
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Whitelist := TNNetAllowedTokensConstraint.Create([5, 8]);
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 9;
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, nil, nil, Whitelist);
+    AssertEquals('EOS blocked: generation runs to the cap', SeqLen, OutLen);
+    for T := PromptLen to OutLen - 1 do
+      AssertTrue('token at pos ' + IntToStr(T) + ' is whitelisted (got ' +
+        IntToStr(Toks[T]) + ')', (Toks[T] = 5) or (Toks[T] = 8));
+  finally
+    Whitelist.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Forced-sequence (trie) constraint: the head is rigged so unconstrained
+// greedy always emits 'dog' - which starts NO candidate. The constraint must
+// force generation down a candidate it would never pick ('cat apple'),
+// complete exactly that one candidate, and then allow EOS.
+procedure TTestNeuralDecode.TestForcedSequenceConstraintFollowsCandidate;
+const
+  SeqLen = 10;
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'apple', 'blue', 'cat',
+    'dog', 'egg', 'fox', 'gold', 'hat', 'ice', 'jam');
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Dict: TStringListInt;
+  Forced: TNNetForcedSequenceConstraint;
+  Toks, FreeToks, CatToks, AppleToks, DogToks: TNeuralIntegerArray;
+  PromptLen, OutLen, FreeLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  Forced := nil;
+  Dict := TStringListInt.Create();
+  try
+    // With LazUtils linked, locale-aware collation would sort '<eos>'/'<pad>'
+    // AFTER the alphabetic words, breaking the "special ids < 2" convention
+    // this test (and the constraint's EOS handling) relies on.
+    Dict.UseLocale := false;
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+    Dict.Tokenize('dog', DogToks);
+    Dict.Tokenize('cat', CatToks);
+    Dict.Tokenize('apple', AppleToks);
+    AssertEquals('special tokens keep ids < 2 (UseLocale=false)',
+      2, AppleToks[0]);
+    // Rig the logit head to constant 'dog', then cap with softmax (the
+    // constraint renormalizes a probability row).
+    RigHeadToConstantToken(Full, DogToks[0]);
+    Full.AddLayer(TNNetPointwiseSoftMax.Create());
+    Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    Forced := TNNetForcedSequenceConstraint.Create(Dict,
+      ['cat apple', 'egg jam']);
+
+    // Unconstrained reference: greedy emits 'dog' (not any candidate start).
+    Dict.Tokenize('blue hat', FreeToks);
+    PromptLen := Length(FreeToks);
+    FreeLen := GenerateTokensStreamed(Session, FreeToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    AssertTrue('reference generated something', FreeLen > PromptLen);
+    AssertEquals('unconstrained greedy picks the rigged token',
+      DogToks[0], FreeToks[PromptLen]);
+
+    // Constrained run: forced down 'cat apple' ('cat' < 'egg' in id order,
+    // probabilities tie at the rigged head), then EOS.
+    Dict.Tokenize('blue hat', Toks);
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, nil, nil, Forced);
+    AssertEquals('candidate + EOS generated', PromptLen + 3, OutLen);
+    AssertEquals('first forced token is cat', CatToks[0], Toks[PromptLen]);
+    AssertEquals('second forced token is apple',
+      AppleToks[0], Toks[PromptLen + 1]);
+    AssertTrue('then a special/EOS token', Toks[PromptLen + 2] < 2);
+    AssertTrue('constraint reports completion', Forced.Completed());
+  finally
+    Forced.Free;
+    Dict.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Driving the automaton directly: object context transitions. After '{' only
+// a key string, '}' or whitespace may follow - never ']' or a bare value.
+procedure TTestNeuralDecode.TestJSONStateMachineObjectTransitions;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('open object', M.FeedChar('{'));
+    AssertTrue('after { a key quote is allowed', M.CharAllowed('"'));
+    AssertTrue('after { an immediate } is allowed', M.CharAllowed('}'));
+    AssertTrue('after { whitespace is allowed', M.CharAllowed(' '));
+    AssertTrue('after { ] is NOT allowed', not M.CharAllowed(']'));
+    AssertTrue('after { a digit is NOT allowed', not M.CharAllowed('5'));
+    AssertTrue('after { a comma is NOT allowed', not M.CharAllowed(','));
+    AssertTrue('key string', M.FeedString('"a"'));
+    AssertTrue('after key only a colon', M.CharAllowed(':'));
+    AssertTrue('no } right after a key', not M.CharAllowed('}'));
+    AssertTrue('no , right after a key', not M.CharAllowed(','));
+    AssertTrue('colon', M.FeedChar(':'));
+    AssertTrue('value position accepts a digit', M.CharAllowed('5'));
+    AssertTrue('value position accepts a string', M.CharAllowed('"'));
+    AssertTrue('no } right after the colon', not M.CharAllowed('}'));
+    AssertTrue('number value', M.FeedChar('1'));
+    AssertTrue('} closes (and first completes the number)',
+      M.FeedChar('}'));
+    AssertTrue('complete top-level object', M.IsComplete());
+    AssertEquals('stack fully popped', 0, M.StackDepth());
+    // No trailing comma: '{"a":1,' must require another key.
+    M.Reset();
+    AssertTrue('reopen', M.FeedString('{"a":1,'));
+    AssertTrue('after , a key is required', M.CharAllowed('"'));
+    AssertTrue('no } after a trailing comma', not M.CharAllowed('}'));
+  finally
+    M.Free;
+  end;
+end;
+
+// String state: most characters are content; an unescaped quote closes;
+// raw control characters are rejected; escapes are validated.
+procedure TTestNeuralDecode.TestJSONStateMachineStringAndEscapes;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('open string', M.FeedChar('"'));
+    AssertTrue('plain char allowed', M.CharAllowed('x'));
+    AssertTrue('structural chars are plain content in a string',
+      M.CharAllowed('{'));
+    AssertTrue('closing quote allowed', M.CharAllowed('"'));
+    AssertTrue('raw newline rejected in a string', not M.CharAllowed(#10));
+    AssertTrue('raw control char rejected', not M.CharAllowed(#1));
+    AssertTrue('backslash starts an escape', M.FeedChar('\'));
+    AssertTrue('\n escape allowed', M.CharAllowed('n'));
+    AssertTrue('escaped quote allowed', M.CharAllowed('"'));
+    AssertTrue('unicode escape allowed', M.CharAllowed('u'));
+    AssertTrue('invalid escape char rejected', not M.CharAllowed('x'));
+    AssertTrue('take the unicode escape', M.FeedChar('u'));
+    AssertTrue('hex digit required', not M.CharAllowed('g'));
+    AssertTrue('4 hex digits', M.FeedString('0Ab9'));
+    AssertTrue('back in the string: content again', M.CharAllowed('x'));
+    AssertTrue('unescaped quote closes', M.FeedChar('"'));
+    AssertTrue('top-level string value complete', M.IsComplete());
+  finally
+    M.Free;
+  end;
+end;
+
+// Number grammar: [-] int frac? exp? with no leading zeros, mandatory digits
+// after '-', '.' and 'e'; an unterminated complete number at top level
+// counts as a complete value.
+procedure TTestNeuralDecode.TestJSONStateMachineNumbers;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('minus', M.FeedChar('-'));
+    AssertTrue('- alone is not complete', not M.IsComplete());
+    AssertTrue('-- rejected', not M.CharAllowed('-'));
+    AssertTrue('-] rejected', not M.CharAllowed(']'));
+    AssertTrue('digit after minus', M.FeedChar('0'));
+    AssertTrue('-0 is complete', M.IsComplete());
+    AssertTrue('no digits after a leading zero', not M.CharAllowed('1'));
+    AssertTrue('fraction allowed after 0', M.FeedChar('.'));
+    AssertTrue('. needs a digit, not e', not M.CharAllowed('e'));
+    AssertTrue('-0. is not complete', not M.IsComplete());
+    AssertTrue('fraction digit', M.FeedChar('5'));
+    AssertTrue('-0.5 is complete', M.IsComplete());
+    AssertTrue('exponent marker', M.FeedChar('e'));
+    AssertTrue('-0.5e is not complete', not M.IsComplete());
+    AssertTrue('exponent sign allowed', M.FeedChar('+'));
+    AssertTrue('second sign rejected', not M.CharAllowed('+'));
+    AssertTrue('exponent digit', M.FeedChar('2'));
+    AssertTrue('-0.5e+2 is complete', M.IsComplete());
+    // Plain int and the leading-zero rule from a fresh start.
+    M.Reset();
+    AssertTrue('42', M.FeedString('42'));
+    AssertTrue('42 is a complete top-level value', M.IsComplete());
+    AssertTrue('no second top-level value', not M.CharAllowed('"'));
+    M.Reset();
+    AssertTrue('0', M.FeedChar('0'));
+    AssertTrue('01 is rejected (leading zero)', not M.CharAllowed('1'));
+  finally
+    M.Free;
+  end;
+end;
+
+// After a complete top-level value, only whitespace may follow (EOS/nothing
+// at the token level): no new value, no closer, no digits.
+procedure TTestNeuralDecode.TestJSONStateMachineTopLevelCompletionAllowsOnlyWS;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('top-level string', M.FeedString('"hi"'));
+    AssertTrue('complete', M.IsComplete());
+    AssertTrue('trailing whitespace ok', M.CharAllowed(' '));
+    AssertTrue('no second value {', not M.CharAllowed('{'));
+    AssertTrue('no second value "', not M.CharAllowed('"'));
+    AssertTrue('no digit', not M.CharAllowed('1'));
+    AssertTrue('no stray ]', not M.CharAllowed(']'));
+    AssertTrue('no stray }', not M.CharAllowed('}'));
+    AssertTrue('feeding whitespace keeps it complete',
+      M.FeedChar(' ') and M.IsComplete());
+  finally
+    M.Free;
+  end;
+end;
+
+// Balanced-stack closing: each close must match the innermost opener.
+procedure TTestNeuralDecode.TestJSONStateMachineBalancedStackClosing;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('[[{', M.FeedString('[[{'));
+    AssertEquals('three open containers', 3, M.StackDepth());
+    AssertTrue('innermost is an object: ] rejected', not M.CharAllowed(']'));
+    AssertTrue('close the object', M.FeedChar('}'));
+    AssertEquals('two left', 2, M.StackDepth());
+    AssertTrue('now } is rejected (innermost is an array)',
+      not M.CharAllowed('}'));
+    AssertTrue('comma then another value is fine', M.CharAllowed(','));
+    AssertTrue('close inner array', M.FeedChar(']'));
+    AssertTrue('not complete yet', not M.IsComplete());
+    AssertTrue('close outer array', M.FeedChar(']'));
+    AssertTrue('balanced: complete', M.IsComplete());
+    AssertEquals('stack empty', 0, M.StackDepth());
+    AssertTrue('no further ]', not M.CharAllowed(']'));
+  finally
+    M.Free;
+  end;
+end;
+
+// Token-level constraint over MULTI-CHARACTER (BPE-style) tokens: a token is
+// allowed exactly when ALL its characters are legal continuations, validated
+// transitively through a cloned automaton; EOS (< 2) only at completion.
+procedure TTestNeuralDecode.TestJSONConstraintValidatesMultiCharTokens;
+var
+  Dict: TStringListInt;
+  C: TNNetJSONConstraint;
+begin
+  Dict := TStringListInt.Create();
+  C := nil;
+  try
+    // Insertion order = token id (no sorting; SaveCurrentPosition snapshots
+    // the id->string map the constraint reads via DeTokenize).
+    Dict.Add('<eos>');   // 0
+    Dict.Add('<pad>');   // 1
+    Dict.Add('{"k":');   // 2
+    Dict.Add('true');    // 3
+    Dict.Add('}');       // 4
+    Dict.Add(']');       // 5
+    Dict.Add('[1,');     // 6
+    Dict.SaveCurrentPosition();
+    C := TNNetJSONConstraint.Create(Dict);
+    C.Reset([]);
+    AssertTrue('multi-char object opener allowed at start', C.TokenAllowed(2));
+    AssertTrue('literal value allowed at start', C.TokenAllowed(3));
+    AssertTrue('array opener with content allowed at start',
+      C.TokenAllowed(6));
+    AssertTrue('lone } not allowed at start', not C.TokenAllowed(4));
+    AssertTrue('lone ] not allowed at start', not C.TokenAllowed(5));
+    AssertTrue('EOS not allowed before any value', not C.TokenAllowed(0));
+    C.Commit(2); // '{"k":' - expecting a value now
+    AssertTrue('value token allowed after the colon', C.TokenAllowed(3));
+    AssertTrue('} not allowed right after the colon', not C.TokenAllowed(4));
+    AssertTrue('] never matches an object', not C.TokenAllowed(5));
+    AssertTrue('EOS not allowed mid-object', not C.TokenAllowed(0));
+    C.Commit(3); // 'true' - value done, object still open
+    AssertTrue('} closes the object now', C.TokenAllowed(4));
+    AssertTrue('] still illegal', not C.TokenAllowed(5));
+    C.Commit(4); // '}' - complete top-level value
+    AssertTrue('EOS allowed once complete', C.TokenAllowed(0));
+    AssertTrue('PAD allowed once complete', C.TokenAllowed(1));
+    AssertTrue('no second value', not C.TokenAllowed(2));
+    AssertTrue('machine agrees', C.Machine.IsComplete());
+  finally
+    C.Free;
+    Dict.Free;
+  end;
+end;
+
+// Fuzz-ish: random walks over the ALLOWED transitions must always yield
+// strings fpjson parses once the automaton reports completion (and must
+// never reject a character it just reported as allowed).
+procedure TTestNeuralDecode.TestJSONStateMachineFuzzRandomWalksStayValid;
+const
+  Alphabet = '{}[]",:0123456789.eE+-truefalsn x';
+  Closers = '"}]1:';
+var
+  M: TNNetJSONStateMachine;
+  Parsed: TJSONData;
+  S: string;
+  AllowedList: array[1..64] of char;
+  Walk, Step, I, AllowedCnt, CompletedCnt: integer;
+  C: char;
+begin
+  RandSeed := 31337;
+  M := TNNetJSONStateMachine.Create();
+  CompletedCnt := 0;
+  try
+    for Walk := 1 to 25 do
+    begin
+      M.Reset();
+      S := '';
+      for Step := 1 to 300 do
+      begin
+        if M.IsComplete() then break;
+        C := #0;
+        // Closing phase (always after step 60, half the time before): take
+        // the first allowed char from a closing-priority list so walks
+        // terminate instead of nesting forever.
+        if (Step > 60) or (Random(2) = 0) then
+          for I := 1 to Length(Closers) do
+            if M.CharAllowed(Closers[I]) then
+            begin
+              C := Closers[I];
+              break;
+            end;
+        if C = #0 then
+        begin
+          // Random pick among the allowed alphabet characters. In a literal
+          // state exactly one character is allowed, so walks always advance.
+          AllowedCnt := 0;
+          for I := 1 to Length(Alphabet) do
+            if M.CharAllowed(Alphabet[I]) then
+            begin
+              Inc(AllowedCnt);
+              AllowedList[AllowedCnt] := Alphabet[I];
+            end;
+          AssertTrue('walk ' + IntToStr(Walk) + ' step ' + IntToStr(Step) +
+            ': some character must be allowed (got stuck after "' + S + '")',
+            AllowedCnt > 0);
+          C := AllowedList[1 + Random(AllowedCnt)];
+        end;
+        AssertTrue('walk ' + IntToStr(Walk) + ': allowed char ''' + C +
+          ''' must be accepted after "' + S + '"', M.FeedChar(C));
+        S := S + C;
+      end;
+      if M.IsComplete() and (S <> '') then
+      begin
+        Inc(CompletedCnt);
+        try
+          Parsed := GetJSON(S);
+          Parsed.Free;
+        except
+          on E: Exception do
+            Fail('walk ' + IntToStr(Walk) + ' produced invalid JSON "' + S +
+              '": ' + E.Message);
+        end;
+      end;
+    end;
+    AssertTrue('most walks reach a complete value (got ' +
+      IntToStr(CompletedCnt) + '/25)', CompletedCnt >= 15);
+  finally
+    M.Free;
+  end;
+end;
+
+// Model-integration: a tiny char-level streamed LM whose head LOVES EOS
+// (then '}', '{', '"'). Unconstrained greedy emits EOS immediately (no JSON
+// at all); JSON-constrained greedy is forced to open and close an object
+// before EOS becomes legal - and the result parses.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedJSONConstraintEmitsParseableJSON;
+const
+  CharVocab = 128;
+var
+  Net: TNNet;
+  Head: TNNetLayer;
+  Session: TNNetStreamingDecoder;
+  Constraint: TNNetJSONConstraint;
+  Toks: TNeuralIntegerArray;
+  Parsed: TJSONData;
+  OutLen, FreeLen, T, N: integer;
+  Emitted: string;
+begin
+  RandSeed := 424242;
+  // Width-1 char-level LM (token id = character code), built directly at the
+  // decode width - no full-width twin needed because nothing is compared
+  // against a full forward here.
+  Net := TNNet.Create();
+  Net.AddLayer(TNNetInput.Create(1, 1, 1));
+  Net.AddLayer(TNNetEmbedding.Create(CharVocab, 8, 0, 0.02));
+  Net.AddLayer(TNNetPointwiseConvLinear.Create(8));
+  Net.AddLayer(TNNetDiagonalSSM.Create());
+  Net.AddLayer(TNNetPointwiseConvLinear.Create(CharVocab));
+  Head := Net.GetLastLayer();
+  Net.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Constraint := TNNetJSONConstraint.CreateCharLevel(CharVocab);
+  try
+    // Rig the logit head: EOS(1) > '}' > '{' > '"' > everything else.
+    for N := 0 to Head.Neurons.Count - 1 do
+    begin
+      Head.Neurons[N].Weights.Fill(0);
+      Head.Neurons[N].BiasWeight := 0;
+    end;
+    Head.Neurons[1].BiasWeight := 10;
+    Head.Neurons[Ord('}')].BiasWeight := 9;
+    Head.Neurons[Ord('{')].BiasWeight := 8;
+    Head.Neurons[Ord('"')].BiasWeight := 7;
+    // No-op refresh so the conv layer's packed weights see the hand edits
+    // (this net is computed directly, with no CopyWeights to refresh it).
+    Head.MulWeights(1.0);
+    Session := TNNetStreamingDecoder.Create(Net, 32);
+
+    // Unconstrained reference: EOS on the very first step.
+    SetLength(Toks, 1);
+    Toks[0] := Ord('a');
+    FreeLen := GenerateTokensStreamed(Session, Toks, 1, 10, 32);
+    AssertEquals('unconstrained greedy stops at EOS immediately', 2, FreeLen);
+    AssertEquals('the free token IS the EOS', 1, Toks[1]);
+
+    // JSON-constrained: EOS is masked until a complete value stands, so the
+    // model is walked through '{' (best allowed) then '}' (best allowed in
+    // the object) and only THEN may stop.
+    SetLength(Toks, 0);
+    SetLength(Toks, 1);
+    Toks[0] := Ord('a');
+    OutLen := GenerateTokensStreamed(Session, Toks, 1, 10, 32,
+      nil, nil, nil, Constraint);
+    Emitted := '';
+    for T := 1 to OutLen - 1 do
+    begin
+      if Toks[T] < 2 then break;
+      Emitted := Emitted + Chr(Toks[T]);
+    end;
+    AssertEquals('constrained generation emits an empty object',
+      '{}', Emitted);
+    AssertEquals('then stops at EOS', 1, Toks[OutLen - 1]);
+    try
+      Parsed := GetJSON(Emitted);
+      Parsed.Free;
+    except
+      on E: Exception do
+        Fail('constrained output "' + Emitted + '" is not parseable JSON: ' +
+          E.Message);
+    end;
+  finally
+    Constraint.Free;
+    Session.Free;
+    Net.Free;
+  end;
+end;
+
+// Same JSON-mode gate on the full-re-encode DecodeGreedy path (char-level
+// one-hot net): unconstrained = immediate EOS, constrained = '{}'.
+procedure TTestNeuralDecode.TestDecodeGreedyJSONConstraintEmitsParseableJSON;
+const
+  CharVocab = 128;
+var
+  NN: TNNet;
+  Logit: TNNetLayer;
+  Constraint: TNNetJSONConstraint;
+  Plain, Constrained: TNNetDecodeResult;
+  Parsed: TJSONData;
+  N: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildTinyNet(8, CharVocab);
+  Constraint := TNNetJSONConstraint.CreateCharLevel(CharVocab);
+  try
+    // Rig the LOGIT layer (the SoftMax head has no neurons): EOS first.
+    Logit := NN.Layers[NN.Layers.Count - 2];
+    for N := 0 to Logit.Neurons.Count - 1 do
+    begin
+      Logit.Neurons[N].Weights.Fill(0);
+      Logit.Neurons[N].BiasWeight := 0;
+    end;
+    Logit.Neurons[1].BiasWeight := 10;
+    Logit.Neurons[Ord('}')].BiasWeight := 9;
+    Logit.Neurons[Ord('{')].BiasWeight := 8;
+    Logit.Neurons[Ord('"')].BiasWeight := 7;
+
+    Plain := DecodeGreedy(NN, 'q', 6);
+    AssertEquals('unconstrained: immediate EOS, empty text', '', Plain.Text);
+    AssertEquals('unconstrained finishes on EOS', True, Plain.Finished);
+
+    Constrained := DecodeGreedy(NN, 'q', 6, [], Constraint);
+    AssertEquals('constrained text is an empty object', '{}',
+      Constrained.Text);
+    AssertEquals('constrained run finishes on the now-legal EOS',
+      True, Constrained.Finished);
+    try
+      Parsed := GetJSON(Constrained.Text);
+      Parsed.Free;
+    except
+      on E: Exception do
+        Fail('constrained DecodeGreedy output "' + Constrained.Text +
+          '" is not parseable JSON: ' + E.Message);
+    end;
+  finally
+    Constraint.Free;
+    NN.Free;
   end;
 end;
 

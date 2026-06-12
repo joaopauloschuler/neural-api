@@ -57,6 +57,41 @@ MODERN SAMPLING CONTROLS. The high-level generation routines also expose:
 All of these default to "off", leaving the original behavior bit-for-bit
 unchanged.
 
+CONSTRAINED (STRUCTURED) DECODING. The generation routines also accept an
+optional TNNetTokenConstraint, a caller-supplied "allowed next tokens" hook
+applied AFTER the penalties and BEFORE the sampler:
+  - The loop calls Reset(PromptTokens) once, then per step MaskAllowed(Probs)
+    on the post-softmax probability row (zero every disallowed token, then
+    renormalize the survivors to sum 1), and Commit(Token) after each emitted
+    token so stateful constraints advance.
+  - FALLBACK: when the allowed probability mass of a row is zero (every token
+    disallowed, or every allowed token has zero probability), MaskAllowed
+    leaves the row UNTOUCHED - generation degrades to unconstrained for that
+    step rather than producing an all-zero / NaN row.
+  - Constraint = nil is bit-for-bit the unconstrained behavior.
+Ready-made constraints:
+  - TNNetAllowedTokensConstraint: a static token-id whitelist.
+  - TNNetForcedSequenceConstraint: forces generation down one of N candidate
+    token sequences (a trie over candidate continuations) - multiple-choice
+    answering; once a candidate is fully emitted only special/EOS tokens
+    (< 2) are allowed.
+  - TNNetJSONConstraint: JSON-mode generation. A character-level JSON
+    pushdown automaton (TNNetJSONStateMachine, public for direct use) tracks
+    the brace/bracket stack and the object/array/string/number/literal
+    context; a token is allowed exactly when feeding its characters through a
+    clone of the automaton accepts all of them, so multi-character (BPE)
+    tokens are validated transitively and NO INVALID JSON can ever be
+    emitted. Special/EOS tokens (< 2) are allowed only once a complete
+    top-level value has been emitted. Documented deviations from full JSON:
+    the grammar is STRICTER in places (no leading '+' or leading zeros in
+    numbers - per spec; raw control characters < #32 are rejected inside
+    strings; \u must be followed by exactly 4 hex digits) and it does not
+    check UTF-8 multi-byte well-formedness (any byte >= #32 is accepted as
+    string content) nor surrogate pairing of \u escapes. Trailing whitespace
+    after the top-level value is accepted. Intended for char-level or BPE
+    (no-separator) vocabularies: token strings are validated as-is, with no
+    separator inserted between tokens.
+
 Coded by Claude (AI).
 *)
 
@@ -83,6 +118,177 @@ type
   // terminates (and the matched tokens are trimmed) as soon as the tail of
   // the GENERATED region equals one of the entries.
   TNNetTokenSequences = array of TNeuralIntegerArray;
+
+  { TNNetTokenConstraint }
+  // Abstract CONSTRAINED-DECODING hook: a caller-supplied "allowed next
+  // tokens" filter the generation loop applies to the POST-SOFTMAX
+  // probability row AFTER the penalties and BEFORE the sampler. Subclasses
+  // implement TokenAllowed (and optionally Reset/Commit for stateful
+  // grammars); the base MaskAllowed zeroes every disallowed token and
+  // renormalizes the survivors to sum 1.
+  // FALLBACK POLICY: when the allowed probability mass is zero (every token
+  // disallowed, or every allowed token already at probability zero), the row
+  // is left UNTOUCHED - the step degrades to unconstrained sampling instead
+  // of producing an all-zero row (whose argmax would degenerate to token 0).
+  // Coded by Claude (AI).
+  TNNetTokenConstraint = class(TObject)
+    public
+      // Called once at the start of generation with the prompt token ids so
+      // stateful constraints can start a fresh sequence. Default: no-op.
+      procedure Reset(const PromptTokens: array of integer); virtual;
+      // True when TokenId may be emitted next. Token ids < 2 are the
+      // codebase's special/EOS ids; each constraint decides when they are
+      // legal (e.g. the JSON constraint allows them only once a complete
+      // top-level value has been emitted).
+      function TokenAllowed(TokenId: integer): boolean; virtual; abstract;
+      // Zeroes the probability of every disallowed token in the row and
+      // renormalizes the allowed ones to sum 1 (see the fallback policy
+      // above). Element index = token id, as everywhere in the decoder.
+      procedure MaskAllowed(Probs: TNNetVolume); virtual;
+      // Advances the constraint state after a token was emitted. Default:
+      // no-op.
+      procedure Commit(TokenId: integer); virtual;
+  end;
+
+  { TNNetAllowedTokensConstraint }
+  // Static whitelist constraint: only the token ids passed to Create are ever
+  // allowed (include the EOS id yourself if generation should be able to
+  // stop before the length caps). Stateless - Reset/Commit are no-ops.
+  // Coded by Claude (AI).
+  TNNetAllowedTokensConstraint = class(TNNetTokenConstraint)
+    private
+      FAllowed: array of boolean;
+    public
+      constructor Create(const AllowedTokens: array of integer);
+      function TokenAllowed(TokenId: integer): boolean; override;
+  end;
+
+  { TNNetForcedSequenceConstraint }
+  // Forces generation to follow ONE of N candidate token sequences (a trie
+  // over the candidate continuations) - the standard multiple-choice
+  // answering constraint. At depth D a token is allowed iff some still-active
+  // candidate has it at position D; Commit deactivates the candidates that
+  // did not match the emitted token. Once an active candidate has been fully
+  // emitted (Completed = True) the special/EOS ids (< 2) become allowed -
+  // longer candidates sharing the emitted prefix may still be continued.
+  // Build from token sequences directly or from strings via a Dict
+  // (Dict.Tokenize per candidate). Reset rewinds to the trie root.
+  // Coded by Claude (AI).
+  TNNetForcedSequenceConstraint = class(TNNetTokenConstraint)
+    private
+      FCandidates: TNNetTokenSequences;
+      FActive: array of boolean;
+      FDepth: integer;
+    public
+      constructor Create(const Candidates: TNNetTokenSequences); overload;
+      constructor Create(Dict: TStringListInt;
+        const Candidates: array of string); overload;
+      procedure Reset(const PromptTokens: array of integer); override;
+      function TokenAllowed(TokenId: integer): boolean; override;
+      procedure Commit(TokenId: integer); override;
+      // True when some still-active candidate has been emitted in full.
+      function Completed(): boolean;
+  end;
+
+  // Main states of the character-level JSON automaton (public so tests and
+  // diagnostics can inspect where the machine is).
+  TNNetJSONMainState = (
+    jmsValue,             // expecting a value (top level, after ':' or after ',' in an array)
+    jmsValueOrArrayClose, // right after '[': a value or an immediate ']'
+    jmsObjectKeyOrClose,  // right after '{': a key string or an immediate '}'
+    jmsObjectKey,         // after ',' in an object: a key string only
+    jmsObjectColon,       // after a key string: ':' only
+    jmsString,            // inside a string (key or value)
+    jmsStringEscape,      // right after '\' inside a string
+    jmsStringUnicode,     // inside the 4 hex digits of a \u escape
+    jmsNumber,            // inside a number (see TNNetJSONNumberState)
+    jmsLiteral,           // inside true/false/null
+    jmsAfterValue,        // a value completed inside an object/array: ',' or the matching close
+    jmsDone);             // a complete top-level value was consumed: whitespace only
+
+  // Sub-states of the JSON number grammar [-] int frac? exp? . The number is
+  // a complete value in jnsZero/jnsInt/jnsFrac/jnsExpDigits; a delimiter
+  // (whitespace, ',', '}', ']') arriving in those states first completes the
+  // number, then is processed in the successor state.
+  TNNetJSONNumberState = (jnsMinus, jnsZero, jnsInt, jnsDot, jnsFrac,
+    jnsExp, jnsExpSign, jnsExpDigits);
+
+  { TNNetJSONStateMachine }
+  // Character-level JSON grammar automaton: a pushdown automaton over the
+  // brace/bracket stack with states for the object/array/string/number/
+  // literal contexts. FeedChar advances by one character and returns False
+  // when the character is not a legal continuation of valid JSON (the state
+  // is undefined after a rejected feed - probe with CharAllowed or a copy
+  // when unsure). It accepts any single JSON value at top level. Deviations
+  // from the full spec are listed in the unit header (stricter in places,
+  // never accepting invalid JSON).
+  // Coded by Claude (AI).
+  TNNetJSONStateMachine = class(TObject)
+    private
+      FState: TNNetJSONMainState;
+      FNumState: TNNetJSONNumberState;
+      FHexRemain: integer;     // hex digits left in a \u escape
+      FLitRemain: string;      // characters left in true/false/null
+      FKeyString: boolean;     // is the current string an object key?
+      FStack: array of char;   // '{' / '[' nesting stack
+      FStackLen: integer;
+      procedure Push(C: char);
+      procedure Pop();
+      function Top(): char;
+      // A value just completed: jmsDone at top level, jmsAfterValue inside
+      // an object/array.
+      procedure CompleteValue();
+      function FeedNumberChar(C: char): boolean;
+      // The number ended on a delimiter: complete it, then process the
+      // delimiter in the successor state.
+      function EndNumberAndRefeed(C: char): boolean;
+    public
+      constructor Create();
+      procedure Reset();
+      procedure CopyFrom(Source: TNNetJSONStateMachine);
+      // Advances by one character; False = not a legal JSON continuation
+      // (state undefined afterwards).
+      function FeedChar(C: char): boolean;
+      // Feeds every character of S; False at the first rejection.
+      function FeedString(const S: string): boolean;
+      // Non-destructive probe: would FeedChar(C) succeed from here?
+      function CharAllowed(C: char): boolean;
+      // True when a complete top-level JSON value has been consumed (jmsDone,
+      // or an unterminated but complete top-level number such as "42").
+      function IsComplete(): boolean;
+      function StackDepth(): integer;
+      property State: TNNetJSONMainState read FState;
+  end;
+
+  { TNNetJSONConstraint }
+  // Grammar-driven JSON-mode constraint: given the tokenizer's id->string
+  // mapping, allows exactly the tokens whose string is a legal continuation
+  // of valid JSON from the current state. Multi-character tokens are
+  // validated transitively: the automaton state is cloned and the token's
+  // characters are fed one by one - all must be accepted. Special/EOS ids
+  // (< 2) are allowed only when a complete top-level value has been emitted;
+  // empty-string tokens are never allowed (they would not advance
+  // generation). Intended for char-level or BPE (no-separator) vocabularies;
+  // word-level dicts whose detokenizer inserts separators would be validated
+  // without the separators. Create(Dict) snapshots Dict.DeTokenize(id) for
+  // every id; CreateCharLevel(VocabSize) is the char-level model convention
+  // (token id = character code, ids < 2 special).
+  // Coded by Claude (AI).
+  TNNetJSONConstraint = class(TNNetTokenConstraint)
+    private
+      FTokenStr: array of string;
+      FMachine: TNNetJSONStateMachine;
+      FProbe: TNNetJSONStateMachine;
+    public
+      constructor Create(Dict: TStringListInt); overload;
+      constructor CreateCharLevel(VocabSize: integer);
+      destructor Destroy(); override;
+      procedure Reset(const PromptTokens: array of integer); override;
+      function TokenAllowed(TokenId: integer): boolean; override;
+      procedure Commit(TokenId: integer); override;
+      // The live automaton (after the committed tokens) for inspection.
+      property Machine: TNNetJSONStateMachine read FMachine;
+  end;
 
   // TNNetStreamingDecoder: a reusable incremental-decode "streaming session"
   // over a causal next-token net, replacing the hand-rolled step-net plumbing
@@ -203,6 +409,18 @@ function DecodeGreedy(NN: TNNet; const Prompt: string;
 function DecodeGreedy(NN: TNNet; const Prompt: string; MaxLen: integer;
   const StopStrings: array of string): TNNetDecodeResult; overload;
 
+// DecodeGreedy with CONSTRAINED DECODING. Constraint (may be nil) restricts
+// the per-step argmax to the allowed tokens (DecodeGreedy is char-level:
+// token id = character code, so build constraints accordingly, e.g.
+// TNNetJSONConstraint.CreateCharLevel). Reset receives the prompt's char
+// codes; Commit is called after every emitted token (EOS included). When NO
+// token is allowed the step falls back to the plain unconstrained argmax
+// (same policy as MaskAllowed). Constraint = nil reproduces the overload
+// above bit-for-bit (which delegates here).
+function DecodeGreedy(NN: TNNet; const Prompt: string; MaxLen: integer;
+  const StopStrings: array of string;
+  Constraint: TNNetTokenConstraint): TNNetDecodeResult; overload;
+
 // Beam search. Keeps BeamWidth partial sequences ranked by length-penalised
 // cumulative log-prob. Returns the single best (highest Score) result.
 //   MaxLen        : maximum number of generated tokens (excludes the prompt).
@@ -285,6 +503,22 @@ function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
   Penalty: TNNetTokenHistoryPenalty;
   const StopSequences: TNNetTokenSequences): integer; overload;
 
+// GenerateTokensStreamed with CONSTRAINED DECODING. Same contract as the
+// overload above plus:
+//  - Constraint (may be nil): a TNNetTokenConstraint applied to the step's
+//    POST-SOFTMAX probability row via MaskAllowed AFTER the penalty and
+//    BEFORE the sampler/argmax reads it. The routine calls
+//    Constraint.Reset(prompt tokens) once, then Constraint.Commit(token)
+//    after every emitted token (EOS included) so stateful grammars advance.
+//    See TNNetTokenConstraint for the all-masked fallback policy.
+// Constraint = nil is bit-for-bit the overload above (which delegates here).
+function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase;
+  Penalty: TNNetTokenHistoryPenalty;
+  const StopSequences: TNNetTokenSequences;
+  Constraint: TNNetTokenConstraint): integer; overload;
+
 // STRING-LEVEL WRAPPER mirroring GenerateStringFromCasualNN's shape
 // (dict/tokenizer + prompt + optional sampler; TNeuralTokenizer is a
 // TStringListInt subclass with virtual Tokenize/DeTokenize, so both word-dict
@@ -316,6 +550,15 @@ function GenerateStringStreamed(Session: TNNetStreamingDecoder;
   oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
   const StopStrings: array of string): string; overload;
 
+// GenerateStringStreamed with CONSTRAINED DECODING: forwards Constraint (may
+// be nil) to the token core (see GenerateTokensStreamed). Constraint = nil is
+// bit-for-bit the overload above (which delegates here).
+function GenerateStringStreamed(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
+  const StopStrings: array of string;
+  Constraint: TNNetTokenConstraint): string; overload;
+
 implementation
 
 uses
@@ -335,6 +578,496 @@ const
 begin
   if P < csTinyProb then P := csTinyProb;
   Result := Ln(P);
+end;
+
+{ TNNetTokenConstraint }
+
+procedure TNNetTokenConstraint.Reset(const PromptTokens: array of integer);
+begin
+  // Default: stateless constraint, nothing to rewind.
+end;
+
+procedure TNNetTokenConstraint.MaskAllowed(Probs: TNNetVolume);
+var
+  I: integer;
+  AllowedMass: TNeuralFloat;
+  Allowed: array of boolean;
+  AnyBlocked: boolean;
+begin
+  SetLength(Allowed, Probs.Size);
+  AllowedMass := 0;
+  AnyBlocked := false;
+  for I := 0 to Probs.Size - 1 do
+  begin
+    Allowed[I] := TokenAllowed(I);
+    if Allowed[I]
+    then AllowedMass := AllowedMass + Probs.Raw[I]
+    else AnyBlocked := true;
+  end;
+  // Nothing to mask: every token is allowed.
+  if not AnyBlocked then exit;
+  // FALLBACK (documented in the class header): zero allowed mass - leave the
+  // row untouched so the step degrades to unconstrained sampling instead of
+  // an all-zero row whose argmax would degenerate to token 0.
+  if AllowedMass <= 0 then exit;
+  for I := 0 to Probs.Size - 1 do
+    if Allowed[I]
+    then Probs.Raw[I] := Probs.Raw[I] / AllowedMass
+    else Probs.Raw[I] := 0;
+end;
+
+procedure TNNetTokenConstraint.Commit(TokenId: integer);
+begin
+  // Default: stateless constraint, nothing to advance.
+end;
+
+{ TNNetAllowedTokensConstraint }
+
+constructor TNNetAllowedTokensConstraint.Create(
+  const AllowedTokens: array of integer);
+var
+  I, MaxId: integer;
+begin
+  inherited Create();
+  MaxId := -1;
+  for I := 0 to High(AllowedTokens) do
+    if AllowedTokens[I] > MaxId then MaxId := AllowedTokens[I];
+  SetLength(FAllowed, MaxId + 1);
+  for I := 0 to MaxId do FAllowed[I] := false;
+  for I := 0 to High(AllowedTokens) do
+    if AllowedTokens[I] >= 0 then FAllowed[AllowedTokens[I]] := true;
+end;
+
+function TNNetAllowedTokensConstraint.TokenAllowed(TokenId: integer): boolean;
+begin
+  Result := (TokenId >= 0) and (TokenId <= High(FAllowed)) and
+    FAllowed[TokenId];
+end;
+
+{ TNNetForcedSequenceConstraint }
+
+constructor TNNetForcedSequenceConstraint.Create(
+  const Candidates: TNNetTokenSequences);
+var
+  I: integer;
+begin
+  inherited Create();
+  SetLength(FCandidates, 0);
+  // Keep non-empty candidates only (an empty candidate would mean "emit
+  // nothing", which cannot guide a generation step).
+  for I := 0 to High(Candidates) do
+  begin
+    if Length(Candidates[I]) = 0 then continue;
+    SetLength(FCandidates, Length(FCandidates) + 1);
+    FCandidates[High(FCandidates)] :=
+      Copy(Candidates[I], 0, Length(Candidates[I]));
+  end;
+  SetLength(FActive, Length(FCandidates));
+  Reset([]);
+end;
+
+constructor TNNetForcedSequenceConstraint.Create(Dict: TStringListInt;
+  const Candidates: array of string);
+var
+  Seqs: TNNetTokenSequences;
+  Toks: TNeuralIntegerArray;
+  I: integer;
+begin
+  SetLength(Seqs, 0);
+  for I := 0 to High(Candidates) do
+  begin
+    if Candidates[I] = '' then continue;
+    Dict.Tokenize(Candidates[I], Toks);
+    if Length(Toks) = 0 then continue;
+    SetLength(Seqs, Length(Seqs) + 1);
+    Seqs[High(Seqs)] := Copy(Toks, 0, Length(Toks));
+  end;
+  Create(Seqs);
+end;
+
+procedure TNNetForcedSequenceConstraint.Reset(
+  const PromptTokens: array of integer);
+var
+  I: integer;
+begin
+  // The candidates constrain the GENERATED region only; the prompt is just
+  // conditioning context, so it is ignored and the trie rewinds to its root.
+  FDepth := 0;
+  for I := 0 to High(FActive) do FActive[I] := true;
+end;
+
+function TNNetForcedSequenceConstraint.TokenAllowed(TokenId: integer): boolean;
+var
+  I: integer;
+begin
+  // Special/EOS ids become legal once some candidate has been fully emitted.
+  if TokenId < 2 then exit(Completed());
+  Result := false;
+  for I := 0 to High(FCandidates) do
+    if FActive[I] and (FDepth < Length(FCandidates[I])) and
+      (FCandidates[I][FDepth] = TokenId) then exit(true);
+end;
+
+procedure TNNetForcedSequenceConstraint.Commit(TokenId: integer);
+var
+  I: integer;
+begin
+  // Special/EOS ids terminate generation without consuming trie depth, so
+  // Completed() remains queryable after the final EOS commit.
+  if TokenId < 2 then exit;
+  for I := 0 to High(FCandidates) do
+    if FActive[I] then
+      FActive[I] := (FDepth < Length(FCandidates[I])) and
+        (FCandidates[I][FDepth] = TokenId);
+  Inc(FDepth);
+end;
+
+function TNNetForcedSequenceConstraint.Completed(): boolean;
+var
+  I: integer;
+begin
+  Result := false;
+  for I := 0 to High(FCandidates) do
+    if FActive[I] and (Length(FCandidates[I]) = FDepth) then exit(true);
+end;
+
+{ TNNetJSONStateMachine }
+
+// JSON insignificant whitespace (RFC 8259: space, tab, LF, CR).
+function JSONIsWS(C: char): boolean;
+begin
+  Result := (C = ' ') or (C = #9) or (C = #10) or (C = #13);
+end;
+
+function JSONIsDigit(C: char): boolean;
+begin
+  Result := (C >= '0') and (C <= '9');
+end;
+
+function JSONIsHexDigit(C: char): boolean;
+begin
+  Result := JSONIsDigit(C) or ((C >= 'a') and (C <= 'f')) or
+    ((C >= 'A') and (C <= 'F'));
+end;
+
+constructor TNNetJSONStateMachine.Create();
+begin
+  inherited Create();
+  SetLength(FStack, 8);
+  Reset();
+end;
+
+procedure TNNetJSONStateMachine.Reset();
+begin
+  FState := jmsValue;
+  FNumState := jnsMinus;
+  FHexRemain := 0;
+  FLitRemain := '';
+  FKeyString := false;
+  FStackLen := 0;
+end;
+
+procedure TNNetJSONStateMachine.CopyFrom(Source: TNNetJSONStateMachine);
+begin
+  FState := Source.FState;
+  FNumState := Source.FNumState;
+  FHexRemain := Source.FHexRemain;
+  FLitRemain := Source.FLitRemain;
+  FKeyString := Source.FKeyString;
+  if Length(FStack) < Source.FStackLen then
+    SetLength(FStack, Source.FStackLen);
+  if Source.FStackLen > 0 then
+    Move(Source.FStack[0], FStack[0], Source.FStackLen * SizeOf(char));
+  FStackLen := Source.FStackLen;
+end;
+
+procedure TNNetJSONStateMachine.Push(C: char);
+begin
+  if FStackLen >= Length(FStack) then SetLength(FStack, FStackLen * 2 + 8);
+  FStack[FStackLen] := C;
+  Inc(FStackLen);
+end;
+
+procedure TNNetJSONStateMachine.Pop();
+begin
+  Dec(FStackLen);
+end;
+
+function TNNetJSONStateMachine.Top(): char;
+begin
+  if FStackLen > 0
+  then Result := FStack[FStackLen - 1]
+  else Result := #0;
+end;
+
+procedure TNNetJSONStateMachine.CompleteValue();
+begin
+  if FStackLen = 0
+  then FState := jmsDone
+  else FState := jmsAfterValue;
+end;
+
+function TNNetJSONStateMachine.EndNumberAndRefeed(C: char): boolean;
+begin
+  // Only called from number states where the number is a complete value.
+  CompleteValue();
+  Result := FeedChar(C);
+end;
+
+function TNNetJSONStateMachine.FeedNumberChar(C: char): boolean;
+begin
+  Result := true;
+  case FNumState of
+    jnsMinus: // '-' consumed: an int part MUST follow ('-' alone is invalid)
+      if C = '0' then FNumState := jnsZero
+      else if (C >= '1') and (C <= '9') then FNumState := jnsInt
+      else Result := false;
+    jnsZero:  // a leading 0 admits no further int digits (per spec)
+      if C = '.' then FNumState := jnsDot
+      else if (C = 'e') or (C = 'E') then FNumState := jnsExp
+      else Result := EndNumberAndRefeed(C);
+    jnsInt:
+      if JSONIsDigit(C) then // stay
+      else if C = '.' then FNumState := jnsDot
+      else if (C = 'e') or (C = 'E') then FNumState := jnsExp
+      else Result := EndNumberAndRefeed(C);
+    jnsDot:   // '.' consumed: at least one fraction digit required
+      if JSONIsDigit(C) then FNumState := jnsFrac
+      else Result := false;
+    jnsFrac:
+      if JSONIsDigit(C) then // stay
+      else if (C = 'e') or (C = 'E') then FNumState := jnsExp
+      else Result := EndNumberAndRefeed(C);
+    jnsExp:   // 'e'/'E' consumed: optional sign, then at least one digit
+      if JSONIsDigit(C) then FNumState := jnsExpDigits
+      else if (C = '+') or (C = '-') then FNumState := jnsExpSign
+      else Result := false;
+    jnsExpSign:
+      if JSONIsDigit(C) then FNumState := jnsExpDigits
+      else Result := false;
+    jnsExpDigits:
+      if JSONIsDigit(C) then // stay
+      else Result := EndNumberAndRefeed(C);
+  end;
+end;
+
+function TNNetJSONStateMachine.FeedChar(C: char): boolean;
+begin
+  Result := true;
+  case FState of
+    jmsValue, jmsValueOrArrayClose:
+      begin
+        if JSONIsWS(C) then exit;
+        case C of
+          '{': begin Push('{'); FState := jmsObjectKeyOrClose; end;
+          '[': begin Push('['); FState := jmsValueOrArrayClose; end;
+          '"': begin FKeyString := false; FState := jmsString; end;
+          't': begin FLitRemain := 'rue'; FState := jmsLiteral; end;
+          'f': begin FLitRemain := 'alse'; FState := jmsLiteral; end;
+          'n': begin FLitRemain := 'ull'; FState := jmsLiteral; end;
+          '-': begin FNumState := jnsMinus; FState := jmsNumber; end;
+          '0': begin FNumState := jnsZero; FState := jmsNumber; end;
+          '1'..'9': begin FNumState := jnsInt; FState := jmsNumber; end;
+          ']': // legal only right after '[' (empty array; no trailing comma)
+            if FState = jmsValueOrArrayClose then
+            begin Pop(); CompleteValue(); end
+            else Result := false;
+          else Result := false;
+        end;
+      end;
+    jmsObjectKeyOrClose:
+      begin
+        if JSONIsWS(C) then exit;
+        if C = '"' then begin FKeyString := true; FState := jmsString; end
+        else if C = '}' then begin Pop(); CompleteValue(); end
+        else Result := false;
+      end;
+    jmsObjectKey: // after ',' in an object: a key string is mandatory
+      begin
+        if JSONIsWS(C) then exit;
+        if C = '"' then begin FKeyString := true; FState := jmsString; end
+        else Result := false;
+      end;
+    jmsObjectColon:
+      begin
+        if JSONIsWS(C) then exit;
+        if C = ':' then FState := jmsValue
+        else Result := false;
+      end;
+    jmsString:
+      begin
+        if C = '"' then
+        begin
+          if FKeyString
+          then FState := jmsObjectColon
+          else CompleteValue();
+        end
+        else if C = '\' then FState := jmsStringEscape
+        // Raw control characters are invalid inside JSON strings; any other
+        // byte (including >#127 UTF-8 continuation bytes) is string content.
+        else if C < #32 then Result := false;
+      end;
+    jmsStringEscape:
+      case C of
+        '"', '\', '/', 'b', 'f', 'n', 'r', 't': FState := jmsString;
+        'u': begin FHexRemain := 4; FState := jmsStringUnicode; end;
+        else Result := false;
+      end;
+    jmsStringUnicode:
+      if JSONIsHexDigit(C) then
+      begin
+        Dec(FHexRemain);
+        if FHexRemain = 0 then FState := jmsString;
+      end
+      else Result := false;
+    jmsNumber:
+      Result := FeedNumberChar(C);
+    jmsLiteral:
+      if (FLitRemain <> '') and (C = FLitRemain[1]) then
+      begin
+        Delete(FLitRemain, 1, 1);
+        if FLitRemain = '' then CompleteValue();
+      end
+      else Result := false;
+    jmsAfterValue: // stack is never empty here (empty stack -> jmsDone)
+      begin
+        if JSONIsWS(C) then exit;
+        if C = ',' then
+        begin
+          if Top() = '{'
+          then FState := jmsObjectKey
+          else FState := jmsValue;
+        end
+        else if (C = '}') and (Top() = '{') then
+        begin Pop(); CompleteValue(); end
+        else if (C = ']') and (Top() = '[') then
+        begin Pop(); CompleteValue(); end
+        else Result := false;
+      end;
+    jmsDone: // trailing whitespace only after the top-level value
+      Result := JSONIsWS(C);
+  end;
+end;
+
+function TNNetJSONStateMachine.FeedString(const S: string): boolean;
+var
+  I: integer;
+begin
+  Result := true;
+  for I := 1 to Length(S) do
+    if not FeedChar(S[I]) then exit(false);
+end;
+
+function TNNetJSONStateMachine.CharAllowed(C: char): boolean;
+var
+  SavedState: TNNetJSONMainState;
+  SavedNumState: TNNetJSONNumberState;
+  SavedHexRemain, SavedStackLen: integer;
+  SavedLitRemain: string;
+  SavedKeyString: boolean;
+begin
+  // One FeedChar performs at most one push (appended above SavedStackLen,
+  // discarded by restoring the length) or one pop (the popped element is
+  // left intact below SavedStackLen), so saving the scalar fields plus the
+  // stack LENGTH restores the exact state.
+  SavedState := FState;
+  SavedNumState := FNumState;
+  SavedHexRemain := FHexRemain;
+  SavedLitRemain := FLitRemain;
+  SavedKeyString := FKeyString;
+  SavedStackLen := FStackLen;
+  Result := FeedChar(C);
+  FState := SavedState;
+  FNumState := SavedNumState;
+  FHexRemain := SavedHexRemain;
+  FLitRemain := SavedLitRemain;
+  FKeyString := SavedKeyString;
+  FStackLen := SavedStackLen;
+end;
+
+function TNNetJSONStateMachine.IsComplete(): boolean;
+begin
+  Result := (FState = jmsDone) or
+    // An unterminated top-level number that is already a complete value
+    // (e.g. "42", "-1.5e3"): valid JSON if generation stops here.
+    ((FState = jmsNumber) and (FStackLen = 0) and
+     (FNumState in [jnsZero, jnsInt, jnsFrac, jnsExpDigits]));
+end;
+
+function TNNetJSONStateMachine.StackDepth(): integer;
+begin
+  Result := FStackLen;
+end;
+
+{ TNNetJSONConstraint }
+
+constructor TNNetJSONConstraint.Create(Dict: TStringListInt);
+var
+  I: integer;
+begin
+  inherited Create();
+  FMachine := TNNetJSONStateMachine.Create();
+  FProbe := TNNetJSONStateMachine.Create();
+  SetLength(FTokenStr, Dict.GetVocabCount());
+  for I := 0 to High(FTokenStr) do
+    if I < 2
+    then FTokenStr[I] := '' // special ids carry no text
+    else FTokenStr[I] := Dict.DeTokenize(I);
+end;
+
+constructor TNNetJSONConstraint.CreateCharLevel(VocabSize: integer);
+var
+  I: integer;
+begin
+  inherited Create();
+  FMachine := TNNetJSONStateMachine.Create();
+  FProbe := TNNetJSONStateMachine.Create();
+  SetLength(FTokenStr, VocabSize);
+  for I := 0 to High(FTokenStr) do
+    if I < 2
+    then FTokenStr[I] := ''
+    else FTokenStr[I] := Chr(I);
+end;
+
+destructor TNNetJSONConstraint.Destroy();
+begin
+  FProbe.Free;
+  FMachine.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetJSONConstraint.Reset(const PromptTokens: array of integer);
+begin
+  // The JSON value starts at the generation boundary; the prompt is plain
+  // conditioning text and is NOT fed through the automaton.
+  FMachine.Reset();
+end;
+
+function TNNetJSONConstraint.TokenAllowed(TokenId: integer): boolean;
+var
+  S: string;
+  I: integer;
+begin
+  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
+  // Special/EOS ids: legal exactly when a complete top-level value stands.
+  if TokenId < 2 then exit(FMachine.IsComplete());
+  S := FTokenStr[TokenId];
+  if S = '' then exit(false); // would not advance generation
+  // Transitive multi-character validation: clone the live state and feed the
+  // token's characters one by one; ALL must be legal continuations.
+  FProbe.CopyFrom(FMachine);
+  for I := 1 to Length(S) do
+    if not FProbe.FeedChar(S[I]) then exit(false);
+  Result := true;
+end;
+
+procedure TNNetJSONConstraint.Commit(TokenId: integer);
+begin
+  if (TokenId < 2) or (TokenId > High(FTokenStr)) then exit;
+  // Tokens reaching Commit were validated by TokenAllowed, so this never
+  // rejects in the generation loop; the result is intentionally ignored so
+  // direct/driving callers cannot corrupt the automaton silently either way.
+  FMachine.FeedString(FTokenStr[TokenId]);
 end;
 
 { TNNetStreamingDecoder }
@@ -482,6 +1215,18 @@ function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
   MaxTotalLen: integer; Sampler: TNNetSamplerBase;
   Penalty: TNNetTokenHistoryPenalty;
   const StopSequences: TNNetTokenSequences): integer;
+begin
+  // Bit-for-bit the unconstrained behavior.
+  Result := GenerateTokensStreamed(Session, Tokens, PromptLen, MaxNewTokens,
+    MaxTotalLen, Sampler, Penalty, StopSequences, nil);
+end;
+
+function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase;
+  Penalty: TNNetTokenHistoryPenalty;
+  const StopSequences: TNNetTokenSequences;
+  Constraint: TNNetTokenConstraint): integer;
 var
   InV: TNNetVolume;
   Pos, CapLen, NextTokenInt, StopLen: integer;
@@ -511,6 +1256,11 @@ begin
       Penalty.ResetHistory();
       for Pos := 0 to PromptLen - 1 do Penalty.RegisterToken(Tokens[Pos]);
     end;
+    // A fresh sequence for the constraint, too: stateful grammars rewind and
+    // receive the prompt ids (most constraints ignore them - the constrained
+    // region is the GENERATED text).
+    if Assigned(Constraint) then
+      Constraint.Reset(Copy(Tokens, 0, PromptLen));
     // Prefill tokens 0..PromptLen-2 one at a time; the LAST prompt token is
     // the first decode step's input (its output row predicts the first new
     // token) - the established prefill-then-step idiom.
@@ -529,12 +1279,17 @@ begin
       // renormalize), not the logit-domain Apply. Mutating the net's output
       // volume in place is safe: the next StepForward recomputes it.
       if Assigned(Penalty) then Penalty.ApplyToProbabilities(Session.Output());
+      // Constrained decoding: AFTER the penalty, BEFORE the sampler - zero
+      // the disallowed tokens and renormalize (or leave the row untouched
+      // when the allowed mass is zero; see TNNetTokenConstraint).
+      if Assigned(Constraint) then Constraint.MaskAllowed(Session.Output());
       // The step net is width-1, so the (only) output row is pixel (0,0).
       if Assigned(Sampler)
       then NextTokenInt := Sampler.GetTokenOnPixel(Session.Output(), 0, 0)
       else NextTokenInt := Session.Output().GetClassOnPixel(0, 0);
       Tokens[Pos] := NextTokenInt;
       if Assigned(Penalty) then Penalty.RegisterToken(NextTokenInt);
+      if Assigned(Constraint) then Constraint.Commit(NextTokenInt);
       Inc(Pos);
       // Stop sequences: if the GENERATED tail now equals one of the entries,
       // terminate and TRIM the matched tokens from the returned length.
@@ -570,6 +1325,17 @@ function GenerateStringStreamed(Session: TNNetStreamingDecoder;
   Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
   oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
   const StopStrings: array of string): string;
+begin
+  // Bit-for-bit the unconstrained behavior.
+  Result := GenerateStringStreamed(Session, Dict, InputString, MaxNewTokens,
+    MaxTotalLen, oSampler, Penalty, StopStrings, nil);
+end;
+
+function GenerateStringStreamed(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
+  const StopStrings: array of string;
+  Constraint: TNNetTokenConstraint): string;
 var
   Tokens, StopToks: TNeuralIntegerArray;
   TokenStops: TNNetTokenSequences;
@@ -595,7 +1361,7 @@ begin
     end;
   end;
   TotalLen := GenerateTokensStreamed(Session, Tokens, PromptLen,
-    MaxNewTokens, MaxTotalLen, oSampler, Penalty, TokenStops);
+    MaxNewTokens, MaxTotalLen, oSampler, Penalty, TokenStops, Constraint);
   // Detokenize the continuation; stop at the first special token (< 2) for
   // display (the TokensToText convention) and join with a space only for
   // separator vocabularies (word dicts; BPE vocabularies concatenate).
@@ -669,9 +1435,18 @@ end;
 
 function DecodeGreedy(NN: TNNet; const Prompt: string; MaxLen: integer;
   const StopStrings: array of string): TNNetDecodeResult;
+begin
+  // Bit-for-bit the unconstrained behavior.
+  Result := DecodeGreedy(NN, Prompt, MaxLen, StopStrings, nil);
+end;
+
+function DecodeGreedy(NN: TNNet; const Prompt: string; MaxLen: integer;
+  const StopStrings: array of string;
+  Constraint: TNNetTokenConstraint): TNNetDecodeResult;
 var
   InputVolume, OutputVolume: TNNetVolume;
   LogProbs: array of TNeuralFloat;
+  PromptIds: TNeuralIntegerArray;
   VocabSize, Step, Best, I, StopLen: integer;
   Context: string;
 begin
@@ -683,14 +1458,33 @@ begin
   Result.SumLogProb := 0;
   Result.Finished := False;
   Context := Prompt;
+  if Assigned(Constraint) then
+  begin
+    // DecodeGreedy is char-level: token id = character code.
+    SetLength(PromptIds, Length(Prompt));
+    for I := 1 to Length(Prompt) do PromptIds[I - 1] := Ord(Prompt[I]);
+    Constraint.Reset(PromptIds);
+  end;
   try
     for Step := 1 to MaxLen do
     begin
       NextLogProbs(NN, Context, InputVolume, OutputVolume, LogProbs);
-      Best := 0;
-      for I := 1 to VocabSize - 1 do
-        if LogProbs[I] > LogProbs[Best] then Best := I;
+      // Constrained step: argmax over the ALLOWED tokens only; when no token
+      // is allowed fall back to the plain argmax (same policy as
+      // TNNetTokenConstraint.MaskAllowed).
+      Best := -1;
+      if Assigned(Constraint) then
+        for I := 0 to VocabSize - 1 do
+          if Constraint.TokenAllowed(I) and
+            ((Best < 0) or (LogProbs[I] > LogProbs[Best])) then Best := I;
+      if Best < 0 then
+      begin
+        Best := 0;
+        for I := 1 to VocabSize - 1 do
+          if LogProbs[I] > LogProbs[Best] then Best := I;
+      end;
       Result.SumLogProb := Result.SumLogProb + LogProbs[Best];
+      if Assigned(Constraint) then Constraint.Commit(Best);
       if Best = csDecodeEOSToken then
       begin
         Result.Finished := True;
