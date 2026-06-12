@@ -17,8 +17,8 @@ interface
 
 uses
   Classes, SysUtils, fpcunit, testregistry, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralsafetensors, neuralpretrained,
-  neuralhftokenizer;
+  neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
+  neuralpretrained, neuralhftokenizer;
 
 type
   TTestNeuralPretrained = class(TTestCase)
@@ -72,6 +72,9 @@ type
     procedure TestImporterFailsOnMissingTensor;
     procedure TestGPT2ConfigFromFixture;
     procedure TestGPT2LogitParity;
+    procedure TestTorchBinMatchesSafeTensorsTwin;
+    procedure TestTorchBinRejectsMaliciousPickle;
+    procedure TestGPT2LogitParityFromTorchBin;
     procedure TestMakeInferenceOnlyKeepsOutputs;
     procedure TestTokenRMSNormForwardAndSaveLoad;
     procedure TestRotaryHalfPermutationMatchesHFRotateHalf;
@@ -819,6 +822,117 @@ begin
     Output.Free;
     Input.Free;
     RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// The restricted torch.save reader (TNNetTorchBinReader) must expose the
+// EXACT same tensors as the safetensors twin of the same pico state_dict
+// (tools/torch_bin_fixture.py writes both from one torch.manual_seed run):
+// same names, dtypes and shapes, and bit-for-bit identical decoded f32
+// values for every supported dtype (F32/F16/BF16/I64) including a 3-D
+// tensor and a 0-d scalar.
+procedure TTestNeuralPretrained.TestTorchBinMatchesSafeTensorsTwin;
+var
+  Bin: TNNetTorchBinReader;
+  St: TNNetSafeTensorsReader;
+  VolBin, VolSt: TNNetVolume;
+  TensorCnt, DimCnt, ElemCnt: integer;
+  TName: string;
+begin
+  RandSeed := 424242;
+  Bin := TNNetTorchBinReader.Create(FixturePath('tiny_torch_state.bin'));
+  St := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_torch_state.safetensors'));
+  VolBin := TNNetVolume.Create;
+  VolSt := TNNetVolume.Create;
+  try
+    AssertEquals('tensor count', St.Count, Bin.Count);
+    AssertTrue('varied dtypes in the fixture',
+      (St.GetDType('w_f16') = 'F16') and (St.GetDType('w_bf16') = 'BF16') and
+      (St.GetDType('ids_i64') = 'I64'));
+    for TensorCnt := 0 to St.Count - 1 do
+    begin
+      TName := St.TensorName(TensorCnt);
+      AssertTrue('.bin has "' + TName + '"', Bin.HasTensor(TName));
+      AssertEquals('dtype of ' + TName,
+        St.GetDType(TName), Bin.GetDType(TName));
+      AssertEquals('dim count of ' + TName,
+        St.DimCount(TName), Bin.DimCount(TName));
+      for DimCnt := 0 to St.DimCount(TName) - 1 do
+        AssertEquals('dim ' + IntToStr(DimCnt) + ' of ' + TName,
+          St.DimSize(TName, DimCnt), Bin.DimSize(TName, DimCnt));
+      St.LoadTensorFlat(TName, VolSt);
+      Bin.LoadTensorFlat(TName, VolBin);
+      AssertEquals('element count of ' + TName, VolSt.Size, VolBin.Size);
+      for ElemCnt := 0 to VolSt.Size - 1 do
+        // BIT-FOR-BIT: both paths decode the same little-endian storage
+        // bytes through the same DecodeF16/DecodeBF16 helpers, so exact
+        // equality is required - any difference means a wrong byte offset.
+        AssertTrue(TName + '[' + IntToStr(ElemCnt) + '] mismatch: .bin=' +
+          FloatToStr(VolBin.FData[ElemCnt]) + ' safetensors=' +
+          FloatToStr(VolSt.FData[ElemCnt]),
+          VolBin.FData[ElemCnt] = VolSt.FData[ElemCnt]);
+    end;
+    AssertEquals('scalar value', 3.5, VolBin.FData[0]);
+  finally
+    VolSt.Free;
+    VolBin.Free;
+    St.Free;
+    Bin.Free;
+  end;
+end;
+
+// The arbitrary-code-execution hazard that motivated safetensors: a pickle
+// whose REDUCE calls os.system. tools/torch_bin_fixture.py torch.saves an
+// object reducing to (os.system, ('echo pwned',)) - a valid torch zip with
+// a malicious data.pkl whose stream contains GLOBAL "posix system" (CPython
+// pickles os.system under its real module, posix). The restricted unpickler
+// must raise ETorchBinError at the non-whitelisted GLOBAL, and must never
+// execute anything.
+procedure TTestNeuralPretrained.TestTorchBinRejectsMaliciousPickle;
+var
+  Reader: TNNetTorchBinReader;
+  Failed: boolean;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  Failed := false;
+  Msg := '';
+  try
+    Reader := TNNetTorchBinReader.Create(FixturePath('evil_torch.bin'));
+    Reader.Free;
+  except
+    on E: ETorchBinError do
+    begin
+      Failed := true;
+      Msg := E.Message;
+    end;
+  end;
+  AssertTrue('malicious GLOBAL "posix system" must raise ETorchBinError',
+    Failed);
+  AssertTrue('the error must name the refused symbol, got: ' + Msg,
+    Pos('posix system', Msg) > 0);
+end;
+
+// End-to-end through the importer: tiny_gpt2.bin is the existing
+// tiny_gpt2.safetensors checkpoint re-saved via torch.save (bit-identical
+// f32 weights), so the .bin path must reproduce the SAME oracle logits in
+// tiny_gpt2_logits.json - exercising CreatePretrainedTensorReader's
+// extension dispatch inside BuildGPT2FromSafeTensorsEx.
+procedure TTestNeuralPretrained.TestGPT2LogitParityFromTorchBin;
+var
+  NN: TNNet;
+  Config: TGPT2Config;
+begin
+  RandSeed := 424242;
+  NN := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.bin'),
+    Config, {SeqLen=}0, {NumHeads=}2);
+  try
+    AssertEquals('n_layer', 2, Config.NLayers);
+    AssertLogitParityWithFixture(NN, FixturePath('tiny_gpt2_logits.json'),
+      Config.NCtx, Config.VocabSize);
+  finally
     NN.Free;
   end;
 end;

@@ -411,7 +411,7 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [ ] PyTorch pytorch_model.bin loader: a RESTRICTED unpickler for the
+- [X] PyTorch pytorch_model.bin loader: a RESTRICTED unpickler for the
       torch.save zip format — the long tail of older/fine-tuned checkpoints
       never got converted to safetensors. State_dicts use a small pickle
       subset (a dozen opcodes + persistent-id storage references into the
@@ -425,6 +425,28 @@ rather than acted on.
       verified 2026-06-12: cerebras/Cerebras-GPT-* and the
       roneneldan/TinyStories-* checkpoints ship pytorch_model.bin ONLY
       (the Cerebras parity work converted via Python as a stopgap).
+      DONE 2026-06-12: TNNetTorchBinReader in neural/neuraltorchbin.pas —
+      own zip central-directory parser (incl. zip64, STORED entries read
+      at absolute offsets) + restricted protocol-2 unpickler (whitelisted
+      GLOBALs: collections OrderedDict, torch._utils
+      _rebuild_tensor_v2/_rebuild_parameter, torch *Storage dtypes; any
+      other GLOBAL/opcode/REDUCE hard-fails, e.g. the fixture's `posix
+      system` payload). Subclasses TNNetSafeTensorsReader and fills the
+      same tensor table, so EVERY importer takes .bin transparently via
+      CreatePretrainedTensorReader extension dispatch (all 7 Build*
+      families + BuildFromPretrained directory probe of
+      pytorch_model.bin). Tests: bit-for-bit twin parity
+      (tools/torch_bin_fixture.py f32/f16/bf16/i64 + 3-D + scalar),
+      malicious-pickle rejection, GPT-2 logit parity through tiny_gpt2.bin.
+- [ ] Sharded pytorch_model.bin checkpoints: support
+      pytorch_model.bin.index.json (same weight_map shape as the landed
+      safetensors index) by opening every referenced .bin shard behind the
+      TNNetTorchBinReader API — mirrors TNNetSafeTensorsReader's
+      OpenFromIndex, mostly plumbing since per-shard absolute offsets
+      already work. Also out of scope from the landed v1, if ever needed:
+      the pre-torch-1.6 non-zip legacy format, DEFLATE-compressed zip
+      entries, and non-contiguous (stride-permuted) state_dict tensors —
+      all currently rejected with descriptive ETorchBinError messages.
 - [ ] T5/Flan-T5 (encoder-decoder) importer: the natural companion to the
       seq2seq generation harness task above. T5's relative-position bias
       buckets are landed (TNNetT5RelPosBiasAttention / avT5RelPosBias), and
@@ -532,10 +554,10 @@ rather than acted on.
       Gemma3ForCausalLM on a sliced text-only checkpoint.
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
-      the GPT-Neo route; the published checkpoints ship pytorch_model.bin
-      only, so a one-line torch state_dict -> safetensors conversion is
-      needed first — see examples/GPT2Import/README.md): the repo's NLP
-      examples already train
+      the GPT-Neo route; the published pytorch_model.bin-only checkpoints
+      now load DIRECTLY via the landed TNNetTorchBinReader — no Python
+      conversion step needed, see examples/GPT2Import/README.md): the
+      repo's NLP examples already train
       on the TinyStories dataset — compare neuralnlpmetrics perplexity of
       a from-scratch CAI training run against the imported
       roneneldan/TinyStories-1M..33M reference at matched vocab/context;

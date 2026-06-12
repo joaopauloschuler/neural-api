@@ -401,7 +401,8 @@ interface
 
 uses
   Classes, SysUtils, fpjson, jsonparser,
-  neuralvolume, neuralnetwork, neuralsafetensors, neuralhftokenizer;
+  neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
+  neuralhftokenizer;
 
 type
   EPretrainedImportError = class(Exception);
@@ -426,6 +427,16 @@ function ReadGPT2Config(Reader: TNNetSafeTensorsReader;
   pNumHeads: integer = 0): TGPT2Config;
 
 function GPT2ConfigToString(const Config: TGPT2Config): string;
+
+// Opens the checkpoint at FileName with the reader matching its format:
+// a ".bin" extension gets the restricted torch.save reader
+// (TNNetTorchBinReader, neuraltorchbin.pas - pytorch_model.bin); anything
+// else gets TNNetSafeTensorsReader (which itself dispatches ".json" to the
+// sharded-index path). TNNetTorchBinReader subclasses the safetensors
+// reader, so every Build*FromSafeTensors* importer in this unit accepts a
+// pytorch_model.bin path transparently through this helper.
+function CreatePretrainedTensorReader(
+  const FileName: string): TNNetSafeTensorsReader;
 
 // Builds a TNNet with the GPT-2 architecture described by the checkpoint at
 // FileName and loads every weight. The returned net takes a (SeqLen,1,1)
@@ -1004,6 +1015,15 @@ begin
   raise EPretrainedImportError.Create(Msg);
 end;
 
+function CreatePretrainedTensorReader(
+  const FileName: string): TNNetSafeTensorsReader;
+begin
+  if LowerCase(ExtractFileExt(FileName)) = '.bin' then
+    Result := TNNetTorchBinReader.Create(FileName)
+  else
+    Result := TNNetSafeTensorsReader.Create(FileName);
+end;
+
 function ReadGPT2Config(Reader: TNNetSafeTensorsReader;
   pNumHeads: integer = 0): TGPT2Config;
 var
@@ -1173,7 +1193,7 @@ var
   end;
 
 begin
-  Reader := TNNetSafeTensorsReader.Create(FileName);
+  Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
@@ -1741,7 +1761,7 @@ var
   end;
 
 begin
-  Reader := TNNetSafeTensorsReader.Create(FileName);
+  Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
@@ -2256,7 +2276,7 @@ var
   end;
 
 begin
-  Reader := TNNetSafeTensorsReader.Create(FileName);
+  Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
@@ -2736,7 +2756,7 @@ var
   end;
 
 begin
-  Reader := TNNetSafeTensorsReader.Create(FileName);
+  Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
@@ -3199,7 +3219,7 @@ var
   end;
 
 begin
-  Reader := TNNetSafeTensorsReader.Create(FileName);
+  Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
@@ -3716,7 +3736,7 @@ var
   end;
 
 begin
-  Reader := TNNetSafeTensorsReader.Create(FileName);
+  Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
@@ -4210,7 +4230,7 @@ var
   end;
 
 begin
-  Reader := TNNetSafeTensorsReader.Create(FileName);
+  Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
@@ -5061,8 +5081,12 @@ begin
     if not FileExists(WeightsPath) then
       WeightsPath := IncludeTrailingPathDelimiter(Path) + 'model.safetensors';
     if not FileExists(WeightsPath) then
-      ImportError('BuildFromPretrained: neither "model.safetensors" nor ' +
-        '"model.safetensors.index.json" found in directory ' + Path + '.');
+      WeightsPath := IncludeTrailingPathDelimiter(Path) +
+        'pytorch_model.bin'; // torch.save fallback (TNNetTorchBinReader)
+    if not FileExists(WeightsPath) then
+      ImportError('BuildFromPretrained: none of "model.safetensors", ' +
+        '"model.safetensors.index.json" or "pytorch_model.bin" found in ' +
+        'directory ' + Path + '.');
   end
   else if FileExists(Path) then
   begin

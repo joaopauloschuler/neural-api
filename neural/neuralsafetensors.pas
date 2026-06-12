@@ -54,7 +54,11 @@ type
   // (with a descriptive message) on truncated, malformed or inconsistent
   // files - it never silently returns garbage.
   TNNetSafeTensorsReader = class
-  private
+  protected
+    // Protected (not private) so format siblings can reuse the stream +
+    // tensor-table + LoadTensorFlat machinery: TNNetTorchBinReader
+    // (neuraltorchbin.pas) subclasses this reader and populates the same
+    // fields from a torch.save zip instead of a safetensors header.
     FFileName: string;           // path given to Create (file or index.json)
     FStreams: array of TFileStream;  // one open stream per shard
     FShardNames: array of string;    // shard file paths (error messages)
@@ -62,6 +66,10 @@ type
     FDataSizes: array of Int64;  // per shard: byte length of data section
     FTensors: array of TSafeTensorInfo;
     function FindTensor(const pName: string): integer;
+    // Allocates WITHOUT parsing anything - the subclass constructor fills
+    // the fields itself (Create(pFileName) would parse as safetensors).
+    constructor CreateBare;
+  private
     // Opens one .safetensors file, validates and parses its header and
     // appends its tensors (tagged with the new shard index) to FTensors.
     // Returns the shard index.
@@ -154,6 +162,11 @@ begin
 end;
 
 { TNNetSafeTensorsReader }
+
+constructor TNNetSafeTensorsReader.CreateBare;
+begin
+  inherited Create;
+end;
 
 constructor TNNetSafeTensorsReader.Create(const pFileName: string);
 begin

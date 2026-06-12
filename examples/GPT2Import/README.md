@@ -70,9 +70,11 @@ position. Two deviations from the OpenAI checkpoints: `activation_function`
 is `"gelu"` (the EXACT erf form — pass `pExactGelu=true` to
 `BuildGPT2FromSafeTensors`, or use `BuildFromPretrained` with the
 checkpoint's `config.json`, which reads it), and upstream ships only
-`pytorch_model.bin` (convert to safetensors via torch — see
-`tools/cerebras_gpt_fixture.py`, which also pins the committed real-weight
-pico fixture `tests/fixtures/tiny_cerebras_gpt.*` asserted by
+`pytorch_model.bin` — which now loads DIRECTLY: every importer accepts a
+`.bin` path via the restricted torch.save reader in
+`neural/neuraltorchbin.pas` (no Python conversion needed; see
+`tools/cerebras_gpt_fixture.py` for the committed real-weight pico fixture
+`tests/fixtures/tiny_cerebras_gpt.*` asserted by
 `TestCerebrasGPTLogitParity`).
 
 ## GPT-Neo / TinyStories
@@ -87,10 +89,10 @@ load through this path — verified 2026-06 on the real TinyStories-1M
 weights: max |logit diff| **6.3e-5** vs HF transformers float64, and a
 10-token greedy continuation of "Once upon a time there was a little girl
 named" is token-for-token identical to HF's (" Lily. She loved to play
-outside in the sunshine"). Note these repos ship `pytorch_model.bin` only;
-convert once with
-`save_file({k: v.contiguous() for k, v in model.state_dict().items()}, 'model.safetensors')`
-(safetensors.torch) next to the repo's `config.json`. The pico parity
+outside in the sunshine"). These repos ship `pytorch_model.bin` only — pass
+the `.bin` path directly (the restricted torch.save reader in
+`neural/neuraltorchbin.pas` handles it; `BuildFromPretrained` on the repo
+directory also probes `pytorch_model.bin` automatically). The pico parity
 fixture is pinned by `tools/gptneo_tiny_fixture.py` →
 `TestGPTNeoLogitParity`.
 
