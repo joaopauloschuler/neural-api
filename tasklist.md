@@ -217,7 +217,7 @@ rather than acted on.
       heads consistent, update FStruct vocab sizes). Needed the moment
       anyone adds special tokens to fine-tune on top of the Llama/GPT-2
       importers.
-- [ ] Phi importer: partial-rotary (rotary_pct) attention + parallel
+- [X] Phi importer: partial-rotary (rotary_pct) attention + parallel
       attention/MLP residual layout — more than a weight-mapping delta on
       the Llama path; reuses the HF-parity fixture tooling.
 - [X] Qwen3 importer (0.6B is the most-used small instruct model): a small

@@ -28,6 +28,10 @@ unit neuralpretrained;
 //     partial INTERLEAVED rotary + separate bias-free q/k/v + untied
 //     lm_head WITH bias) - BuildGPTJFromSafeTensors. See the GPT-J
 //     IMPORT section below.
+//   - Phi (microsoft/phi-1, phi-1_5, phi-2; SHARED-LN parallel residual
+//     like GPT-J but with BIASED separate q/k/v/dense + partial rotary in
+//     the NeoX rotate_half layout + untied lm_head WITH bias) -
+//     BuildPhiFromSafeTensors. See the PHI IMPORT section below.
 //   - BERT (vanilla encoder family, model_type "bert": bert-base/tiny,
 //     sentence-transformers MiniLM, ...) - BuildBertFromSafeTensors.
 //     The FIRST ENCODER here: outputs hidden states, not logits. See the
@@ -237,6 +241,39 @@ unit neuralpretrained;
 // also wired. The LM head is UNTIED and - uniquely among the decoders
 // here - carries a BIAS (lm_head.weight + lm_head.bias). ln_f caps the
 // stack. Positions come ONLY from RoPE (no wpe table).
+//
+// ============================ PHI IMPORT ===================================
+// BuildPhiFromSafeTensors rebuilds Microsoft's Phi decoder (model_type
+// "phi": phi-1, phi-1_5, phi-2). Structurally it is GPT-J's SHARED-LN
+// parallel residual,
+//      x := x + Attn(LN(x)) + MLP(LN(x))
+// with ONE input_layernorm (a LayerNorm WITH bias, not RMSNorm) feeding
+// both branches - but every linear carries a BIAS (separate q/k/v +
+// attention dense, mlp fc1/fc2, and the untied lm_head), and the partial
+// rotary uses the NeoX rotate_half pair layout instead of GPT-J's
+// interleaved one:
+//
+//   PARTIAL rotary, rotate_half layout: only the first
+//   rotary_ndims = int(head_dim * partial_rotary_factor) channels of each
+//   q/k head get RoPE (0.5 for phi-1/phi-1_5, 0.4 for phi-2); the rest
+//   pass through. HF pairs channel k with k + rotary_ndims/2 (rotate_half
+//   restricted to the rotary slice), so at WEIGHT-LOAD time the first
+//   rotary_ndims rows of every q/k head are PERMUTED into
+//   TNNetRotaryEmbedding's interleaved even/odd layout - the same
+//   permutation the gpt_neox path composes into its fused slab, here
+//   applied to the separate q_proj/k_proj matrices (and their biases) by
+//   LoadPhiPartialRotaryLinearWeights. The rotary slice feeds a
+//   depth-rotary_ndims TNNetRotaryEmbedding, so the frequency schedule
+//   theta^(-2k/rotary_ndims) matches HF's inv_freq exactly.
+//
+// Attention is standard scaled (1/sqrt(head_dim)). hidden_act is
+// "gelu_new" (the tanh TNNetGELU) in every released Phi config; the exact
+// erf "gelu" composition is also wired. The LM head is UNTIED with a BIAS
+// (lm_head.weight + lm_head.bias, like GPT-J). model.final_layernorm caps
+// the stack. Positions come ONLY from RoPE (no wpe table). The
+// qk_layernorm config flag (false in every released checkpoint) and GQA
+// (num_key_value_heads <> num_attention_heads) are REJECTED explicitly
+// rather than silently mis-loaded.
 //
 // ============================ BERT IMPORT ==================================
 // BuildBertFromSafeTensors rebuilds the vanilla BERT ENCODER (HF BertModel,
@@ -622,6 +659,58 @@ function BuildGPTJFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
 type
+  TPhiConfig = record
+    HiddenSize: integer;        // d_model (hidden_size)
+    IntermediateSize: integer;  // MLP width (intermediate_size)
+    NumLayers: integer;         // decoder blocks (num_hidden_layers)
+    NumHeads: integer;          // attention heads (num_attention_heads)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings
+    LayerNormEps: TNeuralFloat; // layer_norm_eps
+    PartialRotaryFactor: TNeuralFloat; // partial_rotary_factor (0.5 for
+                                // phi-1/phi-1_5, 0.4 for phi-2)
+    RopeTheta: TNeuralFloat;    // rope_theta (RoPE base)
+    TieWordEmbeddings: boolean; // tie_word_embeddings (Phi: FALSE)
+    HiddenActTanh: boolean;     // true = gelu_new/gelu_pytorch_tanh (the
+                                // Phi default); false = exact erf "gelu"
+    Prefix: string;             // tensor-name prefix ('model.' or '')
+  end;
+
+// Reads a HF Phi config.json (model_type 'phi'). Required: hidden_size,
+// intermediate_size, num_hidden_layers, num_attention_heads, vocab_size,
+// max_position_embeddings. Defaults: partial_rotary_factor = 0.5 (the HF
+// PhiConfig default), rope_theta = 10000, layer_norm_eps = 1e-5,
+// tie_word_embeddings = false, hidden_act = 'gelu_new' (the tanh
+// approximation, Phi's default; 'gelu' selects the exact erf form,
+// anything else is rejected). qk_layernorm = true and GQA
+// (num_key_value_heads <> num_attention_heads) are rejected. Prefix is
+// left '' - the builder detects it.
+function ReadPhiConfigFromJSONFile(const FileName: string): TPhiConfig;
+
+function PhiConfigToString(const Config: TPhiConfig): string;
+
+// Builds a TNNet with the Phi architecture described by the config and
+// loads every weight from the safetensors checkpoint at FileName (see the
+// PHI IMPORT section of the unit header). The net takes a (SeqLen,1,1)
+// volume of token ids and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses
+// the full max_position_embeddings context. pInferenceOnly = True frees
+// training volumes during construction (Compute()-only afterwards).
+// Config.Prefix is detected from the checkpoint and written back.
+function BuildPhiFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TPhiConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildPhiFromSafeTensorsEx(const FileName: string;
+  out Config: TPhiConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildPhiFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+type
   // The encoder families sharing the BERT skeleton (selected by
   // config.json's model_type; see the BERT IMPORT section of the header).
   TBertFamily = (bfBert, bfDistilBert, bfRoberta);
@@ -749,8 +838,8 @@ procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, gpt_neox, gptj, llama, mistral, qwen2, qwen3, bert, distilbert,
-// roberta. Anything else
+// gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, bert,
+// distilbert, roberta. Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
 // choice. OUTPUT SEMANTICS DIFFER BY model_type: the decoder families
@@ -3188,6 +3277,527 @@ begin
     pInferenceOnly);
 end;
 
+// ============================ PHI IMPORT ===================================
+
+function ReadPhiConfigFromJSONFile(const FileName: string): TPhiConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+  Field: TJSONData;
+  NumKVHeads: integer;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Phi import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Phi import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Phi import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Phi import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Phi import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'phi');
+    if ModelType <> 'phi' then
+      ImportError('Phi import: config model_type is "' + ModelType +
+        '" - expected "phi" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    // Every released Phi checkpoint is plain MHA; a GQA config would need
+    // K/V head broadcasting this builder does not wire.
+    NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if NumKVHeads <> Result.NumHeads then
+      ImportError('Phi import: num_key_value_heads=' +
+        IntToStr(NumKVHeads) + ' <> num_attention_heads=' +
+        IntToStr(Result.NumHeads) + ' (GQA) is not supported - every ' +
+        'released Phi checkpoint uses plain MHA.');
+    // qk_layernorm is false in every released checkpoint; loading one
+    // with the flag set would silently skip the q/k norms.
+    if Obj.Get('qk_layernorm', False) then
+      ImportError('Phi import: qk_layernorm=true is not supported - ' +
+        'every released Phi checkpoint has qk_layernorm=false.');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-5);
+    Result.PartialRotaryFactor :=
+      Obj.Get('partial_rotary_factor', 0.5);
+    if (Result.PartialRotaryFactor <= 0) or
+       (Result.PartialRotaryFactor > 1) then
+      ImportError('Phi import: config partial_rotary_factor must be in ' +
+        '(0, 1], got ' + FloatToStr(Result.PartialRotaryFactor) + '.');
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    Field := Obj.Find('rope_scaling');
+    if (Field <> nil) and not Field.IsNull then
+      ImportError('Phi import: config carries a non-null ' +
+        '"rope_scaling" - long-context RoPE scaling is not wired into ' +
+        'this importer yet.');
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    HiddenAct := Obj.Get('hidden_act', 'gelu_new');
+    if HiddenAct = 'gelu' then
+      Result.HiddenActTanh := False // exact erf form
+    else if (HiddenAct = 'gelu_new') or
+            (HiddenAct = 'gelu_pytorch_tanh') then
+      Result.HiddenActTanh := True // the Phi default
+    else
+      ImportError('Phi import: config hidden_act "' + HiddenAct +
+        '" is not supported - only "gelu" (exact), "gelu_new" and ' +
+        '"gelu_pytorch_tanh" are wired here.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function PhiConfigToString(const Config: TPhiConfig): string;
+begin
+  Result := 'phi config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', partial_rotary=' + FloatToStr(Config.PartialRotaryFactor) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.HiddenActTanh then
+    Result := Result + ', act=gelu_tanh'
+  else
+    Result := Result + ', act=gelu_exact';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+// Loads a Phi q_proj/k_proj nn.Linear ([Hidden, Hidden] weight + [Hidden]
+// bias) whose first RotaryDims rows PER HEAD are PERMUTED from HF's
+// rotate_half layout (first-half / second-half within the rotary slice)
+// into TNNetRotaryEmbedding's interleaved (even/odd) pair layout - the
+// same permutation LoadGPTNeoXQKVWeights composes into its fused slab,
+// here applied to a separate projection. Rows beyond the rotary slice
+// (the pass-through tail) and the bias entries follow the same row map.
+procedure LoadPhiPartialRotaryLinearWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  Hidden, HeadDim, RotaryDims: integer);
+var
+  W, B: TNNetVolume;
+  r, i, HeadIdx, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Phi import: missing tensor "' + WName + '".');
+  if not Reader.HasTensor(BName) then
+    ImportError('Phi import: missing tensor "' + BName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> Hidden) or
+     (Reader.DimSize(WName, 1) <> Hidden) then
+    ImportError('Phi import: "' + WName + '" must have shape [' +
+      IntToStr(Hidden) + ', ' + IntToStr(Hidden) + '] (nn.Linear ' +
+      'stores [out, in]), got ' + Reader.ShapeAsString(WName));
+  if (Reader.DimCount(BName) <> 1) or
+     (Reader.DimSize(BName, 0) <> Hidden) then
+    ImportError('Phi import: "' + BName + '" must have shape [' +
+      IntToStr(Hidden) + '], got ' + Reader.ShapeAsString(BName));
+  if Layer.Neurons.Count <> Hidden then
+    ImportError('Phi import: internal error - layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(Hidden) + '.');
+  RotHalf := RotaryDims div 2;
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    for r := 0 to Hidden - 1 do
+    begin
+      HeadIdx := r div HeadDim;
+      RowInHead := r mod HeadDim;
+      // rotate_half -> interleaved permutation, RESTRICTED to the first
+      // RotaryDims rows of the head (the partial-rotary slice).
+      TargetRow := RowInHead;
+      if RowInHead < RotaryDims then
+      begin
+        if RowInHead < RotHalf then
+          TargetRow := 2 * RowInHead
+        else
+          TargetRow := 2 * (RowInHead - RotHalf) + 1;
+      end;
+      TargetIdx := HeadIdx * HeadDim + TargetRow;
+      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+        ImportError('Phi import: internal error - neuron ' +
+          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
+          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          ' weights, expected ' + IntToStr(Hidden) + '.');
+      for i := 0 to Hidden - 1 do
+        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      Layer.Neurons[TargetIdx].BiasWeight := B.FData[r];
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+type
+  TPhiBlockLayers = record
+    LN1, QProj, KProj, VProj, AttnDense, Fc1, Fc2: TNNetLayer;
+  end;
+
+function BuildPhiFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TPhiConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TPhiBlockLayers;
+  EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
+  BranchInput, SharedLN, AttnOut, MlpOut: TNNetLayer;
+  RotSlice, PassSlice, QHead, KHead, VHead, HeadPack: TNNetLayer;
+  GELUSource, PhiBranch: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  RotChannels, PassChannels, VChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, HeadDim, RotaryDims, i, d: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // x*Phi(x), the exact erf GELU, composed from existing layers exactly
+  // like the BERT path (see the BERT IMPORT section of the unit header).
+  // Phi configs use gelu_new (the tanh TNNetGELU) in practice.
+  procedure AddExactOrTanhGELU;
+  begin
+    if Config.HiddenActTanh then
+      NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
+    else
+    begin
+      GELUSource := NN.GetLastLayer();
+      NN.AddLayerAfter(
+        TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
+      NN.AddLayer( TNNetErf.Create() );
+      NN.AddLayer( TNNetAddConstant.Create(1.0) );
+      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
+      NN.AddLayer( TNNetReGLU.Create() );
+    end;
+  end;
+
+begin
+  Reader := TNNetSafeTensorsReader.Create(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('Phi import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('Phi import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if (Config.PartialRotaryFactor <= 0) or
+         (Config.PartialRotaryFactor > 1) then
+        ImportError('Phi import: partial_rotary_factor must be in (0, 1].');
+      // HF: rotary_ndims = int(head_dim * partial_rotary_factor).
+      RotaryDims := Trunc(HeadDim * Config.PartialRotaryFactor);
+      if (RotaryDims < 2) or Odd(RotaryDims) then
+        ImportError('Phi import: rotary_ndims = int(head_dim * ' +
+          'partial_rotary_factor) = ' + IntToStr(RotaryDims) +
+          ' must be an even number >= 2 (RoPE rotates channel pairs).');
+      if Config.TieWordEmbeddings then
+        ImportError('Phi import: tie_word_embeddings=true is not ' +
+          'supported - Phi carries an UNTIED lm_head with its own ' +
+          'bias (every published Phi config is untied).');
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Phi import: neither "model.embed_tokens.weight" ' +
+          'nor "embed_tokens.weight" found in ' + Reader.FileName +
+          ' - not a Phi checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embed_tokens.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Phi import: embed_tokens.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+      // lm_head sits OUTSIDE the model. prefix in PhiForCausalLM exports
+      // (like the GPT-J path) and has a BIAS.
+      if not Reader.HasTensor('lm_head.weight') then
+        ImportError('Phi import: "lm_head.weight" is missing from ' +
+          Reader.FileName + ' - a bare PhiModel export carries no LM ' +
+          'head.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('Phi import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real BPE token, not padding.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(RotChannels, RotaryDims);
+      SetLength(PassChannels, HeadDim - RotaryDims);
+      SetLength(VChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // SHARED-LN PARALLEL residual: ONE LayerNorm (input_layernorm)
+        // feeds BOTH the attention and the MLP branch; one fused 3-input
+        // sum closes the block:  x := x + Attn(LN(x)) + MLP(LN(x))
+        BranchInput := NN.GetLastLayer();
+        SharedLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].LN1 := SharedLN;
+        // SEPARATE BIASED q/k/v projections (plain nn.Linear), all
+        // reading the shared LN output.
+        Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+        Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          // PARTIAL ROTARY per head: RoPE on the first RotaryDims channels
+          // of the Q and K head, pass-through on the rest. Phi pairs the
+          // rotary channels rotate_half-style (k with k + RotaryDims/2),
+          // so the q/k projection rows were PERMUTED at load time into
+          // TNNetRotaryEmbedding's interleaved layout (see
+          // LoadPhiPartialRotaryLinearWeights). The rotary slice feeds a
+          // depth-RotaryDims TNNetRotaryEmbedding, so the layer's
+          // frequency schedule theta^(-2k/RotaryDims) matches HF's
+          // inv_freq over rotary_ndims exactly.
+          for d := 0 to RotaryDims - 1 do
+            RotChannels[d] := HeadCnt * HeadDim + d;
+          for d := 0 to HeadDim - RotaryDims - 1 do
+            PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
+          RotSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(RotChannels),
+            Blocks[BlockCnt].QProj);
+          RotSlice := NN.AddLayerAfter(
+            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+          if HeadDim > RotaryDims then
+          begin
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels),
+              Blocks[BlockCnt].QProj);
+            QHead := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+            QHead := RotSlice;
+          RotSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(RotChannels),
+            Blocks[BlockCnt].KProj);
+          RotSlice := NN.AddLayerAfter(
+            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+          if HeadDim > RotaryDims then
+          begin
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels),
+              Blocks[BlockCnt].KProj);
+            KHead := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+            KHead := RotSlice;
+          // V head (one contiguous head_dim-wide slice; never rotated).
+          for d := 0 to HeadDim - 1 do
+            VChannels[d] := HeadCnt * HeadDim + d;
+          VHead := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(VChannels), Blocks[BlockCnt].VProj);
+          // Pack [Q_h | K_h | V_h] (width 3*head_dim) for the scaled SDPA
+          // (Phi uses the standard 1/sqrt(head_dim) scaling).
+          HeadPack := NN.AddLayer(
+            TNNetDeepConcat.Create([QHead, KHead, VHead]) );
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim,
+              {CausalMask=}true), HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].AttnDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        AttnOut := NN.GetLastLayer();
+        // MLP branch: reads the SAME shared LN output (NOT a second norm,
+        // NOT the attention output - Phi is always parallel).
+        Blocks[BlockCnt].Fc1 := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize),
+          SharedLN);
+        AddExactOrTanhGELU;
+        Blocks[BlockCnt].Fc2 := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        MlpOut := NN.GetLastLayer();
+        NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        // embed_tokens -> embedding table (vocab rows of d floats).
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Phi import: embed_tokens.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+      finally
+        Tmp.Free;
+      end;
+      // UNTIED head WITH a bias (like the GPT-J path).
+      LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+        Config.HiddenSize, Config.VocabSize, 0, -1, 0, 'lm_head.bias');
+      MarkConsumed('lm_head.weight');
+      MarkConsumed('lm_head.bias');
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'self_attn.';
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN1,
+          BlockPrefix + 'input_layernorm.weight',
+          BlockPrefix + 'input_layernorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        MarkConsumed(BlockPrefix + 'input_layernorm.bias');
+        // Biased q/k with the partial-rotary rotate_half permutation
+        // composed in; v and dense load straight (with their biases).
+        LoadPhiPartialRotaryLinearWeights(Reader, Blocks[BlockCnt].QProj,
+          AttnPrefix + 'q_proj.weight', AttnPrefix + 'q_proj.bias',
+          Config.HiddenSize, HeadDim, RotaryDims);
+        MarkConsumed(AttnPrefix + 'q_proj.weight');
+        MarkConsumed(AttnPrefix + 'q_proj.bias');
+        LoadPhiPartialRotaryLinearWeights(Reader, Blocks[BlockCnt].KProj,
+          AttnPrefix + 'k_proj.weight', AttnPrefix + 'k_proj.bias',
+          Config.HiddenSize, HeadDim, RotaryDims);
+        MarkConsumed(AttnPrefix + 'k_proj.weight');
+        MarkConsumed(AttnPrefix + 'k_proj.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+          AttnPrefix + 'v_proj.weight', Config.HiddenSize,
+          Config.HiddenSize, 0, -1, 0, AttnPrefix + 'v_proj.bias');
+        MarkConsumed(AttnPrefix + 'v_proj.weight');
+        MarkConsumed(AttnPrefix + 'v_proj.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
+          AttnPrefix + 'dense.weight', Config.HiddenSize,
+          Config.HiddenSize, 0, -1, 0, AttnPrefix + 'dense.bias');
+        MarkConsumed(AttnPrefix + 'dense.weight');
+        MarkConsumed(AttnPrefix + 'dense.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc1,
+          BlockPrefix + 'mlp.fc1.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'mlp.fc1.bias');
+        MarkConsumed(BlockPrefix + 'mlp.fc1.weight');
+        MarkConsumed(BlockPrefix + 'mlp.fc1.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
+          BlockPrefix + 'mlp.fc2.weight', Config.IntermediateSize,
+          Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'mlp.fc2.bias');
+        MarkConsumed(BlockPrefix + 'mlp.fc2.weight');
+        MarkConsumed(BlockPrefix + 'mlp.fc2.bias');
+      end;
+      LoadLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'final_layernorm.weight',
+        Config.Prefix + 'final_layernorm.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'final_layernorm.weight');
+      MarkConsumed(Config.Prefix + 'final_layernorm.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      // Every tensor must be consumed or be a known ignorable buffer:
+      //  - rotary_emb.inv_freq: RoPE buffers some transformers versions
+      //    persist (structural, rebuilt from the config's base).
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if Pos('rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
+        ImportError('Phi import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildPhiFromSafeTensorsEx(const FileName: string;
+  out Config: TPhiConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadPhiConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildPhiFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildPhiFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TPhiConfig;
+begin
+  Result := BuildPhiFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly);
+end;
+
 // ============================ BERT IMPORT ==================================
 
 function ReadBertConfigFromJSONFile(const FileName: string): TBertConfig;
@@ -3881,6 +4491,7 @@ var
   IgnoredGPTNeoConfig: TGPTNeoConfig;
   IgnoredGPTNeoXConfig: TGPTNeoXConfig;
   IgnoredGPTJConfig: TGPTJConfig;
+  IgnoredPhiConfig: TPhiConfig;
   IgnoredBertConfig: TBertConfig;
 begin
   // ---- resolve the weights file and the config.json ----
@@ -3943,6 +4554,9 @@ begin
   else if ModelType = 'gptj' then
     Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
+  else if ModelType = 'phi' then
+    Result := BuildPhiFromSafeTensorsEx(WeightsPath, IgnoredPhiConfig,
+      pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') then
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
@@ -3961,7 +4575,7 @@ begin
     Result := nil;
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
-      'model_types: gpt2, gpt_neo, gpt_neox, gptj, llama, mistral, ' +
+      'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
       'qwen2, qwen3, bert, distilbert, roberta.');
   end;
 end;

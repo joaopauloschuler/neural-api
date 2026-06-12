@@ -83,6 +83,8 @@ type
     procedure TestGPTNeoXSequentialLogitParity;
     procedure TestGPTJConfigFromJSONFile;
     procedure TestGPTJLogitParity;
+    procedure TestPhiConfigFromJSONFile;
+    procedure TestPhiLogitParity;
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
@@ -1536,6 +1538,67 @@ begin
     AssertEquals('prefix', 'transformer.', Config.Prefix);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gptj_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestPhiConfigFromJSONFile;
+var
+  Config: TPhiConfig;
+begin
+  RandSeed := 424242;
+  Config := ReadPhiConfigFromJSONFile(
+    FixturePath('tiny_phi_config.json'));
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  // 24, deliberately NOT 4*hidden in the fixture.
+  AssertEquals('intermediate_size', 24, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('max_position_embeddings', 16, Config.MaxPositions);
+  AssertEquals('layer_norm_eps', 1e-5, Config.LayerNormEps, 1e-9);
+  AssertEquals('partial_rotary_factor', 0.5,
+    Config.PartialRotaryFactor, 1e-9);
+  AssertEquals('rope_theta', 10000.0, Config.RopeTheta, 1e-6);
+  AssertFalse('tie_word_embeddings (Phi untied)',
+    Config.TieWordEmbeddings);
+  AssertTrue('hidden_act gelu_new = tanh form', Config.HiddenActTanh);
+end;
+
+// Verifies the Phi (phi-1/phi-1_5/phi-2 architecture) import:
+// tests/fixtures/tiny_phi.* is a pico randomly-initialized HF
+// PhiForCausalLM (2 layers, 2 heads x 8 dims, hidden 16, intermediate 24
+// deliberately != 4*hidden, vocab 11) covering the Phi quirks: SHARED-LN
+// parallel residual (ONE input_layernorm feeds both branches,
+// x + Attn(LN(x)) + MLP(LN(x))), PARTIAL rotary with the NeoX rotate_half
+// pair layout (partial_rotary_factor=0.5 -> RoPE on the first 4 of 8 head
+// dims, q/k rows PERMUTED at load time; the generator
+// tools/phi_tiny_fixture.py asserts factors 0.25 and 1.0 would both
+// change the logits), SEPARATE BIASED q/k/v + dense projections, biased
+// mlp fc1/fc2 with gelu_new and the UNTIED lm_head WITH bias. Reference
+// logits come from HF transformers in float64.
+procedure TTestNeuralPretrained.TestPhiLogitParity;
+var
+  NN: TNNet;
+  Config: TPhiConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildPhiFromSafeTensorsEx(
+    FixturePath('tiny_phi.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_phi_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertEquals('partial_rotary_factor', 0.5,
+      Config.PartialRotaryFactor, 1e-9);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_phi_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;
