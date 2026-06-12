@@ -456,6 +456,33 @@ rather than acted on.
       instruction-tuned, so it doubles as the first imported model the
       BLEU/ROUGE metrics can score out of the box. Same HF-parity fixture
       verification as GPT-2/Llama.
+- [ ] Marian / OPUS-MT translation importer (Helsinki-NLP/opus-mt-en-de
+      etc., ~77M params per language pair, 1000+ published pairs — the
+      de-facto open machine-translation checkpoints and the first
+      DEDICATED-translation family; MT is a headline NLP capability the
+      repo has zero coverage of today). Architecturally distinct from the
+      in-flight T5 importer, not a re-skin: POST-norm encoder-decoder
+      blocks (norm after the residual add, vs T5's pre-RMSNorm), STATIC
+      sinusoidal positions (TNNetSinusoidalPositionalEmbedding is landed;
+      no learned/relative positions), swish/SiLU FFN, plain biased
+      LayerNorm, shared source/target embedding matrix tied to the LM
+      head PLUS Marian's final_logits_bias vector folded into the head
+      bias, and decoder_start_token_id = pad. Cross-attention rides the
+      landed TNNetCrossAttention asymmetric mode. Work is the
+      BuildMarianFromSafeTensors weight map in
+      neural/neuralpretrained.pas (config.json: d_model /
+      encoder_layers / decoder_layers / decoder_start_token_id) +
+      BuildFromPretrained dispatch for MarianMTModel. Tokenizer caveat:
+      opus-mt pairs ship source.spm/target.spm SentencePiece-Unigram
+      files without tokenizer.json, so END-TO-END text translation
+      depends on the open Unigram/.spm-protobuf tokenizer task — but the
+      importer + parity fixture work today with pinned token ids
+      (sliced pico fixture vs transformers MarianMTModel float64 oracle,
+      same make-pico recipe as GPT-2/Llama: encoder hidden states +
+      decoder logits). Natural consumer of the open seq2seq
+      generation-harness task, and the first checkpoint the landed
+      CorpusBLEU can score on REAL translation; headline demo once the
+      tokenizer lands: examples/TranslateOffline EN→DE on CPU.
 - [X] DistilBERT / RoBERTa ForSequenceClassification head deltas: the
       landed BuildBertForSequenceClassificationFromSafeTensors (4f0e2c1)
       explicitly rejects non-bfBert families because their classifier
