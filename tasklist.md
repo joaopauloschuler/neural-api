@@ -91,9 +91,24 @@ rather than acted on.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] ONNX import
 - [ ] Gemma 4 import
-- [ ] Qwen 3 import
+- [X] Qwen 3 import
 - [ ] Qwen 3.5 import
 - [ ] Phi-4-mini import
+- [ ] CLIP import — first VISION-LANGUAGE importer: BuildClipFromSafeTensors
+      for openai/clip-vit-base-patch32 (or SigLIP, whichever maps cleaner).
+      Both towers are plain pre-norm transformer encoders the library already
+      has every primitive for: text side = embedding + causal SDPA blocks +
+      final LayerNorm + EOS-token pooling + projection; vision side = patch
+      embedding as TNNetConvolutionLinear(stride=patch_size) + class-token
+      concat + learned positional embedding + bidirectional SDPA blocks +
+      projection — the vision tower doubles as the repo's first ViT, reusable
+      later for ViT/DINO/SigLIP imports. Deliverables: importer with the usual
+      config-JSON dispatch + .bin fallback, pico parity fixture via
+      make_pico_*_fixture.py asserting both embedding towers against HF,
+      L2-normalized dot-product similarity helper (the sentence-embedding
+      mean-pool helper in neuralpretrained.pas is the in-repo precedent), and
+      a zero-shot image classification example (CIFAR-10 class-name prompts,
+      no training) — ties the library's CV roots to the NLP/importer stack.
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
