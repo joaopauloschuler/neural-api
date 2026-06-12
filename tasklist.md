@@ -449,7 +449,7 @@ rather than acted on.
       sits INSIDE the residual branch (normalize sublayer output before
       the add). Reusable beyond Gemma (several recent models adopt
       sandwich norms).
-- [ ] Gemma 2 - BuildGemma2FromSafeTensors importer (the Gemma-1 importer
+- [X] Gemma 2 - BuildGemma2FromSafeTensors importer (the Gemma-1 importer
       landed 2026-06-12 — BuildGemmaFromSafeTensors; still depends on the
       two Gemma-2 tasks above): alternating local(4096)/
       global attention via the landed sliding-window SDPA (same alternating

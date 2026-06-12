@@ -23,6 +23,12 @@ unit neuralpretrained;
 //     sqrt(hidden_size) - folded into the embedding rows, NOT the tied LM
 //     head; always-tied head; 2B is MQA via num_key_value_heads=1, 7B uses
 //     the decoupled head_dim=256) - BuildGemmaFromSafeTensors.
+//   - Gemma 2 (the Gemma-1 skeleton + alternating local/global attention
+//     via the SDPA sliding window on even layers; query_pre_attn_scalar
+//     folded into W_q; attention-logit soft-capping inside SDPA;
+//     final-logit soft-capping via TNNetSoftCapping; sandwich norms - 4
+//     RMSNorms per block with the post-norms inside the residual
+//     branches) - BuildGemma2FromSafeTensors.
 //   - GPT-Neo (EleutherAI's GPT-3 replica; the roneneldan/TinyStories
 //     checkpoints share this architecture) - BuildGPTNeoFromSafeTensors.
 //     See the GPT-NEO IMPORT section below.
@@ -516,6 +522,23 @@ type
     EmbedScale: TNeuralFloat;  // embedding-output scale folded into the
                                // embedding rows at load (Gemma: sqrt(d));
                                // 0 or 1 = off
+    // ---- Gemma-2 deltas (all default off/0 for the other families) ----
+    QueryPreAttnScalar: TNeuralFloat; // attention scores scaled by
+                               // 1/sqrt(query_pre_attn_scalar) instead of
+                               // 1/sqrt(head_dim); folded into W_q at load
+                               // (0 = off)
+    AttnLogitSoftCap: TNeuralFloat;  // attn_logit_softcapping: pre-softmax
+                               // scores squashed to cap*tanh(s/cap) inside
+                               // every SDPA head (0 = off)
+    FinalLogitSoftCap: TNeuralFloat; // final_logit_softcapping: LM-head
+                               // logits squashed to cap*tanh(l/cap) by a
+                               // TNNetSoftCapping layer (0 = off)
+    SandwichNorm: boolean;     // sandwich norms: post-attention and
+                               // post-feedforward RMSNorms INSIDE each
+                               // residual branch (4 norms per block)
+    AltSlidingWindow: boolean; // alternating local/global attention: the
+                               // sliding window applies to EVEN layers
+                               // (0, 2, ...) only; odd layers attend fully
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -628,6 +651,32 @@ function BuildGemmaFromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildGemmaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+// Gemma 2: the Gemma-1 skeleton (GeGLU MLP, zero-centered RMSNorm,
+// sqrt(d) embedding scale, tied head) with five further deltas:
+// (a) ALTERNATING local/global attention - config sliding_window (HF
+//     default 4096) masks EVEN layers (0, 2, ...) with the banded causal
+//     sliding window; odd layers attend over the full context (the
+//     transformers Gemma2Config layer_types default);
+// (b) query_pre_attn_scalar (e.g. 224 on 27B; HF default 256) replaces
+//     head_dim in the attention score scaling - folded into W_q at load;
+// (c) attention-logit soft-capping (attn_logit_softcapping, typically
+//     50.0): pre-softmax scores squashed to cap*tanh(s/cap) inside every
+//     SDPA head (the TNNetScaledDotProductAttention ScoreSoftCap hook);
+// (d) final-logit soft-capping (final_logit_softcapping, typically 30.0):
+//     a plain TNNetSoftCapping on the LM-head logits;
+// (e) sandwich norms - 4 RMSNorms per block: input_layernorm /
+//     post_attention_layernorm around attention and
+//     pre_feedforward_layernorm / post_feedforward_layernorm around the
+//     FFN, with each post-norm INSIDE its residual branch.
+// Thin wrappers over the Llama path that ASSERT model_type is 'gemma2'.
+function BuildGemma2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildGemma2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
 type
@@ -1718,7 +1767,7 @@ var
   Root: TJSONData;
   Obj: TJSONObject;
   ModelType, HiddenAct: string;
-  RopeScaling, HeadDimField, SlidingWindowField: TJSONData;
+  RopeScaling, HeadDimField, SlidingWindowField, FloatField: TJSONData;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -1753,10 +1802,11 @@ begin
     ModelType := Obj.Get('model_type', 'llama');
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
-       (ModelType <> 'gemma') then
+       (ModelType <> 'gemma') and (ModelType <> 'gemma2') then
       ImportError('Llama import: config model_type is "' + ModelType +
-        '" - only "llama", "mistral", "qwen2", "qwen3" and "gemma" are ' +
-        'supported here (see BuildFromPretrained for the full dispatch).');
+        '" - only "llama", "mistral", "qwen2", "qwen3", "gemma" and ' +
+        '"gemma2" are supported here (see BuildFromPretrained for the ' +
+        'full dispatch).');
     RopeScaling := Obj.Find('rope_scaling');
     if (RopeScaling <> nil) and not RopeScaling.IsNull then
       ImportError('Llama import: config carries a non-null "rope_scaling" - ' +
@@ -1771,10 +1821,11 @@ begin
     Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
     Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
     Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
-    // Gemma ALWAYS ties the LM head to the embedding (the HF GemmaConfig
-    // default is tie_word_embeddings=true); the other families default off.
-    Result.TieWordEmbeddings :=
-      Obj.Get('tie_word_embeddings', ModelType = 'gemma');
+    // Gemma ALWAYS ties the LM head to the embedding (the HF GemmaConfig /
+    // Gemma2Config default is tie_word_embeddings=true); the other families
+    // default off.
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings',
+      (ModelType = 'gemma') or (ModelType = 'gemma2'));
     // An explicit head_dim is honored even when it is DECOUPLED from
     // hidden_size/num_attention_heads (Qwen3-0.6B: head_dim=128 with
     // hidden=1024, heads=16). Absent/null leaves HeadDim=0 and the builder
@@ -1795,6 +1846,11 @@ begin
     Result.GegluFFN := False;
     Result.RMSNormAddOne := False;
     Result.EmbedScale := 1.0;
+    Result.QueryPreAttnScalar := 0;
+    Result.AttnLogitSoftCap := 0;
+    Result.FinalLogitSoftCap := 0;
+    Result.SandwichNorm := False;
+    Result.AltSlidingWindow := False;
     if ModelType = 'mistral' then
     begin
       // Many Mistral configs ship sliding_window=null (full attention).
@@ -1824,11 +1880,12 @@ begin
         ImportError('Llama import: Qwen3 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
     end
-    else if ModelType = 'gemma' then
+    else if (ModelType = 'gemma') or (ModelType = 'gemma2') then
     begin
       // Gemma-1 deltas (all load-time; see the BuildGemmaFromSafeTensors
       // interface comment): gated-GELU MLP, zero-centered RMSNorm and the
-      // sqrt(d_model) embedding-output scale.
+      // sqrt(d_model) embedding-output scale. Gemma-2 keeps all three and
+      // adds its own deltas below.
       Result.GegluFFN := True;
       Result.RMSNormAddOne := True;
       Result.EmbedScale := Sqrt(Result.HiddenSize);
@@ -1846,6 +1903,63 @@ begin
         ImportError('Llama import: Gemma hidden activation "' + HiddenAct +
           '" is not supported - expected gelu / gelu_new / ' +
           'gelu_pytorch_tanh (Gemma''s MLP is gated GELU).');
+      if ModelType = 'gemma2' then
+      begin
+        // Gemma-2 deltas on top of the Gemma-1 skeleton:
+        // (a) alternating local/global attention - sliding_window (HF
+        //     default 4096) applies to EVEN layers only (transformers'
+        //     Gemma2Config layer_types default: "sliding_attention" for
+        //     bool((i+1) % 2), i.e. layers 0, 2, ...);
+        // (b) query_pre_attn_scalar (HF default 256) replaces head_dim in
+        //     the attention score scaling - folded into W_q at load;
+        // (c) attention-logit soft-capping (attn_logit_softcapping, HF
+        //     default 50.0; null = off) inside every SDPA head;
+        // (d) final-logit soft-capping (final_logit_softcapping, HF
+        //     default 30.0; null = off) on the LM-head logits;
+        // (e) sandwich norms - post_attention_layernorm and
+        //     post_feedforward_layernorm INSIDE the residual branches.
+        Result.SandwichNorm := True;
+        Result.AltSlidingWindow := True;
+        Result.SlidingWindow := 4096;
+        SlidingWindowField := Obj.Find('sliding_window');
+        if (SlidingWindowField <> nil) and not SlidingWindowField.IsNull then
+        begin
+          Result.SlidingWindow := SlidingWindowField.AsInteger;
+          if Result.SlidingWindow < 1 then
+            ImportError('Llama import: config sliding_window must be a ' +
+              'positive integer or null, got ' +
+              SlidingWindowField.AsJSON + '.');
+        end;
+        Result.QueryPreAttnScalar := 256;
+        FloatField := Obj.Find('query_pre_attn_scalar');
+        if (FloatField <> nil) and not FloatField.IsNull then
+        begin
+          Result.QueryPreAttnScalar := FloatField.AsFloat;
+          if Result.QueryPreAttnScalar <= 0 then
+            ImportError('Llama import: config query_pre_attn_scalar must ' +
+              'be positive, got ' + FloatField.AsJSON + '.');
+        end;
+        Result.AttnLogitSoftCap := 50.0;
+        FloatField := Obj.Find('attn_logit_softcapping');
+        if FloatField <> nil then
+        begin
+          if FloatField.IsNull then Result.AttnLogitSoftCap := 0
+          else Result.AttnLogitSoftCap := FloatField.AsFloat;
+          if Result.AttnLogitSoftCap < 0 then
+            ImportError('Llama import: config attn_logit_softcapping must ' +
+              'be positive or null, got ' + FloatField.AsJSON + '.');
+        end;
+        Result.FinalLogitSoftCap := 30.0;
+        FloatField := Obj.Find('final_logit_softcapping');
+        if FloatField <> nil then
+        begin
+          if FloatField.IsNull then Result.FinalLogitSoftCap := 0
+          else Result.FinalLogitSoftCap := FloatField.AsFloat;
+          if Result.FinalLogitSoftCap < 0 then
+            ImportError('Llama import: config final_logit_softcapping ' +
+              'must be positive or null, got ' + FloatField.AsJSON + '.');
+        end;
+      end;
     end
     else // llama
       Result.QKVBias := Obj.Get('attention_bias', False);
@@ -1883,6 +1997,19 @@ begin
     Result := Result + ', rmsnorm_add_one=true';
   if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
     Result := Result + ', embed_scale=' + FloatToStr(Config.EmbedScale);
+  if Config.QueryPreAttnScalar > 0 then
+    Result := Result + ', query_pre_attn_scalar=' +
+      FloatToStr(Config.QueryPreAttnScalar);
+  if Config.AttnLogitSoftCap > 0 then
+    Result := Result + ', attn_logit_softcapping=' +
+      FloatToStr(Config.AttnLogitSoftCap);
+  if Config.FinalLogitSoftCap > 0 then
+    Result := Result + ', final_logit_softcapping=' +
+      FloatToStr(Config.FinalLogitSoftCap);
+  if Config.SandwichNorm then
+    Result := Result + ', sandwich_norm=true';
+  if Config.AltSlidingWindow then
+    Result := Result + ', alt_sliding_window=true';
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -2057,6 +2184,9 @@ end;
 type
   TLlamaBlockLayers = record
     AttnNorm, QProj, KProj, VProj, OProj, MlpNorm, GateUp, Down: TNNetLayer;
+    // Sandwich norms (Gemma-2 SandwichNorm): post-attention and
+    // post-feedforward RMSNorms INSIDE the residual branches; nil otherwise.
+    PostAttnNorm, PostMlpNorm: TNNetLayer;
     // Per-head q/k RMSNorm copies (Qwen3 QKNorm); empty otherwise.
     QNorms, KNorms: array of TNNetLayer;
   end;
@@ -2074,8 +2204,8 @@ var
   KRotated, VSlices, HeadOutputs: array of TNNetLayer;
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
-  HeadDim, QWidth, KVWidth, i, j, d: integer;
-  NormGainOffset: TNeuralFloat;
+  HeadDim, QWidth, KVWidth, LayerWindow, i, j, d: integer;
+  NormGainOffset, QScale: TNeuralFloat;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr, LMHeadName: string;
   QBiasName, KBiasName, VBiasName: string;
@@ -2232,14 +2362,30 @@ begin
           // Config.SlidingWindow > 0 (Mistral) applies the same banded
           // causal sliding-window mask HF uses: query i attends keys j with
           // i - j < W (and j <= i from the causal mask). 0 = full attention.
+          // Config.AltSlidingWindow (Gemma-2) restricts the window to EVEN
+          // layers (transformers' layer_types default: "sliding_attention"
+          // for layers 0, 2, ...); odd layers attend over the full context.
+          // Config.AttnLogitSoftCap > 0 (Gemma-2) enables the pre-softmax
+          // attention-logit soft-cap cap*tanh(s/cap) inside every head.
+          if Config.AltSlidingWindow and Odd(BlockCnt) then
+            LayerWindow := 0
+          else
+            LayerWindow := Config.SlidingWindow;
           HeadOutputs[HeadCnt] := NN.AddLayerAfter(
             TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true,
-              {pWindow=}Config.SlidingWindow),
+              {pWindow=}LayerWindow,
+              {pScoreSoftCap=}Config.AttnLogitSoftCap),
             HeadPack);
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        // Config.SandwichNorm (Gemma-2): post-attention RMSNorm INSIDE the
+        // residual branch (HF post_attention_layernorm normalizes the
+        // attention output BEFORE the residual add).
+        if Config.SandwichNorm then
+          Blocks[BlockCnt].PostAttnNorm :=
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         // MLP sub-block: x := x + down(act(gate(h)) * up(h)), h = RMSNorm(x),
         // where act is SiLU (SwiGLU, the Llama default) or tanh-GELU (GeGLU,
@@ -2259,6 +2405,11 @@ begin
           NN.AddLayer( TNNetSwiGLU.Create() );
         Blocks[BlockCnt].Down := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        // Config.SandwichNorm (Gemma-2): post-feedforward RMSNorm INSIDE
+        // the residual branch (HF post_feedforward_layernorm).
+        if Config.SandwichNorm then
+          Blocks[BlockCnt].PostMlpNorm :=
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
       end;
@@ -2266,6 +2417,11 @@ begin
         TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
+      // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
+      // (HF applies it to the logits before any sampling softmax).
+      if Config.FinalLogitSoftCap > 0 then
+        NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
@@ -2273,6 +2429,18 @@ begin
       // (zero-centered checkpoint weights) - folded in by the loader.
       if Config.RMSNormAddOne then NormGainOffset := 1.0
       else NormGainOffset := 0;
+      // Config.QueryPreAttnScalar (Gemma-2): HF scales the attention scores
+      // by 1/sqrt(query_pre_attn_scalar) instead of SDPA's structural
+      // 1/sqrt(head_dim). Folded into W_q at load (the GPT-Neo unscaled-
+      // attention trick): scaling every q row by sqrt(head_dim/scalar)
+      // turns SDPA's 1/sqrt(head_dim) into the desired 1/sqrt(scalar).
+      // The fold commutes with the per-head rotate_half permutation and
+      // with RoPE (a rotation); it would NOT commute with a q-side RMSNorm,
+      // but no family combines QKNorm with QueryPreAttnScalar.
+      if Config.QueryPreAttnScalar > 0 then
+        QScale := Sqrt(HeadDim / Config.QueryPreAttnScalar)
+      else
+        QScale := 1.0;
       Tmp := TNNetVolume.Create;
       try
         // embed_tokens -> embedding table (vocab rows of d floats,
@@ -2340,7 +2508,7 @@ begin
         end;
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
           BlockPrefix + 'self_attn.q_proj.weight',
-          Config.HiddenSize, QWidth, 0, -1, HeadDim, QBiasName);
+          Config.HiddenSize, QWidth, 0, -1, HeadDim, QBiasName, QScale);
         MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
         if QBiasName <> '' then MarkConsumed(QBiasName);
         // Qwen3 per-head q/k RMSNorm: one shared [head_dim] gain per block,
@@ -2369,10 +2537,33 @@ begin
           BlockPrefix + 'self_attn.o_proj.weight',
           QWidth, Config.HiddenSize);
         MarkConsumed(BlockPrefix + 'self_attn.o_proj.weight');
-        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].MlpNorm,
-          BlockPrefix + 'post_attention_layernorm.weight', Config.HiddenSize,
-          NormGainOffset);
-        MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+        if Config.SandwichNorm then
+        begin
+          // Gemma-2 sandwich norms: post_attention_layernorm is the TRUE
+          // post-attention norm (inside the residual branch) and the FFN's
+          // pre-norm is pre_feedforward_layernorm; post_feedforward_layernorm
+          // closes the FFN branch.
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostAttnNorm,
+            BlockPrefix + 'post_attention_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].MlpNorm,
+            BlockPrefix + 'pre_feedforward_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'pre_feedforward_layernorm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostMlpNorm,
+            BlockPrefix + 'post_feedforward_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_feedforward_layernorm.weight');
+        end
+        else
+        begin
+          // Llama naming: post_attention_layernorm is the FFN's pre-norm.
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].MlpNorm,
+            BlockPrefix + 'post_attention_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+        end;
         // Fused gate/up: up_proj -> neurons 0..I-1 (SwiGLU's linear half),
         // gate_proj -> neurons I..2I-1 (SwiGLU's Swish-gated half).
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
@@ -5305,6 +5496,24 @@ begin
     pInferenceOnly);
 end;
 
+function BuildGemma2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'gemma2', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName);
+end;
+
+function BuildGemma2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildGemma2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly);
+end;
+
 function LoadPretrainedEmbedding(const FileName: string;
   Embedding: TNNetEmbedding; Tokenizer: TStringListInt;
   FreezeEmbedding: boolean = false): integer;
@@ -6722,10 +6931,13 @@ begin
       pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
-          (ModelType = 'gemma') then
+          (ModelType = 'gemma') or (ModelType = 'gemma2') then
     // 'gemma' (architectures ["GemmaForCausalLM"]) rides the same path: the
     // config reader raises the Gemma flags (GeGLU FFN, zero-centered
-    // RMSNorm, sqrt(d) embedding scale) from model_type alone.
+    // RMSNorm, sqrt(d) embedding scale) from model_type alone. 'gemma2'
+    // (["Gemma2ForCausalLM"]) adds the Gemma-2 deltas (alternating
+    // local/global attention, query_pre_attn_scalar, attention- and
+    // final-logit soft-capping, sandwich norms) the same way.
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
@@ -6762,7 +6974,7 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
-      'qwen2, qwen3, gemma, bert, distilbert, roberta.');
+      'qwen2, qwen3, gemma, gemma2, bert, distilbert, roberta.');
   end;
 end;
 

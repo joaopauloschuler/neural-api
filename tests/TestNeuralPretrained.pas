@@ -100,6 +100,7 @@ type
     procedure TestQwen2LogitParity;
     procedure TestQwen3LogitParity;
     procedure TestGemmaLogitParity;
+    procedure TestGemma2LogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
     procedure TestGPTNeoXConfigFromJSONFile;
@@ -1226,6 +1227,20 @@ begin
   Config.ModelType := 'llama';
   Config.SlidingWindow := 0;
   Config.QKVBias := false;
+  // Hand-filled record: EVERY field must be set explicitly (a local record
+  // is stack garbage otherwise - this used to leave HeadDim/QKNorm/
+  // GegluFFN/EmbedScale & friends uninitialized, the source of an
+  // intermittent AV in this test).
+  Config.HeadDim := 0;
+  Config.QKNorm := false;
+  Config.GegluFFN := false;
+  Config.RMSNormAddOne := false;
+  Config.EmbedScale := 1.0;
+  Config.QueryPreAttnScalar := 0;
+  Config.AttnLogitSoftCap := 0;
+  Config.FinalLogitSoftCap := 0;
+  Config.SandwichNorm := false;
+  Config.AltSlidingWindow := false;
   Config.Prefix := '';
   Failed := false;
   NN := nil;
@@ -1702,6 +1717,104 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gemma_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Gemma-2 import target: tests/fixtures/tiny_gemma2.* is a pico
+// randomly-initialized HF Gemma2ForCausalLM (2 layers, MQA, decoupled
+// head_dim=6 with hidden=8, vocab 13, tied lm_head) exercising every Gemma-2
+// delta on top of the Gemma-1 skeleton. The generator
+// tools/gemma2_tiny_fixture.py ASSERTS each delta is non-vacuous by re-running
+// the float64 oracle with that single delta disabled (max logit |diff|s:
+// sliding window 1.4e-1, query_pre_attn_scalar 2.2e-2, attention soft-cap
+// 3.6e-3, final soft-cap 6.2e-3 - all above the 1e-4 parity gate, so a
+// missing or misrouted delta FAILS this test):
+// (a) ALTERNATING local/global attention - sliding_window=4 on the EVEN
+//     layer only (layer 0 SDPA heads carry Window=4, layer 1 heads Window=0);
+// (b) query_pre_attn_scalar=12 != head_dim=6 folded into W_q at load;
+// (c) attention-logit soft-capping (5.0) via the SDPA ScoreSoftCap hook;
+// (d) final-logit soft-capping (0.5) via TNNetSoftCapping after the head;
+// (e) sandwich norms - 4 RMSNorms per block, post-norms inside the residual
+//     branches (all gains re-randomized to non-zero w by the generator).
+// Reference logits come from HF transformers in float64. The
+// BuildFromPretrained model_type "gemma2" dispatch route is covered too.
+procedure TTestNeuralPretrained.TestGemma2LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, SDPACnt, RMSNormCnt, SoftCapCnt: integer;
+  SDPA: TNNetScaledDotProductAttention;
+begin
+  RandSeed := 424242;
+  NN := BuildGemma2FromSafeTensorsEx(FixturePath('tiny_gemma2.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gemma2_config.json'));
+  try
+    AssertEquals('model_type', 'gemma2', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads (MQA)', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('head_dim', 6, Config.HeadDim);
+    AssertTrue('geglu_ffn', Config.GegluFFN);
+    AssertTrue('rmsnorm_add_one', Config.RMSNormAddOne);
+    AssertEquals('embed_scale=sqrt(8)', Sqrt(8), Config.EmbedScale, 1e-5);
+    AssertTrue('tied (Gemma always ties)', Config.TieWordEmbeddings);
+    AssertTrue('sandwich_norm', Config.SandwichNorm);
+    AssertTrue('alt_sliding_window', Config.AltSlidingWindow);
+    AssertEquals('sliding_window', 4, Config.SlidingWindow);
+    AssertEquals('query_pre_attn_scalar', 12.0,
+      Config.QueryPreAttnScalar, 1e-6);
+    AssertEquals('attn_logit_softcapping', 5.0,
+      Config.AttnLogitSoftCap, 1e-6);
+    AssertEquals('final_logit_softcapping', 0.5,
+      Config.FinalLogitSoftCap, 1e-6);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    // Structure: SDPA heads alternate Window=4 (layer 0, the first
+    // NumHeads SDPAs) / Window=0 (layer 1) and ALL carry the attention
+    // soft-cap; 4 sandwich RMSNorms per block + the final norm = 9; one
+    // TNNetSoftCapping caps the LM-head logits.
+    SDPACnt := 0;
+    RMSNormCnt := 0;
+    SoftCapCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+      begin
+        SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
+        if SDPACnt < Config.NumHeads then
+          AssertEquals('layer-0 SDPA head ' + IntToStr(SDPACnt) +
+            ' window (local)', 4, SDPA.Window)
+        else
+          AssertEquals('layer-1 SDPA head ' + IntToStr(SDPACnt) +
+            ' window (global)', 0, SDPA.Window);
+        AssertEquals('SDPA head ' + IntToStr(SDPACnt) + ' score soft-cap',
+          5.0, SDPA.ScoreSoftCap, 1e-6);
+        Inc(SDPACnt);
+      end;
+      if NN.Layers[LayerCnt] is TNNetTokenRMSNorm then Inc(RMSNormCnt);
+      if NN.Layers[LayerCnt] is TNNetSoftCapping then Inc(SoftCapCnt);
+    end;
+    AssertEquals('SDPA head count', 4, SDPACnt);
+    AssertEquals('sandwich RMSNorm count (4 per block + final)', 9,
+      RMSNormCnt);
+    AssertEquals('final-logit TNNetSoftCapping count', 1, SoftCapCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gemma2_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "gemma2" (architectures ["Gemma2ForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_gemma2.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gemma2_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gemma2_logits.json'), 16, 13);
   finally
     NN.Free;
   end;
