@@ -91,6 +91,9 @@ rather than acted on.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] ONNX import
 - [ ] Gemma 4 import
+- [ ] Qwen 3 import
+- [ ] Qwen 3.5 import
+- [ ] Phi-4-mini import
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
@@ -815,3 +818,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       with loss-difference direction >90% of the time across a small grid.
 - [ ] Coverage matrix at the top of TestNeuralNumerical.pas: per-class
       `[grad] [serialize]` block, written by a small script.
+
+# Examples
+- [ ] A chat terminal application with option to select the model to import
+      and inference parameters.
