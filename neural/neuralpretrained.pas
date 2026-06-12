@@ -373,6 +373,12 @@ unit neuralpretrained;
 //     Wired per token here (pooler + classifier as PointwiseConvLinear),
 //     so the net outputs (SeqLen,1,num_labels) and ROW 0 carries HF's
 //     class logits (the other rows have no HF meaning).
+//     DistilBertForSequenceClassification and
+//     RobertaForSequenceClassification pool the FIRST token too but use
+//     DIFFERENT stacks (and NO pooler): distilbert computes
+//     classifier(ReLU(pre_classifier(h[:, 0]))), roberta computes
+//     classifier.out_proj(tanh(classifier.dense(h[:, 0]))) over the <s>
+//     position. Same per-token wiring and ROW-0 convention here.
 //   - GPT2ForSequenceClassification pools the LAST non-pad token: the
 //     causal trunk only lets information flow left-to-right, so only the
 //     final position has seen the whole text. HF applies score.weight
@@ -388,8 +394,10 @@ unit neuralpretrained;
 // argument of the ...Ex builders); ClassIndexToLabel maps an argmax class
 // index to its label string ("LABEL_i" fallback, the HF default naming).
 // BuildFromPretrained dispatches on config.json's "architectures" array:
-// "BertForSequenceClassification" / "GPT2ForSequenceClassification" route
-// to these builders, anything else keeps the base-LM/encoder default.
+// "BertForSequenceClassification" / "DistilBertForSequenceClassification"
+// / "RobertaForSequenceClassification" / "GPT2ForSequenceClassification"
+// route to these builders, anything else keeps the base-LM/encoder
+// default.
 //
 // All importers FAIL LOUDLY (EPretrainedImportError) on missing tensors,
 // unexpected tensors and shape mismatches.
@@ -840,12 +848,15 @@ function BertConfigToString(const Config: TBertConfig): string;
 // table with Config.PositionOffset (= 2) rows skipped and caps SeqLen at
 // MaxPositions - PositionOffset; checkpoint position rows 0..1 are NEVER
 // read (see the ROBERTA paragraph of the unit header).
-// pSeqClsHead = True builds the BertForSequenceClassification variant
-// (bfBert only): the pooler is forced on and the classifier dense
-// (classifier.{weight,bias}, [num_labels, hidden]) is stacked on top, per
-// token, so the output is (SeqLen,1,num_labels) and ROW 0 (the [CLS]
-// position) carries HF's class logits (see the SEQUENCE CLASSIFICATION
-// IMPORT section). num_labels is inferred from classifier.weight.
+// pSeqClsHead = True builds the *ForSequenceClassification variant of the
+// family: bert forces the pooler on and stacks the classifier dense
+// (classifier.{weight,bias}, [num_labels, hidden]); distilbert stacks
+// pre_classifier + ReLU + classifier (no pooler); roberta stacks
+// classifier.dense + tanh + classifier.out_proj (no pooler). All wired
+// per token, so the output is (SeqLen,1,num_labels) and ROW 0 (the
+// [CLS] / <s> position) carries HF's class logits (see the SEQUENCE
+// CLASSIFICATION IMPORT section). num_labels is inferred from the final
+// classifier weight shape.
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
@@ -922,10 +933,13 @@ function ClassIndexToLabel(Id2Label: TStringList;
 procedure SelectTokenLogits(NetOutput: TNNetVolume; TokenPos: integer;
   Logits: TNNetVolume);
 
-// Builds the FULL BertForSequenceClassification stack: BERT encoder +
-// pooler (dense+tanh) + classifier dense, loading every weight including
-// classifier.{weight,bias}. Output (SeqLen,1,num_labels); ROW 0 (the [CLS]
-// position) carries HF's class logits. model_type must be 'bert'.
+// Builds the FULL *ForSequenceClassification stack of the BERT encoder
+// family (model_type 'bert', 'distilbert' or 'roberta'): the encoder
+// trunk plus the family's classifier head (bert: pooler dense+tanh +
+// classifier; distilbert: pre_classifier + ReLU + classifier; roberta:
+// classifier.dense + tanh + classifier.out_proj), loading every weight.
+// Output (SeqLen,1,num_labels); ROW 0 (the [CLS] / <s> position) carries
+// HF's class logits.
 // Id2Label, when non-nil, is CLEARED and filled with config.json's
 // id2label map (index-ordered; empty when the config has none).
 function BuildBertForSequenceClassificationFromSafeTensorsEx(
@@ -973,8 +987,10 @@ function BuildGPT2ForSequenceClassificationFromSafeTensors(
 // roberta - (SeqLen,1,hidden_size) final hidden states out, pooler NOT
 // included - call BuildBertFromSafeTensors directly for the pooler head;
 // bert/roberta only). FINE-TUNED CLASSIFIERS: when config.json's
-// "architectures" array names BertForSequenceClassification (model_type
-// bert) or GPT2ForSequenceClassification (model_type gpt2), the dispatch
+// "architectures" array names BertForSequenceClassification,
+// DistilBertForSequenceClassification, RobertaForSequenceClassification
+// (model_types bert/distilbert/roberta) or
+// GPT2ForSequenceClassification (model_type gpt2), the dispatch
 // routes to the classifier builders instead and the net outputs
 // (SeqLen,1,num_labels) class logits (row 0 / last non-pad row, see the
 // SEQUENCE CLASSIFICATION IMPORT section); the LM/encoder stays the
@@ -4174,7 +4190,8 @@ var
   NN: TNNet;
   Blocks: array of TBertBlockLayers;
   InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN: TNNetLayer;
-  PoolerDense, ClassifierDense: TNNetLayer;
+  PoolerDense, ClassifierDense, ClsHeadDense: TNNetLayer;
+  ClsHeadName, ClsOutName: string;
   IncludePooler: boolean;
   BranchInput, SliceLayer, HiddenAct, PhiBranch: TNNetLayer;
   BlockCnt, SeqLen, UsablePositions, NumLabels, i: integer;
@@ -4249,13 +4266,12 @@ begin
       if (Config.Family = bfDistilBert) and pIncludePooler then
         ImportError('BERT import: DistilBERT has no pooler head - ' +
           'pIncludePooler is not available for model_type "distilbert".');
-      if pSeqClsHead and (Config.Family <> bfBert) then
-        ImportError('BERT import: the sequence-classification head is ' +
-          'only wired for model_type "bert" (the pooler-based ' +
-          'BertForSequenceClassification head; distilbert/roberta use ' +
-          'different classifier stacks).');
-      // The classifier sits on tanh(pooler(h)): the head forces the pooler.
-      IncludePooler := pIncludePooler or pSeqClsHead;
+      // Only the bert classifier sits on tanh(pooler(h)) - that head
+      // forces the pooler. DistilBERT (pre_classifier + ReLU) and RoBERTa
+      // (classifier.dense + tanh + classifier.out_proj) classify the raw
+      // [CLS] / <s> hidden state: no pooler exists in those checkpoints.
+      IncludePooler := pIncludePooler or
+        (pSeqClsHead and (Config.Family = bfBert));
       // The plain *Model classes serialize without a prefix; *For* exports
       // carry "bert." / "distilbert." / "roberta.". Support both.
       if Config.Family = bfDistilBert then
@@ -4379,21 +4395,54 @@ begin
         NN.AddLayer( TNNetHyperbolicTangent.Create() );
       end;
       ClassifierDense := nil;
+      ClsHeadDense := nil;
       NumLabels := 0;
       if pSeqClsHead then
       begin
-        // BertForSequenceClassification: classifier dense on the pooled
-        // output, per token; row 0 ([CLS]) carries HF's class logits.
-        if not Reader.HasTensor('classifier.weight') then
-          ImportError('BERT import: missing tensor "classifier.weight" - ' +
-            'not a BertForSequenceClassification checkpoint?');
-        if (Reader.DimCount('classifier.weight') <> 2) or
-           (Reader.DimSize('classifier.weight', 1) <> Config.HiddenSize) then
-          ImportError('BERT import: "classifier.weight" must have shape ' +
-            '[num_labels, ' + IntToStr(Config.HiddenSize) + '] (nn.Linear ' +
-            'stores [out, in]), got ' +
-            Reader.ShapeAsString('classifier.weight'));
-        NumLabels := Reader.DimSize('classifier.weight', 0);
+        // Family-specific *ForSequenceClassification stacks, all wired PER
+        // TOKEN so row 0 (the [CLS] / <s> position) carries HF's logits:
+        //   bert:       classifier(tanh(pooler(h)))         (pooler above)
+        //   distilbert: classifier(ReLU(pre_classifier(h))) (no pooler)
+        //   roberta:    classifier.out_proj(tanh(classifier.dense(h)))
+        if Config.Family = bfDistilBert then
+        begin
+          ClsHeadName := 'pre_classifier';
+          ClsOutName := 'classifier';
+        end
+        else if Config.Family = bfRoberta then
+        begin
+          ClsHeadName := 'classifier.dense';
+          ClsOutName := 'classifier.out_proj';
+        end
+        else
+        begin
+          ClsHeadName := ''; // bert: the pooler already played this role
+          ClsOutName := 'classifier';
+        end;
+        if ClsHeadName <> '' then
+        begin
+          if not Reader.HasTensor(ClsHeadName + '.weight') then
+            ImportError('BERT import: missing tensor "' + ClsHeadName +
+              '.weight" - not a *ForSequenceClassification checkpoint of ' +
+              'this family?');
+          ClsHeadDense := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          if Config.Family = bfDistilBert then
+            NN.AddLayer( TNNetReLU.Create() )
+          else
+            NN.AddLayer( TNNetHyperbolicTangent.Create() );
+        end;
+        if not Reader.HasTensor(ClsOutName + '.weight') then
+          ImportError('BERT import: missing tensor "' + ClsOutName +
+            '.weight" - not a *ForSequenceClassification checkpoint?');
+        if (Reader.DimCount(ClsOutName + '.weight') <> 2) or
+           (Reader.DimSize(ClsOutName + '.weight', 1) <>
+            Config.HiddenSize) then
+          ImportError('BERT import: "' + ClsOutName + '.weight" must ' +
+            'have shape [num_labels, ' + IntToStr(Config.HiddenSize) +
+            '] (nn.Linear stores [out, in]), got ' +
+            Reader.ShapeAsString(ClsOutName + '.weight'));
+        NumLabels := Reader.DimSize(ClsOutName + '.weight', 0);
         ClassifierDense := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(NumLabels) );
       end;
@@ -4509,11 +4558,20 @@ begin
       end;
       if pSeqClsHead then
       begin
-        // classifier.{weight,bias} sit at the top level (no family prefix).
-        LoadLlamaLinearWeights(Reader, ClassifierDense, 'classifier.weight',
-          Config.HiddenSize, NumLabels, 0, -1, 0, 'classifier.bias');
-        MarkConsumed('classifier.weight');
-        MarkConsumed('classifier.bias');
+        // The classifier tensors sit at the top level (no family prefix).
+        if ClsHeadDense <> nil then
+        begin
+          LoadLlamaLinearWeights(Reader, ClsHeadDense,
+            ClsHeadName + '.weight', Config.HiddenSize, Config.HiddenSize,
+            0, -1, 0, ClsHeadName + '.bias');
+          MarkConsumed(ClsHeadName + '.weight');
+          MarkConsumed(ClsHeadName + '.bias');
+        end;
+        LoadLlamaLinearWeights(Reader, ClassifierDense,
+          ClsOutName + '.weight', Config.HiddenSize, NumLabels, 0, -1, 0,
+          ClsOutName + '.bias');
+        MarkConsumed(ClsOutName + '.weight');
+        MarkConsumed(ClsOutName + '.bias');
       end;
 
       // ---------------- Unexpected-tensor check ----------------
@@ -4771,8 +4829,11 @@ begin
       Labels.Free;
     end;
   end;
+  // pIncludePooler stays false: the builder forces the pooler on for the
+  // families whose head needs it (bert only - distilbert/roberta
+  // classifier checkpoints carry no pooler tensors).
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, {pIncludePooler=}true, {pSeqClsHead=}true);
+    pInferenceOnly, {pIncludePooler=}false, {pSeqClsHead=}true);
 end;
 
 function BuildBertForSequenceClassificationFromSafeTensors(
@@ -5132,7 +5193,9 @@ begin
       for ArchCnt := 0 to TJSONArray(ArchData).Count - 1 do
       begin
         ArchName := TJSONArray(ArchData).Items[ArchCnt].AsString;
-        if ArchName = 'BertForSequenceClassification' then
+        if (ArchName = 'BertForSequenceClassification') or
+           (ArchName = 'DistilBertForSequenceClassification') or
+           (ArchName = 'RobertaForSequenceClassification') then
           BertSeqCls := true
         else if ArchName = 'GPT2ForSequenceClassification' then
           GPT2SeqCls := true;
@@ -5153,7 +5216,8 @@ begin
   else if ModelType = 'gpt2' then
     Result := BuildGPT2FromSafeTensors(WeightsPath, pSeqLen, NumHeads,
       pInferenceOnly, GPT2ExactGelu)
-  else if (ModelType = 'bert') and BertSeqCls then
+  else if ((ModelType = 'bert') or (ModelType = 'distilbert') or
+           (ModelType = 'roberta')) and BertSeqCls then
   begin
     IgnoredId2Label := nil;
     Result := BuildBertForSequenceClassificationFromSafeTensorsEx(

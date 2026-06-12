@@ -456,7 +456,7 @@ rather than acted on.
       instruction-tuned, so it doubles as the first imported model the
       BLEU/ROUGE metrics can score out of the box. Same HF-parity fixture
       verification as GPT-2/Llama.
-- [ ] DistilBERT / RoBERTa ForSequenceClassification head deltas: the
+- [X] DistilBERT / RoBERTa ForSequenceClassification head deltas: the
       landed BuildBertForSequenceClassificationFromSafeTensors (4f0e2c1)
       explicitly rejects non-bfBert families because their classifier
       stacks differ — DistilBERT uses pre_classifier dense + ReLU on the
@@ -465,6 +465,15 @@ rather than acted on.
       are already landed as deltas on the BERT encoder builder, so each is
       a small head-mapping case on the same pSeqClsHead option. Same
       fixture/parity-test pattern as tiny_bert_seqcls (id2label included).
+      DONE: pSeqClsHead now maps the family-specific head (bert keeps the
+      forced pooler; distilbert = pre_classifier+ReLU+classifier; roberta
+      = classifier.dense+tanh+classifier.out_proj, no pooler in either);
+      BuildFromPretrained dispatches DistilBert/Roberta-
+      ForSequenceClassification architectures. Fixtures
+      tiny_{distilbert,roberta}_seqcls (tools/*_seqcls_tiny_fixture.py,
+      self-checked oracle paths: ReLU clips / tanh bends / offset
+      positions) + parity tests TestDistilBertSeqClsLogitParity,
+      TestRobertaSeqClsLogitParity + both dispatch routes.
 - [ ] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate

@@ -108,6 +108,8 @@ type
     procedure TestRobertaHiddenStateParity;
     procedure TestRobertaPoolerParity;
     procedure TestBertSeqClsLogitParity;
+    procedure TestDistilBertSeqClsLogitParity;
+    procedure TestRobertaSeqClsLogitParity;
     procedure TestGPT2SeqClsLogitParity;
     procedure TestBuildFromPretrainedSeqClsDispatch;
     procedure TestBertPoolSentenceEmbedding;
@@ -2148,6 +2150,89 @@ begin
   end;
 end;
 
+// Fine-tuned classifier import, DistilBERT delta: HF
+// DistilBertForSequenceClassification has NO pooler - logits =
+// classifier(ReLU(pre_classifier(hidden[:, 0]))), the top-level
+// pre_classifier dense + ReLU over the [CLS] position
+// (tools/distilbert_seqcls_tiny_fixture.py asserts the oracle really is
+// that path AND that the ReLU clips, so a pooler/tanh-headed import
+// fails). Row 0 of the (SeqLen,1,3) output must match HF's float64
+// logits; argmax round-trips through id2label.
+procedure TTestNeuralPretrained.TestDistilBertSeqClsLogitParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  Id2Label: TStringList;
+begin
+  RandSeed := 424242;
+  Id2Label := TStringList.Create;
+  try
+    NN := BuildBertForSequenceClassificationFromSafeTensorsEx(
+      FixturePath('tiny_distilbert_seqcls.safetensors'), Config, Id2Label,
+      {SeqLen=}0, {pInferenceOnly=}false,
+      FixturePath('tiny_distilbert_seqcls_config.json'));
+    try
+      AssertEquals('prefix (DistilBertFor* exports carry "distilbert.")',
+        'distilbert.', Config.Prefix);
+      AssertEquals('id2label size', 3, Id2Label.Count);
+      AssertEquals('id2label[0]', 'neg', Id2Label[0]);
+      AssertEquals('id2label[1]', 'neu', Id2Label[1]);
+      AssertEquals('num_labels output depth', 3,
+        NN.GetLastLayer().Output.Depth);
+      AssertSeqClsParityWithFixture(NN,
+        FixturePath('tiny_distilbert_seqcls_logits.json'),
+        Config.MaxPositions, {BertStyle=}true, Id2Label);
+    finally
+      NN.Free;
+    end;
+  finally
+    Id2Label.Free;
+  end;
+end;
+
+// Fine-tuned classifier import, RoBERTa delta: HF
+// RobertaForSequenceClassification has NO pooler either - logits =
+// classifier.out_proj(tanh(classifier.dense(hidden[:, 0]))), the
+// RobertaClassificationHead over the <s> position on the offset-position
+// trunk (tools/roberta_seqcls_tiny_fixture.py asserts the oracle really
+// is that path AND that the tanh bends, so a ReLU-headed import fails;
+// position rows 0/1 are boosted LOUD so an offset bug fails too). Row 0
+// of the (SeqLen,1,3) output must match HF's float64 logits over the
+// usable MaxPositions-2 context; argmax round-trips through id2label.
+procedure TTestNeuralPretrained.TestRobertaSeqClsLogitParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  Id2Label: TStringList;
+begin
+  RandSeed := 424242;
+  Id2Label := TStringList.Create;
+  try
+    NN := BuildBertForSequenceClassificationFromSafeTensorsEx(
+      FixturePath('tiny_roberta_seqcls.safetensors'), Config, Id2Label,
+      {SeqLen=}0, {pInferenceOnly=}false,
+      FixturePath('tiny_roberta_seqcls_config.json'));
+    try
+      AssertEquals('prefix (RobertaFor* exports carry "roberta.")',
+        'roberta.', Config.Prefix);
+      AssertEquals('position offset (pad_token_id + 1)', 2,
+        Config.PositionOffset);
+      AssertEquals('id2label size', 3, Id2Label.Count);
+      AssertEquals('id2label[2]', 'pos', Id2Label[2]);
+      AssertEquals('num_labels output depth', 3,
+        NN.GetLastLayer().Output.Depth);
+      AssertSeqClsParityWithFixture(NN,
+        FixturePath('tiny_roberta_seqcls_logits.json'),
+        Config.MaxPositions - Config.PositionOffset, {BertStyle=}true,
+        Id2Label);
+    finally
+      NN.Free;
+    end;
+  finally
+    Id2Label.Free;
+  end;
+end;
+
 // Fine-tuned classifier import, decoder family: HF
 // GPT2ForSequenceClassification applies the bias-free score head to every
 // hidden state and pools the LAST NON-PAD token (only the final position
@@ -2215,6 +2300,46 @@ begin
         NN.GetLastLayer().Output.Depth);
       AssertSeqClsParityWithFixture(NN,
         FixturePath('tiny_bert_seqcls_logits.json'), 16,
+        {BertStyle=}true, Id2Label);
+    finally
+      NN.Free;
+    end;
+  finally
+    Id2Label.Free;
+  end;
+  // ---- DistilBertForSequenceClassification route ----
+  Id2Label := ReadId2LabelFromJSONFile(
+    FixturePath('tiny_distilbert_seqcls_config.json'));
+  try
+    AssertEquals('distilbert id2label size', 3, Id2Label.Count);
+    NN := BuildFromPretrained(
+      FixturePath('tiny_distilbert_seqcls.safetensors'),
+      0, false, FixturePath('tiny_distilbert_seqcls_config.json'));
+    try
+      AssertEquals('distilbert seqcls output depth', 3,
+        NN.GetLastLayer().Output.Depth);
+      AssertSeqClsParityWithFixture(NN,
+        FixturePath('tiny_distilbert_seqcls_logits.json'), 16,
+        {BertStyle=}true, Id2Label);
+    finally
+      NN.Free;
+    end;
+  finally
+    Id2Label.Free;
+  end;
+  // ---- RobertaForSequenceClassification route (offset positions) ----
+  Id2Label := ReadId2LabelFromJSONFile(
+    FixturePath('tiny_roberta_seqcls_config.json'));
+  try
+    AssertEquals('roberta id2label size', 3, Id2Label.Count);
+    NN := BuildFromPretrained(
+      FixturePath('tiny_roberta_seqcls.safetensors'),
+      0, false, FixturePath('tiny_roberta_seqcls_config.json'));
+    try
+      AssertEquals('roberta seqcls output depth', 3,
+        NN.GetLastLayer().Output.Depth);
+      AssertSeqClsParityWithFixture(NN,
+        FixturePath('tiny_roberta_seqcls_logits.json'), 14,
         {BertStyle=}true, Id2Label);
     finally
       NN.Free;

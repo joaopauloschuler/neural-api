@@ -1,0 +1,25 @@
+{
+ "architectures": [
+  "DistilBertForSequenceClassification"
+ ],
+ "model_type": "distilbert",
+ "dim": 8,
+ "n_layers": 2,
+ "n_heads": 2,
+ "hidden_dim": 16,
+ "vocab_size": 11,
+ "max_position_embeddings": 16,
+ "activation": "gelu",
+ "sinusoidal_pos_embds": false,
+ "num_labels": 3,
+ "id2label": {
+  "0": "neg",
+  "1": "neu",
+  "2": "pos"
+ },
+ "label2id": {
+  "neg": 0,
+  "neu": 1,
+  "pos": 2
+ }
+}
