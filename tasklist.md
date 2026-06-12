@@ -477,8 +477,10 @@ rather than acted on.
       BEFORE RoPE there (the verified Qwen3 ordering). Gemma-3 still needs
       its own placement verification vs HF Gemma3 (norm-vs-RoPE order
       differs across implementations) + the MHA-builder flag.
-- [ ] Gemma 3 - BuildGemma3FromSafeTensors importer, TEXT-ONLY (depends on
-      the QK-norm task + the Gemma-2 importer): 5:1 local:global layer
+- [ ] Gemma 3 - BuildGemma3FromSafeTensors importer, TEXT-ONLY (the Gemma-2
+      importer landed 2026-06-12 — BuildGemma2FromSafeTensors with the SDPA
+      score soft-cap + sandwich norms; still depends on the Gemma-3 QK-norm
+      placement task above): 5:1 local:global layer
       ratio (config wiring over the same alternating machinery) and
       PER-LAYER-TYPE RoPE theta — 10k for local layers, 1M for global
       layers, so rope_theta becomes per-layer instead of one global config
