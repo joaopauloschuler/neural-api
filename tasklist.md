@@ -386,7 +386,7 @@ rather than acted on.
       the pre-torch-1.6 non-zip legacy format, DEFLATE-compressed zip
       entries, and non-contiguous (stride-permuted) state_dict tensors —
       all currently rejected with descriptive ETorchBinError messages.
-- [ ] Marian / OPUS-MT translation importer (Helsinki-NLP/opus-mt-en-de
+- [X] Marian / OPUS-MT translation importer (Helsinki-NLP/opus-mt-en-de
       etc., ~77M params per language pair, 1000+ published pairs — the
       de-facto open machine-translation checkpoints and the first
       DEDICATED-translation family; MT is a headline NLP capability the

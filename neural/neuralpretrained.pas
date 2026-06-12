@@ -57,6 +57,11 @@ unit neuralpretrained;
 //     original v1.0 recipe (ReLU FFN, tied + d_model^-0.5-scaled head) and
 //     the v1.1/Flan recipe (gated-GELU FFN, untied head). See the T5
 //     IMPORT section below.
+//   - Marian / OPUS-MT (model_type "marian": the Helsinki-NLP/opus-mt-*
+//     translation pairs) - BuildMarianFromSafeTensors, the second
+//     encoder-decoder import (POST-norm blocks, static sinusoidal
+//     positions, swish FFN, tied head + final_logits_bias). Runs through
+//     the same RunT5 two-net convention. See the MARIAN IMPORT section.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -1137,6 +1142,100 @@ function T5EncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
 // logits into Logits (resized as needed).
 procedure RunT5(EncoderNet, DecoderNet: TNNet;
   EncoderTokens, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
+
+// ---------------------------------------------------------------------------
+// MARIAN / OPUS-MT IMPORT (model_type "marian") - the Helsinki-NLP/opus-mt-*
+// translation family (1000+ published language pairs, ~77M params each, the
+// de-facto open machine-translation checkpoints). The SECOND encoder-decoder
+// import, sharing T5's two-net convention but architecturally distinct:
+//   - POST-norm blocks: LayerNorm AFTER each residual add
+//     (self_attn_layer_norm / encoder_attn_layer_norm / final_layer_norm
+//     per block) using plain BIASED nn.LayerNorm (TNNetTokenLayerNorm,
+//     eps 1e-5), and NO final stack norm - vs T5's pre-RMSNorm + final norm;
+//   - STATIC sinusoidal positions in HF Marian's HALF-SPLIT layout:
+//     table[pos, c] = sin(pos / 10000^(2c/d)) for c < d/2 and the matching
+//     cos in column d/2 + c. This is NOT the interleaved Vaswani layout of
+//     TNNetSinusoidalPositionalEmbedding (even/odd columns), so the
+//     importer fills a TNNetLearnedPositionalEmbedding table with the
+//     exact half-split formula instead. Real checkpoints do NOT store the
+//     tables (HF _keys_to_ignore_on_save) - they are regenerated here;
+//     legacy exports that still carry them are accepted and ignored;
+//   - swish/SiLU FFN: fc2(silu(fc1(x))) with EVERY linear biased (the
+//     q/k/v/out projections too - the opposite of T5's bias-free stack);
+//   - STANDARD 1/sqrt(head_dim) attention scaling (exactly what
+//     TNNetScaledDotProductAttention / TNNetCrossAttention compute, so no
+//     q-weight compensation is needed);
+//   - scale_embedding (true in every published opus-mt config): token
+//     embeddings are multiplied by sqrt(d_model) BEFORE the positions are
+//     added - folded into the copied embedding rows, while the TIED
+//     lm_head keeps the UNSCALED shared matrix;
+//   - the lm_head is TIED to the shared source/target embedding matrix
+//     PLUS Marian's final_logits_bias vector ([1, vocab_size] buffer),
+//     folded into the head's per-neuron bias;
+//   - decoder_start_token_id = pad_token_id (decoder rows start with it).
+// BuildMarianFromSafeTensors returns the same pair as the T5 importer: the
+// ENCODER ((EncSeqLen,1,1) token ids -> (EncSeqLen,1,d_model) final hidden
+// states) and the two-input DECODER ((DecSeqLen,1,1) token ids +
+// (EncSeqLen,1,d_model) encoder-states second TNNetInput ->
+// (DecSeqLen,1,vocab) logits). T5EncoderStatesInput and RunT5 are GENERIC
+// over this two-net convention - use them to run a Marian pair as well.
+// BuildFromPretrained does NOT dispatch "marian" (it returns ONE net); it
+// raises an error pointing here instead. TOKENIZER NOTE: opus-mt pairs ship
+// source.spm/target.spm SentencePiece UNIGRAM files without tokenizer.json,
+// which neuralhftokenizer.pas does not cover yet - end-to-end text
+// translation needs the Unigram tokenizer task; the importer itself is
+// tokenizer-independent (token ids in, logits out).
+
+type
+  TMarianConfig = record
+    DModel: integer;            // d_model (hidden width; must be EVEN)
+    EncoderLayers: integer;     // encoder_layers
+    DecoderLayers: integer;     // decoder_layers
+    EncoderHeads: integer;      // encoder_attention_heads
+    DecoderHeads: integer;      // decoder_attention_heads
+    EncoderFFNDim: integer;     // encoder_ffn_dim
+    DecoderFFNDim: integer;     // decoder_ffn_dim
+    VocabSize: integer;         // vocab_size
+    MaxPositionEmbeddings: integer; // max_position_embeddings
+    PadTokenId: integer;        // pad_token_id
+    DecoderStartTokenId: integer; // decoder_start_token_id (= pad in Marian)
+    ScaleEmbedding: boolean;    // scale_embedding (sqrt(d_model) on embeds)
+    SwishFFN: boolean;          // activation_function swish/silu vs relu
+    ModelType: string;          // 'marian'
+  end;
+
+// Reads a HF Marian config.json (model_type "marian"). Required: d_model,
+// encoder_layers, decoder_layers, encoder_attention_heads,
+// decoder_attention_heads, encoder_ffn_dim, decoder_ffn_dim, vocab_size.
+// Defaults follow MarianConfig: max_position_embeddings = 1024,
+// pad_token_id = 58100, decoder_start_token_id = pad_token_id,
+// scale_embedding = false (every published opus-mt config pins true),
+// activation_function = "swish" (only "swish"/"silu" and "relu" are
+// supported). share_encoder_decoder_embeddings = false and
+// tie_word_embeddings = false are REJECTED (the untied variants need a
+// second embedding matrix this v1 does not wire).
+function ReadMarianConfigFromJSONFile(const FileName: string): TMarianConfig;
+
+function MarianConfigToString(const Config: TMarianConfig): string;
+
+// Builds the Marian ENCODER and DECODER nets described by Config and loads
+// every weight from the safetensors checkpoint at FileName (see the MARIAN
+// IMPORT section above for shapes and the two-input decoder convention).
+// EncSeqLen/DecSeqLen fix the two sequence lengths at build time and must
+// not exceed max_position_embeddings (the static sinusoidal tables are
+// generated for exactly these lengths). Both nets are owned by the caller.
+// pInferenceOnly = True frees training volumes during construction
+// (Compute()-only afterwards). Run the pair with RunT5.
+procedure BuildMarianFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMarianConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildMarianFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TMarianConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
 
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
@@ -5960,6 +6059,546 @@ begin
   DecoderNet.GetOutput(Logits);
 end;
 
+function ReadMarianConfigFromJSONFile(const FileName: string): TMarianConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Marian import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Marian import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Marian import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Marian import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Marian import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'marian');
+    if ModelType <> 'marian' then
+      ImportError('Marian import: config model_type is "' + ModelType +
+        '" - only "marian" is supported here (see BuildFromPretrained ' +
+        'for the full dispatch).');
+    Result.ModelType := ModelType;
+    Result.DModel := RequiredInt('d_model');
+    Result.EncoderLayers := RequiredInt('encoder_layers');
+    Result.DecoderLayers := RequiredInt('decoder_layers');
+    Result.EncoderHeads := RequiredInt('encoder_attention_heads');
+    Result.DecoderHeads := RequiredInt('decoder_attention_heads');
+    Result.EncoderFFNDim := RequiredInt('encoder_ffn_dim');
+    Result.DecoderFFNDim := RequiredInt('decoder_ffn_dim');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositionEmbeddings :=
+      Obj.Get('max_position_embeddings', 1024);
+    // The HF MarianConfig defaults (every opus-mt pair pins pad/start to
+    // vocab_size-1 = 58100 explicitly; decoder start = pad is the Marian
+    // shift_tokens_right convention).
+    Result.PadTokenId := Obj.Get('pad_token_id', 58100);
+    Result.DecoderStartTokenId :=
+      Obj.Get('decoder_start_token_id', Result.PadTokenId);
+    Result.ScaleEmbedding := Obj.Get('scale_embedding', False);
+    // Only the published Marian recipes are supported: "swish"/"silu"
+    // (every opus-mt pair) and "relu". HF's default "gelu" (the exact erf
+    // form, unused by any released Marian) is rejected to avoid a silent
+    // activation mismatch.
+    ActFn := Obj.Get('activation_function', 'swish');
+    if (ActFn = 'swish') or (ActFn = 'silu') then
+      Result.SwishFFN := True
+    else if ActFn = 'relu' then
+      Result.SwishFFN := False
+    else
+      ImportError('Marian import: activation_function "' + ActFn +
+        '" is not supported - expected "swish"/"silu" (opus-mt) or ' +
+        '"relu".');
+    // The untied variants need a SECOND embedding matrix this v1 does not
+    // wire (share_encoder_decoder_embeddings=false ships separate
+    // encoder/decoder vocabularies; tie_word_embeddings=false a separate
+    // lm_head).
+    if not Obj.Get('share_encoder_decoder_embeddings', True) then
+      ImportError('Marian import: share_encoder_decoder_embeddings=false ' +
+        'is not supported - only the shared-vocabulary opus-mt layout.');
+    if not Obj.Get('tie_word_embeddings', True) then
+      ImportError('Marian import: tie_word_embeddings=false is not ' +
+        'supported - Marian ties the lm_head to the shared embedding.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MarianConfigToString(const Config: TMarianConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'marian'
+  else Result := Config.ModelType;
+  Result := Result + ' config: enc_layers=' + IntToStr(Config.EncoderLayers) +
+    ', dec_layers=' + IntToStr(Config.DecoderLayers) +
+    ', enc_heads=' + IntToStr(Config.EncoderHeads) +
+    ', dec_heads=' + IntToStr(Config.DecoderHeads) +
+    ', d_model=' + IntToStr(Config.DModel) +
+    ', enc_ffn=' + IntToStr(Config.EncoderFFNDim) +
+    ', dec_ffn=' + IntToStr(Config.DecoderFFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings) +
+    ', pad=' + IntToStr(Config.PadTokenId) +
+    ', dec_start=' + IntToStr(Config.DecoderStartTokenId) +
+    ', scale_embedding=' + BoolToStr(Config.ScaleEmbedding, true);
+  if Config.SwishFFN then
+    Result := Result + ', ffn=swish'
+  else
+    Result := Result + ', ffn=relu';
+end;
+
+const
+  // nn.LayerNorm's default eps - Marian never overrides it.
+  MarianLayerNormEps = 1e-5;
+
+type
+  TMarianAttnLayers = record
+    QProj, KProj, VProj, OProj, Norm: TNNetLayer;
+  end;
+  TMarianBlockLayers = record
+    SelfAttn: TMarianAttnLayers;
+    CrossAttn: TMarianAttnLayers; // decoder blocks only
+    Fc1, Fc2, FFNNorm: TNNetLayer;
+  end;
+  TMarianBlockArray = array of TMarianBlockLayers;
+
+// Grows one Marian stack (encoder or decoder) onto NN after the embedding +
+// positional layers. POST-norm wiring: every sublayer reads the RAW stream,
+// adds its residual, THEN applies the biased LayerNorm (the opposite of
+// T5's pre-norm); there is NO final stack norm. IsDecoder adds the causal
+// mask on self-attention plus the cross-attention sub-block reading
+// Keys|Values from EncStates (the decoder net's second TNNetInput). Layer
+// handles for the weight loader are returned in Blocks.
+procedure BuildMarianStackBlocks(NN: TNNet; const Config: TMarianConfig;
+  NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
+  EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
+  pInferenceOnly: boolean);
+var
+  HeadDim, BlockCnt, HeadCnt, d: integer;
+  BranchInput: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
+  Heads: array of TNNetLayer;
+  SliceChannels: array of integer;
+begin
+  HeadDim := Config.DModel div NumHeads;
+  SetLength(Blocks, NumBlocks);
+  SetLength(SliceChannels, HeadDim);
+  SetLength(Heads, NumHeads);
+  for BlockCnt := 0 to NumBlocks - 1 do
+  begin
+    // ---- self-attention sub-block (residual add, THEN LayerNorm) ----
+    // Standard softmax(QK^T/sqrt(head_dim)) per head - exactly what
+    // TNNetScaledDotProductAttention computes, so the q/k/v weights load
+    // unmodified (no T5-style scale compensation).
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+    Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+    Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+    for HeadCnt := 0 to NumHeads - 1 do
+    begin
+      for d := 0 to HeadDim - 1 do
+        SliceChannels[d] := HeadCnt * HeadDim + d;
+      QSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.QProj);
+      KSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.KProj);
+      VSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.VProj);
+      HeadPack := NN.AddLayer(
+        TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+      Heads[HeadCnt] := NN.AddLayerAfter(
+        TNNetScaledDotProductAttention.Create(HeadDim,
+          {CausalMask=}IsDecoder), HeadPack);
+    end;
+    NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+    Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+
+    // ---- cross-attention sub-block (decoder only) ----
+    // Queries from the post-normed decoder stream; Keys|Values projected
+    // from EncStates - the two grids may have DIFFERENT lengths, so the
+    // per-head leaf is TNNetCrossAttention (rectangular DecSeqLen x
+    // EncSeqLen scores; a Q|K|V DeepConcat would be illegal across unequal
+    // SizeX). Residual add THEN encoder_attn_layer_norm.
+    if IsDecoder then
+    begin
+      BranchInput := NN.GetLastLayer();
+      Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+      Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+      Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+      for HeadCnt := 0 to NumHeads - 1 do
+      begin
+        for d := 0 to HeadDim - 1 do
+          SliceChannels[d] := HeadCnt * HeadDim + d;
+        QSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.QProj);
+        KSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.KProj);
+        VSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.VProj);
+        KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+        Heads[HeadCnt] := NN.AddLayerAfter(
+          TNNetCrossAttention.Create(HeadDim, {CausalMask=}false,
+            KVPack), QSlice);
+      end;
+      NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+      Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.DModel) );
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+      Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+    end;
+
+    // ---- FFN sub-block: fc2(act(fc1(x))), then final_layer_norm ----
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].Fc1 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(FFNDim) );
+    if Config.SwishFFN then
+      NN.AddLayer( TNNetSwish.Create() )
+    else
+      NN.AddLayer( TNNetReLU.Create() );
+    Blocks[BlockCnt].Fc2 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    Blocks[BlockCnt].FFNNorm := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+  end;
+  SetLength(SliceChannels, 0);
+  SetLength(Heads, 0);
+end;
+
+// Fills a TNNetLearnedPositionalEmbedding table (SeqLen rows of DModel)
+// with HF Marian's STATIC half-split sinusoids:
+//   table[pos, c]         = sin(pos / 10000^(2c/DModel))   for c < DModel/2
+//   table[pos, DModel/2+c] = cos(pos / 10000^(2c/DModel))
+// (MarianSinusoidalPositionalEmbedding.create_weight - "features are not
+// interleaved. The cos features are in the 2nd half of the vector"). Real
+// checkpoints never store the table (_keys_to_ignore_on_save), so the
+// importer regenerates it; HF builds it in float32, and these doubles
+// round to the same float32 values.
+procedure FillMarianSinusoidalPositions(Layer: TNNetLayer;
+  SeqLen, DModel: integer);
+var
+  PosCnt, ChCnt, Half: integer;
+  Angle: double;
+begin
+  Half := DModel div 2;
+  for PosCnt := 0 to SeqLen - 1 do
+    for ChCnt := 0 to Half - 1 do
+    begin
+      Angle := PosCnt / Exp(Ln(10000.0) * (2 * ChCnt) / DModel);
+      Layer.Neurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
+      Layer.Neurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
+        Cos(Angle);
+    end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads one Marian attention sub-block's q/k/v/out projections (HF
+// nn.Linear [d_model, d_model], ALL biased) plus its post-residual
+// LayerNorm (NormPrefix, weight+bias).
+procedure LoadMarianAttn(Reader: TNNetSafeTensorsReader;
+  const Attn: TMarianAttnLayers; const AttnPrefix, NormPrefix: string;
+  const Config: TMarianConfig; Consumed: TStringList);
+begin
+  LoadLlamaLinearWeights(Reader, Attn.QProj, AttnPrefix + 'q_proj.weight',
+    Config.DModel, Config.DModel, 0, -1, 0, AttnPrefix + 'q_proj.bias');
+  Consumed.Add(AttnPrefix + 'q_proj.weight');
+  Consumed.Add(AttnPrefix + 'q_proj.bias');
+  LoadLlamaLinearWeights(Reader, Attn.KProj, AttnPrefix + 'k_proj.weight',
+    Config.DModel, Config.DModel, 0, -1, 0, AttnPrefix + 'k_proj.bias');
+  Consumed.Add(AttnPrefix + 'k_proj.weight');
+  Consumed.Add(AttnPrefix + 'k_proj.bias');
+  LoadLlamaLinearWeights(Reader, Attn.VProj, AttnPrefix + 'v_proj.weight',
+    Config.DModel, Config.DModel, 0, -1, 0, AttnPrefix + 'v_proj.bias');
+  Consumed.Add(AttnPrefix + 'v_proj.weight');
+  Consumed.Add(AttnPrefix + 'v_proj.bias');
+  LoadLlamaLinearWeights(Reader, Attn.OProj, AttnPrefix + 'out_proj.weight',
+    Config.DModel, Config.DModel, 0, -1, 0, AttnPrefix + 'out_proj.bias');
+  Consumed.Add(AttnPrefix + 'out_proj.weight');
+  Consumed.Add(AttnPrefix + 'out_proj.bias');
+  LoadLayerNormWeights(Reader, Attn.Norm, NormPrefix + '.weight',
+    NormPrefix + '.bias', Config.DModel);
+  Consumed.Add(NormPrefix + '.weight');
+  Consumed.Add(NormPrefix + '.bias');
+end;
+
+// Loads one full Marian stack: per-block self-attention (+ cross-attention
+// in the decoder) with their post-residual norms, plus fc1/fc2 and the
+// block's final_layer_norm.
+procedure LoadMarianStack(Reader: TNNetSafeTensorsReader;
+  const Blocks: TMarianBlockArray; const StackPrefix: string;
+  const Config: TMarianConfig; FFNDim: integer; IsDecoder: boolean;
+  Consumed: TStringList);
+var
+  BlockCnt: integer;
+  BP: string;
+begin
+  for BlockCnt := 0 to High(Blocks) do
+  begin
+    BP := StackPrefix + IntToStr(BlockCnt) + '.';
+    LoadMarianAttn(Reader, Blocks[BlockCnt].SelfAttn, BP + 'self_attn.',
+      BP + 'self_attn_layer_norm', Config, Consumed);
+    if IsDecoder then
+      LoadMarianAttn(Reader, Blocks[BlockCnt].CrossAttn,
+        BP + 'encoder_attn.', BP + 'encoder_attn_layer_norm', Config,
+        Consumed);
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc1,
+      BP + 'fc1.weight', Config.DModel, FFNDim, 0, -1, 0, BP + 'fc1.bias');
+    Consumed.Add(BP + 'fc1.weight');
+    Consumed.Add(BP + 'fc1.bias');
+    LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
+      BP + 'fc2.weight', FFNDim, Config.DModel, 0, -1, 0, BP + 'fc2.bias');
+    Consumed.Add(BP + 'fc2.weight');
+    Consumed.Add(BP + 'fc2.bias');
+    LoadLayerNormWeights(Reader, Blocks[BlockCnt].FFNNorm,
+      BP + 'final_layer_norm.weight', BP + 'final_layer_norm.bias',
+      Config.DModel);
+    Consumed.Add(BP + 'final_layer_norm.weight');
+    Consumed.Add(BP + 'final_layer_norm.bias');
+  end;
+end;
+
+procedure BuildMarianFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMarianConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TMarianBlockArray;
+  EncEmbed, DecEmbed, EncPos, DecPos: TNNetLayer;
+  DecTokenInput, EncStates, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  // ---------------- Config validation ----------------
+  if EncSeqLen < 1 then
+    ImportError('Marian import: EncSeqLen must be >= 1, got ' +
+      IntToStr(EncSeqLen) + '.');
+  if DecSeqLen < 1 then
+    ImportError('Marian import: DecSeqLen must be >= 1, got ' +
+      IntToStr(DecSeqLen) + '.');
+  if (EncSeqLen > Config.MaxPositionEmbeddings) or
+     (DecSeqLen > Config.MaxPositionEmbeddings) then
+    ImportError('Marian import: EncSeqLen/DecSeqLen must not exceed ' +
+      'max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+  if Odd(Config.DModel) then
+    ImportError('Marian import: d_model must be EVEN (the half-split ' +
+      'sinusoidal table), got ' + IntToStr(Config.DModel) + '.');
+  if (Config.EncoderHeads < 1) or
+     ((Config.DModel mod Config.EncoderHeads) <> 0) then
+    ImportError('Marian import: encoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.EncoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  if (Config.DecoderHeads < 1) or
+     ((Config.DModel mod Config.DecoderHeads) <> 0) then
+    ImportError('Marian import: decoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.DecoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if not Reader.HasTensor('model.shared.weight') then
+        ImportError('Marian import: "model.shared.weight" not found in ' +
+          Reader.FileName + ' - not a Marian checkpoint?');
+      if (Reader.DimCount('model.shared.weight') <> 2) or
+         (Reader.DimSize('model.shared.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize('model.shared.weight', 1) <> Config.DModel) then
+        ImportError('Marian import: model.shared.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.DModel) +
+          '], got ' + Reader.ShapeAsString('model.shared.weight'));
+      if not Reader.HasTensor('final_logits_bias') then
+        ImportError('Marian import: "final_logits_bias" not found in ' +
+          Reader.FileName + ' - not a MarianMTModel checkpoint?');
+      if (Reader.DimCount('final_logits_bias') <> 2) or
+         (Reader.DimSize('final_logits_bias', 0) <> 1) or
+         (Reader.DimSize('final_logits_bias', 1) <> Config.VocabSize) then
+        ImportError('Marian import: final_logits_bias must have shape ' +
+          '[1, ' + IntToStr(Config.VocabSize) + '], got ' +
+          Reader.ShapeAsString('final_logits_bias'));
+
+      // ---------------- Encoder architecture ----------------
+      Enc := TNNet.Create();
+      Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
+      // EncodeZero=1: token id 0 (eos in opus-mt) is a real embedding row.
+      EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+      // Static sinusoidal positions, added AFTER the (scaled) token
+      // embedding; the table is filled below (Marian half-split layout).
+      EncPos := Enc.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      BuildMarianStackBlocks(Enc, Config, Config.EncoderLayers,
+        Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
+        nil, EncBlocks, pInferenceOnly);
+      // POST-norm stack: NO final norm (the last block ends in one).
+
+      // ---------------- Decoder architecture ----------------
+      // TWO inputs: Layers[0] = decoder token ids (what Compute feeds);
+      // the second TNNetInput holds the encoder hidden states and is
+      // filled MANUALLY before Compute (RunT5 does it - the convention is
+      // shared with the T5 importer).
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      BuildMarianStackBlocks(Dec, Config, Config.DecoderLayers,
+        Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pInferenceOnly);
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Marian import: model.shared.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+        // scale_embedding folds sqrt(d_model) into the embedding rows
+        // (token embeds are scaled BEFORE positions are added); the TIED
+        // head below copies the UNSCALED rows.
+        if Config.ScaleEmbedding then
+          EmbedScale := Sqrt(Config.DModel)
+        else
+          EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+        begin
+          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        end;
+        EncEmbed.FlushWeightCache();
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('model.shared.weight');
+        // Tied head: logits = h . shared^T + final_logits_bias.
+        for j := 0 to Config.VocabSize - 1 do
+          for i := 0 to Config.DModel - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.DModel + i];
+        Reader.LoadTensorFlat('final_logits_bias', Tmp);
+        for j := 0 to Config.VocabSize - 1 do
+          LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+        LMHead.FlushWeightCache();
+        Consumed.Add('final_logits_bias');
+        // Legacy exports may still carry the tied/static aliases (HF drops
+        // embed_tokens via _tied_weights_keys and the SINUSOIDAL
+        // embed_positions via _keys_to_ignore_on_save).
+        if Reader.HasTensor('lm_head.weight') then
+          Consumed.Add('lm_head.weight');
+        if Reader.HasTensor('model.encoder.embed_tokens.weight') then
+          Consumed.Add('model.encoder.embed_tokens.weight');
+        if Reader.HasTensor('model.decoder.embed_tokens.weight') then
+          Consumed.Add('model.decoder.embed_tokens.weight');
+        if Reader.HasTensor('model.encoder.embed_positions.weight') then
+          Consumed.Add('model.encoder.embed_positions.weight');
+        if Reader.HasTensor('model.decoder.embed_positions.weight') then
+          Consumed.Add('model.decoder.embed_positions.weight');
+      finally
+        Tmp.Free;
+      end;
+      FillMarianSinusoidalPositions(EncPos, EncSeqLen, Config.DModel);
+      FillMarianSinusoidalPositions(DecPos, DecSeqLen, Config.DModel);
+      LoadMarianStack(Reader, EncBlocks, 'model.encoder.layers.', Config,
+        Config.EncoderFFNDim, {IsDecoder=}false, Consumed);
+      LoadMarianStack(Reader, DecBlocks, 'model.decoder.layers.', Config,
+        Config.DecoderFFNDim, {IsDecoder=}true, Consumed);
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Marian import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil; // ownership transferred to the caller
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free; // non-nil only if an exception unwound the build
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildMarianFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TMarianConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMarianConfigFromJSONFile(ConfigPath);
+  BuildMarianFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly);
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -6106,6 +6745,16 @@ begin
     ImportError('BuildFromPretrained: model_type "t5" builds an ' +
       'ENCODER-DECODER pair - call BuildT5FromSafeTensors (returns both ' +
       'nets; run them with RunT5) instead of this single-net dispatch.');
+  end
+  else if ModelType = 'marian' then
+  begin
+    // Marian / OPUS-MT is an encoder-decoder: the import builds TWO nets,
+    // which this single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "marian" builds an ' +
+      'ENCODER-DECODER pair - call BuildMarianFromSafeTensors (returns ' +
+      'both nets; run them with RunT5) instead of this single-net ' +
+      'dispatch.');
   end
   else
   begin
