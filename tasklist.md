@@ -267,6 +267,18 @@ rather than acted on.
       context. Verify: HF parity fixture with a rope_scaling config
       (transformers applies the same remap), plus a sanity check that an
       unscaled config stays bit-identical to the landed path.
+      LANDED (7e74fee): linear/dynamic-NTK/yarn/llama3 wired into the
+      Llama-family, GPT-NeoX and Phi importers via TRoPEScalingConfig +
+      new rsmLlama3 mode; HF-exact YaRN fixes (attention temperature was
+      inverted, band blend now HF's truncate=true dim-index ramp).
+- [ ] rope_scaling follow-ups to the landed wiring (7e74fee): (a) longrope
+      (Phi-3 family — per-dim short/long factor arrays + two attention
+      factors) is parsed and rejected; map it onto a new scaling mode when
+      a Phi-3 import target matters; (b) DeepSeek-style YaRN `mscale` /
+      `mscale_all_dim` overrides are rejected — needed for full
+      DeepSeek-V2 checkpoints (the -Lite config carries them); (c) yarn
+      `"truncate": false` configs are silently treated as truncate=true —
+      honor the flag or reject loudly.
 - [ ] KV-cache eviction for unbounded streaming: attention sinks + rolling
       window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder
       — today the per-SDPA-layer cache grows without bound. Keep the first
@@ -450,6 +462,20 @@ rather than acted on.
       decoder logits 4.8e-6); examples/WhisperTranscribe transcribes
       jfk.wav correctly with the real 39M checkpoint on CPU (~5 min,
       2.5 GB RSS).
+- [ ] Forced-prefix seq2seq decode + KV cache for Whisper-style decoders:
+      DecodeSeq2SeqGreedy/Sampled assume a text encoder input and a
+      single BOS start token, so examples/WhisperTranscribe hand-rolls
+      its decode loop (mel-volume encoder input + the 4-token
+      <|startoftranscript|><|en|><|transcribe|><|notimestamps|>
+      prologue, full prefix re-encoded every step). Add a seq2seq decode
+      variant taking an arbitrary forced token prologue and a
+      pre-computed encoder-states volume, plus decoder-side KV caching
+      (the cross-attention K/V are fixed after encoding — cache them
+      once). Assert greedy output matches the re-encoding loop
+      bit-identically; would cut WhisperTranscribe's ~5 min CPU decode
+      substantially. Note: the WhisperTranscribe example needs ~4 GB
+      VIRTUAL memory (ulimit -v 4000000; the 3 GB test cap aborts during
+      build).
 - [X] DeepSeek-V2 importer (model_type "deepseek_v2"; DeepSeek-V2-Lite is
       the reference checkpoint) — the FIRST importer to exercise the two
       most distinctive landed-but-never-imported blocks:
