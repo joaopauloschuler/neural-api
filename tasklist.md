@@ -372,28 +372,6 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [X] HF Hub download helper: there is no HTTP anywhere in the import path —
-      users must hand-download checkpoint files. A small fphttpclient-based
-      resolver (https://huggingface.co/{repo}/resolve/{rev}/{file}, local
-      cache dir, skip-if-present, optional token header for gated repos) so
-      BuildLlamaFromSafeTensors('TinyLlama/TinyLlama-1.1B-Chat-v1.0') works
-      end to end. Pairs with the (landed) sharded-safetensors support (the
-      index file says which shards to fetch) and the landed tokenizer.json
-      loader / open chat-template task (same repo, same fetch). Keep it a separate opt-in unit so the
-      core importers stay offline-only. NOTE 2026-06-12: this dev
-      environment HAS live network access to huggingface.co (TinyStories-1M
-      and bert-tiny/MiniLM-L6-v2 were downloaded during importer
-      verification), so the helper can be developed and tested end to end.
-      DONE 2026-06-12: neural/neuralhfhub.pas (opt-in; HubFetchFile /
-      HubTryFetchFile / HubFetchModel + cache-dir override, HF_TOKEN bearer,
-      .part-then-rename, sharded index fallback) + tests/TestNeuralHFHub.pas
-      (offline; live test gated by NEURAL_HUB_LIVE_TEST=1) +
-      examples/HubFetch. Verified live: MiniLM-L6-v2 byte-identical to the
-      huggingface_hub download and builds via BuildFromPretrained; 5-shard
-      hf-internal-testing checkpoint through the index path. NOTE:
-      TinyStories-1M / bert-tiny publish only pytorch_model.bin (no
-      safetensors) — fetching their WEIGHTS needs the pytorch_model.bin
-      loader task below.
 - [ ] PyTorch pytorch_model.bin loader: a RESTRICTED unpickler for the
       torch.save zip format — the long tail of older/fine-tuned checkpoints
       never got converted to safetensors. State_dicts use a small pickle
@@ -405,39 +383,6 @@ rather than acted on.
       TNNetSafeTensorsReader so the GPT-2/Llama builders take either
       format. Test: torch.save a pico state_dict in Python, assert every
       tensor matches its safetensors twin bit-for-bit.
-- [X] Sentence-embedding pipeline + semantic-search example on the landed
-      BERT/MiniLM import: the importer is parity-verified against
-      sentence-transformers/all-MiniLM-L6-v2 but nothing turns its
-      (SeqLen,1,hidden) output into a sentence VECTOR — add the
-      sentence-transformers pooling recipe (attention-mask-aware MEAN
-      pooling over real tokens only, ignoring [PAD]; then L2 normalize)
-      as a small helper in neural/neuralpretrained.pas (e.g.
-      EncodeSentence: tokenizer.json text in, normalized embedding out),
-      plus an examples/SemanticSearch demo that embeds a small corpus and
-      ranks it by cosine similarity for a query — the first end-to-end
-      USE of an imported encoder (GPT2Import/LlamaImport cover decoders;
-      no encoder example exists). Mask-aware mean over a variable-length
-      prefix is the part the layer zoo doesn't give for free
-      (TNNetAvgChannel averages all N positions, pads included — see its
-      known N^2 bag scaling); a manual sum/count over Output suffices.
-      Verify: cosine(Pascal, sentence_transformers.encode()) > 0.999 per
-      sentence in the venv, and the demo ranks the paraphrase above the
-      distractors. NLP + pretrained-import priority; depends only on
-      landed pieces (BuildBertFromSafeTensors + neuralhftokenizer).
-- [X] RoBERTa importer delta on BuildBertFromSafeTensors: same skeleton and
-      tensor names modulo the 'roberta.' prefix, but position ids start at
-      padding_idx+1 = 2 (load position_embeddings rows offset by 2 and cap
-      usable SeqLen at max_position_embeddings-2), type_vocab_size = 1
-      (token-type branch degenerates to a constant row), and lm_head-less
-      RobertaModel exports. Parity fixture vs RobertaModel hidden states
-      (the offset is THE bug to catch: assert positions 0/1 rows unused).
-- [X] DistilBERT importer delta on BuildBertFromSafeTensors: same post-LN
-      encoder math but different tensor names (distilbert.embeddings.*,
-      transformer.layer.N.attention.q_lin/k_lin/v_lin/out_lin,
-      sa_layer_norm, ffn.lin1/lin2, output_layer_norm), NO token-type
-      embeddings (input can stay (SeqLen,1,2) with channel 1 ignored, or
-      drop to depth 1) and NO pooler. Config keys also differ (n_layers,
-      n_heads, dim, hidden_dim). Parity fixture vs DistilBertModel.
 - [ ] T5/Flan-T5 (encoder-decoder) importer: the natural companion to the
       seq2seq generation harness task above. T5's relative-position bias
       buckets are landed (TNNetT5RelPosBiasAttention / avT5RelPosBias), and
@@ -503,20 +448,6 @@ rather than acted on.
       sliced parity fixture. The cheapest credible answer to "import a
       trained GPT-3-class model"; doc cross-link target for
       ../gpt-3-for-pascal.
-- [X] GPT-NeoX (Pythia) importer — BuildGPTNeoXFromSafeTensors in
-      neural/neuralpretrained.pas: parallel two-LN residual
-      (x + Attn(LN1(x)) + MLP(LN2(x)); use_parallel_residual=false
-      sequential fallback also wired), PARTIAL rotary (rotary_pct via
-      per-head channel split + RoPE on the first d_rot dims, rotate_half
-      permutation restricted to the rotary slice), fused per-head-
-      interleaved query_key_value de-interleave, exact erf "gelu", untied
-      embed_in/embed_out, "gpt_neox" AutoModel route, SeparateNorms variant
-      on AddParallelTransformerBlock. Pinned pico fixtures
-      (tools/gptneox_tiny_fixture.py, parallel + sequential) at parity
-      <1e-4; REAL EleutherAI/pythia-70m verified end-to-end via
-      HubFetchModel: max |logit diff| 0.058 (~6e-5 relative) vs the HF
-      float64 oracle (HF's own f32 forward is off by 13.0), argmax
-      identical at all 16 positions.
 - [ ] GPT-J importer — the gptj sibling of the landed gpt_neox path:
       SHARED-LN parallel residual (AddParallelTransformerBlock's default
       form, already landed), FULL-but-partial rotary (rotary_dim=64 of
