@@ -82,6 +82,9 @@ type
     procedure TestBertPoolerParity;
     procedure TestDistilBertConfigFromJSONFile;
     procedure TestDistilBertHiddenStateParity;
+    procedure TestRobertaConfigFromJSONFile;
+    procedure TestRobertaHiddenStateParity;
+    procedure TestRobertaPoolerParity;
     procedure TestBertPoolSentenceEmbedding;
     procedure TestBertTokenizeSentence;
     procedure TestBuildFromPretrainedDispatch;
@@ -1472,6 +1475,95 @@ begin
   AssertTrue('pIncludePooler rejected for distilbert', Rejected);
 end;
 
+procedure TTestNeuralPretrained.TestRobertaConfigFromJSONFile;
+var
+  Config: TBertConfig;
+begin
+  Config := ReadBertConfigFromJSONFile(
+    FixturePath('tiny_roberta_config.json'));
+  AssertTrue('family is roberta', Config.Family = bfRoberta);
+  AssertEquals('hidden_size', 8, Config.HiddenSize);
+  AssertEquals('intermediate_size', 16, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('max_position_embeddings', 16, Config.MaxPositions);
+  AssertEquals('type_vocab_size degenerates to 1', 1, Config.TypeVocabSize);
+  AssertEquals('position offset = pad_token_id + 1', 2,
+    Config.PositionOffset);
+  AssertEquals('layer_norm_eps', 1e-5, Config.LayerNormEps, 1e-12);
+  AssertFalse('hidden_act gelu = exact erf form', Config.HiddenActTanh);
+end;
+
+// THE RoBERTa bug to catch is the position-id offset:
+// create_position_ids_from_input_ids starts real-token positions at
+// padding_idx+1 = 2, so the importer must read checkpoint position rows
+// 2..SeqLen+1 (rows 0/1 are NEVER used - the fixture generator rewrites
+// them to huge values, so reading them blows the 2e-5 gate by 5 orders of
+// magnitude) and cap the usable context at max_position_embeddings - 2
+// (here 14). type_vocab_size is 1: the token-type branch is a constant
+// row.
+procedure TTestNeuralPretrained.TestRobertaHiddenStateParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  Rejected: boolean;
+begin
+  RandSeed := 424242;
+  NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_roberta.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}false,
+    FixturePath('tiny_roberta_config.json'));
+  try
+    AssertTrue('family', Config.Family = bfRoberta);
+    AssertEquals('position offset', 2, Config.PositionOffset);
+    AssertEquals('prefix (RobertaModel exports unprefixed)', '',
+      Config.Prefix);
+    // SeqLen=0 must default to the USABLE context, not the table size.
+    AssertEquals('input defaults to max_pos - 2',
+      Config.MaxPositions - 2, NN.Layers[0].Output.SizeX);
+    AssertBertParityWithFixture(NN, FixturePath('tiny_roberta_hidden.json'),
+      Config.MaxPositions - 2, Config.HiddenSize, {PoolerRow0Only=}false);
+  finally
+    NN.Free;
+  end;
+  // Requesting more than max_position_embeddings - 2 positions must fail:
+  // rows 0/1 of the table cannot back real positions.
+  Rejected := false;
+  NN := nil;
+  try
+    try
+      NN := BuildBertFromSafeTensorsEx(
+        FixturePath('tiny_roberta.safetensors'), Config,
+        {SeqLen=}15, false, false,
+        FixturePath('tiny_roberta_config.json'));
+    except
+      on E: EPretrainedImportError do Rejected := true;
+    end;
+  finally
+    NN.Free;
+  end;
+  AssertTrue('SeqLen > max_pos - 2 rejected for roberta', Rejected);
+end;
+
+// RobertaModel carries a BERT-style pooler: with pIncludePooler=true the
+// output row 0 must equal HF's pooler_output.
+procedure TTestNeuralPretrained.TestRobertaPoolerParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_roberta.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}true,
+    FixturePath('tiny_roberta_config.json'));
+  try
+    AssertBertParityWithFixture(NN, FixturePath('tiny_roberta_hidden.json'),
+      Config.MaxPositions - 2, Config.HiddenSize, {PoolerRow0Only=}true);
+  finally
+    NN.Free;
+  end;
+end;
+
 // BuildFromPretrained must route on config.json's model_type:
 //   - gpt2 via a HF-style checkpoint DIRECTORY (config.json +
 //     model.safetensors; n_head read from the config),
@@ -1563,6 +1655,17 @@ begin
   try
     AssertBertParityWithFixture(NN,
       FixturePath('tiny_distilbert_hidden.json'), 16, 8,
+      {PoolerRow0Only=}false);
+  finally
+    NN.Free;
+  end;
+  // ---- roberta through the file route (must apply the +2 position
+  // offset; SeqLen is the usable 14, not the 16-row table) ----
+  NN := BuildFromPretrained(FixturePath('tiny_roberta.safetensors'), 0,
+    false, FixturePath('tiny_roberta_config.json'));
+  try
+    AssertBertParityWithFixture(NN,
+      FixturePath('tiny_roberta_hidden.json'), 14, 8,
       {PoolerRow0Only=}false);
   finally
     NN.Free;

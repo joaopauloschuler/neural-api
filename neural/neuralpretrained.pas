@@ -23,6 +23,10 @@ unit neuralpretrained;
 //     as BERT with different tensor names, NO token-type embeddings and
 //     NO pooler) - the SAME BuildBertFromSafeTensors entry points; the
 //     config's model_type selects the family. See the BERT IMPORT section.
+//   - RoBERTa (model_type "roberta": the BERT skeleton with position ids
+//     OFFSET by padding_idx+1 = 2 and a degenerate 1-row token-type
+//     table) - also the SAME BuildBertFromSafeTensors entry points. See
+//     the BERT IMPORT section.
 //   - AutoModel-style dispatch on config.json's model_type -
 //     BuildFromPretrained (directory or .safetensors/.index.json path).
 //
@@ -206,6 +210,23 @@ unit neuralpretrained;
 //   - NO token-type embeddings: the input stays (SeqLen,1,2) for API
 //     uniformity but channel 1 is IGNORED (feed zeros);
 //   - NO pooler: pIncludePooler = True is rejected.
+//
+// ROBERTA (model_type "roberta") is the BERT skeleton with identical
+// tensor names modulo the optional 'roberta.' prefix; the math differs in
+// ONE place: position ids. RoBERTa's create_position_ids_from_input_ids
+// starts real-token positions at padding_idx+1 = pad_token_id+1 = 2, so
+// row p of the structural position table here is row p+2 of the
+// checkpoint's position_embeddings - rows 0 and 1 (the padding-position
+// rows) are NEVER read - and the usable context is
+// max_position_embeddings - 2 (the famous 514-rows-for-512-positions
+// layout). The importer loads the table with that row offset and caps
+// SeqLen accordingly. This assumes NO padding in the input (positions are
+// consecutive from 2), consistent with the no-padding-mask convention of
+// this importer. type_vocab_size is 1 in real RoBERTa checkpoints: the
+// token-type branch degenerates to a constant row added to every
+// position (feed zeros in channel 1). RobertaModel exports carry a pooler
+// (same as BERT, optional via pIncludePooler); lm_head-less RobertaModel
+// is the supported export, like BertModel.
 //
 // All importers FAIL LOUDLY (EPretrainedImportError) on missing tensors,
 // unexpected tensors and shape mismatches.
@@ -393,10 +414,10 @@ function BuildGPTNeoFromSafeTensors(const FileName: string;
 type
   // The encoder families sharing the BERT skeleton (selected by
   // config.json's model_type; see the BERT IMPORT section of the header).
-  TBertFamily = (bfBert, bfDistilBert);
+  TBertFamily = (bfBert, bfDistilBert, bfRoberta);
 
   TBertConfig = record
-    Family: TBertFamily;       // bert / distilbert (from model_type)
+    Family: TBertFamily;       // bert / distilbert / roberta (model_type)
     HiddenSize: integer;       // d_model (hidden_size; distilbert: dim)
     IntermediateSize: integer; // FFN width (intermediate_size; hidden_dim)
     NumLayers: integer;        // encoder blocks (num_hidden_layers; n_layers)
@@ -410,8 +431,12 @@ type
                                // distilbert hardcodes 1e-12)
     HiddenActTanh: boolean;    // true = gelu_new/gelu_pytorch_tanh (tanh
                                // approximation); false = exact erf "gelu"
+    PositionOffset: integer;   // first position-table row actually used:
+                               // 0 for bert/distilbert; pad_token_id+1 = 2
+                               // for roberta (rows 0..1 are NEVER read and
+                               // usable SeqLen is MaxPositions - 2)
     Prefix: string;            // tensor-name prefix ('' or 'bert.' /
-                               // 'distilbert.')
+                               // 'distilbert.' / 'roberta.')
   end;
 
 // Reads a HF BERT-family config.json (model_type 'bert' or 'distilbert').
@@ -424,6 +449,8 @@ type
 // max_position_embeddings; activation defaults to 'gelu'; TypeVocabSize is
 // forced to 0 (no token-type embeddings) and LayerNormEps to 1e-12 (the
 // value modeling_distilbert hardcodes).
+// roberta - the bert keys, plus PositionOffset := pad_token_id (default 1)
+// + 1: the first usable position-table row (see the header).
 // Prefix is left '' - the builder detects it.
 function ReadBertConfigFromJSONFile(const FileName: string): TBertConfig;
 
@@ -449,6 +476,10 @@ function BertConfigToString(const Config: TBertConfig): string;
 // but maps the DistilBERT tensor names, skips the token-type branch
 // (channel 1 of the input is IGNORED - feed zeros) and rejects
 // pIncludePooler (DistilBERT has no pooler).
+// Config.Family = bfRoberta keeps the BERT names but loads the position
+// table with Config.PositionOffset (= 2) rows skipped and caps SeqLen at
+// MaxPositions - PositionOffset; checkpoint position rows 0..1 are NEVER
+// read (see the ROBERTA paragraph of the unit header).
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false): TNNet;
@@ -508,15 +539,16 @@ procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, llama, mistral, qwen2, bert, distilbert. Anything else raises
-// EPretrainedImportError listing the supported types. The explicit builders
-// stay public for callers that want a compile-time architecture choice.
-// OUTPUT SEMANTICS DIFFER BY model_type: the decoder families return
-// causal-LM nets ((SeqLen,1,1) token ids in, (SeqLen,1,vocab) logits out),
-// while 'bert'/'distilbert' return an ENCODER ((SeqLen,1,2)
-// token|token-type ids in - channel 1 IGNORED for distilbert -
-// (SeqLen,1,hidden_size) final hidden states out, pooler NOT included -
-// call BuildBertFromSafeTensors directly for the pooler head; bert only).
+// gpt_neo, llama, mistral, qwen2, bert, distilbert, roberta. Anything else
+// raises EPretrainedImportError listing the supported types. The explicit
+// builders stay public for callers that want a compile-time architecture
+// choice. OUTPUT SEMANTICS DIFFER BY model_type: the decoder families
+// return causal-LM nets ((SeqLen,1,1) token ids in, (SeqLen,1,vocab)
+// logits out), while the bert family returns an ENCODER ((SeqLen,1,2)
+// token|token-type ids in - channel 1 IGNORED for distilbert, zeros for
+// roberta - (SeqLen,1,hidden_size) final hidden states out, pooler NOT
+// included - call BuildBertFromSafeTensors directly for the pooler head;
+// bert/roberta only).
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -1908,10 +1940,12 @@ begin
       Result.Family := bfBert
     else if ModelType = 'distilbert' then
       Result.Family := bfDistilBert
+    else if ModelType = 'roberta' then
+      Result.Family := bfRoberta
     else
       ImportError('BERT import: config model_type is "' + ModelType +
-        '" - expected "bert" or "distilbert" (RoBERTa has different ' +
-        'embedding quirks; see BuildFromPretrained for the full dispatch).');
+        '" - expected "bert", "distilbert" or "roberta" (see ' +
+        'BuildFromPretrained for the full dispatch).');
     if Result.Family = bfDistilBert then
     begin
       // DistilBertConfig spells everything differently and hardcodes the
@@ -1941,6 +1975,22 @@ begin
       Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-12);
       HiddenAct := Obj.Get('hidden_act', 'gelu');
     end;
+    // RoBERTa: real-token position ids start at padding_idx+1 (HF
+    // create_position_ids_from_input_ids), so the first usable row of the
+    // checkpoint's position table is pad_token_id+1 = 2 for every
+    // published RoBERTa config (pad_token_id 1).
+    if Result.Family = bfRoberta then
+    begin
+      Result.PositionOffset := Obj.Get('pad_token_id', 1) + 1;
+      if (Result.PositionOffset < 1) or
+         (Result.PositionOffset >= Result.MaxPositions) then
+        ImportError('BERT import: roberta pad_token_id ' +
+          IntToStr(Result.PositionOffset - 1) + ' leaves no usable ' +
+          'positions (max_position_embeddings=' +
+          IntToStr(Result.MaxPositions) + ').');
+    end
+    else
+      Result.PositionOffset := 0;
     if HiddenAct = 'gelu' then
       Result.HiddenActTanh := False // exact erf form (the BERT default)
     else if (HiddenAct = 'gelu_new') or
@@ -1961,6 +2011,8 @@ function BertConfigToString(const Config: TBertConfig): string;
 begin
   if Config.Family = bfDistilBert then
     Result := 'distilbert config: layers='
+  else if Config.Family = bfRoberta then
+    Result := 'roberta config: layers='
   else
     Result := 'bert config: layers=';
   Result := Result + IntToStr(Config.NumLayers) +
@@ -1975,6 +2027,8 @@ begin
     Result := Result + ', act=gelu_tanh'
   else
     Result := Result + ', act=gelu_exact';
+  if Config.PositionOffset > 0 then
+    Result := Result + ', pos_offset=' + IntToStr(Config.PositionOffset);
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -1994,7 +2048,7 @@ var
   InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN: TNNetLayer;
   PoolerDense: TNNetLayer;
   BranchInput, SliceLayer, HiddenAct, PhiBranch: TNNetLayer;
-  BlockCnt, SeqLen, i: integer;
+  BlockCnt, SeqLen, UsablePositions, i: integer;
   BlockPrefix, TensorNameStr, FamilyPrefix: string;
   QName, KName, VName, AttnDenseName, AttnLNName: string;
   InterName, OutDenseName, OutLNName: string;
@@ -2007,11 +2061,15 @@ var
 
   // Loads a [Rows, Cols] embedding table straight into the single-neuron
   // weight volume of a TNNetEmbedding / TNNetLearnedPositionalEmbedding
-  // (row-major in both the checkpoint and the layer).
+  // (row-major in both the checkpoint and the layer). SrcRowOffset > 0
+  // SKIPS the first SrcRowOffset checkpoint rows (the layer table then has
+  // Rows - SrcRowOffset rows): the RoBERTa position-table case, where rows
+  // 0..PositionOffset-1 are padding-position rows that are NEVER read.
   procedure LoadEmbeddingTable(Layer: TNNetLayer; const TName: string;
-    Rows, Cols: integer);
+    Rows, Cols: integer; SrcRowOffset: integer = 0);
   var
     Tmp: TNNetVolume;
+    ElementCnt, UsedSize: integer;
   begin
     if not Reader.HasTensor(TName) then
       ImportError('BERT import: missing tensor "' + TName + '".');
@@ -2024,11 +2082,17 @@ var
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(TName, Tmp);
-      if Layer.Neurons[0].Weights.Size <> Tmp.Size then
-        ImportError('BERT import: "' + TName + '" element count ' +
-          IntToStr(Tmp.Size) + ' does not match the table size ' +
+      UsedSize := (Rows - SrcRowOffset) * Cols;
+      if Layer.Neurons[0].Weights.Size <> UsedSize then
+        ImportError('BERT import: "' + TName + '" usable element count ' +
+          IntToStr(UsedSize) + ' does not match the table size ' +
           IntToStr(Layer.Neurons[0].Weights.Size) + '.');
-      Layer.Neurons[0].Weights.Copy(Tmp);
+      if SrcRowOffset = 0 then
+        Layer.Neurons[0].Weights.Copy(Tmp)
+      else
+        for ElementCnt := 0 to UsedSize - 1 do
+          Layer.Neurons[0].Weights.FData[ElementCnt] :=
+            Tmp.FData[SrcRowOffset * Cols + ElementCnt];
       Layer.FlushWeightCache();
     finally
       Tmp.Free;
@@ -2056,10 +2120,12 @@ begin
       if (Config.Family = bfDistilBert) and pIncludePooler then
         ImportError('BERT import: DistilBERT has no pooler head - ' +
           'pIncludePooler is not available for model_type "distilbert".');
-      // BertModel/DistilBertModel serialize without a prefix; BertFor* /
-      // DistilBertFor* exports carry "bert." / "distilbert.". Support both.
+      // The plain *Model classes serialize without a prefix; *For* exports
+      // carry "bert." / "distilbert." / "roberta.". Support both.
       if Config.Family = bfDistilBert then
         FamilyPrefix := 'distilbert.'
+      else if Config.Family = bfRoberta then
+        FamilyPrefix := 'roberta.'
       else
         FamilyPrefix := 'bert.';
       if Reader.HasTensor('embeddings.word_embeddings.weight') then
@@ -2072,12 +2138,24 @@ begin
           '"embeddings.word_embeddings.weight" nor "' +
           FamilyPrefix + 'embeddings.word_embeddings.weight" found in ' +
           Reader.FileName + ' - not a checkpoint of this family?');
-      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      if (Config.PositionOffset < 0) or
+         (Config.PositionOffset >= Config.MaxPositions) then
+        ImportError('BERT import: PositionOffset=' +
+          IntToStr(Config.PositionOffset) + ' leaves no usable positions ' +
+          '(max_position_embeddings=' + IntToStr(Config.MaxPositions) +
+          ').');
+      // RoBERTa burns the first PositionOffset (= pad_token_id+1 = 2) rows
+      // of the position table on padding positions: the usable context is
+      // SHORTER than the table (the 514-rows-for-512-positions layout).
+      UsablePositions := Config.MaxPositions - Config.PositionOffset;
+      if pSeqLen <= 0 then SeqLen := UsablePositions
       else SeqLen := pSeqLen;
-      if SeqLen > Config.MaxPositions then
+      if SeqLen > UsablePositions then
         ImportError('BERT import: requested SeqLen=' + IntToStr(SeqLen) +
-          ' exceeds max_position_embeddings=' +
-          IntToStr(Config.MaxPositions) + '.');
+          ' exceeds the usable context ' + IntToStr(UsablePositions) +
+          ' (max_position_embeddings=' + IntToStr(Config.MaxPositions) +
+          ' minus position offset ' + IntToStr(Config.PositionOffset) +
+          ').');
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
@@ -2090,8 +2168,10 @@ begin
       NN.AddLayer( TNNetSplitChannels.Create([0]) );
       WordEmb := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      // The structural table only carries the USABLE rows: row p is
+      // checkpoint row p + PositionOffset (0 for bert/distilbert).
       PosEmb := NN.AddLayer(
-        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
+        TNNetLearnedPositionalEmbedding.Create(UsablePositions) );
       TypeEmb := nil;
       if Config.TypeVocabSize > 0 then
       begin
@@ -2168,9 +2248,11 @@ begin
       LoadEmbeddingTable(WordEmb,
         Config.Prefix + 'embeddings.word_embeddings.weight',
         Config.VocabSize, Config.HiddenSize);
+      // PositionOffset > 0 (roberta): checkpoint rows 0..PositionOffset-1
+      // are padding-position rows and are NEVER read.
       LoadEmbeddingTable(PosEmb,
         Config.Prefix + 'embeddings.position_embeddings.weight',
-        Config.MaxPositions, Config.HiddenSize);
+        Config.MaxPositions, Config.HiddenSize, Config.PositionOffset);
       if Config.TypeVocabSize > 0 then
         LoadEmbeddingTable(TypeEmb,
           Config.Prefix + 'embeddings.token_type_embeddings.weight',
@@ -2282,7 +2364,8 @@ begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
         if Pos('embeddings.position_ids', TensorNameStr) > 0 then continue;
-        if (Config.Family = bfBert) and (not pIncludePooler) and
+        if (Config.Family in [bfBert, bfRoberta]) and
+           (not pIncludePooler) and
            (Pos('pooler.dense.', TensorNameStr) > 0) then continue;
         ImportError('BERT import: unexpected tensor "' + TensorNameStr +
           '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
@@ -2546,12 +2629,13 @@ begin
           (ModelType = 'qwen2') then
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
-  else if (ModelType = 'bert') or (ModelType = 'distilbert') then
+  else if (ModelType = 'bert') or (ModelType = 'distilbert') or
+          (ModelType = 'roberta') then
     // ENCODER route: input (SeqLen,1,2) token|token-type ids (channel 1
-    // ignored for distilbert), output (SeqLen,1,hidden) final hidden
-    // states - NOT causal-LM logits (see the interface comment). Pooler
-    // excluded; call BuildBertFromSafeTensors directly to include it
-    // (bert only - distilbert has none).
+    // ignored for distilbert, zeros for roberta), output (SeqLen,1,hidden)
+    // final hidden states - NOT causal-LM logits (see the interface
+    // comment). Pooler excluded; call BuildBertFromSafeTensors directly to
+    // include it (bert/roberta - distilbert has none).
     Result := BuildBertFromSafeTensorsEx(WeightsPath, IgnoredBertConfig,
       pSeqLen, pInferenceOnly, {pIncludePooler=}false, ConfigPath)
   else
@@ -2560,7 +2644,7 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, llama, mistral, qwen2, bert, ' +
-      'distilbert.');
+      'distilbert, roberta.');
   end;
 end;
 

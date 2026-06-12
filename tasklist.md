@@ -424,7 +424,7 @@ rather than acted on.
       sentence in the venv, and the demo ranks the paraphrase above the
       distractors. NLP + pretrained-import priority; depends only on
       landed pieces (BuildBertFromSafeTensors + neuralhftokenizer).
-- [ ] RoBERTa importer delta on BuildBertFromSafeTensors: same skeleton and
+- [X] RoBERTa importer delta on BuildBertFromSafeTensors: same skeleton and
       tensor names modulo the 'roberta.' prefix, but position ids start at
       padding_idx+1 = 2 (load position_embeddings rows offset by 2 and cap
       usable SeqLen at max_position_embeddings-2), type_vocab_size = 1
