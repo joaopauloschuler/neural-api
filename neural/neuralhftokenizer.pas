@@ -890,7 +890,11 @@ begin
     // ---- model -------------------------------------------------
     ModelObj := RootObj.Objects['model'];
     FWordPiece := ModelObj.Get('type', '') = 'WordPiece';
-    if (not FWordPiece) and (ModelObj.Get('type', '') <> 'BPE') then
+    // pre-2021 tokenizer.json files (e.g. openai-community/gpt2) omit
+    // model.type entirely; the merges key marks them as BPE
+    if (not FWordPiece) and (ModelObj.Get('type', '') <> 'BPE') and
+      not ((ModelObj.Get('type', '') = '') and
+        (ModelObj.IndexOfName('merges') >= 0)) then
       raise EHFTokenizerError.Create('Unsupported model.type "' +
         ModelObj.Get('type', '') +
         '" (only BPE and WordPiece are supported; Unigram is not)');
