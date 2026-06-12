@@ -17,6 +17,12 @@ unit neuralpretrained;
 //     [head_dim] shared across heads, plus an optionally DECOUPLED
 //     head_dim where num_heads*head_dim <> hidden_size) -
 //     BuildQwen3FromSafeTensors.
+//   - Gemma 1 (the Llama skeleton with three LOAD-TIME deltas: GeGLU MLP
+//     - gated tanh-GELU, TNNetGEGLU instead of TNNetSwiGLU; zero-centered
+//     RMSNorm - gains stored as 1+w; embedding output scaled by
+//     sqrt(hidden_size) - folded into the embedding rows, NOT the tied LM
+//     head; always-tied head; 2B is MQA via num_key_value_heads=1, 7B uses
+//     the decoupled head_dim=256) - BuildGemmaFromSafeTensors.
 //   - GPT-Neo (EleutherAI's GPT-3 replica; the roneneldan/TinyStories
 //     checkpoints share this architecture) - BuildGPTNeoFromSafeTensors.
 //     See the GPT-NEO IMPORT section below.
@@ -492,6 +498,12 @@ type
     QKVBias: boolean;          // q/k/v projections carry biases (Qwen2)
     HeadDim: integer;          // per-head width; 0 = hidden_size/num_heads
     QKNorm: boolean;           // per-head RMSNorm on q/k pre-RoPE (Qwen3)
+    GegluFFN: boolean;         // gated-GELU (tanh) MLP instead of SwiGLU
+                               // (Gemma: hidden_act gelu_pytorch_tanh)
+    RMSNormAddOne: boolean;    // zero-centered RMSNorm: gain = 1 + w (Gemma)
+    EmbedScale: TNeuralFloat;  // embedding-output scale folded into the
+                               // embedding rows at load (Gemma: sqrt(d));
+                               // 0 or 1 = off
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -513,6 +525,16 @@ type
 //            shape [head_dim] shared across heads); QKVBias :=
 //            attention_bias (default false - Qwen3 dropped the biases);
 //            use_sliding_window=true is rejected like Qwen2;
+//   gemma:   GegluFFN := true (gated-GELU MLP - hidden_act/hidden_activation
+//            must be gelu / gelu_new / gelu_pytorch_tanh; older HF configs
+//            say "gelu" but Gemma means the tanh approximation, transformers
+//            special-cases this and so does this reader); RMSNormAddOne :=
+//            true (Gemma applies (1+w)*xhat - the builder stores 1+w into
+//            the TNNetTokenRMSNorm gains); EmbedScale := sqrt(hidden_size)
+//            (Gemma scales the embedding OUTPUT - folded into the embedding
+//            rows at load, NOT into the tied LM head); tie_word_embeddings
+//            defaults TRUE (Gemma always ties); QKVBias := attention_bias
+//            (default false);
 //   llama:   QKVBias := attention_bias (default false).
 // Fails on an unsupported model_type and on a non-null rope_scaling
 // (long-context scaling is not wired here yet).
@@ -575,6 +597,25 @@ function BuildQwen3FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildQwen3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+// Gemma 1: the Llama skeleton with three load-time deltas (no new layers):
+// (a) the embedding OUTPUT is scaled by sqrt(hidden_size) - folded into the
+//     embedding rows at load (the tied LM head keeps the UNSCALED rows, as
+//     in HF GemmaForCausalLM);
+// (b) zero-centered RMSNorm - Gemma computes (1 + w) * xhat, so 1 + w is
+//     stored into every TNNetTokenRMSNorm gain at load;
+// (c) gated-GELU MLP (GeGLU, hidden_act gelu_pytorch_tanh) - TNNetGEGLU
+//     replaces TNNetSwiGLU in the FFN (same fused up|gate packing).
+// Gemma-2B's multi-query attention (num_key_value_heads=1) and Gemma-7B's
+// decoupled head_dim=256 ride the landed GQA/head_dim paths unchanged.
+// Thin wrappers over the Llama path that ASSERT model_type is 'gemma'.
+function BuildGemmaFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildGemmaFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
 type
@@ -1448,7 +1489,7 @@ var
   JsonText: TStringList;
   Root: TJSONData;
   Obj: TJSONObject;
-  ModelType: string;
+  ModelType, HiddenAct: string;
   RopeScaling, HeadDimField, SlidingWindowField: TJSONData;
 
   function RequiredInt(const FieldName: string): integer;
@@ -1483,10 +1524,11 @@ begin
     Obj := TJSONObject(Root);
     ModelType := Obj.Get('model_type', 'llama');
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
-       (ModelType <> 'qwen2') and (ModelType <> 'qwen3') then
+       (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
+       (ModelType <> 'gemma') then
       ImportError('Llama import: config model_type is "' + ModelType +
-        '" - only "llama", "mistral", "qwen2" and "qwen3" are supported ' +
-        'here (see BuildFromPretrained for the full dispatch).');
+        '" - only "llama", "mistral", "qwen2", "qwen3" and "gemma" are ' +
+        'supported here (see BuildFromPretrained for the full dispatch).');
     RopeScaling := Obj.Find('rope_scaling');
     if (RopeScaling <> nil) and not RopeScaling.IsNull then
       ImportError('Llama import: config carries a non-null "rope_scaling" - ' +
@@ -1501,7 +1543,10 @@ begin
     Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
     Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
     Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
-    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    // Gemma ALWAYS ties the LM head to the embedding (the HF GemmaConfig
+    // default is tie_word_embeddings=true); the other families default off.
+    Result.TieWordEmbeddings :=
+      Obj.Get('tie_word_embeddings', ModelType = 'gemma');
     // An explicit head_dim is honored even when it is DECOUPLED from
     // hidden_size/num_attention_heads (Qwen3-0.6B: head_dim=128 with
     // hidden=1024, heads=16). Absent/null leaves HeadDim=0 and the builder
@@ -1519,6 +1564,9 @@ begin
     Result.SlidingWindow := 0;
     Result.QKVBias := False;
     Result.QKNorm := False;
+    Result.GegluFFN := False;
+    Result.RMSNormAddOne := False;
+    Result.EmbedScale := 1.0;
     if ModelType = 'mistral' then
     begin
       // Many Mistral configs ship sliding_window=null (full attention).
@@ -1547,6 +1595,29 @@ begin
       if Obj.Get('use_sliding_window', False) then
         ImportError('Llama import: Qwen3 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
+    end
+    else if ModelType = 'gemma' then
+    begin
+      // Gemma-1 deltas (all load-time; see the BuildGemmaFromSafeTensors
+      // interface comment): gated-GELU MLP, zero-centered RMSNorm and the
+      // sqrt(d_model) embedding-output scale.
+      Result.GegluFFN := True;
+      Result.RMSNormAddOne := True;
+      Result.EmbedScale := Sqrt(Result.HiddenSize);
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      // The newer "hidden_activation" key wins over the legacy "hidden_act".
+      // Older HF Gemma configs say "gelu" but Gemma means the TANH
+      // approximation (gelu_pytorch_tanh) - transformers special-cases this
+      // and so does this reader: every accepted spelling maps to TNNetGEGLU
+      // (tanh). Anything non-GELU is rejected.
+      HiddenAct := Obj.Get('hidden_activation', '');
+      if HiddenAct = '' then
+        HiddenAct := Obj.Get('hidden_act', 'gelu_pytorch_tanh');
+      if (HiddenAct <> 'gelu') and (HiddenAct <> 'gelu_new') and
+         (HiddenAct <> 'gelu_pytorch_tanh') then
+        ImportError('Llama import: Gemma hidden activation "' + HiddenAct +
+          '" is not supported - expected gelu / gelu_new / ' +
+          'gelu_pytorch_tanh (Gemma''s MLP is gated GELU).');
     end
     else // llama
       Result.QKVBias := Obj.Get('attention_bias', False);
@@ -1578,13 +1649,23 @@ begin
     Result := Result + ', qkv_bias=true';
   if Config.QKNorm then
     Result := Result + ', qk_norm=true';
+  if Config.GegluFFN then
+    Result := Result + ', geglu_ffn=true';
+  if Config.RMSNormAddOne then
+    Result := Result + ', rmsnorm_add_one=true';
+  if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
+    Result := Result + ', embed_scale=' + FloatToStr(Config.EmbedScale);
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
 
 // Loads a HF RMSNorm gain vector [d_model] into a TNNetTokenRMSNorm.
+// GainOffset is added to every stored gain: Gemma's zero-centered RMSNorm
+// computes (1 + w) * xhat, so the Gemma path folds the +1 in at load
+// (GainOffset = 1) with zero layer changes.
 procedure LoadLlamaRMSNormWeights(Reader: TNNetSafeTensorsReader;
-  Layer: TNNetLayer; const WName: string; d_model: integer);
+  Layer: TNNetLayer; const WName: string; d_model: integer;
+  GainOffset: TNeuralFloat = 0);
 var
   Tmp: TNNetVolume;
   i: integer;
@@ -1598,7 +1679,7 @@ begin
   try
     Reader.LoadTensorFlat(WName, Tmp);
     for i := 0 to d_model - 1 do
-      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i]; // gain
+      Layer.Neurons[0].Weights.FData[i] := GainOffset + Tmp.FData[i]; // gain
   finally
     Tmp.Free;
   end;
@@ -1766,6 +1847,7 @@ var
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, i, j, d: integer;
+  NormGainOffset: TNeuralFloat;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr, LMHeadName: string;
   QBiasName, KBiasName, VBiasName: string;
@@ -1931,16 +2013,22 @@ begin
         Blocks[BlockCnt].OProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
-        // MLP sub-block: x := x + down(silu(gate(h)) * up(h)), h = RMSNorm(x).
-        // TNNetSwiGLU computes FIRSTHALF * Swish(SECONDHALF), so the fused
+        // MLP sub-block: x := x + down(act(gate(h)) * up(h)), h = RMSNorm(x),
+        // where act is SiLU (SwiGLU, the Llama default) or tanh-GELU (GeGLU,
+        // Gemma's gelu_pytorch_tanh - Config.GegluFFN). Both TNNetSwiGLU and
+        // TNNetGEGLU compute FIRSTHALF * act(SECONDHALF), so the fused
         // projection holds up_proj in neurons 0..I-1 and gate_proj in
-        // neurons I..2I-1 (see LoadLlamaLinearWeights calls below).
+        // neurons I..2I-1 (see LoadLlamaLinearWeights calls below) for
+        // either activation.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].MlpNorm :=
           NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         Blocks[BlockCnt].GateUp := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
-        NN.AddLayer( TNNetSwiGLU.Create() );
+        if Config.GegluFFN then
+          NN.AddLayer( TNNetGEGLU.Create() )
+        else
+          NN.AddLayer( TNNetSwiGLU.Create() );
         Blocks[BlockCnt].Down := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
@@ -1953,6 +2041,10 @@ begin
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
+      // Config.RMSNormAddOne (Gemma): every RMSNorm gain is stored as 1 + w
+      // (zero-centered checkpoint weights) - folded in by the loader.
+      if Config.RMSNormAddOne then NormGainOffset := 1.0
+      else NormGainOffset := 0;
       Tmp := TNNetVolume.Create;
       try
         // embed_tokens -> embedding table (vocab rows of d floats,
@@ -1963,6 +2055,13 @@ begin
             IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
             IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
         EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        // Config.EmbedScale (Gemma: sqrt(hidden_size)) scales the embedding
+        // OUTPUT; TNNetEmbedding's ScaleEmbedding is init-only, so the scale
+        // is folded into the embedding ROWS instead. ONLY the embedding copy
+        // is scaled - the tied LM head below reads the UNSCALED Tmp rows,
+        // matching HF GemmaForCausalLM (the head ties to the raw matrix).
+        if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
+          EmbeddingLayer.Neurons[0].Weights.Mul(Config.EmbedScale);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_tokens.weight');
         if Config.TieWordEmbeddings then
@@ -1992,7 +2091,8 @@ begin
       begin
         BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
         LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].AttnNorm,
-          BlockPrefix + 'input_layernorm.weight', Config.HiddenSize);
+          BlockPrefix + 'input_layernorm.weight', Config.HiddenSize,
+          NormGainOffset);
         MarkConsumed(BlockPrefix + 'input_layernorm.weight');
         // q_proj/k_proj rows are PERMUTED per head for the rotate_half
         // convention (RotaryHeadDim); v_proj/o_proj load straight.
@@ -2042,7 +2142,8 @@ begin
           QWidth, Config.HiddenSize);
         MarkConsumed(BlockPrefix + 'self_attn.o_proj.weight');
         LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].MlpNorm,
-          BlockPrefix + 'post_attention_layernorm.weight', Config.HiddenSize);
+          BlockPrefix + 'post_attention_layernorm.weight', Config.HiddenSize,
+          NormGainOffset);
         MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
         // Fused gate/up: up_proj -> neurons 0..I-1 (SwiGLU's linear half),
         // gate_proj -> neurons I..2I-1 (SwiGLU's Swish-gated half).
@@ -2062,7 +2163,7 @@ begin
         MarkConsumed(BlockPrefix + 'mlp.down_proj.weight');
       end;
       LoadLlamaRMSNormWeights(Reader, FinalNorm,
-        Config.Prefix + 'norm.weight', Config.HiddenSize);
+        Config.Prefix + 'norm.weight', Config.HiddenSize, NormGainOffset);
       MarkConsumed(Config.Prefix + 'norm.weight');
 
       // ---------------- Unexpected-tensor check ----------------
@@ -4883,7 +4984,7 @@ begin
     IgnoredConfig, nil, pSeqLen, pNumHeads, pInferenceOnly);
 end;
 
-// ================== MISTRAL / QWEN2 / QWEN3 / DISPATCH =====================
+// ============= MISTRAL / QWEN2 / QWEN3 / GEMMA / DISPATCH ==================
 
 // Shared wrapper: builds via the Llama path and asserts the config's
 // model_type is the expected family.
@@ -4955,6 +5056,24 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildGemmaFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'gemma', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName);
+end;
+
+function BuildGemmaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildGemmaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly);
 end;
 
@@ -5237,7 +5356,11 @@ begin
     Result := BuildPhiFromSafeTensorsEx(WeightsPath, IgnoredPhiConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
-          (ModelType = 'qwen2') or (ModelType = 'qwen3') then
+          (ModelType = 'qwen2') or (ModelType = 'qwen3') or
+          (ModelType = 'gemma') then
+    // 'gemma' (architectures ["GemmaForCausalLM"]) rides the same path: the
+    // config reader raises the Gemma flags (GeGLU FFN, zero-centered
+    // RMSNorm, sqrt(d) embedding scale) from model_type alone.
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
@@ -5255,7 +5378,7 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
-      'qwen2, qwen3, bert, distilbert, roberta.');
+      'qwen2, qwen3, gemma, bert, distilbert, roberta.');
   end;
 end;
 

@@ -90,6 +90,7 @@ type
     procedure TestMistralLogitParity;
     procedure TestQwen2LogitParity;
     procedure TestQwen3LogitParity;
+    procedure TestGemmaLogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
     procedure TestGPTNeoXConfigFromJSONFile;
@@ -1622,6 +1623,71 @@ begin
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_logits.json'), Config.MaxPositions,
       Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Gemma-1 import target: tests/fixtures/tiny_gemma.* is a pico
+// randomly-initialized HF GemmaForCausalLM (2 layers, 2 query heads sharing
+// 1 kv head - MQA, the Gemma-2B shape - DECOUPLED head_dim=6 with hidden=8
+// - the Gemma-7B quirk - vocab 13, ALWAYS-tied lm_head) exercising all
+// three Gemma-1 load-time deltas on the Llama path:
+// (a) GeGLU MLP - gated tanh-GELU; the generator tools/gemma_tiny_fixture.py
+//     amplifies the gate pre-activations and asserts the same weights under
+//     the Llama-default SiLU gate move the logits by ~2.6e-3 (above the 1e-4
+//     gate, so a SwiGLU mix-up FAILS this test); the committed config says
+//     "hidden_act": "gelu" - the LEGACY spelling that Gemma means as the
+//     tanh approximation (the reader must match transformers' special-case);
+//     a TNNetGEGLU layer must be present STRUCTURALLY;
+// (b) zero-centered RMSNorm - gains stored as 1+w (w re-randomized by the
+//     generator, which asserts zeroing them changes the logits by ~4.8e-2);
+// (c) embedding output scaled by sqrt(hidden_size) folded into the embedding
+//     rows ONLY (the tied head reads the unscaled rows).
+// Reference logits come from HF transformers in float64. The
+// BuildFromPretrained model_type "gemma" dispatch route is covered too.
+procedure TTestNeuralPretrained.TestGemmaLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt: integer;
+  HasGeglu: boolean;
+begin
+  RandSeed := 424242;
+  NN := BuildGemmaFromSafeTensorsEx(FixturePath('tiny_gemma.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gemma_config.json'));
+  try
+    AssertEquals('model_type', 'gemma', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads (MQA)', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('head_dim', 6, Config.HeadDim);
+    AssertFalse('qkv_bias', Config.QKVBias);
+    AssertTrue('geglu_ffn', Config.GegluFFN);
+    AssertTrue('rmsnorm_add_one', Config.RMSNormAddOne);
+    AssertEquals('embed_scale=sqrt(8)', Sqrt(8), Config.EmbedScale, 1e-5);
+    AssertTrue('tied (Gemma always ties)', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    HasGeglu := false;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt] is TNNetGEGLU then HasGeglu := true;
+    AssertTrue('Gemma MLP must use TNNetGEGLU, not TNNetSwiGLU', HasGeglu);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gemma_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "gemma" (architectures ["GemmaForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_gemma.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gemma_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gemma_logits.json'), 16, 13);
   finally
     NN.Free;
   end;

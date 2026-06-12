@@ -492,23 +492,30 @@ rather than acted on.
       easier first Pascal→Python round-trip than the listed safetensors
       writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
-- [ ] Gemma 1 - GeGLU FFN wiring: Gemma's MLP is gated GELU, not SwiGLU.
-      TNNetGELU already implements the exact tanh approximation Gemma
-      specifies (gelu_pytorch_tanh), so this is letting the importer's
-      gated-FFN construction take the gate activation as a parameter
-      (GELU vs SiLU) rather than any new layer. Test: gated-FFN forward
-      parity against transformers' GemmaMLP on a pinned tensor.
-- [ ] Gemma 1 - BuildGemmaFromSafeTensors importer (load-time weight
-      folding on the landed Llama path; depends on the GeGLU task above —
-      the decoupled head_dim config override Gemma-7B needs is already
-      landed on the Llama config reader via the Qwen3 work): (a) embedding output scaled by sqrt(d_model) — fold
-      sqrt(d) into the embedding ROWS at load since TNNetEmbedding's
-      ScaleEmbedding is init-only, and scale ONLY the embedding copy, not
-      the tied LM-head copy (Gemma always ties); (b) zero-centered RMSNorm
-      — Gemma applies (1+w)*xhat, so store 1+w into TNNetTokenRMSNorm
-      weights at load, zero layer changes; (c) MQA on 2B via the landed
-      GQA builder at KVHeads=1. Verify with the HF-parity fixture tooling
-      (sliced pico-Gemma) against GemmaForCausalLM, tied-head case.
+- [X] Gemma 1 - GeGLU FFN wiring: DONE 2026-06-12 — no new layer: the
+      existing TNNetGEGLU (A * tanh-GELU(B), same up|gate half packing as
+      TNNetSwiGLU) is selected by the new TLlamaConfig.GegluFFN flag in
+      BuildLlamaFromSafeTensorsWithConfig; the config reader raises it for
+      model_type "gemma" and accepts gelu / gelu_new / gelu_pytorch_tanh
+      (legacy "gelu" maps to the tanh approx, matching transformers'
+      Gemma special-case). Tested via the tiny_gemma parity fixture, whose
+      generator amplifies the gate pre-activations and asserts GeGLU-vs-SiLU
+      moves the logits ~2.6e-3 (above the 1e-4 parity gate), plus a
+      structural TNNetGEGLU-present assert in TestGemmaLogitParity.
+- [X] Gemma 1 - BuildGemmaFromSafeTensors importer: DONE 2026-06-12 —
+      BuildGemmaFromSafeTensors(Ex) wrappers on the Llama path
+      (model_type "gemma" in the config reader + BuildFromPretrained
+      dispatch). Load-time deltas exactly as planned: (a) sqrt(d_model)
+      folded into the embedding ROWS only (TLlamaConfig.EmbedScale; the
+      tied LM head keeps the unscaled rows — Gemma always ties, reader
+      default flipped for gemma); (b) zero-centered RMSNorm via
+      LoadLlamaRMSNormWeights' new GainOffset=1 (stores 1+w, zero layer
+      changes; TLlamaConfig.RMSNormAddOne); (c) MQA (KVHeads=1) and
+      Gemma-7B's decoupled head_dim ride the landed paths. Verified by
+      tools/gemma_tiny_fixture.py (pico GemmaForCausalLM: MQA, decoupled
+      head_dim=6, tied head, re-randomized norm gains) +
+      TestGemmaLogitParity (direct builder + BuildFromPretrained routes,
+      float64 HF oracle, <1e-4 logit parity).
 - [ ] Gemma 2 - SDPA attention-logit soft-cap hook: the one real LAYER
       change in the Gemma track — Gemma-2 applies cap*tanh(scores/cap)
       (cap 50) to attention logits PRE-softmax, but scores live inside
@@ -525,8 +532,9 @@ rather than acted on.
       sits INSIDE the residual branch (normalize sublayer output before
       the add). Reusable beyond Gemma (several recent models adopt
       sandwich norms).
-- [ ] Gemma 2 - BuildGemma2FromSafeTensors importer (depends on the Gemma-1
-      importer + the two Gemma-2 tasks above): alternating local(4096)/
+- [ ] Gemma 2 - BuildGemma2FromSafeTensors importer (the Gemma-1 importer
+      landed 2026-06-12 — BuildGemmaFromSafeTensors; still depends on the
+      two Gemma-2 tasks above): alternating local(4096)/
       global attention via the landed sliding-window SDPA (same alternating
       pattern as the landed GPT-Neo importer); query_pre_attn_scalar (e.g. 224 on 27B)
       folded into W_q at load (same trick as GPT-Neo's unscaled attention);
