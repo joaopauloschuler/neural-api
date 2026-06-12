@@ -16,6 +16,18 @@ unit neuralsafetensors;
 // via bit manipulation), I64 (converted to single). All loads return 32-bit
 // singles in the same row-major element order as stored.
 //
+// SHARDED CHECKPOINTS: HF repos above ~2B params ship as
+// model-00001-of-000NN.safetensors shards plus a model.safetensors.index.json
+// of the form {"metadata": {...}, "weight_map": {"tensor.name":
+// "model-00001-of-000NN.safetensors", ...}}. Pass the path of the
+// index .json to Create (detected by its ".json" extension) and the reader
+// opens every referenced shard (resolved relative to the index's directory)
+// behind the same API: tensor names span all shards transparently and
+// LoadTensorFlat reads from the owning shard's stream. The weight_map is
+// validated against the shard headers - a tensor mapped to a shard that
+// does not contain it, a duplicate tensor name across shards, or a missing
+// shard file all raise ESafeTensorsError.
+//
 // This unit is coded by Claude (AI).
 {$mode objfpc}{$H+}
 
@@ -32,27 +44,38 @@ type
     DType: string;               // 'F32', 'F16', 'BF16', 'I64', ...
     Shape: array of Int64;       // row-major dims as stored in the file
     DataBegin, DataEnd: Int64;   // byte offsets RELATIVE to the data section
+    Shard: integer;              // index of the owning shard file (0 if single)
   end;
 
   { TNNetSafeTensorsReader }
-  // Opens a safetensors file, parses and validates the header, and loads
-  // named tensors on demand. Raises ESafeTensorsError (with a descriptive
-  // message) on truncated, malformed or inconsistent files - it never
-  // silently returns garbage.
+  // Opens a safetensors file - OR a model.safetensors.index.json describing
+  // a sharded checkpoint (see the unit header) - parses and validates the
+  // header(s), and loads named tensors on demand. Raises ESafeTensorsError
+  // (with a descriptive message) on truncated, malformed or inconsistent
+  // files - it never silently returns garbage.
   TNNetSafeTensorsReader = class
   private
-    FFileName: string;
-    FStream: TFileStream;
-    FDataStart: Int64;           // absolute file offset of the data section
-    FDataSize: Int64;            // byte length of the data section
+    FFileName: string;           // path given to Create (file or index.json)
+    FStreams: array of TFileStream;  // one open stream per shard
+    FShardNames: array of string;    // shard file paths (error messages)
+    FDataStarts: array of Int64; // per shard: absolute offset of data section
+    FDataSizes: array of Int64;  // per shard: byte length of data section
     FTensors: array of TSafeTensorInfo;
     function FindTensor(const pName: string): integer;
-    procedure ParseHeader(const HeaderJson: string);
+    // Opens one .safetensors file, validates and parses its header and
+    // appends its tensors (tagged with the new shard index) to FTensors.
+    // Returns the shard index.
+    function OpenShard(const pShardFileName: string): integer;
+    procedure ParseHeader(const HeaderJson: string; ShardIdx: integer);
+    // Parses a model.safetensors.index.json and opens every referenced shard.
+    procedure OpenFromIndex(const pIndexFileName: string);
   public
     constructor Create(const pFileName: string);
     destructor Destroy; override;
 
     function Count: integer;
+    // Number of open shard files (1 for a plain single-file checkpoint).
+    function ShardCount: integer;
     function TensorName(Index: integer): string;
     function HasTensor(const pName: string): boolean;
     function GetInfo(const pName: string): TSafeTensorInfo;
@@ -133,44 +156,148 @@ end;
 { TNNetSafeTensorsReader }
 
 constructor TNNetSafeTensorsReader.Create(const pFileName: string);
-var
-  HeaderLen: QWord;
-  HeaderBytes: TBytes;
-  HeaderJson: string;
 begin
   inherited Create;
   FFileName := pFileName;
   if not FileExists(pFileName) then
     raise ESafeTensorsError.CreateFmt('safetensors: file not found: %s',
       [pFileName]);
-  FStream := TFileStream.Create(pFileName, fmOpenRead or fmShareDenyWrite);
-  if FStream.Size < 8 then
-    raise ESafeTensorsError.CreateFmt(
-      'safetensors: file too small (%d bytes; need at least the 8-byte ' +
-      'header length): %s', [FStream.Size, pFileName]);
-  FStream.ReadBuffer(HeaderLen, 8); // little-endian uint64 (x86/ARM-LE host)
-  {$IFDEF ENDIAN_BIG}
-  HeaderLen := SwapEndian(HeaderLen);
-  {$ENDIF}
-  if (HeaderLen = 0) or (HeaderLen > QWord(FStream.Size) - 8) then
-    raise ESafeTensorsError.CreateFmt(
-      'safetensors: invalid header length %d (file size %d): %s',
-      [HeaderLen, FStream.Size, pFileName]);
-  SetLength(HeaderBytes, HeaderLen);
-  FStream.ReadBuffer(HeaderBytes[0], HeaderLen);
-  SetString(HeaderJson, PAnsiChar(@HeaderBytes[0]), HeaderLen);
-  FDataStart := 8 + Int64(HeaderLen);
-  FDataSize := FStream.Size - FDataStart;
-  ParseHeader(HeaderJson);
+  // A ".json" extension means a sharded-checkpoint index
+  // (model.safetensors.index.json); anything else is a plain single-file
+  // safetensors checkpoint.
+  if LowerCase(ExtractFileExt(pFileName)) = '.json' then
+    OpenFromIndex(pFileName)
+  else
+    OpenShard(pFileName);
 end;
 
 destructor TNNetSafeTensorsReader.Destroy;
+var
+  i: integer;
 begin
-  FStream.Free;
+  for i := 0 to High(FStreams) do
+    FStreams[i].Free;
   inherited Destroy;
 end;
 
-procedure TNNetSafeTensorsReader.ParseHeader(const HeaderJson: string);
+function TNNetSafeTensorsReader.OpenShard(
+  const pShardFileName: string): integer;
+var
+  HeaderLen: QWord;
+  HeaderBytes: TBytes;
+  HeaderJson: string;
+  Stream: TFileStream;
+begin
+  if not FileExists(pShardFileName) then
+    raise ESafeTensorsError.CreateFmt('safetensors: file not found: %s',
+      [pShardFileName]);
+  Stream := TFileStream.Create(pShardFileName,
+    fmOpenRead or fmShareDenyWrite);
+  Result := Length(FStreams);
+  SetLength(FStreams, Result + 1);
+  SetLength(FShardNames, Result + 1);
+  SetLength(FDataStarts, Result + 1);
+  SetLength(FDataSizes, Result + 1);
+  FStreams[Result] := Stream; // owned (freed by Destroy) from here on
+  FShardNames[Result] := pShardFileName;
+  if Stream.Size < 8 then
+    raise ESafeTensorsError.CreateFmt(
+      'safetensors: file too small (%d bytes; need at least the 8-byte ' +
+      'header length): %s', [Stream.Size, pShardFileName]);
+  Stream.ReadBuffer(HeaderLen, 8); // little-endian uint64 (x86/ARM-LE host)
+  {$IFDEF ENDIAN_BIG}
+  HeaderLen := SwapEndian(HeaderLen);
+  {$ENDIF}
+  if (HeaderLen = 0) or (HeaderLen > QWord(Stream.Size) - 8) then
+    raise ESafeTensorsError.CreateFmt(
+      'safetensors: invalid header length %d (file size %d): %s',
+      [HeaderLen, Stream.Size, pShardFileName]);
+  SetLength(HeaderBytes, HeaderLen);
+  Stream.ReadBuffer(HeaderBytes[0], HeaderLen);
+  SetString(HeaderJson, PAnsiChar(@HeaderBytes[0]), HeaderLen);
+  FDataStarts[Result] := 8 + Int64(HeaderLen);
+  FDataSizes[Result] := Stream.Size - FDataStarts[Result];
+  ParseHeader(HeaderJson, Result);
+end;
+
+procedure TNNetSafeTensorsReader.OpenFromIndex(const pIndexFileName: string);
+var
+  IndexText: TStringList;
+  Root: TJSONData;
+  WeightMap: TJSONData;
+  WeightMapObj: TJSONObject;
+  BaseDir, ShardFile, MappedTensor: string;
+  ShardFiles: TStringList;
+  i, ShardIdx, TensorIdx: integer;
+begin
+  BaseDir := ExtractFilePath(pIndexFileName);
+  IndexText := TStringList.Create;
+  ShardFiles := TStringList.Create;
+  Root := nil;
+  try
+    IndexText.LoadFromFile(pIndexFileName);
+    try
+      Root := GetJSON(IndexText.Text);
+    except
+      on E: Exception do
+        raise ESafeTensorsError.CreateFmt(
+          'safetensors: index is not valid JSON (%s): %s',
+          [E.Message, pIndexFileName]);
+    end;
+    if not (Root is TJSONObject) then
+      raise ESafeTensorsError.CreateFmt(
+        'safetensors: index JSON is not an object: %s', [pIndexFileName]);
+    WeightMap := TJSONObject(Root).Find('weight_map');
+    if not (WeightMap is TJSONObject) then
+      raise ESafeTensorsError.CreateFmt(
+        'safetensors: index has no "weight_map" object: %s',
+        [pIndexFileName]);
+    WeightMapObj := TJSONObject(WeightMap);
+    if WeightMapObj.Count = 0 then
+      raise ESafeTensorsError.CreateFmt(
+        'safetensors: index "weight_map" is empty: %s', [pIndexFileName]);
+    // Open each distinct shard once, in first-mention order.
+    ShardFiles.Sorted := False;
+    for i := 0 to WeightMapObj.Count - 1 do
+    begin
+      if not (WeightMapObj.Items[i].JSONType = jtString) then
+        raise ESafeTensorsError.CreateFmt(
+          'safetensors: index weight_map entry "%s" is not a string: %s',
+          [WeightMapObj.Names[i], pIndexFileName]);
+      ShardFile := WeightMapObj.Items[i].AsString;
+      if ShardFiles.IndexOf(ShardFile) < 0 then
+      begin
+        ShardFiles.Add(ShardFile);
+        OpenShard(BaseDir + ShardFile);
+      end;
+    end;
+    // Validate the weight_map against the shard headers: every mapped
+    // tensor must exist and live in the shard the index claims.
+    for i := 0 to WeightMapObj.Count - 1 do
+    begin
+      MappedTensor := WeightMapObj.Names[i];
+      ShardFile := WeightMapObj.Items[i].AsString;
+      ShardIdx := ShardFiles.IndexOf(ShardFile);
+      TensorIdx := FindTensor(MappedTensor);
+      if TensorIdx < 0 then
+        raise ESafeTensorsError.CreateFmt(
+          'safetensors: index maps tensor "%s" to shard "%s" but no shard ' +
+          'contains it: %s', [MappedTensor, ShardFile, pIndexFileName]);
+      if FTensors[TensorIdx].Shard <> ShardIdx then
+        raise ESafeTensorsError.CreateFmt(
+          'safetensors: index maps tensor "%s" to shard "%s" but it lives ' +
+          'in "%s": %s', [MappedTensor, ShardFile,
+           FShardNames[FTensors[TensorIdx].Shard], pIndexFileName]);
+    end;
+  finally
+    Root.Free;
+    ShardFiles.Free;
+    IndexText.Free;
+  end;
+end;
+
+procedure TNNetSafeTensorsReader.ParseHeader(const HeaderJson: string;
+  ShardIdx: integer);
 var
   Root: TJSONData;
   Obj, TensorObj: TJSONObject;
@@ -178,41 +305,51 @@ var
   i, j, TensorCnt: integer;
   ExpectedBytes, NumElements: Int64;
   ByteSize: integer;
+  ShardName: string;
 begin
+  ShardName := FShardNames[ShardIdx];
   try
     Root := GetJSON(HeaderJson);
   except
     on E: Exception do
       raise ESafeTensorsError.CreateFmt(
         'safetensors: header is not valid JSON (%s): %s',
-        [E.Message, FFileName]);
+        [E.Message, ShardName]);
   end;
   try
     if not (Root is TJSONObject) then
       raise ESafeTensorsError.CreateFmt(
-        'safetensors: header JSON is not an object: %s', [FFileName]);
+        'safetensors: header JSON is not an object: %s', [ShardName]);
     Obj := TJSONObject(Root);
-    SetLength(FTensors, Obj.Count);
-    TensorCnt := 0;
+    // Appends to FTensors: with a sharded checkpoint each shard's header
+    // contributes its own tensors (TensorCnt is the global write cursor).
+    TensorCnt := Length(FTensors);
+    SetLength(FTensors, TensorCnt + Obj.Count);
     for i := 0 to Obj.Count - 1 do
     begin
       if Obj.Names[i] = '__metadata__' then continue;
       if not (Obj.Items[i] is TJSONObject) then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: entry "%s" is not an object: %s',
-          [Obj.Names[i], FFileName]);
+          [Obj.Names[i], ShardName]);
       TensorObj := TJSONObject(Obj.Items[i]);
+      if FindTensor(Obj.Names[i]) >= 0 then
+        raise ESafeTensorsError.CreateFmt(
+          'safetensors: tensor "%s" in shard "%s" duplicates a tensor from ' +
+          'shard "%s".', [Obj.Names[i], ShardName,
+           FShardNames[FTensors[FindTensor(Obj.Names[i])].Shard]]);
       FTensors[TensorCnt].Name := Obj.Names[i];
+      FTensors[TensorCnt].Shard := ShardIdx;
       if TensorObj.IndexOfName('dtype') < 0 then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" has no dtype: %s',
-          [Obj.Names[i], FFileName]);
+          [Obj.Names[i], ShardName]);
       FTensors[TensorCnt].DType := TensorObj.Get('dtype', '');
       if (TensorObj.IndexOfName('shape') < 0) or
          not (TensorObj.Find('shape') is TJSONArray) then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" has no shape array: %s',
-          [Obj.Names[i], FFileName]);
+          [Obj.Names[i], ShardName]);
       ShapeArr := TJSONArray(TensorObj.Find('shape'));
       SetLength(FTensors[TensorCnt].Shape, ShapeArr.Count);
       NumElements := 1;
@@ -222,29 +359,29 @@ begin
         if FTensors[TensorCnt].Shape[j] < 0 then
           raise ESafeTensorsError.CreateFmt(
             'safetensors: tensor "%s" has a negative dimension: %s',
-            [Obj.Names[i], FFileName]);
+            [Obj.Names[i], ShardName]);
         NumElements := NumElements * FTensors[TensorCnt].Shape[j];
       end;
       if (TensorObj.IndexOfName('data_offsets') < 0) or
          not (TensorObj.Find('data_offsets') is TJSONArray) then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" has no data_offsets array: %s',
-          [Obj.Names[i], FFileName]);
+          [Obj.Names[i], ShardName]);
       OffsArr := TJSONArray(TensorObj.Find('data_offsets'));
       if OffsArr.Count <> 2 then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" data_offsets must have 2 entries: %s',
-          [Obj.Names[i], FFileName]);
+          [Obj.Names[i], ShardName]);
       FTensors[TensorCnt].DataBegin := OffsArr.Items[0].AsInt64;
       FTensors[TensorCnt].DataEnd := OffsArr.Items[1].AsInt64;
       if (FTensors[TensorCnt].DataBegin < 0) or
          (FTensors[TensorCnt].DataEnd < FTensors[TensorCnt].DataBegin) or
-         (FTensors[TensorCnt].DataEnd > FDataSize) then
+         (FTensors[TensorCnt].DataEnd > FDataSizes[ShardIdx]) then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" data_offsets [%d, %d) fall outside the ' +
           'data section (size %d): %s',
           [Obj.Names[i], FTensors[TensorCnt].DataBegin,
-           FTensors[TensorCnt].DataEnd, FDataSize, FFileName]);
+           FTensors[TensorCnt].DataEnd, FDataSizes[ShardIdx], ShardName]);
       ByteSize := DTypeByteSize(FTensors[TensorCnt].DType);
       if ByteSize > 0 then
       begin
@@ -257,7 +394,7 @@ begin
             [Obj.Names[i], FTensors[TensorCnt].DType, NumElements,
              ExpectedBytes,
              FTensors[TensorCnt].DataEnd - FTensors[TensorCnt].DataBegin,
-             FFileName]);
+             ShardName]);
       end;
       Inc(TensorCnt);
     end;
@@ -279,6 +416,11 @@ end;
 function TNNetSafeTensorsReader.Count: integer;
 begin
   Result := Length(FTensors);
+end;
+
+function TNNetSafeTensorsReader.ShardCount: integer;
+begin
+  Result := Length(FStreams);
 end;
 
 function TNNetSafeTensorsReader.TensorName(Index: integer): string;
@@ -378,8 +520,8 @@ begin
   Dest.ReSize(integer(NumElements), 1, 1);
   if NumElements = 0 then exit;
   SetLength(RawBytes, Info.DataEnd - Info.DataBegin);
-  FStream.Position := FDataStart + Info.DataBegin;
-  FStream.ReadBuffer(RawBytes[0], Length(RawBytes));
+  FStreams[Info.Shard].Position := FDataStarts[Info.Shard] + Info.DataBegin;
+  FStreams[Info.Shard].ReadBuffer(RawBytes[0], Length(RawBytes));
   if Info.DType = 'F32' then
   begin
     SinglePtr := PSingle(@RawBytes[0]);

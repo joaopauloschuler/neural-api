@@ -367,7 +367,7 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [ ] Sharded safetensors support (model.safetensors.index.json):
+- [X] Sharded safetensors support (model.safetensors.index.json):
       TNNetSafeTensorsReader opens exactly ONE TFileStream, but anything
       above ~2B params (and many smaller repos) ships as
       model-00001-of-000NN.safetensors + an index file. Parse the index
@@ -376,14 +376,19 @@ rather than acted on.
       (and the listed Mistral/Qwen2 importer task, which silently depends
       on this) need no changes. Test: split the pico-Llama parity fixture
       into two shards + index, assert logits bit-identical to the
-      single-file load.
+      single-file load. DONE: TNNetSafeTensorsReader.Create detects a
+      .json path, opens every weight_map shard into a stream pool and
+      validates the map against the shard headers; builders unchanged
+      (pass the index.json path). Fixtures split by
+      tools/shard_tiny_llama_fixture.py; bit-identical-logits +
+      reader-equivalence tests in tests/TestNeuralPretrained.pas.
 - [ ] HF Hub download helper: there is no HTTP anywhere in the import path —
       users must hand-download checkpoint files. A small fphttpclient-based
       resolver (https://huggingface.co/{repo}/resolve/{rev}/{file}, local
       cache dir, skip-if-present, optional token header for gated repos) so
       BuildLlamaFromSafeTensors('TinyLlama/TinyLlama-1.1B-Chat-v1.0') works
-      end to end. Pairs with the sharded-safetensors task (the index file
-      says which shards to fetch) and the tokenizer.json / chat-template
+      end to end. Pairs with the (landed) sharded-safetensors support (the
+      index file says which shards to fetch) and the tokenizer.json / chat-template
       tasks (same repo, same fetch). Keep it a separate opt-in unit so the
       core importers stay offline-only.
 - [ ] PyTorch pytorch_model.bin loader: a RESTRICTED unpickler for the
@@ -497,8 +502,8 @@ rather than acted on.
       (rotary_pct: only the
       first d_rot dims of each head get RoPE; the landed RoPE rotates full
       head dim). Adds "gptj"/"gpt_neox" AutoModel routes; Pythia-70M/160M
-      are CPU-sized parity targets, larger ones depend on the
-      sharded-safetensors task above. Verify against GPTNeoXForCausalLM
+      are CPU-sized parity targets, larger ones load via the (landed)
+      sharded-safetensors support. Verify against GPTNeoXForCausalLM
       with the parity fixture tooling.
 - [ ] Gemma 1 - head_dim config override in the Llama import path: the ONE
       structural gap for Gemma-1 — neural/neuralpretrained.pas (~line 771)

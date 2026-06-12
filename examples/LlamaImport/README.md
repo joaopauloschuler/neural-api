@@ -25,6 +25,11 @@ header for the full discussion):
   `rms_norm_eps`, `rope_theta`, `vocab_size`, `max_position_embeddings`
   and `tie_word_embeddings` are read from the `config.json` next to the
   checkpoint.
+* **Sharded checkpoints** — for repos shipping
+  `model-00001-of-000NN.safetensors` shards, pass the path of the
+  `model.safetensors.index.json` instead of a `.safetensors` file:
+  `TNNetSafeTensorsReader` parses the `weight_map`, opens every shard and
+  serves tensors transparently (no importer changes needed).
 
 Tokenizers (SentencePiece / `tokenizer.json`) are **out of scope** here:
 everything runs on raw token ids.
