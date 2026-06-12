@@ -446,6 +446,25 @@ rather than acted on.
       pooler 2.3e-6, sentence-transformers/all-MiniLM-L6-v2 (the
       sentence-embedding workhorse, model_type bert) hidden 2.4e-6 /
       pooler 1.7e-7.
+- [ ] Sentence-embedding pipeline + semantic-search example on the landed
+      BERT/MiniLM import: the importer is parity-verified against
+      sentence-transformers/all-MiniLM-L6-v2 but nothing turns its
+      (SeqLen,1,hidden) output into a sentence VECTOR — add the
+      sentence-transformers pooling recipe (attention-mask-aware MEAN
+      pooling over real tokens only, ignoring [PAD]; then L2 normalize)
+      as a small helper in neural/neuralpretrained.pas (e.g.
+      EncodeSentence: tokenizer.json text in, normalized embedding out),
+      plus an examples/SemanticSearch demo that embeds a small corpus and
+      ranks it by cosine similarity for a query — the first end-to-end
+      USE of an imported encoder (GPT2Import/LlamaImport cover decoders;
+      no encoder example exists). Mask-aware mean over a variable-length
+      prefix is the part the layer zoo doesn't give for free
+      (TNNetAvgChannel averages all N positions, pads included — see its
+      known N^2 bag scaling); a manual sum/count over Output suffices.
+      Verify: cosine(Pascal, sentence_transformers.encode()) > 0.999 per
+      sentence in the venv, and the demo ranks the paraphrase above the
+      distractors. NLP + pretrained-import priority; depends only on
+      landed pieces (BuildBertFromSafeTensors + neuralhftokenizer).
 - [ ] RoBERTa importer delta on BuildBertFromSafeTensors: same skeleton and
       tensor names modulo the 'roberta.' prefix, but position ids start at
       padding_idx+1 = 2 (load position_embeddings rows offset by 2 and cap
