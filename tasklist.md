@@ -473,6 +473,39 @@ rather than acted on.
       easier first Pascal→Python round-trip than the listed safetensors
       writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
+- [ ] Cerebras-GPT parity verification (possibly ZERO-code "GPT-3 import"):
+      Cerebras-GPT is the truest open GPT-3 reproduction (exact GPT-3
+      recipe — dense attention, learned absolute positions, GPT-2 BPE,
+      Chinchilla-scaled) and its HF checkpoints ship as model_type "gpt2"
+      in GPT2LMHeadModel format, so BuildGPT2FromSafeTensors may load
+      cerebras/Cerebras-GPT-111M TODAY. Task: run the existing GPT-2
+      parity tooling (slicer + logit dump + compare) against it, fix
+      whatever config tolerance breaks (n_positions=2048 etc.), and pin a
+      sliced parity fixture. The cheapest credible answer to "import a
+      trained GPT-3-class model"; doc cross-link target for
+      ../gpt-3-for-pascal.
+- [ ] GPT-Neo importer (EleutherAI's GPT-3 replica — the open
+      implementation of GPT-3's ALTERNATING dense / locally-banded sparse
+      attention): odd layers use a 256-key local window, which the landed
+      sliding-window SDPA (FWindow / TNNetSlidingWindowMaskedFill) already
+      covers. Two quirks: attention is UNSCALED (no 1/sqrt(d) — fold the
+      compensating factor into W_q at load time, zero layer changes), and
+      weights are plain Linear orientation rather than GPT-2's transposed
+      Conv1D. Adds the "gpt_neo" route to the AutoModel-dispatch task.
+      Verify with the HF-parity fixture tooling against GPTNeoForCausalLM
+      (EleutherAI/gpt-neo-125m is CPU-sized).
+- [ ] GPT-J / GPT-NeoX (Pythia) importer — the workhorse open GPT-3-class
+      science suite (Pythia: 70M..12B with many training-step snapshots,
+      untied embeddings; the untied-head path landed with the Llama
+      importer). Two new ingredients: the PARALLEL residual block
+      (x + Attn(LN(x)) + FFN(LN(x)) — one residual add of both branches, a
+      builder variant; gptj uses one shared LN, gpt_neox two, gated by
+      use_parallel_residual) and PARTIAL rotary (rotary_pct: only the
+      first d_rot dims of each head get RoPE; the landed RoPE rotates full
+      head dim). Adds "gptj"/"gpt_neox" AutoModel routes; Pythia-70M/160M
+      are CPU-sized parity targets, larger ones depend on the
+      sharded-safetensors task above. Verify against GPTNeoXForCausalLM
+      with the parity fixture tooling.
 
 ## Layer follow-ups that fix real limitations
 
