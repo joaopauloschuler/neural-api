@@ -32,6 +32,12 @@ GPT2Import <model.safetensors> [SeqLen] [NumHeads] [t0 t1 t2 ...]
   xl 1600→25). The tiny test fixture needs an explicit `2`.
 * `t0 t1 ...` — prompt token ids (default `464`, which is `"The"` in the
   real GPT-2 BPE vocabulary).
+* `-temp X` — sampling temperature: each step softmaxes `logits/X` and
+  draws from the distribution instead of taking the greedy argmax.
+* `-topk K` — keep only the `K` most probable tokens, renormalize and draw
+  proportionally (the standard HF top-k; combines with `-temp`, and
+  `-topk` alone samples at temperature 1.0). Without either flag the
+  generation stays deterministic greedy argmax.
 
 Try it immediately with the tiny committed fixture (from the repo root):
 
@@ -106,6 +112,7 @@ GPT-2-family repo ships one), prompts can be plain text instead of ids:
 
 ```
 GPT2Import /tmp/model.safetensors 64 0 -t "The meaning of life is"
+GPT2Import /tmp/model.safetensors 64 0 -t "The meaning of life is" -temp 0.8 -topk 40
 ```
 
 `neural/neuralhftokenizer.pas` (`TNeuralHFTokenizer`) loads the byte-level

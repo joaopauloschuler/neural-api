@@ -38,6 +38,11 @@ Coded by Claude (AI).
 //   -t text  - text prompt; encoded with the tokenizer.json found in the
 //              checkpoint's directory, and the continuation is decoded
 //              back to text.
+//   -temp X  - sampling temperature (softmax of logits/X); enables
+//              stochastic sampling instead of the default greedy argmax.
+//   -topk K  - keep only the K most probable tokens, renormalize and draw
+//              proportionally (HF semantics: combines with -temp; -topk
+//              alone samples at temperature 1.0).
 //
 // Try it with the tiny committed fixture (from the repo root):
 //   GPT2Import tests/fixtures/tiny_gpt2.safetensors 16 2 0 1 2
@@ -57,6 +62,78 @@ const
   csDefaultSeqLen = 64;
   csNewTokens = 16; // tokens to generate
 
+// Stable softmax of the logits row at PosIdx divided by Temperature, then a
+// weighted draw over the TopK most probable tokens (TopK <= 0 or >= vocab
+// keeps the whole distribution). This is the standard HF top-k sampling;
+// the library TNNetSamplerTopK draws UNIFORMLY among the top K, which would
+// ignore the temperature, so the weighted draw lives here.
+function SampleNextToken(Logits: TNNetVolume; PosIdx, VocabSize: integer;
+  Temperature: TNeuralFloat; TopK: integer): integer;
+var
+  Base, TokCnt, InsCnt, Kept: integer;
+  MaxLogit, Sum, Roll, Cum: TNeuralFloat;
+  Probs: array of TNeuralFloat;
+  KeptProb: array of TNeuralFloat;
+  KeptTok: array of integer;
+begin
+  if Temperature < 1e-6 then Temperature := 1e-6; // -> 0 degenerates to greedy
+  Base := PosIdx * VocabSize;
+  MaxLogit := Logits.FData[Base];
+  for TokCnt := 1 to VocabSize - 1 do
+    if Logits.FData[Base + TokCnt] > MaxLogit then
+      MaxLogit := Logits.FData[Base + TokCnt];
+  SetLength(Probs, VocabSize);
+  Sum := 0;
+  for TokCnt := 0 to VocabSize - 1 do
+  begin
+    Probs[TokCnt] := Exp((Logits.FData[Base + TokCnt] - MaxLogit) / Temperature);
+    Sum := Sum + Probs[TokCnt];
+  end;
+  if (TopK <= 0) or (TopK >= VocabSize) then
+  begin
+    // Full ancestral sampling: cumulative roll over the whole vocabulary.
+    Roll := Random * Sum;
+    Cum := 0;
+    Result := VocabSize - 1;
+    for TokCnt := 0 to VocabSize - 1 do
+    begin
+      Cum := Cum + Probs[TokCnt];
+      if Roll < Cum then exit(TokCnt);
+    end;
+    exit;
+  end;
+  // Single pass keeping the TopK largest probabilities in a descending
+  // insertion array (most tokens fail the [TopK-1] cut immediately).
+  SetLength(KeptProb, TopK);
+  SetLength(KeptTok, TopK);
+  Kept := 0;
+  for TokCnt := 0 to VocabSize - 1 do
+  begin
+    if (Kept = TopK) and (Probs[TokCnt] <= KeptProb[TopK - 1]) then continue;
+    if Kept < TopK then Inc(Kept);
+    InsCnt := Kept - 1;
+    while (InsCnt > 0) and (KeptProb[InsCnt - 1] < Probs[TokCnt]) do
+    begin
+      KeptProb[InsCnt] := KeptProb[InsCnt - 1];
+      KeptTok[InsCnt] := KeptTok[InsCnt - 1];
+      Dec(InsCnt);
+    end;
+    KeptProb[InsCnt] := Probs[TokCnt];
+    KeptTok[InsCnt] := TokCnt;
+  end;
+  Sum := 0;
+  for TokCnt := 0 to Kept - 1 do Sum := Sum + KeptProb[TokCnt];
+  if Sum <= 0 then exit(KeptTok[0]); // degenerate distribution
+  Roll := Random * Sum;
+  Cum := 0;
+  Result := KeptTok[Kept - 1]; // numeric-safety fallback
+  for TokCnt := 0 to Kept - 1 do
+  begin
+    Cum := Cum + KeptProb[TokCnt];
+    if Roll < Cum then exit(KeptTok[TokCnt]);
+  end;
+end;
+
 var
   NN: TNNet;
   Config: TGPT2Config;
@@ -69,9 +146,18 @@ var
   BestLogit: TNeuralFloat;
   Tokenizer: TNeuralHFTokenizer;
   TokenizerPath, PromptText: string;
+  Temperature: TNeuralFloat;
+  TopK: integer;
+  UseSampling: boolean;
+  FloatFmt: TFormatSettings;
 begin
   Tokenizer := nil;
   PromptText := '';
+  Temperature := 1.0;
+  TopK := 0;
+  UseSampling := false;
+  FloatFmt := DefaultFormatSettings;
+  FloatFmt.DecimalSeparator := '.'; // -temp 0.8 regardless of locale
   if ParamCount < 1 then
   begin
     WriteLn('Usage: GPT2Import <model.safetensors> [SeqLen] [NumHeads] [t0 t1 ...]');
@@ -84,14 +170,33 @@ begin
   NumHeads := 0;
   if ParamCount >= 3 then NumHeads := StrToIntDef(ParamStr(3), 0);
   SetLength(Prompt, 0);
-  if (ParamCount >= 5) and (ParamStr(4) = '-t') then
-    PromptText := ParamStr(5)
-  else
-    for ParamCnt := 4 to ParamCount do
+  ParamCnt := 4;
+  while ParamCnt <= ParamCount do
+  begin
+    if (ParamStr(ParamCnt) = '-t') and (ParamCnt < ParamCount) then
+    begin
+      Inc(ParamCnt);
+      PromptText := ParamStr(ParamCnt);
+    end
+    else if (ParamStr(ParamCnt) = '-temp') and (ParamCnt < ParamCount) then
+    begin
+      Inc(ParamCnt);
+      Temperature := StrToFloatDef(ParamStr(ParamCnt), 1.0, FloatFmt);
+      UseSampling := true;
+    end
+    else if (ParamStr(ParamCnt) = '-topk') and (ParamCnt < ParamCount) then
+    begin
+      Inc(ParamCnt);
+      TopK := StrToIntDef(ParamStr(ParamCnt), 0);
+      UseSampling := true;
+    end
+    else
     begin
       SetLength(Prompt, Length(Prompt) + 1);
       Prompt[High(Prompt)] := StrToIntDef(ParamStr(ParamCnt), 0);
     end;
+    Inc(ParamCnt);
+  end;
 
   // Optional text-prompt mode: encode with the HF tokenizer.json that
   // ships next to the checkpoint (raw-id mode keeps working without it).
@@ -157,6 +262,13 @@ begin
     Write('Prompt token ids:');
     for TokenCnt := 0 to PromptLen - 1 do Write(' ', Prompt[TokenCnt]);
     WriteLn;
+    if UseSampling then
+    begin
+      Randomize;
+      Write('Sampling: temperature ', Temperature:0:2);
+      if TopK > 0 then Write(', top-k ', TopK);
+      WriteLn('.');
+    end;
     Input := TNNetVolume.Create(SeqLen, 1, 1);
     Output := TNNetVolume.Create;
     try
@@ -170,14 +282,20 @@ begin
         NN.Compute(Input);
         NN.GetOutput(Output);
         PosIdx := PromptLen - 1; // logits row predicting the NEXT token
-        BestToken := 0;
-        BestLogit := Output.FData[PosIdx * Config.VocabSize];
-        for TokCnt := 1 to Config.VocabSize - 1 do
-          if Output.FData[PosIdx * Config.VocabSize + TokCnt] > BestLogit then
-          begin
-            BestLogit := Output.FData[PosIdx * Config.VocabSize + TokCnt];
-            BestToken := TokCnt;
-          end;
+        if UseSampling then
+          BestToken := SampleNextToken(Output, PosIdx, Config.VocabSize,
+            Temperature, TopK)
+        else
+        begin
+          BestToken := 0;
+          BestLogit := Output.FData[PosIdx * Config.VocabSize];
+          for TokCnt := 1 to Config.VocabSize - 1 do
+            if Output.FData[PosIdx * Config.VocabSize + TokCnt] > BestLogit then
+            begin
+              BestLogit := Output.FData[PosIdx * Config.VocabSize + TokCnt];
+              BestToken := TokCnt;
+            end;
+        end;
         Write(' ', BestToken);
         SetLength(Prompt, PromptLen + 1);
         Prompt[PromptLen] := BestToken;
