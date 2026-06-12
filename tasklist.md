@@ -125,14 +125,13 @@ rather than acted on.
       constraints compose in one pipeline. Add a small TGenerationConfig
       record bundling sampler + penalties + stopping criteria (EOS-id list,
       stop strings, max new tokens).
-- [ ] LoRA adapters (PEFT port): freeze a base PointwiseConvLinear /
-      FullConnect layer's weights and add a parallel low-rank B·A path
-      (rank r, scaling alpha/r, B zero-init so the start is a no-op) with
-      its own learning rate; provide MergeLoRA to fold B·A into W for
-      inference and a builder that wraps existing projection layers.
-      Killer combo with the Llama safetensors importer: cheap fine-tuning
-      of imported pretrained models. Follow-up: load HF PEFT adapter
-      safetensors files onto an imported base model.
+- [ ] LoRA follow-ups (the adapter itself is landed: TNNet.AddLoRAAdapter
+      low-rank B·A bypass + examples/LoRAFineTune, commit 34511c0):
+      (a) MergeLoRA — fold the trained B·A (scaled by alpha/r) into the
+      frozen base layer's W for zero-overhead inference, asserting merged
+      forward equals adapter forward; (b) load HF PEFT adapter safetensors
+      files onto an imported base model (name-map lora_A/lora_B tensors
+      onto the AddLoRAAdapter layers).
 - [ ] Gradient accumulation in neuralfit.pas: accumulate deltas over N
       micro-batches before the optimizer step (large effective batch
       without the memory), scaling the loss/deltas by 1/N so results match
@@ -571,23 +570,6 @@ rather than acted on.
       per-layer override). The 4B+ multimodal vision tower is explicitly
       OUT OF SCOPE (separate project). Parity fixture vs
       Gemma3ForCausalLM on a sliced text-only checkpoint.
-- [X] SmolLM2 parity verification (possibly ZERO-code, the
-      Cerebras-GPT-pattern task for the Llama path): HuggingFace's
-      SmolLM2 family (135M/360M/1.7B) ships as LlamaForCausalLM with tied
-      embeddings — the landed BuildLlamaFromSafeTensors may load
-      SmolLM2-135M TODAY. Run the parity tooling against it, fix whatever
-      config tolerance breaks, pin a fixture. A 135M instruct-tuned
-      2024-era model is arguably the best end-to-end CPU demo this
-      framework could have; natural base model for the LoRA /
-      distillation / GRPO tasks elsewhere in this list.
-      DONE 2026-06-11: confirmed ZERO-code — BuildLlamaFromSafeTensors
-      loads SmolLM2-135M unchanged (tied embeddings, BF16, rope_theta
-      100000, GQA 9/3); 2-layer/4096-vocab real-weight slice max |logit
-      diff| 6.5e-5 vs LlamaForCausalLM. Pinned
-      tests/fixtures/tiny_smollm2.* (BF16 dimension-sliced sub-slab of
-      the real checkpoint via
-      examples/LlamaImport/make_pico_llama_fixture.py) +
-      TestSmolLM2LogitParity.
 - [ ] TinyStories reference-checkpoint import (rider on the GPT-Neo
       importer task above): roneneldan/TinyStories-1M..33M are GPT-NEO
       architecture, so they load with zero extra work once that importer
@@ -638,19 +620,6 @@ rather than acted on.
       at CPU-friendly size; feeds the same token-classification / QA /
       sentence-embedding heads as the BERT task. Parity fixture vs
       ModernBertModel hidden states.
-- [X] distilgpt2 fixture (ZERO-code claim): 82M-param distilled GPT-2
-      almost certainly loads with the landed BuildGPT2FromSafeTensors
-      as-is (same architecture, 6 layers). Add it to the GPT-2 parity
-      fixtures to claim the smallest practical pretrained English LM and
-      a natural teacher/student pair (gpt2 -> distilgpt2) for the
-      knowledge-distillation task elsewhere in this list.
-      DONE 2026-06-11: confirmed ZERO-code — BuildGPT2FromSafeTensors
-      loads distilgpt2 unchanged ("transformer." prefix, n_embd/64 head
-      rule holds); 2-layer/8192-vocab real-weight slice max |logit diff|
-      4.2e-5 vs GPT2LMHeadModel. Pinned tests/fixtures/tiny_distilgpt2.*
-      (dimension-sliced sub-slab of the real checkpoint via
-      examples/GPT2Import/make_pico_gpt2_fixture.py) +
-      TestDistilGPT2LogitParity.
 - [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
       decode docs explicitly note only greedy/sampled streamed generation
