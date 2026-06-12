@@ -652,6 +652,21 @@ rather than acted on.
       static exit layer + confidence threshold; follow-up: per-token
       adaptive exit. Report tokens/sec vs full-depth at matched output
       quality.
+- [ ] DoLa decoding (Decoding by Contrasting Layers, Chuang et al. 2023;
+      transformers `generate(dola_layers=...)`): improve FACTUALITY (not
+      speed — distinct from the early-exit task above and from contrastive
+      search, which contrasts against context tokens) by reading logits at
+      a premature layer via the same LogitLens "logits at layer k" splice,
+      then scoring next tokens by log p_final - log p_premature over an
+      adaptive head-candidate set (tokens above an alpha fraction of the
+      final layer's max prob); pick the premature layer per step as the
+      one with max Jensen-Shannon divergence from the final distribution
+      over a small candidate bucket. Pure decode-time composition of
+      landed primitives — no new weights, no training. v1 in
+      neural/neuraldecode.pas with fixed candidate-layer bucket; test:
+      on a toy LM with a planted shallow-layer bias, DoLa flips the
+      biased completion while greedy full-depth decode does not, and
+      alpha=0/empty-bucket degrades exactly to standard greedy.
 - [ ] Grammar/regex-constrained decoding (GBNF-style): generalize the
       landed hand-written JSON state machine — TNNetTokenConstraint's
       Reset/MaskAllowed/Commit interface (plus the copy-on-fork support
