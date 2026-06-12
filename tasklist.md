@@ -232,7 +232,11 @@ rather than acted on.
       Each reuses the HF-parity fixture tooling (slicer + logit dump
       + compare). Gemma is broken out into its own per-generation task
       track below (gap analysis 2026-06-11: Gemma-1 is ~80% load-time
-      weight folding on the Llama path).
+      weight folding on the Llama path). Qwen3 (0.6B is the most-used
+      small instruct model) is a small delta ON the Qwen2 path: dropped
+      QKV biases + per-head QK-norm — the SAME ingredient as the
+      "Gemma 3 - per-head QK-norm" task below, so land that once and both
+      importers consume it.
 - [ ] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
       de-facto checkpoint format, and it ships PRE-quantized weights —
       dovetails with the int8 quantized-inference task (read Q8_0 blocks
@@ -576,6 +580,50 @@ rather than acted on.
       per-layer override). The 4B+ multimodal vision tower is explicitly
       OUT OF SCOPE (separate project). Parity fixture vs
       Gemma3ForCausalLM on a sliced text-only checkpoint.
+- [ ] SmolLM2 parity verification (possibly ZERO-code, the
+      Cerebras-GPT-pattern task for the Llama path): HuggingFace's
+      SmolLM2 family (135M/360M/1.7B) ships as LlamaForCausalLM with tied
+      embeddings — the landed BuildLlamaFromSafeTensors may load
+      SmolLM2-135M TODAY. Run the parity tooling against it, fix whatever
+      config tolerance breaks, pin a fixture. A 135M instruct-tuned
+      2024-era model is arguably the best end-to-end CPU demo this
+      framework could have; natural base model for the LoRA /
+      distillation / GRPO tasks elsewhere in this list.
+- [ ] TinyStories reference-checkpoint import (rider on the GPT-Neo
+      importer task above): roneneldan/TinyStories-1M..33M are GPT-NEO
+      architecture, so they load with zero extra work once that importer
+      lands. Special fit: the repo's NLP examples already train on the
+      TinyStories dataset, so this gives a direct "our from-scratch
+      training vs the published reference checkpoint" bake-off (compare
+      with neuralnlpmetrics perplexity at matched vocab), and at 1M-33M
+      params the parity tests run against FULL checkpoints instead of
+      sliced fixtures — the only importer family where that is true.
+- [ ] RWKV-4 checkpoint importer (RWKV-4-Pile-169M/430M) — the first
+      NON-TRANSFORMER importer, and the most distinctive: recurrent
+      inference with CONSTANT memory and no KV cache, exactly the right
+      architecture for CPU deployment. TNNetWKV (RWKV-4 time-mixing) and
+      TNNetTokenShift are landed; the gaps are the channel-mix block
+      (token-shift + squared-ReLU gating — existing primitives, builder
+      work) and the weight mapping (per-layer time/channel mix params;
+      map the checkpoint's time_decay/time_first vectors onto TNNetWKV's
+      softplus-decay w and bonus u parameterization — check the exp/log
+      convention against the reference carefully). Verify logit parity vs
+      HF's RwkvForCausalLM on a sliced fixture; a decode-side demo
+      showing flat memory vs a transformer of equal size is the headline.
+- [ ] ModernBERT importer (answer.ai, 139M) — the encoder worth targeting
+      BEYOND vanilla BERT once the BERT-family importer task above lands:
+      RoPE instead of learned positions, GeGLU, alternating local/global
+      attention — every ingredient is already landed or tasked (Gemma /
+      GPT-Neo machinery). Best current retrieval/classification encoder
+      at CPU-friendly size; feeds the same token-classification / QA /
+      sentence-embedding heads as the BERT task. Parity fixture vs
+      ModernBertModel hidden states.
+- [ ] distilgpt2 fixture (ZERO-code claim): 82M-param distilled GPT-2
+      almost certainly loads with the landed BuildGPT2FromSafeTensors
+      as-is (same architecture, 6 layers). Add it to the GPT-2 parity
+      fixtures to claim the smallest practical pretrained English LM and
+      a natural teacher/student pair (gpt2 -> distilgpt2) for the
+      knowledge-distillation task elsewhere in this list.
 
 ## Layer follow-ups that fix real limitations
 
