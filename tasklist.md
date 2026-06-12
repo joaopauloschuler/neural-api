@@ -94,6 +94,13 @@ rather than acted on.
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
       out-of-scope for v1.
+- [ ] Llama-architecture safetensors importer (sibling of the landed GPT-2
+      HuggingFace import in neural/neuralpretrained.pas): RMSNorm + SwiGLU FFN +
+      RoPE + GQA are all available as building blocks, so a TinyLlama/Llama-style
+      checkpoint loader is mostly weight-mapping work (untied embeddings, no
+      biases, per-layer q/k/v/o + gate/up/down proj names). Reuse the GPT-2
+      parity tooling (slicer + logit dump + compare, commit aff96f5) to verify
+      logit parity against HF transformers on a sliced tiny checkpoint.
 
 ## Layer follow-ups that fix real limitations
 
@@ -167,6 +174,23 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       `TNNetTitansMemory` (token-shift + per-token k/v/q projections + the neural
       memory leaf + residual/out-projection), the drop-in Memory-as-Context block,
       mirroring `AddGatedLinearAttention` / `AddRWKVTimeMix`.
+- [ ] SDPA-level KV-cache aliasing for GQA decode (follow-up to the GQA
+      verification batch, commit c1f8c8a): `AddMultiHeadGroupedQueryAttention`'s
+      PARAMETER saving is real, but at decode time `TNNetStreamingDecoder` keeps
+      one KV cache per SDPA layer, so the QueryHeads/KVHeads heads in a group
+      each cache an identical K/V copy. Let grouped SDPA layers share a single
+      KVHeads-sized cache (cache aliasing keyed by the shared K/V projection
+      layers) so the GQA memory win materializes at inference; assert streamed
+      output stays bit-identical to the unaliased path.
+- [ ] Per-sample / dynamic attention masks in TNNetScaledDotProductAttention
+      (follow-up to TNNetSequencePacker, commit 52c5ca0): SDPA only supports
+      the static causal flag + static sliding window, so packed training
+      windows cannot mask attention across document boundaries (GPT-2/3-style
+      cross-doc attention is what ships today). Add an optional per-sample
+      block-diagonal/document-id mask input (or a segment-ids side channel) and
+      wire `TNNetSequencePacker` to emit it; verify with a test that attention
+      weights across a separator are exactly zero and gradients match an
+      unpacked per-document baseline.
 
 ## Tests / numerical-gradient audit
 
