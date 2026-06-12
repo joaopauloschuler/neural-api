@@ -101,6 +101,7 @@ type
     procedure TestQwen3LogitParity;
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
+    procedure TestRWKVLogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
     procedure TestGPTNeoXConfigFromJSONFile;
@@ -1815,6 +1816,93 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gemma2_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the RWKV-4 import target - the suite's FIRST NON-TRANSFORMER
+// importer (HF model_type "rwkv", architectures ["RwkvForCausalLM"], the
+// RWKV/rwkv-4-169m-pile family): tests/fixtures/tiny_rwkv.* is a pico
+// randomly-initialized HF RwkvForCausalLM (2 blocks, hidden 8,
+// intermediate 16, vocab 13, untied head). The generator
+// tools/rwkv_tiny_fixture.py ASSERTS each quirk is non-vacuous by re-running
+// the float64 oracle with that single quirk disabled (max logit |diff|s:
+// decay convention 0.48, squared-ReLU 3.6, token-shift 5.6, ln0/pre_ln 3.4,
+// time_first bonus 2.0, LN biases 4.5 - all far above the 1e-4 parity gate,
+// so a missing or misconverted piece FAILS this test):
+// (a) the DECAY CONVENTION bridge: the checkpoint's per-step decay factor
+//     exp(-exp(time_decay)) mapped EXACTLY onto TNNetWKV's
+//     exp(-softplus(w_raw)) via w_raw = invsoftplus(exp(time_decay)), and
+//     time_first -> the bonus u;
+// (b) SEPARATE token-shift lerp vectors per stream (3 attention + 2 FFN
+//     TNNetTokenShift layers per block);
+// (c) the channel-mix FFN's SQUARED ReLU keying and sigmoid receptance;
+// (d) plain BIASED LayerNorms (NOT RMSNorm) incl. block-0's extra pre_ln
+//     and the final ln_out;
+// (e) bias-free Linears and the untied head.
+// Reference logits come from HF transformers in float64. The
+// BuildFromPretrained model_type "rwkv" dispatch route is covered too.
+procedure TTestNeuralPretrained.TestRWKVLogitParity;
+var
+  NN: TNNet;
+  Config: TRWKVConfig;
+  LayerCnt, WKVCnt, ShiftCnt, SqReLUCnt, LNCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildRWKVFromSafeTensorsEx(FixturePath('tiny_rwkv.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_rwkv_config.json'));
+  try
+    AssertEquals('model_type', 'rwkv', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('hidden', 8, Config.HiddenSize);
+    AssertEquals('attention_hidden', 8, Config.AttentionHiddenSize);
+    AssertEquals('intermediate', 16, Config.IntermediateSize);
+    AssertEquals('context_length', 8, Config.ContextLength);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('layer_norm_epsilon', 1e-5, Config.LayerNormEps, 1e-9);
+    AssertEquals('rescale_every (read, mathematically a no-op)', 6,
+      Config.RescaleEvery);
+    AssertFalse('untied head', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'rwkv.', Config.Prefix);
+    // Structure: one TNNetWKV recurrence per block; FIVE TNNetTokenShift
+    // per block (separate time_mix_{key,value,receptance} + the FFN's
+    // time_mix_{key,receptance}); one squared-ReLU per block; biased
+    // LayerNorms = 2 per block + block-0 pre_ln + final ln_out = 6. And
+    // NOT A SINGLE attention layer - the first non-transformer import.
+    WKVCnt := 0;
+    ShiftCnt := 0;
+    SqReLUCnt := 0;
+    LNCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetWKV then Inc(WKVCnt);
+      if NN.Layers[LayerCnt] is TNNetTokenShift then Inc(ShiftCnt);
+      if NN.Layers[LayerCnt] is TNNetSquaredReLU then Inc(SqReLUCnt);
+      if NN.Layers[LayerCnt] is TNNetTokenLayerNorm then Inc(LNCnt);
+      AssertFalse('no attention layer in an RWKV net',
+        NN.Layers[LayerCnt] is TNNetScaledDotProductAttention);
+    end;
+    AssertEquals('TNNetWKV count (1 per block)', 2, WKVCnt);
+    AssertEquals('TNNetTokenShift count (5 per block)', 10, ShiftCnt);
+    AssertEquals('TNNetSquaredReLU count (1 per block)', 2, SqReLUCnt);
+    AssertEquals('biased LayerNorm count (2/block + pre_ln + ln_out)', 6,
+      LNCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_rwkv_logits.json'), Config.ContextLength,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "rwkv" (architectures ["RwkvForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_rwkv.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_rwkv_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_rwkv_logits.json'), 8, 13);
   finally
     NN.Free;
   end;

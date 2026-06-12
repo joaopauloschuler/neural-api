@@ -11857,6 +11857,31 @@ type
       // (TNNetCellMulByCell) into wkv, (5) a final PointwiseConvLinear out-projection
       // back to D. Shape-preserving (output == input shape). Returns the out layer.
       function AddRWKVTimeMix(): TNNetLayer;
+      // RWKV CHANNEL-MIXING block (the RWKV-4 FFN, Peng et al. 2023,
+      // arXiv:2305.13048) over a (SeqLen,1,D) sequence (SizeY=1). Wires:
+      // (1) TWO independent TNNetTokenShift per-channel time-shifts of the input
+      // (RWKV-4 learns SEPARATE time_mix_k / time_mix_r lerp vectors for the key
+      // and receptance streams), (2) key path: PointwiseConvLinear D->d_ff of the
+      // k-shifted stream followed by SQUARED ReLU (TNNetSquaredReLU - the RWKV
+      // channel-mix activation), then PointwiseConvLinear d_ff->D ("value"),
+      // (3) receptance gate r=sigmoid(PointwiseConvLinear D->D of the r-shifted
+      // stream) cell-multiplied (TNNetCellMulByCell) into the value path.
+      // pFeedForwardSize<=0 defaults to the RWKV-4 convention d_ff=4*D.
+      // Shape-preserving (output == input shape). Returns the gated out layer.
+      function AddRWKVChannelMix(pFeedForwardSize: integer = 0): TNNetLayer;
+      // Composite builder: a full RWKV-4 BLOCK over a (SeqLen,1,d_model) sequence
+      // (SizeY=1) - the recurrent constant-memory analogue of
+      // AddTransformerEncoderBlock. Wires the two pre-LayerNorm residual
+      // sub-blocks of the reference architecture (RWKV-4 uses plain BIASED
+      // LayerNorm, TNNetTokenLayerNorm - NOT RMSNorm):
+      //   1. x := x + TimeMix(LayerNorm(x))      (AddRWKVTimeMix residual)
+      //   2. x := x + ChannelMix(LayerNorm(x))   (AddRWKVChannelMix residual)
+      // pFeedForwardSize<=0 defaults to d_ff=4*d_model. d_model is inferred from
+      // the input depth; the output shape matches the input so blocks stack.
+      // (The reference net also applies an EXTRA embedding LayerNorm before
+      // block 0 and a final ln_out after the last block - add those separately,
+      // as BuildRWKVFromSafeTensors does.) Returns the final residual sum.
+      function AddRWKVBlock(pFeedForwardSize: integer = 0): TNNetLayer;
       // GATED LINEAR ATTENTION time-mixing block (Yang et al. 2023,
       // arXiv:2312.06635) over a (SeqLen,1,D) sequence (SizeY=1). Wraps the
       // TNNetGatedLinearAttention leaf (which itself owns the q/k/v/forget-gate
@@ -47396,6 +47421,54 @@ begin
   Gated := AddLayer( TNNetCellMulByCell.Create(RGate, Wkv) );
   // (5) Output projection back to D.
   Result := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), Gated );
+end;
+
+function TNNet.AddRWKVChannelMix(pFeedForwardSize: integer = 0): TNNetLayer;
+var
+  x, ShiftedK, ShiftedR, KeyAct, VProj, RGate: TNNetLayer;
+  D, dff: integer;
+begin
+  x := GetLastLayer();
+  if x.Output.SizeY <> 1 then
+    FErrorProc('AddRWKVChannelMix requires a (SeqLen,1,D) input (SizeY=1). Got SizeY=' +
+      IntToStr(x.Output.SizeY));
+  D := x.Output.Depth;
+  if pFeedForwardSize <= 0 then dff := 4 * D else dff := pFeedForwardSize;
+  // (1) SEPARATE per-channel token shifts for the key and receptance streams
+  // (RWKV-4 learns independent time_mix_k / time_mix_r lerp vectors).
+  ShiftedK := AddLayerAfter( TNNetTokenShift.Create(), x );
+  // (2) Key path: k = SquaredReLU(W_k . xk), then the d_ff->D "value" proj.
+  KeyAct := AddLayerAfter( [TNNetPointwiseConvLinear.Create(dff, 1),
+    TNNetSquaredReLU.Create()], ShiftedK );
+  VProj := AddLayerAfter( TNNetPointwiseConvLinear.Create(D, 1), KeyAct );
+  // (3) Receptance gate from the r-shifted stream: r = sigmoid(W_r . xr).
+  ShiftedR := AddLayerAfter( TNNetTokenShift.Create(), x );
+  RGate := AddLayerAfter( [TNNetPointwiseConvLinear.Create(D, 1),
+    TNNetSigmoid.Create()], ShiftedR );
+  // (4) out = r (*) value, cell-wise.
+  Result := AddLayer( TNNetCellMulByCell.Create(RGate, VProj) );
+end;
+
+function TNNet.AddRWKVBlock(pFeedForwardSize: integer = 0): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  if GetLastLayer().Output.SizeY <> 1 then
+    FErrorProc('AddRWKVBlock requires a (SeqLen,1,D) input (SizeY=1). Got SizeY=' +
+      IntToStr(GetLastLayer().Output.SizeY));
+  // ---- Time-mixing sub-block: x := x + TimeMix(LayerNorm(x)). ----
+  // Inline residuals (not the AddPreNormResidual helper) because the mixers add
+  // MANY layers through GetLastLayer() chaining. RWKV-4 norms are plain BIASED
+  // LayerNorms (TNNetTokenLayerNorm), not RMSNorm.
+  BranchInput := GetLastLayer();
+  AddLayer( TNNetTokenLayerNorm.Create() );
+  AddRWKVTimeMix();
+  AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+  // ---- Channel-mixing sub-block: x := x + ChannelMix(LayerNorm(x)). ----
+  BranchInput := GetLastLayer();
+  AddLayer( TNNetTokenLayerNorm.Create() );
+  AddRWKVChannelMix(pFeedForwardSize);
+  Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
 end;
 
 function TNNet.AddGatedLinearAttention(): TNNetLayer;

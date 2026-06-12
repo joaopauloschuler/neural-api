@@ -498,18 +498,21 @@ rather than acted on.
       at 1M-33M params the comparison runs against FULL checkpoints
       instead of sliced fixtures, the only importer family where that is
       true.
-- [ ] RWKV-4 checkpoint importer (RWKV-4-Pile-169M/430M) — the first
-      NON-TRANSFORMER importer, and the most distinctive: recurrent
-      inference with CONSTANT memory and no KV cache, exactly the right
-      architecture for CPU deployment. TNNetWKV (RWKV-4 time-mixing) and
-      TNNetTokenShift are landed; the gaps are the channel-mix block
-      (token-shift + squared-ReLU gating — existing primitives, builder
-      work) and the weight mapping (per-layer time/channel mix params;
-      map the checkpoint's time_decay/time_first vectors onto TNNetWKV's
-      softplus-decay w and bonus u parameterization — check the exp/log
-      convention against the reference carefully). Verify logit parity vs
-      HF's RwkvForCausalLM on a sliced fixture; a decode-side demo
-      showing flat memory vs a transformer of equal size is the headline.
+- [x] RWKV-4 checkpoint importer (RWKV-4-Pile-169M/430M) — DONE: the first
+      NON-TRANSFORMER importer. BuildRWKVFromSafeTensors in
+      neural/neuralpretrained.pas (model_type "rwkv" wired into
+      BuildFromPretrained) + TNNet.AddRWKVChannelMix / AddRWKVBlock
+      builders. Decay convention resolved EXACTLY: the checkpoint's
+      per-step factor exp(-exp(time_decay)) maps onto TNNetWKV's
+      exp(-softplus(w_raw)) via w_raw = invsoftplus(exp(time_decay))
+      (bijection onto the positives; >30 shortcut matches the layer
+      bit-for-bit), time_first -> bonus u unchanged. Parity 1.8e-6 vs the
+      HF float64 oracle on tests/fixtures/tiny_rwkv.* (generator
+      tools/rwkv_tiny_fixture.py self-checks every quirk: decay
+      convention, squared-ReLU, token-shift, ln0, bonus, LN biases).
+- [ ] RWKV-4 decode-side demo: flat-memory recurrent decoding vs a
+      transformer of equal size (constant-memory headline of the importer
+      above; needs an incremental TNNetWKV state-carry path).
 - [ ] Mamba checkpoint importer (state-spaces/mamba-130m-hf) — the
       selective-SSM sibling of the RWKV-4 importer task above and the
       second non-transformer family; like RWKV it decodes with CONSTANT

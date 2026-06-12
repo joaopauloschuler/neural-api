@@ -68,6 +68,12 @@ unit neuralpretrained;
 //     encoder-decoder import (POST-norm blocks, static sinusoidal
 //     positions, swish FFN, tied head + final_logits_bias). Runs through
 //     the same RunT5 two-net convention. See the MARIAN IMPORT section.
+//   - RWKV-4 (model_type "rwkv": RWKV/rwkv-4-169m-pile and siblings) -
+//     BuildRWKVFromSafeTensors, the FIRST NON-TRANSFORMER import: a
+//     recurrent WKV mixer (TNNetWKV + TNNetTokenShift) with constant
+//     decode memory and no KV cache - token-shift lerps, squared-ReLU
+//     channel mix, biased LayerNorms incl. the block-0 pre_ln, and the
+//     exp/softplus decay-convention bridge. See the RWKV-4 IMPORT section.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -1286,6 +1292,93 @@ procedure BuildMarianFromSafeTensors(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   const ConfigFileName: string = '');
 
+// ---------------------------------------------------------------------------
+// RWKV-4 IMPORT (model_type "rwkv": RWKV/rwkv-4-169m-pile and siblings,
+// architectures ["RwkvForCausalLM"]) - the FIRST NON-TRANSFORMER importer:
+// a recurrent WKV mixer (Peng et al. 2023, arXiv:2305.13048) that decodes
+// with CONSTANT memory and no KV cache. Differences from the decoder
+// families above:
+//   - NO positional embedding and NO attention: each block is a pre-LN
+//     TIME-MIX residual (token-shift lerped k/v/r streams -> bias-free
+//     key/value/receptance projections -> the TNNetWKV exponential-decay
+//     numerator/denominator recurrence with per-channel decay w and
+//     current-token bonus u -> sigmoid(receptance) gate -> output proj)
+//     plus a pre-LN CHANNEL-MIX residual (token-shift lerped k/r streams,
+//     key = SQUARED ReLU of a D->intermediate proj, out =
+//     sigmoid(receptance proj) (*) value proj back to D);
+//   - token shift: per-channel lerp x*mix + shift(x)*(1-mix) with SEPARATE
+//     learned time_mix_{key,value,receptance} vectors per stream
+//     (TNNetTokenShift, previous token zero-padded at t=0);
+//   - DECAY CONVENTION: the checkpoint stores a RAW time_decay vector
+//     applied as a per-step decay factor exp(-exp(time_decay)); TNNetWKV
+//     parameterizes the same factor as exp(-softplus(w_raw)), so the
+//     import sets w_raw = invsoftplus(exp(time_decay)) - EXACT for every
+//     real value of time_decay because exp() is positive and softplus is a
+//     bijection onto the positives (w_raw = x for x > 30 matches the
+//     layer's own softplus shortcut bit-for-bit). time_first maps to the
+//     bonus u unchanged;
+//   - plain BIASED LayerNorm (TNNetTokenLayerNorm, NOT RMSNorm): ln1/ln2
+//     per block, an EXTRA pre_ln ("ln0") after the embedding in block 0
+//     only, and a final ln_out before the head;
+//   - every Linear is bias-free; the head is UNTIED by default
+//     (tie_word_embeddings false in the published configs);
+//   - config rescale_every (inference-time halving of the hidden stream
+//     every N blocks with matching weight division, a float16 trick) is
+//     read but IGNORED: LayerNorm scale-invariance makes it a mathematical
+//     identity, so loading the raw weights is exact.
+// Tensor names: rwkv.embeddings.weight, rwkv.blocks.N.{pre_ln (N=0 only),
+// ln1,ln2}.{weight,bias}, rwkv.blocks.N.attention.{time_decay,time_first,
+// time_mix_key,time_mix_value,time_mix_receptance,key,value,receptance,
+// output}, rwkv.blocks.N.feed_forward.{time_mix_key,time_mix_receptance,
+// key,receptance,value}, rwkv.ln_out.{weight,bias}, head.weight.
+// BuildFromPretrained dispatches model_type "rwkv" here. pSeqLen <= 0
+// defaults to the config's context_length (RWKV itself has no positional
+// limit; the net is built at a fixed sequence length like every importer).
+
+type
+  TRWKVConfig = record
+    HiddenSize: integer;          // hidden_size (d_model)
+    NumLayers: integer;           // num_hidden_layers
+    VocabSize: integer;           // vocab_size
+    AttentionHiddenSize: integer; // attention_hidden_size (= hidden_size)
+    IntermediateSize: integer;    // intermediate_size (default 4*hidden)
+    ContextLength: integer;       // context_length (default 1024)
+    LayerNormEps: double;         // layer_norm_epsilon (default 1e-5)
+    RescaleEvery: integer;        // rescale_every (read but a no-op; see above)
+    TieWordEmbeddings: boolean;   // tie_word_embeddings (default false)
+    ModelType: string;            // 'rwkv'
+    Prefix: string;               // 'rwkv.' or '' (detected from the file)
+  end;
+
+// Reads a HF RWKV config.json (model_type "rwkv"). Required: hidden_size,
+// num_hidden_layers, vocab_size. Defaults follow RwkvConfig:
+// attention_hidden_size = hidden_size, intermediate_size = 4*hidden_size
+// (null in the published configs), context_length = 1024,
+// layer_norm_epsilon = 1e-5, rescale_every = 6, tie_word_embeddings false.
+function ReadRWKVConfigFromJSONFile(const FileName: string): TRWKVConfig;
+
+function RWKVConfigToString(const Config: TRWKVConfig): string;
+
+// Builds the RWKV-4 causal-LM net described by Config ((SeqLen,1,1) token
+// ids in, (SeqLen,1,vocab) logits out, like the decoder families) and loads
+// every weight from the checkpoint at FileName (see the RWKV-4 IMPORT
+// section above). pSeqLen <= 0 uses Config.ContextLength. pInferenceOnly =
+// True frees training volumes during construction (Compute()-only).
+function BuildRWKVFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TRWKVConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildRWKVFromSafeTensorsEx(const FileName: string;
+  out Config: TRWKVConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildRWKVFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -1294,7 +1387,7 @@ procedure BuildMarianFromSafeTensors(const FileName: string;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, bert,
+// gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, rwkv, bert,
 // distilbert, roberta. Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
@@ -6808,6 +6901,432 @@ begin
     DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly);
 end;
 
+function ReadRWKVConfigFromJSONFile(const FileName: string): TRWKVConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+  Field: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('RWKV import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('RWKV import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('RWKV import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('RWKV import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('RWKV import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'rwkv');
+    if ModelType <> 'rwkv' then
+      ImportError('RWKV import: config model_type is "' + ModelType +
+        '" - expected "rwkv" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.AttentionHiddenSize :=
+      Obj.Get('attention_hidden_size', Result.HiddenSize);
+    if Result.AttentionHiddenSize <= 0 then
+      Result.AttentionHiddenSize := Result.HiddenSize;
+    // intermediate_size is null in the published RWKV-4 configs: the HF
+    // default 4 * hidden_size applies.
+    Field := Obj.Find('intermediate_size');
+    if (Field = nil) or Field.IsNull then
+      Result.IntermediateSize := 4 * Result.HiddenSize
+    else
+      Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.ContextLength := Obj.Get('context_length', 1024);
+    if Result.ContextLength < 1 then
+      ImportError('RWKV import: config context_length must be >= 1, got ' +
+        IntToStr(Result.ContextLength) + '.');
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    // rescale_every is an inference-time float16 trick that LayerNorm
+    // scale-invariance makes a mathematical identity - read, then ignored
+    // (raw weights are exact). See the RWKV-4 IMPORT section.
+    Result.RescaleEvery := Obj.Get('rescale_every', 6);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RWKVConfigToString(const Config: TRWKVConfig): string;
+begin
+  Result := 'rwkv config: layers=' + IntToStr(Config.NumLayers) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', attention_hidden=' + IntToStr(Config.AttentionHiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', context=' + IntToStr(Config.ContextLength) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', rescale_every=' + IntToStr(Config.RescaleEvery) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TRWKVBlockLayers = record
+    LN1, AttShiftK, AttShiftV, AttShiftR: TNNetLayer;
+    AttKey, AttValue, AttRecept, WKV, AttOut: TNNetLayer;
+    LN2, FFShiftK, FFShiftR, FFKey, FFRecept, FFValue: TNNetLayer;
+  end;
+
+function BuildRWKVFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TRWKVConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TRWKVBlockLayers;
+  EmbeddingLayer, PreLN, FinalLN, LMHead: TNNetLayer;
+  BranchInput, KV, RSig, Gated: TNNetLayer;
+  BlockCnt, SeqLen, i, j: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttPrefix, FFPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // Loads a per-channel vector tensor (any dim layout, e.g. the [1,1,C]
+  // time_mix vectors or the [C] time_decay/time_first vectors) into neuron
+  // NeuronIdx of Layer, optionally transformed element-wise.
+  procedure LoadChannelVector(Layer: TNNetLayer; NeuronIdx: integer;
+    const TName: string; Channels: integer);
+  var
+    d: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('RWKV import: missing tensor "' + TName + '" in ' +
+        Reader.FileName);
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Tmp.Size <> Channels then
+      ImportError('RWKV import: "' + TName + '" must carry ' +
+        IntToStr(Channels) + ' elements, got ' +
+        Reader.ShapeAsString(TName));
+    for d := 0 to Channels - 1 do
+      Layer.Neurons[NeuronIdx].Weights.FData[d] := Tmp.FData[d];
+    Layer.FlushWeightCache();
+    MarkConsumed(TName);
+  end;
+
+  // time_decay -> TNNetWKV w_raw: the checkpoint's per-step decay factor is
+  // exp(-exp(time_decay)) while TNNetWKV computes exp(-softplus(w_raw)), so
+  // w_raw = invsoftplus(exp(time_decay)) = ln(exp(exp(time_decay)) - 1).
+  // EXACT for every real time_decay (exp() is positive and softplus is a
+  // bijection onto the positives); for x > 30 w_raw = x matches the layer's
+  // own softplus large-input shortcut bit-for-bit, and for tiny x the
+  // ln(x) limit avoids the exp(x)-1 float underflow.
+  procedure LoadWKVDecay(Layer: TNNetLayer; const TName: string;
+    Channels: integer);
+  var
+    d: integer;
+    x, wraw: double;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('RWKV import: missing tensor "' + TName + '" in ' +
+        Reader.FileName);
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Tmp.Size <> Channels then
+      ImportError('RWKV import: "' + TName + '" must carry ' +
+        IntToStr(Channels) + ' elements, got ' +
+        Reader.ShapeAsString(TName));
+    for d := 0 to Channels - 1 do
+    begin
+      x := Exp(Tmp.FData[d]);            // the checkpoint's effective w > 0
+      if x > 30 then wraw := x
+      else if x < 1e-7 then wraw := Ln(x)
+      else wraw := Ln(Exp(x) - 1.0);
+      Layer.Neurons[0].Weights.FData[d] := wraw;
+    end;
+    Layer.FlushWeightCache();
+    MarkConsumed(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumLayers < 1 then
+        ImportError('RWKV import: num_hidden_layers must be >= 1.');
+      if Reader.HasTensor('rwkv.embeddings.weight') then
+        Config.Prefix := 'rwkv.'
+      else if Reader.HasTensor('embeddings.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('RWKV import: neither "rwkv.embeddings.weight" nor ' +
+          '"embeddings.weight" found in ' + Reader.FileName +
+          ' - not an RWKV checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embeddings.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('RWKV import: embeddings.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embeddings.weight'));
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('head.weight')) then
+        ImportError('RWKV import: config says tie_word_embeddings=false ' +
+          'but "head.weight" is missing from ' + Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.ContextLength
+      else SeqLen := pSeqLen;
+
+      // ---------------- Architecture ----------------
+      // No positional embedding: RWKV's only notion of order is the
+      // recurrence itself (token shift + the WKV decay scan).
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real token, not padding.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      // Block 0's extra embedding LayerNorm ("ln0" / HF pre_ln).
+      PreLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // ---- Time-mix sub-block: x := x + Att(ln1(x)). The importer
+        // wires the block INLINE (not via AddRWKVTimeMix/AddRWKVBlock)
+        // because the checkpoint carries SEPARATE time_mix vectors per
+        // k/v/r stream - one TNNetTokenShift each.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN1 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].AttShiftK := NN.AddLayer( TNNetTokenShift.Create() );
+        Blocks[BlockCnt].AttKey := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1) );
+        Blocks[BlockCnt].AttShiftV := NN.AddLayerAfter(
+          TNNetTokenShift.Create(), Blocks[BlockCnt].LN1 );
+        Blocks[BlockCnt].AttValue := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1) );
+        Blocks[BlockCnt].AttShiftR := NN.AddLayerAfter(
+          TNNetTokenShift.Create(), Blocks[BlockCnt].LN1 );
+        Blocks[BlockCnt].AttRecept := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.AttentionHiddenSize, 1) );
+        RSig := NN.AddLayer( TNNetSigmoid.Create() );
+        // k|v concatenated on the Depth axis -> the 2*C tensor TNNetWKV
+        // splits (first C channels key, next C value).
+        KV := NN.AddLayer( TNNetDeepConcat.Create(
+          [Blocks[BlockCnt].AttKey, Blocks[BlockCnt].AttValue]) );
+        Blocks[BlockCnt].WKV := NN.AddLayerAfter( TNNetWKV.Create(), KV );
+        Gated := NN.AddLayer( TNNetCellMulByCell.Create(
+          RSig, Blocks[BlockCnt].WKV) );
+        Blocks[BlockCnt].AttOut := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1), Gated );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // ---- Channel-mix sub-block: x := x + FFN(ln2(x)) with squared-
+        // ReLU keying and sigmoid receptance gating.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN2 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].FFShiftK := NN.AddLayer( TNNetTokenShift.Create() );
+        Blocks[BlockCnt].FFKey := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1) );
+        NN.AddLayer( TNNetSquaredReLU.Create() );
+        Blocks[BlockCnt].FFValue := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+        Blocks[BlockCnt].FFShiftR := NN.AddLayerAfter(
+          TNNetTokenShift.Create(), Blocks[BlockCnt].LN2 );
+        Blocks[BlockCnt].FFRecept := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+        RSig := NN.AddLayer( TNNetSigmoid.Create() );
+        Gated := NN.AddLayer( TNNetCellMulByCell.Create(
+          RSig, Blocks[BlockCnt].FFValue) );
+        NN.AddLayer( TNNetSum.Create([Gated, BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
+      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        ImportError('RWKV import: embeddings.weight element count ' +
+          IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+          'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(Config.Prefix + 'embeddings.weight');
+      if Config.TieWordEmbeddings then
+      begin
+        // Tied LM head: logits = h . E^T (rows copied, bias-free).
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('head.weight') then
+          MarkConsumed('head.weight');
+      end
+      else
+      begin
+        LoadLlamaLinearWeights(Reader, LMHead, 'head.weight',
+          Config.HiddenSize, Config.VocabSize);
+        MarkConsumed('head.weight');
+      end;
+      LoadLayerNormWeights(Reader, PreLN,
+        Config.Prefix + 'blocks.0.pre_ln.weight',
+        Config.Prefix + 'blocks.0.pre_ln.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'blocks.0.pre_ln.weight');
+      MarkConsumed(Config.Prefix + 'blocks.0.pre_ln.bias');
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'blocks.' + IntToStr(BlockCnt) + '.';
+        AttPrefix := BlockPrefix + 'attention.';
+        FFPrefix := BlockPrefix + 'feed_forward.';
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN1,
+          BlockPrefix + 'ln1.weight', BlockPrefix + 'ln1.bias',
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'ln1.weight');
+        MarkConsumed(BlockPrefix + 'ln1.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN2,
+          BlockPrefix + 'ln2.weight', BlockPrefix + 'ln2.bias',
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'ln2.weight');
+        MarkConsumed(BlockPrefix + 'ln2.bias');
+        // Token-shift lerp vectors (HF stores them [1,1,hidden]).
+        LoadChannelVector(Blocks[BlockCnt].AttShiftK, 0,
+          AttPrefix + 'time_mix_key', Config.HiddenSize);
+        LoadChannelVector(Blocks[BlockCnt].AttShiftV, 0,
+          AttPrefix + 'time_mix_value', Config.HiddenSize);
+        LoadChannelVector(Blocks[BlockCnt].AttShiftR, 0,
+          AttPrefix + 'time_mix_receptance', Config.HiddenSize);
+        LoadChannelVector(Blocks[BlockCnt].FFShiftK, 0,
+          FFPrefix + 'time_mix_key', Config.HiddenSize);
+        LoadChannelVector(Blocks[BlockCnt].FFShiftR, 0,
+          FFPrefix + 'time_mix_receptance', Config.HiddenSize);
+        // WKV decay (softplus-inverted, see LoadWKVDecay) + bonus u.
+        LoadWKVDecay(Blocks[BlockCnt].WKV, AttPrefix + 'time_decay',
+          Config.AttentionHiddenSize);
+        LoadChannelVector(Blocks[BlockCnt].WKV, 1,
+          AttPrefix + 'time_first', Config.AttentionHiddenSize);
+        // Bias-free nn.Linear projections.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttKey,
+          AttPrefix + 'key.weight', Config.HiddenSize,
+          Config.AttentionHiddenSize);
+        MarkConsumed(AttPrefix + 'key.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttValue,
+          AttPrefix + 'value.weight', Config.HiddenSize,
+          Config.AttentionHiddenSize);
+        MarkConsumed(AttPrefix + 'value.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttRecept,
+          AttPrefix + 'receptance.weight', Config.HiddenSize,
+          Config.AttentionHiddenSize);
+        MarkConsumed(AttPrefix + 'receptance.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttOut,
+          AttPrefix + 'output.weight', Config.AttentionHiddenSize,
+          Config.HiddenSize);
+        MarkConsumed(AttPrefix + 'output.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].FFKey,
+          FFPrefix + 'key.weight', Config.HiddenSize,
+          Config.IntermediateSize);
+        MarkConsumed(FFPrefix + 'key.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].FFRecept,
+          FFPrefix + 'receptance.weight', Config.HiddenSize,
+          Config.HiddenSize);
+        MarkConsumed(FFPrefix + 'receptance.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].FFValue,
+          FFPrefix + 'value.weight', Config.IntermediateSize,
+          Config.HiddenSize);
+        MarkConsumed(FFPrefix + 'value.weight');
+      end;
+      LoadLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'ln_out.weight', Config.Prefix + 'ln_out.bias',
+        Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'ln_out.weight');
+      MarkConsumed(Config.Prefix + 'ln_out.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('RWKV import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildRWKVFromSafeTensorsEx(const FileName: string;
+  out Config: TRWKVConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRWKVConfigFromJSONFile(ConfigPath);
+  Result := BuildRWKVFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildRWKVFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  IgnoredConfig: TRWKVConfig;
+begin
+  Result := BuildRWKVFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName);
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -6825,6 +7344,7 @@ var
   IgnoredGPTJConfig: TGPTJConfig;
   IgnoredPhiConfig: TPhiConfig;
   IgnoredBertConfig: TBertConfig;
+  IgnoredRWKVConfig: TRWKVConfig;
 begin
   // ---- resolve the weights file and the config.json ----
   if DirectoryExists(Path) then
@@ -6949,6 +7469,13 @@ begin
     // include it (bert/roberta - distilbert has none).
     Result := BuildBertFromSafeTensorsEx(WeightsPath, IgnoredBertConfig,
       pSeqLen, pInferenceOnly, {pIncludePooler=}false, ConfigPath)
+  else if ModelType = 'rwkv' then
+    // The first NON-TRANSFORMER route: RWKV-4 (architectures
+    // ["RwkvForCausalLM"]), a recurrent WKV mixer - causal-LM contract
+    // like the decoder families ((SeqLen,1,1) ids in, (SeqLen,1,vocab)
+    // logits out). See the RWKV-4 IMPORT section.
+    Result := BuildRWKVFromSafeTensorsEx(WeightsPath, IgnoredRWKVConfig,
+      pSeqLen, pInferenceOnly, ConfigPath)
   else if ModelType = 't5' then
   begin
     // T5 is an encoder-decoder: the import builds TWO nets, which this
@@ -6974,7 +7501,7 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
-      'qwen2, qwen3, gemma, gemma2, bert, distilbert, roberta.');
+      'qwen2, qwen3, gemma, gemma2, rwkv, bert, distilbert, roberta.');
   end;
 end;
 

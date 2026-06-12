@@ -453,6 +453,9 @@ type
     procedure TestAddConformerBlockShape;
     procedure TestAddConformerBlockSerializationRoundTrip;
     procedure TestAddConformerBlockGradientFlow;
+    procedure TestAddRWKVBlockShape;
+    procedure TestAddRWKVBlockSerializationRoundTrip;
+    procedure TestAddRWKVBlockGradientFlow;
     procedure TestAddLinformerAttentionShape;
     procedure TestAddLinformerAttentionSerializationRoundTrip;
     procedure TestAddLinformerAttentionGradientFlow;
@@ -31983,6 +31986,125 @@ begin
     end;
     AssertTrue('Conformer block input gradient finite', not AnyNan);
     AssertTrue('Conformer block input gradient non-zero (sum=' +
+      FloatToStr(GradSum) + ')', GradAbsMax > 1e-9);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddRWKVBlockShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Out: TNNetLayer;
+  i: integer;
+begin
+  // The AddRWKVBlock builder (pre-LN time-mix residual + pre-LN channel-mix
+  // residual, the RWKV-4 block) must be shape-preserving over the
+  // (SeqLen,1,d_model) sequence so blocks can be stacked.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 8);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 8));
+    NN.AddRWKVBlock({d_ff=}16);
+    Out := NN.AddRWKVBlock(); // d_ff<=0 -> the 4*D RWKV-4 default
+    AssertEquals('RWKV block output SizeX', 6, Out.Output.SizeX);
+    AssertEquals('RWKV block output SizeY', 1, Out.Output.SizeY);
+    AssertEquals('RWKV block output Depth', 8, Out.Output.Depth);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6;
+    NN.Compute(Input);
+    AssertEquals('RWKV block computed SizeX', 6, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('RWKV block computed Depth', 8, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddRWKVBlockSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // SaveToString -> LoadFromString -> SaveToString must be byte-identical for
+  // a net containing an AddRWKVBlock (proving every composed sub-layer -
+  // LayerNorms, TokenShifts, pointwise convs, the TNNetWKV recurrence, the
+  // squared ReLU, sigmoid gates, cell-mul gates and the residual sums - all
+  // serialize).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 6));
+    NN.AddRWKVBlock({d_ff=}12);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertEquals('RWKV block round-trip layer count',
+        NN.CountLayers(), NN2.CountLayers());
+      AssertEquals('RWKV block round-trip output Depth',
+        NN.GetLastLayer.Output.Depth, NN2.GetLastLayer.Output.Depth);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('RWKV block SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('RWKV block round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddRWKVBlockGradientFlow;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  GradSum, GradAbsMax: TNeuralFloat;
+  AnyNan: boolean;
+begin
+  // Gradient-flow smoke: one forward+backward must leave the INPUT gradient
+  // finite and non-zero across both residual sub-blocks (token shifts, the
+  // WKV recurrence, squared ReLU and both sigmoid receptance gates).
+  // Uses pError=1 so reading Layers[0].OutputError beyond index 0 is valid.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 6);
+  Desired := TNNetVolume.Create(5, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 1, 6, 1));
+    NN.AddRWKVBlock({d_ff=}12);
+    NN.SetLearningRate(0.01, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.1) * 0.7;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.6) * 0.3;
+
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+
+    GradSum := 0; GradAbsMax := 0; AnyNan := false;
+    for i := 0 to NN.Layers[0].OutputError.Size - 1 do
+    begin
+      if IsNan(NN.Layers[0].OutputError.Raw[i]) or
+         IsInfinite(NN.Layers[0].OutputError.Raw[i]) then AnyNan := true;
+      GradSum := GradSum + Abs(NN.Layers[0].OutputError.Raw[i]);
+      if Abs(NN.Layers[0].OutputError.Raw[i]) > GradAbsMax then
+        GradAbsMax := Abs(NN.Layers[0].OutputError.Raw[i]);
+    end;
+    AssertTrue('RWKV block input gradient finite', not AnyNan);
+    AssertTrue('RWKV block input gradient non-zero (sum=' +
       FloatToStr(GradSum) + ')', GradAbsMax > 1e-9);
   finally
     NN.Free; Input.Free; Desired.Free;
