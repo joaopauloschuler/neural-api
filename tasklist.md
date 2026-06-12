@@ -106,6 +106,21 @@ rather than acted on.
       untied LM head); verified vs transformers' LlamaForCausalLM at ~2e-7
       max |logit diff| (untied / tied / sliced) via examples/LlamaImport;
       committed pure-Python-oracle fixture test TestLlamaLogitParity.
+- [ ] Quantized inference — int8 (and/or FP16 storage) weight compression so
+      real imported checkpoints fit on commodity RAM: TinyLlama-1.1B in FP32 is
+      ~4.4GB of weights, beyond a 3GB-class machine even with MakeInferenceOnly,
+      so this is what separates "imports Llama" (landed, abe7573) from "runs
+      Llama". v1: per-output-channel symmetric int8 weight storage for the
+      weight-heavy layers (PointwiseConvLinear / FullConnect / Conv — the
+      layers the introspection report already flags as quantization
+      candidates), dequantize-on-the-fly into the existing FP32 forward (no
+      int8 matmul kernels needed yet); a `QuantizeWeights` /
+      inference-only-load path wired into BuildGPT2/BuildLlamaFromSafeTensors;
+      assert logit drift vs FP32 stays within a documented tolerance on the
+      pico-Llama parity fixture. FP16 weight STORAGE (half the RAM, ~zero
+      accuracy risk) is an acceptable stepping stone if int8 proves invasive.
+      Follow-ups: int8 activation/matmul path, GPTQ/AWQ-style calibrated
+      quantization, 4-bit.
 - [ ] SentencePiece / tokenizer.json tokenizer loading for the Llama importer
       (examples/LlamaImport currently drives the net with raw token ids):
       parse HF tokenizer.json (BPE/Unigram vocab + merges + byte-fallback) or
