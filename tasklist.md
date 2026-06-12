@@ -228,9 +228,11 @@ rather than acted on.
       importers.
 - [ ] More importer architectures: Mistral / Qwen2 are ~weight-mapping
       deltas on the landed Llama path (sliding-window attention and QKV
-      biases already exist as building blocks); Phi / Gemma slightly more
-      work. Each reuses the HF-parity fixture tooling (slicer + logit dump
-      + compare).
+      biases already exist as building blocks); Phi slightly more work.
+      Each reuses the HF-parity fixture tooling (slicer + logit dump
+      + compare). Gemma is broken out into its own per-generation task
+      track below (gap analysis 2026-06-11: Gemma-1 is ~80% load-time
+      weight folding on the Llama path).
 - [ ] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
       de-facto checkpoint format, and it ships PRE-quantized weights —
       dovetails with the int8 quantized-inference task (read Q8_0 blocks
@@ -506,6 +508,74 @@ rather than acted on.
       are CPU-sized parity targets, larger ones depend on the
       sharded-safetensors task above. Verify against GPTNeoXForCausalLM
       with the parity fixture tooling.
+- [ ] Gemma 1 - head_dim config override in the Llama import path: the ONE
+      structural gap for Gemma-1 — neural/neuralpretrained.pas (~line 771)
+      hardcodes HeadDim := HiddenSize div NumHeads, but Gemma-7B has
+      head_dim=256 != 3072/16=192. Read head_dim from config.json when
+      present, size the q/o projections as NumHeads*HeadDim != hidden_size
+      (o_proj maps back to hidden_size), and keep the div fallback so all
+      landed Llama fixtures stay bit-identical. Prerequisite for every
+      Gemma task below; also future-proofs other head_dim-decoupled
+      architectures.
+- [ ] Gemma 1 - GeGLU FFN wiring: Gemma's MLP is gated GELU, not SwiGLU.
+      TNNetGELU already implements the exact tanh approximation Gemma
+      specifies (gelu_pytorch_tanh), so this is letting the importer's
+      gated-FFN construction take the gate activation as a parameter
+      (GELU vs SiLU) rather than any new layer. Test: gated-FFN forward
+      parity against transformers' GemmaMLP on a pinned tensor.
+- [ ] Gemma 1 - BuildGemmaFromSafeTensors importer (load-time weight
+      folding on the landed Llama path; depends on the head_dim + GeGLU
+      tasks above): (a) embedding output scaled by sqrt(d_model) — fold
+      sqrt(d) into the embedding ROWS at load since TNNetEmbedding's
+      ScaleEmbedding is init-only, and scale ONLY the embedding copy, not
+      the tied LM-head copy (Gemma always ties); (b) zero-centered RMSNorm
+      — Gemma applies (1+w)*xhat, so store 1+w into TNNetTokenRMSNorm
+      weights at load, zero layer changes; (c) MQA on 2B via the landed
+      GQA builder at KVHeads=1. Verify with the HF-parity fixture tooling
+      (sliced pico-Gemma) against GemmaForCausalLM, tied-head case.
+- [ ] Gemma 2 - SDPA attention-logit soft-cap hook: the one real LAYER
+      change in the Gemma track — Gemma-2 applies cap*tanh(scores/cap)
+      (cap 50) to attention logits PRE-softmax, but scores live inside
+      TNNetScaledDotProductAttention, so the standalone TNNetSoftCapping
+      cannot reach them. Add an optional score-softcap parameter to SDPA
+      (same opt-in pattern as the causal/window flags; default off =
+      bit-identical), with the tanh' factor in backward. Gradient-check
+      with the cap on, and assert cap=0/off matches the landed path
+      exactly.
+- [ ] Gemma 2 - sandwich-norm block builder: pre AND post RMSNorm around
+      both the attention and FFN sublayers (4 norms per block, vs the
+      landed pre-norm-only residual helpers). Pure composition — a builder
+      variant beside AddPreNormResidual/AddRMSNormResidual; the post-norm
+      sits INSIDE the residual branch (normalize sublayer output before
+      the add). Reusable beyond Gemma (several recent models adopt
+      sandwich norms).
+- [ ] Gemma 2 - BuildGemma2FromSafeTensors importer (depends on the Gemma-1
+      importer + the two Gemma-2 tasks above): alternating local(4096)/
+      global attention via the landed sliding-window SDPA (same alternating
+      pattern as the GPT-Neo task); query_pre_attn_scalar (e.g. 224 on 27B)
+      folded into W_q at load (same trick as GPT-Neo's unscaled attention);
+      final-logit soft-capping as a plain TNNetSoftCapping.Create(30)
+      before the softmax head — zero new code. Note the 256k vocab makes
+      embedding+head the FP32 memory hot spot (quantized-inference task
+      dependency for the larger sizes). Parity fixture vs
+      Gemma2ForCausalLM.
+- [ ] Gemma 3 - per-head QK-norm composition: Gemma-3 replaces soft-capping
+      with RMSNorm applied per-head to q and k before attention. Likely
+      pure composition: the multi-head builders split q/k/v into explicit
+      per-head layers before SDPA, so insert TNNetTokenRMSNorm on the q and
+      k branches — verify the insertion point sits AFTER RoPE the way
+      transformers' Gemma3 does (norm placement relative to RoPE changed
+      across implementations; pin it against the HF reference, do not
+      guess). Gradient check + a wired-into-MHA-builder flag.
+- [ ] Gemma 3 - BuildGemma3FromSafeTensors importer, TEXT-ONLY (depends on
+      the QK-norm task + the Gemma-2 importer): 5:1 local:global layer
+      ratio (config wiring over the same alternating machinery) and
+      PER-LAYER-TYPE RoPE theta — 10k for local layers, 1M for global
+      layers, so rope_theta becomes per-layer instead of one global config
+      value (plumbing exists from the Llama config reader, needs a
+      per-layer override). The 4B+ multimodal vision tower is explicitly
+      OUT OF SCOPE (separate project). Parity fixture vs
+      Gemma3ForCausalLM on a sliced text-only checkpoint.
 
 ## Layer follow-ups that fix real limitations
 
