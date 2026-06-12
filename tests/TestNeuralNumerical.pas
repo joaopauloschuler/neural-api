@@ -858,6 +858,7 @@ type
     procedure TestRoPEScalingPIHalfPositions;
     procedure TestRoPEScalingNTKDimSelective;
     procedure TestRoPEScalingYaRNBands;
+    procedure TestRoPEScalingLlama3MatchesYaRNUpToTemperature;
     procedure TestRoPEScalingSerializationRoundTrip;
     procedure TestRoPEScalingGradientChecks;
     procedure TestDropPathPZeroBoundary;
@@ -13179,18 +13180,22 @@ var
 begin
   RandSeed := 424242;
   // (d) YaRN per-band ramp with base=10000, d=8, TrainLen=512, s=2,
-  // alpha=1, beta=32. Per-pair wavelength ratios r = 512/(2*pi*base^(2k/8)):
-  //   k=0: r=81.5  >= beta  -> theta unchanged (matches unscaled angles)
-  //   k=1: r=8.15  in (1,32)-> blended, strictly between PI and unscaled
-  //   k=2: r=0.815 <= alpha -> fully interpolated (matches PI angles)
-  //   k=3: r=0.081 <= alpha -> fully interpolated
-  // plus the attention temperature t = 0.1*ln(s)+1 applied as sqrt(1/t) on
-  // the output (this layer sits on BOTH q and k streams in the builders).
+  // alpha=1, beta=32, the HF truncate=true band edges: low =
+  // floor(corr_dim(32)) = floor(0.406) = 0, high = ceil(corr_dim(1)) =
+  // ceil(1.911) = 2, blend linear in the pair index k (gamma = 1 - k/2):
+  //   k=0: gamma=1   -> theta unchanged (matches unscaled angles)
+  //   k=1: gamma=0.5 -> blended, strictly between PI and unscaled
+  //   k=2: gamma=0   -> fully interpolated (matches PI angles)
+  //   k=3: clamped 0 -> fully interpolated
+  // plus the attention temperature: the output is multiplied by
+  // mscale = 0.1*ln(s)+1 (= the paper's sqrt(1/t); HF transformers'
+  // "attention_factor"). This layer sits on BOTH q and k streams in the
+  // builders, so attention logits gain mscale^2 = 1/t.
   SeqLen := 4;
   Depth := 8;
   Scale := 2.0;
   Temperature := 0.1 * Ln(Scale) + 1.0;
-  OutScale := Sqrt(1.0 / Temperature);
+  OutScale := Temperature;
   NNNone := TNNet.Create();
   NNPI := TNNet.Create();
   NNYaRN := TNNet.Create();
@@ -13244,9 +13249,9 @@ begin
     begin
       yNone := pos * 0.1;                      // unscaled angle, k=1
       yPI := pos * 0.05;                       // fully interpolated angle
-      // expected blended angle: gamma=(8.149-1)/31
-      yYaRN := pos * (((1.0 - (512.0 / (2.0 * Pi / 0.1) - 1.0) / 31.0) * 0.05 +
-        ((512.0 / (2.0 * Pi / 0.1) - 1.0) / 31.0) * 0.1));
+      // expected blended angle: gamma = 1 - (k-low)/(high-low) = 0.5, so
+      // theta'_1 = 0.5*0.05 + 0.5*0.1 = 0.075 (the HF yarn formula).
+      yYaRN := pos * 0.075;
       AssertTrue('YaRN k=1 blended angle strictly between pos=' + IntToStr(pos),
         (yYaRN > yPI) and (yYaRN < yNone));
       AssertEquals('YaRN k=1 blended y0 pos=' + IntToStr(pos),
@@ -13258,18 +13263,74 @@ begin
     end;
 
     // Temperature norm check: rotations preserve norm, so
-    // ||out||^2 = (1/t) * ||in||^2.
+    // ||out||^2 = mscale^2 * ||in||^2 (mscale = 0.1*ln(s)+1 = sqrt(1/t);
+    // across the q and k streams attention logits gain the full 1/t).
     InNormSq := Input.GetSumSqr();
     OutNormSq := 0;
     for pos := 0 to SeqLen - 1 do
       for d := 0 to Depth - 1 do
         OutNormSq := OutNormSq + Sqr(NNYaRN.GetLastLayer.Output[pos, 0, d]);
     AssertEquals('YaRN temperature norm ratio',
-      InNormSq / Temperature, OutNormSq, 1e-3);
+      InNormSq * Sqr(Temperature), OutNormSq, 1e-3);
   finally
     NNNone.Free;
     NNPI.Free;
     NNYaRN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEScalingLlama3MatchesYaRNUpToTemperature;
+var
+  NNYaRN, NNLlama3: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Depth, pos, d: integer;
+  Scale, MScale: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  // rsmLlama3 blends linearly in the rotation count r while rsmYaRN blends
+  // linearly in the pair index, but with alpha=1, beta=4, d=8, TrainLen=512
+  // EVERY pair saturates to "keep" (k=0,1) or "fully interpolate" (k=2,3)
+  // under BOTH ramps, so the thetas coincide and the outputs differ ONLY by
+  // the attention temperature yarn applies and llama3 skips: yarn output =
+  // mscale * llama3 output elementwise (mscale = 0.1*ln(s)+1; HF sets
+  // attention_factor=1.0 for "llama3").
+  SeqLen := 4;
+  Depth := 8;
+  Scale := 8.0;
+  MScale := 0.1 * Ln(Scale) + 1.0;
+  NNYaRN := TNNet.Create();
+  NNLlama3 := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NNYaRN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNYaRN.AddLayer(TNNetRotaryEmbedding.Create(10000.0,
+      rsmYaRN, Scale, 512, 1.0, 4.0));
+    NNLlama3.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    NNLlama3.AddLayer(TNNetRotaryEmbedding.Create(10000.0,
+      rsmLlama3, Scale, 512, 1.0, 4.0));
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := Sin((pos * Depth + d) * 0.53) * 0.8 - 0.3;
+
+    NNYaRN.Compute(Input);
+    NNLlama3.Compute(Input);
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        AssertEquals('llama3 = yarn/mscale pos=' + IntToStr(pos) +
+          ' d=' + IntToStr(d),
+          NNYaRN.GetLastLayer.Output[pos, 0, d],
+          MScale * NNLlama3.GetLastLayer.Output[pos, 0, d], 1e-5);
+
+    // Norm check: rotations preserve norm and llama3 has NO output scale.
+    AssertEquals('llama3 preserves the input norm',
+      Input.GetSumSqr(),
+      NNLlama3.GetLastLayer.Output.GetSumSqr(), 1e-3);
+  finally
+    NNYaRN.Free;
+    NNLlama3.Free;
     Input.Free;
   end;
 end;
@@ -13360,9 +13421,10 @@ end;
 procedure TTestNeuralNumerical.TestRoPEScalingGradientChecks;
 begin
   RandSeed := 424242;
-  // (f) Backward is the transpose rotation (times sqrt(1/t) in YaRN mode);
-  // central-difference gradient check in every scaled mode. YaRN is the
-  // important one: it adds the temperature factor to both passes.
+  // (f) Backward is the transpose rotation (times the mscale temperature
+  // factor in YaRN mode); central-difference gradient check in every scaled
+  // mode. YaRN is the important one: it adds the temperature factor to both
+  // passes.
   LayerInputGradientCheck(Self, TNNetRotaryEmbedding.Create(10000.0,
     rsmPositionInterpolation, 2.0, 256),
     'RotaryEmbeddingPI', 3, 1, 4, 0.01);
@@ -13372,6 +13434,9 @@ begin
   LayerInputGradientCheck(Self, TNNetRotaryEmbedding.Create(10000.0,
     rsmYaRN, 2.0, 512, 1.0, 32.0),
     'RotaryEmbeddingYaRN', 3, 1, 4, 0.01);
+  LayerInputGradientCheck(Self, TNNetRotaryEmbedding.Create(10000.0,
+    rsmLlama3, 8.0, 512, 1.0, 4.0),
+    'RotaryEmbeddingLlama3', 3, 1, 4, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestDropPathPZeroBoundary;

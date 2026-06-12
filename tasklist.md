@@ -253,7 +253,7 @@ rather than acted on.
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
       assert, same pattern as the chunked-forward recurrence family.
-- [ ] RoPE scaling config wiring for context extension: the RoPE layer
+- [X] RoPE scaling config wiring for context extension: the RoPE layer
       already implements Position Interpolation, NTK-aware and YaRN
       (TNNetRoPEScalingMode, including YaRN's per-band interpolation +
       attention-temperature factor), but neural/neuralpretrained.pas still

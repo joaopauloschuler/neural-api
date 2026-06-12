@@ -3683,22 +3683,32 @@ type
   //     barely touched (theta_0 = 1 exactly for any base) while
   //     low-frequency dims are slowed roughly as in interpolation.
   //   rsmYaRN                  - YaRN (Peng et al. 2023): per-frequency-band
-  //     ramp. With wavelength lambda_i = 2*pi/theta_i and ratio
-  //     r_i = TrainLen/lambda_i, dims with r_i >= beta (default 32) keep
-  //     their original theta_i; dims with r_i <= alpha (default 1) are fully
-  //     interpolated (theta_i/s); in between the two are linearly blended:
-  //     theta'_i = (1-gamma_i)*theta_i/s + gamma_i*theta_i with
-  //     gamma_i = clamp((r_i - alpha)/(beta - alpha), 0, 1). YaRN also
-  //     applies the attention-temperature correction t = 0.1*ln(s) + 1 by
-  //     multiplying the rotated output by sqrt(1/t). NOTE: this assumes the
-  //     layer is applied to BOTH the q and the k streams (which is how the
-  //     builders in this unit use it - AddMultiHeadSDPAConcat and the
-  //     DeepSeek-MLA builder each insert one TNNetRotaryEmbedding on the Q
-  //     slice and one on the K slice), so attention logits q.k pick up the
-  //     full 1/t factor.
+  //     ramp, implemented EXACTLY like HF transformers' yarn rope (default
+  //     truncate=true): the band edges are the pair indices completing beta
+  //     (= beta_fast, default 32) and alpha (= beta_slow, default 1)
+  //     rotations over TrainLen positions, floor/ceil-snapped to integers;
+  //     pairs below the low edge keep their original theta_i, pairs above
+  //     the high edge are fully interpolated (theta_i/s), and in between
+  //     the blend theta'_i = (1-gamma_i)*theta_i/s + gamma_i*theta_i is
+  //     LINEAR IN THE PAIR INDEX. YaRN also applies the
+  //     attention-temperature correction by multiplying the rotated output
+  //     by mscale = 0.1*ln(s) + 1 (the paper's recommended sqrt(1/t); HF
+  //     transformers applies the same factor to cos/sin as
+  //     "attention_factor"). NOTE: this assumes the layer is applied to BOTH
+  //     the q and the k streams (which is how the builders in this unit use
+  //     it - AddMultiHeadSDPAConcat and the DeepSeek-MLA builder each insert
+  //     one TNNetRotaryEmbedding on the Q slice and one on the K slice), so
+  //     attention logits q.k pick up the full 1/t = mscale^2 factor.
+  //   rsmLlama3                - Llama 3.1 per-band scaling (EXACTLY HF
+  //     transformers' llama3 rope): with rotation count r_i =
+  //     TrainLen/lambda_i, pairs with r_i >= beta (= high_freq_factor,
+  //     default 4) keep theta_i, pairs with r_i <= alpha (= low_freq_factor,
+  //     default 1) are fully interpolated, and in between the same blend is
+  //     LINEAR IN r_i (the smooth_factor). No attention-temperature output
+  //     scale (HF sets attention_factor = 1.0 for rope_type "llama3").
   // Coded by Claude (AI).
   TNNetRoPEScalingMode = (rsmNone, rsmPositionInterpolation, rsmNTKAware,
-    rsmYaRN);
+    rsmYaRN, rsmLlama3);
 
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
   // Parameter-free, applies a fixed position-dependent 2D rotation to
@@ -25965,7 +25975,7 @@ begin
     if pScaleFactor < 1 then
       FErrorProc('TNNetRotaryEmbedding scaling requires ScaleFactor >= 1. ' +
         'Got ScaleFactor=' + FloatToStr(pScaleFactor));
-    if pScalingMode = rsmYaRN then
+    if pScalingMode in [rsmYaRN, rsmLlama3] then
     begin
       if pOriginalContextLen <= 0 then
         FErrorProc('TNNetRotaryEmbedding YaRN requires OriginalContextLen > 0. ' +
@@ -26013,7 +26023,17 @@ var
   HalfD, pairIdx: integer;
   Base, InvD, Theta, Scale, Alpha, Beta, TrainLen: TNeuralFloat;
   Lambda, Ratio, Gamma, Temperature: TNeuralFloat;
+  YarnLow, YarnHigh: TNeuralFloat;
   Mode: TNNetRoPEScalingMode;
+
+  // HF transformers' find_correction_dim: the (fractional) pair index whose
+  // frequency completes NumRotations rotations over TrainLen positions.
+  function CorrectionDim(NumRotations: TNeuralFloat): TNeuralFloat;
+  begin
+    Result := pDepth * pcr_logf(TrainLen / (NumRotations * 2.0 * Pi)) /
+      (2.0 * pcr_logf(Base));
+  end;
+
 begin
   HalfD := pDepth div 2;
   SetLength(FTheta, HalfD);
@@ -26033,6 +26053,22 @@ begin
   // NTK-aware scaling: positions unchanged, base' = base * s^(d/(d-2)).
   if (Mode = rsmNTKAware) and (pDepth > 2) then
     Base := Base * pcr_expf((pDepth / (pDepth - 2)) * pcr_logf(Scale));
+  // YaRN band edges, matching HF transformers' default truncate=true:
+  // computed in (pair-index) dimension space from the rotation-count bounds
+  // and snapped to integers (floor/ceil), then the blend below is LINEAR IN
+  // THE PAIR INDEX between them. (The YaRN paper's by-parts ramp is linear
+  // in the rotation count r instead - that is what rsmLlama3 uses, where it
+  // matches HF's llama3 formula exactly.)
+  YarnLow := 0;
+  YarnHigh := 0;
+  if (Mode = rsmYaRN) and (TrainLen > 0) then
+  begin
+    YarnLow := Floor(CorrectionDim(Beta));   // beta_fast edge (high freq)
+    YarnHigh := Ceil(CorrectionDim(Alpha));  // beta_slow edge (low freq)
+    if YarnLow < 0 then YarnLow := 0;
+    if YarnHigh > pDepth - 1 then YarnHigh := pDepth - 1;
+    if YarnHigh = YarnLow then YarnHigh := YarnLow + 0.001; // HF guard
+  end;
   InvD := 1.0 / pDepth;
   for pairIdx := 0 to HalfD - 1 do
   begin
@@ -26042,8 +26078,21 @@ begin
       rsmPositionInterpolation: Theta := Theta / Scale;
       rsmYaRN:
         begin
-          // gamma=1 (r >= beta, short wavelength) keeps theta; gamma=0
-          // (r <= alpha) fully interpolates to theta/s; blend in between.
+          // gamma=1 (below the low band edge, short wavelength) keeps
+          // theta; gamma=0 (above the high edge) fully interpolates to
+          // theta/s; blend linearly IN THE PAIR INDEX in between (the HF
+          // transformers yarn formula).
+          Gamma := 1.0 - (pairIdx - YarnLow) / (YarnHigh - YarnLow);
+          if Gamma < 0 then Gamma := 0;
+          if Gamma > 1 then Gamma := 1;
+          Theta := (1.0 - Gamma) * (Theta / Scale) + Gamma * Theta;
+        end;
+      rsmLlama3:
+        begin
+          // gamma=1 (r >= beta = high_freq_factor, short wavelength) keeps
+          // theta; gamma=0 (r <= alpha = low_freq_factor) fully
+          // interpolates to theta/s; blend LINEARLY IN THE ROTATION COUNT r
+          // in between (exactly HF transformers' llama3 smooth_factor).
           Lambda := 2.0 * Pi / Theta;
           Ratio := TrainLen / Lambda;
           Gamma := (Ratio - Alpha) / (Beta - Alpha);
@@ -26054,13 +26103,16 @@ begin
     end;
     FTheta[pairIdx] := Theta;
   end;
-  // YaRN attention temperature t = 0.1*ln(s)+1: the rotated output is
-  // multiplied by sqrt(1/t). Applied to BOTH q and k (the builders insert
-  // this layer on both streams), attention logits gain the full 1/t.
+  // YaRN attention temperature: the rotated output is multiplied by
+  // mscale = 0.1*ln(s)+1 (= sqrt(1/t), the paper's recommendation; HF
+  // transformers multiplies cos/sin by the same "attention_factor").
+  // Applied to BOTH q and k (the builders insert this layer on both
+  // streams), attention logits gain the full 1/t = mscale^2.
+  // rsmLlama3 deliberately skips this (HF attention_factor = 1.0).
   if Mode = rsmYaRN then
   begin
     Temperature := 0.1 * pcr_logf(Scale) + 1.0;
-    FOutScale := Sqrt(1.0 / Temperature);
+    FOutScale := Temperature;
   end;
 end;
 
@@ -26099,8 +26151,8 @@ begin
       pcr_sincosf(Angle, s, c);
       x0 := Prev[pos, 0, 2 * k];
       x1 := Prev[pos, 0, 2 * k + 1];
-      // FOutScale is exactly 1.0 except in YaRN mode (sqrt(1/t)), so the
-      // default path is bit-for-bit unchanged.
+      // FOutScale is exactly 1.0 except in YaRN mode (mscale = 0.1*ln(s)+1),
+      // so the default path is bit-for-bit unchanged.
       FOutput[pos, 0, 2 * k]     := FOutScale * (c * x0 - s * x1);
       FOutput[pos, 0, 2 * k + 1] := FOutScale * (s * x0 + c * x1);
     end;
@@ -26137,7 +26189,7 @@ begin
         pcr_sincosf(Angle, s, c);
         gy0 := FOutputError[pos, 0, 2 * k];
         gy1 := FOutputError[pos, 0, 2 * k + 1];
-        // Transpose rotation (times FOutScale, the YaRN sqrt(1/t) factor;
+        // Transpose rotation (times FOutScale, the YaRN mscale factor;
         // exactly 1.0 outside YaRN mode):
         //   gx0 = FOutScale * ( c*gy0 + s*gy1)
         //   gx1 = FOutScale * (-s*gy0 + c*gy1)

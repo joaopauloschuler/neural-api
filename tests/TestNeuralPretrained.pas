@@ -29,6 +29,9 @@ type
     // 8-byte little-endian length); Payload is the raw data section.
     function WriteTempSafeTensors(const HeaderJson: string;
       const Payload: array of byte): string;
+    // Writes Contents verbatim to a temp .json file and returns its path
+    // (caller deletes) - used to exercise config.json parsing variants.
+    function WriteTempJSON(const Contents: string): string;
     // Byte-for-byte file copy (used to assemble HF-style checkpoint
     // directories - config.json + model.safetensors - in a temp dir for
     // the BuildFromPretrained directory-dispatch tests).
@@ -92,6 +95,8 @@ type
     procedure TestRotaryHalfPermutationMatchesHFRotateHalf;
     procedure TestSwiGLUMatchesLlamaMLPGating;
     procedure TestLlamaConfigFromJSONFile;
+    procedure TestRopeScalingConfigParsing;
+    procedure TestRopeScalingWiredIntoLlamaBuilder;
     procedure TestLlamaImporterFailsOnMissingTensor;
     procedure TestLlamaLogitParity;
     procedure TestShardedReaderMatchesSingleFile;
@@ -176,6 +181,21 @@ begin
       FS.WriteBuffer(Payload[0], Length(Payload));
   finally
     FS.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.WriteTempJSON(const Contents: string): string;
+var
+  SL: TStringList;
+begin
+  Result := GetTempDir(false) + 'cai_cfg_test_' + IntToStr(Random(1000000)) +
+    '.json';
+  SL := TStringList.Create;
+  try
+    SL.Text := Contents;
+    SL.SaveToFile(Result);
+  finally
+    SL.Free;
   end;
 end;
 
@@ -1339,6 +1359,196 @@ begin
   AssertFalse('tie_word_embeddings', Config.TieWordEmbeddings);
 end;
 
+procedure TTestNeuralPretrained.TestRopeScalingConfigParsing;
+const
+  // Minimal valid llama config; each case appends its rope_scaling and '}'.
+  LlamaBase = '{"model_type": "llama", "hidden_size": 8, ' +
+    '"intermediate_size": 12, "num_hidden_layers": 2, ' +
+    '"num_attention_heads": 2, "num_key_value_heads": 1, ' +
+    '"vocab_size": 11, "max_position_embeddings": 16';
+
+  function ReadLlamaCase(const RopeScalingJson: string): TLlamaConfig;
+  var
+    Path: string;
+  begin
+    Path := WriteTempJSON(LlamaBase + ', "rope_scaling": ' +
+      RopeScalingJson + '}');
+    try
+      Result := ReadLlamaConfigFromJSONFile(Path);
+    finally
+      DeleteFile(Path);
+    end;
+  end;
+
+  procedure AssertLlamaCaseRejected(const CaseName, RopeScalingJson: string);
+  var
+    Failed: boolean;
+  begin
+    Failed := false;
+    try
+      ReadLlamaCase(RopeScalingJson);
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue(CaseName + ' must be rejected', Failed);
+  end;
+
+var
+  Config: TLlamaConfig;
+  NeoXConfig: TGPTNeoXConfig;
+  PhiConfig: TPhiConfig;
+  Path: string;
+begin
+  RandSeed := 424242;
+  // null: bit-identical unscaled path (also covered by the committed
+  // fixture, which carries "rope_scaling": null).
+  Config := ReadLlamaCase('null');
+  AssertTrue('null -> rsmNone', Config.RopeScaling.Mode = rsmNone);
+  AssertEquals('null factor', 1.0, Config.RopeScaling.Factor, 1e-6);
+
+  // legacy "type" spelling: linear -> Position Interpolation.
+  Config := ReadLlamaCase('{"type": "linear", "factor": 2.0}');
+  AssertTrue('linear -> rsmPositionInterpolation',
+    Config.RopeScaling.Mode = rsmPositionInterpolation);
+  AssertEquals('linear factor', 2.0, Config.RopeScaling.Factor, 1e-6);
+
+  // modern "rope_type" spelling: dynamic -> NTK-aware.
+  Config := ReadLlamaCase('{"rope_type": "dynamic", "factor": 8.0}');
+  AssertTrue('dynamic -> rsmNTKAware',
+    Config.RopeScaling.Mode = rsmNTKAware);
+  AssertEquals('dynamic factor', 8.0, Config.RopeScaling.Factor, 1e-6);
+
+  // yarn with explicit params: beta_slow -> YarnAlpha, beta_fast -> YarnBeta.
+  Config := ReadLlamaCase('{"rope_type": "yarn", "factor": 4.0, ' +
+    '"original_max_position_embeddings": 128, "beta_fast": 16.0, ' +
+    '"beta_slow": 2.0}');
+  AssertTrue('yarn -> rsmYaRN', Config.RopeScaling.Mode = rsmYaRN);
+  AssertEquals('yarn factor', 4.0, Config.RopeScaling.Factor, 1e-6);
+  AssertEquals('yarn original context', 128,
+    Config.RopeScaling.OriginalContextLen);
+  AssertEquals('yarn alpha = beta_slow', 2.0,
+    Config.RopeScaling.YarnAlpha, 1e-6);
+  AssertEquals('yarn beta = beta_fast', 16.0,
+    Config.RopeScaling.YarnBeta, 1e-6);
+
+  // yarn defaults: original context falls back to max_position_embeddings,
+  // beta_slow/beta_fast default to 1/32; the HF-default attention_factor
+  // (0.1*ln(2)+1) is accepted because it matches what the layer hardcodes.
+  Config := ReadLlamaCase('{"rope_type": "yarn", "factor": 2.0, ' +
+    '"attention_factor": 1.0693147}');
+  AssertTrue('yarn defaults mode', Config.RopeScaling.Mode = rsmYaRN);
+  AssertEquals('yarn fallback original context', 16,
+    Config.RopeScaling.OriginalContextLen);
+  AssertEquals('yarn default alpha', 1.0, Config.RopeScaling.YarnAlpha, 1e-6);
+  AssertEquals('yarn default beta', 32.0, Config.RopeScaling.YarnBeta, 1e-6);
+
+  // llama3 -> rsmLlama3 with low/high_freq_factor in the alpha/beta slots.
+  Config := ReadLlamaCase('{"rope_type": "llama3", "factor": 32.0, ' +
+    '"low_freq_factor": 1.0, "high_freq_factor": 4.0, ' +
+    '"original_max_position_embeddings": 8192}');
+  AssertTrue('llama3 -> rsmLlama3', Config.RopeScaling.Mode = rsmLlama3);
+  AssertEquals('llama3 factor', 32.0, Config.RopeScaling.Factor, 1e-6);
+  AssertEquals('llama3 original context', 8192,
+    Config.RopeScaling.OriginalContextLen);
+  AssertEquals('llama3 alpha = low_freq_factor', 1.0,
+    Config.RopeScaling.YarnAlpha, 1e-6);
+  AssertEquals('llama3 beta = high_freq_factor', 4.0,
+    Config.RopeScaling.YarnBeta, 1e-6);
+
+  // Rejections: unknown type, missing factor, custom attention_factor and
+  // DeepSeek-style mscale overrides the layer cannot honor.
+  AssertLlamaCaseRejected('longrope', '{"rope_type": "longrope", ' +
+    '"factor": 2.0}');
+  AssertLlamaCaseRejected('missing factor', '{"rope_type": "linear"}');
+  AssertLlamaCaseRejected('custom attention_factor',
+    '{"rope_type": "yarn", "factor": 4.0, "attention_factor": 3.0}');
+  AssertLlamaCaseRejected('mscale override',
+    '{"rope_type": "yarn", "factor": 4.0, "mscale": 0.707}');
+
+  // The other two importer families parse the same key.
+  Path := WriteTempJSON('{"model_type": "gpt_neox", "hidden_size": 8, ' +
+    '"intermediate_size": 16, "num_hidden_layers": 1, ' +
+    '"num_attention_heads": 2, "vocab_size": 11, ' +
+    '"max_position_embeddings": 16, ' +
+    '"rope_scaling": {"type": "linear", "factor": 2.0}}');
+  try
+    NeoXConfig := ReadGPTNeoXConfigFromJSONFile(Path);
+  finally
+    DeleteFile(Path);
+  end;
+  AssertTrue('gpt_neox linear -> rsmPositionInterpolation',
+    NeoXConfig.RopeScaling.Mode = rsmPositionInterpolation);
+  AssertEquals('gpt_neox factor', 2.0, NeoXConfig.RopeScaling.Factor, 1e-6);
+
+  Path := WriteTempJSON('{"model_type": "phi", "hidden_size": 8, ' +
+    '"intermediate_size": 16, "num_hidden_layers": 1, ' +
+    '"num_attention_heads": 2, "vocab_size": 11, ' +
+    '"max_position_embeddings": 16, ' +
+    '"rope_scaling": {"rope_type": "dynamic", "factor": 8.0}}');
+  try
+    PhiConfig := ReadPhiConfigFromJSONFile(Path);
+  finally
+    DeleteFile(Path);
+  end;
+  AssertTrue('phi dynamic -> rsmNTKAware',
+    PhiConfig.RopeScaling.Mode = rsmNTKAware);
+  AssertEquals('phi factor', 8.0, PhiConfig.RopeScaling.Factor, 1e-6);
+end;
+
+procedure TTestNeuralPretrained.TestRopeScalingWiredIntoLlamaBuilder;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, RopeCnt: integer;
+  Rope: TNNetRotaryEmbedding;
+begin
+  RandSeed := 424242;
+  // The committed fixture carries "rope_scaling": null - the parsed record
+  // must select the unchanged unscaled path...
+  Config := ReadLlamaConfigFromJSONFile(FixturePath('tiny_llama_config.json'));
+  AssertTrue('fixture parses to rsmNone', Config.RopeScaling.Mode = rsmNone);
+  NN := BuildLlamaFromSafeTensorsWithConfig(
+    FixturePath('tiny_llama.safetensors'), Config);
+  try
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt] is TNNetRotaryEmbedding then
+        AssertTrue('unscaled config builds rsmNone rotary layers',
+          TNNetRotaryEmbedding(NN.Layers[LayerCnt]).GetScalingMode() =
+            rsmNone);
+  finally
+    NN.Free;
+  end;
+  // ...and a config WITH rope_scaling must reach every rotary layer the
+  // builder creates (2 blocks x (1 KV head + 2 Q heads) = 6 layers).
+  Config := ReadLlamaConfigFromJSONFile(FixturePath('tiny_llama_config.json'));
+  Config.RopeScaling.Mode := rsmYaRN;
+  Config.RopeScaling.Factor := 4.0;
+  Config.RopeScaling.OriginalContextLen := 8;
+  Config.RopeScaling.YarnAlpha := 1.0;
+  Config.RopeScaling.YarnBeta := 32.0;
+  NN := BuildLlamaFromSafeTensorsWithConfig(
+    FixturePath('tiny_llama.safetensors'), Config);
+  try
+    RopeCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt] is TNNetRotaryEmbedding then
+      begin
+        Inc(RopeCnt);
+        Rope := TNNetRotaryEmbedding(NN.Layers[LayerCnt]);
+        AssertTrue('rotary layer carries rsmYaRN',
+          Rope.GetScalingMode() = rsmYaRN);
+        AssertEquals('rotary layer factor', 4.0, Rope.GetScaleFactor(), 1e-6);
+        AssertEquals('rotary layer original context', 8,
+          Rope.GetOriginalContextLen());
+        AssertEquals('rotary layer alpha', 1.0, Rope.GetYarnAlpha(), 1e-6);
+        AssertEquals('rotary layer beta', 32.0, Rope.GetYarnBeta(), 1e-6);
+      end;
+    AssertEquals('rotary layer count', 6, RopeCnt);
+  finally
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestLlamaImporterFailsOnMissingTensor;
 var
   Path: string;
@@ -1384,6 +1594,9 @@ begin
   Config.FinalLogitSoftCap := 0;
   Config.SandwichNorm := false;
   Config.AltSlidingWindow := false;
+  Config.SlidingWindowPattern := 0;
+  Config.RopeLocalTheta := 0;
+  Config.RopeScaling := DefaultRoPEScaling();
   Config.Prefix := '';
   Failed := false;
   NN := nil;

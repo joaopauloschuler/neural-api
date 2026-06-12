@@ -540,6 +540,32 @@ function BuildGPT2FromSafeTensorsEx(const FileName: string;
   pSeqClsHead: boolean = false; pExactGelu: boolean = false): TNNet;
 
 type
+  // Parsed HF config.json "rope_scaling" (long-context extension), mapped
+  // onto TNNetRotaryEmbedding's scaling-mode constructor arguments:
+  //   "linear"          -> rsmPositionInterpolation (factor)
+  //   "dynamic"/"ntk"   -> rsmNTKAware (factor; static approximation of the
+  //                        dynamic rule at the full config factor)
+  //   "yarn"            -> rsmYaRN (factor, original_max_position_embeddings,
+  //                        YarnAlpha=beta_slow, YarnBeta=beta_fast)
+  //   "llama3"          -> rsmLlama3 (factor, original_max_position_embeddings,
+  //                        YarnAlpha=low_freq_factor, YarnBeta=high_freq_factor)
+  // null/absent rope_scaling (and rope_type "default") parse to Mode=rsmNone,
+  // which keeps the import bit-identical to the unscaled path.
+  TRoPEScalingConfig = record
+    Mode: TNNetRoPEScalingMode;  // rsmNone when rope_scaling is null/absent
+    Factor: TNeuralFloat;        // "factor" (>= 1); 1.0 when Mode=rsmNone
+    OriginalContextLen: integer; // pretraining context (YaRN/llama3 ramp)
+    YarnAlpha: TNeuralFloat;     // beta_slow (yarn) / low_freq_factor (llama3)
+    YarnBeta: TNeuralFloat;      // beta_fast (yarn) / high_freq_factor (llama3)
+  end;
+
+// The Mode=rsmNone record (Factor=1, OriginalContextLen=0, alpha=1, beta=32).
+function DefaultRoPEScaling(): TRoPEScalingConfig;
+
+// 'none' for rsmNone, else e.g. 'linear x2', 'yarn x4 orig=128 ...'.
+function RoPEScalingToString(const S: TRoPEScalingConfig): string;
+
+type
   TLlamaConfig = record
     HiddenSize: integer;       // d_model (hidden_size)
     IntermediateSize: integer; // SwiGLU MLP width (intermediate_size)
@@ -589,6 +615,10 @@ type
                                // layers (rope_local_base_freq, Gemma-3
                                // default 10000); global layers keep
                                // RopeTheta (1e6); 0 = single theta
+    RopeScaling: TRoPEScalingConfig; // parsed "rope_scaling" (Mode=rsmNone
+                               // when null/absent). With RopeLocalTheta > 0
+                               // (Gemma-3) it applies to the GLOBAL layers
+                               // only, matching HF (rope_local is unscaled)
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -631,8 +661,9 @@ type
 //            RopeTheta default 1e6 and RopeLocalTheta
 //            (rope_local_base_freq, default 10000) for the sliding layers;
 //   llama:   QKVBias := attention_bias (default false).
-// Fails on an unsupported model_type and on a non-null rope_scaling
-// (long-context scaling is not wired here yet).
+// Fails on an unsupported model_type. A non-null "rope_scaling" is parsed
+// into Result.RopeScaling (see TRoPEScalingConfig for the supported types:
+// linear, dynamic/ntk, yarn, llama3; anything else is rejected).
 // Prefix is left '' - the builders detect it from the checkpoint.
 function ReadLlamaConfigFromJSONFile(const FileName: string): TLlamaConfig;
 
@@ -831,6 +862,8 @@ type
     TieWordEmbeddings: boolean; // tie_word_embeddings (Pythia: FALSE)
     HiddenActTanh: boolean;     // true = gelu_new/gelu_pytorch_tanh; false =
                                 // exact erf "gelu" (the Pythia default)
+    RopeScaling: TRoPEScalingConfig; // parsed "rope_scaling" (Mode=rsmNone
+                                // when null/absent)
     Prefix: string;             // tensor-name prefix ('gpt_neox.' or '')
   end;
 
@@ -932,6 +965,8 @@ type
     TieWordEmbeddings: boolean; // tie_word_embeddings (Phi: FALSE)
     HiddenActTanh: boolean;     // true = gelu_new/gelu_pytorch_tanh (the
                                 // Phi default); false = exact erf "gelu"
+    RopeScaling: TRoPEScalingConfig; // parsed "rope_scaling" (Mode=rsmNone
+                                // when null/absent)
     Prefix: string;             // tensor-name prefix ('model.' or '')
   end;
 
@@ -2227,6 +2262,168 @@ begin
     pNumHeads, pInferenceOnly, {pSeqClsHead=}false, pExactGelu);
 end;
 
+// ===================== ROPE SCALING (config.json) ==========================
+
+function DefaultRoPEScaling(): TRoPEScalingConfig;
+begin
+  Result.Mode := rsmNone;
+  Result.Factor := 1.0;
+  Result.OriginalContextLen := 0;
+  Result.YarnAlpha := 1.0;
+  Result.YarnBeta := 32.0;
+end;
+
+function RoPEScalingToString(const S: TRoPEScalingConfig): string;
+begin
+  case S.Mode of
+    rsmPositionInterpolation: Result := 'linear x' + FloatToStr(S.Factor);
+    rsmNTKAware: Result := 'ntk x' + FloatToStr(S.Factor);
+    rsmYaRN: Result := 'yarn x' + FloatToStr(S.Factor) +
+      ' orig=' + IntToStr(S.OriginalContextLen) +
+      ' beta_slow=' + FloatToStr(S.YarnAlpha) +
+      ' beta_fast=' + FloatToStr(S.YarnBeta);
+    rsmLlama3: Result := 'llama3 x' + FloatToStr(S.Factor) +
+      ' orig=' + IntToStr(S.OriginalContextLen) +
+      ' low=' + FloatToStr(S.YarnAlpha) +
+      ' high=' + FloatToStr(S.YarnBeta);
+    else Result := 'none';
+  end;
+end;
+
+// Maps a HF config.json "rope_scaling" object (when present and non-null)
+// onto TNNetRotaryEmbedding's scaling-mode constructor arguments - see
+// TRoPEScalingConfig for the type mapping. Notes:
+//  - "rope_type" is the modern spelling; legacy configs say "type".
+//  - "dynamic" (dynamic NTK) rescales the base from the CURRENT sequence
+//    length at inference in HF; this importer applies the static NTK-aware
+//    base change at the full config "factor" instead.
+//  - yarn: original_max_position_embeddings is read from rope_scaling, then
+//    the top level (Phi-3 style), then falls back to max_position_embeddings
+//    (the HF fallback chain). DeepSeek-style "mscale"/"mscale_all_dim"
+//    overrides and a custom "attention_factor" (anything other than the
+//    YaRN default 0.1*ln(factor)+1, which the layer hardcodes) are rejected.
+//    The layer implements HF's DEFAULT truncate=true band edges; a config
+//    with an explicit "truncate": false would deviate slightly on the two
+//    boundary pairs (the key is ignored).
+//  - "longrope" (Phi-3) and unknown types are rejected.
+// Coded by Claude (AI).
+function ReadRoPEScalingFromJSONObject(Obj: TJSONObject;
+  MaxPositions: integer; const ImporterName: string): TRoPEScalingConfig;
+var
+  Field, Sub: TJSONData;
+  Scaling: TJSONObject;
+  TypeName: string;
+  DefaultAttn: TNeuralFloat;
+
+  function ReadOriginalContextLen(): integer;
+  var
+    F: TJSONData;
+  begin
+    F := Scaling.Find('original_max_position_embeddings');
+    if (F = nil) or F.IsNull then
+      F := Obj.Find('original_max_position_embeddings');
+    if (F = nil) or F.IsNull then
+      Result := MaxPositions
+    else
+      Result := F.AsInteger;
+    if Result <= 0 then
+      ImportError(ImporterName + ': rope_scaling ' +
+        'original_max_position_embeddings must be positive, got ' +
+        IntToStr(Result) + '.');
+  end;
+
+  procedure RejectKey(const KeyName: string);
+  var
+    F: TJSONData;
+  begin
+    F := Scaling.Find(KeyName);
+    if (F <> nil) and not F.IsNull then
+      ImportError(ImporterName + ': rope_scaling "' + KeyName + '" (' +
+        F.AsJSON + ') is not wired into TNNetRotaryEmbedding (it changes ' +
+        'the attention factor away from the YaRN default the layer ' +
+        'hardcodes).');
+  end;
+
+begin
+  Result := DefaultRoPEScaling();
+  Field := Obj.Find('rope_scaling');
+  if (Field = nil) or Field.IsNull then Exit; // unscaled: unchanged path
+  if not (Field is TJSONObject) then
+    ImportError(ImporterName + ': config "rope_scaling" must be a JSON ' +
+      'object or null, got ' + Field.AsJSON + '.');
+  Scaling := TJSONObject(Field);
+  TypeName := Scaling.Get('rope_type', Scaling.Get('type', ''));
+  if TypeName = '' then
+    ImportError(ImporterName + ': rope_scaling carries neither "rope_type" ' +
+      'nor "type": ' + Scaling.AsJSON + '.');
+  if TypeName = 'default' then Exit; // explicit no-op scaling
+  Sub := Scaling.Find('factor');
+  if (Sub = nil) or Sub.IsNull then
+    ImportError(ImporterName + ': rope_scaling type "' + TypeName +
+      '" is missing the required "factor".');
+  Result.Factor := Sub.AsFloat;
+  if Result.Factor < 1 then
+    ImportError(ImporterName + ': rope_scaling factor must be >= 1, got ' +
+      FloatToStr(Result.Factor) + '.');
+  if TypeName = 'linear' then
+    Result.Mode := rsmPositionInterpolation
+  else if (TypeName = 'dynamic') or (TypeName = 'ntk') then
+    Result.Mode := rsmNTKAware
+  else if TypeName = 'yarn' then
+  begin
+    Result.Mode := rsmYaRN;
+    Result.OriginalContextLen := ReadOriginalContextLen();
+    Result.YarnAlpha := Scaling.Get('beta_slow', 1.0);
+    Result.YarnBeta := Scaling.Get('beta_fast', 32.0);
+    if Result.YarnBeta <= Result.YarnAlpha then
+      ImportError(ImporterName + ': rope_scaling yarn requires beta_fast > ' +
+        'beta_slow, got beta_fast=' + FloatToStr(Result.YarnBeta) +
+        ' beta_slow=' + FloatToStr(Result.YarnAlpha) + '.');
+    RejectKey('mscale');
+    RejectKey('mscale_all_dim');
+    Sub := Scaling.Find('attention_factor');
+    if (Sub <> nil) and not Sub.IsNull then
+    begin
+      if Result.Factor > 1 then
+        DefaultAttn := 0.1 * Ln(Result.Factor) + 1.0
+      else
+        DefaultAttn := 1.0;
+      if Abs(Sub.AsFloat - DefaultAttn) > 1e-3 then
+        ImportError(ImporterName + ': rope_scaling attention_factor=' +
+          FloatToStr(Sub.AsFloat) + ' is not wired - TNNetRotaryEmbedding ' +
+          'hardcodes the YaRN default 0.1*ln(factor)+1 = ' +
+          FloatToStr(DefaultAttn) + '.');
+    end;
+  end
+  else if TypeName = 'llama3' then
+  begin
+    Result.Mode := rsmLlama3;
+    Result.OriginalContextLen := ReadOriginalContextLen();
+    Result.YarnAlpha := Scaling.Get('low_freq_factor', 1.0);
+    Result.YarnBeta := Scaling.Get('high_freq_factor', 4.0);
+    if Result.YarnBeta <= Result.YarnAlpha then
+      ImportError(ImporterName + ': rope_scaling llama3 requires ' +
+        'high_freq_factor > low_freq_factor, got high=' +
+        FloatToStr(Result.YarnBeta) + ' low=' +
+        FloatToStr(Result.YarnAlpha) + '.');
+  end
+  else
+    ImportError(ImporterName + ': rope_scaling type "' + TypeName +
+      '" is not supported - only "linear" (Position Interpolation), ' +
+      '"dynamic"/"ntk" (NTK-aware), "yarn" and "llama3" are wired onto ' +
+      'TNNetRotaryEmbedding.');
+end;
+
+// Constructs a TNNetRotaryEmbedding from a base and a parsed rope_scaling
+// (Mode=rsmNone passes only the base - bit-identical to the unscaled
+// constructor). Coded by Claude (AI).
+function CreateRoPEFromScaling(Base: TNeuralFloat;
+  const S: TRoPEScalingConfig): TNNetRotaryEmbedding;
+begin
+  Result := TNNetRotaryEmbedding.Create(Base, S.Mode, S.Factor,
+    S.OriginalContextLen, S.YarnAlpha, S.YarnBeta);
+end;
+
 // ============================ LLAMA IMPORT =================================
 
 function ReadLlamaConfigFromJSONFile(const FileName: string): TLlamaConfig;
@@ -2235,7 +2432,7 @@ var
   Root: TJSONData;
   Obj: TJSONObject;
   ModelType, HiddenAct: string;
-  RopeScaling, HeadDimField, SlidingWindowField, FloatField: TJSONData;
+  HeadDimField, SlidingWindowField, FloatField: TJSONData;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -2278,10 +2475,6 @@ begin
         'BuildFromPretrained for the full dispatch; multimodal "gemma3" ' +
         'configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
-    RopeScaling := Obj.Find('rope_scaling');
-    if (RopeScaling <> nil) and not RopeScaling.IsNull then
-      ImportError('Llama import: config carries a non-null "rope_scaling" - ' +
-        'long-context RoPE scaling is not wired into this importer yet.');
     Result.ModelType := ModelType;
     Result.HiddenSize := RequiredInt('hidden_size');
     Result.IntermediateSize := RequiredInt('intermediate_size');
@@ -2289,6 +2482,8 @@ begin
     Result.NumHeads := RequiredInt('num_attention_heads');
     Result.VocabSize := RequiredInt('vocab_size');
     Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.RopeScaling := ReadRoPEScalingFromJSONObject(Obj,
+      Result.MaxPositions, 'Llama import');
     Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
     Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
     Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
@@ -2523,6 +2718,9 @@ begin
     Result := Result + ', sandwich_norm=true';
   if Config.AltSlidingWindow then
     Result := Result + ', alt_sliding_window=true';
+  if Config.RopeScaling.Mode <> rsmNone then
+    Result := Result + ', rope_scaling=' +
+      RoPEScalingToString(Config.RopeScaling);
   if Config.SlidingWindowPattern > 0 then
     Result := Result + ', sliding_window_pattern=' +
       IntToStr(Config.SlidingWindowPattern);
@@ -2733,6 +2931,7 @@ var
   HeadDim, QWidth, KVWidth, LayerWindow, i, j, d: integer;
   LayerIsLocal: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
+  LayerRoPEScaling: TRoPEScalingConfig;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr, LMHeadName: string;
   QBiasName, KBiasName, VBiasName: string;
@@ -2852,10 +3051,20 @@ begin
           LayerWindow := Config.SlidingWindow
         else
           LayerWindow := 0;
+        // rope_scaling: HF Gemma-3 applies it ONLY to the GLOBAL rope
+        // (rope_local_base_freq layers keep the default unscaled
+        // parameters), so sliding layers with a dedicated local theta stay
+        // unscaled; every other family scales all layers.
         if LayerIsLocal and (Config.RopeLocalTheta > 0) then
-          LayerTheta := Config.RopeLocalTheta
+        begin
+          LayerTheta := Config.RopeLocalTheta;
+          LayerRoPEScaling := DefaultRoPEScaling();
+        end
         else
+        begin
           LayerTheta := Config.RopeTheta;
+          LayerRoPEScaling := Config.RopeScaling;
+        end;
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].AttnNorm :=
           NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
@@ -2891,7 +3100,7 @@ begin
             KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
           end;
           KRotated[KVHeadCnt] := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(LayerTheta), KSlice);
+            CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), KSlice);
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
         end;
@@ -2909,7 +3118,7 @@ begin
             QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
           end;
           QSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(LayerTheta), QSlice);
+            CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), QSlice);
           // Pack [Q_h | K_group | V_group] (width 3*head_dim) for SDPA.
           HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
             [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
@@ -3632,7 +3841,6 @@ var
   Root: TJSONData;
   Obj: TJSONObject;
   ModelType, HiddenAct: string;
-  Field: TJSONData;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -3686,11 +3894,8 @@ begin
     // rotary_emb_base is the classic key; rope_theta the newer spelling.
     Result.RopeTheta := Obj.Get('rope_theta',
       Obj.Get('rotary_emb_base', 10000.0));
-    Field := Obj.Find('rope_scaling');
-    if (Field <> nil) and not Field.IsNull then
-      ImportError('GPT-NeoX import: config carries a non-null ' +
-        '"rope_scaling" - long-context RoPE scaling is not wired into ' +
-        'this importer yet.');
+    Result.RopeScaling := ReadRoPEScalingFromJSONObject(Obj,
+      Result.MaxPositions, 'GPT-NeoX import');
     Result.UseParallelResidual := Obj.Get('use_parallel_residual', True);
     Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
     HiddenAct := Obj.Get('hidden_act', 'gelu');
@@ -3723,6 +3928,9 @@ begin
     ', rope_theta=' + FloatToStr(Config.RopeTheta) +
     ', parallel=' + BoolToStr(Config.UseParallelResidual, true) +
     ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.RopeScaling.Mode <> rsmNone then
+    Result := Result + ', rope_scaling=' +
+      RoPEScalingToString(Config.RopeScaling);
   if Config.HiddenActTanh then
     Result := Result + ', act=gelu_tanh'
   else
@@ -3944,7 +4152,7 @@ begin
           RotSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(RotChannels), QKVLayer);
           RotSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), RotSlice);
           if HeadDim > RotaryDims then
           begin
             PassSlice := NN.AddLayerAfter(
@@ -3963,7 +4171,7 @@ begin
           RotSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(RotChannels), QKVLayer);
           RotSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), RotSlice);
           if HeadDim > RotaryDims then
           begin
             PassSlice := NN.AddLayerAfter(
@@ -4607,7 +4815,6 @@ var
   Root: TJSONData;
   Obj: TJSONObject;
   ModelType, HiddenAct: string;
-  Field: TJSONData;
   NumKVHeads: integer;
 
   function RequiredInt(const FieldName: string): integer;
@@ -4672,11 +4879,8 @@ begin
       ImportError('Phi import: config partial_rotary_factor must be in ' +
         '(0, 1], got ' + FloatToStr(Result.PartialRotaryFactor) + '.');
     Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
-    Field := Obj.Find('rope_scaling');
-    if (Field <> nil) and not Field.IsNull then
-      ImportError('Phi import: config carries a non-null ' +
-        '"rope_scaling" - long-context RoPE scaling is not wired into ' +
-        'this importer yet.');
+    Result.RopeScaling := ReadRoPEScalingFromJSONObject(Obj,
+      Result.MaxPositions, 'Phi import');
     Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
     HiddenAct := Obj.Get('hidden_act', 'gelu_new');
     if HiddenAct = 'gelu' then
@@ -4707,6 +4911,9 @@ begin
     ', partial_rotary=' + FloatToStr(Config.PartialRotaryFactor) +
     ', rope_theta=' + FloatToStr(Config.RopeTheta) +
     ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.RopeScaling.Mode <> rsmNone then
+    Result := Result + ', rope_scaling=' +
+      RoPEScalingToString(Config.RopeScaling);
   if Config.HiddenActTanh then
     Result := Result + ', act=gelu_tanh'
   else
@@ -4939,7 +5146,7 @@ begin
             TNNetSplitChannels.Create(RotChannels),
             Blocks[BlockCnt].QProj);
           RotSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), RotSlice);
           if HeadDim > RotaryDims then
           begin
             PassSlice := NN.AddLayerAfter(
@@ -4954,7 +5161,7 @@ begin
             TNNetSplitChannels.Create(RotChannels),
             Blocks[BlockCnt].KProj);
           RotSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), RotSlice);
           if HeadDim > RotaryDims then
           begin
             PassSlice := NN.AddLayerAfter(
