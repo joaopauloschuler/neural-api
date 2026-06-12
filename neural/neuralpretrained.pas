@@ -15,6 +15,10 @@ unit neuralpretrained;
 //   - GPT-Neo (EleutherAI's GPT-3 replica; the roneneldan/TinyStories
 //     checkpoints share this architecture) - BuildGPTNeoFromSafeTensors.
 //     See the GPT-NEO IMPORT section below.
+//   - BERT (vanilla encoder family, model_type "bert": bert-base/tiny,
+//     sentence-transformers MiniLM, ...) - BuildBertFromSafeTensors.
+//     The FIRST ENCODER here: outputs hidden states, not logits. See the
+//     BERT IMPORT section below.
 //   - AutoModel-style dispatch on config.json's model_type -
 //     BuildFromPretrained (directory or .safetensors/.index.json path).
 //
@@ -138,6 +142,52 @@ unit neuralpretrained;
 // the HF default 4 * hidden_size applies. The LM head is tied to wte
 // (copied, like the GPT-2 path). The roneneldan/TinyStories-1M..33M
 // reference checkpoints are GPT-Neo and load through this path unchanged.
+//
+// ============================ BERT IMPORT ==================================
+// BuildBertFromSafeTensors rebuilds the vanilla BERT ENCODER (HF BertModel,
+// model_type "bert") - the first non-decoder in this unit. Differences from
+// the decoder importers, all from existing CAI layers:
+//
+//   Input(SeqLen,1,2)            [ch 0 = token ids, ch 1 = token-type ids]
+//     -> word + learned-position + token-type embeddings, SUMMED
+//     -> TNNetTokenLayerNorm (embeddings.LayerNorm, eps 1e-12)
+//     -> num_hidden_layers x POST-LN blocks (below)
+//   output: (SeqLen,1,hidden_size) final hidden states - NO LM head.
+//
+// Per block (HF BertLayer, POST-LN - norms sit AFTER each residual sum,
+// not before the sublayer like every decoder above):
+//   x := LN_attn( x + dense( MHA(query|key|value (x)) ) )
+//   x := LN_out ( x + output.dense( gelu( intermediate.dense(x) ) ) )
+// MHA is TNNet.AddMultiHeadSelfAttention with CausalMask=FALSE -
+// BIDIRECTIONAL attention, every position attends to all SeqLen keys.
+// There is NO padding mask: feed full-length token rows (pad-token
+// attention is the caller's problem; for parity work, avoid padding).
+// Every linear is nn.Linear [out, in] WITH a bias (q/k/v, attention
+// output.dense, both FFN linears) - LoadLlamaLinearWeights with BiasName.
+// The separate q/k/v load into the fused Q|K|V slab like the GPT-Neo path.
+//
+// EXACT GELU: BERT's hidden_act "gelu" is the exact erf form
+// 0.5*x*(1+erf(x/sqrt(2))), NOT TNNetGELU's tanh approximation (the two
+// differ by ~3e-4 around |x|=2). The exact form is COMPOSED from existing
+// layers: Phi(x) = MulByConstant(1/sqrt(2)) -> TNNetErf -> AddConstant(1)
+// -> MulByConstant(0.5), then DeepConcat([Phi, x]) -> TNNetReGLU. ReGLU
+// outputs ReLU(A)*B with A the FIRST half, and Phi is strictly in (0,1),
+// so ReLU(Phi) = Phi and the product is exactly Phi(x)*x. Configs saying
+// gelu_new / gelu_pytorch_tanh get the single TNNetGELU layer instead.
+//
+// TOKEN-TYPE (segment) EMBEDDINGS: input channel 1 is sliced off
+// (TNNetSplitChannels), looked up in its own TNNetEmbedding
+// (type_vocab_size rows) and SUMMED with the word+position branch before
+// the embedding LayerNorm. Callers with single-segment inputs simply feed
+// zeros in channel 1.
+//
+// POOLER (optional, pIncludePooler): HF's pooler_output =
+// tanh(pooler.dense(h[CLS])). Wired as a per-token PointwiseConvLinear +
+// TNNetHyperbolicTangent, so the output stays (SeqLen,1,hidden) and ROW 0
+// (the [CLS] position) equals HF's pooler_output. When the pooler is NOT
+// requested, pooler.dense.* tensors in the checkpoint are ignored (they
+// are pinned weights of a head this net does not carry, like a tied
+// lm_head.weight).
 //
 // All importers FAIL LOUDLY (EPretrainedImportError) on missing tensors,
 // unexpected tensors and shape mismatches.
@@ -322,6 +372,62 @@ function BuildGPTNeoFromSafeTensorsEx(const FileName: string;
 function BuildGPTNeoFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
+type
+  TBertConfig = record
+    HiddenSize: integer;       // d_model (hidden_size)
+    IntermediateSize: integer; // FFN width (intermediate_size)
+    NumLayers: integer;        // encoder blocks (num_hidden_layers)
+    NumHeads: integer;         // attention heads (num_attention_heads)
+    VocabSize: integer;        // vocab_size
+    MaxPositions: integer;     // max_position_embeddings (position table rows)
+    TypeVocabSize: integer;    // token-type (segment) vocabulary (usually 2)
+    LayerNormEps: TNeuralFloat;// layer_norm_eps (BERT default 1e-12)
+    HiddenActTanh: boolean;    // true = gelu_new/gelu_pytorch_tanh (tanh
+                               // approximation); false = exact erf "gelu"
+    Prefix: string;            // tensor-name prefix ('' or 'bert.')
+  end;
+
+// Reads a HF BERT config.json (model_type 'bert'). Required: hidden_size,
+// intermediate_size, num_hidden_layers, num_attention_heads, vocab_size,
+// max_position_embeddings. Defaults: type_vocab_size = 2,
+// layer_norm_eps = 1e-12, hidden_act = 'gelu' (the EXACT erf form;
+// 'gelu_new'/'gelu_pytorch_tanh' select the tanh approximation, anything
+// else is rejected). Prefix is left '' - the builder detects it.
+function ReadBertConfigFromJSONFile(const FileName: string): TBertConfig;
+
+function BertConfigToString(const Config: TBertConfig): string;
+
+// Builds a TNNet with the BERT ENCODER architecture described by Config and
+// loads every weight from the safetensors checkpoint at FileName (see the
+// BERT IMPORT section of the unit header). UNLIKE the decoder importers,
+// the net takes a (SeqLen,1,2) volume - channel 0 = token ids, channel 1 =
+// token-type (segment) ids, both as floats - and outputs the final HIDDEN
+// STATES, a (SeqLen,1,hidden_size) volume (NOT logits; there is no LM
+// head). Attention is BIDIRECTIONAL (non-causal) and every position
+// attends to all SeqLen positions: there is no padding mask, so feed
+// full-length sequences (or slice the net shorter via pSeqLen).
+// pIncludePooler = True appends the BERT pooler head (dense + tanh,
+// applied per token): the output stays (SeqLen,1,hidden_size) and ROW 0
+// (the [CLS] position) equals HF's pooler_output; the other rows are
+// tanh(dense(h_i)) and carry no HF meaning. pSeqLen = 0 uses the full
+// max_position_embeddings context. pInferenceOnly = True frees training
+// volumes during construction (Compute()-only afterwards).
+// Config.Prefix is detected from the checkpoint and written back.
+function BuildBertFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pIncludePooler: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildBertFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildBertFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pIncludePooler: boolean = false): TNNet;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -330,9 +436,14 @@ function BuildGPTNeoFromSafeTensors(const FileName: string;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, llama, mistral, qwen2. Anything else raises EPretrainedImportError
-// listing the supported types. The explicit builders stay public for
-// callers that want a compile-time architecture choice.
+// gpt_neo, llama, mistral, qwen2, bert. Anything else raises
+// EPretrainedImportError listing the supported types. The explicit builders
+// stay public for callers that want a compile-time architecture choice.
+// OUTPUT SEMANTICS DIFFER BY model_type: the decoder families return
+// causal-LM nets ((SeqLen,1,1) token ids in, (SeqLen,1,vocab) logits out),
+// while 'bert' returns an ENCODER ((SeqLen,1,2) token|token-type ids in,
+// (SeqLen,1,hidden_size) final hidden states out, pooler NOT included -
+// call BuildBertFromSafeTensors directly for the pooler head).
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -1680,6 +1791,401 @@ begin
     pInferenceOnly);
 end;
 
+// ============================ BERT IMPORT ==================================
+
+function ReadBertConfigFromJSONFile(const FileName: string): TBertConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('BERT import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('BERT import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('BERT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('BERT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('BERT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'bert');
+    if ModelType <> 'bert' then
+      ImportError('BERT import: config model_type is "' + ModelType +
+        '" - expected "bert" (RoBERTa/DistilBERT have different tensor ' +
+        'names and embedding quirks; see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.TypeVocabSize := Obj.Get('type_vocab_size', 2);
+    if Result.TypeVocabSize < 1 then
+      ImportError('BERT import: config type_vocab_size must be >= 1, got ' +
+        IntToStr(Result.TypeVocabSize) + '.');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-12);
+    HiddenAct := Obj.Get('hidden_act', 'gelu');
+    if HiddenAct = 'gelu' then
+      Result.HiddenActTanh := False // exact erf form (the BERT default)
+    else if (HiddenAct = 'gelu_new') or
+            (HiddenAct = 'gelu_pytorch_tanh') then
+      Result.HiddenActTanh := True
+    else
+      ImportError('BERT import: config hidden_act "' + HiddenAct +
+        '" is not supported - only "gelu" (exact), "gelu_new" and ' +
+        '"gelu_pytorch_tanh" are wired here.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BertConfigToString(const Config: TBertConfig): string;
+begin
+  Result := 'bert config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', type_vocab=' + IntToStr(Config.TypeVocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps);
+  if Config.HiddenActTanh then
+    Result := Result + ', act=gelu_tanh'
+  else
+    Result := Result + ', act=gelu_exact';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TBertBlockLayers = record
+    QKV, AttnDense, AttnLN, Inter, OutDense, OutLN: TNNetLayer;
+  end;
+
+function BuildBertFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pIncludePooler: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TBertBlockLayers;
+  InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN: TNNetLayer;
+  PoolerDense: TNNetLayer;
+  BranchInput, SliceLayer, HiddenAct, PhiBranch: TNNetLayer;
+  BlockCnt, SeqLen, i: integer;
+  BlockPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // Loads a [Rows, Cols] embedding table straight into the single-neuron
+  // weight volume of a TNNetEmbedding / TNNetLearnedPositionalEmbedding
+  // (row-major in both the checkpoint and the layer).
+  procedure LoadEmbeddingTable(Layer: TNNetLayer; const TName: string;
+    Rows, Cols: integer);
+  var
+    Tmp: TNNetVolume;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('BERT import: missing tensor "' + TName + '".');
+    if (Reader.DimCount(TName) <> 2) or
+       (Reader.DimSize(TName, 0) <> Rows) or
+       (Reader.DimSize(TName, 1) <> Cols) then
+      ImportError('BERT import: "' + TName + '" must have shape [' +
+        IntToStr(Rows) + ', ' + IntToStr(Cols) + '], got ' +
+        Reader.ShapeAsString(TName));
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(TName, Tmp);
+      if Layer.Neurons[0].Weights.Size <> Tmp.Size then
+        ImportError('BERT import: "' + TName + '" element count ' +
+          IntToStr(Tmp.Size) + ' does not match the table size ' +
+          IntToStr(Layer.Neurons[0].Weights.Size) + '.');
+      Layer.Neurons[0].Weights.Copy(Tmp);
+      Layer.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    MarkConsumed(TName);
+  end;
+
+begin
+  Reader := TNNetSafeTensorsReader.Create(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('BERT import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('BERT import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      if Config.TypeVocabSize < 1 then
+        ImportError('BERT import: type_vocab_size must be >= 1.');
+      // BertModel serializes without a prefix; BertFor* exports carry
+      // "bert.". Support both.
+      if Reader.HasTensor('embeddings.word_embeddings.weight') then
+        Config.Prefix := ''
+      else if Reader.HasTensor('bert.embeddings.word_embeddings.weight') then
+        Config.Prefix := 'bert.'
+      else
+        ImportError('BERT import: neither ' +
+          '"embeddings.word_embeddings.weight" nor ' +
+          '"bert.embeddings.word_embeddings.weight" found in ' +
+          Reader.FileName + ' - not a BERT checkpoint?');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('BERT import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      // Channel 0 = token ids, channel 1 = token-type (segment) ids.
+      InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
+      // Word branch: tokens -> embedding -> + learned absolute positions.
+      // EncodeZero=1: token id 0 is [PAD], a REAL row in the BERT vocab.
+      NN.AddLayer( TNNetSplitChannels.Create([0]) );
+      WordEmb := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      PosEmb := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
+      // Token-type branch: segment ids -> their own embedding table.
+      SliceLayer := NN.AddLayerAfter(
+        TNNetSplitChannels.Create([1]), InputLayer);
+      TypeEmb := NN.AddLayerAfter( TNNetEmbedding.Create(
+        Config.TypeVocabSize, Config.HiddenSize, {EncodeZero=}1),
+        SliceLayer);
+      // word + position + token-type, then the embedding LayerNorm.
+      NN.AddLayer( TNNetSum.Create([PosEmb, TypeEmb]) );
+      EmbLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // POST-LN attention sub-block:
+        //   x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].QKV := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        // CausalMask=false: every position attends to all SeqLen keys.
+        Blocks[BlockCnt].AttnDense := NN.AddMultiHeadSelfAttention(
+          Config.NumHeads, {CausalMask=}false);
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].AttnLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        // POST-LN FFN sub-block:
+        //   x := LN(x + output.dense(gelu(intermediate.dense(x)))).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].Inter := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        if Config.HiddenActTanh then
+          NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
+        else
+        begin
+          // EXACT erf GELU x*Phi(x) composed from existing layers (see the
+          // unit header): Phi = 0.5*(1 + erf(x/sqrt(2))) on a side branch,
+          // then ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x since Phi is in (0,1).
+          // (TNNetReGLU applies the ReLU to the FIRST depth half, the
+          // Shazeer max(0, xW) (x) xV convention - Phi must come first.)
+          HiddenAct := NN.GetLastLayer();
+          NN.AddLayerAfter(
+            TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+          NN.AddLayer( TNNetErf.Create() );
+          NN.AddLayer( TNNetAddConstant.Create(1.0) );
+          PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+          NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+          NN.AddLayer( TNNetReGLU.Create() );
+        end;
+        Blocks[BlockCnt].OutDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].OutLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      // No final norm and NO LM head: the encoder output IS the last
+      // block's LN output, (SeqLen,1,hidden) final hidden states.
+      PoolerDense := nil;
+      if pIncludePooler then
+      begin
+        // Per-token dense+tanh; row 0 ([CLS]) equals HF's pooler_output.
+        PoolerDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetHyperbolicTangent.Create() );
+      end;
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      LoadEmbeddingTable(WordEmb,
+        Config.Prefix + 'embeddings.word_embeddings.weight',
+        Config.VocabSize, Config.HiddenSize);
+      LoadEmbeddingTable(PosEmb,
+        Config.Prefix + 'embeddings.position_embeddings.weight',
+        Config.MaxPositions, Config.HiddenSize);
+      LoadEmbeddingTable(TypeEmb,
+        Config.Prefix + 'embeddings.token_type_embeddings.weight',
+        Config.TypeVocabSize, Config.HiddenSize);
+      LoadLayerNormWeights(Reader, EmbLN,
+        Config.Prefix + 'embeddings.LayerNorm.weight',
+        Config.Prefix + 'embeddings.LayerNorm.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'embeddings.LayerNorm.weight');
+      MarkConsumed(Config.Prefix + 'embeddings.LayerNorm.bias');
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'encoder.layer.' +
+          IntToStr(BlockCnt) + '.';
+        // Separate biased nn.Linear q/k/v -> the fused Q|K|V slab (query ->
+        // neurons 0..d-1, key -> d..2d-1, value -> 2d..3d-1; the builder's
+        // per-head slicing then matches HF's transpose_for_scores).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          BlockPrefix + 'attention.self.query.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, 3 * Config.HiddenSize,
+          0, BlockPrefix + 'attention.self.query.bias');
+        MarkConsumed(BlockPrefix + 'attention.self.query.weight');
+        MarkConsumed(BlockPrefix + 'attention.self.query.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          BlockPrefix + 'attention.self.key.weight',
+          Config.HiddenSize, Config.HiddenSize, Config.HiddenSize,
+          3 * Config.HiddenSize, 0, BlockPrefix + 'attention.self.key.bias');
+        MarkConsumed(BlockPrefix + 'attention.self.key.weight');
+        MarkConsumed(BlockPrefix + 'attention.self.key.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+          BlockPrefix + 'attention.self.value.weight',
+          Config.HiddenSize, Config.HiddenSize, 2 * Config.HiddenSize,
+          3 * Config.HiddenSize, 0,
+          BlockPrefix + 'attention.self.value.bias');
+        MarkConsumed(BlockPrefix + 'attention.self.value.weight');
+        MarkConsumed(BlockPrefix + 'attention.self.value.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
+          BlockPrefix + 'attention.output.dense.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'attention.output.dense.bias');
+        MarkConsumed(BlockPrefix + 'attention.output.dense.weight');
+        MarkConsumed(BlockPrefix + 'attention.output.dense.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].AttnLN,
+          BlockPrefix + 'attention.output.LayerNorm.weight',
+          BlockPrefix + 'attention.output.LayerNorm.bias',
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'attention.output.LayerNorm.weight');
+        MarkConsumed(BlockPrefix + 'attention.output.LayerNorm.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Inter,
+          BlockPrefix + 'intermediate.dense.weight',
+          Config.HiddenSize, Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'intermediate.dense.bias');
+        MarkConsumed(BlockPrefix + 'intermediate.dense.weight');
+        MarkConsumed(BlockPrefix + 'intermediate.dense.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutDense,
+          BlockPrefix + 'output.dense.weight',
+          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'output.dense.bias');
+        MarkConsumed(BlockPrefix + 'output.dense.weight');
+        MarkConsumed(BlockPrefix + 'output.dense.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].OutLN,
+          BlockPrefix + 'output.LayerNorm.weight',
+          BlockPrefix + 'output.LayerNorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'output.LayerNorm.weight');
+        MarkConsumed(BlockPrefix + 'output.LayerNorm.bias');
+      end;
+      if pIncludePooler then
+      begin
+        LoadLlamaLinearWeights(Reader, PoolerDense,
+          Config.Prefix + 'pooler.dense.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, -1, 0,
+          Config.Prefix + 'pooler.dense.bias');
+        MarkConsumed(Config.Prefix + 'pooler.dense.weight');
+        MarkConsumed(Config.Prefix + 'pooler.dense.bias');
+      end;
+
+      // ---------------- Unexpected-tensor check ----------------
+      // Every tensor must be consumed or be a known ignorable buffer:
+      //  - embeddings.position_ids: the positional-index buffer older
+      //    transformers versions serialize (positions are structural here);
+      //  - pooler.dense.*: the pooler head when pIncludePooler=false (a
+      //    real weight this net deliberately does not carry).
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if Pos('embeddings.position_ids', TensorNameStr) > 0 then continue;
+        if (not pIncludePooler) and
+           (Pos('pooler.dense.', TensorNameStr) > 0) then continue;
+        ImportError('BERT import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildBertFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBertConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pIncludePooler);
+end;
+
+function BuildBertFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pIncludePooler: boolean = false): TNNet;
+var
+  IgnoredConfig: TBertConfig;
+begin
+  Result := BuildBertFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, pIncludePooler);
+end;
+
 // ===================== MISTRAL / QWEN2 / DISPATCH ==========================
 
 // Shared wrapper: builds via the Llama path and asserts the config's
@@ -1747,6 +2253,7 @@ var
   NumHeads: integer;
   IgnoredLlamaConfig: TLlamaConfig;
   IgnoredGPTNeoConfig: TGPTNeoConfig;
+  IgnoredBertConfig: TBertConfig;
 begin
   // ---- resolve the weights file and the config.json ----
   if DirectoryExists(Path) then
@@ -1806,12 +2313,19 @@ begin
           (ModelType = 'qwen2') then
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
+  else if ModelType = 'bert' then
+    // ENCODER route: input (SeqLen,1,2) token|token-type ids, output
+    // (SeqLen,1,hidden) final hidden states - NOT causal-LM logits (see
+    // the interface comment). Pooler excluded; call BuildBertFromSafeTensors
+    // directly to include it.
+    Result := BuildBertFromSafeTensorsEx(WeightsPath, IgnoredBertConfig,
+      pSeqLen, pInferenceOnly, {pIncludePooler=}false, ConfigPath)
   else
   begin
     Result := nil;
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
-      'model_types: gpt2, gpt_neo, llama, mistral, qwen2.');
+      'model_types: gpt2, gpt_neo, llama, mistral, qwen2, bert.');
   end;
 end;
 

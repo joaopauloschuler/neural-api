@@ -38,6 +38,18 @@ type
     // NEVER loosen past it; fix the model instead).
     procedure AssertLogitParityWithFixture(NN: TNNet;
       const LogitsFileName: string; SeqLen, Vocab: integer);
+    // BERT parity loop: feeds every "sequences"/"token_types" pair of the
+    // reference fixture (JSON {"sequences", "token_types", "hidden",
+    // "pooler"}) through NN as a (SeqLen,1,2) volume (ch0=token id,
+    // ch1=segment id). PoolerRow0Only=false compares all SeqLen rows of
+    // the (SeqLen,1,Hidden) output against "hidden"; true compares ONLY
+    // row 0 against "pooler" (the [CLS] pooler_output of a net built with
+    // pIncludePooler=true). Gate 2e-5: TIGHTER than the 1e-4 logit gate on
+    // purpose - the exact-vs-tanh GELU difference is ~6e-5 on this fixture
+    // and must FAIL (true f32 parity is ~1e-6). Never loosen.
+    procedure AssertBertParityWithFixture(NN: TNNet;
+      const HiddenFileName: string; SeqLen, Hidden: integer;
+      PoolerRow0Only: boolean);
   published
     procedure TestTokenLayerNormForwardAndSaveLoad;
     procedure TestLearnedPositionalEmbeddingForwardAndSaveLoad;
@@ -64,6 +76,9 @@ type
     procedure TestQwen2LogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
+    procedure TestBertConfigFromJSONFile;
+    procedure TestBertHiddenStateParity;
+    procedure TestBertPoolerParity;
     procedure TestBuildFromPretrainedDispatch;
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
   end;
@@ -171,6 +186,90 @@ begin
     // widen the tolerance.
     AssertTrue('logit parity vs ' + LogitsFileName + ': max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.AssertBertParityWithFixture(NN: TNNet;
+  const HiddenFileName: string; SeqLen, Hidden: integer;
+  PoolerRow0Only: boolean);
+var
+  RefRoot: TJSONData;
+  Sequences, TokenTypes, RefArr, SeqArr, TypeArr, PosArr, RowArr: TJSONArray;
+  Input, Output: TNNetVolume;
+  RefJson: TStringList;
+  SeqCnt, PosCnt, ChanCnt, FirstPos, LastPos: integer;
+  Diff, MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(HiddenFileName);
+    RefRoot := GetJSON(RefJson.Text);
+    Sequences := TJSONArray(TJSONObject(RefRoot).Find('sequences'));
+    TokenTypes := TJSONArray(TJSONObject(RefRoot).Find('token_types'));
+    if PoolerRow0Only then
+      RefArr := TJSONArray(TJSONObject(RefRoot).Find('pooler'))
+    else
+      RefArr := TJSONArray(TJSONObject(RefRoot).Find('hidden'));
+    AssertTrue('sequences present', Sequences <> nil);
+    AssertTrue('token_types present', TokenTypes <> nil);
+    AssertTrue('reference present', RefArr <> nil);
+    AssertTrue('at least 3 sequences', Sequences.Count >= 3);
+    MaxDiff := 0;
+    Input.ReSize(SeqLen, 1, 2);
+    for SeqCnt := 0 to Sequences.Count - 1 do
+    begin
+      SeqArr := TJSONArray(Sequences.Items[SeqCnt]);
+      TypeArr := TJSONArray(TokenTypes.Items[SeqCnt]);
+      AssertEquals('sequence length', SeqLen, SeqArr.Count);
+      AssertEquals('token_types length', SeqLen, TypeArr.Count);
+      for PosCnt := 0 to SeqLen - 1 do
+      begin
+        Input.FData[PosCnt * 2] := SeqArr.Items[PosCnt].AsInteger;
+        Input.FData[PosCnt * 2 + 1] := TypeArr.Items[PosCnt].AsInteger;
+      end;
+      NN.Compute(Input);
+      NN.GetOutput(Output);
+      AssertEquals('output size', SeqLen * Hidden, Output.Size);
+      if PoolerRow0Only then
+      begin
+        FirstPos := 0;
+        LastPos := 0; // only the [CLS] row carries the HF pooler_output
+      end
+      else
+      begin
+        FirstPos := 0;
+        LastPos := SeqLen - 1;
+      end;
+      for PosCnt := FirstPos to LastPos do
+      begin
+        if PoolerRow0Only then
+          RowArr := TJSONArray(RefArr.Items[SeqCnt])
+        else
+        begin
+          PosArr := TJSONArray(RefArr.Items[SeqCnt]);
+          RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        end;
+        for ChanCnt := 0 to Hidden - 1 do
+        begin
+          Diff := Abs(Output.FData[PosCnt * Hidden + ChanCnt] -
+            RowArr.Items[ChanCnt].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    // 2e-5 gate (see the declaration comment): catches a tanh-approximated
+    // GELU (~6e-5 on this fixture) while true f32 parity is ~1e-6. NEVER
+    // loosen - fix the model instead.
+    AssertTrue('BERT parity vs ' + HiddenFileName + ': max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-5', MaxDiff < 2e-5);
   finally
     RefRoot.Free;
     Output.Free;
@@ -1242,6 +1341,67 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestBertConfigFromJSONFile;
+var
+  Config: TBertConfig;
+begin
+  Config := ReadBertConfigFromJSONFile(
+    FixturePath('tiny_bert_config.json'));
+  AssertEquals('hidden_size', 8, Config.HiddenSize);
+  AssertEquals('intermediate_size', 16, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('max_position_embeddings', 16, Config.MaxPositions);
+  AssertEquals('type_vocab_size', 2, Config.TypeVocabSize);
+  AssertTrue('layer_norm_eps = 1e-12',
+    Abs(Config.LayerNormEps - 1e-12) < 1e-18);
+  AssertFalse('hidden_act gelu = exact erf form', Config.HiddenActTanh);
+end;
+
+// Flagship encoder test: the imported BertModel's final hidden states must
+// match HF transformers' float64 last_hidden_state on sequences with a
+// NONZERO token-type segment boundary (the fixture asserts the segment
+// embeddings, the bidirectional attention AND the exact-vs-tanh GELU all
+// visibly shape this reference - see tools/bert_tiny_fixture.py).
+procedure TTestNeuralPretrained.TestBertHiddenStateParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_bert.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}false,
+    FixturePath('tiny_bert_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('prefix', '', Config.Prefix);
+    AssertBertParityWithFixture(NN, FixturePath('tiny_bert_hidden.json'),
+      Config.MaxPositions, Config.HiddenSize, {PoolerRow0Only=}false);
+  finally
+    NN.Free;
+  end;
+end;
+
+// With pIncludePooler=true the output row 0 (the [CLS] position) must equal
+// HF's pooler_output = tanh(pooler.dense(h[CLS])).
+procedure TTestNeuralPretrained.TestBertPoolerParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_bert.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}true,
+    FixturePath('tiny_bert_config.json'));
+  try
+    AssertBertParityWithFixture(NN, FixturePath('tiny_bert_hidden.json'),
+      Config.MaxPositions, Config.HiddenSize, {PoolerRow0Only=}true);
+  finally
+    NN.Free;
+  end;
+end;
+
 // BuildFromPretrained must route on config.json's model_type:
 //   - gpt2 via a HF-style checkpoint DIRECTORY (config.json +
 //     model.safetensors; n_head read from the config),
@@ -1314,6 +1474,15 @@ begin
   try
     AssertLogitParityWithFixture(NN, FixturePath('tiny_gptneo_logits.json'),
       16, 11);
+  finally
+    NN.Free;
+  end;
+  // ---- bert through the file route (ENCODER: hidden states, no pooler) ----
+  NN := BuildFromPretrained(FixturePath('tiny_bert.safetensors'), 0, false,
+    FixturePath('tiny_bert_config.json'));
+  try
+    AssertBertParityWithFixture(NN, FixturePath('tiny_bert_hidden.json'),
+      16, 8, {PoolerRow0Only=}false);
   finally
     NN.Free;
   end;

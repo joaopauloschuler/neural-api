@@ -431,16 +431,32 @@ rather than acted on.
       TNNetSafeTensorsReader so the GPT-2/Llama builders take either
       format. Test: torch.save a pico state_dict in Python, assert every
       tensor matches its safetensors twin bit-for-bit.
-- [ ] BERT/encoder-family importer (BERT / RoBERTa / DistilBERT / MiniLM):
-      neural/neuralpretrained.pas is decoder-only and the importer task
-      above (Mistral/Qwen2/Phi/Gemma) is also all-decoder. Encoders are a
-      different skeleton: learned absolute + token-type (segment)
-      embeddings, post-LN blocks, GELU, optional pooler head — all existing
-      building blocks. Highest-leverage importer on this list: it feeds the
-      token-classification head, the QA span head, and (via
-      sentence-transformers MiniLM) real pretrained sentence embeddings for
-      the InfoNCE/retrieval side. Verify with the HF-parity fixture tooling
-      (slicer + hidden-state dump + compare) against BertModel.
+- [X] BERT/encoder-family importer (vanilla BERT + MiniLM):
+      BuildBertFromSafeTensors[Ex/WithConfig] in neural/neuralpretrained.pas
+      — the first ENCODER importer (hidden states out, not logits; input
+      (SeqLen,1,2) token|token-type ids; bidirectional MHA, post-LN blocks,
+      EXACT erf GELU composed from MulByConstant/Erf/AddConstant/ReGLU,
+      optional pooler head; 'bert' route in BuildFromPretrained). Pinned
+      pico fixture tests/fixtures/tiny_bert.* (hidden parity 3.3e-7,
+      pooler 3.7e-8, gate 2e-5 — tight enough to catch a tanh-GELU swap);
+      real checkpoints verified: prajjwal1/bert-tiny hidden 4.1e-6 /
+      pooler 2.3e-6, sentence-transformers/all-MiniLM-L6-v2 (the
+      sentence-embedding workhorse, model_type bert) hidden 2.4e-6 /
+      pooler 1.7e-7.
+- [ ] RoBERTa importer delta on BuildBertFromSafeTensors: same skeleton and
+      tensor names modulo the 'roberta.' prefix, but position ids start at
+      padding_idx+1 = 2 (load position_embeddings rows offset by 2 and cap
+      usable SeqLen at max_position_embeddings-2), type_vocab_size = 1
+      (token-type branch degenerates to a constant row), and lm_head-less
+      RobertaModel exports. Parity fixture vs RobertaModel hidden states
+      (the offset is THE bug to catch: assert positions 0/1 rows unused).
+- [ ] DistilBERT importer delta on BuildBertFromSafeTensors: same post-LN
+      encoder math but different tensor names (distilbert.embeddings.*,
+      transformer.layer.N.attention.q_lin/k_lin/v_lin/out_lin,
+      sa_layer_norm, ffn.lin1/lin2, output_layer_norm), NO token-type
+      embeddings (input can stay (SeqLen,1,2) with channel 1 ignored, or
+      drop to depth 1) and NO pooler. Config keys also differ (n_layers,
+      n_heads, dim, hidden_dim). Parity fixture vs DistilBertModel.
 - [ ] T5/Flan-T5 (encoder-decoder) importer: the natural companion to the
       seq2seq generation harness task above. T5's relative-position bias
       buckets are landed (TNNetT5RelPosBiasAttention / avT5RelPosBias), and
@@ -453,8 +469,10 @@ rather than acted on.
 - [ ] ForSequenceClassification checkpoint import: load FINE-TUNED
       classifier checkpoints (sentiment / NLI / toxicity), not just base
       LMs — classifier-head weight mapping plus id2label from config.json
-      so predictions come out as label strings. Cheap delta on the
-      BERT-family importer above; also applies to decoder classifiers
+      so predictions come out as label strings. Cheap delta on the now-landed
+      BuildBertFromSafeTensors (dependency met: take the (SeqLen,1,hidden)
+      output, classifier = dense(tanh-pooled or [CLS] hidden) per family);
+      also applies to decoder classifiers
       (GPT2ForSequenceClassification uses the LAST non-pad token's hidden
       state — document the pooling difference). Test: parity fixture
       asserting class logits match transformers.
@@ -662,7 +680,7 @@ rather than acted on.
       (same make_pico script recipe as GPT-2/Llama); headline demo:
       tokens/sec flat in context length where the transformer slows.
 - [ ] ModernBERT importer (answer.ai, 139M) — the encoder worth targeting
-      BEYOND vanilla BERT once the BERT-family importer task above lands:
+      BEYOND vanilla BERT now that BuildBertFromSafeTensors has landed:
       RoPE instead of learned positions, GeGLU, alternating local/global
       attention — every ingredient is already landed or tasked (Gemma /
       GPT-Neo machinery). Best current retrieval/classification encoder
