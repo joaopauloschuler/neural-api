@@ -411,6 +411,11 @@ type
     procedure TestSelectiveSSMWeightGradientCheck;
     procedure TestSelectiveSSMSerializationRoundTrip;
     procedure TestSelectiveSSMLTIDegeneracy;
+    procedure TestSelectiveSSMDStateDefaultBitIdentity;
+    procedure TestSelectiveSSMDStateForwardReference;
+    procedure TestSelectiveSSMDStateInputGradientCheck;
+    procedure TestSelectiveSSMDStateWeightGradientCheck;
+    procedure TestSelectiveSSMDStateSerializationRoundTrip;
     procedure TestClosedFormContinuousInputGradientCheck;
     procedure TestClosedFormContinuousWeightGradientCheck;
     procedure TestClosedFormContinuousSerializationRoundTrip;
@@ -29420,6 +29425,279 @@ begin
   finally
     NN.Free; Input.Free;
   end;
+end;
+
+// Fill a DState>1 SelectiveSSM with deterministic, non-trivial values: W_d is
+// (Depth,1,Depth), W_B/W_C are (NS,1,Depth) shared-across-channel projections,
+// A_raw is per-(channel,state) (Depth,1,NS).
+procedure SeedSelectiveSSMDState(LSSM: TNNetSelectiveSSM; Depth, NS: integer);
+var d, j, s: integer;
+begin
+  for d := 0 to Depth - 1 do
+  begin
+    for j := 0 to Depth - 1 do
+      LSSM.Neurons[0].Weights[d, 0, j] := Sin(d * 1.3 + j * 0.7) * 0.15; // W_d
+    LSSM.Neurons[3].Weights.Raw[d] := Cos(d * 0.6) * 0.3;   // b_d
+    LSSM.Neurons[5].Weights.Raw[d] := 0.4 + d * 0.2;        // e (D skip)
+    for s := 0 to NS - 1 do
+      LSSM.Neurons[4].Weights[d, 0, s] := Sin(d * 0.4 + s * 0.9) * 0.5; // A_raw
+  end;
+  for s := 0 to NS - 1 do
+    for j := 0 to Depth - 1 do
+    begin
+      LSSM.Neurons[1].Weights[s, 0, j] := Cos(s * 0.9 + j * 1.1) * 0.18; // W_B
+      LSSM.Neurons[2].Weights[s, 0, j] := Sin(s * 0.5 - j * 0.8) * 0.2;  // W_C
+    end;
+end;
+
+procedure TTestNeuralNumerical.TestSelectiveSSMDStateDefaultBitIdentity;
+var
+  NN1, NN2: TNNet;
+  Input: TNNetVolume;
+  L1, L2: TNNetSelectiveSSM;
+  i: integer;
+begin
+  // The DState argument defaults to 1 and DState=1 must be TODAY'S layer
+  // bit-for-bit: same weight shapes, same code path, identical outputs between
+  // a default-constructed layer and an explicit Create(1).
+  RandSeed := 424242;
+  NN1 := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 3);
+  try
+    NN1.AddLayer(TNNetInput.Create(5, 1, 3));
+    L1 := TNNetSelectiveSSM.Create();
+    NN1.AddLayer(L1);
+    NN2.AddLayer(TNNetInput.Create(5, 1, 3));
+    L2 := TNNetSelectiveSSM.Create(1);
+    NN2.AddLayer(L2);
+    // Legacy shapes: W_B/W_C are DepthxDepth, A_raw is Depth-long.
+    AssertEquals('default W_B rows', 3, L1.Neurons[1].Weights.SizeX);
+    AssertEquals('default W_B cols', 3, L1.Neurons[1].Weights.Depth);
+    AssertEquals('default A_raw size', 3, L1.Neurons[4].Weights.Size);
+    SeedSelectiveSSM(L1, 3);
+    SeedSelectiveSSM(L2, 3);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.7) * 1.2 - 0.3;
+    NN1.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to L1.Output.Size - 1 do
+      AssertEquals('SelectiveSSM Create() vs Create(1) bit-identity at ' +
+        IntToStr(i), L1.Output.Raw[i], L2.Output.Raw[i], 0);
+  finally
+    NN2.Free; NN1.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSelectiveSSMDStateForwardReference;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LSSM: TNNetSelectiveSSM;
+  SeqLen, Depth, NS, t, d, j, s: integer;
+  pre, delta, bs, cs, a, refY, xd: TNeuralFloat;
+  h: array of TNeuralFloat;   // (Depth*NS) running state
+  bt, ct: array of TNeuralFloat;
+begin
+  // Hand-rolled reference of the DState>1 recurrence (the HF MambaMixer
+  // formulas): h_t[d,s] = exp(-delta_t[d]*exp(A_raw[d,s]))*h_{t-1}[d,s]
+  // + delta_t[d]*B_t[s]*x_t[d]; y_t[d] = sum_s C_t[s]*h_t[d,s] + e[d]*x_t[d].
+  RandSeed := 424242;
+  SeqLen := 5; Depth := 3; NS := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    LSSM := TNNetSelectiveSSM.Create(NS);
+    NN.AddLayer(LSSM);
+    SeedSelectiveSSMDState(LSSM, Depth, NS);
+    for t := 0 to Input.Size - 1 do Input.Raw[t] := Sin(t * 0.8) * 1.4 + 0.1;
+    NN.Compute(Input);
+
+    SetLength(h, Depth * NS);
+    SetLength(bt, NS);
+    SetLength(ct, NS);
+    for d := 0 to Depth * NS - 1 do h[d] := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      for s := 0 to NS - 1 do
+      begin
+        bs := 0; cs := 0;
+        for j := 0 to Depth - 1 do
+        begin
+          bs := bs + LSSM.Neurons[1].Weights[s, 0, j] * Input[t, 0, j];
+          cs := cs + LSSM.Neurons[2].Weights[s, 0, j] * Input[t, 0, j];
+        end;
+        bt[s] := bs; ct[s] := cs;
+      end;
+      for d := 0 to Depth - 1 do
+      begin
+        pre := LSSM.Neurons[3].Weights.Raw[d];
+        for j := 0 to Depth - 1 do
+          pre := pre + LSSM.Neurons[0].Weights[d, 0, j] * Input[t, 0, j];
+        delta := Ln(1 + Exp(pre));
+        xd := Input[t, 0, d];
+        refY := LSSM.Neurons[5].Weights.Raw[d] * xd;
+        for s := 0 to NS - 1 do
+        begin
+          a := Exp(-delta * Exp(LSSM.Neurons[4].Weights[d, 0, s]));
+          h[d * NS + s] := a * h[d * NS + s] + delta * bt[s] * xd;
+          refY := refY + ct[s] * h[d * NS + s];
+        end;
+        AssertEquals('SelectiveSSM DState=4 forward t=' + IntToStr(t) +
+          ' d=' + IntToStr(d), refY, LSSM.Output[t, 0, d], 1e-5);
+      end;
+    end;
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSelectiveSSMDStateInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LSSM: TNNetSelectiveSSM;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var kk: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  InputPlus := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LSSM := TNNetSelectiveSSM.Create(4);
+    NN.AddLayer(LSSM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.7 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.9;
+    SeedSelectiveSSMDState(LSSM, 3, 4);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SelectiveSSM DState=4 input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('SelectiveSSM DState=4 input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSelectiveSSMDStateWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LSSM: TNNetSelectiveSSM;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..5] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var kk: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(4, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'W_d'; Names[1] := 'W_B'; Names[2] := 'W_C';
+  Names[3] := 'b_d'; Names[4] := 'A_raw'; Names[5] := 'e';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LSSM := TNNetSelectiveSSM.Create(4);
+    NN.AddLayer(LSSM);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 1.3 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.8;
+    SeedSelectiveSSMDState(LSSM, 3, 4);
+
+    // Covers W_d (3x3), the shared W_B/W_C (4x3), b_d/e (3) and the
+    // per-(channel,state) A_raw (3x4): every tensor of the DState>1 BPTT.
+    for n := 0 to 5 do
+      for i := 0 to LSSM.Neurons[n].Weights.Size - 1 do
+      begin
+        LSSM.Neurons[n].Weights.Raw[i] := LSSM.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LSSM.Neurons[n].Weights.Raw[i] := LSSM.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LSSM.Neurons[n].Weights.Raw[i] := LSSM.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LSSM.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LSSM.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('SelectiveSSM DState=4 weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('SelectiveSSM DState=4 weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSelectiveSSMDStateSerializationRoundTrip;
+begin
+  // DState=4 round trip: FStruct[0] must survive save/load so the loaded layer
+  // rebuilds the (NS,1,Depth) W_B/W_C and (Depth,1,NS) A_raw shapes.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetSelectiveSSM.Create(4), 'SelectiveSSM-DState4', 4, 1, 3, 1e-5);
 end;
 
 // --- TNNetClosedFormContinuous (CfC liquid recurrent cell) ------------------
