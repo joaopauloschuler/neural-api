@@ -433,7 +433,7 @@ rather than acted on.
       easier first Pascal→Python round-trip than the listed safetensors
       writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
-- [ ] Gemma 2 - SDPA attention-logit soft-cap hook: the one real LAYER
+- [X] Gemma 2 - SDPA attention-logit soft-cap hook: the one real LAYER
       change in the Gemma track — Gemma-2 applies cap*tanh(scores/cap)
       (cap 50) to attention logits PRE-softmax, but scores live inside
       TNNetScaledDotProductAttention, so the standalone TNNetSoftCapping

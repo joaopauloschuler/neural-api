@@ -2528,6 +2528,8 @@ type
     FInvSqrtDk: TNeuralFloat;
     FCausal: boolean;
     FWindow: integer; // 0 = full attention; W>0 = sliding window of W keys
+    FScoreSoftCap: TNeuralFloat;    // 0 = off; c>0 = c*tanh(score/c) pre-softmax
+    FInvScoreSoftCap: TNeuralFloat; // 1/FScoreSoftCap when on (0 otherwise)
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     // --- KV-cache incremental-decode state (inference only, not serialized) ---
     FCacheEnabled: boolean;
@@ -2550,8 +2552,21 @@ type
     // bit-identical to the previous behavior). The KV-cache incremental
     // decode path honors the window too (attends over the last W cached
     // positions only).
+    //
+    // pScoreSoftCap = 0 (default) keeps the original behavior bit-identical.
+    // pScoreSoftCap = c > 0 applies the Gemma-2-style attention-logit
+    // SOFT-CAP: every unmasked pre-softmax score s is replaced by
+    // c * tanh(s / c) (a smooth squash into (-c, c); Gemma-2 uses c = 50).
+    // Masked positions keep the raw -1e9 additive sentinel (they must stay
+    // far below any real score so the softmax still zeroes them). Backward
+    // chains the tanh derivative, d(capped)/ds = 1 - tanh(s/c)^2, into the
+    // score gradient. The cap is serialized in FFloatSt[0] (old saved
+    // models load with 0 = off). The KV-cache incremental decode path
+    // applies the cap too. Subclass attention variants that override
+    // Compute() do not honor the cap (they construct with cap = 0 and some
+    // reuse FFloatSt[0] for their own scalar).
     constructor Create(d_k: integer; CausalMask: boolean = false;
-      pWindow: integer = 0); overload;
+      pWindow: integer = 0; pScoreSoftCap: TNeuralFloat = 0); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -2579,6 +2594,7 @@ type
     property Dk: integer read FDk;
     property CausalMask: boolean read FCausal;
     property Window: integer read FWindow;
+    property ScoreSoftCap: TNeuralFloat read FScoreSoftCap;
     property CacheEnabled: boolean read FCacheEnabled;
     property CacheLength: integer read FCacheLen;
     property MaxContext: integer read FCacheMax;
@@ -20995,21 +21011,30 @@ end;
 { TNNetScaledDotProductAttention }
 
 constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: boolean;
-  pWindow: integer);
+  pWindow: integer; pScoreSoftCap: TNeuralFloat);
 begin
   inherited Create();
   FDk := d_k;
   FCausal := CausalMask;
   FWindow := pWindow;
+  FScoreSoftCap := pScoreSoftCap;
   if FDk < 1 then
     FErrorProc('TNNetScaledDotProductAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
   if FWindow < 0 then
     FErrorProc('TNNetScaledDotProductAttention requires Window >= 0 ' +
       '(0 = full attention). Window=' + IntToStr(FWindow));
+  if FScoreSoftCap < 0 then
+    FErrorProc('TNNetScaledDotProductAttention requires ScoreSoftCap >= 0 ' +
+      '(0 = off). ScoreSoftCap=' + FloatToStr(FScoreSoftCap));
+  if FScoreSoftCap > 0 then
+    FInvScoreSoftCap := 1 / FScoreSoftCap
+  else
+    FInvScoreSoftCap := 0;
   FInvSqrtDk := pcr_rsqrtf(FDk);
   FStruct[0] := FDk;
   if FCausal then FStruct[1] := 1 else FStruct[1] := 0;
   FStruct[2] := FWindow;
+  FFloatSt[0] := FScoreSoftCap;
   FAttn := TNNetVolume.Create();
 end;
 
@@ -21119,6 +21144,9 @@ begin
     begin
       Score := TNNetVolume.DotProduct(
         Prev.GetRawPtr(p, 0, 0), FKCache.GetRawPtr(j, 0, 0), FDk) * FInvSqrtDk;
+      // Same attention-logit soft-cap as the full forward (opt-in).
+      if FScoreSoftCap > 0 then
+        Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
       FCacheScores[j] := Score;
       if Score > MaxScore then MaxScore := Score;
     end;
@@ -21201,6 +21229,10 @@ begin
         Score := TNNetVolume.DotProduct(
           Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
         Score := Score * FInvSqrtDk;
+        // Gemma-2-style attention-logit soft-cap (opt-in, default off):
+        // squash the scaled score into (-c, c) with c*tanh(s/c).
+        if FScoreSoftCap > 0 then
+          Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
         FAttn[j, i, 0] := Score;
       end;
       if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
@@ -21255,7 +21287,7 @@ var
   Prev, PrevErr: TNNetVolume;
   dAttn: array of TNeuralFloat;
   dScore: array of TNeuralFloat;
-  SumDAttnAttn, A, dS: TNeuralFloat;
+  SumDAttnAttn, A, dS, TanhVal: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -21304,6 +21336,19 @@ begin
         dS := dScore[j] * FInvSqrtDk;
         if dS <> 0 then
         begin
+          // Attention-logit soft-cap (opt-in): chain the tanh derivative,
+          // d(c*tanh(s/c))/ds = 1 - tanh(s/c)^2, into the score gradient.
+          // The post-softmax FAttn no longer holds the capped score, so the
+          // raw scaled score s is recomputed from Q[i].K[j] (depth is
+          // contiguous: one AVX dot product, only when the cap is on AND
+          // the score gradient is non-zero).
+          if FScoreSoftCap > 0 then
+          begin
+            TanhVal := pcr_tanhf(TNNetVolume.DotProduct(
+              Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk) *
+              FInvSqrtDk * FInvScoreSoftCap);
+            dS := dS * (1 - TanhVal * TanhVal);
+          end;
           TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
             Prev.GetRawPtr(j, 0, FDk), dS, FDk);
           TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk),
@@ -82260,7 +82305,7 @@ begin
       'TNNetFourierMix' :           Result := TNNetFourierMix.Create(St[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
-      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2]);
+      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0]);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
@@ -82640,7 +82685,7 @@ begin
       if S[0] = 'TNNetFourierMix' then Result := TNNetFourierMix.Create(St[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
-      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2]) else
+      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0]) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else

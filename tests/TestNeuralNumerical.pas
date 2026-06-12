@@ -780,6 +780,8 @@ type
     procedure TestScaledDotProductAttentionGradientCheck;
     procedure TestScaledDotProductAttentionCausalGradientCheck;
     procedure TestScaledDotProductAttentionSeqLenStressGradientCheck;
+    procedure TestScaledDotProductAttentionSoftCapGradientCheck;
+    procedure TestScaledDotProductAttentionSoftCapZeroMatchesBaseline;
     procedure TestScaledDotProductAttentionAllMaskedRow;
     procedure TestTalkingHeadsAttentionShape;
     procedure TestTalkingHeadsAttentionInputGradientCheck;
@@ -10891,6 +10893,139 @@ begin
       InputPlus.Free;
       Desired.Free;
     end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScaledDotProductAttentionSoftCapGradientCheck;
+// Numerical gradient check for the Gemma-2-style attention-logit soft-cap
+// (pScoreSoftCap > 0): scores become cap*tanh(score/cap) pre-softmax, so the
+// backward must chain the tanh' = 1 - tanh^2 factor into the score gradient.
+// A SMALL cap (1.0) is used so the raw scaled scores actually reach the
+// nonlinear region of the tanh (a Gemma-sized cap of 50 with O(1) scores
+// would test the identity regime only).
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetScaledDotProductAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetScaledDotProductAttention.Create(Dk, false, 0, {ScoreSoftCap=}1.0);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('SDPA soft-cap input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // Sanity: the cap must actually CHANGE the forward versus an uncapped
+    // layer for this input (otherwise this test exercises nothing).
+    AssertTrue('SDPA soft-cap layer reports its cap', Attn.ScoreSoftCap = 1.0);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestScaledDotProductAttentionSoftCapZeroMatchesBaseline;
+// cap = 0 (the default) must be BIT-IDENTICAL to the landed SDPA path: same
+// outputs on the same inputs for both the default 2-arg constructor and an
+// explicit pScoreSoftCap = 0. Also pins that a small cap really changes the
+// forward (so the cap=0 equality is not vacuous).
+var
+  NNBase, NNZero, NNCapped: TNNet;
+  Input: TNNetVolume;
+  SeqLen, Dk, i: integer;
+  maxDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 4;
+  Dk := 4;
+  NNBase := TNNet.Create();
+  NNZero := TNNet.Create();
+  NNCapped := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  try
+    NNBase.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+    NNBase.AddLayer(TNNetScaledDotProductAttention.Create(Dk, true));
+    NNZero.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+    NNZero.AddLayer(TNNetScaledDotProductAttention.Create(Dk, true, 0, 0));
+    NNCapped.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk));
+    NNCapped.AddLayer(TNNetScaledDotProductAttention.Create(Dk, true, 0, 1.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 1.1 - 0.2;
+
+    NNBase.Compute(Input);
+    NNZero.Compute(Input);
+    NNCapped.Compute(Input);
+
+    // Exact (bit-identical) match between default and explicit cap=0.
+    for i := 0 to NNBase.GetLastLayer.Output.Size - 1 do
+      AssertTrue('SDPA cap=0 output differs from baseline at ' + IntToStr(i),
+        NNBase.GetLastLayer.Output.Raw[i] = NNZero.GetLastLayer.Output.Raw[i]);
+
+    // A small cap must change the forward (non-vacuous check).
+    maxDiff := 0;
+    for i := 0 to NNBase.GetLastLayer.Output.Size - 1 do
+      if Abs(NNBase.GetLastLayer.Output.Raw[i] -
+        NNCapped.GetLastLayer.Output.Raw[i]) > maxDiff then
+        maxDiff := Abs(NNBase.GetLastLayer.Output.Raw[i] -
+          NNCapped.GetLastLayer.Output.Raw[i]);
+    AssertTrue('SDPA cap=1 forward should differ from uncapped, maxDiff=' +
+      FloatToStr(maxDiff), maxDiff > 1e-6);
+  finally
+    NNBase.Free;
+    NNZero.Free;
+    NNCapped.Free;
+    Input.Free;
   end;
 end;
 
