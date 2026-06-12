@@ -372,7 +372,7 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [ ] HF Hub download helper: there is no HTTP anywhere in the import path —
+- [X] HF Hub download helper: there is no HTTP anywhere in the import path —
       users must hand-download checkpoint files. A small fphttpclient-based
       resolver (https://huggingface.co/{repo}/resolve/{rev}/{file}, local
       cache dir, skip-if-present, optional token header for gated repos) so
@@ -384,6 +384,16 @@ rather than acted on.
       environment HAS live network access to huggingface.co (TinyStories-1M
       and bert-tiny/MiniLM-L6-v2 were downloaded during importer
       verification), so the helper can be developed and tested end to end.
+      DONE 2026-06-12: neural/neuralhfhub.pas (opt-in; HubFetchFile /
+      HubTryFetchFile / HubFetchModel + cache-dir override, HF_TOKEN bearer,
+      .part-then-rename, sharded index fallback) + tests/TestNeuralHFHub.pas
+      (offline; live test gated by NEURAL_HUB_LIVE_TEST=1) +
+      examples/HubFetch. Verified live: MiniLM-L6-v2 byte-identical to the
+      huggingface_hub download and builds via BuildFromPretrained; 5-shard
+      hf-internal-testing checkpoint through the index path. NOTE:
+      TinyStories-1M / bert-tiny publish only pytorch_model.bin (no
+      safetensors) — fetching their WEIGHTS needs the pytorch_model.bin
+      loader task below.
 - [ ] PyTorch pytorch_model.bin loader: a RESTRICTED unpickler for the
       torch.save zip format — the long tail of older/fine-tuned checkpoints
       never got converted to safetensors. State_dicts use a small pickle
