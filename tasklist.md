@@ -92,6 +92,35 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
+      generation, the capability step past the landed CLIP dual encoder
+      (which only scores image/text similarity and cannot generate).
+      Target a small open checkpoint on the classic LLaVA recipe (e.g.
+      llava-hf/llava-interleave-qwen-0.5b-hf or a SmolVLM-class model —
+      whichever config maps cleanest onto existing paths): ViT vision
+      tower -> 2-layer MLP projector (gelu) -> visual tokens SPLICED into
+      the decoder's token-embedding sequence at the <image> placeholder
+      position, then ordinary causal decoding. Nearly everything exists:
+      BuildClipVisionTower is the reusable ViT (LLaVA uses the
+      penultimate-layer patch tokens WITHOUT the CLS row and WITHOUT the
+      projection head — needs a select-hidden-layer/skip-pooling mode),
+      the language side is the stock Llama/Qwen2 path, and decode/chat
+      infra (KV cache, samplers, ApplyChatTemplate) is landed. The genuinely
+      new pieces: (a) the projector import + a prompt-assembly helper that
+      runs the vision tower once and concatenates [text-embeds | projected
+      image tokens | text-embeds] as a TNNetInput-fed embedding sequence
+      (in-repo precedent: T5EncoderStatesInput external-states convention),
+      (b) image preprocessing to the processor's normalized RGB tensor
+      (CLIP-style resize/center-crop, mean/std from preprocessor_config.json
+      — also unblocks the ClipZeroShot real-image follow-up), (c) the
+      multimodal chat template ("USER: <image>\n...ASSISTANT:" or
+      ChatML-with-image variant) wired into neuralchat.pas. Deliverables:
+      BuildLlavaFromSafeTensors[Ex] (two nets + projector, multi-shard
+      index.json support), pico parity fixture via the make_pico_*_fixture.py
+      recipe asserting projected visual tokens AND next-token logits for a
+      mixed image+text prompt vs HF float64, and an examples/LlavaDescribe
+      demo that captions a small image on CPU. First image-in/text-out
+      model in the repo; opens the door to Qwen-VL/PaliGemma later.
 - [X] Phi-4-mini import — landed as BuildPhi3FromSafeTensors[Ex] in
       neural/neuralpretrained.pas (model_type "phi3": Phi-3-mini AND
       Phi-4-mini): a thin wrapper over the Llama path with three config
