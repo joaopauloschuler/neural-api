@@ -649,6 +649,30 @@ rather than acted on.
       at CPU-friendly size; feeds the same token-classification / QA /
       sentence-embedding heads as the landed BERT importer. Parity fixture vs
       ModernBertModel hidden states.
+- [ ] Whisper-tiny importer (openai/whisper-tiny, 39M) — the FIRST speech
+      model and the first real ENCODER-DECODER checkpoint import (the T5
+      task above is text-to-text; this one exercises cross-attention from
+      a non-text modality). Every hard ingredient is already landed:
+      TNNetCrossAttention asymmetric mode (QSeqLen != KVSeqLen) for the
+      decoder reading the 1500-frame encoder output, the GPT-2 byte-level
+      BPE tokenizer.json path for Whisper's vocabulary, and FFT machinery
+      (FourierMixFFT) for the frontend. Work: (1) log-mel spectrogram
+      frontend — 80 mel bins, 400-sample STFT window / 160 hop, the fixed
+      HF mel filterbank — as a preprocessing helper (plus a ~40-line
+      16-bit PCM WAV reader) in neuraldatasets.pas or a small
+      neuralaudio.pas; (2) encoder builder: Conv1D(k=3,s=1)+GELU,
+      Conv1D(k=3,s=2)+GELU, FIXED sinusoidal positions, pre-norm
+      transformer blocks; (3) decoder builder: learned positions, causal
+      self-attention + cross-attention per block, tied LM head, and the
+      <|startoftranscript|><|en|><|transcribe|><|notimestamps|> decode
+      prologue; (4) BuildWhisperFromSafeTensors weight map in
+      neural/neuralpretrained.pas (config.json: d_model/encoder_layers/
+      decoder_layers/num_mel_bins). Pairs naturally with the seq2seq
+      generation-harness task above (encode once, autoregress the
+      decoder). Verify encoder hidden states + decoder logits vs
+      transformers WhisperModel on a sliced pico fixture with a pinned
+      mel input; headline demo: examples/WhisperTranscribe transcribing a
+      short WAV to text on CPU.
 - [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
       decode docs explicitly note only greedy/sampled streamed generation
