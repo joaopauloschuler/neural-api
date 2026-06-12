@@ -94,18 +94,6 @@ rather than acted on.
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
       out-of-scope for v1.
-- [x] Llama-architecture safetensors importer (sibling of the landed GPT-2
-      HuggingFace import in neural/neuralpretrained.pas): RMSNorm + SwiGLU FFN +
-      RoPE + GQA are all available as building blocks, so a TinyLlama/Llama-style
-      checkpoint loader is mostly weight-mapping work (untied embeddings, no
-      biases, per-layer q/k/v/o + gate/up/down proj names). Reuse the GPT-2
-      parity tooling (slicer + logit dump + compare, commit aff96f5) to verify
-      logit parity against HF transformers on a sliced tiny checkpoint.
-      DONE: BuildLlamaFromSafeTensors[Ex/WithConfig] + TNNetTokenRMSNorm +
-      ReadLlamaConfigFromJSONFile (rotate_half q/k row permutation, tied or
-      untied LM head); verified vs transformers' LlamaForCausalLM at ~2e-7
-      max |logit diff| (untied / tied / sliced) via examples/LlamaImport;
-      committed pure-Python-oracle fixture test TestLlamaLogitParity.
 - [ ] Quantized inference — int8 (and/or FP16 storage) weight compression so
       real imported checkpoints fit on commodity RAM: TinyLlama-1.1B in FP32 is
       ~4.4GB of weights, beyond a 3GB-class machine even with MakeInferenceOnly,
@@ -126,15 +114,17 @@ rather than acted on.
       parse HF tokenizer.json (BPE/Unigram vocab + merges + byte-fallback) or
       the sentencepiece .model protobuf into a TNeuralTokenizer-compatible
       encoder/decoder so LlamaImport can take text prompts end to end.
-- [ ] Sampling decoders + logits-processor chain in neural/neuraldecode.pas
-      (transformers GenerationMixin port): temperature, top-k, top-p, min-p,
-      repetition/frequency/presence penalties as a `DecodeSample` sibling of
-      DecodeGreedy/DecodeBeamSearch. Generalize TNNetTokenConstraint from
-      "mask allowed tokens" into a chainable logits-processor abstraction
-      (transform the logit vector in order) so penalties, temperature and
-      the existing JSON/forced-sequence constraints compose in one pipeline.
-      Add a small TGenerationConfig record plus stopping criteria (EOS-id
-      list, stop strings, max new tokens).
+- [ ] Logits-processor chain + generation config in neural/neuraldecode.pas
+      (the remaining half of the transformers GenerationMixin port):
+      top-k/top-p/min-p sampling, repetition/frequency/presence penalties
+      (TNNetTokenHistoryPenalty) and stop sequences/strings are all landed —
+      still missing are a temperature knob and a chainable logits-processor
+      abstraction (generalize TNNetTokenConstraint from "mask allowed
+      tokens" into processors that transform the logit vector in order) so
+      penalties, temperature and the existing JSON/forced-sequence
+      constraints compose in one pipeline. Add a small TGenerationConfig
+      record bundling sampler + penalties + stopping criteria (EOS-id list,
+      stop strings, max new tokens).
 - [ ] LoRA adapters (PEFT port): freeze a base PointwiseConvLinear /
       FullConnect layer's weights and add a parallel low-rank B·A path
       (rank r, scaling alpha/r, B zero-init so the start is a no-op) with
@@ -153,12 +143,6 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [ ] Speculative decoding in neural/neuraldecode.pas: small draft model
-      proposes K tokens greedily, target model verifies them in one
-      forward pass with the standard accept/resample rule; output
-      distribution provably identical to target-only sampling. Both nets
-      are plain TNNets (the DPO trainer already holds two models), and
-      TNNetStreamingDecoder gives the harness.
 - [ ] safetensors WRITER (neural/neuralsafetensors.pas has only the
       reader): export named tensors so Pascal-trained models round-trip
       into PyTorch/transformers. Doubles as a cross-framework correctness
@@ -180,7 +164,9 @@ rather than acted on.
       Adafactor (factored second-moment estimate, drastically less optimizer
       state — pairs with the "run big imported models on commodity RAM"
       quantization theme), Lion (sign-based update, single momentum buffer,
-      half of Adam's state), and optionally Muon for 2-D weight matrices.
+      half of Adam's state), and optionally Muon for 2-D weight matrices
+      (a hand-rolled Muon gradient-surgery demo already exists in
+      examples/MuonOptimizer; the optimizer-class port is what's missing).
       Each is a small TNeuralOptimizer subclass in neuralfit.pas.
 - [ ] ReduceLROnPlateau + OneCycle / cyclical LR schedulers
       (neural/neuralscheduler.pas has Step/CosineAnnealing/WarmupCosine/Poly):
@@ -259,16 +245,17 @@ rather than acted on.
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
       assert, same pattern as the chunked-forward recurrence family.
-- [ ] RoPE scaling for context extension (linear / NTK-aware / YaRN /
-      dynamic-NTK): neural/neuralpretrained.pas already PARSES the
-      rope_scaling config key and then ignores it ("long-context scaling is
-      not wired here yet", ~line 172). Wire a scaling mode + factor into the
-      RoPE layer so imported Llama-family checkpoints run past their trained
-      context. Linear ("position interpolation") and NTK-aware are pure
-      frequency-remap formulas; YaRN adds per-band interpolation + an
-      attention-temperature factor. Verify: HF parity fixture with a
-      rope_scaling config (transformers applies the same remap), plus a
-      sanity check that factor=1 stays bit-identical to the landed path.
+- [ ] RoPE scaling config wiring for context extension: the RoPE layer
+      already implements Position Interpolation, NTK-aware and YaRN
+      (TNNetRoPEScalingMode, including YaRN's per-band interpolation +
+      attention-temperature factor), but neural/neuralpretrained.pas still
+      PARSES the rope_scaling config key and then rejects it ("long-context
+      scaling is not wired here yet", ~line 172). Map the config (type +
+      factor + YaRN params) onto the layer's scaling-mode constructor
+      arguments so imported Llama-family checkpoints run past their trained
+      context. Verify: HF parity fixture with a rope_scaling config
+      (transformers applies the same remap), plus a sanity check that an
+      unscaled config stays bit-identical to the landed path.
 - [ ] KV-cache eviction for unbounded streaming: attention sinks + rolling
       window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder
       — today the per-SDPA-layer cache grows without bound. Keep the first
@@ -291,8 +278,8 @@ rather than acted on.
       policy-gradient step with a KL penalty against the reference — no
       value network, so it is the one RL-from-feedback method that fits this
       framework. The DPO trainer already holds policy+reference and computes
-      per-sequence logprobs, and the sampling-decoder task above provides
-      generation. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
+      per-sequence logprobs, and sampled streamed generation already exists
+      in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
       (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real rewards.
 - [ ] Seq2seq (encoder-decoder) generation harness in
@@ -370,9 +357,9 @@ rather than acted on.
       exists) or by an external scorer callback — the standard
       test-time-compute baseline, and the natural consumer of the
       Bradley-Terry reward model from the GRPO task. Self-consistency
-      variant: majority-vote over extracted answers. Trivial once the
-      sampling-decoder task lands; worth its own entry as the canonical
-      harness.
+      variant: majority-vote over extracted answers. Sampled generation is
+      already landed, so this is mostly harness work; worth its own entry as
+      the canonical harness.
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (the rebuild-same-
       architecture-at-a-new-width idiom this list already notes near the
@@ -422,10 +409,11 @@ rather than acted on.
       the InfoNCE/retrieval side. Verify with the HF-parity fixture tooling
       (slicer + hidden-state dump + compare) against BertModel.
 - [ ] T5/Flan-T5 (encoder-decoder) importer: the natural companion to the
-      seq2seq generation harness task above. New ingredient is T5's
-      relative-position bias buckets (shared across layers, separate
-      enc/dec); RMSNorm-style scale-only norm and gated FFN map onto landed
-      blocks. Flan-T5-small is 80M params — genuinely CPU-friendly and
+      seq2seq generation harness task above. T5's relative-position bias
+      buckets are landed (TNNetT5RelPosBiasAttention / avT5RelPosBias), and
+      RMSNorm-style scale-only norm and gated FFN map onto landed blocks, so
+      the work is the importer weight mapping (bias shared across layers,
+      separate enc/dec). Flan-T5-small is 80M params — genuinely CPU-friendly and
       instruction-tuned, so it doubles as the first imported model the
       BLEU/ROUGE metrics can score out of the box. Same HF-parity fixture
       verification as GPT-2/Llama.
@@ -503,10 +491,11 @@ rather than acted on.
 - [ ] GPT-J / GPT-NeoX (Pythia) importer — the workhorse open GPT-3-class
       science suite (Pythia: 70M..12B with many training-step snapshots,
       untied embeddings; the untied-head path landed with the Llama
-      importer). Two new ingredients: the PARALLEL residual block
-      (x + Attn(LN(x)) + FFN(LN(x)) — one residual add of both branches, a
-      builder variant; gptj uses one shared LN, gpt_neox two, gated by
-      use_parallel_residual) and PARTIAL rotary (rotary_pct: only the
+      importer). Two ingredients: the PARALLEL residual block
+      (x + Attn(LN(x)) + FFN(LN(x)) — the shared-LN gptj/PaLM form is landed
+      as AddParallelTransformerBlock; the two-LN gpt_neox form, gated by
+      use_parallel_residual, is a small builder variant) and PARTIAL rotary
+      (rotary_pct: only the
       first d_rot dims of each head get RoPE; the landed RoPE rotates full
       head dim). Adds "gptj"/"gpt_neox" AutoModel routes; Pythia-70M/160M
       are CPU-sized parity targets, larger ones depend on the
@@ -564,8 +553,10 @@ rather than acted on.
       dependency for the larger sizes). Parity fixture vs
       Gemma2ForCausalLM.
 - [ ] Gemma 3 - per-head QK-norm composition: Gemma-3 replaces soft-capping
-      with RMSNorm applied per-head to q and k before attention. Likely
-      pure composition: the multi-head builders split q/k/v into explicit
+      with RMSNorm applied per-head to q and k before attention (distinct
+      from the landed avQKNorm / TNNetQKNormAttention, which L2-normalises
+      q/k with a learnable temperature — Gemma needs a learnable-scale
+      RMSNorm). Likely pure composition: the multi-head builders split q/k/v into explicit
       per-head layers before SDPA, so insert TNNetTokenRMSNorm on the q and
       k branches — verify the insertion point sits AFTER RoPE the way
       transformers' Gemma3 does (norm placement relative to RoPE changed
@@ -645,10 +636,12 @@ rather than acted on.
 - [ ] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
       easy tokens from an intermediate layer through the LM head, fall
       back to full depth when confidence is low — the model becomes its
-      OWN draft model, no second checkpoint. The repo is unusually well
-      positioned: the LogitLens/TunedLens frozen-body splice idiom already
-      implements "read logits at layer k", and the speculative-decoding
-      task elsewhere in this list provides the accept/verify rule. v1:
+      OWN draft model, no second checkpoint. Distinct from the landed
+      examples/SelfSpeculativeDecoding, which drafts from MTP heads, not an
+      intermediate-layer exit. The repo is unusually well positioned: the
+      LogitLens/TunedLens frozen-body splice idiom already implements "read
+      logits at layer k", and examples/SpeculativeDecoding implements the
+      accept/verify rule. v1:
       static exit layer + confidence threshold; follow-up: per-token
       adaptive exit. Report tokens/sec vs full-depth at matched output
       quality.
@@ -699,13 +692,6 @@ rather than acted on.
       The contrastive-search and sampling tasks elsewhere in this list
       have no way to demonstrate their benefit without these. Pinned
       hand-computable fixtures (e.g. "a a a a" distinct-1 = 1/4).
-- [ ] Calibration: ECE report + temperature scaling — expected calibration
-      error as a TNNet.*Report batch diagnostic (introspection-report
-      pattern: per-bin confidence/accuracy table + ECE scalar) plus a
-      one-parameter temperature fit on a validation set (closed loop:
-      report, fit T, report again, ECE drops). General beyond NLP
-      (any softmax classifier); complements the evidential heads, which
-      tackle the same problem by architecture instead of post-hoc.
 - [ ] Needle-in-a-haystack long-context eval harness: place a fact at
       varying depths in a synthetic long context, measure retrieval
       accuracy vs (depth, context length) as a small grid report. The
@@ -959,8 +945,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] Loss-layer gradient-check helper — parameterized helper that takes
       (LossLayer, BatchSize, Shape) and runs a single central-difference
       check.
-- [ ] Scheduler unit tests — given seed and schedule parameters, NextLR
-      must produce a deterministic, finite, monotonically-correct sequence.
 - [ ] Backward-pass sign-correlation test — for every layer that overrides
       Backpropagate, perturb input by ±ε, assert gradient direction agrees
       with loss-difference direction >90% of the time across a small grid.
