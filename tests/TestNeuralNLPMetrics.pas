@@ -31,6 +31,14 @@ type
     // Zero every weight, set every bias to BiasValue, then re-pack the conv
     // weight caches (PointwiseConv keeps packed copies of its weights).
     procedure SetUniformBiases(NN: TNNet; BiasValue: TNeuralFloat);
+    // Input-DEPENDENT per-position scorer: neuron J gets weight 0.02*J and
+    // bias 0.03*J, so the logit row at position P is 0.02*J*TokenId(P)+0.03*J
+    // - the distribution genuinely depends on the PREVIOUS token, pinning the
+    // causal shift (row P-1 scores token P).
+    procedure SetLinearScorerWeights(NN: TNNet);
+    // Analytic softmax log-prob of target Tgt in the row conditioned on
+    // PrevId under SetLinearScorerWeights.
+    function ExpectedRowLogProb(PrevId, Tgt: integer): TNeuralFloat;
   published
     // Identical candidate/reference -> BLEU exactly 1.0, smoothed or not.
     procedure TestBLEUIdenticalIsOne;
@@ -62,6 +70,19 @@ type
     // Char-level path: uniform over 128 -> PPL = 128 and the EOS char chr(1)
     // is skipped as special.
     procedure TestPerplexityFromCharsUniform;
+    // ScoreSequence matches hand-computed softmax math (input-dependent
+    // logits pin the causal shift); Result[0] = 0; context overflow raises.
+    procedure TestScoreSequenceHandComputedSoftmax;
+    // Summing ScoreSequence logprobs over a corpus reproduces Perplexity's
+    // MeanNLL / exp(-mean) on the same (truncation-free) windows.
+    procedure TestScoreSequenceMatchesPerplexity;
+    // ScoreCompletion scores ONLY completion tokens: a non-boundary context
+    // edit leaves the score unchanged, editing the LAST context token changes
+    // it, and shifting the boundary moves exactly one ScoreSequence term.
+    procedure TestScoreCompletionScoresOnlyCompletion;
+    // Pinned multiple-choice fixture: the gold answer wins, and acc vs
+    // acc_norm disagree on a length-confounded item (p_cat^2 < p_dog < p_cat).
+    procedure TestMultipleChoiceAccVsAccNorm;
   end;
 
 implementation
@@ -119,6 +140,33 @@ begin
   // Re-pack the conv weight caches (deltas are zero, so this only re-packs).
   NN.ClearDeltas();
   NN.UpdateWeights();
+end;
+
+procedure TTestNeuralNLPMetrics.SetLinearScorerWeights(NN: TNNet);
+var
+  J: integer;
+  Head: TNNetLayer;
+begin
+  Head := NN.Layers[1]; // PointwiseConvLinear(V) over depth-1 token-id input
+  for J := 0 to Head.Neurons.Count - 1 do
+  begin
+    Head.Neurons[J].Weights.Fill(0.02 * J); // single weight (1x1x1 kernel)
+    Head.Neurons[J].BiasWeight := 0.03 * J;
+  end;
+  NN.ClearDeltas();
+  NN.UpdateWeights(); // re-pack the pointwise-conv weight caches
+end;
+
+function TTestNeuralNLPMetrics.ExpectedRowLogProb(PrevId,
+  Tgt: integer): TNeuralFloat;
+var
+  J: integer;
+  SumExp: TNeuralFloat;
+begin
+  SumExp := 0;
+  for J := 0 to csVocab - 1 do
+    SumExp := SumExp + Exp(0.02 * J * PrevId + 0.03 * J);
+  Result := (0.02 * Tgt * PrevId + 0.03 * Tgt) - Ln(SumExp);
 end;
 
 procedure TTestNeuralNLPMetrics.TestBLEUIdenticalIsOne;
@@ -376,6 +424,223 @@ begin
       Stats.BitsPerToken, 1e-4);
   finally
     Corpus.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestScoreSequenceHandComputedSoftmax;
+var
+  NN: TNNet;
+  Tokens, TooLong: TNeuralIntegerArray;
+  LogProbs: TNeuralFloatDynArr;
+  Pos: integer;
+  Raised: boolean;
+begin
+  NN := BuildPerPositionLM(csCtx, csVocab);
+  try
+    SetLinearScorerWeights(NN);
+    Tokens := TNeuralIntegerArray.Create(2, 5, 3, 7);
+    LogProbs := ScoreSequence(NN, Tokens);
+    AssertEquals('one logprob per token', 4, Length(LogProbs));
+    AssertEquals('first token is never scored', 0.0, LogProbs[0], 1e-9);
+    // Causal shift: LogProbs[Pos] is the softmax row conditioned on the
+    // PREVIOUS token id, hand-computed.
+    for Pos := 1 to 3 do
+      AssertEquals('hand-computed logprob at position ' + IntToStr(Pos),
+        ExpectedRowLogProb(Tokens[Pos - 1], Tokens[Pos]), LogProbs[Pos], 1e-5);
+    // Out-of-vocab target: clamped (SafeLogProb(0)), never -Inf.
+    LogProbs := ScoreSequence(NN, TNeuralIntegerArray.Create(2, csVocab + 5));
+    AssertTrue('OOV target is clamped, finite',
+      (LogProbs[1] < -30) and (LogProbs[1] > -1e6));
+    // v1 context policy: longer than the window raises clearly.
+    SetLength(TooLong, csCtx + 1);
+    for Pos := 0 to High(TooLong) do TooLong[Pos] := 2;
+    Raised := false;
+    try
+      ScoreSequence(NN, TooLong);
+    except
+      on EArgumentException do Raised := true;
+    end;
+    AssertTrue('over-context sequence raises EArgumentException', Raised);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestScoreSequenceMatchesPerplexity;
+var
+  NN: TNNet;
+  Dict: TStringListInt;
+  Corpus: TStringList;
+  Stats: TNNetPerplexityStats;
+  Toks: TNeuralIntegerArray;
+  LogProbs: TNeuralFloatDynArr;
+  LineIdx, Pos, NumScored: integer;
+  SumLP: TNeuralFloat;
+begin
+  NN := BuildPerPositionLM(csCtx, csVocab);
+  Dict := BuildDict();
+  Corpus := TStringList.Create();
+  try
+    SetLinearScorerWeights(NN);
+    // Every line fits the window, so the Perplexity windows and the
+    // ScoreSequence windows are identical. ExcludeSpecialTokens MUST be
+    // false: ScoreSequence never skips tokens, and which word carries a
+    // special id (<2) is collation-dependent here (the test binary's
+    // UTF-8 widestring manager interleaves '<eos>'/'<pad>' with the words,
+    // handing id 1 to a regular word).
+    Corpus.Add('cat dog egg fox');
+    Corpus.Add('gold hat ice jam blue');
+    SumLP := 0;
+    NumScored := 0;
+    for LineIdx := 0 to Corpus.Count - 1 do
+    begin
+      Dict.Tokenize(Corpus[LineIdx], Toks);
+      LogProbs := ScoreSequence(NN, Toks);
+      for Pos := 1 to High(LogProbs) do
+      begin
+        SumLP := SumLP + LogProbs[Pos];
+        Inc(NumScored);
+      end;
+    end;
+    Stats := Perplexity(NN, Dict, Corpus, false);
+    AssertEquals('same number of scored positions',
+      NumScored, Stats.PredictedTokens);
+    AssertEquals('sum of ScoreSequence logprobs reproduces MeanNLL',
+      -SumLP / NumScored, Stats.MeanNLL, 1e-5);
+    AssertEquals('and therefore the perplexity',
+      Exp(-SumLP / NumScored), Stats.Perplexity, 1e-4);
+  finally
+    Corpus.Free;
+    Dict.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestScoreCompletionScoresOnlyCompletion;
+var
+  NN: TNNet;
+  Ctx, CtxMidEdit, CtxLastEdit, CtxShort, Comp, CompLong,
+    EmptyCtx, Full: TNeuralIntegerArray;
+  Base, MidEdit, LastEdit, Shifted: TNNetCompletionScore;
+  LogProbs: TNeuralFloatDynArr;
+  Raised: boolean;
+begin
+  NN := BuildPerPositionLM(csCtx, csVocab);
+  try
+    SetLinearScorerWeights(NN);
+    Ctx := TNeuralIntegerArray.Create(2, 4, 5);
+    Comp := TNeuralIntegerArray.Create(6, 7);
+    Base := ScoreCompletion(NN, Ctx, Comp);
+    AssertEquals('two completion tokens scored', 2, Base.TokenCount);
+    AssertEquals('mean is sum / count', Base.SumLogProb / 2.0,
+      Base.MeanLogProb, 1e-6);
+    // Pinned values: completion rows are conditioned on tokens 5 and 6.
+    AssertEquals('completion sum is hand-computable',
+      ExpectedRowLogProb(5, 6) + ExpectedRowLogProb(6, 7),
+      Base.SumLogProb, 1e-5);
+    // (3a) Editing a NON-boundary context token (its row only scores another
+    // CONTEXT token) leaves the completion score unchanged.
+    CtxMidEdit := TNeuralIntegerArray.Create(2, 9, 5);
+    MidEdit := ScoreCompletion(NN, CtxMidEdit, Comp);
+    AssertEquals('non-boundary context edit does not change the score',
+      Base.SumLogProb, MidEdit.SumLogProb, 1e-6);
+    // (3b) Editing the LAST context token changes the conditioning of the
+    // first completion token - predictably.
+    CtxLastEdit := TNeuralIntegerArray.Create(2, 4, 9);
+    LastEdit := ScoreCompletion(NN, CtxLastEdit, Comp);
+    AssertTrue('last-context edit changes the score',
+      Abs(LastEdit.SumLogProb - Base.SumLogProb) > 1e-3);
+    AssertEquals('and lands exactly on the new conditioning',
+      ExpectedRowLogProb(9, 6) + ExpectedRowLogProb(6, 7),
+      LastEdit.SumLogProb, 1e-5);
+    // (3c) Shifting the boundary by one adds exactly the ScoreSequence term
+    // of the token that crossed from context into completion.
+    CtxShort := TNeuralIntegerArray.Create(2, 4);
+    CompLong := TNeuralIntegerArray.Create(5, 6, 7);
+    Shifted := ScoreCompletion(NN, CtxShort, CompLong);
+    Full := TNeuralIntegerArray.Create(2, 4, 5, 6, 7);
+    LogProbs := ScoreSequence(NN, Full);
+    AssertEquals('boundary shift moves exactly one term',
+      Base.SumLogProb + LogProbs[2], Shifted.SumLogProb, 1e-5);
+    // Empty context is rejected (nothing to condition the first token on).
+    SetLength(EmptyCtx, 0);
+    Raised := false;
+    try
+      ScoreCompletion(NN, EmptyCtx, Comp);
+    except
+      on EArgumentException do Raised := true;
+    end;
+    AssertTrue('empty context raises EArgumentException', Raised);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestMultipleChoiceAccVsAccNorm;
+var
+  NN: TNNet;
+  Dict: TStringListInt;
+  Items: array of TNNetMultipleChoiceItem;
+  Stats: TNNetMultipleChoiceStats;
+  Head: TNNetLayer;
+  CatId, DogId, HatId: integer;
+  SumExp, LpCat, LpDog: TNeuralFloat;
+  GoldScore, OtherScore: TNNetCompletionScore;
+begin
+  NN := BuildPerPositionLM(csCtx, csVocab);
+  Dict := BuildDict();
+  try
+    // Zero weights -> input-independent logits: p(cat) = e^3 / S and
+    // p(dog) = e^2.6 / S with S = e^3 + e^2.6 + 10. Chosen so that
+    // p_cat^2 < p_dog < p_cat: the LONG gold candidate [cat,cat] loses on
+    // sum logprob (acc) but wins on mean logprob (acc_norm).
+    SetUniformBiases(NN, 0.0);
+    Head := NN.Layers[1];
+    CatId := Dict.WordToInteger('cat');
+    DogId := Dict.WordToInteger('dog');
+    HatId := Dict.WordToInteger('hat');
+    Head.Neurons[CatId].BiasWeight := 3.0;
+    Head.Neurons[DogId].BiasWeight := 2.6;
+    NN.ClearDeltas();
+    NN.UpdateWeights();
+    SumExp := Exp(3.0) + Exp(2.6) + (csVocab - 2) * Exp(0.0);
+    LpCat := 3.0 - Ln(SumExp);
+    LpDog := 2.6 - Ln(SumExp);
+    AssertTrue('fixture is length-confounded: p_cat^2 < p_dog < p_cat',
+      (2 * LpCat < LpDog) and (LpDog < LpCat));
+    SetLength(Items, 2);
+    // Item 0: gold [cat,cat] vs distractor [dog] - acc misses, acc_norm hits.
+    Items[0].ContextTokens := TNeuralIntegerArray.Create(HatId);
+    SetLength(Items[0].Candidates, 2);
+    Items[0].Candidates[0] := TNeuralIntegerArray.Create(CatId, CatId);
+    Items[0].Candidates[1] := TNeuralIntegerArray.Create(DogId);
+    Items[0].GoldIndex := 0;
+    // Item 1: gold [cat] vs distractor [dog] - the gold answer wins BOTH ways.
+    Items[1].ContextTokens := TNeuralIntegerArray.Create(HatId);
+    SetLength(Items[1].Candidates, 2);
+    Items[1].Candidates[0] := TNeuralIntegerArray.Create(CatId);
+    Items[1].Candidates[1] := TNeuralIntegerArray.Create(DogId);
+    Items[1].GoldIndex := 0;
+    // Pin the per-candidate scores against the analytic softmax first.
+    GoldScore := ScoreCompletion(NN, Items[0].ContextTokens,
+      Items[0].Candidates[0]);
+    OtherScore := ScoreCompletion(NN, Items[0].ContextTokens,
+      Items[0].Candidates[1]);
+    AssertEquals('gold [cat,cat] sum = 2 ln p_cat', 2 * LpCat,
+      GoldScore.SumLogProb, 1e-4);
+    AssertEquals('distractor [dog] sum = ln p_dog', LpDog,
+      OtherScore.SumLogProb, 1e-4);
+    Stats := EvaluateMultipleChoice(NN, Items);
+    AssertEquals('two items evaluated', 2, Stats.ItemCount);
+    AssertEquals('acc: only the unconfounded item is right', 1,
+      Stats.CorrectCount);
+    AssertEquals('acc_norm: the gold answer wins both items', 2,
+      Stats.CorrectNormCount);
+    AssertEquals('Accuracy = 0.5', 0.5, Stats.Accuracy, 1e-9);
+    AssertEquals('AccuracyNorm = 1.0', 1.0, Stats.AccuracyNorm, 1e-9);
+  finally
+    Dict.Free;
     NN.Free;
   end;
 end;

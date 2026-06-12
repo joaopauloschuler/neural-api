@@ -50,6 +50,40 @@ conventions already in the codebase:
     MeanNLL / ln(2). For char-level models BitsPerToken = BPC; for word/BPE
     models bits-per-character = BitsPerToken * (#tokens / #characters).
 
+TOKEN-LEVEL LOGPROB SCORING (mini lm-eval harness). ScoreSequence(NN,
+Tokens) returns the per-token log-probabilities ln p(t_i | t_0..t_{i-1})
+of an already-tokenized sequence from teacher-forced forward passes (NO
+generation, NO samplers/logit processors: the raw model distribution).
+Result[i] scores Tokens[i]; Result[0] is always 0 (the first token has no
+conditioning context and is never scored - the lm-evaluation-harness
+convention). The same two head shapes as Perplexity are auto-detected
+(per-position heads: ONE forward for the whole sequence, the row at
+position i-1 scores token i; single next-token heads: one forward per
+scored position over the growing right-aligned prefix). Rows are
+defensively re-normalised and clamped through SafeLogProb exactly like
+Perplexity, so summing ScoreSequence over a corpus reproduces
+Perplexity's MeanNLL on the same windows (with ExcludeSpecialTokens =
+false; ScoreSequence itself never skips tokens - out-of-vocab targets
+score SafeLogProb(0)). CONTEXT LENGTH (v1, documented choice): sequences
+longer than the model context window raise a clear exception instead of
+silently scoring a sub-window.
+
+ScoreCompletion(NN, ContextTokens, CompletionTokens) concatenates the two
+and sums ScoreSequence over the COMPLETION tokens only (context tokens
+are conditioned on, never scored; the first completion token is scored
+from the last context position, so ContextTokens must be non-empty).
+Returns the sum, the length-normalized mean (sum / completion length) and
+the token count.
+
+EvaluateMultipleChoice(NN, Items) is the HellaSwag/ARC/PIQA pattern from
+lm-evaluation-harness: each item is a context, N candidate completions
+and a gold index; every candidate is scored with ScoreCompletion and the
+argmax wins (first-max tie-break). Accuracy ranks by SumLogProb (lm-eval
+"acc", short-biased) and AccuracyNorm by MeanLogProb (lm-eval "acc_norm",
+length-normalized) - the two disagree on length-confounded items.
+One full forward per candidate (v1); batching candidates that share a
+context prefix is a possible follow-up.
+
 BLEU. CorpusBLEU implements Papineni et al. 2002: corpus-pooled MODIFIED
 (clipped) n-gram precision up to MaxN (default 4), geometric mean with
 uniform weights, multiplied by the brevity penalty
@@ -92,6 +126,31 @@ type
     SkippedTokens: integer;     // special (<2) / out-of-vocab targets excluded
   end;
 
+  // Result of scoring one candidate completion given a context.
+  TNNetCompletionScore = record
+    SumLogProb: TNeuralFloat;   // sum ln p over completion tokens only
+    MeanLogProb: TNeuralFloat;  // SumLogProb / TokenCount (length-normalized)
+    TokenCount: integer;        // number of completion tokens scored
+  end;
+
+  // One multiple-choice evaluation item (lm-eval request style): a shared
+  // context, N candidate completions and the index of the gold candidate.
+  TNNetMultipleChoiceItem = record
+    ContextTokens: TNeuralIntegerArray;
+    Candidates: array of TNeuralIntegerArray;
+    GoldIndex: integer;
+  end;
+
+  // Aggregate multiple-choice results: acc (SumLogProb argmax) vs acc_norm
+  // (MeanLogProb argmax) - lm-eval's accuracy / length-normalized accuracy.
+  TNNetMultipleChoiceStats = record
+    Accuracy: TNeuralFloat;       // CorrectCount / ItemCount
+    AccuracyNorm: TNeuralFloat;   // CorrectNormCount / ItemCount
+    ItemCount: integer;
+    CorrectCount: integer;        // gold wins by sum logprob
+    CorrectNormCount: integer;    // gold wins by mean (length-normalized) logprob
+  end;
+
   // Precision / recall / F1 triple returned by the ROUGE functions.
   TNNetRougeScore = record
     Precision: TNeuralFloat;
@@ -111,6 +170,24 @@ function Perplexity(NN: TNNet; Dict: TStringListInt; Corpus: TStrings;
 function PerplexityFromChars(NN: TNNet; Corpus: TStrings;
   MinContext: integer = 1;
   ExcludeSpecialTokens: boolean = true): TNNetPerplexityStats;
+
+// Per-token log-probabilities ln p(Tokens[i] | Tokens[0..i-1]) of an
+// already-tokenized sequence (teacher-forced; no generation). Result has the
+// same length as Tokens; Result[0] is 0 (never scored). Raises EArgumentException
+// when the sequence exceeds the model context window (v1; see unit header).
+function ScoreSequence(NN: TNNet;
+  const Tokens: TNeuralIntegerArray): TNeuralFloatDynArr;
+
+// Sum + length-normalized logprob of CompletionTokens given ContextTokens.
+// Only completion tokens are scored; ContextTokens must be non-empty.
+function ScoreCompletion(NN: TNNet;
+  const ContextTokens, CompletionTokens: TNeuralIntegerArray): TNNetCompletionScore;
+
+// Multiple-choice harness: scores every candidate completion of every item
+// with ScoreCompletion and reports acc (sum-logprob argmax) and acc_norm
+// (mean-logprob argmax). See unit header.
+function EvaluateMultipleChoice(NN: TNNet;
+  const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
 
 // Corpus-level BLEU (one reference per candidate; Candidates[i] is scored
 // against References[i]; both arrays must have the same length).
@@ -320,6 +397,185 @@ begin
     InV.Free;
   end;
   FinishStats(SumNLL, Result);
+end;
+
+// ---------------------------------------------------------------------------
+// Token-level logprob scoring + multiple-choice harness
+// ---------------------------------------------------------------------------
+
+function ScoreSequence(NN: TNNet;
+  const Tokens: TNeuralIntegerArray): TNeuralFloatDynArr;
+var
+  InV: TNNetVolume;
+  Last: TNNetLayer;
+  Prefix: TNeuralIntegerArray;
+  ContextLen, InDepth, VocabSize: integer;
+  PerPosition: boolean;
+  SampleLen, Pos, D, Tgt: integer;
+  RowSum, Prob: TNeuralFloat;
+begin
+  SetLength(Result, 0);
+  if NN = nil then Exit;
+  if NN.CountLayers() < 2 then Exit;
+  SampleLen := Length(Tokens);
+  if SampleLen = 0 then Exit;
+  ContextLen := NN.GetFirstLayer().Output.SizeX;
+  InDepth := NN.GetFirstLayer().Output.Depth;
+  Last := NN.GetLastLayer();
+  // Same head-shape auto-detection as Perplexity (see unit header).
+  PerPosition := (ContextLen > 1) and (Last.Output.SizeX = ContextLen) and
+    (Last.Output.Depth >= 2);
+  if PerPosition
+  then VocabSize := Last.Output.Depth
+  else VocabSize := Last.Output.Size;
+  if VocabSize < 2 then Exit;
+  // v1 context policy: error clearly instead of silently sub-windowing.
+  // Per-position heads need the whole sequence in one window; single
+  // next-token heads need the longest scored prefix (SampleLen-1) to fit.
+  if (PerPosition and (SampleLen > ContextLen)) or
+     ((not PerPosition) and (SampleLen - 1 > ContextLen)) then
+    raise EArgumentException.CreateFmt(
+      'ScoreSequence: sequence length %d exceeds the model context window %d',
+      [SampleLen, ContextLen]);
+  SetLength(Result, SampleLen);
+  Result[0] := 0; // first token has no conditioning context - never scored
+  if SampleLen < 2 then Exit;
+  InV := TNNetVolume.Create(NN.GetFirstLayer().Output);
+  try
+    if PerPosition then
+    begin
+      // ONE teacher-forced forward scores every position at once.
+      InV.Fill(0);
+      if InDepth = 1
+      then InV.CopyNoChecksIntArr(Tokens)       // token ids -> embedding
+      else InV.OneHotEncoding(Tokens);          // one-hot, left-aligned
+      NN.Compute(InV);
+      for Pos := 1 to SampleLen - 1 do
+      begin
+        Tgt := Tokens[Pos];
+        if (Tgt < 0) or (Tgt >= VocabSize) then
+        begin
+          Result[Pos] := SafeLogProb(0); // out-of-vocab: clamped, not skipped
+          continue;
+        end;
+        // Output row Pos-1 predicts token Pos (the causal shift). Defensive
+        // re-normalisation, exactly like Perplexity.
+        RowSum := 0;
+        for D := 0 to VocabSize - 1 do
+          RowSum := RowSum + Last.Output[Pos - 1, 0, D];
+        if RowSum <= 0 then RowSum := 1.0;
+        Prob := Last.Output[Pos - 1, 0, Tgt] / RowSum;
+        Result[Pos] := SafeLogProb(Prob);
+      end;
+    end
+    else
+    begin
+      // Single next-token head: one forward per scored position over the
+      // growing right-aligned prefix.
+      for Pos := 1 to SampleLen - 1 do
+      begin
+        Tgt := Tokens[Pos];
+        if (Tgt < 0) or (Tgt >= VocabSize) then
+        begin
+          Result[Pos] := SafeLogProb(0);
+          continue;
+        end;
+        Prefix := Copy(Tokens, 0, Pos);
+        if InDepth = 1 then
+        begin
+          InV.Fill(0);
+          InV.CopyReversedNoChecksIntArr(Prefix);
+        end
+        else InV.OneHotEncodingReversed(Prefix);
+        NN.Compute(InV);
+        RowSum := Last.Output.GetSum();
+        if RowSum <= 0 then RowSum := 1.0;
+        Prob := Last.Output.FData[Tgt] / RowSum;
+        Result[Pos] := SafeLogProb(Prob);
+      end;
+    end;
+  finally
+    InV.Free;
+  end;
+  SetLength(Prefix, 0);
+end;
+
+function ScoreCompletion(NN: TNNet;
+  const ContextTokens, CompletionTokens: TNeuralIntegerArray): TNNetCompletionScore;
+var
+  Full: TNeuralIntegerArray;
+  LogProbs: TNeuralFloatDynArr;
+  CtxLen, CompLen, I: integer;
+begin
+  Result.SumLogProb := 0;
+  Result.MeanLogProb := 0;
+  Result.TokenCount := 0;
+  CtxLen := Length(ContextTokens);
+  CompLen := Length(CompletionTokens);
+  if CtxLen < 1 then
+    raise EArgumentException.Create(
+      'ScoreCompletion: ContextTokens must be non-empty (the first ' +
+      'completion token is scored from the last context position)');
+  if CompLen = 0 then Exit;
+  SetLength(Full, CtxLen + CompLen);
+  for I := 0 to CtxLen - 1 do Full[I] := ContextTokens[I];
+  for I := 0 to CompLen - 1 do Full[CtxLen + I] := CompletionTokens[I];
+  LogProbs := ScoreSequence(NN, Full);
+  if Length(LogProbs) <> CtxLen + CompLen then Exit; // degenerate model
+  // Completion tokens ONLY: indices CtxLen .. CtxLen+CompLen-1.
+  for I := CtxLen to CtxLen + CompLen - 1 do
+    Result.SumLogProb := Result.SumLogProb + LogProbs[I];
+  Result.TokenCount := CompLen;
+  Result.MeanLogProb := Result.SumLogProb / CompLen;
+  SetLength(Full, 0);
+  SetLength(LogProbs, 0);
+end;
+
+function EvaluateMultipleChoice(NN: TNNet;
+  const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
+var
+  ItemIdx, Cand, BestSum, BestNorm: integer;
+  Score: TNNetCompletionScore;
+  BestSumLP, BestNormLP: TNeuralFloat;
+begin
+  Result.Accuracy := 0;
+  Result.AccuracyNorm := 0;
+  Result.ItemCount := 0;
+  Result.CorrectCount := 0;
+  Result.CorrectNormCount := 0;
+  if NN = nil then Exit;
+  for ItemIdx := 0 to High(Items) do
+  begin
+    if Length(Items[ItemIdx].Candidates) = 0 then continue;
+    BestSum := 0;
+    BestNorm := 0;
+    BestSumLP := 0;
+    BestNormLP := 0;
+    for Cand := 0 to High(Items[ItemIdx].Candidates) do
+    begin
+      Score := ScoreCompletion(NN, Items[ItemIdx].ContextTokens,
+        Items[ItemIdx].Candidates[Cand]);
+      // First-max tie-break: a later candidate must be STRICTLY better.
+      if (Cand = 0) or (Score.SumLogProb > BestSumLP) then
+      begin
+        BestSumLP := Score.SumLogProb;
+        BestSum := Cand;
+      end;
+      if (Cand = 0) or (Score.MeanLogProb > BestNormLP) then
+      begin
+        BestNormLP := Score.MeanLogProb;
+        BestNorm := Cand;
+      end;
+    end;
+    Inc(Result.ItemCount);
+    if BestSum = Items[ItemIdx].GoldIndex then Inc(Result.CorrectCount);
+    if BestNorm = Items[ItemIdx].GoldIndex then Inc(Result.CorrectNormCount);
+  end;
+  if Result.ItemCount > 0 then
+  begin
+    Result.Accuracy := Result.CorrectCount / Result.ItemCount;
+    Result.AccuracyNorm := Result.CorrectNormCount / Result.ItemCount;
+  end;
 end;
 
 // ---------------------------------------------------------------------------

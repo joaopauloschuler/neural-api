@@ -547,7 +547,7 @@ rather than acted on.
       disproportionate quality win for completion-style prompts. Test: a
       pinned vocab where the healed and unhealed first-token distributions
       provably differ.
-- [ ] Token-level logprob scoring + mini lm-eval harness: ScoreSequence
+- [X] Token-level logprob scoring + mini lm-eval harness: ScoreSequence
       (NN, tokens) returning per-token logprobs (one forward, no
       generation), then multiple-choice evaluation by length-normalized
       answer logprob — the HellaSwag/ARC/PIQA pattern. NOT the existing
@@ -556,6 +556,15 @@ rather than acted on.
       "imported SmolLM2 scores X on HellaSwag" is the end-to-end proof.
       Reuses the perplexity NLL plumbing in neuralnlpmetrics.pas; ship
       with a tiny pinned multiple-choice fixture for the harness itself.
+- [ ] HellaSwag-style eval example on an imported checkpoint: a small
+      example program that loads a real imported model (e.g. SmolLM2 /
+      pythia via the safetensors importers), tokenizes a handful of
+      multiple-choice items with TNeuralHFTokenizer and reports acc /
+      acc_norm through EvaluateMultipleChoice (neuralnlpmetrics.pas) —
+      the end-to-end "imported model scores X" demo the scoring API
+      (landed above) was built for. Follow-ups: batch candidates sharing
+      a context prefix; optional last-window scoring for over-context
+      sequences (v1 raises).
 - [ ] Generation-quality / degeneration metrics in neuralnlpmetrics.pas:
       distinct-n (Li et al. 2016), self-BLEU (reuses the landed
       CorpusBLEU), and repetition rate — the standard degeneration suite.
