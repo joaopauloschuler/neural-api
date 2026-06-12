@@ -94,6 +94,9 @@ type
     procedure TestShardedTorchBinIndexErrors;
     procedure TestGPT2LogitParityFromShardedTorchBin;
     procedure TestMakeInferenceOnlyKeepsOutputs;
+    procedure TestInt8QuantizeRoundTripAndForward;
+    procedure TestInt8QuantizedGPT2LogitDrift;
+    procedure TestInt8QuantizedLlamaLogitDrift;
     procedure TestTokenRMSNormForwardAndSaveLoad;
     procedure TestRotaryHalfPermutationMatchesHFRotateHalf;
     procedure TestSwiGLUMatchesLlamaMLPGating;
@@ -1438,6 +1441,285 @@ begin
     Input.Free;
     NNInfer.Free;
     NNTrain.Free;
+  end;
+end;
+
+// Unit-level gates for the int8 quantized weight storage
+// (TNNet.QuantizeWeightsInt8): (a) quantize->dequantize round-trip error is
+// bounded per element by scale/2, scale = max|row|/127 (symmetric
+// per-output-channel, round-to-nearest); (b) the QUANTIZED forward equals
+// the FP32 forward run on the dequantized weights (same kernels, same
+// values - only the storage differs); (c) the FP32 storage is genuinely
+// released (neuron volumes shrunk to one element; the int8 container holds
+// ~1/4 of the FP32 weight bytes); (d) Backpropagate on a quantized layer
+// raises - the inference-only contract.
+procedure TTestNeuralPretrained.TestInt8QuantizeRoundTripAndForward;
+var
+  NN: TNNet;
+  ConvLayer, FCLayer: TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  OrigConvW, OrigFCW: array of TNNetVolume;
+  i, n: integer;
+  Scale, Diff: double;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(5, 1, 8) );
+  ConvLayer := NN.AddLayer( TNNetPointwiseConvLinear.Create(6) );
+  FCLayer := NN.AddLayer( TNNetFullConnect.Create(10) );
+  Input := TNNetVolume.Create(5, 1, 8);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  SetLength(OrigConvW, ConvLayer.Neurons.Count);
+  SetLength(OrigFCW, FCLayer.Neurons.Count);
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+    for n := 0 to ConvLayer.Neurons.Count - 1 do
+    begin
+      OrigConvW[n] := TNNetVolume.Create;
+      OrigConvW[n].Copy(ConvLayer.Neurons[n].Weights);
+    end;
+    for n := 0 to FCLayer.Neurons.Count - 1 do
+    begin
+      OrigFCW[n] := TNNetVolume.Create;
+      OrigFCW[n].Copy(FCLayer.Neurons[n].Weights);
+    end;
+
+    NN.QuantizeWeightsInt8();
+    // (c) storage: quantized flags up, FP32 released, container ~1/4.
+    AssertTrue('conv quantized',
+      TNNetLayerConcatedWeights(ConvLayer).WeightsQuantizedInt8);
+    AssertTrue('fc quantized',
+      TNNetLayerConcatedWeights(FCLayer).WeightsQuantizedInt8);
+    AssertEquals('conv FP32 weights released', 1,
+      ConvLayer.Neurons[0].Weights.Size);
+    AssertEquals('fc FP32 weights released', 1,
+      FCLayer.Neurons[0].Weights.Size);
+    // conv: 6 neurons x 8 weights -> 48 code bytes + 24 scale bytes = 72,
+    // vs 192 FP32 bytes (37.5%; the 4-byte-per-row scale is amortized away
+    // on real layer widths - 0.4% overhead at TinyLlama's 2048 columns).
+    AssertEquals('conv int8 container bytes', 6 * 8 + 6 * 4,
+      TNNetLayerConcatedWeights(ConvLayer).Int8QuantizedSizeBytes());
+    AssertEquals('fc int8 container bytes', 10 * 30 + 10 * 4,
+      TNNetLayerConcatedWeights(FCLayer).Int8QuantizedSizeBytes());
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    // (d) inference-only: backprop on a quantized layer must raise.
+    Raised := false;
+    try
+      FCLayer.Backpropagate();
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('Backpropagate must raise on int8-quantized layers', Raised);
+
+    // (b) dequantize back to FP32 and recompute: identical forward.
+    TNNetLayerConcatedWeights(ConvLayer).DequantizeWeightsInt8();
+    TNNetLayerConcatedWeights(FCLayer).DequantizeWeightsInt8();
+    AssertTrue('conv un-quantized',
+      not TNNetLayerConcatedWeights(ConvLayer).WeightsQuantizedInt8);
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('quantized forward = FP32-on-dequantized-weights ' +
+        IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+
+    // (a) round-trip bound: |w_dequant - w_orig| <= scale/2 per element.
+    // (max|row| scanned manually - TVolume.GetMaxAbs misses a negative
+    // max-magnitude element 0.)
+    for n := 0 to ConvLayer.Neurons.Count - 1 do
+    begin
+      Scale := 0;
+      for i := 0 to OrigConvW[n].Size - 1 do
+        if Abs(OrigConvW[n].FData[i]) > Scale then
+          Scale := Abs(OrigConvW[n].FData[i]);
+      Scale := Scale / 127;
+      for i := 0 to OrigConvW[n].Size - 1 do
+      begin
+        Diff := Abs(ConvLayer.Neurons[n].Weights.FData[i] -
+          OrigConvW[n].FData[i]);
+        AssertTrue('conv round-trip bound neuron ' + IntToStr(n) +
+          ' weight ' + IntToStr(i) + ': ' + FloatToStr(Diff) +
+          ' <= scale/2 = ' + FloatToStr(Scale / 2),
+          Diff <= Scale * 0.5 + 1e-9);
+      end;
+    end;
+    for n := 0 to FCLayer.Neurons.Count - 1 do
+    begin
+      Scale := 0;
+      for i := 0 to OrigFCW[n].Size - 1 do
+        if Abs(OrigFCW[n].FData[i]) > Scale then
+          Scale := Abs(OrigFCW[n].FData[i]);
+      Scale := Scale / 127;
+      for i := 0 to OrigFCW[n].Size - 1 do
+      begin
+        Diff := Abs(FCLayer.Neurons[n].Weights.FData[i] -
+          OrigFCW[n].FData[i]);
+        AssertTrue('fc round-trip bound neuron ' + IntToStr(n) +
+          ' weight ' + IntToStr(i),
+          Diff <= Scale * 0.5 + 1e-9);
+      end;
+    end;
+  finally
+    for n := 0 to High(OrigConvW) do OrigConvW[n].Free;
+    for n := 0 to High(OrigFCW) do OrigFCW[n].Free;
+    OutDQ.Free;
+    OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// Logit drift of the int8-quantized GPT-2 import vs the FP32 import on the
+// committed pico fixture. Builds the SAME checkpoint twice - FP32 and
+// pQuantizeInt8 (combined with pInferenceOnly, the intended deployment
+// pairing) - and gates the max |logit diff| RELATIVE to the largest FP32
+// logit magnitude. Measured on tiny_gpt2: see the gate comment below.
+procedure TTestNeuralPretrained.TestInt8QuantizedGPT2LogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TGPT2Config;
+  Input, OutF, OutQ: TNNetVolume;
+  i, s, QuantLayers: integer;
+  MaxDiff, MaxAbsLogit: double;
+  CW: TNNetLayerConcatedWeights;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
+    Config, {SeqLen=}0, {NumHeads=}2);
+  NNQ := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
+    Config, {SeqLen=}0, {NumHeads=}2, {pInferenceOnly=}true,
+    {pSeqClsHead=}false, {pExactGelu=}false, {pQuantizeInt8=}true);
+  Input := TNNetVolume.Create(Config.NCtx, 1, 1);
+  OutF := TNNetVolume.Create;
+  OutQ := TNNetVolume.Create;
+  try
+    // Every weight-heavy layer must really be in int8 storage.
+    QuantLayers := 0;
+    for i := 0 to NNQ.Layers.Count - 1 do
+      if (NNQ.Layers[i] is TNNetLayerConcatedWeights) then
+      begin
+        CW := TNNetLayerConcatedWeights(NNQ.Layers[i]);
+        if CW.WeightsQuantizedInt8 then
+        begin
+          Inc(QuantLayers);
+          AssertEquals('FP32 weights released in layer ' + IntToStr(i),
+            1, CW.Neurons[0].Weights.Size);
+          AssertTrue('int8 container non-empty in layer ' + IntToStr(i),
+            CW.Int8QuantizedSizeBytes() > 0);
+        end;
+      end;
+    // 2 blocks x (c_attn + attn out-proj + c_fc + mlp c_proj) + LM head.
+    AssertTrue('expected >= 9 quantized layers, got ' +
+      IntToStr(QuantLayers), QuantLayers >= 9);
+    MaxDiff := 0;
+    MaxAbsLogit := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to Config.NCtx - 1 do
+        Input.FData[i] := (s * 7 + i * 3 + 1) mod Config.VocabSize;
+      NNFP32.Compute(Input);
+      NNFP32.GetOutput(OutF);
+      NNQ.Compute(Input);
+      NNQ.GetOutput(OutQ);
+      AssertEquals('output size', OutF.Size, OutQ.Size);
+      for i := 0 to OutF.Size - 1 do
+      begin
+        if Abs(OutF.FData[i]) > MaxAbsLogit then
+          MaxAbsLogit := Abs(OutF.FData[i]);
+        if Abs(OutF.FData[i] - OutQ.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutF.FData[i] - OutQ.FData[i]);
+      end;
+    end;
+    AssertTrue('FP32 logits non-degenerate', MaxAbsLogit > 1e-3);
+    // Measured 2026-06 on tiny_gpt2: max |diff| 0.0498 vs max |logit| 2.99
+    // = 1.7e-2 RELATIVE. The pico width (d_model 8: rows of only 8-32
+    // columns) makes per-channel int8 rounding far noisier than on real
+    // checkpoints (full gpt2 rows have 768+ columns, averaging it away).
+    // Gated at 5e-2 relative with margin: a REGRESSION past it means the
+    // dequantization broke, not that the tolerance needs loosening.
+    AssertTrue('int8 logit drift: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' relative to max |logit| = ' + FloatToStr(MaxAbsLogit) +
+      ' must be < 5e-2 relative', MaxDiff < 5e-2 * MaxAbsLogit);
+  finally
+    OutQ.Free;
+    OutF.Free;
+    Input.Free;
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+// Same drift gate for the Llama family path (BuildLlamaFromSafeTensors
+// with pQuantizeInt8) on the committed pico Llama fixture - this is the
+// configuration that lets TinyLlama-1.1B-class checkpoints (~4.4 GB FP32)
+// run on 3 GB-class machines: ~1/4 of the weight bytes resident, peak =
+// quantized net + one FP32 block during load, + one dequantized layer
+// during forward.
+procedure TTestNeuralPretrained.TestInt8QuantizedLlamaLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TLlamaConfig;
+  Input, OutF, OutQ: TNNetVolume;
+  i, s, QuantLayers: integer;
+  MaxDiff, MaxAbsLogit: double;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_llama.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_llama_config.json'));
+  NNQ := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_llama.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}true,
+    FixturePath('tiny_llama_config.json'), {pQuantizeInt8=}true);
+  Input := TNNetVolume.Create(Config.MaxPositions, 1, 1);
+  OutF := TNNetVolume.Create;
+  OutQ := TNNetVolume.Create;
+  try
+    QuantLayers := 0;
+    for i := 0 to NNQ.Layers.Count - 1 do
+      if (NNQ.Layers[i] is TNNetLayerConcatedWeights) and
+         TNNetLayerConcatedWeights(NNQ.Layers[i]).WeightsQuantizedInt8 then
+        Inc(QuantLayers);
+    // 2 blocks x (q/k/v/o projections + gate|up + down) + LM head.
+    AssertTrue('expected >= 13 quantized layers, got ' +
+      IntToStr(QuantLayers), QuantLayers >= 13);
+    MaxDiff := 0;
+    MaxAbsLogit := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to Config.MaxPositions - 1 do
+        Input.FData[i] := (s * 5 + i * 3 + 1) mod Config.VocabSize;
+      NNFP32.Compute(Input);
+      NNFP32.GetOutput(OutF);
+      NNQ.Compute(Input);
+      NNQ.GetOutput(OutQ);
+      AssertEquals('output size', OutF.Size, OutQ.Size);
+      for i := 0 to OutF.Size - 1 do
+      begin
+        if Abs(OutF.FData[i]) > MaxAbsLogit then
+          MaxAbsLogit := Abs(OutF.FData[i]);
+        if Abs(OutF.FData[i] - OutQ.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutF.FData[i] - OutQ.FData[i]);
+      end;
+    end;
+    AssertTrue('FP32 logits non-degenerate', MaxAbsLogit > 1e-3);
+    // Measured 2026-06 on tiny_llama: max |diff| 0.0615 vs max |logit| 2.66
+    // = 2.3e-2 RELATIVE (pico width 8 - see TestInt8QuantizedGPT2LogitDrift
+    // for why this overstates real-checkpoint drift). Gated at 5e-2.
+    AssertTrue('int8 Llama logit drift: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' relative to max |logit| = ' + FloatToStr(MaxAbsLogit) +
+      ' must be < 5e-2 relative', MaxDiff < 5e-2 * MaxAbsLogit);
+  finally
+    OutQ.Free;
+    OutF.Free;
+    Input.Free;
+    NNQ.Free;
+    NNFP32.Free;
   end;
 end;
 

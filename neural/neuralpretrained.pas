@@ -557,9 +557,18 @@ function CreatePretrainedTensorReader(
 // OpenAI GPT-2 activation_function) for the EXACT erf "gelu" composition -
 // the Cerebras-GPT family (model_type "gpt2", the open GPT-3 reproduction)
 // trains with activation_function "gelu" and needs it for logit parity.
+// pQuantizeInt8 = True stores the weights of every PointwiseConvLinear in
+// per-output-channel symmetric int8 (TNNet.QuantizeWeightsInt8), quantizing
+// block by block DURING construction and load so peak RAM carries the FP32
+// weights of at most one block: the loaded net holds ~1/4 of the FP32
+// weight bytes (embedding/positional tables stay FP32) and is
+// inference-only. Logit drift measures ~2e-2 relative on the pico parity
+// fixture (rows of 8-32 columns; much smaller at real checkpoint widths) -
+// see TestInt8QuantizedGPT2LogitDrift.
 function BuildGPT2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false; pExactGelu: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pExactGelu: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // Same, also returning the inferred config.
 // pSeqClsHead = True builds the GPT2ForSequenceClassification variant:
@@ -571,7 +580,8 @@ function BuildGPT2FromSafeTensors(const FileName: string;
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
   pNumHeads: integer = 0; pInferenceOnly: boolean = false;
-  pSeqClsHead: boolean = false; pExactGelu: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pExactGelu: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 type
   // Parsed HF config.json "rope_scaling" (long-context extension), mapped
@@ -731,19 +741,32 @@ function LlamaConfigToString(const Config: TLlamaConfig): string;
 // uses the full max_position_embeddings context. pInferenceOnly = True
 // frees training volumes during construction (Compute()-only afterwards).
 // Config.Prefix is detected from the checkpoint and written back.
+// pQuantizeInt8 = True stores every projection/MLP/LM-head weight matrix in
+// per-output-channel symmetric int8 (TNNet.QuantizeWeightsInt8), quantizing
+// block by block DURING construction and load so peak RAM carries the FP32
+// weights of at most one block plus one streamed tensor: the loaded net
+// holds ~1/4 of the FP32 weight bytes (the embedding table stays FP32) and
+// is inference-only. This is what lets a TinyLlama-1.1B-class checkpoint
+// (~4.4 GB of FP32 weights) run on a 3 GB-class machine. Expect logit
+// drift measures ~2e-2 relative on the pico parity fixture (much smaller
+// at real checkpoint widths) - see TestInt8QuantizedLlamaLogitDrift.
+// Every importer that rides this path (Mistral/Qwen/Gemma/...) inherits
+// the behaviour by passing pQuantizeInt8 through.
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildLlamaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = '';
+  pQuantizeInt8: boolean = false): TNNet;
 
 function BuildLlamaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // Mistral: the Llama skeleton + optional sliding-window attention (config
 // sliding_window; null/absent = full attention). Thin wrappers over the
@@ -2436,12 +2459,27 @@ end;
 // TNNetPointwiseConvLinear with OutDim neurons of InDim weights each.
 // HF Conv1D computes y = x @ W + b with W[in][out] (row-major), so output
 // channel j gets weight column j: Neuron[j].Weights[i] = W[i*out + j].
+// With pQuantizeInt8 the importers quantize layers DURING construction (to
+// bound peak RAM); a loader about to write checkpoint weights into such a
+// layer must first restore writable FP32 neuron volumes. The importer
+// re-quantizes (TNNet.QuantizeWeightsInt8 sweep) after the layer/block is
+// loaded. Requantizing an untouched dequantized row is EXACT: the row max
+// is a +-127 code, so the recomputed scale and codes are identical.
+// Coded by Claude (AI).
+procedure EnsureWritableImportWeights(Layer: TNNetLayer);
+begin
+  if (Layer is TNNetLayerConcatedWeights) and
+     TNNetLayerConcatedWeights(Layer).WeightsQuantizedInt8 then
+    TNNetLayerConcatedWeights(Layer).DequantizeWeightsInt8();
+end;
+
 procedure LoadConv1DWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; InDim, OutDim: integer);
 var
   W, B: TNNetVolume;
   i, j: integer;
 begin
+  EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
     ImportError('GPT-2 import: missing tensor "' + WName + '".');
   if not Reader.HasTensor(BName) then
@@ -2485,7 +2523,8 @@ end;
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
   pNumHeads: integer = 0; pInferenceOnly: boolean = false;
-  pSeqClsHead: boolean = false; pExactGelu: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pExactGelu: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   GELUSource, PhiBranch: TNNetLayer;
   Reader: TNNetSafeTensorsReader;
@@ -2530,7 +2569,13 @@ begin
       // most one block (plus the LM head's, briefly) instead of the whole
       // net's. MakeInferenceOnly is idempotent, so re-sweeping all layers
       // each time is cheap and keeps this code simple.
+      // pQuantizeInt8 follows the same idempotent-sweep pattern: each sweep
+      // converts the freshly built block's weight matrices to int8 so peak
+      // memory carries at most one block of FP32 weights; the load phase
+      // below refills each layer (DequantizeWeightsInt8 inside the loaders)
+      // and re-sweeps after every block.
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NLayers);
       for BlockCnt := 0 to Config.NLayers - 1 do
       begin
@@ -2570,6 +2615,7 @@ begin
           TNNetPointwiseConvLinear.Create(Config.NEmbd) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5) );
       NumLabels := 0;
@@ -2599,6 +2645,7 @@ begin
         LMHead := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -2616,6 +2663,7 @@ begin
         if not pSeqClsHead then
         begin
           // wte -> LM head (tied weights copied; row t of wte = neuron t).
+          EnsureWritableImportWeights(LMHead);
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.NEmbd - 1 do
@@ -2637,6 +2685,8 @@ begin
       finally
         Tmp.Free;
       end;
+      // Re-quantize the refilled LM head before streaming the blocks.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       for BlockCnt := 0 to Config.NLayers - 1 do
       begin
         BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
@@ -2670,6 +2720,8 @@ begin
           4 * Config.NEmbd, Config.NEmbd);
         MarkConsumed(BlockPrefix + 'mlp.c_proj.weight');
         MarkConsumed(BlockPrefix + 'mlp.c_proj.bias');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadLayerNormWeights(Reader, FinalLN,
         Config.Prefix + 'ln_f.weight', Config.Prefix + 'ln_f.bias',
@@ -2683,6 +2735,7 @@ begin
         Tmp := TNNetVolume.Create;
         try
           Reader.LoadTensorFlat('score.weight', Tmp);
+          EnsureWritableImportWeights(LMHead);
           for j := 0 to NumLabels - 1 do
           begin
             for i := 0 to Config.NEmbd - 1 do
@@ -2696,6 +2749,8 @@ begin
         end;
         MarkConsumed('score.weight');
       end;
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Unexpected-tensor check ----------------
       // Every tensor must be consumed or be a known ignorable buffer:
@@ -2728,12 +2783,14 @@ end;
 
 function BuildGPT2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false; pExactGelu: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pExactGelu: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPT2Config;
 begin
   Result := BuildGPT2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pNumHeads, pInferenceOnly, {pSeqClsHead=}false, pExactGelu);
+    pNumHeads, pInferenceOnly, {pSeqClsHead=}false, pExactGelu,
+    pQuantizeInt8);
 end;
 
 // ===================== ROPE SCALING (config.json) ==========================
@@ -3317,6 +3374,7 @@ var
   W, B: TNNetVolume;
   i, j, TargetIdx, HeadIdx, RowInHead, TargetRow, HalfDim, SrcRow: integer;
 begin
+  EnsureWritableImportWeights(Layer);
   if ExpectedNeurons < 0 then ExpectedNeurons := OutDim;
   if SrcRows <= 0 then SrcRows := OutDim;
   if SrcRowBase + OutDim > SrcRows then
@@ -3468,7 +3526,7 @@ type
 
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -3585,7 +3643,12 @@ begin
       // not padding.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      // pQuantizeInt8: idempotent block-by-block sweeps (same pattern as
+      // MakeInferenceOnly) keep peak RAM at quantized-net + one FP32 block
+      // during BOTH construction and the weight-load phase below (the
+      // loaders call DequantizeWeightsInt8 before refilling a layer).
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KRotated, Config.NumKVHeads);
       SetLength(VSlices, Config.NumKVHeads);
@@ -3785,6 +3848,7 @@ begin
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
         TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
@@ -3796,6 +3860,7 @@ begin
       if Config.FinalLogitSoftCap > 0 then
         NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       // Config.RMSNormAddOne (Gemma): every RMSNorm gain is stored as 1 + w
@@ -3843,6 +3908,7 @@ begin
         if Config.TieWordEmbeddings then
         begin
           // Tied LM head: logits = h . embed^T (rows copied, bias-free).
+          EnsureWritableImportWeights(LMHead);
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
@@ -3863,6 +3929,8 @@ begin
       finally
         Tmp.Free;
       end;
+      // Re-quantize the refilled LM head before streaming the blocks.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       for BlockCnt := 0 to Config.NumLayers - 1 do
       begin
         BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
@@ -4009,6 +4077,8 @@ begin
           BlockPrefix + 'mlp.down_proj.weight',
           Config.IntermediateSize, Config.HiddenSize);
         MarkConsumed(BlockPrefix + 'mlp.down_proj.weight');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadLlamaRMSNormWeights(Reader, FinalNorm,
         Config.Prefix + 'norm.weight', Config.HiddenSize, NormGainOffset);
@@ -4043,7 +4113,8 @@ end;
 function BuildLlamaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = '';
+  pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -4052,16 +4123,17 @@ begin
   Config := ReadLlamaConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildLlamaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildLlamaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 // ============================ GPT-NEO IMPORT ===============================

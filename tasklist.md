@@ -146,21 +146,51 @@ rather than acted on.
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
       out-of-scope for v1.
-- [ ] Quantized inference — int8 (and/or FP16 storage) weight compression so
-      real imported checkpoints fit on commodity RAM: TinyLlama-1.1B in FP32 is
-      ~4.4GB of weights, beyond a 3GB-class machine even with MakeInferenceOnly,
-      so this is what separates "imports Llama" (landed, abe7573) from "runs
-      Llama". v1: per-output-channel symmetric int8 weight storage for the
-      weight-heavy layers (PointwiseConvLinear / FullConnect / Conv — the
-      layers the introspection report already flags as quantization
-      candidates), dequantize-on-the-fly into the existing FP32 forward (no
-      int8 matmul kernels needed yet); a `QuantizeWeights` /
-      inference-only-load path wired into BuildGPT2/BuildLlamaFromSafeTensors;
-      assert logit drift vs FP32 stays within a documented tolerance on the
-      pico-Llama parity fixture. FP16 weight STORAGE (half the RAM, ~zero
-      accuracy risk) is an acceptable stepping stone if int8 proves invasive.
-      Follow-ups: int8 activation/matmul path, GPTQ/AWQ-style calibrated
-      quantization, 4-bit.
+- [X] Quantized inference — int8 weight compression so real imported
+      checkpoints fit on commodity RAM. LANDED (v1): per-output-channel
+      symmetric int8 weight STORAGE (scale = max|row|/127) on
+      TNNetLayerConcatedWeights — QuantizeWeightsInt8 / DequantizeWeightsInt8
+      / Int8QuantizedSizeBytes, swept by TNNet.QuantizeWeightsInt8 over the
+      exact weight-heavy classes (Conv/ConvLinear/ConvReLU, PointwiseConv/
+      Linear/ReLU, FullConnect/Linear/ReLU/Sigmoid; exotic subclasses
+      excluded — they reinterpret weight layout). FP32 storage genuinely
+      freed (neuron volumes + concated cache shrunk); forward dequantizes
+      TRANSIENTLY (conv: whole layer into FConcatedWeights then released;
+      fullconnect: one row into a scratch), so steady RAM ~ 1/4 weight bytes
+      and forward peak = quantized net + ONE layer FP32. Backpropagate
+      raises on quantized layers (inference-only). Importer wiring:
+      pQuantizeInt8 on BuildGPT2FromSafeTensors[Ex] and
+      BuildLlamaFromSafeTensors[Ex/WithConfig] quantizes block-by-block
+      during BOTH construction and weight load (loaders auto-dequantize a
+      quantized layer before refilling, importers re-sweep per block), so
+      load peak = quantized net + one FP32 block + one streamed tensor.
+      Tests: round-trip error <= scale/2 per element, quantized forward ==
+      FP32-forward-on-dequantized-weights, container-size assertions,
+      backprop-raises, logit drift vs FP32 on pico-GPT2/pico-Llama fixtures
+      (measured 1.7e-2/2.3e-2 relative at pico width 8; gated 5e-2 —
+      drift shrinks with real row widths). Also fixed-by-avoidance: noted
+      TVolume.GetMaxAbs misses a negative max-magnitude element 0 (scale
+      computed inline instead). DEFERRED: see the follow-up entries below.
+- [ ] Quantized inference follow-up: int8 activation quantization + true
+      int8 matmul kernels (AVX2 maddubs / dot-product paths) so quantized
+      layers stop paying the per-forward dequantize cost; today the int8
+      win is RAM only — compute still runs the FP32 kernels.
+- [ ] Quantized inference follow-up: thread pQuantizeInt8 through the
+      remaining importer entry points that do NOT ride
+      BuildLlamaFromSafeTensorsWithConfig (GPT-Neo/NeoX/J, Phi, BERT family,
+      BLOOM, RWKV, Mamba, T5/Marian, DeepSeek-V2 MoE) — mechanical: same
+      construction-sweep + loader-refill pattern; loaders already
+      auto-dequantize (EnsureWritableImportWeights).
+- [ ] Quantized inference follow-up: GPTQ/AWQ-style calibrated quantization
+      (error-compensating rounding / activation-aware scale search) and
+      4-bit (int4 pairs packed per byte, group-wise scales); also quantized
+      EMBEDDING table storage (the one remaining FP32 heavyweight — vocab x
+      d_model stays FP32 in v1, e.g. ~262MB for TinyLlama) and FP16/BF16
+      weight storage as a zero-drift middle rung.
+- [ ] Quantized inference follow-up: upstream fix for TVolume.GetMaxAbs
+      (seeds the running max with the SIGNED first element, so a negative
+      max-magnitude element 0 is missed; csErrorOverflowBackpropProtection
+      and friends consume it — audit callers before fixing).
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas: (a) Unigram model
       support (model.type "Unigram", Viterbi segmentation) -- needed only
       for tokenizers not yet converted to BPE format; (b) the raw

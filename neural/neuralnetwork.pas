@@ -464,12 +464,53 @@ type
       FShouldConcatWeights: boolean;
       FShouldInterleaveWeights: boolean;
       FAfterWeightUpdateHasBeenCalled:boolean;
+      // INT8 QUANTIZED WEIGHT STORAGE (inference-only). When FQuantInt8 is
+      // true the FP32 weights have been replaced by per-output-channel
+      // symmetric int8 codes: row r of the weight matrix (= neuron r's
+      // weight vector) is stored as FQuantCodes[r*VS..r*VS+VS-1] with
+      // dequantized value code*FQuantScales[r], scale = max|row|/127.
+      // The per-neuron FP32 volumes and the concatenated weight cache are
+      // shrunk to a single element (the heap is genuinely released), so a
+      // quantized layer holds ~1/4 of the FP32 weight bytes. The forward
+      // pass dequantizes TRANSIENTLY (whole layer into FConcatedWeights for
+      // convolutions, one row at a time into FQuantScratch for
+      // fully-connected layers), so peak RAM = quantized weights + at most
+      // ONE layer's FP32 weights at any instant. Biases stay FP32.
+      // Backpropagation raises - quantized layers are inference-only.
+      FQuantInt8: boolean;
+      FQuantCodes: array of ShortInt;
+      FQuantScales: array of TNeuralFloat;
+      FQuantVectorSize: integer;
+      FQuantWSizeX, FQuantWSizeY, FQuantWSizeD: integer;
+      FQuantScratch: TNNetVolume;
       procedure AfterWeightUpdate(); override;
       procedure BuildBiasOutput(); {$IFDEF Release} inline; {$ENDIF}
+      // Dequantizes all rows into FConcatedWeights (resized to hold them) in
+      // the exact layout ConcatInto produces - the AVX DotProducts kernels
+      // consume it unchanged. Caller must shrink FConcatedWeights afterwards
+      // to keep the FP32 copy transient. // Coded by Claude (AI).
+      procedure DequantizeIntoConcatedWeights();
+      // Dequantizes one row into FQuantScratch. // Coded by Claude (AI).
+      procedure DequantizeRowIntoScratch(NeuronIdx: integer);
     public
       constructor Create(); override;
       destructor Destroy(); override;
       procedure RefreshNeuronWeightList();
+      // Converts the FP32 weights to per-output-channel symmetric int8
+      // (scale = max|row|/127, round-to-nearest) and frees the FP32 weight
+      // storage. INFERENCE-ONLY afterwards: Backpropagate raises. No-op on
+      // layers with linked/shared neurons or without weights. Reversible
+      // (up to the quantization error) via DequantizeWeightsInt8.
+      // Coded by Claude (AI).
+      procedure QuantizeWeightsInt8();
+      // Restores FP32 weight storage from the int8 codes (used by the
+      // safetensors importers to refill a quantized layer with checkpoint
+      // weights) and leaves the layer un-quantized. // Coded by Claude (AI).
+      procedure DequantizeWeightsInt8();
+      // Bytes held by the int8 container (codes + scales).
+      // Coded by Claude (AI).
+      function Int8QuantizedSizeBytes(): int64;
+      property WeightsQuantizedInt8: boolean read FQuantInt8;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
       {$ENDIF}
@@ -7358,6 +7399,11 @@ type
       constructor Create(pSize:integer; pSuppressBias: integer = 0); overload;
       procedure Compute(); override;
       procedure ComputeCPU(); virtual;
+      // Forward pass for int8-quantized weights: dequantizes ONE row at a
+      // time into the scratch buffer and applies FActivationFn - shared by
+      // every TNNetFullConnect descendant (they differ only in the
+      // activation function pointers). // Coded by Claude (AI).
+      procedure ComputeQuantizedInt8CPU();
       procedure Backpropagate(); override;
       procedure BackpropagateCPU(); virtual;
       destructor Destroy(); override;
@@ -12266,6 +12312,19 @@ type
       // call repeatedly while a network is still being built (used by the
       // GPT-2 importer to bound peak memory during construction).
       procedure MakeInferenceOnly(); // Coded by Claude (AI).
+      // Converts the FP32 weights of every weight-heavy dense/convolutional
+      // layer (exact classes: TNNetConvolution/Linear/ReLU, TNNetPointwise
+      // Conv/Linear/ReLU, TNNetFullConnect/Linear/ReLU/Sigmoid - the same
+      // layers the introspection report flags as quantization candidates)
+      // to per-output-channel symmetric int8 (scale = max|row|/127),
+      // releasing the FP32 storage: ~1/4 of the weight bytes remain and the
+      // forward pass dequantizes transiently (peak RAM = quantized weights
+      // + ONE layer FP32). INFERENCE-ONLY CONTRACT on quantized layers:
+      // Backpropagate raises. Idempotent - safe to re-sweep while a network
+      // is being built or loaded (used by the safetensors importers to
+      // bound peak memory). Exotic subclasses (quaternion/tropical/KAN...)
+      // are deliberately NOT matched: they reinterpret their weight layout.
+      procedure QuantizeWeightsInt8(); // Coded by Claude (AI).
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2Decay(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2DecayToConvolutionalLayers(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -44811,14 +44870,139 @@ begin
     if FShouldConcatWeights then
     begin
       BuildBiasOutput();
-      FNeuronWeightList.ConcatInto(FConcatedWeights);
-      if FShouldInterleaveWeights then
+      // In int8-quantized mode the per-neuron FP32 volumes are shrunk to a
+      // single element - concatenating them would build a garbage cache.
+      // The bias output above stays correct (biases remain FP32).
+      if not FQuantInt8 then
       begin
-        FConcatedWInter.InterleaveWithXFrom(FConcatedWeights, FVectorSize);
+        FNeuronWeightList.ConcatInto(FConcatedWeights);
+        if FShouldInterleaveWeights then
+        begin
+          FConcatedWInter.InterleaveWithXFrom(FConcatedWeights, FVectorSize);
+        end;
       end;
     end;
   end;
   FAfterWeightUpdateHasBeenCalled := true;
+end;
+
+procedure TNNetLayerConcatedWeights.DequantizeIntoConcatedWeights();
+var
+  NeuronCnt, ElementCnt, RowBase: integer;
+  Scale: TNeuralFloat;
+begin
+  FConcatedWeights.ReSize(FNeurons.Count, 1, FQuantVectorSize);
+  for NeuronCnt := 0 to FNeurons.Count - 1 do
+  begin
+    RowBase := NeuronCnt * FQuantVectorSize;
+    Scale := FQuantScales[NeuronCnt];
+    for ElementCnt := 0 to FQuantVectorSize - 1 do
+      FConcatedWeights.FData[RowBase + ElementCnt] :=
+        FQuantCodes[RowBase + ElementCnt] * Scale;
+  end;
+end;
+
+procedure TNNetLayerConcatedWeights.DequantizeRowIntoScratch(
+  NeuronIdx: integer);
+var
+  ElementCnt, RowBase: integer;
+  Scale: TNeuralFloat;
+begin
+  if FQuantScratch.Size <> FQuantVectorSize then
+    FQuantScratch.ReSize(FQuantVectorSize, 1, 1);
+  RowBase := NeuronIdx * FQuantVectorSize;
+  Scale := FQuantScales[NeuronIdx];
+  for ElementCnt := 0 to FQuantVectorSize - 1 do
+    FQuantScratch.FData[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * Scale;
+end;
+
+procedure TNNetLayerConcatedWeights.QuantizeWeightsInt8();
+var
+  NeuronCnt, ElementCnt, RowBase, Code: integer;
+  MaxAbs, Scale, InvScale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if FQuantInt8 then exit;          // idempotent
+  if FLinkedNeurons then exit;      // shared neurons: owner layer decides
+  if FNeurons.Count = 0 then exit;
+  if FNeurons[0].Weights.Size <= 1 then exit; // nothing to quantize
+  FQuantVectorSize := FNeurons[0].Weights.Size;
+  FQuantWSizeX := FNeurons[0].Weights.SizeX;
+  FQuantWSizeY := FNeurons[0].Weights.SizeY;
+  FQuantWSizeD := FNeurons[0].Weights.Depth;
+  SetLength(FQuantScales, FNeurons.Count);
+  SetLength(FQuantCodes, FNeurons.Count * FQuantVectorSize);
+  for NeuronCnt := 0 to FNeurons.Count - 1 do
+  begin
+    W := FNeurons[NeuronCnt].Weights;
+    if W.Size <> FQuantVectorSize then
+    begin
+      FErrorProc('QuantizeWeightsInt8: neuron ' + IntToStr(NeuronCnt) +
+        ' weight size ' + IntToStr(W.Size) + ' differs from ' +
+        IntToStr(FQuantVectorSize) + '.');
+      exit;
+    end;
+    // max|row| computed inline: TVolume.GetMaxAbs seeds its running max
+    // with the SIGNED first element and never abs-es it, so a negative
+    // max-magnitude element 0 is missed - unusable for a scale.
+    MaxAbs := 0;
+    for ElementCnt := 0 to FQuantVectorSize - 1 do
+      if Abs(W.FData[ElementCnt]) > MaxAbs then
+        MaxAbs := Abs(W.FData[ElementCnt]);
+    if MaxAbs > 0
+      then Scale := MaxAbs / 127
+      else Scale := 1;
+    FQuantScales[NeuronCnt] := Scale;
+    InvScale := 1 / Scale;
+    RowBase := NeuronCnt * FQuantVectorSize;
+    for ElementCnt := 0 to FQuantVectorSize - 1 do
+    begin
+      Code := Round(W.FData[ElementCnt] * InvScale);
+      if Code > 127 then Code := 127;
+      if Code < -127 then Code := -127;
+      FQuantCodes[RowBase + ElementCnt] := Code;
+    end;
+  end;
+  // Free the FP32 storage only after every row quantized successfully.
+  // (1,1,1) matches the pre-SetNumWeights state; SetLength inside ReSize
+  // genuinely shrinks the heap allocations.
+  for NeuronCnt := 0 to FNeurons.Count - 1 do
+  begin
+    FNeurons[NeuronCnt].Weights.ReSize(1, 1, 1);
+    FNeurons[NeuronCnt].Weights.Fill(0);
+  end;
+  FConcatedWeights.ReSize(1, 1, 1);
+  FConcatedWInter.ReSize(1, 1, 1);
+  FQuantInt8 := true;
+end;
+
+procedure TNNetLayerConcatedWeights.DequantizeWeightsInt8();
+var
+  NeuronCnt, ElementCnt, RowBase: integer;
+  Scale: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  if not FQuantInt8 then exit;
+  for NeuronCnt := 0 to FNeurons.Count - 1 do
+  begin
+    W := FNeurons[NeuronCnt].Weights;
+    W.ReSize(FQuantWSizeX, FQuantWSizeY, FQuantWSizeD);
+    RowBase := NeuronCnt * FQuantVectorSize;
+    Scale := FQuantScales[NeuronCnt];
+    for ElementCnt := 0 to FQuantVectorSize - 1 do
+      W.FData[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * Scale;
+  end;
+  SetLength(FQuantCodes, 0);
+  SetLength(FQuantScales, 0);
+  FQuantScratch.ReSize(1, 1, 1);
+  FQuantInt8 := false;
+  AfterWeightUpdate(); // rebuild the concatenated cache / bias output
+end;
+
+function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
+begin
+  Result := int64(Length(FQuantCodes)) * SizeOf(ShortInt) +
+    int64(Length(FQuantScales)) * SizeOf(TNeuralFloat);
 end;
 
 procedure TNNetLayerConcatedWeights.BuildBiasOutput();
@@ -44878,10 +45062,14 @@ begin
   FShouldConcatWeights := false;
   FShouldInterleaveWeights := false;
   FAfterWeightUpdateHasBeenCalled := false;
+  FQuantInt8 := false;
+  FQuantVectorSize := 0;
+  FQuantScratch := TNNetVolume.Create();
 end;
 
 destructor TNNetLayerConcatedWeights.Destroy();
 begin
+  FQuantScratch.Free;
   FBiasOutput.Free;
   FConcatedWeights.Free;
   FNeuronWeightList.Free;
@@ -65022,6 +65210,18 @@ end;
 procedure TNNetConvolution.Compute();
   procedure ComputeOnCPU;
   begin
+    if FQuantInt8 then
+    begin
+      // int8-quantized inference: dequantize the whole layer into the
+      // concatenated-weight cache (the exact FP32 layout the AVX dot-product
+      // kernels consume), run the standard tiled forward, then release the
+      // FP32 copy so it stays TRANSIENT - peak RAM carries the FP32 weights
+      // of at most one layer at any instant.
+      DequantizeIntoConcatedWeights();
+      ComputeTiledCPU();
+      FConcatedWeights.ReSize(1, 1, 1);
+    end
+    else
     // interleaved dot product is faster with small vectors or big convs.
     if ShouldUseInterleavedDotProduct then
     begin
@@ -65086,6 +65286,10 @@ var
   StartTime, LocalNow: double;
   MaxError: TNeuralFloat;
 begin
+  if FQuantInt8 then
+    raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
+      IntToStr(FLayerIdx) + ' has int8-quantized weights (inference-only). ' +
+      'Rebuild/reload without quantization to train.');
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -66091,6 +66295,28 @@ procedure TNNetFullConnect.Compute();
 var
   StartTime: double;
 begin
+  if FQuantInt8 then
+  begin
+    if (FNeurons.Count = FOutput.Size) and
+      (FPrevLayer.Output.Size = FQuantVectorSize) then
+    begin
+      StartTime := Now();
+      ComputeQuantizedInt8CPU();
+      FForwardTime := FForwardTime + (Now() - StartTime);
+    end
+    else
+    begin
+      FErrorProc
+      (
+        'TNNetFullConnect.Compute (int8) should have same sizes. ' +
+        'Neurons:' + IntToStr(FNeurons.Count) +
+        ' Prev Layer Output:' + IntToStr(FPrevLayer.Output.Size) +
+        ' Quantized vector size:' + IntToStr(FQuantVectorSize) +
+        ' Output:' + IntToStr(FOutput.Size)
+      );
+    end;
+    exit;
+  end;
   if (FNeurons.Count = FOutput.Size) and
     (FPrevLayer.Output.Size = FNeurons[0].Weights.Size) then
   begin
@@ -66146,6 +66372,23 @@ begin
       FOutputRaw.FData[Cnt] := Sum;
       FOutput.FData[Cnt] := FActivationFn(Sum);
     end;
+  end;
+end;
+
+procedure TNNetFullConnect.ComputeQuantizedInt8CPU();
+var
+  Cnt, MaxCnt: integer;
+  Sum: TNeuralFloat;
+begin
+  if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
+  MaxCnt := FNeurons.Count - 1;
+  for Cnt := 0 to MaxCnt do
+  begin
+    DequantizeRowIntoScratch(Cnt);
+    Sum := FQuantScratch.DotProduct(FPrevLayer.Output);
+    if FSuppressBias = 0 then Sum := Sum + FArrNeurons[Cnt].FBiasWeight;
+    FOutputRaw.FData[Cnt] := Sum;
+    FOutput.FData[Cnt] := FActivationFn(Sum);
   end;
 end;
 
@@ -66260,6 +66503,10 @@ procedure TNNetFullConnect.Backpropagate();
 var
   StartTime: double;
 begin
+  if FQuantInt8 then
+    raise Exception.Create('TNNetFullConnect.Backpropagate: layer ' +
+      IntToStr(FLayerIdx) + ' has int8-quantized weights (inference-only). ' +
+      'Rebuild/reload without quantization to train.');
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
@@ -86337,6 +86584,33 @@ begin
   for LayerCnt := 0 to GetLastLayerIdx() do
   begin
     FLayers[LayerCnt].MakeInferenceOnly();
+  end;
+end;
+
+procedure TNNet.QuantizeWeightsInt8();
+var
+  LayerCnt: integer;
+  CurrentLayer: TNNetLayer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    CurrentLayer := FLayers[LayerCnt];
+    // EXACT class matches only: descendants such as TNNetQuaternionConv or
+    // TNNetTropicalLinear reinterpret the weight layout/forward math and
+    // must not be silently quantized through the shared storage.
+    if (CurrentLayer.ClassType = TNNetConvolution) or
+       (CurrentLayer.ClassType = TNNetConvolutionLinear) or
+       (CurrentLayer.ClassType = TNNetConvolutionReLU) or
+       (CurrentLayer.ClassType = TNNetPointwiseConv) or
+       (CurrentLayer.ClassType = TNNetPointwiseConvLinear) or
+       (CurrentLayer.ClassType = TNNetPointwiseConvReLU) or
+       (CurrentLayer.ClassType = TNNetFullConnect) or
+       (CurrentLayer.ClassType = TNNetFullConnectLinear) or
+       (CurrentLayer.ClassType = TNNetFullConnectReLU) or
+       (CurrentLayer.ClassType = TNNetFullConnectSigmoid) then
+    begin
+      TNNetLayerConcatedWeights(CurrentLayer).QuantizeWeightsInt8();
+    end;
   end;
 end;
 
