@@ -461,6 +461,8 @@ type
     procedure TestAddRWKVBlockShape;
     procedure TestAddRWKVBlockSerializationRoundTrip;
     procedure TestAddRWKVBlockGradientFlow;
+    procedure TestAddMambaBlockShape;
+    procedure TestAddMambaBlockSmokeTrain;
     procedure TestAddLinformerAttentionShape;
     procedure TestAddLinformerAttentionSerializationRoundTrip;
     procedure TestAddLinformerAttentionGradientFlow;
@@ -32384,6 +32386,95 @@ begin
     AssertTrue('RWKV block input gradient finite', not AnyNan);
     AssertTrue('RWKV block input gradient non-zero (sum=' +
       FloatToStr(GradSum) + ')', GradAbsMax > 1e-9);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddMambaBlockShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Out: TNNetLayer;
+  i: integer;
+begin
+  // The AddMambaBlock builder (pre-RMSNorm residual around the in_proj ->
+  // x|z split -> depthwise causal conv1d + SiLU -> selective scan ->
+  // SiLU(z)-gate -> out_proj mixer) must be shape-preserving over the
+  // (SeqLen,1,d_model) sequence so blocks stack. Also checks the structure:
+  // the scan leaf carries DState and the conv is the k-tap depthwise causal
+  // variant with bias.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 4));
+    NN.AddMambaBlock({pDInner=}0, {pDState=}4, {pConvKernel=}4);
+    Out := NN.AddMambaBlock({pDInner=}10, {pDState=}2, {pConvKernel=}3);
+    AssertEquals('Mamba block output SizeX', 6, Out.Output.SizeX);
+    AssertEquals('Mamba block output SizeY', 1, Out.Output.SizeY);
+    AssertEquals('Mamba block output Depth', 4, Out.Output.Depth);
+    // Structure: find the selective-scan and depthwise-conv leaves.
+    i := 0;
+    while (i < NN.CountLayers()) and
+      not (NN.Layers[i] is TNNetSelectiveSSM) do Inc(i);
+    AssertTrue('Mamba block contains TNNetSelectiveSSM', i < NN.CountLayers());
+    // First block: d_inner defaults to 2*d_model = 8; DState=4.
+    AssertEquals('Mamba scan width (d_inner default 2*d_model)',
+      8, NN.Layers[i].Output.Depth);
+    // DState=4 shows up as the per-(channel,state) A_raw tensor (8 x 4).
+    AssertEquals('Mamba scan A_raw size (d_inner*DState)',
+      32, NN.Layers[i].Neurons[4].Weights.Size);
+    i := 0;
+    while (i < NN.CountLayers()) and
+      not (NN.Layers[i] is TNNetDepthwiseConv1D) do Inc(i);
+    AssertTrue('Mamba block contains TNNetDepthwiseConv1D', i < NN.CountLayers());
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6;
+    NN.Compute(Input);
+    AssertEquals('Mamba block computed SizeX', 6, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Mamba block computed Depth', 4, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddMambaBlockSmokeTrain;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  LossBefore, LossAfter: TNeuralFloat;
+begin
+  // End-to-end smoke: a tiny sequence regression task on a stacked
+  // AddMambaBlock tower. Forward+backward must run through the split/gate
+  // two-branch wiring and training must reduce the loss.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 4);
+  Desired := TNNetVolume.Create(4, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 4));
+    NN.AddMambaBlock({pDInner=}0, {pDState=}4);
+    NN.AddMambaBlock({pDInner=}0, {pDState=}4);
+    NN.SetLearningRate(0.01, 0.0);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.3) * 0.8;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.7) * 0.4;
+
+    NN.Compute(Input);
+    AssertEquals('Mamba block smoke output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Mamba block smoke output Depth', 4, NN.GetLastLayer.Output.Depth);
+    LossBefore := NN.GetLastLayer.Output.SumDiff(Desired);
+    for i := 0 to 199 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.Compute(Input);
+    LossAfter := NN.GetLastLayer.Output.SumDiff(Desired);
+    AssertTrue('Mamba block training reduces loss (' +
+      FloatToStr(LossBefore) + ' -> ' + FloatToStr(LossAfter) + ')',
+      LossAfter < LossBefore);
   finally
     NN.Free; Input.Free; Desired.Free;
   end;

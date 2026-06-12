@@ -11899,6 +11899,25 @@ type
       // block 0 and a final ln_out after the last block - add those separately,
       // as BuildRWKVFromSafeTensors does.) Returns the final residual sum.
       function AddRWKVBlock(pFeedForwardSize: integer = 0): TNNetLayer;
+      // MAMBA block (Gu & Dao 2023, arXiv:2312.00752; the HF MambaMixer
+      // layout) over a (SeqLen,1,d_model) sequence (SizeY=1) - the selective
+      // SSM analogue of AddRWKVBlock, wrapped in a pre-RMSNorm residual:
+      //   x := x + Mixer(RMSNorm(x))
+      // Mixer wiring: (1) in_proj PointwiseConvLinear d_model->2*d_inner (no
+      // bias), split into x|z on the depth axis (TNNetSplitChannels);
+      // (2) x path: depthwise causal conv1d (TNNetDepthwiseConv1D,
+      // k=pConvKernel, WITH bias - HF use_conv_bias default) then SiLU;
+      // (3) the selective scan TNNetSelectiveSSM(pDState) - the leaf owns the
+      // delta/B/C projections internally (an importer folds HF's
+      // x_proj/dt_proj into them, see TNNetSelectiveSSM's class comment) and
+      // its e vector is the Mamba D skip; (4) gate: y (*) SiLU(z)
+      // (TNNetCellMulByCell); (5) out_proj PointwiseConvLinear back to
+      // d_model (no bias). pDInner<=0 defaults to the Mamba convention
+      // expand*d_model = 2*d_model. Shape-preserving so blocks stack; the
+      // reference net adds embeddings + a final norm_f outside the blocks.
+      // Returns the residual sum.
+      function AddMambaBlock(pDInner: integer = 0; pDState: integer = 16;
+        pConvKernel: integer = 4): TNNetLayer;
       // GATED LINEAR ATTENTION time-mixing block (Yang et al. 2023,
       // arXiv:2312.06635) over a (SeqLen,1,D) sequence (SizeY=1). Wraps the
       // TNNetGatedLinearAttention leaf (which itself owns the q/k/v/forget-gate
@@ -47731,6 +47750,39 @@ begin
   BranchInput := GetLastLayer();
   AddLayer( TNNetTokenLayerNorm.Create() );
   AddRWKVChannelMix(pFeedForwardSize);
+  Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
+function TNNet.AddMambaBlock(pDInner: integer = 0; pDState: integer = 16;
+  pConvKernel: integer = 4): TNNetLayer;
+var
+  BranchInput, XZ, Scan, ZGate, Gated: TNNetLayer;
+  d_model, d_inner: integer;
+begin
+  BranchInput := GetLastLayer();
+  if BranchInput.Output.SizeY <> 1 then
+    FErrorProc('AddMambaBlock requires a (SeqLen,1,D) input (SizeY=1). Got SizeY=' +
+      IntToStr(BranchInput.Output.SizeY));
+  d_model := BranchInput.Output.Depth;
+  if pDInner <= 0 then d_inner := 2 * d_model else d_inner := pDInner;
+  // Pre-norm residual, inlined (not AddRMSNormResidual) because the mixer adds
+  // many layers through GetLastLayer() chaining and a two-source gate.
+  AddLayer( TNNetRMSNorm.Create() );
+  // (1) in_proj to 2*d_inner (no bias), then the x|z depth split.
+  XZ := AddLayer( TNNetPointwiseConvLinear.Create(2 * d_inner, 1) );
+  // (2) x path: depthwise causal conv1d (k taps, WITH bias) + SiLU.
+  AddLayerAfter( TNNetSplitChannels.Create(0, d_inner), XZ );
+  AddLayer( TNNetDepthwiseConv1D.Create(pConvKernel, {pCausal=}true, {pSuppressBias=}0) );
+  AddLayer( TNNetSiLU.Create() );
+  // (3) Selective scan: DState states per channel; delta/B/C are the leaf's own
+  // input projections and e is the D skip connection.
+  Scan := AddLayer( TNNetSelectiveSSM.Create(pDState) );
+  // (4) z path: SiLU gate, cell-multiplied into the scan output.
+  AddLayerAfter( TNNetSplitChannels.Create(d_inner, d_inner), XZ );
+  ZGate := AddLayer( TNNetSiLU.Create() );
+  Gated := AddLayer( TNNetCellMulByCell.Create(Scan, ZGate) );
+  // (5) out_proj back to d_model (no bias) + residual sum.
+  AddLayerAfter( TNNetPointwiseConvLinear.Create(d_model, 1), Gated );
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
 end;
 
