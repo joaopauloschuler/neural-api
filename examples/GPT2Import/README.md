@@ -51,6 +51,17 @@ $ bin/x86_64-linux/bin/GPT2Import /tmp/gpt2.safetensors 64 0 464
 (~500 MB; the larger `gpt2-medium` / `gpt2-large` / `gpt2-xl` checkpoints
 work too — same tensor naming, the config is inferred from the shapes.)
 
+**Verified import targets** (logit parity vs HF transformers on real
+weights): `openai-community/gpt2` (124M, see below) and
+`distilbert/distilgpt2` (82M, 6 layers, `transformer.`-prefixed tensors)
+— both load with `BuildGPT2FromSafeTensors` unchanged. distilgpt2 measured
+2026-06: 2-layer/8192-vocab slice max |logit diff| **4.2e-5** over 98,304
+logits, argmax agrees at every position. A committed pico fixture of REAL
+distilgpt2 weights (`tests/fixtures/tiny_distilgpt2.*`, ~10 KB,
+dimension-sliced by `make_pico_gpt2_fixture.py` — 2 of 6 layers, 2 heads × 4
+dims, d_model 8, vocab 12, reference logits from `GPT2LMHeadModel` in
+float64) is asserted by `TestDistilGPT2LogitParity` in every test run.
+
 The program prints token ids only: the repo's `TNeuralTokenizer` cannot read
 HF `vocab.json`/`merges.txt` yet (byte-level BPE support is a noted
 follow-up), so decode the ids with any GPT-2 tokenizer.
@@ -84,6 +95,11 @@ For the **real pretrained weights** there is a manual end-to-end check
 against `transformers.GPT2LMHeadModel` (PyTorch), built from three tools in
 this folder:
 
+* `make_pico_gpt2_fixture.py <src.safetensors> <out_prefix>` — slices a
+  real checkpoint down EVERY dimension (layers, hidden, heads, head_dim,
+  MLP, vocab) into a ~10 KB committable parity fixture of genuine weights
+  plus float64 reference logits from `GPT2LMHeadModel` (needs
+  torch/transformers; used to pin `tests/fixtures/tiny_distilgpt2.*`).
 * `slice_gpt2.py <src> <dst> [layers] [vocab]` — slices a real checkpoint
   into a smaller-but-genuine one: keeps the first N transformer blocks and
   the first V rows of `wte` (a row-major prefix slice), drops the tied

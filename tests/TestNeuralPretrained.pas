@@ -28,6 +28,12 @@ type
     // 8-byte little-endian length); Payload is the raw data section.
     function WriteTempSafeTensors(const HeaderJson: string;
       const Payload: array of byte): string;
+    // Shared parity loop: feeds every "sequences" row of the reference
+    // logits fixture (JSON {"sequences": [[ids..]..], "logits": [[[..]]]})
+    // through NN and asserts max |logit diff| < 1e-4 (hard ceiling 1e-3 -
+    // NEVER loosen past it; fix the model instead).
+    procedure AssertLogitParityWithFixture(NN: TNNet;
+      const LogitsFileName: string; SeqLen, Vocab: integer);
   published
     procedure TestTokenLayerNormForwardAndSaveLoad;
     procedure TestLearnedPositionalEmbeddingForwardAndSaveLoad;
@@ -46,6 +52,7 @@ type
     procedure TestLlamaConfigFromJSONFile;
     procedure TestLlamaImporterFailsOnMissingTensor;
     procedure TestLlamaLogitParity;
+    procedure TestDistilGPT2LogitParity;
   end;
 
 implementation
@@ -81,6 +88,64 @@ begin
       FS.WriteBuffer(Payload[0], Length(Payload));
   finally
     FS.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.AssertLogitParityWithFixture(NN: TNNet;
+  const LogitsFileName: string; SeqLen, Vocab: integer);
+var
+  RefRoot: TJSONData;
+  Sequences, SeqArr, LogitsArr, PosArr, RowArr: TJSONArray;
+  Input, Output: TNNetVolume;
+  RefJson: TStringList;
+  SeqCnt, PosCnt, TokCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(LogitsFileName);
+    RefRoot := GetJSON(RefJson.Text);
+    Sequences := TJSONArray(TJSONObject(RefRoot).Find('sequences'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    AssertTrue('sequences present', Sequences <> nil);
+    AssertTrue('logits present', LogitsArr <> nil);
+    AssertTrue('at least 3 sequences', Sequences.Count >= 3);
+    MaxDiff := 0;
+    Input.ReSize(SeqLen, 1, 1);
+    for SeqCnt := 0 to Sequences.Count - 1 do
+    begin
+      SeqArr := TJSONArray(Sequences.Items[SeqCnt]);
+      AssertEquals('sequence length', SeqLen, SeqArr.Count);
+      for PosCnt := 0 to SeqLen - 1 do
+        Input.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+      NN.Compute(Input);
+      NN.GetOutput(Output);
+      AssertEquals('output size', SeqLen * Vocab, Output.Size);
+      PosArr := TJSONArray(LogitsArr.Items[SeqCnt]);
+      for PosCnt := 0 to SeqLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for TokCnt := 0 to Vocab - 1 do
+        begin
+          Diff := Abs(Output.FData[PosCnt * Vocab + TokCnt] -
+            RowArr.Items[TokCnt].AsFloat);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    // f32 end-to-end vs the float64 oracle on f32-rounded weights. NEVER
+    // loosen the gate past 1e-3 - if parity breaks, fix the model, don't
+    // widen the tolerance.
+    AssertTrue('logit parity vs ' + LogitsFileName + ': max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
   end;
 end;
 
@@ -854,6 +919,38 @@ begin
     Output.Free;
     Input.Free;
     RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies the distilbert/distilgpt2 import target on REAL pretrained
+// weights: tests/fixtures/tiny_distilgpt2.safetensors is a dimension-sliced
+// sub-slab of the genuine distilgpt2 checkpoint (2 of 6 layers, 2 heads x 4
+// dims, d_model 8, vocab 12, "transformer." tensor prefix - see
+// examples/GPT2Import/make_pico_gpt2_fixture.py) and the reference logits
+// come from HF transformers' GPT2LMHeadModel in float64 on the same slice.
+// The full distilgpt2 loads with BuildGPT2FromSafeTensors unchanged
+// (2026-06: 2-layer/8192-vocab real-weight slice max |logit diff| 4.2e-5
+// vs transformers; the n_head = n_embd/64 rule holds - 768 -> 12 heads).
+procedure TTestNeuralPretrained.TestDistilGPT2LogitParity;
+var
+  NN: TNNet;
+  Config: TGPT2Config;
+begin
+  RandSeed := 424242;
+  NN := BuildGPT2FromSafeTensorsEx(
+    FixturePath('tiny_distilgpt2.safetensors'), Config, {SeqLen=}0,
+    {NumHeads=}2);
+  try
+    AssertEquals('n_layer', 2, Config.NLayers);
+    AssertEquals('n_embd', 8, Config.NEmbd);
+    AssertEquals('n_ctx', 16, Config.NCtx);
+    AssertEquals('vocab', 12, Config.VocabSize);
+    AssertEquals('prefix', 'transformer.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_distilgpt2_logits.json'), Config.NCtx,
+      Config.VocabSize);
+  finally
     NN.Free;
   end;
 end;

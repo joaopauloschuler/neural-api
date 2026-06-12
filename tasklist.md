@@ -609,12 +609,19 @@ rather than acted on.
       at CPU-friendly size; feeds the same token-classification / QA /
       sentence-embedding heads as the BERT task. Parity fixture vs
       ModernBertModel hidden states.
-- [ ] distilgpt2 fixture (ZERO-code claim): 82M-param distilled GPT-2
+- [X] distilgpt2 fixture (ZERO-code claim): 82M-param distilled GPT-2
       almost certainly loads with the landed BuildGPT2FromSafeTensors
       as-is (same architecture, 6 layers). Add it to the GPT-2 parity
       fixtures to claim the smallest practical pretrained English LM and
       a natural teacher/student pair (gpt2 -> distilgpt2) for the
       knowledge-distillation task elsewhere in this list.
+      DONE 2026-06-11: confirmed ZERO-code — BuildGPT2FromSafeTensors
+      loads distilgpt2 unchanged ("transformer." prefix, n_embd/64 head
+      rule holds); 2-layer/8192-vocab real-weight slice max |logit diff|
+      4.2e-5 vs GPT2LMHeadModel. Pinned tests/fixtures/tiny_distilgpt2.*
+      (dimension-sliced sub-slab of the real checkpoint via
+      examples/GPT2Import/make_pico_gpt2_fixture.py) +
+      TestDistilGPT2LogitParity.
 - [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
       decode docs explicitly note only greedy/sampled streamed generation
