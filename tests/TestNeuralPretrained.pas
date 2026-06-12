@@ -80,6 +80,8 @@ type
     procedure TestGPTNeoXConfigFromJSONFile;
     procedure TestGPTNeoXLogitParity;
     procedure TestGPTNeoXSequentialLogitParity;
+    procedure TestGPTJConfigFromJSONFile;
+    procedure TestGPTJLogitParity;
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
@@ -1435,6 +1437,66 @@ begin
     AssertFalse('sequential residual', Config.UseParallelResidual);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gptneox_seq_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestGPTJConfigFromJSONFile;
+var
+  Config: TGPTJConfig;
+begin
+  RandSeed := 424242;
+  Config := ReadGPTJConfigFromJSONFile(
+    FixturePath('tiny_gptj_config.json'));
+  AssertEquals('n_embd', 16, Config.HiddenSize);
+  // 24, deliberately NOT 4*hidden in the fixture.
+  AssertEquals('n_inner', 24, Config.IntermediateSize);
+  AssertEquals('n_layer', 2, Config.NumLayers);
+  AssertEquals('n_head', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('n_positions', 16, Config.MaxPositions);
+  AssertEquals('layer_norm_epsilon', 1e-5, Config.LayerNormEps, 1e-9);
+  AssertEquals('rotary_dim', 4, Config.RotaryDim);
+  AssertEquals('rope_theta (GPT-J hardcodes 10000)', 10000.0,
+    Config.RopeTheta, 1e-6);
+  AssertFalse('tie_word_embeddings (GPT-J untied)',
+    Config.TieWordEmbeddings);
+  AssertTrue('activation_function gelu_new = tanh form',
+    Config.HiddenActTanh);
+end;
+
+// Verifies the GPT-J import: tests/fixtures/tiny_gptj.* is a pico
+// randomly-initialized HF GPTJForCausalLM (2 layers, 2 heads x 8 dims,
+// hidden 16, n_inner 24 deliberately != 4*hidden, vocab 11) covering the
+// GPT-J quirks: SHARED-LN parallel residual (ONE ln_1 feeds both branches,
+// x + Attn(LN(x)) + MLP(LN(x))), PARTIAL rotary with the INTERLEAVED
+// GPT-J pair layout (rotary_dim=4 of head_dim 8, rows loaded STRAIGHT -
+// no rotate_half permutation; the generator tools/gptj_tiny_fixture.py
+// asserts rotary_dim 2 and 8 would both change the logits), SEPARATE
+// bias-free q/k/v + out_proj projections, gelu_new and the UNTIED
+// lm_head WITH bias. Reference logits come from HF transformers in
+// float64.
+procedure TTestNeuralPretrained.TestGPTJLogitParity;
+var
+  NN: TNNet;
+  Config: TGPTJConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildGPTJFromSafeTensorsEx(
+    FixturePath('tiny_gptj.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gptj_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertEquals('rotary_dim', 4, Config.RotaryDim);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'transformer.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gptj_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;

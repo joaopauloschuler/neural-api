@@ -448,7 +448,7 @@ rather than acted on.
       sliced parity fixture. The cheapest credible answer to "import a
       trained GPT-3-class model"; doc cross-link target for
       ../gpt-3-for-pascal.
-- [ ] GPT-J importer — the gptj sibling of the landed gpt_neox path:
+- [X] GPT-J importer — the gptj sibling of the landed gpt_neox path:
       SHARED-LN parallel residual (AddParallelTransformerBlock's default
       form, already landed), FULL-but-partial rotary (rotary_dim=64 of
       head_dim 256 for GPT-J-6B) with the INTERLEAVED (GPT-J) RoPE pair

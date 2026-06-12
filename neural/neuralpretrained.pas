@@ -19,6 +19,10 @@ unit neuralpretrained;
 //     two-LN residual + PARTIAL rotary + fused per-head-interleaved
 //     query_key_value + untied embed_in/embed_out) -
 //     BuildGPTNeoXFromSafeTensors. See the GPT-NEOX IMPORT section below.
+//   - GPT-J (EleutherAI's GPT-J-6B; SHARED-LN parallel residual +
+//     partial INTERLEAVED rotary + separate bias-free q/k/v + untied
+//     lm_head WITH bias) - BuildGPTJFromSafeTensors. See the GPT-J
+//     IMPORT section below.
 //   - BERT (vanilla encoder family, model_type "bert": bert-base/tiny,
 //     sentence-transformers MiniLM, ...) - BuildBertFromSafeTensors.
 //     The FIRST ENCODER here: outputs hidden states, not logits. See the
@@ -196,6 +200,37 @@ unit neuralpretrained;
 // Embeddings are UNTIED by default (embed_in / embed_out are separate
 // tensors; tie_word_embeddings=false in every Pythia config); a tied
 // config copies embed_in like the GPT-2 path. final_layer_norm caps the
+// stack. Positions come ONLY from RoPE (no wpe table).
+//
+// ============================ GPT-J IMPORT =================================
+// BuildGPTJFromSafeTensors rebuilds EleutherAI's GPT-J decoder (model_type
+// "gptj", the architecture of GPT-J-6B). Two ingredients distinguish it
+// from the GPT-NeoX path above:
+//
+// 1. SHARED-LN parallel residual: ONE LayerNorm (ln_1) feeds BOTH branches,
+//      x := x + Attn(LN(x)) + MLP(LN(x))
+//    - structurally GPT-NeoX's parallel form with LN_2 = LN_1, so the MLP
+//    branch simply reads the SAME TNNetTokenLayerNorm output the attention
+//    branch does (no sequential variant: GPT-J is always parallel).
+//
+// 2. PARTIAL rotary with the INTERLEAVED (GPT-J) pair layout: only the
+//    FIRST rotary_dim channels of each Q/K head get RoPE (64 of head_dim
+//    256 for GPT-J-6B), wired per head as the same SplitChannels ->
+//    TNNetRotaryEmbedding -> re-concat split the GPT-NeoX path uses. But
+//    GPT-J pairs channels (0,1),(2,3),... - rotate_every_two, exactly
+//    TNNetRotaryEmbedding's native even/odd layout - so unlike
+//    gpt_neox/llama there is NO rotate_half row permutation at weight-load
+//    time: q_proj/k_proj rows load STRAIGHT. (The frequency schedule
+//    matches HF: pair (2k, 2k+1) rotates at base^(-2k/rotary_dim), which
+//    the layer derives from its input depth = rotary_dim.)
+//
+// Attention has SEPARATE bias-free q/k/v projections plus a bias-free
+// out_proj (plain nn.Linear [out, in], head h = rows h*head_dim..); the
+// MLP linears (mlp.fc_in / fc_out) carry biases. Attention is standard
+// scaled (1/sqrt(head_dim)). activation_function is "gelu_new" (the tanh
+// TNNetGELU) in every GPT-J config; the exact erf "gelu" composition is
+// also wired. The LM head is UNTIED and - uniquely among the decoders
+// here - carries a BIAS (lm_head.weight + lm_head.bias). ln_f caps the
 // stack. Positions come ONLY from RoPE (no wpe table).
 //
 // ============================ BERT IMPORT ==================================
@@ -511,6 +546,55 @@ function BuildGPTNeoXFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
 type
+  TGPTJConfig = record
+    HiddenSize: integer;        // d_model (n_embd)
+    IntermediateSize: integer;  // MLP width (n_inner; null = 4*n_embd)
+    NumLayers: integer;         // decoder blocks (n_layer)
+    NumHeads: integer;          // attention heads (n_head)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // n_positions (context length)
+    LayerNormEps: TNeuralFloat; // layer_norm_epsilon
+    RotaryDim: integer;         // rotary_dim (64 of head_dim 256 for 6B)
+    RopeTheta: TNeuralFloat;    // RoPE base (GPT-J hardcodes 10000)
+    TieWordEmbeddings: boolean; // tie_word_embeddings (GPT-J: FALSE)
+    HiddenActTanh: boolean;     // true = gelu_new/gelu_pytorch_tanh (the
+                                // GPT-J default); false = exact erf "gelu"
+    Prefix: string;             // tensor-name prefix ('transformer.' or '')
+  end;
+
+// Reads a HF GPT-J config.json (model_type 'gptj'). Required: n_embd,
+// n_layer, n_head, vocab_size, n_positions. Defaults: n_inner = null ->
+// 4*n_embd (the GPT-J-6B case), rotary_dim = 64 (the HF GPTJConfig
+// default), layer_norm_epsilon = 1e-5, tie_word_embeddings = false,
+// activation_function = 'gelu_new' (the tanh approximation, GPT-J's
+// default; 'gelu' selects the exact erf form, anything else is rejected).
+// Prefix is left '' - the builder detects it.
+function ReadGPTJConfigFromJSONFile(const FileName: string): TGPTJConfig;
+
+function GPTJConfigToString(const Config: TGPTJConfig): string;
+
+// Builds a TNNet with the GPT-J architecture described by the config and
+// loads every weight from the safetensors checkpoint at FileName (see the
+// GPT-J IMPORT section of the unit header). The net takes a (SeqLen,1,1)
+// volume of token ids and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses
+// the full n_positions context. pInferenceOnly = True frees training
+// volumes during construction (Compute()-only afterwards).
+// Config.Prefix is detected from the checkpoint and written back.
+function BuildGPTJFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGPTJConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildGPTJFromSafeTensorsEx(const FileName: string;
+  out Config: TGPTJConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildGPTJFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+type
   // The encoder families sharing the BERT skeleton (selected by
   // config.json's model_type; see the BERT IMPORT section of the header).
   TBertFamily = (bfBert, bfDistilBert, bfRoberta);
@@ -638,8 +722,8 @@ procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, gpt_neox, llama, mistral, qwen2, bert, distilbert, roberta.
-// Anything else
+// gpt_neo, gpt_neox, gptj, llama, mistral, qwen2, bert, distilbert,
+// roberta. Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
 // choice. OUTPUT SEMANTICS DIFFER BY model_type: the decoder families
@@ -2534,6 +2618,443 @@ begin
     pInferenceOnly);
 end;
 
+// ============================ GPT-J IMPORT =================================
+
+function ReadGPTJConfigFromJSONFile(const FileName: string): TGPTJConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+  Field: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('GPT-J import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('GPT-J import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('GPT-J import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('GPT-J import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('GPT-J import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'gptj');
+    if ModelType <> 'gptj' then
+      ImportError('GPT-J import: config model_type is "' + ModelType +
+        '" - expected "gptj" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.HiddenSize := RequiredInt('n_embd');
+    Result.NumLayers := RequiredInt('n_layer');
+    Result.NumHeads := RequiredInt('n_head');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('n_positions');
+    // n_inner is null in the GPT-J-6B config: the HF default 4*n_embd
+    // applies (GPTJMLP: inner_dim = n_inner if n_inner is not None else
+    // 4 * n_embd).
+    Field := Obj.Find('n_inner');
+    if (Field = nil) or Field.IsNull then
+      Result.IntermediateSize := 4 * Result.HiddenSize
+    else
+      Result.IntermediateSize := RequiredInt('n_inner');
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    // rotary_dim defaults to 64 in HF's GPTJConfig (the GPT-J-6B value).
+    Result.RotaryDim := Obj.Get('rotary_dim', 64);
+    if Result.RotaryDim <= 0 then
+      ImportError('GPT-J import: config rotary_dim must be a positive ' +
+        'integer, got ' + Obj.Find('rotary_dim').AsJSON + '.');
+    // GPT-J predates configurable RoPE bases: modeling_gptj hardcodes
+    // 10000. Read rope_theta anyway so a hypothetical override works.
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    HiddenAct := Obj.Get('activation_function', 'gelu_new');
+    if HiddenAct = 'gelu' then
+      Result.HiddenActTanh := False // exact erf form
+    else if (HiddenAct = 'gelu_new') or
+            (HiddenAct = 'gelu_pytorch_tanh') then
+      Result.HiddenActTanh := True // the GPT-J default
+    else
+      ImportError('GPT-J import: config activation_function "' + HiddenAct +
+        '" is not supported - only "gelu" (exact), "gelu_new" and ' +
+        '"gelu_pytorch_tanh" are wired here.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function GPTJConfigToString(const Config: TGPTJConfig): string;
+begin
+  Result := 'gptj config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', rotary_dim=' + IntToStr(Config.RotaryDim) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.HiddenActTanh then
+    Result := Result + ', act=gelu_tanh'
+  else
+    Result := Result + ', act=gelu_exact';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TGPTJBlockLayers = record
+    LN1, QProj, KProj, VProj, OutProj, FcIn, FcOut: TNNetLayer;
+  end;
+
+function BuildGPTJFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGPTJConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TGPTJBlockLayers;
+  EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
+  BranchInput, SharedLN, AttnOut, MlpOut: TNNetLayer;
+  RotSlice, PassSlice, QHead, KHead, VHead, HeadPack: TNNetLayer;
+  GELUSource, PhiBranch: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  RotChannels, PassChannels, VChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, HeadDim, i, d: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // x*Phi(x), the exact erf GELU, composed from existing layers exactly
+  // like the BERT path (see the BERT IMPORT section of the unit header).
+  // GPT-J configs use gelu_new (the tanh TNNetGELU) in practice.
+  procedure AddExactOrTanhGELU;
+  begin
+    if Config.HiddenActTanh then
+      NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
+    else
+    begin
+      GELUSource := NN.GetLastLayer();
+      NN.AddLayerAfter(
+        TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
+      NN.AddLayer( TNNetErf.Create() );
+      NN.AddLayer( TNNetAddConstant.Create(1.0) );
+      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
+      NN.AddLayer( TNNetReGLU.Create() );
+    end;
+  end;
+
+begin
+  Reader := TNNetSafeTensorsReader.Create(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('GPT-J import: n_head must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('GPT-J import: n_embd=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'n_head=' + IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if (Config.RotaryDim < 2) or Odd(Config.RotaryDim) or
+         (Config.RotaryDim > HeadDim) then
+        ImportError('GPT-J import: rotary_dim = ' +
+          IntToStr(Config.RotaryDim) + ' must be an even number in ' +
+          '[2, head_dim=' + IntToStr(HeadDim) + '] (RoPE rotates ' +
+          'channel pairs).');
+      if Config.TieWordEmbeddings then
+        ImportError('GPT-J import: tie_word_embeddings=true is not ' +
+          'supported - GPT-J carries an UNTIED lm_head with its own ' +
+          'bias (every published GPT-J config is untied).');
+      if Reader.HasTensor('transformer.wte.weight') then
+        Config.Prefix := 'transformer.'
+      else if Reader.HasTensor('wte.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('GPT-J import: neither "transformer.wte.weight" ' +
+          'nor "wte.weight" found in ' + Reader.FileName +
+          ' - not a GPT-J checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'wte.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'wte.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'wte.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('GPT-J import: wte.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'wte.weight'));
+      // lm_head sits OUTSIDE the transformer. prefix in GPTJForCausalLM
+      // exports (like embed_out in the GPT-NeoX path) and has a BIAS.
+      if not Reader.HasTensor('lm_head.weight') then
+        ImportError('GPT-J import: "lm_head.weight" is missing from ' +
+          Reader.FileName + ' - a bare GPTJModel export carries no LM ' +
+          'head.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('GPT-J import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds n_positions=' + IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real BPE token, not padding.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(RotChannels, Config.RotaryDim);
+      SetLength(PassChannels, HeadDim - Config.RotaryDim);
+      SetLength(VChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // SHARED-LN PARALLEL residual: ONE LayerNorm (ln_1) feeds BOTH the
+        // attention and the MLP branch; one fused 3-input sum closes the
+        // block:  x := x + Attn(LN(x)) + MLP(LN(x))
+        BranchInput := NN.GetLastLayer();
+        SharedLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].LN1 := SharedLN;
+        // SEPARATE bias-free q/k/v projections (plain nn.Linear), all
+        // reading the shared LN output.
+        Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+        Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), SharedLN);
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          // PARTIAL ROTARY per head: RoPE on the first rotary_dim channels
+          // of the Q and K head, pass-through on the rest. GPT-J pairs the
+          // rotary channels INTERLEAVED - (0,1),(2,3),... - which is
+          // TNNetRotaryEmbedding's native layout, so the projection rows
+          // were loaded STRAIGHT (no rotate_half permutation; see the
+          // unit header). The rotary slice feeds a depth-rotary_dim
+          // TNNetRotaryEmbedding, so the layer's frequency schedule
+          // theta^(-2k/rotary_dim) matches HF's inv_freq exactly.
+          for d := 0 to Config.RotaryDim - 1 do
+            RotChannels[d] := HeadCnt * HeadDim + d;
+          for d := 0 to HeadDim - Config.RotaryDim - 1 do
+            PassChannels[d] := HeadCnt * HeadDim + Config.RotaryDim + d;
+          RotSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(RotChannels),
+            Blocks[BlockCnt].QProj);
+          RotSlice := NN.AddLayerAfter(
+            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+          if HeadDim > Config.RotaryDim then
+          begin
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels),
+              Blocks[BlockCnt].QProj);
+            QHead := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+            QHead := RotSlice;
+          RotSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(RotChannels),
+            Blocks[BlockCnt].KProj);
+          RotSlice := NN.AddLayerAfter(
+            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+          if HeadDim > Config.RotaryDim then
+          begin
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels),
+              Blocks[BlockCnt].KProj);
+            KHead := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+            KHead := RotSlice;
+          // V head (one contiguous head_dim-wide slice; never rotated).
+          for d := 0 to HeadDim - 1 do
+            VChannels[d] := HeadCnt * HeadDim + d;
+          VHead := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(VChannels), Blocks[BlockCnt].VProj);
+          // Pack [Q_h | K_h | V_h] (width 3*head_dim) for the scaled SDPA
+          // (GPT-J uses the standard 1/sqrt(head_dim) scaling).
+          HeadPack := NN.AddLayer(
+            TNNetDeepConcat.Create([QHead, KHead, VHead]) );
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim,
+              {CausalMask=}true), HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].OutProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        AttnOut := NN.GetLastLayer();
+        // MLP branch: reads the SAME shared LN output (NOT a second norm,
+        // NOT the attention output - GPT-J is always parallel).
+        Blocks[BlockCnt].FcIn := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize),
+          SharedLN);
+        AddExactOrTanhGELU;
+        Blocks[BlockCnt].FcOut := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        MlpOut := NN.GetLastLayer();
+        NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        // wte -> embedding table (vocab rows of d floats).
+        Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('GPT-J import: wte.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'wte.weight');
+      finally
+        Tmp.Free;
+      end;
+      // UNTIED head with a BIAS (unique among the decoder importers).
+      LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+        Config.HiddenSize, Config.VocabSize, 0, -1, 0, 'lm_head.bias');
+      MarkConsumed('lm_head.weight');
+      MarkConsumed('lm_head.bias');
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'attn.';
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN1,
+          BlockPrefix + 'ln_1.weight',
+          BlockPrefix + 'ln_1.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'ln_1.weight');
+        MarkConsumed(BlockPrefix + 'ln_1.bias');
+        // Bias-free q/k/v, rows loaded STRAIGHT (RotaryHeadDim=0: GPT-J's
+        // interleaved RoPE pairing is already the layer's layout).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+          AttnPrefix + 'q_proj.weight', Config.HiddenSize,
+          Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'q_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+          AttnPrefix + 'k_proj.weight', Config.HiddenSize,
+          Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'k_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+          AttnPrefix + 'v_proj.weight', Config.HiddenSize,
+          Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'v_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutProj,
+          AttnPrefix + 'out_proj.weight', Config.HiddenSize,
+          Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'out_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].FcIn,
+          BlockPrefix + 'mlp.fc_in.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'mlp.fc_in.bias');
+        MarkConsumed(BlockPrefix + 'mlp.fc_in.weight');
+        MarkConsumed(BlockPrefix + 'mlp.fc_in.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].FcOut,
+          BlockPrefix + 'mlp.fc_out.weight', Config.IntermediateSize,
+          Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'mlp.fc_out.bias');
+        MarkConsumed(BlockPrefix + 'mlp.fc_out.weight');
+        MarkConsumed(BlockPrefix + 'mlp.fc_out.bias');
+      end;
+      LoadLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'ln_f.weight',
+        Config.Prefix + 'ln_f.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'ln_f.weight');
+      MarkConsumed(Config.Prefix + 'ln_f.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      // Every tensor must be consumed or be a known ignorable buffer:
+      //  - h.N.attn.bias / .masked_bias: the causal-mask buffers older
+      //    PyTorch exports serialize (the mask is structural here);
+      //  - attn.embed_positions: the sinusoidal RoPE table some
+      //    transformers versions persist (structural, rebuilt from
+      //    rotary_dim + the base).
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if (Pos('.attn.bias', TensorNameStr) > 0) or
+           (Pos('.attn.masked_bias', TensorNameStr) > 0) or
+           (Pos('.attn.embed_positions', TensorNameStr) > 0) then continue;
+        ImportError('GPT-J import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildGPTJFromSafeTensorsEx(const FileName: string;
+  out Config: TGPTJConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadGPTJConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildGPTJFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildGPTJFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TGPTJConfig;
+begin
+  Result := BuildGPTJFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly);
+end;
+
 // ============================ BERT IMPORT ==================================
 
 function ReadBertConfigFromJSONFile(const FileName: string): TBertConfig;
@@ -3208,6 +3729,7 @@ var
   IgnoredLlamaConfig: TLlamaConfig;
   IgnoredGPTNeoConfig: TGPTNeoConfig;
   IgnoredGPTNeoXConfig: TGPTNeoXConfig;
+  IgnoredGPTJConfig: TGPTJConfig;
   IgnoredBertConfig: TBertConfig;
 begin
   // ---- resolve the weights file and the config.json ----
@@ -3267,6 +3789,9 @@ begin
   else if ModelType = 'gpt_neox' then
     Result := BuildGPTNeoXFromSafeTensorsEx(WeightsPath, IgnoredGPTNeoXConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
+  else if ModelType = 'gptj' then
+    Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
+      pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') then
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
@@ -3285,8 +3810,8 @@ begin
     Result := nil;
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
-      'model_types: gpt2, gpt_neo, gpt_neox, llama, mistral, qwen2, ' +
-      'bert, distilbert, roberta.');
+      'model_types: gpt2, gpt_neo, gpt_neox, gptj, llama, mistral, ' +
+      'qwen2, bert, distilbert, roberta.');
   end;
 end;
 
