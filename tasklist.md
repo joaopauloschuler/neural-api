@@ -133,7 +133,7 @@ rather than acted on.
       hand-written splitter variant when those checkpoint families become
       importable. Test: per-pattern parity fixtures like
       tools/hf_pretok_fixture.py.
-- [ ] Logits-processor chain + generation config in neural/neuraldecode.pas
+- [X] Logits-processor chain + generation config in neural/neuraldecode.pas
       (the remaining half of the transformers GenerationMixin port):
       top-k/top-p/min-p sampling, repetition/frequency/presence penalties
       (TNNetTokenHistoryPenalty) and stop sequences/strings are all landed —

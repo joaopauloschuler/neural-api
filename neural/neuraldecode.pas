@@ -92,6 +92,37 @@ Ready-made constraints:
     (no-separator) vocabularies: token strings are validated as-is, with no
     separator inserted between tokens.
 
+LOGITS-PROCESSOR CHAIN + GENERATION CONFIG. The penalties / temperature /
+constraints above also compose through TNNetLogitsProcessor, a chainable
+per-step distribution transform (the transformers GenerationMixin
+"logits processor" idea):
+  - DOMAIN CONVENTION: on the causal-LM streamed paths the model ends in a
+    SoftMax, so processors receive the POST-SOFTMAX PROBABILITY row, not raw
+    logits. Every shipped processor implements the probability-domain image
+    of its logit rule (documented per class), and ExpectsProbabilities()
+    makes the domain explicit: the streamed loop refuses a processor that
+    declares a raw-logit domain instead of silently misapplying it.
+  - TNNetTemperatureProcessor is the temperature knob (probability-domain
+    image of logits/T: p^(1/T) renormalized, computed stably in log space).
+    Temperature is clamped to >= csDecodeMinTemperature and Temperature -> 0
+    degenerates to greedy argmax - the same convention as
+    DecodeSeq2SeqSampled. Convenience GenerateTokensStreamed /
+    GenerateStringStreamed overloads take a Temperature argument directly.
+  - TNNetPenaltyProcessor / TNNetConstraintProcessor are thin adapters over
+    the existing TNNetTokenHistoryPenalty / TNNetTokenConstraint (which keep
+    their public interfaces unchanged).
+  - TNNetLogitsProcessorChain runs processors IN ORDER (it is itself a
+    processor, so chains nest). The pre-existing penalty/constraint overloads
+    now delegate through adapter chains built in the historical order
+    (penalty, then constraint), keeping them bit-for-bit unchanged.
+  - TGenerationConfig bundles sampler + temperature + penalties + constraint
+    + extra processors + stopping criteria (EOS-id list, stop sequences /
+    strings, max new tokens) into one record consumed by
+    GenerateTokensWithConfig / GenerateStringWithConfig. The implied pipeline
+    order is: penalty -> temperature -> extra processors -> constraint ->
+    sampler (the constraint runs LAST so its structural guarantees - e.g.
+    JSON validity - cannot be broken by a later transform).
+
 Coded by Claude (AI).
 *)
 
@@ -306,6 +337,154 @@ type
       property Machine: TNNetJSONStateMachine read FMachine;
   end;
 
+  { TNNetLogitsProcessor }
+  // Chainable next-token distribution transform - the GenerationMixin-style
+  // "logits processor" abstraction. The generation loop calls
+  // Reset(PromptTokens) once, then per step ProcessRow(Row) on the next-token
+  // distribution BEFORE the sampler/argmax reads it, and Commit(Token) after
+  // each emitted token so stateful processors advance.
+  // DOMAIN CONVENTION: the causal-LM streamed loop works on POST-SOFTMAX
+  // PROBABILITIES (the model ends in a SoftMax), so ProcessRow receives a
+  // probability row and must leave it a valid distribution (or untouched).
+  // ExpectsProbabilities() (default True) declares the domain explicitly; a
+  // future raw-logit processor returns False there and the streamed loop
+  // rejects it with EArgumentException instead of misapplying it.
+  // Coded by Claude (AI).
+  TNNetLogitsProcessor = class(TObject)
+    public
+      // True (default) = ProcessRow expects a POST-SOFTMAX probability row;
+      // False = raw logits (not accepted by the streamed loop).
+      function ExpectsProbabilities(): boolean; virtual;
+      // Called once at the start of generation with the prompt token ids.
+      // Default: no-op.
+      procedure Reset(const PromptTokens: array of integer); virtual;
+      // Transforms the next-token distribution in place. Element index =
+      // token id, as everywhere in the decoder.
+      procedure ProcessRow(Row: TNNetVolume); virtual; abstract;
+      // Advances processor state after a token was emitted. Default: no-op.
+      procedure Commit(TokenId: integer); virtual;
+  end;
+
+  { TNNetTemperatureProcessor }
+  // TEMPERATURE in the probability domain: the exact image of dividing the
+  // logits by T before the softmax is p := p^(1/T) renormalized; computed
+  // stably in log space as exp((ln p - ln max_p)/T) / sum. Temperature = 1.0
+  // is a bit-for-bit no-op; Temperature is clamped to >=
+  // csDecodeMinTemperature, so Temperature -> 0 concentrates all mass on the
+  // argmax (greedy degeneration - the DecodeSeq2SeqSampled convention).
+  // An all-zero row is left untouched (defensive, mirroring MaskAllowed).
+  // Coded by Claude (AI).
+  TNNetTemperatureProcessor = class(TNNetLogitsProcessor)
+    private
+      FTemperature: TNeuralFloat;
+    public
+      constructor Create(Temperature: TNeuralFloat);
+      procedure ProcessRow(Row: TNNetVolume); override;
+      property Temperature: TNeuralFloat read FTemperature write FTemperature;
+  end;
+
+  { TNNetPenaltyProcessor }
+  // Thin adapter exposing an existing TNNetTokenHistoryPenalty as a chain
+  // processor: Reset clears the history and registers the prompt tokens (the
+  // whole context is penalized - the historical convention of the streamed
+  // loop), ProcessRow applies the probability-domain rule
+  // (ApplyToProbabilities) and Commit registers the emitted token. The
+  // wrapped penalty keeps its public interface; it is freed with the adapter
+  // only when OwnsPenalty is True.
+  // Coded by Claude (AI).
+  TNNetPenaltyProcessor = class(TNNetLogitsProcessor)
+    private
+      FPenalty: TNNetTokenHistoryPenalty;
+      FOwnsPenalty: boolean;
+    public
+      constructor Create(pPenalty: TNNetTokenHistoryPenalty;
+        pOwnsPenalty: boolean = false);
+      destructor Destroy(); override;
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      property Penalty: TNNetTokenHistoryPenalty read FPenalty;
+  end;
+
+  { TNNetConstraintProcessor }
+  // Thin adapter exposing an existing TNNetTokenConstraint as a chain
+  // processor: Reset/ProcessRow(=MaskAllowed)/Commit forward 1:1 to the
+  // constraint's own Reset/MaskAllowed/Commit (including the zero-mass
+  // fallback policy). The wrapped constraint keeps its public interface; it
+  // is freed with the adapter only when OwnsConstraint is True.
+  // Coded by Claude (AI).
+  TNNetConstraintProcessor = class(TNNetLogitsProcessor)
+    private
+      FConstraint: TNNetTokenConstraint;
+      FOwnsConstraint: boolean;
+    public
+      constructor Create(pConstraint: TNNetTokenConstraint;
+        pOwnsConstraint: boolean = false);
+      destructor Destroy(); override;
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      property Constraint: TNNetTokenConstraint read FConstraint;
+  end;
+
+  { TNNetLogitsProcessorChain }
+  // Ordered chain of processors; Reset/ProcessRow/Commit forward to every
+  // item IN INSERTION ORDER (order matters: e.g. penalty-then-temperature
+  // sharpens the penalized distribution, temperature-then-penalty penalizes
+  // the sharpened one). The chain is itself a TNNetLogitsProcessor, so chains
+  // nest. Add returns the chain for fluent building; items added with
+  // OwnsProcessor=True are freed with the chain. ExpectsProbabilities is True
+  // only when EVERY item agrees (an empty chain is a no-op and returns True).
+  // Coded by Claude (AI).
+  TNNetLogitsProcessorChain = class(TNNetLogitsProcessor)
+    private
+      FItems: array of TNNetLogitsProcessor;
+      FOwned: array of boolean;
+      function GetCount(): integer;
+      function GetItem(Index: integer): TNNetLogitsProcessor;
+    public
+      destructor Destroy(); override;
+      function Add(P: TNNetLogitsProcessor;
+        OwnsProcessor: boolean = false): TNNetLogitsProcessorChain;
+      function ExpectsProbabilities(): boolean; override;
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      property Count: integer read GetCount;
+      property Items[Index: integer]: TNNetLogitsProcessor read GetItem; default;
+  end;
+
+  { TGenerationConfig }
+  // One-record bundle of generation knobs - the GenerationConfig counterpart
+  // of the parameter piles on the GenerateTokensStreamed overloads, consumed
+  // by GenerateTokensWithConfig / GenerateStringWithConfig. Build it with
+  // DefaultGenerationConfig (every knob "off") and set what you need. NONE of
+  // the referenced objects are owned by the record - the caller frees them.
+  // The implied per-step pipeline is:
+  //   Penalty -> Temperature -> Processors (extra, in order) -> Constraint
+  //   -> Sampler
+  // (the constraint runs LAST so its structural guarantees cannot be broken
+  // by a later transform). Every field at its default reproduces the plain
+  // GenerateTokensStreamed/GenerateStringStreamed paths bit-for-bit.
+  // Coded by Claude (AI).
+  TGenerationConfig = record
+    // Stopping criteria.
+    MaxNewTokens: integer;   // cap on generated tokens
+    MaxTotalLen: integer;    // prompt+generated ceiling; 0 = prompt+MaxNewTokens
+    // Token ids that terminate generation (the emitted EOS is stored and
+    // counted, as everywhere). EMPTY = the codebase default "token < 2" rule.
+    EOSTokens: TNeuralIntegerArray;
+    StopSequences: TNNetTokenSequences; // matched in the generated region
+    StopStrings: array of string;       // string paths only; tokenized + scanned
+    // Distribution pipeline (see order above). Temperature 1.0 = off.
+    Temperature: TNeuralFloat;
+    Penalty: TNNetTokenHistoryPenalty;     // nil = off (not owned)
+    Processors: TNNetLogitsProcessorChain; // nil = none (not owned)
+    Constraint: TNNetTokenConstraint;      // nil = off (not owned)
+    // Sampler reading the processed probability row; nil = greedy argmax.
+    Sampler: TNNetSamplerBase;             // not owned
+  end;
+
   // TNNetStreamingDecoder: a reusable incremental-decode "streaming session"
   // over a causal next-token net, replacing the hand-rolled step-net plumbing
   // every streaming example repeats (build a short-width twin, CopyWeights,
@@ -402,6 +581,10 @@ type
 
 const
   csDecodeEOSToken = 1; // chr(1), the codebase end-of-sequence marker.
+  // Temperature clamp shared by every temperature-taking decode path
+  // (DecodeSeq2SeqSampled and TNNetTemperatureProcessor): Temperature -> 0
+  // degenerates to greedy argmax instead of dividing by zero.
+  csDecodeMinTemperature = 1e-6;
 
 // Wu et al. 2016 length-penalty denominator ((5+L)/6)^alpha. With alpha=0 this
 // is exactly 1.0 (no penalty -> raw sum-log-prob ranking, short-biased).
@@ -574,6 +757,87 @@ function GenerateStringStreamed(Session: TNNetStreamingDecoder;
   oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
   const StopStrings: array of string;
   Constraint: TNNetTokenConstraint): string; overload;
+
+// GenerateTokensStreamed with a TEMPERATURE knob - the causal-LM counterpart
+// of DecodeSeq2SeqSampled's Temperature argument, with the same clamp
+// (>= csDecodeMinTemperature) and the same Temperature -> 0 greedy
+// degeneration. The streamed row holds POST-SOFTMAX probabilities, so the
+// temperature is applied in the probability domain (p^(1/T), renormalized -
+// the exact image of dividing the logits by T; see
+// TNNetTemperatureProcessor). Pipeline order: Penalty -> Temperature ->
+// Constraint -> Sampler. Temperature = 1.0 is bit-for-bit the overload above.
+function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase;
+  Penalty: TNNetTokenHistoryPenalty;
+  const StopSequences: TNNetTokenSequences;
+  Constraint: TNNetTokenConstraint;
+  Temperature: TNeuralFloat): integer; overload;
+
+// GenerateStringStreamed with a TEMPERATURE knob: forwards Temperature to the
+// token core (see the GenerateTokensStreamed temperature overload).
+// Temperature = 1.0 is bit-for-bit the overload above.
+function GenerateStringStreamed(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
+  const StopStrings: array of string;
+  Constraint: TNNetTokenConstraint;
+  Temperature: TNeuralFloat): string; overload;
+
+// THE CHAIN-DRIVEN STREAMED CORE every GenerateTokensStreamed overload above
+// delegates to (so a nil/empty chain is bit-for-bit the plain path by
+// construction). Processors (may be nil; pass a TNNetLogitsProcessorChain
+// for several) transforms each step's POST-SOFTMAX probability row IN ORDER
+// before the sampler/argmax reads it; it must declare ExpectsProbabilities
+// (EArgumentException otherwise). Reset(prompt) is called once and
+// Commit(token) after every emitted token. EOSTokens lists the terminating
+// token ids; EMPTY = the codebase default "token < 2" rule (the emitted EOS
+// is stored and counted either way). Other arguments as in the overloads
+// above.
+// Coded by Claude (AI).
+function GenerateTokensStreamedWithProcessors(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase;
+  Processors: TNNetLogitsProcessor;
+  const StopSequences: TNNetTokenSequences;
+  const EOSTokens: TNeuralIntegerArray): integer;
+
+// STRING-LEVEL chain-driven core (the GenerateStringStreamed counterpart of
+// GenerateTokensStreamedWithProcessors, and the core every string overload
+// delegates to). StopStrings are tokenized for early termination plus the
+// string-level truncation safety net; ExtraStopSequences (may be nil) are
+// token-id stop sequences appended to the tokenized stop strings; EOSTokens
+// as in the token core (also bounds the displayed continuation).
+// Coded by Claude (AI).
+function GenerateStringStreamedWithProcessors(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase; Processors: TNNetLogitsProcessor;
+  const StopStrings: array of string;
+  const ExtraStopSequences: TNNetTokenSequences;
+  const EOSTokens: TNeuralIntegerArray): string;
+
+// A TGenerationConfig with every knob OFF: greedy (nil sampler),
+// Temperature 1.0, no penalties/processors/constraint, no stop
+// sequences/strings, default EOS rule, MaxTotalLen 0 (= prompt +
+// MaxNewTokens). Driving generation with this config reproduces the plain
+// GenerateTokensStreamed/GenerateStringStreamed paths bit-for-bit.
+function DefaultGenerationConfig(MaxNewTokens: integer;
+  MaxTotalLen: integer = 0): TGenerationConfig;
+
+// CONFIG-DRIVEN GENERATION: assembles the pipeline described in
+// TGenerationConfig (Penalty -> Temperature -> Processors -> Constraint ->
+// Sampler) and runs the chain-driven streamed core. Equivalent to the
+// hand-assembled GenerateTokensStreamed calls; see TGenerationConfig for
+// ownership and defaults.
+function GenerateTokensWithConfig(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen: integer;
+  const Config: TGenerationConfig): integer;
+
+// String-level config-driven generation (uses Config.StopStrings AND
+// Config.StopSequences; otherwise as GenerateTokensWithConfig).
+function GenerateStringWithConfig(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string;
+  const Config: TGenerationConfig): string;
 
 // ---------------------------------------------------------------------------
 // SEQ2SEQ (ENCODER-DECODER) GENERATION: the T5/BART-style counterpart of the
@@ -1196,6 +1460,200 @@ begin
   FMachine.FeedString(FTokenStr[TokenId]);
 end;
 
+{ TNNetLogitsProcessor }
+
+function TNNetLogitsProcessor.ExpectsProbabilities(): boolean;
+begin
+  Result := true;
+end;
+
+procedure TNNetLogitsProcessor.Reset(const PromptTokens: array of integer);
+begin
+  // Default: stateless processor, nothing to rewind.
+end;
+
+procedure TNNetLogitsProcessor.Commit(TokenId: integer);
+begin
+  // Default: stateless processor, nothing to advance.
+end;
+
+{ TNNetTemperatureProcessor }
+
+constructor TNNetTemperatureProcessor.Create(Temperature: TNeuralFloat);
+begin
+  inherited Create();
+  FTemperature := Temperature;
+end;
+
+procedure TNNetTemperatureProcessor.ProcessRow(Row: TNNetVolume);
+var
+  I: integer;
+  T, MaxP, LogMaxP, Sum: TNeuralFloat;
+begin
+  T := FTemperature;
+  // Temperature 1.0 is a bit-for-bit no-op (p^(1/1) renormalized would
+  // already be the identity, but skipping avoids float round-trips).
+  if T = 1.0 then exit;
+  if T < csDecodeMinTemperature then T := csDecodeMinTemperature;
+  MaxP := Row.Raw[0];
+  for I := 1 to Row.Size - 1 do
+    if Row.Raw[I] > MaxP then MaxP := Row.Raw[I];
+  // Defensive: an all-zero (or negative-degenerate) row is left untouched,
+  // mirroring MaskAllowed's zero-mass fallback.
+  if MaxP <= 0 then exit;
+  // Stable log-space exponentiation: exp((ln p - ln max_p)/T). The argument
+  // is always <= 0 (SafeLogProb is monotone and clamps zeros), so the max
+  // element maps to exactly 1 and nothing overflows; with T at the clamp the
+  // row degenerates to one-hot argmax (greedy).
+  LogMaxP := SafeLogProb(MaxP);
+  Sum := 0;
+  for I := 0 to Row.Size - 1 do
+  begin
+    Row.Raw[I] := Exp((SafeLogProb(Row.Raw[I]) - LogMaxP) / T);
+    Sum := Sum + Row.Raw[I];
+  end;
+  // Sum >= 1 by construction (the max element contributes exactly 1).
+  for I := 0 to Row.Size - 1 do
+    Row.Raw[I] := Row.Raw[I] / Sum;
+end;
+
+{ TNNetPenaltyProcessor }
+
+constructor TNNetPenaltyProcessor.Create(pPenalty: TNNetTokenHistoryPenalty;
+  pOwnsPenalty: boolean = false);
+begin
+  inherited Create();
+  FPenalty := pPenalty;
+  FOwnsPenalty := pOwnsPenalty;
+end;
+
+destructor TNNetPenaltyProcessor.Destroy();
+begin
+  if FOwnsPenalty then FPenalty.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetPenaltyProcessor.Reset(const PromptTokens: array of integer);
+var
+  I: integer;
+begin
+  // Fresh sequence: clear the history and register the prompt tokens so the
+  // penalties see the WHOLE context (the streamed loop's convention).
+  FPenalty.ResetHistory();
+  for I := 0 to High(PromptTokens) do FPenalty.RegisterToken(PromptTokens[I]);
+end;
+
+procedure TNNetPenaltyProcessor.ProcessRow(Row: TNNetVolume);
+begin
+  // Probability-domain rule (p^r, exp() factors, renormalize) - the row is
+  // post-softmax per the chain's domain convention.
+  FPenalty.ApplyToProbabilities(Row);
+end;
+
+procedure TNNetPenaltyProcessor.Commit(TokenId: integer);
+begin
+  FPenalty.RegisterToken(TokenId);
+end;
+
+{ TNNetConstraintProcessor }
+
+constructor TNNetConstraintProcessor.Create(pConstraint: TNNetTokenConstraint;
+  pOwnsConstraint: boolean = false);
+begin
+  inherited Create();
+  FConstraint := pConstraint;
+  FOwnsConstraint := pOwnsConstraint;
+end;
+
+destructor TNNetConstraintProcessor.Destroy();
+begin
+  if FOwnsConstraint then FConstraint.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetConstraintProcessor.Reset(const PromptTokens: array of integer);
+begin
+  FConstraint.Reset(PromptTokens);
+end;
+
+procedure TNNetConstraintProcessor.ProcessRow(Row: TNNetVolume);
+begin
+  FConstraint.MaskAllowed(Row);
+end;
+
+procedure TNNetConstraintProcessor.Commit(TokenId: integer);
+begin
+  FConstraint.Commit(TokenId);
+end;
+
+{ TNNetLogitsProcessorChain }
+
+destructor TNNetLogitsProcessorChain.Destroy();
+var
+  I: integer;
+begin
+  for I := 0 to High(FItems) do
+    if FOwned[I] then FItems[I].Free;
+  SetLength(FItems, 0);
+  SetLength(FOwned, 0);
+  inherited Destroy();
+end;
+
+function TNNetLogitsProcessorChain.GetCount(): integer;
+begin
+  Result := Length(FItems);
+end;
+
+function TNNetLogitsProcessorChain.GetItem(
+  Index: integer): TNNetLogitsProcessor;
+begin
+  Result := FItems[Index];
+end;
+
+function TNNetLogitsProcessorChain.Add(P: TNNetLogitsProcessor;
+  OwnsProcessor: boolean = false): TNNetLogitsProcessorChain;
+var
+  N: integer;
+begin
+  N := Length(FItems);
+  SetLength(FItems, N + 1);
+  SetLength(FOwned, N + 1);
+  FItems[N] := P;
+  FOwned[N] := OwnsProcessor;
+  Result := Self;
+end;
+
+function TNNetLogitsProcessorChain.ExpectsProbabilities(): boolean;
+var
+  I: integer;
+begin
+  Result := true;
+  for I := 0 to High(FItems) do
+    if not FItems[I].ExpectsProbabilities() then exit(false);
+end;
+
+procedure TNNetLogitsProcessorChain.Reset(
+  const PromptTokens: array of integer);
+var
+  I: integer;
+begin
+  for I := 0 to High(FItems) do FItems[I].Reset(PromptTokens);
+end;
+
+procedure TNNetLogitsProcessorChain.ProcessRow(Row: TNNetVolume);
+var
+  I: integer;
+begin
+  for I := 0 to High(FItems) do FItems[I].ProcessRow(Row);
+end;
+
+procedure TNNetLogitsProcessorChain.Commit(TokenId: integer);
+var
+  I: integer;
+begin
+  for I := 0 to High(FItems) do FItems[I].Commit(TokenId);
+end;
+
 { TNNetStreamingDecoder }
 
 constructor TNNetStreamingDecoder.Create(pNet: TNNet; pMaxCacheLen: integer);
@@ -1347,16 +1805,91 @@ begin
     MaxTotalLen, Sampler, Penalty, StopSequences, nil);
 end;
 
+// True when Token terminates generation: membership in EOSTokens when the
+// list is non-empty, otherwise the codebase-wide "token < 2" rule.
+function TokenIsEOS(Token: integer;
+  const EOSTokens: TNeuralIntegerArray): boolean;
+var
+  I: integer;
+begin
+  if Length(EOSTokens) = 0 then exit(Token < 2);
+  Result := false;
+  for I := 0 to High(EOSTokens) do
+    if EOSTokens[I] = Token then exit(true);
+end;
+
+// Assembles the standard pipeline Penalty -> Temperature -> UserProcessors ->
+// Constraint as an adapter chain (only the non-nil / non-default stages are
+// added; UserProcessors is appended NOT owned). Returns nil when every stage
+// is off, so the caller can take the zero-overhead plain path.
+function BuildProcessorPipeline(Penalty: TNNetTokenHistoryPenalty;
+  Temperature: TNeuralFloat; UserProcessors: TNNetLogitsProcessorChain;
+  Constraint: TNNetTokenConstraint): TNNetLogitsProcessorChain;
+begin
+  if (Penalty = nil) and (Temperature = 1.0) and
+    ((UserProcessors = nil) or (UserProcessors.Count = 0)) and
+    (Constraint = nil) then exit(nil);
+  Result := TNNetLogitsProcessorChain.Create();
+  if Assigned(Penalty) then
+    Result.Add(TNNetPenaltyProcessor.Create(Penalty), true);
+  if Temperature <> 1.0 then
+    Result.Add(TNNetTemperatureProcessor.Create(Temperature), true);
+  if Assigned(UserProcessors) and (UserProcessors.Count > 0) then
+    Result.Add(UserProcessors, false);
+  if Assigned(Constraint) then
+    Result.Add(TNNetConstraintProcessor.Create(Constraint), true);
+end;
+
 function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
   var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
   MaxTotalLen: integer; Sampler: TNNetSamplerBase;
   Penalty: TNNetTokenHistoryPenalty;
   const StopSequences: TNNetTokenSequences;
   Constraint: TNNetTokenConstraint): integer;
+begin
+  // Delegate through the adapter chain in the historical order (penalty,
+  // then constraint) - bit-for-bit the pre-chain behavior.
+  Result := GenerateTokensStreamed(Session, Tokens, PromptLen, MaxNewTokens,
+    MaxTotalLen, Sampler, Penalty, StopSequences, Constraint, 1.0);
+end;
+
+function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase;
+  Penalty: TNNetTokenHistoryPenalty;
+  const StopSequences: TNNetTokenSequences;
+  Constraint: TNNetTokenConstraint;
+  Temperature: TNeuralFloat): integer;
+var
+  Chain: TNNetLogitsProcessorChain;
+begin
+  Chain := BuildProcessorPipeline(Penalty, Temperature, nil, Constraint);
+  try
+    Result := GenerateTokensStreamedWithProcessors(Session, Tokens,
+      PromptLen, MaxNewTokens, MaxTotalLen, Sampler, Chain, StopSequences,
+      nil);
+  finally
+    Chain.Free;
+  end;
+end;
+
+function GenerateTokensStreamedWithProcessors(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens,
+  MaxTotalLen: integer; Sampler: TNNetSamplerBase;
+  Processors: TNNetLogitsProcessor;
+  const StopSequences: TNNetTokenSequences;
+  const EOSTokens: TNeuralIntegerArray): integer;
 var
   InV: TNNetVolume;
   Pos, CapLen, NextTokenInt, StopLen: integer;
 begin
+  // The chain's explicit domain contract: the streamed row is POST-SOFTMAX
+  // probabilities, so a raw-logit processor cannot be applied here.
+  if Assigned(Processors) and (not Processors.ExpectsProbabilities()) then
+    raise EArgumentException.Create(
+      'GenerateTokensStreamedWithProcessors: the streamed loop feeds ' +
+      'POST-SOFTMAX probabilities, but a processor in the chain declares ' +
+      'a raw-logit domain (ExpectsProbabilities=False).');
   if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
     raise EArgumentException.Create(
       'GenerateTokensStreamed: the session net must be a WIDTH-1 twin ' +
@@ -1375,18 +1908,10 @@ begin
   try
     InV.Fill(0);
     Session.Reset();
-    // A fresh sequence: clear the penalty history and register the prompt
-    // tokens, so the penalties see the WHOLE context (usual convention).
-    if Assigned(Penalty) then
-    begin
-      Penalty.ResetHistory();
-      for Pos := 0 to PromptLen - 1 do Penalty.RegisterToken(Tokens[Pos]);
-    end;
-    // A fresh sequence for the constraint, too: stateful grammars rewind and
-    // receive the prompt ids (most constraints ignore them - the constrained
-    // region is the GENERATED text).
-    if Assigned(Constraint) then
-      Constraint.Reset(Copy(Tokens, 0, PromptLen));
+    // A fresh sequence for the whole pipeline: penalties clear their history
+    // and register the prompt, stateful grammars rewind (see the adapters).
+    if Assigned(Processors) then
+      Processors.Reset(Copy(Tokens, 0, PromptLen));
     // Prefill tokens 0..PromptLen-2 one at a time; the LAST prompt token is
     // the first decode step's input (its output row predicts the first new
     // token) - the established prefill-then-step idiom.
@@ -1401,21 +1926,17 @@ begin
       InV.FData[0] := Tokens[Pos - 1];
       Session.StepForward(InV, Pos - 1);
       // The streamed step ends in a SoftMax, so the output row holds
-      // PROBABILITIES - hence ApplyToProbabilities (p^r + exp() factors +
-      // renormalize), not the logit-domain Apply. Mutating the net's output
-      // volume in place is safe: the next StepForward recomputes it.
-      if Assigned(Penalty) then Penalty.ApplyToProbabilities(Session.Output());
-      // Constrained decoding: AFTER the penalty, BEFORE the sampler - zero
-      // the disallowed tokens and renormalize (or leave the row untouched
-      // when the allowed mass is zero; see TNNetTokenConstraint).
-      if Assigned(Constraint) then Constraint.MaskAllowed(Session.Output());
+      // PROBABILITIES (the chain's documented domain). Processors transform
+      // the row IN ORDER before the sampler/argmax reads it. Mutating the
+      // net's output volume in place is safe: the next StepForward
+      // recomputes it.
+      if Assigned(Processors) then Processors.ProcessRow(Session.Output());
       // The step net is width-1, so the (only) output row is pixel (0,0).
       if Assigned(Sampler)
       then NextTokenInt := Sampler.GetTokenOnPixel(Session.Output(), 0, 0)
       else NextTokenInt := Session.Output().GetClassOnPixel(0, 0);
       Tokens[Pos] := NextTokenInt;
-      if Assigned(Penalty) then Penalty.RegisterToken(NextTokenInt);
-      if Assigned(Constraint) then Constraint.Commit(NextTokenInt);
+      if Assigned(Processors) then Processors.Commit(NextTokenInt);
       Inc(Pos);
       // Stop sequences: if the GENERATED tail now equals one of the entries,
       // terminate and TRIM the matched tokens from the returned length.
@@ -1428,9 +1949,10 @@ begin
           Break;
         end;
       end;
-      // End-of-sequence: the codebase-wide "NextTokenInt < 2" rule (the EOS
-      // token is stored and counted, like GenerateStringFromCasualNN).
-      if NextTokenInt < 2 then Break;
+      // End-of-sequence: membership in EOSTokens when provided, else the
+      // codebase-wide "NextTokenInt < 2" rule (the EOS token is stored and
+      // counted, like GenerateStringFromCasualNN).
+      if TokenIsEOS(NextTokenInt, EOSTokens) then Break;
     end;
     Result := Pos;
   finally
@@ -1462,6 +1984,38 @@ function GenerateStringStreamed(Session: TNNetStreamingDecoder;
   oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
   const StopStrings: array of string;
   Constraint: TNNetTokenConstraint): string;
+begin
+  // Delegate through the adapter chain in the historical order (penalty,
+  // then constraint) - bit-for-bit the pre-chain behavior.
+  Result := GenerateStringStreamed(Session, Dict, InputString, MaxNewTokens,
+    MaxTotalLen, oSampler, Penalty, StopStrings, Constraint, 1.0);
+end;
+
+function GenerateStringStreamed(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase; Penalty: TNNetTokenHistoryPenalty;
+  const StopStrings: array of string;
+  Constraint: TNNetTokenConstraint;
+  Temperature: TNeuralFloat): string;
+var
+  Chain: TNNetLogitsProcessorChain;
+begin
+  Chain := BuildProcessorPipeline(Penalty, Temperature, nil, Constraint);
+  try
+    Result := GenerateStringStreamedWithProcessors(Session, Dict,
+      InputString, MaxNewTokens, MaxTotalLen, oSampler, Chain, StopStrings,
+      nil, nil);
+  finally
+    Chain.Free;
+  end;
+end;
+
+function GenerateStringStreamedWithProcessors(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
+  oSampler: TNNetSamplerBase; Processors: TNNetLogitsProcessor;
+  const StopStrings: array of string;
+  const ExtraStopSequences: TNNetTokenSequences;
+  const EOSTokens: TNeuralIntegerArray): string;
 var
   Tokens, StopToks: TNeuralIntegerArray;
   TokenStops: TNNetTokenSequences;
@@ -1486,15 +2040,25 @@ begin
       TokenStops[High(TokenStops)] := Copy(StopToks, 0, Length(StopToks));
     end;
   end;
-  TotalLen := GenerateTokensStreamed(Session, Tokens, PromptLen,
-    MaxNewTokens, MaxTotalLen, oSampler, Penalty, TokenStops, Constraint);
-  // Detokenize the continuation; stop at the first special token (< 2) for
-  // display (the TokensToText convention) and join with a space only for
-  // separator vocabularies (word dicts; BPE vocabularies concatenate).
+  // Token-id stop sequences passed directly (config path) are appended after
+  // the tokenized stop strings.
+  for S := 0 to High(ExtraStopSequences) do
+    if Length(ExtraStopSequences[S]) > 0 then
+    begin
+      SetLength(TokenStops, Length(TokenStops) + 1);
+      TokenStops[High(TokenStops)] :=
+        Copy(ExtraStopSequences[S], 0, Length(ExtraStopSequences[S]));
+    end;
+  TotalLen := GenerateTokensStreamedWithProcessors(Session, Tokens, PromptLen,
+    MaxNewTokens, MaxTotalLen, oSampler, Processors, TokenStops, EOSTokens);
+  // Detokenize the continuation; stop at the first terminating token (the
+  // EOSTokens list, or the "< 2" rule when it is empty) for display (the
+  // TokensToText convention) and join with a space only for separator
+  // vocabularies (word dicts; BPE vocabularies concatenate).
   Continuation := '';
   for Pos := PromptLen to TotalLen - 1 do
   begin
-    if Tokens[Pos] < 2 then Break;
+    if TokenIsEOS(Tokens[Pos], EOSTokens) then Break;
     if Tokens[Pos] < VocabCount then
     begin
       if Dict.TokenizerHasSeparator
@@ -1515,6 +2079,72 @@ begin
   if CutAt > 0 then Continuation := Copy(Continuation, 1, CutAt - 1);
   Result := Result + Continuation;
   SetLength(Tokens, 0);
+end;
+
+{ Config-driven generation }
+
+function DefaultGenerationConfig(MaxNewTokens: integer;
+  MaxTotalLen: integer = 0): TGenerationConfig;
+begin
+  Result.MaxNewTokens := MaxNewTokens;
+  Result.MaxTotalLen := MaxTotalLen;
+  SetLength(Result.EOSTokens, 0);
+  SetLength(Result.StopSequences, 0);
+  SetLength(Result.StopStrings, 0);
+  Result.Temperature := 1.0;
+  Result.Penalty := nil;
+  Result.Processors := nil;
+  Result.Constraint := nil;
+  Result.Sampler := nil;
+end;
+
+function GenerateTokensWithConfig(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen: integer;
+  const Config: TGenerationConfig): integer;
+var
+  Chain: TNNetLogitsProcessorChain;
+  MaxTotal: integer;
+begin
+  MaxTotal := Config.MaxTotalLen;
+  if MaxTotal <= 0 then MaxTotal := PromptLen + Config.MaxNewTokens;
+  Chain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
+    Config.Processors, Config.Constraint);
+  try
+    Result := GenerateTokensStreamedWithProcessors(Session, Tokens,
+      PromptLen, Config.MaxNewTokens, MaxTotal, Config.Sampler, Chain,
+      Config.StopSequences, Config.EOSTokens);
+  finally
+    Chain.Free; // frees the adapters only; Config's objects are NOT owned
+  end;
+end;
+
+function GenerateStringWithConfig(Session: TNNetStreamingDecoder;
+  Dict: TStringListInt; InputString: string;
+  const Config: TGenerationConfig): string;
+var
+  Chain: TNNetLogitsProcessorChain;
+  MaxTotal, PromptLen: integer;
+  Tokens: TNeuralIntegerArray;
+begin
+  // MaxTotalLen = 0 resolves against the PROMPT's token count, mirroring
+  // GenerateTokensWithConfig (one extra tokenize; the wrapper re-tokenizes).
+  MaxTotal := Config.MaxTotalLen;
+  if MaxTotal <= 0 then
+  begin
+    Dict.Tokenize(InputString, Tokens);
+    PromptLen := Length(Tokens);
+    MaxTotal := PromptLen + Config.MaxNewTokens;
+    SetLength(Tokens, 0);
+  end;
+  Chain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
+    Config.Processors, Config.Constraint);
+  try
+    Result := GenerateStringStreamedWithProcessors(Session, Dict,
+      InputString, Config.MaxNewTokens, MaxTotal, Config.Sampler, Chain,
+      Config.StopStrings, Config.StopSequences, Config.EOSTokens);
+  finally
+    Chain.Free; // frees the adapters only; Config's objects are NOT owned
+  end;
 end;
 
 // Forward pass: encode (Prompt + Generated) and return the next-token
@@ -1828,8 +2458,6 @@ function DecodeSeq2SeqSampled(EncoderNet, DecoderNet: TNNet;
   StartTokenId, EOSTokenId, MaxNewTokens: integer;
   Sampler: TNNetSamplerBase;
   Temperature: TNeuralFloat = 1.0): TNeuralIntegerArray;
-const
-  csMinTemperature = 1e-6;
 var
   EncStates: TNNetLayer;
   EncToks, DecToks, Probs: TNNetVolume;
@@ -1855,7 +2483,8 @@ begin
   DecSeqLen := DecoderNet.GetFirstLayer().Output.Size;
   Logits := DecoderNet.GetLastLayer().Output;
   VocabSize := Logits.Depth;
-  if Temperature < csMinTemperature then Temperature := csMinTemperature;
+  if Temperature < csDecodeMinTemperature then
+    Temperature := csDecodeMinTemperature;
   EncToks := TNNetVolume.Create(EncSeqLen, 1, 1);
   DecToks := TNNetVolume.Create(DecSeqLen, 1, 1);
   Probs := TNNetVolume.Create(VocabSize, 1, 1);

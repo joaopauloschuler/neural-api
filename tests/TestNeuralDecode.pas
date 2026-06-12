@@ -100,6 +100,13 @@ type
     procedure TestGenerateTokensStreamedPenaltyAvoidsRepetition;
     procedure TestDecodeGreedyStopStringTrimsAndFinishes;
     procedure TestGenerateStringStreamedStopStringTrims;
+    // Logits-processor chain + temperature + generation config.
+    procedure TestTemperatureProcessorProbabilityDomainMath;
+    procedure TestProcessorChainOrderMatters;
+    procedure TestNoOpChainAndConfigBitIdenticalToPlainPath;
+    procedure TestGenerateWithConfigMatchesHandAssembled;
+    procedure TestTemperatureNearZeroWithSamplerMatchesGreedy;
+    procedure TestStringConfigDefaultsMatchPlainWrapper;
     // Constrained (structured) decoding: TNNetTokenConstraint and friends.
     procedure TestAllowedTokensConstraintMasksAndRenormalizes;
     procedure TestConstraintMaskFallbackLeavesRowUntouched;
@@ -1858,6 +1865,343 @@ begin
       SeqLen - 2, SeqLen, nil, nil, ['dog']);
     AssertEquals('stop string trimmed: prompt returned unchanged',
       'cat egg', WithStops);
+  finally
+    Dict.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// TNNetTemperatureProcessor probability-domain math: T=1 is a bitwise no-op,
+// T=0.5 equals p^2 renormalized (the exact image of logits/T), and T at/below
+// the clamp concentrates all mass on the argmax (greedy degeneration - the
+// DecodeSeq2SeqSampled convention).
+procedure TTestNeuralDecode.TestTemperatureProcessorProbabilityDomainMath;
+var
+  Row: TNNetVolume;
+  Proc: TNNetTemperatureProcessor;
+  I: integer;
+  SumSq, Total: TNeuralFloat;
+const
+  P: array[0..3] of TNeuralFloat = (0.1, 0.2, 0.3, 0.4);
+begin
+  Row := TNNetVolume.Create(4, 1, 1);
+  Proc := TNNetTemperatureProcessor.Create(1.0);
+  try
+    AssertTrue('declares the probability domain',
+      Proc.ExpectsProbabilities());
+    // T = 1.0: bitwise no-op.
+    for I := 0 to 3 do Row.Raw[I] := P[I];
+    Proc.ProcessRow(Row);
+    for I := 0 to 3 do
+      AssertEquals('T=1 leaves p[' + IntToStr(I) + '] bitwise unchanged',
+        P[I], Row.Raw[I], 0.0);
+    // T = 0.5: p^(1/T) = p^2, renormalized.
+    Proc.Temperature := 0.5;
+    SumSq := 0;
+    for I := 0 to 3 do SumSq := SumSq + P[I] * P[I];
+    for I := 0 to 3 do Row.Raw[I] := P[I];
+    Proc.ProcessRow(Row);
+    for I := 0 to 3 do
+      AssertEquals('T=0.5 equals p^2 renormalized at ' + IntToStr(I),
+        P[I] * P[I] / SumSq, Row.Raw[I], 1e-6);
+    Total := 0;
+    for I := 0 to 3 do Total := Total + Row.Raw[I];
+    AssertEquals('T=0.5 row sums to 1', 1.0, Total, 1e-6);
+    // T -> 0 (below the clamp): one-hot at the argmax.
+    Proc.Temperature := 1e-12;
+    for I := 0 to 3 do Row.Raw[I] := P[I];
+    Proc.ProcessRow(Row);
+    AssertEquals('T->0 puts all mass on the argmax', 1.0, Row.Raw[3], 1e-6);
+    for I := 0 to 2 do
+      AssertEquals('T->0 zeroes non-argmax token ' + IntToStr(I),
+        0.0, Row.Raw[I], 1e-6);
+  finally
+    Proc.Free;
+    Row.Free;
+  end;
+end;
+
+// Order matters: penalty-then-temperature sharpens the PENALIZED distribution
+// while temperature-then-penalty penalizes the SHARPENED one - the frequency
+// factor enters once as exp(-a)^(1/T) vs exp(-a). Both expected rows are
+// computed in closed form here.
+procedure TTestNeuralDecode.TestProcessorChainOrderMatters;
+const
+  Alpha = 0.7;
+  Temp = 0.5;
+var
+  Row: TNNetVolume;
+  ChainA, ChainB: TNNetLogitsProcessorChain;
+  PenA, PenB: TNNetTokenHistoryPenalty;
+  A0, A1, B0, B1, Norm: TNeuralFloat;
+begin
+  Row := TNNetVolume.Create(2, 1, 1);
+  PenA := TNNetTokenHistoryPenalty.Create(1.0, Alpha, 0.0);
+  PenB := TNNetTokenHistoryPenalty.Create(1.0, Alpha, 0.0);
+  // Chain A: penalty THEN temperature; chain B: temperature THEN penalty.
+  ChainA := TNNetLogitsProcessorChain.Create();
+  ChainA.Add(TNNetPenaltyProcessor.Create(PenA), true)
+        .Add(TNNetTemperatureProcessor.Create(Temp), true);
+  ChainB := TNNetLogitsProcessorChain.Create();
+  ChainB.Add(TNNetTemperatureProcessor.Create(Temp), true)
+        .Add(TNNetPenaltyProcessor.Create(PenB), true);
+  try
+    AssertEquals('chain A holds two processors', 2, ChainA.Count);
+    // Token 0 was seen once (the "prompt"); the row is (0.6, 0.4).
+    ChainA.Reset([0]);
+    Row.Raw[0] := 0.6; Row.Raw[1] := 0.4;
+    ChainA.ProcessRow(Row);
+    // Expected: penalize (0.6*exp(-a), 0.4)/Z, then square and renormalize.
+    A0 := 0.6 * Exp(-Alpha); A1 := 0.4;
+    Norm := A0 + A1; A0 := A0 / Norm; A1 := A1 / Norm;
+    A0 := A0 * A0; A1 := A1 * A1;
+    Norm := A0 + A1; A0 := A0 / Norm; A1 := A1 / Norm;
+    AssertEquals('penalty->temperature p0', A0, Row.Raw[0], 1e-6);
+    AssertEquals('penalty->temperature p1', A1, Row.Raw[1], 1e-6);
+
+    ChainB.Reset([0]);
+    Row.Raw[0] := 0.6; Row.Raw[1] := 0.4;
+    ChainB.ProcessRow(Row);
+    // Expected: square and renormalize, THEN penalize once.
+    B0 := 0.6 * 0.6; B1 := 0.4 * 0.4;
+    Norm := B0 + B1; B0 := B0 / Norm; B1 := B1 / Norm;
+    B0 := B0 * Exp(-Alpha);
+    Norm := B0 + B1; B0 := B0 / Norm; B1 := B1 / Norm;
+    AssertEquals('temperature->penalty p0', B0, Row.Raw[0], 1e-6);
+    AssertEquals('temperature->penalty p1', B1, Row.Raw[1], 1e-6);
+
+    // The two orders differ materially (the sharpened chain A penalizes
+    // token 0 harder: exp(-a)^2 after squaring vs exp(-a) once).
+    AssertTrue('processor order changes the distribution',
+      Abs(A0 - B0) > 0.05);
+    AssertTrue('penalty-then-temperature suppresses the seen token harder',
+      A0 < B0);
+  finally
+    ChainB.Free;
+    ChainA.Free;
+    PenB.Free;
+    PenA.Free;
+    Row.Free;
+  end;
+end;
+
+// REQUIRED BIT-IDENTITY: a nil chain, an EMPTY chain, the Temperature=1.0
+// overload and an all-defaults TGenerationConfig all reproduce the plain
+// GenerateTokensStreamed path token-for-token.
+procedure TTestNeuralDecode.TestNoOpChainAndConfigBitIdenticalToPlainPath;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  PlainToks, OtherToks: TNeuralIntegerArray;
+  EmptyChain: TNNetLogitsProcessorChain;
+  Config: TGenerationConfig;
+  PlainLen, OtherLen, T, VariantIdx: integer;
+  VariantName: string;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  EmptyChain := TNNetLogitsProcessorChain.Create();
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(PlainToks, PromptLen);
+    PlainToks[0] := 5; PlainToks[1] := 2; PlainToks[2] := 9;
+    PlainLen := GenerateTokensStreamed(Session, PlainToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    AssertTrue('plain path generated something', PlainLen > PromptLen);
+
+    for VariantIdx := 0 to 3 do
+    begin
+      SetLength(OtherToks, 0);
+      SetLength(OtherToks, PromptLen);
+      OtherToks[0] := 5; OtherToks[1] := 2; OtherToks[2] := 9;
+      case VariantIdx of
+        0: begin
+             VariantName := 'nil chain';
+             OtherLen := GenerateTokensStreamedWithProcessors(Session,
+               OtherToks, PromptLen, SeqLen - PromptLen, SeqLen, nil, nil,
+               nil, nil);
+           end;
+        1: begin
+             VariantName := 'empty chain';
+             OtherLen := GenerateTokensStreamedWithProcessors(Session,
+               OtherToks, PromptLen, SeqLen - PromptLen, SeqLen, nil,
+               EmptyChain, nil, nil);
+           end;
+        2: begin
+             VariantName := 'Temperature=1.0 overload';
+             OtherLen := GenerateTokensStreamed(Session, OtherToks,
+               PromptLen, SeqLen - PromptLen, SeqLen, nil, nil, nil, nil,
+               1.0);
+           end;
+        else
+           begin
+             VariantName := 'default TGenerationConfig';
+             Config := DefaultGenerationConfig(SeqLen - PromptLen, SeqLen);
+             OtherLen := GenerateTokensWithConfig(Session, OtherToks,
+               PromptLen, Config);
+           end;
+      end;
+      AssertEquals(VariantName + ': same length', PlainLen, OtherLen);
+      for T := PromptLen to PlainLen - 1 do
+        AssertEquals(VariantName + ': token at ' + IntToStr(T),
+          PlainToks[T], OtherToks[T]);
+    end;
+  finally
+    EmptyChain.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// REQUIRED EQUIVALENCE: a TGenerationConfig with penalty + temperature +
+// top-k sampler reproduces the hand-assembled GenerateTokensStreamed
+// Temperature-overload call (same RNG seed -> same stochastic draws).
+procedure TTestNeuralDecode.TestGenerateWithConfigMatchesHandAssembled;
+const
+  SeqLen = 12;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Penalty: TNNetTokenHistoryPenalty;
+  Sampler: TNNetSamplerBase;
+  HandToks, CfgToks: TNeuralIntegerArray;
+  Config: TGenerationConfig;
+  HandLen, CfgLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  // The pipeline operates on POST-SOFTMAX probabilities: cap both twins
+  // with a per-position softmax (weightless, so CopyWeights stays exact).
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.5, 0.0);
+  Sampler := TNNetSamplerTopK.Create(3);
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    SetLength(HandToks, PromptLen);
+    HandToks[0] := 4; HandToks[1] := 9; HandToks[2] := 6;
+    RandSeed := 5000; // fix the sampler's draws
+    HandLen := GenerateTokensStreamed(Session, HandToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, Sampler, Penalty, nil, nil, 0.7);
+
+    SetLength(CfgToks, PromptLen);
+    CfgToks[0] := 4; CfgToks[1] := 9; CfgToks[2] := 6;
+    Config := DefaultGenerationConfig(SeqLen - PromptLen, SeqLen);
+    Config.Penalty := Penalty;
+    Config.Temperature := 0.7;
+    Config.Sampler := Sampler;
+    RandSeed := 5000; // same draws for the config-driven run
+    CfgLen := GenerateTokensWithConfig(Session, CfgToks, PromptLen, Config);
+
+    AssertTrue('something was generated', HandLen > PromptLen);
+    AssertEquals('config-driven length equals hand-assembled',
+      HandLen, CfgLen);
+    for T := PromptLen to HandLen - 1 do
+      AssertEquals('token at ' + IntToStr(T), HandToks[T], CfgToks[T]);
+  finally
+    Sampler.Free;
+    Penalty.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// REQUIRED CONVENTION: Temperature -> 0 with a STOCHASTIC sampler matches the
+// greedy argmax path (the distribution degenerates to one-hot, so a weighted
+// draw becomes deterministic) - the DecodeSeq2SeqSampled temp-zero behavior
+// on the causal-LM side. The sampler is min-p (a TRUE weighted draw over the
+// kept mass); top-k would NOT work here - it draws UNIFORMLY among the top K
+// tokens, so even a one-hot row stays stochastic under it.
+procedure TTestNeuralDecode.TestTemperatureNearZeroWithSamplerMatchesGreedy;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Sampler: TNNetSamplerBase;
+  GreedyToks, ColdToks: TNeuralIntegerArray;
+  GreedyLen, ColdLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Sampler := TNNetSamplerMinP.Create(0.5);
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    SetLength(GreedyToks, PromptLen);
+    GreedyToks[0] := 5; GreedyToks[1] := 2; GreedyToks[2] := 9;
+    GreedyLen := GenerateTokensStreamed(Session, GreedyToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+
+    SetLength(ColdToks, PromptLen);
+    ColdToks[0] := 5; ColdToks[1] := 2; ColdToks[2] := 9;
+    ColdLen := GenerateTokensStreamed(Session, ColdToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, Sampler, nil, nil, nil, 1e-12);
+
+    AssertEquals('temp->0 sampled length equals greedy', GreedyLen, ColdLen);
+    for T := PromptLen to GreedyLen - 1 do
+      AssertEquals('token at ' + IntToStr(T), GreedyToks[T], ColdToks[T]);
+  finally
+    Sampler.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// String-level config path: an all-defaults config reproduces the plain
+// GenerateStringStreamed wrapper exactly (same dict, same prompt).
+procedure TTestNeuralDecode.TestStringConfigDefaultsMatchPlainWrapper;
+const
+  SeqLen = 9;
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'apple', 'blue', 'cat',
+    'dog', 'egg', 'fox', 'gold', 'hat', 'ice', 'jam');
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Dict: TStringListInt;
+  Config: TGenerationConfig;
+  T: integer;
+  Plain, Got: string;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  Dict := TStringListInt.Create();
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    Plain := GenerateStringStreamed(Session, Dict, 'cat dog egg',
+      SeqLen - 3, SeqLen);
+    Config := DefaultGenerationConfig(SeqLen - 3, SeqLen);
+    Got := GenerateStringWithConfig(Session, Dict, 'cat dog egg', Config);
+    AssertEquals('config wrapper equals plain wrapper', Plain, Got);
   finally
     Dict.Free;
     Session.Free;
