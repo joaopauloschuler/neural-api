@@ -53,6 +53,7 @@ type
     procedure TestLlamaImporterFailsOnMissingTensor;
     procedure TestLlamaLogitParity;
     procedure TestDistilGPT2LogitParity;
+    procedure TestSmolLM2LogitParity;
   end;
 
 implementation
@@ -949,6 +950,42 @@ begin
     AssertEquals('prefix', 'transformer.', Config.Prefix);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_distilgpt2_logits.json'), Config.NCtx,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the HuggingFaceTB/SmolLM2-135M import target on REAL pretrained
+// weights: tests/fixtures/tiny_smollm2.safetensors is a dimension-sliced
+// sub-slab of the genuine SmolLM2-135M checkpoint (2 of 30 layers, 2 query
+// heads sharing 1 kv head x 4 dims, hidden 8, vocab 12 - see
+// examples/LlamaImport/make_pico_llama_fixture.py) and the reference logits
+// come from HF transformers' LlamaForCausalLM in float64 on the same slice.
+// Distinctive coverage vs TestLlamaLogitParity: TIED embeddings (no
+// lm_head tensor in the checkpoint), rope_theta=100000 and a BF16-dtype
+// fixture (end-to-end DecodeBF16). The full SmolLM2-135M loads with
+// BuildLlamaFromSafeTensors unchanged (2026-06: 2-layer/4096-vocab
+// real-weight slice max |logit diff| 6.5e-5 vs transformers).
+procedure TTestNeuralPretrained.TestSmolLM2LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_smollm2.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_smollm2_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 12, Config.VocabSize);
+    AssertEquals('rope_theta', 100000.0, Config.RopeTheta, 1e-3);
+    AssertTrue('tie_word_embeddings', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_smollm2_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;

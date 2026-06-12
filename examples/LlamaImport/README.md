@@ -39,6 +39,12 @@ everything runs on raw token ids.
 * `slice_llama.py` — alternatively, slices a **real** checkpoint
   (e.g. TinyLlama-1.1B) down to its first N blocks and a vocab prefix so
   RAM-limited boxes can check genuine weights.
+* `make_pico_llama_fixture.py <src_dir> <out_prefix>` — slices a real
+  checkpoint down EVERY dimension (layers, hidden, heads/kv-heads,
+  head_dim, MLP, vocab; GQA group structure preserved) into a ~10 KB
+  committable parity fixture of genuine weights plus float64 reference
+  logits from `LlamaForCausalLM` (used to pin
+  `tests/fixtures/tiny_smollm2.*`).
 * `compare_hf_logits.py` — loads the same checkpoint into
   `LlamaForCausalLM` and diffs every logit against the Pascal dump
   (gate 1e-3).
@@ -59,6 +65,20 @@ $ python3 examples/LlamaImport/compare_hf_logits.py \
 Measured (f32 end-to-end, 2026-06): random tiny model max |logit diff|
 **1.8e-7**, tied variant **2.1e-7**, 1-layer/128-vocab slice **1.5e-7**;
 argmax agrees at every position.
+
+**Verified import targets** (logit parity vs HF transformers on real
+weights): `TinyLlama/TinyLlama-1.1B` and `HuggingFaceTB/SmolLM2-135M` —
+both load with `BuildLlamaFromSafeTensors` unchanged. SmolLM2-135M (tied
+embeddings — no `lm_head` tensor in the checkpoint — BF16, rope_theta
+100000, GQA 9 query / 3 kv heads) measured 2026-06: 2-layer/4096-vocab
+slice max |logit diff| **6.5e-5** over 53,248 logits, argmax agrees at
+every position. A committed pico fixture of REAL SmolLM2 weights
+(`tests/fixtures/tiny_smollm2.*`, ~4 KB BF16, dimension-sliced by
+`make_pico_llama_fixture.py` — 2 of 30 layers, 2 q-heads sharing 1 kv head
+× 4 dims, hidden 8, vocab 12, reference logits from `LlamaForCausalLM` in
+float64) is asserted by `TestSmolLM2LogitParity` in every test run; the
+tied-head path and the BF16 decode are thereby covered end-to-end on
+genuine weights.
 
 For a real checkpoint, download e.g.
 `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (`model.safetensors` +

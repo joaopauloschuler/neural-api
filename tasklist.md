@@ -571,7 +571,7 @@ rather than acted on.
       per-layer override). The 4B+ multimodal vision tower is explicitly
       OUT OF SCOPE (separate project). Parity fixture vs
       Gemma3ForCausalLM on a sliced text-only checkpoint.
-- [ ] SmolLM2 parity verification (possibly ZERO-code, the
+- [X] SmolLM2 parity verification (possibly ZERO-code, the
       Cerebras-GPT-pattern task for the Llama path): HuggingFace's
       SmolLM2 family (135M/360M/1.7B) ships as LlamaForCausalLM with tied
       embeddings — the landed BuildLlamaFromSafeTensors may load
@@ -580,6 +580,14 @@ rather than acted on.
       2024-era model is arguably the best end-to-end CPU demo this
       framework could have; natural base model for the LoRA /
       distillation / GRPO tasks elsewhere in this list.
+      DONE 2026-06-11: confirmed ZERO-code — BuildLlamaFromSafeTensors
+      loads SmolLM2-135M unchanged (tied embeddings, BF16, rope_theta
+      100000, GQA 9/3); 2-layer/4096-vocab real-weight slice max |logit
+      diff| 6.5e-5 vs LlamaForCausalLM. Pinned
+      tests/fixtures/tiny_smollm2.* (BF16 dimension-sliced sub-slab of
+      the real checkpoint via
+      examples/LlamaImport/make_pico_llama_fixture.py) +
+      TestSmolLM2LogitParity.
 - [ ] TinyStories reference-checkpoint import (rider on the GPT-Neo
       importer task above): roneneldan/TinyStories-1M..33M are GPT-NEO
       architecture, so they load with zero extra work once that importer
