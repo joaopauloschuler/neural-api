@@ -109,22 +109,6 @@ rather than acted on.
       accuracy risk) is an acceptable stepping stone if int8 proves invasive.
       Follow-ups: int8 activation/matmul path, GPTQ/AWQ-style calibrated
       quantization, 4-bit.
-- [X] SentencePiece / tokenizer.json tokenizer loading for the Llama importer
-      (examples/LlamaImport currently drives the net with raw token ids):
-      parse HF tokenizer.json (BPE/Unigram vocab + merges + byte-fallback) or
-      the sentencepiece .model protobuf into a TNeuralTokenizer-compatible
-      encoder/decoder so LlamaImport can take text prompts end to end.
-      DONE: neural/neuralhftokenizer.pas TNeuralHFTokenizer loads HF
-      tokenizer.json for both importer families -- byte-level BPE
-      (GPT-2/distilgpt2/SmolLM2: bytes-to-unicode table, GPT-2 regex,
-      ranked merges) and metaspace BPE with byte fallback
-      (Llama/TinyLlama: Prepend/Replace normalizer, <0xNN> tokens,
-      Replace/ByteFallback/Fuse/Strip decoder); added/special tokens
-      matched verbatim, ids exposed, never auto-injected. Exact-id parity
-      with HF `tokenizers` pinned by tests/TestNeuralHFTokenizer.pas over
-      fixtures from tools/hf_tokenizer_fixture.py; examples/GPT2Import
-      takes -t "text" prompts when tokenizer.json sits next to the
-      checkpoint. Remaining sub-scopes split out below.
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas: (a) Unigram model
       support (model.type "Unigram", Viterbi segmentation) -- needed only
       for tokenizers not yet converted to BPE format; (b) the raw
@@ -202,10 +186,11 @@ rather than acted on.
       (off at eval); famously a ~5-line instruction-tuning quality win.
       Trivially testable: assert eval forward is noise-free and train
       forward differs.
-- [ ] Mixup / CutMix training augmentation (torchvision transforms-v2
-      staples): sample-pair convex interpolation of inputs AND targets
-      (Beta-distributed lambda) in the fit loop; CutMix patches a rectangle
-      instead. The CIFAR image-classification examples give an instant
+- [ ] CutMix training augmentation (torchvision transforms-v2 staple;
+      Mixup itself is landed: CreateMixedVolumePairList in neuralvolume +
+      examples/Mixup): patch a random rectangle from a second sample into
+      the input and mix the targets by area fraction (Beta-distributed
+      lambda). The CIFAR image-classification examples give an instant
       bake-off harness.
 - [ ] Contrastive search decoding (transformers penalty_alpha): degeneration
       penalty re-ranking each candidate token by max cosine similarity
@@ -222,7 +207,8 @@ rather than acted on.
       paths look single-sample). Makes evaluation sweeps cheap and is a
       prerequisite for an efficient speculative-decoding verify step.
 - [ ] Chat templates (transformers apply_chat_template): follow-up of the
-      tokenizer.json task above — parse the chat template from
+      landed tokenizer.json loader (neural/neuralhftokenizer.pas) — parse
+      the chat template from
       tokenizer_config.json (or hardcode the common Llama/ChatML/Zephyr
       formats) so an imported instruct checkpoint can be prompted with a
       correctly formatted conversation end to end.
@@ -231,16 +217,6 @@ rather than acted on.
       heads consistent, update FStruct vocab sizes). Needed the moment
       anyone adds special tokens to fine-tune on top of the Llama/GPT-2
       importers.
-- [X] Mistral / Qwen2 importer architectures: config-driven deltas on the
-      Llama path in neural/neuralpretrained.pas — Mistral = optional
-      sliding-window attention (config sliding_window, null = full, wired
-      into each head's TNNetScaledDotProductAttention pWindow), Qwen2 =
-      q/k/v projection biases (rotate_half-permuted along with the q/k
-      rows; o_proj stays bias-free). BuildMistralFromSafeTensors /
-      BuildQwen2FromSafeTensors (+Ex) wrappers; HF-parity pico fixtures
-      (tools/mistral_qwen2_tiny_fixture.py, random-init Mistral/
-      Qwen2ForCausalLM, window=4 < seqlen=16 and asserted-nonzero biases)
-      + TestMistralLogitParity / TestQwen2LogitParity.
 - [ ] Phi importer: partial-rotary (rotary_pct) attention + parallel
       attention/MLP residual layout — more than a weight-mapping delta on
       the Llama path; reuses the HF-parity fixture tooling.
@@ -396,29 +372,14 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [X] Sharded safetensors support (model.safetensors.index.json):
-      TNNetSafeTensorsReader opens exactly ONE TFileStream, but anything
-      above ~2B params (and many smaller repos) ships as
-      model-00001-of-000NN.safetensors + an index file. Parse the index
-      JSON, map tensor name → shard file, keep a stream pool behind the
-      existing GetDType/read API so BuildGPT2/BuildLlamaFromSafeTensors
-      (and the listed Mistral/Qwen2 importer task, which silently depends
-      on this) need no changes. Test: split the pico-Llama parity fixture
-      into two shards + index, assert logits bit-identical to the
-      single-file load. DONE: TNNetSafeTensorsReader.Create detects a
-      .json path, opens every weight_map shard into a stream pool and
-      validates the map against the shard headers; builders unchanged
-      (pass the index.json path). Fixtures split by
-      tools/shard_tiny_llama_fixture.py; bit-identical-logits +
-      reader-equivalence tests in tests/TestNeuralPretrained.pas.
 - [ ] HF Hub download helper: there is no HTTP anywhere in the import path —
       users must hand-download checkpoint files. A small fphttpclient-based
       resolver (https://huggingface.co/{repo}/resolve/{rev}/{file}, local
       cache dir, skip-if-present, optional token header for gated repos) so
       BuildLlamaFromSafeTensors('TinyLlama/TinyLlama-1.1B-Chat-v1.0') works
       end to end. Pairs with the (landed) sharded-safetensors support (the
-      index file says which shards to fetch) and the tokenizer.json / chat-template
-      tasks (same repo, same fetch). Keep it a separate opt-in unit so the
+      index file says which shards to fetch) and the landed tokenizer.json
+      loader / open chat-template task (same repo, same fetch). Keep it a separate opt-in unit so the
       core importers stay offline-only. NOTE 2026-06-12: this dev
       environment HAS live network access to huggingface.co (TinyStories-1M
       and bert-tiny/MiniLM-L6-v2 were downloaded during importer
@@ -434,18 +395,6 @@ rather than acted on.
       TNNetSafeTensorsReader so the GPT-2/Llama builders take either
       format. Test: torch.save a pico state_dict in Python, assert every
       tensor matches its safetensors twin bit-for-bit.
-- [X] BERT/encoder-family importer (vanilla BERT + MiniLM):
-      BuildBertFromSafeTensors[Ex/WithConfig] in neural/neuralpretrained.pas
-      — the first ENCODER importer (hidden states out, not logits; input
-      (SeqLen,1,2) token|token-type ids; bidirectional MHA, post-LN blocks,
-      EXACT erf GELU composed from MulByConstant/Erf/AddConstant/ReGLU,
-      optional pooler head; 'bert' route in BuildFromPretrained). Pinned
-      pico fixture tests/fixtures/tiny_bert.* (hidden parity 3.3e-7,
-      pooler 3.7e-8, gate 2e-5 — tight enough to catch a tanh-GELU swap);
-      real checkpoints verified: prajjwal1/bert-tiny hidden 4.1e-6 /
-      pooler 2.3e-6, sentence-transformers/all-MiniLM-L6-v2 (the
-      sentence-embedding workhorse, model_type bert) hidden 2.4e-6 /
-      pooler 1.7e-7.
 - [ ] Sentence-embedding pipeline + semantic-search example on the landed
       BERT/MiniLM import: the importer is parity-verified against
       sentence-transformers/all-MiniLM-L6-v2 but nothing turns its
@@ -506,18 +455,6 @@ rather than acted on.
       training at all (encode class-name prompts, cosine-match image
       embeddings). Verify embedding parity per tower against transformers'
       CLIPModel on the sliced-fixture pattern.
-- [X] AutoModel-style dispatch (BuildFromPretrained): read config.json's
-      model_type and route to the right Build*FromSafeTensors builder.
-      DONE: BuildFromPretrained(Path) in neural/neuralpretrained.pas takes
-      a checkpoint directory (config.json + model.safetensors[.index.json])
-      or an explicit weights file (+ optional config path), routes gpt2 /
-      llama / mistral / qwen2, and raises EPretrainedImportError listing
-      the supported model_types for anything else; explicit builders stay
-      public. Tests: TestBuildFromPretrainedDispatch (all four routes
-      reproduce their pinned oracle logits) +
-      TestBuildFromPretrainedRejectsUnsupportedModelType. New importer
-      tasks (gpt_neo, gptj/gpt_neox, Phi, Qwen3, Gemma) should add their
-      model_type route here when they land.
 - [ ] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate
@@ -556,16 +493,6 @@ rather than acted on.
       sliced parity fixture. The cheapest credible answer to "import a
       trained GPT-3-class model"; doc cross-link target for
       ../gpt-3-for-pascal.
-- [X] GPT-Neo importer (EleutherAI's GPT-3 replica — the open
-      implementation of GPT-3's ALTERNATING dense / locally-banded sparse
-      attention): BuildGPTNeoFromSafeTensors + "gpt_neo" BuildFromPretrained
-      route. HF's local band (bias ^ tril(bias, -window) keeps exactly
-      window_size keys, i-j < W) matches the landed SDPA pWindow convention
-      — verified numerically; UNSCALED attention folded into W_q
-      (x sqrt(d_head)) at load; plain bias-free nn.Linear q/k/v + biased
-      out_proj/MLP. Parity fixture tools/gptneo_tiny_fixture.py asserts the
-      window AND the no-scale quirk both change the logits non-vacuously;
-      also verified on real TinyStories-1M weights (see the rider below).
 - [ ] GPT-J / GPT-NeoX (Pythia) importer — the workhorse open GPT-3-class
       science suite (Pythia: 70M..12B with many training-step snapshots,
       untied embeddings; the untied-head path landed with the Llama
@@ -623,7 +550,7 @@ rather than acted on.
 - [ ] Gemma 2 - BuildGemma2FromSafeTensors importer (depends on the Gemma-1
       importer + the two Gemma-2 tasks above): alternating local(4096)/
       global attention via the landed sliding-window SDPA (same alternating
-      pattern as the GPT-Neo task); query_pre_attn_scalar (e.g. 224 on 27B)
+      pattern as the landed GPT-Neo importer); query_pre_attn_scalar (e.g. 224 on 27B)
       folded into W_q at load (same trick as GPT-Neo's unscaled attention);
       final-logit soft-capping as a plain TNNetSoftCapping.Create(30)
       before the softmax head — zero new code. Note the 256k vocab makes
@@ -649,19 +576,12 @@ rather than acted on.
       per-layer override). The 4B+ multimodal vision tower is explicitly
       OUT OF SCOPE (separate project). Parity fixture vs
       Gemma3ForCausalLM on a sliced text-only checkpoint.
-- [X] TinyStories reference-checkpoint import (rider on the landed GPT-Neo
-      importer): VERIFIED on the real roneneldan/TinyStories-1M checkpoint
-      (8 alternating global/local layers, window 256, tied head, vocab
-      50257) — pytorch_model.bin converted to safetensors, loaded via
-      BuildFromPretrained, max |logit diff| 6.3e-5 vs HF transformers
-      float64, 10 greedy tokens token-for-token identical to HF ("Once
-      upon a time there was a little girl named" -> " Lily. She loved to
-      play outside in the sunshine"). NOTE: the published checkpoints ship
-      pytorch_model.bin only — a one-line torch state_dict -> safetensors
-      save_file conversion is needed first (see examples/GPT2Import/
-      README.md).
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
-      to the verified import above): the repo's NLP examples already train
+      to the landed, parity-verified roneneldan/TinyStories-1M import on
+      the GPT-Neo route; the published checkpoints ship pytorch_model.bin
+      only, so a one-line torch state_dict -> safetensors conversion is
+      needed first — see examples/GPT2Import/README.md): the repo's NLP
+      examples already train
       on the TinyStories dataset — compare neuralnlpmetrics perplexity of
       a from-scratch CAI training run against the imported
       roneneldan/TinyStories-1M..33M reference at matched vocab/context;
@@ -707,7 +627,7 @@ rather than acted on.
       attention — every ingredient is already landed or tasked (Gemma /
       GPT-Neo machinery). Best current retrieval/classification encoder
       at CPU-friendly size; feeds the same token-classification / QA /
-      sentence-embedding heads as the BERT task. Parity fixture vs
+      sentence-embedding heads as the landed BERT importer. Parity fixture vs
       ModernBertModel hidden states.
 - [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
@@ -912,9 +832,16 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] Shared `LayerInputAndWeightGradientCheck(layer, inputShape)` helper
       in tests/TestNeuralNumerical.pas. Three-line tests instead of
       copy-pasted blocks. Should handle both input and weight central-
-      difference checks with a `Tolerance` parameter (default 1e-2) so
-      the DeMaxPool-style Double-precision SSE accumulator can be opted
-      into per-test.
+      difference checks with a `Tolerance` parameter (default 1e-2), and
+      promote DeMaxPoolFamilyGradientCheck's Double-precision SSE
+      accumulator into it (sum the SSE in Double; eps and tolerance stay
+      TNeuralFloat) so it can be opted into per-test. DATA POINT:
+      TNNetAdaptiveMaxPool's gradient check hit the same float32
+      subtractive-cancellation issue (a single cell carrying the whole
+      window error, num=1.2588 vs ana=1.2709) and had to be loosened to
+      tol 0.02 with an in-code comment — verified NOT a layer bug
+      (double-precision central difference matches analytic exactly); a
+      strong candidate to convert once this helper lands.
 - [ ] Property-based gradient harness v0: randomize input shape (keeping
       layer type fixed) for the 6 most recently landed layers. Catches
       shape-edge bugs hand-written tests miss.
@@ -1009,15 +936,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 - [ ] TNNetStraightThroughEstimator `step ≤ 0` guard test.
 - [ ] Audit TNNetSigmoid and TNNetHardSigmoid for negative-x / positive-x
       symmetric-stability (same question as SoftPlus).
-- [ ] Promote DeMaxPoolFamilyGradientCheck's Double-precision SSE
-      accumulator into the shared LayerInputGradientCheck (and weight-grad
-      variant). Sum the SSE in Double; eps and tolerance stay TNeuralFloat.
-      NEW DATA POINT: TNNetAdaptiveMaxPool's gradient check hit the same
-      float32 subtractive-cancellation issue (a single cell carrying the
-      whole window error, num=1.2588 vs ana=1.2709) and had to be loosened
-      to tol 0.02 with an in-code comment — verified NOT a layer bug
-      (double-precision central difference matches analytic exactly). A
-      strong candidate to convert once the Double accumulator helper lands.
 - [ ] Add a "FP32 SSE accumulator warning" comment near LayerInputGradientCheck
       pointing future audits at the DeMaxPool case and the Double-precision
       workaround.
