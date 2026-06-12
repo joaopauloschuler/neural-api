@@ -15,6 +15,10 @@ unit neuralpretrained;
 //   - GPT-Neo (EleutherAI's GPT-3 replica; the roneneldan/TinyStories
 //     checkpoints share this architecture) - BuildGPTNeoFromSafeTensors.
 //     See the GPT-NEO IMPORT section below.
+//   - GPT-NeoX (EleutherAI's Pythia 70M..12B science suite; parallel
+//     two-LN residual + PARTIAL rotary + fused per-head-interleaved
+//     query_key_value + untied embed_in/embed_out) -
+//     BuildGPTNeoXFromSafeTensors. See the GPT-NEOX IMPORT section below.
 //   - BERT (vanilla encoder family, model_type "bert": bert-base/tiny,
 //     sentence-transformers MiniLM, ...) - BuildBertFromSafeTensors.
 //     The FIRST ENCODER here: outputs hidden states, not logits. See the
@@ -150,6 +154,49 @@ unit neuralpretrained;
 // the HF default 4 * hidden_size applies. The LM head is tied to wte
 // (copied, like the GPT-2 path). The roneneldan/TinyStories-1M..33M
 // reference checkpoints are GPT-Neo and load through this path unchanged.
+//
+// =========================== GPT-NEOX IMPORT ===============================
+// BuildGPTNeoXFromSafeTensors rebuilds EleutherAI's GPT-NeoX decoder
+// (model_type "gpt_neox") - the architecture of the Pythia science suite
+// (70M..12B). Two ingredients distinguish it from everything above:
+//
+// 1. PARALLEL residual with TWO LayerNorms (config use_parallel_residual,
+//    default true and used by every Pythia size):
+//      x := x + Attn(LN_1(x)) + MLP(LN_2(x))
+//    - both branches read the SAME block input through their own norms
+//    (input_layernorm / post_attention_layernorm) and the residual is summed
+//    ONCE (a 3-input TNNetSum). use_parallel_residual=false falls back to
+//    the sequential pre-LN form x := x + Attn(LN_1(x));
+//    x := x + MLP(LN_2(x)) - also wired here.
+//
+// 2. PARTIAL ROTARY: only the FIRST rotary_ndims = int(rotary_pct*head_dim)
+//    channels of each Q/K head get RoPE (rotary_pct = 0.25 for Pythia); the
+//    remaining channels pass through unrotated. Wired per head as a channel
+//    split: SplitChannels(first d_rot) -> TNNetRotaryEmbedding(theta) and
+//    SplitChannels(rest), re-concatenated before the SDPA. The RoPE
+//    frequency schedule matches HF (theta_k = base^(-2k/d_rot): the layer
+//    derives the schedule from its input depth, which IS d_rot here).
+//    GPT-NeoX applies rotate_half WITHIN the rotary slice (the same
+//    first-half/second-half layout as Llama), so the loader permutes the
+//    first d_rot rows of every head exactly like the Llama importer does
+//    over the full head (see the ROTATE_HALF CONVENTION note above).
+//
+// The attention projection is ONE fused query_key_value tensor
+// [3*hidden, hidden] with PER-HEAD interleaving: head h occupies rows
+// h*3*head_dim..(h+1)*3*head_dim-1, the first head_dim of them being q,
+// then k, then v (HF view(..., num_heads, 3*head_dim) then thirds) -
+// DIFFERENT from GPT-2's q|k|v thirds layout. The loader de-interleaves
+// into the Q|K|V slab the per-head slicing expects, composing the rotary
+// permutation on the way. query_key_value, attention.dense and both MLP
+// linears (mlp.dense_h_to_4h / dense_4h_to_h) are plain nn.Linear
+// [out, in] WITH biases. Attention is standard scaled (1/sqrt(head_dim)).
+// hidden_act is "gelu" = the EXACT erf form in every Pythia config -
+// composed from existing layers exactly like the BERT path (gelu_new /
+// gelu_pytorch_tanh configs get the single TNNetGELU instead).
+// Embeddings are UNTIED by default (embed_in / embed_out are separate
+// tensors; tie_word_embeddings=false in every Pythia config); a tied
+// config copies embed_in like the GPT-2 path. final_layer_norm caps the
+// stack. Positions come ONLY from RoPE (no wpe table).
 //
 // ============================ BERT IMPORT ==================================
 // BuildBertFromSafeTensors rebuilds the vanilla BERT ENCODER (HF BertModel,
@@ -412,6 +459,58 @@ function BuildGPTNeoFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
 type
+  TGPTNeoXConfig = record
+    HiddenSize: integer;        // d_model (hidden_size)
+    IntermediateSize: integer;  // MLP width (intermediate_size)
+    NumLayers: integer;         // decoder blocks (num_hidden_layers)
+    NumHeads: integer;          // attention heads (num_attention_heads)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings (context length)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps
+    RotaryPct: TNeuralFloat;    // rotary_pct (0.25 for Pythia; 1.0 = full)
+    RopeTheta: TNeuralFloat;    // rotary_emb_base / rope_theta (RoPE base)
+    UseParallelResidual: boolean; // use_parallel_residual (Pythia: true)
+    TieWordEmbeddings: boolean; // tie_word_embeddings (Pythia: FALSE)
+    HiddenActTanh: boolean;     // true = gelu_new/gelu_pytorch_tanh; false =
+                                // exact erf "gelu" (the Pythia default)
+    Prefix: string;             // tensor-name prefix ('gpt_neox.' or '')
+  end;
+
+// Reads a HF GPT-NeoX config.json (model_type 'gpt_neox'). Required:
+// hidden_size, intermediate_size, num_hidden_layers, num_attention_heads,
+// vocab_size, max_position_embeddings. Defaults: rotary_pct = 0.25 (also
+// accepts the newer partial_rotary_factor spelling), rotary_emb_base =
+// 10000 (rope_theta overrides when present), layer_norm_eps = 1e-5,
+// use_parallel_residual = true, tie_word_embeddings = false (the GPT-NeoX
+// convention - Pythia is UNTIED), hidden_act = 'gelu' (the exact erf form;
+// gelu_new/gelu_pytorch_tanh select the tanh approximation, anything else
+// is rejected). Prefix is left '' - the builder detects it.
+function ReadGPTNeoXConfigFromJSONFile(const FileName: string): TGPTNeoXConfig;
+
+function GPTNeoXConfigToString(const Config: TGPTNeoXConfig): string;
+
+// Builds a TNNet with the GPT-NeoX architecture described by the config and
+// loads every weight from the safetensors checkpoint at FileName (see the
+// GPT-NEOX IMPORT section of the unit header). The net takes a (SeqLen,1,1)
+// volume of token ids and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses
+// the full max_position_embeddings context. pInferenceOnly = True frees
+// training volumes during construction (Compute()-only afterwards).
+// Config.Prefix is detected from the checkpoint and written back.
+function BuildGPTNeoXFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGPTNeoXConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildGPTNeoXFromSafeTensorsEx(const FileName: string;
+  out Config: TGPTNeoXConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildGPTNeoXFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+type
   // The encoder families sharing the BERT skeleton (selected by
   // config.json's model_type; see the BERT IMPORT section of the header).
   TBertFamily = (bfBert, bfDistilBert, bfRoberta);
@@ -539,7 +638,8 @@ procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, llama, mistral, qwen2, bert, distilbert, roberta. Anything else
+// gpt_neo, gpt_neox, llama, mistral, qwen2, bert, distilbert, roberta.
+// Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
 // choice. OUTPUT SEMANTICS DIFFER BY model_type: the decoder families
@@ -1896,6 +1996,544 @@ begin
     pInferenceOnly);
 end;
 
+// =========================== GPT-NEOX IMPORT ===============================
+
+function ReadGPTNeoXConfigFromJSONFile(const FileName: string): TGPTNeoXConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+  Field: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('GPT-NeoX import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('GPT-NeoX import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('GPT-NeoX import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('GPT-NeoX import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('GPT-NeoX import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'gpt_neox');
+    if ModelType <> 'gpt_neox' then
+      ImportError('GPT-NeoX import: config model_type is "' + ModelType +
+        '" - expected "gpt_neox" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-5);
+    // rotary_pct is the classic GPTNeoXConfig key; newer transformers
+    // versions serialize the same fraction as partial_rotary_factor.
+    Result.RotaryPct := Obj.Get('rotary_pct',
+      Obj.Get('partial_rotary_factor', 0.25));
+    if (Result.RotaryPct <= 0) or (Result.RotaryPct > 1) then
+      ImportError('GPT-NeoX import: config rotary_pct must be in (0, 1], ' +
+        'got ' + FloatToStr(Result.RotaryPct) + '.');
+    // rotary_emb_base is the classic key; rope_theta the newer spelling.
+    Result.RopeTheta := Obj.Get('rope_theta',
+      Obj.Get('rotary_emb_base', 10000.0));
+    Field := Obj.Find('rope_scaling');
+    if (Field <> nil) and not Field.IsNull then
+      ImportError('GPT-NeoX import: config carries a non-null ' +
+        '"rope_scaling" - long-context RoPE scaling is not wired into ' +
+        'this importer yet.');
+    Result.UseParallelResidual := Obj.Get('use_parallel_residual', True);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    HiddenAct := Obj.Get('hidden_act', 'gelu');
+    if HiddenAct = 'gelu' then
+      Result.HiddenActTanh := False // exact erf form (the Pythia default)
+    else if (HiddenAct = 'gelu_new') or
+            (HiddenAct = 'gelu_pytorch_tanh') then
+      Result.HiddenActTanh := True
+    else
+      ImportError('GPT-NeoX import: config hidden_act "' + HiddenAct +
+        '" is not supported - only "gelu" (exact), "gelu_new" and ' +
+        '"gelu_pytorch_tanh" are wired here.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function GPTNeoXConfigToString(const Config: TGPTNeoXConfig): string;
+begin
+  Result := 'gpt_neox config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', rotary_pct=' + FloatToStr(Config.RotaryPct) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', parallel=' + BoolToStr(Config.UseParallelResidual, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.HiddenActTanh then
+    Result := Result + ', act=gelu_tanh'
+  else
+    Result := Result + ', act=gelu_exact';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+// Loads the fused GPT-NeoX query_key_value nn.Linear ([3*hidden, hidden]
+// weight + [3*hidden] bias) into a TNNetPointwiseConvLinear Q|K|V slab
+// (q -> neurons 0..hidden-1, k -> hidden..2*hidden-1, v -> 2*hidden..).
+// The checkpoint interleaves PER HEAD: source row r belongs to head
+// h = r div (3*head_dim), within which the first head_dim rows are q, the
+// next head_dim k, the last head_dim v (HF view(.., heads, 3*head_dim)
+// then thirds). On top of the de-interleave, the first RotaryDims rows of
+// every q and k head are PERMUTED from HF's rotate_half (first-half /
+// second-half within the rotary slice) into TNNetRotaryEmbedding's
+// interleaved (even/odd) pair layout - the Llama permutation restricted to
+// the rotary slice; v rows and the non-rotary tail load straight.
+procedure LoadGPTNeoXQKVWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  Hidden, Heads, HeadDim, RotaryDims: integer);
+var
+  W, B: TNNetVolume;
+  r, i, HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('GPT-NeoX import: missing tensor "' + WName + '".');
+  if not Reader.HasTensor(BName) then
+    ImportError('GPT-NeoX import: missing tensor "' + BName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> 3 * Hidden) or
+     (Reader.DimSize(WName, 1) <> Hidden) then
+    ImportError('GPT-NeoX import: "' + WName + '" must have shape [' +
+      IntToStr(3 * Hidden) + ', ' + IntToStr(Hidden) + '] (nn.Linear ' +
+      'stores [out, in]), got ' + Reader.ShapeAsString(WName));
+  if (Reader.DimCount(BName) <> 1) or
+     (Reader.DimSize(BName, 0) <> 3 * Hidden) then
+    ImportError('GPT-NeoX import: "' + BName + '" must have shape [' +
+      IntToStr(3 * Hidden) + '], got ' + Reader.ShapeAsString(BName));
+  if Layer.Neurons.Count <> 3 * Hidden then
+    ImportError('GPT-NeoX import: internal error - layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(3 * Hidden) + '.');
+  RotHalf := RotaryDims div 2;
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    for r := 0 to 3 * Hidden - 1 do
+    begin
+      HeadIdx := r div (3 * HeadDim);
+      Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
+      RowInHead := r mod HeadDim;
+      // rotate_half -> interleaved permutation, RESTRICTED to the first
+      // RotaryDims rows of q and k heads (the partial-rotary slice).
+      TargetRow := RowInHead;
+      if (Third < 2) and (RowInHead < RotaryDims) then
+      begin
+        if RowInHead < RotHalf then
+          TargetRow := 2 * RowInHead
+        else
+          TargetRow := 2 * (RowInHead - RotHalf) + 1;
+      end;
+      TargetIdx := Third * Hidden + HeadIdx * HeadDim + TargetRow;
+      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+        ImportError('GPT-NeoX import: internal error - neuron ' +
+          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
+          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          ' weights, expected ' + IntToStr(Hidden) + '.');
+      for i := 0 to Hidden - 1 do
+        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      Layer.Neurons[TargetIdx].BiasWeight := B.FData[r];
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+type
+  TGPTNeoXBlockLayers = record
+    LN1, QKV, AttnDense, LN2, HTo4H, FourHToH: TNNetLayer;
+  end;
+
+function BuildGPTNeoXFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGPTNeoXConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TGPTNeoXBlockLayers;
+  EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
+  BranchInput, AttnOut, MlpOut, QKVLayer: TNNetLayer;
+  RotSlice, PassSlice, QHead, KHead, VHead, HeadPack: TNNetLayer;
+  GELUSource, PhiBranch: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  RotChannels, PassChannels, VChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, HeadDim, RotaryDims, i, j, d: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // x*Phi(x), the exact erf GELU, composed from existing layers exactly
+  // like the BERT path (see the BERT IMPORT section of the unit header).
+  procedure AddExactOrTanhGELU;
+  begin
+    if Config.HiddenActTanh then
+      NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
+    else
+    begin
+      GELUSource := NN.GetLastLayer();
+      NN.AddLayerAfter(
+        TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
+      NN.AddLayer( TNNetErf.Create() );
+      NN.AddLayer( TNNetAddConstant.Create(1.0) );
+      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
+      NN.AddLayer( TNNetReGLU.Create() );
+    end;
+  end;
+
+begin
+  Reader := TNNetSafeTensorsReader.Create(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('GPT-NeoX import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('GPT-NeoX import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if (Config.RotaryPct <= 0) or (Config.RotaryPct > 1) then
+        ImportError('GPT-NeoX import: rotary_pct must be in (0, 1].');
+      // HF: rotary_ndims = int(head_size * rotary_pct) - truncation.
+      RotaryDims := Trunc(HeadDim * Config.RotaryPct);
+      if (RotaryDims < 2) or Odd(RotaryDims) then
+        ImportError('GPT-NeoX import: rotary_ndims = int(head_dim * ' +
+          'rotary_pct) = ' + IntToStr(RotaryDims) + ' must be an even ' +
+          'number >= 2 (RoPE rotates channel pairs).');
+      if Reader.HasTensor('gpt_neox.embed_in.weight') then
+        Config.Prefix := 'gpt_neox.'
+      else if Reader.HasTensor('embed_in.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('GPT-NeoX import: neither "gpt_neox.embed_in.weight" ' +
+          'nor "embed_in.weight" found in ' + Reader.FileName +
+          ' - not a GPT-NeoX checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embed_in.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embed_in.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_in.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('GPT-NeoX import: embed_in.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_in.weight'));
+      // embed_out (the untied LM head) sits OUTSIDE the gpt_neox. prefix in
+      // GPTNeoXForCausalLM exports (like lm_head.weight in the Llama path).
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('embed_out.weight')) then
+        ImportError('GPT-NeoX import: config says tie_word_embeddings=' +
+          'false (the GPT-NeoX/Pythia convention) but "embed_out.weight" ' +
+          'is missing from ' + Reader.FileName + ' - a bare GPTNeoXModel ' +
+          'export carries no LM head.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('GPT-NeoX import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real BPE token, not padding.
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(RotChannels, RotaryDims);
+      SetLength(PassChannels, HeadDim - RotaryDims);
+      SetLength(VChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // Attention branch: dense(MHA-with-partial-RoPE(LN_1(x))).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN1 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        QKVLayer := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        Blocks[BlockCnt].QKV := QKVLayer;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          // PARTIAL ROTARY per head: RoPE on the first RotaryDims channels
+          // of the Q and K slices, pass-through on the rest. The rotary
+          // slice feeds a depth-RotaryDims TNNetRotaryEmbedding, so the
+          // layer's frequency schedule theta^(-2k/RotaryDims) matches HF's
+          // inv_freq over rotary_ndims exactly.
+          for d := 0 to RotaryDims - 1 do
+            RotChannels[d] := HeadCnt * HeadDim + d;
+          for d := 0 to HeadDim - RotaryDims - 1 do
+            PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
+          // Q slice of head HeadCnt (slab channels h*hd..h*hd+hd-1).
+          RotSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(RotChannels), QKVLayer);
+          RotSlice := NN.AddLayerAfter(
+            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+          if HeadDim > RotaryDims then
+          begin
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels), QKVLayer);
+            QHead := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+            QHead := RotSlice;
+          // K slice (slab channels hidden + h*hd...).
+          for d := 0 to RotaryDims - 1 do
+            RotChannels[d] := Config.HiddenSize + HeadCnt * HeadDim + d;
+          for d := 0 to HeadDim - RotaryDims - 1 do
+            PassChannels[d] :=
+              Config.HiddenSize + HeadCnt * HeadDim + RotaryDims + d;
+          RotSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(RotChannels), QKVLayer);
+          RotSlice := NN.AddLayerAfter(
+            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
+          if HeadDim > RotaryDims then
+          begin
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels), QKVLayer);
+            KHead := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+            KHead := RotSlice;
+          // V slice (slab channels 2*hidden + h*hd..., one contiguous
+          // head_dim-wide slice; V is never rotated).
+          for d := 0 to HeadDim - 1 do
+            VChannels[d] := 2 * Config.HiddenSize + HeadCnt * HeadDim + d;
+          VHead := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(VChannels), QKVLayer);
+          // Pack [Q_h | K_h | V_h] (width 3*head_dim) for the scaled SDPA
+          // (GPT-NeoX uses the standard 1/sqrt(head_dim) scaling).
+          HeadPack := NN.AddLayer(
+            TNNetDeepConcat.Create([QHead, KHead, VHead]) );
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim,
+              {CausalMask=}true), HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].AttnDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        AttnOut := NN.GetLastLayer();
+        if Config.UseParallelResidual then
+          // PARALLEL residual: the MLP branch reads the BLOCK INPUT through
+          // its own LayerNorm; one fused 3-input sum closes the block:
+          //   x := x + Attn(LN_1(x)) + MLP(LN_2(x))
+          Blocks[BlockCnt].LN2 := NN.AddLayerAfter(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput)
+        else
+        begin
+          // SEQUENTIAL (use_parallel_residual=false): close the attention
+          // residual first, then the MLP reads the attention output.
+          AttnOut := NN.AddLayer(
+            TNNetSum.Create([AttnOut, BranchInput]) );
+          Blocks[BlockCnt].LN2 := NN.AddLayer(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        end;
+        Blocks[BlockCnt].HTo4H := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        AddExactOrTanhGELU;
+        Blocks[BlockCnt].FourHToH := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        MlpOut := NN.GetLastLayer();
+        if Config.UseParallelResidual then
+          NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) )
+        else
+          NN.AddLayer( TNNetSum.Create([MlpOut, AttnOut]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        // embed_in -> embedding table (vocab rows of d floats).
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_in.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('GPT-NeoX import: embed_in.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'embed_in.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          // Tied LM head (NOT the Pythia convention, but cheap to support):
+          // logits = h . embed_in^T, rows copied, bias-free.
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor('embed_out.weight') then
+            MarkConsumed('embed_out.weight');
+        end
+        else
+        begin
+          // UNTIED head (Pythia): embed_out is its own [vocab, hidden]
+          // nn.Linear weight, bias-free.
+          LoadLlamaLinearWeights(Reader, LMHead, 'embed_out.weight',
+            Config.HiddenSize, Config.VocabSize);
+          MarkConsumed('embed_out.weight');
+        end;
+      finally
+        Tmp.Free;
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'attention.';
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN1,
+          BlockPrefix + 'input_layernorm.weight',
+          BlockPrefix + 'input_layernorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        MarkConsumed(BlockPrefix + 'input_layernorm.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].LN2,
+          BlockPrefix + 'post_attention_layernorm.weight',
+          BlockPrefix + 'post_attention_layernorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+        MarkConsumed(BlockPrefix + 'post_attention_layernorm.bias');
+        // Fused per-head-interleaved query_key_value -> Q|K|V slab with the
+        // partial-rotary rotate_half permutation composed in.
+        LoadGPTNeoXQKVWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'query_key_value.weight',
+          AttnPrefix + 'query_key_value.bias',
+          Config.HiddenSize, Config.NumHeads, HeadDim, RotaryDims);
+        MarkConsumed(AttnPrefix + 'query_key_value.weight');
+        MarkConsumed(AttnPrefix + 'query_key_value.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
+          AttnPrefix + 'dense.weight', Config.HiddenSize,
+          Config.HiddenSize, 0, -1, 0, AttnPrefix + 'dense.bias');
+        MarkConsumed(AttnPrefix + 'dense.weight');
+        MarkConsumed(AttnPrefix + 'dense.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].HTo4H,
+          BlockPrefix + 'mlp.dense_h_to_4h.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'mlp.dense_h_to_4h.bias');
+        MarkConsumed(BlockPrefix + 'mlp.dense_h_to_4h.weight');
+        MarkConsumed(BlockPrefix + 'mlp.dense_h_to_4h.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].FourHToH,
+          BlockPrefix + 'mlp.dense_4h_to_h.weight', Config.IntermediateSize,
+          Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'mlp.dense_4h_to_h.bias');
+        MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.weight');
+        MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.bias');
+      end;
+      LoadLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'final_layer_norm.weight',
+        Config.Prefix + 'final_layer_norm.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'final_layer_norm.weight');
+      MarkConsumed(Config.Prefix + 'final_layer_norm.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      // Every tensor must be consumed or be a known ignorable buffer:
+      //  - layers.N.attention.bias / .masked_bias: the causal-mask buffers
+      //    older PyTorch exports serialize (the mask is structural here);
+      //  - rotary_emb.inv_freq: RoPE buffers (structural, rebuilt from the
+      //    config's base).
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if (Pos('.attention.bias', TensorNameStr) > 0) or
+           (Pos('.attention.masked_bias', TensorNameStr) > 0) or
+           (Pos('rotary_emb.inv_freq', TensorNameStr) > 0) then continue;
+        ImportError('GPT-NeoX import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildGPTNeoXFromSafeTensorsEx(const FileName: string;
+  out Config: TGPTNeoXConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadGPTNeoXConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildGPTNeoXFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildGPTNeoXFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TGPTNeoXConfig;
+begin
+  Result := BuildGPTNeoXFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly);
+end;
+
 // ============================ BERT IMPORT ==================================
 
 function ReadBertConfigFromJSONFile(const FileName: string): TBertConfig;
@@ -2569,6 +3207,7 @@ var
   NumHeads: integer;
   IgnoredLlamaConfig: TLlamaConfig;
   IgnoredGPTNeoConfig: TGPTNeoConfig;
+  IgnoredGPTNeoXConfig: TGPTNeoXConfig;
   IgnoredBertConfig: TBertConfig;
 begin
   // ---- resolve the weights file and the config.json ----
@@ -2625,6 +3264,9 @@ begin
   else if ModelType = 'gpt_neo' then
     Result := BuildGPTNeoFromSafeTensorsEx(WeightsPath, IgnoredGPTNeoConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
+  else if ModelType = 'gpt_neox' then
+    Result := BuildGPTNeoXFromSafeTensorsEx(WeightsPath, IgnoredGPTNeoXConfig,
+      pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') then
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
@@ -2643,8 +3285,8 @@ begin
     Result := nil;
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
-      'model_types: gpt2, gpt_neo, llama, mistral, qwen2, bert, ' +
-      'distilbert, roberta.');
+      'model_types: gpt2, gpt_neo, gpt_neox, llama, mistral, qwen2, ' +
+      'bert, distilbert, roberta.');
   end;
 end;
 

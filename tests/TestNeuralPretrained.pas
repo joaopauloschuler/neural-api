@@ -77,6 +77,9 @@ type
     procedure TestQwen2LogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
+    procedure TestGPTNeoXConfigFromJSONFile;
+    procedure TestGPTNeoXLogitParity;
+    procedure TestGPTNeoXSequentialLogitParity;
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
@@ -1349,6 +1352,95 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestGPTNeoXConfigFromJSONFile;
+var
+  Config: TGPTNeoXConfig;
+begin
+  RandSeed := 424242;
+  Config := ReadGPTNeoXConfigFromJSONFile(
+    FixturePath('tiny_gptneox_config.json'));
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  // 24, deliberately NOT 4*hidden in the fixture.
+  AssertEquals('intermediate_size', 24, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('max_position_embeddings', 16, Config.MaxPositions);
+  AssertEquals('layer_norm_eps', 1e-5, Config.LayerNormEps, 1e-9);
+  AssertEquals('rotary_pct', 0.25, Config.RotaryPct, 1e-9);
+  AssertEquals('rotary_emb_base', 10000.0, Config.RopeTheta, 1e-6);
+  AssertTrue('use_parallel_residual', Config.UseParallelResidual);
+  AssertFalse('tie_word_embeddings (Pythia untied)',
+    Config.TieWordEmbeddings);
+  AssertFalse('hidden_act gelu = exact erf form', Config.HiddenActTanh);
+  // The sequential-variant config flips ONLY use_parallel_residual.
+  Config := ReadGPTNeoXConfigFromJSONFile(
+    FixturePath('tiny_gptneox_seq_config.json'));
+  AssertFalse('seq variant use_parallel_residual',
+    Config.UseParallelResidual);
+end;
+
+// Verifies the GPT-NeoX (Pythia-architecture) import:
+// tests/fixtures/tiny_gptneox.* is a pico randomly-initialized HF
+// GPTNeoXForCausalLM (2 layers, 2 heads x 8 dims, hidden 16,
+// intermediate 24 deliberately != 4*hidden, vocab 11) covering the
+// GPT-NeoX quirks: PARALLEL two-LayerNorm residual
+// (x + Attn(LN1(x)) + MLP(LN2(x))), PARTIAL rotary (rotary_pct=0.25 ->
+// RoPE on only the first 2 of 8 head dims; the generator
+// tools/gptneox_tiny_fixture.py asserts rotary_pct=1.0 would change the
+// logits by ~0.12), the fused per-head-interleaved query_key_value
+// projection, the exact erf "gelu" and the UNTIED embed_in/embed_out
+// pair. Reference logits come from HF transformers in float64.
+procedure TTestNeuralPretrained.TestGPTNeoXLogitParity;
+var
+  NN: TNNet;
+  Config: TGPTNeoXConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildGPTNeoXFromSafeTensorsEx(
+    FixturePath('tiny_gptneox.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gptneox_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertTrue('use_parallel_residual', Config.UseParallelResidual);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'gpt_neox.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gptneox_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// use_parallel_residual=false (the sequential pre-LN fallback): the SAME
+// tiny_gptneox.safetensors weights under the flipped config must match the
+// HF sequential-forward logits (the generator asserts the two residual
+// wirings differ by ~2.5e-2 on these weights, so this parity run genuinely
+// pins the sequential path).
+procedure TTestNeuralPretrained.TestGPTNeoXSequentialLogitParity;
+var
+  NN: TNNet;
+  Config: TGPTNeoXConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildGPTNeoXFromSafeTensorsEx(
+    FixturePath('tiny_gptneox.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gptneox_seq_config.json'));
+  try
+    AssertFalse('sequential residual', Config.UseParallelResidual);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gptneox_seq_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestBertConfigFromJSONFile;
 var
   Config: TBertConfig;
@@ -1636,6 +1728,15 @@ begin
   try
     AssertLogitParityWithFixture(NN, FixturePath('tiny_gptneo_logits.json'),
       16, 11);
+  finally
+    NN.Free;
+  end;
+  // ---- gpt_neox through the file route ----
+  NN := BuildFromPretrained(FixturePath('tiny_gptneox.safetensors'), 0,
+    false, FixturePath('tiny_gptneox_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gptneox_logits.json'), 16, 11);
   finally
     NN.Free;
   end;

@@ -11687,13 +11687,21 @@ type
       // d_model is inferred from the input depth. CausalMask/UseRoPE/Variant/
       // NumSinks are forwarded to AddMultiHeadSelfAttention (same UseRoPE
       // caveat: pair with a TOKEN-ONLY embedding). NormClass=nil defaults to
-      // TNNetLayerNorm (e.g. TNNetRMSNorm, TNNetDyT also fit). Returns the
-      // TNNetSum output layer of the block.
+      // TNNetLayerNorm (e.g. TNNetRMSNorm, TNNetDyT also fit).
+      // SeparateNorms=true uses the GPT-NeoX formulation instead (Black et
+      // al. 2022; config use_parallel_residual=true, the Pythia default):
+      //   y = x + MHA(Norm1(x)) + FFN(Norm2(x))
+      // - each branch gets its OWN NormClass instance (input_layernorm /
+      // post_attention_layernorm in HF gpt_neox), both fed from x. With
+      // identical norm weights the two forms coincide; they diverge as soon
+      // as training updates the norms independently. Returns the TNNetSum
+      // output layer of the block.
       function AddParallelTransformerBlock(Heads, d_ff: integer;
         CausalMask: boolean = false; UseRoPE: boolean = false;
         NormClass: TNNetLayerClass = nil;
         Variant: TNNetAttentionVariant = avSDPA;
-        NumSinks: integer = 1): TNNetLayer;
+        NumSinks: integer = 1;
+        SeparateNorms: boolean = false): TNNetLayer;
       // Composite builder: interleaves weightless Token Merging (ToMe) BETWEEN
       // transformer encoder blocks following the paper's per-block schedule.
       // Stacks Blocks encoder blocks; after each of the first Blocks-1 blocks it
@@ -47062,9 +47070,10 @@ function TNNet.AddParallelTransformerBlock(Heads, d_ff: integer;
   CausalMask: boolean = false; UseRoPE: boolean = false;
   NormClass: TNNetLayerClass = nil;
   Variant: TNNetAttentionVariant = avSDPA;
-  NumSinks: integer = 1): TNNetLayer;
+  NumSinks: integer = 1;
+  SeparateNorms: boolean = false): TNNetLayer;
 var
-  BlockInput, SharedNorm, AttnOut, FFNOut: TNNetLayer;
+  BlockInput, AttnNorm, FFNSource, AttnOut, FFNOut: TNNetLayer;
   d_model: integer;
 begin
   if NormClass = nil then NormClass := TNNetLayerNorm;
@@ -47072,19 +47081,24 @@ begin
   d_model := BlockInput.Output.Depth;  // inferred residual-stream width
   // ONE shared pre-norm feeding BOTH branches (the PaLM formulation):
   //   y = x + MHA(Norm(x)) + FFN(Norm(x))
-  SharedNorm := AddLayer( NormClass.Create() );
+  // SeparateNorms=true (GPT-NeoX): each branch gets its OWN norm fed from x:
+  //   y = x + MHA(Norm1(x)) + FFN(Norm2(x))
+  AttnNorm := AddLayer( NormClass.Create() );
+  FFNSource := AttnNorm; // shared norm: FFN reads the same normalized x
 
-  // ---- Attention branch (chained off SharedNorm). Token-wise QKV slab ----
+  // ---- Attention branch (chained off AttnNorm). Token-wise QKV slab ----
   // projection d_model -> 3*d_model (1x1 conv per token), which
   // AddMultiHeadSelfAttention consumes and out-projects back to d_model.
   AddLayer( TNNetPointwiseConvLinear.Create(3 * d_model) );
   AttnOut := AddMultiHeadSelfAttention(Heads, CausalMask, UseRoPE,
     Variant, NumSinks);
 
-  // ---- FFN branch (attached to the SAME SharedNorm via AddLayerAfter). ----
+  // ---- FFN branch (attached to its source norm via AddLayerAfter). ----
   // Token-wise SwiGLU FFN (1x1 convs preserve the sequence axis). TNNetSwiGLU
   // halves the depth channel-wise, so the inner projection must be 2*d_ff.
-  AddLayerAfter( TNNetPointwiseConvLinear.Create(2 * d_ff), SharedNorm );
+  if SeparateNorms then
+    FFNSource := AddLayerAfter( NormClass.Create(), BlockInput );
+  AddLayerAfter( TNNetPointwiseConvLinear.Create(2 * d_ff), FFNSource );
   AddLayer( TNNetSwiGLU.Create() );
   FFNOut := AddLayer( TNNetPointwiseConvLinear.Create(d_model) );
 

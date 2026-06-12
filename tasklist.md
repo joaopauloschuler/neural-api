@@ -503,19 +503,29 @@ rather than acted on.
       sliced parity fixture. The cheapest credible answer to "import a
       trained GPT-3-class model"; doc cross-link target for
       ../gpt-3-for-pascal.
-- [ ] GPT-J / GPT-NeoX (Pythia) importer — the workhorse open GPT-3-class
-      science suite (Pythia: 70M..12B with many training-step snapshots,
-      untied embeddings; the untied-head path landed with the Llama
-      importer). Two ingredients: the PARALLEL residual block
-      (x + Attn(LN(x)) + FFN(LN(x)) — the shared-LN gptj/PaLM form is landed
-      as AddParallelTransformerBlock; the two-LN gpt_neox form, gated by
-      use_parallel_residual, is a small builder variant) and PARTIAL rotary
-      (rotary_pct: only the
-      first d_rot dims of each head get RoPE; the landed RoPE rotates full
-      head dim). Adds "gptj"/"gpt_neox" AutoModel routes; Pythia-70M/160M
-      are CPU-sized parity targets, larger ones load via the (landed)
-      sharded-safetensors support. Verify against GPTNeoXForCausalLM
-      with the parity fixture tooling.
+- [X] GPT-NeoX (Pythia) importer — BuildGPTNeoXFromSafeTensors in
+      neural/neuralpretrained.pas: parallel two-LN residual
+      (x + Attn(LN1(x)) + MLP(LN2(x)); use_parallel_residual=false
+      sequential fallback also wired), PARTIAL rotary (rotary_pct via
+      per-head channel split + RoPE on the first d_rot dims, rotate_half
+      permutation restricted to the rotary slice), fused per-head-
+      interleaved query_key_value de-interleave, exact erf "gelu", untied
+      embed_in/embed_out, "gpt_neox" AutoModel route, SeparateNorms variant
+      on AddParallelTransformerBlock. Pinned pico fixtures
+      (tools/gptneox_tiny_fixture.py, parallel + sequential) at parity
+      <1e-4; REAL EleutherAI/pythia-70m verified end-to-end via
+      HubFetchModel: max |logit diff| 0.058 (~6e-5 relative) vs the HF
+      float64 oracle (HF's own f32 forward is off by 13.0), argmax
+      identical at all 16 positions.
+- [ ] GPT-J importer — the gptj sibling of the landed gpt_neox path:
+      SHARED-LN parallel residual (AddParallelTransformerBlock's default
+      form, already landed), FULL-but-partial rotary (rotary_dim=64 of
+      head_dim 256 for GPT-J-6B) with the INTERLEAVED (GPT-J) RoPE pair
+      layout — i.e. NO rotate_half permutation when loading q/k, unlike
+      gpt_neox/llama, the partial-rotary split wiring is already in the
+      gpt_neox builder to crib from. Separate q/k/v projections (bias-free)
+      + out_proj, lm_head WITH bias, tied=false. GPT-J-6B is too big for
+      CI: pin a pico GPTJForCausalLM fixture (tools/ script convention).
 - [ ] Gemma 1 - head_dim config override in the Llama import path: the ONE
       structural gap for Gemma-1 — neural/neuralpretrained.pas (~line 771)
       hardcodes HeadDim := HiddenSize div NumHeads, but Gemma-7B has

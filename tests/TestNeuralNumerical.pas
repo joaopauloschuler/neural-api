@@ -14908,7 +14908,7 @@ procedure TTestNeuralNumerical.TestParallelTransformerBlockTrainsAndVariants;
 var
   NN: TNNet;
   Input, Desired: TNNetVolume;
-  i, SeqLen, d_model: integer;
+  i, SeqLen, d_model, lnCount: integer;
   LossBefore, LossAfter: TNeuralFloat;
 begin
   RandSeed := 424242;
@@ -14963,6 +14963,39 @@ begin
     NN.Compute(Input);
     for i := 0 to NN.GetLastLayer.Output.Size - 1 do
       AssertTrue('Parallel avQKNorm finite forward at ' + IntToStr(i),
+        not IsNan(NN.GetLastLayer.Output.Raw[i]) and
+        not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
+  finally
+    NN.Free; Input.Free;
+  end;
+
+  // ---- (f) SeparateNorms=true (the GPT-NeoX two-LN parallel form:
+  // y = x + MHA(Norm1(x)) + FFN(Norm2(x))) must compose, carry exactly TWO
+  // LayerNorm instances (shared form has one), keep the shape and produce a
+  // finite forward pass.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, d_model);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model));
+    NN.AddParallelTransformerBlock({Heads=}2, {d_ff=}16, {CausalMask=}true,
+      {UseRoPE=}false, {NormClass=}nil, {Variant=}avSDPA, {NumSinks=}1,
+      {SeparateNorms=}true);
+    AssertEquals('SeparateNorms block output SizeX', SeqLen,
+      NN.GetLastLayer.Output.SizeX);
+    AssertEquals('SeparateNorms block output Depth', d_model,
+      NN.GetLastLayer.Output.Depth);
+    AssertTrue('SeparateNorms block ends in the fused 3-input TNNetSum',
+      NN.GetLastLayer is TNNetSum);
+    lnCount := 0;
+    for i := 0 to NN.CountLayers - 1 do
+      if NN.Layers[i] is TNNetLayerNorm then Inc(lnCount);
+    AssertEquals('SeparateNorms block carries TWO LayerNorms (one per ' +
+      'branch)', 2, lnCount);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.41) * 0.8;
+    NN.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertTrue('SeparateNorms finite forward at ' + IntToStr(i),
         not IsNan(NN.GetLastLayer.Output.Raw[i]) and
         not IsInfinite(NN.GetLastLayer.Output.Raw[i]));
   finally
