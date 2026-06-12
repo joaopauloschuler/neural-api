@@ -12,6 +12,11 @@ unit neuralpretrained;
 //     BuildMistralFromSafeTensors.
 //   - Qwen2 (the Llama skeleton + q/k/v projection biases; o_proj and the
 //     MLP stay bias-free) - BuildQwen2FromSafeTensors.
+//   - Qwen3 (the Llama skeleton WITHOUT q/k/v biases + per-head RMSNorm on
+//     q and k applied AFTER projection and BEFORE RoPE, gain shape
+//     [head_dim] shared across heads, plus an optionally DECOUPLED
+//     head_dim where num_heads*head_dim <> hidden_size) -
+//     BuildQwen3FromSafeTensors.
 //   - GPT-Neo (EleutherAI's GPT-3 replica; the roneneldan/TinyStories
 //     checkpoints share this architecture) - BuildGPTNeoFromSafeTensors.
 //     See the GPT-NEO IMPORT section below.
@@ -376,26 +381,35 @@ type
     RmsNormEps: TNeuralFloat;  // rms_norm_eps
     RopeTheta: TNeuralFloat;   // rope_theta (RoPE base)
     TieWordEmbeddings: boolean;// tie_word_embeddings (lm_head := embed)
-    ModelType: string;         // 'llama', 'mistral' or 'qwen2'
+    ModelType: string;         // 'llama', 'mistral', 'qwen2' or 'qwen3'
     SlidingWindow: integer;    // sliding-window width; 0 = full attention
     QKVBias: boolean;          // q/k/v projections carry biases (Qwen2)
+    HeadDim: integer;          // per-head width; 0 = hidden_size/num_heads
+    QKNorm: boolean;           // per-head RMSNorm on q/k pre-RoPE (Qwen3)
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
-// Reads a HF Llama-family config.json (model_type 'llama', 'mistral' or
-// 'qwen2'). Required: hidden_size, intermediate_size, num_hidden_layers,
-// num_attention_heads, vocab_size, max_position_embeddings. Defaults:
-// num_key_value_heads = num_attention_heads, rms_norm_eps = 1e-6,
-// rope_theta = 10000, tie_word_embeddings = false. Family deltas:
+// Reads a HF Llama-family config.json (model_type 'llama', 'mistral',
+// 'qwen2' or 'qwen3'). Required: hidden_size, intermediate_size,
+// num_hidden_layers, num_attention_heads, vocab_size,
+// max_position_embeddings. Defaults: num_key_value_heads =
+// num_attention_heads, rms_norm_eps = 1e-6, rope_theta = 10000,
+// tie_word_embeddings = false. An explicit head_dim is honored even when
+// num_heads*head_dim <> hidden_size (Qwen3-0.6B: head_dim=128 with
+// hidden=1024, heads=16); absent/null falls back to
+// hidden_size/num_attention_heads (HeadDim stays 0). Family deltas:
 //   mistral: SlidingWindow := sliding_window (null/absent = 0 = full
 //            attention - many Mistral configs disable it);
 //   qwen2:   QKVBias := true (q/k/v carry biases; o_proj does not); a
 //            use_sliding_window=true config is rejected (Qwen2 windows
 //            only its FIRST max_window_layers layers - not wired here);
+//   qwen3:   QKNorm := true (per-head RMSNorm on q/k BEFORE RoPE, gain
+//            shape [head_dim] shared across heads); QKVBias :=
+//            attention_bias (default false - Qwen3 dropped the biases);
+//            use_sliding_window=true is rejected like Qwen2;
 //   llama:   QKVBias := attention_bias (default false).
-// Fails on an unsupported model_type, on a non-null rope_scaling
-// (long-context scaling is not wired here yet) and on an explicit
-// head_dim differing from hidden_size/num_attention_heads.
+// Fails on an unsupported model_type and on a non-null rope_scaling
+// (long-context scaling is not wired here yet).
 // Prefix is left '' - the builders detect it from the checkpoint.
 function ReadLlamaConfigFromJSONFile(const FileName: string): TLlamaConfig;
 
@@ -442,6 +456,19 @@ function BuildQwen2FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildQwen2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+// Qwen3: the Llama skeleton WITHOUT q/k/v biases, with per-head RMSNorm on
+// q and k (applied after the projection and BEFORE RoPE, gain [head_dim]
+// shared across heads - q_norm.weight/k_norm.weight) and an optionally
+// decoupled head_dim. Thin wrappers over the Llama path that ASSERT the
+// config's model_type is 'qwen3'.
+function BuildQwen3FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildQwen3FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
 type
@@ -722,7 +749,7 @@ procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 //   - a .safetensors / .safetensors.index.json FILE (config.json is read
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
-// gpt_neo, gpt_neox, gptj, llama, mistral, qwen2, bert, distilbert,
+// gpt_neo, gpt_neox, gptj, llama, mistral, qwen2, qwen3, bert, distilbert,
 // roberta. Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
 // builders stay public for callers that want a compile-time architecture
@@ -1126,10 +1153,10 @@ begin
     Obj := TJSONObject(Root);
     ModelType := Obj.Get('model_type', 'llama');
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
-       (ModelType <> 'qwen2') then
+       (ModelType <> 'qwen2') and (ModelType <> 'qwen3') then
       ImportError('Llama import: config model_type is "' + ModelType +
-        '" - only "llama", "mistral" and "qwen2" are supported here ' +
-        '(see BuildFromPretrained for the full dispatch).');
+        '" - only "llama", "mistral", "qwen2" and "qwen3" are supported ' +
+        'here (see BuildFromPretrained for the full dispatch).');
     RopeScaling := Obj.Find('rope_scaling');
     if (RopeScaling <> nil) and not RopeScaling.IsNull then
       ImportError('Llama import: config carries a non-null "rope_scaling" - ' +
@@ -1145,19 +1172,23 @@ begin
     Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
     Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
     Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
-    // An explicit head_dim must agree with hidden_size/num_attention_heads
-    // (Mistral-NeMo-style decoupled head_dim is not wired here).
+    // An explicit head_dim is honored even when it is DECOUPLED from
+    // hidden_size/num_attention_heads (Qwen3-0.6B: head_dim=128 with
+    // hidden=1024, heads=16). Absent/null leaves HeadDim=0 and the builder
+    // falls back to hidden_size div num_attention_heads.
+    Result.HeadDim := 0;
     HeadDimField := Obj.Find('head_dim');
     if (HeadDimField <> nil) and not HeadDimField.IsNull then
-      if (Result.NumHeads < 1) or
-         (HeadDimField.AsInteger * Result.NumHeads <> Result.HiddenSize) then
-        ImportError('Llama import: config head_dim=' + HeadDimField.AsJSON +
-          ' differs from hidden_size/num_attention_heads = ' +
-          IntToStr(Result.HiddenSize) + '/' + IntToStr(Result.NumHeads) +
-          ' - decoupled head dimensions are not wired into this importer.');
+    begin
+      Result.HeadDim := HeadDimField.AsInteger;
+      if Result.HeadDim < 1 then
+        ImportError('Llama import: config head_dim must be a positive ' +
+          'integer or null, got ' + HeadDimField.AsJSON + '.');
+    end;
     // ---- family deltas ----
     Result.SlidingWindow := 0;
     Result.QKVBias := False;
+    Result.QKNorm := False;
     if ModelType = 'mistral' then
     begin
       // Many Mistral configs ship sliding_window=null (full attention).
@@ -1175,6 +1206,16 @@ begin
       Result.QKVBias := True; // Qwen2 q/k/v carry biases; o_proj does not
       if Obj.Get('use_sliding_window', False) then
         ImportError('Llama import: Qwen2 use_sliding_window=true (per-layer ' +
+          'max_window_layers windowing) is not wired into this importer yet.');
+    end
+    else if ModelType = 'qwen3' then
+    begin
+      // Qwen3 dropped the Qwen2 q/k/v biases (attention_bias defaults to
+      // false) and added per-head RMSNorm on q/k before RoPE.
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      Result.QKNorm := True;
+      if Obj.Get('use_sliding_window', False) then
+        ImportError('Llama import: Qwen3 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
     end
     else // llama
@@ -1201,8 +1242,12 @@ begin
     ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
   if Config.SlidingWindow > 0 then
     Result := Result + ', sliding_window=' + IntToStr(Config.SlidingWindow);
+  if Config.HeadDim > 0 then
+    Result := Result + ', head_dim=' + IntToStr(Config.HeadDim);
   if Config.QKVBias then
     Result := Result + ', qkv_bias=true';
+  if Config.QKNorm then
+    Result := Result + ', qk_norm=true';
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -1327,9 +1372,54 @@ begin
   Layer.FlushWeightCache();
 end;
 
+// Loads a Qwen3-style SHARED per-head RMSNorm gain vector [HeadDim] into
+// every per-head TNNetTokenRMSNorm copy in NormLayers (q_norm/k_norm are
+// stored ONCE in the checkpoint but applied to each head's q/k slice).
+// The per-head q/k slices live in the rotate_half-PERMUTED channel order
+// produced by LoadLlamaLinearWeights (RotaryHeadDim), so the gain is
+// permuted the same way: target channel 2k <- HF position k, target
+// channel 2k+1 <- HF position k + HeadDim/2. The RMS denominator itself is
+// permutation-invariant (mean of squares over the whole head).
+procedure LoadLlamaHeadRMSNormWeights(Reader: TNNetSafeTensorsReader;
+  const NormLayers: array of TNNetLayer; const WName: string;
+  HeadDim: integer);
+var
+  Tmp: TNNetVolume;
+  HeadCnt, j, TargetIdx, HalfDim: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Llama import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 1) or
+     (Reader.DimSize(WName, 0) <> HeadDim) then
+    ImportError('Llama import: "' + WName + '" must have shape [' +
+      IntToStr(HeadDim) + '], got ' + Reader.ShapeAsString(WName));
+  HalfDim := HeadDim div 2;
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for HeadCnt := Low(NormLayers) to High(NormLayers) do
+    begin
+      for j := 0 to HeadDim - 1 do
+      begin
+        if j < HalfDim then
+          TargetIdx := 2 * j
+        else
+          TargetIdx := 2 * (j - HalfDim) + 1;
+        NormLayers[HeadCnt].Neurons[0].Weights.FData[TargetIdx] :=
+          Tmp.FData[j]; // gain
+      end;
+      NormLayers[HeadCnt].FlushWeightCache();
+    end;
+  finally
+    Tmp.Free;
+  end;
+end;
+
 type
   TLlamaBlockLayers = record
     AttnNorm, QProj, KProj, VProj, OProj, MlpNorm, GateUp, Down: TNNetLayer;
+    // Per-head q/k RMSNorm copies (Qwen3 QKNorm); empty otherwise.
+    QNorms, KNorms: array of TNNetLayer;
   end;
 
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
@@ -1345,7 +1435,7 @@ var
   KRotated, VSlices, HeadOutputs: array of TNNetLayer;
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
-  HeadDim, KVWidth, i, j, d: integer;
+  HeadDim, QWidth, KVWidth, i, j, d: integer;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr, LMHeadName: string;
   QBiasName, KBiasName, VBiasName: string;
@@ -1372,18 +1462,27 @@ begin
         ImportError('Llama import: num_attention_heads must be >= 1.');
       if Config.NumKVHeads < 1 then
         ImportError('Llama import: num_key_value_heads must be >= 1.');
-      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
-        ImportError('Llama import: hidden_size=' +
-          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
-          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
       if (Config.NumHeads mod Config.NumKVHeads) <> 0 then
         ImportError('Llama import: num_attention_heads=' +
           IntToStr(Config.NumHeads) + ' is not divisible by ' +
           'num_key_value_heads=' + IntToStr(Config.NumKVHeads) + '.');
-      HeadDim := Config.HiddenSize div Config.NumHeads;
+      // An explicit config head_dim wins (it may be DECOUPLED from
+      // hidden_size/num_attention_heads, e.g. Qwen3-0.6B); otherwise the
+      // classic hidden_size div num_attention_heads applies.
+      if Config.HeadDim > 0 then
+        HeadDim := Config.HeadDim
+      else
+      begin
+        if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+          ImportError('Llama import: hidden_size=' +
+            IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+            'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+        HeadDim := Config.HiddenSize div Config.NumHeads;
+      end;
       if Odd(HeadDim) then
         ImportError('Llama import: head_dim=' + IntToStr(HeadDim) +
           ' must be even (RoPE rotates channel pairs).');
+      QWidth := Config.NumHeads * HeadDim;
       KVWidth := Config.NumKVHeads * HeadDim;
       GroupSize := Config.NumHeads div Config.NumKVHeads;
       if Reader.HasTensor('model.embed_tokens.weight') then
@@ -1439,11 +1538,21 @@ begin
           NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         NormedSource := NN.GetLastLayer();
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize), NormedSource);
+          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        // Config.QKNorm (Qwen3): per-head RMSNorm on each q/k slice AFTER
+        // the projection and BEFORE RoPE (the HF modeling_qwen3 ordering:
+        // q_norm(q_proj(x)) then apply_rotary_pos_emb). One
+        // TNNetTokenRMSNorm copy per head; the shared [head_dim] gain is
+        // loaded into every copy below.
+        if Config.QKNorm then
+        begin
+          SetLength(Blocks[BlockCnt].QNorms, Config.NumHeads);
+          SetLength(Blocks[BlockCnt].KNorms, Config.NumKVHeads);
+        end;
         // K is rotated ONCE per KV head; V is never rotated.
         for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
         begin
@@ -1451,6 +1560,12 @@ begin
             SliceChannels[d] := KVHeadCnt * HeadDim + d;
           KSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
+          if Config.QKNorm then
+          begin
+            Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
+              TNNetTokenRMSNorm.Create(Config.RmsNormEps), KSlice);
+            KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
+          end;
           KRotated[KVHeadCnt] := NN.AddLayerAfter(
             TNNetRotaryEmbedding.Create(Config.RopeTheta), KSlice);
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
@@ -1463,6 +1578,12 @@ begin
             SliceChannels[d] := HeadCnt * HeadDim + d;
           QSlice := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+          if Config.QKNorm then
+          begin
+            Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
+              TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
+            QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
+          end;
           QSlice := NN.AddLayerAfter(
             TNNetRotaryEmbedding.Create(Config.RopeTheta), QSlice);
           // Pack [Q_h | K_group | V_group] (width 3*head_dim) for SDPA.
@@ -1561,9 +1682,21 @@ begin
         end;
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
           BlockPrefix + 'self_attn.q_proj.weight',
-          Config.HiddenSize, Config.HiddenSize, 0, -1, HeadDim, QBiasName);
+          Config.HiddenSize, QWidth, 0, -1, HeadDim, QBiasName);
         MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
         if QBiasName <> '' then MarkConsumed(QBiasName);
+        // Qwen3 per-head q/k RMSNorm: one shared [head_dim] gain per block,
+        // copied into every per-head norm (rotate_half-permuted to match
+        // the permuted q/k channel order).
+        if Config.QKNorm then
+        begin
+          LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].QNorms,
+            BlockPrefix + 'self_attn.q_norm.weight', HeadDim);
+          MarkConsumed(BlockPrefix + 'self_attn.q_norm.weight');
+          LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].KNorms,
+            BlockPrefix + 'self_attn.k_norm.weight', HeadDim);
+          MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
+        end;
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
           BlockPrefix + 'self_attn.k_proj.weight',
           Config.HiddenSize, KVWidth, 0, -1, HeadDim, KBiasName);
@@ -1576,7 +1709,7 @@ begin
         if VBiasName <> '' then MarkConsumed(VBiasName);
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
           BlockPrefix + 'self_attn.o_proj.weight',
-          Config.HiddenSize, Config.HiddenSize);
+          QWidth, Config.HiddenSize);
         MarkConsumed(BlockPrefix + 'self_attn.o_proj.weight');
         LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].MlpNorm,
           BlockPrefix + 'post_attention_layernorm.weight', Config.HiddenSize);
@@ -3661,7 +3794,7 @@ begin
   end;
 end;
 
-// ===================== MISTRAL / QWEN2 / DISPATCH ==========================
+// ================== MISTRAL / QWEN2 / QWEN3 / DISPATCH =====================
 
 // Shared wrapper: builds via the Llama path and asserts the config's
 // model_type is the expected family.
@@ -3715,6 +3848,24 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildQwen3FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName);
+end;
+
+function BuildQwen3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildQwen3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly);
 end;
 
@@ -3793,7 +3944,7 @@ begin
     Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
-          (ModelType = 'qwen2') then
+          (ModelType = 'qwen2') or (ModelType = 'qwen3') then
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
@@ -3811,7 +3962,7 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, llama, mistral, ' +
-      'qwen2, bert, distilbert, roberta.');
+      'qwen2, qwen3, bert, distilbert, roberta.');
   end;
 end;
 

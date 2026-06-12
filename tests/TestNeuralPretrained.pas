@@ -75,6 +75,7 @@ type
     procedure TestSmolLM2LogitParity;
     procedure TestMistralLogitParity;
     procedure TestQwen2LogitParity;
+    procedure TestQwen3LogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
     procedure TestGPTNeoXConfigFromJSONFile;
@@ -1297,6 +1298,44 @@ begin
   end;
 end;
 
+// Verifies the Qwen3 import target: tests/fixtures/tiny_qwen3.* is a pico
+// randomly-initialized HF Qwen3ForCausalLM (2 layers, 2 query heads sharing
+// 1 kv head, hidden 8, vocab 13, tied lm_head) exercising both Qwen3 deltas
+// on the Qwen2 path: a DECOUPLED head_dim=6 (num_heads*head_dim = 12 !=
+// hidden_size = 8, the Qwen3-0.6B shape quirk) and per-head q/k RMSNorm
+// applied BEFORE RoPE whose shared [head_dim] gains were re-randomized to
+// NON-ONE values (HF ones-inits them; the generator
+// tools/qwen3_tiny_fixture.py asserts resetting them to ones changes the
+// logits by ~1e-2). No q/k/v biases (Qwen3 dropped them). Reference logits
+// come from HF transformers in float64.
+procedure TTestNeuralPretrained.TestQwen3LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildQwen3FromSafeTensorsEx(FixturePath('tiny_qwen3.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_qwen3_config.json'));
+  try
+    AssertEquals('model_type', 'qwen3', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('head_dim', 6, Config.HeadDim);
+    AssertFalse('qkv_bias', Config.QKVBias);
+    AssertTrue('qk_norm', Config.QKNorm);
+    AssertTrue('tied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestGPTNeoConfigFromJSONFile;
 var
   Config: TGPTNeoConfig;
@@ -1722,7 +1761,8 @@ end;
 //   - gpt2 via a HF-style checkpoint DIRECTORY (config.json +
 //     model.safetensors; n_head read from the config),
 //   - mistral via a directory,
-//   - llama and qwen2 via an explicit .safetensors file + config path.
+//   - llama, qwen2 and qwen3 via an explicit .safetensors file + config
+//     path.
 // Each route must reproduce the family's pinned oracle logits, proving the
 // dispatch reached the correct builder with the correct config.
 procedure TTestNeuralPretrained.TestBuildFromPretrainedDispatch;
@@ -1781,6 +1821,15 @@ begin
   try
     AssertLogitParityWithFixture(NN, FixturePath('tiny_qwen2_logits.json'),
       16, 12);
+  finally
+    NN.Free;
+  end;
+  // ---- qwen3 through the file route ----
+  NN := BuildFromPretrained(FixturePath('tiny_qwen3.safetensors'), 0, false,
+    FixturePath('tiny_qwen3_config.json'));
+  try
+    AssertLogitParityWithFixture(NN, FixturePath('tiny_qwen3_logits.json'),
+      16, 13);
   finally
     NN.Free;
   end;

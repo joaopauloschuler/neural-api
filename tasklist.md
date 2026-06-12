@@ -220,13 +220,21 @@ rather than acted on.
 - [ ] Phi importer: partial-rotary (rotary_pct) attention + parallel
       attention/MLP residual layout — more than a weight-mapping delta on
       the Llama path; reuses the HF-parity fixture tooling.
-- [ ] Qwen3 importer (0.6B is the most-used small instruct model): a small
+- [X] Qwen3 importer (0.6B is the most-used small instruct model): a small
       delta ON the landed Qwen2 path — dropped QKV biases + per-head
       QK-norm, the SAME ingredient as the "Gemma 3 - per-head QK-norm"
       task below, so land that once and both importers consume it.
       Gemma stays broken out in its own per-generation task track below
       (gap analysis 2026-06-11: Gemma-1 is ~80% load-time weight folding
       on the Llama path).
+      DONE 2026-06-12: BuildQwen3FromSafeTensors(Ex) + "qwen3" dispatch;
+      per-head q/k TNNetTokenRMSNorm composed BEFORE RoPE (verified against
+      transformers 5.11 modeling_qwen3.py: q_norm(q_proj(x)) then
+      apply_rotary_pos_emb), shared [head_dim] gain loaded
+      rotate_half-permuted into every head copy
+      (LoadLlamaHeadRMSNormWeights); decoupled config head_dim honored
+      (num_heads*head_dim != hidden_size, div fallback when absent);
+      tiny_qwen3 fixture + parity/dispatch tests.
 - [ ] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
       de-facto checkpoint format, and it ships PRE-quantized weights —
       dovetails with the int8 quantized-inference task (read Q8_0 blocks
@@ -518,6 +526,13 @@ rather than acted on.
       transformers' Gemma3 does (norm placement relative to RoPE changed
       across implementations; pin it against the HF reference, do not
       guess). Gradient check + a wired-into-MHA-builder flag.
+      NOTE 2026-06-12: the reusable composition landed with the Qwen3
+      importer — per-head TNNetTokenRMSNorm copies on the q/k slices with a
+      shared rotate_half-permuted [head_dim] gain
+      (LoadLlamaHeadRMSNormWeights in neural/neuralpretrained.pas), wired
+      BEFORE RoPE there (the verified Qwen3 ordering). Gemma-3 still needs
+      its own placement verification vs HF Gemma3 (norm-vs-RoPE order
+      differs across implementations) + the MHA-builder flag.
 - [ ] Gemma 3 - BuildGemma3FromSafeTensors importer, TEXT-ONLY (depends on
       the QK-norm task + the Gemma-2 importer): 5:1 local:global layer
       ratio (config wiring over the same alternating machinery) and
