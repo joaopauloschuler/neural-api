@@ -28,6 +28,10 @@ type
     // 8-byte little-endian length); Payload is the raw data section.
     function WriteTempSafeTensors(const HeaderJson: string;
       const Payload: array of byte): string;
+    // Byte-for-byte file copy (used to assemble HF-style checkpoint
+    // directories - config.json + model.safetensors - in a temp dir for
+    // the BuildFromPretrained directory-dispatch tests).
+    procedure CopyFileTo(const Src, Dst: string);
     // Shared parity loop: feeds every "sequences" row of the reference
     // logits fixture (JSON {"sequences": [[ids..]..], "logits": [[[..]]]})
     // through NN and asserts max |logit diff| < 1e-4 (hard ceiling 1e-3 -
@@ -56,6 +60,10 @@ type
     procedure TestShardedLlamaLogitsBitIdentical;
     procedure TestDistilGPT2LogitParity;
     procedure TestSmolLM2LogitParity;
+    procedure TestMistralLogitParity;
+    procedure TestQwen2LogitParity;
+    procedure TestBuildFromPretrainedDispatch;
+    procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
   end;
 
 implementation
@@ -91,6 +99,23 @@ begin
       FS.WriteBuffer(Payload[0], Length(Payload));
   finally
     FS.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.CopyFileTo(const Src, Dst: string);
+var
+  SrcStream, DstStream: TFileStream;
+begin
+  SrcStream := TFileStream.Create(Src, fmOpenRead);
+  try
+    DstStream := TFileStream.Create(Dst, fmCreate);
+    try
+      DstStream.CopyFrom(SrcStream, SrcStream.Size);
+    finally
+      DstStream.Free;
+    end;
+  finally
+    SrcStream.Free;
   end;
 end;
 
@@ -836,6 +861,9 @@ begin
   Config.RmsNormEps := 1e-6;
   Config.RopeTheta := 10000;
   Config.TieWordEmbeddings := true;
+  Config.ModelType := 'llama';
+  Config.SlidingWindow := 0;
+  Config.QKVBias := false;
   Config.Prefix := '';
   Failed := false;
   NN := nil;
@@ -1085,6 +1113,184 @@ begin
   finally
     NN.Free;
   end;
+end;
+
+// Verifies the Mistral import target: tests/fixtures/tiny_mistral.* is a
+// pico randomly-initialized HF MistralForCausalLM (2 layers, 2 query heads
+// sharing 1 kv head x 4 dims, hidden 8, vocab 11, untied lm_head) with
+// sliding_window=4 SMALLER than the 16-token test sequences, so the
+// sliding-window mask is genuinely exercised (the generator
+// tools/mistral_qwen2_tiny_fixture.py asserts the windowed logits differ
+// from full attention by ~1e-2 on the same weights). Reference logits come
+// from HF transformers in float64.
+procedure TTestNeuralPretrained.TestMistralLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildMistralFromSafeTensorsEx(FixturePath('tiny_mistral.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_mistral_config.json'));
+  try
+    AssertEquals('model_type', 'mistral', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertEquals('sliding_window', 4, Config.SlidingWindow);
+    AssertFalse('qkv_bias', Config.QKVBias);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_mistral_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Qwen2 import target: tests/fixtures/tiny_qwen2.* is a pico
+// randomly-initialized HF Qwen2ForCausalLM (2 layers, 2 query heads sharing
+// 1 kv head x 4 dims, hidden 8, vocab 12, untied lm_head) whose q/k/v
+// projection biases were re-randomized to NONZERO values (HF zero-inits
+// them; the generator asserts zeroing the biases changes the logits by
+// ~0.15), so the bias-loading path - including the rotate_half permutation
+// of the q/k biases - is genuinely exercised. Reference logits come from
+// HF transformers in float64.
+procedure TTestNeuralPretrained.TestQwen2LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildQwen2FromSafeTensorsEx(FixturePath('tiny_qwen2.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_qwen2_config.json'));
+  try
+    AssertEquals('model_type', 'qwen2', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 12, Config.VocabSize);
+    AssertEquals('sliding_window', 0, Config.SlidingWindow);
+    AssertTrue('qkv_bias', Config.QKVBias);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen2_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// BuildFromPretrained must route on config.json's model_type:
+//   - gpt2 via a HF-style checkpoint DIRECTORY (config.json +
+//     model.safetensors; n_head read from the config),
+//   - mistral via a directory,
+//   - llama and qwen2 via an explicit .safetensors file + config path.
+// Each route must reproduce the family's pinned oracle logits, proving the
+// dispatch reached the correct builder with the correct config.
+procedure TTestNeuralPretrained.TestBuildFromPretrainedDispatch;
+var
+  NN: TNNet;
+  Dir: string;
+  ConfigJson: TStringList;
+begin
+  RandSeed := 424242;
+  // ---- gpt2 through the directory route ----
+  Dir := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    'cai_bfp_gpt2_' + IntToStr(Random(1000000)) + DirectorySeparator;
+  ForceDirectories(Dir);
+  ConfigJson := TStringList.Create;
+  try
+    CopyFileTo(FixturePath('tiny_gpt2.safetensors'),
+      Dir + 'model.safetensors');
+    ConfigJson.Text := '{"model_type": "gpt2", "n_head": 2}';
+    ConfigJson.SaveToFile(Dir + 'config.json');
+    NN := BuildFromPretrained(Dir);
+    try
+      AssertLogitParityWithFixture(NN, FixturePath('tiny_gpt2_logits.json'),
+        16, 11);
+    finally
+      NN.Free;
+    end;
+    // ---- mistral through the directory route ----
+    CopyFileTo(FixturePath('tiny_mistral.safetensors'),
+      Dir + 'model.safetensors');
+    CopyFileTo(FixturePath('tiny_mistral_config.json'), Dir + 'config.json');
+    NN := BuildFromPretrained(Dir);
+    try
+      AssertLogitParityWithFixture(NN,
+        FixturePath('tiny_mistral_logits.json'), 16, 11);
+    finally
+      NN.Free;
+    end;
+  finally
+    ConfigJson.Free;
+    DeleteFile(Dir + 'model.safetensors');
+    DeleteFile(Dir + 'config.json');
+    RemoveDir(Dir);
+  end;
+  // ---- llama through the file route (explicit config path) ----
+  NN := BuildFromPretrained(FixturePath('tiny_llama.safetensors'), 0, false,
+    FixturePath('tiny_llama_config.json'));
+  try
+    AssertLogitParityWithFixture(NN, FixturePath('tiny_llama_logits.json'),
+      16, 11);
+  finally
+    NN.Free;
+  end;
+  // ---- qwen2 through the file route ----
+  NN := BuildFromPretrained(FixturePath('tiny_qwen2.safetensors'), 0, false,
+    FixturePath('tiny_qwen2_config.json'));
+  try
+    AssertLogitParityWithFixture(NN, FixturePath('tiny_qwen2_logits.json'),
+      16, 12);
+  finally
+    NN.Free;
+  end;
+end;
+
+// An unsupported model_type must raise EPretrainedImportError with a
+// message that NAMES the offending type and LISTS the supported ones.
+procedure TTestNeuralPretrained.TestBuildFromPretrainedRejectsUnsupportedModelType;
+var
+  NN: TNNet;
+  ConfigPath, Msg: string;
+  ConfigJson: TStringList;
+  Failed: boolean;
+begin
+  RandSeed := 424242;
+  ConfigPath := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    'cai_bfp_t5_config_' + IntToStr(Random(1000000)) + '.json';
+  ConfigJson := TStringList.Create;
+  NN := nil;
+  Msg := '';
+  Failed := false;
+  try
+    ConfigJson.Text := '{"model_type": "t5"}';
+    ConfigJson.SaveToFile(ConfigPath);
+    try
+      NN := BuildFromPretrained(FixturePath('tiny_llama.safetensors'), 0,
+        false, ConfigPath);
+    except
+      on E: EPretrainedImportError do
+      begin
+        Failed := true;
+        Msg := E.Message;
+      end;
+    end;
+  finally
+    NN.Free;
+    ConfigJson.Free;
+    DeleteFile(ConfigPath);
+  end;
+  AssertTrue('unsupported model_type must raise', Failed);
+  AssertTrue('error names the offending type: ' + Msg,
+    Pos('"t5"', Msg) > 0);
+  AssertTrue('error lists the supported types: ' + Msg,
+    (Pos('gpt2', Msg) > 0) and (Pos('llama', Msg) > 0) and
+    (Pos('mistral', Msg) > 0) and (Pos('qwen2', Msg) > 0));
 end;
 
 initialization

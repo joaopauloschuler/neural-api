@@ -231,17 +231,26 @@ rather than acted on.
       heads consistent, update FStruct vocab sizes). Needed the moment
       anyone adds special tokens to fine-tune on top of the Llama/GPT-2
       importers.
-- [ ] More importer architectures: Mistral / Qwen2 are ~weight-mapping
-      deltas on the landed Llama path (sliding-window attention and QKV
-      biases already exist as building blocks); Phi slightly more work.
-      Each reuses the HF-parity fixture tooling (slicer + logit dump
-      + compare). Gemma is broken out into its own per-generation task
-      track below (gap analysis 2026-06-11: Gemma-1 is ~80% load-time
-      weight folding on the Llama path). Qwen3 (0.6B is the most-used
-      small instruct model) is a small delta ON the Qwen2 path: dropped
-      QKV biases + per-head QK-norm — the SAME ingredient as the
-      "Gemma 3 - per-head QK-norm" task below, so land that once and both
-      importers consume it.
+- [X] Mistral / Qwen2 importer architectures: config-driven deltas on the
+      Llama path in neural/neuralpretrained.pas — Mistral = optional
+      sliding-window attention (config sliding_window, null = full, wired
+      into each head's TNNetScaledDotProductAttention pWindow), Qwen2 =
+      q/k/v projection biases (rotate_half-permuted along with the q/k
+      rows; o_proj stays bias-free). BuildMistralFromSafeTensors /
+      BuildQwen2FromSafeTensors (+Ex) wrappers; HF-parity pico fixtures
+      (tools/mistral_qwen2_tiny_fixture.py, random-init Mistral/
+      Qwen2ForCausalLM, window=4 < seqlen=16 and asserted-nonzero biases)
+      + TestMistralLogitParity / TestQwen2LogitParity.
+- [ ] Phi importer: partial-rotary (rotary_pct) attention + parallel
+      attention/MLP residual layout — more than a weight-mapping delta on
+      the Llama path; reuses the HF-parity fixture tooling.
+- [ ] Qwen3 importer (0.6B is the most-used small instruct model): a small
+      delta ON the landed Qwen2 path — dropped QKV biases + per-head
+      QK-norm, the SAME ingredient as the "Gemma 3 - per-head QK-norm"
+      task below, so land that once and both importers consume it.
+      Gemma stays broken out in its own per-generation task track below
+      (gap analysis 2026-06-11: Gemma-1 is ~80% load-time weight folding
+      on the Llama path).
 - [ ] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
       de-facto checkpoint format, and it ships PRE-quantized weights —
       dovetails with the int8 quantized-inference task (read Q8_0 blocks
@@ -457,13 +466,18 @@ rather than acted on.
       training at all (encode class-name prompts, cosine-match image
       embeddings). Verify embedding parity per tower against transformers'
       CLIPModel on the sliced-fixture pattern.
-- [ ] AutoModel-style dispatch (BuildFromPretrained): read config.json's
-      model_type and route to the right Build*FromSafeTensors builder —
-      two exist today (gpt2, llama) and the importer tasks above add more;
-      one entry point stops every example from hardcoding the family, and
-      is the natural place for a clear "model_type X unsupported, supported
-      are: ..." error. Trivial once a third importer lands; keep the
-      explicit builders public for callers that want compile-time choice.
+- [X] AutoModel-style dispatch (BuildFromPretrained): read config.json's
+      model_type and route to the right Build*FromSafeTensors builder.
+      DONE: BuildFromPretrained(Path) in neural/neuralpretrained.pas takes
+      a checkpoint directory (config.json + model.safetensors[.index.json])
+      or an explicit weights file (+ optional config path), routes gpt2 /
+      llama / mistral / qwen2, and raises EPretrainedImportError listing
+      the supported model_types for anything else; explicit builders stay
+      public. Tests: TestBuildFromPretrainedDispatch (all four routes
+      reproduce their pinned oracle logits) +
+      TestBuildFromPretrainedRejectsUnsupportedModelType. New importer
+      tasks (gpt_neo, gptj/gpt_neox, Phi, Qwen3, Gemma) should add their
+      model_type route here when they land.
 - [ ] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate
