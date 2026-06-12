@@ -479,7 +479,7 @@ rather than acted on.
       landed BuildMambaFromSafeTensors importer; needs an incremental
       TNNetSelectiveSSM state-carry path, the sibling of the RWKV-4
       decode demo task above).
-- [ ] ModernBERT importer (answer.ai, 139M) — the encoder worth targeting
+- [X] ModernBERT importer (answer.ai, 139M) — the encoder worth targeting
       BEYOND vanilla BERT now that BuildBertFromSafeTensors has landed:
       RoPE instead of learned positions, GeGLU, alternating local/global
       attention — every ingredient is already landed or tasked (Gemma /
@@ -487,6 +487,19 @@ rather than acted on.
       at CPU-friendly size; feeds the same token-classification / QA /
       sentence-embedding heads as the landed BERT importer. Parity fixture vs
       ModernBertModel hidden states.
+      LANDED: BuildModernBertFromSafeTensors (model_type "modernbert")
+      plus two new primitives it needed: the SDPA BIDIRECTIONAL window
+      mode (symmetric |i-j| < W, FStruct[3] — encoders window BOTH sides)
+      and TNNetGEGLUErf (exact-erf GeGLU; ModernBERT's hidden_activation
+      "gelu" is the erf form, not tanh). Per-layer-type RoPE theta
+      (global/local), global iff i mod n = 0 (phase OPPOSITE Gemma-3's
+      (i+1) mod n), layer-0 Identity attn_norm, bias-free norms/linears,
+      fused Wqkv whole-thirds + rotate_half row permutation, Wi
+      input|gate halves swapped at load (HF activates the FIRST half).
+      tiny_modernbert random pico fixture with SIX non-vacuity asserts
+      (window, layer pattern, both thetas, erf-vs-tanh, Wi packing swap);
+      TestModernBertHiddenStateParity max |diff| 4.9e-6 vs the float64
+      HF oracle, BuildFromPretrained route covered.
 - [ ] Whisper-tiny importer (openai/whisper-tiny, 39M) — the FIRST speech
       model import (the landed T5 importer is text-to-text; this one
       exercises cross-attention from a non-text modality). Every hard

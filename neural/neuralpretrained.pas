@@ -97,6 +97,15 @@ unit neuralpretrained;
 //     after the word embeddings, sequential pre-LN GELU(tanh) blocks,
 //     fused per-head [q|k|v] query_key_value, ALWAYS-tied LM head + ln_f.
 //     See the BLOOM IMPORT section below.
+//   - ModernBERT (model_type "modernbert": answerdotai/ModernBERT-base /
+//     -large) - BuildModernBertFromSafeTensors, the SECOND encoder family
+//     and the first with RoPE: NO position table at all, BIDIRECTIONAL
+//     attention with rotary q/k, alternating local/global layers (every
+//     3rd global; local layers carry a SYMMETRIC |i-j| <= local_attention/2
+//     sliding window with its own RoPE theta), pre-LN bias-free blocks
+//     (layer 0 skips attn_norm), exact-erf GeGLU MLPs (TNNetGEGLUErf) and
+//     a final_norm. Outputs hidden states like the BERT family. See the
+//     MODERNBERT IMPORT section below.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -1625,6 +1634,113 @@ function BuildBloomFromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildBloomFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ========================= MODERNBERT IMPORT ===============================
+// BuildModernBertFromSafeTensors rebuilds answer.ai's ModernBERT encoder
+// (model_type "modernbert": answerdotai/ModernBERT-base / -large) - the
+// SECOND encoder family here (after BERT/DistilBERT/RoBERTa) and the first
+// with RoPE: ModernBERT has NO learned position table at all; position
+// enters ONLY through rotary embeddings on q/k, applied with BIDIRECTIONAL
+// (non-causal) attention. Architecture (verified against HF transformers
+// modeling_modernbert):
+//
+//   Input(SeqLen,1,1 token ids) -> TNNetEmbedding (embeddings.tok_embeddings)
+//     -> TNNetTokenLayerNorm (embeddings.norm; norm_bias=false -> beta=0)
+//     -> num_hidden_layers x PRE-LN blocks
+//          x := x + Wo(MHA_RoPE(attn_norm(x)))   [layer 0: attn_norm is
+//                                                 nn.Identity - SKIPPED]
+//          x := x + mlp.Wo(GeGLU(mlp.Wi(mlp_norm(x))))
+//     -> TNNetTokenLayerNorm (final_norm)
+//   Output: (SeqLen,1,hidden_size) final hidden states (HF ModernBertModel
+//   last_hidden_state), like BuildBertFromSafeTensors - NO LM/pooler head.
+//
+// ALTERNATING LOCAL/GLOBAL attention: layer i attends GLOBALLY iff
+// i mod global_attn_every_n_layers = 0 (HF: "sliding_attention" iff
+// bool(i % n); default n = 3 - layers 0, 3, 6, ... are global). Local
+// layers carry a BIDIRECTIONAL SYMMETRIC sliding window: query i attends
+// keys j with |i - j| <= local_attention div 2 (config local_attention =
+// 128 is the TOTAL window; HF masks abs(q_idx - kv_idx) > sliding_window
+// with sliding_window = local_attention // 2) - the new
+// pBidirectionalWindow mode of TNNetScaledDotProductAttention (W =
+// local_attention div 2 + 1, the |i-j| < W convention).
+// PER-LAYER-TYPE ROPE THETA (the Gemma-3 delta on a bidirectional
+// encoder): global layers rotate with global_rope_theta (default 160000),
+// local layers with local_rope_theta (default 10000).
+// The fused attn.Wqkv nn.Linear [3*hidden, hidden] packs q|k|v as WHOLE
+// thirds (HF view(.., 3, heads, head_dim): NO per-head interleave - the
+// GPT-2 layout, NOT the BLOOM/NeoX one); the q and k thirds additionally
+// need the rotate_half row permutation (TNNetRotaryEmbedding rotates
+// interleaved pairs; HF rotates half-split lanes - same trick as the Llama
+// family). The GeGLU MLP packs mlp.Wi [2*intermediate, hidden] as
+// input|gate (HF chunk(2): FIRST half is the ACTIVATED input, second half
+// the linear gate - out = Wo(act(input) * gate)); the CAI TNNetGEGLU*
+// layers compute FIRSTHALF * act(SECONDHALF), so the loader swaps the
+// halves (gate rows -> neurons 0..I-1, input rows -> I..2I-1).
+// hidden_activation "gelu" (the ModernBERT default) is the EXACT erf GELU
+// - TNNetGEGLUErf; "gelu_pytorch_tanh" selects the tanh TNNetGEGLU.
+// attention_bias / mlp_bias / norm_bias (all default FALSE) are honored:
+// true loads the corresponding .bias tensors, false zeroes biases/betas.
+// The classifier/MLM heads are OUT OF SCOPE (head-bearing checkpoints are
+// rejected by the unexpected-tensor check) - the base hidden states feed
+// the same downstream heads as the BERT importer.
+
+type
+  TModernBertConfig = record
+    HiddenSize: integer;       // hidden_size
+    IntermediateSize: integer; // intermediate_size (Wi is 2x this wide)
+    NumLayers: integer;        // num_hidden_layers
+    NumHeads: integer;         // num_attention_heads
+    VocabSize: integer;        // vocab_size
+    MaxPositions: integer;     // max_position_embeddings (RoPE soft limit)
+    NormEps: double;           // norm_eps (HF default 1e-5)
+    LocalAttention: integer;   // local_attention TOTAL window (default 128)
+    GlobalEveryN: integer;     // global_attn_every_n_layers (default 3)
+    GlobalRopeTheta: double;   // global_rope_theta (default 160000)
+    LocalRopeTheta: double;    // local_rope_theta (default 10000)
+    HiddenActTanh: boolean;    // true = gelu_pytorch_tanh; false = exact
+                               // erf "gelu" (the ModernBERT default)
+    AttentionBias: boolean;    // attention_bias (Wqkv + attn Wo biases)
+    MlpBias: boolean;          // mlp_bias (Wi + mlp Wo biases)
+    NormBias: boolean;         // norm_bias (LayerNorm betas)
+    ModelType: string;         // 'modernbert'
+    Prefix: string;            // 'model.' or '' (detected by the builder)
+  end;
+
+// Reads a HF ModernBERT config.json (model_type "modernbert"). Required:
+// hidden_size, intermediate_size, num_hidden_layers, num_attention_heads,
+// vocab_size, max_position_embeddings. Defaults follow ModernBertConfig:
+// norm_eps = 1e-5, local_attention = 128, global_attn_every_n_layers = 3,
+// global_rope_theta = 160000, local_rope_theta = 10000, hidden_activation
+// = "gelu" (EXACT erf; "gelu_pytorch_tanh" selects the tanh form, anything
+// else is rejected), attention_bias / mlp_bias / norm_bias = false. An
+// explicit "layer_types" array is verified against the
+// global_attn_every_n_layers pattern (a mismatch is rejected rather than
+// silently mis-wired). Prefix is left '' - the builder detects it.
+function ReadModernBertConfigFromJSONFile(
+  const FileName: string): TModernBertConfig;
+
+function ModernBertConfigToString(const Config: TModernBertConfig): string;
+
+// Builds the ModernBERT ENCODER described by Config ((SeqLen,1,1) token ids
+// in, (SeqLen,1,hidden_size) final hidden states out) and loads every
+// weight from the checkpoint at FileName (see the MODERNBERT IMPORT section
+// above). pSeqLen = 0 uses the full max_position_embeddings context (8192
+// on the released checkpoints - pass an explicit pSeqLen for CPU work).
+// pInferenceOnly = True frees training volumes during construction.
+function BuildModernBertFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TModernBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildModernBertFromSafeTensorsEx(const FileName: string;
+  out Config: TModernBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildModernBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
 
@@ -8572,6 +8688,677 @@ begin
     pInferenceOnly, ConfigFileName);
 end;
 
+function ReadModernBertConfigFromJSONFile(
+  const FileName: string): TModernBertConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  LayerTypes: TJSONData;
+  HiddenAct, LayerTypeStr, ExpectedTypeStr: string;
+  LayerCnt: integer;
+
+  function RequiredInt(const Key: string): integer;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(Key);
+    if (Data = nil) or Data.IsNull then
+      ImportError('ModernBERT import: config "' + FileName +
+        '" is missing required key "' + Key + '".');
+    Result := Data.AsInteger;
+  end;
+
+begin
+  Result := Default(TModernBertConfig);
+  if not FileExists(FileName) then
+    ImportError('ModernBERT import: config file "' + FileName +
+      '" not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('ModernBERT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('ModernBERT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'modernbert');
+    if Result.ModelType <> 'modernbert' then
+      ImportError('ModernBERT import: config model_type is "' +
+        Result.ModelType + '" - expected "modernbert" (see ' +
+        'BuildFromPretrained for the full dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.NormEps := Obj.Get('norm_eps', 1.0e-5);
+    Result.LocalAttention := Obj.Get('local_attention', 128);
+    Result.GlobalEveryN := Obj.Get('global_attn_every_n_layers', 3);
+    if Result.GlobalEveryN < 1 then
+      ImportError('ModernBERT import: global_attn_every_n_layers must be ' +
+        '>= 1, got ' + IntToStr(Result.GlobalEveryN) + '.');
+    if Result.LocalAttention < 2 then
+      ImportError('ModernBERT import: local_attention must be >= 2 (it is ' +
+        'the TOTAL window; HF halves it), got ' +
+        IntToStr(Result.LocalAttention) + '.');
+    Result.GlobalRopeTheta := Obj.Get('global_rope_theta', 160000.0);
+    Result.LocalRopeTheta := Obj.Get('local_rope_theta', 10000.0);
+    HiddenAct := Obj.Get('hidden_activation', 'gelu');
+    if HiddenAct = 'gelu' then
+      Result.HiddenActTanh := false
+    else if (HiddenAct = 'gelu_pytorch_tanh') or (HiddenAct = 'gelu_new') then
+      Result.HiddenActTanh := true
+    else
+      ImportError('ModernBERT import: hidden_activation "' + HiddenAct +
+        '" is not supported (gelu / gelu_pytorch_tanh / gelu_new).');
+    Result.AttentionBias := Obj.Get('attention_bias', False);
+    Result.MlpBias := Obj.Get('mlp_bias', False);
+    Result.NormBias := Obj.Get('norm_bias', False);
+    // An explicit layer_types array must MATCH the
+    // global_attn_every_n_layers pattern the builder wires (HF derives
+    // exactly this when layer_types is absent: "sliding_attention" iff
+    // bool(i % n)) - a divergent hand-written pattern is rejected rather
+    // than silently mis-wired.
+    LayerTypes := Obj.Find('layer_types');
+    if (LayerTypes <> nil) and not LayerTypes.IsNull then
+    begin
+      if (not (LayerTypes is TJSONArray)) or
+         (TJSONArray(LayerTypes).Count <> Result.NumLayers) then
+        ImportError('ModernBERT import: layer_types must be an array of ' +
+          IntToStr(Result.NumLayers) + ' entries.');
+      for LayerCnt := 0 to Result.NumLayers - 1 do
+      begin
+        LayerTypeStr := TJSONArray(LayerTypes).Items[LayerCnt].AsString;
+        if (LayerCnt mod Result.GlobalEveryN) = 0 then
+          ExpectedTypeStr := 'full_attention'
+        else
+          ExpectedTypeStr := 'sliding_attention';
+        if LayerTypeStr <> ExpectedTypeStr then
+          ImportError('ModernBERT import: layer_types[' +
+            IntToStr(LayerCnt) + '] = "' + LayerTypeStr + '" does not ' +
+            'match the global_attn_every_n_layers=' +
+            IntToStr(Result.GlobalEveryN) + ' pattern ("' +
+            ExpectedTypeStr + '" expected).');
+      end;
+    end;
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ModernBertConfigToString(const Config: TModernBertConfig): string;
+begin
+  Result := 'modernbert config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', local_attention=' + IntToStr(Config.LocalAttention) +
+    ', global_every=' + IntToStr(Config.GlobalEveryN) +
+    ', rope_theta=' + FloatToStr(Config.GlobalRopeTheta) + '/' +
+    FloatToStr(Config.LocalRopeTheta) +
+    ', norm_eps=' + FloatToStr(Config.NormEps);
+  if Config.HiddenActTanh then
+    Result := Result + ', act=gelu_tanh'
+  else
+    Result := Result + ', act=gelu_erf';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+// Loads the fused ModernBERT attn.Wqkv nn.Linear ([3*hidden, hidden] weight
+// + optional [3*hidden] bias) into a TNNetPointwiseConvLinear Q|K|V slab
+// (q -> neurons 0..hidden-1, k -> hidden..2*hidden-1, v -> 2*hidden..).
+// LAYOUT: WHOLE thirds, NO per-head interleave (HF view(.., 3, heads,
+// head_dim): the q rows of ALL heads come first - the GPT-2 c_attn layout,
+// NOT the BLOOM/NeoX h-major interleave). The q and k thirds additionally
+// get the rotate_half ROW PERMUTATION inside each head (TNNetRotaryEmbedding
+// rotates interleaved channel pairs (2c, 2c+1); HF rotates the half-split
+// lanes (c, c+head_dim/2) - permuting the projection rows makes the two
+// conventions bit-equal, exactly as in the Llama-family loaders). The v
+// third loads straight. BiasName = '' zeroes the biases (attention_bias =
+// false, the released-checkpoint default).
+procedure LoadModernBertQKVWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; Hidden, HeadDim: integer);
+var
+  W, B: TNNetVolume;
+  r, i, Third, RowInThird, HeadIdx, RowInHead, HalfDim, TargetIdx: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('ModernBERT import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> 3 * Hidden) or
+     (Reader.DimSize(WName, 1) <> Hidden) then
+    ImportError('ModernBERT import: "' + WName + '" must have shape [' +
+      IntToStr(3 * Hidden) + ', ' + IntToStr(Hidden) + '] (nn.Linear ' +
+      'stores [out, in]), got ' + Reader.ShapeAsString(WName));
+  if BName <> '' then
+  begin
+    if not Reader.HasTensor(BName) then
+      ImportError('ModernBERT import: missing tensor "' + BName + '".');
+    if (Reader.DimCount(BName) <> 1) or
+       (Reader.DimSize(BName, 0) <> 3 * Hidden) then
+      ImportError('ModernBERT import: "' + BName + '" must have shape [' +
+        IntToStr(3 * Hidden) + '], got ' + Reader.ShapeAsString(BName));
+  end;
+  if Layer.Neurons.Count <> 3 * Hidden then
+    ImportError('ModernBERT import: internal error - layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(3 * Hidden) + '.');
+  HalfDim := HeadDim div 2;
+  W := TNNetVolume.Create;
+  B := nil;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if BName <> '' then
+    begin
+      B := TNNetVolume.Create;
+      Reader.LoadTensorFlat(BName, B);
+    end;
+    for r := 0 to 3 * Hidden - 1 do
+    begin
+      Third := r div Hidden; // 0=q, 1=k, 2=v (whole thirds)
+      RowInThird := r mod Hidden;
+      if Third < 2 then
+      begin
+        // q and k: rotate_half permutation within each head.
+        HeadIdx := RowInThird div HeadDim;
+        RowInHead := RowInThird mod HeadDim;
+        if RowInHead < HalfDim then
+          TargetIdx := Third * Hidden + HeadIdx * HeadDim + 2 * RowInHead
+        else
+          TargetIdx := Third * Hidden + HeadIdx * HeadDim +
+            2 * (RowInHead - HalfDim) + 1;
+      end
+      else
+        TargetIdx := r; // v: straight
+      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+        ImportError('ModernBERT import: internal error - neuron ' +
+          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
+          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          ' weights, expected ' + IntToStr(Hidden) + '.');
+      for i := 0 to Hidden - 1 do
+        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      if B <> nil then
+        Layer.Neurons[TargetIdx].BiasWeight := B.FData[r]
+      else
+        Layer.Neurons[TargetIdx].BiasWeight := 0;
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads the fused ModernBERT mlp.Wi nn.Linear ([2*intermediate, hidden]
+// weight + optional bias) into the fused GeGLU projection with the halves
+// SWAPPED: HF packs input|gate and computes Wo(act(input) * gate) (chunk(2)
+// - the FIRST half is the ACTIVATED one); the CAI TNNetGEGLU/TNNetGEGLUErf
+// layers compute FIRSTHALF * act(SECONDHALF), so the HF gate rows (I..2I-1)
+// land on neurons 0..I-1 and the HF input rows (0..I-1) on neurons
+// I..2I-1. BiasName = '' zeroes the biases (mlp_bias = false).
+procedure LoadModernBertWiWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  Hidden, Intermediate: integer);
+var
+  W, B: TNNetVolume;
+  r, i, TargetIdx: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('ModernBERT import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> 2 * Intermediate) or
+     (Reader.DimSize(WName, 1) <> Hidden) then
+    ImportError('ModernBERT import: "' + WName + '" must have shape [' +
+      IntToStr(2 * Intermediate) + ', ' + IntToStr(Hidden) +
+      '] (nn.Linear stores [out, in]), got ' + Reader.ShapeAsString(WName));
+  if BName <> '' then
+  begin
+    if not Reader.HasTensor(BName) then
+      ImportError('ModernBERT import: missing tensor "' + BName + '".');
+    if (Reader.DimCount(BName) <> 1) or
+       (Reader.DimSize(BName, 0) <> 2 * Intermediate) then
+      ImportError('ModernBERT import: "' + BName + '" must have shape [' +
+        IntToStr(2 * Intermediate) + '], got ' +
+        Reader.ShapeAsString(BName));
+  end;
+  if Layer.Neurons.Count <> 2 * Intermediate then
+    ImportError('ModernBERT import: internal error - layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(2 * Intermediate) + '.');
+  W := TNNetVolume.Create;
+  B := nil;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if BName <> '' then
+    begin
+      B := TNNetVolume.Create;
+      Reader.LoadTensorFlat(BName, B);
+    end;
+    for r := 0 to 2 * Intermediate - 1 do
+    begin
+      // Swap the halves: HF input rows (r < I) -> neurons I + r (the
+      // activated SECOND half); HF gate rows (r >= I) -> neurons r - I.
+      if r < Intermediate then
+        TargetIdx := Intermediate + r
+      else
+        TargetIdx := r - Intermediate;
+      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+        ImportError('ModernBERT import: internal error - neuron ' +
+          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
+          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          ' weights, expected ' + IntToStr(Hidden) + '.');
+      for i := 0 to Hidden - 1 do
+        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      if B <> nil then
+        Layer.Neurons[TargetIdx].BiasWeight := B.FData[r]
+      else
+        Layer.Neurons[TargetIdx].BiasWeight := 0;
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads a ModernBERT LayerNorm into a TNNetTokenLayerNorm: gamma from
+// WName; beta from BName when HasBias (norm_bias=true), else zeroed (the
+// released checkpoints ship BIAS-FREE norms - HF nn.LayerNorm with
+// bias=False has no .bias tensor at all).
+procedure LoadModernBertNormWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; d_model: integer;
+  HasBias: boolean);
+var
+  Tmp: TNNetVolume;
+  i: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('ModernBERT import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 1) or
+     (Reader.DimSize(WName, 0) <> d_model) then
+    ImportError('ModernBERT import: "' + WName + '" must have shape [' +
+      IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for i := 0 to d_model - 1 do
+      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+    if HasBias then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('ModernBERT import: missing tensor "' + BName + '".');
+      if (Reader.DimCount(BName) <> 1) or
+         (Reader.DimSize(BName, 0) <> d_model) then
+        ImportError('ModernBERT import: "' + BName + '" must have shape [' +
+          IntToStr(d_model) + '], got ' + Reader.ShapeAsString(BName));
+      Reader.LoadTensorFlat(BName, Tmp);
+      for i := 0 to d_model - 1 do
+        Layer.Neurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
+    end
+    else
+      for i := 0 to d_model - 1 do
+        Layer.Neurons[1].Weights.FData[i] := 0; // bias-free norm
+  finally
+    Tmp.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+type
+  TModernBertBlockLayers = record
+    AttnNorm, QKV, AttnWo, MlpNorm, Wi, MlpWo: TNNetLayer;
+  end;
+
+function BuildModernBertFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TModernBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TModernBertBlockLayers;
+  EmbeddingLayer, EmbeddingNorm, FinalNorm: TNNetLayer;
+  BranchInput, NormedSource, QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  Channels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, HeadDim, LayerWindow, i, d: integer;
+  LayerIsGlobal: boolean;
+  LayerTheta: TNeuralFloat;
+  BlockPrefix, TensorNameStr: string;
+  Tmp: TNNetVolume;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('ModernBERT import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('ModernBERT import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if Odd(HeadDim) then
+        ImportError('ModernBERT import: head_dim=' + IntToStr(HeadDim) +
+          ' must be even (RoPE rotates channel pairs).');
+      if Config.GlobalEveryN < 1 then
+        ImportError('ModernBERT import: global_attn_every_n_layers must ' +
+          'be >= 1.');
+      // The plain ModernBertModel serializes without a prefix; the
+      // head-bearing *For* exports carry "model.".
+      if Reader.HasTensor('embeddings.tok_embeddings.weight') then
+        Config.Prefix := ''
+      else if Reader.HasTensor('model.embeddings.tok_embeddings.weight') then
+        Config.Prefix := 'model.'
+      else
+        ImportError('ModernBERT import: neither ' +
+          '"embeddings.tok_embeddings.weight" nor ' +
+          '"model.embeddings.tok_embeddings.weight" found in ' +
+          Reader.FileName + ' - not a ModernBERT checkpoint?');
+      if (Reader.DimCount(Config.Prefix +
+            'embeddings.tok_embeddings.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix +
+            'embeddings.tok_embeddings.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix +
+            'embeddings.tok_embeddings.weight', 1) <> Config.HiddenSize) then
+        ImportError('ModernBERT import: tok_embeddings.weight must have ' +
+          'shape [' + IntToStr(Config.VocabSize) + ', ' +
+          IntToStr(Config.HiddenSize) + '], got ' +
+          Reader.ShapeAsString(Config.Prefix +
+            'embeddings.tok_embeddings.weight'));
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('ModernBERT import: requested SeqLen=' +
+          IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // EncodeZero=1: token id 0 is a real BPE token, not padding (the
+      // ModernBERT [PAD] sits at id 50283).
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      // embeddings.norm right after the table - ModernBERT has NO position
+      // embeddings at all (RoPE inside attention is the only position
+      // signal).
+      EmbeddingNorm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.NormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(Channels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // Per-layer attention type: layer i attends GLOBALLY iff
+        // i mod global_attn_every_n_layers = 0 (HF ModernBertConfig:
+        // "sliding_attention" iff bool(i % n) - layer 0 is ALWAYS global).
+        // NOTE the contrast with Gemma-3 ((i+1) mod n = 0). Local layers
+        // carry the BIDIRECTIONAL window |i-j| <= local_attention div 2
+        // (W = half + 1 in the |i-j| < W convention) and rotate with
+        // local_rope_theta; global layers attend fully and rotate with
+        // global_rope_theta.
+        LayerIsGlobal := (BlockCnt mod Config.GlobalEveryN) = 0;
+        if LayerIsGlobal then
+        begin
+          LayerWindow := 0;
+          LayerTheta := Config.GlobalRopeTheta;
+        end
+        else
+        begin
+          LayerWindow := (Config.LocalAttention div 2) + 1;
+          LayerTheta := Config.LocalRopeTheta;
+        end;
+        BranchInput := NN.GetLastLayer();
+        // PRE-LN attention residual; HF builds layers[0].attn_norm as
+        // nn.Identity (the embedding norm directly above already
+        // normalized the stream), so block 0 SKIPS the norm.
+        if BlockCnt = 0 then
+        begin
+          Blocks[BlockCnt].AttnNorm := nil;
+          NormedSource := BranchInput;
+        end
+        else
+        begin
+          Blocks[BlockCnt].AttnNorm := NN.AddLayer(
+            TNNetTokenLayerNorm.Create(Config.NormEps) );
+          NormedSource := NN.GetLastLayer();
+        end;
+        // ONE fused Wqkv slab (q|k|v whole thirds after the load-time
+        // rotate_half permutation; see LoadModernBertQKVWeights).
+        Blocks[BlockCnt].QKV := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize),
+          NormedSource);
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          // q and k slices rotate with the layer's RoPE theta; v never.
+          for d := 0 to HeadDim - 1 do
+            Channels[d] := HeadCnt * HeadDim + d;
+          QSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(Channels), Blocks[BlockCnt].QKV);
+          QSlice := NN.AddLayerAfter(
+            TNNetRotaryEmbedding.Create(LayerTheta), QSlice);
+          for d := 0 to HeadDim - 1 do
+            Channels[d] := Config.HiddenSize + HeadCnt * HeadDim + d;
+          KSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(Channels), Blocks[BlockCnt].QKV);
+          KSlice := NN.AddLayerAfter(
+            TNNetRotaryEmbedding.Create(LayerTheta), KSlice);
+          for d := 0 to HeadDim - 1 do
+            Channels[d] := 2 * Config.HiddenSize + HeadCnt * HeadDim + d;
+          VSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(Channels), Blocks[BlockCnt].QKV);
+          HeadPack := NN.AddLayer(
+            TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+          // BIDIRECTIONAL attention (CausalMask=false - this is an
+          // encoder); local layers add the symmetric sliding window.
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim,
+              {CausalMask=}false, {pWindow=}LayerWindow,
+              {pScoreSoftCap=}0,
+              {pBidirectionalWindow=}LayerWindow > 0),
+            HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].AttnWo := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // PRE-LN GeGLU MLP residual: x := x + Wo(act(input) * gate),
+        // input|gate = Wi(mlp_norm(x)).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].MlpNorm := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.NormEps) );
+        Blocks[BlockCnt].Wi := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+        // hidden_activation "gelu" is the EXACT erf GELU (TNNetGEGLUErf);
+        // "gelu_pytorch_tanh" the tanh approximation (TNNetGEGLU). Both
+        // compute FIRSTHALF * act(SECONDHALF) - the loader swapped the HF
+        // input|gate halves accordingly (see LoadModernBertWiWeights).
+        if Config.HiddenActTanh then
+          NN.AddLayer( TNNetGEGLU.Create() )
+        else
+          NN.AddLayer( TNNetGEGLUErf.Create() );
+        Blocks[BlockCnt].MlpWo := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      // final_norm; the output IS the (SeqLen,1,hidden) hidden states (HF
+      // ModernBertModel last_hidden_state) - no LM/pooler head.
+      FinalNorm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.NormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(
+          Config.Prefix + 'embeddings.tok_embeddings.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('ModernBERT import: tok_embeddings.weight element ' +
+            'count ' + IntToStr(Tmp.Size) + ' does not match the ' +
+            'embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'embeddings.tok_embeddings.weight');
+      finally
+        Tmp.Free;
+      end;
+      LoadModernBertNormWeights(Reader, EmbeddingNorm,
+        Config.Prefix + 'embeddings.norm.weight',
+        Config.Prefix + 'embeddings.norm.bias', Config.HiddenSize,
+        Config.NormBias);
+      MarkConsumed(Config.Prefix + 'embeddings.norm.weight');
+      if Config.NormBias then
+        MarkConsumed(Config.Prefix + 'embeddings.norm.bias');
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        // Layer 0's attn_norm is nn.Identity - NO tensors exist for it.
+        if BlockCnt > 0 then
+        begin
+          LoadModernBertNormWeights(Reader, Blocks[BlockCnt].AttnNorm,
+            BlockPrefix + 'attn_norm.weight',
+            BlockPrefix + 'attn_norm.bias', Config.HiddenSize,
+            Config.NormBias);
+          MarkConsumed(BlockPrefix + 'attn_norm.weight');
+          if Config.NormBias then
+            MarkConsumed(BlockPrefix + 'attn_norm.bias');
+        end;
+        if Config.AttentionBias then
+        begin
+          LoadModernBertQKVWeights(Reader, Blocks[BlockCnt].QKV,
+            BlockPrefix + 'attn.Wqkv.weight',
+            BlockPrefix + 'attn.Wqkv.bias', Config.HiddenSize, HeadDim);
+          MarkConsumed(BlockPrefix + 'attn.Wqkv.bias');
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnWo,
+            BlockPrefix + 'attn.Wo.weight', Config.HiddenSize,
+            Config.HiddenSize, 0, -1, 0, BlockPrefix + 'attn.Wo.bias');
+          MarkConsumed(BlockPrefix + 'attn.Wo.bias');
+        end
+        else
+        begin
+          LoadModernBertQKVWeights(Reader, Blocks[BlockCnt].QKV,
+            BlockPrefix + 'attn.Wqkv.weight', '',
+            Config.HiddenSize, HeadDim);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnWo,
+            BlockPrefix + 'attn.Wo.weight', Config.HiddenSize,
+            Config.HiddenSize);
+        end;
+        MarkConsumed(BlockPrefix + 'attn.Wqkv.weight');
+        MarkConsumed(BlockPrefix + 'attn.Wo.weight');
+        LoadModernBertNormWeights(Reader, Blocks[BlockCnt].MlpNorm,
+          BlockPrefix + 'mlp_norm.weight',
+          BlockPrefix + 'mlp_norm.bias', Config.HiddenSize,
+          Config.NormBias);
+        MarkConsumed(BlockPrefix + 'mlp_norm.weight');
+        if Config.NormBias then
+          MarkConsumed(BlockPrefix + 'mlp_norm.bias');
+        if Config.MlpBias then
+        begin
+          LoadModernBertWiWeights(Reader, Blocks[BlockCnt].Wi,
+            BlockPrefix + 'mlp.Wi.weight', BlockPrefix + 'mlp.Wi.bias',
+            Config.HiddenSize, Config.IntermediateSize);
+          MarkConsumed(BlockPrefix + 'mlp.Wi.bias');
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].MlpWo,
+            BlockPrefix + 'mlp.Wo.weight', Config.IntermediateSize,
+            Config.HiddenSize, 0, -1, 0, BlockPrefix + 'mlp.Wo.bias');
+          MarkConsumed(BlockPrefix + 'mlp.Wo.bias');
+        end
+        else
+        begin
+          LoadModernBertWiWeights(Reader, Blocks[BlockCnt].Wi,
+            BlockPrefix + 'mlp.Wi.weight', '',
+            Config.HiddenSize, Config.IntermediateSize);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].MlpWo,
+            BlockPrefix + 'mlp.Wo.weight', Config.IntermediateSize,
+            Config.HiddenSize);
+        end;
+        MarkConsumed(BlockPrefix + 'mlp.Wi.weight');
+        MarkConsumed(BlockPrefix + 'mlp.Wo.weight');
+      end;
+      LoadModernBertNormWeights(Reader, FinalNorm,
+        Config.Prefix + 'final_norm.weight',
+        Config.Prefix + 'final_norm.bias', Config.HiddenSize,
+        Config.NormBias);
+      MarkConsumed(Config.Prefix + 'final_norm.weight');
+      if Config.NormBias then
+        MarkConsumed(Config.Prefix + 'final_norm.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('ModernBERT import: unexpected tensor "' +
+          TensorNameStr + '" (shape ' +
+          Reader.ShapeAsString(TensorNameStr) + ') in ' + FileName +
+          ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildModernBertFromSafeTensorsEx(const FileName: string;
+  out Config: TModernBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadModernBertConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildModernBertFromSafeTensorsWithConfig(FileName, Config,
+    pSeqLen, pInferenceOnly);
+end;
+
+function BuildModernBertFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  IgnoredConfig: TModernBertConfig;
+begin
+  Result := BuildModernBertFromSafeTensorsEx(FileName, IgnoredConfig,
+    pSeqLen, pInferenceOnly, ConfigFileName);
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -8592,6 +9379,7 @@ var
   IgnoredRWKVConfig: TRWKVConfig;
   IgnoredMambaConfig: TMambaConfig;
   IgnoredBloomConfig: TBloomConfig;
+  IgnoredModernBertConfig: TModernBertConfig;
 begin
   // ---- resolve the weights file and the config.json ----
   if DirectoryExists(Path) then
@@ -8741,6 +9529,14 @@ begin
     // families. See the BLOOM IMPORT section.
     Result := BuildBloomFromSafeTensorsEx(WeightsPath, IgnoredBloomConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
+  else if ModelType = 'modernbert' then
+    // The second ENCODER route: ModernBERT (architectures
+    // ["ModernBertModel"]; head-bearing exports load their base weights
+    // under the "model." prefix) - input (SeqLen,1,1) token ids (NO
+    // token-type channel, unlike the bert family), output (SeqLen,1,hidden)
+    // final hidden states. See the MODERNBERT IMPORT section.
+    Result := BuildModernBertFromSafeTensorsEx(WeightsPath,
+      IgnoredModernBertConfig, pSeqLen, pInferenceOnly, ConfigPath)
   else if ModelType = 't5' then
   begin
     // T5 is an encoder-decoder: the import builds TWO nets, which this
@@ -8767,7 +9563,7 @@ begin
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
       'qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, mamba, bloom, ' +
-      'bert, distilbert, roberta.');
+      'bert, distilbert, roberta, modernbert.');
   end;
 end;
 

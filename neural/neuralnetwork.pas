@@ -1323,6 +1323,23 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// GEGLU gated activation with the EXACT erf GELU (no tanh approximation).
+  // Splits the input along the channel (depth) axis into two equal halves
+  // A and B and outputs A * GELU_erf(B), GELU_erf(x) = x * Phi(x) with
+  // Phi(x) = 0.5 * (1 + erf(x / sqrt(2))) - the form HF transformers calls
+  // plain "gelu" (ModernBERT's hidden_activation). Output depth = input
+  // depth / 2; no trainable parameter; the input depth must be even.
+  // TNNetGEGLU is the tanh-approximation ("gelu_pytorch_tanh") sibling.
+  // Coded by Claude (AI).
+  TNNetGEGLUErf = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Goodfellow MaxOut activation.
   // Splits the input depth into K equal groups (K = pUnits) and outputs the
   // elementwise maximum across the groups. Output depth = input depth / K.
@@ -2534,6 +2551,7 @@ type
     FInvSqrtDk: TNeuralFloat;
     FCausal: boolean;
     FWindow: integer; // 0 = full attention; W>0 = sliding window of W keys
+    FBidirectionalWindow: boolean; // symmetric (encoder) window: |i-j| < W
     FScoreSoftCap: TNeuralFloat;    // 0 = off; c>0 = c*tanh(score/c) pre-softmax
     FInvScoreSoftCap: TNeuralFloat; // 1/FScoreSoftCap when on (0 otherwise)
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
@@ -2571,8 +2589,22 @@ type
     // applies the cap too. Subclass attention variants that override
     // Compute() do not honor the cap (they construct with cap = 0 and some
     // reuse FFloatSt[0] for their own scalar).
+    //
+    // pBidirectionalWindow = false (default) keeps the one-sided window above
+    // (the future is only ever masked by CausalMask). pBidirectionalWindow =
+    // true makes the window SYMMETRIC: query i attends keys j with
+    // |i - j| < W (at most W-1 positions on EACH side), the sliding-window
+    // pattern of BIDIRECTIONAL encoders (ModernBERT's local_attention: HF
+    // allows |i - j| <= local_attention div 2, so pass
+    // W = local_attention div 2 + 1). Requires Window >= 1 and
+    // CausalMask=false (a causal mask already hides the future; combining
+    // them is rejected as a config error). Serialized in FStruct[3] (old
+    // saved models load with 0 = one-sided, bit-identical). The KV-cache
+    // incremental decode path is causal by construction and therefore
+    // REJECTS the bidirectional window.
     constructor Create(d_k: integer; CausalMask: boolean = false;
-      pWindow: integer = 0; pScoreSoftCap: TNeuralFloat = 0); overload;
+      pWindow: integer = 0; pScoreSoftCap: TNeuralFloat = 0;
+      pBidirectionalWindow: boolean = false); overload;
     destructor Destroy(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -2600,6 +2632,7 @@ type
     property Dk: integer read FDk;
     property CausalMask: boolean read FCausal;
     property Window: integer read FWindow;
+    property BidirectionalWindow: boolean read FBidirectionalWindow;
     property ScoreSoftCap: TNeuralFloat read FScoreSoftCap;
     property CacheEnabled: boolean read FCacheEnabled;
     property CacheLength: integer read FCacheLen;
@@ -17010,6 +17043,96 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetGEGLUErf }
+
+constructor TNNetGEGLUErf.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetGEGLUErf.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetGEGLUErf requires an even input depth. Input depth: ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetGEGLUErf.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, cdf: TNeuralFloat;
+const
+  INV_SQRT_2 = 0.7071067811865476;
+begin
+  StartTime := Now();
+  HalfDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        a := FPrevLayer.FOutput[X, Y, D];
+        b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+        // Exact Gaussian CDF: Phi(b) = 0.5*(1 + erf(b/sqrt(2))).
+        cdf := 0.5 * (1 + pcr_erff(b * INV_SQRT_2));
+        FOutput[X, Y, D] := a * (b * cdf);
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGEGLUErf.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, cdf, pdf, geluVal, geluDeriv, err: TNeuralFloat;
+const
+  INV_SQRT_2 = 0.7071067811865476;
+  INV_SQRT_2PI = 0.3989422804014327;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    HalfDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          a := FPrevLayer.FOutput[X, Y, D];
+          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+          cdf := 0.5 * (1 + pcr_erff(b * INV_SQRT_2));
+          // Gaussian PDF: phi(b) = exp(-b^2/2)/sqrt(2*pi);
+          // d/db GELU_erf(b) = Phi(b) + b*phi(b).
+          pdf := INV_SQRT_2PI * pcr_expf(-0.5 * b * b);
+          geluVal := b * cdf;
+          geluDeriv := cdf + b * pdf;
+          err := FOutputError[X, Y, D];
+          FPrevLayer.FOutputError.Add(X, Y, D, err * geluVal);
+          FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * a * geluDeriv);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetMaxOut }
 
 constructor TNNetMaxOut.Create(pUnits: integer);
@@ -21166,18 +21289,23 @@ end;
 { TNNetScaledDotProductAttention }
 
 constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: boolean;
-  pWindow: integer; pScoreSoftCap: TNeuralFloat);
+  pWindow: integer; pScoreSoftCap: TNeuralFloat; pBidirectionalWindow: boolean);
 begin
   inherited Create();
   FDk := d_k;
   FCausal := CausalMask;
   FWindow := pWindow;
+  FBidirectionalWindow := pBidirectionalWindow;
   FScoreSoftCap := pScoreSoftCap;
   if FDk < 1 then
     FErrorProc('TNNetScaledDotProductAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
   if FWindow < 0 then
     FErrorProc('TNNetScaledDotProductAttention requires Window >= 0 ' +
       '(0 = full attention). Window=' + IntToStr(FWindow));
+  if FBidirectionalWindow and ((FWindow < 1) or FCausal) then
+    FErrorProc('TNNetScaledDotProductAttention: the bidirectional window ' +
+      'requires Window >= 1 and CausalMask=false. Window=' +
+      IntToStr(FWindow) + '.');
   if FScoreSoftCap < 0 then
     FErrorProc('TNNetScaledDotProductAttention requires ScoreSoftCap >= 0 ' +
       '(0 = off). ScoreSoftCap=' + FloatToStr(FScoreSoftCap));
@@ -21189,6 +21317,7 @@ begin
   FStruct[0] := FDk;
   if FCausal then FStruct[1] := 1 else FStruct[1] := 0;
   FStruct[2] := FWindow;
+  if FBidirectionalWindow then FStruct[3] := 1 else FStruct[3] := 0;
   FFloatSt[0] := FScoreSoftCap;
   FAttn := TNNetVolume.Create();
 end;
@@ -21207,6 +21336,13 @@ begin
   begin
     FErrorProc('TNNetScaledDotProductAttention.BeginIncrementalDecode requires' +
       ' MaxContext >= 1. Got ' + IntToStr(MaxContext));
+    exit;
+  end;
+  if FBidirectionalWindow then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.BeginIncrementalDecode: the ' +
+      'cached path is causal by construction and does not support the ' +
+      'bidirectional (encoder) sliding window.');
     exit;
   end;
   // The K and V caches are preallocated HERE, once, at the full MaxContext
@@ -21373,10 +21509,14 @@ begin
     MaxScore := -1e30;
     for j := 0 to SeqLen - 1 do
     begin
-      if (FCausal and (j > i)) or ((FWindow > 0) and (i - j >= FWindow)) then
+      if (FCausal and (j > i)) or
+         ((FWindow > 0) and ((i - j >= FWindow) or
+          (FBidirectionalWindow and (j - i >= FWindow)))) then
       begin
-        // Masked: strict future (causal) or a key beyond the sliding window
-        // (more than Window-1 positions in the past). Same -1e9 sentinel.
+        // Masked: strict future (causal), a key beyond the sliding window
+        // (more than Window-1 positions in the past), or - bidirectional
+        // window only - more than Window-1 positions in the FUTURE (the
+        // symmetric encoder band). Same -1e9 sentinel.
         FAttn[j, i, 0] := -1e9;
       end
       else
@@ -82935,6 +83075,7 @@ begin
       'TNNetThreshold' :            Result := TNNetThreshold.Create(Ft[0], Ft[1]);
       'TNNetSwish6' :               Result := TNNetSwish6.Create();
       'TNNetGEGLU' :                Result := TNNetGEGLU.Create();
+      'TNNetGEGLUErf' :             Result := TNNetGEGLUErf.Create();
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetReGLU' :                Result := TNNetReGLU.Create();
@@ -82984,7 +83125,7 @@ begin
       'TNNetFourierMix' :           Result := TNNetFourierMix.Create(St[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
-      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0]);
+      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
@@ -83316,6 +83457,7 @@ begin
       if S[0] = 'TNNetThreshold' then Result := TNNetThreshold.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetSwish6' then Result := TNNetSwish6.Create() else
       if S[0] = 'TNNetGEGLU' then Result := TNNetGEGLU.Create() else
+      if S[0] = 'TNNetGEGLUErf' then Result := TNNetGEGLUErf.Create() else
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetReGLU' then Result := TNNetReGLU.Create() else
@@ -83365,7 +83507,7 @@ begin
       if S[0] = 'TNNetFourierMix' then Result := TNNetFourierMix.Create(St[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
-      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0]) else
+      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else

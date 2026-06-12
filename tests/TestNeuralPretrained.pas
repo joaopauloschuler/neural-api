@@ -105,6 +105,7 @@ type
     procedure TestRWKVLogitParity;
     procedure TestMambaLogitParity;
     procedure TestBloomLogitParity;
+    procedure TestModernBertHiddenStateParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
     procedure TestGPTNeoXConfigFromJSONFile;
@@ -2203,6 +2204,125 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_bloom_logits.json'), 16, 12);
+  finally
+    NN.Free;
+  end;
+end;
+
+// ModernBERT hidden-state parity (the BIDIRECTIONAL-RoPE encoder,
+// model_type "modernbert", answerdotai/ModernBERT-base/-large):
+// tests/fixtures/tiny_modernbert.* is a RANDOM pico ModernBertModel
+// (tools/modernbert_tiny_fixture.py - generated, never downloaded). The
+// generator ASSERTS every ModernBERT delta is NON-VACUOUS by re-running
+// the float64 oracle with the delta disabled (each moves the output
+// > 1e-3, above the 1e-4 parity gate): (a) the BIDIRECTIONAL SYMMETRIC
+// sliding window on local layers (|i-j| <= local_attention div 2 = 2;
+// widening to full moves the output - the new pBidirectionalWindow SDPA
+// mode is on the parity path); (b) the layer pattern (global iff
+// i mod 3 = 0 - layers 0 and 3 global, 1 and 2 local; the phase OPPOSITE
+// to Gemma-3); (c) PER-LAYER-TYPE RoPE theta (global 1000 vs local 10,
+// both directions checked); (d) the GeGLU Wi input|gate packing (swapped
+// halves move the output - the loader's half swap is load-bearing);
+// (e) the EXACT erf "gelu" (the tanh form moves the output - so
+// TNNetGEGLUErf, not TNNetGEGLU, must be on the path). Also covered:
+// layer 0's IDENTITY attn_norm (no attn_norm tensors exist for layer 0),
+// bias-free norms/linears (norm_bias=attention_bias=mlp_bias=false), the
+// fused Wqkv whole-thirds split + rotate_half row permutation, NO
+// position table (RoPE is the only position signal), and the hidden-state
+// output convention (last_hidden_state stored under the fixture's
+// "logits" key). The BuildFromPretrained "modernbert" route is covered
+// too.
+procedure TTestNeuralPretrained.TestModernBertHiddenStateParity;
+var
+  NN: TNNet;
+  Config: TModernBertConfig;
+  LayerCnt, RopeCnt, SDPACnt, WindowedCnt, GegluErfCnt, LNCnt: integer;
+  SDPA: TNNetScaledDotProductAttention;
+begin
+  RandSeed := 424242;
+  NN := BuildModernBertFromSafeTensorsEx(
+    FixturePath('tiny_modernbert.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_modernbert_config.json'));
+  try
+    AssertEquals('model_type', 'modernbert', Config.ModelType);
+    AssertEquals('layers', 4, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('hidden', 8, Config.HiddenSize);
+    AssertEquals('intermediate', 6, Config.IntermediateSize);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('local_attention (total window)', 4, Config.LocalAttention);
+    AssertEquals('global_attn_every_n_layers', 3, Config.GlobalEveryN);
+    AssertEquals('global_rope_theta', 1000.0, Config.GlobalRopeTheta, 1e-9);
+    AssertEquals('local_rope_theta', 10.0, Config.LocalRopeTheta, 1e-9);
+    AssertFalse('hidden_activation gelu = exact erf', Config.HiddenActTanh);
+    AssertFalse('attention_bias', Config.AttentionBias);
+    AssertFalse('mlp_bias', Config.MlpBias);
+    AssertFalse('norm_bias', Config.NormBias);
+    AssertEquals('prefix (plain ModernBertModel export)', '', Config.Prefix);
+    // Structure: 2 RoPE layers (q and k) per head per block = 16; one
+    // SDPA per head per block = 8, NON-causal everywhere, with the
+    // BIDIRECTIONAL window W = 4 div 2 + 1 = 3 on the LOCAL layers only
+    // (layers 1 and 2 -> 2 layers x 2 heads = 4 windowed heads); one
+    // TNNetGEGLUErf per block (exact erf gelu - NOT the tanh TNNetGEGLU);
+    // LayerNorms = embedding norm + 3 attn_norms (layer 0 SKIPS its
+    // attn_norm: HF nn.Identity) + 4 mlp_norms + final_norm = 9; and NO
+    // learned position table anywhere (RoPE only).
+    RopeCnt := 0;
+    SDPACnt := 0;
+    WindowedCnt := 0;
+    GegluErfCnt := 0;
+    LNCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetRotaryEmbedding then Inc(RopeCnt);
+      if NN.Layers[LayerCnt] is TNNetScaledDotProductAttention then
+      begin
+        SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
+        AssertFalse('encoder attention is non-causal', SDPA.CausalMask);
+        if SDPA.Window > 0 then
+        begin
+          AssertTrue('local-layer window is bidirectional',
+            SDPA.BidirectionalWindow);
+          AssertEquals('window W = local_attention div 2 + 1', 3,
+            SDPA.Window);
+          Inc(WindowedCnt);
+        end
+        else
+          AssertFalse('full-attention head carries no window flag',
+            SDPA.BidirectionalWindow);
+        Inc(SDPACnt);
+      end;
+      if NN.Layers[LayerCnt] is TNNetGEGLUErf then Inc(GegluErfCnt);
+      AssertFalse('no tanh GEGLU with hidden_activation=gelu',
+        (NN.Layers[LayerCnt] is TNNetGEGLU) and
+        not (NN.Layers[LayerCnt] is TNNetGEGLUErf));
+      if NN.Layers[LayerCnt] is TNNetTokenLayerNorm then Inc(LNCnt);
+      AssertFalse('no learned position table in a ModernBERT net',
+        NN.Layers[LayerCnt] is TNNetLearnedPositionalEmbedding);
+    end;
+    AssertEquals('RoPE count (q+k per head per block)', 16, RopeCnt);
+    AssertEquals('SDPA count (heads per block)', 8, SDPACnt);
+    AssertEquals('windowed heads (2 local layers x 2 heads)', 4,
+      WindowedCnt);
+    AssertEquals('TNNetGEGLUErf per block', 4, GegluErfCnt);
+    AssertEquals('LayerNorm count (emb + 3 attn + 4 mlp + final)', 9,
+      LNCnt);
+    // Hidden-state parity: the fixture stores last_hidden_state under the
+    // "logits" key, so the logit helper compares all SeqLen x hidden
+    // values.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_modernbert_logits.json'), 16, Config.HiddenSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "modernbert" onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_modernbert.safetensors'),
+    {SeqLen=}16, {pInferenceOnly=}false,
+    FixturePath('tiny_modernbert_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_modernbert_logits.json'), 16, 8);
   finally
     NN.Free;
   end;
