@@ -111,6 +111,7 @@ type
     procedure TestBertTokenizeSentence;
     procedure TestBuildFromPretrainedDispatch;
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
+    procedure TestLoadPretrainedEmbedding;
   end;
 
 implementation
@@ -2366,6 +2367,101 @@ begin
     AssertEquals('truncated [SEP]', Tok.TokenToId('[SEP]'),
       Truncated[3]);
   finally
+    Tok.Free;
+  end;
+end;
+
+// LoadPretrainedEmbedding (GloVe / word2vec / fastText text format):
+// tests/fixtures/tiny_glove.txt pins 4 GloVe-style lines (no header) of
+// 4-dim vectors - "the", "cat", "dog" plus "zebra", which is NOT in the
+// vocabulary and must be skipped. The vocabulary {cat, dog, fish, the}
+// (sorted: cat=0, dog=1, fish=2, the=3) covers the round-trip (matched
+// rows load EXACTLY), the mean-init miss ("fish" gets the mean of the 3
+// matched vectors - all values dyadic, so f32-exact), the optional
+// "count dim" .vec header (temp copy of the fixture with a "4 4" first
+// line must load identically) and the freeze flag (LearningRate := 0,
+// the examples/LoRAFineTune per-layer convention).
+procedure TTestNeuralPretrained.TestLoadPretrainedEmbedding;
+const
+  // Rows of tiny_glove.txt in vocabulary order (fish = the exact mean).
+  Expected: array[0..3, 0..3] of double = (
+    ( 1.0,  2.5,  -3.25, 0.5),   // cat
+    (-1.5,  0.0,   0.25, 0.5),   // dog
+    ( 0.0,  0.75, -0.5,  1.0),   // fish = mean(the, cat, dog)
+    ( 0.5, -0.25,  1.5,  2.0));  // the
+var
+  Emb: TNNetEmbedding;
+  Tok: TStringListInt;
+  SL: TStringList;
+  TempName: string;
+  MatchedCnt: integer;
+
+  procedure AssertRows(const Stage: string);
+  var
+    RowCnt, DimCnt: integer;
+  begin
+    for RowCnt := 0 to 3 do
+      for DimCnt := 0 to 3 do
+        AssertEquals(Stage + ': row ' + IntToStr(RowCnt) + ' dim ' +
+          IntToStr(DimCnt), Expected[RowCnt][DimCnt],
+          Emb.Neurons[0].Weights.FData[RowCnt * 4 + DimCnt], 0.0);
+  end;
+
+begin
+  Tok := TStringListInt.Create;
+  Emb := nil;
+  try
+    Tok.Sorted := true; // WordToIndex uses Find - the vocab must be sorted
+    Tok.Add('the');
+    Tok.Add('cat');
+    Tok.Add('fish');
+    Tok.Add('dog');
+    AssertEquals('vocab index of cat', 0, Tok.WordToIndex('cat'));
+    AssertEquals('vocab index of fish', 2, Tok.WordToIndex('fish'));
+    Emb := TNNetEmbedding.Create({VocabSize=}4, {EmbeddingSize=}4);
+    MatchedCnt := LoadPretrainedEmbedding(FixturePath('tiny_glove.txt'),
+      Emb, Tok);
+    AssertEquals('matched words (zebra skipped, fish missing)', 3,
+      MatchedCnt);
+    AssertRows('glove style');
+    AssertTrue('not frozen by default', Emb.LearningRate <> 0);
+    Emb.Free;
+    Emb := nil;
+
+    // .vec header variant ("count dim" first line) + freeze flag: same
+    // fixture content behind a "4 4" header must load identically.
+    SL := TStringList.Create;
+    try
+      SL.LoadFromFile(FixturePath('tiny_glove.txt'));
+      SL.Insert(0, '4 4');
+      TempName := GetTempDir(false) + 'cai_tiny_glove_' +
+        IntToStr(Random(1000000)) + '.vec';
+      SL.SaveToFile(TempName);
+    finally
+      SL.Free;
+    end;
+    try
+      Emb := TNNetEmbedding.Create(4, 4);
+      MatchedCnt := LoadPretrainedEmbedding(TempName, Emb, Tok,
+        {FreezeEmbedding=}true);
+      AssertEquals('matched words with .vec header', 3, MatchedCnt);
+      AssertRows('vec header');
+      AssertEquals('frozen: LearningRate', 0.0, Emb.LearningRate, 0.0);
+    finally
+      DeleteFile(TempName);
+    end;
+
+    // A wrong-width layer must be rejected (header "4 4" vs 8-dim layer).
+    Emb.Free;
+    Emb := TNNetEmbedding.Create(4, 8);
+    try
+      LoadPretrainedEmbedding(FixturePath('tiny_glove.txt'), Emb, Tok);
+      Fail('8-dim layer must reject 4-dim vectors');
+    except
+      on E: EPretrainedImportError do ; // expected
+    end;
+  finally
+    Emb.Free;
     Tok.Free;
   end;
 end;

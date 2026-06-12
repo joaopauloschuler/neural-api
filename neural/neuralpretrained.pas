@@ -972,6 +972,31 @@ function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
 
+// ---------------------------------------------------------------------------
+// CLASSICAL PRETRAINED WORD EMBEDDINGS (GloVe / word2vec / fastText text
+// format) - the classical-NLP counterpart of the checkpoint importers above:
+// examples/Word2VecSkipGram TRAINS embeddings, this loads PUBLISHED ones.
+// ---------------------------------------------------------------------------
+// LoadPretrainedEmbedding parses the standard text format - one
+// "word v1 v2 ... vD" line per word, whitespace-separated - including the
+// optional "count dim" header line of word2vec / fastText .vec files (a
+// first line of exactly two integers; the dim must match the layer), and
+// copies every vector whose word is in the tokenizer's vocabulary into the
+// matching TNNetEmbedding row (token id = TStringListInt.WordToIndex, so
+// the tokenizer must be SORTED). Vocabulary words MISSING from the file are
+// initialized to the MEAN of the matched vectors (a better prior than the
+// random init they would otherwise keep; with zero matches every row stays
+// untouched). Matching is CASE-SENSITIVE: GloVe ships lowercase vectors -
+// lowercase your vocabulary to match - while word2vec / fastText publish
+// cased entries. Vector width must equal Embedding.EmbeddingSize.
+// Returns the number of vocabulary rows filled from the file.
+// FreezeEmbedding = True sets the layer's LearningRate to 0 (the per-layer
+// freeze convention of examples/LoRAFineTune). NOTE: TNNet.SetLearningRate
+// sweeps EVERY layer, so re-apply the freeze after each call to it.
+function LoadPretrainedEmbedding(const FileName: string;
+  Embedding: TNNetEmbedding; Tokenizer: TStringListInt;
+  FreezeEmbedding: boolean = false): integer;
+
 implementation
 
 procedure ImportError(const Msg: string);
@@ -4850,6 +4875,163 @@ var
 begin
   Result := BuildQwen3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly);
+end;
+
+function LoadPretrainedEmbedding(const FileName: string;
+  Embedding: TNNetEmbedding; Tokenizer: TStringListInt;
+  FreezeEmbedding: boolean = false): integer;
+var
+  F: TextFile;
+  Weights: TNNetVolume;
+  Matched: array of boolean;
+  Row: array of TNeuralFloat;
+  Line, Field: string;
+  FS: TFormatSettings;
+  LineNo, EmbDim, VocabRows, TokenIdx, DimCnt, RowCnt: integer;
+  MatchedCnt, HeaderCount, HeaderDim: integer;
+  MeanVal: TNeuralFloat;
+  FileOpen: boolean;
+
+  // Returns the next whitespace-separated field of Line starting at P
+  // (1-based); '' once the line is exhausted. Spaces and tabs separate.
+  function NextField(var P: integer): string;
+  begin
+    while (P <= Length(Line)) and (Line[P] in [' ', #9]) do Inc(P);
+    Result := '';
+    while (P <= Length(Line)) and not (Line[P] in [' ', #9]) do
+    begin
+      Result := Result + Line[P];
+      Inc(P);
+    end;
+  end;
+
+  // Parses the D vector floats following the word at position P and, when
+  // the word is a vocabulary token, copies them into its embedding row.
+  procedure ParseDataLine(P: integer; const WordStr: string);
+  var
+    DimCnt: integer;
+  begin
+    for DimCnt := 0 to EmbDim - 1 do
+    begin
+      Field := NextField(P);
+      if Field = '' then
+        ImportError('Embedding import: line ' + IntToStr(LineNo) + ' of ' +
+          FileName + ' has fewer than ' + IntToStr(EmbDim) +
+          ' vector values (word "' + WordStr + '").');
+      try
+        Row[DimCnt] := StrToFloat(Field, FS);
+      except
+        on E: Exception do
+          ImportError('Embedding import: line ' + IntToStr(LineNo) + ' of ' +
+            FileName + ': "' + Field + '" is not a number (word "' + WordStr +
+            '").');
+      end;
+    end;
+    if NextField(P) <> '' then
+      ImportError('Embedding import: line ' + IntToStr(LineNo) + ' of ' +
+        FileName + ' has more than ' + IntToStr(EmbDim) +
+        ' vector values (word "' + WordStr + '") - wrong embedding width?');
+    TokenIdx := Tokenizer.WordToIndex(WordStr);
+    if (TokenIdx >= 0) and (TokenIdx < VocabRows) then
+    begin
+      if not Matched[TokenIdx] then Inc(MatchedCnt);
+      Matched[TokenIdx] := true;
+      for DimCnt := 0 to EmbDim - 1 do
+        Weights.FData[TokenIdx * EmbDim + DimCnt] := Row[DimCnt];
+    end;
+  end;
+
+  // True when S is a plain unsigned integer (a "count dim" header field).
+  function IsPlainInteger(const S: string): boolean;
+  var
+    CharPos: integer;
+  begin
+    Result := S <> '';
+    for CharPos := 1 to Length(S) do
+      if not (S[CharPos] in ['0'..'9']) then Result := false;
+  end;
+
+var
+  P: integer;
+  WordStr, SecondField, ThirdField: string;
+begin
+  Result := 0;
+  if Embedding = nil then
+    ImportError('Embedding import: Embedding is nil.');
+  if Tokenizer = nil then
+    ImportError('Embedding import: Tokenizer is nil.');
+  if not FileExists(FileName) then
+    ImportError('Embedding import: file not found: ' + FileName);
+  EmbDim := Embedding.EmbeddingSize;
+  VocabRows := Embedding.VocabSize;
+  Weights := Embedding.Neurons[0].Weights;
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.'; // the format is locale-independent
+  SetLength(Matched, VocabRows);
+  for RowCnt := 0 to VocabRows - 1 do Matched[RowCnt] := false;
+  SetLength(Row, EmbDim);
+  MatchedCnt := 0;
+  LineNo := 0;
+  AssignFile(F, FileName);
+  Reset(F);
+  FileOpen := true;
+  try
+    while not Eof(F) do
+    begin
+      ReadLn(F, Line);
+      Inc(LineNo);
+      P := 1;
+      WordStr := NextField(P);
+      if WordStr = '' then continue; // blank line
+      if LineNo = 1 then
+      begin
+        // Optional .vec header: exactly two integer fields "count dim".
+        SecondField := NextField(P);
+        ThirdField := NextField(P);
+        if (ThirdField = '') and IsPlainInteger(WordStr) and
+           IsPlainInteger(SecondField) then
+        begin
+          HeaderCount := StrToInt(WordStr);
+          HeaderDim := StrToInt(SecondField);
+          if HeaderDim <> EmbDim then
+            ImportError('Embedding import: ' + FileName + ' declares ' +
+              IntToStr(HeaderDim) + '-dim vectors (header "' + WordStr + ' ' +
+              SecondField + '") but the embedding layer is ' +
+              IntToStr(EmbDim) + '-dim.');
+          if HeaderCount <= 0 then
+            ImportError('Embedding import: ' + FileName +
+              ' declares a non-positive word count in its header.');
+          continue;
+        end;
+        P := 1;
+        WordStr := NextField(P); // not a header: reparse as a data line
+      end;
+      ParseDataLine(P, WordStr);
+    end;
+    CloseFile(F);
+    FileOpen := false;
+    // Mean-init the vocabulary rows the file did not cover: with at least
+    // one match, the mean vector is a better prior than the random init.
+    if (MatchedCnt > 0) and (MatchedCnt < VocabRows) then
+    begin
+      for DimCnt := 0 to EmbDim - 1 do
+      begin
+        MeanVal := 0;
+        for RowCnt := 0 to VocabRows - 1 do
+          if Matched[RowCnt] then
+            MeanVal := MeanVal + Weights.FData[RowCnt * EmbDim + DimCnt];
+        MeanVal := MeanVal / MatchedCnt;
+        for RowCnt := 0 to VocabRows - 1 do
+          if not Matched[RowCnt] then
+            Weights.FData[RowCnt * EmbDim + DimCnt] := MeanVal;
+      end;
+    end;
+    Embedding.FlushWeightCache();
+    if FreezeEmbedding then Embedding.LearningRate := 0;
+    Result := MatchedCnt;
+  finally
+    if FileOpen then CloseFile(F);
+  end;
 end;
 
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;

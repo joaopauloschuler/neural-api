@@ -3956,6 +3956,9 @@ type
     procedure InitDefault(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
+
+    property VocabSize: integer read FVocabSize;
+    property EmbeddingSize: integer read FEmbeddingSize;
   end;
 
   { TNNetTokenAndPositionalEmbedding }

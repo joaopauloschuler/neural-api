@@ -427,7 +427,7 @@ rather than acted on.
       into int8 storage once the quantized-inference task lands — keeping
       only one tensor-sized scratch buffer. Assert peak RSS during import
       stays within tensor-size + model-size on the parity fixture.
-- [ ] GloVe / word2vec / fastText pretrained-embedding loader into
+- [X] GloVe / word2vec / fastText pretrained-embedding loader into
       TNNetEmbedding: the classical-NLP counterpart of the checkpoint
       importers — examples/Word2VecSkipGram TRAINS embeddings, loading
       published pretrained ones is the missing half. Parse the standard
@@ -436,6 +436,13 @@ rather than acted on.
       misses), optional freeze flag. ~50 lines of parser that instantly
       upgrades every small-model NLP example. Test: pinned 3-word file
       round-trips into embedding rows exactly.
+      DONE: LoadPretrainedEmbedding in neural/neuralpretrained.pas
+      (optional "count dim" .vec header, case-sensitive WordToIndex match,
+      mean-init misses, FreezeEmbedding = per-layer LearningRate := 0 as
+      in examples/LoRAFineTune); TNNetEmbedding gained public VocabSize /
+      EmbeddingSize accessors; fixture tests/fixtures/tiny_glove.txt +
+      TestLoadPretrainedEmbedding (exact round-trip, mean miss, header,
+      width rejection, freeze).
 - [ ] NumPy .npy/.npz reader + writer: the universal interchange escape
       hatch — ANY framework can np.savez(**state_dict), and the format is
       trivial (magic + header dict + raw bytes; npz is a zip of npy).
