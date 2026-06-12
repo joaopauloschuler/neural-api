@@ -499,12 +499,14 @@ function ReadGPT2Config(Reader: TNNetSafeTensorsReader;
 function GPT2ConfigToString(const Config: TGPT2Config): string;
 
 // Opens the checkpoint at FileName with the reader matching its format:
-// a ".bin" extension gets the restricted torch.save reader
+// a ".bin" extension - or a ".bin.index.json" sharded-checkpoint index
+// (pytorch_model.bin.index.json) - gets the restricted torch.save reader
 // (TNNetTorchBinReader, neuraltorchbin.pas - pytorch_model.bin); anything
 // else gets TNNetSafeTensorsReader (which itself dispatches ".json" to the
-// sharded-index path). TNNetTorchBinReader subclasses the safetensors
+// sharded-index path). Both readers handle their sharded index
+// transparently, and TNNetTorchBinReader subclasses the safetensors
 // reader, so every Build*FromSafeTensors* importer in this unit accepts a
-// pytorch_model.bin path transparently through this helper.
+// single-file or sharded checkpoint of either format through this helper.
 function CreatePretrainedTensorReader(
   const FileName: string): TNNetSafeTensorsReader;
 
@@ -1810,8 +1812,15 @@ end;
 
 function CreatePretrainedTensorReader(
   const FileName: string): TNNetSafeTensorsReader;
+const
+  BinIndexSuffix = '.bin.index.json';
+var
+  LowerName: string;
 begin
-  if LowerCase(ExtractFileExt(FileName)) = '.bin' then
+  LowerName := LowerCase(FileName);
+  if (ExtractFileExt(LowerName) = '.bin') or
+     (Copy(LowerName, Length(LowerName) - Length(BinIndexSuffix) + 1,
+       Length(BinIndexSuffix)) = BinIndexSuffix) then
     Result := TNNetTorchBinReader.Create(FileName)
   else
     Result := TNNetSafeTensorsReader.Create(FileName);
@@ -9393,9 +9402,12 @@ begin
       WeightsPath := IncludeTrailingPathDelimiter(Path) +
         'pytorch_model.bin'; // torch.save fallback (TNNetTorchBinReader)
     if not FileExists(WeightsPath) then
+      WeightsPath := IncludeTrailingPathDelimiter(Path) +
+        'pytorch_model.bin.index.json'; // sharded torch.save fallback
+    if not FileExists(WeightsPath) then
       ImportError('BuildFromPretrained: none of "model.safetensors", ' +
-        '"model.safetensors.index.json" or "pytorch_model.bin" found in ' +
-        'directory ' + Path + '.');
+        '"model.safetensors.index.json", "pytorch_model.bin" or ' +
+        '"pytorch_model.bin.index.json" found in directory ' + Path + '.');
   end
   else if FileExists(Path) then
   begin

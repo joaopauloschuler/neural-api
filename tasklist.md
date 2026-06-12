@@ -383,15 +383,24 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [ ] Sharded pytorch_model.bin checkpoints: support
+- [X] Sharded pytorch_model.bin checkpoints: support
       pytorch_model.bin.index.json (same weight_map shape as the landed
       safetensors index) by opening every referenced .bin shard behind the
       TNNetTorchBinReader API — mirrors TNNetSafeTensorsReader's
       OpenFromIndex, mostly plumbing since per-shard absolute offsets
-      already work. Also out of scope from the landed v1, if ever needed:
-      the pre-torch-1.6 non-zip legacy format, DEFLATE-compressed zip
-      entries, and non-contiguous (stride-permuted) state_dict tensors —
-      all currently rejected with descriptive ETorchBinError messages.
+      already work. LANDED 2026-06: TNNetTorchBinReader.Create dispatches
+      ".json" to OpenFromBinIndex (per-shard OpenBinShard appends to the
+      inherited tensor table; weight_map validated like the safetensors
+      index); CreatePretrainedTensorReader routes "*.bin.index.json" to
+      the torch reader, BuildFromPretrained probes it after
+      pytorch_model.bin, HubFetchModel falls back to pytorch_model.bin
+      then its index; 2-shard tiny_gpt2 fixture
+      (tools/shard_tiny_gpt2_bin_fixture.py) + reader-parity,
+      index-error-taxonomy and end-to-end GPT-2 logit-parity tests.
+      STILL out of scope, if ever needed: the pre-torch-1.6 non-zip
+      legacy format, DEFLATE-compressed zip entries, and non-contiguous
+      (stride-permuted) state_dict tensors — all rejected with
+      descriptive ETorchBinError messages.
 - [ ] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate

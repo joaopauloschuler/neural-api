@@ -75,7 +75,12 @@ checkpoint's `config.json`, which reads it), and upstream ships only
 `neural/neuraltorchbin.pas` (no Python conversion needed; see
 `tools/cerebras_gpt_fixture.py` for the committed real-weight pico fixture
 `tests/fixtures/tiny_cerebras_gpt.*` asserted by
-`TestCerebrasGPTLogitParity`).
+`TestCerebrasGPTLogitParity`). SHARDED `.bin` checkpoints work too: pass
+the `pytorch_model.bin.index.json` path (the same `weight_map` index
+layout as sharded safetensors) and the reader opens every referenced
+`.bin` shard transparently — `BuildFromPretrained` on a repo directory
+probes it automatically after `pytorch_model.bin`, and `HubFetchModel`
+falls back to it when downloading.
 
 ## GPT-Neo / TinyStories
 

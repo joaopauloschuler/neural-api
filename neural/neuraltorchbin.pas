@@ -33,10 +33,20 @@ unit neuraltorchbin;
 // F16/BF16 decoding - is inherited unchanged and the neuralpretrained.pas
 // importer builders accept either format transparently.
 //
-// Out of scope for v1 (raises a descriptive error): the pre-1.6 non-zip
-// legacy format, DEFLATE-compressed entries, sharded
-// pytorch_model-00001-of-000NN.bin checkpoints, and non-contiguous
-// (stride-permuted) tensors - state_dict tensors are normally contiguous.
+// SHARDED CHECKPOINTS: large .bin repos ship as
+// pytorch_model-00001-of-000NN.bin shards plus a
+// pytorch_model.bin.index.json with the SAME {"metadata": {...},
+// "weight_map": {"tensor.name": "shard file", ...}} layout as the
+// safetensors index. Pass the index path to Create (detected by its
+// ".json" extension, mirroring TNNetSafeTensorsReader) and the reader
+// opens every referenced shard (resolved relative to the index's
+// directory) behind the same API. The weight_map is validated: a tensor
+// mapped to a shard that does not contain it, a duplicate tensor name
+// across shards, or a missing shard file all raise ETorchBinError.
+//
+// Out of scope (raises a descriptive error): the pre-1.6 non-zip legacy
+// format, DEFLATE-compressed entries, and non-contiguous (stride-permuted)
+// tensors - state_dict tensors are normally contiguous.
 //
 // This unit is coded by Claude (AI).
 {$mode objfpc}{$H+}
@@ -44,7 +54,7 @@ unit neuraltorchbin;
 interface
 
 uses
-  Classes, SysUtils, neuralvolume, neuralsafetensors;
+  Classes, SysUtils, fpjson, jsonparser, neuralvolume, neuralsafetensors;
 
 type
   ETorchBinError = class(Exception);
@@ -58,12 +68,18 @@ type
   // garbage.
   TNNetTorchBinReader = class(TNNetSafeTensorsReader)
   private
+    // FZip*/FArchivePrefix describe the shard CURRENTLY being parsed
+    // (FCurShard); each OpenBinShard call overwrites them after baking
+    // absolute byte offsets into the inherited tensor table.
     FZipNames: array of string;   // entry names from the central directory
     FZipMethod: array of word;    // compression method (0 = stored)
     FZipCompSize: array of QWord; // compressed byte size
     FZipSize: array of QWord;     // uncompressed byte size
     FZipLocalOfs: array of QWord; // local-header offset
     FArchivePrefix: string;       // "<archive>/" before data.pkl and data/
+    FCurShard: integer;           // shard index currently being parsed
+    // Current shard's file path - for error messages.
+    function ShardPath: string;
     procedure ParseZipDirectory(Stream: TFileStream);
     function FindZipEntry(const pEntryName: string): integer;
     // Absolute file offset of a STORED entry's first data byte (resolved
@@ -73,6 +89,13 @@ type
       EntryIdx: integer): Int64;
     function ReadZipEntry(Stream: TFileStream; EntryIdx: integer): TBytes;
     procedure Unpickle(const Pickle: TBytes);
+    // Opens one torch.save zip, parses it and appends its tensors (tagged
+    // with the new shard index) to the inherited tensor table. Returns the
+    // shard index. Mirrors TNNetSafeTensorsReader.OpenShard.
+    function OpenBinShard(const pShardFileName: string): integer;
+    // Parses a pytorch_model.bin.index.json and opens every referenced
+    // shard. Mirrors TNNetSafeTensorsReader.OpenFromIndex.
+    procedure OpenFromBinIndex(const pIndexFileName: string);
   public
     constructor Create(const pFileName: string);
   end;
@@ -143,30 +166,53 @@ end;
 { TNNetTorchBinReader }
 
 constructor TNNetTorchBinReader.Create(const pFileName: string);
-var
-  Stream: TFileStream;
-  PklIdx, ByteOrderIdx: integer;
-  PickleBytes, ByteOrderBytes: TBytes;
-  ByteOrderStr: string;
 begin
   inherited CreateBare; // Create(pFileName) would parse as safetensors
   FFileName := pFileName;
   if not FileExists(pFileName) then
     raise ETorchBinError.CreateFmt('torch.bin: file not found: %s',
       [pFileName]);
-  Stream := TFileStream.Create(pFileName, fmOpenRead or fmShareDenyWrite);
+  // A ".json" extension means a sharded-checkpoint index
+  // (pytorch_model.bin.index.json - the same weight_map layout as the
+  // safetensors index); anything else is a single torch.save zip.
+  if LowerCase(ExtractFileExt(pFileName)) = '.json' then
+    OpenFromBinIndex(pFileName)
+  else
+    OpenBinShard(pFileName);
+end;
+
+function TNNetTorchBinReader.ShardPath: string;
+begin
+  Result := FShardNames[FCurShard];
+end;
+
+function TNNetTorchBinReader.OpenBinShard(
+  const pShardFileName: string): integer;
+var
+  Stream: TFileStream;
+  PklIdx, ByteOrderIdx: integer;
+  PickleBytes, ByteOrderBytes: TBytes;
+  ByteOrderStr: string;
+begin
+  if not FileExists(pShardFileName) then
+    raise ETorchBinError.CreateFmt('torch.bin: file not found: %s',
+      [pShardFileName]);
+  Stream := TFileStream.Create(pShardFileName,
+    fmOpenRead or fmShareDenyWrite);
   // Register the stream in the inherited shard table immediately so the
   // inherited destructor owns it even if parsing fails below. Tensor
   // offsets are stored ABSOLUTE, so the shard data section is the whole
-  // file (FDataStarts[0] = 0).
-  SetLength(FStreams, 1);
-  SetLength(FShardNames, 1);
-  SetLength(FDataStarts, 1);
-  SetLength(FDataSizes, 1);
-  FStreams[0] := Stream;
-  FShardNames[0] := pFileName;
-  FDataStarts[0] := 0;
-  FDataSizes[0] := Stream.Size;
+  // file (FDataStarts[shard] = 0).
+  Result := Length(FStreams);
+  SetLength(FStreams, Result + 1);
+  SetLength(FShardNames, Result + 1);
+  SetLength(FDataStarts, Result + 1);
+  SetLength(FDataSizes, Result + 1);
+  FStreams[Result] := Stream;
+  FShardNames[Result] := pShardFileName;
+  FDataStarts[Result] := 0;
+  FDataSizes[Result] := Stream.Size;
+  FCurShard := Result;
   ParseZipDirectory(Stream);
   ByteOrderIdx := FindZipEntry(FArchivePrefix + 'byteorder');
   if ByteOrderIdx >= 0 then
@@ -177,11 +223,87 @@ begin
     if Trim(ByteOrderStr) <> 'little' then
       raise ETorchBinError.CreateFmt(
         'torch.bin: byteorder "%s" not supported (little-endian only): %s',
-        [Trim(ByteOrderStr), pFileName]);
+        [Trim(ByteOrderStr), pShardFileName]);
   end;
   PklIdx := FindZipEntry(FArchivePrefix + 'data.pkl');
   PickleBytes := ReadZipEntry(Stream, PklIdx);
   Unpickle(PickleBytes);
+end;
+
+procedure TNNetTorchBinReader.OpenFromBinIndex(const pIndexFileName: string);
+var
+  IndexText: TStringList;
+  Root: TJSONData;
+  WeightMap: TJSONData;
+  WeightMapObj: TJSONObject;
+  BaseDir, ShardFile, MappedTensor: string;
+  ShardFiles: TStringList;
+  i, ShardIdx, TensorIdx: integer;
+begin
+  BaseDir := ExtractFilePath(pIndexFileName);
+  IndexText := TStringList.Create;
+  ShardFiles := TStringList.Create;
+  Root := nil;
+  try
+    IndexText.LoadFromFile(pIndexFileName);
+    try
+      Root := GetJSON(IndexText.Text);
+    except
+      on E: Exception do
+        raise ETorchBinError.CreateFmt(
+          'torch.bin: index is not valid JSON (%s): %s',
+          [E.Message, pIndexFileName]);
+    end;
+    if not (Root is TJSONObject) then
+      raise ETorchBinError.CreateFmt(
+        'torch.bin: index JSON is not an object: %s', [pIndexFileName]);
+    WeightMap := TJSONObject(Root).Find('weight_map');
+    if not (WeightMap is TJSONObject) then
+      raise ETorchBinError.CreateFmt(
+        'torch.bin: index has no "weight_map" object: %s',
+        [pIndexFileName]);
+    WeightMapObj := TJSONObject(WeightMap);
+    if WeightMapObj.Count = 0 then
+      raise ETorchBinError.CreateFmt(
+        'torch.bin: index "weight_map" is empty: %s', [pIndexFileName]);
+    // Open each distinct shard once, in first-mention order.
+    ShardFiles.Sorted := False;
+    for i := 0 to WeightMapObj.Count - 1 do
+    begin
+      if not (WeightMapObj.Items[i].JSONType = jtString) then
+        raise ETorchBinError.CreateFmt(
+          'torch.bin: index weight_map entry "%s" is not a string: %s',
+          [WeightMapObj.Names[i], pIndexFileName]);
+      ShardFile := WeightMapObj.Items[i].AsString;
+      if ShardFiles.IndexOf(ShardFile) < 0 then
+      begin
+        ShardFiles.Add(ShardFile);
+        OpenBinShard(BaseDir + ShardFile);
+      end;
+    end;
+    // Validate the weight_map against the shard state_dicts: every mapped
+    // tensor must exist and live in the shard the index claims.
+    for i := 0 to WeightMapObj.Count - 1 do
+    begin
+      MappedTensor := WeightMapObj.Names[i];
+      ShardFile := WeightMapObj.Items[i].AsString;
+      ShardIdx := ShardFiles.IndexOf(ShardFile);
+      TensorIdx := FindTensor(MappedTensor);
+      if TensorIdx < 0 then
+        raise ETorchBinError.CreateFmt(
+          'torch.bin: index maps tensor "%s" to shard "%s" but no shard ' +
+          'contains it: %s', [MappedTensor, ShardFile, pIndexFileName]);
+      if FTensors[TensorIdx].Shard <> ShardIdx then
+        raise ETorchBinError.CreateFmt(
+          'torch.bin: index maps tensor "%s" to shard "%s" but it lives ' +
+          'in "%s": %s', [MappedTensor, ShardFile,
+           FShardNames[FTensors[TensorIdx].Shard], pIndexFileName]);
+    end;
+  finally
+    Root.Free;
+    ShardFiles.Free;
+    IndexText.Free;
+  end;
 end;
 
 procedure TNNetTorchBinReader.ParseZipDirectory(Stream: TFileStream);
@@ -230,7 +352,7 @@ begin
     raise ETorchBinError.CreateFmt(
       'torch.bin: file too small to be a zip archive (%d bytes; the ' +
       'pre-1.6 non-zip legacy torch format is not supported): %s',
-      [Stream.Size, FFileName]);
+      [Stream.Size, ShardPath]);
   // The EOCD record sits in the last 22..22+65535 bytes (variable comment).
   TailLen := 22 + 65535 + 20; // + room for the zip64 locator just before it
   if TailLen > Stream.Size then TailLen := Stream.Size;
@@ -252,7 +374,7 @@ begin
     raise ETorchBinError.CreateFmt(
       'torch.bin: zip end-of-central-directory record not found (not a ' +
       'torch.save zip checkpoint? the pre-1.6 non-zip legacy format is ' +
-      'not supported): %s', [FFileName]);
+      'not supported): %s', [ShardPath]);
   EntryCount := ReadWordAt(Tail, EocdPos + 10);
   CDirOfs := ReadDWordAt(Tail, EocdPos + 16);
   if (EntryCount = $FFFF) or (CDirOfs = $FFFFFFFF) then
@@ -263,7 +385,7 @@ begin
        (ReadDWordAt(Tail, EocdPos - 20) <> Z64_LOCATOR_SIG) then
       raise ETorchBinError.CreateFmt(
         'torch.bin: zip64 sizes announced but no zip64 locator found: %s',
-        [FFileName]);
+        [ShardPath]);
     Z64EocdOfs := ReadQWordAt(Tail, EocdPos - 20 + 8);
     SetLength(Tail, 56);
     Stream.Position := Z64EocdOfs;
@@ -271,13 +393,13 @@ begin
     if ReadDWordAt(Tail, 0) <> Z64_EOCD_SIG then
       raise ETorchBinError.CreateFmt(
         'torch.bin: zip64 end-of-central-directory signature missing: %s',
-        [FFileName]);
+        [ShardPath]);
     EntryCount := ReadQWordAt(Tail, 32);
     CDirOfs := ReadQWordAt(Tail, 48);
   end;
   if EntryCount = 0 then
     raise ETorchBinError.CreateFmt('torch.bin: zip archive is empty: %s',
-      [FFileName]);
+      [ShardPath]);
   // Walk the central directory.
   Stream.Position := CDirOfs;
   SetLength(FZipNames, EntryCount);
@@ -293,7 +415,7 @@ begin
     if Sig <> CDIR_SIG then
       raise ETorchBinError.CreateFmt(
         'torch.bin: bad central-directory entry signature $%x at entry ' +
-        '%d: %s', [Sig, EntryCnt, FFileName]);
+        '%d: %s', [Sig, EntryCnt, ShardPath]);
     Method := ReadWordAt(Tail, 10);
     CompSize32 := ReadDWordAt(Tail, 20);
     Size32 := ReadDWordAt(Tail, 24);
@@ -358,7 +480,7 @@ begin
   if ZipIdx < 0 then
     raise ETorchBinError.CreateFmt(
       'torch.bin: no data.pkl entry in the zip (not a torch.save ' +
-      'checkpoint?): %s', [FFileName]);
+      'checkpoint?): %s', [ShardPath]);
   SlashPos := Length(FZipNames[ZipIdx]) - Length('data.pkl');
   FArchivePrefix := Copy(FZipNames[ZipIdx], 1, SlashPos);
 end;
@@ -388,7 +510,7 @@ begin
   if Sig <> LOCAL_SIG then
     raise ETorchBinError.CreateFmt(
       'torch.bin: bad local-header signature for zip entry "%s": %s',
-      [FZipNames[EntryIdx], FFileName]);
+      [FZipNames[EntryIdx], ShardPath]);
   // The LOCAL name/extra lengths can differ from the central directory's
   // (torch pads the local extra field to 64-byte-align tensor data).
   NameLen := Hdr[26] or (word(Hdr[27]) shl 8);
@@ -404,7 +526,7 @@ begin
     raise ETorchBinError.CreateFmt(
       'torch.bin: zip entry "%s" uses compression method %d; only STORED ' +
       '(0) entries are supported (torch.save never compresses): %s',
-      [FZipNames[EntryIdx], FZipMethod[EntryIdx], FFileName]);
+      [FZipNames[EntryIdx], FZipMethod[EntryIdx], ShardPath]);
   SetLength(Result, FZipSize[EntryIdx]);
   if FZipSize[EntryIdx] = 0 then exit;
   Stream.Position := ZipEntryDataOffset(Stream, EntryIdx);
@@ -431,7 +553,7 @@ var
   procedure Fail(const Msg: string);
   begin
     raise ETorchBinError.CreateFmt('torch.bin: %s (pickle offset %d): %s',
-      [Msg, Pos, FFileName]);
+      [Msg, Pos, ShardPath]);
   end;
 
   function NewNode(pKind: TPickleKind): TPickleNode;
@@ -844,24 +966,27 @@ begin
     if (Root = nil) or (Root.Kind <> pkDict) then
       raise ETorchBinError.CreateFmt(
         'torch.bin: the pickled object is not a dict/state_dict: %s',
-        [FFileName]);
+        [ShardPath]);
 
     // ---- materialize the tensor table from the unpickled state_dict ----
-    TensorCnt := 0;
-    SetLength(FTensors, Length(Root.Keys));
+    // Appends to FTensors: with a sharded checkpoint each shard's
+    // state_dict contributes its own tensors (duplicate names across
+    // shards are rejected via FindTensor below).
+    TensorCnt := Length(FTensors);
+    SetLength(FTensors, TensorCnt + Length(Root.Keys));
     for i := 0 to High(Root.Keys) do
     begin
       if (Root.Keys[i].Kind <> pkStr) then
         raise ETorchBinError.CreateFmt(
           'torch.bin: state_dict key %d is not a string: %s',
-          [i, FFileName]);
+          [i, ShardPath]);
       ValNode := Root.Vals[i];
       if ValNode.Kind <> pkTensor then continue; // tolerate metadata values
       Node := ValNode;
       if FindTensor(Root.Keys[i].StrVal) >= 0 then
         raise ETorchBinError.CreateFmt(
           'torch.bin: duplicate state_dict tensor "%s": %s',
-          [Root.Keys[i].StrVal, FFileName]);
+          [Root.Keys[i].StrVal, ShardPath]);
       // Contiguity: state_dict tensors are normally contiguous; reject the
       // stride-permuted exception loudly rather than stride-walk in v1.
       // (PyTorch semantics: strides of size<=1 dims are irrelevant.)
@@ -874,38 +999,38 @@ begin
             'torch.bin: tensor "%s" is not contiguous (dim %d stride %d, ' +
             'expected %d) - non-contiguous tensors are not supported: %s',
             [Root.Keys[i].StrVal, j, Node.Stride[j], ExpectedStride,
-             FFileName]);
+             ShardPath]);
         ExpectedStride := ExpectedStride * Node.Shape[j];
         NumElements := NumElements * Node.Shape[j];
       end;
       FTensors[TensorCnt].Name := Root.Keys[i].StrVal;
-      FTensors[TensorCnt].Shard := 0;
+      FTensors[TensorCnt].Shard := FCurShard;
       FTensors[TensorCnt].DType :=
         DTypeOfStorageClass(Node.StorageDType, ElemSize);
       SetLength(FTensors[TensorCnt].Shape, Length(Node.Shape));
       for j := 0 to High(Node.Shape) do
         FTensors[TensorCnt].Shape[j] := Node.Shape[j];
       // Resolve the storage zip entry to an ABSOLUTE byte range
-      // (FDataStarts[0] = 0, so the inherited LoadTensorFlat reads it
-      // directly; views share a storage via their element offsets).
+      // (FDataStarts[FCurShard] = 0, so the inherited LoadTensorFlat reads
+      // it directly; views share a storage via their element offsets).
       EntryName := FArchivePrefix + 'data/' + Node.StorageKey;
       EntryIdx := FindZipEntry(EntryName);
       if EntryIdx < 0 then
         raise ETorchBinError.CreateFmt(
           'torch.bin: tensor "%s" references missing storage entry "%s": %s',
-          [Root.Keys[i].StrVal, EntryName, FFileName]);
+          [Root.Keys[i].StrVal, EntryName, ShardPath]);
       if FZipMethod[EntryIdx] <> 0 then
         raise ETorchBinError.CreateFmt(
           'torch.bin: storage entry "%s" is compressed (method %d); only ' +
           'STORED entries are supported: %s',
-          [EntryName, FZipMethod[EntryIdx], FFileName]);
+          [EntryName, FZipMethod[EntryIdx], ShardPath]);
       if QWord(Node.StorageNumel) * QWord(ElemSize) > FZipSize[EntryIdx] then
         raise ETorchBinError.CreateFmt(
           'torch.bin: storage "%s" declares %d %s elements but the zip ' +
           'entry holds only %d bytes: %s',
           [EntryName, Node.StorageNumel, FTensors[TensorCnt].DType,
-           FZipSize[EntryIdx], FFileName]);
-      ByteBegin := ZipEntryDataOffset(FStreams[0], EntryIdx) +
+           FZipSize[EntryIdx], ShardPath]);
+      ByteBegin := ZipEntryDataOffset(FStreams[FCurShard], EntryIdx) +
         Node.StorageOffset * ElemSize;
       ByteEnd := ByteBegin + NumElements * ElemSize;
       if (Node.StorageOffset < 0) or
@@ -914,7 +1039,7 @@ begin
           'torch.bin: tensor "%s" (offset %d + %d elements) overruns its ' +
           'storage (%d elements): %s',
           [Root.Keys[i].StrVal, Node.StorageOffset, NumElements,
-           Node.StorageNumel, FFileName]);
+           Node.StorageNumel, ShardPath]);
       FTensors[TensorCnt].DataBegin := ByteBegin;
       FTensors[TensorCnt].DataEnd := ByteEnd;
       Inc(TensorCnt);

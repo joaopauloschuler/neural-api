@@ -38,10 +38,12 @@ Coded by Claude (AI).
 //     (rev defaults to 'main') into a local cache directory and returns
 //     the local path. Files already in the cache are NOT re-downloaded.
 //   * HubFetchModel(Repo) fetches config.json, tokenizer.json (when the
-//     repo has one) and the safetensors weights -- following
-//     model.safetensors.index.json to its shards when the checkpoint is
-//     sharded -- and returns the local snapshot DIRECTORY, which is
-//     exactly what BuildFromPretrained accepts.
+//     repo has one) and the weights -- model.safetensors first, then the
+//     sharded model.safetensors.index.json, then the torch.save
+//     pytorch_model.bin and the sharded pytorch_model.bin.index.json
+//     (following either index to its shards) -- and returns the local
+//     snapshot DIRECTORY, which is exactly what BuildFromPretrained
+//     accepts.
 //   * Gated repos: pass a token explicitly or set the HF_TOKEN
 //     environment variable; it is sent as "Authorization: Bearer ...".
 //   * Cache layout: {cache}/{repo}/{revision}/{file}. The cache root
@@ -84,9 +86,9 @@ function HubResolveURL(const RepoId, FileName: string;
 // {cache}/{repo}/{rev}/{file} -- where HubFetchFile will put the file.
 function HubLocalPath(const RepoId, FileName: string;
   const Revision: string = 'main'): string;
-// Parses a model.safetensors.index.json TEXT and returns the unique shard
-// file names referenced by its "weight_map", sorted. Raises EHubError on
-// malformed input.
+// Parses a model.safetensors.index.json (or pytorch_model.bin.index.json -
+// same layout) TEXT and returns the unique shard file names referenced by
+// its "weight_map", sorted. Raises EHubError on malformed input.
 function HubShardListFromIndexJson(const IndexJsonText: string): TStringArray;
 
 // ---- downloads -------------------------------------------------------------
@@ -100,9 +102,10 @@ function HubFetchFile(const RepoId, FileName: string;
 function HubTryFetchFile(const RepoId, FileName: string;
   out LocalPath: string; const Revision: string = 'main';
   const Token: string = ''; ForceDownload: boolean = false): boolean;
-// Fetches config.json + tokenizer.json (if present) + the safetensors
-// weights (single-file or index + shards) and returns the local snapshot
-// directory -- pass it straight to BuildFromPretrained /
+// Fetches config.json + tokenizer.json (if present) + the weights
+// (model.safetensors, sharded safetensors index, pytorch_model.bin or
+// sharded .bin index - single-file or index + shards) and returns the
+// local snapshot directory -- pass it straight to BuildFromPretrained /
 // BuildLlamaFromSafeTensors(dir + '/model.safetensors') etc.
 function HubFetchModel(const RepoId: string; const Revision: string = 'main';
   const Token: string = ''): string;
@@ -317,26 +320,19 @@ function HubFetchModel(const RepoId: string; const Revision: string;
   const Token: string): string;
 var
   ConfigPath, WeightsPath, IndexPath: string;
-  IndexText: TStringList;
-  Shards: TStringArray;
-  I: integer;
-begin
-  // config.json is mandatory: every importer needs it and every HF model
-  // repo has one. A missing config is a hard error (bad repo id / gating).
-  ConfigPath := HubFetchFile(RepoId, 'config.json', Revision, Token);
-  Result := ExtractFileDir(ConfigPath);
-  // tokenizer.json is optional (e.g. older SentencePiece-only repos).
-  HubTryFetchFile(RepoId, 'tokenizer.json', WeightsPath, Revision, Token);
-  // Weights: single-file model.safetensors, else the sharded index + its
-  // shards (the importers' sharded reader takes the index path directly).
-  if not HubTryFetchFile(RepoId, 'model.safetensors', WeightsPath, Revision,
-    Token) then
+
+  // Downloads every shard referenced by an already-fetched index json
+  // (model.safetensors.index.json / pytorch_model.bin.index.json - the
+  // importers' sharded readers take the index path directly).
+  procedure FetchIndexShards(const pIndexPath: string);
+  var
+    IndexText: TStringList;
+    Shards: TStringArray;
+    I: integer;
   begin
-    IndexPath := HubFetchFile(RepoId, 'model.safetensors.index.json',
-      Revision, Token);
     IndexText := TStringList.Create;
     try
-      IndexText.LoadFromFile(IndexPath);
+      IndexText.LoadFromFile(pIndexPath);
       Shards := HubShardListFromIndexJson(IndexText.Text);
     finally
       IndexText.Free;
@@ -344,6 +340,38 @@ begin
     for I := 0 to High(Shards) do
       HubFetchFile(RepoId, Shards[I], Revision, Token);
   end;
+
+begin
+  // config.json is mandatory: every importer needs it and every HF model
+  // repo has one. A missing config is a hard error (bad repo id / gating).
+  ConfigPath := HubFetchFile(RepoId, 'config.json', Revision, Token);
+  Result := ExtractFileDir(ConfigPath);
+  // tokenizer.json is optional (e.g. older SentencePiece-only repos).
+  HubTryFetchFile(RepoId, 'tokenizer.json', WeightsPath, Revision, Token);
+  // Weights, in preference order: single-file model.safetensors, the
+  // sharded safetensors index + its shards, the torch.save
+  // pytorch_model.bin, then the sharded .bin index + its shards.
+  if HubTryFetchFile(RepoId, 'model.safetensors', WeightsPath, Revision,
+    Token) then
+    exit;
+  if HubTryFetchFile(RepoId, 'model.safetensors.index.json', IndexPath,
+    Revision, Token) then
+  begin
+    FetchIndexShards(IndexPath);
+    exit;
+  end;
+  if HubTryFetchFile(RepoId, 'pytorch_model.bin', WeightsPath, Revision,
+    Token) then
+    exit;
+  if HubTryFetchFile(RepoId, 'pytorch_model.bin.index.json', IndexPath,
+    Revision, Token) then
+  begin
+    FetchIndexShards(IndexPath);
+    exit;
+  end;
+  raise EHubError.Create('neuralhfhub: no weights found in "' + RepoId +
+    '" - tried model.safetensors, model.safetensors.index.json, ' +
+    'pytorch_model.bin and pytorch_model.bin.index.json.');
 end;
 
 end.
