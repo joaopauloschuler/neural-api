@@ -624,6 +624,103 @@ rather than acted on.
       fixtures to claim the smallest practical pretrained English LM and
       a natural teacher/student pair (gpt2 -> distilgpt2) for the
       knowledge-distillation task elsewhere in this list.
+- [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
+      TNNet and RE-ENCODES the whole prefix every step — the streaming-
+      decode docs explicitly note only greedy/sampled streamed generation
+      is exact today. Add a fork/clone primitive to TNNetStreamingDecoder
+      (copy, or copy-on-write, of per-layer cache state per surviving
+      hypothesis) and a cache-backed DecodeBeamSearch variant on top.
+      Turns beam from O(L^2) per hypothesis into O(L); the fork primitive
+      is also what best-of-N and the speculative-decoding verify step
+      want. Assert ranked beam output is identical to the re-encoding
+      implementation.
+- [ ] Prefix/session cache reuse in TNNetStreamingDecoder: no way today to
+      save/restore or fork a session, so a shared system prompt is
+      re-prefilled for every generation. Add snapshot-after-prefill +
+      clone-per-request (and optional save/load to disk for a persistent
+      system-prompt cache). The single biggest practical speedup for the
+      chat-template task's use case; shares the fork primitive with the
+      KV-cache beam task above. Assert a forked session's continuation is
+      bit-identical to a fresh prefill.
+- [ ] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
+      easy tokens from an intermediate layer through the LM head, fall
+      back to full depth when confidence is low — the model becomes its
+      OWN draft model, no second checkpoint. The repo is unusually well
+      positioned: the LogitLens/TunedLens frozen-body splice idiom already
+      implements "read logits at layer k", and the speculative-decoding
+      task elsewhere in this list provides the accept/verify rule. v1:
+      static exit layer + confidence threshold; follow-up: per-token
+      adaptive exit. Report tokens/sec vs full-depth at matched output
+      quality.
+- [ ] Grammar/regex-constrained decoding (GBNF-style): generalize the
+      landed hand-written JSON state machine — TNNetTokenConstraint's
+      Reset/MaskAllowed/Commit interface (plus the copy-on-fork support
+      the JSON machine already has) is exactly the right plug. v1: a
+      llama.cpp-GBNF-subset grammar compiled to a pushdown machine over
+      CHARACTERS, with the existing char-by-char token-feasibility walk;
+      alternatively (or additionally) regex -> DFA. Test: a small
+      arithmetic-expression grammar accepts only valid strings across
+      greedy/sampled decoding, and forked beams keep independent states.
+- [ ] Token healing (guidance-style): back up over the LAST prompt token
+      and constrain the first generated token to extensions of its text,
+      fixing the classic BPE boundary artifact ("http:" never continuing
+      to "//" because the prompt split mid-merge). ~30 lines on top of the
+      constraint machinery + tokenizer vocab prefix lookup;
+      disproportionate quality win for completion-style prompts. Test: a
+      pinned vocab where the healed and unhealed first-token distributions
+      provably differ.
+- [ ] Token-level logprob scoring + mini lm-eval harness: ScoreSequence
+      (NN, tokens) returning per-token logprobs (one forward, no
+      generation), then multiple-choice evaluation by length-normalized
+      answer logprob — the HellaSwag/ARC/PIQA pattern. NOT the existing
+      forced-sequence constraint (that FORCES generation; this SCORES
+      candidates). This is what makes the importer program measurable:
+      "imported SmolLM2 scores X on HellaSwag" is the end-to-end proof.
+      Reuses the perplexity NLL plumbing in neuralnlpmetrics.pas; ship
+      with a tiny pinned multiple-choice fixture for the harness itself.
+- [ ] Generation-quality / degeneration metrics in neuralnlpmetrics.pas:
+      distinct-n (Li et al. 2016), self-BLEU (reuses the landed
+      CorpusBLEU), and repetition rate — the standard degeneration suite.
+      The contrastive-search and sampling tasks elsewhere in this list
+      have no way to demonstrate their benefit without these. Pinned
+      hand-computable fixtures (e.g. "a a a a" distinct-1 = 1/4).
+- [ ] Calibration: ECE report + temperature scaling — expected calibration
+      error as a TNNet.*Report batch diagnostic (introspection-report
+      pattern: per-bin confidence/accuracy table + ECE scalar) plus a
+      one-parameter temperature fit on a validation set (closed loop:
+      report, fit T, report again, ECE drops). General beyond NLP
+      (any softmax classifier); complements the evidential heads, which
+      tackle the same problem by architecture instead of post-hoc.
+- [ ] Needle-in-a-haystack long-context eval harness: place a fact at
+      varying depths in a synthetic long context, measure retrieval
+      accuracy vs (depth, context length) as a small grid report. The
+      RoPE-scaling and KV-cache-eviction tasks elsewhere in this list both
+      NEED this to demonstrate they work — neither lists an eval. Works
+      with the char-level/TinyStories-scale models the repo can actually
+      run, not just imported LLMs.
+- [ ] Streaming corpus loader with shuffle buffer: the landed packing
+      pipeline materializes the whole token stream in RAM (neuraldatasets
+      builds one concatenated Stream array). Read large text/token files
+      in chunks through a fixed-size shuffle buffer (the datasets-library
+      streaming pattern) feeding the existing packer windows — the only
+      way to pretrain on corpora bigger than RAM. Assert: same model
+      quality on a small corpus vs the in-memory path at matched
+      examples-seen, and bounded RSS on a corpus larger than the buffer.
+- [ ] BPE-dropout subword regularization (Provilkov et al. 2020): during
+      TRAINING tokenization randomly skip each applicable merge with
+      p~0.1 so the model sees alternative segmentations of the same text;
+      well-known robustness/quality win, ~20 lines in the existing
+      neuraltokenizer BPE merge loop, train-time only (eval tokenization
+      unchanged). Test: p=0 is bit-identical to the deterministic
+      tokenizer; p>0 at fixed seed yields a pinned alternative
+      segmentation.
+- [ ] MinHash near-duplicate corpus dedup tool: the C4/Pile hygiene step —
+      shingle each document, MinHash signatures, LSH banding to find
+      near-duplicate clusters, keep one representative. Small standalone
+      unit (or scripts/ tool) pairing with the streaming-corpus-loader
+      task above; report duplicate-cluster stats. Test: planted
+      near-duplicates (one-word edits) are found, distinct documents are
+      not merged.
 
 ## Layer follow-ups that fix real limitations
 
