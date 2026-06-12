@@ -44,7 +44,13 @@ unit neuralpretrained;
 //     OFFSET by padding_idx+1 = 2 and a degenerate 1-row token-type
 //     table) - also the SAME BuildBertFromSafeTensors entry points. See
 //     the BERT IMPORT section.
-//   - AutoModel-style dispatch on config.json's model_type -
+//   - Fine-tuned classifier checkpoints: BertForSequenceClassification
+//     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
+//     - BuildBertForSequenceClassificationFromSafeTensors /
+//     BuildGPT2ForSequenceClassificationFromSafeTensors, with id2label
+//     support. See the SEQUENCE CLASSIFICATION IMPORT section.
+//   - AutoModel-style dispatch on config.json's model_type (and, for the
+//     classifier heads, its "architectures" array) -
 //     BuildFromPretrained (directory or .safetensors/.index.json path).
 //
 // ============================ GPT-2 IMPORT =================================
@@ -352,6 +358,39 @@ unit neuralpretrained;
 // (same as BERT, optional via pIncludePooler); lm_head-less RobertaModel
 // is the supported export, like BertModel.
 //
+// =================== SEQUENCE CLASSIFICATION IMPORT =======================
+//
+// BuildBertForSequenceClassificationFromSafeTensors and
+// BuildGPT2ForSequenceClassificationFromSafeTensors load FINE-TUNED
+// classifier checkpoints (sentiment / NLI / toxicity heads), not just base
+// LMs. Both stack a tiny head on the landed trunks; the POOLING convention
+// differs by family and is the whole point of documenting them together:
+//
+//   - BertForSequenceClassification pools the FIRST token: HF computes
+//     logits = classifier(dropout(pooler(h[:, 0]))), i.e. the dense+tanh
+//     pooler over the [CLS] hidden state at POSITION 0, then the
+//     classifier dense (classifier.{weight,bias}, [num_labels, hidden]).
+//     Wired per token here (pooler + classifier as PointwiseConvLinear),
+//     so the net outputs (SeqLen,1,num_labels) and ROW 0 carries HF's
+//     class logits (the other rows have no HF meaning).
+//   - GPT2ForSequenceClassification pools the LAST non-pad token: the
+//     causal trunk only lets information flow left-to-right, so only the
+//     final position has seen the whole text. HF applies score.weight
+//     ([num_labels, n_embd], NO bias) to every hidden state and returns
+//     the logits at the last non-pad position. Here the net outputs
+//     per-position logits (SeqLen,1,num_labels); select row
+//     RealTokens - 1 (= SeqLen-1 for full-length input) - the
+//     SelectTokenLogits helper does exactly that.
+//
+// num_labels is inferred from the classifier/score weight shape.
+// id2label: config.json's {"0": "neg", ...} map is parsed into an
+// index-ordered TStringList (ReadId2LabelFromJSONFile, or the Id2Label
+// argument of the ...Ex builders); ClassIndexToLabel maps an argmax class
+// index to its label string ("LABEL_i" fallback, the HF default naming).
+// BuildFromPretrained dispatches on config.json's "architectures" array:
+// "BertForSequenceClassification" / "GPT2ForSequenceClassification" route
+// to these builders, anything else keeps the base-LM/encoder default.
+//
 // All importers FAIL LOUDLY (EPretrainedImportError) on missing tensors,
 // unexpected tensors and shape mismatches.
 //
@@ -402,9 +441,16 @@ function BuildGPT2FromSafeTensors(const FileName: string;
   pInferenceOnly: boolean = false): TNNet;
 
 // Same, also returning the inferred config.
+// pSeqClsHead = True builds the GPT2ForSequenceClassification variant:
+// the LM head is replaced by the score head (score.weight,
+// [num_labels, n_embd], NO bias - HF defines no score bias) and the net
+// outputs per-position class logits (SeqLen,1,num_labels); HF's logits
+// are the LAST non-pad row (see the SEQUENCE CLASSIFICATION IMPORT
+// section and SelectTokenLogits). num_labels comes from score.weight.
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
-  pNumHeads: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pNumHeads: integer = 0; pInferenceOnly: boolean = false;
+  pSeqClsHead: boolean = false): TNNet;
 
 type
   TLlamaConfig = record
@@ -779,9 +825,16 @@ function BertConfigToString(const Config: TBertConfig): string;
 // table with Config.PositionOffset (= 2) rows skipped and caps SeqLen at
 // MaxPositions - PositionOffset; checkpoint position rows 0..1 are NEVER
 // read (see the ROBERTA paragraph of the unit header).
+// pSeqClsHead = True builds the BertForSequenceClassification variant
+// (bfBert only): the pooler is forced on and the classifier dense
+// (classifier.{weight,bias}, [num_labels, hidden]) is stacked on top, per
+// token, so the output is (SeqLen,1,num_labels) and ROW 0 (the [CLS]
+// position) carries HF's class logits (see the SEQUENCE CLASSIFICATION
+// IMPORT section). num_labels is inferred from classifier.weight.
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pIncludePooler: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
+  pSeqClsHead: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
@@ -830,6 +883,62 @@ procedure BertPoolSentenceEmbedding(HiddenStates: TNNetVolume;
 procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
   const Text: string; Embedding: TNNetVolume);
 
+// =================== SEQUENCE CLASSIFICATION IMPORT =======================
+// Fine-tuned classifier checkpoints (see the unit-header section of the
+// same name for the [CLS]-first vs last-token pooling difference).
+
+// Reads config.json's id2label map ({"0": "neg", "1": "neu", ...}) into a
+// NEW index-ordered TStringList (Result[i] = label of class i; caller
+// frees). A missing id2label yields an EMPTY list (use ClassIndexToLabel
+// for the LABEL_i fallback). Non-contiguous or duplicate ids fail loudly.
+function ReadId2LabelFromJSONFile(const FileName: string): TStringList;
+
+// Maps an argmax class index to its label string: Id2Label[ClassIndex]
+// when available, else the HF default name 'LABEL_<index>' (also used when
+// Id2Label is nil or empty).
+function ClassIndexToLabel(Id2Label: TStringList;
+  ClassIndex: integer): string;
+
+// Copies the depth column at position TokenPos of a per-position output
+// (SeqLen,1,Depth, SizeY must be 1) into Logits (resized to (1,1,Depth)).
+// For BertForSequenceClassification pass TokenPos = 0 (the [CLS] row); for
+// GPT2ForSequenceClassification pass the LAST non-pad position,
+// RealTokens - 1 (= SeqLen - 1 for full-length input).
+procedure SelectTokenLogits(NetOutput: TNNetVolume; TokenPos: integer;
+  Logits: TNNetVolume);
+
+// Builds the FULL BertForSequenceClassification stack: BERT encoder +
+// pooler (dense+tanh) + classifier dense, loading every weight including
+// classifier.{weight,bias}. Output (SeqLen,1,num_labels); ROW 0 (the [CLS]
+// position) carries HF's class logits. model_type must be 'bert'.
+// Id2Label, when non-nil, is CLEARED and filled with config.json's
+// id2label map (index-ordered; empty when the config has none).
+function BuildBertForSequenceClassificationFromSafeTensorsEx(
+  const FileName: string; out Config: TBertConfig; Id2Label: TStringList;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildBertForSequenceClassificationFromSafeTensors(
+  const FileName: string; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Builds the FULL GPT2ForSequenceClassification stack: GPT-2 trunk + the
+// bias-free score head instead of the LM head. Output is per-position
+// class logits (SeqLen,1,num_labels); HF's logits are the LAST non-pad row
+// - use SelectTokenLogits(Output, RealTokens - 1, ...). Id2Label, when
+// non-nil, is CLEARED and filled from ConfigFileName ('' = "config.json"
+// next to FileName; the file is only required when Id2Label <> nil - the
+// trunk config itself is inferred from the tensors, see ReadGPT2Config).
+function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
+  const FileName: string; out Config: TGPT2Config; Id2Label: TStringList;
+  pSeqLen: integer = 0; pNumHeads: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildGPT2ForSequenceClassificationFromSafeTensors(
+  const FileName: string; pSeqLen: integer = 0; pNumHeads: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -848,7 +957,13 @@ procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 // token|token-type ids in - channel 1 IGNORED for distilbert, zeros for
 // roberta - (SeqLen,1,hidden_size) final hidden states out, pooler NOT
 // included - call BuildBertFromSafeTensors directly for the pooler head;
-// bert/roberta only).
+// bert/roberta only). FINE-TUNED CLASSIFIERS: when config.json's
+// "architectures" array names BertForSequenceClassification (model_type
+// bert) or GPT2ForSequenceClassification (model_type gpt2), the dispatch
+// routes to the classifier builders instead and the net outputs
+// (SeqLen,1,num_labels) class logits (row 0 / last non-pad row, see the
+// SEQUENCE CLASSIFICATION IMPORT section); the LM/encoder stays the
+// default for every other architectures value.
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
@@ -1009,14 +1124,15 @@ end;
 
 function BuildGPT2FromSafeTensorsEx(const FileName: string;
   out Config: TGPT2Config; pSeqLen: integer = 0;
-  pNumHeads: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pNumHeads: integer = 0; pInferenceOnly: boolean = false;
+  pSeqClsHead: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TGPT2BlockLayers;
   EmbeddingLayer, PosLayer, FinalLN, LMHead: TNNetLayer;
   BranchInput: TNNetLayer;
-  BlockCnt, SeqLen, i, j: integer;
+  BlockCnt, SeqLen, NumLabels, i, j: integer;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr: string;
   Consumed: TStringList;
@@ -1080,11 +1196,32 @@ begin
         if pInferenceOnly then NN.MakeInferenceOnly();
       end;
       FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(1e-5) );
-      // LM head tied to wte: logits = h . wte^T. Implemented as an untied
-      // PointwiseConvLinear(vocab) whose weights are a COPY of wte (see the
-      // unit header). Bias-free in GPT-2: biases stay 0.
-      LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      NumLabels := 0;
+      if pSeqClsHead then
+      begin
+        // GPT2ForSequenceClassification: the score head (bias-free
+        // nn.Linear [num_labels, n_embd]) replaces the LM head; the net
+        // outputs per-position class logits and HF's logits are the LAST
+        // non-pad row (see the SEQUENCE CLASSIFICATION IMPORT section).
+        if not Reader.HasTensor('score.weight') then
+          ImportError('GPT-2 import: missing tensor "score.weight" - not ' +
+            'a GPT2ForSequenceClassification checkpoint?');
+        if (Reader.DimCount('score.weight') <> 2) or
+           (Reader.DimSize('score.weight', 1) <> Config.NEmbd) then
+          ImportError('GPT-2 import: "score.weight" must have shape ' +
+            '[num_labels, ' + IntToStr(Config.NEmbd) + '] (nn.Linear ' +
+            'stores [out, in]), got ' +
+            Reader.ShapeAsString('score.weight'));
+        NumLabels := Reader.DimSize('score.weight', 0);
+        LMHead := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(NumLabels) );
+      end
+      else
+        // LM head tied to wte: logits = h . wte^T. Implemented as an untied
+        // PointwiseConvLinear(vocab) whose weights are a COPY of wte (see
+        // the unit header). Bias-free in GPT-2: biases stay 0.
+        LMHead := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
 
       // ---------------- Weights ----------------
@@ -1100,15 +1237,18 @@ begin
         EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'wte.weight');
-        // wte -> LM head (tied weights copied; row t of wte = neuron t).
-        for j := 0 to Config.VocabSize - 1 do
+        if not pSeqClsHead then
         begin
-          for i := 0 to Config.NEmbd - 1 do
-            LMHead.Neurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Config.NEmbd + i];
-          LMHead.Neurons[j].BiasWeight := 0;
+          // wte -> LM head (tied weights copied; row t of wte = neuron t).
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.NEmbd - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.NEmbd + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
         end;
-        LMHead.FlushWeightCache();
         // wpe -> learned positional table (n_ctx rows of d floats).
         Reader.LoadTensorFlat(Config.Prefix + 'wpe.weight', Tmp);
         if PosLayer.Neurons[0].Weights.Size <> Tmp.Size then
@@ -1160,6 +1300,26 @@ begin
         Config.NEmbd);
       MarkConsumed(Config.Prefix + 'ln_f.weight');
       MarkConsumed(Config.Prefix + 'ln_f.bias');
+      if pSeqClsHead then
+      begin
+        // nn.Linear [out, in] row-major: row j -> neuron j. Bias-free by
+        // HF definition (GPT2ForSequenceClassification's score has none).
+        Tmp := TNNetVolume.Create;
+        try
+          Reader.LoadTensorFlat('score.weight', Tmp);
+          for j := 0 to NumLabels - 1 do
+          begin
+            for i := 0 to Config.NEmbd - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.NEmbd + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+        finally
+          Tmp.Free;
+        end;
+        MarkConsumed('score.weight');
+      end;
 
       // ---------------- Unexpected-tensor check ----------------
       // Every tensor must be consumed or be a known ignorable buffer:
@@ -3942,15 +4102,17 @@ type
 
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false; pIncludePooler: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
+  pSeqClsHead: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TBertBlockLayers;
   InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN: TNNetLayer;
-  PoolerDense: TNNetLayer;
+  PoolerDense, ClassifierDense: TNNetLayer;
+  IncludePooler: boolean;
   BranchInput, SliceLayer, HiddenAct, PhiBranch: TNNetLayer;
-  BlockCnt, SeqLen, UsablePositions, i: integer;
+  BlockCnt, SeqLen, UsablePositions, NumLabels, i: integer;
   BlockPrefix, TensorNameStr, FamilyPrefix: string;
   QName, KName, VName, AttnDenseName, AttnLNName: string;
   InterName, OutDenseName, OutLNName: string;
@@ -4022,6 +4184,13 @@ begin
       if (Config.Family = bfDistilBert) and pIncludePooler then
         ImportError('BERT import: DistilBERT has no pooler head - ' +
           'pIncludePooler is not available for model_type "distilbert".');
+      if pSeqClsHead and (Config.Family <> bfBert) then
+        ImportError('BERT import: the sequence-classification head is ' +
+          'only wired for model_type "bert" (the pooler-based ' +
+          'BertForSequenceClassification head; distilbert/roberta use ' +
+          'different classifier stacks).');
+      // The classifier sits on tanh(pooler(h)): the head forces the pooler.
+      IncludePooler := pIncludePooler or pSeqClsHead;
       // The plain *Model classes serialize without a prefix; *For* exports
       // carry "bert." / "distilbert." / "roberta.". Support both.
       if Config.Family = bfDistilBert then
@@ -4137,12 +4306,31 @@ begin
       // No final norm and NO LM head: the encoder output IS the last
       // block's LN output, (SeqLen,1,hidden) final hidden states.
       PoolerDense := nil;
-      if pIncludePooler then
+      if IncludePooler then
       begin
         // Per-token dense+tanh; row 0 ([CLS]) equals HF's pooler_output.
         PoolerDense := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
         NN.AddLayer( TNNetHyperbolicTangent.Create() );
+      end;
+      ClassifierDense := nil;
+      NumLabels := 0;
+      if pSeqClsHead then
+      begin
+        // BertForSequenceClassification: classifier dense on the pooled
+        // output, per token; row 0 ([CLS]) carries HF's class logits.
+        if not Reader.HasTensor('classifier.weight') then
+          ImportError('BERT import: missing tensor "classifier.weight" - ' +
+            'not a BertForSequenceClassification checkpoint?');
+        if (Reader.DimCount('classifier.weight') <> 2) or
+           (Reader.DimSize('classifier.weight', 1) <> Config.HiddenSize) then
+          ImportError('BERT import: "classifier.weight" must have shape ' +
+            '[num_labels, ' + IntToStr(Config.HiddenSize) + '] (nn.Linear ' +
+            'stores [out, in]), got ' +
+            Reader.ShapeAsString('classifier.weight'));
+        NumLabels := Reader.DimSize('classifier.weight', 0);
+        ClassifierDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(NumLabels) );
       end;
       if pInferenceOnly then NN.MakeInferenceOnly();
 
@@ -4245,7 +4433,7 @@ begin
         MarkConsumed(OutLNName + '.weight');
         MarkConsumed(OutLNName + '.bias');
       end;
-      if pIncludePooler then
+      if IncludePooler then
       begin
         LoadLlamaLinearWeights(Reader, PoolerDense,
           Config.Prefix + 'pooler.dense.weight',
@@ -4253,6 +4441,14 @@ begin
           Config.Prefix + 'pooler.dense.bias');
         MarkConsumed(Config.Prefix + 'pooler.dense.weight');
         MarkConsumed(Config.Prefix + 'pooler.dense.bias');
+      end;
+      if pSeqClsHead then
+      begin
+        // classifier.{weight,bias} sit at the top level (no family prefix).
+        LoadLlamaLinearWeights(Reader, ClassifierDense, 'classifier.weight',
+          Config.HiddenSize, NumLabels, 0, -1, 0, 'classifier.bias');
+        MarkConsumed('classifier.weight');
+        MarkConsumed('classifier.bias');
       end;
 
       // ---------------- Unexpected-tensor check ----------------
@@ -4267,7 +4463,7 @@ begin
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
         if Pos('embeddings.position_ids', TensorNameStr) > 0 then continue;
         if (Config.Family in [bfBert, bfRoberta]) and
-           (not pIncludePooler) and
+           (not IncludePooler) and
            (Pos('pooler.dense.', TensorNameStr) > 0) then continue;
         ImportError('BERT import: unexpected tensor "' + TensorNameStr +
           '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
@@ -4404,6 +4600,163 @@ begin
   end;
 end;
 
+// =================== SEQUENCE CLASSIFICATION IMPORT =======================
+
+function ReadId2LabelFromJSONFile(const FileName: string): TStringList;
+var
+  JsonText: TStringList;
+  Root, MapData: TJSONData;
+  MapObj: TJSONObject;
+  ClassId, EntryCnt: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('id2label import: config file not found: ' + FileName);
+  Result := TStringList.Create;
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    try
+      JsonText.LoadFromFile(FileName);
+      try
+        Root := GetJSON(JsonText.Text);
+      except
+        on E: Exception do
+          ImportError('id2label import: config "' + FileName +
+            '" is not valid JSON (' + E.Message + ').');
+      end;
+      if not (Root is TJSONObject) then
+        ImportError('id2label import: config "' + FileName +
+          '" is not a JSON object.');
+      MapData := TJSONObject(Root).Find('id2label');
+      if MapData = nil then exit; // no map: empty list (LABEL_i fallback)
+      if not (MapData is TJSONObject) then
+        ImportError('id2label import: "id2label" in ' + FileName +
+          ' is not a JSON object.');
+      MapObj := TJSONObject(MapData);
+      // Pre-size, then place each label at its integer key: the JSON map
+      // {"0": ..} must cover exactly 0..Count-1 (HF's contiguous ids).
+      for EntryCnt := 0 to MapObj.Count - 1 do Result.Add('');
+      for EntryCnt := 0 to MapObj.Count - 1 do
+      begin
+        ClassId := StrToIntDef(MapObj.Names[EntryCnt], -1);
+        if (ClassId < 0) or (ClassId >= MapObj.Count) then
+          ImportError('id2label import: id "' + MapObj.Names[EntryCnt] +
+            '" in ' + FileName + ' is not in 0..' +
+            IntToStr(MapObj.Count - 1) + ' (non-contiguous map).');
+        if Result[ClassId] <> '' then
+          ImportError('id2label import: duplicate id ' +
+            IntToStr(ClassId) + ' in ' + FileName + '.');
+        Result[ClassId] := MapObj.Items[EntryCnt].AsString;
+      end;
+    except
+      Result.Free;
+      raise;
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ClassIndexToLabel(Id2Label: TStringList;
+  ClassIndex: integer): string;
+begin
+  if (Id2Label <> nil) and (ClassIndex >= 0) and
+     (ClassIndex < Id2Label.Count) then
+    Result := Id2Label[ClassIndex]
+  else
+    Result := 'LABEL_' + IntToStr(ClassIndex); // the HF default naming
+end;
+
+procedure SelectTokenLogits(NetOutput: TNNetVolume; TokenPos: integer;
+  Logits: TNNetVolume);
+var
+  ChanCnt, LabelCnt: integer;
+begin
+  if NetOutput.SizeY <> 1 then
+    ImportError('SelectTokenLogits: expected a (SeqLen,1,num_labels) ' +
+      'volume, got SizeY=' + IntToStr(NetOutput.SizeY) + '.');
+  if (TokenPos < 0) or (TokenPos >= NetOutput.SizeX) then
+    ImportError('SelectTokenLogits: TokenPos ' + IntToStr(TokenPos) +
+      ' is outside 0..' + IntToStr(NetOutput.SizeX - 1) + '.');
+  LabelCnt := NetOutput.Depth;
+  Logits.ReSize(1, 1, LabelCnt);
+  for ChanCnt := 0 to LabelCnt - 1 do
+    Logits.FData[ChanCnt] := NetOutput.FData[TokenPos * LabelCnt + ChanCnt];
+end;
+
+function BuildBertForSequenceClassificationFromSafeTensorsEx(
+  const FileName: string; out Config: TBertConfig; Id2Label: TStringList;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+  Labels: TStringList;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBertConfigFromJSONFile(ConfigPath);
+  // Labels first: a label-parse failure must not leak a built net.
+  if Id2Label <> nil then
+  begin
+    Labels := ReadId2LabelFromJSONFile(ConfigPath);
+    try
+      Id2Label.Assign(Labels);
+    finally
+      Labels.Free;
+    end;
+  end;
+  Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, {pIncludePooler=}true, {pSeqClsHead=}true);
+end;
+
+function BuildBertForSequenceClassificationFromSafeTensors(
+  const FileName: string; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TBertConfig;
+begin
+  Result := BuildBertForSequenceClassificationFromSafeTensorsEx(FileName,
+    IgnoredConfig, nil, pSeqLen, pInferenceOnly);
+end;
+
+function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
+  const FileName: string; out Config: TGPT2Config; Id2Label: TStringList;
+  pSeqLen: integer = 0; pNumHeads: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+  Labels: TStringList;
+begin
+  // Labels first (same leak-avoidance order as the BERT variant). The
+  // config.json is ONLY touched for id2label: the trunk config is
+  // inferred from the checkpoint tensors (ReadGPT2Config).
+  if Id2Label <> nil then
+  begin
+    if ConfigFileName <> '' then ConfigPath := ConfigFileName
+    else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+    Labels := ReadId2LabelFromJSONFile(ConfigPath);
+    try
+      Id2Label.Assign(Labels);
+    finally
+      Labels.Free;
+    end;
+  end;
+  Result := BuildGPT2FromSafeTensorsEx(FileName, Config, pSeqLen,
+    pNumHeads, pInferenceOnly, {pSeqClsHead=}true);
+end;
+
+function BuildGPT2ForSequenceClassificationFromSafeTensors(
+  const FileName: string; pSeqLen: integer = 0; pNumHeads: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TGPT2Config;
+begin
+  Result := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(FileName,
+    IgnoredConfig, nil, pSeqLen, pNumHeads, pInferenceOnly);
+end;
+
 // ================== MISTRAL / QWEN2 / QWEN3 / DISPATCH =====================
 
 // Shared wrapper: builds via the Llama path and asserts the config's
@@ -4483,10 +4836,13 @@ function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
 var
-  ConfigPath, WeightsPath, ModelType: string;
+  ConfigPath, WeightsPath, ModelType, ArchName: string;
   JsonText: TStringList;
-  Root: TJSONData;
-  NumHeads: integer;
+  Root, ArchData: TJSONData;
+  NumHeads, ArchCnt: integer;
+  BertSeqCls, GPT2SeqCls: boolean;
+  IgnoredGPT2Config: TGPT2Config;
+  IgnoredId2Label: TStringList;
   IgnoredLlamaConfig: TLlamaConfig;
   IgnoredGPTNeoConfig: TGPTNeoConfig;
   IgnoredGPTNeoXConfig: TGPTNeoXConfig;
@@ -4536,15 +4892,43 @@ begin
         '" is not a JSON object.');
     ModelType := TJSONObject(Root).Get('model_type', '');
     NumHeads := TJSONObject(Root).Get('n_head', 0); // GPT-2 family key
+    // "architectures" disambiguates a fine-tuned classifier head from the
+    // base LM/encoder of the same model_type (the LM stays the default).
+    BertSeqCls := false;
+    GPT2SeqCls := false;
+    ArchData := TJSONObject(Root).Find('architectures');
+    if (ArchData <> nil) and (ArchData is TJSONArray) then
+      for ArchCnt := 0 to TJSONArray(ArchData).Count - 1 do
+      begin
+        ArchName := TJSONArray(ArchData).Items[ArchCnt].AsString;
+        if ArchName = 'BertForSequenceClassification' then
+          BertSeqCls := true
+        else if ArchName = 'GPT2ForSequenceClassification' then
+          GPT2SeqCls := true;
+      end;
   finally
     Root.Free;
     JsonText.Free;
   end;
 
   // ---- dispatch ----
-  if ModelType = 'gpt2' then
+  if (ModelType = 'gpt2') and GPT2SeqCls then
+  begin
+    IgnoredId2Label := nil;
+    Result := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
+      WeightsPath, IgnoredGPT2Config, IgnoredId2Label, pSeqLen, NumHeads,
+      pInferenceOnly, ConfigPath);
+  end
+  else if ModelType = 'gpt2' then
     Result := BuildGPT2FromSafeTensors(WeightsPath, pSeqLen, NumHeads,
       pInferenceOnly)
+  else if (ModelType = 'bert') and BertSeqCls then
+  begin
+    IgnoredId2Label := nil;
+    Result := BuildBertForSequenceClassificationFromSafeTensorsEx(
+      WeightsPath, IgnoredBertConfig, IgnoredId2Label, pSeqLen,
+      pInferenceOnly, ConfigPath);
+  end
   else if ModelType = 'gpt_neo' then
     Result := BuildGPTNeoFromSafeTensorsEx(WeightsPath, IgnoredGPTNeoConfig,
       pSeqLen, pInferenceOnly, ConfigPath)

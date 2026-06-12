@@ -400,7 +400,7 @@ rather than acted on.
       instruction-tuned, so it doubles as the first imported model the
       BLEU/ROUGE metrics can score out of the box. Same HF-parity fixture
       verification as GPT-2/Llama.
-- [ ] ForSequenceClassification checkpoint import: load FINE-TUNED
+- [X] ForSequenceClassification checkpoint import: load FINE-TUNED
       classifier checkpoints (sentiment / NLI / toxicity), not just base
       LMs — classifier-head weight mapping plus id2label from config.json
       so predictions come out as label strings. Cheap delta on the now-landed

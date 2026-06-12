@@ -51,6 +51,16 @@ type
     procedure AssertBertParityWithFixture(NN: TNNet;
       const HiddenFileName: string; SeqLen, Hidden: integer;
       PoolerRow0Only: boolean);
+    // Sequence-classification parity loop: feeds every "sequences" row of
+    // the fixture through NN ((SeqLen,1,2) token|token-type ids for
+    // BertStyle, else (SeqLen,1,1) token ids), selects the pooled row via
+    // SelectTokenLogits - row 0 for BERT's [CLS]-first pooling, the
+    // fixture's "pooled_position" (the last non-pad token) for GPT-2 -
+    // and asserts class-logit parity < 1e-4 PLUS the id2label round-trip:
+    // ClassIndexToLabel(argmax) must equal the fixture's pinned label.
+    procedure AssertSeqClsParityWithFixture(NN: TNNet;
+      const LogitsFileName: string; SeqLen: integer; BertStyle: boolean;
+      Id2Label: TStringList);
   published
     procedure TestTokenLayerNormForwardAndSaveLoad;
     procedure TestLearnedPositionalEmbeddingForwardAndSaveLoad;
@@ -93,6 +103,9 @@ type
     procedure TestRobertaConfigFromJSONFile;
     procedure TestRobertaHiddenStateParity;
     procedure TestRobertaPoolerParity;
+    procedure TestBertSeqClsLogitParity;
+    procedure TestGPT2SeqClsLogitParity;
+    procedure TestBuildFromPretrainedSeqClsDispatch;
     procedure TestBertPoolSentenceEmbedding;
     procedure TestBertTokenizeSentence;
     procedure TestBuildFromPretrainedDispatch;
@@ -288,6 +301,105 @@ begin
       FloatToStr(MaxDiff) + ' must be < 2e-5', MaxDiff < 2e-5);
   finally
     RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.AssertSeqClsParityWithFixture(NN: TNNet;
+  const LogitsFileName: string; SeqLen: integer; BertStyle: boolean;
+  Id2Label: TStringList);
+var
+  RefRoot: TJSONData;
+  Obj: TJSONObject;
+  Sequences, TokenTypes, LogitsArr, LabelsArr: TJSONArray;
+  SeqArr, TypeArr, RowArr: TJSONArray;
+  Input, Output, Logits: TNNetVolume;
+  RefJson: TStringList;
+  SeqCnt, PosCnt, LabelCnt, NumLabels, PooledPos, ArgMax: integer;
+  Diff, MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(LogitsFileName);
+    RefRoot := GetJSON(RefJson.Text);
+    Obj := TJSONObject(RefRoot);
+    Sequences := TJSONArray(Obj.Find('sequences'));
+    LogitsArr := TJSONArray(Obj.Find('logits'));
+    LabelsArr := TJSONArray(Obj.Find('labels'));
+    AssertTrue('sequences present', Sequences <> nil);
+    AssertTrue('logits present', LogitsArr <> nil);
+    AssertTrue('labels present', LabelsArr <> nil);
+    AssertTrue('at least 3 sequences', Sequences.Count >= 3);
+    TokenTypes := nil;
+    if BertStyle then
+    begin
+      TokenTypes := TJSONArray(Obj.Find('token_types'));
+      AssertTrue('token_types present', TokenTypes <> nil);
+      PooledPos := 0; // [CLS]-first pooling (BertForSequenceClassification)
+      Input.ReSize(SeqLen, 1, 2);
+    end
+    else
+    begin
+      // Last-non-pad-token pooling (GPT2ForSequenceClassification); the
+      // fixture's sequences are full-length, so this is SeqLen - 1.
+      PooledPos := Obj.Get('pooled_position', SeqLen - 1);
+      AssertEquals('pooled position is the last token', SeqLen - 1,
+        PooledPos);
+      Input.ReSize(SeqLen, 1, 1);
+    end;
+    MaxDiff := 0;
+    for SeqCnt := 0 to Sequences.Count - 1 do
+    begin
+      SeqArr := TJSONArray(Sequences.Items[SeqCnt]);
+      AssertEquals('sequence length', SeqLen, SeqArr.Count);
+      if BertStyle then
+      begin
+        TypeArr := TJSONArray(TokenTypes.Items[SeqCnt]);
+        for PosCnt := 0 to SeqLen - 1 do
+        begin
+          Input.FData[PosCnt * 2] := SeqArr.Items[PosCnt].AsInteger;
+          Input.FData[PosCnt * 2 + 1] := TypeArr.Items[PosCnt].AsInteger;
+        end;
+      end
+      else
+        for PosCnt := 0 to SeqLen - 1 do
+          Input.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+      NN.Compute(Input);
+      NN.GetOutput(Output);
+      RowArr := TJSONArray(LogitsArr.Items[SeqCnt]);
+      NumLabels := RowArr.Count;
+      AssertEquals('per-position class logits', SeqLen * NumLabels,
+        Output.Size);
+      SelectTokenLogits(Output, PooledPos, Logits);
+      AssertEquals('selected logits size', NumLabels, Logits.Size);
+      ArgMax := 0;
+      for LabelCnt := 0 to NumLabels - 1 do
+      begin
+        Diff := Abs(Logits.FData[LabelCnt] -
+          RowArr.Items[LabelCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+        if Logits.FData[LabelCnt] > Logits.FData[ArgMax] then
+          ArgMax := LabelCnt;
+      end;
+      // id2label round-trip: argmax class index -> label string.
+      AssertEquals('label of sequence ' + IntToStr(SeqCnt),
+        LabelsArr.Items[SeqCnt].AsString,
+        ClassIndexToLabel(Id2Label, ArgMax));
+    end;
+    // Same 1e-4 gate as the LM-logit parity tests. NEVER loosen past
+    // 1e-3 - fix the model, don't widen the tolerance.
+    AssertTrue('class-logit parity vs ' + LogitsFileName +
+      ': max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+      MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
     Output.Free;
     Input.Free;
     RefJson.Free;
@@ -1817,6 +1929,142 @@ begin
       Config.MaxPositions - 2, Config.HiddenSize, {PoolerRow0Only=}true);
   finally
     NN.Free;
+  end;
+end;
+
+// Fine-tuned classifier import, encoder family: HF
+// BertForSequenceClassification pools the FIRST token - logits =
+// classifier(pooler(hidden[:, 0])), the dense+tanh pooler over the [CLS]
+// position (the OPPOSITE pooling convention to GPT-2's last-token, see
+// TestGPT2SeqClsLogitParity). The imported net outputs (SeqLen,1,3) and
+// row 0 must match HF's float64 class logits
+// (tools/bert_seqcls_tiny_fixture.py asserts the oracle really is the
+// [CLS]-pooled path); argmax indices must round-trip through id2label to
+// the pinned 'neg'/'neu'/'pos' strings.
+procedure TTestNeuralPretrained.TestBertSeqClsLogitParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  Id2Label: TStringList;
+begin
+  RandSeed := 424242;
+  Id2Label := TStringList.Create;
+  try
+    NN := BuildBertForSequenceClassificationFromSafeTensorsEx(
+      FixturePath('tiny_bert_seqcls.safetensors'), Config, Id2Label,
+      {SeqLen=}0, {pInferenceOnly=}false,
+      FixturePath('tiny_bert_seqcls_config.json'));
+    try
+      AssertEquals('prefix (BertFor* exports carry "bert.")', 'bert.',
+        Config.Prefix);
+      AssertEquals('id2label size', 3, Id2Label.Count);
+      AssertEquals('id2label[0]', 'neg', Id2Label[0]);
+      AssertEquals('id2label[2]', 'pos', Id2Label[2]);
+      AssertEquals('num_labels output depth', 3,
+        NN.GetLastLayer().Output.Depth);
+      AssertSeqClsParityWithFixture(NN,
+        FixturePath('tiny_bert_seqcls_logits.json'), Config.MaxPositions,
+        {BertStyle=}true, Id2Label);
+    finally
+      NN.Free;
+    end;
+  finally
+    Id2Label.Free;
+  end;
+end;
+
+// Fine-tuned classifier import, decoder family: HF
+// GPT2ForSequenceClassification applies the bias-free score head to every
+// hidden state and pools the LAST NON-PAD token (only the final position
+// of a causal trunk has seen the whole text). The imported net outputs
+// per-position (SeqLen,1,3) class logits; SelectTokenLogits at the
+// fixture's pooled_position (= SeqLen-1, full-length input) must match
+// HF's float64 logits (tools/gpt2_seqcls_tiny_fixture.py asserts
+// position-0 pooling would visibly differ, so this test discriminates
+// the two pooling conventions); argmax round-trips through id2label.
+procedure TTestNeuralPretrained.TestGPT2SeqClsLogitParity;
+var
+  NN: TNNet;
+  Config: TGPT2Config;
+  Id2Label: TStringList;
+begin
+  RandSeed := 424242;
+  Id2Label := TStringList.Create;
+  try
+    NN := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
+      FixturePath('tiny_gpt2_seqcls.safetensors'), Config, Id2Label,
+      {SeqLen=}0, {pNumHeads=}2, {pInferenceOnly=}false,
+      FixturePath('tiny_gpt2_seqcls_config.json'));
+    try
+      AssertEquals('prefix (GPT2For* exports carry "transformer.")',
+        'transformer.', Config.Prefix);
+      AssertEquals('id2label size', 3, Id2Label.Count);
+      AssertEquals('id2label[1]', 'neu', Id2Label[1]);
+      AssertEquals('num_labels output depth', 3,
+        NN.GetLastLayer().Output.Depth);
+      AssertSeqClsParityWithFixture(NN,
+        FixturePath('tiny_gpt2_seqcls_logits.json'), Config.NCtx,
+        {BertStyle=}false, Id2Label);
+    finally
+      NN.Free;
+    end;
+  finally
+    Id2Label.Free;
+  end;
+end;
+
+// BuildFromPretrained must read config.json's "architectures" array and
+// route *ForSequenceClassification checkpoints to the classifier builders
+// (the base-LM/encoder default for the same model_types is covered by
+// TestBuildFromPretrainedDispatch). Full logit parity through both routes
+// proves the dispatch reached the classifier heads; also covers the
+// standalone ReadId2LabelFromJSONFile helper and the LABEL_i fallback of
+// ClassIndexToLabel.
+procedure TTestNeuralPretrained.TestBuildFromPretrainedSeqClsDispatch;
+var
+  NN: TNNet;
+  Id2Label: TStringList;
+begin
+  RandSeed := 424242;
+  // ClassIndexToLabel falls back to HF's default naming without a map.
+  AssertEquals('LABEL_i fallback', 'LABEL_7', ClassIndexToLabel(nil, 7));
+  // ---- BertForSequenceClassification route ----
+  Id2Label := ReadId2LabelFromJSONFile(
+    FixturePath('tiny_bert_seqcls_config.json'));
+  try
+    AssertEquals('bert id2label size', 3, Id2Label.Count);
+    NN := BuildFromPretrained(FixturePath('tiny_bert_seqcls.safetensors'),
+      0, false, FixturePath('tiny_bert_seqcls_config.json'));
+    try
+      AssertEquals('bert seqcls output depth', 3,
+        NN.GetLastLayer().Output.Depth);
+      AssertSeqClsParityWithFixture(NN,
+        FixturePath('tiny_bert_seqcls_logits.json'), 16,
+        {BertStyle=}true, Id2Label);
+    finally
+      NN.Free;
+    end;
+  finally
+    Id2Label.Free;
+  end;
+  // ---- GPT2ForSequenceClassification route (n_head from the config) ----
+  Id2Label := ReadId2LabelFromJSONFile(
+    FixturePath('tiny_gpt2_seqcls_config.json'));
+  try
+    AssertEquals('gpt2 id2label size', 3, Id2Label.Count);
+    NN := BuildFromPretrained(FixturePath('tiny_gpt2_seqcls.safetensors'),
+      0, false, FixturePath('tiny_gpt2_seqcls_config.json'));
+    try
+      AssertEquals('gpt2 seqcls output depth', 3,
+        NN.GetLastLayer().Output.Depth);
+      AssertSeqClsParityWithFixture(NN,
+        FixturePath('tiny_gpt2_seqcls_logits.json'), 16,
+        {BertStyle=}false, Id2Label);
+    finally
+      NN.Free;
+    end;
+  finally
+    Id2Label.Free;
   end;
 end;
 
