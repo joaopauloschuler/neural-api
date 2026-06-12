@@ -564,6 +564,29 @@ rather than acted on.
       transformers WhisperModel on a sliced pico fixture with a pinned
       mel input; headline demo: examples/WhisperTranscribe transcribing a
       short WAV to text on CPU.
+- [ ] BLOOM importer (bigscience/bloom-560m / bloomz-560m) — the ALiBi
+      architecture family, the one positional scheme NO landed importer
+      exercises (GPT-2 learned, Llama/NeoX/Qwen RoPE, T5 relative bias,
+      BERT learned): no positional embeddings at all, per-head linear
+      attention biases. TNNetALiBi already exists but is a STANDALONE
+      identity layer never wired into the attention builders, so the new
+      ingredient is plumbing per-head ALiBi slopes into the
+      SDPA/MHA score path (an avALiBi-style variant or Window-arg-like
+      FStruct flag, the same pattern as the landed avT5RelPosBias) —
+      which also unblocks ALiBi for from-scratch training and gives a
+      length-extrapolation story (train short, decode long; pairs with
+      the examples/ALiBiSlopeSweep findings). Remaining work is routine:
+      BuildBloomFromSafeTensors in neural/neuralpretrained.pas (fused
+      query_key_value with BLOOM's per-head [q|k|v] interleave — distinct
+      from NeoX's, worth a comment; embedding LayerNorm right after the
+      word embeddings; pre-LN GELU blocks; tied LM head; config.json
+      n_head/hidden_size/n_layer), the existing byte-level BPE
+      tokenizer.json path, .bin dispatch like the other importers, and a
+      sliced pico parity fixture (make_pico_*_fixture.py recipe) checking
+      hidden states + logits vs transformers BloomModel. Multilingual
+      checkpoint (46 languages) — also the first importer whose tokenizer
+      stresses non-Latin scripts end-to-end (the fpjson \uXXXX pre-decode
+      path).
 - [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
       decode docs explicitly note only greedy/sampled streamed generation
