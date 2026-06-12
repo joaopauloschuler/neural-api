@@ -31,8 +31,13 @@ header for the full discussion):
   `TNNetSafeTensorsReader` parses the `weight_map`, opens every shard and
   serves tensors transparently (no importer changes needed).
 
-Tokenizers (SentencePiece / `tokenizer.json`) are **out of scope** here:
-everything runs on raw token ids.
+Tokenizers: `neural/neuralhftokenizer.pas` (`TNeuralHFTokenizer`) reads the
+HF `tokenizer.json` that ships with Llama-family repos (BPE with metaspace
+normalizer + `<0xNN>` byte fallback), so text can be encoded to ids and
+decoded back (`LoadFromFile` / `Encode` / `Decode`; see
+`examples/GPT2Import` for end-to-end text-prompt usage). The logits dumper
+below still runs on raw token ids. The raw SentencePiece `.model` protobuf
+is not parsed -- use the repo's `tokenizer.json`.
 
 ## Files
 

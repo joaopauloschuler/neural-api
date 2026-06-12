@@ -1,0 +1,482 @@
+{
+ "byte_level": {
+  "tokenizer": "tiny_bpe_bytelevel_tokenizer.json",
+  "cases": [
+   {
+    "text": "Hello world",
+    "ids": [
+     40,
+     69,
+     266,
+     79,
+     277,
+     283,
+     76,
+     68
+    ],
+    "decoded": "Hello world"
+   },
+   {
+    "text": "Hello, world!",
+    "ids": [
+     40,
+     69,
+     266,
+     79,
+     12,
+     277,
+     283,
+     76,
+     68,
+     1
+    ],
+    "decoded": "Hello, world!"
+   },
+   {
+    "text": "the cat sat on the mat",
+    "ids": [
+     365,
+     268,
+     263,
+     309,
+     307,
+     261,
+     285,
+     263
+    ],
+    "decoded": "the cat sat on the mat"
+   },
+   {
+    "text": "  leading and  multiple   spaces",
+    "ids": [
+     221,
+     276,
+     69,
+     65,
+     68,
+     347,
+     71,
+     278,
+     221,
+     285,
+     85,
+     76,
+     84,
+     73,
+     80,
+     351,
+     221,
+     221,
+     258,
+     80,
+     65,
+     67,
+     337
+    ],
+    "decoded": "  leading and  multiple   spaces"
+   },
+   {
+    "text": "trailing space ",
+    "ids": [
+     84,
+     82,
+     65,
+     73,
+     76,
+     347,
+     71,
+     258,
+     80,
+     65,
+     67,
+     69,
+     221
+    ],
+    "decoded": "trailing space "
+   },
+   {
+    "text": "tabs\tand\nnewlines",
+    "ids": [
+     84,
+     65,
+     66,
+     83,
+     198,
+     65,
+     274,
+     199,
+     78,
+     69,
+     87,
+     76,
+     347,
+     337
+    ],
+    "decoded": "tabs\tand\nnewlines"
+   },
+   {
+    "text": "Don't stop, don't ever stop!",
+    "ids": [
+     322,
+     318,
+     258,
+     364,
+     80,
+     12,
+     269,
+     264,
+     318,
+     221,
+     338,
+     258,
+     364,
+     80,
+     1
+    ],
+    "decoded": "Don't stop, don't ever stop!"
+   },
+   {
+    "text": "numbers 12345 and 3.14",
+    "ids": [
+     354,
+     352,
+     361,
+     305,
+     18,
+     19,
+     20,
+     21,
+     278,
+     221,
+     19,
+     14,
+     17,
+     20
+    ],
+    "decoded": "numbers 12345 and 3.14"
+   },
+   {
+    "text": "café naïve résumé",
+    "ids": [
+     67,
+     293,
+     128,
+     103,
+     286,
+     65,
+     128,
+     108,
+     267,
+     221,
+     82,
+     128,
+     103,
+     83,
+     85,
+     77,
+     128,
+     103
+    ],
+    "decoded": "café naïve résumé"
+   },
+   {
+    "text": "emoji 😀 test",
+    "ids": [
+     69,
+     77,
+     79,
+     74,
+     73,
+     221,
+     173,
+     254,
+     247,
+     223,
+     259,
+     337,
+     84
+    ],
+    "decoded": "emoji 😀 test"
+   },
+   {
+    "text": "mixed: café 42 🚀!",
+    "ids": [
+     77,
+     73,
+     88,
+     69,
+     68,
+     26,
+     268,
+     293,
+     128,
+     103,
+     221,
+     20,
+     18,
+     221,
+     173,
+     254,
+     249,
+     223,
+     1
+    ],
+    "decoded": "mixed: café 42 🚀!"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   },
+   {
+    "text": "x<|endoftext|>y",
+    "ids": [
+     88,
+     0,
+     89
+    ],
+    "decoded": "xy"
+   }
+  ]
+ },
+ "metaspace": {
+  "tokenizer": "tiny_bpe_metaspace_tokenizer.json",
+  "cases": [
+   {
+    "text": "Hello world",
+    "ids": [
+     305,
+     274,
+     319,
+     293,
+     338,
+     315,
+     290,
+     282
+    ],
+    "decoded": "Hello world"
+   },
+   {
+    "text": "Hello, world!",
+    "ids": [
+     305,
+     274,
+     319,
+     293,
+     326,
+     301,
+     315,
+     290,
+     282,
+     259
+    ],
+    "decoded": "Hello, world!"
+   },
+   {
+    "text": "the cat sat on the mat",
+    "ids": [
+     480,
+     530
+    ],
+    "decoded": "the cat sat on the mat"
+   },
+   {
+    "text": "  leading and  multiple   spaces",
+    "ids": [
+     305,
+     305,
+     305,
+     290,
+     322,
+     282,
+     426,
+     285,
+     366,
+     305,
+     360,
+     299,
+     290,
+     298,
+     287,
+     294,
+     432,
+     305,
+     305,
+     297,
+     294,
+     279,
+     281,
+     412
+    ],
+    "decoded": "  leading and  multiple   spaces"
+   },
+   {
+    "text": "trailing space ",
+    "ids": [
+     305,
+     298,
+     296,
+     279,
+     287,
+     348,
+     292,
+     423,
+     297,
+     294,
+     279,
+     281,
+     306
+    ],
+    "decoded": "trailing space "
+   },
+   {
+    "text": "tabs\tand\nnewlines",
+    "ids": [
+     305,
+     298,
+     279,
+     280,
+     297,
+     12,
+     343,
+     13,
+     292,
+     283,
+     301,
+     348,
+     292,
+     412
+    ],
+    "decoded": "tabs\tand\nnewlines"
+   },
+   {
+    "text": "Don't stop, don't ever stop!",
+    "ids": [
+     459,
+     372,
+     297,
+     298,
+     293,
+     294,
+     326,
+     282,
+     314,
+     372,
+     415,
+     305,
+     297,
+     298,
+     293,
+     294,
+     259
+    ],
+    "decoded": "Don't stop, don't ever stop!"
+   },
+   {
+    "text": "numbers 12345 and 3.14",
+    "ids": [
+     508,
+     308,
+     375,
+     266,
+     267,
+     268,
+     366,
+     305,
+     266,
+     262,
+     264,
+     267
+    ],
+    "decoded": "numbers 12345 and 3.14"
+   },
+   {
+    "text": "café naïve résumé",
+    "ids": [
+     305,
+     406,
+     198,
+     172,
+     337,
+     279,
+     198,
+     178,
+     300,
+     306,
+     296,
+     198,
+     172,
+     297,
+     299,
+     291,
+     198,
+     172
+    ],
+    "decoded": "café naïve résumé"
+   },
+   {
+    "text": "emoji 😀 test",
+    "ids": [
+     305,
+     283,
+     291,
+     293,
+     288,
+     287,
+     305,
+     243,
+     162,
+     155,
+     131,
+     305,
+     298,
+     412,
+     298
+    ],
+    "decoded": "emoji 😀 test"
+   },
+   {
+    "text": "mixed: café 42 🚀!",
+    "ids": [
+     360,
+     287,
+     302,
+     283,
+     282,
+     61,
+     305,
+     406,
+     198,
+     172,
+     305,
+     267,
+     265,
+     305,
+     243,
+     162,
+     157,
+     131,
+     259
+    ],
+    "decoded": "mixed: café 42 🚀!"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   },
+   {
+    "text": "<s>hello</s>",
+    "ids": [
+     1,
+     305,
+     286,
+     319,
+     293,
+     2
+    ],
+    "decoded": "hello"
+   }
+  ]
+ }
+}

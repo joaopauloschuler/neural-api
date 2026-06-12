@@ -109,11 +109,31 @@ rather than acted on.
       accuracy risk) is an acceptable stepping stone if int8 proves invasive.
       Follow-ups: int8 activation/matmul path, GPTQ/AWQ-style calibrated
       quantization, 4-bit.
-- [ ] SentencePiece / tokenizer.json tokenizer loading for the Llama importer
+- [X] SentencePiece / tokenizer.json tokenizer loading for the Llama importer
       (examples/LlamaImport currently drives the net with raw token ids):
       parse HF tokenizer.json (BPE/Unigram vocab + merges + byte-fallback) or
       the sentencepiece .model protobuf into a TNeuralTokenizer-compatible
       encoder/decoder so LlamaImport can take text prompts end to end.
+      DONE: neural/neuralhftokenizer.pas TNeuralHFTokenizer loads HF
+      tokenizer.json for both importer families -- byte-level BPE
+      (GPT-2/distilgpt2/SmolLM2: bytes-to-unicode table, GPT-2 regex,
+      ranked merges) and metaspace BPE with byte fallback
+      (Llama/TinyLlama: Prepend/Replace normalizer, <0xNN> tokens,
+      Replace/ByteFallback/Fuse/Strip decoder); added/special tokens
+      matched verbatim, ids exposed, never auto-injected. Exact-id parity
+      with HF `tokenizers` pinned by tests/TestNeuralHFTokenizer.pas over
+      fixtures from tools/hf_tokenizer_fixture.py; examples/GPT2Import
+      takes -t "text" prompts when tokenizer.json sits next to the
+      checkpoint. Remaining sub-scopes split out below.
+- [ ] Tokenizer follow-ups for neuralhftokenizer.pas: (a) Unigram model
+      support (model.type "Unigram", Viterbi segmentation) -- needed only
+      for tokenizers not yet converted to BPE format; (b) the raw
+      SentencePiece .model protobuf path (parse the protobuf wire format
+      or vendor a minimal decoder) for checkpoints that ship without a
+      tokenizer.json; (c) exact full-Unicode \p{L}/\p{N} tables (current
+      classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
+      Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
+      punctuation class of the GPT-2 regex).
 - [ ] Logits-processor chain + generation config in neural/neuraldecode.pas
       (the remaining half of the transformers GenerationMixin port):
       top-k/top-p/min-p sampling, repetition/frequency/presence penalties

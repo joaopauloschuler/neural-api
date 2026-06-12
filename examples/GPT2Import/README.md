@@ -62,9 +62,19 @@ dimension-sliced by `make_pico_gpt2_fixture.py` — 2 of 6 layers, 2 heads × 4
 dims, d_model 8, vocab 12, reference logits from `GPT2LMHeadModel` in
 float64) is asserted by `TestDistilGPT2LogitParity` in every test run.
 
-The program prints token ids only: the repo's `TNeuralTokenizer` cannot read
-HF `vocab.json`/`merges.txt` yet (byte-level BPE support is a noted
-follow-up), so decode the ids with any GPT-2 tokenizer.
+With a HuggingFace `tokenizer.json` sitting next to the checkpoint (every
+GPT-2-family repo ships one), prompts can be plain text instead of ids:
+
+```
+GPT2Import /tmp/model.safetensors 64 0 -t "The meaning of life is"
+```
+
+`neural/neuralhftokenizer.pas` (`TNeuralHFTokenizer`) loads the byte-level
+BPE (vocab + ranked merges + the GPT-2 pre-tokenization regex and
+bytes-to-unicode table), encodes the prompt and decodes the generated
+continuation back to text. Raw-id mode keeps working without any tokenizer
+file. Exact-id parity with the HF `tokenizers` library is pinned by
+`tests/TestNeuralHFTokenizer.pas`.
 
 ## How correctness is verified (logit parity)
 

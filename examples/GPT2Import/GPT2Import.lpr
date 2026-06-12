@@ -22,11 +22,12 @@ Coded by Claude (AI).
 // GPT2Import -- imports a pretrained HuggingFace GPT-2 checkpoint
 // (model.safetensors) into a CAI TNNet, prints the inferred configuration
 // and the built architecture, and greedily generates a continuation from a
-// raw token-id prompt (the repo's tokenizer cannot read HF vocab.json /
-// merges.txt yet, so prompts and outputs are token ids).
+// raw token-id prompt or, when a HuggingFace tokenizer.json sits next to
+// the checkpoint, from a text prompt (neuralhftokenizer.pas).
 //
 // Usage:
 //   GPT2Import <model.safetensors> [SeqLen] [NumHeads] [t0 t1 t2 ...]
+//   GPT2Import <model.safetensors> [SeqLen] [NumHeads] -t "prompt text"
 //
 //   SeqLen   - context window to build (default 64; 0 = the full n_ctx,
 //              which is SLOW for the real 1024-context GPT-2 on CPU).
@@ -34,12 +35,15 @@ Coded by Claude (AI).
 //              fixture needs an explicit 2).
 //   t0 t1... - prompt token ids (default: 464 = "The" for the real GPT-2
 //              vocabulary).
+//   -t text  - text prompt; encoded with the tokenizer.json found in the
+//              checkpoint's directory, and the continuation is decoded
+//              back to text.
 //
 // Try it with the tiny committed fixture (from the repo root):
 //   GPT2Import tests/fixtures/tiny_gpt2.safetensors 16 2 0 1 2
 // or with the real 124M-parameter GPT-2 (see README.md for the download
-// link; ~500 MB):
-//   GPT2Import /tmp/model.safetensors 64 0 464
+// link; ~500 MB, tokenizer.json next to it enables text prompts):
+//   GPT2Import /tmp/model.safetensors 64 0 -t "The"
 
 {$mode objfpc}{$H+}
 
@@ -47,7 +51,7 @@ uses
   {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
   Classes, SysUtils,
   neuralvolume, neuralnetwork,
-  neuralsafetensors, neuralpretrained;
+  neuralsafetensors, neuralpretrained, neuralhftokenizer;
 
 const
   csDefaultSeqLen = 64;
@@ -63,7 +67,11 @@ var
   TokenCnt, PromptLen, StepCnt, PosIdx: integer;
   BestToken, TokCnt: integer;
   BestLogit: TNeuralFloat;
+  Tokenizer: TNeuralHFTokenizer;
+  TokenizerPath, PromptText: string;
 begin
+  Tokenizer := nil;
+  PromptText := '';
   if ParamCount < 1 then
   begin
     WriteLn('Usage: GPT2Import <model.safetensors> [SeqLen] [NumHeads] [t0 t1 ...]');
@@ -76,10 +84,37 @@ begin
   NumHeads := 0;
   if ParamCount >= 3 then NumHeads := StrToIntDef(ParamStr(3), 0);
   SetLength(Prompt, 0);
-  for ParamCnt := 4 to ParamCount do
+  if (ParamCount >= 5) and (ParamStr(4) = '-t') then
+    PromptText := ParamStr(5)
+  else
+    for ParamCnt := 4 to ParamCount do
+    begin
+      SetLength(Prompt, Length(Prompt) + 1);
+      Prompt[High(Prompt)] := StrToIntDef(ParamStr(ParamCnt), 0);
+    end;
+
+  // Optional text-prompt mode: encode with the HF tokenizer.json that
+  // ships next to the checkpoint (raw-id mode keeps working without it).
+  if PromptText <> '' then
   begin
-    SetLength(Prompt, Length(Prompt) + 1);
-    Prompt[High(Prompt)] := StrToIntDef(ParamStr(ParamCnt), 0);
+    TokenizerPath := ExtractFilePath(ExpandFileName(FileName)) +
+      'tokenizer.json';
+    if not FileExists(TokenizerPath) then
+    begin
+      WriteLn('Text prompts need a HuggingFace tokenizer.json next to the');
+      WriteLn('checkpoint; not found: ', TokenizerPath);
+      Halt(1);
+    end;
+    Tokenizer := TNeuralHFTokenizer.Create();
+    Tokenizer.LoadFromFile(TokenizerPath);
+    Prompt := Tokenizer.Encode(PromptText);
+    WriteLn('Loaded ', TokenizerPath, ' (vocab: ',
+      Tokenizer.GetVocabSize(), ').');
+    if Length(Prompt) = 0 then
+    begin
+      WriteLn('The prompt text encoded to zero tokens.');
+      Halt(1);
+    end;
   end;
   if Length(Prompt) = 0 then
   begin
@@ -149,14 +184,22 @@ begin
         Inc(PromptLen);
       end;
       WriteLn;
-      WriteLn('(Token ids only - decode them with any GPT-2 BPE tokenizer;');
-      WriteLn(' teaching TNeuralTokenizer to read HF vocab.json/merges.txt');
-      WriteLn(' is a noted follow-up.)');
+      if Tokenizer <> nil then
+      begin
+        WriteLn('Decoded text (prompt + continuation):');
+        WriteLn(Tokenizer.Decode(Prompt, {SkipSpecialTokens=}true));
+      end
+      else
+      begin
+        WriteLn('(Token ids only - rerun with -t "your prompt" and a');
+        WriteLn(' tokenizer.json next to the checkpoint for text in/out.)');
+      end;
     finally
       Output.Free;
       Input.Free;
     end;
   finally
+    Tokenizer.Free;
     NN.Free;
   end;
 end.
