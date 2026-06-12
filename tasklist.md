@@ -609,6 +609,27 @@ rather than acted on.
       convention against the reference carefully). Verify logit parity vs
       HF's RwkvForCausalLM on a sliced fixture; a decode-side demo
       showing flat memory vs a transformer of equal size is the headline.
+- [ ] Mamba checkpoint importer (state-spaces/mamba-130m-hf) — the
+      selective-SSM sibling of the RWKV-4 importer task above and the
+      second non-transformer family; like RWKV it decodes with CONSTANT
+      memory (no KV cache). TNNetSelectiveSSM is landed but is the N=1
+      special case: it keeps ONE state scalar per channel and emits
+      per-channel b_t/c_t, while the HF MambaMixer carries d_state=16
+      states per channel with B,C in R^d_state shared across channels
+      (x_proj -> [delta_rank|2*d_state] split, low-rank dt_proj with the
+      inv-softplus dt bias init, per-(channel,state) A_log, D skip).
+      Work: (1) generalize TNNetSelectiveSSM with a DState argument
+      (FStruct, default 1 = today's behavior bit-for-bit, gradient check
+      for DState>1); (2) AddMambaBlock builder — in_proj to 2*d_inner
+      (x|z gate split via TNNetSplitChannels), depthwise
+      TNNetCausalConv1D(k=4)+bias, SiLU, selective scan, SiLU(z) gate
+      mul, out_proj, wrapped in AddRMSNormResidual; (3) the
+      BuildMambaFromSafeTensors weight mapping in
+      neural/neuralpretrained.pas (config.json: d_model/n_layer/
+      time_step_rank; fold conv1d/x_proj/dt_proj layouts; tied LM head).
+      Verify logit parity vs HF MambaForCausalLM on a sliced pico fixture
+      (same make_pico script recipe as GPT-2/Llama); headline demo:
+      tokens/sec flat in context length where the transformer slows.
 - [ ] ModernBERT importer (answer.ai, 139M) — the encoder worth targeting
       BEYOND vanilla BERT once the BERT-family importer task above lands:
       RoPE instead of learned positions, GeGLU, alternating local/global
