@@ -124,6 +124,7 @@ type
     procedure TestGPTJLogitParity;
     procedure TestPhiConfigFromJSONFile;
     procedure TestPhiLogitParity;
+    procedure TestPhi3LogitParity;
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
@@ -3120,6 +3121,62 @@ begin
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_phi_logits.json'), Config.MaxPositions,
       Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Phi-3 / Phi-4-mini import target (model_type "phi3" - NOT
+// phi-1/phi-2's "phi" above): tests/fixtures/tiny_phi3.* is a pico
+// randomly-initialized HF Phi3ForCausalLM (2 layers, 4 query heads sharing
+// 2 kv heads x 8 dims - GQA, the Phi-4-mini 24q/8kv shape scaled down -
+// hidden 32, vocab 13, TIED lm_head) riding the Llama path with every phi3
+// delta genuinely exercised (the generator tools/phi3_tiny_fixture.py
+// asserts each one moves the logits):
+// (a) FUSED bias-free qkv_proj (q|k|v packed rows, sliced row-block-wise
+//     with the rotate_half permutation applied AFTER slicing) and
+//     gate_up_proj (gate|up packed - a swapped-halves load would fail);
+// (b) PARTIAL rotary: partial_rotary_factor=0.75 -> RoPE on the first 6 of
+//     8 head dims, pass-through tail (full rotary moves the logits ~1.1);
+// (c) Mistral-convention sliding_window=4 SMALLER than the 16-token
+//     sequences (full attention moves the logits ~2.9).
+// Reference logits come from HF transformers in float64.
+procedure TTestNeuralPretrained.TestPhi3LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildPhi3FromSafeTensorsEx(FixturePath('tiny_phi3.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_phi3_config.json'));
+  try
+    AssertEquals('model_type', 'phi3', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 4, Config.NumHeads);
+    AssertEquals('kv_heads', 2, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('sliding_window', 4, Config.SlidingWindow);
+    AssertEquals('partial_rotary_factor', 0.75,
+      Config.PartialRotaryFactor, 1e-9);
+    AssertTrue('fused_qkv_gate_up', Config.FusedQKVGateUp);
+    AssertFalse('qkv_bias (phi3 is bias-free)', Config.QKVBias);
+    AssertTrue('tied (Phi-4-mini ties)', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_phi3_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "phi3" (architectures ["Phi3ForCausalLM"]) onto the same Llama path.
+  NN := BuildFromPretrained(FixturePath('tiny_phi3.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_phi3_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_phi3_logits.json'), 16, 13);
   finally
     NN.Free;
   end;

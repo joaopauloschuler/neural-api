@@ -92,7 +92,18 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Phi-4-mini import
+- [X] Phi-4-mini import — landed as BuildPhi3FromSafeTensors[Ex] in
+      neural/neuralpretrained.pas (model_type "phi3": Phi-3-mini AND
+      Phi-4-mini): a thin wrapper over the Llama path with three config
+      flags — FUSED bias-free qkv_proj / gate_up_proj slabs (row-block
+      slicing, rotate_half permutation after the slice), PARTIAL rotary
+      (partial_rotary_factor, 0.75 on Phi-4-mini) and the Mistral-style
+      sliding window. The 128k "longrope" rope_scaling variants are
+      REJECTED with a clear error. Parity fixture
+      tests/fixtures/tiny_phi3.* (tools/phi3_tiny_fixture.py; GQA + tied
+      head + window + partial rotary all asserted non-vacuous) verified at
+      max |logit diff| 1.7e-6 vs HF float64 (TestPhi3LogitParity, both the
+      direct and the BuildFromPretrained dispatch routes).
 - [ ] CLIP import — first VISION-LANGUAGE importer: BuildClipFromSafeTensors
       for openai/clip-vit-base-patch32 (or SigLIP, whichever maps cleaner).
       Both towers are plain pre-norm transformer encoders the library already

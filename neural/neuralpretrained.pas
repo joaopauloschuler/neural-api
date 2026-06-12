@@ -52,6 +52,15 @@ unit neuralpretrained;
 //     like GPT-J but with BIASED separate q/k/v/dense + partial rotary in
 //     the NeoX rotate_half layout + untied lm_head WITH bias) -
 //     BuildPhiFromSafeTensors. See the PHI IMPORT section below.
+//   - Phi-3 / Phi-4-mini (model_type "phi3": microsoft/Phi-3-mini-4k-
+//     instruct, Phi-4-mini-instruct and siblings; the LLAMA skeleton -
+//     pre-norm RMSNorm, sequential residual, SwiGLU, GQA - with FUSED
+//     bias-free qkv_proj (q|k|v packed rows) and gate_up_proj (gate|up)
+//     slabs plus optional PARTIAL rotary (partial_rotary_factor, 0.75 on
+//     Phi-4-mini) in the rotate_half layout) - BuildPhi3FromSafeTensors,
+//     a thin wrapper over the Llama path (longrope rope_scaling - the
+//     128k variants - is REJECTED, not mis-loaded). See the LLAMA IMPORT
+//     section below.
 //   - BERT (vanilla encoder family, model_type "bert": bert-base/tiny,
 //     sentence-transformers MiniLM, ...) - BuildBertFromSafeTensors.
 //     The FIRST ENCODER here: outputs hidden states, not logits. See the
@@ -634,11 +643,21 @@ type
                                // when null/absent). With RopeLocalTheta > 0
                                // (Gemma-3) it applies to the GLOBAL layers
                                // only, matching HF (rope_local is unscaled)
+    // ---- Phi-3 deltas (all default off/full for the other families) ----
+    FusedQKVGateUp: boolean;   // FUSED bias-free projections (Phi-3):
+                               // self_attn.qkv_proj.weight packs q|k|v rows
+                               // and mlp.gate_up_proj.weight packs gate|up -
+                               // sliced into the same layers at load
+    PartialRotaryFactor: TNeuralFloat; // partial_rotary_factor: RoPE rotates
+                               // only the first int(head_dim*factor)
+                               // channels of each q/k head, the tail passes
+                               // through (Phi-4-mini: 0.75); 0 or 1 = full
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
 // Reads a HF Llama-family config.json (model_type 'llama', 'mistral',
-// 'qwen2' or 'qwen3'). Required: hidden_size, intermediate_size,
+// 'qwen2', 'qwen3', 'gemma', 'gemma2', 'gemma3_text' or 'phi3').
+// Required: hidden_size, intermediate_size,
 // num_hidden_layers, num_attention_heads, vocab_size,
 // max_position_embeddings. Defaults: num_key_value_heads =
 // num_attention_heads, rms_norm_eps = 1e-6, rope_theta = 10000,
@@ -675,6 +694,17 @@ type
 //            (sliding_window_pattern, default 6 - every 6th layer global),
 //            RopeTheta default 1e6 and RopeLocalTheta
 //            (rope_local_base_freq, default 10000) for the sliding layers;
+//   phi3:    FusedQKVGateUp := true (fused bias-free qkv_proj / gate_up_proj
+//            slabs); PartialRotaryFactor := partial_rotary_factor (default
+//            1.0 = full rotary; Phi-4-mini ships 0.75); rms_norm_eps
+//            defaults 1e-5 (the Phi3Config default); SlidingWindow :=
+//            sliding_window like mistral (null/absent = full attention -
+//            HF Phi3 windows EVERY layer through the same mask util as
+//            Mistral, so the Mistral convention applies unchanged); a
+//            "longrope" (or Phi-3-spelled "su"/"yarn") rope_scaling - the
+//            128k checkpoints - is REJECTED with a clear error (the
+//            per-frequency long/short factor tables are not standard YaRN
+//            and are not wired into TNNetRotaryEmbedding);
 //   llama:   QKVBias := attention_bias (default false).
 // Fails on an unsupported model_type. A non-null "rope_scaling" is parsed
 // into Result.RopeScaling (see TRoPEScalingConfig for the supported types:
@@ -811,6 +841,36 @@ function BuildGemma3FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 function BuildGemma3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+// Phi-3 / Phi-4-mini (model_type "phi3": microsoft/Phi-3-mini-4k-instruct,
+// Phi-4-mini-instruct and siblings - NOT phi-1/phi-2, which are model_type
+// "phi" and architecturally different; see BuildPhiFromSafeTensors): the
+// Llama skeleton (pre-norm RMSNorm, sequential residual, SwiGLU MLP, GQA,
+// model.norm + lm_head - tied on Phi-4-mini, untied on Phi-3-mini) with
+// three load-time deltas:
+// (a) FUSED bias-free projections - self_attn.qkv_proj.weight packs the
+//     q|k|v rows (q = num_heads*head_dim, then k and v =
+//     num_key_value_heads*head_dim each) and mlp.gate_up_proj.weight packs
+//     gate|up; both are sliced row-block-wise into the same Llama layers,
+//     with the rotate_half->interleaved q/k permutation applied AFTER
+//     slicing;
+// (b) PARTIAL rotary (partial_rotary_factor, 0.75 on Phi-4-mini; 1.0 -
+//     full - on Phi-3-mini): RoPE rotates only the first
+//     int(head_dim*factor) channels of each q/k head, the tail passes
+//     through (the Phi/NeoX rotate_half slice layout);
+// (c) Mistral-style sliding window (sliding_window, EVERY layer; HF Phi3
+//     routes it through the same mask util as Mistral, so the landed SDPA
+//     window convention applies unchanged; null/absent = full attention).
+// The 128k "longrope" rope_scaling variants are REJECTED with a clear
+// error (not silently mis-loaded). Thin wrappers over the Llama path that
+// ASSERT model_type is 'phi3'.
+function BuildPhi3FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildPhi3FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
 
 type
@@ -2703,10 +2763,10 @@ begin
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
-       (ModelType <> 'gemma3_text') then
+       (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "gemma", ' +
-        '"gemma2" and "gemma3_text" are supported here (see ' +
+        '"gemma2", "gemma3_text" and "phi3" are supported here (see ' +
         'BuildFromPretrained for the full dispatch; multimodal "gemma3" ' +
         'configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
@@ -2755,6 +2815,8 @@ begin
     Result.AltSlidingWindow := False;
     Result.SlidingWindowPattern := 0;
     Result.RopeLocalTheta := 0;
+    Result.FusedQKVGateUp := False;
+    Result.PartialRotaryFactor := 1.0;
     if ModelType = 'mistral' then
     begin
       // Many Mistral configs ship sliding_window=null (full attention).
@@ -2904,6 +2966,47 @@ begin
         end;
       end;
     end
+    else if ModelType = 'phi3' then
+    begin
+      // Phi-3 / Phi-4-mini deltas (see BuildPhi3FromSafeTensors): fused
+      // bias-free qkv_proj / gate_up_proj slabs, optional partial rotary
+      // and a Mistral-style sliding window (HF Phi3 routes
+      // config.sliding_window through the SAME mask util as Mistral, on
+      // every layer; null/absent = full attention).
+      Result.FusedQKVGateUp := True;
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5); // Phi3 default
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: Phi-3 hidden_act "' + HiddenAct +
+          '" is not supported - every released phi3 checkpoint uses ' +
+          '"silu" (SwiGLU).');
+      Result.PartialRotaryFactor :=
+        Obj.Get('partial_rotary_factor', 1.0);
+      if (Result.PartialRotaryFactor <= 0) or
+         (Result.PartialRotaryFactor > 1) then
+        ImportError('Llama import: config partial_rotary_factor must be ' +
+          'in (0, 1], got ' + FloatToStr(Result.PartialRotaryFactor) + '.');
+      SlidingWindowField := Obj.Find('sliding_window');
+      if (SlidingWindowField <> nil) and not SlidingWindowField.IsNull then
+      begin
+        Result.SlidingWindow := SlidingWindowField.AsInteger;
+        if Result.SlidingWindow < 1 then
+          ImportError('Llama import: config sliding_window must be a ' +
+            'positive integer or null, got ' + SlidingWindowField.AsJSON + '.');
+      end;
+      // The 128k Phi-3 variants ship rope_scaling type "longrope" (older
+      // configs spell it "su" or even "yarn" - HF's Phi3Config remaps both
+      // to longrope): per-frequency long/short factor tables that are NOT
+      // standard YaRN. The generic parse above already rejects
+      // "longrope"/"su" as unknown types; a phi3 "yarn" would be ACCEPTED
+      // as standard YaRN and silently mis-load, so it is rejected here.
+      if Result.RopeScaling.Mode = rsmYaRN then
+        ImportError('Llama import: a phi3 rope_scaling of type "yarn" is ' +
+          'LongRoPE in disguise (HF Phi3Config remaps "su"/"yarn" to ' +
+          '"longrope": per-frequency long/short factor tables, not ' +
+          'standard YaRN) - the 128k Phi-3 variants are not wired into ' +
+          'TNNetRotaryEmbedding; use a 4k/8k checkpoint.');
+    end
     else // llama
       Result.QKVBias := Obj.Get('attention_bias', False);
     Result.Prefix := ''; // detected from the checkpoint by the builder
@@ -2962,6 +3065,12 @@ begin
   if Config.RopeLocalTheta > 0 then
     Result := Result + ', rope_local_theta=' +
       FloatToStr(Config.RopeLocalTheta);
+  if Config.FusedQKVGateUp then
+    Result := Result + ', fused_qkv_gate_up=true';
+  if (Config.PartialRotaryFactor > 0) and
+     (Config.PartialRotaryFactor < 1) then
+    Result := Result + ', partial_rotary=' +
+      FloatToStr(Config.PartialRotaryFactor);
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -3010,16 +3119,31 @@ end;
 //   target channel (h*hd + 2k + 1) <- HF row (h*hd + k + hd/2)
 // Scale multiplies every loaded weight (and bias): the GPT-Neo importer
 // folds the missing 1/sqrt(d_head) attention scaling into W_q with it.
+// RotaryDims > 0 RESTRICTS the rotate_half permutation to the first
+// RotaryDims rows of each RotaryHeadDim-wide head (the PARTIAL-rotary
+// layout of Phi-3; rows beyond the rotary slice keep their position) -
+// 0 permutes the full head (RotaryDims = RotaryHeadDim).
+// SrcRowBase/SrcRows slice a ROW BLOCK out of a larger FUSED slab (the
+// Phi-3 qkv_proj / gate_up_proj packing): the checkpoint tensor is
+// expected to have SrcRows rows (0 = OutDim, the whole tensor) and rows
+// SrcRowBase..SrcRowBase+OutDim-1 are loaded - the q/k rotate_half
+// permutation applies AFTER the slicing, within the destination block.
 procedure LoadLlamaLinearWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
   NeuronBase: integer = 0; ExpectedNeurons: integer = -1;
   RotaryHeadDim: integer = 0; const BiasName: string = '';
-  Scale: TNeuralFloat = 1.0);
+  Scale: TNeuralFloat = 1.0; RotaryDims: integer = 0;
+  SrcRowBase: integer = 0; SrcRows: integer = 0);
 var
   W, B: TNNetVolume;
-  i, j, TargetIdx, HeadIdx, RowInHead, HalfDim: integer;
+  i, j, TargetIdx, HeadIdx, RowInHead, TargetRow, HalfDim, SrcRow: integer;
 begin
   if ExpectedNeurons < 0 then ExpectedNeurons := OutDim;
+  if SrcRows <= 0 then SrcRows := OutDim;
+  if SrcRowBase + OutDim > SrcRows then
+    ImportError('Llama import: internal error - row block ' +
+      IntToStr(SrcRowBase) + '..' + IntToStr(SrcRowBase + OutDim - 1) +
+      ' for "' + WName + '" exceeds the slab rows ' + IntToStr(SrcRows) + '.');
   if not Reader.HasTensor(WName) then
     ImportError('Llama import: missing tensor "' + WName + '".');
   if BiasName <> '' then
@@ -3027,26 +3151,30 @@ begin
     if not Reader.HasTensor(BiasName) then
       ImportError('Llama import: missing tensor "' + BiasName + '".');
     if (Reader.DimCount(BiasName) <> 1) or
-       (Reader.DimSize(BiasName, 0) <> OutDim) then
+       (Reader.DimSize(BiasName, 0) <> SrcRows) then
       ImportError('Llama import: "' + BiasName + '" must have shape [' +
-        IntToStr(OutDim) + '], got ' + Reader.ShapeAsString(BiasName));
+        IntToStr(SrcRows) + '], got ' + Reader.ShapeAsString(BiasName));
   end;
   if (Reader.DimCount(WName) <> 2) or
-     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 0) <> SrcRows) or
      (Reader.DimSize(WName, 1) <> InDim) then
     ImportError('Llama import: "' + WName + '" must have shape [' +
-      IntToStr(OutDim) + ', ' + IntToStr(InDim) + '] (nn.Linear stores ' +
+      IntToStr(SrcRows) + ', ' + IntToStr(InDim) + '] (nn.Linear stores ' +
       '[out, in]), got ' + Reader.ShapeAsString(WName));
   if Layer.Neurons.Count <> ExpectedNeurons then
     ImportError('Llama import: internal error - layer for "' + WName +
       '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
       IntToStr(ExpectedNeurons) + '.');
+  if (RotaryHeadDim > 0) and (RotaryDims <= 0) then
+    RotaryDims := RotaryHeadDim; // full-head rotary (the Llama default)
   if (RotaryHeadDim > 0) and
-     (((OutDim mod RotaryHeadDim) <> 0) or Odd(RotaryHeadDim)) then
+     (((OutDim mod RotaryHeadDim) <> 0) or Odd(RotaryDims) or
+      (RotaryDims > RotaryHeadDim)) then
     ImportError('Llama import: internal error - "' + WName + '" rows (' +
-      IntToStr(OutDim) + ') are not a multiple of the even head_dim ' +
-      IntToStr(RotaryHeadDim) + '.');
-  HalfDim := RotaryHeadDim div 2;
+      IntToStr(OutDim) + ') are not a multiple of head_dim ' +
+      IntToStr(RotaryHeadDim) + ' with an even rotary slice ' +
+      IntToStr(RotaryDims) + '.');
+  HalfDim := RotaryDims div 2;
   W := TNNetVolume.Create;
   B := nil;
   try
@@ -3062,14 +3190,23 @@ begin
       begin
         HeadIdx := j div RotaryHeadDim;
         RowInHead := j mod RotaryHeadDim;
-        if RowInHead < HalfDim then
-          TargetIdx := HeadIdx * RotaryHeadDim + 2 * RowInHead
-        else
-          TargetIdx := HeadIdx * RotaryHeadDim + 2 * (RowInHead - HalfDim) + 1;
+        // rotate_half -> interleaved, restricted to the rotary slice
+        // (RowInHead >= RotaryDims is the partial-rotary pass-through
+        // tail and keeps its position).
+        TargetRow := RowInHead;
+        if RowInHead < RotaryDims then
+        begin
+          if RowInHead < HalfDim then
+            TargetRow := 2 * RowInHead
+          else
+            TargetRow := 2 * (RowInHead - HalfDim) + 1;
+        end;
+        TargetIdx := HeadIdx * RotaryHeadDim + TargetRow;
       end
       else
         TargetIdx := j;
       TargetIdx := TargetIdx + NeuronBase;
+      SrcRow := SrcRowBase + j;
       if Layer.Neurons[TargetIdx].Weights.Size <> InDim then
         ImportError('Llama import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
@@ -3077,9 +3214,9 @@ begin
           ' weights, expected ' + IntToStr(InDim) + '.');
       for i := 0 to InDim - 1 do
         Layer.Neurons[TargetIdx].Weights.FData[i] :=
-          Scale * W.FData[j * InDim + i];
+          Scale * W.FData[SrcRow * InDim + i];
       if B <> nil then
-        Layer.Neurons[TargetIdx].BiasWeight := Scale * B.FData[j]
+        Layer.Neurons[TargetIdx].BiasWeight := Scale * B.FData[SrcRow]
       else
         Layer.Neurons[TargetIdx].BiasWeight := 0; // bias-free Linear
     end;
@@ -3159,16 +3296,16 @@ var
   Blocks: array of TLlamaBlockLayers;
   EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
   BranchInput, NormedSource: TNNetLayer;
-  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack, RotSlice, PassSlice: TNNetLayer;
   KRotated, VSlices, HeadOutputs: array of TNNetLayer;
-  SliceChannels: array of integer;
+  SliceChannels, RotChannels, PassChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
-  HeadDim, QWidth, KVWidth, LayerWindow, i, j, d: integer;
+  HeadDim, QWidth, KVWidth, RotaryDims, LayerWindow, i, j, d: integer;
   LayerIsLocal: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
   LayerRoPEScaling: TRoPEScalingConfig;
   Tmp: TNNetVolume;
-  BlockPrefix, TensorNameStr, LMHeadName: string;
+  BlockPrefix, TensorNameStr, LMHeadName, FusedName: string;
   QBiasName, KBiasName, VBiasName: string;
   Consumed: TStringList;
 
@@ -3213,6 +3350,23 @@ begin
       if Odd(HeadDim) then
         ImportError('Llama import: head_dim=' + IntToStr(HeadDim) +
           ' must be even (RoPE rotates channel pairs).');
+      // Partial rotary (Phi-3): RoPE rotates only the first
+      // int(head_dim * partial_rotary_factor) channels of each q/k head
+      // (HF: rotary_dim = int(head_dim * partial_rotary_factor)); the
+      // tail passes through unrotated.
+      if (Config.PartialRotaryFactor > 0) and
+         (Config.PartialRotaryFactor < 1) then
+        RotaryDims := Trunc(HeadDim * Config.PartialRotaryFactor)
+      else
+        RotaryDims := HeadDim;
+      if (RotaryDims < 2) or Odd(RotaryDims) then
+        ImportError('Llama import: rotary_dim = int(head_dim * ' +
+          'partial_rotary_factor) = ' + IntToStr(RotaryDims) +
+          ' must be an even number >= 2 (RoPE rotates channel pairs).');
+      if Config.QKNorm and (RotaryDims < HeadDim) then
+        ImportError('Llama import: internal error - partial rotary ' +
+          'combined with per-head q/k RMSNorm is not wired (no family ' +
+          'uses both).');
       QWidth := Config.NumHeads * HeadDim;
       KVWidth := Config.NumKVHeads * HeadDim;
       GroupSize := Config.NumHeads div Config.NumKVHeads;
@@ -3258,6 +3412,8 @@ begin
       SetLength(VSlices, Config.NumKVHeads);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(SliceChannels, HeadDim);
+      SetLength(RotChannels, RotaryDims);
+      SetLength(PassChannels, HeadDim - RotaryDims);
       for BlockCnt := 0 to Config.NumLayers - 1 do
       begin
         // Attention sub-block: x := x + o_proj(rotary-GQA(RMSNorm(x))).
@@ -3326,16 +3482,42 @@ begin
         begin
           for d := 0 to HeadDim - 1 do
             SliceChannels[d] := KVHeadCnt * HeadDim + d;
-          KSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
-          if Config.QKNorm then
+          if RotaryDims < HeadDim then
           begin
-            Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
-              TNNetTokenRMSNorm.Create(Config.RmsNormEps), KSlice);
-            KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
+            // PARTIAL rotary (Phi-3, Config.PartialRotaryFactor < 1):
+            // RoPE on the first RotaryDims channels of the head only -
+            // both slices are cut straight off the K projection and
+            // re-concatenated [rotated | pass-through]. The rotary slice
+            // feeds a depth-RotaryDims TNNetRotaryEmbedding, so the
+            // frequency schedule theta^(-2k/RotaryDims) matches HF's
+            // inv_freq over rotary_dim exactly. (QKNorm + partial rotary
+            // is rejected up front - no family combines them.)
+            for d := 0 to RotaryDims - 1 do
+              RotChannels[d] := KVHeadCnt * HeadDim + d;
+            for d := 0 to HeadDim - RotaryDims - 1 do
+              PassChannels[d] := KVHeadCnt * HeadDim + RotaryDims + d;
+            RotSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(RotChannels), Blocks[BlockCnt].KProj);
+            RotSlice := NN.AddLayerAfter(
+              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), RotSlice);
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels), Blocks[BlockCnt].KProj);
+            KRotated[KVHeadCnt] := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+          begin
+            KSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
+            if Config.QKNorm then
+            begin
+              Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps), KSlice);
+              KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
+            end;
+            KRotated[KVHeadCnt] := NN.AddLayerAfter(
+              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), KSlice);
           end;
-          KRotated[KVHeadCnt] := NN.AddLayerAfter(
-            CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), KSlice);
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
         end;
@@ -3344,16 +3526,35 @@ begin
           KVGroup := HeadCnt div GroupSize;
           for d := 0 to HeadDim - 1 do
             SliceChannels[d] := HeadCnt * HeadDim + d;
-          QSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
-          if Config.QKNorm then
+          if RotaryDims < HeadDim then
           begin
-            Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
-              TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
-            QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
+            // Partial rotary on the Q head - same wiring as the K path.
+            for d := 0 to RotaryDims - 1 do
+              RotChannels[d] := HeadCnt * HeadDim + d;
+            for d := 0 to HeadDim - RotaryDims - 1 do
+              PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
+            RotSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(RotChannels), Blocks[BlockCnt].QProj);
+            RotSlice := NN.AddLayerAfter(
+              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), RotSlice);
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels), Blocks[BlockCnt].QProj);
+            QSlice := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+          begin
+            QSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+            if Config.QKNorm then
+            begin
+              Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
+              QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
+            end;
+            QSlice := NN.AddLayerAfter(
+              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), QSlice);
           end;
-          QSlice := NN.AddLayerAfter(
-            CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), QSlice);
           // Pack [Q_h | K_group | V_group] (width 3*head_dim) for SDPA.
           HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
             [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
@@ -3506,38 +3707,61 @@ begin
           KBiasName := '';
           VBiasName := '';
         end;
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
-          BlockPrefix + 'self_attn.q_proj.weight',
-          Config.HiddenSize, QWidth, 0, -1, HeadDim, QBiasName, QProjScale);
-        MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
-        if QBiasName <> '' then MarkConsumed(QBiasName);
-        // Qwen3/Gemma-3 per-head q/k RMSNorm: one shared [head_dim] gain
-        // per block, copied into every per-head norm (rotate_half-permuted
-        // to match the permuted q/k channel order). Gemma-3's zero-centered
-        // gains get the +1 offset (NormGainOffset), and the
-        // query_pre_attn_scalar fold rides the q-side gains (QScale; see
-        // above - a W_q fold would be erased by the norm).
-        if Config.QKNorm then
+        if Config.FusedQKVGateUp then
         begin
-          LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].QNorms,
-            BlockPrefix + 'self_attn.q_norm.weight', HeadDim,
-            NormGainOffset, QScale);
-          MarkConsumed(BlockPrefix + 'self_attn.q_norm.weight');
-          LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].KNorms,
-            BlockPrefix + 'self_attn.k_norm.weight', HeadDim,
-            NormGainOffset);
-          MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
+          // Phi-3 fused qkv_proj: q|k|v packed rows
+          // (q = num_heads*head_dim, then k and v = kv_heads*head_dim
+          // each), no biases. Each block of rows is sliced into its
+          // separate projection layer; the rotate_half->interleaved
+          // permutation applies AFTER the slicing, restricted to the
+          // RotaryDims-wide rotary slice of each head (partial rotary).
+          FusedName := BlockPrefix + 'self_attn.qkv_proj.weight';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj, FusedName,
+            Config.HiddenSize, QWidth, 0, -1, HeadDim, '', QProjScale,
+            RotaryDims, 0, QWidth + 2 * KVWidth);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj, FusedName,
+            Config.HiddenSize, KVWidth, 0, -1, HeadDim, '', 1.0,
+            RotaryDims, QWidth, QWidth + 2 * KVWidth);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj, FusedName,
+            Config.HiddenSize, KVWidth, 0, -1, 0, '', 1.0,
+            0, QWidth + KVWidth, QWidth + 2 * KVWidth);
+          MarkConsumed(FusedName);
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+            BlockPrefix + 'self_attn.q_proj.weight',
+            Config.HiddenSize, QWidth, 0, -1, HeadDim, QBiasName, QProjScale);
+          MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
+          if QBiasName <> '' then MarkConsumed(QBiasName);
+          // Qwen3/Gemma-3 per-head q/k RMSNorm: one shared [head_dim] gain
+          // per block, copied into every per-head norm (rotate_half-permuted
+          // to match the permuted q/k channel order). Gemma-3's zero-centered
+          // gains get the +1 offset (NormGainOffset), and the
+          // query_pre_attn_scalar fold rides the q-side gains (QScale; see
+          // above - a W_q fold would be erased by the norm).
+          if Config.QKNorm then
+          begin
+            LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].QNorms,
+              BlockPrefix + 'self_attn.q_norm.weight', HeadDim,
+              NormGainOffset, QScale);
+            MarkConsumed(BlockPrefix + 'self_attn.q_norm.weight');
+            LoadLlamaHeadRMSNormWeights(Reader, Blocks[BlockCnt].KNorms,
+              BlockPrefix + 'self_attn.k_norm.weight', HeadDim,
+              NormGainOffset);
+            MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
+          end;
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+            BlockPrefix + 'self_attn.k_proj.weight',
+            Config.HiddenSize, KVWidth, 0, -1, HeadDim, KBiasName);
+          MarkConsumed(BlockPrefix + 'self_attn.k_proj.weight');
+          if KBiasName <> '' then MarkConsumed(KBiasName);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+            BlockPrefix + 'self_attn.v_proj.weight',
+            Config.HiddenSize, KVWidth, 0, -1, 0, VBiasName);
+          MarkConsumed(BlockPrefix + 'self_attn.v_proj.weight');
+          if VBiasName <> '' then MarkConsumed(VBiasName);
         end;
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
-          BlockPrefix + 'self_attn.k_proj.weight',
-          Config.HiddenSize, KVWidth, 0, -1, HeadDim, KBiasName);
-        MarkConsumed(BlockPrefix + 'self_attn.k_proj.weight');
-        if KBiasName <> '' then MarkConsumed(KBiasName);
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
-          BlockPrefix + 'self_attn.v_proj.weight',
-          Config.HiddenSize, KVWidth, 0, -1, 0, VBiasName);
-        MarkConsumed(BlockPrefix + 'self_attn.v_proj.weight');
-        if VBiasName <> '' then MarkConsumed(VBiasName);
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
           BlockPrefix + 'self_attn.o_proj.weight',
           QWidth, Config.HiddenSize);
@@ -3571,16 +3795,37 @@ begin
         end;
         // Fused gate/up: up_proj -> neurons 0..I-1 (SwiGLU's linear half),
         // gate_proj -> neurons I..2I-1 (SwiGLU's Swish-gated half).
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
-          BlockPrefix + 'mlp.up_proj.weight',
-          Config.HiddenSize, Config.IntermediateSize,
-          0, 2 * Config.IntermediateSize);
-        MarkConsumed(BlockPrefix + 'mlp.up_proj.weight');
-        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
-          BlockPrefix + 'mlp.gate_proj.weight',
-          Config.HiddenSize, Config.IntermediateSize,
-          Config.IntermediateSize, 2 * Config.IntermediateSize);
-        MarkConsumed(BlockPrefix + 'mlp.gate_proj.weight');
+        if Config.FusedQKVGateUp then
+        begin
+          // Phi-3 fused mlp.gate_up_proj packs gate (rows 0..I-1) THEN up
+          // (rows I..2I-1) - HF chunks the output in that order - so the
+          // UP half lands in neurons 0..I-1 and the GATE half in
+          // neurons I..2I-1 (TNNetSwiGLU computes FIRSTHALF *
+          // silu(SECONDHALF)).
+          FusedName := BlockPrefix + 'mlp.gate_up_proj.weight';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp, FusedName,
+            Config.HiddenSize, Config.IntermediateSize,
+            0, 2 * Config.IntermediateSize, 0, '', 1.0, 0,
+            Config.IntermediateSize, 2 * Config.IntermediateSize);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp, FusedName,
+            Config.HiddenSize, Config.IntermediateSize,
+            Config.IntermediateSize, 2 * Config.IntermediateSize,
+            0, '', 1.0, 0, 0, 2 * Config.IntermediateSize);
+          MarkConsumed(FusedName);
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+            BlockPrefix + 'mlp.up_proj.weight',
+            Config.HiddenSize, Config.IntermediateSize,
+            0, 2 * Config.IntermediateSize);
+          MarkConsumed(BlockPrefix + 'mlp.up_proj.weight');
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+            BlockPrefix + 'mlp.gate_proj.weight',
+            Config.HiddenSize, Config.IntermediateSize,
+            Config.IntermediateSize, 2 * Config.IntermediateSize);
+          MarkConsumed(BlockPrefix + 'mlp.gate_proj.weight');
+        end;
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
           BlockPrefix + 'mlp.down_proj.weight',
           Config.IntermediateSize, Config.HiddenSize);
@@ -6532,6 +6777,24 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGemma3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly);
+end;
+
+function BuildPhi3FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'phi3', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName);
+end;
+
+function BuildPhi3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildPhi3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly);
 end;
 
@@ -11294,7 +11557,7 @@ begin
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
           (ModelType = 'gemma') or (ModelType = 'gemma2') or
-          (ModelType = 'gemma3_text') then
+          (ModelType = 'gemma3_text') or (ModelType = 'phi3') then
     // 'gemma' (architectures ["GemmaForCausalLM"]) rides the same path: the
     // config reader raises the Gemma flags (GeGLU FFN, zero-centered
     // RMSNorm, sqrt(d) embedding scale) from model_type alone. 'gemma2'
@@ -11303,7 +11566,10 @@ begin
     // final-logit soft-capping, sandwich norms) the same way.
     // 'gemma3_text' (["Gemma3ForCausalLM"], TEXT-ONLY) swaps the soft-caps
     // for the per-head q/k RMSNorm and adds the 5:1 local:global pattern
-    // with per-layer-type RoPE theta.
+    // with per-layer-type RoPE theta. 'phi3' (["Phi3ForCausalLM"],
+    // Phi-3-mini / Phi-4-mini) raises the fused qkv_proj/gate_up_proj and
+    // partial-rotary flags the same way (the 128k longrope variants are
+    // rejected by the config reader).
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
@@ -11390,9 +11656,9 @@ begin
     Result := nil;
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
-      'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, llama, mistral, ' +
-      'qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, mamba, bloom, ' +
-      'bert, distilbert, roberta, modernbert, deepseek_v2.');
+      'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, phi3, llama, ' +
+      'mistral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, mamba, ' +
+      'bloom, bert, distilbert, roberta, modernbert, deepseek_v2.');
   end;
 end;
 
