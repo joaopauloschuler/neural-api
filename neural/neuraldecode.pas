@@ -114,6 +114,22 @@ type
 
   TNNetDecodeResultArray = array of TNNetDecodeResult;
 
+  // A scored TOKEN-ID decode candidate - the seq2seq (encoder-decoder) beam
+  // counterpart of the char-level TNNetDecodeResult above. Tokens holds the
+  // GENERATED target ids only (StartTokenId excluded; the EOS token IS
+  // included when the beam finished by emitting it, mirroring
+  // DecodeSeq2SeqGreedy's "EOS is appended" convention - so a finished
+  // beam's Tokens compares token-for-token with a greedy result).
+  // Coded by Claude (AI).
+  TNNetTokenDecodeResult = record
+    Tokens: TNeuralIntegerArray; // generated ids (StartTokenId NOT included)
+    SumLogProb: TNeuralFloat;    // sum of per-step log-probabilities
+    Score: TNeuralFloat;         // length-penalised score actually ranked on
+    Finished: boolean;           // True if the beam emitted EOSTokenId
+  end;
+
+  TNNetTokenDecodeResultArray = array of TNNetTokenDecodeResult;
+
   // A list of token-id stop sequences for GenerateTokensStreamed: generation
   // terminates (and the matched tokens are trimmed) as soon as the tail of
   // the GENERATED region equals one of the entries.
@@ -588,9 +604,11 @@ function GenerateStringStreamed(Session: TNNetStreamingDecoder;
 // VALIDATION. Length(SourceTokens) must equal the encoder's build-time
 // EncSeqLen, the encoder output must match the decoder's second-input size,
 // and the decoder must actually have a second TNNetInput - violations raise
-// EArgumentException. Beam search is NOT provided here: the existing
-// DecodeBeamSearch is char-level/string-based and does not compose with the
-// two-net token-id convention (a seq2seq beam is a separate follow-up).
+// EArgumentException. BEAM SEARCH: the existing DecodeBeamSearch is
+// char-level/string-based and does not compose with the two-net token-id
+// convention, so DecodeSeq2SeqBeamSearch / DecodeSeq2SeqBeamSearchAll below
+// run their own TOKEN-ID candidate loop over the same encode-once /
+// per-step-full-decoder-re-forward harness.
 // Coded by Claude (AI).
 
 // Returns the decoder net's SECOND TNNetInput - the encoder-hidden-states
@@ -615,6 +633,57 @@ function DecodeSeq2SeqSampled(EncoderNet, DecoderNet: TNNet;
   StartTokenId, EOSTokenId, MaxNewTokens: integer;
   Sampler: TNNetSamplerBase;
   Temperature: TNeuralFloat = 1.0): TNeuralIntegerArray;
+
+// TOKEN-ID seq2seq BEAM SEARCH over the two-net convention above - the
+// encoder-decoder counterpart of the char-level DecodeBeamSearch. Keeps
+// BeamWidth partial target sequences ranked by length-penalised cumulative
+// log-probability (Wu et al. 2016, see LengthPenaltyDenominator; the length
+// is Length(Tokens), so an emitted EOS counts). Scoring is in LOG space:
+// each step's logits row is converted to log-probs with a numerically-stable
+// softmax + SafeLogProb, exactly the per-step distribution the greedy /
+// sampled routines act on.
+//
+// The source is encoded ONCE (cached in the decoder's second TNNetInput,
+// constant across all beams and steps); every step then re-runs the FULL
+// decoder forward once PER LIVE BEAM on that beam's StartTokenId-padded
+// prefix and expands it by every vocabulary token - O(BeamWidth * L) decoder
+// forwards for L generated tokens.
+//
+// FINISHED POOL (same idiom as DecodeBeamSearchAll): a candidate that emits
+// EOSTokenId moves to a finished pool (its EOS is INCLUDED in Tokens and its
+// log-prob in SumLogProb) and is ranked there against still-growing beams;
+// growth stops once BeamWidth finished beams all outscore every live beam,
+// when MaxNewTokens tokens were generated, or when the decoder's build-time
+// capacity DecSeqLen is exhausted (same caps as DecodeSeq2SeqGreedy). Any
+// live beams remaining at the cap join the pool unfinished.
+//
+// BeamWidth = 1 with LengthPenalty = 0 follows exactly the greedy argmax
+// path (log-softmax is monotone in the logits, ties resolve to the lowest
+// token id like GetClassOnPixel), so it reproduces DecodeSeq2SeqGreedy
+// whenever the greedy path's EOS-terminated beam outranks the shorter
+// EOS-truncations collected along the way (raw sum-log-prob ranking is
+// short-biased by construction - LengthPenalty exists to counter it).
+//
+// Validation matches DecodeSeq2SeqSampled (source length, encoder/decoder
+// state-size match, second TNNetInput; violations raise EArgumentException).
+// MaxNewTokens < 1 returns empty; BeamWidth < 1 is clamped to 1. Pure beam
+// search - fully deterministic, no RNG anywhere.
+// Coded by Claude (AI).
+
+// Returns the single best (highest Score) beam's generated token ids -
+// shaped like DecodeSeq2SeqGreedy's result (EOS included when emitted).
+function DecodeSeq2SeqBeamSearch(EncoderNet, DecoderNet: TNNet;
+  const SourceTokens: array of integer;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer;
+  BeamWidth: integer; LengthPenalty: TNeuralFloat): TNeuralIntegerArray;
+
+// Full seq2seq beam search returning the entire final ranked pool (finished
+// + surviving live beams), sorted best-first by Score - the token-id
+// counterpart of DecodeBeamSearchAll, so callers can inspect runners-up.
+function DecodeSeq2SeqBeamSearchAll(EncoderNet, DecoderNet: TNNet;
+  const SourceTokens: array of integer;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer;
+  BeamWidth: integer; LengthPenalty: TNeuralFloat): TNNetTokenDecodeResultArray;
 
 implementation
 
@@ -1849,6 +1918,189 @@ begin
     DecToks.Free;
     EncToks.Free;
   end;
+end;
+
+// Insertion sort token beams in DESCENDING Score. Strictly-less comparison
+// keeps earlier-inserted beams ahead on ties (candidates are appended in
+// token-id order, so ties resolve to the lowest token id - matching the
+// first-max rule of the greedy argmax). Small arrays, B is tiny.
+procedure SortTokenBeamsByScore(var Beams: TNNetTokenDecodeResultArray);
+var
+  I, J: integer;
+  Tmp: TNNetTokenDecodeResult;
+begin
+  for I := 1 to High(Beams) do
+  begin
+    Tmp := Beams[I];
+    J := I - 1;
+    while (J >= 0) and (Beams[J].Score < Tmp.Score) do
+    begin
+      Beams[J + 1] := Beams[J];
+      Dec(J);
+    end;
+    Beams[J + 1] := Tmp;
+  end;
+end;
+
+function DecodeSeq2SeqBeamSearchAll(EncoderNet, DecoderNet: TNNet;
+  const SourceTokens: array of integer;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer;
+  BeamWidth: integer; LengthPenalty: TNeuralFloat): TNNetTokenDecodeResultArray;
+var
+  EncStates: TNNetLayer;
+  EncToks, DecToks: TNNetVolume;
+  Logits: TNNetVolume;          // the decoder's own output volume (not owned)
+  LogProbs: array of TNeuralFloat;
+  Live: TNNetTokenDecodeResultArray;     // still-growing beams
+  Finished: TNNetTokenDecodeResultArray; // beams that emitted EOSTokenId
+  Cand: TNNetTokenDecodeResultArray;     // expansion candidates per step
+  NewBeam: TNNetTokenDecodeResult;
+  EncSeqLen, DecSeqLen, VocabSize, EffMaxNew: integer;
+  Step, B, T, Pos, PrevLen, Base: integer;
+  MaxLogit, SumExp, CutScore: TNeuralFloat;
+  AllDominated: boolean;
+begin
+  SetLength(Result, 0);
+  if MaxNewTokens < 1 then exit;
+  if BeamWidth < 1 then BeamWidth := 1;
+  EncSeqLen := EncoderNet.GetFirstLayer().Output.Size;
+  if Length(SourceTokens) <> EncSeqLen then
+    raise EArgumentException.Create('DecodeSeq2SeqBeamSearchAll: ' +
+      IntToStr(Length(SourceTokens)) + ' source tokens but the encoder was ' +
+      'built at EncSeqLen ' + IntToStr(EncSeqLen) + '.');
+  EncStates := Seq2SeqEncoderStatesInput(DecoderNet);
+  if EncoderNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+    raise EArgumentException.Create('DecodeSeq2SeqBeamSearchAll: encoder ' +
+      'output size ' + IntToStr(EncoderNet.GetLastLayer().Output.Size) +
+      ' does not match the decoder''s encoder-states input size ' +
+      IntToStr(EncStates.Output.Size) + ' (EncSeqLen/d_model mismatch?).');
+  DecSeqLen := DecoderNet.GetFirstLayer().Output.Size;
+  Logits := DecoderNet.GetLastLayer().Output;
+  VocabSize := Logits.Depth;
+  // Build-time decoder capacity: a beam with G generated tokens re-forwards
+  // a (1 + G)-token prefix, so generation caps at DecSeqLen tokens - the
+  // same stopping rule as DecodeSeq2SeqGreedy's "CurLen >= DecSeqLen" break.
+  EffMaxNew := MaxNewTokens;
+  if EffMaxNew > DecSeqLen then EffMaxNew := DecSeqLen;
+  SetLength(LogProbs, VocabSize);
+  EncToks := TNNetVolume.Create(EncSeqLen, 1, 1);
+  DecToks := TNNetVolume.Create(DecSeqLen, 1, 1);
+  try
+    // (1) Encode the source ONCE and cache the hidden states in the
+    // decoder's second input - constant across all beams and steps.
+    for Pos := 0 to EncSeqLen - 1 do EncToks.FData[Pos] := SourceTokens[Pos];
+    EncoderNet.Compute(EncToks);
+    EncStates.Output.Copy(EncoderNet.GetLastLayer().Output);
+
+    // (2) Candidate loop. Every live beam at step S carries S-1 generated
+    // tokens, so the whole live front shares one prefix length per step.
+    SetLength(Live, 1);
+    SetLength(Live[0].Tokens, 0);
+    Live[0].SumLogProb := 0;
+    Live[0].Score := 0;
+    Live[0].Finished := False;
+    SetLength(Finished, 0);
+
+    for Step := 1 to EffMaxNew do
+    begin
+      if Length(Live) = 0 then Break;
+
+      // Early stop (same idiom as DecodeBeamSearchAll): once BeamWidth
+      // finished beams exist and no live beam outscores the BeamWidth-th
+      // finished one, stop growing. A growing beam's sum-log-prob only
+      // decreases, so its current score is used as the prune bound.
+      if Length(Finished) >= BeamWidth then
+      begin
+        SortTokenBeamsByScore(Finished);
+        CutScore := Finished[BeamWidth - 1].Score;
+        AllDominated := True;
+        for B := 0 to High(Live) do
+          if Live[B].Score > CutScore then AllDominated := False;
+        if AllDominated then Break;
+      end;
+
+      // Expand every live beam by every vocabulary token.
+      SetLength(Cand, 0);
+      for B := 0 to High(Live) do
+      begin
+        PrevLen := Length(Live[B].Tokens); // = Step - 1
+        // StartTokenId + generated prefix, padded with StartTokenId: causal
+        // self-attention makes the padding invisible to row PrevLen (same
+        // re-forward convention as DecodeSeq2SeqSampled).
+        DecToks.FData[0] := StartTokenId;
+        for Pos := 1 to DecSeqLen - 1 do
+          if Pos <= PrevLen
+          then DecToks.FData[Pos] := Live[B].Tokens[Pos - 1]
+          else DecToks.FData[Pos] := StartTokenId;
+        DecoderNet.Compute(DecToks);
+        // Stable softmax of the logits row at the last prefix position,
+        // then SafeLogProb - the log image of the greedy/sampled row.
+        Base := PrevLen * VocabSize;
+        MaxLogit := Logits.FData[Base];
+        for T := 1 to VocabSize - 1 do
+          if Logits.FData[Base + T] > MaxLogit then
+            MaxLogit := Logits.FData[Base + T];
+        SumExp := 0;
+        for T := 0 to VocabSize - 1 do
+          SumExp := SumExp + Exp(Logits.FData[Base + T] - MaxLogit);
+        if SumExp <= 0 then SumExp := 1.0;
+        for T := 0 to VocabSize - 1 do
+          LogProbs[T] :=
+            SafeLogProb(Exp(Logits.FData[Base + T] - MaxLogit) / SumExp);
+        for T := 0 to VocabSize - 1 do
+        begin
+          NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+          NewBeam.Tokens := Copy(Live[B].Tokens, 0, PrevLen);
+          SetLength(NewBeam.Tokens, PrevLen + 1);
+          NewBeam.Tokens[PrevLen] := T; // EOS included, like greedy
+          NewBeam.Finished := (T = EOSTokenId);
+          NewBeam.Score := NewBeam.SumLogProb /
+            LengthPenaltyDenominator(PrevLen + 1, LengthPenalty);
+          if NewBeam.Finished then
+          begin
+            SetLength(Finished, Length(Finished) + 1);
+            Finished[High(Finished)] := NewBeam;
+          end
+          else
+          begin
+            SetLength(Cand, Length(Cand) + 1);
+            Cand[High(Cand)] := NewBeam;
+          end;
+        end;
+      end;
+
+      // Re-prune the survivors to the top BeamWidth by penalised score.
+      SortTokenBeamsByScore(Cand);
+      if Length(Cand) > BeamWidth then SetLength(Cand, BeamWidth);
+      Live := Copy(Cand, 0, Length(Cand));
+    end;
+
+    // Merge remaining live beams into the pool (MaxNewTokens/capacity hit).
+    for B := 0 to High(Live) do
+    begin
+      SetLength(Finished, Length(Finished) + 1);
+      Finished[High(Finished)] := Live[B];
+    end;
+    SortTokenBeamsByScore(Finished);
+    Result := Finished;
+  finally
+    DecToks.Free;
+    EncToks.Free;
+  end;
+end;
+
+function DecodeSeq2SeqBeamSearch(EncoderNet, DecoderNet: TNNet;
+  const SourceTokens: array of integer;
+  StartTokenId, EOSTokenId, MaxNewTokens: integer;
+  BeamWidth: integer; LengthPenalty: TNeuralFloat): TNeuralIntegerArray;
+var
+  All: TNNetTokenDecodeResultArray;
+begin
+  All := DecodeSeq2SeqBeamSearchAll(EncoderNet, DecoderNet, SourceTokens,
+    StartTokenId, EOSTokenId, MaxNewTokens, BeamWidth, LengthPenalty);
+  if Length(All) > 0
+  then Result := Copy(All[0].Tokens, 0, Length(All[0].Tokens))
+  else SetLength(Result, 0);
 end;
 
 end.

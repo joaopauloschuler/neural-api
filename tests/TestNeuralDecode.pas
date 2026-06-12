@@ -42,6 +42,19 @@ type
     // Locates the committed encoder-decoder fixtures (same probing as
     // TestNeuralPretrained.FixturePath: RunAll.sh runs from tests/).
     function FixturePath(const FileName: string): string;
+    // Hand-rigged MARKOV-CHAIN two-net pair for the seq2seq beam tests: the
+    // decoder is Input(DecSeqLen,1,1) tokens -> TNNetEmbedding(Vocab,Vocab)
+    // whose output row r IS the next-token logits given the token at
+    // position r (logits depend only on the previous token - trivially
+    // causal), plus the second TNNetInput the two-net convention requires
+    // (filled but unused). Each embedding row is set to ln(P(next|prev)),
+    // so the routines' softmax recovers the exact transition probabilities
+    // and every beam's cumulative log-prob is known in closed form.
+    procedure BuildMarkovSeq2SeqPair(out Enc, Dec: TNNet;
+      out Emb: TNNetEmbedding; Vocab, EncSeqLen, DecSeqLen: integer);
+    // Sets Emb's row of PrevToken to ln of the given next-token probs.
+    procedure SetMarkovRow(Emb: TNNetEmbedding; PrevToken: integer;
+      const Probs: array of TNeuralFloat);
   published
     // Pure helper functions (no network needed).
     procedure TestLengthPenaltyAlphaZeroIsOne;
@@ -110,6 +123,12 @@ type
     procedure TestDecodeSeq2SeqSampledTempZeroMatchesGreedy;
     procedure TestDecodeSeq2SeqGreedyMarianPairAndCapacity;
     procedure TestDecodeSeq2SeqRejectsInvalidArguments;
+    // Seq2seq token-id beam search (DecodeSeq2SeqBeamSearch[All]) on the
+    // hand-rigged Markov pair (exact closed-form log-probs) + T5 fixture.
+    procedure TestSeq2SeqBeamWidth1MatchesGreedy;
+    procedure TestSeq2SeqBeamBeatsGreedyFirstTokenTrap;
+    procedure TestSeq2SeqBeamFinishedPoolLengthPenaltyFlipsRanking;
+    procedure TestSeq2SeqBeamDeterministicCapsAndValidation;
   end;
 
 implementation
@@ -2728,6 +2747,266 @@ begin
     end;
     G := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 0);
     AssertEquals('MaxNewTokens=0 returns empty', 0, Length(G));
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.BuildMarkovSeq2SeqPair(out Enc, Dec: TNNet;
+  out Emb: TNNetEmbedding; Vocab, EncSeqLen, DecSeqLen: integer);
+var
+  TokIn: TNNetLayer;
+begin
+  // Identity "encoder": (EncSeqLen,1,1) in = out, so the decoder's second
+  // input is sized EncSeqLen to match.
+  Enc := TNNet.Create();
+  Enc.AddLayer(TNNetInput.Create(EncSeqLen, 1, 1));
+  Enc.AddLayer(TNNetIdentity.Create());
+  // Markov decoder: token ids -> embedding row = next-token logits given the
+  // PREVIOUS token only (row r reads the token at position r, so causality
+  // holds trivially and the padded suffix never influences earlier rows).
+  Dec := TNNet.Create();
+  TokIn := Dec.AddLayer(TNNetInput.Create(DecSeqLen, 1, 1));
+  // The second TNNetInput the two-net convention requires (filled by the
+  // decode routines with the cached encoder states; unused by the chain).
+  Dec.AddLayerAfter(TNNetInput.Create(EncSeqLen, 1, 1, 1), 0);
+  Emb := TNNetEmbedding(Dec.AddLayerAfter(
+    TNNetEmbedding.Create(Vocab, Vocab, {EncodeZero=}1, 1.0), TokIn));
+end;
+
+procedure TTestNeuralDecode.SetMarkovRow(Emb: TNNetEmbedding;
+  PrevToken: integer; const Probs: array of TNeuralFloat);
+var
+  T: integer;
+begin
+  // Logits = ln(P): the decode routines' stable softmax recovers exactly
+  // these transition probabilities (up to the row's normalisation).
+  for T := 0 to High(Probs) do
+    Emb.Neurons[0].Weights[PrevToken, 0, T] := Ln(Probs[T]);
+end;
+
+// "Trap" transition table shared by the two beam-vs-greedy tests (vocab 6,
+// start=0, EOS=1). After start, token 2 (p=.50) narrowly beats token 3
+// (p=.45) - but 2 leads to a mediocre continuation (best: EOS at p=.40)
+// while 3 is followed by EOS at p=.99. Greedy locks in [2,1] with
+// ln(.50)+ln(.40) = -1.609; the global best is [3,1] with
+// ln(.45)+ln(.99) = -0.809.
+procedure FillTrapTable(Test: TTestNeuralDecode; Emb: TNNetEmbedding);
+begin
+  Test.SetMarkovRow(Emb, 0, [1e-6, 0.02, 0.50, 0.45, 0.02, 0.01]);
+  Test.SetMarkovRow(Emb, 1, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+  Test.SetMarkovRow(Emb, 2, [0.05, 0.40, 0.15, 0.15, 0.15, 0.10]);
+  Test.SetMarkovRow(Emb, 3, [0.002, 0.99, 0.002, 0.002, 0.002, 0.002]);
+  Test.SetMarkovRow(Emb, 4, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+  Test.SetMarkovRow(Emb, 5, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+end;
+
+// BeamWidth=1 with LengthPenalty=0 reproduces DecodeSeq2SeqGreedy exactly,
+// token for token (EOS included): the single beam follows the argmax path
+// and its EOS-terminated beam outranks the step-1 EOS truncation
+// (ln(.02) = -3.9 < -1.609) in the finished pool.
+procedure TTestNeuralDecode.TestSeq2SeqBeamWidth1MatchesGreedy;
+const
+  Src: array[0..1] of integer = (1, 2);
+var
+  Enc, Dec: TNNet;
+  Emb: TNNetEmbedding;
+  G, Bm: TNeuralIntegerArray;
+  I: integer;
+begin
+  BuildMarkovSeq2SeqPair(Enc, Dec, Emb, {Vocab=}6, {EncSeqLen=}2,
+    {DecSeqLen=}6);
+  try
+    FillTrapTable(Self, Emb);
+    G := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 6);
+    // Self-check the scenario: greedy falls into the trap, [2, EOS].
+    AssertEquals('greedy emits two tokens', 2, Length(G));
+    AssertEquals('greedy first token is the trap token 2', 2, G[0]);
+    AssertEquals('greedy second token is EOS', 1, G[1]);
+    Bm := DecodeSeq2SeqBeamSearch(Enc, Dec, Src, 0, 1, 6,
+      {BeamWidth=}1, {LengthPenalty=}0.0);
+    AssertEquals('B=1/alpha=0 beam length equals greedy',
+      Length(G), Length(Bm));
+    for I := 0 to High(G) do
+      AssertEquals('B=1/alpha=0 beam token ' + IntToStr(I), G[I], Bm[I]);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// BeamWidth=2 recovers from the locally-greedy first-token mistake: the
+// beam keeps runner-up token 3 alive, finds [3, EOS] with cumulative
+// log-prob ln(.45)+ln(.99) = -0.809 > greedy's ln(.50)+ln(.40) = -1.609,
+// and ranks it first in the returned pool.
+procedure TTestNeuralDecode.TestSeq2SeqBeamBeatsGreedyFirstTokenTrap;
+const
+  Src: array[0..1] of integer = (1, 2);
+var
+  Enc, Dec: TNNet;
+  Emb: TNNetEmbedding;
+  G: TNeuralIntegerArray;
+  All: TNNetTokenDecodeResultArray;
+  GreedySum: TNeuralFloat;
+  I: integer;
+begin
+  BuildMarkovSeq2SeqPair(Enc, Dec, Emb, 6, 2, 6);
+  try
+    FillTrapTable(Self, Emb);
+    G := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 6);
+    AssertEquals('greedy locks in the trap path [2,1]', 2, G[0]);
+    All := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, 0, 1, 6,
+      {BeamWidth=}2, {LengthPenalty=}0.0);
+    AssertTrue('beam returns a ranked pool', Length(All) >= 2);
+    for I := 1 to High(All) do
+      AssertTrue('pool sorted by descending score',
+        All[I - 1].Score >= All[I].Score - 1e-6);
+    AssertEquals('best beam has two tokens', 2, Length(All[0].Tokens));
+    AssertEquals('best beam recovers token 3', 3, All[0].Tokens[0]);
+    AssertEquals('best beam then EOS', 1, All[0].Tokens[1]);
+    AssertTrue('best beam is finished', All[0].Finished);
+    AssertEquals('best beam sum-log-prob is ln(.45)+ln(.99)',
+      Ln(0.45) + Ln(0.99), All[0].SumLogProb, 1e-3);
+    GreedySum := Ln(0.50) + Ln(0.40);
+    AssertTrue('beam best beats the greedy path''s cumulative log-prob',
+      All[0].SumLogProb > GreedySum + 0.5);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Finished-pool ranking: with alpha=0 the short finished beam [2,EOS]
+// (sum -0.998) outranks the longer [3,4,EOS] (sum -1.203); alpha=2 lifts
+// longer beams (denominator (5+L)/6)^2 grows with L) and flips the
+// ranking - the verifiable direction of the Wu et al. penalty. Both
+// winners come from the finished pool (EOS-terminated), ranked against
+// the still-growing beams that were pruned/dominated along the way.
+procedure TTestNeuralDecode.TestSeq2SeqBeamFinishedPoolLengthPenaltyFlipsRanking;
+const
+  Src: array[0..1] of integer = (3, 0);
+var
+  Enc, Dec: TNNet;
+  Emb: TNNetEmbedding;
+  All0, All2: TNNetTokenDecodeResultArray;
+  I: integer;
+  FoundLong: boolean;
+begin
+  BuildMarkovSeq2SeqPair(Enc, Dec, Emb, 6, 2, 6);
+  try
+    // [2,1]: ln(.55)+ln(.67) = -0.998 ; [3,4,1]: ln(.40)+ln(.95)+ln(.79)
+    // = -1.203. Flip needs (8/7)^alpha > 1.203/0.998: alpha=2 gives 1.306.
+    SetMarkovRow(Emb, 0, [1e-6, 0.01, 0.55, 0.40, 0.02, 0.02]);
+    SetMarkovRow(Emb, 1, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+    SetMarkovRow(Emb, 2, [0.03, 0.67, 0.10, 0.10, 0.05, 0.05]);
+    SetMarkovRow(Emb, 3, [0.002, 0.02, 0.01, 0.013, 0.95, 0.005]);
+    SetMarkovRow(Emb, 4, [0.05, 0.79, 0.04, 0.04, 0.04, 0.04]);
+    SetMarkovRow(Emb, 5, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+
+    All0 := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, 0, 1, 6, 2, 0.0);
+    AssertTrue('alpha=0 pool non-empty', Length(All0) >= 2);
+    AssertEquals('alpha=0: short beam [2,1] wins', 2, Length(All0[0].Tokens));
+    AssertEquals('alpha=0 winner first token', 2, All0[0].Tokens[0]);
+    AssertEquals('alpha=0 winner ends in EOS', 1, All0[0].Tokens[1]);
+    AssertTrue('alpha=0 winner is from the finished pool', All0[0].Finished);
+    // The longer rival IS in the ranked pool (finished), just outranked.
+    FoundLong := false;
+    for I := 0 to High(All0) do
+      if (Length(All0[I].Tokens) = 3) and (All0[I].Tokens[0] = 3) and
+        (All0[I].Tokens[1] = 4) and (All0[I].Tokens[2] = 1) and
+        All0[I].Finished then FoundLong := true;
+    AssertTrue('alpha=0 pool contains the finished [3,4,1] rival', FoundLong);
+
+    All2 := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, 0, 1, 6, 2, 2.0);
+    AssertTrue('alpha=2 pool non-empty', Length(All2) >= 2);
+    AssertEquals('alpha=2: longer beam [3,4,1] wins',
+      3, Length(All2[0].Tokens));
+    AssertEquals('alpha=2 winner token 0', 3, All2[0].Tokens[0]);
+    AssertEquals('alpha=2 winner token 1', 4, All2[0].Tokens[1]);
+    AssertEquals('alpha=2 winner ends in EOS', 1, All2[0].Tokens[2]);
+    AssertTrue('alpha=2 winner is finished', All2[0].Finished);
+    AssertEquals('alpha=2 runner-up is the short beam [2,1]',
+      2, Length(All2[1].Tokens));
+    AssertEquals('alpha=2 runner-up first token', 2, All2[1].Tokens[0]);
+    // Score = SumLogProb / ((5+L)/6)^alpha with L counting the EOS token.
+    AssertEquals('alpha=2 winner score applies the Wu denominator',
+      All2[0].SumLogProb / Sqr(8.0 / 6.0), All2[0].Score, 1e-5);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Pure beam search has NO RNG: two runs on the committed T5 pico pair are
+// identical beam-for-beam (tokens, sums, scores). Caps and validation match
+// the greedy routine: generation never exceeds min(MaxNewTokens, DecSeqLen),
+// EOS only ever ends a finished beam, a wrong source length raises, and
+// MaxNewTokens < 1 returns an empty pool (BeamWidth < 1 clamps to 1).
+procedure TTestNeuralDecode.TestSeq2SeqBeamDeterministicCapsAndValidation;
+const
+  Src: array[0..9] of integer = (3, 7, 1, 11, 4, 9, 2, 8, 5, 12);
+  StartId = 0;
+  EOSId = 1;
+var
+  Enc, Dec: TNNet;
+  Config: TT5Config;
+  A1, A2: TNNetTokenDecodeResultArray;
+  B1, BClamped: TNeuralIntegerArray;
+  I, T: integer;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  try
+    A1 := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, StartId, EOSId, 99,
+      {BeamWidth=}3, {LengthPenalty=}1.0);
+    A2 := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, StartId, EOSId, 99,
+      {BeamWidth=}3, {LengthPenalty=}1.0);
+    AssertTrue('beam pool non-empty', Length(A1) >= 1);
+    AssertEquals('deterministic pool size', Length(A1), Length(A2));
+    for I := 0 to High(A1) do
+    begin
+      AssertEquals('deterministic beam ' + IntToStr(I) + ' length',
+        Length(A1[I].Tokens), Length(A2[I].Tokens));
+      for T := 0 to High(A1[I].Tokens) do
+        AssertEquals('deterministic beam ' + IntToStr(I) + ' token ' +
+          IntToStr(T), A1[I].Tokens[T], A2[I].Tokens[T]);
+      AssertEquals('deterministic beam ' + IntToStr(I) + ' score',
+        A1[I].Score, A2[I].Score, 0.0);
+      // Caps and EOS placement, per beam.
+      AssertTrue('beam capped at DecSeqLen', Length(A1[I].Tokens) <= 6);
+      for T := 0 to High(A1[I].Tokens) do
+        if A1[I].Tokens[T] = EOSId then
+        begin
+          AssertEquals('EOS only at the last position of a beam',
+            High(A1[I].Tokens), T);
+          AssertTrue('EOS-ending beam is marked finished', A1[I].Finished);
+        end;
+      if I > 0 then
+        AssertTrue('pool sorted by descending score',
+          A1[I - 1].Score >= A1[I].Score);
+    end;
+    // BeamWidth < 1 clamps to 1 (same single-best path as BeamWidth = 1).
+    B1 := DecodeSeq2SeqBeamSearch(Enc, Dec, Src, StartId, EOSId, 5, 1, 0.0);
+    BClamped := DecodeSeq2SeqBeamSearch(Enc, Dec, Src, StartId, EOSId, 5,
+      0, 0.0);
+    AssertEquals('BeamWidth=0 clamps to 1 (length)',
+      Length(B1), Length(BClamped));
+    for T := 0 to High(B1) do
+      AssertEquals('BeamWidth=0 clamps to 1 (token ' + IntToStr(T) + ')',
+        B1[T], BClamped[T]);
+    // Validation mirrors the greedy/sampled routines.
+    try
+      DecodeSeq2SeqBeamSearch(Enc, Dec, [3, 7, 1], StartId, EOSId, 5, 2, 0.0);
+      Fail('a 3-token source must be rejected (encoder built at 10)');
+    except
+      on EArgumentException do ; // expected
+    end;
+    AssertEquals('MaxNewTokens=0 returns an empty pool', 0,
+      Length(DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, StartId, EOSId, 0,
+        2, 0.0)));
   finally
     Dec.Free;
     Enc.Free;

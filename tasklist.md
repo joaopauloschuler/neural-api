@@ -289,18 +289,22 @@ rather than acted on.
       in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
       (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real rewards.
-- [ ] Seq2seq BEAM SEARCH on the landed encoder-decoder harness: greedy +
-      temperature/top-k/top-p sampling landed in neural/neuraldecode.pas
-      (DecodeSeq2SeqGreedy / DecodeSeq2SeqSampled over the
-      BuildT5FromSafeTensors / BuildMarianFromSafeTensors two-net pairs -
-      encode-once cached encoder states, per-step full decoder re-forward,
-      EOS/MaxLen/capacity stops). The remaining slice is a token-id beam:
-      the existing DecodeBeamSearch is char-level/string-based and does not
-      compose with the two-net convention, so a seq2seq beam needs its own
-      candidate loop (reuse LengthPenaltyDenominator/SafeLogProb and the
-      finished-pool pruning idiom). Unlocks translation/summarization
-      examples that the landed BLEU/ROUGE metrics in neuralnlpmetrics.pas
-      are waiting for, once the Unigram tokenizer lands.
+- [X] Seq2seq BEAM SEARCH on the landed encoder-decoder harness: landed as
+      DecodeSeq2SeqBeamSearch / DecodeSeq2SeqBeamSearchAll in
+      neural/neuraldecode.pas - token-id candidate loop over the two-net
+      convention (encode-once cached states, per-beam full decoder
+      re-forward), reusing LengthPenaltyDenominator/SafeLogProb and the
+      finished-pool pruning idiom; new TNNetTokenDecodeResult ranked-pool
+      record (EOS included in Tokens, mirroring greedy). Tests: B=1/alpha=0
+      equals greedy token-for-token, B=2 escapes a greedy first-token trap
+      on a hand-rigged Markov two-net pair (closed-form log-probs), length
+      penalty verifiably flips the finished-pool ranking, determinism +
+      caps + validation on the T5 pico fixture.
+- [ ] Seq2seq translation/summarization EXAMPLE on the landed beam:
+      DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in
+      neuralnlpmetrics.pas are both waiting on the Unigram/SentencePiece
+      tokenizer for real Marian/T5 checkpoints - wire an examples/ entry
+      (and an examples/README.md mention) once that lands.
 - [ ] Masked-LM data collator (transformers DataCollatorForLanguageModeling
       port): BERT-style dynamic masking — pick 15% of tokens, replace 80%
       with [MASK] / 10% random / 10% unchanged, loss only on masked
