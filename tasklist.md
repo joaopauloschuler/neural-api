@@ -118,6 +118,30 @@ rather than acted on.
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
       Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
       punctuation class of the GPT-2 regex).
+- [ ] `Split`-regex + `Metaspace` pre_tokenizer support in
+      neural/neuralhftokenizer.pas: AddPreTokenizer hard-rejects every type
+      except Sequence/ByteLevel/BertPreTokenizer, so the tokenizer.json
+      shipped with the ALREADY-IMPORTABLE Llama-family checkpoints fails to
+      load — Qwen2/Qwen3 and Llama-3-style tokenizers use
+      Sequence[Split(pattern=cl100k-style regex, behavior=isolated),
+      ByteLevel(use_regex=false)], and Llama-2/Mistral-v0.1
+      SentencePiece-BPE tokenizers use Metaspace (U+2581 prefix-space
+      replacement). Net effect: BuildQwen2/BuildMistralFromSafeTensors load
+      weights that nothing in the repo can tokenize for end-to-end. v1:
+      (a) Metaspace — space→▁ replacement with prepend/add_prefix_space
+      handling plus the matching Metaspace decoder branch; (b) Split —
+      interpret the shipped pattern against the handful of regex idioms
+      these tokenizers actually use rather than vendoring a full regex
+      engine (SplitGPT2 already implements the contraction/\p{L}/\p{N}
+      machinery; generalize for the cl100k deltas: case-insensitive
+      contractions, \p{N}{1,3} digit-run capping, optional non-letter
+      leading char), rejecting genuinely unknown patterns loudly as today.
+      Test: per-family parity fixtures (tiny tokenizer.json + reference
+      token ids from transformers AutoTokenizer covering numbers,
+      punctuation, CJK, newlines, leading spaces), same pattern as the
+      existing GPT-2/BERT tokenizer tests. Distinct from the
+      Unigram/.model-protobuf follow-ups task above: these checkpoints DO
+      ship a tokenizer.json — only the pre_tokenizer kind is unsupported.
 - [ ] Logits-processor chain + generation config in neural/neuraldecode.pas
       (the remaining half of the transformers GenerationMixin port):
       top-k/top-p/min-p sampling, repetition/frequency/presence penalties
