@@ -289,17 +289,6 @@ rather than acted on.
       in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
       (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real rewards.
-- [X] Seq2seq BEAM SEARCH on the landed encoder-decoder harness: landed as
-      DecodeSeq2SeqBeamSearch / DecodeSeq2SeqBeamSearchAll in
-      neural/neuraldecode.pas - token-id candidate loop over the two-net
-      convention (encode-once cached states, per-beam full decoder
-      re-forward), reusing LengthPenaltyDenominator/SafeLogProb and the
-      finished-pool pruning idiom; new TNNetTokenDecodeResult ranked-pool
-      record (EOS included in Tokens, mirroring greedy). Tests: B=1/alpha=0
-      equals greedy token-for-token, B=2 escapes a greedy first-token trap
-      on a hand-rigged Markov two-net pair (closed-form log-probs), length
-      penalty verifiably flips the finished-pool ranking, determinism +
-      caps + validation on the T5 pico fixture.
 - [ ] Seq2seq translation/summarization EXAMPLE on the landed beam:
       DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in
       neuralnlpmetrics.pas are both waiting on the Unigram/SentencePiece
@@ -383,24 +372,6 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [X] Sharded pytorch_model.bin checkpoints: support
-      pytorch_model.bin.index.json (same weight_map shape as the landed
-      safetensors index) by opening every referenced .bin shard behind the
-      TNNetTorchBinReader API — mirrors TNNetSafeTensorsReader's
-      OpenFromIndex, mostly plumbing since per-shard absolute offsets
-      already work. LANDED 2026-06: TNNetTorchBinReader.Create dispatches
-      ".json" to OpenFromBinIndex (per-shard OpenBinShard appends to the
-      inherited tensor table; weight_map validated like the safetensors
-      index); CreatePretrainedTensorReader routes "*.bin.index.json" to
-      the torch reader, BuildFromPretrained probes it after
-      pytorch_model.bin, HubFetchModel falls back to pytorch_model.bin
-      then its index; 2-shard tiny_gpt2 fixture
-      (tools/shard_tiny_gpt2_bin_fixture.py) + reader-parity,
-      index-error-taxonomy and end-to-end GPT-2 logit-parity tests.
-      STILL out of scope, if ever needed: the pre-torch-1.6 non-zip
-      legacy format, DEFLATE-compressed zip entries, and non-contiguous
-      (stride-permuted) state_dict tensors — all rejected with
-      descriptive ETorchBinError messages.
 - [ ] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate
@@ -419,58 +390,6 @@ rather than acted on.
       easier first Pascal→Python round-trip than the listed safetensors
       writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
-- [X] Gemma 3 - per-head QK-norm composition: Gemma-3 replaces soft-capping
-      with RMSNorm applied per-head to q and k before attention (distinct
-      from the landed avQKNorm / TNNetQKNormAttention, which L2-normalises
-      q/k with a learnable temperature — Gemma needs a learnable-scale
-      RMSNorm). Likely pure composition: the multi-head builders split q/k/v into explicit
-      per-head layers before SDPA, so insert TNNetTokenRMSNorm on the q and
-      k branches — verify the insertion point sits AFTER RoPE the way
-      transformers' Gemma3 does (norm placement relative to RoPE changed
-      across implementations; pin it against the HF reference, do not
-      guess). Gradient check + a wired-into-MHA-builder flag.
-      NOTE 2026-06-12: the reusable composition landed with the Qwen3
-      importer — per-head TNNetTokenRMSNorm copies on the q/k slices with a
-      shared rotate_half-permuted [head_dim] gain
-      (LoadLlamaHeadRMSNormWeights in neural/neuralpretrained.pas), wired
-      BEFORE RoPE there (the verified Qwen3 ordering). Gemma-3 still needs
-      its own placement verification vs HF Gemma3 (norm-vs-RoPE order
-      differs across implementations) + the MHA-builder flag.
-      LANDED 2026-06-12: Gemma-3's placement verified against HF
-      modeling_gemma3.Gemma3Attention.forward - q_norm/k_norm BEFORE
-      apply_rotary_pos_emb, the SAME ordering as Qwen3, so the landed
-      composition reuses directly (with Gemma's zero-centered 1+w gains via
-      a new GainOffset arg on LoadLlamaHeadRMSNormWeights, and the
-      query_pre_attn_scalar fold moved into the q_norm GAINS - a W_q fold
-      would be erased by the norm). MHA-builder flag: QKRMSNorm boolean on
-      AddMultiHeadSDPAConcat / AddMultiHeadSelfAttention inserts a
-      learnable-scale per-head TNNetTokenRMSNorm on each Q/K slice before
-      RoPE; input-gradient finite-difference check in
-      TestMultiHeadSelfAttentionQKRMSNormGradientCheck (max err 4.3e-4).
-- [X] Gemma 3 - BuildGemma3FromSafeTensors importer, TEXT-ONLY (the Gemma-2
-      importer landed 2026-06-12 — BuildGemma2FromSafeTensors with the SDPA
-      score soft-cap + sandwich norms; still depends on the Gemma-3 QK-norm
-      placement task above): 5:1 local:global layer
-      ratio (config wiring over the same alternating machinery) and
-      PER-LAYER-TYPE RoPE theta — 10k for local layers, 1M for global
-      layers, so rope_theta becomes per-layer instead of one global config
-      value (plumbing exists from the Llama config reader, needs a
-      per-layer override). The 4B+ multimodal vision tower is explicitly
-      OUT OF SCOPE (separate project). Parity fixture vs
-      Gemma3ForCausalLM on a sliced text-only checkpoint.
-      LANDED 2026-06-12: BuildGemma3FromSafeTensors(Ex) (model_type
-      "gemma3_text") - per-head QK-norm replaces the soft-caps (both
-      default None, still honored if non-null), SlidingWindowPattern
-      config field (sliding_window_pattern, default 6: every Nth layer
-      global - the 5:1 ratio) and RopeLocalTheta (rope_local_base_freq,
-      default 10k local vs rope_theta 1M global) wired per-layer through
-      the existing alternating machinery; .bin rides
-      CreatePretrainedTensorReader like the rest of the Llama family;
-      BuildFromPretrained dispatches gemma3_text. Parity fixture
-      tests/fixtures/tiny_gemma3.* (tools/gemma3_tiny_fixture.py, random
-      pico Gemma3ForCausalLM, all five deltas asserted non-vacuous);
-      TestGemma3LogitParity passes the 1e-4 gate with max |logit diff|
-      9.6e-8.
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
       the GPT-Neo route; the published pytorch_model.bin-only checkpoints
@@ -492,27 +411,6 @@ rather than acted on.
       landed BuildMambaFromSafeTensors importer; needs an incremental
       TNNetSelectiveSSM state-carry path, the sibling of the RWKV-4
       decode demo task above).
-- [X] ModernBERT importer (answer.ai, 139M) — the encoder worth targeting
-      BEYOND vanilla BERT now that BuildBertFromSafeTensors has landed:
-      RoPE instead of learned positions, GeGLU, alternating local/global
-      attention — every ingredient is already landed or tasked (Gemma /
-      GPT-Neo machinery). Best current retrieval/classification encoder
-      at CPU-friendly size; feeds the same token-classification / QA /
-      sentence-embedding heads as the landed BERT importer. Parity fixture vs
-      ModernBertModel hidden states.
-      LANDED: BuildModernBertFromSafeTensors (model_type "modernbert")
-      plus two new primitives it needed: the SDPA BIDIRECTIONAL window
-      mode (symmetric |i-j| < W, FStruct[3] — encoders window BOTH sides)
-      and TNNetGEGLUErf (exact-erf GeGLU; ModernBERT's hidden_activation
-      "gelu" is the erf form, not tanh). Per-layer-type RoPE theta
-      (global/local), global iff i mod n = 0 (phase OPPOSITE Gemma-3's
-      (i+1) mod n), layer-0 Identity attn_norm, bias-free norms/linears,
-      fused Wqkv whole-thirds + rotate_half row permutation, Wi
-      input|gate halves swapped at load (HF activates the FIRST half).
-      tiny_modernbert random pico fixture with SIX non-vacuity asserts
-      (window, layer pattern, both thetas, erf-vs-tanh, Wi packing swap);
-      TestModernBertHiddenStateParity max |diff| 4.9e-6 vs the float64
-      HF oracle, BuildFromPretrained route covered.
 - [ ] Whisper-tiny importer (openai/whisper-tiny, 39M) — the FIRST speech
       model import (the landed T5 importer is text-to-text; this one
       exercises cross-attention from a non-text modality). Every hard
@@ -531,8 +429,8 @@ rather than acted on.
       <|startoftranscript|><|en|><|transcribe|><|notimestamps|> decode
       prologue; (4) BuildWhisperFromSafeTensors weight map in
       neural/neuralpretrained.pas (config.json: d_model/encoder_layers/
-      decoder_layers/num_mel_bins). Pairs naturally with the seq2seq
-      generation-harness task above (encode once, autoregress the
+      decoder_layers/num_mel_bins). Pairs naturally with the landed seq2seq
+      generation harness (encode once, autoregress the
       decoder). Verify encoder hidden states + decoder logits vs
       transformers WhisperModel on a sliced pico fixture with a pinned
       mel input; headline demo: examples/WhisperTranscribe transcribing a
@@ -566,50 +464,6 @@ rather than acted on.
       HF float64 oracle, plus non-vacuity asserts on kv_lora_rank, the
       decoupled-rope slice, shared-expert contribution, and the layer-0
       dense-vs-MoE split.
-- [X] BLOOM importer (bigscience/bloom-560m / bloomz-560m) — the ALiBi
-      architecture family, the one positional scheme NO landed importer
-      exercises (GPT-2 learned, Llama/NeoX/Qwen RoPE, T5 relative bias,
-      BERT learned): no positional embeddings at all, per-head linear
-      attention biases. TNNetALiBi already exists but is a STANDALONE
-      identity layer never wired into the attention builders, so the new
-      ingredient is plumbing per-head ALiBi slopes into the
-      SDPA/MHA score path (an avALiBi-style variant or Window-arg-like
-      FStruct flag, the same pattern as the landed avT5RelPosBias) —
-      which also unblocks ALiBi for from-scratch training and gives a
-      length-extrapolation story (train short, decode long; pairs with
-      the examples/ALiBiSlopeSweep findings). Remaining work is routine:
-      BuildBloomFromSafeTensors in neural/neuralpretrained.pas (fused
-      query_key_value with BLOOM's per-head [q|k|v] interleave — distinct
-      from NeoX's, worth a comment; embedding LayerNorm right after the
-      word embeddings; pre-LN GELU blocks; tied LM head; config.json
-      n_head/hidden_size/n_layer), the existing byte-level BPE
-      tokenizer.json path, .bin dispatch like the other importers, and a
-      sliced pico parity fixture (make_pico_*_fixture.py recipe) checking
-      hidden states + logits vs transformers BloomModel. Multilingual
-      checkpoint (46 languages) — also the first importer whose tokenizer
-      stresses non-Latin scripts end-to-end (the fpjson \uXXXX pre-decode
-      path).
-      NOTE 2026-06-12: LANDED. TNNetALiBiAttention (SDPA subclass, fixed
-      per-head slope in FFloatSt[1], exact HF build_alibi_tensor slope
-      recipe incl. the non-power-of-two branch, cached incremental decode,
-      inherited backward stays exact since the bias is an additive
-      constant) + avALiBi variant through AddMultiHeadSDPAConcat /
-      AddMultiHeadSelfAttention (per-head ALiBiSlope(h, Heads), Window
-      honoured); FD input-gradient check + slope-reference + zero-slope==
-      SDPA + serialization + builder-shape tests in TestNeuralNumerical.
-      BuildBloomFromSafeTensors in neuralpretrained.pas (per-head [q|k|v]
-      de-interleave with the NeoX-contrast comment — same h-major layout,
-      NO rotary permutation; word_embeddings_layernorm; sequential pre-LN
-      tanh-GELU blocks; always-tied head + ln_f; legacy config spellings
-      n_embed/num_attention_heads/n_layer, n_inner null = 4*hidden; .bin
-      dispatch via CreatePretrainedTensorReader; BuildFromPretrained
-      "bloom" route). tests/fixtures/tiny_bloom.* sliced from the REAL
-      bloom-560m (tools/bloom_tiny_fixture.py; 3 heads = non-power-of-two
-      slopes on the parity path, FP16 preserved, zero-ALiBi non-vacuity
-      assert); TestBloomLogitParity max |logit diff| 5.2e-7 vs the float64
-      HF oracle. Non-Latin tokenizer round-trip cases (CJK/Arabic/
-      Devanagari/Cyrillic) added to hf_tokenizer_cases.json (byte_level/
-      metaspace/wordpiece families).
 - [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
       decode docs explicitly note only greedy/sampled streamed generation
