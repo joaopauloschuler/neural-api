@@ -148,6 +148,40 @@ rather than acted on.
       float64, and a cross-encoder RERANKING example over the landed
       BuildBertForSequenceClassification scoring path (query+passage -> relevance
       score), the canonical RAG-reranker demo the encoder importers enable.
+- [ ] BART importer + abstractive-summarization example
+      (BuildBartFromSafeTensors[Ex], model_type "bart"): the dominant
+      pretrained encoder-decoder for SUMMARIZATION (facebook/bart-large-cnn,
+      sshleifer/distilbart-cnn-*) and the NLP task the repo cannot do today —
+      it has classification/NER/QA/embeddings and MT-via-Marian, but no
+      abstractive summarization on a real checkpoint. Architecturally DISTINCT
+      from the landed T5 (relative-position bias + RMSNorm + bias-free) and
+      Marian (static sinusoidal table) encoder-decoder importers, so it is not
+      a near-duplicate: BART is essentially a bidirectional BERT-style encoder
+      + GPT-2-style causal decoder with cross-attention, using LEARNED ABSOLUTE
+      positional embeddings (embed_positions, with BART's +2 padding-idx
+      offset), standard LayerNorm (post-norm: residual then norm, i.e.
+      normalize_before=false), GeLU FFN, encoder/decoder token embeddings TIED
+      to a shared table, and an lm_head tied to that table plus a
+      final_logits_bias row. Reuses almost all landed plumbing: the
+      T5EncoderStatesInput external-encoder-states convention, RunT5-style
+      two-net wiring, DecodeSeq2SeqGreedy/Sampled/BeamSearch in neuraldecode,
+      and the ROUGE metric in neuralnlpmetrics.pas; the tokenizer is GPT-2
+      byte-level BPE, which the landed TNeuralHFTokenizer already reads (no
+      SentencePiece dependency, unlike mBART/NLLB). Scope v1 to BART proper;
+      document the close cousins as follow-ups that ride this path —
+      Pegasus (pre-norm normalize_before=true + static sinusoidal positions)
+      and mBART/NLLB (pre-norm + extra final encoder/decoder LayerNorm +
+      SentencePiece tokenizer, so blocked on the open Unigram/SentencePiece
+      task). Deliverables: BuildBartFromSafeTensors[Ex] (two nets +
+      multi-shard index.json support), a pico parity fixture via the
+      make_pico_*_fixture.py recipe asserting encoder hidden states AND decoder
+      next-token logits for a fixed source+prefix vs HF float64, and an
+      examples/Summarize demo that summarizes a short article on CPU through
+      the landed beam search and reports ROUGE against a reference (the
+      seq2seq-summarization example the landed DecodeSeq2SeqBeamSearch + ROUGE
+      were built for). Closes the open "seq2seq translation/summarization
+      EXAMPLE" entry for the summarization half without waiting on
+      SentencePiece.
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
