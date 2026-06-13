@@ -86,6 +86,10 @@ type
     procedure TestDoLaAlphaZeroMatchesGreedy;
     procedure TestDoLaEmptyBucketMatchesGreedy;
     procedure TestDoLaFlipsShallowBiasedCompletion;
+    // Best-of-N / self-consistency reranking.
+    procedure TestBestOfNReturnsHighestScoringCandidate;
+    procedure TestBestOfNExternalScorerPicksItsTop;
+    procedure TestSelfConsistencyReturnsModalAnswer;
     // KV-cache incremental decode on TNNetScaledDotProductAttention.
     procedure TestKVCacheIncrementalMatchesFullForward;
     procedure TestKVCacheSlidingWindowMatchesFullForward;
@@ -171,6 +175,21 @@ type
 implementation
 
 uses Math, fpjson, jsonparser, neuralpretrained;
+
+// External Best-of-N scorer fixture: rewards LONGER completions (matches the
+// TNNetSequenceScorer signature). Overrides the default logprob ranking so the
+// test can assert the scorer, not logprob, decides the winner.
+function ScoreByLength(const Prompt, Generated: string): TNeuralFloat;
+begin
+  Result := Length(Generated) * 1.0;
+end;
+
+// Self-consistency answer-extractor fixture: the answer is the FIRST character
+// of the completion (matches the TNNetAnswerExtractor signature).
+function FirstChar(const Generated: string): string;
+begin
+  if Generated = '' then Result := '' else Result := Generated[1];
+end;
 
 function TTestNeuralDecode.BuildTinyNet(ContextLen, Vocab: integer): TNNet;
 begin
@@ -442,6 +461,124 @@ begin
     end;
     AssertTrue('DoLa actually changed the completion', D.Text <> G.Text);
   finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBestOfNReturnsHighestScoringCandidate;
+var
+  NN: TNNet;
+  Cands: TNNetDecodeResultArray;
+  Best: TNNetDecodeResult;
+  Sampler: TNNetSamplerTopK;
+  NoStops: array of string;
+  I, MaxIdx: integer;
+begin
+  // Best-of-N must return the candidate with the highest length-normalized
+  // score among the SAME N draws (re-run with the same seed to reproduce them).
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  Sampler := TNNetSamplerTopK.Create(4);
+  try
+    RandSeed := 7777;
+    Cands := SampleNCompletions(NN, 'ab', 8, 5, Sampler, 0.0, NoStops, nil);
+    MaxIdx := 0;
+    for I := 1 to High(Cands) do
+      if Cands[I].Score > Cands[MaxIdx].Score then MaxIdx := I;
+    RandSeed := 7777;
+    Best := DecodeBestOfN(NN, 'ab', 8, 5, Sampler, 0.0, NoStops, nil);
+    AssertEquals('best-of-N returns the modal max-score text',
+      Cands[MaxIdx].Text, Best.Text);
+    AssertEquals('best-of-N score == that candidate score',
+      Cands[MaxIdx].Score, Best.Score, 1e-6);
+  finally
+    Sampler.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBestOfNExternalScorerPicksItsTop;
+var
+  NN: TNNet;
+  Cands: TNNetDecodeResultArray;
+  Best: TNNetDecodeResult;
+  Sampler: TNNetSamplerTopK;
+  NoStops: array of string;
+  I, WantIdx: integer;
+begin
+  // The external scorer overrides logprob ranking: ScoreByLength rewards LONGER
+  // completions, so best-of-N must return the longest of the N draws.
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  Sampler := TNNetSamplerTopK.Create(4);
+  try
+    RandSeed := 31337;
+    Cands := SampleNCompletions(NN, 'ab', 8, 6, Sampler, 0.0, NoStops,
+      @ScoreByLength);
+    WantIdx := 0;
+    for I := 1 to High(Cands) do
+      if Cands[I].Score > Cands[WantIdx].Score then WantIdx := I;
+    RandSeed := 31337;
+    Best := DecodeBestOfN(NN, 'ab', 8, 6, Sampler, 0.0, NoStops, @ScoreByLength);
+    AssertEquals('external scorer picks its top-ranked candidate',
+      Cands[WantIdx].Text, Best.Text);
+    AssertEquals('returned score is the scorer value',
+      Length(Best.Text) * 1.0, Best.Score, 1e-6);
+  finally
+    Sampler.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestSelfConsistencyReturnsModalAnswer;
+var
+  NN: TNNet;
+  Sampler: TNNetSamplerTopK;
+  NoStops: array of string;
+  Cands: TNNetDecodeResultArray;
+  Answer, A: string;
+  Distinct: array of string;
+  Counts: array of integer;
+  I, J, K, NumDistinct, BestCount, BestIdx: integer;
+  Found: boolean;
+begin
+  // Self-consistency = majority vote over extracted answers. We compute the
+  // expected modal answer independently from the SAME N draws (FirstChar
+  // extractor) and assert DecodeSelfConsistency agrees, deterministically.
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  Sampler := TNNetSamplerTopK.Create(4);
+  try
+    RandSeed := 9001;
+    Cands := SampleNCompletions(NN, 'ab', 8, 9, Sampler, 0.0, NoStops, nil);
+    SetLength(Distinct, 0);
+    SetLength(Counts, 0);
+    NumDistinct := 0;
+    for I := 0 to High(Cands) do
+    begin
+      A := FirstChar(Cands[I].Text);
+      if A = '' then Continue;
+      Found := False;
+      for J := 0 to NumDistinct - 1 do
+        if Distinct[J] = A then begin Inc(Counts[J]); Found := True; Break; end;
+      if not Found then
+      begin
+        SetLength(Distinct, NumDistinct + 1);
+        SetLength(Counts, NumDistinct + 1);
+        Distinct[NumDistinct] := A; Counts[NumDistinct] := 1;
+        Inc(NumDistinct);
+      end;
+    end;
+    BestIdx := 0; BestCount := -1;
+    for K := 0 to NumDistinct - 1 do
+      if Counts[K] > BestCount then begin BestCount := Counts[K]; BestIdx := K; end;
+    RandSeed := 9001;
+    Answer := DecodeSelfConsistency(NN, 'ab', 8, 9, Sampler, @FirstChar, NoStops);
+    AssertTrue('there is at least one extractable answer', NumDistinct >= 1);
+    AssertEquals('self-consistency returns the modal answer',
+      Distinct[BestIdx], Answer);
+  finally
+    Sampler.Free;
     NN.Free;
   end;
 end;

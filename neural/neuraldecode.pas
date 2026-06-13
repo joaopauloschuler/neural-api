@@ -146,6 +146,18 @@ type
   // streaming session, but the session class is declared further down.
   TNNetStreamingDecoder = class;
 
+  // External per-candidate scorer for Best-of-N reranking (the Bradley-Terry /
+  // reward-model plug). Returns a scalar reward for a generated continuation;
+  // Best-of-N returns the candidate with the MAXIMUM scorer value. Plain (not
+  // "of object") so a bare function can be passed. Coded by Claude (AI).
+  TNNetSequenceScorer = function(const Prompt, Generated: string): TNeuralFloat;
+
+  // Answer-extraction callback for the self-consistency variant: maps a full
+  // generated continuation to its canonical ANSWER string (e.g. the final
+  // number after "####"). Candidates whose extracted answer is the empty string
+  // are ignored in the vote. Coded by Claude (AI).
+  TNNetAnswerExtractor = function(const Generated: string): string;
+
   // A scored decode candidate: the generated text (excluding the prompt) and
   // its cumulative log-probability.
   TNNetDecodeResult = record
@@ -816,6 +828,51 @@ function DecodeDoLa(NN: TNNet; const Prompt: string;
   MaxLen: integer; Alpha: TNeuralFloat;
   const StopStrings: array of string;
   HeadStartIdx: integer = -1): TNNetDecodeResult;
+
+// SAMPLED char-level decode: the stochastic sibling of DecodeGreedy. Each step
+// draws the next token from the softmax row via Sampler.GetToken (Sampler = nil
+// -> greedy argmax, bit-identical to DecodeGreedy). Stop strings are trimmed as
+// in DecodeGreedy. Result.SumLogProb sums the chosen tokens' log-probs so the
+// completion is directly rerankable (the Best-of-N building block). The caller
+// seeds the RNG (RandSeed) for reproducibility. Coded by Claude (AI).
+function DecodeSampled(NN: TNNet; const Prompt: string; MaxLen: integer;
+  Sampler: TNNetSamplerBase;
+  const StopStrings: array of string): TNNetDecodeResult;
+
+// BEST-OF-N reranking (the canonical test-time-compute baseline). Draws N
+// sampled completions (DecodeSampled with the given Sampler; the caller seeds
+// RandSeed) and returns the single best.
+//   * Default ranking is by LENGTH-NORMALIZED sequence log-prob:
+//       Score = SumLogProb / LengthPenaltyDenominator(Length(Text), LengthPenalty)
+//     (LengthPenalty=0 -> raw sum-log-prob; >0 lifts longer completions, Wu et
+//     al.). Each returned candidate carries this Score.
+//   * When Scorer <> nil the EXTERNAL scorer decides instead: the candidate
+//     with the maximum Scorer(Prompt, Text) is returned (the Bradley-Terry
+//     reward-model consumer). Score is overwritten with the scorer's value.
+// N < 1 is clamped to 1; ties keep the FIRST (lowest-index) candidate.
+// Coded by Claude (AI).
+function DecodeBestOfN(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; LengthPenalty: TNeuralFloat;
+  const StopStrings: array of string;
+  Scorer: TNNetSequenceScorer = nil): TNNetDecodeResult;
+
+// Like DecodeBestOfN but returns ALL N candidates (in draw order, unsorted), so
+// callers can inspect/rerank them externally. Each carries its length-normalized
+// Score (or, when Scorer<>nil, the scorer value). Coded by Claude (AI).
+function SampleNCompletions(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; LengthPenalty: TNeuralFloat;
+  const StopStrings: array of string;
+  Scorer: TNNetSequenceScorer = nil): TNNetDecodeResultArray;
+
+// SELF-CONSISTENCY (Wang et al. 2022): draw N sampled completions, extract each
+// one's ANSWER via Extract, and return the MODAL (majority-vote) answer string.
+// Ties are broken toward the answer that FIRST reached the winning count (the
+// earliest-drawn modal answer). Candidates whose extracted answer is empty are
+// ignored; if none yields an answer the empty string is returned. The caller
+// seeds RandSeed. Coded by Claude (AI).
+function DecodeSelfConsistency(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; Extract: TNNetAnswerExtractor;
+  const StopStrings: array of string): string;
 
 // ---------------------------------------------------------------------------
 // STREAMED GENERATION: the KV-cache / SSM-state counterpart of neuraldatasets'
@@ -3154,6 +3211,156 @@ begin
   end;
   Result.Score := Result.SumLogProb /
     LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function DecodeSampled(NN: TNNet; const Prompt: string; MaxLen: integer;
+  Sampler: TNNetSamplerBase;
+  const StopStrings: array of string): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  VocabSize, Step, I, Best, StopLen: integer;
+  Total, Pf: TNeuralFloat;
+  Context: string;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  VocabSize := OutputVolume.Size;
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      if Assigned(Sampler) then
+        Best := Sampler.GetToken(OutputVolume)
+      else
+      begin
+        Best := 0;
+        for I := 1 to VocabSize - 1 do
+          if OutputVolume.Raw[I] > OutputVolume.Raw[Best] then Best := I;
+      end;
+      if (Best < 0) or (Best >= VocabSize) then Best := 0;
+      // Log-prob of the chosen token (re-normalised row, same convention as
+      // NextLogProbs) so completions are directly rerankable.
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      Pf := OutputVolume.Raw[Best] / Total;
+      Result.SumLogProb := Result.SumLogProb + SafeLogProb(Pf);
+      if Best = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      Result.Text := Result.Text + Chr(Best);
+      Context := Context + Chr(Best);
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+  end;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function SampleNCompletions(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; LengthPenalty: TNeuralFloat;
+  const StopStrings: array of string;
+  Scorer: TNNetSequenceScorer): TNNetDecodeResultArray;
+var
+  I: integer;
+begin
+  if N < 1 then N := 1;
+  SetLength(Result, N);
+  for I := 0 to N - 1 do
+  begin
+    Result[I] := DecodeSampled(NN, Prompt, MaxLen, Sampler, StopStrings);
+    if Assigned(Scorer) then
+      Result[I].Score := Scorer(Prompt, Result[I].Text)
+    else
+      Result[I].Score := Result[I].SumLogProb /
+        LengthPenaltyDenominator(Length(Result[I].Text), LengthPenalty);
+  end;
+end;
+
+function DecodeBestOfN(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; LengthPenalty: TNeuralFloat;
+  const StopStrings: array of string;
+  Scorer: TNNetSequenceScorer): TNNetDecodeResult;
+var
+  Cands: TNNetDecodeResultArray;
+  I, Best: integer;
+begin
+  Cands := SampleNCompletions(NN, Prompt, MaxLen, N, Sampler, LengthPenalty,
+    StopStrings, Scorer);
+  Best := 0;
+  for I := 1 to High(Cands) do
+    if Cands[I].Score > Cands[Best].Score then Best := I; // ties keep first
+  Result := Cands[Best];
+end;
+
+function DecodeSelfConsistency(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; Extract: TNNetAnswerExtractor;
+  const StopStrings: array of string): string;
+var
+  Cands: TNNetDecodeResultArray;
+  Answers: array of string;
+  Counts: array of integer;
+  I, J, NumDistinct, Best: integer;
+  Ans: string;
+  Found: boolean;
+begin
+  if N < 1 then N := 1;
+  Cands := SampleNCompletions(NN, Prompt, MaxLen, N, Sampler, 0.0,
+    StopStrings, nil);
+  // Tally extracted answers in FIRST-SEEN order so ties resolve toward the
+  // earliest-drawn modal answer.
+  SetLength(Answers, 0);
+  SetLength(Counts, 0);
+  NumDistinct := 0;
+  for I := 0 to High(Cands) do
+  begin
+    if Assigned(Extract) then Ans := Extract(Cands[I].Text)
+    else Ans := Cands[I].Text;
+    if Ans = '' then Continue;          // unparseable: ignore in the vote
+    Found := False;
+    for J := 0 to NumDistinct - 1 do
+      if Answers[J] = Ans then
+      begin
+        Inc(Counts[J]);
+        Found := True;
+        Break;
+      end;
+    if not Found then
+    begin
+      SetLength(Answers, NumDistinct + 1);
+      SetLength(Counts, NumDistinct + 1);
+      Answers[NumDistinct] := Ans;
+      Counts[NumDistinct] := 1;
+      Inc(NumDistinct);
+    end;
+  end;
+  if NumDistinct = 0 then
+  begin
+    Result := '';
+    Exit;
+  end;
+  Best := 0;
+  for J := 1 to NumDistinct - 1 do
+    if Counts[J] > Counts[Best] then Best := J; // strict > keeps first-seen tie
+  Result := Answers[Best];
 end;
 
 type

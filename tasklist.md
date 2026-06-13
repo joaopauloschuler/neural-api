@@ -485,7 +485,7 @@ rather than acted on.
       mask and left-padded-generation tasks: this is the TRAINING data-side
       half. Test: identical loss trajectory vs naive padding at fixed seed
       modulo batch order, plus a padded-token-count reduction assert.
-- [ ] Best-of-N / self-consistency reranking utility in
+- [X] Best-of-N / self-consistency reranking utility in
       neural/neuraldecode.pas: sample N completions, rerank by
       length-normalized sequence logprob (LengthPenaltyDenominator already
       exists) or by an external scorer callback — the standard
@@ -494,6 +494,12 @@ rather than acted on.
       variant: majority-vote over extracted answers. Sampled generation is
       already landed, so this is mostly harness work; worth its own entry as
       the canonical harness.
+      LANDED: DecodeSampled (stochastic sibling of DecodeGreedy),
+      SampleNCompletions, DecodeBestOfN (length-normalized logprob OR
+      TNNetSequenceScorer callback), DecodeSelfConsistency (majority vote via
+      TNNetAnswerExtractor). 3 deterministic tests. FOLLOW-UP: wire a concrete
+      Bradley-Terry reward model as the TNNetSequenceScorer once the GRPO task
+      lands its reward head.
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (the rebuild-same-
       architecture-at-a-new-width idiom this list already notes near the
