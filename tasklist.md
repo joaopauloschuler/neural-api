@@ -454,22 +454,6 @@ rather than acted on.
       transformer of equal size (constant-memory headline of the landed
       BuildRWKVFromSafeTensors importer; needs an incremental TNNetWKV
       state-carry path).
-- [X] Mamba-2 / SSD importer (model_type "mamba2"): LANDED. TNNetMamba2
-      multi-head leaf (per-head scalar A=-exp(A_log), grouped B/C, pre-out_proj
-      gated RMSNorm; head-wise recurrent forward + exact BPTT) +
-      BuildMamba2FromSafeTensors[Ex]/WithConfig wired into BuildFromPretrained,
-      reusing the Mamba-1 conv1d/in_proj/out_proj plumbing (in_proj ->
-      [gate|x|B|C|dt], conv+SiLU on x|B|C, DeepConcat to the leaf's
-      [x|B|C|dt|gate] layout). Parity max |logit diff| ~= 2.4e-6 vs the float64
-      HF oracle (TestMamba2LogitParity; residual is HF's float32 cast inside its
-      gated RMSNorm). tools/make_pico_mamba2_fixture.py = synthetic
-      config-faithful HF Mamba2ForCausalLM (no download, 6 non-vacuous quirk
-      self-checks). TNNetMamba2 numerical-gradient (input + 4 weight sets) +
-      serialization round-trip tests in TestNeuralNumerical. DEFERRED
-      FOLLOW-UPS: the chunked SSD scan (v1 is the recurrent scan, like Mamba-1);
-      the hybrid Mamba-2 + attention families (Zamba2, Nemotron-H); an
-      incremental O(1) decode state-carry path; n_groups>1 real checkpoints
-      (supported but only n_groups=1 fixture-tested).
 - [ ] Mamba decode-side demo: tokens/sec flat in context length where a
       transformer of equal size slows (constant-memory headline of the
       landed BuildMambaFromSafeTensors importer; needs an incremental
@@ -529,23 +513,6 @@ rather than acted on.
       empty-bucket = bit-identical greedy; 3 tests incl. planted shallow-bias
       flip): add per-step ADAPTIVE candidate-layer selection beyond the fixed
       bucket — the paper's DoLa-low / DoLa-high dynamic high/low layer buckets.
-- [X] Grammar-constrained decoding (GBNF-style): DONE — TNNetGrammar compiles
-      a GBNF-subset grammar to a flat pushdown representation; TNNetGrammarMachine
-      runs it as an NFA-of-stacks (active set = set of parse stacks, so
-      alternation/optional/repetition are exact); TNNetGrammarConstraint plugs
-      into TNNetTokenConstraint's Reset/MaskAllowed/Commit reusing the JSON
-      machine's char-by-char token-feasibility walk + copy-on-fork. Supported
-      subset: name ::= body (entry 'root'); sequence + '|'; "abc" literals
-      (\n \r \t \" \\); classes [a-z], [^...] negation, '.' any; * + ? and
-      ( ... ) grouping; rule refs (recursion); '#' comments + whitespace.
-      Tested (TestNeuralDecode): the required arithmetic grammar
-      root ::= term (("+"|"-") term)* / term ::= num / num ::= [0-9]+ accepts
-      only valid strings, masks violations, gates EOS on completeness, keeps
-      forked states independent, and stays valid under greedy + weighted-sampled
-      decoding. STILL OPEN: regex->DFA path; bounded repetition {m,n}; numeric
-      \xNN/\uNNNN class escapes. (Note: TNNetSamplerTopK does a UNIFORM top-K
-      draw that ignores the mask — use TNNetSamplerWeightedTopK with grammar
-      constraints.)
 - [ ] Token healing follow-ups (v1 is landed: TNNetTokenHealingConstraint +
       PrepareTokenHealing + TGenerationConfig.TokenHealing):
       (a) PrepareTokenHealing is TStringListInt-only — a TNeuralHFTokenizer
