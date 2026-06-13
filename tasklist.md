@@ -93,23 +93,6 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] GLM-4 importer (BuildGLM4FromSafeTensors, model_type
-      "glm4", e.g. THUDM/glm-4-9b-chat-hf or the smaller zai-org/GLM-4
-      text checkpoints). This is NOT a near-duplicate of the existing
-      Llama-path importers: GLM-4 uses a sandwich-norm block
-      (post_self_attn_layernorm AFTER attention and post_mlp_layernorm
-      AFTER the MLP, in addition to the usual input/post-attention RMSNorm
-      — four norms per layer instead of two) plus PARTIAL rotary
-      (partial_rotary_factor = 0.5, only half the head dim rotated, reuse
-      the RotaryDims wiring proven on Phi-3 / GPT-NeoX) and a fused
-      qkv_proj with bias on q/k/v but NOT on o_proj. Wire the two extra
-      post-norms via the existing post-norm residual builders
-      (cf. OLMo-2 AddOutputNormResidual / [[olmo2-importer]]); fold
-      query_pre_attn scaling onto the q gains if present. Reuses GQA +
-      SwiGLU already on the Llama path. Verify against a pico fixture
-      (tools/make_pico_*_fixture.py recipe, [[pico-import-fixtures]]) and
-      logits parity against transformers in venv x. High value: GLM-4 is a
-      widely-used open bilingual model family with no current import path.
 - [ ] Qwen3-MoE importer (BuildQwen3MoeFromSafeTensors[Ex], model_type
       "qwen3_moe", e.g. Qwen/Qwen3-30B-A3B and the smaller Qwen3-MoE chat
       checkpoints). This is NOT a near-duplicate of any landed importer: it
@@ -223,8 +206,8 @@ rather than acted on.
       weight storage as a zero-drift middle rung. GGUF dovetails (reader
       landed in neural/neuralgguf.pas): load Q8_0 blocks straight into the
       int8 weight-only storage instead of dequantize-then-requantize (the
-      k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load path is its own dedicated
-      GGUF READ task below).
+      k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
+      neural/neuralgguf.pas).
 - [ ] Quantized inference follow-up: upstream fix for TVolume.GetMaxAbs
       (seeds the running max with the SIGNED first element, so a negative
       max-magnitude element 0 is missed; csErrorOverflowBackpropProtection
@@ -252,15 +235,6 @@ rather than acted on.
       (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap; add
       o200k when a GPT-4o-family checkpoint matters. Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
-- [X] EMA (exponential moving average) shadow weights in neuralfit.pas:
-      maintain decay-averaged copies of all weights during training and
-      allow swapping them in for eval/save; classic free eval-quality win.
-      Landed: TNeuralFitBase.EnableEMA/EMADecay opt-in; the per-step EMA fold
-      hooks into TNeuralFitBase.Optimize() right after the live weight update
-      (same cadence as the real step, AccumulationSteps-aware); lazy-seeded on
-      first update; ApplyEMAWeights/RestoreLiveWeights store-and-restore swap;
-      EMAShadowNet accessor. Reuses TNNetEMAWrapper (neuralnetwork.pas).
-      Tests in tests/TestNeuralFit.pas (TestEMA*).
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
@@ -299,38 +273,12 @@ rather than acted on.
       compares logits bit-for-bit. Scope v1 to the Llama family (the
       best-covered importer path); document other architectures as
       out-of-scope, same as the ONNX-export task.
-- [X] GGUF k-quant READ support: Q2_K/Q4_K/Q5_K/Q6_K all LANDED.
-      neural/neuralgguf.pas dequantizes Q2_K (id 10, 84-B super-block), Q4_K
-      (id 12, 144-B), Q5_K (id 13, 176-B) and Q6_K (id 14, 210-B) at load
-      alongside F32/F16/Q8_0 — i.e. the full Q4_K_M / Q2_K / Q5_K mixes that
-      cover the overwhelming majority of community .gguf files, so
-      BuildLlamaFromGGUF (and every other GGUF importer — the dequant is
-      architecture-agnostic) opens real downloaded checkpoints now, not just
-      the rare full-precision/Q8_0 builds. Added GGML_TYPE_Q2_K/Q4_K/Q5_K/Q6_K
-      + GGUF_QK_K/GGUF_K_SCALE_SIZE/GGUF_Q2_K_BLOCK_BYTES(84)/
-      GGUF_Q4_K_BLOCK_BYTES(144)/GGUF_Q5_K_BLOCK_BYTES(176)/
-      GGUF_Q6_K_BLOCK_BYTES(210) consts, DequantizeQ2K/Q4K/Q5K/Q6K helpers
-      (+ DequantizeQ4KScaleMin mirroring ggml's get_scale_min_k4, reused by
-      Q5_K) reproducing ggml's reference dequant_row_q2_K/q4_K/q5_K/q6_K
-      bit-unpacking exactly (Q5_K = Q4_K + a 32-byte qh 5th-bit plane,
-      q = ql | (qh_bit<<4); Q2_K = 16 sub-blocks of 16, 4-bit scale|min per
-      sub-block, 2-bit quants), the 256-element contiguous-dim divisibility
-      guard mirroring the Q8_0 one, and the LoadTensorFlat cases. Verified by
-      tools/make_kquant_gguf_fixture.py (hand-rolls valid block bytes in the
-      exact ggml layout — the gguf python package only implements DEquantize
-      for k-quants, not quantize — then captures the gguf-package reference
-      dequant in tiny_kquant_ref.json) and TestGGUFKQuantDecodeParity, which
-      dequantizes the committed tiny_kquant.gguf (8 KB) in Pascal and matches
-      the Python reference to max |diff| < 1e-4 (f32-rounding) plus a
-      non-vacuous-quantization gate vs the F32 source for all four types.
-      Pairs with the GGUF tokenizer-metadata follow-up so a single real
-      Q4_K_M .gguf becomes fully self-contained.
 - [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.
-      Distinct from the EMA task above (running decay average) but should
-      share the shadow-weights machinery — consider landing both on one
-      shadow-copy mechanism. NOTE: the EMA task landed its trainer wiring
+      Distinct from the landed EMA shadow-weights wiring (running decay
+      average) but should share the shadow-weights machinery. NOTE: the EMA
+      task landed its trainer wiring
       (TNeuralFitBase.EnableEMA + ApplyEMAWeights/RestoreLiveWeights store-and-
       restore swap) on TNNetEMAWrapper; TNNetSWAWrapper already exists too, so
       SWA is mostly a matter of wiring that wrapper into TNeuralFitBase reusing
@@ -463,17 +411,6 @@ rather than acted on.
       DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in neuralnlpmetrics.pas
       over a real Marian/T5 checkpoint (the Unigram tokenizer these need has
       landed, reading the checkpoint's tokenizer.json).
-- [X] Span-corruption pretraining EXAMPLE: TNNetSpanCorruptionCollator landed
-      in neuraldatasets.pas (T5/SpanBERT contiguous-span masking, descending
-      sentinel ids, round-trippable source/target; tests in
-      TestNeuralMaskedLM). Whole-word masking (CollateWholeWord, WordIds side
-      channel, HF DataCollatorForWholeWordMask semantics) also landed.
-      LANDED: examples/SpanCorruptionPretrain pretrains a tiny two-input
-      encoder-decoder (one TNNet, end-to-end through cross-attention) FROM
-      SCRATCH on the span-corruption objective with WORD-level tokenization over
-      a strongly deterministic toy corpus; inlined greedy DecodeSeq2Seq reaches
-      ~10/12 exact-match span reconstructions (~95% per-token, CE ~2.0 -> ~0.04)
-      in ~2 min CPU. Demo writeup in examples/README.md.
 - [ ] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
       above): K learnable virtual-token embeddings prepended to the
       embedding-layer output, base model frozen — K*d_model trainable
