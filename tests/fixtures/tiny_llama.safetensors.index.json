@@ -1,0 +1,29 @@
+{
+ "metadata": {
+  "total_size": 4712
+ },
+ "weight_map": {
+  "lm_head.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.embed_tokens.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.input_layernorm.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.mlp.down_proj.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.mlp.gate_proj.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.mlp.up_proj.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.post_attention_layernorm.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.self_attn.k_proj.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.self_attn.o_proj.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.self_attn.q_proj.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.self_attn.rotary_emb.inv_freq": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.0.self_attn.v_proj.weight": "tiny_llama-00001-of-00002.safetensors",
+  "model.layers.1.input_layernorm.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.layers.1.mlp.down_proj.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.layers.1.mlp.gate_proj.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.layers.1.mlp.up_proj.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.layers.1.post_attention_layernorm.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.layers.1.self_attn.k_proj.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.layers.1.self_attn.o_proj.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.layers.1.self_attn.q_proj.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.layers.1.self_attn.v_proj.weight": "tiny_llama-00002-of-00002.safetensors",
+  "model.norm.weight": "tiny_llama-00002-of-00002.safetensors"
+ }
+}

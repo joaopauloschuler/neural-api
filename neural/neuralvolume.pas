@@ -543,6 +543,27 @@ type
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
   end;
 
+  { TNNetSamplerMinP }
+  // Min-p sampling (Nguyen et al. 2024, "Turning Up the Heat: Min-p Sampling
+  // for Creative and Coherent LLM Outputs"). Operates on PROBABILITIES (a
+  // post-softmax volume, same convention as TNNetSamplerTopP): keeps every
+  // token whose probability satisfies p >= MinP * max(p), renormalizes the
+  // kept mass and draws PROPORTIONALLY to the renormalized probabilities (a
+  // true weighted draw). MinP = 1.0 keeps only the argmax (greedy);
+  // MinP -> 0 approaches full ancestral sampling.
+  // Coded by Claude (AI).
+  TNNetSamplerMinP = class (TNNetSamplerBase)
+    protected
+      FMinP: TNeuralFloat;
+      // Weighted draw over the (descending-sorted) FTokenArr entries that
+      // pass the p >= MinP * max(p) cut.
+      function SampleFromSorted(): integer;
+    public
+      constructor Create(MinP: TNeuralFloat);
+      function GetToken(Origin: TNNetVolume): integer; override;
+      function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
+  end;
+
   { TNNetTokenHistoryPenalty }
   // Stateful logit processor that sits BETWEEN the model output and the
   // TNNetSamplerBase family (Greedy / TopK / TopP). It is NOT a sampler: it
@@ -579,6 +600,18 @@ type
       procedure ResetHistory();
       // Mutates the logit volume in place; each element index is a token id.
       procedure Apply(Logits: TNNetVolume);
+      // Probability-domain (POST-SOFTMAX) variant of Apply for callers whose
+      // next-token volume holds probabilities rather than raw logits (e.g.
+      // the streamed generation loop in neuraldecode, where the model ends
+      // in a SoftMax). Works in log space (ln p = logit - logsumexp):
+      //  (a) repetition: ln p is always <= 0, so the sign-correct CTRL rule
+      //      reduces to ln p := ln p * r, i.e. p := p^r - the standard
+      //      "power then renormalize" probability adaptation;
+      //  (b/c) frequency/presence: subtracting alpha_f*count + alpha_p from
+      //      the log multiplies p by exp(-alpha_f*count - alpha_p).
+      // The volume is renormalized to sum 1 afterwards. Bit-for-bit no-op
+      // when all knobs are at their defaults or no token has been seen.
+      procedure ApplyToProbabilities(Probs: TNNetVolume);
   end;
 
   /// Implements a pair of volumes
@@ -2201,6 +2234,72 @@ begin
     Result := FTokenArr[0].Token; // Fallback in case P is too low.
 end;
 
+{ TNNetSamplerMinP }
+
+constructor TNNetSamplerMinP.Create(MinP: TNeuralFloat);
+begin
+  inherited Create();
+  FMinP := MinP;
+end;
+
+function TNNetSamplerMinP.SampleFromSorted(): integer;
+var
+  Threshold, KeptSum, Roll, Cumulative: TNeuralFloat;
+  I, KeptCount: integer;
+begin
+  if Length(FTokenArr) = 0 then
+  begin
+    Result := 0; // defensive: empty distribution
+    exit;
+  end;
+  // FTokenArr is sorted DESCENDING, so [0] holds the max probability.
+  Threshold := FMinP * FTokenArr[0].Score;
+  KeptCount := 0;
+  KeptSum := 0;
+  for I := Low(FTokenArr) to High(FTokenArr) do
+  begin
+    if FTokenArr[I].Score >= Threshold then
+    begin
+      Inc(KeptCount);
+      KeptSum := KeptSum + FTokenArr[I].Score;
+    end
+    else Break; // sorted descending: nothing later can pass the cut
+  end;
+  if (KeptCount = 0) or (KeptSum <= 0) then
+  begin
+    Result := FTokenArr[0].Token; // fallback: degenerate distribution
+    exit;
+  end;
+  // Weighted draw proportional to the renormalized kept mass.
+  Roll := Random * KeptSum;
+  Cumulative := 0;
+  Result := FTokenArr[KeptCount - 1].Token; // numeric-safety fallback
+  for I := 0 to KeptCount - 1 do
+  begin
+    Cumulative := Cumulative + FTokenArr[I].Score;
+    if Roll < Cumulative then
+    begin
+      Result := FTokenArr[I].Token;
+      exit;
+    end;
+  end;
+end;
+
+function TNNetSamplerMinP.GetToken(Origin: TNNetVolume): integer;
+begin
+  Origin.GetTokenArray(FTokenArr);
+  SortTokenArray();
+  Result := SampleFromSorted();
+end;
+
+function TNNetSamplerMinP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
+  PixelY: integer): integer;
+begin
+  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  SortTokenArray();
+  Result := SampleFromSorted();
+end;
+
 { TNNetSamplerTopK }
 
 constructor TNNetSamplerTopK.Create(TopK: integer);
@@ -2321,6 +2420,44 @@ begin
       Logit := Logit - FPresence;
       Logits.FData[I] := Logit;
     end;
+  end;
+end;
+
+procedure TNNetTokenHistoryPenalty.ApplyToProbabilities(Probs: TNNetVolume);
+var
+  I, MaxToken, Count: integer;
+  P, Total: TNeuralFloat;
+  Changed: boolean;
+begin
+  // Guaranteed bit-for-bit no-op when every knob is at its default.
+  if (FRepetition = 1.0) and (FFrequency = 0.0) and (FPresence = 0.0) then exit;
+  Changed := false;
+  MaxToken := Length(FCounts) - 1;
+  if MaxToken >= Probs.Size then MaxToken := Probs.Size - 1;
+  for I := 0 to MaxToken do
+  begin
+    Count := FCounts[I];
+    if Count > 0 then
+    begin
+      P := Probs.FData[I];
+      // (a) repetition penalty: p := p^r ("power then renormalize", the
+      // probability-domain image of the sign-correct CTRL logit rule -
+      // ln p <= 0 always, so the negative branch ln p * r applies).
+      if (FRepetition <> 1.0) and (P > 0) then P := Power(P, FRepetition);
+      // (b) frequency + (c) presence: log-space subtraction is a
+      // multiplicative exp() factor on the probability.
+      if (FFrequency <> 0.0) or (FPresence <> 0.0) then
+        P := P * Exp(-(FFrequency * Count + FPresence));
+      Probs.FData[I] := P;
+      Changed := true;
+    end;
+  end;
+  // Renormalize to a proper distribution (only if something changed, so an
+  // empty history remains a bit-for-bit no-op).
+  if Changed then
+  begin
+    Total := Probs.GetSum();
+    if Total > 0 then Probs.Divi(Total);
   end;
 end;
 

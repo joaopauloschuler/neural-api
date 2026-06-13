@@ -349,6 +349,107 @@ procedure DebugNLPOnPos(NN: TNNet; Dict: TStringListInt; var Dataset: TNNetAAInt
 // Converts a string into an array of integer
 function StringToArrayOfInteger(InputString: string): TNeuralIntegerArray;
 
+type
+  // How TNNetSequencePacker lays documents out into fixed-length windows:
+  // - pmSplitAcrossWindows: GPT-2/GPT-3 style packing. All documents are
+  //   concatenated into one token stream (each document followed by one
+  //   separator token) and the stream is cut into consecutive ContextLen
+  //   windows; a document may be split across a window boundary. Only the
+  //   final partial window is padded.
+  // - pmNoSplitGreedy: greedy bin fill that never splits a document. Each
+  //   document (+ its separator) is appended to the current window when it
+  //   fits; otherwise the current window is padded and a new one starts.
+  //   Documents longer than ContextLen-1 tokens are truncated.
+  // - pmOneDocPerWindow: classic padded feeding (the baseline packing is
+  //   compared against): one document per window, truncated to ContextLen-1
+  //   tokens, followed by one separator and padding.
+  TNNetPackingMode = (pmSplitAcrossWindows, pmNoSplitGreedy, pmOneDocPerWindow);
+
+  { TNNetSequencePacker }
+  // Sequence packing for autoregressive language-model pretraining: packs a
+  // tokenized corpus (variable-length documents) into fixed ContextLen
+  // training windows instead of padding each document, which is a large
+  // throughput win on pad-heavy corpora.
+  //
+  // Conventions (matching the NLP pipeline in this repo, where token ids < 2
+  // are special): pad = 0, end-of-document separator = 1, real corpus tokens
+  // must be >= 2 (AddDocument raises EArgumentException otherwise). Every
+  // document is followed by exactly one separator, so separator count equals
+  // document count. The separator IS a training target (the model learns to
+  // end documents); only positions whose next-token target is the pad token
+  // are excluded from the loss (IsTargetPredictable = false). Within a
+  // window, the target for position P is the token at position P+1, so the
+  // last position of every window never has a target.
+  //
+  // Cross-document attention masking is intentionally NOT implemented:
+  // TNNetScaledDotProductAttention only supports a static causal flag (plus
+  // a static sliding window), not per-sample dynamic masks, so attention may
+  // cross document boundaries inside a packed window. This is the standard
+  // GPT-2/GPT-3 packing behaviour and works fine in practice.
+  //
+  // Typical use (per-position causal LM with a TNNetPointwiseSoftMax head):
+  //   Packer.AddDocument(...); ...; Packer.Pack();
+  //   Packer.GetTrainingPair(W, InputV, TargetV);
+  //   NN.Compute(InputV);
+  //   Packer.ApplyLossMask(W, TargetV, NN.GetLastLayer().Output);
+  //   NN.Backpropagate(TargetV); // error = Output - Desired = 0 when masked
+  // Coded by Claude (AI).
+  TNNetSequencePacker = class(TObject)
+    private
+      FContextLen: integer;
+      FMode: TNNetPackingMode;
+      FSeparatorToken: integer;
+      FPadToken: integer;
+      FDocs: array of TNeuralIntegerArray;
+      FDocCount: integer;
+      FWindows: TNNetAAInteger;
+      FIsPacked: boolean;
+      procedure RequirePacked();
+      procedure PackSplit();
+      procedure PackGreedyBins(OneDocPerWindow: boolean);
+    public
+      constructor Create(pContextLen: integer;
+        pMode: TNNetPackingMode = pmSplitAcrossWindows;
+        pSeparatorToken: integer = 1; pPadToken: integer = 0);
+      destructor Destroy; override;
+      // Removes all documents and packed windows.
+      procedure Clear();
+      // Adds one tokenized document (without trailing separator; the packer
+      // appends the separator itself). All token ids must be >= 2.
+      procedure AddDocument(const Tokens: array of integer);
+      // Char-level convenience: document tokens are Ord() of each character.
+      procedure AddDocumentFromString(const Str: string);
+      // Builds the packed windows from the documents added so far.
+      procedure Pack();
+      function WindowCount(): integer;
+      // Returns a copy of window WindowIdx (always ContextLen tokens).
+      function GetWindow(WindowIdx: integer): TNeuralIntegerArray;
+      function GetToken(WindowIdx, Pos: integer): integer;
+      // True when position Pos of window WindowIdx carries a loss: the target
+      // (next token in the window) exists and is not the pad token.
+      function IsTargetPredictable(WindowIdx, Pos: integer): boolean;
+      function PredictableTargetCount(WindowIdx: integer): integer;
+      // Fraction of loss-bearing target slots over all windows:
+      // sum(PredictableTargetCount) / (WindowCount * (ContextLen-1)).
+      function Utilization(): TNeuralFloat;
+      // Fills a training pair for window WindowIdx. Input: token ids on the X
+      // axis when pInput.Depth = 1 (embedding pipelines), one-hot across the
+      // depth axis otherwise. Target: per-position one-hot of the next token
+      // (rows without a predictable target are left all-zero - call
+      // ApplyLossMask after Compute so they carry no gradient).
+      procedure GetTrainingPair(WindowIdx: integer; pInput, pTarget: TNNetVolume);
+      // Copies the actual network output into Desired at every position that
+      // is not predictable. With the framework's error convention
+      // e = Output - Desired this makes the error at masked positions exactly
+      // zero, so no loss is backpropagated from pad targets.
+      procedure ApplyLossMask(WindowIdx: integer; Desired, Actual: TNNetVolume);
+      property ContextLen: integer read FContextLen;
+      property Mode: TNNetPackingMode read FMode;
+      property SeparatorToken: integer read FSeparatorToken;
+      property PadToken: integer read FPadToken;
+      property DocumentCount: integer read FDocCount;
+  end;
+
 implementation
 
 uses
@@ -653,6 +754,272 @@ begin
     for CntChar := 1 to InputLen do
     begin
       Result[CntChar-1] := ord(InputString[CntChar]);
+    end;
+  end;
+end;
+
+{ TNNetSequencePacker }
+
+constructor TNNetSequencePacker.Create(pContextLen: integer;
+  pMode: TNNetPackingMode; pSeparatorToken: integer; pPadToken: integer);
+begin
+  inherited Create();
+  if pContextLen < 2 then
+    raise Exception.Create('TNNetSequencePacker: ContextLen must be >= 2.');
+  if pSeparatorToken = pPadToken then
+    raise Exception.Create(
+      'TNNetSequencePacker: separator and pad tokens must differ.');
+  FContextLen := pContextLen;
+  FMode := pMode;
+  FSeparatorToken := pSeparatorToken;
+  FPadToken := pPadToken;
+  Clear();
+end;
+
+destructor TNNetSequencePacker.Destroy;
+begin
+  Clear();
+  inherited Destroy;
+end;
+
+procedure TNNetSequencePacker.Clear();
+var
+  I: integer;
+begin
+  for I := 0 to Length(FDocs) - 1 do SetLength(FDocs[I], 0);
+  SetLength(FDocs, 0);
+  FDocCount := 0;
+  for I := 0 to Length(FWindows) - 1 do SetLength(FWindows[I], 0);
+  SetLength(FWindows, 0);
+  FIsPacked := false;
+end;
+
+procedure TNNetSequencePacker.AddDocument(const Tokens: array of integer);
+var
+  I: integer;
+begin
+  for I := 0 to Length(Tokens) - 1 do
+  begin
+    if Tokens[I] < 2 then
+      raise Exception.Create(
+        'TNNetSequencePacker: real token ids must be >= 2 ' +
+        '(ids < 2 are reserved for pad/separator); got ' +
+        IntToStr(Tokens[I]) + '.');
+  end;
+  if FDocCount >= Length(FDocs) then SetLength(FDocs, 8 + FDocCount * 2);
+  SetLength(FDocs[FDocCount], Length(Tokens));
+  for I := 0 to Length(Tokens) - 1 do FDocs[FDocCount][I] := Tokens[I];
+  Inc(FDocCount);
+  FIsPacked := false;
+end;
+
+procedure TNNetSequencePacker.AddDocumentFromString(const Str: string);
+var
+  Tokens: TNeuralIntegerArray;
+begin
+  Tokens := StringToArrayOfInteger(Str);
+  AddDocument(Tokens);
+  SetLength(Tokens, 0);
+end;
+
+procedure TNNetSequencePacker.RequirePacked();
+begin
+  if not FIsPacked then
+    raise Exception.Create('TNNetSequencePacker: call Pack() first.');
+end;
+
+// GPT-style v1 packing: one continuous stream (doc + separator per document)
+// cut into consecutive ContextLen windows; documents may be split across a
+// window boundary; only the final partial window is padded.
+procedure TNNetSequencePacker.PackSplit();
+var
+  StreamLen, DocIdx, I, Pos, WinCount, W: integer;
+  Stream: TNeuralIntegerArray;
+begin
+  StreamLen := 0;
+  for DocIdx := 0 to FDocCount - 1 do
+    StreamLen := StreamLen + Length(FDocs[DocIdx]) + 1; // +1 separator
+  SetLength(Stream, StreamLen);
+  Pos := 0;
+  for DocIdx := 0 to FDocCount - 1 do
+  begin
+    for I := 0 to Length(FDocs[DocIdx]) - 1 do
+    begin
+      Stream[Pos] := FDocs[DocIdx][I];
+      Inc(Pos);
+    end;
+    Stream[Pos] := FSeparatorToken;
+    Inc(Pos);
+  end;
+  WinCount := (StreamLen + FContextLen - 1) div FContextLen;
+  SetLength(FWindows, WinCount);
+  for W := 0 to WinCount - 1 do
+  begin
+    SetLength(FWindows[W], FContextLen);
+    for I := 0 to FContextLen - 1 do
+    begin
+      Pos := W * FContextLen + I;
+      if Pos < StreamLen
+      then FWindows[W][I] := Stream[Pos]
+      else FWindows[W][I] := FPadToken;
+    end;
+  end;
+  SetLength(Stream, 0);
+end;
+
+// No-split greedy bin fill (and, when OneDocPerWindow, the padded baseline):
+// a document (+ its separator) never crosses a window boundary; documents
+// longer than ContextLen-1 tokens are truncated so doc+separator always fits.
+procedure TNNetSequencePacker.PackGreedyBins(OneDocPerWindow: boolean);
+var
+  DocIdx, DocLen, I, Pos, W: integer;
+
+  procedure PadAndCloseCurrent();
+  var
+    P: integer;
+  begin
+    for P := Pos to FContextLen - 1 do FWindows[W][P] := FPadToken;
+    Pos := FContextLen;
+  end;
+
+  procedure OpenNewWindow();
+  begin
+    Inc(W);
+    if W >= Length(FWindows) then SetLength(FWindows, 8 + W * 2);
+    SetLength(FWindows[W], FContextLen);
+    Pos := 0;
+  end;
+
+begin
+  W := -1;
+  Pos := FContextLen; // force a new window for the first document
+  for DocIdx := 0 to FDocCount - 1 do
+  begin
+    DocLen := Length(FDocs[DocIdx]);
+    if DocLen > FContextLen - 1 then DocLen := FContextLen - 1;
+    if (Pos + DocLen + 1 > FContextLen) or
+      (OneDocPerWindow and (Pos > 0)) then
+    begin
+      if W >= 0 then PadAndCloseCurrent();
+      OpenNewWindow();
+    end;
+    for I := 0 to DocLen - 1 do
+    begin
+      FWindows[W][Pos] := FDocs[DocIdx][I];
+      Inc(Pos);
+    end;
+    FWindows[W][Pos] := FSeparatorToken;
+    Inc(Pos);
+  end;
+  if W >= 0 then PadAndCloseCurrent();
+  SetLength(FWindows, W + 1);
+end;
+
+procedure TNNetSequencePacker.Pack();
+begin
+  case FMode of
+    pmSplitAcrossWindows: PackSplit();
+    pmNoSplitGreedy: PackGreedyBins(false);
+    pmOneDocPerWindow: PackGreedyBins(true);
+  end;
+  FIsPacked := true;
+end;
+
+function TNNetSequencePacker.WindowCount(): integer;
+begin
+  RequirePacked();
+  Result := Length(FWindows);
+end;
+
+function TNNetSequencePacker.GetWindow(WindowIdx: integer): TNeuralIntegerArray;
+var
+  I: integer;
+begin
+  RequirePacked();
+  SetLength(Result, FContextLen);
+  for I := 0 to FContextLen - 1 do Result[I] := FWindows[WindowIdx][I];
+end;
+
+function TNNetSequencePacker.GetToken(WindowIdx, Pos: integer): integer;
+begin
+  RequirePacked();
+  Result := FWindows[WindowIdx][Pos];
+end;
+
+function TNNetSequencePacker.IsTargetPredictable(WindowIdx, Pos: integer): boolean;
+begin
+  RequirePacked();
+  Result := (Pos >= 0) and (Pos < FContextLen - 1) and
+    (FWindows[WindowIdx][Pos + 1] <> FPadToken);
+end;
+
+function TNNetSequencePacker.PredictableTargetCount(WindowIdx: integer): integer;
+var
+  Pos: integer;
+begin
+  Result := 0;
+  for Pos := 0 to FContextLen - 2 do
+    if IsTargetPredictable(WindowIdx, Pos) then Inc(Result);
+end;
+
+function TNNetSequencePacker.Utilization(): TNeuralFloat;
+var
+  W, TotalSlots, Predictable: integer;
+begin
+  RequirePacked();
+  Result := 0;
+  TotalSlots := Length(FWindows) * (FContextLen - 1);
+  if TotalSlots = 0 then exit;
+  Predictable := 0;
+  for W := 0 to Length(FWindows) - 1 do
+    Predictable := Predictable + PredictableTargetCount(W);
+  Result := Predictable / TotalSlots;
+end;
+
+procedure TNNetSequencePacker.GetTrainingPair(WindowIdx: integer;
+  pInput, pTarget: TNNetVolume);
+var
+  Pos, Token: integer;
+begin
+  RequirePacked();
+  if pInput.SizeX <> FContextLen then
+    raise Exception.Create('TNNetSequencePacker.GetTrainingPair: input SizeX ' +
+      IntToStr(pInput.SizeX) + ' <> ContextLen ' + IntToStr(FContextLen) + '.');
+  if pTarget.SizeX <> FContextLen then
+    raise Exception.Create('TNNetSequencePacker.GetTrainingPair: target SizeX ' +
+      IntToStr(pTarget.SizeX) + ' <> ContextLen ' + IntToStr(FContextLen) + '.');
+  pInput.Fill(0);
+  for Pos := 0 to FContextLen - 1 do
+  begin
+    Token := FWindows[WindowIdx][Pos];
+    if pInput.Depth = 1
+    then pInput[Pos, 0, 0] := Token              // token ids -> embedding
+    else if Token < pInput.Depth
+    then pInput[Pos, 0, Token] := 1;             // one-hot across depth
+  end;
+  pTarget.Fill(0);
+  for Pos := 0 to FContextLen - 2 do
+  begin
+    if IsTargetPredictable(WindowIdx, Pos) then
+    begin
+      Token := FWindows[WindowIdx][Pos + 1];
+      if Token < pTarget.Depth then pTarget[Pos, 0, Token] := 1;
+    end;
+  end;
+end;
+
+procedure TNNetSequencePacker.ApplyLossMask(WindowIdx: integer;
+  Desired, Actual: TNNetVolume);
+var
+  Pos, D: integer;
+begin
+  RequirePacked();
+  for Pos := 0 to FContextLen - 1 do
+  begin
+    if not IsTargetPredictable(WindowIdx, Pos) then
+    begin
+      for D := 0 to Desired.Depth - 1 do
+        Desired[Pos, 0, D] := Actual[Pos, 0, D];
     end;
   end;
 end;

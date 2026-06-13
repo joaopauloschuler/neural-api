@@ -41,6 +41,7 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
   neuralfit,
   neuralthread,
   neuraldatasets,
+  neuralnlpmetrics,
   CustApp,
   Math;
 
@@ -65,7 +66,9 @@ type
     FNN: TNNet;
     NFit: TNeuralDataLoadingFit;
     FSampler: TNNetSamplerBase;
+    FMinPSampler: TNNetSamplerBase;
     procedure BuildCorpus;
+    procedure PrintPerplexity;
     procedure DoRun; override;
   public
     procedure OnAfterEpoch(Sender: TObject);
@@ -112,6 +115,10 @@ type
     NFit := TNeuralDataLoadingFit.Create();
     // TopP sampling adds a little variety while staying close to the corpus.
     FSampler := TNNetSamplerTopP.Create(0.6);
+    // Min-p sampling (Nguyen et al. 2024): keep tokens with
+    // p >= MinP * max(p), renormalize and draw proportionally - the kept set
+    // adapts to the model's confidence (narrow when peaked, wide when flat).
+    FMinPSampler := TNNetSamplerMinP.Create(0.15);
 
     // ---- Decoder-only (GPT) architecture ----
     // One-hot char input -> project to d_model -> absolute positional
@@ -170,12 +177,44 @@ type
     WriteLn();
     WriteLn('==== Final autoregressive samples (seed -> generated) ====');
     OnAfterEpoch(Self);
+    PrintPerplexity();
 
+    FMinPSampler.Free;
     FSampler.Free;
     NFit.Free;
     FNN.Free;
     FDataset.Free;
     Terminate;
+  end;
+
+  // Teacher-forced perplexity over the 8 unique corpus sentences using
+  // neuralnlpmetrics.PerplexityFromChars (the char-level / single next-char
+  // softmax path; prefixes are one-hot right-aligned exactly like training).
+  // The corpus is memorized rather than held out (TinyGPT trains on it), so
+  // this is a goodness-of-fit number: 128 = uniform/untrained, ~1 = perfect
+  // memorization. The EOS chr(1) targets are excluded as special tokens.
+  procedure TTinyGPT.PrintPerplexity;
+  var
+    EvalCorpus: TStringList;
+    I: integer;
+    Stats: TNNetPerplexityStats;
+  begin
+    EvalCorpus := TStringList.Create();
+    try
+      // Rows 0..7 are the unique sentences (the rest are repetitions).
+      for I := 0 to 7 do EvalCorpus.Add(FDataset[I]);
+      Stats := PerplexityFromChars(NFit.NN, EvalCorpus,
+        {MinContext=}csMinSampleSize);
+      WriteLn();
+      WriteLn('==== Corpus perplexity (teacher-forced, char-level) ====');
+      WriteLn(Format(
+        '  perplexity: %.4f  mean NLL: %.4f nats  bits/char: %.4f  ' +
+        '(%d chars scored, %d special skipped)',
+        [Stats.Perplexity, Stats.MeanNLL, Stats.BitsPerToken,
+         Stats.PredictedTokens, Stats.SkippedTokens]));
+    finally
+      EvalCorpus.Free;
+    end;
   end;
 
   procedure TTinyGPT.OnAfterEpoch(Sender: TObject);
@@ -186,6 +225,8 @@ type
       GenerateStringFromChars(NFit.NN, 'the lazy', FSampler));
     WriteLn('  "in the for"-> ',
       GenerateStringFromChars(NFit.NN, 'in the for', FSampler));
+    WriteLn('  "the quick" -> (min-p) ',
+      GenerateStringFromChars(NFit.NN, 'the quick', FMinPSampler));
   end;
 
   procedure TTinyGPT.GetTrainingPair(Idx: integer; ThreadId: integer;

@@ -41,6 +41,18 @@ type
     procedure TestPenaltyRepetitionSignCorrect;
     procedure TestPenaltyResetHistory;
     procedure TestPenaltyFrequencyScalesWithCount;
+
+    // TNNetSamplerMinP tests
+    procedure TestMinPSamplerKeepsExactlyExpectedSet;
+    procedure TestMinPSamplerOneIsGreedy;
+    procedure TestMinPSamplerBoundaryTokenIsKept;
+    procedure TestMinPSamplerGetTokenOnPixel;
+
+    // TNNetTokenHistoryPenalty.ApplyToProbabilities tests
+    procedure TestPenaltyProbabilitiesNoOpIsBitForBit;
+    procedure TestPenaltyProbabilitiesRepetitionChangesArgmax;
+    procedure TestPenaltyProbabilitiesFrequencyPresenceFactor;
+    procedure TestPenaltyProbabilitiesSumsToOne;
   end;
 
 implementation
@@ -600,6 +612,221 @@ begin
     // 5.0 - 2 * 0.5 = 4.0
     AssertEquals('Frequency penalty subtracts 2 * alpha_f for count = 2',
       4.0, V.Raw[2], 0.0001);
+  finally
+    V.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMinPSamplerKeepsExactlyExpectedSet;
+var
+  Sampler: TNNetSamplerMinP;
+  V: TNNetVolume;
+  Token, I: integer;
+  Seen: array[0..4] of boolean;
+begin
+  // probs = [0.5, 0.3, 0.12, 0.05, 0.03]; MinP = 0.2 -> threshold = 0.1.
+  // EXACTLY tokens {0, 1, 2} pass p >= 0.1; tokens 3 and 4 must NEVER be
+  // drawn.
+  RandSeed := 20260611;
+  Sampler := TNNetSamplerMinP.Create(0.2);
+  V := TNNetVolume.Create(5, 1, 1);
+  try
+    V.Raw[0] := 0.5;
+    V.Raw[1] := 0.3;
+    V.Raw[2] := 0.12;
+    V.Raw[3] := 0.05;
+    V.Raw[4] := 0.03;
+    for I := 0 to 4 do Seen[I] := false;
+    for I := 1 to 300 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('min-p must only draw from the kept set {0,1,2}, got ' +
+        IntToStr(Token), (Token >= 0) and (Token <= 2));
+      Seen[Token] := true;
+    end;
+    // The weighted draw over the renormalized kept mass must reach every
+    // kept token in 300 draws (min renormalized prob is 0.12/0.92 > 0.13).
+    AssertTrue('kept token 0 drawn', Seen[0]);
+    AssertTrue('kept token 1 drawn', Seen[1]);
+    AssertTrue('kept token 2 drawn', Seen[2]);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMinPSamplerOneIsGreedy;
+var
+  Sampler: TNNetSamplerMinP;
+  V: TNNetVolume;
+  I: integer;
+begin
+  // MinP = 1.0 keeps only tokens with p >= max(p), i.e. the argmax alone:
+  // min-p degenerates to deterministic greedy.
+  RandSeed := 20260611;
+  Sampler := TNNetSamplerMinP.Create(1.0);
+  V := TNNetVolume.Create(6, 1, 1);
+  try
+    V.Fill(0.1);
+    V.Raw[4] := 0.5;
+    for I := 1 to 50 do
+      AssertEquals('MinP=1.0 must always return the argmax',
+        4, Sampler.GetToken(V));
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMinPSamplerBoundaryTokenIsKept;
+var
+  Sampler: TNNetSamplerMinP;
+  V: TNNetVolume;
+  Token, I: integer;
+  SawBoundary: boolean;
+begin
+  // Token 1 sits EXACTLY at the threshold (p = MinP * max = 0.4*0.5 = 0.2);
+  // the cut is inclusive (p >= threshold), so it must remain sampleable while
+  // the below-threshold tokens (0.05 each) must never appear.
+  RandSeed := 20260611;
+  Sampler := TNNetSamplerMinP.Create(0.4);
+  V := TNNetVolume.Create(8, 1, 1);
+  try
+    V.Fill(0.05);
+    V.Raw[0] := 0.5;
+    V.Raw[1] := 0.2;
+    SawBoundary := false;
+    for I := 1 to 300 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('only {0,1} pass the inclusive cut, got ' + IntToStr(Token),
+        (Token = 0) or (Token = 1));
+      if Token = 1 then SawBoundary := true;
+    end;
+    AssertTrue('the exactly-at-threshold token must be kept', SawBoundary);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMinPSamplerGetTokenOnPixel;
+var
+  Sampler: TNNetSamplerMinP;
+  V: TNNetVolume;
+  I: integer;
+begin
+  // Pixel-addressed variant with MinP=1.0: deterministic argmax at (2,1).
+  RandSeed := 20260611;
+  Sampler := TNNetSamplerMinP.Create(1.0);
+  V := TNNetVolume.Create(4, 4, 10);
+  try
+    V.Fill(0.05);
+    V[2, 1, 7] := 0.9;
+    for I := 1 to 20 do
+      AssertEquals('MinP=1.0 on pixel (2,1) must return token 7',
+        7, Sampler.GetTokenOnPixel(V, 2, 1));
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyProbabilitiesNoOpIsBitForBit;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V, Before: TNNetVolume;
+  I: integer;
+begin
+  // Default knobs (r=1, alpha_f=alpha_p=0) must leave a probability volume
+  // bit-for-bit unchanged - no power, no exp factor, no renormalization.
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.0, 0.0);
+  V := TNNetVolume.Create(4, 1, 1);
+  Before := TNNetVolume.Create(4, 1, 1);
+  try
+    V.Raw[0] := 0.4; V.Raw[1] := 0.3; V.Raw[2] := 0.2; V.Raw[3] := 0.1;
+    Before.Copy(V);
+    Penalty.RegisterToken(0);
+    Penalty.RegisterToken(2);
+    Penalty.ApplyToProbabilities(V);
+    for I := 0 to 3 do
+      AssertTrue('no-op ApplyToProbabilities must be bit-for-bit at ' +
+        IntToStr(I), V.Raw[I] = Before.Raw[I]);
+  finally
+    V.Free;
+    Before.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyProbabilitiesRepetitionChangesArgmax;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+begin
+  // probs = [0.6, 0.4], token 0 already generated, r = 2:
+  // p0 := 0.6^2 = 0.36 < 0.4 -> after renormalization the argmax flips to
+  // token 1. Exact values: 0.36/0.76 and 0.40/0.76.
+  Penalty := TNNetTokenHistoryPenalty.Create(2.0, 0.0, 0.0);
+  V := TNNetVolume.Create(2, 1, 1);
+  try
+    V.Raw[0] := 0.6;
+    V.Raw[1] := 0.4;
+    AssertEquals('argmax before penalty', 0, V.GetClass());
+    Penalty.RegisterToken(0);
+    Penalty.ApplyToProbabilities(V);
+    AssertEquals('repetition penalty must flip the argmax', 1, V.GetClass());
+    AssertEquals('p0 = 0.36/0.76', 0.36 / 0.76, V.Raw[0], 0.0001);
+    AssertEquals('p1 = 0.40/0.76', 0.40 / 0.76, V.Raw[1], 0.0001);
+  finally
+    V.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyProbabilitiesFrequencyPresenceFactor;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+begin
+  // probs = [0.5, 0.5], token 0 seen TWICE, alpha_f=0.5, alpha_p=0.3:
+  // log-space subtraction of 2*0.5 + 0.3 = 1.3 means
+  // p0/p1 = exp(-1.3) after the (ratio-preserving) renormalization.
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.5, 0.3);
+  V := TNNetVolume.Create(2, 1, 1);
+  try
+    V.Raw[0] := 0.5;
+    V.Raw[1] := 0.5;
+    Penalty.RegisterToken(0);
+    Penalty.RegisterToken(0);
+    Penalty.ApplyToProbabilities(V);
+    AssertEquals('p0/p1 must equal exp(-(2*alpha_f + alpha_p))',
+      Exp(-1.3), V.Raw[0] / V.Raw[1], 0.0001);
+  finally
+    V.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyProbabilitiesSumsToOne;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+begin
+  // After any non-trivial penalty the volume must be renormalized to a
+  // proper distribution (sum = 1).
+  Penalty := TNNetTokenHistoryPenalty.Create(3.0, 0.7, 0.4);
+  V := TNNetVolume.Create(5, 1, 1);
+  try
+    V.Raw[0] := 0.3; V.Raw[1] := 0.25; V.Raw[2] := 0.2;
+    V.Raw[3] := 0.15; V.Raw[4] := 0.1;
+    Penalty.RegisterToken(1);
+    Penalty.RegisterToken(3);
+    Penalty.RegisterToken(3);
+    Penalty.ApplyToProbabilities(V);
+    AssertEquals('penalized probabilities must sum to 1',
+      1.0, V.GetSum(), 0.0001);
   finally
     V.Free;
     Penalty.Free;

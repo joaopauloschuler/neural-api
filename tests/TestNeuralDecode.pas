@@ -24,6 +24,7 @@ type
     function BuildTinyCausalLM(ContextLen: integer): TNNet;   // RoPE attention
     function BuildTinySSMLM(ContextLen: integer): TNNet;      // DiagonalSSM
     function BuildTinyHybridLM(ContextLen: integer): TNNet;   // SSM + attention
+    function BuildTinyGQALM(ContextLen: integer): TNNet;      // grouped-query
     // Streams Toks token-at-a-time through Session and asserts every step's
     // output row matches the corresponding row of Full's causal forward.
     procedure AssertStreamMatchesFull(Full: TNNet;
@@ -38,6 +39,22 @@ type
     // Zeroes the last (logit head) layer's weights and biases and raises one
     // token's bias so greedy argmax always emits exactly that token.
     procedure RigHeadToConstantToken(NN: TNNet; Token: integer);
+    // Locates the committed encoder-decoder fixtures (same probing as
+    // TestNeuralPretrained.FixturePath: RunAll.sh runs from tests/).
+    function FixturePath(const FileName: string): string;
+    // Hand-rigged MARKOV-CHAIN two-net pair for the seq2seq beam tests: the
+    // decoder is Input(DecSeqLen,1,1) tokens -> TNNetEmbedding(Vocab,Vocab)
+    // whose output row r IS the next-token logits given the token at
+    // position r (logits depend only on the previous token - trivially
+    // causal), plus the second TNNetInput the two-net convention requires
+    // (filled but unused). Each embedding row is set to ln(P(next|prev)),
+    // so the routines' softmax recovers the exact transition probabilities
+    // and every beam's cumulative log-prob is known in closed form.
+    procedure BuildMarkovSeq2SeqPair(out Enc, Dec: TNNet;
+      out Emb: TNNetEmbedding; Vocab, EncSeqLen, DecSeqLen: integer);
+    // Sets Emb's row of PrevToken to ln of the given next-token probs.
+    procedure SetMarkovRow(Emb: TNNetEmbedding; PrevToken: integer;
+      const Probs: array of TNeuralFloat);
   published
     // Pure helper functions (no network needed).
     procedure TestLengthPenaltyAlphaZeroIsOne;
@@ -64,6 +81,7 @@ type
     procedure TestSSMDisabledPathUnchanged;
     // TNNetStreamingDecoder: the reusable incremental-decode session.
     procedure TestStreamingDecoderTransformerMatchesFullForward;
+    procedure TestStreamingDecoderGQAMatchesFullForward;
     procedure TestStreamingDecoderSSMMatchesFullForward;
     procedure TestStreamingDecoderResetStartsFreshSequence;
     procedure TestStreamingDecoderTruncateToRollsBack;
@@ -75,11 +93,57 @@ type
     procedure TestGenerateTokensStreamedRespectsCaps;
     procedure TestGenerateTokensStreamedRejectsWideSession;
     procedure TestGenerateStringStreamedMatchesTokenCore;
+    // Modern sampling controls: penalties, stop sequences, stop strings.
+    procedure TestGenerateTokensStreamedExtendedOverloadDefaultsMatchPlain;
+    procedure TestGenerateTokensStreamedStopSequenceTrims;
+    procedure TestGenerateTokensStreamedStopSequenceStaysInGeneratedRegion;
+    procedure TestGenerateTokensStreamedPenaltyAvoidsRepetition;
+    procedure TestDecodeGreedyStopStringTrimsAndFinishes;
+    procedure TestGenerateStringStreamedStopStringTrims;
+    // Logits-processor chain + temperature + generation config.
+    procedure TestTemperatureProcessorProbabilityDomainMath;
+    procedure TestProcessorChainOrderMatters;
+    procedure TestNoOpChainAndConfigBitIdenticalToPlainPath;
+    procedure TestGenerateWithConfigMatchesHandAssembled;
+    procedure TestTemperatureNearZeroWithSamplerMatchesGreedy;
+    procedure TestStringConfigDefaultsMatchPlainWrapper;
+    // Constrained (structured) decoding: TNNetTokenConstraint and friends.
+    procedure TestAllowedTokensConstraintMasksAndRenormalizes;
+    procedure TestConstraintMaskFallbackLeavesRowUntouched;
+    procedure TestGenerateTokensStreamedNilConstraintMatchesPlain;
+    procedure TestGenerateTokensStreamedWhitelistOnlyEmitsAllowed;
+    procedure TestForcedSequenceConstraintFollowsCandidate;
+    // Token healing (guidance-style BPE boundary repair).
+    procedure TestPrepareTokenHealingBuildsPrefixSetAndTrims;
+    procedure TestTokenHealingChangesFirstTokenVsUnhealed;
+    // JSON automaton unit tests (no model).
+    procedure TestJSONStateMachineObjectTransitions;
+    procedure TestJSONStateMachineStringAndEscapes;
+    procedure TestJSONStateMachineNumbers;
+    procedure TestJSONStateMachineTopLevelCompletionAllowsOnlyWS;
+    procedure TestJSONStateMachineBalancedStackClosing;
+    procedure TestJSONConstraintValidatesMultiCharTokens;
+    procedure TestJSONStateMachineFuzzRandomWalksStayValid;
+    // Model-integration: constrained generation emits parseable JSON.
+    procedure TestGenerateTokensStreamedJSONConstraintEmitsParseableJSON;
+    procedure TestDecodeGreedyJSONConstraintEmitsParseableJSON;
+    // Seq2seq (encoder-decoder) generation on the committed T5/Marian pico
+    // fixture pairs (BuildT5FromSafeTensors / BuildMarianFromSafeTensors).
+    procedure TestDecodeSeq2SeqGreedyT5DeterministicEOSAndOracle;
+    procedure TestDecodeSeq2SeqSampledTempZeroMatchesGreedy;
+    procedure TestDecodeSeq2SeqGreedyMarianPairAndCapacity;
+    procedure TestDecodeSeq2SeqRejectsInvalidArguments;
+    // Seq2seq token-id beam search (DecodeSeq2SeqBeamSearch[All]) on the
+    // hand-rigged Markov pair (exact closed-form log-probs) + T5 fixture.
+    procedure TestSeq2SeqBeamWidth1MatchesGreedy;
+    procedure TestSeq2SeqBeamBeatsGreedyFirstTokenTrap;
+    procedure TestSeq2SeqBeamFinishedPoolLengthPenaltyFlipsRanking;
+    procedure TestSeq2SeqBeamDeterministicCapsAndValidation;
   end;
 
 implementation
 
-uses Math;
+uses Math, fpjson, jsonparser, neuralpretrained;
 
 function TTestNeuralDecode.BuildTinyNet(ContextLen, Vocab: integer): TNNet;
 begin
@@ -936,6 +1000,21 @@ begin
   Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
 end;
 
+function TTestNeuralDecode.BuildTinyGQALM(ContextLen: integer): TNNet;
+begin
+  // Grouped-Query Attention mixer (4 query heads sharing 2 K/V heads). The
+  // builder composes token-wise projections + plain SDPA heads, all
+  // sequence-length independent, so it must stream through the same KV-cache
+  // path as standard MHA. No RoPE/positional signal on purpose (keeps the
+  // exactness check focused on the GQA wiring itself).
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Result.AddLayer(TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddMultiHeadGroupedQueryAttention({QueryHeads=}4, {KVHeads=}2,
+    {CausalMask=}true);
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
 procedure TTestNeuralDecode.AssertStreamMatchesFull(Full: TNNet;
   Session: TNNetStreamingDecoder; const Toks: array of integer;
   const MsgPrefix: string);
@@ -991,6 +1070,38 @@ begin
     AssertTrue('session exposes the twin', Session.Net = Twin);
     Session.Reset();
     AssertStreamMatchesFull(Full, Session, Toks, 'transformer');
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Grouped-Query Attention nets must stream exactly through the same KV-cache
+// path: GQA emits one plain TNNetScaledDotProductAttention per QUERY head (the
+// K/V projection weights are shared per group), so the session collects all
+// 4 of them and a width-1 weight-copied twin must reproduce every
+// per-position output of the full-width causal forward.
+procedure TTestNeuralDecode.TestStreamingDecoderGQAMatchesFullForward;
+const
+  SeqLen = 7;
+  Toks: array[0..6] of integer = (6, 2, 10, 3, 8, 1, 5);
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyGQALM(SeqLen);
+  Twin := BuildTinyGQALM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertEquals('one SDPA per QUERY head (KV sharing is in the projections)',
+      4, Session.SDPACount);
+    AssertEquals('no SSM layers in a GQA transformer', 0, Session.SSMCount);
+    Session.Reset();
+    AssertStreamMatchesFull(Full, Session, Toks, 'gqa');
   finally
     Session.Free;
     Twin.Free;
@@ -1202,6 +1313,11 @@ begin
     Head.Neurons[N].BiasWeight := 0;
   end;
   Head.Neurons[Token].BiasWeight := 5;
+  // MulWeights(1.0) is a no-op on the values but runs AfterWeightUpdate, so
+  // layers with packed/prepared weight copies see the hand-edited neurons
+  // even when the rigged net is computed directly (without a CopyWeights
+  // refresh on a twin).
+  Head.MulWeights(1.0);
 end;
 
 // Streamed greedy generation from a width-1 RoPE-transformer twin must equal
@@ -1488,6 +1604,1915 @@ begin
     Session.Free;
     Twin.Free;
     Full.Free;
+  end;
+end;
+
+// The extended overload with Penalty=nil and no stop sequences must produce
+// exactly the same stream (length and tokens) as the plain overload.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedExtendedOverloadDefaultsMatchPlain;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  PlainToks, ExtToks: TNeuralIntegerArray;
+  PlainLen, ExtLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(PlainToks, PromptLen);
+    SetLength(ExtToks, PromptLen);
+    PlainToks[0] := 5; PlainToks[1] := 2; PlainToks[2] := 9;
+    for T := 0 to PromptLen - 1 do ExtToks[T] := PlainToks[T];
+
+    PlainLen := GenerateTokensStreamed(Session, PlainToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    ExtLen := GenerateTokensStreamed(Session, ExtToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, nil, nil);
+
+    AssertEquals('same length with default extended args', PlainLen, ExtLen);
+    for T := PromptLen to PlainLen - 1 do
+      AssertEquals('token at pos ' + IntToStr(T), PlainToks[T], ExtToks[T]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// A matched stop sequence terminates generation and is TRIMMED from the
+// returned length. Deterministic via a head rigged to a constant token 7:
+// a [7] stop trims immediately; a [7,7] stop trims after two emissions.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedStopSequenceTrims;
+const
+  PromptLen = 2;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Toks: TNeuralIntegerArray;
+  Stops: TNNetTokenSequences;
+  OutLen: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(16);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    RigHeadToConstantToken(Full, 7);
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, 16);
+
+    // Single-token stop [7]: the first emitted 7 matches and is trimmed.
+    SetLength(Stops, 1);
+    SetLength(Stops[0], 1);
+    Stops[0][0] := 7;
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 8;
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen, 10, 16,
+      nil, nil, Stops);
+    AssertEquals('single-token stop trims to the prompt', PromptLen, OutLen);
+
+    // Two-token stop [7,7]: emitted 7,7 then both trimmed.
+    SetLength(Stops[0], 2);
+    Stops[0][0] := 7; Stops[0][1] := 7;
+    SetLength(Toks, 0);
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 8;
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen, 10, 16,
+      nil, nil, Stops);
+    AssertEquals('two-token stop trims both matched tokens',
+      PromptLen, OutLen);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// A stop sequence must match entirely inside the GENERATED region: with a
+// prompt ENDING in 7 and a [7,7] stop, the first generated 7 must NOT match
+// (it would span the prompt boundary); only the second generated 7 completes
+// a legal match, trimming back exactly to the prompt.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedStopSequenceStaysInGeneratedRegion;
+const
+  PromptLen = 2;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Toks: TNeuralIntegerArray;
+  Stops: TNNetTokenSequences;
+  OutLen: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(16);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    RigHeadToConstantToken(Full, 7);
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, 16);
+    SetLength(Stops, 1);
+    SetLength(Stops[0], 2);
+    Stops[0][0] := 7; Stops[0][1] := 7;
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 7; // prompt ENDS in 7
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen, 10, 16,
+      nil, nil, Stops);
+    // A boundary-spanning (buggy) match after the FIRST generated 7 would
+    // trim into the prompt (OutLen = PromptLen - 1). The correct match needs
+    // TWO generated 7s and trims back exactly to the prompt.
+    AssertEquals('match confined to the generated region', PromptLen, OutLen);
+    AssertEquals('prompt left untouched', 7, Toks[PromptLen - 1]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// With a SOFTMAX-headed LM and a huge frequency penalty, every seen token's
+// probability collapses to ~0, so greedy decode can never emit the same
+// token twice (nor re-emit a prompt token): the whole stream is pairwise
+// distinct. This also exercises the probability-domain penalty path inside
+// the generation loop end to end.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedPenaltyAvoidsRepetition;
+const
+  SeqLen = 12;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Penalty: TNNetTokenHistoryPenalty;
+  Toks: TNeuralIntegerArray;
+  OutLen, I, J: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  // The streamed penalty path expects POST-SOFTMAX probabilities: cap both
+  // twins with a per-position softmax (weightless, so CopyWeights is exact).
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, {Frequency=}100.0, 0.0);
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(Toks, PromptLen);
+    Toks[0] := 4; Toks[1] := 9; Toks[2] := 6; // distinct prompt tokens
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, Penalty, nil);
+    AssertTrue('something was generated', OutLen > PromptLen);
+    for I := 0 to OutLen - 2 do
+      for J := I + 1 to OutLen - 1 do
+        AssertTrue('tokens at ' + IntToStr(I) + ' and ' + IntToStr(J) +
+          ' must differ under a huge frequency penalty',
+          Toks[I] <> Toks[J]);
+  finally
+    Penalty.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// DecodeGreedy stop strings: with the logit layer rigged to a constant
+// char, a matching stop string terminates generation, is trimmed from the
+// text and marks the result Finished; a non-occurring stop string leaves
+// the output identical to the plain overload.
+procedure TTestNeuralDecode.TestDecodeGreedyStopStringTrimsAndFinishes;
+const
+  Vocab = 16;
+  MaxLen = 6;
+var
+  NN: TNNet;
+  Logit: TNNetLayer;
+  Plain, Stopped, Unmatched: TNNetDecodeResult;
+  N: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildTinyNet(8, Vocab);
+  try
+    // Rig the LOGIT layer (the SoftMax head has no neurons) to constant 7.
+    Logit := NN.Layers[NN.Layers.Count - 2];
+    for N := 0 to Logit.Neurons.Count - 1 do
+    begin
+      Logit.Neurons[N].Weights.Fill(0);
+      Logit.Neurons[N].BiasWeight := 0;
+    end;
+    Logit.Neurons[7].BiasWeight := 5;
+
+    Plain := DecodeGreedy(NN, 'ab', MaxLen);
+    AssertEquals('rigged plain decode emits MaxLen constant chars',
+      StringOfChar(Chr(7), MaxLen), Plain.Text);
+    AssertEquals('plain decode does not finish', False, Plain.Finished);
+
+    Stopped := DecodeGreedy(NN, 'ab', MaxLen, [Chr(7) + Chr(7)]);
+    AssertEquals('stop string trimmed from the output', '', Stopped.Text);
+    AssertEquals('stop string marks the result finished',
+      True, Stopped.Finished);
+
+    Unmatched := DecodeGreedy(NN, 'ab', MaxLen, [Chr(9)]);
+    AssertEquals('non-occurring stop leaves the text unchanged',
+      Plain.Text, Unmatched.Text);
+    AssertEquals('non-occurring stop does not finish',
+      False, Unmatched.Finished);
+  finally
+    NN.Free;
+  end;
+end;
+
+// String-level wrapper: a stop string is tokenized for early termination and
+// never appears in the returned string; without stops the rigged net keeps
+// appending the constant word.
+procedure TTestNeuralDecode.TestGenerateStringStreamedStopStringTrims;
+const
+  SeqLen = 9;
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'apple', 'blue', 'cat',
+    'dog', 'egg', 'fox', 'gold', 'hat', 'ice', 'jam');
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Dict: TStringListInt;
+  DogToks: TNeuralIntegerArray;
+  T: integer;
+  NoStops, WithStops: string;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  Dict := TStringListInt.Create();
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+    Dict.Tokenize('dog', DogToks);
+    AssertEquals('stop word tokenizes to one id', 1, Length(DogToks));
+    RigHeadToConstantToken(Full, DogToks[0]);
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    NoStops := GenerateStringStreamed(Session, Dict, 'cat egg',
+      SeqLen - 2, SeqLen);
+    AssertEquals('rigged net keeps emitting the constant word',
+      'cat egg dog dog dog dog dog dog dog', NoStops);
+
+    WithStops := GenerateStringStreamed(Session, Dict, 'cat egg',
+      SeqLen - 2, SeqLen, nil, nil, ['dog']);
+    AssertEquals('stop string trimmed: prompt returned unchanged',
+      'cat egg', WithStops);
+  finally
+    Dict.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// TNNetTemperatureProcessor probability-domain math: T=1 is a bitwise no-op,
+// T=0.5 equals p^2 renormalized (the exact image of logits/T), and T at/below
+// the clamp concentrates all mass on the argmax (greedy degeneration - the
+// DecodeSeq2SeqSampled convention).
+procedure TTestNeuralDecode.TestTemperatureProcessorProbabilityDomainMath;
+var
+  Row: TNNetVolume;
+  Proc: TNNetTemperatureProcessor;
+  I: integer;
+  SumSq, Total: TNeuralFloat;
+const
+  P: array[0..3] of TNeuralFloat = (0.1, 0.2, 0.3, 0.4);
+begin
+  Row := TNNetVolume.Create(4, 1, 1);
+  Proc := TNNetTemperatureProcessor.Create(1.0);
+  try
+    AssertTrue('declares the probability domain',
+      Proc.ExpectsProbabilities());
+    // T = 1.0: bitwise no-op.
+    for I := 0 to 3 do Row.Raw[I] := P[I];
+    Proc.ProcessRow(Row);
+    for I := 0 to 3 do
+      AssertEquals('T=1 leaves p[' + IntToStr(I) + '] bitwise unchanged',
+        P[I], Row.Raw[I], 0.0);
+    // T = 0.5: p^(1/T) = p^2, renormalized.
+    Proc.Temperature := 0.5;
+    SumSq := 0;
+    for I := 0 to 3 do SumSq := SumSq + P[I] * P[I];
+    for I := 0 to 3 do Row.Raw[I] := P[I];
+    Proc.ProcessRow(Row);
+    for I := 0 to 3 do
+      AssertEquals('T=0.5 equals p^2 renormalized at ' + IntToStr(I),
+        P[I] * P[I] / SumSq, Row.Raw[I], 1e-6);
+    Total := 0;
+    for I := 0 to 3 do Total := Total + Row.Raw[I];
+    AssertEquals('T=0.5 row sums to 1', 1.0, Total, 1e-6);
+    // T -> 0 (below the clamp): one-hot at the argmax.
+    Proc.Temperature := 1e-12;
+    for I := 0 to 3 do Row.Raw[I] := P[I];
+    Proc.ProcessRow(Row);
+    AssertEquals('T->0 puts all mass on the argmax', 1.0, Row.Raw[3], 1e-6);
+    for I := 0 to 2 do
+      AssertEquals('T->0 zeroes non-argmax token ' + IntToStr(I),
+        0.0, Row.Raw[I], 1e-6);
+  finally
+    Proc.Free;
+    Row.Free;
+  end;
+end;
+
+// Order matters: penalty-then-temperature sharpens the PENALIZED distribution
+// while temperature-then-penalty penalizes the SHARPENED one - the frequency
+// factor enters once as exp(-a)^(1/T) vs exp(-a). Both expected rows are
+// computed in closed form here.
+procedure TTestNeuralDecode.TestProcessorChainOrderMatters;
+const
+  Alpha = 0.7;
+  Temp = 0.5;
+var
+  Row: TNNetVolume;
+  ChainA, ChainB: TNNetLogitsProcessorChain;
+  PenA, PenB: TNNetTokenHistoryPenalty;
+  A0, A1, B0, B1, Norm: TNeuralFloat;
+begin
+  Row := TNNetVolume.Create(2, 1, 1);
+  PenA := TNNetTokenHistoryPenalty.Create(1.0, Alpha, 0.0);
+  PenB := TNNetTokenHistoryPenalty.Create(1.0, Alpha, 0.0);
+  // Chain A: penalty THEN temperature; chain B: temperature THEN penalty.
+  ChainA := TNNetLogitsProcessorChain.Create();
+  ChainA.Add(TNNetPenaltyProcessor.Create(PenA), true)
+        .Add(TNNetTemperatureProcessor.Create(Temp), true);
+  ChainB := TNNetLogitsProcessorChain.Create();
+  ChainB.Add(TNNetTemperatureProcessor.Create(Temp), true)
+        .Add(TNNetPenaltyProcessor.Create(PenB), true);
+  try
+    AssertEquals('chain A holds two processors', 2, ChainA.Count);
+    // Token 0 was seen once (the "prompt"); the row is (0.6, 0.4).
+    ChainA.Reset([0]);
+    Row.Raw[0] := 0.6; Row.Raw[1] := 0.4;
+    ChainA.ProcessRow(Row);
+    // Expected: penalize (0.6*exp(-a), 0.4)/Z, then square and renormalize.
+    A0 := 0.6 * Exp(-Alpha); A1 := 0.4;
+    Norm := A0 + A1; A0 := A0 / Norm; A1 := A1 / Norm;
+    A0 := A0 * A0; A1 := A1 * A1;
+    Norm := A0 + A1; A0 := A0 / Norm; A1 := A1 / Norm;
+    AssertEquals('penalty->temperature p0', A0, Row.Raw[0], 1e-6);
+    AssertEquals('penalty->temperature p1', A1, Row.Raw[1], 1e-6);
+
+    ChainB.Reset([0]);
+    Row.Raw[0] := 0.6; Row.Raw[1] := 0.4;
+    ChainB.ProcessRow(Row);
+    // Expected: square and renormalize, THEN penalize once.
+    B0 := 0.6 * 0.6; B1 := 0.4 * 0.4;
+    Norm := B0 + B1; B0 := B0 / Norm; B1 := B1 / Norm;
+    B0 := B0 * Exp(-Alpha);
+    Norm := B0 + B1; B0 := B0 / Norm; B1 := B1 / Norm;
+    AssertEquals('temperature->penalty p0', B0, Row.Raw[0], 1e-6);
+    AssertEquals('temperature->penalty p1', B1, Row.Raw[1], 1e-6);
+
+    // The two orders differ materially (the sharpened chain A penalizes
+    // token 0 harder: exp(-a)^2 after squaring vs exp(-a) once).
+    AssertTrue('processor order changes the distribution',
+      Abs(A0 - B0) > 0.05);
+    AssertTrue('penalty-then-temperature suppresses the seen token harder',
+      A0 < B0);
+  finally
+    ChainB.Free;
+    ChainA.Free;
+    PenB.Free;
+    PenA.Free;
+    Row.Free;
+  end;
+end;
+
+// REQUIRED BIT-IDENTITY: a nil chain, an EMPTY chain, the Temperature=1.0
+// overload and an all-defaults TGenerationConfig all reproduce the plain
+// GenerateTokensStreamed path token-for-token.
+procedure TTestNeuralDecode.TestNoOpChainAndConfigBitIdenticalToPlainPath;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  PlainToks, OtherToks: TNeuralIntegerArray;
+  EmptyChain: TNNetLogitsProcessorChain;
+  Config: TGenerationConfig;
+  PlainLen, OtherLen, T, VariantIdx: integer;
+  VariantName: string;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  EmptyChain := TNNetLogitsProcessorChain.Create();
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(PlainToks, PromptLen);
+    PlainToks[0] := 5; PlainToks[1] := 2; PlainToks[2] := 9;
+    PlainLen := GenerateTokensStreamed(Session, PlainToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    AssertTrue('plain path generated something', PlainLen > PromptLen);
+
+    for VariantIdx := 0 to 3 do
+    begin
+      SetLength(OtherToks, 0);
+      SetLength(OtherToks, PromptLen);
+      OtherToks[0] := 5; OtherToks[1] := 2; OtherToks[2] := 9;
+      case VariantIdx of
+        0: begin
+             VariantName := 'nil chain';
+             OtherLen := GenerateTokensStreamedWithProcessors(Session,
+               OtherToks, PromptLen, SeqLen - PromptLen, SeqLen, nil, nil,
+               nil, nil);
+           end;
+        1: begin
+             VariantName := 'empty chain';
+             OtherLen := GenerateTokensStreamedWithProcessors(Session,
+               OtherToks, PromptLen, SeqLen - PromptLen, SeqLen, nil,
+               EmptyChain, nil, nil);
+           end;
+        2: begin
+             VariantName := 'Temperature=1.0 overload';
+             OtherLen := GenerateTokensStreamed(Session, OtherToks,
+               PromptLen, SeqLen - PromptLen, SeqLen, nil, nil, nil, nil,
+               1.0);
+           end;
+        else
+           begin
+             VariantName := 'default TGenerationConfig';
+             Config := DefaultGenerationConfig(SeqLen - PromptLen, SeqLen);
+             OtherLen := GenerateTokensWithConfig(Session, OtherToks,
+               PromptLen, Config);
+           end;
+      end;
+      AssertEquals(VariantName + ': same length', PlainLen, OtherLen);
+      for T := PromptLen to PlainLen - 1 do
+        AssertEquals(VariantName + ': token at ' + IntToStr(T),
+          PlainToks[T], OtherToks[T]);
+    end;
+  finally
+    EmptyChain.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// REQUIRED EQUIVALENCE: a TGenerationConfig with penalty + temperature +
+// top-k sampler reproduces the hand-assembled GenerateTokensStreamed
+// Temperature-overload call (same RNG seed -> same stochastic draws).
+procedure TTestNeuralDecode.TestGenerateWithConfigMatchesHandAssembled;
+const
+  SeqLen = 12;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Penalty: TNNetTokenHistoryPenalty;
+  Sampler: TNNetSamplerBase;
+  HandToks, CfgToks: TNeuralIntegerArray;
+  Config: TGenerationConfig;
+  HandLen, CfgLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  // The pipeline operates on POST-SOFTMAX probabilities: cap both twins
+  // with a per-position softmax (weightless, so CopyWeights stays exact).
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.5, 0.0);
+  Sampler := TNNetSamplerTopK.Create(3);
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    SetLength(HandToks, PromptLen);
+    HandToks[0] := 4; HandToks[1] := 9; HandToks[2] := 6;
+    RandSeed := 5000; // fix the sampler's draws
+    HandLen := GenerateTokensStreamed(Session, HandToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, Sampler, Penalty, nil, nil, 0.7);
+
+    SetLength(CfgToks, PromptLen);
+    CfgToks[0] := 4; CfgToks[1] := 9; CfgToks[2] := 6;
+    Config := DefaultGenerationConfig(SeqLen - PromptLen, SeqLen);
+    Config.Penalty := Penalty;
+    Config.Temperature := 0.7;
+    Config.Sampler := Sampler;
+    RandSeed := 5000; // same draws for the config-driven run
+    CfgLen := GenerateTokensWithConfig(Session, CfgToks, PromptLen, Config);
+
+    AssertTrue('something was generated', HandLen > PromptLen);
+    AssertEquals('config-driven length equals hand-assembled',
+      HandLen, CfgLen);
+    for T := PromptLen to HandLen - 1 do
+      AssertEquals('token at ' + IntToStr(T), HandToks[T], CfgToks[T]);
+  finally
+    Sampler.Free;
+    Penalty.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// REQUIRED CONVENTION: Temperature -> 0 with a STOCHASTIC sampler matches the
+// greedy argmax path (the distribution degenerates to one-hot, so a weighted
+// draw becomes deterministic) - the DecodeSeq2SeqSampled temp-zero behavior
+// on the causal-LM side. The sampler is min-p (a TRUE weighted draw over the
+// kept mass); top-k would NOT work here - it draws UNIFORMLY among the top K
+// tokens, so even a one-hot row stays stochastic under it.
+procedure TTestNeuralDecode.TestTemperatureNearZeroWithSamplerMatchesGreedy;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Sampler: TNNetSamplerBase;
+  GreedyToks, ColdToks: TNeuralIntegerArray;
+  GreedyLen, ColdLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Sampler := TNNetSamplerMinP.Create(0.5);
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    SetLength(GreedyToks, PromptLen);
+    GreedyToks[0] := 5; GreedyToks[1] := 2; GreedyToks[2] := 9;
+    GreedyLen := GenerateTokensStreamed(Session, GreedyToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+
+    SetLength(ColdToks, PromptLen);
+    ColdToks[0] := 5; ColdToks[1] := 2; ColdToks[2] := 9;
+    ColdLen := GenerateTokensStreamed(Session, ColdToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, Sampler, nil, nil, nil, 1e-12);
+
+    AssertEquals('temp->0 sampled length equals greedy', GreedyLen, ColdLen);
+    for T := PromptLen to GreedyLen - 1 do
+      AssertEquals('token at ' + IntToStr(T), GreedyToks[T], ColdToks[T]);
+  finally
+    Sampler.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// String-level config path: an all-defaults config reproduces the plain
+// GenerateStringStreamed wrapper exactly (same dict, same prompt).
+procedure TTestNeuralDecode.TestStringConfigDefaultsMatchPlainWrapper;
+const
+  SeqLen = 9;
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'apple', 'blue', 'cat',
+    'dog', 'egg', 'fox', 'gold', 'hat', 'ice', 'jam');
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Dict: TStringListInt;
+  Config: TGenerationConfig;
+  T: integer;
+  Plain, Got: string;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  Dict := TStringListInt.Create();
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    Plain := GenerateStringStreamed(Session, Dict, 'cat dog egg',
+      SeqLen - 3, SeqLen);
+    Config := DefaultGenerationConfig(SeqLen - 3, SeqLen);
+    Got := GenerateStringWithConfig(Session, Dict, 'cat dog egg', Config);
+    AssertEquals('config wrapper equals plain wrapper', Plain, Got);
+  finally
+    Dict.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// MaskAllowed must zero every disallowed token and renormalize the allowed
+// ones to sum 1, preserving their relative proportions.
+procedure TTestNeuralDecode.TestAllowedTokensConstraintMasksAndRenormalizes;
+var
+  V: TNNetVolume;
+  C: TNNetAllowedTokensConstraint;
+  I: integer;
+  Total: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(8, 1, 1);
+  C := TNNetAllowedTokensConstraint.Create([1, 2]);
+  try
+    for I := 0 to 7 do V.Raw[I] := 0.125;
+    V.Raw[1] := 0.1; V.Raw[2] := 0.2; // allowed mass 0.3 before masking
+    C.MaskAllowed(V);
+    for I := 0 to 7 do
+      if (I <> 1) and (I <> 2) then
+        AssertEquals('disallowed token ' + IntToStr(I) + ' zeroed',
+          0.0, V.Raw[I], 1e-9);
+    AssertEquals('allowed token 1 renormalized', 0.1 / 0.3, V.Raw[1], 1e-6);
+    AssertEquals('allowed token 2 renormalized', 0.2 / 0.3, V.Raw[2], 1e-6);
+    Total := 0;
+    for I := 0 to 7 do Total := Total + V.Raw[I];
+    AssertEquals('row sums to 1 after masking', 1.0, Total, 1e-6);
+    AssertTrue('whitelist membership', C.TokenAllowed(2));
+    AssertTrue('out-of-whitelist id', not C.TokenAllowed(5));
+    AssertTrue('out-of-range id', not C.TokenAllowed(123));
+  finally
+    C.Free;
+    V.Free;
+  end;
+end;
+
+// The documented fallback: when the allowed probability mass is zero (no
+// token allowed, or every allowed token at probability 0), the row is left
+// UNTOUCHED rather than zeroed (whose argmax would degenerate to token 0).
+procedure TTestNeuralDecode.TestConstraintMaskFallbackLeavesRowUntouched;
+var
+  V: TNNetVolume;
+  CEmpty, CZeroMass: TNNetAllowedTokensConstraint;
+  I: integer;
+begin
+  V := TNNetVolume.Create(6, 1, 1);
+  CEmpty := TNNetAllowedTokensConstraint.Create([]);
+  CZeroMass := TNNetAllowedTokensConstraint.Create([5]);
+  try
+    for I := 0 to 4 do V.Raw[I] := 0.2;
+    V.Raw[5] := 0; // the only whitelisted token has zero probability
+    CEmpty.MaskAllowed(V);
+    for I := 0 to 4 do
+      AssertEquals('empty whitelist leaves element ' + IntToStr(I),
+        0.2, V.Raw[I], 1e-6);
+    CZeroMass.MaskAllowed(V);
+    for I := 0 to 4 do
+      AssertEquals('zero allowed mass leaves element ' + IntToStr(I),
+        0.2, V.Raw[I], 1e-6);
+    AssertEquals('zero allowed mass leaves the allowed element too',
+      0.0, V.Raw[5], 1e-9);
+  finally
+    CZeroMass.Free;
+    CEmpty.Free;
+    V.Free;
+  end;
+end;
+
+// The constrained overload with Constraint=nil must produce exactly the same
+// stream (length and tokens) as the plain overload - fixed seed, same net.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedNilConstraintMatchesPlain;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  PlainToks, ConToks: TNeuralIntegerArray;
+  PlainLen, ConLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(PlainToks, PromptLen);
+    SetLength(ConToks, PromptLen);
+    PlainToks[0] := 5; PlainToks[1] := 2; PlainToks[2] := 9;
+    for T := 0 to PromptLen - 1 do ConToks[T] := PlainToks[T];
+
+    PlainLen := GenerateTokensStreamed(Session, PlainToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    ConLen := GenerateTokensStreamed(Session, ConToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, nil, nil, nil);
+
+    AssertEquals('same length with nil constraint', PlainLen, ConLen);
+    for T := PromptLen to PlainLen - 1 do
+      AssertEquals('token at pos ' + IntToStr(T), PlainToks[T], ConToks[T]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// A static whitelist on the streamed path: every generated token must come
+// from the whitelist; EOS is NOT whitelisted, so generation runs to the cap.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedWhitelistOnlyEmitsAllowed;
+const
+  SeqLen = 12;
+  PromptLen = 2;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Whitelist: TNNetAllowedTokensConstraint;
+  Toks: TNeuralIntegerArray;
+  OutLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  // The constraint path expects POST-SOFTMAX probabilities (the masking
+  // renormalizes a probability row): cap both twins with a per-position
+  // softmax, exactly like the penalty test.
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Whitelist := TNNetAllowedTokensConstraint.Create([5, 8]);
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(Toks, PromptLen);
+    Toks[0] := 3; Toks[1] := 9;
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, nil, nil, Whitelist);
+    AssertEquals('EOS blocked: generation runs to the cap', SeqLen, OutLen);
+    for T := PromptLen to OutLen - 1 do
+      AssertTrue('token at pos ' + IntToStr(T) + ' is whitelisted (got ' +
+        IntToStr(Toks[T]) + ')', (Toks[T] = 5) or (Toks[T] = 8));
+  finally
+    Whitelist.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Forced-sequence (trie) constraint: the head is rigged so unconstrained
+// greedy always emits 'dog' - which starts NO candidate. The constraint must
+// force generation down a candidate it would never pick ('cat apple'),
+// complete exactly that one candidate, and then allow EOS.
+procedure TTestNeuralDecode.TestForcedSequenceConstraintFollowsCandidate;
+const
+  SeqLen = 10;
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'apple', 'blue', 'cat',
+    'dog', 'egg', 'fox', 'gold', 'hat', 'ice', 'jam');
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Dict: TStringListInt;
+  Forced: TNNetForcedSequenceConstraint;
+  Toks, FreeToks, CatToks, AppleToks, DogToks: TNeuralIntegerArray;
+  PromptLen, OutLen, FreeLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Twin := BuildTinySSMLM(1);
+  Session := nil;
+  Forced := nil;
+  Dict := TStringListInt.Create();
+  try
+    // With LazUtils linked, locale-aware collation would sort '<eos>'/'<pad>'
+    // AFTER the alphabetic words, breaking the "special ids < 2" convention
+    // this test (and the constraint's EOS handling) relies on.
+    Dict.UseLocale := false;
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+    Dict.Tokenize('dog', DogToks);
+    Dict.Tokenize('cat', CatToks);
+    Dict.Tokenize('apple', AppleToks);
+    AssertEquals('special tokens keep ids < 2 (UseLocale=false)',
+      2, AppleToks[0]);
+    // Rig the logit head to constant 'dog', then cap with softmax (the
+    // constraint renormalizes a probability row).
+    RigHeadToConstantToken(Full, DogToks[0]);
+    Full.AddLayer(TNNetPointwiseSoftMax.Create());
+    Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    Forced := TNNetForcedSequenceConstraint.Create(Dict,
+      ['cat apple', 'egg jam']);
+
+    // Unconstrained reference: greedy emits 'dog' (not any candidate start).
+    Dict.Tokenize('blue hat', FreeToks);
+    PromptLen := Length(FreeToks);
+    FreeLen := GenerateTokensStreamed(Session, FreeToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    AssertTrue('reference generated something', FreeLen > PromptLen);
+    AssertEquals('unconstrained greedy picks the rigged token',
+      DogToks[0], FreeToks[PromptLen]);
+
+    // Constrained run: forced down 'cat apple' ('cat' < 'egg' in id order,
+    // probabilities tie at the rigged head), then EOS.
+    Dict.Tokenize('blue hat', Toks);
+    OutLen := GenerateTokensStreamed(Session, Toks, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, nil, nil, Forced);
+    AssertEquals('candidate + EOS generated', PromptLen + 3, OutLen);
+    AssertEquals('first forced token is cat', CatToks[0], Toks[PromptLen]);
+    AssertEquals('second forced token is apple',
+      AppleToks[0], Toks[PromptLen + 1]);
+    AssertTrue('then a special/EOS token', Toks[PromptLen + 2] < 2);
+    AssertTrue('constraint reports completion', Forced.Completed());
+  finally
+    Forced.Free;
+    Dict.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// PrepareTokenHealing without a model: on a vocabulary holding 'egg',
+// 'egging' and 'eggs', a prompt ending in 'egg' must yield a one-shot
+// constraint allowing EXACTLY the egg-prefixed tokens, decrement PromptLen
+// and report the dropped id; Commit lifts the restriction and Reset re-arms
+// it. Healing must be SKIPPED (nil, PromptLen untouched) for a 1-token
+// prompt and for a last token without any strict extension.
+procedure TTestNeuralDecode.TestPrepareTokenHealingBuildsPrefixSetAndTrims;
+const
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'blue', 'cat', 'dog',
+    'egg', 'egging', 'eggs', 'fox', 'gold', 'hat', 'ice');
+var
+  Dict: TStringListInt;
+  Toks: TNeuralIntegerArray;
+  C: TNNetTokenHealingConstraint;
+  PromptLen, Dropped, T: integer;
+begin
+  Dict := TStringListInt.Create();
+  C := nil;
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+
+    Dict.Tokenize('cat egg', Toks);
+    PromptLen := Length(Toks);
+    AssertEquals('prompt tokenizes to 2 ids', 2, PromptLen);
+    C := PrepareTokenHealing(Dict, Toks, PromptLen, Dropped);
+    AssertTrue('healing applies', C <> nil);
+    AssertEquals('prompt len trimmed by one', 1, PromptLen);
+    AssertEquals('dropped id is egg', Dict.WordToIndex('egg'), Dropped);
+    for T := 0 to Dict.GetVocabCount() - 1 do
+      AssertEquals('step-1 allowance of "' + Dict.DeTokenize(T) + '"',
+        Copy(Dict.DeTokenize(T), 1, 3) = 'egg', C.TokenAllowed(T));
+    C.Commit(Dict.WordToIndex('eggs'));
+    AssertTrue('constraint lifted after the first emission',
+      C.TokenAllowed(Dict.WordToIndex('dog')));
+    C.Reset([]);
+    AssertTrue('Reset re-arms the one-shot restriction',
+      not C.TokenAllowed(Dict.WordToIndex('dog')));
+    FreeAndNil(C);
+
+    // 1-token prompt: healing would empty it - skipped.
+    Dict.Tokenize('egg', Toks);
+    PromptLen := Length(Toks);
+    C := PrepareTokenHealing(Dict, Toks, PromptLen, Dropped);
+    AssertTrue('1-token prompt is not healed', C = nil);
+    AssertEquals('prompt len untouched', 1, PromptLen);
+
+    // Last token with no strict extension: provable no-op - skipped.
+    Dict.Tokenize('cat hat', Toks);
+    PromptLen := Length(Toks);
+    C := PrepareTokenHealing(Dict, Toks, PromptLen, Dropped);
+    AssertTrue('no strict extension - not healed', C = nil);
+    AssertEquals('prompt len untouched without extensions', 2, PromptLen);
+  finally
+    C.Free;
+    Dict.Free;
+  end;
+end;
+
+// End-to-end token healing on a rigged head whose healed and unhealed
+// first-token distributions PROVABLY differ: probabilities are ordered
+// dog > eggs > egg > egging, so an unhealed greedy run from 'cat egg' emits
+// 'dog' first, while the healed run drops 'egg', masks step 1 to the
+// egg-prefixed tokens and emits 'eggs' (the argmax of the allowed set),
+// then continues unconstrained with 'dog'. Pinned both at the token level
+// (PrepareTokenHealing + Constraint overload) and at the string level
+// (TGenerationConfig.TokenHealing through GenerateStringWithConfig).
+procedure TTestNeuralDecode.TestTokenHealingChangesFirstTokenVsUnhealed;
+const
+  SeqLen = 9;
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'blue', 'cat', 'dog',
+    'egg', 'egging', 'eggs', 'fox', 'gold', 'hat', 'ice');
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Dict: TStringListInt;
+  Head: TNNetLayer;
+  UToks, HToks: TNeuralIntegerArray;
+  C: TNNetTokenHealingConstraint;
+  Config: TGenerationConfig;
+  PromptLen, Dropped, T, ULen, HLen: integer;
+  Unhealed, Healed: string;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  C := nil;
+  Dict := TStringListInt.Create();
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+    AssertEquals('vocab matches the tiny LM', csStreamVocab,
+      Dict.GetVocabCount());
+    // Rig the head to a CONSTANT graded distribution:
+    // dog > eggs > egg > egging > everything else.
+    Head := Full.GetLastLayer();
+    for T := 0 to Head.Neurons.Count - 1 do
+    begin
+      Head.Neurons[T].Weights.Fill(0);
+      Head.Neurons[T].BiasWeight := 0;
+    end;
+    Head.Neurons[Dict.WordToIndex('dog')].BiasWeight := 5;
+    Head.Neurons[Dict.WordToIndex('eggs')].BiasWeight := 3;
+    Head.Neurons[Dict.WordToIndex('egg')].BiasWeight := 2;
+    Head.Neurons[Dict.WordToIndex('egging')].BiasWeight := 1;
+    Head.MulWeights(1.0); // no-op refresh of packed weight copies
+    Full.AddLayer(TNNetPointwiseSoftMax.Create());
+    Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    // Token level. Unhealed greedy baseline: 'dog' twice.
+    Dict.Tokenize('cat egg', UToks);
+    PromptLen := Length(UToks);
+    AssertEquals('prompt tokenizes to 2 ids', 2, PromptLen);
+    ULen := GenerateTokensStreamed(Session, UToks, PromptLen, 2, SeqLen);
+    AssertEquals('unhealed generates 2 tokens', PromptLen + 2, ULen);
+    AssertEquals('unhealed first token is dog',
+      Dict.WordToIndex('dog'), UToks[PromptLen]);
+    // Healed: drop 'egg', constrain step 1 to its extensions.
+    Dict.Tokenize('cat egg', HToks);
+    PromptLen := Length(HToks);
+    C := PrepareTokenHealing(Dict, HToks, PromptLen, Dropped);
+    AssertTrue('healing constraint built', C <> nil);
+    AssertEquals('healed prompt is 1 token', 1, PromptLen);
+    HLen := GenerateTokensStreamed(Session, HToks, PromptLen, 2, SeqLen,
+      nil, nil, nil, C);
+    AssertEquals('healed generates 2 tokens', PromptLen + 2, HLen);
+    AssertEquals('healed first token is eggs (argmax of the allowed set)',
+      Dict.WordToIndex('eggs'), HToks[PromptLen]);
+    AssertTrue('healed and unhealed first tokens differ',
+      HToks[1] <> UToks[2]);
+    AssertEquals('healed second step is unconstrained again (dog)',
+      Dict.WordToIndex('dog'), HToks[PromptLen + 1]);
+
+    // String level: TGenerationConfig.TokenHealing, pinned results.
+    Config := DefaultGenerationConfig(2, SeqLen);
+    Unhealed := GenerateStringWithConfig(Session, Dict, 'cat egg', Config);
+    AssertEquals('unhealed string pinned', 'cat egg dog dog', Unhealed);
+    Config.TokenHealing := true;
+    Healed := GenerateStringWithConfig(Session, Dict, 'cat egg', Config);
+    AssertEquals('healed string pinned', 'cat eggs dog', Healed);
+    AssertTrue('healed text differs from the unhealed run',
+      Healed <> Unhealed);
+  finally
+    C.Free;
+    Dict.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// Driving the automaton directly: object context transitions. After '{' only
+// a key string, '}' or whitespace may follow - never ']' or a bare value.
+procedure TTestNeuralDecode.TestJSONStateMachineObjectTransitions;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('open object', M.FeedChar('{'));
+    AssertTrue('after { a key quote is allowed', M.CharAllowed('"'));
+    AssertTrue('after { an immediate } is allowed', M.CharAllowed('}'));
+    AssertTrue('after { whitespace is allowed', M.CharAllowed(' '));
+    AssertTrue('after { ] is NOT allowed', not M.CharAllowed(']'));
+    AssertTrue('after { a digit is NOT allowed', not M.CharAllowed('5'));
+    AssertTrue('after { a comma is NOT allowed', not M.CharAllowed(','));
+    AssertTrue('key string', M.FeedString('"a"'));
+    AssertTrue('after key only a colon', M.CharAllowed(':'));
+    AssertTrue('no } right after a key', not M.CharAllowed('}'));
+    AssertTrue('no , right after a key', not M.CharAllowed(','));
+    AssertTrue('colon', M.FeedChar(':'));
+    AssertTrue('value position accepts a digit', M.CharAllowed('5'));
+    AssertTrue('value position accepts a string', M.CharAllowed('"'));
+    AssertTrue('no } right after the colon', not M.CharAllowed('}'));
+    AssertTrue('number value', M.FeedChar('1'));
+    AssertTrue('} closes (and first completes the number)',
+      M.FeedChar('}'));
+    AssertTrue('complete top-level object', M.IsComplete());
+    AssertEquals('stack fully popped', 0, M.StackDepth());
+    // No trailing comma: '{"a":1,' must require another key.
+    M.Reset();
+    AssertTrue('reopen', M.FeedString('{"a":1,'));
+    AssertTrue('after , a key is required', M.CharAllowed('"'));
+    AssertTrue('no } after a trailing comma', not M.CharAllowed('}'));
+  finally
+    M.Free;
+  end;
+end;
+
+// String state: most characters are content; an unescaped quote closes;
+// raw control characters are rejected; escapes are validated.
+procedure TTestNeuralDecode.TestJSONStateMachineStringAndEscapes;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('open string', M.FeedChar('"'));
+    AssertTrue('plain char allowed', M.CharAllowed('x'));
+    AssertTrue('structural chars are plain content in a string',
+      M.CharAllowed('{'));
+    AssertTrue('closing quote allowed', M.CharAllowed('"'));
+    AssertTrue('raw newline rejected in a string', not M.CharAllowed(#10));
+    AssertTrue('raw control char rejected', not M.CharAllowed(#1));
+    AssertTrue('backslash starts an escape', M.FeedChar('\'));
+    AssertTrue('\n escape allowed', M.CharAllowed('n'));
+    AssertTrue('escaped quote allowed', M.CharAllowed('"'));
+    AssertTrue('unicode escape allowed', M.CharAllowed('u'));
+    AssertTrue('invalid escape char rejected', not M.CharAllowed('x'));
+    AssertTrue('take the unicode escape', M.FeedChar('u'));
+    AssertTrue('hex digit required', not M.CharAllowed('g'));
+    AssertTrue('4 hex digits', M.FeedString('0Ab9'));
+    AssertTrue('back in the string: content again', M.CharAllowed('x'));
+    AssertTrue('unescaped quote closes', M.FeedChar('"'));
+    AssertTrue('top-level string value complete', M.IsComplete());
+  finally
+    M.Free;
+  end;
+end;
+
+// Number grammar: [-] int frac? exp? with no leading zeros, mandatory digits
+// after '-', '.' and 'e'; an unterminated complete number at top level
+// counts as a complete value.
+procedure TTestNeuralDecode.TestJSONStateMachineNumbers;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('minus', M.FeedChar('-'));
+    AssertTrue('- alone is not complete', not M.IsComplete());
+    AssertTrue('-- rejected', not M.CharAllowed('-'));
+    AssertTrue('-] rejected', not M.CharAllowed(']'));
+    AssertTrue('digit after minus', M.FeedChar('0'));
+    AssertTrue('-0 is complete', M.IsComplete());
+    AssertTrue('no digits after a leading zero', not M.CharAllowed('1'));
+    AssertTrue('fraction allowed after 0', M.FeedChar('.'));
+    AssertTrue('. needs a digit, not e', not M.CharAllowed('e'));
+    AssertTrue('-0. is not complete', not M.IsComplete());
+    AssertTrue('fraction digit', M.FeedChar('5'));
+    AssertTrue('-0.5 is complete', M.IsComplete());
+    AssertTrue('exponent marker', M.FeedChar('e'));
+    AssertTrue('-0.5e is not complete', not M.IsComplete());
+    AssertTrue('exponent sign allowed', M.FeedChar('+'));
+    AssertTrue('second sign rejected', not M.CharAllowed('+'));
+    AssertTrue('exponent digit', M.FeedChar('2'));
+    AssertTrue('-0.5e+2 is complete', M.IsComplete());
+    // Plain int and the leading-zero rule from a fresh start.
+    M.Reset();
+    AssertTrue('42', M.FeedString('42'));
+    AssertTrue('42 is a complete top-level value', M.IsComplete());
+    AssertTrue('no second top-level value', not M.CharAllowed('"'));
+    M.Reset();
+    AssertTrue('0', M.FeedChar('0'));
+    AssertTrue('01 is rejected (leading zero)', not M.CharAllowed('1'));
+  finally
+    M.Free;
+  end;
+end;
+
+// After a complete top-level value, only whitespace may follow (EOS/nothing
+// at the token level): no new value, no closer, no digits.
+procedure TTestNeuralDecode.TestJSONStateMachineTopLevelCompletionAllowsOnlyWS;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('top-level string', M.FeedString('"hi"'));
+    AssertTrue('complete', M.IsComplete());
+    AssertTrue('trailing whitespace ok', M.CharAllowed(' '));
+    AssertTrue('no second value {', not M.CharAllowed('{'));
+    AssertTrue('no second value "', not M.CharAllowed('"'));
+    AssertTrue('no digit', not M.CharAllowed('1'));
+    AssertTrue('no stray ]', not M.CharAllowed(']'));
+    AssertTrue('no stray }', not M.CharAllowed('}'));
+    AssertTrue('feeding whitespace keeps it complete',
+      M.FeedChar(' ') and M.IsComplete());
+  finally
+    M.Free;
+  end;
+end;
+
+// Balanced-stack closing: each close must match the innermost opener.
+procedure TTestNeuralDecode.TestJSONStateMachineBalancedStackClosing;
+var
+  M: TNNetJSONStateMachine;
+begin
+  M := TNNetJSONStateMachine.Create();
+  try
+    AssertTrue('[[{', M.FeedString('[[{'));
+    AssertEquals('three open containers', 3, M.StackDepth());
+    AssertTrue('innermost is an object: ] rejected', not M.CharAllowed(']'));
+    AssertTrue('close the object', M.FeedChar('}'));
+    AssertEquals('two left', 2, M.StackDepth());
+    AssertTrue('now } is rejected (innermost is an array)',
+      not M.CharAllowed('}'));
+    AssertTrue('comma then another value is fine', M.CharAllowed(','));
+    AssertTrue('close inner array', M.FeedChar(']'));
+    AssertTrue('not complete yet', not M.IsComplete());
+    AssertTrue('close outer array', M.FeedChar(']'));
+    AssertTrue('balanced: complete', M.IsComplete());
+    AssertEquals('stack empty', 0, M.StackDepth());
+    AssertTrue('no further ]', not M.CharAllowed(']'));
+  finally
+    M.Free;
+  end;
+end;
+
+// Token-level constraint over MULTI-CHARACTER (BPE-style) tokens: a token is
+// allowed exactly when ALL its characters are legal continuations, validated
+// transitively through a cloned automaton; EOS (< 2) only at completion.
+procedure TTestNeuralDecode.TestJSONConstraintValidatesMultiCharTokens;
+var
+  Dict: TStringListInt;
+  C: TNNetJSONConstraint;
+begin
+  Dict := TStringListInt.Create();
+  C := nil;
+  try
+    // Insertion order = token id (no sorting; SaveCurrentPosition snapshots
+    // the id->string map the constraint reads via DeTokenize).
+    Dict.Add('<eos>');   // 0
+    Dict.Add('<pad>');   // 1
+    Dict.Add('{"k":');   // 2
+    Dict.Add('true');    // 3
+    Dict.Add('}');       // 4
+    Dict.Add(']');       // 5
+    Dict.Add('[1,');     // 6
+    Dict.SaveCurrentPosition();
+    C := TNNetJSONConstraint.Create(Dict);
+    C.Reset([]);
+    AssertTrue('multi-char object opener allowed at start', C.TokenAllowed(2));
+    AssertTrue('literal value allowed at start', C.TokenAllowed(3));
+    AssertTrue('array opener with content allowed at start',
+      C.TokenAllowed(6));
+    AssertTrue('lone } not allowed at start', not C.TokenAllowed(4));
+    AssertTrue('lone ] not allowed at start', not C.TokenAllowed(5));
+    AssertTrue('EOS not allowed before any value', not C.TokenAllowed(0));
+    C.Commit(2); // '{"k":' - expecting a value now
+    AssertTrue('value token allowed after the colon', C.TokenAllowed(3));
+    AssertTrue('} not allowed right after the colon', not C.TokenAllowed(4));
+    AssertTrue('] never matches an object', not C.TokenAllowed(5));
+    AssertTrue('EOS not allowed mid-object', not C.TokenAllowed(0));
+    C.Commit(3); // 'true' - value done, object still open
+    AssertTrue('} closes the object now', C.TokenAllowed(4));
+    AssertTrue('] still illegal', not C.TokenAllowed(5));
+    C.Commit(4); // '}' - complete top-level value
+    AssertTrue('EOS allowed once complete', C.TokenAllowed(0));
+    AssertTrue('PAD allowed once complete', C.TokenAllowed(1));
+    AssertTrue('no second value', not C.TokenAllowed(2));
+    AssertTrue('machine agrees', C.Machine.IsComplete());
+  finally
+    C.Free;
+    Dict.Free;
+  end;
+end;
+
+// Fuzz-ish: random walks over the ALLOWED transitions must always yield
+// strings fpjson parses once the automaton reports completion (and must
+// never reject a character it just reported as allowed).
+procedure TTestNeuralDecode.TestJSONStateMachineFuzzRandomWalksStayValid;
+const
+  Alphabet = '{}[]",:0123456789.eE+-truefalsn x';
+  Closers = '"}]1:';
+var
+  M: TNNetJSONStateMachine;
+  Parsed: TJSONData;
+  S: string;
+  AllowedList: array[1..64] of char;
+  Walk, Step, I, AllowedCnt, CompletedCnt: integer;
+  C: char;
+begin
+  RandSeed := 31337;
+  M := TNNetJSONStateMachine.Create();
+  CompletedCnt := 0;
+  try
+    for Walk := 1 to 25 do
+    begin
+      M.Reset();
+      S := '';
+      for Step := 1 to 300 do
+      begin
+        if M.IsComplete() then break;
+        C := #0;
+        // Closing phase (always after step 60, half the time before): take
+        // the first allowed char from a closing-priority list so walks
+        // terminate instead of nesting forever.
+        if (Step > 60) or (Random(2) = 0) then
+          for I := 1 to Length(Closers) do
+            if M.CharAllowed(Closers[I]) then
+            begin
+              C := Closers[I];
+              break;
+            end;
+        if C = #0 then
+        begin
+          // Random pick among the allowed alphabet characters. In a literal
+          // state exactly one character is allowed, so walks always advance.
+          AllowedCnt := 0;
+          for I := 1 to Length(Alphabet) do
+            if M.CharAllowed(Alphabet[I]) then
+            begin
+              Inc(AllowedCnt);
+              AllowedList[AllowedCnt] := Alphabet[I];
+            end;
+          AssertTrue('walk ' + IntToStr(Walk) + ' step ' + IntToStr(Step) +
+            ': some character must be allowed (got stuck after "' + S + '")',
+            AllowedCnt > 0);
+          C := AllowedList[1 + Random(AllowedCnt)];
+        end;
+        AssertTrue('walk ' + IntToStr(Walk) + ': allowed char ''' + C +
+          ''' must be accepted after "' + S + '"', M.FeedChar(C));
+        S := S + C;
+      end;
+      if M.IsComplete() and (S <> '') then
+      begin
+        Inc(CompletedCnt);
+        try
+          Parsed := GetJSON(S);
+          Parsed.Free;
+        except
+          on E: Exception do
+            Fail('walk ' + IntToStr(Walk) + ' produced invalid JSON "' + S +
+              '": ' + E.Message);
+        end;
+      end;
+    end;
+    AssertTrue('most walks reach a complete value (got ' +
+      IntToStr(CompletedCnt) + '/25)', CompletedCnt >= 15);
+  finally
+    M.Free;
+  end;
+end;
+
+// Model-integration: a tiny char-level streamed LM whose head LOVES EOS
+// (then '}', '{', '"'). Unconstrained greedy emits EOS immediately (no JSON
+// at all); JSON-constrained greedy is forced to open and close an object
+// before EOS becomes legal - and the result parses.
+procedure TTestNeuralDecode.TestGenerateTokensStreamedJSONConstraintEmitsParseableJSON;
+const
+  CharVocab = 128;
+var
+  Net: TNNet;
+  Head: TNNetLayer;
+  Session: TNNetStreamingDecoder;
+  Constraint: TNNetJSONConstraint;
+  Toks: TNeuralIntegerArray;
+  Parsed: TJSONData;
+  OutLen, FreeLen, T, N: integer;
+  Emitted: string;
+begin
+  RandSeed := 424242;
+  // Width-1 char-level LM (token id = character code), built directly at the
+  // decode width - no full-width twin needed because nothing is compared
+  // against a full forward here.
+  Net := TNNet.Create();
+  Net.AddLayer(TNNetInput.Create(1, 1, 1));
+  Net.AddLayer(TNNetEmbedding.Create(CharVocab, 8, 0, 0.02));
+  Net.AddLayer(TNNetPointwiseConvLinear.Create(8));
+  Net.AddLayer(TNNetDiagonalSSM.Create());
+  Net.AddLayer(TNNetPointwiseConvLinear.Create(CharVocab));
+  Head := Net.GetLastLayer();
+  Net.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  Constraint := TNNetJSONConstraint.CreateCharLevel(CharVocab);
+  try
+    // Rig the logit head: EOS(1) > '}' > '{' > '"' > everything else.
+    for N := 0 to Head.Neurons.Count - 1 do
+    begin
+      Head.Neurons[N].Weights.Fill(0);
+      Head.Neurons[N].BiasWeight := 0;
+    end;
+    Head.Neurons[1].BiasWeight := 10;
+    Head.Neurons[Ord('}')].BiasWeight := 9;
+    Head.Neurons[Ord('{')].BiasWeight := 8;
+    Head.Neurons[Ord('"')].BiasWeight := 7;
+    // No-op refresh so the conv layer's packed weights see the hand edits
+    // (this net is computed directly, with no CopyWeights to refresh it).
+    Head.MulWeights(1.0);
+    Session := TNNetStreamingDecoder.Create(Net, 32);
+
+    // Unconstrained reference: EOS on the very first step.
+    SetLength(Toks, 1);
+    Toks[0] := Ord('a');
+    FreeLen := GenerateTokensStreamed(Session, Toks, 1, 10, 32);
+    AssertEquals('unconstrained greedy stops at EOS immediately', 2, FreeLen);
+    AssertEquals('the free token IS the EOS', 1, Toks[1]);
+
+    // JSON-constrained: EOS is masked until a complete value stands, so the
+    // model is walked through '{' (best allowed) then '}' (best allowed in
+    // the object) and only THEN may stop.
+    SetLength(Toks, 0);
+    SetLength(Toks, 1);
+    Toks[0] := Ord('a');
+    OutLen := GenerateTokensStreamed(Session, Toks, 1, 10, 32,
+      nil, nil, nil, Constraint);
+    Emitted := '';
+    for T := 1 to OutLen - 1 do
+    begin
+      if Toks[T] < 2 then break;
+      Emitted := Emitted + Chr(Toks[T]);
+    end;
+    AssertEquals('constrained generation emits an empty object',
+      '{}', Emitted);
+    AssertEquals('then stops at EOS', 1, Toks[OutLen - 1]);
+    try
+      Parsed := GetJSON(Emitted);
+      Parsed.Free;
+    except
+      on E: Exception do
+        Fail('constrained output "' + Emitted + '" is not parseable JSON: ' +
+          E.Message);
+    end;
+  finally
+    Constraint.Free;
+    Session.Free;
+    Net.Free;
+  end;
+end;
+
+// Same JSON-mode gate on the full-re-encode DecodeGreedy path (char-level
+// one-hot net): unconstrained = immediate EOS, constrained = '{}'.
+procedure TTestNeuralDecode.TestDecodeGreedyJSONConstraintEmitsParseableJSON;
+const
+  CharVocab = 128;
+var
+  NN: TNNet;
+  Logit: TNNetLayer;
+  Constraint: TNNetJSONConstraint;
+  Plain, Constrained: TNNetDecodeResult;
+  Parsed: TJSONData;
+  N: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildTinyNet(8, CharVocab);
+  Constraint := TNNetJSONConstraint.CreateCharLevel(CharVocab);
+  try
+    // Rig the LOGIT layer (the SoftMax head has no neurons): EOS first.
+    Logit := NN.Layers[NN.Layers.Count - 2];
+    for N := 0 to Logit.Neurons.Count - 1 do
+    begin
+      Logit.Neurons[N].Weights.Fill(0);
+      Logit.Neurons[N].BiasWeight := 0;
+    end;
+    Logit.Neurons[1].BiasWeight := 10;
+    Logit.Neurons[Ord('}')].BiasWeight := 9;
+    Logit.Neurons[Ord('{')].BiasWeight := 8;
+    Logit.Neurons[Ord('"')].BiasWeight := 7;
+
+    Plain := DecodeGreedy(NN, 'q', 6);
+    AssertEquals('unconstrained: immediate EOS, empty text', '', Plain.Text);
+    AssertEquals('unconstrained finishes on EOS', True, Plain.Finished);
+
+    Constrained := DecodeGreedy(NN, 'q', 6, [], Constraint);
+    AssertEquals('constrained text is an empty object', '{}',
+      Constrained.Text);
+    AssertEquals('constrained run finishes on the now-legal EOS',
+      True, Constrained.Finished);
+    try
+      Parsed := GetJSON(Constrained.Text);
+      Parsed.Free;
+    except
+      on E: Exception do
+        Fail('constrained DecodeGreedy output "' + Constrained.Text +
+          '" is not parseable JSON: ' + E.Message);
+    end;
+  finally
+    Constraint.Free;
+    NN.Free;
+  end;
+end;
+
+function TTestNeuralDecode.FixturePath(const FileName: string): string;
+begin
+  Result := 'fixtures' + DirectorySeparator + FileName;
+  if not FileExists(Result) then
+    Result := 'tests' + DirectorySeparator + 'fixtures' + DirectorySeparator +
+      FileName;
+  if not FileExists(Result) then
+    Fail('Fixture not found: ' + FileName +
+      ' (run python3 tools/t5_tiny_fixture.py from the repo root).');
+end;
+
+// Greedy seq2seq decode on the committed T5 v1.0 pico pair: (a) two runs
+// produce identical token ids (deterministic) within the caps and the vocab;
+// (b) EOS may only ever be the LAST emitted token, and rigging EOS to the
+// run's own first token forces an immediate single-token EOS stop; (c) the
+// first generated token equals the argmax of row 0 of a single RunT5 call
+// whose decoder input is the start token (the consistency oracle - causal
+// self-attention makes the padded suffix invisible to row 0).
+procedure TTestNeuralDecode.TestDecodeSeq2SeqGreedyT5DeterministicEOSAndOracle;
+const
+  Src: array[0..9] of integer = (3, 7, 1, 11, 4, 9, 2, 8, 5, 12);
+  StartId = 0; // T5 decoder_start_token_id
+  EOSId = 1;   // T5 eos_token_id
+var
+  Enc, Dec: TNNet;
+  Config: TT5Config;
+  G1, G2, ForcedEOS: TNeuralIntegerArray;
+  EncToks, DecToks, Logits: TNNetVolume;
+  I, OracleArgmax: integer;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  EncToks := TNNetVolume.Create(10, 1, 1);
+  DecToks := TNNetVolume.Create(6, 1, 1);
+  Logits := TNNetVolume.Create();
+  try
+    G1 := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, EOSId, 5);
+    G2 := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, EOSId, 5);
+    AssertTrue('greedy generated something', Length(G1) >= 1);
+    AssertTrue('greedy respects MaxNewTokens', Length(G1) <= 5);
+    AssertEquals('greedy is deterministic (length)', Length(G1), Length(G2));
+    for I := 0 to High(G1) do
+    begin
+      AssertEquals('greedy is deterministic (token ' + IntToStr(I) + ')',
+        G1[I], G2[I]);
+      AssertTrue('token id in vocab',
+        (G1[I] >= 0) and (G1[I] < Config.VocabSize));
+      // EOS terminates generation, so it can only be the last element.
+      if G1[I] = EOSId then
+        AssertEquals('EOS only at the last position', High(G1), I);
+    end;
+    AssertTrue('stops at EOS or MaxNewTokens',
+      (G1[High(G1)] = EOSId) or (Length(G1) = 5));
+    // (b) Forced EOS stop: declare the run's own first token to be EOS - the
+    // decode must emit exactly that one token and stop.
+    ForcedEOS := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, G1[0], 5);
+    AssertEquals('EOS-on-first-token stops immediately', 1, Length(ForcedEOS));
+    AssertEquals('the EOS token is appended', G1[0], ForcedEOS[0]);
+    // (c) Consistency oracle: one RunT5 call with the start-token-padded
+    // decoder input; row 0's argmax must equal the first generated token.
+    for I := 0 to 9 do EncToks.FData[I] := Src[I];
+    for I := 0 to 5 do DecToks.FData[I] := StartId;
+    RunT5(Enc, Dec, EncToks, DecToks, Logits);
+    OracleArgmax := 0;
+    for I := 1 to Config.VocabSize - 1 do
+      if Logits.FData[I] > Logits.FData[OracleArgmax] then OracleArgmax := I;
+    AssertEquals('first greedy step matches the RunT5 row-0 argmax oracle',
+      OracleArgmax, G1[0]);
+  finally
+    Logits.Free;
+    DecToks.Free;
+    EncToks.Free;
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Sampling at Temperature -> 0 turns the softmaxed row into a one-hot at the
+// argmax, so probability-weighted samplers must reproduce the greedy
+// sequence token for token (the "temperature ~0 matches greedy" gate): TopP
+// falls back to the argmax once the top token alone exceeds P, and MinP's
+// weighted draw collapses onto the one-hot. TNNetSamplerTopK draws UNIFORMLY
+// among the top K (not probability-weighted), so only K=1 matches greedy -
+// covered as the degenerate deterministic case. A nil sampler must equal
+// greedy at ANY temperature (pure argmax path, no softmax computed).
+procedure TTestNeuralDecode.TestDecodeSeq2SeqSampledTempZeroMatchesGreedy;
+const
+  Src: array[0..9] of integer = (3, 7, 1, 11, 4, 9, 2, 8, 5, 12);
+var
+  Enc, Dec: TNNet;
+  Config: TT5Config;
+  Greedy, Sampled: TNeuralIntegerArray;
+  Sampler: TNNetSamplerBase;
+  I: integer;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  try
+    Greedy := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 5);
+    Sampler := TNNetSamplerTopK.Create(1);
+    try
+      Sampled := DecodeSeq2SeqSampled(Enc, Dec, Src, 0, 1, 5, Sampler, 1.0);
+    finally
+      Sampler.Free;
+    end;
+    AssertEquals('TopK(1) length matches greedy',
+      Length(Greedy), Length(Sampled));
+    for I := 0 to High(Greedy) do
+      AssertEquals('TopK(1) token ' + IntToStr(I), Greedy[I], Sampled[I]);
+    Sampler := TNNetSamplerTopP.Create(0.9);
+    try
+      Sampled := DecodeSeq2SeqSampled(Enc, Dec, Src, 0, 1, 5, Sampler, 1e-8);
+    finally
+      Sampler.Free;
+    end;
+    AssertEquals('TopP temp~0 length matches greedy',
+      Length(Greedy), Length(Sampled));
+    for I := 0 to High(Greedy) do
+      AssertEquals('TopP temp~0 token ' + IntToStr(I), Greedy[I], Sampled[I]);
+    Sampler := TNNetSamplerMinP.Create(0.5);
+    try
+      Sampled := DecodeSeq2SeqSampled(Enc, Dec, Src, 0, 1, 5, Sampler, 1e-8);
+    finally
+      Sampler.Free;
+    end;
+    AssertEquals('MinP temp~0 length matches greedy',
+      Length(Greedy), Length(Sampled));
+    for I := 0 to High(Greedy) do
+      AssertEquals('MinP temp~0 token ' + IntToStr(I), Greedy[I], Sampled[I]);
+    // nil sampler = greedy at any temperature (the argmax path ignores it).
+    Sampled := DecodeSeq2SeqSampled(Enc, Dec, Src, 0, 1, 5, nil, 7.5);
+    AssertEquals('nil sampler length matches greedy',
+      Length(Greedy), Length(Sampled));
+    for I := 0 to High(Greedy) do
+      AssertEquals('nil sampler token ' + IntToStr(I), Greedy[I], Sampled[I]);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// The harness is GENERIC over the two-net convention: the post-norm Marian
+// pico pair (decoder_start = pad = 12, eos = 0) decodes deterministically,
+// matches the same RunT5 row-0 argmax oracle, and a MaxNewTokens larger
+// than the decoder's build-time DecSeqLen is capped by the capacity.
+procedure TTestNeuralDecode.TestDecodeSeq2SeqGreedyMarianPairAndCapacity;
+const
+  Src: array[0..9] of integer = (5, 2, 9, 0, 7, 11, 3, 8, 1, 10);
+  StartId = 12; // Marian decoder_start_token_id = pad_token_id
+  EOSId = 0;    // Marian eos_token_id
+var
+  Enc, Dec: TNNet;
+  Config: TMarianConfig;
+  G1, G2: TNeuralIntegerArray;
+  EncToks, DecToks, Logits: TNNetVolume;
+  I, OracleArgmax: integer;
+begin
+  RandSeed := 424242;
+  BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_marian_config.json'));
+  EncToks := TNNetVolume.Create(10, 1, 1);
+  DecToks := TNNetVolume.Create(6, 1, 1);
+  Logits := TNNetVolume.Create();
+  try
+    // MaxNewTokens 99 >> DecSeqLen 6: capped by the build-time capacity
+    // (6 tokens at most - the 6th is generated from the full-width prefix).
+    G1 := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, EOSId, 99);
+    G2 := DecodeSeq2SeqGreedy(Enc, Dec, Src, StartId, EOSId, 99);
+    AssertTrue('marian greedy generated something', Length(G1) >= 1);
+    AssertTrue('capacity caps generation at DecSeqLen', Length(G1) <= 6);
+    AssertEquals('marian greedy deterministic (length)',
+      Length(G1), Length(G2));
+    for I := 0 to High(G1) do
+    begin
+      AssertEquals('marian greedy deterministic (token ' + IntToStr(I) + ')',
+        G1[I], G2[I]);
+      AssertTrue('marian token id in vocab',
+        (G1[I] >= 0) and (G1[I] < Config.VocabSize));
+      if G1[I] = EOSId then
+        AssertEquals('marian EOS only at the last position', High(G1), I);
+    end;
+    // Same consistency oracle as the T5 test, through the shared RunT5 path.
+    for I := 0 to 9 do EncToks.FData[I] := Src[I];
+    for I := 0 to 5 do DecToks.FData[I] := StartId;
+    RunT5(Enc, Dec, EncToks, DecToks, Logits);
+    OracleArgmax := 0;
+    for I := 1 to Config.VocabSize - 1 do
+      if Logits.FData[I] > Logits.FData[OracleArgmax] then OracleArgmax := I;
+    AssertEquals('marian first greedy step matches the RunT5 oracle',
+      OracleArgmax, G1[0]);
+  finally
+    Logits.Free;
+    DecToks.Free;
+    EncToks.Free;
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Validation: a wrong source length and a decoder without a second
+// TNNetInput raise EArgumentException; MaxNewTokens < 1 returns empty.
+procedure TTestNeuralDecode.TestDecodeSeq2SeqRejectsInvalidArguments;
+const
+  Src: array[0..9] of integer = (3, 7, 1, 11, 4, 9, 2, 8, 5, 12);
+var
+  Enc, Dec, SingleInput: TNNet;
+  Config: TT5Config;
+  G: TNeuralIntegerArray;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  try
+    try
+      DecodeSeq2SeqGreedy(Enc, Dec, [3, 7, 1], 0, 1, 5);
+      Fail('a 3-token source must be rejected (encoder built at 10)');
+    except
+      on EArgumentException do ; // expected
+    end;
+    SingleInput := BuildTinyNet(4, 8);
+    try
+      try
+        DecodeSeq2SeqGreedy(Enc, SingleInput, Src, 0, 1, 5);
+        Fail('a decoder without a second TNNetInput must be rejected');
+      except
+        on EArgumentException do ; // expected
+      end;
+    finally
+      SingleInput.Free;
+    end;
+    G := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 0);
+    AssertEquals('MaxNewTokens=0 returns empty', 0, Length(G));
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.BuildMarkovSeq2SeqPair(out Enc, Dec: TNNet;
+  out Emb: TNNetEmbedding; Vocab, EncSeqLen, DecSeqLen: integer);
+var
+  TokIn: TNNetLayer;
+begin
+  // Identity "encoder": (EncSeqLen,1,1) in = out, so the decoder's second
+  // input is sized EncSeqLen to match.
+  Enc := TNNet.Create();
+  Enc.AddLayer(TNNetInput.Create(EncSeqLen, 1, 1));
+  Enc.AddLayer(TNNetIdentity.Create());
+  // Markov decoder: token ids -> embedding row = next-token logits given the
+  // PREVIOUS token only (row r reads the token at position r, so causality
+  // holds trivially and the padded suffix never influences earlier rows).
+  Dec := TNNet.Create();
+  TokIn := Dec.AddLayer(TNNetInput.Create(DecSeqLen, 1, 1));
+  // The second TNNetInput the two-net convention requires (filled by the
+  // decode routines with the cached encoder states; unused by the chain).
+  Dec.AddLayerAfter(TNNetInput.Create(EncSeqLen, 1, 1, 1), 0);
+  Emb := TNNetEmbedding(Dec.AddLayerAfter(
+    TNNetEmbedding.Create(Vocab, Vocab, {EncodeZero=}1, 1.0), TokIn));
+end;
+
+procedure TTestNeuralDecode.SetMarkovRow(Emb: TNNetEmbedding;
+  PrevToken: integer; const Probs: array of TNeuralFloat);
+var
+  T: integer;
+begin
+  // Logits = ln(P): the decode routines' stable softmax recovers exactly
+  // these transition probabilities (up to the row's normalisation).
+  for T := 0 to High(Probs) do
+    Emb.Neurons[0].Weights[PrevToken, 0, T] := Ln(Probs[T]);
+end;
+
+// "Trap" transition table shared by the two beam-vs-greedy tests (vocab 6,
+// start=0, EOS=1). After start, token 2 (p=.50) narrowly beats token 3
+// (p=.45) - but 2 leads to a mediocre continuation (best: EOS at p=.40)
+// while 3 is followed by EOS at p=.99. Greedy locks in [2,1] with
+// ln(.50)+ln(.40) = -1.609; the global best is [3,1] with
+// ln(.45)+ln(.99) = -0.809.
+procedure FillTrapTable(Test: TTestNeuralDecode; Emb: TNNetEmbedding);
+begin
+  Test.SetMarkovRow(Emb, 0, [1e-6, 0.02, 0.50, 0.45, 0.02, 0.01]);
+  Test.SetMarkovRow(Emb, 1, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+  Test.SetMarkovRow(Emb, 2, [0.05, 0.40, 0.15, 0.15, 0.15, 0.10]);
+  Test.SetMarkovRow(Emb, 3, [0.002, 0.99, 0.002, 0.002, 0.002, 0.002]);
+  Test.SetMarkovRow(Emb, 4, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+  Test.SetMarkovRow(Emb, 5, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+end;
+
+// BeamWidth=1 with LengthPenalty=0 reproduces DecodeSeq2SeqGreedy exactly,
+// token for token (EOS included): the single beam follows the argmax path
+// and its EOS-terminated beam outranks the step-1 EOS truncation
+// (ln(.02) = -3.9 < -1.609) in the finished pool.
+procedure TTestNeuralDecode.TestSeq2SeqBeamWidth1MatchesGreedy;
+const
+  Src: array[0..1] of integer = (1, 2);
+var
+  Enc, Dec: TNNet;
+  Emb: TNNetEmbedding;
+  G, Bm: TNeuralIntegerArray;
+  I: integer;
+begin
+  BuildMarkovSeq2SeqPair(Enc, Dec, Emb, {Vocab=}6, {EncSeqLen=}2,
+    {DecSeqLen=}6);
+  try
+    FillTrapTable(Self, Emb);
+    G := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 6);
+    // Self-check the scenario: greedy falls into the trap, [2, EOS].
+    AssertEquals('greedy emits two tokens', 2, Length(G));
+    AssertEquals('greedy first token is the trap token 2', 2, G[0]);
+    AssertEquals('greedy second token is EOS', 1, G[1]);
+    Bm := DecodeSeq2SeqBeamSearch(Enc, Dec, Src, 0, 1, 6,
+      {BeamWidth=}1, {LengthPenalty=}0.0);
+    AssertEquals('B=1/alpha=0 beam length equals greedy',
+      Length(G), Length(Bm));
+    for I := 0 to High(G) do
+      AssertEquals('B=1/alpha=0 beam token ' + IntToStr(I), G[I], Bm[I]);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// BeamWidth=2 recovers from the locally-greedy first-token mistake: the
+// beam keeps runner-up token 3 alive, finds [3, EOS] with cumulative
+// log-prob ln(.45)+ln(.99) = -0.809 > greedy's ln(.50)+ln(.40) = -1.609,
+// and ranks it first in the returned pool.
+procedure TTestNeuralDecode.TestSeq2SeqBeamBeatsGreedyFirstTokenTrap;
+const
+  Src: array[0..1] of integer = (1, 2);
+var
+  Enc, Dec: TNNet;
+  Emb: TNNetEmbedding;
+  G: TNeuralIntegerArray;
+  All: TNNetTokenDecodeResultArray;
+  GreedySum: TNeuralFloat;
+  I: integer;
+begin
+  BuildMarkovSeq2SeqPair(Enc, Dec, Emb, 6, 2, 6);
+  try
+    FillTrapTable(Self, Emb);
+    G := DecodeSeq2SeqGreedy(Enc, Dec, Src, 0, 1, 6);
+    AssertEquals('greedy locks in the trap path [2,1]', 2, G[0]);
+    All := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, 0, 1, 6,
+      {BeamWidth=}2, {LengthPenalty=}0.0);
+    AssertTrue('beam returns a ranked pool', Length(All) >= 2);
+    for I := 1 to High(All) do
+      AssertTrue('pool sorted by descending score',
+        All[I - 1].Score >= All[I].Score - 1e-6);
+    AssertEquals('best beam has two tokens', 2, Length(All[0].Tokens));
+    AssertEquals('best beam recovers token 3', 3, All[0].Tokens[0]);
+    AssertEquals('best beam then EOS', 1, All[0].Tokens[1]);
+    AssertTrue('best beam is finished', All[0].Finished);
+    AssertEquals('best beam sum-log-prob is ln(.45)+ln(.99)',
+      Ln(0.45) + Ln(0.99), All[0].SumLogProb, 1e-3);
+    GreedySum := Ln(0.50) + Ln(0.40);
+    AssertTrue('beam best beats the greedy path''s cumulative log-prob',
+      All[0].SumLogProb > GreedySum + 0.5);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Finished-pool ranking: with alpha=0 the short finished beam [2,EOS]
+// (sum -0.998) outranks the longer [3,4,EOS] (sum -1.203); alpha=2 lifts
+// longer beams (denominator (5+L)/6)^2 grows with L) and flips the
+// ranking - the verifiable direction of the Wu et al. penalty. Both
+// winners come from the finished pool (EOS-terminated), ranked against
+// the still-growing beams that were pruned/dominated along the way.
+procedure TTestNeuralDecode.TestSeq2SeqBeamFinishedPoolLengthPenaltyFlipsRanking;
+const
+  Src: array[0..1] of integer = (3, 0);
+var
+  Enc, Dec: TNNet;
+  Emb: TNNetEmbedding;
+  All0, All2: TNNetTokenDecodeResultArray;
+  I: integer;
+  FoundLong: boolean;
+begin
+  BuildMarkovSeq2SeqPair(Enc, Dec, Emb, 6, 2, 6);
+  try
+    // [2,1]: ln(.55)+ln(.67) = -0.998 ; [3,4,1]: ln(.40)+ln(.95)+ln(.79)
+    // = -1.203. Flip needs (8/7)^alpha > 1.203/0.998: alpha=2 gives 1.306.
+    SetMarkovRow(Emb, 0, [1e-6, 0.01, 0.55, 0.40, 0.02, 0.02]);
+    SetMarkovRow(Emb, 1, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+    SetMarkovRow(Emb, 2, [0.03, 0.67, 0.10, 0.10, 0.05, 0.05]);
+    SetMarkovRow(Emb, 3, [0.002, 0.02, 0.01, 0.013, 0.95, 0.005]);
+    SetMarkovRow(Emb, 4, [0.05, 0.79, 0.04, 0.04, 0.04, 0.04]);
+    SetMarkovRow(Emb, 5, [1/6, 1/6, 1/6, 1/6, 1/6, 1/6]);
+
+    All0 := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, 0, 1, 6, 2, 0.0);
+    AssertTrue('alpha=0 pool non-empty', Length(All0) >= 2);
+    AssertEquals('alpha=0: short beam [2,1] wins', 2, Length(All0[0].Tokens));
+    AssertEquals('alpha=0 winner first token', 2, All0[0].Tokens[0]);
+    AssertEquals('alpha=0 winner ends in EOS', 1, All0[0].Tokens[1]);
+    AssertTrue('alpha=0 winner is from the finished pool', All0[0].Finished);
+    // The longer rival IS in the ranked pool (finished), just outranked.
+    FoundLong := false;
+    for I := 0 to High(All0) do
+      if (Length(All0[I].Tokens) = 3) and (All0[I].Tokens[0] = 3) and
+        (All0[I].Tokens[1] = 4) and (All0[I].Tokens[2] = 1) and
+        All0[I].Finished then FoundLong := true;
+    AssertTrue('alpha=0 pool contains the finished [3,4,1] rival', FoundLong);
+
+    All2 := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, 0, 1, 6, 2, 2.0);
+    AssertTrue('alpha=2 pool non-empty', Length(All2) >= 2);
+    AssertEquals('alpha=2: longer beam [3,4,1] wins',
+      3, Length(All2[0].Tokens));
+    AssertEquals('alpha=2 winner token 0', 3, All2[0].Tokens[0]);
+    AssertEquals('alpha=2 winner token 1', 4, All2[0].Tokens[1]);
+    AssertEquals('alpha=2 winner ends in EOS', 1, All2[0].Tokens[2]);
+    AssertTrue('alpha=2 winner is finished', All2[0].Finished);
+    AssertEquals('alpha=2 runner-up is the short beam [2,1]',
+      2, Length(All2[1].Tokens));
+    AssertEquals('alpha=2 runner-up first token', 2, All2[1].Tokens[0]);
+    // Score = SumLogProb / ((5+L)/6)^alpha with L counting the EOS token.
+    AssertEquals('alpha=2 winner score applies the Wu denominator',
+      All2[0].SumLogProb / Sqr(8.0 / 6.0), All2[0].Score, 1e-5);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Pure beam search has NO RNG: two runs on the committed T5 pico pair are
+// identical beam-for-beam (tokens, sums, scores). Caps and validation match
+// the greedy routine: generation never exceeds min(MaxNewTokens, DecSeqLen),
+// EOS only ever ends a finished beam, a wrong source length raises, and
+// MaxNewTokens < 1 returns an empty pool (BeamWidth < 1 clamps to 1).
+procedure TTestNeuralDecode.TestSeq2SeqBeamDeterministicCapsAndValidation;
+const
+  Src: array[0..9] of integer = (3, 7, 1, 11, 4, 9, 2, 8, 5, 12);
+  StartId = 0;
+  EOSId = 1;
+var
+  Enc, Dec: TNNet;
+  Config: TT5Config;
+  A1, A2: TNNetTokenDecodeResultArray;
+  B1, BClamped: TNeuralIntegerArray;
+  I, T: integer;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  try
+    A1 := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, StartId, EOSId, 99,
+      {BeamWidth=}3, {LengthPenalty=}1.0);
+    A2 := DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, StartId, EOSId, 99,
+      {BeamWidth=}3, {LengthPenalty=}1.0);
+    AssertTrue('beam pool non-empty', Length(A1) >= 1);
+    AssertEquals('deterministic pool size', Length(A1), Length(A2));
+    for I := 0 to High(A1) do
+    begin
+      AssertEquals('deterministic beam ' + IntToStr(I) + ' length',
+        Length(A1[I].Tokens), Length(A2[I].Tokens));
+      for T := 0 to High(A1[I].Tokens) do
+        AssertEquals('deterministic beam ' + IntToStr(I) + ' token ' +
+          IntToStr(T), A1[I].Tokens[T], A2[I].Tokens[T]);
+      AssertEquals('deterministic beam ' + IntToStr(I) + ' score',
+        A1[I].Score, A2[I].Score, 0.0);
+      // Caps and EOS placement, per beam.
+      AssertTrue('beam capped at DecSeqLen', Length(A1[I].Tokens) <= 6);
+      for T := 0 to High(A1[I].Tokens) do
+        if A1[I].Tokens[T] = EOSId then
+        begin
+          AssertEquals('EOS only at the last position of a beam',
+            High(A1[I].Tokens), T);
+          AssertTrue('EOS-ending beam is marked finished', A1[I].Finished);
+        end;
+      if I > 0 then
+        AssertTrue('pool sorted by descending score',
+          A1[I - 1].Score >= A1[I].Score);
+    end;
+    // BeamWidth < 1 clamps to 1 (same single-best path as BeamWidth = 1).
+    B1 := DecodeSeq2SeqBeamSearch(Enc, Dec, Src, StartId, EOSId, 5, 1, 0.0);
+    BClamped := DecodeSeq2SeqBeamSearch(Enc, Dec, Src, StartId, EOSId, 5,
+      0, 0.0);
+    AssertEquals('BeamWidth=0 clamps to 1 (length)',
+      Length(B1), Length(BClamped));
+    for T := 0 to High(B1) do
+      AssertEquals('BeamWidth=0 clamps to 1 (token ' + IntToStr(T) + ')',
+        B1[T], BClamped[T]);
+    // Validation mirrors the greedy/sampled routines.
+    try
+      DecodeSeq2SeqBeamSearch(Enc, Dec, [3, 7, 1], StartId, EOSId, 5, 2, 0.0);
+      Fail('a 3-token source must be rejected (encoder built at 10)');
+    except
+      on EArgumentException do ; // expected
+    end;
+    AssertEquals('MaxNewTokens=0 returns an empty pool', 0,
+      Length(DecodeSeq2SeqBeamSearchAll(Enc, Dec, Src, StartId, EOSId, 0,
+        2, 0.0)));
+  finally
+    Dec.Free;
+    Enc.Free;
   end;
 end;
 

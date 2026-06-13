@@ -1,0 +1,15 @@
+{
+ "architectures": [
+  "BloomForCausalLM"
+ ],
+ "model_type": "bloom",
+ "hidden_size": 12,
+ "n_layer": 2,
+ "n_head": 3,
+ "n_inner": null,
+ "vocab_size": 12,
+ "seq_length": 16,
+ "layer_norm_epsilon": 1e-05,
+ "apply_residual_connection_post_layernorm": false,
+ "tie_word_embeddings": true
+}

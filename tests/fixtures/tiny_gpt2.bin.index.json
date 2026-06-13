@@ -1,0 +1,37 @@
+{
+ "metadata": {
+  "total_size": 9952
+ },
+ "weight_map": {
+  "h.0.attn.bias": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.attn.c_attn.bias": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.attn.c_attn.weight": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.attn.c_proj.bias": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.attn.c_proj.weight": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.ln_1.bias": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.ln_1.weight": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.ln_2.bias": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.ln_2.weight": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.mlp.c_fc.bias": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.mlp.c_fc.weight": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.mlp.c_proj.bias": "tiny_gpt2-00001-of-00002.bin",
+  "h.0.mlp.c_proj.weight": "tiny_gpt2-00001-of-00002.bin",
+  "h.1.attn.bias": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.attn.c_attn.bias": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.attn.c_attn.weight": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.attn.c_proj.bias": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.attn.c_proj.weight": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.ln_1.bias": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.ln_1.weight": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.ln_2.bias": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.ln_2.weight": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.mlp.c_fc.bias": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.mlp.c_fc.weight": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.mlp.c_proj.bias": "tiny_gpt2-00002-of-00002.bin",
+  "h.1.mlp.c_proj.weight": "tiny_gpt2-00002-of-00002.bin",
+  "ln_f.bias": "tiny_gpt2-00002-of-00002.bin",
+  "ln_f.weight": "tiny_gpt2-00002-of-00002.bin",
+  "wpe.weight": "tiny_gpt2-00001-of-00002.bin",
+  "wte.weight": "tiny_gpt2-00001-of-00002.bin"
+ }
+}

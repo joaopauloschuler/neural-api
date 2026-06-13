@@ -70,6 +70,18 @@ type
     // Scheduler wiring
     procedure TestSchedulerDefaultsNil;
     procedure TestConstantSchedulerMatchesFixedLR;
+
+    // AdamW optimizer (decoupled weight decay) tests
+    procedure TestAdamWOptimizerCreation;
+    procedure TestDecoupledWeightDecayExactMath;
+    procedure TestAdamWZeroDecayMatchesAdam;
+    procedure TestAdamWShrinksWeightsVsAdam;
+    procedure TestAdamWTrainingLearns;
+
+    // Label smoothing tests
+    procedure TestLabelSmoothingDefaultZero;
+    procedure TestLabelSmoothingTargetMath;
+    procedure TestLabelSmoothingZeroIsBitIdentical;
   end;
 
 implementation
@@ -650,6 +662,302 @@ begin
     Probe.Free;
     Pairs.Free;
     Net.Free;
+  end;
+end;
+
+// Trains Net with the given OPTIONAL optimizer (nil = default SGD path) and
+// returns the last-layer weight vector after training. Mirrors RunFit but
+// exercises the Optimizer property instead of the Scheduler property.
+procedure RunFitWithOptimizer(Net: TNNet; Opt: TNeuralOptimizer;
+  out W: TNNetVolume);
+var
+  Fit: TNeuralFit;
+  Pairs: TNNetVolumePairList;
+begin
+  Pairs := BuildFitPairs();
+  // Reseed immediately before Fit so runs see the same RNG stream; the only
+  // difference between two runs is then the optimizer itself.
+  RandSeed := 100;
+  Fit := TNeuralFit.Create;
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.LoadBestAtEnd := False;
+    if Opt <> nil then Fit.Optimizer := Opt; // caller keeps ownership
+    Fit.Fit(Net, Pairs, nil, nil, 4, 20);
+    W := TNNetVolume.Create();
+    W.Copy(Net.GetLastLayer.Neurons[0].Weights);
+  finally
+    Fit.Free;
+    Pairs.Free;
+  end;
+end;
+
+// Mean squared error of Net over the tiny XOR-ish set from BuildFitPairs.
+function FitNetMSE(Net: TNNet): TNeuralFloat;
+var
+  Pairs: TNNetVolumePairList;
+  Output: TNNetVolume;
+  I: integer;
+  Diff: TNeuralFloat;
+begin
+  Result := 0;
+  Output := TNNetVolume.Create(1, 1, 1);
+  Pairs := BuildFitPairs();
+  try
+    for I := 0 to Pairs.Count - 1 do
+    begin
+      Net.Compute(Pairs[I].A);
+      Net.GetOutput(Output);
+      Diff := Output.FData[0] - Pairs[I].B.FData[0];
+      Result := Result + Diff * Diff;
+    end;
+    Result := Result / Pairs.Count;
+  finally
+    Pairs.Free;
+    Output.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAdamWOptimizerCreation;
+var
+  Optimizer: TNeuralOptimizerAdamW;
+begin
+  Optimizer := TNeuralOptimizerAdamW.Create(0.9, 0.999, 1e-08, 0.01);
+  try
+    AssertTrue('AdamW optimizer should be created', Optimizer <> nil);
+    AssertEquals('WeightDecay should round-trip', 0.01,
+      Optimizer.WeightDecay, 1e-9);
+    Optimizer.WeightDecay := 0.1;
+    AssertEquals('WeightDecay should be writable', 0.1,
+      Optimizer.WeightDecay, 1e-6);
+  finally
+    Optimizer.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestDecoupledWeightDecayExactMath;
+var
+  NN: TNNet;
+  OldFC, OldLN: TNNetVolume;
+  OldBias: TNeuralFloat;
+  I: integer;
+const
+  cRate = 0.01; // = LearningRate * WeightDecay in an AdamW step
+begin
+  // Controlled single decay step: weights of a neuron-bearing trainable
+  // layer must scale EXACTLY by (1 - rate); its biases and any
+  // normalization layer's parameters must be left untouched.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  OldFC := TNNetVolume.Create();
+  OldLN := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(3));
+    NN.AddLayer(TNNetLayerNorm.Create());
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+
+    OldFC.Copy(NN.Layers[1].Neurons[0].Weights);
+    OldBias := NN.Layers[1].Neurons[0].BiasWeight;
+    OldLN.Copy(NN.Layers[2].Neurons[0].Weights);
+
+    NN.ApplyDecoupledWeightDecay(cRate);
+
+    // (a) decayable weights: exact (1 - rate) scaling, up to single-precision
+    // rounding of the multiply (weights are singles; 1 ulp ~ 6e-8 here).
+    for I := 0 to OldFC.Size - 1 do
+      AssertEquals('FC weight must scale exactly by (1-rate)',
+        OldFC.FData[I] * (1 - cRate),
+        NN.Layers[1].Neurons[0].Weights.FData[I], 1e-7);
+    // (b) biases: never decayed.
+    AssertEquals('Bias must not be decayed', OldBias,
+      NN.Layers[1].Neurons[0].BiasWeight, 0);
+    // (c) normalization layer (TNNetIdentityWithoutL2 descendant): skipped.
+    for I := 0 to OldLN.Size - 1 do
+      AssertEquals('LayerNorm parameter must not be decayed',
+        OldLN.FData[I], NN.Layers[2].Neurons[0].Weights.FData[I], 0);
+  finally
+    OldFC.Free;
+    OldLN.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAdamWZeroDecayMatchesAdam;
+var
+  NetA, NetB: TNNet;
+  WA, WB: TNNetVolume;
+  Adam: TNeuralOptimizerAdam;
+  AdamW: TNeuralOptimizerAdamW;
+  I: integer;
+begin
+  WA := nil;
+  WB := nil;
+  NetA := BuildFitNet();          // same seed -> identical init weights
+  NetB := BuildFitNet();
+  Adam := TNeuralOptimizerAdam.Create(0.9, 0.999, 1e-08);
+  AdamW := TNeuralOptimizerAdamW.Create(0.9, 0.999, 1e-08, 0.0);
+  try
+    RunFitWithOptimizer(NetA, Adam, WA);
+    RunFitWithOptimizer(NetB, AdamW, WB);
+
+    AssertEquals('Weight vector size must match', WA.Size, WB.Size);
+    // With WeightDecay = 0 the decay branch is skipped entirely, so the
+    // computation sequence is identical to plain Adam: exact match.
+    for I := 0 to WA.Size - 1 do
+      AssertEquals('AdamW(wd=0) weights must match plain Adam exactly',
+        WA.FData[I], WB.FData[I], 0);
+  finally
+    WA.Free;
+    WB.Free;
+    Adam.Free;
+    AdamW.Free;
+    NetA.Free;
+    NetB.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAdamWShrinksWeightsVsAdam;
+var
+  NetA, NetB: TNNet;
+  WA, WB: TNNetVolume;
+  Adam: TNeuralOptimizerAdam;
+  AdamW: TNeuralOptimizerAdamW;
+  NormA, NormB: TNeuralFloat;
+  I: integer;
+begin
+  WA := nil;
+  WB := nil;
+  NetA := BuildFitNet();
+  NetB := BuildFitNet();
+  Adam := TNeuralOptimizerAdam.Create(0.9, 0.999, 1e-08);
+  // Strong decay so the multiplicative shrinkage dominates the (identical)
+  // gradient dynamics on this tiny run: per step factor (1 - 0.01*2.0).
+  AdamW := TNeuralOptimizerAdamW.Create(0.9, 0.999, 1e-08, 2.0);
+  try
+    RunFitWithOptimizer(NetA, Adam, WA);
+    RunFitWithOptimizer(NetB, AdamW, WB);
+
+    NormA := 0;
+    NormB := 0;
+    for I := 0 to WA.Size - 1 do
+      NormA := NormA + WA.FData[I] * WA.FData[I];
+    for I := 0 to WB.Size - 1 do
+      NormB := NormB + WB.FData[I] * WB.FData[I];
+    AssertTrue('AdamW with wd>0 must end with smaller weight norm than Adam'
+      + ' (' + FloatToStr(NormB) + ' vs ' + FloatToStr(NormA) + ')',
+      NormB < NormA);
+  finally
+    WA.Free;
+    WB.Free;
+    Adam.Free;
+    AdamW.Free;
+    NetA.Free;
+    NetB.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAdamWTrainingLearns;
+var
+  Net: TNNet;
+  W: TNNetVolume;
+  AdamW: TNeuralOptimizerAdamW;
+  ErrBefore, ErrAfter: TNeuralFloat;
+begin
+  W := nil;
+  Net := BuildFitNet();
+  AdamW := TNeuralOptimizerAdamW.Create(0.9, 0.999, 1e-08, 0.01);
+  try
+    ErrBefore := FitNetMSE(Net);
+    RunFitWithOptimizer(Net, AdamW, W);
+    ErrAfter := FitNetMSE(Net);
+    AssertTrue('AdamW training must reduce the error ('
+      + FloatToStr(ErrAfter) + ' vs ' + FloatToStr(ErrBefore) + ')',
+      ErrAfter < ErrBefore);
+  finally
+    W.Free;
+    AdamW.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestLabelSmoothingDefaultZero;
+var
+  Fit: TNeuralImageFit;
+begin
+  Fit := TNeuralImageFit.Create;
+  try
+    // Must default to 0 so existing training paths are unchanged.
+    AssertEquals('LabelSmoothing should default to 0', 0.0,
+      Fit.LabelSmoothing, 0);
+    Fit.LabelSmoothing := 0.1;
+    AssertEquals('LabelSmoothing should be settable', 0.1,
+      Fit.LabelSmoothing, 1e-7);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestLabelSmoothingTargetMath;
+var
+  Fit: TNeuralImageFit;
+  Target: TNNetVolume;
+  I: integer;
+const
+  cEps: single = 0.1;
+  cNumClasses = 4;
+  cClassId = 2;
+begin
+  Fit := TNeuralImageFit.Create;
+  Target := TNNetVolume.Create(cNumClasses, 1, 1);
+  try
+    Fit.LabelSmoothing := cEps;
+    Target.SetClassForSoftMax(cClassId);
+    Fit.ApplyLabelSmoothing(Target);
+    // target = (1-eps)*onehot + eps/NumClasses
+    for I := 0 to cNumClasses - 1 do
+    begin
+      if I = cClassId
+        then AssertEquals('Smoothed true-class target',
+          (1 - cEps) * 1 + cEps / cNumClasses, Target.FData[I], 1e-6)
+        else AssertEquals('Smoothed off-class target',
+          cEps / cNumClasses, Target.FData[I], 1e-6);
+    end;
+  finally
+    Target.Free;
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestLabelSmoothingZeroIsBitIdentical;
+var
+  Fit: TNeuralImageFit;
+  Target, Reference: TNNetVolume;
+  I: integer;
+const
+  cNumClasses = 10;
+begin
+  Fit := TNeuralImageFit.Create;
+  Target := TNNetVolume.Create(cNumClasses, 1, 1);
+  Reference := TNNetVolume.Create(cNumClasses, 1, 1);
+  try
+    Target.SetClassForSoftMax(7);
+    Reference.Copy(Target);
+    // LabelSmoothing = 0 (the default) must leave the target bit-for-bit
+    // identical to the plain one-hot construction.
+    Fit.ApplyLabelSmoothing(Target);
+    for I := 0 to cNumClasses - 1 do
+      AssertEquals('LabelSmoothing=0 must not change the target at all',
+        Reference.FData[I], Target.FData[I], 0);
+  finally
+    Reference.Free;
+    Target.Free;
+    Fit.Free;
   end;
 end;
 

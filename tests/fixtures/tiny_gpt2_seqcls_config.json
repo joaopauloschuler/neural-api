@@ -1,0 +1,23 @@
+{
+ "architectures": [
+  "GPT2ForSequenceClassification"
+ ],
+ "model_type": "gpt2",
+ "n_layer": 2,
+ "n_head": 2,
+ "n_embd": 8,
+ "n_positions": 16,
+ "vocab_size": 11,
+ "pad_token_id": 0,
+ "num_labels": 3,
+ "id2label": {
+  "0": "neg",
+  "1": "neu",
+  "2": "pos"
+ },
+ "label2id": {
+  "neg": 0,
+  "neu": 1,
+  "pos": 2
+ }
+}

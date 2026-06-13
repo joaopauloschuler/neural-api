@@ -1,0 +1,18 @@
+{
+ "architectures": [
+  "RwkvForCausalLM"
+ ],
+ "model_type": "rwkv",
+ "vocab_size": 13,
+ "context_length": 8,
+ "hidden_size": 8,
+ "num_hidden_layers": 2,
+ "attention_hidden_size": 8,
+ "intermediate_size": 16,
+ "layer_norm_epsilon": 1e-05,
+ "rescale_every": 6,
+ "tie_word_embeddings": false,
+ "use_cache": true,
+ "bos_token_id": 0,
+ "eos_token_id": 0
+}

@@ -1,0 +1,29 @@
+{
+ "architectures": [
+  "GPTNeoForCausalLM"
+ ],
+ "model_type": "gpt_neo",
+ "hidden_size": 8,
+ "num_layers": 2,
+ "num_heads": 2,
+ "attention_types": [
+  [
+   [
+    "global",
+    "local"
+   ],
+   1
+  ]
+ ],
+ "window_size": 4,
+ "intermediate_size": null,
+ "vocab_size": 11,
+ "max_position_embeddings": 16,
+ "layer_norm_epsilon": 1e-05,
+ "activation_function": "gelu_new",
+ "tie_word_embeddings": true,
+ "attention_layers": [
+  "global",
+  "local"
+ ]
+}

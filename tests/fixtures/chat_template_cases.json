@@ -1,0 +1,758 @@
+{
+ "chatml": {
+  "template": "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}",
+  "cases": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|im_start|>user\nHello, how are you?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi!"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Answer briefly."
+     },
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<|im_start|>system\nAnswer briefly.<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Ping"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<|im_start|>user\nPing<|im_end|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "  Café olé?  "
+     },
+     {
+      "role": "assistant",
+      "content": " Of course! "
+     },
+     {
+      "role": "user",
+      "content": "\tthanks\n"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|im_start|>user\n  Café olé?  <|im_end|>\n<|im_start|>assistant\n Of course! <|im_end|>\n<|im_start|>user\n\tthanks\n<|im_end|>\n<|im_start|>assistant\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "I speak first."
+     },
+     {
+      "role": "user",
+      "content": "odd"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|im_start|>assistant\nI speak first.<|im_end|>\n<|im_start|>user\nodd<|im_end|>\n<|im_start|>assistant\n"
+   }
+  ]
+ },
+ "llama2": {
+  "template": "{% if messages[0]['role'] == 'system' %}{% set loop_messages = messages[1:] %}{% set system_message = messages[0]['content'] %}{% else %}{% set loop_messages = messages %}{% set system_message = false %}{% endif %}{% for message in loop_messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if loop.index0 == 0 and system_message != false %}{% set content = '<<SYS>>\n' + system_message + '\n<</SYS>>\n\n' + message['content'] %}{% else %}{% set content = message['content'] %}{% endif %}{% if message['role'] == 'user' %}{{ bos_token + '[INST] ' + content.strip() + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' ' + content.strip() + ' ' + eos_token }}{% endif %}{% endfor %}",
+  "cases": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<s>[INST] Hello, how are you? [/INST]"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<s>[INST] <<SYS>>\nYou are a helpful assistant.\n<</SYS>>\n\nWhat is the capital of France? [/INST]"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi!"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<s>[INST] Hi! [/INST] Hello! How can I help? </s><s>[INST] Tell me a joke. [/INST]"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Answer briefly."
+     },
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<s>[INST] <<SYS>>\nAnswer briefly.\n<</SYS>>\n\n2+2? [/INST] 4 </s>"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Ping"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<s>[INST] Ping [/INST]"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "  Café olé?  "
+     },
+     {
+      "role": "assistant",
+      "content": " Of course! "
+     },
+     {
+      "role": "user",
+      "content": "\tthanks\n"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<s>[INST] Café olé? [/INST] Of course! </s><s>[INST] thanks [/INST]"
+   },
+   {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "I speak first."
+     },
+     {
+      "role": "user",
+      "content": "odd"
+     }
+    ],
+    "add_generation_prompt": true,
+    "raises": true,
+    "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+   }
+  ]
+ },
+ "llama3": {
+  "template": "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}",
+  "cases": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello, how are you?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is the capital of France?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi!"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHi!<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHello! How can I help?<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nTell me a joke.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Answer briefly."
+     },
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nAnswer briefly.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n2+2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n4<|eot_id|>"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Ping"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nPing<|eot_id|>"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "  Café olé?  "
+     },
+     {
+      "role": "assistant",
+      "content": " Of course! "
+     },
+     {
+      "role": "user",
+      "content": "\tthanks\n"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nCafé olé?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nOf course!<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nthanks<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "I speak first."
+     },
+     {
+      "role": "user",
+      "content": "odd"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|begin_of_text|><|start_header_id|>assistant<|end_header_id|>\n\nI speak first.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nodd<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+   }
+  ]
+ },
+ "zephyr": {
+  "template": "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}",
+  "cases": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|user|>\nHello, how are you?</s>\n<|assistant|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nWhat is the capital of France?</s>\n<|assistant|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi!"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|user|>\nHi!</s>\n<|assistant|>\nHello! How can I help?</s>\n<|user|>\nTell me a joke.</s>\n<|assistant|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Answer briefly."
+     },
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<|system|>\nAnswer briefly.</s>\n<|user|>\n2+2?</s>\n<|assistant|>\n4</s>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Ping"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<|user|>\nPing</s>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "  Café olé?  "
+     },
+     {
+      "role": "assistant",
+      "content": " Of course! "
+     },
+     {
+      "role": "user",
+      "content": "\tthanks\n"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|user|>\n  Café olé?  </s>\n<|assistant|>\n Of course! </s>\n<|user|>\n\tthanks\n</s>\n<|assistant|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "I speak first."
+     },
+     {
+      "role": "user",
+      "content": "odd"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|assistant|>\nI speak first.</s>\n<|user|>\nodd</s>\n<|assistant|>\n"
+   }
+  ]
+ },
+ "gemma": {
+  "template": "{{ bos_token }}{% if messages[0]['role'] == 'system' %}{{ raise_exception('System role not supported') }}{% endif %}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if (message['role'] == 'assistant') %}{% set role = 'model' %}{% else %}{% set role = message['role'] %}{% endif %}{{ '<start_of_turn>' + role + '\n' + message['content'] | trim + '<end_of_turn>\n' }}{% endfor %}{% if add_generation_prompt %}{{'<start_of_turn>model\n'}}{% endif %}",
+  "cases": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<bos><start_of_turn>user\nHello, how are you?<end_of_turn>\n<start_of_turn>model\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "raises": true,
+    "error": "System role not supported"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi!"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<bos><start_of_turn>user\nHi!<end_of_turn>\n<start_of_turn>model\nHello! How can I help?<end_of_turn>\n<start_of_turn>user\nTell me a joke.<end_of_turn>\n<start_of_turn>model\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Answer briefly."
+     },
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4"
+     }
+    ],
+    "add_generation_prompt": false,
+    "raises": true,
+    "error": "System role not supported"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Ping"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<bos><start_of_turn>user\nPing<end_of_turn>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "  Café olé?  "
+     },
+     {
+      "role": "assistant",
+      "content": " Of course! "
+     },
+     {
+      "role": "user",
+      "content": "\tthanks\n"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<bos><start_of_turn>user\nCafé olé?<end_of_turn>\n<start_of_turn>model\nOf course!<end_of_turn>\n<start_of_turn>user\nthanks<end_of_turn>\n<start_of_turn>model\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "I speak first."
+     },
+     {
+      "role": "user",
+      "content": "odd"
+     }
+    ],
+    "add_generation_prompt": true,
+    "raises": true,
+    "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+   }
+  ]
+ },
+ "phi3": {
+  "template": "{% for message in messages %}{% if message['role'] == 'system' %}{{'<|system|>\n' + message['content'] + '<|end|>\n'}}{% elif message['role'] == 'user' %}{{'<|user|>\n' + message['content'] + '<|end|>\n'}}{% elif message['role'] == 'assistant' %}{{'<|assistant|>\n' + message['content'] + '<|end|>\n'}}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<|assistant|>\n' }}{% else %}{{ eos_token }}{% endif %}",
+  "cases": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|user|>\nHello, how are you?<|end|>\n<|assistant|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|system|>\nYou are a helpful assistant.<|end|>\n<|user|>\nWhat is the capital of France?<|end|>\n<|assistant|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi!"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|user|>\nHi!<|end|>\n<|assistant|>\nHello! How can I help?<|end|>\n<|user|>\nTell me a joke.<|end|>\n<|assistant|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Answer briefly."
+     },
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<|system|>\nAnswer briefly.<|end|>\n<|user|>\n2+2?<|end|>\n<|assistant|>\n4<|end|>\n<|endoftext|>"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Ping"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<|user|>\nPing<|end|>\n<|endoftext|>"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "  Café olé?  "
+     },
+     {
+      "role": "assistant",
+      "content": " Of course! "
+     },
+     {
+      "role": "user",
+      "content": "\tthanks\n"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|user|>\n  Café olé?  <|end|>\n<|assistant|>\n Of course! <|end|>\n<|user|>\n\tthanks\n<|end|>\n<|assistant|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "I speak first."
+     },
+     {
+      "role": "user",
+      "content": "odd"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<|assistant|>\nI speak first.<|end|>\n<|user|>\nodd<|end|>\n<|assistant|>\n"
+   }
+  ]
+ },
+ "mistral": {
+  "template": "{{ bos_token }}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if message['role'] == 'user' %}{{ '[INST] ' + message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token + ' ' }}{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}{% endif %}{% endfor %}",
+  "cases": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<s>[INST] Hello, how are you? [/INST]"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "raises": true,
+    "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi!"
+     },
+     {
+      "role": "assistant",
+      "content": "Hello! How can I help?"
+     },
+     {
+      "role": "user",
+      "content": "Tell me a joke."
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<s>[INST] Hi! [/INST]Hello! How can I help?</s> [INST] Tell me a joke. [/INST]"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "Answer briefly."
+     },
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "4"
+     }
+    ],
+    "add_generation_prompt": false,
+    "raises": true,
+    "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Ping"
+     }
+    ],
+    "add_generation_prompt": false,
+    "expected": "<s>[INST] Ping [/INST]"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "  Café olé?  "
+     },
+     {
+      "role": "assistant",
+      "content": " Of course! "
+     },
+     {
+      "role": "user",
+      "content": "\tthanks\n"
+     }
+    ],
+    "add_generation_prompt": true,
+    "expected": "<s>[INST]   Café olé?   [/INST] Of course! </s> [INST] \tthanks\n [/INST]"
+   },
+   {
+    "messages": [
+     {
+      "role": "assistant",
+      "content": "I speak first."
+     },
+     {
+      "role": "user",
+      "content": "odd"
+     }
+    ],
+    "add_generation_prompt": true,
+    "raises": true,
+    "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+   }
+  ]
+ }
+}

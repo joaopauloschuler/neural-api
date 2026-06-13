@@ -11,7 +11,9 @@ uses
   TestNeuralVolume, TestNeuralLayers, TestNeuralThread,
   TestNeuralFit, TestNeuralVolumePairs, TestNeuralSamplers,
   TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical,
-  TestNeuralScheduler, TestNeuralDecode;
+  TestNeuralScheduler, TestNeuralDecode, TestNeuralPretrained,
+  TestNeuralDPO, TestNeuralNLPMetrics, TestNeuralPacking,
+  TestNeuralHFTokenizer, TestNeuralHFHub;
 
 type
   TMyTestRunner = class(TTestRunner)

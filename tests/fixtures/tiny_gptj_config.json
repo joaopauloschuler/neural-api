@@ -1,0 +1,16 @@
+{
+ "architectures": [
+  "GPTJForCausalLM"
+ ],
+ "model_type": "gptj",
+ "n_embd": 16,
+ "n_inner": 24,
+ "n_layer": 2,
+ "n_head": 2,
+ "vocab_size": 11,
+ "n_positions": 16,
+ "rotary_dim": 4,
+ "layer_norm_epsilon": 1e-05,
+ "activation_function": "gelu_new",
+ "tie_word_embeddings": false
+}

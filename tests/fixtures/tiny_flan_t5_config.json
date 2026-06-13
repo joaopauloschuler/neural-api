@@ -1,0 +1,22 @@
+{
+ "architectures": [
+  "T5ForConditionalGeneration"
+ ],
+ "model_type": "t5",
+ "d_model": 8,
+ "d_kv": 3,
+ "d_ff": 16,
+ "num_layers": 2,
+ "num_decoder_layers": 2,
+ "num_heads": 2,
+ "relative_attention_num_buckets": 8,
+ "relative_attention_max_distance": 8,
+ "vocab_size": 13,
+ "dropout_rate": 0.0,
+ "layer_norm_epsilon": 1e-06,
+ "feed_forward_proj": "gated-gelu",
+ "tie_word_embeddings": false,
+ "pad_token_id": 0,
+ "eos_token_id": 1,
+ "decoder_start_token_id": 0
+}
