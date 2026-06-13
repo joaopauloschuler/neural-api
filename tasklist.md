@@ -569,7 +569,7 @@ rather than acted on.
       byte-level-BPE variant needs a vocab prefix-scan helper there;
       (b) guidance-style multi-token rollback (back up over more than the
       single last prompt token when the boundary artifact spans merges).
-- [ ] HellaSwag-style eval example on an imported checkpoint: a small
+- [X] HellaSwag-style eval example on an imported checkpoint: a small
       example program that loads a real imported model (e.g. SmolLM2 /
       pythia via the safetensors importers), tokenizes a handful of
       multiple-choice items with TNeuralHFTokenizer and reports acc /
