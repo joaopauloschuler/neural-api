@@ -51,8 +51,11 @@ jobs:
 
     - name: Run Tests
       run: |
-        cd bin
-        ./RunTests --all --format=plain
+        # Run from tests/ so the suite's relative 'fixtures/...' paths resolve
+        # (FixturePath probes fixtures/ then tests/fixtures/); the binary lives
+        # in ../bin. RunAll.sh runs the suite from tests/ for the same reason.
+        cd tests
+        ../bin/RunTests --all --format=plain
 
     - name: Build Examples
       env:
