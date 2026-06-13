@@ -363,10 +363,13 @@ rather than acted on.
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
 - [ ] HF-names safetensors exporter — per-importer name maps follow-up
-      (the GPT-2 exporter SaveGPT2ToSafeTensors landed as the exact inverse of
-      the importer): add a layer->HF-name + transpose inverse map for the other
-      architectures (Llama/Qwen3/BERT/...), each its own map (the
-      "generalize later" clause of the landed GPT-2 round-trip).
+      (GPT-2 SaveGPT2ToSafeTensors and Llama SaveLlamaToSafeTensors landed as the
+      exact inverses of their importers — Llama via the shared
+      BuildLlamaMemTensorReader walk that also backs the GGUF exporter, undoing
+      the q/k rotate_half de-permute + SwiGLU gate|up un-fuse + Gemma RMSNorm
+      gain offset; round-trip gated by TestLlamaSafeTensorsRoundTrip): add a
+      layer->HF-name + transpose inverse map for the REMAINING architectures
+      (Qwen3/BERT/GPT-NeoX/...), each its own map.
 - [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the

@@ -106,6 +106,7 @@ type
     procedure TestGPT2ConfigFromFixture;
     procedure TestGPT2LogitParity;
     procedure TestGPT2SafeTensorsRoundTrip;
+    procedure TestLlamaSafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -1487,6 +1488,66 @@ begin
     // F32 -> F32 round-trip with an exact name/transpose inverse is bit-exact;
     // allow a tiny epsilon for any non-determinism, far under the 1e-3 ceiling.
     AssertTrue('GPT-2 safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
+    NN.Free;
+  end;
+end;
+
+// Round-trip gate for the Llama HF-names safetensors exporter
+// (SaveLlamaToSafeTensors): import the committed pico Llama fixture -> export
+// to a temp .safetensors -> re-import (same config.json) and assert next-token
+// logits match the original import bit-tight on pinned inputs. Proves the
+// name map, the q/k rotate_half de-permutation and the SwiGLU gate|up
+// un-fusion are exactly the inverse of BuildLlamaFromSafeTensors.
+procedure TTestNeuralPretrained.TestLlamaSafeTensorsRoundTrip;
+var
+  NN, NN2: TNNet;
+  Config, Config2: TLlamaConfig;
+  Input, Out1, Out2: TNNetVolume;
+  TmpPath, CfgPath: string;
+  i, s, SeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  CfgPath := FixturePath('tiny_llama_config.json');
+  TmpPath := GetTempDir(false) + 'cai_llama_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  NN := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_llama.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false, CfgPath);
+  Input := TNNetVolume.Create;
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  NN2 := nil;
+  try
+    SaveLlamaToSafeTensors(NN, Config, TmpPath);
+    NN2 := BuildLlamaFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}0,
+      {pInferenceOnly=}false, CfgPath);
+
+    SeqLen := Config.MaxPositions;
+    Vocab := Config.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      NN.Compute(Input);
+      NN.GetOutput(Out1);
+      NN2.Compute(Input);
+      NN2.GetOutput(Out2);
+      AssertEquals('llama round-trip output size', Out1.Size, Out2.Size);
+      for i := 0 to Out1.Size - 1 do
+        if Abs(Out1.FData[i] - Out2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(Out1.FData[i] - Out2.FData[i]);
+    end;
+    // F32 + invertible q/k de-permute + SwiGLU un-fuse -> identical logits.
+    AssertTrue('Llama safetensors round-trip: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
   finally
     if FileExists(TmpPath) then DeleteFile(TmpPath);

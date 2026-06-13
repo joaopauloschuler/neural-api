@@ -968,6 +968,15 @@ procedure SaveTNNetLlamaToGGUFEx(Net: TNNet;
 procedure SaveTNNetLlamaToGGUF(Net: TNNet;
   const Config: TLlamaConfig; const FileName: string);
 
+// HF-names safetensors exporter: the exact inverse of
+// BuildLlamaFromSafeTensors. Writes the wired Llama TNNet's weights to a
+// .safetensors file under HF tensor names (q/k rotate_half de-permute, SwiGLU
+// gate|up un-fuse, Gemma RMSNorm gain offset all undone), so a re-import via
+// BuildLlamaFromSafeTensors (with the matching config.json) is bit-identical.
+// Weights only - supply the original config.json at import time.
+procedure SaveLlamaToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
 // Mistral: the Llama skeleton + optional sliding-window attention (config
 // sliding_window; null/absent = full attention). Thin wrappers over the
 // Llama path that ASSERT the config's model_type is 'mistral'.
@@ -6373,17 +6382,25 @@ begin
   Dest.Copy(FData[Idx]);
 end;
 
-procedure SaveTNNetLlamaToGGUFEx(Net: TNNet;
-  const Config: TLlamaConfig; const Tokens: array of string;
-  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+// Walks a wired plain-Llama TNNet and emits every load-bearing weight into a
+// fresh TNNetMemTensorReader under its EXACT HuggingFace tensor name, undoing
+// each transform BuildLlamaFromSafeTensors applied on import: the interleaved
+// rotate_half q/k de-permutation, the SwiGLU gate|up un-fusion, and the Gemma
+// RMSNorm +1 gain offset. The returned reader is the in-memory equivalent of
+// the original HF safetensors checkpoint (row-major [out,in] linear matrices,
+// [d] norm gains, [vocab,hidden] embedding) and is shared by the GGUF and
+// safetensors TNNet exporters. Caller owns the result. Coded by Claude (AI).
+function BuildLlamaMemTensorReader(Net: TNNet;
+  const Config: TLlamaConfig): TNNetMemTensorReader;
 var
   Reader: TNNetMemTensorReader;
-  HeadDim, QWidth, KVWidth, b, j, i, c: integer;
+  HeadDim, QWidth, KVWidth, b, j, c: integer;
   HalfDim, h, k, IntSize: integer;
   NormGainOffset: TNeuralFloat;
   Linears, Norms: array of TNNetLayer;
   Embed: TNNetLayer;
   Lay: TNNetLayer;
+  i: integer;
   V: TNNetVolume;
   BlockPrefix: string;
 
@@ -6516,7 +6533,8 @@ begin
       ' RMSNorms, expected ' + IntToStr(Config.NumLayers * 2 + 1) +
       ' (2 per block + final norm).');
 
-  Reader := TNNetMemTensorReader.Create;
+  Result := TNNetMemTensorReader.Create;
+  Reader := Result;
   V := TNNetVolume.Create;
   try
     // ---- token embedding table [vocab, hidden] (row-major, straight) ----
@@ -6620,12 +6638,27 @@ begin
         'lm_head.weight');
     // (tied head: omit lm_head.weight - SaveLlamaToGGUFEx mirrors llama.cpp by
     //  also omitting output.weight, so the round-trip re-infers the tie.)
+  except
+    V.Free;
+    Result.Free;
+    raise;
+  end;
+  V.Free;
+end;
 
-    // ---- ride the existing reader-source emitter (shared q/k re-permute,
-    //      reversed dims, F32/F16/Q8_0, metadata + tokenizer block) ----
+procedure SaveTNNetLlamaToGGUFEx(Net: TNNet;
+  const Config: TLlamaConfig; const Tokens: array of string;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+var
+  Reader: TNNetMemTensorReader;
+begin
+  // Re-derive the HF-named weights from the wired layers, then ride the
+  // existing reader-source emitter (shared q/k re-permute, reversed dims,
+  // F32/F16/Q8_0, metadata + tokenizer block).
+  Reader := BuildLlamaMemTensorReader(Net, Config);
+  try
     SaveLlamaToGGUFEx(Reader, Config, Tokens, FileName, pDType);
   finally
-    V.Free;
     Reader.Free;
   end;
 end;
@@ -6637,6 +6670,57 @@ var
 begin
   SetLength(NoTokens, 0);
   SaveTNNetLlamaToGGUFEx(Net, Config, NoTokens, FileName, gwF32);
+end;
+
+// HF-names safetensors exporter - the exact inverse of
+// BuildLlamaFromSafeTensors. Re-derives the HF-named weight set from the wired
+// layers (the SAME in-memory reader the GGUF exporter uses, so the q/k
+// rotate_half de-permutation, SwiGLU gate|up un-fusion and Gemma RMSNorm gain
+// offset are undone identically) and writes it to a .safetensors file under
+// the precise model.embed_tokens / model.layers.N.* / model.norm / lm_head
+// names BuildLlamaFromSafeTensors reads. Linear matrices are emitted [out,in]
+// row-major (plain nn.Linear, NOT the GPT-2 Conv1D [in,out] transpose) and
+// norm gains as [d], so a re-import is bit-identical. Tied-embedding models
+// omit lm_head.weight (the importer re-infers the tie from
+// config.tie_word_embeddings). The matching config.json must accompany the
+// file at import (this writes weights only, like the GPT-2 exporter).
+// Coded by Claude (AI).
+procedure SaveLlamaToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Reader: TNNetMemTensorReader;
+  Writer: TNNetSafeTensorsWriter;
+  V: TNNetVolume;
+  i, d, Dims: integer;
+  Shape: array of Int64;
+  TName: string;
+begin
+  Reader := BuildLlamaMemTensorReader(Net, Config);
+  V := TNNetVolume.Create;
+  try
+    Writer := TNNetSafeTensorsWriter.Create(FileName);
+    try
+      Writer.SetMetadata('format', 'pt');
+      Writer.SetMetadata('exporter', 'cai-neural-api/llama');
+      // Drain every HF-named tensor the walk produced, preserving its shape.
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TName := Reader.TensorName(i);
+        Dims := Reader.DimCount(TName);
+        SetLength(Shape, Dims);
+        for d := 0 to Dims - 1 do
+          Shape[d] := Reader.DimSize(TName, d);
+        Reader.LoadTensorFlat(TName, V);
+        Writer.AddTensorFlat(TName, Shape, V, pDType);
+      end;
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+  finally
+    V.Free;
+    Reader.Free;
+  end;
 end;
 
 function BuildLlamaFromSafeTensorsEx(const FileName: string;
