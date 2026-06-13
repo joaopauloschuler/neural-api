@@ -510,7 +510,7 @@ unit neuralpretrained;
 interface
 
 uses
-  Classes, SysUtils, fpjson, jsonparser,
+  Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralhftokenizer, neuralmxfp4;
 
@@ -1817,6 +1817,75 @@ procedure BertPoolSentenceEmbedding(HiddenStates: TNNetVolume;
 // padded calls return an approximation.
 procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
   const Text: string; Embedding: TNNetVolume);
+
+// ------------------- generalized pooling + instructions -------------------
+// Sentence-embedding pooling modes generalizing BertPoolSentenceEmbedding's
+// mean-only head:
+//   epCLS       - the FIRST token (row 0), BERT/[CLS]-pooler convention.
+//   epMean      - mean over the REAL tokens (== BertPoolSentenceEmbedding).
+//   epLastToken - the LAST real token (row RealTokens-1), the e5-mistral /
+//                 decoder-as-encoder convention.
+type
+  TNNetEmbedPooling = (epCLS, epMean, epLastToken);
+
+// Pools the (SeqLen,1,hidden) HiddenStates into Embedding (1,1,hidden) using
+// the requested Pooling mode over the first RealTokens rows, optionally
+// L2-normalizing (Normalize=True makes cosine = dot product). The epMean path
+// delegates to BertPoolSentenceEmbedding when Normalize=True (its built-in
+// behaviour); the CLS / last-token paths copy a single row. RealTokens must be
+// in 1..SeqLen.
+procedure PoolSentenceEmbedding(HiddenStates: TNNetVolume;
+  RealTokens: integer; Pooling: TNNetEmbedPooling; Embedding: TNNetVolume;
+  Normalize: boolean = True);
+
+// Instruction-prefix families for asymmetric embedding models. Each prepends a
+// short instruction to the raw text before tokenization (the CALLER tokenizes
+// the returned string). efNone returns the text unchanged.
+//   efE5       - intfloat/e5-* : "query: " / "passage: "
+//   efBGE      - BAAI/bge-*    : query gets the retrieval instruction,
+//                                passages stay raw.
+//   efGteQwen2 - Alibaba-NLP/gte-Qwen2-*-instruct: "Instruct: <task>\nQuery: "
+//                                on queries; passages stay raw.
+type
+  TNNetEmbedInstruction = (efNone, efE5, efBGE, efGteQwen2);
+
+// Returns the bare instruction prefix string for (Family, IsQuery). Passages
+// of efBGE/efGteQwen2 return '' (no prefix). The efGteQwen2 query template
+// embeds Task (defaulting to a generic retrieval task when empty).
+function EmbedInstructionPrefix(Family: TNNetEmbedInstruction;
+  IsQuery: boolean; const Task: string = ''): string;
+
+// Prepends the instruction prefix to Text (see EmbedInstructionPrefix).
+function ApplyEmbedInstruction(Family: TNNetEmbedInstruction;
+  IsQuery: boolean; const Text: string; const Task: string = ''): string;
+
+// ------------------------- embedding eval reports -------------------------
+// Cosine similarity between two equal-length vectors (returns 0 if either is
+// the zero vector). Public so callers can score pairs without a report.
+function CosineSimilarity(A, B: TNNetVolume): TNeuralFloat;
+
+// STSReport: semantic-textual-similarity correlation report. Given Pred cosine
+// (or any) similarity scores and Gold reference scores (parallel arrays of the
+// same length), returns a formatted multi-line report with the Pearson (linear)
+// and Spearman (rank) correlation of Pred vs Gold. Raises on length mismatch or
+// fewer than 2 pairs. Spearman is Pearson on the (average-tie) ranks.
+function STSReport(const Pred, Gold: array of TNeuralFloat): string;
+
+// Pearson / Spearman correlation primitives behind STSReport, exposed for
+// programmatic use (NaN when a series has zero variance).
+function PearsonCorrelation(const X, Y: array of TNeuralFloat): TNeuralFloat;
+function SpearmanCorrelation(const X, Y: array of TNeuralFloat): TNeuralFloat;
+
+// RetrievalReport: ranking-quality report for a planted query/passage set.
+// QueryEmb[i] and PassageEmb[j] are (1,1,d) embeddings; Relevant[i] lists the
+// gold-relevant passage indices for query i (graded relevance not modelled:
+// every listed passage counts as gain 1). For each query, passages are ranked
+// by descending cosine similarity to the query, then Recall@k (for each k in
+// KList) and nDCG@10 are averaged over queries. Returns a formatted report.
+// Raises if QueryEmb/Relevant lengths differ or a passage index is out of range.
+function RetrievalReport(QueryEmb, PassageEmb: array of TNNetVolume;
+  const Relevant: array of TNeuralIntegerArray;
+  const KList: array of integer): string;
 
 // =================== SEQUENCE CLASSIFICATION IMPORT =======================
 // Fine-tuned classifier checkpoints (see the unit-header section of the
@@ -11712,6 +11781,313 @@ begin
     Hidden.Free;
     Input.Free;
   end;
+end;
+
+procedure PoolSentenceEmbedding(HiddenStates: TNNetVolume;
+  RealTokens: integer; Pooling: TNNetEmbedPooling; Embedding: TNNetVolume;
+  Normalize: boolean = True);
+var
+  SeqLen, Depth, ChanCnt, SrcRow: integer;
+  Norm: TNeuralFloat;
+begin
+  SeqLen := HiddenStates.SizeX;
+  Depth := HiddenStates.Depth;
+  if (HiddenStates.SizeY <> 1) or (SeqLen < 1) or (Depth < 1) then
+    ImportError('PoolSentenceEmbedding: expected a (SeqLen,1,hidden) ' +
+      'volume, got ' + IntToStr(SeqLen) + 'x' +
+      IntToStr(HiddenStates.SizeY) + 'x' + IntToStr(Depth) + '.');
+  if (RealTokens < 1) or (RealTokens > SeqLen) then
+    ImportError('PoolSentenceEmbedding: RealTokens ' +
+      IntToStr(RealTokens) + ' out of range 1..' + IntToStr(SeqLen) + '.');
+  // mean path with normalization is exactly BertPoolSentenceEmbedding
+  if (Pooling = epMean) and Normalize then
+  begin
+    BertPoolSentenceEmbedding(HiddenStates, RealTokens, Embedding);
+    Exit;
+  end;
+  Embedding.ReSize(1, 1, Depth);
+  case Pooling of
+    epCLS:        SrcRow := 0;
+    epLastToken:  SrcRow := RealTokens - 1;
+  else
+    SrcRow := -1; // epMean (un-normalized) handled below
+  end;
+  if SrcRow >= 0 then
+    for ChanCnt := 0 to Depth - 1 do
+      Embedding.FData[ChanCnt] := HiddenStates.FData[SrcRow * Depth + ChanCnt]
+  else
+    for ChanCnt := 0 to Depth - 1 do
+    begin
+      Norm := 0; // reuse Norm as a row accumulator
+      for SrcRow := 0 to RealTokens - 1 do
+        Norm := Norm + HiddenStates.FData[SrcRow * Depth + ChanCnt];
+      Embedding.FData[ChanCnt] := Norm / RealTokens;
+    end;
+  if Normalize then
+  begin
+    Norm := 0;
+    for ChanCnt := 0 to Depth - 1 do
+      Norm := Norm + Embedding.FData[ChanCnt] * Embedding.FData[ChanCnt];
+    Norm := Sqrt(Norm);
+    if Norm > 0 then
+      for ChanCnt := 0 to Depth - 1 do
+        Embedding.FData[ChanCnt] := Embedding.FData[ChanCnt] / Norm;
+  end;
+end;
+
+function EmbedInstructionPrefix(Family: TNNetEmbedInstruction;
+  IsQuery: boolean; const Task: string = ''): string;
+var
+  TaskStr: string;
+begin
+  Result := '';
+  case Family of
+    efNone: Result := '';
+    efE5:
+      if IsQuery then Result := 'query: ' else Result := 'passage: ';
+    efBGE:
+      if IsQuery then
+        Result := 'Represent this sentence for searching relevant ' +
+          'passages: ';
+      // bge passages are embedded raw
+    efGteQwen2:
+      if IsQuery then
+      begin
+        TaskStr := Task;
+        if TaskStr = '' then
+          TaskStr := 'Given a web search query, retrieve relevant ' +
+            'passages that answer the query';
+        Result := 'Instruct: ' + TaskStr + #10 + 'Query: ';
+      end;
+      // gte-Qwen2 passages are embedded raw
+  end;
+end;
+
+function ApplyEmbedInstruction(Family: TNNetEmbedInstruction;
+  IsQuery: boolean; const Text: string; const Task: string = ''): string;
+begin
+  Result := EmbedInstructionPrefix(Family, IsQuery, Task) + Text;
+end;
+
+function CosineSimilarity(A, B: TNNetVolume): TNeuralFloat;
+var
+  Dot, NormA, NormB: TNeuralFloat;
+  Cnt: integer;
+begin
+  if A.Size <> B.Size then
+    ImportError('CosineSimilarity: vector size mismatch ' +
+      IntToStr(A.Size) + ' vs ' + IntToStr(B.Size) + '.');
+  Dot := 0; NormA := 0; NormB := 0;
+  for Cnt := 0 to A.Size - 1 do
+  begin
+    Dot   := Dot   + A.FData[Cnt] * B.FData[Cnt];
+    NormA := NormA + A.FData[Cnt] * A.FData[Cnt];
+    NormB := NormB + B.FData[Cnt] * B.FData[Cnt];
+  end;
+  if (NormA <= 0) or (NormB <= 0) then
+    Result := 0
+  else
+    Result := Dot / (Sqrt(NormA) * Sqrt(NormB));
+end;
+
+function PearsonCorrelation(const X, Y: array of TNeuralFloat): TNeuralFloat;
+var
+  N, Cnt: integer;
+  MeanX, MeanY, Cov, VarX, VarY, Dx, Dy: TNeuralFloat;
+begin
+  N := Length(X);
+  if N <> Length(Y) then
+    ImportError('PearsonCorrelation: length mismatch ' + IntToStr(N) +
+      ' vs ' + IntToStr(Length(Y)) + '.');
+  if N < 2 then
+    ImportError('PearsonCorrelation: need at least 2 points.');
+  MeanX := 0; MeanY := 0;
+  for Cnt := 0 to N - 1 do
+  begin
+    MeanX := MeanX + X[Cnt];
+    MeanY := MeanY + Y[Cnt];
+  end;
+  MeanX := MeanX / N; MeanY := MeanY / N;
+  Cov := 0; VarX := 0; VarY := 0;
+  for Cnt := 0 to N - 1 do
+  begin
+    Dx := X[Cnt] - MeanX;
+    Dy := Y[Cnt] - MeanY;
+    Cov  := Cov  + Dx * Dy;
+    VarX := VarX + Dx * Dx;
+    VarY := VarY + Dy * Dy;
+  end;
+  if (VarX <= 0) or (VarY <= 0) then
+    Result := NaN
+  else
+    Result := Cov / (Sqrt(VarX) * Sqrt(VarY));
+end;
+
+// Average-tie ranks: equal values share the mean of the ranks they span
+// (e.g. two values tied for ranks 3,4 both get 3.5). This is the standard
+// rank assignment that makes Spearman = Pearson-on-ranks consistent with
+// scipy.stats.spearmanr.
+function AverageTieRanks(const V: array of TNeuralFloat): TNeuralFloatDynArr;
+var
+  N, Cnt, i, j: integer;
+  Order: array of integer;
+  Tmp: integer;
+  RankSum: TNeuralFloat;
+begin
+  N := Length(V);
+  SetLength(Result, N);
+  SetLength(Order, N);
+  for Cnt := 0 to N - 1 do Order[Cnt] := Cnt;
+  // simple insertion sort of indices by ascending V (N is small in eval sets)
+  for i := 1 to N - 1 do
+  begin
+    Tmp := Order[i];
+    j := i - 1;
+    while (j >= 0) and (V[Order[j]] > V[Tmp]) do
+    begin
+      Order[j + 1] := Order[j];
+      Dec(j);
+    end;
+    Order[j + 1] := Tmp;
+  end;
+  // assign average ranks (1-based) to runs of equal values
+  i := 0;
+  while i < N do
+  begin
+    j := i;
+    while (j + 1 < N) and (V[Order[j + 1]] = V[Order[i]]) do Inc(j);
+    RankSum := 0;
+    for Cnt := i to j do RankSum := RankSum + (Cnt + 1);
+    RankSum := RankSum / (j - i + 1);
+    for Cnt := i to j do Result[Order[Cnt]] := RankSum;
+    i := j + 1;
+  end;
+end;
+
+function SpearmanCorrelation(const X, Y: array of TNeuralFloat): TNeuralFloat;
+var
+  RankX, RankY: TNeuralFloatDynArr;
+begin
+  if Length(X) <> Length(Y) then
+    ImportError('SpearmanCorrelation: length mismatch ' +
+      IntToStr(Length(X)) + ' vs ' + IntToStr(Length(Y)) + '.');
+  RankX := AverageTieRanks(X);
+  RankY := AverageTieRanks(Y);
+  Result := PearsonCorrelation(RankX, RankY);
+end;
+
+function STSReport(const Pred, Gold: array of TNeuralFloat): string;
+var
+  N: integer;
+  Pear, Spear: TNeuralFloat;
+begin
+  N := Length(Pred);
+  if N <> Length(Gold) then
+    ImportError('STSReport: Pred/Gold length mismatch ' + IntToStr(N) +
+      ' vs ' + IntToStr(Length(Gold)) + '.');
+  if N < 2 then
+    ImportError('STSReport: need at least 2 pairs.');
+  Pear  := PearsonCorrelation(Pred, Gold);
+  Spear := SpearmanCorrelation(Pred, Gold);
+  Result :=
+    '=== STS Report ===' + sLineBreak +
+    'pairs:    ' + IntToStr(N) + sLineBreak +
+    'Pearson:  ' + FloatToStrF(Pear,  ffFixed, 8, 4) + sLineBreak +
+    'Spearman: ' + FloatToStrF(Spear, ffFixed, 8, 4) + sLineBreak;
+end;
+
+function RetrievalReport(QueryEmb, PassageEmb: array of TNNetVolume;
+  const Relevant: array of TNeuralIntegerArray;
+  const KList: array of integer): string;
+var
+  NQ, NP, Qi, Pj, Ki, RankPos, RelIdx, MaxK: integer;
+  Scores: TNeuralFloatDynArr;
+  Order: array of integer;
+  Tmp: integer;
+  IsRel: array of boolean;
+  RecallSum: TNeuralFloatDynArr;
+  NDCGSum, DCG, IDCG, Gain: TNeuralFloat;
+  HitCount, NumRel, i, j: integer;
+begin
+  NQ := Length(QueryEmb);
+  NP := Length(PassageEmb);
+  if NQ <> Length(Relevant) then
+    ImportError('RetrievalReport: QueryEmb/Relevant length mismatch ' +
+      IntToStr(NQ) + ' vs ' + IntToStr(Length(Relevant)) + '.');
+  if (NQ < 1) or (NP < 1) then
+    ImportError('RetrievalReport: need >=1 query and >=1 passage.');
+  if Length(KList) < 1 then
+    ImportError('RetrievalReport: KList must list at least one k.');
+  SetLength(RecallSum, Length(KList));
+  for Ki := 0 to High(KList) do RecallSum[Ki] := 0;
+  NDCGSum := 0;
+  MaxK := 10; // nDCG@10
+  SetLength(Scores, NP);
+  SetLength(Order, NP);
+  SetLength(IsRel, NP);
+  for Qi := 0 to NQ - 1 do
+  begin
+    for Pj := 0 to NP - 1 do
+    begin
+      Scores[Pj] := CosineSimilarity(QueryEmb[Qi], PassageEmb[Pj]);
+      Order[Pj] := Pj;
+      IsRel[Pj] := False;
+    end;
+    NumRel := Length(Relevant[Qi]);
+    for RelIdx := 0 to NumRel - 1 do
+    begin
+      Pj := Relevant[Qi][RelIdx];
+      if (Pj < 0) or (Pj >= NP) then
+        ImportError('RetrievalReport: relevant passage index ' +
+          IntToStr(Pj) + ' for query ' + IntToStr(Qi) + ' out of range.');
+      IsRel[Pj] := True;
+    end;
+    // descending sort of passage indices by score (stable insertion sort,
+    // ties keep lower index first -> deterministic ranking)
+    for i := 1 to NP - 1 do
+    begin
+      Tmp := Order[i];
+      j := i - 1;
+      while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
+      begin
+        Order[j + 1] := Order[j];
+        Dec(j);
+      end;
+      Order[j + 1] := Tmp;
+    end;
+    // Recall@k for each requested k
+    for Ki := 0 to High(KList) do
+    begin
+      HitCount := 0;
+      for RankPos := 0 to KList[Ki] - 1 do
+        if (RankPos < NP) and IsRel[Order[RankPos]] then Inc(HitCount);
+      if NumRel > 0 then
+        RecallSum[Ki] := RecallSum[Ki] + HitCount / NumRel;
+    end;
+    // nDCG@10 (binary relevance: gain 1 per relevant hit)
+    DCG := 0;
+    for RankPos := 0 to MaxK - 1 do
+      if (RankPos < NP) and IsRel[Order[RankPos]] then
+      begin
+        Gain := 1;
+        DCG := DCG + Gain / (Ln(RankPos + 2) / Ln(2)); // log2(rank+1), rank 1-based
+      end;
+    IDCG := 0;
+    for RankPos := 0 to MaxK - 1 do
+      if RankPos < NumRel then
+        IDCG := IDCG + 1 / (Ln(RankPos + 2) / Ln(2));
+    if IDCG > 0 then
+      NDCGSum := NDCGSum + DCG / IDCG;
+  end;
+  Result :=
+    '=== Retrieval Report ===' + sLineBreak +
+    'queries:  ' + IntToStr(NQ) + sLineBreak +
+    'passages: ' + IntToStr(NP) + sLineBreak;
+  for Ki := 0 to High(KList) do
+    Result := Result + 'Recall@' + IntToStr(KList[Ki]) + ': ' +
+      FloatToStrF(RecallSum[Ki] / NQ, ffFixed, 8, 4) + sLineBreak;
+  Result := Result + 'nDCG@10:  ' +
+    FloatToStrF(NDCGSum / NQ, ffFixed, 8, 4) + sLineBreak;
 end;
 
 // =================== SEQUENCE CLASSIFICATION IMPORT =======================

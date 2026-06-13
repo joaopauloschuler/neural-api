@@ -233,6 +233,11 @@ type
     procedure TestGPT2SeqClsLogitParity;
     procedure TestBuildFromPretrainedSeqClsDispatch;
     procedure TestBertPoolSentenceEmbedding;
+    procedure TestPoolSentenceEmbeddingModes;
+    procedure TestEmbedInstructionPrefixTable;
+    procedure TestPearsonAndSpearmanCorrelation;
+    procedure TestSTSReport;
+    procedure TestRetrievalReport;
     procedure TestBertTokenizeSentence;
     procedure TestBuildFromPretrainedDispatch;
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
@@ -7572,6 +7577,180 @@ begin
   finally
     Embedding.Free;
     Hidden.Free;
+  end;
+end;
+
+// PoolSentenceEmbedding must select CLS (row 0), MEAN (== BertPool), and
+// LAST real token (row RealTokens-1) with optional L2 normalization.
+procedure TTestNeuralPretrained.TestPoolSentenceEmbeddingModes;
+var
+  Hidden, Emb, MeanRef: TNNetVolume;
+  m: double;
+begin
+  Hidden := TNNetVolume.Create();
+  Emb := TNNetVolume.Create();
+  MeanRef := TNNetVolume.Create();
+  try
+    Hidden.ReSize(4, 1, 2);
+    Hidden.FData[0] := 1; Hidden.FData[1] := 2;     // row 0 (CLS)
+    Hidden.FData[2] := 3; Hidden.FData[3] := 10;    // row 1
+    Hidden.FData[4] := 7; Hidden.FData[5] := -1;    // row 2 (last real)
+    Hidden.FData[6] := 999; Hidden.FData[7] := -999;// row 3 = pad
+    // CLS, un-normalized: exactly row 0
+    PoolSentenceEmbedding(Hidden, 3, epCLS, Emb, False);
+    AssertEquals('cls ch0', 1, Emb.FData[0], 1e-6);
+    AssertEquals('cls ch1', 2, Emb.FData[1], 1e-6);
+    // last-token, un-normalized: exactly row 2
+    PoolSentenceEmbedding(Hidden, 3, epLastToken, Emb, False);
+    AssertEquals('last ch0', 7, Emb.FData[0], 1e-6);
+    AssertEquals('last ch1', -1, Emb.FData[1], 1e-6);
+    // last-token, normalized: row 2 / ||row2||
+    PoolSentenceEmbedding(Hidden, 3, epLastToken, Emb, True);
+    m := Sqrt(7*7 + 1);
+    AssertEquals('last-norm ch0', 7 / m, Emb.FData[0], 1e-6);
+    AssertEquals('last-norm unit', 1.0,
+      Sqrt(Sqr(Emb.FData[0]) + Sqr(Emb.FData[1])), 1e-6);
+    // mean, normalized: identical to BertPoolSentenceEmbedding
+    PoolSentenceEmbedding(Hidden, 3, epMean, Emb, True);
+    BertPoolSentenceEmbedding(Hidden, 3, MeanRef);
+    AssertEquals('mean==bertpool ch0', MeanRef.FData[0], Emb.FData[0], 1e-6);
+    AssertEquals('mean==bertpool ch1', MeanRef.FData[1], Emb.FData[1], 1e-6);
+    // mean, un-normalized: raw average of rows 0..2
+    PoolSentenceEmbedding(Hidden, 3, epMean, Emb, False);
+    AssertEquals('mean-raw ch0', (1 + 3 + 7) / 3.0, Emb.FData[0], 1e-6);
+    AssertEquals('mean-raw ch1', (2 + 10 - 1) / 3.0, Emb.FData[1], 1e-6);
+  finally
+    MeanRef.Free; Emb.Free; Hidden.Free;
+  end;
+end;
+
+// Instruction-prefix table: E5 query/passage, BGE query-only, gte-Qwen2
+// templated query, and the ApplyEmbedInstruction prepend.
+procedure TTestNeuralPretrained.TestEmbedInstructionPrefixTable;
+begin
+  AssertEquals('none', '', EmbedInstructionPrefix(efNone, True));
+  AssertEquals('e5 query', 'query: ',
+    EmbedInstructionPrefix(efE5, True));
+  AssertEquals('e5 passage', 'passage: ',
+    EmbedInstructionPrefix(efE5, False));
+  AssertEquals('bge query',
+    'Represent this sentence for searching relevant passages: ',
+    EmbedInstructionPrefix(efBGE, True));
+  AssertEquals('bge passage raw', '',
+    EmbedInstructionPrefix(efBGE, False));
+  AssertEquals('gte-qwen2 query',
+    'Instruct: Find the answer' + #10 + 'Query: ',
+    EmbedInstructionPrefix(efGteQwen2, True, 'Find the answer'));
+  AssertEquals('gte-qwen2 passage raw', '',
+    EmbedInstructionPrefix(efGteQwen2, False, 'Find the answer'));
+  AssertEquals('apply prepend', 'query: hello world',
+    ApplyEmbedInstruction(efE5, True, 'hello world'));
+end;
+
+// Pearson on a perfectly linear pair = 1; Spearman on a monotone-but-
+// non-linear pair = 1 while Pearson < 1; both -1 when reversed.
+procedure TTestNeuralPretrained.TestPearsonAndSpearmanCorrelation;
+var
+  X, YLin, YMono, YRev: array[0..4] of TNeuralFloat;
+  TieX, TieY, TieRankX, TieRankY: array[0..3] of TNeuralFloat;
+  Pear, Spear: TNeuralFloat;
+  i: integer;
+begin
+  TieX[0] := 1;   TieX[1] := 2;   TieX[2] := 2;   TieX[3] := 3;
+  TieY[0] := 10;  TieY[1] := 20;  TieY[2] := 30;  TieY[3] := 40;
+  TieRankX[0] := 1; TieRankX[1] := 2.5; TieRankX[2] := 2.5; TieRankX[3] := 4;
+  TieRankY[0] := 1; TieRankY[1] := 2;   TieRankY[2] := 3;   TieRankY[3] := 4;
+  for i := 0 to 4 do
+  begin
+    X[i]    := i;          // 0,1,2,3,4
+    YLin[i] := 2 * i + 1;  // perfectly linear
+    YMono[i]:= i * i * i;  // strictly increasing, very non-linear
+    YRev[i] := -i;         // perfectly anti-correlated
+  end;
+  AssertEquals('pearson linear=1', 1.0,
+    PearsonCorrelation(X, YLin), 1e-6);
+  AssertEquals('spearman linear=1', 1.0,
+    SpearmanCorrelation(X, YLin), 1e-6);
+  // monotone cubic: Spearman is exactly 1 (rank-preserving) ...
+  AssertEquals('spearman monotone=1', 1.0,
+    SpearmanCorrelation(X, YMono), 1e-6);
+  // ... but Pearson is strictly below 1 (non-linear).
+  Pear := PearsonCorrelation(X, YMono);
+  AssertTrue('pearson monotone<1', Pear < 0.99);
+  AssertTrue('pearson monotone>0', Pear > 0.0);
+  // reversed: both -1
+  AssertEquals('pearson reversed=-1', -1.0,
+    PearsonCorrelation(X, YRev), 1e-6);
+  AssertEquals('spearman reversed=-1', -1.0,
+    SpearmanCorrelation(X, YRev), 1e-6);
+  // average-tie ranks: Spearman with a tie equals the hand value.
+  // X=(1,2,2,3) ranks (1,2.5,2.5,4); Y=(10,20,30,40) ranks (1,2,3,4)
+  Spear := SpearmanCorrelation(
+    TieX, TieY);
+  Pear := PearsonCorrelation(
+    TieRankX, TieRankY);
+  AssertEquals('spearman tie matches pearson-on-hand-ranks',
+    Spear, Pear, 1e-6);
+end;
+
+// STSReport text must carry the pinned Pearson/Spearman of the pair.
+procedure TTestNeuralPretrained.TestSTSReport;
+var
+  Pred, Gold: array[0..3] of TNeuralFloat;
+  Rep: string;
+begin
+  // Pred monotone in Gold but non-linear -> Spearman 1.0000, Pearson < 1.
+  Pred[0] := 0.10; Pred[1] := 0.20; Pred[2] := 0.40; Pred[3] := 0.95;
+  Gold[0] := 1;    Gold[1] := 2;    Gold[2] := 3;    Gold[3] := 4;
+  Rep := STSReport(Pred, Gold);
+  AssertTrue('has header', Pos('STS Report', Rep) > 0);
+  AssertTrue('pairs 4', Pos('pairs:    4', Rep) > 0);
+  AssertTrue('spearman 1.0000', Pos('Spearman: 1.0000', Rep) > 0);
+  AssertTrue('pearson present', Pos('Pearson:', Rep) > 0);
+end;
+
+// RetrievalReport on a planted ranking with known Recall@k and nDCG@10.
+procedure TTestNeuralPretrained.TestRetrievalReport;
+var
+  Q: array[0..0] of TNNetVolume;
+  P: array[0..3] of TNNetVolume;
+  Rel: array[0..0] of TNeuralIntegerArray;
+  Rep: string;
+  i: integer;
+  expNDCG: double;
+  KList: array[0..1] of integer;
+begin
+  KList[0] := 1; KList[1] := 2;
+  for i := 0 to 0 do Q[i] := TNNetVolume.Create();
+  for i := 0 to 3 do P[i] := TNNetVolume.Create();
+  try
+    // 2-D embeddings; query points along +x. Each passage carries a
+    // y-component so its cosine to the query genuinely varies
+    // (cos = x / sqrt(x^2+y^2)).
+    Q[0].ReSize(1,1,2); Q[0].FData[0] := 1; Q[0].FData[1] := 0;
+    // chosen so cosines order P0 > P2 > P1 > P3:
+    P[0].ReSize(1,1,2); P[0].FData[0] := 10; P[0].FData[1] := 1;   // ~0.995
+    P[1].ReSize(1,1,2); P[1].FData[0] := 1;  P[1].FData[1] := 1.5; // ~0.555
+    P[2].ReSize(1,1,2); P[2].FData[0] := 3;  P[2].FData[1] := 1;   // ~0.949
+    P[3].ReSize(1,1,2); P[3].FData[0] := 1;  P[3].FData[1] := 9;   // ~0.110
+    // ranking by cosine: P0(0.99) > P2(0.95) > P1(0.50) > P3(0.10)
+    // gold relevant = {P2, P3} (one at rank 2, one at rank 4)
+    SetLength(Rel[0], 2); Rel[0][0] := 2; Rel[0][1] := 3;
+    Rep := RetrievalReport(Q, P, Rel, KList);
+    AssertTrue('header', Pos('Retrieval Report', Rep) > 0);
+    // Recall@1: rank-1 is P0 (not relevant) -> 0/2 = 0.0000
+    AssertTrue('recall@1 0.0000', Pos('Recall@1: 0.0000', Rep) > 0);
+    // Recall@2: top-2 = {P0,P2}, P2 relevant -> 1/2 = 0.5000
+    AssertTrue('recall@2 0.5000', Pos('Recall@2: 0.5000', Rep) > 0);
+    // nDCG@10: relevant hits at ranks 2 (P2) and 4 (P3).
+    // DCG = 1/log2(3) + 1/log2(5); IDCG = 1/log2(2) + 1/log2(3)
+    expNDCG := (1/(Ln(3)/Ln(2)) + 1/(Ln(5)/Ln(2))) /
+               (1/(Ln(2)/Ln(2)) + 1/(Ln(3)/Ln(2)));
+    AssertTrue('ndcg pinned',
+      Pos('nDCG@10:  ' + FloatToStrF(expNDCG, ffFixed, 8, 4), Rep) > 0);
+  finally
+    for i := 0 to 0 do Q[i].Free;
+    for i := 0 to 3 do P[i].Free;
   end;
 end;
 

@@ -563,6 +563,28 @@ rather than acted on.
       CPU. Turns the broad encoder-import coverage into a usable RAG retriever
       and is the missing measurement half for the existing embedding-training
       examples.
+      LANDED (a3): (a) pooling-mode selector TNNetEmbedPooling
+      (epCLS/epMean/epLastToken) + PoolSentenceEmbedding helper (wraps
+      pooling + optional L2-normalize, delegates to BertPoolSentenceEmbedding
+      on the mean+normalize path); (b) instruction-prefix table
+      TNNetEmbedInstruction (efNone/efE5/efBGE/efGteQwen2) +
+      EmbedInstructionPrefix/ApplyEmbedInstruction; the genuinely new
+      reusable metrics — CosineSimilarity, PearsonCorrelation,
+      SpearmanCorrelation (average-tie ranks), STSReport (Pearson + Spearman
+      vs gold) and RetrievalReport (Recall@k + nDCG@10 over a planted
+      query/passage set), all in neuralpretrained.pas. Unit tests in
+      TestNeuralPretrained.pas: TestPoolSentenceEmbeddingModes,
+      TestEmbedInstructionPrefixTable, TestPearsonAndSpearmanCorrelation,
+      TestSTSReport, TestRetrievalReport (synthetic vectors with pinned
+      metric values).
+      STILL DEFERRED (RAM/time-gated, for a future agent): the pico parity
+      fixture (make_pico_*_fixture.py recipe) asserting one E5-or-BGE
+      checkpoint's pooled+normalized query/passage vectors match HF
+      sentence-transformers float64 within 1e-4, and the
+      examples/SemanticSearch-style demo that embeds passages and ranks them
+      against a query on CPU (the existing examples/SemanticSearch already
+      covers the MiniLM mean-pool case; the new piece would wire a pooling
+      mode + instruction prefix through it).
 
 ## Layer follow-ups that fix real limitations
 
