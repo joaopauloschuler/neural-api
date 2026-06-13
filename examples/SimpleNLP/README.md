@@ -172,10 +172,13 @@ the decode benchmark. The model is a small RoPE transformer decoder
 (ctx=48, d_model=128, 2 blocks, 8 heads, FFN 512, 3k vocab, \~1.31M params) with
 `TNNetDyT` normalization — RoPE and DyT are chosen because both are exactly
 streamable token-at-a-time (learned absolute positions and sequence-wide LayerNorm
-statistics are not). Phase 1 saves `bakeoff-phase1.nn`; phase 5 loads it and trains a
+statistics are not). 
+
+**Phase 1** saves `bakeoff-phase1.nn`; phase 5 loads it and trains a
 cheap attention-free TokenShift draft (d=64, FFN 256), then runs greedy speculative
 decoding with cached verification and `TruncateCache` rollback on rejection.
-Phase 2 uses MTP (Multi-Token Prediction, Gloeckle et al. 2024 / DeepSeek-V3 —
+
+**Phase 2** uses MTP (Multi-Token Prediction, Gloeckle et al. 2024 / DeepSeek-V3 —
 parallel heads that forecast several future tokens at once instead of only the next
 one): it trains the same trunk with `TNNet.AddMultiTokenPrediction(NumFuture=3)`
 (\~2.08M params): head 0 is the ordinary next-token head, heads 1..2 forecast t+2/t+3
@@ -187,7 +190,8 @@ cache with MTP drafting is NOT attempted (after a rejection the drafts come from
 forward whose window a cache never saw — known open problem), so both phase-2 arms
 pay full re-encode forwards and the measured win is forwards/token at equal
 per-forward cost.
-Phase 3 swaps the sequence mixer: same residual skeleton (DyT pre-norm + SwiGLU FFN,
+
+**Phase 3** swaps the sequence mixer: same residual skeleton (DyT pre-norm + SwiGLU FFN,
 same d_model/blocks/FFN/head), but the mixer is the recurrent `TNNetDiagonalSSM` —
 an SSM (State-Space Model, the S4/Mamba family): a linear per-channel recurrence
 `h_t = a·h_{t-1} + b·x_t` whose fixed-size hidden state carries the entire past, so
@@ -197,7 +201,8 @@ positional embedding — the recurrence carries order. Its decode benchmark is f
 re-encode vs the layer's `BeginIncrementalDecode`/`ResetState` O(1)-per-step path,
 where the ENTIRE past is a Depth-long state vector per SSM layer (no per-token cache
 growth), with step cost reported per prefix-length bucket to show flatness.
-Phase 4 swaps the attention for MLA (Multi-head Latent Attention, DeepSeek-V2 — an
+
+**Phase 4** swaps the attention for MLA (Multi-head Latent Attention, DeepSeek-V2 — an
 attention variant that shrinks the per-token KV cache by factoring K/V through a tiny
 shared latent instead of caching full per-head K and V):
 `TNNet.AddMultiHeadLatentAttention(128, 8, LatentDim=32,
@@ -208,7 +213,8 @@ the per-head SDPA caches + `PositionOffset` (proving streamed-MLA token-exactnes
 rope slice included); the latent-only bytes/token row in its economics table is the
 ANALYTIC paper number — the true latent-only decode loop is run in
 [examples/LatentAttention](../LatentAttention), not here.
-Phase 6 builds the hybrid that phases 1–5 point to as the constrained-CPU
+
+**Phase 6** builds the hybrid that phases 1–5 point to as the constrained-CPU
 recommendation: a 3-block trunk of TWO phase-3 DiagonalSSM blocks and ONE phase-4 MLA
 block (LatentDim 32, RopeDim 8), each block keeping the identical
 [DyT → mixer → residual] + [DyT → SwiGLU FFN 512 → residual] skeleton, token-only
@@ -226,7 +232,8 @@ greedy only (phase 5 showed speculation does not pay on CPU; phase 2's extra MTP
 heads cost two more 128→3000 projections), and the phase ends with a printed
 three-assumption verdict (convergence vs the pure-mixer references, sample looping,
 decode cost/flatness/cache size).
-Phase 7 repeats phase 6 with every large dense 1×1 projection swapped for its grouped
+
+**Phase 7** repeats phase 6 with every large dense 1×1 projection swapped for its grouped
 alternative (`TNNetGroupedPointwiseConvLinear` through `AddAutoGroupedPointwiseConv`,
 MinChannelsPerGroup=16: block-diagonal weights, plus interleave-based intergroup
 remixing where input depth ≥ output depth): the SSM in/out projections, the SwiGLU FFN
@@ -238,7 +245,8 @@ intergroup remix). Grouped pointwise convs are strictly per-token, so the phase-
 dual-family streamed decode applies unchanged, and the hard assert doubles as proof
 that grouped layers stream token-exactly. Its verdict compares weight count,
 convergence and decode cost against phase 6's dense references.
-Phase 8 is phase 1's transformer skeleton EXACTLY — `TNNet.AddAlternatingLocalGlobalBlocks`
+
+**Phase 8** is phase 1's transformer skeleton EXACTLY — `TNNet.AddAlternatingLocalGlobalBlocks`
 with phase 1's arguments (DyT pre-norm, RoPE, SwiGLU FFN 512, CausalMask) expands to the
 same `AddTransformerEncoderBlock` calls — with only the attention MASKING changed: block 1
 is LOCAL (Gemma-2-style sliding window of 12 keys = ctx/4, the new `Window` argument of
@@ -250,7 +258,8 @@ min(t, W) positions provably sufficient decode state, so a local layer's KV cach
 BOUNDED at 2·d_model·W floats while every global layer grows by 2·d_model floats/token —
 printed at several prefix lengths against phase 1's all-global two-layer reference,
 together with the quality cost of windowing vs phase 1's reference loss.
-Phase 9 swaps phase 1's SEQUENTIAL encoder blocks for the PARALLEL attention+FFN
+
+**Phase 9** swaps phase 1's SEQUENTIAL encoder blocks for the PARALLEL attention+FFN
 formulation (GPT-J / PaLM / Falcon, `TNNet.AddParallelTransformerBlock`):
 y = x + Attn(DyT(x)) + FFN(DyT(x)) with ONE shared pre-norm and a single 3-input residual
 sum — same d_model/heads/FFN/RoPE, one DyT fewer per block, so the weight counts match to
@@ -267,6 +276,7 @@ owns the incremental-mode switching, `ResetCache`/`ResetState`, per-forward
 RoPE `PositionOffset`, and the speculative `TruncateTo` rollback — one session
 class covers the attention-only, SSM-only and dual-family hybrid twins alike.
 
+### Results
 Dataset setup is the same as above (run from this directory):
 ```
 git clone https://huggingface.co/datasets/schuler/TinyStories4Pascal-Tokenized-v2
