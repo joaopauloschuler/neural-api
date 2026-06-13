@@ -870,6 +870,23 @@ var
       else
         FBertStripAccents := Node.AsBoolean;
     end
+    else if (Kind = 'NFC') or (Kind = 'NFD') or (Kind = 'NFKC') or
+            (Kind = 'NFKD') then
+      // Unicode normalization forms (Qwen2/3 ship a bare NFC normalizer).
+      // Applying them faithfully would need the full canonical
+      // composition/decomposition tables; we treat them as no-ops instead
+      // (the SAME approximation stance taken for NFKC/precompiled_charsmap on
+      // the Unigram / SentencePiece path). Real-world input -- including
+      // terminal chat and HF-emitted text -- is already in NFC, so this is a
+      // no-op in practice; only pre-decomposed input would tokenize slightly
+      // differently.
+      //
+      // TODO: implement REAL Unicode normalization here instead of stubbing
+      // it out. Needs the canonical-decomposition (NFD) + combining-class
+      // ordering + canonical-composition (NFC) tables (and the compatibility
+      // mappings for NFKC/NFKD), vendored compactly or generated from
+      // UnicodeData.txt, plus an HF parity test on combining-mark input.
+      // Tracked in tasklist.md ("Proper Unicode NFC normalization").
     else
       raise EHFTokenizerError.Create('Unsupported normalizer type: ' + Kind);
   end;

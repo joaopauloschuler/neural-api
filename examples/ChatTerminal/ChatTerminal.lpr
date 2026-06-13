@@ -75,6 +75,12 @@ uses
   neuralvolume, neuralnetwork, neuralpretrained, neuralhftokenizer,
   neuralchat, neuraldecode;
 
+const
+  // Default --ctx when the user gives none. Kept modest because build memory
+  // is O(ctx^2) (a SeqLen x SeqLen score buffer per head per layer); the full
+  // checkpoint context (e.g. 32768) would OOM at load. See the load path.
+  DefaultCtxCap = 2048;
+
 type
   TChatOptions = record
     ModelDir: string;
@@ -116,7 +122,7 @@ begin
   WriteLn('  --presence-penalty X    presence penalty (default 0)');
   WriteLn('  --max-new-tokens N    reply length cap (default 128)');
   WriteLn('  --seed N              RNG seed (default: randomize)');
-  WriteLn('  --ctx N               context window to build (default: model max)');
+  WriteLn('  --ctx N               context window (default min(model max,2048); mem ~O(ctx^2))');
   WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral');
   WriteLn('  --system "msg"        initial system prompt');
   WriteLn('  --int8                int8 weight-only quantized inference');
@@ -416,6 +422,40 @@ begin
   SL.Free;
 end;
 
+// Reads an integer field from config.json (e.g. max_position_embeddings),
+// returning Default on any trouble. Same fpjson stance as ReadModelType.
+function ReadConfigInt(const ConfigFile, Field: string;
+  Default: integer): integer;
+var
+  SL: TStringList;
+  Parser: TJSONParser;
+  Root: TJSONData;
+  Node: TJSONData;
+begin
+  Result := Default;
+  if not FileExists(ConfigFile) then exit;
+  SL := TStringList.Create();
+  try
+    SL.LoadFromFile(ConfigFile);
+    Parser := TJSONParser.Create(SL.Text, []);
+    try
+      Root := Parser.Parse();
+      try
+        Node := Root.FindPath(Field);
+        if Assigned(Node) and (Node.JSONType = jtNumber) then
+          Result := Node.AsInteger;
+      finally
+        Root.Free;
+      end;
+    finally
+      Parser.Free;
+    end;
+  except
+    Result := Default;
+  end;
+  SL.Free;
+end;
+
 // ---------------------------------------------------------------------------
 // Generation: one assistant reply, streamed to stdout as it decodes.
 // ---------------------------------------------------------------------------
@@ -703,6 +743,23 @@ begin
 
   if Opt.Seed >= 0 then RandSeed := Opt.Seed
   else Randomize;
+
+  // Default context window. The full-recompute decode allocates a persistent
+  // SeqLen x SeqLen attention-score buffer PER HEAD PER LAYER, so build memory
+  // grows as O(SeqLen^2) (e.g. ~336 such buffers for a 24-layer/14-head 0.5B
+  // model). Using the checkpoint's full max_position_embeddings (32768 for
+  // Qwen2.5) would request terabytes and OOM at load, so when the user gives
+  // no --ctx we cap the default at DefaultCtxCap (clamped to the model's own
+  // limit). Raise it with --ctx N (and prefer --int8) if you have the RAM.
+  if Opt.CtxLen <= 0 then
+  begin
+    Cnt := ReadConfigInt(IncludeTrailingPathDelimiter(Opt.ModelDir) +
+      'config.json', 'max_position_embeddings', DefaultCtxCap);
+    if (Cnt <= 0) or (Cnt > DefaultCtxCap) then Cnt := DefaultCtxCap;
+    Opt.CtxLen := Cnt;
+    WriteLn('[context not set - defaulting to ', Opt.CtxLen,
+      ' tokens; override with --ctx N (memory grows ~O(ctx^2))]');
+  end;
 
   // Model: generic architecture dispatch, inference-only, optional int8.
   WriteLn('Loading ', Opt.ModelDir, ' ...');

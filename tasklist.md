@@ -87,6 +87,18 @@ rather than acted on.
       denormals inside the layer's FFT so callers don't have to.
 - [ ] ulimit -v 3000000 ChatTerminal /path/to/Qwen2.5-0.5B-Instruct crashes using all RAM at loading the model
       Tested with !git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
+- [ ] Proper Unicode NFC normalization in `neuralhftokenizer.pas`
+      (`AddNormalizer`). Qwen2/3 ship a bare `{"type":"NFC"}` normalizer;
+      we currently accept NFC/NFD/NFKC/NFKD as NO-OPS (the same approximation
+      stance as the Unigram/SentencePiece NFKC path) so the tokenizer loads.
+      This is correct only for already-NFC input (true for terminal chat and
+      HF-emitted text), but pre-decomposed input tokenizes differently from
+      HF. Implement real canonical composition/decomposition: needs the
+      Unicode canonical-decomposition (NFD) + canonical-ordering (combining
+      classes) + composition (NFC) tables — either vendor a compact table or
+      generate it from UnicodeData.txt. Start with NFC/NFD (canonical), then
+      NFKC/NFKD (compatibility). Add a parity test against HF on a string
+      with combining marks to pin behavior. See the TODO in `AddNormalizer`.
 
 ## Infrastructure / dev experience
 
