@@ -52,6 +52,11 @@ type
     // log p_final - log p_premature is then MAXIMISED at TGood, so DoLa flips
     // the completion from TBias to TGood while greedy never does.
     function BuildDoLaBiasedNet(ContextLen, Vocab, TBias, TGood: integer): TNNet;
+    // DoLa toy LM with TWO lens-compatible premature layers (a SHALLOW and a
+    // DEEP candidate) that peak on DIFFERENT tokens, so DoLa-low and DoLa-high
+    // select different premature layers and contrast to different next tokens.
+    function BuildDoLaTwoCandidateNet(ContextLen, Vocab,
+      TShallow, TDeep, TFinal: integer): TNNet;
     // Locates the committed encoder-decoder fixtures (same probing as
     // TestNeuralPretrained.FixturePath: RunAll.sh runs from tests/).
     function FixturePath(const FileName: string): string;
@@ -93,6 +98,7 @@ type
     procedure TestDoLaAlphaZeroMatchesGreedy;
     procedure TestDoLaEmptyBucketMatchesGreedy;
     procedure TestDoLaFlipsShallowBiasedCompletion;
+    procedure TestDoLaLowHighBucketsSelectDifferentLayers;
     // Best-of-N / self-consistency reranking.
     procedure TestBestOfNReturnsHighestScoringCandidate;
     procedure TestBestOfNExternalScorerPicksItsTop;
@@ -645,6 +651,103 @@ begin
       AssertEquals('DoLa flips to the good token', Chr(TGood), D.Text[I]);
     end;
     AssertTrue('DoLa actually changed the completion', D.Text <> G.Text);
+  finally
+    NN.Free;
+  end;
+end;
+
+function TTestNeuralDecode.BuildDoLaTwoCandidateNet(ContextLen, Vocab,
+  TShallow, TDeep, TFinal: integer): TNNet;
+var
+  L1, L2, L3, L4: TNNetLayer;
+  N: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, Vocab));
+  L1 := Result.AddLayer(TNNetFullConnectLinear.Create(Vocab)); // shallow premature
+  L2 := Result.AddLayer(TNNetFullConnectLinear.Create(Vocab)); // deep premature
+  L3 := Result.AddLayer(TNNetFullConnectLinear.Create(Vocab)); // head input
+  L4 := Result.AddLayer(TNNetFullConnectLinear.Create(Vocab)); // LM head
+  Result.AddLayer(TNNetSoftMax.Create());
+  Result.InitWeights();
+  // L1 (shallow lens): zero weights -> input-independent logits peaked on
+  // TShallow. lens_low(t) = softmax over [.. peak at TShallow ..].
+  for N := 0 to L1.Neurons.Count - 1 do
+  begin
+    L1.Neurons[N].Weights.Fill(0);
+    L1.Neurons[N].BiasWeight := 0;
+  end;
+  L1.Neurons[TShallow].BiasWeight := 5;
+  L1.MulWeights(1.0);
+  // L2 (deep lens): zero weights -> input-independent logits peaked on TDeep.
+  for N := 0 to L2.Neurons.Count - 1 do
+  begin
+    L2.Neurons[N].Weights.Fill(0);
+    L2.Neurons[N].BiasWeight := 0;
+  end;
+  L2.Neurons[TDeep].BiasWeight := 5;
+  L2.MulWeights(1.0);
+  // L3 (head input): IDENTITY from L2 (logit 5 at TDeep) plus a bias so the
+  // FINAL logits are EQUAL-high at BOTH TShallow and TDeep (the plausible set),
+  // making the contrast term log p_final - log p_lens decide the winner.
+  // Final logits: TShallow=6, TDeep=6 (L2 had 5 at TDeep so +1 there, +6 at
+  // TShallow which L2 left at 0). TFinal is left low here on purpose - the
+  // contrast, not the raw argmax, drives the choice.
+  for N := 0 to L3.Neurons.Count - 1 do
+  begin
+    L3.Neurons[N].Weights.Fill(0);
+    L3.Neurons[N].Weights.FData[N] := 1; // identity from L2
+    L3.Neurons[N].BiasWeight := 0;
+  end;
+  L3.Neurons[TShallow].BiasWeight := 6;  // final[TShallow] = 0 + 6 = 6
+  L3.Neurons[TDeep].BiasWeight := 1;     // final[TDeep]    = 5 + 1 = 6
+  L3.MulWeights(1.0);
+  // L4 (LM head): identity.
+  for N := 0 to L4.Neurons.Count - 1 do
+  begin
+    L4.Neurons[N].Weights.Fill(0);
+    L4.Neurons[N].Weights.FData[N] := 1;
+    L4.Neurons[N].BiasWeight := 0;
+  end;
+  L4.MulWeights(1.0);
+  if TFinal < 0 then; // TFinal unused as a separate peak; kept for documentation
+end;
+
+procedure TTestNeuralDecode.TestDoLaLowHighBucketsSelectDifferentLayers;
+const
+  TShallow = 3;
+  TDeep    = 4;
+var
+  NN: TNNet;
+  DLow, DHigh: TNNetDecodeResult;
+  NoStops: array of string;
+  I: integer;
+begin
+  // Two lens-compatible premature layers (L1 shallow peaks on TShallow, L2 deep
+  // peaks on TDeep). The plausible set is {TShallow, TDeep} (equal-high final
+  // logits). The contrast argmax(final_logit - lens_logit) then:
+  //   * DoLa-LOW (lens = shallow, peaks TShallow) suppresses TShallow -> TDeep.
+  //   * DoLa-HIGH (lens = deep,  peaks TDeep)     suppresses TDeep    -> TShallow.
+  // So restricting the candidate bucket to the low vs high half flips the
+  // emitted token EVERY step - proof the bucket restriction changes which
+  // premature layer is chosen and thus the contrasted logits.
+  SetLength(NoStops, 0);
+  NN := BuildDoLaTwoCandidateNet(4, 8, TShallow, TDeep, -1);
+  try
+    DLow  := DecodeDoLa(NN, 'ab', 4, 0.1, NoStops, dlbLow);
+    DHigh := DecodeDoLa(NN, 'ab', 4, 0.1, NoStops, dlbHigh);
+    AssertEquals('DoLa-low and DoLa-high same length',
+      Length(DLow.Text), Length(DHigh.Text));
+    AssertTrue('DoLa-low produced tokens', Length(DLow.Text) >= 1);
+    AssertTrue('low/high buckets pick different layers -> different text',
+      DLow.Text <> DHigh.Text);
+    for I := 1 to Length(DLow.Text) do
+    begin
+      AssertEquals('DoLa-low emits TDeep (shallow lens suppresses TShallow)',
+        Chr(TDeep), DLow.Text[I]);
+      AssertEquals('DoLa-high emits TShallow (deep lens suppresses TDeep)',
+        Chr(TShallow), DHigh.Text[I]);
+    end;
   finally
     NN.Free;
   end;

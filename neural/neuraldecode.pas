@@ -167,6 +167,18 @@ type
   // "of object") so a bare function can be passed. Coded by Claude (AI).
   TNNetSequenceScorer = function(const Prompt, Generated: string): TNeuralFloat;
 
+  // DoLa candidate-layer bucket selection (Chuang et al. 2023, the paper's
+  // DoLa-low / DoLa-high dynamic premature-layer pools). The lens-compatible
+  // earlier layers (those whose Output.Size matches the head-input slot) are
+  // ordered by depth and split at the midpoint:
+  //   dlbFull - all lens-compatible layers (the v1 fixed bucket; default).
+  //   dlbLow  - the SHALLOW half (early layers, index < count div 2).
+  //   dlbHigh - the DEEP half (later layers, index >= count div 2).
+  // With a single candidate layer dlbLow keeps it and dlbHigh is empty (an
+  // empty bucket degrades DoLa to greedy, same invariant as Alpha<=0).
+  // Coded by Claude (AI).
+  TDoLaLayerBucket = (dlbFull, dlbLow, dlbHigh);
+
   // Answer-extraction callback for the self-consistency variant: maps a full
   // generated continuation to its canonical ANSWER string (e.g. the final
   // number after "####"). Candidates whose extracted answer is the empty string
@@ -1073,7 +1085,19 @@ function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
 function DecodeDoLa(NN: TNNet; const Prompt: string;
   MaxLen: integer; Alpha: TNeuralFloat;
   const StopStrings: array of string;
-  HeadStartIdx: integer = -1): TNNetDecodeResult;
+  HeadStartIdx: integer = -1): TNNetDecodeResult; overload;
+
+// DoLa with explicit DoLa-low / DoLa-high candidate-layer bucket selection
+// (the paper's dynamic premature-layer pools). Bucket=dlbFull is identical to
+// the call above. dlbLow restricts the per-step max-JS premature-layer search
+// to the SHALLOW half of the lens-compatible layers, dlbHigh to the DEEP half;
+// an empty resulting bucket degrades to greedy exactly as Alpha<=0 does.
+// Coded by Claude (AI).
+function DecodeDoLa(NN: TNNet; const Prompt: string;
+  MaxLen: integer; Alpha: TNeuralFloat;
+  const StopStrings: array of string;
+  Bucket: TDoLaLayerBucket;
+  HeadStartIdx: integer = -1): TNNetDecodeResult; overload;
 
 // SAMPLED char-level decode: the stochastic sibling of DecodeGreedy. Each step
 // draws the next token from the softmax row via Sampler.GetToken (Sampler = nil
@@ -4014,15 +4038,18 @@ begin
   if Result > LastLayer then Result := LastLayer;
 end;
 
-// Builds the fixed DoLa candidate-layer bucket: every layer 0..HeadInIdx-1 whose
+// Builds the DoLa candidate-layer bucket: every layer 0..HeadInIdx-1 whose
 // Output.Size equals the head-input size (so its activation can be spliced into
 // the head-input slot and pushed through the SAME LM head). HeadInIdx itself is
 // EXCLUDED - contrasting a layer against its own forward is a no-op.
+// Mode selects the paper's dynamic premature-layer pool over those (already
+// depth-ordered) candidates: dlbFull keeps all, dlbLow the shallow half
+// (index < count div 2), dlbHigh the deep half (index >= count div 2).
 // Coded by Claude (AI).
 procedure BuildDoLaCandidateBucket(NN: TNNet; HeadInIdx: integer;
-  var Bucket: TNeuralIntegerArray);
+  Mode: TDoLaLayerBucket; var Bucket: TNeuralIntegerArray);
 var
-  LayerIdx, HeadInSize, N: integer;
+  LayerIdx, HeadInSize, N, Total, Half, Lo, Hi, W: integer;
 begin
   HeadInSize := NN.Layers[HeadInIdx].Output.Size;
   N := 0;
@@ -4034,17 +4061,44 @@ begin
       Inc(N);
     end;
   SetLength(Bucket, N);
+  if Mode = dlbFull then Exit;
+  // Split the depth-ordered candidates at the midpoint and keep one half.
+  Total := N;
+  Half := Total div 2;
+  case Mode of
+    dlbLow:  begin Lo := 0;    Hi := Half - 1; end;
+    dlbHigh: begin Lo := Half; Hi := Total - 1; end;
+  else
+    begin Lo := 0; Hi := Total - 1; end;
+  end;
+  W := 0;
+  for LayerIdx := Lo to Hi do
+  begin
+    Bucket[W] := Bucket[LayerIdx];
+    Inc(W);
+  end;
+  SetLength(Bucket, W);
 end;
 
 function DecodeDoLa(NN: TNNet; const Prompt: string;
   MaxLen: integer; Alpha: TNeuralFloat;
   const StopStrings: array of string;
   HeadStartIdx: integer): TNNetDecodeResult;
+begin
+  Result := DecodeDoLa(NN, Prompt, MaxLen, Alpha, StopStrings, dlbFull,
+    HeadStartIdx);
+end;
+
+function DecodeDoLa(NN: TNNet; const Prompt: string;
+  MaxLen: integer; Alpha: TNeuralFloat;
+  const StopStrings: array of string;
+  Bucket: TDoLaLayerBucket;
+  HeadStartIdx: integer): TNNetDecodeResult;
 var
   InputVolume, OutputVolume: TNNetVolume;
   CandSnap: TNNetVolume;
   PFinal, PLens, MFinalLens: array of TNeuralFloat;  // distributions + 0.5(p+q)
-  Bucket: TNeuralIntegerArray;
+  Cands: TNeuralIntegerArray;
   VocabSize, Step, I, C, L, HeadIdx, HeadInIdx, LastLayer: integer;
   NumCand, BestLayer, Best, StopLen: integer;
   Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, Pm, ScoreV, BestScore: TNeuralFloat;
@@ -4063,8 +4117,8 @@ begin
   LastLayer := NN.GetLastLayerIdx();
   HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
   HeadInIdx := HeadIdx - 1;
-  BuildDoLaCandidateBucket(NN, HeadInIdx, Bucket);
-  NumCand := Length(Bucket);
+  BuildDoLaCandidateBucket(NN, HeadInIdx, Bucket, Cands);
+  NumCand := Length(Cands);
   // The contrast path is active only when Alpha > 0 AND the bucket is non-empty.
   // Otherwise this MUST reproduce plain greedy argmax bit-for-bit, so we take
   // EXACTLY the DecodeGreedy step (argmax over the raw softmax row).
@@ -4107,11 +4161,11 @@ begin
         //         net after the full forward above (no extra forward needed);
         //         snapshot it, splice into the head-input slot, recompute the
         //         head sub-stack, read p_premature.
-        BestLayer := Bucket[0];
+        BestLayer := Cands[0];
         BestJS := -1.0;
         for C := 0 to NumCand - 1 do
         begin
-          L := Bucket[C];
+          L := Cands[C];
           CandSnap.Copy(NN.Layers[L].Output);
           NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
           for I := HeadIdx to LastLayer do NN.Layers[I].Compute();

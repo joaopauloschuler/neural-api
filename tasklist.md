@@ -518,12 +518,16 @@ rather than acted on.
       static exit layer + confidence threshold; follow-up: per-token
       adaptive exit. Report tokens/sec vs full-depth at matched output
       quality.
-- [ ] DoLa decoding follow-up (DecodeDoLa LANDED in neural/neuraldecode.pas:
-      LogitLens splice idiom; per-step max-JS premature layer over a fixed
-      Output.Size-matched candidate bucket; adaptive head set; Alpha<=0 /
-      empty-bucket = bit-identical greedy; 3 tests incl. planted shallow-bias
-      flip): add per-step ADAPTIVE candidate-layer selection beyond the fixed
-      bucket — the paper's DoLa-low / DoLa-high dynamic high/low layer buckets.
+- [X] DoLa decoding follow-up: DoLa-low / DoLa-high dynamic premature-layer
+      buckets LANDED (neural/neuraldecode.pas). TDoLaLayerBucket enum
+      (dlbFull/dlbLow/dlbHigh) + overloaded DecodeDoLa(...; Bucket; HeadStartIdx)
+      restricts the per-step max-JS premature-layer search to the shallow half
+      (dlbLow), deep half (dlbHigh), or all lens-compatible layers (dlbFull, the
+      original v1 bucket; the original signature delegates here so it is fully
+      backward compatible). Empty resulting bucket still degrades to greedy like
+      Alpha<=0. Test TestDoLaLowHighBucketsSelectDifferentLayers pins a planted
+      two-candidate net where low/high select different premature layers and flip
+      the emitted token every step.
 - [ ] Token healing follow-ups (v1 is landed: TNNetTokenHealingConstraint +
       PrepareTokenHealing + TGenerationConfig.TokenHealing):
       (a) PrepareTokenHealing is TStringListInt-only — a TNeuralHFTokenizer
