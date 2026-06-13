@@ -351,6 +351,8 @@ type
     procedure TestMLPMixerBlockLoadFromString;
     // AddLoRAAdapter builder (low-rank residual bypass over a frozen projection)
     procedure TestLoRAAdapterSmoke;
+    // MergeLoRA: folding the trained B*A bypass into the frozen base weights
+    procedure TestMergeLoRAEqualsAdapter;
     procedure TestSwitchableNormForward;
     procedure TestSwitchableNormGradientCheck;
     procedure TestSwitchableNormSerializationRoundTrip;
@@ -4602,6 +4604,105 @@ begin
       upMovedAfter or upMovedBefore);
   finally
     NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMergeLoRAEqualsAdapter;
+const
+  cSeqLen = 3;
+  cDModel = 5;
+  cRank   = 2;
+  cAlpha  = 4.0;
+var
+  AdaptNN, MergeNN: TNNet;
+  Input, Desired: TNNetVolume;
+  FrozenA, Adapted, Down, Up: TNNetLayer;
+  FrozenM, BaseOut: TNNetLayer;
+  DownM, UpM: TNNetLayer;
+  i, n, w: integer;
+  maxDiff, dlt: TNeuralFloat;
+begin
+  // Project memory: tests share one RNG; reseed so this test does not perturb
+  // an unrelated ordering-sensitive check downstream.
+  RandSeed := 424242;
+  Input   := TNNetVolume.Create(cSeqLen, 1, cDModel, 1);
+  Desired := TNNetVolume.Create(cSeqLen, 1, cDModel);
+  // Two nets: AdaptNN keeps the live LoRA bypass; MergeNN has the SAME base +
+  // adapter weights folded into its base via MergeLoRA. After the merge a
+  // forward through MergeNN's base alone must equal AdaptNN's adapter (Sum)
+  // output, proving the fold is exact (zero-overhead inference).
+  AdaptNN := TNNet.Create();
+  MergeNN := TNNet.Create();
+  try
+    // --- adapter net: input -> frozen base -> LoRA adapter ---
+    AdaptNN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    FrozenA := AdaptNN.AddLayer(TNNetPointwiseConvLinear.Create(cDModel));
+    Adapted := AdaptNN.AddLoRAAdapter(FrozenA, cRank, cAlpha);
+    Down := AdaptNN.Layers[FrozenA.LayerIdx + 1];
+    Up   := AdaptNN.Layers[FrozenA.LayerIdx + 2];
+
+    // --- merge net: input -> base (will absorb the bypass) ---
+    MergeNN.AddLayer(TNNetInput.Create(cSeqLen, 1, cDModel, 1));
+    BaseOut := MergeNN.AddLayer(TNNetPointwiseConvLinear.Create(cDModel));
+    FrozenM := BaseOut;
+    // Mirror base weights from the adapter net so both start identical.
+    FrozenM.CopyWeights(FrozenA);
+
+    // A modest LR keeps the trained weights O(1): a merged-vs-live forward at
+    // huge weight magnitudes would diverge by float ASSOCIATIVITY alone
+    // ((B*A)*x vs B*(A*x)), which is not a merge bug, so train gently.
+    AdaptNN.SetLearningRate(0.02, 0.0);
+    FrozenA.LearningRate := 0.0; // freeze the base; only A/B train
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.1 - 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4);
+
+    // Train the bypass so B leaves its zero-init and the merge is non-trivial.
+    AdaptNN.SetBatchUpdate(false);
+    for i := 1 to 25 do
+    begin
+      AdaptNN.Compute(Input);
+      AdaptNN.Backpropagate(Desired);
+    end;
+
+    // Build a separate A/B reference in the merge net's space is unnecessary:
+    // MergeLoRA folds DIRECTLY from the trained adapter-net A/B layers into the
+    // merge-net base (same shapes), scaled by Alpha/Rank.
+    DownM := Down;
+    UpM   := Up;
+    MergeNN.MergeLoRA(FrozenM, DownM, UpM, cAlpha);
+
+    // Sanity: the trained B must have moved off zero (else the merge is vacuous).
+    dlt := 0;
+    for n := 0 to Up.Neurons.Count - 1 do
+      for w := 0 to Up.Neurons[n].Weights.Size - 1 do
+        dlt := Max(dlt, Abs(Up.Neurons[n].Weights.Raw[w]));
+    AssertTrue('MergeLoRA: B (up) trained off zero before merge (max |B|=' +
+      FloatToStr(dlt) + ')', dlt > 1e-4);
+
+    // Forward both nets on a fresh probe and compare merged-base vs adapter-Sum.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Cos(i * 0.9) * 0.8 + 0.2;
+    AdaptNN.Compute(Input);
+    MergeNN.Compute(Input);
+
+    AssertEquals('MergeLoRA output Size', Adapted.Output.Size,
+      BaseOut.Output.Size);
+    maxDiff := 0;
+    for i := 0 to Adapted.Output.Size - 1 do
+    begin
+      dlt := Abs(BaseOut.Output.Raw[i] - Adapted.Output.Raw[i]);
+      if dlt > maxDiff then maxDiff := dlt;
+    end;
+    AssertTrue('MergeLoRA: merged base == adapter forward < 1e-5 (got ' +
+      FloatToStr(maxDiff) + ')', maxDiff < 1e-5);
+  finally
+    AdaptNN.Free;
+    MergeNN.Free;
     Input.Free;
     Desired.Free;
   end;

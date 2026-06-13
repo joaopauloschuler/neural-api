@@ -170,13 +170,6 @@ rather than acted on.
       (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap; add
       o200k when a GPT-4o-family checkpoint matters. Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
-- [ ] LoRA follow-ups (the adapter itself is landed: TNNet.AddLoRAAdapter
-      low-rank B·A bypass + examples/LoRAFineTune, commit 34511c0):
-      (a) MergeLoRA — fold the trained B·A (scaled by alpha/r) into the
-      frozen base layer's W for zero-overhead inference, asserting merged
-      forward equals adapter forward; (b) load HF PEFT adapter safetensors
-      files onto an imported base model (name-map lora_A/lora_B tensors
-      onto the AddLoRAAdapter layers).
 - [ ] Gradient accumulation in neuralfit.pas: accumulate deltas over N
       micro-batches before the optimizer step (large effective batch
       without the memory), scaling the loss/deltas by 1/N so results match

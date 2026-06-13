@@ -198,6 +198,7 @@ type
     procedure TestBuildFromPretrainedDispatch;
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
     procedure TestLoadPretrainedEmbedding;
+    procedure TestPEFTLoRAAdapterLoadAndMerge;
   end;
 
 implementation
@@ -6611,6 +6612,130 @@ begin
   finally
     Emb.Free;
     Tok.Free;
+  end;
+end;
+
+// End-to-end PEFT LoRA: loads a committed tiny HF PEFT adapter
+// (tiny_lora_adapter.safetensors + adapter_config.json) onto an
+// AddLoRAAdapter-wrapped base, asserts the adapted forward matches the
+// independent float64 oracle (tiny_lora_logits.json), then folds the bypass
+// with TNNet.MergeLoRA and asserts a base-only forward reproduces the same
+// outputs (zero-overhead inference). Exercises ReadPEFTAdapterConfig,
+// LoadPEFTLoRAModule (base_model.model. prefix + .default. segment name-map)
+// and MergeLoRA together against one fixture.
+procedure TTestNeuralPretrained.TestPEFTLoRAAdapterLoadAndMerge;
+var
+  AdaptNN, MergeNN: TNNet;
+  BaseReader, AdapReader: TNNetSafeTensorsReader;
+  Cfg: TPEFTAdapterConfig;
+  Base, Adapted, Down, Up, MergeBase: TNNetLayer;
+  RefRoot: TJSONData;
+  InputsArr, OutputsArr, RowArr: TJSONArray;
+  RefJson: TStringList;
+  Input, Output: TNNetVolume;
+  d_in, d_out, Rank, n, i, Row: integer;
+  Scale, Diff, MaxDiff: double;
+begin
+  d_in := 5; d_out := 4; // from tools/lora_peft_tiny_fixture.py
+  AdaptNN := nil; MergeNN := nil;
+  BaseReader := nil; AdapReader := nil;
+  RefRoot := nil;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create(1, 1, d_in, 1);
+  Output := TNNetVolume.Create;
+  try
+    // ---- config: r and lora_alpha ----
+    Cfg := ReadPEFTAdapterConfig(FixturePath('tiny_lora_adapter_config.json'));
+    AssertTrue('PEFT config r found', Cfg.RankFound);
+    AssertEquals('PEFT config r', 2, Cfg.Rank);
+    AssertEquals('PEFT config lora_alpha', 8.0, Cfg.Alpha, 0.0);
+    Rank := Cfg.Rank;
+    Scale := Cfg.Alpha / Rank; // PEFT scale folded into B at load (= 4.0)
+
+    // ---- adapter net: input -> base proj -> LoRA adapter ----
+    AdaptNN := TNNet.Create();
+    AdaptNN.AddLayer(TNNetInput.Create(1, 1, d_in, 1));
+    Base := AdaptNN.AddLayer(TNNetPointwiseConvLinear.Create(d_out));
+    Adapted := AdaptNN.AddLoRAAdapter(Base, Rank, {Alpha=}Cfg.Alpha);
+    Down := AdaptNN.Layers[Base.LayerIdx + 1]; // A (down)
+    Up   := AdaptNN.Layers[Base.LayerIdx + 2]; // B (up)
+
+    // Load the frozen base weight "proj.weight" [d_out, d_in] onto the base.
+    BaseReader := TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_lora_base.safetensors'));
+    LoadPlainLinearWeights(BaseReader, Base, 'proj.weight', d_in, d_out, 1.0);
+
+    // Load the PEFT adapter A/B onto the AddLoRAAdapter projections. The
+    // builder's MulByConstant already multiplies by Alpha/Rank, so the A/B
+    // weights must NOT be pre-scaled here: pass Scale=1.0 to LoadPEFTLoRAModule.
+    AdapReader := TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_lora_adapter.safetensors'));
+    LoadPEFTLoRAModule(AdapReader, Down, Up, 'proj', {Scale=}1.0);
+
+    // ---- oracle parity on the adapter net ----
+    RefJson.LoadFromFile(FixturePath('tiny_lora_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    InputsArr  := TJSONArray(TJSONObject(RefRoot).Find('inputs'));
+    OutputsArr := TJSONArray(TJSONObject(RefRoot).Find('outputs'));
+    AssertTrue('inputs present', InputsArr <> nil);
+    AssertTrue('outputs present', OutputsArr <> nil);
+    AssertTrue('at least 3 inputs', InputsArr.Count >= 3);
+
+    MaxDiff := 0;
+    for n := 0 to InputsArr.Count - 1 do
+    begin
+      RowArr := TJSONArray(InputsArr.Items[n]);
+      AssertEquals('input dim', d_in, RowArr.Count);
+      for i := 0 to d_in - 1 do
+        Input.FData[i] := RowArr.Items[i].AsFloat;
+      AdaptNN.Compute(Input);
+      AdaptNN.GetOutput(Output);
+      AssertEquals('adapter output size', d_out, Output.Size);
+      RowArr := TJSONArray(OutputsArr.Items[n]);
+      for i := 0 to d_out - 1 do
+      begin
+        Diff := Abs(Output.FData[i] - RowArr.Items[i].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('PEFT adapter forward parity vs oracle: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- MergeLoRA: fold B*A into a base-only net, expect same outputs ----
+    MergeNN := TNNet.Create();
+    MergeNN.AddLayer(TNNetInput.Create(1, 1, d_in, 1));
+    MergeBase := MergeNN.AddLayer(TNNetPointwiseConvLinear.Create(d_out));
+    MergeBase.CopyWeights(Base); // same base weights as the adapter net
+    // Fold the (already PEFT-scaled-by-construction) trained A/B with the same
+    // Alpha so the merge applies Alpha/Rank exactly as the live bypass did.
+    MergeNN.MergeLoRA(MergeBase, Down, Up, Cfg.Alpha);
+
+    MaxDiff := 0;
+    for n := 0 to InputsArr.Count - 1 do
+    begin
+      RowArr := TJSONArray(InputsArr.Items[n]);
+      for i := 0 to d_in - 1 do
+        Input.FData[i] := RowArr.Items[i].AsFloat;
+      MergeNN.Compute(Input);
+      MergeNN.GetOutput(Output);
+      RowArr := TJSONArray(OutputsArr.Items[n]);
+      for i := 0 to d_out - 1 do
+      begin
+        Diff := Abs(Output.FData[i] - RowArr.Items[i].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('MergeLoRA merged-base forward parity vs oracle: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    Output.Free;
+    Input.Free;
+    BaseReader.Free;
+    AdapReader.Free;
+    AdaptNN.Free;
+    MergeNN.Free;
   end;
 end;
 

@@ -11279,6 +11279,22 @@ type
       // at AddLayer time: the base randomly, B at zero).
       function AddLoRAAdapter(FrozenLayer: TNNetLayer; Rank: integer;
         Alpha: TNeuralFloat = 1.0): TNNetLayer;
+      // Folds a trained LoRA bypass (the A=down and B=up pointwise projections
+      // built by AddLoRAAdapter) into the frozen base layer's weights so the
+      // adapter can be DELETED for zero-overhead inference:
+      //   W_base[j][i] += (Alpha/Rank) * sum_k B[j][k]*A[k][i]
+      // (the standard LoRA merge -- the low-rank update B*A scaled by Alpha/Rank
+      // is added to the base weight matrix). Any A/B bias (A keeps its random
+      // bias init; B is normally zero) is folded into the base BIAS the same
+      // way, so the fold is exact regardless of the adapter's biases.
+      // BaseLayer, ADown and BUp must be pointwise-linear
+      // projections with matching dims (BaseLayer/BUp: d_out neurons; ADown:
+      // Rank neurons; ADown weights: d_in; BUp weights: Rank). After the call
+      // BaseLayer alone reproduces base(x) + (Alpha/Rank)*B*A*x, so a forward
+      // through BaseLayer equals the wrapped adapter forward to within
+      // floating-point tolerance. Rank is read from ADown's neuron count.
+      procedure MergeLoRA(BaseLayer, ADown, BUp: TNNetLayer;
+        Alpha: TNeuralFloat = 1.0);
       // Convenience wrapper around TNNetGatherChannels: appends a learnable-free
       // depth-channel gather that selects an ORDERED SUBSET (and/or reorders or
       // duplicates) the previous layer's channels, yielding an output of shape
@@ -46831,6 +46847,63 @@ begin
   Scaled := AddLayer(TNNetMulByConstant.Create(Alpha / Rank));
   // Residual add: adapted = base + (Alpha/Rank) * B*A.
   Result := AddLayer(TNNetSum.Create([FrozenLayer, Scaled]));
+end;
+
+procedure TNNet.MergeLoRA(BaseLayer, ADown, BUp: TNNetLayer;
+  Alpha: TNeuralFloat);
+var
+  Rank, d_in, d_out, i, j, k: integer;
+  Scale, Acc: TNeuralFloat;
+begin
+  if (BaseLayer = nil) or (ADown = nil) or (BUp = nil) then
+    FErrorProc('MergeLoRA requires non-nil BaseLayer, ADown and BUp layers.');
+  Rank := ADown.Neurons.Count;
+  if Rank < 1 then
+    FErrorProc('MergeLoRA: ADown has no neurons (Rank=' + IntToStr(Rank) + ').');
+  d_out := BaseLayer.Neurons.Count;
+  if d_out < 1 then
+    FErrorProc('MergeLoRA: BaseLayer has no neurons.');
+  if BUp.Neurons.Count <> d_out then
+    FErrorProc('MergeLoRA: BUp neuron count (' + IntToStr(BUp.Neurons.Count) +
+      ') must equal BaseLayer neuron count (' + IntToStr(d_out) + ').');
+  // A maps d_in -> Rank: every A neuron carries d_in weights. B maps Rank ->
+  // d_out: every B neuron carries Rank weights.
+  d_in := ADown.Neurons[0].Weights.Size;
+  if BaseLayer.Neurons[0].Weights.Size <> d_in then
+    FErrorProc('MergeLoRA: BaseLayer in-dim (' +
+      IntToStr(BaseLayer.Neurons[0].Weights.Size) + ') must equal ADown in-dim ('
+      + IntToStr(d_in) + ').');
+  if BUp.Neurons[0].Weights.Size <> Rank then
+    FErrorProc('MergeLoRA: BUp in-dim (' + IntToStr(BUp.Neurons[0].Weights.Size) +
+      ') must equal Rank (' + IntToStr(Rank) + ').');
+  Scale := Alpha / Rank;
+  // The bypass output is bypass[j] = Scale*( sum_k B[j][k]*(A[k].x + biasA[k])
+  // + biasB[j] ). The x-dependent part folds into the base WEIGHTS and the
+  // constant part (the A/B biases threaded through B) folds into the base
+  // BIAS, so the merged base reproduces base(x)+bypass(x) exactly:
+  //   W_base[j][i] += Scale * sum_k B[j][k] * A[k][i]
+  //   bias_base[j] += Scale * ( sum_k B[j][k] * biasA[k] + biasB[j] )
+  // (AddLoRAAdapter zero-inits biasB, but a general PEFT-imported adapter may
+  // carry one, so both terms are folded.)
+  for j := 0 to d_out - 1 do
+  begin
+    for i := 0 to d_in - 1 do
+    begin
+      Acc := 0;
+      for k := 0 to Rank - 1 do
+        Acc := Acc +
+          BUp.Neurons[j].Weights.FData[k] * ADown.Neurons[k].Weights.FData[i];
+      BaseLayer.Neurons[j].Weights.FData[i] :=
+        BaseLayer.Neurons[j].Weights.FData[i] + Scale * Acc;
+    end;
+    Acc := BUp.Neurons[j].BiasWeight;
+    for k := 0 to Rank - 1 do
+      Acc := Acc + BUp.Neurons[j].Weights.FData[k] * ADown.Neurons[k].BiasWeight;
+    BaseLayer.Neurons[j].BiasWeight :=
+      BaseLayer.Neurons[j].BiasWeight + Scale * Acc;
+  end;
+  // Refresh the concatenated-weight caches after the in-place mutation.
+  BaseLayer.AfterWeightUpdate();
 end;
 
 procedure TNNet.AddSplitQKVHeads(d_model, Heads: integer;

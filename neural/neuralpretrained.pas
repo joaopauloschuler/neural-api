@@ -2545,6 +2545,54 @@ function LoadPretrainedEmbedding(const FileName: string;
   Embedding: TNNetEmbedding; Tokenizer: TStringListInt;
   FreezeEmbedding: boolean = false): integer;
 
+// ----------------------------- HF PEFT LoRA -------------------------------
+// Loads a Hugging Face PEFT LoRA adapter (an adapter_model.safetensors plus
+// an optional adapter_config.json) onto the A=down / B=up pointwise
+// projections built by TNNet.AddLoRAAdapter. PEFT stores, per wrapped module
+// <m>, two nn.Linear weight matrices:
+//   <prefix><m>.lora_A.weight : [r,     d_in ]   (down, A)
+//   <prefix><m>.lora_B.weight : [d_out, r    ]   (up,   B)
+// where <prefix> is usually "base_model.model." (and the matrices often sit
+// under a ".default." adapter-name segment). The effective bypass applied at
+// inference is (lora_alpha / r) * B*A; PEFT's own scaling lives in the config,
+// NOT in the stored weights, which exactly matches AddLoRAAdapter's
+// MulByConstant(Alpha/Rank). Both [out, in] matrices follow nn.Linear layout,
+// so they map row-for-row onto the pointwise neurons (neuron j, weight i).
+type
+  // alpha (lora_alpha) and r read from an adapter_config.json. RankFound is
+  // false when no config was read (caller keeps the rank it built with).
+  TPEFTAdapterConfig = record
+    Alpha: TNeuralFloat;
+    Rank: integer;
+    RankFound: boolean;
+  end;
+
+// Loads a bias-free nn.Linear [OutDim, InDim] matrix straight onto a pointwise
+// layer's neurons (neuron j gets row j, weight i = W[j*InDim+i]), each weight
+// multiplied by Scale. The pointwise/per-token layout the AddLoRAAdapter A/B
+// projections use, so it is reused to drop the base proj and the lora_A/lora_B
+// matrices onto their layers. Raises EPretrainedImportError on a shape or
+// neuron-count mismatch.
+procedure LoadPlainLinearWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
+  Scale: TNeuralFloat = 1.0);
+
+// Reads lora_alpha and r from a PEFT adapter_config.json. Missing fields
+// default to Alpha=Rank (scale 1.0) so a config-less adapter still loads.
+function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
+
+// Loads ONE wrapped module's LoRA pair from an already-open reader onto the
+// AddLoRAAdapter A (down) and B (up) layers. ModuleName is the PEFT module
+// path (e.g. "model.layers.0.self_attn.q_proj"); the loader tries the common
+// "base_model.model." prefix and ".default."/"" adapter-name segments until
+// it finds "<...>.lora_A.weight" and "<...>.lora_B.weight". Scale is the
+// effective alpha/r multiplier folded into B at load time (so the built
+// MulByConstant(1.0) net still applies the right PEFT scaling). Returns the
+// resolved tensor base name (the "<...>" before ".lora_A.weight").
+function LoadPEFTLoRAModule(Reader: TNNetSafeTensorsReader;
+  ADown, BUp: TNNetLayer; const ModuleName: string;
+  Scale: TNeuralFloat = 1.0): string;
+
 implementation
 
 procedure ImportError(const Msg: string);
@@ -3745,6 +3793,151 @@ begin
     W.Free;
   end;
   Layer.FlushWeightCache();
+end;
+
+// Loads a bias-free nn.Linear [OutDim, InDim] matrix straight onto a pointwise
+// layer's neurons (neuron j gets row j, weight i = W[j*InDim+i]), each weight
+// multiplied by Scale. Used by the PEFT LoRA loader to drop lora_A/lora_B onto
+// the AddLoRAAdapter A/B projections (which carry exactly this layout).
+procedure LoadPlainLinearWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
+  Scale: TNeuralFloat = 1.0);
+var
+  W: TNNetVolume;
+  i, j: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('PEFT import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) then
+    ImportError('PEFT import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + '] (nn.Linear stores ' +
+      '[out, in]), got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('PEFT import: layer for "' + WName + '" has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for j := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[j].Weights.Size <> InDim then
+        ImportError('PEFT import: neuron ' + IntToStr(j) + ' for "' + WName +
+          '" has ' + IntToStr(Layer.Neurons[j].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for i := 0 to InDim - 1 do
+        Layer.Neurons[j].Weights.FData[i] := Scale * W.FData[j * InDim + i];
+      Layer.Neurons[j].BiasWeight := 0; // LoRA projections are bias-free
+    end;
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  Field: TJSONData;
+begin
+  Result.Alpha := 1.0;
+  Result.Rank := 1;
+  Result.RankFound := False;
+  if not FileExists(FileName) then
+    ImportError('PEFT import: adapter_config.json not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('PEFT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('PEFT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Field := Obj.Find('r');
+    if (Field <> nil) and not Field.IsNull then
+    begin
+      Result.Rank := Field.AsInteger;
+      Result.RankFound := True;
+      if Result.Rank < 1 then
+        ImportError('PEFT import: config "r" must be a positive integer, got '
+          + Field.AsJSON + '.');
+    end;
+    // lora_alpha defaults to r (PEFT scale 1.0) when absent.
+    Result.Alpha := Obj.Get('lora_alpha', TNeuralFloat(Result.Rank));
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function LoadPEFTLoRAModule(Reader: TNNetSafeTensorsReader;
+  ADown, BUp: TNNetLayer; const ModuleName: string;
+  Scale: TNeuralFloat): string;
+var
+  Rank, d_in, d_out, p, s: integer;
+  Prefixes, Segments: array of string;
+  Base, AName, BName: string;
+  Found: boolean;
+begin
+  if (ADown = nil) or (BUp = nil) then
+    ImportError('PEFT import: LoadPEFTLoRAModule requires non-nil A and B ' +
+      'layers (module "' + ModuleName + '").');
+  Rank := ADown.Neurons.Count;
+  d_out := BUp.Neurons.Count;
+  if Rank < 1 then
+    ImportError('PEFT import: A layer for "' + ModuleName +
+      '" has no neurons.');
+  d_in := ADown.Neurons[0].Weights.Size;
+  // PEFT names are "<prefix><module>.lora_A<seg>weight" where <prefix> is
+  // usually "base_model.model." and <seg> is ".default." (the adapter name)
+  // or "." (no adapter-name segment). Try the common combinations.
+  SetLength(Prefixes, 2);
+  Prefixes[0] := 'base_model.model.';
+  Prefixes[1] := '';
+  SetLength(Segments, 2);
+  Segments[0] := '.default.';
+  Segments[1] := '.';
+  Found := False;
+  Base := '';
+  AName := '';
+  BName := '';
+  for p := 0 to High(Prefixes) do
+  begin
+    for s := 0 to High(Segments) do
+    begin
+      Base := Prefixes[p] + ModuleName;
+      AName := Base + '.lora_A' + Segments[s] + 'weight';
+      BName := Base + '.lora_B' + Segments[s] + 'weight';
+      if Reader.HasTensor(AName) and Reader.HasTensor(BName) then
+      begin
+        Found := True;
+        break;
+      end;
+    end;
+    if Found then break;
+  end;
+  if not Found then
+    ImportError('PEFT import: could not find lora_A/lora_B tensors for module '
+      + '"' + ModuleName + '" (tried prefixes "base_model.model." and "", ' +
+      'adapter segments ".default." and ".").');
+  // A: [Rank, d_in] -> A layer (Rank neurons, d_in weights). The PEFT scaling
+  // alpha/r is folded into B, so A loads unscaled.
+  LoadPlainLinearWeights(Reader, ADown, AName, d_in, Rank, 1.0);
+  // B: [d_out, Rank] -> B layer (d_out neurons, Rank weights), scaled.
+  LoadPlainLinearWeights(Reader, BUp, BName, Rank, d_out, Scale);
+  Result := Base;
 end;
 
 // Loads a Qwen3-style SHARED per-head RMSNorm gain vector [HeadDim] into
