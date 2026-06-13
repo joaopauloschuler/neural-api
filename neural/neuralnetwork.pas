@@ -1414,6 +1414,28 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// gpt-oss clamped gated SwiGLU activation - This is an experimental layer.
+  // The gated activation used by the gpt-oss MoE experts. The input depth is
+  // split INTERLEAVED along the channel (depth) axis (gate = even channels,
+  // up = odd channels - i.e. gate[d] = in[2d], up[d] = in[2d+1]), then:
+  //   gate := min(gate, limit)            { upper-clamp only, no lower clamp }
+  //   up   := clamp(up, -limit, +limit)
+  //   glu  := gate * sigmoid(alpha * gate)
+  //   out  := (up + 1) * glu
+  // Output depth = input depth / 2. alpha (default 1.702) lives in FFloatSt[0],
+  // limit (default 7.0) in FFloatSt[1]. No trainable parameter; input depth
+  // must be even. Matches transformers' GptOssExperts._apply_gate.
+  // Coded by Claude (AI).
+  TNNetGptOssGatedSwiGLU = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); overload; override;
+    constructor Create(pAlpha, pLimit: TNeuralFloat); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// GLU (Gated Linear Unit) gated activation - This is an experimental layer.
   // Splits the input along the channel (depth) axis into two equal halves
   // A and B and outputs A * sigmoid(B). Output depth = input depth / 2.
@@ -17540,6 +17562,115 @@ begin
           err := FOutputError[X, Y, D];
           FPrevLayer.FOutputError.Add(X, Y, D, err * swishVal);
           FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * a * swishDeriv);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetGptOssGatedSwiGLU }
+
+constructor TNNetGptOssGatedSwiGLU.Create();
+begin
+  Create(1.702, 7.0);
+end;
+
+constructor TNNetGptOssGatedSwiGLU.Create(pAlpha, pLimit: TNeuralFloat);
+begin
+  inherited Create();
+  FFloatSt[0] := pAlpha;
+  FFloatSt[1] := pLimit;
+end;
+
+procedure TNNetGptOssGatedSwiGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetGptOssGatedSwiGLU requires an even input depth. ' +
+      'Input depth: ' + IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetGptOssGatedSwiGLU.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  alpha, limit, gate, up, sigmoidVal, glu: TNeuralFloat;
+begin
+  StartTime := Now();
+  alpha := FFloatSt[0];
+  limit := FFloatSt[1];
+  HalfDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        // Interleaved: gate = even channel 2D, up = odd channel 2D+1.
+        gate := FPrevLayer.FOutput[X, Y, 2 * D];
+        up   := FPrevLayer.FOutput[X, Y, 2 * D + 1];
+        if gate > limit then gate := limit;          // upper-clamp only
+        if up >  limit then up :=  limit;
+        if up < -limit then up := -limit;
+        sigmoidVal := 1 / (1 + pcr_expf(-alpha * gate));
+        glu := gate * sigmoidVal;
+        FOutput[X, Y, D] := (up + 1) * glu;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGptOssGatedSwiGLU.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  alpha, limit, gateRaw, upRaw, gate, up: TNeuralFloat;
+  sigmoidVal, glu, gluDeriv, err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    alpha := FFloatSt[0];
+    limit := FFloatSt[1];
+    HalfDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          gateRaw := FPrevLayer.FOutput[X, Y, 2 * D];
+          upRaw   := FPrevLayer.FOutput[X, Y, 2 * D + 1];
+          gate := gateRaw;
+          up   := upRaw;
+          if gate > limit then gate := limit;
+          if up >  limit then up :=  limit;
+          if up < -limit then up := -limit;
+          sigmoidVal := 1 / (1 + pcr_expf(-alpha * gate));
+          glu := gate * sigmoidVal;
+          // d glu / d gate = sigmoid + gate*alpha*sigmoid*(1-sigmoid).
+          gluDeriv := sigmoidVal +
+            gate * alpha * sigmoidVal * (1 - sigmoidVal);
+          err := FOutputError[X, Y, D];
+          // out = (up+1)*glu. Clamp regions have zero local derivative.
+          if (gateRaw <= limit) then
+            FPrevLayer.FOutputError.Add(X, Y, 2 * D,
+              err * (up + 1) * gluDeriv);
+          if (upRaw >= -limit) and (upRaw <= limit) then
+            FPrevLayer.FOutputError.Add(X, Y, 2 * D + 1, err * glu);
         end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -83887,6 +84018,7 @@ begin
       'TNNetGEGLU' :                Result := TNNetGEGLU.Create();
       'TNNetGEGLUErf' :             Result := TNNetGEGLUErf.Create();
       'TNNetSwiGLU' :               Result := TNNetSwiGLU.Create();
+      'TNNetGptOssGatedSwiGLU' :    Result := TNNetGptOssGatedSwiGLU.Create(Ft[0], Ft[1]);
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetReGLU' :                Result := TNNetReGLU.Create();
       'TNNetTanhGLU' :              Result := TNNetTanhGLU.Create();
@@ -84271,6 +84403,7 @@ begin
       if S[0] = 'TNNetGEGLU' then Result := TNNetGEGLU.Create() else
       if S[0] = 'TNNetGEGLUErf' then Result := TNNetGEGLUErf.Create() else
       if S[0] = 'TNNetSwiGLU' then Result := TNNetSwiGLU.Create() else
+      if S[0] = 'TNNetGptOssGatedSwiGLU' then Result := TNNetGptOssGatedSwiGLU.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetReGLU' then Result := TNNetReGLU.Create() else
       if S[0] = 'TNNetTanhGLU' then Result := TNNetTanhGLU.Create() else

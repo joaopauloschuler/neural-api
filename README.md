@@ -817,6 +817,7 @@ Gated Linear Units split the input along the channel (depth) axis into two equal
 | `TNNetGEGLU`                 | 1D, 2D, or 3D (even depth)  | GELU-gated linear unit: outputs `A * GELU(B)` (tanh-approximation GELU, HF's `gelu_pytorch_tanh`). Created with `TNNetGEGLU.Create()`. |
 | `TNNetGEGLUErf`              | 1D, 2D, or 3D (even depth)  | GELU-gated linear unit with the **exact erf GELU** (no tanh approximation): outputs `A * GELU_erf(B)`, `GELU_erf(x) = x * 0.5*(1 + erf(x/sqrt(2)))` — the form HF transformers calls plain `gelu` (ModernBERT's `hidden_activation`). Created with `TNNetGEGLUErf.Create()`. |
 | `TNNetSwiGLU`                | 1D, 2D, or 3D (even depth)  | Swish-gated linear unit: outputs `A * Swish(B)`, where `Swish(x) = x * sigmoid(x)`. Created with `TNNetSwiGLU.Create()`. |
+| `TNNetGptOssGatedSwiGLU`     | 1D, 2D, or 3D (even depth)  | gpt-oss clamped gated SwiGLU. Splits the depth **interleaved** (gate = even channels, up = odd), upper-clamps the gate to `limit`, clamps `up` to `[-limit, +limit]`, then outputs `(up + 1) * gate * sigmoid(alpha * gate)`. Created with `TNNetGptOssGatedSwiGLU.Create()` (alpha=1.702, limit=7.0) or `Create(alpha, limit)`. |
 | `TNNetTanhGLU`               | 1D, 2D, or 3D (even depth)  | Tanh-gated linear unit: outputs `A * tanh(B)`. Parameter-free; mirrors `TNNetGLU` with the sigmoid gate swapped for tanh. Created with `TNNetTanhGLU.Create()`. |
 
 ### Attention

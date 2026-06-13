@@ -717,6 +717,10 @@ type
     procedure TestGEGLUGradientCheck;
     procedure TestSwiGLUForward;
     procedure TestSwiGLUGradientCheck;
+    procedure TestGptOssGatedSwiGLUForward;
+    procedure TestGptOssGatedSwiGLUClamping;
+    procedure TestGptOssGatedSwiGLUGradientCheck;
+    procedure TestGptOssGatedSwiGLULoadFromString;
     procedure TestGLUForward;
     procedure TestGLUGradientCheck;
     procedure TestTanhGLUForward;
@@ -8824,6 +8828,212 @@ end;
 procedure TTestNeuralNumerical.TestSwiGLUGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetSwiGLU.Create(), 'SwiGLU', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGptOssGatedSwiGLUForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  gate, up, glu, expected: TNeuralFloat;
+  alpha: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  alpha := 1.702;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetGptOssGatedSwiGLU.Create()); // alpha=1.702, limit=7
+
+    // Interleaved layout: gate = even channels, up = odd channels.
+    Input.Raw[0] := 1.0;   // gate[0]
+    Input.Raw[1] := 0.5;   // up[0]
+    Input.Raw[2] := -2.0;  // gate[1]
+    Input.Raw[3] := -1.0;  // up[1]
+
+    NN.Compute(Input);
+
+    AssertEquals('GptOssGatedSwiGLU output depth = input depth / 2', 2,
+      NN.GetLastLayer.Output.Depth);
+
+    // out = (up+1) * gate * sigmoid(alpha*gate)
+    gate := 1.0; up := 0.5;
+    glu := gate * (1 / (1 + Exp(-alpha * gate)));
+    expected := (up + 1) * glu;
+    AssertEquals('GptOssGatedSwiGLU out[0]', expected,
+      NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    gate := -2.0; up := -1.0;
+    glu := gate * (1 / (1 + Exp(-alpha * gate)));
+    expected := (up + 1) * glu;
+    AssertEquals('GptOssGatedSwiGLU out[1]', expected,
+      NN.GetLastLayer.Output.Raw[1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssGatedSwiGLUClamping;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  gate, up, glu, expected: TNeuralFloat;
+  alpha, limit: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  alpha := 1.702;
+  limit := 3.0;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetGptOssGatedSwiGLU.Create(alpha, limit));
+
+    // gate above limit -> clamped to +limit (upper-clamp only).
+    // up below -limit -> clamped to -limit.
+    Input.Raw[0] := 10.0;   // gate[0] -> clamps to 3
+    Input.Raw[1] := -8.0;   // up[0]   -> clamps to -3
+    // gate very negative -> NOT lower-clamped (min=None);
+    // up above limit -> clamps to +limit.
+    Input.Raw[2] := -10.0;  // gate[1] -> stays -10
+    Input.Raw[3] := 9.0;    // up[1]   -> clamps to 3
+
+    NN.Compute(Input);
+
+    gate := 3.0; up := -3.0;        // both clamped
+    glu := gate * (1 / (1 + Exp(-alpha * gate)));
+    expected := (up + 1) * glu;
+    AssertEquals('GptOssGatedSwiGLU clamp out[0]', expected,
+      NN.GetLastLayer.Output.Raw[0], 0.0001);
+
+    gate := -10.0; up := 3.0;       // gate unclamped, up clamped to +limit
+    glu := gate * (1 / (1 + Exp(-alpha * gate)));
+    expected := (up + 1) * glu;
+    AssertEquals('GptOssGatedSwiGLU clamp out[1]', expected,
+      NN.GetLastLayer.Output.Raw[1], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssGatedSwiGLUGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Bespoke gradient check. The shared LayerInputGradientCheck seeds inputs in
+  // ~[-1.7, 2.3]; with the (up+1)*gate*sigmoid(alpha*gate) gating a gate near
+  // 2.3 produces an output near 7, and the resulting large squared-loss terms
+  // wreck the single-precision finite-difference by catastrophic cancellation
+  // (the analytic gradient is exact - verified against a double-precision
+  // oracle). Keeping every input small (|x| < ~0.4) keeps every output small
+  // so the FD is well-conditioned, and stays strictly inside the limit=7 clamp
+  // band so the activation is smooth everywhere.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 4);
+  InputPlus := TNNetVolume.Create(2, 2, 4);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 4, 1));
+    NN.AddLayer(TNNetGptOssGatedSwiGLU.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.5) * 0.3;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GptOssGatedSwiGLU input gradient check at position ' +
+        IntToStr(i) + ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssGatedSwiGLULoadFromString;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // Round-trip non-default alpha=1.5, limit=5.0 (FFloatSt[0], FFloatSt[1])
+  // through both dispatch points.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    NN.AddLayer(TNNetGptOssGatedSwiGLU.Create(1.5, 5.0));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('GptOssGatedSwiGLU round-trip class identity',
+        NN2.GetLastLayer is TNNetGptOssGatedSwiGLU);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GptOssGatedSwiGLU SaveToString round-trip equality',
+        Saved, Saved2);
+
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('GptOssGatedSwiGLU round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestGLUForward;

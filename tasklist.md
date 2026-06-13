@@ -105,7 +105,30 @@ rather than acted on.
 - [ ] GPT-OSS importer (BuildGptOssFromSafeTensors[Ex], model_type "gpt_oss",
       i.e. openai/gpt-oss-20b and gpt-oss-120b — OpenAI's first open-weight
       release and currently the highest-profile open MoE LLM with NO import
-      path here). This is NOT a near-duplicate of any landed importer: it is a
+      path here).
+      FOUNDATION PRIMITIVES LANDED (a3, the two genuinely-new low-level pieces
+      the full importer will consume; the importer assembly itself is still
+      open):
+        * MXFP4 dequant-at-load reader: `DequantizeMXFP4` + `MXFP4Lut` in the
+          new unit `neural/neuralmxfp4.pas` (E2M1 FP4 LUT, 32-elem blocks of
+          16 packed nibble-pair bytes, E8M0 `2^(byte-127)` scale incl. the
+          0xFF=NaN case; low nibble=even elem, high nibble=odd). Verified
+          against transformers 5.11 integrations/mxfp4.py FP4_VALUES +
+          _convert_moe_packed_tensors. Tests:
+          TestMXFP4DequantHandBlock / TestMXFP4DequantNaNScale in
+          tests/TestNeuralPretrained.pas (hand-built block, exact-equality).
+        * Clamped-SwiGLU activation: new layer `TNNetGptOssGatedSwiGLU` in
+          neural/neuralnetwork.pas (interleaved gate=even/up=odd, gate
+          upper-clamped to limit, up clamped to +/-limit, out=(up+1)*gate*
+          sigmoid(alpha*gate); alpha=1.702/limit=7.0 in FFloatSt[0..1]),
+          registered in both dispatch tables. Matches GptOssExperts._apply_gate.
+          Tests: TestGptOssGatedSwiGLU{Forward,Clamping,GradientCheck,
+          LoadFromString} in tests/TestNeuralNumerical.pas.
+      REMAINING: the BuildGptOssFromSafeTensors[Ex] assembly itself — wiring the
+      avSink attention + alternating sliding/full window + YaRN RoPE + top-k-MoE
+      paths together, multi-shard index.json support, and the pico parity
+      fixture. Detail below.
+      This is NOT a near-duplicate of any landed importer: it is a
       distinct CROSS of subsystems we already have plus one genuinely new
       dequant. The architecture is a sparse top-k MoE decoder (config
       num_local_experts / num_experts_per_tok / a per-layer router gate) — reuse
