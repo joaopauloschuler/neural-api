@@ -202,18 +202,29 @@ rather than acted on.
       float64, and a cross-encoder RERANKING example over the landed
       BuildBertForSequenceClassification scoring path (query+passage -> relevance
       score), the canonical RAG-reranker demo the encoder importers enable.
-- [ ] BART-family follow-ups (BuildBartFromSafeTensors landed in
-      neuralpretrained.pas — two-net post-norm encoder-decoder, learned +2
-      positions, layernorm_embedding, erf-GELU, tied embeddings +
-      final_logits_bias; parity test TestBartParity at 1.5e-6/3.6e-6;
-      examples/Summarize beam-search + ROUGE demo): the close cousins that ride
-      the same path — (a) Pegasus (pre-norm normalize_before=true + static
-      sinusoidal positions; reuses the Marian sinusoidal-table builder); (b)
-      mBART/NLLB (pre-norm + an EXTRA final encoder AND decoder LayerNorm +
-      SentencePiece tokenizer, so blocked on the open Unigram/SentencePiece
-      task). Also: the committed bart_tiny fixture is single-shard, so the
-      inherited multi-shard index.json path is untested for BART specifically —
-      add a 2-shard fixture if a real distilbart import surfaces a bug.
+- [X] BART-family follow-up (a) Pegasus — BuildPegasusFromSafeTensors[Ex]
+      landed in neuralpretrained.pas (two-net PRE-norm encoder-decoder:
+      LayerNorm before each sub-layer, raw residual after; STATIC half-split
+      sinusoidal positions via FillMarianSinusoidalPositions, no +2 offset; NO
+      layernorm_embedding; a FINAL encoder AND decoder layer_norm closing each
+      pre-norm stack; scale_embedding on; erf-GELU FFN; tied embeddings +
+      final_logits_bias; .bin + multi-shard index.json via the shared reader).
+      Parity test TestPegasusParity + TestPegasusConfigFromJSONFile at
+      <1e-4 (encoder hidden AND decoder logits vs HF float64); fixture
+      tools/pegasus_tiny_fixture.py with per-quirk non-vacuity self-checks
+      (half-split sinusoid layout, pre-norm placement, final enc/dec
+      layer_norm, scale_embedding, gelu-vs-relu/silu, cross-attn, causality).
+      examples/Summarize README + examples/README.md document the
+      same-path beam-search decode (model math landed; end-to-end TEXT gated on
+      the SentencePiece tokenizer task below).
+- [ ] BART-family follow-up (b) mBART/NLLB — pre-norm + an EXTRA final encoder
+      AND decoder LayerNorm (same pre-norm shape the Pegasus importer now ships,
+      so it should reuse BuildPegasusStackBlocks) + a SentencePiece tokenizer,
+      so blocked on the open Unigram/SentencePiece task. Also: the committed
+      bart_tiny / tiny_pegasus fixtures are single-shard, so the inherited
+      multi-shard index.json path is untested for these encoder-decoders
+      specifically — add a 2-shard fixture if a real distilbart/pegasus import
+      surfaces a bug.
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are

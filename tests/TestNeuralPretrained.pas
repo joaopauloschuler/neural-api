@@ -190,6 +190,8 @@ type
     procedure TestMarianParity;
     procedure TestBartConfigFromJSONFile;
     procedure TestBartParity;
+    procedure TestPegasusConfigFromJSONFile;
+    procedure TestPegasusParity;
     procedure TestWhisperConfigFromJSONFile;
     procedure TestWhisperParity;
     procedure TestClipConfigFromJSONFile;
@@ -6425,6 +6427,82 @@ begin
       T5EncoderStatesInput(Dec).Output.Size);
     AssertT5ParityWithFixture(Enc, Dec,
       FixturePath('tiny_bart_logits.json'), 10, 6, Config.DModel,
+      Config.VocabSize);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Verifies ReadPegasusConfigFromJSONFile on the committed Pegasus pico
+// config plus the BuildFromPretrained "pegasus" rejection (an
+// encoder-decoder cannot be returned by the single-net dispatch; the error
+// must redirect to BuildPegasusFromSafeTensors).
+procedure TTestNeuralPretrained.TestPegasusConfigFromJSONFile;
+var
+  Config: TPegasusConfig;
+begin
+  RandSeed := 424242;
+  Config := ReadPegasusConfigFromJSONFile(
+    FixturePath('tiny_pegasus_config.json'));
+  AssertEquals('model_type', 'pegasus', Config.ModelType);
+  AssertEquals('d_model', 8, Config.DModel);
+  AssertEquals('enc layers', 2, Config.EncoderLayers);
+  AssertEquals('dec layers', 2, Config.DecoderLayers);
+  AssertEquals('enc heads', 2, Config.EncoderHeads);
+  AssertEquals('dec heads', 2, Config.DecoderHeads);
+  AssertEquals('enc ffn', 16, Config.EncoderFFNDim);
+  AssertEquals('dec ffn', 16, Config.DecoderFFNDim);
+  AssertEquals('vocab', 13, Config.VocabSize);
+  AssertEquals('max positions', 16, Config.MaxPositionEmbeddings);
+  AssertEquals('pad token', 0, Config.PadTokenId);
+  AssertEquals('eos token', 1, Config.EosTokenId);
+  AssertEquals('decoder start = pad', 0, Config.DecoderStartTokenId);
+  AssertTrue('scale_embedding on', Config.ScaleEmbedding);
+  try
+    BuildFromPretrained(FixturePath('tiny_pegasus.safetensors'),
+      {SeqLen=}0, {pInferenceOnly=}false,
+      FixturePath('tiny_pegasus_config.json'));
+    Fail('BuildFromPretrained must reject model_type "pegasus"');
+  except
+    on E: EPretrainedImportError do
+      AssertTrue('pegasus rejection must point at ' +
+        'BuildPegasusFromSafeTensors, got: ' + E.Message,
+        Pos('BuildPegasusFromSafeTensors', E.Message) > 0);
+  end;
+end;
+
+// Verifies the Pegasus import target - the PRE-norm summarization cousin of
+// BART (google/pegasus-*). tests/fixtures/tiny_pegasus.* is a pico
+// randomly-initialized HF PegasusForConditionalGeneration (2+2 layers, 2
+// heads, d_model 8, vocab 13, pad 0 / eos 1, decoder start = pad, gelu FFN,
+// PRE-norm biased LayerNorms, STATIC half-split sinusoidal positions, a
+// FINAL encoder AND decoder layer_norm, and scale_embedding=true). The
+// generator tools/pegasus_tiny_fixture.py asserts every quirk moves the
+// float64 oracle above the 1e-4 gate: the half-split sinusoid layout,
+// zeroed positions (3.74), the final enc/dec layer_norm (5.60/2.89),
+// pre-norm placement, scale_embedding, gelu vs relu/silu (0.34/0.55),
+// final_logits_bias (0.93), cross-attention (2.36) and decoder causality.
+// The parity loop is the SAME AssertT5ParityWithFixture/RunT5 path - the
+// two-net convention is shared with T5/Marian/BART.
+procedure TTestNeuralPretrained.TestPegasusParity;
+var
+  Enc, Dec: TNNet;
+  Config: TPegasusConfig;
+begin
+  RandSeed := 424242;
+  BuildPegasusFromSafeTensors(FixturePath('tiny_pegasus.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_pegasus_config.json'));
+  try
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    AssertTrue('decoder second input is TNNetInput',
+      T5EncoderStatesInput(Dec) is TNNetInput);
+    AssertEquals('encoder-states input size', 10 * Config.DModel,
+      T5EncoderStatesInput(Dec).Output.Size);
+    AssertT5ParityWithFixture(Enc, Dec,
+      FixturePath('tiny_pegasus_logits.json'), 10, 6, Config.DModel,
       Config.VocabSize);
   finally
     Dec.Free;
