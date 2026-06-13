@@ -1795,6 +1795,15 @@ procedure SaveBertToSafeTensors(Net: TNNet; const Config: TBertConfig;
   const FileName: string; pIncludePooler: boolean = false;
   pDType: TSafeTensorsWriteDType = stwF32);
 
+// Inverse of BuildGPTNeoXFromSafeTensors: walks the wired GPT-NeoX decoder
+// in importer build order, recovers each HF-named tensor with the EXACT
+// inverse of every load transform (re-interleaving the per-head Q|K|V slab
+// back into the single fused query_key_value tensor, undoing the partial
+// rotate_half permutation) and saves the .safetensors under the gpt_neox.*
+// name map. Config.Prefix selects the tensor-name prefix ('gpt_neox.' or '').
+procedure SaveGPTNeoXToSafeTensors(Net: TNNet; const Config: TGPTNeoXConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
 // ======================= SENTENCE EMBEDDINGS ===============================
 // sentence-transformers style sentence vectors on top of the BERT encoder
 // (e.g. sentence-transformers/all-MiniLM-L6-v2): tokenize, run the net,
@@ -7996,6 +8005,216 @@ begin
     end;
   finally
     V.Free;
+  end;
+end;
+
+// Inverse of BuildGPTNeoXFromSafeTensors. The importer collects, per block,
+// the typed layers in this insertion order: TNNetTokenLayerNorm -> [LN1, LN2],
+// TNNetPointwiseConvLinear -> [QKV, AttnDense, dense_h_to_4h, dense_4h_to_h]
+// (the per-head SDPA adds SplitChannels/RoPE/SDPA, none of which we collect),
+// then a final TNNetTokenLayerNorm (final_layer_norm) and the LM-head
+// PointwiseConvLinear. The TNNetEmbedding is embed_in.
+//   - embed_in.weight: [vocab, hidden] straight from the embedding table.
+//   - embed_out.weight: [vocab, hidden] straight from the LM-head neurons
+//     (bias-free). When tie_word_embeddings the head is a copy of embed_in,
+//     so dumping it straight reproduces the same tensor; HF untied (Pythia)
+//     exports always carry embed_out, so we always emit it.
+//   - input_layernorm / post_attention_layernorm / final_layer_norm: gamma=
+//     Neurons[0], beta=Neurons[1] (SaveLayerNormWeights).
+//   - attention.query_key_value: RE-FUSE the per-head Q|K|V slab into the
+//     single [3*hidden, hidden] (+bias) tensor, INVERTING the partial
+//     rotate_half interleave of LoadGPTNeoXQKVWeights (HF row r maps to neuron
+//     TargetIdx; here we read neuron TargetIdx back into HF row r).
+//   - attention.dense / mlp.dense_h_to_4h / mlp.dense_4h_to_h: straight
+//     [out,in] nn.Linear (+bias).
+// Coded by Claude (AI).
+procedure SaveGPTNeoXToSafeTensors(Net: TNNet; const Config: TGPTNeoXConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  Embeds, LayerNorms, PwConvs: array of TNNetLayer;
+  EmbIn, FinalLN, LMHead: TNNetLayer;
+  i, BlockCnt, PwBase, ExpectPw, ExpectLN: integer;
+  d, IntSize, HeadDim, RotaryDims: integer;
+  BlockPrefix, AttnPrefix: string;
+
+  // Straight HF nn.Linear [OutDim, InDim] (+optional bias [OutDim]) from
+  // OutDim consecutive neurons of Layer at NeuronBase: neuron (NeuronBase+j)
+  // is checkpoint row j. The exact inverse of LoadLlamaLinearWeights (no
+  // rotary). When BName='' the layer is bias-free (the LM head).
+  procedure DumpLinear(Layer: TNNetLayer; NeuronBase, OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+          ImportError('GPT-NeoX export: neuron ' + IntToStr(NeuronBase + jj) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] :=
+            Layer.Neurons[NeuronBase + jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[NeuronBase + jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      if BName <> '' then
+        Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Re-fuse the per-head Q|K|V slab into the single interleaved
+  // query_key_value [3*hidden, hidden] (+bias). HF source row r maps to net
+  // neuron TargetIdx exactly as LoadGPTNeoXQKVWeights does; we run the same
+  // map and copy neuron TargetIdx back into HF row r.
+  procedure DumpQKV(Layer: TNNetLayer; const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    r, ii, HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
+  begin
+    if Layer.Neurons.Count <> 3 * d then
+      ImportError('GPT-NeoX export: layer for "' + WName + '" has ' +
+        IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+        IntToStr(3 * d) + '.');
+    RotHalf := RotaryDims div 2;
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(3 * d * d, 1, 1);
+      B.ReSize(3 * d, 1, 1);
+      for r := 0 to 3 * d - 1 do
+      begin
+        HeadIdx := r div (3 * HeadDim);
+        Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
+        RowInHead := r mod HeadDim;
+        TargetRow := RowInHead;
+        if (Third < 2) and (RowInHead < RotaryDims) then
+        begin
+          if RowInHead < RotHalf then
+            TargetRow := 2 * RowInHead
+          else
+            TargetRow := 2 * (RowInHead - RotHalf) + 1;
+        end;
+        TargetIdx := Third * d + HeadIdx * HeadDim + TargetRow;
+        if Layer.Neurons[TargetIdx].Weights.Size <> d then
+          ImportError('GPT-NeoX export: neuron ' + IntToStr(TargetIdx) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+            ' weights, expected ' + IntToStr(d) + '.');
+        for ii := 0 to d - 1 do
+          W.FData[r * d + ii] := Layer.Neurons[TargetIdx].Weights.FData[ii];
+        B.FData[r] := Layer.Neurons[TargetIdx].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [3 * d, d], W, pDType);
+      Writer.AddTensorFlat(BName, [3 * d], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  IntSize := Config.IntermediateSize;
+  if Config.NumHeads < 1 then
+    ImportError('GPT-NeoX export: num_attention_heads must be >= 1.');
+  if (d mod Config.NumHeads) <> 0 then
+    ImportError('GPT-NeoX export: hidden_size not divisible by num heads.');
+  HeadDim := d div Config.NumHeads;
+  RotaryDims := Trunc(HeadDim * Config.RotaryPct);
+  // ---- collect load-bearing layers in net (= importer build) order ----
+  SetLength(Embeds, 0);
+  SetLength(LayerNorms, 0);
+  SetLength(PwConvs, 0);
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetEmbedding then
+    begin
+      SetLength(Embeds, Length(Embeds) + 1);
+      Embeds[High(Embeds)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LayerNorms, Length(LayerNorms) + 1);
+      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if Length(Embeds) <> 1 then
+    ImportError('GPT-NeoX export: found ' + IntToStr(Length(Embeds)) +
+      ' TNNetEmbedding layers, expected 1 - not a ' +
+      'BuildGPTNeoXFromSafeTensors decoder?');
+  ExpectLN := 2 * Config.NumLayers + 1;   // LN1/LN2 per block + final_layer_norm
+  ExpectPw := 4 * Config.NumLayers + 1;   // QKV,AttnDense,HTo4H,FourHToH + LMHead
+  if Length(LayerNorms) <> ExpectLN then
+    ImportError('GPT-NeoX export: found ' + IntToStr(Length(LayerNorms)) +
+      ' LayerNorm layers, expected ' + IntToStr(ExpectLN) + ' for ' +
+      IntToStr(Config.NumLayers) + ' blocks.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('GPT-NeoX export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) + '.');
+  EmbIn := Embeds[0];
+  FinalLN := LayerNorms[2 * Config.NumLayers];     // last collected LayerNorm
+  LMHead := PwConvs[4 * Config.NumLayers];          // last collected PwConv
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/gpt_neox');
+    // ---- embeddings ----
+    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+      ImportError('GPT-NeoX export: embed_in size ' +
+        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(Config.VocabSize * d) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'embed_in.weight',
+      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+    // ---- decoder blocks ----
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+      AttnPrefix := BlockPrefix + 'attention.';
+      PwBase := BlockCnt * 4;
+      SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 0],
+        BlockPrefix + 'input_layernorm.weight',
+        BlockPrefix + 'input_layernorm.bias', d, pDType);
+      SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 1],
+        BlockPrefix + 'post_attention_layernorm.weight',
+        BlockPrefix + 'post_attention_layernorm.bias', d, pDType);
+      DumpQKV(PwConvs[PwBase + 0],
+        AttnPrefix + 'query_key_value.weight',
+        AttnPrefix + 'query_key_value.bias');
+      DumpLinear(PwConvs[PwBase + 1], 0, d, d,
+        AttnPrefix + 'dense.weight', AttnPrefix + 'dense.bias');
+      DumpLinear(PwConvs[PwBase + 2], 0, IntSize, d,
+        BlockPrefix + 'mlp.dense_h_to_4h.weight',
+        BlockPrefix + 'mlp.dense_h_to_4h.bias');
+      DumpLinear(PwConvs[PwBase + 3], 0, d, IntSize,
+        BlockPrefix + 'mlp.dense_4h_to_h.weight',
+        BlockPrefix + 'mlp.dense_4h_to_h.bias');
+    end;
+    SaveLayerNormWeights(Writer, FinalLN,
+      Config.Prefix + 'final_layer_norm.weight',
+      Config.Prefix + 'final_layer_norm.bias', d, pDType);
+    // ---- LM head (embed_out, OUTSIDE the gpt_neox. prefix, bias-free) ----
+    DumpLinear(LMHead, 0, Config.VocabSize, d, 'embed_out.weight', '');
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
   end;
 end;
 

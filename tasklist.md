@@ -272,9 +272,18 @@ rather than acted on.
       Q|K|V slab into the three nn.Linear tensors and dumps straight [out,in]
       linears (+bias) / LayerNorm gamma-beta / word|type|position embeddings
       under the family name map (bert/distilbert/roberta prefixes), round-trip
-      gated by TestBertSafeTensorsRoundTrip): add a layer->HF-name + transpose
-      inverse map for the REMAINING architectures (GPT-NeoX/...), each its own
-      map.
+      gated by TestBertSafeTensorsRoundTrip; GPT-NeoX SaveGPTNeoXToSafeTensors
+      LANDED as the exact inverse of BuildGPTNeoXFromSafeTensors — collects the
+      decoder's typed layers in build order and RE-FUSES the per-head Q|K|V slab
+      back into the single interleaved query_key_value tensor (inverting the
+      partial rotate_half permutation of LoadGPTNeoXQKVWeights) plus straight
+      [out,in] dense/dense_h_to_4h/dense_4h_to_h linears, LayerNorm gamma|beta,
+      embed_in / embed_out under the gpt_neox.* name map, round-trip gated by
+      TestGPTNeoXSafeTensorsRoundTrip over BOTH parallel and sequential
+      configs): add a layer->HF-name + transpose inverse map for the REMAINING
+      architectures (e.g. GPT-NeoX-style siblings already covered; next up the
+      non-transformer / encoder-decoder importers such as RWKV/Mamba, T5/Marian,
+      BLOOM — each its own map).
 - [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the
