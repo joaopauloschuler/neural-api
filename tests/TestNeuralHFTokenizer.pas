@@ -31,6 +31,11 @@ type
     procedure TestWordPieceParityWithHF;
     procedure TestUnigramParityWithHF;
     procedure TestUnigramSegmentationAndFusedUnk;
+    // Raw SentencePiece .model protobuf reader (LoadSentencePieceModel):
+    // ids must match the SentencePiece encoder oracle for every pinned
+    // case (fixture by tools/make_pico_spm_fixture.py), decode must match
+    // for the unk-free cases, and special ids come from trainer_spec.
+    procedure TestSentencePieceModelParity;
     procedure TestSplitQwen2ParityWithHF;
     procedure TestSplitCl100kParityWithHF;
     procedure TestMetaspacePreTokenizerParityWithHF;
@@ -219,6 +224,75 @@ begin
   finally
     Ids.Free;
     Tok.Free;
+  end;
+end;
+
+// Raw SentencePiece .model protobuf path. The oracle is the SentencePiece
+// encoder itself (tools/make_pico_spm_fixture.py): every pinned id list
+// must match exactly. Decode is asserted only for cases with no <unk>
+// (id 0): the Pascal Decode follows the HF tokenizers metaspace convention
+// (unk -> empty surface), whereas the spm reference renders <unk> as its
+// unk_surface ' ⁇ ', so the two intentionally differ there.
+procedure TTestNeuralHFTokenizer.TestSentencePieceModelParity;
+var
+  Tok: TNeuralHFTokenizer;
+  Root: TJSONData;
+  Group, CaseObj: TJSONObject;
+  Cases, ExpectedIds: TJSONArray;
+  Ids: TIntegerList;
+  CaseCnt, IdCnt: integer;
+  Text, Context: string;
+  HasUnk: boolean;
+  FS: TFileStream;
+begin
+  FS := TFileStream.Create(FixturePath('hf_tokenizer_cases.json'),
+    fmOpenRead or fmShareDenyWrite);
+  try
+    Root := GetJSON(FS);
+  finally
+    FS.Free;
+  end;
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Group := TJSONObject(Root).Objects['spm_model'];
+    // Exercise BOTH entry points: LoadFromFile must auto-dispatch the
+    // '.model' extension to the raw protobuf reader.
+    Tok.LoadFromFile(FixturePath(Group.Get('tokenizer', '')));
+    AssertTrue('spm flag', Tok.IsUnigram);
+    AssertTrue('not byte-level', not Tok.IsByteLevel);
+    AssertTrue('vocab loaded', Tok.GetVocabSize() > 10);
+    // trainer_spec ids (unk=0, bos=1, eos=2 in the fixture).
+    AssertEquals('unk id from trainer_spec', 0, Tok.UnkId);
+    AssertEquals('bos id from trainer_spec', 1, Tok.BosId);
+    AssertEquals('eos id from trainer_spec', 2, Tok.EosId);
+
+    Cases := Group.Arrays['cases'];
+    AssertTrue('no cases pinned', Cases.Count >= 10);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Text := CaseObj.Get('text', '');
+      ExpectedIds := CaseObj.Arrays['ids'];
+      Context := 'spm case ' + IntToStr(CaseCnt) + ' "' + Text + '"';
+      Ids.Clear;
+      Tok.Encode(Text, Ids);
+      AssertEquals(Context + ': id count', ExpectedIds.Count, Ids.Count);
+      HasUnk := false;
+      for IdCnt := 0 to ExpectedIds.Count - 1 do
+      begin
+        AssertEquals(Context + ': id[' + IntToStr(IdCnt) + ']',
+          ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+        if ExpectedIds.Integers[IdCnt] = Tok.UnkId then HasUnk := true;
+      end;
+      if not HasUnk then
+        AssertEquals(Context + ': decode',
+          CaseObj.Get('decoded', ''), Tok.Decode(Ids, true));
+    end;
+  finally
+    Ids.Free;
+    Tok.Free;
+    Root.Free;
   end;
 end;
 

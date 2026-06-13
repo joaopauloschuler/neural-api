@@ -150,9 +150,12 @@ rather than acted on.
 - [ ] BART-family follow-up (b) mBART/NLLB — pre-norm + an EXTRA final encoder
       AND decoder LayerNorm (same pre-norm shape the Pegasus importer now ships,
       so it should reuse BuildPegasusStackBlocks) + a SentencePiece tokenizer:
-      mBART/NLLB ship a raw sentencepiece.bpe.model without a tokenizer.json, so
-      they still need the open raw .model protobuf path (the landed Unigram reader
-      only covers tokenizer.json). Also: the committed
+      mBART/NLLB ship a raw sentencepiece.bpe.model without a tokenizer.json:
+      the raw .model protobuf reader has now LANDED (LoadSentencePieceModel,
+      see Tokenizer follow-up (b) below) and covers the Unigram .model that
+      mBART(-Unigram)/DeBERTa-v3/T5/ALBERT use, so the tokenizer side is
+      unblocked for those; NLLB/mBART variants that ship a BPE .model still
+      need the BPE-in-.model follow-up. Also: the committed
       bart_tiny / tiny_pegasus fixtures are single-shard, so the inherited
       multi-shard index.json path is untested for these encoder-decoders
       specifically — add a 2-shard fixture if a real distilbart/pegasus import
@@ -181,10 +184,20 @@ rather than acted on.
       max-magnitude element 0 is missed; csErrorOverflowBackpropProtection
       and friends consume it — audit callers before fixing).
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
-      (b) the raw SentencePiece .model protobuf path (parse the protobuf
-      wire format
-      or vendor a minimal decoder) for checkpoints that ship without a
-      tokenizer.json; (c) exact full-Unicode \p{L}/\p{N} tables (current
+      (b) DONE — raw SentencePiece .model protobuf path landed
+      (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
+      vendored proto lib; auto-dispatched from LoadFromFile by the '.model'
+      extension or a non-'{' first byte). Populates the SAME Unigram
+      structures as the tokenizer.json path; pico fixture + spm-oracle parity
+      test (tools/make_pico_spm_fixture.py, tests/fixtures/tiny_spm.model,
+      TestSentencePieceModelParity). UNIGRAM model_type only; a BPE/WORD/CHAR
+      ModelProto raises EHFTokenizerError ("use tokenizer.json"). OPEN
+      follow-ups: BPE-in-.model (NLLB/mBART-BPE exports — needs the merges
+      decoded from the ModelProto pieces or via tokenizer.json), and BYTE
+      (type=6) byte-fallback pieces are loaded as plain pieces but not wired
+      to <0xNN> byte-fallback decoding. This partially UNBLOCKS the
+      mBART/NLLB BART-family follow-up (b) and the DeBERTa-v3 import (both
+      ship raw sentencepiece .model and are Unigram). (c) exact full-Unicode \p{L}/\p{N} tables (current
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
       Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
       punctuation class of the GPT-2 regex); (d) build a tokenizer from

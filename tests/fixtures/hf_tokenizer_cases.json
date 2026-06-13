@@ -2174,5 +2174,131 @@
     "decoded": ""
    }
   ]
+ },
+ "spm_model": {
+  "tokenizer": "tiny_spm.model",
+  "cases": [
+   {
+    "text": "the cat sat",
+    "ids": [
+     4,
+     11,
+     8,
+     6
+    ],
+    "decoded": "the cat sat"
+   },
+   {
+    "text": "the cat sat on the mat",
+    "ids": [
+     4,
+     11,
+     8,
+     6,
+     3,
+     30,
+     4,
+     16
+    ],
+    "decoded": "the cat sat on the mat"
+   },
+   {
+    "text": "running and jumping",
+    "ids": [
+     15,
+     37,
+     9,
+     7,
+     5,
+     12,
+     3,
+     46,
+     36,
+     21,
+     23,
+     7
+    ],
+    "decoded": "running and jumping"
+   },
+   {
+    "text": "the morning meeting",
+    "ids": [
+     4,
+     28,
+     42,
+     9,
+     7,
+     28,
+     33
+    ],
+    "decoded": "the morning meeting"
+   },
+   {
+    "text": "nation station",
+    "ids": [
+     3,
+     9,
+     10,
+     8,
+     35,
+     10
+    ],
+    "decoded": "nation station"
+   },
+   {
+    "text": "a fat cat",
+    "ids": [
+     5,
+     40,
+     6,
+     11
+    ],
+    "decoded": "a fat cat"
+   },
+   {
+    "text": "eating sleeping",
+    "ids": [
+     25,
+     8,
+     14,
+     50,
+     23,
+     7
+    ],
+    "decoded": "eating sleeping"
+   },
+   {
+    "text": "the dog",
+    "ids": [
+     4,
+     3,
+     13,
+     27
+    ],
+    "decoded": "the dog"
+   },
+   {
+    "text": "cat",
+    "ids": [
+     11
+    ],
+    "decoded": "cat"
+   },
+   {
+    "text": "the qxz cat",
+    "ids": [
+     4,
+     3,
+     0,
+     11
+    ],
+    "decoded": "the  ⁇  cat"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   }
+  ]
  }
 }

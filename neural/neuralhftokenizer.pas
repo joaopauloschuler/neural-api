@@ -61,9 +61,24 @@ Coded by Claude (AI).
 //     cover (HF behavior). Composes with the Metaspace pre_tokenizer /
 //     decoder that these tokenizers ship with.
 //
+//   * Raw SentencePiece `.model` protobuf (LoadSentencePieceModel, also
+//     auto-dispatched from LoadFromFile by the '.model' extension or a
+//     non-'{' first byte): the ModelProto wire format is hand-decoded (no
+//     vendored proto library) into the SAME Unigram structures as the
+//     tokenizer.json-Unigram path -- pieces (text, score, type) + the
+//     trainer_spec unk/bos/eos ids -- and the SentencePiece Metaspace
+//     convention is wired so Encode/Decode behave identically. This is what
+//     T5 / ALBERT / XLNet / DeBERTa-v3 / mBART(-Unigram) checkpoints ship
+//     when they carry NO tokenizer.json. Only the UNIGRAM model_type is
+//     read; a BPE/WORD/CHAR ModelProto raises EHFTokenizerError. NFKC /
+//     precompiled_charsmap normalization is not applied (same approximation
+//     stance as the tokenizer.json Unigram path above).
+//
 // NOT supported (raises EHFTokenizerError with a clear message):
 //   * model.type <> "BPE"/"WordPiece"/"Unigram".
-//   * The raw SentencePiece .model protobuf (use tokenizer.json instead).
+//   * A raw SentencePiece .model whose trainer_spec.model_type is BPE / WORD
+//     / CHAR (only UNIGRAM is read from the protobuf -- use tokenizer.json
+//     for the BPE-in-.model case, e.g. some NLLB exports).
 //
 // Unicode \p{L} / \p{N} classification for the GPT-2 regex is implemented
 // over explicit ranges covering Latin (incl. Latin-1/Extended), Greek,
@@ -195,8 +210,24 @@ type
       constructor Create();
       destructor Destroy(); override;
 
-      // Loads a HuggingFace tokenizer.json file.
+      // Loads a HuggingFace tokenizer.json file. A path ending in '.model'
+      // (or whose first byte is not '{') is dispatched to the raw
+      // SentencePiece ModelProto reader (LoadSentencePieceModel).
       procedure LoadFromFile(const FileName: string);
+
+      // Loads a raw SentencePiece `.model` (sentencepiece.bpe.model /
+      // spm.model / tokenizer.model) ModelProto protobuf, as shipped by
+      // T5 / ALBERT / XLNet / DeBERTa-v3 / mBART(-Unigram) checkpoints that
+      // carry no tokenizer.json. Only the UNIGRAM model_type is supported
+      // (the Viterbi path); a BPE/WORD/CHAR ModelProto raises
+      // EHFTokenizerError ("use tokenizer.json"). The pieces (text, score,
+      // type) populate the SAME internal Unigram structures the
+      // tokenizer.json-Unigram path uses, and the SentencePiece Metaspace
+      // convention (add_dummy_prefix -> prepend U+2581, space -> U+2581) is
+      // wired so Encode/Decode behave identically. NFKC/precompiled_charsmap
+      // normalization is NOT applied (same approximation stance as the
+      // tokenizer.json Unigram path).
+      procedure LoadSentencePieceModel(const FileName: string);
 
       // Text -> token ids. Special tokens are matched if present verbatim
       // in the text but never auto-injected.
@@ -951,6 +982,14 @@ var
 var
   RawJson: string;
 begin
+  // Raw SentencePiece .model protobuf dispatch: by extension, or by sniffing
+  // the first byte (every tokenizer.json starts with '{'; a ModelProto
+  // starts with the protobuf tag 0x0A for field 1 = pieces).
+  if LowerCase(ExtractFileExt(FileName)) = '.model' then
+  begin
+    LoadSentencePieceModel(FileName);
+    Exit;
+  end;
   ClearState();
   DetectKeyMangling();
   FS := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
@@ -959,6 +998,13 @@ begin
     if FS.Size > 0 then FS.ReadBuffer(RawJson[1], FS.Size);
   finally
     FS.Free;
+  end;
+  // Sniff: a non-'{' first non-whitespace byte means this is a binary
+  // ModelProto saved under a non-.model name (e.g. some tokenizer.model).
+  if (Length(RawJson) > 0) and (RawJson[1] <> '{') and (RawJson[1] <> #$EF) then
+  begin
+    LoadSentencePieceModel(FileName);
+    Exit;
   end;
   // decode \uXXXX up front (see DecodeUnicodeEscapes) and parse raw
   Root := ParseJSONRaw(DecodeUnicodeEscapes(RawJson));
@@ -1099,6 +1145,275 @@ begin
   finally
     Root.Free;
   end;
+end;
+
+{ ---------------------------------------------------------------- }
+{ Raw SentencePiece ModelProto protobuf reader                      }
+{ ---------------------------------------------------------------- }
+//
+// Hand-decoded protobuf wire format (no vendored proto library). The
+// SentencePiece ModelProto (sentencepiece_model.proto) is:
+//   field 1  pieces        repeated message SentencePiece
+//                            f1 piece (string), f2 score (float/fixed32),
+//                            f3 type (enum 1=NORMAL 2=UNKNOWN 3=CONTROL
+//                            4=USER_DEFINED 5=UNUSED 6=BYTE)
+//   field 2  trainer_spec  message
+//                            f3  model_type (1=UNIGRAM 2=BPE 3=WORD 4=CHAR)
+//                            f40 unk_id, f41 bos_id, f42 eos_id, f43 pad_id
+//   field 3  normalizer_spec (precompiled_charsmap etc. -- ignored here)
+// Wire tag = (field_number shl 3) or wire_type; wire_type 0=varint,
+// 1=fixed64, 2=length-delimited, 5=fixed32. Negative ids are stored as
+// their two's-complement uint64 (e.g. pad_id -1 == high(uint64)).
+procedure TNeuralHFTokenizer.LoadSentencePieceModel(const FileName: string);
+var
+  FS: TFileStream;
+  Buf: array of byte;
+  BufLen: integer;
+  PieceTextV: array of string;  // piece text, id-indexed
+  PieceTypeV: array of integer; // piece type, id-indexed
+  PieceCount: integer;
+  ModelType: integer;           // trainer_spec.model_type (default UNIGRAM)
+  SpmUnk, SpmBos, SpmEos: integer;
+  Cnt: integer;
+  Score: single;
+
+  // Reads a base-128 varint at Pos (0-based into Buf), advances Pos.
+  function ReadVarint(var Pos: integer): QWord;
+  var
+    Shift: integer;
+    B: byte;
+  begin
+    Result := 0;
+    Shift := 0;
+    repeat
+      if Pos >= BufLen then
+        raise EHFTokenizerError.Create(
+          'SentencePiece .model: truncated varint');
+      B := Buf[Pos];
+      Inc(Pos);
+      Result := Result or (QWord(B and $7F) shl Shift);
+      Inc(Shift, 7);
+    until (B and $80) = 0;
+  end;
+
+  // Sign-recovers a uint64 wire id to a signed integer (HF/SPM convention:
+  // an "unset" id of -1 is serialized as 2^64-1).
+  function ToSignedId(V: QWord): integer;
+  begin
+    if V > QWord($7FFFFFFFFFFFFFFF) then
+      Result := integer(Int64(V))   // negative (e.g. -1)
+    else
+      Result := integer(V);
+  end;
+
+  // Parses one SentencePiece submessage [Start, Stop) into Text/Typ/Score.
+  procedure ParsePiece(Start, Stop: integer; out Text: string;
+    out Typ: integer; out PScore: single);
+  var
+    P, FieldNum, WireType, Len: integer;
+    V: QWord;
+    U: cardinal;
+  begin
+    Text := '';
+    Typ := 1; // NORMAL
+    PScore := 0;
+    P := Start;
+    while P < Stop do
+    begin
+      V := ReadVarint(P);
+      FieldNum := integer(V shr 3);
+      WireType := integer(V and 7);
+      case WireType of
+        0: // varint  -> f3 type
+          begin
+            V := ReadVarint(P);
+            if FieldNum = 3 then Typ := integer(V);
+          end;
+        1: Inc(P, 8); // fixed64 (none used in a piece)
+        2: // length-delimited -> f1 piece string
+          begin
+            Len := integer(ReadVarint(P));
+            if FieldNum = 1 then
+            begin
+              SetLength(Text, Len);
+              if Len > 0 then Move(Buf[P], Text[1], Len);
+            end;
+            Inc(P, Len);
+          end;
+        5: // fixed32 -> f2 score (little-endian IEEE-754 single)
+          begin
+            if P + 4 > Stop then
+              raise EHFTokenizerError.Create(
+                'SentencePiece .model: truncated fixed32');
+            U := cardinal(Buf[P]) or (cardinal(Buf[P + 1]) shl 8) or
+              (cardinal(Buf[P + 2]) shl 16) or (cardinal(Buf[P + 3]) shl 24);
+            if FieldNum = 2 then PScore := single((@U)^);
+            Inc(P, 4);
+          end;
+      else
+        raise EHFTokenizerError.Create(
+          'SentencePiece .model: bad wire type in piece');
+      end;
+    end;
+  end;
+
+  // Parses the trainer_spec submessage [Start, Stop): model_type + ids.
+  procedure ParseTrainerSpec(Start, Stop: integer);
+  var
+    P, FieldNum, WireType, Len: integer;
+    V: QWord;
+  begin
+    P := Start;
+    while P < Stop do
+    begin
+      V := ReadVarint(P);
+      FieldNum := integer(V shr 3);
+      WireType := integer(V and 7);
+      case WireType of
+        0:
+          begin
+            V := ReadVarint(P);
+            case FieldNum of
+              3:  ModelType := integer(V);
+              40: SpmUnk := ToSignedId(V);
+              41: SpmBos := ToSignedId(V);
+              42: SpmEos := ToSignedId(V);
+              // 43 = pad_id (unused here)
+            end;
+          end;
+        1: Inc(P, 8);
+        2: begin Len := integer(ReadVarint(P)); Inc(P, Len); end;
+        5: Inc(P, 4);
+      else
+        raise EHFTokenizerError.Create(
+          'SentencePiece .model: bad wire type in trainer_spec');
+      end;
+    end;
+  end;
+
+  // Top-level ModelProto walk: collect pieces (field 1) and trainer_spec
+  // (field 2). normalizer_spec (field 3) and everything else is skipped.
+  procedure ParseModelProto();
+  var
+    P, FieldNum, WireType, Len: integer;
+    V: QWord;
+    PText: string;
+    PTyp: integer;
+  begin
+    P := 0;
+    while P < BufLen do
+    begin
+      V := ReadVarint(P);
+      FieldNum := integer(V shr 3);
+      WireType := integer(V and 7);
+      case WireType of
+        0: ReadVarint(P);
+        1: Inc(P, 8);
+        2:
+          begin
+            Len := integer(ReadVarint(P));
+            if FieldNum = 1 then // a SentencePiece
+            begin
+              ParsePiece(P, P + Len, PText, PTyp, Score);
+              if PieceCount >= Length(PieceTextV) then
+              begin
+                SetLength(PieceTextV, Length(PieceTextV) * 2 + 16);
+                SetLength(PieceTypeV, Length(PieceTextV));
+                SetLength(FUniScore, Length(PieceTextV));
+              end;
+              PieceTextV[PieceCount] := PText;
+              PieceTypeV[PieceCount] := PTyp;
+              FUniScore[PieceCount] := Score;
+              Inc(PieceCount);
+            end
+            else if FieldNum = 2 then // trainer_spec
+              ParseTrainerSpec(P, P + Len);
+            Inc(P, Len);
+          end;
+        5: Inc(P, 4);
+      else
+        raise EHFTokenizerError.Create(
+          'SentencePiece .model: bad wire type at top level');
+      end;
+    end;
+  end;
+
+begin
+  ClearState();
+  // NOTE: DetectKeyMangling() is intentionally NOT called -- the .model
+  // reader handles raw bytes itself (no fpjson involved), so no key
+  // mangling can occur and the probe (which parses JSON) would be wasted.
+  FS := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+  try
+    BufLen := FS.Size;
+    SetLength(Buf, BufLen);
+    if BufLen > 0 then FS.ReadBuffer(Buf[0], BufLen);
+  finally
+    FS.Free;
+  end;
+
+  PieceCount := 0;
+  ModelType := 1;   // UNIGRAM default (matches SPM proto default)
+  SpmUnk := -1;
+  SpmBos := -1;
+  SpmEos := -1;
+  ParseModelProto();
+
+  if ModelType <> 1 then
+    raise EHFTokenizerError.Create(
+      'SentencePiece .model: only the UNIGRAM model_type is supported by ' +
+      'the raw-.model reader (model_type=' + IntToStr(ModelType) +
+      '; BPE/WORD/CHAR not supported -- use tokenizer.json instead).');
+  if PieceCount = 0 then
+    raise EHFTokenizerError.Create('SentencePiece .model: no pieces found.');
+
+  // Populate the SAME internal Unigram structures the tokenizer.json path
+  // uses: FVocab (token->id), FIdToToken (id->token), FUniScore (id->score),
+  // FUniMinScore. The 0-based piece index IS the id.
+  FUnigram := true;
+  SetLength(FIdToToken, PieceCount);
+  SetLength(FUniScore, PieceCount);
+  FUniMinScore := 0;
+  for Cnt := 0 to PieceCount - 1 do
+  begin
+    FVocab.AddObject(PieceTextV[Cnt], TObject(PtrInt(Cnt)));
+    FIdToToken[Cnt] := PieceTextV[Cnt];
+    if (Cnt = 0) or (FUniScore[Cnt] < FUniMinScore) then
+      FUniMinScore := FUniScore[Cnt];
+  end;
+
+  // Special-token ids straight from trainer_spec (authoritative for SPM).
+  if SpmUnk >= 0 then FUnkId := SpmUnk;
+  if SpmBos >= 0 then FBosId := SpmBos;
+  if SpmEos >= 0 then FEosId := SpmEos;
+
+  // SentencePiece always uses the Metaspace convention: add_dummy_prefix
+  // prepends U+2581 and every space becomes U+2581. Wire the SAME
+  // pre-tokenizer + decoder the tokenizer.json Unigram path gets from its
+  // Metaspace pre_tokenizer / decoder entries (prepend always, split on the
+  // metaspace, replacement U+2581 -> ' ' on decode, strip one leading space).
+  FMetaspacePreTok := true;
+  FMSReplacement := csMetaspace;
+  FMSPrependScheme := 'always';
+  FMSSplit := true;
+  SetLength(FDecReplaceFrom, 1);
+  SetLength(FDecReplaceTo, 1);
+  FDecReplaceFrom[0] := csMetaspace;
+  FDecReplaceTo[0] := ' ';
+  FDecStripLeft := 1;
+
+  // Expose the special pieces as added tokens so they round-trip verbatim
+  // in the input text and Decode(skip_special_tokens) drops them, matching
+  // the tokenizer.json path's added_tokens handling.
+  SetLength(FAddedTokens, 0);
+  for Cnt := 0 to PieceCount - 1 do
+    if (PieceTypeV[Cnt] = 2) or (PieceTypeV[Cnt] = 3) then // UNKNOWN/CONTROL
+    begin
+      SetLength(FAddedTokens, Length(FAddedTokens) + 1);
+      FAddedTokens[High(FAddedTokens)].Content := PieceTextV[Cnt];
+      FAddedTokens[High(FAddedTokens)].Id := Cnt;
+      FAddedTokens[High(FAddedTokens)].Special := true;
+    end;
 end;
 
 function TNeuralHFTokenizer.FindAddedToken(const Text: string;
