@@ -165,11 +165,11 @@ bash run_decode_bakeoff.sh             (all nine phases, logs to decode_bakeoff_
 | 9 | Parallel attention+FFN block step-cost bake-off (`TNNet.AddParallelTransformerBlock`, GPT-J/PaLM single shared pre-norm) | implemented |
 
 Every phase self-budgets to 270 s of wall clock: training is time-boxed inside the
-program (~185 s in phases 1/4/8, ~195 s in phases 2/3, ~190 s in phases 6/7, ~180 s in
-phase 9 — its box pays for a pre-train timed forward comparison — and ~160 s draft
+program (\~185 s in phases 1/4/8, \~195 s in phases 2/3, \~190 s in phases 6/7, \~180 s in
+phase 9 — its box pays for a pre-train timed forward comparison — and \~160 s draft
 training in phase 5), leaving the rest for
 the decode benchmark. The model is a small RoPE transformer decoder
-(ctx=48, d_model=128, 2 blocks, 8 heads, FFN 512, 3k vocab, ~1.31M params) with
+(ctx=48, d_model=128, 2 blocks, 8 heads, FFN 512, 3k vocab, \~1.31M params) with
 `TNNetDyT` normalization — RoPE and DyT are chosen because both are exactly
 streamable token-at-a-time (learned absolute positions and sequence-wide LayerNorm
 statistics are not). Phase 1 saves `bakeoff-phase1.nn`; phase 5 loads it and trains a
@@ -178,7 +178,7 @@ decoding with cached verification and `TruncateCache` rollback on rejection.
 Phase 2 uses MTP (Multi-Token Prediction, Gloeckle et al. 2024 / DeepSeek-V3 —
 parallel heads that forecast several future tokens at once instead of only the next
 one): it trains the same trunk with `TNNet.AddMultiTokenPrediction(NumFuture=3)`
-(~2.08M params): head 0 is the ordinary next-token head, heads 1..2 forecast t+2/t+3
+(\~2.08M params): head 0 is the ordinary next-token head, heads 1..2 forecast t+2/t+3
 and double as a built-in draft — no second network. Each self-speculative pass is one
 forward that verifies the pending drafts (accept-until-first-mismatch; a rejection
 still commits head-0's corrected token; full acceptance yields a bonus token) and
@@ -192,7 +192,7 @@ same d_model/blocks/FFN/head), but the mixer is the recurrent `TNNetDiagonalSSM`
 an SSM (State-Space Model, the S4/Mamba family): a linear per-channel recurrence
 `h_t = a·h_{t-1} + b·x_t` whose fixed-size hidden state carries the entire past, so
 order needs no positional embedding and decoding is O(1) per step with constant memory
-wrapped in token-wise in/out projections (~1.25M params), with NO RoPE and NO
+wrapped in token-wise in/out projections (\~1.25M params), with NO RoPE and NO
 positional embedding — the recurrence carries order. Its decode benchmark is full
 re-encode vs the layer's `BeginIncrementalDecode`/`ResetState` O(1)-per-step path,
 where the ENTIRE past is a Depth-long state vector per SSM layer (no per-token cache
@@ -201,7 +201,7 @@ Phase 4 swaps the attention for MLA (Multi-head Latent Attention, DeepSeek-V2 �
 attention variant that shrinks the per-token KV cache by factoring K/V through a tiny
 shared latent instead of caching full per-head K and V):
 `TNNet.AddMultiHeadLatentAttention(128, 8, LatentDim=32,
-CausalMask, RopeDim=8)` in the same pre-norm residual block (~1.29M params); K/V are
+CausalMask, RopeDim=8)` in the same pre-norm residual block (\~1.29M params); K/V are
 low-rank-factored through a 32-wide per-token latent and position enters ONLY through
 the decoupled rotated rope slice (token-only embedding). Its cached decode arm uses
 the per-head SDPA caches + `PositionOffset` (proving streamed-MLA token-exactness,
@@ -213,7 +213,7 @@ recommendation: a 3-block trunk of TWO phase-3 DiagonalSSM blocks and ONE phase-
 block (LatentDim 32, RopeDim 8), each block keeping the identical
 [DyT → mixer → residual] + [DyT → SwiGLU FFN 512 → residual] skeleton, token-only
 embedding (order = the SSM recurrences + the MLA rope slice), d_model 128, ctx 48,
-~1.50M params (3 blocks vs 2 elsewhere). Block order is SSM → MLA → SSM — attention
+\~1.50M params (3 blocks vs 2 elsewhere). Block order is SSM → MLA → SSM — attention
 in the middle, the Jamba/Zamba interleaving default: the first recurrent block hands
 the lone attention layer globally-mixed inputs, and a constant-state recurrence (not
 a second cache-growing attention) closes the trunk. Trained at lr=0.001 (phase-2/4
@@ -284,7 +284,7 @@ Prompt "one day"          full re-encode 33.61 ms/token  KV-cached 1.50 ms/token
 Prompt "once upon a time" full re-encode 45.80 ms/token  KV-cached 2.31 ms/token  speedup 19.9x
 ```
 
-Phase 2 (greedy, 40 new tokens per prompt, both arms token-identical; ~195 s training
+Phase 2 (greedy, 40 new tokens per prompt, both arms token-identical; \~195 s training
 box, loss 5.21 → 4.78 — within the box only the nearest future head converges:
 accept rate 97.5% at distance t+2 vs 0.0% at t+3; 1.93 committed tokens per
 verification pass):
@@ -296,12 +296,12 @@ speedup            : 1.90x wall clock   1.90x forwards
 ```
 Both phase-2 arms run the SAME MTP net and re-encode fully, so wall clock tracks the
 forward-pass ratio exactly. Note the measurement-honesty gap vs phase 1: an MTP
-forward costs more than a plain-head forward (phase 2's ~101 ms/token plain-greedy
-baseline vs phase 1's ~34-46 ms/token is the price of the two extra 128→3000 head
+forward costs more than a plain-head forward (phase 2's \~101 ms/token plain-greedy
+baseline vs phase 1's \~34-46 ms/token is the price of the two extra 128→3000 head
 projections), which is why the comparison is plain vs self-speculative from the same
 model, not across models.
 
-Phase 3 (greedy, 40 new tokens per prompt, both arms token-identical; ~195 s training
+Phase 3 (greedy, 40 new tokens per prompt, both arms token-identical; \~195 s training
 box, loss 4.47 → 2.34 — the recurrent mixer's O(n) forward fits more examples in the
 box than phase 1's O(n²) attention and lands at a comparable loss, though its samples
 loop sooner at this budget):
@@ -313,7 +313,7 @@ step cost vs prefix length:  <16 tokens 1.00 ms/step   16-31 tokens 1.05 ms/step
 The per-bucket step cost is FLAT in the prefix length (the whole past is a Depth-long
 state vector per SSM layer), whereas a KV-cached attention step grows with the cache.
 
-Phase 4 (greedy, 40 new tokens per prompt, both arms token-identical; ~185 s training
+Phase 4 (greedy, 40 new tokens per prompt, both arms token-identical; \~185 s training
 box at lr=0.001 — the latent down/up projections and rope-slice plumbing make an MLA
 step costlier than phase 1's MHA step — loss 3.90 → 2.53):
 ```
@@ -342,12 +342,12 @@ speedup vs plain-full  : 37.6x (cached)  9.3x (spec+cached)
 
 Note the target forwards per token: speculative verification really does halve them
 (0.54 vs 1.00). On CPU the plain KV-cached arm still wins wall-clock because a width-5
-verify forward costs ~5x a width-1 step here (compute-bound); speculative decoding pays
+verify forward costs \~5x a width-1 step here (compute-bound); speculative decoding pays
 off when single-token steps are memory-bandwidth-bound (GPUs/batch-1 LLM serving), and
 this phase demonstrates the exactness and the forward-count economics of composing it
 with the cache.
 
-Phase 6 (greedy, 40 new tokens per prompt, both arms token-identical; ~190 s training
+Phase 6 (greedy, 40 new tokens per prompt, both arms token-identical; \~190 s training
 box at lr=0.001, 1,496,582 params; first-logged loss 3.44 → 1.39 final running mean,
 three epochs on an idle machine):
 ```
@@ -362,7 +362,7 @@ Streamed-decode cache memory (4-byte floats):
   phase-1 transformer reference, 2 layers x 2*d_model:         512 floats = 2048 bytes  per token
 ```
 The three-assumption verdict (printed by the phase itself):
-1. **Convergence: HOLDS.** The hybrid's final loss (~1.39–1.61 across runs, machine-load
+1. **Convergence: HOLDS.** The hybrid's final loss (\~1.39–1.61 across runs, machine-load
    dependent) lands clearly BELOW pure SSM (2.34), pure MLA (2.53) and the transformer
    (2.87) at the same time budget — the single attention block does not slow the
    SSM-dominant trunk down; it helps.
@@ -371,8 +371,8 @@ The three-assumption verdict (printed by the phase itself):
    than phase 3's "there was a time, there was a time…" (the phase prints a repeated-
    trigram count per prompt as a cheap loop metric: 11/80 generated tokens here vs the
    pure-SSM run's tighter immediate loops).
-3. **Decode cost: HOLDS.** The streamed dual-family step lands at ~0.35 ms/token on an
-   idle machine (~1.2–1.9 ms/token under heavy load), flat in prefix length
+3. **Decode cost: HOLDS.** The streamed dual-family step lands at \~0.35 ms/token on an
+   idle machine (\~1.2–1.9 ms/token under heavy load), flat in prefix length
    (0.303/0.306/0.303 ms across the <16/16–31/≥32 buckets) — the SSM state is a
    constant 256 floats TOTAL and only ONE MLA block's cache grows per token (1536
    bytes/token as run via per-head SDPA caches; 160 bytes/token analytic latent-only),
@@ -382,7 +382,7 @@ So the hybrid recommendation holds on this workload: 2×SSM + 1×MLA converges a
 better than every pure stack, decodes at KV-cached-transformer speed or better with a
 quarter to one-tenth of the growing cache, and needs no speculation machinery.
 
-Phase 7 (greedy, 40 new tokens per prompt, both arms token-identical; same ~190 s box
+Phase 7 (greedy, 40 new tokens per prompt, both arms token-identical; same \~190 s box
 and lr=0.001 as phase 6; 541,574 params — 36.2% of the dense hybrid's 1,496,582,
 2.76× smaller):
 ```
@@ -393,14 +393,14 @@ step cost vs prefix length:  <16 tokens 0.275 ms/step   16-31 tokens 0.273 ms/st
 Its verdict (printed by the phase): **convergence HOLDS** — the grouped hybrid's loss
 fell 8.13 → 1.58, matching the dense reference's 1.61 at 2.76× fewer weights (the
 cheaper grouped step also fits more examples into the same time box: 9,600 seen vs
-phase 6's typical ~6,400); the samples carried 0 repeated trigrams across 80 generated
+phase 6's typical \~6,400); the samples carried 0 repeated trigrams across 80 generated
 tokens ("one day, there was a little girl named lily. she loved to play with her
 friends…"); and **decode cost HOLDS** — 0.31 ms/token streamed, flat across the
 prefix buckets (0.273–0.275 ms/step). The hard assert doubles as proof that grouped
 pointwise convolutions (block-diagonal weights + interleave intergroup remixing)
 stream token-exactly through the dual-family loop.
 
-Phase 8 (greedy, 40 new tokens per prompt, both arms token-identical; same ~185 s box
+Phase 8 (greedy, 40 new tokens per prompt, both arms token-identical; same \~185 s box
 and lr=0.0005 as phase 1; loss 5.01 → 2.50 vs phase 1's all-global 2.87 — at ctx=48
 the 12-key window costs nothing at this budget; longer contexts are where the
 local/global trade-off bites):
@@ -418,10 +418,10 @@ KV-cache state by prefix length (4-byte floats; analytic bounded-window state):
 The local layer's decode state is BOUNDED at 2·d_model·W = 3072 floats (12 KiB): the
 sliding-window mask discards every key older than 12 positions, so the table's
 local+global column converges to HALF of the all-global reference as the prefix grows
-(Gemma 2's 1:1 interleave; Gemma 3's 5:1 saves ~5/6 of the growing cache). The hard
+(Gemma 2's 1:1 interleave; Gemma 3's 5:1 saves \~5/6 of the growing cache). The hard
 assert proves the windowed SDPA streams token-exactly through the KV cache.
 
-Phase 9 (greedy, 40 new tokens per prompt, both arms token-identical; ~180 s box at
+Phase 9 (greedy, 40 new tokens per prompt, both arms token-identical; \~180 s box at
 lr=0.0005; 1,309,186 params vs the sequential reference's 1,309,700 — equal to within
 the 514 norm-layer params; loss 4.70 → 2.82 vs phase 1's sequential 2.87 at the same
 budget):
@@ -437,8 +437,8 @@ Prompt "once upon a time" full re-encode 82.71 ms/token  KV-cached 3.70 ms/token
 Quality matches the sequential block at the same budget (2.82 vs 2.87), and the cached
 decode stays token-exact through the parallel wiring (the same per-head SDPA layers, so
 the `TNNetStreamingDecoder` path applies unchanged). The honest step-cost finding: on
-THIS CPU library the parallel block is ~10% SLOWER per forward, not faster — the two
-branches execute serially layer-by-layer, so PaLM's ~15% step win (which comes from
+THIS CPU library the parallel block is \~10% SLOWER per forward, not faster — the two
+branches execute serially layer-by-layer, so PaLM's \~15% step win (which comes from
 running the attention and FFN branches CONCURRENTLY on parallel hardware) does not
 materialize; what the parallel form buys here is one norm layer fewer per block at
 equal quality.
