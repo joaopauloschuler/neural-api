@@ -924,6 +924,7 @@ type
     FSDPAs: array of TNNetScaledDotProductAttention;
     FSSMs: array of TNNetDiagonalSSM;
     FRopes: array of TNNetRotaryEmbedding;
+    FHiddenLayer: TNNetLayer;        // lazily resolved last-hidden-state layer
     function GetSDPACount(): integer;
     function GetSSMCount(): integer;
     function GetRopeCount(): integer;
@@ -945,6 +946,14 @@ type
     // Convenience: the net's last layer output (e.g. the softmax row(s) of
     // the window just computed).
     function Output(): TNNetVolume;
+    // LAST-HIDDEN-STATE accessor: the output of the layer feeding the LM head
+    // (the representation a contrastive-search / embedding consumer reads),
+    // resolved once with the same heuristic as the cache-less
+    // ContrastiveHiddenLayer. After a width-1 StepForward this is exactly the
+    // just-stepped token's hidden state - no re-encode, no slicing - so it is
+    // the reusable primitive token-level contrastive search (and the KV-cache
+    // beam / best-of-N tasks) read instead of running an extra full forward.
+    function HiddenState(): TNNetVolume;
     property Net: TNNet read FNet;
     property SDPACount: integer read GetSDPACount;
     property SSMCount: integer read GetSSMCount;
@@ -1096,6 +1105,45 @@ function DecodeConstrainedBeamSearch(NN: TNNet; const Prompt: string;
 function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
   MaxLen: integer; TopK: integer; PenaltyAlpha: TNeuralFloat;
   const StopStrings: array of string): TNNetDecodeResult;
+
+// TOKEN-LEVEL / KV-CACHE CONTRASTIVE SEARCH (follow-up to the char-level v1
+// above), driven by a TNNetStreamingDecoder session instead of re-encoding the
+// whole context each step. Identical scoring to v1:
+//   score(v) = (1 - PenaltyAlpha) * p(v)
+//            - PenaltyAlpha * max_{j<t} cos_sim( h_v , h_j )
+// but the per-step cost is paid with the session's KV cache, not a full
+// re-encode:
+//   * The next-token distribution p(.) is the output row of the LAST COMMITTED
+//     streamed step (one width-1 forward over the cached past), so there is NO
+//     re-encode of the growing context.
+//   * Each top-k candidate's hidden state h_v is read via the fork/rollback
+//     primitive: StepForward([v]) appends v's K/V to the cache, HiddenState()
+//     reads the resulting last-hidden-state, then TruncateTo(committedLen)
+//     rolls the cache back. Candidates are thus evaluated AGAINST the cached
+//     state - no full re-encode per candidate. (One width-1 forward per
+//     candidate is INHERENT to contrastive search: h_v depends on v as the
+//     model input; HF batches the same k forwards. v1 additionally paid a full
+//     O(context) re-encode for each, which this variant removes.)
+//   * The chosen token is committed with a single StepForward, advancing the
+//     cache by one - no separate "commit" re-encode.
+// DEGRADE-TO-GREEDY invariant (matches v1): PenaltyAlpha<=0 skips every
+// candidate forward and emits the top-probability token, BIT-FOR-BIT the
+// streamed greedy argmax (GenerateTokensStreamed with a nil sampler) on the
+// same session.
+//
+// CONTRACT. Session is a WIDTH-1 twin of the trained causal next-token net
+// (built and weight-copied by the caller, exactly as for GenerateTokensStreamed
+// - see the TNNetStreamingDecoder header). PromptTokens[0..PromptLen-1] is the
+// prompt; the function Reset()s the session, prefills the prompt, then decodes
+// up to MaxNewTokens tokens (or until an EOS token < 2 / a StopSequences match,
+// trimmed like the streamed greedy loop). MaxTotalLen must not exceed the
+// session's cache budget. The generated token ids are written into Tokens
+// (resized if needed); the return value is the final committed length.
+// Coded by Claude (AI).
+function DecodeContrastiveSearchStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens, MaxTotalLen,
+  TopK: integer; PenaltyAlpha: TNeuralFloat;
+  const StopSequences: TNNetTokenSequences): integer;
 
 // DoLa DECODING (Decoding by Contrasting Layers, Chuang et al. 2023; the
 // transformers `generate(dola_layers=...)` path). Improves FACTUALITY (NOT
@@ -1624,6 +1672,10 @@ implementation
 
 uses
   Math;
+
+// Forward declarations for helpers used before their definition.
+function ContrastiveHiddenLayer(NN: TNNet): TNNetLayer; forward;
+function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat; forward;
 
 function LengthPenaltyDenominator(L: integer; Alpha: TNeuralFloat): TNeuralFloat;
 begin
@@ -3298,6 +3350,15 @@ begin
   Result := FNet.GetLastLayer().Output;
 end;
 
+function TNNetStreamingDecoder.HiddenState(): TNNetVolume;
+begin
+  // Resolve the LM-head input layer once (same heuristic as the cache-less
+  // path) and return its output - the hidden state of the token in the window
+  // just stepped.
+  if FHiddenLayer = nil then FHiddenLayer := ContrastiveHiddenLayer(FNet);
+  Result := FHiddenLayer.Output;
+end;
+
 function TNNetStreamingDecoder.GetSDPACount(): integer;
 begin
   Result := Length(FSDPAs);
@@ -4128,6 +4189,143 @@ begin
   end;
   Result.Score := Result.SumLogProb /
     LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function DecodeContrastiveSearchStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens, MaxTotalLen,
+  TopK: integer; PenaltyAlpha: TNeuralFloat;
+  const StopSequences: TNNetTokenSequences): integer;
+var
+  InV, Row: TNNetVolume;
+  Probs: array of TNeuralFloat;
+  Cand: array of integer;
+  Past: array of TNNetVolume;
+  CandHidden: TNNetVolume;
+  VocabSize, Pos, CapLen, I, J, NumCand, Best, PastLen, StopLen: integer;
+  Total, MaxSim, Sim, ScoreV, BestScore: TNeuralFloat;
+  TmpI: integer;
+begin
+  if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'DecodeContrastiveSearchStreamed: the session net must be a WIDTH-1 ' +
+      'twin (input SizeX=1); got SizeX=' +
+      IntToStr(Session.Net.GetFirstLayer().Output.SizeX) + '.');
+  if PromptLen < 1 then
+    raise EArgumentException.Create(
+      'DecodeContrastiveSearchStreamed: PromptLen must be >= 1.');
+  Row := Session.Output();
+  VocabSize := Row.Size;
+  SetLength(Probs, VocabSize);
+  if TopK < 1 then TopK := 1;
+  if TopK > VocabSize then TopK := VocabSize;
+  CapLen := Min(PromptLen + MaxNewTokens, MaxTotalLen);
+  if Length(Tokens) < CapLen then SetLength(Tokens, CapLen);
+  InV := TNNetVolume.Create(Session.Net.GetFirstLayer().Output);
+  Past := nil;
+  PastLen := 0;
+  CandHidden := nil;
+  try
+    InV.Fill(0);
+    Session.Reset();
+    // Prefill tokens 0..PromptLen-2 one at a time; the LAST prompt token is the
+    // first decode step's input. Record the prompt's running hidden states as
+    // the past-context set so step 1 already has something to penalise against
+    // (mirrors v1 seeding the prompt's hidden state).
+    for Pos := 0 to PromptLen - 2 do
+    begin
+      InV.FData[0] := Tokens[Pos];
+      Session.StepForward(InV, Pos);
+      if PenaltyAlpha > 0 then
+      begin
+        SetLength(Past, PastLen + 1);
+        Past[PastLen] := TNNetVolume.Create();
+        Past[PastLen].Copy(Session.HiddenState());
+        Inc(PastLen);
+      end;
+    end;
+    Pos := PromptLen;
+    while Pos < CapLen do
+    begin
+      // The committed forward of the previous token: its output row is the
+      // next-token distribution, its hidden state is the last context token's.
+      InV.FData[0] := Tokens[Pos - 1];
+      Session.StepForward(InV, Pos - 1);
+      if PenaltyAlpha > 0 then
+      begin
+        SetLength(Past, PastLen + 1);
+        Past[PastLen] := TNNetVolume.Create();
+        Past[PastLen].Copy(Session.HiddenState());
+        Inc(PastLen);
+      end;
+      Row := Session.Output();
+      Total := Row.GetSum();
+      if Total <= 0 then Total := 1.0;
+      for I := 0 to VocabSize - 1 do Probs[I] := Row.Raw[I] / Total;
+      // Top-k candidates by probability (partial selection sort; k is tiny).
+      SetLength(Cand, VocabSize);
+      for I := 0 to VocabSize - 1 do Cand[I] := I;
+      NumCand := TopK;
+      for I := 0 to NumCand - 1 do
+      begin
+        Best := I;
+        for J := I + 1 to VocabSize - 1 do
+          if Probs[Cand[J]] > Probs[Cand[Best]] then Best := J;
+        TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
+      end;
+      SetLength(Cand, NumCand);
+      // Re-rank by the contrastive objective. PenaltyAlpha=0 keeps
+      // (1-alpha)*p(v) only, so Cand[0] (the global argmax) wins by
+      // construction -> bit-for-bit the streamed greedy argmax.
+      Best := Cand[0];
+      BestScore := -1e30;
+      for I := 0 to NumCand - 1 do
+      begin
+        MaxSim := 0;
+        if PenaltyAlpha > 0 then
+        begin
+          // Fork/rollback: append the candidate's K/V (StepForward), read the
+          // resulting last-hidden-state, then truncate the cache back to the
+          // committed length. No re-encode, no extra commit forward.
+          InV.FData[0] := Cand[I];
+          Session.StepForward(InV, Pos);
+          if CandHidden = nil then CandHidden := TNNetVolume.Create();
+          CandHidden.Copy(Session.HiddenState());
+          Session.TruncateTo(Pos);
+          MaxSim := -1e30;
+          for J := 0 to PastLen - 1 do
+          begin
+            Sim := ContrastiveCosine(CandHidden, Past[J]);
+            if Sim > MaxSim then MaxSim := Sim;
+          end;
+        end;
+        ScoreV := (1 - PenaltyAlpha) * Probs[Cand[I]] - PenaltyAlpha * MaxSim;
+        if ScoreV > BestScore then
+        begin
+          BestScore := ScoreV;
+          Best := Cand[I];
+        end;
+      end;
+      Tokens[Pos] := Best;
+      Inc(Pos);
+      // Stop sequences: trim the matched generated tail (like the streamed
+      // greedy loop).
+      if Length(StopSequences) > 0 then
+      begin
+        StopLen := MatchStopSuffix(Tokens, Pos, PromptLen, StopSequences);
+        if StopLen > 0 then
+        begin
+          Pos := Pos - StopLen;
+          Break;
+        end;
+      end;
+      if TokenIsEOS(Best, nil) then Break;
+    end;
+    Result := Pos;
+  finally
+    InV.Free;
+    if Assigned(CandHidden) then CandHidden.Free;
+    for I := 0 to PastLen - 1 do Past[I].Free;
+  end;
 end;
 
 // Resolves the LM-head start index for the DoLa / logit-lens splice: when

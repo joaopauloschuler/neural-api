@@ -380,15 +380,24 @@ rather than acted on.
       the input and mix the targets by area fraction (Beta-distributed
       lambda). The CIFAR image-classification examples give an instant
       bake-off harness.
-- [ ] Contrastive search decoding follow-up (v1 landed:
-      DecodeContrastiveSearch in neuraldecode.pas, char-level, alpha=0
-      degrades bit-identically to greedy, tests in TestNeuralDecode): v1
-      re-encodes the full context each step AND runs one extra forward per
-      top-k candidate to capture its hidden state (O(k) forwards/step). Add a
-      token-level / KV-cache (TNNetStreamingDecoder) variant that reads the
-      last-hidden-state from the streamed window — no re-encode, no
-      per-candidate forwards. Shares the fork/snapshot primitive the KV-cache
-      beam + best-of-N tasks want.
+- [X] Contrastive search decoding follow-up — LANDED:
+      DecodeContrastiveSearchStreamed in neuraldecode.pas (token-level /
+      KV-cache variant, driven by TNNetStreamingDecoder). The full re-encode
+      per step is GONE: p(.) is the previous committed streamed step's output
+      row; each top-k candidate's hidden state is read via the fork/rollback
+      primitive (StepForward appends K/V -> Session.HiddenState() ->
+      TruncateTo(committedLen) rolls back) so candidates are evaluated against
+      the CACHED state, not a re-encode; the chosen token commits with one
+      StepForward (no extra commit forward). The reusable primitive added on
+      TNNetStreamingDecoder is HiddenState() (last-hidden-state accessor) on top
+      of the existing TruncateTo() cache rollback — the KV-cache beam +
+      best-of-N tasks want the same pair. alpha=0 degrades BIT-FOR-BIT to the
+      streamed greedy argmax (GenerateTokensStreamed nil sampler); tests in
+      TestNeuralDecode (AlphaZeroMatchesStreamedGreedy / Deterministic /
+      AlphaChangesSelection). NOTE: one width-1 forward per candidate REMAINS
+      and is inherent — h_v depends on candidate v as the model input (HF
+      batches the same k forwards); what this removes vs v1 is the O(context)
+      re-encode that v1 paid on top of each.
 - [ ] Batched generation with left-padding in neural/neuraldecode.pas:
       generate for N prompts in one forward pass per step (today's decode
       paths look single-sample). Makes evaluation sweeps cheap and is a

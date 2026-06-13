@@ -94,6 +94,10 @@ type
     // Contrastive search (penalty_alpha) decoding.
     procedure TestContrastiveAlphaZeroMatchesGreedy;
     procedure TestContrastiveAlphaChangesSelection;
+    // Token-level / KV-cache contrastive search (TNNetStreamingDecoder).
+    procedure TestContrastiveStreamedAlphaZeroMatchesStreamedGreedy;
+    procedure TestContrastiveStreamedDeterministic;
+    procedure TestContrastiveStreamedAlphaChangesSelection;
     // DoLa (Decoding by Contrasting Layers).
     procedure TestDoLaAlphaZeroMatchesGreedy;
     procedure TestDoLaEmptyBucketMatchesGreedy;
@@ -578,6 +582,138 @@ begin
       C1.Text <> G.Text);
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestContrastiveStreamedAlphaZeroMatchesStreamedGreedy;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  GreedyToks, CSToks: TNeuralIntegerArray;
+  GreedyLen, CSLen, T: integer;
+  NoStops: TNNetTokenSequences;
+begin
+  // Degrade-to-greedy invariant for the KV-cache variant: PenaltyAlpha=0 keeps
+  // only (1-alpha)*p(v), so the top-probability candidate (= streamed greedy
+  // argmax) wins every step. Output must be BIT-FOR-BIT the streamed greedy
+  // GenerateTokensStreamed (nil sampler) on the same session.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(GreedyToks, PromptLen);
+    SetLength(CSToks, PromptLen);
+    GreedyToks[0] := 3; GreedyToks[1] := 7; GreedyToks[2] := 5;
+    for T := 0 to PromptLen - 1 do CSToks[T] := GreedyToks[T];
+
+    GreedyLen := GenerateTokensStreamed(Session, GreedyToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    CSLen := DecodeContrastiveSearchStreamed(Session, CSToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, {TopK=}4, {alpha=}0.0, NoStops);
+
+    AssertEquals('alpha=0 streamed CS length == streamed greedy length',
+      GreedyLen, CSLen);
+    for T := PromptLen to CSLen - 1 do
+      AssertEquals('alpha=0 streamed CS token at ' + IntToStr(T),
+        GreedyToks[T], CSToks[T]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestContrastiveStreamedDeterministic;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  A, B: TNeuralIntegerArray;
+  LenA, LenB, T: integer;
+  NoStops: TNNetTokenSequences;
+begin
+  // Same session, same prompt, twice -> identical output (no hidden RNG / state
+  // leak across the fork/rollback candidate evaluation).
+  RandSeed := 1234567;
+  SetLength(NoStops, 0);
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(A, PromptLen);
+    SetLength(B, PromptLen);
+    A[0] := 4; A[1] := 2; A[2] := 9;
+    for T := 0 to PromptLen - 1 do B[T] := A[T];
+
+    LenA := DecodeContrastiveSearchStreamed(Session, A, PromptLen,
+      SeqLen - PromptLen, SeqLen, {TopK=}6, {alpha=}0.6, NoStops);
+    LenB := DecodeContrastiveSearchStreamed(Session, B, PromptLen,
+      SeqLen - PromptLen, SeqLen, {TopK=}6, {alpha=}0.6, NoStops);
+
+    AssertEquals('streamed CS is deterministic (length)', LenA, LenB);
+    for T := PromptLen to LenA - 1 do
+      AssertEquals('streamed CS deterministic token at ' + IntToStr(T),
+        A[T], B[T]);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestContrastiveStreamedAlphaChangesSelection;
+const
+  SeqLen = 10;
+  PromptLen = 3;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  GreedyToks, CSToks: TNeuralIntegerArray;
+  GreedyLen, CSLen, T: integer;
+  Differs: boolean;
+  NoStops: TNNetTokenSequences;
+begin
+  // A non-zero degeneration penalty must be able to steer away from the greedy
+  // choice (the contrast path actually does something on the cached state).
+  RandSeed := 99999;
+  SetLength(NoStops, 0);
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(GreedyToks, PromptLen);
+    SetLength(CSToks, PromptLen);
+    GreedyToks[0] := 6; GreedyToks[1] := 1; GreedyToks[2] := 8;
+    for T := 0 to PromptLen - 1 do CSToks[T] := GreedyToks[T];
+
+    GreedyLen := GenerateTokensStreamed(Session, GreedyToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    CSLen := DecodeContrastiveSearchStreamed(Session, CSToks, PromptLen,
+      SeqLen - PromptLen, SeqLen, {TopK=}8, {alpha=}1.0, NoStops);
+
+    Differs := (GreedyLen <> CSLen);
+    if not Differs then
+      for T := PromptLen to CSLen - 1 do
+        if CSToks[T] <> GreedyToks[T] then Differs := True;
+    AssertTrue('alpha=1 streamed penalty changes the greedy selection',
+      Differs);
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
   end;
 end;
 
