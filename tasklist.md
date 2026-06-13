@@ -148,7 +148,7 @@ rather than acted on.
       float64, and a cross-encoder RERANKING example over the landed
       BuildBertForSequenceClassification scoring path (query+passage -> relevance
       score), the canonical RAG-reranker demo the encoder importers enable.
-- [ ] BART importer + abstractive-summarization example
+- [X] BART importer + abstractive-summarization example
       (BuildBartFromSafeTensors[Ex], model_type "bart"): the dominant
       pretrained encoder-decoder for SUMMARIZATION (facebook/bart-large-cnn,
       sshleifer/distilbart-cnn-*) and the NLP task the repo cannot do today —
