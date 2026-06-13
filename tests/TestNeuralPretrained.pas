@@ -167,6 +167,7 @@ type
     procedure TestMixtralLogitParity;
     procedure TestRWKVLogitParity;
     procedure TestMambaLogitParity;
+    procedure TestRecurrentGemmaLogitParity;
     procedure TestJambaLogitParity;
     procedure TestBloomLogitParity;
     procedure TestModernBertHiddenStateParity;
@@ -5158,6 +5159,76 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_mamba_logits.json'), 8, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the RECURRENT GEMMA import target - the Griffin/Hawk recurrent +
+// local-attention hybrid (HF model_type "recurrent_gemma", architectures
+// ["RecurrentGemmaForCausalLM"], the google/recurrentgemma-2b family), the
+// FIRST import to use the new TNNetRGLRU real-gated linear recurrent unit.
+// tests/fixtures/tiny_recurrentgemma.* is a pico RANDOM model (3 layers:
+// recurrent, recurrent, local-attention; hidden 16, lru_width 16, heads 2,
+// kv_heads 1, head_dim 8, conv1d 4, partial rotary 0.5, GEGLU MLP, final
+// logit soft cap 30, tied head). tools/make_pico_recurrentgemma_fixture.py
+// ASSERTS each quirk is non-vacuous via the float64 oracle (max logit |diff|s
+// with one piece disabled: Lambda 5.7, input gate 10.5, recurrence gate 6.6,
+// conv bias 7.2, GELU y-branch 11.0, attention layer 4.6 - all far above the
+// 1e-4 gate). Exercises: the RG-LRU recurrence + per-head block-diagonal gate
+// matrices realised as Pointwise projections, the GELU(tanh) y-branch gating,
+// depthwise causal conv1d, local sliding-window GQA with partial rotary and
+// an o_proj bias, Gemma (1+w) RMSNorm + sqrt(hidden) embedding scale, the
+// GEGLU MLP and the tied soft-capped head. BuildFromPretrained dispatch too.
+procedure TTestNeuralPretrained.TestRecurrentGemmaLogitParity;
+var
+  NN: TNNet;
+  Config: TRecurrentGemmaConfig;
+  LayerCnt, RGLRUCnt, ConvCnt, SDPACnt, GeluCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildRecurrentGemmaFromSafeTensorsEx(
+    FixturePath('tiny_recurrentgemma.safetensors'), Config, {SeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_recurrentgemma_config.json'));
+  try
+    AssertEquals('model_type', 'recurrent_gemma', Config.ModelType);
+    AssertEquals('layers', 3, Config.NumLayers);
+    AssertEquals('hidden', 16, Config.HiddenSize);
+    AssertEquals('lru_width', 16, Config.LruWidth);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('head_dim', 8, Config.HeadDim);
+    AssertEquals('conv1d_width', 4, Config.ConvKernel);
+    AssertEquals('vocab', 32, Config.VocabSize);
+    AssertEquals('block 0 recurrent', 'recurrent', Config.BlockTypes[0]);
+    AssertEquals('block 2 attention', 'attention', Config.BlockTypes[2]);
+    // Structure: 2 recurrent blocks -> 2 TNNetRGLRU + 2 depthwise conv;
+    // 1 attention block -> NumHeads SDPA; GELU appears in every recurrent
+    // y-branch (2) + every MLP gate (3) = 5.
+    RGLRUCnt := 0; ConvCnt := 0; SDPACnt := 0; GeluCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetRGLRU then Inc(RGLRUCnt);
+      if NN.Layers[LayerCnt] is TNNetDepthwiseConv1D then Inc(ConvCnt);
+      if NN.Layers[LayerCnt] is TNNetScaledDotProductAttention then Inc(SDPACnt);
+      if NN.Layers[LayerCnt] is TNNetGELU then Inc(GeluCnt);
+    end;
+    AssertEquals('TNNetRGLRU count (1 per recurrent block)', 2, RGLRUCnt);
+    AssertEquals('depthwise conv count (1 per recurrent block)', 2, ConvCnt);
+    AssertEquals('SDPA head count (NumHeads in the one attn block)', 2, SDPACnt);
+    AssertEquals('GELU count (y-branch x2 + MLP gate x3)', 5, GeluCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_recurrentgemma_logits.json'), 6, Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route via BuildFromPretrained (model_type dispatch).
+  NN := BuildFromPretrained(FixturePath('tiny_recurrentgemma.safetensors'),
+    {SeqLen=}6, {pInferenceOnly=}false,
+    FixturePath('tiny_recurrentgemma_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_recurrentgemma_logits.json'), 6, 32);
   finally
     NN.Free;
   end;

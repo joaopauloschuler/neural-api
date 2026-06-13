@@ -2425,6 +2425,84 @@ function BuildMambaFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
+// ====================== RECURRENT GEMMA IMPORT ===========================
+// BuildRecurrentGemmaFromSafeTensors imports Google's Griffin/Hawk hybrid
+// (HF model_type "recurrent_gemma", google/recurrentgemma-2b[-it]) - the
+// major modern-recurrent-LM family member alongside the landed RWKV / Mamba
+// importers, and the FIRST import to use the new TNNetRGLRU real-gated linear
+// recurrent unit.
+//
+// Architecture: a fixed temporal-block PATTERN (block_types, default
+// ('recurrent','recurrent','attention') replicated to num_hidden_layers).
+// Each decoder layer is two pre-norm residual sub-blocks:
+//   x := x + temporal_block(RMSNorm(x))   (recurrent OR local attention)
+//   x := x + mlp_block(RMSNorm(x))        (GEGLU(tanh) FFN, intermediate//2)
+// where RMSNorm is the Gemma (1+w) zero-centered norm and the word
+// embeddings are scaled by sqrt(hidden_size) once at the input.
+//
+// Recurrent block (Hawk/Griffin): y = gelu_tanh(linear_y(x)); the x-branch is
+// linear_x(x) -> depthwise CAUSAL conv1d (conv1d_width) -> RG-LRU; output is
+// linear_out(rg_lru_out * y). The per-head block-diagonal RG-LRU gate
+// matrices (input_gate / recurrent_gate, [heads, bw, bw] + biases) are
+// realised as full lru_width->lru_width Pointwise projections (block-diagonal
+// = a full matrix with zero off-block entries), so TNNetRGLRU consumes the
+// packed [x | i_logits | a_logits] slab and owns only Lambda (recurrent_param).
+//
+// Attention block: LOCAL sliding-window (attention_window_size) GQA with
+// PARTIAL rotary (partial_rotary_factor, default 0.5 -> rotary_dims =
+// head_dim*0.5), attention scaled by head_dim**-0.5, an o_proj BIAS (q/k/v
+// biased iff attention_bias). The LM head is tied; the final logits are
+// soft-capped to logits_soft_cap*tanh(logits/cap) (default 30).
+type
+  TRecurrentGemmaConfig = record
+    HiddenSize: integer;          // hidden_size
+    LruWidth: integer;            // lru_width (default hidden_size)
+    NumLayers: integer;           // num_hidden_layers
+    VocabSize: integer;           // vocab_size
+    NumHeads: integer;            // num_attention_heads
+    NumKVHeads: integer;          // num_key_value_heads (default num_heads)
+    HeadDim: integer;             // head_dim (default hidden/num_heads)
+    Intermediate: integer;        // intermediate_size (GEGLU uses half)
+    ConvKernel: integer;          // conv1d_width (default 4)
+    Window: integer;              // attention_window_size (default 2048)
+    LogitSoftCap: double;         // logits_soft_cap (default 30, 0 = off)
+    RmsNormEps: double;           // rms_norm_eps (default 1e-6)
+    PartialRotaryFactor: double;  // partial_rotary_factor (default 0.5)
+    RopeTheta: double;            // rope_theta (default 10000)
+    AttentionBias: boolean;       // attention_bias (q/k/v bias; default false)
+    BlockTypes: array of string;  // per-layer 'recurrent' / 'attention'
+    ModelType: string;            // 'recurrent_gemma'
+    Prefix: string;               // 'model.' or '' (detected from the file)
+  end;
+
+// Reads a HF recurrent_gemma config.json. Required: hidden_size,
+// num_hidden_layers, vocab_size, num_attention_heads. block_types defaults to
+// ('recurrent','recurrent','attention'); lru_width defaults to hidden_size;
+// head_dim to hidden/num_heads; num_key_value_heads to num_attention_heads.
+function ReadRecurrentGemmaConfigFromJSONFile(
+  const FileName: string): TRecurrentGemmaConfig;
+
+function RecurrentGemmaConfigToString(
+  const Config: TRecurrentGemmaConfig): string;
+
+// Builds the RecurrentGemma causal-LM net described by Config ((SeqLen,1,1)
+// token ids in, (SeqLen,1,vocab) logits out) and loads every weight from the
+// checkpoint at FileName. pSeqLen <= 0 uses 2048.
+function BuildRecurrentGemmaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildRecurrentGemmaFromSafeTensorsEx(const FileName: string;
+  out Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildRecurrentGemmaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
 // ============================ JAMBA IMPORT ================================
 // BuildJambaFromSafeTensors imports AI21's Jamba (HF model_type "jamba",
 // ai21labs/Jamba-tiny-dev / Jamba-Mini / Jamba-1.5) - the FIRST HYBRID
@@ -14786,6 +14864,590 @@ begin
     pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
+// ====================== RECURRENT GEMMA IMPORT (impl) =====================
+
+function ReadRecurrentGemmaConfigFromJSONFile(
+  const FileName: string): TRecurrentGemmaConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  Arr: TJSONArray;
+  Field: TJSONData;
+  i: integer;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('RecurrentGemma import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('RecurrentGemma import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('RecurrentGemma import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('RecurrentGemma import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('RecurrentGemma import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'recurrent_gemma');
+    if Result.ModelType <> 'recurrent_gemma' then
+      ImportError('RecurrentGemma import: config model_type is "' +
+        Result.ModelType + '" - expected "recurrent_gemma" (see ' +
+        'BuildFromPretrained for the full dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if Result.NumKVHeads < 1 then Result.NumKVHeads := Result.NumHeads;
+    if (Result.NumHeads mod Result.NumKVHeads) <> 0 then
+      ImportError('RecurrentGemma import: num_attention_heads must be a ' +
+        'multiple of num_key_value_heads.');
+    Result.HeadDim := Obj.Get('head_dim', Result.HiddenSize div Result.NumHeads);
+    Result.LruWidth := Obj.Get('lru_width', Result.HiddenSize);
+    if Result.LruWidth <> Result.HiddenSize then
+      ImportError('RecurrentGemma import: lru_width != hidden_size (' +
+        IntToStr(Result.LruWidth) + ' vs ' + IntToStr(Result.HiddenSize) +
+        ') is not wired (the recurrent block would need an extra ' +
+        'projection); every released recurrentgemma keeps them equal.');
+    if (Result.LruWidth mod Result.NumHeads) <> 0 then
+      ImportError('RecurrentGemma import: lru_width must be a multiple of ' +
+        'num_attention_heads (per-head RG-LRU gate blocks).');
+    Field := Obj.Find('intermediate_size');
+    if (Field = nil) or Field.IsNull then
+      Result.Intermediate := 3 * Result.HiddenSize
+    else
+      Result.Intermediate := RequiredInt('intermediate_size');
+    if Odd(Result.Intermediate) then
+      ImportError('RecurrentGemma import: intermediate_size must be even ' +
+        '(the GEGLU MLP uses intermediate_size // 2).');
+    Result.ConvKernel := Obj.Get('conv1d_width', 4);
+    Result.Window := Obj.Get('attention_window_size', 2048);
+    Result.LogitSoftCap := Obj.Get('logits_soft_cap', 30.0);
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
+    Result.PartialRotaryFactor := Obj.Get('partial_rotary_factor', 0.5);
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    Result.AttentionBias := Obj.Get('attention_bias', False);
+    // block_types defaults to ('recurrent','recurrent','attention') tiled.
+    SetLength(Result.BlockTypes, Result.NumLayers);
+    Field := Obj.Find('block_types');
+    if (Field <> nil) and (Field is TJSONArray) then
+    begin
+      Arr := TJSONArray(Field);
+      for i := 0 to Result.NumLayers - 1 do
+        Result.BlockTypes[i] := Arr.Strings[i mod Arr.Count];
+    end
+    else
+      for i := 0 to Result.NumLayers - 1 do
+        case i mod 3 of
+          0, 1: Result.BlockTypes[i] := 'recurrent';
+        else    Result.BlockTypes[i] := 'attention';
+        end;
+    for i := 0 to Result.NumLayers - 1 do
+      if (Result.BlockTypes[i] <> 'recurrent') and
+         (Result.BlockTypes[i] <> 'attention') then
+        ImportError('RecurrentGemma import: block_types[' + IntToStr(i) +
+          '] = "' + Result.BlockTypes[i] + '" - expected "recurrent" or ' +
+          '"attention".');
+    Result.Prefix := ''; // detected by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RecurrentGemmaConfigToString(
+  const Config: TRecurrentGemmaConfig): string;
+var
+  i: integer;
+  Pat: string;
+begin
+  Pat := '';
+  for i := 0 to Config.NumLayers - 1 do
+  begin
+    if Config.BlockTypes[i] = 'recurrent' then Pat := Pat + 'R'
+    else Pat := Pat + 'A';
+  end;
+  Result := 'recurrent_gemma config: layers=' + IntToStr(Config.NumLayers) +
+    ' [' + Pat + ']' +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', lru_width=' + IntToStr(Config.LruWidth) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', head_dim=' + IntToStr(Config.HeadDim) +
+    ', intermediate=' + IntToStr(Config.Intermediate) +
+    ', conv1d=' + IntToStr(Config.ConvKernel) +
+    ', window=' + IntToStr(Config.Window) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', rms_eps=' + FloatToStr(Config.RmsNormEps) +
+    ', partial_rotary=' + FloatToStr(Config.PartialRotaryFactor) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', logit_softcap=' + FloatToStr(Config.LogitSoftCap);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TRecGemmaBlock = record
+    IsAttn: boolean;
+    TemporalNorm, ChannelNorm: TNNetLayer;
+    // recurrent block:
+    LinearX, LinearY, Conv, IGate, AGate, RGLRU, LinearOut: TNNetLayer;
+    // attention block:
+    QProj, KProj, VProj, OProj: TNNetLayer;
+    // mlp:
+    Gate, Up, Down: TNNetLayer;
+  end;
+
+function BuildRecurrentGemmaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TRecGemmaBlock;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSrc, Residual, XBranch, YBranch, ConvAct, PackedSlab: TNNetLayer;
+  Gated, MlpNormed, GateAct, UpAct, MlpProd, GegluProd: TNNetLayer;
+  QSrc, KSrc, VSrc, AttnConcat, KRot, VSlice, QSlice, KSlice, RotS, PassS: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  KRotated, VSlices: array of TNNetLayer;
+  SliceCh, RotCh, PassCh: array of integer;
+  BlockCnt, SeqLen, i, j, d, HeadCnt, KVHeadCnt, GroupSize: integer;
+  RotaryDims, HalfFFN, BlockWidth, AttnD: integer;
+  Tmp: TNNetVolume;
+  MixP, LayerP, TensorNameStr, QkvBias: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // conv1d.weight [lru_width, 1, k] (+ bias) into a TNNetDepthwiseConv1D
+  // (tap order maps directly; HF pads k-1 on the left and truncates).
+  procedure LoadConv(Layer: TNNetLayer; const WName, BName: string);
+  var
+    dd, kk: integer;
+  begin
+    if (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> Config.LruWidth) or
+       (Reader.DimSize(WName, 1) <> 1) or
+       (Reader.DimSize(WName, 2) <> Config.ConvKernel) then
+      ImportError('RecurrentGemma import: "' + WName + '" must have shape [' +
+        IntToStr(Config.LruWidth) + ', 1, ' + IntToStr(Config.ConvKernel) +
+        '], got ' + Reader.ShapeAsString(WName));
+    Reader.LoadTensorFlat(WName, Tmp);
+    for dd := 0 to Config.LruWidth - 1 do
+      for kk := 0 to Config.ConvKernel - 1 do
+        Layer.Neurons[dd].Weights.FData[kk] :=
+          Tmp.FData[dd * Config.ConvKernel + kk];
+    MarkConsumed(WName);
+    Reader.LoadTensorFlat(BName, Tmp);
+    for dd := 0 to Config.LruWidth - 1 do
+      Layer.Neurons[dd].BiasWeight := Tmp.FData[dd];
+    MarkConsumed(BName);
+    Layer.FlushWeightCache();
+  end;
+
+  // The per-head block-diagonal RG-LRU gate matrix [heads, bw, bw] + bias
+  // [heads, bw] into a full lru_width->lru_width Pointwise layer (off-block
+  // entries left 0). HF baddbmm computes, per head h, logits = act @ W_h +
+  // b_h with act [.., bw], W_h [bw, bw] -> out[o] = sum_i act[i]*W_h[i,o] +
+  // b_h[o]. So output channel (h*bw + o) gathers input channels (h*bw + i)
+  // with weight W_h[i, o] = W[h, i, o] (row-major [h, i, o]).
+  procedure LoadGate(Layer: TNNetLayer; const WName, BName: string);
+  var
+    h, ci, co, outCh, inCh: integer;
+    Wt, Bt: TNNetVolume;
+  begin
+    if (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> Config.NumHeads) or
+       (Reader.DimSize(WName, 1) <> BlockWidth) or
+       (Reader.DimSize(WName, 2) <> BlockWidth) then
+      ImportError('RecurrentGemma import: "' + WName + '" must have shape [' +
+        IntToStr(Config.NumHeads) + ', ' + IntToStr(BlockWidth) + ', ' +
+        IntToStr(BlockWidth) + '], got ' + Reader.ShapeAsString(WName));
+    EnsureWritableImportWeights(Layer);
+    Wt := TNNetVolume.Create;
+    Bt := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(WName, Wt);
+      Reader.LoadTensorFlat(BName, Bt);
+      for h := 0 to Config.NumHeads - 1 do
+        for co := 0 to BlockWidth - 1 do
+        begin
+          outCh := h * BlockWidth + co;
+          Layer.Neurons[outCh].Weights.Fill(0);
+          for ci := 0 to BlockWidth - 1 do
+          begin
+            inCh := h * BlockWidth + ci;
+            // W[h, ci, co]
+            Layer.Neurons[outCh].Weights.FData[inCh] :=
+              Wt.FData[(h * BlockWidth + ci) * BlockWidth + co];
+          end;
+          Layer.Neurons[outCh].BiasWeight :=
+            Bt.FData[h * BlockWidth + co];
+        end;
+    finally
+      Bt.Free;
+      Wt.Free;
+    end;
+    MarkConsumed(WName);
+    MarkConsumed(BName);
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if Config.NumLayers < 1 then
+        ImportError('RecurrentGemma import: num_hidden_layers must be >= 1.');
+      // Prefix detection.
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('RecurrentGemma import: neither "model.embed_tokens.' +
+          'weight" nor "embed_tokens.weight" found in ' + Reader.FileName +
+          ' - not a recurrent_gemma checkpoint?');
+      if (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('RecurrentGemma import: embed_tokens.weight must have ' +
+          'shape [' + IntToStr(Config.VocabSize) + ', ' +
+          IntToStr(Config.HiddenSize) + '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+      if pSeqLen <= 0 then SeqLen := 2048 else SeqLen := pSeqLen;
+      RotaryDims := Round(Config.HeadDim * Config.PartialRotaryFactor);
+      if Odd(RotaryDims) then Dec(RotaryDims);
+      HalfFFN := Config.Intermediate div 2;
+      BlockWidth := Config.LruWidth div Config.NumHeads;
+      AttnD := Config.NumHeads * Config.HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(KRotated, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(SliceCh, Config.HeadDim);
+      SetLength(RotCh, RotaryDims);
+      SetLength(PassCh, Config.HeadDim - RotaryDims);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        Blocks[BlockCnt].IsAttn :=
+          Config.BlockTypes[BlockCnt] = 'attention';
+        // ---- temporal sub-block: x := x + temporal(RMSNorm(x)) ----
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].TemporalNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        NormedSrc := NN.GetLastLayer();
+        if not Blocks[BlockCnt].IsAttn then
+        begin
+          // RECURRENT block. y = gelu_tanh(linear_y(x));
+          // x_branch = rg_lru(conv(linear_x(x)));  out = linear_out(x_branch*y).
+          Blocks[BlockCnt].LinearY := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.LruWidth), NormedSrc);
+          YBranch := NN.AddLayer( TNNetGELU.Create() );
+          Blocks[BlockCnt].LinearX := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.LruWidth), NormedSrc);
+          Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
+            Config.ConvKernel, {pCausal=}true, {pSuppressBias=}0) );
+          ConvAct := NN.GetLastLayer();
+          // The two gate logit projections (block-diagonal, full Pointwise).
+          Blocks[BlockCnt].IGate := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.LruWidth), ConvAct);
+          Blocks[BlockCnt].AGate := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.LruWidth), ConvAct);
+          // Pack [x | i_logits | a_logits] for the RG-LRU leaf.
+          PackedSlab := NN.AddLayer( TNNetDeepConcat.Create(
+            [ConvAct, Blocks[BlockCnt].IGate, Blocks[BlockCnt].AGate]) );
+          Blocks[BlockCnt].RGLRU := NN.AddLayerAfter(
+            TNNetRGLRU.Create(), PackedSlab);
+          Gated := NN.AddLayer( TNNetCellMulByCell.Create(
+            Blocks[BlockCnt].RGLRU, YBranch) );
+          Blocks[BlockCnt].LinearOut := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize), Gated);
+        end
+        else
+        begin
+          // LOCAL sliding-window GQA attention with partial rotary.
+          Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(AttnD), NormedSrc);
+          Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim),
+            NormedSrc);
+          Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim),
+            NormedSrc);
+          QSrc := Blocks[BlockCnt].QProj;
+          KSrc := Blocks[BlockCnt].KProj;
+          VSrc := Blocks[BlockCnt].VProj;
+          // K rotated once per KV head; V sliced once per KV head.
+          for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+          begin
+            for d := 0 to RotaryDims - 1 do
+              RotCh[d] := KVHeadCnt * Config.HeadDim + d;
+            for d := 0 to Config.HeadDim - RotaryDims - 1 do
+              PassCh[d] := KVHeadCnt * Config.HeadDim + RotaryDims + d;
+            RotS := NN.AddLayerAfter( TNNetSplitChannels.Create(RotCh), KSrc);
+            RotS := NN.AddLayerAfter(
+              TNNetRotaryEmbedding.Create(Config.RopeTheta), RotS);
+            PassS := NN.AddLayerAfter( TNNetSplitChannels.Create(PassCh), KSrc);
+            KRotated[KVHeadCnt] := NN.AddLayer(
+              TNNetDeepConcat.Create([RotS, PassS]) );
+            for d := 0 to Config.HeadDim - 1 do
+              SliceCh[d] := KVHeadCnt * Config.HeadDim + d;
+            VSlices[KVHeadCnt] := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceCh), VSrc);
+          end;
+          // One SDPA head per query head (GQA: head h shares KV group h div G).
+          for HeadCnt := 0 to Config.NumHeads - 1 do
+          begin
+            for d := 0 to RotaryDims - 1 do
+              RotCh[d] := HeadCnt * Config.HeadDim + d;
+            for d := 0 to Config.HeadDim - RotaryDims - 1 do
+              PassCh[d] := HeadCnt * Config.HeadDim + RotaryDims + d;
+            RotS := NN.AddLayerAfter( TNNetSplitChannels.Create(RotCh), QSrc);
+            RotS := NN.AddLayerAfter(
+              TNNetRotaryEmbedding.Create(Config.RopeTheta), RotS);
+            PassS := NN.AddLayerAfter( TNNetSplitChannels.Create(PassCh), QSrc);
+            QSlice := NN.AddLayer( TNNetDeepConcat.Create([RotS, PassS]) );
+            KVHeadCnt := HeadCnt div GroupSize;
+            // Pack [Q|K|V] for this head: SDPA reads the 3*head_dim slab.
+            AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(
+              [QSlice, KRotated[KVHeadCnt], VSlices[KVHeadCnt]]) );
+            HeadOutputs[HeadCnt] := NN.AddLayer(
+              TNNetScaledDotProductAttention.Create(Config.HeadDim,
+                {CausalMask=}true, {Window=}Config.Window) );
+          end;
+          NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+          Blocks[BlockCnt].OProj := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        end;
+        // Residual sum (temporal).
+        Residual := NN.AddLayer(
+          TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // ---- channel sub-block: x := residual + GEGLU(RMSNorm(residual)) ----
+        Blocks[BlockCnt].ChannelNorm := NN.AddLayerAfter(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps), Residual);
+        MlpNormed := NN.GetLastLayer();
+        Blocks[BlockCnt].Gate := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(HalfFFN), MlpNormed);
+        GateAct := NN.AddLayer( TNNetGELU.Create() );
+        Blocks[BlockCnt].Up := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(HalfFFN), MlpNormed);
+        UpAct := NN.GetLastLayer();
+        GegluProd := NN.AddLayer( TNNetCellMulByCell.Create(GateAct, UpAct) );
+        Blocks[BlockCnt].Down := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), GegluProd);
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), Residual]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if Config.LogitSoftCap > 0 then
+        NN.AddLayer( TNNetSoftCapping.Create(Config.LogitSoftCap) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+      // Tied head reads UNSCALED rows; embedding then gets *sqrt(hidden).
+      EnsureWritableImportWeights(LMHead);
+      for j := 0 to Config.VocabSize - 1 do
+      begin
+        for i := 0 to Config.HiddenSize - 1 do
+          LMHead.Neurons[j].Weights.FData[i] :=
+            Tmp.FData[j * Config.HiddenSize + i];
+        LMHead.Neurons[j].BiasWeight := 0;
+      end;
+      LMHead.FlushWeightCache();
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.Neurons[0].Weights.Mul(Sqrt(Config.HiddenSize));
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+      if Reader.HasTensor('lm_head.weight') then MarkConsumed('lm_head.weight');
+
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        MixP := LayerP + 'temporal_block.';
+        // Gemma RMSNorm gain = 1 + w.
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].TemporalNorm,
+          LayerP + 'temporal_pre_norm.weight', Config.HiddenSize, 1.0);
+        MarkConsumed(LayerP + 'temporal_pre_norm.weight');
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].ChannelNorm,
+          LayerP + 'channel_pre_norm.weight', Config.HiddenSize, 1.0);
+        MarkConsumed(LayerP + 'channel_pre_norm.weight');
+        if not Blocks[BlockCnt].IsAttn then
+        begin
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].LinearY,
+            MixP + 'linear_y.weight', Config.HiddenSize, Config.LruWidth,
+            0, -1, 0, MixP + 'linear_y.bias');
+          MarkConsumed(MixP + 'linear_y.weight');
+          MarkConsumed(MixP + 'linear_y.bias');
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].LinearX,
+            MixP + 'linear_x.weight', Config.HiddenSize, Config.LruWidth,
+            0, -1, 0, MixP + 'linear_x.bias');
+          MarkConsumed(MixP + 'linear_x.weight');
+          MarkConsumed(MixP + 'linear_x.bias');
+          LoadConv(Blocks[BlockCnt].Conv, MixP + 'conv_1d.weight',
+            MixP + 'conv_1d.bias');
+          LoadGate(Blocks[BlockCnt].IGate,
+            MixP + 'rg_lru.input_gate_weight', MixP + 'rg_lru.input_gate_bias');
+          LoadGate(Blocks[BlockCnt].AGate,
+            MixP + 'rg_lru.recurrent_gate_weight',
+            MixP + 'rg_lru.recurrent_gate_bias');
+          // recurrent_param -> Lambda (raw copy; the layer applies softplus).
+          Reader.LoadTensorFlat(MixP + 'rg_lru.recurrent_param', Tmp);
+          for d := 0 to Config.LruWidth - 1 do
+            Blocks[BlockCnt].RGLRU.Neurons[0].Weights.FData[d] := Tmp.FData[d];
+          Blocks[BlockCnt].RGLRU.FlushWeightCache();
+          MarkConsumed(MixP + 'rg_lru.recurrent_param');
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].LinearOut,
+            MixP + 'linear_out.weight', Config.LruWidth, Config.HiddenSize,
+            0, -1, 0, MixP + 'linear_out.bias');
+          MarkConsumed(MixP + 'linear_out.weight');
+          MarkConsumed(MixP + 'linear_out.bias');
+        end
+        else
+        begin
+          if Config.AttentionBias then QkvBias := MixP + 'q_proj.bias'
+          else QkvBias := '';
+          // q/k get the rotate_half->interleaved permutation over the rotary
+          // slice (RotaryHeadDim=head_dim, RotaryDims=partial slice).
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+            MixP + 'q_proj.weight', Config.HiddenSize, AttnD, 0, -1,
+            Config.HeadDim, QkvBias, 1.0, RotaryDims);
+          MarkConsumed(MixP + 'q_proj.weight');
+          if QkvBias <> '' then MarkConsumed(QkvBias);
+          if Config.AttentionBias then QkvBias := MixP + 'k_proj.bias'
+          else QkvBias := '';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+            MixP + 'k_proj.weight', Config.HiddenSize,
+            Config.NumKVHeads * Config.HeadDim, 0, -1,
+            Config.HeadDim, QkvBias, 1.0, RotaryDims);
+          MarkConsumed(MixP + 'k_proj.weight');
+          if QkvBias <> '' then MarkConsumed(QkvBias);
+          if Config.AttentionBias then QkvBias := MixP + 'v_proj.bias'
+          else QkvBias := '';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+            MixP + 'v_proj.weight', Config.HiddenSize,
+            Config.NumKVHeads * Config.HeadDim, 0, -1, 0, QkvBias);
+          MarkConsumed(MixP + 'v_proj.weight');
+          if QkvBias <> '' then MarkConsumed(QkvBias);
+          // o_proj ALWAYS has a bias in recurrentgemma.
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+            MixP + 'o_proj.weight', AttnD, Config.HiddenSize, 0, -1, 0,
+            MixP + 'o_proj.bias');
+          MarkConsumed(MixP + 'o_proj.weight');
+          MarkConsumed(MixP + 'o_proj.bias');
+        end;
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Gate,
+          LayerP + 'mlp_block.gate_proj.weight', Config.HiddenSize, HalfFFN,
+          0, -1, 0, LayerP + 'mlp_block.gate_proj.bias');
+        MarkConsumed(LayerP + 'mlp_block.gate_proj.weight');
+        MarkConsumed(LayerP + 'mlp_block.gate_proj.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Up,
+          LayerP + 'mlp_block.up_proj.weight', Config.HiddenSize, HalfFFN,
+          0, -1, 0, LayerP + 'mlp_block.up_proj.bias');
+        MarkConsumed(LayerP + 'mlp_block.up_proj.weight');
+        MarkConsumed(LayerP + 'mlp_block.up_proj.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
+          LayerP + 'mlp_block.down_proj.weight', HalfFFN, Config.HiddenSize,
+          0, -1, 0, LayerP + 'mlp_block.down_proj.bias');
+        MarkConsumed(LayerP + 'mlp_block.down_proj.weight');
+        MarkConsumed(LayerP + 'mlp_block.down_proj.bias');
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadLlamaRMSNormWeights(Reader, FinalNorm,
+        Config.Prefix + 'final_norm.weight', Config.HiddenSize, 1.0);
+      MarkConsumed(Config.Prefix + 'final_norm.weight');
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('RecurrentGemma import: unexpected tensor "' +
+          TensorNameStr + '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildRecurrentGemmaFromSafeTensorsEx(const FileName: string;
+  out Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRecurrentGemmaConfigFromJSONFile(ConfigPath);
+  Result := BuildRecurrentGemmaFromSafeTensorsWithConfig(FileName, Config,
+    pSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildRecurrentGemmaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TRecurrentGemmaConfig;
+begin
+  Result := BuildRecurrentGemmaFromSafeTensorsEx(FileName, IgnoredConfig,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
 // ============================ JAMBA IMPORT (impl) =========================
 
 function ReadJambaConfigFromJSONFile(const FileName: string): TJambaConfig;
@@ -18465,6 +19127,7 @@ var
   IgnoredBertConfig: TBertConfig;
   IgnoredRWKVConfig: TRWKVConfig;
   IgnoredMambaConfig: TMambaConfig;
+  IgnoredRecGemmaConfig: TRecurrentGemmaConfig;
   IgnoredJambaConfig: TJambaConfig;
   IgnoredBloomConfig: TBloomConfig;
   IgnoredFalconConfig: TFalconConfig;
@@ -18648,6 +19311,14 @@ begin
     // logits out). See the MAMBA IMPORT section.
     Result := BuildMambaFromSafeTensorsEx(WeightsPath, IgnoredMambaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'recurrent_gemma' then
+    // RecurrentGemma (architectures ["RecurrentGemmaForCausalLM"]) - the
+    // Griffin/Hawk recurrent+local-attention hybrid built on the new
+    // TNNetRGLRU. Causal-LM contract like the other decoder families. See the
+    // RECURRENT GEMMA IMPORT section.
+    Result := BuildRecurrentGemmaFromSafeTensorsEx(WeightsPath,
+      IgnoredRecGemmaConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
   else if ModelType = 'jamba' then
     // The first HYBRID route: Jamba (architectures ["JambaForCausalLM"]) -
     // interleaved Mamba / softmax-attention layers with per-layer dense or

@@ -6336,6 +6336,10 @@ type
   //   nx_t = sqrt(1 - a_t^2) * (i_t * x_t)              (gamma-normalised drive)
   //   h_t = a_t * h_{t-1} + nx_t          (h_{-1}=0)    (REAL state)
   //   y_t = h_t
+  // SEQUENCE-START RESET (HF Griffin position-0 reset): at t=0 the recurrence
+  // gate is masked to 0 and the input multiplier is 1 (not sqrt(1-a_0^2)), so
+  // h_0 = i_0 * x_0; h_{-1}=0 makes the masked gate moot, only the multiplier
+  // matters. (v1 resets at SizeX position 0 only - one document per sweep.)
   // This matches HF RecurrentGemmaRglru exactly (softplus(Lambda), c=8, a^2 via
   // exp(2 log_a), sqrt(1-a^2) input normaliser). Storage in Neurons[] (1 tensor):
   //   [0]=Lambda (Depth)   recurrent_param (init so softplus(Lambda)~=0.5)
@@ -37327,7 +37331,16 @@ begin
       loga := -cDecay * rg * sp;
       a := Exp(loga);
       a2 := Exp(2 * loga);
-      mult := Sqrt(1 - a2);
+      // Sequence-start reset (HF Griffin: at position 0 the recurrence gate is
+      // masked to 0 and the input multiplier is 1 instead of sqrt(1-a^2);
+      // h_{-1}=0 so the masked gate is moot, only the multiplier matters).
+      if t = 0 then
+      begin
+        a := 0;
+        mult := 1;
+      end
+      else
+        mult := Sqrt(1 - a2);
       hNew := a * hPrev + mult * (ig * xt);
       FA.FData[FA.GetRawPos(t, 0, d)] := a;
       FIg.FData[FIg.GetRawPos(t, 0, d)] := ig;

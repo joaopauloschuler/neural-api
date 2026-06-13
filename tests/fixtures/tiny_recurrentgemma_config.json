@@ -1,0 +1,31 @@
+{
+ "architectures": [
+  "RecurrentGemmaForCausalLM"
+ ],
+ "model_type": "recurrent_gemma",
+ "vocab_size": 32,
+ "hidden_size": 16,
+ "lru_width": 16,
+ "intermediate_size": 48,
+ "num_hidden_layers": 3,
+ "num_attention_heads": 2,
+ "num_key_value_heads": 1,
+ "head_dim": 8,
+ "conv1d_width": 4,
+ "attention_window_size": 8,
+ "logits_soft_cap": 30.0,
+ "rms_norm_eps": 1e-06,
+ "block_types": [
+  "recurrent",
+  "recurrent",
+  "attention"
+ ],
+ "partial_rotary_factor": 0.5,
+ "hidden_activation": "gelu_pytorch_tanh",
+ "rope_theta": 10000.0,
+ "attention_bias": false,
+ "use_cache": true,
+ "bos_token_id": 0,
+ "eos_token_id": 0,
+ "pad_token_id": 0
+}

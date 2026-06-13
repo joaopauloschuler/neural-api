@@ -94,23 +94,28 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Griffin / RecurrentGemma importer (BuildRecurrentGemmaFromSafeTensors,
-      google/recurrentgemma-2b-it). The one major modern-recurrent-LM family
-      member still missing next to the landed RWKV/Mamba/xLSTM/LRU/GLA
-      importers, and it ships real HF checkpoints. Architecture = Hawk/Griffin
-      hybrid: a fixed temporal block PATTERN where most layers are a
-      "recurrent" block (RG-LRU + a small conv1d temporal mixer) and every
-      3rd layer is LOCAL sliding-window attention (reuse the SDPA Window
-      FStruct path already wired for Gemma-2/3). Needs a NEW layer
-      TNNetRGLRU = the real-valued gated linear recurrent unit from the
-      Griffin paper (input gate i_t=sigmoid(W_i x), recurrence gate
-      a_t=sigmoid(c*softplus(Lambda)) with the fixed c=8 log-space decay
-      parametrization, h_t = a_t (.) h_{t-1} + sqrt(1-a_t^2) (.) (i_t (.) x));
-      this is NOT a duplicate of the existing complex-diagonal TNNetLRU — flag
-      the distinction in its header. Decode-side: O(1) recurrent state carry
-      like the Mamba/RWKV demos. Verify with a pico parity fixture
-      (tools/make_pico_recurrentgemma_fixture.py, ~10 KB sliced real weights)
-      asserting logits ~1e-4 vs HF, plus a TestRecurrentGemmaParity case.
+- [X] Griffin / RecurrentGemma importer (BuildRecurrentGemmaFromSafeTensors[Ex],
+      model_type "recurrent_gemma", google/recurrentgemma-2b). LANDED. New layer
+      TNNetRGLRU = the real-gated linear recurrent unit (Griffin/Hawk; c=8
+      log-space decay, input gate i_t=sigmoid(W_x x), recurrence gate
+      r_t=sigmoid(W_a x), log a_t=-c*r_t*softplus(Lambda),
+      h_t = a_t(.)h_{t-1} + sqrt(1-a_t^2)(.)(i_t(.)x_t), position-0 reset
+      mult=1) — distinct from complex-diagonal TNNetLRU (flagged in header).
+      Layer takes a packed [x|i_logits|a_logits] slab so the importer realises
+      the per-head block-diagonal gate matrices + conv1d as upstream Pointwise
+      projections; the leaf owns only Lambda. Forward scan + exact BPTT,
+      registered in both dispatch tables, gradient-checked
+      (TestRGLRU{ShapeInference,InputGradientCheck,WeightGradientCheck,
+      SerializationRoundTrip}). Importer wires the recurrent/attention block
+      PATTERN (block_types), GEGLU(tanh) MLP, local sliding-window GQA with
+      partial rotary + o_proj bias, Gemma (1+w) RMSNorm + sqrt(hidden) embed
+      scale, tied soft-capped head. Pico fixture
+      tools/make_pico_recurrentgemma_fixture.py (synthetic config-faithful HF
+      RecurrentGemmaForCausalLM, no download) + TestRecurrentGemmaLogitParity
+      (max |logit diff| ~5e-6 vs the float64 HF oracle). DEFERRED: O(1)
+      decode-side recurrent-state carry for TNNetRGLRU (decode demo) — the
+      training/prefill scan + full-forward parity is complete; KV-cache-style
+      incremental decode for the recurrent leaf is a follow-up.
 - [ ] GPT-OSS importer follow-ups (BuildGptOssFromSafeTensors[Ex] LANDED,
       model_type "gpt_oss", with TNNetGptOssSinkAttention per-head scalar sink +
       alternating sliding/full window + YaRN truncate flag + top-k MoE +
