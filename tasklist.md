@@ -390,7 +390,7 @@ rather than acted on.
       original_max_position_embeddings. Add a decode-time mode that selects the
       short table for short sequences (or document that the static long import
       is intentional for the 128k use case).
-- [ ] Knowledge-distillation EXAMPLE on the landed trainer (TNeuralKDTrainer in
+- [X] Knowledge-distillation EXAMPLE on the landed trainer (TNeuralKDTrainer in
       neural/neuralkd.pas, commit bff113f): distill an imported pretrained
       teacher (GPT-2 / TinyStories via the safetensors/torch.bin importers) into
       a small Pascal-trained student and report student perplexity vs hard-label-
