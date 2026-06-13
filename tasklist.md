@@ -267,11 +267,6 @@ rather than acted on.
       registered on TNeuralFitBase. Early stopping, custom logging, and the
       EMA/SWA tasks become small callbacks instead of ever more
       TNeuralFitBase fields.
-- [X] NEFTune noisy embedding fine-tuning: uniform noise scaled by
-      alpha/sqrt(L*d) added to embedding-layer outputs during TRAINING only
-      (off at eval); famously a ~5-line instruction-tuning quality win.
-      Trivially testable: assert eval forward is noise-free and train
-      forward differs.
 - [ ] CutMix training augmentation (torchvision transforms-v2 staple;
       Mixup itself is landed: CreateMixedVolumePairList in neuralvolume +
       examples/Mixup): patch a random rectangle from a second sample into
@@ -423,19 +418,6 @@ rather than acted on.
       mask and left-padded-generation tasks: this is the TRAINING data-side
       half. Test: identical loss trajectory vs naive padding at fixed seed
       modulo batch order, plus a padded-token-count reduction assert.
-- [X] Classifier-free guidance for text generation (transformers
-      UnbatchedClassifierFreeGuidanceLogitsProcessor port): run the model
-      with and without the prompt (or with a negative prompt), combine
-      l_uncond + g*(l_cond - l_uncond) before sampling. Two forward passes
-      per step, no training; slots into the landed logits-processor chain
-      as just another processor. Test: g=1 is bit-identical to normal
-      decoding; g=0 ignores the prompt.
-      LANDED: TNNetCFGProcessor in neuraldecode.pas owns a SECOND width-1
-      TNNetStreamingDecoder for the unconditional/negative branch, steps it
-      each ProcessRow, combines in log-prob space (the per-branch softmax
-      constant cancels in the final softmax, so g=1 leaves the cond row
-      untouched bit-for-bit and skips the extra forward). 3 tests:
-      g=1==plain greedy, g=0 prompt-independent, arg validation.
 - [ ] Best-of-N / self-consistency reranking utility in
       neural/neuraldecode.pas: sample N completions, rerank by
       length-normalized sequence logprob (LengthPenaltyDenominator already
