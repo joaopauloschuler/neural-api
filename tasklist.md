@@ -111,155 +111,22 @@ rather than acted on.
       like the Mamba/RWKV demos. Verify with a pico parity fixture
       (tools/make_pico_recurrentgemma_fixture.py, ~10 KB sliced real weights)
       asserting logits ~1e-4 vs HF, plus a TestRecurrentGemmaParity case.
-- [X] Qwen3-MoE importer follow-up — SLIDING-WINDOW remainder. MIXED
-      dense/MoE layers DONE (per-layer LlamaLayerIsMoE gate mirrors HF
-      modeling_qwen3_moe: layer i is MoE iff i not in mlp_only_layers AND
-      (i+1) mod decoder_sparse_step = 0; else dense SwiGLU FFN of full
-      intermediate_size). Pico fixture tools/qwen3_moe_mixed_tiny_fixture.py
-      (decoder_sparse_step=2, 3 layers -> dense/MoE/dense) + parity test
-      TestQwen3MoeMixedLogitParity. use_sliding_window=true NOW WIRED: HF
-      Qwen3MoeConfig sets sliding_window = sliding_window if use_sliding_window
-      else None and bands EVERY layer (create_sliding_window_causal_mask, no
-      max_window_layers gating), so the importer maps it onto the Mistral
-      convention (SlidingWindow > 0 => every layer local) threading the window
-      into each SDPA via pWindow/FStruct[2]. Pico fixture
-      tools/qwen3_moe_window_tiny_fixture.py (sliding_window=3 over len-16,
-      non-vacuity 3.58) + parity test TestQwen3MoeWindowLogitParity (also pins
-      every SDPA head Window=3).
-- [X] GPT-OSS importer (BuildGptOssFromSafeTensors[Ex], model_type "gpt_oss",
-      i.e. openai/gpt-oss-20b and gpt-oss-120b — OpenAI's first open-weight
-      release and currently the highest-profile open MoE LLM with NO import
-      path here).
-      LANDED (a3): BuildGptOssFromSafeTensors[Ex] + ReadGptOssConfigFromJSONFile
-      + TGptOssConfig in neuralpretrained.pas (multi-shard index.json via
-      CreatePretrainedTensorReader; BuildFromPretrained "gpt_oss" dispatch).
-      Wires: (a) a NEW faithful sink layer TNNetGptOssSinkAttention (per-head
-      SCALAR sink logit in the softmax denominator, sink contributes ZERO to the
-      output — the landed avSink/TNNetSinkAttention's Q.SinkKey dot-product +
-      value slot does NOT match gpt-oss, so a dedicated subclass was added;
-      forward/backward/serialization tested in TestNeuralNumerical
-      TestGptOssSinkAttention{Forward,GradientCheck,SerializationRoundTrip});
-      (b) alternating sliding/full window via the per-head Window (FStruct[2]);
-      (c) YaRN RoPE on every layer — required adding the "truncate" flag to
-      TNNetRotaryEmbedding (gpt-oss ships truncate:false, the band edges are NOT
-      floor/ceil'd; stored INVERTED in FStruct[2] so old YaRN layers reload
-      unchanged) and to TRoPEScalingConfig/the YaRN config reader; (d) top-k MoE
-      via TNNetPointwiseSoftMax+TNNetTopKGate(renorm=true) — gpt-oss's
-      topk-then-softmax == Mixtral's softmax-then-topk-renorm — with biased,
-      INTERLEAVED-gate|up, clamped-SwiGLU (TNNetGptOssGatedSwiGLU) experts;
-      (e) MXFP4 expert dequant-at-load via DequantizeMXFP4 + a new
-      TNNetSafeTensorsReader.LoadTensorRawBytes (handles the [E,OUT,IN/32,16]
-      _blocks + [E,OUT,IN/32] _scales pair, transposed back to [E,IN,OUT]); a
-      dense F32 expert form loads straight. q/k rotate_half->interleaved row
-      permutation + q/k/v/o biases via LoadLlamaLinearWeights.
-      Pico parity fixtures (tools/gpt_oss_tiny_fixture.py, 2 layers / 4 experts /
-      top-2, one sliding + one full layer, hidden/inter=32 so the SAME pico
-      re-emits MXFP4): tiny_gpt_oss.* (dense, TestGptOssLogitParity) AND
-      tiny_gpt_oss_mxfp4.* (MXFP4 _blocks/_scales, TestGptOssMXFP4LogitParity) —
-      both assert next-token logits vs transformers 5.11 in float64 to <1e-4.
-      The generator ASSERTS the sink path (zeroing sinks moves logits ~5.5) and
-      the alternating-window path (making the sliding layer full moves them ~10.9)
-      are non-vacuous. gpt-oss-120b documented as import-capable but RAM-gated
-      (pInferenceOnly + sharded) in the importer doc comment and
-      examples/GPT2Import/README.md.
-      OPEN follow-ups: MXFP4 -> int8 weight-only storage path (pQuantizeInt8 is
-      wired but re-quantizes the dequantized FP32, not a direct 4->8 transcode);
-      no real-weight 20B/120B smoke run yet (RAM-gated; pico parity only).
-      FOUNDATION PRIMITIVES LANDED (a3, the two genuinely-new low-level pieces
-      the full importer will consume; the importer assembly itself is still
-      open):
-        * MXFP4 dequant-at-load reader: `DequantizeMXFP4` + `MXFP4Lut` in the
-          new unit `neural/neuralmxfp4.pas` (E2M1 FP4 LUT, 32-elem blocks of
-          16 packed nibble-pair bytes, E8M0 `2^(byte-127)` scale incl. the
-          0xFF=NaN case; low nibble=even elem, high nibble=odd). Verified
-          against transformers 5.11 integrations/mxfp4.py FP4_VALUES +
-          _convert_moe_packed_tensors. Tests:
-          TestMXFP4DequantHandBlock / TestMXFP4DequantNaNScale in
-          tests/TestNeuralPretrained.pas (hand-built block, exact-equality).
-        * Clamped-SwiGLU activation: new layer `TNNetGptOssGatedSwiGLU` in
-          neural/neuralnetwork.pas (interleaved gate=even/up=odd, gate
-          upper-clamped to limit, up clamped to +/-limit, out=(up+1)*gate*
-          sigmoid(alpha*gate); alpha=1.702/limit=7.0 in FFloatSt[0..1]),
-          registered in both dispatch tables. Matches GptOssExperts._apply_gate.
-          Tests: TestGptOssGatedSwiGLU{Forward,Clamping,GradientCheck,
-          LoadFromString} in tests/TestNeuralNumerical.pas.
-      REMAINING: the BuildGptOssFromSafeTensors[Ex] assembly itself — wiring the
-      avSink attention + alternating sliding/full window + YaRN RoPE + top-k-MoE
-      paths together, multi-shard index.json support, and the pico parity
-      fixture. Detail below.
-      This is NOT a near-duplicate of any landed importer: it is a
-      distinct CROSS of subsystems we already have plus one genuinely new
-      dequant. The architecture is a sparse top-k MoE decoder (config
-      num_local_experts / num_experts_per_tok / a per-layer router gate) — reuse
-      AddTopKMixtureOfExperts / TNNetTopKGate ([[topk-moe-routing]]) exactly as
-      the Mixtral/Qwen3-MoE importers do — but with three pieces no current
-      importer combines: (a) LEARNED PER-HEAD ATTENTION SINKS — each attention
-      layer carries a trainable `sinks` logit per head appended to the softmax
-      denominator, which is precisely the landed avSink attention variant
-      ([[mha-attention-variant-flag]]), so wire the imported sink logits into
-      that path rather than inventing a layer; (b) ALTERNATING sliding-window /
-      full attention every other layer (layer_types), the same per-layer Window
-      wiring AddAlternatingLocalGlobalBlocks / the Gemma-2 importer already ship
-      ([[gemma2-alternating-local-global]]); (c) YaRN RoPE scaling
-      ([[rope-scaling-config-wiring]]) on the full-attention layers. The FFN is a
-      gated SwiGLU expert but with gpt-oss's specific clamped-SwiGLU activation
-      (alpha=1.702 sigmoid gate plus a hard clamp on the gate/up pre-activations
-      — a small TNNet activation/clamp combo, verify the exact formula against
-      transformers' modeling_gpt_oss). The genuinely NEW low-level work is the
-      MXFP4 weight format the checkpoints actually ship in: the MoE expert
-      matrices are stored as 4-bit micro-scaled-FP4 blocks (a per-block uint8
-      scale exponent + packed 4-bit mantissa pairs); add an MXFP4 dequant-at-load
-      path (sibling of the landed GGUF Q4_K/Q8_0 dequant-at-load,
-      [[gguf-reader-importer]]) that expands MXFP4 -> FP32 into the existing
-      expert weight buffers (and, as a follow-up, straight into the int8
-      weight-only storage). Deliverables: BuildGptOssFromSafeTensors[Ex] (multi-
-      shard index.json support — the real checkpoints are sharded), an MXFP4
-      reader with its own round-trip unit test on a hand-built block, and a pico
-      parity fixture (tools/make_pico_*_fixture.py recipe,
-      [[pico-import-fixtures]]) sliced to 2 layers / 4 experts / top-2 with one
-      sliding + one full layer, asserting next-token logits vs transformers in
-      venv x (dequantize the fixture's MXFP4 experts to a tiny config so the
-      whole thing stays ~tens of KB). High value: it adds the most-deployed
-      brand-new open MoE family, exercises the avSink + alternating-window + YaRN
-      + top-k-MoE paths together for the first time, and the MXFP4 dequant is a
-      reusable new quant primitive (NOT a duplicate of the GGUF k-quant or int8
-      paths — it is a different block layout). Document gpt-oss-120b as
-      import-capable but RAM-gated like the other large checkpoints.
-- [X] Jamba importer (BuildJambaFromSafeTensors[Ex], model_type "jamba",
-      ai21labs/Jamba-tiny-dev / Jamba-Mini): the FIRST HYBRID Mamba+attention
-      +MoE decoder import. LANDED — neural/neuralpretrained.pas
-      BuildJambaFromSafeTensors[Ex]/WithConfig + ReadJambaConfigFromJSONFile +
-      JambaLayerIsAttention/IsMoE, dispatched from BuildFromPretrained for
-      model_type "jamba". Per-layer block-type schedule mirrors HF
-      configuration_jamba EXACTLY (attention iff i mod attn_layer_period =
-      attn_layer_offset; N-expert MoE iff i mod expert_layer_period =
-      expert_layer_offset). NoPE throughout, RMSNorm, bias-free GQA attention,
-      Mixtral-style top-k MoE with NON-renormalized gate weights (HF
-      JambaSparseMoeBlock takes raw softmax probs). The genuinely-new SSM piece:
-      HF JambaMambaMixer inserts an inner per-vector RMSNorm on dt/B/C between
-      x_proj and the scan, which cannot be folded into the plain-Mamba constant
-      projections — added a forward-only "Jamba inner-norm" mode to
-      TNNetSelectiveSSM (CreateJambaInner: keeps the dt path unfolded, applies
-      the three inner gains; backward raises a clear error — importer nets are
-      inference-only). Multi-shard .index.json supported via the existing
-      reader. Pico fixture tools/jamba_tiny_fixture.py → tests/fixtures/
-      tiny_jamba.* (6 layers covering ALL FOUR block kinds via attn_period=2/
-      offset=1 + expert_period=3/offset=1, 2 experts/top-1, GQA 4q/2kv,
-      d_state=4, dt_rank=3); oracle is a float64 numpy reimplementation of
-      modeling_jamba slow_forward, CROSS-CHECKED against real transformers
-      5.11 (== HF to 3.5e-5 = f32-vs-f64 rounding). Parity asserted by
-      tests/TestNeuralPretrained.pas TestJambaLogitParity (< 1e-4). Jamba-Mini/
-      1.5 documented as import-capable-but-RAM-gated in README.md + the
-      importer doc comment. Remaining open follow-ups (not blockers):
-        - mamba_proj_bias=true (in/out_proj biases) is REJECTED — no published
-          Jamba uses it; wire the bias path if a checkpoint needs it.
-        - training through the Jamba inner-norm SSM is not wired (forward-only);
-          add backward through the dt/B/C RMSNorms if fine-tuning is wanted.
-        - SentencePiece/tokenizer.json text prompting for Jamba: TNeuralHFTokenizer
-          reads it but no Jamba-specific demo/example was added (raw ids work).
-        - no real-checkpoint slicer fixture (parity uses a random pico model,
-          like the Mamba/Mixtral importers); add a make_pico-style real slice
-          if a genuine-weight parity fixture is later wanted.
+- [ ] GPT-OSS importer follow-ups (BuildGptOssFromSafeTensors[Ex] LANDED,
+      model_type "gpt_oss", with TNNetGptOssSinkAttention per-head scalar sink +
+      alternating sliding/full window + YaRN truncate flag + top-k MoE +
+      TNNetGptOssGatedSwiGLU clamped experts + MXFP4 dequant-at-load; pico parity
+      TestGptOssLogitParity / TestGptOssMXFP4LogitParity <1e-4): (a) MXFP4 -> int8
+      weight-only STORAGE path — pQuantizeInt8 currently re-quantizes the
+      dequantized FP32 rather than a direct 4->8 transcode; (b) no real-weight
+      20B/120B smoke run yet (RAM-gated; pico parity only).
+- [ ] Jamba importer follow-ups (BuildJambaFromSafeTensors[Ex] LANDED, model_type
+      "jamba", first hybrid Mamba+attention+MoE import; TNNetSelectiveSSM
+      CreateJambaInner inner-norm mode; pico parity TestJambaLogitParity <1e-4):
+      (a) mamba_proj_bias=true (in/out_proj biases) is REJECTED — wire the bias
+      path if a checkpoint needs it; (b) training through the Jamba inner-norm SSM
+      is forward-only — add backward through the dt/B/C RMSNorms for fine-tuning;
+      (c) no Jamba-specific tokenizer demo (raw ids work); (d) no real-checkpoint
+      slicer fixture (parity uses a random pico model).
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
@@ -313,9 +180,10 @@ rather than acted on.
       Conv-after-embeddings option is absent here (v3 has none), but the
       embedding path is StableDropout + a single LayerNorm (no token-type add
       when type_vocab_size=0), and the v3 LM/classification head differs from
-      BERT. Tokenizer: DeBERTa-v3 ships a SentencePiece model — depends on the
-      open SentencePiece/Unigram tokenizer task (or convert to the BPE
-      tokenizer.json the landed TNeuralHFTokenizer reads). Deliverables:
+      BERT. Tokenizer: DeBERTa-v3's Unigram tokenizer.json now rides the landed
+      TNeuralHFTokenizer Unigram/SentencePiece reader; only checkpoints shipping a
+      raw spm.model without a tokenizer.json need the still-open .model protobuf
+      path (see the neuralhftokenizer follow-up below). Deliverables:
       BuildDebertaV2FromSafeTensors[Ex] + a TNNetDisentangledAttention layer
       with its own numerical-gradient test, a pico parity fixture (make_pico_*
       recipe) asserting hidden states AND sequence-classification logits vs HF
@@ -324,8 +192,10 @@ rather than acted on.
       score), the canonical RAG-reranker demo the encoder importers enable.
 - [ ] BART-family follow-up (b) mBART/NLLB — pre-norm + an EXTRA final encoder
       AND decoder LayerNorm (same pre-norm shape the Pegasus importer now ships,
-      so it should reuse BuildPegasusStackBlocks) + a SentencePiece tokenizer,
-      so blocked on the open Unigram/SentencePiece task. Also: the committed
+      so it should reuse BuildPegasusStackBlocks) + a SentencePiece tokenizer:
+      mBART/NLLB ship a raw sentencepiece.bpe.model without a tokenizer.json, so
+      they still need the open raw .model protobuf path (the landed Unigram reader
+      only covers tokenizer.json). Also: the committed
       bart_tiny / tiny_pegasus fixtures are single-shard, so the inherited
       multi-shard index.json path is untested for these encoder-decoders
       specifically — add a 2-shard fixture if a real distilbart/pegasus import
@@ -473,27 +343,6 @@ rather than acted on.
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
       assert, same pattern as the chunked-forward recurrence family.
-- [X] rope_scaling follow-ups to the landed wiring (7e74fee): (a) [DONE]
-      DeepSeek-style YaRN `mscale` / `mscale_all_dim` overrides are now parsed
-      (ReadRoPEScalingFromJSONObject -> TRoPEScalingConfig.YarnAttnFactor =
-      _yarn_get_mscale(s,mscale)/_yarn_get_mscale(s,mscale_all_dim), matching
-      HF deepseek_v2 _compute_yarn_parameters bit-for-bit) and threaded into
-      TNNetRotaryEmbedding's FOutScale via FFloatSt[4] (0 = no override, keeps
-      the 0.1*ln(s)+1 default bit-for-bit; the constructor's pLongAttnFactor
-      default changed 1.0->0.0 so it doubles as the YaRN-override slot). An
-      explicit `attention_factor` is also honored now. Wired into the
-      DeepSeek-V2 importer (Config.RopeScaling, both rope sites). Parity test
-      TestDeepSeekV2YarnMScaleLogitParity + fixture tiny_deepseek_v2_yarn.*
-      (tools/deepseek_v2_yarn_tiny_fixture.py, mscale=2.0/mscale_all_dim=0.5 ->
-      1.1944 vs default 1.1386) verified vs HF float64; full V2 (q_lora_rank)
-      still out of scope. (b) [DONE,
-      landed with the GPT-OSS importer] yarn `"truncate"` is now parsed
-      (TRoPEScalingConfig.YarnTruncate, default true) and threaded into
-      TNNetRotaryEmbedding (FStruct[2], stored inverted so old serialized
-      YaRN layers reload unchanged); gpt-oss ships `"truncate": false`.
-      [longrope (Phi-3) DONE: rsmLongRoPE mode wired into TNNetRotaryEmbedding
-      + ReadRoPEScalingFromJSONObject parses longrope/su/yarn-with-long_factor;
-      parity fixture tiny_phi3_longrope verified vs HF float64.]
 - [ ] longrope short-factor / dynamic switching follow-up (static long-context
       import landed): the import statically picks the long_factor table + long
       attention scaling. HF switches to short_factor when seq_len <=
