@@ -6299,6 +6299,72 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetRGLRU: the Real-Gated Linear Recurrent Unit (RG-LRU) of the Griffin /
+  // Hawk family (De, Smith, Fernando, Botev, Cristian-Muraru, Gu, Haroun,
+  // Berrada, Chen, Srinivasan, Desjardins, Doucet, Budden, Teh, Pascanu, De
+  // Freitas, Gulcehre 2024, "Griffin: Mixing Gated Linear Recurrences with Local
+  // Attention for Efficient Language Models", arXiv:2402.19427). It is the
+  // recurrent core of google/recurrentgemma. Operates over a (SeqLen,1,Depth)
+  // sequence laid out along SizeX exactly like the attention / TNNetDiagonalSSM /
+  // TNNetLRU layers (SizeY must be 1); output shape == input shape.
+  //
+  // NOT a duplicate of TNNetLRU: TNNetLRU is the COMPLEX-diagonal, UNGATED Orvieto
+  // LRU (lambda in C, fixed per channel, gamma = sqrt(1-|lambda|^2) a constant).
+  // The RG-LRU is REAL-valued and INPUT-GATED: both the recurrence decay a_t and
+  // the input drive are modulated per timestep by sigmoid gates computed from the
+  // input, and the input-normalisation factor sqrt(1-a_t^2) is therefore also
+  // time-varying. There is no oscillation/rotation (real state only).
+  //
+  // This layer is self-contained: its single PrevLayer output packs THREE
+  // Depth-blocks along the depth axis (total input depth = 3*Depth):
+  //   block 0 = x        : the value stream to be gated and recurred
+  //   block 1 = i_logits : input-gate pre-activations (W_x x + b_x, computed by
+  //                        upstream projection layers)
+  //   block 2 = a_logits : recurrence-gate pre-activations (W_a x + b_a)
+  // Packing the externally-projected gate logits (rather than owning W_x/W_a)
+  // lets the recurrentgemma importer realise the per-head block-diagonal gate
+  // matrices as ordinary upstream Pointwise projections, exactly as the Mamba /
+  // RWKV importers fold their input-dependent projections outside the recurrent
+  // leaf. The only trainable weight the layer itself owns is the per-channel
+  // recurrent parameter Lambda.
+  //
+  // Per channel d, with c = 8.0 the fixed log-space decay constant:
+  //   i_t = sigmoid(i_logits_t)                         (input gate)
+  //   r_t = sigmoid(a_logits_t)                         (recurrence gate)
+  //   log_a_t = -c * r_t * softplus(Lambda_d)           (<= 0, so a_t in (0,1])
+  //   a_t = exp(log_a_t)                                (per-step decay)
+  //   nx_t = sqrt(1 - a_t^2) * (i_t * x_t)              (gamma-normalised drive)
+  //   h_t = a_t * h_{t-1} + nx_t          (h_{-1}=0)    (REAL state)
+  //   y_t = h_t
+  // This matches HF RecurrentGemmaRglru exactly (softplus(Lambda), c=8, a^2 via
+  // exp(2 log_a), sqrt(1-a^2) input normaliser). Storage in Neurons[] (1 tensor):
+  //   [0]=Lambda (Depth)   recurrent_param (init so softplus(Lambda)~=0.5)
+  // FStruct[0]=Depth (3*Depth input -> Depth output, resolved in SetPrevLayer).
+  // The real state h re-inits per sweep (NOT persisted). FORWARD is a
+  // left-to-right scan caching h_t, a_t, the gates and the multiplier. BACKWARD
+  // is the EXACT BPTT adjoint scan (right-to-left, carrying dL/dh_t), folding the
+  // input gradients into the x / i_logits / a_logits blocks and the per-channel
+  // Lambda gradient (chaining through sigmoid, softplus, exp and the
+  // sqrt(1-a^2) normaliser). Per-channel scalar scan -> scalar, no AVX.
+  // Coded by Claude (AI).
+  TNNetRGLRU = class(TNNetLayer)
+    private
+      FDepth: integer;          // resolved in SetPrevLayer (output depth)
+      FH: TNNetVolume;          // cached state h_t, (SeqLen,1,Depth)
+      FA: TNNetVolume;          // cached per-step decay a_t
+      FIg: TNNetVolume;         // cached input gate sigmoid(i_logits)
+      FRg: TNNetVolume;         // cached recurrence gate sigmoid(a_logits)
+      FMult: TNNetVolume;       // cached sqrt(1 - a_t^2)
+      FGradLambda: TNNetVolume;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); override;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetLegendreMemoryUnit: the Legendre Memory Unit (LMU, Voelker, Kajic &
   // Eliasmith 2019, "Legendre Memory Units: Continuous-Time Representation in
   // Recurrent Neural Networks", NeurIPS 2019) built on the HiPPO-LegS
@@ -37174,6 +37240,213 @@ begin
   FNeurons[3].FWeights.Fill(1);          // Cre = 1
   FNeurons[4].FWeights.Fill(0);          // Cim = 0
   FNeurons[5].FWeights.Fill(0);          // D = 0
+  AfterWeightUpdate();
+end;
+
+{ TNNetRGLRU }
+constructor TNNetRGLRU.Create();
+begin
+  inherited Create();
+  FDepth := 0;
+  FStruct[0] := 0;
+  FH := TNNetVolume.Create();
+  FA := TNNetVolume.Create();
+  FIg := TNNetVolume.Create();
+  FRg := TNNetVolume.Create();
+  FMult := TNNetVolume.Create();
+  FGradLambda := TNNetVolume.Create();
+  // [0]=Lambda (recurrent_param)
+  AddMissingNeurons(1);
+end;
+
+destructor TNNetRGLRU.Destroy();
+begin
+  FGradLambda.Free;
+  FMult.Free;
+  FRg.Free;
+  FIg.Free;
+  FA.Free;
+  FH.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetRGLRU.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetRGLRU requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if (pPrevLayer.FOutput.Depth mod 3) <> 0 then
+    FErrorProc('TNNetRGLRU requires input depth = 3*Depth (x|i_logits|a_logits), got Depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  FDepth := pPrevLayer.FOutput.Depth div 3;
+  FStruct[0] := FDepth;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDepth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, FDepth);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  FH.ReSize(FOutput.SizeX, 1, FDepth);
+  FA.ReSize(FOutput.SizeX, 1, FDepth);
+  FIg.ReSize(FOutput.SizeX, 1, FDepth);
+  FRg.ReSize(FOutput.SizeX, 1, FDepth);
+  FMult.ReSize(FOutput.SizeX, 1, FDepth);
+  FGradLambda.ReSize(1, 1, FDepth);
+  InitDefault();
+end;
+
+procedure TNNetRGLRU.Compute();
+const
+  cDecay = 8.0;             // fixed log-space decay constant c
+var
+  StartTime: double;
+  Prev, WLam: TNNetVolume;
+  SeqLen, Dn, t, d: integer;
+  sp, lam, igl, agl, ig, rg, loga, a, a2, mult, xt, hPrev, hNew: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  WLam := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  Dn := FDepth;
+  for d := 0 to Dn - 1 do
+  begin
+    lam := WLam.FData[d];
+    // softplus(Lambda) with the usual large-x shortcut.
+    if lam > 30 then sp := lam else sp := Ln(1 + Exp(lam));
+    hPrev := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      xt  := Prev.FData[Prev.GetRawPos(t, 0, d)];
+      igl := Prev.FData[Prev.GetRawPos(t, 0, Dn + d)];
+      agl := Prev.FData[Prev.GetRawPos(t, 0, 2 * Dn + d)];
+      ig := 1 / (1 + Exp(-igl));
+      rg := 1 / (1 + Exp(-agl));
+      loga := -cDecay * rg * sp;
+      a := Exp(loga);
+      a2 := Exp(2 * loga);
+      mult := Sqrt(1 - a2);
+      hNew := a * hPrev + mult * (ig * xt);
+      FA.FData[FA.GetRawPos(t, 0, d)] := a;
+      FIg.FData[FIg.GetRawPos(t, 0, d)] := ig;
+      FRg.FData[FRg.GetRawPos(t, 0, d)] := rg;
+      FMult.FData[FMult.GetRawPos(t, 0, d)] := mult;
+      FH.FData[FH.GetRawPos(t, 0, d)] := hNew;
+      FOutput.FData[FOutput.GetRawPos(t, 0, d)] := hNew;
+      hPrev := hNew;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetRGLRU.Backpropagate();
+const
+  cDecay = 8.0;
+var
+  StartTime: double;
+  Prev, PrevErr, WLam: TNNetVolume;
+  SeqLen, Dn, t, d: integer;
+  sp, dSpdLam, lam, ig, rg, a, a2, mult, xt, hPrev: TNeuralFloat;
+  ph, dh, dnx, dmult, da2, da, dloga, drg, dig, dxt, gLam: TNeuralFloat;
+  dLoga_dRg, dLoga_dSp: TNeuralFloat;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  WLam := FNeurons[0].FWeights;
+  SeqLen := FOutput.SizeX;
+  Dn := FDepth;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGradLambda.Fill(0);
+  // Exact BPTT carrying ph = dL/dh_t right-to-left. Forward per step:
+  //   loga = -c * rg * sp;  a = exp(loga);  mult = sqrt(1 - exp(2 loga))
+  //   h_t  = a * h_{t-1} + mult * ig * x_t;   y_t = h_t
+  for d := 0 to Dn - 1 do
+  begin
+    lam := WLam.FData[d];
+    if lam > 30 then
+    begin
+      sp := lam;
+      dSpdLam := 1;                   // sigmoid(lam) -> 1
+    end
+    else
+    begin
+      sp := Ln(1 + Exp(lam));
+      dSpdLam := 1 / (1 + Exp(-lam)); // d/dlam softplus = sigmoid(lam)
+    end;
+    ph := 0;
+    gLam := 0;
+    for t := SeqLen - 1 downto 0 do
+    begin
+      xt := Prev.FData[Prev.GetRawPos(t, 0, d)];
+      ig := FIg.FData[FIg.GetRawPos(t, 0, d)];
+      rg := FRg.FData[FRg.GetRawPos(t, 0, d)];
+      a  := FA.FData[FA.GetRawPos(t, 0, d)];
+      a2 := a * a;
+      mult := FMult.FData[FMult.GetRawPos(t, 0, d)];
+      if t > 0 then hPrev := FH.FData[FH.GetRawPos(t - 1, 0, d)]
+      else hPrev := 0;
+      // dL/dh_t = carried adjoint + read-out (y_t = h_t).
+      dh := ph + FOutputError.FData[FOutputError.GetRawPos(t, 0, d)];
+      // h_t = a*h_{t-1} + nx;  nx = mult * ig * x_t.
+      dnx := dh;
+      // Propagate to h_{t-1}: appears as a*h_{t-1} AND inside a via nothing else.
+      ph := dh * a;
+      // ---- nx = mult * (ig * x_t) ----
+      dmult := dnx * (ig * xt);
+      dig   := dnx * mult * xt;
+      dxt   := dnx * mult * ig;
+      // ---- a-path: a affects h via a*h_{t-1}, and via mult = sqrt(1-a^2). ----
+      // da from the a*h_{t-1} term:
+      da := dh * hPrev;
+      // da from mult = sqrt(1 - a^2):  dmult/da = -a / sqrt(1-a^2).
+      if mult > 1e-12 then
+        da := da + dmult * (-a / mult);
+      // a = exp(loga) -> da/dloga = a.
+      dloga := da * a;
+      // loga = -c * rg * sp.
+      dLoga_dRg := -cDecay * sp;
+      dLoga_dSp := -cDecay * rg;
+      drg := dloga * dLoga_dRg;
+      gLam := gLam + dloga * dLoga_dSp * dSpdLam;
+      // ---- gate sigmoids: ig = sigmoid(igl), rg = sigmoid(agl) ----
+      if hasInputGrad then
+      begin
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, d)] + dxt;
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, Dn + d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, Dn + d)] + dig * ig * (1 - ig);
+        PrevErr.FData[PrevErr.GetRawPos(t, 0, 2 * Dn + d)] :=
+          PrevErr.FData[PrevErr.GetRawPos(t, 0, 2 * Dn + d)] + drg * rg * (1 - rg);
+      end;
+    end;
+    FGradLambda.FData[d] := gLam;
+  end;
+  TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradLambda.GetRawPtr(), -FLearningRate, Dn);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetRGLRU.InitDefault();
+const
+  // softplus(Lambda) = 0.5 -> exp(Lambda) = exp(0.5)-1 -> Lambda = ln(exp(0.5)-1).
+  cLambdaInit = -0.4327;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  FNeurons[0].FWeights.Fill(cLambdaInit);
   AfterWeightUpdate();
 end;
 
@@ -84834,6 +85107,7 @@ begin
       'TNNetGatedLinearAttention':  Result := TNNetGatedLinearAttention.Create();
       'TNNetWKV':                   Result := TNNetWKV.Create();
       'TNNetLRU':                   Result := TNNetLRU.Create();
+      'TNNetRGLRU':                 Result := TNNetRGLRU.Create();
       'TNNetCrossWKV':              Result := TNNetCrossWKV.Create(aL[0], St[1] = 1);
       'TNNetAffineCoupling':        Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]);
       'TNNetInvertible1x1Conv':     Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]);
@@ -85222,6 +85496,7 @@ begin
       if S[0] = 'TNNetGatedLinearAttention' then Result := TNNetGatedLinearAttention.Create() else
       if S[0] = 'TNNetWKV' then Result := TNNetWKV.Create() else
       if S[0] = 'TNNetLRU' then Result := TNNetLRU.Create() else
+      if S[0] = 'TNNetRGLRU' then Result := TNNetRGLRU.Create() else
       if S[0] = 'TNNetCrossWKV' then Result := TNNetCrossWKV.Create(aL[0], St[1] = 1) else
       if S[0] = 'TNNetAffineCoupling' then Result := TNNetAffineCoupling.Create(St[0] = 1, St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetInvertible1x1Conv' then Result := TNNetInvertible1x1Conv.Create(St[2] = 1, St[1]) else
