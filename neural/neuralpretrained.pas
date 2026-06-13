@@ -2017,6 +2017,86 @@ function BuildBloomFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
+// ============================= FALCON IMPORT ===============================
+// BuildFalconFromSafeTensors rebuilds the Falcon decoder family (model_type
+// "falcon"; legacy "RefinedWebModel" = falcon-7b, "RefinedWeb" = falcon-40b)
+// - the closest cousin of the GPT-NeoX path (fused query_key_value, RoPE,
+// parallel attention+MLP residual) with two Falcon-specific twists:
+//   - FUSED MULTI-QUERY / GQA query_key_value: a single [qkv_out, hidden]
+//     slab. For multi_query=true & new_decoder_architecture=false
+//     (falcon-7b, falcon-rw): num_heads query heads + ONE shared K head +
+//     ONE shared V head (view(num_heads+2, head_dim)); the single cached
+//     K/V fans out across every query head. For new_decoder_architecture=
+//     true (falcon-40b): num_kv_heads GQA groups, each
+//     (num_heads/num_kv_heads query heads + 1 K + 1 V) INTERLEAVED per group
+//     (view(-1, num_heads//num_kv_heads + 2, head_dim)). multi_query=false &
+//     new_decoder_architecture=false is plain per-head [q|k|v] (the GPT-NeoX
+//     layout). RoPE is FULL-head Llama rotate_half (the loader composes the
+//     rotate_half->interleaved permutation into Q and K rows).
+//   - PARALLEL attention+MLP residual x := x + Attn(ln(x)) + MLP(ln(x)) with
+//     a SINGLE shared LayerNorm (parallel_attn / num_ln_in_parallel_attn=1,
+//     falcon-7b: input_layernorm) OR TWO separate norms (new arch /
+//     num_ln_in_parallel_attn=2, falcon-40b: ln_attn for attention,
+//     ln_mlp for the MLP). parallel_attn=false is the rare SEQUENTIAL pre-LN
+//     fallback (input_layernorm + post_attention_layernorm).
+// Plain BIASED LayerNorm (NOT RMSNorm), GELU MLP, NO biases on any Linear
+// (bias=false). Causal-LM contract like the other decoder families
+// ((SeqLen,1,1) ids in, (SeqLen,1,vocab) logits out).
+type
+  TFalconConfig = record
+    HiddenSize: integer;        // hidden_size (d_model)
+    IntermediateSize: integer;  // ffn_hidden_size (null/absent = 4*hidden)
+    NumLayers: integer;         // num_hidden_layers (legacy n_layer)
+    NumHeads: integer;          // num_attention_heads (legacy n_head)
+    NumKVHeads: integer;        // EFFECTIVE K/V heads: num_kv_heads (new
+                                // arch), 1 (multi_query), or NumHeads (MHA)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings
+    LayerNormEps: TNeuralFloat; // layer_norm_epsilon
+    RopeTheta: TNeuralFloat;    // rope_theta (RoPE base, default 10000)
+    NewDecoderArchitecture: boolean; // new_decoder_architecture (falcon-40b)
+    ParallelAttn: boolean;      // parallel_attn (single LN, falcon-7b)
+    TwoLayerNorms: boolean;     // ln_attn/ln_mlp split (new arch /
+                                // num_ln_in_parallel_attn=2)
+    TieWordEmbeddings: boolean; // tie_word_embeddings
+    RopeScaling: TRoPEScalingConfig; // parsed "rope_scaling"/"rope_parameters"
+    Prefix: string;             // tensor-name prefix ('transformer.' or '')
+  end;
+
+// Reads a HF Falcon config.json (model_type "falcon"; the legacy
+// "RefinedWebModel"/"RefinedWeb" spellings are accepted). Required: n_head /
+// num_attention_heads, n_layer / num_hidden_layers, vocab_size, hidden_size.
+// Defaults follow FalconConfig: ffn_hidden_size null = 4*hidden_size,
+// num_kv_heads = num_attention_heads, new_decoder_architecture = false,
+// multi_query = true, parallel_attn = true, layer_norm_epsilon = 1e-5,
+// rope_theta = 10000, max_position_embeddings = 2048, tie_word_embeddings =
+// true. alibi=true is rejected (use the BLOOM-style path, not wired for
+// Falcon). bias=true is rejected (no released Falcon uses biased Linears).
+// Prefix is left '' - the builder detects it.
+function ReadFalconConfigFromJSONFile(const FileName: string): TFalconConfig;
+
+function FalconConfigToString(const Config: TFalconConfig): string;
+
+// Builds the Falcon causal-LM net described by Config and loads every weight
+// from the checkpoint at FileName (see the FALCON IMPORT section above).
+// pSeqLen <= 0 uses max_position_embeddings. pInferenceOnly = True frees
+// training volumes during construction. Config.Prefix is detected from the
+// checkpoint and written back.
+function BuildFalconFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TFalconConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildFalconFromSafeTensorsEx(const FileName: string;
+  out Config: TFalconConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildFalconFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
 // ========================= MODERNBERT IMPORT ===============================
 // BuildModernBertFromSafeTensors rebuilds answer.ai's ModernBERT encoder
 // (model_type "modernbert": answerdotai/ModernBERT-base / -large) - the
@@ -2415,7 +2495,8 @@ function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
 // gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, gemma,
-// gemma2, gemma3_text, rwkv, mamba, bloom, bert, distilbert, roberta,
+// gemma2, gemma3_text, rwkv, mamba, bloom, falcon (legacy RefinedWebModel /
+// RefinedWeb spellings accepted), bert, distilbert, roberta,
 // modernbert, deepseek_v2.
 // Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
@@ -11056,6 +11137,624 @@ begin
     pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
+// ============================= FALCON IMPORT ===============================
+
+function ReadFalconConfigFromJSONFile(const FileName: string): TFalconConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, RopeObj: TJSONObject;
+  Field: TJSONData;
+  ModelType: string;
+  MultiQuery: boolean;
+  NumLnInParallel: integer;
+
+  function RequiredInt(const Key, AltKey: string): integer;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(Key);
+    if (Data = nil) or Data.IsNull then
+      Data := Obj.Find(AltKey);
+    if (Data = nil) or Data.IsNull then
+      ImportError('Falcon import: config "' + FileName +
+        '" is missing required key "' + Key + '" (or "' + AltKey + '").');
+    Result := Data.AsInteger;
+  end;
+
+begin
+  Result := Default(TFalconConfig);
+  if not FileExists(FileName) then
+    ImportError('Falcon import: config file "' + FileName + '" not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Falcon import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Falcon import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    // model_type "falcon"; the original tiiuae exports used the legacy
+    // "RefinedWebModel" (falcon-7b) and "RefinedWeb" (falcon-40b) spellings.
+    ModelType := Obj.Get('model_type', 'falcon');
+    if (ModelType <> 'falcon') and (ModelType <> 'RefinedWebModel') and
+       (ModelType <> 'RefinedWeb') then
+      ImportError('Falcon import: config model_type is "' + ModelType +
+        '" - expected "falcon", "RefinedWebModel" or "RefinedWeb" (see ' +
+        'BuildFromPretrained for the full dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size', 'hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers', 'n_layer');
+    Result.NumHeads := RequiredInt('num_attention_heads', 'n_head');
+    Result.VocabSize := RequiredInt('vocab_size', 'vocab_size');
+    Result.MaxPositions := Obj.Get('max_position_embeddings', 2048);
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    // ffn_hidden_size null/absent = 4*hidden_size (the FalconConfig default).
+    Field := Obj.Find('ffn_hidden_size');
+    if (Field <> nil) and not Field.IsNull then
+      Result.IntermediateSize := Field.AsInteger
+    else
+      Result.IntermediateSize := 4 * Result.HiddenSize;
+    // alibi=true and bias=true are not wired for Falcon (no released Falcon
+    // uses either - alibi was an early experiment, all releases use RoPE).
+    if Obj.Get('alibi', False) then
+      ImportError('Falcon import: config has alibi=true - this importer ' +
+        'only wires the RoPE form (every released Falcon uses RoPE).');
+    if Obj.Get('bias', False) then
+      ImportError('Falcon import: config has bias=true - this importer ' +
+        'only wires the bias-free form (no released Falcon uses biased ' +
+        'Linears).');
+    Result.NewDecoderArchitecture := Obj.Get('new_decoder_architecture', False);
+    Result.ParallelAttn := Obj.Get('parallel_attn', True);
+    MultiQuery := Obj.Get('multi_query', True);
+    // EFFECTIVE K/V head count and the QKV slab layout depend on the branch:
+    //   - new arch: num_kv_heads GQA groups (default = num_attention_heads);
+    //   - multi_query (old arch): ONE shared K/V head;
+    //   - neither: plain per-head [q|k|v] MHA (num_kv_heads = num_heads).
+    if Result.NewDecoderArchitecture then
+    begin
+      Field := Obj.Find('num_kv_heads');
+      if (Field <> nil) and not Field.IsNull then
+        Result.NumKVHeads := Field.AsInteger
+      else
+        Result.NumKVHeads := Result.NumHeads;
+    end
+    else if MultiQuery then
+      Result.NumKVHeads := 1
+    else
+      Result.NumKVHeads := Result.NumHeads;
+    // LayerNorm topology: new arch (or num_ln_in_parallel_attn=2) splits the
+    // single input_layernorm into ln_attn + ln_mlp. parallel_attn=false is
+    // the rare sequential pre-LN fallback (input_layernorm +
+    // post_attention_layernorm), single norm at the block entry.
+    NumLnInParallel := Obj.Get('num_ln_in_parallel_attn', 0); // 0 = absent
+    if Result.NewDecoderArchitecture and (NumLnInParallel = 0) then
+      NumLnInParallel := 2; // FalconDecoderLayer default for the new arch
+    Result.TwoLayerNorms :=
+      Result.ParallelAttn and (NumLnInParallel = 2);
+    // rope_theta: the classic key, or the newer rope_parameters.rope_theta
+    // nesting; default 10000.
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    Field := Obj.Find('rope_parameters');
+    if (Field <> nil) and (Field is TJSONObject) then
+    begin
+      RopeObj := TJSONObject(Field);
+      Result.RopeTheta := RopeObj.Get('rope_theta', Result.RopeTheta);
+      Result.RopeScaling := ReadRoPEScalingFromJSONObject(RopeObj,
+        Result.MaxPositions, 'Falcon import');
+    end
+    else
+      Result.RopeScaling := ReadRoPEScalingFromJSONObject(Obj,
+        Result.MaxPositions, 'Falcon import');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function FalconConfigToString(const Config: TFalconConfig): string;
+begin
+  Result := 'falcon config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', new_arch=' + BoolToStr(Config.NewDecoderArchitecture, true) +
+    ', parallel=' + BoolToStr(Config.ParallelAttn, true) +
+    ', two_ln=' + BoolToStr(Config.TwoLayerNorms, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.RopeScaling.Mode <> rsmNone then
+    Result := Result + ', rope_scaling=' +
+      RoPEScalingToString(Config.RopeScaling);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+// Loads the fused Falcon query_key_value nn.Linear ([qkv_out, hidden]
+// weight, bias-free) into a TNNetPointwiseConvLinear Q|K|V slab laid out
+// q -> neurons 0..QWidth-1, k -> QWidth..QWidth+KVWidth-1,
+// v -> QWidth+KVWidth..QWidth+2*KVWidth-1 (the same de-interleaved layout
+// the GQA head wiring below expects, identical to the Llama q/k/v split).
+// The source slab is INTERLEAVED PER GQA GROUP: group g packs GroupSize
+// query heads, then ONE K head, then ONE V head, each head_dim rows wide
+// (HF view(-1, GroupSize + 2, head_dim)); multi_query is the special case
+// num_kv_heads=1 (one group). The plain-MHA layout (NOT new arch, NOT
+// multi_query) is per-head [q|k|v] thirds (view(num_heads, 3, head_dim)) and
+// is handled by PerHeadThirds=true. On top of the de-interleave, the q and k
+// rows are PERMUTED from HF's rotate_half (first-half / second-half) into
+// TNNetRotaryEmbedding's interleaved (even/odd) pair layout (the Llama
+// permutation); v rows load straight.
+procedure LoadFalconQKVWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string;
+  Hidden, Heads, KVHeads, HeadDim: integer; PerHeadThirds: boolean);
+var
+  W: TNNetVolume;
+  GroupSize, QkvOut, QWidth, KVWidth, r, i: integer;
+  HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
+  Group, SubInGroup, GroupStride: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  GroupSize := Heads div KVHeads;
+  QWidth := Heads * HeadDim;
+  KVWidth := KVHeads * HeadDim;
+  QkvOut := QWidth + 2 * KVWidth;
+  if not Reader.HasTensor(WName) then
+    ImportError('Falcon import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> QkvOut) or
+     (Reader.DimSize(WName, 1) <> Hidden) then
+    ImportError('Falcon import: "' + WName + '" must have shape [' +
+      IntToStr(QkvOut) + ', ' + IntToStr(Hidden) + '] (nn.Linear stores ' +
+      '[out, in]), got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> QkvOut then
+    ImportError('Falcon import: internal error - layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(QkvOut) + '.');
+  RotHalf := HeadDim div 2;
+  GroupStride := (GroupSize + 2) * HeadDim;
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for r := 0 to QkvOut - 1 do
+    begin
+      // Decode source row r -> (Third in {0=q,1=k,2=v}, HeadIdx, RowInHead).
+      if PerHeadThirds then
+      begin
+        // view(num_heads, 3, head_dim): head h, third t, dim d at
+        // ((h*3 + t)*head_dim + d).
+        HeadIdx := r div (3 * HeadDim);
+        Third := (r mod (3 * HeadDim)) div HeadDim;
+        RowInHead := r mod HeadDim;
+      end
+      else
+      begin
+        // view(num_kv_heads, GroupSize + 2, head_dim): group g, sub s, dim d
+        // at ((g*(GroupSize+2) + s)*head_dim + d). s in 0..GroupSize-1 are
+        // query heads (global head g*GroupSize + s), s=GroupSize is the K
+        // head, s=GroupSize+1 the V head (both shared across the group).
+        Group := r div GroupStride;
+        SubInGroup := (r mod GroupStride) div HeadDim;
+        RowInHead := r mod HeadDim;
+        if SubInGroup < GroupSize then
+        begin
+          Third := 0;
+          HeadIdx := Group * GroupSize + SubInGroup;
+        end
+        else if SubInGroup = GroupSize then
+        begin
+          Third := 1;
+          HeadIdx := Group;
+        end
+        else
+        begin
+          Third := 2;
+          HeadIdx := Group;
+        end;
+      end;
+      // rotate_half -> interleaved permutation on q and k rows (full head).
+      TargetRow := RowInHead;
+      if Third < 2 then
+      begin
+        if RowInHead < RotHalf then
+          TargetRow := 2 * RowInHead
+        else
+          TargetRow := 2 * (RowInHead - RotHalf) + 1;
+      end;
+      // Destination index in the q|k|v slab.
+      case Third of
+        0: TargetIdx := HeadIdx * HeadDim + TargetRow;
+        1: TargetIdx := QWidth + HeadIdx * HeadDim + TargetRow;
+      else
+        TargetIdx := QWidth + KVWidth + HeadIdx * HeadDim + TargetRow;
+      end;
+      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+        ImportError('Falcon import: internal error - neuron ' +
+          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
+          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          ' weights, expected ' + IntToStr(Hidden) + '.');
+      for i := 0 to Hidden - 1 do
+        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      Layer.Neurons[TargetIdx].BiasWeight := 0;
+    end;
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+type
+  TFalconBlockLayers = record
+    LNAttn, LNMlp, LNPostAttn, QKV, AttnDense, HTo4H, FourHToH: TNNetLayer;
+  end;
+
+function BuildFalconFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TFalconConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TFalconBlockLayers;
+  EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
+  BranchInput, AttnSource, MlpSource, AttnOut, MlpOut, QKVLayer: TNNetLayer;
+  QSource, KSource, QSlice, KSlice, HeadPack: TNNetLayer;
+  KRotated, VSlices, HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
+  HeadDim, QWidth, KVWidth, i, j, d: integer;
+  PerHeadThirds: boolean;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // x*Phi(x), the exact erf GELU (Falcon's activation is "gelu" = exact),
+  // composed from existing layers exactly like the GPT-NeoX/BERT path.
+  procedure AddExactGELU;
+  var
+    GELUSource, PhiBranch: TNNetLayer;
+  begin
+    GELUSource := NN.GetLastLayer();
+    NN.AddLayerAfter(
+      TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
+    NN.AddLayer( TNNetErf.Create() );
+    NN.AddLayer( TNNetAddConstant.Create(1.0) );
+    PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+    NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
+    NN.AddLayer( TNNetReGLU.Create() );
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('Falcon import: num_attention_heads must be >= 1.');
+      if Config.NumKVHeads < 1 then
+        ImportError('Falcon import: effective num_kv_heads must be >= 1.');
+      if (Config.NumHeads mod Config.NumKVHeads) <> 0 then
+        ImportError('Falcon import: num_attention_heads=' +
+          IntToStr(Config.NumHeads) + ' is not divisible by the effective ' +
+          'num_kv_heads=' + IntToStr(Config.NumKVHeads) + '.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('Falcon import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if Odd(HeadDim) then
+        ImportError('Falcon import: head_dim=' + IntToStr(HeadDim) +
+          ' must be even (RoPE rotates channel pairs).');
+      QWidth := Config.NumHeads * HeadDim;
+      KVWidth := Config.NumKVHeads * HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+      // The plain-MHA QKV layout (per-head [q|k|v] thirds) is used ONLY when
+      // neither the new arch nor multi_query applies: that is exactly when
+      // the effective num_kv_heads equals num_heads AND the new arch is off.
+      PerHeadThirds := (not Config.NewDecoderArchitecture) and
+        (Config.NumKVHeads = Config.NumHeads);
+      if Reader.HasTensor('transformer.word_embeddings.weight') then
+        Config.Prefix := 'transformer.'
+      else if Reader.HasTensor('word_embeddings.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Falcon import: neither ' +
+          '"transformer.word_embeddings.weight" nor ' +
+          '"word_embeddings.weight" found in ' + Reader.FileName +
+          ' - not a Falcon checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'word_embeddings.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'word_embeddings.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'word_embeddings.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Falcon import: word_embeddings.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'word_embeddings.weight'));
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('lm_head.weight')) then
+        ImportError('Falcon import: config says tie_word_embeddings=false ' +
+          'but "lm_head.weight" is missing from ' + Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('Falcon import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(KRotated, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BranchInput := NN.GetLastLayer();
+        // LayerNorm topology:
+        //  - TwoLayerNorms (new arch / num_ln_in_parallel_attn=2): ln_attn
+        //    feeds attention, ln_mlp feeds the MLP, BOTH read the block input;
+        //  - otherwise a single LayerNorm (input_layernorm) feeds both the
+        //    attention branch and (parallel_attn) the MLP branch.
+        if Config.TwoLayerNorms then
+        begin
+          Blocks[BlockCnt].LNAttn := NN.AddLayerAfter(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput);
+          AttnSource := Blocks[BlockCnt].LNAttn;
+          Blocks[BlockCnt].LNMlp := NN.AddLayerAfter(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput);
+          MlpSource := Blocks[BlockCnt].LNMlp;
+        end
+        else
+        begin
+          Blocks[BlockCnt].LNAttn := NN.AddLayerAfter(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput);
+          AttnSource := Blocks[BlockCnt].LNAttn;
+          MlpSource := Blocks[BlockCnt].LNAttn; // shared (set below if seq.)
+        end;
+        // ---- attention branch: dense(GQA-RoPE(ln(x))) ----
+        QKVLayer := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(QWidth + 2 * KVWidth), AttnSource);
+        Blocks[BlockCnt].QKV := QKVLayer;
+        QSource := QKVLayer;
+        KSource := QKVLayer;
+        // K is rotated ONCE per KV head; V (slab tail) is never rotated.
+        for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+        begin
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := QWidth + KVHeadCnt * HeadDim + d;
+          KSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), KSource);
+          KRotated[KVHeadCnt] := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
+            KSlice);
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := QWidth + KVWidth + KVHeadCnt * HeadDim + d;
+          VSlices[KVHeadCnt] := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), QKVLayer);
+        end;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          KVGroup := HeadCnt div GroupSize;
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := HeadCnt * HeadDim + d;
+          QSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), QSource);
+          QSlice := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
+            QSlice);
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+            [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim,
+              {CausalMask=}true), HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].AttnDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        AttnOut := NN.GetLastLayer();
+        if not Config.ParallelAttn then
+        begin
+          // SEQUENTIAL pre-LN (parallel_attn=false): close the attention
+          // residual first, then the MLP reads post_attention_layernorm of
+          // the updated stream. x := x + Attn(ln1(x));
+          // x := x + MLP(ln2(x)).
+          AttnOut := NN.AddLayer( TNNetSum.Create([AttnOut, BranchInput]) );
+          Blocks[BlockCnt].LNPostAttn := NN.AddLayer(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          MlpSource := Blocks[BlockCnt].LNPostAttn;
+        end;
+        // ---- MLP branch: dense_4h_to_h(gelu(dense_h_to_4h(ln(x)))) ----
+        Blocks[BlockCnt].HTo4H := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize), MlpSource);
+        AddExactGELU;
+        Blocks[BlockCnt].FourHToH := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        MlpOut := NN.GetLastLayer();
+        if Config.ParallelAttn then
+          // PARALLEL: x := x + Attn(ln(x)) + MLP(ln(x)). One fused 3-input
+          // sum (HF computes mlp_output += attention_output then
+          // residual + mlp_output).
+          NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) )
+        else
+          NN.AddLayer( TNNetSum.Create([MlpOut, AttnOut]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Config.Prefix + 'word_embeddings.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Falcon import: word_embeddings.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'word_embeddings.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          EnsureWritableImportWeights(LMHead);
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor('lm_head.weight') then
+            MarkConsumed('lm_head.weight');
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+            Config.HiddenSize, Config.VocabSize);
+          MarkConsumed('lm_head.weight');
+        end;
+      finally
+        Tmp.Free;
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'self_attention.';
+        if Config.TwoLayerNorms then
+        begin
+          LoadLayerNormWeights(Reader, Blocks[BlockCnt].LNAttn,
+            BlockPrefix + 'ln_attn.weight', BlockPrefix + 'ln_attn.bias',
+            Config.HiddenSize);
+          MarkConsumed(BlockPrefix + 'ln_attn.weight');
+          MarkConsumed(BlockPrefix + 'ln_attn.bias');
+          LoadLayerNormWeights(Reader, Blocks[BlockCnt].LNMlp,
+            BlockPrefix + 'ln_mlp.weight', BlockPrefix + 'ln_mlp.bias',
+            Config.HiddenSize);
+          MarkConsumed(BlockPrefix + 'ln_mlp.weight');
+          MarkConsumed(BlockPrefix + 'ln_mlp.bias');
+        end
+        else
+        begin
+          LoadLayerNormWeights(Reader, Blocks[BlockCnt].LNAttn,
+            BlockPrefix + 'input_layernorm.weight',
+            BlockPrefix + 'input_layernorm.bias', Config.HiddenSize);
+          MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+          MarkConsumed(BlockPrefix + 'input_layernorm.bias');
+          if not Config.ParallelAttn then
+          begin
+            LoadLayerNormWeights(Reader, Blocks[BlockCnt].LNPostAttn,
+              BlockPrefix + 'post_attention_layernorm.weight',
+              BlockPrefix + 'post_attention_layernorm.bias',
+              Config.HiddenSize);
+            MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+            MarkConsumed(BlockPrefix + 'post_attention_layernorm.bias');
+          end;
+        end;
+        LoadFalconQKVWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'query_key_value.weight',
+          Config.HiddenSize, Config.NumHeads, Config.NumKVHeads, HeadDim,
+          PerHeadThirds);
+        MarkConsumed(AttnPrefix + 'query_key_value.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
+          AttnPrefix + 'dense.weight', Config.HiddenSize, Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'dense.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].HTo4H,
+          BlockPrefix + 'mlp.dense_h_to_4h.weight', Config.HiddenSize,
+          Config.IntermediateSize);
+        MarkConsumed(BlockPrefix + 'mlp.dense_h_to_4h.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].FourHToH,
+          BlockPrefix + 'mlp.dense_4h_to_h.weight', Config.IntermediateSize,
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.weight');
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'ln_f.weight', Config.Prefix + 'ln_f.bias',
+        Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'ln_f.weight');
+      MarkConsumed(Config.Prefix + 'ln_f.bias');
+
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // rotary_emb.inv_freq: RoPE buffers (structural, rebuilt from base).
+        if Pos('rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
+        ImportError('Falcon import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) + ') in ' +
+          FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildFalconFromSafeTensorsEx(const FileName: string;
+  out Config: TFalconConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadFalconConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildFalconFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildFalconFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TFalconConfig;
+begin
+  Result := BuildFalconFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
 function ReadModernBertConfigFromJSONFile(
   const FileName: string): TModernBertConfig;
 var
@@ -13099,6 +13798,7 @@ var
   IgnoredRWKVConfig: TRWKVConfig;
   IgnoredMambaConfig: TMambaConfig;
   IgnoredBloomConfig: TBloomConfig;
+  IgnoredFalconConfig: TFalconConfig;
   IgnoredModernBertConfig: TModernBertConfig;
   IgnoredDeepSeekV2Config: TDeepSeekV2Config;
 begin
@@ -13262,6 +13962,16 @@ begin
     // families. See the BLOOM IMPORT section.
     Result := BuildBloomFromSafeTensorsEx(WeightsPath, IgnoredBloomConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if (ModelType = 'falcon') or (ModelType = 'RefinedWebModel') or
+          (ModelType = 'RefinedWeb') then
+    // Falcon (architectures ["FalconForCausalLM"]; the original tiiuae
+    // exports used model_type "RefinedWebModel" = falcon-7b and "RefinedWeb"
+    // = falcon-40b): fused multi-query/GQA query_key_value, RoPE, parallel
+    // attention+MLP residual with one (parallel_attn) or two (new arch,
+    // ln_attn/ln_mlp) LayerNorms. Causal-LM contract like the other decoder
+    // families. See the FALCON IMPORT section.
+    Result := BuildFalconFromSafeTensorsEx(WeightsPath, IgnoredFalconConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'modernbert' then
     // The second ENCODER route: ModernBERT (architectures
     // ["ModernBertModel"]; head-bearing exports load their base weights
@@ -13331,8 +14041,8 @@ begin
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, phi3, llama, ' +
       'mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, ' +
-      'mamba, bloom, bert, distilbert, roberta, modernbert, deepseek_v2, ' +
-      'olmo2.');
+      'mamba, bloom, falcon, bert, distilbert, roberta, modernbert, ' +
+      'deepseek_v2, olmo2.');
   end;
 end;
 

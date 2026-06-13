@@ -1,0 +1,20 @@
+{
+ "architectures": [
+  "FalconForCausalLM"
+ ],
+ "model_type": "falcon",
+ "hidden_size": 32,
+ "ffn_hidden_size": 48,
+ "num_hidden_layers": 2,
+ "num_attention_heads": 4,
+ "vocab_size": 11,
+ "max_position_embeddings": 16,
+ "layer_norm_epsilon": 1e-05,
+ "rope_theta": 10000.0,
+ "multi_query": true,
+ "new_decoder_architecture": false,
+ "parallel_attn": true,
+ "bias": false,
+ "alibi": false,
+ "tie_word_embeddings": true
+}

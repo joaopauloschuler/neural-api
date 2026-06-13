@@ -92,7 +92,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Falcon importer (model_type "falcon" / "RefinedWeb" / "RefinedWebModel",
+- [X] Falcon importer (model_type "falcon" / "RefinedWeb" / "RefinedWebModel",
       e.g. tiiuae/falcon-7b or the tiny falcon-rw-1b sibling): a canonical open
       decoder family with a genuinely DISTINCT recipe not covered by any landed
       importer. The defining pieces: (a) FUSED multi-query QKV — a single

@@ -161,6 +161,9 @@ type
     procedure TestGPTNeoXConfigFromJSONFile;
     procedure TestGPTNeoXLogitParity;
     procedure TestGPTNeoXSequentialLogitParity;
+    procedure TestFalconConfigFromJSONFile;
+    procedure TestFalconMultiQueryLogitParity;
+    procedure TestFalconNewArchLogitParity;
     procedure TestGPTJConfigFromJSONFile;
     procedure TestGPTJLogitParity;
     procedure TestPhiConfigFromJSONFile;
@@ -4661,6 +4664,108 @@ begin
     AssertFalse('sequential residual', Config.UseParallelResidual);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gptneox_seq_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestFalconConfigFromJSONFile;
+var
+  Config: TFalconConfig;
+begin
+  RandSeed := 424242;
+  // multi_query branch (falcon-7b style): single shared K/V, one LN.
+  Config := ReadFalconConfigFromJSONFile(
+    FixturePath('tiny_falcon_mq_config.json'));
+  AssertEquals('hidden_size', 32, Config.HiddenSize);
+  // 48, deliberately NOT 4*hidden in the fixture.
+  AssertEquals('ffn_hidden_size', 48, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 4, Config.NumHeads);
+  // multi_query=true collapses the effective K/V head count to 1.
+  AssertEquals('effective num_kv_heads (multi_query)', 1, Config.NumKVHeads);
+  AssertEquals('vocab_size', 11, Config.VocabSize);
+  AssertEquals('layer_norm_epsilon', 1e-5, Config.LayerNormEps, 1e-9);
+  AssertEquals('rope_theta', 10000.0, Config.RopeTheta, 1e-6);
+  AssertFalse('new_decoder_architecture', Config.NewDecoderArchitecture);
+  AssertTrue('parallel_attn', Config.ParallelAttn);
+  AssertFalse('two layernorms (multi_query has one)', Config.TwoLayerNorms);
+  AssertTrue('tie_word_embeddings', Config.TieWordEmbeddings);
+  // new_decoder_architecture branch (falcon-40b style): GQA, two LNs.
+  Config := ReadFalconConfigFromJSONFile(
+    FixturePath('tiny_falcon_nda_config.json'));
+  AssertTrue('new_decoder_architecture', Config.NewDecoderArchitecture);
+  AssertEquals('effective num_kv_heads (GQA)', 2, Config.NumKVHeads);
+  AssertTrue('two layernorms (new arch ln_attn/ln_mlp)', Config.TwoLayerNorms);
+  AssertFalse('tie_word_embeddings (nda untied)', Config.TieWordEmbeddings);
+end;
+
+// Verifies the Falcon import on the multi_query branch (falcon-7b /
+// falcon-rw): tests/fixtures/tiny_falcon_mq.* is a pico randomly-initialized
+// HF FalconForCausalLM (2 layers, 4 heads x 8 dims, hidden 32, ffn 48
+// deliberately != 4*hidden, vocab 11) covering the multi_query quirks: ONE
+// shared K head + ONE shared V head fanned out across all query heads (the
+// query_key_value view(num_heads + 2, head_dim) layout), a SINGLE
+// input_layernorm feeding both the attention and MLP parallel-residual
+// branches (x + Attn(ln(x)) + MLP(ln(x))), full-head Llama-rotate_half RoPE
+// (the generator asserts disabling rotation moves the logits by ~0.14),
+// the exact erf GELU and the tied lm_head. Reference logits come from HF
+// transformers in float64.
+procedure TTestNeuralPretrained.TestFalconMultiQueryLogitParity;
+var
+  NN: TNNet;
+  Config: TFalconConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildFalconFromSafeTensorsEx(
+    FixturePath('tiny_falcon_mq.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_falcon_mq_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 4, Config.NumHeads);
+    AssertEquals('kv heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertTrue('parallel_attn', Config.ParallelAttn);
+    AssertTrue('tied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'transformer.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_falcon_mq_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Falcon import on the new_decoder_architecture branch
+// (falcon-40b): tests/fixtures/tiny_falcon_nda.* is a pico
+// randomly-initialized HF FalconForCausalLM (2 layers, 4 query heads x 8
+// dims, num_kv_heads=2, hidden 32, vocab 11) covering the new-arch quirks:
+// num_kv_heads GQA groups with the per-group INTERLEAVED query_key_value
+// layout (view(-1, num_heads//num_kv_heads + 2, head_dim)) and TWO separate
+// parallel-residual LayerNorms ln_attn (attention) / ln_mlp (MLP), both
+// reading the block input. Reference logits come from HF transformers in
+// float64.
+procedure TTestNeuralPretrained.TestFalconNewArchLogitParity;
+var
+  NN: TNNet;
+  Config: TFalconConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildFalconFromSafeTensorsEx(
+    FixturePath('tiny_falcon_nda.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_falcon_nda_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 4, Config.NumHeads);
+    AssertEquals('kv heads (GQA)', 2, Config.NumKVHeads);
+    AssertTrue('new_decoder_architecture', Config.NewDecoderArchitecture);
+    AssertTrue('two layernorms', Config.TwoLayerNorms);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_falcon_nda_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;
