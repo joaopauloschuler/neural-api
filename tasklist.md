@@ -538,6 +538,30 @@ rather than acted on.
       static exit layer + confidence threshold; follow-up: per-token
       adaptive exit. Report tokens/sec vs full-depth at matched output
       quality.
+- [ ] Prompt-lookup / n-gram speculative decoding (transformers
+      `prompt_lookup_num_tokens` / "assisted generation with an n-gram
+      drafter"): a TRAINING-FREE, NO-second-model speculative decode where the
+      draft of the next few tokens is produced by matching the last
+      MatchLen tokens of the running context against earlier occurrences in the
+      prompt+generation so far and copying the NumDraft tokens that followed the
+      most recent match, then verifying the whole window in one forward pass with
+      the EXISTING width-K verify rule (the same TruncateCache/last-window
+      primitive examples/SelfSpeculativeDecoding and DecodeSpeculative already
+      use). Distinct from every landed/proposed speculative variant — the MTP
+      draft (examples/SelfSpeculativeDecoding), the early-exit/LayerSkip self-
+      draft task above, and the external-draft DecodeSpeculative all run a NEURAL
+      drafter; this one drafts by pure string lookup, so it is nearly free and is
+      the standout win for repetition-heavy NLP workloads (RAG / summarization /
+      code-edit / "quote the passage" prompts) where the answer reuses spans of
+      the input verbatim. Deliverables: DecodePromptLookup in
+      neural/neuraldecode.pas (MatchLen + NumDraft + max-new-tokens args, longest-
+      suffix match preferring the most recent occurrence), a degrades-to-greedy
+      guarantee when no n-gram match is found (emit one token, identical to plain
+      greedy), and a test asserting the output is BIT-IDENTICAL to greedy on a
+      pinned context that forces several accepted/rejected drafts (acceptance is a
+      speedup, never a quality change). Reuses the existing accept/verify plumbing,
+      so it is small; pairs naturally with the KV-cache fork primitive the beam /
+      best-of-N tasks want.
 - [X] DoLa decoding follow-up: DoLa-low / DoLa-high dynamic premature-layer
       buckets LANDED (neural/neuraldecode.pas). TDoLaLayerBucket enum
       (dlbFull/dlbLow/dlbHigh) + overloaded DecodeDoLa(...; Bucket; HeadStartIdx)
