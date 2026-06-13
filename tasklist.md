@@ -516,7 +516,7 @@ rather than acted on.
       byte-level-BPE variant needs a vocab prefix-scan helper there;
       (b) guidance-style multi-token rollback (back up over more than the
       single last prompt token when the boundary artifact spans merges).
-- [ ] Needle-in-a-haystack long-context eval harness: place a fact at
+- [X] Needle-in-a-haystack long-context eval harness: place a fact at
       varying depths in a synthetic long context, measure retrieval
       accuracy vs (depth, context length) as a small grid report. The
       landed RoPE-scaling wiring and the open KV-cache-eviction task both

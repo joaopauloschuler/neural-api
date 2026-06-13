@@ -196,6 +196,53 @@ type
 
   TNNetDecodeResultArray = array of TNNetDecodeResult;
 
+  // -------------------------------------------------------------------------
+  // NEEDLE-IN-A-HAYSTACK long-context evaluation (NeedleInHaystackReport).
+  //
+  // Places a FACT ("needle") at varying depths inside a synthetic long
+  // context ("haystack" filler), appends a retrieval question, runs
+  // generation, and checks whether the answer was recovered. The result is a
+  // (depth x context-length) accuracy grid - the standard probe for whether a
+  // position-extrapolation scheme (RoPE scaling) or a KV-cache-eviction policy
+  // actually preserves access to information far from the query position.
+  //
+  // Pluggable callbacks keep it model-agnostic so it can be exercised both by
+  // a real char-level TNNet (via the convenience overload that wraps
+  // DecodeGreedy) and by a deterministic stand-in in tests:
+  //   TNeedleFillerCallback   builds CharCount characters of distractor text
+  //                           (must NOT contain the needle answer);
+  //   TNeedleGenerateCallback runs the model on a fully-assembled prompt and
+  //                           returns its generated continuation.
+  // Coded by Claude (AI).
+  TNeedleFillerCallback =
+    function(CharCount: integer; Data: Pointer): string;
+  TNeedleGenerateCallback =
+    function(const Prompt: string; Data: Pointer): string;
+
+  // Outcome of a single (length,depth) probe plus the assembled prompt and the
+  // raw model output, so callers can inspect individual cells.
+  // Coded by Claude (AI).
+  TNeedleCell = record
+    ContextLen: integer;       // requested filler length in characters
+    DepthFraction: TNeuralFloat; // needle insertion depth in [0,1]
+    Prompt: string;            // the fully-assembled probe prompt
+    Output: string;            // the model's generated continuation
+    Hit: boolean;              // True if Output contained the needle answer
+  end;
+
+  // Full grid result: Cells[depthRow][lenCol], the requested axes, and the
+  // overall hit rate (HitCount/TotalCount). Report is the rendered grid.
+  // Coded by Claude (AI).
+  TNeedleInHaystackResult = record
+    Cells: array of array of TNeedleCell; // [depth][length]
+    DepthFractions: TNeuralFloatDynArr;
+    ContextLengths: TNeuralIntegerArray;
+    HitCount: integer;
+    TotalCount: integer;
+    Accuracy: TNeuralFloat;    // HitCount / TotalCount (0 if empty)
+    Report: string;            // rendered ASCII grid + summary
+  end;
+
   // A scored TOKEN-ID decode candidate - the seq2seq (encoder-decoder) beam
   // counterpart of the char-level TNNetDecodeResult above. Tokens holds the
   // GENERATED target ids only (StartTokenId excluded; the EOS token IS
@@ -1533,6 +1580,45 @@ function DecodeSeq2SeqBeamSearchAll(EncoderNet, DecoderNet: TNNet;
   const SourceTokens: array of integer;
   StartTokenId, EOSTokenId, MaxNewTokens: integer;
   BeamWidth: integer; LengthPenalty: TNeuralFloat): TNNetTokenDecodeResultArray;
+
+// ---------------------------------------------------------------------------
+// NEEDLE-IN-A-HAYSTACK long-context eval harness.
+//
+// For each (ContextLengths[c], DepthFractions[d]) cell the harness:
+//   1. builds Filler(ContextLengths[c]) characters of distractor text;
+//   2. splices NeedleFact in at byte position round(DepthFraction*len) snapped
+//      to a space boundary (depth 0 = very start, 1 = very end);
+//   3. appends Question, yielding the probe Prompt;
+//   4. calls Generate(Prompt) and records Hit := the output contains
+//      NeedleAnswer (case-insensitive substring match);
+// then renders a depth x length pass/fail grid plus an overall accuracy line.
+//
+// The callbacks carry an opaque Data pointer (e.g. a TNNet, a sampler, or a
+// test stand-in's state) so no globals are needed. NeedleFact should embed the
+// answer; NeedleAnswer is the token actually looked for in the output;
+// Question is the retrieval prompt that triggers recall. Empty axis arrays
+// yield an empty grid with Accuracy 0. Returns the full grid; .Report holds
+// the rendered string (also the function-style overload's Result).
+// Coded by Claude (AI).
+function NeedleInHaystackReport(
+  const ContextLengths: array of integer;
+  const DepthFractions: array of TNeuralFloat;
+  const NeedleFact, NeedleAnswer, Question: string;
+  Filler: TNeedleFillerCallback;
+  Generate: TNeedleGenerateCallback;
+  Data: Pointer): TNeedleInHaystackResult; overload;
+
+// Convenience overload that drives a real char-level TNNet through DecodeGreedy
+// (MaxLen generated chars) and a built-in repeating-lorem filler. The needle
+// answer match is the same case-insensitive substring test. This is the path
+// used to evaluate RoPE-scaling / KV-cache-eviction on a TinyStories-scale
+// char model the repo can run on CPU.
+// Coded by Claude (AI).
+function NeedleInHaystackReport(NN: TNNet;
+  const ContextLengths: array of integer;
+  const DepthFractions: array of TNeuralFloat;
+  const NeedleFact, NeedleAnswer, Question: string;
+  MaxLen: integer): TNeedleInHaystackResult; overload;
 
 implementation
 
@@ -5444,6 +5530,144 @@ begin
   if Length(All) > 0
   then Result := Copy(All[0].Tokens, 0, Length(All[0].Tokens))
   else SetLength(Result, 0);
+end;
+
+// ---------------------------------------------------------------------------
+// Needle-in-a-haystack harness implementation.
+
+// Insert NeedleFact into Filler at depth DepthFraction (0..1), snapped to the
+// nearest space so a word is never sliced mid-token. Depth 0 prepends, depth 1
+// appends.
+function NeedleSpliceAt(const Filler, NeedleFact: string;
+  DepthFraction: TNeuralFloat): string;
+var
+  Len, Pos: integer;
+begin
+  Len := Length(Filler);
+  if DepthFraction < 0 then DepthFraction := 0;
+  if DepthFraction > 1 then DepthFraction := 1;
+  Pos := Round(DepthFraction * Len);
+  if Pos < 0 then Pos := 0;
+  if Pos > Len then Pos := Len;
+  // Snap forward to the next space so we splice on a word boundary.
+  while (Pos > 0) and (Pos < Len) and (Filler[Pos] <> ' ') do Inc(Pos);
+  Result := Copy(Filler, 1, Pos);
+  if (Result <> '') and (Result[Length(Result)] <> ' ') then Result := Result + ' ';
+  Result := Result + NeedleFact + ' ';
+  Result := Result + Copy(Filler, Pos + 1, Len - Pos);
+end;
+
+function NeedleInHaystackReport(
+  const ContextLengths: array of integer;
+  const DepthFractions: array of TNeuralFloat;
+  const NeedleFact, NeedleAnswer, Question: string;
+  Filler: TNeedleFillerCallback;
+  Generate: TNeedleGenerateCallback;
+  Data: Pointer): TNeedleInHaystackResult;
+var
+  d, c: integer;
+  FillerText, Haystack, Prompt, Output, AnswerLow: string;
+  Cell: TNeedleCell;
+  S: TStringList;
+  Line: string;
+begin
+  SetLength(Result.DepthFractions, Length(DepthFractions));
+  for d := 0 to High(DepthFractions) do Result.DepthFractions[d] := DepthFractions[d];
+  SetLength(Result.ContextLengths, Length(ContextLengths));
+  for c := 0 to High(ContextLengths) do Result.ContextLengths[c] := ContextLengths[c];
+
+  SetLength(Result.Cells, Length(DepthFractions), Length(ContextLengths));
+  Result.HitCount := 0;
+  Result.TotalCount := 0;
+  AnswerLow := LowerCase(NeedleAnswer);
+
+  for d := 0 to High(DepthFractions) do
+    for c := 0 to High(ContextLengths) do
+    begin
+      FillerText := Filler(ContextLengths[c], Data);
+      Haystack := NeedleSpliceAt(FillerText, NeedleFact, DepthFractions[d]);
+      Prompt := Haystack + ' ' + Question;
+      Output := Generate(Prompt, Data);
+
+      Cell.ContextLen := ContextLengths[c];
+      Cell.DepthFraction := DepthFractions[d];
+      Cell.Prompt := Prompt;
+      Cell.Output := Output;
+      Cell.Hit := (AnswerLow <> '') and (Pos(AnswerLow, LowerCase(Output)) > 0);
+      Result.Cells[d][c] := Cell;
+
+      Inc(Result.TotalCount);
+      if Cell.Hit then Inc(Result.HitCount);
+    end;
+
+  if Result.TotalCount > 0
+  then Result.Accuracy := Result.HitCount / Result.TotalCount
+  else Result.Accuracy := 0;
+
+  // Render the grid: rows = depth %, cols = context length.
+  S := TStringList.Create;
+  try
+    S.Add('Needle-in-a-Haystack retrieval grid (. = miss, X = hit)');
+    Line := 'depth\len ';
+    for c := 0 to High(ContextLengths) do
+      Line := Line + Format('%7d', [ContextLengths[c]]);
+    S.Add(Line);
+    for d := 0 to High(DepthFractions) do
+    begin
+      Line := Format('%7.0f%% ', [DepthFractions[d] * 100]);
+      for c := 0 to High(ContextLengths) do
+        if Result.Cells[d][c].Hit
+        then Line := Line + '      X'
+        else Line := Line + '      .';
+      S.Add(Line);
+    end;
+    S.Add(Format('Overall: %d/%d retrieved (%.1f%% accuracy)',
+      [Result.HitCount, Result.TotalCount, Result.Accuracy * 100]));
+    Result.Report := S.Text;
+  finally
+    S.Free;
+  end;
+end;
+
+type
+  // Carries the TNNet and MaxLen through the convenience overload's callbacks.
+  TNeedleGreedyContext = record
+    NN: TNNet;
+    MaxLen: integer;
+  end;
+  PNeedleGreedyContext = ^TNeedleGreedyContext;
+
+function NeedleLoremFiller(CharCount: integer; Data: Pointer): string;
+const
+  cLorem = 'the quick brown fox jumps over the lazy dog while a calm river ' +
+           'flows past green hills and a small village sleeps under stars ';
+begin
+  Result := '';
+  while Length(Result) < CharCount do Result := Result + cLorem;
+  Result := Copy(Result, 1, CharCount);
+end;
+
+function NeedleGreedyGenerate(const Prompt: string; Data: Pointer): string;
+var
+  Ctx: PNeedleGreedyContext;
+begin
+  Ctx := PNeedleGreedyContext(Data);
+  Result := DecodeGreedy(Ctx^.NN, Prompt, Ctx^.MaxLen).Text;
+end;
+
+function NeedleInHaystackReport(NN: TNNet;
+  const ContextLengths: array of integer;
+  const DepthFractions: array of TNeuralFloat;
+  const NeedleFact, NeedleAnswer, Question: string;
+  MaxLen: integer): TNeedleInHaystackResult;
+var
+  Ctx: TNeedleGreedyContext;
+begin
+  Ctx.NN := NN;
+  Ctx.MaxLen := MaxLen;
+  Result := NeedleInHaystackReport(ContextLengths, DepthFractions,
+    NeedleFact, NeedleAnswer, Question,
+    @NeedleLoremFiller, @NeedleGreedyGenerate, @Ctx);
 end;
 
 end.

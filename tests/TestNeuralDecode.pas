@@ -193,6 +193,12 @@ type
     procedure TestSeq2SeqBeamBeatsGreedyFirstTokenTrap;
     procedure TestSeq2SeqBeamFinishedPoolLengthPenaltyFlipsRanking;
     procedure TestSeq2SeqBeamDeterministicCapsAndValidation;
+    // Needle-in-a-haystack long-context eval harness (no model: deterministic
+    // string stand-ins exercise insertion/grid/accuracy mechanics).
+    procedure TestNeedleHaystackGridShapeMatchesAxes;
+    procedure TestNeedleHaystackPerfectRetrieverIs100Percent;
+    procedure TestNeedleHaystackNeverRetrieverIsZeroPercent;
+    procedure TestNeedleHaystackInsertsNeedleAtRequestedDepth;
   end;
 
 implementation
@@ -212,6 +218,43 @@ end;
 function FirstChar(const Generated: string): string;
 begin
   if Generated = '' then Result := '' else Result := Generated[1];
+end;
+
+// ---- Needle-in-a-haystack deterministic stand-in callbacks (no model) ----
+// Filler: deterministic, space-separated, never contains the needle answer.
+function NeedleTestFiller(CharCount: integer; Data: Pointer): string;
+const cWord = 'word ';
+begin
+  Result := '';
+  while Length(Result) < CharCount do Result := Result + cWord;
+  Result := Copy(Result, 1, CharCount);
+end;
+
+// Perfect retriever: echoes the needle answer ("42") only when the retrieval
+// question is present in the prompt, simulating an oracle model. This exercises
+// the full pipeline (insertion -> prompt assembly -> hit detection) at 100%.
+function NeedlePerfectGen(const Prompt: string; Data: Pointer): string;
+begin
+  if Pos('magic number', LowerCase(Prompt)) > 0
+  then Result := 'The answer is 42.'
+  else Result := 'I do not know.';
+end;
+
+// Never retriever: never emits the answer -> 0% accuracy.
+function NeedleNeverGen(const Prompt: string; Data: Pointer): string;
+begin
+  Result := 'I do not know.';
+end;
+
+// Depth-probe generator: returns whatever 8 characters follow the needle fact
+// in the prompt, so the test can confirm the needle was actually spliced in
+// (and the question still trails it). Reports the answer iff the splice is
+// intact ("42" appears).
+function NeedleDepthProbeGen(const Prompt: string; Data: Pointer): string;
+var P: integer;
+begin
+  P := Pos('magic number is 42', LowerCase(Prompt));
+  if P > 0 then Result := '42' else Result := 'missing';
 end;
 
 function TTestNeuralDecode.BuildTinyNet(ContextLen, Vocab: integer): TNNet;
@@ -4834,6 +4877,95 @@ begin
     Dec.Free;
     Enc.Free;
   end;
+end;
+
+// ---------------------------------------------------------------------------
+// Needle-in-a-haystack harness tests (deterministic, no trained model).
+
+procedure TTestNeuralDecode.TestNeedleHaystackGridShapeMatchesAxes;
+const
+  Lengths: array[0..2] of integer = (50, 100, 200);
+  Depths: array[0..3] of TNeuralFloat = (0.0, 0.33, 0.66, 1.0);
+var
+  R: TNeedleInHaystackResult;
+begin
+  R := NeedleInHaystackReport(Lengths, Depths,
+    'The magic number is 42.', '42', 'What is the magic number?',
+    @NeedleTestFiller, @NeedlePerfectGen, nil);
+  AssertEquals('rows = number of depth fractions', Length(Depths),
+    Length(R.Cells));
+  AssertEquals('cols = number of context lengths', Length(Lengths),
+    Length(R.Cells[0]));
+  AssertEquals('total cells = rows * cols',
+    Length(Depths) * Length(Lengths), R.TotalCount);
+  AssertEquals('depth axis preserved', Length(Depths),
+    Length(R.DepthFractions));
+  AssertEquals('length axis preserved', Length(Lengths),
+    Length(R.ContextLengths));
+end;
+
+procedure TTestNeuralDecode.TestNeedleHaystackPerfectRetrieverIs100Percent;
+const
+  Lengths: array[0..1] of integer = (60, 120);
+  Depths: array[0..2] of TNeuralFloat = (0.0, 0.5, 1.0);
+var
+  R: TNeedleInHaystackResult;
+begin
+  R := NeedleInHaystackReport(Lengths, Depths,
+    'The magic number is 42.', '42', 'What is the magic number?',
+    @NeedleTestFiller, @NeedlePerfectGen, nil);
+  AssertEquals('oracle retrieves every cell', R.TotalCount, R.HitCount);
+  AssertEquals('accuracy is 1.0', 1.0, R.Accuracy, 1e-6);
+  // Rendered report must show only hit markers and the 100% summary.
+  AssertTrue('report contains a hit marker (X)', Pos('X', R.Report) > 0);
+  AssertTrue('report contains no miss marker (.)',
+    Pos(' .', R.Report) = 0);
+  AssertTrue('report shows 100.0% accuracy',
+    Pos('100.0% accuracy', R.Report) > 0);
+end;
+
+procedure TTestNeuralDecode.TestNeedleHaystackNeverRetrieverIsZeroPercent;
+const
+  Lengths: array[0..1] of integer = (60, 120);
+  Depths: array[0..2] of TNeuralFloat = (0.0, 0.5, 1.0);
+var
+  R: TNeedleInHaystackResult;
+begin
+  R := NeedleInHaystackReport(Lengths, Depths,
+    'The magic number is 42.', '42', 'What is the magic number?',
+    @NeedleTestFiller, @NeedleNeverGen, nil);
+  AssertEquals('never-retriever scores no hits', 0, R.HitCount);
+  AssertEquals('accuracy is 0.0', 0.0, R.Accuracy, 1e-6);
+  AssertTrue('report contains a miss marker (.)', Pos('.', R.Report) > 0);
+  AssertTrue('report shows 0.0% accuracy',
+    Pos('0.0% accuracy', R.Report) > 0);
+end;
+
+procedure TTestNeuralDecode.TestNeedleHaystackInsertsNeedleAtRequestedDepth;
+const
+  Lengths: array[0..0] of integer = (80);
+  Depths: array[0..2] of TNeuralFloat = (0.0, 0.5, 1.0);
+var
+  R: TNeedleInHaystackResult;
+  d: integer;
+  NeedlePos: integer;
+begin
+  // The depth-probe generator only answers if "magic number is 42" survived
+  // splicing intact at EVERY depth -> all hits proves correct insertion.
+  R := NeedleInHaystackReport(Lengths, Depths,
+    'The magic number is 42.', '42', 'What is the magic number?',
+    @NeedleTestFiller, @NeedleDepthProbeGen, nil);
+  AssertEquals('needle intact at all depths', R.TotalCount, R.HitCount);
+  // Splice position must MOVE with depth: start prompt has the needle near the
+  // front, end prompt near the back.
+  for d := 0 to High(Depths) do
+  begin
+    NeedlePos := Pos('magic number is 42', LowerCase(R.Cells[d][0].Prompt));
+    AssertTrue('needle present in cell prompt', NeedlePos > 0);
+  end;
+  AssertTrue('depth 0 needle is earlier than depth 1 needle',
+    Pos('magic number is 42', LowerCase(R.Cells[0][0].Prompt)) <
+    Pos('magic number is 42', LowerCase(R.Cells[High(Depths)][0].Prompt)));
 end;
 
 initialization
