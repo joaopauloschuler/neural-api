@@ -86,6 +86,7 @@ rather than acted on.
       example-side SetExceptionMask workaround — consider masking/guarding the
       denormals inside the layer's FFT so callers don't have to.
 - [ ] ulimit -v 3000000 ChatTerminal /path/to/Qwen2.5-0.5B-Instruct crashes using all RAM at loading the model
+      Tested with !git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
 
 ## Infrastructure / dev experience
 
