@@ -147,16 +147,6 @@ rather than acted on.
       int8 matmul kernels (AVX2 maddubs / dot-product paths) so quantized
       layers stop paying the per-forward dequantize cost; today the int8
       win is RAM only — compute still runs the FP32 kernels.
-- [X] Quantized inference follow-up: thread pQuantizeInt8 through the
-      remaining importer entry points that do NOT ride
-      BuildLlamaFromSafeTensorsWithConfig (GPT-Neo/NeoX/J, Phi, BERT family,
-      BLOOM, RWKV, Mamba, T5/Marian, DeepSeek-V2 MoE) — mechanical: same
-      construction-sweep + loader-refill pattern; loaders already
-      auto-dequantize (EnsureWritableImportWeights). (Landed: all of the
-      above + ModernBERT, the seq-cls wrappers, the Mistral/Qwen/Gemma/
-      Phi-3 wrapper chain and BuildFromPretrained; 12 pico drift tests
-      gated at 5e-2 relative. Whisper and CLIP remain FP32-only — wire
-      them if int8 audio/vision import is ever needed.)
 - [ ] Quantized inference follow-up: GPTQ/AWQ-style calibrated quantization
       (error-compensating rounding / activation-aware scale search) and
       4-bit (int4 pairs packed per byte, group-wise scales); also quantized
@@ -285,20 +275,6 @@ rather than acted on.
       default-system injection); read the separate chat_template.jinja
       file newer transformers exports alongside tokenizer_config.json;
       continue_final_message / return_assistant_tokens_mask equivalents.
-- [X] resize_token_embeddings equivalent: grow/shrink the token embedding +
-      (landed: TNNet.ResizeTokenEmbeddings, mean-init rows, copy-tied head
-      kept equal, int8/inference-only safe)
-      LM-head vocab of an imported model (mean-init new rows, keep tied
-      heads consistent, update FStruct vocab sizes). Needed the moment
-      anyone adds special tokens to fine-tune on top of the Llama/GPT-2
-      importers.
-- [X] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
-      de-facto checkpoint format, and it ships PRE-quantized weights —
-      dovetails with the landed int8 quantized inference (read Q8_0 blocks
-      directly instead of quantizing FP32 yourself). (landed:
-      neural/neuralgguf.pas TNNetGGUFReader F32/F16/Q8_0 +
-      BuildLlamaFromGGUF; Q8_0 still dequantizes to FP32 at load — the
-      direct-into-int8-storage path remains open)
 - [ ] Magnitude pruning (torch.nn.utils.prune port): PERSISTENT global or
       per-layer magnitude masks applied during training/inference — the
       diagnostics half is landed (TNNet.MagnitudePruningReport +
@@ -546,19 +522,12 @@ rather than acted on.
       alternatively (or additionally) regex -> DFA. Test: a small
       arithmetic-expression grammar accepts only valid strings across
       greedy/sampled decoding, and forked beams keep independent states.
-- [X] Token healing (guidance-style): back up over the LAST prompt token
-      (landed: TNNetTokenHealingConstraint + PrepareTokenHealing +
-      TGenerationConfig.TokenHealing; still open: PrepareTokenHealing is
-      TStringListInt-only — a TNeuralHFTokenizer byte-level-BPE variant
-      needs a vocab prefix-scan helper there — and guidance-style
-      multi-token rollback)
-      and constrain the first generated token to extensions of its text,
-      fixing the classic BPE boundary artifact ("http:" never continuing
-      to "//" because the prompt split mid-merge). ~30 lines on top of the
-      constraint machinery + tokenizer vocab prefix lookup;
-      disproportionate quality win for completion-style prompts. Test: a
-      pinned vocab where the healed and unhealed first-token distributions
-      provably differ.
+- [ ] Token healing follow-ups (v1 is landed: TNNetTokenHealingConstraint +
+      PrepareTokenHealing + TGenerationConfig.TokenHealing):
+      (a) PrepareTokenHealing is TStringListInt-only — a TNeuralHFTokenizer
+      byte-level-BPE variant needs a vocab prefix-scan helper there;
+      (b) guidance-style multi-token rollback (back up over more than the
+      single last prompt token when the boundary artifact spans merges).
 - [ ] Weighted top-k sampler with HF semantics: TNNetSamplerTopK draws
       UNIFORMLY among the top K instead of by renormalized probability
       (long-standing gotcha; examples/GPT2Import and examples/ChatTerminal
@@ -839,7 +808,3 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       with loss-difference direction >90% of the time across a small grid.
 - [ ] Coverage matrix at the top of TestNeuralNumerical.pas: per-class
       `[grad] [serialize]` block, written by a small script.
-
-# Examples
-- [X] A chat terminal application with option to select the model to import
-      and inference parameters.
