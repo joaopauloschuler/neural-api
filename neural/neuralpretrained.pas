@@ -2284,6 +2284,92 @@ procedure BuildMBartFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // ---------------------------------------------------------------------------
+// M2M100 / NLLB IMPORT (model_type "m2m_100": the facebook/m2m100_* and
+// facebook/nllb-200-* multilingual translation checkpoints; architectures
+// ["M2M100ForConditionalGeneration"]) - the SINUSOIDAL-position cousin of
+// mBART, and the REMAINING piece of the BART-family follow-up. M2M100 is
+// EXACTLY Pegasus's pre-norm encoder-decoder body with three deltas:
+//   - SINUSOIDAL positions (M2M100SinusoidalPositionalEmbedding) like
+//     Marian/Pegasus, BUT with the half-split base log(10000)/(half-1) AND a
+//     +2 offset: token position p reads sinusoidal row p+2 (HF position_ids
+//     start at padding_idx+1 = 2). FillM2M100SinusoidalPositions regenerates
+//     the static table - HF drops embed_positions via _keys_to_ignore_on_save;
+//   - NO layernorm_embedding (mBART has one; M2M100, like Pegasus, does NOT);
+//   - a ReLU FFN (activation_function="relu" on every published M2M100 and
+//     NLLB checkpoint) instead of Pegasus/mBART's exact-erf GELU. The shared
+//     BuildPegasusStackBlocks grows the relu FFN via its UseReluFFN flag.
+// Everything else matches mBART/Pegasus: PRE-NORM blocks (the per-block norm
+// tensor names are identical, so LoadMarianStack is reused verbatim), a FINAL
+// encoder AND decoder layer_norm closing each pre-norm stack, scale_embedding
+// (default ON; sqrt(d_model) folds into the embedding rows), shared
+// source/target embedding TIED to the lm_head plus a final_logits_bias row,
+// all q/k/v/out/fc Linears biased, 1/sqrt(head_dim) attention, biased
+// nn.LayerNorm (eps 1e-5), pad_token_id = 1 / bos = 0 / eos = 2 /
+// decoder_start = eos. NLLB-200 and base M2M100 share this exact body (HF has
+// no normalize_before branch for m2m_100 - both are pre-norm). The raw
+// sentencepiece.bpe.model tokenizer is a separate open task; this importer
+// covers the MODEL only (teacher-forced parity on a pinned (enc ids, dec ids)
+// pair). BuildFromPretrained does NOT dispatch "m2m_100" (it returns ONE net);
+// it raises an error pointing here instead.
+
+type
+  TM2M100Config = record
+    DModel: integer;            // d_model (hidden width; must be EVEN)
+    EncoderLayers: integer;     // encoder_layers
+    DecoderLayers: integer;     // decoder_layers
+    EncoderHeads: integer;      // encoder_attention_heads
+    DecoderHeads: integer;      // decoder_attention_heads
+    EncoderFFNDim: integer;     // encoder_ffn_dim
+    DecoderFFNDim: integer;     // decoder_ffn_dim
+    VocabSize: integer;         // vocab_size
+    MaxPositionEmbeddings: integer; // max_position_embeddings
+    PadTokenId: integer;        // pad_token_id (default 1)
+    BosTokenId: integer;        // bos_token_id (default 0)
+    EosTokenId: integer;        // eos_token_id (default 2)
+    DecoderStartTokenId: integer; // decoder_start_token_id (= eos)
+    ScaleEmbedding: boolean;    // scale_embedding (sqrt(d_model); default ON)
+    ModelType: string;          // 'm2m_100'
+  end;
+
+// Reads a HF M2M100/NLLB config.json (model_type "m2m_100"). Required:
+// d_model, encoder_layers, decoder_layers, encoder_attention_heads,
+// decoder_attention_heads, encoder_ffn_dim (or ffn_dim), decoder_ffn_dim (or
+// ffn_dim), vocab_size. Defaults follow M2M100Config: max_position_embeddings
+// = 1024, pad_token_id = 1, bos_token_id = 0, eos_token_id = 2,
+// decoder_start_token_id = eos_token_id, scale_embedding = true.
+// activation_function must be "relu" (every published M2M100/NLLB pins it).
+// tie_word_embeddings = false is REJECTED.
+function ReadM2M100ConfigFromJSONFile(const FileName: string): TM2M100Config;
+
+function M2M100ConfigToString(const Config: TM2M100Config): string;
+
+// Builds the M2M100/NLLB ENCODER and DECODER nets and loads every weight from
+// the safetensors checkpoint at FileName (see the M2M100 IMPORT section
+// above). EncSeqLen/DecSeqLen fix the two sequence lengths at build time and
+// must not exceed max_position_embeddings (the static sinusoidal tables are
+// generated for exactly these lengths). Both nets are owned by the caller.
+// Run the pair with RunT5 (the two-net convention shared with the
+// T5/Marian/BART/Pegasus/mBART importers); the DECODER's second TNNetInput
+// holds the encoder hidden states (T5EncoderStatesInput).
+procedure BuildM2M100FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, but takes the already-read Config by value (the ...Ex naming).
+procedure BuildM2M100FromSafeTensorsEx(const FileName: string;
+  Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildM2M100FromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TM2M100Config;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+
+// ---------------------------------------------------------------------------
 // WHISPER IMPORT (model_type "whisper": the openai/whisper-* speech-to-text
 // checkpoints; architectures ["WhisperForConditionalGeneration"]) - the
 // FIRST SPEECH importer and the THIRD encoder-decoder import after T5 and
@@ -13688,6 +13774,39 @@ begin
   Layer.FlushWeightCache();
 end;
 
+// Fills a TNNetLearnedPositionalEmbedding table with the M2M100/NLLB
+// sinusoidal positions (M2M100SinusoidalPositionalEmbedding). The half-split
+// layout matches Marian/Pegasus (sin in the first d/2 columns, cos in the
+// second), BUT the frequency base is log(10000)/(half-1) - NOT the
+// /d_model spacing of FillMarianSinusoidalPositions - and the token at
+// (0-based) position p reads table row p + 2 (HF position_ids start at
+// padding_idx + 1 = 2; the padding-idx row is never reached for non-pad
+// sequences). The whole table is a pure function of d_model, so the importer
+// regenerates it (HF drops embed_positions via _keys_to_ignore_on_save).
+procedure FillM2M100SinusoidalPositions(Layer: TNNetLayer;
+  SeqLen, DModel: integer);
+const
+  M2M100PositionOffset = 2;
+var
+  PosCnt, ChCnt, Half, Row: integer;
+  EmbConst, Angle: double;
+begin
+  Half := DModel div 2;
+  EmbConst := Ln(10000.0) / (Half - 1);
+  for PosCnt := 0 to SeqLen - 1 do
+  begin
+    Row := PosCnt + M2M100PositionOffset;
+    for ChCnt := 0 to Half - 1 do
+    begin
+      Angle := Row * Exp(-ChCnt * EmbConst);
+      Layer.Neurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
+      Layer.Neurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
+        Cos(Angle);
+    end;
+  end;
+  Layer.FlushWeightCache();
+end;
+
 // Loads one Marian attention sub-block's q/k/v/out projections (HF
 // nn.Linear [d_model, d_model], ALL biased) plus its post-residual
 // LayerNorm (NormPrefix, weight+bias).
@@ -14577,7 +14696,8 @@ end;
 procedure BuildPegasusStackBlocks(NN: TNNet; const Config: TPegasusConfig;
   NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
   EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
-  pInferenceOnly: boolean; pQuantizeInt8: boolean = false);
+  pInferenceOnly: boolean; pQuantizeInt8: boolean = false;
+  UseReluFFN: boolean = false);
 var
   HeadDim, BlockCnt, HeadCnt, d: integer;
   ResidualInput, NormedInput, HiddenAct, PhiBranch: TNNetLayer;
@@ -14664,23 +14784,31 @@ begin
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
     end;
 
-    // ---- FFN sub-block (PRE-norm): fc2(gelu(fc1(LN(x)))) + x ----
+    // ---- FFN sub-block (PRE-norm): fc2(act(fc1(LN(x)))) + x ----
     ResidualInput := NN.GetLastLayer();
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
       TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
     Blocks[BlockCnt].Fc1 := NN.AddLayer(
       TNNetPointwiseConvLinear.Create(FFNDim) );
-    // EXACT erf GELU x*Phi(x), the same BERT/BART composition: Phi on a side
-    // branch, then ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x (Phi in (0,1)). ReGLU
-    // applies the ReLU to the FIRST depth half, so Phi must come first.
-    HiddenAct := NN.GetLastLayer();
-    NN.AddLayerAfter(
-      TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
-    NN.AddLayer( TNNetErf.Create() );
-    NN.AddLayer( TNNetAddConstant.Create(1.0) );
-    PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
-    NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
-    NN.AddLayer( TNNetReGLU.Create() );
+    if UseReluFFN then
+    begin
+      // Plain ReLU FFN (M2M100/NLLB use activation_function="relu").
+      NN.AddLayer( TNNetReLU.Create() );
+    end
+    else
+    begin
+      // EXACT erf GELU x*Phi(x), the same BERT/BART composition: Phi on a side
+      // branch, then ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x (Phi in (0,1)). ReGLU
+      // applies the ReLU to the FIRST depth half, so Phi must come first.
+      HiddenAct := NN.GetLastLayer();
+      NN.AddLayerAfter(
+        TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+      NN.AddLayer( TNNetErf.Create() );
+      NN.AddLayer( TNNetAddConstant.Create(1.0) );
+      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+      NN.AddLayer( TNNetReGLU.Create() );
+    end;
     Blocks[BlockCnt].Fc2 := NN.AddLayer(
       TNNetPointwiseConvLinear.Create(Config.DModel) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
@@ -15284,6 +15412,377 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMBartConfigFromJSONFile(ConfigPath);
   BuildMBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+// ===========================================================================
+// M2M100 / NLLB IMPORT (sinusoidal-position +relu cousin of mBART/Pegasus)
+// ===========================================================================
+
+function ReadM2M100ConfigFromJSONFile(const FileName: string): TM2M100Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('M2M100 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('M2M100 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+  // encoder_ffn_dim / decoder_ffn_dim, falling back to the shared "ffn_dim"
+  // some fairseq-converted m2m_100 configs use.
+  function FFNDim(const PrimaryField: string): integer;
+  begin
+    if Obj.IndexOfName(PrimaryField) >= 0 then
+      Result := Obj.Get(PrimaryField, 0)
+    else if Obj.IndexOfName('ffn_dim') >= 0 then
+      Result := Obj.Get('ffn_dim', 0)
+    else
+      ImportError('M2M100 import: config "' + FileName +
+        '" is missing "' + PrimaryField + '" (and the "ffn_dim" fallback).');
+    if Result <= 0 then
+      ImportError('M2M100 import: FFN dim "' + PrimaryField +
+        '" must be positive, got ' + IntToStr(Result) + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('M2M100 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('M2M100 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('M2M100 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'm2m_100');
+    if ModelType <> 'm2m_100' then
+      ImportError('M2M100 import: config model_type is "' + ModelType +
+        '" - only "m2m_100" is supported here (NLLB uses m2m_100; see ' +
+        'BuildFromPretrained for the full dispatch).');
+    Result.ModelType := ModelType;
+    Result.DModel := RequiredInt('d_model');
+    Result.EncoderLayers := RequiredInt('encoder_layers');
+    Result.DecoderLayers := RequiredInt('decoder_layers');
+    Result.EncoderHeads := RequiredInt('encoder_attention_heads');
+    Result.DecoderHeads := RequiredInt('decoder_attention_heads');
+    Result.EncoderFFNDim := FFNDim('encoder_ffn_dim');
+    Result.DecoderFFNDim := FFNDim('decoder_ffn_dim');
+    Result.VocabSize := RequiredInt('vocab_size');
+    if Odd(Result.DModel) then
+      ImportError('M2M100 import: d_model must be EVEN (the half-split ' +
+        'sinusoidal table), got ' + IntToStr(Result.DModel) + '.');
+    Result.MaxPositionEmbeddings :=
+      Obj.Get('max_position_embeddings', 1024);
+    // HF M2M100Config defaults (pad 1 / bos 0 / eos 2; decoder start = eos).
+    Result.PadTokenId := Obj.Get('pad_token_id', 1);
+    Result.BosTokenId := Obj.Get('bos_token_id', 0);
+    Result.EosTokenId := Obj.Get('eos_token_id', 2);
+    Result.DecoderStartTokenId :=
+      Obj.Get('decoder_start_token_id', Result.EosTokenId);
+    // M2M100/NLLB pin scale_embedding=true (sqrt(d_model) on the embeddings).
+    Result.ScaleEmbedding := Obj.Get('scale_embedding', True);
+    // Only the published M2M100/NLLB recipe ("relu") is supported; gelu /
+    // gelu_new / swish are rejected to avoid a silent activation mismatch.
+    ActFn := Obj.Get('activation_function', 'relu');
+    if ActFn <> 'relu' then
+      ImportError('M2M100 import: activation_function "' + ActFn +
+        '" is not supported - expected "relu" (every published M2M100/NLLB ' +
+        'pins it).');
+    if not Obj.Get('tie_word_embeddings', True) then
+      ImportError('M2M100 import: tie_word_embeddings=false is not ' +
+        'supported - M2M100 ties the lm_head to the shared embedding.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function M2M100ConfigToString(const Config: TM2M100Config): string;
+begin
+  if Config.ModelType = '' then Result := 'm2m_100'
+  else Result := Config.ModelType;
+  Result := Result + ' config: enc_layers=' +
+    IntToStr(Config.EncoderLayers) +
+    ', dec_layers=' + IntToStr(Config.DecoderLayers) +
+    ', enc_heads=' + IntToStr(Config.EncoderHeads) +
+    ', dec_heads=' + IntToStr(Config.DecoderHeads) +
+    ', d_model=' + IntToStr(Config.DModel) +
+    ', enc_ffn=' + IntToStr(Config.EncoderFFNDim) +
+    ', dec_ffn=' + IntToStr(Config.DecoderFFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings) +
+    ', pad=' + IntToStr(Config.PadTokenId) +
+    ', eos=' + IntToStr(Config.EosTokenId) +
+    ', dec_start=' + IntToStr(Config.DecoderStartTokenId) +
+    ', scale_embedding=' + BoolToStr(Config.ScaleEmbedding, true) +
+    ', ffn=relu (pre-norm, sinusoidal +2)';
+end;
+
+procedure BuildM2M100FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TMarianBlockArray;
+  EncEmbed, DecEmbed, EncPos, DecPos, EncFinalLN, DecFinalLN: TNNetLayer;
+  DecTokenInput, EncStates, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+  // LoadMarianStack reads only .DModel; BuildPegasusStackBlocks takes a
+  // TPegasusConfig and also reads only .DModel. Both shims carry d_model so
+  // the shared helpers work unchanged - M2M100 is mBART's pre-norm body with
+  // sinusoidal positions and a relu FFN.
+  MarianShim: TMarianConfig;
+  PegShim: TPegasusConfig;
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  // ---------------- Config validation ----------------
+  if EncSeqLen < 1 then
+    ImportError('M2M100 import: EncSeqLen must be >= 1, got ' +
+      IntToStr(EncSeqLen) + '.');
+  if DecSeqLen < 1 then
+    ImportError('M2M100 import: DecSeqLen must be >= 1, got ' +
+      IntToStr(DecSeqLen) + '.');
+  if (EncSeqLen > Config.MaxPositionEmbeddings) or
+     (DecSeqLen > Config.MaxPositionEmbeddings) then
+    ImportError('M2M100 import: EncSeqLen/DecSeqLen must not exceed ' +
+      'max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+  if Odd(Config.DModel) then
+    ImportError('M2M100 import: d_model must be EVEN (the half-split ' +
+      'sinusoidal table), got ' + IntToStr(Config.DModel) + '.');
+  if (Config.EncoderHeads < 1) or
+     ((Config.DModel mod Config.EncoderHeads) <> 0) then
+    ImportError('M2M100 import: encoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.EncoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  if (Config.DecoderHeads < 1) or
+     ((Config.DModel mod Config.DecoderHeads) <> 0) then
+    ImportError('M2M100 import: decoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.DecoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  PegShim.DModel := Config.DModel;
+  try
+    try
+      if not Reader.HasTensor('model.shared.weight') then
+        ImportError('M2M100 import: "model.shared.weight" not found in ' +
+          Reader.FileName + ' - not an M2M100 checkpoint?');
+      if (Reader.DimCount('model.shared.weight') <> 2) or
+         (Reader.DimSize('model.shared.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize('model.shared.weight', 1) <> Config.DModel) then
+        ImportError('M2M100 import: model.shared.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.DModel) +
+          '], got ' + Reader.ShapeAsString('model.shared.weight'));
+      // final_logits_bias is OPTIONAL: transformers >= 5 dropped it from
+      // M2M100 entirely (bias-free lm_head), while older published NLLB/
+      // M2M100 checkpoints carry an all-ZERO [1, vocab] buffer. When present
+      // it must have the right shape; when absent the head bias is left zero.
+      if Reader.HasTensor('final_logits_bias') then
+        if (Reader.DimCount('final_logits_bias') <> 2) or
+           (Reader.DimSize('final_logits_bias', 0) <> 1) or
+           (Reader.DimSize('final_logits_bias', 1) <> Config.VocabSize) then
+          ImportError('M2M100 import: final_logits_bias must have shape ' +
+            '[1, ' + IntToStr(Config.VocabSize) + '], got ' +
+            Reader.ShapeAsString('final_logits_bias'));
+
+      // ---------------- Encoder architecture ----------------
+      // Pegasus front-end: token embedding -> static sinusoidal positions
+      // (+2 offset), NO layernorm_embedding. PRE-norm relu blocks then a
+      // FINAL encoder layer_norm.
+      Enc := TNNet.Create();
+      Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
+      EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+      EncPos := Enc.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Enc, PegShim, Config.EncoderLayers,
+        Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
+        nil, EncBlocks, pInferenceOnly, pQuantizeInt8, {UseReluFFN=}true);
+      EncFinalLN := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+
+      // ---------------- Decoder architecture ----------------
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
+        Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8,
+        {UseReluFFN=}true);
+      DecFinalLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('M2M100 import: model.shared.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+        if Config.ScaleEmbedding then
+          EmbedScale := Sqrt(Config.DModel)
+        else
+          EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+        begin
+          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        end;
+        EncEmbed.FlushWeightCache();
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('model.shared.weight');
+        // Tied head: logits = h . shared^T + final_logits_bias (UNSCALED).
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+          for i := 0 to Config.DModel - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.DModel + i];
+        // final_logits_bias is optional (see the validation note above): a
+        // zero head bias is the default for the bias-free transformers-5 head
+        // and for the all-zero buffer of older checkpoints.
+        if Reader.HasTensor('final_logits_bias') then
+        begin
+          Reader.LoadTensorFlat('final_logits_bias', Tmp);
+          for j := 0 to Config.VocabSize - 1 do
+            LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+          Consumed.Add('final_logits_bias');
+        end
+        else
+          for j := 0 to Config.VocabSize - 1 do
+            LMHead.Neurons[j].BiasWeight := 0.0;
+        LMHead.FlushWeightCache();
+        // Legacy aliases (HF drops embed_tokens/lm_head via
+        // _tied_weights_keys and the SINUSOIDAL embed_positions via
+        // _keys_to_ignore_on_save).
+        if Reader.HasTensor('lm_head.weight') then
+          Consumed.Add('lm_head.weight');
+        if Reader.HasTensor('model.encoder.embed_tokens.weight') then
+          Consumed.Add('model.encoder.embed_tokens.weight');
+        if Reader.HasTensor('model.decoder.embed_tokens.weight') then
+          Consumed.Add('model.decoder.embed_tokens.weight');
+        if Reader.HasTensor('model.encoder.embed_positions.weights') then
+          Consumed.Add('model.encoder.embed_positions.weights');
+        if Reader.HasTensor('model.decoder.embed_positions.weights') then
+          Consumed.Add('model.decoder.embed_positions.weights');
+      finally
+        Tmp.Free;
+      end;
+      // Static sinusoidal positions (half-split, +2 offset).
+      FillM2M100SinusoidalPositions(EncPos, EncSeqLen, Config.DModel);
+      FillM2M100SinusoidalPositions(DecPos, DecSeqLen, Config.DModel);
+      // Per-block weights (same names/shapes as BART/Marian; the pre-norm
+      // norms sit BEFORE each sub-layer but the tensor names are identical).
+      MarianShim.DModel := Config.DModel;
+      LoadMarianStack(Reader, EncBlocks, 'model.encoder.layers.',
+        MarianShim, Config.EncoderFFNDim, {IsDecoder=}false, Consumed);
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      LoadMarianStack(Reader, DecBlocks, 'model.decoder.layers.',
+        MarianShim, Config.DecoderFFNDim, {IsDecoder=}true, Consumed);
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // Final per-stack LayerNorms (pre-norm models close each stack).
+      LoadLayerNormWeights(Reader, EncFinalLN,
+        'model.encoder.layer_norm.weight',
+        'model.encoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.encoder.layer_norm.weight');
+      Consumed.Add('model.encoder.layer_norm.bias');
+      LoadLayerNormWeights(Reader, DecFinalLN,
+        'model.decoder.layer_norm.weight',
+        'model.decoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.decoder.layer_norm.weight');
+      Consumed.Add('model.decoder.layer_norm.bias');
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('M2M100 import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil;
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free;
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildM2M100FromSafeTensorsEx(const FileName: string;
+  Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+begin
+  BuildM2M100FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+procedure BuildM2M100FromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TM2M100Config;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadM2M100ConfigFromJSONFile(ConfigPath);
+  BuildM2M100FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
     DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
 end;
 
@@ -21788,6 +22287,16 @@ begin
     Result := nil;
     ImportError('BuildFromPretrained: model_type "mbart" builds an ' +
       'ENCODER-DECODER pair - call BuildMBartFromSafeTensors (returns ' +
+      'both nets; run them with RunT5) instead of this single-net ' +
+      'dispatch.');
+  end
+  else if ModelType = 'm2m_100' then
+  begin
+    // M2M100/NLLB is an encoder-decoder: the import builds TWO nets, which
+    // this single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "m2m_100" builds an ' +
+      'ENCODER-DECODER pair - call BuildM2M100FromSafeTensors (returns ' +
       'both nets; run them with RunT5) instead of this single-net ' +
       'dispatch.');
   end

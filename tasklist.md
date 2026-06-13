@@ -167,7 +167,7 @@ rather than acted on.
       Cohere weights on top of the synthetic fixture. Also: order_of_interleaved_layers
       (legacy cohere2 spelling) maps to sliding_window_pattern but was not seen
       in a published config — wire it if one surfaces.
-- [ ] BART-family follow-up (b): mBART DONE — BuildMBartFromSafeTensors[Ex]
+- [X] BART-family follow-up (b): mBART DONE — BuildMBartFromSafeTensors[Ex]
       (model_type "mbart") LANDED, parity ~teacher-forced logits within the
       1e-4 gate vs HF float64 oracle (tools/mbart_tiny_fixture.py,
       tests/fixtures/tiny_mbart.*, TestMBartParity). mBART = BART's embedding
@@ -175,20 +175,31 @@ rather than acted on.
       + final_logits_bias) stacked on PEGASUS-style pre-norm blocks + a FINAL
       encoder AND decoder layer_norm, so it reuses BuildPegasusStackBlocks
       verbatim and TBartConfig (model_type accepted = "mbart").
-      REMAINING: NLLB (model_type "m2m_100", the M2M100 architecture — a close
-      BART-style relative; build a BuildM2M100FromSafeTensors on the same
-      path). Tokenizer: mBART/NLLB ship a raw sentencepiece.bpe.model without a
-      tokenizer.json; the raw .model protobuf reader (LoadSentencePieceModel,
-      see Tokenizer follow-up (b) below) covers the Unigram .model that
-      mBART(-Unigram)/DeBERTa-v3/T5/ALBERT use, so the tokenizer side is
-      unblocked for those (Unigram .model is already loaded + tested via
-      tiny_spm.model / TestSentencePieceModelParity); NLLB/mBART variants that
-      ship a BPE .model still need the BPE-in-.model follow-up, and real-vocab
-      verification against a downloaded sentencepiece.bpe.model is a follow-up.
-      Also: the committed bart_tiny / tiny_pegasus / tiny_mbart fixtures are
+      NLLB / M2M100 DONE — BuildM2M100FromSafeTensors[Ex]/WithConfig +
+      TM2M100Config + ReadM2M100ConfigFromJSONFile (model_type "m2m_100",
+      NLLB's architecture) LANDED on the SAME two-net path, parity within the
+      1e-4 gate vs HF float64 oracle (tools/m2m100_tiny_fixture.py,
+      tests/fixtures/tiny_m2m100.*, TestM2M100Parity +
+      TestM2M100ConfigFromJSONFile). M2M100 = Pegasus's pre-norm body with
+      THREE deltas: SINUSOIDAL positions (new FillM2M100SinusoidalPositions:
+      half-split base log(1e4)/(half-1) WITH a +2 offset — token pos p reads
+      row p+2), NO layernorm_embedding, and a RELU FFN (new UseReluFFN flag on
+      BuildPegasusStackBlocks). NLLB-200 and base M2M100 share this exact body
+      (HF has no normalize_before branch — both pre-norm). final_logits_bias is
+      OPTIONAL (transformers >=5 dropped it; older checkpoints carry an all-zero
+      buffer). BuildFromPretrained rejects "m2m_100" with a redirect to the
+      two-net importer. Tokenizer: mBART/NLLB ship a raw sentencepiece.bpe.model
+      without a tokenizer.json; the raw .model protobuf reader
+      (LoadSentencePieceModel, see Tokenizer follow-up (b)) covers the Unigram
+      .model that mBART(-Unigram)/DeBERTa-v3/T5/ALBERT use (loaded + tested via
+      tiny_spm.model / TestSentencePieceModelParity).
+      RESIDUAL (open, minor): NLLB/mBART variants that ship a BPE .model still
+      need the BPE-in-.model follow-up; real-vocab verification against a
+      downloaded sentencepiece.bpe.model + real safetensors is a follow-up; the
+      committed bart_tiny / tiny_pegasus / tiny_mbart / tiny_m2m100 fixtures are
       single-shard, so the inherited multi-shard index.json path is untested
       for these encoder-decoders specifically — add a 2-shard fixture if a real
-      distilbart/pegasus/mbart import surfaces a bug.
+      distilbart/pegasus/mbart/nllb import surfaces a bug.
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are

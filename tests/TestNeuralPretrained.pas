@@ -218,6 +218,8 @@ type
     procedure TestPegasusParity;
     procedure TestMBartConfigFromJSONFile;
     procedure TestMBartParity;
+    procedure TestM2M100ConfigFromJSONFile;
+    procedure TestM2M100Parity;
     procedure TestWhisperConfigFromJSONFile;
     procedure TestWhisperParity;
     procedure TestClipConfigFromJSONFile;
@@ -8044,6 +8046,87 @@ begin
       T5EncoderStatesInput(Dec).Output.Size);
     AssertT5ParityWithFixture(Enc, Dec,
       FixturePath('tiny_mbart_logits.json'), 10, 6, Config.DModel,
+      Config.VocabSize);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Verifies ReadM2M100ConfigFromJSONFile on the committed M2M100/NLLB pico
+// config plus the BuildFromPretrained "m2m_100" rejection (an encoder-decoder
+// cannot be returned by the single-net dispatch; the error must redirect to
+// BuildM2M100FromSafeTensors).
+procedure TTestNeuralPretrained.TestM2M100ConfigFromJSONFile;
+var
+  Config: TM2M100Config;
+begin
+  RandSeed := 424242;
+  Config := ReadM2M100ConfigFromJSONFile(
+    FixturePath('tiny_m2m100_config.json'));
+  AssertEquals('model_type', 'm2m_100', Config.ModelType);
+  AssertEquals('d_model', 8, Config.DModel);
+  AssertEquals('enc layers', 2, Config.EncoderLayers);
+  AssertEquals('dec layers', 2, Config.DecoderLayers);
+  AssertEquals('enc heads', 2, Config.EncoderHeads);
+  AssertEquals('dec heads', 2, Config.DecoderHeads);
+  AssertEquals('enc ffn', 16, Config.EncoderFFNDim);
+  AssertEquals('dec ffn', 16, Config.DecoderFFNDim);
+  AssertEquals('vocab', 13, Config.VocabSize);
+  AssertEquals('max positions', 16, Config.MaxPositionEmbeddings);
+  AssertEquals('pad token', 1, Config.PadTokenId);
+  AssertEquals('bos token', 0, Config.BosTokenId);
+  AssertEquals('eos token', 2, Config.EosTokenId);
+  AssertEquals('decoder start = eos', 2, Config.DecoderStartTokenId);
+  AssertTrue('scale_embedding on', Config.ScaleEmbedding);
+  try
+    BuildFromPretrained(FixturePath('tiny_m2m100.safetensors'),
+      {SeqLen=}0, {pInferenceOnly=}false,
+      FixturePath('tiny_m2m100_config.json'));
+    Fail('BuildFromPretrained must reject model_type "m2m_100"');
+  except
+    on E: EPretrainedImportError do
+      AssertTrue('m2m_100 rejection must point at ' +
+        'BuildM2M100FromSafeTensors, got: ' + E.Message,
+        Pos('BuildM2M100FromSafeTensors', E.Message) > 0);
+  end;
+end;
+
+// Verifies the M2M100/NLLB import target - the SINUSOIDAL-position +relu
+// cousin of mBART (facebook/m2m100_* and facebook/nllb-200-*).
+// tests/fixtures/tiny_m2m100.* is a pico randomly-initialized HF
+// M2M100ForConditionalGeneration (2+2 layers, 2 heads, d_model 8, vocab 13,
+// pad 1 / bos 0 / eos 2, decoder start = eos, RELU FFN, PRE-norm biased
+// LayerNorms, SINUSOIDAL +2-offset half-split positions, NO
+// layernorm_embedding, a FINAL encoder AND decoder layer_norm,
+// scale_embedding=true, tied bias-free lm_head). The generator
+// tools/m2m100_tiny_fixture.py asserts every quirk moves the float64 oracle
+// above the 1e-4 gate: sinusoidal positions (2.25), the final enc/dec
+// layer_norm (2.01/2.33), pre-norm placement, relu vs gelu/silu (0.60/1.42),
+// cross-attention (3.88) and decoder causality, plus the no-layernorm_embed
+// and tied-head structural checks. M2M100 = Pegasus's pre-norm body with
+// sinusoidal positions and a relu FFN, so the importer reuses
+// BuildPegasusStackBlocks (UseReluFFN). The parity loop is the SAME
+// AssertT5ParityWithFixture/RunT5 path shared with T5/Marian/BART/Pegasus/
+// mBART.
+procedure TTestNeuralPretrained.TestM2M100Parity;
+var
+  Enc, Dec: TNNet;
+  Config: TM2M100Config;
+begin
+  RandSeed := 424242;
+  BuildM2M100FromSafeTensors(FixturePath('tiny_m2m100.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_m2m100_config.json'));
+  try
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    AssertTrue('decoder second input is TNNetInput',
+      T5EncoderStatesInput(Dec) is TNNetInput);
+    AssertEquals('encoder-states input size', 10 * Config.DModel,
+      T5EncoderStatesInput(Dec).Output.Size);
+    AssertT5ParityWithFixture(Enc, Dec,
+      FixturePath('tiny_m2m100_logits.json'), 10, 6, Config.DModel,
       Config.VocabSize);
   finally
     Dec.Free;
