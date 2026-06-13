@@ -2159,6 +2159,74 @@ procedure BuildPegasusFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // ---------------------------------------------------------------------------
+// mBART IMPORT (model_type "mbart": the facebook/mbart-large-* multilingual
+// translation/denoising checkpoints; architectures
+// ["MBartForConditionalGeneration"]) - the PRE-NORM cousin of BART. mBART is
+// EXACTLY BART's embedding front-end stacked on PEGASUS-style pre-norm blocks:
+//   - LEARNED absolute position embeddings with BART's +2 padding offset
+//     (model.{encoder,decoder}.embed_positions.weight, shape
+//     [max_position_embeddings + 2, d_model]; token position p reads row p+2)
+//     - NOT Pegasus's static sinusoids;
+//   - a layernorm_embedding LayerNorm AFTER token+position embeddings in BOTH
+//     stacks (BART has it; Pegasus does NOT);
+//   - PRE-NORM transformer blocks (normalize_before=true): each sub-layer
+//     NORMS the residual stream first, runs the sub-layer, then adds the RAW
+//     residual back - the SAME wiring as Pegasus, so BuildPegasusStackBlocks
+//     is reused verbatim (the per-block norm tensor names are identical);
+//   - a FINAL encoder AND decoder layer_norm closing each pre-norm stack
+//     (model.{encoder,decoder}.layer_norm) - like Pegasus;
+//   - exact-erf GELU FFN, ALL q/k/v/out/fc Linears biased, 1/sqrt(head_dim)
+//     attention, biased nn.LayerNorm (eps 1e-5);
+//   - shared source/target embedding TIED to the lm_head plus a
+//     final_logits_bias row (the BartForConditionalGeneration head);
+//   - scale_embedding follows the config (mBART default OFF; the sqrt(d_model)
+//     folds into the embedding rows exactly as in BART/Pegasus).
+// mBART ships a raw sentencepiece.bpe.model (no tokenizer.json) - the
+// Unigram .model path in neuralhftokenizer.LoadSentencePieceModel covers the
+// tokenizer side (see TNeuralHFTokenizer.LoadFromFile). mBART config reuses
+// TBartConfig (same fields) but the importer accepts model_type "mbart".
+// For a v1 PARITY fixture this importer is checked on teacher-forced logits
+// for a pinned (encoder ids, decoder ids) pair - the full multilingual
+// forced-language-token generation protocol is a generation-time concern, not
+// a model-build one. BuildFromPretrained does NOT dispatch "mbart" (it
+// returns ONE net); it raises an error pointing here instead.
+// NLLB (model_type "m2m_100", the M2M100 architecture) is a close BART-style
+// relative and a documented follow-up.
+
+// Reads a HF mBART config.json (model_type "mbart"). Same fields as BART;
+// max_position_embeddings = 1024, pad_token_id = 1, bos_token_id = 0,
+// eos_token_id = 2, decoder_start_token_id = eos_token_id, scale_embedding =
+// false by default. activation_function must be "gelu" (the exact erf form);
+// tie_word_embeddings = false is REJECTED. Returns a TBartConfig with
+// ModelType = 'mbart'.
+function ReadMBartConfigFromJSONFile(const FileName: string): TBartConfig;
+
+// Builds the mBART ENCODER and DECODER nets and loads every weight from the
+// safetensors checkpoint at FileName (see the mBART IMPORT section above).
+// EncSeqLen/DecSeqLen fix the two sequence lengths at build time and must not
+// exceed max_position_embeddings. Both nets are owned by the caller. Run the
+// pair with RunT5 (the two-net convention shared with the T5/Marian/BART/
+// Pegasus importers); the DECODER's second TNNetInput holds the encoder
+// hidden states (T5EncoderStatesInput).
+procedure BuildMBartFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, but takes the already-read Config by value (the ...Ex naming).
+procedure BuildMBartFromSafeTensorsEx(const FileName: string;
+  Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildMBartFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+
+// ---------------------------------------------------------------------------
 // WHISPER IMPORT (model_type "whisper": the openai/whisper-* speech-to-text
 // checkpoints; architectures ["WhisperForConditionalGeneration"]) - the
 // FIRST SPEECH importer and the THIRD encoder-decoder import after T5 and
@@ -14351,6 +14419,363 @@ begin
     DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
 end;
 
+// ===========================================================================
+// mBART IMPORT (BART embedding front-end + Pegasus pre-norm stacks)
+// ===========================================================================
+
+function ReadMBartConfigFromJSONFile(const FileName: string): TBartConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('mBART import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('mBART import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('mBART import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('mBART import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('mBART import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'mbart');
+    if ModelType <> 'mbart' then
+      ImportError('mBART import: config model_type is "' + ModelType +
+        '" - only "mbart" is supported here (NLLB/M2M100 "m2m_100" is a ' +
+        'documented follow-up; see BuildFromPretrained for the dispatch).');
+    Result.ModelType := ModelType;
+    Result.DModel := RequiredInt('d_model');
+    Result.EncoderLayers := RequiredInt('encoder_layers');
+    Result.DecoderLayers := RequiredInt('decoder_layers');
+    Result.EncoderHeads := RequiredInt('encoder_attention_heads');
+    Result.DecoderHeads := RequiredInt('decoder_attention_heads');
+    Result.EncoderFFNDim := RequiredInt('encoder_ffn_dim');
+    Result.DecoderFFNDim := RequiredInt('decoder_ffn_dim');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositionEmbeddings :=
+      Obj.Get('max_position_embeddings', 1024);
+    // HF MBartConfig defaults (pad 1 / bos 0 / eos 2; decoder start = eos).
+    Result.PadTokenId := Obj.Get('pad_token_id', 1);
+    Result.BosTokenId := Obj.Get('bos_token_id', 0);
+    Result.EosTokenId := Obj.Get('eos_token_id', 2);
+    Result.DecoderStartTokenId :=
+      Obj.Get('decoder_start_token_id', Result.EosTokenId);
+    Result.ScaleEmbedding := Obj.Get('scale_embedding', False);
+    // Only the published mBART recipe ("gelu", the exact erf form) is
+    // supported; gelu_new / relu / swish are rejected to avoid a silent
+    // activation mismatch.
+    ActFn := Obj.Get('activation_function', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('mBART import: activation_function "' + ActFn +
+        '" is not supported - expected "gelu" (the exact erf form every ' +
+        'published mBART pins).');
+    if not Obj.Get('tie_word_embeddings', True) then
+      ImportError('mBART import: tie_word_embeddings=false is not ' +
+        'supported - mBART ties the lm_head to the shared embedding.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+procedure BuildMBartFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TMarianBlockArray;
+  EncEmbed, DecEmbed, EncPos, DecPos, EncEmbLN, DecEmbLN: TNNetLayer;
+  EncFinalLN, DecFinalLN: TNNetLayer;
+  DecTokenInput, EncStates, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+  // The per-block loader (LoadMarianStack) only reads .DModel; the pre-norm
+  // stack builder (BuildPegasusStackBlocks) takes a TPegasusConfig and also
+  // only reads .DModel. Both shims carry d_model so the shared helpers work
+  // unchanged - mBART is BART's embedding front-end on Pegasus pre-norm blocks.
+  MarianShim: TMarianConfig;
+  PegShim: TPegasusConfig;
+
+  // Loads embed_positions rows BartPositionOffset..SeqLen+offset-1 into the
+  // SeqLen-row TNNetLearnedPositionalEmbedding table (token position p reads
+  // checkpoint row p + 2; rows 0/1 are the padding-idx slots).
+  procedure LoadMBartPositions(PosLayer: TNNetLayer; const TName: string;
+    SeqLen: integer);
+  var
+    PosCnt, ElementCnt: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('mBART import: missing tensor "' + TName + '".');
+    if (Reader.DimCount(TName) <> 2) or
+       (Reader.DimSize(TName, 0) <>
+          Config.MaxPositionEmbeddings + BartPositionOffset) or
+       (Reader.DimSize(TName, 1) <> Config.DModel) then
+      ImportError('mBART import: "' + TName + '" must have shape [' +
+        IntToStr(Config.MaxPositionEmbeddings + BartPositionOffset) + ', ' +
+        IntToStr(Config.DModel) + '], got ' + Reader.ShapeAsString(TName));
+    Reader.LoadTensorFlat(TName, Tmp);
+    for PosCnt := 0 to SeqLen - 1 do
+      for ElementCnt := 0 to Config.DModel - 1 do
+        PosLayer.Neurons[0].Weights.FData[PosCnt * Config.DModel +
+          ElementCnt] := Tmp.FData[(PosCnt + BartPositionOffset) *
+            Config.DModel + ElementCnt];
+    PosLayer.FlushWeightCache();
+    Consumed.Add(TName);
+  end;
+
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  // ---------------- Config validation ----------------
+  if EncSeqLen < 1 then
+    ImportError('mBART import: EncSeqLen must be >= 1, got ' +
+      IntToStr(EncSeqLen) + '.');
+  if DecSeqLen < 1 then
+    ImportError('mBART import: DecSeqLen must be >= 1, got ' +
+      IntToStr(DecSeqLen) + '.');
+  if (EncSeqLen > Config.MaxPositionEmbeddings) or
+     (DecSeqLen > Config.MaxPositionEmbeddings) then
+    ImportError('mBART import: EncSeqLen/DecSeqLen must not exceed ' +
+      'max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+  if (Config.EncoderHeads < 1) or
+     ((Config.DModel mod Config.EncoderHeads) <> 0) then
+    ImportError('mBART import: encoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.EncoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  if (Config.DecoderHeads < 1) or
+     ((Config.DModel mod Config.DecoderHeads) <> 0) then
+    ImportError('mBART import: decoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.DecoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  PegShim.DModel := Config.DModel;
+  try
+    try
+      if not Reader.HasTensor('model.shared.weight') then
+        ImportError('mBART import: "model.shared.weight" not found in ' +
+          Reader.FileName + ' - not an mBART checkpoint?');
+      if (Reader.DimCount('model.shared.weight') <> 2) or
+         (Reader.DimSize('model.shared.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize('model.shared.weight', 1) <> Config.DModel) then
+        ImportError('mBART import: model.shared.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.DModel) +
+          '], got ' + Reader.ShapeAsString('model.shared.weight'));
+      if not Reader.HasTensor('final_logits_bias') then
+        ImportError('mBART import: "final_logits_bias" not found in ' +
+          Reader.FileName +
+          ' - not an MBartForConditionalGeneration checkpoint?');
+      if (Reader.DimCount('final_logits_bias') <> 2) or
+         (Reader.DimSize('final_logits_bias', 0) <> 1) or
+         (Reader.DimSize('final_logits_bias', 1) <> Config.VocabSize) then
+        ImportError('mBART import: final_logits_bias must have shape ' +
+          '[1, ' + IntToStr(Config.VocabSize) + '], got ' +
+          Reader.ShapeAsString('final_logits_bias'));
+
+      // ---------------- Encoder architecture ----------------
+      // BART front-end: token embedding -> learned positions (+2) ->
+      // layernorm_embedding. PRE-norm blocks then a FINAL encoder layer_norm.
+      Enc := TNNet.Create();
+      Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
+      EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+      EncPos := Enc.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+      EncEmbLN := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Enc, PegShim, Config.EncoderLayers,
+        Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
+        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
+      EncFinalLN := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+
+      // ---------------- Decoder architecture ----------------
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+      DecEmbLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
+        Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
+      DecFinalLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('mBART import: model.shared.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+        if Config.ScaleEmbedding then
+          EmbedScale := Sqrt(Config.DModel)
+        else
+          EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+        begin
+          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        end;
+        EncEmbed.FlushWeightCache();
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('model.shared.weight');
+        // Tied head: logits = h . shared^T + final_logits_bias (UNSCALED rows).
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+          for i := 0 to Config.DModel - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.DModel + i];
+        Reader.LoadTensorFlat('final_logits_bias', Tmp);
+        for j := 0 to Config.VocabSize - 1 do
+          LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+        LMHead.FlushWeightCache();
+        Consumed.Add('final_logits_bias');
+        // Legacy exports may still carry the tied aliases (HF drops
+        // embed_tokens and lm_head via _tied_weights_keys).
+        if Reader.HasTensor('lm_head.weight') then
+          Consumed.Add('lm_head.weight');
+        if Reader.HasTensor('model.encoder.embed_tokens.weight') then
+          Consumed.Add('model.encoder.embed_tokens.weight');
+        if Reader.HasTensor('model.decoder.embed_tokens.weight') then
+          Consumed.Add('model.decoder.embed_tokens.weight');
+        // Learned positions (the +2-offset window).
+        LoadMBartPositions(EncPos,
+          'model.encoder.embed_positions.weight', EncSeqLen);
+        LoadMBartPositions(DecPos,
+          'model.decoder.embed_positions.weight', DecSeqLen);
+      finally
+        Tmp.Free;
+      end;
+      // layernorm_embedding (after token+position embeddings).
+      LoadLayerNormWeights(Reader, EncEmbLN,
+        'model.encoder.layernorm_embedding.weight',
+        'model.encoder.layernorm_embedding.bias', Config.DModel);
+      Consumed.Add('model.encoder.layernorm_embedding.weight');
+      Consumed.Add('model.encoder.layernorm_embedding.bias');
+      LoadLayerNormWeights(Reader, DecEmbLN,
+        'model.decoder.layernorm_embedding.weight',
+        'model.decoder.layernorm_embedding.bias', Config.DModel);
+      Consumed.Add('model.decoder.layernorm_embedding.weight');
+      Consumed.Add('model.decoder.layernorm_embedding.bias');
+      // Per-block weights (same names/shapes as BART/Marian; the per-block
+      // norms now sit BEFORE each sub-layer (pre-norm) but the names match).
+      MarianShim.DModel := Config.DModel;
+      LoadMarianStack(Reader, EncBlocks, 'model.encoder.layers.',
+        MarianShim, Config.EncoderFFNDim, {IsDecoder=}false, Consumed);
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      LoadMarianStack(Reader, DecBlocks, 'model.decoder.layers.',
+        MarianShim, Config.DecoderFFNDim, {IsDecoder=}true, Consumed);
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // Final per-stack LayerNorms (pre-norm models close each stack).
+      LoadLayerNormWeights(Reader, EncFinalLN,
+        'model.encoder.layer_norm.weight',
+        'model.encoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.encoder.layer_norm.weight');
+      Consumed.Add('model.encoder.layer_norm.bias');
+      LoadLayerNormWeights(Reader, DecFinalLN,
+        'model.decoder.layer_norm.weight',
+        'model.decoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.decoder.layer_norm.weight');
+      Consumed.Add('model.decoder.layer_norm.bias');
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('mBART import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil;
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free;
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildMBartFromSafeTensorsEx(const FileName: string;
+  Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+begin
+  BuildMBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+procedure BuildMBartFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMBartConfigFromJSONFile(ConfigPath);
+  BuildMBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
 function ReadWhisperConfigFromJSONFile(const FileName: string): TWhisperConfig;
 var
   JsonText: TStringList;
@@ -20830,6 +21255,16 @@ begin
     Result := nil;
     ImportError('BuildFromPretrained: model_type "pegasus" builds an ' +
       'ENCODER-DECODER pair - call BuildPegasusFromSafeTensors (returns ' +
+      'both nets; run them with RunT5) instead of this single-net ' +
+      'dispatch.');
+  end
+  else if ModelType = 'mbart' then
+  begin
+    // mBART is an encoder-decoder: the import builds TWO nets, which this
+    // single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "mbart" builds an ' +
+      'ENCODER-DECODER pair - call BuildMBartFromSafeTensors (returns ' +
       'both nets; run them with RunT5) instead of this single-net ' +
       'dispatch.');
   end

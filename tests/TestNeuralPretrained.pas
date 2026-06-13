@@ -214,6 +214,8 @@ type
     procedure TestBartParity;
     procedure TestPegasusConfigFromJSONFile;
     procedure TestPegasusParity;
+    procedure TestMBartConfigFromJSONFile;
+    procedure TestMBartParity;
     procedure TestWhisperConfigFromJSONFile;
     procedure TestWhisperParity;
     procedure TestClipConfigFromJSONFile;
@@ -7871,6 +7873,84 @@ begin
       T5EncoderStatesInput(Dec).Output.Size);
     AssertT5ParityWithFixture(Enc, Dec,
       FixturePath('tiny_pegasus_logits.json'), 10, 6, Config.DModel,
+      Config.VocabSize);
+  finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Verifies ReadMBartConfigFromJSONFile on the committed mBART pico config
+// plus the BuildFromPretrained "mbart" rejection (an encoder-decoder cannot
+// be returned by the single-net dispatch; the error must redirect to
+// BuildMBartFromSafeTensors).
+procedure TTestNeuralPretrained.TestMBartConfigFromJSONFile;
+var
+  Config: TBartConfig;
+begin
+  RandSeed := 424242;
+  Config := ReadMBartConfigFromJSONFile(
+    FixturePath('tiny_mbart_config.json'));
+  AssertEquals('model_type', 'mbart', Config.ModelType);
+  AssertEquals('d_model', 8, Config.DModel);
+  AssertEquals('enc layers', 2, Config.EncoderLayers);
+  AssertEquals('dec layers', 2, Config.DecoderLayers);
+  AssertEquals('enc heads', 2, Config.EncoderHeads);
+  AssertEquals('dec heads', 2, Config.DecoderHeads);
+  AssertEquals('enc ffn', 16, Config.EncoderFFNDim);
+  AssertEquals('dec ffn', 16, Config.DecoderFFNDim);
+  AssertEquals('vocab', 13, Config.VocabSize);
+  AssertEquals('max positions', 16, Config.MaxPositionEmbeddings);
+  AssertEquals('pad token', 1, Config.PadTokenId);
+  AssertEquals('bos token', 0, Config.BosTokenId);
+  AssertEquals('eos token', 2, Config.EosTokenId);
+  AssertEquals('decoder start = eos', 2, Config.DecoderStartTokenId);
+  AssertTrue('scale_embedding on', Config.ScaleEmbedding);
+  try
+    BuildFromPretrained(FixturePath('tiny_mbart.safetensors'),
+      {SeqLen=}0, {pInferenceOnly=}false,
+      FixturePath('tiny_mbart_config.json'));
+    Fail('BuildFromPretrained must reject model_type "mbart"');
+  except
+    on E: EPretrainedImportError do
+      AssertTrue('mbart rejection must point at ' +
+        'BuildMBartFromSafeTensors, got: ' + E.Message,
+        Pos('BuildMBartFromSafeTensors', E.Message) > 0);
+  end;
+end;
+
+// Verifies the mBART import target - the PRE-norm multilingual cousin of BART
+// (facebook/mbart-large-*). tests/fixtures/tiny_mbart.* is a pico randomly-
+// initialized HF MBartForConditionalGeneration (2+2 layers, 2 heads, d_model
+// 8, vocab 13, pad 1 / bos 0 / eos 2, decoder start = eos, gelu FFN, PRE-norm
+// biased LayerNorms, LEARNED +2-offset positions, a layernorm_embedding after
+// the embeddings, a FINAL encoder AND decoder layer_norm, scale_embedding=
+// true). The generator tools/mbart_tiny_fixture.py asserts every quirk moves
+// the float64 oracle above the 1e-4 gate: learned positions (0.07), the
+// enc/dec layernorm_embedding (1.25/1.22), the final enc/dec layer_norm
+// (2.37/2.28), pre-norm placement, gelu vs relu/silu (0.25/1.02),
+// final_logits_bias (1.32), cross-attention (2.75) and decoder causality.
+// mBART = BART's embedding front-end on Pegasus pre-norm blocks, so the
+// importer reuses BuildPegasusStackBlocks. The parity loop is the SAME
+// AssertT5ParityWithFixture/RunT5 path shared with T5/Marian/BART/Pegasus.
+procedure TTestNeuralPretrained.TestMBartParity;
+var
+  Enc, Dec: TNNet;
+  Config: TBartConfig;
+begin
+  RandSeed := 424242;
+  BuildMBartFromSafeTensors(FixturePath('tiny_mbart.safetensors'),
+    Enc, Dec, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_mbart_config.json'));
+  try
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    AssertTrue('decoder second input is TNNetInput',
+      T5EncoderStatesInput(Dec) is TNNetInput);
+    AssertEquals('encoder-states input size', 10 * Config.DModel,
+      T5EncoderStatesInput(Dec).Output.Size);
+    AssertT5ParityWithFixture(Enc, Dec,
+      FixturePath('tiny_mbart_logits.json'), 10, 6, Config.DModel,
       Config.VocabSize);
   finally
     Dec.Free;

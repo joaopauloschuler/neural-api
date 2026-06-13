@@ -147,19 +147,28 @@ rather than acted on.
       Cohere weights on top of the synthetic fixture. Also: order_of_interleaved_layers
       (legacy cohere2 spelling) maps to sliding_window_pattern but was not seen
       in a published config — wire it if one surfaces.
-- [ ] BART-family follow-up (b) mBART/NLLB — pre-norm + an EXTRA final encoder
-      AND decoder LayerNorm (same pre-norm shape the Pegasus importer now ships,
-      so it should reuse BuildPegasusStackBlocks) + a SentencePiece tokenizer:
-      mBART/NLLB ship a raw sentencepiece.bpe.model without a tokenizer.json:
-      the raw .model protobuf reader has now LANDED (LoadSentencePieceModel,
-      see Tokenizer follow-up (b) below) and covers the Unigram .model that
+- [ ] BART-family follow-up (b): mBART DONE — BuildMBartFromSafeTensors[Ex]
+      (model_type "mbart") LANDED, parity ~teacher-forced logits within the
+      1e-4 gate vs HF float64 oracle (tools/mbart_tiny_fixture.py,
+      tests/fixtures/tiny_mbart.*, TestMBartParity). mBART = BART's embedding
+      front-end (learned +2-offset positions + layernorm_embedding + tied head
+      + final_logits_bias) stacked on PEGASUS-style pre-norm blocks + a FINAL
+      encoder AND decoder layer_norm, so it reuses BuildPegasusStackBlocks
+      verbatim and TBartConfig (model_type accepted = "mbart").
+      REMAINING: NLLB (model_type "m2m_100", the M2M100 architecture — a close
+      BART-style relative; build a BuildM2M100FromSafeTensors on the same
+      path). Tokenizer: mBART/NLLB ship a raw sentencepiece.bpe.model without a
+      tokenizer.json; the raw .model protobuf reader (LoadSentencePieceModel,
+      see Tokenizer follow-up (b) below) covers the Unigram .model that
       mBART(-Unigram)/DeBERTa-v3/T5/ALBERT use, so the tokenizer side is
-      unblocked for those; NLLB/mBART variants that ship a BPE .model still
-      need the BPE-in-.model follow-up. Also: the committed
-      bart_tiny / tiny_pegasus fixtures are single-shard, so the inherited
-      multi-shard index.json path is untested for these encoder-decoders
-      specifically — add a 2-shard fixture if a real distilbart/pegasus import
-      surfaces a bug.
+      unblocked for those (Unigram .model is already loaded + tested via
+      tiny_spm.model / TestSentencePieceModelParity); NLLB/mBART variants that
+      ship a BPE .model still need the BPE-in-.model follow-up, and real-vocab
+      verification against a downloaded sentencepiece.bpe.model is a follow-up.
+      Also: the committed bart_tiny / tiny_pegasus / tiny_mbart fixtures are
+      single-shard, so the inherited multi-shard index.json path is untested
+      for these encoder-decoders specifically — add a 2-shard fixture if a real
+      distilbart/pegasus/mbart import surfaces a bug.
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
