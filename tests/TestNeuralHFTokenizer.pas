@@ -64,6 +64,10 @@ type
   private
     function FixturePath(const FileName: string): string;
     procedure RunChatBattery(const FormatName: string);
+    // Runs every pinned case of FormatName through the mini-Jinja
+    // INTERPRETER fed that family's AUTHENTIC chat_template string, with
+    // the right bos/eos, and asserts byte-exact parity with ground truth.
+    procedure RunInterpreterBattery(const FormatName, Bos, Eos: string);
   published
     procedure TestChatMLParityWithJinja;
     procedure TestLlama2ParityWithJinja;
@@ -82,6 +86,16 @@ type
     procedure TestEncodeChatChatMLAddedToken;
     procedure TestLoadChatTemplateFromTokenizerConfig;
     procedure TestUnknownFormatRaises;
+    // mini-Jinja interpreter (chat templates v2)
+    procedure TestInterpreterChatMLParity;
+    procedure TestInterpreterLlama3Parity;
+    procedure TestInterpreterDeepSeekParity;
+    procedure TestInterpreterPhi4MiniParity;
+    procedure TestInterpreterZephyrWhitespaceControl;
+    procedure TestInterpreterAllBundledTemplatesParity;
+    procedure TestInterpreterUnsupportedConstructRaises;
+    procedure TestInterpreterWhitespaceControlTrimming;
+    procedure TestApplyChatTemplateStringFallback;
   end;
 
 implementation
@@ -926,6 +940,226 @@ begin
     on E: ENeuralChatError do Raised := true;
   end;
   AssertTrue('cfUnknown must raise ENeuralChatError', Raised);
+end;
+
+// ===================================================================
+// Mini-Jinja interpreter (chat templates v2) parity battery.
+// ===================================================================
+
+// DeepSeek special tokens: fullwidth pipe U+FF5C + one-eighth block U+2581.
+const
+  csDsBos =
+    '<' + #$EF#$BD#$9C + 'begin' + #$E2#$96#$81 + 'of' + #$E2#$96#$81 +
+    'sentence' + #$EF#$BD#$9C + '>';
+  csDsEos =
+    '<' + #$EF#$BD#$9C + 'end' + #$E2#$96#$81 + 'of' + #$E2#$96#$81 +
+    'sentence' + #$EF#$BD#$9C + '>';
+
+// Feeds the AUTHENTIC published chat_template string (pinned in the fixture
+// next to its cases) to RenderChatTemplate -- the mini-Jinja interpreter --
+// and asserts byte-exact parity with the ground-truth output (and that the
+// pinned raise cases raise EChatTemplateError, exactly where HF raises).
+procedure TTestNeuralChat.RunInterpreterBattery(
+  const FormatName, Bos, Eos: string);
+var
+  Root: TJSONData;
+  Group, CaseObj, MsgObj: TJSONObject;
+  Cases, MsgArr: TJSONArray;
+  Messages: TChatMessages;
+  Template, Context, Rendered: string;
+  CaseCnt, MsgCnt: integer;
+  Raised: boolean;
+  FS: TFileStream;
+begin
+  FS := TFileStream.Create(FixturePath('chat_template_cases.json'),
+    fmOpenRead or fmShareDenyWrite);
+  try
+    // parse WITHOUT joUTF8 so the DeepSeek non-ASCII bytes in 'expected'
+    // survive without a widestring manager (see fpjson trap notes).
+    Root := GetJSON(FS, False);
+  finally
+    FS.Free;
+  end;
+  try
+    Group := TJSONObject(Root).Objects[FormatName];
+    Template := Group.Get('template', '');
+    AssertTrue(FormatName + ': template pinned', Template <> '');
+    Cases := Group.Arrays['cases'];
+    AssertTrue(FormatName + ': no cases pinned', Cases.Count >= 5);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Context := 'interp ' + FormatName + ' case ' + IntToStr(CaseCnt);
+      MsgArr := CaseObj.Arrays['messages'];
+      SetLength(Messages, MsgArr.Count);
+      for MsgCnt := 0 to MsgArr.Count - 1 do
+      begin
+        MsgObj := MsgArr.Objects[MsgCnt];
+        Messages[MsgCnt] := ChatMessage(MsgObj.Get('role', ''),
+          MsgObj.Get('content', ''));
+      end;
+      if CaseObj.Get('raises', false) then
+      begin
+        Raised := false;
+        try
+          RenderChatTemplate(Template, Messages,
+            CaseObj.Get('add_generation_prompt', true), Bos, Eos);
+        except
+          on E: EChatTemplateError do Raised := true;
+        end;
+        AssertTrue(Context + ': must raise EChatTemplateError', Raised);
+      end
+      else
+      begin
+        Rendered := RenderChatTemplate(Template, Messages,
+          CaseObj.Get('add_generation_prompt', true), Bos, Eos);
+        AssertEquals(Context, CaseObj.Get('expected', ''), Rendered);
+      end;
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralChat.TestInterpreterChatMLParity;
+begin
+  RunInterpreterBattery('chatml', '', '');
+end;
+
+procedure TTestNeuralChat.TestInterpreterLlama3Parity;
+begin
+  RunInterpreterBattery('llama3', '<|begin_of_text|>', '');
+end;
+
+procedure TTestNeuralChat.TestInterpreterDeepSeekParity;
+begin
+  RunInterpreterBattery('deepseek', csDsBos, csDsEos);
+end;
+
+procedure TTestNeuralChat.TestInterpreterPhi4MiniParity;
+begin
+  RunInterpreterBattery('phi4mini', '', '');
+end;
+
+// zephyr's authentic template is littered with literal newlines between its
+// block tags; only the implicit trim_blocks + lstrip_blocks transformers
+// uses makes it render correctly. This pins that behavior end to end.
+procedure TTestNeuralChat.TestInterpreterZephyrWhitespaceControl;
+begin
+  RunInterpreterBattery('zephyr', '', '</s>');
+end;
+
+// Every bundled family's authentic template, end to end, with the bos/eos
+// the family's tokens resolve to. This is the headline acceptance criterion:
+// the interpreter reproduces the byte-pinned ground truth for ALL of them.
+procedure TTestNeuralChat.TestInterpreterAllBundledTemplatesParity;
+begin
+  RunInterpreterBattery('chatml', '', '');
+  RunInterpreterBattery('llama2', '<s>', '</s>');
+  RunInterpreterBattery('llama3', '<|begin_of_text|>', '');
+  RunInterpreterBattery('zephyr', '', '</s>');
+  RunInterpreterBattery('gemma', '<bos>', '');
+  RunInterpreterBattery('phi3', '', '<|endoftext|>');
+  RunInterpreterBattery('mistral', '<s>', '</s>');
+  RunInterpreterBattery('deepseek', csDsBos, csDsEos);
+  RunInterpreterBattery('phi4mini', '', '');
+end;
+
+// Unsupported constructs must raise cleanly, never emit garbage.
+procedure TTestNeuralChat.TestInterpreterUnsupportedConstructRaises;
+var
+  Messages: TChatMessages;
+
+  function Raises(const Template: string): boolean;
+  begin
+    Result := false;
+    try
+      RenderChatTemplate(Template, Messages, true, '', '');
+    except
+      on E: EChatTemplateError do Result := true;
+    end;
+  end;
+
+begin
+  SetLength(Messages, 1);
+  Messages[0] := ChatMessage('user', 'hi');
+  AssertTrue('unknown filter raises',
+    Raises('{{ messages[0][''content''] | upper }}'));
+  AssertTrue('unknown statement raises',
+    Raises('{% macro foo %}x{% endmacro %}'));
+  AssertTrue('unknown method raises',
+    Raises('{{ messages[0][''content''].title() }}'));
+  AssertTrue('unterminated tag raises', Raises('{{ messages '));
+  AssertTrue('missing endfor raises',
+    Raises('{% for m in messages %}x'));
+  AssertTrue('unknown message key raises',
+    Raises('{{ messages[0][''bogus''] }}'));
+end;
+
+// {%- / -%} whitespace control and the default trim_blocks/lstrip_blocks.
+procedure TTestNeuralChat.TestInterpreterWhitespaceControlTrimming;
+var
+  Messages: TChatMessages;
+begin
+  SetLength(Messages, 0);
+  // {%- strips ALL preceding whitespace (incl. the newline).
+  AssertEquals('left trim marker',
+    'ab', RenderChatTemplate('a   ' + #10 + '{%- if true %}b{% endif %}',
+      Messages, true, '', ''));
+  // -%} strips ALL following whitespace.
+  AssertEquals('right trim marker', '   bx',
+    RenderChatTemplate('{% if true %}   b{% endif -%}   ' + #10 + 'x',
+      Messages, true, '', ''));
+  // trim_blocks default: the newline right after a block tag is swallowed.
+  AssertEquals('trim_blocks swallows newline', 'b',
+    RenderChatTemplate('{% if true %}' + #10 + 'b{% endif %}',
+      Messages, true, '', ''));
+  // lstrip_blocks default: leading spaces up to a block tag are stripped.
+  AssertEquals('lstrip_blocks strips indent', 'X',
+    RenderChatTemplate('   {% if true %}X{% endif %}',
+      Messages, true, '', ''));
+  // a {{ output }} tag does NOT trigger trim_blocks (newline kept).
+  AssertEquals('output tag keeps newline', 'x' + #10,
+    RenderChatTemplate('{{ ''x'' }}' + #10, Messages, true, '', ''));
+end;
+
+// ApplyChatTemplateString: recognized family -> hardcoded renderer;
+// unrecognized but renderable -> the interpreter fallback; empty -> raise.
+procedure TTestNeuralChat.TestApplyChatTemplateStringFallback;
+var
+  Messages: TChatMessages;
+  ChatMLTpl, CustomTpl: string;
+  Raised: boolean;
+begin
+  SetLength(Messages, 1);
+  Messages[0] := ChatMessage('user', 'hi');
+  ChatMLTpl :=
+    '{% for message in messages %}{{''<|im_start|>'' + message[''role''] '
+    + '+ ''' + #10 + ''' + message[''content''] + ''<|im_end|>'' + ''' + #10
+    + '''}}{% endfor %}{% if add_generation_prompt %}'
+    + '{{ ''<|im_start|>assistant' + #10 + ''' }}{% endif %}';
+  // ChatML is a recognized family: routes to the hardcoded renderer, so the
+  // result equals ApplyChatTemplate(cfChatML, ...).
+  AssertEquals('recognized family routes to hardcoded',
+    ApplyChatTemplate(cfChatML, Messages, true),
+    ApplyChatTemplateString(ChatMLTpl, Messages, true, '<s>', '</s>'));
+
+  // An unrecognized custom template falls back to the interpreter.
+  CustomTpl :=
+    '{% for m in messages %}[{{ m.role }}] {{ m[''content''] }}' + #10
+    + '{% endfor %}{% if add_generation_prompt %}[bot] {% endif %}';
+  AssertEquals('unrecognized falls back to interpreter',
+    '[user] hi' + #10 + '[bot] ',
+    ApplyChatTemplateString(CustomTpl, Messages, true, '', ''));
+
+  // Empty template -> clean raise.
+  Raised := false;
+  try
+    ApplyChatTemplateString('', Messages, true, '', '');
+  except
+    on E: EChatTemplateError do Raised := true;
+  end;
+  AssertTrue('empty template raises EChatTemplateError', Raised);
 end;
 
 initialization

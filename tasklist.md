@@ -332,9 +332,13 @@ rather than acted on.
       prerequisite for an efficient speculative-decoding verify step.
 - [ ] Chat templates v2 (v1 is landed in neural/neuralchat.pas —
       ApplyChatTemplate with seven hardcoded formats + DetectChatFormat
-      fingerprinting + EncodeChat): a mini-Jinja subset interpreter for unrecognized
-      chat_template strings (must pass ground truth for all bundled
-      templates and raise cleanly on unsupported constructs); more
+      fingerprinting + EncodeChat): ~~a mini-Jinja subset interpreter for
+      unrecognized chat_template strings (must pass ground truth for all
+      bundled templates and raise cleanly on unsupported constructs)~~
+      [DONE: TJInterp / RenderChatTemplate + ApplyChatTemplateString
+      fallback path; reproduces all 9 bundled templates byte-exact incl.
+      whitespace control, raises EChatTemplateError on unsupported
+      constructs; tests in TestNeuralHFTokenizer.pas]; more
       formats (~~DeepSeek~~ [DONE: cfDeepSeek], ~~Phi-4-mini's tool-aware
       ChatML variant~~ [DONE: cfPhi4Mini], Qwen's default-system injection);
       ~~read the separate chat_template.jinja file newer transformers exports

@@ -84,6 +84,10 @@ uses
 
 type
   ENeuralChatError = class(Exception);
+  // Raised by the mini-Jinja interpreter on an unsupported construct or a
+  // template-side raise_exception(...) call. A subclass of ENeuralChatError
+  // so callers that already catch ENeuralChatError keep working.
+  EChatTemplateError = class(ENeuralChatError);
 
   TNeuralChatFormat = (
     cfUnknown,
@@ -118,6 +122,17 @@ function ApplyChatTemplate(ChatFormat: TNeuralChatFormat;
   const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean = true): string;
 
+// Resolves an arbitrary chat_template string to a rendered prompt. First
+// tries DetectChatFormat: a recognized family routes to the fast hardcoded
+// renderer (ignoring the supplied template body). Otherwise the mini-Jinja
+// interpreter renders the template directly (the v2 fallback path), with
+// BosToken/EosToken substituted for {{ bos_token }}/{{ eos_token }}. Raises
+// EChatTemplateError on an unsupported Jinja construct.
+function ApplyChatTemplateString(const ChatTemplate: string;
+  const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean = true;
+  const BosToken: string = ''; const EosToken: string = ''): string;
+
 // 'chatml' <-> cfChatML etc; ChatFormatFromName returns cfUnknown for
 // unrecognized names.
 function ChatFormatName(ChatFormat: TNeuralChatFormat): string;
@@ -140,6 +155,36 @@ function LoadChatTemplateString(const TokenizerConfigFile: string): string;
 // LoadChatTemplateString + DetectChatFormat in one call.
 function DetectChatFormatFromConfigFile(
   const TokenizerConfigFile: string): TNeuralChatFormat;
+
+// Mini-Jinja subset INTERPRETER (chat templates v2). Renders an HF
+// chat_template Jinja string directly, for checkpoints whose template does
+// NOT match any hardcoded TNeuralChatFormat. This is the fallback path: it
+// reproduces, byte for byte, the output of every hardcoded format when fed
+// that family's authentic chat_template string, and raises a clean
+// EChatTemplateError on any construct outside the supported subset (rather
+// than silently emitting garbage).
+//
+// Supported constructs (the union actually used by the real published HF
+// chat templates this repo bundles):
+//   * {{ expr }} output, {%- / -%} whitespace control, and the implicit
+//     trim_blocks + lstrip_blocks transformers uses by default.
+//   * {% for x in seq %}...{% endfor %} over messages (and message slices),
+//     with loop.index0 / loop.index / loop.first / loop.last.
+//   * {% if c %}...{% elif c %}...{% else %}...{% endif %}.
+//   * {% set name = expr %} (incl. list slices like messages[1:]).
+//   * Variable / index / attribute access: messages, messages[0],
+//     message['role'], message.content, message['content'], loop.last.
+//   * Specials add_generation_prompt, bos_token, eos_token.
+//   * Operators: + (string concat / int add), ~ (concat), % (mod),
+//     == != < <= > >= , and / or / not , 'is defined'.
+//   * String/int/bool literals (true/false), parentheses.
+//   * Filters .strip() / | trim, | default(value), and the
+//     raise_exception('msg') call (raises EChatTemplateError).
+// Anything else raises EChatTemplateError.
+function RenderChatTemplate(const Template: string;
+  const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean;
+  const BosToken: string = ''; const EosToken: string = ''): string;
 
 // ApplyChatTemplate followed by Tokenizer.Encode. The rendered template
 // embeds control tokens (<|im_start|>, <s>, ...) as TEXT; the tokenizer
@@ -527,6 +572,939 @@ begin
     Result := Result + '<|assistant|>';
 end;
 
+// ===================================================================
+// Mini-Jinja subset interpreter (chat templates v2).
+// ===================================================================
+//
+// Pipeline: Tokenize (split into TEXT / {{...}} / {%...%} chunks honouring
+// {%- -%} and trim_blocks+lstrip_blocks) -> recursive descent over the
+// chunk stream evaluating expressions against a dynamic scope. There is no
+// separate AST: control blocks are executed by scanning the matching
+// end tag, because the template language is tiny and linear.
+
+type
+  // A dynamic value. Lists/objects are modelled lazily: a value points back
+  // into the host Messages array by index range rather than copying.
+  TJValueKind = (jvUndefined, jvString, jvInt, jvBool, jvMessages,
+    jvMessage, jvLoop);
+  TJValue = record
+    Kind: TJValueKind;
+    Str: string;
+    IntV: integer;
+    BoolV: boolean;
+    // jvMessages: a (possibly sliced) window over the host messages.
+    SliceLo, SliceHi: integer;   // inclusive..exclusive host indices
+    // jvMessage: index into the host messages array.
+    MsgIdx: integer;
+    // jvLoop: the loop bookkeeping (index0 within the iterated slice).
+    LoopIndex0, LoopCount: integer;
+  end;
+
+  TJVarBinding = record
+    Name: string;
+    Value: TJValue;
+  end;
+
+  // The interpreter object. One instance per RenderChatTemplate call.
+  TJInterp = class
+  private
+    FTemplate: string;
+    FMessages: array of TChatMessage;
+    FAddGen: boolean;
+    FBos, FEos: string;
+    FVars: array of TJVarBinding;
+    FOutput: string;
+    // chunk stream
+    FChunks: array of record
+      Kind: char;   // 'T' text, 'O' output {{ }}, 'S' statement {% %}
+      Text: string; // payload (for 'O'/'S' the inner expression, trimmed)
+    end;
+    procedure Tokenize;
+    procedure Fail(const Msg: string);
+    function LookupVar(const Name: string; out V: TJValue): boolean;
+    procedure SetVar(const Name: string; const V: TJValue);
+    function MakeStr(const S: string): TJValue;
+    function MakeInt(I: integer): TJValue;
+    function MakeBool(B: boolean): TJValue;
+    function MakeUndefined: TJValue;
+    function ToStr(const V: TJValue): string;
+    function Truthy(const V: TJValue): boolean;
+    function ValuesEqual(const A, B: TJValue): boolean;
+    // expression parser (operates on a single statement/output string)
+    function ParseExpr(const S: string; var P: integer): TJValue;
+    function ParseOr(const S: string; var P: integer): TJValue;
+    function ParseAnd(const S: string; var P: integer): TJValue;
+    function ParseNot(const S: string; var P: integer): TJValue;
+    function ParseCompare(const S: string; var P: integer): TJValue;
+    function ParseConcat(const S: string; var P: integer): TJValue;
+    function ParseAddSub(const S: string; var P: integer): TJValue;
+    function ParseMulMod(const S: string; var P: integer): TJValue;
+    function ParsePostfix(const S: string; var P: integer): TJValue;
+    function ParsePrimary(const S: string; var P: integer): TJValue;
+    procedure SkipWs(const S: string; var P: integer);
+    function PeekWord(const S: string; P: integer; const W: string): boolean;
+    // block execution: render chunk range [Lo..Hi) into FOutput
+    procedure ExecRange(Lo, Hi: integer);
+    procedure ExecIf(Lo, EndIdx: integer; const FirstCond: string);
+    function EvalFullExpr(const S: string): TJValue;
+    function FindMatchingEnd(Lo: integer;
+      const OpenKw, EndKw: string): integer;
+  public
+    constructor Create(const ATemplate: string;
+      const AMessages: array of TChatMessage; AAddGen: boolean;
+      const ABos, AEos: string);
+    function Render: string;
+  end;
+
+constructor TJInterp.Create(const ATemplate: string;
+  const AMessages: array of TChatMessage; AAddGen: boolean;
+  const ABos, AEos: string);
+var
+  I: integer;
+begin
+  inherited Create;
+  FTemplate := ATemplate;
+  SetLength(FMessages, Length(AMessages));
+  for I := 0 to High(AMessages) do FMessages[I] := AMessages[I];
+  FAddGen := AAddGen;
+  FBos := ABos;
+  FEos := AEos;
+end;
+
+procedure TJInterp.Fail(const Msg: string);
+begin
+  raise EChatTemplateError.Create('chat_template: ' + Msg);
+end;
+
+function TJInterp.MakeStr(const S: string): TJValue;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.Kind := jvString;
+  Result.Str := S;
+end;
+
+function TJInterp.MakeInt(I: integer): TJValue;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.Kind := jvInt;
+  Result.IntV := I;
+end;
+
+function TJInterp.MakeBool(B: boolean): TJValue;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.Kind := jvBool;
+  Result.BoolV := B;
+end;
+
+function TJInterp.MakeUndefined: TJValue;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.Kind := jvUndefined;
+end;
+
+function TJInterp.ToStr(const V: TJValue): string;
+begin
+  case V.Kind of
+    jvString: Result := V.Str;
+    jvInt: Result := IntToStr(V.IntV);
+    jvBool: if V.BoolV then Result := 'True' else Result := 'False';
+    jvUndefined: Result := '';
+    else
+      Fail('cannot stringify a list/object value');
+  end;
+end;
+
+function TJInterp.Truthy(const V: TJValue): boolean;
+begin
+  case V.Kind of
+    jvUndefined: Result := false;
+    jvBool: Result := V.BoolV;
+    jvString: Result := V.Str <> '';
+    jvInt: Result := V.IntV <> 0;
+    jvMessages: Result := (V.SliceHi - V.SliceLo) > 0;
+    jvMessage: Result := true;
+    else Result := true;
+  end;
+end;
+
+function TJInterp.ValuesEqual(const A, B: TJValue): boolean;
+begin
+  // bool vs bool, int vs int, string vs string; undefined never equals a
+  // concrete value except undefined==undefined.
+  if (A.Kind = jvUndefined) or (B.Kind = jvUndefined) then
+    Result := (A.Kind = jvUndefined) and (B.Kind = jvUndefined)
+  else if (A.Kind = jvBool) or (B.Kind = jvBool) then
+    Result := (A.Kind = jvBool) and (B.Kind = jvBool) and (A.BoolV = B.BoolV)
+  else if (A.Kind = jvInt) and (B.Kind = jvInt) then
+    Result := A.IntV = B.IntV
+  else if (A.Kind = jvString) and (B.Kind = jvString) then
+    Result := A.Str = B.Str
+  else
+    Result := false;
+end;
+
+function TJInterp.LookupVar(const Name: string; out V: TJValue): boolean;
+var
+  I: integer;
+begin
+  // user-set variables take precedence (a {% set %} can shadow specials).
+  for I := High(FVars) downto 0 do
+    if FVars[I].Name = Name then
+    begin
+      V := FVars[I].Value;
+      Exit(true);
+    end;
+  if Name = 'messages' then
+  begin
+    FillChar(V, SizeOf(V), 0);
+    V.Kind := jvMessages;
+    V.SliceLo := 0;
+    V.SliceHi := Length(FMessages);
+    Exit(true);
+  end
+  else if Name = 'add_generation_prompt' then
+  begin
+    V := MakeBool(FAddGen);
+    Exit(true);
+  end
+  else if Name = 'bos_token' then begin V := MakeStr(FBos); Exit(true); end
+  else if Name = 'eos_token' then begin V := MakeStr(FEos); Exit(true); end
+  else if Name = 'true' then begin V := MakeBool(true); Exit(true); end
+  else if Name = 'false' then begin V := MakeBool(false); Exit(true); end
+  else if Name = 'none' then begin V := MakeUndefined; Exit(true); end;
+  V := MakeUndefined;
+  Result := false;
+end;
+
+procedure TJInterp.SetVar(const Name: string; const V: TJValue);
+var
+  I: integer;
+begin
+  for I := 0 to High(FVars) do
+    if FVars[I].Name = Name then
+    begin
+      FVars[I].Value := V;
+      Exit;
+    end;
+  SetLength(FVars, Length(FVars) + 1);
+  FVars[High(FVars)].Name := Name;
+  FVars[High(FVars)].Value := V;
+end;
+
+// --- Tokenizer: split FTemplate into TEXT / output / statement chunks,
+// applying whitespace control. trim_blocks: a block tag {% %} that is
+// immediately followed by a newline swallows that newline. lstrip_blocks:
+// whitespace from line start up to a block tag is stripped. {%- strips all
+// whitespace before; -%} strips all whitespace after (overrides the block
+// defaults). Same for {{- -}}.
+procedure TJInterp.Tokenize;
+var
+  P, Len, TagStart, TagEnd: integer;
+  T: string;
+  IsStmt, TrimLeft, TrimRight: boolean;
+  Inner, PrevText: string;
+  K: integer;
+
+  procedure AddChunk(Kind: char; const Txt: string);
+  begin
+    SetLength(FChunks, Length(FChunks) + 1);
+    FChunks[High(FChunks)].Kind := Kind;
+    FChunks[High(FChunks)].Text := Txt;
+  end;
+
+begin
+  T := FTemplate;
+  Len := Length(T);
+  P := 1;
+  while P <= Len do
+  begin
+    // find next tag opener "{{" or "{%"
+    TagStart := 0;
+    K := P;
+    while K < Len do
+    begin
+      if (T[K] = '{') and ((T[K + 1] = '{') or (T[K + 1] = '%')) then
+      begin
+        TagStart := K;
+        Break;
+      end;
+      Inc(K);
+    end;
+    if TagStart = 0 then
+    begin
+      // trailing text
+      if P <= Len then AddChunk('T', Copy(T, P, Len - P + 1));
+      Break;
+    end;
+    // emit preceding text chunk
+    if TagStart > P then AddChunk('T', Copy(T, P, TagStart - P));
+    IsStmt := T[TagStart + 1] = '%';
+    // detect left trim marker "{{-" / "{%-"
+    TrimLeft := (TagStart + 2 <= Len) and (T[TagStart + 2] = '-');
+    // find tag end
+    TagEnd := 0;
+    K := TagStart + 2;
+    while K < Len do
+    begin
+      if IsStmt and (T[K] = '%') and (T[K + 1] = '}') then
+      begin TagEnd := K; Break; end;
+      if (not IsStmt) and (T[K] = '}') and (T[K + 1] = '}') then
+      begin TagEnd := K; Break; end;
+      Inc(K);
+    end;
+    if TagEnd = 0 then Fail('unterminated tag');
+    TrimRight := (T[TagEnd - 1] = '-');
+    Inner := Copy(T, TagStart + 2, TagEnd - (TagStart + 2));
+    if TrimLeft then Delete(Inner, 1, 1);
+    if TrimRight then Delete(Inner, Length(Inner), 1);
+    Inner := Trim(Inner);
+
+    // apply left-side whitespace control to the previously emitted TEXT.
+    if Length(FChunks) > 0 then
+    begin
+      if FChunks[High(FChunks)].Kind = 'T' then
+      begin
+        PrevText := FChunks[High(FChunks)].Text;
+        if TrimLeft then
+        begin
+          // strip ALL trailing whitespace
+          while (Length(PrevText) > 0) and
+            (PrevText[Length(PrevText)] in [' ', #9, #10, #13]) do
+            Delete(PrevText, Length(PrevText), 1);
+        end
+        else if IsStmt then
+        begin
+          // lstrip_blocks: strip spaces/tabs back to the last newline.
+          K := Length(PrevText);
+          while (K > 0) and (PrevText[K] in [' ', #9]) do Dec(K);
+          if (K = 0) or (PrevText[K] = #10) then
+            SetLength(PrevText, K);
+        end;
+        FChunks[High(FChunks)].Text := PrevText;
+      end;
+    end;
+
+    if IsStmt then AddChunk('S', Inner) else AddChunk('O', Inner);
+
+    P := TagEnd + 2;
+    // right-side whitespace control on the text that FOLLOWS.
+    if TrimRight then
+    begin
+      while (P <= Len) and (T[P] in [' ', #9, #10, #13]) do Inc(P);
+    end
+    else if IsStmt then
+    begin
+      // trim_blocks: swallow a single trailing newline (and a preceding CR).
+      if (P <= Len) and (T[P] = #13) and (P + 1 <= Len) and (T[P + 1] = #10)
+        then Inc(P, 2)
+      else if (P <= Len) and (T[P] = #10) then Inc(P);
+    end;
+  end;
+end;
+
+procedure TJInterp.SkipWs(const S: string; var P: integer);
+begin
+  while (P <= Length(S)) and (S[P] in [' ', #9, #10, #13]) do Inc(P);
+end;
+
+function TJInterp.PeekWord(const S: string; P: integer;
+  const W: string): boolean;
+var
+  E: integer;
+begin
+  // matches keyword W at P followed by a non-identifier char (word boundary)
+  if Copy(S, P, Length(W)) <> W then Exit(false);
+  E := P + Length(W);
+  Result := (E > Length(S)) or not (S[E] in
+    ['a'..'z', 'A'..'Z', '0'..'9', '_']);
+end;
+
+// --- expression evaluation (recursive descent) ---
+
+function TJInterp.ParseExpr(const S: string; var P: integer): TJValue;
+begin
+  Result := ParseOr(S, P);
+end;
+
+function TJInterp.ParseOr(const S: string; var P: integer): TJValue;
+var
+  R: TJValue;
+begin
+  Result := ParseAnd(S, P);
+  SkipWs(S, P);
+  while PeekWord(S, P, 'or') do
+  begin
+    Inc(P, 2);
+    R := ParseAnd(S, P);
+    Result := MakeBool(Truthy(Result) or Truthy(R));
+    SkipWs(S, P);
+  end;
+end;
+
+function TJInterp.ParseAnd(const S: string; var P: integer): TJValue;
+var
+  R: TJValue;
+begin
+  Result := ParseNot(S, P);
+  SkipWs(S, P);
+  while PeekWord(S, P, 'and') do
+  begin
+    Inc(P, 3);
+    R := ParseNot(S, P);
+    Result := MakeBool(Truthy(Result) and Truthy(R));
+    SkipWs(S, P);
+  end;
+end;
+
+function TJInterp.ParseNot(const S: string; var P: integer): TJValue;
+var
+  R: TJValue;
+begin
+  SkipWs(S, P);
+  if PeekWord(S, P, 'not') then
+  begin
+    Inc(P, 3);
+    R := ParseNot(S, P);
+    Result := MakeBool(not Truthy(R));
+  end
+  else
+    Result := ParseCompare(S, P);
+end;
+
+function TJInterp.ParseCompare(const S: string; var P: integer): TJValue;
+var
+  R: TJValue;
+  Op: string;
+  Cmp: integer;
+  Res: boolean;
+begin
+  Result := ParseConcat(S, P);
+  SkipWs(S, P);
+  // 'is defined' / 'is not defined'
+  if PeekWord(S, P, 'is') then
+  begin
+    Inc(P, 2);
+    SkipWs(S, P);
+    if PeekWord(S, P, 'not') then
+    begin
+      Inc(P, 3); SkipWs(S, P);
+      if not PeekWord(S, P, 'defined') then Fail('expected ''defined''');
+      Inc(P, 7);
+      Result := MakeBool(Result.Kind = jvUndefined);
+    end
+    else if PeekWord(S, P, 'defined') then
+    begin
+      Inc(P, 7);
+      Result := MakeBool(Result.Kind <> jvUndefined);
+    end
+    else
+      Fail('unsupported ''is'' test');
+    Exit;
+  end;
+  // relational / equality operators
+  Op := '';
+  if Copy(S, P, 2) = '==' then Op := '=='
+  else if Copy(S, P, 2) = '!=' then Op := '!='
+  else if Copy(S, P, 2) = '<=' then Op := '<='
+  else if Copy(S, P, 2) = '>=' then Op := '>='
+  else if (P <= Length(S)) and (S[P] = '<') then Op := '<'
+  else if (P <= Length(S)) and (S[P] = '>') then Op := '>';
+  if Op = '' then Exit;
+  Inc(P, Length(Op));
+  R := ParseConcat(S, P);
+  case Op of
+    '==': Result := MakeBool(ValuesEqual(Result, R));
+    '!=': Result := MakeBool(not ValuesEqual(Result, R));
+    else
+    begin
+      if (Result.Kind <> jvInt) or (R.Kind <> jvInt) then
+        Fail('relational comparison needs integers');
+      if Result.IntV < R.IntV then Cmp := -1
+      else if Result.IntV > R.IntV then Cmp := 1
+      else Cmp := 0;
+      case Op of
+        '<': Res := Cmp < 0;
+        '<=': Res := Cmp <= 0;
+        '>': Res := Cmp > 0;
+        '>=': Res := Cmp >= 0;
+        else Res := false;
+      end;
+      Result := MakeBool(Res);
+    end;
+  end;
+end;
+
+function TJInterp.ParseConcat(const S: string; var P: integer): TJValue;
+var
+  R: TJValue;
+begin
+  Result := ParseAddSub(S, P);
+  SkipWs(S, P);
+  while (P <= Length(S)) and (S[P] = '~') do
+  begin
+    Inc(P);
+    R := ParseAddSub(S, P);
+    Result := MakeStr(ToStr(Result) + ToStr(R));
+    SkipWs(S, P);
+  end;
+end;
+
+function TJInterp.ParseAddSub(const S: string; var P: integer): TJValue;
+var
+  R: TJValue;
+  Op: char;
+begin
+  Result := ParseMulMod(S, P);
+  SkipWs(S, P);
+  while (P <= Length(S)) and ((S[P] = '+') or (S[P] = '-')) do
+  begin
+    // ensure it's not part of "->" or similar; here only + and - binary
+    Op := S[P];
+    Inc(P);
+    R := ParseMulMod(S, P);
+    if (Op = '+') and ((Result.Kind = jvString) or (R.Kind = jvString)) then
+      Result := MakeStr(ToStr(Result) + ToStr(R))
+    else if (Result.Kind = jvInt) and (R.Kind = jvInt) then
+    begin
+      if Op = '+' then Result := MakeInt(Result.IntV + R.IntV)
+      else Result := MakeInt(Result.IntV - R.IntV);
+    end
+    else
+      Fail('cannot apply ''' + Op + ''' to these operands');
+    SkipWs(S, P);
+  end;
+end;
+
+function TJInterp.ParseMulMod(const S: string; var P: integer): TJValue;
+var
+  R: TJValue;
+begin
+  Result := ParsePostfix(S, P);
+  SkipWs(S, P);
+  while (P <= Length(S)) and (S[P] = '%') do
+  begin
+    Inc(P);
+    R := ParsePostfix(S, P);
+    if (Result.Kind <> jvInt) or (R.Kind <> jvInt) or (R.IntV = 0) then
+      Fail('modulo needs nonzero integers');
+    Result := MakeInt(Result.IntV mod R.IntV);
+    SkipWs(S, P);
+  end;
+end;
+
+// postfix: indexing [..], attribute .name, filter |name(args), method .m()
+function TJInterp.ParsePostfix(const S: string; var P: integer): TJValue;
+var
+  Key, FilterName, AttrName: string;
+  Idx, Start, ColonPos, Lo, Hi: integer;
+  IdxVal: TJValue;
+  HasLo, HasHi: boolean;
+  Inner: string;
+begin
+  Result := ParsePrimary(S, P);
+  SkipWs(S, P);
+  while P <= Length(S) do
+  begin
+    if S[P] = '[' then
+    begin
+      // subscript: string key or integer index or slice a:b
+      Inc(P);
+      SkipWs(S, P);
+      // gather inner up to matching ]
+      Start := P;
+      while (P <= Length(S)) and (S[P] <> ']') do Inc(P);
+      if P > Length(S) then Fail('unterminated subscript');
+      Inner := Trim(Copy(S, Start, P - Start));
+      Inc(P); // skip ]
+      ColonPos := Pos(':', Inner);
+      if ColonPos > 0 then
+      begin
+        // slice messages[a:b] -- only valid on jvMessages
+        if Result.Kind <> jvMessages then
+          Fail('slice on non-list');
+        HasLo := Trim(Copy(Inner, 1, ColonPos - 1)) <> '';
+        HasHi := Trim(Copy(Inner, ColonPos + 1, MaxInt)) <> '';
+        if HasLo then Lo := StrToInt(Trim(Copy(Inner, 1, ColonPos - 1)))
+        else Lo := 0;
+        if HasHi then
+          Hi := StrToInt(Trim(Copy(Inner, ColonPos + 1, MaxInt)))
+        else Hi := Result.SliceHi - Result.SliceLo;
+        IdxVal := Result;
+        Result.SliceLo := IdxVal.SliceLo + Lo;
+        Result.SliceHi := IdxVal.SliceLo + Hi;
+      end
+      else if (Length(Inner) > 0) and
+        ((Inner[1] = '''') or (Inner[1] = '"')) then
+      begin
+        // string key on a message
+        Key := Copy(Inner, 2, Length(Inner) - 2);
+        if Result.Kind <> jvMessage then Fail('string key on non-object');
+        if Key = 'role' then Result := MakeStr(FMessages[Result.MsgIdx].Role)
+        else if Key = 'content' then
+          Result := MakeStr(FMessages[Result.MsgIdx].Content)
+        else
+          Fail('unknown message key ''' + Key + '''');
+      end
+      else
+      begin
+        // integer index into messages
+        Idx := StrToInt(Inner);
+        if Result.Kind <> jvMessages then Fail('index on non-list');
+        if (Idx < 0) or (Result.SliceLo + Idx >= Result.SliceHi) then
+          Fail('list index out of range');
+        IdxVal := Result;
+        FillChar(Result, SizeOf(Result), 0);
+        Result.Kind := jvMessage;
+        Result.MsgIdx := IdxVal.SliceLo + Idx;
+      end;
+    end
+    else if (S[P] = '.') then
+    begin
+      Inc(P);
+      Start := P;
+      while (P <= Length(S)) and (S[P] in
+        ['a'..'z', 'A'..'Z', '0'..'9', '_']) do Inc(P);
+      AttrName := Copy(S, Start, P - Start);
+      SkipWs(S, P);
+      if (P <= Length(S)) and (S[P] = '(') then
+      begin
+        // method call: only .strip() supported
+        Inc(P);
+        SkipWs(S, P);
+        if (P <= Length(S)) and (S[P] = ')') then Inc(P)
+        else Fail('method args not supported');
+        if AttrName = 'strip' then
+          Result := MakeStr(PyStrip(ToStr(Result)))
+        else
+          Fail('unsupported method .' + AttrName + '()');
+      end
+      else
+      begin
+        // attribute: message.role / message.content / loop.xxx
+        if Result.Kind = jvMessage then
+        begin
+          if AttrName = 'role' then
+            Result := MakeStr(FMessages[Result.MsgIdx].Role)
+          else if AttrName = 'content' then
+            Result := MakeStr(FMessages[Result.MsgIdx].Content)
+          else
+            Fail('unknown message attribute .' + AttrName);
+        end
+        else if Result.Kind = jvLoop then
+        begin
+          if AttrName = 'index0' then Result := MakeInt(Result.LoopIndex0)
+          else if AttrName = 'index' then
+            Result := MakeInt(Result.LoopIndex0 + 1)
+          else if AttrName = 'first' then
+            Result := MakeBool(Result.LoopIndex0 = 0)
+          else if AttrName = 'last' then
+            Result := MakeBool(Result.LoopIndex0 = Result.LoopCount - 1)
+          else
+            Fail('unknown loop attribute .' + AttrName);
+        end
+        else
+          Fail('attribute .' + AttrName + ' on unsupported value');
+      end;
+    end
+    else if S[P] = '|' then
+    begin
+      Inc(P);
+      SkipWs(S, P);
+      Start := P;
+      while (P <= Length(S)) and (S[P] in
+        ['a'..'z', 'A'..'Z', '0'..'9', '_']) do Inc(P);
+      FilterName := Copy(S, Start, P - Start);
+      SkipWs(S, P);
+      if FilterName = 'trim' then
+        Result := MakeStr(PyStrip(ToStr(Result)))
+      else if FilterName = 'default' then
+      begin
+        if (P > Length(S)) or (S[P] <> '(') then
+          Fail('default filter needs an argument');
+        Inc(P);
+        IdxVal := ParseExpr(S, P);
+        SkipWs(S, P);
+        if (P > Length(S)) or (S[P] <> ')') then Fail('expected )');
+        Inc(P);
+        if Result.Kind = jvUndefined then Result := IdxVal;
+      end
+      else
+        Fail('unsupported filter |' + FilterName);
+    end
+    else
+      Break;
+    SkipWs(S, P);
+  end;
+end;
+
+function TJInterp.ParsePrimary(const S: string; var P: integer): TJValue;
+var
+  Start: integer;
+  Ident, Lit, FnName, Quote: string;
+  V: TJValue;
+  Arg: TJValue;
+begin
+  SkipWs(S, P);
+  if P > Length(S) then Fail('unexpected end of expression');
+  if S[P] = '(' then
+  begin
+    Inc(P);
+    Result := ParseExpr(S, P);
+    SkipWs(S, P);
+    if (P > Length(S)) or (S[P] <> ')') then Fail('expected )');
+    Inc(P);
+    Exit;
+  end;
+  if (S[P] = '''') or (S[P] = '"') then
+  begin
+    Quote := S[P];
+    Inc(P);
+    Start := P;
+    while (P <= Length(S)) and (S[P] <> Quote[1]) do Inc(P);
+    if P > Length(S) then Fail('unterminated string literal');
+    Lit := Copy(S, Start, P - Start);
+    Inc(P);
+    Result := MakeStr(Lit);
+    Exit;
+  end;
+  if S[P] in ['0'..'9'] then
+  begin
+    Start := P;
+    while (P <= Length(S)) and (S[P] in ['0'..'9']) do Inc(P);
+    Result := MakeInt(StrToInt(Copy(S, Start, P - Start)));
+    Exit;
+  end;
+  if S[P] in ['a'..'z', 'A'..'Z', '_'] then
+  begin
+    Start := P;
+    while (P <= Length(S)) and (S[P] in
+      ['a'..'z', 'A'..'Z', '0'..'9', '_']) do Inc(P);
+    Ident := Copy(S, Start, P - Start);
+    SkipWs(S, P);
+    // function call?
+    if (P <= Length(S)) and (S[P] = '(') then
+    begin
+      FnName := Ident;
+      Inc(P);
+      SkipWs(S, P);
+      if FnName = 'raise_exception' then
+      begin
+        Arg := ParseExpr(S, P);
+        SkipWs(S, P);
+        if (P > Length(S)) or (S[P] <> ')') then Fail('expected )');
+        Inc(P);
+        raise EChatTemplateError.Create(ToStr(Arg));
+      end
+      else
+        Fail('unsupported function ' + FnName + '()');
+    end;
+    if LookupVar(Ident, V) then Result := V
+    else Result := MakeUndefined;
+    Exit;
+  end;
+  Fail('unexpected character ''' + S[P] + ''' in expression');
+end;
+
+// --- block execution ---
+
+function TJInterp.FindMatchingEnd(Lo: integer;
+  const OpenKw, EndKw: string): integer;
+var
+  I, Depth, P: integer;
+  Kw, Body: string;
+begin
+  Depth := 1;
+  I := Lo;
+  while I < Length(FChunks) do
+  begin
+    if FChunks[I].Kind = 'S' then
+    begin
+      Body := FChunks[I].Text;
+      P := 1;
+      while (P <= Length(Body)) and (Body[P] in
+        ['a'..'z', 'A'..'Z', '_']) do Inc(P);
+      Kw := Copy(Body, 1, P - 1);
+      if Kw = OpenKw then Inc(Depth)
+      else if Kw = EndKw then
+      begin
+        Dec(Depth);
+        if Depth = 0 then Exit(I);
+      end;
+    end;
+    Inc(I);
+  end;
+  Fail('missing {% ' + EndKw + ' %}');
+  Result := -1;
+end;
+
+function TJInterp.EvalFullExpr(const S: string): TJValue;
+var
+  P: integer;
+begin
+  P := 1;
+  Result := ParseExpr(S, P);
+  SkipWs(S, P);
+  if P <= Length(S) then Fail('trailing characters in expression: ' +
+    Copy(S, P, MaxInt));
+end;
+
+// Splits a statement chunk into its leading keyword and the remainder.
+procedure StatementKeyword(const Body: string;
+  out Kw, Rest: string);
+var
+  P: integer;
+begin
+  P := 1;
+  while (P <= Length(Body)) and (Body[P] in
+    ['a'..'z', 'A'..'Z', '_']) do Inc(P);
+  Kw := Copy(Body, 1, P - 1);
+  Rest := Trim(Copy(Body, P, MaxInt));
+end;
+
+// Executes an {% if %}...{% endif %} block. Lo points just past the {% if %}
+// chunk; EndIdx is the {% endif %} chunk index. FirstCond is the if
+// condition. Walks the elif/else clauses at nesting depth 0.
+procedure TJInterp.ExecIf(Lo, EndIdx: integer; const FirstCond: string);
+var
+  I, Depth, ClauseStart: integer;
+  Kw, Rest, CurCond: string;
+  Taken: boolean;
+begin
+  CurCond := FirstCond;
+  ClauseStart := Lo;
+  Taken := false;
+  I := Lo;
+  Depth := 0;
+  while I < EndIdx do
+  begin
+    if FChunks[I].Kind = 'S' then
+    begin
+      StatementKeyword(FChunks[I].Text, Kw, Rest);
+      if (Kw = 'if') or (Kw = 'for') then Inc(Depth)
+      else if (Kw = 'endif') or (Kw = 'endfor') then Dec(Depth)
+      else if (Depth = 0) and ((Kw = 'elif') or (Kw = 'else')) then
+      begin
+        // close the current clause; evaluate it if not yet taken.
+        if (not Taken) and Truthy(EvalFullExpr(CurCond)) then
+        begin
+          ExecRange(ClauseStart, I);
+          Taken := true;
+        end;
+        if Kw = 'elif' then CurCond := Rest
+        else CurCond := 'true'; // else clause always passes if reached
+        ClauseStart := I + 1;
+      end;
+    end;
+    Inc(I);
+  end;
+  if (not Taken) and Truthy(EvalFullExpr(CurCond)) then
+    ExecRange(ClauseStart, EndIdx);
+end;
+
+procedure TJInterp.ExecRange(Lo, Hi: integer);
+var
+  I, P, EndIdx, BodyStart: integer;
+  Body, Kw, Rest, VarName, IterName: string;
+  IterVal, Item, LoopVal, SetVal: TJValue;
+  M: integer;
+begin
+  I := Lo;
+  while I < Hi do
+  begin
+    case FChunks[I].Kind of
+      'T': begin FOutput := FOutput + FChunks[I].Text; Inc(I); end;
+      'O':
+        begin
+          FOutput := FOutput + ToStr(EvalFullExpr(FChunks[I].Text));
+          Inc(I);
+        end;
+      'S':
+        begin
+          StatementKeyword(FChunks[I].Text, Kw, Rest);
+          if Kw = 'for' then
+          begin
+            EndIdx := FindMatchingEnd(I + 1, 'for', 'endfor');
+            // parse "var in expr"
+            P := 1;
+            SkipWs(Rest, P);
+            BodyStart := P;
+            while (P <= Length(Rest)) and (Rest[P] in
+              ['a'..'z', 'A'..'Z', '0'..'9', '_']) do Inc(P);
+            IterName := Copy(Rest, BodyStart, P - BodyStart);
+            SkipWs(Rest, P);
+            if not PeekWord(Rest, P, 'in') then Fail('for: expected ''in''');
+            Inc(P, 2);
+            IterVal := ParseExpr(Rest, P);
+            SkipWs(Rest, P);
+            if P <= Length(Rest) then
+              Fail('for: trailing characters after iterable');
+            if IterVal.Kind <> jvMessages then
+              Fail('for: only message lists are iterable');
+            for M := IterVal.SliceLo to IterVal.SliceHi - 1 do
+            begin
+              FillChar(Item, SizeOf(Item), 0);
+              Item.Kind := jvMessage;
+              Item.MsgIdx := M;
+              SetVar(IterName, Item);
+              FillChar(LoopVal, SizeOf(LoopVal), 0);
+              LoopVal.Kind := jvLoop;
+              LoopVal.LoopIndex0 := M - IterVal.SliceLo;
+              LoopVal.LoopCount := IterVal.SliceHi - IterVal.SliceLo;
+              SetVar('loop', LoopVal);
+              ExecRange(I + 1, EndIdx);
+            end;
+            I := EndIdx + 1;
+          end
+          else if Kw = 'if' then
+          begin
+            EndIdx := FindMatchingEnd(I + 1, 'if', 'endif');
+            ExecIf(I + 1, EndIdx, Rest);
+            I := EndIdx + 1;
+          end
+          else if Kw = 'set' then
+          begin
+            P := Pos('=', Rest);
+            if P = 0 then Fail('set: expected ''=''');
+            VarName := Trim(Copy(Rest, 1, P - 1));
+            SetVal := EvalFullExpr(Trim(Copy(Rest, P + 1, MaxInt)));
+            SetVar(VarName, SetVal);
+            Inc(I);
+          end
+          else if (Kw = 'endfor') or (Kw = 'endif') or (Kw = 'else') or
+            (Kw = 'elif') then
+            Fail('unexpected {% ' + Kw + ' %}')
+          else
+            Fail('unsupported statement {% ' + Kw + ' %}');
+        end;
+    end;
+  end;
+end;
+
+function TJInterp.Render: string;
+begin
+  Tokenize;
+  FOutput := '';
+  ExecRange(0, Length(FChunks));
+  Result := FOutput;
+end;
+
+function RenderChatTemplate(const Template: string;
+  const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean;
+  const BosToken: string = ''; const EosToken: string = ''): string;
+var
+  Interp: TJInterp;
+begin
+  Interp := TJInterp.Create(Template, Messages, AddGenerationPrompt,
+    BosToken, EosToken);
+  try
+    Result := Interp.Render;
+  finally
+    Interp.Free;
+  end;
+end;
+
 function ApplyChatTemplate(ChatFormat: TNeuralChatFormat;
   const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean = true): string;
@@ -548,6 +1526,27 @@ begin
         '(auto-detection via DetectChatFormat did not recognize the ' +
         'model''s chat_template).');
   end;
+end;
+
+function ApplyChatTemplateString(const ChatTemplate: string;
+  const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean = true;
+  const BosToken: string = ''; const EosToken: string = ''): string;
+var
+  Detected: TNeuralChatFormat;
+begin
+  Detected := DetectChatFormat(ChatTemplate);
+  if Detected <> cfUnknown then
+    // Recognized family: the hardcoded renderer is the byte-pinned ground
+    // truth, so prefer it over re-interpreting the Jinja.
+    Result := ApplyChatTemplate(Detected, Messages, AddGenerationPrompt)
+  else if Trim(ChatTemplate) = '' then
+    raise EChatTemplateError.Create(
+      'no chat_template available to render')
+  else
+    // Fallback: render the raw Jinja template via the mini-Jinja interpreter.
+    Result := RenderChatTemplate(ChatTemplate, Messages,
+      AddGenerationPrompt, BosToken, EosToken);
 end;
 
 procedure EncodeChat(Tokenizer: TNeuralHFTokenizer;
