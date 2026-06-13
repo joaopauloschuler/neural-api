@@ -801,5 +801,5 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       `[grad] [serialize]` block, written by a small script.
 
 # Examples
-- [ ] A chat terminal application with option to select the model to import
+- [X] A chat terminal application with option to select the model to import
       and inference parameters.
