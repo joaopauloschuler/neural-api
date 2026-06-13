@@ -123,6 +123,31 @@ rather than acted on.
       mixed image+text prompt vs HF float64, and an examples/LlavaDescribe
       demo that captions a small image on CPU. First image-in/text-out
       model in the repo; opens the door to Qwen-VL/PaliGemma later.
+- [ ] DeBERTa-v3 importer + disentangled attention (BuildDebertaV2FromSafeTensors,
+      model_type "deberta-v2"): the dominant small-encoder family for
+      NLU/classification/NER/reranking (deberta-v3-base/small, the ms-marco
+      rerankers), and the FIRST genuinely new attention mechanism beyond the
+      landed softmax/ALiBi/T5-bias variants — distinct from RoBERTa, which the
+      BERT importer already covers. The new piece is DISENTANGLED attention:
+      the score is content-to-content PLUS content-to-position PLUS
+      position-to-content, where the position terms use a SEPARATE relative-
+      position embedding table projected by its own W_q_pos/W_k_pos and gathered
+      by clamped relative distance (att_span buckets, log-bucket "bucketing"
+      when position_buckets>0) — a new TNNet attention layer, not a builder over
+      SDPA (the existing avT5RelPosBias adds a learned SCALAR bias per bucket;
+      this projects position EMBEDDINGS, a different math). Also new: the
+      Conv-after-embeddings option is absent here (v3 has none), but the
+      embedding path is StableDropout + a single LayerNorm (no token-type add
+      when type_vocab_size=0), and the v3 LM/classification head differs from
+      BERT. Tokenizer: DeBERTa-v3 ships a SentencePiece model — depends on the
+      open SentencePiece/Unigram tokenizer task (or convert to the BPE
+      tokenizer.json the landed TNeuralHFTokenizer reads). Deliverables:
+      BuildDebertaV2FromSafeTensors[Ex] + a TNNetDisentangledAttention layer
+      with its own numerical-gradient test, a pico parity fixture (make_pico_*
+      recipe) asserting hidden states AND sequence-classification logits vs HF
+      float64, and a cross-encoder RERANKING example over the landed
+      BuildBertForSequenceClassification scoring path (query+passage -> relevance
+      score), the canonical RAG-reranker demo the encoder importers enable.
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
