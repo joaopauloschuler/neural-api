@@ -412,10 +412,10 @@ rather than acted on.
       neuralnlpmetrics.pas are both waiting on the Unigram/SentencePiece
       tokenizer for real Marian/T5 checkpoints - wire an examples/ entry
       (and an examples/README.md mention) once that lands.
-- [ ] Masked-LM collator follow-up (TNNetMaskedLMCollator is landed in
+- [X] Masked-LM collator follow-up (TNNetMaskedLMCollator is landed in
       neuraldatasets.pas): whole-word masking (group subword pieces of one
       word and mask them together).
-- [ ] Masked-LM collator follow-up: T5 span corruption with sentinel tokens
+- [X] Masked-LM collator follow-up: T5 span corruption with sentinel tokens
       (contiguous-span masking, sentinel id stream).
 - [ ] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
       above): K learnable virtual-token embeddings prepended to the
