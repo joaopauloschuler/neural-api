@@ -628,6 +628,17 @@ rather than acted on.
       them on CPU. Completes the bi-encoder / cross-encoder / late-interaction
       retrieval trio and turns the broad encoder-import coverage into a
       state-of-the-art RAG retriever.
+      ColBERT follow-ups (the core import + MaxSim scorer + report + parity
+      fixture + examples/ColBERTSearch all LANDED a3, commit 442af2c): (a)
+      attention-padding-mask support so a document shorter than the net's SeqLen
+      is encoded exactly — today real tokens attend to the [PAD] rows (the same
+      approximation examples/SemanticSearch documents); this also unblocks
+      faithful batch-encoding of mixed-length docs in one net; (b) a library-side
+      end-to-end "encode corpus -> cache doc matrices -> score query" helper in
+      neuralpretrained.pas (today only the examples/ColBERTSearch demo wires this;
+      ColBERTEmbedTokens + ColBERTMaxSimScore exist but the caching loop lives in
+      the example); (c) pQuantizeInt8 for the ColBERT path — the projection head
+      is always f32 while the BERT backbone already supports int8.
 
 ## Layer follow-ups that fix real limitations
 
