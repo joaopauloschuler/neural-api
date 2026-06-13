@@ -109,6 +109,38 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] Extractive question-answering (SQuAD) head import + EM/F1 eval — the
+      missing classic downstream-task head on top of the landed encoder
+      importers. Today only TWO task heads exist
+      (BuildBertForSequenceClassificationFromSafeTensors,
+      BuildGPT2ForSequenceClassificationFromSafeTensors), both single-vector
+      classifiers; extractive QA is genuinely DIFFERENT and not a near-duplicate
+      of either: the `qa_outputs` head is a [hidden -> 2] linear producing
+      PER-TOKEN start/end span logits (no pooling), decode picks the best span
+      `argmax_{s<=e<=s+maxlen} start[s]+end[e]` over the context tokens (not the
+      question), and the metric is SQuAD Exact-Match + token-F1 over the decoded
+      answer STRING (not classification accuracy). Nearly everything exists: the
+      backbone is the stock BERT/RoBERTa/DistilBERT path
+      (BuildBertFromSafeTensors / family name map), the tokenizers are landed,
+      and the offset-mapping helper (EncodeWithOffsets) already maps tokens back
+      to character spans so the predicted token span can be sliced out of the
+      original context. The genuinely new pieces: (a) a thin import EXTENSION
+      that loads the `qa_outputs` [hidden -> 2] dense (+bias) onto the encoder
+      (BuildBertForQuestionAnsweringFromSafeTensors[Ex], `*ForQuestionAnswering`
+      architectures), (b) a span-decode helper `AnswerSpan(question, context)`
+      that runs the [CLS] question [SEP] context [SEP] forward, masks
+      question/special positions, picks the top-scoring valid span, and returns
+      the answer substring via the offset map, and (c) a SQuAD `QAReport`
+      (Exact-Match + macro token-F1 over a planted question/context/gold-answer
+      set, mirroring the introspection-report pattern of the landed STSReport /
+      RetrievalReport). Deliverables: the importer + AnswerSpan + QAReport
+      helpers in neuralpretrained.pas, a pico parity fixture
+      (make_pico_*_fixture.py recipe) asserting the start/end span logits of one
+      distilbert-base-cased-distilled-squad / deepset-roberta-squad2-class
+      checkpoint match HF float64 within 1e-4, and an examples/ExtractiveQA demo
+      that answers a question from a short passage on CPU. Completes the
+      classify / retrieve / EXTRACT downstream-head trio on the encoder
+      backbones.
 - [ ] M2M100/NLLB translate demo + real-vocab check (follow-up to the landed
       BuildM2M100FromSafeTensors, commit cb21550): an examples/NLLBTranslate
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and
