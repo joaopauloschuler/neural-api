@@ -835,6 +835,9 @@ type
     procedure TestSinkAttentionGradientCheck;
     procedure TestSinkAttentionSinkParamGradientCheck;
     procedure TestSinkAttentionSerializationRoundTrip;
+    procedure TestGptOssSinkAttentionForward;
+    procedure TestGptOssSinkAttentionGradientCheck;
+    procedure TestGptOssSinkAttentionSerializationRoundTrip;
     procedure TestDifferentialAttentionLambdaZeroDegeneracy;
     procedure TestDifferentialAttentionGradientCheck;
     procedure TestDifferentialAttentionLambdaGradientCheck;
@@ -12811,6 +12814,196 @@ begin
       NN2.LoadFromString(Saved);
       Saved2 := NN2.SaveToString();
       AssertEquals('SinkAttn save->load->save string equality', Saved, Saved2);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssSinkAttentionForward;
+// Forward reference for a causal TNNetGptOssSinkAttention (d_k=4, SeqLen=3):
+// the per-head sink logit s enters the softmax DENOMINATOR only and the sink
+// contributes NOTHING to the output. Compared against a by-hand reference that
+// matches transformers' gpt_oss eager_attention_forward (cat([scores, sink]),
+// softmax, drop the sink column).
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Attn: TNNetGptOssSinkAttention;
+  SeqLen, Dk, i, j, d: integer;
+  InvSqrtDk, MaxScore, SumExp, sc, Sink: TNeuralFloat;
+  Score, Wgt: array of TNeuralFloat;
+  Ref: TNeuralFloat;
+begin
+  SeqLen := 3;
+  Dk := 4;
+  InvSqrtDk := 1.0 / Sqrt(Dk);
+  Sink := 0.6;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  SetLength(Score, SeqLen);
+  SetLength(Wgt, SeqLen);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetGptOssSinkAttention.Create(Dk, true, 0);
+    NN.AddLayer(Attn);
+    Attn.SetSinkLogit(Sink);
+    for i := 0 to SeqLen - 1 do
+      for d := 0 to Dk - 1 do
+      begin
+        Input[i, 0, d] := Sin(i * 0.7 + d * 0.3) + 0.5;        // Q
+        Input[i, 0, Dk + d] := Cos(i * 0.4 - d * 0.6) - 0.3;   // K
+        Input[i, 0, 2 * Dk + d] := i * 1.0 + 0.1 * d;          // V
+      end;
+    NN.Compute(Input);
+    AssertEquals('GptOssSink sink logit round-trips', Sink, Attn.SinkLogit(),
+      1e-6);
+    for i := 0 to SeqLen - 1 do
+    begin
+      MaxScore := Sink;
+      for j := 0 to SeqLen - 1 do
+      begin
+        if j > i then Score[j] := -1e30
+        else
+        begin
+          sc := 0;
+          for d := 0 to Dk - 1 do sc := sc + Input[i, 0, d] * Input[j, 0, Dk + d];
+          Score[j] := sc * InvSqrtDk;
+        end;
+        if Score[j] > MaxScore then MaxScore := Score[j];
+      end;
+      SumExp := Exp(Sink - MaxScore); // sink in the denominator only
+      for j := 0 to SeqLen - 1 do
+      begin
+        if j > i then Wgt[j] := 0 else Wgt[j] := Exp(Score[j] - MaxScore);
+        SumExp := SumExp + Wgt[j];
+      end;
+      for j := 0 to SeqLen - 1 do Wgt[j] := Wgt[j] / SumExp;
+      for d := 0 to Dk - 1 do
+      begin
+        Ref := 0;
+        for j := 0 to SeqLen - 1 do Ref := Ref + Wgt[j] * Input[j, 0, 2 * Dk + d];
+        AssertEquals('GptOssSink out[' + IntToStr(i) + ',' + IntToStr(d) + ']',
+          Ref, Attn.Output[i, 0, d], 1e-5);
+      end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssSinkAttentionGradientCheck;
+// Central-difference check of BOTH the input gradient (dL/dInput) AND the
+// trainable sink-logit gradient of a causal TNNetGptOssSinkAttention
+// (d_k=4, SeqLen=3) with a non-zero sink.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Attn: TNNetGptOssSinkAttention;
+  SeqLen, Dk: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  SeqLen := 3;
+  Dk := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetGptOssSinkAttention.Create(Dk, true, 0);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    Attn.SetSinkLogit(0.4);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    // --- input gradient ---
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      AssertTrue('GptOssSink input gradient at ' + IntToStr(i) + ' num=' +
+        FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // --- sink-logit gradient (analytical = -Neuron.Delta) ---
+    Attn.Neurons[0].Weights.Raw[0] := Attn.Neurons[0].Weights.Raw[0] + epsilon;
+    lossPlus := ComputeLoss(Input);
+    Attn.Neurons[0].Weights.Raw[0] := Attn.Neurons[0].Weights.Raw[0] - 2 * epsilon;
+    lossMinus := ComputeLoss(Input);
+    Attn.Neurons[0].Weights.Raw[0] := Attn.Neurons[0].Weights.Raw[0] + epsilon;
+    numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+    NN.Compute(Input);
+    Attn.Neurons[0].ClearDelta;
+    NN.Backpropagate(Desired);
+    analyticalGrad := -Attn.Neurons[0].Delta.Raw[0];
+    AssertTrue('GptOssSink sink-logit gradient num=' + FloatToStr(numericalGrad) +
+      ' ana=' + FloatToStr(analyticalGrad),
+      Abs(numericalGrad - analyticalGrad) < 0.01);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGptOssSinkAttentionSerializationRoundTrip;
+// save -> load -> save string equality with a non-default sink logit and a
+// sliding window (d_k=4, causal=true, window=2).
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn: TNNetGptOssSinkAttention;
+  Saved, Saved2: string;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 12, 1));
+    Attn := TNNetGptOssSinkAttention.Create(4, true, 2);
+    NN.AddLayer(Attn);
+    AssertEquals('GptOssSink neuron count', 1, Attn.Neurons.Count);
+    AssertEquals('GptOssSink window', 2, Attn.Window);
+    Attn.SetSinkLogit(1.234);
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('GptOssSink save->load->save string equality', Saved, Saved2);
+      AssertEquals('GptOssSink sink logit survives round-trip', 1.234,
+        TNNetGptOssSinkAttention(NN2.Layers[1]).SinkLogit(), 1e-6);
     finally
       NN2.Free;
     end;

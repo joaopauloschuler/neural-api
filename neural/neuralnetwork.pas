@@ -3535,6 +3535,39 @@ type
     property SinkAttentionWeights: TNNetVolume read FSinkAttn;
   end;
 
+  /// GPT-OSS attention sink (OpenAI gpt-oss, openai/gpt-oss-20b/120b).
+  // A drop-in variant of TNNetScaledDotProductAttention that appends ONE
+  // learnable SCALAR sink LOGIT to every query's softmax denominator. Unlike
+  // TNNetSinkAttention (whose sink score is a Q.SinkKey dot product and whose
+  // sink slot adds a learnable VALUE to the output), gpt-oss's sink is a fixed
+  // per-head scalar s that is independent of the query AND contributes NOTHING
+  // to the value mix (transformers modeling_gpt_oss.eager_attention_forward
+  // appends `sinks` to the logits, softmaxes, then DROPS the sink column:
+  // scores = probs[..., :-1]). For each query i over the real keys j:
+  //   score[j] = (Q[i].K[j]) / sqrt(d_k)   (masked if causal/window and j>i)
+  //   w[j]     = exp(score[j]) / (exp(s) + sum_k exp(score[k]))
+  //   out[i]   = sum_j w[j] * V[j]
+  // so the sink only leaks softmax mass off the real keys (smaller weights,
+  // never an explicit output term). The sink logit s is a single trainable
+  // scalar held as ONE neuron with ONE weight, so it round-trips through the
+  // base neuron save/load and is stepped by the optimizer. Causal mask and the
+  // sliding window are the parent's (FStruct), so this layer slots straight
+  // into the alternating sliding/full attention stack the gpt-oss importer
+  // builds. Input layout (same as SDPA): SizeY=1, SizeX=seqlen, Depth=3*d_k
+  // (Q|K|V). Output: SizeX x 1 x d_k.
+  // Coded by Claude (AI).
+  TNNetGptOssSinkAttention = class(TNNetScaledDotProductAttention)
+  public
+    constructor Create(d_k: integer; pCausalMask: boolean = true;
+      pWindow: integer = 0); overload;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    // The learnable per-head sink logit s (the single trainable scalar).
+    function SinkLogit(): TNeuralFloat;
+    procedure SetSinkLogit(const Value: TNeuralFloat);
+  end;
+
   /// Differential Attention (Differential Transformer, Ye et al., Microsoft
   /// 2024, https://arxiv.org/abs/2410.05258).
   // A drop-in variant of TNNetScaledDotProductAttention that computes TWO
@@ -3904,7 +3937,8 @@ type
       pOriginalContextLen: integer = 0;
       pYarnAlpha: TNeuralFloat = 1.0;
       pYarnBeta: TNeuralFloat = 32.0;
-      pLongAttnFactor: TNeuralFloat = 1.0); overload;
+      pLongAttnFactor: TNeuralFloat = 1.0;
+      pYarnTruncate: boolean = true); overload;
     // LongRoPE (rsmLongRoPE) constructor: pLongFactors is the per-frequency
     // factor table (length head_dim/2, divides each inverse frequency) and
     // pAttnFactor multiplies the rotated output (long_mscale).
@@ -26026,6 +26060,167 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetGptOssSinkAttention }
+
+constructor TNNetGptOssSinkAttention.Create(d_k: integer; pCausalMask: boolean;
+  pWindow: integer);
+begin
+  inherited Create(d_k, pCausalMask, pWindow);
+end;
+
+procedure TNNetGptOssSinkAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // ONE trainable scalar: the per-head sink logit, held as a single neuron
+  // with a single weight so it round-trips through the base neuron save/load.
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, 1);
+  FNeurons[0].FWeights.Raw[0] := 0;
+  AfterWeightUpdate();
+end;
+
+function TNNetGptOssSinkAttention.SinkLogit(): TNeuralFloat;
+begin
+  Result := FNeurons[0].FWeights.Raw[0];
+end;
+
+procedure TNNetGptOssSinkAttention.SetSinkLogit(const Value: TNeuralFloat);
+begin
+  FNeurons[0].FWeights.Raw[0] := Value;
+  AfterWeightUpdate();
+end;
+
+procedure TNNetGptOssSinkAttention.Compute();
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  Score, MaxScore, SumExp, Sink: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Sink := FNeurons[0].FWeights.Raw[0];
+  for i := 0 to SeqLen - 1 do
+  begin
+    // 1) Scaled scores into FAttn[*, i, 0] over the real keys, then fold the
+    //    sink logit into the running max for a numerically stable softmax.
+    MaxScore := Sink;
+    for j := 0 to SeqLen - 1 do
+    begin
+      if (FCausal and (j > i)) or
+         ((FWindow > 0) and (i - j >= FWindow)) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        Score := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
+        Score := Score * FInvSqrtDk;
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    // 2) Softmax with the sink term in the denominator only (the sink column is
+    //    never written into FAttn and contributes nothing to the output).
+    SumExp := pcr_expf(Sink - MaxScore);
+    for j := 0 to SeqLen - 1 do
+    begin
+      Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+      FAttn[j, i, 0] := Score;
+      SumExp := SumExp + Score;
+    end;
+    if SumExp > 0 then
+      for j := 0 to SeqLen - 1 do
+        FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    // 3) Output[i, d] = sum_j Attn[i,j] * V[j,d] (V contiguous along depth).
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGptOssSinkAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, j, k: integer;
+  Prev, PrevErr: TNNetVolume;
+  dAttn: array of TNeuralFloat;
+  dScore: array of TNeuralFloat;
+  SumDAttnAttn, A, dS, gSink, wSink: TNeuralFloat;
+  hasInputGrad: boolean;
+  OutErrPtr: TNeuralFloatArrPtr;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  hasInputGrad := (Prev.Size > 0) and (Prev.Size = PrevErr.Size);
+  SeqLen := Prev.SizeX;
+  SetLength(dAttn, SeqLen);
+  SetLength(dScore, SeqLen);
+  gSink := 0;
+  for i := 0 to SeqLen - 1 do
+  begin
+    OutErrPtr := FOutputError.GetRawPtr(i, 0, 0);
+    // dV[j] += Attn[i,j]*dOut[i];  dAttn[j] = dOut[i] . V[j]
+    for j := 0 to SeqLen - 1 do
+    begin
+      A := FAttn[j, i, 0];
+      if hasInputGrad then
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, 2 * FDk), OutErrPtr, A, FDk);
+      dAttn[j] := TNNetVolume.DotProduct(
+        OutErrPtr, Prev.GetRawPtr(j, 0, 2 * FDk), FDk);
+    end;
+    // Softmax Jacobian over the AUGMENTED row (real keys + the sink column).
+    // The sink has dAttn_sink = 0 (it contributes nothing to the output) but
+    // its post-softmax weight wSink = 1 - sum_j Attn[i,j] still enters the
+    // shared subtraction term and yields the sink-logit gradient.
+    wSink := 1;
+    SumDAttnAttn := 0;
+    for k := 0 to SeqLen - 1 do
+    begin
+      SumDAttnAttn := SumDAttnAttn + dAttn[k] * FAttn[k, i, 0];
+      wSink := wSink - FAttn[k, i, 0];
+    end;
+    if wSink < 0 then wSink := 0;
+    for j := 0 to SeqLen - 1 do
+      dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
+    // dL/ds for the sink column: w_sink * (0 - SumDAttnAttn).
+    gSink := gSink + wSink * (-SumDAttnAttn);
+    // dQ[i] / dK[j] from the real-key scores.
+    if hasInputGrad then
+      for j := 0 to SeqLen - 1 do
+      begin
+        dS := dScore[j] * FInvSqrtDk;
+        if dS <> 0 then
+        begin
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+            Prev.GetRawPtr(j, 0, FDk), dS, FDk);
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk),
+            Prev.GetRawPtr(i, 0, 0), dS, FDk);
+        end;
+      end;
+  end;
+  // Flush the sink-logit gradient (delta += -LR*grad, the layer convention).
+  FNeurons[0].FDelta.Raw[0] := FNeurons[0].FDelta.Raw[0] + (-FLearningRate) * gSink;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetDifferentialAttention }
 
 constructor TNNetDifferentialAttention.Create(d_k: integer;
@@ -26509,7 +26704,8 @@ end;
 constructor TNNetRotaryEmbedding.Create(pBase: TNeuralFloat;
   pScalingMode: TNNetRoPEScalingMode; pScaleFactor: TNeuralFloat;
   pOriginalContextLen: integer; pYarnAlpha: TNeuralFloat;
-  pYarnBeta: TNeuralFloat; pLongAttnFactor: TNeuralFloat);
+  pYarnBeta: TNeuralFloat; pLongAttnFactor: TNeuralFloat;
+  pYarnTruncate: boolean);
 begin
   inherited Create();
   if pBase <= 0 then
@@ -26538,6 +26734,11 @@ begin
     end;
     FStruct[0] := Ord(pScalingMode);
     FStruct[1] := pOriginalContextLen;
+    // FStruct[2]: YaRN correction-range truncation. Stored INVERTED (0 =
+    // truncate, the paper/HF default; 1 = no truncation, gpt-oss's
+    // rope_parameters "truncate": false) so existing serialized YaRN layers
+    // (FStruct[2]=0) keep the original floor/ceil behaviour on reload.
+    if pYarnTruncate then FStruct[2] := 0 else FStruct[2] := 1;
     FFloatSt[1] := pScaleFactor;
     FFloatSt[2] := pYarnAlpha;
     FFloatSt[3] := pYarnBeta;
@@ -26690,8 +26891,19 @@ begin
   YarnHigh := 0;
   if (Mode = rsmYaRN) and (TrainLen > 0) then
   begin
-    YarnLow := Floor(CorrectionDim(Beta));   // beta_fast edge (high freq)
-    YarnHigh := Ceil(CorrectionDim(Alpha));  // beta_slow edge (low freq)
+    // FStruct[2]=1 (gpt-oss "truncate": false) skips the floor/ceil rounding
+    // of the band edges; the default (FStruct[2]=0) floors/ceils them as HF's
+    // truncate=true does.
+    if FStruct[2] = 1 then
+    begin
+      YarnLow := CorrectionDim(Beta);   // beta_fast edge (high freq)
+      YarnHigh := CorrectionDim(Alpha); // beta_slow edge (low freq)
+    end
+    else
+    begin
+      YarnLow := Floor(CorrectionDim(Beta));   // beta_fast edge (high freq)
+      YarnHigh := Ceil(CorrectionDim(Alpha));  // beta_slow edge (low freq)
+    end;
     if YarnLow < 0 then YarnLow := 0;
     if YarnHigh > pDepth - 1 then YarnHigh := pDepth - 1;
     if YarnHigh = YarnLow then YarnHigh := YarnLow + 0.001; // HF guard
@@ -84167,6 +84379,7 @@ begin
       'TNNetT5RelPosBiasAttention' : Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
       'TNNetALiBiAttention' :       Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
+      'TNNetGptOssSinkAttention' :  Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetRetention' :            Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1);
       'TNNetForgetGateBias' :       Result := TNNetForgetGateBias.Create();
@@ -84179,7 +84392,7 @@ begin
       'TNNetPerformerAttention' :   Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
-      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4]);
+      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -84552,6 +84765,7 @@ begin
       if S[0] = 'TNNetT5RelPosBiasAttention' then Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
       if S[0] = 'TNNetALiBiAttention' then Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
+      if S[0] = 'TNNetGptOssSinkAttention' then Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetRetention' then Result := TNNetRetention.Create(St[0], Ft[0], St[1] = 1) else
       if S[0] = 'TNNetForgetGateBias' then Result := TNNetForgetGateBias.Create() else
@@ -84564,7 +84778,7 @@ begin
       if S[0] = 'TNNetPerformerAttention' then Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
-      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4]) else
+      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else

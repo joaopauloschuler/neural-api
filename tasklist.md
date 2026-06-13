@@ -109,10 +109,45 @@ rather than acted on.
       tools/qwen3_moe_window_tiny_fixture.py (sliding_window=3 over len-16,
       non-vacuity 3.58) + parity test TestQwen3MoeWindowLogitParity (also pins
       every SDPA head Window=3).
-- [ ] GPT-OSS importer (BuildGptOssFromSafeTensors[Ex], model_type "gpt_oss",
+- [X] GPT-OSS importer (BuildGptOssFromSafeTensors[Ex], model_type "gpt_oss",
       i.e. openai/gpt-oss-20b and gpt-oss-120b — OpenAI's first open-weight
       release and currently the highest-profile open MoE LLM with NO import
       path here).
+      LANDED (a3): BuildGptOssFromSafeTensors[Ex] + ReadGptOssConfigFromJSONFile
+      + TGptOssConfig in neuralpretrained.pas (multi-shard index.json via
+      CreatePretrainedTensorReader; BuildFromPretrained "gpt_oss" dispatch).
+      Wires: (a) a NEW faithful sink layer TNNetGptOssSinkAttention (per-head
+      SCALAR sink logit in the softmax denominator, sink contributes ZERO to the
+      output — the landed avSink/TNNetSinkAttention's Q.SinkKey dot-product +
+      value slot does NOT match gpt-oss, so a dedicated subclass was added;
+      forward/backward/serialization tested in TestNeuralNumerical
+      TestGptOssSinkAttention{Forward,GradientCheck,SerializationRoundTrip});
+      (b) alternating sliding/full window via the per-head Window (FStruct[2]);
+      (c) YaRN RoPE on every layer — required adding the "truncate" flag to
+      TNNetRotaryEmbedding (gpt-oss ships truncate:false, the band edges are NOT
+      floor/ceil'd; stored INVERTED in FStruct[2] so old YaRN layers reload
+      unchanged) and to TRoPEScalingConfig/the YaRN config reader; (d) top-k MoE
+      via TNNetPointwiseSoftMax+TNNetTopKGate(renorm=true) — gpt-oss's
+      topk-then-softmax == Mixtral's softmax-then-topk-renorm — with biased,
+      INTERLEAVED-gate|up, clamped-SwiGLU (TNNetGptOssGatedSwiGLU) experts;
+      (e) MXFP4 expert dequant-at-load via DequantizeMXFP4 + a new
+      TNNetSafeTensorsReader.LoadTensorRawBytes (handles the [E,OUT,IN/32,16]
+      _blocks + [E,OUT,IN/32] _scales pair, transposed back to [E,IN,OUT]); a
+      dense F32 expert form loads straight. q/k rotate_half->interleaved row
+      permutation + q/k/v/o biases via LoadLlamaLinearWeights.
+      Pico parity fixtures (tools/gpt_oss_tiny_fixture.py, 2 layers / 4 experts /
+      top-2, one sliding + one full layer, hidden/inter=32 so the SAME pico
+      re-emits MXFP4): tiny_gpt_oss.* (dense, TestGptOssLogitParity) AND
+      tiny_gpt_oss_mxfp4.* (MXFP4 _blocks/_scales, TestGptOssMXFP4LogitParity) —
+      both assert next-token logits vs transformers 5.11 in float64 to <1e-4.
+      The generator ASSERTS the sink path (zeroing sinks moves logits ~5.5) and
+      the alternating-window path (making the sliding layer full moves them ~10.9)
+      are non-vacuous. gpt-oss-120b documented as import-capable but RAM-gated
+      (pInferenceOnly + sharded) in the importer doc comment and
+      examples/GPT2Import/README.md.
+      OPEN follow-ups: MXFP4 -> int8 weight-only storage path (pQuantizeInt8 is
+      wired but re-quantizes the dequantized FP32, not a direct 4->8 transcode);
+      no real-weight 20B/120B smoke run yet (RAM-gated; pico parity only).
       FOUNDATION PRIMITIVES LANDED (a3, the two genuinely-new low-level pieces
       the full importer will consume; the importer assembly itself is still
       open):

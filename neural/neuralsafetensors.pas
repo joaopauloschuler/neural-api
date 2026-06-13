@@ -100,6 +100,12 @@ type
     // quantized blocks, neuralgguf.pas) can decode their own dtypes.
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); virtual;
+    // Loads the named tensor's RAW on-disk bytes verbatim into Dest (no dtype
+    // decoding). Used by the MXFP4 dequant-at-load path (gpt-oss), whose
+    // packed-nibble "*_blocks" and E8M0 "*_scales" tensors ship as U8 and must
+    // be read byte-for-byte. Dest is set to Length(Dest) = the tensor's byte
+    // length. Coded by Claude (AI).
+    procedure LoadTensorRawBytes(const pName: string; out Dest: TBytes);
     property FileName: string read FFileName;
   end;
 
@@ -750,6 +756,20 @@ begin
       Inc(Int64Ptr);
     end;
   end;
+end;
+
+procedure TNNetSafeTensorsReader.LoadTensorRawBytes(const pName: string;
+  out Dest: TBytes);
+var
+  Info: TSafeTensorInfo;
+  Len: Int64;
+begin
+  Info := GetInfo(pName);
+  Len := Info.DataEnd - Info.DataBegin;
+  SetLength(Dest, Len);
+  if Len = 0 then exit;
+  FStreams[Info.Shard].Position := FDataStarts[Info.Shard] + Info.DataBegin;
+  FStreams[Info.Shard].ReadBuffer(Dest[0], Len);
 end;
 
 { TNNetSafeTensorsWriter }

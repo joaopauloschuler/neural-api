@@ -107,6 +107,38 @@ directory also probes `pytorch_model.bin` automatically). The pico parity
 fixture is pinned by `tools/gptneo_tiny_fixture.py` →
 `TestGPTNeoLogitParity`.
 
+## GPT-OSS (OpenAI gpt-oss MoE)
+
+`neuralpretrained.pas` imports **GPT-OSS** — OpenAI's open-weight Mixture-of-
+Experts decoder (`openai/gpt-oss-20b` and `openai/gpt-oss-120b`,
+`model_type: "gpt_oss"`) — via `BuildGptOssFromSafeTensors[Ex]` (or
+`BuildFromPretrained` on the config). It crosses several subsystems no other
+importer combines: attention with a **learned per-head sink logit** appended to
+the softmax denominator (`TNNetGptOssSinkAttention`), **alternating
+sliding-window / full** attention per layer (`layer_types`), **YaRN** RoPE
+(including gpt-oss's `truncate: false`) on every layer, and a **top-k routed
+MoE** FFN with gpt-oss's **clamped-SwiGLU** expert activation
+(`TNNetGptOssGatedSwiGLU`, interleaved gate|up, biased experts + router). The
+real checkpoints ship the expert matrices as **MXFP4** 4-bit blocks
+(`...experts.gate_up_proj_blocks`/`_scales` + `...down_proj_blocks`/`_scales`,
+uint8); the importer **dequantizes them at load** via `DequantizeMXFP4`
+(`neural/neuralmxfp4.pas`). A checkpoint that ships the experts already dense
+(`...experts.gate_up_proj`/`down_proj`, batched `[E,in,out]`) loads straight.
+Multi-shard `model.safetensors.index.json` checkpoints (the real 20B/120B are
+sharded) are handled transparently by the reader.
+
+Parity is pinned by a pico fixture (`tools/gpt_oss_tiny_fixture.py` →
+`tests/fixtures/tiny_gpt_oss.*`) asserted in float64 by `TestGptOssLogitParity`,
+with a second MXFP4-packed copy (`tiny_gpt_oss_mxfp4.*`) driving the MXFP4
+dequant-at-load path end-to-end in `TestGptOssMXFP4LogitParity`.
+
+**`gpt-oss-120b` is import-capable but RAM-gated** like the other large
+checkpoints: pass `pInferenceOnly=True` and a sharded checkpoint so peak memory
+stays near the quantized weight size. The 20B fits comfortably with
+`pInferenceOnly`; the 120B needs a large-memory host (the importer expands the
+MXFP4 experts to FP32 at load — the same RAM caveat as the other multi-billion
+checkpoints documented above).
+
 With a HuggingFace `tokenizer.json` sitting next to the checkpoint (every
 GPT-2-family repo ships one), prompts can be plain text instead of ids:
 

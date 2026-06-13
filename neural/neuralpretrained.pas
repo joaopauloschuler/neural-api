@@ -512,7 +512,7 @@ interface
 uses
   Classes, SysUtils, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
-  neuralgguf, neuralhftokenizer;
+  neuralgguf, neuralhftokenizer, neuralmxfp4;
 
 type
   EPretrainedImportError = class(Exception);
@@ -631,6 +631,10 @@ type
     // or sqrt(1+ln(max/orig)/ln(orig)) when no explicit mscale is given).
     LongFactors: TNeuralFloatDynArr;
     LongAttnFactor: TNeuralFloat;
+    // YaRN only: "truncate" (rope_parameters/rope_scaling). HF/the paper floor/
+    // ceil the correction-range band edges (truncate=true, the default here);
+    // gpt-oss ships "truncate": false (no rounding). Coded by Claude (AI).
+    YarnTruncate: boolean;
   end;
 
 // The Mode=rsmNone record (Factor=1, OriginalContextLen=0, alpha=1, beta=32).
@@ -1200,6 +1204,79 @@ function BuildMixtralFromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMixtralFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+type
+  // GPT-OSS (OpenAI gpt-oss, model_type "gpt_oss"; openai/gpt-oss-20b and
+  // gpt-oss-120b). A sparse top-k MoE decoder that CROSSES several subsystems:
+  //  - attention with a LEARNED PER-HEAD SINK logit appended to the softmax
+  //    denominator (TNNetGptOssSinkAttention; the sink leaks softmax mass off
+  //    the real keys but contributes nothing to the value mix);
+  //  - ALTERNATING sliding-window / full attention per layer (layer_types,
+  //    the same per-layer banded-window wiring as Gemma-2/3);
+  //  - YaRN RoPE (rope_parameters.rope_type "yarn") on EVERY layer;
+  //  - FFN = top-k routed experts with gpt-oss's CLAMPED-SwiGLU activation
+  //    (TNNetGptOssGatedSwiGLU, alpha=1.702/limit=7.0), the gate|up projection
+  //    INTERLEAVED (gate=even, up=odd) and BOTH the expert projections AND the
+  //    router carrying biases;
+  //  - the MoE expert matrices ship as MXFP4 4-bit blocks in real checkpoints
+  //    ("...experts.gate_up_proj_blocks"/"_scales" + "...down_proj_blocks"/
+  //    "_scales", uint8) - dequantized at load via DequantizeMXFP4. A checkpoint
+  //    that ships the experts already in plain F32/F16/BF16
+  //    ("...experts.gate_up_proj" / "...down_proj", batched [E,in,out]) loads
+  //    straight (the pico parity fixture uses this form to stay tiny).
+  // Coded by Claude (AI).
+  TGptOssConfig = record
+    HiddenSize: integer;       // hidden_size
+    IntermediateSize: integer; // per-expert SwiGLU width (intermediate_size)
+    NumLayers: integer;        // num_hidden_layers
+    NumHeads: integer;         // num_attention_heads
+    NumKVHeads: integer;       // num_key_value_heads (GQA)
+    HeadDim: integer;          // head_dim
+    VocabSize: integer;        // vocab_size
+    MaxPositions: integer;     // max_position_embeddings
+    RmsNormEps: TNeuralFloat;  // rms_norm_eps
+    RopeTheta: TNeuralFloat;   // rope_parameters.rope_theta
+    SlidingWindow: integer;    // sliding_window (sliding layers)
+    NumLocalExperts: integer;  // num_local_experts
+    NumExpertsPerTok: integer; // num_experts_per_tok (top-k)
+    SwiGLUAlpha: TNeuralFloat; // clamped-SwiGLU alpha (1.702)
+    SwiGLULimit: TNeuralFloat; // clamped-SwiGLU clamp limit (7.0)
+    TieWordEmbeddings: boolean;// tie_word_embeddings
+    LayerIsSliding: array of boolean; // per-layer attention type (layer_types)
+    RopeScaling: TRoPEScalingConfig;  // parsed rope_parameters (YaRN)
+    Prefix: string;            // 'model.' or ''
+  end;
+
+// Reads a HF gpt_oss config.json (model_type "gpt_oss"). Required:
+// hidden_size, intermediate_size, num_hidden_layers, num_attention_heads,
+// vocab_size. Defaults: num_key_value_heads = num_attention_heads,
+// head_dim = 64, rms_norm_eps = 1e-5, num_local_experts = 128,
+// num_experts_per_tok = 4, sliding_window = 128, max_position_embeddings =
+// 131072, tie_word_embeddings = false. layer_types (a list of
+// "sliding_attention"/"full_attention") sets the per-layer window; when absent
+// it defaults to the gpt-oss alternating pattern (even = sliding, odd = full).
+// rope_parameters (rope_type "yarn" + rope_theta/factor/beta_fast/beta_slow/
+// original_max_position_embeddings) is parsed into RopeScaling.
+function ReadGptOssConfigFromJSONFile(const FileName: string): TGptOssConfig;
+
+function GptOssConfigToString(const Config: TGptOssConfig): string;
+
+// Builds the gpt-oss decoder from Config and loads every weight from the
+// checkpoint at FileName (single .safetensors, a .safetensors.index.json
+// shard set - the real 20B/120B checkpoints are sharded - or pytorch_model.bin
+// via CreatePretrainedTensorReader). ConfigFileName overrides the config.json
+// location (defaults to a sibling of FileName). pSeqLen caps the context (0 =
+// max_position_embeddings). pInferenceOnly / pQuantizeInt8 mirror the other
+// importers. gpt-oss-120b imports with the SAME path but is RAM-gated like the
+// other large checkpoints - use pInferenceOnly and a sharded checkpoint.
+function BuildGptOssFromSafeTensorsEx(const FileName: string;
+  out Config: TGptOssConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildGptOssFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -3634,6 +3711,7 @@ begin
   Result.YarnBeta := 32.0;
   SetLength(Result.LongFactors, 0);
   Result.LongAttnFactor := 1.0;
+  Result.YarnTruncate := True;
 end;
 
 function RoPEScalingToString(const S: TRoPEScalingConfig): string;
@@ -3800,6 +3878,9 @@ begin
     Result.OriginalContextLen := ReadOriginalContextLen();
     Result.YarnAlpha := Scaling.Get('beta_slow', 1.0);
     Result.YarnBeta := Scaling.Get('beta_fast', 32.0);
+    // "truncate" (gpt-oss rope_parameters): false skips the floor/ceil rounding
+    // of the YaRN correction-range band edges. Defaults true (HF/paper).
+    Result.YarnTruncate := Scaling.Get('truncate', True);
     if Result.YarnBeta <= Result.YarnAlpha then
       ImportError(ImporterName + ': rope_scaling yarn requires beta_fast > ' +
         'beta_slow, got beta_fast=' + FloatToStr(Result.YarnBeta) +
@@ -3851,7 +3932,7 @@ begin
       S.LongAttnFactor)
   else
     Result := TNNetRotaryEmbedding.Create(Base, S.Mode, S.Factor,
-      S.OriginalContextLen, S.YarnAlpha, S.YarnBeta);
+      S.OriginalContextLen, S.YarnAlpha, S.YarnBeta, 1.0, S.YarnTruncate);
 end;
 
 // ============================ LLAMA IMPORT =================================
@@ -10131,6 +10212,529 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildMixtralFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ============================ GPT-OSS IMPORT ===============================
+
+function ReadGptOssConfigFromJSONFile(const FileName: string): TGptOssConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, RopeObj: TJSONObject;
+  ModelType: string;
+  Field: TJSONData;
+  LayerTypesArr: TJSONArray;
+  i: integer;
+  TypeStr: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('gpt-oss import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('gpt-oss import: config field "' + FieldName +
+        '" must be a positive integer, got ' + Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  Result := Default(TGptOssConfig);
+  if not FileExists(FileName) then
+    ImportError('gpt-oss import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('gpt-oss import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('gpt-oss import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if ModelType <> 'gpt_oss' then
+      ImportError('gpt-oss import: config model_type is "' + ModelType +
+        '", expected "gpt_oss".');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if Result.NumKVHeads <= 0 then Result.NumKVHeads := Result.NumHeads;
+    Result.HeadDim := Obj.Get('head_dim', 0);
+    if Result.HeadDim <= 0 then
+      Result.HeadDim := Result.HiddenSize div Result.NumHeads;
+    Result.MaxPositions := Obj.Get('max_position_embeddings', 131072);
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', TNeuralFloat(1e-5));
+    Result.SlidingWindow := Obj.Get('sliding_window', 128);
+    Result.NumLocalExperts := Obj.Get('num_local_experts', 128);
+    Result.NumExpertsPerTok := Obj.Get('num_experts_per_tok', 4);
+    Result.SwiGLUAlpha := 1.702;
+    Result.SwiGLULimit := 7.0;
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    Result.RopeScaling := DefaultRoPEScaling();
+    Result.RopeTheta := 150000.0;
+    // rope_parameters (gpt-oss spelling) OR rope_theta (plain). gpt-oss packs
+    // rope_theta + the YaRN parameters inside rope_parameters; map it onto a
+    // synthetic rope_scaling object the shared YaRN reader understands.
+    Field := Obj.Find('rope_parameters');
+    if (Field <> nil) and (Field is TJSONObject) then
+    begin
+      RopeObj := TJSONObject(Field);
+      Result.RopeTheta := RopeObj.Get('rope_theta', Result.RopeTheta);
+      TypeStr := RopeObj.Get('rope_type', RopeObj.Get('type', 'default'));
+      if (TypeStr <> 'default') and (TypeStr <> '') then
+        Result.RopeScaling := ReadRoPEScalingFromJSONObject(
+          TJSONObject.Create(['rope_scaling', RopeObj.Clone]),
+          Result.MaxPositions, 'gpt-oss import');
+    end
+    else
+      Result.RopeTheta := Obj.Get('rope_theta', Result.RopeTheta);
+    // Per-layer attention type. layer_types overrides; otherwise gpt-oss
+    // alternates sliding (even) / full (odd).
+    SetLength(Result.LayerIsSliding, Result.NumLayers);
+    Field := Obj.Find('layer_types');
+    if (Field <> nil) and (Field is TJSONArray) then
+    begin
+      LayerTypesArr := TJSONArray(Field);
+      if LayerTypesArr.Count <> Result.NumLayers then
+        ImportError('gpt-oss import: layer_types has ' +
+          IntToStr(LayerTypesArr.Count) + ' entries but num_hidden_layers=' +
+          IntToStr(Result.NumLayers) + '.');
+      for i := 0 to Result.NumLayers - 1 do
+      begin
+        TypeStr := LayerTypesArr.Items[i].AsString;
+        if TypeStr = 'sliding_attention' then
+          Result.LayerIsSliding[i] := True
+        else if TypeStr = 'full_attention' then
+          Result.LayerIsSliding[i] := False
+        else
+          ImportError('gpt-oss import: layer_types[' + IntToStr(i) +
+            '] = "' + TypeStr + '" is not "sliding_attention" or ' +
+            '"full_attention".');
+      end;
+    end
+    else
+      for i := 0 to Result.NumLayers - 1 do
+        Result.LayerIsSliding[i] := not Odd(i);
+    Result.Prefix := '';
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function GptOssConfigToString(const Config: TGptOssConfig): string;
+var
+  i, SlideCnt: integer;
+begin
+  SlideCnt := 0;
+  for i := 0 to High(Config.LayerIsSliding) do
+    if Config.LayerIsSliding[i] then Inc(SlideCnt);
+  Result :=
+    'gpt_oss: hidden=' + IntToStr(Config.HiddenSize) +
+    ' inter=' + IntToStr(Config.IntermediateSize) +
+    ' layers=' + IntToStr(Config.NumLayers) +
+    ' heads=' + IntToStr(Config.NumHeads) +
+    ' kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ' head_dim=' + IntToStr(Config.HeadDim) +
+    ' vocab=' + IntToStr(Config.VocabSize) +
+    ' experts=' + IntToStr(Config.NumLocalExperts) +
+    ' top_k=' + IntToStr(Config.NumExpertsPerTok) +
+    ' sliding_window=' + IntToStr(Config.SlidingWindow) +
+    ' sliding_layers=' + IntToStr(SlideCnt) + '/' +
+      IntToStr(Config.NumLayers) +
+    ' rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ' rope_mode=' + IntToStr(Ord(Config.RopeScaling.Mode)) +
+    ' tie_embed=' + BoolToStr(Config.TieWordEmbeddings, True);
+end;
+
+// Loads expert bank e of a gpt-oss MoE FFN. The HF expert matrices are stored
+// BATCHED and in [in, out] order (current_state @ gate_up_proj[e], unlike a
+// bias-free nn.Linear): gate_up_proj is [E, hidden, 2*inter] and down_proj is
+// [E, inter, hidden]. Per expert e, neuron j (output channel) of the pointwise
+// layer gets weight i = W[e, i, j] (the [in, out] -> per-neuron [in] transpose)
+// and bias[j] from *_bias[e, j]. The gate|up output stays INTERLEAVED
+// (gate=even, up=odd) for TNNetGptOssGatedSwiGLU. W/B supply the already FLAT
+// (E*In*Out) weights and (E*Out) biases.
+procedure LoadGptOssExpertMatrix(WLayer: TNNetLayer; const W, B: TNNetVolume;
+  ExpertIdx, InDim, OutDim: integer);
+var
+  i, j, ExpertBase, BiasBase: integer;
+begin
+  EnsureWritableImportWeights(WLayer);
+  if WLayer.Neurons.Count <> OutDim then
+    ImportError('gpt-oss import: internal error - expert layer has ' +
+      IntToStr(WLayer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  ExpertBase := ExpertIdx * InDim * OutDim;
+  BiasBase := ExpertIdx * OutDim;
+  for j := 0 to OutDim - 1 do
+  begin
+    for i := 0 to InDim - 1 do
+      WLayer.Neurons[j].Weights.FData[i] := W.FData[ExpertBase + i * OutDim + j];
+    if B <> nil then
+      WLayer.Neurons[j].BiasWeight := B.FData[BiasBase + j]
+    else
+      WLayer.Neurons[j].BiasWeight := 0;
+  end;
+  WLayer.FlushWeightCache();
+end;
+
+// Reads a gpt-oss expert weight slab into Dest as a FLAT [E*In*Out] array in
+// the F32 [E, In, Out] layout LoadGptOssExpertMatrix expects. Handles BOTH
+// storage forms: a plain dense tensor (BaseName, dtype F32/F16/BF16) loaded
+// straight, OR the MXFP4 pair (BaseName+"_blocks" uint8 + BaseName+"_scales"
+// uint8) dequantized via DequantizeMXFP4. The MXFP4 packed layout is
+// [E, Out, In/32, 16] -> dequant to [E, Out, In] -> transpose to [E, In, Out]
+// (transformers _convert_moe_packed_tensors ends with .transpose(1,2)).
+procedure LoadGptOssExpertSlab(Reader: TNNetSafeTensorsReader;
+  const BaseName: string; NumExperts, InDim, OutDim: integer; Dest: TNNetVolume);
+var
+  Blocks, Scales: TBytes;
+  Deq: array of single;
+  e, ii, oo, NumBlocks: integer;
+  BlocksName, ScalesName: string;
+begin
+  if Reader.HasTensor(BaseName) then
+  begin
+    if (Reader.DimCount(BaseName) <> 3) or
+       (Reader.DimSize(BaseName, 0) <> NumExperts) or
+       (Reader.DimSize(BaseName, 1) <> InDim) or
+       (Reader.DimSize(BaseName, 2) <> OutDim) then
+      ImportError('gpt-oss import: "' + BaseName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(InDim) + ', ' +
+        IntToStr(OutDim) + '], got ' + Reader.ShapeAsString(BaseName));
+    Reader.LoadTensorFlat(BaseName, Dest);
+    Exit;
+  end;
+  BlocksName := BaseName + '_blocks';
+  ScalesName := BaseName + '_scales';
+  if not (Reader.HasTensor(BlocksName) and Reader.HasTensor(ScalesName)) then
+    ImportError('gpt-oss import: missing expert tensor "' + BaseName +
+      '" (neither the dense form nor the MXFP4 "' + BlocksName + '"/"' +
+      ScalesName + '" pair is present).');
+  if (InDim mod MXFP4_BLOCK_ELEMS) <> 0 then
+    ImportError('gpt-oss import: MXFP4 expert "' + BaseName + '" in-dim ' +
+      IntToStr(InDim) + ' is not a multiple of ' +
+      IntToStr(MXFP4_BLOCK_ELEMS) + '.');
+  NumBlocks := NumExperts * OutDim * (InDim div MXFP4_BLOCK_ELEMS);
+  Reader.LoadTensorRawBytes(BlocksName, Blocks);
+  Reader.LoadTensorRawBytes(ScalesName, Scales);
+  if Length(Blocks) <> NumBlocks * MXFP4_BLOCK_BYTES then
+    ImportError('gpt-oss import: MXFP4 "' + BlocksName + '" has ' +
+      IntToStr(Length(Blocks)) + ' bytes, expected ' +
+      IntToStr(NumBlocks * MXFP4_BLOCK_BYTES) + '.');
+  if Length(Scales) <> NumBlocks then
+    ImportError('gpt-oss import: MXFP4 "' + ScalesName + '" has ' +
+      IntToStr(Length(Scales)) + ' bytes, expected ' +
+      IntToStr(NumBlocks) + '.');
+  SetLength(Deq, NumExperts * OutDim * InDim);
+  DequantizeMXFP4(@Blocks[0], @Scales[0], NumBlocks, @Deq[0]);
+  // Deq is [E, Out, In] (row-major). Transpose the last two axes into Dest's
+  // [E, In, Out] layout.
+  Dest.ReSize(NumExperts * InDim * OutDim, 1, 1);
+  for e := 0 to NumExperts - 1 do
+    for oo := 0 to OutDim - 1 do
+      for ii := 0 to InDim - 1 do
+        Dest.FData[(e * InDim + ii) * OutDim + oo] :=
+          Deq[(e * OutDim + oo) * InDim + ii];
+  SetLength(Deq, 0);
+end;
+
+// Builds and loads one gpt-oss MoE FFN branch from MoESource. Router (bias) ->
+// per-token softmax -> top-k gate (renormalized, == gpt-oss's topk-then-softmax)
+// -> per-expert [interleaved gate|up (bias) -> clamped SwiGLU -> down (bias)],
+// gate-weighted sum. Mirrors BuildMixtralMoEBranch but for gpt-oss's biased,
+// interleaved, clamped-SwiGLU experts.
+procedure BuildGptOssMoEBranch(NN: TNNet; MoESource: TNNetLayer;
+  const Config: TGptOssConfig; Reader: TNNetSafeTensorsReader;
+  const BlockPrefix: string);
+var
+  GateConv, GateTopK, ExpertOut, GateE, GateEBroadcast: TNNetLayer;
+  GateUpLayers, DownLayers, MoEBranches: array of TNNetLayer;
+  ExpertCnt: integer;
+  GateUpW, GateUpB, DownW, DownB: TNNetVolume;
+  GU2: integer;
+begin
+  GU2 := 2 * Config.IntermediateSize;
+  SetLength(GateUpLayers, Config.NumLocalExperts);
+  SetLength(DownLayers, Config.NumLocalExperts);
+  SetLength(MoEBranches, Config.NumLocalExperts);
+  GateConv := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts), MoESource);
+  NN.AddLayer( TNNetPointwiseSoftMax.Create() );
+  GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+    Config.NumExpertsPerTok, {pRenormalize=}True) );
+  for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
+  begin
+    GateUpLayers[ExpertCnt] := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(GU2), MoESource);
+    NN.AddLayer( TNNetGptOssGatedSwiGLU.Create(
+      Config.SwiGLUAlpha, Config.SwiGLULimit) );
+    DownLayers[ExpertCnt] := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    ExpertOut := NN.GetLastLayer();
+    GateE := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(ExpertCnt, 1), GateTopK);
+    GateEBroadcast := NN.AddLayer(
+      TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
+    MoEBranches[ExpertCnt] := NN.AddLayer(
+      TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+  end;
+  NN.AddLayer( TNNetSum.Create(MoEBranches) );
+  // ---- weights ----
+  GateUpW := TNNetVolume.Create;
+  GateUpB := TNNetVolume.Create;
+  DownW := TNNetVolume.Create;
+  DownB := TNNetVolume.Create;
+  try
+    LoadLlamaLinearWeights(Reader, GateConv,
+      BlockPrefix + 'mlp.router.weight', Config.HiddenSize,
+      Config.NumLocalExperts, 0, -1, 0,
+      BlockPrefix + 'mlp.router.bias');
+    LoadGptOssExpertSlab(Reader, BlockPrefix + 'mlp.experts.gate_up_proj',
+      Config.NumLocalExperts, Config.HiddenSize, GU2, GateUpW);
+    Reader.LoadTensorFlat(BlockPrefix + 'mlp.experts.gate_up_proj_bias', GateUpB);
+    LoadGptOssExpertSlab(Reader, BlockPrefix + 'mlp.experts.down_proj',
+      Config.NumLocalExperts, Config.IntermediateSize, Config.HiddenSize, DownW);
+    Reader.LoadTensorFlat(BlockPrefix + 'mlp.experts.down_proj_bias', DownB);
+    for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
+    begin
+      LoadGptOssExpertMatrix(GateUpLayers[ExpertCnt], GateUpW, GateUpB,
+        ExpertCnt, Config.HiddenSize, GU2);
+      LoadGptOssExpertMatrix(DownLayers[ExpertCnt], DownW, DownB,
+        ExpertCnt, Config.IntermediateSize, Config.HiddenSize);
+    end;
+  finally
+    DownB.Free; DownW.Free; GateUpB.Free; GateUpW.Free;
+  end;
+end;
+
+function BuildGptOssFromTensorReaderWithConfig(
+  pReader: TNNetSafeTensorsReader; const FileName: string;
+  var Config: TGptOssConfig; pSeqLen: integer;
+  pInferenceOnly: boolean; pQuantizeInt8: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  EmbeddingLayer, LMHead, BranchInput, NormedSource: TNNetLayer;
+  AttnNorm, MlpNorm, QProj, KProj, VProj, OProj: TNNetLayer;
+  QSlice, KSlice, HeadPack: TNNetLayer;
+  KRotated, VSlices, HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
+  HeadDim, QWidth, KVWidth, LayerWindow, i, j, d: integer;
+  LMHeadName, BlockPrefix: string;
+  Tmp: TNNetVolume;
+begin
+  Reader := pReader;
+  NN := nil;
+  try
+    HeadDim := Config.HeadDim;
+    if Odd(HeadDim) then
+      ImportError('gpt-oss import: head_dim=' + IntToStr(HeadDim) +
+        ' must be even (RoPE rotates channel pairs).');
+    QWidth := Config.NumHeads * HeadDim;
+    KVWidth := Config.NumKVHeads * HeadDim;
+    if (Config.NumHeads mod Config.NumKVHeads) <> 0 then
+      ImportError('gpt-oss import: num_attention_heads=' +
+        IntToStr(Config.NumHeads) + ' is not a multiple of ' +
+        'num_key_value_heads=' + IntToStr(Config.NumKVHeads) + '.');
+    GroupSize := Config.NumHeads div Config.NumKVHeads;
+    if Reader.HasTensor('model.embed_tokens.weight') then
+      Config.Prefix := 'model.'
+    else if Reader.HasTensor('embed_tokens.weight') then
+      Config.Prefix := ''
+    else
+      ImportError('gpt-oss import: neither "model.embed_tokens.weight" nor ' +
+        '"embed_tokens.weight" found in ' + Reader.FileName + '.');
+    LMHeadName := 'lm_head.weight';
+    if (not Config.TieWordEmbeddings) and (not Reader.HasTensor(LMHeadName)) then
+      ImportError('gpt-oss import: tie_word_embeddings=false but "' +
+        LMHeadName + '" is missing from ' + Reader.FileName + '.');
+    if pSeqLen <= 0 then SeqLen := Config.MaxPositions else SeqLen := pSeqLen;
+    if SeqLen > Config.MaxPositions then
+      ImportError('gpt-oss import: requested SeqLen=' + IntToStr(SeqLen) +
+        ' exceeds max_position_embeddings=' +
+        IntToStr(Config.MaxPositions) + '.');
+
+    NN := TNNet.Create();
+    NN.AddLayer( TNNetInput.Create(SeqLen) );
+    EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+      Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(KRotated, Config.NumKVHeads);
+    SetLength(VSlices, Config.NumKVHeads);
+    SetLength(HeadOutputs, Config.NumHeads);
+    SetLength(SliceChannels, HeadDim);
+
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        ImportError('gpt-oss import: embed_tokens.weight element count ' +
+          IntToStr(Tmp.Size) + ' <> embedding table size ' +
+          IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+      if Config.LayerIsSliding[BlockCnt] then
+        LayerWindow := Config.SlidingWindow
+      else
+        LayerWindow := 0;
+      // attention sub-block: x := x + o_proj(sink-attn(rope-GQA(RMSNorm(x))))
+      BranchInput := NN.GetLastLayer();
+      AttnNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      NormedSource := AttnNorm;
+      QProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+      KProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+      VProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+      for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+      begin
+        for d := 0 to HeadDim - 1 do
+          SliceChannels[d] := KVHeadCnt * HeadDim + d;
+        KSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels), KProj);
+        KRotated[KVHeadCnt] := NN.AddLayerAfter(
+          CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), KSlice);
+        VSlices[KVHeadCnt] := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels), VProj);
+      end;
+      for HeadCnt := 0 to Config.NumHeads - 1 do
+      begin
+        KVGroup := HeadCnt div GroupSize;
+        for d := 0 to HeadDim - 1 do
+          SliceChannels[d] := HeadCnt * HeadDim + d;
+        QSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels), QProj);
+        QSlice := NN.AddLayerAfter(
+          CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), QSlice);
+        HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+          [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
+        HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+          TNNetGptOssSinkAttention.Create(HeadDim, {pCausalMask=}True,
+            {pWindow=}LayerWindow), HeadPack);
+      end;
+      NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+      OProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      NN.AddLayer( TNNetSum.Create([OProj, BranchInput]) );
+      // MLP sub-block: x := x + MoE(RMSNorm(x))
+      BranchInput := NN.GetLastLayer();
+      MlpNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      BuildGptOssMoEBranch(NN, MlpNorm, Config, Reader, BlockPrefix);
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      LoadLlamaRMSNormWeights(Reader, AttnNorm,
+        BlockPrefix + 'input_layernorm.weight', Config.HiddenSize);
+      LoadLlamaRMSNormWeights(Reader, MlpNorm,
+        BlockPrefix + 'post_attention_layernorm.weight', Config.HiddenSize);
+      LoadLlamaLinearWeights(Reader, QProj,
+        BlockPrefix + 'self_attn.q_proj.weight', Config.HiddenSize, QWidth,
+        0, -1, HeadDim, BlockPrefix + 'self_attn.q_proj.bias');
+      LoadLlamaLinearWeights(Reader, KProj,
+        BlockPrefix + 'self_attn.k_proj.weight', Config.HiddenSize, KVWidth,
+        0, -1, HeadDim, BlockPrefix + 'self_attn.k_proj.bias');
+      LoadLlamaLinearWeights(Reader, VProj,
+        BlockPrefix + 'self_attn.v_proj.weight', Config.HiddenSize, KVWidth,
+        0, -1, 0, BlockPrefix + 'self_attn.v_proj.bias');
+      LoadLlamaLinearWeights(Reader, OProj,
+        BlockPrefix + 'self_attn.o_proj.weight', QWidth, Config.HiddenSize,
+        0, -1, 0, BlockPrefix + 'self_attn.o_proj.bias');
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(BlockPrefix + 'self_attn.sinks', Tmp);
+        if Tmp.Size <> Config.NumHeads then
+          ImportError('gpt-oss import: "' + BlockPrefix +
+            'self_attn.sinks" has ' + IntToStr(Tmp.Size) +
+            ' entries, expected num_attention_heads=' +
+            IntToStr(Config.NumHeads) + '.');
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+          TNNetGptOssSinkAttention(HeadOutputs[HeadCnt]).SetSinkLogit(
+            Tmp.FData[HeadCnt]);
+      finally
+        Tmp.Free;
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+    end;
+
+    NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+    LoadLlamaRMSNormWeights(Reader, NN.GetLastLayer(),
+      Config.Prefix + 'norm.weight', Config.HiddenSize);
+    LMHead := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    Tmp := TNNetVolume.Create;
+    try
+      if Config.TieWordEmbeddings then
+      begin
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+      end
+      else
+        LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+          Config.HiddenSize, Config.VocabSize);
+    finally
+      Tmp.Free;
+    end;
+    if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+    Result := NN;
+    NN := nil;
+  finally
+    NN.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildGptOssFromSafeTensorsEx(const FileName: string;
+  out Config: TGptOssConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadGptOssConfigFromJSONFile(ConfigPath);
+  Result := BuildGptOssFromTensorReaderWithConfig(
+    CreatePretrainedTensorReader(FileName), FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildGptOssFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TGptOssConfig;
+begin
+  Result := BuildGptOssFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -17058,6 +17662,7 @@ var
   IgnoredGPTNeoConfig: TGPTNeoConfig;
   IgnoredGPTNeoXConfig: TGPTNeoXConfig;
   IgnoredGPTJConfig: TGPTJConfig;
+  IgnoredGptOssConfig: TGptOssConfig;
   IgnoredCohereConfig: TCohereConfig;
   IgnoredPhiConfig: TPhiConfig;
   IgnoredBertConfig: TBertConfig;
@@ -17170,6 +17775,14 @@ begin
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'gptj' then
     Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'gpt_oss' then
+    // GPT-OSS (OpenAI gpt-oss, architectures ["GptOssForCausalLM"], the
+    // openai/gpt-oss-20b/120b family): sparse top-k MoE decoder with learned
+    // per-head attention sinks, alternating sliding/full attention, YaRN RoPE
+    // and gpt-oss's clamped-SwiGLU experts (MXFP4 dequant-at-load for the real
+    // checkpoints). See BuildGptOssFromSafeTensors.
+    Result := BuildGptOssFromSafeTensorsEx(WeightsPath, IgnoredGptOssConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'cohere') or (ModelType = 'cohere2') then
     // Cohere Command-R / Aya (architectures ["CohereForCausalLM"]) and the

@@ -157,6 +157,8 @@ type
     procedure TestQwen3MoeLogitParity;
     procedure TestQwen3MoeMixedLogitParity;
     procedure TestQwen3MoeWindowLogitParity;
+    procedure TestGptOssLogitParity;
+    procedure TestGptOssMXFP4LogitParity;
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
@@ -4769,6 +4771,124 @@ begin
       SDPACnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_moe_window_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the GPT-OSS import target (OpenAI gpt-oss, HF model_type "gpt_oss",
+// architectures ["GptOssForCausalLM"], the openai/gpt-oss-20b/120b family):
+// tests/fixtures/tiny_gpt_oss.* is a pico randomly-initialized
+// GptOssForCausalLM (2 layers, hidden 32, DECOUPLED head_dim 10, 4 experts /
+// top-2, 1 kv head < 4 query heads, untied head; hidden/inter are 32 so the
+// SAME pico re-emits with MXFP4-packed experts). It is the CROSS of several
+// subsystems no other importer combines: (a) attention with a LEARNED PER-HEAD
+// SINK logit appended to the softmax denominator (TNNetGptOssSinkAttention);
+// (b) ALTERNATING sliding-window (layer 0) / full (layer 1) attention;
+// (c) YaRN RoPE on every layer; (d) top-k routed experts with gpt-oss's
+// CLAMPED-SwiGLU activation (TNNetGptOssGatedSwiGLU, interleaved gate|up,
+// alpha=1.702/limit=7.0) and biases on BOTH the experts AND the router. The
+// generator tools/gpt_oss_tiny_fixture.py ASSERTS both quirks are non-vacuous
+// (zeroing the sinks moves the logits by ~3.1; making the sliding layer full
+// moves them by ~6.8). The dense F32 experts keep the fixture ~37 KB; the
+// MXFP4 dequant-at-load path real checkpoints use is exercised by
+// TestMXFP4Dequant*. Reference logits computed by HF in float64. The
+// BuildFromPretrained model_type "gpt_oss" dispatch is checked too.
+procedure TTestNeuralPretrained.TestGptOssLogitParity;
+var
+  NN: TNNet;
+  Config: TGptOssConfig;
+  LayerCnt, SinkCnt, SwiGLUCnt, GateCnt: integer;
+  Sink: TNNetGptOssSinkAttention;
+begin
+  RandSeed := 424242;
+  NN := BuildGptOssFromSafeTensorsEx(
+    FixturePath('tiny_gpt_oss.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gpt_oss_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 4, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('head_dim', 10, Config.HeadDim);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('num_local_experts', 4, Config.NumLocalExperts);
+    AssertEquals('num_experts_per_tok', 2, Config.NumExpertsPerTok);
+    AssertEquals('sliding_window', 4, Config.SlidingWindow);
+    AssertTrue('layer 0 sliding', Config.LayerIsSliding[0]);
+    AssertFalse('layer 1 full', Config.LayerIsSliding[1]);
+    AssertTrue('yarn rope', Config.RopeScaling.Mode = rsmYaRN);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    // Structure: NumHeads sink-attention heads per layer (the alternating
+    // window lives on each), one router gate + one clamped SwiGLU per expert
+    // per layer.
+    SinkCnt := 0; SwiGLUCnt := 0; GateCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetGptOssSinkAttention then
+      begin
+        Sink := TNNetGptOssSinkAttention(NN.Layers[LayerCnt]);
+        // Layer 0 heads carry Window=4; layer 1 heads Window=0 (full).
+        if SinkCnt < Config.NumHeads then
+          AssertEquals('layer0 sink head window', 4, Sink.Window)
+        else
+          AssertEquals('layer1 sink head window', 0, Sink.Window);
+        Inc(SinkCnt);
+      end;
+      if NN.Layers[LayerCnt].ClassType = TNNetGptOssGatedSwiGLU then
+        Inc(SwiGLUCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
+    end;
+    AssertEquals('sink heads = NumHeads * layers', Config.NumHeads * 2,
+      SinkCnt);
+    AssertEquals('one clamped SwiGLU per expert per layer',
+      Config.NumLocalExperts * Config.NumLayers, SwiGLUCnt);
+    AssertEquals('one top-k gate per layer', Config.NumLayers, GateCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gpt_oss_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "gpt_oss" onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_gpt_oss.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gpt_oss_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gpt_oss_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the gpt-oss MXFP4 dequant-at-load IMPORT path: the SAME pico model
+// as TestGptOssLogitParity but with its MoE experts stored as the MXFP4 4-bit
+// "_blocks" (uint8 packed nibbles) + "_scales" (E8M0) pair the real
+// openai/gpt-oss-20b/120b checkpoints ship - the layout
+// BuildGptOssFromSafeTensors dequantizes via DequantizeMXFP4 (and transposes
+// the [E,OUT,IN] packed axes back to [E,IN,OUT]). tools/gpt_oss_tiny_fixture.py
+// computes the reference logits from the DEQUANTIZED experts (exactly what the
+// importer reconstructs), so parity holds to 1e-4 despite the lossy 4-bit
+// weights. This is the only test that drives the MXFP4 import branch
+// end-to-end (TestMXFP4Dequant* cover the raw block decode).
+procedure TTestNeuralPretrained.TestGptOssMXFP4LogitParity;
+var
+  NN: TNNet;
+  Config: TGptOssConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildGptOssFromSafeTensorsEx(
+    FixturePath('tiny_gpt_oss_mxfp4.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gpt_oss_config.json'));
+  try
+    AssertEquals('num_local_experts', 4, Config.NumLocalExperts);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gpt_oss_mxfp4_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;
