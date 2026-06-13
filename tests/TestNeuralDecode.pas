@@ -66,6 +66,9 @@ type
     procedure TestGreedyReturnsBoundedFiniteResult;
     procedure TestBeamSearchAllSortedDescending;
     procedure TestBeamSearchScoreNoWorseThanGreedy;
+    // Contrastive search (penalty_alpha) decoding.
+    procedure TestContrastiveAlphaZeroMatchesGreedy;
+    procedure TestContrastiveAlphaChangesSelection;
     // KV-cache incremental decode on TNNetScaledDotProductAttention.
     procedure TestKVCacheIncrementalMatchesFullForward;
     procedure TestKVCacheSlidingWindowMatchesFullForward;
@@ -249,6 +252,57 @@ begin
     G := DecodeGreedy(NN, 'ab', 6);
     B := DecodeBeamSearch(NN, 'ab', 6, 4, 0.0);
     AssertTrue('beam score >= greedy score', B.Score >= G.Score - 1e-4);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestContrastiveAlphaZeroMatchesGreedy;
+var
+  NN: TNNet;
+  G, C: TNNetDecodeResult;
+  NoStops: array of string;
+begin
+  // Degrade-to-greedy invariant: PenaltyAlpha=0 keeps only (1-alpha)*p(v), so
+  // the top-probability candidate (always the global argmax) wins every step.
+  // Output must be bit-identical to plain greedy argmax over the same net.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  try
+    G := DecodeGreedy(NN, 'ab', 8);
+    C := DecodeContrastiveSearch(NN, 'ab', 8, 4, 0.0, NoStops);
+    AssertEquals('alpha=0 contrastive text == greedy text', G.Text, C.Text);
+    AssertEquals('alpha=0 contrastive finished == greedy',
+      Ord(G.Finished), Ord(C.Finished));
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestContrastiveAlphaChangesSelection;
+var
+  NN: TNNet;
+  G, C1, C2: TNNetDecodeResult;
+  NoStops: array of string;
+begin
+  // With a non-zero degeneration penalty the re-rank must (a) be deterministic
+  // and (b) be able to steer away from greedy's choice. We pin a seed so the
+  // tiny net's random head gives top-k candidates with distinct hidden states;
+  // alpha=1 (pure similarity penalty) then re-orders them, changing the output.
+  RandSeed := 1234567;
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  try
+    G := DecodeGreedy(NN, 'ab', 8);
+    C1 := DecodeContrastiveSearch(NN, 'ab', 8, 6, 1.0, NoStops);
+    C2 := DecodeContrastiveSearch(NN, 'ab', 8, 6, 1.0, NoStops);
+    AssertEquals('contrastive is deterministic', C1.Text, C2.Text);
+    AssertTrue('contrastive result finite/bounded',
+      (Length(C1.Text) <= 8) and not IsNan(C1.Score) and
+      not IsInfinite(C1.Score));
+    AssertTrue('alpha=1 penalty changes the greedy selection',
+      C1.Text <> G.Text);
   finally
     NN.Free;
   end;

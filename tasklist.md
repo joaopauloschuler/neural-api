@@ -309,7 +309,7 @@ rather than acted on.
       the input and mix the targets by area fraction (Beta-distributed
       lambda). The CIFAR image-classification examples give an instant
       bake-off harness.
-- [ ] Contrastive search decoding (transformers penalty_alpha): degeneration
+- [X] Contrastive search decoding (transformers penalty_alpha): degeneration
       penalty re-ranking each candidate token by max cosine similarity
       between its hidden state and all previous tokens' hidden states;
       needs hidden-state capture during decode — a different beast from the

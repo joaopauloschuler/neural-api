@@ -752,6 +752,34 @@ function DecodeBeamSearchAll(NN: TNNet; const Prompt: string;
   MaxLen: integer; BeamWidth: integer;
   LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
 
+// CONTRASTIVE SEARCH decoding (Su et al. 2022, "A Contrastive Framework for
+// Neural Text Generation"; the transformers `penalty_alpha` decoder). Each
+// step re-ranks the TopK most probable next-token candidates by
+//   score(v) = (1 - PenaltyAlpha) * p(v)
+//            - PenaltyAlpha * max_{j<t} cos_sim( h_v , h_j )
+// where p(v) is the model probability of candidate v, h_v is the LAST hidden
+// state (the input to the final projection / softmax layer) the model produces
+// when v is appended, and {h_j} are the hidden states of all previously
+// processed tokens (the "degeneration penalty" context). The candidate with
+// the highest score is emitted; this favours fluent continuations while
+// penalising tokens whose representation collapses onto the existing context
+// (the cause of greedy degeneration / repetition).
+//   MaxLen       : maximum number of generated tokens (excludes the prompt).
+//   TopK         : candidate-set size (Su et al. use 4..8); TopK<=1 is greedy.
+//   PenaltyAlpha : the degeneration penalty in [0,1]. PenaltyAlpha=0 degrades
+//                  EXACTLY to greedy argmax over the SAME TopK candidates
+//                  (i.e. plain greedy argmax, since the top-prob candidate is
+//                  always in the TopK set). PenaltyAlpha=1 ranks purely by the
+//                  similarity penalty.
+// Char-level, same forward-pass / encoding convention as DecodeGreedy (token
+// id = character code). The hidden state is read from the layer feeding the
+// final projection via an extra forward of each candidate continuation; no
+// KV-cache is used (v1, mirrors the char-level DecodeGreedy re-encode loop).
+// Coded by Claude (AI).
+function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; TopK: integer; PenaltyAlpha: TNeuralFloat;
+  const StopStrings: array of string): TNNetDecodeResult;
+
 // ---------------------------------------------------------------------------
 // STREAMED GENERATION: the KV-cache / SSM-state counterpart of neuraldatasets'
 // GenerateStringFromCasualNN, driven by a TNNetStreamingDecoder session.
@@ -2704,6 +2732,172 @@ begin
   finally
     InputVolume.Free;
     OutputVolume.Free;
+  end;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+// The "last hidden state" layer for contrastive search: the input to the final
+// projection / LM head. The last layer is the logit / probability layer; when
+// it is a SoftMax variant the logit-producing layer is the one before it. The
+// hidden state is the OUTPUT of the layer FEEDING that logit layer (the
+// representation the LM head reads). Falls back to GetLastLayer's PrevLayer
+// when the chain is too short to look further back.
+// Coded by Claude (AI).
+function ContrastiveHiddenLayer(NN: TNNet): TNNetLayer;
+var
+  Head: TNNetLayer;
+begin
+  Head := NN.GetLastLayer();
+  // Skip a trailing softmax: the LM head (logits) is its predecessor.
+  if (Head is TNNetPointwiseSoftMax) and Assigned(Head.PrevLayer) then
+    Head := Head.PrevLayer;
+  // Hidden state = the LM head's input representation.
+  if Assigned(Head.PrevLayer) then
+    Result := Head.PrevLayer
+  else
+    Result := Head;
+end;
+
+// Cosine similarity of two equal-length flat vectors (the per-token hidden
+// states). Zero magnitude on either side yields 0 (no penalty), keeping the
+// score finite for a dead representation.
+function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat;
+var
+  Denom: TNeuralFloat;
+begin
+  Denom := A.GetMagnitude() * B.GetMagnitude();
+  if Denom <= 0 then
+    Result := 0
+  else
+    Result := A.DotProduct(B) / Denom;
+end;
+
+function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; TopK: integer; PenaltyAlpha: TNeuralFloat;
+  const StopStrings: array of string): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  HiddenLayer: TNNetLayer;
+  Probs: array of TNeuralFloat;
+  Cand: array of integer;          // current top-k candidate token ids
+  Past: array of TNNetVolume;      // hidden states of already-processed tokens
+  CandHidden: TNNetVolume;         // snapshot of a candidate's hidden state
+  VocabSize, Step, I, J, NumCand, Best, StopLen, PastLen: integer;
+  Total, MaxSim, Sim, ScoreV, BestScore: TNeuralFloat;
+  Context, CandStr: string;
+  TmpI: integer;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  HiddenLayer := ContrastiveHiddenLayer(NN);
+  VocabSize := OutputVolume.Size;
+  SetLength(Probs, VocabSize);
+  if TopK < 1 then TopK := 1;
+  if TopK > VocabSize then TopK := VocabSize;
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  Past := nil;
+  PastLen := 0;
+  CandHidden := nil;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      // Forward the current context: probabilities for the next token AND the
+      // context's own last hidden state (seeds the past set on the first step).
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      for I := 0 to VocabSize - 1 do Probs[I] := OutputVolume.Raw[I] / Total;
+      // On the first step record the prompt's hidden state as the only past
+      // context (so step 1 already has something to penalise against).
+      if PastLen = 0 then
+      begin
+        SetLength(Past, 1);
+        Past[0] := TNNetVolume.Create();
+        Past[0].Copy(HiddenLayer.Output);
+        PastLen := 1;
+      end;
+      // Top-k candidates by probability (partial selection sort; k is tiny).
+      SetLength(Cand, VocabSize);
+      for I := 0 to VocabSize - 1 do Cand[I] := I;
+      NumCand := TopK;
+      for I := 0 to NumCand - 1 do
+      begin
+        Best := I;
+        for J := I + 1 to VocabSize - 1 do
+          if Probs[Cand[J]] > Probs[Cand[Best]] then Best := J;
+        TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
+      end;
+      SetLength(Cand, NumCand);
+      // Re-rank candidates by the contrastive objective. PenaltyAlpha=0 keeps
+      // (1-alpha)*p(v) only, so the highest-probability candidate (Cand[0])
+      // wins by construction -> exactly greedy argmax over the top-k (= plain
+      // greedy argmax, since the global argmax is always in the top-k set).
+      Best := Cand[0];
+      BestScore := -1e30;
+      for I := 0 to NumCand - 1 do
+      begin
+        MaxSim := 0;
+        if PenaltyAlpha > 0 then
+        begin
+          // Hidden state the model produces when candidate Cand[I] is appended.
+          CandStr := Context + Chr(Cand[I]);
+          InputVolume.OneHotEncodingReversed(CandStr);
+          NN.Compute(InputVolume, OutputVolume);
+          if CandHidden = nil then CandHidden := TNNetVolume.Create();
+          CandHidden.Copy(HiddenLayer.Output);
+          MaxSim := -1e30;
+          for J := 0 to PastLen - 1 do
+          begin
+            Sim := ContrastiveCosine(CandHidden, Past[J]);
+            if Sim > MaxSim then MaxSim := Sim;
+          end;
+        end;
+        ScoreV := (1 - PenaltyAlpha) * Probs[Cand[I]] - PenaltyAlpha * MaxSim;
+        if ScoreV > BestScore then
+        begin
+          BestScore := ScoreV;
+          Best := Cand[I];
+        end;
+      end;
+      Result.SumLogProb := Result.SumLogProb + SafeLogProb(Probs[Best]);
+      if Best = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      // Commit: append the token, and add ITS hidden state to the past set so
+      // future candidates are penalised against it too. Recompute the chosen
+      // continuation's hidden state (cheap, k is small; avoids stashing all k).
+      Result.Text := Result.Text + Chr(Best);
+      Context := Context + Chr(Best);
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      SetLength(Past, PastLen + 1);
+      Past[PastLen] := TNNetVolume.Create();
+      Past[PastLen].Copy(HiddenLayer.Output);
+      Inc(PastLen);
+      // Stop strings: terminate and trim, exactly like DecodeGreedy.
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+    if Assigned(CandHidden) then CandHidden.Free;
+    for I := 0 to PastLen - 1 do Past[I].Free;
   end;
   Result.Score := Result.SumLogProb /
     LengthPenaltyDenominator(Length(Result.Text), 0);
