@@ -208,6 +208,15 @@ rather than acted on.
 - [X] safetensors writer F16/BF16 output: TNNetSafeTensorsWriter only
       emits F32; add encode-on-write halves (EncodeF16/EncodeBF16 mirroring
       the existing decoders) for smaller exported checkpoints.
+      DONE (commit 04418a5): EncodeF16/EncodeBF16 (round-to-nearest-even) now
+      live in neuralsafetensors.pas (neuralnumpy.EncodeF16 forwards to it —
+      single shared impl); per-tensor TSafeTensorsWriteDType on AddTensorFlat
+      (default stwF32, callers unchanged) + SaveNNetToSafeTensorsEx(dtype).
+      Tests in TestNeuralPretrained (round-trip dtype/offsets + F16 NNet
+      logit-drift). RESIDUAL: tools/verify_safetensors_writer.py not extended
+      to cross-check the F16/BF16 files against the python safetensors library
+      (a quick python-side dtype + value assert; /home/bpsa/x/bin/python has
+      the package).
 - [ ] HF-names safetensors exporter: export an imported pico-GPT-2 back to
       HF tensor names (wte.weight, h.N.attn.c_attn.weight, ...), reload via
       BuildGPT2FromSafeTensors and compare logits; generalize per-importer
@@ -351,6 +360,15 @@ rather than acted on.
       session and twin. RESIDUAL: a full-width->width-1 auto-clone is not
       attempted (a string round-trip preserves the original width) — caller
       still builds the width-1 net once via the Build*(1)+CopyWeights idiom.
+- [ ] CFG follow-up: a full-width-net -> width-1 unconditional-twin auto-clone
+      so MakeUnconditionalTwin (commit 48e2fd2) works from a single imported
+      model with no hand-built width-1 net. A SaveToString->LoadFromString
+      round-trip preserves the ORIGINAL input width, so this needs either a
+      rebuild-architecture-at-width-1 + CopyWeights walk (per-importer, or a
+      generic layer-shape-independent rebuilder) or a width-rewrite on the
+      serialized string. Assert the twin's logits match the source on a pinned
+      input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
+      template).
 - [ ] KV-cache eviction for unbounded streaming: attention sinks + rolling
       window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder
       — today the per-SDPA-layer cache grows without bound. Keep the first
@@ -412,6 +430,14 @@ rather than acted on.
       TestNeuralNLPMetrics (BIO decode, perfect/boundary/split/type-mismatch
       P/R/F1, micro-average), TestNeuralHFTokenizer (offset round-trip +
       word-id alignment). README + builder reused by Task B.
+- [ ] Offset-mapping follow-up: EncodeWithOffsets (commit 1e90b8a) is a
+      post-hoc surface-match heuristic (each token's DecodeToken surface
+      located forward at the running cursor), so it leaves tokens unmapped
+      when the decoded surface can't be found at the cursor (added/special
+      tokens, byte-fallback fragments). Add a byte-exact trace through the
+      byte-level-BPE merge state for a guaranteed alignment, and a test over
+      a pinned string with a byte-fallback / multi-byte-UTF8 token that the
+      heuristic currently leaves unmapped.
 - [X] QA span-extraction head (transformers ForQuestionAnswering port):
       two per-token logit heads (start/end) over the sequence axis +
       SQuAD-style postprocessing (top-k start×end pairs, end>=start, max
