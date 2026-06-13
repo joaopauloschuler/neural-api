@@ -2880,6 +2880,97 @@ function BuildModernBertFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
+// DEBERTA-V2 / DEBERTA-V3 IMPORT (model_type "deberta-v2"; the deberta-v3
+// family - microsoft/deberta-v3-base/-small, the ms-marco cross-encoder
+// rerankers - all use the DebertaV2 architecture class). The THIRD encoder
+// family here and the first with DISENTANGLED ATTENTION
+// (TNNetDisentangledAttention): the pre-softmax score is content-to-content
+// PLUS content-to-position PLUS position-to-content, the position terms
+// projecting a SEPARATE relative-position embedding table (distinct from the
+// avT5RelPosBias SCALAR bias). Architecture (verified vs HF transformers
+// modeling_deberta_v2):
+//
+//   Input(SeqLen,1,1 token ids) -> TNNetEmbedding (embeddings.word_embeddings)
+//     -> TNNetTokenLayerNorm (embeddings.LayerNorm)        [StableDropout off]
+//     -> num_hidden_layers x POST-LN blocks
+//          x := LN(x + dense(DISENTANGLED-MHA(q|k|v(x))))
+//          x := LN(x + output.dense(gelu(intermediate.dense(x))))
+//     -> Output: (SeqLen,1,hidden) final hidden states (HF DebertaV2Model
+//        last_hidden_state) - NO LM head.
+//
+// DeBERTa-v3 specifics handled here:
+//   - position_biased_input=false: NO absolute position table and NO
+//     token-type add in the embedding path (type_vocab_size=0) - just word
+//     embedding -> LayerNorm. (The BERT importer's pos/type branches are
+//     ABSENT.)
+//   - conv-after-embeddings is ABSENT in v3 (conv_kernel_size unset/0).
+//   - relative_attention=true, pos_att_type=[p2c,c2p], share_att_key=true:
+//     ONE shared rel_embeddings table (2*pos_ebd_size rows), LayerNorm'd
+//     (norm_rel_ebd "layer_norm") then projected by the SAME per-layer
+//     query/key weights as content (share_att_key). The importer precomputes
+//     each layer's per-head position-KEY (K^r = key_proj(rel_ln)) and
+//     position-QUERY (Q^r = query_proj(rel_ln)) tables and loads them into
+//     the per-head TNNetDisentangledAttention neurons.
+//   - exact erf GELU (hidden_act "gelu"), composed like the BERT importer.
+//   - sequence-classification head (pSeqClsHead): ContextPooler
+//     dense+gelu on row 0 then classifier(pooled) - reuses the same per-token
+//     PointwiseConvLinear scoring path as BuildBertForSequenceClassification.
+//
+// Tokenizer is a Unigram tokenizer.json (rides TNeuralHFTokenizer); the raw
+// spm.model protobuf path is OUT OF SCOPE here.
+
+type
+  TDebertaV2Config = record
+    HiddenSize: integer;       // hidden_size
+    IntermediateSize: integer; // intermediate_size
+    NumLayers: integer;        // num_hidden_layers
+    NumHeads: integer;         // num_attention_heads
+    VocabSize: integer;        // vocab_size
+    MaxPositions: integer;     // max_position_embeddings
+    LayerNormEps: double;      // layer_norm_eps (DeBERTa default 1e-7)
+    PosBuckets: integer;       // position_buckets (-1/0 = no log bucketing)
+    MaxRelPos: integer;        // max_relative_positions (resolved)
+    PosEbdSize: integer;       // att_span = position_buckets if >0 else MaxRel
+    NormRelEbd: boolean;       // norm_rel_ebd contains "layer_norm"
+    HiddenActTanh: boolean;    // false = exact erf "gelu" (the v3 default)
+    PoolerActTanh: boolean;    // pooler_hidden_act: false = gelu (default)
+    ModelType: string;         // 'deberta-v2'
+    Prefix: string;            // 'deberta.' or '' (detected by the builder)
+  end;
+
+// Reads a HF DeBERTa-v2/v3 config.json (model_type "deberta-v2"). Requires
+// hidden_size, intermediate_size, num_hidden_layers, num_attention_heads,
+// vocab_size, max_position_embeddings. Defaults follow DebertaV2Config:
+// layer_norm_eps = 1e-7, position_buckets = -1, max_relative_positions = -1
+// (resolved to max_position_embeddings), norm_rel_ebd = "none". Only the
+// p2c+c2p (scale_factor 3), share_att_key=true, relative_attention=true
+// configuration is supported (the deberta-v3 family); anything else is
+// rejected.
+function ReadDebertaV2ConfigFromJSONFile(
+  const FileName: string): TDebertaV2Config;
+
+function DebertaV2ConfigToString(const Config: TDebertaV2Config): string;
+
+// Builds the DeBERTa-v2/v3 ENCODER described by Config ((SeqLen,1,1) token ids
+// in, (SeqLen,1,hidden) final hidden states out) and loads every weight from
+// the checkpoint at FileName. pSeqLen = 0 uses the full
+// max_position_embeddings context. pInferenceOnly frees training volumes.
+// pSeqClsHead = True appends the ContextPooler + classifier head (row 0 then
+// carries HF's sequence-classification logits).
+function BuildDebertaV2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TDebertaV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pSeqClsHead: boolean = false): TNNet;
+
+function BuildDebertaV2FromSafeTensorsEx(const FileName: string;
+  out Config: TDebertaV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; const ConfigFileName: string = '';
+  pSeqClsHead: boolean = false): TNNet;
+
+function BuildDebertaV2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // DEEPSEEK-V2 IMPORT (model_type "deepseek_v2"; DeepSeek-V2-Lite is the
 // reference checkpoint) - the first importer to carry the two DeepSeek-V2
 // signature blocks: Multi-head Latent Attention (MLA: a low-rank compressed
@@ -10281,6 +10372,542 @@ begin
   Result := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(FileName,
     IgnoredConfig, nil, pSeqLen, pNumHeads, pInferenceOnly, '',
     pQuantizeInt8);
+end;
+
+// ============= DEBERTA-V2 / DEBERTA-V3 IMPORT =============================
+
+function ReadDebertaV2ConfigFromJSONFile(
+  const FileName: string): TDebertaV2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct, PoolerAct, NormRel: string;
+  PosAtt: TJSONArray;
+  HasC2P, HasP2C: boolean;
+  i: integer;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('DeBERTa import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('DeBERTa import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('DeBERTa import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('DeBERTa import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('DeBERTa import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'deberta-v2');
+    if (ModelType <> 'deberta-v2') and (ModelType <> 'deberta') then
+      ImportError('DeBERTa import: config model_type is "' + ModelType +
+        '" - expected "deberta-v2" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.ModelType := 'deberta-v2';
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-7);
+    if not Obj.Get('relative_attention', false) then
+      ImportError('DeBERTa import: only relative_attention=true (the ' +
+        'deberta-v3 disentangled-attention config) is supported.');
+    Result.PosBuckets := Obj.Get('position_buckets', -1);
+    Result.MaxRelPos := Obj.Get('max_relative_positions', -1);
+    if Result.MaxRelPos < 1 then Result.MaxRelPos := Result.MaxPositions;
+    if Result.PosBuckets > 0 then
+      Result.PosEbdSize := Result.PosBuckets
+    else
+      Result.PosEbdSize := Result.MaxRelPos;
+    if not Obj.Get('share_att_key', false) then
+      ImportError('DeBERTa import: only share_att_key=true is supported ' +
+        '(the deberta-v3 family; separate pos_key/pos_query projections are ' +
+        'not wired).');
+    // pos_att_type must be exactly {p2c, c2p} (scale_factor 3).
+    HasC2P := false; HasP2C := false;
+    if Obj.Find('pos_att_type') is TJSONArray then
+    begin
+      PosAtt := TJSONArray(Obj.Find('pos_att_type'));
+      for i := 0 to PosAtt.Count - 1 do
+      begin
+        if PosAtt.Strings[i] = 'c2p' then HasC2P := true;
+        if PosAtt.Strings[i] = 'p2c' then HasP2C := true;
+      end;
+    end;
+    if not (HasC2P and HasP2C) then
+      ImportError('DeBERTa import: only pos_att_type containing BOTH "c2p" ' +
+        'and "p2c" (scale_factor 3, the deberta-v3 default) is supported.');
+    NormRel := Obj.Get('norm_rel_ebd', 'none');
+    Result.NormRelEbd := Pos('layer_norm', NormRel) > 0;
+    HiddenAct := Obj.Get('hidden_act', 'gelu');
+    if HiddenAct = 'gelu' then
+      Result.HiddenActTanh := false
+    else if (HiddenAct = 'gelu_new') or (HiddenAct = 'gelu_pytorch_tanh') then
+      Result.HiddenActTanh := true
+    else
+      ImportError('DeBERTa import: config hidden_act "' + HiddenAct +
+        '" is not supported (only "gelu", "gelu_new", "gelu_pytorch_tanh").');
+    PoolerAct := Obj.Get('pooler_hidden_act', 'gelu');
+    Result.PoolerActTanh := (PoolerAct = 'tanh');
+    Result.Prefix := '';
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function DebertaV2ConfigToString(const Config: TDebertaV2Config): string;
+begin
+  Result := 'deberta-v2 config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', pos_buckets=' + IntToStr(Config.PosBuckets) +
+    ', max_rel=' + IntToStr(Config.MaxRelPos) +
+    ', att_span=' + IntToStr(Config.PosEbdSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps);
+  if Config.NormRelEbd then Result := Result + ', norm_rel_ebd=layer_norm';
+  if Config.HiddenActTanh then Result := Result + ', act=gelu_tanh'
+  else Result := Result + ', act=gelu_exact';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TDebertaBlock = record
+    QKV, AttnDense, AttnLN, Inter, OutDense, OutLN: TNNetLayer;
+    Heads: array of TNNetLayer; // per-head TNNetDisentangledAttention
+  end;
+
+// Computes RelLN[a, :] = LayerNorm(RelEmb[a, :]) over the hidden axis for the
+// first twoSpan rows (matching HF DebertaV2Encoder.get_rel_embedding, which
+// LayerNorm-normalizes the rel_embeddings when norm_rel_ebd contains
+// "layer_norm"). When NormRel=false RelLN is a straight copy of the rows.
+procedure DebertaBuildRelLN(RelEmb, RelGamma, RelBeta: TNNetVolume;
+  NormRel: boolean; twoSpan, Hidden: integer; Eps: double; RelLN: TNNetVolume);
+var
+  a, c: integer;
+  Mean, Variance, InvStd, V: TNeuralFloat;
+begin
+  for a := 0 to twoSpan - 1 do
+  begin
+    if NormRel then
+    begin
+      Mean := 0;
+      for c := 0 to Hidden - 1 do
+        Mean := Mean + RelEmb.FData[a * Hidden + c];
+      Mean := Mean / Hidden;
+      Variance := 0;
+      for c := 0 to Hidden - 1 do
+      begin
+        V := RelEmb.FData[a * Hidden + c] - Mean;
+        Variance := Variance + V * V;
+      end;
+      Variance := Variance / Hidden;
+      InvStd := 1.0 / Sqrt(Variance + Eps);
+      for c := 0 to Hidden - 1 do
+        RelLN.FData[a * Hidden + c] :=
+          (RelEmb.FData[a * Hidden + c] - Mean) * InvStd *
+          RelGamma.FData[c] + RelBeta.FData[c];
+    end
+    else
+      for c := 0 to Hidden - 1 do
+        RelLN.FData[a * Hidden + c] := RelEmb.FData[a * Hidden + c];
+  end;
+end;
+
+// Projects the (LayerNorm'd) rel-embedding rows through one head's slice of
+// the content key/query projections (share_att_key) and writes the resulting
+// position-KEY table into the head layer's neuron 0 (K^r) and the
+// position-QUERY table into neuron 1 (Q^r). W* are [out=hidden, in=hidden]
+// row-major nn.Linear weights, B* the [hidden] biases; the head reads output
+// columns [h*d_k .. h*d_k+d_k-1]. The neuron table is twoSpan rows of d_k,
+// flattened row-major (FData[a*d_k + dLocal]).
+procedure DebertaLoadHeadPosTables(HeadLayer: TNNetLayer;
+  RelLN, Wq, Bq, Wk, Bk: TNNetVolume; HeadIdx, d_k, Hidden, twoSpan: integer);
+var
+  PosK, PosQ: TNNetVolume;
+  a, dLocal, c, OutRow: integer;
+  AccK, AccQ: TNeuralFloat;
+  RelRow: TNeuralFloatArrPtr;
+begin
+  EnsureWritableImportWeights(HeadLayer);
+  PosK := HeadLayer.Neurons[0].Weights; // K^r
+  PosQ := HeadLayer.Neurons[1].Weights; // Q^r
+  for a := 0 to twoSpan - 1 do
+  begin
+    RelRow := RelLN.GetRawPtr(a, 0, 0);
+    for dLocal := 0 to d_k - 1 do
+    begin
+      OutRow := HeadIdx * d_k + dLocal;
+      AccK := Bk.FData[OutRow];
+      AccQ := Bq.FData[OutRow];
+      for c := 0 to Hidden - 1 do
+      begin
+        AccK := AccK + RelRow^[c] * Wk.FData[OutRow * Hidden + c];
+        AccQ := AccQ + RelRow^[c] * Wq.FData[OutRow * Hidden + c];
+      end;
+      PosK.FData[a * d_k + dLocal] := AccK;
+      PosQ.FData[a * d_k + dLocal] := AccQ;
+    end;
+  end;
+  HeadLayer.FlushWeightCache();
+end;
+
+function BuildDebertaV2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TDebertaV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pSeqClsHead: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TDebertaBlock;
+  InputLayer, WordEmb, EmbLN, BranchInput, HiddenAct, PhiBranch: TNNetLayer;
+  PoolerDense, ClassifierDense, ConcatLayer: TNNetLayer;
+  SliceLayers: array of TNNetLayer;
+  BlockCnt, SeqLen, d_k, h, NumLabels, i, twoSpan: integer;
+  BlockPrefix, TensorNameStr, QName, KName, VName: string;
+  Consumed: TStringList;
+  RelEmb, RelGamma, RelBeta, RelLN: TNNetVolume;
+  WqV, WkV, BqV, BkV: TNNetVolume;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  procedure LoadWordEmbedding(Layer: TNNetLayer; const TName: string);
+  var Tmp: TNNetVolume;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('DeBERTa import: missing tensor "' + TName + '".');
+    if (Reader.DimCount(TName) <> 2) or
+       (Reader.DimSize(TName, 0) <> Config.VocabSize) or
+       (Reader.DimSize(TName, 1) <> Config.HiddenSize) then
+      ImportError('DeBERTa import: "' + TName + '" must be [' +
+        IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+        '], got ' + Reader.ShapeAsString(TName));
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(TName, Tmp);
+      Layer.Neurons[0].Weights.Copy(Tmp);
+      Layer.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    MarkConsumed(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  RelEmb := nil; RelGamma := nil; RelBeta := nil; RelLN := nil;
+  WqV := nil; WkV := nil; BqV := nil; BkV := nil;
+  try
+    try
+      if Config.NumHeads < 1 then
+        ImportError('DeBERTa import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('DeBERTa import: hidden_size not divisible by heads.');
+      d_k := Config.HiddenSize div Config.NumHeads;
+      twoSpan := 2 * Config.PosEbdSize;
+      // Prefix: the plain *Model serializes with no prefix; *For* exports
+      // carry "deberta.".
+      if Reader.HasTensor('embeddings.word_embeddings.weight') then
+        Config.Prefix := ''
+      else if Reader.HasTensor('deberta.embeddings.word_embeddings.weight') then
+        Config.Prefix := 'deberta.'
+      else
+        ImportError('DeBERTa import: word_embeddings.weight not found - not ' +
+          'a deberta-v2 checkpoint?');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      // Channel 0 = token ids (token-type IGNORED: type_vocab_size=0 in v3;
+      // the shape stays (SeqLen,1,2) for API uniformity with the BERT family).
+      InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
+      NN.AddLayer( TNNetSplitChannels.Create([0]) );
+      WordEmb := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      // position_biased_input=false: NO absolute position add, NO token-type
+      // add. Just the embedding LayerNorm.
+      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        SetLength(Blocks[BlockCnt].Heads, Config.NumHeads);
+        // POST-LN disentangled-attention sub-block.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].QKV := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        // Manual multi-head disentangled attention (one head per
+        // TNNetDisentangledAttention so the importer can load each head's
+        // position tables).
+        SetLength(SliceLayers, Config.NumHeads);
+        NN.AddSplitQKVHeads(Config.HiddenSize, Config.NumHeads, SliceLayers,
+          Blocks[BlockCnt].QKV);
+        for h := 0 to Config.NumHeads - 1 do
+          Blocks[BlockCnt].Heads[h] := NN.AddLayerAfter(
+            TNNetDisentangledAttention.Create(d_k, {causal=}false,
+              Config.PosEbdSize, Config.PosBuckets, Config.MaxRelPos),
+            SliceLayers[h]);
+        ConcatLayer := NN.AddLayer(
+          TNNetDeepConcat.Create(Blocks[BlockCnt].Heads) );
+        Blocks[BlockCnt].AttnDense := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), ConcatLayer );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].AttnLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        // POST-LN FFN sub-block.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].Inter := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        if Config.HiddenActTanh then
+          NN.AddLayer( TNNetGELU.Create() )
+        else
+        begin
+          HiddenAct := NN.GetLastLayer();
+          NN.AddLayerAfter(
+            TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+          NN.AddLayer( TNNetErf.Create() );
+          NN.AddLayer( TNNetAddConstant.Create(1.0) );
+          PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+          NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+          NN.AddLayer( TNNetReGLU.Create() );
+        end;
+        Blocks[BlockCnt].OutDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].OutLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      // Optional sequence-classification head (ContextPooler + classifier).
+      PoolerDense := nil;
+      ClassifierDense := nil;
+      NumLabels := 0;
+      if pSeqClsHead then
+      begin
+        // ContextPooler: dense(hidden->hidden) + pooler_hidden_act, per-token
+        // (row 0 = HF pooled_output); then classifier(pooled).
+        PoolerDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        if Config.PoolerActTanh then
+          NN.AddLayer( TNNetHyperbolicTangent.Create() )
+        else
+        begin
+          HiddenAct := NN.GetLastLayer();
+          NN.AddLayerAfter(
+            TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+          NN.AddLayer( TNNetErf.Create() );
+          NN.AddLayer( TNNetAddConstant.Create(1.0) );
+          PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+          NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+          NN.AddLayer( TNNetReGLU.Create() );
+        end;
+        if not Reader.HasTensor('classifier.weight') then
+          ImportError('DeBERTa import: missing "classifier.weight" - not a ' +
+            '*ForSequenceClassification checkpoint?');
+        NumLabels := Reader.DimSize('classifier.weight', 0);
+        ClassifierDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(NumLabels) );
+      end;
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      LoadWordEmbedding(WordEmb,
+        Config.Prefix + 'embeddings.word_embeddings.weight');
+      LoadLayerNormWeights(Reader, EmbLN,
+        Config.Prefix + 'embeddings.LayerNorm.weight',
+        Config.Prefix + 'embeddings.LayerNorm.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'embeddings.LayerNorm.weight');
+      MarkConsumed(Config.Prefix + 'embeddings.LayerNorm.bias');
+
+      // Shared relative-position embedding table + its LayerNorm, applied
+      // once. RelLN[a, :] = LayerNorm(rel_embeddings[a, :]) over hidden.
+      RelEmb := TNNetVolume.Create;
+      Reader.LoadTensorFlat(Config.Prefix + 'encoder.rel_embeddings.weight',
+        RelEmb);
+      MarkConsumed(Config.Prefix + 'encoder.rel_embeddings.weight');
+      if Reader.DimSize(Config.Prefix + 'encoder.rel_embeddings.weight', 0) <
+         twoSpan then
+        ImportError('DeBERTa import: rel_embeddings has fewer than 2*att_span='
+          + IntToStr(twoSpan) + ' rows.');
+      RelLN := TNNetVolume.Create;
+      RelLN.ReSize(twoSpan, 1, Config.HiddenSize);
+      if Config.NormRelEbd then
+      begin
+        RelGamma := TNNetVolume.Create;
+        RelBeta := TNNetVolume.Create;
+        Reader.LoadTensorFlat(Config.Prefix + 'encoder.LayerNorm.weight',
+          RelGamma);
+        Reader.LoadTensorFlat(Config.Prefix + 'encoder.LayerNorm.bias',
+          RelBeta);
+        MarkConsumed(Config.Prefix + 'encoder.LayerNorm.weight');
+        MarkConsumed(Config.Prefix + 'encoder.LayerNorm.bias');
+      end;
+      // Build the (LayerNorm'd) rel-embedding rows used by every layer.
+      DebertaBuildRelLN(RelEmb, RelGamma, RelBeta, Config.NormRelEbd,
+        twoSpan, Config.HiddenSize, Config.LayerNormEps, RelLN);
+
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'encoder.layer.' + IntToStr(BlockCnt) +
+          '.';
+        QName := BlockPrefix + 'attention.self.query_proj';
+        KName := BlockPrefix + 'attention.self.key_proj';
+        VName := BlockPrefix + 'attention.self.value_proj';
+        // Content Q|K|V slab (separate biased Linears -> fused QKV).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV, QName + '.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, 3 * Config.HiddenSize, 0,
+          QName + '.bias');
+        MarkConsumed(QName + '.weight'); MarkConsumed(QName + '.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV, KName + '.weight',
+          Config.HiddenSize, Config.HiddenSize, Config.HiddenSize,
+          3 * Config.HiddenSize, 0, KName + '.bias');
+        MarkConsumed(KName + '.weight'); MarkConsumed(KName + '.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV, VName + '.weight',
+          Config.HiddenSize, Config.HiddenSize, 2 * Config.HiddenSize,
+          3 * Config.HiddenSize, 0, VName + '.bias');
+        MarkConsumed(VName + '.weight'); MarkConsumed(VName + '.bias');
+        // Per-head position tables: project RelLN through THIS layer's
+        // query_proj (-> Q^r, neuron 1) and key_proj (-> K^r, neuron 0),
+        // share_att_key=true. Read the projection weights into volumes.
+        WqV := TNNetVolume.Create; WkV := TNNetVolume.Create;
+        BqV := TNNetVolume.Create; BkV := TNNetVolume.Create;
+        Reader.LoadTensorFlat(QName + '.weight', WqV);
+        Reader.LoadTensorFlat(KName + '.weight', WkV);
+        Reader.LoadTensorFlat(QName + '.bias', BqV);
+        Reader.LoadTensorFlat(KName + '.bias', BkV);
+        for h := 0 to Config.NumHeads - 1 do
+          DebertaLoadHeadPosTables(Blocks[BlockCnt].Heads[h], RelLN,
+            WqV, BqV, WkV, BkV, h, d_k, Config.HiddenSize, twoSpan);
+        FreeAndNil(WqV); FreeAndNil(WkV); FreeAndNil(BqV); FreeAndNil(BkV);
+        // attention.output dense + LayerNorm.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
+          BlockPrefix + 'attention.output.dense.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'attention.output.dense.bias');
+        MarkConsumed(BlockPrefix + 'attention.output.dense.weight');
+        MarkConsumed(BlockPrefix + 'attention.output.dense.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].AttnLN,
+          BlockPrefix + 'attention.output.LayerNorm.weight',
+          BlockPrefix + 'attention.output.LayerNorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'attention.output.LayerNorm.weight');
+        MarkConsumed(BlockPrefix + 'attention.output.LayerNorm.bias');
+        // FFN.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Inter,
+          BlockPrefix + 'intermediate.dense.weight',
+          Config.HiddenSize, Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'intermediate.dense.bias');
+        MarkConsumed(BlockPrefix + 'intermediate.dense.weight');
+        MarkConsumed(BlockPrefix + 'intermediate.dense.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutDense,
+          BlockPrefix + 'output.dense.weight',
+          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'output.dense.bias');
+        MarkConsumed(BlockPrefix + 'output.dense.weight');
+        MarkConsumed(BlockPrefix + 'output.dense.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].OutLN,
+          BlockPrefix + 'output.LayerNorm.weight',
+          BlockPrefix + 'output.LayerNorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'output.LayerNorm.weight');
+        MarkConsumed(BlockPrefix + 'output.LayerNorm.bias');
+      end;
+      if pSeqClsHead then
+      begin
+        LoadLlamaLinearWeights(Reader, PoolerDense,
+          'pooler.dense.weight', Config.HiddenSize, Config.HiddenSize, 0, -1,
+          0, 'pooler.dense.bias');
+        MarkConsumed('pooler.dense.weight');
+        MarkConsumed('pooler.dense.bias');
+        LoadLlamaLinearWeights(Reader, ClassifierDense,
+          'classifier.weight', Config.HiddenSize, NumLabels, 0, -1, 0,
+          'classifier.bias');
+        MarkConsumed('classifier.weight');
+        MarkConsumed('classifier.bias');
+      end;
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if Pos('position_ids', TensorNameStr) > 0 then continue;
+        if Pos('embeddings.position_embeddings', TensorNameStr) > 0 then
+          continue; // present but unused when position_biased_input=false
+        if (not pSeqClsHead) and (Pos('pooler.', TensorNameStr) > 0) then
+          continue;
+        if (not pSeqClsHead) and (Pos('classifier.', TensorNameStr) > 0) then
+          continue;
+        ImportError('DeBERTa import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+    RelEmb.Free; RelGamma.Free; RelBeta.Free; RelLN.Free;
+    WqV.Free; WkV.Free; BqV.Free; BkV.Free;
+  end;
+end;
+
+function BuildDebertaV2FromSafeTensorsEx(const FileName: string;
+  out Config: TDebertaV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; const ConfigFileName: string = '';
+  pSeqClsHead: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDebertaV2ConfigFromJSONFile(ConfigPath);
+  Result := BuildDebertaV2FromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pSeqClsHead);
+end;
+
+function BuildDebertaV2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  IgnoredConfig: TDebertaV2Config;
+begin
+  Result := BuildDebertaV2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName, {pSeqClsHead=}false);
 end;
 
 // ============= MISTRAL / QWEN2 / QWEN3 / GEMMA / DISPATCH ==================
@@ -19132,6 +19759,7 @@ var
   IgnoredBloomConfig: TBloomConfig;
   IgnoredFalconConfig: TFalconConfig;
   IgnoredModernBertConfig: TModernBertConfig;
+  IgnoredDebertaV2Config: TDebertaV2Config;
   IgnoredDeepSeekV2Config: TDeepSeekV2Config;
 begin
   // ---- resolve the weights file and the config.json ----
@@ -19352,6 +19980,17 @@ begin
     Result := BuildModernBertFromSafeTensorsEx(WeightsPath,
       IgnoredModernBertConfig, pSeqLen, pInferenceOnly, ConfigPath,
       pQuantizeInt8)
+  else if ModelType = 'deberta-v2' then
+    // The third ENCODER route: DeBERTa-v2/v3 (architectures
+    // ["DebertaV2Model"]; the deberta-v3 family - microsoft/deberta-v3-base,
+    // the ms-marco rerankers) - input (SeqLen,1,2) token|token-type ids
+    // (channel 1 ignored, type_vocab_size=0), output (SeqLen,1,hidden) final
+    // hidden states. The FIRST disentangled-attention encoder
+    // (TNNetDisentangledAttention). Sequence-classification head excluded;
+    // call BuildDebertaV2FromSafeTensorsEx with pSeqClsHead=true for it. See
+    // the DEBERTA-V2 IMPORT section.
+    Result := BuildDebertaV2FromSafeTensorsEx(WeightsPath,
+      IgnoredDebertaV2Config, pSeqLen, pInferenceOnly, ConfigPath)
   else if ModelType = 'deepseek_v2' then
     // DeepSeek-V2 (architectures ["DeepseekV2ForCausalLM"];
     // DeepSeek-V2-Lite is the reference checkpoint): Multi-head Latent

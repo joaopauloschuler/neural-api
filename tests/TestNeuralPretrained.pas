@@ -171,6 +171,9 @@ type
     procedure TestJambaLogitParity;
     procedure TestBloomLogitParity;
     procedure TestModernBertHiddenStateParity;
+    procedure TestDebertaV2ConfigFromJSONFile;
+    procedure TestDebertaV2HiddenStateParity;
+    procedure TestDebertaV2SeqClassificationParity;
     procedure TestDeepSeekV2LogitParity;
     procedure TestDeepSeekV2YarnMScaleLogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
@@ -5519,6 +5522,112 @@ begin
       FixturePath('tiny_modernbert_logits.json'), 16, 8);
   finally
     NN.Free;
+  end;
+end;
+
+// DeBERTa-v2/v3 parity (model_type "deberta-v2"): tests/fixtures/
+// tiny_debertav2.* is a RANDOM pico DebertaV2Model
+// (tools/deberta_v2_tiny_fixture.py - float64 transformers oracle,
+// O(1)-scale re-randomized weights, disentangled-attention non-vacuity
+// asserted by dropping the position terms). Exercises disentangled
+// attention (pos_att_type p2c+c2p, share_att_key, log bucketing at small
+// position_buckets=4/max_rel=6), position_biased_input=false (no abs-pos /
+// token-type add) and the exact erf GELU.
+procedure TTestNeuralPretrained.TestDebertaV2ConfigFromJSONFile;
+var
+  Config: TDebertaV2Config;
+begin
+  Config := ReadDebertaV2ConfigFromJSONFile(
+    FixturePath('tiny_debertav2_config.json'));
+  AssertEquals('model_type', 'deberta-v2', Config.ModelType);
+  AssertEquals('layers', 3, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('hidden', 8, Config.HiddenSize);
+  AssertEquals('intermediate', 10, Config.IntermediateSize);
+  AssertEquals('vocab', 17, Config.VocabSize);
+  AssertEquals('position_buckets', 4, Config.PosBuckets);
+  AssertEquals('max_relative_positions', 6, Config.MaxRelPos);
+  AssertEquals('att_span = position_buckets', 4, Config.PosEbdSize);
+  AssertTrue('norm_rel_ebd layer_norm', Config.NormRelEbd);
+  AssertFalse('hidden_act gelu = exact erf', Config.HiddenActTanh);
+end;
+
+procedure TTestNeuralPretrained.TestDebertaV2HiddenStateParity;
+var
+  NN: TNNet;
+  Config: TDebertaV2Config;
+  LayerCnt, DisCnt: integer;
+  Dis: TNNetDisentangledAttention;
+begin
+  RandSeed := 424242;
+  NN := BuildDebertaV2FromSafeTensorsEx(
+    FixturePath('tiny_debertav2.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_debertav2_config.json'));
+  try
+    AssertEquals('model_type', 'deberta-v2', Config.ModelType);
+    AssertEquals('prefix (plain DebertaV2Model export)', '', Config.Prefix);
+    // Structure: one TNNetDisentangledAttention per head per layer
+    // (3 layers x 2 heads = 6), each carrying att_span / buckets / max_rel.
+    DisCnt := 0;
+    for LayerCnt := 0 to NN.CountLayers - 1 do
+      if NN.Layers[LayerCnt] is TNNetDisentangledAttention then
+      begin
+        Inc(DisCnt);
+        Dis := NN.Layers[LayerCnt] as TNNetDisentangledAttention;
+        AssertEquals('disentangled att_span', 4, Dis.AttSpan);
+        AssertEquals('disentangled pos_buckets', 4, Dis.PosBuckets);
+        AssertEquals('disentangled max_rel', 6, Dis.MaxRelPos);
+      end;
+    AssertEquals('disentangled heads (3 layers x 2 heads)', 6, DisCnt);
+    // Hidden-state parity vs the HF float64 oracle (exact erf GELU -> true
+    // f32 parity well under the 2e-5 BERT gate).
+    AssertBertParityWithFixture(NN,
+      FixturePath('tiny_debertav2_hidden.json'), 16, Config.HiddenSize,
+      {PoolerRow0Only=}false);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch "deberta-v2".
+  NN := BuildFromPretrained(FixturePath('tiny_debertav2.safetensors'),
+    {SeqLen=}16, {pInferenceOnly=}false,
+    FixturePath('tiny_debertav2_config.json'));
+  try
+    AssertBertParityWithFixture(NN,
+      FixturePath('tiny_debertav2_hidden.json'), 16, 8,
+      {PoolerRow0Only=}false);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestDebertaV2SeqClassificationParity;
+var
+  NN: TNNet;
+  Config: TDebertaV2Config;
+  Id2Label: TStringList;
+begin
+  RandSeed := 424242;
+  Id2Label := ReadId2LabelFromJSONFile(
+    FixturePath('tiny_debertav2_seqcls_config.json'));
+  try
+    NN := BuildDebertaV2FromSafeTensorsEx(
+      FixturePath('tiny_debertav2_seqcls.safetensors'), Config, {SeqLen=}16,
+      {pInferenceOnly=}false,
+      FixturePath('tiny_debertav2_seqcls_config.json'),
+      {pSeqClsHead=}true);
+    try
+      AssertEquals('num_labels output depth', 2,
+        NN.GetLastLayer().Output.Depth);
+      // ContextPooler (dense+gelu on row 0) + classifier; row 0 carries HF's
+      // sequence-classification logits (BERT-style CLS-first pooling).
+      AssertSeqClsParityWithFixture(NN,
+        FixturePath('tiny_debertav2_seqcls_logits.json'), 16,
+        {BertStyle=}true, Id2Label);
+    finally
+      NN.Free;
+    end;
+  finally
+    Id2Label.Free;
   end;
 end;
 

@@ -25896,22 +25896,26 @@ begin
   AfterWeightUpdate();
   // Precompute the two gather indices per (i,j) pair (HF gather math). r=i-j.
   //   c2p_pos(i,j) = clamp( bucket(i-j) + att_span, 0, 2*att_span-1)
-  //   p2c_pos(j,i) = clamp( bucket(j-i) + att_span, 0, 2*att_span-1)
-  // (HF clamps -r_pos + att_span where r_pos = bucket(query-key); from the
-  // KEY's row that is bucket(j-i), then the result is transposed onto [i,j],
-  // so the (i,j) entry reads bucket((j)-(i)). Both reduce to bucket of the
-  // distance with opposite sign.)
+  //   p2c_pos(j,i) = clamp(-bucket(j-i) + att_span, 0, 2*att_span-1)
+  // HF clamps -r_pos + att_span where r_pos = bucket(query-key) (from the
+  // KEY's row that is bucket(j-i)), then TRANSPOSES the result onto [i,j], so
+  // the p2c (i,j) entry reads clamp(-bucket(j-i) + att_span). The DeBERTa
+  // log-bucket function is ODD (bucket(-x) = -bucket(x)), so
+  // -bucket(j-i) = bucket(i-j) = bucket(r): the c2p and p2c gather indices
+  // COINCIDE for the symmetric (query==key) encoder case. Computed
+  // independently here so the math is explicit and a future asymmetric
+  // variant can diverge them.
   SetLength(FC2P, FSeqLen * FSeqLen);
   SetLength(FP2C, FSeqLen * FSeqLen);
   for i := 0 to FSeqLen - 1 do
     for j := 0 to FSeqLen - 1 do
     begin
       r := i - j;
-      rb := Bucketed(r) + FAttSpan;
+      rb := Bucketed(r) + FAttSpan;            // c2p_pos
       if rb < 0 then rb := 0;
       if rb > twoSpan - 1 then rb := twoSpan - 1;
       c2p := rb;
-      rb := Bucketed(-r) + FAttSpan;
+      rb := -Bucketed(-r) + FAttSpan;          // p2c_pos = -bucket(j-i)+span
       if rb < 0 then rb := 0;
       if rb > twoSpan - 1 then rb := twoSpan - 1;
       p2c := rb;
