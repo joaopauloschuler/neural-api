@@ -458,9 +458,11 @@ rather than acted on.
       assert, same pattern as the chunked-forward recurrence family.
 - [ ] rope_scaling follow-ups to the landed wiring (7e74fee): (a) DeepSeek-style YaRN `mscale` /
       `mscale_all_dim` overrides are rejected — needed for full
-      DeepSeek-V2 checkpoints (the -Lite config carries them); (b) yarn
-      `"truncate": false` configs are silently treated as truncate=true —
-      honor the flag or reject loudly.
+      DeepSeek-V2 checkpoints (the -Lite config carries them); (b) [DONE,
+      landed with the GPT-OSS importer] yarn `"truncate"` is now parsed
+      (TRoPEScalingConfig.YarnTruncate, default true) and threaded into
+      TNNetRotaryEmbedding (FStruct[2], stored inverted so old serialized
+      YaRN layers reload unchanged); gpt-oss ships `"truncate": false`.
       [longrope (Phi-3) DONE: rsmLongRoPE mode wired into TNNetRotaryEmbedding
       + ReadRoPEScalingFromJSONObject parses longrope/su/yarn-with-long_factor;
       parity fixture tiny_phi3_longrope verified vs HF float64.]
