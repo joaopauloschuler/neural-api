@@ -107,6 +107,10 @@ type
     procedure TestGenerateWithConfigMatchesHandAssembled;
     procedure TestTemperatureNearZeroWithSamplerMatchesGreedy;
     procedure TestStringConfigDefaultsMatchPlainWrapper;
+    // Classifier-free guidance (CFG) processor.
+    procedure TestCFGScaleOneMatchesPlainDecoding;
+    procedure TestCFGScaleZeroIgnoresConditionalPrompt;
+    procedure TestCFGRejectsInvalidArguments;
     // Constrained (structured) decoding: TNNetTokenConstraint and friends.
     procedure TestAllowedTokensConstraintMasksAndRenormalizes;
     procedure TestConstraintMaskFallbackLeavesRowUntouched;
@@ -2210,6 +2214,165 @@ begin
     Session.Free;
     Twin.Free;
     Full.Free;
+  end;
+end;
+
+// CFG INVARIANT 1: GuidanceScale = 1 collapses to the conditional-only
+// distribution (uncond + 1*(cond-uncond) = cond), so a CFG-guided greedy run
+// must reproduce a plain (no-processor) greedy run token-for-token. The
+// conditional loop and the unconditional branch use SEPARATE width-1 twins of
+// the same weights (one session cannot be driven by two loops at once).
+procedure TTestNeuralDecode.TestCFGScaleOneMatchesPlainDecoding;
+const
+  SeqLen = 12;
+  PromptLen = 4;
+var
+  Full, TwinPlain, TwinCond, TwinUncond: TNNet;
+  PlainSession, CondSession, UncondSession: TNNetStreamingDecoder;
+  CFG: TNNetCFGProcessor;
+  PlainToks, CFGToks: TNeuralIntegerArray;
+  NegPrompt: array[0..1] of integer;
+  PlainLen, CFGLen, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  // The pipeline operates on POST-SOFTMAX probabilities: cap with a
+  // per-position softmax (weightless, so CopyWeights stays exact).
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinPlain := BuildTinySSMLM(1); TwinPlain.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinCond := BuildTinySSMLM(1); TwinCond.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinUncond := BuildTinySSMLM(1); TwinUncond.AddLayer(TNNetPointwiseSoftMax.Create());
+  PlainSession := nil; CondSession := nil; UncondSession := nil; CFG := nil;
+  try
+    TwinPlain.CopyWeights(Full);
+    TwinCond.CopyWeights(Full);
+    TwinUncond.CopyWeights(Full);
+    PlainSession := TNNetStreamingDecoder.Create(TwinPlain, SeqLen);
+    CondSession := TNNetStreamingDecoder.Create(TwinCond, SeqLen);
+    UncondSession := TNNetStreamingDecoder.Create(TwinUncond, SeqLen);
+
+    SetLength(PlainToks, PromptLen);
+    PlainToks[0] := 5; PlainToks[1] := 2; PlainToks[2] := 9; PlainToks[3] := 4;
+    PlainLen := GenerateTokensStreamed(PlainSession, PlainToks, PromptLen,
+      SeqLen - PromptLen, SeqLen);
+    AssertTrue('plain path generated something', PlainLen > PromptLen);
+
+    NegPrompt[0] := 7; NegPrompt[1] := 3; // arbitrary - ignored at scale 1
+    CFG := TNNetCFGProcessor.Create(UncondSession, NegPrompt, 1.0);
+    SetLength(CFGToks, PromptLen);
+    CFGToks[0] := 5; CFGToks[1] := 2; CFGToks[2] := 9; CFGToks[3] := 4;
+    CFGLen := GenerateTokensStreamedWithProcessors(CondSession, CFGToks,
+      PromptLen, SeqLen - PromptLen, SeqLen, nil, CFG, nil, nil);
+
+    AssertEquals('scale=1 same generated length', PlainLen, CFGLen);
+    for T := PromptLen to PlainLen - 1 do
+      AssertEquals('scale=1 token at ' + IntToStr(T), PlainToks[T], CFGToks[T]);
+  finally
+    CFG.Free;
+    UncondSession.Free; CondSession.Free; PlainSession.Free;
+    TwinUncond.Free; TwinCond.Free; TwinPlain.Free; Full.Free;
+  end;
+end;
+
+// CFG INVARIANT 2: GuidanceScale = 0 collapses to the unconditional branch
+// (uncond + 0*(cond-uncond) = uncond), so the conditional prompt has NO
+// influence: two runs with DIFFERENT conditional prompts but the SAME negative
+// prompt must produce identical output. (The model is a stateful SSM, so its
+// output genuinely depends on the conditioning context - the test would be
+// vacuous on a context-free head.)
+procedure TTestNeuralDecode.TestCFGScaleZeroIgnoresConditionalPrompt;
+const
+  SeqLen = 12;
+  PromptLen = 4;
+var
+  Full, TwinA, TwinB, TwinUA, TwinUB: TNNet;
+  SessA, SessB, USessA, USessB: TNNetStreamingDecoder;
+  CFGa, CFGb: TNNetCFGProcessor;
+  ToksA, ToksB: TNeuralIntegerArray;
+  NegPrompt: array[0..2] of integer;
+  LenA, LenB, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinA := BuildTinySSMLM(1); TwinA.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinB := BuildTinySSMLM(1); TwinB.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinUA := BuildTinySSMLM(1); TwinUA.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinUB := BuildTinySSMLM(1); TwinUB.AddLayer(TNNetPointwiseSoftMax.Create());
+  SessA := nil; SessB := nil; USessA := nil; USessB := nil; CFGa := nil; CFGb := nil;
+  try
+    TwinA.CopyWeights(Full); TwinB.CopyWeights(Full);
+    TwinUA.CopyWeights(Full); TwinUB.CopyWeights(Full);
+    SessA := TNNetStreamingDecoder.Create(TwinA, SeqLen);
+    SessB := TNNetStreamingDecoder.Create(TwinB, SeqLen);
+    USessA := TNNetStreamingDecoder.Create(TwinUA, SeqLen);
+    USessB := TNNetStreamingDecoder.Create(TwinUB, SeqLen);
+
+    NegPrompt[0] := 6; NegPrompt[1] := 1; NegPrompt[2] := 10; // shared uncond ctx
+
+    // Run A: conditional prompt #1.
+    CFGa := TNNetCFGProcessor.Create(USessA, NegPrompt, 0.0);
+    SetLength(ToksA, PromptLen);
+    ToksA[0] := 5; ToksA[1] := 2; ToksA[2] := 9; ToksA[3] := 4;
+    LenA := GenerateTokensStreamedWithProcessors(SessA, ToksA, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, CFGa, nil, nil);
+
+    // Run B: a COMPLETELY DIFFERENT conditional prompt, same negative prompt.
+    CFGb := TNNetCFGProcessor.Create(USessB, NegPrompt, 0.0);
+    SetLength(ToksB, PromptLen);
+    ToksB[0] := 11; ToksB[1] := 8; ToksB[2] := 3; ToksB[3] := 7;
+    LenB := GenerateTokensStreamedWithProcessors(SessB, ToksB, PromptLen,
+      SeqLen - PromptLen, SeqLen, nil, CFGb, nil, nil);
+
+    AssertTrue('scale=0 generated something', LenA > PromptLen);
+    AssertEquals('scale=0 output length is prompt-independent', LenA, LenB);
+    for T := PromptLen to LenA - 1 do
+      AssertEquals('scale=0 token at ' + IntToStr(T) +
+        ' independent of conditional prompt', ToksA[T], ToksB[T]);
+  finally
+    CFGa.Free; CFGb.Free;
+    USessB.Free; USessA.Free; SessB.Free; SessA.Free;
+    TwinUB.Free; TwinUA.Free; TwinB.Free; TwinA.Free; Full.Free;
+  end;
+end;
+
+// CFG construction validation: an unassigned session, an empty negative
+// prompt, and a wide (SizeX>1) session are each rejected.
+procedure TTestNeuralDecode.TestCFGRejectsInvalidArguments;
+var
+  Twin, Wide: TNNet;
+  Session, WideSession: TNNetStreamingDecoder;
+  Neg: array[0..0] of integer;
+  Empty: array of integer;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinySSMLM(1); Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Wide := BuildTinySSMLM(4); Wide.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil; WideSession := nil;
+  Neg[0] := 5;
+  SetLength(Empty, 0);
+  try
+    Session := TNNetStreamingDecoder.Create(Twin, 8);
+    WideSession := TNNetStreamingDecoder.Create(Wide, 8);
+
+    Raised := false;
+    try TNNetCFGProcessor.Create(nil, Neg, 1.5).Free;
+    except on EArgumentException do Raised := true; end;
+    AssertTrue('nil session rejected', Raised);
+
+    Raised := false;
+    try TNNetCFGProcessor.Create(Session, Empty, 1.5).Free;
+    except on EArgumentException do Raised := true; end;
+    AssertTrue('empty negative prompt rejected', Raised);
+
+    Raised := false;
+    try TNNetCFGProcessor.Create(WideSession, Neg, 1.5).Free;
+    except on EArgumentException do Raised := true; end;
+    AssertTrue('wide session rejected', Raised);
+  finally
+    WideSession.Free; Session.Free;
+    Wide.Free; Twin.Free;
   end;
 end;
 

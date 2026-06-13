@@ -122,6 +122,14 @@ per-step distribution transform (the transformers GenerationMixin
     order is: penalty -> temperature -> extra processors -> constraint ->
     sampler (the constraint runs LAST so its structural guarantees - e.g.
     JSON validity - cannot be broken by a later transform).
+  - TNNetCFGProcessor is CLASSIFIER-FREE GUIDANCE (the transformers
+    UnbatchedClassifierFreeGuidanceLogitsProcessor): it owns a SECOND width-1
+    streaming session for an unconditional / negative prompt, runs it forward
+    alongside the conditional loop each step, and combines the two
+    distributions in LOGIT space (logits := uncond + scale*(cond-uncond))
+    before the sampler. GuidanceScale=1 is bit-for-bit conditional-only
+    decoding; GuidanceScale=0 ignores the conditional prompt entirely. As a
+    plain TNNetLogitsProcessor it plugs into any processor-accepting overload.
 
 Coded by Claude (AI).
 *)
@@ -134,6 +142,10 @@ uses
   Classes, SysUtils, neuralvolume, neuralnetwork;
 
 type
+  // Forward declaration: TNNetCFGProcessor (below) holds an unconditional
+  // streaming session, but the session class is declared further down.
+  TNNetStreamingDecoder = class;
+
   // A scored decode candidate: the generated text (excluding the prompt) and
   // its cumulative log-probability.
   TNNetDecodeResult = record
@@ -475,6 +487,67 @@ type
       procedure Commit(TokenId: integer); override;
       property Count: integer read GetCount;
       property Items[Index: integer]: TNNetLogitsProcessor read GetItem; default;
+  end;
+
+  { TNNetCFGProcessor }
+  // CLASSIFIER-FREE GUIDANCE (CFG) for autoregressive text generation - the
+  // port of transformers' UnbatchedClassifierFreeGuidanceLogitsProcessor. Each
+  // decode step the model is run TWICE: the CONDITIONAL branch (the real
+  // prompt, owned by the calling generation loop) and an UNCONDITIONAL branch
+  // (an empty or NEGATIVE prompt, owned by THIS processor's own width-1
+  // streaming session). The two distributions are combined in LOGIT space
+  // before the sampler reads them:
+  //   logits := uncond + GuidanceScale * (cond - uncond)
+  // GuidanceScale = 1 reproduces the conditional-only distribution exactly
+  // (the term collapses to cond); GuidanceScale = 0 collapses to uncond,
+  // ignoring the conditional prompt entirely; GuidanceScale > 1 SHARPENS the
+  // contrast (the usual CFG regime).
+  //
+  // DOMAIN. The chain feeds POST-SOFTMAX PROBABILITIES (the model ends in a
+  // SoftMax). CFG is a logit-space rule, so this processor maps each branch's
+  // probabilities to LOG-PROBABILITIES (SafeLogProb), combines, and softmaxes
+  // back to a probability row. Using log-probs instead of true pre-softmax
+  // logits differs only by a per-branch additive constant; that constant is
+  // uniform across tokens and cancels in the final softmax, so the combine is
+  // exact (and GuidanceScale = 1 is bit-for-bit the untouched cond row).
+  //
+  // OWNERSHIP / WIRING (mirrors the HF design that wires an unconditional
+  // model+inputs into the processor): Create takes the UNCONDITIONAL width-1
+  // streaming session (typically the SAME twin net as the conditional loop, or
+  // a separate twin sharing weights) and the negative/unconditional prompt
+  // token ids. The session is NOT owned unless OwnsSession is True. The
+  // processor drives its own session: Reset prefills the negative prompt,
+  // ProcessRow steps the unconditional branch forward one token and combines,
+  // Commit feeds the just-emitted token into the unconditional branch (so both
+  // branches share the generated suffix, differing only in their prompt).
+  // The negative prompt may be empty (pure unconditional / "no prompt"): a
+  // single BOS-like seed token is then required so the branch has an input -
+  // pass at least one token (e.g. the conditional prompt's first token, or a
+  // dedicated BOS id) as the unconditional context.
+  // Coded by Claude (AI).
+  TNNetCFGProcessor = class(TNNetLogitsProcessor)
+    private
+      FSession: TNNetStreamingDecoder;
+      FOwnsSession: boolean;
+      FNegPrompt: TNeuralIntegerArray;
+      FInV: TNNetVolume;
+      FPendingToken: integer; // next token to feed the uncond branch
+      FAbsPos: integer;       // absolute position of FPendingToken
+      FGuidanceScale: TNeuralFloat;
+    public
+      // UncondSession: a WIDTH-1 streaming session for the unconditional
+      // branch. NegativePrompt: the unconditional/negative prompt token ids
+      // (must be non-empty - it seeds the branch's first input). GuidanceScale
+      // = 1 is a no-op; = 0 ignores the conditional prompt.
+      constructor Create(UncondSession: TNNetStreamingDecoder;
+        const NegativePrompt: array of integer; GuidanceScale: TNeuralFloat;
+        OwnsSession: boolean = false);
+      destructor Destroy(); override;
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      property GuidanceScale: TNeuralFloat
+        read FGuidanceScale write FGuidanceScale;
   end;
 
   { TGenerationConfig }
@@ -1736,6 +1809,111 @@ var
   I: integer;
 begin
   for I := 0 to High(FItems) do FItems[I].Commit(TokenId);
+end;
+
+{ TNNetCFGProcessor }
+
+constructor TNNetCFGProcessor.Create(UncondSession: TNNetStreamingDecoder;
+  const NegativePrompt: array of integer; GuidanceScale: TNeuralFloat;
+  OwnsSession: boolean = false);
+var
+  I: integer;
+begin
+  inherited Create();
+  if not Assigned(UncondSession) then
+    raise EArgumentException.Create(
+      'TNNetCFGProcessor: the unconditional session must be assigned.');
+  if Length(NegativePrompt) < 1 then
+    raise EArgumentException.Create(
+      'TNNetCFGProcessor: the negative/unconditional prompt must be ' +
+      'non-empty (it seeds the unconditional branch''s first input).');
+  if UncondSession.Net.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'TNNetCFGProcessor: the unconditional session net must be a WIDTH-1 ' +
+      'twin (input SizeX=1).');
+  FSession := UncondSession;
+  FOwnsSession := OwnsSession;
+  FGuidanceScale := GuidanceScale;
+  SetLength(FNegPrompt, Length(NegativePrompt));
+  for I := 0 to High(NegativePrompt) do FNegPrompt[I] := NegativePrompt[I];
+  FInV := TNNetVolume.Create(FSession.Net.GetFirstLayer().Output);
+  FInV.Fill(0);
+end;
+
+destructor TNNetCFGProcessor.Destroy();
+begin
+  FInV.Free;
+  if FOwnsSession then FSession.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetCFGProcessor.Reset(const PromptTokens: array of integer);
+var
+  Pos: integer;
+begin
+  // Fresh sequence: prefill the unconditional branch with the negative prompt
+  // (tokens 0..len-2), leaving its LAST token as the first decode step's
+  // input - exactly the prefill-then-step idiom the conditional loop uses on
+  // its own prompt. The conditional PromptTokens are intentionally ignored:
+  // the whole point of CFG is that the two branches differ in their prompt.
+  FSession.Reset();
+  for Pos := 0 to Length(FNegPrompt) - 2 do
+  begin
+    FInV.FData[0] := FNegPrompt[Pos];
+    FSession.StepForward(FInV, Pos);
+  end;
+  FPendingToken := FNegPrompt[High(FNegPrompt)];
+  FAbsPos := Length(FNegPrompt) - 1;
+end;
+
+procedure TNNetCFGProcessor.ProcessRow(Row: TNNetVolume);
+var
+  UncondRow: TNNetVolume;
+  I: integer;
+  LCond, LUncond, Combined, MaxL, Sum: TNeuralFloat;
+begin
+  // GuidanceScale = 1 collapses to the conditional row exactly (uncond + 1 *
+  // (cond - uncond) = cond); skip the second forward to keep it bit-for-bit
+  // identical to plain decoding AND to avoid the cost.
+  if FGuidanceScale = 1.0 then exit;
+  // Step the unconditional branch forward one token at its absolute position
+  // (the negative prompt's running length + tokens generated so far).
+  FInV.FData[0] := FPendingToken;
+  FSession.StepForward(FInV, FAbsPos);
+  UncondRow := FSession.Output();
+  // Combine in LOG space: logits := uncond + scale * (cond - uncond), with
+  // log-probs standing in for the pre-softmax logits (the per-branch softmax
+  // constant cancels in the final softmax below). Track the max for a stable
+  // softmax back to probabilities.
+  MaxL := -1e30;
+  for I := 0 to Row.Size - 1 do
+  begin
+    LCond := SafeLogProb(Row.Raw[I]);
+    LUncond := SafeLogProb(UncondRow.Raw[I]);
+    Combined := LUncond + FGuidanceScale * (LCond - LUncond);
+    Row.Raw[I] := Combined;
+    if Combined > MaxL then MaxL := Combined;
+  end;
+  // Softmax the combined logits back into a probability row (the chain's
+  // documented domain).
+  Sum := 0;
+  for I := 0 to Row.Size - 1 do
+  begin
+    Row.Raw[I] := Exp(Row.Raw[I] - MaxL);
+    Sum := Sum + Row.Raw[I];
+  end;
+  if Sum > 0 then
+    for I := 0 to Row.Size - 1 do Row.Raw[I] := Row.Raw[I] / Sum;
+end;
+
+procedure TNNetCFGProcessor.Commit(TokenId: integer);
+begin
+  // The emitted token becomes the next input of BOTH branches; the
+  // unconditional branch advances one absolute position. (When GuidanceScale
+  // = 1 ProcessRow never stepped the branch, but keeping the bookkeeping in
+  // sync is harmless and lets the scale be changed mid-run.)
+  FPendingToken := TokenId;
+  Inc(FAbsPos);
 end;
 
 { TNNetStreamingDecoder }
