@@ -261,7 +261,9 @@ rather than acted on.
       default-system injection); read the separate chat_template.jinja
       file newer transformers exports alongside tokenizer_config.json;
       continue_final_message / return_assistant_tokens_mask equivalents.
-- [ ] resize_token_embeddings equivalent: grow/shrink the token embedding +
+- [X] resize_token_embeddings equivalent: grow/shrink the token embedding +
+      (landed: TNNet.ResizeTokenEmbeddings, mean-init rows, copy-tied head
+      kept equal, int8/inference-only safe)
       LM-head vocab of an imported model (mean-init new rows, keep tied
       heads consistent, update FStruct vocab sizes). Needed the moment
       anyone adds special tokens to fine-tune on top of the Llama/GPT-2
@@ -516,7 +518,9 @@ rather than acted on.
       alternatively (or additionally) regex -> DFA. Test: a small
       arithmetic-expression grammar accepts only valid strings across
       greedy/sampled decoding, and forked beams keep independent states.
-- [ ] Token healing (guidance-style): back up over the LAST prompt token
+- [X] Token healing (guidance-style): back up over the LAST prompt token
+      (landed: TNNetTokenHealingConstraint + PrepareTokenHealing +
+      TGenerationConfig.TokenHealing)
       and constrain the first generated token to extensions of its text,
       fixing the classic BPE boundary artifact ("http:" never continuing
       to "//" because the prompt split mid-merge). ~30 lines on top of the
