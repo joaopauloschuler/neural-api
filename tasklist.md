@@ -123,6 +123,31 @@ rather than acted on.
       mixed image+text prompt vs HF float64, and an examples/LlavaDescribe
       demo that captions a small image on CPU. First image-in/text-out
       model in the repo; opens the door to Qwen-VL/PaliGemma later.
+- [ ] Cohere Command-R / Aya importer (BuildCohereFromSafeTensors[Ex],
+      model_type "cohere", and the "cohere2" Command-R7B variant): the leading
+      open MULTILINGUAL instruct family (C4AI Command-R, Aya-Expanse-8B,
+      Command-R7B), absent from the landed importer set and architecturally
+      distinct enough to not be a Llama clone. The genuinely new pieces are
+      few but real: (a) a PARALLEL residual where attention AND MLP both read
+      ONE input LayerNorm and sum into the residual (x = x + Attn(LN(x)) +
+      MLP(LN(x))) — the GPTNeoX parallel-residual path already in-repo, reused
+      here; (b) Cohere's LayerNorm is bias-free and weight-only (no
+      learned shift) — confirm TNNetLayerNorm with SuppressBias maps it, else a
+      small flag; (c) a scalar logit_scale that multiplies the final logits
+      before softmax — fold into the tied LM head the way query_pre_attn_scalar
+      folding is done for Gemma (see [[gemma3-importer]]); (d) tied input/output
+      embeddings and NO attention/MLP biases. The cohere2 (Command-R7B) variant
+      adds the alternating sliding-window/global pattern already wired for
+      Gemma-2/3 (reuse SlidingWindowPattern, see [[gemma2-alternating-local-global]])
+      plus an order_of_interleaved_layers config. RoPE is standard full-rotary.
+      Tokenizer is a BPE tokenizer.json the landed TNeuralHFTokenizer reads.
+      Deliverables: BuildCohereFromSafeTensors[Ex] on the parallel-residual path,
+      a pico parity fixture (make_pico_*_fixture.py recipe, see
+      [[pico-import-fixtures]]) asserting hidden states AND logit_scale-scaled
+      next-token logits vs HF float64 for both cohere and cohere2 configs, and a
+      short multilingual-generation snippet in the importer example. Closes the
+      last big mainstream decoder gap and validates logit_scale handling reusable
+      for future families.
 - [ ] DeBERTa-v3 importer + disentangled attention (BuildDebertaV2FromSafeTensors,
       model_type "deberta-v2"): the dominant small-encoder family for
       NLU/classification/NER/reranking (deberta-v3-base/small, the ms-marco
