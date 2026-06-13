@@ -304,6 +304,24 @@ rather than acted on.
       [longrope (Phi-3) DONE: rsmLongRoPE mode wired into TNNetRotaryEmbedding
       + ReadRoPEScalingFromJSONObject parses longrope/su/yarn-with-long_factor;
       parity fixture tiny_phi3_longrope verified vs HF float64.]
+- [ ] longrope short-factor / dynamic switching follow-up (static long-context
+      import landed): the import statically picks the long_factor table + long
+      attention scaling. HF switches to short_factor when seq_len <=
+      original_max_position_embeddings. Add a decode-time mode that selects the
+      short table for short sequences (or document that the static long import
+      is intentional for the 128k use case).
+- [ ] Knowledge-distillation EXAMPLE on the landed trainer (TNeuralKDTrainer in
+      neural/neuralkd.pas, commit bff113f): distill an imported pretrained
+      teacher (GPT-2 / TinyStories via the safetensors/torch.bin importers) into
+      a small Pascal-trained student and report student perplexity vs hard-label-
+      only training at matched steps. Pure harness work over the landed trainer +
+      importers; writeup goes in examples/README.md.
+- [ ] CFG decode follow-ups (TNNetCFGProcessor landed, commit 11e668f): (a) wire
+      guidance_scale + negative prompt into TGenerationConfig so the high-level
+      decode entry points expose CFG without manual processor construction;
+      (b) the processor builds a second width-1 streaming twin of the same net —
+      add a convenience that derives the unconditional twin automatically from a
+      single imported model (build-twice + CopyWeights, or share weights).
 - [ ] KV-cache eviction for unbounded streaming: attention sinks + rolling
       window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder
       — today the per-SDPA-layer cache grows without bound. Keep the first
