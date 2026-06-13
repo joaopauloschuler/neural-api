@@ -57,6 +57,16 @@ Coded by Claude (AI).
 //             <|endoftext|>.
 //   cfMistral <s>[INST] ... [/INST]answer</s>        Mistral-7B-Instruct
 //             v0.1/v0.2; NO system role and strict alternation (raises).
+//   cfDeepSeek <｜begin▁of▁sentence｜>system User: ...\n\n
+//             Assistant: answer<｜end▁of▁sentence｜>        DeepSeek-V2/V3-Chat;
+//             the bos / end-of-sentence tokens use the fullwidth pipe
+//             U+FF5C and the one-eighth block U+2581; system content is
+//             emitted verbatim with no role tag; generation prompt is the
+//             bare 'Assistant:'. No content strip; no role alternation check.
+//   cfPhi4Mini <|system|>...<|end|><|user|>...<|end|><|assistant|>
+//             Phi-4-mini-instruct ChatML-style tool-aware template; like
+//             cfPhi3 but the tags carry NO trailing newline and there is no
+//             eos fallback when add_generation_prompt is false.
 //
 // Auto-detection does NOT interpret Jinja: DetectChatFormat fingerprints
 // the chat_template string from tokenizer_config.json by its distinctive
@@ -83,7 +93,9 @@ type
     cfZephyr,   // zephyr-7b-beta / TinyLlama-1.1B-Chat
     cfGemma,    // gemma-it <start_of_turn>
     cfPhi3,     // Phi-3-mini-instruct <|user|>...<|end|>
-    cfMistral   // Mistral-7B-Instruct [INST] without system
+    cfMistral,  // Mistral-7B-Instruct [INST] without system
+    cfDeepSeek, // DeepSeek-V2/V3-Chat <｜begin▁of▁sentence｜>User: ...
+    cfPhi4Mini  // Phi-4-mini-instruct ChatML-style (no-newline tags)
   );
 
   TChatMessage = record
@@ -119,7 +131,10 @@ function DetectChatFormat(const ChatTemplate: string): TNeuralChatFormat;
 // Reads the raw chat_template string from a HF tokenizer_config.json
 // ('' when the file has none). The newer list-of-named-templates form
 // ([{"name": ..., "template": ...}]) resolves to the 'default' entry or,
-// absent one, the first entry.
+// absent one, the first entry. When tokenizer_config.json carries no
+// chat_template field, newer transformers exports it to a sibling
+// chat_template.jinja in the same directory; that file is read as the
+// fallback.
 function LoadChatTemplateString(const TokenizerConfigFile: string): string;
 
 // LoadChatTemplateString + DetectChatFormat in one call.
@@ -146,6 +161,17 @@ uses
 const
   csAlternateError =
     'Conversation roles must alternate user/assistant/user/assistant/...';
+  // DeepSeek special tokens: '<' + U+FF5C + 'begin' + U+2581 + 'of' +
+  // U+2581 + 'sentence' + U+FF5C + '>' (and 'end' for the eos). Written as
+  // raw UTF-8 byte sequences so the source stays encoding-agnostic.
+  csPipe = #$EF#$BD#$9C;    // U+FF5C FULLWIDTH VERTICAL LINE
+  csBlock = #$E2#$96#$81;   // U+2581 LOWER ONE EIGHTH BLOCK
+  csDeepSeekBos =
+    '<' + csPipe + 'begin' + csBlock + 'of' + csBlock + 'sentence' +
+    csPipe + '>';
+  csDeepSeekEos =
+    '<' + csPipe + 'end' + csBlock + 'of' + csBlock + 'sentence' +
+    csPipe + '>';
 
 // Python str.strip() / Jinja "| trim" equivalent: trims ASCII whitespace
 // only (space, \t, \n, \r, \v, \f), NOT the other control chars that
@@ -179,6 +205,8 @@ begin
     cfGemma: Result := 'gemma';
     cfPhi3: Result := 'phi3';
     cfMistral: Result := 'mistral';
+    cfDeepSeek: Result := 'deepseek';
+    cfPhi4Mini: Result := 'phi4mini';
     else Result := 'unknown';
   end;
 end;
@@ -195,6 +223,8 @@ begin
   else if Lowered = 'gemma' then Result := cfGemma
   else if Lowered = 'phi3' then Result := cfPhi3
   else if Lowered = 'mistral' then Result := cfMistral
+  else if Lowered = 'deepseek' then Result := cfDeepSeek
+  else if Lowered = 'phi4mini' then Result := cfPhi4Mini
   else Result := cfUnknown;
 end;
 
@@ -209,37 +239,55 @@ begin
     Result := cfLlama3
   else if Pos('<<SYS>>', ChatTemplate) > 0 then Result := cfLlama2
   else if Pos('<start_of_turn>', ChatTemplate) > 0 then Result := cfGemma
+  // DeepSeek: either the rendered begin-of-sentence token (fullwidth pipe
+  // U+FF5C + block U+2581) or, in the raw Jinja (where the token hides
+  // behind {{ bos_token }}), the distinctive 'User: '/'Assistant: ' prefix
+  // literal pair is unique to the family.
+  else if (Pos(csDeepSeekBos, ChatTemplate) > 0) or
+    ((Pos('''User: ''', ChatTemplate) > 0) and
+     (Pos('''Assistant: ''', ChatTemplate) > 0)) then Result := cfDeepSeek
+  // cfPhi3 and cfPhi4Mini share <|user|> + <|end|>; cfPhi3's tags carry a
+  // trailing newline ('<|user|>\n'), cfPhi4Mini's do not -- test cfPhi3
+  // first so the Phi-4-mini no-newline ChatML lands in its own branch.
   else if (Pos('<|end|>', ChatTemplate) > 0) and
-    (Pos('<|user|>', ChatTemplate) > 0) then Result := cfPhi3
+    (Pos('<|user|>' + #10, ChatTemplate) > 0) then Result := cfPhi3
+  else if (Pos('<|end|>', ChatTemplate) > 0) and
+    (Pos('<|user|>', ChatTemplate) > 0) then Result := cfPhi4Mini
   else if Pos('<|user|>', ChatTemplate) > 0 then Result := cfZephyr
   else if Pos('[INST]', ChatTemplate) > 0 then Result := cfMistral
   else Result := cfUnknown;
 end;
 
-function LoadChatTemplateString(const TokenizerConfigFile: string): string;
+// Reads an entire file into a string (raw bytes, no encoding translation).
+function ReadFileToString(const FileName: string): string;
 var
   FS: TFileStream;
-  RawJson: string;
+begin
+  Result := '';
+  FS := TFileStream.Create(FileName, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(Result, FS.Size);
+    if FS.Size > 0 then FS.ReadBuffer(Result[1], FS.Size);
+  finally
+    FS.Free;
+  end;
+end;
+
+// Extracts the chat_template field from an already-loaded tokenizer_config
+// JSON string ('' when absent).
+function ExtractChatTemplateFromJson(const RawJson, ConfigFile: string): string;
+var
   Root, Node, Entry: TJSONData;
   Arr: TJSONArray;
   Cnt: integer;
 begin
   Result := '';
-  FS := TFileStream.Create(TokenizerConfigFile,
-    fmOpenRead or fmShareDenyWrite);
-  try
-    SetLength(RawJson, FS.Size);
-    if FS.Size > 0 then FS.ReadBuffer(RawJson[1], FS.Size);
-  finally
-    FS.Free;
-  end;
   // same fpjson stance as neuralhftokenizer: decode \uXXXX up front and
   // parse raw so non-ASCII survives without a widestring manager.
   Root := HFParseJSONRaw(HFDecodeUnicodeEscapes(RawJson));
   try
     if not (Root is TJSONObject) then
-      raise ENeuralChatError.Create(TokenizerConfigFile +
-        ': root is not an object');
+      raise ENeuralChatError.Create(ConfigFile + ': root is not an object');
     Node := TJSONObject(Root).Find('chat_template');
     if (Node = nil) or Node.IsNull then exit;
     if Node is TJSONArray then
@@ -260,6 +308,21 @@ begin
   finally
     Root.Free;
   end;
+end;
+
+function LoadChatTemplateString(const TokenizerConfigFile: string): string;
+var
+  JinjaFile: string;
+begin
+  Result := ExtractChatTemplateFromJson(
+    ReadFileToString(TokenizerConfigFile), TokenizerConfigFile);
+  if Result <> '' then exit;
+  // Newer transformers exports the template to a sibling chat_template.jinja
+  // instead of embedding it in tokenizer_config.json. The .jinja file holds
+  // the raw Jinja source directly (no JSON wrapper).
+  JinjaFile := ExtractFilePath(TokenizerConfigFile) + 'chat_template.jinja';
+  if FileExists(JinjaFile) then
+    Result := ReadFileToString(JinjaFile);
 end;
 
 function DetectChatFormatFromConfigFile(
@@ -420,6 +483,50 @@ begin
   end;
 end;
 
+function RenderDeepSeek(const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean): string;
+var
+  Cnt: integer;
+  Role: string;
+begin
+  // {{ bos_token }} -- always emitted, exactly once, before the loop.
+  Result := csDeepSeekBos;
+  for Cnt := 0 to High(Messages) do
+  begin
+    Role := Messages[Cnt].Role;
+    if Role = 'user' then
+      Result := Result + 'User: ' + Messages[Cnt].Content + #10#10
+    else if Role = 'assistant' then
+      Result := Result + 'Assistant: ' + Messages[Cnt].Content + csDeepSeekEos
+    else if Role = 'system' then
+      Result := Result + Messages[Cnt].Content + #10#10;
+    // other roles: the template has no branch for them -> emit nothing.
+    // NOTE: no content strip and no role-alternation check (HF parity).
+  end;
+  if AddGenerationPrompt then
+    Result := Result + 'Assistant:';
+end;
+
+function RenderPhi4Mini(const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean): string;
+var
+  Cnt: integer;
+  Role: string;
+begin
+  // Like cfPhi3 but the <|...|> tags carry NO trailing newline, and there
+  // is no eos fallback when add_generation_prompt is false.
+  Result := '';
+  for Cnt := 0 to High(Messages) do
+  begin
+    Role := Messages[Cnt].Role;
+    if (Role = 'system') or (Role = 'user') or (Role = 'assistant') then
+      Result := Result + '<|' + Role + '|>' + Messages[Cnt].Content +
+        '<|end|>';
+  end;
+  if AddGenerationPrompt then
+    Result := Result + '<|assistant|>';
+end;
+
 function ApplyChatTemplate(ChatFormat: TNeuralChatFormat;
   const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean = true): string;
@@ -432,9 +539,12 @@ begin
     cfGemma: Result := RenderGemma(Messages, AddGenerationPrompt);
     cfPhi3: Result := RenderPhi3(Messages, AddGenerationPrompt);
     cfMistral: Result := RenderMistral(Messages);
+    cfDeepSeek: Result := RenderDeepSeek(Messages, AddGenerationPrompt);
+    cfPhi4Mini: Result := RenderPhi4Mini(Messages, AddGenerationPrompt);
     else
       raise ENeuralChatError.Create('Unknown chat format. Pass one of ' +
-        'cfChatML/cfLlama2/cfLlama3/cfZephyr/cfGemma/cfPhi3/cfMistral ' +
+        'cfChatML/cfLlama2/cfLlama3/cfZephyr/cfGemma/cfPhi3/cfMistral/' +
+        'cfDeepSeek/cfPhi4Mini ' +
         '(auto-detection via DetectChatFormat did not recognize the ' +
         'model''s chat_template).');
   end;

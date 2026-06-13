@@ -351,10 +351,12 @@ rather than acted on.
       fingerprinting + EncodeChat): a mini-Jinja subset interpreter for unrecognized
       chat_template strings (must pass ground truth for all bundled
       templates and raise cleanly on unsupported constructs); more
-      formats (DeepSeek, Phi-4-mini's tool-aware ChatML variant, Qwen's
-      default-system injection); read the separate chat_template.jinja
-      file newer transformers exports alongside tokenizer_config.json;
-      continue_final_message / return_assistant_tokens_mask equivalents.
+      formats (~~DeepSeek~~ [DONE: cfDeepSeek], ~~Phi-4-mini's tool-aware
+      ChatML variant~~ [DONE: cfPhi4Mini], Qwen's default-system injection);
+      ~~read the separate chat_template.jinja file newer transformers exports
+      alongside tokenizer_config.json~~ [DONE: LoadChatTemplateString sibling
+      fallback]; continue_final_message / return_assistant_tokens_mask
+      equivalents.
 - [ ] Magnitude pruning (torch.nn.utils.prune port): PERSISTENT global or
       per-layer magnitude masks applied during training/inference — the
       diagnostics half is landed (TNNet.MagnitudePruningReport +

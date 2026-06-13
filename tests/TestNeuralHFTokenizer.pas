@@ -72,6 +72,10 @@ type
     procedure TestGemmaParityWithJinja;
     procedure TestPhi3ParityWithJinja;
     procedure TestMistralParityWithJinja;
+    procedure TestDeepSeekParityWithJinja;
+    procedure TestPhi4MiniParityWithJinja;
+    procedure TestDetectDeepSeekAndPhi4Mini;
+    procedure TestLoadChatTemplateFromSiblingJinja;
     procedure TestDetectFormatOnAuthenticTemplates;
     procedure TestFormatNameRoundTrip;
     procedure TestEncodeChatLlama2SpecialTokens;
@@ -663,6 +667,103 @@ begin
   RunChatBattery('mistral');
 end;
 
+procedure TTestNeuralChat.TestDeepSeekParityWithJinja;
+begin
+  RunChatBattery('deepseek');
+end;
+
+procedure TTestNeuralChat.TestPhi4MiniParityWithJinja;
+begin
+  RunChatBattery('phi4mini');
+end;
+
+// DetectChatFormat fingerprints the DeepSeek begin-of-sentence token (the
+// fullwidth pipe U+FF5C + block U+2581) and tells the no-newline Phi-4-mini
+// ChatML apart from the newline-tagged cfPhi3.
+procedure TTestNeuralChat.TestDetectDeepSeekAndPhi4Mini;
+const
+  // Authentic published chat_template strings (delimiter substrings).
+  DeepSeekTpl =
+    '{{ bos_token }}{% for message in messages %}'
+    + '{% if message[''role''] == ''user'' %}'
+    + '{{ ''User: '' + message[''content''] }}'
+    + '{% elif message[''role''] == ''assistant'' %}'
+    + '{{ ''Assistant: '' + message[''content''] + eos_token }}{% endif %}'
+    + '{% endfor %}'
+    // bos_token resolves to the DeepSeek begin-of-sentence token: the
+    // fullwidth pipe U+FF5C ($EF$BD$9C) and the one-eighth block U+2581
+    // ($E2$96$81), which is what DetectChatFormat fingerprints on.
+    + '<' + #$EF#$BD#$9C + 'begin' + #$E2#$96#$81 + 'of' + #$E2#$96#$81
+    + 'sentence' + #$EF#$BD#$9C + '>';
+  Phi4MiniTpl =
+    '{% for message in messages %}'
+    + '{% if message[''role''] == ''system'' %}'
+    + '{{''<|system|>'' + message[''content''] + ''<|end|>''}}'
+    + '{% elif message[''role''] == ''user'' %}'
+    + '{{''<|user|>'' + message[''content''] + ''<|end|>''}}'
+    + '{% elif message[''role''] == ''assistant'' %}'
+    + '{{''<|assistant|>'' + message[''content''] + ''<|end|>''}}'
+    + '{% endif %}{% endfor %}'
+    + '{% if add_generation_prompt %}{{''<|assistant|>''}}{% endif %}';
+begin
+  AssertTrue('deepseek template detected',
+    DetectChatFormat(DeepSeekTpl) = cfDeepSeek);
+  AssertTrue('phi4mini template detected',
+    DetectChatFormat(Phi4MiniTpl) = cfPhi4Mini);
+  // The phi4mini fingerprint must NOT swallow the newline-tagged cfPhi3.
+  AssertTrue('phi3 newline-tagged stays cfPhi3',
+    DetectChatFormat('{{''<|user|>' + #10 + ''' + content + ''<|end|>''}}')
+      = cfPhi3);
+end;
+
+// chat_template.jinja sibling fallback: when tokenizer_config.json lacks a
+// chat_template field, the template is read from chat_template.jinja in the
+// same directory and the SAME fingerprint detection runs on it.
+procedure TTestNeuralChat.TestLoadChatTemplateFromSiblingJinja;
+var
+  Dir, ConfigFile, JinjaFile, Template: string;
+  SL: TStringList;
+begin
+  Dir := GetTempDir(true) + 'chat_jinja_sibling' + DirectorySeparator;
+  ForceDirectories(Dir);
+  ConfigFile := Dir + 'tokenizer_config.json';
+  JinjaFile := Dir + 'chat_template.jinja';
+  SL := TStringList.Create();
+  try
+    // tokenizer_config.json WITHOUT a chat_template field.
+    SL.Text := '{"eos_token": "<|im_end|>", "bos_token": "<s>"}';
+    SL.SaveToFile(ConfigFile);
+    // sibling chat_template.jinja with a known (ChatML) template.
+    SL.Text := '{% for m in messages %}<|im_start|>{{ m.role }}{% endfor %}';
+    SL.SaveToFile(JinjaFile);
+
+    Template := LoadChatTemplateString(ConfigFile);
+    AssertTrue('sibling .jinja read', Pos('<|im_start|>', Template) > 0);
+    AssertTrue('sibling .jinja detected as chatml',
+      DetectChatFormatFromConfigFile(ConfigFile) = cfChatML);
+
+    // When tokenizer_config.json HAS a chat_template, it wins over the
+    // sibling .jinja (no fallback).
+    SL.Text := '{"chat_template": "x<start_of_turn>y"}';
+    SL.SaveToFile(ConfigFile);
+    AssertEquals('embedded chat_template wins over sibling',
+      'x<start_of_turn>y', LoadChatTemplateString(ConfigFile));
+
+    DeleteFile(JinjaFile);
+    DeleteFile(ConfigFile);
+    // No chat_template anywhere -> empty / cfUnknown.
+    SL.Text := '{"eos_token": "</s>"}';
+    SL.SaveToFile(ConfigFile);
+    AssertEquals('no template anywhere -> empty',
+      '', LoadChatTemplateString(ConfigFile));
+  finally
+    SL.Free;
+    DeleteFile(JinjaFile);
+    DeleteFile(ConfigFile);
+    RemoveDir(Dir);
+  end;
+end;
+
 // DetectChatFormat must recognize each AUTHENTIC published template
 // string (pinned in the fixture next to its cases) as its own format --
 // this is the auto-detection path for tokenizer_config.json templates.
@@ -703,7 +804,7 @@ procedure TTestNeuralChat.TestFormatNameRoundTrip;
 var
   ChatFormat: TNeuralChatFormat;
 begin
-  for ChatFormat := cfChatML to cfMistral do
+  for ChatFormat := cfChatML to cfPhi4Mini do
     AssertTrue('round trip ' + ChatFormatName(ChatFormat),
       ChatFormatFromName(ChatFormatName(ChatFormat)) = ChatFormat);
   AssertTrue('unknown name', ChatFormatFromName('vicuna') = cfUnknown);
