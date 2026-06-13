@@ -92,18 +92,6 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] OLMo-2 importer (model_type "olmo2", e.g. allenai/OLMo-2-0425-1B):
-      reordered post-norm (x + Norm(Attn(x)), no input_layernorm) + QK-norm
-      over the FULL flattened q/k projection width before head-split + RoPE.
-      LANDED: BuildOlmo2FromSafeTensors[Ex] on the Llama config plumbing
-      (PostNormReordered + QKNormFullWidth TLlamaConfig flags,
-      LoadLlamaFullWidthQKNormWeights rotate_half-permuted gain loader),
-      TNNet.AddOutputNormResidual builder (y = x + Norm(Sublayer(x))),
-      BuildFromPretrained "olmo2" dispatch, tools/olmo2_tiny_fixture.py pico
-      fixture (HF float64 oracle; both deltas asserted non-vacuous) +
-      TestOlmo2LogitParity (max |logit diff| 3.2e-8); OLMo-2-0425-1B
-      verified end-to-end (int8 + inference-only): coherent greedy
-      continuation from a real prompt.
 - [ ] Mixtral / sparse-MoE importer (model_type "mixtral", e.g.
       mistralai/Mixtral-8x7B-v0.1, or a small sibling like OLMoE/Qwen-MoE
       that shares the recipe): the CANONICAL open sparse-MoE — a stock
