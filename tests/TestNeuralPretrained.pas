@@ -169,6 +169,7 @@ type
     procedure TestPhiConfigFromJSONFile;
     procedure TestPhiLogitParity;
     procedure TestPhi3LogitParity;
+    procedure TestPhi3LongRoPELogitParity;
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
@@ -4945,6 +4946,73 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_phi3_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Phi-3 LongRoPE (rope_scaling type "longrope") import target:
+// tests/fixtures/tiny_phi3_longrope.* is a pico randomly-initialized HF
+// Phi3ForCausalLM with original_max_position_embeddings=8 SMALLER than the
+// 16-token test sequences, so HF's Phi3RotaryEmbedding selects the LONG
+// factor table (long_inv_freq) and the long attention scaling. The fixture
+// generator (tools/phi3_longrope_tiny_fixture.py) asserts the non-trivial
+// long_factor [1.0, 1.3, 1.8] visibly moves the logits, so matching HF here
+// proves the per-frequency inv-freq division AND the cos/sin attention
+// scaling are wired correctly (parsed as rsmLongRoPE, NOT rejected).
+procedure TTestNeuralPretrained.TestPhi3LongRoPELogitParity;
+var
+  NN, NN2: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  // SeqLen=16 (the fixture sequence length): the config max_position=32 is
+  // the EXTENDED context, so a SeqLen=0 build would size the input to 32 and
+  // reject the 16-token parity inputs.
+  NN := BuildPhi3FromSafeTensorsEx(
+    FixturePath('tiny_phi3_longrope.safetensors'),
+    Config, {SeqLen=}16, {pInferenceOnly=}false,
+    FixturePath('tiny_phi3_longrope_config.json'));
+  try
+    AssertEquals('model_type', 'phi3', Config.ModelType);
+    AssertEquals('rope mode = longrope', Ord(rsmLongRoPE),
+      Ord(Config.RopeScaling.Mode));
+    // rotary_dim = int(8 * 0.75) = 6 -> 3 per-frequency factors.
+    AssertEquals('long_factor count', 3,
+      Length(Config.RopeScaling.LongFactors));
+    AssertEquals('long_factor[1]', 1.3,
+      Config.RopeScaling.LongFactors[1], 1e-6);
+    AssertEquals('long_factor[2]', 1.8,
+      Config.RopeScaling.LongFactors[2], 1e-6);
+    // long attention scaling = sqrt(1 + ln(max/orig)/ln(orig))
+    //                        = sqrt(1 + ln(32/8)/ln(8)) = 1.290994...
+    AssertEquals('long attention scaling', 1.290994,
+      Config.RopeScaling.LongAttnFactor, 1e-5);
+    // The fixture sequences are 16 tokens (> original_max_position=8 so HF
+    // used the long table); MaxPositions=32 is the extended context.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_phi3_longrope_logits.json'), {SeqLen=}16,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Serialization round-trip: a SaveToString / LoadFromString cycle must
+  // keep the LongRoPE per-frequency factor table (stored in the RoPE layer's
+  // FNeurons[0]) and the attention scaling (FFloatSt[4]), so the reloaded net
+  // reproduces the same logits.
+  RandSeed := 424242;
+  NN := BuildFromPretrained(FixturePath('tiny_phi3_longrope.safetensors'),
+    {SeqLen=}16, {pInferenceOnly=}false,
+    FixturePath('tiny_phi3_longrope_config.json'));
+  try
+    NN2 := TNNet.Create;
+    try
+      NN2.LoadFromString(NN.SaveToString());
+      AssertLogitParityWithFixture(NN2,
+        FixturePath('tiny_phi3_longrope_logits.json'), 16, 13);
+    finally
+      NN2.Free;
+    end;
   finally
     NN.Free;
   end;

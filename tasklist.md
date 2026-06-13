@@ -303,15 +303,14 @@ rather than acted on.
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
       assert, same pattern as the chunked-forward recurrence family.
-- [ ] rope_scaling follow-ups to the landed wiring (7e74fee): (a) longrope
-      (Phi-3 family — per-dim short/long factor arrays + two attention
-      factors) is parsed and rejected; map it onto a new scaling mode to
-      unlock the 128k-context variants of the now-importable Phi-3/
-      Phi-4-mini family (BuildPhi3FromSafeTensors rejects them today); (b) DeepSeek-style YaRN `mscale` /
+- [ ] rope_scaling follow-ups to the landed wiring (7e74fee): (a) DeepSeek-style YaRN `mscale` /
       `mscale_all_dim` overrides are rejected — needed for full
-      DeepSeek-V2 checkpoints (the -Lite config carries them); (c) yarn
+      DeepSeek-V2 checkpoints (the -Lite config carries them); (b) yarn
       `"truncate": false` configs are silently treated as truncate=true —
       honor the flag or reject loudly.
+      [longrope (Phi-3) DONE: rsmLongRoPE mode wired into TNNetRotaryEmbedding
+      + ReadRoPEScalingFromJSONObject parses longrope/su/yarn-with-long_factor;
+      parity fixture tiny_phi3_longrope verified vs HF float64.]
 - [ ] KV-cache eviction for unbounded streaming: attention sinks + rolling
       window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder
       — today the per-SDPA-layer cache grows without bound. Keep the first

@@ -599,6 +599,9 @@ type
   //                        YarnAlpha=beta_slow, YarnBeta=beta_fast)
   //   "llama3"          -> rsmLlama3 (factor, original_max_position_embeddings,
   //                        YarnAlpha=low_freq_factor, YarnBeta=high_freq_factor)
+  //   "longrope"/"su"   -> rsmLongRoPE (Phi-3): per-frequency LongFactors table
+  //                        (long_factor, length head_dim/2) divides each
+  //                        inverse frequency, LongAttnFactor scales the output.
   // null/absent rope_scaling (and rope_type "default") parse to Mode=rsmNone,
   // which keeps the import bit-identical to the unscaled path.
   TRoPEScalingConfig = record
@@ -607,6 +610,11 @@ type
     OriginalContextLen: integer; // pretraining context (YaRN/llama3 ramp)
     YarnAlpha: TNeuralFloat;     // beta_slow (yarn) / low_freq_factor (llama3)
     YarnBeta: TNeuralFloat;      // beta_fast (yarn) / high_freq_factor (llama3)
+    // LongRoPE (rsmLongRoPE) only: the verbatim per-frequency long_factor
+    // table (length head_dim/2) and the output attention scaling (long_mscale,
+    // or sqrt(1+ln(max/orig)/ln(orig)) when no explicit mscale is given).
+    LongFactors: TNeuralFloatDynArr;
+    LongAttnFactor: TNeuralFloat;
   end;
 
 // The Mode=rsmNone record (Factor=1, OriginalContextLen=0, alpha=1, beta=32).
@@ -3060,6 +3068,8 @@ begin
   Result.OriginalContextLen := 0;
   Result.YarnAlpha := 1.0;
   Result.YarnBeta := 32.0;
+  SetLength(Result.LongFactors, 0);
+  Result.LongAttnFactor := 1.0;
 end;
 
 function RoPEScalingToString(const S: TRoPEScalingConfig): string;
@@ -3075,6 +3085,10 @@ begin
       ' orig=' + IntToStr(S.OriginalContextLen) +
       ' low=' + FloatToStr(S.YarnAlpha) +
       ' high=' + FloatToStr(S.YarnBeta);
+    rsmLongRoPE: Result := 'longrope orig=' +
+      IntToStr(S.OriginalContextLen) +
+      ' long_factors=' + IntToStr(Length(S.LongFactors)) +
+      ' attn=' + FloatToStr(S.LongAttnFactor);
     else Result := 'none';
   end;
 end;
@@ -3133,6 +3147,35 @@ var
         'hardcodes).');
   end;
 
+  // Reads a LongRoPE per-frequency factor array (long_factor / short_factor):
+  // a non-empty JSON array of positive numbers.
+  function ReadFactorArray(const KeyName: string): TNeuralFloatDynArr;
+  var
+    F: TJSONData;
+    Arr: TJSONArray;
+    I: integer;
+    V: TNeuralFloat;
+  begin
+    F := Scaling.Find(KeyName);
+    if (F = nil) or F.IsNull or not (F is TJSONArray) then
+      ImportError(ImporterName + ': rope_scaling longrope requires a "' +
+        KeyName + '" array.');
+    Arr := TJSONArray(F);
+    if Arr.Count < 1 then
+      ImportError(ImporterName + ': rope_scaling longrope "' + KeyName +
+        '" array is empty.');
+    SetLength(Result, Arr.Count);
+    for I := 0 to Arr.Count - 1 do
+    begin
+      V := Arr.Items[I].AsFloat;
+      if V <= 0 then
+        ImportError(ImporterName + ': rope_scaling longrope "' + KeyName +
+          '" entries must be positive, got ' + FloatToStr(V) +
+          ' at index ' + IntToStr(I) + '.');
+      Result[I] := V;
+    end;
+  end;
+
 begin
   Result := DefaultRoPEScaling();
   Field := Obj.Find('rope_scaling');
@@ -3146,6 +3189,35 @@ begin
     ImportError(ImporterName + ': rope_scaling carries neither "rope_type" ' +
       'nor "type": ' + Scaling.AsJSON + '.');
   if TypeName = 'default' then Exit; // explicit no-op scaling
+  // HF's Phi3Config remaps rope_scaling type "su"/"yarn" to "longrope" when a
+  // per-frequency long_factor table is present; detect that FIRST (before the
+  // scalar "factor" guard, which longrope does not require) so a Phi-3 "yarn"
+  // (carrying long_factor, NOT beta_slow/beta_fast) is treated as LongRoPE
+  // rather than mis-parsed as standard YaRN.
+  if (TypeName = 'longrope') or (TypeName = 'su') or
+     ((TypeName = 'yarn') and (Scaling.Find('long_factor') <> nil) and
+      not Scaling.Find('long_factor').IsNull) then
+  begin
+    // Phi-3 LongRoPE: per-frequency long_factor table (used for the long
+    // context) divides each inverse frequency, plus an attention scaling.
+    Result.Mode := rsmLongRoPE;
+    Result.Factor := 1.0;
+    Result.OriginalContextLen := ReadOriginalContextLen();
+    Result.LongFactors := ReadFactorArray('long_factor');
+    // attention_factor (long_mscale): explicit value wins; otherwise HF's
+    // sqrt(1 + ln(max_pos/orig)/ln(orig)) when max_pos > orig, else 1.0.
+    Sub := Scaling.Find('long_mscale');
+    if (Sub = nil) or Sub.IsNull then Sub := Scaling.Find('attention_factor');
+    if (Sub <> nil) and not Sub.IsNull then
+      Result.LongAttnFactor := Sub.AsFloat
+    else if MaxPositions > Result.OriginalContextLen then
+      Result.LongAttnFactor :=
+        Sqrt(1.0 + Ln(MaxPositions / Result.OriginalContextLen) /
+          Ln(Result.OriginalContextLen))
+    else
+      Result.LongAttnFactor := 1.0;
+    Exit;
+  end;
   Sub := Scaling.Find('factor');
   if (Sub = nil) or Sub.IsNull then
     ImportError(ImporterName + ': rope_scaling type "' + TypeName +
@@ -3199,7 +3271,8 @@ begin
   else
     ImportError(ImporterName + ': rope_scaling type "' + TypeName +
       '" is not supported - only "linear" (Position Interpolation), ' +
-      '"dynamic"/"ntk" (NTK-aware), "yarn" and "llama3" are wired onto ' +
+      '"dynamic"/"ntk" (NTK-aware), "yarn", "llama3" and ' +
+      '"longrope"/"su" (Phi-3 LongRoPE) are wired onto ' +
       'TNNetRotaryEmbedding.');
 end;
 
@@ -3209,8 +3282,12 @@ end;
 function CreateRoPEFromScaling(Base: TNeuralFloat;
   const S: TRoPEScalingConfig): TNNetRotaryEmbedding;
 begin
-  Result := TNNetRotaryEmbedding.Create(Base, S.Mode, S.Factor,
-    S.OriginalContextLen, S.YarnAlpha, S.YarnBeta);
+  if S.Mode = rsmLongRoPE then
+    Result := TNNetRotaryEmbedding.CreateLongRoPE(Base, S.LongFactors,
+      S.LongAttnFactor)
+  else
+    Result := TNNetRotaryEmbedding.Create(Base, S.Mode, S.Factor,
+      S.OriginalContextLen, S.YarnAlpha, S.YarnBeta);
 end;
 
 // ============================ LLAMA IMPORT =================================
@@ -3533,17 +3610,11 @@ begin
             'positive integer or null, got ' + SlidingWindowField.AsJSON + '.');
       end;
       // The 128k Phi-3 variants ship rope_scaling type "longrope" (older
-      // configs spell it "su" or even "yarn" - HF's Phi3Config remaps both
-      // to longrope): per-frequency long/short factor tables that are NOT
-      // standard YaRN. The generic parse above already rejects
-      // "longrope"/"su" as unknown types; a phi3 "yarn" would be ACCEPTED
-      // as standard YaRN and silently mis-load, so it is rejected here.
-      if Result.RopeScaling.Mode = rsmYaRN then
-        ImportError('Llama import: a phi3 rope_scaling of type "yarn" is ' +
-          'LongRoPE in disguise (HF Phi3Config remaps "su"/"yarn" to ' +
-          '"longrope": per-frequency long/short factor tables, not ' +
-          'standard YaRN) - the 128k Phi-3 variants are not wired into ' +
-          'TNNetRotaryEmbedding; use a 4k/8k checkpoint.');
+      // configs spell it "su" or even "yarn" - HF's Phi3Config remaps all
+      // three to longrope): per-frequency long/short factor tables. The
+      // generic parse above (ReadRoPEScalingFromJSONObject) now maps these to
+      // rsmLongRoPE (using the long_factor table and the long attention
+      // scaling for the static long-context import).
     end
     else if ModelType = 'olmo2' then
     begin
@@ -4190,6 +4261,15 @@ begin
         ImportError('Llama import: rotary_dim = int(head_dim * ' +
           'partial_rotary_factor) = ' + IntToStr(RotaryDims) +
           ' must be an even number >= 2 (RoPE rotates channel pairs).');
+      // LongRoPE per-frequency table must have exactly RotaryDims/2 entries
+      // (one per rotated channel pair) - HF's long_factor is rotary_ndims/2
+      // long. Validate here for a clear message before the layer build.
+      if (Config.RopeScaling.Mode = rsmLongRoPE) and
+         (Length(Config.RopeScaling.LongFactors) <> (RotaryDims div 2)) then
+        ImportError('Llama import: rope_scaling longrope long_factor has ' +
+          IntToStr(Length(Config.RopeScaling.LongFactors)) + ' entries but ' +
+          'rotary_dim/2 = ' + IntToStr(RotaryDims div 2) +
+          ' are required (one factor per rotated channel pair).');
       if Config.QKNorm and (RotaryDims < HeadDim) then
         ImportError('Llama import: internal error - partial rotary ' +
           'combined with per-head q/k RMSNorm is not wired (no family ' +

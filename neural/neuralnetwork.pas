@@ -3747,9 +3747,22 @@ type
   //     default 1) are fully interpolated, and in between the same blend is
   //     LINEAR IN r_i (the smooth_factor). No attention-temperature output
   //     scale (HF sets attention_factor = 1.0 for rope_type "llama3").
+  //   rsmLongRoPE              - Phi-3 LongRoPE (Ding et al. 2024, HF
+  //     Phi3LongRoPEScaledRotaryEmbedding): a PER-FREQUENCY factor table
+  //     (head_dim/2 entries) DIVIDES each inverse frequency,
+  //     theta'_i = theta_i / factor_i, and the rotated output is multiplied by
+  //     a single attention scaling. Unlike PI/NTK/YaRN/Llama3 the factors are
+  //     not derived from a scalar - they are imported verbatim from the
+  //     checkpoint's long_factor (used for the long-context import). The
+  //     factor table is stored in the single neuron FNeurons[0] (head_dim/2
+  //     weights, round-trips through Save/LoadDataFromString) and the
+  //     attention scaling in FFloatSt[4]. For a static long-context import the
+  //     long_factor table and the long attention scaling
+  //     sqrt(1 + ln(max_pos/orig_max_pos)/ln(orig_max_pos)) (or an explicit
+  //     long_mscale) are used.
   // Coded by Claude (AI).
   TNNetRoPEScalingMode = (rsmNone, rsmPositionInterpolation, rsmNTKAware,
-    rsmYaRN, rsmLlama3);
+    rsmYaRN, rsmLlama3, rsmLongRoPE);
 
   /// Rotary Positional Embedding (RoPE, Su et al. 2021).
   // Parameter-free, applies a fixed position-dependent 2D rotation to
@@ -3787,6 +3800,12 @@ type
     // BuildThetaCache whenever the depth changes.
     FTheta: array of TNeuralFloat;
     FOutScale: TNeuralFloat;
+    // rsmLongRoPE per-frequency factor table supplied by the importer
+    // constructor (verbatim long_factor). It is mirrored into FNeurons[0] so
+    // it round-trips through Save/LoadDataFromString; on a load-from-string the
+    // factors arrive via FNeurons[0] instead (this array stays empty until
+    // BuildThetaCache copies them out).
+    FLongFactors: array of TNeuralFloat;
     procedure BuildThetaCache(pDepth: integer);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -3796,7 +3815,15 @@ type
       pScaleFactor: TNeuralFloat = 1.0;
       pOriginalContextLen: integer = 0;
       pYarnAlpha: TNeuralFloat = 1.0;
-      pYarnBeta: TNeuralFloat = 32.0); overload;
+      pYarnBeta: TNeuralFloat = 32.0;
+      pLongAttnFactor: TNeuralFloat = 1.0); overload;
+    // LongRoPE (rsmLongRoPE) constructor: pLongFactors is the per-frequency
+    // factor table (length head_dim/2, divides each inverse frequency) and
+    // pAttnFactor multiplies the rotated output (long_mscale).
+    constructor CreateLongRoPE(pBase: TNeuralFloat;
+      const pLongFactors: array of TNeuralFloat;
+      pAttnFactor: TNeuralFloat); overload;
+    procedure LoadDataFromString(strData: string); override;
     function GetScalingMode(): TNNetRoPEScalingMode;
     function GetScaleFactor(): TNeuralFloat;
     function GetOriginalContextLen(): integer;
@@ -26075,7 +26102,7 @@ end;
 constructor TNNetRotaryEmbedding.Create(pBase: TNeuralFloat;
   pScalingMode: TNNetRoPEScalingMode; pScaleFactor: TNeuralFloat;
   pOriginalContextLen: integer; pYarnAlpha: TNeuralFloat;
-  pYarnBeta: TNeuralFloat);
+  pYarnBeta: TNeuralFloat; pLongAttnFactor: TNeuralFloat);
 begin
   inherited Create();
   if pBase <= 0 then
@@ -26088,7 +26115,9 @@ begin
   // slots load as "no scaling").
   if pScalingMode <> rsmNone then
   begin
-    if pScaleFactor < 1 then
+    // LongRoPE's "factor" is a per-frequency table, not a scalar >= 1, so the
+    // scalar-factor guard does not apply to it.
+    if (pScalingMode <> rsmLongRoPE) and (pScaleFactor < 1) then
       FErrorProc('TNNetRotaryEmbedding scaling requires ScaleFactor >= 1. ' +
         'Got ScaleFactor=' + FloatToStr(pScaleFactor));
     if pScalingMode in [rsmYaRN, rsmLlama3] then
@@ -26105,6 +26134,45 @@ begin
     FFloatSt[1] := pScaleFactor;
     FFloatSt[2] := pYarnAlpha;
     FFloatSt[3] := pYarnBeta;
+    // FFloatSt[4] is the LongRoPE attention scaling (long_mscale); it stays 0
+    // for every other mode, which BuildThetaCache treats as "no extra scale".
+    FFloatSt[4] := pLongAttnFactor;
+  end;
+end;
+
+constructor TNNetRotaryEmbedding.CreateLongRoPE(pBase: TNeuralFloat;
+  const pLongFactors: array of TNeuralFloat; pAttnFactor: TNeuralFloat);
+var
+  I: integer;
+begin
+  // pScaleFactor / alpha / beta are unused by rsmLongRoPE; pass 1.0 so the
+  // shared scalar slots stay benign.
+  Create(pBase, rsmLongRoPE, 1.0, 0, 1.0, 32.0, pAttnFactor);
+  if Length(pLongFactors) < 1 then
+    FErrorProc('TNNetRotaryEmbedding LongRoPE requires a non-empty ' +
+      'long_factor table.');
+  SetLength(FLongFactors, Length(pLongFactors));
+  for I := 0 to Length(pLongFactors) - 1 do
+  begin
+    if pLongFactors[I] <= 0 then
+      FErrorProc('TNNetRotaryEmbedding LongRoPE factors must be positive, ' +
+        'got ' + FloatToStr(pLongFactors[I]) + ' at index ' + IntToStr(I) + '.');
+    FLongFactors[I] := pLongFactors[I];
+  end;
+end;
+
+procedure TNNetRotaryEmbedding.LoadDataFromString(strData: string);
+begin
+  inherited LoadDataFromString(strData);
+  // For rsmLongRoPE the per-frequency factor table just arrived in
+  // FNeurons[0]; drop any stale FLongFactors and theta cache so the next
+  // BuildThetaCache copies the loaded factors back out.
+  if TNNetRoPEScalingMode(FStruct[0]) = rsmLongRoPE then
+  begin
+    SetLength(FLongFactors, 0);
+    SetLength(FTheta, 0);
+    if Assigned(FPrevLayer) and (FPrevLayer.Output.Depth > 0) then
+      BuildThetaCache(FPrevLayer.Output.Depth);
   end;
 end;
 
@@ -26150,12 +26218,48 @@ var
       (2.0 * pcr_logf(Base));
   end;
 
+var
+  LongFactor: TNeuralFloat;
 begin
   HalfD := pDepth div 2;
   SetLength(FTheta, HalfD);
   Base := FFloatSt[0];
   if Base <= 0 then Base := 10000.0;
   Mode := TNNetRoPEScalingMode(FStruct[0]);
+  // rsmLongRoPE: synchronise the per-frequency factor table with FNeurons[0]
+  // (the serialized home of the table). On the importer path FLongFactors is
+  // already populated, so MIRROR it into FNeurons[0]; on a load-from-string
+  // FLongFactors is empty, so COPY OUT of FNeurons[0] (filled by
+  // LoadDataFromString). Either way FLongFactors holds the live table below.
+  if Mode = rsmLongRoPE then
+  begin
+    if Length(FLongFactors) = HalfD then
+    begin
+      if FNeurons.Count < 1 then AddNeurons(1);
+      FNeurons[0].Weights.ReSize(HalfD, 1, 1);
+      for pairIdx := 0 to HalfD - 1 do
+        FNeurons[0].Weights.FData[pairIdx] := FLongFactors[pairIdx];
+    end
+    else if (FNeurons.Count >= 1) and (FNeurons[0].Weights.Size = HalfD) then
+    begin
+      // Load path (post LoadDataFromString): copy the table out of FNeurons[0].
+      SetLength(FLongFactors, HalfD);
+      for pairIdx := 0 to HalfD - 1 do
+        FLongFactors[pairIdx] := FNeurons[0].Weights.FData[pairIdx];
+    end
+    else
+    begin
+      // Structure-load path BEFORE LoadDataFromString fills the table: create a
+      // placeholder neuron of the right length (so LoadDataFromString's
+      // neuron-count check passes) and use factor 1 for now -
+      // LoadDataFromString rebuilds the cache with the real factors.
+      if FNeurons.Count < 1 then AddNeurons(1);
+      FNeurons[0].Weights.ReSize(HalfD, 1, 1);
+      SetLength(FLongFactors, HalfD);
+      for pairIdx := 0 to HalfD - 1 do
+        FLongFactors[pairIdx] := 1.0;
+    end;
+  end;
   Scale := GetScaleFactor();
   Alpha := FFloatSt[2];
   Beta := FFloatSt[3];
@@ -26192,6 +26296,15 @@ begin
     case Mode of
       // Position Interpolation: angle uses m/s, i.e. theta' = theta/s.
       rsmPositionInterpolation: Theta := Theta / Scale;
+      // LongRoPE: divide each inverse frequency by its per-pair factor
+      // (theta'_i = theta_i / long_factor_i), matching HF
+      // Phi3LongRoPEScaledRotaryEmbedding (inv_freq = 1/(factor*base^(2i/d))).
+      rsmLongRoPE:
+        begin
+          LongFactor := FLongFactors[pairIdx];
+          if LongFactor <= 0 then LongFactor := 1.0;
+          Theta := Theta / LongFactor;
+        end;
       rsmYaRN:
         begin
           // gamma=1 (below the low band edge, short wavelength) keeps
@@ -26230,6 +26343,10 @@ begin
     Temperature := 0.1 * pcr_logf(Scale) + 1.0;
     FOutScale := Temperature;
   end;
+  // LongRoPE attention scaling (long_mscale): multiply the rotated output by
+  // the imported factor, applied to BOTH q and k by the builders.
+  if (Mode = rsmLongRoPE) and (FFloatSt[4] > 0) then
+    FOutScale := FFloatSt[4];
 end;
 
 procedure TNNetRotaryEmbedding.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -83587,7 +83704,7 @@ begin
       'TNNetPerformerAttention' :   Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
-      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3]);
+      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
       'TNNetReLU6' :                Result := TNNetReLU6.Create(St[2]);
@@ -83969,7 +84086,7 @@ begin
       if S[0] = 'TNNetPerformerAttention' then Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
-      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3]) else
+      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetReLU6' then Result := TNNetReLU6.Create(St[2]) else
