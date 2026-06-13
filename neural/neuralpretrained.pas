@@ -2932,6 +2932,23 @@ function BuildMambaFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
+// Writes Net (a BuildMambaFromSafeTensors causal-LM) back out under the HF
+// "backbone.*" (or bare, per Config.Prefix) tensor names - the exact inverse
+// of BuildMambaFromSafeTensorsWithConfig. A_log and D and dt_proj.bias and
+// the B|C x_proj rows round-trip RAW; the conv1d / in_proj / out_proj are
+// straight nn.Linear dumps. The one non-trivial inversion is the low-rank
+// dt path: the importer FOLDED dt_proj.weight @ x_proj.weight[0:dt_rank]
+// (a [d_inner, dt_rank] @ [dt_rank, d_inner] product) into the single
+// [d_inner, d_inner] rank-<=dt_rank matrix W_d stored in the scan layer, so
+// the original factors are not retained. The exporter recovers an EXACT
+// rank-<=dt_rank factorization of W_d (Gaussian elimination with partial
+// pivoting), emitting dt_proj.weight = L and x_proj.weight[0:dt_rank] = U
+// with L @ U = W_d - re-importing folds them back to the same W_d (bit-exact
+// in F32 up to single-precision rounding of the factor product). Tied LM
+// heads emit no lm_head.weight tensor (Config.TieWordEmbeddings).
+procedure SaveMambaToSafeTensors(Net: TNNet; const Config: TMambaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
 // ====================== MAMBA-2 / SSD IMPORT ============================
 // BuildMamba2FromSafeTensors imports the Mamba-2 / State-Space Duality
 // family (HF model_type "mamba2", architectures ["Mamba2ForCausalLM"]:
@@ -19566,6 +19583,309 @@ var
 begin
   Result := BuildMambaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+procedure SaveMambaToSafeTensors(Net: TNNet; const Config: TMambaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  Embeds, Norms, PwConvs, Convs, Scans: array of TNNetLayer;
+  EmbIn, FinalNorm, LMHead: TNNetLayer;
+  i, BlockCnt: integer;
+  d, DI, NS, RK, ExpectNorm, ExpectPw: integer;
+  MixPrefix, NormName: string;
+
+  // Straight HF nn.Linear [OutDim, InDim] (+optional bias [OutDim]) from
+  // OutDim consecutive neurons of Layer: neuron j is checkpoint row j. The
+  // exact inverse of LoadLlamaLinearWeights (no rotary on any Mamba linear).
+  // BName='' for the bias-free in/out_proj when use_bias=false.
+  procedure DumpLinear(Layer: TNNetLayer; OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[jj].Weights.Size <> InDim then
+          ImportError('Mamba export: neuron ' + IntToStr(jj) + ' for "' +
+            WName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      if BName <> '' then Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // depthwise causal conv1d [d_inner, 1, k] (one k-tap filter per channel,
+  // tap order direct) + optional [d_inner] bias - inverse of LoadDepthwiseConv.
+  procedure DumpDepthwiseConv(Layer: TNNetLayer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    dd, kk: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(DI * Config.ConvKernel, 1, 1);
+      B.ReSize(DI, 1, 1);
+      for dd := 0 to DI - 1 do
+      begin
+        for kk := 0 to Config.ConvKernel - 1 do
+          W.FData[dd * Config.ConvKernel + kk] :=
+            Layer.Neurons[dd].Weights.FData[kk];
+        B.FData[dd] := Layer.Neurons[dd].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [DI, 1, Config.ConvKernel], W, pDType);
+      if Config.UseConvBias then
+        Writer.AddTensorFlat(BName, [DI], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Per-token RMSNorm gain [d_model] -> single tensor (Neurons[0].Weights),
+  // the inverse of LoadLlamaRMSNormWeights.
+  procedure DumpRMSNorm(Layer: TNNetLayer; const WName: string);
+  begin
+    if Layer.Neurons[0].Weights.Size <> d then
+      ImportError('Mamba export: RMSNorm "' + WName + '" gain size ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' <> ' + IntToStr(d) + '.');
+    Writer.AddTensorFlat(WName, [d], Layer.Neurons[0].Weights, pDType);
+  end;
+
+  // The selective-scan bundle (inverse of LoadScanWeights). W_B/W_C/b_d/A_log/D
+  // round-trip raw. The folded W_d (Neurons[0], [d_inner, d_inner], rank
+  // <= dt_rank) is factored EXACTLY into dt_proj.weight [d_inner, dt_rank]
+  // (= L) and the first dt_rank rows of x_proj.weight (= U) via Gaussian
+  // elimination with partial pivoting, so L @ U = W_d.
+  procedure DumpScanWeights(Layer: TNNetLayer; const MixP: string);
+  var
+    Wd: array of array of double;   // d_inner x d_inner working copy
+    L: array of array of double;    // d_inner x dt_rank
+    U: array of array of double;    // dt_rank x d_inner
+    PivRow: array of integer;
+    XW, DtW, Vec: TNNetVolume;
+    a, b, c, s, r, k, pr: integer;
+    piv, mult, maxv: double;
+  begin
+    XW := TNNetVolume.Create;     // x_proj.weight  [RK+2*NS, DI]
+    DtW := TNNetVolume.Create;    // dt_proj.weight [DI, RK]
+    Vec := TNNetVolume.Create;
+    try
+      // ---- exact rank-<=RK factorization of W_d (Neurons[0]) ----
+      SetLength(Wd, DI);
+      for a := 0 to DI - 1 do
+      begin
+        SetLength(Wd[a], DI);
+        for b := 0 to DI - 1 do
+          Wd[a][b] := Layer.Neurons[0].Weights.FData[a * DI + b];
+      end;
+      SetLength(L, DI);
+      for a := 0 to DI - 1 do
+      begin
+        SetLength(L[a], RK);
+        for r := 0 to RK - 1 do L[a][r] := 0;
+      end;
+      SetLength(U, RK);
+      for r := 0 to RK - 1 do
+      begin
+        SetLength(U[r], DI);
+        for b := 0 to DI - 1 do U[r][b] := 0;
+      end;
+      SetLength(PivRow, RK);
+      // Column-by-column LU-style extraction: at step r pick the row with the
+      // largest residual entry in some pivot column, record it as U[r], and
+      // eliminate it from the remaining rows (multipliers -> L[*][r]).
+      for r := 0 to RK - 1 do
+      begin
+        // pivot = row with the max-abs entry over the whole residual matrix.
+        pr := -1; maxv := 0;
+        for a := 0 to DI - 1 do
+          for b := 0 to DI - 1 do
+            if Abs(Wd[a][b]) > maxv then
+            begin
+              maxv := Abs(Wd[a][b]); pr := a;
+            end;
+        if pr < 0 then pr := r;          // residual already ~0: any row
+        PivRow[r] := pr;
+        for b := 0 to DI - 1 do U[r][b] := Wd[pr][b];
+        // choose the pivot column = the largest-magnitude entry of U[r].
+        k := 0; piv := 0;
+        for b := 0 to DI - 1 do
+          if Abs(U[r][b]) > Abs(piv) then begin piv := U[r][b]; k := b; end;
+        if piv = 0 then
+        begin
+          // U[r] is all zero: this rank slot contributes nothing.
+          for a := 0 to DI - 1 do L[a][r] := 0;
+          continue;
+        end;
+        // eliminate the pivot column from every row.
+        for a := 0 to DI - 1 do
+        begin
+          mult := Wd[a][k] / piv;
+          L[a][r] := mult;
+          for b := 0 to DI - 1 do
+            Wd[a][b] := Wd[a][b] - mult * U[r][b];
+        end;
+      end;
+      // ---- assemble x_proj.weight [RK+2*NS, DI] ----
+      XW.ReSize((RK + 2 * NS) * DI, 1, 1);
+      for r := 0 to RK - 1 do
+        for b := 0 to DI - 1 do
+          XW.FData[r * DI + b] := U[r][b];
+      for s := 0 to NS - 1 do
+        for b := 0 to DI - 1 do
+        begin
+          XW.FData[(RK + s) * DI + b] :=
+            Layer.Neurons[1].Weights.FData[s * DI + b];       // W_B
+          XW.FData[(RK + NS + s) * DI + b] :=
+            Layer.Neurons[2].Weights.FData[s * DI + b];       // W_C
+        end;
+      Writer.AddTensorFlat(MixP + 'x_proj.weight', [RK + 2 * NS, DI],
+        XW, pDType);
+      // ---- dt_proj.weight [DI, RK] = L ----
+      DtW.ReSize(DI * RK, 1, 1);
+      for a := 0 to DI - 1 do
+        for r := 0 to RK - 1 do
+          DtW.FData[a * RK + r] := L[a][r];
+      Writer.AddTensorFlat(MixP + 'dt_proj.weight', [DI, RK], DtW, pDType);
+      // ---- dt_proj.bias = b_d (Neurons[3]) ----
+      Vec.ReSize(DI, 1, 1);
+      for a := 0 to DI - 1 do Vec.FData[a] := Layer.Neurons[3].Weights.FData[a];
+      Writer.AddTensorFlat(MixP + 'dt_proj.bias', [DI], Vec, pDType);
+      // ---- A_log = A_raw RAW (Neurons[4], [DI, NS]) ----
+      Vec.ReSize(DI * NS, 1, 1);
+      for a := 0 to DI * NS - 1 do
+        Vec.FData[a] := Layer.Neurons[4].Weights.FData[a];
+      Writer.AddTensorFlat(MixP + 'A_log', [DI, NS], Vec, pDType);
+      // ---- D = e (Neurons[5], [DI]) ----
+      Vec.ReSize(DI, 1, 1);
+      for a := 0 to DI - 1 do Vec.FData[a] := Layer.Neurons[5].Weights.FData[a];
+      Writer.AddTensorFlat(MixP + 'D', [DI], Vec, pDType);
+    finally
+      Vec.Free;
+      DtW.Free;
+      XW.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  DI := Config.DInner;
+  NS := Config.StateSize;
+  RK := Config.TimeStepRank;
+  if Config.NumLayers < 1 then
+    ImportError('Mamba export: num_hidden_layers must be >= 1.');
+  // ---- collect load-bearing layers in net (= importer build) order ----
+  SetLength(Embeds, 0); SetLength(Norms, 0); SetLength(PwConvs, 0);
+  SetLength(Convs, 0); SetLength(Scans, 0);
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetEmbedding then
+    begin
+      SetLength(Embeds, Length(Embeds) + 1);
+      Embeds[High(Embeds)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenRMSNorm then
+    begin
+      SetLength(Norms, Length(Norms) + 1);
+      Norms[High(Norms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetSelectiveSSM then
+    begin
+      SetLength(Scans, Length(Scans) + 1);
+      Scans[High(Scans)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetDepthwiseConv1D then
+    begin
+      SetLength(Convs, Length(Convs) + 1);
+      Convs[High(Convs)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if Length(Embeds) <> 1 then
+    ImportError('Mamba export: found ' + IntToStr(Length(Embeds)) +
+      ' TNNetEmbedding layers, expected 1 - not a ' +
+      'BuildMambaFromSafeTensors net?');
+  ExpectNorm := Config.NumLayers + 1;     // per-block norm + norm_f
+  ExpectPw := 2 * Config.NumLayers + 1;   // in_proj + out_proj per block + LM head
+  if Length(Norms) <> ExpectNorm then
+    ImportError('Mamba export: found ' + IntToStr(Length(Norms)) +
+      ' TokenRMSNorm layers, expected ' + IntToStr(ExpectNorm) + '.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('Mamba export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) + '.');
+  if Length(Scans) <> Config.NumLayers then
+    ImportError('Mamba export: found ' + IntToStr(Length(Scans)) +
+      ' SelectiveSSM layers, expected ' + IntToStr(Config.NumLayers) + '.');
+  if Length(Convs) <> Config.NumLayers then
+    ImportError('Mamba export: found ' + IntToStr(Length(Convs)) +
+      ' DepthwiseConv1D layers, expected ' + IntToStr(Config.NumLayers) + '.');
+  EmbIn := Embeds[0];
+  FinalNorm := Norms[Config.NumLayers];           // last collected norm
+  LMHead := PwConvs[2 * Config.NumLayers];         // last collected PwConv
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/mamba');
+    // ---- embeddings ----
+    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+      ImportError('Mamba export: embeddings size ' +
+        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(Config.VocabSize * d) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'embeddings.weight',
+      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+    // ---- mixer blocks ----
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      MixPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.mixer.';
+      NormName := Config.Prefix + 'layers.' + IntToStr(BlockCnt) +
+        '.norm.weight';
+      DumpRMSNorm(Norms[BlockCnt], NormName);
+      if Config.UseBias then
+        DumpLinear(PwConvs[BlockCnt * 2 + 0], 2 * DI, d,
+          MixPrefix + 'in_proj.weight', MixPrefix + 'in_proj.bias')
+      else
+        DumpLinear(PwConvs[BlockCnt * 2 + 0], 2 * DI, d,
+          MixPrefix + 'in_proj.weight', '');
+      DumpDepthwiseConv(Convs[BlockCnt], MixPrefix + 'conv1d.weight',
+        MixPrefix + 'conv1d.bias');
+      DumpScanWeights(Scans[BlockCnt], MixPrefix);
+      if Config.UseBias then
+        DumpLinear(PwConvs[BlockCnt * 2 + 1], d, DI,
+          MixPrefix + 'out_proj.weight', MixPrefix + 'out_proj.bias')
+      else
+        DumpLinear(PwConvs[BlockCnt * 2 + 1], d, DI,
+          MixPrefix + 'out_proj.weight', '');
+    end;
+    // ---- final norm ----
+    DumpRMSNorm(FinalNorm, Config.Prefix + 'norm_f.weight');
+    // ---- LM head (untied only; tied heads carry no lm_head tensor) ----
+    if not Config.TieWordEmbeddings then
+      DumpLinear(LMHead, Config.VocabSize, d, 'lm_head.weight', '');
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
 end;
 
 // ====================== MAMBA-2 / SSD IMPORT (impl) ======================

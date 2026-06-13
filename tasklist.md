@@ -309,10 +309,23 @@ rather than acted on.
       straight [out,in] dense/dense_h_to_4h/dense_4h_to_h linears, LayerNorm
       gamma|beta INCLUDING the word_embeddings_layernorm, tied word_embeddings
       (no separate lm_head tensor) and ln_f under the transformer.* name map,
-      round-trip gated by TestBloomSafeTensorsRoundTrip): add a layer->HF-name +
+      round-trip gated by TestBloomSafeTensorsRoundTrip; Mamba
+      SaveMambaToSafeTensors LANDED as the exact inverse of
+      BuildMambaFromSafeTensors — the first NON-TRANSFORMER exporter: walks the
+      typed layers (Embedding / per-block TokenRMSNorm+in_proj PointwiseConvLinear
+      +DepthwiseConv1D+SelectiveSSM+out_proj / norm_f / LM head) in build order
+      and emits the backbone.* name map; A_log/D/dt_proj.bias and the B|C x_proj
+      rows round-trip RAW, conv1d/in_proj/out_proj are straight dumps, and the
+      one non-trivial inversion — the importer's FOLD of dt_proj.weight @
+      x_proj.weight[0:dt_rank] into the single rank-<=dt_rank [d_inner,d_inner]
+      W_d — is re-factored EXACTLY at export by Gaussian elimination (emit
+      dt_proj.weight=L, x_proj rows[0:dt_rank]=U with L@U=W_d); tied
+      tie_word_embeddings emits no lm_head tensor; round-trip gated by
+      TestMambaSafeTensorsRoundTrip, max |logit diff| = 4.4e-6 (single-precision
+      rounding of the factor product, well under 1e-5)): add a layer->HF-name +
       transpose inverse map for the REMAINING architectures (e.g. GPT-NeoX-style
       siblings already covered; next up the non-transformer / encoder-decoder
-      importers such as RWKV/Mamba, T5/Marian — each its own map).
+      importers such as RWKV, T5/Marian — each its own map).
 - [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the

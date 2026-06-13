@@ -111,6 +111,7 @@ type
     procedure TestBertSafeTensorsRoundTrip;
     procedure TestGPTNeoXSafeTensorsRoundTrip;
     procedure TestBloomSafeTensorsRoundTrip;
+    procedure TestMambaSafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -1830,6 +1831,65 @@ begin
     // (no rotary on BLOOM) -> identical logits.
     AssertTrue('BLOOM safetensors round-trip: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
+    NN.Free;
+  end;
+end;
+
+// SaveMambaToSafeTensors round-trip: import the pico Mamba, export, re-import,
+// and compare logits. The folded low-rank dt path (dt_proj.weight @
+// x_proj.weight[0:dt_rank] -> single [d_inner, d_inner] W_d) is re-factored
+// EXACTLY at export (Gaussian elimination), so the re-imported W_d matches up
+// to single-precision rounding of the factor product; A_log/D/dt_bias/B/C
+// round-trip raw. F32 -> logits agree to <1e-4.
+procedure TTestNeuralPretrained.TestMambaSafeTensorsRoundTrip;
+var
+  NN, NN2: TNNet;
+  Config, Config2: TMambaConfig;
+  Input, Out1, Out2: TNNetVolume;
+  TmpPath: string;
+  i, s, SeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  TmpPath := GetTempDir(false) + 'cai_mamba_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  NN := BuildMambaFromSafeTensorsEx(
+    FixturePath('tiny_mamba.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_mamba_config.json'));
+  Input := TNNetVolume.Create;
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  NN2 := nil;
+  try
+    SaveMambaToSafeTensors(NN, Config, TmpPath);
+    NN2 := BuildMambaFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}8,
+      {pInferenceOnly=}false, FixturePath('tiny_mamba_config.json'));
+    SeqLen := 8;
+    Vocab := Config.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input[i, 0, 0] := (s * 5 + i * 3 + 1) mod Vocab;
+      NN.Compute(Input);
+      NN.GetOutput(Out1);
+      NN2.Compute(Input);
+      NN2.GetOutput(Out2);
+      AssertEquals('mamba round-trip output size', Out1.Size, Out2.Size);
+      for i := 0 to Out1.Size - 1 do
+        if Abs(Out1.FData[i] - Out2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(Out1.FData[i] - Out2.FData[i]);
+    end;
+    // F32; only the exact dt-fold re-factorization rounds at single precision.
+    AssertTrue('Mamba safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     if FileExists(TmpPath) then DeleteFile(TmpPath);
     Out2.Free;
