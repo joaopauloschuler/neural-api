@@ -42,6 +42,9 @@ type
     procedure TestRejectsUnknownSplitPattern;
     procedure TestNFCComposesDecomposedInput;
     procedure TestNFDDecomposesPrecomposedInput;
+    procedure TestNFKCFoldsCompatibilityForms;
+    procedure TestNFKDFoldsCompatibilityForms;
+    procedure TestNFKCNormalizerFoldsTokenIds;
     procedure TestNFCNormalizerFoldsTokenIds;
     procedure TestWordPieceSpecialTokenIds;
     procedure TestByteLevelSpecialTokenIds;
@@ -450,6 +453,96 @@ begin
     AssertEquals('precomposed yields 2 byte ids', 2, Length(IdsC));
     AssertEquals('byte C3 -> id 1', 1, IdsC[0]);
     AssertEquals('byte A9 -> id 2', 2, IdsC[1]);
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
+end;
+
+// Compatibility NFKC: compat decompositions (ligatures, full/half-width,
+// super/subscripts, fractions, no-break space, circled/parenthesized/roman
+// numerals) fold, THEN canonical composition runs. Oracle strings are pinned
+// from Python unicodedata.normalize('NFKC', ...). UTF-8 byte literals.
+procedure TTestNeuralHFTokenizer.TestNFKCFoldsCompatibilityForms;
+  function NFKC(const S: string): string;
+  begin
+    Result := TNeuralHFTokenizer.NormalizeUnicodeText(S, True, True);
+  end;
+begin
+  // U+FB01 LATIN SMALL LIGATURE FI -> 'fi'
+  AssertEquals('NFKC ligature fi -> fi', 'fi', NFKC(#$EF#$AC#$81));
+  // U+FF21 FULLWIDTH LATIN CAPITAL LETTER A -> 'A'
+  AssertEquals('NFKC fullwidth A -> A', 'A', NFKC(#$EF#$BC#$A1));
+  // U+00B2 SUPERSCRIPT TWO -> '2'
+  AssertEquals('NFKC superscript 2 -> 2', '2', NFKC(#$C2#$B2));
+  // U+00BD VULGAR FRACTION ONE HALF -> '1' U+2044 FRACTION SLASH '2'
+  AssertEquals('NFKC fraction 1/2', '1' + #$E2#$81#$84 + '2', NFKC(#$C2#$BD));
+  // U+00A0 NO-BREAK SPACE -> U+0020 SPACE
+  AssertEquals('NFKC no-break space -> space', ' ', NFKC(#$C2#$A0));
+  // U+2460 CIRCLED DIGIT ONE -> '1'
+  AssertEquals('NFKC circled 1 -> 1', '1', NFKC(#$E2#$91#$A0));
+  // U+2474 PARENTHESIZED DIGIT ONE -> '(1)'
+  AssertEquals('NFKC parenthesized 1 -> (1)', '(1)', NFKC(#$E2#$91#$B4));
+  // U+2168 ROMAN NUMERAL NINE -> 'IX'
+  AssertEquals('NFKC roman IX -> IX', 'IX', NFKC(#$E2#$85#$A8));
+  // Compat THEN canonical compose: 'e'+U+0301 (decomposed) followed by
+  // U+00B2 superscript two -> U+00E9 'e' (composed) + '2'.
+  AssertEquals('NFKC compat-decompose then compose',
+    #$C3#$A9 + '2', NFKC('e' + #$CC#$81 + #$C2#$B2));
+  // Plain ASCII is untouched.
+  AssertEquals('NFKC ASCII identity', 'hello', NFKC('hello'));
+end;
+
+// Compatibility NFKD: same compat folds as NFKC but WITHOUT canonical compose,
+// so combining marks stay decomposed. Oracle from Python NFKD.
+procedure TTestNeuralHFTokenizer.TestNFKDFoldsCompatibilityForms;
+  function NFKD(const S: string): string;
+  begin
+    Result := TNeuralHFTokenizer.NormalizeUnicodeText(S, False, True);
+  end;
+begin
+  AssertEquals('NFKD ligature fi -> fi', 'fi', NFKD(#$EF#$AC#$81));
+  AssertEquals('NFKD fullwidth A -> A', 'A', NFKD(#$EF#$BC#$A1));
+  AssertEquals('NFKD superscript 2 -> 2', '2', NFKD(#$C2#$B2));
+  AssertEquals('NFKD fraction 1/2', '1' + #$E2#$81#$84 + '2', NFKD(#$C2#$BD));
+  AssertEquals('NFKD no-break space -> space', ' ', NFKD(#$C2#$A0));
+  AssertEquals('NFKD parenthesized 1 -> (1)', '(1)', NFKD(#$E2#$91#$B4));
+  // 'e'+U+0301 + U+00B2 stays decomposed under NFKD: 'e' U+0301 '2'.
+  AssertEquals('NFKD keeps marks decomposed',
+    'e' + #$CC#$81 + '2', NFKD('e' + #$CC#$81 + #$C2#$B2));
+end;
+
+// End-to-end: a tokenizer carrying {"type":"NFKC"} must fold a compatibility
+// form (fullwidth 'A' U+FF21) to the SAME token ids as plain ASCII 'A'.
+procedure TTestNeuralHFTokenizer.TestNFKCNormalizerFoldsTokenIds;
+var
+  Tok: TNeuralHFTokenizer;
+  TempFile: string;
+  SL: TStringList;
+  IdsW, IdsA: TNeuralIntegerArray;
+  Cnt: integer;
+begin
+  TempFile := GetTempDir(true) + 'nfkc_bytelevel_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    // Byte-level BPE, no merges, NFKC normalizer. After NFKC the fullwidth 'A'
+    // (U+FF21, bytes EF BC A1) folds to ASCII 'A' (byte 0x41 -> GPT-2 alphabet
+    // char 'A'). Vocab maps 'A' so both inputs yield the same single id.
+    SL.Text :=
+      '{"normalizer": {"type": "NFKC"},' +
+      ' "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},' +
+      ' "model": {"type": "BPE", "vocab": {"A": 0}, "merges": []}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    IdsW := Tok.Encode(#$EF#$BC#$A1); // fullwidth A
+    IdsA := Tok.Encode('A');          // ASCII A
+    AssertEquals('NFKC folds id count', Length(IdsA), Length(IdsW));
+    for Cnt := 0 to High(IdsA) do
+      AssertEquals('NFKC folds id[' + IntToStr(Cnt) + ']', IdsA[Cnt], IdsW[Cnt]);
+    AssertEquals('ASCII A yields 1 id', 1, Length(IdsA));
+    AssertEquals('byte 0x41 -> id 0', 0, IdsA[0]);
   finally
     Tok.Free;
     SL.Free;

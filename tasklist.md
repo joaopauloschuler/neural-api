@@ -87,15 +87,21 @@ rather than acted on.
       denormals inside the layer's FFT so callers don't have to.
 - [ ] ulimit -v 3000000 ChatTerminal /path/to/Qwen2.5-0.5B-Instruct crashes using all RAM at loading the model
       Tested with !git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
-- [ ] Compatibility Unicode normalization (NFKC/NFKD) in
-      `neuralhftokenizer.pas` (`AddNormalizer`). Canonical NFC/NFD are done
-      (above); NFKC/NFKD are currently APPROXIMATED by folding them to their
-      canonical counterpart (NFC/NFD) — canonical mappings apply but the
-      COMPATIBILITY folds (ligatures, full/half-width forms, superscripts,
-      etc.) are NOT. To finish, emit the compatibility decomposition mappings
-      from `gen_nfc_tables.py` (drop the `<...>`-tag filter) into a second
-      table and apply them in `UnicodeNormalize` before canonical ordering.
-      Same Unigram/SentencePiece NFKC path approximation still applies there.
+- [X] Compatibility Unicode normalization (NFKC/NFKD) in
+      `neuralhftokenizer.pas` (`AddNormalizer`). `gen_nfc_tables.py` now also
+      emits the compatibility decomposition table
+      (`cNFKCDecompIdx`/`cNFKCDecompPool`, full recursive NFKD expansions);
+      `UnicodeNormalize(S, Compose, Compat)` applies compat folds (ligatures,
+      full/half-width, super/subscripts, fractions, no-break space,
+      circled/parenthesized/roman numerals, ...) BEFORE canonical ordering,
+      then canonical compose for NFKC. `AddNormalizer` stores the real
+      NFKC/NFKD form (no longer folded to NFC/NFD). Tests
+      `TestNFKCFoldsCompatibilityForms` / `TestNFKDFoldsCompatibilityForms` /
+      `TestNFKCNormalizerFoldsTokenIds` pin oracles from Python unicodedata.
+      FOLLOW-UP: the SentencePiece `.model` `precompiled_charsmap` (opaque
+      per-model normalization trie, NOT standard NFKC) is still not
+      parsed/applied — a tokenizer.json that declares a standard NFKC/NFKD
+      normalizer now works in full; only the embedded charsmap is unhandled.
 
 ## Infrastructure / dev experience
 

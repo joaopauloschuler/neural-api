@@ -4,17 +4,19 @@
 #
 # Run with: /home/bpsa/x/bin/python tools/gen_nfc_tables.py
 #
-# Emits three const arrays (see the .inc header for the exact layout):
+# Emits four const arrays (see the .inc header for the exact layout):
 #   cNFCDecomp     -- canonical decomposition pairs (CP -> A [+ B])
 #   cNFCComposePair-- canonical composition pairs (A,B -> CP), exclusions removed
 #   cNFCCombClass  -- nonzero Canonical_Combining_Class entries
+#   cNFKCDecomp    -- COMPATIBILITY decomposition mappings (CP -> [A,B,...]),
+#                     i.e. the entries tagged <compat>/<wide>/<super>/...
 #
 # Coverage: every CANONICAL (non-compatibility) decomposition and every
 # nonzero combining class in the Basic Multilingual Plane plus the few
 # above it that unicodedata knows -- i.e. the full canonical algorithm,
 # not a subset. Hangul is handled ALGORITHMICALLY in Pascal and is
 # deliberately excluded from the table. Compatibility forms (NFKC/NFKD)
-# are NOT emitted here.
+# ARE emitted (cNFKCDecomp), applied before canonical ordering in Pascal.
 import sys
 import unicodedata
 
@@ -31,6 +33,7 @@ def main():
     decomp = {}        # cp -> (a, b)  (b may be None for singleton)
     combclass = {}     # cp -> ccc
     full_decomp_first = {}  # cp -> first decomposition codepoint (for exclusion logic)
+    compat = {}        # cp -> [c0, c1, ...] FULLY-resolved compatibility decomposition
 
     for cp in range(0x110000):
         ch = chr(cp)
@@ -42,7 +45,12 @@ def main():
             continue
         parts = d.split()
         if parts and parts[0].startswith('<'):
-            # compatibility decomposition -- skip (NFKC/NFKD not handled)
+            # compatibility decomposition (<compat>/<wide>/<super>/<sub>/
+            # <fraction>/<font>/<noBreak>/...). Record the FULLY recursive
+            # compatibility (NFKD) expansion of CP, MINUS the tag. Hangul
+            # syllables never carry a compat tag so no special-case needed.
+            nfkd = unicodedata.normalize('NFKD', ch)
+            compat[cp] = [ord(c) for c in nfkd]
             continue
         if is_hangul_syllable(cp):
             # algorithmic in Pascal
@@ -86,7 +94,8 @@ def main():
     w('{ Coverage: ALL canonical (non-compatibility) decompositions and   }')
     w('{ nonzero Canonical_Combining_Class values that Python unicodedata  }')
     w('{ knows. Hangul syllables are handled ALGORITHMICALLY in Pascal and }')
-    w('{ are NOT tabled. Compatibility forms (NFKC/NFKD) are NOT here.     }')
+    w('{ are NOT tabled. Compatibility (NFKC/NFKD) decompositions ARE in   }')
+    w('{ cNFKCDecompIdx/cNFKCDecompPool below.                             }')
     w('{ ---------------------------------------------------------------- }')
     w('')
 
@@ -133,12 +142,47 @@ def main():
     w('  );')
     w('')
 
+    # Compatibility (NFKD) decomposition table. Variable length, so store a
+    # flat pool of codepoints plus an index table (CP, offset, length) sorted
+    # by CP for binary search. Applied in Pascal BEFORE canonical ordering
+    # when the requested form is NFKC/NFKD.
+    xitems = sorted(compat.items())
+    pool = []
+    index = []
+    for cp, cps in xitems:
+        index.append((cp, len(pool), len(cps)))
+        pool.extend(cps)
+    w('// Compatibility decomposition (NFKD). cNFKCDecompIdx maps CP ->')
+    w('// (offset, length) into the flat cNFKCDecompPool codepoint array;')
+    w('// each entry is the FULL recursive NFKD expansion. Sorted by CP for')
+    w('// binary search. Applied before canonical ordering for NFKC/NFKD.')
+    w('const')
+    w('  cNFKCDecompCount = %d;' % len(index))
+    w('  cNFKCDecompPoolCount = %d;' % len(pool))
+    w('  cNFKCDecompIdx: array[0..cNFKCDecompCount - 1, 0..2] of cardinal = (')
+    rows = []
+    for cp, off, ln in index:
+        rows.append('    ($%05X, %d, %d)' % (cp, off, ln))
+    w(',\n'.join(rows))
+    w('  );')
+    w('  cNFKCDecompPool: array[0..cNFKCDecompPoolCount - 1] of cardinal = (')
+    # 8 codepoints per line for readability.
+    plines = []
+    for i in range(0, len(pool), 8):
+        chunk = pool[i:i + 8]
+        plines.append('    ' + ', '.join('$%05X' % c for c in chunk))
+    w(',\n'.join(plines))
+    w('  );')
+    w('')
+
     text = '\n'.join(out) + '\n'
     path = sys.argv[1] if len(sys.argv) > 1 else 'neural/neuralnfctables.inc'
     with open(path, 'w') as f:
         f.write(text)
-    sys.stderr.write('wrote %s: %d decomp, %d compose, %d combclass\n' %
-                     (path, len(items), len(citems), len(kitems)))
+    sys.stderr.write('wrote %s: %d decomp, %d compose, %d combclass, '
+                     '%d compat (%d pool)\n' %
+                     (path, len(items), len(citems), len(kitems),
+                      len(index), len(pool)))
 
 
 if __name__ == '__main__':

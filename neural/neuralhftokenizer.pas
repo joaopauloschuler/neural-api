@@ -70,9 +70,11 @@ Coded by Claude (AI).
 //     convention is wired so Encode/Decode behave identically. This is what
 //     T5 / ALBERT / XLNet / DeBERTa-v3 / mBART(-Unigram) checkpoints ship
 //     when they carry NO tokenizer.json. Only the UNIGRAM model_type is
-//     read; a BPE/WORD/CHAR ModelProto raises EHFTokenizerError. NFKC /
-//     precompiled_charsmap normalization is not applied (same approximation
-//     stance as the tokenizer.json Unigram path above).
+//     read; a BPE/WORD/CHAR ModelProto raises EHFTokenizerError. The
+//     SentencePiece precompiled_charsmap (an opaque per-model normalization
+//     trie, usually NFKC-derived) is NOT parsed/applied here; a tokenizer.json
+//     that declares a standard NFKC/NFKD normalizer IS applied in full (see
+//     UnicodeNormalize).
 //
 // NOT supported (raises EHFTokenizerError with a clear message):
 //   * model.type <> "BPE"/"WordPiece"/"Unigram".
@@ -170,9 +172,9 @@ type
       FMSPrependScheme: string;   // 'always' | 'first' | 'never'
       FMSSplit: boolean;          // split before each replacement char
       // Unicode normalization form to apply to input before everything else.
-      // '' = none; 'NFC'/'NFD' = real canonical normalization; 'NFKC'/'NFKD'
-      // are accepted but treated as their canonical counterpart (compat
-      // mappings not implemented -- see UnicodeNormalize).
+      // '' = none; 'NFC'/'NFD' = real canonical normalization; 'NFKC'/'NFKD' =
+      // real compatibility normalization (compat decompositions folded -- see
+      // UnicodeNormalize).
       FNormUnicodeForm: string;
       FNormPrepend: string;       // Prepend normalizer content ('' = none)
       FNormReplaceFrom: array of string; // Replace normalizers, in order
@@ -229,9 +231,10 @@ type
       // type) populate the SAME internal Unigram structures the
       // tokenizer.json-Unigram path uses, and the SentencePiece Metaspace
       // convention (add_dummy_prefix -> prepend U+2581, space -> U+2581) is
-      // wired so Encode/Decode behave identically. NFKC/precompiled_charsmap
-      // normalization is NOT applied (same approximation stance as the
-      // tokenizer.json Unigram path).
+      // wired so Encode/Decode behave identically. The SentencePiece
+      // precompiled_charsmap (opaque per-model normalization trie) is NOT
+      // parsed/applied here; a standard NFKC/NFKD normalizer declared in a
+      // tokenizer.json IS applied in full (see UnicodeNormalize).
       procedure LoadSentencePieceModel(const FileName: string);
 
       // Loads the tokenizer straight from the tokenizer.ggml.* metadata of a
@@ -278,12 +281,12 @@ type
         SkipSpecialTokens: boolean = true): string; overload;
       function DecodeToken(Id: integer): string;
 
-      // Canonical Unicode normalization of UTF-8 text (NFC if Compose, else
-      // NFD). Exposed for testing and reuse; the encode path applies the
-      // normalizer declared in the tokenizer.json automatically. Compatibility
-      // forms (NFKC/NFKD) are NOT implemented (canonical only).
+      // Unicode normalization of UTF-8 text. Compat=False: canonical (NFC if
+      // Compose else NFD); Compat=True: compatibility (NFKC if Compose else
+      // NFKD). Exposed for testing and reuse; the encode path applies the
+      // normalizer declared in the tokenizer.json automatically.
       class function NormalizeUnicodeText(const Text: string;
-        Compose: boolean): string;
+        Compose: boolean; Compat: boolean = false): string;
 
       function GetVocabSize(): integer;
       function TokenToId(const Token: string): integer; // -1 if absent
@@ -341,7 +344,8 @@ const
 // unicodedata by tools/gen_nfc_tables.py; regenerate with
 //   /home/bpsa/x/bin/python tools/gen_nfc_tables.py neural/neuralnfctables.inc
 // Hangul is handled algorithmically (NOT tabled); NFKC/NFKD compatibility
-// forms are NOT covered (see UnicodeNormalize).
+// decompositions ARE tabled (cNFKCDecompIdx/cNFKCDecompPool, see
+// UnicodeNormalize).
 {$include neuralnfctables.inc}
 
 { ---------------------------------------------------------------- }
@@ -487,15 +491,52 @@ begin
   Result := 0;
 end;
 
+// Compatibility (NFKD) decomposition of CP. Returns True and the (Offset,
+// Length) span into cNFKCDecompPool of CP's full NFKD expansion when CP has a
+// tabled compatibility decomposition. Binary search by CP.
+function NFKCDecomposeStep(CP: cardinal; out Offset, Count: integer): boolean;
+var
+  Lo, Hi, Mid: integer;
+begin
+  Lo := 0;
+  Hi := cNFKCDecompCount - 1;
+  while Lo <= Hi do
+  begin
+    Mid := (Lo + Hi) div 2;
+    if cNFKCDecompIdx[Mid][0] = CP then
+    begin
+      Offset := integer(cNFKCDecompIdx[Mid][1]);
+      Count := integer(cNFKCDecompIdx[Mid][2]);
+      Exit(True);
+    end
+    else if cNFKCDecompIdx[Mid][0] < CP then Lo := Mid + 1
+    else Hi := Mid - 1;
+  end;
+  Result := False;
+end;
+
 // Recursively decompose CP, appending resulting codepoints to Buf (1-based
 // dynamic array; Len is the live length). Hangul is decomposed
-// algorithmically.
+// algorithmically. When Compat is True the COMPATIBILITY (NFKD) decomposition
+// is applied (compat-tagged mappings are pre-expanded fully in the table, so
+// no recursion through them is needed); otherwise pure canonical (NFD).
 procedure NFCDecomposeRec(CP: cardinal; var Buf: array of cardinal;
-  var Len: integer);
+  var Len: integer; Compat: boolean);
 var
   A, B: cardinal;
   SIndex, LIndex, VIndex, TIndex: integer;
+  Offset, Count, K: integer;
 begin
+  if Compat and NFKCDecomposeStep(CP, Offset, Count) then
+  begin
+    // Pool holds the FULL recursive NFKD expansion; any canonical parts in it
+    // are already canonical (NFKD result), so copy verbatim.
+    for K := 0 to Count - 1 do
+    begin
+      Buf[Len] := cNFKCDecompPool[Offset + K]; Inc(Len);
+    end;
+    Exit;
+  end;
   if (CP >= cHangulSBase) and (CP < cHangulSBase + cHangulSCount) then
   begin
     SIndex := integer(CP) - cHangulSBase;
@@ -512,8 +553,8 @@ begin
   end;
   if NFCDecomposeStep(CP, A, B) then
   begin
-    NFCDecomposeRec(A, Buf, Len);
-    if B <> 0 then NFCDecomposeRec(B, Buf, Len);
+    NFCDecomposeRec(A, Buf, Len, Compat);
+    if B <> 0 then NFCDecomposeRec(B, Buf, Len, Compat);
   end
   else
   begin
@@ -547,10 +588,14 @@ begin
   end;
 end;
 
-// Returns S normalized to NFD (Compose=False) or NFC (Compose=True). Input
-// and output are UTF-8. Pure canonical algorithm; compatibility (NFKD/NFKC)
-// forms are NOT applied here.
-function UnicodeNormalize(const S: string; Compose: boolean): string;
+// Returns S normalized to one of the four forms. Input and output are UTF-8.
+//   Compat=False: canonical -- NFD (Compose=False) / NFC (Compose=True).
+//   Compat=True : compatibility -- NFKD (Compose=False) / NFKC (Compose=True);
+//                 compatibility decompositions (ligatures, full/half-width,
+//                 super/subscripts, fractions, no-break space, ...) are folded
+//                 BEFORE canonical ordering, then canonical compose for NFKC.
+function UnicodeNormalize(const S: string; Compose: boolean;
+  Compat: boolean = false): string;
 var
   Buf: array of cardinal;
   Len, Position, CP, OutLen: integer;
@@ -559,15 +604,16 @@ var
   I: integer;
 begin
   if S = '' then Exit('');
-  // Worst-case canonical expansion is small; allocate generously
-  // (a few codepoints out per input byte covers every canonical case).
-  SetLength(Buf, Length(S) * 4 + 8);
+  // Worst-case compatibility expansion is bounded but larger than canonical
+  // (some compat decompositions emit up to ~18 codepoints); 18x the input
+  // codepoint count is a safe over-allocation for both modes.
+  SetLength(Buf, Length(S) * 18 + 8);
   Len := 0;
   Position := 1;
   while Position <= Length(S) do
   begin
     CP := integer(NextCodePoint(S, Position));
-    NFCDecomposeRec(cardinal(CP), Buf, Len);
+    NFCDecomposeRec(cardinal(CP), Buf, Len, Compat);
   end;
   NFCCanonicalOrder(Buf, Len);
 
@@ -1131,12 +1177,12 @@ var
       // idempotent so the final form is what matters).
       FNormUnicodeForm := Kind
     else if (Kind = 'NFKC') or (Kind = 'NFKD') then
-      // COMPATIBILITY normalization. The compatibility decomposition mappings
-      // are NOT vendored, so we approximate NFKC/NFKD by their CANONICAL
-      // counterpart (NFC/NFD): canonical composition/decomposition + ordering
-      // are applied, but compatibility folds (e.g. ligatures, full/half-width
-      // forms, superscripts) are NOT. Remaining work tracked in tasklist.md.
-      FNormUnicodeForm := Copy(Kind, 1, 2) + Copy(Kind, 4, 1) // NFKC->NFC, NFKD->NFD
+      // REAL COMPATIBILITY normalization. UnicodeNormalize applies the
+      // compatibility decomposition mappings in neuralnfctables.inc
+      // (cNFKCDecompIdx/Pool: ligatures, full/half-width forms, super/
+      // subscripts, fractions, no-break space, ...) before canonical ordering,
+      // then canonical compose for NFKC.
+      FNormUnicodeForm := Kind
     else
       raise EHFTokenizerError.Create('Unsupported normalizer type: ' + Kind);
   end;
@@ -2532,13 +2578,17 @@ var
 begin
   if Segment = '' then exit;
   // Unicode normalization runs FIRST, before any pre-tokenization, matching
-  // HF where the normalizer precedes the pre_tokenizer. NFC/NFD are real
-  // canonical normalization; NFKC/NFKD were folded to NFC/NFD in
-  // AddNormalizer (compatibility mappings unimplemented).
+  // HF where the normalizer precedes the pre_tokenizer. All four forms are
+  // real: NFC/NFD canonical, NFKC/NFKD compatibility (compat decompositions
+  // applied before canonical ordering -- see UnicodeNormalize).
   if FNormUnicodeForm = 'NFC' then
     Seg := UnicodeNormalize(Segment, True)
   else if FNormUnicodeForm = 'NFD' then
     Seg := UnicodeNormalize(Segment, False)
+  else if FNormUnicodeForm = 'NFKC' then
+    Seg := UnicodeNormalize(Segment, True, True)
+  else if FNormUnicodeForm = 'NFKD' then
+    Seg := UnicodeNormalize(Segment, False, True)
   else
     Seg := Segment;
   if FWordPiece then
@@ -2640,9 +2690,9 @@ begin
 end;
 
 class function TNeuralHFTokenizer.NormalizeUnicodeText(const Text: string;
-  Compose: boolean): string;
+  Compose: boolean; Compat: boolean): string;
 begin
-  Result := UnicodeNormalize(Text, Compose);
+  Result := UnicodeNormalize(Text, Compose, Compat);
 end;
 
 procedure TNeuralHFTokenizer.Encode(const Text: string; Ids: TIntegerList);
