@@ -93,32 +93,6 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] Qwen3-MoE importer (BuildQwen3MoeFromSafeTensors[Ex], model_type
-      "qwen3_moe", e.g. Qwen/Qwen3-30B-A3B and the smaller Qwen3-MoE chat
-      checkpoints). This is NOT a near-duplicate of any landed importer: it
-      is the missing CROSS of two paths we already have but never combined.
-      The attention side is the dense Qwen3 path verbatim — per-head
-      TokenRMSNorm on q and k BEFORE RoPE via LoadLlamaHeadRMSNormWeights +
-      GQA ([[qwen3-importer-qknorm]]) — which Mixtral does NOT have (Mixtral
-      is plain Llama-attention MoE), and the FFN side is a sparse top-k
-      Mixture-of-Experts (config num_experts / num_experts_per_tok /
-      moe_intermediate_size, a router gate.weight per layer feeding
-      SwiGLU experts), which the dense Qwen3 importer does NOT have. It is
-      also distinct from DeepSeek-V2/[[deepseek-v2-importer]] (which pairs MoE
-      with MLA latent attention and shared experts, not GQA + QK-norm). Reuse
-      the landed AddTopKMixtureOfExperts / TNNetTopKGate wiring
-      ([[topk-moe-routing]]) exactly as the Mixtral importer
-      (BuildMixtralFromSafeTensors) already does for expert weight loading and
-      router-logit softmax-then-renormalize, only swapping the attention
-      block for the Qwen3 QK-norm+GQA builder; note Qwen3-MoE has NO shared
-      expert and NO per-expert/router bias (norm_topk_prob renormalizes the
-      top-k gates). Verify against a pico fixture sliced down to 2 layers /
-      4 experts / top-2 (tools/make_pico_*_fixture.py recipe,
-      [[pico-import-fixtures]]) with next-token logits parity against
-      transformers in venv x. High value: the Qwen3-MoE family is one of the
-      most widely deployed open sparse-MoE LLMs and currently has no import
-      path, and it lands as almost pure composition of two already-verified
-      subsystems.
 - [ ] Qwen3-MoE importer follow-up (BuildQwen3MoeFromSafeTensors landed in a3,
       commit 6417ce3): v1 supports only the UNIFORM all-MoE stack and rejects
       mixed dense/MoE layers (decoder_sparse_step > 1 or non-empty
@@ -292,61 +266,6 @@ rather than acted on.
       BuildGPT2FromSafeTensors and compare logits; generalize per-importer
       name maps later. The generic writer landed; only the naming/transpose
       mapping (Pascal neuron-major vs HF [in,out] Conv1D) is missing.
-- [X] GGUF WRITER / export path (neural/neuralgguf.pas currently READS only:
-      TNNetGGUFReader F32/F16/Q8_0 + BuildLlamaFromGGUF). Add a
-      TNNetGGUFWriter / SaveNNetToGGUF that emits a llama.cpp-loadable .gguf
-      for an imported-or-trained Llama-family decoder, so CAI models can run
-      in the dominant local-inference ecosystem (llama.cpp / ollama / LM
-      Studio) — the export mirror of the landed reader and the natural
-      interop sibling of the safetensors writer and the separate ONNX-export
-      task (different runtime, F16/Q8_0 quantized output is the headline GGUF
-      can do that ONNX/safetensors do not). The genuinely new work: (a) the
-      ggml binary container — magic/version, the typed key/value metadata
-      block (general.architecture="llama", the llama.* hyperparameters
-      block_count/embedding_length/attention.head_count[_kv]/rope.* /
-      context_length, plus the tokenizer.ggml.* model/tokens/merges/scores/
-      token-type arrays so a single .gguf is self-contained, reusing the
-      vocab already carried by the importers), and (b) the tensor section
-      with ggml's REVERSED dimension order and 32-byte alignment, writing
-      back the HF-canonical names llama.cpp expects (token_embd, blk.N.attn_q/
-      k/v/output, blk.N.ffn_gate/up/down, *_norm, output_norm, output) and
-      UNDOING the importer's rotate_half q/k permutation + SwiGLU up|gate
-      split so a llama.cpp round-trip reproduces logits. v1: F32 + F16 +
-      Q8_0 output (Q8_0 dovetails with the landed int8 weight-only storage —
-      write its blocks straight out instead of re-quantizing). Deliverables:
-      SaveNNetToGGUF[Ex], a tools/verify_gguf_writer.py cross-check that
-      loads the emitted file with the gguf python package (and, when present,
-      llama-cpp-python) and asserts dimensions/metadata and next-token logits
-      vs the Pascal model within tolerance, and a round-trip test that writes
-      a pico-Llama then re-imports it via the landed BuildLlamaFromGGUF and
-      compares logits bit-for-bit. Scope v1 to the Llama family (the
-      best-covered importer path); document other architectures as
-      out-of-scope, same as the ONNX-export task.
-      DONE (a3): TNNetGGUFWriter in neuralgguf.pas (container + typed KV
-      metadata + reversed-dims/32-byte-aligned tensor section, F32/F16/Q8_0
-      encode-on-write) + SaveLlamaToGGUF[Ex] in neuralpretrained.pas (llama.*
-      metadata + self-contained tokenizer.ggml.* block + ggml-canonical
-      names + the rotate_half->interleaved q/k permute, the exact inverse of
-      the reader's de-interleave). TestGGUFWriterRoundTrip: F32 write ->
-      BuildLlamaFromGGUF reproduces logits to <1e-5 (bit-exact modulo FP);
-      Q8_0 drift bounded (pico-width quantization error). tools/
-      verify_gguf_writer.py cross-checks the emitted file with the python
-      gguf package (architecture/metadata/tokenizer + reversed-dims tensor
-      table). v1 SCOPE CUTS (deferred follow-ups):
-        * Source is an HF-named tensor reader + TLlamaConfig (the importer's
-          natural inverse), NOT weight-readback from a trained TNNet's wired
-          layers - exporting an arbitrary in-memory net needs the layer->HF
-          inverse mapping (q/k de-permute, SwiGLU un-fuse) and is open.
-        * Q8_0 is quantized ON WRITE from F32 (ggml quantize_row_q8_0 ref),
-          NOT straight-copied from the int8 weight-only storage - the
-          straight-copy coupling is open.
-        * Only the plain Llama family (separate q/k/v, SwiGLU, single RoPE
-          theta, none/linear scaling); MoE / fused proj / sandwich-post norms
-          / QK-norm / partial-rotary / per-layer theta / soft-capping / embed
-          scale are rejected loudly. merges array also not emitted (SP-style
-          tokenizer.ggml.tokens/scores/token_type only).
-        * Python next-token-logit parity not wired (the Pascal round-trip
-          through BuildLlamaFromGGUF is the logit-exactness gate instead).
 - [ ] GGUF writer follow-up: export an arbitrary trained/in-memory TNNet
       (the layer->HF inverse mapping — q/k de-permute + SwiGLU un-fuse —
       reading weights back out of the WIRED Llama layers) rather than only an
@@ -453,12 +372,6 @@ rather than acted on.
       original_max_position_embeddings. Add a decode-time mode that selects the
       short table for short sequences (or document that the static long import
       is intentional for the 128k use case).
-- [X] Knowledge-distillation EXAMPLE on the landed trainer (TNeuralKDTrainer in
-      neural/neuralkd.pas, commit bff113f): distill an imported pretrained
-      teacher (GPT-2 / TinyStories via the safetensors/torch.bin importers) into
-      a small Pascal-trained student and report student perplexity vs hard-label-
-      only training at matched steps. Pure harness work over the landed trainer +
-      importers; writeup goes in examples/README.md.
 - [ ] CFG follow-up: a full-width-net -> width-1 unconditional-twin auto-clone
       so MakeUnconditionalTwin (commit 48e2fd2) works from a single imported
       model with no hand-built width-1 net. A SaveToString->LoadFromString
@@ -499,14 +412,6 @@ rather than acted on.
       DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in neuralnlpmetrics.pas
       over a real Marian/T5 checkpoint (the Unigram tokenizer these need has
       landed, reading the checkpoint's tokenizer.json).
-- [X] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
-      above): K learnable virtual-token embeddings prepended to the
-      embedding-layer output, base model frozen — K*d_model trainable
-      params, the cheapest fine-tune of an imported checkpoint. Mostly
-      composes existing pieces (a learnable bank + sequence-axis concat);
-      decode side must skip the K virtual positions when detokenizing.
-      Test: base weights bit-unchanged after a training step, soft-prompt
-      gradient nonzero, eval forward deterministic.
 - [ ] Offset-mapping follow-up: EncodeWithOffsets (commit 1e90b8a) is a
       post-hoc surface-match heuristic (each token's DecodeToken surface
       located forward at the running cursor), so it leaves tokens unmapped
@@ -632,15 +537,11 @@ rather than acted on.
       byte-level-BPE variant needs a vocab prefix-scan helper there;
       (b) guidance-style multi-token rollback (back up over more than the
       single last prompt token when the boundary artifact spans merges).
-- [X] HellaSwag-style eval example on an imported checkpoint: a small
-      example program that loads a real imported model (e.g. SmolLM2 /
-      pythia via the safetensors importers), tokenizes a handful of
-      multiple-choice items with TNeuralHFTokenizer and reports acc /
-      acc_norm through EvaluateMultipleChoice (neuralnlpmetrics.pas) —
-      the end-to-end "imported model scores X" demo the landed scoring
-      API was built for. Follow-ups: batch candidates sharing
-      a context prefix; optional last-window scoring for over-context
-      sequences (v1 raises).
+- [ ] HellaSwag-style eval follow-up (the example landed: examples/HellaSwagEval
+      loads an imported checkpoint, tokenizes multiple-choice items with
+      TNeuralHFTokenizer and reports acc / acc_norm through
+      EvaluateMultipleChoice): batch candidates sharing a context prefix;
+      optional last-window scoring for over-context sequences (v1 raises).
 - [ ] Needle-in-a-haystack long-context eval harness: place a fact at
       varying depths in a synthetic long context, measure retrieval
       accuracy vs (depth, context length) as a small grid report. The
