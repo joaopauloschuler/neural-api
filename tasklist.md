@@ -94,34 +94,6 @@ rather than acted on.
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
 - [ ] Import NFC tokenizer
-- [X] Falcon importer (model_type "falcon" / "RefinedWeb" / "RefinedWebModel",
-      e.g. tiiuae/falcon-7b or the tiny falcon-rw-1b sibling): a canonical open
-      decoder family with a genuinely DISTINCT recipe not covered by any landed
-      importer. The defining pieces: (a) FUSED multi-query QKV — a single
-      `query_key_value` slab packs all query heads plus ONE shared K head and
-      ONE shared V head (new_decoder_architecture=false / multi_query=true on
-      falcon-7b), or num_kv_heads GQA groups interleaved per group on the
-      "new" architecture (falcon-40b) — the fan-out of one cached K/V across
-      all query heads is the novel slicing vs GPT-NeoX's plain 3-way split;
-      (b) PARALLEL attention+MLP residual (x + Attn(ln(x)) + MLP(ln(x))) — the
-      landed AddParallelTransformerBlock already does this, but Falcon toggles
-      between a SINGLE shared input_layernorm (parallel_attn, falcon-7b) and
-      TWO separate norms ln_attn/ln_mlp (new arch) and that config branch must
-      be wired; (c) plain LayerNorm (NOT RMSNorm), RoPE, GELU MLP, and NO
-      biases anywhere (bias=false). Nearly everything exists — RoPE, GQA head
-      plumbing, LayerNorm, the parallel-residual builder, KV-cache decode — so
-      the genuinely new work is the fused-QKV multi-query weight slicing
-      (map one K/V head onto the existing per-head K/V projections via
-      aliasing) and the single-vs-dual-layernorm config switch. Deliverables:
-      BuildFalconFromSafeTensors[Ex] (multi-shard index.json support; .bin
-      fallback via TNNetTorchBinReader since falcon-rw checkpoints ship
-      pytorch_model.bin), a tools/falcon_tiny_fixture.py pico fixture (tiny
-      random falcon config covering BOTH multi_query and new_decoder_architecture
-      branches, asserting next-token logits vs an HF float64 oracle), and a
-      "falcon"/"RefinedWebModel" dispatch in BuildFromPretrained. Distinct from
-      the landed BuildGPTNeoXFromSafeTensors (3-way interleaved qkv, partial
-      rotary) and BuildBloomFromSafeTensors (ALiBi, no RoPE); fills the most
-      conspicuous remaining gap in the open-decoder importer roster.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
@@ -378,23 +350,11 @@ rather than acted on.
       neuralnlpmetrics.pas are both waiting on the Unigram/SentencePiece
       tokenizer for real Marian/T5 checkpoints - wire an examples/ entry
       (and an examples/README.md mention) once that lands.
-- [X] Masked-LM data collator (transformers DataCollatorForLanguageModeling
-      port): BERT-style dynamic masking — pick 15% of tokens, replace 80%
-      with [MASK] / 10% random / 10% unchanged, loss only on masked
-      positions. Everything in the current NLP stack is
-      causal-LM; one collator unit unlocks encoder pretraining with the
-      existing AddTransformerEncoderBlock, no new layers. Test: masked
-      fraction and 80/10/10 split within tolerance at fixed seed; loss
-      ignores unmasked positions exactly.
-      DONE: TNNetMaskedLMCollator in neuraldatasets.pas (seedable internal LCG
-      RNG; csMaskedLMIgnoreLabel=-1 ignore convention; Collate /
-      BuildTrainingPair / ApplyLossMask mirroring TNNetSequencePacker's
-      e=Output-Desired loss-mask contract); tests in
-      tests/TestNeuralMaskedLM.pas (7 tests, registered in RunTests.pas).
-      - [ ] Stretch deferred: whole-word masking (group subword pieces of one
-            word and mask them together).
-      - [ ] Stretch deferred: T5 span corruption with sentinel tokens
-            (contiguous-span masking, sentinel id stream).
+- [ ] Masked-LM collator follow-up (TNNetMaskedLMCollator is landed in
+      neuraldatasets.pas): whole-word masking (group subword pieces of one
+      word and mask them together).
+- [ ] Masked-LM collator follow-up: T5 span corruption with sentinel tokens
+      (contiguous-span masking, sentinel id stream).
 - [ ] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
       above): K learnable virtual-token embeddings prepended to the
       embedding-layer output, base model frozen — K*d_model trainable
@@ -419,14 +379,6 @@ rather than acted on.
       projections; pairs with the offset-mapping utility from the
       token-classification task to map spans back to text. Test: pinned
       logits → pinned extracted span.
-- [X] chrF metric in neural/neuralnlpmetrics.pas: character n-gram F-score
-      (Popović 2015) — tokenizer-independent so it sidesteps the BLEU
-      tokenization sensitivity, ~100 lines beside the landed BLEU/ROUGE.
-      ChrF/ChrFpp/CorpusChrF; sacrebleu's CHRF aggregation (per-order F
-      averaged) + default whitespace stripping; returns 0..1 (=sacrebleu/100).
-      - [X] chrF++ (word unigrams+bigrams via WordOrder arg) landed too.
-      Pinned against a hand-written char-ngram reference reproducing
-      sacrebleu (sacrebleu not installed in the env).
 - [ ] Strided sliding-window perplexity in neural/neuralnlpmetrics.pas
       (the HF-docs-standard evaluation): for corpora longer than the model
       context, slide a window with stride < window and score only the
@@ -475,25 +427,9 @@ rather than acted on.
       destination layer — or straight into the landed int8 storage —
       keeping only one tensor-sized scratch buffer. Assert peak RSS during import
       stays within tensor-size + model-size on the parity fixture.
-- [X] NumPy .npy/.npz reader + writer: the universal interchange escape
-      hatch — ANY framework can np.savez(**state_dict), and the format is
-      trivial (magic + header dict + raw bytes; npz is a zip of npy).
-      Reader gives a generic named-tensor import path for frameworks with
-      no safetensors export; WRITER doubles as fixture tooling for parity
-      tests (dump Pascal tensors, compare in Python), complementing the
-      landed safetensors writer. Support F32/F64/F16 + int dtypes, C-order only, reject
-      Fortran-order/pickled-object arrays explicitly.
-      LANDED: neural/neuralnumpy.pas (LoadVolumeFromNpy/SaveVolumeToNpy +
-      TNNetNpzReader/TNNetNpzWriter), EncodeF16 here / DecodeF16 reused from
-      neuralsafetensors. .npy v1/2/3 headers; dtypes f4/f8/f2, i1/i2/i4/i8,
-      u1/u2/u4/u8, b1; big-endian/Fortran-order/object dtypes rejected. .npz
-      reader handles STORED + DEFLATE (paszlib/zstream); WRITER is STORED-only
-      (np.savez parity; np.savez_compressed not emitted). tests/TestNeuralNumpy
-      + bidirectional numpy cross-check (tools/numpy_crosscheck_fixture.py,
-      tiny committed fixtures). 1-D/2-D map naturally to volume dims; 3-D+ load
-      flat (caller reshapes from the returned numpy shape).
-      - [ ] follow-up: DEFLATE-compressed .npz WRITER (savez_compressed) +
-            zip64 / >4GB archive support (reader currently rejects zip64).
+- [ ] NumPy .npz follow-up (neural/neuralnumpy.pas reader/writer landed; WRITER
+      is STORED-only): DEFLATE-compressed .npz WRITER (savez_compressed) +
+      zip64 / >4GB archive support (reader currently rejects zip64).
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
       the GPT-Neo route; the published pytorch_model.bin-only checkpoints
@@ -593,15 +529,6 @@ rather than acted on.
       byte-level-BPE variant needs a vocab prefix-scan helper there;
       (b) guidance-style multi-token rollback (back up over more than the
       single last prompt token when the boundary artifact spans merges).
-- [X] Weighted top-k sampler with HF semantics: TNNetSamplerTopK draws
-      UNIFORMLY among the top K instead of by renormalized probability
-      (long-standing gotcha; examples/GPT2Import and examples/ChatTerminal
-      hand-roll around it, and seq2seq sampled decode inherits it). Add a
-      probability-weighted top-k sampler in neuralvolume (or fix
-      TNNetSamplerTopK behind a flag, default unchanged for
-      reproducibility), switch the hand-rolled call sites to it, and pin a
-      distribution test (chi-square or fixed-seed draw sequence) proving
-      weighted-vs-uniform differ on a skewed 3-token head.
 - [ ] HellaSwag-style eval example on an imported checkpoint: a small
       example program that loads a real imported model (e.g. SmolLM2 /
       pythia via the safetensors importers), tokenizes a handful of
@@ -611,15 +538,6 @@ rather than acted on.
       API was built for. Follow-ups: batch candidates sharing
       a context prefix; optional last-window scoring for over-context
       sequences (v1 raises).
-- [X] Generation-quality / degeneration metrics in neuralnlpmetrics.pas:
-      distinct-n (Li et al. 2016), self-BLEU (reuses the landed
-      CorpusBLEU), and repetition rate — the standard degeneration suite.
-      DistinctN/RepetitionRate(=1-distinct-n)/RepeatedTokenRate/SelfBLEU
-      (dual token-id+string APIs); self-BLEU averages single-ref CorpusBLEU
-      of each generation vs every other (multi-ref clip deferred, v1).
-      The contrastive-search and sampling tasks elsewhere in this list
-      have no way to demonstrate their benefit without these. Pinned
-      hand-computable fixtures (e.g. "a a a a" distinct-1 = 1/4).
 - [ ] Needle-in-a-haystack long-context eval harness: place a fact at
       varying depths in a synthetic long context, measure retrieval
       accuracy vs (depth, context length) as a small grid report. The
