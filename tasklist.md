@@ -123,7 +123,7 @@ rather than acted on.
       mixed image+text prompt vs HF float64, and an examples/LlavaDescribe
       demo that captions a small image on CPU. First image-in/text-out
       model in the repo; opens the door to Qwen-VL/PaliGemma later.
-- [ ] Cohere Command-R / Aya importer (BuildCohereFromSafeTensors[Ex],
+- [X] Cohere Command-R / Aya importer (BuildCohereFromSafeTensors[Ex],
       model_type "cohere", and the "cohere2" Command-R7B variant): the leading
       open MULTILINGUAL instruct family (C4AI Command-R, Aya-Expanse-8B,
       Command-R7B), absent from the landed importer set and architecturally
@@ -148,6 +148,35 @@ rather than acted on.
       short multilingual-generation snippet in the importer example. Closes the
       last big mainstream decoder gap and validates logit_scale handling reusable
       for future families.
+      DONE (a3): BuildCohereFromSafeTensors[Ex]/WithConfig on a DEDICATED
+      parallel-residual builder (NOT the Llama path - too many fundamental
+      differences). Key findings vs the simplified task spec, all verified
+      against HF modeling_cohere/cohere2: (1) Cohere's norm is a TRUE
+      mean-subtracting LayerNorm (CohereLayerNorm), bias-free weight-only ->
+      TNNetTokenLayerNorm with beta forced to 0 (NOT TNNetLayerNorm/SuppressBias,
+      NOT RMSNorm); a small LoadCohereLayerNormWeights helper loads gamma only.
+      (2) RoPE is the GPT-J INTERLEAVED pair layout (rotate_half = even/odd
+      stack + repeat_interleave(freqs,2)) = TNNetRotaryEmbedding's NATIVE layout,
+      so q/k rows load STRAIGHT (RotaryHeadDim=0, NO rotate_half permutation -
+      OPPOSITE of the Llama/NeoX half-split path). (3) logit_scale folds into the
+      tied LM-head weight rows (logits = (h.embed^T)*scale; exact since bias-free
+      and tied). (4) cohere qk_norm is a PER-HEAD mean-subtracting CohereLayerNorm
+      over head_dim with PER-HEAD DISTINCT gains. (5) cohere2 CRUCIAL: RoPE is
+      applied ONLY on the sliding (local) layers - the GLOBAL layers use NoPE (no
+      positional embedding at all); cohere2 has NO qk_norm. Fixtures
+      tools/cohere_tiny_fixture.py -> tests/fixtures/tiny_cohere{,2}.* (synthetic
+      config-faithful random-weight pico checkpoints cross-checked against HF's
+      own float64 forward; HF std-0.02 init is vacuous at pico scale so weights
+      re-randomized to O(1), every delta asserted non-vacuous). Tests
+      TestCohereConfigFromJSONFile / TestCohereLogitParity / TestCohere2LogitParity
+      in TestNeuralPretrained.pas: max |logit diff| 3.96e-7 (cohere) / 2.15e-7
+      (cohere2) vs the float64 oracle (gate 1e-4). Dispatch wired in
+      BuildFromPretrained; multilingual session snippet added to
+      examples/ChatTerminal/README.md. Follow-up: a REAL-checkpoint slicer for
+      Aya-Expanse-8B / Command-R7B (like slice_llama.py) would add real-weight
+      parity on top of the synthetic fixture; order_of_interleaved_layers (legacy
+      cohere2 spelling) maps to sliding_window_pattern but was not seen in a
+      published config, so only sliding_window_pattern is read.
 - [ ] DeBERTa-v3 importer + disentangled attention (BuildDebertaV2FromSafeTensors,
       model_type "deberta-v2"): the dominant small-encoder family for
       NLU/classification/NER/reranking (deberta-v3-base/small, the ms-marco

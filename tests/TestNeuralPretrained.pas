@@ -168,6 +168,9 @@ type
     procedure TestFalconNewArchLogitParity;
     procedure TestGPTJConfigFromJSONFile;
     procedure TestGPTJLogitParity;
+    procedure TestCohereConfigFromJSONFile;
+    procedure TestCohereLogitParity;
+    procedure TestCohere2LogitParity;
     procedure TestPhiConfigFromJSONFile;
     procedure TestPhiLogitParity;
     procedure TestPhi3LogitParity;
@@ -5022,6 +5025,151 @@ begin
     AssertEquals('prefix', 'transformer.', Config.Prefix);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gptj_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestCohereConfigFromJSONFile;
+var
+  Config: TCohereConfig;
+begin
+  RandSeed := 424242;
+  Config := ReadCohereConfigFromJSONFile(
+    FixturePath('tiny_cohere_config.json'));
+  AssertEquals('model_type', 'cohere', Config.ModelType);
+  AssertEquals('hidden_size', 8, Config.HiddenSize);
+  AssertEquals('intermediate_size', 12, Config.IntermediateSize);
+  AssertEquals('layers', 3, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('kv_heads (MQA)', 1, Config.NumKVHeads);
+  AssertEquals('head_dim', 4, Config.HeadDim);
+  AssertEquals('vocab', 13, Config.VocabSize);
+  AssertEquals('max_pos', 16, Config.MaxPositions);
+  AssertEquals('layer_norm_eps', 1e-5, Config.LayerNormEps, 1e-9);
+  AssertEquals('rope_theta', 1000.0, Config.RopeTheta, 1e-6);
+  AssertEquals('logit_scale', 0.0625, Config.LogitScale, 1e-9);
+  AssertTrue('tied (Cohere ties)', Config.TieWordEmbeddings);
+  AssertTrue('use_qk_norm', Config.UseQKNorm);
+  AssertEquals('no sliding pattern (cohere)', 0,
+    Config.SlidingWindowPattern);
+end;
+
+// Verifies the Cohere import: tests/fixtures/tiny_cohere.* is a pico
+// randomly-initialized HF CohereForCausalLM (3 layers, 2 heads / 1 kv head
+// x 4 dims, hidden 8, vocab 13) covering the Cohere deltas: SHARED-LN
+// PARALLEL residual (x + Attn(LN(x)) + MLP(LN(x))), mean-subtracting
+// bias-free CohereLayerNorm, logit_scale=0.0625 folded into the tied LM
+// head, INTERLEAVED RoPE (rows loaded straight, no rotate_half permute),
+// MQA GQA sharing, and PER-HEAD q_norm/k_norm CohereLayerNorm pre-RoPE.
+// The generator tools/cohere_tiny_fixture.py asserts logit_scale and the
+// qk_norm gains both change the logits. Reference logits come from HF
+// transformers in float64.
+procedure TTestNeuralPretrained.TestCohereLogitParity;
+var
+  NN: TNNet;
+  Config: TCohereConfig;
+  LayerCnt, SDPACnt, LNCnt: integer;
+  SDPA: TNNetScaledDotProductAttention;
+begin
+  RandSeed := 424242;
+  NN := BuildCohereFromSafeTensorsEx(
+    FixturePath('tiny_cohere.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_cohere_config.json'));
+  try
+    AssertEquals('model_type', 'cohere', Config.ModelType);
+    AssertEquals('layers', 3, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('head_dim', 4, Config.HeadDim);
+    AssertEquals('logit_scale', 0.0625, Config.LogitScale, 1e-9);
+    AssertTrue('use_qk_norm', Config.UseQKNorm);
+    AssertTrue('tied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    // Structure: cohere = full attention + RoPE everywhere (no window).
+    // LayerNorm count: 1 input LN per block + 1 final + per-head q/k norms
+    // (2 q + 1 k per block, MQA) = 3 + 1 + 3*3 = 13 TNNetTokenLayerNorm.
+    SDPACnt := 0;
+    LNCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+      begin
+        SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
+        AssertEquals('SDPA head ' + IntToStr(SDPACnt) +
+          ' full attention (no window)', 0, SDPA.Window);
+        Inc(SDPACnt);
+      end;
+      if NN.Layers[LayerCnt].ClassType = TNNetTokenLayerNorm then
+        Inc(LNCnt);
+    end;
+    AssertEquals('SDPA heads (3 layers x 2 q heads)', 6, SDPACnt);
+    AssertEquals('TokenLayerNorm count (3 input + 1 final + 9 qk)', 13,
+      LNCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_cohere_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the cohere2 (Command-R7B) import: tests/fixtures/tiny_cohere2.*
+// is a pico HF Cohere2ForCausalLM (4 layers, 2 heads / 1 kv head x 4 dims,
+// hidden 8, vocab 13) with the alternating sliding/global pattern AND the
+// cohere2 distinction that RoPE is applied ONLY on the SLIDING layers (the
+// global layers are NoPE). sliding_window=4, sliding_window_pattern=4 ->
+// layers 0,1,2 sliding (windowed, RoPE) and layer 3 global (full
+// attention, NO RoPE). No qk_norm. Reference logits from HF in float64.
+procedure TTestNeuralPretrained.TestCohere2LogitParity;
+var
+  NN: TNNet;
+  Config: TCohereConfig;
+  LayerCnt, SDPACnt, RoPECnt: integer;
+  SDPA: TNNetScaledDotProductAttention;
+begin
+  RandSeed := 424242;
+  NN := BuildCohereFromSafeTensorsEx(
+    FixturePath('tiny_cohere2.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_cohere2_config.json'));
+  try
+    AssertEquals('model_type', 'cohere2', Config.ModelType);
+    AssertEquals('layers', 4, Config.NumLayers);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertFalse('no qk_norm (cohere2)', Config.UseQKNorm);
+    AssertEquals('sliding_window', 4, Config.SlidingWindow);
+    AssertEquals('sliding_window_pattern', 4, Config.SlidingWindowPattern);
+    AssertEquals('logit_scale', 0.0625, Config.LogitScale, 1e-9);
+    // layers 0,1,2 local (Window=4) + RoPE; layer 3 global (Window=0) NoPE.
+    // RoPE layers: q+k per local layer = (2 q + 1 kv) per layer x 3 local
+    // layers = 9 TNNetRotaryEmbedding; the global layer has NONE.
+    SDPACnt := 0;
+    RoPECnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+      begin
+        SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
+        if SDPACnt < 3 * Config.NumHeads then
+          AssertEquals('local SDPA head ' + IntToStr(SDPACnt) +
+            ' window', 4, SDPA.Window)
+        else
+          AssertEquals('global SDPA head ' + IntToStr(SDPACnt) +
+            ' window (full)', 0, SDPA.Window);
+        Inc(SDPACnt);
+      end;
+      if NN.Layers[LayerCnt].ClassType = TNNetRotaryEmbedding then
+        Inc(RoPECnt);
+    end;
+    AssertEquals('SDPA heads (4 layers x 2 q heads)', 8, SDPACnt);
+    AssertEquals('RoPE layers (3 local x (2 q + 1 kv); global NoPE)', 9,
+      RoPECnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_cohere2_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;

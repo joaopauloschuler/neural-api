@@ -1192,6 +1192,64 @@ function BuildGPTJFromSafeTensors(const FileName: string;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
+  TCohereConfig = record
+    HiddenSize: integer;        // d_model (hidden_size)
+    IntermediateSize: integer;  // SwiGLU MLP width (intermediate_size)
+    NumLayers: integer;         // decoder blocks (num_hidden_layers)
+    NumHeads: integer;          // query heads (num_attention_heads)
+    NumKVHeads: integer;        // K/V heads (num_key_value_heads; GQA/MQA)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings (context length)
+    HeadDim: integer;           // per-head width; 0 = hidden_size/num_heads
+    LayerNormEps: TNeuralFloat; // layer_norm_eps
+    RopeTheta: TNeuralFloat;    // rope_theta (RoPE base)
+    LogitScale: TNeuralFloat;   // logit_scale (final logits *= it; folded
+                                // into the tied LM-head rows at load)
+    TieWordEmbeddings: boolean; // tie_word_embeddings (Cohere: TRUE)
+    UseQKNorm: boolean;         // per-head q/k LayerNorm pre-RoPE (cohere
+                                // only; CohereLayerNorm = mean-subtracting)
+    ModelType: string;          // 'cohere' or 'cohere2'
+    SlidingWindow: integer;     // cohere2 sliding-window width (0 = cohere)
+    SlidingWindowPattern: integer; // cohere2: every Nth layer global, the
+                                // rest local AND RoPE only on local layers
+                                // (global = NoPE); 0 = cohere (full + RoPE)
+    Prefix: string;             // tensor-name prefix ('model.' or '')
+  end;
+
+// Reads a HF Cohere config.json (model_type 'cohere' or 'cohere2').
+// Required: hidden_size, intermediate_size, num_hidden_layers,
+// num_attention_heads, vocab_size, max_position_embeddings. Defaults:
+// num_key_value_heads = num_attention_heads, layer_norm_eps = 1e-5,
+// rope_theta = 10000, logit_scale = 0.0625, tie_word_embeddings = true,
+// use_qk_norm = false. cohere2 adds sliding_window (4096) and
+// sliding_window_pattern (4); attention_bias=true and any non-silu
+// hidden_act are rejected. See the COHERE IMPORT section.
+function ReadCohereConfigFromJSONFile(const FileName: string): TCohereConfig;
+
+function CohereConfigToString(const Config: TCohereConfig): string;
+
+// Builds the Cohere Command-R / Aya (model_type 'cohere') or Command-R7B
+// ('cohere2') decoder and loads every weight from FileName. The net takes a
+// (SeqLen,1,1) volume of token ids and outputs (SeqLen,1,vocab) logits
+// already scaled by logit_scale (folded into the tied LM head). See the
+// COHERE IMPORT section for the architecture mapping. pSeqLen/pInferenceOnly/
+// pQuantizeInt8 behave as on the Llama path.
+function BuildCohereFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TCohereConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildCohereFromSafeTensorsEx(const FileName: string;
+  out Config: TCohereConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildCohereFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+type
   TPhiConfig = record
     HiddenSize: integer;        // d_model (hidden_size)
     IntermediateSize: integer;  // MLP width (intermediate_size)
@@ -6617,6 +6675,611 @@ var
   IgnoredConfig: TGPTJConfig;
 begin
   Result := BuildGPTJFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ============================ COHERE IMPORT ================================
+//
+// BuildCohereFromSafeTensors rebuilds Cohere's Command-R / Aya decoder
+// (model_type "cohere") and the Command-R7B variant (model_type "cohere2").
+// This is the leading open MULTILINGUAL instruct family (C4AI Command-R,
+// Aya-Expanse-8B, Command-R7B). It is NOT a Llama clone - the genuinely new
+// pieces, all verified against HF modeling_cohere / modeling_cohere2:
+//
+//  (a) PARALLEL residual: ONE input LayerNorm feeds BOTH the attention and
+//      the MLP branch, and a single fused 3-input sum closes the block:
+//         x := x + Attn(LN(x)) + MLP(LN(x))
+//      exactly the GPT-J/GPT-NeoX parallel-residual path reused here.
+//  (b) Cohere's norm is a TRUE LayerNorm (mean-subtracting), bias-free and
+//      weight-only (CohereLayerNorm: (x-mean)/sqrt(var+eps)*weight, no beta).
+//      -> TNNetTokenLayerNorm with the beta neuron left at zero (only the
+//      gamma vector is loaded). This is distinct from the Llama families'
+//      TNNetTokenRMSNorm (no mean subtraction).
+//  (c) a scalar logit_scale multiplies the final logits before softmax
+//      (HF: logits = (h . embed^T) * logit_scale). The embeddings are tied,
+//      so logit_scale is folded into every LM-head weight row at load (the
+//      same idiom as Gemma's query_pre_attn_scalar / embed-scale folding) -
+//      the head alone reproduces the scaled logits.
+//  (d) tied input/output embeddings, NO attention/MLP biases (attention_bias
+//      defaults false; the MLP and o_proj are plain bias-free nn.Linear).
+//  (e) RoPE is FULL-head and uses the GPT-J INTERLEAVED pair layout
+//      (rotate_half = stack(-x[1::2], x[0::2]); repeat_interleave(freqs,2)),
+//      which is TNNetRotaryEmbedding's NATIVE (even/odd) layout - so the
+//      q/k projection rows load STRAIGHT (RotaryHeadDim=0, NO rotate_half
+//      row permutation, opposite of the Llama/NeoX half-split path).
+//  (f) GQA (num_key_value_heads <= num_attention_heads): each KV head is
+//      projected and rotated once, then shared across its query-head group.
+//  (g) cohere ONLY (Config.UseQKNorm): per-head q_norm/k_norm are
+//      CohereLayerNorm over head_dim with PER-HEAD DISTINCT gains (weight
+//      shape [num_heads, head_dim] / [num_kv_heads, head_dim]), applied
+//      AFTER the projection and BEFORE RoPE (HF: "main diff from Llama").
+//      Mean-subtracting -> a per-head TNNetTokenLayerNorm (NOT TokenRMSNorm).
+//  (h) cohere2 ONLY: an alternating sliding-window / global attention
+//      pattern (Config.SlidingWindowPattern, every Nth layer global, the
+//      rest local) AND - crucially - RoPE is applied ONLY on the SLIDING
+//      layers; the GLOBAL layers use NoPE (no positional embedding at all,
+//      HF: `if self.sliding_window is not None: apply_rotary_pos_emb`).
+//      cohere2 has NO qk_norm.
+//
+// The MLP is the standard SwiGLU (down(silu(gate(x)) * up(x))). TNNetSwiGLU
+// computes FIRSTHALF * Swish(SECONDHALF), so the fused gate/up projection
+// holds up_proj in neurons 0..I-1 and gate_proj in I..2I-1.
+//
+// The net takes a (SeqLen,1,1) volume of token ids and outputs
+// (SeqLen,1,vocab) logit_scale-scaled logits, matching the other decoder
+// importers' causal-LM contract. .bin checkpoints dispatch through the same
+// TNNetTorchBinReader path (CreatePretrainedTensorReader) and multi-shard
+// .index.json is handled by the reader, like every importer in this unit.
+// Coded by Claude (AI).
+
+function ReadCohereConfigFromJSONFile(const FileName: string): TCohereConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+  Field: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Cohere import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Cohere import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Cohere import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Cohere import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Cohere import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'cohere');
+    if (ModelType <> 'cohere') and (ModelType <> 'cohere2') then
+      ImportError('Cohere import: config model_type is "' + ModelType +
+        '" - expected "cohere" or "cohere2".');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    // num_key_value_heads defaults to num_attention_heads (no GQA).
+    Field := Obj.Find('num_key_value_heads');
+    if (Field = nil) or Field.IsNull then
+      Result.NumKVHeads := Result.NumHeads
+    else
+      Result.NumKVHeads := RequiredInt('num_key_value_heads');
+    // head_dim is implicit in every published Cohere config.
+    Field := Obj.Find('head_dim');
+    if (Field = nil) or Field.IsNull then
+      Result.HeadDim := 0
+    else
+      Result.HeadDim := RequiredInt('head_dim');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-5);
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    // logit_scale: CohereConfig default 0.0625 (Command-R) - always present
+    // in the published configs, but keep the documented default.
+    Result.LogitScale := Obj.Get('logit_scale', 0.0625);
+    // tie_word_embeddings defaults TRUE for Cohere (the published configs
+    // tie; there is no separate lm_head tensor).
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    // attention_bias / MLP bias are false in every Cohere config; a true
+    // value would mean tensors this importer does not wire.
+    if Obj.Get('attention_bias', False) then
+      ImportError('Cohere import: attention_bias=true is not supported ' +
+        '(every published Cohere config is bias-free).');
+    HiddenAct := Obj.Get('hidden_act', 'silu');
+    if HiddenAct <> 'silu' then
+      ImportError('Cohere import: hidden_act "' + HiddenAct +
+        '" is not supported - Cohere uses "silu" (SwiGLU).');
+    // use_qk_norm: cohere only (CohereConfig default false; Aya-Expanse and
+    // some Command-R checkpoints enable it). cohere2 has no qk_norm.
+    Result.UseQKNorm := Obj.Get('use_qk_norm', False);
+    if ModelType = 'cohere2' then
+    begin
+      if Result.UseQKNorm then
+        ImportError('Cohere import: cohere2 does not define use_qk_norm.');
+      // sliding_window + sliding_window_pattern: every Nth layer is global,
+      // the rest carry the sliding window (Command-R7B: window 4096,
+      // pattern 4 - 3 local : 1 global). order_of_interleaved_layers in
+      // older configs maps to the same period.
+      Result.SlidingWindow := Obj.Get('sliding_window', 4096);
+      Result.SlidingWindowPattern := Obj.Get('sliding_window_pattern', 4);
+      if Result.SlidingWindowPattern < 1 then
+        ImportError('Cohere import: sliding_window_pattern must be >= 1.');
+    end
+    else
+    begin
+      Result.SlidingWindow := 0;
+      Result.SlidingWindowPattern := 0;
+    end;
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function CohereConfigToString(const Config: TCohereConfig): string;
+begin
+  Result := Config.ModelType + ' config: layers=' +
+    IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', logit_scale=' + FloatToStr(Config.LogitScale) +
+    ', qk_norm=' + BoolToStr(Config.UseQKNorm, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.SlidingWindowPattern > 0 then
+    Result := Result + ', window=' + IntToStr(Config.SlidingWindow) +
+      ', pattern=' + IntToStr(Config.SlidingWindowPattern);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+// Loads a bias-free, weight-only LayerNorm gain [d] (CohereLayerNorm) into a
+// TNNetTokenLayerNorm: only the gamma neuron (Neurons[0]) is written; the
+// beta neuron (Neurons[1]) is forced to zero (Cohere has no learned shift).
+// Coded by Claude (AI).
+procedure LoadCohereLayerNormWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; d_model: integer);
+var
+  Tmp: TNNetVolume;
+  i: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Cohere import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 1) or (Reader.DimSize(WName, 0) <> d_model) then
+    ImportError('Cohere import: "' + WName + '" must have shape [' +
+      IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for i := 0 to d_model - 1 do
+    begin
+      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+      Layer.Neurons[1].Weights.FData[i] := 0;            // beta (bias-free)
+    end;
+  finally
+    Tmp.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads the per-head CohereLayerNorm q_norm/k_norm gains (weight shape
+// [num_heads, head_dim], PER-HEAD DISTINCT) into the list of per-head
+// TNNetTokenLayerNorm layers (one gamma row each, beta zero). Row h of the
+// flat [num_heads*head_dim] tensor is head h's gain. Loaded STRAIGHT - the
+// q/k projection rows are NOT rotate_half-permuted on the Cohere path.
+// Coded by Claude (AI).
+procedure LoadCohereHeadLayerNormWeights(Reader: TNNetSafeTensorsReader;
+  NormLayers: array of TNNetLayer; const WName: string;
+  NumHeadsExpected, HeadDim: integer);
+var
+  Tmp: TNNetVolume;
+  h, i: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Cohere import: missing tensor "' + WName + '".');
+  if Reader.ElementCount(WName) <> NumHeadsExpected * HeadDim then
+    ImportError('Cohere import: "' + WName + '" must have ' +
+      IntToStr(NumHeadsExpected * HeadDim) + ' elements ([' +
+      IntToStr(NumHeadsExpected) + ', ' + IntToStr(HeadDim) + ']), got ' +
+      Reader.ShapeAsString(WName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for h := 0 to NumHeadsExpected - 1 do
+    begin
+      for i := 0 to HeadDim - 1 do
+      begin
+        NormLayers[h].Neurons[0].Weights.FData[i] :=
+          Tmp.FData[h * HeadDim + i];           // gamma row h
+        NormLayers[h].Neurons[1].Weights.FData[i] := 0; // beta
+      end;
+      NormLayers[h].FlushWeightCache();
+    end;
+  finally
+    Tmp.Free;
+  end;
+end;
+
+type
+  TCohereBlockLayers = record
+    LN1, QProj, KProj, VProj, OProj, GateUp, Down: TNNetLayer;
+    QNorms, KNorms: array of TNNetLayer; // per-head q/k LayerNorm (cohere)
+  end;
+
+function BuildCohereFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TCohereConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TCohereBlockLayers;
+  EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
+  BranchInput, SharedLN, AttnOut, MlpOut: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  KRotated, VSlices: array of TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
+  HeadDim, QWidth, KVWidth, i, j, d: integer;
+  LayerIsLocal: boolean;
+  LayerWindow: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, LMHeadName, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // Builds one q or k head: optional per-head LayerNorm (cohere qk_norm),
+  // then RoPE iff this layer is rotary (full head, interleaved native
+  // layout). Returns the rotated/normed head slice layer.
+  function BuildQKHead(ProjLayer: TNNetLayer; HeadIdx: integer;
+    IsQuery, ApplyRoPE: boolean): TNNetLayer;
+  var
+    s: TNNetLayer;
+    cc: integer;
+  begin
+    for cc := 0 to HeadDim - 1 do
+      SliceChannels[cc] := HeadIdx * HeadDim + cc;
+    s := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceChannels), ProjLayer);
+    if Config.UseQKNorm then
+    begin
+      s := NN.AddLayerAfter(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps), s);
+      if IsQuery then Blocks[BlockCnt].QNorms[HeadIdx] := s
+      else Blocks[BlockCnt].KNorms[HeadIdx] := s;
+    end;
+    if ApplyRoPE then
+      s := NN.AddLayerAfter(
+        TNNetRotaryEmbedding.Create(Config.RopeTheta), s);
+    Result := s;
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('Cohere import: num_attention_heads must be >= 1.');
+      if Config.NumKVHeads < 1 then
+        ImportError('Cohere import: num_key_value_heads must be >= 1.');
+      if (Config.NumHeads mod Config.NumKVHeads) <> 0 then
+        ImportError('Cohere import: num_attention_heads=' +
+          IntToStr(Config.NumHeads) + ' is not a multiple of ' +
+          'num_key_value_heads=' + IntToStr(Config.NumKVHeads) + '.');
+      if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+      else
+      begin
+        if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+          ImportError('Cohere import: hidden_size=' +
+            IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+            'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+        HeadDim := Config.HiddenSize div Config.NumHeads;
+      end;
+      if Odd(HeadDim) then
+        ImportError('Cohere import: head_dim=' + IntToStr(HeadDim) +
+          ' must be even (RoPE rotates channel pairs).');
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+      QWidth := Config.NumHeads * HeadDim;
+      KVWidth := Config.NumKVHeads * HeadDim;
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Cohere import: neither "model.embed_tokens.weight" ' +
+          'nor "embed_tokens.weight" found in ' + Reader.FileName +
+          ' - not a Cohere checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embed_tokens.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Cohere import: embed_tokens.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+      LMHeadName := 'lm_head.weight';
+      if (not Config.TieWordEmbeddings) and (not Reader.HasTensor(LMHeadName)) then
+        ImportError('Cohere import: tie_word_embeddings=false but ' +
+          '"lm_head.weight" is missing from ' + Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('Cohere import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(KRotated, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // cohere2 alternating attention: every Nth layer (1-indexed) is
+        // GLOBAL, the rest carry the sliding window. AND RoPE is applied
+        // only on the SLIDING layers - global layers are NoPE (HF
+        // Cohere2Attention: rotary only when self.sliding_window is not
+        // None). cohere (pattern 0) is full attention + RoPE everywhere.
+        if Config.SlidingWindowPattern > 1 then
+          LayerIsLocal := ((BlockCnt + 1) mod Config.SlidingWindowPattern) <> 0
+        else
+          LayerIsLocal := false;
+        if (Config.SlidingWindowPattern > 0) then
+        begin
+          // cohere2: window on local layers, NoPE on global layers.
+          if LayerIsLocal then LayerWindow := Config.SlidingWindow
+          else LayerWindow := 0;
+        end
+        else
+          LayerWindow := 0; // cohere: full attention everywhere
+        // SHARED-LN PARALLEL residual: one input_layernorm feeds BOTH
+        // branches; one fused 3-input sum closes the block.
+        BranchInput := NN.GetLastLayer();
+        SharedLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].LN1 := SharedLN;
+        // bias-free q/k/v projections (GQA: kv width may be narrower).
+        Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(QWidth), SharedLN);
+        Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), SharedLN);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), SharedLN);
+        if Config.UseQKNorm then
+        begin
+          SetLength(Blocks[BlockCnt].QNorms, Config.NumHeads);
+          SetLength(Blocks[BlockCnt].KNorms, Config.NumKVHeads);
+        end;
+        // RoPE iff this layer is rotary: cohere = always, cohere2 = only
+        // the sliding layers (global layers are NoPE).
+        // Build each KV head once (rotated/normed), shared across its group.
+        for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+        begin
+          KRotated[KVHeadCnt] := BuildQKHead(Blocks[BlockCnt].KProj,
+            KVHeadCnt, {IsQuery=}false,
+            {ApplyRoPE=}(Config.SlidingWindowPattern = 0) or LayerIsLocal);
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := KVHeadCnt * HeadDim + d;
+          VSlices[KVHeadCnt] := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
+        end;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          KVGroup := HeadCnt div GroupSize;
+          QSlice := BuildQKHead(Blocks[BlockCnt].QProj, HeadCnt,
+            {IsQuery=}true,
+            {ApplyRoPE=}(Config.SlidingWindowPattern = 0) or LayerIsLocal);
+          // Pack [Q_h | K_group | V_group] for SDPA (standard
+          // 1/sqrt(head_dim) scaling). LayerWindow>0 bands the causal mask.
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+            [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true,
+              {pWindow=}LayerWindow), HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        AttnOut := NN.GetLastLayer();
+        // MLP branch reads the SAME shared LN (parallel residual).
+        Blocks[BlockCnt].GateUp := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize),
+          SharedLN);
+        NN.AddLayer( TNNetSwiGLU.Create() );
+        Blocks[BlockCnt].Down := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        MlpOut := NN.GetLastLayer();
+        NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Cohere import: embed_tokens.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+        // LM head: logits = (h . embed^T) * logit_scale. With tied
+        // embeddings the scale is folded into every head weight row (the
+        // head alone reproduces the scaled logits, bias-free). An untied
+        // lm_head loads via LoadLlamaLinearWeights with the same Scale fold.
+        if Config.TieWordEmbeddings then
+        begin
+          EnsureWritableImportWeights(LMHead);
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Config.LogitScale * Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+            Config.HiddenSize, Config.VocabSize, 0, -1, 0, '',
+            Config.LogitScale);
+          MarkConsumed(LMHeadName);
+        end;
+      finally
+        Tmp.Free;
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'self_attn.';
+        LoadCohereLayerNormWeights(Reader, Blocks[BlockCnt].LN1,
+          BlockPrefix + 'input_layernorm.weight', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        // bias-free q/k/v, rows loaded STRAIGHT (RotaryHeadDim=0: Cohere's
+        // interleaved RoPE pairing is already the layer's native layout).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+          AttnPrefix + 'q_proj.weight', Config.HiddenSize, QWidth);
+        MarkConsumed(AttnPrefix + 'q_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+          AttnPrefix + 'k_proj.weight', Config.HiddenSize, KVWidth);
+        MarkConsumed(AttnPrefix + 'k_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+          AttnPrefix + 'v_proj.weight', Config.HiddenSize, KVWidth);
+        MarkConsumed(AttnPrefix + 'v_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+          AttnPrefix + 'o_proj.weight', QWidth, Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'o_proj.weight');
+        if Config.UseQKNorm then
+        begin
+          LoadCohereHeadLayerNormWeights(Reader, Blocks[BlockCnt].QNorms,
+            AttnPrefix + 'q_norm.weight', Config.NumHeads, HeadDim);
+          MarkConsumed(AttnPrefix + 'q_norm.weight');
+          LoadCohereHeadLayerNormWeights(Reader, Blocks[BlockCnt].KNorms,
+            AttnPrefix + 'k_norm.weight', Config.NumKVHeads, HeadDim);
+          MarkConsumed(AttnPrefix + 'k_norm.weight');
+        end;
+        // SwiGLU: TNNetSwiGLU = FIRSTHALF * Swish(SECONDHALF); Cohere's MLP
+        // is down(silu(gate) * up), so up_proj -> neurons 0..I-1 and
+        // gate_proj -> I..2I-1.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+          BlockPrefix + 'mlp.up_proj.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, 2 * Config.IntermediateSize);
+        MarkConsumed(BlockPrefix + 'mlp.up_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+          BlockPrefix + 'mlp.gate_proj.weight', Config.HiddenSize,
+          Config.IntermediateSize, Config.IntermediateSize,
+          2 * Config.IntermediateSize);
+        MarkConsumed(BlockPrefix + 'mlp.gate_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
+          BlockPrefix + 'mlp.down_proj.weight', Config.IntermediateSize,
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'mlp.down_proj.weight');
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadCohereLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'norm.weight', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'norm.weight');
+
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // rotary_emb.inv_freq: the persisted RoPE buffer (structural).
+        if Pos('.rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
+        ImportError('Cohere import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildCohereFromSafeTensorsEx(const FileName: string;
+  out Config: TCohereConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadCohereConfigFromJSONFile(ConfigPath);
+  Result := BuildCohereFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildCohereFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TCohereConfig;
+begin
+  Result := BuildCohereFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -14641,6 +15304,7 @@ var
   IgnoredGPTNeoConfig: TGPTNeoConfig;
   IgnoredGPTNeoXConfig: TGPTNeoXConfig;
   IgnoredGPTJConfig: TGPTJConfig;
+  IgnoredCohereConfig: TCohereConfig;
   IgnoredPhiConfig: TPhiConfig;
   IgnoredBertConfig: TBertConfig;
   IgnoredRWKVConfig: TRWKVConfig;
@@ -14752,6 +15416,15 @@ begin
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'gptj' then
     Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if (ModelType = 'cohere') or (ModelType = 'cohere2') then
+    // Cohere Command-R / Aya (architectures ["CohereForCausalLM"]) and the
+    // Command-R7B variant (["Cohere2ForCausalLM"]): parallel residual,
+    // mean-subtracting weight-only LayerNorm, interleaved RoPE, tied
+    // embeddings with logit_scale folded into the head. cohere2 adds the
+    // alternating sliding/global pattern with NoPE on global layers. See
+    // the COHERE IMPORT section.
+    Result := BuildCohereFromSafeTensorsEx(WeightsPath, IgnoredCohereConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'phi' then
     Result := BuildPhiFromSafeTensorsEx(WeightsPath, IgnoredPhiConfig,

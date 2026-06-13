@@ -2,14 +2,38 @@
 
 A terminal chat program for the checkpoints the generic importer dispatch
 (`BuildFromPretrained` in `neural/neuralpretrained.pas`) understands: gpt2,
-llama, mistral, qwen2/3, gemma/2/3, phi/phi3, gpt_neo(x), gptj, rwkv, mamba,
-bloom, deepseek_v2, ... Point it at a HuggingFace-style model directory
-(`config.json` + `model.safetensors` [or sharded index / pytorch_model.bin]
-+ `tokenizer.json` [+ `tokenizer_config.json`]) and chat:
+llama, mistral, qwen2/3, gemma/2/3, phi/phi3, gpt_neo(x), gptj,
+cohere/cohere2, rwkv, mamba, bloom, deepseek_v2, ... Point it at a
+HuggingFace-style model directory (`config.json` + `model.safetensors` [or
+sharded index / pytorch_model.bin] + `tokenizer.json`
+[+ `tokenizer_config.json`]) and chat:
 
 ```
 ChatTerminal /path/to/Qwen2.5-0.5B-Instruct --temperature 0.8 --top-p 0.9
 ```
+
+### Multilingual generation (Cohere Command-R / Aya)
+
+The Cohere family (`BuildCohereFromSafeTensors`, model_type `cohere` /
+`cohere2`) is the leading **open multilingual** instruct family
+(C4AI Command-R, Aya-Expanse-8B, Command-R7B). The same REPL drives it -
+the importer handles Cohere's parallel residual, mean-subtracting bias-free
+LayerNorm, interleaved RoPE, tied embeddings with `logit_scale` folded into
+the LM head, and (cohere2) the alternating sliding/global attention with
+NoPE on the global layers:
+
+```
+ChatTerminal /path/to/aya-expanse-8b --temperature 0.3
+> Traduce al espanol: "The cat sits on the windowsill."
+El gato esta sentado en el alfeizar de la ventana.
+> Continue en francais.
+Le chat est assis sur le rebord de la fenetre.
+```
+
+Aya / Command-R are tuned for cross-lingual instruction following, so a
+single session can switch languages turn to turn. The chat format is
+fingerprinted from the Cohere `tokenizer_config.json` like every other
+family; `--int8` keeps an 8B checkpoint within a few GB of RAM.
 
 The conversation is kept as a multi-turn history rendered through the
 chat-template engine (`neural/neuralchat.pas`): the chat format is
