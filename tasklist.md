@@ -187,10 +187,14 @@ rather than acted on.
       (seeds the running max with the SIGNED first element, so a negative
       max-magnitude element 0 is missed; csErrorOverflowBackpropProtection
       and friends consume it — audit callers before fixing).
-- [ ] Tokenizer follow-ups for neuralhftokenizer.pas: (a) Unigram model
-      support (model.type "Unigram", Viterbi segmentation) -- needed only
-      for tokenizers not yet converted to BPE format; (b) the raw
-      SentencePiece .model protobuf path (parse the protobuf wire format
+- [ ] Tokenizer follow-ups for neuralhftokenizer.pas: (a) DONE -- Unigram
+      model support landed (model.type "Unigram": [piece, log_prob] vocab
+      array + unk_id, maximum-log-prob Viterbi segmentation with fused
+      <unk> for unreachable char runs, composes with the Metaspace
+      pre_tokenizer/decoder; HF parity fixture tiny_unigram_tokenizer.json
+      via tools/hf_unigram_fixture.py, pinned in TestNeuralHFTokenizer.pas);
+      (b) the raw SentencePiece .model protobuf path (parse the protobuf
+      wire format
       or vendor a minimal decoder) for checkpoints that ship without a
       tokenizer.json; (c) exact full-Unicode \p{L}/\p{N} tables (current
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/

@@ -54,10 +54,15 @@ Coded by Claude (AI).
 //     add them via TokenToId('[CLS]') / TokenToId('[SEP]') (see
 //     BertTokenizeSentence in neuralpretrained.pas).
 //
+//   * Unigram (SentencePiece-Unigram: ALBERT / T5 / XLNet / DeBERTa-v3):
+//     the `vocab` array of [piece, log_prob] pairs plus unk_id, Viterbi
+//     maximum-log-probability segmentation over the vocab pieces, with a
+//     single fused <unk> covering each run of characters no piece can
+//     cover (HF behavior). Composes with the Metaspace pre_tokenizer /
+//     decoder that these tokenizers ship with.
+//
 // NOT supported (raises EHFTokenizerError with a clear message):
-//   * model.type <> "BPE"/"WordPiece" (e.g. Unigram) -- the HF conversion
-//     of SentencePiece Llama tokenizers is BPE, which is what ships in
-//     TinyLlama / Llama-2 / SmolLM2 tokenizer.json files.
+//   * model.type <> "BPE"/"WordPiece"/"Unigram".
 //   * The raw SentencePiece .model protobuf (use tokenizer.json instead).
 //
 // Unicode \p{L} / \p{N} classification for the GPT-2 regex is implemented
@@ -120,6 +125,10 @@ type
       // model flags
       FByteFallback, FFuseUnk, FIgnoreMerges: boolean;
       FUnkId, FBosId, FEosId: integer;
+      // Unigram (SentencePiece-Unigram: ALBERT/T5/XLNet/DeBERTa-v3) family
+      FUnigram: boolean;          // model.type = Unigram
+      FUniScore: array of double; // per-id piece log-prob (score), id-indexed
+      FUniMinScore: double;       // min vocab score (unk penalty base)
       // WordPiece (BERT) family
       FWordPiece: boolean;        // model.type = WordPiece
       FWPPrefix: string;          // continuing_subword_prefix ('##')
@@ -158,6 +167,7 @@ type
       function VocabFind(const Token: string): integer; // id or -1
       function MergeRank(const A, B: string): integer;  // rank or MaxInt
       procedure BPEWord(const Symbols: TStringList; Ids: TIntegerList);
+      procedure UnigramWord(const PieceText: string; Ids: TIntegerList);
       procedure EmitTokenOrFallback(const Symbol: string; Ids: TIntegerList);
       function BertNormalize(const Segment: string): string;
       procedure BertPieces(const Segment: string; Pieces: TStringList);
@@ -214,6 +224,7 @@ type
       property EosId: integer read FEosId; // -1 if none
       property IsByteLevel: boolean read FByteLevel;
       property IsWordPiece: boolean read FWordPiece;
+      property IsUnigram: boolean read FUnigram;
   end;
 
 // fpjson portability helpers, exported for the other HF-JSON readers
@@ -612,6 +623,9 @@ begin
   FByteFallback := false;
   FFuseUnk := false;
   FIgnoreMerges := false;
+  FUnigram := false;
+  SetLength(FUniScore, 0);
+  FUniMinScore := 0;
   FByteLevel := false;
   FAddPrefixSpace := false;
   FSplitPreTok := false;
@@ -746,9 +760,10 @@ var
   Root: TJSONData;
   RootObj, ModelObj, Entry: TJSONObject;
   VocabObj: TJSONObject;
-  MergesArr, AddedArr, SubArr: TJSONArray;
+  MergesArr, AddedArr, SubArr, VocabArr: TJSONArray;
   FS: TFileStream;
   Cnt, TokenId, MaxId: integer;
+  Score: double;
   Left, Right, MergeStr, NormType, Content: string;
   SpacePos: integer;
   Node: TJSONData;
@@ -938,14 +953,16 @@ begin
     // ---- model -------------------------------------------------
     ModelObj := RootObj.Objects['model'];
     FWordPiece := ModelObj.Get('type', '') = 'WordPiece';
+    FUnigram := ModelObj.Get('type', '') = 'Unigram';
     // pre-2021 tokenizer.json files (e.g. openai-community/gpt2) omit
     // model.type entirely; the merges key marks them as BPE
-    if (not FWordPiece) and (ModelObj.Get('type', '') <> 'BPE') and
+    if (not FWordPiece) and (not FUnigram) and
+      (ModelObj.Get('type', '') <> 'BPE') and
       not ((ModelObj.Get('type', '') = '') and
         (ModelObj.IndexOfName('merges') >= 0)) then
       raise EHFTokenizerError.Create('Unsupported model.type "' +
         ModelObj.Get('type', '') +
-        '" (only BPE and WordPiece are supported; Unigram is not)');
+        '" (only BPE, WordPiece and Unigram are supported)');
     FByteFallback := ModelObj.Get('byte_fallback', false);
     FFuseUnk := ModelObj.Get('fuse_unk', false);
     FIgnoreMerges := ModelObj.Get('ignore_merges', false);
@@ -955,23 +972,47 @@ begin
       FWPMaxChars := ModelObj.Get('max_input_chars_per_word', 100);
     end;
 
-    // vocab: token -> id
-    VocabObj := ModelObj.Objects['vocab'];
-    MaxId := -1;
-    for Cnt := 0 to VocabObj.Count - 1 do
-      MaxId := Max(MaxId, VocabObj.Items[Cnt].AsInteger);
-    SetLength(FIdToToken, MaxId + 1);
-    for Cnt := 0 to VocabObj.Count - 1 do
+    // vocab. BPE/WordPiece: an object token -> id. Unigram: an ARRAY of
+    // [piece, log_prob] pairs whose 0-based index IS the id.
+    if FUnigram then
     begin
-      TokenId := VocabObj.Items[Cnt].AsInteger;
-      Content := FixJSONKey(VocabObj.Names[Cnt]);
-      FVocab.AddObject(Content, TObject(PtrInt(TokenId)));
-      FIdToToken[TokenId] := Content;
+      VocabArr := ModelObj.Arrays['vocab'];
+      SetLength(FIdToToken, VocabArr.Count);
+      SetLength(FUniScore, VocabArr.Count);
+      FUniMinScore := 0;
+      for Cnt := 0 to VocabArr.Count - 1 do
+      begin
+        SubArr := TJSONArray(VocabArr.Items[Cnt]);
+        Content := FixJSONKey(SubArr.Strings[0]);
+        Score := SubArr.Floats[1];
+        FVocab.AddObject(Content, TObject(PtrInt(Cnt)));
+        FIdToToken[Cnt] := Content;
+        FUniScore[Cnt] := Score;
+        if (Cnt = 0) or (Score < FUniMinScore) then FUniMinScore := Score;
+      end;
+      // unk_id is an INDEX into the vocab array (not a token string).
+      Node := ModelObj.Find('unk_id');
+      if (Node <> nil) and not Node.IsNull then FUnkId := Node.AsInteger;
+    end
+    else
+    begin
+      VocabObj := ModelObj.Objects['vocab'];
+      MaxId := -1;
+      for Cnt := 0 to VocabObj.Count - 1 do
+        MaxId := Max(MaxId, VocabObj.Items[Cnt].AsInteger);
+      SetLength(FIdToToken, MaxId + 1);
+      for Cnt := 0 to VocabObj.Count - 1 do
+      begin
+        TokenId := VocabObj.Items[Cnt].AsInteger;
+        Content := FixJSONKey(VocabObj.Names[Cnt]);
+        FVocab.AddObject(Content, TObject(PtrInt(TokenId)));
+        FIdToToken[TokenId] := Content;
+      end;
     end;
 
     // merges: ["a b", ...] (old) or [["a","b"], ...] (new).
-    // WordPiece has no merges (greedy longest-match over the vocab).
-    if FWordPiece then
+    // WordPiece (greedy longest-match) and Unigram (Viterbi) have no merges.
+    if FWordPiece or FUnigram then
       MergesArr := nil
     else
       MergesArr := ModelObj.Arrays['merges'];
@@ -1449,6 +1490,105 @@ begin
     EmitTokenOrFallback(Symbols[Cnt], Ids);
 end;
 
+// Unigram (SentencePiece) Viterbi segmentation of one pre-tokenized piece.
+// Builds the best (maximum total log-prob) segmentation into vocab pieces;
+// any single character not starting a vocab piece is covered by a 1-char
+// <unk> node with score FUniMinScore - kUnkPenalty (HF's kUnkPenalty=10.0).
+// Adjacent <unk> nodes are fused into one emitted <unk> id (HF behavior).
+procedure TNeuralHFTokenizer.UnigramWord(const PieceText: string;
+  Ids: TIntegerList);
+const
+  kUnkPenalty = 10.0;
+var
+  CPStart: array of integer;  // byte offset (1-based) where char i starts
+  SegId: array of integer;    // backtracked ids, collected in reverse
+  Total, Position, SegCnt, I, J, BestPrev, TokenId: integer;
+  BestScore: array of double; // best score to reach char-boundary J (0..Total)
+  BackPtr: array of integer;  // start char index of the piece ending at J
+  BackId: array of integer;   // vocab id of that piece, or -1 for unk
+  CandScore, UnkScore: double;
+  Sub: string;
+  LastWasUnk: boolean;
+begin
+  if PieceText = '' then exit;
+  // Char-boundary table: CPStart[i] is the 1-based byte offset of char i,
+  // with a sentinel one past the last byte.
+  SetLength(CPStart, Length(PieceText) + 1);
+  Total := 0;
+  Position := 1;
+  while Position <= Length(PieceText) do
+  begin
+    CPStart[Total] := Position;
+    NextCodePoint(PieceText, Position);
+    Inc(Total);
+  end;
+  CPStart[Total] := Position;
+  if Total = 0 then exit;
+
+  UnkScore := FUniMinScore - kUnkPenalty;
+  SetLength(BestScore, Total + 1);
+  SetLength(BackPtr, Total + 1);
+  SetLength(BackId, Total + 1);
+  for I := 1 to Total do
+  begin
+    BestScore[I] := NegInfinity;
+    BackPtr[I] := -1;
+    BackId[I] := -1;
+  end;
+  BestScore[0] := 0;
+
+  // Forward DP: BestScore[J] = best total log-prob for chars [0..J).
+  for J := 1 to Total do
+    for I := 0 to J - 1 do
+    begin
+      if BestScore[I] = NegInfinity then continue;
+      Sub := Copy(PieceText, CPStart[I], CPStart[J] - CPStart[I]);
+      TokenId := VocabFind(Sub);
+      if TokenId >= 0 then
+        CandScore := BestScore[I] + FUniScore[TokenId]
+      else if J = I + 1 then
+      begin
+        // single-character unk node (spans exactly one character)
+        CandScore := BestScore[I] + UnkScore;
+        TokenId := -1;
+      end
+      else
+        continue;
+      if CandScore > BestScore[J] then
+      begin
+        BestScore[J] := CandScore;
+        BackPtr[J] := I;
+        BackId[J] := TokenId;
+      end;
+    end;
+
+  // Backtrack (collect ids in reverse), then emit forward, fusing adjacent
+  // unk ids into one.
+  SetLength(SegId, Total);
+  SegCnt := 0;
+  J := Total;
+  while J > 0 do
+  begin
+    BestPrev := BackPtr[J];
+    if BestPrev < 0 then BestPrev := J - 1; // safety (shouldn't happen)
+    SegId[SegCnt] := BackId[J];
+    Inc(SegCnt);
+    J := BestPrev;
+  end;
+  LastWasUnk := false;
+  for I := SegCnt - 1 downto 0 do
+    if SegId[I] < 0 then
+    begin
+      if (FUnkId >= 0) and (not LastWasUnk) then Ids.Add(FUnkId);
+      LastWasUnk := true;
+    end
+    else
+    begin
+      Ids.Add(SegId[I]);
+      LastWasUnk := false;
+    end;
+end;
+
 // BertNormalizer: clean_text -> handle_chinese_chars -> strip_accents ->
 // lowercase (HF order). clean_text drops control chars and canonicalizes
 // \t\n\r to spaces; handle_chinese_chars pads CJK ideographs with spaces.
@@ -1593,6 +1733,11 @@ var
     CPSyms: TStringList;
     BytePos, CPStart: integer;
   begin
+    if FUnigram then
+    begin
+      UnigramWord(Copy(Normalized, PieceFrom, PieceTo - PieceFrom + 1), Ids);
+      exit;
+    end;
     CPSyms := TStringList.Create();
     try
       BytePos := PieceFrom;

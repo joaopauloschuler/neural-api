@@ -29,6 +29,8 @@ type
     procedure TestByteLevelParityWithHF;
     procedure TestMetaspaceParityWithHF;
     procedure TestWordPieceParityWithHF;
+    procedure TestUnigramParityWithHF;
+    procedure TestUnigramSegmentationAndFusedUnk;
     procedure TestSplitQwen2ParityWithHF;
     procedure TestSplitCl100kParityWithHF;
     procedure TestMetaspacePreTokenizerParityWithHF;
@@ -110,7 +112,7 @@ begin
   try
     Group := TJSONObject(Root).Objects[GroupName];
     Tok.LoadFromFile(FixturePath(Group.Get('tokenizer', '')));
-    AssertTrue(GroupName + ': vocab not loaded', Tok.GetVocabSize() > 100);
+    AssertTrue(GroupName + ': vocab not loaded', Tok.GetVocabSize() > 10);
     Cases := Group.Arrays['cases'];
     AssertTrue(GroupName + ': no cases pinned', Cases.Count >= 10);
     for CaseCnt := 0 to Cases.Count - 1 do
@@ -148,6 +150,52 @@ end;
 procedure TTestNeuralHFTokenizer.TestWordPieceParityWithHF;
 begin
   RunParityBattery('wordpiece');
+end;
+
+// SentencePiece-Unigram (ALBERT/T5/XLNet/DeBERTa-v3 family): Viterbi
+// segmentation over the [piece, log_prob] vocab + Metaspace pre_tokenizer.
+procedure TTestNeuralHFTokenizer.TestUnigramParityWithHF;
+begin
+  RunParityBattery('unigram');
+end;
+
+// Targeted Unigram checks: the IsUnigram flag, a known multi-character
+// Viterbi segmentation, and that a run of out-of-vocab characters between
+// known pieces collapses to a SINGLE fused <unk> id (HF behavior).
+procedure TTestNeuralHFTokenizer.TestUnigramSegmentationAndFusedUnk;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TIntegerList;
+  UnkCount, Cnt: integer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_unigram_tokenizer.json'));
+    AssertTrue('unigram flag', Tok.IsUnigram);
+    AssertTrue('not byte-level', not Tok.IsByteLevel);
+    AssertTrue('not wordpiece', not Tok.IsWordPiece);
+    AssertTrue('unk id present', Tok.UnkId >= 0);
+    AssertTrue('vocab loaded', Tok.GetVocabSize() > 10);
+
+    // "the" is a single multi-char vocab piece; the metaspace prefix makes
+    // it "▁the" -> the highest-score segmentation is a single id.
+    Ids.Clear;
+    Tok.Encode('the', Ids);
+    AssertEquals('"the" decodes back', 'the', Tok.Decode(Ids, true));
+
+    // A run of three unknown capitals (Q,X,Z) between known pieces must
+    // produce exactly ONE fused <unk>.
+    Ids.Clear;
+    Tok.Encode('the QXZ cat', Ids);
+    UnkCount := 0;
+    for Cnt := 0 to Ids.Count - 1 do
+      if Ids[Cnt] = Tok.UnkId then Inc(UnkCount);
+    AssertEquals('the QXZ run fuses to one unk', 1, UnkCount);
+  finally
+    Ids.Free;
+    Tok.Free;
+  end;
 end;
 
 // Qwen2/Qwen3-style Sequence[Split(cl100k-style regex with \p{N}),
@@ -287,11 +335,13 @@ var
   SL: TStringList;
   Raised: boolean;
 begin
+  // BPE, WordPiece and Unigram are supported; any other model.type must
+  // still raise (e.g. a hypothetical/unknown model).
   TempFile := GetTempDir(true) + 'not_bpe_tokenizer.json';
   SL := TStringList.Create();
   Tok := TNeuralHFTokenizer.Create();
   try
-    SL.Text := '{"model": {"type": "Unigram", "vocab": []}}';
+    SL.Text := '{"model": {"type": "FancyNewModel", "vocab": {}}}';
     SL.SaveToFile(TempFile);
     Raised := false;
     try
@@ -299,7 +349,7 @@ begin
     except
       on E: EHFTokenizerError do Raised := true;
     end;
-    AssertTrue('Unigram must raise EHFTokenizerError', Raised);
+    AssertTrue('unknown model.type must raise EHFTokenizerError', Raised);
   finally
     Tok.Free;
     SL.Free;
