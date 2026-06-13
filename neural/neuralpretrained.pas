@@ -1782,6 +1782,19 @@ function BuildBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pIncludePooler: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
+// Re-emits a wired BERT-family encoder (built by BuildBertFromSafeTensors) as
+// a HF-named .safetensors checkpoint - the exact inverse of the importer's
+// name map and transforms. Config must be the one the importer returned (it
+// carries Family / Prefix / PositionOffset / HiddenActTanh). Round-trips
+// bit-for-bit for bert/distilbert; for roberta the first PositionOffset
+// position-table rows are NEVER read by the net (padding positions) and so
+// cannot be recovered - they are re-emitted as zeros, which the importer
+// skips anyway. pIncludePooler re-emits the pooler.dense head when the net
+// carries it. Coded by Claude (AI).
+procedure SaveBertToSafeTensors(Net: TNNet; const Config: TBertConfig;
+  const FileName: string; pIncludePooler: boolean = false;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
 // ======================= SENTENCE EMBEDDINGS ===============================
 // sentence-transformers style sentence vectors on top of the BERT encoder
 // (e.g. sentence-transformers/all-MiniLM-L6-v2): tokenize, run the net,
@@ -7664,6 +7677,242 @@ begin
   finally
     V.Free;
     Reader.Free;
+  end;
+end;
+
+// Inverse of BuildBertFromSafeTensors: walks the wired encoder in the
+// importer's build order, recovers each HF-named tensor and writes it with
+// the EXACT inverse of every load transform, then saves the .safetensors.
+//   - embeddings.word/token_type: [vocab/type, hidden] straight from the
+//     single-neuron embedding tables (TNNetEmbedding).
+//   - embeddings.position: the structural table carries only the USABLE rows
+//     (checkpoint rows PositionOffset..MaxPositions-1); the first
+//     PositionOffset rows are padding positions the net never reads, so they
+//     are re-emitted as zeros (the importer skips them via SrcRowOffset).
+//   - LayerNorm: gamma=Neurons[0], beta=Neurons[1] (SaveLayerNormWeights).
+//   - q/k/v: un-fuse the [3*hidden] Q|K|V slab back into the three separate
+//     nn.Linear [hidden,hidden] (+bias) tensors - query=neurons 0..d-1,
+//     key=d..2d-1, value=2d..3d-1 - each stored [out,in] STRAIGHT (neuron j =
+//     row j, BiasWeight = bias[j]); NO Conv1D transpose (BERT is nn.Linear).
+//   - attention.output.dense / intermediate.dense / output.dense: straight
+//     [out,in] nn.Linear (+bias). The exact-erf-vs-tanh GELU is structural
+//     (no weights), so nothing to invert there.
+//   - pooler.dense: same straight [hidden,hidden] nn.Linear when present.
+// Coded by Claude (AI).
+procedure SaveBertToSafeTensors(Net: TNNet; const Config: TBertConfig;
+  const FileName: string; pIncludePooler: boolean = false;
+  pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  Embeds, LayerNorms, PwConvs: array of TNNetLayer;
+  WordEmb, TypeEmb, PosEmb, EmbLN: TNNetLayer;
+  V: TNNetVolume;
+  i, BlockCnt, PwBase, NumPw, ExpectPw, ExpectLN, ExpectEmb: integer;
+  d, IntSize, UsablePositions: integer;
+  BlockPrefix, QName, KName, VName, AttnDenseName, AttnLNName: string;
+  InterName, OutDenseName, OutLNName: string;
+
+  // Writes a HF nn.Linear [OutDim, InDim] weight (+bias [OutDim]) STRAIGHT
+  // from OutDim consecutive neurons of Layer starting at NeuronBase: neuron
+  // (NeuronBase+j) is checkpoint row j (weight i = W[j*InDim+i]), BiasWeight
+  // is bias[j]. The exact inverse of LoadLlamaLinearWeights with no rotary.
+  procedure DumpLinear(Layer: TNNetLayer; NeuronBase, OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+          ImportError('BERT export: neuron ' + IntToStr(NeuronBase + jj) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] :=
+            Layer.Neurons[NeuronBase + jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[NeuronBase + jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  IntSize := Config.IntermediateSize;
+  UsablePositions := Config.MaxPositions - Config.PositionOffset;
+  // ---- collect the load-bearing layers in net (= importer build) order ----
+  // Embeddings: WordEmb then (if TypeVocabSize>0) TypeEmb - both TNNetEmbedding
+  // - and the TNNetLearnedPositionalEmbedding position table. LayerNorms: EmbLN
+  // then AttnLN/OutLN per block. PointwiseConvLinear: QKV,AttnDense,Inter,
+  // OutDense per block, then the optional pooler.dense (the SDPA per-head
+  // attention adds SplitChannels, not PointwiseConvLinear).
+  SetLength(Embeds, 0);
+  SetLength(LayerNorms, 0);
+  SetLength(PwConvs, 0);
+  PosEmb := nil;
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetLearnedPositionalEmbedding then
+    begin
+      if PosEmb <> nil then
+        ImportError('BERT export: more than one positional-embedding layer.');
+      PosEmb := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetEmbedding then
+    begin
+      SetLength(Embeds, Length(Embeds) + 1);
+      Embeds[High(Embeds)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LayerNorms, Length(LayerNorms) + 1);
+      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if PosEmb = nil then
+    ImportError('BERT export: no TNNetLearnedPositionalEmbedding layer - ' +
+      'not a BuildBertFromSafeTensors encoder?');
+  if Config.TypeVocabSize > 0 then ExpectEmb := 2 else ExpectEmb := 1;
+  if Length(Embeds) <> ExpectEmb then
+    ImportError('BERT export: found ' + IntToStr(Length(Embeds)) +
+      ' TNNetEmbedding layers, expected ' + IntToStr(ExpectEmb) +
+      '.');
+  // Build order interleaves the word/type embeddings; the FIRST is word, the
+  // SECOND (when present) is token_type (see the importer).
+  WordEmb := Embeds[0];
+  if Config.TypeVocabSize > 0 then TypeEmb := Embeds[1] else TypeEmb := nil;
+  ExpectLN := 2 * Config.NumLayers + 1;        // EmbLN + AttnLN/OutLN per block
+  ExpectPw := 4 * Config.NumLayers;            // QKV,AttnDense,Inter,OutDense
+  if pIncludePooler then Inc(ExpectPw);        // + pooler.dense
+  if Length(LayerNorms) <> ExpectLN then
+    ImportError('BERT export: found ' + IntToStr(Length(LayerNorms)) +
+      ' LayerNorm layers, expected ' + IntToStr(ExpectLN) + ' for ' +
+      IntToStr(Config.NumLayers) + ' blocks.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('BERT export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) +
+      ' (4 per block + optional pooler). A classifier head (pSeqClsHead) is ' +
+      'out of scope for this exporter.');
+  EmbLN := LayerNorms[0];
+
+  V := TNNetVolume.Create;
+  try
+    Writer := TNNetSafeTensorsWriter.Create(FileName);
+    try
+      Writer.SetMetadata('format', 'pt');
+      Writer.SetMetadata('exporter', 'cai-neural-api/bert');
+      // ---- embeddings ----
+      if WordEmb.Neurons[0].Weights.Size <> Config.VocabSize * d then
+        ImportError('BERT export: word embedding size ' +
+          IntToStr(WordEmb.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+          IntToStr(Config.VocabSize * d) + '.');
+      Writer.AddTensorFlat(Config.Prefix + 'embeddings.word_embeddings.weight',
+        [Config.VocabSize, d], WordEmb.Neurons[0].Weights, pDType);
+      // Position table: the layer holds only UsablePositions rows = checkpoint
+      // rows PositionOffset..MaxPositions-1. Re-emit a full [MaxPositions,
+      // hidden] tensor with the first PositionOffset rows zeroed (never read).
+      if PosEmb.Neurons[0].Weights.Size <> UsablePositions * d then
+        ImportError('BERT export: position table size ' +
+          IntToStr(PosEmb.Neurons[0].Weights.Size) + ' <> usable*hidden = ' +
+          IntToStr(UsablePositions * d) + '.');
+      V.ReSize(Config.MaxPositions * d, 1, 1);
+      V.Fill(0);
+      for i := 0 to UsablePositions * d - 1 do
+        V.FData[Config.PositionOffset * d + i] :=
+          PosEmb.Neurons[0].Weights.FData[i];
+      Writer.AddTensorFlat(
+        Config.Prefix + 'embeddings.position_embeddings.weight',
+        [Config.MaxPositions, d], V, pDType);
+      if TypeEmb <> nil then
+      begin
+        if TypeEmb.Neurons[0].Weights.Size <> Config.TypeVocabSize * d then
+          ImportError('BERT export: token_type embedding size mismatch.');
+        Writer.AddTensorFlat(
+          Config.Prefix + 'embeddings.token_type_embeddings.weight',
+          [Config.TypeVocabSize, d], TypeEmb.Neurons[0].Weights, pDType);
+      end;
+      SaveLayerNormWeights(Writer, EmbLN,
+        Config.Prefix + 'embeddings.LayerNorm.weight',
+        Config.Prefix + 'embeddings.LayerNorm.bias', d, pDType);
+
+      // ---- encoder blocks ----
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        if Config.Family = bfDistilBert then
+        begin
+          BlockPrefix := Config.Prefix + 'transformer.layer.' +
+            IntToStr(BlockCnt) + '.';
+          QName := BlockPrefix + 'attention.q_lin';
+          KName := BlockPrefix + 'attention.k_lin';
+          VName := BlockPrefix + 'attention.v_lin';
+          AttnDenseName := BlockPrefix + 'attention.out_lin';
+          AttnLNName := BlockPrefix + 'sa_layer_norm';
+          InterName := BlockPrefix + 'ffn.lin1';
+          OutDenseName := BlockPrefix + 'ffn.lin2';
+          OutLNName := BlockPrefix + 'output_layer_norm';
+        end
+        else
+        begin
+          BlockPrefix := Config.Prefix + 'encoder.layer.' +
+            IntToStr(BlockCnt) + '.';
+          QName := BlockPrefix + 'attention.self.query';
+          KName := BlockPrefix + 'attention.self.key';
+          VName := BlockPrefix + 'attention.self.value';
+          AttnDenseName := BlockPrefix + 'attention.output.dense';
+          AttnLNName := BlockPrefix + 'attention.output.LayerNorm';
+          InterName := BlockPrefix + 'intermediate.dense';
+          OutDenseName := BlockPrefix + 'output.dense';
+          OutLNName := BlockPrefix + 'output.LayerNorm';
+        end;
+        PwBase := BlockCnt * 4;
+        // Un-fuse the Q|K|V slab: query=neurons 0..d-1, key=d..2d-1,
+        // value=2d..3d-1 (the importer's LoadLlamaLinearWeights NeuronBase).
+        DumpLinear(PwConvs[PwBase + 0], 0,     d, d, QName + '.weight',
+          QName + '.bias');
+        DumpLinear(PwConvs[PwBase + 0], d,     d, d, KName + '.weight',
+          KName + '.bias');
+        DumpLinear(PwConvs[PwBase + 0], 2 * d, d, d, VName + '.weight',
+          VName + '.bias');
+        DumpLinear(PwConvs[PwBase + 1], 0, d, d, AttnDenseName + '.weight',
+          AttnDenseName + '.bias');
+        SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 1],
+          AttnLNName + '.weight', AttnLNName + '.bias', d, pDType);
+        DumpLinear(PwConvs[PwBase + 2], 0, IntSize, d, InterName + '.weight',
+          InterName + '.bias');
+        DumpLinear(PwConvs[PwBase + 3], 0, d, IntSize, OutDenseName + '.weight',
+          OutDenseName + '.bias');
+        SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 2],
+          OutLNName + '.weight', OutLNName + '.bias', d, pDType);
+      end;
+
+      // ---- optional pooler head ----
+      if pIncludePooler then
+        DumpLinear(PwConvs[4 * Config.NumLayers], 0, d, d,
+          Config.Prefix + 'pooler.dense.weight',
+          Config.Prefix + 'pooler.dense.bias');
+
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+  finally
+    V.Free;
   end;
 end;
 

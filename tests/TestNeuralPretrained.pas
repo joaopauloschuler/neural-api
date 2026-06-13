@@ -108,6 +108,7 @@ type
     procedure TestGPT2SafeTensorsRoundTrip;
     procedure TestLlamaSafeTensorsRoundTrip;
     procedure TestQwen3SafeTensorsRoundTrip;
+    procedure TestBertSafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -1629,6 +1630,74 @@ begin
     // F32 + invertible q/k de-permute + SwiGLU un-fuse + per-head q/k RMSNorm
     // gain un-permute -> identical logits.
     AssertTrue('Qwen3 safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
+    NN.Free;
+  end;
+end;
+
+// (SaveBertToSafeTensors): import the committed pico BERT fixture -> export to
+// a temp .safetensors -> re-import (same config.json) and assert the final
+// hidden states match the original import bit-tight on pinned (token-id,
+// token-type) inputs. Proves the name map, the Q|K|V slab un-fusion and the
+// straight [out,in] nn.Linear (+bias) / LayerNorm gamma-beta dumps are the
+// exact inverse of BuildBertFromSafeTensors. pIncludePooler=true also exercises
+// the pooler.dense head round-trip.
+procedure TTestNeuralPretrained.TestBertSafeTensorsRoundTrip;
+var
+  NN, NN2: TNNet;
+  Config, Config2: TBertConfig;
+  Input, Out1, Out2: TNNetVolume;
+  TmpPath, CfgPath: string;
+  i, s, SeqLen, Vocab, TypeVocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  CfgPath := FixturePath('tiny_bert_config.json');
+  TmpPath := GetTempDir(false) + 'cai_bert_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_bert.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false, {pIncludePooler=}true, CfgPath);
+  Input := TNNetVolume.Create;
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  NN2 := nil;
+  try
+    SaveBertToSafeTensors(NN, Config, TmpPath, {pIncludePooler=}true);
+    NN2 := BuildBertFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}0,
+      {pInferenceOnly=}false, {pIncludePooler=}true, CfgPath);
+
+    SeqLen := Config.MaxPositions - Config.PositionOffset;
+    Vocab := Config.VocabSize;
+    if Config.TypeVocabSize > 0 then TypeVocab := Config.TypeVocabSize
+    else TypeVocab := 1;
+    // Channel 0 = token ids, channel 1 = token-type (segment) ids.
+    Input.ReSize(SeqLen, 1, 2);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+      begin
+        Input[i, 0, 0] := (s * 5 + i * 3 + 1) mod Vocab;
+        Input[i, 0, 1] := (i + s) mod TypeVocab;
+      end;
+      NN.Compute(Input);
+      NN.GetOutput(Out1);
+      NN2.Compute(Input);
+      NN2.GetOutput(Out2);
+      AssertEquals('bert round-trip output size', Out1.Size, Out2.Size);
+      for i := 0 to Out1.Size - 1 do
+        if Abs(Out1.FData[i] - Out2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(Out1.FData[i] - Out2.FData[i]);
+    end;
+    // F32 + invertible Q|K|V un-fuse + straight nn.Linear/LayerNorm dumps ->
+    // identical hidden states.
+    AssertTrue('BERT safetensors round-trip: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
   finally
     if FileExists(TmpPath) then DeleteFile(TmpPath);

@@ -255,8 +255,14 @@ rather than acted on.
       SaveQwen3ToSafeTensors LANDED via the dedicated BuildQwen3MemTensorReader
       walk — same q/k rotate_half de-permute + SwiGLU gate|up un-fuse PLUS the
       per-head q/k RMSNorm gain un-permute, round-trip gated by
-      TestQwen3SafeTensorsRoundTrip): add a layer->HF-name + transpose inverse
-      map for the REMAINING architectures (BERT/GPT-NeoX/...), each its own map.
+      TestQwen3SafeTensorsRoundTrip; BERT SaveBertToSafeTensors LANDED as the
+      exact inverse of BuildBertFromSafeTensors — walks the encoder, un-fuses the
+      Q|K|V slab into the three nn.Linear tensors and dumps straight [out,in]
+      linears (+bias) / LayerNorm gamma-beta / word|type|position embeddings
+      under the family name map (bert/distilbert/roberta prefixes), round-trip
+      gated by TestBertSafeTensorsRoundTrip): add a layer->HF-name + transpose
+      inverse map for the REMAINING architectures (GPT-NeoX/...), each its own
+      map.
 - [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the
