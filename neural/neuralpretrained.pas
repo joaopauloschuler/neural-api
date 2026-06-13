@@ -879,6 +879,40 @@ function BuildLlamaFromGGUF(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// ---- GGUF EXPORT (writer) ----------------------------------------------
+// The byte-for-byte inverse of BuildLlamaFromGGUFEx: writes a llama.cpp-
+// loadable .gguf for a Llama-family decoder whose HF-named weights live in
+// Reader (a safetensors / torch.bin / GGUF tensor source) and whose
+// hyperparameters live in Config. Emits the ggml container (magic, version
+// 3, 32-byte alignment), the llama.* metadata block (general.architecture
+// "llama", block_count / embedding_length / feed_forward_length /
+// attention.head_count[_kv] / context_length / rope.freq_base /
+// attention.layer_norm_rms_epsilon / vocab_size) and, when Tokens is
+// non-empty, a self-contained tokenizer.ggml.* block (model "llama", the
+// token list, and matching scores/token_type arrays). Tensors carry the
+// ggml-canonical names (token_embd, blk.N.attn_q/k/v/output, blk.N.ffn_
+// gate/up/down, blk.N.attn_norm/ffn_norm, output_norm, output) with the
+// dims reversed; the q/k projection rows are permuted from HF rotate_half
+// into the interleaved-rotary layout llama.cpp expects (the inverse of the
+// reader's de-interleave), so a write -> BuildLlamaFromGGUF round-trip
+// reproduces logits. pDType selects the matrix encoding (gwF32 lossless,
+// gwF16, gwQ8_0); 1-D norm gains always stay F32.
+//
+// SCOPE: Llama-family decoders only (model_type llama/mistral/qwen2 with the
+// standard SwiGLU MLP, separate q/k/v, single RoPE theta). The exotic deltas
+// (MoE, fused qkv/gate-up, sandwich/post norms, QK-norm, partial rotary,
+// per-layer theta, soft-capping, embed scale) are NOT serialized and are
+// rejected loudly - exporting those is out of scope for v1, same as the
+// ONNX-export task. Q8_0 is quantized on write (max|x|/127 + round, the
+// ggml quantize_row_q8_0 reference).
+procedure SaveLlamaToGGUFEx(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; const Tokens: array of string;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+// As SaveLlamaToGGUFEx with the F32 (lossless) matrix encoding and no
+// tokenizer block (pass tokens to the Ex form for a self-contained file).
+procedure SaveLlamaToGGUF(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; const FileName: string);
+
 // Mistral: the Llama skeleton + optional sliding-window attention (config
 // sliding_window; null/absent = full attention). Thin wrappers over the
 // Llama path that ASSERT the config's model_type is 'mistral'.
@@ -5570,6 +5604,251 @@ var
 begin
   Result := BuildLlamaFromGGUFEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, pQuantizeInt8);
+end;
+
+procedure SaveLlamaToGGUFEx(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; const Tokens: array of string;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+var
+  Writer: TNNetGGUFWriter;
+  Prefix: string;
+  HeadDim, QWidth, KVWidth, b, i: integer;
+  BlockPrefix, GGUFBlock: string;
+  Scores: array of single;
+  TokenTypes: array of Int64;
+
+  // Loads an HF-named tensor [Rows, Cols] from the reader.
+  function LoadHF(const HFName: string): TNNetVolume;
+  begin
+    if not Reader.HasTensor(HFName) then
+      ImportError('Llama GGUF export: missing tensor "' + HFName + '" in ' +
+        Reader.FileName + '.');
+    Result := TNNetVolume.Create;
+    Reader.LoadTensorFlat(HFName, Result);
+  end;
+
+  // Writes a 2-D matrix tensor [Rows, Cols] under its ggml name.
+  procedure WriteMatrix(const HFName, GGUFName: string;
+    Rows, Cols: integer);
+  var
+    V: TNNetVolume;
+  begin
+    V := LoadHF(HFName);
+    try
+      if V.Size <> Rows * Cols then
+        ImportError('Llama GGUF export: tensor "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' +
+          IntToStr(Rows * Cols) + '.');
+      Writer.AddTensorFlat(GGUFName, [Rows, Cols], V, pDType);
+    finally
+      V.Free;
+    end;
+  end;
+
+  // Writes a 1-D norm gain [Cols]; always F32 (the llama.cpp convention).
+  procedure WriteNorm(const HFName, GGUFName: string; Cols: integer);
+  var
+    V: TNNetVolume;
+  begin
+    V := LoadHF(HFName);
+    try
+      if V.Size <> Cols then
+        ImportError('Llama GGUF export: norm "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' + IntToStr(Cols) + '.');
+      Writer.AddTensorFlat(GGUFName, [Cols], V, gwF32);
+    finally
+      V.Free;
+    end;
+  end;
+
+  // Writes a q/k projection [Rows, Cols], permuting the rows from HF
+  // rotate_half into llama.cpp's interleaved-rotary layout (the inverse of
+  // the reader's de-interleave): stored[head, 2p] = hf[head, p],
+  // stored[head, 2p+1] = hf[head, p + head_dim/2].
+  procedure WriteQKMatrix(const HFName, GGUFName: string;
+    Rows, Cols: integer);
+  var
+    V, Perm: TNNetVolume;
+    HalfDim, hd, pp, srcRow, dstRow, c: integer;
+  begin
+    V := LoadHF(HFName);
+    Perm := TNNetVolume.Create;
+    try
+      if V.Size <> Rows * Cols then
+        ImportError('Llama GGUF export: q/k tensor "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' +
+          IntToStr(Rows * Cols) + '.');
+      if (Rows mod HeadDim) <> 0 then
+        ImportError('Llama GGUF export: q/k tensor "' + HFName + '" rows ' +
+          IntToStr(Rows) + ' not a multiple of head_dim ' +
+          IntToStr(HeadDim) + '.');
+      Perm.ReSize(Rows * Cols, 1, 1);
+      HalfDim := HeadDim div 2;
+      // For each HF source row, compute its stored (interleaved) row.
+      for srcRow := 0 to Rows - 1 do
+      begin
+        hd := srcRow div HeadDim;
+        pp := srcRow mod HeadDim;
+        if pp < HalfDim then
+          dstRow := hd * HeadDim + 2 * pp
+        else
+          dstRow := hd * HeadDim + 2 * (pp - HalfDim) + 1;
+        for c := 0 to Cols - 1 do
+          Perm.FData[dstRow * Cols + c] := V.FData[srcRow * Cols + c];
+      end;
+      Writer.AddTensorFlat(GGUFName, [Rows, Cols], Perm, pDType);
+    finally
+      Perm.Free;
+      V.Free;
+    end;
+  end;
+
+begin
+  // ---- reject the out-of-scope architecture deltas (v1 = plain Llama) ----
+  if Config.IsMoE then
+    ImportError('Llama GGUF export: MoE models are out of scope for v1.');
+  if Config.FusedQKVGateUp or Config.FusedGateUp then
+    ImportError('Llama GGUF export: fused qkv/gate-up projections are out ' +
+      'of scope for v1.');
+  if Config.SandwichNorm or Config.GLM4SandwichNorm or
+     Config.PostNormReordered then
+    ImportError('Llama GGUF export: sandwich/reordered norms are out of ' +
+      'scope for v1.');
+  if Config.QKNorm or Config.QKNormFullWidth then
+    ImportError('Llama GGUF export: q/k RMSNorm models are out of scope ' +
+      'for v1.');
+  if (Config.PartialRotaryFactor > 0) and (Config.PartialRotaryFactor < 1) then
+    ImportError('Llama GGUF export: partial rotary is out of scope for v1.');
+  if Config.InterleavedRotary then
+    ImportError('Llama GGUF export: interleaved-rotary families (GLM-4/' +
+      'Cohere) are out of scope for v1.');
+  if Config.GegluFFN then
+    ImportError('Llama GGUF export: gated-GELU FFN (Gemma) is out of scope ' +
+      'for v1.');
+  if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1) then
+    ImportError('Llama GGUF export: embedding scaling (Gemma) is out of ' +
+      'scope for v1.');
+  if (Config.QueryPreAttnScalar <> 0) or (Config.AttnLogitSoftCap <> 0) or
+     (Config.FinalLogitSoftCap <> 0) then
+    ImportError('Llama GGUF export: Gemma-2 score scaling / soft-capping ' +
+      'is out of scope for v1.');
+  if Config.RopeLocalTheta > 0 then
+    ImportError('Llama GGUF export: per-layer RoPE theta (Gemma-3) is out ' +
+      'of scope for v1.');
+
+  if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+  else HeadDim := Config.HiddenSize div Config.NumHeads;
+  QWidth := Config.NumHeads * HeadDim;
+  KVWidth := Config.NumKVHeads * HeadDim;
+
+  // Detect the tensor-name prefix ('model.' for HF, '' for some exports).
+  if Reader.HasTensor('model.embed_tokens.weight') then Prefix := 'model.'
+  else if Reader.HasTensor('embed_tokens.weight') then Prefix := ''
+  else
+    ImportError('Llama GGUF export: neither "model.embed_tokens.weight" ' +
+      'nor "embed_tokens.weight" found in ' + Reader.FileName + '.');
+
+  Writer := TNNetGGUFWriter.Create(FileName);
+  try
+    // ---- metadata (the llama.* hyperparameter block) ----
+    Writer.AddMetaString('general.architecture', 'llama');
+    Writer.AddMetaString('general.name', 'cai-neural-api-export');
+    Writer.AddMetaUInt32('llama.block_count', Config.NumLayers);
+    Writer.AddMetaUInt32('llama.context_length', Config.MaxPositions);
+    Writer.AddMetaUInt32('llama.embedding_length', Config.HiddenSize);
+    Writer.AddMetaUInt32('llama.feed_forward_length',
+      Config.IntermediateSize);
+    Writer.AddMetaUInt32('llama.attention.head_count', Config.NumHeads);
+    Writer.AddMetaUInt32('llama.attention.head_count_kv', Config.NumKVHeads);
+    Writer.AddMetaFloat32('llama.attention.layer_norm_rms_epsilon',
+      Config.RmsNormEps);
+    Writer.AddMetaFloat32('llama.rope.freq_base', Config.RopeTheta);
+    Writer.AddMetaUInt32('llama.rope.dimension_count', HeadDim);
+    Writer.AddMetaUInt32('llama.vocab_size', Config.VocabSize);
+    if (Config.HeadDim > 0) and
+       (Config.HeadDim <> Config.HiddenSize div Config.NumHeads) then
+      Writer.AddMetaUInt32('llama.attention.key_length', HeadDim);
+    if Config.RopeScaling.Mode = rsmPositionInterpolation then
+    begin
+      Writer.AddMetaString('llama.rope.scaling.type', 'linear');
+      Writer.AddMetaFloat32('llama.rope.scaling.factor',
+        Config.RopeScaling.Factor);
+    end
+    else if Config.RopeScaling.Mode <> rsmNone then
+      ImportError('Llama GGUF export: rope_scaling mode ' +
+        IntToStr(Ord(Config.RopeScaling.Mode)) + ' is out of scope for v1 ' +
+        '(only none / linear).');
+
+    // ---- a self-contained tokenizer block (when tokens are supplied) ----
+    if Length(Tokens) > 0 then
+    begin
+      if Length(Tokens) <> Config.VocabSize then
+        ImportError('Llama GGUF export: ' + IntToStr(Length(Tokens)) +
+          ' tokens supplied but vocab_size is ' +
+          IntToStr(Config.VocabSize) + '.');
+      Writer.AddMetaString('tokenizer.ggml.model', 'llama');
+      Writer.AddMetaStringArray('tokenizer.ggml.tokens', Tokens);
+      SetLength(Scores, Length(Tokens));
+      SetLength(TokenTypes, Length(Tokens));
+      for i := 0 to High(Tokens) do
+      begin
+        Scores[i] := 0;
+        TokenTypes[i] := 1; // LLAMA_TOKEN_TYPE_NORMAL
+      end;
+      Writer.AddMetaFloat32Array('tokenizer.ggml.scores', Scores);
+      Writer.AddMetaInt32Array('tokenizer.ggml.token_type', TokenTypes);
+    end;
+
+    // ---- tensors (ggml-canonical names, dims reversed by the writer) ----
+    WriteMatrix(Prefix + 'embed_tokens.weight', 'token_embd.weight',
+      Config.VocabSize, Config.HiddenSize);
+    for b := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Prefix + 'layers.' + IntToStr(b) + '.';
+      GGUFBlock := 'blk.' + IntToStr(b) + '.';
+      WriteNorm(BlockPrefix + 'input_layernorm.weight',
+        GGUFBlock + 'attn_norm.weight', Config.HiddenSize);
+      WriteQKMatrix(BlockPrefix + 'self_attn.q_proj.weight',
+        GGUFBlock + 'attn_q.weight', QWidth, Config.HiddenSize);
+      WriteQKMatrix(BlockPrefix + 'self_attn.k_proj.weight',
+        GGUFBlock + 'attn_k.weight', KVWidth, Config.HiddenSize);
+      WriteMatrix(BlockPrefix + 'self_attn.v_proj.weight',
+        GGUFBlock + 'attn_v.weight', KVWidth, Config.HiddenSize);
+      WriteMatrix(BlockPrefix + 'self_attn.o_proj.weight',
+        GGUFBlock + 'attn_output.weight', Config.HiddenSize, QWidth);
+      WriteNorm(BlockPrefix + 'post_attention_layernorm.weight',
+        GGUFBlock + 'ffn_norm.weight', Config.HiddenSize);
+      WriteMatrix(BlockPrefix + 'mlp.gate_proj.weight',
+        GGUFBlock + 'ffn_gate.weight', Config.IntermediateSize,
+        Config.HiddenSize);
+      WriteMatrix(BlockPrefix + 'mlp.up_proj.weight',
+        GGUFBlock + 'ffn_up.weight', Config.IntermediateSize,
+        Config.HiddenSize);
+      WriteMatrix(BlockPrefix + 'mlp.down_proj.weight',
+        GGUFBlock + 'ffn_down.weight', Config.HiddenSize,
+        Config.IntermediateSize);
+    end;
+    WriteNorm(Prefix + 'norm.weight', 'output_norm.weight',
+      Config.HiddenSize);
+    // llama.cpp omits output.weight when the LM head is tied to the
+    // embeddings; mirror that so the round-trip infers TieWordEmbeddings.
+    if not Config.TieWordEmbeddings then
+      WriteMatrix('lm_head.weight', 'output.weight',
+        Config.VocabSize, Config.HiddenSize);
+
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
+procedure SaveLlamaToGGUF(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; const FileName: string);
+var
+  NoTokens: array of string;
+begin
+  SetLength(NoTokens, 0);
+  SaveLlamaToGGUFEx(Reader, Config, NoTokens, FileName, gwF32);
 end;
 
 function BuildLlamaFromSafeTensorsEx(const FileName: string;

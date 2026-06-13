@@ -141,6 +141,7 @@ type
     procedure TestGGUFKQuantDecodeParity;
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
+    procedure TestGGUFWriterRoundTrip;
     procedure TestShardedReaderMatchesSingleFile;
     procedure TestShardedLlamaLogitsBitIdentical;
     procedure TestDistilGPT2LogitParity;
@@ -216,6 +217,45 @@ type
   end;
 
 implementation
+
+// Writes a small JSON sidecar describing the GGUF the writer round-trip
+// test emitted, for tools/verify_gguf_writer.py to cross-check against the
+// python "gguf" package: the file path plus the llama.* hyperparameters
+// that must round-trip (block_count / embedding_length / head counts /
+// vocab / rms eps / rope base) and the expected tied-head flag.
+procedure WriteGGUFWriterSidecar(const SidecarPath, GGUFPath: string;
+  const Config: TLlamaConfig);
+var
+  SL: TStringList;
+  FS: TFormatSettings;
+  Tied: string;
+begin
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  if Config.TieWordEmbeddings then Tied := 'true' else Tied := 'false';
+  SL := TStringList.Create;
+  try
+    SL.Add('{');
+    SL.Add('  "file": ' + AnsiQuotedStr(GGUFPath, '"') + ',');
+    SL.Add('  "block_count": ' + IntToStr(Config.NumLayers) + ',');
+    SL.Add('  "embedding_length": ' + IntToStr(Config.HiddenSize) + ',');
+    SL.Add('  "feed_forward_length": ' +
+      IntToStr(Config.IntermediateSize) + ',');
+    SL.Add('  "head_count": ' + IntToStr(Config.NumHeads) + ',');
+    SL.Add('  "head_count_kv": ' + IntToStr(Config.NumKVHeads) + ',');
+    SL.Add('  "vocab_size": ' + IntToStr(Config.VocabSize) + ',');
+    SL.Add('  "context_length": ' + IntToStr(Config.MaxPositions) + ',');
+    SL.Add('  "rms_norm_eps": ' +
+      FloatToStr(Config.RmsNormEps, FS) + ',');
+    SL.Add('  "rope_freq_base": ' +
+      FloatToStr(Config.RopeTheta, FS) + ',');
+    SL.Add('  "tie_word_embeddings": ' + Tied);
+    SL.Add('}');
+    SL.SaveToFile(SidecarPath);
+  finally
+    SL.Free;
+  end;
+end;
 
 function TTestNeuralPretrained.FixturePath(const FileName: string): string;
 begin
@@ -3521,6 +3561,143 @@ begin
   finally
     NNG.Free;
     NNRef.Free;
+  end;
+end;
+
+// GGUF WRITER round-trip: import the tiny_llama checkpoint from
+// safetensors, SaveLlamaToGGUFEx it back out, then re-import the emitted
+// .gguf via BuildLlamaFromGGUF and assert the two nets produce IDENTICAL
+// logits. The F32 writer is lossless and its q/k rotate_half->interleaved
+// permute is the exact inverse of the reader's de-interleave, so the
+// round-trip must reproduce logits bit-for-bit (gated at 1e-5, well below
+// the F32 import's own 1e-4 oracle gate). A second pass uses the Q8_0
+// writer on the hidden-32 fixture and bounds the quantization drift.
+procedure TTestNeuralPretrained.TestGGUFWriterRoundTrip;
+var
+  NNRef, NNG: TNNet;
+  Config, ConfigG: TLlamaConfig;
+  Reader: TNNetSafeTensorsReader;
+  Tokens: array of string;
+  GGUFPath: string;
+  Input, OutR, OutG: TNNetVolume;
+  i, s, SeqLen, Vocab: integer;
+  MaxDiff, MaxAbsLogit, Drift: double;
+begin
+  RandSeed := 424242;
+  // ---- (a) F32 lossless round-trip on the untied tiny_llama fixture ----
+  // Written to a STABLE path (+ a sidecar of the expected metadata) so
+  // tools/verify_gguf_writer.py can cross-check it with the python "gguf"
+  // package after `bash tests/RunAll.sh`.
+  GGUFPath := GetTempDir(false) + 'cai_gguf_writer_demo.gguf';
+  Config := ReadLlamaConfigFromJSONFile(FixturePath('tiny_llama_config.json'));
+  // The config.json omits vocab_size at times; fill from the embedding rows.
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_llama.safetensors'));
+  try
+    if Config.VocabSize <= 0 then
+      Config.VocabSize := integer(
+        Reader.DimSize('model.embed_tokens.weight', 0));
+    SetLength(Tokens, Config.VocabSize);
+    for i := 0 to Config.VocabSize - 1 do
+      Tokens[i] := '<tok_' + IntToStr(i) + '>';
+    SaveLlamaToGGUFEx(Reader, Config, Tokens, GGUFPath, gwF32);
+  finally
+    Reader.Free;
+  end;
+  WriteGGUFWriterSidecar(GetTempDir(false) + 'cai_gguf_writer_demo.json',
+    GGUFPath, Config);
+
+  NNRef := BuildLlamaFromSafeTensorsEx(
+    FixturePath('tiny_llama.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_llama_config.json'));
+  NNG := BuildLlamaFromGGUFEx(GGUFPath, ConfigG);
+  Input := TNNetVolume.Create;
+  OutR := TNNetVolume.Create;
+  OutG := TNNetVolume.Create;
+  try
+    AssertEquals('round-trip hidden', Config.HiddenSize, ConfigG.HiddenSize);
+    AssertEquals('round-trip layers', Config.NumLayers, ConfigG.NumLayers);
+    AssertEquals('round-trip vocab', Config.VocabSize, ConfigG.VocabSize);
+    AssertFalse('round-trip untied head', ConfigG.TieWordEmbeddings);
+    SeqLen := ConfigG.MaxPositions;
+    Vocab := ConfigG.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      NNRef.Compute(Input);
+      NNRef.GetOutput(OutR);
+      NNG.Compute(Input);
+      NNG.GetOutput(OutG);
+      AssertEquals('round-trip output size', OutR.Size, OutG.Size);
+      for i := 0 to OutR.Size - 1 do
+        if Abs(OutR.FData[i] - OutG.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutR.FData[i] - OutG.FData[i]);
+    end;
+    // F32 + invertible permute -> identical logits (allow tiny FP slack).
+    AssertTrue('F32 GGUF writer round-trip max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    OutG.Free; OutR.Free; Input.Free;
+    NNG.Free; NNRef.Free;
+    // NB: GGUFPath is left on disk for tools/verify_gguf_writer.py.
+  end;
+
+  // ---- (b) Q8_0 writer on the hidden-32 (tied) fixture: bounded drift ----
+  GGUFPath := GetTempDir(false) + 'cai_gguf_writer_rt_q8_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Config := ReadLlamaConfigFromJSONFile(
+    FixturePath('tiny_llama_q8_config.json'));
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_llama_q8.safetensors'));
+  try
+    SetLength(Tokens, 0);
+    SaveLlamaToGGUFEx(Reader, Config, Tokens, GGUFPath, gwQ8_0);
+  finally
+    Reader.Free;
+  end;
+  NNRef := BuildLlamaFromSafeTensorsEx(
+    FixturePath('tiny_llama_q8.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_llama_q8_config.json'));
+  NNG := BuildLlamaFromGGUFEx(GGUFPath, ConfigG);
+  Input := TNNetVolume.Create;
+  OutR := TNNetVolume.Create;
+  OutG := TNNetVolume.Create;
+  try
+    AssertTrue('q8 round-trip tied head', ConfigG.TieWordEmbeddings);
+    SeqLen := ConfigG.MaxPositions;
+    Vocab := ConfigG.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0; MaxAbsLogit := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      NNRef.Compute(Input);
+      NNRef.GetOutput(OutR);
+      NNG.Compute(Input);
+      NNG.GetOutput(OutG);
+      for i := 0 to OutR.Size - 1 do
+      begin
+        if Abs(OutR.FData[i]) > MaxAbsLogit then
+          MaxAbsLogit := Abs(OutR.FData[i]);
+        if Abs(OutR.FData[i] - OutG.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutR.FData[i] - OutG.FData[i]);
+      end;
+    end;
+    AssertTrue('q8 reference non-degenerate', MaxAbsLogit > 1e-3);
+    Drift := MaxDiff / MaxAbsLogit;
+    // Pure Q8_0 quantization error at pico width 32 (same regime as the
+    // reader Q8 drift test, ~8e-2); must be VISIBLE (> 1e-3) but bounded.
+    AssertTrue('Q8_0 GGUF writer drift = ' + FloatToStr(Drift) +
+      ' must be in (1e-3, 1.5e-1) relative',
+      (Drift > 1e-3) and (Drift < 1.5e-1));
+  finally
+    OutG.Free; OutR.Free; Input.Free;
+    NNG.Free; NNRef.Free;
+    DeleteFile(GGUFPath);
   end;
 end;
 

@@ -243,7 +243,7 @@ rather than acted on.
       BuildGPT2FromSafeTensors and compare logits; generalize per-importer
       name maps later. The generic writer landed; only the naming/transpose
       mapping (Pascal neuron-major vs HF [in,out] Conv1D) is missing.
-- [ ] GGUF WRITER / export path (neural/neuralgguf.pas currently READS only:
+- [X] GGUF WRITER / export path (neural/neuralgguf.pas currently READS only:
       TNNetGGUFReader F32/F16/Q8_0 + BuildLlamaFromGGUF). Add a
       TNNetGGUFWriter / SaveNNetToGGUF that emits a llama.cpp-loadable .gguf
       for an imported-or-trained Llama-family decoder, so CAI models can run
@@ -273,6 +273,31 @@ rather than acted on.
       compares logits bit-for-bit. Scope v1 to the Llama family (the
       best-covered importer path); document other architectures as
       out-of-scope, same as the ONNX-export task.
+      DONE (a3): TNNetGGUFWriter in neuralgguf.pas (container + typed KV
+      metadata + reversed-dims/32-byte-aligned tensor section, F32/F16/Q8_0
+      encode-on-write) + SaveLlamaToGGUF[Ex] in neuralpretrained.pas (llama.*
+      metadata + self-contained tokenizer.ggml.* block + ggml-canonical
+      names + the rotate_half->interleaved q/k permute, the exact inverse of
+      the reader's de-interleave). TestGGUFWriterRoundTrip: F32 write ->
+      BuildLlamaFromGGUF reproduces logits to <1e-5 (bit-exact modulo FP);
+      Q8_0 drift bounded (pico-width quantization error). tools/
+      verify_gguf_writer.py cross-checks the emitted file with the python
+      gguf package (architecture/metadata/tokenizer + reversed-dims tensor
+      table). v1 SCOPE CUTS (deferred follow-ups):
+        * Source is an HF-named tensor reader + TLlamaConfig (the importer's
+          natural inverse), NOT weight-readback from a trained TNNet's wired
+          layers - exporting an arbitrary in-memory net needs the layer->HF
+          inverse mapping (q/k de-permute, SwiGLU un-fuse) and is open.
+        * Q8_0 is quantized ON WRITE from F32 (ggml quantize_row_q8_0 ref),
+          NOT straight-copied from the int8 weight-only storage - the
+          straight-copy coupling is open.
+        * Only the plain Llama family (separate q/k/v, SwiGLU, single RoPE
+          theta, none/linear scaling); MoE / fused proj / sandwich-post norms
+          / QK-norm / partial-rotary / per-layer theta / soft-capping / embed
+          scale are rejected loudly. merges array also not emitted (SP-style
+          tokenizer.ggml.tokens/scores/token_type only).
+        * Python next-token-logit parity not wired (the Pascal round-trip
+          through BuildLlamaFromGGUF is the logit-exactness gate instead).
 - [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.

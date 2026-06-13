@@ -189,6 +189,84 @@ type
     property Alignment: integer read FAlignment;
   end;
 
+type
+  // The ggml dtype a writer encodes a 2-D matrix tensor as. F32 is the
+  // lossless default; F16 halves the file (round-to-nearest-even via
+  // EncodeF16); Q8_0 quantizes 32-element blocks to an f16 scale + 32 int8
+  // (~4x smaller, the dominant weight-only quant). 1-D norm gains always
+  // stay F32 (the llama.cpp convention), whatever the matrix dtype.
+  TGGUFWriteDType = (gwF32, gwF16, gwQ8_0);
+
+  // One tensor queued in a TNNetGGUFWriter: its ggml name, the row-major
+  // shape (the writer reverses it to the ggml contiguous-first order on
+  // disk), the chosen ggml dtype and the encoded little-endian bytes.
+  TGGUFPendingTensor = record
+    Name: string;
+    Shape: array of Int64;       // row-major (as the reader serves it)
+    GGMLType: integer;           // GGML_TYPE_* actually written
+    Data: TBytes;                // already-encoded payload
+  end;
+
+  { TNNetGGUFWriter }
+  // Builds a llama.cpp/ggml-loadable .gguf (the byte-for-byte inverse of
+  // TNNetGGUFReader): magic 'GGUF', version 3, the typed metadata KV block
+  // and the tensor section with ggml's REVERSED dimension order and 32-byte
+  // data alignment. Metadata is queued through the typed Add* methods
+  // (insertion order is preserved); tensors through AddTensorFlat (which
+  // encodes F32/F16/Q8_0 and reverses the shape). SaveToFile emits the file
+  // once. A file written here re-imports through TNNetGGUFReader /
+  // BuildLlamaFromGGUF and loads with the Python "gguf" package.
+  // Coded by Claude (AI).
+  TNNetGGUFWriter = class
+  private
+    FFileName: string;
+    FMeta: array of TGGUFMetaValue;
+    FTensors: array of TGGUFPendingTensor;
+    FAlignment: integer;
+    FSaved: boolean;
+    function FindMeta(const pKey: string): integer;
+    function FindTensor(const pName: string): integer;
+    procedure AddMeta(const Meta: TGGUFMetaValue);
+    procedure WriteHeaderString(Stream: TStream; const S: string);
+    procedure WriteMetaValue(Stream: TStream; const Meta: TGGUFMetaValue);
+  public
+    constructor Create(const pFileName: string);
+    destructor Destroy; override;
+
+    // ---- typed metadata (queued in call order, keys must be unique) ----
+    procedure AddMetaUInt32(const pKey: string; Value: cardinal);
+    procedure AddMetaInt32(const pKey: string; Value: integer);
+    procedure AddMetaUInt64(const pKey: string; Value: QWord);
+    procedure AddMetaFloat32(const pKey: string; Value: single);
+    procedure AddMetaBool(const pKey: string; Value: boolean);
+    procedure AddMetaString(const pKey, pValue: string);
+    // A string array (e.g. tokenizer.ggml.tokens / .merges).
+    procedure AddMetaStringArray(const pKey: string;
+      const Values: array of string);
+    // A float32 array (e.g. tokenizer.ggml.scores).
+    procedure AddMetaFloat32Array(const pKey: string;
+      const Values: array of single);
+    // An int32 array (e.g. tokenizer.ggml.token_type).
+    procedure AddMetaInt32Array(const pKey: string;
+      const Values: array of Int64);
+
+    // Queues a named tensor. pShape is the row-major shape (a 2-D matrix is
+    // [out, in], the same view the reader serves); the writer reverses it to
+    // ggml's contiguous-first order on disk. Src supplies the elements in
+    // flat row-major order (prod(pShape) must equal Src.Size). pDType picks
+    // the ggml encoding: gwF32/gwF16/gwQ8_0. Q8_0 requires the contiguous
+    // (last) dimension to be a multiple of 32. Data is copied, so Src may be
+    // freed/reused immediately.
+    procedure AddTensorFlat(const pName: string; const pShape: array of Int64;
+      Src: TNNetVolume; pDType: TGGUFWriteDType = gwF32);
+    function Count: integer;
+    // Writes the queued metadata and tensors to FileName. Call once.
+    procedure SaveToFile;
+
+    property FileName: string read FFileName;
+    property Alignment: integer read FAlignment write FAlignment;
+  end;
+
 // Human-readable name of a ggml tensor dtype id (for error messages).
 function GGMLTypeName(TypeId: integer): string;
 
@@ -1069,6 +1147,449 @@ begin
       for i := 0 to RowLen - 1 do
         Dest.FData[r * RowLen + i] := Tmp[SrcRow * RowLen + i];
     end;
+  end;
+end;
+
+{ TNNetGGUFWriter }
+
+constructor TNNetGGUFWriter.Create(const pFileName: string);
+begin
+  inherited Create;
+  FFileName := pFileName;
+  FAlignment := 32;
+  FSaved := false;
+end;
+
+destructor TNNetGGUFWriter.Destroy;
+begin
+  inherited Destroy;
+end;
+
+function TNNetGGUFWriter.FindMeta(const pKey: string): integer;
+var
+  i: integer;
+begin
+  for i := 0 to High(FMeta) do
+    if FMeta[i].Key = pKey then exit(i);
+  Result := -1;
+end;
+
+function TNNetGGUFWriter.FindTensor(const pName: string): integer;
+var
+  i: integer;
+begin
+  for i := 0 to High(FTensors) do
+    if FTensors[i].Name = pName then exit(i);
+  Result := -1;
+end;
+
+procedure TNNetGGUFWriter.AddMeta(const Meta: TGGUFMetaValue);
+begin
+  if Meta.Key = '' then
+    raise EGGUFError.Create('gguf writer: empty metadata key.');
+  if FindMeta(Meta.Key) >= 0 then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: duplicate metadata key "%s".', [Meta.Key]);
+  SetLength(FMeta, Length(FMeta) + 1);
+  FMeta[High(FMeta)] := Meta;
+end;
+
+procedure TNNetGGUFWriter.AddMetaUInt32(const pKey: string; Value: cardinal);
+var
+  M: TGGUFMetaValue;
+begin
+  M := Default(TGGUFMetaValue);
+  M.Key := pKey; M.ValueType := GGUF_TYPE_UINT32; M.IntVal := Value;
+  AddMeta(M);
+end;
+
+procedure TNNetGGUFWriter.AddMetaInt32(const pKey: string; Value: integer);
+var
+  M: TGGUFMetaValue;
+begin
+  M := Default(TGGUFMetaValue);
+  M.Key := pKey; M.ValueType := GGUF_TYPE_INT32; M.IntVal := Value;
+  AddMeta(M);
+end;
+
+procedure TNNetGGUFWriter.AddMetaUInt64(const pKey: string; Value: QWord);
+var
+  M: TGGUFMetaValue;
+begin
+  M := Default(TGGUFMetaValue);
+  M.Key := pKey; M.ValueType := GGUF_TYPE_UINT64; M.IntVal := Int64(Value);
+  AddMeta(M);
+end;
+
+procedure TNNetGGUFWriter.AddMetaFloat32(const pKey: string; Value: single);
+var
+  M: TGGUFMetaValue;
+begin
+  M := Default(TGGUFMetaValue);
+  M.Key := pKey; M.ValueType := GGUF_TYPE_FLOAT32; M.FloatVal := Value;
+  AddMeta(M);
+end;
+
+procedure TNNetGGUFWriter.AddMetaBool(const pKey: string; Value: boolean);
+var
+  M: TGGUFMetaValue;
+begin
+  M := Default(TGGUFMetaValue);
+  M.Key := pKey; M.ValueType := GGUF_TYPE_BOOL;
+  M.BoolVal := Value;
+  if Value then M.IntVal := 1 else M.IntVal := 0;
+  AddMeta(M);
+end;
+
+procedure TNNetGGUFWriter.AddMetaString(const pKey, pValue: string);
+var
+  M: TGGUFMetaValue;
+begin
+  M := Default(TGGUFMetaValue);
+  M.Key := pKey; M.ValueType := GGUF_TYPE_STRING; M.StrVal := pValue;
+  AddMeta(M);
+end;
+
+procedure TNNetGGUFWriter.AddMetaStringArray(const pKey: string;
+  const Values: array of string);
+var
+  M: TGGUFMetaValue;
+  i: integer;
+begin
+  M := Default(TGGUFMetaValue);
+  M.Key := pKey; M.ValueType := GGUF_TYPE_ARRAY;
+  M.ArrElemType := GGUF_TYPE_STRING;
+  SetLength(M.ArrStr, Length(Values));
+  for i := 0 to High(Values) do M.ArrStr[i] := Values[i];
+  AddMeta(M);
+end;
+
+procedure TNNetGGUFWriter.AddMetaFloat32Array(const pKey: string;
+  const Values: array of single);
+var
+  M: TGGUFMetaValue;
+  i: integer;
+begin
+  M := Default(TGGUFMetaValue);
+  M.Key := pKey; M.ValueType := GGUF_TYPE_ARRAY;
+  M.ArrElemType := GGUF_TYPE_FLOAT32;
+  SetLength(M.ArrNum, Length(Values));
+  SetLength(M.ArrInt, Length(Values));
+  for i := 0 to High(Values) do M.ArrNum[i] := Values[i];
+  AddMeta(M);
+end;
+
+procedure TNNetGGUFWriter.AddMetaInt32Array(const pKey: string;
+  const Values: array of Int64);
+var
+  M: TGGUFMetaValue;
+  i: integer;
+begin
+  M := Default(TGGUFMetaValue);
+  M.Key := pKey; M.ValueType := GGUF_TYPE_ARRAY;
+  M.ArrElemType := GGUF_TYPE_INT32;
+  SetLength(M.ArrInt, Length(Values));
+  SetLength(M.ArrNum, Length(Values));
+  for i := 0 to High(Values) do M.ArrInt[i] := Values[i];
+  AddMeta(M);
+end;
+
+procedure TNNetGGUFWriter.AddTensorFlat(const pName: string;
+  const pShape: array of Int64; Src: TNNetVolume; pDType: TGGUFWriteDType);
+var
+  Idx, i, ContigDim: integer;
+  NumElements, NumBlocks, b, e: Int64;
+  WordPtr: PWord;
+  SinglePtr: PSingle;
+  QuantPtr: PShortInt;
+  ScalePtr: PWord;
+  AbsMax, V, Scale, InvScale, Q: single;
+  Pending: TGGUFPendingTensor;
+begin
+  if FSaved then
+    raise EGGUFError.Create('gguf writer: AddTensorFlat after SaveToFile.');
+  if pName = '' then
+    raise EGGUFError.Create('gguf writer: empty tensor name.');
+  if FindTensor(pName) >= 0 then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: duplicate tensor name "%s".', [pName]);
+  if Length(pShape) = 0 then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: tensor "%s" needs at least one dimension.', [pName]);
+  NumElements := 1;
+  for i := 0 to High(pShape) do
+  begin
+    if pShape[i] <= 0 then
+      raise EGGUFError.CreateFmt(
+        'gguf writer: tensor "%s" has a non-positive dimension %d.',
+        [pName, pShape[i]]);
+    NumElements := NumElements * pShape[i];
+  end;
+  if NumElements <> Src.Size then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: tensor "%s" shape implies %d elements but the source ' +
+      'holds %d.', [pName, NumElements, Src.Size]);
+
+  Pending := Default(TGGUFPendingTensor);
+  Pending.Name := pName;
+  SetLength(Pending.Shape, Length(pShape));
+  for i := 0 to High(pShape) do Pending.Shape[i] := pShape[i];
+
+  case pDType of
+    gwF32:
+    begin
+      Pending.GGMLType := GGML_TYPE_F32;
+      SetLength(Pending.Data, NumElements * 4);
+      SinglePtr := PSingle(@Pending.Data[0]);
+      for i := 0 to NumElements - 1 do
+      begin
+        SinglePtr^ := Src.FData[i];
+        Inc(SinglePtr);
+      end;
+    end;
+    gwF16:
+    begin
+      Pending.GGMLType := GGML_TYPE_F16;
+      SetLength(Pending.Data, NumElements * 2);
+      WordPtr := PWord(@Pending.Data[0]);
+      for i := 0 to NumElements - 1 do
+      begin
+        WordPtr^ := EncodeF16(Src.FData[i]);
+        Inc(WordPtr);
+      end;
+    end;
+    gwQ8_0:
+    begin
+      ContigDim := integer(pShape[High(pShape)]);
+      if (ContigDim mod GGUF_Q8_0_BLOCK_ELEMS) <> 0 then
+        raise EGGUFError.CreateFmt(
+          'gguf writer: tensor "%s" is Q8_0 but its contiguous dimension ' +
+          '%d is not a multiple of the block size %d.',
+          [pName, ContigDim, GGUF_Q8_0_BLOCK_ELEMS]);
+      Pending.GGMLType := GGML_TYPE_Q8_0;
+      NumBlocks := NumElements div GGUF_Q8_0_BLOCK_ELEMS;
+      SetLength(Pending.Data, NumBlocks * GGUF_Q8_0_BLOCK_BYTES);
+      for b := 0 to NumBlocks - 1 do
+      begin
+        // ggml quantize_row_q8_0: scale = max|x| / 127, quants = round(x/scale)
+        // clamped to int8; the scale is stored as f16. Mirrors gguf's
+        // quants.quantize(..., Q8_0) so a reader round-trip is bit-stable.
+        AbsMax := 0;
+        for i := 0 to GGUF_Q8_0_BLOCK_ELEMS - 1 do
+        begin
+          V := Abs(Src.FData[b * GGUF_Q8_0_BLOCK_ELEMS + i]);
+          if V > AbsMax then AbsMax := V;
+        end;
+        Scale := AbsMax / 127.0;
+        if Scale = 0 then InvScale := 0 else InvScale := 1.0 / Scale;
+        ScalePtr := PWord(@Pending.Data[b * GGUF_Q8_0_BLOCK_BYTES]);
+        ScalePtr^ := EncodeF16(Scale);
+        QuantPtr := PShortInt(@Pending.Data[b * GGUF_Q8_0_BLOCK_BYTES + 2]);
+        for i := 0 to GGUF_Q8_0_BLOCK_ELEMS - 1 do
+        begin
+          Q := Src.FData[b * GGUF_Q8_0_BLOCK_ELEMS + i] * InvScale;
+          // round-half-away-from-zero then clamp to [-127, 127]
+          if Q >= 0 then e := Trunc(Q + 0.5) else e := Trunc(Q - 0.5);
+          if e > 127 then e := 127;
+          if e < -127 then e := -127;
+          QuantPtr^ := ShortInt(e);
+          Inc(QuantPtr);
+        end;
+      end;
+    end;
+  end;
+
+  Idx := Length(FTensors);
+  SetLength(FTensors, Idx + 1);
+  FTensors[Idx] := Pending;
+end;
+
+function TNNetGGUFWriter.Count: integer;
+begin
+  Result := Length(FTensors);
+end;
+
+procedure TNNetGGUFWriter.WriteHeaderString(Stream: TStream;
+  const S: string);
+var
+  Len: QWord;
+begin
+  Len := Length(S);
+  Stream.WriteBuffer(Len, 8);
+  if Len > 0 then Stream.WriteBuffer(S[1], Len);
+end;
+
+procedure TNNetGGUFWriter.WriteMetaValue(Stream: TStream;
+  const Meta: TGGUFMetaValue);
+var
+  U8: byte;
+  U32: cardinal;
+  U64: QWord;
+  Cnt: QWord;
+  i: integer;
+  ElemType: cardinal;
+
+  procedure WriteScalar(TypeId: integer; const M: TGGUFMetaValue;
+    StrIdx, NumIdx: integer);
+  var
+    lU8: byte;
+    lU32: cardinal;
+    lU64: QWord;
+    lF32: single;
+  begin
+    case TypeId of
+      GGUF_TYPE_UINT8, GGUF_TYPE_INT8, GGUF_TYPE_BOOL:
+        begin lU8 := byte(M.IntVal); Stream.WriteBuffer(lU8, 1); end;
+      GGUF_TYPE_UINT16, GGUF_TYPE_INT16:
+        begin lU32 := cardinal(M.IntVal);
+          Stream.WriteBuffer(lU32, 2); end;
+      GGUF_TYPE_UINT32, GGUF_TYPE_INT32:
+        begin lU32 := cardinal(M.IntVal);
+          Stream.WriteBuffer(lU32, 4); end;
+      GGUF_TYPE_UINT64, GGUF_TYPE_INT64:
+        begin lU64 := QWord(M.IntVal); Stream.WriteBuffer(lU64, 8); end;
+      GGUF_TYPE_FLOAT32:
+        begin
+          if NumIdx >= 0 then lF32 := M.ArrNum[NumIdx] else lF32 := M.FloatVal;
+          Stream.WriteBuffer(lF32, 4);
+        end;
+      GGUF_TYPE_STRING:
+        if StrIdx >= 0 then WriteHeaderString(Stream, M.ArrStr[StrIdx])
+        else WriteHeaderString(Stream, M.StrVal);
+      else
+        raise EGGUFError.CreateFmt(
+          'gguf writer: cannot write metadata "%s" value type %d.',
+          [M.Key, TypeId]);
+    end;
+  end;
+
+begin
+  if Meta.ValueType = GGUF_TYPE_ARRAY then
+  begin
+    ElemType := cardinal(Meta.ArrElemType);
+    Stream.WriteBuffer(ElemType, 4);
+    if Meta.ArrElemType = GGUF_TYPE_STRING then
+      Cnt := Length(Meta.ArrStr)
+    else
+      Cnt := Length(Meta.ArrInt);
+    if Meta.ArrElemType = GGUF_TYPE_FLOAT32 then
+      Cnt := Length(Meta.ArrNum);
+    Stream.WriteBuffer(Cnt, 8);
+    for i := 0 to integer(Cnt) - 1 do
+    begin
+      case Meta.ArrElemType of
+        GGUF_TYPE_STRING: WriteScalar(GGUF_TYPE_STRING, Meta, i, -1);
+        GGUF_TYPE_FLOAT32: WriteScalar(GGUF_TYPE_FLOAT32, Meta, -1, i);
+        GGUF_TYPE_UINT32, GGUF_TYPE_INT32:
+          begin U32 := cardinal(Meta.ArrInt[i]); Stream.WriteBuffer(U32, 4); end;
+        GGUF_TYPE_UINT64, GGUF_TYPE_INT64:
+          begin U64 := QWord(Meta.ArrInt[i]); Stream.WriteBuffer(U64, 8); end;
+        GGUF_TYPE_UINT8, GGUF_TYPE_INT8, GGUF_TYPE_BOOL:
+          begin U8 := byte(Meta.ArrInt[i]); Stream.WriteBuffer(U8, 1); end;
+        else
+          raise EGGUFError.CreateFmt(
+            'gguf writer: cannot write array element type %d for "%s".',
+            [Meta.ArrElemType, Meta.Key]);
+      end;
+    end;
+  end
+  else
+    WriteScalar(Meta.ValueType, Meta, -1, -1);
+end;
+
+procedure TNNetGGUFWriter.SaveToFile;
+var
+  Stream: TFileStream;
+  Magic, U32: cardinal;
+  U64, Offset: QWord;
+  TensorCount, KVCount: QWord;
+  i, j, NDims: integer;
+  Pad: array of byte;
+  PadLen: Int64;
+  HeaderEnd, DataStart: Int64;
+begin
+  if FSaved then
+    raise EGGUFError.Create('gguf writer: SaveToFile called twice.');
+  FSaved := true;
+  if (FAlignment < 1) or ((FAlignment and (FAlignment - 1)) <> 0) then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: alignment %d is not a positive power of two.',
+      [FAlignment]);
+  Stream := TFileStream.Create(FFileName, fmCreate);
+  try
+    // ---- header ----
+    Magic := $46554747; // 'GGUF' little-endian
+    Stream.WriteBuffer(Magic, 4);
+    U32 := 3; // version 3
+    Stream.WriteBuffer(U32, 4);
+    TensorCount := Length(FTensors);
+    KVCount := Length(FMeta);
+    Stream.WriteBuffer(TensorCount, 8);
+    Stream.WriteBuffer(KVCount, 8);
+
+    // ---- metadata KV pairs ----
+    for i := 0 to High(FMeta) do
+    begin
+      WriteHeaderString(Stream, FMeta[i].Key);
+      U32 := cardinal(FMeta[i].ValueType);
+      Stream.WriteBuffer(U32, 4);
+      WriteMetaValue(Stream, FMeta[i]);
+    end;
+
+    // ---- tensor infos (offsets computed below, relative to data section) ----
+    // First pass: compute each tensor's aligned offset into the data blob.
+    Offset := 0;
+    for i := 0 to High(FTensors) do
+    begin
+      WriteHeaderString(Stream, FTensors[i].Name);
+      NDims := Length(FTensors[i].Shape);
+      U32 := cardinal(NDims);
+      Stream.WriteBuffer(U32, 4);
+      // ggml stores the contiguous axis FIRST: reverse the row-major shape.
+      for j := 0 to NDims - 1 do
+      begin
+        U64 := QWord(FTensors[i].Shape[NDims - 1 - j]);
+        Stream.WriteBuffer(U64, 8);
+      end;
+      U32 := cardinal(FTensors[i].GGMLType);
+      Stream.WriteBuffer(U32, 4);
+      Stream.WriteBuffer(Offset, 8);
+      // Advance the data offset, aligning each tensor to FAlignment.
+      Inc(Offset, QWord(Length(FTensors[i].Data)));
+      Offset := ((Offset + QWord(FAlignment) - 1) div QWord(FAlignment)) *
+        QWord(FAlignment);
+    end;
+
+    // ---- alignment padding, then the tensor data blob ----
+    HeaderEnd := Stream.Position;
+    DataStart := ((HeaderEnd + FAlignment - 1) div FAlignment) * FAlignment;
+    PadLen := DataStart - HeaderEnd;
+    if PadLen > 0 then
+    begin
+      SetLength(Pad, PadLen);
+      FillChar(Pad[0], PadLen, 0);
+      Stream.WriteBuffer(Pad[0], PadLen);
+    end;
+    // Write each tensor's payload, padding between tensors to FAlignment.
+    for i := 0 to High(FTensors) do
+    begin
+      if Length(FTensors[i].Data) > 0 then
+        Stream.WriteBuffer(FTensors[i].Data[0], Length(FTensors[i].Data));
+      if i < High(FTensors) then
+      begin
+        PadLen := Int64(FAlignment) -
+          (Int64(Length(FTensors[i].Data)) mod FAlignment);
+        if PadLen = FAlignment then PadLen := 0;
+        if PadLen > 0 then
+        begin
+          SetLength(Pad, PadLen);
+          FillChar(Pad[0], PadLen, 0);
+          Stream.WriteBuffer(Pad[0], PadLen);
+        end;
+      end;
+    end;
+  finally
+    Stream.Free;
   end;
 end;
 
