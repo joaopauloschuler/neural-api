@@ -120,32 +120,6 @@ rather than acted on.
       the landed BuildGPTNeoXFromSafeTensors (3-way interleaved qkv, partial
       rotary) and BuildBloomFromSafeTensors (ALiBi, no RoPE); fills the most
       conspicuous remaining gap in the open-decoder importer roster.
-- [X] Mixtral / sparse-MoE importer (model_type "mixtral", e.g.
-      mistralai/Mixtral-8x7B-v0.1, or a small sibling like OLMoE/Qwen-MoE
-      that shares the recipe): the CANONICAL open sparse-MoE — a stock
-      Mistral/Llama decoder where every FFN is replaced by `block_sparse_moe`
-      = a `gate` linear (num_local_experts logits) + N independent SwiGLU
-      experts (`experts.{i}.w1/w2/w3`), softmax over ALL experts then top-k
-      (num_experts_per_tok=2) routing, output = sum of the selected experts'
-      outputs weighted by RENORMALIZED top-k softmax probs (HF normalizes the
-      top-k subset — distinct from DeepSeek-V2's raw-weight norm_topk_prob=false
-      path). This is genuinely distinct from the landed
-      BuildDeepSeekV2FromSafeTensors (which is MLA + FINE-GRAINED shared-expert
-      MoE with a bias-balanced gate); Mixtral is full MHA/GQA + standard
-      top-2 routing, NO shared expert, NO MLA — the single most-imported open
-      MoE and the one most users actually reach for. The repo is well
-      positioned: the AddTopKMixtureOfExperts / TNNetTopKGate machinery, the
-      SwiGLU expert MLP packing (up|gate), and the entire Llama attention/RoPE
-      path are all landed; the genuinely new pieces are (a) mapping
-      `gate.weight` + the per-expert `w1/w2/w3` slabs onto the existing MoE
-      block with pRenormalize=true and (b) wiring sliding_window (Mistral) and
-      GQA head counts through. Deliverables: BuildMixtralFromSafeTensors[Ex]
-      on the Llama config plumbing (multi-shard index.json support — the
-      real checkpoints are sharded), a tools/mixtral_tiny_fixture.py pico
-      fixture (tiny random Mixtral config, e.g. 4 experts/top-2, asserting
-      router probs AND next-token logits vs an HF float64 oracle), and a
-      BuildFromPretrained "mixtral" dispatch. Unlocks the whole Mixtral/MoE
-      family without the MLA complexity DeepSeek-V2 carries.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
