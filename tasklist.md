@@ -471,6 +471,30 @@ rather than acted on.
       transformer of equal size (constant-memory headline of the landed
       BuildRWKVFromSafeTensors importer; needs an incremental TNNetWKV
       state-carry path).
+- [ ] Mamba-2 / SSD importer (model_type "mamba2"): the landed
+      BuildMambaFromSafeTensors covers Mamba-1 only (TNNetSelectiveSSM with a
+      full per-channel input-dependent A). Mamba-2 is the architecturally
+      DISTINCT successor — State-Space Duality: a MULTI-HEAD SSM whose state
+      transition A is a single SCALAR decay per head (a_t = exp(dt * A_log),
+      A_log a per-head scalar, not the per-(channel,state) matrix of Mamba-1),
+      with B/C SHARED across the heads in a group (GQA-like) and an extra
+      grouped RMSNorm gate before out_proj — so it is NOT a flag on
+      TNNetSelectiveSSM but a new TNNetMamba2/SSD leaf (the chunked SSD scan is
+      the headline, but a plain head-wise recurrent forward + exact BPTT is the
+      v1, mirroring how Mamba-1 landed the scan before any chunking). Powers
+      real checkpoints the repo cannot load today: state-spaces/mamba2-*,
+      Codestral-Mamba-7B (mistralai/Mamba-Codestral-7B-v0.1) and
+      tiiuae/Falcon-Mamba-7B (pure-SSM 7B LMs, no attention). Importer reuses
+      the Mamba-1 conv1d/in_proj/out_proj plumbing and AddMambaBlock pattern;
+      the genuinely new pieces are the head-scalar A_log copy, the grouped
+      B/C/heads layout, and the pre-out_proj gated RMSNorm. Deliverables:
+      BuildMamba2FromSafeTensors[Ex] wired into BuildFromPretrained, a
+      TNNetMamba2 leaf with its own numerical-gradient + serialization tests,
+      and a pico parity fixture (tools/make_pico_mamba2_fixture.py, synthetic
+      config-faithful HF Mamba2ForCausalLM, no download) asserting next-token
+      logits <1e-4 vs the float64 HF oracle — same recipe as the Mamba-1 /
+      RWKV importers. Opens the hybrid Mamba-2 + attention families (Zamba2,
+      Nemotron-H, the Codestral-Mamba line) for later.
 - [ ] Mamba decode-side demo: tokens/sec flat in context length where a
       transformer of equal size slows (constant-memory headline of the
       landed BuildMambaFromSafeTensors importer; needs an incremental
