@@ -543,6 +543,38 @@ rather than acted on.
       task above; report duplicate-cluster stats. Test: planted
       near-duplicates (one-word edits) are found, distinct documents are
       not merged.
+- [ ] Text-embedding / retrieval inference + eval harness for the E5 / BGE /
+      GTE retriever family on top of the landed encoder importers (BERT /
+      ModernBERT, and the decoder-as-encoder last-token path for the
+      Qwen2/Mistral-based e5-mistral / gte-Qwen2 retrievers). Today the repo
+      can IMPORT these backbones and has BertPoolSentenceEmbedding (mean-pool +
+      L2-normalize), but it cannot reproduce a published embedding model
+      because two pieces are missing, and there is NO embedding-quality metric
+      anywhere (no STS / retrieval eval): (a) a pooling-mode selector — CLS
+      (BGE), mean (E5/GTE), and last-token (e5-mistral, with the EOS/left-pad
+      convention) — exposed as an EmbedText/EmbedBatch helper that wraps the
+      forward pass + pooling + optional L2-normalize, generalizing the
+      mean-only BertPoolSentenceEmbedding; (b) the model-specific INSTRUCTION
+      PREFIXES that change the vector and are mandatory for parity — E5's
+      "query: "/"passage: ", BGE's "Represent this sentence for searching
+      relevant passages: " query instruction, and the gte-Qwen2 "Instruct:
+      ...\nQuery: " template — as a small per-family prefix table the helper
+      prepends. The genuinely new, reusable deliverable is the EVAL HARNESS
+      that none of the landed embedding examples (ArcFace/Matryoshka/Triplet/
+      Cosine-siamese all TRAIN embeddings, none score a pretrained one)
+      provide: an STS report (cosine similarity vs gold scores → Spearman/
+      Pearson rho over a tiny bundled STS-B slice) and a small retrieval report
+      (recall@k + nDCG@10 over a planted query/passage set), both as
+      introspection-style reports reusable across importers. Deliverables: the
+      EmbedText/EmbedBatch + pooling-mode + prefix-table helper in
+      neuralpretrained.pas, a STSReport/RetrievalReport pair, a pico parity
+      fixture (make_pico_*_fixture.py recipe) asserting the pooled+normalized
+      query/passage vectors of one E5-or-BGE checkpoint match HF
+      sentence-transformers float64 within 1e-4, and an examples/SemanticSearch
+      demo that embeds a handful of passages and ranks them against a query on
+      CPU. Turns the broad encoder-import coverage into a usable RAG retriever
+      and is the missing measurement half for the existing embedding-training
+      examples.
 
 ## Layer follow-ups that fix real limitations
 
