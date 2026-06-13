@@ -176,6 +176,8 @@ type
     procedure TestPhiLogitParity;
     procedure TestPhi3LogitParity;
     procedure TestPhi3LongRoPELogitParity;
+    procedure TestGLM4ConfigFromJSONFile;
+    procedure TestGLM4LogitParity;
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
@@ -5452,6 +5454,101 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestGLM4ConfigFromJSONFile;
+var
+  Config: TLlamaConfig;
+begin
+  Config := ReadLlamaConfigFromJSONFile(
+    FixturePath('tiny_glm4_config.json'));
+  AssertEquals('model_type', 'glm4', Config.ModelType);
+  AssertEquals('hidden_size', 8, Config.HiddenSize);
+  AssertEquals('intermediate_size', 12, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('num_key_value_heads', 1, Config.NumKVHeads);
+  AssertEquals('head_dim', 4, Config.HeadDim);
+  AssertEquals('vocab_size', 13, Config.VocabSize);
+  AssertEquals('partial_rotary_factor', 0.5,
+    Config.PartialRotaryFactor, 1e-9);
+  AssertTrue('glm4_sandwich_norm', Config.GLM4SandwichNorm);
+  AssertTrue('sandwich_norm (shared wiring)', Config.SandwichNorm);
+  AssertTrue('fused_gate_up', Config.FusedGateUp);
+  AssertFalse('fused_qkv_gate_up must stay OFF (qkv is split)',
+    Config.FusedQKVGateUp);
+  AssertTrue('interleaved_rotary', Config.InterleavedRotary);
+  AssertTrue('qkv_bias', Config.QKVBias);
+  AssertFalse('untied', Config.TieWordEmbeddings);
+end;
+
+// Verifies the GLM-4 import target (HF model_type "glm4", architectures
+// ["Glm4ForCausalLM"], the THUDM/GLM-4-9B-0414 / zai-org/GLM-4 text family):
+// tests/fixtures/tiny_glm4.* is a pico randomly-initialized HF
+// Glm4ForCausalLM (2 layers, 2 query heads sharing 1 kv head x 4 dims - GQA,
+// hidden 8, vocab 13, UNTIED lm_head) riding the Llama path with every GLM-4
+// delta genuinely exercised (the generator tools/glm4_tiny_fixture.py asserts
+// the in-branch sandwich post-norms and the q/k/v biases each move the
+// logits):
+// (a) FOUR-norm SANDWICH block: input_layernorm + post_attention_layernorm
+//     as the attention/FFN PRE-norms PLUS post_self_attn_layernorm and
+//     post_mlp_layernorm INSIDE the two residual branches (4 norms/block);
+// (b) PARTIAL rotary: partial_rotary_factor=0.5 -> RoPE on the first 2 of 4
+//     head dims, the tail passes through;
+// (c) INTERLEAVED rotary: GLM-4 rotates consecutive channel pairs (the
+//     native TNNetRotaryEmbedding layout), so q/k rows load STRAIGHT - a
+//     rotate_half (half-split) permutation would mis-load them;
+// (d) SEPARATE q/k/v projections WITH bias and a bias-free o_proj, plus a
+//     FUSED bias-free mlp.gate_up_proj (gate|up packing, like Phi-3).
+// Reference logits come from HF transformers (Glm4ForCausalLM) in float64.
+procedure TTestNeuralPretrained.TestGLM4LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, NormCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildGLM4FromSafeTensorsEx(FixturePath('tiny_glm4.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_glm4_config.json'));
+  try
+    AssertEquals('model_type', 'glm4', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('partial_rotary_factor', 0.5,
+      Config.PartialRotaryFactor, 1e-9);
+    AssertTrue('glm4_sandwich_norm', Config.GLM4SandwichNorm);
+    AssertTrue('fused_gate_up', Config.FusedGateUp);
+    AssertTrue('interleaved_rotary', Config.InterleavedRotary);
+    AssertTrue('qkv_bias', Config.QKVBias);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    // Four RMSNorms per block (the sandwich) + the final norm.
+    NormCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt].ClassType = TNNetTokenRMSNorm then
+        Inc(NormCnt);
+    AssertEquals('TokenRMSNorm count (4 per block + final)',
+      4 * Config.NumLayers + 1, NormCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_glm4_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "glm4" (architectures ["Glm4ForCausalLM"]) onto the same Llama path.
+  NN := BuildFromPretrained(FixturePath('tiny_glm4.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_glm4_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_glm4_logits.json'), 16, 13);
   finally
     NN.Free;
   end;

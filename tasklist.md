@@ -93,7 +93,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] GLM-4 importer (BuildGLM4FromSafeTensors, model_type "glm" /
+- [X] GLM-4 importer (BuildGLM4FromSafeTensors, model_type
       "glm4", e.g. THUDM/glm-4-9b-chat-hf or the smaller zai-org/GLM-4
       text checkpoints). This is NOT a near-duplicate of the existing
       Llama-path importers: GLM-4 uses a sandwich-norm block

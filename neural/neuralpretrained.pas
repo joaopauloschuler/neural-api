@@ -710,6 +710,24 @@ type
                                // are block_sparse_moe.experts.{i}.w1/w2/w3
     MoEExpertsPerTok: integer; // num_experts_per_tok routed per token
                                // (Mixtral: 2); the renormalized top-k
+    // ---- GLM-4 deltas (all default off for the other families) ----
+    GLM4SandwichNorm: boolean; // GLM-4 four-norm sandwich block: the usual
+                               // input_layernorm (attn pre) and
+                               // post_attention_layernorm (FFN pre) PLUS
+                               // post_self_attn_layernorm INSIDE the attention
+                               // residual branch and post_mlp_layernorm INSIDE
+                               // the FFN residual branch. Structurally the
+                               // SandwichNorm wiring (4 norms) but with GLM-4's
+                               // distinct tensor key names (see the loader)
+    FusedGateUp: boolean;      // FUSED bias-free mlp.gate_up_proj (gate|up
+                               // rows) WITHOUT a fused qkv_proj - GLM-4 keeps
+                               // SEPARATE q/k/v projections (with bias) but
+                               // fuses the MLP gate+up like Phi-3
+    InterleavedRotary: boolean;// q/k rows feed RoPE in the native INTERLEAVED
+                               // (even/odd) pair layout, so they load STRAIGHT
+                               // (no rotate_half row permutation) - GLM-4 (and
+                               // Cohere) rotate consecutive channel pairs, the
+                               // exact layout TNNetRotaryEmbedding expects
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -1015,6 +1033,34 @@ function BuildPhi3FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildPhi3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// GLM-4 (model_type "glm4", e.g. THUDM/GLM-4-9B-0414 / zai-org/GLM-4 text
+// checkpoints - NOT the older two-norm "glm"): the Llama skeleton (GQA,
+// SwiGLU, RoPE, model.norm + untied lm_head) with four architectural deltas
+// (no new layers - it composes the SandwichNorm + partial-rotary builders):
+// (a) FOUR-norm SANDWICH block - input_layernorm (attention pre-norm) and
+//     post_attention_layernorm (FFN pre-norm) PLUS post_self_attn_layernorm
+//     INSIDE the attention residual branch and post_mlp_layernorm INSIDE the
+//     FFN residual branch (the Gemma-2 sandwich WIRING with GLM-4's distinct
+//     tensor key names);
+// (b) PARTIAL rotary - partial_rotary_factor 0.5, RoPE rotates only the
+//     first int(head_dim*0.5) channels of each q/k head (the same
+//     RotaryDims slice wiring proven on Phi-3 / GPT-NeoX);
+// (c) INTERLEAVED rotary - GLM-4 rotates consecutive channel PAIRS
+//     (rotate_half over x[0::2]/x[1::2]), the native TNNetRotaryEmbedding
+//     layout, so the q/k rows load STRAIGHT (no rotate_half permutation);
+// (d) SEPARATE q/k/v projections WITH bias (attention_bias true) and a
+//     bias-free o_proj, with a FUSED bias-free mlp.gate_up_proj (gate|up
+//     rows, the Phi-3 packing). Thin wrappers over the Llama path that
+//     ASSERT the config's model_type is 'glm4'.
+function BuildGLM4FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildGLM4FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -3568,11 +3614,12 @@ begin
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
        (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') and
-       (ModelType <> 'olmo2') and (ModelType <> 'mixtral') then
+       (ModelType <> 'olmo2') and (ModelType <> 'mixtral') and
+       (ModelType <> 'glm4') and (ModelType <> 'glm') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "gemma", ' +
-        '"gemma2", "gemma3_text", "phi3", "olmo2" and "mixtral" are ' +
-        'supported here ' +
+        '"gemma2", "gemma3_text", "phi3", "olmo2", "mixtral" and "glm4" ' +
+        'are supported here ' +
         '(see BuildFromPretrained for the full dispatch; multimodal ' +
         '"gemma3" configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
@@ -3628,6 +3675,9 @@ begin
     Result.IsMoE := False;
     Result.NumLocalExperts := 0;
     Result.MoEExpertsPerTok := 0;
+    Result.GLM4SandwichNorm := False;
+    Result.FusedGateUp := False;
+    Result.InterleavedRotary := False;
     if ModelType = 'mixtral' then
     begin
       // Mixtral: a stock Mistral decoder (full MHA/GQA, RoPE, sliding
@@ -3871,6 +3921,50 @@ begin
           '" is not supported - every released olmo2 checkpoint uses ' +
           '"silu" (SwiGLU).');
     end
+    else if ModelType = 'glm4' then
+    begin
+      // GLM-4 (model_type "glm4", e.g. THUDM/GLM-4-9B-0414 /
+      // zai-org/GLM-4 text checkpoints): the Llama skeleton (GQA, SwiGLU,
+      // RoPE) with FOUR architectural deltas (see BuildGLM4FromSafeTensors):
+      // (a) FOUR-norm SANDWICH block - the usual input_layernorm (attn pre)
+      //     and post_attention_layernorm (FFN pre) PLUS
+      //     post_self_attn_layernorm INSIDE the attention residual branch
+      //     and post_mlp_layernorm INSIDE the FFN residual branch (the
+      //     Gemma-2 sandwich WIRING with GLM-4's distinct key names);
+      // (b) PARTIAL rotary (partial_rotary_factor 0.5: RoPE rotates the
+      //     first int(head_dim*0.5) channels of each q/k head, the tail
+      //     passes through);
+      // (c) INTERLEAVED rotary - GLM-4 rotates consecutive channel PAIRS
+      //     (rotate_half over x[0::2]/x[1::2]), the native
+      //     TNNetRotaryEmbedding layout, so q/k rows load STRAIGHT (no
+      //     rotate_half row permutation);
+      // (d) SEPARATE q/k/v projections WITH bias (attention_bias true) and a
+      //     bias-free o_proj, but a FUSED bias-free mlp.gate_up_proj.
+      Result.GLM4SandwichNorm := True;
+      Result.SandwichNorm := True; // share the sandwich block WIRING
+      Result.FusedGateUp := True;  // fused mlp.gate_up_proj (qkv stays split)
+      Result.InterleavedRotary := True;
+      Result.QKVBias := Obj.Get('attention_bias', True); // GLM-4 default true
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.5625e-07); // GLM-4 default
+      Result.PartialRotaryFactor :=
+        Obj.Get('partial_rotary_factor', 0.5);
+      if (Result.PartialRotaryFactor <= 0) or
+         (Result.PartialRotaryFactor > 1) then
+        ImportError('Llama import: config partial_rotary_factor must be ' +
+          'in (0, 1], got ' + FloatToStr(Result.PartialRotaryFactor) + '.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: GLM-4 hidden_act "' + HiddenAct +
+          '" is not supported - every released glm4 checkpoint uses ' +
+          '"silu" (SwiGLU).');
+    end
+    else if ModelType = 'glm' then
+      // model_type "glm" (the older two-norm GLM-4 9B - pre-norm, NOT the
+      // four-norm sandwich; HF GlmForCausalLM) is a DIFFERENT block and is
+      // not wired here. BuildGLM4FromSafeTensors targets "glm4".
+      ImportError('Llama import: model_type "glm" (the two-norm GLM, ' +
+        'HF GlmForCausalLM) is not supported - this importer targets ' +
+        'model_type "glm4" (the four-norm sandwich block).')
     else // llama
       Result.QKVBias := Obj.Get('attention_bias', False);
     Result.Prefix := ''; // detected from the checkpoint by the builder
@@ -3942,6 +4036,12 @@ begin
   if Config.IsMoE then
     Result := Result + ', moe=' + IntToStr(Config.NumLocalExperts) +
       'x top-' + IntToStr(Config.MoEExpertsPerTok);
+  if Config.GLM4SandwichNorm then
+    Result := Result + ', glm4_sandwich_norm=true';
+  if Config.FusedGateUp then
+    Result := Result + ', fused_gate_up=true';
+  if Config.InterleavedRotary then
+    Result := Result + ', interleaved_rotary=true';
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -4432,6 +4532,7 @@ var
   SliceChannels, RotChannels, PassChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, RotaryDims, LayerWindow, i, j, d: integer;
+  RotaryHeadDimArg: integer;
   LayerIsLocal: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
   LayerRoPEScaling: TRoPEScalingConfig;
@@ -4938,9 +5039,19 @@ begin
         end
         else
         begin
+          // Config.InterleavedRotary (GLM-4, Cohere): RoPE rotates
+          // consecutive channel PAIRS - the native TNNetRotaryEmbedding
+          // layout - so the q/k rows load STRAIGHT (RotaryHeadDim=0, no
+          // rotate_half row permutation). Llama/Phi/NeoX (half-split
+          // rotate_half) pass HeadDim to permute into the interleaved order.
+          if Config.InterleavedRotary then
+            RotaryHeadDimArg := 0
+          else
+            RotaryHeadDimArg := HeadDim;
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
             BlockPrefix + 'self_attn.q_proj.weight',
-            Config.HiddenSize, QWidth, 0, -1, HeadDim, QBiasName, QProjScale);
+            Config.HiddenSize, QWidth, 0, -1, RotaryHeadDimArg, QBiasName,
+            QProjScale);
           MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
           if QBiasName <> '' then MarkConsumed(QBiasName);
           // Qwen3/Gemma-3 per-head q/k RMSNorm: one shared [head_dim] gain
@@ -4980,7 +5091,7 @@ begin
           end;
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
             BlockPrefix + 'self_attn.k_proj.weight',
-            Config.HiddenSize, KVWidth, 0, -1, HeadDim, KBiasName);
+            Config.HiddenSize, KVWidth, 0, -1, RotaryHeadDimArg, KBiasName);
           MarkConsumed(BlockPrefix + 'self_attn.k_proj.weight');
           if KBiasName <> '' then MarkConsumed(KBiasName);
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
@@ -4993,7 +5104,27 @@ begin
           BlockPrefix + 'self_attn.o_proj.weight',
           QWidth, Config.HiddenSize);
         MarkConsumed(BlockPrefix + 'self_attn.o_proj.weight');
-        if Config.SandwichNorm then
+        if Config.GLM4SandwichNorm then
+        begin
+          // GLM-4 four-norm sandwich (same WIRING as Gemma-2's sandwich,
+          // different key names): input_layernorm (attn pre, loaded above) +
+          // post_self_attn_layernorm INSIDE the attention branch +
+          // post_attention_layernorm as the FFN PRE-norm +
+          // post_mlp_layernorm closing the FFN branch.
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostAttnNorm,
+            BlockPrefix + 'post_self_attn_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_self_attn_layernorm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].MlpNorm,
+            BlockPrefix + 'post_attention_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostMlpNorm,
+            BlockPrefix + 'post_mlp_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_mlp_layernorm.weight');
+        end
+        else if Config.SandwichNorm then
         begin
           // Gemma-2 sandwich norms: post_attention_layernorm is the TRUE
           // post-attention norm (inside the residual branch) and the FFN's
@@ -5070,7 +5201,9 @@ begin
         end;
         // Fused gate/up: up_proj -> neurons 0..I-1 (SwiGLU's linear half),
         // gate_proj -> neurons I..2I-1 (SwiGLU's Swish-gated half).
-        if Config.FusedQKVGateUp then
+        // Phi-3 (FusedQKVGateUp) AND GLM-4 (FusedGateUp - qkv stays split)
+        // both ship mlp.gate_up_proj with the SAME gate|up row order.
+        if Config.FusedQKVGateUp or Config.FusedGateUp then
         begin
           // Phi-3 fused mlp.gate_up_proj packs gate (rows 0..I-1) THEN up
           // (rows I..2I-1) - HF chunks the output in that order - so the
@@ -8922,6 +9055,25 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildPhi3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildGLM4FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'glm4', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildGLM4FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildGLM4FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -15997,7 +16149,13 @@ begin
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
           (ModelType = 'gemma') or (ModelType = 'gemma2') or
           (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
-          (ModelType = 'olmo2') or (ModelType = 'mixtral') then
+          (ModelType = 'olmo2') or (ModelType = 'mixtral') or
+          (ModelType = 'glm4') then
+    // 'glm4' (architectures ["Glm4ForCausalLM"], THUDM/GLM-4-9B-0414 etc.)
+    // raises the four-norm sandwich (post_self_attn_layernorm /
+    // post_mlp_layernorm INSIDE the residual branches), partial+interleaved
+    // rotary and fused-gate_up flags from model_type alone (the older
+    // two-norm "glm" is rejected by the config reader).
     // 'gemma' (architectures ["GemmaForCausalLM"]) rides the same path: the
     // config reader raises the Gemma flags (GeGLU FFN, zero-centered
     // RMSNorm, sqrt(d) embedding scale) from model_type alone. 'gemma2'
