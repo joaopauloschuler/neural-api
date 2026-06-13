@@ -127,6 +127,47 @@ rather than acted on.
       on the index) so e.g. configs that interleave a dense layer every N
       blocks import; sliding-window support rides the existing SDPA window arg.
       Add a pico fixture with decoder_sparse_step=2 (or one mlp_only_layer).
+- [ ] GPT-OSS importer (BuildGptOssFromSafeTensors[Ex], model_type "gpt_oss",
+      i.e. openai/gpt-oss-20b and gpt-oss-120b — OpenAI's first open-weight
+      release and currently the highest-profile open MoE LLM with NO import
+      path here). This is NOT a near-duplicate of any landed importer: it is a
+      distinct CROSS of subsystems we already have plus one genuinely new
+      dequant. The architecture is a sparse top-k MoE decoder (config
+      num_local_experts / num_experts_per_tok / a per-layer router gate) — reuse
+      AddTopKMixtureOfExperts / TNNetTopKGate ([[topk-moe-routing]]) exactly as
+      the Mixtral/Qwen3-MoE importers do — but with three pieces no current
+      importer combines: (a) LEARNED PER-HEAD ATTENTION SINKS — each attention
+      layer carries a trainable `sinks` logit per head appended to the softmax
+      denominator, which is precisely the landed avSink attention variant
+      ([[mha-attention-variant-flag]]), so wire the imported sink logits into
+      that path rather than inventing a layer; (b) ALTERNATING sliding-window /
+      full attention every other layer (layer_types), the same per-layer Window
+      wiring AddAlternatingLocalGlobalBlocks / the Gemma-2 importer already ship
+      ([[gemma2-alternating-local-global]]); (c) YaRN RoPE scaling
+      ([[rope-scaling-config-wiring]]) on the full-attention layers. The FFN is a
+      gated SwiGLU expert but with gpt-oss's specific clamped-SwiGLU activation
+      (alpha=1.702 sigmoid gate plus a hard clamp on the gate/up pre-activations
+      — a small TNNet activation/clamp combo, verify the exact formula against
+      transformers' modeling_gpt_oss). The genuinely NEW low-level work is the
+      MXFP4 weight format the checkpoints actually ship in: the MoE expert
+      matrices are stored as 4-bit micro-scaled-FP4 blocks (a per-block uint8
+      scale exponent + packed 4-bit mantissa pairs); add an MXFP4 dequant-at-load
+      path (sibling of the landed GGUF Q4_K/Q8_0 dequant-at-load,
+      [[gguf-reader-importer]]) that expands MXFP4 -> FP32 into the existing
+      expert weight buffers (and, as a follow-up, straight into the int8
+      weight-only storage). Deliverables: BuildGptOssFromSafeTensors[Ex] (multi-
+      shard index.json support — the real checkpoints are sharded), an MXFP4
+      reader with its own round-trip unit test on a hand-built block, and a pico
+      parity fixture (tools/make_pico_*_fixture.py recipe,
+      [[pico-import-fixtures]]) sliced to 2 layers / 4 experts / top-2 with one
+      sliding + one full layer, asserting next-token logits vs transformers in
+      venv x (dequantize the fixture's MXFP4 experts to a tiny config so the
+      whole thing stays ~tens of KB). High value: it adds the most-deployed
+      brand-new open MoE family, exercises the avSink + alternating-window + YaRN
+      + top-k-MoE paths together for the first time, and the MXFP4 dequant is a
+      reusable new quant primitive (NOT a duplicate of the GGUF k-quant or int8
+      paths — it is a different block layout). Document gpt-oss-120b as
+      import-capable but RAM-gated like the other large checkpoints.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
