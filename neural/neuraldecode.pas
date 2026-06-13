@@ -780,6 +780,43 @@ function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
   MaxLen: integer; TopK: integer; PenaltyAlpha: TNeuralFloat;
   const StopStrings: array of string): TNNetDecodeResult;
 
+// DoLa DECODING (Decoding by Contrasting Layers, Chuang et al. 2023; the
+// transformers `generate(dola_layers=...)` path). Improves FACTUALITY (NOT
+// speed - distinct from early-exit, and distinct from contrastive SEARCH which
+// contrasts against context tokens: DoLa contrasts LAYERS). At each step the
+// FINAL distribution p_final is contrasted against a PREMATURE-layer
+// distribution p_premature, both read through the SAME LM head:
+//   1. A full forward gives p_final (the mature distribution).
+//   2. The "logits at layer k" splice (the frozen-body idiom from
+//      TNNet.LogitLensReport) takes each candidate premature layer's activation,
+//      copies it into the head-input slot, and recomputes ONLY the head
+//      sub-stack -> p_premature for that layer.
+//   3. The premature layer is chosen PER STEP as the one whose distribution has
+//      the MAXIMUM Jensen-Shannon divergence from p_final, over the fixed
+//      candidate-layer bucket (v1: every earlier layer whose Output.Size matches
+//      the head-input size; HeadInIdx itself is excluded - contrasting against
+//      itself is a no-op).
+//   4. The next token is argmax over the ADAPTIVE head-candidate set
+//      V_head = { t : p_final[t] >= Alpha * max_j p_final[j] } of the contrast
+//      score  log p_final[t] - log p_premature[t]  (tokens outside V_head are
+//      masked out, exactly as in the paper's APC step).
+// DEGRADE-TO-GREEDY invariant: Alpha <= 0 (or an EMPTY candidate-layer bucket,
+// e.g. a net with no lens-compatible earlier layer) disables the contrast and
+// reproduces plain greedy argmax BIT-FOR-BIT (the same net's DecodeGreedy).
+//   MaxLen        : maximum number of generated tokens (excludes the prompt).
+//   Alpha         : head-set fraction in [0,1]; the paper uses ~0.1. Alpha<=0
+//                   degrades exactly to greedy. Alpha=1 keeps only the
+//                   final-argmax token (also greedy, but via the contrast path).
+//   HeadStartIdx  : first layer of the LM head sub-stack; -1 auto-detects it as
+//                   the last trainable layer (same heuristic as LogitLensReport).
+// Char-level, same forward-pass / encoding convention as DecodeGreedy /
+// DecodeContrastiveSearch (token id = character code); no KV-cache (v1).
+// Coded by Claude (AI).
+function DecodeDoLa(NN: TNNet; const Prompt: string;
+  MaxLen: integer; Alpha: TNeuralFloat;
+  const StopStrings: array of string;
+  HeadStartIdx: integer = -1): TNNetDecodeResult;
+
 // ---------------------------------------------------------------------------
 // STREAMED GENERATION: the KV-cache / SSM-state counterpart of neuraldatasets'
 // GenerateStringFromCasualNN, driven by a TNNetStreamingDecoder session.
@@ -2898,6 +2935,222 @@ begin
     OutputVolume.Free;
     if Assigned(CandHidden) then CandHidden.Free;
     for I := 0 to PastLen - 1 do Past[I].Free;
+  end;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+// Resolves the LM-head start index for the DoLa / logit-lens splice: when
+// HeadStartIdx < 0 it is the LAST trainable layer (Neurons.Count > 0), the same
+// heuristic TNNet.LogitLensReport uses; clamped to [1, LastLayer] so there is
+// always an input slot below the head. Coded by Claude (AI).
+function ResolveHeadStartIdx(NN: TNNet; HeadStartIdx: integer): integer;
+var
+  LayerIdx, LastLayer, LastTrainable: integer;
+begin
+  LastLayer := NN.GetLastLayerIdx();
+  if HeadStartIdx < 0 then
+  begin
+    LastTrainable := -1;
+    for LayerIdx := 0 to LastLayer do
+      if NN.Layers[LayerIdx].Neurons.Count > 0 then
+        LastTrainable := LayerIdx;
+    if LastTrainable <= 0 then
+      Result := LastLayer
+    else
+      Result := LastTrainable;
+  end
+  else
+    Result := HeadStartIdx;
+  if Result < 1 then Result := 1;
+  if Result > LastLayer then Result := LastLayer;
+end;
+
+// Builds the fixed DoLa candidate-layer bucket: every layer 0..HeadInIdx-1 whose
+// Output.Size equals the head-input size (so its activation can be spliced into
+// the head-input slot and pushed through the SAME LM head). HeadInIdx itself is
+// EXCLUDED - contrasting a layer against its own forward is a no-op.
+// Coded by Claude (AI).
+procedure BuildDoLaCandidateBucket(NN: TNNet; HeadInIdx: integer;
+  var Bucket: TNeuralIntegerArray);
+var
+  LayerIdx, HeadInSize, N: integer;
+begin
+  HeadInSize := NN.Layers[HeadInIdx].Output.Size;
+  N := 0;
+  SetLength(Bucket, HeadInIdx);
+  for LayerIdx := 0 to HeadInIdx - 1 do
+    if NN.Layers[LayerIdx].Output.Size = HeadInSize then
+    begin
+      Bucket[N] := LayerIdx;
+      Inc(N);
+    end;
+  SetLength(Bucket, N);
+end;
+
+function DecodeDoLa(NN: TNNet; const Prompt: string;
+  MaxLen: integer; Alpha: TNeuralFloat;
+  const StopStrings: array of string;
+  HeadStartIdx: integer): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  CandSnap: TNNetVolume;
+  PFinal, PLens, MFinalLens: array of TNeuralFloat;  // distributions + 0.5(p+q)
+  Bucket: TNeuralIntegerArray;
+  VocabSize, Step, I, C, L, HeadIdx, HeadInIdx, LastLayer: integer;
+  NumCand, BestLayer, Best, StopLen: integer;
+  Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, Pm, ScoreV, BestScore: TNeuralFloat;
+  Context: string;
+  HaveContrast: boolean;
+const
+  cEps = 1e-12;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  CandSnap := TNNetVolume.Create();
+  VocabSize := OutputVolume.Size;
+  SetLength(PFinal, VocabSize);
+  SetLength(PLens, VocabSize);
+  SetLength(MFinalLens, VocabSize);
+  LastLayer := NN.GetLastLayerIdx();
+  HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
+  HeadInIdx := HeadIdx - 1;
+  BuildDoLaCandidateBucket(NN, HeadInIdx, Bucket);
+  NumCand := Length(Bucket);
+  // The contrast path is active only when Alpha > 0 AND the bucket is non-empty.
+  // Otherwise this MUST reproduce plain greedy argmax bit-for-bit, so we take
+  // EXACTLY the DecodeGreedy step (argmax over the raw softmax row).
+  HaveContrast := (Alpha > 0) and (NumCand > 0);
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      // (1) Full forward -> the mature distribution p_final (re-normalised
+      //     defensively, same convention as NextLogProbs / contrastive search).
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      MaxFinal := 0;
+      for I := 0 to VocabSize - 1 do
+      begin
+        Pf := OutputVolume.Raw[I] / Total;
+        if Pf < 0 then Pf := 0;
+        PFinal[I] := Pf;
+        if Pf > MaxFinal then MaxFinal := Pf;
+      end;
+
+      if not HaveContrast then
+      begin
+        // Greedy argmax over p_final == DecodeGreedy's step (the raw softmax row
+        // is monotone in p_final, so this is bit-identical).
+        Best := 0;
+        for I := 1 to VocabSize - 1 do
+          if PFinal[I] > PFinal[Best] then Best := I;
+        Result.SumLogProb := Result.SumLogProb + SafeLogProb(PFinal[Best]);
+      end
+      else
+      begin
+        // (2)+(3) Pick the premature layer with MAX Jensen-Shannon divergence
+        //         from p_final. The candidate activation already lives in the
+        //         net after the full forward above (no extra forward needed);
+        //         snapshot it, splice into the head-input slot, recompute the
+        //         head sub-stack, read p_premature.
+        BestLayer := Bucket[0];
+        BestJS := -1.0;
+        for C := 0 to NumCand - 1 do
+        begin
+          L := Bucket[C];
+          CandSnap.Copy(NN.Layers[L].Output);
+          NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
+          for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
+          Total := NN.GetLastLayer().Output.GetSum();
+          if Total <= 0 then Total := 1.0;
+          // JS(p_final || p_lens) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q).
+          JS := 0;
+          for I := 0 to VocabSize - 1 do
+          begin
+            Pl := NN.GetLastLayer().Output.Raw[I] / Total;
+            if Pl < 0 then Pl := 0;
+            PLens[I] := Pl;
+            MFinalLens[I] := 0.5 * (PFinal[I] + Pl);
+          end;
+          for I := 0 to VocabSize - 1 do
+          begin
+            Pm := MFinalLens[I];
+            if Pm < cEps then Continue;
+            Pf := PFinal[I];
+            if Pf >= cEps then JS := JS + 0.5 * Pf * Ln(Pf / Pm);
+            Pl := PLens[I];
+            if Pl >= cEps then JS := JS + 0.5 * Pl * Ln(Pl / Pm);
+          end;
+          if JS > BestJS then
+          begin
+            BestJS := JS;
+            BestLayer := L;
+          end;
+        end;
+        // Recompute the chosen premature layer's distribution into PLens.
+        CandSnap.Copy(NN.Layers[BestLayer].Output);
+        NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
+        for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
+        Total := NN.GetLastLayer().Output.GetSum();
+        if Total <= 0 then Total := 1.0;
+        for I := 0 to VocabSize - 1 do
+        begin
+          Pl := NN.GetLastLayer().Output.Raw[I] / Total;
+          if Pl < 0 then Pl := 0;
+          PLens[I] := Pl;
+        end;
+        // (4) Adaptive plausibility constraint: keep only tokens at/above
+        //     Alpha * max(p_final); argmax the contrast score over that set.
+        Threshold := Alpha * MaxFinal;
+        Best := -1;
+        BestScore := -1e30;
+        for I := 0 to VocabSize - 1 do
+          if PFinal[I] >= Threshold then
+          begin
+            ScoreV := SafeLogProb(PFinal[I]) - SafeLogProb(PLens[I]);
+            if (Best < 0) or (ScoreV > BestScore) then
+            begin
+              BestScore := ScoreV;
+              Best := I;
+            end;
+          end;
+        if Best < 0 then  // degenerate empty head set: fall back to final argmax
+        begin
+          Best := 0;
+          for I := 1 to VocabSize - 1 do
+            if PFinal[I] > PFinal[Best] then Best := I;
+        end;
+        Result.SumLogProb := Result.SumLogProb + SafeLogProb(PFinal[Best]);
+      end;
+
+      if Best = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      Result.Text := Result.Text + Chr(Best);
+      Context := Context + Chr(Best);
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+    CandSnap.Free;
   end;
   Result.Score := Result.SumLogProb /
     LengthPenaltyDenominator(Length(Result.Text), 0);

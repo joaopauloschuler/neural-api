@@ -39,6 +39,19 @@ type
     // Zeroes the last (logit head) layer's weights and biases and raises one
     // token's bias so greedy argmax always emits exactly that token.
     procedure RigHeadToConstantToken(NN: TNNet; Token: integer);
+    // DoLa toy LM with a PLANTED shallow-layer bias. Layers:
+    //   0 Input(ContextLen,1,Vocab)
+    //   1 FullConnectLinear(Vocab)  <- the premature candidate; zero weights,
+    //        bias[TBias]=4, bias[TGood]=2 (input-independent logits).
+    //   2 FullConnectLinear(Vocab)  <- head input; IDENTITY weights + a bias
+    //        correction that lowers TBias and raises TGood, so the FINAL argmax
+    //        is still TBias (greedy emits it) but the premature distribution is
+    //        even more peaked on TBias.
+    //   3 FullConnectLinear(Vocab)  <- LM head; IDENTITY.
+    //   4 SoftMax
+    // log p_final - log p_premature is then MAXIMISED at TGood, so DoLa flips
+    // the completion from TBias to TGood while greedy never does.
+    function BuildDoLaBiasedNet(ContextLen, Vocab, TBias, TGood: integer): TNNet;
     // Locates the committed encoder-decoder fixtures (same probing as
     // TestNeuralPretrained.FixturePath: RunAll.sh runs from tests/).
     function FixturePath(const FileName: string): string;
@@ -69,6 +82,10 @@ type
     // Contrastive search (penalty_alpha) decoding.
     procedure TestContrastiveAlphaZeroMatchesGreedy;
     procedure TestContrastiveAlphaChangesSelection;
+    // DoLa (Decoding by Contrasting Layers).
+    procedure TestDoLaAlphaZeroMatchesGreedy;
+    procedure TestDoLaEmptyBucketMatchesGreedy;
+    procedure TestDoLaFlipsShallowBiasedCompletion;
     // KV-cache incremental decode on TNNetScaledDotProductAttention.
     procedure TestKVCacheIncrementalMatchesFullForward;
     procedure TestKVCacheSlidingWindowMatchesFullForward;
@@ -303,6 +320,127 @@ begin
       not IsInfinite(C1.Score));
     AssertTrue('alpha=1 penalty changes the greedy selection',
       C1.Text <> G.Text);
+  finally
+    NN.Free;
+  end;
+end;
+
+function TTestNeuralDecode.BuildDoLaBiasedNet(
+  ContextLen, Vocab, TBias, TGood: integer): TNNet;
+var
+  L1, L2, L3: TNNetLayer;
+  N: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, Vocab));
+  L1 := Result.AddLayer(TNNetFullConnectLinear.Create(Vocab)); // premature
+  L2 := Result.AddLayer(TNNetFullConnectLinear.Create(Vocab)); // head input
+  L3 := Result.AddLayer(TNNetFullConnectLinear.Create(Vocab)); // LM head
+  Result.AddLayer(TNNetSoftMax.Create());
+  Result.InitWeights();
+  // Layer 1: zero weights -> input-independent constant logits via bias only.
+  for N := 0 to L1.Neurons.Count - 1 do
+  begin
+    L1.Neurons[N].Weights.Fill(0);
+    L1.Neurons[N].BiasWeight := 0;
+  end;
+  L1.Neurons[TBias].BiasWeight := 4;
+  L1.Neurons[TGood].BiasWeight := 2;
+  L1.MulWeights(1.0);
+  // Layer 2: identity weights + bias correction (lower TBias, raise TGood) so
+  // FINAL argmax stays TBias but premature is even more peaked on TBias.
+  for N := 0 to L2.Neurons.Count - 1 do
+  begin
+    L2.Neurons[N].Weights.Fill(0);
+    L2.Neurons[N].Weights.FData[N] := 1; // identity
+    L2.Neurons[N].BiasWeight := 0;
+  end;
+  L2.Neurons[TBias].BiasWeight := -1.0;  // L2[TBias] = 4 - 1.0 = 3.0
+  L2.Neurons[TGood].BiasWeight := 0.8;   // L2[TGood] = 2 + 0.8 = 2.8  (< 3.0)
+  L2.MulWeights(1.0);
+  // Layer 3: identity LM head.
+  for N := 0 to L3.Neurons.Count - 1 do
+  begin
+    L3.Neurons[N].Weights.Fill(0);
+    L3.Neurons[N].Weights.FData[N] := 1;
+    L3.Neurons[N].BiasWeight := 0;
+  end;
+  L3.MulWeights(1.0);
+end;
+
+procedure TTestNeuralDecode.TestDoLaAlphaZeroMatchesGreedy;
+var
+  NN: TNNet;
+  G, D: TNNetDecodeResult;
+  NoStops: array of string;
+begin
+  // Degrade-to-greedy invariant: Alpha<=0 disables the layer contrast, so DoLa
+  // must reproduce plain greedy argmax bit-for-bit.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  try
+    G := DecodeGreedy(NN, 'ab', 8);
+    D := DecodeDoLa(NN, 'ab', 8, 0.0, NoStops);
+    AssertEquals('alpha=0 DoLa text == greedy text', G.Text, D.Text);
+    AssertEquals('alpha=0 DoLa finished == greedy',
+      Ord(G.Finished), Ord(D.Finished));
+    AssertEquals('alpha=0 DoLa sumlogprob == greedy', G.SumLogProb,
+      D.SumLogProb, 1e-6);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestDoLaEmptyBucketMatchesGreedy;
+var
+  NN: TNNet;
+  G, D: TNNetDecodeResult;
+  NoStops: array of string;
+begin
+  // BuildTinyNet has no earlier layer the size of the head input (FC ReLU(16)
+  // feeds an FCLinear(Vocab) head), so the candidate bucket is EMPTY and DoLa
+  // must fall back to greedy even at a non-zero Alpha.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  try
+    G := DecodeGreedy(NN, 'ab', 8);
+    D := DecodeDoLa(NN, 'ab', 8, 0.1, NoStops);
+    AssertEquals('empty-bucket DoLa text == greedy text', G.Text, D.Text);
+    AssertEquals('empty-bucket DoLa sumlogprob == greedy', G.SumLogProb,
+      D.SumLogProb, 1e-6);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestDoLaFlipsShallowBiasedCompletion;
+const
+  TBias = 5;
+  TGood = 6;
+var
+  NN: TNNet;
+  G, D: TNNetDecodeResult;
+  NoStops: array of string;
+  I: integer;
+begin
+  // Planted shallow-layer bias: greedy emits the biased token TBias every step,
+  // but the layer contrast (log p_final - log p_premature) is maximised at
+  // TGood, so DoLa flips the whole completion to TGood.
+  SetLength(NoStops, 0);
+  NN := BuildDoLaBiasedNet(4, 8, TBias, TGood);
+  try
+    G := DecodeGreedy(NN, 'ab', 5);
+    D := DecodeDoLa(NN, 'ab', 5, 0.1, NoStops);
+    AssertTrue('greedy emitted at least one token', Length(G.Text) >= 1);
+    AssertEquals('DoLa and greedy same length', Length(G.Text), Length(D.Text));
+    for I := 1 to Length(G.Text) do
+    begin
+      AssertEquals('greedy emits the biased token', Chr(TBias), G.Text[I]);
+      AssertEquals('DoLa flips to the good token', Chr(TGood), D.Text[I]);
+    end;
+    AssertTrue('DoLa actually changed the completion', D.Text <> G.Text);
   finally
     NN.Free;
   end;
