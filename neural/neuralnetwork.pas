@@ -3436,6 +3436,76 @@ type
     property MaxDistance: integer read FMaxDistance;
   end;
 
+  /// Disentangled self-attention (He et al. 2021, "DeBERTa: Decoding-enhanced
+  // BERT with Disentangled Attention", https://arxiv.org/abs/2006.03654, and
+  // the DeBERTa-v3 / DeBERTaV2 implementation in HF transformers
+  // DisentangledSelfAttention). This is a NEW attention MECHANISM, not just a
+  // bias-on-the-logits variant: the pre-softmax score is the SUM of three
+  // terms, content-to-content PLUS content-to-position PLUS position-to-content
+  //   score[i,j] = ( Q^c_i . K^c_j                                  (c2c)
+  //               +  Q^c_i . K^r_{c2p_pos(i,j)}                     (c2p)
+  //               +  K^c_j . Q^r_{p2c_pos(j,i)} ) / sqrt(d_k * 3)   (p2c)
+  // where Q^c|K^c|V^c are the ordinary content projections fed in the input
+  // (depth 3*d_k, the same Q|K|V slab as TNNetScaledDotProductAttention) and
+  // K^r / Q^r are SEPARATE relative-position projections looked up by the
+  // CLAMPED, optionally log-BUCKETED relative distance of the (query i, key j)
+  // pair. Unlike avT5RelPosBias (which adds a learned SCALAR bias per bucket)
+  // this projects whole position EMBEDDINGS and dots them with the content
+  // query / key, so it carries a (2*att_span)*d_k position-KEY table and a
+  // (2*att_span)*d_k position-QUERY table (this is genuinely different math).
+  // The relative position is r = i - j; the two gathers follow HF EXACTLY:
+  //   c2p_pos(i,j) = clamp(r + att_span, 0, 2*att_span-1)
+  //   p2c_pos(j,i) = clamp(-r + att_span, 0, 2*att_span-1)  (note the swap +
+  //     the negation; the p2c term reads the bucketed distance from the KEY's
+  //     point of view and transposes it back onto [i,j]).
+  // When PosBuckets > 0 the raw relative distance is first mapped through
+  // DeBERTa's log-bucket function make_log_bucket_position (att_span =
+  // PosBuckets); when PosBuckets = 0 the distance is used directly (att_span =
+  // MaxRelPos) and only the clamp applies. Scale uses scale_factor = 3 (both
+  // c2p and p2c present, the DeBERTa-v3 default) baked into 1/sqrt(d_k*3).
+  // Input layout (same as SDPA): SizeY = 1, SizeX = sequence length,
+  // Depth = 3 * d_k. Output shape: SizeX x 1 x d_k. Bidirectional (encoder)
+  // by default; CausalMask honoured (masked logits keep the -1e9 sentinel).
+  // Trainable parameters: the two position tables live in FNeurons[0] (K^r,
+  // 2*att_span rows of d_k) and FNeurons[1] (Q^r), so they round-trip through
+  // the base per-neuron save/load and step with the optimizer. The DeBERTa
+  // importer loads them by projecting the shared rel_embeddings through the
+  // attention key/query weights (share_att_key). att_span is stored in
+  // FStruct[3], PosBuckets in FStruct[4], MaxRelPos in FStruct[5]
+  // (FStruct[0..2] = d_k / causal / window as in the parent). KV-cache
+  // incremental decode is NOT supported (encoder layer). The backward pass is
+  // the exact adjoint of all three score terms: it scatters dScore into dQ^c,
+  // dK^c (the c2c + c2p + p2c contributions) and into the two position tables.
+  // Coded by Claude (AI).
+  TNNetDisentangledAttention = class(TNNetScaledDotProductAttention)
+  private
+    FAttSpan: integer;     // pos_ebd_size: position table half-width
+    FPosBuckets: integer;  // 0 = no log bucketing; >0 = bucket size
+    FMaxRelPos: integer;   // max_relative_positions for the log bucket
+    FInvSqrtScaled: TNeuralFloat; // 1 / sqrt(d_k * 3) (scale_factor=3)
+    // Precomputed gather indices per (i,j) pair, built in SetPrevLayer
+    // (FC2P[i*SeqLen+j] and FP2C[i*SeqLen+j]). Both already clamped to
+    // 0..2*att_span-1, so Compute is a flat lookup.
+    FC2P: array of integer;
+    FP2C: array of integer;
+    FSeqLen: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pCausalMask: boolean = false;
+      pAttSpan: integer = 256; pPosBuckets: integer = 256;
+      pMaxRelPos: integer = 512); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    // EXACT port of DeBERTa-v2's make_log_bucket_position (HF reference).
+    // Maps a raw relative position to its bucketed value (still signed).
+    class function LogBucketPosition(RelativePosition, BucketSize,
+      MaxPosition: integer): integer;
+    property AttSpan: integer read FAttSpan;
+    property PosBuckets: integer read FPosBuckets;
+    property MaxRelPos: integer read FMaxRelPos;
+  end;
+
   /// ALiBi attention (Press et al. 2022, "Train Short, Test Long: Attention
   // with Linear Biases Enables Input Length Extrapolation",
   // https://arxiv.org/abs/2108.12409).
@@ -25739,6 +25809,277 @@ begin
   if (not FBatchUpdate) then
   begin
     FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetDisentangledAttention }
+
+constructor TNNetDisentangledAttention.Create(d_k: integer;
+  pCausalMask: boolean; pAttSpan: integer; pPosBuckets: integer;
+  pMaxRelPos: integer);
+begin
+  inherited Create(d_k, pCausalMask);
+  FAttSpan := pAttSpan;
+  FPosBuckets := pPosBuckets;
+  FMaxRelPos := pMaxRelPos;
+  if FAttSpan < 1 then
+    FErrorProc('TNNetDisentangledAttention requires AttSpan >= 1. AttSpan=' +
+      IntToStr(FAttSpan));
+  if FPosBuckets < 0 then
+    FErrorProc('TNNetDisentangledAttention requires PosBuckets >= 0 ' +
+      '(0 = no log bucketing). PosBuckets=' + IntToStr(FPosBuckets));
+  // scale_factor = 3 (c2c + c2p + p2c, the DeBERTa-v3 default): scale is
+  // sqrt(d_k * scale_factor). HF applies the SAME scale to all three terms.
+  FInvSqrtScaled := pcr_rsqrtf(FDk * 3);
+  // FStruct[0..2] taken by the parent (d_k, causal flag, window).
+  FStruct[3] := FAttSpan;
+  FStruct[4] := FPosBuckets;
+  FStruct[5] := FMaxRelPos;
+end;
+
+// EXACT port of DeBERTa-v2 make_log_bucket_position (HF reference).
+class function TNNetDisentangledAttention.LogBucketPosition(
+  RelativePosition, BucketSize, MaxPosition: integer): integer;
+var
+  Sign, Mid, AbsPos, LogPos: integer;
+  Ratio: double;
+begin
+  if RelativePosition > 0 then Sign := 1
+  else if RelativePosition < 0 then Sign := -1
+  else Sign := 0;
+  Mid := BucketSize div 2;
+  // abs_pos = (|rp| in the exact middle band) ? mid-1 : |rp|
+  if (RelativePosition < Mid) and (RelativePosition > -Mid) then
+    AbsPos := Mid - 1
+  else
+    AbsPos := Abs(RelativePosition);
+  if AbsPos <= Mid then
+  begin
+    // |rp| in the exact region: bucket = rp itself (the where(abs_pos<=mid)).
+    Result := RelativePosition;
+  end
+  else
+  begin
+    // log_pos = ceil( ln(abs_pos/mid) / ln((max-1)/mid) * (mid-1) ) + mid
+    Ratio := Ln(AbsPos / Mid) / Ln((MaxPosition - 1) / Mid) * (Mid - 1);
+    LogPos := Ceil(Ratio) + Mid;
+    Result := LogPos * Sign;
+  end;
+end;
+
+procedure TNNetDisentangledAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  i, j, r, rb, c2p, p2c, twoSpan: integer;
+
+  // Bucketed (or raw) signed relative position for distance `rel`.
+  function Bucketed(rel: integer): integer;
+  begin
+    if FPosBuckets > 0 then
+      Result := LogBucketPosition(rel, FPosBuckets, FMaxRelPos)
+    else
+      Result := rel;
+  end;
+
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FSeqLen := pPrevLayer.FOutput.SizeX;
+  twoSpan := 2 * FAttSpan;
+  // TWO neurons, each a (2*att_span) x d_k position table: neuron 0 = K^r
+  // (the content->position key table), neuron 1 = Q^r (the position->content
+  // query table). Storing them as neuron weights round-trips them through the
+  // base per-neuron save/load and steps them with the optimizer.
+  if FNeurons.Count < 2 then AddMissingNeurons(2 - FNeurons.Count);
+  SetNumWeightsForAllNeurons(twoSpan, 1, FDk);
+  AfterWeightUpdate();
+  // Precompute the two gather indices per (i,j) pair (HF gather math). r=i-j.
+  //   c2p_pos(i,j) = clamp( bucket(i-j) + att_span, 0, 2*att_span-1)
+  //   p2c_pos(j,i) = clamp( bucket(j-i) + att_span, 0, 2*att_span-1)
+  // (HF clamps -r_pos + att_span where r_pos = bucket(query-key); from the
+  // KEY's row that is bucket(j-i), then the result is transposed onto [i,j],
+  // so the (i,j) entry reads bucket((j)-(i)). Both reduce to bucket of the
+  // distance with opposite sign.)
+  SetLength(FC2P, FSeqLen * FSeqLen);
+  SetLength(FP2C, FSeqLen * FSeqLen);
+  for i := 0 to FSeqLen - 1 do
+    for j := 0 to FSeqLen - 1 do
+    begin
+      r := i - j;
+      rb := Bucketed(r) + FAttSpan;
+      if rb < 0 then rb := 0;
+      if rb > twoSpan - 1 then rb := twoSpan - 1;
+      c2p := rb;
+      rb := Bucketed(-r) + FAttSpan;
+      if rb < 0 then rb := 0;
+      if rb > twoSpan - 1 then rb := twoSpan - 1;
+      p2c := rb;
+      FC2P[i * FSeqLen + j] := c2p;
+      FP2C[i * FSeqLen + j] := p2c;
+    end;
+end;
+
+procedure TNNetDisentangledAttention.InitDefault();
+begin
+  // Small Gaussian init for the position tables (they are real projections,
+  // unlike the T5 bias table which starts at zero). The DeBERTa importer
+  // overwrites them with the projected rel_embeddings anyway.
+  if FNeurons.Count >= 2 then
+  begin
+    FNeurons[0].InitGaussian(0.02);
+    FNeurons[1].InitGaussian(0.02);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetDisentangledAttention.Compute();
+const
+  cMaskFloor = -1e8; // same all-masked-row floor as the parent
+var
+  StartTime: double;
+  SeqLen, i, j, d: integer;
+  Score, MaxScore, SumExp, c2c, c2p, p2c: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr, Krow, Qrow: TNeuralFloatArrPtr;
+  PosK, PosQ: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  PosK := FNeurons[0].FWeights; // K^r table, row a at GetRawPtr(a,0,0)
+  PosQ := FNeurons[1].FWeights; // Q^r table
+  for i := 0 to SeqLen - 1 do
+  begin
+    MaxScore := -1e30;
+    for j := 0 to SeqLen - 1 do
+    begin
+      if FCausal and (j > i) then
+      begin
+        FAttn[j, i, 0] := -1e9;
+      end
+      else
+      begin
+        // Content-to-content: Q^c_i . K^c_j (depth contiguous AVX dot).
+        c2c := TNNetVolume.DotProduct(
+          Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
+        // Content-to-position: Q^c_i . K^r_{c2p_pos(i,j)}.
+        Krow := PosK.GetRawPtr(FC2P[i * SeqLen + j], 0, 0);
+        c2p := TNNetVolume.DotProduct(Prev.GetRawPtr(i, 0, 0), Krow, FDk);
+        // Position-to-content: K^c_j . Q^r_{p2c_pos(i,j)}.
+        Qrow := PosQ.GetRawPtr(FP2C[i * SeqLen + j], 0, 0);
+        p2c := TNNetVolume.DotProduct(Prev.GetRawPtr(j, 0, FDk), Qrow, FDk);
+        Score := (c2c + c2p + p2c) * FInvSqrtScaled;
+        FAttn[j, i, 0] := Score;
+      end;
+      if FAttn[j, i, 0] > MaxScore then MaxScore := FAttn[j, i, 0];
+    end;
+    if MaxScore <= cMaskFloor then
+    begin
+      for j := 0 to SeqLen - 1 do
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqLen - 1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqLen - 1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqLen - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetDisentangledAttention.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, i, j, kk: integer;
+  Prev, PrevErr, PosK, PosQ, dPosK, dPosQ: TNNetVolume;
+  dAttn, dScore: array of TNeuralFloat;
+  SumDAttnAttn, A, dS, g: TNeuralFloat;
+  Krow, Qrow: TNeuralFloatArrPtr;
+  a_idx, b_idx: integer;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  PrevErr := FPrevLayer.FOutputError;
+  PosK := FNeurons[0].FWeights;
+  PosQ := FNeurons[1].FWeights;
+  dPosK := FNeurons[0].FDelta;
+  dPosQ := FNeurons[1].FDelta;
+  SeqLen := Prev.SizeX;
+  SetLength(dAttn, SeqLen);
+  SetLength(dScore, SeqLen);
+  for i := 0 to SeqLen - 1 do
+  begin
+    // ---- dV and dAttn (identical to the parent) ----
+    for j := 0 to SeqLen - 1 do
+    begin
+      A := FAttn[j, i, 0];
+      if (FPrevLayer.Output.Size > 0) and
+         (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, 2 * FDk),
+          FOutputError.GetRawPtr(i, 0, 0), A, FDk);
+      dAttn[j] := TNNetVolume.DotProduct(
+        FOutputError.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, 2 * FDk), FDk);
+    end;
+    // ---- softmax Jacobian -> dScore ----
+    SumDAttnAttn := 0;
+    for kk := 0 to SeqLen - 1 do
+      SumDAttnAttn := SumDAttnAttn + dAttn[kk] * FAttn[kk, i, 0];
+    for j := 0 to SeqLen - 1 do
+      dScore[j] := FAttn[j, i, 0] * (dAttn[j] - SumDAttnAttn);
+    // ---- scatter dScore into Q^c, K^c, K^r, Q^r ----
+    // score[i,j] = (Qc_i.Kc_j + Qc_i.Kr_a + Kc_j.Qr_b) * FInvSqrtScaled.
+    //   dQc_i += g*(Kc_j + Kr_a);  dKc_j += g*(Qc_i + Qr_b);
+    //   dKr_a += g*Qc_i;           dQr_b += g*Kc_j.   (g = dScore*FInvSqrtScaled)
+    for j := 0 to SeqLen - 1 do
+    begin
+      g := dScore[j] * FInvSqrtScaled;
+      if g = 0 then continue;
+      a_idx := FC2P[i * SeqLen + j];
+      b_idx := FP2C[i * SeqLen + j];
+      Krow := PosK.GetRawPtr(a_idx, 0, 0);
+      Qrow := PosQ.GetRawPtr(b_idx, 0, 0);
+      // Position-table grads (delta convention: += -lr * grad).
+      TNNetVolume.MulAdd(dPosK.GetRawPtr(a_idx, 0, 0),
+        Prev.GetRawPtr(i, 0, 0), -FLearningRate * g, FDk);
+      TNNetVolume.MulAdd(dPosQ.GetRawPtr(b_idx, 0, 0),
+        Prev.GetRawPtr(j, 0, FDk), -FLearningRate * g, FDk);
+      // Content grads into Q^c_i and K^c_j.
+      if (FPrevLayer.Output.Size > 0) and
+         (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+      begin
+        // dQc_i += g*Kc_j + g*Kr_a
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0),
+          Prev.GetRawPtr(j, 0, FDk), g, FDk);
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(i, 0, 0), Krow, g, FDk);
+        // dKc_j += g*Qc_i + g*Qr_b
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk),
+          Prev.GetRawPtr(i, 0, 0), g, FDk);
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(j, 0, FDk), Qrow, g, FDk);
+      end;
+    end;
+  end;
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    FNeurons[1].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -84884,6 +85225,7 @@ begin
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetQKNormAttention' :      Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetT5RelPosBiasAttention' : Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
+      'TNNetDisentangledAttention' : Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]);
       'TNNetALiBiAttention' :       Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetGptOssSinkAttention' :  Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]);
@@ -85271,6 +85613,7 @@ begin
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetQKNormAttention' then Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetT5RelPosBiasAttention' then Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
+      if S[0] = 'TNNetDisentangledAttention' then Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]) else
       if S[0] = 'TNNetALiBiAttention' then Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetGptOssSinkAttention' then Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]) else

@@ -831,6 +831,8 @@ type
     procedure TestT5RelPosBiasAttentionGradientCheck;
     procedure TestT5RelPosBiasAttentionZeroBiasMatchesSDPA;
     procedure TestT5RelPosBiasAttentionSerializationRoundTrip;
+    procedure TestDisentangledAttentionGradientCheck;
+    procedure TestDisentangledAttentionSerializationRoundTrip;
     procedure TestALiBiSlopeMatchesReference;
     procedure TestALiBiAttentionGradientCheck;
     procedure TestALiBiAttentionZeroSlopeMatchesSDPA;
@@ -19482,6 +19484,179 @@ begin
 
     S2 := NN2.SaveToString();
     AssertEquals('T5 save->load->save string equality', S, S2);
+  finally
+    NN.Free;
+    if Assigned(NN2) then NN2.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDisentangledAttentionGradientCheck;
+// Central-difference check of the input gradient AND both relative-position
+// table gradients (K^r in Neurons[0], Q^r in Neurons[1]) of a bidirectional
+// TNNetDisentangledAttention (d_k=4, SeqLen=6, att_span=4, pos_buckets=4,
+// max_rel=6). With learning rate 1 and batch update the analytical weight
+// gradient is -Neurons[n].Delta (Delta accumulates -lr*grad), matching the
+// sibling attention weight-grad tests. The input layer is built with the
+// 4-arg ctor (pError=1) so reads of Layers[0].OutputError are in-bounds.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetDisentangledAttention;
+  SeqLen, Dk, Span, n, w: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var idx: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for idx := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[idx] - Desired.Raw[idx];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 6;
+  Dk := 4;
+  Span := 4;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetDisentangledAttention.Create(Dk, {causal=}false,
+      Span, {pos_buckets=}4, {max_rel=}6);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    AssertEquals('Disentangled K^r table has 2*att_span*d_k weights',
+      2 * Span * Dk, Attn.Neurons[0].Weights.Size);
+    AssertEquals('Disentangled Q^r table has 2*att_span*d_k weights',
+      2 * Span * Dk, Attn.Neurons[1].Weights.Size);
+
+    // Deterministic, O(1)-scale tables and input so all three score terms
+    // genuinely shape the softmax (away from any degenerate near-zero floor).
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+    begin
+      Attn.Neurons[0].Weights.Raw[w] := Sin((w + 1) * 0.53) * 0.6;
+      Attn.Neurons[1].Weights.Raw[w] := Cos((w + 1) * 0.47) * 0.6;
+    end;
+    Attn.FlushWeightCache;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+
+    // ---- Position-table gradients (both neurons; rows unused by this SeqLen
+    // legitimately get zero gradient on both sides). ----
+    for n := 0 to 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+      begin
+        Attn.Neurons[n].Weights.Raw[w] := Attn.Neurons[n].Weights.Raw[w] + epsilon;
+        Attn.FlushWeightCache;
+        lossPlus := ComputeLoss;
+        Attn.Neurons[n].Weights.Raw[w] := Attn.Neurons[n].Weights.Raw[w] - 2 * epsilon;
+        Attn.FlushWeightCache;
+        lossMinus := ComputeLoss;
+        Attn.Neurons[n].Weights.Raw[w] := Attn.Neurons[n].Weights.Raw[w] + epsilon;
+        Attn.FlushWeightCache;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        Attn.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -Attn.Neurons[n].Delta.Raw[w];
+
+        AssertTrue('Disentangled pos-table[' + IntToStr(n) + '] grad[' +
+          IntToStr(w) + '] num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+
+    // ---- Input gradient ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Disentangled input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDisentangledAttentionSerializationRoundTrip;
+// SaveToString/LoadFromString must reconstruct a TNNetDisentangledAttention
+// (registered in BOTH dispatch tables) with NON-default hyperparams, round-trip
+// the two position tables and reproduce Compute exactly.
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Attn, Attn2: TNNetDisentangledAttention;
+  S, S2: string;
+  i, n, w: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN2 := nil;
+  Input := TNNetVolume.Create(6, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 12, 1));
+    Attn := TNNetDisentangledAttention.Create(4, false, 5, 5, 8);
+    NN.AddLayer(Attn);
+    for n := 0 to 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+        Attn.Neurons[n].Weights.Raw[w] := Sin((w + 1 + n * 7) * 0.43) * 0.7;
+    Attn.FlushWeightCache;
+
+    S := NN.SaveToString();
+    NN2 := TNNet.Create();
+    NN2.LoadFromString(S);
+
+    AssertTrue('Loaded layer is TNNetDisentangledAttention',
+      NN2.Layers[1] is TNNetDisentangledAttention);
+    Attn2 := NN2.Layers[1] as TNNetDisentangledAttention;
+    AssertEquals('Disentangled att_span round-trips', 5, Attn2.AttSpan);
+    AssertEquals('Disentangled pos_buckets round-trips', 5, Attn2.PosBuckets);
+    AssertEquals('Disentangled max_rel round-trips', 8, Attn2.MaxRelPos);
+    AssertEquals('Disentangled d_k round-trips', 4, Attn2.Dk);
+    for n := 0 to 1 do
+      for w := 0 to Attn.Neurons[n].Weights.Size - 1 do
+        AssertEquals('Disentangled table[' + IntToStr(n) + '] round-trips at ' +
+          IntToStr(w),
+          Attn.Neurons[n].Weights.Raw[w], Attn2.Neurons[n].Weights.Raw[w], 1e-5);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.29) * 0.8 - 0.1;
+    NN.Compute(Input);
+    NN2.Compute(Input);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('Disentangled save/load Compute match at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+
+    S2 := NN2.SaveToString();
+    AssertEquals('Disentangled save->load->save string equality', S, S2);
   finally
     NN.Free;
     if Assigned(NN2) then NN2.Free;
