@@ -94,7 +94,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] StarCoder2 importer (model_type "starcoder2") — the most-used modern
+- [X] StarCoder2 importer (model_type "starcoder2") — the most-used modern
       open CODE LLM family (bigcode/starcoder2-3b/7b/15b) and the first
       code-specialised model in the repo. Architecturally DISTINCT from every
       landed Llama-path importer, so it adds real coverage rather than a near-

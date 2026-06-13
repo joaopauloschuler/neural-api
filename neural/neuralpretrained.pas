@@ -1414,6 +1414,63 @@ function BuildGPTNeoXFromSafeTensors(const FileName: string;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
+  // HF Starcoder2Config (model_type "starcoder2", bigcode/starcoder2-3b/7b/15b).
+  // The first CODE-specialised decoder: RoPE + GQA + (optional) sliding-window
+  // attention pinned to three GPT-2-flavoured pieces the RMSNorm/SwiGLU Llama
+  // path does NOT use - biased nn.LayerNorm norms (NOT RMSNorm), bias=True on
+  // EVERY linear (q/k/v AND o_proj - the path OLMo-2 deliberately rejects), and
+  // a plain two-matrix gelu_pytorch_tanh FFN (c_fc -> GELU -> c_proj, NO gate).
+  TStarCoder2Config = record
+    HiddenSize: integer;        // hidden_size (d_model)
+    IntermediateSize: integer;  // intermediate_size (c_fc width)
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads (query heads)
+    NumKVHeads: integer;        // num_key_value_heads (GQA/MQA)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings
+    LayerNormEps: TNeuralFloat; // norm_epsilon (nn.LayerNorm eps, default 1e-5)
+    RopeTheta: TNeuralFloat;    // rope_theta (RoPE base)
+    SlidingWindow: integer;     // sliding_window (0/null = full attention; when
+                                // set, applies to EVERY layer - no pattern)
+    UseBias: boolean;           // use_bias: q/k/v/o AND c_fc/c_proj carry biases
+                                // (default true); lm_head is ALWAYS bias-free
+    TieWordEmbeddings: boolean; // tie_word_embeddings (config default true; the
+                                // released 3b/7b/15b checkpoints are UNTIED)
+    Prefix: string;             // tensor-name prefix ('model.' or '')
+  end;
+
+// Reads a HF Starcoder2 config.json (model_type 'starcoder2'). Required:
+// hidden_size, intermediate_size, num_hidden_layers, num_attention_heads,
+// vocab_size, max_position_embeddings. Defaults: num_key_value_heads =
+// num_attention_heads, norm_epsilon = 1e-5, rope_theta = 10000 (also read from
+// rope_parameters.rope_theta when present), sliding_window = 0 (full
+// attention), use_bias = true, tie_word_embeddings = true. hidden_act must be
+// 'gelu_pytorch_tanh' (the only released form). head_dim = hidden/heads.
+function ReadStarCoder2ConfigFromJSONFile(const FileName: string): TStarCoder2Config;
+
+function StarCoder2ConfigToString(const Config: TStarCoder2Config): string;
+
+// Builds a TNNet with the Starcoder2 architecture described by the config and
+// loads every weight from the safetensors/.bin checkpoint at FileName (see the
+// STARCODER2 IMPORT section). The net takes a (SeqLen,1,1) volume of token ids
+// and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses the full
+// max_position_embeddings context. Config.Prefix is detected and written back.
+function BuildStarCoder2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TStarCoder2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildStarCoder2FromSafeTensorsEx(const FileName: string;
+  out Config: TStarCoder2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildStarCoder2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+type
   TGPTJConfig = record
     HiddenSize: integer;        // d_model (n_embd)
     IntermediateSize: integer;  // MLP width (n_inner; null = 4*n_embd)
@@ -8407,6 +8464,460 @@ var
   IgnoredConfig: TGPTNeoXConfig;
 begin
   Result := BuildGPTNeoXFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ========================= STARCODER2 IMPORT ==============================
+// Starcoder2 (model_type "starcoder2", bigcode/starcoder2-3b/7b/15b) is the
+// first CODE-specialised decoder in this unit. It pairs the modern Llama-style
+// attention front-end - RoPE on q/k, GQA (num_key_value_heads), an OPTIONAL
+// sliding window applied to EVERY layer when sliding_window is set - with three
+// GPT-2-flavoured pieces the RMSNorm/SwiGLU Llama path never exercises:
+//   (a) biased nn.LayerNorm norms (TNNetTokenLayerNorm WITH a learned bias),
+//       NOT RMSNorm - input_layernorm, post_attention_layernorm and the final
+//       model.norm, eps = norm_epsilon (default 1e-5);
+//   (b) bias=True (config use_bias) on ALL FOUR attention projections including
+//       o_proj (the exact path OLMo-2's attention_bias deliberately REJECTS)
+//       AND on both MLP matrices; lm_head is always bias-free;
+//   (c) a plain two-matrix gelu_pytorch_tanh FFN (c_fc -> GELU -> c_proj, NO
+//       SwiGLU gate), so it reuses TNNetGELU (the tanh approximation = HF's
+//       gelu_pytorch_tanh) on a dedicated LayerNorm pre-norm block.
+// The block is the standard sequential pre-norm pair (residual_dropout and
+// embedding_dropout are 0 at inference):
+//   x := x + o_proj( GQA-RoPE-SDPA( input_layernorm(x) ) )
+//   x := x + c_proj( gelu_tanh( c_fc( post_attention_layernorm(x) ) ) )
+// q/k rows carry the same per-head rotate_half permutation as the Llama path
+// (TNNetRotaryEmbedding rotates interleaved pairs; HF rotates half-split pairs);
+// v/o load straight. Embeddings are usually UNTIED (a separate lm_head.weight);
+// the config-default tied case copies the embedding rows into the head.
+// Tokenizer is the stock BPE tokenizer.json path (already supported).
+
+function ReadStarCoder2ConfigFromJSONFile(const FileName: string): TStarCoder2Config;
+var
+  JsonText: TStringList;
+  Root, RopeParams: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Starcoder2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Starcoder2 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Starcoder2 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Starcoder2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Starcoder2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'starcoder2');
+    if ModelType <> 'starcoder2' then
+      ImportError('Starcoder2 import: config model_type is "' + ModelType +
+        '" - expected "starcoder2" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if Result.NumKVHeads <= 0 then Result.NumKVHeads := Result.NumHeads;
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.LayerNormEps := Obj.Get('norm_epsilon', 1.0e-5);
+    // rope_theta is top-level in the released checkpoint configs; newer
+    // transformers nests it under rope_parameters.rope_theta.
+    Result.RopeTheta := Obj.Get('rope_theta', 0.0);
+    if Result.RopeTheta <= 0 then
+    begin
+      RopeParams := Obj.Find('rope_parameters');
+      if (RopeParams <> nil) and (RopeParams is TJSONObject) then
+        Result.RopeTheta := TJSONObject(RopeParams).Get('rope_theta', 0.0);
+    end;
+    if Result.RopeTheta <= 0 then Result.RopeTheta := 10000.0;
+    // sliding_window may be null (full attention) or a positive int (applied to
+    // EVERY layer, no Mistral-style per-layer pattern).
+    Result.SlidingWindow := 0;
+    if (Obj.IndexOfName('sliding_window') >= 0) and
+       (Obj.Find('sliding_window').JSONType = jtNumber) then
+      Result.SlidingWindow := Obj.Get('sliding_window', 0);
+    if Result.SlidingWindow < 0 then Result.SlidingWindow := 0;
+    Result.UseBias := Obj.Get('use_bias', True);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    HiddenAct := Obj.Get('hidden_act', 'gelu_pytorch_tanh');
+    if (HiddenAct <> 'gelu_pytorch_tanh') and (HiddenAct <> 'gelu_new') then
+      ImportError('Starcoder2 import: config hidden_act "' + HiddenAct +
+        '" is not supported - only "gelu_pytorch_tanh" (the released form) ' +
+        'is wired here.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function StarCoder2ConfigToString(const Config: TStarCoder2Config): string;
+begin
+  Result := 'starcoder2 config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', window=' + IntToStr(Config.SlidingWindow) +
+    ', bias=' + BoolToStr(Config.UseBias, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TStarCoder2BlockLayers = record
+    AttnNorm, QProj, KProj, VProj, OProj: TNNetLayer;
+    MlpNorm, CFc, CProj: TNNetLayer;
+  end;
+
+function BuildStarCoder2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TStarCoder2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TStarCoder2BlockLayers;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSource, KSlice, QSlice, HeadPack: TNNetLayer;
+  KRotated, VSlices, HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
+  HeadDim, QWidth, KVWidth, i, j, d: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, MlpPrefix, TensorNameStr, LMHeadName: string;
+  QBiasName, KBiasName, VBiasName, OBiasName, FcBiasName, ProjBiasName: string;
+  RopeScaling: TRoPEScalingConfig;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // Loads a [d_model] LayerNorm weight/bias pair under the Starcoder2 message
+  // namespace (delegates to the shared loader, which already handles bias).
+  procedure LoadNorm(Layer: TNNetLayer; const Base: string);
+  begin
+    LoadLayerNormWeights(Reader, Layer, Base + '.weight', Base + '.bias',
+      Config.HiddenSize);
+    MarkConsumed(Base + '.weight');
+    MarkConsumed(Base + '.bias');
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  RopeScaling := DefaultRoPEScaling();
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('Starcoder2 import: num_attention_heads must be >= 1.');
+      if Config.NumKVHeads < 1 then
+        ImportError('Starcoder2 import: num_key_value_heads must be >= 1.');
+      if (Config.NumHeads mod Config.NumKVHeads) <> 0 then
+        ImportError('Starcoder2 import: num_attention_heads=' +
+          IntToStr(Config.NumHeads) + ' is not divisible by ' +
+          'num_key_value_heads=' + IntToStr(Config.NumKVHeads) + '.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('Starcoder2 import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if Odd(HeadDim) then
+        ImportError('Starcoder2 import: head_dim=' + IntToStr(HeadDim) +
+          ' must be even (RoPE rotates channel pairs).');
+      if Config.SlidingWindow < 0 then
+        ImportError('Starcoder2 import: sliding_window must be >= 0 ' +
+          '(0 = full attention).');
+      QWidth := Config.NumHeads * HeadDim;
+      KVWidth := Config.NumKVHeads * HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Starcoder2 import: neither "model.embed_tokens.weight" ' +
+          'nor "embed_tokens.weight" found in ' + Reader.FileName +
+          ' - not a Starcoder2 checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embed_tokens.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Starcoder2 import: embed_tokens.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+      LMHeadName := 'lm_head.weight';
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor(LMHeadName)) then
+        ImportError('Starcoder2 import: config says tie_word_embeddings=' +
+          'false but "' + LMHeadName + '" is missing from ' +
+          Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('Starcoder2 import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(KRotated, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // Attention sub-block: x := x + o_proj(rotary-GQA(LayerNorm(x))),
+        // wired from primitives exactly like the Llama path (per-head RoPE on
+        // each Q/K slice; depth = head_dim so the frequency schedule matches
+        // HF), but with a BIASED LayerNorm pre-norm and biased projections.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].AttnNorm := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        NormedSource := NN.GetLastLayer();
+        Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+        Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        // K is rotated ONCE per KV head; V is never rotated.
+        for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+        begin
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := KVHeadCnt * HeadDim + d;
+          KSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
+          KRotated[KVHeadCnt] := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), KSlice);
+          VSlices[KVHeadCnt] := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
+        end;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          KVGroup := HeadCnt div GroupSize;
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := HeadCnt * HeadDim + d;
+          QSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+          QSlice := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), QSlice);
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+            [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
+          // Config.SlidingWindow > 0 (when set) applies the banded causal
+          // window to EVERY layer (HF Starcoder2 has no per-layer pattern).
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true,
+              {pWindow=}Config.SlidingWindow),
+            HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // MLP sub-block: x := x + c_proj(gelu_tanh(c_fc(LayerNorm(x)))) -
+        // a plain two-matrix FFN, NO SwiGLU gate.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].MlpNorm := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].CFc := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        NN.AddLayer( TNNetGELU.Create() ); // gelu_pytorch_tanh
+        Blocks[BlockCnt].CProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Starcoder2 import: embed_tokens.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          EnsureWritableImportWeights(LMHead);
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+        end
+        else
+        begin
+          // UNTIED head: lm_head.weight is its own [vocab, hidden] bias-free
+          // nn.Linear (HF builds lm_head with bias=False regardless of use_bias).
+          LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+            Config.HiddenSize, Config.VocabSize);
+          MarkConsumed(LMHeadName);
+        end;
+      finally
+        Tmp.Free;
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'self_attn.';
+        MlpPrefix := BlockPrefix + 'mlp.';
+        LoadNorm(Blocks[BlockCnt].AttnNorm, BlockPrefix + 'input_layernorm');
+        LoadNorm(Blocks[BlockCnt].MlpNorm,
+          BlockPrefix + 'post_attention_layernorm');
+        // Config.UseBias (default true): every attention projection - q/k/v
+        // AND o_proj - carries a bias (the path OLMo-2 rejects). q/k rows are
+        // rotate_half-permuted per head; v/o load straight.
+        if Config.UseBias then
+        begin
+          QBiasName := AttnPrefix + 'q_proj.bias';
+          KBiasName := AttnPrefix + 'k_proj.bias';
+          VBiasName := AttnPrefix + 'v_proj.bias';
+          OBiasName := AttnPrefix + 'o_proj.bias';
+          FcBiasName := MlpPrefix + 'c_fc.bias';
+          ProjBiasName := MlpPrefix + 'c_proj.bias';
+        end
+        else
+        begin
+          QBiasName := ''; KBiasName := ''; VBiasName := '';
+          OBiasName := ''; FcBiasName := ''; ProjBiasName := '';
+        end;
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+          AttnPrefix + 'q_proj.weight', Config.HiddenSize, QWidth,
+          0, -1, HeadDim, QBiasName);
+        MarkConsumed(AttnPrefix + 'q_proj.weight');
+        if QBiasName <> '' then MarkConsumed(QBiasName);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+          AttnPrefix + 'k_proj.weight', Config.HiddenSize, KVWidth,
+          0, -1, HeadDim, KBiasName);
+        MarkConsumed(AttnPrefix + 'k_proj.weight');
+        if KBiasName <> '' then MarkConsumed(KBiasName);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+          AttnPrefix + 'v_proj.weight', Config.HiddenSize, KVWidth,
+          0, -1, 0, VBiasName);
+        MarkConsumed(AttnPrefix + 'v_proj.weight');
+        if VBiasName <> '' then MarkConsumed(VBiasName);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+          AttnPrefix + 'o_proj.weight', QWidth, Config.HiddenSize,
+          0, -1, 0, OBiasName);
+        MarkConsumed(AttnPrefix + 'o_proj.weight');
+        if OBiasName <> '' then MarkConsumed(OBiasName);
+        // Two-matrix FFN: c_fc (hidden -> intermediate), c_proj back.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CFc,
+          MlpPrefix + 'c_fc.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, -1, 0, FcBiasName);
+        MarkConsumed(MlpPrefix + 'c_fc.weight');
+        if FcBiasName <> '' then MarkConsumed(FcBiasName);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CProj,
+          MlpPrefix + 'c_proj.weight', Config.IntermediateSize,
+          Config.HiddenSize, 0, -1, 0, ProjBiasName);
+        MarkConsumed(MlpPrefix + 'c_proj.weight');
+        if ProjBiasName <> '' then MarkConsumed(ProjBiasName);
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadNorm(FinalNorm, Config.Prefix + 'norm');
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if Pos('rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
+        ImportError('Starcoder2 import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildStarCoder2FromSafeTensorsEx(const FileName: string;
+  out Config: TStarCoder2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadStarCoder2ConfigFromJSONFile(ConfigPath);
+  Result := BuildStarCoder2FromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildStarCoder2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TStarCoder2Config;
+begin
+  Result := BuildStarCoder2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -20956,6 +21467,7 @@ var
   IgnoredGPTNeoConfig: TGPTNeoConfig;
   IgnoredGPTNeoXConfig: TGPTNeoXConfig;
   IgnoredGPTJConfig: TGPTJConfig;
+  IgnoredStarCoder2Config: TStarCoder2Config;
   IgnoredGptOssConfig: TGptOssConfig;
   IgnoredCohereConfig: TCohereConfig;
   IgnoredPhiConfig: TPhiConfig;
@@ -21074,6 +21586,17 @@ begin
   else if ModelType = 'gptj' then
     Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'starcoder2' then
+    // Starcoder2 (architectures ["Starcoder2ForCausalLM"],
+    // bigcode/starcoder2-3b/7b/15b): the first CODE-specialised decoder -
+    // RoPE + GQA + (optional) sliding window with biased nn.LayerNorm norms
+    // (NOT RMSNorm), bias=True on all q/k/v AND o_proj linears, and a plain
+    // two-matrix gelu_pytorch_tanh FFN (c_fc -> GELU -> c_proj, no gate).
+    // Causal-LM contract like the other decoder families. See the STARCODER2
+    // IMPORT section.
+    Result := BuildStarCoder2FromSafeTensorsEx(WeightsPath,
+      IgnoredStarCoder2Config, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
   else if ModelType = 'gpt_oss' then
     // GPT-OSS (OpenAI gpt-oss, architectures ["GptOssForCausalLM"], the
     // openai/gpt-oss-20b/120b family): sparse top-k MoE decoder with learned

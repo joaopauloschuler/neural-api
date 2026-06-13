@@ -188,6 +188,8 @@ type
     procedure TestFalconNewArchLogitParity;
     procedure TestGPTJConfigFromJSONFile;
     procedure TestGPTJLogitParity;
+    procedure TestStarCoder2LogitParity;
+    procedure TestStarCoder2WindowLogitParity;
     procedure TestCohereConfigFromJSONFile;
     procedure TestCohereLogitParity;
     procedure TestCohere2LogitParity;
@@ -6302,6 +6304,97 @@ begin
     AssertEquals('prefix', 'transformer.', Config.Prefix);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gptj_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Starcoder2 import target (HF model_type "starcoder2",
+// architectures ["Starcoder2ForCausalLM"], the bigcode/starcoder2-3b/7b/15b
+// code-LLM family): the first CODE-specialised decoder. tiny_starcoder2.* is a
+// pico randomly-initialized Starcoder2ForCausalLM (2 layers, hidden 8, GQA
+// 2/1, untied head) exercising the three GPT-2-flavoured pieces the
+// RMSNorm/SwiGLU Llama path never uses - BIASED nn.LayerNorm norms (NOT
+// RMSNorm), bias=True on q/k/v AND o_proj (the path OLMo-2 rejects), and a
+// plain two-matrix gelu_pytorch_tanh FFN (c_fc -> GELU -> c_proj, no gate).
+// The generator (tools/starcoder2_tiny_fixture.py) re-randomizes the
+// (HF-zero-inited) LayerNorm biases and the o_proj bias and ASSERTS both move
+// the float64-oracle logits, so the importer's bias loading is genuinely
+// covered. Structural checks pin the TokenLayerNorm count (2 per block + 1
+// final = 5) - a sneaked-in RMSNorm would build TokenRMSNorm and fail it.
+procedure TTestNeuralPretrained.TestStarCoder2LogitParity;
+var
+  NN: TNNet;
+  Config: TStarCoder2Config;
+  LayerCnt, NormCnt, RMSCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildStarCoder2FromSafeTensorsEx(
+    FixturePath('tiny_starcoder2.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_starcoder2_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertTrue('use_bias', Config.UseBias);
+    AssertEquals('window (full attention)', 0, Config.SlidingWindow);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    NormCnt := 0;
+    RMSCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetTokenLayerNorm then
+        Inc(NormCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetTokenRMSNorm then
+        Inc(RMSCnt);
+    end;
+    AssertEquals('TokenLayerNorm count (2 per block + final)',
+      2 * Config.NumLayers + 1, NormCnt);
+    AssertEquals('no RMSNorm (Starcoder2 is LayerNorm)', 0, RMSCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_starcoder2_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "starcoder2" onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_starcoder2.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_starcoder2_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_starcoder2_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Same checkpoint weights as TestStarCoder2LogitParity but with
+// sliding_window set < the sequence length (tiny_starcoder2_window.*): the
+// banded causal mask is applied to EVERY layer (HF Starcoder2 has no
+// per-layer pattern). The generator ASSERTS the windowed logits differ from
+// the full-attention logits of the same weights, so this exercises the
+// TNNetScaledDotProductAttention pWindow path distinctly.
+procedure TTestNeuralPretrained.TestStarCoder2WindowLogitParity;
+var
+  NN: TNNet;
+  Config: TStarCoder2Config;
+begin
+  RandSeed := 424242;
+  NN := BuildStarCoder2FromSafeTensorsEx(
+    FixturePath('tiny_starcoder2_window.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_starcoder2_window_config.json'));
+  try
+    AssertTrue('sliding window set', Config.SlidingWindow > 0);
+    AssertTrue('window < context', Config.SlidingWindow < Config.MaxPositions);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_starcoder2_window_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;
