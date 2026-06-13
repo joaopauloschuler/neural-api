@@ -38,6 +38,26 @@ type
     procedure TestReseedReproducible;
     // BuildTrainingPair + ApplyLossMask: ignored rows carry zero output error.
     procedure TestLossMaskZeroErrorAtIgnoredPositions;
+    // Whole-word masking: a selected word has ALL its pieces masked together
+    // and no partial-word masking ever occurs.
+    procedure TestWholeWordNoPartialMasking;
+    // Whole-word masking with MaskProb=0 selects nothing and corrupts nothing.
+    procedure TestWholeWordZeroProbSelectsNothing;
+  end;
+
+  TTestNeuralSpanCorruption = class(TTestCase)
+  published
+    // Sentinel ids descend from the configured base.
+    procedure TestSentinelIdsDescend;
+    // The original sequence is exactly reconstructable from source + target.
+    procedure TestRoundTripReconstruction;
+    // Source sentinel placement matches the target sentinel/span stream and the
+    // target ends with the trailing (final) sentinel.
+    procedure TestSourceTargetSentinelConsistency;
+    // CorruptionRate=0 leaves the sequence untouched (no spans, source=input).
+    procedure TestZeroRateNoCorruption;
+    // Reseeding reproduces identical collation.
+    procedure TestSpanReseedReproducible;
   end;
 
 implementation
@@ -297,6 +317,258 @@ begin
   end;
 end;
 
+procedure TTestNeuralMaskedLM.TestWholeWordNoPartialMasking;
+var
+  Col: TNNetMaskedLMCollator;
+  Tokens, WordIds, Corrupt, Labels: TNeuralIntegerArray;
+  N, I, W, WordStart, AnySelected: integer;
+  WordHasSelected, WordHasIgnored: boolean;
+  Selected: integer;
+begin
+  // 600 words, each 1..4 pieces. WordIds tags each piece with its word index.
+  N := 0; W := 0;
+  SetLength(Tokens, 4000);
+  SetLength(WordIds, 4000);
+  while W < 600 do
+  begin
+    WordStart := (W mod 4) + 1; // 1..4 pieces
+    for I := 0 to WordStart - 1 do
+    begin
+      Tokens[N] := 10 + ((W * 7 + I) mod 80);
+      WordIds[N] := W;
+      Inc(N);
+    end;
+    Inc(W);
+  end;
+  SetLength(Tokens, N);
+  SetLength(WordIds, N);
+  Col := TNNetMaskedLMCollator.Create(MaskId, Vocab, 0.15);
+  try
+    Col.Reseed(424242);
+    Col.CollateWholeWord(Tokens, WordIds, Corrupt, Labels);
+    // Walk each word: it must be entirely selected or entirely ignored.
+    AnySelected := 0;
+    I := 0;
+    while I < N do
+    begin
+      W := WordIds[I];
+      WordHasSelected := false;
+      WordHasIgnored := false;
+      while (I < N) and (WordIds[I] = W) do
+      begin
+        if Labels[I] <> csMaskedLMIgnoreLabel then WordHasSelected := true
+        else WordHasIgnored := true;
+        Inc(I);
+      end;
+      AssertTrue('word not partially masked',
+        not (WordHasSelected and WordHasIgnored));
+      if WordHasSelected then Inc(AnySelected);
+    end;
+    AssertTrue('some words selected', AnySelected > 0);
+    // Selected fraction (over tokens) should be roughly the mask prob.
+    Selected := 0;
+    for I := 0 to N - 1 do
+      if Labels[I] <> csMaskedLMIgnoreLabel then Inc(Selected);
+    AssertTrue('selected token fraction sane',
+      (Selected / N > 0.05) and (Selected / N < 0.30));
+    // Off the selected set the input is untouched; on it the label is original.
+    for I := 0 to N - 1 do
+      if Labels[I] = csMaskedLMIgnoreLabel
+      then AssertEquals('ignored unchanged', Tokens[I], Corrupt[I])
+      else AssertEquals('selected label = original', Tokens[I], Labels[I]);
+  finally
+    Col.Free;
+  end;
+end;
+
+procedure TTestNeuralMaskedLM.TestWholeWordZeroProbSelectsNothing;
+var
+  Col: TNNetMaskedLMCollator;
+  Tokens, WordIds, Corrupt, Labels: TNeuralIntegerArray;
+  N, I: integer;
+begin
+  N := 500;
+  SetLength(Tokens, N);
+  SetLength(WordIds, N);
+  for I := 0 to N - 1 do
+  begin
+    Tokens[I] := 10 + (I mod 80);
+    WordIds[I] := I div 3; // words of 3 pieces
+  end;
+  Col := TNNetMaskedLMCollator.Create(MaskId, Vocab, 0.0);
+  try
+    Col.Reseed(11);
+    Col.CollateWholeWord(Tokens, WordIds, Corrupt, Labels);
+    for I := 0 to N - 1 do
+    begin
+      AssertEquals('p=0 nothing selected', csMaskedLMIgnoreLabel, Labels[I]);
+      AssertEquals('p=0 nothing corrupted', Tokens[I], Corrupt[I]);
+    end;
+  finally
+    Col.Free;
+  end;
+end;
+
+const
+  SpanVocab = 200;
+  SpanBase = 199; // <extra_id_0> at top of vocab
+
+procedure TTestNeuralSpanCorruption.TestSentinelIdsDescend;
+var
+  Col: TNNetSpanCorruptionCollator;
+begin
+  Col := TNNetSpanCorruptionCollator.Create(SpanBase, SpanVocab, 0.15, 3.0);
+  try
+    AssertEquals('extra_id_0', SpanBase, Col.SentinelId(0));
+    AssertEquals('extra_id_1', SpanBase - 1, Col.SentinelId(1));
+    AssertEquals('extra_id_5', SpanBase - 5, Col.SentinelId(5));
+  finally
+    Col.Free;
+  end;
+end;
+
+// Rebuilds the original sequence from a T5 (source, target) pair: walk the
+// source, and at each sentinel splice in the span that follows the matching
+// sentinel in the target.
+function RebuildFromSpanPair(const Source, Target: TNeuralIntegerArray;
+  Base: integer): TNeuralIntegerArray;
+var
+  I, J, OutLen, Sent: integer;
+begin
+  SetLength(Result, 4096);
+  OutLen := 0;
+  for I := 0 to Length(Source) - 1 do
+  begin
+    if (Source[I] <= Base) and (Source[I] > Base - 64) then
+    begin
+      // A sentinel: find it in the target and copy the span until the next
+      // sentinel (or end).
+      Sent := Source[I];
+      J := 0;
+      while (J < Length(Target)) and (Target[J] <> Sent) do Inc(J);
+      Inc(J); // skip the sentinel itself
+      while (J < Length(Target)) and
+            (not ((Target[J] <= Base) and (Target[J] > Base - 64))) do
+      begin
+        Result[OutLen] := Target[J]; Inc(OutLen);
+        Inc(J);
+      end;
+    end
+    else
+    begin
+      Result[OutLen] := Source[I]; Inc(OutLen);
+    end;
+  end;
+  SetLength(Result, OutLen);
+end;
+
+procedure TTestNeuralSpanCorruption.TestRoundTripReconstruction;
+var
+  Col: TNNetSpanCorruptionCollator;
+  Tokens, Source, Target, Rebuilt: TNeuralIntegerArray;
+  N, I, NumSpans: integer;
+begin
+  N := 120;
+  SetLength(Tokens, N);
+  // Distinct non-sentinel real ids (kept well below the sentinel band).
+  for I := 0 to N - 1 do Tokens[I] := 10 + (I mod 100);
+  Col := TNNetSpanCorruptionCollator.Create(SpanBase, SpanVocab, 0.15, 3.0);
+  try
+    Col.Reseed(424242);
+    Col.Collate(Tokens, Source, Target, NumSpans);
+    AssertTrue('at least one span', NumSpans > 0);
+    Rebuilt := RebuildFromSpanPair(Source, Target, SpanBase);
+    AssertEquals('rebuilt length', N, Length(Rebuilt));
+    for I := 0 to N - 1 do
+      AssertEquals('rebuilt token ' + IntToStr(I), Tokens[I], Rebuilt[I]);
+  finally
+    Col.Free;
+  end;
+end;
+
+procedure TTestNeuralSpanCorruption.TestSourceTargetSentinelConsistency;
+var
+  Col: TNNetSpanCorruptionCollator;
+  Tokens, Source, Target: TNeuralIntegerArray;
+  N, I, NumSpans, SrcSent: integer;
+begin
+  N := 120;
+  SetLength(Tokens, N);
+  for I := 0 to N - 1 do Tokens[I] := 10 + (I mod 100);
+  Col := TNNetSpanCorruptionCollator.Create(SpanBase, SpanVocab, 0.2, 3.0);
+  try
+    Col.Reseed(2024);
+    Col.Collate(Tokens, Source, Target, NumSpans);
+    // Count sentinels in the source: must equal NumSpans, in descending order.
+    SrcSent := 0;
+    for I := 0 to Length(Source) - 1 do
+      if Source[I] = Col.SentinelId(SrcSent) then Inc(SrcSent)
+      else AssertTrue('source has no out-of-order sentinel',
+        (Source[I] < SpanBase - 63) or (Source[I] >= 0));
+    AssertEquals('source sentinel count = spans', NumSpans, SrcSent);
+    // Target must START with sentinel 0 and END with the trailing sentinel.
+    AssertEquals('target starts with extra_id_0',
+      Col.SentinelId(0), Target[0]);
+    AssertEquals('target ends with final sentinel',
+      Col.SentinelId(NumSpans), Target[Length(Target) - 1]);
+  finally
+    Col.Free;
+  end;
+end;
+
+procedure TTestNeuralSpanCorruption.TestZeroRateNoCorruption;
+var
+  Col: TNNetSpanCorruptionCollator;
+  Tokens, Source, Target: TNeuralIntegerArray;
+  N, I, NumSpans: integer;
+begin
+  N := 80;
+  SetLength(Tokens, N);
+  for I := 0 to N - 1 do Tokens[I] := 10 + (I mod 100);
+  Col := TNNetSpanCorruptionCollator.Create(SpanBase, SpanVocab, 0.0, 3.0);
+  try
+    Col.Reseed(5);
+    Col.Collate(Tokens, Source, Target, NumSpans);
+    AssertEquals('no spans', 0, NumSpans);
+    AssertEquals('source = input length', N, Length(Source));
+    for I := 0 to N - 1 do
+      AssertEquals('source untouched', Tokens[I], Source[I]);
+    // Target is just the single trailing sentinel.
+    AssertEquals('target is one sentinel', 1, Length(Target));
+    AssertEquals('that sentinel is extra_id_0', Col.SentinelId(0), Target[0]);
+  finally
+    Col.Free;
+  end;
+end;
+
+procedure TTestNeuralSpanCorruption.TestSpanReseedReproducible;
+var
+  ColA, ColB: TNNetSpanCorruptionCollator;
+  Tokens, Sa, Ta, Sb, Tb: TNeuralIntegerArray;
+  N, I, NsA, NsB: integer;
+begin
+  N := 120;
+  SetLength(Tokens, N);
+  for I := 0 to N - 1 do Tokens[I] := 10 + (I mod 100);
+  ColA := TNNetSpanCorruptionCollator.Create(SpanBase, SpanVocab, 0.15, 3.0);
+  ColB := TNNetSpanCorruptionCollator.Create(SpanBase, SpanVocab, 0.15, 3.0);
+  try
+    ColA.Reseed(777); ColA.Collate(Tokens, Sa, Ta, NsA);
+    ColB.Reseed(777); ColB.Collate(Tokens, Sb, Tb, NsB);
+    AssertEquals('same span count', NsA, NsB);
+    AssertEquals('same source length', Length(Sa), Length(Sb));
+    AssertEquals('same target length', Length(Ta), Length(Tb));
+    for I := 0 to Length(Sa) - 1 do
+      AssertEquals('same source ' + IntToStr(I), Sa[I], Sb[I]);
+    for I := 0 to Length(Ta) - 1 do
+      AssertEquals('same target ' + IntToStr(I), Ta[I], Tb[I]);
+  finally
+    ColB.Free;
+    ColA.Free;
+  end;
+end;
+
 initialization
   RegisterTest(TTestNeuralMaskedLM);
+  RegisterTest(TTestNeuralSpanCorruption);
 end.

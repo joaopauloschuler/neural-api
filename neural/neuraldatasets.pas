@@ -518,6 +518,21 @@ type
       // id at each selected position and csMaskedLMIgnoreLabel everywhere else.
       procedure Collate(const Tokens: array of integer;
         out CorruptedIds, Labels: TNeuralIntegerArray);
+      // Whole-word masking variant (a port of HuggingFace transformers
+      // DataCollatorForWholeWordMask). WordIds is a per-token grouping array
+      // parallel to Tokens: tokens carrying the SAME WordIds value are the
+      // subword pieces of one word and the masking DECISION is taken once per
+      // word -- if a word is selected, all of its pieces become loss targets
+      // together (no partial-word masking). Within a selected word the existing
+      // 80/10/10 mask/random/keep policy is applied INDEPENDENTLY per piece,
+      // exactly as the HF reference does. A piece whose token is special is
+      // never selected and never anchors a word (its WordIds value is ignored
+      // for grouping of real pieces). Use any monotone-or-not integer scheme to
+      // tag words; equal adjacent-or-not values are grouped. A common caller
+      // convention is to give every special token its own unique WordIds value
+      // (e.g. a decreasing counter) so specials never join a real word.
+      procedure CollateWholeWord(const Tokens, WordIds: array of integer;
+        out CorruptedIds, Labels: TNeuralIntegerArray);
       // Fills network volumes from one already-collated pair. pInput: corrupted
       // token ids on the X axis when pInput.Depth = 1 (embedding pipelines),
       // one-hot across the depth axis otherwise. pTarget: per-position one-hot
@@ -537,6 +552,81 @@ type
       property ReplaceMaskProb: TNeuralFloat read FReplaceMaskProb write FReplaceMaskProb;
       property RandomTokenProb: TNeuralFloat read FRandomTokenProb write FRandomTokenProb;
       property MaskTokenId: integer read FMaskTokenId;
+      property VocabSize: integer read FVocabSize;
+  end;
+
+  { TNNetSpanCorruptionCollator }
+  // T5 / SpanBERT-style span-corruption collator (a port of the T5
+  // span_corruption objective, the BERT-relative sibling of
+  // TNNetMaskedLMCollator). Instead of masking individual tokens in place it
+  // masks CONTIGUOUS SPANS and produces a reshaped encoder-decoder pair:
+  //
+  //   * The INPUT is the original sequence with each masked span collapsed to a
+  //     single unique sentinel token. Sentinels descend from a configurable
+  //     base id: <extra_id_0> = SentinelBaseId, <extra_id_1> = SentinelBaseId-1,
+  //     ... (the T5 convention puts <extra_id_0> at the top of the vocabulary).
+  //   * The TARGET is the sentinel/span stream
+  //       sentinel_0, span0_tokens, sentinel_1, span1_tokens, ..., final_sentinel
+  //     i.e. each dropped span prefixed by the sentinel that replaced it, with a
+  //     trailing sentinel (the T5 end marker) after the last span.
+  //
+  // Spans are sampled so that ~CorruptionRate of the (non-special) tokens are
+  // masked, with span lengths drawn around MeanSpanLength (T5 defaults: 0.15
+  // rate, mean length 3). Special tokens (anything passed to AddSpecialTokenId)
+  // are never masked and break spans. Because the target is a RESHAPED, shorter
+  // sequence than the input, this is a sibling class rather than a flag on
+  // TNNetMaskedLMCollator. The (corrupted input, target) pair is exactly
+  // round-trippable: the original sequence can be rebuilt by walking the input
+  // and substituting, at each sentinel, the span that follows the matching
+  // sentinel in the target.
+  //
+  // The RNG is an internal LCG seeded via Reseed, identical to and independent
+  // of TNNetMaskedLMCollator's, so collation is reproducible and never perturbs
+  // weight-init randomness.
+  // Coded by Claude (AI).
+  TNNetSpanCorruptionCollator = class(TObject)
+    private
+      FCorruptionRate: TNeuralFloat;
+      FMeanSpanLength: TNeuralFloat;
+      FSentinelBaseId: integer;
+      FVocabSize: integer;
+      FSpecials: TNeuralIntegerArray;
+      FSpecialCount: integer;
+      FRngState: cardinal;
+      function NextRandom(): TNeuralFloat;
+      function NextRandomInt(N: integer): integer;
+      function IsSpecial(TokenId: integer): boolean;
+      function SampleSpanLength(): integer;
+    public
+      // pSentinelBaseId: id of <extra_id_0> (sentinels count DOWN from here).
+      // pVocabSize: number of token ids (sentinels are assumed to live at the
+      // top of the vocabulary, so SentinelBaseId is typically VocabSize-1).
+      // pCorruptionRate: target fraction of non-special tokens to mask.
+      // pMeanSpanLength: mean masked-span length (>= 1).
+      constructor Create(pSentinelBaseId, pVocabSize: integer;
+        pCorruptionRate: TNeuralFloat = 0.15;
+        pMeanSpanLength: TNeuralFloat = 3.0);
+      destructor Destroy; override;
+      // Registers a token id that must never be masked and that breaks spans.
+      procedure AddSpecialTokenId(TokenId: integer);
+      // Reseeds the internal RNG for reproducible span sampling.
+      procedure Reseed(Seed: cardinal);
+      // Returns the id of the I-th sentinel (<extra_id_I>): SentinelBaseId - I.
+      function SentinelId(I: integer): integer;
+      // Corrupts one sequence into a T5 (input, target) pair. SourceIds receives
+      // the original sequence with each masked span replaced by one descending
+      // sentinel; TargetIds receives the sentinel/span stream terminated by the
+      // next (final) sentinel. NumSpans returns how many spans were masked.
+      procedure Collate(const Tokens: array of integer;
+        out SourceIds, TargetIds: TNeuralIntegerArray; out NumSpans: integer);
+      // Fills network volumes from an already-collated pair (token ids on the X
+      // axis when Depth = 1, one-hot on the depth axis otherwise). The encoder
+      // is fed pSource; an autoregressive decoder is trained on pTarget.
+      procedure BuildTrainingPair(const SourceIds, TargetIds: TNeuralIntegerArray;
+        pSource, pTarget: TNNetVolume);
+      property CorruptionRate: TNeuralFloat read FCorruptionRate write FCorruptionRate;
+      property MeanSpanLength: TNeuralFloat read FMeanSpanLength write FMeanSpanLength;
+      property SentinelBaseId: integer read FSentinelBaseId;
       property VocabSize: integer read FVocabSize;
   end;
 
@@ -1220,6 +1310,63 @@ begin
   end;
 end;
 
+procedure TNNetMaskedLMCollator.CollateWholeWord(
+  const Tokens, WordIds: array of integer;
+  out CorruptedIds, Labels: TNeuralIntegerArray);
+var
+  Len, I, J: integer;
+  Roll: TNeuralFloat;
+  WordSelected: boolean;
+begin
+  Len := Length(Tokens);
+  if Length(WordIds) <> Len then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator.CollateWholeWord: Tokens and WordIds lengths ' +
+      'differ.');
+  SetLength(CorruptedIds, Len);
+  SetLength(Labels, Len);
+  for I := 0 to Len - 1 do
+  begin
+    CorruptedIds[I] := Tokens[I];
+    Labels[I] := csMaskedLMIgnoreLabel;
+  end;
+  // Walk contiguous runs of equal WordIds (one word = one run of pieces). The
+  // mask/keep DECISION is taken once per word; special pieces are skipped and
+  // break the run so they never join a real word.
+  I := 0;
+  while I < Len do
+  begin
+    if IsSpecial(Tokens[I]) then
+    begin
+      Inc(I);
+      continue;
+    end;
+    // Extent of this word: pieces sharing WordIds[I], stopping at a special.
+    J := I + 1;
+    while (J < Len) and (WordIds[J] = WordIds[I]) and (not IsSpecial(Tokens[J])) do
+      Inc(J);
+    // One selection draw for the whole word [I, J).
+    WordSelected := NextRandom() < FMaskProb;
+    if WordSelected then
+    begin
+      while I < J do
+      begin
+        Labels[I] := Tokens[I];
+        // HF applies the 80/10/10 split independently to each piece.
+        Roll := NextRandom();
+        if Roll < FReplaceMaskProb then
+          CorruptedIds[I] := FMaskTokenId
+        else if Roll < FReplaceMaskProb + FRandomTokenProb then
+          CorruptedIds[I] := RandomRealToken()
+        ;
+        Inc(I);
+      end;
+    end
+    else
+      I := J;
+  end;
+end;
+
 procedure TNNetMaskedLMCollator.BuildTrainingPair(
   const CorruptedIds, Labels: TNeuralIntegerArray; pInput, pTarget: TNNetVolume);
 var
@@ -1262,6 +1409,199 @@ begin
     if Labels[P] = csMaskedLMIgnoreLabel then
       for D := 0 to Desired.Depth - 1 do
         Desired[P, 0, D] := Actual[P, 0, D];
+end;
+
+{ TNNetSpanCorruptionCollator }
+
+constructor TNNetSpanCorruptionCollator.Create(
+  pSentinelBaseId, pVocabSize: integer;
+  pCorruptionRate, pMeanSpanLength: TNeuralFloat);
+begin
+  inherited Create();
+  if pVocabSize < 2 then
+    raise Exception.Create('TNNetSpanCorruptionCollator: VocabSize must be >= 2.');
+  if (pSentinelBaseId < 0) or (pSentinelBaseId >= pVocabSize) then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator: SentinelBaseId must be in 0..VocabSize-1.');
+  if (pCorruptionRate < 0) or (pCorruptionRate > 1) then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator: CorruptionRate must be in [0,1].');
+  if pMeanSpanLength < 1 then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator: MeanSpanLength must be >= 1.');
+  FSentinelBaseId := pSentinelBaseId;
+  FVocabSize := pVocabSize;
+  FCorruptionRate := pCorruptionRate;
+  FMeanSpanLength := pMeanSpanLength;
+  FSpecialCount := 0;
+  SetLength(FSpecials, 0);
+  FRngState := 305419896;
+end;
+
+destructor TNNetSpanCorruptionCollator.Destroy;
+begin
+  SetLength(FSpecials, 0);
+  inherited Destroy;
+end;
+
+procedure TNNetSpanCorruptionCollator.AddSpecialTokenId(TokenId: integer);
+begin
+  if IsSpecial(TokenId) then exit;
+  if FSpecialCount >= Length(FSpecials) then
+    SetLength(FSpecials, 8 + FSpecialCount * 2);
+  FSpecials[FSpecialCount] := TokenId;
+  Inc(FSpecialCount);
+end;
+
+procedure TNNetSpanCorruptionCollator.Reseed(Seed: cardinal);
+begin
+  if Seed = 0 then Seed := 1;
+  FRngState := Seed;
+end;
+
+function TNNetSpanCorruptionCollator.NextRandom(): TNeuralFloat;
+begin
+  FRngState := FRngState * 1664525 + 1013904223;
+  Result := (FRngState shr 8) / 16777216.0;
+end;
+
+function TNNetSpanCorruptionCollator.NextRandomInt(N: integer): integer;
+begin
+  if N <= 1 then begin Result := 0; exit; end;
+  Result := Trunc(NextRandom() * N);
+  if Result >= N then Result := N - 1;
+end;
+
+function TNNetSpanCorruptionCollator.IsSpecial(TokenId: integer): boolean;
+var
+  I: integer;
+begin
+  Result := false;
+  for I := 0 to FSpecialCount - 1 do
+    if FSpecials[I] = TokenId then begin Result := true; exit; end;
+end;
+
+function TNNetSpanCorruptionCollator.SampleSpanLength(): integer;
+begin
+  // Geometric-ish span length with the requested mean, clamped to >= 1. A
+  // geometric distribution with success p = 1/mean has mean 1/p = MeanSpanLength.
+  Result := 1;
+  while (NextRandom() > (1.0 / FMeanSpanLength)) do
+  begin
+    Inc(Result);
+    if Result >= 256 then break; // safety clamp
+  end;
+end;
+
+function TNNetSpanCorruptionCollator.SentinelId(I: integer): integer;
+begin
+  Result := FSentinelBaseId - I;
+end;
+
+procedure TNNetSpanCorruptionCollator.Collate(const Tokens: array of integer;
+  out SourceIds, TargetIds: TNeuralIntegerArray; out NumSpans: integer);
+var
+  Len, I, Budget, SpanLen, SrcLen, TgtLen, SpanEnd: integer;
+  Masked: array of boolean;
+begin
+  Len := Length(Tokens);
+  NumSpans := 0;
+  SetLength(Masked, Len);
+  for I := 0 to Len - 1 do Masked[I] := false;
+  // Token budget to mask (~CorruptionRate of non-special tokens).
+  Budget := 0;
+  for I := 0 to Len - 1 do
+    if not IsSpecial(Tokens[I]) then Inc(Budget);
+  Budget := Round(Budget * FCorruptionRate);
+
+  // Greedily sample spans left-to-right until the budget is spent. A coin per
+  // start position keeps spans spread out; an accepted span is the next run of
+  // SampleSpanLength() non-special tokens.
+  I := 0;
+  while (I < Len) and (Budget > 0) do
+  begin
+    if IsSpecial(Tokens[I]) then begin Inc(I); continue; end;
+    // Probability of starting a span here, tuned so spans cover ~the budget.
+    if NextRandom() < (1.0 / FMeanSpanLength) then
+    begin
+      SpanLen := SampleSpanLength();
+      if SpanLen > Budget then SpanLen := Budget;
+      SpanEnd := I;
+      while (SpanEnd < Len) and (SpanLen > 0) and (not IsSpecial(Tokens[SpanEnd])) do
+      begin
+        Masked[SpanEnd] := true;
+        Dec(Budget);
+        Dec(SpanLen);
+        Inc(SpanEnd);
+      end;
+      Inc(NumSpans);
+      // Leave at least one unmasked token before the next span may start.
+      I := SpanEnd + 1;
+    end
+    else
+      Inc(I);
+  end;
+
+  // Build the source (sentinel-collapsed) and target (sentinel/span) streams.
+  SetLength(SourceIds, Len);     // upper bound; trimmed below
+  SetLength(TargetIds, Len + NumSpans + 1); // spans + leading/trailing sentinels
+  SrcLen := 0;
+  TgtLen := 0;
+  NumSpans := 0;
+  I := 0;
+  while I < Len do
+  begin
+    if Masked[I] then
+    begin
+      // Emit one sentinel into source; open the span in target.
+      SourceIds[SrcLen] := SentinelId(NumSpans); Inc(SrcLen);
+      TargetIds[TgtLen] := SentinelId(NumSpans); Inc(TgtLen);
+      while (I < Len) and Masked[I] do
+      begin
+        TargetIds[TgtLen] := Tokens[I]; Inc(TgtLen);
+        Inc(I);
+      end;
+      Inc(NumSpans);
+    end
+    else
+    begin
+      SourceIds[SrcLen] := Tokens[I]; Inc(SrcLen);
+      Inc(I);
+    end;
+  end;
+  // Trailing (final) sentinel after the last span, per the T5 target format.
+  TargetIds[TgtLen] := SentinelId(NumSpans); Inc(TgtLen);
+  SetLength(SourceIds, SrcLen);
+  SetLength(TargetIds, TgtLen);
+end;
+
+procedure TNNetSpanCorruptionCollator.BuildTrainingPair(
+  const SourceIds, TargetIds: TNeuralIntegerArray; pSource, pTarget: TNNetVolume);
+var
+  P: integer;
+begin
+  if pSource.SizeX < Length(SourceIds) then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator.BuildTrainingPair: source SizeX (' +
+      IntToStr(pSource.SizeX) + ') < source length (' +
+      IntToStr(Length(SourceIds)) + ').');
+  if pTarget.SizeX < Length(TargetIds) then
+    raise Exception.Create(
+      'TNNetSpanCorruptionCollator.BuildTrainingPair: target SizeX (' +
+      IntToStr(pTarget.SizeX) + ') < target length (' +
+      IntToStr(Length(TargetIds)) + ').');
+  pSource.Fill(0);
+  pTarget.Fill(0);
+  for P := 0 to Length(SourceIds) - 1 do
+    if pSource.Depth = 1 then
+      pSource[P, 0, 0] := SourceIds[P]
+    else
+      pSource[P, 0, SourceIds[P]] := 1;
+  for P := 0 to Length(TargetIds) - 1 do
+    if pTarget.Depth = 1 then
+      pTarget[P, 0, 0] := TargetIds[P]
+    else
+      pTarget[P, 0, TargetIds[P]] := 1;
 end;
 
 procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes, ImgValidationVolumes,
