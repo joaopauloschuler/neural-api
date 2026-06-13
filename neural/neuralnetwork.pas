@@ -6915,6 +6915,72 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// TNNetMamba2: the Mamba-2 / State-Space Duality (SSD) sequence mixer
+  // (Dao & Gu 2024, "Transformers are SSMs: Generalized Models and Efficient
+  // Algorithms Through Structured State Space Duality", arXiv:2405.21060) - the
+  // architecturally DISTINCT successor to TNNetSelectiveSSM (Mamba-1). Operates
+  // over a (SeqLen,1,InDepth) sequence (SizeY must be 1).
+  //
+  // Mamba-2 is a MULTI-HEAD SSM. The d_inner = NumHeads*HeadDim intermediate
+  // channels are partitioned into NumHeads heads of HeadDim channels each. The
+  // state transition A is a single SCALAR per head (a_t = exp(dt*A), A =
+  // -exp(A_log), A_log a per-HEAD scalar - NOT the per-(channel,state) matrix
+  // of Mamba-1) and B/C are SHARED across the heads of a group (GQA-like: there
+  // are NGroups groups, head h belongs to group h div (NumHeads div NGroups)).
+  // An extra GROUPED gated RMSNorm (over the d_inner axis, modulated by a
+  // SiLU(gate)) is applied to the scan output BEFORE the out_proj.
+  //
+  // RESPONSIBILITY BOUNDARY (mirrors how TNNetSelectiveSSM takes conv'd x): the
+  // in_proj, the depthwise causal conv1d over (x|B|C) + SiLU, and the out_proj
+  // live in surrounding layers (the importer / builder wire them). This leaf
+  // takes the already-split, already-conv'd-and-SiLU'd stream laid out on the
+  // depth axis as
+  //   [ x (d_inner) | B (NGroups*N) | C (NGroups*N) | dt (NumHeads) | gate (d_inner) ]
+  // (InDepth = 2*d_inner + 2*NGroups*N + NumHeads) and emits the gated-normed
+  // scan output of width d_inner. Per timestep t, head h (channels c=0..P-1,
+  // P=HeadDim), group g = h div (NumHeads div NGroups), state s=0..N-1:
+  //   dt_h    = softplus(dt_in[h] + dt_bias[h])          (per-head positive step)
+  //   a_h     = exp(dt_h * (-exp(A_log[h])))             (scalar decay in (0,1))
+  //   h_t[h,c,s] = a_h * h_{t-1}[h,c,s] + dt_h * B_t[g,s] * x_t[h,c]
+  //   y_t[h,c]   = sum_s C_t[g,s] * h_t[h,c,s] + D[h] * x_t[h,c]
+  // then the gated RMSNorm over the full d_inner vector y_t:
+  //   z_t   = y_t * silu(gate_t)
+  //   out_t = (z_t / sqrt(mean(z_t^2) + eps)) * norm_weight    (HF MambaRMSNormGated)
+  // Storage in Neurons[]:
+  //   [0]=A_log (NumHeads)  [1]=D (NumHeads)  [2]=dt_bias (NumHeads)
+  //   [3]=norm_weight (d_inner)
+  // FStruct[0]=NumHeads [1]=HeadDim [2]=StateSize(N) [3]=NGroups; FFloatSt[0]=eps.
+  // Forward is the direct O(SeqLen*d_inner*N) head-wise causal scan (the chunked
+  // SSD scan is a stretch goal - this is the v1, mirroring how Mamba-1 landed
+  // the recurrent scan before any chunking); backward is exact BPTT.
+  // Coded by Claude (AI).
+  TNNetMamba2 = class(TNNetLayer)
+    private
+      FNumHeads: integer;    // FStruct[0]
+      FHeadDim: integer;     // FStruct[1] (P)
+      FStateSize: integer;   // FStruct[2] (N)
+      FNGroups: integer;     // FStruct[3]
+      FDInner: integer;      // NumHeads*HeadDim (cached)
+      FState: TNNetVolume;   // forward state cache h_t, (SeqLen,1,DInner*N)
+      FDt: TNNetVolume;      // cached dt_h per timestep, (SeqLen,1,NumHeads)
+      FAt: TNNetVolume;      // cached a_h per timestep, (SeqLen,1,NumHeads)
+      FY: TNNetVolume;       // cached pre-norm scan output y_t, (SeqLen,1,DInner)
+      FZ: TNNetVolume;       // cached gated z_t = y*silu(gate), (SeqLen,1,DInner)
+      FRStd: TNNetVolume;    // cached 1/sqrt(mean(z^2)+eps), (SeqLen,1,1)
+      FH: TNNetVolume;       // running state h, DInner*N-long scratch
+      FGh: TNNetVolume;      // backward state-gradient gh, DInner*N-long scratch
+      FGradA, FGradD, FGradDtB, FGradNorm: TNNetVolume; // weight grad accums
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pNumHeads: integer = 1; pHeadDim: integer = 1;
+        pStateSize: integer = 16; pNGroups: integer = 1;
+        pEps: TNeuralFloat = 1e-5); reintroduce; overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+  end;
+
   /// TNNetImplicitLongConv: the Hyena Hierarchy (Poli et al. 2023,
   // "Hyena Hierarchy", arXiv:2302.10866) implicit long-convolution primitive -
   // an attention-free, sub-quadratic sequence mixer. The input is a
@@ -43932,6 +43998,349 @@ begin
   end;
   FNeurons[3].FWeights.Fill(0);   // b_d
   FNeurons[5].FWeights.Fill(1);   // e (feedthrough / Mamba D skip)
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetMamba2 }
+constructor TNNetMamba2.Create(pNumHeads: integer = 1; pHeadDim: integer = 1;
+  pStateSize: integer = 16; pNGroups: integer = 1;
+  pEps: TNeuralFloat = 1e-5);
+begin
+  inherited Create();
+  FNumHeads := Max(pNumHeads, 1);
+  FHeadDim := Max(pHeadDim, 1);
+  FStateSize := Max(pStateSize, 1);
+  FNGroups := Max(pNGroups, 1);
+  FStruct[0] := FNumHeads;
+  FStruct[1] := FHeadDim;
+  FStruct[2] := FStateSize;
+  FStruct[3] := FNGroups;
+  FFloatSt[0] := pEps;
+  FDInner := FNumHeads * FHeadDim;
+  FState := TNNetVolume.Create();
+  FDt := TNNetVolume.Create();
+  FAt := TNNetVolume.Create();
+  FY := TNNetVolume.Create();
+  FZ := TNNetVolume.Create();
+  FRStd := TNNetVolume.Create();
+  FH := TNNetVolume.Create();
+  FGh := TNNetVolume.Create();
+  FGradA := TNNetVolume.Create();
+  FGradD := TNNetVolume.Create();
+  FGradDtB := TNNetVolume.Create();
+  FGradNorm := TNNetVolume.Create();
+  AddMissingNeurons(4);
+end;
+
+destructor TNNetMamba2.Destroy();
+begin
+  FGradNorm.Free;
+  FGradDtB.Free;
+  FGradD.Free;
+  FGradA.Free;
+  FGh.Free;
+  FH.Free;
+  FRStd.Free;
+  FZ.Free;
+  FY.Free;
+  FAt.Free;
+  FDt.Free;
+  FState.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetMamba2.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ExpectedIn, ii: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetMamba2 requires SizeY=1, got SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  // FStruct/FFloatSt are authoritative so a loaded net round-trips the config.
+  FNumHeads := Max(FStruct[0], 1);
+  FHeadDim := Max(FStruct[1], 1);
+  FStateSize := Max(FStruct[2], 1);
+  FNGroups := Max(FStruct[3], 1);
+  FDInner := FNumHeads * FHeadDim;
+  ExpectedIn := 2 * FDInner + 2 * FNGroups * FStateSize + FNumHeads;
+  if pPrevLayer.FOutput.Depth <> ExpectedIn then
+    FErrorProc('TNNetMamba2 expects input depth ' + IntToStr(ExpectedIn) +
+      ' ([x|B|C|dt|gate]), got ' + IntToStr(pPrevLayer.FOutput.Depth));
+  // Output is the gated-normed scan output of width d_inner.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDInner);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  FNeurons[0].FWeights.ReSize(FNumHeads, 1, 1);  // A_log
+  FNeurons[1].FWeights.ReSize(FNumHeads, 1, 1);  // D
+  FNeurons[2].FWeights.ReSize(FNumHeads, 1, 1);  // dt_bias
+  FNeurons[3].FWeights.ReSize(FDInner, 1, 1);    // norm_weight
+  for ii := 0 to FNeurons.Count - 1 do
+  begin
+    FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+    FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+  end;
+  FState.ReSize(FOutput.SizeX, 1, FDInner * FStateSize);
+  FDt.ReSize(FOutput.SizeX, 1, FNumHeads);
+  FAt.ReSize(FOutput.SizeX, 1, FNumHeads);
+  FY.ReSize(FOutput.SizeX, 1, FDInner);
+  FZ.ReSize(FOutput.SizeX, 1, FDInner);
+  FRStd.ReSize(FOutput.SizeX, 1, 1);
+  FH.ReSize(1, 1, FDInner * FStateSize);
+  FGh.ReSize(1, 1, FDInner * FStateSize);
+  FGradA.ReSize(1, 1, FNumHeads);
+  FGradD.ReSize(1, 1, FNumHeads);
+  FGradDtB.ReSize(1, 1, FNumHeads);
+  FGradNorm.ReSize(1, 1, FDInner);
+  InitDefault();
+end;
+
+procedure TNNetMamba2.Compute();
+var
+  StartTime: double;
+  Alog, Dd, DtB, NormW, Prev: TNNetVolume;
+  SeqLen, t, h, c, s, g, hpg, bOff, cOff, dtOff, gateOff: integer;
+  dInner, P, N, NG, gw, hbase, ebase, xbase: integer;
+  pre, dth, ah, xv, hnew, accY, ar, zsq, gate, msq, rstd: TNeuralFloat;
+  XtPtr, OutPtr: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Alog := FNeurons[0].FWeights;
+  Dd := FNeurons[1].FWeights;
+  DtB := FNeurons[2].FWeights;
+  NormW := FNeurons[3].FWeights;
+  SeqLen := FOutput.SizeX;
+  P := FHeadDim; N := FStateSize; NG := FNGroups;
+  dInner := FDInner;
+  gw := FNumHeads div NG;            // heads per group
+  bOff := dInner;                    // B starts after x
+  cOff := dInner + NG * N;           // C starts after B
+  dtOff := dInner + 2 * NG * N;      // dt starts after C
+  gateOff := dtOff + FNumHeads;      // gate starts after dt
+  FH.Fill(0);
+  for t := 0 to SeqLen - 1 do
+  begin
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    // Per-head dt and decay a.
+    for h := 0 to FNumHeads - 1 do
+    begin
+      pre := XtPtr^[dtOff + h] + DtB.FData[h];
+      if pre > 30 then dth := pre
+      else if pre < -30 then dth := Exp(pre)
+      else dth := Ln(1 + Exp(pre));
+      FDt.FData[(t * FNumHeads) + h] := dth;
+      ar := -Exp(Min(Alog.FData[h], 30));   // A = -exp(A_log)
+      ah := Exp(dth * ar);
+      FAt.FData[(t * FNumHeads) + h] := ah;
+    end;
+    // Head-wise recurrence + per-head output (pre-norm y_t).
+    for h := 0 to FNumHeads - 1 do
+    begin
+      g := h div gw;
+      hpg := g * N;
+      dth := FDt.FData[(t * FNumHeads) + h];
+      ah := FAt.FData[(t * FNumHeads) + h];
+      for c := 0 to P - 1 do
+      begin
+        xbase := h * P + c;
+        xv := XtPtr^[xbase];
+        ebase := xbase * N;
+        hbase := ((t * dInner) + xbase) * N;
+        accY := 0;
+        for s := 0 to N - 1 do
+        begin
+          hnew := ah * FH.FData[ebase + s] +
+            dth * XtPtr^[bOff + hpg + s] * xv;
+          FH.FData[ebase + s] := hnew;
+          FState.FData[hbase + s] := hnew;
+          accY := accY + XtPtr^[cOff + hpg + s] * hnew;
+        end;
+        FY.FData[(t * dInner) + xbase] := accY + Dd.FData[h] * xv;
+      end;
+    end;
+    // Gated RMSNorm over the d_inner axis: z = y*silu(gate); out = rms(z)*w.
+    msq := 0;
+    for c := 0 to dInner - 1 do
+    begin
+      gate := XtPtr^[gateOff + c];
+      gate := gate / (1 + Exp(-gate));   // silu(gate)
+      zsq := FY.FData[(t * dInner) + c] * gate;
+      FZ.FData[(t * dInner) + c] := zsq;
+      msq := msq + zsq * zsq;
+    end;
+    msq := msq / dInner;
+    rstd := 1 / Sqrt(msq + FFloatSt[0]);
+    FRStd.FData[t] := rstd;
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    for c := 0 to dInner - 1 do
+      OutPtr^[c] := FZ.FData[(t * dInner) + c] * rstd * NormW.FData[c];
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMamba2.Backpropagate();
+var
+  StartTime: double;
+  NA, ND, NDtB, NNorm: TNNetNeuron;
+  Alog, Dd, NormW, Prev, PrevErr: TNNetVolume;
+  SeqLen, t, h, c, s, g, hpg, bOff, cOff, dtOff, gateOff: integer;
+  dInner, P, N, NG, gw, hbase, ebase, xbase: integer;
+  hasInputGrad: boolean;
+  GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
+  rstd, gy, z, dotzg, gz, gate, sig, silu, dsilu, gdth, ght, gAlog: TNeuralFloat;
+  dth, ah, ar, xv, htm1, gy_y, gpre, gxv, yval: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  NA := FNeurons[0]; ND := FNeurons[1]; NDtB := FNeurons[2]; NNorm := FNeurons[3];
+  Alog := NA.FWeights; Dd := ND.FWeights; NormW := NNorm.FWeights;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := FOutput.SizeX;
+  P := FHeadDim; N := FStateSize; NG := FNGroups;
+  dInner := FDInner;
+  gw := FNumHeads div NG;
+  bOff := dInner;
+  cOff := dInner + NG * N;
+  dtOff := dInner + 2 * NG * N;
+  gateOff := dtOff + FNumHeads;
+  // Mamba2 changes depth (in = 2*d_inner+2*NG*N+heads, out = d_inner) so the
+  // prev error buffer is NOT the same size as ours; only require that prev
+  // carries an error buffer matching ITS OWN output (training is wired).
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
+    (FPrevLayer.FOutput.Size > 0);
+  PrevErr := nil;
+  if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  FGh.Fill(0);
+  FGradA.Fill(0); FGradD.Fill(0); FGradDtB.Fill(0); FGradNorm.Fill(0);
+  // Right-to-left BPTT. Gradients flow: out_t -> (gated RMSNorm) -> y_t & gate,
+  // then y_t -> the head-wise recurrence (gh carries dL/dh across timesteps).
+  for t := SeqLen - 1 downto 0 do
+  begin
+    GyPtr := FOutputError.GetRawPtr(t, 0, 0);
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    if hasInputGrad
+      then PrevErrPtr := PrevErr.GetRawPtr(t, 0, 0)
+      else PrevErrPtr := nil;
+    rstd := FRStd.FData[t];
+    // --- Gated RMSNorm backward: out = z*rstd*w, rstd=1/sqrt(mean(z^2)+eps),
+    // z = y*silu(gate). gz_c = w_c*rstd*gy_c - z_c*rstd^3/dInner*sum_k(w_k*gy_k*z_k).
+    dotzg := 0;
+    for c := 0 to dInner - 1 do
+    begin
+      z := FZ.FData[(t * dInner) + c];
+      FGradNorm.FData[c] := FGradNorm.FData[c] +
+        GyPtr^[c] * z * rstd;                    // dL/dnorm_weight
+      dotzg := dotzg + NormW.FData[c] * GyPtr^[c] * z;
+    end;
+    // dL/dy_c and dL/dgate_c. Overwrite FY in place with dL/dy_c for the
+    // recurrence pass (the forward y_t is no longer needed).
+    for c := 0 to dInner - 1 do
+    begin
+      gy := GyPtr^[c];
+      gz := NormW.FData[c] * rstd * gy
+        - FZ.FData[(t * dInner) + c] * rstd * rstd * rstd / dInner * dotzg;
+      gate := XtPtr^[gateOff + c];
+      sig := 1 / (1 + Exp(-gate));
+      silu := gate * sig;
+      dsilu := sig * (1 + gate * (1 - sig));        // d silu / d gate
+      yval := FY.FData[(t * dInner) + c];           // forward pre-norm y_c
+      FY.FData[(t * dInner) + c] := gz * silu;      // dL/dy_c = gz*silu(gate)
+      if hasInputGrad then
+        PrevErrPtr^[gateOff + c] := PrevErrPtr^[gateOff + c] +
+          gz * yval * dsilu;                        // dL/dgate_c = gz*y*dsilu
+    end;
+    // --- Recurrence backward, per head/channel/state.
+    for h := 0 to FNumHeads - 1 do
+    begin
+      g := h div gw;
+      hpg := g * N;
+      dth := FDt.FData[(t * FNumHeads) + h];
+      ah := FAt.FData[(t * FNumHeads) + h];
+      ar := -Exp(Min(Alog.FData[h], 30));   // A = -exp(A_log)
+      gdth := 0;
+      gAlog := 0;
+      for c := 0 to P - 1 do
+      begin
+        xbase := h * P + c;
+        xv := XtPtr^[xbase];
+        ebase := xbase * N;
+        hbase := ((t * dInner) + xbase) * N;
+        gy_y := FY.FData[(t * dInner) + xbase];   // dL/dy_c (set above)
+        // D skip: y_c += D[h]*x_c.
+        FGradD.FData[h] := FGradD.FData[h] + gy_y * xv;
+        gxv := gy_y * Dd.FData[h];
+        for s := 0 to N - 1 do
+        begin
+          if t > 0
+            then htm1 := FState.FData[hbase - (dInner * N) + s]
+            else htm1 := 0;
+          // gh_t[c,s] = gh-from-(t+1) (in FGh) + direct y-path C*gy_y.
+          ght := FGh.FData[ebase + s] + XtPtr^[cOff + hpg + s] * gy_y;
+          // dL/dC[g,s] += gy_y * h_t[c,s]  -> input-grad on C channel.
+          if hasInputGrad then
+            PrevErrPtr^[cOff + hpg + s] := PrevErrPtr^[cOff + hpg + s] +
+              gy_y * FState.FData[hbase + s];
+          // h_t = a*h_{t-1} + dt*B*x ; a = exp(dt*ar).
+          // dt path: dh/ddt = ar*a*h_{t-1} + B*x.
+          gdth := gdth + ght * (ar * ah * htm1 +
+            XtPtr^[bOff + hpg + s] * xv);
+          // A_log path: da/dA_log = a*dt*ar (ar=-exp(A_log)); dh/da = h_{t-1}.
+          gAlog := gAlog + ght * htm1;
+          // B path (input grad): dh/dB = dt*x.
+          if hasInputGrad then
+            PrevErrPtr^[bOff + hpg + s] := PrevErrPtr^[bOff + hpg + s] +
+              ght * dth * xv;
+          // x path through dt*B*x.
+          gxv := gxv + ght * dth * XtPtr^[bOff + hpg + s];
+          // Propagate to t-1: gh_{t-1}[c,s] = a*gh_t[c,s].
+          FGh.FData[ebase + s] := ah * ght;
+        end;
+        if hasInputGrad then
+          PrevErrPtr^[xbase] := PrevErrPtr^[xbase] + gxv;
+      end;
+      // dL/dA_log via the per-head accumulated gAlog (= sum ght*h_{t-1}).
+      FGradA.FData[h] := FGradA.FData[h] + gAlog * (ah * dth * ar);
+      // dt backward: dt = softplus(dt_in + dt_bias); dsoftplus = 1 - exp(-dt).
+      gpre := gdth * (1 - Exp(-dth));
+      FGradDtB.FData[h] := FGradDtB.FData[h] + gpre;     // dL/d dt_bias
+      if hasInputGrad then
+        PrevErrPtr^[dtOff + h] := PrevErrPtr^[dtOff + h] + gpre;
+    end;
+  end;
+  // Flush -FLearningRate-scaled grads.
+  TNNetVolume.MulAdd(NA.FDelta.GetRawPtr(), FGradA.GetRawPtr(), -FLearningRate, FNumHeads);
+  TNNetVolume.MulAdd(ND.FDelta.GetRawPtr(), FGradD.GetRawPtr(), -FLearningRate, FNumHeads);
+  TNNetVolume.MulAdd(NDtB.FDelta.GetRawPtr(), FGradDtB.GetRawPtr(), -FLearningRate, FNumHeads);
+  TNNetVolume.MulAdd(NNorm.FDelta.GetRawPtr(), FGradNorm.GetRawPtr(), -FLearningRate, dInner);
+  if (not FBatchUpdate) then
+  begin
+    NA.UpdateWeights(FInertia);  ND.UpdateWeights(FInertia);
+    NDtB.UpdateWeights(FInertia); NNorm.UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetMamba2.InitDefault();
+var
+  oldSeed: integer;
+begin
+  if FNeurons.Count < 4 then AddMissingNeurons(4);
+  oldSeed := RandSeed;
+  RandSeed := 314159;
+  // Benign defaults; the importer overwrites them. A_log small (A=-exp(A_log)
+  // ~ -1), D = 1 (identity skip), dt_bias = 0, norm_weight = 1.
+  FNeurons[0].FWeights.Fill(0);   // A_log -> A = -1
+  FNeurons[1].FWeights.Fill(1);   // D
+  FNeurons[2].FWeights.Fill(0);   // dt_bias
+  FNeurons[3].FWeights.Fill(1);   // norm_weight
   RandSeed := oldSeed;
   AfterWeightUpdate();
 end;
@@ -85477,6 +85886,7 @@ begin
       'TNNetKalmanFilterCell':      Result := TNNetKalmanFilterCell.Create();
       'TNNetHamiltonianCell':       Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1], St[3] <> 0);
       'TNNetSelectiveSSM':          Result := TNNetSelectiveSSM.Create(Max(St[0], 1));
+      'TNNetMamba2':                Result := TNNetMamba2.Create(Max(St[0], 1), Max(St[1], 1), Max(St[2], 1), Max(St[3], 1), Ft[0]);
       'TNNetImplicitLongConv':      Result := TNNetImplicitLongConv.Create(Max(St[0], 1));
       'TNNetSpatialGatingUnit':     Result := TNNetSpatialGatingUnit.Create(St[0]);
       'TNNetPolynomialActivation':  Result := TNNetPolynomialActivation.Create();
@@ -85867,6 +86277,7 @@ begin
       if S[0] = 'TNNetKalmanFilterCell' then Result := TNNetKalmanFilterCell.Create() else
       if S[0] = 'TNNetHamiltonianCell' then Result := TNNetHamiltonianCell.Create(Max(St[2], 1), Ft[0], St[1], St[3] <> 0) else
       if S[0] = 'TNNetSelectiveSSM' then Result := TNNetSelectiveSSM.Create(Max(St[0], 1)) else
+      if S[0] = 'TNNetMamba2' then Result := TNNetMamba2.Create(Max(St[0], 1), Max(St[1], 1), Max(St[2], 1), Max(St[3], 1), Ft[0]) else
       if S[0] = 'TNNetImplicitLongConv' then Result := TNNetImplicitLongConv.Create(Max(St[0], 1)) else
       if S[0] = 'TNNetSpatialGatingUnit' then Result := TNNetSpatialGatingUnit.Create(St[0]) else
       if S[0] = 'TNNetPolynomialActivation' then Result := TNNetPolynomialActivation.Create() else

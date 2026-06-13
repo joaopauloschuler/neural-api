@@ -168,6 +168,7 @@ type
     procedure TestMixtralLogitParity;
     procedure TestRWKVLogitParity;
     procedure TestMambaLogitParity;
+    procedure TestMamba2LogitParity;
     procedure TestRecurrentGemmaLogitParity;
     procedure TestJambaLogitParity;
     procedure TestBloomLogitParity;
@@ -5225,6 +5226,74 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_mamba_logits.json'), 8, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the MAMBA-2 / SSD import target (HF model_type "mamba2",
+// architectures ["Mamba2ForCausalLM"], the state-spaces/mamba2-* /
+// Falcon-Mamba / Codestral-Mamba family) - the multi-head state-space-duality
+// successor to Mamba-1. tests/fixtures/tiny_mamba2.* is a pico RANDOM model
+// (2 layers, hidden 8, d_inner 8, num_heads 2, head_dim 4, n_groups 1 <
+// num_heads, d_state 4, conv 4, vocab 13, tied head).
+// tools/make_pico_mamba2_fixture.py ASSERTS each quirk is non-vacuous via the
+// float64 oracle. Exercises: the per-HEAD scalar A = -exp(A_log), grouped B/C
+// shared across the group's heads, the per-head dt softplus + D head skip, the
+// (x|B|C)-only depthwise causal conv + SiLU, and the gated RMSNorm before
+// out_proj - the new TNNetMamba2 leaf. The BuildFromPretrained model_type
+// "mamba2" dispatch route is covered too.
+procedure TTestNeuralPretrained.TestMamba2LogitParity;
+var
+  NN: TNNet;
+  Config: TMamba2Config;
+  LayerCnt, ScanCnt, ConvCnt, ConcatCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildMamba2FromSafeTensorsEx(FixturePath('tiny_mamba2.safetensors'),
+    Config, {SeqLen=}8, {pInferenceOnly=}false,
+    FixturePath('tiny_mamba2_config.json'));
+  try
+    AssertEquals('model_type', 'mamba2', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('hidden', 8, Config.HiddenSize);
+    AssertEquals('d_inner (num_heads*head_dim)', 8, Config.DInner);
+    AssertEquals('num_heads', 2, Config.NumHeads);
+    AssertEquals('head_dim', 4, Config.HeadDim);
+    AssertEquals('n_groups', 1, Config.NGroups);
+    AssertEquals('d_state', 4, Config.StateSize);
+    AssertEquals('conv_kernel', 4, Config.ConvKernel);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertTrue('use_conv_bias', Config.UseConvBias);
+    AssertFalse('use_bias (in/out_proj)', Config.UseBias);
+    AssertTrue('tied head', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'backbone.', Config.Prefix);
+    // One TNNetMamba2 scan + one depthwise causal conv + one DeepConcat
+    // ([x|B|C | dt | gate]) per block; and NOT A SINGLE attention layer.
+    ScanCnt := 0; ConvCnt := 0; ConcatCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetMamba2 then Inc(ScanCnt);
+      if NN.Layers[LayerCnt] is TNNetDepthwiseConv1D then Inc(ConvCnt);
+      if NN.Layers[LayerCnt] is TNNetDeepConcat then Inc(ConcatCnt);
+      AssertFalse('no attention layer in a Mamba2 net',
+        NN.Layers[LayerCnt] is TNNetScaledDotProductAttention);
+    end;
+    AssertEquals('TNNetMamba2 count (1 per block)', 2, ScanCnt);
+    AssertEquals('TNNetDepthwiseConv1D count (1 per block)', 2, ConvCnt);
+    AssertEquals('TNNetDeepConcat count (1 per block)', 2, ConcatCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_mamba2_logits.json'), 8, Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type "mamba2".
+  NN := BuildFromPretrained(FixturePath('tiny_mamba2.safetensors'),
+    {SeqLen=}8, {pInferenceOnly=}false,
+    FixturePath('tiny_mamba2_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_mamba2_logits.json'), 8, 13);
   finally
     NN.Free;
   end;

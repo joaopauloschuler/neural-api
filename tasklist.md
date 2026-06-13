@@ -399,30 +399,22 @@ rather than acted on.
       transformer of equal size (constant-memory headline of the landed
       BuildRWKVFromSafeTensors importer; needs an incremental TNNetWKV
       state-carry path).
-- [ ] Mamba-2 / SSD importer (model_type "mamba2"): the landed
-      BuildMambaFromSafeTensors covers Mamba-1 only (TNNetSelectiveSSM with a
-      full per-channel input-dependent A). Mamba-2 is the architecturally
-      DISTINCT successor — State-Space Duality: a MULTI-HEAD SSM whose state
-      transition A is a single SCALAR decay per head (a_t = exp(dt * A_log),
-      A_log a per-head scalar, not the per-(channel,state) matrix of Mamba-1),
-      with B/C SHARED across the heads in a group (GQA-like) and an extra
-      grouped RMSNorm gate before out_proj — so it is NOT a flag on
-      TNNetSelectiveSSM but a new TNNetMamba2/SSD leaf (the chunked SSD scan is
-      the headline, but a plain head-wise recurrent forward + exact BPTT is the
-      v1, mirroring how Mamba-1 landed the scan before any chunking). Powers
-      real checkpoints the repo cannot load today: state-spaces/mamba2-*,
-      Codestral-Mamba-7B (mistralai/Mamba-Codestral-7B-v0.1) and
-      tiiuae/Falcon-Mamba-7B (pure-SSM 7B LMs, no attention). Importer reuses
-      the Mamba-1 conv1d/in_proj/out_proj plumbing and AddMambaBlock pattern;
-      the genuinely new pieces are the head-scalar A_log copy, the grouped
-      B/C/heads layout, and the pre-out_proj gated RMSNorm. Deliverables:
-      BuildMamba2FromSafeTensors[Ex] wired into BuildFromPretrained, a
-      TNNetMamba2 leaf with its own numerical-gradient + serialization tests,
-      and a pico parity fixture (tools/make_pico_mamba2_fixture.py, synthetic
-      config-faithful HF Mamba2ForCausalLM, no download) asserting next-token
-      logits <1e-4 vs the float64 HF oracle — same recipe as the Mamba-1 /
-      RWKV importers. Opens the hybrid Mamba-2 + attention families (Zamba2,
-      Nemotron-H, the Codestral-Mamba line) for later.
+- [X] Mamba-2 / SSD importer (model_type "mamba2"): LANDED. TNNetMamba2
+      multi-head leaf (per-head scalar A=-exp(A_log), grouped B/C, pre-out_proj
+      gated RMSNorm; head-wise recurrent forward + exact BPTT) +
+      BuildMamba2FromSafeTensors[Ex]/WithConfig wired into BuildFromPretrained,
+      reusing the Mamba-1 conv1d/in_proj/out_proj plumbing (in_proj ->
+      [gate|x|B|C|dt], conv+SiLU on x|B|C, DeepConcat to the leaf's
+      [x|B|C|dt|gate] layout). Parity max |logit diff| ~= 2.4e-6 vs the float64
+      HF oracle (TestMamba2LogitParity; residual is HF's float32 cast inside its
+      gated RMSNorm). tools/make_pico_mamba2_fixture.py = synthetic
+      config-faithful HF Mamba2ForCausalLM (no download, 6 non-vacuous quirk
+      self-checks). TNNetMamba2 numerical-gradient (input + 4 weight sets) +
+      serialization round-trip tests in TestNeuralNumerical. DEFERRED
+      FOLLOW-UPS: the chunked SSD scan (v1 is the recurrent scan, like Mamba-1);
+      the hybrid Mamba-2 + attention families (Zamba2, Nemotron-H); an
+      incremental O(1) decode state-carry path; n_groups>1 real checkpoints
+      (supported but only n_groups=1 fixture-tested).
 - [ ] Mamba decode-side demo: tokens/sec flat in context length where a
       transformer of equal size slows (constant-memory headline of the
       landed BuildMambaFromSafeTensors importer; needs an incremental

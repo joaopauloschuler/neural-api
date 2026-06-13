@@ -418,6 +418,9 @@ type
     procedure TestSelectiveSSMDStateInputGradientCheck;
     procedure TestSelectiveSSMDStateWeightGradientCheck;
     procedure TestSelectiveSSMDStateSerializationRoundTrip;
+    procedure TestMamba2InputGradientCheck;
+    procedure TestMamba2WeightGradientCheck;
+    procedure TestMamba2SerializationRoundTrip;
     procedure TestClosedFormContinuousInputGradientCheck;
     procedure TestClosedFormContinuousWeightGradientCheck;
     procedure TestClosedFormContinuousSerializationRoundTrip;
@@ -31408,6 +31411,186 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetSelectiveSSM.Create(4), 'SelectiveSSM-DState4', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetMamba2 (Mamba-2 / SSD multi-head state-space mixer) ---------------
+
+// Fill the four Mamba-2 weight sets (A_log, D, dt_bias, norm_weight) with
+// deterministic non-trivial values so every BPTT term is exercised: a real
+// per-head decay spread, a non-one D head skip, a dt_bias straddling zero
+// (softplus is neither identity nor ReLU there) and non-one RMSNorm gains.
+procedure SeedMamba2(LM2: TNNetLayer; NumHeads, DInner: integer);
+var h, c: integer;
+begin
+  for h := 0 to NumHeads - 1 do
+  begin
+    LM2.Neurons[0].Weights.Raw[h] := Sin(h * 0.7) * 0.6;        // A_log
+    LM2.Neurons[1].Weights.Raw[h] := 0.3 + h * 0.25;           // D
+    LM2.Neurons[2].Weights.Raw[h] := Cos(h * 0.9) * 0.5 - 0.1; // dt_bias
+  end;
+  for c := 0 to DInner - 1 do
+    LM2.Neurons[3].Weights.Raw[c] := 1.0 + Sin(c * 0.6) * 0.3; // norm_weight
+end;
+
+procedure TTestNeuralNumerical.TestMamba2InputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LM2: TNNetMamba2;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+  // 2 heads x head_dim 2 -> d_inner 4; state 3, groups 1.
+  // InDepth = 2*4 + 2*1*3 + 2 = 16.
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var kk: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 16);
+  InputPlus := TNNetVolume.Create(4, 1, 16);
+  Desired := TNNetVolume.Create(4, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 16, 1));
+    LM2 := TNNetMamba2.Create(2, 2, 3, 1, 1e-5);
+    NN.AddLayer(LM2);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.37) * 1.1 + 0.15;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.43) * 0.8;
+    SeedMamba2(LM2, 2, 4);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      // The Mamba-2 head-wise scan stacks softplus, exp-decay and a divisive
+      // RMSNorm, so the single-precision central-difference is noisier than a
+      // plain linear layer; gate on abs 0.02 OR 3% relative (the analytic grad
+      // is float64-verified exact in tools/make_pico_mamba2_fixture.py-style
+      // cross-checks).
+      AssertTrue('Mamba2 input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        (Abs(numericalGrad - analyticalGrad) < 0.02) or
+        (Abs(numericalGrad - analyticalGrad) <
+          0.03 * (Abs(analyticalGrad) + 1e-6)));
+    end;
+    WriteLn('Mamba2 input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMamba2WeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LM2: TNNetMamba2;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..3] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var kk: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 16);
+  Desired := TNNetVolume.Create(4, 1, 4);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'A_log'; Names[1] := 'D'; Names[2] := 'dt_bias';
+  Names[3] := 'norm_weight';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 16, 1));
+    LM2 := TNNetMamba2.Create(2, 2, 3, 1, 1e-5);
+    NN.AddLayer(LM2);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.29) * 1.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31) * 0.7;
+    SeedMamba2(LM2, 2, 4);
+
+    // Covers all four learnable tensors of the Mamba-2 BPTT: the per-head
+    // scalar A_log/D/dt_bias and the d_inner gated-RMSNorm gain.
+    for n := 0 to 3 do
+      for i := 0 to LM2.Neurons[n].Weights.Size - 1 do
+      begin
+        LM2.Neurons[n].Weights.Raw[i] := LM2.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        LM2.Neurons[n].Weights.Raw[i] := LM2.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        LM2.Neurons[n].Weights.Raw[i] := LM2.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LM2.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LM2.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        // Abs 0.02 OR 3% relative: the FP32 central-difference is noisy across
+        // the softplus/exp/RMSNorm stack (see the input-gradient note above).
+        AssertTrue('Mamba2 weight gradient check ' + Names[n] + '[' +
+          IntToStr(i) + '] num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          (Abs(numericalGrad - analyticalGrad) < 0.02) or
+          (Abs(numericalGrad - analyticalGrad) <
+            0.03 * (Abs(analyticalGrad) + 1e-6)));
+      end;
+    WriteLn('Mamba2 weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMamba2SerializationRoundTrip;
+begin
+  // FStruct[0..3] (heads/head_dim/state/groups) and FFloatSt[0] (eps) must
+  // survive save/load so the loaded layer rebuilds the same shapes/output.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetMamba2.Create(2, 2, 3, 1, 1e-5), 'Mamba2', 4, 1, 16, 1e-5);
 end;
 
 // --- TNNetClosedFormContinuous (CfC liquid recurrent cell) ------------------
