@@ -98,8 +98,10 @@ type
     procedure TestReaderRejectsGarbage;
     procedure TestReaderReadsTinyFixture;
     procedure TestSafeTensorsWriterRoundTrip;
+    procedure TestSafeTensorsWriterF16BF16RoundTrip;
     procedure TestSafeTensorsWriterRejectsBadInput;
     procedure TestSaveLoadNNetToSafeTensors;
+    procedure TestSaveLoadNNetToSafeTensorsF16;
     procedure TestImporterFailsOnMissingTensor;
     procedure TestGPT2ConfigFromFixture;
     procedure TestGPT2LogitParity;
@@ -935,6 +937,90 @@ begin
   end;
 end;
 
+procedure TTestNeuralPretrained.TestSafeTensorsWriterF16BF16RoundTrip;
+var
+  Path: string;
+  Writer: TNNetSafeTensorsWriter;
+  Reader: TNNetSafeTensorsReader;
+  Src, Dst: TNNetVolume;
+  Info: TSafeTensorInfo;
+  i: integer;
+  V, Tol: single;
+
+  function Value(pElement: integer): single;
+  begin
+    // A spread of magnitudes (incl. negatives, fractions) so the rounding is
+    // genuinely exercised, none of them powers of two so they are inexact.
+    Result := (pElement - 5) * 0.3 + 0.07;
+  end;
+
+begin
+  RandSeed := 424242;
+  Path := GetTempDir(false) + 'cai_st_writer_half.safetensors';
+  Src := TNNetVolume.Create;
+  Dst := TNNetVolume.Create;
+  Src.ReSize(11, 1, 1);
+  for i := 0 to Src.Size - 1 do
+    Src.FData[i] := Value(i);
+  Writer := TNNetSafeTensorsWriter.Create(Path);
+  try
+    Writer.AddTensorFlat('half.f32', [11], Src, stwF32);
+    Writer.AddTensorFlat('half.f16', [11], Src, stwF16);
+    Writer.AddTensorFlat('half.bf16', [11], Src, stwBF16);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+
+  Reader := TNNetSafeTensorsReader.Create(Path);
+  try
+    // Header carries the chosen dtype string per tensor.
+    AssertEquals('f32 dtype', 'F32', Reader.GetDType('half.f32'));
+    AssertEquals('f16 dtype', 'F16', Reader.GetDType('half.f16'));
+    AssertEquals('bf16 dtype', 'BF16', Reader.GetDType('half.bf16'));
+
+    // data_offsets: F32 spans 11*4=44 bytes, each half spans 11*2=22 bytes,
+    // packed contiguously in insertion order.
+    Info := Reader.GetInfo('half.f32');
+    AssertEquals('f32 begin', 0, Info.DataBegin);
+    AssertEquals('f32 end', 44, Info.DataEnd);
+    Info := Reader.GetInfo('half.f16');
+    AssertEquals('f16 begin', 44, Info.DataBegin);
+    AssertEquals('f16 end', 66, Info.DataEnd);
+    Info := Reader.GetInfo('half.bf16');
+    AssertEquals('bf16 begin', 66, Info.DataBegin);
+    AssertEquals('bf16 end', 88, Info.DataEnd);
+
+    // F32 round-trips bit-exact.
+    Reader.LoadTensorFlat('half.f32', Dst);
+    for i := 0 to Src.Size - 1 do
+      AssertEquals('f32[' + IntToStr(i) + ']', Value(i), Dst.FData[i], 0);
+
+    // F16: ~3-4 significant decimal digits; relative tol 1e-3 covers it.
+    Reader.LoadTensorFlat('half.f16', Dst);
+    for i := 0 to Src.Size - 1 do
+    begin
+      V := Value(i);
+      Tol := Abs(V) * 1e-3 + 1e-4;
+      AssertEquals('f16[' + IntToStr(i) + ']', V, Dst.FData[i], Tol);
+    end;
+
+    // BF16: only 8 mantissa bits, coarser - relative tol ~1e-2.
+    Reader.LoadTensorFlat('half.bf16', Dst);
+    for i := 0 to Src.Size - 1 do
+    begin
+      V := Value(i);
+      Tol := Abs(V) * 1e-2 + 1e-3;
+      AssertEquals('bf16[' + IntToStr(i) + ']', V, Dst.FData[i], Tol);
+    end;
+  finally
+    Reader.Free;
+    Dst.Free;
+    Src.Free;
+    DeleteFile(Path);
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestSafeTensorsWriterRejectsBadInput;
 var
   Path: string;
@@ -1061,6 +1147,71 @@ begin
     AssertTrue('structure mismatch must abort the load', Failed);
   finally
     NNOther.Free;
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
+    NN1.Free;
+    DeleteFile(Path);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSaveLoadNNetToSafeTensorsF16;
+var
+  Path: string;
+  NN1, NN2: TNNet;
+  Input, Out1, Out2: TNNetVolume;
+  i: integer;
+  MaxDiff, Mag, Tol: TNeuralFloat;
+
+  function SmallNet: TNNet;
+  begin
+    Result := TNNet.Create;
+    Result.AddLayer([
+      TNNetInput.Create(6, 6, 3),
+      TNNetConvolutionReLU.Create(4, 3, 1, 1, 1),
+      TNNetMaxPool.Create(2),
+      TNNetFullConnectLinear.Create(5)
+    ]);
+  end;
+
+begin
+  RandSeed := 424242;
+  Path := GetTempDir(false) + 'cai_st_nnet_roundtrip_f16.safetensors';
+  NN1 := SmallNet;
+  NN2 := SmallNet; // same structure, DIFFERENT random init
+  Input := TNNetVolume.Create(6, 6, 3);
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := 0.05 * i - 2.5;
+    NN1.Compute(Input);
+    NN1.GetOutput(Out1);
+
+    // Save NN1 as F16, load into NN2, forward: outputs within F16 precision.
+    SaveNNetToSafeTensorsEx(NN1, Path, stwF16);
+    LoadNNetFromSafeTensors(NN2, Path);
+    NN2.Compute(Input);
+    NN2.GetOutput(Out2);
+    AssertEquals('output size', Out1.Size, Out2.Size);
+    Mag := 0;
+    for i := 0 to Out1.Size - 1 do
+      if Abs(Out1.FData[i]) > Mag then Mag := Abs(Out1.FData[i]);
+    // F16 weight rounding accumulates through the conv+FC; allow a tolerance
+    // scaled by the output magnitude (logits, not probabilities).
+    Tol := Mag * 5e-2 + 1e-2;
+    MaxDiff := 0;
+    for i := 0 to Out1.Size - 1 do
+      if Abs(Out1.FData[i] - Out2.FData[i]) > MaxDiff then
+        MaxDiff := Abs(Out1.FData[i] - Out2.FData[i]);
+    AssertTrue('F16-reloaded output within tol (max diff ' +
+      FloatToStr(MaxDiff) + ', tol ' + FloatToStr(Tol) + ')',
+      MaxDiff <= Tol);
+    // It must NOT be bit-exact (otherwise the F16 path is a no-op).
+    AssertTrue('F16 path must lose some precision (max diff ' +
+      FloatToStr(MaxDiff) + ')', MaxDiff > 0);
+  finally
     Out2.Free;
     Out1.Free;
     Input.Free;

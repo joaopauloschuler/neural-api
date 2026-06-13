@@ -160,67 +160,13 @@ const
   NPY_MAGIC: array[0..5] of byte = ($93, $4E, $55, $4D, $50, $59); // \x93NUMPY
 
 // ---------------------------------------------------------------------------
-// F16 encode (decode lives in neuralsafetensors; we reuse DecodeF16 there).
+// F16 encode (the canonical implementation, like DecodeF16, now lives in
+// neuralsafetensors so the .npy writer and the safetensors writer share one
+// copy; this thin forwarder keeps neuralnumpy.EncodeF16 a stable entry point).
 // ---------------------------------------------------------------------------
 function EncodeF16(Value: Single): Word;
-var
-  Bits: Cardinal;
-  Sign, Exp, Mant: Cardinal;
-  E: integer;
-  Half: Cardinal;
 begin
-  Bits := PCardinal(@Value)^;
-  Sign := (Bits shr 16) and $8000;
-  Exp := (Bits shr 23) and $FF;
-  Mant := Bits and $7FFFFF;
-  if Exp = $FF then
-  begin
-    // Inf or NaN
-    if Mant <> 0 then
-      Result := Word(Sign or $7E00) // canonical quiet NaN
-    else
-      Result := Word(Sign or $7C00); // Inf
-    exit;
-  end;
-  E := integer(Exp) - 127 + 15; // rebias 127 -> 15
-  if E >= $1F then
-  begin
-    // overflow -> Inf
-    Result := Word(Sign or $7C00);
-    exit;
-  end
-  else if E <= 0 then
-  begin
-    // subnormal or zero
-    if E < -10 then
-    begin
-      Result := Word(Sign); // too small -> signed zero
-      exit;
-    end;
-    // add implicit leading 1, then shift into subnormal position with rounding
-    Mant := Mant or $800000;
-    // shift right by (14 - E) bits to align to 10-bit mantissa
-    // half mantissa occupies bits, total shift = (1 - E) + 13
-    Half := Mant shr (14 - E);
-    // round to nearest even using the bit just shifted out
-    if (Mant shr (13 - E)) and 1 = 1 then
-      Inc(Half);
-    Result := Word(Sign or Half);
-    exit;
-  end
-  else
-  begin
-    // normal: 10-bit mantissa = top 10 bits of the 23-bit mantissa
-    Half := (Cardinal(E) shl 10) or (Mant shr 13);
-    // round to nearest even on the dropped 13 bits
-    if (Mant and $1000) <> 0 then // guard bit set
-    begin
-      if ((Mant and $FFF) <> 0) or ((Half and 1) = 1) then
-        Inc(Half); // may carry into exponent, which is the correct behavior
-    end;
-    Result := Word(Sign or Half);
-    exit;
-  end;
+  Result := neuralsafetensors.EncodeF16(Value);
 end;
 
 // ---------------------------------------------------------------------------

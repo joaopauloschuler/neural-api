@@ -205,7 +205,7 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [ ] safetensors writer F16/BF16 output: TNNetSafeTensorsWriter only
+- [X] safetensors writer F16/BF16 output: TNNetSafeTensorsWriter only
       emits F32; add encode-on-write halves (EncodeF16/EncodeBF16 mirroring
       the existing decoders) for smaller exported checkpoints.
 - [ ] HF-names safetensors exporter: export an imported pico-GPT-2 back to
