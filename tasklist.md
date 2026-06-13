@@ -99,7 +99,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Extractive question-answering (SQuAD) head import + EM/F1 eval — the
+- [X] Extractive question-answering (SQuAD) head import + EM/F1 eval — the
       missing classic downstream-task head on top of the landed encoder
       importers. Today only TWO task heads exist
       (BuildBertForSequenceClassificationFromSafeTensors,

@@ -2051,6 +2051,60 @@ function BuildGPT2ForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0; pNumHeads: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
+// =================== EXTRACTIVE QUESTION ANSWERING (SQuAD) ================
+// Fine-tuned *ForQuestionAnswering checkpoints (bert / distilbert / roberta
+// family): the stock encoder trunk plus a SINGLE [hidden -> 2] dense head
+// ("qa_outputs", no intervening pooler) that emits, PER TOKEN, a start logit
+// (column 0) and an end logit (column 1). HF stores qa_outputs as one
+// nn.Linear [2, hidden]: row 0 -> start logits, row 1 -> end logits. The
+// answer span is argmax_{s<=e} start[s]+end[e] over the CONTEXT tokens.
+
+// Builds the FULL *ForQuestionAnswering stack: the BERT-family encoder
+// (BuildBertFromSafeTensorsWithConfig, no pooler) with AddQuestionAnsweringHead
+// appended - two per-token [hidden -> 1] projections (TNNetPointwiseConvLinear)
+// DeepConcat'd to (SeqLen,1,2): channel 0 = start logits, channel 1 = end
+// logits. The HF "qa_outputs.weight" [2, hidden] row 0 is loaded onto the start
+// projection, row 1 onto the end projection (likewise "qa_outputs.bias" [2]).
+// Config is returned; ConfigFileName '' = "config.json" next to FileName.
+function BuildBertForQuestionAnsweringFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildBertForQuestionAnsweringFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// AnswerSpan: runs "[CLS] question [SEP] context [SEP]" through a QA net and
+// returns the predicted answer substring of Context. The question, special and
+// pad positions are masked out; only CONTEXT tokens are eligible span ends.
+// The best span maximizes start[s]+end[e] subject to s<=e<=s+MaxAnswerLen-1
+// (MaxAnswerLen<=0 -> 30, the SQuAD default). StartChar/EndChar return the
+// 0-based [start,end) char span into Context (-1/-1 when empty). Score returns
+// start[s]+end[e]. An empty/over-long input that leaves no context token
+// yields '' (StartChar=-1). NoAnswerScore returns start[CLS]+end[CLS] (the
+// SQuAD2 null-answer baseline) so callers can threshold abstention.
+function AnswerSpan(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Question, Context: string; out StartChar, EndChar: integer;
+  out Score, NoAnswerScore: TNeuralFloat;
+  MaxAnswerLen: integer = 0): string;
+
+// QAReport: SQuAD Exact-Match + macro token-F1 over a planted set. Questions[i]
+// / Contexts[i] / GoldAnswers[i] are parallel arrays; the net answers each and
+// the prediction is compared to the gold under the official SQuAD normalization
+// (lowercase, strip articles a/an/the, drop punctuation, collapse whitespace).
+// EM is the fraction of exact normalized matches; F1 is the macro mean of the
+// per-example token-overlap F1. Returns a formatted report. Mirrors STSReport /
+// RetrievalReport. Raises on length mismatch or an empty set.
+function QAReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Questions, Contexts, GoldAnswers: array of string): string;
+
+// SQuAD answer normalization (lowercase, remove a/an/the, strip punctuation,
+// collapse whitespace) and the token-overlap F1 behind QAReport, exposed for
+// programmatic scoring.
+function NormalizeSquadAnswer(const S: string): string;
+function SquadTokenF1(const Pred, Gold: string): TNeuralFloat;
+
 // ---------------------------------------------------------------------------
 // T5 / FLAN-T5 IMPORT (model_type "t5") - the FIRST ENCODER-DECODER import.
 // ---------------------------------------------------------------------------
@@ -12204,6 +12258,11 @@ begin
         // separate per-token head on top of this encoder.
         if (TensorNameStr = 'linear.weight') or
            (TensorNameStr = 'linear.bias') then continue;
+        // *ForQuestionAnswering span head ([2, hidden] qa_outputs): not part of
+        // a plain BERT export; BuildBertForQuestionAnsweringFromSafeTensorsEx
+        // loads it as a separate per-token head on top of this encoder.
+        if (TensorNameStr = 'qa_outputs.weight') or
+           (TensorNameStr = 'qa_outputs.bias') then continue;
         ImportError('BERT import: unexpected tensor "' + TensorNameStr +
           '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
           ') in ' + FileName + ' - refusing a partial import.');
@@ -13117,6 +13176,317 @@ begin
   Result := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(FileName,
     IgnoredConfig, nil, pSeqLen, pNumHeads, pInferenceOnly, '',
     pQuantizeInt8);
+end;
+
+// =================== EXTRACTIVE QUESTION ANSWERING (SQuAD) ================
+
+function BuildBertForQuestionAnsweringFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  ConfigPath: string;
+  Head, StartLayer, EndLayer: TNNetLayer;
+  StartIdx: integer;
+begin
+  // Build the stock BERT-family encoder (no pooler, no seq-cls head). DEFER
+  // the inference-only / int8 pass: the qa_outputs head appended below must
+  // be loaded with writable weights first (the ColBERT pattern).
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBertConfigFromJSONFile(ConfigPath);
+  Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    {pInferenceOnly=}false, {pIncludePooler=}false, {pSeqClsHead=}false,
+    {pQuantizeInt8=}false);
+  try
+    // AddQuestionAnsweringHead returns the (SeqLen,1,2) DeepConcat; the two
+    // [hidden -> 1] per-token projections are the two layers right before it:
+    // StartLogit (channel 0) then EndLogit (channel 1).
+    Head := Result.AddQuestionAnsweringHead();
+    StartIdx := Result.Layers.Count - 3;
+    StartLayer := Result.Layers[StartIdx];
+    EndLayer := Result.Layers[StartIdx + 1];
+    if (Head = nil) or
+       (not (StartLayer is TNNetPointwiseConvLinear)) or
+       (not (EndLayer is TNNetPointwiseConvLinear)) or
+       (StartLayer.Neurons.Count <> 1) or (EndLayer.Neurons.Count <> 1) then
+      ImportError('QA import: internal error wiring AddQuestionAnsweringHead.');
+    Reader := CreatePretrainedTensorReader(FileName);
+    try
+      if not Reader.HasTensor('qa_outputs.weight') then
+        ImportError('QA import: missing tensor "qa_outputs.weight" (the ' +
+          '[2, hidden] span head) - not a *ForQuestionAnswering checkpoint?');
+      if (Reader.DimCount('qa_outputs.weight') <> 2) or
+         (Reader.DimSize('qa_outputs.weight', 0) <> 2) or
+         (Reader.DimSize('qa_outputs.weight', 1) <> Config.HiddenSize) then
+        ImportError('QA import: "qa_outputs.weight" must have shape ' +
+          '[2, ' + IntToStr(Config.HiddenSize) + '] (nn.Linear stores ' +
+          '[out, in]), got ' + Reader.ShapeAsString('qa_outputs.weight'));
+      // Row 0 -> start projection, row 1 -> end projection. SrcRows=2 selects
+      // the right weight/bias row via SrcRowBase (start=0, end=1).
+      LoadLlamaLinearWeights(Reader, StartLayer, 'qa_outputs.weight',
+        Config.HiddenSize, 1, 0, 1, 0, 'qa_outputs.bias', 1.0, 0, 0, 2);
+      LoadLlamaLinearWeights(Reader, EndLayer, 'qa_outputs.weight',
+        Config.HiddenSize, 1, 0, 1, 0, 'qa_outputs.bias', 1.0, 0, 1, 2);
+    finally
+      Reader.Free;
+    end;
+  except
+    on E: ESafeTensorsError do
+    begin
+      Result.Free;
+      raise EPretrainedImportError.Create(E.Message);
+    end;
+    on E: Exception do
+    begin
+      Result.Free;
+      raise;
+    end;
+  end;
+  if pInferenceOnly then Result.MakeInferenceOnly();
+  if pQuantizeInt8 then Result.QuantizeWeightsInt8();
+end;
+
+function BuildBertForQuestionAnsweringFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TBertConfig;
+begin
+  Result := BuildBertForQuestionAnsweringFromSafeTensorsEx(FileName,
+    IgnoredConfig, pSeqLen, pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function AnswerSpan(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Question, Context: string; out StartChar, EndChar: integer;
+  out Score, NoAnswerScore: TNeuralFloat;
+  MaxAnswerLen: integer = 0): string;
+var
+  QOff, COff: TNeuralTokenOffsetArray;
+  SeqLen, ClsId, SepId, PadId: integer;
+  Input, Output: TNNetVolume;
+  Pos, QCnt, CCnt, ContextBase, ContextCnt, Used: integer;
+  IsContext: array of boolean;       // per seq position: an eligible answer token
+  CtxOffStart, CtxOffLen: array of integer; // per seq position: char span into Context
+  StartLogit, EndLogit: TNeuralFloat;
+  s, e, BestS, BestE: integer;
+  Best: TNeuralFloat;
+begin
+  StartChar := -1;
+  EndChar := -1;
+  Score := 0;
+  NoAnswerScore := 0;
+  if MaxAnswerLen <= 0 then MaxAnswerLen := 30;
+  SeqLen := Net.Layers[0].Output.SizeX;
+  if Net.Layers[0].Output.Depth <> 2 then
+    ImportError('AnswerSpan: net input is not (SeqLen,1,2) - not a ' +
+      'BuildBertForQuestionAnswering encoder?');
+  ClsId := Tokenizer.TokenToId('[CLS]');
+  SepId := Tokenizer.TokenToId('[SEP]');
+  if (ClsId < 0) or (SepId < 0) then
+  begin
+    // RoBERTa-family <s>/</s> fallback.
+    ClsId := Tokenizer.TokenToId('<s>');
+    SepId := Tokenizer.TokenToId('</s>');
+  end;
+  if (ClsId < 0) or (SepId < 0) then
+    ImportError('AnswerSpan: tokenizer has no [CLS]/[SEP] (or <s>/</s>) ' +
+      'special tokens.');
+  PadId := Tokenizer.TokenToId('[PAD]');
+  if PadId < 0 then PadId := Tokenizer.TokenToId('<pad>');
+  if PadId < 0 then PadId := 0;
+
+  QOff := Tokenizer.EncodeWithOffsets(Question);
+  COff := Tokenizer.EncodeWithOffsets(Context);
+
+  Input := TNNetVolume.Create();
+  Output := TNNetVolume.Create();
+  SetLength(IsContext, SeqLen);
+  SetLength(CtxOffStart, SeqLen);
+  SetLength(CtxOffLen, SeqLen);
+  try
+    Input.ReSize(SeqLen, 1, 2);
+    Input.Fill(0); // segment ids: 0 everywhere here (works for distilbert/roberta
+                   // which ignore them; BERT QA is robust to all-zero segments).
+    for Pos := 0 to SeqLen - 1 do IsContext[Pos] := False;
+    // [CLS] question [SEP] context [SEP], truncating context to fit.
+    Pos := 0;
+    Input.FData[Pos * 2] := ClsId; Inc(Pos);
+    for QCnt := 0 to High(QOff) do
+    begin
+      if Pos >= SeqLen - 2 then Break; // leave room for [SEP] context [SEP]
+      Input.FData[Pos * 2] := QOff[QCnt].Id; Inc(Pos);
+    end;
+    if Pos >= SeqLen - 1 then Pos := SeqLen - 2;
+    Input.FData[Pos * 2] := SepId; Inc(Pos);
+    ContextBase := Pos;
+    ContextCnt := 0;
+    for CCnt := 0 to High(COff) do
+    begin
+      if Pos >= SeqLen - 1 then Break; // leave room for the trailing [SEP]
+      Input.FData[Pos * 2] := COff[CCnt].Id;
+      // Only real-surface context tokens are eligible answer positions.
+      if COff[CCnt].Length > 0 then
+      begin
+        IsContext[Pos] := True;
+        // EncodeWithOffsets Start is 1-based; convert to 0-based [start,end).
+        CtxOffStart[Pos] := COff[CCnt].Start - 1;
+        CtxOffLen[Pos] := COff[CCnt].Length;
+      end;
+      Inc(Pos); Inc(ContextCnt);
+    end;
+    Input.FData[Pos * 2] := SepId; Inc(Pos);
+    Used := Pos;
+    for Pos := Used to SeqLen - 1 do Input.FData[Pos * 2] := PadId;
+
+    Net.Compute(Input);
+    Net.GetOutput(Output); // (SeqLen,1,2): depth 0 = start, depth 1 = end
+
+    // SQuAD2 null-answer baseline: start[CLS] + end[CLS] (position 0).
+    NoAnswerScore := Output.FData[0 * 2 + 0] + Output.FData[0 * 2 + 1];
+
+    if ContextCnt = 0 then Exit; // nothing to answer over
+
+    Best := -1e30; BestS := -1; BestE := -1;
+    for s := ContextBase to ContextBase + ContextCnt - 1 do
+    begin
+      if not IsContext[s] then Continue;
+      StartLogit := Output.FData[s * 2 + 0];
+      for e := s to s + MaxAnswerLen - 1 do
+      begin
+        if e > ContextBase + ContextCnt - 1 then Break;
+        if not IsContext[e] then Continue;
+        EndLogit := Output.FData[e * 2 + 1];
+        if StartLogit + EndLogit > Best then
+        begin
+          Best := StartLogit + EndLogit;
+          BestS := s; BestE := e;
+        end;
+      end;
+    end;
+    if BestS < 0 then Exit;
+    Score := Best;
+    StartChar := CtxOffStart[BestS];
+    EndChar := CtxOffStart[BestE] + CtxOffLen[BestE];
+    if (StartChar < 0) or (EndChar < StartChar) or
+       (EndChar > Length(Context)) then Exit;
+    Result := Copy(Context, StartChar + 1, EndChar - StartChar);
+  finally
+    Output.Free;
+    Input.Free;
+  end;
+end;
+
+function NormalizeSquadAnswer(const S: string): string;
+var
+  Lower, Tmp, Word: string;
+  i: integer;
+  Words: TStringList;
+  Ch: char;
+begin
+  // Lowercase, strip punctuation to spaces, collapse whitespace, drop the
+  // English articles a/an/the (the official SQuAD normalize_answer).
+  Lower := LowerCase(S);
+  Tmp := '';
+  for i := 1 to Length(Lower) do
+  begin
+    Ch := Lower[i];
+    if ((Ch >= 'a') and (Ch <= 'z')) or ((Ch >= '0') and (Ch <= '9')) then
+      Tmp := Tmp + Ch
+    else
+      Tmp := Tmp + ' '; // punctuation and whitespace both become separators
+  end;
+  Words := TStringList.Create();
+  try
+    Words.Delimiter := ' ';
+    Words.StrictDelimiter := False; // collapse runs of spaces
+    Words.DelimitedText := Tmp;
+    Result := '';
+    for i := 0 to Words.Count - 1 do
+    begin
+      Word := Words[i];
+      if (Word = '') or (Word = 'a') or (Word = 'an') or (Word = 'the') then
+        Continue;
+      if Result <> '' then Result := Result + ' ';
+      Result := Result + Word;
+    end;
+  finally
+    Words.Free;
+  end;
+end;
+
+function SquadTokenF1(const Pred, Gold: string): TNeuralFloat;
+var
+  PredToks, GoldToks: TStringList;
+  i, j, Same: integer;
+  Used: array of boolean;
+  Prec, Rec: TNeuralFloat;
+begin
+  PredToks := TStringList.Create();
+  GoldToks := TStringList.Create();
+  try
+    PredToks.Delimiter := ' '; PredToks.StrictDelimiter := False;
+    GoldToks.Delimiter := ' '; GoldToks.StrictDelimiter := False;
+    PredToks.DelimitedText := NormalizeSquadAnswer(Pred);
+    GoldToks.DelimitedText := NormalizeSquadAnswer(Gold);
+    // SQuAD convention: if either side is empty, F1 is 1 iff both empty.
+    if (PredToks.Count = 0) or (GoldToks.Count = 0) then
+    begin
+      if PredToks.Count = GoldToks.Count then Result := 1.0
+      else Result := 0.0;
+      Exit;
+    end;
+    // Multiset intersection (bag-of-words overlap).
+    SetLength(Used, GoldToks.Count);
+    for j := 0 to GoldToks.Count - 1 do Used[j] := False;
+    Same := 0;
+    for i := 0 to PredToks.Count - 1 do
+      for j := 0 to GoldToks.Count - 1 do
+        if (not Used[j]) and (PredToks[i] = GoldToks[j]) then
+        begin
+          Used[j] := True; Inc(Same); Break;
+        end;
+    if Same = 0 then begin Result := 0.0; Exit; end;
+    Prec := Same / PredToks.Count;
+    Rec := Same / GoldToks.Count;
+    Result := 2 * Prec * Rec / (Prec + Rec);
+  finally
+    GoldToks.Free;
+    PredToks.Free;
+  end;
+end;
+
+function QAReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Questions, Contexts, GoldAnswers: array of string): string;
+var
+  N, i, EMCount: integer;
+  Pred: string;
+  StartChar, EndChar: integer;
+  Score, NoAns, F1Sum, F1: TNeuralFloat;
+begin
+  N := Length(Questions);
+  if (N <> Length(Contexts)) or (N <> Length(GoldAnswers)) then
+    ImportError('QAReport: Questions/Contexts/GoldAnswers length mismatch.');
+  if N < 1 then
+    ImportError('QAReport: need at least 1 example.');
+  EMCount := 0;
+  F1Sum := 0;
+  for i := 0 to N - 1 do
+  begin
+    Pred := AnswerSpan(Net, Tokenizer, Questions[i], Contexts[i],
+      StartChar, EndChar, Score, NoAns);
+    if NormalizeSquadAnswer(Pred) = NormalizeSquadAnswer(GoldAnswers[i]) then
+      Inc(EMCount);
+    F1 := SquadTokenF1(Pred, GoldAnswers[i]);
+    F1Sum := F1Sum + F1;
+  end;
+  Result :=
+    '=== QA Report (SQuAD) ===' + sLineBreak +
+    'examples: ' + IntToStr(N) + sLineBreak +
+    'EM:       ' + FloatToStrF(100.0 * EMCount / N, ffFixed, 8, 2) +
+      sLineBreak +
+    'F1:       ' + FloatToStrF(100.0 * F1Sum / N, ffFixed, 8, 2) + sLineBreak;
 end;
 
 // ============= DEBERTA-V2 / DEBERTA-V3 IMPORT =============================

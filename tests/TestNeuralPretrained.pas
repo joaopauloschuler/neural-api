@@ -233,6 +233,8 @@ type
     procedure TestDistilBertSeqClsLogitParity;
     procedure TestRobertaSeqClsLogitParity;
     procedure TestGPT2SeqClsLogitParity;
+    procedure TestDistilBertQALogitParity;
+    procedure TestAnswerSpanAndQAReport;
     procedure TestBuildFromPretrainedSeqClsDispatch;
     procedure TestBertPoolSentenceEmbedding;
     procedure TestPoolSentenceEmbeddingModes;
@@ -7419,6 +7421,166 @@ begin
     end;
   finally
     Id2Label.Free;
+  end;
+end;
+
+// Extractive-QA import parity: DistilBertForQuestionAnswering = the
+// distilbert trunk + a [dim -> 2] qa_outputs span head. The Pascal
+// AddQuestionAnsweringHead emits (SeqLen,1,2) (depth 0 = start logits,
+// depth 1 = end logits) PER TOKEN; every position must match HF's float64
+// start_logits/end_logits. Row 0 of qa_outputs must land on the start
+// projection, row 1 on the end projection (the fixture boosts the head so
+// a row swap fails loudly).
+procedure TTestNeuralPretrained.TestDistilBertQALogitParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Obj: TJSONObject;
+  Sequences, StartArr, EndArr, SeqArr, SRow, ERow: TJSONArray;
+  Input, Output: TNNetVolume;
+  SeqLen, SeqCnt, PosCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildBertForQuestionAnsweringFromSafeTensorsEx(
+    FixturePath('tiny_distilbert_qa.safetensors'), Config,
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_distilbert_qa_config.json'));
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertEquals('prefix (DistilBertFor* exports carry "distilbert.")',
+      'distilbert.', Config.Prefix);
+    AssertEquals('QA head output depth (start|end)', 2,
+      NN.GetLastLayer().Output.Depth);
+    SeqLen := Config.MaxPositions;
+    RefJson.LoadFromFile(FixturePath('tiny_distilbert_qa_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Obj := TJSONObject(RefRoot);
+    Sequences := TJSONArray(Obj.Find('sequences'));
+    StartArr := TJSONArray(Obj.Find('start_logits'));
+    EndArr := TJSONArray(Obj.Find('end_logits'));
+    AssertTrue('sequences present', Sequences <> nil);
+    AssertTrue('start_logits present', StartArr <> nil);
+    AssertTrue('end_logits present', EndArr <> nil);
+    AssertTrue('at least 3 sequences', Sequences.Count >= 3);
+    Input.ReSize(SeqLen, 1, 2);
+    MaxDiff := 0;
+    for SeqCnt := 0 to Sequences.Count - 1 do
+    begin
+      SeqArr := TJSONArray(Sequences.Items[SeqCnt]);
+      AssertEquals('sequence length', SeqLen, SeqArr.Count);
+      for PosCnt := 0 to SeqLen - 1 do
+      begin
+        Input.FData[PosCnt * 2] := SeqArr.Items[PosCnt].AsInteger;
+        Input.FData[PosCnt * 2 + 1] := 0; // single segment
+      end;
+      NN.Compute(Input);
+      NN.GetOutput(Output);
+      AssertEquals('per-position span logits', SeqLen * 2, Output.Size);
+      SRow := TJSONArray(StartArr.Items[SeqCnt]);
+      ERow := TJSONArray(EndArr.Items[SeqCnt]);
+      for PosCnt := 0 to SeqLen - 1 do
+      begin
+        // depth 0 = start, depth 1 = end (the AddQuestionAnsweringHead
+        // DeepConcat order).
+        Diff := Abs(Output.FData[PosCnt * 2 + 0] -
+          SRow.Items[PosCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+        Diff := Abs(Output.FData[PosCnt * 2 + 1] -
+          ERow.Items[PosCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // Same 1e-4 gate as the seq-cls / LM parity tests.
+    AssertTrue('span-logit parity: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// AnswerSpan / QAReport functional test on a HAND-BUILT QA net (the pico
+// fixture trunk's vocab=11 is too small for real tokenizer ids). The net
+// is Embedding -> AddQuestionAnsweringHead with the two span projections
+// wired so start[t] = end[t] = hidden[t][0]; embedding rows are set so a
+// chosen context word carries the peak logit. The whole-pipeline path
+// ([CLS] q [SEP] context [SEP], context-only masking, offset map, span
+// argmax) must recover that word; SQuAD normalization/F1 are checked too.
+procedure TTestNeuralPretrained.TestAnswerSpanAndQAReport;
+var
+  Tok: TNeuralHFTokenizer;
+  NN: TNNet;
+  Emb, StartProj, EndProj: TNNetLayer;
+  V, AnswerId, i: integer;
+  StartChar, EndChar: integer;
+  Score, NoAns: TNeuralFloat;
+  Pred, Rep: string;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  NN := TNNet.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    V := 255; // the tiny WordPiece vocab size
+    NN.AddLayer(TNNetInput.Create(32, 1, 2));
+    NN.AddLayer(TNNetSplitChannels.Create([0]));
+    Emb := NN.AddLayer(TNNetEmbedding.Create(V, 1, {EncodeZero=}1));
+    NN.AddQuestionAnsweringHead();
+    // Head layers: ... Emb, StartProj, EndProj, DeepConcat.
+    StartProj := NN.Layers[NN.Layers.Count - 3];
+    EndProj := NN.Layers[NN.Layers.Count - 2];
+    // start = end = +1 * hidden[0] (single hidden channel), no bias.
+    StartProj.Neurons[0].Weights.FData[0] := 1.0;
+    StartProj.Neurons[0].BiasWeight := 0;
+    EndProj.Neurons[0].Weights.FData[0] := 1.0;
+    EndProj.Neurons[0].BiasWeight := 0;
+    StartProj.FlushWeightCache();
+    EndProj.FlushWeightCache();
+    // Embedding row value = the token's logit. Make the word 'fox' the
+    // single highest-logit token; everything else low.
+    for i := 0 to V - 1 do Emb.Neurons[0].Weights.FData[i] := -5.0;
+    AnswerId := Tok.TokenToId('fox');
+    AssertTrue('fox in vocab', AnswerId >= 0);
+    Emb.Neurons[0].Weights.FData[AnswerId] := 9.0;
+    Emb.FlushWeightCache();
+
+    Pred := AnswerSpan(NN, Tok, 'what jumped', 'the quick brown fox',
+      StartChar, EndChar, Score, NoAns);
+    AssertEquals('extracted answer span', 'fox', Pred);
+    AssertTrue('start char inside context', StartChar >= 0);
+    AssertEquals('answer substring matches offsets', 'fox',
+      Copy('the quick brown fox', StartChar + 1, EndChar - StartChar));
+
+    // QAReport: one correct, one wrong-gold example -> EM 50, F1 50.
+    Rep := QAReport(NN, Tok,
+      ['what jumped', 'color'],
+      ['the quick brown fox', 'the quick brown fox'],
+      ['fox', 'red']);
+    AssertTrue('report mentions EM', Pos('EM:', Rep) > 0);
+    AssertTrue('report mentions F1', Pos('F1:', Rep) > 0);
+    AssertTrue('report mentions 2 examples', Pos('examples: 2', Rep) > 0);
+
+    // SQuAD normalization + token F1 primitives.
+    AssertEquals('normalize strips articles/punct/case',
+      'quick brown fox', NormalizeSquadAnswer('The Quick, Brown FOX!'));
+    AssertTrue('exact F1 = 1',
+      Abs(SquadTokenF1('the brown fox', 'a Brown Fox') - 1.0) < 1e-6);
+    AssertTrue('partial F1 in (0,1)',
+      (SquadTokenF1('brown fox dog', 'brown fox') > 0.5) and
+      (SquadTokenF1('brown fox dog', 'brown fox') < 1.0));
+    AssertTrue('disjoint F1 = 0',
+      SquadTokenF1('cat', 'dog') < 1e-6);
+  finally
+    NN.Free;
+    Tok.Free;
   end;
 end;
 
