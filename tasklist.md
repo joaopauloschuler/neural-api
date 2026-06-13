@@ -93,7 +93,23 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Import NFC tokenizer
+- [ ] GLM-4 importer (BuildGLM4FromSafeTensors, model_type "glm" /
+      "glm4", e.g. THUDM/glm-4-9b-chat-hf or the smaller zai-org/GLM-4
+      text checkpoints). This is NOT a near-duplicate of the existing
+      Llama-path importers: GLM-4 uses a sandwich-norm block
+      (post_self_attn_layernorm AFTER attention and post_mlp_layernorm
+      AFTER the MLP, in addition to the usual input/post-attention RMSNorm
+      — four norms per layer instead of two) plus PARTIAL rotary
+      (partial_rotary_factor = 0.5, only half the head dim rotated, reuse
+      the RotaryDims wiring proven on Phi-3 / GPT-NeoX) and a fused
+      qkv_proj with bias on q/k/v but NOT on o_proj. Wire the two extra
+      post-norms via the existing post-norm residual builders
+      (cf. OLMo-2 AddOutputNormResidual / [[olmo2-importer]]); fold
+      query_pre_attn scaling onto the q gains if present. Reuses GQA +
+      SwiGLU already on the Llama path. Verify against a pico fixture
+      (tools/make_pico_*_fixture.py recipe, [[pico-import-fixtures]]) and
+      logits parity against transformers in venv x. High value: GLM-4 is a
+      widely-used open bilingual model family with no current import path.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
