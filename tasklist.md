@@ -705,6 +705,15 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       TestSegmentMaskCrossDocAttentionIsZero (cross-doc attn exactly 0),
       TestSegmentMaskMatchesUnpackedBaseline (parity vs independent per-doc
       runs), TestSegmentMaskSaveLoad, TestSegmentIdsMarkDocumentBoundaries.
+- [ ] Segment-mask MHA-builder wiring follow-up (the SDPA-layer + packer half
+      landed above): thread an optional segment-id source through the
+      multi-head attention BUILDERS (AddMultiHeadSelfAttention and friends) so
+      packed-window training masks cross-document attention end-to-end, not just
+      at the bare TNNetScaledDotProductAttention layer. Each per-head SDPA in the
+      builder takes the same shared `pSegmentSource`; assert a packed two-doc MHA
+      stack matches the concatenation of independent per-document MHA runs (the
+      builder-level analogue of TestSegmentMaskMatchesUnpackedBaseline). KV-cache
+      incremental decode stays intentionally unmasked (single-stream = one doc).
 
 ## Tests / numerical-gradient audit
 
