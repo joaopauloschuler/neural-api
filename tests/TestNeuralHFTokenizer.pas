@@ -38,6 +38,8 @@ type
     procedure TestSentencePieceModelParity;
     procedure TestSplitQwen2ParityWithHF;
     procedure TestSplitCl100kParityWithHF;
+    procedure TestSplitDeepSeekParityWithHF;
+    procedure TestByteLevelNoRegexParityWithHF;
     procedure TestMetaspacePreTokenizerParityWithHF;
     procedure TestRejectsUnknownSplitPattern;
     procedure TestNFCComposesDecomposedInput;
@@ -322,6 +324,21 @@ end;
 procedure TTestNeuralHFTokenizer.TestSplitCl100kParityWithHF;
 begin
   RunParityBattery('split_cl100k');
+end;
+
+// DeepSeek-V2/V2-Lite multi-Split+Digits pre_tokenizer Sequence. Cases are
+// restricted to the classes SplitDeepSeekPieces reproduces exactly (ASCII
+// letters/digits/punct, whitespace incl tabs/CR/LF, and CJK).
+procedure TTestNeuralHFTokenizer.TestSplitDeepSeekParityWithHF;
+begin
+  RunParityBattery('split_deepseek');
+end;
+
+// STANDALONE ByteLevel(use_regex=false): the GPT-2 regex split must be
+// SKIPPED -- the whole segment is one chunk fed to the byte alphabet.
+procedure TTestNeuralHFTokenizer.TestByteLevelNoRegexParityWithHF;
+begin
+  RunParityBattery('bytelevel_noregex');
 end;
 
 // Mistral / legacy=false Llama style Metaspace PRE_TOKENIZER

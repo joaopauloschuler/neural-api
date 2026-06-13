@@ -228,16 +228,32 @@ rather than acted on.
       tokenizer.json source (TestLoadFromGGUF{Llama,Gpt2}RoundTrip,
       TestLoadFromGGUFRejectsUnsupportedModel in TestNeuralHFTokenizer.pas).
 - [ ] neuralhftokenizer.pas pre_tokenizer leftovers from the Split/Metaspace
-      batch: (a) a STANDALONE ByteLevel pre_tokenizer with use_regex=false
+      batch: ~~(a) a STANDALONE ByteLevel pre_tokenizer with use_regex=false
       silently applies the GPT-2 regex anyway (the flag is only honored
       implicitly inside the Sequence[Split, ByteLevel] path, which bypasses
-      ByteLevelPieces; parse use_regex and skip the regex split when false);
+      ByteLevelPieces; parse use_regex and skip the regex split when false)~~
+      DONE: FByteLevelUseRegex parsed; standalone ByteLevel(use_regex=false)
+      now feeds the whole segment as ONE chunk to the byte alphabet (no GPT-2
+      regex). Test TestByteLevelNoRegexParityWithHF + bytelevel_noregex
+      fixture group.
       (b) only the Qwen2 and Llama-3/cl100k Split pattern literals are
       recognized — the o200k (GPT-4o-family) and DeepSeek pattern strings
-      raise EHFTokenizerError; add them to the verbatim-match table with a
-      hand-written splitter variant — the DeepSeek family is now importable
-      (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap; add
-      o200k when a GPT-4o-family checkpoint matters. Test: per-pattern
+      raise EHFTokenizerError. ~~the DeepSeek family is now importable
+      (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap~~ DONE
+      for DeepSeek-V2/V2-Lite: the multi-Split+Digits Sequence is detected as
+      a WHOLE (MatchesDeepSeekSequence) and dispatched to SplitDeepSeekPieces
+      (a distinct splitter: \s?-prefixed letter/punct runs, separate CJK run,
+      individual digits, \s+$ trailing). Test TestSplitDeepSeekParityWithHF +
+      split_deepseek fixture. REMAINING sub-tasks: (i) o200k (GPT-4o-family)
+      Split pattern — add when a GPT-4o checkpoint matters; (ii) DeepSeek-V3
+      pre-tokenizer (different shape: \p{N}{1,3} + packed punct+letter Split,
+      NO Digits stage) — not matched by MatchesDeepSeekSequence, falls through
+      and raises; add a V3 variant when V3 is imported; (iii) non-ASCII Latin
+      parity for SplitDeepSeekPieces — the HF onig engine isolates some
+      precomposed Latin-1 letters that the \p{L} table groups, so exact byte
+      parity is only guaranteed over ASCII/digit/punct/whitespace/CJK (the
+      same approximation stance as the cl100k splitter; would need the exact
+      DeepSeek letter-class range table ported to Pascal). Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for

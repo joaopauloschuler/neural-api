@@ -163,9 +163,19 @@ type
       // pre-tokenizer / normalizer
       FByteLevel: boolean;        // ByteLevel pre-tokenizer present
       FAddPrefixSpace: boolean;
+      // ByteLevel use_regex: when false a STANDALONE ByteLevel pre_tokenizer
+      // does NOT apply the GPT-2 regex split -- the whole segment is one
+      // chunk fed straight to the byte-level alphabet. (Inside a
+      // Sequence[Split, ByteLevel] the upstream Split already did the
+      // splitting, so ByteLevel always has use_regex=false there.) Default
+      // true = legacy GPT-2 behavior.
+      FByteLevelUseRegex: boolean;
       // Split pre-tokenizer (Qwen2 / Llama-3 cl100k-style pattern)
       FSplitPreTok: boolean;
       FSplitDigitsMax: integer;   // 1 (Qwen2 \p{N}) or 3 (cl100k \p{N}{1,3})
+      // DeepSeek-V2/V3 multi-Split+Digits pre-tokenizer (a distinct splitter
+      // from the cl100k family -- see SplitDeepSeekPieces).
+      FDeepSeekPreTok: boolean;
       // Metaspace pre-tokenizer (Llama-2 / Mistral SentencePiece-BPE)
       FMetaspacePreTok: boolean;
       FMSReplacement: string;     // usually U+2581
@@ -208,6 +218,8 @@ type
         IsFirstSegment: boolean);
       procedure ByteLevelPieces(const Segment: string; Pieces: TStringList);
       procedure SplitCl100kPieces(const Segment: string;
+        Pieces: TStringList);
+      procedure SplitDeepSeekPieces(const Segment: string;
         Pieces: TStringList);
       function MapPieceToByteLevel(const Piece: string): TStringList;
       function FindAddedToken(const Text: string; Position: integer;
@@ -992,8 +1004,10 @@ begin
   FUniMinScore := 0;
   FByteLevel := false;
   FAddPrefixSpace := false;
+  FByteLevelUseRegex := true;
   FSplitPreTok := false;
   FSplitDigitsMax := 1;
+  FDeepSeekPreTok := false;
   FMetaspacePreTok := false;
   FMSReplacement := csMetaspace;
   FMSPrependScheme := 'always';
@@ -1187,6 +1201,54 @@ var
       raise EHFTokenizerError.Create('Unsupported normalizer type: ' + Kind);
   end;
 
+  // Returns the Split "pattern.Regex" string of a pre_tokenizer child, or ''
+  // when the child is not a Split or carries no Regex pattern.
+  function ChildRegex(Child: TJSONObject): string;
+  var
+    PatNode: TJSONData;
+  begin
+    Result := '';
+    if Child.Get('type', '') <> 'Split' then Exit;
+    PatNode := Child.Find('pattern');
+    if (PatNode <> nil) and (PatNode is TJSONObject) then
+      Result := TJSONObject(PatNode).Get('Regex', '');
+  end;
+
+  // Detects the DeepSeek-V2 / V2-Lite / V3 pre-tokenizer Sequence as a WHOLE.
+  // These ship several Split stages with huge explicit Unicode letter/punct/
+  // CJK ranges plus a Digits(individual) stage -- behaviorally a \s?-prefixed
+  // letter/number/punct/CJK/newline splitter with single-digit isolation,
+  // which SplitDeepSeekPieces reproduces. Matched by distinctive substrings of
+  // the shipped patterns (the literals span thousands of codepoints, so a
+  // verbatim multi-KB string constant is intentionally avoided).
+  function MatchesDeepSeekSequence(Arr: TJSONArray): boolean;
+  var
+    I: integer;
+    HasNL, HasLetters, HasDigits, HasByteLevel: boolean;
+    R, Kind2: string;
+  begin
+    Result := false;
+    HasNL := false; HasLetters := false; HasDigits := false;
+    HasByteLevel := false;
+    for I := 0 to Arr.Count - 1 do
+    begin
+      Kind2 := Arr.Objects[I].Get('type', '');
+      if (Kind2 = 'Digits') and Arr.Objects[I].Get('individual_digits', false)
+        then HasDigits := true;
+      if Kind2 = 'ByteLevel' then HasByteLevel := true;
+      R := ChildRegex(Arr.Objects[I]);
+      // The JSON loader unescapes "[\r\n]" to "[" + CR + LF + "]"; accept
+      // both the unescaped and the verbatim-backslash forms.
+      if (R = '[' + #13 + #10 + ']') or (R = '[\r\n]') then HasNL := true;
+      // the V2/V2-Lite/coder letter class starts with "\s?[A-Za-z" / "\s?\p{L}";
+      // V3 packs digits first then a CJK class then a punct+letter class.
+      if (Pos('\s?[A-Za-z', R) = 1) or (Pos('\s?\p{L}', R) = 1) then
+        HasLetters := true;
+    end;
+    // V2/V2-Lite/coder shape: [\r\n] + \s?letters + ... + Digits + ByteLevel.
+    Result := HasNL and HasLetters and HasDigits and HasByteLevel;
+  end;
+
   procedure AddPreTokenizer(PreObj: TJSONObject);
   var
     Kind, Pattern: string;
@@ -1198,6 +1260,20 @@ var
     if Kind = 'Sequence' then
     begin
       InnerArr := PreObj.Arrays['pretokenizers'];
+      // The DeepSeek-V2/V2-Lite/V3 pre-tokenizer is a Sequence of several
+      // Split stages + a Digits(individual) stage + ByteLevel(use_regex=
+      // false). It is NOT a single cl100k-style pattern, so it is detected
+      // as a WHOLE (by its distinctive Split-pattern set) and dispatched to
+      // the dedicated SplitDeepSeekPieces splitter rather than recursed
+      // into child-by-child.
+      if MatchesDeepSeekSequence(InnerArr) then
+      begin
+        FDeepSeekPreTok := true;
+        FByteLevel := true;
+        FByteLevelUseRegex := false;
+        FAddPrefixSpace := false;
+        Exit;
+      end;
       for InnerCnt := 0 to InnerArr.Count - 1 do
         AddPreTokenizer(InnerArr.Objects[InnerCnt]);
     end
@@ -1205,6 +1281,11 @@ var
     begin
       FByteLevel := true;
       FAddPrefixSpace := PreObj.Get('add_prefix_space', false);
+      // use_regex (default true): a standalone ByteLevel with use_regex=false
+      // skips the GPT-2 regex split (one chunk -> byte alphabet). When a
+      // Split pre-tokenizer already ran upstream, the ByteLevel's own
+      // use_regex is moot (FSplitPreTok/FDeepSeekPreTok take the split path).
+      FByteLevelUseRegex := PreObj.Get('use_regex', true);
     end
     else if Kind = 'BertPreTokenizer' then
       // whitespace split + isolated punctuation; keyed off FWordPiece in
@@ -2216,6 +2297,157 @@ begin
   end;
 end;
 
+// Splits a segment with the DeepSeek-V2 / V2-Lite pre-tokenizer Sequence,
+// which (unlike the cl100k family) is a chain of several Split stages plus a
+// Digits(individual) stage. Behaviorally, in left-to-right order:
+//   [\r\n]              -> every CR and LF is its OWN single-char piece
+//   \s?[\p{L}]+         -> optional ONE leading space + maximal LETTER run
+//                          (Latin/Greek/Cyrillic/... but NOT CJK)
+//   \s?[punct]+         -> optional ONE leading space + maximal PUNCT run
+//   [CJK]+              -> maximal CJK run (no leading-space prefix)
+//   Digits(individual)  -> every digit is its OWN single-char piece
+//   \s+$ / interior ws  -> a whitespace run with NO eligible following
+//                          letter/punct keeps the WHOLE run as one piece;
+//                          before a letter/punct the LAST space is peeled off
+//                          as that run's \s? prefix (the rest stay as one
+//                          piece).
+// Validated against HF `tokenizers` for ASCII text, digits, ASCII/fullwidth
+// punctuation, whitespace (incl. tabs/CR/LF) and CJK. NON-ASCII LETTERS use
+// the same \p{L} approximation as IsLetterCP (see unit header) -- the HF onig
+// engine isolates some precomposed Latin-1 letters that this table groups,
+// so exact parity is only guaranteed over the validated classes.
+procedure TNeuralHFTokenizer.SplitDeepSeekPieces(const Segment: string;
+  Pieces: TStringList);
+var
+  CPs: array of cardinal;
+  CPStr: array of string;
+  Total, Position, Idx, RunStart, RunEnd: integer;
+
+  function Collect(StartIdx, EndIdx: integer): string;
+  var
+    J: integer;
+  begin
+    Result := '';
+    for J := StartIdx to EndIdx do Result := Result + CPStr[J];
+  end;
+
+  function IsNL(CP: cardinal): boolean;
+  begin
+    Result := (CP = 10) or (CP = 13);
+  end;
+
+  // DeepSeek CJK class: U+0800..U+9FA5 and Hangul U+AC00..U+D7FF.
+  function IsCJK(CP: cardinal): boolean;
+  begin
+    Result := ((CP >= $800) and (CP <= $9FA5)) or
+      ((CP >= $AC00) and (CP <= $D7FF));
+  end;
+
+  // DeepSeek letter class (NOT CJK -- CJK is its own stage above).
+  function IsDSLetter(CP: cardinal): boolean;
+  begin
+    Result := IsLetterCP(CP) and (not IsCJK(CP));
+  end;
+
+  // \s but NOT CR/LF (those are isolated by the [\r\n] stage first).
+  function IsSpace(CP: cardinal): boolean;
+  begin
+    Result := IsWhitespaceCP(CP) and (not IsNL(CP));
+  end;
+
+  // punct class: everything that is not space, letter, digit, CJK, newline.
+  function IsPunct(CP: cardinal): boolean;
+  begin
+    Result := (not IsSpace(CP)) and (not IsNL(CP)) and
+      (not IsDSLetter(CP)) and (not IsNumberCP(CP)) and (not IsCJK(CP));
+  end;
+
+begin
+  // decode UTF-8 into codepoint arrays
+  SetLength(CPs, Length(Segment));
+  SetLength(CPStr, Length(Segment));
+  Total := 0;
+  Position := 1;
+  while Position <= Length(Segment) do
+  begin
+    RunStart := Position;
+    CPs[Total] := NextCodePoint(Segment, Position);
+    CPStr[Total] := Copy(Segment, RunStart, Position - RunStart);
+    Inc(Total);
+  end;
+  SetLength(CPs, Total);
+  SetLength(CPStr, Total);
+
+  Idx := 0;
+  while Idx < Total do
+  begin
+    // 1. [\r\n] : each CR / LF isolated
+    if IsNL(CPs[Idx]) then
+    begin
+      Pieces.Add(CPStr[Idx]);
+      Inc(Idx);
+    end
+    // 2. \s?[\p{L}]+  (optional ONE leading space glued to a letter run)
+    else if IsDSLetter(CPs[Idx]) or ((CPs[Idx] = 32) and (Idx + 1 < Total)
+      and IsDSLetter(CPs[Idx + 1])) then
+    begin
+      RunEnd := Idx;
+      if not IsDSLetter(CPs[Idx]) then Inc(RunEnd); // the optional space
+      while (RunEnd + 1 < Total) and IsDSLetter(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
+    end
+    // 3. \s?[punct]+  (optional ONE leading space glued to a punct run)
+    else if IsPunct(CPs[Idx]) or ((CPs[Idx] = 32) and (Idx + 1 < Total)
+      and IsPunct(CPs[Idx + 1])) then
+    begin
+      RunEnd := Idx;
+      if not IsPunct(CPs[Idx]) then Inc(RunEnd); // the optional space
+      while (RunEnd + 1 < Total) and IsPunct(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
+    end
+    // 4. [CJK]+  (no leading-space prefix)
+    else if IsCJK(CPs[Idx]) then
+    begin
+      RunEnd := Idx;
+      while (RunEnd + 1 < Total) and IsCJK(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
+    end
+    // 5. Digits(individual) : each digit isolated
+    else if IsNumberCP(CPs[Idx]) then
+    begin
+      Pieces.Add(CPStr[Idx]);
+      Inc(Idx);
+    end
+    else
+    begin
+      // whitespace run (no CR/LF inside -- those were isolated above). The
+      // run extends to the next CR/LF or end. If it is followed by a letter
+      // or punct, the LAST space becomes that run's \s? prefix; otherwise
+      // (digit / CJK / end) the whole run is one piece.
+      RunEnd := Idx;
+      while (RunEnd + 1 < Total) and IsSpace(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      if (RunEnd + 1 < Total) and (RunEnd > Idx) and
+        (IsDSLetter(CPs[RunEnd + 1]) or IsPunct(CPs[RunEnd + 1])) then
+      begin
+        Pieces.Add(Collect(Idx, RunEnd - 1));
+        Idx := RunEnd; // last space attaches to the following run
+      end
+      else
+      begin
+        Pieces.Add(Collect(Idx, RunEnd));
+        Idx := RunEnd + 1;
+      end;
+    end;
+  end;
+end;
+
 // Maps a raw piece to its byte-level alphabet symbols (one mapped
 // codepoint per input byte). Caller frees the result.
 function TNeuralHFTokenizer.MapPieceToByteLevel(
@@ -2602,6 +2834,26 @@ begin
       Pieces.Free;
     end;
   end
+  else if FDeepSeekPreTok then
+  begin
+    // DeepSeek-V2/V2-Lite multi-Split+Digits Sequence, then byte-level
+    // alphabet + BPE per piece (NO GPT-2 regex pass).
+    Pieces := TStringList.Create();
+    try
+      SplitDeepSeekPieces(Seg, Pieces);
+      for Cnt := 0 to Pieces.Count - 1 do
+      begin
+        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
+        try
+          BPEWord(Symbols, Ids);
+        finally
+          Symbols.Free;
+        end;
+      end;
+    finally
+      Pieces.Free;
+    end;
+  end
   else if FSplitPreTok then
   begin
     // Sequence[Split(cl100k-style), ByteLevel(use_regex=false)]:
@@ -2626,11 +2878,17 @@ begin
   else if FByteLevel then
   begin
     Normalized := Seg;
-    if FAddPrefixSpace and (Normalized[1] <> ' ') then
+    if FAddPrefixSpace and (Length(Normalized) > 0) and
+      (Normalized[1] <> ' ') then
       Normalized := ' ' + Normalized;
     Pieces := TStringList.Create();
     try
-      ByteLevelPieces(Normalized, Pieces);
+      if FByteLevelUseRegex then
+        ByteLevelPieces(Normalized, Pieces)
+      else if Length(Normalized) > 0 then
+        // use_regex=false: NO GPT-2 regex split -- the whole segment is a
+        // single chunk fed straight to the byte-level alphabet + BPE.
+        Pieces.Add(Normalized);
       for Cnt := 0 to Pieces.Count - 1 do
       begin
         Symbols := MapPieceToByteLevel(Pieces[Cnt]);
