@@ -40,6 +40,9 @@ type
     procedure TestSplitCl100kParityWithHF;
     procedure TestMetaspacePreTokenizerParityWithHF;
     procedure TestRejectsUnknownSplitPattern;
+    procedure TestNFCComposesDecomposedInput;
+    procedure TestNFDDecomposesPrecomposedInput;
+    procedure TestNFCNormalizerFoldsTokenIds;
     procedure TestWordPieceSpecialTokenIds;
     procedure TestByteLevelSpecialTokenIds;
     procedure TestMetaspaceSpecialTokenIds;
@@ -349,6 +352,104 @@ begin
       on E: EHFTokenizerError do Raised := true;
     end;
     AssertTrue('unknown Split pattern must raise EHFTokenizerError', Raised);
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
+end;
+
+// Canonical NFC: pre-DECOMPOSED input (base + combining mark) must compose
+// to the PRECOMPOSED single codepoint, byte-identical to precomposed UTF-8.
+// Also pins canonical ordering of stacked marks and Hangul L+V+T composition.
+procedure TTestNeuralHFTokenizer.TestNFCComposesDecomposedInput;
+var
+  eAcuteD, aDiaerD, qStack, hangulD: string;
+begin
+  // 'e' + U+0301 COMBINING ACUTE  ->  U+00E9 'e' (C3 A9)
+  eAcuteD := 'e' + #$CC#$81;
+  AssertEquals('NFC e+0301 -> U+00E9 bytes', #$C3#$A9,
+    TNeuralHFTokenizer.NormalizeUnicodeText(eAcuteD, True));
+  // 'a' + U+0308 COMBINING DIAERESIS  ->  U+00E4 'a' (C3 A4)
+  aDiaerD := 'a' + #$CC#$88;
+  AssertEquals('NFC a+0308 -> U+00E4 bytes', #$C3#$A4,
+    TNeuralHFTokenizer.NormalizeUnicodeText(aDiaerD, True));
+  // Already-precomposed input is idempotent under NFC.
+  AssertEquals('NFC idempotent on U+00E9', #$C3#$A9,
+    TNeuralHFTokenizer.NormalizeUnicodeText(#$C3#$A9, True));
+  // Canonical ordering: q + U+0301(ccc230) + U+0323(ccc220). The lower class
+  // U+0323 must be reordered BEFORE U+0301; neither composes with q, so the
+  // NFC result is q U+0323 U+0301 = 71 CC A3 CC 81.
+  qStack := 'q' + #$CC#$81 + #$CC#$A3;
+  AssertEquals('NFC canonical-orders stacked marks',
+    'q' + #$CC#$A3 + #$CC#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText(qStack, True));
+  // Hangul algorithmic composition: U+1100 U+1161 U+11A8 -> U+AC01 (EA B0 81).
+  hangulD := #$E1#$84#$80 + #$E1#$85#$A1 + #$E1#$86#$A8;
+  AssertEquals('NFC composes Hangul jamo to syllable', #$EA#$B0#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText(hangulD, True));
+end;
+
+// Canonical NFD: PRECOMPOSED input must decompose to base + combining mark(s),
+// byte-identical to the expected decomposed UTF-8. Hangul decomposes via the
+// algorithmic S->L/V/T arithmetic.
+procedure TTestNeuralHFTokenizer.TestNFDDecomposesPrecomposedInput;
+begin
+  // U+00E9 'e'  ->  'e' + U+0301  (65 CC 81)
+  AssertEquals('NFD U+00E9 -> e+0301', 'e' + #$CC#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText(#$C3#$A9, False));
+  // U+00E4 'a'  ->  'a' + U+0308  (61 CC 88)
+  AssertEquals('NFD U+00E4 -> a+0308', 'a' + #$CC#$88,
+    TNeuralHFTokenizer.NormalizeUnicodeText(#$C3#$A4, False));
+  // Already-decomposed input is idempotent under NFD.
+  AssertEquals('NFD idempotent on e+0301', 'e' + #$CC#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText('e' + #$CC#$81, False));
+  // Hangul U+AC01 -> U+1100 U+1161 U+11A8.
+  AssertEquals('NFD decomposes Hangul syllable',
+    #$E1#$84#$80 + #$E1#$85#$A1 + #$E1#$86#$A8,
+    TNeuralHFTokenizer.NormalizeUnicodeText(#$EA#$B0#$81, False));
+end;
+
+// End-to-end: a tokenizer carrying a bare {"type":"NFC"} normalizer (Qwen2/3
+// style) must fold a pre-decomposed string to the SAME token ids as the
+// precomposed string. A byte-level BPE vocab over the relevant bytes is built
+// inline so encoding exercises the real normalize -> pre-tokenize -> BPE path.
+procedure TTestNeuralHFTokenizer.TestNFCNormalizerFoldsTokenIds;
+var
+  Tok: TNeuralHFTokenizer;
+  TempFile: string;
+  SL: TStringList;
+  IdsD, IdsC: TNeuralIntegerArray;
+  Cnt: integer;
+begin
+  TempFile := GetTempDir(true) + 'nfc_bytelevel_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    // Minimal byte-level BPE: vocab maps the GPT-2 byte-alphabet chars for
+    // the UTF-8 bytes of 'é' precomposed (C3 A9) and decomposed (65 CC 81),
+    // no merges, with an NFC normalizer. After NFC both inputs become C3 A9.
+    // GPT-2 byte alphabet (bytes_to_unicode): 0x65->U+0065 'e',
+    // 0xC3->U+00C3, 0xA9->U+00A9, 0xCC->U+00CC, 0x81->U+0123. After NFC both
+    // 'e'+U+0301 and U+00E9 become bytes C3 A9 -> chars U+00C3,U+00A9.
+    SL.Text :=
+      '{"normalizer": {"type": "NFC"},' +
+      ' "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},' +
+      ' "model": {"type": "BPE", "vocab":' +
+      ' {"e": 0, ' + '"' + #$C3#$83 + '": 1, "' + #$C2#$A9 + '": 2,' +
+      ' "' + #$C3#$8C + '": 3, "' + #$C4#$A3 + '": 4}, "merges": []}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    // decomposed 'e'+U+0301 and precomposed U+00E9 must tokenize identically
+    IdsD := Tok.Encode('e' + #$CC#$81);
+    IdsC := Tok.Encode(#$C3#$A9);
+    AssertEquals('NFC folds id count', Length(IdsC), Length(IdsD));
+    for Cnt := 0 to High(IdsC) do
+      AssertEquals('NFC folds id[' + IntToStr(Cnt) + ']', IdsC[Cnt], IdsD[Cnt]);
+    // and both are the precomposed byte ids C3 A9 -> tokens 1,2
+    AssertEquals('precomposed yields 2 byte ids', 2, Length(IdsC));
+    AssertEquals('byte C3 -> id 1', 1, IdsC[0]);
+    AssertEquals('byte A9 -> id 2', 2, IdsC[1]);
   finally
     Tok.Free;
     SL.Free;

@@ -169,6 +169,11 @@ type
       FMSReplacement: string;     // usually U+2581
       FMSPrependScheme: string;   // 'always' | 'first' | 'never'
       FMSSplit: boolean;          // split before each replacement char
+      // Unicode normalization form to apply to input before everything else.
+      // '' = none; 'NFC'/'NFD' = real canonical normalization; 'NFKC'/'NFKD'
+      // are accepted but treated as their canonical counterpart (compat
+      // mappings not implemented -- see UnicodeNormalize).
+      FNormUnicodeForm: string;
       FNormPrepend: string;       // Prepend normalizer content ('' = none)
       FNormReplaceFrom: array of string; // Replace normalizers, in order
       FNormReplaceTo: array of string;
@@ -273,6 +278,13 @@ type
         SkipSpecialTokens: boolean = true): string; overload;
       function DecodeToken(Id: integer): string;
 
+      // Canonical Unicode normalization of UTF-8 text (NFC if Compose, else
+      // NFD). Exposed for testing and reuse; the encode path applies the
+      // normalizer declared in the tokenizer.json automatically. Compatibility
+      // forms (NFKC/NFKD) are NOT implemented (canonical only).
+      class function NormalizeUnicodeText(const Text: string;
+        Compose: boolean): string;
+
       function GetVocabSize(): integer;
       function TokenToId(const Token: string): integer; // -1 if absent
       function IdToToken(Id: integer): string;
@@ -324,6 +336,14 @@ const
     '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|' +
     '\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
 
+// Compact CANONICAL Unicode tables (decomposition, composition, combining
+// class) backing the NFD/NFC normalizers below. AUTO-GENERATED from Python
+// unicodedata by tools/gen_nfc_tables.py; regenerate with
+//   /home/bpsa/x/bin/python tools/gen_nfc_tables.py neural/neuralnfctables.inc
+// Hangul is handled algorithmically (NOT tabled); NFKC/NFKD compatibility
+// forms are NOT covered (see UnicodeNormalize).
+{$include neuralnfctables.inc}
+
 { ---------------------------------------------------------------- }
 { UTF-8 helpers                                                     }
 { ---------------------------------------------------------------- }
@@ -363,6 +383,237 @@ begin
   else
     Result := Chr($F0 or (CP shr 18)) + Chr($80 or ((CP shr 12) and $3F)) +
       Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F));
+end;
+
+{ ---------------------------------------------------------------- }
+{ Unicode canonical normalization (NFD / NFC)                       }
+{                                                                   }
+{ Real canonical decomposition + canonical ordering (NFD) and       }
+{ canonical composition (NFC), driven by the compact tables in      }
+{ neuralnfctables.inc plus the algorithmic Hangul L/V/T arithmetic. }
+{ Coded by Claude (AI).                                             }
+{ ---------------------------------------------------------------- }
+
+const
+  cHangulSBase = $AC00;
+  cHangulLBase = $1100;
+  cHangulVBase = $1161;
+  cHangulTBase = $11A7;
+  cHangulLCount = 19;
+  cHangulVCount = 21;
+  cHangulTCount = 28;
+  cHangulNCount = cHangulVCount * cHangulTCount; // 588
+  cHangulSCount = cHangulLCount * cHangulNCount; // 11172
+
+// Canonical_Combining_Class for CP (0 when unlisted). Binary search.
+function NFCCombiningClass(CP: cardinal): integer;
+var
+  Lo, Hi, Mid: integer;
+begin
+  Lo := 0;
+  Hi := cNFCCombClassCount - 1;
+  while Lo <= Hi do
+  begin
+    Mid := (Lo + Hi) div 2;
+    if cNFCCombClass[Mid][0] = CP then Exit(integer(cNFCCombClass[Mid][1]))
+    else if cNFCCombClass[Mid][0] < CP then Lo := Mid + 1
+    else Hi := Mid - 1;
+  end;
+  Result := 0;
+end;
+
+// One-step canonical decomposition of CP. Returns True and fills A (and B,
+// or 0 for a singleton) when CP has a tabled canonical decomposition.
+function NFCDecomposeStep(CP: cardinal; out A, B: cardinal): boolean;
+var
+  Lo, Hi, Mid: integer;
+begin
+  Lo := 0;
+  Hi := cNFCDecompCount - 1;
+  while Lo <= Hi do
+  begin
+    Mid := (Lo + Hi) div 2;
+    if cNFCDecomp[Mid][0] = CP then
+    begin
+      A := cNFCDecomp[Mid][1];
+      B := cNFCDecomp[Mid][2];
+      Exit(True);
+    end
+    else if cNFCDecomp[Mid][0] < CP then Lo := Mid + 1
+    else Hi := Mid - 1;
+  end;
+  Result := False;
+end;
+
+// Canonical composition of a starter A with following char B. Returns the
+// composite CP or 0 when (A,B) does not canonically compose. Hangul L+V and
+// LV+T compositions are handled algorithmically.
+function NFCComposePair(A, B: cardinal): cardinal;
+var
+  Lo, Hi, Mid: integer;
+  LIndex, VIndex, TIndex, SIndex: integer;
+begin
+  // Hangul: L + V
+  if (A >= cHangulLBase) and (A < cHangulLBase + cHangulLCount) and
+     (B >= cHangulVBase) and (B < cHangulVBase + cHangulVCount) then
+  begin
+    LIndex := integer(A) - cHangulLBase;
+    VIndex := integer(B) - cHangulVBase;
+    Exit(cardinal(cHangulSBase + (LIndex * cHangulVCount + VIndex) * cHangulTCount));
+  end;
+  // Hangul: LV + T
+  if (A >= cHangulSBase) and (A < cHangulSBase + cHangulSCount) and
+     (((integer(A) - cHangulSBase) mod cHangulTCount) = 0) and
+     (B > cHangulTBase) and (B < cHangulTBase + cHangulTCount) then
+  begin
+    SIndex := integer(A) - cHangulSBase;
+    TIndex := integer(B) - cHangulTBase;
+    Exit(cardinal(integer(A) + TIndex));
+  end;
+  Lo := 0;
+  Hi := cNFCComposeCount - 1;
+  while Lo <= Hi do
+  begin
+    Mid := (Lo + Hi) div 2;
+    if cNFCCompose[Mid][0] = A then
+    begin
+      if cNFCCompose[Mid][1] = B then Exit(cNFCCompose[Mid][2])
+      else if cNFCCompose[Mid][1] < B then Lo := Mid + 1
+      else Hi := Mid - 1;
+    end
+    else if cNFCCompose[Mid][0] < A then Lo := Mid + 1
+    else Hi := Mid - 1;
+  end;
+  Result := 0;
+end;
+
+// Recursively decompose CP, appending resulting codepoints to Buf (1-based
+// dynamic array; Len is the live length). Hangul is decomposed
+// algorithmically.
+procedure NFCDecomposeRec(CP: cardinal; var Buf: array of cardinal;
+  var Len: integer);
+var
+  A, B: cardinal;
+  SIndex, LIndex, VIndex, TIndex: integer;
+begin
+  if (CP >= cHangulSBase) and (CP < cHangulSBase + cHangulSCount) then
+  begin
+    SIndex := integer(CP) - cHangulSBase;
+    LIndex := SIndex div cHangulNCount;
+    VIndex := (SIndex mod cHangulNCount) div cHangulTCount;
+    TIndex := SIndex mod cHangulTCount;
+    Buf[Len] := cardinal(cHangulLBase + LIndex); Inc(Len);
+    Buf[Len] := cardinal(cHangulVBase + VIndex); Inc(Len);
+    if TIndex > 0 then
+    begin
+      Buf[Len] := cardinal(cHangulTBase + TIndex); Inc(Len);
+    end;
+    Exit;
+  end;
+  if NFCDecomposeStep(CP, A, B) then
+  begin
+    NFCDecomposeRec(A, Buf, Len);
+    if B <> 0 then NFCDecomposeRec(B, Buf, Len);
+  end
+  else
+  begin
+    Buf[Len] := CP; Inc(Len);
+  end;
+end;
+
+// Canonical ordering: stable sort runs of combining marks (ccc<>0) by
+// combining class (insertion sort on the ccc key is stable and exact).
+procedure NFCCanonicalOrder(var Buf: array of cardinal; Len: integer);
+var
+  I, CCI, CCPrev: integer;
+  Tmp: cardinal;
+begin
+  I := 1;
+  while I < Len do
+  begin
+    CCI := NFCCombiningClass(Buf[I]);
+    if CCI <> 0 then
+    begin
+      CCPrev := NFCCombiningClass(Buf[I - 1]);
+      if (CCPrev <> 0) and (CCPrev > CCI) then
+      begin
+        Tmp := Buf[I];
+        Buf[I] := Buf[I - 1];
+        Buf[I - 1] := Tmp;
+        if I > 1 then begin Dec(I); continue; end;
+      end;
+    end;
+    Inc(I);
+  end;
+end;
+
+// Returns S normalized to NFD (Compose=False) or NFC (Compose=True). Input
+// and output are UTF-8. Pure canonical algorithm; compatibility (NFKD/NFKC)
+// forms are NOT applied here.
+function UnicodeNormalize(const S: string; Compose: boolean): string;
+var
+  Buf: array of cardinal;
+  Len, Position, CP, OutLen: integer;
+  StarterPos: integer;
+  StarterCC, CC, Composite: integer;
+  I: integer;
+begin
+  if S = '' then Exit('');
+  // Worst-case canonical expansion is small; allocate generously
+  // (a few codepoints out per input byte covers every canonical case).
+  SetLength(Buf, Length(S) * 4 + 8);
+  Len := 0;
+  Position := 1;
+  while Position <= Length(S) do
+  begin
+    CP := integer(NextCodePoint(S, Position));
+    NFCDecomposeRec(cardinal(CP), Buf, Len);
+  end;
+  NFCCanonicalOrder(Buf, Len);
+
+  if Compose then
+  begin
+    // Canonical composition (Unicode 3.11 algorithm). StarterPos tracks the
+    // last starter we may still compose onto; StarterCC is the ccc of the
+    // most recent character between the starter and the candidate.
+    OutLen := 0;
+    StarterPos := -1;
+    StarterCC := 0;
+    for I := 0 to Len - 1 do
+    begin
+      CC := NFCCombiningClass(Buf[I]);
+      // Candidate Buf[I] may compose onto the starter unless it is BLOCKED:
+      // it is blocked when some character sits between the starter and the
+      // candidate whose ccc is >= the candidate's ccc (StarterCC tracks the
+      // max ccc seen since the starter). A candidate immediately after the
+      // starter (StarterCC = 0) is never blocked.
+      if (StarterPos >= 0) and ((StarterCC < CC) or
+         ((StarterCC = 0) and (CC = 0))) then
+      begin
+        Composite := integer(NFCComposePair(Buf[StarterPos], Buf[I]));
+        if (Composite <> 0) and (NFCCombiningClass(cardinal(Composite)) = 0)
+        then
+        begin
+          Buf[StarterPos] := cardinal(Composite);
+          continue; // candidate consumed; keep same starter
+        end;
+      end;
+      if CC = 0 then
+      begin
+        StarterPos := OutLen;
+        StarterCC := 0;
+      end
+      else
+        StarterCC := CC;
+      Buf[OutLen] := Buf[I];
+      Inc(OutLen);
+    end;
+    Len := OutLen;
+  end;
+
+  Result := '';
+  for I := 0 to Len - 1 do
+    Result := Result + CodePointToUTF8(Buf[I]);
 end;
 
 { ---------------------------------------------------------------- }
@@ -710,6 +961,7 @@ begin
   FBertHandleChinese := false;
   FDecWordPieceCleanup := false;
   FNormPrepend := '';
+  FNormUnicodeForm := '';
   FDecStripLeft := 0;
   FUnkId := -1;
   FBosId := -1;
@@ -870,23 +1122,21 @@ var
       else
         FBertStripAccents := Node.AsBoolean;
     end
-    else if (Kind = 'NFC') or (Kind = 'NFD') or (Kind = 'NFKC') or
-            (Kind = 'NFKD') then
-      // Unicode normalization forms (Qwen2/3 ship a bare NFC normalizer).
-      // Applying them faithfully would need the full canonical
-      // composition/decomposition tables; we treat them as no-ops instead
-      // (the SAME approximation stance taken for NFKC/precompiled_charsmap on
-      // the Unigram / SentencePiece path). Real-world input -- including
-      // terminal chat and HF-emitted text -- is already in NFC, so this is a
-      // no-op in practice; only pre-decomposed input would tokenize slightly
-      // differently.
-      //
-      // TODO: implement REAL Unicode normalization here instead of stubbing
-      // it out. Needs the canonical-decomposition (NFD) + combining-class
-      // ordering + canonical-composition (NFC) tables (and the compatibility
-      // mappings for NFKC/NFKD), vendored compactly or generated from
-      // UnicodeData.txt, plus an HF parity test on combining-mark input.
-      // Tracked in tasklist.md ("Proper Unicode NFC normalization").
+    else if (Kind = 'NFC') or (Kind = 'NFD') then
+      // REAL canonical Unicode normalization (Qwen2/3 ship a bare NFC
+      // normalizer). Applied to input by UnicodeNormalize before any
+      // pre-tokenization, driven by the compact canonical tables in
+      // neuralnfctables.inc + algorithmic Hangul. Last writer wins inside a
+      // Sequence (HF applies them in order, but canonical NFC/NFD are
+      // idempotent so the final form is what matters).
+      FNormUnicodeForm := Kind
+    else if (Kind = 'NFKC') or (Kind = 'NFKD') then
+      // COMPATIBILITY normalization. The compatibility decomposition mappings
+      // are NOT vendored, so we approximate NFKC/NFKD by their CANONICAL
+      // counterpart (NFC/NFD): canonical composition/decomposition + ordering
+      // are applied, but compatibility folds (e.g. ligatures, full/half-width
+      // forms, superscripts) are NOT. Remaining work tracked in tasklist.md.
+      FNormUnicodeForm := Copy(Kind, 1, 2) + Copy(Kind, 4, 1) // NFKC->NFC, NFKD->NFD
     else
       raise EHFTokenizerError.Create('Unsupported normalizer type: ' + Kind);
   end;
@@ -2251,6 +2501,7 @@ var
   Pieces, Symbols: TStringList;
   Cnt, Position, RunStart, PieceStart: integer;
   Normalized: string;
+  Seg: string;
 
   // BPEs Normalized[PieceFrom..PieceTo] (1-based bytes) over codepoints.
   procedure BPECodePoints(PieceFrom, PieceTo: integer);
@@ -2280,11 +2531,21 @@ var
 
 begin
   if Segment = '' then exit;
+  // Unicode normalization runs FIRST, before any pre-tokenization, matching
+  // HF where the normalizer precedes the pre_tokenizer. NFC/NFD are real
+  // canonical normalization; NFKC/NFKD were folded to NFC/NFD in
+  // AddNormalizer (compatibility mappings unimplemented).
+  if FNormUnicodeForm = 'NFC' then
+    Seg := UnicodeNormalize(Segment, True)
+  else if FNormUnicodeForm = 'NFD' then
+    Seg := UnicodeNormalize(Segment, False)
+  else
+    Seg := Segment;
   if FWordPiece then
   begin
     Pieces := TStringList.Create();
     try
-      BertPieces(BertNormalize(Segment), Pieces);
+      BertPieces(BertNormalize(Seg), Pieces);
       for Cnt := 0 to Pieces.Count - 1 do
         WordPieceWord(Pieces[Cnt], Ids);
     finally
@@ -2298,7 +2559,7 @@ begin
     // (NO GPT-2 regex pass).
     Pieces := TStringList.Create();
     try
-      SplitCl100kPieces(Segment, Pieces);
+      SplitCl100kPieces(Seg, Pieces);
       for Cnt := 0 to Pieces.Count - 1 do
       begin
         Symbols := MapPieceToByteLevel(Pieces[Cnt]);
@@ -2314,7 +2575,7 @@ begin
   end
   else if FByteLevel then
   begin
-    Normalized := Segment;
+    Normalized := Seg;
     if FAddPrefixSpace and (Normalized[1] <> ' ') then
       Normalized := ' ' + Normalized;
     Pieces := TStringList.Create();
@@ -2337,7 +2598,7 @@ begin
   begin
     // metaspace family: normalizer chain first (Prepend/Replace --
     // Llama-2 style files do metaspace HERE and have no pre_tokenizer)
-    Normalized := FNormPrepend + Segment;
+    Normalized := FNormPrepend + Seg;
     for Cnt := 0 to High(FNormReplaceFrom) do
       Normalized := StringReplace(Normalized, FNormReplaceFrom[Cnt],
         FNormReplaceTo[Cnt], [rfReplaceAll]);
@@ -2376,6 +2637,12 @@ begin
     // whole-segment BPE over codepoints
     BPECodePoints(1, Length(Normalized));
   end;
+end;
+
+class function TNeuralHFTokenizer.NormalizeUnicodeText(const Text: string;
+  Compose: boolean): string;
+begin
+  Result := UnicodeNormalize(Text, Compose);
 end;
 
 procedure TNeuralHFTokenizer.Encode(const Text: string; Ids: TIntegerList);
