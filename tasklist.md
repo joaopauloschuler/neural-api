@@ -218,13 +218,6 @@ rather than acted on.
       compares logits bit-for-bit. Scope v1 to the Llama family (the
       best-covered importer path); document other architectures as
       out-of-scope, same as the ONNX-export task.
-- [ ] Knowledge distillation trainer (transformers DistillationTrainer /
-      classic Hinton KD): temperature-softened KL between a frozen teacher's
-      logits and the student's, blended with the hard-label loss
-      (L = alpha*CE(hard) + (1-alpha)*T^2*KL(soft)). The DPO trainer already
-      holds two TNNets simultaneously, so the two-model plumbing exists.
-      Killer combo with the Llama/GPT-2 importers: distill an imported
-      pretrained teacher into a small Pascal-trained student.
 - [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.

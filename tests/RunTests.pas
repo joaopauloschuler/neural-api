@@ -12,7 +12,7 @@ uses
   TestNeuralFit, TestNeuralVolumePairs, TestNeuralSamplers,
   TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical,
   TestNeuralScheduler, TestNeuralDecode, TestNeuralPretrained,
-  TestNeuralDPO, TestNeuralNLPMetrics, TestNeuralPacking,
+  TestNeuralDPO, TestNeuralKD, TestNeuralNLPMetrics, TestNeuralPacking,
   TestNeuralMaskedLM,
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy;
 
