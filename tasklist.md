@@ -130,12 +130,16 @@ rather than acted on.
       int8 matmul kernels (AVX2 maddubs / dot-product paths) so quantized
       layers stop paying the per-forward dequantize cost; today the int8
       win is RAM only — compute still runs the FP32 kernels.
-- [ ] Quantized inference follow-up: thread pQuantizeInt8 through the
+- [X] Quantized inference follow-up: thread pQuantizeInt8 through the
       remaining importer entry points that do NOT ride
       BuildLlamaFromSafeTensorsWithConfig (GPT-Neo/NeoX/J, Phi, BERT family,
       BLOOM, RWKV, Mamba, T5/Marian, DeepSeek-V2 MoE) — mechanical: same
       construction-sweep + loader-refill pattern; loaders already
-      auto-dequantize (EnsureWritableImportWeights).
+      auto-dequantize (EnsureWritableImportWeights). (Landed: all of the
+      above + ModernBERT, the seq-cls wrappers, the Mistral/Qwen/Gemma/
+      Phi-3 wrapper chain and BuildFromPretrained; 12 pico drift tests
+      gated at 5e-2 relative. Whisper and CLIP remain FP32-only — wire
+      them if int8 audio/vision import is ever needed.)
 - [ ] Quantized inference follow-up: GPTQ/AWQ-style calibrated quantization
       (error-compensating rounding / activation-aware scale search) and
       4-bit (int4 pairs packed per byte, group-wise scales); also quantized

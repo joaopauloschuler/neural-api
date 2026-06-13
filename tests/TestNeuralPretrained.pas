@@ -73,6 +73,22 @@ type
     procedure AssertT5ParityWithFixture(EncoderNet, DecoderNet: TNNet;
       const FixtureFileName: string; EncSeqLen, DecSeqLen, DModel,
       Vocab: integer);
+    // Shared int8 weight-only drift gate for the importer families: every
+    // quantized layer in NNQ must really hold int8 storage (FP32 rows
+    // released, >= MinQuantLayers of them), then both nets are driven with
+    // 3 deterministic token sequences and max |out diff| is gated RELATIVE
+    // to the largest FP32 output magnitude (MaxRelDrift; see
+    // TestInt8QuantizedGPT2LogitDrift for why pico widths overstate the
+    // drift of real checkpoints). TwoChannelInput=true feeds (SeqLen,1,2)
+    // token|token-type volumes (the BERT family convention, types all 0).
+    procedure AssertInt8DriftPair(const FamilyName: string;
+      NNFP32, NNQ: TNNet; SeqLen, VocabRange, MinQuantLayers: integer;
+      MaxRelDrift: double; TwoChannelInput: boolean);
+    // Same gate for the two-net encoder-decoder importers (T5/Marian):
+    // counts quantized layers across BOTH nets and compares RunT5 logits.
+    procedure AssertInt8DriftSeq2Seq(const FamilyName: string;
+      EncF, DecF, EncQ, DecQ: TNNet; EncSeqLen, DecSeqLen, VocabRange,
+      MinQuantLayers: integer; MaxRelDrift: double);
   published
     procedure TestTokenLayerNormForwardAndSaveLoad;
     procedure TestLearnedPositionalEmbeddingForwardAndSaveLoad;
@@ -97,6 +113,18 @@ type
     procedure TestInt8QuantizeRoundTripAndForward;
     procedure TestInt8QuantizedGPT2LogitDrift;
     procedure TestInt8QuantizedLlamaLogitDrift;
+    procedure TestInt8QuantizedGPTNeoLogitDrift;
+    procedure TestInt8QuantizedGPTNeoXLogitDrift;
+    procedure TestInt8QuantizedGPTJLogitDrift;
+    procedure TestInt8QuantizedPhiLogitDrift;
+    procedure TestInt8QuantizedBertHiddenDrift;
+    procedure TestInt8QuantizedBloomLogitDrift;
+    procedure TestInt8QuantizedRWKVLogitDrift;
+    procedure TestInt8QuantizedMambaLogitDrift;
+    procedure TestInt8QuantizedModernBertHiddenDrift;
+    procedure TestInt8QuantizedDeepSeekV2LogitDrift;
+    procedure TestInt8QuantizedT5LogitDrift;
+    procedure TestInt8QuantizedMarianLogitDrift;
     procedure TestTokenRMSNormForwardAndSaveLoad;
     procedure TestRotaryHalfPermutationMatchesHFRotateHalf;
     procedure TestSwiGLUMatchesLlamaMLPGating;
@@ -1724,6 +1752,463 @@ begin
     Input.Free;
     NNQ.Free;
     NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.AssertInt8DriftPair(const FamilyName: string;
+  NNFP32, NNQ: TNNet; SeqLen, VocabRange, MinQuantLayers: integer;
+  MaxRelDrift: double; TwoChannelInput: boolean);
+var
+  Input, OutF, OutQ: TNNetVolume;
+  i, s, QuantLayers: integer;
+  MaxDiff, MaxAbsOut: double;
+  CW: TNNetLayerConcatedWeights;
+begin
+  Input := TNNetVolume.Create;
+  OutF := TNNetVolume.Create;
+  OutQ := TNNetVolume.Create;
+  try
+    // Every quantized layer must really be in int8 storage.
+    QuantLayers := 0;
+    for i := 0 to NNQ.Layers.Count - 1 do
+      if NNQ.Layers[i] is TNNetLayerConcatedWeights then
+      begin
+        CW := TNNetLayerConcatedWeights(NNQ.Layers[i]);
+        if CW.WeightsQuantizedInt8 then
+        begin
+          Inc(QuantLayers);
+          AssertEquals(FamilyName + ': FP32 weights released in layer ' +
+            IntToStr(i), 1, CW.Neurons[0].Weights.Size);
+          AssertTrue(FamilyName + ': int8 container non-empty in layer ' +
+            IntToStr(i), CW.Int8QuantizedSizeBytes() > 0);
+        end;
+      end;
+    AssertTrue(FamilyName + ': expected >= ' + IntToStr(MinQuantLayers) +
+      ' quantized layers, got ' + IntToStr(QuantLayers),
+      QuantLayers >= MinQuantLayers);
+    if TwoChannelInput then Input.ReSize(SeqLen, 1, 2)
+    else Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    MaxAbsOut := 0;
+    for s := 0 to 2 do
+    begin
+      Input.Fill(0);
+      for i := 0 to SeqLen - 1 do
+        if TwoChannelInput then
+          Input.FData[i * 2] := (s * 7 + i * 3 + 1) mod VocabRange
+        else
+          Input.FData[i] := (s * 7 + i * 3 + 1) mod VocabRange;
+      NNFP32.Compute(Input);
+      NNFP32.GetOutput(OutF);
+      NNQ.Compute(Input);
+      NNQ.GetOutput(OutQ);
+      AssertEquals(FamilyName + ': output size', OutF.Size, OutQ.Size);
+      for i := 0 to OutF.Size - 1 do
+      begin
+        if Abs(OutF.FData[i]) > MaxAbsOut then
+          MaxAbsOut := Abs(OutF.FData[i]);
+        if Abs(OutF.FData[i] - OutQ.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutF.FData[i] - OutQ.FData[i]);
+      end;
+    end;
+    AssertTrue(FamilyName + ': FP32 outputs non-degenerate',
+      MaxAbsOut > 1e-3);
+    AssertTrue(FamilyName + ': int8 drift max |diff| = ' +
+      FloatToStr(MaxDiff) + ' relative to max |out| = ' +
+      FloatToStr(MaxAbsOut) + ' must be < ' + FloatToStr(MaxRelDrift) +
+      ' relative', MaxDiff < MaxRelDrift * MaxAbsOut);
+  finally
+    OutQ.Free;
+    OutF.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.AssertInt8DriftSeq2Seq(
+  const FamilyName: string; EncF, DecF, EncQ, DecQ: TNNet;
+  EncSeqLen, DecSeqLen, VocabRange, MinQuantLayers: integer;
+  MaxRelDrift: double);
+var
+  EncIn, DecIn, OutF, OutQ: TNNetVolume;
+  i, s, QuantLayers: integer;
+  MaxDiff, MaxAbsOut: double;
+
+  procedure CountQuantized(NN: TNNet);
+  var
+    LayerCnt: integer;
+    CW: TNNetLayerConcatedWeights;
+  begin
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt] is TNNetLayerConcatedWeights then
+      begin
+        CW := TNNetLayerConcatedWeights(NN.Layers[LayerCnt]);
+        if CW.WeightsQuantizedInt8 then
+        begin
+          Inc(QuantLayers);
+          AssertEquals(FamilyName + ': FP32 weights released in layer ' +
+            IntToStr(LayerCnt), 1, CW.Neurons[0].Weights.Size);
+        end;
+      end;
+  end;
+
+begin
+  EncIn := TNNetVolume.Create(EncSeqLen, 1, 1);
+  DecIn := TNNetVolume.Create(DecSeqLen, 1, 1);
+  OutF := TNNetVolume.Create;
+  OutQ := TNNetVolume.Create;
+  try
+    QuantLayers := 0;
+    CountQuantized(EncQ);
+    CountQuantized(DecQ);
+    AssertTrue(FamilyName + ': expected >= ' + IntToStr(MinQuantLayers) +
+      ' quantized layers across the pair, got ' + IntToStr(QuantLayers),
+      QuantLayers >= MinQuantLayers);
+    MaxDiff := 0;
+    MaxAbsOut := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to EncSeqLen - 1 do
+        EncIn.FData[i] := (s * 7 + i * 3 + 1) mod VocabRange;
+      for i := 0 to DecSeqLen - 1 do
+        DecIn.FData[i] := (s * 5 + i * 2 + 1) mod VocabRange;
+      RunT5(EncF, DecF, EncIn, DecIn, OutF);
+      RunT5(EncQ, DecQ, EncIn, DecIn, OutQ);
+      AssertEquals(FamilyName + ': logits size', OutF.Size, OutQ.Size);
+      for i := 0 to OutF.Size - 1 do
+      begin
+        if Abs(OutF.FData[i]) > MaxAbsOut then
+          MaxAbsOut := Abs(OutF.FData[i]);
+        if Abs(OutF.FData[i] - OutQ.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutF.FData[i] - OutQ.FData[i]);
+      end;
+    end;
+    AssertTrue(FamilyName + ': FP32 logits non-degenerate',
+      MaxAbsOut > 1e-3);
+    AssertTrue(FamilyName + ': int8 drift max |diff| = ' +
+      FloatToStr(MaxDiff) + ' relative to max |logit| = ' +
+      FloatToStr(MaxAbsOut) + ' must be < ' + FloatToStr(MaxRelDrift) +
+      ' relative', MaxDiff < MaxRelDrift * MaxAbsOut);
+  finally
+    OutQ.Free;
+    OutF.Free;
+    DecIn.Free;
+    EncIn.Free;
+  end;
+end;
+
+// Int8 drift gates for the importer families wired AFTER GPT-2/Llama (the
+// "thread pQuantizeInt8 through the remaining entry points" batch). Each
+// builds the SAME pico checkpoint twice - FP32, and pQuantizeInt8 combined
+// with pInferenceOnly (the intended deployment pairing) - and gates the
+// output drift through AssertInt8DriftPair/Seq2Seq. The per-family
+// relative gates are pinned from measurements on the pico fixtures (see
+// the call sites); a REGRESSION past one means the family quantize or
+// dequantize wiring broke, not that the tolerance needs loosening.
+procedure TTestNeuralPretrained.TestInt8QuantizedGPTNeoLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TGPTNeoConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildGPTNeoFromSafeTensorsEx(
+    FixturePath('tiny_gptneo.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_gptneo_config.json'));
+  NNQ := BuildGPTNeoFromSafeTensorsEx(
+    FixturePath('tiny_gptneo.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, FixturePath('tiny_gptneo_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (qkv slab + out_proj + c_fc + c_proj) + LM head.
+    // Measured 2026-06 on tiny_gptneo: 8.5e-4 vs max |logit| 0.215 =
+    // 3.9e-3 relative; gated at 5e-2 with margin.
+    AssertInt8DriftPair('GPT-Neo', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}9, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedGPTNeoXLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TGPTNeoXConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildGPTNeoXFromSafeTensorsEx(
+    FixturePath('tiny_gptneox.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_gptneox_config.json'));
+  NNQ := BuildGPTNeoXFromSafeTensorsEx(
+    FixturePath('tiny_gptneox.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, FixturePath('tiny_gptneox_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (qkv + dense + h_to_4h + 4h_to_h) + untied embed_out.
+    // Measured 2026-06 on tiny_gptneox: 5.5e-3 relative; gated at 5e-2.
+    AssertInt8DriftPair('GPT-NeoX', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}9, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedGPTJLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TGPTJConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildGPTJFromSafeTensorsEx(
+    FixturePath('tiny_gptj.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_gptj_config.json'));
+  NNQ := BuildGPTJFromSafeTensorsEx(
+    FixturePath('tiny_gptj.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, FixturePath('tiny_gptj_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (qkv slab + out_proj + fc_in + fc_out) + biased lm_head.
+    // Measured 2026-06 on tiny_gptj: 8.3e-3 relative; gated at 5e-2.
+    AssertInt8DriftPair('GPT-J', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}9, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedPhiLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TPhiConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildPhiFromSafeTensorsEx(
+    FixturePath('tiny_phi.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_phi_config.json'));
+  NNQ := BuildPhiFromSafeTensorsEx(
+    FixturePath('tiny_phi.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, FixturePath('tiny_phi_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (qkv slab + dense + fc1 + fc2) + biased lm_head.
+    // Measured 2026-06 on tiny_phi: 7.2e-3 relative; gated at 5e-2.
+    AssertInt8DriftPair('Phi', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}9, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedBertHiddenDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TBertConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildBertFromSafeTensorsEx(
+    FixturePath('tiny_bert.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, {pIncludePooler=}false,
+    FixturePath('tiny_bert_config.json'));
+  NNQ := BuildBertFromSafeTensorsEx(
+    FixturePath('tiny_bert.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, {pIncludePooler=}false,
+    FixturePath('tiny_bert_config.json'), {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (qkv + attn dense + intermediate + output) - the
+    // encoder has no LM head (output = final hidden states).
+    // Measured 2026-06 on tiny_bert: 1.8e-3 relative; gated at 5e-2.
+    AssertInt8DriftPair('BERT', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}8, {MaxRelDrift=}5e-2, {TwoChannelInput=}true);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedBloomLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TBloomConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildBloomFromSafeTensorsEx(
+    FixturePath('tiny_bloom.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_bloom_config.json'));
+  NNQ := BuildBloomFromSafeTensorsEx(
+    FixturePath('tiny_bloom.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, FixturePath('tiny_bloom_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (qkv + dense + h_to_4h + 4h_to_h) + tied LM head.
+    // Measured 2026-06 on tiny_bloom: 2.7e-3 relative; gated at 5e-2.
+    AssertInt8DriftPair('BLOOM', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}9, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedRWKVLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TRWKVConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildRWKVFromSafeTensorsEx(
+    FixturePath('tiny_rwkv.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_rwkv_config.json'));
+  NNQ := BuildRWKVFromSafeTensorsEx(
+    FixturePath('tiny_rwkv.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, FixturePath('tiny_rwkv_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (attn k/v/r/output + ffn k/r/v = 7) + untied head.
+    // Measured 2026-06 on tiny_rwkv: 1.2e-2 relative (the recurrent WKV
+    // path compounds per-step rounding); gated at 5e-2.
+    AssertInt8DriftPair('RWKV', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}15, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedMambaLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TMambaConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildMambaFromSafeTensorsEx(
+    FixturePath('tiny_mamba.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_mamba_config.json'));
+  NNQ := BuildMambaFromSafeTensorsEx(
+    FixturePath('tiny_mamba.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, FixturePath('tiny_mamba_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (in_proj + out_proj) + tied LM head (the scan/conv
+    // parameters live in non-quantizable layer classes).
+    // Measured 2026-06 on tiny_mamba: 2.0e-2 relative (the selective-scan
+    // recurrence compounds per-step rounding); gated at 5e-2.
+    AssertInt8DriftPair('Mamba', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}5, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedModernBertHiddenDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TModernBertConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildModernBertFromSafeTensorsEx(
+    FixturePath('tiny_modernbert.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_modernbert_config.json'));
+  NNQ := BuildModernBertFromSafeTensorsEx(
+    FixturePath('tiny_modernbert.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, FixturePath('tiny_modernbert_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 4 blocks x (Wqkv + attn Wo + mlp Wi + mlp Wo) - encoder, no head.
+    // Measured 2026-06 on tiny_modernbert: 2.7e-2 relative (4 blocks of
+    // pico width compound more rounding than the 2-block picos); gated
+    // at 5e-2.
+    AssertInt8DriftPair('ModernBERT', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}16, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedDeepSeekV2LogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TDeepSeekV2Config;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildDeepSeekV2FromSafeTensorsEx(
+    FixturePath('tiny_deepseek_v2.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_deepseek_v2_config.json'));
+  NNQ := BuildDeepSeekV2FromSafeTensorsEx(
+    FixturePath('tiny_deepseek_v2.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}true, FixturePath('tiny_deepseek_v2_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // MLA projections + dense block-0 MLP + MoE expert/shared SwiGLUs +
+    // tied LM head (the router gate is also a PointwiseConvLinear, so
+    // int8 noise can flip a top-k pick - the gate below absorbs that).
+    // Measured 2026-06 on tiny_deepseek_v2: 2.8e-2 relative; gated at
+    // 5e-2.
+    AssertInt8DriftPair('DeepSeek-V2', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}10, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedT5LogitDrift;
+var
+  EncF, DecF, EncQ, DecQ: TNNet;
+  Config: TT5Config;
+begin
+  RandSeed := 424242;
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    EncF, DecF, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_t5v10_config.json'));
+  BuildT5FromSafeTensors(FixturePath('tiny_t5v10.safetensors'),
+    EncQ, DecQ, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}true, FixturePath('tiny_t5v10_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // enc 2 blocks x (q/k/v/o + wi + wo) + dec 2 blocks x (self q/k/v/o +
+    // cross q/k/v/o + wi + wo) + tied LM head.
+    // Measured 2026-06 on tiny_t5v10: 2.8e-2 relative (encoder drift
+    // feeds the decoder through cross-attention); gated at 5e-2.
+    AssertInt8DriftSeq2Seq('T5', EncF, DecF, EncQ, DecQ,
+      {EncSeqLen=}10, {DecSeqLen=}6, Config.VocabSize,
+      {MinQuantLayers=}25, {MaxRelDrift=}5e-2);
+  finally
+    DecQ.Free;
+    EncQ.Free;
+    DecF.Free;
+    EncF.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedMarianLogitDrift;
+var
+  EncF, DecF, EncQ, DecQ: TNNet;
+  Config: TMarianConfig;
+begin
+  RandSeed := 424242;
+  BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
+    EncF, DecF, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}false, FixturePath('tiny_marian_config.json'));
+  BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
+    EncQ, DecQ, Config, {EncSeqLen=}10, {DecSeqLen=}6,
+    {pInferenceOnly=}true, FixturePath('tiny_marian_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // Same layout as T5 with biased linears + tied head with
+    // final_logits_bias.
+    // Measured 2026-06 on tiny_marian: 1.2e-2 relative; gated at 5e-2.
+    AssertInt8DriftSeq2Seq('Marian', EncF, DecF, EncQ, DecQ,
+      {EncSeqLen=}10, {DecSeqLen=}6, Config.VocabSize,
+      {MinQuantLayers=}25, {MaxRelDrift=}5e-2);
+  finally
+    DecQ.Free;
+    EncQ.Free;
+    DecF.Free;
+    EncF.Free;
   end;
 end;
 

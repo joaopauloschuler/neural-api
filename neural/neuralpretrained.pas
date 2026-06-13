@@ -815,10 +815,11 @@ function BuildLlamaFromGGUF(const FileName: string;
 function BuildMistralFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMistralFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // Qwen2: the Llama skeleton + biases on the q/k/v projections (o_proj and
 // the MLP stay bias-free). Thin wrappers over the Llama path that ASSERT
@@ -826,10 +827,11 @@ function BuildMistralFromSafeTensors(const FileName: string;
 function BuildQwen2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildQwen2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // Qwen3: the Llama skeleton WITHOUT q/k/v biases, with per-head RMSNorm on
 // q and k (applied after the projection and BEFORE RoPE, gain [head_dim]
@@ -839,10 +841,11 @@ function BuildQwen2FromSafeTensors(const FileName: string;
 function BuildQwen3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildQwen3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // Gemma 1: the Llama skeleton with three load-time deltas (no new layers):
 // (a) the embedding OUTPUT is scaled by sqrt(hidden_size) - folded into the
@@ -858,10 +861,11 @@ function BuildQwen3FromSafeTensors(const FileName: string;
 function BuildGemmaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGemmaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // Gemma 2: the Gemma-1 skeleton (GeGLU MLP, zero-centered RMSNorm,
 // sqrt(d) embedding scale, tied head) with five further deltas:
@@ -884,10 +888,11 @@ function BuildGemmaFromSafeTensors(const FileName: string;
 function BuildGemma2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGemma2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // Gemma 3 TEXT-ONLY (model_type "gemma3_text", architectures
 // ["Gemma3ForCausalLM"], e.g. google/gemma-3-1b-it; the 4B+ multimodal
@@ -912,10 +917,11 @@ function BuildGemma2FromSafeTensors(const FileName: string;
 function BuildGemma3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGemma3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // Phi-3 / Phi-4-mini (model_type "phi3": microsoft/Phi-3-mini-4k-instruct,
 // Phi-4-mini-instruct and siblings - NOT phi-1/phi-2, which are model_type
@@ -942,10 +948,11 @@ function BuildGemma3FromSafeTensors(const FileName: string;
 function BuildPhi3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildPhi3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 type
   TGPTNeoConfig = record
@@ -984,17 +991,18 @@ function GPTNeoConfigToString(const Config: TGPTNeoConfig): string;
 // Config.Prefix is detected from the checkpoint and written back.
 function BuildGPTNeoFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildGPTNeoFromSafeTensorsEx(const FileName: string;
   out Config: TGPTNeoConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGPTNeoFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 type
   TGPTNeoXConfig = record
@@ -1038,17 +1046,18 @@ function GPTNeoXConfigToString(const Config: TGPTNeoXConfig): string;
 // Config.Prefix is detected from the checkpoint and written back.
 function BuildGPTNeoXFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoXConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildGPTNeoXFromSafeTensorsEx(const FileName: string;
   out Config: TGPTNeoXConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGPTNeoXFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 type
   TGPTJConfig = record
@@ -1087,17 +1096,18 @@ function GPTJConfigToString(const Config: TGPTJConfig): string;
 // Config.Prefix is detected from the checkpoint and written back.
 function BuildGPTJFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTJConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildGPTJFromSafeTensorsEx(const FileName: string;
   out Config: TGPTJConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGPTJFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 type
   TPhiConfig = record
@@ -1141,17 +1151,18 @@ function PhiConfigToString(const Config: TPhiConfig): string;
 // Config.Prefix is detected from the checkpoint and written back.
 function BuildPhiFromSafeTensorsWithConfig(const FileName: string;
   var Config: TPhiConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildPhiFromSafeTensorsEx(const FileName: string;
   out Config: TPhiConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildPhiFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 type
   // The encoder families sharing the BERT skeleton (selected by
@@ -1234,18 +1245,18 @@ function BertConfigToString(const Config: TBertConfig): string;
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
-  pSeqClsHead: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildBertFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  pIncludePooler: boolean = false): TNNet;
+  pIncludePooler: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // ======================= SENTENCE EMBEDDINGS ===============================
 // sentence-transformers style sentence vectors on top of the BERT encoder
@@ -1319,11 +1330,11 @@ procedure SelectTokenLogits(NetOutput: TNNetVolume; TokenPos: integer;
 function BuildBertForSequenceClassificationFromSafeTensorsEx(
   const FileName: string; out Config: TBertConfig; Id2Label: TStringList;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildBertForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Builds the FULL GPT2ForSequenceClassification stack: GPT-2 trunk + the
 // bias-free score head instead of the LM head. Output is per-position
@@ -1336,11 +1347,11 @@ function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
   const FileName: string; out Config: TGPT2Config; Id2Label: TStringList;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGPT2ForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
 // T5 / FLAN-T5 IMPORT (model_type "t5") - the FIRST ENCODER-DECODER import.
@@ -1441,14 +1452,15 @@ function T5ConfigToString(const Config: TT5Config): string;
 // construction (Compute()-only afterwards).
 procedure BuildT5FromSafeTensorsWithConfig(const FileName: string;
   var Config: TT5Config; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false);
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildT5FromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TT5Config;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = '');
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // Returns the decoder net's SECOND TNNetInput - the (EncSeqLen,1,d_model)
 // encoder-hidden-states input every cross-attention reads. Fill its
@@ -1549,14 +1561,15 @@ function MarianConfigToString(const Config: TMarianConfig): string;
 // (Compute()-only afterwards). Run the pair with RunT5.
 procedure BuildMarianFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMarianConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false);
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 procedure BuildMarianFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TMarianConfig;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = '');
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
 // ---------------------------------------------------------------------------
 // WHISPER IMPORT (model_type "whisper": the openai/whisper-* speech-to-text
@@ -1739,18 +1752,18 @@ function RWKVConfigToString(const Config: TRWKVConfig): string;
 // True frees training volumes during construction (Compute()-only).
 function BuildRWKVFromSafeTensorsWithConfig(const FileName: string;
   var Config: TRWKVConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildRWKVFromSafeTensorsEx(const FileName: string;
   out Config: TRWKVConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildRWKVFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ============================ MAMBA IMPORT =================================
 // Mamba (model_type "mamba": state-spaces/mamba-130m-hf and siblings,
@@ -1825,18 +1838,18 @@ function MambaConfigToString(const Config: TMambaConfig): string;
 // pInferenceOnly = True frees training volumes during construction.
 function BuildMambaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildMambaFromSafeTensorsEx(const FileName: string;
   out Config: TMambaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMambaFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ============================ BLOOM IMPORT =================================
 // BuildBloomFromSafeTensors rebuilds BigScience's BLOOM decoder (model_type
@@ -1917,18 +1930,18 @@ function BloomConfigToString(const Config: TBloomConfig): string;
 // pInferenceOnly = True frees training volumes during construction.
 function BuildBloomFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBloomConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildBloomFromSafeTensorsEx(const FileName: string;
   out Config: TBloomConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildBloomFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ========================= MODERNBERT IMPORT ===============================
 // BuildModernBertFromSafeTensors rebuilds answer.ai's ModernBERT encoder
@@ -2024,18 +2037,18 @@ function ModernBertConfigToString(const Config: TModernBertConfig): string;
 // pInferenceOnly = True frees training volumes during construction.
 function BuildModernBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TModernBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
 function BuildModernBertFromSafeTensorsEx(const FileName: string;
   out Config: TModernBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildModernBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
 // DEEPSEEK-V2 IMPORT (model_type "deepseek_v2"; DeepSeek-V2-Lite is the
@@ -2140,14 +2153,15 @@ function DeepSeekV2ConfigToString(const Config: TDeepSeekV2Config): string;
 // Config.Prefix is detected from the checkpoint (var parameter).
 function BuildDeepSeekV2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TDeepSeekV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 // Reads ConfigFileName (default: config.json next to FileName), then builds.
 function BuildDeepSeekV2FromSafeTensorsEx(const FileName: string;
   out Config: TDeepSeekV2Config; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 function BuildDeepSeekV2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
 // CLIP IMPORT (model_type "clip": openai/clip-vit-base-patch32/-patch16,
@@ -2349,7 +2363,7 @@ function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 // default for every other architectures value.
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
 // CLASSICAL PRETRAINED WORD EMBEDDINGS (GloVe / word2vec / fastText text
@@ -4132,6 +4146,8 @@ begin
         Config.Prefix + 'norm.weight', Config.HiddenSize, NormGainOffset);
       MarkConsumed(Config.Prefix + 'norm.weight');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       // Every tensor must be consumed or be a known ignorable buffer:
       // older HF exports serialize the per-layer "rotary_emb.inv_freq"
@@ -4511,7 +4527,7 @@ type
 
 function BuildGPTNeoFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -4591,6 +4607,7 @@ begin
       PosLayer := NN.AddLayer(
         TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       for BlockCnt := 0 to Config.NumLayers - 1 do
       begin
@@ -4620,12 +4637,14 @@ begin
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -4642,6 +4661,7 @@ begin
         if Config.TieWordEmbeddings then
         begin
           // Tied LM head: logits = h . wte^T (rows copied, bias-free).
+          EnsureWritableImportWeights(LMHead);
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
@@ -4722,6 +4742,8 @@ begin
           Config.HiddenSize, 0, -1, 0, BlockPrefix + 'mlp.c_proj.bias');
         MarkConsumed(BlockPrefix + 'mlp.c_proj.weight');
         MarkConsumed(BlockPrefix + 'mlp.c_proj.bias');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadLayerNormWeights(Reader, FinalLN,
         Config.Prefix + 'ln_f.weight', Config.Prefix + 'ln_f.bias',
@@ -4729,6 +4751,8 @@ begin
       MarkConsumed(Config.Prefix + 'ln_f.weight');
       MarkConsumed(Config.Prefix + 'ln_f.bias');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       // Every tensor must be consumed or be a known ignorable buffer:
       // h.N.attn.attention.bias / .masked_bias are the causal/banded mask
@@ -4760,7 +4784,7 @@ end;
 function BuildGPTNeoFromSafeTensorsEx(const FileName: string;
   out Config: TGPTNeoConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -4769,16 +4793,17 @@ begin
   Config := ReadGPTNeoConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildGPTNeoFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildGPTNeoFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPTNeoConfig;
 begin
   Result := BuildGPTNeoFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 // =========================== GPT-NEOX IMPORT ===============================
@@ -4905,6 +4930,7 @@ var
   W, B: TNNetVolume;
   r, i, HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
 begin
+  EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
     ImportError('GPT-NeoX import: missing tensor "' + WName + '".');
   if not Reader.HasTensor(BName) then
@@ -4968,7 +4994,7 @@ type
 
 function BuildGPTNeoXFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTNeoXConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -5071,6 +5097,7 @@ begin
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(RotChannels, RotaryDims);
@@ -5173,12 +5200,14 @@ begin
         else
           NN.AddLayer( TNNetSum.Create([MlpOut, AttnOut]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -5196,6 +5225,7 @@ begin
         begin
           // Tied LM head (NOT the Pythia convention, but cheap to support):
           // logits = h . embed_in^T, rows copied, bias-free.
+          EnsureWritableImportWeights(LMHead);
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
@@ -5257,6 +5287,8 @@ begin
           BlockPrefix + 'mlp.dense_4h_to_h.bias');
         MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.weight');
         MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.bias');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadLayerNormWeights(Reader, FinalLN,
         Config.Prefix + 'final_layer_norm.weight',
@@ -5264,6 +5296,8 @@ begin
       MarkConsumed(Config.Prefix + 'final_layer_norm.weight');
       MarkConsumed(Config.Prefix + 'final_layer_norm.bias');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       // Every tensor must be consumed or be a known ignorable buffer:
       //  - layers.N.attention.bias / .masked_bias: the causal-mask buffers
@@ -5297,7 +5331,7 @@ end;
 function BuildGPTNeoXFromSafeTensorsEx(const FileName: string;
   out Config: TGPTNeoXConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -5306,16 +5340,17 @@ begin
   Config := ReadGPTNeoXConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildGPTNeoXFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildGPTNeoXFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPTNeoXConfig;
 begin
   Result := BuildGPTNeoXFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 // ============================ GPT-J IMPORT =================================
@@ -5430,7 +5465,7 @@ type
 
 function BuildGPTJFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTJConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -5533,6 +5568,7 @@ begin
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(RotChannels, Config.RotaryDim);
@@ -5627,12 +5663,14 @@ begin
         MlpOut := NN.GetLastLayer();
         NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -5693,6 +5731,8 @@ begin
           BlockPrefix + 'mlp.fc_out.bias');
         MarkConsumed(BlockPrefix + 'mlp.fc_out.weight');
         MarkConsumed(BlockPrefix + 'mlp.fc_out.bias');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadLayerNormWeights(Reader, FinalLN,
         Config.Prefix + 'ln_f.weight',
@@ -5700,6 +5740,8 @@ begin
       MarkConsumed(Config.Prefix + 'ln_f.weight');
       MarkConsumed(Config.Prefix + 'ln_f.bias');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       // Every tensor must be consumed or be a known ignorable buffer:
       //  - h.N.attn.bias / .masked_bias: the causal-mask buffers older
@@ -5734,7 +5776,7 @@ end;
 function BuildGPTJFromSafeTensorsEx(const FileName: string;
   out Config: TGPTJConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -5743,16 +5785,17 @@ begin
   Config := ReadGPTJConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildGPTJFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildGPTJFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPTJConfig;
 begin
   Result := BuildGPTJFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 // ============================ PHI IMPORT ===================================
@@ -5884,6 +5927,7 @@ var
   W, B: TNNetVolume;
   r, i, HeadIdx, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
 begin
+  EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
     ImportError('Phi import: missing tensor "' + WName + '".');
   if not Reader.HasTensor(BName) then
@@ -5946,7 +5990,7 @@ type
 
 function BuildPhiFromSafeTensorsWithConfig(const FileName: string;
   var Config: TPhiConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -6053,6 +6097,7 @@ begin
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(RotChannels, RotaryDims);
@@ -6148,12 +6193,14 @@ begin
         MlpOut := NN.GetLastLayer();
         NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -6218,6 +6265,8 @@ begin
           BlockPrefix + 'mlp.fc2.bias');
         MarkConsumed(BlockPrefix + 'mlp.fc2.weight');
         MarkConsumed(BlockPrefix + 'mlp.fc2.bias');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadLayerNormWeights(Reader, FinalLN,
         Config.Prefix + 'final_layernorm.weight',
@@ -6225,6 +6274,8 @@ begin
       MarkConsumed(Config.Prefix + 'final_layernorm.weight');
       MarkConsumed(Config.Prefix + 'final_layernorm.bias');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       // Every tensor must be consumed or be a known ignorable buffer:
       //  - rotary_emb.inv_freq: RoPE buffers some transformers versions
@@ -6254,7 +6305,7 @@ end;
 function BuildPhiFromSafeTensorsEx(const FileName: string;
   out Config: TPhiConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -6263,16 +6314,17 @@ begin
   Config := ReadPhiConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildPhiFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildPhiFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TPhiConfig;
 begin
   Result := BuildPhiFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 // ============================ BERT IMPORT ==================================
@@ -6420,7 +6472,7 @@ type
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
-  pSeqClsHead: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -6576,6 +6628,7 @@ begin
       EmbLN := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       for BlockCnt := 0 to Config.NumLayers - 1 do
       begin
@@ -6619,6 +6672,7 @@ begin
         Blocks[BlockCnt].OutLN := NN.AddLayer(
           TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       // No final norm and NO LM head: the encoder output IS the last
       // block's LN output, (SeqLen,1,hidden) final hidden states.
@@ -6683,6 +6737,7 @@ begin
           TNNetPointwiseConvLinear.Create(NumLabels) );
       end;
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       LoadEmbeddingTable(WordEmb,
@@ -6782,6 +6837,8 @@ begin
           OutLNName + '.bias', Config.HiddenSize);
         MarkConsumed(OutLNName + '.weight');
         MarkConsumed(OutLNName + '.bias');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       if IncludePooler then
       begin
@@ -6810,6 +6867,8 @@ begin
         MarkConsumed(ClsOutName + '.bias');
       end;
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       // Every tensor must be consumed or be a known ignorable buffer:
       //  - embeddings.position_ids: the positional-index buffer older
@@ -6844,7 +6903,7 @@ end;
 function BuildBertFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -6853,17 +6912,17 @@ begin
   Config := ReadBertConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, pIncludePooler);
+    pInferenceOnly, pIncludePooler, {pSeqClsHead=}false, pQuantizeInt8);
 end;
 
 function BuildBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  pIncludePooler: boolean = false): TNNet;
+  pIncludePooler: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TBertConfig;
 begin
   Result := BuildBertFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, pIncludePooler);
+    pInferenceOnly, pIncludePooler, '', pQuantizeInt8);
 end;
 
 // ======================= SENTENCE EMBEDDINGS ===============================
@@ -7047,7 +7106,7 @@ end;
 function BuildBertForSequenceClassificationFromSafeTensorsEx(
   const FileName: string; out Config: TBertConfig; Id2Label: TStringList;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
   Labels: TStringList;
@@ -7069,24 +7128,25 @@ begin
   // families whose head needs it (bert only - distilbert/roberta
   // classifier checkpoints carry no pooler tensors).
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly, {pIncludePooler=}false, {pSeqClsHead=}true);
+    pInferenceOnly, {pIncludePooler=}false, {pSeqClsHead=}true,
+    pQuantizeInt8);
 end;
 
 function BuildBertForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TBertConfig;
 begin
   Result := BuildBertForSequenceClassificationFromSafeTensorsEx(FileName,
-    IgnoredConfig, nil, pSeqLen, pInferenceOnly);
+    IgnoredConfig, nil, pSeqLen, pInferenceOnly, '', pQuantizeInt8);
 end;
 
 function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
   const FileName: string; out Config: TGPT2Config; Id2Label: TStringList;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
   Labels: TStringList;
@@ -7106,17 +7166,19 @@ begin
     end;
   end;
   Result := BuildGPT2FromSafeTensorsEx(FileName, Config, pSeqLen,
-    pNumHeads, pInferenceOnly, {pSeqClsHead=}true);
+    pNumHeads, pInferenceOnly, {pSeqClsHead=}true, {pExactGelu=}false,
+    pQuantizeInt8);
 end;
 
 function BuildGPT2ForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0; pNumHeads: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TGPT2Config;
 begin
   Result := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(FileName,
-    IgnoredConfig, nil, pSeqLen, pNumHeads, pInferenceOnly);
+    IgnoredConfig, nil, pSeqLen, pNumHeads, pInferenceOnly, '',
+    pQuantizeInt8);
 end;
 
 // ============= MISTRAL / QWEN2 / QWEN3 / GEMMA / DISPATCH ==================
@@ -7126,10 +7188,10 @@ end;
 function BuildLlamaFamilyFromSafeTensors(const FileName: string;
   const ExpectedModelType: string; out Config: TLlamaConfig;
   pSeqLen: integer; pInferenceOnly: boolean;
-  const ConfigFileName: string): TNNet;
+  const ConfigFileName: string; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFromSafeTensorsEx(FileName, Config, pSeqLen,
-    pInferenceOnly, ConfigFileName);
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
   if Config.ModelType <> ExpectedModelType then
   begin
     Result.Free;
@@ -7143,127 +7205,134 @@ end;
 function BuildMistralFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'mistral', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName);
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildMistralFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildMistralFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 function BuildQwen2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen2', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName);
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildQwen2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 function BuildQwen3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName);
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildQwen3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 function BuildGemmaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'gemma', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName);
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildGemmaFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGemmaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 function BuildGemma2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'gemma2', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName);
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildGemma2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGemma2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 function BuildGemma3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'gemma3_text', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName);
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildGemma3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGemma3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 function BuildPhi3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'phi3', Config,
-    pSeqLen, pInferenceOnly, ConfigFileName);
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 function BuildPhi3FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildPhi3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 function LoadPretrainedEmbedding(const FileName: string;
@@ -7542,7 +7611,8 @@ type
 // TNNetInput). Layer handles for the weight loader are returned in Blocks.
 procedure BuildT5StackBlocks(NN: TNNet; const Config: TT5Config;
   NumBlocks: integer; IsDecoder: boolean; EncStates: TNNetLayer;
-  var Blocks: TT5BlockArray; pInferenceOnly: boolean);
+  var Blocks: TT5BlockArray; pInferenceOnly: boolean;
+  pQuantizeInt8: boolean = false);
 var
   InnerDim, BlockCnt, HeadCnt, d: integer;
   BranchInput, NormedSource: TNNetLayer;
@@ -7663,6 +7733,7 @@ begin
       TNNetPointwiseConvLinear.Create(Config.DModel) );
     NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
     if pInferenceOnly then NN.MakeInferenceOnly();
+    if pQuantizeInt8 then NN.QuantizeWeightsInt8();
   end;
   SetLength(SliceChannels, 0);
 end;
@@ -7800,7 +7871,8 @@ end;
 
 procedure BuildT5FromSafeTensorsWithConfig(const FileName: string;
   var Config: TT5Config; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false);
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
 var
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
@@ -7862,11 +7934,13 @@ begin
       EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.DModel, {EncodeZero=}1) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildT5StackBlocks(Enc, Config, Config.NumLayers, {IsDecoder=}false,
-        nil, EncBlocks, pInferenceOnly);
+        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
       EncFinalNorm := Enc.AddLayer(
         TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
 
       // ---------------- Decoder architecture ----------------
       // TWO inputs: Layers[0] = decoder token ids (what Compute feeds);
@@ -7880,13 +7954,16 @@ begin
       DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
         Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
       if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildT5StackBlocks(Dec, Config, Config.NumDecoderLayers,
-        {IsDecoder=}true, EncStates, DecBlocks, pInferenceOnly);
+        {IsDecoder=}true, EncStates, DecBlocks, pInferenceOnly,
+        pQuantizeInt8);
       DecFinalNorm := Dec.AddLayer(
         TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
       LMHead := Dec.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -7911,6 +7988,7 @@ begin
           // T5 v1.0 tied head: logits = (h * d_model^-0.5) . shared^T -
           // the scale is folded into the copied rows (bias-free).
           TieScale := 1.0 / Sqrt(Config.DModel);
+          EnsureWritableImportWeights(LMHead);
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.DModel - 1 do
@@ -7935,8 +8013,12 @@ begin
       end;
       LoadT5Stack(Reader, EncBlocks, 'encoder.', Config,
         {IsDecoder=}false, Consumed);
+      // Re-quantize the stack just refilled with checkpoint weights.
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       LoadT5Stack(Reader, DecBlocks, 'decoder.', Config,
         {IsDecoder=}true, Consumed);
+      // Re-quantize the stack just refilled with checkpoint weights.
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       LoadLlamaRMSNormWeights(Reader, EncFinalNorm,
         'encoder.final_layer_norm.weight', Config.DModel);
       Consumed.Add('encoder.final_layer_norm.weight');
@@ -7944,6 +8026,9 @@ begin
         'decoder.final_layer_norm.weight', Config.DModel);
       Consumed.Add('decoder.final_layer_norm.weight');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       for i := 0 to Reader.Count - 1 do
       begin
@@ -7972,7 +8057,7 @@ end;
 procedure BuildT5FromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TT5Config;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = '');
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 var
   ConfigPath: string;
 begin
@@ -7980,7 +8065,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadT5ConfigFromJSONFile(ConfigPath);
   BuildT5FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly);
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
 end;
 
 function T5EncoderStatesInput(DecoderNet: TNNet): TNNetLayer;
@@ -8156,7 +8241,7 @@ type
 procedure BuildMarianStackBlocks(NN: TNNet; const Config: TMarianConfig;
   NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
   EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
-  pInferenceOnly: boolean);
+  pInferenceOnly: boolean; pQuantizeInt8: boolean = false);
 var
   HeadDim, BlockCnt, HeadCnt, d: integer;
   BranchInput: TNNetLayer;
@@ -8262,6 +8347,7 @@ begin
     Blocks[BlockCnt].FFNNorm := NN.AddLayer(
       TNNetTokenLayerNorm.Create(MarianLayerNormEps) );
     if pInferenceOnly then NN.MakeInferenceOnly();
+    if pQuantizeInt8 then NN.QuantizeWeightsInt8();
   end;
   SetLength(SliceChannels, 0);
   SetLength(Heads, 0);
@@ -8361,7 +8447,8 @@ end;
 
 procedure BuildMarianFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMarianConfig; out EncoderNet, DecoderNet: TNNet;
-  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false);
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
 var
   Reader: TNNetSafeTensorsReader;
   Enc, Dec: TNNet;
@@ -8439,9 +8526,10 @@ begin
       EncPos := Enc.AddLayer(
         TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
       if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       BuildMarianStackBlocks(Enc, Config, Config.EncoderLayers,
         Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
-        nil, EncBlocks, pInferenceOnly);
+        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
       // POST-norm stack: NO final norm (the last block ends in one).
 
       // ---------------- Decoder architecture ----------------
@@ -8458,12 +8546,14 @@ begin
       DecPos := Dec.AddLayer(
         TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       BuildMarianStackBlocks(Dec, Config, Config.DecoderLayers,
         Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
-        EncStates, DecBlocks, pInferenceOnly);
+        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
       LMHead := Dec.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -8489,6 +8579,7 @@ begin
         DecEmbed.FlushWeightCache();
         Consumed.Add('model.shared.weight');
         // Tied head: logits = h . shared^T + final_logits_bias.
+        EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
           for i := 0 to Config.DModel - 1 do
             LMHead.Neurons[j].Weights.FData[i] :=
@@ -8518,9 +8609,16 @@ begin
       FillMarianSinusoidalPositions(DecPos, DecSeqLen, Config.DModel);
       LoadMarianStack(Reader, EncBlocks, 'model.encoder.layers.', Config,
         Config.EncoderFFNDim, {IsDecoder=}false, Consumed);
+      // Re-quantize the stack just refilled with checkpoint weights.
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
       LoadMarianStack(Reader, DecBlocks, 'model.decoder.layers.', Config,
         Config.DecoderFFNDim, {IsDecoder=}true, Consumed);
+      // Re-quantize the stack just refilled with checkpoint weights.
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       for i := 0 to Reader.Count - 1 do
       begin
@@ -8549,7 +8647,7 @@ end;
 procedure BuildMarianFromSafeTensors(const FileName: string;
   out EncoderNet, DecoderNet: TNNet; out Config: TMarianConfig;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = '');
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 var
   ConfigPath: string;
 begin
@@ -8557,7 +8655,7 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMarianConfigFromJSONFile(ConfigPath);
   BuildMarianFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
-    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly);
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
 end;
 
 function ReadWhisperConfigFromJSONFile(const FileName: string): TWhisperConfig;
@@ -9305,7 +9403,7 @@ type
 
 function BuildRWKVFromSafeTensorsWithConfig(const FileName: string;
   var Config: TRWKVConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -9425,6 +9523,7 @@ begin
       PreLN := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       for BlockCnt := 0 to Config.NumLayers - 1 do
       begin
@@ -9477,12 +9576,14 @@ begin
           RSig, Blocks[BlockCnt].FFValue) );
         NN.AddLayer( TNNetSum.Create([Gated, BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
@@ -9496,6 +9597,7 @@ begin
       if Config.TieWordEmbeddings then
       begin
         // Tied LM head: logits = h . E^T (rows copied, bias-free).
+        EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
@@ -9578,6 +9680,8 @@ begin
           FFPrefix + 'value.weight', Config.IntermediateSize,
           Config.HiddenSize);
         MarkConsumed(FFPrefix + 'value.weight');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadLayerNormWeights(Reader, FinalLN,
         Config.Prefix + 'ln_out.weight', Config.Prefix + 'ln_out.bias',
@@ -9585,6 +9689,8 @@ begin
       MarkConsumed(Config.Prefix + 'ln_out.weight');
       MarkConsumed(Config.Prefix + 'ln_out.bias');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       for i := 0 to Reader.Count - 1 do
       begin
@@ -9611,7 +9717,7 @@ end;
 function BuildRWKVFromSafeTensorsEx(const FileName: string;
   out Config: TRWKVConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -9619,17 +9725,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRWKVConfigFromJSONFile(ConfigPath);
   Result := BuildRWKVFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildRWKVFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TRWKVConfig;
 begin
   Result := BuildRWKVFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName);
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 function ReadMambaConfigFromJSONFile(const FileName: string): TMambaConfig;
@@ -9741,7 +9847,7 @@ type
 
 function BuildMambaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TMambaConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -9936,6 +10042,7 @@ begin
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       for BlockCnt := 0 to Config.NumLayers - 1 do
       begin
@@ -9970,12 +10077,14 @@ begin
           TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1), Gated );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
         TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
@@ -9990,6 +10099,7 @@ begin
       begin
         // Tied LM head: logits = h . E^T (rows copied, bias-free) - the
         // published Mamba checkpoints carry no lm_head.weight tensor.
+        EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
@@ -10033,11 +10143,15 @@ begin
           Config.HiddenSize, 0, -1, 0, OutBias);
         MarkConsumed(MixPrefix + 'out_proj.weight');
         if OutBias <> '' then MarkConsumed(OutBias);
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadLlamaRMSNormWeights(Reader, FinalNorm,
         Config.Prefix + 'norm_f.weight', Config.HiddenSize);
       MarkConsumed(Config.Prefix + 'norm_f.weight');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       for i := 0 to Reader.Count - 1 do
       begin
@@ -10064,7 +10178,7 @@ end;
 function BuildMambaFromSafeTensorsEx(const FileName: string;
   out Config: TMambaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -10072,17 +10186,17 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMambaConfigFromJSONFile(ConfigPath);
   Result := BuildMambaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildMambaFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TMambaConfig;
 begin
   Result := BuildMambaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName);
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 // ============================ BLOOM IMPORT =================================
@@ -10208,6 +10322,7 @@ var
   W, B: TNNetVolume;
   r, i, HeadIdx, Third, RowInHead, TargetIdx: integer;
 begin
+  EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
     ImportError('BLOOM import: missing tensor "' + WName + '".');
   if not Reader.HasTensor(BName) then
@@ -10260,7 +10375,7 @@ type
 
 function BuildBloomFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBloomConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -10331,6 +10446,7 @@ begin
       EmbeddingLN := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(Channels, 3 * HeadDim);
@@ -10384,12 +10500,14 @@ begin
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), AttnOut]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalLN := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -10405,6 +10523,7 @@ begin
         EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'word_embeddings.weight');
+        EnsureWritableImportWeights(LMHead);
         for j := 0 to Config.VocabSize - 1 do
         begin
           for i := 0 to Config.HiddenSize - 1 do
@@ -10462,6 +10581,8 @@ begin
           BlockPrefix + 'mlp.dense_4h_to_h.bias');
         MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.weight');
         MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.bias');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadLayerNormWeights(Reader, FinalLN,
         Config.Prefix + 'ln_f.weight',
@@ -10469,6 +10590,8 @@ begin
       MarkConsumed(Config.Prefix + 'ln_f.weight');
       MarkConsumed(Config.Prefix + 'ln_f.bias');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       for i := 0 to Reader.Count - 1 do
       begin
@@ -10494,7 +10617,7 @@ end;
 function BuildBloomFromSafeTensorsEx(const FileName: string;
   out Config: TBloomConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -10503,17 +10626,17 @@ begin
   Config := ReadBloomConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildBloomFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pInferenceOnly);
+    pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildBloomFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TBloomConfig;
 begin
   Result := BuildBloomFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
-    pInferenceOnly, ConfigFileName);
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 function ReadModernBertConfigFromJSONFile(
@@ -10664,6 +10787,7 @@ var
   W, B: TNNetVolume;
   r, i, Third, RowInThird, HeadIdx, RowInHead, HalfDim, TargetIdx: integer;
 begin
+  EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
     ImportError('ModernBERT import: missing tensor "' + WName + '".');
   if (Reader.DimCount(WName) <> 2) or
@@ -10745,6 +10869,7 @@ var
   W, B: TNNetVolume;
   r, i, TargetIdx: integer;
 begin
+  EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
     ImportError('ModernBERT import: missing tensor "' + WName + '".');
   if (Reader.DimCount(WName) <> 2) or
@@ -10853,7 +10978,7 @@ type
 
 function BuildModernBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TModernBertConfig; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -10938,6 +11063,7 @@ begin
       EmbeddingNorm := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.NormEps) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
       SetLength(Channels, HeadDim);
@@ -11035,12 +11161,14 @@ begin
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       // final_norm; the output IS the (SeqLen,1,hidden) hidden states (HF
       // ModernBertModel last_hidden_state) - no LM/pooler head.
       FinalNorm := NN.AddLayer(
         TNNetTokenLayerNorm.Create(Config.NormEps) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -11130,6 +11258,8 @@ begin
         end;
         MarkConsumed(BlockPrefix + 'mlp.Wi.weight');
         MarkConsumed(BlockPrefix + 'mlp.Wo.weight');
+        // Re-quantize the block just refilled with checkpoint weights.
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       LoadModernBertNormWeights(Reader, FinalNorm,
         Config.Prefix + 'final_norm.weight',
@@ -11139,6 +11269,8 @@ begin
       if Config.NormBias then
         MarkConsumed(Config.Prefix + 'final_norm.bias');
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       for i := 0 to Reader.Count - 1 do
       begin
@@ -11165,7 +11297,7 @@ end;
 function BuildModernBertFromSafeTensorsEx(const FileName: string;
   out Config: TModernBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -11174,17 +11306,17 @@ begin
   Config := ReadModernBertConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildModernBertFromSafeTensorsWithConfig(FileName, Config,
-    pSeqLen, pInferenceOnly);
+    pSeqLen, pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildModernBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TModernBertConfig;
 begin
   Result := BuildModernBertFromSafeTensorsEx(FileName, IgnoredConfig,
-    pSeqLen, pInferenceOnly, ConfigFileName);
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
 // ========================= DEEPSEEK-V2 IMPORT ==============================
@@ -11381,7 +11513,7 @@ type
 
 function BuildDeepSeekV2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TDeepSeekV2Config; pSeqLen: integer = 0;
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -11431,6 +11563,7 @@ var
   var
     RowCnt, ColCnt: integer;
   begin
+    EnsureWritableImportWeights(Layer);
     for RowCnt := 0 to RowCount - 1 do
     begin
       if Layer.Neurons[DstBase + RowCnt].Weights.Size <> InDim then
@@ -11495,6 +11628,7 @@ begin
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(HeadOutputs, Config.NumHeads);
       for BlockCnt := 0 to Config.NumLayers - 1 do
@@ -11657,12 +11791,14 @@ begin
         end;
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
         TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
       LMHead := NN.AddLayer(
         TNNetPointwiseConvLinear.Create(Config.VocabSize) );
       if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
 
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
@@ -11679,6 +11815,7 @@ begin
         if Config.TieWordEmbeddings then
         begin
           // Tied LM head: logits = h . embed^T (rows copied, bias-free).
+          EnsureWritableImportWeights(LMHead);
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
@@ -11837,6 +11974,8 @@ begin
                 BlockPrefix + 'mlp.shared_experts.down_proj.weight');
             end;
           end;
+          // Re-quantize the block just refilled with checkpoint weights.
+          if pQuantizeInt8 then NN.QuantizeWeightsInt8();
         end;
         LoadLlamaRMSNormWeights(Reader, FinalNorm,
           Config.Prefix + 'norm.weight', Config.HiddenSize);
@@ -11845,6 +11984,8 @@ begin
         Tmp.Free;
       end;
 
+      // Final sweep: everything refilled above ends int8-quantized.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       for i := 0 to Reader.Count - 1 do
       begin
@@ -11872,7 +12013,7 @@ end;
 function BuildDeepSeekV2FromSafeTensorsEx(const FileName: string;
   out Config: TDeepSeekV2Config; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath: string;
 begin
@@ -11881,16 +12022,17 @@ begin
   Config := ReadDeepSeekV2ConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildDeepSeekV2FromSafeTensorsWithConfig(FileName, Config,
-    pSeqLen, pInferenceOnly);
+    pSeqLen, pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildDeepSeekV2FromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TDeepSeekV2Config;
 begin
   Result := BuildDeepSeekV2FromSafeTensorsEx(FileName, IgnoredConfig,
-    pSeqLen, pInferenceOnly);
+    pSeqLen, pInferenceOnly, '', pQuantizeInt8);
 end;
 
 // ============================ CLIP IMPORT ==================================
@@ -12522,7 +12664,7 @@ end;
 
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 var
   ConfigPath, WeightsPath, ModelType, ArchName: string;
   JsonText: TStringList;
@@ -12624,31 +12766,31 @@ begin
     IgnoredId2Label := nil;
     Result := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
       WeightsPath, IgnoredGPT2Config, IgnoredId2Label, pSeqLen, NumHeads,
-      pInferenceOnly, ConfigPath);
+      pInferenceOnly, ConfigPath, pQuantizeInt8);
   end
   else if ModelType = 'gpt2' then
     Result := BuildGPT2FromSafeTensors(WeightsPath, pSeqLen, NumHeads,
-      pInferenceOnly, GPT2ExactGelu)
+      pInferenceOnly, GPT2ExactGelu, pQuantizeInt8)
   else if ((ModelType = 'bert') or (ModelType = 'distilbert') or
            (ModelType = 'roberta')) and BertSeqCls then
   begin
     IgnoredId2Label := nil;
     Result := BuildBertForSequenceClassificationFromSafeTensorsEx(
       WeightsPath, IgnoredBertConfig, IgnoredId2Label, pSeqLen,
-      pInferenceOnly, ConfigPath);
+      pInferenceOnly, ConfigPath, pQuantizeInt8);
   end
   else if ModelType = 'gpt_neo' then
     Result := BuildGPTNeoFromSafeTensorsEx(WeightsPath, IgnoredGPTNeoConfig,
-      pSeqLen, pInferenceOnly, ConfigPath)
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'gpt_neox' then
     Result := BuildGPTNeoXFromSafeTensorsEx(WeightsPath, IgnoredGPTNeoXConfig,
-      pSeqLen, pInferenceOnly, ConfigPath)
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'gptj' then
     Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
-      pSeqLen, pInferenceOnly, ConfigPath)
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'phi' then
     Result := BuildPhiFromSafeTensorsEx(WeightsPath, IgnoredPhiConfig,
-      pSeqLen, pInferenceOnly, ConfigPath)
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
           (ModelType = 'gemma') or (ModelType = 'gemma2') or
@@ -12666,7 +12808,7 @@ begin
     // partial-rotary flags the same way (the 128k longrope variants are
     // rejected by the config reader).
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
-      pSeqLen, pInferenceOnly, ConfigPath)
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
           (ModelType = 'roberta') then
     // ENCODER route: input (SeqLen,1,2) token|token-type ids (channel 1
@@ -12675,28 +12817,29 @@ begin
     // comment). Pooler excluded; call BuildBertFromSafeTensors directly to
     // include it (bert/roberta - distilbert has none).
     Result := BuildBertFromSafeTensorsEx(WeightsPath, IgnoredBertConfig,
-      pSeqLen, pInferenceOnly, {pIncludePooler=}false, ConfigPath)
+      pSeqLen, pInferenceOnly, {pIncludePooler=}false, ConfigPath,
+      pQuantizeInt8)
   else if ModelType = 'rwkv' then
     // The first NON-TRANSFORMER route: RWKV-4 (architectures
     // ["RwkvForCausalLM"]), a recurrent WKV mixer - causal-LM contract
     // like the decoder families ((SeqLen,1,1) ids in, (SeqLen,1,vocab)
     // logits out). See the RWKV-4 IMPORT section.
     Result := BuildRWKVFromSafeTensorsEx(WeightsPath, IgnoredRWKVConfig,
-      pSeqLen, pInferenceOnly, ConfigPath)
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'mamba' then
     // The second non-transformer route: Mamba (architectures
     // ["MambaForCausalLM"]), a selective-SSM mixer - causal-LM contract
     // like the decoder families ((SeqLen,1,1) ids in, (SeqLen,1,vocab)
     // logits out). See the MAMBA IMPORT section.
     Result := BuildMambaFromSafeTensorsEx(WeightsPath, IgnoredMambaConfig,
-      pSeqLen, pInferenceOnly, ConfigPath)
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'bloom' then
     // The ALiBi route: BLOOM (architectures ["BloomForCausalLM"]), no
     // positional embeddings - per-head fixed linear attention biases
     // (TNNetALiBiAttention). Causal-LM contract like the other decoder
     // families. See the BLOOM IMPORT section.
     Result := BuildBloomFromSafeTensorsEx(WeightsPath, IgnoredBloomConfig,
-      pSeqLen, pInferenceOnly, ConfigPath)
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'modernbert' then
     // The second ENCODER route: ModernBERT (architectures
     // ["ModernBertModel"]; head-bearing exports load their base weights
@@ -12704,7 +12847,8 @@ begin
     // token-type channel, unlike the bert family), output (SeqLen,1,hidden)
     // final hidden states. See the MODERNBERT IMPORT section.
     Result := BuildModernBertFromSafeTensorsEx(WeightsPath,
-      IgnoredModernBertConfig, pSeqLen, pInferenceOnly, ConfigPath)
+      IgnoredModernBertConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
   else if ModelType = 'deepseek_v2' then
     // DeepSeek-V2 (architectures ["DeepseekV2ForCausalLM"];
     // DeepSeek-V2-Lite is the reference checkpoint): Multi-head Latent
@@ -12715,7 +12859,8 @@ begin
     // full-V2 variants (q_lora_rank, YaRN-with-mscale rope_scaling,
     // group_limited_greedy).
     Result := BuildDeepSeekV2FromSafeTensorsEx(WeightsPath,
-      IgnoredDeepSeekV2Config, pSeqLen, pInferenceOnly, ConfigPath)
+      IgnoredDeepSeekV2Config, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
   else if ModelType = 't5' then
   begin
     // T5 is an encoder-decoder: the import builds TWO nets, which this
