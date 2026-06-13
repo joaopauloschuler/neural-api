@@ -180,9 +180,9 @@ rather than acted on.
       d_model stays FP32 in v1, e.g. ~262MB for TinyLlama) and FP16/BF16
       weight storage as a zero-drift middle rung. GGUF dovetails (reader
       landed in neural/neuralgguf.pas): load Q8_0 blocks straight into the
-      int8 weight-only storage instead of dequantize-then-requantize, and
-      decode the common ggml 4-bit types (Q4_0/Q4_K/Q6_K) so real-world
-      quantized checkpoints import.
+      int8 weight-only storage instead of dequantize-then-requantize (the
+      k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load path is its own dedicated
+      GGUF READ task below).
 - [ ] Quantized inference follow-up: upstream fix for TVolume.GetMaxAbs
       (seeds the running max with the SIGNED first element, so a negative
       max-magnitude element 0 is missed; csErrorOverflowBackpropProtection
