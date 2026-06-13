@@ -26,6 +26,7 @@ guard, flushed per token so piped output streams too).
 | --- | --- | --- |
 | `--temperature X` | sampling temperature (probability-domain `TNNetTemperatureProcessor`) | 1.0 (off) |
 | `--top-k N` | `TNNetSamplerTopK` — NOTE: draws **uniformly** among the top K | off |
+| `--weighted-top-k N` | `TNNetSamplerWeightedTopK` — HF semantics: draws **proportionally** to the renormalized top-K probabilities | off |
 | `--top-p X` | `TNNetSamplerTopP` nucleus sampling (weighted draw) | off |
 | `--min-p X` | `TNNetSamplerMinP` (weighted draw) | off |
 | `--repetition-penalty X` | CTRL repetition penalty (`TNNetTokenHistoryPenalty`) | 1.0 (off) |

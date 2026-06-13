@@ -53,6 +53,13 @@ type
     procedure TestPenaltyProbabilitiesRepetitionChangesArgmax;
     procedure TestPenaltyProbabilitiesFrequencyPresenceFactor;
     procedure TestPenaltyProbabilitiesSumsToOne;
+
+    // TNNetSamplerWeightedTopK tests
+    procedure TestWeightedTopKMatchesRenormalizedDistribution;
+    procedure TestWeightedTopKDiffersFromUniform;
+    procedure TestWeightedTopKSequenceReproducible;
+    procedure TestWeightedTopKNeverDrawsOutsideTopK;
+    procedure TestWeightedTopKGetTokenOnPixel;
   end;
 
 implementation
@@ -830,6 +837,169 @@ begin
   finally
     V.Free;
     Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestWeightedTopKMatchesRenormalizedDistribution;
+var
+  Sampler: TNNetSamplerWeightedTopK;
+  V: TNNetVolume;
+  Token, I, N: integer;
+  Counts: array[0..2] of integer;
+  Freq, Expected: array[0..2] of TNeuralFloat;
+  KeptSum: TNeuralFloat;
+begin
+  // Skewed top-3 head probs = [0.7, 0.2, 0.07] (+ negligible tail). With K=3
+  // the renormalized distribution over {0,1,2} is far from uniform 1/3 each.
+  // A large fixed-seed draw must match the renormalized probabilities, NOT
+  // the uniform distribution that the legacy TNNetSamplerTopK produces.
+  RandSeed := 20260613;
+  Sampler := TNNetSamplerWeightedTopK.Create(3);
+  V := TNNetVolume.Create(6, 1, 1);
+  try
+    V.Fill(0.01);
+    V.Raw[0] := 0.7;
+    V.Raw[1] := 0.2;
+    V.Raw[2] := 0.07;
+    KeptSum := 0.7 + 0.2 + 0.07;
+    Expected[0] := 0.7 / KeptSum;
+    Expected[1] := 0.2 / KeptSum;
+    Expected[2] := 0.07 / KeptSum;
+    for I := 0 to 2 do Counts[I] := 0;
+    N := 40000;
+    for I := 1 to N do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('weighted top-k must draw from {0,1,2}',
+        (Token >= 0) and (Token <= 2));
+      Inc(Counts[Token]);
+    end;
+    for I := 0 to 2 do Freq[I] := Counts[I] / N;
+    // Empirical frequencies must match the renormalized probabilities.
+    for I := 0 to 2 do
+      AssertEquals('empirical freq matches renormalized prob at ' + IntToStr(I),
+        Expected[I], Freq[I], 0.02);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestWeightedTopKDiffersFromUniform;
+var
+  Sampler: TNNetSamplerWeightedTopK;
+  V: TNNetVolume;
+  Token, I, N: integer;
+  Freq0: TNeuralFloat;
+  Count0: integer;
+begin
+  // The dominant token (renormalized prob ~0.72) must be drawn FAR more often
+  // than the uniform 1/3, proving weighted-vs-uniform differ.
+  RandSeed := 20260613;
+  Sampler := TNNetSamplerWeightedTopK.Create(3);
+  V := TNNetVolume.Create(6, 1, 1);
+  try
+    V.Fill(0.01);
+    V.Raw[0] := 0.7;
+    V.Raw[1] := 0.2;
+    V.Raw[2] := 0.07;
+    Count0 := 0;
+    N := 40000;
+    for I := 1 to N do
+    begin
+      Token := Sampler.GetToken(V);
+      if Token = 0 then Inc(Count0);
+    end;
+    Freq0 := Count0 / N;
+    // Uniform would give ~0.333; weighted gives ~0.72. Assert clearly above
+    // uniform (well outside any sampling noise band).
+    AssertTrue('weighted top-k must NOT match uniform 1/3 (got ' +
+      FloatToStr(Freq0) + ')', Freq0 > 0.5);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestWeightedTopKSequenceReproducible;
+var
+  Sampler: TNNetSamplerWeightedTopK;
+  V: TNNetVolume;
+  SeqA, SeqB: array[0..49] of integer;
+  I: integer;
+begin
+  // Two runs from the SAME fixed seed must produce the identical draw
+  // sequence.
+  Sampler := TNNetSamplerWeightedTopK.Create(4);
+  V := TNNetVolume.Create(8, 1, 1);
+  try
+    V.Fill(0.01);
+    V.Raw[0] := 0.5;
+    V.Raw[1] := 0.25;
+    V.Raw[2] := 0.12;
+    V.Raw[3] := 0.06;
+    RandSeed := 987654321;
+    for I := 0 to 49 do SeqA[I] := Sampler.GetToken(V);
+    RandSeed := 987654321;
+    for I := 0 to 49 do SeqB[I] := Sampler.GetToken(V);
+    for I := 0 to 49 do
+      AssertEquals('fixed-seed draw sequence must be reproducible at ' +
+        IntToStr(I), SeqA[I], SeqB[I]);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestWeightedTopKNeverDrawsOutsideTopK;
+var
+  Sampler: TNNetSamplerWeightedTopK;
+  V: TNNetVolume;
+  Token, I: integer;
+begin
+  // With K=2 only the two highest-probability tokens (0 and 1) may ever be
+  // drawn; the renormalized tail must never appear.
+  RandSeed := 20260613;
+  Sampler := TNNetSamplerWeightedTopK.Create(2);
+  V := TNNetVolume.Create(10, 1, 1);
+  try
+    V.Fill(0.02);
+    V.Raw[0] := 0.6;
+    V.Raw[1] := 0.3;
+    for I := 1 to 500 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('K=2 must only draw from {0,1}, got ' + IntToStr(Token),
+        (Token = 0) or (Token = 1));
+    end;
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestWeightedTopKGetTokenOnPixel;
+var
+  Sampler: TNNetSamplerWeightedTopK;
+  V: TNNetVolume;
+  Token, I: integer;
+begin
+  // Pixel-addressed variant with K=1 degenerates to greedy argmax.
+  RandSeed := 20260613;
+  Sampler := TNNetSamplerWeightedTopK.Create(1);
+  V := TNNetVolume.Create(4, 4, 10);
+  try
+    V.Fill(0.05);
+    V[2, 1, 7] := 0.9;
+    for I := 1 to 20 do
+    begin
+      Token := Sampler.GetTokenOnPixel(V, 2, 1);
+      AssertEquals('K=1 weighted top-k on pixel (2,1) must return token 7',
+        7, Token);
+    end;
+  finally
+    V.Free;
+    Sampler.Free;
   end;
 end;
 

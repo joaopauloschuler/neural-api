@@ -64,9 +64,12 @@ const
 
 // Stable softmax of the logits row at PosIdx divided by Temperature, then a
 // weighted draw over the TopK most probable tokens (TopK <= 0 or >= vocab
-// keeps the whole distribution). This is the standard HF top-k sampling;
-// the library TNNetSamplerTopK draws UNIFORMLY among the top K, which would
-// ignore the temperature, so the weighted draw lives here.
+// keeps the whole distribution). This is the standard HF top-k sampling.
+// The library TNNetSamplerWeightedTopK now implements the same weighted-draw
+// semantics on a post-softmax row; this routine is kept because it fuses the
+// temperatured softmax and the top-K draw over the packed multi-position
+// logits buffer in a single pass (the legacy TNNetSamplerTopK draws UNIFORMLY
+// among the top K and would ignore the temperature).
 function SampleNextToken(Logits: TNNetVolume; PosIdx, VocabSize: integer;
   Temperature: TNeuralFloat; TopK: integer): integer;
 var

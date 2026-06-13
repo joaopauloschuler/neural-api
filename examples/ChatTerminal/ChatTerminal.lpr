@@ -83,6 +83,7 @@ type
     MaxNewTokens: integer;
     Temperature: TNeuralFloat;   // 1.0 = off
     TopK: integer;               // 0 = off
+    WeightedTopK: boolean;       // true = weighted (HF) top-k, false = uniform
     TopP: TNeuralFloat;          // 0 = off
     MinP: TNeuralFloat;          // 0 = off
     RepetitionPenalty: TNeuralFloat; // 1.0 = off
@@ -107,6 +108,7 @@ begin
   WriteLn('Options:');
   WriteLn('  --temperature X       sampling temperature (default 1.0)');
   WriteLn('  --top-k N             top-k sampling (uniform draw among top K)');
+  WriteLn('  --weighted-top-k N    top-k sampling (HF: weighted draw among top K)');
   WriteLn('  --top-p X             nucleus sampling (weighted draw)');
   WriteLn('  --min-p X             min-p sampling (weighted draw)');
   WriteLn('  --repetition-penalty X  CTRL repetition penalty (default 1.0)');
@@ -132,6 +134,7 @@ begin
   Result.MaxNewTokens := 128;
   Result.Temperature := 1.0;
   Result.TopK := 0;
+  Result.WeightedTopK := false;
   Result.TopP := 0;
   Result.MinP := 0;
   Result.RepetitionPenalty := 1.0;
@@ -216,6 +219,12 @@ begin
     begin
       if not NextInt(Arg, IVal) then exit(false);
       Opt.TopK := IVal;
+    end
+    else if Arg = '--weighted-top-k' then
+    begin
+      if not NextInt(Arg, IVal) then exit(false);
+      Opt.TopK := IVal;
+      Opt.WeightedTopK := true;
     end
     else if Arg = '--top-p' then
     begin
@@ -724,7 +733,11 @@ begin
   if Opt.Temperature <> 1.0 then
     Chain.Add(TNNetTemperatureProcessor.Create(Opt.Temperature), true);
   Sampler := nil;
-  if Opt.TopK > 0 then Sampler := TNNetSamplerTopK.Create(Opt.TopK)
+  if Opt.TopK > 0 then
+  begin
+    if Opt.WeightedTopK then Sampler := TNNetSamplerWeightedTopK.Create(Opt.TopK)
+    else Sampler := TNNetSamplerTopK.Create(Opt.TopK);
+  end
   else if Opt.TopP > 0 then Sampler := TNNetSamplerTopP.Create(Opt.TopP)
   else if Opt.MinP > 0 then Sampler := TNNetSamplerMinP.Create(Opt.MinP);
 

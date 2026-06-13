@@ -564,6 +564,27 @@ type
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
   end;
 
+  { TNNetSamplerWeightedTopK }
+  // HF-semantics top-k sampling. Operates on PROBABILITIES (a post-softmax
+  // volume, same convention as TNNetSamplerTopP / TNNetSamplerMinP): keeps the
+  // TopK highest-probability tokens, renormalizes their mass and draws
+  // PROPORTIONALLY to the renormalized probabilities. This differs from the
+  // legacy TNNetSamplerTopK, which draws UNIFORMLY (1/K each) among the top K
+  // and is deliberately left unchanged for reproducibility. TopK <= 0 or
+  // TopK >= vocab degenerates to full ancestral sampling over the whole row.
+  // Coded by Claude (AI).
+  TNNetSamplerWeightedTopK = class (TNNetSamplerBase)
+    protected
+      FTopK: integer;
+      // Weighted draw over the top-K entries of the (descending-sorted)
+      // FTokenArr, proportional to their renormalized probability mass.
+      function SampleFromSorted(): integer;
+    public
+      constructor Create(TopK: integer);
+      function GetToken(Origin: TNNetVolume): integer; override;
+      function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
+  end;
+
   { TNNetTokenHistoryPenalty }
   // Stateful logit processor that sits BETWEEN the model output and the
   // TNNetSamplerBase family (Greedy / TopK / TopP). It is NOT a sampler: it
@@ -2321,6 +2342,66 @@ begin
   Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
   SortTokenArray();
   Result := FTokenArr[Random(FTopK)].Token;
+end;
+
+{ TNNetSamplerWeightedTopK }
+
+constructor TNNetSamplerWeightedTopK.Create(TopK: integer);
+begin
+  inherited Create();
+  FTopK := TopK;
+end;
+
+function TNNetSamplerWeightedTopK.SampleFromSorted(): integer;
+var
+  KeptSum, Roll, Cumulative: TNeuralFloat;
+  I, KeptCount: integer;
+begin
+  if Length(FTokenArr) = 0 then
+  begin
+    Result := 0; // defensive: empty distribution
+    exit;
+  end;
+  // FTokenArr is sorted DESCENDING, so [0..KeptCount-1] are the top-K tokens.
+  KeptCount := FTopK;
+  if (KeptCount <= 0) or (KeptCount > Length(FTokenArr)) then
+    KeptCount := Length(FTokenArr); // <=0 or >=vocab => whole row
+  KeptSum := 0;
+  for I := 0 to KeptCount - 1 do
+    KeptSum := KeptSum + FTokenArr[I].Score;
+  if KeptSum <= 0 then
+  begin
+    Result := FTokenArr[0].Token; // fallback: degenerate distribution
+    exit;
+  end;
+  // Weighted draw proportional to the renormalized kept mass.
+  Roll := Random * KeptSum;
+  Cumulative := 0;
+  Result := FTokenArr[KeptCount - 1].Token; // numeric-safety fallback
+  for I := 0 to KeptCount - 1 do
+  begin
+    Cumulative := Cumulative + FTokenArr[I].Score;
+    if Roll < Cumulative then
+    begin
+      Result := FTokenArr[I].Token;
+      exit;
+    end;
+  end;
+end;
+
+function TNNetSamplerWeightedTopK.GetToken(Origin: TNNetVolume): integer;
+begin
+  Origin.GetTokenArray(FTokenArr);
+  SortTokenArray();
+  Result := SampleFromSorted();
+end;
+
+function TNNetSamplerWeightedTopK.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
+  PixelY: integer): integer;
+begin
+  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  SortTokenArray();
+  Result := SampleFromSorted();
 end;
 
 { TNNetSamplerBase }

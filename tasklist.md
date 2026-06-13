@@ -563,7 +563,7 @@ rather than acted on.
       byte-level-BPE variant needs a vocab prefix-scan helper there;
       (b) guidance-style multi-token rollback (back up over more than the
       single last prompt token when the boundary artifact spans merges).
-- [ ] Weighted top-k sampler with HF semantics: TNNetSamplerTopK draws
+- [X] Weighted top-k sampler with HF semantics: TNNetSamplerTopK draws
       UNIFORMLY among the top K instead of by renormalized probability
       (long-standing gotcha; examples/GPT2Import and examples/ChatTerminal
       hand-roll around it, and seq2seq sampled decode inherits it). Add a
