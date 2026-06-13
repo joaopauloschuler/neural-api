@@ -94,26 +94,6 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] StarCoder2 importer (model_type "starcoder2") — the most-used modern
-      open CODE LLM family (bigcode/starcoder2-3b/7b/15b) and the first
-      code-specialised model in the repo. Architecturally DISTINCT from every
-      landed Llama-path importer, so it adds real coverage rather than a near-
-      duplicate: it pairs RoPE + GQA + (optional) sliding-window attention
-      with three GPT-2-flavoured pieces that the RMSNorm/SwiGLU importers do
-      NOT exercise — (a) LayerNorm (norm_type "layer_norm", with bias) instead
-      of RMSNorm, (b) bias=True on ALL linears including q/k/v AND o_proj (the
-      exact path OLMo2 deliberately REJECTS — see the olmo2 memory), and (c) a
-      plain GELU-tanh two-matrix FFN (c_fc -> gelu_pytorch_tanh -> c_proj, no
-      gate), so it reuses TNNetGELU + the attention_bias plumbing already in
-      neuralpretrained.pas but on a dedicated LayerNorm pre-norm block builder.
-      Embeddings are untied (separate lm_head). Deliverables:
-      BuildStarCoder2FromSafeTensors[Ex] (+ .bin dispatch), a pico parity
-      fixture via the make_pico_*_fixture.py recipe asserting next-token logits
-      vs HF float64 within the 1e-4 gate (exercise BOTH a full-attention and a
-      sliding-window config), and a short examples/StarCoder2Complete code-
-      completion demo on CPU. Tokenizer is the stock BPE tokenizer.json path
-      (already supported). Opens the door to GPT-BigCode/StarCoder-v1 (MQA +
-      learned absolute positions) as a later relative.
 - [ ] GPT-BigCode / StarCoder-v1 importer (model_type "gpt_bigcode") — the
       now-unblocked relative of the landed StarCoder2 importer (commit 19e594c,
       BuildStarCoder2FromSafeTensors). Reuses StarCoder2's LayerNorm-with-bias
@@ -187,39 +167,6 @@ rather than acted on.
       Cohere weights on top of the synthetic fixture. Also: order_of_interleaved_layers
       (legacy cohere2 spelling) maps to sliding_window_pattern but was not seen
       in a published config — wire it if one surfaces.
-- [X] BART-family follow-up (b): mBART DONE — BuildMBartFromSafeTensors[Ex]
-      (model_type "mbart") LANDED, parity ~teacher-forced logits within the
-      1e-4 gate vs HF float64 oracle (tools/mbart_tiny_fixture.py,
-      tests/fixtures/tiny_mbart.*, TestMBartParity). mBART = BART's embedding
-      front-end (learned +2-offset positions + layernorm_embedding + tied head
-      + final_logits_bias) stacked on PEGASUS-style pre-norm blocks + a FINAL
-      encoder AND decoder layer_norm, so it reuses BuildPegasusStackBlocks
-      verbatim and TBartConfig (model_type accepted = "mbart").
-      NLLB / M2M100 DONE — BuildM2M100FromSafeTensors[Ex]/WithConfig +
-      TM2M100Config + ReadM2M100ConfigFromJSONFile (model_type "m2m_100",
-      NLLB's architecture) LANDED on the SAME two-net path, parity within the
-      1e-4 gate vs HF float64 oracle (tools/m2m100_tiny_fixture.py,
-      tests/fixtures/tiny_m2m100.*, TestM2M100Parity +
-      TestM2M100ConfigFromJSONFile). M2M100 = Pegasus's pre-norm body with
-      THREE deltas: SINUSOIDAL positions (new FillM2M100SinusoidalPositions:
-      half-split base log(1e4)/(half-1) WITH a +2 offset — token pos p reads
-      row p+2), NO layernorm_embedding, and a RELU FFN (new UseReluFFN flag on
-      BuildPegasusStackBlocks). NLLB-200 and base M2M100 share this exact body
-      (HF has no normalize_before branch — both pre-norm). final_logits_bias is
-      OPTIONAL (transformers >=5 dropped it; older checkpoints carry an all-zero
-      buffer). BuildFromPretrained rejects "m2m_100" with a redirect to the
-      two-net importer. Tokenizer: mBART/NLLB ship a raw sentencepiece.bpe.model
-      without a tokenizer.json; the raw .model protobuf reader
-      (LoadSentencePieceModel, see Tokenizer follow-up (b)) covers the Unigram
-      .model that mBART(-Unigram)/DeBERTa-v3/T5/ALBERT use (loaded + tested via
-      tiny_spm.model / TestSentencePieceModelParity).
-      RESIDUAL (open, minor): NLLB/mBART variants that ship a BPE .model still
-      need the BPE-in-.model follow-up; real-vocab verification against a
-      downloaded sentencepiece.bpe.model + real safetensors is a follow-up; the
-      committed bart_tiny / tiny_pegasus / tiny_mbart / tiny_m2m100 fixtures are
-      single-shard, so the inherited multi-shard index.json path is untested
-      for these encoder-decoders specifically — add a 2-shard fixture if a real
-      distilbart/pegasus/mbart/nllb import surfaces a bug.
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
@@ -379,12 +326,6 @@ rather than acted on.
       examples/MagnitudePruning prune-and-restore sweep); still open are
       masks that stay applied (instead of restoring weights after the
       sweep) and a fine-tune-after-prune example showing accuracy recovery.
-- [X] Anomaly detection mode (autograd.set_detect_anomaly port): a debug
-      flag that checks every layer's Output/OutputError for NaN/Inf during
-      forward AND backward and names the FIRST offending layer + phase.
-      The random-architecture NaN fuzz task elsewhere in this list finds
-      such failures; this is the runtime tool that makes them diagnosable.
-      Probably the highest value-to-effort diagnostic on this list.
 - [ ] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
       with forward/backward wall-time and parameter/activation memory per
       layer (introspection-report pattern). Directly serves the open
@@ -562,35 +503,12 @@ rather than acted on.
       speedup, never a quality change). Reuses the existing accept/verify plumbing,
       so it is small; pairs naturally with the KV-cache fork primitive the beam /
       best-of-N tasks want.
-- [X] DoLa decoding follow-up: DoLa-low / DoLa-high dynamic premature-layer
-      buckets LANDED (neural/neuraldecode.pas). TDoLaLayerBucket enum
-      (dlbFull/dlbLow/dlbHigh) + overloaded DecodeDoLa(...; Bucket; HeadStartIdx)
-      restricts the per-step max-JS premature-layer search to the shallow half
-      (dlbLow), deep half (dlbHigh), or all lens-compatible layers (dlbFull, the
-      original v1 bucket; the original signature delegates here so it is fully
-      backward compatible). Empty resulting bucket still degrades to greedy like
-      Alpha<=0. Test TestDoLaLowHighBucketsSelectDifferentLayers pins a planted
-      two-candidate net where low/high select different premature layers and flip
-      the emitted token every step.
 - [ ] Token healing follow-ups (v1 is landed: TNNetTokenHealingConstraint +
       PrepareTokenHealing + TGenerationConfig.TokenHealing):
       (a) PrepareTokenHealing is TStringListInt-only — a TNeuralHFTokenizer
       byte-level-BPE variant needs a vocab prefix-scan helper there;
       (b) guidance-style multi-token rollback (back up over more than the
       single last prompt token when the boundary artifact spans merges).
-- [X] HellaSwag-style eval follow-up: BOTH pieces LANDED in
-      neural/neuralnlpmetrics.pas. (a) ScoreCompletionsBatch(NN, Context,
-      Candidates) scores all candidates of a shared context, skipping the
-      shared-context forwards for single next-token heads (only completion
-      positions are forwarded per candidate) - scores IDENTICAL to per-candidate
-      ScoreCompletion; EvaluateMultipleChoice now routes through it.
-      (b) ScoreSequence/ScoreCompletion gained an optional LastWindow flag
-      (default false = the v1 raise policy) that scores over-context sequences
-      over the trailing context-window ending at each position instead of
-      raising (both per-position and single-head paths). Tests:
-      TestScoreCompletionsBatchMatchesPerCandidate (batch == per-candidate) and
-      TestScoreSequenceLastWindowScoresOverContext (raises by default, scores
-      under LastWindow, trailing position matches the standalone window).
 - [ ] Needle-in-a-haystack long-context eval harness: place a fact at
       varying depths in a synthetic long context, measure retrieval
       accuracy vs (depth, context length) as a small grid report. The
