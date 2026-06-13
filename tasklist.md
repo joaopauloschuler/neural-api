@@ -314,34 +314,11 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [X] HF-names safetensors exporter: export an imported pico-GPT-2 back to
-      HF tensor names (wte.weight, h.N.attn.c_attn.weight, ...), reload via
-      BuildGPT2FromSafeTensors and compare logits; generalize per-importer
-      name maps later. The generic writer landed; only the naming/transpose
-      mapping (Pascal neuron-major vs HF [in,out] Conv1D) is missing.
-      DONE (GPT-2): SaveGPT2ToSafeTensors in neuralpretrained.pas is the exact
-      inverse of the importer (Conv1D [in,out] transpose W[i*out+j]=Neuron[j][i],
-      LayerNorm gamma/beta neurons, tied lm_head re-emit); recovers the named
-      layers by walking the wired net. TestGPT2SafeTensorsRoundTrip round-trips
-      bit-exact (max |diff| < 1e-5). STILL OPEN: per-importer name maps for the
-      other architectures (Llama/Qwen3/BERT/...) - each needs its own
-      layer->HF-name + transpose inverse (the "generalize later" clause).
-- [X] GGUF writer follow-up: export an arbitrary trained/in-memory TNNet
-      (the layer->HF inverse mapping — q/k de-permute + SwiGLU un-fuse —
-      reading weights back out of the WIRED Llama layers) rather than only an
-      HF-named tensor reader + TLlamaConfig as SaveLlamaToGGUF does today. This
-      is what lets a from-scratch CAI-trained Llama (not just a re-export of an
-      import) reach llama.cpp.
-      DONE: SaveTNNetLlamaToGGUF[Ex](Net, Config, ...) in neuralpretrained.pas
-      walks the wired plain-Llama stack into an in-memory HF-named tensor
-      source (TNNetMemTensorReader) — de-fusing SwiGLU gate|up and DE-permuting
-      q/k from the interleaved-rotary neuron layout back to HF rotate_half —
-      then rides the existing SaveLlamaToGGUFEx emitter, so the q/k re-permute,
-      reversed ggml dims and F32/F16/Q8_0 paths are SHARED with the reader-
-      source export. TestTNNetGGUFWriterRoundTrip: wired Llama -> export ->
-      BuildLlamaFromGGUFEx reproduces logits < 1e-5. Q8_0 here re-quantizes
-      from FP32 (writing Q8_0 STRAIGHT from int8 storage is the SEPARATE
-      follow-up below).
+- [ ] HF-names safetensors exporter — per-importer name maps follow-up
+      (the GPT-2 exporter SaveGPT2ToSafeTensors landed as the exact inverse of
+      the importer): add a layer->HF-name + transpose inverse map for the other
+      architectures (Llama/Qwen3/BERT/...), each its own map (the
+      "generalize later" clause of the landed GPT-2 round-trip).
 - [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the
@@ -715,25 +692,6 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       KVHeads-sized cache (cache aliasing keyed by the shared K/V projection
       layers) so the GQA memory win materializes at inference; assert streamed
       output stays bit-identical to the unaliased path.
-- [X] Per-sample / dynamic attention masks in TNNetScaledDotProductAttention
-      (follow-up to TNNetSequencePacker, commit 52c5ca0): SDPA only supports
-      the static causal flag + static sliding window, so packed training
-      windows cannot mask attention across document boundaries (GPT-2/3-style
-      cross-doc attention is what ships today). Add an optional per-sample
-      block-diagonal/document-id mask input (or a segment-ids side channel) and
-      wire `TNNetSequencePacker` to emit it; verify with a test that attention
-      weights across a separator are exactly zero and gradients match an
-      unpacked per-document baseline.
-      DONE: optional `pSegmentSource: TNNetLayer = nil` second-source on
-      `TNNetScaledDotProductAttention` (segment-ids side channel, design (a),
-      wired like TNNetCrossAttention; index serialized in the layer-index slot;
-      default nil = bit-identical legacy path). Mask intersects with
-      causal+window (key attendable iff causal AND window AND seg[i]=seg[j]);
-      ids carry no gradient. `TNNetSequencePacker.GetSegmentIds` /
-      `GetSegmentVolume` emit per-token document ids. Tests:
-      TestSegmentMaskCrossDocAttentionIsZero (cross-doc attn exactly 0),
-      TestSegmentMaskMatchesUnpackedBaseline (parity vs independent per-doc
-      runs), TestSegmentMaskSaveLoad, TestSegmentIdsMarkDocumentBoundaries.
 - [ ] Segment-mask MHA-builder wiring follow-up (the SDPA-layer + packer half
       landed above): thread an optional segment-id source through the
       multi-head attention BUILDERS (AddMultiHeadSelfAttention and friends) so
