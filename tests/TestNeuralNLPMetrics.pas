@@ -83,6 +83,15 @@ type
     // Pinned multiple-choice fixture: the gold answer wins, and acc vs
     // acc_norm disagree on a length-confounded item (p_cat^2 < p_dog < p_cat).
     procedure TestMultipleChoiceAccVsAccNorm;
+    // chrF of an identical pair is exactly 1.0 (every order matches).
+    procedure TestChrFIdenticalIsOne;
+    // chrF / chrF++ pinned against a hand-written char-ngram reference that
+    // reproduces sacrebleu's CHRF aggregation (sacrebleu not installed here).
+    procedure TestChrFPinnedValues;
+    // chrF is tokenizer/whitespace-independent by default: "a b"/"ab" tie.
+    procedure TestChrFWhitespaceStripped;
+    // CorpusChrF is the macro average of the per-pair scores.
+    procedure TestCorpusChrFAverages;
   end;
 
 implementation
@@ -643,6 +652,54 @@ begin
     Dict.Free;
     NN.Free;
   end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestChrFIdenticalIsOne;
+const
+  S = 'the cat sat on the mat';
+begin
+  // Every char (and word) n-gram order matches perfectly -> F = 1 each order.
+  AssertEquals('identical pair chrF', 1.0, ChrF(S, S), 1e-9);
+  AssertEquals('identical pair chrF++', 1.0, ChrFpp(S, S), 1e-9);
+end;
+
+procedure TTestNeuralNLPMetrics.TestChrFPinnedValues;
+begin
+  // Reference values from a hand-written char-ngram script reproducing
+  // sacrebleu's CHRF aggregation (sacrebleu is not installed in this env):
+  // per-order F_beta=2 averaged over effective orders, whitespace stripped.
+  // "abc"/"abd": char n=1 P=R=2/3 (F=2/3); n=2 match 1/2 (F=1/2); n=3 match 0
+  // (F=0); n=4..6 empty (skipped) -> chrF = (2/3+1/2+0)/3 = 7/18.
+  AssertEquals('chrF abc/abd', 7.0 / 18.0, ChrF('abc', 'abd'), 1e-5);
+  // chrF++ adds word unigram (no match, F=0) - bigrams empty/skipped -> the
+  // 3 char orders + 1 word order = (7/6 + 0)/4 = 7/24.
+  AssertEquals('chrF++ abc/abd', 7.0 / 24.0, ChrFpp('abc', 'abd'), 1e-5);
+  // A realistic sentence pair, pinned to the reference script's 0..1 output.
+  AssertEquals('chrF sentence pair', 0.6010827407886231,
+    ChrF('the cat sat on the mat', 'a cat sat upon the mat'), 1e-5);
+  AssertEquals('chrF++ sentence pair', 0.5841453889248007,
+    ChrFpp('the cat sat on the mat', 'a cat sat upon the mat'), 1e-5);
+end;
+
+procedure TTestNeuralNLPMetrics.TestChrFWhitespaceStripped;
+begin
+  // sacrebleu default strips whitespace before char n-grams, so spacing does
+  // not matter: "a b" and "ab" share identical char n-grams -> chrF = 1.
+  AssertEquals('whitespace is stripped by default', 1.0,
+    ChrF('a b', 'ab'), 1e-9);
+  // With IncludeWhitespace the space participates and the score drops below 1.
+  AssertTrue('whitespace-included chrF sees the space',
+    ChrF('a b', 'ab', 6, 2.0, 0, true) < 1.0);
+end;
+
+procedure TTestNeuralNLPMetrics.TestCorpusChrFAverages;
+var
+  P1, P2: TNeuralFloat;
+begin
+  P1 := ChrF('abc', 'abd');
+  P2 := ChrF('the cat', 'the cat'); // identical -> 1.0
+  AssertEquals('corpus chrF is the macro average', (P1 + P2) / 2.0,
+    CorpusChrF(['abc', 'the cat'], ['abd', 'the cat']), 1e-5);
 end;
 
 initialization

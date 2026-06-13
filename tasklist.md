@@ -387,11 +387,14 @@ rather than acted on.
       projections; pairs with the offset-mapping utility from the
       token-classification task to map spans back to text. Test: pinned
       logits → pinned extracted span.
-- [ ] chrF metric in neural/neuralnlpmetrics.pas: character n-gram F-score
+- [X] chrF metric in neural/neuralnlpmetrics.pas: character n-gram F-score
       (Popović 2015) — tokenizer-independent so it sidesteps the BLEU
       tokenization sensitivity, ~100 lines beside the landed BLEU/ROUGE.
-      Optional chrF++ (adds word unigrams+bigrams). Test against pinned
-      values from sacrebleu on a couple of sentence pairs.
+      ChrF/ChrFpp/CorpusChrF; sacrebleu's CHRF aggregation (per-order F
+      averaged) + default whitespace stripping; returns 0..1 (=sacrebleu/100).
+      - [X] chrF++ (word unigrams+bigrams via WordOrder arg) landed too.
+      Pinned against a hand-written char-ngram reference reproducing
+      sacrebleu (sacrebleu not installed in the env).
 - [ ] Strided sliding-window perplexity in neural/neuralnlpmetrics.pas
       (the HF-docs-standard evaluation): for corpora longer than the model
       context, slide a window with stride < window and score only the

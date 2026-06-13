@@ -95,6 +95,32 @@ match count and the candidate n-gram total for every order n >= 2
 candidates shorter than n) are excluded from the geometric mean. Identical
 candidate/reference pairs score exactly 1.0 with or without smoothing.
 
+chrF. ChrF implements Popovic (2015): the character n-gram F-score, a
+tokenizer-INDEPENDENT metric that operates directly on characters and so
+sidesteps BLEU's tokenization sensitivity. For each character n-gram order
+n in 1..CharOrder (default 6) the clipped (min-count) multiset overlap
+gives a per-order precision (match/hyp) and recall (match/ref); a per-order
+F_beta = (1+beta^2)*P*R / (beta^2*P + R) is formed, and the metric is the
+ARITHMETIC MEAN of the per-order F_beta over all "effective" orders (orders
+where the hypothesis OR reference has at least one n-gram of that length;
+empty orders are skipped, never counted as zero). beta default 2 weights
+recall twice precision. This matches sacrebleu's CHRF aggregation (average
+of per-order F, NOT F of the averaged P/R).
+
+WHITESPACE (sacrebleu default, documented): sacrebleu's default chrF has
+whitespace=False, which STRIPS all whitespace before extracting character
+n-grams (so "a b" and "ab" share the same char n-grams). ChrF reproduces
+that default; pass IncludeWhitespace=true for the spaces-in-n-grams variant.
+
+chrF++ (ChrFpp / the WordOrder argument): adds WORD n-grams (whitespace-
+tokenized, BEFORE whitespace stripping) of orders 1..WordOrder to the same
+per-order F average. The canonical chrF++ uses WordOrder=2 (word unigrams +
+bigrams); WordOrder=0 is plain chrF.
+
+SCALE: the functions here return a 0..1 fraction (consistent with the
+CorpusBLEU/ROUGE convention in this unit); sacrebleu reports the same number
+multiplied by 100. CorpusChrF macro-averages the per-pair score.
+
 ROUGE. RougeN returns clipped n-gram overlap precision/recall/F1
 (beta = 1); RougeL returns the LCS-based variant (P = LCS/|cand|,
 R = LCS/|ref|, F1 = harmonic mean). CorpusRougeN / CorpusRougeL average the
@@ -210,6 +236,25 @@ function RougeL(const Candidate, Reference: string): TNNetRougeScore; overload;
 function CorpusRougeN(const Candidates, References: array of string;
   N: integer): TNNetRougeScore;
 function CorpusRougeL(const Candidates, References: array of string): TNNetRougeScore;
+
+// chrF / chrF++ (Popovic 2015) for one hypothesis/reference string pair.
+// CharOrder = max character n-gram length (default 6); Beta weights recall
+// (default 2); WordOrder > 0 turns on chrF++ (word n-grams 1..WordOrder, the
+// canonical chrF++ uses 2); IncludeWhitespace = false (sacrebleu default)
+// strips all whitespace before char n-gram extraction. Returns a 0..1
+// fraction (= sacrebleu's report / 100).
+function ChrF(const Hypothesis, Reference: string;
+  CharOrder: integer = 6; Beta: TNeuralFloat = 2.0;
+  WordOrder: integer = 0; IncludeWhitespace: boolean = false): TNeuralFloat;
+
+// Convenience chrF++ wrapper: ChrF with WordOrder = 2.
+function ChrFpp(const Hypothesis, Reference: string;
+  CharOrder: integer = 6; Beta: TNeuralFloat = 2.0): TNeuralFloat;
+
+// Corpus-level (macro-averaged) chrF over aligned hypothesis/reference lists.
+function CorpusChrF(const Hypotheses, References: array of string;
+  CharOrder: integer = 6; Beta: TNeuralFloat = 2.0;
+  WordOrder: integer = 0; IncludeWhitespace: boolean = false): TNeuralFloat;
 
 implementation
 
@@ -887,6 +932,145 @@ begin
   Result.Precision := Result.Precision / Length(Candidates);
   Result.Recall := Result.Recall / Length(Candidates);
   Result.F1 := Result.F1 / Length(Candidates);
+end;
+
+// ---------------------------------------------------------------------------
+// chrF / chrF++
+// ---------------------------------------------------------------------------
+
+// Sorted "ngram -> count" multiset of all length-N character substrings of S.
+function CountCharNGrams(const S: string; N: integer): TStringList;
+var
+  Start, KeyPos: integer;
+  Key: string;
+begin
+  Result := TStringList.Create();
+  Result.Sorted := true;
+  Result.CaseSensitive := true;
+  for Start := 1 to Length(S) - N + 1 do
+  begin
+    Key := Copy(S, Start, N);
+    if Result.Find(Key, KeyPos)
+    then Result.Objects[KeyPos] := TObject(PtrInt(Result.Objects[KeyPos]) + 1)
+    else Result.AddObject(Key, TObject(PtrInt(1)));
+  end;
+end;
+
+// Accumulates one effective order into the running F-score sum: given the
+// clipped match count and the hypothesis / reference n-gram totals, adds the
+// per-order F_beta (skipping the order entirely when both totals are zero).
+procedure AddOrderF(Match, HypTotal, RefTotal: integer; Beta2: TNeuralFloat;
+  var ScoreSum: TNeuralFloat; var EffOrders: integer);
+var
+  P, R, Denom: TNeuralFloat;
+begin
+  if (HypTotal = 0) and (RefTotal = 0) then Exit; // order not present at all
+  if HypTotal > 0 then P := Match / HypTotal else P := 0;
+  if RefTotal > 0 then R := Match / RefTotal else R := 0;
+  Denom := Beta2 * P + R;
+  if Denom > 0
+  then ScoreSum := ScoreSum + (1 + Beta2) * P * R / Denom;
+  // (Denom = 0 contributes a zero F but still counts as an effective order.)
+  Inc(EffOrders);
+end;
+
+function ChrF(const Hypothesis, Reference: string;
+  CharOrder: integer = 6; Beta: TNeuralFloat = 2.0;
+  WordOrder: integer = 0; IncludeWhitespace: boolean = false): TNeuralFloat;
+var
+  H, R: string;
+  HypW, RefW: TNeuralIntegerArray; // word-id sequences for chrF++
+  Vocab: TStringList;
+  N, ScoreSumOrders: integer;
+  HypNG, RefNG: TStringList;
+  HypWNG, RefWNG: TStringList;
+  ScoreSum, Beta2: TNeuralFloat;
+
+  // Strip whitespace (sacrebleu default) or keep it, per IncludeWhitespace.
+  function Prep(const Src: string): string;
+  var I: integer;
+  begin
+    if IncludeWhitespace then Exit(Src);
+    Result := '';
+    for I := 1 to Length(Src) do
+      if Src[I] > ' ' then Result := Result + Src[I];
+  end;
+
+begin
+  Result := 0;
+  if CharOrder < 1 then CharOrder := 1;
+  if Beta <= 0 then Beta := 2.0;
+  Beta2 := Beta * Beta;
+  H := Prep(Hypothesis);
+  R := Prep(Reference);
+  ScoreSum := 0;
+  ScoreSumOrders := 0;
+  // Character n-gram orders.
+  for N := 1 to CharOrder do
+  begin
+    HypNG := CountCharNGrams(H, N);
+    RefNG := CountCharNGrams(R, N);
+    try
+      AddOrderF(ClippedOverlap(HypNG, RefNG),
+        // total counts = sum over types, but a multiset's total is just the
+        // number of n-gram occurrences = max(0, len - n + 1).
+        Max(0, Length(H) - N + 1), Max(0, Length(R) - N + 1),
+        Beta2, ScoreSum, ScoreSumOrders);
+    finally
+      HypNG.Free;
+      RefNG.Free;
+    end;
+  end;
+  // Word n-gram orders (chrF++): tokenize through a shared vocab so identical
+  // words map to identical ids, then reuse the BLEU/ROUGE n-gram machinery.
+  if WordOrder > 0 then
+  begin
+    Vocab := TStringList.Create();
+    Vocab.Sorted := true;
+    Vocab.CaseSensitive := true;
+    try
+      // Word ids come from the ORIGINAL strings (before whitespace stripping).
+      TokenizeWithVocab(Hypothesis, Vocab, HypW);
+      TokenizeWithVocab(Reference, Vocab, RefW);
+      for N := 1 to WordOrder do
+      begin
+        HypWNG := CountNGrams(HypW, N);
+        RefWNG := CountNGrams(RefW, N);
+        try
+          AddOrderF(ClippedOverlap(HypWNG, RefWNG),
+            Max(0, Length(HypW) - N + 1), Max(0, Length(RefW) - N + 1),
+            Beta2, ScoreSum, ScoreSumOrders);
+        finally
+          HypWNG.Free;
+          RefWNG.Free;
+        end;
+      end;
+    finally
+      Vocab.Free;
+    end;
+  end;
+  if ScoreSumOrders > 0 then Result := ScoreSum / ScoreSumOrders;
+end;
+
+function ChrFpp(const Hypothesis, Reference: string;
+  CharOrder: integer = 6; Beta: TNeuralFloat = 2.0): TNeuralFloat;
+begin
+  Result := ChrF(Hypothesis, Reference, CharOrder, Beta, 2, false);
+end;
+
+function CorpusChrF(const Hypotheses, References: array of string;
+  CharOrder: integer = 6; Beta: TNeuralFloat = 2.0;
+  WordOrder: integer = 0; IncludeWhitespace: boolean = false): TNeuralFloat;
+var
+  PairIdx: integer;
+begin
+  Result := 0;
+  if (Length(Hypotheses) = 0) or
+     (Length(Hypotheses) <> Length(References)) then Exit;
+  for PairIdx := 0 to High(Hypotheses) do
+    Result := Result + ChrF(Hypotheses[PairIdx], References[PairIdx],
+      CharOrder, Beta, WordOrder, IncludeWhitespace);
+  Result := Result / Length(Hypotheses);
 end;
 
 end.
