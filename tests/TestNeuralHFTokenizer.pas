@@ -43,6 +43,12 @@ type
     procedure TestEncodeIntegerArrayHelper;
     procedure TestOffsetMappingRoundTrip;
     procedure TestOffsetMappingWordIds;
+    // BPE-dropout (Provilkov et al. 2020): p=0 is bit-identical to eval;
+    // p=1 is the maximally-split per-byte tokenization; a seeded mid-value
+    // run is deterministic and differs from p=0.
+    procedure TestDropoutZeroIsBitIdentical;
+    procedure TestDropoutOneIsMaximallySplit;
+    procedure TestDropoutSeededIsDeterministicAndDiffers;
   end;
 
   // Tests for the chat templates in neuralchat.pas. The flagship tests
@@ -446,6 +452,98 @@ begin
         MaxWord := Offsets[I].WordId;
       end;
     AssertEquals('three whitespace words -> max word id 2', 2, MaxWord);
+  finally
+    Tok.Free;
+  end;
+end;
+
+// p=0 (default) must reproduce the deterministic byte-level BPE ids exactly
+// (bit-identical to eval/inference; mirrors TestNeuralTokenizer).
+procedure TTestNeuralHFTokenizer.TestDropoutZeroIsBitIdentical;
+var
+  Tok: TNeuralHFTokenizer;
+  BaseLine, WithZero: TNeuralIntegerArray;
+  I: integer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    AssertEquals('DropoutProb defaults to OFF', 0.0, Tok.DropoutProb, 0.0);
+    BaseLine := Tok.Encode('the cat sat on the mat');
+    Tok.DropoutProb := 0.0;
+    RandSeed := 999; // must be irrelevant at p=0
+    WithZero := Tok.Encode('the cat sat on the mat');
+    AssertEquals('p=0 id count unchanged', Length(BaseLine), Length(WithZero));
+    for I := 0 to High(BaseLine) do
+      AssertEquals('p=0 id[' + IntToStr(I) + ']', BaseLine[I], WithZero[I]);
+  finally
+    Tok.Free;
+  end;
+end;
+
+// p=1 drops EVERY merge, so the tokenization collapses to the per-byte
+// alphabet tokens (the maximally-split segmentation), which still
+// round-trips on decode.
+procedure TTestNeuralHFTokenizer.TestDropoutOneIsMaximallySplit;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TNeuralIntegerArray;
+  Text: string;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    Text := 'the cat';
+    Tok.DropoutProb := 1.0;
+    RandSeed := 1;
+    Ids := Tok.Encode(Text);
+    // The maximally-split result is one id per UTF-8 byte of the text
+    // (every byte maps to its byte-level alphabet token, no merge applied).
+    AssertEquals('p=1 emits one id per input byte', Length(Text), Length(Ids));
+    AssertEquals('p=1 still round-trips', Text, Tok.Decode(Ids, true));
+  finally
+    Tok.Free;
+  end;
+end;
+
+// A seeded mid-value run is deterministic (same seed -> same ids) and
+// differs from the p=0 deterministic segmentation.
+procedure TTestNeuralHFTokenizer.TestDropoutSeededIsDeterministicAndDiffers;
+var
+  Tok: TNeuralHFTokenizer;
+  Deterministic, RunA, RunB: TNeuralIntegerArray;
+  Text: string;
+  I: integer;
+  Differs: boolean;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    Text := 'the cat sat on the mat';
+    Deterministic := Tok.Encode(Text);
+
+    Tok.DropoutProb := 0.5;
+    RandSeed := 424242;
+    RunA := Tok.Encode(Text);
+    RandSeed := 424242;
+    RunB := Tok.Encode(Text);
+
+    // Same seed -> identical ids (deterministic given the RNG state).
+    AssertEquals('seeded dropout id count stable',
+      Length(RunA), Length(RunB));
+    for I := 0 to High(RunA) do
+      AssertEquals('seeded dropout id[' + IntToStr(I) + ']',
+        RunA[I], RunB[I]);
+
+    // The dropout segmentation must differ from the p=0 one (the chosen
+    // seed/text actually drops at least one merge).
+    Differs := Length(RunA) <> Length(Deterministic);
+    if not Differs then
+      for I := 0 to High(RunA) do
+        if RunA[I] <> Deterministic[I] then Differs := true;
+    AssertTrue('seeded dropout differs from deterministic', Differs);
+    // And it still round-trips.
+    AssertEquals('seeded dropout round-trips', Text, Tok.Decode(RunA, true));
   finally
     Tok.Free;
   end;
