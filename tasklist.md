@@ -403,13 +403,19 @@ rather than acted on.
       TestNeuralNLPMetrics (BIO decode, perfect/boundary/split/type-mismatch
       P/R/F1, micro-average), TestNeuralHFTokenizer (offset round-trip +
       word-id alignment). README + builder reused by Task B.
-- [ ] QA span-extraction head (transformers ForQuestionAnswering port):
+- [X] QA span-extraction head (transformers ForQuestionAnswering port):
       two per-token logit heads (start/end) over the sequence axis +
       SQuAD-style postprocessing (top-k start×end pairs, end>=start, max
       answer length, n-best list). Pure composition over existing per-token
       projections; pairs with the offset-mapping utility from the
       token-classification task to map spans back to text. Test: pinned
       logits → pinned extracted span.
+      DONE: TNNet.AddQuestionAnsweringHead() -> two parallel per-token
+      PointwiseConvLinear(1) start/end logits concatenated to (SeqLen,1,2);
+      ExtractQASpans(StartLogits,EndLogits,TopK,MaxAnswerLen,NBest) n-best
+      list ranked by start+end logit, end>=start + length cap, in
+      neuralnlpmetrics.pas. Maps back to text via EncodeWithOffsets (Task A).
+      Tests TestExtractQASpansPinned / TestExtractQASpansMaxLenAndOrder.
 - [ ] Strided sliding-window perplexity in neural/neuralnlpmetrics.pas
       (the HF-docs-standard evaluation): for corpora longer than the model
       context, slide a window with stride < window and score only the

@@ -106,6 +106,9 @@ type
     procedure TestEntityScoreBoundaryError;
     procedure TestEntityScoreTypeMismatch;
     procedure TestCorpusEntityScoreMicroAverage;
+    // QA span extraction (Task B): pinned logits -> pinned n-best spans.
+    procedure TestExtractQASpansPinned;
+    procedure TestExtractQASpansMaxLenAndOrder;
   end;
 
 implementation
@@ -873,6 +876,44 @@ begin
   AssertEquals('micro FP', 1, S.FalsePos);
   AssertEquals('micro FN', 1, S.FalseNeg);
   AssertEquals('micro F1', 0.5, S.F1, 1e-9);
+end;
+
+procedure TTestNeuralNLPMetrics.TestExtractQASpansPinned;
+var
+  StartLogits, EndLogits: TNeuralFloatDynArr;
+  Spans: TNNetQASpanArray;
+begin
+  // 5 tokens. Best start at idx 1 (3.0), best end at idx 3 (4.0): span [1..3].
+  StartLogits := TNeuralFloatDynArr.Create(0.5, 3.0, 0.1, 0.2, 0.0);
+  EndLogits   := TNeuralFloatDynArr.Create(0.0, 0.3, 1.0, 4.0, 0.1);
+  Spans := ExtractQASpans(StartLogits, EndLogits, 20, 30, 20);
+  AssertTrue('at least one span', Length(Spans) >= 1);
+  AssertEquals('best start', 1, Spans[0].TokenStart);
+  AssertEquals('best end', 3, Spans[0].TokenEnd);
+  AssertEquals('best score', 7.0, Spans[0].Score, 1e-6);
+  // Spans are ranked descending by score.
+  AssertTrue('descending order', Spans[0].Score >= Spans[1].Score);
+end;
+
+procedure TTestNeuralNLPMetrics.TestExtractQASpansMaxLenAndOrder;
+var
+  StartLogits, EndLogits: TNeuralFloatDynArr;
+  Spans: TNNetQASpanArray;
+begin
+  // Best raw pair would be start 0, end 4 (len 5), but MaxAnswerLen=2 forbids
+  // it. With cap 2 the valid top pair is start 0 (5.0) end 1 (5.0) = 10.0.
+  StartLogits := TNeuralFloatDynArr.Create(5.0, 0.0, 0.0, 0.0, 0.0);
+  EndLogits   := TNeuralFloatDynArr.Create(0.0, 5.0, 0.0, 0.0, 4.0);
+  Spans := ExtractQASpans(StartLogits, EndLogits, 20, 2, 20);
+  AssertEquals('capped start', 0, Spans[0].TokenStart);
+  AssertEquals('capped end', 1, Spans[0].TokenEnd);
+  AssertEquals('capped len <= 2', true,
+    (Spans[0].TokenEnd - Spans[0].TokenStart + 1) <= 2);
+  // end >= start enforced.
+  AssertTrue('end>=start', Spans[0].TokenEnd >= Spans[0].TokenStart);
+  // NBest cap limits the list length.
+  Spans := ExtractQASpans(StartLogits, EndLogits, 20, 30, 3);
+  AssertTrue('n-best capped at 3', Length(Spans) <= 3);
 end;
 
 initialization

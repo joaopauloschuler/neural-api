@@ -12108,6 +12108,15 @@ type
       // per-position argmax over the NumLabels depth axis (BIO/IOB2 tag id). Returns
       // the logits layer. (Coded by Claude (AI).)
       function AddTokenClassificationHead(NumLabels: integer): TNNetLayer;
+      // QA SPAN-EXTRACTION head (HF *ForQuestionAnswering port): TWO parallel
+      // per-token logit projections (start, end) of the (SeqLen,1,d_model) hidden
+      // state, each a token-wise 1x1 conv (TNNetPointwiseConvLinear) to 1 channel,
+      // concatenated along depth into output (SeqLen,1,2): channel 0 = start logit,
+      // channel 1 = end logit per position. Pure composition over per-token
+      // projections; pairs with neuralnlpmetrics.ExtractQASpans + the tokenizer
+      // offset-mapping to map the best (start,end) span back to text. Returns the
+      // concatenated output layer. (Coded by Claude (AI).)
+      function AddQuestionAnsweringHead(): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       // Single-head SINKHORN attention: a drop-in, DOUBLY-STOCHASTIC contrast to
       // softmax self-attention. Standard attention row-normalizes the scaled QK^T
@@ -48552,6 +48561,19 @@ begin
   // Token-wise 1x1 conv keeps the (SeqLen,1,*) sequence axis: every token gets its
   // own NumLabels-wide logit vector (a FullConnect would flatten/mix the tokens).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(NumLabels));
+end;
+
+function TNNet.AddQuestionAnsweringHead(): TNNetLayer;
+var
+  Trunk, StartLogit, EndLogit: TNNetLayer;
+begin
+  Trunk := GetLastLayer();           // shared (SeqLen,1,d_model) hidden state
+  // Two parallel per-token 1-channel projections off the SAME trunk. Token-wise
+  // 1x1 convs keep the sequence axis (FullConnect would mix tokens).
+  StartLogit := AddLayerAfter(TNNetPointwiseConvLinear.Create(1), Trunk);
+  EndLogit   := AddLayerAfter(TNNetPointwiseConvLinear.Create(1), Trunk);
+  // Concatenate along depth -> (SeqLen,1,2): channel 0 = start, channel 1 = end.
+  Result := AddLayer(TNNetDeepConcat.Create([StartLogit, EndLogit]));
 end;
 
 // Ported code from:

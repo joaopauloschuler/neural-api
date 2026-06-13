@@ -232,6 +232,15 @@ type
     FalseNeg: integer;
   end;
 
+  // One QA candidate answer span (token-index range, inclusive) and its score
+  // (start_logit + end_logit), produced by ExtractQASpans as an n-best list.
+  TNNetQASpan = record
+    TokenStart: integer;
+    TokenEnd: integer;
+    Score: TNeuralFloat;
+  end;
+  TNNetQASpanArray = array of TNNetQASpan;
+
 // Teacher-forced held-out perplexity of a token-level autoregressive LM over
 // a corpus of text samples (one sample per Corpus line). See the unit header
 // for head-shape auto-detection, truncation and special-token rules.
@@ -350,6 +359,21 @@ function EntityScore(const PredTags, GoldTags: array of string): TNNetEntityScor
 // once (the seqeval classification_report micro-average). Pred[i] and Gold[i]
 // are the tag sequences of sentence i and must be equal length.
 function CorpusEntityScore(const Pred, Gold: array of TStringArray): TNNetEntityScore;
+
+// ---------------------------------------------------------------------------
+// QA span extraction (SQuAD-style postprocessing)
+// ---------------------------------------------------------------------------
+
+// SQuAD-style n-best span extraction from per-token start/end logits. Considers
+// the TopK highest start positions and TopK highest end positions, forms every
+// (start,end) pair with end >= start and (end - start + 1) <= MaxAnswerLen, and
+// returns them ranked by start_logit + end_logit (descending), keeping at most
+// NBest candidates. StartLogits and EndLogits must have the same length (the
+// sequence length); MaxAnswerLen <= 0 means no length cap. The top result is
+// Result[0] (empty array only when no valid pair exists, e.g. zero-length input).
+function ExtractQASpans(const StartLogits, EndLogits: TNeuralFloatDynArr;
+  TopK: integer = 20; MaxAnswerLen: integer = 30;
+  NBest: integer = 20): TNNetQASpanArray;
 
 implementation
 
@@ -1454,6 +1478,82 @@ begin
       Result.TruePos, Result.FalsePos, Result.FalseNeg);
   end;
   FinishEntityScore(Result);
+end;
+
+// ---------------------------------------------------------------------------
+// QA span extraction
+// ---------------------------------------------------------------------------
+
+// Returns the indices of the TopK largest values in Logits (descending by
+// value; stable first-max tie-break by index). Fewer than TopK when the input
+// is shorter.
+function TopKIndices(const Logits: TNeuralFloatDynArr; TopK: integer): TNeuralIntegerArray;
+var
+  Order: TNeuralIntegerArray;
+  I, J, Tmp, N: integer;
+begin
+  N := Length(Logits);
+  SetLength(Order, N);
+  for I := 0 to N - 1 do Order[I] := I;
+  // simple selection sort by descending logit (N is small: TopK candidates)
+  for I := 0 to N - 1 do
+    for J := I + 1 to N - 1 do
+      if Logits[Order[J]] > Logits[Order[I]] then
+      begin
+        Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
+      end;
+  if TopK > N then TopK := N;
+  if TopK < 0 then TopK := 0;
+  SetLength(Result, TopK);
+  for I := 0 to TopK - 1 do Result[I] := Order[I];
+end;
+
+function ExtractQASpans(const StartLogits, EndLogits: TNeuralFloatDynArr;
+  TopK: integer = 20; MaxAnswerLen: integer = 30;
+  NBest: integer = 20): TNNetQASpanArray;
+var
+  StartIdx, EndIdx: TNeuralIntegerArray;
+  I, J, S, E, Count, A, B, Tmp: integer;
+  Cand: TNNetQASpanArray;
+  TmpSpan: TNNetQASpan;
+begin
+  SetLength(Result, 0);
+  if Length(StartLogits) <> Length(EndLogits) then
+    raise EArgumentException.Create(
+      'ExtractQASpans: StartLogits and EndLogits must have the same length.');
+  if Length(StartLogits) = 0 then Exit;
+
+  StartIdx := TopKIndices(StartLogits, TopK);
+  EndIdx := TopKIndices(EndLogits, TopK);
+
+  Count := 0;
+  SetLength(Cand, Length(StartIdx) * Length(EndIdx));
+  for I := 0 to High(StartIdx) do
+    for J := 0 to High(EndIdx) do
+    begin
+      S := StartIdx[I];
+      E := EndIdx[J];
+      if E < S then Continue;
+      if (MaxAnswerLen > 0) and ((E - S + 1) > MaxAnswerLen) then Continue;
+      Cand[Count].TokenStart := S;
+      Cand[Count].TokenEnd := E;
+      Cand[Count].Score := StartLogits[S] + EndLogits[E];
+      Inc(Count);
+    end;
+  SetLength(Cand, Count);
+
+  // descending by score (stable selection sort; small candidate set)
+  for A := 0 to Count - 1 do
+    for B := A + 1 to Count - 1 do
+      if Cand[B].Score > Cand[A].Score then
+      begin
+        TmpSpan := Cand[A]; Cand[A] := Cand[B]; Cand[B] := TmpSpan;
+      end;
+
+  Tmp := Count;
+  if (NBest > 0) and (NBest < Tmp) then Tmp := NBest;
+  SetLength(Result, Tmp);
+  for A := 0 to Tmp - 1 do Result[A] := Cand[A];
 end;
 
 end.
