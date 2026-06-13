@@ -948,6 +948,9 @@ var
   Info: TSafeTensorInfo;
   i: integer;
   V, Tol: single;
+  SidecarPath, Json: string;
+  Sidecar: TStringList;
+  FS: TFormatSettings;
 
   function Value(pElement: integer): single;
   begin
@@ -958,7 +961,11 @@ var
 
 begin
   RandSeed := 424242;
+  // Fixed file names (NOT deleted): tools/verify_safetensors_writer.py loads
+  // this pair with the Python "safetensors" library to cross-check that the
+  // EncodeF16/EncodeBF16 encode-on-write output is byte-correct.
   Path := GetTempDir(false) + 'cai_st_writer_half.safetensors';
+  SidecarPath := GetTempDir(false) + 'cai_st_writer_half.json';
   Src := TNNetVolume.Create;
   Dst := TNNetVolume.Create;
   Src.ReSize(11, 1, 1);
@@ -1019,7 +1026,41 @@ begin
     Reader.Free;
     Dst.Free;
     Src.Free;
-    DeleteFile(Path);
+  end;
+
+  // Emit the JSON sidecar for the Python cross-check: the original F32 source
+  // values (9 sig digits round-trip float32 exactly) plus the expected on-disk
+  // dtype per tensor. The Python verifier decodes F16/BF16 and asserts the
+  // values match within the format's rounding tolerance.
+  FS := DefaultFormatSettings;
+  FS.DecimalSeparator := '.';
+  Json := '{"file":"' + StringReplace(Path, '\', '/', [rfReplaceAll]) +
+    '","tensors":{';
+  Json := Json + '"half.f32":{"dtype":"F32","shape":[11],"values":[';
+  for i := 0 to 10 do
+  begin
+    if i > 0 then Json := Json + ',';
+    Json := Json + FloatToStrF(Value(i), ffGeneral, 9, 0, FS);
+  end;
+  Json := Json + ']},"half.f16":{"dtype":"F16","shape":[11],"values":[';
+  for i := 0 to 10 do
+  begin
+    if i > 0 then Json := Json + ',';
+    Json := Json + FloatToStrF(Value(i), ffGeneral, 9, 0, FS);
+  end;
+  Json := Json + ']},"half.bf16":{"dtype":"BF16","shape":[11],"values":[';
+  for i := 0 to 10 do
+  begin
+    if i > 0 then Json := Json + ',';
+    Json := Json + FloatToStrF(Value(i), ffGeneral, 9, 0, FS);
+  end;
+  Json := Json + ']}}}';
+  Sidecar := TStringList.Create;
+  try
+    Sidecar.Text := Json;
+    Sidecar.SaveToFile(SidecarPath);
+  finally
+    Sidecar.Free;
   end;
 end;
 

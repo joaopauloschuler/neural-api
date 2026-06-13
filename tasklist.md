@@ -239,7 +239,7 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [ ] safetensors writer F16/BF16 cross-check: tools/verify_safetensors_writer.py
+- [X] safetensors writer F16/BF16 cross-check: tools/verify_safetensors_writer.py
       cross-checks the F32 writer against the python safetensors library but is
       not extended to the landed EncodeF16/EncodeBF16 encode-on-write output —
       add a quick python-side dtype + value assert over an F16/BF16 file
