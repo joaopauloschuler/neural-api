@@ -359,7 +359,7 @@ rather than acted on.
       examples/MagnitudePruning prune-and-restore sweep); still open are
       masks that stay applied (instead of restoring weights after the
       sweep) and a fine-tune-after-prune example showing accuracy recovery.
-- [ ] Anomaly detection mode (autograd.set_detect_anomaly port): a debug
+- [X] Anomaly detection mode (autograd.set_detect_anomaly port): a debug
       flag that checks every layer's Output/OutputError for NaN/Inf during
       forward AND backward and names the FIRST offending layer + phase.
       The random-architecture NaN fuzz task elsewhere in this list finds

@@ -137,9 +137,165 @@ type
     procedure TestShakeDropEvalAndRoundTrip;
     procedure TestRoutingEntropyReportSmoke;
     procedure TestLocalLearningCoefficientReportSmoke;
+    procedure TestDetectAnomalyCleanForwardBackward;
+    procedure TestDetectAnomalyForwardCatchesNaN;
+    procedure TestDetectAnomalyBackwardCatchesNaN;
+    procedure TestDetectAnomalyOffDoesNotRaise;
   end;
 
 implementation
+
+procedure TTestNeuralLayersExtra.TestDetectAnomalyCleanForwardBackward;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+begin
+  // A clean tiny net with anomaly detection ON must NOT raise.
+  NN := TNNet.Create;
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(2, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.SetLearningRate(0.01, 0.0);
+    NN.DetectAnomaly := True;
+    Input.Fill(0.5);
+    Target.Fill(0.1);
+    // Should run cleanly through both passes with no exception.
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+    AssertTrue('clean forward/backward did not raise with DetectAnomaly on', True);
+  finally
+    Target.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDetectAnomalyForwardCatchesNaN;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Raised: boolean;
+  Msg: string;
+begin
+  // Inject Infinity into a hidden layer's bias so its OUTPUT becomes non-finite
+  // during the forward pass; the anomaly must be caught and name layer 1.
+  NN := TNNet.Create;
+  Input := TNNetVolume.Create(4, 1, 1);
+  Raised := False;
+  Msg := '';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3)); // layer index 1
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.DetectAnomaly := True;
+    NN.HideMessages();
+    Input.Fill(0.5);
+    NN.Layers[1].Neurons[0].BiasWeight := Infinity;
+    try
+      NN.Compute(Input);
+    except
+      on E: Exception do
+      begin
+        Raised := True;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('forward anomaly was raised', Raised);
+    AssertTrue('message names FORWARD phase', Pos('FORWARD', Msg) > 0);
+    AssertTrue('message names OUTPUT', Pos('OUTPUT', Msg) > 0);
+    AssertTrue('message names layer 1', Pos('layer 1 ', Msg) > 0);
+    AssertTrue('message names layer class',
+      Pos('TNNetFullConnectLinear', Msg) > 0);
+  finally
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDetectAnomalyBackwardCatchesNaN;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  Raised: boolean;
+  Msg: string;
+begin
+  // A non-finite TARGET makes the output layer's OutputError non-finite during
+  // the backward pass; the anomaly must be caught and name the BACKWARD phase.
+  NN := TNNet.Create;
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(2, 1, 1);
+  Raised := False;
+  Msg := '';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2)); // output, layer index 2
+    NN.SetLearningRate(0.01, 0.0);
+    NN.DetectAnomaly := True;
+    NN.HideMessages();
+    Input.Fill(0.5);
+    Target.Fill(Infinity);
+    NN.Compute(Input);
+    try
+      NN.Backpropagate(Target);
+    except
+      on E: Exception do
+      begin
+        Raised := True;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('backward anomaly was raised', Raised);
+    AssertTrue('message names BACKWARD phase', Pos('BACKWARD', Msg) > 0);
+    AssertTrue('message names OUTPUTERROR', Pos('OUTPUTERROR', Msg) > 0);
+    AssertTrue('message names layer 2', Pos('layer 2 ', Msg) > 0);
+  finally
+    Target.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDetectAnomalyOffDoesNotRaise;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  Raised: boolean;
+begin
+  // With DetectAnomaly OFF (default), the same non-finite injection must NOT
+  // raise - the overhead-off path is silent.
+  NN := TNNet.Create;
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(2, 1, 1);
+  Raised := False;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.SetLearningRate(0.01, 0.0);
+    AssertFalse('DetectAnomaly defaults to false', NN.DetectAnomaly);
+    NN.HideMessages();
+    Input.Fill(0.5);
+    // Same forward injection as the forward-anomaly test, but the flag is OFF.
+    NN.Layers[1].Neurons[0].BiasWeight := Infinity;
+    try
+      NN.Compute(Input);
+    except
+      on E: Exception do
+        Raised := True;
+    end;
+    AssertFalse('no anomaly raised when DetectAnomaly is off', Raised);
+    AssertTrue('output is actually non-finite (injection took effect)',
+      NN.Layers[1].Output.HasNonFinite());
+  finally
+    Target.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
 
 procedure TTestNeuralLayersExtra.TestDeconvolutionForward;
 var

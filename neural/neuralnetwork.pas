@@ -11121,6 +11121,9 @@ type
       FBackwardTime: double;
       //Layer with Max Delta. You can read after calling GetMaxAbsoluteDelta.
       FMaxDeltaLayer: integer;
+      // When True, anomaly detection scans each layer's Output (forward) and
+      // OutputError (backward) for NaN/Inf and raises on the first offender.
+      FDetectAnomaly: boolean;
       {$IFDEF OpenCL}
       FDotProductKernel: TDotProductKernel;
       {$ENDIF}
@@ -14842,12 +14845,26 @@ type
       // custom layers support
       function ShouldIncDepartingBranchesCnt(pLayer: TNNetLayer):boolean; virtual;
 
+      // Anomaly detection (port of torch.autograd.set_detect_anomaly).
+      // When DetectAnomaly is True, Compute scans every layer's Output for
+      // NaN/Inf right after that layer runs (forward), and Backpropagate scans
+      // every layer's OutputError for NaN/Inf after the backward pass. On the
+      // FIRST offending layer it raises an exception (via FErrorProc) naming the
+      // layer index, the layer class and the phase, e.g.:
+      //   'Anomaly detected: NaN/Inf in OUTPUT of layer 7 (TNNetSwiGLU) during FORWARD pass'
+      // The per-element scan is O(size) per layer per pass and is only paid when
+      // the flag is enabled; it is OFF by default.
+      procedure CheckForwardAnomaly(LayerCnt: integer);
+      procedure CheckBackwardAnomaly();
+
     published
       property BackwardTime: double read FBackwardTime write FBackwardTime;
       property ForwardTime: double read FForwardTime write FForwardTime;
       property Layers: TNNetLayerList read FLayers;
       property LearningRate: TNeuralFloat read FLearningRate;
       property MaxDeltaLayer: integer read FMaxDeltaLayer;
+      // Enables anomaly detection. See CheckForwardAnomaly/CheckBackwardAnomaly.
+      property DetectAnomaly: boolean read FDetectAnomaly write FDetectAnomaly;
   end;
 
   { TNNetSWAWrapper }
@@ -69175,6 +69192,7 @@ begin
   inherited Create();
   FLayers := TNNetLayerList.Create();
   ClearTime();
+  FDetectAnomaly := false;
   {$IFDEF OpenCL}
   FDotProductKernel := nil;
   {$ENDIF}
@@ -87813,6 +87831,44 @@ begin
   end;
 end;
 
+procedure TNNet.CheckForwardAnomaly(LayerCnt: integer);
+var
+  Msg: string;
+begin
+  if Assigned(FLayers[LayerCnt].FOutput) and
+     FLayers[LayerCnt].FOutput.HasNonFinite() then
+  begin
+    Msg :=
+      'Anomaly detected: NaN/Inf in OUTPUT of layer ' + IntToStr(LayerCnt) +
+      ' (' + FLayers[LayerCnt].ClassName + ') during FORWARD pass';
+    FErrorProc(Msg);
+    raise Exception.Create(Msg);
+  end;
+end;
+
+procedure TNNet.CheckBackwardAnomaly();
+var
+  LayerCnt: integer;
+  Msg: string;
+begin
+  // Backpropagation runs from the output layer towards the input layer, so the
+  // FIRST offending layer (in computation order) is the one with the highest
+  // index. Scan from output to input and raise on the first non-finite
+  // OutputError found.
+  for LayerCnt := GetLastLayerIdx() downto 0 do
+  begin
+    if Assigned(FLayers[LayerCnt].FOutputError) and
+       FLayers[LayerCnt].FOutputError.HasNonFinite() then
+    begin
+      Msg :=
+        'Anomaly detected: NaN/Inf in OUTPUTERROR of layer ' + IntToStr(LayerCnt) +
+        ' (' + FLayers[LayerCnt].ClassName + ') during BACKWARD pass';
+      FErrorProc(Msg);
+      raise Exception.Create(Msg);
+    end;
+  end;
+end;
+
 procedure TNNet.Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0);
 var
   LayerCnt: integer;
@@ -87829,6 +87885,7 @@ begin
       for LayerCnt := FromLayerIdx to LastLayer do
       begin
         FLayers[LayerCnt].Compute();
+        if FDetectAnomaly then CheckForwardAnomaly(LayerCnt);
       end;
     end else
     begin
@@ -87972,6 +88029,7 @@ begin
     FLayers[LastLayer].ComputeOutputErrorWith(pOutput);
     FLayers[LastLayer].Backpropagate();
     ComputeL2Decay();
+    if FDetectAnomaly then CheckBackwardAnomaly();
     {$IFDEF Debug}
     DebugBackpropagation();
     {$ENDIF}
