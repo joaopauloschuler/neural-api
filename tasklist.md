@@ -94,6 +94,23 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] Griffin / RecurrentGemma importer (BuildRecurrentGemmaFromSafeTensors,
+      google/recurrentgemma-2b-it). The one major modern-recurrent-LM family
+      member still missing next to the landed RWKV/Mamba/xLSTM/LRU/GLA
+      importers, and it ships real HF checkpoints. Architecture = Hawk/Griffin
+      hybrid: a fixed temporal block PATTERN where most layers are a
+      "recurrent" block (RG-LRU + a small conv1d temporal mixer) and every
+      3rd layer is LOCAL sliding-window attention (reuse the SDPA Window
+      FStruct path already wired for Gemma-2/3). Needs a NEW layer
+      TNNetRGLRU = the real-valued gated linear recurrent unit from the
+      Griffin paper (input gate i_t=sigmoid(W_i x), recurrence gate
+      a_t=sigmoid(c*softplus(Lambda)) with the fixed c=8 log-space decay
+      parametrization, h_t = a_t (.) h_{t-1} + sqrt(1-a_t^2) (.) (i_t (.) x));
+      this is NOT a duplicate of the existing complex-diagonal TNNetLRU — flag
+      the distinction in its header. Decode-side: O(1) recurrent state carry
+      like the Mamba/RWKV demos. Verify with a pico parity fixture
+      (tools/make_pico_recurrentgemma_fixture.py, ~10 KB sliced real weights)
+      asserting logits ~1e-4 vs HF, plus a TestRecurrentGemmaParity case.
 - [X] Qwen3-MoE importer follow-up — SLIDING-WINDOW remainder. MIXED
       dense/MoE layers DONE (per-layer LlamaLayerIsMoE gate mirrors HF
       modeling_qwen3_moe: layer i is MoE iff i not in mlp_only_layers AND
