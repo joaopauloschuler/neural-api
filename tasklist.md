@@ -239,18 +239,11 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [X] safetensors writer F16/BF16 output: TNNetSafeTensorsWriter only
-      emits F32; add encode-on-write halves (EncodeF16/EncodeBF16 mirroring
-      the existing decoders) for smaller exported checkpoints.
-      DONE (commit 04418a5): EncodeF16/EncodeBF16 (round-to-nearest-even) now
-      live in neuralsafetensors.pas (neuralnumpy.EncodeF16 forwards to it —
-      single shared impl); per-tensor TSafeTensorsWriteDType on AddTensorFlat
-      (default stwF32, callers unchanged) + SaveNNetToSafeTensorsEx(dtype).
-      Tests in TestNeuralPretrained (round-trip dtype/offsets + F16 NNet
-      logit-drift). RESIDUAL: tools/verify_safetensors_writer.py not extended
-      to cross-check the F16/BF16 files against the python safetensors library
-      (a quick python-side dtype + value assert; /home/bpsa/x/bin/python has
-      the package).
+- [ ] safetensors writer F16/BF16 cross-check: tools/verify_safetensors_writer.py
+      cross-checks the F32 writer against the python safetensors library but is
+      not extended to the landed EncodeF16/EncodeBF16 encode-on-write output —
+      add a quick python-side dtype + value assert over an F16/BF16 file
+      (/home/bpsa/x/bin/python has the package).
 - [ ] HF-names safetensors exporter: export an imported pico-GPT-2 back to
       HF tensor names (wte.weight, h.N.attn.c_attn.weight, ...), reload via
       BuildGPT2FromSafeTensors and compare logits; generalize per-importer
@@ -379,21 +372,6 @@ rather than acted on.
       a small Pascal-trained student and report student perplexity vs hard-label-
       only training at matched steps. Pure harness work over the landed trainer +
       importers; writeup goes in examples/README.md.
-- [X] CFG decode follow-ups (TNNetCFGProcessor landed, commit 11e668f): (a) wire
-      guidance_scale + negative prompt into TGenerationConfig so the high-level
-      decode entry points expose CFG without manual processor construction;
-      (b) the processor builds a second width-1 streaming twin of the same net —
-      add a convenience that derives the unconditional twin automatically from a
-      single imported model (build-twice + CopyWeights, or share weights).
-      DONE: TGenerationConfig gains GuidanceScale (1.0=off) / CFGUncond /
-      NegativePrompt; BuildConfigPipeline prepends a TNNetCFGProcessor at the
-      FRONT of the per-step pipeline when scale<>1 (scale=1 is bit-identical to
-      the no-CFG path). MakeUnconditionalTwin clones a WIDTH-1 net via
-      SaveToString->LoadFromString (architecture+weights, width preserved) and
-      wraps it in an independent-state TNNetStreamingDecoder; caller frees both
-      session and twin. RESIDUAL: a full-width->width-1 auto-clone is not
-      attempted (a string round-trip preserves the original width) — caller
-      still builds the width-1 net once via the Build*(1)+CopyWeights idiom.
 - [ ] CFG follow-up: a full-width-net -> width-1 unconditional-twin auto-clone
       so MakeUnconditionalTwin (commit 48e2fd2) works from a single imported
       model with no hand-built width-1 net. A SaveToString->LoadFromString
@@ -447,23 +425,6 @@ rather than acted on.
       decode side must skip the K virtual positions when detokenizing.
       Test: base weights bit-unchanged after a training step, soft-prompt
       gradient nonzero, eval forward deterministic.
-- [X] Token-classification head + entity-level metrics (transformers
-      ForTokenClassification + seqeval port): per-token PointwiseConvLinear
-      head over the sequence axis plus span-aware precision/recall/F1
-      (BIO/IOB2 decoding, entity-level not token-level) in
-      neuralnlpmetrics.pas. Needs tokenizer offset-mapping / word-id
-      alignment (subword → word labels, return_offsets_mapping equivalent in
-      neuraltokenizer.pas) — that alignment utility is reusable beyond NER.
-      Test: pinned BIO sequences with known entity P/R/F1, including the
-      classic boundary-error cases.
-      DONE: TNNet.AddTokenClassificationHead(NumLabels) per-token
-      PointwiseConvLinear head; DecodeBIOEntities + EntityScore +
-      CorpusEntityScore (span exact-match seqeval micro-average) in
-      neuralnlpmetrics.pas; TNeuralHFTokenizer.EncodeWithOffsets offset
-      mapping + word-ids (tokenizer-agnostic post-hoc surface match). Tests:
-      TestNeuralNLPMetrics (BIO decode, perfect/boundary/split/type-mismatch
-      P/R/F1, micro-average), TestNeuralHFTokenizer (offset round-trip +
-      word-id alignment). README + builder reused by Task B.
 - [ ] Offset-mapping follow-up: EncodeWithOffsets (commit 1e90b8a) is a
       post-hoc surface-match heuristic (each token's DecodeToken surface
       located forward at the running cursor), so it leaves tokens unmapped
@@ -472,27 +433,6 @@ rather than acted on.
       byte-level-BPE merge state for a guaranteed alignment, and a test over
       a pinned string with a byte-fallback / multi-byte-UTF8 token that the
       heuristic currently leaves unmapped.
-- [X] QA span-extraction head (transformers ForQuestionAnswering port):
-      two per-token logit heads (start/end) over the sequence axis +
-      SQuAD-style postprocessing (top-k start×end pairs, end>=start, max
-      answer length, n-best list). Pure composition over existing per-token
-      projections; pairs with the offset-mapping utility from the
-      token-classification task to map spans back to text. Test: pinned
-      logits → pinned extracted span.
-      DONE: TNNet.AddQuestionAnsweringHead() -> two parallel per-token
-      PointwiseConvLinear(1) start/end logits concatenated to (SeqLen,1,2);
-      ExtractQASpans(StartLogits,EndLogits,TopK,MaxAnswerLen,NBest) n-best
-      list ranked by start+end logit, end>=start + length cap, in
-      neuralnlpmetrics.pas. Maps back to text via EncodeWithOffsets (Task A).
-      Tests TestExtractQASpansPinned / TestExtractQASpansMaxLenAndOrder.
-- [X] Strided sliding-window perplexity in neural/neuralnlpmetrics.pas
-      (the HF-docs-standard evaluation): for corpora longer than the model
-      context, slide a window with stride < window and score only the
-      non-overlapping tail tokens, so every token gets (bounded) left
-      context instead of the chop-into-disjoint-windows underestimate the
-      landed Perplexity() implies. Test: stride = window reproduces the
-      disjoint baseline exactly; smaller stride gives <= NLL on a model
-      with real long-range structure.
 - [ ] Length-grouped batching + dynamic padding collator (transformers
       LengthGroupedSampler + DataCollatorWithPadding port) in neuralfit:
       sort/bucket variable-length text by length, batch neighbors, pad each
