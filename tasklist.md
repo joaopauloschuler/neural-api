@@ -121,86 +121,12 @@ rather than acted on.
       mixed image+text prompt vs HF float64, and an examples/LlavaDescribe
       demo that captions a small image on CPU. First image-in/text-out
       model in the repo; opens the door to Qwen-VL/PaliGemma later.
-- [X] Phi-4-mini import — landed as BuildPhi3FromSafeTensors[Ex] in
-      neural/neuralpretrained.pas (model_type "phi3": Phi-3-mini AND
-      Phi-4-mini): a thin wrapper over the Llama path with three config
-      flags — FUSED bias-free qkv_proj / gate_up_proj slabs (row-block
-      slicing, rotate_half permutation after the slice), PARTIAL rotary
-      (partial_rotary_factor, 0.75 on Phi-4-mini) and the Mistral-style
-      sliding window. The 128k "longrope" rope_scaling variants are
-      REJECTED with a clear error. Parity fixture
-      tests/fixtures/tiny_phi3.* (tools/phi3_tiny_fixture.py; GQA + tied
-      head + window + partial rotary all asserted non-vacuous) verified at
-      max |logit diff| 1.7e-6 vs HF float64 (TestPhi3LogitParity, both the
-      direct and the BuildFromPretrained dispatch routes).
-- [X] CLIP import — first VISION-LANGUAGE importer: BuildClipFromSafeTensors
-      for openai/clip-vit-base-patch32 (or SigLIP, whichever maps cleaner).
-      Both towers are plain pre-norm transformer encoders the library already
-      has every primitive for: text side = embedding + causal SDPA blocks +
-      final LayerNorm + EOS-token pooling + projection; vision side = patch
-      embedding as TNNetConvolutionLinear(stride=patch_size) + class-token
-      concat + learned positional embedding + bidirectional SDPA blocks +
-      projection — the vision tower doubles as the repo's first ViT, reusable
-      later for ViT/DINO/SigLIP imports. Deliverables: importer with the usual
-      config-JSON dispatch + .bin fallback, pico parity fixture via
-      make_pico_*_fixture.py asserting both embedding towers against HF,
-      L2-normalized dot-product similarity helper (the sentence-embedding
-      mean-pool helper in neuralpretrained.pas is the in-repo precedent), and
-      a zero-shot image classification example (CIFAR-10 class-name prompts,
-      no training) — ties the library's CV roots to the NLP/importer stack.
-      LANDED: BuildClipFromSafeTensors returns the dual encoder as TWO
-      independent nets (the T5/Marian two-net convention, as peers — no
-      cross-attention, RunT5 does not apply). quick_gelu =
-      TNNetSwishLearnable(1.702) (x*sigmoid(1.702x) exactly — no new
-      layer); the vision class token is folded into row 0 of the learned
-      position table over a zero left-pad slot (PadXY+Crop, exact); the
-      vision tower is the reusable BuildClipVisionTower (post_layernorm +
-      bias-free projection applied PER TOKEN — exact for the pooled row 0).
-      ClipTextEosPosition implements BOTH modeling_clip pooling branches
-      (legacy eos_token_id=2 ARGMAX-of-ids + fixed first-eos);
-      ClipExtractEmbedding/ClipSimilarity give the L2-normalized cosine
-      head, exp(Config.LogitScale)*cosine reproduces HF logits_per_image.
-      Pico fixture tests/fixtures/tiny_clip.* (tools/clip_tiny_fixture.py;
-      quick_gelu-vs-gelu, causal text, argmax-pooling position,
-      class-embedding/positions/pre_layrnorm all asserted non-vacuous):
-      text embeds 7.0e-7 / image embeds 4.9e-7 / logits 7.7e-7 vs HF
-      float64 (TestClipParity + TestClipConfigFromJSONFile).
-      BuildFromPretrained dispatches "clip" to a redirect error; .bin
-      works via CreatePretrainedTensorReader. examples/ClipZeroShot runs
-      the zero-shot softmax OFFLINE on the fixture (real CIFAR-10
-      class-name prompts need the CLIP BPE tokenizer wiring + image
-      preprocessing — a follow-up; neuralhftokenizer already reads the
-      tokenizer.json).
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
       out-of-scope for v1.
-- [X] Quantized inference — int8 weight compression so real imported
-      checkpoints fit on commodity RAM. LANDED (v1): per-output-channel
-      symmetric int8 weight STORAGE (scale = max|row|/127) on
-      TNNetLayerConcatedWeights — QuantizeWeightsInt8 / DequantizeWeightsInt8
-      / Int8QuantizedSizeBytes, swept by TNNet.QuantizeWeightsInt8 over the
-      exact weight-heavy classes (Conv/ConvLinear/ConvReLU, PointwiseConv/
-      Linear/ReLU, FullConnect/Linear/ReLU/Sigmoid; exotic subclasses
-      excluded — they reinterpret weight layout). FP32 storage genuinely
-      freed (neuron volumes + concated cache shrunk); forward dequantizes
-      TRANSIENTLY (conv: whole layer into FConcatedWeights then released;
-      fullconnect: one row into a scratch), so steady RAM ~ 1/4 weight bytes
-      and forward peak = quantized net + ONE layer FP32. Backpropagate
-      raises on quantized layers (inference-only). Importer wiring:
-      pQuantizeInt8 on BuildGPT2FromSafeTensors[Ex] and
-      BuildLlamaFromSafeTensors[Ex/WithConfig] quantizes block-by-block
-      during BOTH construction and weight load (loaders auto-dequantize a
-      quantized layer before refilling, importers re-sweep per block), so
-      load peak = quantized net + one FP32 block + one streamed tensor.
-      Tests: round-trip error <= scale/2 per element, quantized forward ==
-      FP32-forward-on-dequantized-weights, container-size assertions,
-      backprop-raises, logit drift vs FP32 on pico-GPT2/pico-Llama fixtures
-      (measured 1.7e-2/2.3e-2 relative at pico width 8; gated 5e-2 —
-      drift shrinks with real row widths). Also fixed-by-avoidance: noted
-      TVolume.GetMaxAbs misses a negative max-magnitude element 0 (scale
-      computed inline instead). DEFERRED: see the follow-up entries below.
-- [ ] Quantized inference follow-up: int8 activation quantization + true
+- [ ] Quantized inference follow-up (int8 weight-only v1 is landed): int8
+      activation quantization + true
       int8 matmul kernels (AVX2 maddubs / dot-product paths) so quantized
       layers stop paying the per-forward dequantize cost; today the int8
       win is RAM only — compute still runs the FP32 kernels.
@@ -258,16 +184,6 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [X] safetensors WRITER (neural/neuralsafetensors.pas has only the
-      reader): export named tensors so Pascal-trained models round-trip
-      into PyTorch/transformers. Doubles as a cross-framework correctness
-      check for the GPT-2/Llama importers (export → reload → compare).
-      LANDED: TNNetSafeTensorsWriter (F32, manual ASCII JSON header,
-      8-byte-aligned) + SaveNNetToSafeTensors/LoadNNetFromSafeTensors
-      (layer_<idx>.<ClassName>.weights/.biases naming) in
-      neuralsafetensors.pas; Pascal round-trip + bit-exact forward tests
-      in TestNeuralPretrained; tools/verify_safetensors_writer.py
-      validated against Python safetensors 0.8.0.
 - [ ] safetensors writer F16/BF16 output: TNNetSafeTensorsWriter only
       emits F32; add encode-on-write halves (EncodeF16/EncodeBF16 mirroring
       the existing decoders) for smaller exported checkpoints.
@@ -332,25 +248,9 @@ rather than acted on.
       generate for N prompts in one forward pass per step (today's decode
       paths look single-sample). Makes evaluation sweeps cheap and is a
       prerequisite for an efficient speculative-decoding verify step.
-- [X] Chat templates (transformers apply_chat_template): follow-up of the
-      landed tokenizer.json loader (neural/neuralhftokenizer.pas) — parse
-      the chat template from
-      tokenizer_config.json (or hardcode the common Llama/ChatML/Zephyr
-      formats) so an imported instruct checkpoint can be prompted with a
-      correctly formatted conversation end to end.
-      LANDED: neural/neuralchat.pas — TChatMessage + ApplyChatTemplate
-      with seven hardcoded formats (cfChatML, cfLlama2, cfLlama3,
-      cfZephyr, cfGemma, cfPhi3, cfMistral), DetectChatFormat substring
-      fingerprinting of the chat_template string read from
-      tokenizer_config.json (string and list-of-named-templates forms),
-      and EncodeChat (template -> TNeuralHFTokenizer.Encode; control
-      tokens ride the added-tokens verbatim matcher). HF-raise parity
-      (Gemma system turn, Llama-2/Gemma/Mistral alternation). Pinned byte
-      for byte against the authentic published Jinja templates rendered
-      with the exact transformers Jinja env (tools/
-      chat_template_fixture.py -> tests/fixtures/chat_template_cases.json,
-      TTestNeuralChat in tests/TestNeuralHFTokenizer.pas).
-- [ ] Chat templates v2: a mini-Jinja subset interpreter for unrecognized
+- [ ] Chat templates v2 (v1 is landed in neural/neuralchat.pas —
+      ApplyChatTemplate with seven hardcoded formats + DetectChatFormat
+      fingerprinting + EncodeChat): a mini-Jinja subset interpreter for unrecognized
       chat_template strings (must pass ground truth for all bundled
       templates and raise cleanly on unsupported constructs); more
       formats (DeepSeek, Phi-4-mini's tool-aware ChatML variant, Qwen's
@@ -364,7 +264,7 @@ rather than acted on.
       importers.
 - [ ] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
       de-facto checkpoint format, and it ships PRE-quantized weights —
-      dovetails with the int8 quantized-inference task (read Q8_0 blocks
+      dovetails with the landed int8 quantized inference (read Q8_0 blocks
       directly instead of quantizing FP32 yourself).
 - [ ] Magnitude pruning (torch.nn.utils.prune port): PERSISTENT global or
       per-layer magnitude masks applied during training/inference — the
@@ -388,8 +288,9 @@ rather than acted on.
       assert, same pattern as the chunked-forward recurrence family.
 - [ ] rope_scaling follow-ups to the landed wiring (7e74fee): (a) longrope
       (Phi-3 family — per-dim short/long factor arrays + two attention
-      factors) is parsed and rejected; map it onto a new scaling mode when
-      a Phi-3 import target matters; (b) DeepSeek-style YaRN `mscale` /
+      factors) is parsed and rejected; map it onto a new scaling mode to
+      unlock the 128k-context variants of the now-importable Phi-3/
+      Phi-4-mini family (BuildPhi3FromSafeTensors rejects them today); (b) DeepSeek-style YaRN `mscale` /
       `mscale_all_dim` overrides are rejected — needed for full
       DeepSeek-V2 checkpoints (the -Lite config carries them); (c) yarn
       `"truncate": false` configs are silently treated as truncate=true —
@@ -405,7 +306,7 @@ rather than acted on.
       <= window the streamed tokens are bit-identical to the unbounded
       cache, and memory stays flat past it.
 - [ ] KV-cache quantization (int8 cache with per-channel scales): the
-      quantized-inference task above covers WEIGHT storage; for long-context
+      landed int8 quantized inference covers WEIGHT storage; for long-context
       decode the KV cache dominates memory instead. Quantize cached K/V
       blocks to int8 on append, dequantize on read inside
       TNNetStreamingDecoder; assert logit drift vs the FP32 cache stays
@@ -506,20 +407,18 @@ rather than acted on.
 - [ ] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate
-      on commodity RAM (the TinyLlama ~4.4GB case the quantized-inference
-      task documents). Read one tensor at a time from the (seekable)
-      safetensors stream straight into the destination layer — or straight
-      into int8 storage once the quantized-inference task lands — keeping
-      only one tensor-sized scratch buffer. Assert peak RSS during import
+      on commodity RAM (the TinyLlama ~4.4GB case). Read one tensor at a
+      time from the (seekable) safetensors stream straight into the
+      destination layer — or straight into the landed int8 storage —
+      keeping only one tensor-sized scratch buffer. Assert peak RSS during import
       stays within tensor-size + model-size on the parity fixture.
 - [ ] NumPy .npy/.npz reader + writer: the universal interchange escape
       hatch — ANY framework can np.savez(**state_dict), and the format is
       trivial (magic + header dict + raw bytes; npz is a zip of npy).
       Reader gives a generic named-tensor import path for frameworks with
       no safetensors export; WRITER doubles as fixture tooling for parity
-      tests (dump Pascal tensors, compare in Python) and is arguably an
-      easier first Pascal→Python round-trip than the listed safetensors
-      writer. Support F32/F64/F16 + int dtypes, C-order only, reject
+      tests (dump Pascal tensors, compare in Python), complementing the
+      landed safetensors writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
@@ -571,7 +470,7 @@ rather than acted on.
       re-prefilled for every generation. Add snapshot-after-prefill +
       clone-per-request (and optional save/load to disk for a persistent
       system-prompt cache). The single biggest practical speedup for the
-      chat-template task's use case; shares the fork primitive with the
+      landed chat-templates use case; shares the fork primitive with the
       KV-cache beam task above. Assert a forked session's continuation is
       bit-identical to a fresh prefill.
 - [ ] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
