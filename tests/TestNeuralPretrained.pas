@@ -103,6 +103,7 @@ type
     procedure TestImporterFailsOnMissingTensor;
     procedure TestGPT2ConfigFromFixture;
     procedure TestGPT2LogitParity;
+    procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
     procedure TestGPT2LogitParityFromTorchBin;
@@ -1177,6 +1178,175 @@ begin
     Output.Free;
     Input.Free;
     RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// TNNet.ResizeTokenEmbeddings (the HF resize_token_embeddings equivalent)
+// on the imported pico GPT-2:
+//  - GROW by +4: old-token logits bit-preserved, new embedding rows equal
+//    the mean of the old rows (HF convention), and the COPY-tied LM head
+//    stays row-for-row equal to the embedding table (the importers tie by
+//    copying, so mean-from-own-rows preserves equality exactly).
+//  - SHRINK below the original vocab: truncation; surviving-token logits
+//    still match the original baseline.
+//  - int8-quantized net: the head is dequantized/resized/requantized
+//    (requantization of untouched rows is exact), stays quantized, and the
+//    old-token logits match the quantized baseline.
+procedure TTestNeuralPretrained.TestResizeTokenEmbeddings;
+var
+  NN, QNN: TNNet;
+  Config, QConfig: TGPT2Config;
+  Input, Baseline, Output, QBaseline: TNNetVolume;
+  EmbLayer: TNNetEmbedding;
+  Head: TNNetLayer;
+  SeqLen, Vocab, Emb, GrownVocab, ShrunkVocab: integer;
+  PosCnt, TokCnt, RowCnt, ColCnt: integer;
+  MeanCol: array of double;
+  Diff, MaxDiff: double;
+  V: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
+    Config, {SeqLen=}0, {NumHeads=}2);
+  QNN := nil;
+  Input := TNNetVolume.Create;
+  Baseline := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  QBaseline := TNNetVolume.Create;
+  try
+    SeqLen := Config.NCtx;
+    Vocab := Config.VocabSize;
+    Emb := Config.NEmbd;
+    GrownVocab := Vocab + 4;
+    ShrunkVocab := Vocab - 3;
+    AssertTrue('fixture vocab big enough', Vocab > 8);
+    // Token ids stay valid through every phase (max id < ShrunkVocab).
+    Input.ReSize(SeqLen, 1, 1);
+    for PosCnt := 0 to SeqLen - 1 do
+      Input.FData[PosCnt] := (PosCnt * 5 + 3) mod ShrunkVocab;
+    NN.Compute(Input);
+    NN.GetOutput(Baseline);
+    AssertEquals('baseline output size', SeqLen * Vocab, Baseline.Size);
+
+    EmbLayer := nil;
+    for RowCnt := 0 to NN.GetLastLayerIdx() do
+      if NN.Layers[RowCnt] is TNNetEmbedding then
+      begin
+        EmbLayer := TNNetEmbedding(NN.Layers[RowCnt]);
+        break;
+      end;
+    AssertTrue('embedding layer found', EmbLayer <> nil);
+    Head := NN.GetLastLayer();
+    AssertEquals('head channels = vocab before resize',
+      Vocab, Head.Neurons.Count);
+
+    // Expected mean embedding row (computed BEFORE the resize).
+    SetLength(MeanCol, Emb);
+    for ColCnt := 0 to Emb - 1 do MeanCol[ColCnt] := 0;
+    for RowCnt := 0 to Vocab - 1 do
+      for ColCnt := 0 to Emb - 1 do
+        MeanCol[ColCnt] := MeanCol[ColCnt] +
+          EmbLayer.Neurons[0].Weights.FData[RowCnt * Emb + ColCnt];
+    for ColCnt := 0 to Emb - 1 do
+      MeanCol[ColCnt] := MeanCol[ColCnt] / Vocab;
+
+    // ---------------- grow ----------------
+    AssertTrue('resize returns the embedding layer',
+      NN.ResizeTokenEmbeddings(GrownVocab) = EmbLayer);
+    AssertEquals('embedding vocab grown', GrownVocab, EmbLayer.VocabSize);
+    AssertEquals('head channels grown', GrownVocab, Head.Neurons.Count);
+    MaxDiff := 0;
+    for RowCnt := Vocab to GrownVocab - 1 do
+      for ColCnt := 0 to Emb - 1 do
+      begin
+        Diff := Abs(EmbLayer.Neurons[0].Weights.FData[RowCnt * Emb + ColCnt]
+          - MeanCol[ColCnt]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    AssertTrue('new embedding rows = mean of old rows: max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-6);
+    // The GPT-2 importer ties by COPY (head row j = wte row j); the resize
+    // must keep every row pair equal, including the 4 new mean rows.
+    MaxDiff := 0;
+    for RowCnt := 0 to GrownVocab - 1 do
+      for ColCnt := 0 to Emb - 1 do
+      begin
+        Diff := Abs(Head.Neurons[RowCnt].Weights.FData[ColCnt] -
+          EmbLayer.Neurons[0].Weights.FData[RowCnt * Emb + ColCnt]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    AssertTrue('copy-tied head stays equal to the embedding: max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-7);
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+    AssertEquals('grown output size', SeqLen * GrownVocab, Output.Size);
+    MaxDiff := 0;
+    for PosCnt := 0 to SeqLen - 1 do
+      for TokCnt := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(Output.FData[PosCnt * GrownVocab + TokCnt] -
+          Baseline.FData[PosCnt * Vocab + TokCnt]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    AssertTrue('old-token logits unchanged after grow: max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    for PosCnt := 0 to SeqLen - 1 do
+      for TokCnt := Vocab to GrownVocab - 1 do
+      begin
+        V := Output.FData[PosCnt * GrownVocab + TokCnt];
+        AssertTrue('new-token logit finite', (V = V) and (Abs(V) < 1e30));
+      end;
+
+    // ---------------- shrink (below the ORIGINAL vocab) ----------------
+    NN.ResizeTokenEmbeddings(ShrunkVocab);
+    AssertEquals('embedding vocab shrunk', ShrunkVocab, EmbLayer.VocabSize);
+    AssertEquals('head channels shrunk', ShrunkVocab, Head.Neurons.Count);
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+    AssertEquals('shrunk output size', SeqLen * ShrunkVocab, Output.Size);
+    MaxDiff := 0;
+    for PosCnt := 0 to SeqLen - 1 do
+      for TokCnt := 0 to ShrunkVocab - 1 do
+      begin
+        Diff := Abs(Output.FData[PosCnt * ShrunkVocab + TokCnt] -
+          Baseline.FData[PosCnt * Vocab + TokCnt]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    AssertTrue('surviving-token logits unchanged after shrink: max |diff| = '
+      + FloatToStr(MaxDiff), MaxDiff < 1e-5);
+
+    // ---------------- int8-quantized head ----------------
+    RandSeed := 424242;
+    QNN := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
+      QConfig, {SeqLen=}0, {NumHeads=}2, {pInferenceOnly=}false,
+      {pSeqClsHead=}false, {pExactGelu=}false, {pQuantizeInt8=}true);
+    QNN.Compute(Input);
+    QNN.GetOutput(QBaseline);
+    QNN.ResizeTokenEmbeddings(GrownVocab);
+    AssertTrue('head still int8 after resize',
+      (QNN.GetLastLayer() is TNNetLayerConcatedWeights) and
+      TNNetLayerConcatedWeights(QNN.GetLastLayer()).WeightsQuantizedInt8);
+    QNN.Compute(Input);
+    QNN.GetOutput(Output);
+    AssertEquals('quantized grown output size',
+      SeqLen * GrownVocab, Output.Size);
+    MaxDiff := 0;
+    for PosCnt := 0 to SeqLen - 1 do
+      for TokCnt := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(Output.FData[PosCnt * GrownVocab + TokCnt] -
+          QBaseline.FData[PosCnt * Vocab + TokCnt]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    AssertTrue('quantized old-token logits unchanged: max |diff| = ' +
+      FloatToStr(MaxDiff), MaxDiff < 1e-5);
+  finally
+    QBaseline.Free;
+    Output.Free;
+    Baseline.Free;
+    Input.Free;
+    QNN.Free;
     NN.Free;
   end;
 end;

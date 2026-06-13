@@ -12325,6 +12325,24 @@ type
       // bound peak memory). Exotic subclasses (quaternion/tropical/KAN...)
       // are deliberately NOT matched: they reinterpret their weight layout.
       procedure QuantizeWeightsInt8(); // Coded by Claude (AI).
+      // HF resize_token_embeddings equivalent: grows/shrinks the token
+      // vocabulary of an imported causal LM IN PLACE. The FIRST
+      // TNNetEmbedding in the net gets NewVocabSize rows (existing rows are
+      // preserved; new rows are the MEAN of the existing rows - the HF
+      // convention; shrinking truncates). If the LAST layer is a pointwise
+      // convolution with exactly OldVocabSize output channels (the LM-head
+      // shape every importer in neuralpretrained.pas builds), it is resized
+      // too: kept rows/biases preserved, new rows mean-initialized from the
+      // EXISTING HEAD rows (mean bias likewise). Because the importers
+      // implement tied heads as a COPY of the embedding matrix, mean-from-
+      // own-rows keeps a tied (equal) head exactly equal after the resize -
+      // and an untied head is mean-initialized from itself, matching HF.
+      // The head is rebuilt through SetPrevLayer, so output volumes/FStruct
+      // resize coherently; int8-quantized heads are dequantized, resized
+      // and re-quantized; inference-only nets stay inference-only. A
+      // sequence-classification head (channel count <> vocab) is left
+      // untouched. Returns the embedding layer (nil on error).
+      function ResizeTokenEmbeddings(NewVocabSize: integer): TNNetEmbedding; // Coded by Claude (AI).
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2Decay(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2DecayToConvolutionalLayers(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
@@ -86611,6 +86629,164 @@ begin
     begin
       TNNetLayerConcatedWeights(CurrentLayer).QuantizeWeightsInt8();
     end;
+  end;
+end;
+
+function TNNet.ResizeTokenEmbeddings(NewVocabSize: integer): TNNetEmbedding;
+var
+  EmbLayer: TNNetEmbedding;
+  Head: TNNetConvolutionBase;
+  LastLayer: TNNetLayer;
+  LayerCnt, RowCnt, ColCnt: integer;
+  OldVocab, EmbSize, CopyRows: integer;
+  OldW, OldHeadW: TNNetVolume;
+  MeanRow: array of TNeuralFloat;
+  OldBias: array of TNeuralFloat;
+  MeanBias: TNeuralFloat;
+  HeadVecSize: integer;
+  EmbWasInferenceOnly, HeadWasInferenceOnly, HeadWasQuant: boolean;
+  W: TNNetVolume;
+begin
+  Result := nil;
+  if NewVocabSize <= 0 then
+  begin
+    FErrorProc('ResizeTokenEmbeddings: new vocab size must be positive, got '
+      + IntToStr(NewVocabSize) + '.');
+    exit;
+  end;
+  // Locate the FIRST embedding layer (TNNetTokenAndPositionalEmbedding is a
+  // descendant and is matched too).
+  EmbLayer := nil;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    if FLayers[LayerCnt] is TNNetEmbedding then
+    begin
+      EmbLayer := TNNetEmbedding(FLayers[LayerCnt]);
+      break;
+    end;
+  end;
+  if EmbLayer = nil then
+  begin
+    FErrorProc('ResizeTokenEmbeddings: no TNNetEmbedding layer found.');
+    exit;
+  end;
+  OldVocab := EmbLayer.VocabSize;
+  EmbSize := EmbLayer.EmbeddingSize;
+  Result := EmbLayer;
+  if NewVocabSize = OldVocab then exit;
+
+  // LM-head detection: the LAST layer, when it is a pointwise convolution
+  // with exactly OldVocab output channels. Heads buried mid-net are NOT
+  // resized (downstream layers would need a shape re-propagation); every
+  // importer in neuralpretrained.pas ends the net with the LM head.
+  Head := nil;
+  LastLayer := GetLastLayer();
+  if (LastLayer <> EmbLayer) and (LastLayer is TNNetConvolutionBase) and
+     TNNetConvolutionBase(LastLayer).Pointwise and
+     (LastLayer.Neurons.Count = OldVocab) then
+    Head := TNNetConvolutionBase(LastLayer);
+
+  // ---------------- Embedding table ----------------
+  W := EmbLayer.Neurons[0].Weights;
+  EmbWasInferenceOnly := EmbLayer.Neurons[0].Delta.Size < W.Size;
+  OldW := TNNetVolume.Create;
+  try
+    OldW.Copy(W);
+    // Mean of the existing rows (HF convention for new token rows).
+    SetLength(MeanRow, EmbSize);
+    for ColCnt := 0 to EmbSize - 1 do MeanRow[ColCnt] := 0;
+    for RowCnt := 0 to OldVocab - 1 do
+      for ColCnt := 0 to EmbSize - 1 do
+        MeanRow[ColCnt] := MeanRow[ColCnt] +
+          OldW.FData[RowCnt * EmbSize + ColCnt];
+    for ColCnt := 0 to EmbSize - 1 do
+      MeanRow[ColCnt] := MeanRow[ColCnt] / OldVocab;
+    EmbLayer.SetNumWeightsForAllNeurons(NewVocabSize, 1, EmbSize);
+    CopyRows := Min(OldVocab, NewVocabSize);
+    for RowCnt := 0 to CopyRows - 1 do
+      for ColCnt := 0 to EmbSize - 1 do
+        W.FData[RowCnt * EmbSize + ColCnt] :=
+          OldW.FData[RowCnt * EmbSize + ColCnt];
+    for RowCnt := CopyRows to NewVocabSize - 1 do
+      for ColCnt := 0 to EmbSize - 1 do
+        W.FData[RowCnt * EmbSize + ColCnt] := MeanRow[ColCnt];
+  finally
+    OldW.Free;
+  end;
+  EmbLayer.FVocabSize := NewVocabSize;
+  EmbLayer.FStruct[0] := NewVocabSize;
+  if EmbWasInferenceOnly then EmbLayer.MakeInferenceOnly();
+  EmbLayer.AfterWeightUpdate();
+
+  // ---------------- LM head ----------------
+  if Head <> nil then
+  begin
+    HeadWasQuant := Head.WeightsQuantizedInt8;
+    if HeadWasQuant then Head.DequantizeWeightsInt8();
+    HeadVecSize := Head.Neurons[0].Weights.Size;
+    HeadWasInferenceOnly :=
+      Head.Neurons[0].Delta.Size < Head.Neurons[0].Weights.Size;
+    OldHeadW := TNNetVolume.Create;
+    try
+      // Snapshot existing rows + biases and their means BEFORE mutating.
+      OldHeadW.ReSize(OldVocab, 1, HeadVecSize);
+      SetLength(OldBias, OldVocab);
+      SetLength(MeanRow, HeadVecSize);
+      for ColCnt := 0 to HeadVecSize - 1 do MeanRow[ColCnt] := 0;
+      MeanBias := 0;
+      for RowCnt := 0 to OldVocab - 1 do
+      begin
+        for ColCnt := 0 to HeadVecSize - 1 do
+        begin
+          OldHeadW.FData[RowCnt * HeadVecSize + ColCnt] :=
+            Head.Neurons[RowCnt].Weights.FData[ColCnt];
+          MeanRow[ColCnt] := MeanRow[ColCnt] +
+            Head.Neurons[RowCnt].Weights.FData[ColCnt];
+        end;
+        OldBias[RowCnt] := Head.Neurons[RowCnt].BiasWeight;
+        MeanBias := MeanBias + Head.Neurons[RowCnt].BiasWeight;
+      end;
+      for ColCnt := 0 to HeadVecSize - 1 do
+        MeanRow[ColCnt] := MeanRow[ColCnt] / OldVocab;
+      MeanBias := MeanBias / OldVocab;
+      // Adjust the neuron count, then rebuild the layer geometry through
+      // SetPrevLayer: output volumes, vector sizes, concatenated-weight
+      // caches and tiling all derive from FNeurons.Count there. It re-inits
+      // the weights (InitDefault), so the snapshot is written back below.
+      // FShouldConcatWeights must be OFF while the neuron count disagrees
+      // with the output volumes: AddNeurons/SetNumWeightsForAllNeurons call
+      // AfterWeightUpdate, and BuildBiasOutput would write FNeurons.Count
+      // bias floats per position into FBiasOutput rows still pitched at
+      // OldVocab (heap overflow). SetPrevLayer resizes the volumes and then
+      // switches the flag back on before its InitDefault rebuilds caches.
+      Head.FShouldConcatWeights := false;
+      if NewVocabSize > OldVocab then
+        Head.AddNeurons(NewVocabSize - OldVocab)
+      else
+        for RowCnt := OldVocab - 1 downto NewVocabSize do
+          Head.FNeurons.Delete(RowCnt);
+      Head.FStruct[0] := NewVocabSize;
+      Head.SetPrevLayer(Head.FPrevLayer);
+      CopyRows := Min(OldVocab, NewVocabSize);
+      for RowCnt := 0 to CopyRows - 1 do
+      begin
+        for ColCnt := 0 to HeadVecSize - 1 do
+          Head.Neurons[RowCnt].Weights.FData[ColCnt] :=
+            OldHeadW.FData[RowCnt * HeadVecSize + ColCnt];
+        Head.Neurons[RowCnt].BiasWeight := OldBias[RowCnt];
+      end;
+      for RowCnt := CopyRows to NewVocabSize - 1 do
+      begin
+        for ColCnt := 0 to HeadVecSize - 1 do
+          Head.Neurons[RowCnt].Weights.FData[ColCnt] := MeanRow[ColCnt];
+        Head.Neurons[RowCnt].BiasWeight := MeanBias;
+      end;
+    finally
+      OldHeadW.Free;
+    end;
+    if HeadWasInferenceOnly then Head.MakeInferenceOnly();
+    Head.FlushWeightCache();
+    if HeadWasQuant then Head.QuantizeWeightsInt8();
   end;
 end;
 
