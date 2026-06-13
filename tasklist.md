@@ -166,6 +166,35 @@ rather than acted on.
       reusable new quant primitive (NOT a duplicate of the GGUF k-quant or int8
       paths — it is a different block layout). Document gpt-oss-120b as
       import-capable but RAM-gated like the other large checkpoints.
+- [ ] Jamba importer (BuildJambaFromSafeTensors[Ex], model_type "jamba", e.g.
+      ai21labs/Jamba-tiny-dev / Jamba-Mini): the FIRST HYBRID Mamba+Transformer
+      decoder import, and the first model that exercises three landed subsystems
+      TOGETHER in one stack — selective-SSM mixers (TNNetSelectiveSSM /
+      AddMambaBlock, [[nontransformer-importers-rwkv-mamba]]), full softmax
+      attention layers, and Mixtral-style top-k MoE FFNs (AddTopKMixtureOfExperts
+      / TNNetTopKGate, [[topk-moe-routing]]). This is NOT a near-duplicate of the
+      landed BuildMambaFromSafeTensors (pure-SSM) or Qwen3-MoE (pure-attention
+      MoE): the genuinely new piece is the PER-LAYER block-TYPE schedule — Jamba
+      interleaves Mamba and attention layers on a fixed period (config
+      attn_layer_offset / attn_layer_period) and MoE vs dense MLP on another
+      period (expert_layer_offset / expert_layer_period / num_experts /
+      num_experts_per_tok), so the builder picks {mamba|attention} x {moe|dense}
+      per layer index from the config (mirror HF modeling_jamba's layer-type
+      computation exactly). Other Jamba specifics to wire: NO positional encoding
+      / RoPE at all (the Mamba layers carry order; attention is NoPE), RMSNorm,
+      GQA on the attention layers (num_key_value_heads), and the Mamba mixer's
+      pre-conv RMSNorm placement. Tokenizer is a Llama-style SentencePiece
+      tokenizer.json the landed TNeuralHFTokenizer reads. Deliverables:
+      BuildJambaFromSafeTensors[Ex] (multi-shard index.json support — real Jamba
+      checkpoints are large/sharded), a config-faithful pico parity fixture via
+      the make_pico_*_fixture.py recipe ([[pico-import-fixtures]]) sliced to ~4
+      layers covering all four block kinds (mamba-dense, mamba-moe,
+      attn-dense, attn-moe) with 2 experts / top-1, asserting next-token logits
+      vs transformers in venv x (float64), and documenting Jamba-Mini as
+      import-capable but RAM-gated like the other large checkpoints. High value:
+      hybrid SSM-attention-MoE is the dominant efficient-long-context recipe and
+      this is the first import path here that proves the Mamba + attention + MoE
+      primitives compose into a real published architecture.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
