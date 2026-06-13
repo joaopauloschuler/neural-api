@@ -145,7 +145,11 @@ rather than acted on.
       4-bit (int4 pairs packed per byte, group-wise scales); also quantized
       EMBEDDING table storage (the one remaining FP32 heavyweight — vocab x
       d_model stays FP32 in v1, e.g. ~262MB for TinyLlama) and FP16/BF16
-      weight storage as a zero-drift middle rung.
+      weight storage as a zero-drift middle rung. GGUF dovetails (reader
+      landed in neural/neuralgguf.pas): load Q8_0 blocks straight into the
+      int8 weight-only storage instead of dequantize-then-requantize, and
+      decode the common ggml 4-bit types (Q4_0/Q4_K/Q6_K) so real-world
+      quantized checkpoints import.
 - [ ] Quantized inference follow-up: upstream fix for TVolume.GetMaxAbs
       (seeds the running max with the SIGNED first element, so a negative
       max-magnitude element 0 is missed; csErrorOverflowBackpropProtection
@@ -158,7 +162,10 @@ rather than acted on.
       tokenizer.json; (c) exact full-Unicode \p{L}/\p{N} tables (current
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
       Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
-      punctuation class of the GPT-2 regex).
+      punctuation class of the GPT-2 regex); (d) build a tokenizer from
+      GGUF tokenizer.ggml.* metadata (tokens/merges/scores arrays are
+      already readable via TNNetGGUFReader) so a single .gguf file is
+      fully self-contained for generation without tokenizer.json.
 - [ ] neuralhftokenizer.pas pre_tokenizer leftovers from the Split/Metaspace
       batch: (a) a STANDALONE ByteLevel pre_tokenizer with use_regex=false
       silently applies the GPT-2 regex anyway (the flag is only honored
@@ -481,7 +488,11 @@ rather than acted on.
       system-prompt cache). The single biggest practical speedup for the
       landed chat-templates use case; shares the fork primitive with the
       KV-cache beam task above. Assert a forked session's continuation is
-      bit-identical to a fresh prefill.
+      bit-identical to a fresh prefill. Related consumer: the landed
+      examples/ChatTerminal decodes with one full fixed-width forward per
+      token because importers build at full context width — an importer
+      option to build a width-1 decode twin (or build-twice +
+      CopyWeights) would let chat ride TNNetStreamingDecoder.
 - [ ] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
       easy tokens from an intermediate layer through the LM head, fall
       back to full depth when confidence is low — the model becomes its
@@ -520,7 +531,10 @@ rather than acted on.
       greedy/sampled decoding, and forked beams keep independent states.
 - [X] Token healing (guidance-style): back up over the LAST prompt token
       (landed: TNNetTokenHealingConstraint + PrepareTokenHealing +
-      TGenerationConfig.TokenHealing)
+      TGenerationConfig.TokenHealing; still open: PrepareTokenHealing is
+      TStringListInt-only — a TNeuralHFTokenizer byte-level-BPE variant
+      needs a vocab prefix-scan helper there — and guidance-style
+      multi-token rollback)
       and constrain the first generated token to extensions of its text,
       fixing the classic BPE boundary artifact ("http:" never continuing
       to "//" because the prompt split mid-merge). ~30 lines on top of the
@@ -528,6 +542,15 @@ rather than acted on.
       disproportionate quality win for completion-style prompts. Test: a
       pinned vocab where the healed and unhealed first-token distributions
       provably differ.
+- [ ] Weighted top-k sampler with HF semantics: TNNetSamplerTopK draws
+      UNIFORMLY among the top K instead of by renormalized probability
+      (long-standing gotcha; examples/GPT2Import and examples/ChatTerminal
+      hand-roll around it, and seq2seq sampled decode inherits it). Add a
+      probability-weighted top-k sampler in neuralvolume (or fix
+      TNNetSamplerTopK behind a flag, default unchanged for
+      reproducibility), switch the hand-rolled call sites to it, and pin a
+      distribution test (chi-square or fixed-seed draw sequence) proving
+      weighted-vs-uniform differ on a skewed 3-token head.
 - [ ] HellaSwag-style eval example on an imported checkpoint: a small
       example program that loads a real imported model (e.g. SmolLM2 /
       pythia via the safetensors importers), tokenizes a handful of
