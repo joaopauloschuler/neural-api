@@ -506,7 +506,7 @@ interface
 uses
   Classes, SysUtils, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
-  neuralhftokenizer;
+  neuralgguf, neuralhftokenizer;
 
 type
   EPretrainedImportError = class(Exception);
@@ -765,6 +765,47 @@ function BuildLlamaFromSafeTensorsEx(const FileName: string;
   pQuantizeInt8: boolean = false): TNNet;
 
 function BuildLlamaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// GGUF IMPORT (llama.cpp checkpoints): builds the SAME Llama net as
+// BuildLlamaFromSafeTensors from a .gguf file (general.architecture
+// "llama"). No config.json is needed - the config travels inside the file
+// as GGUF metadata, mapped onto TLlamaConfig:
+//   llama.embedding_length -> hidden_size       (required)
+//   llama.feed_forward_length -> intermediate_size (required)
+//   llama.block_count -> num_hidden_layers      (required)
+//   llama.attention.head_count -> num_attention_heads (required)
+//   llama.attention.head_count_kv -> num_key_value_heads (default
+//     head_count)
+//   llama.context_length -> max_position_embeddings (required)
+//   llama.attention.layer_norm_rms_epsilon -> rms_norm_eps (default 1e-5)
+//   llama.rope.freq_base -> rope_theta (default 10000)
+//   llama.attention.key_length -> head_dim (default hidden/heads)
+//   llama.vocab_size -> vocab_size (default: the token_embd.weight rows,
+//     itself defaulting to the tokenizer.ggml.tokens count)
+//   llama.rope.scaling.type "linear" -> rope_scaling linear with
+//     llama.rope.scaling.factor; absent/"none" = unscaled; anything else
+//     (yarn ...) is rejected.
+// tie_word_embeddings is inferred: tied iff the file has no
+// "output.weight" tensor (llama.cpp omits the LM head when tied).
+// The ggml tensor names (token_embd.weight, blk.N.attn_q.weight,
+// output_norm.weight, ...) are renamed to their HF equivalents and the
+// import reuses the exact BuildLlamaFromSafeTensorsWithConfig path - with
+// ONE data fix-up: llama.cpp's convert script permutes the q/k projection
+// rows from HF's rotate_half layout into the interleaved-pair rotary
+// layout, so the reader de-interleaves those rows back to HF order at
+// load (TNNetGGUFReader.RegisterRowDeinterleave).
+// Tensor dtypes F32/F16/Q8_0 are decoded (Q8_0 dequantizes to FP32 at
+// load); other ggml quantizations are rejected with a clear error.
+// pInferenceOnly/pQuantizeInt8 behave exactly as in
+// BuildLlamaFromSafeTensorsWithConfig (pQuantizeInt8 re-quantizes the
+// dequantized weights into the int8 weight-only storage).
+function BuildLlamaFromGGUFEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildLlamaFromGGUF(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -3524,7 +3565,14 @@ type
     QNorms, KNorms: array of TNNetLayer;
   end;
 
-function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
+// The Llama builder core: builds the net and loads every weight from the
+// ALREADY-OPEN pReader (whose tensor table must use the HF tensor names).
+// Takes OWNERSHIP of pReader (frees it on every path). FileName is used in
+// error messages only. BuildLlamaFromSafeTensorsWithConfig wraps this with
+// CreatePretrainedTensorReader; BuildLlamaFromGGUFEx wraps it with a
+// TNNetGGUFReader whose tensors were renamed to the HF names.
+function BuildLlamaFromTensorReaderWithConfig(
+  pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
@@ -3552,7 +3600,7 @@ var
   end;
 
 begin
-  Reader := CreatePretrainedTensorReader(FileName);
+  Reader := pReader; // ownership taken: freed in the finally below
   NN := nil;
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
@@ -4108,6 +4156,175 @@ begin
     Consumed.Free;
     Reader.Free;
   end;
+end;
+
+function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFromTensorReaderWithConfig(
+    CreatePretrainedTensorReader(FileName), FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildLlamaFromGGUFEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetGGUFReader;
+  Arch, ScalingType, GGUFPrefix, HFPrefix: string;
+  BlockCnt, HeadDim: integer;
+  OK: boolean;
+
+  function RequiredMetaInt(const Key: string): integer;
+  var
+    V: Int64;
+  begin
+    V := Reader.GetMetaInt(Key, -1);
+    if V <= 0 then
+      ImportError('Llama GGUF import: metadata key "' + Key +
+        '" is missing or not a positive integer in ' + FileName + '.');
+    Result := integer(V);
+  end;
+
+  // Renames a ggml tensor name to its HF equivalent; Optional=true makes
+  // a missing tensor a no-op (the core builder reports missing REQUIRED
+  // tensors itself, with the HF name).
+  procedure Rename(const GGUFName, HFName: string; Optional: boolean);
+  begin
+    if Reader.HasTensor(GGUFName) then
+      Reader.RenameTensor(GGUFName, HFName)
+    else if not Optional then
+      ImportError('Llama GGUF import: missing tensor "' + GGUFName +
+        '" in ' + FileName + '.');
+  end;
+
+begin
+  Reader := TNNetGGUFReader.Create(FileName);
+  OK := false;
+  try
+    Arch := Reader.GetMetaString('general.architecture', '');
+    if Arch <> 'llama' then
+      ImportError('Llama GGUF import: general.architecture is "' + Arch +
+        '" - only "llama" is supported here: ' + FileName);
+    Config := Default(TLlamaConfig);
+    Config.ModelType := 'llama';
+    Config.HiddenSize := RequiredMetaInt('llama.embedding_length');
+    Config.IntermediateSize := RequiredMetaInt('llama.feed_forward_length');
+    Config.NumLayers := RequiredMetaInt('llama.block_count');
+    Config.NumHeads := RequiredMetaInt('llama.attention.head_count');
+    Config.NumKVHeads := integer(Reader.GetMetaInt(
+      'llama.attention.head_count_kv', Config.NumHeads));
+    Config.MaxPositions := RequiredMetaInt('llama.context_length');
+    Config.RmsNormEps := Reader.GetMetaFloat(
+      'llama.attention.layer_norm_rms_epsilon', 1e-5);
+    Config.RopeTheta := Reader.GetMetaFloat('llama.rope.freq_base', 10000.0);
+    Config.HeadDim := integer(Reader.GetMetaInt(
+      'llama.attention.key_length', 0));
+    Config.PartialRotaryFactor := 1.0;
+    Config.RopeScaling := DefaultRoPEScaling();
+    ScalingType := Reader.GetMetaString('llama.rope.scaling.type', 'none');
+    if ScalingType = 'linear' then
+    begin
+      Config.RopeScaling.Mode := rsmPositionInterpolation;
+      Config.RopeScaling.Factor := Reader.GetMetaFloat(
+        'llama.rope.scaling.factor', 1.0);
+      if Config.RopeScaling.Factor < 1 then
+        ImportError('Llama GGUF import: llama.rope.scaling.factor must ' +
+          'be >= 1, got ' + FloatToStr(Config.RopeScaling.Factor) + '.');
+      if Config.RopeScaling.Factor = 1.0 then
+        Config.RopeScaling.Mode := rsmNone;
+    end
+    else if ScalingType <> 'none' then
+      ImportError('Llama GGUF import: llama.rope.scaling.type "' +
+        ScalingType + '" is not supported (supported: none, linear): ' +
+        FileName);
+    // vocab_size: explicit key, else the embedding rows (the GGUF dims are
+    // served reversed, so dim 0 IS the vocab axis), else the token list.
+    Config.VocabSize := integer(Reader.GetMetaInt('llama.vocab_size', 0));
+    if Config.VocabSize <= 0 then
+    begin
+      if Reader.HasTensor('token_embd.weight') and
+         (Reader.DimCount('token_embd.weight') = 2) then
+        Config.VocabSize := integer(Reader.DimSize('token_embd.weight', 0))
+      else
+        Config.VocabSize := integer(Reader.GetMetaArrayCount(
+          'tokenizer.ggml.tokens'));
+    end;
+    if Config.VocabSize <= 0 then
+      ImportError('Llama GGUF import: cannot determine the vocab size ' +
+        '(no llama.vocab_size, no 2-D token_embd.weight, no ' +
+        'tokenizer.ggml.tokens) in ' + FileName + '.');
+    // llama.cpp omits "output.weight" when the LM head ties to the
+    // embedding table.
+    Config.TieWordEmbeddings := not Reader.HasTensor('output.weight');
+
+    // ---- ggml -> HF tensor names (the names the core builder expects) ----
+    Rename('token_embd.weight', 'model.embed_tokens.weight', false);
+    Rename('output_norm.weight', 'model.norm.weight', false);
+    Rename('output.weight', 'lm_head.weight', true);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      GGUFPrefix := 'blk.' + IntToStr(BlockCnt) + '.';
+      HFPrefix := 'model.layers.' + IntToStr(BlockCnt) + '.';
+      Rename(GGUFPrefix + 'attn_norm.weight',
+        HFPrefix + 'input_layernorm.weight', false);
+      Rename(GGUFPrefix + 'attn_q.weight',
+        HFPrefix + 'self_attn.q_proj.weight', false);
+      Rename(GGUFPrefix + 'attn_k.weight',
+        HFPrefix + 'self_attn.k_proj.weight', false);
+      Rename(GGUFPrefix + 'attn_v.weight',
+        HFPrefix + 'self_attn.v_proj.weight', false);
+      Rename(GGUFPrefix + 'attn_output.weight',
+        HFPrefix + 'self_attn.o_proj.weight', false);
+      Rename(GGUFPrefix + 'ffn_norm.weight',
+        HFPrefix + 'post_attention_layernorm.weight', false);
+      Rename(GGUFPrefix + 'ffn_gate.weight',
+        HFPrefix + 'mlp.gate_proj.weight', false);
+      Rename(GGUFPrefix + 'ffn_up.weight',
+        HFPrefix + 'mlp.up_proj.weight', false);
+      Rename(GGUFPrefix + 'ffn_down.weight',
+        HFPrefix + 'mlp.down_proj.weight', false);
+    end;
+    // llama.cpp's convert script permutes the q/k rows from HF rotate_half
+    // into the interleaved rotary layout; register the inverse so the core
+    // builder (which applies the rotate_half->interleaved permutation
+    // itself) receives HF-order rows.
+    if Config.HeadDim > 0 then
+      HeadDim := Config.HeadDim
+    else
+    begin
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('Llama GGUF import: llama.embedding_length=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'llama.attention.head_count=' + IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+    end;
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      HFPrefix := 'model.layers.' + IntToStr(BlockCnt) + '.';
+      Reader.RegisterRowDeinterleave(
+        HFPrefix + 'self_attn.q_proj.weight', HeadDim);
+      Reader.RegisterRowDeinterleave(
+        HFPrefix + 'self_attn.k_proj.weight', HeadDim);
+    end;
+    OK := true;
+  finally
+    // The core builder takes ownership of the reader only when reached.
+    if not OK then Reader.Free;
+  end;
+  Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
+    pSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildLlamaFromGGUF(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildLlamaFromGGUFEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
 end;
 
 function BuildLlamaFromSafeTensorsEx(const FileName: string;

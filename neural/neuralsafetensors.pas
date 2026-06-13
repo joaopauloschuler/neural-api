@@ -96,7 +96,10 @@ type
     // Loads the named tensor as a FLAT row-major array of singles into Dest:
     // Dest is resized to (ElementCount, 1, 1) and Dest.FData[i] receives the
     // i-th element in the stored row-major order (last dim contiguous).
-    procedure LoadTensorFlat(const pName: string; Dest: TNNetVolume);
+    // Virtual so format siblings with non-raw storage (TNNetGGUFReader's
+    // quantized blocks, neuralgguf.pas) can decode their own dtypes.
+    procedure LoadTensorFlat(const pName: string;
+      Dest: TNNetVolume); virtual;
     property FileName: string read FFileName;
   end;
 

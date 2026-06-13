@@ -18,7 +18,7 @@ interface
 uses
   Classes, SysUtils, fpcunit, testregistry, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
-  neuralpretrained, neuralhftokenizer, neuralaudio;
+  neuralgguf, neuralpretrained, neuralhftokenizer, neuralaudio;
 
 type
   TTestNeuralPretrained = class(TTestCase)
@@ -105,6 +105,10 @@ type
     procedure TestRopeScalingWiredIntoLlamaBuilder;
     procedure TestLlamaImporterFailsOnMissingTensor;
     procedure TestLlamaLogitParity;
+    procedure TestGGUFReaderMetadataAndTensors;
+    procedure TestGGUFTensorDecodeParity;
+    procedure TestGGUFLlamaLogitParity;
+    procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestShardedReaderMatchesSingleFile;
     procedure TestShardedLlamaLogitsBitIdentical;
     procedure TestDistilGPT2LogitParity;
@@ -2240,6 +2244,307 @@ begin
     Input.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// GGUF reader smoke test on tests/fixtures/tiny_llama_f32.gguf (the
+// tiny_llama checkpoint converted by tools/make_pico_gguf_fixture.py with
+// the llama.cpp tensor naming and q/k permute): header fields, typed
+// metadata scalars/arrays/defaults, and the tensor table with the ggml
+// dims REVERSED into row-major order (a [out, in] matrix must report the
+// same shape as its safetensors twin).
+procedure TTestNeuralPretrained.TestGGUFReaderMetadataAndTensors;
+var
+  Reader: TNNetGGUFReader;
+begin
+  Reader := TNNetGGUFReader.Create(FixturePath('tiny_llama_f32.gguf'));
+  try
+    AssertEquals('gguf version', 3, Reader.Version);
+    AssertEquals('gguf alignment', 32, Reader.Alignment);
+    AssertEquals('architecture', 'llama',
+      Reader.GetMetaString('general.architecture', ''));
+    AssertEquals('block_count', 2,
+      integer(Reader.GetMetaInt('llama.block_count', -1)));
+    AssertEquals('embedding_length', 8,
+      integer(Reader.GetMetaInt('llama.embedding_length', -1)));
+    AssertEquals('feed_forward_length', 12,
+      integer(Reader.GetMetaInt('llama.feed_forward_length', -1)));
+    AssertEquals('head_count', 2,
+      integer(Reader.GetMetaInt('llama.attention.head_count', -1)));
+    AssertEquals('head_count_kv', 1,
+      integer(Reader.GetMetaInt('llama.attention.head_count_kv', -1)));
+    AssertEquals('context_length', 16,
+      integer(Reader.GetMetaInt('llama.context_length', -1)));
+    AssertEquals('vocab_size', 11,
+      integer(Reader.GetMetaInt('llama.vocab_size', -1)));
+    AssertEquals('rope freq_base', 10000.0,
+      Reader.GetMetaFloat('llama.rope.freq_base', -1), 1e-3);
+    AssertEquals('rms eps', 1e-5,
+      Reader.GetMetaFloat('llama.attention.layer_norm_rms_epsilon', -1),
+      1e-9);
+    // Missing keys fall back to the caller's default.
+    AssertEquals('missing int key default', 77,
+      integer(Reader.GetMetaInt('no.such.key', 77)));
+    AssertEquals('missing string key default', 'dflt',
+      Reader.GetMetaString('no.such.key', 'dflt'));
+    // String-array metadata (the tokenizer block).
+    AssertEquals('tokenizer model', 'llama',
+      Reader.GetMetaString('tokenizer.ggml.model', ''));
+    AssertEquals('token list count', 11,
+      integer(Reader.GetMetaArrayCount('tokenizer.ggml.tokens')));
+    AssertEquals('token 3', '<tok_3>',
+      Reader.GetMetaArrayString('tokenizer.ggml.tokens', 3));
+    // Tensor table: embed + 2 blocks x 9 + final norm + untied head.
+    AssertEquals('tensor count', 21, Reader.Count);
+    AssertTrue('token_embd present', Reader.HasTensor('token_embd.weight'));
+    AssertTrue('output.weight present (untied)',
+      Reader.HasTensor('output.weight'));
+    // ggml stores dims contiguous-first ([8, 11] on the wire); the reader
+    // must serve the row-major [vocab, hidden] = [11, 8] view.
+    AssertEquals('embed dim count', 2, Reader.DimCount('token_embd.weight'));
+    AssertEquals('embed rows', 11, Reader.DimSize('token_embd.weight', 0));
+    AssertEquals('embed cols', 8, Reader.DimSize('token_embd.weight', 1));
+    AssertEquals('k_proj rows (kv_width)', 4,
+      Reader.DimSize('blk.0.attn_k.weight', 0));
+    AssertEquals('k_proj cols', 8, Reader.DimSize('blk.0.attn_k.weight', 1));
+    AssertEquals('embed dtype', 'F32', Reader.GetDType('token_embd.weight'));
+    AssertTrue('embed ggml type',
+      Reader.TensorGGMLType('token_embd.weight') = GGML_TYPE_F32);
+    AssertEquals('norm dim count', 1,
+      Reader.DimCount('output_norm.weight'));
+  finally
+    Reader.Free;
+  end;
+end;
+
+// Tensor decode parity against the safetensors twin of the same weights:
+// F32 must be bit-exact, F16 within half-precision rounding, Q8_0 within
+// the block-quantization error - and llama.cpp's q/k row permute must
+// round-trip exactly through RegisterRowDeinterleave.
+procedure TTestNeuralPretrained.TestGGUFTensorDecodeParity;
+var
+  GGUF: TNNetGGUFReader;
+  ST: TNNetSafeTensorsReader;
+  VG, VS: TNNetVolume;
+  MaxDiff: double;
+
+  function MaxAbsDiff(const GGUFName, STName: string): double;
+  var
+    i: integer;
+  begin
+    GGUF.LoadTensorFlat(GGUFName, VG);
+    ST.LoadTensorFlat(STName, VS);
+    AssertEquals('element count of ' + GGUFName, VS.Size, VG.Size);
+    Result := 0;
+    for i := 0 to VS.Size - 1 do
+      if Abs(VG.FData[i] - VS.FData[i]) > Result then
+        Result := Abs(VG.FData[i] - VS.FData[i]);
+  end;
+
+begin
+  VG := TNNetVolume.Create;
+  VS := TNNetVolume.Create;
+  ST := TNNetSafeTensorsReader.Create(FixturePath('tiny_llama.safetensors'));
+  try
+    // ---- F32: bit-exact ----
+    GGUF := TNNetGGUFReader.Create(FixturePath('tiny_llama_f32.gguf'));
+    try
+      AssertTrue('F32 embed exact', MaxAbsDiff('token_embd.weight',
+        'model.embed_tokens.weight') = 0);
+      AssertTrue('F32 ffn_up exact', MaxAbsDiff('blk.0.ffn_up.weight',
+        'model.layers.0.mlp.up_proj.weight') = 0);
+      AssertTrue('F32 final norm exact', MaxAbsDiff('output_norm.weight',
+        'model.norm.weight') = 0);
+      // The stored attn_q rows are llama.cpp-PERMUTED: they must NOT match
+      // the HF rows raw, and must match EXACTLY after de-interleaving.
+      AssertTrue('q_proj stored rows are permuted',
+        MaxAbsDiff('blk.0.attn_q.weight',
+          'model.layers.0.self_attn.q_proj.weight') > 1e-3);
+      GGUF.RegisterRowDeinterleave('blk.0.attn_q.weight', {HeadDim=}4);
+      AssertTrue('q_proj de-interleaved rows exact',
+        MaxAbsDiff('blk.0.attn_q.weight',
+          'model.layers.0.self_attn.q_proj.weight') = 0);
+    finally
+      GGUF.Free;
+    end;
+    // ---- F16: half-precision rounding (weights are O(1) scale, so the
+    // worst rounding step is ~2^-11 * |w| ~ 1e-3) ----
+    GGUF := TNNetGGUFReader.Create(FixturePath('tiny_llama_f16.gguf'));
+    try
+      AssertEquals('f16 dtype', 'F16', GGUF.GetDType('token_embd.weight'));
+      MaxDiff := MaxAbsDiff('token_embd.weight',
+        'model.embed_tokens.weight');
+      AssertTrue('F16 embed within rounding: max |diff| = ' +
+        FloatToStr(MaxDiff), (MaxDiff > 0) and (MaxDiff < 2e-3));
+      // Norm gains stay F32 in the f16 file (the llama.cpp convention).
+      AssertTrue('f16 file norm gains exact',
+        MaxAbsDiff('output_norm.weight', 'model.norm.weight') = 0);
+    finally
+      GGUF.Free;
+    end;
+  finally
+    ST.Free;
+  end;
+  // ---- Q8_0: block quantization error (scale d = blockmax/127, so the
+  // per-element error is <= d/2 + f16(d) rounding; the fixture weights
+  // are std 0.25 -> d ~ 0.008) ----
+  ST := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_llama_q8.safetensors'));
+  GGUF := TNNetGGUFReader.Create(FixturePath('tiny_llama_q8.gguf'));
+  try
+    AssertEquals('q8 dtype', 'Q8_0', GGUF.GetDType('blk.0.ffn_up.weight'));
+    AssertTrue('q8 ggml type',
+      GGUF.TensorGGMLType('blk.0.ffn_up.weight') = GGML_TYPE_Q8_0);
+    MaxDiff := MaxAbsDiff('blk.0.ffn_up.weight',
+      'model.layers.0.mlp.up_proj.weight');
+    // Non-vacuous: the dequantized values must differ from FP32 (it IS
+    // quantized) but stay within the Q8_0 step.
+    AssertTrue('Q8_0 ffn_up within quantization error: max |diff| = ' +
+      FloatToStr(MaxDiff), (MaxDiff > 1e-6) and (MaxDiff < 0.01));
+    MaxDiff := MaxAbsDiff('token_embd.weight',
+      'model.embed_tokens.weight');
+    AssertTrue('Q8_0 embed within quantization error: max |diff| = ' +
+      FloatToStr(MaxDiff), (MaxDiff > 1e-6) and (MaxDiff < 0.015));
+    // Norm gains stay F32 even in the quantized file.
+    AssertTrue('q8 file norm gains exact',
+      MaxAbsDiff('output_norm.weight', 'model.norm.weight') = 0);
+  finally
+    GGUF.Free;
+    ST.Free;
+  end;
+end;
+
+// End-to-end GGUF Llama import parity: BuildLlamaFromGGUF on the F32 GGUF
+// conversion of tiny_llama must reproduce the SAME logits the safetensors
+// import is verified against - tiny_llama_logits.json, the independent
+// pure-Python oracle (itself verified against HF transformers). This
+// closes the loop on the metadata->config mapping, the ggml->HF tensor
+// renames AND the q/k de-interleave in one gate.
+procedure TTestNeuralPretrained.TestGGUFLlamaLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildLlamaFromGGUFEx(FixturePath('tiny_llama_f32.gguf'), Config);
+  try
+    AssertEquals('hidden', 8, Config.HiddenSize);
+    AssertEquals('intermediate', 12, Config.IntermediateSize);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 11, Config.VocabSize);
+    AssertEquals('max positions', 16, Config.MaxPositions);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertFalse('untied head', Config.TieWordEmbeddings);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_llama_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Quantized/half-precision GGUF import drift, both measured against the
+// FP32 safetensors import of the IDENTICAL weights:
+// (a) tiny_llama_q8.gguf (Q8_0 matrices, TIED head, hidden=32) vs
+//     tiny_llama_q8.safetensors - gates the Q8_0 dequantize end to end;
+// (b) tiny_llama_f16.gguf vs tiny_llama.safetensors - gates F16 end to
+//     end. Drift gates are RELATIVE to the largest FP32 logit.
+procedure TTestNeuralPretrained.TestGGUFLlamaQ8AndF16ImportDrift;
+var
+  NNRef, NNG: TNNet;
+  ConfigRef, ConfigG: TLlamaConfig;
+
+  // Max |logit diff| / max |reference logit| over 3 deterministic
+  // sequences of SeqLen tokens (ids cycle through the vocab).
+  function RelativeDrift(SeqLen, Vocab: integer): double;
+  var
+    Input, OutR, OutG: TNNetVolume;
+    i, s: integer;
+    MaxDiff, MaxAbsLogit: double;
+  begin
+    Input := TNNetVolume.Create(SeqLen, 1, 1);
+    OutR := TNNetVolume.Create;
+    OutG := TNNetVolume.Create;
+    try
+      MaxDiff := 0;
+      MaxAbsLogit := 0;
+      for s := 0 to 2 do
+      begin
+        for i := 0 to SeqLen - 1 do
+          Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+        NNRef.Compute(Input);
+        NNRef.GetOutput(OutR);
+        NNG.Compute(Input);
+        NNG.GetOutput(OutG);
+        AssertEquals('output size', OutR.Size, OutG.Size);
+        for i := 0 to OutR.Size - 1 do
+        begin
+          if Abs(OutR.FData[i]) > MaxAbsLogit then
+            MaxAbsLogit := Abs(OutR.FData[i]);
+          if Abs(OutR.FData[i] - OutG.FData[i]) > MaxDiff then
+            MaxDiff := Abs(OutR.FData[i] - OutG.FData[i]);
+        end;
+      end;
+      AssertTrue('reference logits non-degenerate', MaxAbsLogit > 1e-3);
+      Result := MaxDiff / MaxAbsLogit;
+    finally
+      OutG.Free;
+      OutR.Free;
+      Input.Free;
+    end;
+  end;
+
+var
+  Drift: double;
+begin
+  RandSeed := 424242;
+  // ---- (a) Q8_0 ----
+  NNRef := BuildLlamaFromSafeTensorsEx(
+    FixturePath('tiny_llama_q8.safetensors'), ConfigRef, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_llama_q8_config.json'));
+  NNG := BuildLlamaFromGGUFEx(FixturePath('tiny_llama_q8.gguf'), ConfigG);
+  try
+    AssertEquals('q8 hidden', 32, ConfigG.HiddenSize);
+    AssertEquals('q8 layers', 2, ConfigG.NumLayers);
+    AssertEquals('q8 kv heads', 1, ConfigG.NumKVHeads);
+    AssertEquals('q8 vocab', 8, ConfigG.VocabSize);
+    // No output.weight in the file -> the head ties to the embedding.
+    AssertTrue('q8 tied head inferred', ConfigG.TieWordEmbeddings);
+    AssertTrue('q8 config matches json config',
+      ConfigRef.TieWordEmbeddings);
+    Drift := RelativeDrift(ConfigG.MaxPositions, ConfigG.VocabSize);
+    // Measured 2026-06: 8.33e-2 relative - and VERIFIED inherent: HF
+    // transformers' LlamaForCausalLM fed the identically Q8_0-dequantized
+    // weights drifts 8.33e-2 relative too (matching this import to 6
+    // significant digits), so the gap is pure quantization error at pico
+    // width 32 (it shrinks at real checkpoint widths - see the int8 drift
+    // tests for the same effect), not an import bug. Gated at ~1.8x the
+    // measurement; the quantization must also be VISIBLE (> 1e-3) or the
+    // fixture went vacuous.
+    AssertTrue('Q8_0 GGUF logit drift = ' + FloatToStr(Drift) +
+      ' must be in (1e-3, 1.5e-1) relative',
+      (Drift > 1e-3) and (Drift < 1.5e-1));
+  finally
+    NNG.Free;
+    NNRef.Free;
+  end;
+  // ---- (b) F16 ----
+  NNRef := BuildLlamaFromSafeTensorsEx(
+    FixturePath('tiny_llama.safetensors'), ConfigRef, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_llama_config.json'));
+  NNG := BuildLlamaFromGGUFEx(FixturePath('tiny_llama_f16.gguf'), ConfigG);
+  try
+    Drift := RelativeDrift(ConfigG.MaxPositions, ConfigG.VocabSize);
+    // HF transformers fed the identically f16-rounded weights drifts
+    // 9.2e-4 relative (measured 2026-06; F16 rounds each weight to ~5e-4
+    // relative). Gated at ~3x that.
+    AssertTrue('F16 GGUF logit drift = ' + FloatToStr(Drift) +
+      ' must be < 3e-3 relative', Drift < 3e-3);
+  finally
+    NNG.Free;
+    NNRef.Free;
   end;
 end;
 

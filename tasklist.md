@@ -262,10 +262,13 @@ rather than acted on.
       heads consistent, update FStruct vocab sizes). Needed the moment
       anyone adds special tokens to fine-tune on top of the Llama/GPT-2
       importers.
-- [ ] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
+- [X] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
       de-facto checkpoint format, and it ships PRE-quantized weights —
       dovetails with the landed int8 quantized inference (read Q8_0 blocks
-      directly instead of quantizing FP32 yourself).
+      directly instead of quantizing FP32 yourself). (landed:
+      neural/neuralgguf.pas TNNetGGUFReader F32/F16/Q8_0 +
+      BuildLlamaFromGGUF; Q8_0 still dequantizes to FP32 at load — the
+      direct-into-int8-storage path remains open)
 - [ ] Magnitude pruning (torch.nn.utils.prune port): PERSISTENT global or
       per-layer magnitude masks applied during training/inference — the
       diagnostics half is landed (TNNet.MagnitudePruningReport +
