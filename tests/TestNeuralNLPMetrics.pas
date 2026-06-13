@@ -91,6 +91,12 @@ type
     // edit leaves the score unchanged, editing the LAST context token changes
     // it, and shifting the boundary moves exactly one ScoreSequence term.
     procedure TestScoreCompletionScoresOnlyCompletion;
+    // Shared-prefix batch scoring gives IDENTICAL scores to per-candidate
+    // ScoreCompletion (and EvaluateMultipleChoice still agrees).
+    procedure TestScoreCompletionsBatchMatchesPerCandidate;
+    // Over-context sequences raise by default but score under LastWindow, and
+    // the trailing positions match scoring the trailing window standalone.
+    procedure TestScoreSequenceLastWindowScoresOverContext;
     // Pinned multiple-choice fixture: the gold answer wins, and acc vs
     // acc_norm disagree on a length-confounded item (p_cat^2 < p_dog < p_cat).
     procedure TestMultipleChoiceAccVsAccNorm;
@@ -765,6 +771,101 @@ begin
     AssertTrue('empty context raises EArgumentException', Raised);
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestScoreCompletionsBatchMatchesPerCandidate;
+var
+  NN: TNNet;
+  Ctx: TNeuralIntegerArray;
+  Cands: array of TNeuralIntegerArray;
+  Batch: TNNetCompletionScoreArray;
+  Single: TNNetCompletionScore;
+  Cand: integer;
+begin
+  // Single next-token head (BuildCharLM): the batch path scores ONLY the
+  // completion positions per candidate, skipping the shared-context forwards.
+  // Result MUST be bit-identical to per-candidate ScoreCompletion.
+  RandSeed := 424242;
+  NN := BuildCharLM(csCtx, csVocab);
+  try
+    NN.InitWeights();
+    Ctx := TNeuralIntegerArray.Create(2, 4, 5);
+    SetLength(Cands, 3);
+    Cands[0] := TNeuralIntegerArray.Create(6, 7);
+    Cands[1] := TNeuralIntegerArray.Create(3);
+    Cands[2] := TNeuralIntegerArray.Create(8, 9, 10);
+    Batch := ScoreCompletionsBatch(NN, Ctx, Cands);
+    AssertEquals('one score per candidate', 3, Length(Batch));
+    for Cand := 0 to High(Cands) do
+    begin
+      Single := ScoreCompletion(NN, Ctx, Cands[Cand]);
+      AssertEquals('batch SumLogProb == per-candidate, cand ' + IntToStr(Cand),
+        Single.SumLogProb, Batch[Cand].SumLogProb, 1e-9);
+      AssertEquals('batch MeanLogProb == per-candidate, cand ' + IntToStr(Cand),
+        Single.MeanLogProb, Batch[Cand].MeanLogProb, 1e-9);
+      AssertEquals('batch TokenCount == per-candidate, cand ' + IntToStr(Cand),
+        Single.TokenCount, Batch[Cand].TokenCount);
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestScoreSequenceLastWindowScoresOverContext;
+var
+  NN, CharNN: TNNet;
+  Tokens, Window: TNeuralIntegerArray;
+  LogProbs, WinProbs: TNeuralFloatDynArr;
+  Pos: integer;
+  Raised: boolean;
+begin
+  // Per-position LM with deterministic weights: it conditions only on the
+  // immediately previous token, so last-window scoring of an over-context
+  // sequence reproduces the hand-computed per-token logprob exactly.
+  NN := BuildPerPositionLM(csCtx, csVocab);
+  try
+    SetLinearScorerWeights(NN);
+    // csCtx+2 tokens: longer than the window (csCtx). Default policy raises.
+    SetLength(Tokens, csCtx + 2);
+    for Pos := 0 to High(Tokens) do Tokens[Pos] := (Pos * 3 + 2) mod csVocab;
+    Raised := false;
+    try
+      ScoreSequence(NN, Tokens);
+    except
+      on EArgumentException do Raised := true;
+    end;
+    AssertTrue('over-context raises without LastWindow', Raised);
+    // With LastWindow it scores instead of raising.
+    LogProbs := ScoreSequence(NN, Tokens, true);
+    AssertEquals('one logprob per token', Length(Tokens), Length(LogProbs));
+    AssertEquals('first token never scored', 0.0, LogProbs[0], 1e-9);
+    for Pos := 1 to High(Tokens) do
+      AssertEquals('last-window logprob conditions on previous token, pos ' +
+        IntToStr(Pos),
+        ExpectedRowLogProb(Tokens[Pos - 1], Tokens[Pos]), LogProbs[Pos], 1e-5);
+  finally
+    NN.Free;
+  end;
+  // Single next-token head: the last scored position's window equals scoring
+  // the trailing context-window standalone (LastWindow truncates the prefix).
+  RandSeed := 424242;
+  CharNN := BuildCharLM(csCtx, csVocab);
+  try
+    CharNN.InitWeights();
+    SetLength(Tokens, csCtx + 3);
+    for Pos := 0 to High(Tokens) do Tokens[Pos] := (Pos * 5 + 1) mod csVocab;
+    LogProbs := ScoreSequence(CharNN, Tokens, true);
+    AssertEquals('char-LM over-context scores under LastWindow',
+      Length(Tokens), Length(LogProbs));
+    // Last position: window = the csCtx tokens immediately before it plus it.
+    // Build that standalone sequence (length csCtx+1) and score its last token.
+    Window := Copy(Tokens, High(Tokens) - csCtx, csCtx + 1);
+    WinProbs := ScoreSequence(CharNN, Window); // fits exactly, no flag needed
+    AssertEquals('last-window tail matches standalone trailing-window score',
+      WinProbs[High(WinProbs)], LogProbs[High(LogProbs)], 1e-5);
+  finally
+    CharNN.Free;
   end;
 end;
 

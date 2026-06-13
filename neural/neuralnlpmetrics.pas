@@ -94,8 +94,16 @@ and a gold index; every candidate is scored with ScoreCompletion and the
 argmax wins (first-max tie-break). Accuracy ranks by SumLogProb (lm-eval
 "acc", short-biased) and AccuracyNorm by MeanLogProb (lm-eval "acc_norm",
 length-normalized) - the two disagree on length-confounded items.
-One full forward per candidate (v1); batching candidates that share a
-context prefix is a possible follow-up.
+It scores each item's candidates through ScoreCompletionsBatch, which shares
+the common context prefix: for single next-token heads only the completion
+positions are forwarded per candidate (the shared-context forwards are not
+re-run), giving scores IDENTICAL to per-candidate ScoreCompletion.
+
+CONTEXT OVERFLOW. ScoreSequence / ScoreCompletion take an optional
+LastWindow flag (default false = the v1 raise-on-overflow policy). With
+LastWindow=true an over-context sequence is scored over the trailing
+context-window ending at each position (the standard sliding-window LM eval)
+instead of raising; sequences that already fit score identically either way.
 
 BLEU. CorpusBLEU implements Papineni et al. 2002: corpus-pooled MODIFIED
 (clipped) n-gram precision up to MaxN (default 4), geometric mean with
@@ -198,6 +206,8 @@ type
     TokenCount: integer;        // number of completion tokens scored
   end;
 
+  TNNetCompletionScoreArray = array of TNNetCompletionScore;
+
   // One multiple-choice evaluation item (lm-eval request style): a shared
   // context, N candidate completions and the index of the gold candidate.
   TNNetMultipleChoiceItem = record
@@ -289,15 +299,37 @@ function PerplexityStrided(NN: TNNet; Dict: TStringListInt; Corpus: TStrings;
 
 // Per-token log-probabilities ln p(Tokens[i] | Tokens[0..i-1]) of an
 // already-tokenized sequence (teacher-forced; no generation). Result has the
-// same length as Tokens; Result[0] is 0 (never scored). Raises EArgumentException
-// when the sequence exceeds the model context window (v1; see unit header).
+// same length as Tokens; Result[0] is 0 (never scored).
+//   LastWindow=false (default): a sequence that exceeds the model context
+//     window raises EArgumentException (the v1 policy; see unit header).
+//   LastWindow=true: instead of raising, each position is scored over the LAST
+//     context-window of tokens ending at it (the standard sliding-window LM
+//     eval) - position Pos conditions on tokens (Pos-ContextLen+1 .. Pos-1)
+//     when its full left context would overflow. Sequences that already fit are
+//     scored identically with or without the flag.
 function ScoreSequence(NN: TNNet;
-  const Tokens: TNeuralIntegerArray): TNeuralFloatDynArr;
+  const Tokens: TNeuralIntegerArray;
+  LastWindow: boolean = false): TNeuralFloatDynArr;
 
 // Sum + length-normalized logprob of CompletionTokens given ContextTokens.
 // Only completion tokens are scored; ContextTokens must be non-empty.
+// LastWindow forwards to ScoreSequence (over-context -> last-window scoring
+// instead of raising).
 function ScoreCompletion(NN: TNNet;
-  const ContextTokens, CompletionTokens: TNeuralIntegerArray): TNNetCompletionScore;
+  const ContextTokens, CompletionTokens: TNeuralIntegerArray;
+  LastWindow: boolean = false): TNNetCompletionScore;
+
+// SHARED-PREFIX batch scoring: scores every candidate completion of ONE shared
+// context, returning the same TNNetCompletionScore array as calling
+// ScoreCompletion(NN, ContextTokens, Candidates[i]) candidate-by-candidate -
+// but the single next-token head path scores ONLY the completion positions
+// (the unused context-position forwards ScoreSequence would run are skipped, so
+// the shared context is not re-forwarded for every candidate). Scores are
+// IDENTICAL to the per-candidate path. LastWindow is honored per candidate.
+function ScoreCompletionsBatch(NN: TNNet;
+  const ContextTokens: TNeuralIntegerArray;
+  const Candidates: array of TNeuralIntegerArray;
+  LastWindow: boolean = false): TNNetCompletionScoreArray;
 
 // Multiple-choice harness: scores every candidate completion of every item
 // with ScoreCompletion and reports acc (sum-logprob argmax) and acc_norm
@@ -694,15 +726,22 @@ end;
 // Token-level logprob scoring + multiple-choice harness
 // ---------------------------------------------------------------------------
 
-function ScoreSequence(NN: TNNet;
-  const Tokens: TNeuralIntegerArray): TNeuralFloatDynArr;
+// Internal worker behind ScoreSequence / ScoreCompletionsBatch. Fills Result
+// for scored positions in [max(1,FirstScored) .. High(Tokens)] and leaves all
+// earlier entries at 0. FirstScored lets the shared-prefix batch path skip the
+// (unused) context positions for single next-token heads, scoring ONLY the
+// completion tokens while producing identical per-token log-probs. LastWindow
+// switches over-context sequences from raising to trailing-window scoring.
+function ScoreSequenceFrom(NN: TNNet;
+  const Tokens: TNeuralIntegerArray; FirstScored: integer;
+  LastWindow: boolean): TNeuralFloatDynArr;
 var
   InV: TNNetVolume;
   Last: TNNetLayer;
   Prefix: TNeuralIntegerArray;
   ContextLen, InDepth, VocabSize: integer;
-  PerPosition: boolean;
-  SampleLen, Pos, D, Tgt: integer;
+  PerPosition, Overflows: boolean;
+  SampleLen, Pos, D, Tgt, FirstPos, WinStart, WinLen, Row: integer;
   RowSum, Prob: TNeuralFloat;
 begin
   SetLength(Result, 0);
@@ -720,20 +759,24 @@ begin
   then VocabSize := Last.Output.Depth
   else VocabSize := Last.Output.Size;
   if VocabSize < 2 then Exit;
-  // v1 context policy: error clearly instead of silently sub-windowing.
-  // Per-position heads need the whole sequence in one window; single
-  // next-token heads need the longest scored prefix (SampleLen-1) to fit.
-  if (PerPosition and (SampleLen > ContextLen)) or
-     ((not PerPosition) and (SampleLen - 1 > ContextLen)) then
+  // Per-position heads need the whole sequence in one window; single next-token
+  // heads need the longest scored prefix (SampleLen-1) to fit.
+  Overflows := (PerPosition and (SampleLen > ContextLen)) or
+               ((not PerPosition) and (SampleLen - 1 > ContextLen));
+  // v1 context policy: error clearly instead of silently sub-windowing -
+  // UNLESS the caller opted into last-window scoring.
+  if Overflows and (not LastWindow) then
     raise EArgumentException.CreateFmt(
       'ScoreSequence: sequence length %d exceeds the model context window %d',
       [SampleLen, ContextLen]);
   SetLength(Result, SampleLen);
-  Result[0] := 0; // first token has no conditioning context - never scored
+  for Pos := 0 to SampleLen - 1 do Result[Pos] := 0;
   if SampleLen < 2 then Exit;
+  FirstPos := FirstScored;
+  if FirstPos < 1 then FirstPos := 1;
   InV := TNNetVolume.Create(NN.GetFirstLayer().Output);
   try
-    if PerPosition then
+    if PerPosition and (not Overflows) then
     begin
       // ONE teacher-forced forward scores every position at once.
       InV.Fill(0);
@@ -741,7 +784,7 @@ begin
       then InV.CopyNoChecksIntArr(Tokens)       // token ids -> embedding
       else InV.OneHotEncoding(Tokens);          // one-hot, left-aligned
       NN.Compute(InV);
-      for Pos := 1 to SampleLen - 1 do
+      for Pos := FirstPos to SampleLen - 1 do
       begin
         Tgt := Tokens[Pos];
         if (Tgt < 0) or (Tgt >= VocabSize) then
@@ -759,11 +802,11 @@ begin
         Result[Pos] := SafeLogProb(Prob);
       end;
     end
-    else
+    else if PerPosition then
     begin
-      // Single next-token head: one forward per scored position over the
-      // growing right-aligned prefix.
-      for Pos := 1 to SampleLen - 1 do
+      // Over-context per-position head + LastWindow: per scored position, run a
+      // ContextLen window ENDING at Pos and read the row predicting Pos.
+      for Pos := FirstPos to SampleLen - 1 do
       begin
         Tgt := Tokens[Pos];
         if (Tgt < 0) or (Tgt >= VocabSize) then
@@ -771,7 +814,40 @@ begin
           Result[Pos] := SafeLogProb(0);
           continue;
         end;
-        Prefix := Copy(Tokens, 0, Pos);
+        WinStart := Pos - ContextLen + 1;
+        if WinStart < 0 then WinStart := 0;
+        WinLen := Pos - WinStart + 1;           // tokens [WinStart..Pos]
+        Prefix := Copy(Tokens, WinStart, WinLen);
+        InV.Fill(0);
+        if InDepth = 1
+        then InV.CopyNoChecksIntArr(Prefix)
+        else InV.OneHotEncoding(Prefix);
+        NN.Compute(InV);
+        Row := WinLen - 2;                       // row predicting the last token
+        RowSum := 0;
+        for D := 0 to VocabSize - 1 do
+          RowSum := RowSum + Last.Output[Row, 0, D];
+        if RowSum <= 0 then RowSum := 1.0;
+        Prob := Last.Output[Row, 0, Tgt] / RowSum;
+        Result[Pos] := SafeLogProb(Prob);
+      end;
+    end
+    else
+    begin
+      // Single next-token head: one forward per scored position over the
+      // right-aligned prefix. LastWindow caps the prefix at ContextLen tokens.
+      for Pos := FirstPos to SampleLen - 1 do
+      begin
+        Tgt := Tokens[Pos];
+        if (Tgt < 0) or (Tgt >= VocabSize) then
+        begin
+          Result[Pos] := SafeLogProb(0);
+          continue;
+        end;
+        // Prefix = tokens [WinStart..Pos-1] (the target Tokens[Pos] excluded).
+        WinStart := 0;
+        if LastWindow and (Pos > ContextLen) then WinStart := Pos - ContextLen;
+        Prefix := Copy(Tokens, WinStart, Pos - WinStart);
         if InDepth = 1 then
         begin
           InV.Fill(0);
@@ -791,8 +867,20 @@ begin
   SetLength(Prefix, 0);
 end;
 
-function ScoreCompletion(NN: TNNet;
-  const ContextTokens, CompletionTokens: TNeuralIntegerArray): TNNetCompletionScore;
+function ScoreSequence(NN: TNNet;
+  const Tokens: TNeuralIntegerArray;
+  LastWindow: boolean): TNeuralFloatDynArr;
+begin
+  Result := ScoreSequenceFrom(NN, Tokens, 1, LastWindow);
+end;
+
+// Shared core: scores CompletionTokens given ContextTokens. FirstScored=CtxLen
+// asks ScoreSequenceFrom to forward only the completion positions (the unused
+// context positions are skipped for single next-token heads). Identical scores
+// to scoring the whole sequence and summing the completion indices.
+function ScoreCompletionCore(NN: TNNet;
+  const ContextTokens, CompletionTokens: TNeuralIntegerArray;
+  LastWindow: boolean): TNNetCompletionScore;
 var
   Full: TNeuralIntegerArray;
   LogProbs: TNeuralFloatDynArr;
@@ -811,7 +899,9 @@ begin
   SetLength(Full, CtxLen + CompLen);
   for I := 0 to CtxLen - 1 do Full[I] := ContextTokens[I];
   for I := 0 to CompLen - 1 do Full[CtxLen + I] := CompletionTokens[I];
-  LogProbs := ScoreSequence(NN, Full);
+  // Only the completion positions (CtxLen ..) are summed below, so scoring can
+  // start there - the shared context forwards are skipped for single-head nets.
+  LogProbs := ScoreSequenceFrom(NN, Full, CtxLen, LastWindow);
   if Length(LogProbs) <> CtxLen + CompLen then Exit; // degenerate model
   // Completion tokens ONLY: indices CtxLen .. CtxLen+CompLen-1.
   for I := CtxLen to CtxLen + CompLen - 1 do
@@ -822,10 +912,31 @@ begin
   SetLength(LogProbs, 0);
 end;
 
+function ScoreCompletion(NN: TNNet;
+  const ContextTokens, CompletionTokens: TNeuralIntegerArray;
+  LastWindow: boolean): TNNetCompletionScore;
+begin
+  Result := ScoreCompletionCore(NN, ContextTokens, CompletionTokens, LastWindow);
+end;
+
+function ScoreCompletionsBatch(NN: TNNet;
+  const ContextTokens: TNeuralIntegerArray;
+  const Candidates: array of TNeuralIntegerArray;
+  LastWindow: boolean): TNNetCompletionScoreArray;
+var
+  Cand: integer;
+begin
+  SetLength(Result, Length(Candidates));
+  for Cand := 0 to High(Candidates) do
+    Result[Cand] := ScoreCompletionCore(NN, ContextTokens,
+      Candidates[Cand], LastWindow);
+end;
+
 function EvaluateMultipleChoice(NN: TNNet;
   const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
 var
   ItemIdx, Cand, BestSum, BestNorm: integer;
+  Scores: TNNetCompletionScoreArray;
   Score: TNNetCompletionScore;
   BestSumLP, BestNormLP: TNeuralFloat;
 begin
@@ -842,10 +953,13 @@ begin
     BestNorm := 0;
     BestSumLP := 0;
     BestNormLP := 0;
+    // Shared-prefix batch: all candidates of an item share ContextTokens, so
+    // the shared context is not re-forwarded per candidate (single-head nets).
+    Scores := ScoreCompletionsBatch(NN, Items[ItemIdx].ContextTokens,
+      Items[ItemIdx].Candidates);
     for Cand := 0 to High(Items[ItemIdx].Candidates) do
     begin
-      Score := ScoreCompletion(NN, Items[ItemIdx].ContextTokens,
-        Items[ItemIdx].Candidates[Cand]);
+      Score := Scores[Cand];
       // First-max tie-break: a later candidate must be STRICTLY better.
       if (Cand = 0) or (Score.SumLogProb > BestSumLP) then
       begin

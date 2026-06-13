@@ -534,11 +534,19 @@ rather than acted on.
       byte-level-BPE variant needs a vocab prefix-scan helper there;
       (b) guidance-style multi-token rollback (back up over more than the
       single last prompt token when the boundary artifact spans merges).
-- [ ] HellaSwag-style eval follow-up (the example landed: examples/HellaSwagEval
-      loads an imported checkpoint, tokenizes multiple-choice items with
-      TNeuralHFTokenizer and reports acc / acc_norm through
-      EvaluateMultipleChoice): batch candidates sharing a context prefix;
-      optional last-window scoring for over-context sequences (v1 raises).
+- [X] HellaSwag-style eval follow-up: BOTH pieces LANDED in
+      neural/neuralnlpmetrics.pas. (a) ScoreCompletionsBatch(NN, Context,
+      Candidates) scores all candidates of a shared context, skipping the
+      shared-context forwards for single next-token heads (only completion
+      positions are forwarded per candidate) - scores IDENTICAL to per-candidate
+      ScoreCompletion; EvaluateMultipleChoice now routes through it.
+      (b) ScoreSequence/ScoreCompletion gained an optional LastWindow flag
+      (default false = the v1 raise policy) that scores over-context sequences
+      over the trailing context-window ending at each position instead of
+      raising (both per-position and single-head paths). Tests:
+      TestScoreCompletionsBatchMatchesPerCandidate (batch == per-candidate) and
+      TestScoreSequenceLastWindowScoresOverContext (raises by default, scores
+      under LastWindow, trailing position matches the standalone window).
 - [ ] Needle-in-a-haystack long-context eval harness: place a fact at
       varying depths in a synthetic long context, measure retrieval
       accuracy vs (depth, context length) as a small grid report. The
