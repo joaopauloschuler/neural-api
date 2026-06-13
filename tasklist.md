@@ -269,9 +269,12 @@ rather than acted on.
       exact inverses of their importers — Llama via the shared
       BuildLlamaMemTensorReader walk that also backs the GGUF exporter, undoing
       the q/k rotate_half de-permute + SwiGLU gate|up un-fuse + Gemma RMSNorm
-      gain offset; round-trip gated by TestLlamaSafeTensorsRoundTrip): add a
-      layer->HF-name + transpose inverse map for the REMAINING architectures
-      (Qwen3/BERT/GPT-NeoX/...), each its own map.
+      gain offset; round-trip gated by TestLlamaSafeTensorsRoundTrip; QWEN3
+      SaveQwen3ToSafeTensors LANDED via the dedicated BuildQwen3MemTensorReader
+      walk — same q/k rotate_half de-permute + SwiGLU gate|up un-fuse PLUS the
+      per-head q/k RMSNorm gain un-permute, round-trip gated by
+      TestQwen3SafeTensorsRoundTrip): add a layer->HF-name + transpose inverse
+      map for the REMAINING architectures (BERT/GPT-NeoX/...), each its own map.
 - [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the

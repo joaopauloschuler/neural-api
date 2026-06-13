@@ -107,6 +107,7 @@ type
     procedure TestGPT2LogitParity;
     procedure TestGPT2SafeTensorsRoundTrip;
     procedure TestLlamaSafeTensorsRoundTrip;
+    procedure TestQwen3SafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -1553,6 +1554,68 @@ begin
     end;
     // F32 + invertible q/k de-permute + SwiGLU un-fuse -> identical logits.
     AssertTrue('Llama safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
+    NN.Free;
+  end;
+end;
+
+// (SaveQwen3ToSafeTensors): import the committed pico Qwen3 fixture -> export
+// to a temp .safetensors -> re-import (same config.json) and assert next-token
+// logits match the original import bit-tight on pinned inputs. Proves the name
+// map, the q/k rotate_half de-permutation, the SwiGLU gate|up un-fusion AND
+// the per-head q/k RMSNorm gain un-permutation are exactly the inverse of
+// BuildQwen3FromSafeTensors.
+procedure TTestNeuralPretrained.TestQwen3SafeTensorsRoundTrip;
+var
+  NN, NN2: TNNet;
+  Config, Config2: TLlamaConfig;
+  Input, Out1, Out2: TNNetVolume;
+  TmpPath, CfgPath: string;
+  i, s, SeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  CfgPath := FixturePath('tiny_qwen3_config.json');
+  TmpPath := GetTempDir(false) + 'cai_qwen3_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  NN := BuildQwen3FromSafeTensorsEx(FixturePath('tiny_qwen3.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false, CfgPath);
+  Input := TNNetVolume.Create;
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  NN2 := nil;
+  try
+    AssertTrue('qk_norm', Config.QKNorm);
+    SaveQwen3ToSafeTensors(NN, Config, TmpPath);
+    NN2 := BuildQwen3FromSafeTensorsEx(TmpPath, Config2, {SeqLen=}0,
+      {pInferenceOnly=}false, CfgPath);
+
+    SeqLen := Config.MaxPositions;
+    Vocab := Config.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      NN.Compute(Input);
+      NN.GetOutput(Out1);
+      NN2.Compute(Input);
+      NN2.GetOutput(Out2);
+      AssertEquals('qwen3 round-trip output size', Out1.Size, Out2.Size);
+      for i := 0 to Out1.Size - 1 do
+        if Abs(Out1.FData[i] - Out2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(Out1.FData[i] - Out2.FData[i]);
+    end;
+    // F32 + invertible q/k de-permute + SwiGLU un-fuse + per-head q/k RMSNorm
+    // gain un-permute -> identical logits.
+    AssertTrue('Qwen3 safetensors round-trip: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
   finally
     if FileExists(TmpPath) then DeleteFile(TmpPath);

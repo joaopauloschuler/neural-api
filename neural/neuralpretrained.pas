@@ -1021,6 +1021,19 @@ function BuildQwen3FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// HF-names safetensors exporter - the exact inverse of
+// BuildQwen3FromSafeTensors. Re-derives the HF-named weight set from the
+// wired layers (the q/k rotate_half de-permutation and SwiGLU gate|up
+// un-fusion of the Llama exporter PLUS the per-head q/k RMSNorm gain
+// un-pack: each block's shared [head_dim] q_norm/k_norm gain is read back
+// from the first per-head TNNetTokenRMSNorm copy and rotate_half-de-permuted)
+// and writes it under the precise model.embed_tokens / model.layers.N.* /
+// model.norm / lm_head names BuildQwen3FromSafeTensors reads, so a re-import
+// is bit-identical. Tied-embedding models omit lm_head.weight. The matching
+// config.json must accompany the file for re-import. Coded by Claude (AI).
+procedure SaveQwen3ToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
 // Qwen3-MoE (model_type "qwen3_moe", e.g. Qwen/Qwen3-30B-A3B and smaller
 // Qwen3-MoE chat checkpoints): the CROSS of the dense-Qwen3 attention and a
 // sparse top-k Mixture-of-Experts FFN. The attention side is the Qwen3 path
@@ -6911,6 +6924,335 @@ begin
       Writer.SetMetadata('format', 'pt');
       Writer.SetMetadata('exporter', 'cai-neural-api/llama');
       // Drain every HF-named tensor the walk produced, preserving its shape.
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TName := Reader.TensorName(i);
+        Dims := Reader.DimCount(TName);
+        SetLength(Shape, Dims);
+        for d := 0 to Dims - 1 do
+          Shape[d] := Reader.DimSize(TName, d);
+        Reader.LoadTensorFlat(TName, V);
+        Writer.AddTensorFlat(TName, Shape, V, pDType);
+      end;
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+  finally
+    V.Free;
+    Reader.Free;
+  end;
+end;
+
+// Re-derives the HF-named Qwen3 weight set (row-major [out,in] linears,
+// [d] norm gains, per-head [head_dim] q_norm/k_norm gains, [vocab,hidden]
+// embedding) from a wired Qwen3 TNNet, undoing every transform
+// BuildQwen3FromSafeTensors applied: the interleaved rotate_half q/k
+// de-permutation, the SwiGLU gate|up un-fusion, and the per-head q/k RMSNorm
+// gain un-permutation. This is the Qwen3 sibling of BuildLlamaMemTensorReader
+// (which rejects QKNorm); the Llama walker cannot be reused because the
+// per-head TNNetTokenRMSNorm copies are interleaved with the block norms in
+// net order (AttnNorm, K-norms, Q-norms, MlpNorm per block). The returned
+// reader is the in-memory equivalent of the original HF safetensors
+// checkpoint. Caller owns the result. Coded by Claude (AI).
+function BuildQwen3MemTensorReader(Net: TNNet;
+  const Config: TLlamaConfig): TNNetMemTensorReader;
+var
+  Reader: TNNetMemTensorReader;
+  HeadDim, QWidth, KVWidth, HalfDim, IntSize: integer;
+  b, j, c, h, k, i: integer;
+  Linears, Norms: array of TNNetLayer;
+  Embed, Lay: TNNetLayer;
+  V: TNNetVolume;
+  BlockPrefix: string;
+  NormsPerBlock: integer;
+
+  // Reads a bias-free [OutDim, InDim] PointwiseConvLinear back into a flat
+  // row-major [OutDim*InDim] volume (neuron j weight i = W[j*InDim+i]).
+  procedure DumpLinear(Layer: TNNetLayer; OutDim, InDim: integer;
+    const HFName: string);
+  var
+    jj, ii: integer;
+  begin
+    if Layer.Neurons.Count <> OutDim then
+      ImportError('TNNet Qwen3 export: layer for "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+        IntToStr(OutDim) + '.');
+    V.ReSize(OutDim * InDim, 1, 1);
+    for jj := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[jj].Weights.Size <> InDim then
+        ImportError('TNNet Qwen3 export: neuron ' + IntToStr(jj) + ' of "' +
+          HFName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for ii := 0 to InDim - 1 do
+        V.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+    end;
+    Reader.AddTensor(HFName, [OutDim, InDim], V);
+  end;
+
+  // Reads a TokenRMSNorm gain [d] back straight (Qwen3 has no gain offset).
+  procedure DumpNorm(Layer: TNNetLayer; d: integer; const HFName: string);
+  var
+    ii: integer;
+  begin
+    if Layer.Neurons[0].Weights.Size < d then
+      ImportError('TNNet Qwen3 export: norm "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' gains, expected >= ' +
+        IntToStr(d) + '.');
+    V.ReSize(d, 1, 1);
+    for ii := 0 to d - 1 do
+      V.FData[ii] := Layer.Neurons[0].Weights.FData[ii];
+    Reader.AddTensor(HFName, [d], V);
+  end;
+
+  // Reads a per-head q/k RMSNorm [head_dim] gain back, de-permuting the
+  // rotate_half order LoadLlamaHeadRMSNormWeights applied (stored channel
+  // 2k <- HF k for k<half, 2(k-half)+1 <- HF k for k>=half). The shared
+  // gain is identical in every head copy, so the first copy is sufficient.
+  procedure DumpHeadNorm(Layer: TNNetLayer; const HFName: string);
+  var
+    kk, src: integer;
+  begin
+    if Layer.Neurons[0].Weights.Size < HeadDim then
+      ImportError('TNNet Qwen3 export: head norm "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' gains, expected >= ' +
+        IntToStr(HeadDim) + '.');
+    V.ReSize(HeadDim, 1, 1);
+    for kk := 0 to HeadDim - 1 do
+    begin
+      if kk < HalfDim then src := 2 * kk
+      else src := 2 * (kk - HalfDim) + 1;
+      V.FData[kk] := Layer.Neurons[0].Weights.FData[src];
+    end;
+    Reader.AddTensor(HFName, [HeadDim], V);
+  end;
+
+begin
+  // ---- reject the out-of-scope architecture deltas. Qwen3 is the plain
+  //      Llama stack PLUS per-head q/k RMSNorm (QKNorm); everything else
+  //      (MoE, fused projections, sandwich norms, partial/interleaved rotary,
+  //      GeGLU, embed scaling, Gemma score scaling, per-layer rope theta,
+  //      full-width q/k norm, q/k/v bias) is out of scope for this exporter. ----
+  if not Config.QKNorm then
+    ImportError('TNNet Qwen3 export: Config.QKNorm must be true (this is the '
+      + 'Qwen3 per-head q/k RMSNorm exporter; use SaveLlamaToSafeTensors for '
+      + 'plain-Llama stacks).');
+  if Config.IsMoE then
+    ImportError('TNNet Qwen3 export: MoE models (qwen3_moe) are out of scope.');
+  if Config.FusedQKVGateUp or Config.FusedGateUp then
+    ImportError('TNNet Qwen3 export: fused qkv/gate-up projections are out ' +
+      'of scope.');
+  if Config.SandwichNorm or Config.GLM4SandwichNorm or
+     Config.PostNormReordered then
+    ImportError('TNNet Qwen3 export: sandwich/reordered norms are out of scope.');
+  if Config.QKNormFullWidth then
+    ImportError('TNNet Qwen3 export: full-width q/k RMSNorm (OLMo-2) is out ' +
+      'of scope.');
+  if Config.QKVBias then
+    ImportError('TNNet Qwen3 export: q/k/v projection biases are out of scope.');
+  if (Config.PartialRotaryFactor > 0) and (Config.PartialRotaryFactor < 1) then
+    ImportError('TNNet Qwen3 export: partial rotary is out of scope.');
+  if Config.InterleavedRotary then
+    ImportError('TNNet Qwen3 export: interleaved-rotary families are out of ' +
+      'scope.');
+  if Config.GegluFFN then
+    ImportError('TNNet Qwen3 export: gated-GELU FFN is out of scope.');
+  if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1) then
+    ImportError('TNNet Qwen3 export: embedding scaling is out of scope.');
+  if (Config.QueryPreAttnScalar <> 0) or (Config.AttnLogitSoftCap <> 0) or
+     (Config.FinalLogitSoftCap <> 0) then
+    ImportError('TNNet Qwen3 export: score scaling / soft-capping is out of ' +
+      'scope.');
+  if Config.RopeLocalTheta > 0 then
+    ImportError('TNNet Qwen3 export: per-layer RoPE theta is out of scope.');
+
+  if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+  else HeadDim := Config.HiddenSize div Config.NumHeads;
+  QWidth := Config.NumHeads * HeadDim;
+  KVWidth := Config.NumKVHeads * HeadDim;
+  HalfDim := HeadDim div 2;
+  IntSize := Config.IntermediateSize;
+  // Per block: AttnNorm (1) + K-norms (NumKVHeads) + Q-norms (NumHeads) +
+  // MlpNorm (1), in that net order; plus one final norm.
+  NormsPerBlock := 2 + Config.NumHeads + Config.NumKVHeads;
+
+  // ---- collect linears and norms in net order. Linears per block are
+  //      Q/K/V/O/GateUp/Down (6) like plain Llama, then the LM head; the
+  //      norms are the interleaved block + per-head set above. Per-head q/k
+  //      slices are TNNetSplitChannels so only the genuine norms land here. ----
+  Embed := nil;
+  SetLength(Linears, 0);
+  SetLength(Norms, 0);
+  for i := 0 to Net.Layers.Count - 1 do
+  begin
+    Lay := Net.Layers[i];
+    if Lay is TNNetEmbedding then
+    begin
+      if Embed <> nil then
+        ImportError('TNNet Qwen3 export: more than one TNNetEmbedding layer.');
+      Embed := Lay;
+    end
+    else if Lay is TNNetPointwiseConvLinear then
+    begin
+      SetLength(Linears, Length(Linears) + 1);
+      Linears[High(Linears)] := Lay;
+    end
+    else if Lay is TNNetTokenRMSNorm then
+    begin
+      SetLength(Norms, Length(Norms) + 1);
+      Norms[High(Norms)] := Lay;
+    end;
+  end;
+  if Embed = nil then
+    ImportError('TNNet Qwen3 export: no TNNetEmbedding layer found - not a ' +
+      'Qwen3 TNNet stack?');
+  if Length(Linears) <> Config.NumLayers * 6 + 1 then
+    ImportError('TNNet Qwen3 export: found ' + IntToStr(Length(Linears)) +
+      ' linear projections, expected ' + IntToStr(Config.NumLayers * 6 + 1) +
+      ' (6 per block + LM head).');
+  if Length(Norms) <> Config.NumLayers * NormsPerBlock + 1 then
+    ImportError('TNNet Qwen3 export: found ' + IntToStr(Length(Norms)) +
+      ' RMSNorms, expected ' + IntToStr(Config.NumLayers * NormsPerBlock + 1) +
+      ' (1 attn + ' + IntToStr(Config.NumKVHeads) + ' k_norm + ' +
+      IntToStr(Config.NumHeads) + ' q_norm per block + final norm).');
+
+  Result := TNNetMemTensorReader.Create;
+  Reader := Result;
+  V := TNNetVolume.Create;
+  try
+    // ---- token embedding table [vocab, hidden] (row-major, straight) ----
+    if Embed.Neurons[0].Weights.Size <> Config.VocabSize * Config.HiddenSize then
+      ImportError('TNNet Qwen3 export: embedding table has ' +
+        IntToStr(Embed.Neurons[0].Weights.Size) + ' elements, expected ' +
+        IntToStr(Config.VocabSize * Config.HiddenSize) + '.');
+    V.Copy(Embed.Neurons[0].Weights);
+    Reader.AddTensor('model.embed_tokens.weight',
+      [Config.VocabSize, Config.HiddenSize], V);
+
+    for b := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := 'model.layers.' + IntToStr(b) + '.';
+      // Norm group for this block: base = b * NormsPerBlock.
+      //   [base]                           = AttnNorm (input_layernorm)
+      //   [base+1 .. +NumKVHeads]          = K-norms  (k_norm, shared gain)
+      //   [base+1+NumKVHeads .. +NumHeads] = Q-norms  (q_norm, shared gain)
+      //   [base+1+NumKVHeads+NumHeads]     = MlpNorm  (post_attention_ln)
+      DumpNorm(Norms[b * NormsPerBlock], Config.HiddenSize,
+        BlockPrefix + 'input_layernorm.weight');
+      DumpNorm(Norms[b * NormsPerBlock + 1 + Config.NumKVHeads +
+        Config.NumHeads], Config.HiddenSize,
+        BlockPrefix + 'post_attention_layernorm.weight');
+      // q/k RMSNorm shared [head_dim] gain (first head copy is canonical).
+      DumpHeadNorm(Norms[b * NormsPerBlock + 1],
+        BlockPrefix + 'self_attn.k_norm.weight');
+      DumpHeadNorm(Norms[b * NormsPerBlock + 1 + Config.NumKVHeads],
+        BlockPrefix + 'self_attn.q_norm.weight');
+
+      // Q/K/V/O = Linears[6*b .. 6*b+3]; GateUp/Down = Linears[6*b+4..+5].
+      // The q/k neurons are in the interleaved-rotary layout the loader
+      // produced; DE-permute back to HF rotate_half (HF row k -> interleaved
+      // neuron row 2k if k<half else 2(k-half)+1).
+      // --- q_proj ---
+      Lay := Linears[6 * b];
+      if Lay.Neurons.Count <> QWidth then
+        ImportError('TNNet Qwen3 export: q_proj block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(QWidth) + '.');
+      V.ReSize(QWidth * Config.HiddenSize, 1, 1);
+      for h := 0 to Config.NumHeads - 1 do
+        for k := 0 to HeadDim - 1 do
+        begin
+          if k < HalfDim then j := h * HeadDim + 2 * k
+          else j := h * HeadDim + 2 * (k - HalfDim) + 1;
+          for c := 0 to Config.HiddenSize - 1 do
+            V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
+              Lay.Neurons[j].Weights.FData[c];
+        end;
+      Reader.AddTensor(BlockPrefix + 'self_attn.q_proj.weight',
+        [QWidth, Config.HiddenSize], V);
+      // --- k_proj ---
+      Lay := Linears[6 * b + 1];
+      if Lay.Neurons.Count <> KVWidth then
+        ImportError('TNNet Qwen3 export: k_proj block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(KVWidth) + '.');
+      V.ReSize(KVWidth * Config.HiddenSize, 1, 1);
+      for h := 0 to Config.NumKVHeads - 1 do
+        for k := 0 to HeadDim - 1 do
+        begin
+          if k < HalfDim then j := h * HeadDim + 2 * k
+          else j := h * HeadDim + 2 * (k - HalfDim) + 1;
+          for c := 0 to Config.HiddenSize - 1 do
+            V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
+              Lay.Neurons[j].Weights.FData[c];
+        end;
+      Reader.AddTensor(BlockPrefix + 'self_attn.k_proj.weight',
+        [KVWidth, Config.HiddenSize], V);
+      // --- v_proj / o_proj (straight) ---
+      DumpLinear(Linears[6 * b + 2], KVWidth, Config.HiddenSize,
+        BlockPrefix + 'self_attn.v_proj.weight');
+      DumpLinear(Linears[6 * b + 3], Config.HiddenSize, QWidth,
+        BlockPrefix + 'self_attn.o_proj.weight');
+
+      // --- SwiGLU fused gate|up -> un-fuse into mlp.up / mlp.gate ---
+      // The loader packs up_proj into neurons 0..I-1 and gate_proj into
+      // neurons I..2I-1 (TNNetSwiGLU = up * silu(gate)). Split them back.
+      Lay := Linears[6 * b + 4];
+      if Lay.Neurons.Count <> 2 * IntSize then
+        ImportError('TNNet Qwen3 export: fused gate|up block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(2 * IntSize) + '.');
+      // up_proj = neurons 0..I-1
+      V.ReSize(IntSize * Config.HiddenSize, 1, 1);
+      for j := 0 to IntSize - 1 do
+        for c := 0 to Config.HiddenSize - 1 do
+          V.FData[j * Config.HiddenSize + c] := Lay.Neurons[j].Weights.FData[c];
+      Reader.AddTensor(BlockPrefix + 'mlp.up_proj.weight',
+        [IntSize, Config.HiddenSize], V);
+      // gate_proj = neurons I..2I-1
+      V.ReSize(IntSize * Config.HiddenSize, 1, 1);
+      for j := 0 to IntSize - 1 do
+        for c := 0 to Config.HiddenSize - 1 do
+          V.FData[j * Config.HiddenSize + c] :=
+            Lay.Neurons[IntSize + j].Weights.FData[c];
+      Reader.AddTensor(BlockPrefix + 'mlp.gate_proj.weight',
+        [IntSize, Config.HiddenSize], V);
+      // --- down_proj (straight) ---
+      DumpLinear(Linears[6 * b + 5], Config.HiddenSize, IntSize,
+        BlockPrefix + 'mlp.down_proj.weight');
+    end;
+
+    // ---- final norm + LM head ----
+    DumpNorm(Norms[High(Norms)], Config.HiddenSize, 'model.norm.weight');
+    if not Config.TieWordEmbeddings then
+      DumpLinear(Linears[High(Linears)], Config.VocabSize, Config.HiddenSize,
+        'lm_head.weight');
+  except
+    V.Free;
+    Result.Free;
+    raise;
+  end;
+  V.Free;
+end;
+
+procedure SaveQwen3ToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Reader: TNNetMemTensorReader;
+  Writer: TNNetSafeTensorsWriter;
+  V: TNNetVolume;
+  i, d, Dims: integer;
+  Shape: array of Int64;
+  TName: string;
+begin
+  Reader := BuildQwen3MemTensorReader(Net, Config);
+  V := TNNetVolume.Create;
+  try
+    Writer := TNNetSafeTensorsWriter.Create(FileName);
+    try
+      Writer.SetMetadata('format', 'pt');
+      Writer.SetMetadata('exporter', 'cai-neural-api/qwen3');
       for i := 0 to Reader.Count - 1 do
       begin
         TName := Reader.TensorName(i);
