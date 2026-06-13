@@ -19,6 +19,7 @@ examples/BeamSearchDecode/BeamSearchDecode
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix
+examples/SpanCorruptionPretrain/SpanCorruptionPretrain
 link*.res
 autosave.csv
 autosave.nn

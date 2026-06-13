@@ -425,14 +425,17 @@ rather than acted on.
       DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in neuralnlpmetrics.pas
       over a real Marian/T5 checkpoint (the Unigram tokenizer these need has
       landed, reading the checkpoint's tokenizer.json).
-- [ ] Span-corruption pretraining EXAMPLE: TNNetSpanCorruptionCollator landed
+- [X] Span-corruption pretraining EXAMPLE: TNNetSpanCorruptionCollator landed
       in neuraldatasets.pas (T5/SpanBERT contiguous-span masking, descending
       sentinel ids, round-trippable source/target; tests in
       TestNeuralMaskedLM). Whole-word masking (CollateWholeWord, WordIds side
-      channel, HF DataCollatorForWholeWordMask semantics) also landed. Open:
-      wire an examples/ entry that pretrains a tiny encoder-decoder on span
-      corruption through DecodeSeq2Seq* and reports it (the collator's natural
-      end-to-end demo; pairs with the BART/T5 seq2seq path).
+      channel, HF DataCollatorForWholeWordMask semantics) also landed.
+      LANDED: examples/SpanCorruptionPretrain pretrains a tiny two-input
+      encoder-decoder (one TNNet, end-to-end through cross-attention) FROM
+      SCRATCH on the span-corruption objective with WORD-level tokenization over
+      a strongly deterministic toy corpus; inlined greedy DecodeSeq2Seq reaches
+      ~10/12 exact-match span reconstructions (~95% per-token, CE ~2.0 -> ~0.04)
+      in ~2 min CPU. Demo writeup in examples/README.md.
 - [ ] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
       above): K learnable virtual-token embeddings prepended to the
       embedding-layer output, base model frozen — K*d_model trainable
