@@ -599,6 +599,42 @@ rather than acted on.
       covers the MiniLM mean-pool case; the new piece would wire a pooling
       mode + instruction prefix through it).
 
+- [ ] ColBERT-style LATE-INTERACTION retrieval import + scorer (the third and
+      missing RAG retrieval paradigm in the repo). The bi-encoder path is landed
+      (single pooled vector + cosine, the embedding/STS/Retrieval harness above)
+      and the cross-encoder path is landed (joint [CLS] query[SEP]passage scorer,
+      examples/DebertaReranker on BuildDebertaV2FromSafeTensorsEx) — ColBERT sits
+      between them and is genuinely DIFFERENT from both: it keeps the PER-TOKEN
+      contextual embeddings of query and document (no pooling), projects each
+      token to a small dim (typically 128) + L2-normalizes, and scores a (query,
+      doc) pair by the MaxSim late-interaction sum
+      `score = sum_{q in query} max_{d in doc} <E_q, E_d>` — every query token
+      matched to its best document token, then summed. This is the accuracy of a
+      cross-encoder at near the cost of a bi-encoder (docs are pre-encoded once),
+      so it is a distinct and widely-used RAG retriever, not a near-duplicate of
+      either landed path. Nearly everything exists: the backbone is the stock
+      BERT path (BuildBertFromSafeTensors) and the tokenizer/Unigram/WordPiece
+      loaders are landed; the genuinely new pieces are (a) a thin import
+      EXTENSION that loads the ColBERT `linear` projection head (the
+      [hidden -> 128] dense, no bias) sitting on top of the encoder and the
+      query/doc marker-token convention ([Q]/[D] prepended, query padded with
+      [MASK] for augmentation), (b) an `EmbedTokens` helper returning the
+      per-token L2-normalized projected matrix (skipping the pooling step the
+      bi-encoder helper forces) for both query and document, and (c) a
+      `ColBERTMaxSimScore(queryMat, docMat)` scorer + a `ColBERTRetrievalReport`
+      (Recall@k + nDCG@10 over a planted query/passage set, mirroring the landed
+      RetrievalReport but driven by MaxSim instead of cosine), all in
+      neuralpretrained.pas. Deliverables: BuildColBERTFromSafeTensors[Ex] (BERT
+      backbone + projection head), the EmbedTokens + ColBERTMaxSimScore +
+      ColBERTRetrievalReport helpers, a pico parity fixture
+      (make_pico_*_fixture.py recipe) asserting the per-token projected+normalized
+      query/doc matrices AND the MaxSim score of one colbert-ir/colbertv2.0-class
+      checkpoint match HF float64 within 1e-4, and an examples/ColBERTSearch demo
+      that pre-encodes a handful of passages, scores a query by MaxSim, and ranks
+      them on CPU. Completes the bi-encoder / cross-encoder / late-interaction
+      retrieval trio and turns the broad encoder-import coverage into a
+      state-of-the-art RAG retriever.
+
 ## Layer follow-ups that fix real limitations
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
