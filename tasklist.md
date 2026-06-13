@@ -92,7 +92,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Mixtral / sparse-MoE importer (model_type "mixtral", e.g.
+- [X] Mixtral / sparse-MoE importer (model_type "mixtral", e.g.
       mistralai/Mixtral-8x7B-v0.1, or a small sibling like OLMoE/Qwen-MoE
       that shares the recipe): the CANONICAL open sparse-MoE — a stock
       Mistral/Llama decoder where every FFN is replaced by `block_sparse_moe`

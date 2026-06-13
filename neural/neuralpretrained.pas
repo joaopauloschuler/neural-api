@@ -691,6 +691,17 @@ type
                                // and BEFORE the head split + RoPE - distinct
                                // from the Qwen3/Gemma-3 PER-HEAD placement
                                // (QKNorm)
+    // ---- Mixtral deltas (all default off for the other families) ----
+    IsMoE: boolean;            // every FFN is a block_sparse_moe: a router
+                               // (mlp gate linear -> num_local_experts
+                               // logits) + N independent SwiGLU experts,
+                               // softmax over ALL experts then top-k
+                               // routing with the top-k subset RENORMALIZED
+                               // (Mixtral; the standard top-2 sparse MoE)
+    NumLocalExperts: integer;  // num_local_experts (Mixtral: 8); experts
+                               // are block_sparse_moe.experts.{i}.w1/w2/w3
+    MoEExpertsPerTok: integer; // num_experts_per_tok routed per token
+                               // (Mixtral: 2); the renormalized top-k
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -996,6 +1007,24 @@ function BuildPhi3FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildPhi3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// Imports a HF Mixtral checkpoint (model_type "mixtral", e.g.
+// mistralai/Mixtral-8x7B-v0.1): a stock Mistral/Llama decoder (full
+// MHA/GQA, RoPE, optional sliding window) whose every FFN is replaced by
+// block_sparse_moe = a router gate linear (num_local_experts logits) + N
+// independent SwiGLU experts (experts.{i}.w1/w2/w3), softmax over ALL
+// experts then top-k (num_experts_per_tok, default 2) routing with the
+// top-k subset RENORMALIZED (HF normalize_topk_prob). No shared expert, no
+// MLA - distinct from BuildDeepSeekV2FromSafeTensors. Runs on the shared
+// Llama path (TLlamaConfig.IsMoE).
+function BuildMixtralFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildMixtralFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -3100,10 +3129,11 @@ begin
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
        (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') and
-       (ModelType <> 'olmo2') then
+       (ModelType <> 'olmo2') and (ModelType <> 'mixtral') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "gemma", ' +
-        '"gemma2", "gemma3_text", "phi3" and "olmo2" are supported here ' +
+        '"gemma2", "gemma3_text", "phi3", "olmo2" and "mixtral" are ' +
+        'supported here ' +
         '(see BuildFromPretrained for the full dispatch; multimodal ' +
         '"gemma3" configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
@@ -3156,7 +3186,47 @@ begin
     Result.PartialRotaryFactor := 1.0;
     Result.PostNormReordered := False;
     Result.QKNormFullWidth := False;
-    if ModelType = 'mistral' then
+    Result.IsMoE := False;
+    Result.NumLocalExperts := 0;
+    Result.MoEExpertsPerTok := 0;
+    if ModelType = 'mixtral' then
+    begin
+      // Mixtral: a stock Mistral decoder (full MHA/GQA, RoPE, sliding
+      // window) whose every FFN is replaced by block_sparse_moe = a gate
+      // linear (num_local_experts logits) + N independent SwiGLU experts,
+      // softmax over ALL experts then top-k (num_experts_per_tok, default
+      // 2) routing, output = sum of selected experts weighted by the
+      // RENORMALIZED top-k softmax probs (HF normalizes the top-k subset).
+      // No shared expert, no MLA - the distinction from DeepSeek-V2.
+      Result.IsMoE := True;
+      Result.NumLocalExperts := Obj.Get('num_local_experts', 8);
+      Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 2);
+      if Result.NumLocalExperts < 1 then
+        ImportError('Llama import: Mixtral num_local_experts must be >= 1, ' +
+          'got ' + IntToStr(Result.NumLocalExperts) + '.');
+      if (Result.MoEExpertsPerTok < 1) or
+         (Result.MoEExpertsPerTok > Result.NumLocalExperts) then
+        ImportError('Llama import: Mixtral num_experts_per_tok=' +
+          IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, ' +
+          'num_local_experts=' + IntToStr(Result.NumLocalExperts) + '].');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: Mixtral hidden_act "' + HiddenAct +
+          '" is not supported - every released mixtral checkpoint uses ' +
+          '"silu" (SwiGLU experts).');
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      // Mixtral configs ship sliding_window (8x7B: null in newer revisions,
+      // 4096 in the original); null/absent = full attention.
+      SlidingWindowField := Obj.Find('sliding_window');
+      if (SlidingWindowField <> nil) and not SlidingWindowField.IsNull then
+      begin
+        Result.SlidingWindow := SlidingWindowField.AsInteger;
+        if Result.SlidingWindow < 1 then
+          ImportError('Llama import: config sliding_window must be a ' +
+            'positive integer or null, got ' + SlidingWindowField.AsJSON + '.');
+      end;
+    end
+    else if ModelType = 'mistral' then
     begin
       // Many Mistral configs ship sliding_window=null (full attention).
       SlidingWindowField := Obj.Find('sliding_window');
@@ -3436,6 +3506,9 @@ begin
      (Config.PartialRotaryFactor < 1) then
     Result := Result + ', partial_rotary=' +
       FloatToStr(Config.PartialRotaryFactor);
+  if Config.IsMoE then
+    Result := Result + ', moe=' + IntToStr(Config.NumLocalExperts) +
+      'x top-' + IntToStr(Config.MoEExpertsPerTok);
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -3699,7 +3772,65 @@ type
     QNorms, KNorms: array of TNNetLayer;
     // FULL-WIDTH q/k RMSNorm (OLMo-2 QKNormFullWidth); nil otherwise.
     QNormFull, KNormFull: TNNetLayer;
+    // Mixtral block_sparse_moe (Config.IsMoE): the router gate conv plus
+    // per-expert fused gate|up and down projections; empty otherwise.
+    GateConv: TNNetLayer;
+    ExpertGateUp, ExpertDown: array of TNNetLayer;
   end;
+
+// Wires Mixtral's block_sparse_moe FFN from primitives onto MoESource (the
+// pre-FFN-normalized residual stream): a token-wise router (gate linear ->
+// num_local_experts logits -> PER-TOKEN softmax -> hard top-k gate with the
+// surviving probs RENORMALIZED, HF's normalize_topk_prob), N independent
+// SwiGLU experts, and y = Sum_e gTopK[e] * Expert_e(x). This is the
+// AddTopKMixtureOfExperts combine specialized to SwiGLU experts so the
+// importer can drop the checkpoint's per-expert w1/w2/w3 onto named layers.
+// The gate's PER-TOKEN softmax matches HF (the whole-volume TNNetSoftMax
+// would couple tokens); pRenormalize=true is Mixtral's top-k renorm, the
+// one routing knob that distinguishes it from DeepSeek-V2 (norm=false).
+// Leaves the combined sum as the last layer (the caller closes the residual).
+procedure BuildMixtralMoEBranch(NN: TNNet; var Block: TLlamaBlockLayers;
+  MoESource: TNNetLayer; const Config: TLlamaConfig);
+var
+  GateTopK, ExpertOut, GateE, GateEBroadcast: TNNetLayer;
+  MoEBranches: array of TNNetLayer;
+  ExpertCnt: integer;
+begin
+  SetLength(Block.ExpertGateUp, Config.NumLocalExperts);
+  SetLength(Block.ExpertDown, Config.NumLocalExperts);
+  SetLength(MoEBranches, Config.NumLocalExperts);
+  // Router: token-wise linear -> PER-TOKEN softmax (over ALL experts) ->
+  // hard top-k gate with the top-k subset renormalized (pRenormalize=true).
+  Block.GateConv := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts), MoESource);
+  NN.AddLayer( TNNetPointwiseSoftMax.Create() );
+  GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+    Config.MoEExpertsPerTok, {pRenormalize=}true) );
+  for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
+  begin
+    // Per-expert SwiGLU MLP. TNNetSwiGLU computes FIRSTHALF * silu(SECONDHALF):
+    // the fused projection holds w3 (up) in neurons 0..I-1 and w1 (gate) in
+    // I..2I-1; w2 is the down projection (loaded below).
+    Block.ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize), MoESource);
+    NN.AddLayer( TNNetSwiGLU.Create() );
+    Block.ExpertDown[ExpertCnt] := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    ExpertOut := NN.GetLastLayer();
+    // Slice this expert's renormalized top-k gate weight g[e], broadcast it
+    // across d_model and cell-multiply it in (zero for non-selected experts).
+    GateE := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(ExpertCnt, 1), GateTopK);
+    GateEBroadcast := NN.AddLayer(
+      TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
+    MoEBranches[ExpertCnt] := NN.AddLayer(
+      TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+  end;
+  // y = Sum_e gTopK[e] * Expert_e(x). (NumExpertsPerTok>=2 routing implies
+  // NumLocalExperts>=2; a single-expert sum is still valid for safety.)
+  NN.AddLayer( TNNetSum.Create(MoEBranches) );
+  SetLength(MoEBranches, 0);
+end;
 
 // The Llama builder core: builds the net and loads every weight from the
 // ALREADY-OPEN pReader (whose tensor table must use the HF tensor names).
@@ -4065,14 +4196,20 @@ begin
         if not Config.PostNormReordered then
           Blocks[BlockCnt].MlpNorm :=
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
-        Blocks[BlockCnt].GateUp := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
-        if Config.GegluFFN then
-          NN.AddLayer( TNNetGEGLU.Create() )
+        if Config.IsMoE then
+          BuildMixtralMoEBranch(NN, Blocks[BlockCnt], NN.GetLastLayer(),
+            Config)
         else
-          NN.AddLayer( TNNetSwiGLU.Create() );
-        Blocks[BlockCnt].Down := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        begin
+          Blocks[BlockCnt].GateUp := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+          if Config.GegluFFN then
+            NN.AddLayer( TNNetGEGLU.Create() )
+          else
+            NN.AddLayer( TNNetSwiGLU.Create() );
+          Blocks[BlockCnt].Down := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        end;
         // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
         // post-feedforward RMSNorm INSIDE the residual branch (HF
         // post_feedforward_layernorm).
@@ -4310,6 +4447,39 @@ begin
             BlockPrefix + 'post_attention_layernorm.weight',
             Config.HiddenSize, NormGainOffset);
           MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+        end;
+        if Config.IsMoE then
+        begin
+          // Mixtral block_sparse_moe: router gate + per-expert SwiGLU.
+          // Router gate: bias-free [num_local_experts, hidden] nn.Linear.
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateConv,
+            BlockPrefix + 'block_sparse_moe.gate.weight',
+            Config.HiddenSize, Config.NumLocalExperts);
+          MarkConsumed(BlockPrefix + 'block_sparse_moe.gate.weight');
+          // Per-expert SwiGLU (HF: w1=gate_proj, w3=up_proj, w2=down_proj;
+          // y = w2(silu(w1 x) * w3 x)). TNNetSwiGLU = FIRSTHALF*silu(SECOND),
+          // so w3 (up) -> neurons 0..I-1 and w1 (gate) -> I..2I-1.
+          for d := 0 to Config.NumLocalExperts - 1 do
+          begin
+            TensorNameStr := BlockPrefix + 'block_sparse_moe.experts.' +
+              IntToStr(d) + '.';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+              TensorNameStr + 'w3.weight',
+              Config.HiddenSize, Config.IntermediateSize,
+              0, 2 * Config.IntermediateSize);
+            MarkConsumed(TensorNameStr + 'w3.weight');
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+              TensorNameStr + 'w1.weight',
+              Config.HiddenSize, Config.IntermediateSize,
+              Config.IntermediateSize, 2 * Config.IntermediateSize);
+            MarkConsumed(TensorNameStr + 'w1.weight');
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertDown[d],
+              TensorNameStr + 'w2.weight',
+              Config.IntermediateSize, Config.HiddenSize);
+            MarkConsumed(TensorNameStr + 'w2.weight');
+          end;
+          if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+          continue;
         end;
         // Fused gate/up: up_proj -> neurons 0..I-1 (SwiGLU's linear half),
         // gate_proj -> neurons I..2I-1 (SwiGLU's Swish-gated half).
@@ -7560,6 +7730,25 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildPhi3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildMixtralFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'mixtral', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildMixtralFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildMixtralFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -13023,7 +13212,7 @@ begin
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
           (ModelType = 'gemma') or (ModelType = 'gemma2') or
           (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
-          (ModelType = 'olmo2') then
+          (ModelType = 'olmo2') or (ModelType = 'mixtral') then
     // 'gemma' (architectures ["GemmaForCausalLM"]) rides the same path: the
     // config reader raises the Gemma flags (GeGLU FFN, zero-centered
     // RMSNorm, sqrt(d) embedding scale) from model_type alone. 'gemma2'
@@ -13037,7 +13226,9 @@ begin
     // partial-rotary flags the same way (the 128k longrope variants are
     // rejected by the config reader). 'olmo2' (["Olmo2ForCausalLM"]) raises
     // the reordered post-norm (x + Norm(Attn(x)), no input_layernorm) and
-    // full-width q/k RMSNorm flags.
+    // full-width q/k RMSNorm flags. 'mixtral' (["MixtralForCausalLM"])
+    // raises the block_sparse_moe flags (per-FFN router gate +
+    // num_local_experts SwiGLU experts, renormalized top-k routing).
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
@@ -13139,8 +13330,9 @@ begin
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, phi3, llama, ' +
-      'mistral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, mamba, ' +
-      'bloom, bert, distilbert, roberta, modernbert, deepseek_v2.');
+      'mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, ' +
+      'mamba, bloom, bert, distilbert, roberta, modernbert, deepseek_v2, ' +
+      'olmo2.');
   end;
 end;
 

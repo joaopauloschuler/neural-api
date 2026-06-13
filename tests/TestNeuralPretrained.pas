@@ -150,6 +150,7 @@ type
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
     procedure TestOlmo2LogitParity;
+    procedure TestMixtralLogitParity;
     procedure TestRWKVLogitParity;
     procedure TestMambaLogitParity;
     procedure TestBloomLogitParity;
@@ -2813,6 +2814,13 @@ begin
   Config.SlidingWindowPattern := 0;
   Config.RopeLocalTheta := 0;
   Config.RopeScaling := DefaultRoPEScaling();
+  Config.FusedQKVGateUp := false;
+  Config.PartialRotaryFactor := 1.0;
+  Config.PostNormReordered := false;
+  Config.QKNormFullWidth := false;
+  Config.IsMoE := false;
+  Config.NumLocalExperts := 0;
+  Config.MoEExpertsPerTok := 0;
   Config.Prefix := '';
   Failed := false;
   NN := nil;
@@ -3870,6 +3878,78 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_olmo2_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Mixtral / sparse-MoE import target (HF model_type "mixtral",
+// architectures ["MixtralForCausalLM"], the mistralai/Mixtral-8x* family):
+// tests/fixtures/tiny_mixtral.* is a pico randomly-initialized
+// MixtralForCausalLM (2 layers, hidden 8, 4 experts / top-2, 1 kv head < 2
+// query heads, untied head) whose every FFN is a block_sparse_moe = a router
+// gate linear (num_local_experts logits) + N independent SwiGLU experts
+// (block_sparse_moe.experts.{i}.w1/w2/w3), softmax over ALL experts then
+// top-k routing with the top-k subset RENORMALIZED (HF normalize_topk_prob;
+// pRenormalize=true - the one routing knob that distinguishes Mixtral from
+// DeepSeek-V2's norm_topk_prob=false). No shared expert, no MLA. The
+// generator tools/mixtral_tiny_fixture.py ASSERTS the renorm is non-vacuous
+// by re-running the float64 oracle with it disabled (max logit |diff| ~1.16,
+// far above the 1e-4 parity gate). Reference logits come from HF transformers
+// in float64. The BuildFromPretrained model_type "mixtral" dispatch is
+// covered too.
+procedure TTestNeuralPretrained.TestMixtralLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, GateCnt, SoftMaxCnt, SwiGLUCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildMixtralFromSafeTensorsEx(FixturePath('tiny_mixtral.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_mixtral_config.json'));
+  try
+    AssertEquals('model_type', 'mixtral', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertTrue('is_moe', Config.IsMoE);
+    AssertEquals('num_local_experts', 4, Config.NumLocalExperts);
+    AssertEquals('num_experts_per_tok', 2, Config.MoEExpertsPerTok);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    // Structure: one router (TNNetTopKGate + its PER-TOKEN PointwiseSoftMax)
+    // per block, and one SwiGLU per expert per block (no dense MLP SwiGLU).
+    GateCnt := 0;
+    SoftMaxCnt := 0;
+    SwiGLUCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetPointwiseSoftMax then
+        Inc(SoftMaxCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
+    end;
+    AssertEquals('one top-k router gate per block', Config.NumLayers, GateCnt);
+    AssertEquals('one per-token router softmax per block',
+      Config.NumLayers, SoftMaxCnt);
+    AssertEquals('one SwiGLU per expert per block',
+      Config.NumLocalExperts * Config.NumLayers, SwiGLUCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_mixtral_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "mixtral" (architectures ["MixtralForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_mixtral.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_mixtral_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_mixtral_logits.json'), 16, 13);
   finally
     NN.Free;
   end;
