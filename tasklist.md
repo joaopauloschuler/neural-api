@@ -226,9 +226,15 @@ rather than acted on.
       (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap; add
       o200k when a GPT-4o-family checkpoint matters. Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
-- [ ] EMA (exponential moving average) shadow weights in neuralfit.pas:
+- [X] EMA (exponential moving average) shadow weights in neuralfit.pas:
       maintain decay-averaged copies of all weights during training and
       allow swapping them in for eval/save; classic free eval-quality win.
+      Landed: TNeuralFitBase.EnableEMA/EMADecay opt-in; the per-step EMA fold
+      hooks into TNeuralFitBase.Optimize() right after the live weight update
+      (same cadence as the real step, AccumulationSteps-aware); lazy-seeded on
+      first update; ApplyEMAWeights/RestoreLiveWeights store-and-restore swap;
+      EMAShadowNet accessor. Reuses TNNetEMAWrapper (neuralnetwork.pas).
+      Tests in tests/TestNeuralFit.pas (TestEMA*).
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
@@ -298,7 +304,11 @@ rather than acted on.
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.
       Distinct from the EMA task above (running decay average) but should
       share the shadow-weights machinery — consider landing both on one
-      shadow-copy mechanism.
+      shadow-copy mechanism. NOTE: the EMA task landed its trainer wiring
+      (TNeuralFitBase.EnableEMA + ApplyEMAWeights/RestoreLiveWeights store-and-
+      restore swap) on TNNetEMAWrapper; TNNetSWAWrapper already exists too, so
+      SWA is mostly a matter of wiring that wrapper into TNeuralFitBase reusing
+      the same Apply/Restore swap plumbing.
 - [ ] Optimizer zoo expansion (only SGD/Adam/AdamW exist today):
       Adafactor (factored second-moment estimate, drastically less optimizer
       state — pairs with the "run big imported models on commodity RAM"

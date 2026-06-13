@@ -174,6 +174,13 @@ type
       FScheduler: TNeuralLRScheduler;
       FAccumulationSteps: integer;
       FCurrentAccumulationStep: integer;
+      // EMA (exponential moving average) shadow weights. Opt-in via EnableEMA.
+      FEnableEMA: boolean;
+      FEMADecay: TNeuralFloat;
+      FEMA: TNNetEMAWrapper;            // lazily created on the first update
+      FEMASwapped: boolean;             // true while EMA weights are swapped in
+      FEMASaved: TNNet;                 // live weights stashed during a swap
+      procedure UpdateEMA();            // called once per real weight update
       procedure SetAccumulationSteps(Value: integer);
       procedure CheckLearningRate(iEpochCount: integer);
       procedure Optimize();
@@ -267,6 +274,34 @@ type
       // GetTrainingPair/Proc can combine this with its own index to draw the
       // matching slice of a large effective batch.
       property CurrentAccumulationStep: integer read FCurrentAccumulationStep;
+      // EMA (exponential moving average) shadow weights. When EnableEMA is true,
+      // after every REAL weight update (i.e. once per optimizer step, on the
+      // same cadence as the live update, regardless of AccumulationSteps) a
+      // shadow copy of every trainable weight tensor is folded with
+      //   shadow := EMADecay*shadow + (1 - EMADecay)*live.
+      // The shadow is lazily seeded from the live weights on the first update,
+      // so the EMA starts from the real initialization, not from zeros.
+      // v1 uses a FIXED decay (no warmup/bias-correction ramp) for simplicity;
+      // the common min(decay,(1+step)/(10+step)) ramp can be layered on later.
+      // Disabled by default => zero behaviour change. The averaging machinery
+      // is TNNetEMAWrapper (neuralnetwork.pas), shared with the planned SWA
+      // feature (TNNetSWAWrapper).
+      property EnableEMA: boolean read FEnableEMA write FEnableEMA;
+      // EMA decay factor (typical 0.999 / 0.9999). 0 makes the shadow equal the
+      // live weights after one update; values in (0,1) keep a decaying memory.
+      property EMADecay: TNeuralFloat read FEMADecay write FEMADecay;
+      // The shadow network holding the EMA weights (nil until the first update;
+      // owned by the wrapper). Read-only convenience accessor.
+      function EMAShadowNet(): TNNet;
+      // Swaps the EMA (shadow) weights INTO the live net for eval/save, stashing
+      // the live training weights so they can be restored. No-op (returns false)
+      // if EMA is disabled or has not been initialized yet. Pairs with
+      // RestoreLiveWeights; nested ApplyEMAWeights calls are ignored.
+      function ApplyEMAWeights(): boolean;
+      // Restores the live training weights stashed by ApplyEMAWeights, leaving
+      // them bit-identical to before the swap so training can continue. No-op if
+      // no swap is currently active.
+      procedure RestoreLiveWeights();
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
@@ -768,6 +803,64 @@ begin
   FOptimizer.Optimize();
   //Write(FNN.ForceMaxAbsoluteWeight(2):3:2,' ');
   if FL2Decay > 0.0 then FNN.ComputeL2Decay();
+  // EMA shadow update runs on the SAME cadence as the live weight update
+  // (once per real optimizer step), right after the live weights changed.
+  if FEnableEMA then UpdateEMA();
+end;
+
+procedure TNeuralFitBase.UpdateEMA();
+begin
+  if not FEnableEMA then Exit;
+  if not Assigned(FEMA) then
+  begin
+    // Lazy init: seed the shadow from the real (current) live weights, so the
+    // EMA starts from the init/checkpoint, not from zeros.
+    // NOTE: TNNetEMAWrapper clones the net, and cloning constructs layers whose
+    // weight initializers draw from the GLOBAL Mersenne-Twister RNG (the random
+    // values are then overwritten by CopyWeights). FPC's MT keeps a 624-word
+    // internal state that is not publicly saveable/restorable, so this single
+    // lazy clone perturbs the global RNG stream by a bounded amount. EMA is
+    // otherwise a pure side-channel: it never touches the live weights or
+    // deltas, so the optimization MATH is identical with EMA on or off; only
+    // the stochastic batch-shuffle order can differ, within float tolerance.
+    FEMA := TNNetEMAWrapper.Create(FNN, FEMADecay);
+    // First update degenerates to a copy of the live weights, so the shadow
+    // already reflects this step. Keep decay in sync in case it was changed.
+    FEMA.Decay := FEMADecay;
+    FEMA.Update();
+    Exit;
+  end;
+  // Honour live decay changes between steps.
+  FEMA.Decay := FEMADecay;
+  FEMA.Update();
+end;
+
+function TNeuralFitBase.EMAShadowNet(): TNNet;
+begin
+  if Assigned(FEMA)
+    then Result := FEMA.ShadowNet()
+    else Result := nil;
+end;
+
+function TNeuralFitBase.ApplyEMAWeights(): boolean;
+begin
+  Result := false;
+  if (not FEnableEMA) or (not Assigned(FEMA)) or (not Assigned(FNN)) then Exit;
+  if FEMASwapped then Exit; // already swapped; ignore nested calls
+  // Stash the live training weights, then copy the EMA shadow into the net.
+  if not Assigned(FEMASaved)
+    then FEMASaved := FNN.Clone()
+    else FEMASaved.CopyWeights(FNN);
+  FEMA.SetEmaShadow(FNN);
+  FEMASwapped := true;
+  Result := true;
+end;
+
+procedure TNeuralFitBase.RestoreLiveWeights();
+begin
+  if not FEMASwapped then Exit;
+  if Assigned(FEMASaved) and Assigned(FNN) then FNN.CopyWeights(FEMASaved);
+  FEMASwapped := false;
 end;
 
 constructor TNeuralFitWithImageBase.Create();
@@ -2138,6 +2231,11 @@ begin
   FSaveBest := SaveBestAccuracy;
   FAccumulationSteps := 1;
   FCurrentAccumulationStep := 0;
+  FEnableEMA := false;
+  FEMADecay := 0.999;
+  FEMA := nil;
+  FEMASwapped := false;
+  FEMASaved := nil;
 end;
 
 procedure TNeuralFitBase.SetAccumulationSteps(Value: integer);
@@ -2149,6 +2247,10 @@ end;
 destructor TNeuralFitBase.Destroy();
 begin
   if FOptimizerOwned and Assigned(FOptimizer) then FOptimizer.Free;
+  // If training ended mid-swap, put the live weights back before tearing down.
+  if FEMASwapped then RestoreLiveWeights();
+  if Assigned(FEMA) then FreeAndNil(FEMA);
+  if Assigned(FEMASaved) then FreeAndNil(FEMASaved);
   {$IFDEF HASTHREADS}
   NeuralDoneCriticalSection(FCritSec);
   {$ENDIF}

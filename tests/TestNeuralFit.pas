@@ -48,6 +48,22 @@ type
     procedure GetPair(Idx, ThreadId: integer; vInput, vOutput: TNNetVolume);
   end;
 
+  // OnAfterStep probe for the EMA tests. Fires inside the epoch loop right
+  // after each optimizer step (and thus after the per-step EMA update), BEFORE
+  // the end-of-Fit FAvgWeight overwrite of the live net. On every step it
+  // snapshots the LIVE last-layer weights and the EMA SHADOW last-layer weights,
+  // so after Fit the snapshots hold the final-step values that must satisfy the
+  // EMA invariants (which the post-Fit FNN, overwritten by FAvgWeight, does not).
+  TEMAStepProbe = class
+  public
+    FFit: TNeuralFitBase;
+    Live, Shadow: TNNetVolume;   // last-step snapshots (owned)
+    HadShadow: boolean;
+    constructor Create(pFit: TNeuralFitBase);
+    destructor Destroy; override;
+    procedure AfterStep(Sender: TObject);
+  end;
+
   TTestNeuralFit = class(TTestCase)
   private
     function RunAccumFit(MicroBatch, AccumSteps, Epochs: integer;
@@ -106,6 +122,13 @@ type
     procedure TestAccumulationStepsDefaultsToOne;
     procedure TestAccumulationStepsClampsBelowOne;
     procedure TestAccumulationEqualsBigBatch;
+
+    // EMA shadow-weights tests
+    procedure TestEMADefaultsOff;
+    procedure TestEMADecayZeroEqualsLive;
+    procedure TestEMAConvexBlend;
+    procedure TestEMAApplyRestoreRoundTrip;
+    procedure TestEMADisabledIsBitIdentical;
   end;
 
 implementation
@@ -1162,6 +1185,295 @@ begin
   finally
     WAccum.Free;
     WBig.Free;
+  end;
+end;
+
+constructor TEMAStepProbe.Create(pFit: TNeuralFitBase);
+begin
+  inherited Create;
+  FFit := pFit;
+  Live := TNNetVolume.Create();
+  Shadow := TNNetVolume.Create();
+  HadShadow := False;
+end;
+
+destructor TEMAStepProbe.Destroy;
+begin
+  Live.Free;
+  Shadow.Free;
+  inherited Destroy;
+end;
+
+procedure TEMAStepProbe.AfterStep(Sender: TObject);
+var
+  N: TNNet;
+begin
+  // Snapshot the LIVE weights as they stand right after this step's update.
+  Live.Copy(FFit.NN.GetLastLayer.Neurons[0].Weights);
+  N := FFit.EMAShadowNet();
+  if Assigned(N) then
+  begin
+    Shadow.Copy(N.GetLastLayer.Neurons[0].Weights);
+    HadShadow := True;
+  end;
+end;
+
+// Runs a short, deterministic Fit on Net with EMA configured by pEnable/pDecay.
+// Captures the LAST-step LIVE and EMA SHADOW last-layer weights via an
+// OnAfterStep probe (BEFORE the end-of-Fit FAvgWeight overwrite). Returns the
+// live snapshot in WLive and, when EMA produced a shadow, the shadow in WShadow
+// (nil otherwise). Mirrors RunFit's determinism recipe.
+procedure RunFitEMA(Net: TNNet; pEnable: boolean; pDecay: TNeuralFloat;
+  out WLive, WShadow: TNNetVolume);
+var
+  Fit: TNeuralFit;
+  Pairs: TNNetVolumePairList;
+  Probe: TEMAStepProbe;
+begin
+  WShadow := nil;
+  Pairs := BuildFitPairs();
+  RandSeed := 100;
+  Fit := TNeuralFit.Create;
+  Probe := TEMAStepProbe.Create(Fit);
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.LoadBestAtEnd := False;
+    Fit.EnableEMA := pEnable;
+    Fit.EMADecay := pDecay;
+    Fit.OnAfterStep := {$IFDEF FPC}@{$ENDIF}Probe.AfterStep;
+    Fit.Fit(Net, Pairs, nil, nil, 4, 20);
+    WLive := TNNetVolume.Create();
+    WLive.Copy(Probe.Live);
+    if Probe.HadShadow then
+    begin
+      WShadow := TNNetVolume.Create();
+      WShadow.Copy(Probe.Shadow);
+    end;
+  finally
+    Probe.Free;
+    Fit.Free;
+    Pairs.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMADefaultsOff;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    // EMA must be OPT-IN so the default training path is unchanged.
+    AssertFalse('EnableEMA must default to false', Fit.EnableEMA);
+    AssertTrue('EMAShadowNet must be nil before any update',
+      Fit.EMAShadowNet() = nil);
+    // ApplyEMAWeights is a no-op when EMA is disabled.
+    AssertFalse('ApplyEMAWeights must be a no-op when EMA is off',
+      Fit.ApplyEMAWeights());
+    Fit.EnableEMA := True;
+    AssertTrue('EnableEMA must be settable', Fit.EnableEMA);
+    Fit.EMADecay := 0.9999;
+    // EMADecay is a single, so compare at single precision.
+    AssertEquals('EMADecay must round-trip', 0.9999, Fit.EMADecay, 1e-6);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMADecayZeroEqualsLive;
+var
+  Net: TNNet;
+  WLive, WShadow: TNNetVolume;
+  I: integer;
+begin
+  WLive := nil;
+  WShadow := nil;
+  Net := BuildFitNet();
+  try
+    // With decay = 0 the EMA degenerates to a plain copy: after the LAST update
+    // shadow := 0*shadow + 1*live = live. So the shadow must equal the final
+    // live weights exactly.
+    RunFitEMA(Net, True, 0.0, WLive, WShadow);
+    AssertTrue('Shadow net must exist after training with EMA on',
+      Assigned(WShadow));
+    AssertEquals('Shadow size must match live size', WLive.Size, WShadow.Size);
+    for I := 0 to WLive.Size - 1 do
+      AssertEquals('decay=0 shadow must equal the live weights exactly',
+        WLive.FData[I], WShadow.FData[I], 0);
+  finally
+    WLive.Free;
+    WShadow.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMAConvexBlend;
+var
+  NetInit, Net: TNNet;
+  WInit, WLive, WShadow: TNNetVolume;
+  I: integer;
+  Lo, Hi, Sh: TNeuralFloat;
+  SawStrictlyBetween: boolean;
+begin
+  WInit := nil;
+  WLive := nil;
+  WShadow := nil;
+  // Snapshot the initialization weights (same seed as the trained net).
+  NetInit := BuildFitNet();
+  Net := BuildFitNet();
+  try
+    WInit := TNNetVolume.Create();
+    WInit.Copy(NetInit.GetLastLayer.Neurons[0].Weights);
+
+    // 0 < decay < 1 over several updates: the shadow is a convex blend of the
+    // initial seed and the live weights. It must lie BETWEEN them and equal
+    // neither (for at least one coordinate that actually moved).
+    RunFitEMA(Net, True, 0.9, WLive, WShadow);
+    AssertTrue('Shadow net must exist', Assigned(WShadow));
+
+    SawStrictlyBetween := False;
+    for I := 0 to WLive.Size - 1 do
+    begin
+      Lo := Min(WInit.FData[I], WLive.FData[I]);
+      Hi := Max(WInit.FData[I], WLive.FData[I]);
+      Sh := WShadow.FData[I];
+      // Shadow stays within the [init, live] interval (small epsilon for fp).
+      AssertTrue('EMA shadow must lie within [init, live]',
+        (Sh >= Lo - 1e-6) and (Sh <= Hi + 1e-6));
+      // Strict blend: for a coordinate that moved, the shadow differs from BOTH
+      // endpoints (it lags the live weights but has left the init).
+      if (Abs(WLive.FData[I] - WInit.FData[I]) > 1e-4) then
+        if (Abs(Sh - WLive.FData[I]) > 1e-7) and
+           (Abs(Sh - WInit.FData[I]) > 1e-7) then
+          SawStrictlyBetween := True;
+    end;
+    AssertTrue('EMA shadow must be a STRICT blend (not equal to init or live) '
+      + 'for at least one moved weight', SawStrictlyBetween);
+  finally
+    WInit.Free;
+    WLive.Free;
+    WShadow.Free;
+    NetInit.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMAApplyRestoreRoundTrip;
+var
+  Net: TNNet;
+  Pairs: TNNetVolumePairList;
+  Fit: TNeuralFit;
+  Before, Swapped, After: TNNetVolume;
+  ShadowRef: TNNetVolume;
+  I: integer;
+  Applied: boolean;
+begin
+  Before := nil;
+  Swapped := nil;
+  After := nil;
+  ShadowRef := nil;
+  Net := BuildFitNet();
+  Pairs := BuildFitPairs();
+  Fit := TNeuralFit.Create;
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.LoadBestAtEnd := False;
+    Fit.EnableEMA := True;
+    Fit.EMADecay := 0.9; // shadow != live so the swap is observable
+    RandSeed := 100;
+    Fit.Fit(Net, Pairs, nil, nil, 4, 20);
+
+    // Capture the live training weights before any swap.
+    Before := TNNetVolume.Create();
+    Before.Copy(Net.GetLastLayer.Neurons[0].Weights);
+    // Capture what the shadow holds (the expected post-swap content).
+    ShadowRef := TNNetVolume.Create();
+    ShadowRef.Copy(Fit.EMAShadowNet().GetLastLayer.Neurons[0].Weights);
+
+    // Swap EMA weights into the live net.
+    Applied := Fit.ApplyEMAWeights();
+    AssertTrue('ApplyEMAWeights must succeed when EMA is initialized', Applied);
+    Swapped := TNNetVolume.Create();
+    Swapped.Copy(Net.GetLastLayer.Neurons[0].Weights);
+    for I := 0 to Swapped.Size - 1 do
+      AssertEquals('After swap the live net must hold the EMA shadow weights',
+        ShadowRef.FData[I], Swapped.FData[I], 0);
+
+    // A nested ApplyEMAWeights must be ignored (returns false, no change).
+    AssertFalse('Nested ApplyEMAWeights must be ignored',
+      Fit.ApplyEMAWeights());
+
+    // Restore: the live training weights must be bit-identical to before.
+    Fit.RestoreLiveWeights();
+    After := TNNetVolume.Create();
+    After.Copy(Net.GetLastLayer.Neurons[0].Weights);
+    AssertEquals('Restore size must match', Before.Size, After.Size);
+    for I := 0 to Before.Size - 1 do
+      AssertEquals('Apply-then-restore must leave LIVE weights bit-identical',
+        Before.FData[I], After.FData[I], 0);
+  finally
+    Before.Free;
+    Swapped.Free;
+    After.Free;
+    ShadowRef.Free;
+    Fit.Free;
+    Pairs.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMADisabledIsBitIdentical;
+var
+  NetA, NetB, NetOn: TNNet;
+  WA, WB, WOn, DummyA, DummyB, ShadowOn: TNNetVolume;
+  I: integer;
+  ErrBeforeOn, ErrAfterOn: TNeuralFloat;
+begin
+  WA := nil; WB := nil; WOn := nil;
+  DummyA := nil; DummyB := nil; ShadowOn := nil;
+  NetA := BuildFitNet();
+  NetB := BuildFitNet();    // same seed -> identical init
+  NetOn := BuildFitNet();
+  try
+    // (1) Zero behaviour change with EMA OFF (the default): two EMA-disabled
+    // runs of the same net/data must be BIT-FOR-BIT identical. The EMA code
+    // path is fully short-circuited when EnableEMA is false, so adding the
+    // feature does not perturb the default training path at all.
+    RunFitEMA(NetA, False, 0.999, WA, DummyA);
+    RunFitEMA(NetB, False, 0.999, WB, DummyB);
+    AssertTrue('No shadow must exist with EMA off', DummyA = nil);
+    AssertTrue('No shadow must exist with EMA off', DummyB = nil);
+    AssertEquals('Live weight size must match', WA.Size, WB.Size);
+    for I := 0 to WA.Size - 1 do
+      AssertEquals('EMA-off must be bit-identical run-to-run '
+        + '(default path unchanged by the feature)',
+        WA.FData[I], WB.FData[I], 0);
+
+    // (2) EMA is a side-channel that never feeds back into the live weights or
+    // deltas (the math is untouched; only the one lazy shadow clone draws from
+    // the global RNG, which can reorder the batch shuffle). So an EMA-ON run
+    // must still LEARN normally: the live error after training is well below
+    // the error before training.
+    ErrBeforeOn := FitNetMSE(NetOn);
+    RunFitEMA(NetOn, True, 0.999, WOn, ShadowOn);
+    ErrAfterOn := FitNetMSE(NetOn);
+    AssertTrue('A shadow must exist when EMA is on', Assigned(ShadowOn));
+    AssertTrue('EMA-on training must still reduce the error ('
+      + FloatToStr(ErrAfterOn) + ' vs ' + FloatToStr(ErrBeforeOn) + ')',
+      ErrAfterOn < ErrBeforeOn);
+  finally
+    WA.Free; WB.Free; WOn.Free;
+    DummyA.Free; DummyB.Free; ShadowOn.Free;
+    NetA.Free; NetB.Free; NetOn.Free;
   end;
 end;
 
