@@ -3092,6 +3092,41 @@ type
       property Dim: integer read FDim;
   end;
 
+  /// Soft-prompt / prompt-tuning layer (Lester et al. 2021, "The Power of
+  // Scale for Parameter-Efficient Prompt Tuning"; the P-tuning / prefix-tuning
+  // family). Holds a learnable bank of NumVirtualTokens d-vectors (the "soft
+  // prompt") and PREPENDS them along the sequence axis to the (SeqLen,1,d)
+  // output of the (typically frozen) token-embedding layer below it. With an
+  // input of shape (SeqLen,1,d) the output is (NumVirtualTokens+SeqLen,1,d):
+  // the first NumVirtualTokens rows are the trainable virtual-token embeddings,
+  // the remaining rows are the unchanged real token embeddings (forwarded
+  // verbatim, gradient passed straight through). The ONLY trainable parameters
+  // are the NumVirtualTokens*d soft-prompt weights -- the cheapest fine-tune of
+  // an imported checkpoint: freeze the base model (LearningRate := 0 on every
+  // other layer) and only this bank updates.
+  //
+  // DECODE SIDE: detokenization must SKIP the first NumVirtualTokens output
+  // positions -- they are virtual tokens with no vocabulary id. The
+  // NumVirtualTokens property exposes that offset to the caller.
+  //
+  // Backward scatters the upstream sequence-row gradient: rows
+  // 0..NumVirtualTokens-1 accumulate into the soft-prompt delta, rows
+  // NumVirtualTokens.. flow back unchanged into the previous (embedding) layer.
+  // Coded by Claude (AI).
+  TNNetSoftPrompt = class(TNNetLayer)
+    private
+      FNumVirtual: integer;  // K learnable virtual tokens
+      FDim: integer;         // feature width d
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(NumVirtualTokens, d: integer); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      procedure InitDefault(); override;
+      property NumVirtualTokens: integer read FNumVirtual;
+      property Dim: integer read FDim;
+  end;
+
   /// Product-Key Memory layer (Lample et al., NeurIPS 2019, "Large Memory
   // Layers with Product Keys"). A large, SPARSELY-accessed key->value memory.
   // Instead of one flat set of |K| keys addressed by a full softmax, it keeps
@@ -23026,6 +23061,123 @@ begin
   oldSeed := RandSeed;
   RandSeed := 161803;
   for q := 0 to FK - 1 do
+    for d := 0 to FDim - 1 do
+      FNeurons[0].FWeights[q, 0, d] :=
+        FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
+  RandSeed := oldSeed;
+  AfterWeightUpdate();
+end;
+
+{ TNNetSoftPrompt }
+
+constructor TNNetSoftPrompt.Create(NumVirtualTokens, d: integer);
+begin
+  inherited Create();
+  FNumVirtual := NumVirtualTokens;
+  FDim := d;
+  if FNumVirtual < 1 then
+    FErrorProc('TNNetSoftPrompt requires NumVirtualTokens >= 1. Got ' +
+      IntToStr(FNumVirtual));
+  if FDim < 1 then
+    FErrorProc('TNNetSoftPrompt requires d >= 1. Got ' + IntToStr(FDim));
+  FStruct[0] := FNumVirtual;
+  FStruct[1] := FDim;
+  AddMissingNeurons(1);
+end;
+
+procedure TNNetSoftPrompt.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  SeqLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeY <> 1 then
+    FErrorProc('TNNetSoftPrompt requires SizeY=1. SizeY=' +
+      IntToStr(pPrevLayer.FOutput.SizeY));
+  if pPrevLayer.FOutput.Depth <> FDim then
+    FErrorProc('TNNetSoftPrompt requires input depth = d. Got depth=' +
+      IntToStr(pPrevLayer.FOutput.Depth) + ', d=' + IntToStr(FDim));
+  SeqLen := pPrevLayer.FOutput.SizeX;
+  // Output prepends K virtual tokens: (K+SeqLen, 1, d).
+  FOutput.ReSize(FNumVirtual + SeqLen, 1, FDim);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Soft-prompt bank P: (K, 1, d) -- each virtual-token d-vector is
+  // depth-contiguous, exactly like an embedding row.
+  FNeurons[0].FWeights.ReSize(FNumVirtual, 1, FDim);
+  FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
+  FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
+  InitDefault();
+end;
+
+procedure TNNetSoftPrompt.Compute();
+var
+  StartTime: double;
+  X, P: TNNetVolume;
+  SeqLen, ni: integer;
+begin
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  P := FNeurons[0].FWeights;
+  SeqLen := X.SizeX;
+  // Rows 0..K-1: the learnable virtual tokens.
+  for ni := 0 to FNumVirtual - 1 do
+    Move(P.GetRawPtr(ni, 0, 0)^, FOutput.GetRawPtr(ni, 0, 0)^,
+      FDim * SizeOf(TNeuralFloat));
+  // Rows K..K+SeqLen-1: the real token embeddings, forwarded verbatim.
+  for ni := 0 to SeqLen - 1 do
+    Move(X.GetRawPtr(ni, 0, 0)^, FOutput.GetRawPtr(FNumVirtual + ni, 0, 0)^,
+      FDim * SizeOf(TNeuralFloat));
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSoftPrompt.Backpropagate();
+var
+  StartTime: double;
+  X, P, Xerr: TNNetVolume;
+  SeqLen, ni: integer;
+  hasInputGrad: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  P := FNeurons[0].FWeights;
+  SeqLen := X.SizeX;
+  hasInputGrad := Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
+  Xerr := nil;
+  if hasInputGrad then Xerr := FPrevLayer.FOutputError;
+  // Virtual-token rows -> soft-prompt delta (-LearningRate scaled, like the
+  // other learnable-bank layers).
+  for ni := 0 to FNumVirtual - 1 do
+    TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(ni, 0, 0),
+      FOutputError.GetRawPtr(ni, 0, 0), -FLearningRate, FDim);
+  // Real-token rows -> straight-through into the previous layer.
+  if hasInputGrad then
+    for ni := 0 to SeqLen - 1 do
+      TNNetVolume.Add(Xerr.GetRawPtr(ni, 0, 0),
+        FOutputError.GetRawPtr(FNumVirtual + ni, 0, 0), FDim);
+  if (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if hasInputGrad then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetSoftPrompt.InitDefault();
+var
+  q, d, oldSeed: integer;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  // Small Gaussian init (Lester et al. init the soft prompt from a random
+  // normal); a fixed seed keeps the eval forward deterministic across builds.
+  oldSeed := RandSeed;
+  RandSeed := 271828;
+  for q := 0 to FNumVirtual - 1 do
     for d := 0 to FDim - 1 do
       FNeurons[0].FWeights[q, 0, d] :=
         FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
@@ -83799,6 +83951,7 @@ begin
       'TNNetModernHopfield' :       Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetInducedSetAttention' :  Result := TNNetInducedSetAttention.Create(St[0], St[1]);
       'TNNetAttentionPooling' :     Result := TNNetAttentionPooling.Create(St[0], St[1]);
+      'TNNetSoftPrompt' :           Result := TNNetSoftPrompt.Create(St[0], St[1]);
       'TNNetProductKeyMemory' :     Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetLinearAttention' :      Result := TNNetLinearAttention.Create(St[0]);
       'TNNetPerformerAttention' :   Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]);
@@ -84182,6 +84335,7 @@ begin
       if S[0] = 'TNNetModernHopfield' then Result := TNNetModernHopfield.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetInducedSetAttention' then Result := TNNetInducedSetAttention.Create(St[0], St[1]) else
       if S[0] = 'TNNetAttentionPooling' then Result := TNNetAttentionPooling.Create(St[0], St[1]) else
+      if S[0] = 'TNNetSoftPrompt' then Result := TNNetSoftPrompt.Create(St[0], St[1]) else
       if S[0] = 'TNNetProductKeyMemory' then Result := TNNetProductKeyMemory.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetLinearAttention' then Result := TNNetLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetPerformerAttention' then Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]) else

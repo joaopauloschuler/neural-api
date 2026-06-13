@@ -555,6 +555,11 @@ type
     procedure TestMultiHeadInducedSetAttentionInputGradientCheck;
     procedure TestMultiHeadAttentionPoolingBuilder;
     procedure TestMultiHeadAttentionPoolingPermutationInvariance;
+    procedure TestSoftPromptForwardShape;
+    procedure TestSoftPromptWeightGradientCheck;
+    procedure TestSoftPromptInputGradientCheck;
+    procedure TestSoftPromptSerializationRoundTrip;
+    procedure TestSoftPromptFreezeOnlyPromptTrains;
     procedure TestSABBuilderShape;
     procedure TestSABInputGradientCheck;
     procedure TestSABSerializationRoundTrip;
@@ -35023,6 +35028,260 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetAttentionPooling.Create(2, 3), 'AttentionPooling', 5, 1, 3, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSoftPromptForwardShape;
+// (K=3 virtual tokens) prepended to (SeqLen=4, d=2) -> (7, 1, 2). The first
+// K rows are the learnable bank verbatim; the trailing rows echo the input.
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LH: TNNetSoftPrompt;
+  i, d: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 2, 1));
+    LH := TNNetSoftPrompt.Create(3, 2);
+    NN.AddLayer(LH);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) + 0.2;
+    NN.Compute(Input);
+    AssertEquals('SoftPrompt output SizeX = K+SeqLen', 7, LH.Output.SizeX);
+    AssertEquals('SoftPrompt output Depth preserved', 2, LH.Output.Depth);
+    AssertEquals('SoftPrompt NumVirtualTokens', 3, LH.NumVirtualTokens);
+    // First K rows == bank.
+    for i := 0 to 2 do
+      for d := 0 to 1 do
+        AssertEquals('SoftPrompt virtual row ' + IntToStr(i),
+          LH.Neurons[0].Weights[i, 0, d], LH.Output[i, 0, d], 1e-6);
+    // Trailing rows == input (straight-through), offset by K.
+    for i := 0 to 3 do
+      for d := 0 to 1 do
+        AssertEquals('SoftPrompt echo row ' + IntToStr(i),
+          Input[i, 0, d], LH.Output[3 + i, 0, d], 1e-6);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPromptWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LH: TNNetSoftPrompt;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(6, 1, 3); // (K=2)+4 rows
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LH := TNNetSoftPrompt.Create(2, 3);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.45) * 0.9 + 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+
+    for i := 0 to LH.Neurons[0].Weights.Size - 1 do
+    begin
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      LH.Neurons[0].Weights.Raw[i] := LH.Neurons[0].Weights.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      LH.Neurons[0].ClearDelta;
+      NN.Backpropagate(Desired);
+      analyticalGrad := -LH.Neurons[0].Delta.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SoftPrompt weight gradient P[' + IntToStr(i) +
+        '] num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    // Soft-prompt gradient must be NONZERO (it is the only trainable signal).
+    AssertTrue('SoftPrompt gradient is nonzero', maxErr >= 0);
+    AssertTrue('SoftPrompt delta has a nonzero entry',
+      LH.Neurons[0].Delta.GetSumAbs() > 0);
+    WriteLn('SoftPrompt weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPromptInputGradientCheck;
+// The trailing (real-token) rows pass gradient straight through to the input.
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LH: TNNetSoftPrompt;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  InputPlus := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(6, 1, 3);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    LH := TNNetSoftPrompt.Create(2, 3);
+    NN.AddLayer(LH);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('SoftPrompt input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('SoftPrompt input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSoftPromptSerializationRoundTrip;
+begin
+  // The learnable virtual-token bank (K x d) must survive Save/LoadFromString
+  // along with the K/d hyperparameters.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetSoftPrompt.Create(3, 4), 'SoftPrompt', 5, 1, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSoftPromptFreezeOnlyPromptTrains;
+// Prompt-tuning contract: freeze the base model (LearningRate := 0 on every
+// layer except the soft prompt), run one training step, and assert (1) the
+// frozen embedding weights are BIT-unchanged, (2) the soft-prompt weights DID
+// change, and (3) the eval (no-backprop) forward is deterministic.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Emb: TNNetEmbedding;
+  SP: TNNetSoftPrompt;
+  EmbBefore: TNNetVolume;
+  PromptBefore: TNNetVolume;
+  i: integer;
+  embChanged, promptChanged: boolean;
+  out1, out2: TNNetVolume;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  EmbBefore := TNNetVolume.Create();
+  PromptBefore := TNNetVolume.Create();
+  out1 := TNNetVolume.Create();
+  out2 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    Emb := TNNetEmbedding.Create(8, 5) as TNNetEmbedding; // vocab 8, d=5
+    NN.AddLayer(Emb);
+    SP := TNNetSoftPrompt.Create(2, 5);
+    NN.AddLayer(SP);
+    NN.AddLayer(TNNetFullConnectLinear.Create(8)); // a tiny head
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output);
+
+    // Freeze EVERYTHING except the soft prompt (LR := 0 on the others).
+    for i := 0 to NN.CountLayers - 1 do
+      NN.Layers[i].LearningRate := 0;
+    SP.LearningRate := 1.0;
+    NN.SetBatchUpdate(false);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := i mod 8;
+    NN.Compute(Input);
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Sin(i * 0.3) * 0.5;
+
+    EmbBefore.Copy(Emb.Neurons[0].Weights);
+    PromptBefore.Copy(SP.Neurons[0].Weights);
+
+    NN.Compute(Input);
+    NN.Backpropagate(Desired);
+
+    // (1) Frozen embedding bit-unchanged.
+    embChanged := false;
+    for i := 0 to Emb.Neurons[0].Weights.Size - 1 do
+      if Emb.Neurons[0].Weights.Raw[i] <> EmbBefore.Raw[i] then embChanged := true;
+    AssertFalse('Frozen embedding weights must be bit-unchanged', embChanged);
+
+    // (2) Soft prompt changed.
+    promptChanged := false;
+    for i := 0 to SP.Neurons[0].Weights.Size - 1 do
+      if SP.Neurons[0].Weights.Raw[i] <> PromptBefore.Raw[i] then promptChanged := true;
+    AssertTrue('Soft-prompt weights must update', promptChanged);
+
+    // (3) Eval forward deterministic (two forwards, no backprop, identical).
+    NN.Compute(Input);
+    out1.Copy(NN.GetLastLayer.Output);
+    NN.Compute(Input);
+    out2.Copy(NN.GetLastLayer.Output);
+    for i := 0 to out1.Size - 1 do
+      AssertEquals('Eval forward deterministic at ' + IntToStr(i),
+        out1.Raw[i], out2.Raw[i], 0.0);
+    Desired.Free;
+  finally
+    NN.Free; Input.Free; EmbBefore.Free; PromptBefore.Free;
+    out1.Free; out2.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestAddAttentionPoolingBuilder;

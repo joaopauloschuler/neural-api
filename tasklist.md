@@ -436,7 +436,7 @@ rather than acted on.
       DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in neuralnlpmetrics.pas
       over a real Marian/T5 checkpoint (the Unigram tokenizer these need has
       landed, reading the checkpoint's tokenizer.json).
-- [ ] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
+- [X] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
       above): K learnable virtual-token embeddings prepended to the
       embedding-layer output, base model frozen — K*d_model trainable
       params, the cheapest fine-tune of an imported checkpoint. Mostly
