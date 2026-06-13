@@ -381,11 +381,12 @@ type
   // window, the target for position P is the token at position P+1, so the
   // last position of every window never has a target.
   //
-  // Cross-document attention masking is intentionally NOT implemented:
-  // TNNetScaledDotProductAttention only supports a static causal flag (plus
-  // a static sliding window), not per-sample dynamic masks, so attention may
-  // cross document boundaries inside a packed window. This is the standard
-  // GPT-2/GPT-3 packing behaviour and works fine in practice.
+  // By default attention may cross document boundaries inside a packed window
+  // (the standard GPT-2/GPT-3 packing behaviour, which works fine in practice).
+  // To PREVENT cross-document attention, call GetSegmentIds / GetSegmentVolume
+  // to obtain the per-token document ids and feed them as the segment source of
+  // a TNNetScaledDotProductAttention layer (its optional per-sample
+  // block-diagonal mask: query i attends key j only when seg[i] = seg[j]).
   //
   // Typical use (per-position causal LM with a TNNetPointwiseSoftMax head):
   //   Packer.AddDocument(...); ...; Packer.Pack();
@@ -425,6 +426,21 @@ type
       // Returns a copy of window WindowIdx (always ContextLen tokens).
       function GetWindow(WindowIdx: integer): TNeuralIntegerArray;
       function GetToken(WindowIdx, Pos: integer): integer;
+      // Per-token DOCUMENT/SEGMENT ids for window WindowIdx (length ContextLen),
+      // for feeding TNNetScaledDotProductAttention's per-sample segment mask so
+      // attention does NOT cross document boundaries inside the packed window.
+      // A new document begins immediately after each end-of-document separator,
+      // so the id is incremented every time the PREVIOUS token was a separator;
+      // the separator itself shares its document's id (it is that document's
+      // last token). Every trailing pad position is given one shared id that is
+      // distinct from all real-document ids (their outputs are loss-masked, so
+      // attending among themselves is harmless, while they never see a real
+      // document). Returns a TNeuralIntegerArray of length ContextLen.
+      function GetSegmentIds(WindowIdx: integer): TNeuralIntegerArray;
+      // Fills pSegment (SizeX=ContextLen, SizeY=1, Depth=1) with the per-token
+      // segment ids from GetSegmentIds, ready to be the segment source of a
+      // TNNetScaledDotProductAttention layer.
+      procedure GetSegmentVolume(WindowIdx: integer; pSegment: TNNetVolume);
       // True when position Pos of window WindowIdx carries a loss: the target
       // (next token in the window) exists and is not the pad token.
       function IsTargetPredictable(WindowIdx, Pos: integer): boolean;
@@ -1124,6 +1140,53 @@ function TNNetSequencePacker.GetToken(WindowIdx, Pos: integer): integer;
 begin
   RequirePacked();
   Result := FWindows[WindowIdx][Pos];
+end;
+
+function TNNetSequencePacker.GetSegmentIds(WindowIdx: integer): TNeuralIntegerArray;
+var
+  Pos, SegId, PadId: integer;
+begin
+  RequirePacked();
+  SetLength(Result, FContextLen);
+  // First pass: real/separator tokens get an incrementing document id; a new
+  // document opens right after each separator. Pad positions are tagged -1 and
+  // reassigned a single shared id below.
+  SegId := 0;
+  for Pos := 0 to FContextLen - 1 do
+  begin
+    if FWindows[WindowIdx][Pos] = FPadToken then
+    begin
+      Result[Pos] := -1;
+    end
+    else
+    begin
+      Result[Pos] := SegId;
+      if FWindows[WindowIdx][Pos] = FSeparatorToken then Inc(SegId);
+    end;
+  end;
+  // Pads share one id distinct from every real-document id (= SegId, the next
+  // unused value), so a pad never matches any real document.
+  PadId := SegId;
+  for Pos := 0 to FContextLen - 1 do
+    if Result[Pos] = -1 then Result[Pos] := PadId;
+end;
+
+procedure TNNetSequencePacker.GetSegmentVolume(WindowIdx: integer;
+  pSegment: TNNetVolume);
+var
+  Ids: TNeuralIntegerArray;
+  Pos: integer;
+begin
+  RequirePacked();
+  if (pSegment.SizeX <> FContextLen) or (pSegment.SizeY <> 1) or
+     (pSegment.Depth <> 1) then
+    raise Exception.Create('TNNetSequencePacker.GetSegmentVolume: pSegment ' +
+      'must be (ContextLen,1,1). Got (' + IntToStr(pSegment.SizeX) + ',' +
+      IntToStr(pSegment.SizeY) + ',' + IntToStr(pSegment.Depth) + ').');
+  Ids := GetSegmentIds(WindowIdx);
+  for Pos := 0 to FContextLen - 1 do
+    pSegment[Pos, 0, 0] := Ids[Pos];
+  SetLength(Ids, 0);
 end;
 
 function TNNetSequencePacker.IsTargetPredictable(WindowIdx, Pos: integer): boolean;

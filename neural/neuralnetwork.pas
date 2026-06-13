@@ -2617,6 +2617,13 @@ type
     FBidirectionalWindow: boolean; // symmetric (encoder) window: |i-j| < W
     FScoreSoftCap: TNeuralFloat;    // 0 = off; c>0 = c*tanh(score/c) pre-softmax
     FInvScoreSoftCap: TNeuralFloat; // 1/FScoreSoftCap when on (0 otherwise)
+    // Optional PER-SAMPLE segment-id (document-id) side channel. nil (default)
+    // = no segment masking (full backward compat). When set it points at a
+    // layer of shape (SeqLen,1,1) whose value at position j is the integer
+    // document id of token j; query i may only attend key j when seg[i]=seg[j]
+    // (intersected with the static causal/window masks). The ids carry NO
+    // gradient (discrete labels) so no error is pushed back into this source.
+    FSegLayer: TNNetLayer;
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     // --- KV-cache incremental-decode state (inference only, not serialized) ---
     FCacheEnabled: boolean;
@@ -2665,10 +2672,33 @@ type
     // saved models load with 0 = one-sided, bit-identical). The KV-cache
     // incremental decode path is causal by construction and therefore
     // REJECTS the bidirectional window.
+    //
+    // pSegmentSource = nil (default) keeps the original behavior bit-identical
+    // (no per-sample masking; the layer has only its single PrevLayer source).
+    // pSegmentSource <> nil enables the PER-SAMPLE block-diagonal / document-id
+    // mask for PACKED training windows: it must be a layer of shape
+    // (SeqLen,1,1) whose value at position j is the integer document/segment id
+    // of token j (e.g. fed by a TNNetInput(SeqLen,1,1) carrying the ids emitted
+    // by TNNetSequencePacker.GetSegmentIds). Query position i may then only
+    // attend key position j when seg[i] = seg[j] (rounded to the nearest
+    // integer) -- INTERSECTED with the static causal and sliding-window masks
+    // (a key is attendable iff causal-allowed AND window-allowed AND
+    // same-document). This lets a single window pack several concatenated
+    // documents without attention bleeding across document boundaries (the
+    // GPT-2/3 cross-document attention that ships by default). The mask varies
+    // ACROSS the batch (unlike the static causal/window flags) because the ids
+    // are read per-sample from the source's current Output. The segment ids
+    // are discrete labels and receive NO gradient. The source layer index is
+    // serialized in the (otherwise empty) layer-index slot (like
+    // TNNetCrossAttention), so the net round-trips through Save/LoadFromString.
+    // The KV-cache incremental-decode path does NOT support segment masking
+    // (single-stream decoding has one document by construction).
     constructor Create(d_k: integer; CausalMask: boolean = false;
       pWindow: integer = 0; pScoreSoftCap: TNeuralFloat = 0;
-      pBidirectionalWindow: boolean = false); overload;
+      pBidirectionalWindow: boolean = false;
+      pSegmentSource: TNNetLayer = nil); overload;
     destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     // Enable the KV-cache incremental-decode path. Preallocates the K and V
@@ -2697,6 +2727,7 @@ type
     property Window: integer read FWindow;
     property BidirectionalWindow: boolean read FBidirectionalWindow;
     property ScoreSoftCap: TNeuralFloat read FScoreSoftCap;
+    property SegmentSource: TNNetLayer read FSegLayer;
     property CacheEnabled: boolean read FCacheEnabled;
     property CacheLength: integer read FCacheLen;
     property MaxContext: integer read FCacheMax;
@@ -21645,7 +21676,8 @@ end;
 { TNNetScaledDotProductAttention }
 
 constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: boolean;
-  pWindow: integer; pScoreSoftCap: TNeuralFloat; pBidirectionalWindow: boolean);
+  pWindow: integer; pScoreSoftCap: TNeuralFloat; pBidirectionalWindow: boolean;
+  pSegmentSource: TNNetLayer);
 begin
   inherited Create();
   FDk := d_k;
@@ -21653,6 +21685,7 @@ begin
   FWindow := pWindow;
   FBidirectionalWindow := pBidirectionalWindow;
   FScoreSoftCap := pScoreSoftCap;
+  FSegLayer := pSegmentSource;
   if FDk < 1 then
     FErrorProc('TNNetScaledDotProductAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
   if FWindow < 0 then
@@ -21676,6 +21709,14 @@ begin
   if FBidirectionalWindow then FStruct[3] := 1 else FStruct[3] := 0;
   FFloatSt[0] := FScoreSoftCap;
   FAttn := TNNetVolume.Create();
+  if Assigned(FSegLayer) then
+  begin
+    // Optional second source carrying per-token document/segment ids. It is a
+    // read-only side channel (discrete ids, no gradient) but it IS a graph
+    // branch, so register a departing branch on it for backprop
+    // reference-counting balance (same convention as TNNetCrossAttention).
+    FSegLayer.IncDepartingBranchesCnt();
+  end;
 end;
 
 destructor TNNetScaledDotProductAttention.Destroy();
@@ -21684,6 +21725,18 @@ begin
   FVCache.Free;
   FAttn.Free;
   inherited Destroy();
+end;
+
+function TNNetScaledDotProductAttention.SaveStructureToString(): string;
+begin
+  if Assigned(FSegLayer) then
+    // Inject the segment-id source layer index into the (otherwise empty)
+    // third ':'-delimited slot, exactly as TNNetCrossAttention does, so
+    // CreateLayer / LoadFromString can reconnect the second source.
+    Result := StringReplace(inherited SaveStructureToString,
+      '::', ':' + IntToStr(FSegLayer.FLayerIdx) + ':', [rfReplaceAll])
+  else
+    Result := inherited SaveStructureToString;
 end;
 
 procedure TNNetScaledDotProductAttention.BeginIncrementalDecode(MaxContext: integer);
@@ -21832,6 +21885,22 @@ begin
   FOutputErrorDeriv.ReSize(FOutput);
   // Attention weights: rows = queries (i), cols = keys (j). Use X=key, Y=query.
   FAttn.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeX, 1);
+  if Assigned(FSegLayer) then
+  begin
+    if FSegLayer.FOutput.SizeY <> 1 then
+      FErrorProc('TNNetScaledDotProductAttention segment-id source requires ' +
+        'SizeY=1. SizeY=' + IntToStr(FSegLayer.FOutput.SizeY));
+    if FSegLayer.FOutput.Depth <> 1 then
+      FErrorProc('TNNetScaledDotProductAttention segment-id source requires ' +
+        'Depth=1. Depth=' + IntToStr(FSegLayer.FOutput.Depth));
+    if FSegLayer.FOutput.SizeX <> pPrevLayer.FOutput.SizeX then
+      FErrorProc('TNNetScaledDotProductAttention segment-id source SeqLen (' +
+        IntToStr(FSegLayer.FOutput.SizeX) + ') must match the query SeqLen (' +
+        IntToStr(pPrevLayer.FOutput.SizeX) + ').');
+    if FCacheEnabled then
+      FErrorProc('TNNetScaledDotProductAttention: segment masking is not ' +
+        'supported on the KV-cache incremental-decode path.');
+  end;
 end;
 
 procedure TNNetScaledDotProductAttention.Compute();
@@ -21845,8 +21914,10 @@ var
   StartTime: double;
   SeqLen, i, j, d: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
-  Prev: TNNetVolume;
+  Prev, Seg: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
+  SegI: integer;
+  HasSeg: boolean;
 begin
   if FCacheEnabled then
   begin
@@ -21856,23 +21927,32 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
+  HasSeg := Assigned(FSegLayer);
+  Seg := nil;
+  SegI := 0;
+  if HasSeg then Seg := FSegLayer.FOutput;
   // For each query row i: compute scores, softmax, then weighted sum of V.
   for i := 0 to SeqLen - 1 do
   begin
     // 1) Scaled scores into FAttn[*, i, 0]. The depth axis is contiguous, so
     //    score = Q[i] . K[j] is an AVX dot product over FDk floats:
     //    Q at GetRawPtr(i,0,0), K at GetRawPtr(j,0,FDk).
+    if HasSeg then SegI := Round(Seg[i, 0, 0]);
     MaxScore := -1e30;
     for j := 0 to SeqLen - 1 do
     begin
       if (FCausal and (j > i)) or
          ((FWindow > 0) and ((i - j >= FWindow) or
-          (FBidirectionalWindow and (j - i >= FWindow)))) then
+          (FBidirectionalWindow and (j - i >= FWindow)))) or
+         (HasSeg and (Round(Seg[j, 0, 0]) <> SegI)) then
       begin
         // Masked: strict future (causal), a key beyond the sliding window
-        // (more than Window-1 positions in the past), or - bidirectional
-        // window only - more than Window-1 positions in the FUTURE (the
-        // symmetric encoder band). Same -1e9 sentinel.
+        // (more than Window-1 positions in the past), - bidirectional window
+        // only - more than Window-1 positions in the FUTURE (the symmetric
+        // encoder band), OR (per-sample segment mask) a key that belongs to a
+        // DIFFERENT document than this query (seg[j] <> seg[i]). The three
+        // masks INTERSECT: a key is attendable only if every active mask
+        // permits it. Same -1e9 sentinel.
         FAttn[j, i, 0] := -1e9;
       end
       else
@@ -22009,6 +22089,13 @@ begin
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
+  // The per-sample segment-id mask only forces FAttn rows to 0 (the softmax
+  // Jacobian backward above is mask-agnostic), so no gradient math changes.
+  // The segment ids are discrete labels and receive NO gradient, but the
+  // source is still a graph branch: call its Backpropagate to keep the
+  // backprop reference-counting balanced (same convention as
+  // TNNetCrossAttention's K|V source).
+  if Assigned(FSegLayer) then FSegLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -83896,8 +83983,10 @@ var
   ClassNameStr: string;
   SCount: integer;
   StructCount: integer;
+  SegSrc: TNNetLayer;
 begin
   Result := nil;
+  SegSrc := nil;
   S := CreateTokenizedStringList(strData,':');
   S2 := CreateTokenizedStringList(strData,';');
 
@@ -83933,10 +84022,11 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetScaledDotProductAttention') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
+        if Length(aL) > 0 then SegSrc := aL[0];
       end;
     end;
 
@@ -84067,7 +84157,7 @@ begin
       'TNNetFourierMix' :           Result := TNNetFourierMix.Create(St[0]);
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
-      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1);
+      'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
@@ -84452,7 +84542,7 @@ begin
       if S[0] = 'TNNetFourierMix' then Result := TNNetFourierMix.Create(St[0]) else
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
-      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1) else
+      if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else

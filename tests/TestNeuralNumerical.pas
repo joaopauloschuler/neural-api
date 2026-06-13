@@ -930,6 +930,9 @@ type
     procedure TestTransformerEncoderBlockCustomNorm;
     procedure TestSlidingWindowAttentionLocality;
     procedure TestSlidingWindowAttentionSaveLoad;
+    procedure TestSegmentMaskCrossDocAttentionIsZero;
+    procedure TestSegmentMaskMatchesUnpackedBaseline;
+    procedure TestSegmentMaskSaveLoad;
     procedure TestAlternatingLocalGlobalBlocksPattern;
     procedure TestAlternatingLocalGlobalBlocksGradFlow;
     procedure TestParallelTransformerBlockShapeAndGradFlow;
@@ -15235,6 +15238,225 @@ begin
           TNNetScaledDotProductAttention(NN.Layers[i]).Window = 0);
       end;
     AssertTrue('default encoder block has 2 SDPA heads', FoundSDPA = 2);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSegmentMaskCrossDocAttentionIsZero;
+// Per-sample block-diagonal / document-id mask in TNNetScaledDotProductAttention.
+// A packed window of SeqLen=4 holds two documents: positions {0,1} = doc 0,
+// positions {2,3} = doc 1 (segment ids [0,0,1,1]), NON-causal attention.
+// The post-softmax attention map FAttn[key, query, 0] must be EXACTLY zero for
+// every (query, key) pair that crosses the document boundary, and each query
+// row must still sum to 1 over its own document's keys.
+var
+  NN: TNNet;
+  QKVIn, SegIn, SDPALayer: TNNetLayer;
+  QKV, Seg: TNNetVolume;
+  SDPA: TNNetScaledDotProductAttention;
+  d_k, i, j, qd, kd: integer;
+begin
+  RandSeed := 424242;
+  d_k := 3;
+  NN := TNNet.Create();
+  QKV := TNNetVolume.Create(4, 1, 3 * d_k, 1);
+  Seg := TNNetVolume.Create(4, 1, 1, 1);
+  try
+    QKVIn := NN.AddLayer(TNNetInput.Create(4, 1, 3 * d_k, 1));
+    SegIn := NN.AddLayerAfter(TNNetInput.Create(4, 1, 1, 1), 0);
+    SDPALayer := NN.AddLayerAfter(
+      TNNetScaledDotProductAttention.Create(d_k, {Causal=}false, 0, 0, false,
+        SegIn), QKVIn);
+    SDPA := TNNetScaledDotProductAttention(SDPALayer);
+    // Distinct, well-separated Q/K/V so unmasked scores are clearly non-zero.
+    for i := 0 to QKV.Size - 1 do QKV.Raw[i] := Sin(i * 0.53) * 0.9 + 0.15;
+    Seg[0, 0, 0] := 0; Seg[1, 0, 0] := 0;  // doc 0
+    Seg[2, 0, 0] := 1; Seg[3, 0, 0] := 1;  // doc 1
+    QKVIn.Output.Copy(QKV);
+    SegIn.Output.Copy(Seg);
+    NN.Compute(QKVIn.Output);
+    // FAttn[key j, query i, 0] must be 0 whenever seg[i] <> seg[j].
+    for i := 0 to 3 do
+      for j := 0 to 3 do
+      begin
+        qd := Round(Seg[i, 0, 0]);
+        kd := Round(Seg[j, 0, 0]);
+        if qd <> kd then
+          AssertEquals('cross-doc attn q=' + IntToStr(i) + ' k=' + IntToStr(j) +
+            ' must be exactly zero', 0.0, SDPA.AttentionWeights[j, i, 0], 0.0);
+      end;
+    // Each query row sums to 1 over its OWN document's keys.
+    for i := 0 to 3 do
+    begin
+      qd := Round(Seg[i, 0, 0]);
+      // sum over same-doc keys
+      AssertEquals('row ' + IntToStr(i) + ' sums to 1 within its document',
+        1.0,
+        SDPA.AttentionWeights[(qd * 2), i, 0] +
+        SDPA.AttentionWeights[(qd * 2) + 1, i, 0], 1e-5);
+    end;
+  finally
+    Seg.Free;
+    QKV.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSegmentMaskMatchesUnpackedBaseline;
+// A packed window of two documents run with the per-sample segment mask must
+// produce, for every token, the SAME SDPA output as running each document
+// SEPARATELY (unpacked) through an identical SDPA layer. This is the parity
+// guarantee that block-diagonal masking == independent per-document attention.
+// Doc A = positions {0,1}, doc B = positions {2,3,4} (SeqLen=5, seg [0,0,1,1,1]).
+var
+  PackedNN, BaseNN: TNNet;
+  QKVIn, SegIn, SDPALayer: TNNetLayer;
+  QKV, Seg, DocA, DocB: TNNetVolume;
+  PackedOut: TNNetVolume;
+  d_k, i, d, p: integer;
+
+  function BuildBaseline(SeqLen: integer): TNNet;
+  begin
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * d_k, 1));
+    Result.AddLayer(TNNetScaledDotProductAttention.Create(d_k, {Causal=}true));
+  end;
+
+begin
+  RandSeed := 424242;
+  d_k := 3;
+  PackedNN := TNNet.Create();
+  QKV := TNNetVolume.Create(5, 1, 3 * d_k, 1);
+  Seg := TNNetVolume.Create(5, 1, 1, 1);
+  DocA := TNNetVolume.Create(2, 1, 3 * d_k, 1);
+  DocB := TNNetVolume.Create(3, 1, 3 * d_k, 1);
+  PackedOut := TNNetVolume.Create();
+  try
+    // Packed net: causal SDPA WITH the segment mask.
+    QKVIn := PackedNN.AddLayer(TNNetInput.Create(5, 1, 3 * d_k, 1));
+    SegIn := PackedNN.AddLayerAfter(TNNetInput.Create(5, 1, 1, 1), 0);
+    SDPALayer := PackedNN.AddLayerAfter(
+      TNNetScaledDotProductAttention.Create(d_k, {Causal=}true, 0, 0, false,
+        SegIn), QKVIn);
+    for i := 0 to QKV.Size - 1 do QKV.Raw[i] := Sin(i * 0.41) * 0.8 + 0.2;
+    Seg[0, 0, 0] := 0; Seg[1, 0, 0] := 0;
+    Seg[2, 0, 0] := 1; Seg[3, 0, 0] := 1; Seg[4, 0, 0] := 1;
+    QKVIn.Output.Copy(QKV);
+    SegIn.Output.Copy(Seg);
+    PackedNN.Compute(QKVIn.Output);
+    PackedOut.Copy(SDPALayer.Output);
+
+    // Split the SAME Q/K/V into the two per-document slabs.
+    for p := 0 to 1 do
+      for d := 0 to 3 * d_k - 1 do DocA[p, 0, d] := QKV[p, 0, d];
+    for p := 0 to 2 do
+      for d := 0 to 3 * d_k - 1 do DocB[p, 0, d] := QKV[p + 2, 0, d];
+
+    // Baseline doc A (causal, no segment mask): outputs for positions 0..1.
+    BaseNN := BuildBaseline(2);
+    try
+      BaseNN.Compute(DocA);
+      for p := 0 to 1 do
+        for d := 0 to d_k - 1 do
+          AssertEquals('doc A token ' + IntToStr(p) + ' d=' + IntToStr(d),
+            BaseNN.GetLastLayer.Output[p, 0, d], PackedOut[p, 0, d], 1e-5);
+    finally
+      BaseNN.Free;
+    end;
+
+    // Baseline doc B (causal): outputs map to packed positions 2..4.
+    BaseNN := BuildBaseline(3);
+    try
+      BaseNN.Compute(DocB);
+      for p := 0 to 2 do
+        for d := 0 to d_k - 1 do
+          AssertEquals('doc B token ' + IntToStr(p) + ' d=' + IntToStr(d),
+            BaseNN.GetLastLayer.Output[p, 0, d], PackedOut[p + 2, 0, d], 1e-5);
+    finally
+      BaseNN.Free;
+    end;
+  finally
+    PackedOut.Free;
+    DocB.Free;
+    DocA.Free;
+    Seg.Free;
+    QKV.Free;
+    PackedNN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSegmentMaskSaveLoad;
+// The optional segment-id source layer index is serialized in the layer-index
+// slot (like TNNetCrossAttention): a net with a segment-masked SDPA round-trips
+// through SaveToString -> LoadFromString with the source reconnected and an
+// identical forward output. Backward-compat is pinned separately: a plain SDPA
+// (no segment source) serializes with SegmentSource = nil.
+var
+  NN, NN2: TNNet;
+  QKVIn, SegIn, SDPALayer: TNNetLayer;
+  QKV, Seg: TNNetVolume;
+  Saved: string;
+  d_k, i, FoundSDPA, FoundWithSeg: integer;
+begin
+  RandSeed := 424242;
+  d_k := 3;
+  NN := TNNet.Create();
+  QKV := TNNetVolume.Create(4, 1, 3 * d_k, 1);
+  Seg := TNNetVolume.Create(4, 1, 1, 1);
+  try
+    QKVIn := NN.AddLayer(TNNetInput.Create(4, 1, 3 * d_k, 1));
+    SegIn := NN.AddLayerAfter(TNNetInput.Create(4, 1, 1, 1), 0);
+    SDPALayer := NN.AddLayerAfter(
+      TNNetScaledDotProductAttention.Create(d_k, {Causal=}true, 0, 0, false,
+        SegIn), QKVIn);
+    for i := 0 to QKV.Size - 1 do QKV.Raw[i] := Sin(i * 0.31) * 0.7 + 0.1;
+    Seg[0, 0, 0] := 0; Seg[1, 0, 0] := 0; Seg[2, 0, 0] := 1; Seg[3, 0, 0] := 1;
+    QKVIn.Output.Copy(QKV);
+    SegIn.Output.Copy(Seg);
+    NN.Compute(QKVIn.Output);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      FoundSDPA := 0;
+      FoundWithSeg := 0;
+      for i := 0 to NN2.CountLayers() - 1 do
+        if NN2.Layers[i].ClassType = TNNetScaledDotProductAttention then
+        begin
+          Inc(FoundSDPA);
+          if Assigned(
+            TNNetScaledDotProductAttention(NN2.Layers[i]).SegmentSource) then
+            Inc(FoundWithSeg);
+        end;
+      AssertTrue('round-trip finds the SDPA layer', FoundSDPA = 1);
+      AssertTrue('reloaded SDPA reconnected its segment source',
+        FoundWithSeg = 1);
+      // Feed the reloaded net the same inputs and compare forward output.
+      NN2.Layers[0].Output.Copy(QKV);
+      NN2.Layers[1].Output.Copy(Seg);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('round-trip forward at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    Seg.Free;
+    QKV.Free;
+    NN.Free;
+  end;
+
+  // Backward-compat: a plain SDPA (no segment source) has SegmentSource = nil.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3 * d_k, 1));
+    NN.AddLayer(TNNetScaledDotProductAttention.Create(d_k, true));
+    AssertTrue('plain SDPA has nil segment source',
+      TNNetScaledDotProductAttention(NN.GetLastLayer).SegmentSource = nil);
   finally
     NN.Free;
   end;

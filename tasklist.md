@@ -686,7 +686,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       KVHeads-sized cache (cache aliasing keyed by the shared K/V projection
       layers) so the GQA memory win materializes at inference; assert streamed
       output stays bit-identical to the unaliased path.
-- [ ] Per-sample / dynamic attention masks in TNNetScaledDotProductAttention
+- [X] Per-sample / dynamic attention masks in TNNetScaledDotProductAttention
       (follow-up to TNNetSequencePacker, commit 52c5ca0): SDPA only supports
       the static causal flag + static sliding window, so packed training
       windows cannot mask attention across document boundaries (GPT-2/3-style
@@ -695,6 +695,16 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       wire `TNNetSequencePacker` to emit it; verify with a test that attention
       weights across a separator are exactly zero and gradients match an
       unpacked per-document baseline.
+      DONE: optional `pSegmentSource: TNNetLayer = nil` second-source on
+      `TNNetScaledDotProductAttention` (segment-ids side channel, design (a),
+      wired like TNNetCrossAttention; index serialized in the layer-index slot;
+      default nil = bit-identical legacy path). Mask intersects with
+      causal+window (key attendable iff causal AND window AND seg[i]=seg[j]);
+      ids carry no gradient. `TNNetSequencePacker.GetSegmentIds` /
+      `GetSegmentVolume` emit per-token document ids. Tests:
+      TestSegmentMaskCrossDocAttentionIsZero (cross-doc attn exactly 0),
+      TestSegmentMaskMatchesUnpackedBaseline (parity vs independent per-doc
+      runs), TestSegmentMaskSaveLoad, TestSegmentIdsMarkDocumentBoundaries.
 
 ## Tests / numerical-gradient audit
 
