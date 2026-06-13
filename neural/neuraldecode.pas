@@ -210,6 +210,29 @@ type
       function TokenAllowed(TokenId: integer): boolean; override;
   end;
 
+  { TNNetTokenHealingConstraint }
+  // ONE-SHOT whitelist for guidance-style TOKEN HEALING: like
+  // TNNetAllowedTokensConstraint, but the restriction applies to the FIRST
+  // emitted token only - Commit lifts it, and Reset re-arms it for the next
+  // generation run. Token healing backs up over the LAST prompt token and
+  // constrains the first generated token to vocabulary entries whose text
+  // EXTENDS the dropped token's text (the dropped token itself included, so
+  // generation can never get stuck), fixing the classic BPE boundary
+  // artifact ("http:" never continuing with "//" because the prompt split
+  // mid-merge). Build the allowed set yourself, or use PrepareTokenHealing
+  // for the dict-driven prefix scan + prompt trim in one call.
+  // Coded by Claude (AI).
+  TNNetTokenHealingConstraint = class(TNNetTokenConstraint)
+    private
+      FAllowed: array of boolean;
+      FDone: boolean;
+    public
+      constructor Create(const AllowedTokens: array of integer);
+      procedure Reset(const PromptTokens: array of integer); override;
+      function TokenAllowed(TokenId: integer): boolean; override;
+      procedure Commit(TokenId: integer); override;
+  end;
+
   { TNNetForcedSequenceConstraint }
   // Forces generation to follow ONE of N candidate token sequences (a trie
   // over the candidate continuations) - the standard multiple-choice
@@ -483,6 +506,13 @@ type
     Constraint: TNNetTokenConstraint;      // nil = off (not owned)
     // Sampler reading the processed probability row; nil = greedy argmax.
     Sampler: TNNetSamplerBase;             // not owned
+    // Guidance-style TOKEN HEALING (string paths only - the token-level
+    // routines have no dict; call PrepareTokenHealing yourself there): drop
+    // the last prompt token and constrain the FIRST generated token to
+    // vocabulary entries whose text extends the dropped token's text. A
+    // no-op when healing is not applicable (1-token prompt, empty/unknown
+    // last-token text, or no strict extension exists in the vocabulary).
+    TokenHealing: boolean;
   end;
 
   // TNNetStreamingDecoder: a reusable incremental-decode "streaming session"
@@ -814,7 +844,25 @@ function GenerateStringStreamedWithProcessors(Session: TNNetStreamingDecoder;
   oSampler: TNNetSamplerBase; Processors: TNNetLogitsProcessor;
   const StopStrings: array of string;
   const ExtraStopSequences: TNNetTokenSequences;
-  const EOSTokens: TNeuralIntegerArray): string;
+  const EOSTokens: TNeuralIntegerArray;
+  TokenHealing: boolean = false): string;
+
+// TOKEN HEALING SET-UP for the token-level routines: when healing applies,
+// returns a one-shot TNNetTokenHealingConstraint allowing exactly the
+// vocabulary entries whose text has the LAST prompt token's text as a
+// PREFIX (the dropped token itself included), decrements PromptLen (the
+// dropped token stays in Tokens and is simply overwritten by the first
+// generated token) and reports the dropped id in DroppedToken. Returns nil
+// - and leaves PromptLen untouched - when healing is not applicable:
+// PromptLen < 2 (healing would empty the prompt), the last id is outside
+// the dict, its text is empty, or NO vocabulary entry STRICTLY extends it
+// (the healed run would provably equal the unhealed one). Pass the
+// constraint to any Constraint-accepting overload (the caller frees it).
+// Linear vocab scan (v1) - fine for the dict sizes the streamed paths use.
+// Coded by Claude (AI).
+function PrepareTokenHealing(Dict: TStringListInt;
+  const Tokens: TNeuralIntegerArray; var PromptLen: integer;
+  out DroppedToken: integer): TNNetTokenHealingConstraint;
 
 // A TGenerationConfig with every knob OFF: greedy (nil sampler),
 // Temperature 1.0, no penalties/processors/constraint, no stop
@@ -1032,6 +1080,42 @@ function TNNetAllowedTokensConstraint.TokenAllowed(TokenId: integer): boolean;
 begin
   Result := (TokenId >= 0) and (TokenId <= High(FAllowed)) and
     FAllowed[TokenId];
+end;
+
+{ TNNetTokenHealingConstraint }
+
+constructor TNNetTokenHealingConstraint.Create(
+  const AllowedTokens: array of integer);
+var
+  I, MaxId: integer;
+begin
+  inherited Create();
+  MaxId := -1;
+  for I := 0 to High(AllowedTokens) do
+    if AllowedTokens[I] > MaxId then MaxId := AllowedTokens[I];
+  SetLength(FAllowed, MaxId + 1);
+  for I := 0 to MaxId do FAllowed[I] := false;
+  for I := 0 to High(AllowedTokens) do
+    if AllowedTokens[I] >= 0 then FAllowed[AllowedTokens[I]] := true;
+  FDone := false;
+end;
+
+procedure TNNetTokenHealingConstraint.Reset(
+  const PromptTokens: array of integer);
+begin
+  FDone := false; // re-arm: a fresh generation heals its first step again
+end;
+
+function TNNetTokenHealingConstraint.TokenAllowed(TokenId: integer): boolean;
+begin
+  // After the first emitted token the constraint is lifted entirely.
+  Result := FDone or ((TokenId >= 0) and (TokenId <= High(FAllowed)) and
+    FAllowed[TokenId]);
+end;
+
+procedure TNNetTokenHealingConstraint.Commit(TokenId: integer);
+begin
+  FDone := true;
 end;
 
 { TNNetForcedSequenceConstraint }
@@ -2010,23 +2094,103 @@ begin
   end;
 end;
 
+function PrepareTokenHealing(Dict: TStringListInt;
+  const Tokens: TNeuralIntegerArray; var PromptLen: integer;
+  out DroppedToken: integer): TNNetTokenHealingConstraint;
+var
+  LastText, CandText: string;
+  Allowed: TNeuralIntegerArray;
+  TokenCnt, AllowedCount, VocabCount, LastLen: integer;
+  HasStrictExtension: boolean;
+begin
+  Result := nil;
+  DroppedToken := -1;
+  if PromptLen < 2 then exit; // healing would empty the prompt
+  VocabCount := Dict.GetVocabCount();
+  if (Tokens[PromptLen - 1] < 0) or
+     (Tokens[PromptLen - 1] >= VocabCount) then exit;
+  LastText := Dict.DeTokenize(Tokens[PromptLen - 1]);
+  LastLen := Length(LastText);
+  if LastLen = 0 then exit; // byte-level/special oddity: no-op fallback
+  SetLength(Allowed, VocabCount);
+  AllowedCount := 0;
+  HasStrictExtension := false;
+  for TokenCnt := 0 to VocabCount - 1 do
+  begin
+    CandText := Dict.DeTokenize(TokenCnt);
+    if (Length(CandText) >= LastLen) and
+       (Copy(CandText, 1, LastLen) = LastText) then
+    begin
+      Allowed[AllowedCount] := TokenCnt;
+      Inc(AllowedCount);
+      if Length(CandText) > LastLen then HasStrictExtension := true;
+    end;
+  end;
+  // Without a strict extension the only allowed continuation re-emits the
+  // dropped token - the healed run provably equals the unhealed one, so
+  // healing is skipped (PromptLen untouched).
+  if not HasStrictExtension then exit;
+  SetLength(Allowed, AllowedCount);
+  DroppedToken := Tokens[PromptLen - 1];
+  Dec(PromptLen);
+  Result := TNNetTokenHealingConstraint.Create(Allowed);
+end;
+
 function GenerateStringStreamedWithProcessors(Session: TNNetStreamingDecoder;
   Dict: TStringListInt; InputString: string; MaxNewTokens, MaxTotalLen: integer;
   oSampler: TNNetSamplerBase; Processors: TNNetLogitsProcessor;
   const StopStrings: array of string;
   const ExtraStopSequences: TNNetTokenSequences;
-  const EOSTokens: TNeuralIntegerArray): string;
+  const EOSTokens: TNeuralIntegerArray;
+  TokenHealing: boolean = false): string;
 var
   Tokens, StopToks: TNeuralIntegerArray;
   TokenStops: TNNetTokenSequences;
   PromptLen, TotalLen, Pos, VocabCount, S, CutAt: integer;
-  Continuation: string;
+  Continuation, Prefix, DroppedText: string;
+  HealConstraint: TNNetTokenHealingConstraint;
+  HealChain: TNNetLogitsProcessorChain;
+  EffProcessors: TNNetLogitsProcessor;
+  DroppedToken: integer;
 begin
   Result := InputString;
   VocabCount := Dict.GetVocabCount();
   Dict.Tokenize(InputString, Tokens);
   PromptLen := Length(Tokens);
   if PromptLen < 1 then Exit; // nothing to condition on
+  // Token healing: drop the last prompt token, constrain step 1 to its
+  // extensions, and strip its text (plus the display separator for word
+  // dicts) from the prompt prefix - the healed first token re-emits the
+  // text, possibly extended.
+  Prefix := InputString;
+  HealConstraint := nil;
+  HealChain := nil;
+  EffProcessors := Processors;
+  if TokenHealing then
+  begin
+    HealConstraint := PrepareTokenHealing(Dict, Tokens, PromptLen,
+      DroppedToken);
+    if HealConstraint <> nil then
+    begin
+      DroppedText := Dict.DeTokenize(DroppedToken);
+      if (Length(DroppedText) <= Length(Prefix)) and
+         (Copy(Prefix, Length(Prefix) - Length(DroppedText) + 1,
+           Length(DroppedText)) = DroppedText) then
+      begin
+        SetLength(Prefix, Length(Prefix) - Length(DroppedText));
+        if Dict.TokenizerHasSeparator and (Prefix <> '') and
+           (Prefix[Length(Prefix)] = ' ') then
+          SetLength(Prefix, Length(Prefix) - 1);
+      end;
+      // The healing constraint runs LAST (after any caller pipeline), the
+      // TGenerationConfig convention for structural constraints.
+      HealChain := TNNetLogitsProcessorChain.Create();
+      if Processors <> nil then HealChain.Add(Processors, false);
+      HealChain.Add(TNNetConstraintProcessor.Create(HealConstraint,
+        {OwnsConstraint=}true), {OwnsProcessor=}true);
+      EffProcessors := HealChain;
+    end;
+  end;
   // Tokenize each stop string into a token-id stop sequence so the token
   // core terminates early; entries that tokenize to nothing are skipped.
   SetLength(TokenStops, 0);
@@ -2050,7 +2214,8 @@ begin
         Copy(ExtraStopSequences[S], 0, Length(ExtraStopSequences[S]));
     end;
   TotalLen := GenerateTokensStreamedWithProcessors(Session, Tokens, PromptLen,
-    MaxNewTokens, MaxTotalLen, oSampler, Processors, TokenStops, EOSTokens);
+    MaxNewTokens, MaxTotalLen, oSampler, EffProcessors, TokenStops, EOSTokens);
+  HealChain.Free; // frees the healing adapter+constraint; never Processors
   // Detokenize the continuation; stop at the first terminating token (the
   // EOSTokens list, or the "< 2" rule when it is empty) for display (the
   // TokensToText convention) and join with a space only for separator
@@ -2077,7 +2242,14 @@ begin
     if (Pos > 0) and ((CutAt = 0) or (Pos < CutAt)) then CutAt := Pos;
   end;
   if CutAt > 0 then Continuation := Copy(Continuation, 1, CutAt - 1);
-  Result := Result + Continuation;
+  // Healed runs rebuild from the trimmed prefix (the healed first token
+  // re-emits the dropped text). If nothing was generated after all
+  // (MaxNewTokens=0, or an immediate EOS through the zero-mass fallback),
+  // fall back to the untouched prompt instead of losing the dropped text.
+  if (HealConstraint <> nil) and (Continuation = '') then
+    Result := InputString
+  else
+    Result := Prefix + Continuation;
   SetLength(Tokens, 0);
 end;
 
@@ -2096,6 +2268,7 @@ begin
   Result.Processors := nil;
   Result.Constraint := nil;
   Result.Sampler := nil;
+  Result.TokenHealing := false;
 end;
 
 function GenerateTokensWithConfig(Session: TNNetStreamingDecoder;
@@ -2141,7 +2314,8 @@ begin
   try
     Result := GenerateStringStreamedWithProcessors(Session, Dict,
       InputString, Config.MaxNewTokens, MaxTotal, Config.Sampler, Chain,
-      Config.StopStrings, Config.StopSequences, Config.EOSTokens);
+      Config.StopStrings, Config.StopSequences, Config.EOSTokens,
+      Config.TokenHealing);
   finally
     Chain.Free; // frees the adapters only; Config's objects are NOT owned
   end;

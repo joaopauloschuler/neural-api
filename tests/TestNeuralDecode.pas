@@ -113,6 +113,9 @@ type
     procedure TestGenerateTokensStreamedNilConstraintMatchesPlain;
     procedure TestGenerateTokensStreamedWhitelistOnlyEmitsAllowed;
     procedure TestForcedSequenceConstraintFollowsCandidate;
+    // Token healing (guidance-style BPE boundary repair).
+    procedure TestPrepareTokenHealingBuildsPrefixSetAndTrims;
+    procedure TestTokenHealingChangesFirstTokenVsUnhealed;
     // JSON automaton unit tests (no model).
     procedure TestJSONStateMachineObjectTransitions;
     procedure TestJSONStateMachineStringAndEscapes;
@@ -2424,6 +2427,162 @@ begin
     AssertTrue('constraint reports completion', Forced.Completed());
   finally
     Forced.Free;
+    Dict.Free;
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+// PrepareTokenHealing without a model: on a vocabulary holding 'egg',
+// 'egging' and 'eggs', a prompt ending in 'egg' must yield a one-shot
+// constraint allowing EXACTLY the egg-prefixed tokens, decrement PromptLen
+// and report the dropped id; Commit lifts the restriction and Reset re-arms
+// it. Healing must be SKIPPED (nil, PromptLen untouched) for a 1-token
+// prompt and for a last token without any strict extension.
+procedure TTestNeuralDecode.TestPrepareTokenHealingBuildsPrefixSetAndTrims;
+const
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'blue', 'cat', 'dog',
+    'egg', 'egging', 'eggs', 'fox', 'gold', 'hat', 'ice');
+var
+  Dict: TStringListInt;
+  Toks: TNeuralIntegerArray;
+  C: TNNetTokenHealingConstraint;
+  PromptLen, Dropped, T: integer;
+begin
+  Dict := TStringListInt.Create();
+  C := nil;
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+
+    Dict.Tokenize('cat egg', Toks);
+    PromptLen := Length(Toks);
+    AssertEquals('prompt tokenizes to 2 ids', 2, PromptLen);
+    C := PrepareTokenHealing(Dict, Toks, PromptLen, Dropped);
+    AssertTrue('healing applies', C <> nil);
+    AssertEquals('prompt len trimmed by one', 1, PromptLen);
+    AssertEquals('dropped id is egg', Dict.WordToIndex('egg'), Dropped);
+    for T := 0 to Dict.GetVocabCount() - 1 do
+      AssertEquals('step-1 allowance of "' + Dict.DeTokenize(T) + '"',
+        Copy(Dict.DeTokenize(T), 1, 3) = 'egg', C.TokenAllowed(T));
+    C.Commit(Dict.WordToIndex('eggs'));
+    AssertTrue('constraint lifted after the first emission',
+      C.TokenAllowed(Dict.WordToIndex('dog')));
+    C.Reset([]);
+    AssertTrue('Reset re-arms the one-shot restriction',
+      not C.TokenAllowed(Dict.WordToIndex('dog')));
+    FreeAndNil(C);
+
+    // 1-token prompt: healing would empty it - skipped.
+    Dict.Tokenize('egg', Toks);
+    PromptLen := Length(Toks);
+    C := PrepareTokenHealing(Dict, Toks, PromptLen, Dropped);
+    AssertTrue('1-token prompt is not healed', C = nil);
+    AssertEquals('prompt len untouched', 1, PromptLen);
+
+    // Last token with no strict extension: provable no-op - skipped.
+    Dict.Tokenize('cat hat', Toks);
+    PromptLen := Length(Toks);
+    C := PrepareTokenHealing(Dict, Toks, PromptLen, Dropped);
+    AssertTrue('no strict extension - not healed', C = nil);
+    AssertEquals('prompt len untouched without extensions', 2, PromptLen);
+  finally
+    C.Free;
+    Dict.Free;
+  end;
+end;
+
+// End-to-end token healing on a rigged head whose healed and unhealed
+// first-token distributions PROVABLY differ: probabilities are ordered
+// dog > eggs > egg > egging, so an unhealed greedy run from 'cat egg' emits
+// 'dog' first, while the healed run drops 'egg', masks step 1 to the
+// egg-prefixed tokens and emits 'eggs' (the argmax of the allowed set),
+// then continues unconstrained with 'dog'. Pinned both at the token level
+// (PrepareTokenHealing + Constraint overload) and at the string level
+// (TGenerationConfig.TokenHealing through GenerateStringWithConfig).
+procedure TTestNeuralDecode.TestTokenHealingChangesFirstTokenVsUnhealed;
+const
+  SeqLen = 9;
+  Words: array[0..11] of string = ('<eos>', '<pad>', 'blue', 'cat', 'dog',
+    'egg', 'egging', 'eggs', 'fox', 'gold', 'hat', 'ice');
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Dict: TStringListInt;
+  Head: TNNetLayer;
+  UToks, HToks: TNeuralIntegerArray;
+  C: TNNetTokenHealingConstraint;
+  Config: TGenerationConfig;
+  PromptLen, Dropped, T, ULen, HLen: integer;
+  Unhealed, Healed: string;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  Session := nil;
+  C := nil;
+  Dict := TStringListInt.Create();
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+    AssertEquals('vocab matches the tiny LM', csStreamVocab,
+      Dict.GetVocabCount());
+    // Rig the head to a CONSTANT graded distribution:
+    // dog > eggs > egg > egging > everything else.
+    Head := Full.GetLastLayer();
+    for T := 0 to Head.Neurons.Count - 1 do
+    begin
+      Head.Neurons[T].Weights.Fill(0);
+      Head.Neurons[T].BiasWeight := 0;
+    end;
+    Head.Neurons[Dict.WordToIndex('dog')].BiasWeight := 5;
+    Head.Neurons[Dict.WordToIndex('eggs')].BiasWeight := 3;
+    Head.Neurons[Dict.WordToIndex('egg')].BiasWeight := 2;
+    Head.Neurons[Dict.WordToIndex('egging')].BiasWeight := 1;
+    Head.MulWeights(1.0); // no-op refresh of packed weight copies
+    Full.AddLayer(TNNetPointwiseSoftMax.Create());
+    Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+
+    // Token level. Unhealed greedy baseline: 'dog' twice.
+    Dict.Tokenize('cat egg', UToks);
+    PromptLen := Length(UToks);
+    AssertEquals('prompt tokenizes to 2 ids', 2, PromptLen);
+    ULen := GenerateTokensStreamed(Session, UToks, PromptLen, 2, SeqLen);
+    AssertEquals('unhealed generates 2 tokens', PromptLen + 2, ULen);
+    AssertEquals('unhealed first token is dog',
+      Dict.WordToIndex('dog'), UToks[PromptLen]);
+    // Healed: drop 'egg', constrain step 1 to its extensions.
+    Dict.Tokenize('cat egg', HToks);
+    PromptLen := Length(HToks);
+    C := PrepareTokenHealing(Dict, HToks, PromptLen, Dropped);
+    AssertTrue('healing constraint built', C <> nil);
+    AssertEquals('healed prompt is 1 token', 1, PromptLen);
+    HLen := GenerateTokensStreamed(Session, HToks, PromptLen, 2, SeqLen,
+      nil, nil, nil, C);
+    AssertEquals('healed generates 2 tokens', PromptLen + 2, HLen);
+    AssertEquals('healed first token is eggs (argmax of the allowed set)',
+      Dict.WordToIndex('eggs'), HToks[PromptLen]);
+    AssertTrue('healed and unhealed first tokens differ',
+      HToks[1] <> UToks[2]);
+    AssertEquals('healed second step is unconstrained again (dog)',
+      Dict.WordToIndex('dog'), HToks[PromptLen + 1]);
+
+    // String level: TGenerationConfig.TokenHealing, pinned results.
+    Config := DefaultGenerationConfig(2, SeqLen);
+    Unhealed := GenerateStringWithConfig(Session, Dict, 'cat egg', Config);
+    AssertEquals('unhealed string pinned', 'cat egg dog dog', Unhealed);
+    Config.TokenHealing := true;
+    Healed := GenerateStringWithConfig(Session, Dict, 'cat egg', Config);
+    AssertEquals('healed string pinned', 'cat eggs dog', Healed);
+    AssertTrue('healed text differs from the unhealed run',
+      Healed <> Unhealed);
+  finally
+    C.Free;
     Dict.Free;
     Session.Free;
     Twin.Free;
