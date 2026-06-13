@@ -138,6 +138,7 @@ type
     procedure TestLlamaLogitParity;
     procedure TestGGUFReaderMetadataAndTensors;
     procedure TestGGUFTensorDecodeParity;
+    procedure TestGGUFKQuantDecodeParity;
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestShardedReaderMatchesSingleFile;
@@ -3279,6 +3280,100 @@ begin
   finally
     GGUF.Free;
     ST.Free;
+  end;
+end;
+
+// GGUF k-quant (Q4_K / Q6_K) dequant-at-load parity. tools/
+// make_kquant_gguf_fixture.py packs the SAME seeded 4x256 source tensor
+// into Q4_K and Q6_K super-blocks (hand-rolled into the exact ggml byte
+// layout) plus an F32 copy, and records the gguf-package reference dequant
+// values in tiny_kquant_ref.json. This test dequantizes each k-quant
+// tensor in Pascal and asserts:
+//   (a) it matches the Python reference dequant essentially exactly (the
+//       Pascal and reference bit-unpacking must agree to f32-rounding) -
+//       this is the real bit-layout gate;
+//   (b) it stays within the quantization step of the F32 source (non-
+//       vacuous: it IS quantized, so it must differ AND stay bounded).
+procedure TTestNeuralPretrained.TestGGUFKQuantDecodeParity;
+var
+  GGUF: TNNetGGUFReader;
+  V: TNNetVolume;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefF32, DeqArr: TJSONArray;
+  DeqObj: TJSONObject;
+  Cnt: integer;
+
+  // Dequantizes kq.<TypeName>.weight and checks it against both the JSON
+  // reference dequant for that type and the F32 source, returning the max
+  // |Pascal - reference| (the bit-layout gate) via MaxVsRef.
+  procedure CheckType(const TypeName: string; SrcTol: double;
+    out MaxVsRef, MaxVsSrc: double);
+  var
+    j: integer;
+    dv, rv, sv: double;
+  begin
+    GGUF.LoadTensorFlat('kq.' + TypeName + '.weight', V);
+    AssertEquals(TypeName + ' element count', Cnt, V.Size);
+    DeqArr := TJSONArray(DeqObj.Find(TypeName));
+    AssertTrue(TypeName + ' reference dequant present', DeqArr <> nil);
+    AssertEquals(TypeName + ' reference count', Cnt, DeqArr.Count);
+    MaxVsRef := 0;
+    MaxVsSrc := 0;
+    for j := 0 to Cnt - 1 do
+    begin
+      dv := V.FData[j];
+      rv := DeqArr.Items[j].AsFloat;
+      sv := RefF32.Items[j].AsFloat;
+      if Abs(dv - rv) > MaxVsRef then MaxVsRef := Abs(dv - rv);
+      if Abs(dv - sv) > MaxVsSrc then MaxVsSrc := Abs(dv - sv);
+    end;
+    // Pascal must reproduce the reference bit-unpacking to f32 rounding.
+    AssertTrue(TypeName + ' Pascal vs reference dequant: max |diff| = ' +
+      FloatToStr(MaxVsRef) + ' must be < 1e-4', MaxVsRef < 1e-4);
+    // Non-vacuous quantization within the expected step.
+    AssertTrue(TypeName + ' vs F32 source: max |diff| = ' +
+      FloatToStr(MaxVsSrc) + ' must be in (1e-4, ' + FloatToStr(SrcTol) +
+      ')', (MaxVsSrc > 1e-4) and (MaxVsSrc < SrcTol));
+  end;
+
+var
+  M4Ref, M4Src, M6Ref, M6Src: double;
+begin
+  V := TNNetVolume.Create;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_kquant_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefF32 := TJSONArray(TJSONObject(RefRoot).Find('ref_f32'));
+    DeqObj := TJSONObject(TJSONObject(RefRoot).Find('dequant'));
+    // 'dequant' is a JSON object keyed by type name.
+    AssertTrue('ref_f32 present', RefF32 <> nil);
+    Cnt := RefF32.Count;
+    AssertEquals('fixture element count', 4 * 256, Cnt);
+
+    GGUF := TNNetGGUFReader.Create(FixturePath('tiny_kquant.gguf'));
+    try
+      // dtype + ggml type id round-trip.
+      AssertEquals('Q4_K dtype', 'Q4_K', GGUF.GetDType('kq.Q4_K.weight'));
+      AssertTrue('Q4_K ggml type',
+        GGUF.TensorGGMLType('kq.Q4_K.weight') = GGML_TYPE_Q4_K);
+      AssertEquals('Q6_K dtype', 'Q6_K', GGUF.GetDType('kq.Q6_K.weight'));
+      AssertTrue('Q6_K ggml type',
+        GGUF.TensorGGMLType('kq.Q6_K.weight') = GGML_TYPE_Q6_K);
+
+      // 4-bit step over data spanning ~+-6 => sub-unit error.
+      CheckType('Q4_K', 1.5, M4Ref, M4Src);
+      // 6-bit is finer.
+      CheckType('Q6_K', 0.6, M6Ref, M6Src);
+    finally
+      GGUF.Free;
+    end;
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    V.Free;
   end;
 end;
 

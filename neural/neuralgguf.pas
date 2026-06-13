@@ -28,7 +28,13 @@ unit neuralgguf;
 //        each block an f16 scale d + 32 int8 quants, x = d * q. Decoded
 //        (dequantized) to FP32 on load - the int8-direct path into
 //        TNNet.QuantizeWeightsInt8 storage is a possible follow-up.
-// Anything else (Q4_K & friends) raises EGGUFError with the type name.
+//   Q4_K (type id 12) / Q6_K (type id 14) - the two members of the
+//        dominant Q4_K_M community mix. ggml k-quant 256-element
+//        super-blocks (8 sub-blocks of 32): a block-level f16 d (plus a
+//        f16 d_min for Q4_K), 6-bit packed sub-scales/sub-mins and 4/6-bit
+//        packed quants. Dequantized to FP32 on load, mirroring ggml's
+//        reference dequant_row_q4_K / dequant_row_q6_K bit-unpacking.
+// Anything else (Q2_K/Q3_K/Q5_K/...) raises EGGUFError with the type name.
 //
 // Importer hooks (used by BuildLlamaFromGGUF in neuralpretrained.pas):
 //   RenameTensor          - GGUF names tensors per the ggml convention
@@ -71,10 +77,24 @@ const
   GGML_TYPE_F32  = 0;
   GGML_TYPE_F16  = 1;
   GGML_TYPE_Q8_0 = 8;
+  GGML_TYPE_Q4_K = 12;
+  GGML_TYPE_Q6_K = 14;
 
   // Q8_0 block geometry: 32 elements stored as f16 scale + 32 int8.
   GGUF_Q8_0_BLOCK_ELEMS = 32;
   GGUF_Q8_0_BLOCK_BYTES = 34;
+
+  // k-quant super-block geometry. Every k-quant packs 256 elements
+  // (QK_K) into one super-block of 8 sub-blocks of 32. Q4_K and Q6_K are
+  // the two members of the dominant Q4_K_M mix.
+  GGUF_QK_K            = 256;
+  // block_q4_K = 144 bytes: f16 d, f16 d_min, 12 bytes of 6-bit packed
+  // sub-scales/sub-mins, then 128 bytes of 4-bit quants (256 nibbles).
+  GGUF_Q4_K_BLOCK_BYTES = 144;
+  GGUF_K_SCALE_SIZE     = 12;
+  // block_q6_K = 210 bytes: 128 bytes ql (4-bit low), 64 bytes qh (2-bit
+  // high), 16 int8 group scales, then f16 d.
+  GGUF_Q6_K_BLOCK_BYTES = 210;
 
 type
   EGGUFError = class(ESafeTensorsError);
@@ -200,7 +220,139 @@ begin
     GGML_TYPE_Q8_0:
       Result := (NumElements div GGUF_Q8_0_BLOCK_ELEMS) *
         GGUF_Q8_0_BLOCK_BYTES;
+    GGML_TYPE_Q4_K:
+      Result := (NumElements div GGUF_QK_K) * GGUF_Q4_K_BLOCK_BYTES;
+    GGML_TYPE_Q6_K:
+      Result := (NumElements div GGUF_QK_K) * GGUF_Q6_K_BLOCK_BYTES;
     else Result := 0;
+  end;
+end;
+
+// Unpacks the 12 packed bytes of a Q4_K super-block into the 8 6-bit
+// sub-block scales (Sc) and 8 6-bit sub-block mins (Mn). This mirrors
+// ggml's get_scale_min_k4 EXACTLY. The 12 bytes hold, per the layout
+// (groups d=bytes[0..3], m=bytes[4..7], m_d=bytes[8..11]):
+//   sc[0..3] = d & 0x3F
+//   sc[4..7] = (m_d & 0x0F) | ((d >> 2) & 0x30)
+//   mn[0..3] = m & 0x3F
+//   mn[4..7] = (m_d >> 4) | ((m >> 2) & 0x30)
+procedure DequantizeQ4KScaleMin(const PackedSc: PByte;
+  out Sc, Mn: array of byte);
+var
+  j: integer;
+  d, m, m_d: byte;
+begin
+  for j := 0 to 3 do
+  begin
+    d   := PackedSc[j];
+    m   := PackedSc[j + 4];
+    m_d := PackedSc[j + 8];
+    Sc[j]     := d and $3F;
+    Sc[j + 4] := (m_d and $0F) or ((d shr 2) and $30);
+    Mn[j]     := m and $3F;
+    Mn[j + 4] := (m_d shr 4) or ((m shr 2) and $30);
+  end;
+end;
+
+// Dequantizes a Q4_K tensor (NumBlocks super-blocks of 256) from Raw into
+// Dest in flat row-major order. Block layout (144 bytes): f16 d, f16
+// d_min, 12 packed scale bytes, then 128 bytes of 4-bit quants. The 256
+// nibbles are 4 byte-chunks of 32; chunk c carries sub-block 2c in the low
+// nibble and sub-block 2c+1 in the high nibble. Reconstruction per
+// sub-block j (0..7): x = d*Sc[j]*q - d_min*Mn[j], q in [0,15].
+procedure DequantizeQ4K(const Raw: PByte; NumBlocks: Int64;
+  Dest: PSingle);
+var
+  b, j, c, i: Int64;
+  Base: PByte;
+  d, dmin, dsc, dm: single;
+  Sc, Mn: array[0..7] of byte;
+  q: byte;
+  Outp: PSingle;
+begin
+  for b := 0 to NumBlocks - 1 do
+  begin
+    Base := Raw + b * GGUF_Q4_K_BLOCK_BYTES;
+    d    := DecodeF16(PWord(Base)^);
+    dmin := DecodeF16(PWord(Base + 2)^);
+    DequantizeQ4KScaleMin(Base + 4, Sc, Mn);
+    Outp := Dest + b * GGUF_QK_K;
+    // Sub-blocks come in low/high-nibble pairs sharing one 32-byte chunk.
+    for c := 0 to 3 do
+    begin
+      // even sub-block: low nibble; odd sub-block: high nibble.
+      j := 2 * c;
+      dsc := d * Sc[j];
+      dm  := dmin * Mn[j];
+      for i := 0 to 31 do
+      begin
+        q := (Base + 16 + c * 32 + i)^ and $0F;
+        Outp[j * 32 + i] := dsc * q - dm;
+      end;
+      j := 2 * c + 1;
+      dsc := d * Sc[j];
+      dm  := dmin * Mn[j];
+      for i := 0 to 31 do
+      begin
+        q := ((Base + 16 + c * 32 + i)^ shr 4) and $0F;
+        Outp[j * 32 + i] := dsc * q - dm;
+      end;
+    end;
+  end;
+end;
+
+// Dequantizes a Q6_K tensor (NumBlocks super-blocks of 256) from Raw into
+// Dest in flat row-major order. Block layout (210 bytes): 128 bytes ql
+// (4-bit low), 64 bytes qh (2-bit high), 16 int8 group scales, then f16 d.
+// The 6-bit quant q = (ql | (qh << 4)) - 32 in [-32,31]; there are 16
+// scale groups of 16 elements (scale group g = element index div 16).
+// Reconstruction: x = d * scales[g] * q.
+//
+// ql layout: 2 byte-chunks of 64; chunk c carries sub-block 2c (low
+// nibble) and sub-block 2c+1 (high nibble), sub-blocks 64 wide.
+// qh layout: 2 byte-chunks of 32; chunk c packs four 32-wide sub-blocks at
+// bit offsets 0,2,4,6.
+procedure DequantizeQ6K(const Raw: PByte; NumBlocks: Int64;
+  Dest: PSingle);
+var
+  b, i, g: Int64;
+  Base, QlPtr, QhPtr: PByte;
+  d: single;
+  Scales: PShortInt;
+  Outp: PSingle;
+  ql, qh, idx, qv: integer;
+begin
+  for b := 0 to NumBlocks - 1 do
+  begin
+    Base := Raw + b * GGUF_Q6_K_BLOCK_BYTES;
+    QlPtr := Base;
+    QhPtr := Base + 128;
+    Scales := PShortInt(Base + 192);
+    d := DecodeF16(PWord(Base + 208)^);
+    Outp := Dest + b * GGUF_QK_K;
+    // Walk the 256 element indices; recompute each byte/bit position from
+    // ggml's ql reshape((-1,1,64))>>[0,4] and qh reshape((-1,1,32))>>
+    // [0,2,4,6] super-block decomposition (the two 128-element halves
+    // n in {0,128} of dequantize_row_q6_K). Verified against the gguf
+    // package's dequantize_blocks reshape semantics:
+    //   ql byte  = (i div 128)*64 + (i mod 64); low nibble when (i mod 128)
+    //              < 64, else high nibble.
+    //   qh byte  = (i div 128)*32 + (i mod 32); 2-bit field at shift
+    //              2*((i mod 128) div 32).
+    for i := 0 to GGUF_QK_K - 1 do
+    begin
+      ql := (QlPtr + ((i div 128) * 64 + (i mod 64)))^;
+      if (i mod 128) < 64 then
+        ql := ql and $0F
+      else
+        ql := (ql shr 4) and $0F;
+      idx := (i div 128) * 32 + (i mod 32);
+      qh := (QhPtr + idx)^;
+      qh := (qh shr (2 * ((i mod 128) div 32))) and $03;
+      qv := (ql or (qh shl 4)) - 32;
+      g := i div 16;
+      Outp[i] := d * Scales[g] * qv;
+    end;
   end;
 end;
 
@@ -421,6 +573,14 @@ begin
         'gguf: tensor "%s" is Q8_0 but its contiguous dimension %d is not ' +
         'a multiple of the block size %d: %s',
         [FTensors[i].Name, Dims[0], GGUF_Q8_0_BLOCK_ELEMS, FFileName]);
+    if ((FGGMLTypes[i] = GGML_TYPE_Q4_K) or
+        (FGGMLTypes[i] = GGML_TYPE_Q6_K)) and
+       ((Dims[0] mod GGUF_QK_K) <> 0) then
+      raise EGGUFError.CreateFmt(
+        'gguf: tensor "%s" is %s but its contiguous dimension %d is not a ' +
+        'multiple of the k-quant super-block size %d: %s',
+        [FTensors[i].Name, GGMLTypeName(FGGMLTypes[i]), Dims[0],
+         GGUF_QK_K, FFileName]);
     Stream.ReadBuffer(U64, 8); // offset relative to the data section
     FTensors[i].DataBegin := Int64(U64);
     ByteSize := GGMLByteSize(FGGMLTypes[i], NumElements);
@@ -685,10 +845,12 @@ begin
       'gguf: tensor "%s" not found in %s', [pName, FFileName]);
   GGMLType := FGGMLTypes[Idx];
   if (GGMLType <> GGML_TYPE_F32) and (GGMLType <> GGML_TYPE_F16) and
-     (GGMLType <> GGML_TYPE_Q8_0) then
+     (GGMLType <> GGML_TYPE_Q8_0) and (GGMLType <> GGML_TYPE_Q4_K) and
+     (GGMLType <> GGML_TYPE_Q6_K) then
     raise EGGUFError.CreateFmt(
       'gguf: tensor "%s" has unsupported ggml dtype %s (supported: F32, ' +
-      'F16, Q8_0): %s', [pName, GGMLTypeName(GGMLType), FFileName]);
+      'F16, Q8_0, Q4_K, Q6_K): %s',
+      [pName, GGMLTypeName(GGMLType), FFileName]);
   NumElements := ElementCount(pName);
   if NumElements > High(integer) then
     raise EGGUFError.CreateFmt(
@@ -738,6 +900,20 @@ begin
           Inc(QuantPtr);
         end;
       end;
+    end;
+    GGML_TYPE_Q4_K:
+    begin
+      // k-quant super-blocks of 256 along the contiguous axis (a multiple
+      // of 256, validated at parse), so a sequential sweep decodes the
+      // flat row-major order. Each block: f16 d, f16 d_min, 12 packed
+      // 6-bit sub-scales/sub-mins, 128 bytes of 4-bit quants.
+      NumBlocks := NumElements div GGUF_QK_K;
+      DequantizeQ4K(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
+    end;
+    GGML_TYPE_Q6_K:
+    begin
+      NumBlocks := NumElements div GGUF_QK_K;
+      DequantizeQ6K(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
     end;
   end;
   // Registered q/k projections: undo llama.cpp's per-head interleaved-
