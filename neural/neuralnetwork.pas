@@ -11015,6 +11015,21 @@ type
       // TNNetLayerNorm for the LayerNorm variant).
       function AddSandwichNormResidual(pSublayers: array of TNNetLayer;
         NormClass: TNNetLayerClass = nil): TNNetLayer;
+      // Output-norm residual block (OLMo-2-style reordered post-norm):
+      //   y = x + Norm(Sublayer(x))
+      // i.e. the sublayer runs on the RAW input (no pre-norm at all) and its
+      // output is normalized BEFORE the residual add - the third placement
+      // beside AddPreNormResidual (y = x + Sublayer(Norm(x))) and
+      // AddPostNormResidual (y = Norm(Sublayer(x) + x)); it is
+      // AddSandwichNormResidual minus the entry norm. This is the OLMo-2
+      // decoder convention (HF post_attention_layernorm /
+      // post_feedforward_layernorm with NO input_layernorm). pSublayers is
+      // the caller-provided sublayer stack; its output shape MUST match the
+      // block input shape so the residual sum is valid. Returns the
+      // residual-sum layer. NormClass selects the normalization layer class;
+      // nil defaults to TNNetRMSNorm (OLMo-2 uses RMSNorm).
+      function AddOutputNormResidual(pSublayers: array of TNNetLayer;
+        NormClass: TNNetLayerClass = nil): TNNetLayer;
       // Gated residual block:  y = x + GatedResidual(Sublayer(x)).
       // Unlike the norm-based siblings above, this block applies NO
       // normalization. Instead it inserts a TNNetGatedResidual after the
@@ -84941,6 +84956,20 @@ begin
   if NormClass = nil then NormClass := TNNetRMSNorm;
   BranchInput := GetLastLayer();
   AddLayer( NormClass.Create() );
+  AddLayer(pSublayers);
+  AddLayer( NormClass.Create() );
+  Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );
+end;
+
+function TNNet.AddOutputNormResidual(pSublayers: array of TNNetLayer;
+  NormClass: TNNetLayerClass = nil): TNNetLayer;
+var
+  BranchInput: TNNetLayer;
+begin
+  // y = x + Norm(Sublayer(x))  (OLMo-2-style reordered post-norm: NO entry
+  // norm; the sublayer output is normalized BEFORE the residual add).
+  if NormClass = nil then NormClass := TNNetRMSNorm;
+  BranchInput := GetLastLayer();
   AddLayer(pSublayers);
   AddLayer( NormClass.Create() );
   Result := AddLayer( TNNetSum.Create([GetLastLayer(), BranchInput]) );

@@ -34,3 +34,6 @@ examples/SimpleNLP/datasets/
 examples/SimpleNLP/temp.csv
 examples/SimpleNLP/*.nn
 examples/SimpleNLP/decode_bakeoff_phase*.log
+
+# Downloaded HF model checkpoints (large binaries, never commit)
+.olmo2_1b/

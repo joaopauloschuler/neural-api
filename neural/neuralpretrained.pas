@@ -17,6 +17,12 @@ unit neuralpretrained;
 //     [head_dim] shared across heads, plus an optionally DECOUPLED
 //     head_dim where num_heads*head_dim <> hidden_size) -
 //     BuildQwen3FromSafeTensors.
+//   - OLMo-2 (model_type "olmo2", the fully-open AllenAI family; the Llama
+//     tensor layout with REORDERED post-norm - RMSNorm on the sublayer
+//     OUTPUT before the residual add, x + Norm(Attn(x)), NO input_layernorm
+//     - and q/k RMSNorm over the FULL flattened projection width BEFORE the
+//     head split + RoPE, unlike Qwen3's per-head placement) -
+//     BuildOlmo2FromSafeTensors.
 //   - Gemma 1 (the Llama skeleton with three LOAD-TIME deltas: GeGLU MLP
 //     - gated tanh-GELU, TNNetGEGLU instead of TNNetSwiGLU; zero-centered
 //     RMSNorm - gains stored as 1+w; embedding output scaled by
@@ -672,11 +678,24 @@ type
                                // only the first int(head_dim*factor)
                                // channels of each q/k head, the tail passes
                                // through (Phi-4-mini: 0.75); 0 or 1 = full
+    // ---- OLMo-2 deltas (all default off for the other families) ----
+    PostNormReordered: boolean;// REORDERED post-norm: RMSNorm on the SUBLAYER
+                               // OUTPUT before the residual add -
+                               // x + Norm(Attn(x)) - with NO input_layernorm
+                               // and NO pre-FFN norm (HF keys
+                               // post_attention_layernorm /
+                               // post_feedforward_layernorm)
+    QKNormFullWidth: boolean;  // RMSNorm over the FULL flattened q/k
+                               // projection width (num_heads*head_dim /
+                               // num_kv_heads*head_dim) AFTER the projection
+                               // and BEFORE the head split + RoPE - distinct
+                               // from the Qwen3/Gemma-3 PER-HEAD placement
+                               // (QKNorm)
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
 // Reads a HF Llama-family config.json (model_type 'llama', 'mistral',
-// 'qwen2', 'qwen3', 'gemma', 'gemma2', 'gemma3_text' or 'phi3').
+// 'qwen2', 'qwen3', 'gemma', 'gemma2', 'gemma3_text', 'phi3' or 'olmo2').
 // Required: hidden_size, intermediate_size,
 // num_hidden_layers, num_attention_heads, vocab_size,
 // max_position_embeddings. Defaults: num_key_value_heads =
@@ -844,6 +863,32 @@ function BuildQwen3FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildQwen3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// OLMo-2 (model_type "olmo2", e.g. allenai/OLMo-2-0425-1B - the fully-open
+// weights+data+code family): the Llama tensor layout (SwiGLU, RoPE, no
+// biases) with TWO architectural deltas:
+// (a) REORDERED post-norm - RMSNorm applied to the SUBLAYER OUTPUT before
+//     the residual add, x + Norm(Attn(x)) / x + Norm(MLP(x)) (HF keys
+//     post_attention_layernorm / post_feedforward_layernorm; there is NO
+//     input_layernorm and no pre-FFN norm) - a third placement beside the
+//     pre-norm (Llama) and sandwich-norm (Gemma-2) conventions (see
+//     TNNet.AddOutputNormResidual for the builder form);
+// (b) q/k RMSNorm over the FULL flattened projection width
+//     (num_heads*head_dim / num_kv_heads*head_dim) AFTER the projection and
+//     BEFORE the head split + RoPE (HF keys q_norm / k_norm) - distinct
+//     from the Qwen3/Gemma-3 PER-HEAD placement whose RMS statistic spans
+//     head_dim channels only.
+// The final norm is the standard model.norm and the tokenizer is a stock
+// GPT-NeoX-style BPE tokenizer.json (TNeuralHFTokenizer). Thin wrappers
+// over the Llama path that ASSERT the config's model_type is 'olmo2'.
+function BuildOlmo2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildOlmo2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -3054,12 +3099,13 @@ begin
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
-       (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') then
+       (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') and
+       (ModelType <> 'olmo2') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "gemma", ' +
-        '"gemma2", "gemma3_text" and "phi3" are supported here (see ' +
-        'BuildFromPretrained for the full dispatch; multimodal "gemma3" ' +
-        'configs are out of scope - use a TEXT-ONLY gemma3_text ' +
+        '"gemma2", "gemma3_text", "phi3" and "olmo2" are supported here ' +
+        '(see BuildFromPretrained for the full dispatch; multimodal ' +
+        '"gemma3" configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
     Result.ModelType := ModelType;
     Result.HiddenSize := RequiredInt('hidden_size');
@@ -3108,6 +3154,8 @@ begin
     Result.RopeLocalTheta := 0;
     Result.FusedQKVGateUp := False;
     Result.PartialRotaryFactor := 1.0;
+    Result.PostNormReordered := False;
+    Result.QKNormFullWidth := False;
     if ModelType = 'mistral' then
     begin
       // Many Mistral configs ship sliding_window=null (full attention).
@@ -3298,6 +3346,28 @@ begin
           'standard YaRN) - the 128k Phi-3 variants are not wired into ' +
           'TNNetRotaryEmbedding; use a 4k/8k checkpoint.');
     end
+    else if ModelType = 'olmo2' then
+    begin
+      // OLMo-2 deltas (see BuildOlmo2FromSafeTensors): reordered post-norm
+      // (x + Norm(Attn(x)), NO input_layernorm) and full-width q/k RMSNorm
+      // before the head split + RoPE. rms_norm_eps defaults to 1e-5 (the
+      // HF Olmo2Config default). attention_bias=true would put biases on
+      // ALL FOUR projections including o_proj (unlike Qwen2's q/k/v-only
+      // QKVBias) - no released OLMo-2 checkpoint uses it, so it is
+      // rejected rather than half-wired.
+      Result.PostNormReordered := True;
+      Result.QKNormFullWidth := True;
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5);
+      if Obj.Get('attention_bias', False) then
+        ImportError('Llama import: OLMo-2 attention_bias=true (biases on ' +
+          'q/k/v AND o_proj) is not wired into this importer - every ' +
+          'released OLMo-2 checkpoint is bias-free.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: OLMo-2 hidden_act "' + HiddenAct +
+          '" is not supported - every released olmo2 checkpoint uses ' +
+          '"silu" (SwiGLU).');
+    end
     else // llama
       Result.QKVBias := Obj.Get('attention_bias', False);
     Result.Prefix := ''; // detected from the checkpoint by the builder
@@ -3358,6 +3428,10 @@ begin
       FloatToStr(Config.RopeLocalTheta);
   if Config.FusedQKVGateUp then
     Result := Result + ', fused_qkv_gate_up=true';
+  if Config.PostNormReordered then
+    Result := Result + ', post_norm_reordered=true';
+  if Config.QKNormFullWidth then
+    Result := Result + ', qk_norm_full_width=true';
   if (Config.PartialRotaryFactor > 0) and
      (Config.PartialRotaryFactor < 1) then
     Result := Result + ', partial_rotary=' +
@@ -3569,14 +3643,62 @@ begin
   end;
 end;
 
+// Loads a HF FULL-WIDTH q/k RMSNorm gain [num_heads*head_dim] (OLMo-2
+// QKNormFullWidth: ONE norm over the whole flattened projection output,
+// applied BEFORE the head split + RoPE) into a single TNNetTokenRMSNorm.
+// The q/k projection ROWS were loaded with the per-head rotate_half ->
+// interleaved-pair permutation, so each head's HeadDim-wide gain slice is
+// permuted the same way (the RMS statistic itself is permutation-invariant,
+// only the per-channel gains must follow their channels).
+procedure LoadLlamaFullWidthQKNormWeights(Reader: TNNetSafeTensorsReader;
+  NormLayer: TNNetLayer; const WName: string; Width, HeadDim: integer;
+  GainOffset: TNeuralFloat = 0);
+var
+  Tmp: TNNetVolume;
+  HeadCnt, j, TargetIdx, HalfDim: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Llama import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 1) or
+     (Reader.DimSize(WName, 0) <> Width) then
+    ImportError('Llama import: "' + WName + '" must have shape [' +
+      IntToStr(Width) + '], got ' + Reader.ShapeAsString(WName));
+  HalfDim := HeadDim div 2;
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for HeadCnt := 0 to (Width div HeadDim) - 1 do
+    begin
+      for j := 0 to HeadDim - 1 do
+      begin
+        if j < HalfDim then
+          TargetIdx := 2 * j
+        else
+          TargetIdx := 2 * (j - HalfDim) + 1;
+        NormLayer.Neurons[0].Weights.FData[HeadCnt * HeadDim + TargetIdx] :=
+          GainOffset + Tmp.FData[HeadCnt * HeadDim + j]; // gain
+      end;
+    end;
+    NormLayer.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+end;
+
 type
   TLlamaBlockLayers = record
     AttnNorm, QProj, KProj, VProj, OProj, MlpNorm, GateUp, Down: TNNetLayer;
     // Sandwich norms (Gemma-2 SandwichNorm): post-attention and
     // post-feedforward RMSNorms INSIDE the residual branches; nil otherwise.
+    // OLMo-2's PostNormReordered REUSES the two fields (its
+    // post_attention_layernorm / post_feedforward_layernorm sit in the same
+    // place - the sublayer output, before the residual add - it just drops
+    // the entry norms: AttnNorm and MlpNorm stay nil).
     PostAttnNorm, PostMlpNorm: TNNetLayer;
     // Per-head q/k RMSNorm copies (Qwen3 QKNorm); empty otherwise.
     QNorms, KNorms: array of TNNetLayer;
+    // FULL-WIDTH q/k RMSNorm (OLMo-2 QKNormFullWidth); nil otherwise.
+    QNormFull, KNormFull: TNNetLayer;
   end;
 
 // The Llama builder core: builds the net and loads every weight from the
@@ -3595,6 +3717,7 @@ var
   Blocks: array of TLlamaBlockLayers;
   EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
   BranchInput, NormedSource: TNNetLayer;
+  QSource, KSource: TNNetLayer;
   QSlice, KSlice, VSlice, HeadPack, RotSlice, PassSlice: TNNetLayer;
   KRotated, VSlices, HeadOutputs: array of TNNetLayer;
   SliceChannels, RotChannels, PassChannels: array of integer;
@@ -3666,6 +3789,18 @@ begin
         ImportError('Llama import: internal error - partial rotary ' +
           'combined with per-head q/k RMSNorm is not wired (no family ' +
           'uses both).');
+      if Config.QKNormFullWidth and (RotaryDims < HeadDim) then
+        ImportError('Llama import: internal error - partial rotary ' +
+          'combined with full-width q/k RMSNorm is not wired (no family ' +
+          'uses both).');
+      if Config.QKNormFullWidth and Config.QKNorm then
+        ImportError('Llama import: internal error - per-head (QKNorm) and ' +
+          'full-width (QKNormFullWidth) q/k RMSNorm are mutually ' +
+          'exclusive.');
+      if Config.PostNormReordered and Config.SandwichNorm then
+        ImportError('Llama import: internal error - PostNormReordered ' +
+          '(OLMo-2, no entry norms) and SandwichNorm (Gemma-2, entry + ' +
+          'exit norms) are mutually exclusive.');
       QWidth := Config.NumHeads * HeadDim;
       KVWidth := Config.NumKVHeads * HeadDim;
       GroupSize := Config.NumHeads div Config.NumKVHeads;
@@ -3761,15 +3896,44 @@ begin
           LayerRoPEScaling := Config.RopeScaling;
         end;
         BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].AttnNorm :=
-          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
-        NormedSource := NN.GetLastLayer();
+        // Config.PostNormReordered (OLMo-2): NO input_layernorm - the
+        // attention sub-block reads the raw residual stream and the RMSNorm
+        // moves to the SUBLAYER OUTPUT (PostAttnNorm below):
+        // x := x + Norm(Attn(x)).
+        if Config.PostNormReordered then
+          NormedSource := BranchInput
+        else
+        begin
+          Blocks[BlockCnt].AttnNorm :=
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+          NormedSource := NN.GetLastLayer();
+        end;
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        // Config.QKNormFullWidth (OLMo-2): ONE RMSNorm over the FULL
+        // flattened q/k projection width (num_heads*head_dim /
+        // num_kv_heads*head_dim) AFTER the projection and BEFORE the head
+        // split + RoPE (HF modeling_olmo2: q_norm(q_proj(x)) over the whole
+        // width, then view(heads, head_dim) and apply_rotary_pos_emb) -
+        // distinct from the Qwen3/Gemma-3 PER-HEAD QKNorm whose RMS
+        // statistic spans head_dim channels only.
+        QSource := Blocks[BlockCnt].QProj;
+        KSource := Blocks[BlockCnt].KProj;
+        if Config.QKNormFullWidth then
+        begin
+          Blocks[BlockCnt].QNormFull := NN.AddLayerAfter(
+            TNNetTokenRMSNorm.Create(Config.RmsNormEps),
+            Blocks[BlockCnt].QProj);
+          QSource := Blocks[BlockCnt].QNormFull;
+          Blocks[BlockCnt].KNormFull := NN.AddLayerAfter(
+            TNNetTokenRMSNorm.Create(Config.RmsNormEps),
+            Blocks[BlockCnt].KProj);
+          KSource := Blocks[BlockCnt].KNormFull;
+        end;
         // Config.QKNorm (Qwen3, Gemma-3): per-head RMSNorm on each q/k
         // slice AFTER the projection and BEFORE RoPE (the HF
         // modeling_qwen3 AND modeling_gemma3 ordering, both verified:
@@ -3801,18 +3965,18 @@ begin
             for d := 0 to HeadDim - RotaryDims - 1 do
               PassChannels[d] := KVHeadCnt * HeadDim + RotaryDims + d;
             RotSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(RotChannels), Blocks[BlockCnt].KProj);
+              TNNetSplitChannels.Create(RotChannels), KSource);
             RotSlice := NN.AddLayerAfter(
               CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), RotSlice);
             PassSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(PassChannels), Blocks[BlockCnt].KProj);
+              TNNetSplitChannels.Create(PassChannels), KSource);
             KRotated[KVHeadCnt] := NN.AddLayer(
               TNNetDeepConcat.Create([RotSlice, PassSlice]) );
           end
           else
           begin
             KSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
+              TNNetSplitChannels.Create(SliceChannels), KSource);
             if Config.QKNorm then
             begin
               Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
@@ -3838,18 +4002,18 @@ begin
             for d := 0 to HeadDim - RotaryDims - 1 do
               PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
             RotSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(RotChannels), Blocks[BlockCnt].QProj);
+              TNNetSplitChannels.Create(RotChannels), QSource);
             RotSlice := NN.AddLayerAfter(
               CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), RotSlice);
             PassSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(PassChannels), Blocks[BlockCnt].QProj);
+              TNNetSplitChannels.Create(PassChannels), QSource);
             QSlice := NN.AddLayer(
               TNNetDeepConcat.Create([RotSlice, PassSlice]) );
           end
           else
           begin
             QSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+              TNNetSplitChannels.Create(SliceChannels), QSource);
             if Config.QKNorm then
             begin
               Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
@@ -3878,10 +4042,12 @@ begin
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
-        // Config.SandwichNorm (Gemma-2): post-attention RMSNorm INSIDE the
-        // residual branch (HF post_attention_layernorm normalizes the
-        // attention output BEFORE the residual add).
-        if Config.SandwichNorm then
+        // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
+        // post-attention RMSNorm INSIDE the residual branch (HF
+        // post_attention_layernorm normalizes the attention output BEFORE
+        // the residual add). OLMo-2 drops the entry norm above, making this
+        // the block's ONLY attention norm: x + Norm(Attn(x)).
+        if Config.SandwichNorm or Config.PostNormReordered then
           Blocks[BlockCnt].PostAttnNorm :=
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
@@ -3893,8 +4059,12 @@ begin
         // neurons I..2I-1 (see LoadLlamaLinearWeights calls below) for
         // either activation.
         BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].MlpNorm :=
-          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        // Config.PostNormReordered (OLMo-2): no pre-FFN norm either - the
+        // MLP reads the raw residual stream and PostMlpNorm (below) closes
+        // the branch: x := x + Norm(MLP(x)).
+        if not Config.PostNormReordered then
+          Blocks[BlockCnt].MlpNorm :=
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         Blocks[BlockCnt].GateUp := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
         if Config.GegluFFN then
@@ -3903,9 +4073,10 @@ begin
           NN.AddLayer( TNNetSwiGLU.Create() );
         Blocks[BlockCnt].Down := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
-        // Config.SandwichNorm (Gemma-2): post-feedforward RMSNorm INSIDE
-        // the residual branch (HF post_feedforward_layernorm).
-        if Config.SandwichNorm then
+        // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
+        // post-feedforward RMSNorm INSIDE the residual branch (HF
+        // post_feedforward_layernorm).
+        if Config.SandwichNorm or Config.PostNormReordered then
           Blocks[BlockCnt].PostMlpNorm :=
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
@@ -3944,7 +4115,7 @@ begin
         QScale := Sqrt(HeadDim / Config.QueryPreAttnScalar)
       else
         QScale := 1.0;
-      if Config.QKNorm then
+      if Config.QKNorm or Config.QKNormFullWidth then
         QProjScale := 1.0
       else
         QProjScale := QScale;
@@ -3996,10 +4167,15 @@ begin
       for BlockCnt := 0 to Config.NumLayers - 1 do
       begin
         BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
-        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].AttnNorm,
-          BlockPrefix + 'input_layernorm.weight', Config.HiddenSize,
-          NormGainOffset);
-        MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        // Config.PostNormReordered (OLMo-2): there is NO input_layernorm -
+        // the block's two norms load into the post-norms below.
+        if not Config.PostNormReordered then
+        begin
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].AttnNorm,
+            BlockPrefix + 'input_layernorm.weight', Config.HiddenSize,
+            NormGainOffset);
+          MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        end;
         // q_proj/k_proj rows are PERMUTED per head for the rotate_half
         // convention (RotaryHeadDim); v_proj/o_proj load straight.
         // Config.QKVBias (Qwen2) loads q/k/v biases too - permuted along
@@ -4060,6 +4236,24 @@ begin
               NormGainOffset);
             MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
           end;
+          // OLMo-2 full-width q/k RMSNorm: ONE [num_heads*head_dim] /
+          // [num_kv_heads*head_dim] gain per block, loaded with the same
+          // per-head rotate_half permutation as the q/k projection ROWS
+          // (the RMS statistic is permutation-invariant; the per-channel
+          // gains must follow their permuted channels).
+          if Config.QKNormFullWidth then
+          begin
+            LoadLlamaFullWidthQKNormWeights(Reader,
+              Blocks[BlockCnt].QNormFull,
+              BlockPrefix + 'self_attn.q_norm.weight', QWidth, HeadDim,
+              NormGainOffset);
+            MarkConsumed(BlockPrefix + 'self_attn.q_norm.weight');
+            LoadLlamaFullWidthQKNormWeights(Reader,
+              Blocks[BlockCnt].KNormFull,
+              BlockPrefix + 'self_attn.k_norm.weight', KVWidth, HeadDim,
+              NormGainOffset);
+            MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
+          end;
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
             BlockPrefix + 'self_attn.k_proj.weight',
             Config.HiddenSize, KVWidth, 0, -1, HeadDim, KBiasName);
@@ -4089,6 +4283,21 @@ begin
             BlockPrefix + 'pre_feedforward_layernorm.weight',
             Config.HiddenSize, NormGainOffset);
           MarkConsumed(BlockPrefix + 'pre_feedforward_layernorm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostMlpNorm,
+            BlockPrefix + 'post_feedforward_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_feedforward_layernorm.weight');
+        end
+        else if Config.PostNormReordered then
+        begin
+          // OLMo-2 reordered post-norms: post_attention_layernorm closes
+          // the attention branch and post_feedforward_layernorm the FFN
+          // branch (both INSIDE the residual, before the add); there are
+          // no entry norms.
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostAttnNorm,
+            BlockPrefix + 'post_attention_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
           LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostMlpNorm,
             BlockPrefix + 'post_feedforward_layernorm.weight',
             Config.HiddenSize, NormGainOffset);
@@ -7256,6 +7465,25 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildOlmo2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'olmo2', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildOlmo2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildOlmo2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -12794,7 +13022,8 @@ begin
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
           (ModelType = 'gemma') or (ModelType = 'gemma2') or
-          (ModelType = 'gemma3_text') or (ModelType = 'phi3') then
+          (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
+          (ModelType = 'olmo2') then
     // 'gemma' (architectures ["GemmaForCausalLM"]) rides the same path: the
     // config reader raises the Gemma flags (GeGLU FFN, zero-centered
     // RMSNorm, sqrt(d) embedding scale) from model_type alone. 'gemma2'
@@ -12806,7 +13035,9 @@ begin
     // with per-layer-type RoPE theta. 'phi3' (["Phi3ForCausalLM"],
     // Phi-3-mini / Phi-4-mini) raises the fused qkv_proj/gate_up_proj and
     // partial-rotary flags the same way (the 128k longrope variants are
-    // rejected by the config reader).
+    // rejected by the config reader). 'olmo2' (["Olmo2ForCausalLM"]) raises
+    // the reordered post-norm (x + Norm(Attn(x)), no input_layernorm) and
+    // full-width q/k RMSNorm flags.
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or

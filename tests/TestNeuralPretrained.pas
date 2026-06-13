@@ -149,6 +149,7 @@ type
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
+    procedure TestOlmo2LogitParity;
     procedure TestRWKVLogitParity;
     procedure TestMambaLogitParity;
     procedure TestBloomLogitParity;
@@ -3798,6 +3799,77 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gemma3_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the OLMo-2 import target (HF model_type "olmo2", architectures
+// ["Olmo2ForCausalLM"], the allenai/OLMo-2-0425-1B family):
+// tests/fixtures/tiny_olmo2.* is a pico randomly-initialized HF
+// Olmo2ForCausalLM (2 layers, 2 query heads sharing 1 kv head, hidden 8,
+// vocab 13, UNTIED lm_head) exercising the two OLMo-2 deltas on the Llama
+// path:
+// (a) REORDERED post-norm - RMSNorm on the SUBLAYER OUTPUT before the
+//     residual add (x + Norm(Attn(x)); post_attention_layernorm /
+//     post_feedforward_layernorm; NO input_layernorm and no pre-FFN norm);
+// (b) q/k RMSNorm over the FULL flattened projection width BEFORE the head
+//     split + RoPE (q_norm [num_heads*head_dim=8], k_norm
+//     [num_kv_heads*head_dim=4]) - the RMS statistic spans the WHOLE
+//     projection, unlike Qwen3's per-head placement, and with 2 query
+//     heads a per-head mix-up changes the q statistic and FAILS parity.
+// The generator tools/olmo2_tiny_fixture.py re-randomizes every RMSNorm
+// gain (HF ones-inits them) and asserts both deltas are non-vacuous
+// (resetting the q/k norm gains to ones moves the logits by 2.3e-2, the
+// post-norm gains by 9.6e-2 - far above the 1e-4 parity gate). The block
+// must carry EXACTLY 4 TNNetTokenRMSNorm per layer (q/k full-width + the
+// two post-norms) plus the final norm - 4*2+1 = 9 total - which fails if
+// an input_layernorm sneaks back in or the full-width norms are dropped.
+// Reference logits come from HF transformers in float64. The
+// BuildFromPretrained model_type "olmo2" dispatch route is covered too.
+procedure TTestNeuralPretrained.TestOlmo2LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, NormCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildOlmo2FromSafeTensorsEx(FixturePath('tiny_olmo2.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_olmo2_config.json'));
+  try
+    AssertEquals('model_type', 'olmo2', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertFalse('qkv_bias', Config.QKVBias);
+    AssertFalse('per-head qk_norm must stay OFF', Config.QKNorm);
+    AssertTrue('qk_norm_full_width', Config.QKNormFullWidth);
+    AssertTrue('post_norm_reordered', Config.PostNormReordered);
+    AssertFalse('sandwich_norm must stay OFF', Config.SandwichNorm);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    NormCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt].ClassType = TNNetTokenRMSNorm then
+        Inc(NormCnt);
+    AssertEquals('TokenRMSNorm count (4 per block + final)',
+      4 * Config.NumLayers + 1, NormCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_olmo2_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "olmo2" (architectures ["Olmo2ForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_olmo2.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_olmo2_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_olmo2_logits.json'), 16, 13);
   finally
     NN.Free;
   end;
