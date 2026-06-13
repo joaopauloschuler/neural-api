@@ -239,6 +239,10 @@ type
     procedure TestPearsonAndSpearmanCorrelation;
     procedure TestSTSReport;
     procedure TestRetrievalReport;
+    procedure TestColBERTParity;
+    procedure TestColBERTMaxSimScore;
+    procedure TestColBERTRetrievalReport;
+    procedure TestColBERTBuildInput;
     procedure TestBertTokenizeSentence;
     procedure TestBuildFromPretrainedDispatch;
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
@@ -7820,6 +7824,221 @@ begin
   finally
     for i := 0 to 0 do Q[i].Free;
     for i := 0 to 3 do P[i].Free;
+  end;
+end;
+
+// ColBERT late-interaction parity: build the encoder + projection head from
+// the pico fixture, run the pinned query/doc token rows through it, project +
+// L2-normalize each token, and assert BOTH the per-token matrices AND the
+// MaxSim score match the HF float64 oracle within 1e-4.
+procedure TTestNeuralPretrained.TestColBERTParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  ProjDim, SeqLen, QReal, DReal, R, C: integer;
+  RefRoot: TJSONData;
+  RefObj: TJSONObject;
+  QIds, DIds, QMatArr, DMatArr, RowArr: TJSONArray;
+  RefJson: TStringList;
+  Input, Out, QMat, DMat: TNNetVolume;
+  Diff, MaxDiff, Score, RefScore: double;
+
+  procedure RunRows(IdsArr: TJSONArray; RealTokens: integer; Mat: TNNetVolume);
+  var P, Ch: integer;
+  begin
+    Input.Fill(0);
+    for P := 0 to SeqLen - 1 do
+      Input.FData[P * 2] := IdsArr.Items[P].AsInteger;
+    NN.Compute(Input);
+    NN.GetOutput(Out);
+    Mat.ReSize(RealTokens, 1, ProjDim);
+    for P := 0 to RealTokens - 1 do
+      for Ch := 0 to ProjDim - 1 do
+        Mat.FData[P * ProjDim + Ch] := Out.FData[P * ProjDim + Ch];
+    ColBERTNormalizeRows(Mat);
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := nil;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Out := TNNetVolume.Create;
+  QMat := TNNetVolume.Create;
+  DMat := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_colbert_score.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    SeqLen := RefObj.Find('seq_len').AsInteger;
+    // build the encoder at the fixture's SeqLen (the [MASK]-padded query
+    // length): the imported encoder carries no attention pad mask, so for
+    // parity the net length must equal the pinned input length.
+    NN := BuildColBERTFromSafeTensorsEx(
+      FixturePath('tiny_colbert.safetensors'),
+      Config, ProjDim, {pSeqLen=}SeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_colbert_config.json'));
+    AssertEquals('proj dim', 5, ProjDim);
+    AssertEquals('layers', 2, Config.NumLayers);
+    QReal := RefObj.Find('query_real_tokens').AsInteger;
+    DReal := RefObj.Find('doc_real_tokens').AsInteger;
+    RefScore := RefObj.Find('maxsim').AsFloat;
+    QIds := TJSONArray(RefObj.Find('query_ids'));
+    DIds := TJSONArray(RefObj.Find('doc_ids'));
+    QMatArr := TJSONArray(RefObj.Find('query_mat'));
+    DMatArr := TJSONArray(RefObj.Find('doc_mat'));
+    AssertEquals('net seqlen', SeqLen, NN.Layers[0].Output.SizeX);
+    Input.ReSize(SeqLen, 1, 2);
+    RunRows(QIds, QReal, QMat);
+    RunRows(DIds, DReal, DMat);
+    // per-token matrix parity
+    MaxDiff := 0;
+    for R := 0 to QReal - 1 do
+    begin
+      RowArr := TJSONArray(QMatArr.Items[R]);
+      for C := 0 to ProjDim - 1 do
+      begin
+        Diff := Abs(QMat.FData[R * ProjDim + C] - RowArr.Items[C].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    for R := 0 to DReal - 1 do
+    begin
+      RowArr := TJSONArray(DMatArr.Items[R]);
+      for C := 0 to ProjDim - 1 do
+      begin
+        Diff := Abs(DMat.FData[R * ProjDim + C] - RowArr.Items[C].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('ColBERT per-token matrix parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    // MaxSim score parity
+    Score := ColBERTMaxSimScore(QMat, DMat);
+    AssertTrue('ColBERT MaxSim parity: ' + FloatToStr(Score) + ' vs ' +
+      FloatToStr(RefScore) + ' must be within 1e-4',
+      Abs(Score - RefScore) < 1e-4);
+  finally
+    RefRoot.Free;
+    DMat.Free; QMat.Free; Out.Free; Input.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// ColBERTMaxSimScore on hand-pinned unit vectors: score = sum over query rows
+// of the max dot with any doc row.
+procedure TTestNeuralPretrained.TestColBERTMaxSimScore;
+var
+  Q, D: TNNetVolume;
+  Score, Exp: double;
+begin
+  Q := TNNetVolume.Create;
+  D := TNNetVolume.Create;
+  try
+    // 2 query rows, 3 doc rows, dim 2; all unit vectors (axis-aligned + a 45).
+    Q.ReSize(2, 1, 2);
+    Q.FData[0] := 1; Q.FData[1] := 0;                 // q0 = +x
+    Q.FData[2] := 0; Q.FData[3] := 1;                 // q1 = +y
+    D.ReSize(3, 1, 2);
+    D.FData[0] := 1; D.FData[1] := 0;                 // d0 = +x
+    D.FData[2] := Sqrt(0.5); D.FData[3] := Sqrt(0.5); // d1 = 45 deg
+    D.FData[4] := 0; D.FData[5] := 1;                 // d2 = +y
+    // q0: max(<q0,d0>=1, <q0,d1>=0.7071, <q0,d2>=0) = 1
+    // q1: max(<q1,d0>=0, <q1,d1>=0.7071, <q1,d2>=1) = 1
+    Exp := 2.0;
+    Score := ColBERTMaxSimScore(Q, D);
+    AssertEquals('MaxSim pinned', Exp, Score, 1e-6);
+    // drop the +x and +y doc rows: best matches become the 45-deg row.
+    D.ReSize(1, 1, 2);
+    D.FData[0] := Sqrt(0.5); D.FData[1] := Sqrt(0.5);
+    Score := ColBERTMaxSimScore(Q, D);
+    AssertEquals('MaxSim single 45-deg doc', 2 * Sqrt(0.5), Score, 1e-6);
+  finally
+    D.Free; Q.Free;
+  end;
+end;
+
+// ColBERTRetrievalReport with pinned MaxSim rankings (mirrors
+// TestRetrievalReport but driven by MaxSim, not cosine).
+procedure TTestNeuralPretrained.TestColBERTRetrievalReport;
+var
+  Q: array[0..0] of TNNetVolume;
+  P: array[0..3] of TNNetVolume;
+  Rel: array[0..0] of TNeuralIntegerArray;
+  Rep: string;
+  i: integer;
+  expNDCG: double;
+  KList: array[0..1] of integer;
+begin
+  KList[0] := 1; KList[1] := 2;
+  for i := 0 to 0 do Q[i] := TNNetVolume.Create();
+  for i := 0 to 3 do P[i] := TNNetVolume.Create();
+  try
+    // single 1-token query along +x; each doc is a single unit token whose
+    // MaxSim to the query is just its x-component (cos of its angle).
+    Q[0].ReSize(1,1,2); Q[0].FData[0] := 1; Q[0].FData[1] := 0;
+    P[0].ReSize(1,1,2); P[0].FData[0] := 0.995; P[0].FData[1] := 0.0999;//~0.995
+    P[1].ReSize(1,1,2); P[1].FData[0] := 0.555; P[1].FData[1] := 0.832; //~0.555
+    P[2].ReSize(1,1,2); P[2].FData[0] := 0.949; P[2].FData[1] := 0.316; //~0.949
+    P[3].ReSize(1,1,2); P[3].FData[0] := 0.110; P[3].FData[1] := 0.994; //~0.110
+    // MaxSim ranking: P0 > P2 > P1 > P3 (same order as TestRetrievalReport)
+    SetLength(Rel[0], 2); Rel[0][0] := 2; Rel[0][1] := 3;
+    Rep := ColBERTRetrievalReport(Q, P, Rel, KList);
+    AssertTrue('header', Pos('ColBERT Retrieval Report', Rep) > 0);
+    AssertTrue('recall@1 0.0000', Pos('Recall@1: 0.0000', Rep) > 0);
+    AssertTrue('recall@2 0.5000', Pos('Recall@2: 0.5000', Rep) > 0);
+    expNDCG := (1/(Ln(3)/Ln(2)) + 1/(Ln(5)/Ln(2))) /
+               (1/(Ln(2)/Ln(2)) + 1/(Ln(3)/Ln(2)));
+    AssertTrue('ndcg pinned',
+      Pos('nDCG@10:  ' + FloatToStrF(expNDCG, ffFixed, 8, 4), Rep) > 0);
+  finally
+    for i := 0 to 0 do Q[i].Free;
+    for i := 0 to 3 do P[i].Free;
+  end;
+end;
+
+// ColBERTBuildInput marker convention: [CLS][Q] content [SEP] [MASK]-padded
+// for queries (all rows real); [CLS][D] content [SEP] [PAD]-filled for docs
+// (only the non-pad prefix real).
+procedure TTestNeuralPretrained.TestColBERTBuildInput;
+var
+  Tok: TNeuralHFTokenizer;
+  M: TColBERTMarkers;
+  QRow, DRow, Content: TNeuralIntegerArray;
+  QReal, DReal, Cnt: integer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    M := ColBERTDefaultMarkers(Tok);
+    AssertEquals('[CLS]', Tok.TokenToId('[CLS]'), M.ClsId);
+    AssertEquals('[SEP]', Tok.TokenToId('[SEP]'), M.SepId);
+    AssertEquals('[MASK]', Tok.TokenToId('[MASK]'), M.MaskId);
+    Content := Tok.Encode('the quick brown fox');
+    // query: SeqLen 10 -> [CLS][Q] + up to 7 content + [SEP], rest [MASK]
+    QRow := ColBERTBuildInput(Tok, 'the quick brown fox', {IsQuery=}true,
+      M, 10, QReal);
+    AssertEquals('query length', 10, Length(QRow));
+    AssertEquals('query all real (mask counts)', 10, QReal);
+    AssertEquals('query [CLS]', M.ClsId, QRow[0]);
+    AssertEquals('query [Q] marker', M.QueryMarkerId, QRow[1]);
+    for Cnt := 0 to High(Content) do
+      AssertEquals('query content ' + IntToStr(Cnt), Content[Cnt],
+        QRow[Cnt + 2]);
+    AssertEquals('query [SEP]', M.SepId, QRow[Length(Content) + 2]);
+    AssertEquals('query [MASK] pad', M.MaskId, QRow[High(QRow)]);
+    // doc: same content -> [CLS][D] content [SEP], rest [PAD]; real = prefix
+    DRow := ColBERTBuildInput(Tok, 'the quick brown fox', {IsQuery=}false,
+      M, 10, DReal);
+    AssertEquals('doc length', 10, Length(DRow));
+    AssertEquals('doc real = prefix', Length(Content) + 3, DReal);
+    AssertEquals('doc [D] marker', M.DocMarkerId, DRow[1]);
+    AssertEquals('doc [SEP]', M.SepId, DRow[Length(Content) + 2]);
+    AssertEquals('doc [PAD] pad', M.PadId, DRow[High(DRow)]);
+  finally
+    Tok.Free;
   end;
 end;
 

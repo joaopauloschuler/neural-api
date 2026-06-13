@@ -558,7 +558,7 @@ rather than acted on.
       covers the MiniLM mean-pool case; the new piece would wire a pooling
       mode + instruction prefix through it).
 
-- [ ] ColBERT-style LATE-INTERACTION retrieval import + scorer (the third and
+- [X] ColBERT-style LATE-INTERACTION retrieval import + scorer (the third and
       missing RAG retrieval paradigm in the repo). The bi-encoder path is landed
       (single pooled vector + cosine, the embedding/STS/Retrieval harness above)
       and the cross-encoder path is landed (joint [CLS] query[SEP]passage scorer,

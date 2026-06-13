@@ -1900,6 +1900,89 @@ function RetrievalReport(QueryEmb, PassageEmb: array of TNNetVolume;
   const Relevant: array of TNeuralIntegerArray;
   const KList: array of integer): string;
 
+// ====================== COLBERT LATE INTERACTION ==========================
+// ColBERT (colbert-ir/colbertv2.0) late-interaction retrieval: the third RAG
+// paradigm next to the landed bi-encoder (single pooled vector + cosine) and
+// cross-encoder (joint [CLS] q[SEP]passage scorer) paths. The backbone is the
+// stock BERT encoder (BuildBertFromSafeTensors) with a single EXTRA head: a
+// [hidden -> dim] dense with NO bias (the ColBERT "linear" tensor, dim 128 in
+// the released checkpoints). Each token's contextual hidden state is projected
+// and L2-normalized - there is NO pooling: query and document are kept as
+// PER-TOKEN matrices. A (query, doc) pair is scored by MaxSim late interaction
+//   score = sum_{q in query} max_{d in doc} <E_q, E_d>
+// (every query token matched to its single best document token, then summed) -
+// cross-encoder-grade accuracy at bi-encoder cost (docs are pre-encoded once).
+
+// Builds the ColBERT encoder: the BERT backbone (exactly BuildBertFromSafeTensorsEx)
+// with the [hidden -> ProjDim] no-bias "linear" projection head appended PER
+// TOKEN (TNNetPointwiseConvLinear). Output is the (SeqLen,1,ProjDim) RAW
+// projected hidden states (NOT yet L2-normalized - EmbedTokens normalizes).
+// "linear.weight" must be present in the checkpoint ([ProjDim, hidden]).
+// ProjDim is read from that tensor (0 in/out below = autodetected). Config
+// is returned. ConfigFileName '' = "config.json" next to FileName.
+function BuildColBERTFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildColBERTFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+
+// ColBERT marker-token convention: a query is [CLS][Q] tokens... [SEP] then
+// PADDED with [MASK] to the net's SeqLen (query augmentation - the [MASK] rows
+// are REAL inputs, projected and matched); a document is [CLS][D] tokens...
+// [SEP] then [PAD]-filled (pad rows are skipped). [Q]/[D] are the unused BERT
+// vocab slots [unused0]/[unused1] (ids 1/2 in bert-base-uncased), overridable.
+type
+  TColBERTMarkers = record
+    QueryMarkerId: integer;   // [Q]   (default [unused0] = 1)
+    DocMarkerId: integer;     // [D]   (default [unused1] = 2)
+    MaskId: integer;          // [MASK] (query augmentation pad)
+    ClsId, SepId, PadId: integer;
+  end;
+
+// Default markers for a bert-base-uncased-family tokenizer (looks up [MASK]/
+// [CLS]/[SEP]/[PAD]; [Q]/[D] default to ids 1/2 = [unused0]/[unused1]).
+function ColBERTDefaultMarkers(Tokenizer: TNeuralHFTokenizer):
+  TColBERTMarkers;
+
+// Builds the ColBERT input token row (length = net SeqLen) for Text. IsQuery
+// selects the [Q]/[D] marker and the [MASK]/[PAD] augmentation. Returns the
+// REAL token count via RealTokens (positions that contribute to MaxSim: ALL
+// SeqLen for a query because [MASK] rows count; the non-[PAD] prefix for a
+// document). Truncates content to fit SeqLen.
+function ColBERTBuildInput(Tokenizer: TNeuralHFTokenizer; const Text: string;
+  IsQuery: boolean; const Markers: TColBERTMarkers; SeqLen: integer;
+  out RealTokens: integer): TNeuralIntegerArray;
+
+// EmbedTokens: runs Text through the ColBERT net and returns the per-token
+// L2-normalized projected matrix as a (RealTokens,1,ProjDim) volume into Mat
+// (NO pooling - this is the whole point of late interaction). RealTokens is
+// the MaxSim-contributing row count (see ColBERTBuildInput): all rows for a
+// query, the non-[PAD] prefix for a document. Each row is unit L2 norm.
+procedure ColBERTEmbedTokens(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Text: string; IsQuery: boolean; const Markers: TColBERTMarkers;
+  Mat: TNNetVolume);
+
+// L2-normalizes each row of a (Rows,1,Dim) projected matrix in place (used by
+// ColBERTEmbedTokens; public so callers can normalize hand-built matrices).
+procedure ColBERTNormalizeRows(Mat: TNNetVolume);
+
+// MaxSim late-interaction score between a query matrix and a doc matrix, both
+// (Rows,1,Dim) with L2-normalized rows (so <E_q,E_d> is a cosine):
+//   score = sum over query rows of ( max over doc rows of dot(q_row, d_row) ).
+// Dims must match; raises otherwise.
+function ColBERTMaxSimScore(QueryMat, DocMat: TNNetVolume): TNeuralFloat;
+
+// ColBERTRetrievalReport: the RetrievalReport ranking quality report driven by
+// MaxSim instead of cosine. QueryMats[i] / DocMats[j] are per-token
+// (Rows,1,Dim) matrices (from ColBERTEmbedTokens); Relevant[i] lists the gold
+// doc indices for query i. Recall@k (each k in KList) and nDCG@10, averaged
+// over queries. Returns a formatted report.
+function ColBERTRetrievalReport(QueryMats, DocMats: array of TNNetVolume;
+  const Relevant: array of TNeuralIntegerArray;
+  const KList: array of integer): string;
+
 // =================== SEQUENCE CLASSIFICATION IMPORT =======================
 // Fine-tuned classifier checkpoints (see the unit-header section of the
 // same name for the [CLS]-first vs last-token pooling difference).
@@ -11897,6 +11980,11 @@ begin
         if (Config.Family in [bfBert, bfRoberta]) and
            (not IncludePooler) and
            (Pos('pooler.dense.', TensorNameStr) > 0) then continue;
+        // ColBERT projection head ([dim, hidden] no-bias "linear"): not part
+        // of a plain BERT export; BuildColBERTFromSafeTensorsEx loads it as a
+        // separate per-token head on top of this encoder.
+        if (TensorNameStr = 'linear.weight') or
+           (TensorNameStr = 'linear.bias') then continue;
         ImportError('BERT import: unexpected tensor "' + TensorNameStr +
           '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
           ') in ' + FileName + ' - refusing a partial import.');
@@ -12332,6 +12420,316 @@ begin
     '=== Retrieval Report ===' + sLineBreak +
     'queries:  ' + IntToStr(NQ) + sLineBreak +
     'passages: ' + IntToStr(NP) + sLineBreak;
+  for Ki := 0 to High(KList) do
+    Result := Result + 'Recall@' + IntToStr(KList[Ki]) + ': ' +
+      FloatToStrF(RecallSum[Ki] / NQ, ffFixed, 8, 4) + sLineBreak;
+  Result := Result + 'nDCG@10:  ' +
+    FloatToStrF(NDCGSum / NQ, ffFixed, 8, 4) + sLineBreak;
+end;
+
+// ====================== COLBERT LATE INTERACTION ==========================
+
+function BuildColBERTFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  ProjLayer: TNNetLayer;
+  ConfigPath: string;
+begin
+  // Build the stock BERT encoder (no pooler/seq-cls head). DEFER the
+  // inference-only/quantization pass: the projection head appended below must
+  // be loaded with writable weights first.
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBertConfigFromJSONFile(ConfigPath);
+  Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    {pInferenceOnly=}false, {pIncludePooler=}false, {pSeqClsHead=}false,
+    {pQuantizeInt8=}false);
+  ProjDim := 0;
+  try
+    // Read ProjDim from "linear.weight" ([ProjDim, hidden], no bias).
+    Reader := CreatePretrainedTensorReader(FileName);
+    try
+      if not Reader.HasTensor('linear.weight') then
+        ImportError('ColBERT import: missing tensor "linear.weight" (the ' +
+          '[dim, hidden] projection head) - not a ColBERT checkpoint?');
+      if (Reader.DimCount('linear.weight') <> 2) or
+         (Reader.DimSize('linear.weight', 1) <> Config.HiddenSize) then
+        ImportError('ColBERT import: "linear.weight" must have shape ' +
+          '[dim, ' + IntToStr(Config.HiddenSize) + '] (nn.Linear stores ' +
+          '[out, in]), got ' + Reader.ShapeAsString('linear.weight'));
+      if Reader.HasTensor('linear.bias') then
+        ImportError('ColBERT import: "linear.bias" present - the ColBERT ' +
+          'projection head is bias-free; refusing the import.');
+      ProjDim := Reader.DimSize('linear.weight', 0);
+      // Per-token projection head: TNNetPointwiseConvLinear with bias
+      // suppressed (second arg 1).
+      ProjLayer := Result.AddLayer(
+        TNNetPointwiseConvLinear.Create(ProjDim, {pSuppressBias=}1) );
+      LoadLlamaLinearWeights(Reader, ProjLayer, 'linear.weight',
+        Config.HiddenSize, ProjDim, 0, -1, 0, {BiasName=}'');
+    finally
+      Reader.Free;
+    end;
+  except
+    on E: ESafeTensorsError do
+    begin
+      Result.Free;
+      raise EPretrainedImportError.Create(E.Message);
+    end;
+    on E: Exception do
+    begin
+      Result.Free;
+      raise;
+    end;
+  end;
+  if pInferenceOnly then Result.MakeInferenceOnly();
+end;
+
+function BuildColBERTFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+var
+  IgnoredConfig: TBertConfig;
+  IgnoredDim: integer;
+begin
+  Result := BuildColBERTFromSafeTensorsEx(FileName, IgnoredConfig, IgnoredDim,
+    pSeqLen, pInferenceOnly, '');
+end;
+
+function ColBERTDefaultMarkers(Tokenizer: TNeuralHFTokenizer):
+  TColBERTMarkers;
+begin
+  Result.ClsId  := Tokenizer.TokenToId('[CLS]');
+  Result.SepId  := Tokenizer.TokenToId('[SEP]');
+  Result.PadId  := Tokenizer.TokenToId('[PAD]');
+  Result.MaskId := Tokenizer.TokenToId('[MASK]');
+  if (Result.ClsId < 0) or (Result.SepId < 0) or (Result.MaskId < 0) then
+    ImportError('ColBERTDefaultMarkers: tokenizer has no [CLS]/[SEP]/[MASK] ' +
+      'special tokens (not a BERT-family tokenizer.json?).');
+  if Result.PadId < 0 then Result.PadId := 0; // BERT [PAD] is id 0
+  // [Q]/[D] = bert-base-uncased [unused0]/[unused1] (ids 1/2). Prefer the
+  // named tokens when present, else fall back to the canonical ids.
+  Result.QueryMarkerId := Tokenizer.TokenToId('[unused0]');
+  if Result.QueryMarkerId < 0 then Result.QueryMarkerId := 1;
+  Result.DocMarkerId := Tokenizer.TokenToId('[unused1]');
+  if Result.DocMarkerId < 0 then Result.DocMarkerId := 2;
+end;
+
+function ColBERTBuildInput(Tokenizer: TNeuralHFTokenizer; const Text: string;
+  IsQuery: boolean; const Markers: TColBERTMarkers; SeqLen: integer;
+  out RealTokens: integer): TNeuralIntegerArray;
+var
+  ContentIds: TNeuralIntegerArray;
+  Marker, FillId, ContentLen, Cnt, Used: integer;
+begin
+  if SeqLen < 4 then
+    ImportError('ColBERTBuildInput: SeqLen must be >= 4 ([CLS][Q/D] x ... ' +
+      '[SEP]).');
+  if IsQuery then
+  begin
+    Marker := Markers.QueryMarkerId;
+    FillId := Markers.MaskId; // query augmentation: pad with [MASK]
+  end
+  else
+  begin
+    Marker := Markers.DocMarkerId;
+    FillId := Markers.PadId;
+  end;
+  ContentIds := Tokenizer.Encode(Text);
+  ContentLen := Length(ContentIds);
+  // [CLS] [marker] content... [SEP] must fit in SeqLen -> content <= SeqLen-3.
+  if ContentLen > SeqLen - 3 then ContentLen := SeqLen - 3;
+  SetLength(Result, SeqLen);
+  Result[0] := Markers.ClsId;
+  Result[1] := Marker;
+  for Cnt := 0 to ContentLen - 1 do Result[Cnt + 2] := ContentIds[Cnt];
+  Result[ContentLen + 2] := Markers.SepId;
+  Used := ContentLen + 3; // [CLS][marker] content [SEP]
+  for Cnt := Used to SeqLen - 1 do Result[Cnt] := FillId;
+  // Query: the [MASK] augmentation rows ARE real inputs and contribute to
+  // MaxSim, so all SeqLen rows count. Document: only the non-[PAD] prefix.
+  if IsQuery then RealTokens := SeqLen
+  else RealTokens := Used;
+end;
+
+procedure ColBERTNormalizeRows(Mat: TNNetVolume);
+var
+  Rows, Dim, R, C: integer;
+  Norm: TNeuralFloat;
+begin
+  Rows := Mat.SizeX;
+  Dim := Mat.Depth;
+  if (Mat.SizeY <> 1) or (Rows < 1) or (Dim < 1) then
+    ImportError('ColBERTNormalizeRows: expected a (Rows,1,Dim) volume, got ' +
+      IntToStr(Rows) + 'x' + IntToStr(Mat.SizeY) + 'x' + IntToStr(Dim) + '.');
+  for R := 0 to Rows - 1 do
+  begin
+    Norm := 0;
+    for C := 0 to Dim - 1 do
+      Norm := Norm + Mat.FData[R * Dim + C] * Mat.FData[R * Dim + C];
+    Norm := Sqrt(Norm);
+    if Norm > 0 then
+      for C := 0 to Dim - 1 do
+        Mat.FData[R * Dim + C] := Mat.FData[R * Dim + C] / Norm;
+  end;
+end;
+
+procedure ColBERTEmbedTokens(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Text: string; IsQuery: boolean; const Markers: TColBERTMarkers;
+  Mat: TNNetVolume);
+var
+  TokenIds: TNeuralIntegerArray;
+  Input, Proj: TNNetVolume;
+  SeqLen, Dim, RealTokens, PosCnt, ChanCnt: integer;
+begin
+  SeqLen := Net.Layers[0].Output.SizeX;
+  if Net.Layers[0].Output.Depth <> 2 then
+    ImportError('ColBERTEmbedTokens: net input is not (SeqLen,1,2) - not a ' +
+      'BuildColBERTFromSafeTensors encoder?');
+  TokenIds := ColBERTBuildInput(Tokenizer, Text, IsQuery, Markers, SeqLen,
+    RealTokens);
+  Input := TNNetVolume.Create();
+  Proj := TNNetVolume.Create();
+  try
+    Input.ReSize(SeqLen, 1, 2);
+    Input.Fill(0); // single segment: token-type channel all zeros
+    for PosCnt := 0 to SeqLen - 1 do
+      Input.FData[PosCnt * 2] := TokenIds[PosCnt];
+    Net.Compute(Input);
+    Net.GetOutput(Proj);
+    Dim := Proj.Depth;
+    if (Proj.SizeX <> SeqLen) or (Proj.SizeY <> 1) then
+      ImportError('ColBERTEmbedTokens: unexpected output shape ' +
+        IntToStr(Proj.SizeX) + 'x' + IntToStr(Proj.SizeY) + 'x' +
+        IntToStr(Dim) + '.');
+    // Keep only the MaxSim-contributing rows (skip [PAD] for documents).
+    Mat.ReSize(RealTokens, 1, Dim);
+    for PosCnt := 0 to RealTokens - 1 do
+      for ChanCnt := 0 to Dim - 1 do
+        Mat.FData[PosCnt * Dim + ChanCnt] :=
+          Proj.FData[PosCnt * Dim + ChanCnt];
+    ColBERTNormalizeRows(Mat);
+  finally
+    Proj.Free;
+    Input.Free;
+  end;
+end;
+
+function ColBERTMaxSimScore(QueryMat, DocMat: TNNetVolume): TNeuralFloat;
+var
+  QRows, DRows, Dim, Qi, Di, C: integer;
+  Dot, Best: TNeuralFloat;
+begin
+  Dim := QueryMat.Depth;
+  QRows := QueryMat.SizeX;
+  DRows := DocMat.SizeX;
+  if (QueryMat.SizeY <> 1) or (DocMat.SizeY <> 1) or
+     (QRows < 1) or (DRows < 1) or (Dim < 1) then
+    ImportError('ColBERTMaxSimScore: expected (Rows,1,Dim) matrices, got ' +
+      IntToStr(QRows) + 'x' + IntToStr(QueryMat.SizeY) + 'x' + IntToStr(Dim) +
+      ' and ' + IntToStr(DRows) + 'x' + IntToStr(DocMat.SizeY) + 'x' +
+      IntToStr(DocMat.Depth) + '.');
+  if DocMat.Depth <> Dim then
+    ImportError('ColBERTMaxSimScore: dim mismatch query ' + IntToStr(Dim) +
+      ' vs doc ' + IntToStr(DocMat.Depth) + '.');
+  Result := 0;
+  for Qi := 0 to QRows - 1 do
+  begin
+    Best := -1e30;
+    for Di := 0 to DRows - 1 do
+    begin
+      Dot := 0;
+      for C := 0 to Dim - 1 do
+        Dot := Dot + QueryMat.FData[Qi * Dim + C] * DocMat.FData[Di * Dim + C];
+      if Dot > Best then Best := Dot;
+    end;
+    Result := Result + Best;
+  end;
+end;
+
+function ColBERTRetrievalReport(QueryMats, DocMats: array of TNNetVolume;
+  const Relevant: array of TNeuralIntegerArray;
+  const KList: array of integer): string;
+var
+  NQ, NP, Qi, Pj, Ki, RankPos, RelIdx, MaxK: integer;
+  Scores: TNeuralFloatDynArr;
+  Order: array of integer;
+  Tmp: integer;
+  IsRel: array of boolean;
+  RecallSum: TNeuralFloatDynArr;
+  NDCGSum, DCG, IDCG: TNeuralFloat;
+  HitCount, NumRel, i, j: integer;
+begin
+  NQ := Length(QueryMats);
+  NP := Length(DocMats);
+  if NQ <> Length(Relevant) then
+    ImportError('ColBERTRetrievalReport: QueryMats/Relevant length mismatch ' +
+      IntToStr(NQ) + ' vs ' + IntToStr(Length(Relevant)) + '.');
+  if (NQ < 1) or (NP < 1) then
+    ImportError('ColBERTRetrievalReport: need >=1 query and >=1 doc.');
+  if Length(KList) < 1 then
+    ImportError('ColBERTRetrievalReport: KList must list at least one k.');
+  SetLength(RecallSum, Length(KList));
+  for Ki := 0 to High(KList) do RecallSum[Ki] := 0;
+  NDCGSum := 0;
+  MaxK := 10; // nDCG@10
+  SetLength(Scores, NP);
+  SetLength(Order, NP);
+  SetLength(IsRel, NP);
+  for Qi := 0 to NQ - 1 do
+  begin
+    for Pj := 0 to NP - 1 do
+    begin
+      Scores[Pj] := ColBERTMaxSimScore(QueryMats[Qi], DocMats[Pj]);
+      Order[Pj] := Pj;
+      IsRel[Pj] := False;
+    end;
+    NumRel := Length(Relevant[Qi]);
+    for RelIdx := 0 to NumRel - 1 do
+    begin
+      Pj := Relevant[Qi][RelIdx];
+      if (Pj < 0) or (Pj >= NP) then
+        ImportError('ColBERTRetrievalReport: relevant doc index ' +
+          IntToStr(Pj) + ' for query ' + IntToStr(Qi) + ' out of range.');
+      IsRel[Pj] := True;
+    end;
+    // descending stable insertion sort by MaxSim (ties keep lower index)
+    for i := 1 to NP - 1 do
+    begin
+      Tmp := Order[i];
+      j := i - 1;
+      while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
+      begin
+        Order[j + 1] := Order[j];
+        Dec(j);
+      end;
+      Order[j + 1] := Tmp;
+    end;
+    for Ki := 0 to High(KList) do
+    begin
+      HitCount := 0;
+      for RankPos := 0 to KList[Ki] - 1 do
+        if (RankPos < NP) and IsRel[Order[RankPos]] then Inc(HitCount);
+      if NumRel > 0 then
+        RecallSum[Ki] := RecallSum[Ki] + HitCount / NumRel;
+    end;
+    DCG := 0;
+    for RankPos := 0 to MaxK - 1 do
+      if (RankPos < NP) and IsRel[Order[RankPos]] then
+        DCG := DCG + 1 / (Ln(RankPos + 2) / Ln(2));
+    IDCG := 0;
+    for RankPos := 0 to MaxK - 1 do
+      if RankPos < NumRel then
+        IDCG := IDCG + 1 / (Ln(RankPos + 2) / Ln(2));
+    if IDCG > 0 then
+      NDCGSum := NDCGSum + DCG / IDCG;
+  end;
+  Result :=
+    '=== ColBERT Retrieval Report (MaxSim) ===' + sLineBreak +
+    'queries:  ' + IntToStr(NQ) + sLineBreak +
+    'docs:     ' + IntToStr(NP) + sLineBreak;
   for Ki := 0 to High(KList) do
     Result := Result + 'Recall@' + IntToStr(KList[Ki]) + ': ' +
       FloatToStrF(RecallSum[Ki] / NQ, ffFixed, 8, 4) + sLineBreak;

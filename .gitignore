@@ -16,6 +16,7 @@ tests/RunTests
 examples/ActivationBakeoff/ActivationBakeoff
 examples/GumbelAnnealingAutoencoder/GumbelAnnealingAutoencoder
 examples/BeamSearchDecode/BeamSearchDecode
+examples/ColBERTSearch/ColBERTSearch
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix
