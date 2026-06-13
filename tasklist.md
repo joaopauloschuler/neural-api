@@ -479,7 +479,7 @@ rather than acted on.
       static exit layer + confidence threshold; follow-up: per-token
       adaptive exit. Report tokens/sec vs full-depth at matched output
       quality.
-- [ ] Prompt-lookup / n-gram speculative decoding (transformers
+- [X] Prompt-lookup / n-gram speculative decoding (transformers
       `prompt_lookup_num_tokens` / "assisted generation with an n-gram
       drafter"): a TRAINING-FREE, NO-second-model speculative decode where the
       draft of the next few tokens is produced by matching the last

@@ -103,6 +103,9 @@ type
     procedure TestBestOfNReturnsHighestScoringCandidate;
     procedure TestBestOfNExternalScorerPicksItsTop;
     procedure TestSelfConsistencyReturnsModalAnswer;
+    // Prompt-lookup / n-gram speculative decoding (training-free, no draft net).
+    procedure TestPromptLookupMatchesGreedyBitIdentical;
+    procedure TestPromptLookupNoMatchDegradesToGreedy;
     // KV-cache incremental decode on TNNetScaledDotProductAttention.
     procedure TestKVCacheIncrementalMatchesFullForward;
     procedure TestKVCacheSlidingWindowMatchesFullForward;
@@ -867,6 +870,65 @@ begin
       Distinct[BestIdx], Answer);
   finally
     Sampler.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestPromptLookupMatchesGreedyBitIdentical;
+var
+  NN: TNNet;
+  G, P: TNNetDecodeResult;
+  NoStops: array of string;
+  Prompt: string;
+begin
+  // CORE INVARIANT: prompt-lookup speculative decoding emits exactly the greedy
+  // argmax at every position; acceptance is a speedup, never a quality change.
+  // We use a REPETITION-HEAVY prompt so the suffix n-gram lookup fires every
+  // step (forcing several accepted AND rejected drafts), and assert the output
+  // is BIT-IDENTICAL to plain DecodeGreedy on the same net. A small ContextLen
+  // (the input window is the LAST few chars) makes the tiny net behave like a
+  // short-context Markov model, so repeated context yields repeated drafts.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  Prompt := 'abcabcabcabc';
+  NN := BuildTinyNet(4, 8);
+  try
+    G := DecodeGreedy(NN, Prompt, 24);
+    // MatchLen=2, NumDraft=3 exercises multi-token accept windows + rejects.
+    P := DecodePromptLookup(NN, Prompt, 24, 2, 3, NoStops);
+    AssertEquals('prompt-lookup text == greedy text (bit-identical)',
+      G.Text, P.Text);
+    AssertEquals('prompt-lookup finished == greedy',
+      Ord(G.Finished), Ord(P.Finished));
+    // A second, different (MatchLen,NumDraft) must ALSO match greedy exactly.
+    P := DecodePromptLookup(NN, Prompt, 24, 3, 5, NoStops);
+    AssertEquals('prompt-lookup text == greedy text (other params)',
+      G.Text, P.Text);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestPromptLookupNoMatchDegradesToGreedy;
+var
+  NN: TNNet;
+  G, P: TNNetDecodeResult;
+  NoStops: array of string;
+begin
+  // DEGRADE-TO-GREEDY GUARANTEE: a MatchLen LONGER than the whole context can
+  // never find an earlier n-gram occurrence, so no draft is ever produced and
+  // every step emits exactly one greedy token. Output must be bit-identical to
+  // DecodeGreedy.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  try
+    G := DecodeGreedy(NN, 'ab', 8);
+    P := DecodePromptLookup(NN, 'ab', 8, 64, 4, NoStops);
+    AssertEquals('no-match prompt-lookup text == greedy text', G.Text, P.Text);
+    AssertEquals('no-match prompt-lookup finished == greedy',
+      Ord(G.Finished), Ord(P.Finished));
+  finally
     NN.Free;
   end;
 end;

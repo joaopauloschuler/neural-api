@@ -1144,6 +1144,38 @@ function DecodeSelfConsistency(NN: TNNet; const Prompt: string; MaxLen, N: integ
   Sampler: TNNetSamplerBase; Extract: TNNetAnswerExtractor;
   const StopStrings: array of string): string;
 
+// PROMPT-LOOKUP / N-GRAM SPECULATIVE DECODING (Saxena 2023, "prompt lookup
+// decoding"; the transformers `prompt_lookup_num_tokens` path). A TRAINING-FREE,
+// NO-second-model speculative decode: the draft of the next few tokens is
+// produced by a pure STRING LOOKUP instead of a draft network.
+//   * Each step, the last MatchLen characters of the running context (prompt +
+//     text generated so far) are matched against EARLIER occurrences of that
+//     same MatchLen-gram in the context. The MOST RECENT earlier occurrence is
+//     preferred; the NumDraft characters that FOLLOWED that occurrence become
+//     the speculative draft.
+//   * The draft is then VERIFIED against the model with the same width-K greedy
+//     verify rule used by speculative decoding: walking the draft left-to-right,
+//     a drafted character is ACCEPTED iff it equals the model's greedy argmax at
+//     that position; the first mismatch (or draft exhaustion) ends the window.
+//     The model's own argmax at the first rejected position is then emitted, so
+//     EVERY emitted character is exactly the greedy argmax - acceptance is a
+//     SPEEDUP, never a quality change.
+//   * DEGRADE-TO-GREEDY GUARANTEE: when no MatchLen-gram match is found (or the
+//     whole draft is rejected) exactly one token is emitted, identical to plain
+//     DecodeGreedy. The full output is therefore BIT-FOR-BIT DecodeGreedy on the
+//     same net for any MatchLen / NumDraft (only the number of forward passes
+//     differs). This is the standout win for repetition-heavy NLP (RAG,
+//     summarization, "quote the passage").
+//   MaxLen   : maximum number of generated tokens (excludes the prompt).
+//   MatchLen : length of the suffix n-gram matched into the context (>=1).
+//   NumDraft : how many following characters to copy as the draft (>=1).
+// Char-level, same forward-pass / encoding convention as DecodeGreedy (token id
+// = character code); no KV-cache (v1, re-encode loop), so the verify window is
+// checked one prefix at a time - the lookup itself is free. Coded by Claude (AI).
+function DecodePromptLookup(NN: TNNet; const Prompt: string;
+  MaxLen: integer; MatchLen: integer; NumDraft: integer;
+  const StopStrings: array of string): TNNetDecodeResult;
+
 // ---------------------------------------------------------------------------
 // STREAMED GENERATION: the KV-cache / SSM-state counterpart of neuraldatasets'
 // GenerateStringFromCasualNN, driven by a TNNetStreamingDecoder session.
@@ -4406,6 +4438,134 @@ begin
   for J := 1 to NumDistinct - 1 do
     if Counts[J] > Counts[Best] then Best := J; // strict > keeps first-seen tie
   Result := Answers[Best];
+end;
+
+// Prompt-lookup draft: find the NumDraft characters that follow the MOST RECENT
+// EARLIER occurrence of the last MatchLen characters of Context. Returns '' when
+// there is no such earlier occurrence (degrade-to-greedy). The suffix itself
+// (the final MatchLen characters) is excluded as a match site so the draft is
+// always copied from STRICTLY earlier in the string.
+function PromptLookupDraft(const Context: string;
+  MatchLen, NumDraft: integer): string;
+var
+  CtxLen, P, FollowLen: integer;
+  Suffix: string;
+begin
+  Result := '';
+  CtxLen := Length(Context);
+  if (MatchLen < 1) or (NumDraft < 1) or (CtxLen < MatchLen + 1) then Exit;
+  Suffix := Copy(Context, CtxLen - MatchLen + 1, MatchLen);
+  // Scan candidate start positions from the most recent earlier one backwards;
+  // a match at start position P occupies Context[P .. P+MatchLen-1]. The most
+  // recent earlier occurrence has the largest P with P+MatchLen-1 < CtxLen, i.e.
+  // P <= CtxLen - MatchLen, EXCLUDING P = CtxLen - MatchLen + 1 (the suffix).
+  for P := CtxLen - MatchLen downto 1 do
+    if Copy(Context, P, MatchLen) = Suffix then
+    begin
+      FollowLen := CtxLen - (P + MatchLen) + 1; // chars available after match
+      if FollowLen > NumDraft then FollowLen := NumDraft;
+      if FollowLen >= 1 then
+        Result := Copy(Context, P + MatchLen, FollowLen);
+      Exit; // most-recent occurrence wins
+    end;
+end;
+
+function DecodePromptLookup(NN: TNNet; const Prompt: string;
+  MaxLen: integer; MatchLen: integer; NumDraft: integer;
+  const StopStrings: array of string): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  LogProbs: array of TNeuralFloat;
+  VocabSize, Step, I, Best, StopLen, D: integer;
+  Context, Draft: string;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  VocabSize := OutputVolume.Size;
+  SetLength(LogProbs, VocabSize);
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  if MatchLen < 1 then MatchLen := 1;
+  if NumDraft < 1 then NumDraft := 1;
+  try
+    Step := 0;
+    while Step < MaxLen do
+    begin
+      // One forward pass over the current context -> next-token greedy argmax.
+      NextLogProbs(NN, Context, InputVolume, OutputVolume, LogProbs);
+      Best := 0;
+      for I := 1 to VocabSize - 1 do
+        if LogProbs[I] > LogProbs[Best] then Best := I;
+      Result.SumLogProb := Result.SumLogProb + LogProbs[Best];
+      Inc(Step);
+      if Best = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      Result.Text := Result.Text + Chr(Best);
+      Context := Context + Chr(Best);
+      // Stop-string check on the freshly emitted greedy token (identical policy
+      // to DecodeGreedy: trim and finish).
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+
+      // SPECULATIVE VERIFY of a prompt-lookup draft. The draft characters that
+      // follow the most-recent earlier occurrence of the current suffix are
+      // verified one prefix at a time; each is accepted only if it equals the
+      // model's greedy argmax at that position (bit-identical to greedy).
+      Draft := PromptLookupDraft(Context, MatchLen, NumDraft);
+      D := 1;
+      while (D <= Length(Draft)) and (Step < MaxLen) and
+        (not Result.Finished) do
+      begin
+        NextLogProbs(NN, Context, InputVolume, OutputVolume, LogProbs);
+        Best := 0;
+        for I := 1 to VocabSize - 1 do
+          if LogProbs[I] > LogProbs[Best] then Best := I;
+        // Reject as soon as the model disagrees with the draft (or EOS).
+        if (Best = csDecodeEOSToken) or (Best <> Ord(Draft[D])) then
+        begin
+          // The model's argmax here is the next emitted token; fall back to the
+          // outer greedy loop, which will recompute exactly this same argmax on
+          // its next iteration over the unchanged Context.
+          Break;
+        end;
+        // Accept: identical to the greedy argmax, so emit it.
+        Result.SumLogProb := Result.SumLogProb + LogProbs[Best];
+        Inc(Step);
+        Result.Text := Result.Text + Chr(Best);
+        Context := Context + Chr(Best);
+        if Length(StopStrings) > 0 then
+        begin
+          StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+          if StopLen > 0 then
+          begin
+            SetLength(Result.Text, Length(Result.Text) - StopLen);
+            Result.Finished := True;
+            Break;
+          end;
+        end;
+        Inc(D);
+      end;
+      if Result.Finished then Break;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+  end;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
 end;
 
 type
