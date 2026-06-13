@@ -256,6 +256,35 @@ rather than acted on.
       compares logits bit-for-bit. Scope v1 to the Llama family (the
       best-covered importer path); document other architectures as
       out-of-scope, same as the ONNX-export task.
+- [ ] GGUF k-quant READ support (Q4_K / Q6_K / Q5_K, then Q2_K) in
+      neural/neuralgguf.pas. Today TNNetGGUFReader handles only F32/F16/Q8_0
+      and raises EGGUFError on "Q4_K & friends" (see the explicit guard at
+      neuralgguf.pas line ~31 and the GGMLTypeName cases for ids 10/12/13/14
+      that exist for diagnostics but cannot be dequantized). This is the
+      single biggest blocker to importing REAL downloaded checkpoints: the
+      overwhelming majority of community .gguf files are Q4_K_M (a mix of
+      Q4_K and Q6_K super-blocks), so the landed BuildLlamaFromGGUF can only
+      open the rare full-precision/Q8_0 builds. Unlike the open GGUF WRITER
+      task (export), this is pure READ-side dequant-at-load, dovetailing with
+      the importer's existing "dequantize Q8_0 blocks straight into f32 at
+      load" path. The genuinely new work is ggml's k-quant super-block
+      geometry: each 256-element super-block stores a block-level f16
+      d (and, for the _K_M variants, d_min) plus 6-bit packed sub-scales and
+      4/5/6-bit packed quants across 8 sub-blocks of 32 — i.e. the exact
+      byte layouts of block_q4_K (144 B), block_q6_K (210 B), block_q5_K and
+      block_q2_K from ggml-quants. Add GGML_TYPE_* constants + block-byte
+      sizes to GGMLTypeBlockBytes, a DequantizeKQuant helper per type that
+      reproduces ggml's reference dequant_row_q*_K bit-unpacking exactly, and
+      wire it into the same load path that already inflates Q8_0, with the
+      256-element contiguous-dim divisibility check mirroring the existing
+      Q8_0 guard. Deliverables: read support for Q4_K/Q6_K/Q5_K/Q2_K,
+      tolerant of arch (the dequant is architecture-agnostic, so every GGUF
+      importer benefits, not just Llama), a tools/make_kquant_gguf_fixture.py
+      that quantizes a tiny tensor with the gguf python package into each
+      k-quant type, and a parity test that dequantizes those committed
+      fixtures in Pascal and matches the gguf-python reference within f16
+      block-scale tolerance. Pairs with the GGUF tokenizer-metadata follow-up
+      so a single real Q4_K_M .gguf becomes fully self-contained.
 - [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.
