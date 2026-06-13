@@ -94,7 +94,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] GPT-BigCode / StarCoder-v1 importer (model_type "gpt_bigcode") — the
+- [X] GPT-BigCode / StarCoder-v1 importer (model_type "gpt_bigcode") — the
       now-unblocked relative of the landed StarCoder2 importer (commit 19e594c,
       BuildStarCoder2FromSafeTensors). Reuses StarCoder2's LayerNorm-with-bias
       pre-norm block + full-bias linears + two-matrix GELU-tanh FFN, but swaps

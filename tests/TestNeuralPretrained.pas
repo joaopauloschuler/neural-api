@@ -190,6 +190,7 @@ type
     procedure TestGPTJLogitParity;
     procedure TestStarCoder2LogitParity;
     procedure TestStarCoder2WindowLogitParity;
+    procedure TestGptBigCodeLogitParity;
     procedure TestCohereConfigFromJSONFile;
     procedure TestCohereLogitParity;
     procedure TestCohere2LogitParity;
@@ -6398,6 +6399,73 @@ begin
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_starcoder2_window_logits.json'), Config.MaxPositions,
       Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// GPT-BigCode / StarCoder-v1 (model_type "gpt_bigcode", architectures
+// ["GPTBigCodeForCausalLM"]; bigcode/starcoder & the StarCoderBase family).
+// tiny_gptbigcode.* is a pico randomly-initialized GPTBigCodeForCausalLM (2
+// layers, hidden 8, 2 query heads, MULTI-QUERY = 1 shared K/V head, tied head)
+// exercising the two GPT-2 hallmarks StarCoder2 dropped - LEARNED absolute
+// position embeddings (wpe added to wte; NO RoPE) and a FUSED c_attn slab
+// [q | k | v] sliced/split Phi-3 style - plus multi-query attention (the lone
+// K/V head broadcast across every query head). The generator
+// (tools/gptbigcode_tiny_fixture.py) re-randomizes the (HF-zero-inited)
+// LayerNorm and attention biases and ASSERTS both the wpe table and the shared
+// K/V head move the float64-oracle logits, so those paths are genuinely
+// covered. Structural checks pin the TokenLayerNorm count (2 per block + final
+// = 5; a sneaked-in RMSNorm would fail) and the lone LearnedPositionalEmbedding.
+procedure TTestNeuralPretrained.TestGptBigCodeLogitParity;
+var
+  NN: TNNet;
+  Config: TGptBigCodeConfig;
+  LayerCnt, NormCnt, RMSCnt, PosCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildGptBigCodeFromSafeTensorsEx(
+    FixturePath('tiny_gptbigcode.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gptbigcode_config.json'));
+  try
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertEquals('max_pos', 16, Config.MaxPositions);
+    AssertTrue('multi_query', Config.MultiQuery);
+    AssertTrue('tied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'transformer.', Config.Prefix);
+    NormCnt := 0;
+    RMSCnt := 0;
+    PosCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetTokenLayerNorm then
+        Inc(NormCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetTokenRMSNorm then
+        Inc(RMSCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetLearnedPositionalEmbedding then
+        Inc(PosCnt);
+    end;
+    AssertEquals('TokenLayerNorm count (2 per block + final)',
+      2 * Config.NumLayers + 1, NormCnt);
+    AssertEquals('no RMSNorm (GPT-BigCode is LayerNorm)', 0, RMSCnt);
+    AssertEquals('one learned-position table', 1, PosCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gptbigcode_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "gpt_bigcode" onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_gptbigcode.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gptbigcode_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gptbigcode_logits.json'), 16, 13);
   finally
     NN.Free;
   end;

@@ -1471,6 +1471,61 @@ function BuildStarCoder2FromSafeTensors(const FileName: string;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
+  // HF GPTBigCodeConfig (model_type "gpt_bigcode", architectures
+  // ["GPTBigCodeForCausalLM"]; bigcode/starcoder, bigcode/gpt_bigcode-santacoder
+  // and the StarCoder-v1 / StarCoderBase family). The same biased-pre-LN GPT-2
+  // skeleton as StarCoder2 (biased nn.LayerNorm norms, bias=True on every
+  // nn.Linear, a two-matrix gelu_pytorch_tanh FFN) but with the two GPT-2
+  // hallmarks StarCoder2 dropped: LEARNED absolute position embeddings (a wpe
+  // table added to wte; NO RoPE) and a FUSED c_attn slab. The defining twist is
+  // MULTI-QUERY attention (multi_query=true): a SINGLE shared K/V head
+  // broadcast to every query head (GQA with kv_heads = 1), so the c_attn slab
+  // is [q (n_head*head_dim) | k (head_dim) | v (head_dim)].
+  TGptBigCodeConfig = record
+    HiddenSize: integer;        // n_embd (d_model)
+    IntermediateSize: integer;  // n_inner (c_fc width; null = 4*n_embd)
+    NumLayers: integer;         // n_layer
+    NumHeads: integer;          // n_head (query heads)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // n_positions (wpe rows / context length)
+    LayerNormEps: TNeuralFloat; // layer_norm_epsilon (nn.LayerNorm eps, 1e-5)
+    MultiQuery: boolean;        // multi_query: true = 1 shared K/V head (the
+                                // only form wired here; false = full MHA)
+    TieWordEmbeddings: boolean; // tie_word_embeddings (config default true)
+    Prefix: string;             // tensor-name prefix ('transformer.' or '')
+  end;
+
+// Reads a HF GPTBigCode config.json (model_type 'gpt_bigcode'). Required:
+// n_embd (or hidden_size), n_layer, n_head, vocab_size, n_positions. Defaults:
+// n_inner = 4*n_embd, layer_norm_epsilon = 1e-5, multi_query = true,
+// tie_word_embeddings = true. activation_function must be 'gelu_pytorch_tanh'
+// or 'gelu_new'. head_dim = n_embd / n_head. multi_query=false is rejected
+// (no committed checkpoint uses it; the released family is all MQA).
+function ReadGptBigCodeConfigFromJSONFile(const FileName: string): TGptBigCodeConfig;
+
+function GptBigCodeConfigToString(const Config: TGptBigCodeConfig): string;
+
+// Builds a TNNet with the GPT-BigCode architecture described by the config and
+// loads every weight from the safetensors/.bin checkpoint at FileName (see the
+// GPT-BIGCODE IMPORT section). The net takes a (SeqLen,1,1) volume of token ids
+// and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses the full
+// n_positions context. Config.Prefix is detected and written back.
+function BuildGptBigCodeFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGptBigCodeConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildGptBigCodeFromSafeTensorsEx(const FileName: string;
+  out Config: TGptBigCodeConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildGptBigCodeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+type
   TGPTJConfig = record
     HiddenSize: integer;        // d_model (n_embd)
     IntermediateSize: integer;  // MLP width (n_inner; null = 4*n_embd)
@@ -9004,6 +9059,388 @@ var
   IgnoredConfig: TStarCoder2Config;
 begin
   Result := BuildStarCoder2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ========================== GPT-BIGCODE IMPORT =============================
+//
+// GPT-BigCode / StarCoder-v1 (model_type "gpt_bigcode") is the biased-pre-LN
+// GPT-2 skeleton with two GPT-2 hallmarks StarCoder2 later dropped - LEARNED
+// absolute position embeddings (a wpe table added to wte; NO RoPE) and a FUSED
+// c_attn slab - plus the defining twist: MULTI-QUERY attention (a single shared
+// K/V head broadcast to every query head). Per HF the c_attn slab is laid out
+// [q (n_head*head_dim) | k (head_dim) | v (head_dim)] and split on dim -1; the
+// importer slices it into three nn.Linear sub-blocks (Phi-3 style) and wires
+// MQA over the grouped-SDPA path (every query head shares the lone K/V slice).
+// Norms are biased nn.LayerNorm, every nn.Linear (q/k/v fused, c_proj, c_fc,
+// c_proj) carries a bias, the FFN is the plain two-matrix gelu_pytorch_tanh,
+// and lm_head is tied to wte by default.
+
+function ReadGptBigCodeConfigFromJSONFile(const FileName: string): TGptBigCodeConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+
+  // n_embd / hidden_size etc. are required positive ints (HF accepts either
+  // spelling for the dims; n_embd is the canonical GPT-BigCode form).
+  function RequiredInt(const Primary, Alt: string): integer;
+  var
+    Name: string;
+  begin
+    Name := Primary;
+    if (Obj.IndexOfName(Primary) < 0) and (Alt <> '') and
+       (Obj.IndexOfName(Alt) >= 0) then
+      Name := Alt;
+    if Obj.IndexOfName(Name) < 0 then
+      ImportError('GPT-BigCode import: config "' + FileName +
+        '" is missing the required field "' + Primary + '".');
+    Result := Obj.Get(Name, 0);
+    if Result <= 0 then
+      ImportError('GPT-BigCode import: config field "' + Name +
+        '" must be a positive integer, got ' + Obj.Find(Name).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('GPT-BigCode import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('GPT-BigCode import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('GPT-BigCode import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'gpt_bigcode');
+    if ModelType <> 'gpt_bigcode' then
+      ImportError('GPT-BigCode import: config model_type is "' + ModelType +
+        '" - expected "gpt_bigcode" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.HiddenSize := RequiredInt('n_embd', 'hidden_size');
+    Result.NumLayers := RequiredInt('n_layer', 'num_hidden_layers');
+    Result.NumHeads := RequiredInt('n_head', 'num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size', '');
+    Result.MaxPositions := RequiredInt('n_positions', 'max_position_embeddings');
+    // n_inner null = 4*n_embd (the GPT-2 / GPT-BigCode default).
+    Result.IntermediateSize := 4 * Result.HiddenSize;
+    if (Obj.IndexOfName('n_inner') >= 0) and
+       (Obj.Find('n_inner').JSONType = jtNumber) then
+      Result.IntermediateSize := Obj.Get('n_inner', Result.IntermediateSize);
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    Result.MultiQuery := Obj.Get('multi_query', True);
+    if not Result.MultiQuery then
+      ImportError('GPT-BigCode import: multi_query=false (full multi-head) is ' +
+        'not wired here - the released gpt_bigcode family is all multi-query.');
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    HiddenAct := Obj.Get('activation_function', 'gelu_pytorch_tanh');
+    if (HiddenAct <> 'gelu_pytorch_tanh') and (HiddenAct <> 'gelu_new') then
+      ImportError('GPT-BigCode import: config activation_function "' +
+        HiddenAct + '" is not supported - only the gelu-tanh forms ' +
+        '("gelu_pytorch_tanh" / "gelu_new") are wired here.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function GptBigCodeConfigToString(const Config: TGptBigCodeConfig): string;
+begin
+  Result := 'gpt_bigcode config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', multi_query=' + BoolToStr(Config.MultiQuery, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TGptBigCodeBlockLayers = record
+    LN1, QProj, KProj, VProj, OProj: TNNetLayer;
+    LN2, CFc, CProj: TNNetLayer;
+  end;
+
+function BuildGptBigCodeFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGptBigCodeConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TGptBigCodeBlockLayers;
+  EmbeddingLayer, PosLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSource, KSlice, VSlice, QSlice, HeadPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, HeadDim, QWidth, SlabRows, i, j, d: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, MlpPrefix, TensorNameStr, LMHeadName: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  procedure LoadNorm(Layer: TNNetLayer; const Base: string);
+  begin
+    LoadLayerNormWeights(Reader, Layer, Base + '.weight', Base + '.bias',
+      Config.HiddenSize);
+    MarkConsumed(Base + '.weight');
+    MarkConsumed(Base + '.bias');
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('GPT-BigCode import: n_head must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('GPT-BigCode import: n_embd=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by n_head=' +
+          IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      QWidth := Config.NumHeads * HeadDim;        // == HiddenSize
+      // c_attn slab rows: q (QWidth) | k (head_dim) | v (head_dim).
+      SlabRows := QWidth + 2 * HeadDim;
+      if Reader.HasTensor('transformer.wte.weight') then
+        Config.Prefix := 'transformer.'
+      else if Reader.HasTensor('wte.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('GPT-BigCode import: neither "transformer.wte.weight" nor ' +
+          '"wte.weight" found in ' + Reader.FileName +
+          ' - not a GPT-BigCode checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'wte.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'wte.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'wte.weight', 1) <> Config.HiddenSize) then
+        ImportError('GPT-BigCode import: wte.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' + Reader.ShapeAsString(Config.Prefix + 'wte.weight'));
+      LMHeadName := 'lm_head.weight';
+      if (not Config.TieWordEmbeddings) and (not Reader.HasTensor(LMHeadName)) then
+        ImportError('GPT-BigCode import: config says tie_word_embeddings=false ' +
+          'but "' + LMHeadName + '" is missing from ' + Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('GPT-BigCode import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds n_positions=' + IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      // Learned absolute positions (wpe), GPT-2 style: x := wte[token] + wpe[pos].
+      PosLayer := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // Attention sub-block: x := x + c_proj(MQA-SDPA(LayerNorm(x))).
+        // No RoPE; the lone K/V head is shared across every query head.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN1 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        NormedSource := NN.GetLastLayer();
+        // Three nn.Linear sub-blocks sliced from the fused c_attn slab below.
+        Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+        Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(HeadDim), NormedSource);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(HeadDim), NormedSource);
+        // The single shared K and V slices (the WHOLE projection is one head).
+        KSlice := Blocks[BlockCnt].KProj;
+        VSlice := Blocks[BlockCnt].VProj;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := HeadCnt * HeadDim + d;
+          QSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true),
+            HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // MLP sub-block: x := x + c_proj(gelu_tanh(c_fc(LayerNorm(x)))).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN2 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].CFc := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        NN.AddLayer( TNNetGELU.Create() ); // gelu_pytorch_tanh
+        Blocks[BlockCnt].CProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('GPT-BigCode import: wte.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'wte.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          EnsureWritableImportWeights(LMHead);
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+            Config.HiddenSize, Config.VocabSize);
+          MarkConsumed(LMHeadName);
+        end;
+        // wpe -> learned positional table (n_positions rows of d floats).
+        Reader.LoadTensorFlat(Config.Prefix + 'wpe.weight', Tmp);
+        if PosLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('GPT-BigCode import: wpe.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the positional table size ' +
+            IntToStr(PosLayer.Neurons[0].Weights.Size) + '.');
+        PosLayer.Neurons[0].Weights.Copy(Tmp);
+        PosLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'wpe.weight');
+      finally
+        Tmp.Free;
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'attn.';
+        MlpPrefix := BlockPrefix + 'mlp.';
+        LoadNorm(Blocks[BlockCnt].LN1, BlockPrefix + 'ln_1');
+        LoadNorm(Blocks[BlockCnt].LN2, BlockPrefix + 'ln_2');
+        // FUSED c_attn slab [q (QWidth) | k (head_dim) | v (head_dim)],
+        // sliced into three nn.Linear sub-blocks (Phi-3-style SrcRowBase). All
+        // load straight (no rotate_half permutation - GPT-BigCode has no RoPE).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+          AttnPrefix + 'c_attn.weight', Config.HiddenSize, QWidth,
+          0, -1, 0, AttnPrefix + 'c_attn.bias', 1.0, 0, {SrcRowBase=}0, SlabRows);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+          AttnPrefix + 'c_attn.weight', Config.HiddenSize, HeadDim,
+          0, -1, 0, AttnPrefix + 'c_attn.bias', 1.0, 0,
+          {SrcRowBase=}QWidth, SlabRows);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+          AttnPrefix + 'c_attn.weight', Config.HiddenSize, HeadDim,
+          0, -1, 0, AttnPrefix + 'c_attn.bias', 1.0, 0,
+          {SrcRowBase=}QWidth + HeadDim, SlabRows);
+        MarkConsumed(AttnPrefix + 'c_attn.weight');
+        MarkConsumed(AttnPrefix + 'c_attn.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+          AttnPrefix + 'c_proj.weight', Config.HiddenSize, Config.HiddenSize,
+          0, -1, 0, AttnPrefix + 'c_proj.bias');
+        MarkConsumed(AttnPrefix + 'c_proj.weight');
+        MarkConsumed(AttnPrefix + 'c_proj.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CFc,
+          MlpPrefix + 'c_fc.weight', Config.HiddenSize, Config.IntermediateSize,
+          0, -1, 0, MlpPrefix + 'c_fc.bias');
+        MarkConsumed(MlpPrefix + 'c_fc.weight');
+        MarkConsumed(MlpPrefix + 'c_fc.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CProj,
+          MlpPrefix + 'c_proj.weight', Config.IntermediateSize, Config.HiddenSize,
+          0, -1, 0, MlpPrefix + 'c_proj.bias');
+        MarkConsumed(MlpPrefix + 'c_proj.weight');
+        MarkConsumed(MlpPrefix + 'c_proj.bias');
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadNorm(FinalNorm, Config.Prefix + 'ln_f');
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('GPT-BigCode import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) + ') in ' +
+          FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildGptBigCodeFromSafeTensorsEx(const FileName: string;
+  out Config: TGptBigCodeConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadGptBigCodeConfigFromJSONFile(ConfigPath);
+  Result := BuildGptBigCodeFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildGptBigCodeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TGptBigCodeConfig;
+begin
+  Result := BuildGptBigCodeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -21967,6 +22404,7 @@ var
   IgnoredGPTNeoXConfig: TGPTNeoXConfig;
   IgnoredGPTJConfig: TGPTJConfig;
   IgnoredStarCoder2Config: TStarCoder2Config;
+  IgnoredGptBigCodeConfig: TGptBigCodeConfig;
   IgnoredGptOssConfig: TGptOssConfig;
   IgnoredCohereConfig: TCohereConfig;
   IgnoredPhiConfig: TPhiConfig;
@@ -22095,6 +22533,16 @@ begin
     // IMPORT section.
     Result := BuildStarCoder2FromSafeTensorsEx(WeightsPath,
       IgnoredStarCoder2Config, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
+  else if ModelType = 'gpt_bigcode' then
+    // GPT-BigCode / StarCoder-v1 (architectures ["GPTBigCodeForCausalLM"];
+    // bigcode/starcoder, gpt_bigcode-santacoder, StarCoderBase): the biased
+    // pre-LN GPT-2 skeleton (biased nn.LayerNorm norms, bias on every linear,
+    // two-matrix gelu-tanh FFN) with LEARNED absolute positions (wpe; NO RoPE),
+    // a FUSED c_attn slab and MULTI-QUERY attention (one shared K/V head
+    // broadcast across query heads). See the GPT-BIGCODE IMPORT section.
+    Result := BuildGptBigCodeFromSafeTensorsEx(WeightsPath,
+      IgnoredGptBigCodeConfig, pSeqLen, pInferenceOnly, ConfigPath,
       pQuantizeInt8)
   else if ModelType = 'gpt_oss' then
     // GPT-OSS (OpenAI gpt-oss, architectures ["GptOssForCausalLM"], the
