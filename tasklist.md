@@ -208,35 +208,41 @@ rather than acted on.
       reusable new quant primitive (NOT a duplicate of the GGUF k-quant or int8
       paths — it is a different block layout). Document gpt-oss-120b as
       import-capable but RAM-gated like the other large checkpoints.
-- [ ] Jamba importer (BuildJambaFromSafeTensors[Ex], model_type "jamba", e.g.
-      ai21labs/Jamba-tiny-dev / Jamba-Mini): the FIRST HYBRID Mamba+Transformer
-      decoder import, and the first model that exercises three landed subsystems
-      TOGETHER in one stack — selective-SSM mixers (TNNetSelectiveSSM /
-      AddMambaBlock, [[nontransformer-importers-rwkv-mamba]]), full softmax
-      attention layers, and Mixtral-style top-k MoE FFNs (AddTopKMixtureOfExperts
-      / TNNetTopKGate, [[topk-moe-routing]]). This is NOT a near-duplicate of the
-      landed BuildMambaFromSafeTensors (pure-SSM) or Qwen3-MoE (pure-attention
-      MoE): the genuinely new piece is the PER-LAYER block-TYPE schedule — Jamba
-      interleaves Mamba and attention layers on a fixed period (config
-      attn_layer_offset / attn_layer_period) and MoE vs dense MLP on another
-      period (expert_layer_offset / expert_layer_period / num_experts /
-      num_experts_per_tok), so the builder picks {mamba|attention} x {moe|dense}
-      per layer index from the config (mirror HF modeling_jamba's layer-type
-      computation exactly). Other Jamba specifics to wire: NO positional encoding
-      / RoPE at all (the Mamba layers carry order; attention is NoPE), RMSNorm,
-      GQA on the attention layers (num_key_value_heads), and the Mamba mixer's
-      pre-conv RMSNorm placement. Tokenizer is a Llama-style SentencePiece
-      tokenizer.json the landed TNeuralHFTokenizer reads. Deliverables:
-      BuildJambaFromSafeTensors[Ex] (multi-shard index.json support — real Jamba
-      checkpoints are large/sharded), a config-faithful pico parity fixture via
-      the make_pico_*_fixture.py recipe ([[pico-import-fixtures]]) sliced to ~4
-      layers covering all four block kinds (mamba-dense, mamba-moe,
-      attn-dense, attn-moe) with 2 experts / top-1, asserting next-token logits
-      vs transformers in venv x (float64), and documenting Jamba-Mini as
-      import-capable but RAM-gated like the other large checkpoints. High value:
-      hybrid SSM-attention-MoE is the dominant efficient-long-context recipe and
-      this is the first import path here that proves the Mamba + attention + MoE
-      primitives compose into a real published architecture.
+- [X] Jamba importer (BuildJambaFromSafeTensors[Ex], model_type "jamba",
+      ai21labs/Jamba-tiny-dev / Jamba-Mini): the FIRST HYBRID Mamba+attention
+      +MoE decoder import. LANDED — neural/neuralpretrained.pas
+      BuildJambaFromSafeTensors[Ex]/WithConfig + ReadJambaConfigFromJSONFile +
+      JambaLayerIsAttention/IsMoE, dispatched from BuildFromPretrained for
+      model_type "jamba". Per-layer block-type schedule mirrors HF
+      configuration_jamba EXACTLY (attention iff i mod attn_layer_period =
+      attn_layer_offset; N-expert MoE iff i mod expert_layer_period =
+      expert_layer_offset). NoPE throughout, RMSNorm, bias-free GQA attention,
+      Mixtral-style top-k MoE with NON-renormalized gate weights (HF
+      JambaSparseMoeBlock takes raw softmax probs). The genuinely-new SSM piece:
+      HF JambaMambaMixer inserts an inner per-vector RMSNorm on dt/B/C between
+      x_proj and the scan, which cannot be folded into the plain-Mamba constant
+      projections — added a forward-only "Jamba inner-norm" mode to
+      TNNetSelectiveSSM (CreateJambaInner: keeps the dt path unfolded, applies
+      the three inner gains; backward raises a clear error — importer nets are
+      inference-only). Multi-shard .index.json supported via the existing
+      reader. Pico fixture tools/jamba_tiny_fixture.py → tests/fixtures/
+      tiny_jamba.* (6 layers covering ALL FOUR block kinds via attn_period=2/
+      offset=1 + expert_period=3/offset=1, 2 experts/top-1, GQA 4q/2kv,
+      d_state=4, dt_rank=3); oracle is a float64 numpy reimplementation of
+      modeling_jamba slow_forward, CROSS-CHECKED against real transformers
+      5.11 (== HF to 3.5e-5 = f32-vs-f64 rounding). Parity asserted by
+      tests/TestNeuralPretrained.pas TestJambaLogitParity (< 1e-4). Jamba-Mini/
+      1.5 documented as import-capable-but-RAM-gated in README.md + the
+      importer doc comment. Remaining open follow-ups (not blockers):
+        - mamba_proj_bias=true (in/out_proj biases) is REJECTED — no published
+          Jamba uses it; wire the bias path if a checkpoint needs it.
+        - training through the Jamba inner-norm SSM is not wired (forward-only);
+          add backward through the dt/B/C RMSNorms if fine-tuning is wanted.
+        - SentencePiece/tokenizer.json text prompting for Jamba: TNeuralHFTokenizer
+          reads it but no Jamba-specific demo/example was added (raw ids work).
+        - no real-checkpoint slicer fixture (parity uses a random pico model,
+          like the Mamba/Mixtral importers); add a make_pico-style real slice
+          if a genuine-weight parity fixture is later wanted.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).

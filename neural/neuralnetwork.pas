@@ -6718,9 +6718,30 @@ type
   // delta_t stays the per-channel softplus projection, so an importer can fold
   // HF's low-rank dt_proj@x_proj_dt product into W_d and dt_proj.bias into b_d.
   // Init for DState>1 uses the HF/S4D-real A_log: A_raw[d,s] = ln(1+s).
+  //
+  // JAMBA INNER-NORM MODE (FStruct[1]=1, FStruct[2]=dt_rank, FFloatSt[0]=eps):
+  // the hybrid Jamba mixer (HF JambaMambaMixer) inserts a per-vector RMSNorm
+  // on the dt / B / C selection vectors BETWEEN x_proj and dt_proj/scan, which
+  // is nonlinear and so cannot be folded into the constant W_d/W_B/W_C the
+  // legacy path uses. In this mode the layer keeps the dt path UNFOLDED and,
+  // per timestep, computes
+  //   ts   = x_proj_dt . x_conv                    (dt_rank-long)
+  //   dt   = softplus( dt_proj . rms(ts)*dt_gain + b_d )
+  //   b_t  = rms(W_B . x_conv)*b_gain   (NS-long, rms over the NS axis)
+  //   c_t  = rms(W_C . x_conv)*c_gain
+  // then runs the same multi-state recurrence. Neuron layout differs:
+  //   [0]=dt_proj.weight (Depth,1,dt_rank)  [1]=W_B (NS,1,Depth)
+  //   [2]=W_C (NS,1,Depth)  [3]=b_d=dt_proj.bias (Depth)  [4]=A_raw (Depth,1,NS)
+  //   [5]=e=D (Depth)  [6]=x_proj_dt (dt_rank,1,Depth)  [7]=dt_gain (dt_rank)
+  //   [8]=b_gain (NS)  [9]=c_gain (NS)
+  // FORWARD-ONLY: backward raises a clear error in this mode (the importer
+  // builds the net inference-only; training the inner norms is not wired).
+  // Coded by Claude (AI).
   TNNetSelectiveSSM = class(TNNetLayer)
     private
       FDState: integer;      // states per channel N (FStruct[0]); 1 = legacy
+      FJambaInner: integer;  // FStruct[1]: 1 = Jamba inner dt/B/C RMSNorm mode
+      FDtRank: integer;      // FStruct[2]: dt_rank (Jamba inner-norm mode only)
       FState: TNNetVolume;   // forward state cache h_t, (SeqLen,1,Depth*N)
       FDelta: TNNetVolume;   // cached delta_t, (SeqLen,1,Depth)
       FBt: TNNetVolume;      // cached b_t, (SeqLen,1,Depth) or (SeqLen,1,N)
@@ -6729,14 +6750,20 @@ type
       FH: TNNetVolume;       // running state vector h, Depth*N-long scratch
       FGh: TNNetVolume;      // backward state-gradient gh, Depth*N-long scratch
       FExpA: TNNetVolume;    // exp(A_raw), Depth*N-long scratch
+      FTsBuf: TNNetVolume;   // dt_rank-long scratch (Jamba inner-norm forward)
       FGbT, FGcT: TNNetVolume; // per-timestep dL/db_t, dL/dc_t (DState>1 only)
       FGradWd, FGradWB, FGradWC: TNNetVolume; // projection grad accumulators
       FGradBd, FGradA, FGradE: TNNetVolume;   // per-channel(-state) grad accums
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure ComputeMultiState();
+      procedure ComputeJambaInner();
       procedure BackpropagateMultiState();
     public
       constructor Create(pDState: integer = 1); reintroduce; overload;
+      // Jamba hybrid mixer: DState states, an unfolded dt path of rank pDtRank
+      // and an inner RMSNorm (eps pEps) on dt / B / C. Forward-only.
+      constructor CreateJambaInner(pDState, pDtRank: integer;
+        pEps: TNeuralFloat = 1e-6); reintroduce; overload;
       destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -42544,7 +42571,11 @@ constructor TNNetSelectiveSSM.Create(pDState: integer = 1);
 begin
   inherited Create();
   FDState := Max(pDState, 1);
+  FJambaInner := 0;
+  FDtRank := 0;
   FStruct[0] := FDState;
+  FStruct[1] := 0;
+  FStruct[2] := 0;
   FState := TNNetVolume.Create();
   FDelta := TNNetVolume.Create();
   FBt := TNNetVolume.Create();
@@ -42553,6 +42584,7 @@ begin
   FH := TNNetVolume.Create();
   FGh := TNNetVolume.Create();
   FExpA := TNNetVolume.Create();
+  FTsBuf := TNNetVolume.Create();
   FGbT := TNNetVolume.Create();
   FGcT := TNNetVolume.Create();
   FGradWd := TNNetVolume.Create();
@@ -42565,6 +42597,19 @@ begin
   AddMissingNeurons(6);
 end;
 
+constructor TNNetSelectiveSSM.CreateJambaInner(pDState, pDtRank: integer;
+  pEps: TNeuralFloat = 1e-6);
+begin
+  Create(Max(pDState, 1));
+  FJambaInner := 1;
+  FDtRank := Max(pDtRank, 1);
+  FStruct[1] := 1;
+  FStruct[2] := FDtRank;
+  FFloatSt[0] := pEps;
+  // Jamba mode adds four neurons: [6]=x_proj_dt [7..9]=dt/b/c inner gains.
+  AddMissingNeurons(10);
+end;
+
 destructor TNNetSelectiveSSM.Destroy();
 begin
   FGcT.Free;
@@ -42575,6 +42620,7 @@ begin
   FGradWC.Free;
   FGradWB.Free;
   FGradWd.Free;
+  FTsBuf.Free;
   FExpA.Free;
   FGh.Free;
   FH.Free;
@@ -42598,6 +42644,9 @@ begin
   // FStruct[0] (not the constructor argument) is authoritative so loading a
   // saved net (which restores FStruct before wiring layers) round-trips DState.
   FDState := Max(FStruct[0], 1);
+  // FStruct[1]/[2] round-trip the Jamba inner-norm mode and its dt_rank.
+  FJambaInner := FStruct[1];
+  if FJambaInner = 1 then FDtRank := Max(FStruct[2], 1);
   NS := FDState;
   // Selective SSM preserves the sequence layout.
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, Depth);
@@ -42609,17 +42658,33 @@ begin
   // DState=N>1 (Mamba): W_B/W_C become (N,1,Depth) shared-across-channel
   // projections and A_raw becomes per-(channel,state) (Depth,1,N).
   if NS = 1 then BCRows := Depth else BCRows := NS;
-  FNeurons[0].FWeights.ReSize(Depth, 1, Depth);
+  if FJambaInner = 1 then
+  begin
+    // Jamba: [0]=dt_proj.weight (Depth,1,dt_rank). The remaining slots match
+    // the multi-state layout; [6..9] hold the unfolded x_proj_dt + inner gains.
+    if FNeurons.Count < 10 then AddMissingNeurons(10);
+    FNeurons[0].FWeights.ReSize(Depth, 1, FDtRank);
+  end
+  else
+    FNeurons[0].FWeights.ReSize(Depth, 1, Depth);
   FNeurons[1].FWeights.ReSize(BCRows, 1, Depth);
   FNeurons[2].FWeights.ReSize(BCRows, 1, Depth);
   FNeurons[3].FWeights.ReSize(Depth, 1, 1);
   FNeurons[4].FWeights.ReSize(Depth, 1, NS);
   FNeurons[5].FWeights.ReSize(Depth, 1, 1);
-  for ii := 0 to 5 do
+  if FJambaInner = 1 then
+  begin
+    FNeurons[6].FWeights.ReSize(FDtRank, 1, Depth); // x_proj_dt
+    FNeurons[7].FWeights.ReSize(FDtRank, 1, 1);     // dt_gain
+    FNeurons[8].FWeights.ReSize(NS, 1, 1);          // b_gain
+    FNeurons[9].FWeights.ReSize(NS, 1, 1);          // c_gain
+  end;
+  for ii := 0 to FNeurons.Count - 1 do
   begin
     FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
     FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
   end;
+  FTsBuf.ReSize(1, 1, Max(FDtRank, 1));
   FState.ReSize(FOutput.SizeX, 1, Depth * NS);
   FDelta.ReSize(FOutput.SizeX, 1, Depth);
   FBt.ReSize(FOutput.SizeX, 1, BCRows);
@@ -42648,6 +42713,11 @@ var
   XtPtr, OutPtr: TNeuralFloatArrPtr;
   WdRow, WBRow, WCRow: TNeuralFloatArrPtr;
 begin
+  if FJambaInner = 1 then
+  begin
+    ComputeJambaInner();
+    exit;
+  end;
   if FDState > 1 then
   begin
     ComputeMultiState();
@@ -42785,6 +42855,118 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+procedure TNNetSelectiveSSM.ComputeJambaInner();
+// HF JambaMambaMixer slow_forward (the recurrence part). The conv1d + SiLU
+// gating live in surrounding layers (the importer wires them); this layer
+// takes the conv'd hidden_states x_conv (Depth-long per timestep) and runs:
+//   ts   = x_proj_dt . x_conv        (FDtRank-long)
+//   dt   = softplus( dt_proj . (rms(ts)*dt_gain) + b_d )
+//   b_t  = rms(W_B . x_conv) * b_gain     (NS-long, rms over the NS axis)
+//   c_t  = rms(W_C . x_conv) * c_gain
+//   h_t[d,s] = exp(-dt[d]*exp(A_raw[d,s]))*h_{t-1}[d,s] + dt[d]*b_t[s]*x[d]
+//   y_t[d]   = sum_s c_t[s]*h_t[d,s] + D[d]*x[d]
+// rms(v) = v / sqrt(mean(v^2) + eps).  Forward-only (see Backpropagate).
+var
+  StartTime: double;
+  WdtProj, WB, WC, Bd, Ar, Ee, WxProj, GDt, GB, GC, Prev: TNNetVolume;
+  SeqLen, Depth, NS, RK, t, d, s, r, hbase, ebase: integer;
+  pre, sp, ad, hnew, accY, xd, ss, inv, eps: TNeuralFloat;
+  XtPtr, OutPtr, WdtRow: TNeuralFloatArrPtr;
+
+  function RmsScale(V: TNNetVolume; Cnt: integer): TNeuralFloat;
+  var k: integer; acc: TNeuralFloat;
+  begin
+    acc := 0;
+    for k := 0 to Cnt - 1 do acc := acc + V.FData[k] * V.FData[k];
+    Result := 1.0 / Sqrt(acc / Cnt + eps);
+  end;
+
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  WdtProj := FNeurons[0].FWeights;   // dt_proj.weight (Depth,1,RK)
+  WB := FNeurons[1].FWeights;        // W_B (NS,1,Depth)
+  WC := FNeurons[2].FWeights;        // W_C (NS,1,Depth)
+  Bd := FNeurons[3].FWeights;        // dt_proj.bias (Depth)
+  Ar := FNeurons[4].FWeights;        // A_log (Depth,1,NS)
+  Ee := FNeurons[5].FWeights;        // D (Depth)
+  WxProj := FNeurons[6].FWeights;    // x_proj_dt (RK,1,Depth)
+  GDt := FNeurons[7].FWeights;       // dt_gain (RK)
+  GB := FNeurons[8].FWeights;        // b_gain (NS)
+  GC := FNeurons[9].FWeights;        // c_gain (NS)
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  NS := FDState;
+  RK := FDtRank;
+  eps := FFloatSt[0];
+  if eps <= 0 then eps := 1e-6;
+  for s := 0 to Ar.Size - 1 do
+    FExpA.FData[s] := Exp(Min(Ar.FData[s], 10));
+  FH.Fill(0);
+  for t := 0 to SeqLen - 1 do
+  begin
+    XtPtr := Prev.GetRawPtr(t, 0, 0);
+    OutPtr := FOutput.GetRawPtr(t, 0, 0);
+    // ts = x_proj_dt . x_conv, then RMSNorm(ts)*dt_gain.
+    for r := 0 to RK - 1 do
+      FTsBuf.FData[r] := TNNetVolume.DotProduct(
+        WxProj.GetRawPtr(r, 0, 0), XtPtr, Depth);
+    inv := RmsScale(FTsBuf, RK);
+    for r := 0 to RK - 1 do
+      FTsBuf.FData[r] := FTsBuf.FData[r] * inv * GDt.FData[r];
+    // dt[d] = softplus(dt_proj[d,:].ts_norm + b_d[d]).
+    for d := 0 to Depth - 1 do
+    begin
+      pre := Bd.FData[d];
+      WdtRow := WdtProj.GetRawPtr(d, 0, 0);
+      for r := 0 to RK - 1 do
+        pre := pre + WdtRow^[r] * FTsBuf.FData[r];
+      if pre > 30 then sp := pre
+      else if pre < -30 then sp := Exp(pre)
+      else sp := Ln(1 + Exp(pre));
+      FDelta.FData[(t * Depth) + d] := sp;
+    end;
+    // b_t / c_t = RMSNorm(W_{B,C} . x_conv) * gain, rms over the NS axis.
+    for s := 0 to NS - 1 do
+    begin
+      FBt.FData[(t * NS) + s] := TNNetVolume.DotProduct(
+        WB.GetRawPtr(s, 0, 0), XtPtr, Depth);
+      FCt.FData[(t * NS) + s] := TNNetVolume.DotProduct(
+        WC.GetRawPtr(s, 0, 0), XtPtr, Depth);
+    end;
+    ss := 0;
+    for s := 0 to NS - 1 do ss := ss + FBt.FData[(t * NS) + s] * FBt.FData[(t * NS) + s];
+    inv := 1.0 / Sqrt(ss / NS + eps);
+    for s := 0 to NS - 1 do
+      FBt.FData[(t * NS) + s] := FBt.FData[(t * NS) + s] * inv * GB.FData[s];
+    ss := 0;
+    for s := 0 to NS - 1 do ss := ss + FCt.FData[(t * NS) + s] * FCt.FData[(t * NS) + s];
+    inv := 1.0 / Sqrt(ss / NS + eps);
+    for s := 0 to NS - 1 do
+      FCt.FData[(t * NS) + s] := FCt.FData[(t * NS) + s] * inv * GC.FData[s];
+    // Recurrence + output sum over states.
+    for d := 0 to Depth - 1 do
+    begin
+      sp := FDelta.FData[(t * Depth) + d];
+      xd := XtPtr^[d];
+      hbase := ((t * Depth) + d) * NS;
+      ebase := d * NS;
+      accY := 0;
+      for s := 0 to NS - 1 do
+      begin
+        ad := Exp(-sp * FExpA.FData[ebase + s]);
+        FAt.FData[hbase + s] := ad;
+        hnew := ad * FH.FData[ebase + s] + sp * FBt.FData[(t * NS) + s] * xd;
+        FH.FData[ebase + s] := hnew;
+        FState.FData[hbase + s] := hnew;
+        accY := accY + FCt.FData[(t * NS) + s] * hnew;
+      end;
+      OutPtr^[d] := accY + Ee.FData[d] * xd;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 procedure TNNetSelectiveSSM.Backpropagate();
 var
   StartTime: double;
@@ -42801,6 +42983,9 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  if FJambaInner = 1 then
+    FErrorProc('TNNetSelectiveSSM Jamba inner-norm mode is forward-only ' +
+      '(used by the Jamba importer for inference); training it is not wired.');
   if FDState > 1 then
   begin
     BackpropagateMultiState();
@@ -43050,6 +43235,27 @@ begin
   // default (leaky accumulator + feedthrough).
   oldSeed := RandSeed;
   RandSeed := 314159;
+  if FStruct[1] = 1 then
+  begin
+    // Jamba inner-norm mode: weights are filled by the importer. Seed benign
+    // defaults so an un-loaded layer is still well-formed (gains = 1, identity
+    // feedthrough, S4D-real A_log, zero projections/bias).
+    FNeurons[0].FWeights.Fill(0);                 // dt_proj.weight
+    FNeurons[1].FWeights.Fill(0);                 // W_B
+    FNeurons[2].FWeights.Fill(0);                 // W_C
+    FNeurons[3].FWeights.Fill(0);                 // dt_proj.bias
+    for d := 0 to Depth - 1 do
+      for s := 0 to NS - 1 do
+        FNeurons[4].FWeights[d, 0, s] := Ln(1 + s);
+    FNeurons[5].FWeights.Fill(1);                 // D
+    FNeurons[6].FWeights.Fill(0);                 // x_proj_dt
+    FNeurons[7].FWeights.Fill(1);                 // dt_gain
+    FNeurons[8].FWeights.Fill(1);                 // b_gain
+    FNeurons[9].FWeights.Fill(1);                 // c_gain
+    RandSeed := oldSeed;
+    AfterWeightUpdate();
+    exit;
+  end;
   if NS = 1 then
   begin
     for d := 0 to Depth - 1 do

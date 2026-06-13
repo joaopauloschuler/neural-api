@@ -2410,6 +2410,103 @@ function BuildMambaFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
+// ============================ JAMBA IMPORT ================================
+// BuildJambaFromSafeTensors imports AI21's Jamba (HF model_type "jamba",
+// ai21labs/Jamba-tiny-dev / Jamba-Mini / Jamba-1.5) - the FIRST HYBRID
+// Mamba+attention+MoE decoder in this suite, and the first import that
+// composes three landed primitives in ONE stack: selective-SSM mixers
+// (TNNetSelectiveSSM), full softmax attention, and Mixtral-style top-k MoE.
+//
+// PER-LAYER BLOCK-TYPE SCHEDULE (the genuinely new piece; mirrors HF
+// configuration_jamba EXACTLY): layer i is an ATTENTION layer iff
+// i mod attn_layer_period = attn_layer_offset (else a MAMBA layer); its FFN
+// is an N-expert MoE iff i mod expert_layer_period = expert_layer_offset
+// (else a dense SwiGLU MLP). The 4 block kinds (mamba|attn) x (moe|dense)
+// can co-occur in any combination.
+//
+// Each block is pre-norm with two residuals (HF JambaAttention/MambaDecoder
+// Layer): x := x + Mixer(input_layernorm(x)); x := x + FFN(pre_ff_layernorm
+// (x)). RMSNorm throughout (eps rms_norm_eps). NO positional encoding at all
+// - the Mamba layers carry order; attention is NoPE (no RoPE in HF
+// JambaAttention.forward). Attention is bias-free GQA (num_key_value_heads),
+// scale head_dim^-0.5.
+//
+// The MAMBA mixer is HF JambaMambaMixer, which differs from plain Mamba by an
+// INNER per-vector RMSNorm on the dt / B / C selection vectors between x_proj
+// and the scan (dt_layernorm / b_layernorm / c_layernorm). That nonlinearity
+// cannot be folded into the constant projections the plain-Mamba importer
+// uses, so the SSM leaf is built in TNNetSelectiveSSM's forward-only Jamba
+// inner-norm mode (CreateJambaInner), which keeps the dt path unfolded and
+// applies the three inner RMSNorms itself. The surrounding wiring (in_proj
+// x|z split, depthwise causal conv1d + SiLU, SiLU(z) gate, out_proj) matches
+// the plain Mamba block.
+//
+// The MoE FFN is the Mixtral combine (router softmax over ALL experts, hard
+// top-k, SwiGLU experts) but with the top-k weights NOT renormalized (HF
+// JambaSparseMoeBlock takes the raw softmax probs of the selected experts).
+//
+// Causal-LM contract like the other decoder families: (SeqLen,1,1) token ids
+// in, (SeqLen,1,vocab) logits out. Multi-shard .index.json checkpoints are
+// supported (real Jamba is large/sharded). Jamba-Mini (52B, 12 active) and
+// the 1.5 line import on this exact path but are RAM-gated like the other
+// large checkpoints - use a sliced fixture for tests; never load a real one
+// in CI. Coded by Claude (AI).
+type
+  TJambaConfig = record
+    HiddenSize: integer;        // hidden_size (d_model)
+    IntermediateSize: integer;  // SwiGLU / per-expert width
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    NumKVHeads: integer;        // num_key_value_heads (GQA)
+    VocabSize: integer;         // vocab_size
+    RmsNormEps: TNeuralFloat;   // rms_norm_eps
+    TieWordEmbeddings: boolean; // tie_word_embeddings (default false)
+    NumExperts: integer;        // num_experts (the MoE expert count)
+    NumExpertsPerTok: integer;  // num_experts_per_tok (top-k)
+    ExpertLayerPeriod: integer; // expert_layer_period
+    ExpertLayerOffset: integer; // expert_layer_offset
+    AttnLayerPeriod: integer;   // attn_layer_period
+    AttnLayerOffset: integer;   // attn_layer_offset
+    MambaDState: integer;       // mamba_d_state
+    MambaDConv: integer;        // mamba_d_conv (conv kernel)
+    MambaExpand: integer;       // mamba_expand (d_inner = expand*hidden)
+    MambaDtRank: integer;       // mamba_dt_rank ("auto" = ceil(hidden/16))
+    MambaConvBias: boolean;     // mamba_conv_bias
+    MambaProjBias: boolean;     // mamba_proj_bias (in/out_proj bias)
+    DInner: integer;            // derived: MambaExpand*HiddenSize
+    ModelType: string;          // 'jamba'
+    Prefix: string;             // 'model.' (detected from the checkpoint)
+  end;
+
+// Reads an HF Jamba config.json (model_type "jamba"). Defaults follow
+// JambaConfig: num_key_value_heads = num_attention_heads, rms_norm_eps =
+// 1e-6, tie_word_embeddings false, num_experts 16, num_experts_per_tok 2,
+// expert_layer_period 2 / offset 1, attn_layer_period 8 / offset 4,
+// mamba_d_state 16, mamba_d_conv 4, mamba_expand 2, mamba_dt_rank "auto",
+// mamba_conv_bias true, mamba_proj_bias false.
+function ReadJambaConfigFromJSONFile(const FileName: string): TJambaConfig;
+
+function JambaConfigToString(const Config: TJambaConfig): string;
+
+// Per-layer block-type predicates (HF configuration_jamba, verbatim).
+function JambaLayerIsAttention(const Config: TJambaConfig;
+  LayerIdx: integer): boolean;
+function JambaLayerIsMoE(const Config: TJambaConfig;
+  LayerIdx: integer): boolean;
+
+function BuildJambaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TJambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildJambaFromSafeTensorsEx(const FileName: string;
+  out Config: TJambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildJambaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
 // ============================ BLOOM IMPORT =================================
 // BuildBloomFromSafeTensors rebuilds BigScience's BLOOM decoder (model_type
 // "bloom": bigscience/bloom-560m .. bloom-176B and the instruction-tuned
@@ -14566,6 +14663,575 @@ begin
     pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
+// ============================ JAMBA IMPORT (impl) =========================
+
+function ReadJambaConfigFromJSONFile(const FileName: string): TJambaConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+  Field: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Jamba import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Jamba import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Jamba import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Jamba import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Jamba import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'jamba');
+    if ModelType <> 'jamba' then
+      ImportError('Jamba import: config model_type is "' + ModelType +
+        '" - expected "jamba".');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if (Result.NumKVHeads < 1) or
+       ((Result.NumHeads mod Result.NumKVHeads) <> 0) then
+      ImportError('Jamba import: num_key_value_heads (' +
+        IntToStr(Result.NumKVHeads) + ') must divide num_attention_heads (' +
+        IntToStr(Result.NumHeads) + ').');
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    Result.NumExperts := Obj.Get('num_experts', 16);
+    Result.NumExpertsPerTok := Obj.Get('num_experts_per_tok', 2);
+    Result.ExpertLayerPeriod := Obj.Get('expert_layer_period', 2);
+    Result.ExpertLayerOffset := Obj.Get('expert_layer_offset', 1);
+    Result.AttnLayerPeriod := Obj.Get('attn_layer_period', 8);
+    Result.AttnLayerOffset := Obj.Get('attn_layer_offset', 4);
+    if (Result.AttnLayerOffset >= Result.AttnLayerPeriod) or
+       (Result.ExpertLayerOffset >= Result.ExpertLayerPeriod) then
+      ImportError('Jamba import: layer offset must be smaller than its ' +
+        'period (HF validate_architecture).');
+    Result.MambaDState := Obj.Get('mamba_d_state', 16);
+    Result.MambaDConv := Obj.Get('mamba_d_conv', 4);
+    Result.MambaExpand := Obj.Get('mamba_expand', 2);
+    Field := Obj.Find('mamba_dt_rank');
+    if (Field = nil) or Field.IsNull or
+       ((Field is TJSONString) and (Field.AsString = 'auto')) then
+      Result.MambaDtRank := (Result.HiddenSize + 15) div 16
+    else
+      Result.MambaDtRank := RequiredInt('mamba_dt_rank');
+    Result.MambaConvBias := Obj.Get('mamba_conv_bias', True);
+    Result.MambaProjBias := Obj.Get('mamba_proj_bias', False);
+    if Result.MambaProjBias then
+      ImportError('Jamba import: mamba_proj_bias=true is not wired (the ' +
+        'published Jamba checkpoints keep in/out_proj bias-free).');
+    Result.DInner := Result.MambaExpand * Result.HiddenSize;
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function JambaConfigToString(const Config: TJambaConfig): string;
+begin
+  Result := 'jamba config: layers=' + IntToStr(Config.NumLayers) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', inter=' + IntToStr(Config.IntermediateSize) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', experts=' + IntToStr(Config.NumExperts) +
+    ', top_k=' + IntToStr(Config.NumExpertsPerTok) +
+    ', attn(period=' + IntToStr(Config.AttnLayerPeriod) +
+    ',offset=' + IntToStr(Config.AttnLayerOffset) + ')' +
+    ', expert(period=' + IntToStr(Config.ExpertLayerPeriod) +
+    ',offset=' + IntToStr(Config.ExpertLayerOffset) + ')' +
+    ', d_inner=' + IntToStr(Config.DInner) +
+    ', d_state=' + IntToStr(Config.MambaDState) +
+    ', dt_rank=' + IntToStr(Config.MambaDtRank) +
+    ', conv_kernel=' + IntToStr(Config.MambaDConv);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+function JambaLayerIsAttention(const Config: TJambaConfig;
+  LayerIdx: integer): boolean;
+begin
+  Result := (LayerIdx mod Config.AttnLayerPeriod) = Config.AttnLayerOffset;
+end;
+
+function JambaLayerIsMoE(const Config: TJambaConfig;
+  LayerIdx: integer): boolean;
+begin
+  Result := (Config.NumExperts > 1) and
+    ((LayerIdx mod Config.ExpertLayerPeriod) = Config.ExpertLayerOffset);
+end;
+
+type
+  TJambaBlockLayers = record
+    InNorm, FfNorm: TNNetLayer;
+    // attention
+    QProj, KProj, VProj, OProj: TNNetLayer;
+    // mamba mixer
+    InProj, Conv, Scan, OutProj: TNNetLayer;
+    // dense FFN
+    GateUp, Down: TNNetLayer;
+    // MoE FFN
+    GateConv: TNNetLayer;
+    ExpertGateUp, ExpertDown: array of TNNetLayer;
+  end;
+
+function BuildJambaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TJambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TJambaBlockLayers;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSrc, ScanL, ZGate, Gated: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack, ExpertOut, GateTopK, GateE, GateEB: TNNetLayer;
+  KSlices, VSlices: array of TNNetLayer;
+  HeadOutputs, MoEBranches: array of TNNetLayer;
+  BlockCnt, SeqLen, i, j, HeadDim, QWidth, KVWidth, GroupSize: integer;
+  HeadCnt, KVHeadCnt, KVGroup, d, e: integer;
+  Tmp, XW, DtW: TNNetVolume;
+  MixP, FfP, AttP, LayerP, TensorNameStr: string;
+  Consumed: TStringList;
+  ConvBiasSuppress, NS, DI, RK: integer;
+  SliceChannels: array of integer;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // conv1d.weight [d_inner,1,k] (+ bias) into TNNetDepthwiseConv1D, exactly
+  // like the plain Mamba importer.
+  procedure LoadDepthwiseConv(Layer: TNNetLayer; const WName, BName: string);
+  var dd, kk: integer;
+  begin
+    if (not Reader.HasTensor(WName)) or (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> Config.DInner) or
+       (Reader.DimSize(WName, 1) <> 1) or
+       (Reader.DimSize(WName, 2) <> Config.MambaDConv) then
+      ImportError('Jamba import: "' + WName + '" must have shape [' +
+        IntToStr(Config.DInner) + ', 1, ' + IntToStr(Config.MambaDConv) +
+        '], got ' + Reader.ShapeAsString(WName));
+    Reader.LoadTensorFlat(WName, Tmp);
+    for dd := 0 to Config.DInner - 1 do
+      for kk := 0 to Config.MambaDConv - 1 do
+        Layer.Neurons[dd].Weights.FData[kk] :=
+          Tmp.FData[dd * Config.MambaDConv + kk];
+    MarkConsumed(WName);
+    if Config.MambaConvBias then
+    begin
+      Reader.LoadTensorFlat(BName, Tmp);
+      for dd := 0 to Config.DInner - 1 do
+        Layer.Neurons[dd].BiasWeight := Tmp.FData[dd];
+      MarkConsumed(BName);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+  procedure LoadVec(Layer: TNNetLayer; NeuronIdx: integer;
+    const TName: string; Cnt: integer);
+  var dd: integer;
+  begin
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Tmp.Size <> Cnt then
+      ImportError('Jamba import: "' + TName + '" must carry ' +
+        IntToStr(Cnt) + ' elements, got ' + Reader.ShapeAsString(TName));
+    for dd := 0 to Cnt - 1 do
+      Layer.Neurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
+    Layer.FlushWeightCache();
+    MarkConsumed(TName);
+  end;
+
+  // Jamba inner-norm SSM weights. Unlike plain Mamba, dt stays UNFOLDED:
+  // [0]=dt_proj.weight (DI,RK), [6]=x_proj_dt (RK,DI). W_B/W_C are the
+  // remaining x_proj rows; the three inner gains go to [7..9].
+  procedure LoadJambaScan(Layer: TNNetLayer; const MixPfx: string);
+  var d, j, r, s: integer;
+  begin
+    if (not Reader.HasTensor(MixPfx + 'x_proj.weight')) or
+       (Reader.DimSize(MixPfx + 'x_proj.weight', 0) <> RK + 2 * NS) or
+       (Reader.DimSize(MixPfx + 'x_proj.weight', 1) <> DI) then
+      ImportError('Jamba import: "' + MixPfx + 'x_proj.weight" must be [' +
+        IntToStr(RK + 2 * NS) + ', ' + IntToStr(DI) + '].');
+    if (not Reader.HasTensor(MixPfx + 'dt_proj.weight')) or
+       (Reader.DimSize(MixPfx + 'dt_proj.weight', 0) <> DI) or
+       (Reader.DimSize(MixPfx + 'dt_proj.weight', 1) <> RK) then
+      ImportError('Jamba import: "' + MixPfx + 'dt_proj.weight" must be [' +
+        IntToStr(DI) + ', ' + IntToStr(RK) + '].');
+    Reader.LoadTensorFlat(MixPfx + 'x_proj.weight', XW);
+    Reader.LoadTensorFlat(MixPfx + 'dt_proj.weight', DtW);
+    // [0] dt_proj.weight (DI rows of RK), [6] x_proj_dt (RK rows of DI).
+    for d := 0 to DI - 1 do
+      for r := 0 to RK - 1 do
+        Layer.Neurons[0].Weights.FData[d * RK + r] := DtW.FData[d * RK + r];
+    for r := 0 to RK - 1 do
+      for j := 0 to DI - 1 do
+        Layer.Neurons[6].Weights.FData[r * DI + j] := XW.FData[r * DI + j];
+    // W_B / W_C: the d_state + d_state rows after the dt rows.
+    for s := 0 to NS - 1 do
+      for j := 0 to DI - 1 do
+      begin
+        Layer.Neurons[1].Weights.FData[s * DI + j] := XW.FData[(RK + s) * DI + j];
+        Layer.Neurons[2].Weights.FData[s * DI + j] := XW.FData[(RK + NS + s) * DI + j];
+      end;
+    MarkConsumed(MixPfx + 'x_proj.weight');
+    MarkConsumed(MixPfx + 'dt_proj.weight');
+    LoadVec(Layer, 3, MixPfx + 'dt_proj.bias', DI);       // b_d
+    LoadVec(Layer, 4, MixPfx + 'A_log', DI * NS);         // A_raw (raw copy)
+    LoadVec(Layer, 5, MixPfx + 'D', DI);                  // D skip
+    LoadVec(Layer, 7, MixPfx + 'dt_layernorm.weight', RK);// dt inner gain
+    LoadVec(Layer, 8, MixPfx + 'b_layernorm.weight', NS); // B inner gain
+    LoadVec(Layer, 9, MixPfx + 'c_layernorm.weight', NS); // C inner gain
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  XW := TNNetVolume.Create;
+  DtW := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if Config.NumLayers < 1 then
+        ImportError('Jamba import: num_hidden_layers must be >= 1.');
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Jamba import: neither "model.embed_tokens.weight" nor ' +
+          '"embed_tokens.weight" found in ' + Reader.FileName +
+          ' - not a Jamba checkpoint?');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      QWidth := Config.NumHeads * HeadDim;
+      KVWidth := Config.NumKVHeads * HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+      NS := Config.MambaDState;
+      DI := Config.DInner;
+      RK := Config.MambaDtRank;
+      if Config.MambaConvBias then ConvBiasSuppress := 0
+      else ConvBiasSuppress := 1;
+      if pSeqLen <= 0 then SeqLen := 1024 else SeqLen := pSeqLen;
+
+      // ---------------- Architecture (NO positional encoding) ----------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(KSlices, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // ---- mixer sub-block: x := x + Mixer(input_layernorm(x)) ----
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].InNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        NormedSrc := NN.GetLastLayer();
+        if JambaLayerIsAttention(Config, BlockCnt) then
+        begin
+          // Bias-free GQA, NoPE. Pack [Q_h|K_g|V_g] per query head -> SDPA.
+          Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(QWidth, 1), NormedSrc);
+          Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+          Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+          for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+          begin
+            for d := 0 to HeadDim - 1 do
+              SliceChannels[d] := KVHeadCnt * HeadDim + d;
+            KSlices[KVHeadCnt] := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
+            VSlices[KVHeadCnt] := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
+          end;
+          for HeadCnt := 0 to Config.NumHeads - 1 do
+          begin
+            KVGroup := HeadCnt div GroupSize;
+            for d := 0 to HeadDim - 1 do
+              SliceChannels[d] := HeadCnt * HeadDim + d;
+            QSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+            HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+              [QSlice, KSlices[KVGroup], VSlices[KVGroup]]) );
+            HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+              TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true),
+              HeadPack);
+          end;
+          NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+          Blocks[BlockCnt].OProj := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+        end
+        else
+        begin
+          // Mamba mixer (HF JambaMambaMixer): in_proj x|z split, depthwise
+          // causal conv1d + SiLU, the inner-norm selective scan, SiLU(z)
+          // gate, out_proj.
+          Blocks[BlockCnt].InProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(2 * DI, 1), NormedSrc);
+          NN.AddLayerAfter( TNNetSplitChannels.Create(0, DI),
+            Blocks[BlockCnt].InProj );
+          Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
+            Config.MambaDConv, {pCausal=}true, ConvBiasSuppress) );
+          NN.AddLayer( TNNetSiLU.Create() );
+          Blocks[BlockCnt].Scan := NN.AddLayer(
+            TNNetSelectiveSSM.CreateJambaInner(NS, RK, Config.RmsNormEps) );
+          ScanL := Blocks[BlockCnt].Scan;
+          NN.AddLayerAfter( TNNetSplitChannels.Create(DI, DI),
+            Blocks[BlockCnt].InProj );
+          ZGate := NN.AddLayer( TNNetSiLU.Create() );
+          Gated := NN.AddLayer( TNNetCellMulByCell.Create(ScanL, ZGate) );
+          Blocks[BlockCnt].OutProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1), Gated );
+        end;
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+
+        // ---- FFN sub-block: x := x + FFN(pre_ff_layernorm(x)) ----
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].FfNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        NormedSrc := NN.GetLastLayer();
+        if JambaLayerIsMoE(Config, BlockCnt) then
+        begin
+          // Mixtral combine but NOT renormalized (HF JambaSparseMoeBlock
+          // takes the RAW top-k softmax probs).
+          SetLength(Blocks[BlockCnt].ExpertGateUp, Config.NumExperts);
+          SetLength(Blocks[BlockCnt].ExpertDown, Config.NumExperts);
+          SetLength(MoEBranches, Config.NumExperts);
+          Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.NumExperts), NormedSrc);
+          NN.AddLayer( TNNetPointwiseSoftMax.Create() );
+          GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+            Config.NumExpertsPerTok, {pRenormalize=}false) );
+          for e := 0 to Config.NumExperts - 1 do
+          begin
+            Blocks[BlockCnt].ExpertGateUp[e] := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize),
+              NormedSrc);
+            NN.AddLayer( TNNetSwiGLU.Create() );
+            Blocks[BlockCnt].ExpertDown[e] := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+            ExpertOut := NN.GetLastLayer();
+            GateE := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(e, 1), GateTopK);
+            GateEB := NN.AddLayer(
+              TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
+            MoEBranches[e] := NN.AddLayer(
+              TNNetCellMulByCell.Create(ExpertOut, GateEB) );
+          end;
+          NN.AddLayer( TNNetSum.Create(MoEBranches) );
+          SetLength(MoEBranches, 0);
+        end
+        else
+        begin
+          Blocks[BlockCnt].GateUp := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+          NN.AddLayer( TNNetSwiGLU.Create() );
+          Blocks[BlockCnt].Down := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        end;
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      LMHead := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        ImportError('Jamba import: embed_tokens.weight size mismatch.');
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+      if Config.TieWordEmbeddings then
+      begin
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then MarkConsumed('lm_head.weight');
+      end
+      else
+      begin
+        LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+          Config.HiddenSize, Config.VocabSize);
+        MarkConsumed('lm_head.weight');
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].InNorm,
+          LayerP + 'input_layernorm.weight', Config.HiddenSize);
+        MarkConsumed(LayerP + 'input_layernorm.weight');
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].FfNorm,
+          LayerP + 'pre_ff_layernorm.weight', Config.HiddenSize);
+        MarkConsumed(LayerP + 'pre_ff_layernorm.weight');
+        if JambaLayerIsAttention(Config, BlockCnt) then
+        begin
+          AttP := LayerP + 'self_attn.';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+            AttP + 'q_proj.weight', Config.HiddenSize, QWidth);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+            AttP + 'k_proj.weight', Config.HiddenSize, KVWidth);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+            AttP + 'v_proj.weight', Config.HiddenSize, KVWidth);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+            AttP + 'o_proj.weight', QWidth, Config.HiddenSize);
+          MarkConsumed(AttP + 'q_proj.weight');
+          MarkConsumed(AttP + 'k_proj.weight');
+          MarkConsumed(AttP + 'v_proj.weight');
+          MarkConsumed(AttP + 'o_proj.weight');
+        end
+        else
+        begin
+          MixP := LayerP + 'mamba.';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].InProj,
+            MixP + 'in_proj.weight', Config.HiddenSize, 2 * DI);
+          MarkConsumed(MixP + 'in_proj.weight');
+          LoadDepthwiseConv(Blocks[BlockCnt].Conv,
+            MixP + 'conv1d.weight', MixP + 'conv1d.bias');
+          LoadJambaScan(Blocks[BlockCnt].Scan, MixP);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutProj,
+            MixP + 'out_proj.weight', DI, Config.HiddenSize);
+          MarkConsumed(MixP + 'out_proj.weight');
+        end;
+        FfP := LayerP + 'feed_forward.';
+        if JambaLayerIsMoE(Config, BlockCnt) then
+        begin
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateConv,
+            FfP + 'router.weight', Config.HiddenSize, Config.NumExperts);
+          MarkConsumed(FfP + 'router.weight');
+          for e := 0 to Config.NumExperts - 1 do
+          begin
+            // SwiGLU fused: up_proj (w3) in 0..I-1, gate_proj (w1) in I..2I-1.
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[e],
+              FfP + 'experts.' + IntToStr(e) + '.up_proj.weight',
+              Config.HiddenSize, Config.IntermediateSize, 0,
+              2 * Config.IntermediateSize);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[e],
+              FfP + 'experts.' + IntToStr(e) + '.gate_proj.weight',
+              Config.HiddenSize, Config.IntermediateSize,
+              Config.IntermediateSize, 2 * Config.IntermediateSize);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertDown[e],
+              FfP + 'experts.' + IntToStr(e) + '.down_proj.weight',
+              Config.IntermediateSize, Config.HiddenSize);
+            MarkConsumed(FfP + 'experts.' + IntToStr(e) + '.up_proj.weight');
+            MarkConsumed(FfP + 'experts.' + IntToStr(e) + '.gate_proj.weight');
+            MarkConsumed(FfP + 'experts.' + IntToStr(e) + '.down_proj.weight');
+          end;
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+            FfP + 'up_proj.weight', Config.HiddenSize,
+            Config.IntermediateSize, 0, 2 * Config.IntermediateSize);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+            FfP + 'gate_proj.weight', Config.HiddenSize,
+            Config.IntermediateSize, Config.IntermediateSize,
+            2 * Config.IntermediateSize);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
+            FfP + 'down_proj.weight', Config.IntermediateSize,
+            Config.HiddenSize);
+          MarkConsumed(FfP + 'up_proj.weight');
+          MarkConsumed(FfP + 'gate_proj.weight');
+          MarkConsumed(FfP + 'down_proj.weight');
+        end;
+      end;
+      LoadLlamaRMSNormWeights(Reader, FinalNorm,
+        Config.Prefix + 'final_layernorm.weight', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'final_layernorm.weight');
+
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Jamba import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    DtW.Free;
+    XW.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildJambaFromSafeTensorsEx(const FileName: string;
+  out Config: TJambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadJambaConfigFromJSONFile(ConfigPath);
+  Result := BuildJambaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildJambaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TJambaConfig;
+begin
+  Result := BuildJambaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
 // ============================ BLOOM IMPORT =================================
 
 function ReadBloomConfigFromJSONFile(const FileName: string): TBloomConfig;
@@ -17668,6 +18334,7 @@ var
   IgnoredBertConfig: TBertConfig;
   IgnoredRWKVConfig: TRWKVConfig;
   IgnoredMambaConfig: TMambaConfig;
+  IgnoredJambaConfig: TJambaConfig;
   IgnoredBloomConfig: TBloomConfig;
   IgnoredFalconConfig: TFalconConfig;
   IgnoredModernBertConfig: TModernBertConfig;
@@ -17849,6 +18516,13 @@ begin
     // like the decoder families ((SeqLen,1,1) ids in, (SeqLen,1,vocab)
     // logits out). See the MAMBA IMPORT section.
     Result := BuildMambaFromSafeTensorsEx(WeightsPath, IgnoredMambaConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'jamba' then
+    // The first HYBRID route: Jamba (architectures ["JambaForCausalLM"]) -
+    // interleaved Mamba / softmax-attention layers with per-layer dense or
+    // top-k MoE FFNs on the config schedule. NoPE, RMSNorm, GQA. Causal-LM
+    // contract like the other decoder families. See the JAMBA IMPORT section.
+    Result := BuildJambaFromSafeTensorsEx(WeightsPath, IgnoredJambaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'bloom' then
     // The ALiBi route: BLOOM (architectures ["BloomForCausalLM"]), no

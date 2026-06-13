@@ -166,6 +166,7 @@ type
     procedure TestMixtralLogitParity;
     procedure TestRWKVLogitParity;
     procedure TestMambaLogitParity;
+    procedure TestJambaLogitParity;
     procedure TestBloomLogitParity;
     procedure TestModernBertHiddenStateParity;
     procedure TestDeepSeekV2LogitParity;
@@ -5068,6 +5069,80 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_mamba_logits.json'), 8, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the JAMBA import target - the suite's FIRST HYBRID
+// Mamba+attention+MoE decoder (HF model_type "jamba", architectures
+// ["JambaForCausalLM"], the ai21labs/Jamba-tiny-dev / Jamba-Mini family).
+// tests/fixtures/tiny_jamba.* is a pico RANDOM model (6 layers covering all
+// four block kinds: mamba-dense, attn-moe, mamba-dense, attn-dense,
+// mamba-moe, attn-dense via attn_period=2/offset=1 and
+// expert_period=3/offset=1) with 2 experts / top-1, GQA (4 q heads, 2 kv
+// heads), d_state=4, dt_rank=3 and the inner dt/B/C RMSNorms. The reference
+// logits are a float64 reimplementation of HF modeling_jamba slow_forward,
+// cross-checked against real transformers (== HF to 3.5e-5, i.e. f32-vs-f64
+// rounding) - see tools/jamba_tiny_fixture.py. Quirks on the parity path:
+//   - the per-layer block-type schedule (mamba|attn x moe|dense);
+//   - NoPE (no positional encoding anywhere) + GQA bias-free attention;
+//   - the Mamba mixer's inner per-vector dt/B/C RMSNorm (TNNetSelectiveSSM
+//     Jamba inner-norm mode), which a folded importer cannot represent;
+//   - non-renormalized top-k MoE routing (raw softmax probs).
+procedure TTestNeuralPretrained.TestJambaLogitParity;
+var
+  NN: TNNet;
+  Config: TJambaConfig;
+  LayerCnt, ScanCnt, AttnCnt, MoEGate, SwiGLUCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildJambaFromSafeTensorsEx(FixturePath('tiny_jamba.safetensors'),
+    Config, {SeqLen=}7, {pInferenceOnly=}false,
+    FixturePath('tiny_jamba_config.json'));
+  try
+    AssertEquals('model_type', 'jamba', Config.ModelType);
+    AssertEquals('layers', 6, Config.NumLayers);
+    AssertEquals('hidden', 8, Config.HiddenSize);
+    AssertEquals('inter', 12, Config.IntermediateSize);
+    AssertEquals('heads', 4, Config.NumHeads);
+    AssertEquals('kv_heads (GQA)', 2, Config.NumKVHeads);
+    AssertEquals('d_inner', 16, Config.DInner);
+    AssertEquals('d_state', 4, Config.MambaDState);
+    AssertEquals('dt_rank', 3, Config.MambaDtRank);
+    AssertEquals('experts', 2, Config.NumExperts);
+    AssertEquals('top_k', 1, Config.NumExpertsPerTok);
+    AssertEquals('vocab', 17, Config.VocabSize);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    // Schedule: attn at i mod 2 = 1 (layers 1,3,5 -> 3 attention layers, the
+    // other 3 are mamba); MoE at i mod 3 = 1 (layers 1,4 -> 2 MoE FFNs).
+    ScanCnt := 0; AttnCnt := 0; MoEGate := 0; SwiGLUCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetSelectiveSSM then Inc(ScanCnt);
+      if NN.Layers[LayerCnt] is TNNetScaledDotProductAttention then Inc(AttnCnt);
+      if NN.Layers[LayerCnt] is TNNetSwiGLU then Inc(SwiGLUCnt);
+    end;
+    // 3 mamba layers -> 3 selective-SSM leaves.
+    AssertEquals('TNNetSelectiveSSM count (1 per mamba layer)', 3, ScanCnt);
+    // 3 attention layers x 4 query heads = 12 SDPA heads.
+    AssertEquals('SDPA head count (4 heads x 3 attn layers)', 12, AttnCnt);
+    // SwiGLU: dense layers 1 each (4 dense FFNs) + MoE layers 2 experts each
+    // (2 MoE FFNs x 2 = 4) = 8.
+    AssertEquals('SwiGLU count (4 dense + 2x2 experts)', 8, SwiGLUCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_jamba_logits.json'), 7, Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "jamba" (architectures ["JambaForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_jamba.safetensors'),
+    {SeqLen=}7, {pInferenceOnly=}true,
+    FixturePath('tiny_jamba_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_jamba_logits.json'), 7, 17);
   finally
     NN.Free;
   end;
