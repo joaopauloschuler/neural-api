@@ -223,6 +223,36 @@ rather than acted on.
       BuildGPT2FromSafeTensors and compare logits; generalize per-importer
       name maps later. The generic writer landed; only the naming/transpose
       mapping (Pascal neuron-major vs HF [in,out] Conv1D) is missing.
+- [ ] GGUF WRITER / export path (neural/neuralgguf.pas currently READS only:
+      TNNetGGUFReader F32/F16/Q8_0 + BuildLlamaFromGGUF). Add a
+      TNNetGGUFWriter / SaveNNetToGGUF that emits a llama.cpp-loadable .gguf
+      for an imported-or-trained Llama-family decoder, so CAI models can run
+      in the dominant local-inference ecosystem (llama.cpp / ollama / LM
+      Studio) — the export mirror of the landed reader and the natural
+      interop sibling of the safetensors writer and the separate ONNX-export
+      task (different runtime, F16/Q8_0 quantized output is the headline GGUF
+      can do that ONNX/safetensors do not). The genuinely new work: (a) the
+      ggml binary container — magic/version, the typed key/value metadata
+      block (general.architecture="llama", the llama.* hyperparameters
+      block_count/embedding_length/attention.head_count[_kv]/rope.* /
+      context_length, plus the tokenizer.ggml.* model/tokens/merges/scores/
+      token-type arrays so a single .gguf is self-contained, reusing the
+      vocab already carried by the importers), and (b) the tensor section
+      with ggml's REVERSED dimension order and 32-byte alignment, writing
+      back the HF-canonical names llama.cpp expects (token_embd, blk.N.attn_q/
+      k/v/output, blk.N.ffn_gate/up/down, *_norm, output_norm, output) and
+      UNDOING the importer's rotate_half q/k permutation + SwiGLU up|gate
+      split so a llama.cpp round-trip reproduces logits. v1: F32 + F16 +
+      Q8_0 output (Q8_0 dovetails with the landed int8 weight-only storage —
+      write its blocks straight out instead of re-quantizing). Deliverables:
+      SaveNNetToGGUF[Ex], a tools/verify_gguf_writer.py cross-check that
+      loads the emitted file with the gguf python package (and, when present,
+      llama-cpp-python) and asserts dimensions/metadata and next-token logits
+      vs the Pascal model within tolerance, and a round-trip test that writes
+      a pico-Llama then re-imports it via the landed BuildLlamaFromGGUF and
+      compares logits bit-for-bit. Scope v1 to the Llama family (the
+      best-covered importer path); document other architectures as
+      out-of-scope, same as the ONNX-export task.
 - [ ] Knowledge distillation trainer (transformers DistillationTrainer /
       classic Hinton KD): temperature-softened KL between a frozen teacher's
       logits and the student's, blended with the hard-label loss
