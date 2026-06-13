@@ -922,6 +922,32 @@ procedure SaveLlamaToGGUFEx(Reader: TNNetSafeTensorsReader;
 procedure SaveLlamaToGGUF(Reader: TNNetSafeTensorsReader;
   const Config: TLlamaConfig; const FileName: string);
 
+// Exports a from-scratch CAI-trained (or imported) Llama held PURELY in wired
+// TNNet layers to GGUF - the inverse mapping of BuildLlamaFromTensorReader's
+// weight load. Net must be the exact plain-Llama layer stack
+// BuildLlamaFromSafeTensors produces (token embedding, per-block TokenRMSNorm
+// + Q/K/V/O PointwiseConvLinear projections + RMSNorm + fused SwiGLU gate|up /
+// down, final norm, output head); the architecture is described by Config (the
+// same TLlamaConfig the importer/SaveLlamaToGGUF takes - this does NOT infer
+// hyperparameters from layer shapes). Internally it reads the weights back OUT
+// of the wired layers into an in-memory HF-named tensor source (de-fusing the
+// SwiGLU gate|up split and DE-permuting q/k from the interleaved-rotary neuron
+// layout back to HF rotate_half) and then rides the existing SaveLlamaToGGUFEx
+// emitter, so the q/k re-permute, reversed ggml dims and F32/F16/Q8_0 paths are
+// shared byte-for-byte with the reader-source export. The same out-of-scope
+// architecture deltas (MoE/fused-qkv/sandwich/QK-norm/partial-rotary/per-layer
+// theta/soft-cap/embed-scale) are rejected loudly. pDType selects the on-disk
+// matrix encoding (gwF32 lossless default; gwF16/gwQ8_0 lossy). Q8_0 here
+// re-quantizes from the FP32 layer weights (writing Q8_0 STRAIGHT from int8
+// quantized storage is a separate follow-up). Coded by Claude (AI).
+procedure SaveTNNetLlamaToGGUFEx(Net: TNNet;
+  const Config: TLlamaConfig; const Tokens: array of string;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+// As SaveTNNetLlamaToGGUFEx with the F32 (lossless) encoding and no tokenizer
+// block.
+procedure SaveTNNetLlamaToGGUF(Net: TNNet;
+  const Config: TLlamaConfig; const FileName: string);
+
 // Mistral: the Llama skeleton + optional sliding-window attention (config
 // sliding_window; null/absent = full attention). Thin wrappers over the
 // Llama path that ASSERT the config's model_type is 'mistral'.
@@ -5890,6 +5916,350 @@ var
 begin
   SetLength(NoTokens, 0);
   SaveLlamaToGGUFEx(Reader, Config, NoTokens, FileName, gwF32);
+end;
+
+type
+  // In-memory HF-named tensor source: holds row-major F32 tensors handed to
+  // it (a private copy each) and serves them through the parent reader's
+  // metadata accessors (HasTensor/DimCount/...) + an overridden LoadTensorFlat.
+  // Built bare (CreateBare) so the parent never tries to parse a file; the
+  // FTensors table is populated with synthetic F32 entries whose byte offsets
+  // index FData rather than a stream. Lets the TNNet->GGUF exporter reuse the
+  // existing reader-source SaveLlamaToGGUFEx emitter verbatim. Coded by Claude
+  // (AI).
+  TNNetMemTensorReader = class(TNNetSafeTensorsReader)
+  private
+    FData: array of TNNetVolume;  // one volume per FTensors entry (owned)
+  public
+    constructor Create;
+    destructor Destroy; override;
+    // Adds a named row-major tensor (a private copy of Src is kept).
+    procedure AddTensor(const pName: string; const pShape: array of Int64;
+      Src: TNNetVolume);
+    procedure LoadTensorFlat(const pName: string;
+      Dest: TNNetVolume); override;
+  end;
+
+constructor TNNetMemTensorReader.Create;
+begin
+  inherited CreateBare;
+  FFileName := '<in-memory TNNet weights>';
+end;
+
+destructor TNNetMemTensorReader.Destroy;
+var
+  i: integer;
+begin
+  for i := 0 to High(FData) do
+    FData[i].Free;
+  inherited Destroy;
+end;
+
+procedure TNNetMemTensorReader.AddTensor(const pName: string;
+  const pShape: array of Int64; Src: TNNetVolume);
+var
+  Idx, i: integer;
+  Elems: Int64;
+  V: TNNetVolume;
+begin
+  if HasTensor(pName) then
+    ImportError('TNNet GGUF export: duplicate tensor "' + pName + '".');
+  Elems := 1;
+  for i := 0 to High(pShape) do Elems := Elems * pShape[i];
+  if Elems <> Src.Size then
+    ImportError('TNNet GGUF export: tensor "' + pName + '" shape product ' +
+      IntToStr(Elems) + ' <> source element count ' + IntToStr(Src.Size) + '.');
+  Idx := Length(FData);
+  SetLength(FData, Idx + 1);
+  V := TNNetVolume.Create;
+  V.Copy(Src);
+  FData[Idx] := V;
+  SetLength(FTensors, Idx + 1);
+  FTensors[Idx].Name := pName;
+  FTensors[Idx].DType := 'F32';
+  SetLength(FTensors[Idx].Shape, Length(pShape));
+  for i := 0 to High(pShape) do FTensors[Idx].Shape[i] := pShape[i];
+  // Byte offsets are unused by the override below, but keep them consistent.
+  FTensors[Idx].DataBegin := 0;
+  FTensors[Idx].DataEnd := Elems * 4;
+  FTensors[Idx].Shard := 0;
+end;
+
+procedure TNNetMemTensorReader.LoadTensorFlat(const pName: string;
+  Dest: TNNetVolume);
+var
+  Idx: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    ImportError('TNNet GGUF export: tensor "' + pName + '" not found.');
+  Dest.Copy(FData[Idx]);
+end;
+
+procedure SaveTNNetLlamaToGGUFEx(Net: TNNet;
+  const Config: TLlamaConfig; const Tokens: array of string;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+var
+  Reader: TNNetMemTensorReader;
+  HeadDim, QWidth, KVWidth, b, j, i, c: integer;
+  HalfDim, h, k, IntSize: integer;
+  NormGainOffset: TNeuralFloat;
+  Linears, Norms: array of TNNetLayer;
+  Embed: TNNetLayer;
+  Lay: TNNetLayer;
+  V: TNNetVolume;
+  BlockPrefix: string;
+
+  // Reads a bias-free [OutDim, InDim] PointwiseConvLinear back into a flat
+  // row-major [OutDim*InDim] volume (neuron j weight i = W[j*InDim+i]).
+  procedure DumpLinear(Layer: TNNetLayer; OutDim, InDim: integer;
+    const HFName: string);
+  var
+    jj, ii: integer;
+  begin
+    if Layer.Neurons.Count <> OutDim then
+      ImportError('TNNet GGUF export: layer for "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+        IntToStr(OutDim) + '.');
+    V.ReSize(OutDim * InDim, 1, 1);
+    for jj := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[jj].Weights.Size <> InDim then
+        ImportError('TNNet GGUF export: neuron ' + IntToStr(jj) + ' of "' +
+          HFName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for ii := 0 to InDim - 1 do
+        V.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+    end;
+    Reader.AddTensor(HFName, [OutDim, InDim], V);
+  end;
+
+  // Reads a TokenRMSNorm gain [d] back (un-folding the Gemma +offset).
+  procedure DumpNorm(Layer: TNNetLayer; d: integer; const HFName: string);
+  var
+    ii: integer;
+  begin
+    if Layer.Neurons[0].Weights.Size < d then
+      ImportError('TNNet GGUF export: norm "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' gains, expected >= ' +
+        IntToStr(d) + '.');
+    V.ReSize(d, 1, 1);
+    for ii := 0 to d - 1 do
+      V.FData[ii] := Layer.Neurons[0].Weights.FData[ii] - NormGainOffset;
+    Reader.AddTensor(HFName, [d], V);
+  end;
+
+begin
+  // ---- reject the out-of-scope architecture deltas (mirror SaveLlamaToGGUFEx
+  //      so the wired stack is guaranteed to be the plain-Llama layout this
+  //      walker understands; the emitter rejects them again, but a clear
+  //      message here precedes the layer walk) ----
+  if Config.IsMoE then
+    ImportError('TNNet GGUF export: MoE models are out of scope for v1.');
+  if Config.FusedQKVGateUp or Config.FusedGateUp then
+    ImportError('TNNet GGUF export: fused qkv/gate-up projections are out ' +
+      'of scope for v1.');
+  if Config.SandwichNorm or Config.GLM4SandwichNorm or
+     Config.PostNormReordered then
+    ImportError('TNNet GGUF export: sandwich/reordered norms are out of ' +
+      'scope for v1.');
+  if Config.QKNorm or Config.QKNormFullWidth then
+    ImportError('TNNet GGUF export: q/k RMSNorm models are out of scope ' +
+      'for v1.');
+  if Config.QKVBias then
+    ImportError('TNNet GGUF export: q/k/v projection biases are out of ' +
+      'scope for v1.');
+  if (Config.PartialRotaryFactor > 0) and (Config.PartialRotaryFactor < 1) then
+    ImportError('TNNet GGUF export: partial rotary is out of scope for v1.');
+  if Config.InterleavedRotary then
+    ImportError('TNNet GGUF export: interleaved-rotary families are out of ' +
+      'scope for v1.');
+  if Config.GegluFFN then
+    ImportError('TNNet GGUF export: gated-GELU FFN (Gemma) is out of scope ' +
+      'for v1.');
+  if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1) then
+    ImportError('TNNet GGUF export: embedding scaling (Gemma) is out of ' +
+      'scope for v1.');
+  if (Config.QueryPreAttnScalar <> 0) or (Config.AttnLogitSoftCap <> 0) or
+     (Config.FinalLogitSoftCap <> 0) then
+    ImportError('TNNet GGUF export: Gemma-2 score scaling / soft-capping ' +
+      'is out of scope for v1.');
+  if Config.RopeLocalTheta > 0 then
+    ImportError('TNNet GGUF export: per-layer RoPE theta (Gemma-3) is out ' +
+      'of scope for v1.');
+
+  if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+  else HeadDim := Config.HiddenSize div Config.NumHeads;
+  QWidth := Config.NumHeads * HeadDim;
+  KVWidth := Config.NumKVHeads * HeadDim;
+  HalfDim := HeadDim div 2;
+  IntSize := Config.IntermediateSize;
+  if Config.RMSNormAddOne then NormGainOffset := 1.0 else NormGainOffset := 0;
+
+  // ---- collect the load-bearing layers in net order. For the plain-Llama
+  //      stack the only TNNetPointwiseConvLinear layers are, per block,
+  //      QProj/KProj/VProj/OProj then GateUp/Down (6), followed by the LM
+  //      head; the only TNNetTokenRMSNorm layers are AttnNorm/MlpNorm per
+  //      block (2) then the final norm. Per-head slices are TNNetSplitChannels
+  //      so they do not pollute either list. ----
+  Embed := nil;
+  SetLength(Linears, 0);
+  SetLength(Norms, 0);
+  for i := 0 to Net.Layers.Count - 1 do
+  begin
+    Lay := Net.Layers[i];
+    if Lay is TNNetEmbedding then
+    begin
+      if Embed <> nil then
+        ImportError('TNNet GGUF export: more than one TNNetEmbedding layer ' +
+          '- not the plain-Llama stack this exporter understands.');
+      Embed := Lay;
+    end
+    else if Lay is TNNetPointwiseConvLinear then
+    begin
+      SetLength(Linears, Length(Linears) + 1);
+      Linears[High(Linears)] := Lay;
+    end
+    else if Lay is TNNetTokenRMSNorm then
+    begin
+      SetLength(Norms, Length(Norms) + 1);
+      Norms[High(Norms)] := Lay;
+    end;
+  end;
+  if Embed = nil then
+    ImportError('TNNet GGUF export: no TNNetEmbedding layer found - not a ' +
+      'Llama TNNet stack?');
+  if Length(Linears) <> Config.NumLayers * 6 + 1 then
+    ImportError('TNNet GGUF export: found ' + IntToStr(Length(Linears)) +
+      ' linear projections, expected ' + IntToStr(Config.NumLayers * 6 + 1) +
+      ' (6 per block + LM head) - not the plain-Llama stack, or wrong ' +
+      'num_hidden_layers in Config.');
+  if Length(Norms) <> Config.NumLayers * 2 + 1 then
+    ImportError('TNNet GGUF export: found ' + IntToStr(Length(Norms)) +
+      ' RMSNorms, expected ' + IntToStr(Config.NumLayers * 2 + 1) +
+      ' (2 per block + final norm).');
+
+  Reader := TNNetMemTensorReader.Create;
+  V := TNNetVolume.Create;
+  try
+    // ---- token embedding table [vocab, hidden] (row-major, straight) ----
+    if Embed.Neurons[0].Weights.Size <> Config.VocabSize * Config.HiddenSize then
+      ImportError('TNNet GGUF export: embedding table has ' +
+        IntToStr(Embed.Neurons[0].Weights.Size) + ' elements, expected ' +
+        IntToStr(Config.VocabSize * Config.HiddenSize) + '.');
+    V.Copy(Embed.Neurons[0].Weights);
+    Reader.AddTensor('model.embed_tokens.weight',
+      [Config.VocabSize, Config.HiddenSize], V);
+
+    for b := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := 'model.layers.' + IntToStr(b) + '.';
+      // attn_norm = AttnNorm (norm 2*b), ffn_norm = MlpNorm (norm 2*b+1).
+      DumpNorm(Norms[2 * b], Config.HiddenSize,
+        BlockPrefix + 'input_layernorm.weight');
+      DumpNorm(Norms[2 * b + 1], Config.HiddenSize,
+        BlockPrefix + 'post_attention_layernorm.weight');
+
+      // Q/K/V/O = Linears[6*b .. 6*b+3]; GateUp/Down = Linears[6*b+4..+5].
+      // The q/k neurons are in the interleaved-rotary layout the loader
+      // produced; DE-permute back to HF rotate_half so SaveLlamaToGGUFEx's
+      // WriteQKMatrix re-permutes to the exact ggml order (round-trips the
+      // reader-source path). HF row (head h, within-head k): the interleaved
+      // neuron row is 2k if k<half else 2(k-half)+1.
+      // --- q_proj ---
+      Lay := Linears[6 * b];
+      if Lay.Neurons.Count <> QWidth then
+        ImportError('TNNet GGUF export: q_proj block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(QWidth) + '.');
+      V.ReSize(QWidth * Config.HiddenSize, 1, 1);
+      for h := 0 to Config.NumHeads - 1 do
+        for k := 0 to HeadDim - 1 do
+        begin
+          if k < HalfDim then j := h * HeadDim + 2 * k
+          else j := h * HeadDim + 2 * (k - HalfDim) + 1;
+          for c := 0 to Config.HiddenSize - 1 do
+            V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
+              Lay.Neurons[j].Weights.FData[c];
+        end;
+      Reader.AddTensor(BlockPrefix + 'self_attn.q_proj.weight',
+        [QWidth, Config.HiddenSize], V);
+      // --- k_proj ---
+      Lay := Linears[6 * b + 1];
+      if Lay.Neurons.Count <> KVWidth then
+        ImportError('TNNet GGUF export: k_proj block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(KVWidth) + '.');
+      V.ReSize(KVWidth * Config.HiddenSize, 1, 1);
+      for h := 0 to Config.NumKVHeads - 1 do
+        for k := 0 to HeadDim - 1 do
+        begin
+          if k < HalfDim then j := h * HeadDim + 2 * k
+          else j := h * HeadDim + 2 * (k - HalfDim) + 1;
+          for c := 0 to Config.HiddenSize - 1 do
+            V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
+              Lay.Neurons[j].Weights.FData[c];
+        end;
+      Reader.AddTensor(BlockPrefix + 'self_attn.k_proj.weight',
+        [KVWidth, Config.HiddenSize], V);
+      // --- v_proj / o_proj (straight) ---
+      DumpLinear(Linears[6 * b + 2], KVWidth, Config.HiddenSize,
+        BlockPrefix + 'self_attn.v_proj.weight');
+      DumpLinear(Linears[6 * b + 3], Config.HiddenSize, QWidth,
+        BlockPrefix + 'self_attn.o_proj.weight');
+
+      // --- SwiGLU fused gate|up -> un-fuse into ffn_up / ffn_gate ---
+      // The loader packs up_proj into neurons 0..I-1 and gate_proj into
+      // neurons I..2I-1 (TNNetSwiGLU = up * silu(gate)). Split them back.
+      Lay := Linears[6 * b + 4];
+      if Lay.Neurons.Count <> 2 * IntSize then
+        ImportError('TNNet GGUF export: fused gate|up block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(2 * IntSize) + '.');
+      // up_proj = neurons 0..I-1
+      V.ReSize(IntSize * Config.HiddenSize, 1, 1);
+      for j := 0 to IntSize - 1 do
+        for c := 0 to Config.HiddenSize - 1 do
+          V.FData[j * Config.HiddenSize + c] := Lay.Neurons[j].Weights.FData[c];
+      Reader.AddTensor(BlockPrefix + 'mlp.up_proj.weight',
+        [IntSize, Config.HiddenSize], V);
+      // gate_proj = neurons I..2I-1
+      V.ReSize(IntSize * Config.HiddenSize, 1, 1);
+      for j := 0 to IntSize - 1 do
+        for c := 0 to Config.HiddenSize - 1 do
+          V.FData[j * Config.HiddenSize + c] :=
+            Lay.Neurons[IntSize + j].Weights.FData[c];
+      Reader.AddTensor(BlockPrefix + 'mlp.gate_proj.weight',
+        [IntSize, Config.HiddenSize], V);
+      // --- down_proj (straight) ---
+      DumpLinear(Linears[6 * b + 5], Config.HiddenSize, IntSize,
+        BlockPrefix + 'mlp.down_proj.weight');
+    end;
+
+    // ---- final norm + LM head ----
+    DumpNorm(Norms[High(Norms)], Config.HiddenSize, 'model.norm.weight');
+    if not Config.TieWordEmbeddings then
+      DumpLinear(Linears[High(Linears)], Config.VocabSize, Config.HiddenSize,
+        'lm_head.weight');
+    // (tied head: omit lm_head.weight - SaveLlamaToGGUFEx mirrors llama.cpp by
+    //  also omitting output.weight, so the round-trip re-infers the tie.)
+
+    // ---- ride the existing reader-source emitter (shared q/k re-permute,
+    //      reversed dims, F32/F16/Q8_0, metadata + tokenizer block) ----
+    SaveLlamaToGGUFEx(Reader, Config, Tokens, FileName, pDType);
+  finally
+    V.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure SaveTNNetLlamaToGGUF(Net: TNNet;
+  const Config: TLlamaConfig; const FileName: string);
+var
+  NoTokens: array of string;
+begin
+  SetLength(NoTokens, 0);
+  SaveTNNetLlamaToGGUFEx(Net, Config, NoTokens, FileName, gwF32);
 end;
 
 function BuildLlamaFromSafeTensorsEx(const FileName: string;

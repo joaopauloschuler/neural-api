@@ -142,6 +142,7 @@ type
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestGGUFWriterRoundTrip;
+    procedure TestTNNetGGUFWriterRoundTrip;
     procedure TestMXFP4DequantHandBlock;
     procedure TestMXFP4DequantNaNScale;
     procedure TestShardedReaderMatchesSingleFile;
@@ -3697,6 +3698,81 @@ begin
     AssertTrue('Q8_0 GGUF writer drift = ' + FloatToStr(Drift) +
       ' must be in (1e-3, 1.5e-1) relative',
       (Drift > 1e-3) and (Drift < 1.5e-1));
+  finally
+    OutG.Free; OutR.Free; Input.Free;
+    NNG.Free; NNRef.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+// Round-trips a Llama held PURELY in wired TNNet layers through the
+// TNNet-source GGUF exporter: import the untied tiny_llama fixture into a wired
+// TNNet, export it with SaveTNNetLlamaToGGUFEx (reads weights back OUT of the
+// layers - de-permuting q/k, un-fusing SwiGLU gate|up), re-import with the
+// LANDED BuildLlamaFromGGUFEx, and assert the reloaded logits match the
+// original wired model's logits within tight FP tolerance. Proves the
+// layer->HF inverse mapping (q/k de-permute + SwiGLU un-fuse + reversed dims)
+// is exact.
+procedure TTestNeuralPretrained.TestTNNetGGUFWriterRoundTrip;
+var
+  NNRef, NNG: TNNet;
+  Config, ConfigG: TLlamaConfig;
+  Tokens: array of string;
+  GGUFPath: string;
+  Input, OutR, OutG: TNNetVolume;
+  i, s, SeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  Config := ReadLlamaConfigFromJSONFile(FixturePath('tiny_llama_config.json'));
+  if Config.VocabSize <= 0 then
+    Config.VocabSize := 32; // tiny_llama fixture vocab (kept in sync below)
+
+  // Build the wired Llama (the SAME stack a from-scratch CAI-trained Llama
+  // would carry) - this is the export SOURCE.
+  NNRef := BuildLlamaFromSafeTensorsEx(
+    FixturePath('tiny_llama.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_llama_config.json'));
+
+  GGUFPath := GetTempDir(false) + 'cai_tnnet_gguf_rt_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  SetLength(Tokens, Config.VocabSize);
+  for i := 0 to Config.VocabSize - 1 do
+    Tokens[i] := '<tok_' + IntToStr(i) + '>';
+  // Export straight from the WIRED layers (no HF reader involved).
+  SaveTNNetLlamaToGGUFEx(NNRef, Config, Tokens, GGUFPath, gwF32);
+
+  NNG := BuildLlamaFromGGUFEx(GGUFPath, ConfigG);
+  Input := TNNetVolume.Create;
+  OutR := TNNetVolume.Create;
+  OutG := TNNetVolume.Create;
+  try
+    AssertEquals('tnnet round-trip hidden', Config.HiddenSize,
+      ConfigG.HiddenSize);
+    AssertEquals('tnnet round-trip layers', Config.NumLayers,
+      ConfigG.NumLayers);
+    AssertEquals('tnnet round-trip vocab', Config.VocabSize, ConfigG.VocabSize);
+    AssertFalse('tnnet round-trip untied head', ConfigG.TieWordEmbeddings);
+    SeqLen := ConfigG.MaxPositions;
+    Vocab := ConfigG.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      NNRef.Compute(Input);
+      NNRef.GetOutput(OutR);
+      NNG.Compute(Input);
+      NNG.GetOutput(OutG);
+      AssertEquals('tnnet round-trip output size', OutR.Size, OutG.Size);
+      for i := 0 to OutR.Size - 1 do
+        if Abs(OutR.FData[i] - OutG.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutR.FData[i] - OutG.FData[i]);
+    end;
+    // F32 + invertible q/k de-permute + SwiGLU un-fuse -> identical logits.
+    AssertTrue('TNNet GGUF writer round-trip max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
   finally
     OutG.Free; OutR.Free; Input.Free;
     NNG.Free; NNRef.Free;
