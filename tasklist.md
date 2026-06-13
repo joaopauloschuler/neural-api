@@ -92,6 +92,23 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] OLMo-2 importer (model_type "olmo2", e.g. allenai/OLMo-2-0425-1B —
+      the fully-open weights+data+code family): rides the Llama tensor
+      layout (SwiGLU, RoPE, no biases) but needs TWO deltas the
+      BuildLlamaFromSafeTensorsWithConfig path cannot express today:
+      (a) REORDERED post-norm — RMSNorm is applied to the SUBLAYER OUTPUT
+      before the residual add (x + Norm(Attn(x)), keys
+      post_attention_layernorm / post_feedforward_layernorm; there is NO
+      input_layernorm), i.e. a third placement beside the existing
+      AddPreNorm/AddPostNorm conventions; (b) QK-norm over the FULL
+      flattened q/k projection width BEFORE head-split + RoPE — distinct
+      from the landed Qwen3/Gemma-3 PER-HEAD placement, so
+      LoadLlamaHeadRMSNormWeights does not apply as-is. Deliverables:
+      BuildOlmo2FromSafeTensors[Ex] on the Llama config plumbing, pico
+      parity fixture via the make_pico_*_fixture.py recipe (HF float64
+      next-token logits), tokenizer is stock GPT-NeoX-style BPE
+      tokenizer.json (already supported). Verify the 1B checkpoint
+      end-to-end like pythia-70m was.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
