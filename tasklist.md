@@ -92,6 +92,34 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] Falcon importer (model_type "falcon" / "RefinedWeb" / "RefinedWebModel",
+      e.g. tiiuae/falcon-7b or the tiny falcon-rw-1b sibling): a canonical open
+      decoder family with a genuinely DISTINCT recipe not covered by any landed
+      importer. The defining pieces: (a) FUSED multi-query QKV — a single
+      `query_key_value` slab packs all query heads plus ONE shared K head and
+      ONE shared V head (new_decoder_architecture=false / multi_query=true on
+      falcon-7b), or num_kv_heads GQA groups interleaved per group on the
+      "new" architecture (falcon-40b) — the fan-out of one cached K/V across
+      all query heads is the novel slicing vs GPT-NeoX's plain 3-way split;
+      (b) PARALLEL attention+MLP residual (x + Attn(ln(x)) + MLP(ln(x))) — the
+      landed AddParallelTransformerBlock already does this, but Falcon toggles
+      between a SINGLE shared input_layernorm (parallel_attn, falcon-7b) and
+      TWO separate norms ln_attn/ln_mlp (new arch) and that config branch must
+      be wired; (c) plain LayerNorm (NOT RMSNorm), RoPE, GELU MLP, and NO
+      biases anywhere (bias=false). Nearly everything exists — RoPE, GQA head
+      plumbing, LayerNorm, the parallel-residual builder, KV-cache decode — so
+      the genuinely new work is the fused-QKV multi-query weight slicing
+      (map one K/V head onto the existing per-head K/V projections via
+      aliasing) and the single-vs-dual-layernorm config switch. Deliverables:
+      BuildFalconFromSafeTensors[Ex] (multi-shard index.json support; .bin
+      fallback via TNNetTorchBinReader since falcon-rw checkpoints ship
+      pytorch_model.bin), a tools/falcon_tiny_fixture.py pico fixture (tiny
+      random falcon config covering BOTH multi_query and new_decoder_architecture
+      branches, asserting next-token logits vs an HF float64 oracle), and a
+      "falcon"/"RefinedWebModel" dispatch in BuildFromPretrained. Distinct from
+      the landed BuildGPTNeoXFromSafeTensors (3-way interleaved qkv, partial
+      rotary) and BuildBloomFromSafeTensors (ALiBi, no RoPE); fills the most
+      conspicuous remaining gap in the open-decoder importer roster.
 - [X] Mixtral / sparse-MoE importer (model_type "mixtral", e.g.
       mistralai/Mixtral-8x7B-v0.1, or a small sibling like OLMoE/Qwen-MoE
       that shares the recipe): the CANONICAL open sparse-MoE — a stock
