@@ -106,18 +106,6 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] GPT-BigCode / StarCoder-v1 importer (model_type "gpt_bigcode") — the
-      now-unblocked relative of the landed StarCoder2 importer (commit 19e594c,
-      BuildStarCoder2FromSafeTensors). Reuses StarCoder2's LayerNorm-with-bias
-      pre-norm block + full-bias linears + two-matrix GELU-tanh FFN, but swaps
-      RoPE/GQA for (a) MULTI-QUERY attention (single shared K/V head — GQA with
-      KVHeads=1, already expressible via the grouped-SDPA path) and (b) LEARNED
-      ABSOLUTE position embeddings (wpe table added to token embeddings, the
-      GPT-2 path) instead of RoPE. Fused c_attn qkv slab (GPT-2 style) needs the
-      slice-then-split handling already used by Phi-3. Deliverables: dedicated
-      builder reusing the StarCoder2 LayerNorm block, a pico parity fixture
-      (make_pico_*_fixture.py recipe) within 1e-4 vs HF float64 exercising the
-      MQA + learned-position path, and BuildFromPretrained dispatch.
 - [ ] M2M100/NLLB translate demo + real-vocab check (follow-up to the landed
       BuildM2M100FromSafeTensors, commit cb21550): an examples/NLLBTranslate
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and
