@@ -110,6 +110,7 @@ type
     procedure TestQwen3SafeTensorsRoundTrip;
     procedure TestBertSafeTensorsRoundTrip;
     procedure TestGPTNeoXSafeTensorsRoundTrip;
+    procedure TestBloomSafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -1782,6 +1783,60 @@ begin
       NN2.Free;
       NN.Free;
     end;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestBloomSafeTensorsRoundTrip;
+var
+  NN, NN2: TNNet;
+  Config, Config2: TBloomConfig;
+  Input, Out1, Out2: TNNetVolume;
+  TmpPath: string;
+  i, s, SeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  TmpPath := GetTempDir(false) + 'cai_bloom_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  NN := BuildBloomFromSafeTensorsEx(
+    FixturePath('tiny_bloom.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_bloom_config.json'));
+  Input := TNNetVolume.Create;
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  NN2 := nil;
+  try
+    SaveBloomToSafeTensors(NN, Config, TmpPath);
+    NN2 := BuildBloomFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}0,
+      {pInferenceOnly=}false, FixturePath('tiny_bloom_config.json'));
+    SeqLen := Config.SeqLength;
+    Vocab := Config.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input[i, 0, 0] := (s * 5 + i * 3 + 1) mod Vocab;
+      NN.Compute(Input);
+      NN.GetOutput(Out1);
+      NN2.Compute(Input);
+      NN2.GetOutput(Out2);
+      AssertEquals('bloom round-trip output size', Out1.Size, Out2.Size);
+      for i := 0 to Out1.Size - 1 do
+        if Abs(Out1.FData[i] - Out2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(Out1.FData[i] - Out2.FData[i]);
+    end;
+    // F32 + invertible Q|K|V re-fuse + straight nn.Linear/LayerNorm dumps
+    // (no rotary on BLOOM) -> identical logits.
+    AssertTrue('BLOOM safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
+    NN.Free;
   end;
 end;
 

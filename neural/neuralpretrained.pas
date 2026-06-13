@@ -3258,6 +3258,17 @@ function BuildBloomFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
+// Inverse of BuildBloomFromSafeTensors: walks the wired BLOOM decoder in
+// importer build order and saves each HF-named tensor with the EXACT inverse
+// of every load transform - re-fusing the per-head Q|K|V slab back into the
+// single query_key_value tensor (BLOOM has NO rotary, so NO rotate_half
+// permutation), and dumping the word_embeddings_layernorm, the per-block
+// input/post_attention LayerNorms, dense/mlp Linears (with bias) and the
+// final ln_f. The LM head is ALWAYS tied (no separate lm_head tensor is
+// written). Config.Prefix selects the name prefix ('transformer.' or '').
+procedure SaveBloomToSafeTensors(Net: TNNet; const Config: TBloomConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
 // ============================= FALCON IMPORT ===============================
 // BuildFalconFromSafeTensors rebuilds the Falcon decoder family (model_type
 // "falcon"; legacy "RefinedWebModel" = falcon-7b, "RefinedWeb" = falcon-40b)
@@ -8266,6 +8277,187 @@ begin
       Config.Prefix + 'final_layer_norm.bias', d, pDType);
     // ---- LM head (embed_out, OUTSIDE the gpt_neox. prefix, bias-free) ----
     DumpLinear(LMHead, 0, Config.VocabSize, d, 'embed_out.weight', '');
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
+procedure SaveBloomToSafeTensors(Net: TNNet; const Config: TBloomConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  Embeds, LayerNorms, PwConvs: array of TNNetLayer;
+  EmbIn, EmbLN, FinalLN: TNNetLayer;
+  i, BlockCnt, PwBase, ExpectPw, ExpectLN: integer;
+  d, IntSize, HeadDim: integer;
+  BlockPrefix, AttnPrefix: string;
+
+  // Straight HF nn.Linear [OutDim, InDim] (+bias [OutDim]) from OutDim
+  // consecutive neurons at NeuronBase. The exact inverse of
+  // LoadLlamaLinearWeights (no rotary on any BLOOM linear).
+  procedure DumpLinear(Layer: TNNetLayer; NeuronBase, OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+          ImportError('BLOOM export: neuron ' + IntToStr(NeuronBase + jj) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] :=
+            Layer.Neurons[NeuronBase + jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[NeuronBase + jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Re-fuse the per-head Q|K|V slab back into the single query_key_value
+  // [3*hidden, hidden] (+bias). HF source row r maps to net neuron TargetIdx
+  // exactly as LoadBloomQKVWeights does (no rotate_half - BLOOM is ALiBi);
+  // we run the same map and copy neuron TargetIdx back into HF row r.
+  procedure DumpQKV(Layer: TNNetLayer; const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    r, ii, HeadIdx, Third, RowInHead, TargetIdx: integer;
+  begin
+    if Layer.Neurons.Count <> 3 * d then
+      ImportError('BLOOM export: layer for "' + WName + '" has ' +
+        IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+        IntToStr(3 * d) + '.');
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(3 * d * d, 1, 1);
+      B.ReSize(3 * d, 1, 1);
+      for r := 0 to 3 * d - 1 do
+      begin
+        HeadIdx := r div (3 * HeadDim);
+        Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
+        RowInHead := r mod HeadDim;
+        TargetIdx := Third * d + HeadIdx * HeadDim + RowInHead;
+        if Layer.Neurons[TargetIdx].Weights.Size <> d then
+          ImportError('BLOOM export: neuron ' + IntToStr(TargetIdx) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+            ' weights, expected ' + IntToStr(d) + '.');
+        for ii := 0 to d - 1 do
+          W.FData[r * d + ii] := Layer.Neurons[TargetIdx].Weights.FData[ii];
+        B.FData[r] := Layer.Neurons[TargetIdx].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [3 * d, d], W, pDType);
+      Writer.AddTensorFlat(BName, [3 * d], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  IntSize := Config.IntermediateSize;
+  if Config.NumHeads < 1 then
+    ImportError('BLOOM export: n_head must be >= 1.');
+  if (d mod Config.NumHeads) <> 0 then
+    ImportError('BLOOM export: hidden_size not divisible by n_head.');
+  HeadDim := d div Config.NumHeads;
+  // ---- collect load-bearing layers in net (= importer build) order ----
+  SetLength(Embeds, 0);
+  SetLength(LayerNorms, 0);
+  SetLength(PwConvs, 0);
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetEmbedding then
+    begin
+      SetLength(Embeds, Length(Embeds) + 1);
+      Embeds[High(Embeds)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LayerNorms, Length(LayerNorms) + 1);
+      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if Length(Embeds) <> 1 then
+    ImportError('BLOOM export: found ' + IntToStr(Length(Embeds)) +
+      ' TNNetEmbedding layers, expected 1 - not a ' +
+      'BuildBloomFromSafeTensors decoder?');
+  // word_embeddings LN + 2 per block + ln_f.
+  ExpectLN := 2 * Config.NumLayers + 2;
+  // QKV,AttnDense,HTo4H,FourHToH per block + tied LM head.
+  ExpectPw := 4 * Config.NumLayers + 1;
+  if Length(LayerNorms) <> ExpectLN then
+    ImportError('BLOOM export: found ' + IntToStr(Length(LayerNorms)) +
+      ' LayerNorm layers, expected ' + IntToStr(ExpectLN) + ' for ' +
+      IntToStr(Config.NumLayers) + ' blocks.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('BLOOM export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) + '.');
+  EmbIn := Embeds[0];
+  EmbLN := LayerNorms[0];                          // word_embeddings_layernorm
+  FinalLN := LayerNorms[2 * Config.NumLayers + 1]; // last collected LayerNorm
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/bloom');
+    // ---- embeddings (LM head is tied; no separate lm_head tensor) ----
+    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+      ImportError('BLOOM export: word_embeddings size ' +
+        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(Config.VocabSize * d) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'word_embeddings.weight',
+      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+    SaveLayerNormWeights(Writer, EmbLN,
+      Config.Prefix + 'word_embeddings_layernorm.weight',
+      Config.Prefix + 'word_embeddings_layernorm.bias', d, pDType);
+    // ---- decoder blocks ----
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+      AttnPrefix := BlockPrefix + 'self_attention.';
+      PwBase := BlockCnt * 4;
+      SaveLayerNormWeights(Writer, LayerNorms[1 + BlockCnt * 2 + 0],
+        BlockPrefix + 'input_layernorm.weight',
+        BlockPrefix + 'input_layernorm.bias', d, pDType);
+      SaveLayerNormWeights(Writer, LayerNorms[1 + BlockCnt * 2 + 1],
+        BlockPrefix + 'post_attention_layernorm.weight',
+        BlockPrefix + 'post_attention_layernorm.bias', d, pDType);
+      DumpQKV(PwConvs[PwBase + 0],
+        AttnPrefix + 'query_key_value.weight',
+        AttnPrefix + 'query_key_value.bias');
+      DumpLinear(PwConvs[PwBase + 1], 0, d, d,
+        AttnPrefix + 'dense.weight', AttnPrefix + 'dense.bias');
+      DumpLinear(PwConvs[PwBase + 2], 0, IntSize, d,
+        BlockPrefix + 'mlp.dense_h_to_4h.weight',
+        BlockPrefix + 'mlp.dense_h_to_4h.bias');
+      DumpLinear(PwConvs[PwBase + 3], 0, d, IntSize,
+        BlockPrefix + 'mlp.dense_4h_to_h.weight',
+        BlockPrefix + 'mlp.dense_4h_to_h.bias');
+    end;
+    SaveLayerNormWeights(Writer, FinalLN,
+      Config.Prefix + 'ln_f.weight',
+      Config.Prefix + 'ln_f.bias', d, pDType);
     Writer.SaveToFile;
   finally
     Writer.Free;

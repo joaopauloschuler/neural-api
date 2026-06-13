@@ -302,10 +302,17 @@ rather than acted on.
       [out,in] dense/dense_h_to_4h/dense_4h_to_h linears, LayerNorm gamma|beta,
       embed_in / embed_out under the gpt_neox.* name map, round-trip gated by
       TestGPTNeoXSafeTensorsRoundTrip over BOTH parallel and sequential
-      configs): add a layer->HF-name + transpose inverse map for the REMAINING
-      architectures (e.g. GPT-NeoX-style siblings already covered; next up the
-      non-transformer / encoder-decoder importers such as RWKV/Mamba, T5/Marian,
-      BLOOM — each its own map).
+      configs; BLOOM SaveBloomToSafeTensors LANDED as the exact inverse of
+      BuildBloomFromSafeTensors — collects the decoder's typed layers in build
+      order and RE-FUSES the per-head Q|K|V slab back into the single
+      query_key_value tensor (NO rotate_half — BLOOM is ALiBi, not rotary) plus
+      straight [out,in] dense/dense_h_to_4h/dense_4h_to_h linears, LayerNorm
+      gamma|beta INCLUDING the word_embeddings_layernorm, tied word_embeddings
+      (no separate lm_head tensor) and ln_f under the transformer.* name map,
+      round-trip gated by TestBloomSafeTensorsRoundTrip): add a layer->HF-name +
+      transpose inverse map for the REMAINING architectures (e.g. GPT-NeoX-style
+      siblings already covered; next up the non-transformer / encoder-decoder
+      importers such as RWKV/Mamba, T5/Marian — each its own map).
 - [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the
