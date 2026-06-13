@@ -635,6 +635,12 @@ type
     // ceil the correction-range band edges (truncate=true, the default here);
     // gpt-oss ships "truncate": false (no rounding). Coded by Claude (AI).
     YarnTruncate: boolean;
+    // YaRN only: explicit attention scaling folded from DeepSeek-V2/-V3's
+    // "mscale"/"mscale_all_dim" rope_scaling fields, =
+    //   _yarn_get_mscale(factor,mscale)/_yarn_get_mscale(factor,mscale_all_dim).
+    // 0 means "no explicit override" -> the layer uses the YaRN default
+    // 0.1*ln(factor)+1. Coded by Claude (AI).
+    YarnAttnFactor: TNeuralFloat;
   end;
 
 // The Mode=rsmNone record (Factor=1, OriginalContextLen=0, alpha=1, beta=32).
@@ -2840,9 +2846,9 @@ function BuildModernBertFromSafeTensors(const FileName: string;
 // LIMITATIONS (all checked, with clear errors): q_lora_rank must be null
 // (the -Lite case; the full 236B V2 uses a low-rank W_q, not wired),
 // qk_nope_head_dim must equal v_head_dim (true for -Lite AND full V2; the
-// zero-pad trick reuses the dr-wide rope-K block), rope_scaling must be
-// null (DeepSeek's YaRN carries mscale/mscale_all_dim attention-scale
-// overrides that the rope-scaling support deliberately rejects),
+// zero-pad trick reuses the dr-wide rope-K block). rope_scaling: YaRN (incl.
+// DeepSeek's mscale/mscale_all_dim attention-scale overrides, folded into the
+// rotary FOutScale) and null are wired; other types are rejected.
 // topk_method must be "greedy" (group_limited_greedy routing is a full-V2
 // feature), scoring_func "softmax", moe_layer_freq 1, attention_bias and
 // mlp_bias false.
@@ -2874,6 +2880,10 @@ type
     TieWordEmbeddings: boolean;
     ModelType: string;          // 'deepseek_v2'
     Prefix: string;             // detected: 'model.' or ''
+    // Parsed "rope_scaling" (Mode=rsmNone when null/absent). DeepSeek-V2-Lite
+    // carries a YaRN config with explicit mscale/mscale_all_dim attention-scale
+    // overrides, folded into RopeScaling.YarnAttnFactor. Coded by Claude (AI).
+    RopeScaling: TRoPEScalingConfig;
   end;
 
 // Reads a HF DeepSeek-V2 config.json (model_type "deepseek_v2"). Required:
@@ -2883,9 +2893,10 @@ type
 // num_experts_per_tok. Optional: n_shared_experts (null/absent = 0),
 // first_k_dense_replace (default 0), norm_topk_prob (default false),
 // routed_scaling_factor (default 1.0), rms_norm_eps (1e-6), rope_theta
-// (10000), tie_word_embeddings (false). Fails with a clear message on the
+// (10000), tie_word_embeddings (false), rope_scaling (null or YaRN incl.
+// mscale/mscale_all_dim overrides). Fails with a clear message on the
 // unsupported variants listed in the section header (q_lora_rank,
-// rope_scaling, group_limited_greedy, ...).
+// non-YaRN rope_scaling, group_limited_greedy, ...).
 function ReadDeepSeekV2ConfigFromJSONFile(
   const FileName: string): TDeepSeekV2Config;
 // One-line human-readable summary (mirrors LlamaConfigToString).
@@ -3818,6 +3829,7 @@ begin
   SetLength(Result.LongFactors, 0);
   Result.LongAttnFactor := 1.0;
   Result.YarnTruncate := True;
+  Result.YarnAttnFactor := 0.0;
 end;
 
 function RoPEScalingToString(const S: TRoPEScalingConfig): string;
@@ -3851,12 +3863,14 @@ end;
 //  - yarn: original_max_position_embeddings is read from rope_scaling, then
 //    the top level (Phi-3 style), then falls back to max_position_embeddings
 //    (the HF fallback chain). DeepSeek-style "mscale"/"mscale_all_dim"
-//    overrides and a custom "attention_factor" (anything other than the
-//    YaRN default 0.1*ln(factor)+1, which the layer hardcodes) are rejected.
-//    The layer implements HF's DEFAULT truncate=true band edges; a config
-//    with an explicit "truncate": false would deviate slightly on the two
-//    boundary pairs (the key is ignored).
-//  - "longrope" (Phi-3) and unknown types are rejected.
+//    overrides and an explicit "attention_factor" are now HONORED (folded
+//    into YarnAttnFactor = _yarn_get_mscale(s,mscale)/_yarn_get_mscale(s,
+//    mscale_all_dim), exactly HF deepseek_v2 _compute_yarn_parameters, and
+//    threaded into TNNetRotaryEmbedding's FOutScale). When they resolve to the
+//    plain YaRN default 0.1*ln(factor)+1, YarnAttnFactor stays 0 so the
+//    no-mscale path is bit-for-bit unchanged. "truncate" is parsed
+//    (YarnTruncate, default true) and threaded into the band edges.
+//  - "longrope" (Phi-3) is wired (rsmLongRoPE); unknown types are rejected.
 // Coded by Claude (AI).
 function ReadRoPEScalingFromJSONObject(Obj: TJSONObject;
   MaxPositions: integer; const ImporterName: string): TRoPEScalingConfig;
@@ -3864,7 +3878,14 @@ var
   Field, Sub: TJSONData;
   Scaling: TJSONObject;
   TypeName: string;
-  DefaultAttn: TNeuralFloat;
+  DefaultAttn, MScaleVal, MScaleAllDim: TNeuralFloat;
+
+  // HF transformers' _yarn_get_mscale: 1.0 for scale<=1, else 0.1*m*ln(scale)+1.
+  function YarnGetMScale(Scale, M: TNeuralFloat): TNeuralFloat;
+  begin
+    if Scale <= 1 then Result := 1.0
+    else Result := 0.1 * M * Ln(Scale) + 1.0;
+  end;
 
   function ReadOriginalContextLen(): integer;
   var
@@ -3881,18 +3902,6 @@ var
       ImportError(ImporterName + ': rope_scaling ' +
         'original_max_position_embeddings must be positive, got ' +
         IntToStr(Result) + '.');
-  end;
-
-  procedure RejectKey(const KeyName: string);
-  var
-    F: TJSONData;
-  begin
-    F := Scaling.Find(KeyName);
-    if (F <> nil) and not F.IsNull then
-      ImportError(ImporterName + ': rope_scaling "' + KeyName + '" (' +
-        F.AsJSON + ') is not wired into TNNetRotaryEmbedding (it changes ' +
-        'the attention factor away from the YaRN default the layer ' +
-        'hardcodes).');
   end;
 
   // Reads a LongRoPE per-frequency factor array (long_factor / short_factor):
@@ -3991,21 +4000,47 @@ begin
       ImportError(ImporterName + ': rope_scaling yarn requires beta_fast > ' +
         'beta_slow, got beta_fast=' + FloatToStr(Result.YarnBeta) +
         ' beta_slow=' + FloatToStr(Result.YarnAlpha) + '.');
-    RejectKey('mscale');
-    RejectKey('mscale_all_dim');
+    // DeepSeek-style attention scaling. HF's _compute_yarn_parameters infers
+    // the post-rotation cos/sin scale ("attention_factor") as follows:
+    //   if attention_factor given:        use it verbatim
+    //   elif mscale and mscale_all_dim:   _yarn_get_mscale(factor,mscale) /
+    //                                      _yarn_get_mscale(factor,mscale_all_dim)
+    //   else:                             _yarn_get_mscale(factor)
+    // where _yarn_get_mscale(s,m)=1 if s<=1 else 0.1*m*ln(s)+1. The third
+    // branch is the layer's hardcoded 0.1*ln(factor)+1 default, so we only set
+    // YarnAttnFactor (FFloatSt[4]) when an EXPLICIT attention_factor or a
+    // mscale/mscale_all_dim PAIR is present; otherwise it stays 0 and the layer
+    // keeps the default bit-for-bit. Note HF treats a 0/absent mscale (or
+    // mscale_all_dim) as falsy -> default branch.
+    Result.YarnAttnFactor := 0.0;
+    if Result.Factor > 1 then
+      DefaultAttn := 0.1 * Ln(Result.Factor) + 1.0
+    else
+      DefaultAttn := 1.0;
     Sub := Scaling.Find('attention_factor');
     if (Sub <> nil) and not Sub.IsNull then
     begin
-      if Result.Factor > 1 then
-        DefaultAttn := 0.1 * Ln(Result.Factor) + 1.0
-      else
-        DefaultAttn := 1.0;
-      if Abs(Sub.AsFloat - DefaultAttn) > 1e-3 then
-        ImportError(ImporterName + ': rope_scaling attention_factor=' +
-          FloatToStr(Sub.AsFloat) + ' is not wired - TNNetRotaryEmbedding ' +
-          'hardcodes the YaRN default 0.1*ln(factor)+1 = ' +
-          FloatToStr(DefaultAttn) + '.');
+      // Explicit attention_factor wins over both default and mscale pair.
+      Result.YarnAttnFactor := Sub.AsFloat;
+      if Result.YarnAttnFactor <= 0 then
+        ImportError(ImporterName + ': rope_scaling attention_factor must be ' +
+          'positive, got ' + FloatToStr(Result.YarnAttnFactor) + '.');
+    end
+    else
+    begin
+      MScaleVal := Scaling.Get('mscale', 0.0);
+      MScaleAllDim := Scaling.Get('mscale_all_dim', 0.0);
+      if (MScaleVal <> 0.0) and (MScaleAllDim <> 0.0) then
+        Result.YarnAttnFactor :=
+          YarnGetMScale(Result.Factor, MScaleVal) /
+          YarnGetMScale(Result.Factor, MScaleAllDim);
     end;
+    // If the resolved factor equals the layer default to within tolerance,
+    // leave YarnAttnFactor=0 so serialization/round-trip is bit-for-bit
+    // identical to the no-mscale path (the layer recomputes the same value).
+    if (Result.YarnAttnFactor > 0) and
+       (Abs(Result.YarnAttnFactor - DefaultAttn) <= 1e-9) then
+      Result.YarnAttnFactor := 0.0;
   end
   else if TypeName = 'llama3' then
   begin
@@ -4037,8 +4072,12 @@ begin
     Result := TNNetRotaryEmbedding.CreateLongRoPE(Base, S.LongFactors,
       S.LongAttnFactor)
   else
+    // The 7th arg (pLongAttnFactor -> FFloatSt[4]) carries the explicit YaRN
+    // attention scaling for DeepSeek-style mscale/mscale_all_dim overrides; 0
+    // for every other YaRN config keeps the layer's 0.1*ln(s)+1 default.
     Result := TNNetRotaryEmbedding.Create(Base, S.Mode, S.Factor,
-      S.OriginalContextLen, S.YarnAlpha, S.YarnBeta, 1.0, S.YarnTruncate);
+      S.OriginalContextLen, S.YarnAlpha, S.YarnBeta, S.YarnAttnFactor,
+      S.YarnTruncate);
 end;
 
 // ============================ LLAMA IMPORT =================================
@@ -17161,11 +17200,16 @@ begin
         'null, the DeepSeek-V2-Lite case) is wired. The low-rank ' +
         'q_a_proj/q_a_layernorm/q_b_proj query path of the full 236B V2 ' +
         'is not implemented.');
-    if HasNonNull('rope_scaling') then
-      ImportError('DeepSeek-V2 import: rope_scaling is not supported - ' +
-        'DeepSeek''s YaRN configs carry mscale/mscale_all_dim ' +
-        'attention-scale overrides that the rope-scaling support ' +
-        'deliberately rejects. Use a checkpoint with rope_scaling: null.');
+    // rope_scaling: DeepSeek-V2-Lite ships a YaRN config carrying explicit
+    // mscale/mscale_all_dim attention-scale overrides. The shared reader folds
+    // them into RopeScaling.YarnAttnFactor (=_yarn_get_mscale(s,mscale)/
+    // _yarn_get_mscale(s,mscale_all_dim)); null/absent stays Mode=rsmNone.
+    Result.RopeScaling := ReadRoPEScalingFromJSONObject(Obj,
+      Result.MaxPositions, 'DeepSeek-V2 import');
+    if not (Result.RopeScaling.Mode in [rsmNone, rsmYaRN]) then
+      ImportError('DeepSeek-V2 import: rope_scaling type ' +
+        RoPEScalingToString(Result.RopeScaling) +
+        ' is not supported - DeepSeek-V2 uses YaRN (or null).');
     StrVal := Obj.Get('topk_method', 'greedy');
     if StrVal <> 'greedy' then
       ImportError('DeepSeek-V2 import: topk_method "' + StrVal +
@@ -17222,6 +17266,9 @@ begin
       FloatToStr(Config.RoutedScalingFactor);
   if Config.TieWordEmbeddings then
     Result := Result + ', tied_embeddings=true';
+  if Config.RopeScaling.Mode <> rsmNone then
+    Result := Result + ', rope_scaling=' +
+      RoPEScalingToString(Config.RopeScaling);
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -17408,7 +17455,7 @@ begin
         Blocks[BlockCnt].KRope := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(dr), NormedSource);
         KRopeRot := NN.AddLayerAfter(
-          CreateRoPEFromScaling(Config.RopeTheta, DefaultRoPEScaling()),
+          CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
           Blocks[BlockCnt].KRope);
         // SDPA packs equal-width Q|K|V; V (width dv = dn) has no rope
         // slice, so it is padded with an exact dr-wide zero block built as
@@ -17433,7 +17480,7 @@ begin
             TNNetSplitChannels.Create(HeadCnt * dr, dr),
             Blocks[BlockCnt].QRope);
           QRopeSlice := NN.AddLayerAfter(
-            CreateRoPEFromScaling(Config.RopeTheta, DefaultRoPEScaling()),
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
             QRopeSlice);
           // Pack [Q_h|ropeQ_h | K_h|ropeK | V_h|0] (width 3*(dn+dr)).
           HeadPack := NN.AddLayer( TNNetDeepConcat.Create(

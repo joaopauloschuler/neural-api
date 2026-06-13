@@ -456,9 +456,20 @@ rather than acted on.
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
       assert, same pattern as the chunked-forward recurrence family.
-- [ ] rope_scaling follow-ups to the landed wiring (7e74fee): (a) DeepSeek-style YaRN `mscale` /
-      `mscale_all_dim` overrides are rejected — needed for full
-      DeepSeek-V2 checkpoints (the -Lite config carries them); (b) [DONE,
+- [X] rope_scaling follow-ups to the landed wiring (7e74fee): (a) [DONE]
+      DeepSeek-style YaRN `mscale` / `mscale_all_dim` overrides are now parsed
+      (ReadRoPEScalingFromJSONObject -> TRoPEScalingConfig.YarnAttnFactor =
+      _yarn_get_mscale(s,mscale)/_yarn_get_mscale(s,mscale_all_dim), matching
+      HF deepseek_v2 _compute_yarn_parameters bit-for-bit) and threaded into
+      TNNetRotaryEmbedding's FOutScale via FFloatSt[4] (0 = no override, keeps
+      the 0.1*ln(s)+1 default bit-for-bit; the constructor's pLongAttnFactor
+      default changed 1.0->0.0 so it doubles as the YaRN-override slot). An
+      explicit `attention_factor` is also honored now. Wired into the
+      DeepSeek-V2 importer (Config.RopeScaling, both rope sites). Parity test
+      TestDeepSeekV2YarnMScaleLogitParity + fixture tiny_deepseek_v2_yarn.*
+      (tools/deepseek_v2_yarn_tiny_fixture.py, mscale=2.0/mscale_all_dim=0.5 ->
+      1.1944 vs default 1.1386) verified vs HF float64; full V2 (q_lora_rank)
+      still out of scope. (b) [DONE,
       landed with the GPT-OSS importer] yarn `"truncate"` is now parsed
       (TRoPEScalingConfig.YarnTruncate, default true) and threaded into
       TNNetRotaryEmbedding (FStruct[2], stored inverted so old serialized

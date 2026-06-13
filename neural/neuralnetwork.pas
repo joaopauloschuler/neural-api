@@ -3937,7 +3937,12 @@ type
       pOriginalContextLen: integer = 0;
       pYarnAlpha: TNeuralFloat = 1.0;
       pYarnBeta: TNeuralFloat = 32.0;
-      pLongAttnFactor: TNeuralFloat = 1.0;
+      // pLongAttnFactor (FFloatSt[4]) is the EXPLICIT attention scaling for
+      // LongRoPE (long_mscale) AND for DeepSeek-style YaRN mscale/mscale_all_dim
+      // overrides. The 0 default is the "no explicit override" sentinel: YaRN
+      // then uses its 0.1*ln(s)+1 temperature and LongRoPE its 1.0. A POSITIVE
+      // value overrides FOutScale in BuildThetaCache.
+      pLongAttnFactor: TNeuralFloat = 0.0;
       pYarnTruncate: boolean = true); overload;
     // LongRoPE (rsmLongRoPE) constructor: pLongFactors is the per-frequency
     // factor table (length head_dim/2, divides each inverse frequency) and
@@ -26984,10 +26989,20 @@ begin
   // Applied to BOTH q and k (the builders insert this layer on both
   // streams), attention logits gain the full 1/t = mscale^2.
   // rsmLlama3 deliberately skips this (HF attention_factor = 1.0).
+  // DeepSeek-V2/-V3 carry explicit "mscale"/"mscale_all_dim" rope_scaling
+  // fields; the importer folds them into the single attention scaling
+  //   _yarn_get_mscale(s,mscale)/_yarn_get_mscale(s,mscale_all_dim)
+  // and passes it through FFloatSt[4] (>0). When present it OVERRIDES the
+  // 0.1*ln(s)+1 default; absent (FFloatSt[4]<=0) keeps the default bit-for-bit.
   if Mode = rsmYaRN then
   begin
-    Temperature := 0.1 * pcr_logf(Scale) + 1.0;
-    FOutScale := Temperature;
+    if FFloatSt[4] > 0 then
+      FOutScale := FFloatSt[4]
+    else
+    begin
+      Temperature := 0.1 * pcr_logf(Scale) + 1.0;
+      FOutScale := Temperature;
+    end;
   end;
   // LongRoPE attention scaling (long_mscale): multiply the rotated output by
   // the imported factor, applied to BOTH q and k by the builders.

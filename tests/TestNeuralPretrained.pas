@@ -171,6 +171,7 @@ type
     procedure TestBloomLogitParity;
     procedure TestModernBertHiddenStateParity;
     procedure TestDeepSeekV2LogitParity;
+    procedure TestDeepSeekV2YarnMScaleLogitParity;
     procedure TestGPTNeoConfigFromJSONFile;
     procedure TestGPTNeoLogitParity;
     procedure TestGPTNeoXConfigFromJSONFile;
@@ -3025,7 +3026,8 @@ begin
 
   // yarn defaults: original context falls back to max_position_embeddings,
   // beta_slow/beta_fast default to 1/32; the HF-default attention_factor
-  // (0.1*ln(2)+1) is accepted because it matches what the layer hardcodes.
+  // (0.1*ln(2)+1) collapses to YarnAttnFactor=0 (the layer recomputes the same
+  // default), so the no-mscale path stays bit-for-bit unchanged.
   Config := ReadLlamaCase('{"rope_type": "yarn", "factor": 2.0, ' +
     '"attention_factor": 1.0693147}');
   AssertTrue('yarn defaults mode', Config.RopeScaling.Mode = rsmYaRN);
@@ -3033,6 +3035,34 @@ begin
     Config.RopeScaling.OriginalContextLen);
   AssertEquals('yarn default alpha', 1.0, Config.RopeScaling.YarnAlpha, 1e-6);
   AssertEquals('yarn default beta', 32.0, Config.RopeScaling.YarnBeta, 1e-6);
+  AssertEquals('default attention_factor -> YarnAttnFactor 0', 0.0,
+    Config.RopeScaling.YarnAttnFactor, 1e-9);
+
+  // DeepSeek-style rope_scaling follow-up (a): an EXPLICIT attention_factor
+  // that DIFFERS from the YaRN default is now honored (folded into
+  // YarnAttnFactor -> TNNetRotaryEmbedding FOutScale), not rejected.
+  Config := ReadLlamaCase('{"rope_type": "yarn", "factor": 4.0, ' +
+    '"attention_factor": 3.0}');
+  AssertTrue('explicit attention_factor mode', Config.RopeScaling.Mode = rsmYaRN);
+  AssertEquals('explicit attention_factor honored', 3.0,
+    Config.RopeScaling.YarnAttnFactor, 1e-6);
+
+  // mscale + mscale_all_dim PAIR: folded to
+  // _yarn_get_mscale(4,2)/_yarn_get_mscale(4,0.5).
+  Config := ReadLlamaCase('{"rope_type": "yarn", "factor": 4.0, ' +
+    '"mscale": 2.0, "mscale_all_dim": 0.5}');
+  AssertTrue('mscale-pair mode', Config.RopeScaling.Mode = rsmYaRN);
+  AssertEquals('mscale-pair folded attention factor',
+    (0.1 * 2.0 * Ln(4.0) + 1.0) / (0.1 * 0.5 * Ln(4.0) + 1.0),
+    Config.RopeScaling.YarnAttnFactor, 1e-6);
+
+  // mscale ALONE (no mscale_all_dim) is falsy in HF -> the default branch,
+  // so YarnAttnFactor stays 0 (bit-for-bit default). Previously REJECTED.
+  Config := ReadLlamaCase('{"rope_type": "yarn", "factor": 4.0, ' +
+    '"mscale": 0.707}');
+  AssertTrue('lone-mscale mode', Config.RopeScaling.Mode = rsmYaRN);
+  AssertEquals('lone mscale -> default (YarnAttnFactor 0)', 0.0,
+    Config.RopeScaling.YarnAttnFactor, 1e-9);
 
   // llama3 -> rsmLlama3 with low/high_freq_factor in the alpha/beta slots.
   Config := ReadLlamaCase('{"rope_type": "llama3", "factor": 32.0, ' +
@@ -3047,15 +3077,13 @@ begin
   AssertEquals('llama3 beta = high_freq_factor', 4.0,
     Config.RopeScaling.YarnBeta, 1e-6);
 
-  // Rejections: unknown type, missing factor, custom attention_factor and
-  // DeepSeek-style mscale overrides the layer cannot honor.
+  // Rejections: unknown type, missing factor, and a non-positive explicit
+  // attention_factor (the mscale overrides are now wired - see above).
   AssertLlamaCaseRejected('longrope', '{"rope_type": "longrope", ' +
     '"factor": 2.0}');
   AssertLlamaCaseRejected('missing factor', '{"rope_type": "linear"}');
-  AssertLlamaCaseRejected('custom attention_factor',
-    '{"rope_type": "yarn", "factor": 4.0, "attention_factor": 3.0}');
-  AssertLlamaCaseRejected('mscale override',
-    '{"rope_type": "yarn", "factor": 4.0, "mscale": 0.707}');
+  AssertLlamaCaseRejected('non-positive attention_factor',
+    '{"rope_type": "yarn", "factor": 4.0, "attention_factor": 0.0}');
 
   // The other two importer families parse the same key.
   Path := WriteTempJSON('{"model_type": "gpt_neox", "hidden_size": 8, ' +
@@ -5593,6 +5621,67 @@ begin
   finally
     Output.Free;
     Input.Free;
+    NN.Free;
+  end;
+end;
+
+// DeepSeek-V2 YaRN-with-mscale logit parity (rope_scaling follow-up (a)):
+// tests/fixtures/tiny_deepseek_v2_yarn.* (tools/deepseek_v2_yarn_tiny_fixture.py)
+// is the same pico DeepseekV2ForCausalLM as TestDeepSeekV2LogitParity but its
+// config carries an EXPLICIT YaRN rope_scaling with DeepSeek-style
+// mscale=2.0 / mscale_all_dim=0.5 and factor=4. HF's _compute_yarn_parameters
+// folds these into the post-rotation cos/sin attention scaling
+//   _yarn_get_mscale(4,2.0)/_yarn_get_mscale(4,0.5) = 1.19446...
+// which is DELIBERATELY distinct from the YaRN default 0.1*ln(4)+1 = 1.13862...
+// so this test FAILS if the importer ignored the override. The Pascal reader
+// (ReadRoPEScalingFromJSONObject) folds them into RopeScaling.YarnAttnFactor,
+// threaded into TNNetRotaryEmbedding's FOutScale. float64 oracle matched.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestDeepSeekV2YarnMScaleLogitParity;
+var
+  NN: TNNet;
+  Config: TDeepSeekV2Config;
+  LayerCnt, RopeCnt: integer;
+  RopeLayer: TNNetRotaryEmbedding;
+  ExpectedScale, DefaultScale: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := BuildDeepSeekV2FromSafeTensorsEx(
+    FixturePath('tiny_deepseek_v2_yarn.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_deepseek_v2_yarn_config.json'));
+  try
+    AssertEquals('model_type', 'deepseek_v2', Config.ModelType);
+    // The YaRN rope_scaling parsed with an explicit mscale override.
+    AssertTrue('rope_scaling parsed as YaRN',
+      Config.RopeScaling.Mode = rsmYaRN);
+    AssertEquals('yarn factor', 4.0, Config.RopeScaling.Factor, 1e-6);
+    // _yarn_get_mscale(4,2.0)/_yarn_get_mscale(4,0.5).
+    ExpectedScale := (0.1 * 2.0 * Ln(4.0) + 1.0) / (0.1 * 0.5 * Ln(4.0) + 1.0);
+    DefaultScale := 0.1 * Ln(4.0) + 1.0;
+    AssertEquals('folded YaRN attention factor (mscale override)',
+      ExpectedScale, Config.RopeScaling.YarnAttnFactor, 1e-6);
+    AssertTrue('override differs from YaRN default',
+      Abs(ExpectedScale - DefaultScale) > 1e-2);
+
+    // The rotary layers must carry the override (FOutScale), not the default.
+    RopeCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt] is TNNetRotaryEmbedding then
+      begin
+        RopeLayer := TNNetRotaryEmbedding(NN.Layers[LayerCnt]);
+        AssertTrue('rope layer is YaRN mode',
+          RopeLayer.GetScalingMode = rsmYaRN);
+        Inc(RopeCnt);
+      end;
+    AssertEquals('rotary layer count',
+      Config.NumLayers * (Config.NumHeads + 1), RopeCnt);
+
+    // float64 oracle parity: this is the load-bearing assertion - it only
+    // passes if FOutScale uses the mscale override on cos/sin (both q and k).
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_deepseek_v2_yarn_logits.json'),
+      Config.MaxPositions, Config.VocabSize);
+  finally
     NN.Free;
   end;
 end;
