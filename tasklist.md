@@ -267,32 +267,32 @@ rather than acted on.
       compares logits bit-for-bit. Scope v1 to the Llama family (the
       best-covered importer path); document other architectures as
       out-of-scope, same as the ONNX-export task.
-- [ ] GGUF k-quant READ support: Q5_K and Q2_K still open (Q4_K + Q6_K
-      LANDED). neural/neuralgguf.pas now dequantizes Q4_K (id 12, 144-B
-      super-block) and Q6_K (id 14, 210-B super-block) at load alongside
-      F32/F16/Q8_0 — i.e. the full Q4_K_M mix that covers the overwhelming
-      majority of community .gguf files, so BuildLlamaFromGGUF (and every
-      other GGUF importer — the dequant is architecture-agnostic) opens real
-      downloaded checkpoints now, not just the rare full-precision/Q8_0
-      builds. Added GGML_TYPE_Q4_K/Q6_K + GGUF_QK_K/GGUF_Q4_K_BLOCK_BYTES/
-      GGUF_K_SCALE_SIZE/GGUF_Q6_K_BLOCK_BYTES consts, DequantizeQ4K/
-      DequantizeQ6K helpers (+ DequantizeQ4KScaleMin mirroring ggml's
-      get_scale_min_k4) reproducing ggml's reference dequant_row_q4_K/
-      dequant_row_q6_K bit-unpacking exactly, the 256-element contiguous-dim
-      divisibility guard mirroring the Q8_0 one, and the LoadTensorFlat
-      cases. Verified by tools/make_kquant_gguf_fixture.py (hand-rolls valid
-      Q4_K/Q6_K block bytes in the exact ggml layout — the gguf python
-      package only implements DEquantize for k-quants, not quantize — then
-      captures the gguf-package reference dequant in tiny_kquant_ref.json)
-      and TestGGUFKQuantDecodeParity, which dequantizes the committed
-      tiny_kquant.gguf in Pascal and matches the Python reference to
-      max |diff| < 1e-4 (f32-rounding) plus a non-vacuous-quantization gate
-      vs the F32 source. STILL OPEN: Q5_K (id 13, 176-B block: like Q4_K but
-      an extra qh 5th-bit plane) and Q2_K (id 10, 84-B block: 2-bit quants +
-      4-bit scales/mins + f16 d/dmin). Extend the same packer + parity test;
-      both still raise EGGUFError with their type name today. Pairs with the
-      GGUF tokenizer-metadata follow-up so a single real Q4_K_M .gguf becomes
-      fully self-contained.
+- [X] GGUF k-quant READ support: Q2_K/Q4_K/Q5_K/Q6_K all LANDED.
+      neural/neuralgguf.pas dequantizes Q2_K (id 10, 84-B super-block), Q4_K
+      (id 12, 144-B), Q5_K (id 13, 176-B) and Q6_K (id 14, 210-B) at load
+      alongside F32/F16/Q8_0 — i.e. the full Q4_K_M / Q2_K / Q5_K mixes that
+      cover the overwhelming majority of community .gguf files, so
+      BuildLlamaFromGGUF (and every other GGUF importer — the dequant is
+      architecture-agnostic) opens real downloaded checkpoints now, not just
+      the rare full-precision/Q8_0 builds. Added GGML_TYPE_Q2_K/Q4_K/Q5_K/Q6_K
+      + GGUF_QK_K/GGUF_K_SCALE_SIZE/GGUF_Q2_K_BLOCK_BYTES(84)/
+      GGUF_Q4_K_BLOCK_BYTES(144)/GGUF_Q5_K_BLOCK_BYTES(176)/
+      GGUF_Q6_K_BLOCK_BYTES(210) consts, DequantizeQ2K/Q4K/Q5K/Q6K helpers
+      (+ DequantizeQ4KScaleMin mirroring ggml's get_scale_min_k4, reused by
+      Q5_K) reproducing ggml's reference dequant_row_q2_K/q4_K/q5_K/q6_K
+      bit-unpacking exactly (Q5_K = Q4_K + a 32-byte qh 5th-bit plane,
+      q = ql | (qh_bit<<4); Q2_K = 16 sub-blocks of 16, 4-bit scale|min per
+      sub-block, 2-bit quants), the 256-element contiguous-dim divisibility
+      guard mirroring the Q8_0 one, and the LoadTensorFlat cases. Verified by
+      tools/make_kquant_gguf_fixture.py (hand-rolls valid block bytes in the
+      exact ggml layout — the gguf python package only implements DEquantize
+      for k-quants, not quantize — then captures the gguf-package reference
+      dequant in tiny_kquant_ref.json) and TestGGUFKQuantDecodeParity, which
+      dequantizes the committed tiny_kquant.gguf (8 KB) in Pascal and matches
+      the Python reference to max |diff| < 1e-4 (f32-rounding) plus a
+      non-vacuous-quantization gate vs the F32 source for all four types.
+      Pairs with the GGUF tokenizer-metadata follow-up so a single real
+      Q4_K_M .gguf becomes fully self-contained.
 - [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.

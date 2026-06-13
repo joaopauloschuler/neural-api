@@ -3285,9 +3285,9 @@ begin
   end;
 end;
 
-// GGUF k-quant (Q4_K / Q6_K) dequant-at-load parity. tools/
+// GGUF k-quant (Q2_K / Q4_K / Q5_K / Q6_K) dequant-at-load parity. tools/
 // make_kquant_gguf_fixture.py packs the SAME seeded 4x256 source tensor
-// into Q4_K and Q6_K super-blocks (hand-rolled into the exact ggml byte
+// into each k-quant super-block (hand-rolled into the exact ggml byte
 // layout) plus an F32 copy, and records the gguf-package reference dequant
 // values in tiny_kquant_ref.json. This test dequantizes each k-quant
 // tensor in Pascal and asserts:
@@ -3340,7 +3340,7 @@ var
   end;
 
 var
-  M4Ref, M4Src, M6Ref, M6Src: double;
+  M4Ref, M4Src, M5Ref, M5Src, M6Ref, M6Src, M2Ref, M2Src: double;
 begin
   V := TNNetVolume.Create;
   RefJson := TStringList.Create;
@@ -3361,14 +3361,24 @@ begin
       AssertEquals('Q4_K dtype', 'Q4_K', GGUF.GetDType('kq.Q4_K.weight'));
       AssertTrue('Q4_K ggml type',
         GGUF.TensorGGMLType('kq.Q4_K.weight') = GGML_TYPE_Q4_K);
+      AssertEquals('Q5_K dtype', 'Q5_K', GGUF.GetDType('kq.Q5_K.weight'));
+      AssertTrue('Q5_K ggml type',
+        GGUF.TensorGGMLType('kq.Q5_K.weight') = GGML_TYPE_Q5_K);
       AssertEquals('Q6_K dtype', 'Q6_K', GGUF.GetDType('kq.Q6_K.weight'));
       AssertTrue('Q6_K ggml type',
         GGUF.TensorGGMLType('kq.Q6_K.weight') = GGML_TYPE_Q6_K);
+      AssertEquals('Q2_K dtype', 'Q2_K', GGUF.GetDType('kq.Q2_K.weight'));
+      AssertTrue('Q2_K ggml type',
+        GGUF.TensorGGMLType('kq.Q2_K.weight') = GGML_TYPE_Q2_K);
 
       // 4-bit step over data spanning ~+-6 => sub-unit error.
       CheckType('Q4_K', 1.5, M4Ref, M4Src);
+      // 5-bit is finer than 4-bit.
+      CheckType('Q5_K', 0.9, M5Ref, M5Src);
       // 6-bit is finer.
       CheckType('Q6_K', 0.6, M6Ref, M6Src);
+      // 2-bit is the coarsest.
+      CheckType('Q2_K', 3.5, M2Ref, M2Src);
     finally
       GGUF.Free;
     end;

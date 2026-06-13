@@ -43,11 +43,12 @@ FIX = os.path.join(ROOT, "tests", "fixtures")
 
 F32 = gguf.GGMLQuantizationType.F32
 
-# The k-quant types this fixture (and the Pascal reader) covers. Add Q5_K /
-# Q2_K here once the Pascal side implements them.
+# The k-quant types this fixture (and the Pascal reader) covers.
 KQUANT_TYPES = {
     "Q4_K": gguf.GGMLQuantizationType.Q4_K,
+    "Q5_K": gguf.GGMLQuantizationType.Q5_K,
     "Q6_K": gguf.GGMLQuantizationType.Q6_K,
+    "Q2_K": gguf.GGMLQuantizationType.Q2_K,
 }
 
 # Source tensor: rows x cols, cols a multiple of the 256-element super-block.
@@ -176,6 +177,108 @@ def pack_q6_k(src):
     return np.concatenate(out).astype(np.uint8)
 
 
+def pack_q5_k(src):
+    """Hand-rolled Q5_K packer -> 176-byte super-blocks in the exact ggml
+    byte layout (d f16, d_min f16, 12 bytes packed 6-bit sc/min, 32 bytes qh
+    5th-bit plane, 128 bytes 4-bit low quants). Like Q4_K but each quant is
+    5-bit: q = ql | (qh_bit << 4) in [0,31]. Reconstruction:
+    x = d*sc[j]*q - d_min*min[j], over 8 sub-blocks of 32."""
+    rows = src.reshape(-1, 256)
+    out = []
+    for blk in rows:
+        sub = blk.reshape(8, 32)
+        smin = sub.min(axis=1)
+        smax = sub.max(axis=1)
+        sscale = (smax - smin) / 31.0           # 5-bit range
+        sscale = np.where(sscale == 0, 1.0, sscale)
+        d = float(sscale.max() / 63.0)
+        dmin = float((-smin).max() / 63.0)
+        if d == 0:
+            d = 1.0
+        if dmin == 0:
+            dmin = 1.0
+        d = float(f16(d)); dmin = float(f16(dmin))
+        sc6 = np.clip(np.round(sscale / d), 0, 63).astype(np.uint8)
+        min6 = np.clip(np.round((-smin) / dmin), 0, 63).astype(np.uint8)
+        eff_scale = d * sc6.astype(np.float32)
+        eff_min = dmin * min6.astype(np.float32)
+        q = np.zeros((8, 32), dtype=np.uint8)
+        for j in range(8):
+            s = eff_scale[j] if eff_scale[j] != 0 else 1.0
+            q[j] = np.clip(np.round((sub[j] + eff_min[j]) / s), 0, 31).astype(np.uint8)
+        # Pack the 6-bit sc/min into 12 bytes (same as Q4_K).
+        scales = np.zeros(12, dtype=np.uint8)
+        for j in range(4):
+            scales[j] = sc6[j] & 0x3F
+            scales[j + 4] = min6[j] & 0x3F
+            scales[j + 8] = (sc6[j + 4] & 0x0F) | ((min6[j + 4] & 0x0F) << 4)
+            scales[j] |= (sc6[j + 4] & 0x30) << 2
+            scales[j + 4] |= (min6[j + 4] & 0x30) << 2
+        ql4 = q & 0x0F                # low 4 bits
+        qh1 = (q >> 4) & 0x01         # 5th bit
+        # qs: 4-bit low, byte-chunk c holds sub-block 2c(low)+2c+1(high).
+        qs = np.zeros(128, dtype=np.uint8)
+        for c in range(4):
+            qs[c * 32:(c + 1) * 32] = (ql4[2 * c] & 0x0F) | ((ql4[2 * c + 1] & 0x0F) << 4)
+        # qh: 32 bytes, sub-block j occupies bit j of each of the 32 bytes
+        # (qh.reshape(-1,1,32) >> [0..7] & 1).
+        qh = np.zeros(32, dtype=np.uint8)
+        for j in range(8):
+            qh |= (qh1[j] & 0x01) << j
+        d16 = np.array([d], dtype=np.float16).view(np.uint8)
+        dmin16 = np.array([dmin], dtype=np.float16).view(np.uint8)
+        out.append(np.concatenate([d16, dmin16, scales, qh, qs]))
+    return np.concatenate(out).astype(np.uint8)
+
+
+def pack_q2_k(src):
+    """Hand-rolled Q2_K packer -> 84-byte super-blocks in the exact ggml byte
+    layout (16 bytes packed 4-bit scale|min, 64 bytes 2-bit quants, f16 d,
+    f16 d_min). 16 sub-blocks of 16: x = d*(sc&0xF)*q - d_min*(sc>>4),
+    q in [0,3]. The 4-bit scale and 4-bit min share one byte per sub-block."""
+    rows = src.reshape(-1, 256)
+    out = []
+    for blk in rows:
+        sub = blk.reshape(16, 16)           # 16 sub-blocks of 16
+        smin = sub.min(axis=1)
+        smax = sub.max(axis=1)
+        sscale = (smax - smin) / 3.0        # 2-bit range
+        sscale = np.where(sscale == 0, 1.0, sscale)
+        # 4-bit super-scale for the per-sub-block scales and mins.
+        d = float(sscale.max() / 15.0)
+        dmin = float((-smin).max() / 15.0)
+        if d == 0:
+            d = 1.0
+        if dmin == 0:
+            dmin = 1.0
+        d = float(f16(d)); dmin = float(f16(dmin))
+        sc4 = np.clip(np.round(sscale / d), 0, 15).astype(np.uint8)
+        min4 = np.clip(np.round((-smin) / dmin), 0, 15).astype(np.uint8)
+        eff_scale = d * sc4.astype(np.float32)
+        eff_min = dmin * min4.astype(np.float32)
+        q = np.zeros((16, 16), dtype=np.uint8)
+        for sb in range(16):
+            s = eff_scale[sb] if eff_scale[sb] != 0 else 1.0
+            q[sb] = np.clip(np.round((sub[sb] + eff_min[sb]) / s), 0, 3).astype(np.uint8)
+        # scales: 1 byte per sub-block, (min4 << 4) | sc4.
+        scales = ((min4 & 0x0F) << 4) | (sc4 & 0x0F)
+        scales = scales.astype(np.uint8)
+        # qs: 64 bytes. Output element e (0..255): c=e//128, s=(e%128)//32,
+        # p=e%32; byte c*32+p, 2-bit field at shift 2*s. Build the inverse:
+        # element index in (16 sub-blocks x 16) order is e = sb*16 + k.
+        qflat = q.reshape(256)              # e -> 2-bit value
+        qs = np.zeros(64, dtype=np.uint8)
+        for e in range(256):
+            c = e // 128
+            s = (e % 128) // 32
+            p = e % 32
+            qs[c * 32 + p] |= (qflat[e] & 0x03) << (2 * s)
+        d16 = np.array([d], dtype=np.float16).view(np.uint8)
+        dmin16 = np.array([dmin], dtype=np.float16).view(np.uint8)
+        out.append(np.concatenate([scales, qs, d16, dmin16]))
+    return np.concatenate(out).astype(np.uint8)
+
+
 def main():
     w = gguf.GGUFWriter(os.path.join(FIX, "tiny_kquant.gguf"), "kquanttest")
     w.add_uint32("kquant.block_size", 256)
@@ -188,7 +291,8 @@ def main():
     }
 
     w.add_tensor("ref.f32.weight", np.ascontiguousarray(src, dtype=np.float32))
-    packers = {"Q4_K": pack_q4_k, "Q6_K": pack_q6_k}
+    packers = {"Q4_K": pack_q4_k, "Q5_K": pack_q5_k,
+               "Q6_K": pack_q6_k, "Q2_K": pack_q2_k}
     for name, qt in KQUANT_TYPES.items():
         # The gguf package only implements dequantize for k-quants, not
         # quantize. We pack valid block bytes ourselves (hand-rolled
