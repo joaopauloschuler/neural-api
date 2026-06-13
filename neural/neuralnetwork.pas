@@ -4207,6 +4207,24 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// NEFTune noisy embedding fine-tuning (Jain et al. 2023, "NEFTune: Noisy
+  // Embeddings Improve Instruction Finetuning"). During TRAINING ONLY
+  // (FEnabled = true) it adds uniform noise to the (embedding) layer output,
+  // scaled by alpha/sqrt(L*d) where L is the token/sequence axis (SizeX) and
+  // d is the embedding dimension (Depth): each element gets
+  // + (alpha/sqrt(L*d)) * Uniform(-1,+1). L and d are read from the actual
+  // input shape at forward time. At inference (FEnabled = false) the layer is
+  // a pure pass-through (identity). The noise is additive and
+  // input-independent, so the Jacobian is the identity and the backward pass
+  // forwards OutputError unchanged (inherited identity Backpropagate). alpha is
+  // stored in FFloatSt[0] (round-trips via Save/Load). No trainable params.
+  // Coded by Claude (AI).
+  TNNetNEFTune = class(TNNetAddNoiseBase)
+    public
+      constructor Create(pAlpha: TNeuralFloat = 5.0); overload;
+      procedure Compute(); override;
+  end;
+
   /// Spatial dropout (2D). Drops entire feature-map channels rather than
   // individual elements. With probability p (FFloatSt[0]) each channel
   // (depth slice covering the full SizeX*SizeY spatial extent) is zeroed;
@@ -61761,6 +61779,46 @@ begin
   BackpropagateNoTest();
 end;
 
+{ TNNetNEFTune }
+constructor TNNetNEFTune.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  if pAlpha < 0 then pAlpha := 0;
+  FFloatSt[0] := pAlpha;
+  if pAlpha > 0 then FEnabled := true;
+end;
+
+procedure TNNetNEFTune.Compute();
+var
+  StartTime: double;
+  Alpha, Scale: TNeuralFloat;
+  L, D: integer;
+  CntOut, MaxOutput: integer;
+begin
+  StartTime := Now();
+  // Identity copy (used at inference and as the base path).
+  FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  Alpha := FFloatSt[0];
+  if FEnabled and (Alpha > 0) then
+  begin
+    // L = sequence/token axis (SizeX); d = embedding dimension (Depth).
+    L := FOutput.SizeX;
+    D := FOutput.Depth;
+    if (L > 0) and (D > 0) then
+    begin
+      Scale := Alpha / Sqrt(L * D);
+      MaxOutput := FOutput.Size - 1;
+      for CntOut := 0 to MaxOutput do
+      begin
+        // Uniform(-1,+1): 2*Random - 1.
+        FOutput.FData[CntOut] := FOutput.FData[CntOut] +
+          Scale * (2 * Random - 1);
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
 { TNNetSpatialDropout2D }
 constructor TNNetSpatialDropout2D.Create(pDropProb: TNeuralFloat);
 begin
@@ -83726,6 +83784,7 @@ begin
       'TNNetLogCoshActivation' :    Result := TNNetLogCoshActivation.Create();
       'TNNetDropout' :              Result := TNNetDropout.Create(1/St[0], St[1]);
       'TNNetDropPath' :             Result := TNNetDropPath.Create(Ft[0]);
+      'TNNetNEFTune' :              Result := TNNetNEFTune.Create(Ft[0]);
       'TNNetSpatialDropout1D' :     Result := TNNetSpatialDropout1D.Create(Ft[0]);
       'TNNetSpatialDropout2D' :     Result := TNNetSpatialDropout2D.Create(Ft[0]);
       'TNNetDropBlock' :            Result := TNNetDropBlock.Create(St[0], Ft[0]);
@@ -84108,6 +84167,7 @@ begin
       if S[0] = 'TNNetLogCoshActivation' then Result := TNNetLogCoshActivation.Create() else
       if S[0] = 'TNNetDropout' then Result := TNNetDropout.Create(1/St[0], St[1]) else
       if S[0] = 'TNNetDropPath' then Result := TNNetDropPath.Create(Ft[0]) else
+      if S[0] = 'TNNetNEFTune' then Result := TNNetNEFTune.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout1D' then Result := TNNetSpatialDropout1D.Create(Ft[0]) else
       if S[0] = 'TNNetSpatialDropout2D' then Result := TNNetSpatialDropout2D.Create(Ft[0]) else
       if S[0] = 'TNNetDropBlock' then Result := TNNetDropBlock.Create(St[0], Ft[0]) else

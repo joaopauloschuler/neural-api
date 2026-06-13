@@ -242,7 +242,7 @@ rather than acted on.
       registered on TNeuralFitBase. Early stopping, custom logging, and the
       EMA/SWA tasks become small callbacks instead of ever more
       TNeuralFitBase fields.
-- [ ] NEFTune noisy embedding fine-tuning: uniform noise scaled by
+- [X] NEFTune noisy embedding fine-tuning: uniform noise scaled by
       alpha/sqrt(L*d) added to embedding-layer outputs during TRAINING only
       (off at eval); famously a ~5-line instruction-tuning quality win.
       Trivially testable: assert eval forward is noise-free and train

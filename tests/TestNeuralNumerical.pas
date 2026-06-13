@@ -870,6 +870,10 @@ type
     procedure TestSoftCappingExtremeInputSaturation;
     procedure TestSoftCappingSerializationRoundTrip;
     procedure TestDropPathSerializationRoundTrip;
+    procedure TestNEFTuneInferenceIdentity;
+    procedure TestNEFTuneTrainingNoiseBounded;
+    procedure TestNEFTuneGradientPassThrough;
+    procedure TestNEFTuneSerializationRoundTrip;
     procedure TestRotaryEmbeddingSerializationRoundTrip;
     procedure TestMaskedFillSerializationRoundTrip;
     procedure TestScaledDotProductAttentionSerializationRoundTrip;
@@ -14120,6 +14124,180 @@ begin
       for i := 0 to Input.Size - 1 do
         AssertEquals('DropPath reloaded forward is identity at ' + IntToStr(i),
           Input.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-7);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNEFTuneInferenceIdentity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // Shape (SeqLen=4, 1, EmbDim=3): L on SizeX, d on Depth.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetNEFTune.Create(5.0));
+    NN.EnableDropouts(false); // inference => pure pass-through.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    NN.Compute(Input);
+    // Bit-for-bit identity at inference.
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('NEFTune inference is identity at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNEFTuneTrainingNoiseBounded;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i, L, D: integer;
+  Alpha, Scale, Delta: TNeuralFloat;
+  AnyDifferent: boolean;
+begin
+  L := 4;
+  D := 3;
+  Alpha := 5.0;
+  Scale := Alpha / Sqrt(L * D);
+  AnyDifferent := false;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(L, 1, D);
+  try
+    NN.AddLayer(TNNetInput.Create(L, 1, D, 1));
+    NN.AddLayer(TNNetNEFTune.Create(Alpha));
+    NN.EnableDropouts(true); // training => noise applied.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    RandSeed := 4242;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+    begin
+      Delta := NN.GetLastLayer.Output.Raw[i] - Input.Raw[i];
+      if Abs(Delta) > 1e-9 then AnyDifferent := true;
+      // Per-element noise magnitude bounded by alpha/sqrt(L*d).
+      AssertTrue('NEFTune noise bounded at ' + IntToStr(i) +
+        ' (|delta|=' + FloatToStr(Abs(Delta)) + ' scale=' + FloatToStr(Scale) + ')',
+        Abs(Delta) <= Scale + 1e-6);
+    end;
+    AssertTrue('NEFTune training forward differs from clean input', AnyDifferent);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNEFTuneGradientPassThrough;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  ExpectedErr: TNeuralFloat;
+begin
+  // Noise is additive and input-independent => Jacobian is identity, so the
+  // backward pass must forward OutputError unchanged.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 3, 1));
+    NN.AddLayer(TNNetNEFTune.Create(5.0));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.EnableDropouts(true);
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0; // upstream grad = output - 0 = output.
+    RandSeed := 99;
+    NN.Compute(Input);
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    // Input-layer error must equal the (noisy) output unchanged (identity grad).
+    for i := 0 to Input.Size - 1 do
+    begin
+      ExpectedErr := NN.GetLastLayer.Output.Raw[i];
+      AssertEquals('NEFTune grad passes through at ' + IntToStr(i),
+        ExpectedErr, NN.Layers[0].OutputError.Raw[i], 1e-5);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNEFTuneSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved: string;
+  i, L, D: integer;
+  Alpha, Scale, Delta, MaxDelta, LooseScale: TNeuralFloat;
+begin
+  // Non-default alpha (3.5) must round-trip via FFloatSt[0]. We prove it by
+  // training-mode noise statistics on the reloaded net: with alpha=3.5 the
+  // noise bound is 3.5/sqrt(L*d); a default-alpha (5.0) reload would exceed
+  // the 3.5 bound, and a lost-alpha (0) reload would add no noise at all.
+  L := 4;
+  D := 3;
+  Alpha := 3.5;
+  Scale := Alpha / Sqrt(L * D);
+  LooseScale := 5.0 / Sqrt(L * D); // default alpha, used as a discriminating upper guard
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(L, 1, D);
+  try
+    NN.AddLayer(TNNetInput.Create(L, 1, D, 1));
+    NN.AddLayer(TNNetNEFTune.Create(Alpha));
+    NN.EnableDropouts(false);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('NEFTune reloaded layer type',
+        NN2.Layers[1] is TNNetNEFTune);
+      // Inference identity survives the round-trip.
+      NN2.EnableDropouts(false);
+      NN2.Compute(Input);
+      for i := 0 to Input.Size - 1 do
+        AssertEquals('NEFTune reloaded inference identity at ' + IntToStr(i),
+          Input.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-7);
+      // Training noise on the reloaded net must respect the alpha=3.5 bound.
+      NN2.EnableDropouts(true);
+      RandSeed := 7;
+      MaxDelta := 0;
+      for i := 0 to 49 do
+      begin
+        NN2.Compute(Input);
+        for L := 0 to Input.Size - 1 do
+        begin
+          Delta := Abs(NN2.GetLastLayer.Output.Raw[L] - Input.Raw[L]);
+          if Delta > MaxDelta then MaxDelta := Delta;
+          AssertTrue('NEFTune reloaded noise within alpha=3.5 bound',
+            Delta <= Scale + 1e-6);
+        end;
+      end;
+      // Discriminating checks: alpha was neither lost (no noise) nor reset to
+      // the 5.0 default (which over many trials would approach LooseScale).
+      AssertTrue('NEFTune reloaded alpha not lost (noise present)',
+        MaxDelta > 1e-6);
+      AssertTrue('NEFTune reloaded alpha not the default 5.0',
+        MaxDelta < LooseScale);
     finally
       NN2.Free;
     end;
