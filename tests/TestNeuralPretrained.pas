@@ -151,6 +151,7 @@ type
     procedure TestQwen2LogitParity;
     procedure TestQwen3LogitParity;
     procedure TestQwen3MoeLogitParity;
+    procedure TestQwen3MoeMixedLogitParity;
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
@@ -4517,6 +4518,64 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_moe_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Qwen3-MoE MIXED dense/MoE stack import path (the follow-up to
+// TestQwen3MoeLogitParity, which only covers the uniform all-MoE stack).
+// tests/fixtures/tiny_qwen3_moe_mixed.* is a pico randomly-initialized
+// Qwen3MoeForCausalLM with decoder_sparse_step=2 over 3 layers, so by the HF
+// rule (layer_idx+1) mod step = 0 -> MoE: layer 0 DENSE, layer 1 MoE, layer 2
+// DENSE. The importer must build a sparse top-k MoE FFN for layer 1 and plain
+// SwiGLU FFNs (full intermediate_size, mlp.gate_proj/up_proj/down_proj) for
+// layers 0 and 2, sharing the identical Qwen3 QK-norm attention. Logit parity
+// against the transformers float64 oracle pins the per-layer gate AND that the
+// dense layers load the dense FFN width/names (not the moe ones).
+// tools/qwen3_moe_mixed_tiny_fixture.py generates the fixture and asserts the
+// mixed split is non-vacuous (both kinds present). Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen3MoeMixedLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, GateCnt, SoftMaxCnt, SwiGLUCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildQwen3MoeFromSafeTensorsEx(
+    FixturePath('tiny_qwen3_moe_mixed.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_qwen3_moe_mixed_config.json'));
+  try
+    AssertEquals('model_type', 'qwen3_moe', Config.ModelType);
+    AssertEquals('layers', 3, Config.NumLayers);
+    AssertTrue('is_moe', Config.IsMoE);
+    AssertEquals('decoder_sparse_step', 2, Config.MoEDecoderSparseStep);
+    AssertEquals('mlp_only_layers empty', 0, Length(Config.MoEMlpOnlyLayers));
+    AssertEquals('num_experts', 4, Config.NumLocalExperts);
+    AssertEquals('moe_intermediate_size', 5, Config.MoEIntermediateSize);
+    AssertEquals('intermediate_size', 12, Config.IntermediateSize);
+    // ONE MoE layer (layer 1): exactly one router (TopKGate + per-token
+    // softmax). SwiGLU count = experts on the MoE layer (4) PLUS one dense
+    // SwiGLU per dense layer (layers 0 and 2 = 2): 6 total.
+    GateCnt := 0;
+    SoftMaxCnt := 0;
+    SwiGLUCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetPointwiseSoftMax then
+        Inc(SoftMaxCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
+    end;
+    AssertEquals('one top-k router gate (single MoE layer)', 1, GateCnt);
+    AssertEquals('one per-token router softmax (single MoE layer)',
+      1, SoftMaxCnt);
+    AssertEquals('SwiGLUs = experts(4) on MoE layer + 1 per dense layer(2)',
+      Config.NumLocalExperts + 2, SwiGLUCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_moe_mixed_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
   finally
     NN.Free;
   end;

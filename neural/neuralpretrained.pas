@@ -724,6 +724,15 @@ type
     MoENormTopK: boolean;      // renormalize the top-k gate probs to sum 1
                                // (Mixtral: always true; Qwen3-MoE:
                                // norm_topk_prob, default false)
+    MoEDecoderSparseStep: integer; // Qwen3-MoE decoder_sparse_step: a decoder
+                               // layer is MoE iff (layer_idx+1) mod step = 0
+                               // (HF modeling_qwen3_moe). 1 = every layer MoE
+                               // (the uniform stack); >1 intersperses dense
+                               // SwiGLU FFN layers. 0/unset treated as 1.
+    MoEMlpOnlyLayers: array of integer; // Qwen3-MoE mlp_only_layers: layer
+                               // indices FORCED to a dense SwiGLU FFN (plain
+                               // intermediate_size) regardless of the step
+                               // rule; empty = none
     // ---- GLM-4 deltas (all default off for the other families) ----
     GLM4SandwichNorm: boolean; // GLM-4 four-norm sandwich block: the usual
                                // input_layernorm (attn pre) and
@@ -3648,6 +3657,8 @@ var
   Obj: TJSONObject;
   ModelType, HiddenAct: string;
   HeadDimField, SlidingWindowField, FloatField: TJSONData;
+  MoEMlpOnlyArr: TJSONData;
+  i: integer;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -3749,6 +3760,8 @@ begin
     Result.MoEQwen3Naming := False;
     Result.MoEIntermediateSize := 0;
     Result.MoENormTopK := False;
+    Result.MoEDecoderSparseStep := 1;
+    SetLength(Result.MoEMlpOnlyLayers, 0);
     Result.GLM4SandwichNorm := False;
     Result.FusedGateUp := False;
     Result.InterleavedRotary := False;
@@ -3846,22 +3859,26 @@ begin
         ImportError('Llama import: Qwen3-MoE num_experts_per_tok=' +
           IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, num_experts=' +
           IntToStr(Result.NumLocalExperts) + '].');
-      // Qwen3-MoE can intersperse DENSE FFN layers (decoder_sparse_step > 1
-      // or an mlp_only_layers list). The reference all-MoE checkpoints
-      // (Qwen3-30B-A3B) use decoder_sparse_step=1 with mlp_only_layers=[];
-      // the mixed-layer variants are not wired into this uniform builder.
-      if Obj.Get('decoder_sparse_step', 1) <> 1 then
+      // Qwen3-MoE MIXED stack: a decoder layer is MoE iff (layer_idx+1) mod
+      // decoder_sparse_step = 0 AND layer_idx not in mlp_only_layers (HF
+      // modeling_qwen3_moe.Qwen3MoeDecoderLayer.__init__); otherwise it is a
+      // plain dense SwiGLU FFN of full intermediate_size. The reference
+      // all-MoE checkpoints (Qwen3-30B-A3B) use decoder_sparse_step=1 with
+      // mlp_only_layers=[], so EVERY layer is MoE (the uniform path). See
+      // LlamaLayerIsMoE for the per-layer gate; both the block builder and
+      // the weight loader consult it.
+      Result.MoEDecoderSparseStep := Obj.Get('decoder_sparse_step', 1);
+      if Result.MoEDecoderSparseStep < 1 then
         ImportError('Llama import: Qwen3-MoE decoder_sparse_step=' +
-          IntToStr(Obj.Get('decoder_sparse_step', 1)) + ' (dense layers ' +
-          'interspersed with MoE) is not wired into this importer yet - ' +
-          'only the uniform all-MoE stack (decoder_sparse_step=1) is ' +
-          'supported.');
-      if (Obj.Find('mlp_only_layers') <> nil) and
-         (Obj.Find('mlp_only_layers') is TJSONArray) and
-         (TJSONArray(Obj.Find('mlp_only_layers')).Count > 0) then
-        ImportError('Llama import: Qwen3-MoE mlp_only_layers (dense FFN on ' +
-          'specific layers) is not wired into this importer yet - only the ' +
-          'uniform all-MoE stack (empty mlp_only_layers) is supported.');
+          IntToStr(Result.MoEDecoderSparseStep) + ' must be >= 1.');
+      MoEMlpOnlyArr := Obj.Find('mlp_only_layers');
+      if (MoEMlpOnlyArr <> nil) and (MoEMlpOnlyArr is TJSONArray) then
+      begin
+        SetLength(Result.MoEMlpOnlyLayers,
+          TJSONArray(MoEMlpOnlyArr).Count);
+        for i := 0 to TJSONArray(MoEMlpOnlyArr).Count - 1 do
+          Result.MoEMlpOnlyLayers[i] := TJSONArray(MoEMlpOnlyArr).Integers[i];
+      end;
       if Obj.Get('use_sliding_window', False) then
         ImportError('Llama import: Qwen3-MoE use_sliding_window=true is not ' +
           'wired into this importer yet.');
@@ -4589,6 +4606,28 @@ type
 // would couple tokens); pRenormalize=true is Mixtral's top-k renorm, the
 // one routing knob that distinguishes it from DeepSeek-V2 (norm=false).
 // Leaves the combined sum as the last layer (the caller closes the residual).
+//
+// Per-layer dense/MoE gate for the Qwen3-MoE mixed stack. Mirrors HF
+// modeling_qwen3_moe.Qwen3MoeDecoderLayer.__init__ EXACTLY: layer LayerIdx is
+// an MoE FFN iff it is NOT in mlp_only_layers AND num_experts > 0 AND
+// (LayerIdx+1) mod decoder_sparse_step = 0; otherwise it is a plain dense
+// SwiGLU FFN (full intermediate_size). For the uniform all-MoE stack
+// (decoder_sparse_step=1, empty mlp_only_layers) this is true for every layer,
+// so the original behaviour is unchanged. Config.IsMoE gates whether ANY layer
+// is MoE (non-MoE families short-circuit to dense). Coded by Claude (AI).
+function LlamaLayerIsMoE(const Config: TLlamaConfig; LayerIdx: integer): boolean;
+var
+  Step, k: integer;
+begin
+  if not Config.IsMoE then Exit(False);
+  if Config.NumLocalExperts < 1 then Exit(False);
+  for k := 0 to High(Config.MoEMlpOnlyLayers) do
+    if Config.MoEMlpOnlyLayers[k] = LayerIdx then Exit(False);
+  Step := Config.MoEDecoderSparseStep;
+  if Step < 1 then Step := 1;
+  Result := ((LayerIdx + 1) mod Step) = 0;
+end;
+
 procedure BuildMixtralMoEBranch(NN: TNNet; var Block: TLlamaBlockLayers;
   MoESource: TNNetLayer; const Config: TLlamaConfig);
 var
@@ -5012,7 +5051,9 @@ begin
         if not Config.PostNormReordered then
           Blocks[BlockCnt].MlpNorm :=
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
-        if Config.IsMoE then
+        // Per-layer dense/MoE choice (Qwen3-MoE mixed stack; uniform stacks
+        // and non-MoE families fall through unchanged - see LlamaLayerIsMoE).
+        if LlamaLayerIsMoE(Config, BlockCnt) then
           BuildMixtralMoEBranch(NN, Blocks[BlockCnt], NN.GetLastLayer(),
             Config)
         else
@@ -5294,7 +5335,7 @@ begin
             Config.HiddenSize, NormGainOffset);
           MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
         end;
-        if Config.IsMoE then
+        if LlamaLayerIsMoE(Config, BlockCnt) then
         begin
           // Sparse top-k MoE FFN: a router gate + per-expert SwiGLU. Two
           // checkpoint dialects share the SAME math (the block builder above);

@@ -93,14 +93,15 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Qwen3-MoE importer follow-up (BuildQwen3MoeFromSafeTensors landed in a3,
-      commit 6417ce3): v1 supports only the UNIFORM all-MoE stack and rejects
-      mixed dense/MoE layers (decoder_sparse_step > 1 or non-empty
-      mlp_only_layers) and use_sliding_window loudly. Add the mixed-layer path
-      (some decoder layers are dense SwiGLU FFN, some are MoE — gate per layer
-      on the index) so e.g. configs that interleave a dense layer every N
-      blocks import; sliding-window support rides the existing SDPA window arg.
-      Add a pico fixture with decoder_sparse_step=2 (or one mlp_only_layer).
+- [ ] Qwen3-MoE importer follow-up — SLIDING-WINDOW remainder only. MIXED
+      dense/MoE layers DONE (per-layer LlamaLayerIsMoE gate mirrors HF
+      modeling_qwen3_moe: layer i is MoE iff i not in mlp_only_layers AND
+      (i+1) mod decoder_sparse_step = 0; else dense SwiGLU FFN of full
+      intermediate_size). Pico fixture tools/qwen3_moe_mixed_tiny_fixture.py
+      (decoder_sparse_step=2, 3 layers -> dense/MoE/dense) + parity test
+      TestQwen3MoeMixedLogitParity. STILL OPEN: use_sliding_window=true is
+      still rejected loudly — wire it through the existing SDPA window arg
+      (FStruct[2]) like Gemma-2/Qwen2 do.
 - [ ] GPT-OSS importer (BuildGptOssFromSafeTensors[Ex], model_type "gpt_oss",
       i.e. openai/gpt-oss-20b and gpt-oss-120b — OpenAI's first open-weight
       release and currently the highest-profile open MoE LLM with NO import
