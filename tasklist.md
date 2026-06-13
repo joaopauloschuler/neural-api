@@ -169,7 +169,7 @@ rather than acted on.
       Cohere weights on top of the synthetic fixture. Also: order_of_interleaved_layers
       (legacy cohere2 spelling) maps to sliding_window_pattern but was not seen
       in a published config — wire it if one surfaces.
-- [ ] DeBERTa-v3 importer + disentangled attention (BuildDebertaV2FromSafeTensors,
+- [X] DeBERTa-v3 importer + disentangled attention (BuildDebertaV2FromSafeTensors,
       model_type "deberta-v2"): the dominant small-encoder family for
       NLU/classification/NER/reranking (deberta-v3-base/small, the ms-marco
       rerankers), and the FIRST genuinely new attention mechanism beyond the
@@ -195,6 +195,16 @@ rather than acted on.
       float64, and a cross-encoder RERANKING example over the landed
       BuildBertForSequenceClassification scoring path (query+passage -> relevance
       score), the canonical RAG-reranker demo the encoder importers enable.
+      DONE: TNNetDisentangledAttention layer (gradient + serialization tests),
+      BuildDebertaV2FromSafeTensors[Ex] wired into BuildFromPretrained, pico
+      fixture tools/deberta_v2_tiny_fixture.py (hidden parity <2e-5, seq-cls
+      logits <1e-4 vs HF float64), examples/DebertaReranker. NOTE: the layer's
+      sequence classification head is the DeBERTa ContextPooler (dense + GELU on
+      row 0) + classifier — implemented with the same per-token PointwiseConvLinear
+      scoring path / AssertSeqClsParityWithFixture machinery as the BERT seq-cls
+      head, NOT BuildBertForSequenceClassification literally. Deferred: the raw
+      spm.model protobuf tokenizer path (out of scope, see neuralhftokenizer
+      follow-up); real-checkpoint (deberta-v3-base) ad-hoc verification.
 - [ ] BART-family follow-up (b) mBART/NLLB — pre-norm + an EXTRA final encoder
       AND decoder LayerNorm (same pre-norm shape the Pegasus importer now ships,
       so it should reuse BuildPegasusStackBlocks) + a SentencePiece tokenizer:
