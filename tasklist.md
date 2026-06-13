@@ -322,10 +322,22 @@ rather than acted on.
       dt_proj.weight=L, x_proj rows[0:dt_rank]=U with L@U=W_d); tied
       tie_word_embeddings emits no lm_head tensor; round-trip gated by
       TestMambaSafeTensorsRoundTrip, max |logit diff| = 4.4e-6 (single-precision
-      rounding of the factor product, well under 1e-5)): add a layer->HF-name +
-      transpose inverse map for the REMAINING architectures (e.g. GPT-NeoX-style
-      siblings already covered; next up the non-transformer / encoder-decoder
-      importers such as RWKV, T5/Marian — each its own map).
+      rounding of the factor product, well under 1e-5); RWKV
+      SaveRWKVToSafeTensors LANDED as the exact inverse of
+      BuildRWKVFromSafeTensors — the second NON-TRANSFORMER exporter: walks the
+      typed layers (Embedding / ln0 pre_ln / per-block ln1+ln2 TokenLayerNorm,
+      5 TokenShift lerp vectors, 7 PointwiseConvLinear projections, WKV / ln_out
+      / tied|untied head) in build order and emits the rwkv.* name map; every
+      tensor round-trips RAW except time_decay, which is reconstructed by the
+      FORWARD softplus time_decay=ln(softplus(w_raw)) — the EXACT inverse of
+      LoadWKVDecay's invsoftplus (same w_raw>30 and exp-limit branch bounds), so
+      the round-trip is BIT-EXACT; LayerNorms dump gamma|beta, projections are
+      straight bias-free [out,in] dumps, time_first bonus and token-shift lerps
+      round-trip raw, tied tie_word_embeddings emits no head.weight tensor;
+      round-trip gated by TestRWKVSafeTensorsRoundTrip, max |logit diff| = 0
+      (bit-exact)): add a layer->HF-name + transpose inverse map for the
+      REMAINING architectures — only the ENCODER-DECODER importers (T5/Marian,
+      each its own two-net map) now remain on this entry.
 - [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the

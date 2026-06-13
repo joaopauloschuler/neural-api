@@ -112,6 +112,7 @@ type
     procedure TestGPTNeoXSafeTensorsRoundTrip;
     procedure TestBloomSafeTensorsRoundTrip;
     procedure TestMambaSafeTensorsRoundTrip;
+    procedure TestRWKVSafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -1889,6 +1890,64 @@ begin
     end;
     // F32; only the exact dt-fold re-factorization rounds at single precision.
     AssertTrue('Mamba safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
+    NN.Free;
+  end;
+end;
+
+// SaveRWKVToSafeTensors round-trip: import tiny_rwkv -> export -> re-import
+// and assert the logits match. F32; the only non-raw tensor is time_decay,
+// reconstructed by the FORWARD softplus (the exact inverse of LoadWKVDecay's
+// invsoftplus), so the round-trip is near bit-exact.
+procedure TTestNeuralPretrained.TestRWKVSafeTensorsRoundTrip;
+var
+  NN, NN2: TNNet;
+  Config, Config2: TRWKVConfig;
+  Input, Out1, Out2: TNNetVolume;
+  TmpPath: string;
+  i, s, SeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  TmpPath := GetTempDir(false) + 'cai_rwkv_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  NN := BuildRWKVFromSafeTensorsEx(
+    FixturePath('tiny_rwkv.safetensors'), Config, {SeqLen=}8,
+    {pInferenceOnly=}false, FixturePath('tiny_rwkv_config.json'));
+  Input := TNNetVolume.Create;
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  NN2 := nil;
+  try
+    SaveRWKVToSafeTensors(NN, Config, TmpPath);
+    NN2 := BuildRWKVFromSafeTensorsEx(TmpPath, Config2, {SeqLen=}8,
+      {pInferenceOnly=}false, FixturePath('tiny_rwkv_config.json'));
+    SeqLen := 8;
+    Vocab := Config.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input[i, 0, 0] := (s * 5 + i * 3 + 1) mod Vocab;
+      NN.Compute(Input);
+      NN.GetOutput(Out1);
+      NN2.Compute(Input);
+      NN2.GetOutput(Out2);
+      AssertEquals('rwkv round-trip output size', Out1.Size, Out2.Size);
+      for i := 0 to Out1.Size - 1 do
+        if Abs(Out1.FData[i] - Out2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(Out1.FData[i] - Out2.FData[i]);
+    end;
+    // F32; only time_decay round-trips through the softplus<->invsoftplus
+    // pair. Measured 2026-06 on tiny_rwkv: bit-exact (max |diff| = 0).
+    AssertTrue('RWKV safetensors round-trip: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     if FileExists(TmpPath) then DeleteFile(TmpPath);

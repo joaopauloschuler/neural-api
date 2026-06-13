@@ -2846,6 +2846,16 @@ function BuildRWKVFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
+// Writes Net (a BuildRWKVFromSafeTensors causal-LM) back out under the HF
+// rwkv.* tensor names, the exact inverse of BuildRWKVFromSafeTensorsWithConfig.
+// time_decay is reconstructed by applying the FORWARD softplus to the stored
+// w_raw (LoadWKVDecay's inverse): time_decay = ln(softplus(w_raw)). All other
+// tensors round-trip raw (LayerNorms, token-shift lerp vectors, bias-free
+// projections, time_first bonus, embeddings, ln0/ln_out, tied/untied head).
+procedure SaveRWKVToSafeTensors(Net: TNNet; const Config: TRWKVConfig;
+  const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
 // ============================ MAMBA IMPORT =================================
 // Mamba (model_type "mamba": state-spaces/mamba-130m-hf and siblings,
 // architectures ["MambaForCausalLM"]) - the SECOND NON-TRANSFORMER importer
@@ -19882,6 +19892,249 @@ begin
     // ---- LM head (untied only; tied heads carry no lm_head tensor) ----
     if not Config.TieWordEmbeddings then
       DumpLinear(LMHead, Config.VocabSize, d, 'lm_head.weight', '');
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
+procedure SaveRWKVToSafeTensors(Net: TNNet; const Config: TRWKVConfig;
+  const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  LNorms, Shifts, PwConvs, WKVs: array of TNNetLayer;
+  EmbIn, PreLN, FinalLN, LMHead: TNNetLayer;
+  i, BlockCnt, d, AH, IM: integer;
+  ExpectLN, ExpectShift, ExpectPw: integer;
+  BlockPrefix, AttPrefix, FFPrefix: string;
+
+  // Straight bias-free HF nn.Linear [OutDim, InDim] from OutDim consecutive
+  // neurons (neuron j = checkpoint row j). Inverse of LoadLlamaLinearWeights
+  // (no rotary/scale on any RWKV linear).
+  procedure DumpLinear(Layer: TNNetLayer; OutDim, InDim: integer;
+    const WName: string);
+  var
+    W: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[jj].Weights.Size <> InDim then
+          ImportError('RWKV export: neuron ' + IntToStr(jj) + ' for "' +
+            WName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+    finally
+      W.Free;
+    end;
+  end;
+
+  // LayerNorm gamma (Neurons[0]) + beta (Neurons[1]), each [Chan].
+  // Inverse of LoadLayerNormWeights.
+  procedure DumpLayerNorm(Layer: TNNetLayer;
+    const WName, BName: string; Chan: integer);
+  var
+    G, B: TNNetVolume;
+    ii: integer;
+  begin
+    if (Layer.Neurons[0].Weights.Size <> Chan) or
+       (Layer.Neurons[1].Weights.Size <> Chan) then
+      ImportError('RWKV export: LayerNorm "' + WName + '" gain/bias size ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' <> ' + IntToStr(Chan) +
+        '.');
+    G := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      G.ReSize(Chan, 1, 1);
+      B.ReSize(Chan, 1, 1);
+      for ii := 0 to Chan - 1 do
+      begin
+        G.FData[ii] := Layer.Neurons[0].Weights.FData[ii];
+        B.FData[ii] := Layer.Neurons[1].Weights.FData[ii];
+      end;
+      Writer.AddTensorFlat(WName, [Chan], G, pDType);
+      Writer.AddTensorFlat(BName, [Chan], B, pDType);
+    finally
+      B.Free;
+      G.Free;
+    end;
+  end;
+
+  // Per-channel vector [1,1,Chan] (token-shift lerp or time_first bonus)
+  // from neuron NeuronIdx of Layer. Inverse of LoadChannelVector.
+  procedure DumpChannelVector(Layer: TNNetLayer; NeuronIdx: integer;
+    const TName: string; Chan: integer);
+  var
+    V: TNNetVolume;
+    ii: integer;
+  begin
+    if Layer.Neurons[NeuronIdx].Weights.Size < Chan then
+      ImportError('RWKV export: vector "' + TName + '" neuron ' +
+        IntToStr(NeuronIdx) + ' has ' +
+        IntToStr(Layer.Neurons[NeuronIdx].Weights.Size) +
+        ' elements, expected >= ' + IntToStr(Chan) + '.');
+    V := TNNetVolume.Create;
+    try
+      V.ReSize(Chan, 1, 1);
+      for ii := 0 to Chan - 1 do
+        V.FData[ii] := Layer.Neurons[NeuronIdx].Weights.FData[ii];
+      Writer.AddTensorFlat(TName, [1, 1, Chan], V, pDType);
+    finally
+      V.Free;
+    end;
+  end;
+
+  // TNNetWKV w_raw (Neurons[0]) -> HF time_decay [Chan]: the FORWARD softplus,
+  // exactly inverting LoadWKVDecay. The checkpoint's effective decay is
+  // x = softplus(w_raw) = ln(1+exp(w_raw)) and time_decay = ln(x). Branch
+  // bounds mirror the importer's: w_raw > 30 took the x=w_raw shortcut, and
+  // x < 1e-7 (w_raw < ln(1e-7) ~= -16.118) took the x=exp(w_raw) limit.
+  procedure DumpWKVDecay(Layer: TNNetLayer; const TName: string; Chan: integer);
+  var
+    V: TNNetVolume;
+    ii: integer;
+    wraw, x: double;
+  begin
+    V := TNNetVolume.Create;
+    try
+      V.ReSize(Chan, 1, 1);
+      for ii := 0 to Chan - 1 do
+      begin
+        wraw := Layer.Neurons[0].Weights.FData[ii];
+        if wraw > 30 then x := wraw                 // softplus(w)=w for big w
+        else if wraw < Ln(1e-7) then x := Exp(wraw) // softplus(w)=exp(w) tiny
+        else x := Ln(1.0 + Exp(wraw));
+        V.FData[ii] := Ln(x);                       // time_decay = ln(x)
+      end;
+      Writer.AddTensorFlat(TName, [Chan], V, pDType);
+    finally
+      V.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  AH := Config.AttentionHiddenSize;
+  IM := Config.IntermediateSize;
+  if Config.NumLayers < 1 then
+    ImportError('RWKV export: num_hidden_layers must be >= 1.');
+  // ---- collect load-bearing layers in net (= importer build) order ----
+  SetLength(LNorms, 0); SetLength(Shifts, 0);
+  SetLength(PwConvs, 0); SetLength(WKVs, 0);
+  EmbIn := nil;
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetEmbedding then
+      EmbIn := Net.Layers[i]
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LNorms, Length(LNorms) + 1);
+      LNorms[High(LNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenShift then
+    begin
+      SetLength(Shifts, Length(Shifts) + 1);
+      Shifts[High(Shifts)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetWKV then
+    begin
+      SetLength(WKVs, Length(WKVs) + 1);
+      WKVs[High(WKVs)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if EmbIn = nil then
+    ImportError('RWKV export: no TNNetEmbedding layer - not a ' +
+      'BuildRWKVFromSafeTensors net?');
+  ExpectLN := 2 * Config.NumLayers + 2;     // ln0 + ln1/ln2 per block + ln_out
+  ExpectShift := 5 * Config.NumLayers;      // 3 attn + 2 ffn shifts per block
+  ExpectPw := 7 * Config.NumLayers + 1;     // 7 projections per block + head
+  if Length(LNorms) <> ExpectLN then
+    ImportError('RWKV export: found ' + IntToStr(Length(LNorms)) +
+      ' TokenLayerNorm layers, expected ' + IntToStr(ExpectLN) + '.');
+  if Length(Shifts) <> ExpectShift then
+    ImportError('RWKV export: found ' + IntToStr(Length(Shifts)) +
+      ' TokenShift layers, expected ' + IntToStr(ExpectShift) + '.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('RWKV export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) + '.');
+  if Length(WKVs) <> Config.NumLayers then
+    ImportError('RWKV export: found ' + IntToStr(Length(WKVs)) +
+      ' WKV layers, expected ' + IntToStr(Config.NumLayers) + '.');
+  PreLN := LNorms[0];
+  FinalLN := LNorms[2 * Config.NumLayers + 1];   // last collected norm
+  LMHead := PwConvs[7 * Config.NumLayers];       // last collected PwConv
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/rwkv');
+    // ---- embeddings ----
+    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+      ImportError('RWKV export: embeddings size ' +
+        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(Config.VocabSize * d) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'embeddings.weight',
+      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+    // ---- block-0 embedding LayerNorm (ln0 / HF pre_ln) ----
+    DumpLayerNorm(PreLN, Config.Prefix + 'blocks.0.pre_ln.weight',
+      Config.Prefix + 'blocks.0.pre_ln.bias', d);
+    // ---- blocks ----
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'blocks.' + IntToStr(BlockCnt) + '.';
+      AttPrefix := BlockPrefix + 'attention.';
+      FFPrefix := BlockPrefix + 'feed_forward.';
+      // ln1 = LNorms[1 + 2*b], ln2 = LNorms[2 + 2*b]
+      DumpLayerNorm(LNorms[1 + 2 * BlockCnt], BlockPrefix + 'ln1.weight',
+        BlockPrefix + 'ln1.bias', d);
+      DumpLayerNorm(LNorms[2 + 2 * BlockCnt], BlockPrefix + 'ln2.weight',
+        BlockPrefix + 'ln2.bias', d);
+      // Token-shift lerp vectors. Shift order per block:
+      //   [0]=AttShiftK [1]=AttShiftV [2]=AttShiftR [3]=FFShiftK [4]=FFShiftR
+      DumpChannelVector(Shifts[5 * BlockCnt + 0], 0,
+        AttPrefix + 'time_mix_key', d);
+      DumpChannelVector(Shifts[5 * BlockCnt + 1], 0,
+        AttPrefix + 'time_mix_value', d);
+      DumpChannelVector(Shifts[5 * BlockCnt + 2], 0,
+        AttPrefix + 'time_mix_receptance', d);
+      DumpChannelVector(Shifts[5 * BlockCnt + 3], 0,
+        FFPrefix + 'time_mix_key', d);
+      DumpChannelVector(Shifts[5 * BlockCnt + 4], 0,
+        FFPrefix + 'time_mix_receptance', d);
+      // WKV decay (forward softplus) + time_first bonus.
+      DumpWKVDecay(WKVs[BlockCnt], AttPrefix + 'time_decay', AH);
+      DumpChannelVector(WKVs[BlockCnt], 1, AttPrefix + 'time_first', AH);
+      // Bias-free projections. PwConv order per block:
+      //   [0]=AttKey [1]=AttValue [2]=AttRecept [3]=AttOut
+      //   [4]=FFKey  [5]=FFValue  [6]=FFRecept
+      DumpLinear(PwConvs[7 * BlockCnt + 0], AH, d, AttPrefix + 'key.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 1], AH, d, AttPrefix + 'value.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 2], AH, d,
+        AttPrefix + 'receptance.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 3], d, AH, AttPrefix + 'output.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 4], IM, d, FFPrefix + 'key.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 5], d, IM, FFPrefix + 'value.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 6], d, d,
+        FFPrefix + 'receptance.weight');
+    end;
+    // ---- final LayerNorm ----
+    DumpLayerNorm(FinalLN, Config.Prefix + 'ln_out.weight',
+      Config.Prefix + 'ln_out.bias', d);
+    // ---- LM head (untied only; tied heads carry no head.weight tensor) ----
+    if not Config.TieWordEmbeddings then
+      DumpLinear(LMHead, Config.VocabSize, d, 'head.weight');
     Writer.SaveToFile;
   finally
     Writer.Free;
