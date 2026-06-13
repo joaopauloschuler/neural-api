@@ -500,15 +500,23 @@ rather than acted on.
       empty-bucket = bit-identical greedy; 3 tests incl. planted shallow-bias
       flip): add per-step ADAPTIVE candidate-layer selection beyond the fixed
       bucket — the paper's DoLa-low / DoLa-high dynamic high/low layer buckets.
-- [ ] Grammar/regex-constrained decoding (GBNF-style): generalize the
-      landed hand-written JSON state machine — TNNetTokenConstraint's
-      Reset/MaskAllowed/Commit interface (plus the copy-on-fork support
-      the JSON machine already has) is exactly the right plug. v1: a
-      llama.cpp-GBNF-subset grammar compiled to a pushdown machine over
-      CHARACTERS, with the existing char-by-char token-feasibility walk;
-      alternatively (or additionally) regex -> DFA. Test: a small
-      arithmetic-expression grammar accepts only valid strings across
-      greedy/sampled decoding, and forked beams keep independent states.
+- [X] Grammar-constrained decoding (GBNF-style): DONE — TNNetGrammar compiles
+      a GBNF-subset grammar to a flat pushdown representation; TNNetGrammarMachine
+      runs it as an NFA-of-stacks (active set = set of parse stacks, so
+      alternation/optional/repetition are exact); TNNetGrammarConstraint plugs
+      into TNNetTokenConstraint's Reset/MaskAllowed/Commit reusing the JSON
+      machine's char-by-char token-feasibility walk + copy-on-fork. Supported
+      subset: name ::= body (entry 'root'); sequence + '|'; "abc" literals
+      (\n \r \t \" \\); classes [a-z], [^...] negation, '.' any; * + ? and
+      ( ... ) grouping; rule refs (recursion); '#' comments + whitespace.
+      Tested (TestNeuralDecode): the required arithmetic grammar
+      root ::= term (("+"|"-") term)* / term ::= num / num ::= [0-9]+ accepts
+      only valid strings, masks violations, gates EOS on completeness, keeps
+      forked states independent, and stays valid under greedy + weighted-sampled
+      decoding. STILL OPEN: regex->DFA path; bounded repetition {m,n}; numeric
+      \xNN/\uNNNN class escapes. (Note: TNNetSamplerTopK does a UNIFORM top-K
+      draw that ignores the mask — use TNNetSamplerWeightedTopK with grammar
+      constraints.)
 - [ ] Token healing follow-ups (v1 is landed: TNNetTokenHealingConstraint +
       PrepareTokenHealing + TGenerationConfig.TokenHealing):
       (a) PrepareTokenHealing is TStringListInt-only — a TNeuralHFTokenizer

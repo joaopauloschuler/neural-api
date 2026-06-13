@@ -91,6 +91,21 @@ Ready-made constraints:
     after the top-level value is accepted. Intended for char-level or BPE
     (no-separator) vocabularies: token strings are validated as-is, with no
     separator inserted between tokens.
+  - TNNetGrammarConstraint: GENERAL grammar-constrained generation, the
+    generalization of the JSON machine to an arbitrary GBNF-subset grammar
+    (llama.cpp style). TNNetGrammar compiles GBNF text to a flat pushdown
+    representation; TNNetGrammarMachine runs it as an NFA-of-stacks (the active
+    set is a SET of parse stacks, so alternation / optional / repetition are
+    handled exactly), reusing the same char-by-char token-feasibility walk: a
+    token is allowed iff feeding its characters through a FORK of the machine
+    accepts all of them, and EOS (< 2) iff the machine is in an accepting
+    (complete) state. The grammar constrains ONLY the generated text (the
+    prompt is plain conditioning). Supported subset: rule defs name ::= body
+    (entry rule MUST be 'root'); sequence + alternation '|'; char literals
+    "abc" (\n \r \t \" \\ escapes); classes [a-z], negation [^...], '.' any;
+    repetition * + ? and grouping ( ... ); rule references (recursion ->
+    the pushdown stack); '#' comments and free whitespace. NOT in v1: bounded
+    repetition {m,n}, regex->DFA, and numeric \xNN/\uNNNN class escapes.
 
 LOGITS-PROCESSOR CHAIN + GENERATION CONFIG. The penalties / temperature /
 constraints above also compose through TNNetLogitsProcessor, a chainable
@@ -382,6 +397,175 @@ type
       procedure Commit(TokenId: integer); override;
       // The live automaton (after the committed tokens) for inspection.
       property Machine: TNNetJSONStateMachine read FMachine;
+  end;
+
+  // Flat compiled-grammar element kind (the llama.cpp GBNF encoding: a grammar
+  // rule body is a flat array of these, alternates separated by getAlt and
+  // terminated by getEnd). Coded by Claude (AI).
+  TNNetGrammarElemType = (
+    getEnd,        // end of a rule body (an alternate completes here)
+    getAlt,        // separates the alternates of a rule body
+    getRuleRef,    // a reference to another rule (Value = rule index)
+    getChar,       // a single literal character (Value = ord(char))
+    getCharSet,    // a character class: Value = index into FCharSets
+    getCharSetNot, // a negated character class (Value = index into FCharSets)
+    getCharAny);   // '.' : any character (rejects only nothing; impl excludes #0)
+
+  // One compiled grammar element. Coded by Claude (AI).
+  TNNetGrammarElem = record
+    ElemType: TNNetGrammarElemType;
+    Value: integer;
+  end;
+  TNNetGrammarElemArray = array of TNNetGrammarElem;
+
+  // A character-class entry: an inclusive [Lo..Hi] range (a single char is
+  // Lo=Hi). A class is a contiguous run of these in FRanges. Coded by Claude (AI).
+  TNNetGrammarRange = record
+    Lo, Hi: char;
+  end;
+
+  { TNNetGrammar }
+  // A GBNF-subset grammar COMPILED to a flat pushdown representation. Supported
+  // subset (llama.cpp-style, v1):
+  //   - rule definitions:  name ::= body  (one per logical line; the entry
+  //     rule MUST be named 'root')
+  //   - sequence (concatenation) and alternation '|'
+  //   - char literals "abc" (each char a literal; \n \r \t \" \\ \] escapes)
+  //   - character classes [a-z0-9_], negation [^...], '.' any-char
+  //   - repetition postfix '*', '+', '?' and grouping '( ... )'
+  //   - rule references (recursion -> the pushdown stack)
+  //   - '#' line comments and free whitespace between tokens
+  // NOT in v1 (see the unit header / tasklist): bounded repetition {m,n},
+  // regex->DFA, and numeric \xNN / \uNNNN escapes in classes.
+  // Repetition/grouping/optional are desugared into anonymous helper rules at
+  // compile time, so the run-time machine only ever sees char/charset/ruleref/
+  // alt/end elements (exactly the llama.cpp scheme). Coded by Claude (AI).
+  TNNetGrammar = class(TObject)
+    private
+      FSource: string;
+      FRuleNames: TStringList;        // index -> rule name
+      FRules: array of TNNetGrammarElemArray; // index -> compiled body
+      FRanges: array of TNNetGrammarRange;    // pooled char-class ranges
+      FCharSets: array of record First, Count: integer; end; // run in FRanges
+      FRootRule: integer;
+      // --- parser state (over FSource) ---
+      FPos: integer;
+      function PeekCh(): char;
+      procedure NextCh();
+      procedure SkipWS();
+      function AtEnd(): boolean;
+      function AddRule(const Name: string): integer;
+      function FindOrAddRule(const Name: string): integer;
+      function NewAnonRule(): integer;
+      function AddCharSet(const ARanges: array of TNNetGrammarRange): integer;
+      // Parses one rule body (alternation of sequences) into Elems, then
+      // applies a possible repetition wrapper. Returns via Elems.
+      procedure ParseAlternates(var Elems: TNNetGrammarElemArray);
+      procedure ParseSequence(var Elems: TNNetGrammarElemArray);
+      // Parses ONE element (literal/class/group/ref) plus its */+/? postfix;
+      // appends the resulting element(s) to Elems.
+      procedure ParseElement(var Elems: TNNetGrammarElemArray);
+      // Parses a '[' ... ']' class; sets Negated for '[^'. Returns charset idx.
+      function ParseCharClass(out Negated: boolean): integer;
+      procedure ExpectCh(C: char);
+      // Desugar helpers: append a single getRuleRef to a freshly built
+      // anonymous rule implementing the postfix over AtomRule.
+      procedure BuildOptRule(AtomRule: integer;
+        var Elems: TNNetGrammarElemArray);
+      procedure BuildStarRule(AtomRule: integer;
+        var Elems: TNNetGrammarElemArray);
+      procedure BuildPlusRule(AtomRule: integer;
+        var Elems: TNNetGrammarElemArray);
+      procedure Compile();
+    public
+      // Builds and compiles the grammar from GBNF text. Raises EAssertionFailed
+      // on a malformed grammar or a missing 'root' rule.
+      constructor Create(const GBNFText: string);
+      destructor Destroy(); override;
+      property RootRule: integer read FRootRule;
+  end;
+
+  { TNNetGrammarMachine }
+  // Run-time NFA-of-stacks over a compiled TNNetGrammar (does NOT own it). The
+  // active set is a list of STACKS; each stack is a list of element positions
+  // (a position = rule index * KStride + element index, packed) with the TOP at
+  // the end. FeedChar(C) keeps only the stacks whose top element matches C,
+  // advances each past the matched element (descending into rule refs along the
+  // way so the new tops are again terminals), and dedups. IsComplete() is true
+  // when some active stack is empty (a full parse of 'root' stands). CharAllowed
+  // is a non-destructive probe; CopyFrom supports copy-on-fork for beams.
+  // Coded by Claude (AI).
+  TNNetGrammarMachine = class(TObject)
+    private
+      FGrammar: TNNetGrammar;
+      // Active set: FStacks[i] is a stack of packed positions, length in
+      // FStackLen[i]; FStackCount stacks are live.
+      FStacks: array of array of integer;
+      FStackLen: array of integer;
+      FStackCount: integer;
+      // Scratch for FeedChar/CharAllowed (avoids per-call allocation).
+      FScratch: array of array of integer;
+      FScratchLen: array of integer;
+      FScratchCount: integer;
+      function PackPos(Rule, Idx: integer): integer;
+      procedure UnpackPos(Pos: integer; out Rule, Idx: integer);
+      // Pushes a stack (copy of Src[0..Len-1] then descends rule refs so the
+      // new top is a terminal or the stack is empty) into the scratch set,
+      // expanding alternates. Dedups against what's already in scratch.
+      procedure AddStackExpanded(const Src: array of integer; Len: integer);
+      // Forks Base into every alternate of RuleIdx (used by Reset and ruleref
+      // expansion).
+      procedure PushRuleAlternates(const Base: array of integer;
+        BaseLen, RuleIdx: integer);
+      procedure AddStackRaw(const Src: array of integer; Len: integer);
+      function ScratchHas(const Src: array of integer; Len: integer): boolean;
+      // Replaces the active set with the freshly built scratch set.
+      procedure CommitScratchToActive();
+      // Char matches the terminal element at Pos?
+      function ElemMatches(Pos: integer; C: char): boolean;
+    public
+      constructor Create(AGrammar: TNNetGrammar);
+      procedure Reset();
+      procedure CopyFrom(Source: TNNetGrammarMachine);
+      // Advances by one character; False = no active stack accepts C (the
+      // active set is REPLACED by the survivors, which is empty on False - call
+      // CharAllowed/use a copy if you must probe non-destructively).
+      function FeedChar(C: char): boolean;
+      function FeedString(const S: string): boolean;
+      function CharAllowed(C: char): boolean;
+      // True when a complete parse of the root rule stands (some empty stack).
+      function IsComplete(): boolean;
+      function ActiveCount(): integer;
+  end;
+
+  { TNNetGrammarConstraint }
+  // Grammar-driven constrained-decoding hook: allows exactly the tokens whose
+  // decoded surface text is a legal continuation of the grammar from the
+  // current parse state. Multi-character tokens are validated transitively by
+  // feeding their characters through a forked machine (the same char-by-char
+  // token-feasibility walk the JSON constraint uses). The grammar constrains
+  // ONLY the generated text - the prompt is plain conditioning and is NOT fed
+  // through the machine. Special/EOS ids (< 2) are allowed exactly when the
+  // grammar is in a complete (accepting) state; empty-string tokens are never
+  // allowed. Create(GBNFText, Dict) snapshots Dict.DeTokenize(id) per id;
+  // CreateCharLevel(GBNFText, VocabSize) is the char-level convention (token id
+  // = character code, ids < 2 special). Owns its TNNetGrammar.
+  // Coded by Claude (AI).
+  TNNetGrammarConstraint = class(TNNetTokenConstraint)
+    private
+      FTokenStr: array of string;
+      FGrammar: TNNetGrammar;
+      FMachine: TNNetGrammarMachine;
+      FProbe: TNNetGrammarMachine;
+    public
+      constructor Create(const GBNFText: string; Dict: TStringListInt); overload;
+      constructor CreateCharLevel(const GBNFText: string; VocabSize: integer);
+      destructor Destroy(); override;
+      procedure Reset(const PromptTokens: array of integer); override;
+      function TokenAllowed(TokenId: integer): boolean; override;
+      procedure Commit(TokenId: integer); override;
+      // The live machine (after the committed tokens) for inspection.
+      property Machine: TNNetGrammarMachine read FMachine;
   end;
 
   { TNNetLogitsProcessor }
@@ -1838,6 +2022,751 @@ begin
   // Tokens reaching Commit were validated by TokenAllowed, so this never
   // rejects in the generation loop; the result is intentionally ignored so
   // direct/driving callers cannot corrupt the automaton silently either way.
+  FMachine.FeedString(FTokenStr[TokenId]);
+end;
+
+{ TNNetGrammar }
+
+const
+  // Packed position = Rule * KGrammarStride + ElementIndex. A rule body of more
+  // than KGrammarStride elements would collide; far beyond any practical GBNF.
+  KGrammarStride = 1000000;
+
+constructor TNNetGrammar.Create(const GBNFText: string);
+begin
+  inherited Create();
+  FSource := GBNFText;
+  FRuleNames := TStringList.Create();
+  FRuleNames.CaseSensitive := true;
+  FRootRule := -1;
+  Compile();
+end;
+
+destructor TNNetGrammar.Destroy();
+begin
+  FRuleNames.Free;
+  inherited Destroy();
+end;
+
+function TNNetGrammar.PeekCh(): char;
+begin
+  if FPos <= Length(FSource) then Result := FSource[FPos] else Result := #0;
+end;
+
+procedure TNNetGrammar.NextCh();
+begin
+  Inc(FPos);
+end;
+
+function TNNetGrammar.AtEnd(): boolean;
+begin
+  Result := FPos > Length(FSource);
+end;
+
+procedure TNNetGrammar.SkipWS();
+// Whitespace AND '#' line comments between grammar tokens.
+begin
+  while not AtEnd() do
+  begin
+    if (PeekCh() = ' ') or (PeekCh() = #9) or (PeekCh() = #13) or
+       (PeekCh() = #10) then NextCh()
+    else if PeekCh() = '#' then
+      while (not AtEnd()) and (PeekCh() <> #10) do NextCh()
+    else break;
+  end;
+end;
+
+procedure TNNetGrammar.ExpectCh(C: char);
+begin
+  if PeekCh() <> C then
+    raise EAssertionFailed.Create('TNNetGrammar: expected ''' + C +
+      ''' at offset ' + IntToStr(FPos) + ' in grammar');
+  NextCh();
+end;
+
+function TNNetGrammar.AddRule(const Name: string): integer;
+begin
+  Result := FRuleNames.Add(Name);
+  SetLength(FRules, Length(FRules) + 1);
+end;
+
+function TNNetGrammar.FindOrAddRule(const Name: string): integer;
+begin
+  Result := FRuleNames.IndexOf(Name);
+  if Result < 0 then Result := AddRule(Name);
+end;
+
+function TNNetGrammar.NewAnonRule(): integer;
+begin
+  Result := AddRule('__anon' + IntToStr(Length(FRules)));
+end;
+
+function TNNetGrammar.AddCharSet(
+  const ARanges: array of TNNetGrammarRange): integer;
+var
+  I, Base: integer;
+begin
+  Base := Length(FRanges);
+  SetLength(FRanges, Base + Length(ARanges));
+  for I := 0 to High(ARanges) do FRanges[Base + I] := ARanges[I];
+  Result := Length(FCharSets);
+  SetLength(FCharSets, Result + 1);
+  FCharSets[Result].First := Base;
+  FCharSets[Result].Count := Length(ARanges);
+end;
+
+// Appends one element to a growing element array.
+procedure GrammarAppendElem(var Elems: TNNetGrammarElemArray;
+  AType: TNNetGrammarElemType; AValue: integer);
+begin
+  SetLength(Elems, Length(Elems) + 1);
+  Elems[High(Elems)].ElemType := AType;
+  Elems[High(Elems)].Value := AValue;
+end;
+
+function TNNetGrammar.ParseCharClass(out Negated: boolean): integer;
+// Current char is '['. Parses up to and including ']'. Handles '[^...]'.
+var
+  Ranges: array of TNNetGrammarRange;
+  Lo, Hi: char;
+
+  function ReadClassChar(): char;
+  begin
+    if PeekCh() = '\' then
+    begin
+      NextCh();
+      case PeekCh() of
+        'n': Result := #10;
+        'r': Result := #13;
+        't': Result := #9;
+        else Result := PeekCh(); // \\ \] \^ \- \" and any other: literal
+      end;
+      NextCh();
+    end
+    else
+    begin
+      Result := PeekCh();
+      NextCh();
+    end;
+  end;
+
+begin
+  ExpectCh('[');
+  Negated := false;
+  if PeekCh() = '^' then
+  begin
+    Negated := true;
+    NextCh();
+  end;
+  SetLength(Ranges, 0);
+  while (not AtEnd()) and (PeekCh() <> ']') do
+  begin
+    Lo := ReadClassChar();
+    Hi := Lo;
+    if (PeekCh() = '-') and (FPos + 1 <= Length(FSource)) and
+       (FSource[FPos + 1] <> ']') then
+    begin
+      NextCh(); // consume '-'
+      Hi := ReadClassChar();
+    end;
+    SetLength(Ranges, Length(Ranges) + 1);
+    Ranges[High(Ranges)].Lo := Lo;
+    Ranges[High(Ranges)].Hi := Hi;
+  end;
+  ExpectCh(']');
+  Result := AddCharSet(Ranges);
+end;
+
+// opt ::= atom | <empty>
+procedure TNNetGrammar.BuildOptRule(AtomRule: integer;
+  var Elems: TNNetGrammarElemArray);
+var
+  Body: TNNetGrammarElemArray;
+  R: integer;
+begin
+  R := NewAnonRule();
+  SetLength(Body, 0);
+  GrammarAppendElem(Body, getRuleRef, AtomRule);
+  GrammarAppendElem(Body, getAlt, 0);
+  GrammarAppendElem(Body, getEnd, 0); // empty alternate
+  FRules[R] := Body;
+  GrammarAppendElem(Elems, getRuleRef, R);
+end;
+
+// star ::= atom star | <empty>
+procedure TNNetGrammar.BuildStarRule(AtomRule: integer;
+  var Elems: TNNetGrammarElemArray);
+var
+  Body: TNNetGrammarElemArray;
+  R: integer;
+begin
+  R := NewAnonRule();
+  SetLength(Body, 0);
+  GrammarAppendElem(Body, getRuleRef, AtomRule);
+  GrammarAppendElem(Body, getRuleRef, R); // self-reference -> repetition
+  GrammarAppendElem(Body, getAlt, 0);
+  GrammarAppendElem(Body, getEnd, 0);
+  FRules[R] := Body;
+  GrammarAppendElem(Elems, getRuleRef, R);
+end;
+
+// plus ::= atom plus | atom
+procedure TNNetGrammar.BuildPlusRule(AtomRule: integer;
+  var Elems: TNNetGrammarElemArray);
+var
+  Body: TNNetGrammarElemArray;
+  R: integer;
+begin
+  R := NewAnonRule();
+  SetLength(Body, 0);
+  GrammarAppendElem(Body, getRuleRef, AtomRule);
+  GrammarAppendElem(Body, getRuleRef, R);
+  GrammarAppendElem(Body, getAlt, 0);
+  GrammarAppendElem(Body, getRuleRef, AtomRule);
+  GrammarAppendElem(Body, getEnd, 0);
+  FRules[R] := Body;
+  GrammarAppendElem(Elems, getRuleRef, R);
+end;
+
+procedure TNNetGrammar.ParseElement(var Elems: TNNetGrammarElemArray);
+var
+  Inner: TNNetGrammarElemArray;
+  AnonRule, SetIdx, RefRule: integer;
+  Negated: boolean;
+  StartLen, I: integer;
+  Name: string;
+  Postfix: char;
+begin
+  SkipWS();
+  StartLen := Length(Elems);
+  case PeekCh() of
+    '"':
+      begin
+        NextCh();
+        while (not AtEnd()) and (PeekCh() <> '"') do
+        begin
+          if PeekCh() = '\' then
+          begin
+            NextCh();
+            case PeekCh() of
+              'n': GrammarAppendElem(Elems, getChar, Ord(#10));
+              'r': GrammarAppendElem(Elems, getChar, Ord(#13));
+              't': GrammarAppendElem(Elems, getChar, Ord(#9));
+              else GrammarAppendElem(Elems, getChar, Ord(PeekCh()));
+            end;
+            NextCh();
+          end
+          else
+          begin
+            GrammarAppendElem(Elems, getChar, Ord(PeekCh()));
+            NextCh();
+          end;
+        end;
+        ExpectCh('"');
+      end;
+    '[':
+      begin
+        SetIdx := ParseCharClass(Negated);
+        if Negated
+        then GrammarAppendElem(Elems, getCharSetNot, SetIdx)
+        else GrammarAppendElem(Elems, getCharSet, SetIdx);
+      end;
+    '.':
+      begin
+        NextCh();
+        GrammarAppendElem(Elems, getCharAny, 0);
+      end;
+    '(':
+      begin
+        NextCh();
+        SetLength(Inner, 0);
+        ParseAlternates(Inner);
+        SkipWS();
+        ExpectCh(')');
+        AnonRule := NewAnonRule();
+        GrammarAppendElem(Inner, getEnd, 0);
+        FRules[AnonRule] := Inner;
+        GrammarAppendElem(Elems, getRuleRef, AnonRule);
+      end;
+    'a'..'z', 'A'..'Z', '_':
+      begin
+        Name := '';
+        while (not AtEnd()) and
+          (PeekCh() in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) do
+        begin
+          Name := Name + PeekCh();
+          NextCh();
+        end;
+        RefRule := FindOrAddRule(Name);
+        GrammarAppendElem(Elems, getRuleRef, RefRule);
+      end;
+    else
+      raise EAssertionFailed.Create('TNNetGrammar: unexpected ''' + PeekCh() +
+        ''' at offset ' + IntToStr(FPos));
+  end;
+
+  // Postfix repetition wraps the just-parsed atom (elements StartLen..end).
+  SkipWS();
+  Postfix := PeekCh();
+  if (Postfix = '*') or (Postfix = '+') or (Postfix = '?') then
+  begin
+    NextCh();
+    AnonRule := NewAnonRule();
+    SetLength(Inner, 0);
+    for I := StartLen to High(Elems) do
+      GrammarAppendElem(Inner, Elems[I].ElemType, Elems[I].Value);
+    SetLength(Elems, StartLen); // drop the atom; replaced by the wrapper ref
+    GrammarAppendElem(Inner, getEnd, 0);
+    FRules[AnonRule] := Inner;
+    case Postfix of
+      '?': BuildOptRule(AnonRule, Elems);
+      '*': BuildStarRule(AnonRule, Elems);
+      '+': BuildPlusRule(AnonRule, Elems);
+    end;
+  end;
+end;
+
+procedure TNNetGrammar.ParseSequence(var Elems: TNNetGrammarElemArray);
+begin
+  SkipWS();
+  while (not AtEnd()) and (PeekCh() <> '|') and (PeekCh() <> ')') do
+  begin
+    ParseElement(Elems);
+    SkipWS();
+  end;
+end;
+
+procedure TNNetGrammar.ParseAlternates(var Elems: TNNetGrammarElemArray);
+begin
+  ParseSequence(Elems);
+  SkipWS();
+  while PeekCh() = '|' do
+  begin
+    NextCh();
+    GrammarAppendElem(Elems, getAlt, 0);
+    ParseSequence(Elems);
+    SkipWS();
+  end;
+end;
+
+procedure TNNetGrammar.Compile();
+// Splits the source into 'name ::= body' definitions (continuation lines fold
+// into the previous def), pre-registers names so forward refs resolve, parses
+// each body, then resolves 'root'.
+var
+  Lines, Defs: TStringList;
+  I, J, ArrowPos, R: integer;
+  RawLine, Name, Body, FullBody: string;
+  LocalBody: TNNetGrammarElemArray;
+
+  function IsDefLine(const S: string): boolean;
+  var
+    K: integer;
+    T: string;
+  begin
+    T := TrimLeft(S);
+    Result := false;
+    if T = '' then exit;
+    if not (T[1] in ['a'..'z', 'A'..'Z', '_']) then exit;
+    K := 1;
+    while (K <= Length(T)) and
+      (T[K] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) do Inc(K);
+    while (K <= Length(T)) and (T[K] = ' ') do Inc(K);
+    Result := (K + 2 <= Length(T)) and (Copy(T, K, 3) = '::=');
+  end;
+
+begin
+  Defs := TStringList.Create();
+  Lines := TStringList.Create();
+  try
+    Lines.Text := FSource;
+    FullBody := '';
+    for I := 0 to Lines.Count - 1 do
+    begin
+      RawLine := Lines[I];
+      J := Pos('#', RawLine);
+      if J > 0 then RawLine := Copy(RawLine, 1, J - 1);
+      if IsDefLine(RawLine) then
+      begin
+        if FullBody <> '' then Defs.Add(FullBody);
+        FullBody := RawLine;
+      end
+      else if Trim(RawLine) <> '' then
+        FullBody := FullBody + ' ' + RawLine;
+    end;
+    if FullBody <> '' then Defs.Add(FullBody);
+
+    for I := 0 to Defs.Count - 1 do
+    begin
+      RawLine := TrimLeft(Defs[I]);
+      ArrowPos := Pos('::=', RawLine);
+      Name := Trim(Copy(RawLine, 1, ArrowPos - 1));
+      FindOrAddRule(Name);
+    end;
+
+    for I := 0 to Defs.Count - 1 do
+    begin
+      RawLine := TrimLeft(Defs[I]);
+      ArrowPos := Pos('::=', RawLine);
+      Name := Trim(Copy(RawLine, 1, ArrowPos - 1));
+      Body := Copy(RawLine, ArrowPos + 3, Length(RawLine));
+      R := FindOrAddRule(Name);
+      FSource := Body;   // parse this body in isolation
+      FPos := 1;
+      // Parse into a LOCAL array: parsing may create anonymous helper rules,
+      // which SetLength(FRules) and would invalidate a var-alias into FRules.
+      SetLength(LocalBody, 0);
+      ParseAlternates(LocalBody);
+      GrammarAppendElem(LocalBody, getEnd, 0);
+      FRules[R] := LocalBody;
+    end;
+  finally
+    Lines.Free;
+    Defs.Free;
+  end;
+
+  FRootRule := FRuleNames.IndexOf('root');
+  if FRootRule < 0 then
+    raise EAssertionFailed.Create('TNNetGrammar: no ''root'' rule defined');
+end;
+
+{ TNNetGrammarMachine }
+
+constructor TNNetGrammarMachine.Create(AGrammar: TNNetGrammar);
+begin
+  inherited Create();
+  FGrammar := AGrammar;
+  Reset();
+end;
+
+function TNNetGrammarMachine.PackPos(Rule, Idx: integer): integer;
+begin
+  Result := Rule * KGrammarStride + Idx;
+end;
+
+procedure TNNetGrammarMachine.UnpackPos(Pos: integer; out Rule, Idx: integer);
+begin
+  Rule := Pos div KGrammarStride;
+  Idx := Pos mod KGrammarStride;
+end;
+
+function TNNetGrammarMachine.ScratchHas(const Src: array of integer;
+  Len: integer): boolean;
+var
+  I, J: integer;
+  Same: boolean;
+begin
+  Result := false;
+  for I := 0 to FScratchCount - 1 do
+  begin
+    if FScratchLen[I] <> Len then continue;
+    Same := true;
+    for J := 0 to Len - 1 do
+      if FScratch[I][J] <> Src[J] then begin Same := false; break; end;
+    if Same then exit(true);
+  end;
+end;
+
+procedure TNNetGrammarMachine.AddStackRaw(const Src: array of integer;
+  Len: integer);
+var
+  J: integer;
+begin
+  if ScratchHas(Src, Len) then exit;
+  if FScratchCount >= Length(FScratch) then
+  begin
+    SetLength(FScratch, FScratchCount * 2 + 8);
+    SetLength(FScratchLen, FScratchCount * 2 + 8);
+  end;
+  if Length(FScratch[FScratchCount]) < Len then
+    SetLength(FScratch[FScratchCount], Len + 8);
+  for J := 0 to Len - 1 do FScratch[FScratchCount][J] := Src[J];
+  FScratchLen[FScratchCount] := Len;
+  Inc(FScratchCount);
+end;
+
+procedure TNNetGrammarMachine.AddStackExpanded(const Src: array of integer;
+  Len: integer);
+// Descends the stack top: rule-refs are expanded (forking on each alternate),
+// getEnd/getAlt pop, terminals (or empty stacks) come to rest in the scratch
+// set. Recursion depth is bounded by the grammar nesting + recursion depth of
+// the partial parse.
+var
+  Work: array of integer;
+  WLen: integer;
+  TopPos, Rule, Idx, RefRule, ContPos, K: integer;
+  Body: TNNetGrammarElemArray;
+begin
+  SetLength(Work, Len + 8);
+  for K := 0 to Len - 1 do Work[K] := Src[K];
+  WLen := Len;
+
+  if WLen = 0 then
+  begin
+    AddStackRaw(Work, 0);
+    exit;
+  end;
+
+  TopPos := Work[WLen - 1];
+  UnpackPos(TopPos, Rule, Idx);
+  Body := FGrammar.FRules[Rule];
+
+  case Body[Idx].ElemType of
+    getEnd, getAlt:
+      begin
+        // End of an alternate/rule: pop and continue with the parent.
+        Dec(WLen);
+        AddStackExpanded(Work, WLen);
+      end;
+    getRuleRef:
+      begin
+        RefRule := Body[Idx].Value;
+        ContPos := PackPos(Rule, Idx + 1);
+        Work[WLen - 1] := ContPos; // continuation replaces the ref on top
+        // Fork into each alternate of the referenced rule.
+        PushRuleAlternates(Work, WLen, RefRule);
+      end;
+    else
+      // Terminal top: a valid resting state.
+      AddStackRaw(Work, WLen);
+  end;
+end;
+
+procedure TNNetGrammarMachine.PushRuleAlternates(const Base: array of integer;
+  BaseLen, RuleIdx: integer);
+// For each top-level alternate of RuleIdx, push its first-element position atop
+// Base[0..BaseLen-1] and expand. An empty alternate's first position is its
+// getEnd, which AddStackExpanded pops to continue with Base.
+var
+  Work: array of integer;
+  AltIdx, K: integer;
+  RefBody: TNNetGrammarElemArray;
+begin
+  RefBody := FGrammar.FRules[RuleIdx];
+  SetLength(Work, BaseLen + 1);
+  for K := 0 to BaseLen - 1 do Work[K] := Base[K];
+  AltIdx := 0;
+  while true do
+  begin
+    Work[BaseLen] := PackPos(RuleIdx, AltIdx);
+    AddStackExpanded(Work, BaseLen + 1);
+    K := AltIdx;
+    while (RefBody[K].ElemType <> getAlt) and
+          (RefBody[K].ElemType <> getEnd) do Inc(K);
+    if RefBody[K].ElemType = getEnd then break;
+    AltIdx := K + 1;
+  end;
+end;
+
+procedure TNNetGrammarMachine.CommitScratchToActive();
+var
+  I, J: integer;
+begin
+  if Length(FStacks) < FScratchCount then
+  begin
+    SetLength(FStacks, FScratchCount);
+    SetLength(FStackLen, FScratchCount);
+  end;
+  for I := 0 to FScratchCount - 1 do
+  begin
+    if Length(FStacks[I]) < FScratchLen[I] then
+      SetLength(FStacks[I], FScratchLen[I] + 8);
+    for J := 0 to FScratchLen[I] - 1 do FStacks[I][J] := FScratch[I][J];
+    FStackLen[I] := FScratchLen[I];
+  end;
+  FStackCount := FScratchCount;
+end;
+
+procedure TNNetGrammarMachine.Reset();
+var
+  Empty: array of integer;
+begin
+  FStackCount := 0;
+  FScratchCount := 0;
+  SetLength(Empty, 0);
+  // Seed the active set with every alternate of the root rule.
+  PushRuleAlternates(Empty, 0, FGrammar.RootRule);
+  CommitScratchToActive();
+end;
+
+procedure TNNetGrammarMachine.CopyFrom(Source: TNNetGrammarMachine);
+var
+  I, J: integer;
+begin
+  FGrammar := Source.FGrammar;
+  if Length(FStacks) < Source.FStackCount then
+  begin
+    SetLength(FStacks, Source.FStackCount);
+    SetLength(FStackLen, Source.FStackCount);
+  end;
+  for I := 0 to Source.FStackCount - 1 do
+  begin
+    if Length(FStacks[I]) < Source.FStackLen[I] then
+      SetLength(FStacks[I], Source.FStackLen[I] + 8);
+    for J := 0 to Source.FStackLen[I] - 1 do
+      FStacks[I][J] := Source.FStacks[I][J];
+    FStackLen[I] := Source.FStackLen[I];
+  end;
+  FStackCount := Source.FStackCount;
+end;
+
+function TNNetGrammarMachine.ElemMatches(Pos: integer; C: char): boolean;
+var
+  Rule, Idx, SetIdx, R: integer;
+  Body: TNNetGrammarElemArray;
+  InSet: boolean;
+begin
+  UnpackPos(Pos, Rule, Idx);
+  Body := FGrammar.FRules[Rule];
+  case Body[Idx].ElemType of
+    getChar: Result := C = Chr(Body[Idx].Value);
+    getCharAny: Result := C <> #0;
+    getCharSet, getCharSetNot:
+      begin
+        SetIdx := Body[Idx].Value;
+        InSet := false;
+        for R := FGrammar.FCharSets[SetIdx].First to
+          FGrammar.FCharSets[SetIdx].First +
+          FGrammar.FCharSets[SetIdx].Count - 1 do
+          if (C >= FGrammar.FRanges[R].Lo) and
+             (C <= FGrammar.FRanges[R].Hi) then
+          begin InSet := true; break; end;
+        if Body[Idx].ElemType = getCharSet
+        then Result := InSet
+        else Result := (not InSet) and (C <> #0);
+      end;
+    else Result := false;
+  end;
+end;
+
+function TNNetGrammarMachine.FeedChar(C: char): boolean;
+var
+  I, TopPos, Rule, Idx: integer;
+  Adv: array of integer;
+begin
+  FScratchCount := 0;
+  for I := 0 to FStackCount - 1 do
+  begin
+    if FStackLen[I] = 0 then continue; // a completed stack accepts nothing
+    TopPos := FStacks[I][FStackLen[I] - 1];
+    if ElemMatches(TopPos, C) then
+    begin
+      UnpackPos(TopPos, Rule, Idx);
+      SetLength(Adv, FStackLen[I]);
+      Move(FStacks[I][0], Adv[0], FStackLen[I] * SizeOf(integer));
+      Adv[FStackLen[I] - 1] := PackPos(Rule, Idx + 1);
+      AddStackExpanded(Adv, FStackLen[I]);
+    end;
+  end;
+  Result := FScratchCount > 0;
+  CommitScratchToActive();
+end;
+
+function TNNetGrammarMachine.FeedString(const S: string): boolean;
+var
+  I: integer;
+begin
+  Result := true;
+  for I := 1 to Length(S) do
+    if not FeedChar(S[I]) then exit(false);
+end;
+
+function TNNetGrammarMachine.CharAllowed(C: char): boolean;
+var
+  I, TopPos: integer;
+begin
+  Result := false;
+  for I := 0 to FStackCount - 1 do
+  begin
+    if FStackLen[I] = 0 then continue;
+    TopPos := FStacks[I][FStackLen[I] - 1];
+    if ElemMatches(TopPos, C) then exit(true);
+  end;
+end;
+
+function TNNetGrammarMachine.IsComplete(): boolean;
+var
+  I: integer;
+begin
+  Result := false;
+  for I := 0 to FStackCount - 1 do
+    if FStackLen[I] = 0 then exit(true);
+end;
+
+function TNNetGrammarMachine.ActiveCount(): integer;
+begin
+  Result := FStackCount;
+end;
+
+{ TNNetGrammarConstraint }
+
+constructor TNNetGrammarConstraint.Create(const GBNFText: string;
+  Dict: TStringListInt);
+var
+  I: integer;
+begin
+  inherited Create();
+  FGrammar := TNNetGrammar.Create(GBNFText);
+  FMachine := TNNetGrammarMachine.Create(FGrammar);
+  FProbe := TNNetGrammarMachine.Create(FGrammar);
+  SetLength(FTokenStr, Dict.GetVocabCount());
+  for I := 0 to High(FTokenStr) do
+    if I < 2
+    then FTokenStr[I] := ''
+    else FTokenStr[I] := Dict.DeTokenize(I);
+end;
+
+constructor TNNetGrammarConstraint.CreateCharLevel(const GBNFText: string;
+  VocabSize: integer);
+var
+  I: integer;
+begin
+  inherited Create();
+  FGrammar := TNNetGrammar.Create(GBNFText);
+  FMachine := TNNetGrammarMachine.Create(FGrammar);
+  FProbe := TNNetGrammarMachine.Create(FGrammar);
+  SetLength(FTokenStr, VocabSize);
+  for I := 0 to High(FTokenStr) do
+    if I < 2
+    then FTokenStr[I] := ''
+    else FTokenStr[I] := Chr(I);
+end;
+
+destructor TNNetGrammarConstraint.Destroy();
+begin
+  FProbe.Free;
+  FMachine.Free;
+  FGrammar.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetGrammarConstraint.Reset(const PromptTokens: array of integer);
+begin
+  // The grammar constrains ONLY the generated text; the prompt is plain
+  // conditioning and is NOT fed through the machine.
+  FMachine.Reset();
+end;
+
+function TNNetGrammarConstraint.TokenAllowed(TokenId: integer): boolean;
+var
+  S: string;
+  I: integer;
+begin
+  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
+  // Special/EOS ids: legal exactly when the grammar is in a complete state.
+  if TokenId < 2 then exit(FMachine.IsComplete());
+  S := FTokenStr[TokenId];
+  if S = '' then exit(false);
+  // Transitive multi-character validation on a forked machine.
+  FProbe.CopyFrom(FMachine);
+  for I := 1 to Length(S) do
+    if not FProbe.FeedChar(S[I]) then exit(false);
+  Result := true;
+end;
+
+procedure TNNetGrammarConstraint.Commit(TokenId: integer);
+begin
+  if (TokenId < 2) or (TokenId > High(FTokenStr)) then exit;
   FMachine.FeedString(FTokenStr[TokenId]);
 end;
 

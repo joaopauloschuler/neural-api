@@ -162,6 +162,13 @@ type
     procedure TestJSONStateMachineBalancedStackClosing;
     procedure TestJSONConstraintValidatesMultiCharTokens;
     procedure TestJSONStateMachineFuzzRandomWalksStayValid;
+    // GBNF grammar engine + constraint (no model).
+    procedure TestGrammarArithmeticAcceptsOnlyValidExpressions;
+    procedure TestGrammarMachineForkKeepsIndependentState;
+    procedure TestGrammarConstraintMasksViolationsAndGatesEOS;
+    procedure TestGrammarAlternationGroupingRepetitionOptional;
+    procedure TestGrammarConstraintGreedyDrivenWalkStaysValid;
+    procedure TestGrammarConstraintSampledDrivenWalkStaysValid;
     // Model-integration: constrained generation emits parseable JSON.
     procedure TestGenerateTokensStreamedJSONConstraintEmitsParseableJSON;
     procedure TestDecodeGreedyJSONConstraintEmitsParseableJSON;
@@ -3725,6 +3732,300 @@ begin
       IntToStr(CompletedCnt) + '/25)', CompletedCnt >= 15);
   finally
     M.Free;
+  end;
+end;
+
+// The REQUIRED arithmetic grammar from the tasklist:
+//   root ::= term (("+"|"-") term)*   term ::= num   num ::= [0-9]+
+// must accept exactly the valid expressions and reject everything else; EOS
+// (IsComplete) only after a complete term.
+const
+  ArithGrammar =
+    'root ::= term (("+"|"-") term)*'#10 +
+    'term ::= num'#10 +
+    'num ::= [0-9]+';
+
+procedure TTestNeuralDecode.TestGrammarArithmeticAcceptsOnlyValidExpressions;
+var
+  G: TNNetGrammar;
+  M: TNNetGrammarMachine;
+
+  function AcceptsComplete(const S: string): boolean;
+  begin
+    M.Reset();
+    Result := M.FeedString(S) and M.IsComplete();
+  end;
+
+  function AcceptsPrefix(const S: string): boolean;
+  begin
+    M.Reset();
+    Result := M.FeedString(S);
+  end;
+
+begin
+  G := TNNetGrammar.Create(ArithGrammar);
+  M := TNNetGrammarMachine.Create(G);
+  try
+    // Valid complete expressions.
+    AssertTrue('"1" valid', AcceptsComplete('1'));
+    AssertTrue('"42" valid', AcceptsComplete('42'));
+    AssertTrue('"12+3" valid', AcceptsComplete('12+3'));
+    AssertTrue('"1-2+34" valid', AcceptsComplete('1-2+34'));
+    AssertTrue('"0-0-0" valid', AcceptsComplete('0-0-0'));
+    // Incomplete but legal prefixes (accepted by FeedString, not complete).
+    AssertTrue('"1+" is a legal prefix', AcceptsPrefix('1+'));
+    AssertTrue('"1+" is NOT complete', not AcceptsComplete('1+'));
+    AssertTrue('"" is NOT complete', not AcceptsComplete(''));
+    // Hard rejections.
+    AssertTrue('"+1" rejected (no leading op)', not AcceptsPrefix('+1'));
+    AssertTrue('"1++2" rejected (double op)', not AcceptsPrefix('1++2'));
+    AssertTrue('"1a" rejected (non-grammar char)', not AcceptsPrefix('1a'));
+    AssertTrue('"1 + 2" rejected (no whitespace in grammar)',
+      not AcceptsPrefix('1 + 2'));
+  finally
+    M.Free;
+    G.Free;
+  end;
+end;
+
+// A forked machine (CopyFrom) must keep parse progress fully independent of the
+// machine it was copied from - the beam copy-on-fork guarantee.
+procedure TTestNeuralDecode.TestGrammarMachineForkKeepsIndependentState;
+var
+  G: TNNetGrammar;
+  A, B: TNNetGrammarMachine;
+begin
+  G := TNNetGrammar.Create(ArithGrammar);
+  A := TNNetGrammarMachine.Create(G);
+  B := TNNetGrammarMachine.Create(G);
+  try
+    A.Reset();
+    AssertTrue('feed "12"', A.FeedString('12'));
+    AssertTrue('"12" is a complete value', A.IsComplete());
+    B.CopyFrom(A);                          // fork at "12"
+    AssertTrue('A advances past the fork ("+")', A.FeedChar('+'));
+    AssertTrue('A is now incomplete after "12+"', not A.IsComplete());
+    // B must be untouched by A's advance.
+    AssertTrue('B still complete at "12"', B.IsComplete());
+    AssertTrue('B (at "12") can take a "+"', B.CharAllowed('+'));
+    AssertTrue('A (at "12+") needs a digit, not a "+"',
+      A.CharAllowed('7') and (not A.CharAllowed('+')));
+    // Drive them to different complete strings.
+    AssertTrue('A -> "12+5"', A.FeedString('5') and A.IsComplete());
+    AssertTrue('B -> "12-9"', B.FeedString('-9') and B.IsComplete());
+  finally
+    A.Free;
+    B.Free;
+    G.Free;
+  end;
+end;
+
+// TNNetGrammarConstraint over a char-level vocab (id = char code, ids < 2
+// special): violating chars are zeroed by MaskAllowed and EOS is allowed only
+// at a complete state.
+procedure TTestNeuralDecode.TestGrammarConstraintMasksViolationsAndGatesEOS;
+var
+  C: TNNetGrammarConstraint;
+  P: TNNetVolume;
+begin
+  C := TNNetGrammarConstraint.CreateCharLevel(ArithGrammar, 128);
+  P := TNNetVolume.Create(128, 1, 1);
+  try
+    C.Reset([]);
+    // At the start only digits are legal; ops, letters, EOS are not.
+    AssertTrue('digit allowed at start', C.TokenAllowed(Ord('5')));
+    AssertTrue('"+" not allowed at start', not C.TokenAllowed(Ord('+')));
+    AssertTrue('letter not allowed at start', not C.TokenAllowed(Ord('a')));
+    AssertTrue('EOS not allowed at start', not C.TokenAllowed(0));
+    C.Commit(Ord('1'));
+    // After one digit the expression is complete -> EOS allowed; digit/op too.
+    AssertTrue('EOS allowed after a complete term', C.TokenAllowed(0));
+    AssertTrue('"+" allowed after a term', C.TokenAllowed(Ord('+')));
+    AssertTrue('another digit allowed (multi-digit num)',
+      C.TokenAllowed(Ord('2')));
+    AssertTrue('letter still illegal', not C.TokenAllowed(Ord('a')));
+    C.Commit(Ord('+'));
+    // After an operator a digit is mandatory; EOS now illegal (incomplete).
+    AssertTrue('EOS illegal mid-expression', not C.TokenAllowed(0));
+    AssertTrue('digit mandatory after "+"', C.TokenAllowed(Ord('9')));
+    AssertTrue('"+" illegal after "+"', not C.TokenAllowed(Ord('+')));
+    // MaskAllowed zeroes the illegal mass and keeps the legal one.
+    P.Fill(1.0 / 128);
+    C.MaskAllowed(P);
+    AssertEquals('illegal "a" zeroed', 0.0, P.Raw[Ord('a')], 0.0);
+    AssertEquals('illegal "+" zeroed', 0.0, P.Raw[Ord('+')], 0.0);
+    AssertEquals('illegal EOS zeroed', 0.0, P.Raw[0], 0.0);
+    AssertTrue('legal digit "7" keeps positive mass', P.Raw[Ord('7')] > 0);
+  finally
+    P.Free;
+    C.Free;
+  end;
+end;
+
+// Exercises every GBNF-subset construct: alternation, grouping, '*', '+', '?',
+// classes (incl. negation), '.' and rule references.
+procedure TTestNeuralDecode.TestGrammarAlternationGroupingRepetitionOptional;
+var
+  G: TNNetGrammar;
+  M: TNNetGrammarMachine;
+
+  function OK(const S: string): boolean;
+  begin
+    M.Reset();
+    Result := M.FeedString(S) and M.IsComplete();
+  end;
+
+begin
+  // Optional sign, '+' digits, optional fractional group.
+  G := TNNetGrammar.Create('root ::= "-"? [0-9]+ ("." [0-9]+)?');
+  M := TNNetGrammarMachine.Create(G);
+  try
+    AssertTrue('5', OK('5'));
+    AssertTrue('-5', OK('-5'));
+    AssertTrue('5.25', OK('5.25'));
+    AssertTrue('-12.5', OK('-12.5'));
+    AssertTrue('"5." rejected (frac needs a digit)', not OK('5.'));
+    AssertTrue('"--5" rejected (one optional sign)', not OK('--5'));
+    AssertTrue('"" rejected ([0-9]+ needs one)', not OK(''));
+  finally
+    M.Free;
+    G.Free;
+  end;
+  // Plain alternation of literals.
+  G := TNNetGrammar.Create('root ::= "ab" | "cd" | "e"');
+  M := TNNetGrammarMachine.Create(G);
+  try
+    AssertTrue('ab', OK('ab'));
+    AssertTrue('cd', OK('cd'));
+    AssertTrue('e', OK('e'));
+    AssertTrue('"a" incomplete', not OK('a'));
+    AssertTrue('"ax" rejected', not OK('ax'));
+  finally
+    M.Free;
+    G.Free;
+  end;
+  // Negated class and '.' any-char inside delimiters.
+  G := TNNetGrammar.Create('root ::= "<" [^>]+ ">" "." ');
+  M := TNNetGrammarMachine.Create(G);
+  try
+    AssertTrue('<hi>.', OK('<hi>.'));
+    AssertTrue('"<>." rejected ([^>]+ needs one)', not OK('<>.'));
+    AssertTrue('">" inside class rejected', not OK('<a>b>.'));
+  finally
+    M.Free;
+    G.Free;
+  end;
+end;
+
+// Greedy decode driven by the constraint: at every step pick the highest-prob
+// token that survives MaskAllowed, Commit it, stop at EOS. The emitted string
+// must always parse, and a synthetic head biased toward an ILLEGAL char must be
+// steered to a legal one by the constraint.
+procedure TTestNeuralDecode.TestGrammarConstraintGreedyDrivenWalkStaysValid;
+var
+  C: TNNetGrammarConstraint;
+  Verify: TNNetGrammarMachine;
+  VG: TNNetGrammar;
+  P: TNNetVolume;
+  Step, Best, I: integer;
+  S: string;
+begin
+  C := TNNetGrammarConstraint.CreateCharLevel(ArithGrammar, 128);
+  VG := TNNetGrammar.Create(ArithGrammar);
+  Verify := TNNetGrammarMachine.Create(VG);
+  P := TNNetVolume.Create(128, 1, 1);
+  try
+    C.Reset([]);
+    S := '';
+    for Step := 1 to 11 do  // odd cap: a "d+d+..." walk ends on a digit
+    begin
+      // Head that ADORES '+' (an often-illegal char) over the digit, with EOS
+      // last - so the unconstrained argmax would emit '+' first (invalid). The
+      // constraint must steer every step to a legal token, producing the
+      // alternating "7+7+7..." expression.
+      P.Fill(0.001);
+      P.Raw[Ord('+')] := 5.0;
+      P.Raw[Ord('7')] := 4.0;
+      P.Raw[0] := 1.0;            // EOS (never wins here while '+'/'7' legal)
+      C.MaskAllowed(P);
+      Best := 0;
+      for I := 0 to P.Size - 1 do
+        if P.Raw[I] > P.Raw[Best] then Best := I;
+      if Best < 2 then break;     // EOS (only reachable at a complete state)
+      AssertTrue('greedy step ' + IntToStr(Step) + ' picked a legal token',
+        C.TokenAllowed(Best));
+      C.Commit(Best);
+      S := S + Chr(Best);
+    end;
+    // The constrained greedy walk must never have emitted an illegal char; the
+    // accumulated string always feeds the grammar (it is at worst a legal
+    // prefix). With the odd cap the walk ends after a digit -> complete.
+    Verify.Reset();
+    AssertTrue('greedy output "' + S + '" feeds the grammar',
+      Verify.FeedString(S));
+    AssertTrue('greedy output "' + S + '" is a complete expression',
+      Verify.IsComplete());
+    AssertEquals('greedy steered to the "7+7+..." form', '7+7+7+7+7+7', S);
+  finally
+    P.Free;
+    Verify.Free;
+    VG.Free;
+    C.Free;
+  end;
+end;
+
+// Same idea under SAMPLED decoding: a probability-weighted sampler over the
+// masked row never draws a zeroed (illegal) token, and every completed run
+// parses. (TNNetSamplerWeightedTopK samples proportional to mass, so masked-out
+// tokens have zero draw probability - unlike TNNetSamplerTopK's uniform top-K
+// draw, which would ignore the mask.)
+procedure TTestNeuralDecode.TestGrammarConstraintSampledDrivenWalkStaysValid;
+var
+  C: TNNetGrammarConstraint;
+  Verify: TNNetGrammarMachine;
+  VG: TNNetGrammar;
+  P: TNNetVolume;
+  Sampler: TNNetSamplerWeightedTopK;
+  Trial, Step, Tok: integer;
+  S: string;
+begin
+  RandSeed := 20260613;
+  C := TNNetGrammarConstraint.CreateCharLevel(ArithGrammar, 128);
+  VG := TNNetGrammar.Create(ArithGrammar);
+  Verify := TNNetGrammarMachine.Create(VG);
+  P := TNNetVolume.Create(128, 1, 1);
+  Sampler := TNNetSamplerWeightedTopK.Create(40);
+  try
+    for Trial := 1 to 20 do
+    begin
+      C.Reset([]);
+      S := '';
+      for Step := 1 to 16 do
+      begin
+        // Roughly uniform head; the grammar does all the constraining. Include
+        // a chance of EOS so runs terminate.
+        P.Fill(1.0);
+        P.Raw[0] := 3.0;       // EOS bias
+        C.MaskAllowed(P);
+        Tok := Sampler.GetToken(P);
+        if Tok < 2 then break; // EOS - allowed only at a complete state
+        AssertTrue('run ' + IntToStr(Trial) + ' step ' + IntToStr(Step) +
+          ': sampled token is grammar-legal', C.TokenAllowed(Tok));
+        C.Commit(Tok);
+        S := S + Chr(Tok);
+      end;
+      // Whatever was produced (terminated by EOS or the cap) must at least be a
+      // legal prefix; if it stopped at EOS it must be a complete expression.
+      Verify.Reset();
+      AssertTrue('run ' + IntToStr(Trial) + ' output "' + S +
+        '" is a legal grammar prefix', Verify.FeedString(S));
+    end;
+  finally
+    Sampler.Free;
+    P.Free;
+    Verify.Free;
+    VG.Free;
+    C.Free;
   end;
 end;
 
