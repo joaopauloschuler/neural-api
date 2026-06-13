@@ -172,6 +172,9 @@ type
       FOptimizer: TNeuralOptimizer;
       FOptimizerOwned: boolean;
       FScheduler: TNeuralLRScheduler;
+      FAccumulationSteps: integer;
+      FCurrentAccumulationStep: integer;
+      procedure SetAccumulationSteps(Value: integer);
       procedure CheckLearningRate(iEpochCount: integer);
       procedure Optimize();
       procedure SetOptimizer(pOptimizer: TNeuralOptimizer);
@@ -245,6 +248,25 @@ type
       // logic. When nil, the legacy LR code path is byte-for-byte unchanged.
       // The caller retains ownership of the scheduler instance.
       property Scheduler: TNeuralLRScheduler read FScheduler write FScheduler;
+      // Gradient accumulation. When AccumulationSteps = N > 1, every optimizer
+      // step is preceded by N forward+backward micro-batches whose per-neuron
+      // deltas are summed into the main network WITHOUT calling UpdateWeights,
+      // giving an effective batch of N*BatchSize at the memory cost of a single
+      // BatchSize micro-batch. Because the framework ACCUMULATES (sums, never
+      // averages) deltas across a batch, N micro-batches of size M produce
+      // exactly the same summed delta as one true batch of size N*M, so no
+      // 1/N rescaling is applied. Reported loss/accuracy are likewise summed
+      // over all N micro-batches before the per-example averaging in the fit
+      // loop, matching a true N*M batch. One optimizer step (and one LR-schedule
+      // step count) happens per N micro-batches, not per micro-batch.
+      // Default 1 = today's behaviour, bit-for-bit. Provider code can read
+      // CurrentAccumulationStep (0..N-1) to fetch distinct data per micro-batch.
+      property AccumulationSteps: integer read FAccumulationSteps write SetAccumulationSteps;
+      // 0-based index of the micro-batch currently being run inside a gradient
+      // accumulation group (always 0 when AccumulationSteps = 1). A deterministic
+      // GetTrainingPair/Proc can combine this with its own index to draw the
+      // matching slice of a large effective batch.
+      property CurrentAccumulationStep: integer read FCurrentAccumulationStep;
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
@@ -1791,20 +1813,34 @@ end;
 procedure TNeuralDataLoadingFit.RunTrainingBatch();
 var
   MaxDelta: TNeuralFloat;
+  AccStep: integer;
 begin
+  // Reset the global hit/loss/error accumulators ONCE per optimizer step. When
+  // FAccumulationSteps = N > 1 they keep accumulating across all N micro-batches
+  // so the reported loss/accuracy match a true N*BatchSize batch.
   FGlobalHit       := 0;
   FGlobalMiss      := 0;
   FGlobalTotalLoss := 0;
   FGlobalErrorSum  := 0;
-  FFinishedThread.Fill(0);
-  FNN.ClearTime();
-  FNN.RefreshDropoutMask();
-  {$IFDEF HASTHREADS}
-  //ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-  FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
-  {$ELSE}
-  RunNNThread(0, 1);
-  {$ENDIF}
+  // FNN's per-neuron deltas are zero on entry (the previous Optimize() cleared
+  // them via UpdateWeights). Each micro-batch's threads SUM their deltas into
+  // FNN without clearing it, so deltas accumulate across the whole group; the
+  // single Optimize() below applies the summed delta exactly once.
+  for AccStep := 0 to FAccumulationSteps - 1 do
+  begin
+    FCurrentAccumulationStep := AccStep;
+    if FShouldQuit then break;
+    FFinishedThread.Fill(0);
+    FNN.ClearTime();
+    FNN.RefreshDropoutMask();
+    {$IFDEF HASTHREADS}
+    //ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+    FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
+    {$ELSE}
+    RunNNThread(0, 1);
+    {$ENDIF}
+  end;
+  FCurrentAccumulationStep := 0;
   Optimize();
 end;
 
@@ -2100,6 +2136,14 @@ begin
   FOptimizer := nil;
   FOptimizerOwned := false;
   FSaveBest := SaveBestAccuracy;
+  FAccumulationSteps := 1;
+  FCurrentAccumulationStep := 0;
+end;
+
+procedure TNeuralFitBase.SetAccumulationSteps(Value: integer);
+begin
+  if Value < 1 then Value := 1;
+  FAccumulationSteps := Value;
 end;
 
 destructor TNeuralFitBase.Destroy();

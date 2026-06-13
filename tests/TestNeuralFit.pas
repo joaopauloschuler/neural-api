@@ -32,7 +32,26 @@ type
     procedure HandleError(const S: string);
   end;
 
+  // Deterministic, counter-addressed training-data source for the gradient
+  // accumulation equivalence test. It owns a fixed pool of (input,target)
+  // samples and, given the within-micro-batch index and the owning Fit's
+  // CurrentAccumulationStep, returns the GLOBAL sample of an effective batch.
+  // This makes "N micro-batches of M" draw the SAME M*N samples in the SAME
+  // order as "one true batch of M*N", which is what the equivalence proof needs.
+  TAccumDataSource = class
+  public
+    FFit: TNeuralFitBase;
+    FMicroBatch: integer;          // M, the per-micro-batch size
+    FPoolIn, FPoolOut: array of TNNetVolume;
+    constructor Create(pMicroBatch, pPoolSize, pInDepth, pOutDepth: integer);
+    destructor Destroy; override;
+    procedure GetPair(Idx, ThreadId: integer; vInput, vOutput: TNNetVolume);
+  end;
+
   TTestNeuralFit = class(TTestCase)
+  private
+    function RunAccumFit(MicroBatch, AccumSteps, Epochs: integer;
+      out FinalLoss: TNeuralFloat): TNNetVolume;
   published
     // Optimizer tests
     procedure TestSGDOptimizerCreation;
@@ -82,6 +101,11 @@ type
     procedure TestLabelSmoothingDefaultZero;
     procedure TestLabelSmoothingTargetMath;
     procedure TestLabelSmoothingZeroIsBitIdentical;
+
+    // Gradient accumulation tests
+    procedure TestAccumulationStepsDefaultsToOne;
+    procedure TestAccumulationStepsClampsBelowOne;
+    procedure TestAccumulationEqualsBigBatch;
   end;
 
 implementation
@@ -958,6 +982,186 @@ begin
     Reference.Free;
     Target.Free;
     Fit.Free;
+  end;
+end;
+
+constructor TAccumDataSource.Create(pMicroBatch, pPoolSize, pInDepth,
+  pOutDepth: integer);
+var
+  S, D: integer;
+begin
+  inherited Create;
+  FMicroBatch := pMicroBatch;
+  SetLength(FPoolIn, pPoolSize);
+  SetLength(FPoolOut, pPoolSize);
+  // Deterministic content: independent of the global RNG so both runs see the
+  // exact same samples regardless of how many times RefreshDropoutMask draws.
+  for S := 0 to pPoolSize - 1 do
+  begin
+    FPoolIn[S] := TNNetVolume.Create(pInDepth, 1, 1);
+    FPoolOut[S] := TNNetVolume.Create(pOutDepth, 1, 1);
+    for D := 0 to pInDepth - 1 do
+      FPoolIn[S].FData[D] := Sin(0.7 * S + 1.3 * D) * 0.5 + 0.5;
+    for D := 0 to pOutDepth - 1 do
+      FPoolOut[S].FData[D] := Cos(0.9 * S + 0.5 * D) * 0.5 + 0.5;
+  end;
+end;
+
+destructor TAccumDataSource.Destroy;
+var
+  S: integer;
+begin
+  for S := 0 to High(FPoolIn) do
+  begin
+    FPoolIn[S].Free;
+    FPoolOut[S].Free;
+  end;
+  inherited Destroy;
+end;
+
+procedure TAccumDataSource.GetPair(Idx, ThreadId: integer;
+  vInput, vOutput: TNNetVolume);
+var
+  Global: integer;
+begin
+  // Idx is the 1-based within-micro-batch index; CurrentAccumulationStep is the
+  // 0-based micro-batch number inside the accumulation group. Together they
+  // address the global sample of an effective FMicroBatch*AccumulationSteps
+  // batch. With AccumulationSteps = 1 this is just (Idx - 1), so a true big
+  // batch and an accumulated batch enumerate the identical sample sequence.
+  Global := FFit.CurrentAccumulationStep * FMicroBatch + (Idx - 1);
+  vInput.Copy(FPoolIn[Global]);
+  vOutput.Copy(FPoolOut[Global]);
+end;
+
+// Trains a fresh, deterministically-initialized net with the given micro-batch
+// size and AccumulationSteps for Epochs epochs, returning the last-layer weight
+// vector (live, no best-model reload) and the final training loss. The
+// effective batch is always MicroBatch*AccumSteps and the pool/order is fixed,
+// so two configs with the same product MUST converge to the same weights.
+function TTestNeuralFit.RunAccumFit(MicroBatch, AccumSteps, Epochs: integer;
+  out FinalLoss: TNeuralFloat): TNNetVolume;
+var
+  Net: TNNet;
+  Fit: TNeuralFit;
+  Source: TAccumDataSource;
+  EffectiveBatch: integer;
+begin
+  EffectiveBatch := MicroBatch * AccumSteps;
+  // Identical initial weights for every call.
+  RandSeed := 424242;
+  Net := TNNet.Create();
+  Net.AddLayer([
+    TNNetInput.Create(3),
+    TNNetFullConnectLinear.Create(4),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  // Plain SGD with no inertia keeps the step a pure sum of per-sample deltas,
+  // so the summed-delta equivalence is exercised without momentum book-keeping.
+  Net.SetLearningRate(0.01, 0.0);
+
+  Source := TAccumDataSource.Create(MicroBatch, EffectiveBatch, 3, 2);
+  Fit := TNeuralFit.Create;
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;            // deterministic reduction order
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;       // hold LR fixed
+    Fit.StaircaseEpochs := 1;
+    Fit.Inertia := 0.0;               // pure SGD, no momentum
+    Fit.L2Decay := 0;                 // no weight decay term
+    Fit.ClipNorm := 0;                // disable per-layer norm clipping...
+    Fit.ClipDelta := 0;               // ...and delta clipping so deltas pass through raw
+    Fit.MinBackpropagationError := 0;
+    Fit.MinBackpropagationErrorProportion := 0; // backprop EVERY sample (no skip)
+    Fit.LoadBestAtEnd := False;       // keep live trained weights
+    Fit.AccumulationSteps := AccumSteps;
+    Source.FFit := Fit;
+    Fit.EnableDefaultLoss();
+    // One optimizer step per epoch: the per-epoch loop runs
+    // (TrainingCnt div BatchSize) = 1 RunTrainingBatch, and each RunTrainingBatch
+    // runs AccumSteps micro-batches => exactly EffectiveBatch samples per step.
+    Fit.FitLoading(Net, {TrainingCnt=}MicroBatch, 0, 0, {BatchSize=}MicroBatch,
+      Epochs, {$IFDEF FPC}@{$ENDIF}Source.GetPair, nil, nil);
+    FinalLoss := Fit.CurrentTrainingError;
+    Result := TNNetVolume.Create();
+    Result.Copy(Net.GetLastLayer.Neurons[0].Weights);
+  finally
+    Fit.Free;
+    Source.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAccumulationStepsDefaultsToOne;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    AssertEquals('AccumulationSteps must default to 1 (today''s behaviour)',
+      1, Fit.AccumulationSteps);
+    AssertEquals('CurrentAccumulationStep must start at 0',
+      0, Fit.CurrentAccumulationStep);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAccumulationStepsClampsBelowOne;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    Fit.AccumulationSteps := 0;
+    AssertEquals('AccumulationSteps <= 0 must clamp to 1', 1,
+      Fit.AccumulationSteps);
+    Fit.AccumulationSteps := -5;
+    AssertEquals('Negative AccumulationSteps must clamp to 1', 1,
+      Fit.AccumulationSteps);
+    Fit.AccumulationSteps := 4;
+    AssertEquals('Valid AccumulationSteps must round-trip', 4,
+      Fit.AccumulationSteps);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAccumulationEqualsBigBatch;
+var
+  WAccum, WBig: TNNetVolume;
+  LossAccum, LossBig: TNeuralFloat;
+  I: integer;
+const
+  cMicroBatch = 3;
+  cAccumSteps = 4;   // effective batch = 12
+  cEpochs = 8;
+begin
+  WAccum := nil;
+  WBig := nil;
+  try
+    // Accumulated: 4 micro-batches of 3 => effective batch 12 per optimizer step.
+    WAccum := RunAccumFit(cMicroBatch, cAccumSteps, cEpochs, LossAccum);
+    // True big batch: one batch of 12, AccumulationSteps = 1.
+    WBig := RunAccumFit(cMicroBatch * cAccumSteps, 1, cEpochs, LossBig);
+
+    AssertEquals('Weight vector size must match', WBig.Size, WAccum.Size);
+    // The framework SUMS deltas across a batch (it never averages), so N
+    // micro-batches of M produce the identical summed delta as one batch of
+    // N*M. After many compounding steps the weights must coincide to tight
+    // single-precision tolerance (only float-add ordering differs).
+    for I := 0 to WBig.Size - 1 do
+      AssertEquals('Accumulated weights must match true big-batch weights',
+        WBig.FData[I], WAccum.FData[I], 1e-5);
+    // Loss bookkeeping must also match: accumulation reports the loss over the
+    // full effective batch, exactly like the true big batch.
+    AssertEquals('Final training error must match the big-batch run',
+      LossBig, LossAccum, 1e-5);
+  finally
+    WAccum.Free;
+    WBig.Free;
   end;
 end;
 

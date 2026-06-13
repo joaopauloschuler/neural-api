@@ -215,10 +215,16 @@ rather than acted on.
       (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap; add
       o200k when a GPT-4o-family checkpoint matters. Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
-- [ ] Gradient accumulation in neuralfit.pas: accumulate deltas over N
+- [X] Gradient accumulation in neuralfit.pas: accumulate deltas over N
       micro-batches before the optimizer step (large effective batch
-      without the memory), scaling the loss/deltas by 1/N so results match
-      a true big batch.
+      without the memory), so results match a true big batch.
+      AccumulationSteps property (default 1 = bit-identical to today) on
+      TNeuralFitBase; RunTrainingBatch runs N forward+backward micro-batches
+      summing deltas into FNN, then one Optimize(). No 1/N rescale: the
+      framework SUMS (never averages) deltas across a batch, so N x M ==
+      true N*M. CurrentAccumulationStep exposed for deterministic providers.
+      Verified by TestAccumulationEqualsBigBatch (4 micro of 3 vs one of 12,
+      8 epochs, weights+loss match to 1e-5).
 - [ ] EMA (exponential moving average) shadow weights in neuralfit.pas:
       maintain decay-averaged copies of all weights during training and
       allow swapping them in for eval/save; classic free eval-quality win.
