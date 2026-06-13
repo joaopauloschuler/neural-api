@@ -579,6 +579,20 @@ type
     Constraint: TNNetTokenConstraint;      // nil = off (not owned)
     // Sampler reading the processed probability row; nil = greedy argmax.
     Sampler: TNNetSamplerBase;             // not owned
+    // CLASSIFIER-FREE GUIDANCE (CFG). GuidanceScale = 1.0 is OFF (the no-op
+    // default): the conditional distribution is used untouched and CFGUncond
+    // is ignored, so the path is bit-for-bit the non-CFG path. When
+    // GuidanceScale <> 1.0 the config wires a TNNetCFGProcessor at the FRONT
+    // of the per-step pipeline (it combines the two model distributions BEFORE
+    // penalty/temperature/processors/constraint see the row). CFGUncond is the
+    // WIDTH-1 unconditional streaming twin (typically derived with
+    // MakeUnconditionalTwin from the same imported net; not owned by the
+    // record). NegativePrompt is the unconditional/negative prompt token ids;
+    // it must be non-empty when GuidanceScale <> 1.0 (it seeds the
+    // unconditional branch - pass a single BOS-like id for "no prompt").
+    GuidanceScale: TNeuralFloat;           // 1.0 = off
+    CFGUncond: TNNetStreamingDecoder;      // unconditional twin (not owned)
+    NegativePrompt: TNeuralIntegerArray;   // negative/unconditional prompt ids
     // Guidance-style TOKEN HEALING (string paths only - the token-level
     // routines have no dict; call PrepareTokenHealing yourself there): drop
     // the last prompt token and constrain the FIRST generated token to
@@ -959,6 +973,32 @@ function GenerateTokensWithConfig(Session: TNNetStreamingDecoder;
 function GenerateStringWithConfig(Session: TNNetStreamingDecoder;
   Dict: TStringListInt; InputString: string;
   const Config: TGenerationConfig): string;
+
+// CFG CONVENIENCE: derive the UNCONDITIONAL streaming twin automatically from
+// a single (already WIDTH-1) trained net, so CFG callers do not hand-build a
+// second branch. SourceWidth1Net must be the same width-1 net the conditional
+// streaming loop drives (e.g. an imported inference model, or the twin built
+// for the conditional TNNetStreamingDecoder). The function CLONES it through
+// SaveToString -> LoadFromString (architecture AND weights survive the
+// round-trip, and the width-1 input shape is preserved exactly), giving the
+// CFG branch its OWN net with INDEPENDENT KV-cache / SSM state but the SAME
+// trained weights - the conditional and unconditional branches must not share
+// one cache. The clone is returned in TwinNet and wrapped in a fresh
+// TNNetStreamingDecoder (cache budget MaxTotalLen) returned as the result.
+//
+// OWNERSHIP: the CALLER owns and frees BOTH the returned session AND TwinNet
+// (free the session first). A TNNetCFGProcessor created with this session and
+// OwnsSession=false leaves them for the caller; with OwnsSession=true the
+// processor frees the session but NOT TwinNet (the session never owns its
+// net), so the caller still frees TwinNet.
+//
+// A direct full-width->width-1 clone is intentionally NOT attempted: a TNNet
+// cannot be reshaped to a different input width by a string round-trip (the
+// saved structure carries the original width). Build the width-1 net once
+// (the established Build*(1)+CopyWeights idiom) and pass it here.
+// Coded by Claude (AI).
+function MakeUnconditionalTwin(SourceWidth1Net: TNNet;
+  MaxTotalLen: integer; out TwinNet: TNNet): TNNetStreamingDecoder;
 
 // ---------------------------------------------------------------------------
 // SEQ2SEQ (ENCODER-DECODER) GENERATION: the T5/BART-style counterpart of the
@@ -2433,6 +2473,25 @@ end;
 
 { Config-driven generation }
 
+function MakeUnconditionalTwin(SourceWidth1Net: TNNet;
+  MaxTotalLen: integer; out TwinNet: TNNet): TNNetStreamingDecoder;
+begin
+  if not Assigned(SourceWidth1Net) then
+    raise EArgumentException.Create(
+      'MakeUnconditionalTwin: SourceWidth1Net must be assigned.');
+  if SourceWidth1Net.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'MakeUnconditionalTwin: SourceWidth1Net must be a WIDTH-1 net ' +
+      '(input SizeX=1); build the width-1 twin first (Build*(1) + ' +
+      'CopyWeights). Got SizeX=' +
+      IntToStr(SourceWidth1Net.GetFirstLayer().Output.SizeX) + '.');
+  // Clone architecture AND weights; the round-trip preserves the width-1
+  // input shape, so the clone is a valid streaming twin with its own state.
+  TwinNet := TNNet.Create();
+  TwinNet.LoadFromString(SourceWidth1Net.SaveToString());
+  Result := TNNetStreamingDecoder.Create(TwinNet, MaxTotalLen);
+end;
+
 function DefaultGenerationConfig(MaxNewTokens: integer;
   MaxTotalLen: integer = 0): TGenerationConfig;
 begin
@@ -2446,7 +2505,38 @@ begin
   Result.Processors := nil;
   Result.Constraint := nil;
   Result.Sampler := nil;
+  Result.GuidanceScale := 1.0; // CFG off
+  Result.CFGUncond := nil;
+  SetLength(Result.NegativePrompt, 0);
   Result.TokenHealing := false;
+end;
+
+// Assemble the per-step pipeline implied by a TGenerationConfig. CFG (when
+// GuidanceScale <> 1.0) runs FIRST - it combines the conditional and
+// unconditional model distributions before any penalty/temperature/processor/
+// constraint transform sees the row - then the standard
+// Penalty -> Temperature -> Processors -> Constraint pipeline. Returns nil
+// when every knob is off (the plain path). The returned chain owns only the
+// adapters it created (the CFG processor included); Config's own objects are
+// not owned.
+function BuildConfigPipeline(
+  const Config: TGenerationConfig): TNNetLogitsProcessorChain;
+var
+  StdChain: TNNetLogitsProcessorChain;
+begin
+  StdChain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
+    Config.Processors, Config.Constraint);
+  if Config.GuidanceScale = 1.0 then exit(StdChain); // CFG off: as before
+  if not Assigned(Config.CFGUncond) then
+    raise EArgumentException.Create(
+      'BuildConfigPipeline: GuidanceScale <> 1 requires Config.CFGUncond ' +
+      '(the unconditional width-1 twin) to be assigned.');
+  Result := TNNetLogitsProcessorChain.Create();
+  // CFG owns its run but NOT the session/twin (OwnsSession=false): the config
+  // does not own CFGUncond, so neither does the chain it spawns.
+  Result.Add(TNNetCFGProcessor.Create(Config.CFGUncond, Config.NegativePrompt,
+    Config.GuidanceScale, {OwnsSession=}false), {OwnsProcessor=}true);
+  if Assigned(StdChain) then Result.Add(StdChain, {OwnsProcessor=}true);
 end;
 
 function GenerateTokensWithConfig(Session: TNNetStreamingDecoder;
@@ -2458,8 +2548,7 @@ var
 begin
   MaxTotal := Config.MaxTotalLen;
   if MaxTotal <= 0 then MaxTotal := PromptLen + Config.MaxNewTokens;
-  Chain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
-    Config.Processors, Config.Constraint);
+  Chain := BuildConfigPipeline(Config);
   try
     Result := GenerateTokensStreamedWithProcessors(Session, Tokens,
       PromptLen, Config.MaxNewTokens, MaxTotal, Config.Sampler, Chain,
@@ -2487,8 +2576,7 @@ begin
     MaxTotal := PromptLen + Config.MaxNewTokens;
     SetLength(Tokens, 0);
   end;
-  Chain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
-    Config.Processors, Config.Constraint);
+  Chain := BuildConfigPipeline(Config);
   try
     Result := GenerateStringStreamedWithProcessors(Session, Dict,
       InputString, Config.MaxNewTokens, MaxTotal, Config.Sampler, Chain,

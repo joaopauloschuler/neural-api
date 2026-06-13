@@ -336,12 +336,21 @@ rather than acted on.
       a small Pascal-trained student and report student perplexity vs hard-label-
       only training at matched steps. Pure harness work over the landed trainer +
       importers; writeup goes in examples/README.md.
-- [ ] CFG decode follow-ups (TNNetCFGProcessor landed, commit 11e668f): (a) wire
+- [X] CFG decode follow-ups (TNNetCFGProcessor landed, commit 11e668f): (a) wire
       guidance_scale + negative prompt into TGenerationConfig so the high-level
       decode entry points expose CFG without manual processor construction;
       (b) the processor builds a second width-1 streaming twin of the same net —
       add a convenience that derives the unconditional twin automatically from a
       single imported model (build-twice + CopyWeights, or share weights).
+      DONE: TGenerationConfig gains GuidanceScale (1.0=off) / CFGUncond /
+      NegativePrompt; BuildConfigPipeline prepends a TNNetCFGProcessor at the
+      FRONT of the per-step pipeline when scale<>1 (scale=1 is bit-identical to
+      the no-CFG path). MakeUnconditionalTwin clones a WIDTH-1 net via
+      SaveToString->LoadFromString (architecture+weights, width preserved) and
+      wraps it in an independent-state TNNetStreamingDecoder; caller frees both
+      session and twin. RESIDUAL: a full-width->width-1 auto-clone is not
+      attempted (a string round-trip preserves the original width) — caller
+      still builds the width-1 net once via the Build*(1)+CopyWeights idiom.
 - [ ] KV-cache eviction for unbounded streaming: attention sinks + rolling
       window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder
       — today the per-SDPA-layer cache grows without bound. Keep the first

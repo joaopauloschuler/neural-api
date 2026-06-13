@@ -111,6 +111,9 @@ type
     procedure TestCFGScaleOneMatchesPlainDecoding;
     procedure TestCFGScaleZeroIgnoresConditionalPrompt;
     procedure TestCFGRejectsInvalidArguments;
+    procedure TestConfigCFGScaleOneMatchesNoCFGConfig;
+    procedure TestConfigCFGScaleChangesOutput;
+    procedure TestMakeUnconditionalTwinMatchesSourceLogits;
     // Constrained (structured) decoding: TNNetTokenConstraint and friends.
     procedure TestAllowedTokensConstraintMasksAndRenormalizes;
     procedure TestConstraintMaskFallbackLeavesRowUntouched;
@@ -2373,6 +2376,187 @@ begin
   finally
     WideSession.Free; Session.Free;
     Wide.Free; Twin.Free;
+  end;
+end;
+
+// TGenerationConfig CFG wiring, INVARIANT 1: a config with GuidanceScale = 1
+// (the default) must be bit-for-bit identical to a config that leaves CFG off
+// entirely (CFGUncond unassigned) - the CFG branch is never constructed and
+// never steps. Both run through GenerateTokensWithConfig.
+procedure TTestNeuralDecode.TestConfigCFGScaleOneMatchesNoCFGConfig;
+const
+  SeqLen = 12;
+  PromptLen = 4;
+var
+  Full, TwinA, TwinB, TwinU, TwinUClone: TNNet;
+  SessA, SessB, USess: TNNetStreamingDecoder;
+  NoCFG, WithCFG: TGenerationConfig;
+  ToksA, ToksB: TNeuralIntegerArray;
+  LenA, LenB, T: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinA := BuildTinySSMLM(1); TwinA.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinB := BuildTinySSMLM(1); TwinB.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinU := BuildTinySSMLM(1); TwinU.AddLayer(TNNetPointwiseSoftMax.Create());
+  SessA := nil; SessB := nil; USess := nil; TwinUClone := nil;
+  try
+    TwinA.CopyWeights(Full); TwinB.CopyWeights(Full); TwinU.CopyWeights(Full);
+    SessA := TNNetStreamingDecoder.Create(TwinA, SeqLen);
+    SessB := TNNetStreamingDecoder.Create(TwinB, SeqLen);
+    // Derive the unconditional twin automatically (part (b)).
+    USess := MakeUnconditionalTwin(TwinU, SeqLen, TwinUClone);
+
+    SetLength(ToksA, PromptLen);
+    ToksA[0] := 5; ToksA[1] := 2; ToksA[2] := 9; ToksA[3] := 4;
+    NoCFG := DefaultGenerationConfig(SeqLen - PromptLen, SeqLen);
+    LenA := GenerateTokensWithConfig(SessA, ToksA, PromptLen, NoCFG);
+    AssertTrue('no-CFG config generated something', LenA > PromptLen);
+
+    SetLength(ToksB, PromptLen);
+    ToksB[0] := 5; ToksB[1] := 2; ToksB[2] := 9; ToksB[3] := 4;
+    WithCFG := DefaultGenerationConfig(SeqLen - PromptLen, SeqLen);
+    WithCFG.GuidanceScale := 1.0; // explicit no-op
+    WithCFG.CFGUncond := USess;
+    SetLength(WithCFG.NegativePrompt, 2);
+    WithCFG.NegativePrompt[0] := 7; WithCFG.NegativePrompt[1] := 3;
+    LenB := GenerateTokensWithConfig(SessB, ToksB, PromptLen, WithCFG);
+
+    AssertEquals('scale=1 config same length', LenA, LenB);
+    for T := PromptLen to LenA - 1 do
+      AssertEquals('scale=1 config token at ' + IntToStr(T),
+        ToksA[T], ToksB[T]);
+  finally
+    USess.Free; SessB.Free; SessA.Free;
+    TwinUClone.Free; TwinU.Free; TwinB.Free; TwinA.Free; Full.Free;
+  end;
+end;
+
+// TGenerationConfig CFG wiring, INVARIANT 2: a config with GuidanceScale <> 1
+// must actually engage the processor and CHANGE the result versus an otherwise
+// identical scale=1 config (sanity that the per-step pipeline really runs the
+// CFG combine). A negative prompt that differs from the conditional prompt is
+// used so the two branches disagree.
+procedure TTestNeuralDecode.TestConfigCFGScaleChangesOutput;
+const
+  SeqLen = 16;
+  PromptLen = 4;
+var
+  Full, TwinA, TwinB, TwinUA, TwinUB, CloneA, CloneB: TNNet;
+  SessA, SessB, USessA, USessB: TNNetStreamingDecoder;
+  CfgOne, CfgGuided: TGenerationConfig;
+  ToksOne, ToksGuided: TNeuralIntegerArray;
+  LenOne, LenGuided, T: integer;
+  Differs: boolean;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinA := BuildTinySSMLM(1); TwinA.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinB := BuildTinySSMLM(1); TwinB.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinUA := BuildTinySSMLM(1); TwinUA.AddLayer(TNNetPointwiseSoftMax.Create());
+  TwinUB := BuildTinySSMLM(1); TwinUB.AddLayer(TNNetPointwiseSoftMax.Create());
+  SessA := nil; SessB := nil; USessA := nil; USessB := nil;
+  CloneA := nil; CloneB := nil;
+  try
+    TwinA.CopyWeights(Full); TwinB.CopyWeights(Full);
+    TwinUA.CopyWeights(Full); TwinUB.CopyWeights(Full);
+    SessA := TNNetStreamingDecoder.Create(TwinA, SeqLen);
+    SessB := TNNetStreamingDecoder.Create(TwinB, SeqLen);
+    USessA := MakeUnconditionalTwin(TwinUA, SeqLen, CloneA);
+    USessB := MakeUnconditionalTwin(TwinUB, SeqLen, CloneB);
+
+    // Baseline: scale=1 (CFG is a no-op even though wired).
+    SetLength(ToksOne, PromptLen);
+    ToksOne[0] := 5; ToksOne[1] := 2; ToksOne[2] := 9; ToksOne[3] := 4;
+    CfgOne := DefaultGenerationConfig(SeqLen - PromptLen, SeqLen);
+    CfgOne.GuidanceScale := 1.0;
+    CfgOne.CFGUncond := USessA;
+    SetLength(CfgOne.NegativePrompt, 2);
+    CfgOne.NegativePrompt[0] := 11; CfgOne.NegativePrompt[1] := 8;
+    LenOne := GenerateTokensWithConfig(SessA, ToksOne, PromptLen, CfgOne);
+
+    // Guided: scale=3, same prompts/negative prompt.
+    SetLength(ToksGuided, PromptLen);
+    ToksGuided[0] := 5; ToksGuided[1] := 2; ToksGuided[2] := 9; ToksGuided[3] := 4;
+    CfgGuided := DefaultGenerationConfig(SeqLen - PromptLen, SeqLen);
+    CfgGuided.GuidanceScale := 3.0;
+    CfgGuided.CFGUncond := USessB;
+    SetLength(CfgGuided.NegativePrompt, 2);
+    CfgGuided.NegativePrompt[0] := 11; CfgGuided.NegativePrompt[1] := 8;
+    LenGuided := GenerateTokensWithConfig(SessB, ToksGuided, PromptLen,
+      CfgGuided);
+
+    AssertTrue('guided run generated something', LenGuided > PromptLen);
+    Differs := (LenOne <> LenGuided);
+    if not Differs then
+      for T := PromptLen to LenOne - 1 do
+        if ToksOne[T] <> ToksGuided[T] then Differs := true;
+    AssertTrue('GuidanceScale<>1 changes the generated tokens', Differs);
+  finally
+    USessB.Free; USessA.Free; SessB.Free; SessA.Free;
+    CloneB.Free; CloneA.Free;
+    TwinUB.Free; TwinUA.Free; TwinB.Free; TwinA.Free; Full.Free;
+  end;
+end;
+
+// MakeUnconditionalTwin part (b): the auto-derived twin must produce the SAME
+// unconditional next-token distribution as the source net on a pinned input
+// sequence (the SaveToString -> LoadFromString clone shares the trained
+// weights exactly; only the cache state is independent).
+procedure TTestNeuralDecode.TestMakeUnconditionalTwinMatchesSourceLogits;
+const
+  SeqLen = 10;
+  Toks: array[0..3] of integer = (6, 1, 9, 4);
+var
+  Full, Source, Clone: TNNet;
+  SrcSess, TwinSess: TNNetStreamingDecoder;
+  InV: TNNetVolume;
+  SrcRow: array of TNeuralFloat;
+  I, P: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinySSMLM(SeqLen);
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Source := BuildTinySSMLM(1); Source.AddLayer(TNNetPointwiseSoftMax.Create());
+  SrcSess := nil; TwinSess := nil; Clone := nil; InV := nil;
+  try
+    Source.CopyWeights(Full);
+    SrcSess := TNNetStreamingDecoder.Create(Source, SeqLen);
+    TwinSess := MakeUnconditionalTwin(Source, SeqLen, Clone);
+
+    InV := TNNetVolume.Create(Source.GetFirstLayer().Output);
+    InV.Fill(0);
+
+    // Drive both sessions over the SAME pinned input; the final step's output
+    // row is the unconditional distribution to compare.
+    SrcSess.Reset();
+    for P := 0 to High(Toks) do
+    begin
+      InV.FData[0] := Toks[P];
+      SrcSess.StepForward(InV, P);
+    end;
+    SetLength(SrcRow, SrcSess.Output().Size);
+    for I := 0 to SrcSess.Output().Size - 1 do
+      SrcRow[I] := SrcSess.Output().Raw[I];
+
+    TwinSess.Reset();
+    for P := 0 to High(Toks) do
+    begin
+      InV.FData[0] := Toks[P];
+      TwinSess.StepForward(InV, P);
+    end;
+
+    AssertEquals('clone output size matches source',
+      Length(SrcRow), TwinSess.Output().Size);
+    for I := 0 to High(SrcRow) do
+      AssertEquals('clone logit ' + IntToStr(I) + ' matches source',
+        SrcRow[I], TwinSess.Output().Raw[I], 1e-6);
+  finally
+    InV.Free;
+    TwinSess.Free; SrcSess.Free;
+    Clone.Free; Source.Free; Full.Free;
   end;
 end;
 
