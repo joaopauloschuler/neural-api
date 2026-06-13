@@ -126,7 +126,33 @@ ROUGE. RougeN returns clipped n-gram overlap precision/recall/F1
 R = LCS/|ref|, F1 = harmonic mean). CorpusRougeN / CorpusRougeL average the
 per-pair scores (macro average over the corpus).
 
-Both metrics expose a dual API: integer TOKEN-ID arrays
+DEGENERATION / GENERATION-QUALITY metrics (the standard suite for judging
+sampler/decoding diversity).
+
+  DistinctN (Li et al. 2016): the ratio (number of DISTINCT n-grams) /
+  (total number of n-grams) of a single generation. distinct-1 / distinct-2
+  are the canonical reported values; the n argument generalises. "a a a a"
+  has 4 unigrams but 1 distinct type -> distinct-1 = 1/4. An empty / too-short
+  generation (fewer than n tokens) scores 0.
+
+  RepetitionRate is the complementary degeneration signal: the fraction of
+  n-gram occurrences that are REPEATS of an already-seen type,
+  = 1 - DistinctN (so "a a a a" has repetition-1 = 3/4). Sequence-level
+  repetition: it is the standard rep-n used in the neural-text-degeneration
+  literature (Welleck et al. 2020 / Holtzman et al. 2020). RepeatedTokenRate
+  is the rep-1 special case spelled out for convenience.
+
+  SelfBLEU (Zhu et al. 2018, "Texec"/diversity): for a set of generations,
+  each generation is scored with sentence-BLEU against ALL THE OTHERS as
+  references, and the scores are averaged. High self-BLEU = the generations
+  resemble each other = low diversity. This REUSES the corpus-BLEU machinery
+  above (one generation = candidate, every other = a reference): because
+  CorpusBLEU here is single-reference (v1), each candidate is scored against
+  every other generation separately and the per-candidate BLEU is the MEAN
+  over those single-reference BLEUs (the multi-reference clip is a documented
+  v1 simplification). Needs at least two generations.
+
+Both BLEU/ROUGE metrics expose a dual API: integer TOKEN-ID arrays
 (TNeuralIntegerArray, e.g. straight out of Dict.Tokenize) and a string
 convenience overload that whitespace-tokenizes (case-sensitive; words are
 mapped to ids through a vocabulary shared between candidate and
@@ -255,6 +281,28 @@ function ChrFpp(const Hypothesis, Reference: string;
 function CorpusChrF(const Hypotheses, References: array of string;
   CharOrder: integer = 6; Beta: TNeuralFloat = 2.0;
   WordOrder: integer = 0; IncludeWhitespace: boolean = false): TNeuralFloat;
+
+// distinct-n (Li et al. 2016): distinct n-grams / total n-grams of one
+// generation. Returns 0 when the generation has fewer than N tokens.
+function DistinctN(const Tokens: TNeuralIntegerArray; N: integer): TNeuralFloat; overload;
+function DistinctN(const Text: string; N: integer): TNeuralFloat; overload;
+
+// repetition rate = 1 - distinct-n (fraction of n-gram occurrences that
+// repeat an already-seen type); 0 for a generation shorter than N tokens.
+function RepetitionRate(const Tokens: TNeuralIntegerArray; N: integer): TNeuralFloat; overload;
+function RepetitionRate(const Text: string; N: integer): TNeuralFloat; overload;
+
+// Convenience rep-1 (repeated-token rate = 1 - distinct-1).
+function RepeatedTokenRate(const Tokens: TNeuralIntegerArray): TNeuralFloat; overload;
+function RepeatedTokenRate(const Text: string): TNeuralFloat; overload;
+
+// self-BLEU (Zhu et al. 2018): mean sentence-BLEU of each generation against
+// the OTHER generations (diversity / mode-collapse signal). Reuses CorpusBLEU.
+// Needs >= 2 generations; returns 0 otherwise.
+function SelfBLEU(const Generations: array of TNeuralIntegerArray;
+  MaxN: integer = 4; Smooth: boolean = true): TNeuralFloat; overload;
+function SelfBLEU(const Generations: array of string;
+  MaxN: integer = 4; Smooth: boolean = true): TNeuralFloat; overload;
 
 implementation
 
@@ -1071,6 +1119,130 @@ begin
     Result := Result + ChrF(Hypotheses[PairIdx], References[PairIdx],
       CharOrder, Beta, WordOrder, IncludeWhitespace);
   Result := Result / Length(Hypotheses);
+end;
+
+// ---------------------------------------------------------------------------
+// Degeneration / generation-quality metrics
+// ---------------------------------------------------------------------------
+
+function DistinctN(const Tokens: TNeuralIntegerArray; N: integer): TNeuralFloat;
+var
+  Counts: TStringList;
+  Total: integer;
+begin
+  Result := 0;
+  if N < 1 then Exit;
+  Total := Length(Tokens) - N + 1;
+  if Total <= 0 then Exit;
+  Counts := CountNGrams(Tokens, N); // sorted "ngram -> count" map
+  try
+    // distinct = number of TYPES (one StringList entry per distinct n-gram).
+    Result := Counts.Count / Total;
+  finally
+    Counts.Free;
+  end;
+end;
+
+function DistinctN(const Text: string; N: integer): TNeuralFloat;
+var
+  Vocab: TStringList;
+  Ids: TNeuralIntegerArray;
+begin
+  Vocab := TStringList.Create();
+  Vocab.Sorted := true;
+  Vocab.CaseSensitive := true;
+  try
+    TokenizeWithVocab(Text, Vocab, Ids);
+    Result := DistinctN(Ids, N);
+  finally
+    Vocab.Free;
+  end;
+end;
+
+function RepetitionRate(const Tokens: TNeuralIntegerArray; N: integer): TNeuralFloat;
+begin
+  if Length(Tokens) - N + 1 <= 0 then Result := 0
+  else Result := 1.0 - DistinctN(Tokens, N);
+end;
+
+function RepetitionRate(const Text: string; N: integer): TNeuralFloat;
+var
+  Vocab: TStringList;
+  Ids: TNeuralIntegerArray;
+begin
+  Vocab := TStringList.Create();
+  Vocab.Sorted := true;
+  Vocab.CaseSensitive := true;
+  try
+    TokenizeWithVocab(Text, Vocab, Ids);
+    Result := RepetitionRate(Ids, N);
+  finally
+    Vocab.Free;
+  end;
+end;
+
+function RepeatedTokenRate(const Tokens: TNeuralIntegerArray): TNeuralFloat;
+begin
+  Result := RepetitionRate(Tokens, 1);
+end;
+
+function RepeatedTokenRate(const Text: string): TNeuralFloat;
+begin
+  Result := RepetitionRate(Text, 1);
+end;
+
+function SelfBLEU(const Generations: array of TNeuralIntegerArray;
+  MaxN: integer = 4; Smooth: boolean = true): TNeuralFloat;
+var
+  I, J, NumOthers: integer;
+  PerCand, OtherBleu: TNeuralFloat;
+  Cand, Ref: array of TNeuralIntegerArray;
+begin
+  Result := 0;
+  if Length(Generations) < 2 then Exit; // need at least one "other" reference
+  SetLength(Cand, 1);
+  SetLength(Ref, 1);
+  for I := 0 to High(Generations) do
+  begin
+    // Mean single-reference BLEU of generation I against every OTHER one
+    // (v1: CorpusBLEU is single-reference, so average instead of multi-ref
+    // clipping - documented in the unit header).
+    PerCand := 0;
+    NumOthers := 0;
+    Cand[0] := Generations[I];
+    for J := 0 to High(Generations) do
+    begin
+      if J = I then continue;
+      Ref[0] := Generations[J];
+      OtherBleu := CorpusBLEU(Cand, Ref, MaxN, Smooth);
+      PerCand := PerCand + OtherBleu;
+      Inc(NumOthers);
+    end;
+    if NumOthers > 0 then Result := Result + PerCand / NumOthers;
+  end;
+  Result := Result / Length(Generations);
+end;
+
+function SelfBLEU(const Generations: array of string;
+  MaxN: integer = 4; Smooth: boolean = true): TNeuralFloat;
+var
+  Vocab: TStringList;
+  Ids: array of TNeuralIntegerArray;
+  I: integer;
+begin
+  Result := 0;
+  if Length(Generations) < 2 then Exit;
+  Vocab := TStringList.Create();
+  Vocab.Sorted := true;
+  Vocab.CaseSensitive := true;
+  try
+    SetLength(Ids, Length(Generations));
+    for I := 0 to High(Generations) do
+      TokenizeWithVocab(Generations[I], Vocab, Ids[I]);
+    Result := SelfBLEU(Ids, MaxN, Smooth);
+  finally
+    Vocab.Free;
+  end;
 end;
 
 end.

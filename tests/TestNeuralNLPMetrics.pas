@@ -92,6 +92,14 @@ type
     procedure TestChrFWhitespaceStripped;
     // CorpusChrF is the macro average of the per-pair scores.
     procedure TestCorpusChrFAverages;
+    // distinct-n and repetition-rate on hand-computable fixtures
+    // ("a a a a" -> distinct-1 = 1/4, repetition-1 = 3/4).
+    procedure TestDistinctNAndRepetition;
+    // distinct-n dual API (token-id vs whitespace string) agrees.
+    procedure TestDistinctNTokenAndStringAPIsAgree;
+    // self-BLEU: identical generations -> 1.0; reuses CorpusBLEU and equals
+    // the hand-computed mean of pairwise BLEUs.
+    procedure TestSelfBLEU;
   end;
 
 implementation
@@ -700,6 +708,69 @@ begin
   P2 := ChrF('the cat', 'the cat'); // identical -> 1.0
   AssertEquals('corpus chrF is the macro average', (P1 + P2) / 2.0,
     CorpusChrF(['abc', 'the cat'], ['abd', 'the cat']), 1e-5);
+end;
+
+procedure TTestNeuralNLPMetrics.TestDistinctNAndRepetition;
+begin
+  // "a a a a": 4 unigrams, 1 distinct -> distinct-1 = 1/4, repetition = 3/4.
+  AssertEquals('distinct-1 of "a a a a"', 1.0 / 4.0, DistinctN('a a a a', 1), 1e-9);
+  AssertEquals('repetition-1 of "a a a a"', 3.0 / 4.0,
+    RepetitionRate('a a a a', 1), 1e-9);
+  AssertEquals('repeated-token-rate alias', 3.0 / 4.0,
+    RepeatedTokenRate('a a a a'), 1e-9);
+  // "a a a a": 3 bigrams ("a a" x3), 1 distinct -> distinct-2 = 1/3.
+  AssertEquals('distinct-2 of "a a a a"', 1.0 / 3.0, DistinctN('a a a a', 2), 1e-9);
+  // All-distinct generation -> distinct-1 = 1, repetition = 0.
+  AssertEquals('distinct-1 of "a b c d"', 1.0, DistinctN('a b c d', 1), 1e-9);
+  AssertEquals('repetition-1 of "a b c d"', 0.0,
+    RepetitionRate('a b c d', 1), 1e-9);
+  // "the cat the dog the": 5 unigrams, 3 distinct (the,cat,dog) -> 3/5.
+  AssertEquals('distinct-1 of repeated-"the"', 3.0 / 5.0,
+    DistinctN('the cat the dog the', 1), 1e-9);
+  // Fewer than N tokens -> 0 (no n-grams to count).
+  AssertEquals('distinct-2 of a single token', 0.0, DistinctN('a', 2), 1e-9);
+  AssertEquals('repetition-2 of a single token', 0.0,
+    RepetitionRate('a', 2), 1e-9);
+end;
+
+procedure TTestNeuralNLPMetrics.TestDistinctNTokenAndStringAPIsAgree;
+var
+  Ids: TNeuralIntegerArray;
+begin
+  // "a a a a" -> ids [0,0,0,0]; both APIs must agree.
+  Ids := TNeuralIntegerArray.Create(0, 0, 0, 0);
+  AssertEquals('token/string distinct-1 agree', DistinctN('a a a a', 1),
+    DistinctN(Ids, 1), 1e-9);
+  AssertEquals('token/string distinct-2 agree', DistinctN('a a a a', 2),
+    DistinctN(Ids, 2), 1e-9);
+end;
+
+procedure TTestNeuralNLPMetrics.TestSelfBLEU;
+var
+  Gens: array of TNeuralIntegerArray;
+  Expected: TNeuralFloat;
+begin
+  // Three IDENTICAL generations: every candidate-vs-other BLEU is 1.0, so
+  // self-BLEU = 1.0 (maximal redundancy / zero diversity).
+  AssertEquals('self-BLEU of identical generations',
+    1.0, SelfBLEU(['a b c a', 'a b c a', 'a b c a'], 4, true), 1e-9);
+  // Two generations: self-BLEU is symmetric, = mean of the two single-ref
+  // BLEUs, which here equals CorpusBLEU(one vs the other) both directions.
+  // Hand-anchor against the reused CorpusBLEU machinery directly.
+  Expected := (CorpusBLEU(['the cat sat'], ['the cat ran'], 4, true) +
+               CorpusBLEU(['the cat ran'], ['the cat sat'], 4, true)) / 2.0;
+  AssertEquals('self-BLEU reuses CorpusBLEU (two generations)',
+    Expected, SelfBLEU(['the cat sat', 'the cat ran'], 4, true), 1e-9);
+  // Token-id and string overloads agree on the same content.
+  SetLength(Gens, 2);
+  Gens[0] := TNeuralIntegerArray.Create(0, 1, 2); // 'the cat sat'
+  Gens[1] := TNeuralIntegerArray.Create(0, 1, 3); // 'the cat ran'
+  AssertEquals('token/string self-BLEU agree',
+    SelfBLEU(['the cat sat', 'the cat ran'], 4, true),
+    SelfBLEU(Gens, 4, true), 1e-9);
+  // Fewer than two generations -> 0 (nothing to compare against).
+  AssertEquals('self-BLEU of a single generation is 0',
+    0.0, SelfBLEU(['a b c'], 4, true), 1e-9);
 end;
 
 initialization

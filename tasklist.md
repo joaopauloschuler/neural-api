@@ -92,6 +92,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] Import NFC tokenizer
 - [X] Falcon importer (model_type "falcon" / "RefinedWeb" / "RefinedWebModel",
       e.g. tiiuae/falcon-7b or the tiny falcon-rw-1b sibling): a canonical open
       decoder family with a genuinely DISTINCT recipe not covered by any landed
@@ -579,9 +580,12 @@ rather than acted on.
       API was built for. Follow-ups: batch candidates sharing
       a context prefix; optional last-window scoring for over-context
       sequences (v1 raises).
-- [ ] Generation-quality / degeneration metrics in neuralnlpmetrics.pas:
+- [X] Generation-quality / degeneration metrics in neuralnlpmetrics.pas:
       distinct-n (Li et al. 2016), self-BLEU (reuses the landed
       CorpusBLEU), and repetition rate — the standard degeneration suite.
+      DistinctN/RepetitionRate(=1-distinct-n)/RepeatedTokenRate/SelfBLEU
+      (dual token-id+string APIs); self-BLEU averages single-ref CorpusBLEU
+      of each generation vs every other (multi-ref clip deferred, v1).
       The contrastive-search and sampling tasks elsewhere in this list
       have no way to demonstrate their benefit without these. Pinned
       hand-computable fixtures (e.g. "a a a a" distinct-1 = 1/4).
