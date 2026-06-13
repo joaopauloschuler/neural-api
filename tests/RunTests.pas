@@ -13,7 +13,7 @@ uses
   TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical,
   TestNeuralScheduler, TestNeuralDecode, TestNeuralPretrained,
   TestNeuralDPO, TestNeuralNLPMetrics, TestNeuralPacking,
-  TestNeuralHFTokenizer, TestNeuralHFHub;
+  TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy;
 
 type
   TMyTestRunner = class(TTestRunner)

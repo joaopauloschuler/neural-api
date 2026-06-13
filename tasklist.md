@@ -432,7 +432,7 @@ rather than acted on.
       destination layer — or straight into the landed int8 storage —
       keeping only one tensor-sized scratch buffer. Assert peak RSS during import
       stays within tensor-size + model-size on the parity fixture.
-- [ ] NumPy .npy/.npz reader + writer: the universal interchange escape
+- [X] NumPy .npy/.npz reader + writer: the universal interchange escape
       hatch — ANY framework can np.savez(**state_dict), and the format is
       trivial (magic + header dict + raw bytes; npz is a zip of npy).
       Reader gives a generic named-tensor import path for frameworks with
@@ -440,6 +440,17 @@ rather than acted on.
       tests (dump Pascal tensors, compare in Python), complementing the
       landed safetensors writer. Support F32/F64/F16 + int dtypes, C-order only, reject
       Fortran-order/pickled-object arrays explicitly.
+      LANDED: neural/neuralnumpy.pas (LoadVolumeFromNpy/SaveVolumeToNpy +
+      TNNetNpzReader/TNNetNpzWriter), EncodeF16 here / DecodeF16 reused from
+      neuralsafetensors. .npy v1/2/3 headers; dtypes f4/f8/f2, i1/i2/i4/i8,
+      u1/u2/u4/u8, b1; big-endian/Fortran-order/object dtypes rejected. .npz
+      reader handles STORED + DEFLATE (paszlib/zstream); WRITER is STORED-only
+      (np.savez parity; np.savez_compressed not emitted). tests/TestNeuralNumpy
+      + bidirectional numpy cross-check (tools/numpy_crosscheck_fixture.py,
+      tiny committed fixtures). 1-D/2-D map naturally to volume dims; 3-D+ load
+      flat (caller reshapes from the returned numpy shape).
+      - [ ] follow-up: DEFLATE-compressed .npz WRITER (savez_compressed) +
+            zip64 / >4GB archive support (reader currently rejects zip64).
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
       the GPT-Neo route; the published pytorch_model.bin-only checkpoints
