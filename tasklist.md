@@ -87,21 +87,11 @@ rather than acted on.
       denormals inside the layer's FFT so callers don't have to.
 - [ ] ulimit -v 3000000 ChatTerminal /path/to/Qwen2.5-0.5B-Instruct crashes using all RAM at loading the model
       Tested with !git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
-- [X] Compatibility Unicode normalization (NFKC/NFKD) in
-      `neuralhftokenizer.pas` (`AddNormalizer`). `gen_nfc_tables.py` now also
-      emits the compatibility decomposition table
-      (`cNFKCDecompIdx`/`cNFKCDecompPool`, full recursive NFKD expansions);
-      `UnicodeNormalize(S, Compose, Compat)` applies compat folds (ligatures,
-      full/half-width, super/subscripts, fractions, no-break space,
-      circled/parenthesized/roman numerals, ...) BEFORE canonical ordering,
-      then canonical compose for NFKC. `AddNormalizer` stores the real
-      NFKC/NFKD form (no longer folded to NFC/NFD). Tests
-      `TestNFKCFoldsCompatibilityForms` / `TestNFKDFoldsCompatibilityForms` /
-      `TestNFKCNormalizerFoldsTokenIds` pin oracles from Python unicodedata.
-      FOLLOW-UP: the SentencePiece `.model` `precompiled_charsmap` (opaque
-      per-model normalization trie, NOT standard NFKC) is still not
-      parsed/applied — a tokenizer.json that declares a standard NFKC/NFKD
-      normalizer now works in full; only the embedded charsmap is unhandled.
+- [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
+      per-model normalization trie (NOT standard NFKC) is still not
+      parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
+      normalizer already works in full (`UnicodeNormalize` + `AddNormalizer`,
+      landed); only the embedded charsmap is unhandled.
 
 ## Infrastructure / dev experience
 
@@ -566,111 +556,19 @@ rather than acted on.
       task above; report duplicate-cluster stats. Test: planted
       near-duplicates (one-word edits) are found, distinct documents are
       not merged.
-- [X] Text-embedding / retrieval inference + eval harness for the E5 / BGE /
-      GTE retriever family on top of the landed encoder importers (BERT /
-      ModernBERT, and the decoder-as-encoder last-token path for the
-      Qwen2/Mistral-based e5-mistral / gte-Qwen2 retrievers). Today the repo
-      can IMPORT these backbones and has BertPoolSentenceEmbedding (mean-pool +
-      L2-normalize), but it cannot reproduce a published embedding model
-      because two pieces are missing, and there is NO embedding-quality metric
-      anywhere (no STS / retrieval eval): (a) a pooling-mode selector — CLS
-      (BGE), mean (E5/GTE), and last-token (e5-mistral, with the EOS/left-pad
-      convention) — exposed as an EmbedText/EmbedBatch helper that wraps the
-      forward pass + pooling + optional L2-normalize, generalizing the
-      mean-only BertPoolSentenceEmbedding; (b) the model-specific INSTRUCTION
-      PREFIXES that change the vector and are mandatory for parity — E5's
-      "query: "/"passage: ", BGE's "Represent this sentence for searching
-      relevant passages: " query instruction, and the gte-Qwen2 "Instruct:
-      ...\nQuery: " template — as a small per-family prefix table the helper
-      prepends. The genuinely new, reusable deliverable is the EVAL HARNESS
-      that none of the landed embedding examples (ArcFace/Matryoshka/Triplet/
-      Cosine-siamese all TRAIN embeddings, none score a pretrained one)
-      provide: an STS report (cosine similarity vs gold scores → Spearman/
-      Pearson rho over a tiny bundled STS-B slice) and a small retrieval report
-      (recall@k + nDCG@10 over a planted query/passage set), both as
-      introspection-style reports reusable across importers. Deliverables: the
-      EmbedText/EmbedBatch + pooling-mode + prefix-table helper in
-      neuralpretrained.pas, a STSReport/RetrievalReport pair, a pico parity
-      fixture (make_pico_*_fixture.py recipe) asserting the pooled+normalized
-      query/passage vectors of one E5-or-BGE checkpoint match HF
-      sentence-transformers float64 within 1e-4, and an examples/SemanticSearch
-      demo that embeds a handful of passages and ranks them against a query on
-      CPU. Turns the broad encoder-import coverage into a usable RAG retriever
-      and is the missing measurement half for the existing embedding-training
-      examples.
-      LANDED (a3): (a) pooling-mode selector TNNetEmbedPooling
-      (epCLS/epMean/epLastToken) + PoolSentenceEmbedding helper (wraps
-      pooling + optional L2-normalize, delegates to BertPoolSentenceEmbedding
-      on the mean+normalize path); (b) instruction-prefix table
-      TNNetEmbedInstruction (efNone/efE5/efBGE/efGteQwen2) +
-      EmbedInstructionPrefix/ApplyEmbedInstruction; the genuinely new
-      reusable metrics — CosineSimilarity, PearsonCorrelation,
-      SpearmanCorrelation (average-tie ranks), STSReport (Pearson + Spearman
-      vs gold) and RetrievalReport (Recall@k + nDCG@10 over a planted
-      query/passage set), all in neuralpretrained.pas. Unit tests in
-      TestNeuralPretrained.pas: TestPoolSentenceEmbeddingModes,
-      TestEmbedInstructionPrefixTable, TestPearsonAndSpearmanCorrelation,
-      TestSTSReport, TestRetrievalReport (synthetic vectors with pinned
-      metric values).
-      LANDED (a3, deferred half): the pico parity fixture
-      (tools/e5_embed_tiny_fixture.py — a SYNTHESIZED pico BertModel, the E5
-      forward is identical at any width) + tests/fixtures/tiny_e5.* with a HF
-      float64 oracle (mean-pool + L2-normalize, the prefix baked into the
-      token ids); TestE5EmbeddingParity in TestNeuralPretrained.pas asserts
-      the imported pooled+normalized query AND passage vectors match within
-      1e-4 (sentence-transformers NOT required — for E5/BGE its
-      SentenceTransformer is exactly AutoModel forward -> mean/CLS pool -> L2
-      normalize in float64). examples/EmbeddingSearch (self-contained sibling
-      of examples/SemanticSearch) wires the pooling-mode selector +
-      instruction-prefix table through a CPU-fast (<1s, no download) ranking
-      demo on the committed fixture. NOTHING MEANINGFUL REMAINS.
-
-- [X] ColBERT-style LATE-INTERACTION retrieval import + scorer (the third and
-      missing RAG retrieval paradigm in the repo). The bi-encoder path is landed
-      (single pooled vector + cosine, the embedding/STS/Retrieval harness above)
-      and the cross-encoder path is landed (joint [CLS] query[SEP]passage scorer,
-      examples/DebertaReranker on BuildDebertaV2FromSafeTensorsEx) — ColBERT sits
-      between them and is genuinely DIFFERENT from both: it keeps the PER-TOKEN
-      contextual embeddings of query and document (no pooling), projects each
-      token to a small dim (typically 128) + L2-normalizes, and scores a (query,
-      doc) pair by the MaxSim late-interaction sum
-      `score = sum_{q in query} max_{d in doc} <E_q, E_d>` — every query token
-      matched to its best document token, then summed. This is the accuracy of a
-      cross-encoder at near the cost of a bi-encoder (docs are pre-encoded once),
-      so it is a distinct and widely-used RAG retriever, not a near-duplicate of
-      either landed path. Nearly everything exists: the backbone is the stock
-      BERT path (BuildBertFromSafeTensors) and the tokenizer/Unigram/WordPiece
-      loaders are landed; the genuinely new pieces are (a) a thin import
-      EXTENSION that loads the ColBERT `linear` projection head (the
-      [hidden -> 128] dense, no bias) sitting on top of the encoder and the
-      query/doc marker-token convention ([Q]/[D] prepended, query padded with
-      [MASK] for augmentation), (b) an `EmbedTokens` helper returning the
-      per-token L2-normalized projected matrix (skipping the pooling step the
-      bi-encoder helper forces) for both query and document, and (c) a
-      `ColBERTMaxSimScore(queryMat, docMat)` scorer + a `ColBERTRetrievalReport`
-      (Recall@k + nDCG@10 over a planted query/passage set, mirroring the landed
-      RetrievalReport but driven by MaxSim instead of cosine), all in
-      neuralpretrained.pas. Deliverables: BuildColBERTFromSafeTensors[Ex] (BERT
-      backbone + projection head), the EmbedTokens + ColBERTMaxSimScore +
-      ColBERTRetrievalReport helpers, a pico parity fixture
-      (make_pico_*_fixture.py recipe) asserting the per-token projected+normalized
-      query/doc matrices AND the MaxSim score of one colbert-ir/colbertv2.0-class
-      checkpoint match HF float64 within 1e-4, and an examples/ColBERTSearch demo
-      that pre-encodes a handful of passages, scores a query by MaxSim, and ranks
-      them on CPU. Completes the bi-encoder / cross-encoder / late-interaction
-      retrieval trio and turns the broad encoder-import coverage into a
-      state-of-the-art RAG retriever.
-      ColBERT follow-ups (the core import + MaxSim scorer + report + parity
-      fixture + examples/ColBERTSearch all LANDED a3, commit 442af2c): (a)
-      attention-padding-mask support so a document shorter than the net's SeqLen
-      is encoded exactly — today real tokens attend to the [PAD] rows (the same
-      approximation examples/SemanticSearch documents); this also unblocks
-      faithful batch-encoding of mixed-length docs in one net; (b) a library-side
-      end-to-end "encode corpus -> cache doc matrices -> score query" helper in
-      neuralpretrained.pas (today only the examples/ColBERTSearch demo wires this;
-      ColBERTEmbedTokens + ColBERTMaxSimScore exist but the caching loop lives in
-      the example); (c) pQuantizeInt8 for the ColBERT path — the projection head
-      is always f32 while the BERT backbone already supports int8.
+- [ ] ColBERT late-interaction retrieval follow-ups (core import +
+      BuildColBERTFromSafeTensors[Ex] + MaxSim scorer + ColBERTRetrievalReport
+      + parity fixture + examples/ColBERTSearch all LANDED a3, commit 442af2c):
+      (a) attention-padding-mask support so a document shorter than the net's
+      SeqLen is encoded exactly — today real tokens attend to the [PAD] rows
+      (the same approximation examples/SemanticSearch documents); this also
+      unblocks faithful batch-encoding of mixed-length docs in one net; (b) a
+      library-side end-to-end "encode corpus -> cache doc matrices -> score
+      query" helper in neuralpretrained.pas (today only the examples/ColBERTSearch
+      demo wires this; ColBERTEmbedTokens + ColBERTMaxSimScore exist but the
+      caching loop lives in the example); (c) pQuantizeInt8 for the ColBERT path
+      — the projection head is always f32 while the BERT backbone already
+      supports int8.
 
 ## Layer follow-ups that fix real limitations
 
