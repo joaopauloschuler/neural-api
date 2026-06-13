@@ -99,6 +99,32 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] IBM Granite 3.x importer (`BuildGraniteFromSafeTensors[Ex]`, model_type
+      `granite`/`granitemoe`) — genuinely DISTINCT from the landed Llama path,
+      NOT a near-duplicate. Granite keeps Llama's RMSNorm + RoPE + SwiGLU
+      attention block but multiplies four scalar knobs that Llama lacks and
+      that materially change the forward pass: `embedding_multiplier` (scale
+      token embeddings after lookup), `residual_multiplier` (scale each
+      attention/FFN sublayer output BEFORE the residual add — a per-block
+      gain, not LayerScale weights), `attention_multiplier` (replaces the
+      default `1/sqrt(head_dim)` SDPA scale — wire through the existing SDPA
+      `Scale`/FStruct slot, do NOT hardcode), and `logits_scaling` (divide
+      final logits by this before softmax — fold into the output projection
+      like the Cohere `logit_scale` fold already does). Reuse
+      LoadLlamaHeadRMSNormWeights / SwiGLU up|gate packing / rotate_half q/k
+      permutation unchanged; the only new code is the four multipliers (three
+      are constant-scale folds into existing weights at load time, so no new
+      layer types needed — fold embedding_multiplier into the embedding
+      weights, residual_multiplier into each sublayer's output projection,
+      logits_scaling into the LM head). `granitemoe` swaps the FFN for the
+      Mixtral-style MoE block already imported by BuildMixtralFromSafeTensors,
+      so the MoE variant is mostly config plumbing. Add a pico fixture via the
+      existing make_pico_*_fixture.py recipe and a parity check against HF
+      `transformers` GraniteForCausalLM in venv x. Value: Granite 3.x is a
+      widely-deployed enterprise/code model family and the multiplier knobs
+      are exactly the kind of silent-wrong-output trap (logits off by a
+      constant factor → wrong sampling temperature behaviour) that a tested
+      importer prevents.
 - [X] Extractive question-answering (SQuAD) head import + EM/F1 eval — the
       missing classic downstream-task head on top of the landed encoder
       importers. Today only TWO task heads exist
