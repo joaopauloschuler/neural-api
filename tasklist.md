@@ -93,7 +93,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Qwen3-MoE importer (BuildQwen3MoeFromSafeTensors[Ex], model_type
+- [X] Qwen3-MoE importer (BuildQwen3MoeFromSafeTensors[Ex], model_type
       "qwen3_moe", e.g. Qwen/Qwen3-30B-A3B and the smaller Qwen3-MoE chat
       checkpoints). This is NOT a near-duplicate of any landed importer: it
       is the missing CROSS of two paths we already have but never combined.

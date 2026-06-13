@@ -149,6 +149,7 @@ type
     procedure TestMistralLogitParity;
     procedure TestQwen2LogitParity;
     procedure TestQwen3LogitParity;
+    procedure TestQwen3MoeLogitParity;
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
@@ -4261,6 +4262,84 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_mixtral_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Qwen3-MoE import target (HF model_type "qwen3_moe",
+// architectures ["Qwen3MoeForCausalLM"], the Qwen/Qwen3-30B-A3B family):
+// tests/fixtures/tiny_qwen3_moe.* is a pico randomly-initialized
+// Qwen3MoeForCausalLM (2 layers, hidden 8, DECOUPLED head_dim 6, 4 experts /
+// top-2, 1 kv head < 2 query heads, NARROWER moe_intermediate_size 5 != dense
+// 12, untied head). It is the CROSS of two landed paths: the dense-Qwen3
+// attention VERBATIM (per-head q/k RMSNorm BEFORE RoPE + GQA) and the
+// Mixtral-style sparse MoE FFN (router mlp.gate.weight -> per-token softmax ->
+// top-k gate with the survivors RENORMALIZED, norm_topk_prob=true; NO shared
+// expert, NO bias - the distinction from DeepSeek-V2). The generator
+// tools/qwen3_moe_tiny_fixture.py ASSERTS BOTH knobs are non-vacuous
+// (resetting the q/k-norm gains to ones moves the logits by 1.30; dropping
+// the top-k renorm moves them by 0.44). Reference logits computed by HF in
+// float64. The BuildFromPretrained model_type "qwen3_moe" dispatch is checked
+// too.
+procedure TTestNeuralPretrained.TestQwen3MoeLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, GateCnt, SoftMaxCnt, SwiGLUCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildQwen3MoeFromSafeTensorsEx(
+    FixturePath('tiny_qwen3_moe.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_qwen3_moe_config.json'));
+  try
+    AssertEquals('model_type', 'qwen3_moe', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('head_dim', 6, Config.HeadDim);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertTrue('qk_norm', Config.QKNorm);
+    AssertTrue('is_moe', Config.IsMoE);
+    AssertTrue('qwen3 expert naming', Config.MoEQwen3Naming);
+    AssertTrue('renorm top-k', Config.MoENormTopK);
+    AssertEquals('num_experts', 4, Config.NumLocalExperts);
+    AssertEquals('num_experts_per_tok', 2, Config.MoEExpertsPerTok);
+    AssertEquals('moe_intermediate_size', 5, Config.MoEIntermediateSize);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    // Structure: one router (TNNetTopKGate + its PER-TOKEN PointwiseSoftMax)
+    // per block, one SwiGLU per expert per block (no dense MLP SwiGLU).
+    GateCnt := 0;
+    SoftMaxCnt := 0;
+    SwiGLUCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetPointwiseSoftMax then
+        Inc(SoftMaxCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
+    end;
+    AssertEquals('one top-k router gate per block', Config.NumLayers, GateCnt);
+    AssertEquals('one per-token router softmax per block',
+      Config.NumLayers, SoftMaxCnt);
+    AssertEquals('one SwiGLU per expert per block',
+      Config.NumLocalExperts * Config.NumLayers, SwiGLUCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_moe_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "qwen3_moe" (architectures ["Qwen3MoeForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_qwen3_moe.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_qwen3_moe_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_moe_logits.json'), 16, 13);
   finally
     NN.Free;
   end;
