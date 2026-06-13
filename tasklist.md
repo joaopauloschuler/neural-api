@@ -92,23 +92,44 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] OLMo-2 importer (model_type "olmo2", e.g. allenai/OLMo-2-0425-1B —
-      the fully-open weights+data+code family): rides the Llama tensor
-      layout (SwiGLU, RoPE, no biases) but needs TWO deltas the
-      BuildLlamaFromSafeTensorsWithConfig path cannot express today:
-      (a) REORDERED post-norm — RMSNorm is applied to the SUBLAYER OUTPUT
-      before the residual add (x + Norm(Attn(x)), keys
-      post_attention_layernorm / post_feedforward_layernorm; there is NO
-      input_layernorm), i.e. a third placement beside the existing
-      AddPreNorm/AddPostNorm conventions; (b) QK-norm over the FULL
-      flattened q/k projection width BEFORE head-split + RoPE — distinct
-      from the landed Qwen3/Gemma-3 PER-HEAD placement, so
-      LoadLlamaHeadRMSNormWeights does not apply as-is. Deliverables:
-      BuildOlmo2FromSafeTensors[Ex] on the Llama config plumbing, pico
-      parity fixture via the make_pico_*_fixture.py recipe (HF float64
-      next-token logits), tokenizer is stock GPT-NeoX-style BPE
-      tokenizer.json (already supported). Verify the 1B checkpoint
-      end-to-end like pythia-70m was.
+- [X] OLMo-2 importer (model_type "olmo2", e.g. allenai/OLMo-2-0425-1B):
+      reordered post-norm (x + Norm(Attn(x)), no input_layernorm) + QK-norm
+      over the FULL flattened q/k projection width before head-split + RoPE.
+      LANDED: BuildOlmo2FromSafeTensors[Ex] on the Llama config plumbing
+      (PostNormReordered + QKNormFullWidth TLlamaConfig flags,
+      LoadLlamaFullWidthQKNormWeights rotate_half-permuted gain loader),
+      TNNet.AddOutputNormResidual builder (y = x + Norm(Sublayer(x))),
+      BuildFromPretrained "olmo2" dispatch, tools/olmo2_tiny_fixture.py pico
+      fixture (HF float64 oracle; both deltas asserted non-vacuous) +
+      TestOlmo2LogitParity (max |logit diff| 3.2e-8); OLMo-2-0425-1B
+      verified end-to-end (int8 + inference-only): coherent greedy
+      continuation from a real prompt.
+- [ ] Mixtral / sparse-MoE importer (model_type "mixtral", e.g.
+      mistralai/Mixtral-8x7B-v0.1, or a small sibling like OLMoE/Qwen-MoE
+      that shares the recipe): the CANONICAL open sparse-MoE — a stock
+      Mistral/Llama decoder where every FFN is replaced by `block_sparse_moe`
+      = a `gate` linear (num_local_experts logits) + N independent SwiGLU
+      experts (`experts.{i}.w1/w2/w3`), softmax over ALL experts then top-k
+      (num_experts_per_tok=2) routing, output = sum of the selected experts'
+      outputs weighted by RENORMALIZED top-k softmax probs (HF normalizes the
+      top-k subset — distinct from DeepSeek-V2's raw-weight norm_topk_prob=false
+      path). This is genuinely distinct from the landed
+      BuildDeepSeekV2FromSafeTensors (which is MLA + FINE-GRAINED shared-expert
+      MoE with a bias-balanced gate); Mixtral is full MHA/GQA + standard
+      top-2 routing, NO shared expert, NO MLA — the single most-imported open
+      MoE and the one most users actually reach for. The repo is well
+      positioned: the AddTopKMixtureOfExperts / TNNetTopKGate machinery, the
+      SwiGLU expert MLP packing (up|gate), and the entire Llama attention/RoPE
+      path are all landed; the genuinely new pieces are (a) mapping
+      `gate.weight` + the per-expert `w1/w2/w3` slabs onto the existing MoE
+      block with pRenormalize=true and (b) wiring sliding_window (Mistral) and
+      GQA head counts through. Deliverables: BuildMixtralFromSafeTensors[Ex]
+      on the Llama config plumbing (multi-shard index.json support — the
+      real checkpoints are sharded), a tools/mixtral_tiny_fixture.py pico
+      fixture (tiny random Mixtral config, e.g. 4 experts/top-2, asserting
+      router probs AND next-token logits vs an HF float64 oracle), and a
+      BuildFromPretrained "mixtral" dispatch. Unlocks the whole Mixtral/MoE
+      family without the MLA complexity DeepSeek-V2 carries.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
