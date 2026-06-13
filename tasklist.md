@@ -110,6 +110,32 @@ rather than acted on.
       (tools/make_pico_*_fixture.py recipe, [[pico-import-fixtures]]) and
       logits parity against transformers in venv x. High value: GLM-4 is a
       widely-used open bilingual model family with no current import path.
+- [ ] Qwen3-MoE importer (BuildQwen3MoeFromSafeTensors[Ex], model_type
+      "qwen3_moe", e.g. Qwen/Qwen3-30B-A3B and the smaller Qwen3-MoE chat
+      checkpoints). This is NOT a near-duplicate of any landed importer: it
+      is the missing CROSS of two paths we already have but never combined.
+      The attention side is the dense Qwen3 path verbatim — per-head
+      TokenRMSNorm on q and k BEFORE RoPE via LoadLlamaHeadRMSNormWeights +
+      GQA ([[qwen3-importer-qknorm]]) — which Mixtral does NOT have (Mixtral
+      is plain Llama-attention MoE), and the FFN side is a sparse top-k
+      Mixture-of-Experts (config num_experts / num_experts_per_tok /
+      moe_intermediate_size, a router gate.weight per layer feeding
+      SwiGLU experts), which the dense Qwen3 importer does NOT have. It is
+      also distinct from DeepSeek-V2/[[deepseek-v2-importer]] (which pairs MoE
+      with MLA latent attention and shared experts, not GQA + QK-norm). Reuse
+      the landed AddTopKMixtureOfExperts / TNNetTopKGate wiring
+      ([[topk-moe-routing]]) exactly as the Mixtral importer
+      (BuildMixtralFromSafeTensors) already does for expert weight loading and
+      router-logit softmax-then-renormalize, only swapping the attention
+      block for the Qwen3 QK-norm+GQA builder; note Qwen3-MoE has NO shared
+      expert and NO per-expert/router bias (norm_topk_prob renormalizes the
+      top-k gates). Verify against a pico fixture sliced down to 2 layers /
+      4 experts / top-2 (tools/make_pico_*_fixture.py recipe,
+      [[pico-import-fixtures]]) with next-token logits parity against
+      transformers in venv x. High value: the Qwen3-MoE family is one of the
+      most widely deployed open sparse-MoE LLMs and currently has no import
+      path, and it lands as almost pure composition of two already-verified
+      subsystems.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
