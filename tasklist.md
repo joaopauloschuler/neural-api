@@ -386,7 +386,7 @@ rather than acted on.
       decode side must skip the K virtual positions when detokenizing.
       Test: base weights bit-unchanged after a training step, soft-prompt
       gradient nonzero, eval forward deterministic.
-- [ ] Token-classification head + entity-level metrics (transformers
+- [X] Token-classification head + entity-level metrics (transformers
       ForTokenClassification + seqeval port): per-token PointwiseConvLinear
       head over the sequence axis plus span-aware precision/recall/F1
       (BIO/IOB2 decoding, entity-level not token-level) in
@@ -395,6 +395,14 @@ rather than acted on.
       neuraltokenizer.pas) — that alignment utility is reusable beyond NER.
       Test: pinned BIO sequences with known entity P/R/F1, including the
       classic boundary-error cases.
+      DONE: TNNet.AddTokenClassificationHead(NumLabels) per-token
+      PointwiseConvLinear head; DecodeBIOEntities + EntityScore +
+      CorpusEntityScore (span exact-match seqeval micro-average) in
+      neuralnlpmetrics.pas; TNeuralHFTokenizer.EncodeWithOffsets offset
+      mapping + word-ids (tokenizer-agnostic post-hoc surface match). Tests:
+      TestNeuralNLPMetrics (BIO decode, perfect/boundary/split/type-mismatch
+      P/R/F1, micro-average), TestNeuralHFTokenizer (offset round-trip +
+      word-id alignment). README + builder reused by Task B.
 - [ ] QA span-extraction head (transformers ForQuestionAnswering port):
       two per-token logit heads (start/end) over the sequence axis +
       SQuAD-style postprocessing (top-k start×end pairs, end>=start, max

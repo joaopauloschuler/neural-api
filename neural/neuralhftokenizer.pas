@@ -91,6 +91,21 @@ type
     Special: boolean;
   end;
 
+  // One emitted token's char span in the ORIGINAL input text. Start is the
+  // 1-based byte index of the first char of the token's surface text; Length
+  // is the byte length. Copy(Text, Start, Length) slices the surface text
+  // back. WordId is the 0-based index of the whitespace-split word the token
+  // belongs to (subword -> word alignment, HF word_ids() equivalent), or -1
+  // for a token with no surface text in the input (e.g. an added/special
+  // token like [CLS]). The HF (start,end) convention is (Start-1, Start-1+Length).
+  TNeuralTokenOffset = record
+    Id: integer;
+    Start: integer;   // 1-based byte offset into the input text
+    Length: integer;  // byte length of the surface text (0 if none)
+    WordId: integer;  // 0-based whitespace word index, or -1
+  end;
+  TNeuralTokenOffsetArray = array of TNeuralTokenOffset;
+
   { TNeuralHFTokenizer }
   // Encoder/decoder for the HuggingFace tokenizer.json fast-tokenizer
   // format (byte-level BPE, metaspace/byte-fallback BPE and BERT
@@ -168,6 +183,18 @@ type
       procedure Encode(const Text: string; Ids: TIntegerList); overload;
       function Encode(const Text: string): TNeuralIntegerArray; overload;
 
+      // Encode + offset mapping (HF return_offsets_mapping + word_ids
+      // equivalent). Returns one TNeuralTokenOffset per emitted token id with
+      // the (Start,Length) char span in Text and the whitespace word index.
+      // Implemented post-hoc and tokenizer-agnostic: every token's surface
+      // text (DecodeToken, leading metaspace/'##' stripped) is greedily matched
+      // forward into Text from the running cursor, skipping intervening
+      // whitespace. A token whose surface is empty or not found at/after the
+      // cursor (added/special tokens, byte-fallback fragments) gets Start=0,
+      // Length=0, WordId=-1. Works for the byte-level BPE, metaspace BPE and
+      // WordPiece paths.
+      function EncodeWithOffsets(const Text: string): TNeuralTokenOffsetArray;
+
       // Token ids -> text. SkipSpecialTokens drops added special tokens
       // (BOS/EOS/...) from the output, like HF decode(skip_special_tokens).
       function Decode(const Ids: array of integer;
@@ -203,7 +230,7 @@ function HFParseJSONRaw(const S: string): TJSONData;
 implementation
 
 uses
-  jsonparser, Math;
+  jsonparser, Math, StrUtils;
 
 const
   csMergeSep = #1;
@@ -1718,6 +1745,84 @@ begin
     Encode(Text, Ids);
     SetLength(Result, Ids.Count);
     for Cnt := 0 to Ids.Count - 1 do Result[Cnt] := Ids[Cnt];
+  finally
+    Ids.Free;
+  end;
+end;
+
+function TNeuralHFTokenizer.EncodeWithOffsets(
+  const Text: string): TNeuralTokenOffsetArray;
+var
+  Ids: TIntegerList;
+  WordOf: array of integer;   // 1-based byte pos -> 0-based word index
+  Cnt, Cursor, TokenIndex, MatchPos, SurfStart, SurfLen: integer;
+  InWord: boolean;
+  WordCnt: integer;
+  Surface: string;
+begin
+  Ids := TIntegerList.Create();
+  try
+    Encode(Text, Ids);
+    SetLength(Result, Ids.Count);
+
+    // Per-byte word index: a word starts at each whitespace -> non-whitespace
+    // transition (whitespace-split words, HF word_ids granularity).
+    SetLength(WordOf, Length(Text) + 1);
+    WordCnt := -1;
+    InWord := false;
+    for Cnt := 1 to Length(Text) do
+    begin
+      if Text[Cnt] in [' ', #9, #10, #13] then
+        InWord := false
+      else
+      begin
+        if not InWord then begin Inc(WordCnt); InWord := true; end;
+      end;
+      if InWord then WordOf[Cnt] := WordCnt else WordOf[Cnt] := -1;
+    end;
+
+    Cursor := 1;
+    for Cnt := 0 to Ids.Count - 1 do
+    begin
+      Result[Cnt].Id := Ids[Cnt];
+      Result[Cnt].Start := 0;
+      Result[Cnt].Length := 0;
+      Result[Cnt].WordId := -1;
+
+      // Added/special tokens have no surface text in the input.
+      if IsAddedTokenId(Ids[Cnt], TokenIndex) then Continue;
+
+      Surface := DecodeToken(Ids[Cnt]);
+      // Strip the WordPiece continuation prefix ('##') so the surface is the
+      // raw substring; metaspace/leading-space surfaces are trimmed below.
+      if FWordPiece and (FWPPrefix <> '') and
+        (Copy(Surface, 1, Length(FWPPrefix)) = FWPPrefix) then
+        Surface := Copy(Surface, Length(FWPPrefix) + 1, MaxInt);
+      // Trim leading whitespace from the surface (byte-level / metaspace tokens
+      // carry the preceding space); we anchor on the first real char.
+      while (Surface <> '') and (Surface[1] in [' ', #9, #10, #13]) do
+        Delete(Surface, 1, 1);
+      if Surface = '' then Continue;
+
+      // Greedy forward match: find Surface at/after Cursor, allowing only
+      // whitespace to be skipped in between.
+      SurfStart := Cursor;
+      while (SurfStart <= Length(Text)) and
+            (Text[SurfStart] in [' ', #9, #10, #13]) do
+        Inc(SurfStart);
+      MatchPos := PosEx(Surface, Text, SurfStart);
+      // Accept only if it lands at the skipped-whitespace anchor (so token
+      // order and char positions stay monotonic); otherwise leave unmapped.
+      if MatchPos = SurfStart then
+      begin
+        SurfLen := Length(Surface);
+        Result[Cnt].Start := MatchPos;
+        Result[Cnt].Length := SurfLen;
+        if (MatchPos >= 1) and (MatchPos <= Length(Text)) then
+          Result[Cnt].WordId := WordOf[MatchPos];
+        Cursor := MatchPos + SurfLen;
+      end;
+    end;
   finally
     Ids.Free;
   end;

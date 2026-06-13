@@ -12098,6 +12098,16 @@ type
       // the trunk depth. Returns the concatenated output layer. (Coded by Claude (AI).)
       function AddMultiTokenPrediction(NumFuture, VocabSize: integer;
         ProjHidden: boolean = false; pActFn: TNNetActivationFunctionClass = nil): TNNetLayer;
+      // TOKEN-CLASSIFICATION head (HF *ForTokenClassification port): a per-token
+      // linear projection of the (SeqLen,1,d_model) hidden state to NumLabels
+      // logits per position, i.e. output (SeqLen,1,NumLabels). The projection is a
+      // token-wise 1x1 conv (TNNetPointwiseConvLinear) so the sequence axis is kept
+      // and each token is classified INDEPENDENTLY (a FullConnect would flatten/mix
+      // tokens). d_model is inferred from the trunk depth. The framework seeds the
+      // per-token cross-entropy gradient at the last layer; for inference, read the
+      // per-position argmax over the NumLabels depth axis (BIO/IOB2 tag id). Returns
+      // the logits layer. (Coded by Claude (AI).)
+      function AddTokenClassificationHead(NumLabels: integer): TNNetLayer;
       procedure AddSingleHeadSelfAttention(out Attended, W: TNNetLayer; NoForward:boolean = false);
       // Single-head SINKHORN attention: a drop-in, DOUBLY-STOCHASTIC contrast to
       // softmax self-attention. Standard attention row-normalizes the scaled QK^T
@@ -48532,6 +48542,16 @@ begin
   // slab [h*VocabSize .. (h+1)*VocabSize-1]. Output (SeqLen,1,NumFuture*VocabSize).
   Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   SetLength(HeadOutputs, 0);
+end;
+
+function TNNet.AddTokenClassificationHead(NumLabels: integer): TNNetLayer;
+begin
+  if NumLabels < 1 then
+    FErrorProc('AddTokenClassificationHead requires NumLabels >= 1. NumLabels=' +
+      IntToStr(NumLabels));
+  // Token-wise 1x1 conv keeps the (SeqLen,1,*) sequence axis: every token gets its
+  // own NumLabels-wide logit vector (a FullConnect would flatten/mix the tokens).
+  Result := AddLayer(TNNetPointwiseConvLinear.Create(NumLabels));
 end;
 
 // Ported code from:

@@ -210,6 +210,28 @@ type
     F1: TNeuralFloat;
   end;
 
+  // One decoded entity span from a BIO/IOB2 tag sequence: the entity TYPE
+  // (the part after the "B-"/"I-" prefix, e.g. 'PER') and the inclusive token
+  // index range [TokenStart..TokenEnd] it covers.
+  TNNetEntitySpan = record
+    EntityType: string;
+    TokenStart: integer;
+    TokenEnd: integer;
+  end;
+  TNNetEntitySpanArray = array of TNNetEntitySpan;
+
+  // seqeval-style entity-level evaluation result (an exact-match span set
+  // comparison: a predicted span counts as correct only when its type AND its
+  // [start..end] range both match a gold span).
+  TNNetEntityScore = record
+    Precision: TNeuralFloat;  // TruePos / (TruePos + FalsePos)
+    Recall: TNeuralFloat;     // TruePos / (TruePos + FalseNeg)
+    F1: TNeuralFloat;         // harmonic mean
+    TruePos: integer;
+    FalsePos: integer;
+    FalseNeg: integer;
+  end;
+
 // Teacher-forced held-out perplexity of a token-level autoregressive LM over
 // a corpus of text samples (one sample per Corpus line). See the unit header
 // for head-shape auto-detection, truncation and special-token rules.
@@ -303,6 +325,31 @@ function SelfBLEU(const Generations: array of TNeuralIntegerArray;
   MaxN: integer = 4; Smooth: boolean = true): TNeuralFloat; overload;
 function SelfBLEU(const Generations: array of string;
   MaxN: integer = 4; Smooth: boolean = true): TNeuralFloat; overload;
+
+// ---------------------------------------------------------------------------
+// Token classification (NER): BIO/IOB2 entity decoding + entity-level P/R/F1
+// ---------------------------------------------------------------------------
+
+// Decodes a BIO/IOB2 tag sequence into entity spans (the seqeval get_entities
+// algorithm). Tags are strings: 'O' (outside), 'B-TYPE' (begin) or 'I-TYPE'
+// (inside). A span opens on a 'B-TYPE' tag (or on an 'I-TYPE' that follows a
+// non-matching tag - the IOB2 lenient-start rule seqeval uses) and extends
+// over consecutive 'I-TYPE' of the SAME type; any 'O', a 'B-' or a type switch
+// closes the current span. Returns the spans in left-to-right order.
+function DecodeBIOEntities(const Tags: array of string): TNNetEntitySpanArray;
+
+// Entity-level (span exact-match) precision / recall / F1 for one sentence,
+// the seqeval default. A predicted span is a true positive only when an
+// identical (type + [start..end]) gold span exists; unmatched predictions are
+// false positives, unmatched gold spans false negatives. PredTags and GoldTags
+// must have the same length.
+function EntityScore(const PredTags, GoldTags: array of string): TNNetEntityScore; overload;
+
+// Corpus-level (micro-averaged) entity P/R/F1 over aligned predicted/gold tag
+// sentences: TP/FP/FN are pooled across all sentences, then P/R/F1 computed
+// once (the seqeval classification_report micro-average). Pred[i] and Gold[i]
+// are the tag sequences of sentence i and must be equal length.
+function CorpusEntityScore(const Pred, Gold: array of TStringArray): TNNetEntityScore;
 
 implementation
 
@@ -1243,6 +1290,170 @@ begin
   finally
     Vocab.Free;
   end;
+end;
+
+// ---------------------------------------------------------------------------
+// Token classification (NER) entity-level metrics
+// ---------------------------------------------------------------------------
+
+// Splits a tag into prefix ('B'/'I'/'O') and type (after the first '-').
+procedure SplitTag(const Tag: string; out Prefix, EntType: string);
+var
+  DashPos: integer;
+begin
+  if Tag = '' then begin Prefix := 'O'; EntType := ''; Exit; end;
+  DashPos := Pos('-', Tag);
+  if DashPos = 0 then
+  begin
+    Prefix := Tag;       // 'O' (or a bare tag treated as outside)
+    EntType := '';
+  end
+  else
+  begin
+    Prefix := Copy(Tag, 1, DashPos - 1);
+    EntType := Copy(Tag, DashPos + 1, MaxInt);
+  end;
+end;
+
+function DecodeBIOEntities(const Tags: array of string): TNNetEntitySpanArray;
+var
+  I, Count: integer;
+  Prefix, EntType: string;
+  OpenType: string;
+  OpenStart: integer;
+
+  procedure CloseOpen(EndIdx: integer);
+  begin
+    if OpenStart >= 0 then
+    begin
+      SetLength(Result, Count + 1);
+      Result[Count].EntityType := OpenType;
+      Result[Count].TokenStart := OpenStart;
+      Result[Count].TokenEnd := EndIdx;
+      Inc(Count);
+      OpenStart := -1;
+      OpenType := '';
+    end;
+  end;
+
+begin
+  SetLength(Result, 0);
+  Count := 0;
+  OpenStart := -1;
+  OpenType := '';
+  for I := 0 to High(Tags) do
+  begin
+    SplitTag(Tags[I], Prefix, EntType);
+    if Prefix = 'B' then
+    begin
+      CloseOpen(I - 1);
+      OpenType := EntType;
+      OpenStart := I;
+    end
+    else if Prefix = 'I' then
+    begin
+      // Continue only when the type matches the open span; otherwise the
+      // IOB2 lenient rule opens a fresh span on this 'I-'.
+      if (OpenStart >= 0) and (EntType = OpenType) then
+        // extend (handled implicitly: span end advances on close)
+      else
+      begin
+        CloseOpen(I - 1);
+        OpenType := EntType;
+        OpenStart := I;
+      end;
+    end
+    else // 'O' or unknown -> outside
+      CloseOpen(I - 1);
+  end;
+  CloseOpen(High(Tags));
+end;
+
+function SpanInArray(const Span: TNNetEntitySpan;
+  const Arr: TNNetEntitySpanArray; const Used: array of boolean): integer;
+var
+  I: integer;
+begin
+  Result := -1;
+  for I := 0 to High(Arr) do
+    if (not Used[I]) and (Arr[I].EntityType = Span.EntityType) and
+       (Arr[I].TokenStart = Span.TokenStart) and
+       (Arr[I].TokenEnd = Span.TokenEnd) then
+      Exit(I);
+end;
+
+procedure CountEntityMatches(const PredTags, GoldTags: array of string;
+  var TP, FP, FN: integer);
+var
+  Pred, Gold: TNNetEntitySpanArray;
+  Used: array of boolean;
+  I, MatchIdx: integer;
+begin
+  Pred := DecodeBIOEntities(PredTags);
+  Gold := DecodeBIOEntities(GoldTags);
+  SetLength(Used, Length(Gold));
+  for I := 0 to High(Used) do Used[I] := false;
+  for I := 0 to High(Pred) do
+  begin
+    MatchIdx := SpanInArray(Pred[I], Gold, Used);
+    if MatchIdx >= 0 then
+    begin
+      Inc(TP);
+      Used[MatchIdx] := true;
+    end
+    else
+      Inc(FP);
+  end;
+  for I := 0 to High(Used) do
+    if not Used[I] then Inc(FN);
+end;
+
+procedure FinishEntityScore(var S: TNNetEntityScore);
+begin
+  if (S.TruePos + S.FalsePos) > 0 then
+    S.Precision := S.TruePos / (S.TruePos + S.FalsePos)
+  else S.Precision := 0;
+  if (S.TruePos + S.FalseNeg) > 0 then
+    S.Recall := S.TruePos / (S.TruePos + S.FalseNeg)
+  else S.Recall := 0;
+  if (S.Precision + S.Recall) > 0 then
+    S.F1 := 2 * S.Precision * S.Recall / (S.Precision + S.Recall)
+  else S.F1 := 0;
+end;
+
+function EntityScore(const PredTags, GoldTags: array of string): TNNetEntityScore;
+begin
+  if Length(PredTags) <> Length(GoldTags) then
+    raise EArgumentException.Create(
+      'EntityScore: PredTags and GoldTags must have the same length.');
+  Result.TruePos := 0;
+  Result.FalsePos := 0;
+  Result.FalseNeg := 0;
+  CountEntityMatches(PredTags, GoldTags,
+    Result.TruePos, Result.FalsePos, Result.FalseNeg);
+  FinishEntityScore(Result);
+end;
+
+function CorpusEntityScore(const Pred, Gold: array of TStringArray): TNNetEntityScore;
+var
+  I: integer;
+begin
+  if Length(Pred) <> Length(Gold) then
+    raise EArgumentException.Create(
+      'CorpusEntityScore: Pred and Gold must have the same number of sentences.');
+  Result.TruePos := 0;
+  Result.FalsePos := 0;
+  Result.FalseNeg := 0;
+  for I := 0 to High(Pred) do
+  begin
+    if Length(Pred[I]) <> Length(Gold[I]) then
+      raise EArgumentException.Create(
+        'CorpusEntityScore: sentence ' + IntToStr(I) +
+        ' Pred/Gold length mismatch.');
+    CountEntityMatches(Pred[I], Gold[I],
+      Result.TruePos, Result.FalsePos, Result.FalseNeg);
+  end;
+  FinishEntityScore(Result);
 end;
 
 end.

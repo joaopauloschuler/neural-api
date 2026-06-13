@@ -39,6 +39,8 @@ type
     procedure TestDecodeKeepsSpecialsWhenAsked;
     procedure TestRejectsNonBPEModel;
     procedure TestEncodeIntegerArrayHelper;
+    procedure TestOffsetMappingRoundTrip;
+    procedure TestOffsetMappingWordIds;
   end;
 
   // Tests for the chat templates in neuralchat.pas. The flagship tests
@@ -317,6 +319,83 @@ begin
     AssertTrue('array helper returns ids', Length(Arr) > 0);
     AssertEquals('decode round-trips the array helper',
       'the cat', Tok.Decode(Arr, true));
+  finally
+    Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestOffsetMappingRoundTrip;
+var
+  Tok: TNeuralHFTokenizer;
+  Offsets: TNeuralTokenOffsetArray;
+  Text, Slice, Joined: string;
+  I: integer;
+begin
+  // Byte-level path: every mapped token's (Start,Length) must slice back to a
+  // non-empty substring, spans must be monotonic, and concatenating the mapped
+  // surfaces in order must reproduce the input with whitespace removed.
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    Text := 'the cat sat';
+    Offsets := Tok.EncodeWithOffsets(Text);
+    AssertTrue('byte-level offsets emitted', Length(Offsets) > 0);
+    Joined := '';
+    for I := 0 to High(Offsets) do
+      if Offsets[I].Length > 0 then
+      begin
+        Slice := Copy(Text, Offsets[I].Start, Offsets[I].Length);
+        AssertTrue('span ' + IntToStr(I) + ' nonempty slice', Slice <> '');
+        if I > 0 then
+          AssertTrue('monotonic start',
+            Offsets[I].Start >= Offsets[I - 1].Start);
+        Joined := Joined + Slice;
+      end;
+    AssertEquals('mapped surfaces reconstruct non-space input',
+      StringReplace(Text, ' ', '', [rfReplaceAll]), Joined);
+  finally
+    Tok.Free;
+  end;
+  // WordPiece path: same invariants (surface stripped of '##').
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    Text := 'the cat';
+    Offsets := Tok.EncodeWithOffsets(Text);
+    AssertTrue('wordpiece offsets emitted', Length(Offsets) > 0);
+    for I := 0 to High(Offsets) do
+      if Offsets[I].Length > 0 then
+        AssertTrue('wp span ' + IntToStr(I) + ' in bounds',
+          (Offsets[I].Start >= 1) and
+          (Offsets[I].Start + Offsets[I].Length - 1 <= Length(Text)));
+  finally
+    Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestOffsetMappingWordIds;
+var
+  Tok: TNeuralHFTokenizer;
+  Offsets: TNeuralTokenOffsetArray;
+  Text: string;
+  I, MaxWord: integer;
+begin
+  // Three whitespace words -> word ids must be 0,1,2 in non-decreasing order;
+  // a subword of word k carries WordId = k (subword -> word alignment).
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    Text := 'the cat sat';
+    Offsets := Tok.EncodeWithOffsets(Text);
+    MaxWord := -1;
+    for I := 0 to High(Offsets) do
+      if Offsets[I].WordId >= 0 then
+      begin
+        AssertTrue('word ids non-decreasing',
+          Offsets[I].WordId >= MaxWord);
+        MaxWord := Offsets[I].WordId;
+      end;
+    AssertEquals('three whitespace words -> max word id 2', 2, MaxWord);
   finally
     Tok.Free;
   end;

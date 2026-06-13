@@ -100,6 +100,12 @@ type
     // self-BLEU: identical generations -> 1.0; reuses CorpusBLEU and equals
     // the hand-computed mean of pairwise BLEUs.
     procedure TestSelfBLEU;
+    // Entity-level NER metrics (Task A): BIO decoding + span P/R/F1.
+    procedure TestDecodeBIOEntities;
+    procedure TestEntityScorePerfectMatch;
+    procedure TestEntityScoreBoundaryError;
+    procedure TestEntityScoreTypeMismatch;
+    procedure TestCorpusEntityScoreMicroAverage;
   end;
 
 implementation
@@ -771,6 +777,102 @@ begin
   // Fewer than two generations -> 0 (nothing to compare against).
   AssertEquals('self-BLEU of a single generation is 0',
     0.0, SelfBLEU(['a b c'], 4, true), 1e-9);
+end;
+
+procedure TTestNeuralNLPMetrics.TestDecodeBIOEntities;
+var
+  Spans: TNNetEntitySpanArray;
+begin
+  // 'B-PER I-PER O B-LOC' -> PER[0..1], LOC[3..3].
+  Spans := DecodeBIOEntities(['B-PER', 'I-PER', 'O', 'B-LOC']);
+  AssertEquals('two entities decoded', 2, Length(Spans));
+  AssertEquals('first type', 'PER', Spans[0].EntityType);
+  AssertEquals('first start', 0, Spans[0].TokenStart);
+  AssertEquals('first end', 1, Spans[0].TokenEnd);
+  AssertEquals('second type', 'LOC', Spans[1].EntityType);
+  AssertEquals('second start', 3, Spans[1].TokenStart);
+  AssertEquals('second end', 3, Spans[1].TokenEnd);
+  // Two adjacent B- of the same type are TWO separate entities (B closes B).
+  Spans := DecodeBIOEntities(['B-PER', 'B-PER']);
+  AssertEquals('adjacent B-PER are two spans', 2, Length(Spans));
+  // Lenient IOB2: a leading I- opens a span.
+  Spans := DecodeBIOEntities(['I-ORG', 'I-ORG']);
+  AssertEquals('leading I-ORG opens one span', 1, Length(Spans));
+  AssertEquals('lenient start', 0, Spans[0].TokenStart);
+  AssertEquals('lenient end', 1, Spans[0].TokenEnd);
+end;
+
+procedure TTestNeuralNLPMetrics.TestEntityScorePerfectMatch;
+var
+  S: TNNetEntityScore;
+begin
+  S := EntityScore(['B-PER', 'I-PER', 'O', 'B-LOC'],
+                   ['B-PER', 'I-PER', 'O', 'B-LOC']);
+  AssertEquals('TP', 2, S.TruePos);
+  AssertEquals('FP', 0, S.FalsePos);
+  AssertEquals('FN', 0, S.FalseNeg);
+  AssertEquals('P', 1.0, S.Precision, 1e-9);
+  AssertEquals('R', 1.0, S.Recall, 1e-9);
+  AssertEquals('F1', 1.0, S.F1, 1e-9);
+end;
+
+procedure TTestNeuralNLPMetrics.TestEntityScoreBoundaryError;
+var
+  S: TNNetEntityScore;
+begin
+  // Gold one PER span [0..1]; pred only [0..0] (boundary/length error).
+  // Spans differ -> 0 TP, 1 FP (pred), 1 FN (gold). P=R=F1=0.
+  S := EntityScore(['B-PER', 'O'], ['B-PER', 'I-PER']);
+  AssertEquals('TP', 0, S.TruePos);
+  AssertEquals('FP', 1, S.FalsePos);
+  AssertEquals('FN', 1, S.FalseNeg);
+  AssertEquals('F1', 0.0, S.F1, 1e-9);
+  // Split entity: gold one [0..2], pred two [0..0] and [2..2] (the seqeval
+  // split-error case). 0 TP, 2 FP, 1 FN -> P=0, R=0.
+  S := EntityScore(['B-PER', 'O', 'B-PER'], ['B-PER', 'I-PER', 'I-PER']);
+  AssertEquals('split TP', 0, S.TruePos);
+  AssertEquals('split FP', 2, S.FalsePos);
+  AssertEquals('split FN', 1, S.FalseNeg);
+end;
+
+procedure TTestNeuralNLPMetrics.TestEntityScoreTypeMismatch;
+var
+  S: TNNetEntityScore;
+begin
+  // Right boundary, wrong type: gold LOC[0..0], pred PER[0..0]. Not a match.
+  S := EntityScore(['B-PER'], ['B-LOC']);
+  AssertEquals('type-mismatch TP', 0, S.TruePos);
+  AssertEquals('type-mismatch FP', 1, S.FalsePos);
+  AssertEquals('type-mismatch FN', 1, S.FalseNeg);
+  // One correct + one type error: gold PER[0..0],LOC[2..2]; pred PER[0..0],
+  // ORG[2..2]. TP=1, FP=1, FN=1 -> P=R=0.5, F1=0.5.
+  S := EntityScore(['B-PER', 'O', 'B-ORG'], ['B-PER', 'O', 'B-LOC']);
+  AssertEquals('mixed TP', 1, S.TruePos);
+  AssertEquals('mixed FP', 1, S.FalsePos);
+  AssertEquals('mixed FN', 1, S.FalseNeg);
+  AssertEquals('mixed P', 0.5, S.Precision, 1e-9);
+  AssertEquals('mixed R', 0.5, S.Recall, 1e-9);
+  AssertEquals('mixed F1', 0.5, S.F1, 1e-9);
+end;
+
+procedure TTestNeuralNLPMetrics.TestCorpusEntityScoreMicroAverage;
+var
+  Pred, Gold: array of TStringArray;
+  S: TNNetEntityScore;
+begin
+  SetLength(Pred, 2);
+  SetLength(Gold, 2);
+  // Sentence 0: perfect single PER. Sentence 1: type error (1 FP, 1 FN).
+  Pred[0] := TStringArray.Create('B-PER', 'I-PER');
+  Gold[0] := TStringArray.Create('B-PER', 'I-PER');
+  Pred[1] := TStringArray.Create('B-ORG');
+  Gold[1] := TStringArray.Create('B-LOC');
+  S := CorpusEntityScore(Pred, Gold);
+  // Pooled: TP=1, FP=1, FN=1 -> P=R=F1=0.5.
+  AssertEquals('micro TP', 1, S.TruePos);
+  AssertEquals('micro FP', 1, S.FalsePos);
+  AssertEquals('micro FN', 1, S.FalseNeg);
+  AssertEquals('micro F1', 0.5, S.F1, 1e-9);
 end;
 
 initialization
