@@ -94,28 +94,6 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] Griffin / RecurrentGemma importer (BuildRecurrentGemmaFromSafeTensors[Ex],
-      model_type "recurrent_gemma", google/recurrentgemma-2b). LANDED. New layer
-      TNNetRGLRU = the real-gated linear recurrent unit (Griffin/Hawk; c=8
-      log-space decay, input gate i_t=sigmoid(W_x x), recurrence gate
-      r_t=sigmoid(W_a x), log a_t=-c*r_t*softplus(Lambda),
-      h_t = a_t(.)h_{t-1} + sqrt(1-a_t^2)(.)(i_t(.)x_t), position-0 reset
-      mult=1) — distinct from complex-diagonal TNNetLRU (flagged in header).
-      Layer takes a packed [x|i_logits|a_logits] slab so the importer realises
-      the per-head block-diagonal gate matrices + conv1d as upstream Pointwise
-      projections; the leaf owns only Lambda. Forward scan + exact BPTT,
-      registered in both dispatch tables, gradient-checked
-      (TestRGLRU{ShapeInference,InputGradientCheck,WeightGradientCheck,
-      SerializationRoundTrip}). Importer wires the recurrent/attention block
-      PATTERN (block_types), GEGLU(tanh) MLP, local sliding-window GQA with
-      partial rotary + o_proj bias, Gemma (1+w) RMSNorm + sqrt(hidden) embed
-      scale, tied soft-capped head. Pico fixture
-      tools/make_pico_recurrentgemma_fixture.py (synthetic config-faithful HF
-      RecurrentGemmaForCausalLM, no download) + TestRecurrentGemmaLogitParity
-      (max |logit diff| ~5e-6 vs the float64 HF oracle). DEFERRED: O(1)
-      decode-side recurrent-state carry for TNNetRGLRU (decode demo) — the
-      training/prefill scan + full-forward parity is complete; KV-cache-style
-      incremental decode for the recurrent leaf is a follow-up.
 - [ ] GPT-OSS importer follow-ups (BuildGptOssFromSafeTensors[Ex] LANDED,
       model_type "gpt_oss", with TNNetGptOssSinkAttention per-head scalar sink +
       alternating sliding/full window + YaRN truncate flag + top-k MoE +
@@ -169,42 +147,6 @@ rather than acted on.
       Cohere weights on top of the synthetic fixture. Also: order_of_interleaved_layers
       (legacy cohere2 spelling) maps to sliding_window_pattern but was not seen
       in a published config — wire it if one surfaces.
-- [X] DeBERTa-v3 importer + disentangled attention (BuildDebertaV2FromSafeTensors,
-      model_type "deberta-v2"): the dominant small-encoder family for
-      NLU/classification/NER/reranking (deberta-v3-base/small, the ms-marco
-      rerankers), and the FIRST genuinely new attention mechanism beyond the
-      landed softmax/ALiBi/T5-bias variants — distinct from RoBERTa, which the
-      BERT importer already covers. The new piece is DISENTANGLED attention:
-      the score is content-to-content PLUS content-to-position PLUS
-      position-to-content, where the position terms use a SEPARATE relative-
-      position embedding table projected by its own W_q_pos/W_k_pos and gathered
-      by clamped relative distance (att_span buckets, log-bucket "bucketing"
-      when position_buckets>0) — a new TNNet attention layer, not a builder over
-      SDPA (the existing avT5RelPosBias adds a learned SCALAR bias per bucket;
-      this projects position EMBEDDINGS, a different math). Also new: the
-      Conv-after-embeddings option is absent here (v3 has none), but the
-      embedding path is StableDropout + a single LayerNorm (no token-type add
-      when type_vocab_size=0), and the v3 LM/classification head differs from
-      BERT. Tokenizer: DeBERTa-v3's Unigram tokenizer.json now rides the landed
-      TNeuralHFTokenizer Unigram/SentencePiece reader; only checkpoints shipping a
-      raw spm.model without a tokenizer.json need the still-open .model protobuf
-      path (see the neuralhftokenizer follow-up below). Deliverables:
-      BuildDebertaV2FromSafeTensors[Ex] + a TNNetDisentangledAttention layer
-      with its own numerical-gradient test, a pico parity fixture (make_pico_*
-      recipe) asserting hidden states AND sequence-classification logits vs HF
-      float64, and a cross-encoder RERANKING example over the landed
-      BuildBertForSequenceClassification scoring path (query+passage -> relevance
-      score), the canonical RAG-reranker demo the encoder importers enable.
-      DONE: TNNetDisentangledAttention layer (gradient + serialization tests),
-      BuildDebertaV2FromSafeTensors[Ex] wired into BuildFromPretrained, pico
-      fixture tools/deberta_v2_tiny_fixture.py (hidden parity <2e-5, seq-cls
-      logits <1e-4 vs HF float64), examples/DebertaReranker. NOTE: the layer's
-      sequence classification head is the DeBERTa ContextPooler (dense + GELU on
-      row 0) + classifier — implemented with the same per-token PointwiseConvLinear
-      scoring path / AssertSeqClsParityWithFixture machinery as the BERT seq-cls
-      head, NOT BuildBertForSequenceClassification literally. Deferred: the raw
-      spm.model protobuf tokenizer path (out of scope, see neuralhftokenizer
-      follow-up); real-checkpoint (deberta-v3-base) ad-hoc verification.
 - [ ] BART-family follow-up (b) mBART/NLLB — pre-norm + an EXTRA final encoder
       AND decoder LayerNorm (same pre-norm shape the Pegasus importer now ships,
       so it should reuse BuildPegasusStackBlocks) + a SentencePiece tokenizer:
@@ -406,20 +348,6 @@ rather than acted on.
       in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
       (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real rewards.
-- [X] Seq2seq translation/summarization EXAMPLE on the landed beam: wire an
-      examples/ entry (and an examples/README.md mention) using
-      DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in neuralnlpmetrics.pas
-      over a real Marian/T5 checkpoint (the Unigram tokenizer these need has
-      landed, reading the checkpoint's tokenizer.json).
-      DONE: examples/Seq2SeqTranslate (.lpr + .lpi + README) imports the
-      committed pico Marian fixture OFFLINE (no download), runs
-      DecodeSeq2SeqBeamSearch, and prints corpus BLEU + ROUGE-1/2/L over the
-      decoded ids (token-id metric overloads). Random pico weights => it is a
-      PLUMBING demo (import -> beam -> BLEU/ROUGE), with determinism +
-      self-reference==1.0 assertions; builds/runs in <3GB. examples/Summarize
-      is the real-checkpoint text counterpart (BART/Pegasus). The earlier
-      Summarize example was checkpoint-only (ROUGE-only, no offline path), so
-      this offline BLEU+ROUGE fixture demo is the deliverable.
 - [ ] Offset-mapping follow-up: EncodeWithOffsets (commit 1e90b8a) is a
       post-hoc surface-match heuristic (each token's DecodeToken surface
       located forward at the running cursor), so it leaves tokens unmapped
