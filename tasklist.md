@@ -119,6 +119,14 @@ rather than acted on.
       most widely deployed open sparse-MoE LLMs and currently has no import
       path, and it lands as almost pure composition of two already-verified
       subsystems.
+- [ ] Qwen3-MoE importer follow-up (BuildQwen3MoeFromSafeTensors landed in a3,
+      commit 6417ce3): v1 supports only the UNIFORM all-MoE stack and rejects
+      mixed dense/MoE layers (decoder_sparse_step > 1 or non-empty
+      mlp_only_layers) and use_sliding_window loudly. Add the mixed-layer path
+      (some decoder layers are dense SwiGLU FFN, some are MoE — gate per layer
+      on the index) so e.g. configs that interleave a dense layer every N
+      blocks import; sliding-window support rides the existing SDPA window arg.
+      Add a pico fixture with decoder_sparse_step=2 (or one mlp_only_layer).
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
@@ -298,6 +306,20 @@ rather than acted on.
           tokenizer.ggml.tokens/scores/token_type only).
         * Python next-token-logit parity not wired (the Pascal round-trip
           through BuildLlamaFromGGUF is the logit-exactness gate instead).
+- [ ] GGUF writer follow-up: export an arbitrary trained/in-memory TNNet
+      (the layer->HF inverse mapping — q/k de-permute + SwiGLU un-fuse —
+      reading weights back out of the WIRED Llama layers) rather than only an
+      HF-named tensor reader + TLlamaConfig as SaveLlamaToGGUF does today. This
+      is what lets a from-scratch CAI-trained Llama (not just a re-export of an
+      import) reach llama.cpp.
+- [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
+      storage ([[int8-quantized-inference]]) instead of quantizing-on-write
+      from F32 (avoids the dequantize-then-requantize round trip when the
+      source layers already hold int8 blocks).
+- [ ] GGUF writer follow-up: wire tools/verify_gguf_writer.py to assert
+      next-token-logit parity against the Pascal model via llama-cpp-python
+      (when installed), and emit the BPE merges array for byte-level-BPE
+      tokenizers (v1 emits SP-style tokens/scores/token_type only).
 - [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.
