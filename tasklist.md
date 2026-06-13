@@ -148,40 +148,18 @@ rather than acted on.
       float64, and a cross-encoder RERANKING example over the landed
       BuildBertForSequenceClassification scoring path (query+passage -> relevance
       score), the canonical RAG-reranker demo the encoder importers enable.
-- [X] BART importer + abstractive-summarization example
-      (BuildBartFromSafeTensors[Ex], model_type "bart"): the dominant
-      pretrained encoder-decoder for SUMMARIZATION (facebook/bart-large-cnn,
-      sshleifer/distilbart-cnn-*) and the NLP task the repo cannot do today —
-      it has classification/NER/QA/embeddings and MT-via-Marian, but no
-      abstractive summarization on a real checkpoint. Architecturally DISTINCT
-      from the landed T5 (relative-position bias + RMSNorm + bias-free) and
-      Marian (static sinusoidal table) encoder-decoder importers, so it is not
-      a near-duplicate: BART is essentially a bidirectional BERT-style encoder
-      + GPT-2-style causal decoder with cross-attention, using LEARNED ABSOLUTE
-      positional embeddings (embed_positions, with BART's +2 padding-idx
-      offset), standard LayerNorm (post-norm: residual then norm, i.e.
-      normalize_before=false), GeLU FFN, encoder/decoder token embeddings TIED
-      to a shared table, and an lm_head tied to that table plus a
-      final_logits_bias row. Reuses almost all landed plumbing: the
-      T5EncoderStatesInput external-encoder-states convention, RunT5-style
-      two-net wiring, DecodeSeq2SeqGreedy/Sampled/BeamSearch in neuraldecode,
-      and the ROUGE metric in neuralnlpmetrics.pas; the tokenizer is GPT-2
-      byte-level BPE, which the landed TNeuralHFTokenizer already reads (no
-      SentencePiece dependency, unlike mBART/NLLB). Scope v1 to BART proper;
-      document the close cousins as follow-ups that ride this path —
-      Pegasus (pre-norm normalize_before=true + static sinusoidal positions)
-      and mBART/NLLB (pre-norm + extra final encoder/decoder LayerNorm +
+- [ ] BART-family follow-ups (BuildBartFromSafeTensors landed in
+      neuralpretrained.pas — two-net post-norm encoder-decoder, learned +2
+      positions, layernorm_embedding, erf-GELU, tied embeddings +
+      final_logits_bias; parity test TestBartParity at 1.5e-6/3.6e-6;
+      examples/Summarize beam-search + ROUGE demo): the close cousins that ride
+      the same path — (a) Pegasus (pre-norm normalize_before=true + static
+      sinusoidal positions; reuses the Marian sinusoidal-table builder); (b)
+      mBART/NLLB (pre-norm + an EXTRA final encoder AND decoder LayerNorm +
       SentencePiece tokenizer, so blocked on the open Unigram/SentencePiece
-      task). Deliverables: BuildBartFromSafeTensors[Ex] (two nets +
-      multi-shard index.json support), a pico parity fixture via the
-      make_pico_*_fixture.py recipe asserting encoder hidden states AND decoder
-      next-token logits for a fixed source+prefix vs HF float64, and an
-      examples/Summarize demo that summarizes a short article on CPU through
-      the landed beam search and reports ROUGE against a reference (the
-      seq2seq-summarization example the landed DecodeSeq2SeqBeamSearch + ROUGE
-      were built for). Closes the open "seq2seq translation/summarization
-      EXAMPLE" entry for the summarization half without waiting on
-      SentencePiece.
+      task). Also: the committed bart_tiny fixture is single-shard, so the
+      inherited multi-shard index.json path is untested for BART specifically —
+      add a 2-shard fixture if a real distilbart import surfaces a bug.
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
@@ -239,11 +217,6 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [X] safetensors writer F16/BF16 cross-check: tools/verify_safetensors_writer.py
-      cross-checks the F32 writer against the python safetensors library but is
-      not extended to the landed EncodeF16/EncodeBF16 encode-on-write output —
-      add a quick python-side dtype + value assert over an F16/BF16 file
-      (/home/bpsa/x/bin/python has the package).
 - [ ] HF-names safetensors exporter: export an imported pico-GPT-2 back to
       HF tensor names (wte.weight, h.N.attn.c_attn.weight, ...), reload via
       BuildGPT2FromSafeTensors and compare logits; generalize per-importer
@@ -309,12 +282,15 @@ rather than acted on.
       the input and mix the targets by area fraction (Beta-distributed
       lambda). The CIFAR image-classification examples give an instant
       bake-off harness.
-- [X] Contrastive search decoding (transformers penalty_alpha): degeneration
-      penalty re-ranking each candidate token by max cosine similarity
-      between its hidden state and all previous tokens' hidden states;
-      needs hidden-state capture during decode — a different beast from the
-      landed sampling/logits-processor chain and strong for greedy-quality
-      open-ended text.
+- [ ] Contrastive search decoding follow-up (v1 landed:
+      DecodeContrastiveSearch in neuraldecode.pas, char-level, alpha=0
+      degrades bit-identically to greedy, tests in TestNeuralDecode): v1
+      re-encodes the full context each step AND runs one extra forward per
+      top-k candidate to capture its hidden state (O(k) forwards/step). Add a
+      token-level / KV-cache (TNNetStreamingDecoder) variant that reads the
+      last-hidden-state from the streamed window — no re-encode, no
+      per-candidate forwards. Shares the fork/snapshot primitive the KV-cache
+      beam + best-of-N tasks want.
 - [ ] Diverse beam search (Hamming-diversity groups) + constrained beam
       search (force_words_ids: force given phrases to APPEAR anywhere in the
       output — stronger than the existing TNNetTokenConstraint prefix/mask
@@ -412,11 +388,14 @@ rather than acted on.
       neuralnlpmetrics.pas are both waiting on the Unigram/SentencePiece
       tokenizer for real Marian/T5 checkpoints - wire an examples/ entry
       (and an examples/README.md mention) once that lands.
-- [X] Masked-LM collator follow-up (TNNetMaskedLMCollator is landed in
-      neuraldatasets.pas): whole-word masking (group subword pieces of one
-      word and mask them together).
-- [X] Masked-LM collator follow-up: T5 span corruption with sentinel tokens
-      (contiguous-span masking, sentinel id stream).
+- [ ] Span-corruption pretraining EXAMPLE: TNNetSpanCorruptionCollator landed
+      in neuraldatasets.pas (T5/SpanBERT contiguous-span masking, descending
+      sentinel ids, round-trippable source/target; tests in
+      TestNeuralMaskedLM). Whole-word masking (CollateWholeWord, WordIds side
+      channel, HF DataCollatorForWholeWordMask semantics) also landed. Open:
+      wire an examples/ entry that pretrains a tiny encoder-decoder on span
+      corruption through DecodeSeq2Seq* and reports it (the collator's natural
+      end-to-end demo; pairs with the BART/T5 seq2seq path).
 - [ ] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
       above): K learnable virtual-token embeddings prepended to the
       embedding-layer output, base model frozen — K*d_model trainable
