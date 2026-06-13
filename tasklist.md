@@ -203,12 +203,7 @@ rather than acted on.
       (seeds the running max with the SIGNED first element, so a negative
       max-magnitude element 0 is missed; csErrorOverflowBackpropProtection
       and friends consume it — audit callers before fixing).
-- [ ] Tokenizer follow-ups for neuralhftokenizer.pas: (a) DONE -- Unigram
-      model support landed (model.type "Unigram": [piece, log_prob] vocab
-      array + unk_id, maximum-log-prob Viterbi segmentation with fused
-      <unk> for unreachable char runs, composes with the Metaspace
-      pre_tokenizer/decoder; HF parity fixture tiny_unigram_tokenizer.json
-      via tools/hf_unigram_fixture.py, pinned in TestNeuralHFTokenizer.pas);
+- [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
       (b) the raw SentencePiece .model protobuf path (parse the protobuf
       wire format
       or vendor a minimal decoder) for checkpoints that ship without a
@@ -231,16 +226,6 @@ rather than acted on.
       (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap; add
       o200k when a GPT-4o-family checkpoint matters. Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
-- [X] Gradient accumulation in neuralfit.pas: accumulate deltas over N
-      micro-batches before the optimizer step (large effective batch
-      without the memory), so results match a true big batch.
-      AccumulationSteps property (default 1 = bit-identical to today) on
-      TNeuralFitBase; RunTrainingBatch runs N forward+backward micro-batches
-      summing deltas into FNN, then one Optimize(). No 1/N rescale: the
-      framework SUMS (never averages) deltas across a batch, so N x M ==
-      true N*M. CurrentAccumulationStep exposed for deterministic providers.
-      Verified by TestAccumulationEqualsBigBatch (4 micro of 3 vs one of 12,
-      8 epochs, weights+loss match to 1e-5).
 - [ ] EMA (exponential moving average) shadow weights in neuralfit.pas:
       maintain decay-averaged copies of all weights during training and
       allow swapping them in for eval/save; classic free eval-quality win.
@@ -347,16 +332,6 @@ rather than acted on.
       last-hidden-state from the streamed window — no re-encode, no
       per-candidate forwards. Shares the fork/snapshot primitive the KV-cache
       beam + best-of-N tasks want.
-- [X] Diverse beam search (Hamming-diversity groups) + constrained beam
-      search (force_words_ids: force given phrases to APPEAR anywhere in the
-      output — stronger than the existing TNNetTokenConstraint prefix/mask
-      machinery) in neural/neuraldecode.pas as DecodeBeamSearch variants.
-      DONE: DecodeDiverseBeamSearch[All] (Vijayakumar groups, NumGroups=1 &
-      lambda=0 bit-identical to DecodeBeamSearchAll; lambda>0 force distinct
-      group first-tokens) and DecodeConstrainedBeamSearch[All] (banked
-      force-completion via monotone ForcedProgress; empty ForceTokens
-      bit-identical to beam; phrase provably emitted). Tested in
-      tests/TestNeuralDecode.pas.
 - [ ] Batched generation with left-padding in neural/neuraldecode.pas:
       generate for N prompts in one forward pass per step (today's decode
       paths look single-sample). Makes evaluation sweeps cheap and is a
@@ -445,11 +420,11 @@ rather than acted on.
       in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
       (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real rewards.
-- [ ] Seq2seq translation/summarization EXAMPLE on the landed beam:
-      DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in
-      neuralnlpmetrics.pas are both waiting on the Unigram/SentencePiece
-      tokenizer for real Marian/T5 checkpoints - wire an examples/ entry
-      (and an examples/README.md mention) once that lands.
+- [ ] Seq2seq translation/summarization EXAMPLE on the landed beam: wire an
+      examples/ entry (and an examples/README.md mention) using
+      DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in neuralnlpmetrics.pas
+      over a real Marian/T5 checkpoint (the Unigram tokenizer these need has
+      landed, reading the checkpoint's tokenizer.json).
 - [ ] Span-corruption pretraining EXAMPLE: TNNetSpanCorruptionCollator landed
       in neuraldatasets.pas (T5/SpanBERT contiguous-span masking, descending
       sentinel ids, round-trippable source/target; tests in
@@ -615,15 +590,6 @@ rather than acted on.
       way to pretrain on corpora bigger than RAM. Assert: same model
       quality on a small corpus vs the in-memory path at matched
       examples-seen, and bounded RSS on a corpus larger than the buffer.
-- [x] BPE-dropout follow-up for TNeuralHFTokenizer (Provilkov et al. 2020):
-      DONE. TNeuralHFTokenizer.DropoutProb added (default 0.0 = OFF =
-      bit-identical eval); the rank-based BPE merge loop (BPEWord) now skips
-      each otherwise-applicable merge with probability DropoutProb (train-time
-      only; the FIgnoreMerges whole-word fast path is bypassed when active),
-      so byte-level-BPE imported tokenizers can also subword-regularize at
-      train time. Tests in TestNeuralHFTokenizer.pas (p=0 bit-identical, p=1
-      maximally-split per-byte, seeded mid-value deterministic + differs),
-      mirroring the TNeuralTokenizer.DropoutProb v1.
 - [ ] MinHash near-duplicate corpus dedup tool: the C4/Pile hygiene step —
       shingle each document, MinHash signatures, LSH banding to find
       near-duplicate clusters, keep one representative. Small standalone
