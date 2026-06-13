@@ -450,6 +450,96 @@ type
       property DocumentCount: integer read FDocCount;
   end;
 
+const
+  // Ignore-label convention for masked-LM training: a label of -1 means
+  // "this position is NOT a loss target" (BERT/HuggingFace use -100, but this
+  // repo's token ids are non-negative and any negative sentinel works; -1 is
+  // used throughout TNNetMaskedLMCollator). Use BuildTrainingPair to turn the
+  // integer label array into a one-hot target volume with all-zero rows at the
+  // ignored positions (then ApplyLossMask after Compute, exactly like
+  // TNNetSequencePacker, so e = Output - Desired is zero off the masked set).
+  csMaskedLMIgnoreLabel = -1;
+
+type
+  { TNNetMaskedLMCollator }
+  // BERT-style dynamic masked-language-model collator (a port of the
+  // HuggingFace transformers DataCollatorForLanguageModeling, MLM mode).
+  // Given a batch of token-id sequences, it independently corrupts each
+  // sequence: a fraction MaskProb (default 0.15) of the non-special tokens is
+  // selected for prediction; of the selected tokens 80% are replaced with the
+  // [MASK] id, 10% with a uniformly random real token, and 10% are left
+  // unchanged. Only the selected positions carry a loss; every other position
+  // gets the ignore label csMaskedLMIgnoreLabel in the labels array, and the
+  // selected positions carry the ORIGINAL (pre-corruption) token id.
+  //
+  // This unlocks encoder pretraining on top of the existing
+  // AddTransformerEncoderBlock with no new layer types: feed CorruptedIds to
+  // the encoder (token ids on the X axis when the input Depth = 1, one-hot on
+  // the depth axis otherwise) and train a TNNetPointwiseSoftMax head against
+  // the one-hot targets built by BuildTrainingPair; call ApplyLossMask after
+  // Compute so the ignored positions backpropagate no gradient.
+  //
+  // Special tokens (pad/cls/sep/mask and anything passed to
+  // AddSpecialTokenId) are NEVER selected for masking and never used as the
+  // random replacement token.
+  //
+  // The masking RNG is seeded via Reseed so tests / runs are reproducible;
+  // it uses an internal LCG independent of the global RandSeed so collation
+  // does not perturb (or get perturbed by) weight-init randomness.
+  // Coded by Claude (AI).
+  TNNetMaskedLMCollator = class(TObject)
+    private
+      FMaskProb: TNeuralFloat;
+      FReplaceMaskProb: TNeuralFloat;  // P(replace with [MASK]) within selected
+      FRandomTokenProb: TNeuralFloat;  // P(replace with random token) within selected
+      FMaskTokenId: integer;
+      FVocabSize: integer;
+      FSpecials: TNeuralIntegerArray;
+      FSpecialCount: integer;
+      FRngState: cardinal;
+      function NextRandom(): TNeuralFloat;          // uniform [0,1)
+      function NextRandomInt(N: integer): integer;  // uniform 0..N-1
+      function IsSpecial(TokenId: integer): boolean;
+      function RandomRealToken(): integer;          // a real (non-special) id
+    public
+      // pMaskTokenId: the [MASK] token id. pVocabSize: number of token ids
+      // (random replacement draws from 0..pVocabSize-1, skipping specials).
+      // The pad/cls/sep/mask ids and any AddSpecialTokenId id are never masked.
+      constructor Create(pMaskTokenId, pVocabSize: integer;
+        pMaskProb: TNeuralFloat = 0.15);
+      destructor Destroy; override;
+      // Registers a token id that must never be masked nor used as a random
+      // replacement (the mask id itself is registered automatically).
+      procedure AddSpecialTokenId(TokenId: integer);
+      // Reseeds the internal RNG for reproducible masking.
+      procedure Reseed(Seed: cardinal);
+      // Corrupts one sequence in place of a copy. CorruptedIds receives the
+      // masked input ids (same length as Tokens); Labels receives the original
+      // id at each selected position and csMaskedLMIgnoreLabel everywhere else.
+      procedure Collate(const Tokens: array of integer;
+        out CorruptedIds, Labels: TNeuralIntegerArray);
+      // Fills network volumes from one already-collated pair. pInput: corrupted
+      // token ids on the X axis when pInput.Depth = 1 (embedding pipelines),
+      // one-hot across the depth axis otherwise. pTarget: per-position one-hot
+      // of the ORIGINAL token at selected positions, all-zero rows elsewhere
+      // (so a softmax head with ApplyLossMask trains only on the masked set).
+      procedure BuildTrainingPair(const CorruptedIds, Labels: TNeuralIntegerArray;
+        pInput, pTarget: TNNetVolume);
+      // Copies the network output into Desired at every ignored position so
+      // that with e = Output - Desired the error there is exactly zero (same
+      // contract as TNNetSequencePacker.ApplyLossMask). SeqLen rows are read
+      // from Labels.
+      procedure ApplyLossMask(const Labels: TNeuralIntegerArray;
+        Desired, Actual: TNNetVolume);
+      property MaskProb: TNeuralFloat read FMaskProb write FMaskProb;
+      // The 80/10/10 split. ReplaceMaskProb + RandomTokenProb must be <= 1;
+      // the remainder is the "leave unchanged" probability.
+      property ReplaceMaskProb: TNeuralFloat read FReplaceMaskProb write FReplaceMaskProb;
+      property RandomTokenProb: TNeuralFloat read FRandomTokenProb write FRandomTokenProb;
+      property MaskTokenId: integer read FMaskTokenId;
+      property VocabSize: integer read FVocabSize;
+  end;
+
 implementation
 
 uses
@@ -1022,6 +1112,156 @@ begin
         Desired[Pos, 0, D] := Actual[Pos, 0, D];
     end;
   end;
+end;
+
+{ TNNetMaskedLMCollator }
+
+constructor TNNetMaskedLMCollator.Create(pMaskTokenId, pVocabSize: integer;
+  pMaskProb: TNeuralFloat);
+begin
+  inherited Create();
+  if pVocabSize < 2 then
+    raise Exception.Create('TNNetMaskedLMCollator: VocabSize must be >= 2.');
+  if (pMaskTokenId < 0) or (pMaskTokenId >= pVocabSize) then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator: MaskTokenId must be in 0..VocabSize-1.');
+  if (pMaskProb < 0) or (pMaskProb > 1) then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator: MaskProb must be in [0,1].');
+  FMaskTokenId := pMaskTokenId;
+  FVocabSize := pVocabSize;
+  FMaskProb := pMaskProb;
+  FReplaceMaskProb := 0.8;
+  FRandomTokenProb := 0.1;
+  FSpecialCount := 0;
+  SetLength(FSpecials, 0);
+  FRngState := 305419896; // arbitrary non-zero default seed
+  // The mask token is special: never selected, never a random replacement.
+  AddSpecialTokenId(pMaskTokenId);
+end;
+
+destructor TNNetMaskedLMCollator.Destroy;
+begin
+  SetLength(FSpecials, 0);
+  inherited Destroy;
+end;
+
+procedure TNNetMaskedLMCollator.AddSpecialTokenId(TokenId: integer);
+begin
+  if IsSpecial(TokenId) then exit;
+  if FSpecialCount >= Length(FSpecials) then
+    SetLength(FSpecials, 8 + FSpecialCount * 2);
+  FSpecials[FSpecialCount] := TokenId;
+  Inc(FSpecialCount);
+end;
+
+procedure TNNetMaskedLMCollator.Reseed(Seed: cardinal);
+begin
+  if Seed = 0 then Seed := 1; // a zero state would stick at zero
+  FRngState := Seed;
+end;
+
+function TNNetMaskedLMCollator.NextRandom(): TNeuralFloat;
+begin
+  // Numerical Recipes LCG; the high bits are well-mixed, so use them for the
+  // [0,1) draw. Independent of the global RandSeed.
+  FRngState := FRngState * 1664525 + 1013904223;
+  Result := (FRngState shr 8) / 16777216.0; // top 24 bits / 2^24
+end;
+
+function TNNetMaskedLMCollator.NextRandomInt(N: integer): integer;
+begin
+  if N <= 1 then begin Result := 0; exit; end;
+  Result := Trunc(NextRandom() * N);
+  if Result >= N then Result := N - 1; // guard the (vanishingly rare) edge
+end;
+
+function TNNetMaskedLMCollator.IsSpecial(TokenId: integer): boolean;
+var
+  I: integer;
+begin
+  Result := false;
+  for I := 0 to FSpecialCount - 1 do
+    if FSpecials[I] = TokenId then begin Result := true; exit; end;
+end;
+
+function TNNetMaskedLMCollator.RandomRealToken(): integer;
+begin
+  // Rejection-sample a non-special id in 0..VocabSize-1.
+  repeat
+    Result := NextRandomInt(FVocabSize);
+  until not IsSpecial(Result);
+end;
+
+procedure TNNetMaskedLMCollator.Collate(const Tokens: array of integer;
+  out CorruptedIds, Labels: TNeuralIntegerArray);
+var
+  Len, I: integer;
+  Roll: TNeuralFloat;
+begin
+  Len := Length(Tokens);
+  SetLength(CorruptedIds, Len);
+  SetLength(Labels, Len);
+  for I := 0 to Len - 1 do
+  begin
+    CorruptedIds[I] := Tokens[I];
+    Labels[I] := csMaskedLMIgnoreLabel;
+    if IsSpecial(Tokens[I]) then continue;
+    if NextRandom() >= FMaskProb then continue; // not selected for prediction
+    // Selected: this position carries the loss; remember the original id.
+    Labels[I] := Tokens[I];
+    Roll := NextRandom();
+    if Roll < FReplaceMaskProb then
+      CorruptedIds[I] := FMaskTokenId                    // 80%: [MASK]
+    else if Roll < FReplaceMaskProb + FRandomTokenProb then
+      CorruptedIds[I] := RandomRealToken()               // 10%: random token
+    // else 10%: leave CorruptedIds[I] unchanged.
+    ;
+  end;
+end;
+
+procedure TNNetMaskedLMCollator.BuildTrainingPair(
+  const CorruptedIds, Labels: TNeuralIntegerArray; pInput, pTarget: TNNetVolume);
+var
+  Len, P: integer;
+begin
+  Len := Length(CorruptedIds);
+  if Length(Labels) <> Len then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator.BuildTrainingPair: CorruptedIds and Labels ' +
+      'lengths differ.');
+  if pInput.SizeX < Len then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator.BuildTrainingPair: input SizeX (' +
+      IntToStr(pInput.SizeX) + ') < sequence length (' + IntToStr(Len) + ').');
+  if pTarget.SizeX < Len then
+    raise Exception.Create(
+      'TNNetMaskedLMCollator.BuildTrainingPair: target SizeX (' +
+      IntToStr(pTarget.SizeX) + ') < sequence length (' + IntToStr(Len) + ').');
+  pInput.Fill(0);
+  pTarget.Fill(0);
+  for P := 0 to Len - 1 do
+  begin
+    if pInput.Depth = 1 then
+      pInput[P, 0, 0] := CorruptedIds[P]            // token ids on the X axis
+    else
+      pInput[P, 0, CorruptedIds[P]] := 1;           // one-hot on the depth axis
+    // Target: one-hot of the ORIGINAL id only at selected positions; ignored
+    // rows stay all-zero (no loss with ApplyLossMask).
+    if Labels[P] <> csMaskedLMIgnoreLabel then
+      pTarget[P, 0, Labels[P]] := 1;
+  end;
+end;
+
+procedure TNNetMaskedLMCollator.ApplyLossMask(const Labels: TNeuralIntegerArray;
+  Desired, Actual: TNNetVolume);
+var
+  P, D: integer;
+begin
+  for P := 0 to Length(Labels) - 1 do
+    if Labels[P] = csMaskedLMIgnoreLabel then
+      for D := 0 to Desired.Depth - 1 do
+        Desired[P, 0, D] := Actual[P, 0, D];
 end;
 
 procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes, ImgValidationVolumes,

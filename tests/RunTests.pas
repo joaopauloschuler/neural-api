@@ -13,6 +13,7 @@ uses
   TestNeuralLayersExtra, TestNeuralTraining, TestNeuralNumerical,
   TestNeuralScheduler, TestNeuralDecode, TestNeuralPretrained,
   TestNeuralDPO, TestNeuralNLPMetrics, TestNeuralPacking,
+  TestNeuralMaskedLM,
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy;
 
 type

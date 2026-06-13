@@ -346,15 +346,23 @@ rather than acted on.
       neuralnlpmetrics.pas are both waiting on the Unigram/SentencePiece
       tokenizer for real Marian/T5 checkpoints - wire an examples/ entry
       (and an examples/README.md mention) once that lands.
-- [ ] Masked-LM data collator (transformers DataCollatorForLanguageModeling
+- [X] Masked-LM data collator (transformers DataCollatorForLanguageModeling
       port): BERT-style dynamic masking — pick 15% of tokens, replace 80%
       with [MASK] / 10% random / 10% unchanged, loss only on masked
-      positions — plus whole-word masking and, as a stretch, T5 span
-      corruption (sentinel tokens). Everything in the current NLP stack is
+      positions. Everything in the current NLP stack is
       causal-LM; one collator unit unlocks encoder pretraining with the
       existing AddTransformerEncoderBlock, no new layers. Test: masked
       fraction and 80/10/10 split within tolerance at fixed seed; loss
       ignores unmasked positions exactly.
+      DONE: TNNetMaskedLMCollator in neuraldatasets.pas (seedable internal LCG
+      RNG; csMaskedLMIgnoreLabel=-1 ignore convention; Collate /
+      BuildTrainingPair / ApplyLossMask mirroring TNNetSequencePacker's
+      e=Output-Desired loss-mask contract); tests in
+      tests/TestNeuralMaskedLM.pas (7 tests, registered in RunTests.pas).
+      - [ ] Stretch deferred: whole-word masking (group subword pieces of one
+            word and mask them together).
+      - [ ] Stretch deferred: T5 span corruption with sentinel tokens
+            (contiguous-span masking, sentinel id stream).
 - [ ] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
       above): K learnable virtual-token embeddings prepended to the
       embedding-layer output, base model frozen — K*d_model trainable
