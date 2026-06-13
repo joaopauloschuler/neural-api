@@ -240,6 +240,7 @@ type
     procedure TestPearsonAndSpearmanCorrelation;
     procedure TestSTSReport;
     procedure TestRetrievalReport;
+    procedure TestE5EmbeddingParity;
     procedure TestColBERTParity;
     procedure TestColBERTMaxSimScore;
     procedure TestColBERTRetrievalReport;
@@ -7893,6 +7894,95 @@ begin
   finally
     for i := 0 to 0 do Q[i].Free;
     for i := 0 to 3 do P[i].Free;
+  end;
+end;
+
+// E5-style sentence-embedding parity (the deferred half of the
+// text-embedding / retrieval task): build the pico BertModel encoder from
+// tiny_e5.*, feed the pinned query/passage token-id sequences (the E5
+// "query: "/"passage: " prefix is baked into the leading ids by the
+// fixture maker), MEAN-pool over the real tokens + L2-normalize via
+// PoolSentenceEmbedding(epMean), and assert every pooled vector matches
+// the HF float64 oracle within 1e-4. Also checks the planted retrieval
+// signal (the shared-body passage ranks above the unrelated one).
+procedure TTestNeuralPretrained.TestE5EmbeddingParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  RefRoot: TJSONData;
+  RefObj: TJSONObject;
+  Sequences, RealTokens, RefEmb, IdsArr, RowArr: TJSONArray;
+  RefJson: TStringList;
+  Input, Hidden, Emb: TNNetVolume;
+  SeqCnt, PosCnt, ChanCnt, SeqLen, Hid, NReal: integer;
+  Diff, MaxDiff, S0, S1: double;
+  Embs: array of TNNetVolume;
+begin
+  RandSeed := 424242;
+  NN := nil;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Hidden := TNNetVolume.Create;
+  Emb := TNNetVolume.Create;
+  RefRoot := nil;
+  Embs := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_e5_embed.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    AssertEquals('pooling mode', 'mean', RefObj.Find('pooling').AsString);
+    Sequences := TJSONArray(RefObj.Find('sequences'));
+    RealTokens := TJSONArray(RefObj.Find('real_tokens'));
+    RefEmb := TJSONArray(RefObj.Find('embeddings'));
+    AssertTrue('sequences present', Sequences <> nil);
+    AssertTrue('at least 3 sequences', Sequences.Count >= 3);
+    SeqLen := TJSONArray(Sequences.Items[0]).Count;
+    NN := BuildBertFromSafeTensorsEx(FixturePath('tiny_e5.safetensors'),
+      Config, {SeqLen=}SeqLen, {pInferenceOnly=}false, {pIncludePooler=}false,
+      FixturePath('tiny_e5_config.json'));
+    Hid := Config.HiddenSize;
+    AssertEquals('net seqlen', SeqLen, NN.Layers[0].Output.SizeX);
+    Input.ReSize(SeqLen, 1, 2);
+    SetLength(Embs, Sequences.Count);
+    MaxDiff := 0;
+    for SeqCnt := 0 to Sequences.Count - 1 do
+    begin
+      IdsArr := TJSONArray(Sequences.Items[SeqCnt]);
+      NReal := RealTokens.Items[SeqCnt].AsInteger;
+      Input.Fill(0); // ids in channel 0, token-type channel 1 stays zero
+      for PosCnt := 0 to SeqLen - 1 do
+        Input.FData[PosCnt * 2] := IdsArr.Items[PosCnt].AsInteger;
+      NN.Compute(Input);
+      NN.GetOutput(Hidden);
+      // the deferred path under test: mean pool over REAL tokens + L2 norm
+      PoolSentenceEmbedding(Hidden, NReal, epMean, Emb, {Normalize=}True);
+      RowArr := TJSONArray(RefEmb.Items[SeqCnt]);
+      AssertEquals('embedding dim', Hid, RowArr.Count);
+      for ChanCnt := 0 to Hid - 1 do
+      begin
+        Diff := Abs(Emb.FData[ChanCnt] - RowArr.Items[ChanCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      Embs[SeqCnt] := TNNetVolume.Create();
+      Embs[SeqCnt].Copy(Emb);
+    end;
+    // 1e-4 gate (the published-parity convention for the embedding task).
+    AssertTrue('E5 embedding parity: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    // Planted retrieval signal: query (0) closer to shared-body passage (1)
+    // than to the unrelated passage (2). Cosine = dot (unit vectors).
+    S0 := CosineSimilarity(Embs[0], Embs[1]);
+    S1 := CosineSimilarity(Embs[0], Embs[2]);
+    AssertTrue('shared-body passage ranks above unrelated', S0 > S1);
+  finally
+    for SeqCnt := 0 to High(Embs) do
+      if Embs[SeqCnt] <> nil then Embs[SeqCnt].Free;
+    Emb.Free;
+    Hidden.Free;
+    Input.Free;
+    RefRoot.Free;
+    RefJson.Free;
+    NN.Free;
   end;
 end;
 

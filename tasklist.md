@@ -534,7 +534,7 @@ rather than acted on.
       task above; report duplicate-cluster stats. Test: planted
       near-duplicates (one-word edits) are found, distinct documents are
       not merged.
-- [ ] Text-embedding / retrieval inference + eval harness for the E5 / BGE /
+- [X] Text-embedding / retrieval inference + eval harness for the E5 / BGE /
       GTE retriever family on top of the landed encoder importers (BERT /
       ModernBERT, and the decoder-as-encoder last-token path for the
       Qwen2/Mistral-based e5-mistral / gte-Qwen2 retrievers). Today the repo
@@ -580,14 +580,18 @@ rather than acted on.
       TestEmbedInstructionPrefixTable, TestPearsonAndSpearmanCorrelation,
       TestSTSReport, TestRetrievalReport (synthetic vectors with pinned
       metric values).
-      STILL DEFERRED (RAM/time-gated, for a future agent): the pico parity
-      fixture (make_pico_*_fixture.py recipe) asserting one E5-or-BGE
-      checkpoint's pooled+normalized query/passage vectors match HF
-      sentence-transformers float64 within 1e-4, and the
-      examples/SemanticSearch-style demo that embeds passages and ranks them
-      against a query on CPU (the existing examples/SemanticSearch already
-      covers the MiniLM mean-pool case; the new piece would wire a pooling
-      mode + instruction prefix through it).
+      LANDED (a3, deferred half): the pico parity fixture
+      (tools/e5_embed_tiny_fixture.py — a SYNTHESIZED pico BertModel, the E5
+      forward is identical at any width) + tests/fixtures/tiny_e5.* with a HF
+      float64 oracle (mean-pool + L2-normalize, the prefix baked into the
+      token ids); TestE5EmbeddingParity in TestNeuralPretrained.pas asserts
+      the imported pooled+normalized query AND passage vectors match within
+      1e-4 (sentence-transformers NOT required — for E5/BGE its
+      SentenceTransformer is exactly AutoModel forward -> mean/CLS pool -> L2
+      normalize in float64). examples/EmbeddingSearch (self-contained sibling
+      of examples/SemanticSearch) wires the pooling-mode selector +
+      instruction-prefix table through a CPU-fast (<1s, no download) ranking
+      demo on the committed fixture. NOTHING MEANINGFUL REMAINS.
 
 - [X] ColBERT-style LATE-INTERACTION retrieval import + scorer (the third and
       missing RAG retrieval paradigm in the repo). The bi-encoder path is landed
