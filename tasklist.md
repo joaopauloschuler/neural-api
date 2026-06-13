@@ -125,38 +125,6 @@ rather than acted on.
       are exactly the kind of silent-wrong-output trap (logits off by a
       constant factor → wrong sampling temperature behaviour) that a tested
       importer prevents.
-- [X] Extractive question-answering (SQuAD) head import + EM/F1 eval — the
-      missing classic downstream-task head on top of the landed encoder
-      importers. Today only TWO task heads exist
-      (BuildBertForSequenceClassificationFromSafeTensors,
-      BuildGPT2ForSequenceClassificationFromSafeTensors), both single-vector
-      classifiers; extractive QA is genuinely DIFFERENT and not a near-duplicate
-      of either: the `qa_outputs` head is a [hidden -> 2] linear producing
-      PER-TOKEN start/end span logits (no pooling), decode picks the best span
-      `argmax_{s<=e<=s+maxlen} start[s]+end[e]` over the context tokens (not the
-      question), and the metric is SQuAD Exact-Match + token-F1 over the decoded
-      answer STRING (not classification accuracy). Nearly everything exists: the
-      backbone is the stock BERT/RoBERTa/DistilBERT path
-      (BuildBertFromSafeTensors / family name map), the tokenizers are landed,
-      and the offset-mapping helper (EncodeWithOffsets) already maps tokens back
-      to character spans so the predicted token span can be sliced out of the
-      original context. The genuinely new pieces: (a) a thin import EXTENSION
-      that loads the `qa_outputs` [hidden -> 2] dense (+bias) onto the encoder
-      (BuildBertForQuestionAnsweringFromSafeTensors[Ex], `*ForQuestionAnswering`
-      architectures), (b) a span-decode helper `AnswerSpan(question, context)`
-      that runs the [CLS] question [SEP] context [SEP] forward, masks
-      question/special positions, picks the top-scoring valid span, and returns
-      the answer substring via the offset map, and (c) a SQuAD `QAReport`
-      (Exact-Match + macro token-F1 over a planted question/context/gold-answer
-      set, mirroring the introspection-report pattern of the landed STSReport /
-      RetrievalReport). Deliverables: the importer + AnswerSpan + QAReport
-      helpers in neuralpretrained.pas, a pico parity fixture
-      (make_pico_*_fixture.py recipe) asserting the start/end span logits of one
-      distilbert-base-cased-distilled-squad / deepset-roberta-squad2-class
-      checkpoint match HF float64 within 1e-4, and an examples/ExtractiveQA demo
-      that answers a question from a short passage on CPU. Completes the
-      classify / retrieve / EXTRACT downstream-head trio on the encoder
-      backbones.
 - [ ] M2M100/NLLB translate demo + real-vocab check (follow-up to the landed
       BuildM2M100FromSafeTensors, commit cb21550): an examples/NLLBTranslate
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and
@@ -406,24 +374,6 @@ rather than acted on.
       the input and mix the targets by area fraction (Beta-distributed
       lambda). The CIFAR image-classification examples give an instant
       bake-off harness.
-- [X] Contrastive search decoding follow-up — LANDED:
-      DecodeContrastiveSearchStreamed in neuraldecode.pas (token-level /
-      KV-cache variant, driven by TNNetStreamingDecoder). The full re-encode
-      per step is GONE: p(.) is the previous committed streamed step's output
-      row; each top-k candidate's hidden state is read via the fork/rollback
-      primitive (StepForward appends K/V -> Session.HiddenState() ->
-      TruncateTo(committedLen) rolls back) so candidates are evaluated against
-      the CACHED state, not a re-encode; the chosen token commits with one
-      StepForward (no extra commit forward). The reusable primitive added on
-      TNNetStreamingDecoder is HiddenState() (last-hidden-state accessor) on top
-      of the existing TruncateTo() cache rollback — the KV-cache beam +
-      best-of-N tasks want the same pair. alpha=0 degrades BIT-FOR-BIT to the
-      streamed greedy argmax (GenerateTokensStreamed nil sampler); tests in
-      TestNeuralDecode (AlphaZeroMatchesStreamedGreedy / Deterministic /
-      AlphaChangesSelection). NOTE: one width-1 forward per candidate REMAINS
-      and is inherent — h_v depends on candidate v as the model input (HF
-      batches the same k forwards); what this removes vs v1 is the O(context)
-      re-encode that v1 paid on top of each.
 - [ ] Batched generation with left-padding in neural/neuraldecode.pas:
       generate for N prompts in one forward pass per step (today's decode
       paths look single-sample). Makes evaluation sweeps cheap and is a
