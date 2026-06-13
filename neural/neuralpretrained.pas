@@ -4085,9 +4085,28 @@ begin
         for i := 0 to TJSONArray(MoEMlpOnlyArr).Count - 1 do
           Result.MoEMlpOnlyLayers[i] := TJSONArray(MoEMlpOnlyArr).Integers[i];
       end;
+      // Qwen3-MoE sliding window: HF Qwen3MoeConfig sets
+      // self.sliding_window = sliding_window if use_sliding_window else None,
+      // and the model bands EVERY layer's causal mask with that window when it
+      // is not None (create_sliding_window_causal_mask, no max_window_layers
+      // gating in this revision - unlike the older Qwen2 first-N-layers
+      // scheme). So use_sliding_window=true with a positive sliding_window is
+      // exactly the Mistral convention: SlidingWindow > 0 => every layer local
+      // (LlamaLayerWindow above bands each SDPA via pWindow/FStruct[2]).
       if Obj.Get('use_sliding_window', False) then
-        ImportError('Llama import: Qwen3-MoE use_sliding_window=true is not ' +
-          'wired into this importer yet.');
+      begin
+        SlidingWindowField := Obj.Find('sliding_window');
+        if (SlidingWindowField <> nil) and not SlidingWindowField.IsNull then
+        begin
+          Result.SlidingWindow := SlidingWindowField.AsInteger;
+          if Result.SlidingWindow < 1 then
+            ImportError('Llama import: config sliding_window must be a ' +
+              'positive integer or null, got ' +
+              SlidingWindowField.AsJSON + '.');
+        end;
+        // use_sliding_window=true with sliding_window=null leaves
+        // SlidingWindow=0 (full attention), matching HF's None fallback.
+      end;
     end
     else if (ModelType = 'gemma') or (ModelType = 'gemma2') or
             (ModelType = 'gemma3_text') then

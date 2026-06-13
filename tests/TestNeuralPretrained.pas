@@ -156,6 +156,7 @@ type
     procedure TestQwen3LogitParity;
     procedure TestQwen3MoeLogitParity;
     procedure TestQwen3MoeMixedLogitParity;
+    procedure TestQwen3MoeWindowLogitParity;
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
@@ -4711,6 +4712,63 @@ begin
       Config.NumLocalExperts + 2, SwiGLUCnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_moe_mixed_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the Qwen3-MoE SLIDING-WINDOW import path (use_sliding_window=true).
+// HF Qwen3MoeConfig sets self.sliding_window = sliding_window if
+// use_sliding_window else None, and bands EVERY layer's causal mask with that
+// window when it is not None (create_sliding_window_causal_mask, no
+// max_window_layers gating) - so the importer maps it onto the Mistral
+// convention (Config.SlidingWindow > 0 => every layer local) and threads the
+// window into each TNNetScaledDotProductAttention via pWindow/FStruct[2].
+// tests/fixtures/tiny_qwen3_moe_window.* is a pico randomly-initialized
+// Qwen3MoeForCausalLM (2 all-MoE layers, sliding_window=3 over a length-16
+// sequence). tools/qwen3_moe_window_tiny_fixture.py asserts the window is
+// non-vacuous (re-running with full attention moves the logits by 3.58, far
+// above the 1e-4 parity gate). The test pins (a) the config parse
+// (SlidingWindow=3, no longer a loud rejection), (b) EVERY SDPA head carrying
+// Window=3, and (c) next-token logit parity vs the float64 oracle.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen3MoeWindowLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, SDPACnt: integer;
+  SDPA: TNNetScaledDotProductAttention;
+begin
+  RandSeed := 424242;
+  NN := BuildQwen3MoeFromSafeTensorsEx(
+    FixturePath('tiny_qwen3_moe_window.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_qwen3_moe_window_config.json'));
+  try
+    AssertEquals('model_type', 'qwen3_moe', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertTrue('is_moe', Config.IsMoE);
+    // use_sliding_window=true with sliding_window=3 is now wired (was a loud
+    // rejection); HF gates the window behind use_sliding_window, so the
+    // config parse must surface SlidingWindow=3 (not 0 / full attention).
+    AssertEquals('sliding_window honored', 3, Config.SlidingWindow);
+    // EVERY SDPA head (both all-MoE layers, every head) carries Window=3.
+    SDPACnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+      begin
+        SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
+        AssertEquals('SDPA head ' + IntToStr(SDPACnt) + ' window', 3,
+          SDPA.Window);
+        Inc(SDPACnt);
+      end;
+    end;
+    AssertEquals('SDPA heads = NumHeads * layers', Config.NumHeads * 2,
+      SDPACnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_moe_window_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
     NN.Free;

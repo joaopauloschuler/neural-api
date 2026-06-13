@@ -93,15 +93,21 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Qwen3-MoE importer follow-up — SLIDING-WINDOW remainder only. MIXED
+- [X] Qwen3-MoE importer follow-up — SLIDING-WINDOW remainder. MIXED
       dense/MoE layers DONE (per-layer LlamaLayerIsMoE gate mirrors HF
       modeling_qwen3_moe: layer i is MoE iff i not in mlp_only_layers AND
       (i+1) mod decoder_sparse_step = 0; else dense SwiGLU FFN of full
       intermediate_size). Pico fixture tools/qwen3_moe_mixed_tiny_fixture.py
       (decoder_sparse_step=2, 3 layers -> dense/MoE/dense) + parity test
-      TestQwen3MoeMixedLogitParity. STILL OPEN: use_sliding_window=true is
-      still rejected loudly — wire it through the existing SDPA window arg
-      (FStruct[2]) like Gemma-2/Qwen2 do.
+      TestQwen3MoeMixedLogitParity. use_sliding_window=true NOW WIRED: HF
+      Qwen3MoeConfig sets sliding_window = sliding_window if use_sliding_window
+      else None and bands EVERY layer (create_sliding_window_causal_mask, no
+      max_window_layers gating), so the importer maps it onto the Mistral
+      convention (SlidingWindow > 0 => every layer local) threading the window
+      into each SDPA via pWindow/FStruct[2]. Pico fixture
+      tools/qwen3_moe_window_tiny_fixture.py (sliding_window=3 over len-16,
+      non-vacuity 3.58) + parity test TestQwen3MoeWindowLogitParity (also pins
+      every SDPA head Window=3).
 - [ ] GPT-OSS importer (BuildGptOssFromSafeTensors[Ex], model_type "gpt_oss",
       i.e. openai/gpt-oss-20b and gpt-oss-120b — OpenAI's first open-weight
       release and currently the highest-profile open MoE LLM with NO import
