@@ -16,9 +16,9 @@ unit TestNeuralPretrained;
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry, fpjson, jsonparser,
+  Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
-  neuralgguf, neuralpretrained, neuralhftokenizer, neuralaudio;
+  neuralgguf, neuralmxfp4, neuralpretrained, neuralhftokenizer, neuralaudio;
 
 type
   TTestNeuralPretrained = class(TTestCase)
@@ -142,6 +142,8 @@ type
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestGGUFWriterRoundTrip;
+    procedure TestMXFP4DequantHandBlock;
+    procedure TestMXFP4DequantNaNScale;
     procedure TestShardedReaderMatchesSingleFile;
     procedure TestShardedLlamaLogitsBitIdentical;
     procedure TestDistilGPT2LogitParity;
@@ -7820,6 +7822,71 @@ begin
     AdaptNN.Free;
     MergeNN.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestMXFP4DequantHandBlock;
+var
+  Blocks: array[0..15] of byte;
+  Scales: array[0..0] of byte;
+  Dest: array[0..31] of single;
+  Expected: array[0..31] of single;
+  i: integer;
+begin
+  RandSeed := 424242;
+  // One MXFP4 block: 16 packed bytes -> 32 FP4 values. Within each byte the
+  // LOW nibble is the EVEN element, the HIGH nibble is the ODD element.
+  // Bytes chosen so the 32 nibbles sweep a known pattern.
+  Blocks[0] := $10; Blocks[1] := $32; Blocks[2] := $54; Blocks[3] := $76;
+  Blocks[4] := $98; Blocks[5] := $BA; Blocks[6] := $DC; Blocks[7] := $FE;
+  Blocks[8] := $01; Blocks[9] := $23; Blocks[10] := $45; Blocks[11] := $67;
+  Blocks[12] := $89; Blocks[13] := $AB; Blocks[14] := $CD; Blocks[15] := $EF;
+  // E8M0 scale byte 129 -> exponent 129-127 = 2 -> scale = 4.0.
+  Scales[0] := 129;
+  // Hand-computed: MXFP4_LUT[nibble] * 4.0. LUT positive half
+  // [0,0.5,1,1.5,2,3,4,6], negative half negated. Cross-checked against
+  // transformers _convert_moe_packed_tensors (FP4_VALUES table).
+  Expected[0]  :=   0.0; Expected[1]  :=   2.0; Expected[2]  :=   4.0;
+  Expected[3]  :=   6.0; Expected[4]  :=   8.0; Expected[5]  :=  12.0;
+  Expected[6]  :=  16.0; Expected[7]  :=  24.0; Expected[8]  :=   0.0;
+  Expected[9]  :=  -2.0; Expected[10] :=  -4.0; Expected[11] :=  -6.0;
+  Expected[12] :=  -8.0; Expected[13] := -12.0; Expected[14] := -16.0;
+  Expected[15] := -24.0; Expected[16] :=   2.0; Expected[17] :=   0.0;
+  Expected[18] :=   6.0; Expected[19] :=   4.0; Expected[20] :=  12.0;
+  Expected[21] :=   8.0; Expected[22] :=  24.0; Expected[23] :=  16.0;
+  Expected[24] :=  -2.0; Expected[25] :=   0.0; Expected[26] :=  -6.0;
+  Expected[27] :=  -4.0; Expected[28] := -12.0; Expected[29] :=  -8.0;
+  Expected[30] := -24.0; Expected[31] := -16.0;
+
+  DequantizeMXFP4(@Blocks[0], @Scales[0], 1, @Dest[0]);
+  for i := 0 to 31 do
+    AssertEquals('MXFP4 element ' + IntToStr(i), Expected[i], Dest[i], 0);
+
+  // Scale byte 127 -> exponent 0 -> scale 1.0: dequant equals raw LUT values.
+  Scales[0] := 127;
+  DequantizeMXFP4(@Blocks[0], @Scales[0], 1, @Dest[0]);
+  // Element 5 -> high nibble of byte 2 ($5 = 3.0) at scale 1.0.
+  AssertEquals('MXFP4 scale=1 elem5', 3.0, Dest[5], 0);
+  // Element 7 -> high nibble of byte 3 ($7 = 6.0).
+  AssertEquals('MXFP4 scale=1 elem7', 6.0, Dest[7], 0);
+  // Element 31 -> high nibble of byte 15 ($EF) = $E = LUT[14] = -4.0.
+  AssertEquals('MXFP4 scale=1 elem31', -4.0, Dest[31], 0);
+end;
+
+procedure TTestNeuralPretrained.TestMXFP4DequantNaNScale;
+var
+  Blocks: array[0..15] of byte;
+  Scales: array[0..0] of byte;
+  Dest: array[0..31] of single;
+  i: integer;
+begin
+  RandSeed := 424242;
+  for i := 0 to 15 do Blocks[i] := $12;       // arbitrary nibbles
+  // 0xFF is the reserved E8M0 NaN scale -> whole block is NaN.
+  Scales[0] := $FF;
+  DequantizeMXFP4(@Blocks[0], @Scales[0], 1, @Dest[0]);
+  for i := 0 to 31 do
+    AssertTrue('MXFP4 NaN-scale element ' + IntToStr(i) + ' is NaN',
+      IsNan(Dest[i]));
 end;
 
 initialization
