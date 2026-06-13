@@ -94,6 +94,26 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] StarCoder2 importer (model_type "starcoder2") — the most-used modern
+      open CODE LLM family (bigcode/starcoder2-3b/7b/15b) and the first
+      code-specialised model in the repo. Architecturally DISTINCT from every
+      landed Llama-path importer, so it adds real coverage rather than a near-
+      duplicate: it pairs RoPE + GQA + (optional) sliding-window attention
+      with three GPT-2-flavoured pieces that the RMSNorm/SwiGLU importers do
+      NOT exercise — (a) LayerNorm (norm_type "layer_norm", with bias) instead
+      of RMSNorm, (b) bias=True on ALL linears including q/k/v AND o_proj (the
+      exact path OLMo2 deliberately REJECTS — see the olmo2 memory), and (c) a
+      plain GELU-tanh two-matrix FFN (c_fc -> gelu_pytorch_tanh -> c_proj, no
+      gate), so it reuses TNNetGELU + the attention_bias plumbing already in
+      neuralpretrained.pas but on a dedicated LayerNorm pre-norm block builder.
+      Embeddings are untied (separate lm_head). Deliverables:
+      BuildStarCoder2FromSafeTensors[Ex] (+ .bin dispatch), a pico parity
+      fixture via the make_pico_*_fixture.py recipe asserting next-token logits
+      vs HF float64 within the 1e-4 gate (exercise BOTH a full-attention and a
+      sliding-window config), and a short examples/StarCoder2Complete code-
+      completion demo on CPU. Tokenizer is the stock BPE tokenizer.json path
+      (already supported). Opens the door to GPT-BigCode/StarCoder-v1 (MQA +
+      learned absolute positions) as a later relative.
 - [ ] GPT-OSS importer follow-ups (BuildGptOssFromSafeTensors[Ex] LANDED,
       model_type "gpt_oss", with TNNetGptOssSinkAttention per-head scalar sink +
       alternating sliding/full window + YaRN truncate flag + top-k MoE +
