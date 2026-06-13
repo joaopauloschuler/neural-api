@@ -406,11 +406,20 @@ rather than acted on.
       in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
       (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real rewards.
-- [ ] Seq2seq translation/summarization EXAMPLE on the landed beam: wire an
+- [X] Seq2seq translation/summarization EXAMPLE on the landed beam: wire an
       examples/ entry (and an examples/README.md mention) using
       DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in neuralnlpmetrics.pas
       over a real Marian/T5 checkpoint (the Unigram tokenizer these need has
       landed, reading the checkpoint's tokenizer.json).
+      DONE: examples/Seq2SeqTranslate (.lpr + .lpi + README) imports the
+      committed pico Marian fixture OFFLINE (no download), runs
+      DecodeSeq2SeqBeamSearch, and prints corpus BLEU + ROUGE-1/2/L over the
+      decoded ids (token-id metric overloads). Random pico weights => it is a
+      PLUMBING demo (import -> beam -> BLEU/ROUGE), with determinism +
+      self-reference==1.0 assertions; builds/runs in <3GB. examples/Summarize
+      is the real-checkpoint text counterpart (BART/Pegasus). The earlier
+      Summarize example was checkpoint-only (ROUGE-only, no offline path), so
+      this offline BLEU+ROUGE fixture demo is the deliverable.
 - [ ] Offset-mapping follow-up: EncodeWithOffsets (commit 1e90b8a) is a
       post-hoc surface-match heuristic (each token's DecodeToken surface
       located forward at the running cursor), so it leaves tokens unmapped
