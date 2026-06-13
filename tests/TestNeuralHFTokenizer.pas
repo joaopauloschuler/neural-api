@@ -18,7 +18,7 @@ interface
 
 uses
   Classes, SysUtils, fpcunit, testregistry, fpjson, jsonparser,
-  neuralvolume, neuralhftokenizer, neuralchat;
+  neuralvolume, neuralhftokenizer, neuralchat, neuralgguf;
 
 type
   TTestNeuralHFTokenizer = class(TTestCase)
@@ -54,6 +54,14 @@ type
     procedure TestDropoutZeroIsBitIdentical;
     procedure TestDropoutOneIsMaximallySplit;
     procedure TestDropoutSeededIsDeterministicAndDiffers;
+    // GGUF embedded-tokenizer loader (LoadFromGGUF): write the unigram /
+    // cl100k-BPE fixture's vocab+scores(+merges) into a temp .gguf as
+    // tokenizer.ggml.* (model "llama" / "gpt2"), read it back, and assert
+    // Encode/Decode match the tokenizer.json source exactly; plus the
+    // unsupported-model rejection.
+    procedure TestLoadFromGGUFLlamaRoundTrip;
+    procedure TestLoadFromGGUFGpt2RoundTrip;
+    procedure TestLoadFromGGUFRejectsUnsupportedModel;
   end;
 
   // Tests for the chat templates in neuralchat.pas. The flagship tests
@@ -638,6 +646,264 @@ begin
     AssertEquals('seeded dropout round-trips', Text, Tok.Decode(RunA, true));
   finally
     Tok.Free;
+  end;
+end;
+
+// Reads a tokenizer.json fixture and emits an equivalent tokenizer.ggml.*
+// block (model "llama" Unigram-with-scores, or "gpt2" byte-level BPE with
+// merges) into GGUFPath. A single dummy F32 tensor keeps the GGUF valid.
+// This is the WRITE half of the GGUF embedded-tokenizer round-trip oracle.
+procedure WriteTokenizerGGUFFromJSON(const JSONPath, GGUFPath, Model: string;
+  BosId, EosId, UnkId: integer);
+var
+  FS: TFileStream;
+  RawJson: string;
+  Root: TJSONData;
+  RootObj, ModelObj, VocabObj: TJSONObject;
+  VocabArr, MergesArr, AddedArr, Pair: TJSONArray;
+  Writer: TNNetGGUFWriter;
+  Tokens, Merges: array of string;
+  Scores: array of single;
+  Types: array of Int64;
+  Cnt, Idx, TokId: integer;
+  Content: string;
+  Dummy: TNNetVolume;
+  IsLlama: boolean;
+begin
+  IsLlama := Model = 'llama';
+  FS := TFileStream.Create(JSONPath, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(RawJson, FS.Size);
+    if FS.Size > 0 then FS.ReadBuffer(RawJson[1], FS.Size);
+  finally
+    FS.Free;
+  end;
+  Root := HFParseJSONRaw(HFDecodeUnicodeEscapes(RawJson));
+  try
+    RootObj := TJSONObject(Root);
+    ModelObj := RootObj.Objects['model'];
+
+    if IsLlama then
+    begin
+      // Unigram vocab is an array of [piece, log_prob]; index = id.
+      VocabArr := ModelObj.Arrays['vocab'];
+      SetLength(Tokens, VocabArr.Count);
+      SetLength(Scores, VocabArr.Count);
+      SetLength(Types, VocabArr.Count);
+      for Cnt := 0 to VocabArr.Count - 1 do
+      begin
+        Pair := TJSONArray(VocabArr.Items[Cnt]);
+        Tokens[Cnt] := Pair.Strings[0];
+        Scores[Cnt] := Pair.Floats[1];
+        Types[Cnt] := 1; // NORMAL (overridden for added/special below)
+      end;
+    end
+    else
+    begin
+      // BPE vocab is an object token -> id; rebuild the id-indexed list.
+      VocabObj := ModelObj.Objects['vocab'];
+      Idx := 0;
+      for Cnt := 0 to VocabObj.Count - 1 do
+        if VocabObj.Items[Cnt].AsInteger > Idx then
+          Idx := VocabObj.Items[Cnt].AsInteger;
+      SetLength(Tokens, Idx + 1);
+      SetLength(Scores, Idx + 1);
+      SetLength(Types, Idx + 1);
+      for Cnt := 0 to VocabObj.Count - 1 do
+      begin
+        TokId := VocabObj.Items[Cnt].AsInteger;
+        Tokens[TokId] := VocabObj.Names[Cnt];
+        Scores[TokId] := 0;
+        Types[TokId] := 1;
+      end;
+      MergesArr := ModelObj.Arrays['merges'];
+      SetLength(Merges, MergesArr.Count);
+      for Cnt := 0 to MergesArr.Count - 1 do
+        Merges[Cnt] := TJSONArray(MergesArr.Items[Cnt]).Strings[0] + ' ' +
+          TJSONArray(MergesArr.Items[Cnt]).Strings[1];
+    end;
+
+    // Tag special / control pieces from added_tokens so token_type carries
+    // them (CONTROL=3; the unk piece UNKNOWN=2).
+    if RootObj.IndexOfName('added_tokens') >= 0 then
+    begin
+      AddedArr := RootObj.Arrays['added_tokens'];
+      for Cnt := 0 to AddedArr.Count - 1 do
+      begin
+        TokId := AddedArr.Objects[Cnt].Get('id', -1);
+        Content := AddedArr.Objects[Cnt].Get('content', '');
+        if (TokId >= 0) and (TokId <= High(Types)) then
+        begin
+          if Content = '<unk>' then Types[TokId] := 2 else Types[TokId] := 3;
+        end;
+      end;
+    end;
+  finally
+    Root.Free;
+  end;
+
+  Writer := TNNetGGUFWriter.Create(GGUFPath);
+  Dummy := TNNetVolume.Create(4, 1, 1);
+  try
+    Writer.AddMetaString('general.architecture', 'llama');
+    Writer.AddMetaString('tokenizer.ggml.model', Model);
+    Writer.AddMetaStringArray('tokenizer.ggml.tokens', Tokens);
+    Writer.AddMetaFloat32Array('tokenizer.ggml.scores', Scores);
+    Writer.AddMetaInt32Array('tokenizer.ggml.token_type', Types);
+    if Length(Merges) > 0 then
+      Writer.AddMetaStringArray('tokenizer.ggml.merges', Merges);
+    if BosId >= 0 then
+      Writer.AddMetaUInt32('tokenizer.ggml.bos_token_id', BosId);
+    if EosId >= 0 then
+      Writer.AddMetaUInt32('tokenizer.ggml.eos_token_id', EosId);
+    if UnkId >= 0 then
+      Writer.AddMetaUInt32('tokenizer.ggml.unknown_token_id', UnkId);
+    Dummy.Fill(0);
+    Writer.AddTensorFlat('token_embd.weight', [1, 4], Dummy, gwF32);
+    Writer.SaveToFile;
+  finally
+    Dummy.Free;
+    Writer.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestLoadFromGGUFLlamaRoundTrip;
+var
+  Src, Gguf: TNeuralHFTokenizer;
+  GGUFPath: string;
+  Texts: array[0..3] of string;
+  T: integer;
+  IdsSrc, IdsG: TNeuralIntegerArray;
+  K: integer;
+begin
+  Texts[0] := 'the';
+  Texts[1] := 'the cat sat on the mat';
+  Texts[2] := 'a man and a dog';
+  Texts[3] := 'the QXZ cat';
+  GGUFPath := GetTempDir(false) + 'cai_tok_gguf_llama_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Src := TNeuralHFTokenizer.Create();
+  Gguf := TNeuralHFTokenizer.Create();
+  try
+    Src.LoadFromFile(FixturePath('tiny_unigram_tokenizer.json'));
+    // unk=0, bos=1 (<s>), eos=2 (</s>) per the fixture's added_tokens.
+    WriteTokenizerGGUFFromJSON(FixturePath('tiny_unigram_tokenizer.json'),
+      GGUFPath, 'llama', {bos=}1, {eos=}2, {unk=}0);
+    Gguf.LoadFromGGUF(GGUFPath);
+
+    AssertTrue('gguf llama unigram flag', Gguf.IsUnigram);
+    AssertEquals('gguf llama vocab size', Src.GetVocabSize(),
+      Gguf.GetVocabSize());
+    AssertEquals('gguf llama unk id', 0, Gguf.UnkId);
+    AssertEquals('gguf llama bos id', 1, Gguf.BosId);
+    AssertEquals('gguf llama eos id', 2, Gguf.EosId);
+
+    for T := 0 to High(Texts) do
+    begin
+      IdsSrc := Src.Encode(Texts[T]);
+      IdsG := Gguf.Encode(Texts[T]);
+      AssertEquals('gguf llama id count "' + Texts[T] + '"',
+        Length(IdsSrc), Length(IdsG));
+      for K := 0 to High(IdsSrc) do
+        AssertEquals('gguf llama id[' + IntToStr(K) + '] "' + Texts[T] + '"',
+          IdsSrc[K], IdsG[K]);
+      AssertEquals('gguf llama decode "' + Texts[T] + '"',
+        Src.Decode(IdsSrc, true), Gguf.Decode(IdsG, true));
+    end;
+  finally
+    Gguf.Free;
+    Src.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestLoadFromGGUFGpt2RoundTrip;
+var
+  Src, Gguf: TNeuralHFTokenizer;
+  GGUFPath: string;
+  Texts: array[0..3] of string;
+  T: integer;
+  IdsSrc, IdsG: TNeuralIntegerArray;
+  K: integer;
+begin
+  Texts[0] := 'the cat sat on the mat';
+  Texts[1] := 'Hello, world!';
+  Texts[2] := 'a man and a dog 123';
+  Texts[3] := 'the dog ran';
+  GGUFPath := GetTempDir(false) + 'cai_tok_gguf_gpt2_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Src := TNeuralHFTokenizer.Create();
+  Gguf := TNeuralHFTokenizer.Create();
+  try
+    // The cl100k fixture is byte-level BPE with the Split pre-tokenizer
+    // (digits capped at 3) - exactly the config the gpt2 GGUF path wires.
+    Src.LoadFromFile(FixturePath('tiny_bpe_split_cl100k_tokenizer.json'));
+    // <|endoftext|> is id 0 and doubles as eos/bos for this GPT-2 family.
+    WriteTokenizerGGUFFromJSON(
+      FixturePath('tiny_bpe_split_cl100k_tokenizer.json'),
+      GGUFPath, 'gpt2', {bos=}-1, {eos=}0, {unk=}-1);
+    Gguf.LoadFromGGUF(GGUFPath);
+
+    AssertTrue('gguf gpt2 byte-level flag', Gguf.IsByteLevel);
+    AssertEquals('gguf gpt2 vocab size', Src.GetVocabSize(),
+      Gguf.GetVocabSize());
+
+    for T := 0 to High(Texts) do
+    begin
+      IdsSrc := Src.Encode(Texts[T]);
+      IdsG := Gguf.Encode(Texts[T]);
+      AssertEquals('gguf gpt2 id count "' + Texts[T] + '"',
+        Length(IdsSrc), Length(IdsG));
+      for K := 0 to High(IdsSrc) do
+        AssertEquals('gguf gpt2 id[' + IntToStr(K) + '] "' + Texts[T] + '"',
+          IdsSrc[K], IdsG[K]);
+      AssertEquals('gguf gpt2 decode "' + Texts[T] + '"',
+        Src.Decode(IdsSrc, true), Gguf.Decode(IdsG, true));
+    end;
+  finally
+    Gguf.Free;
+    Src.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestLoadFromGGUFRejectsUnsupportedModel;
+var
+  Gguf: TNeuralHFTokenizer;
+  GGUFPath: string;
+  Writer: TNNetGGUFWriter;
+  Dummy: TNNetVolume;
+  Raised: boolean;
+begin
+  GGUFPath := GetTempDir(false) + 'cai_tok_gguf_bert_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Writer := TNNetGGUFWriter.Create(GGUFPath);
+  Dummy := TNNetVolume.Create(4, 1, 1);
+  try
+    Writer.AddMetaString('general.architecture', 'bert');
+    Writer.AddMetaString('tokenizer.ggml.model', 'bert');
+    Writer.AddMetaStringArray('tokenizer.ggml.tokens',
+      ['[PAD]', '[UNK]', 'the', 'cat']);
+    Dummy.Fill(0);
+    Writer.AddTensorFlat('token_embd.weight', [1, 4], Dummy, gwF32);
+    Writer.SaveToFile;
+  finally
+    Dummy.Free;
+    Writer.Free;
+  end;
+
+  Gguf := TNeuralHFTokenizer.Create();
+  Raised := false;
+  try
+    try
+      Gguf.LoadFromGGUF(GGUFPath);
+    except
+      on E: EHFTokenizerError do Raised := true;
+    end;
+    AssertTrue('gguf bert tokenizer model rejected', Raised);
+  finally
+    Gguf.Free;
+    DeleteFile(GGUFPath);
   end;
 end;
 

@@ -105,7 +105,7 @@ unit neuralhftokenizer;
 interface
 
 uses
-  Classes, SysUtils, fpjson, neuralvolume;
+  Classes, SysUtils, fpjson, neuralvolume, neuralgguf;
 
 type
   EHFTokenizerError = class(Exception);
@@ -228,6 +228,25 @@ type
       // normalization is NOT applied (same approximation stance as the
       // tokenizer.json Unigram path).
       procedure LoadSentencePieceModel(const FileName: string);
+
+      // Loads the tokenizer straight from the tokenizer.ggml.* metadata of a
+      // .gguf checkpoint, so a single .gguf file is self-contained for
+      // generation (no sidecar tokenizer.json / .model needed). Opens the
+      // file through TNNetGGUFReader, reads tokenizer.ggml.model and the
+      // tokens / scores / token_type (and, for gpt2, merges) arrays, and
+      // populates the SAME internal structures the tokenizer.json / .model
+      // loaders use, so Encode/Decode behave identically.
+      //   * tokenizer.ggml.model = "llama"  -> SentencePiece-with-scores fed
+      //     into the Unigram (Viterbi) path: metaspace U+2581, <0xNN> byte
+      //     fallback, special pieces (token_type CONTROL/UNKNOWN/USER_DEFINED)
+      //     exposed as added tokens.
+      //   * tokenizer.ggml.model = "gpt2"   -> byte-level BPE: tokens + the
+      //     tokenizer.ggml.merges array fed into the BPE path with the GPT-2
+      //     bytes<->unicode table and the cl100k Split pre-tokenizer.
+      //   * "bert" / "no_vocab" (and any other value) raise EHFTokenizerError
+      //     (deferred). Special-token ids come from
+      //     tokenizer.ggml.{bos,eos,unknown,padding}_token_id when present.
+      procedure LoadFromGGUF(const FileName: string);
 
       // Text -> token ids. Special tokens are matched if present verbatim
       // in the text but never auto-injected.
@@ -1414,6 +1433,154 @@ begin
       FAddedTokens[High(FAddedTokens)].Id := Cnt;
       FAddedTokens[High(FAddedTokens)].Special := true;
     end;
+end;
+
+procedure TNeuralHFTokenizer.LoadFromGGUF(const FileName: string);
+// GGUF tokenizer.ggml.token_type enum (llama.cpp llama_token_attr / the
+// legacy llama_token_type values shipped in tokenizer.ggml.token_type):
+//   1 = NORMAL, 2 = UNKNOWN, 3 = CONTROL, 4 = USER_DEFINED, 5 = UNUSED,
+//   6 = BYTE. CONTROL / UNKNOWN / USER_DEFINED pieces are exposed as added
+//   tokens so they round-trip verbatim and Decode(skip_special) drops them.
+var
+  Reader: TNNetGGUFReader;
+  Model: string;
+  TokCount, Cnt: integer;
+  ScoreCount, TypeCount, MergeCount: Int64;
+  HasScores, HasTypes: boolean;
+  TokType: integer;
+  Content, MergeStr, Left, Right: string;
+  SpacePos: integer;
+  MetaBos, MetaEos, MetaUnk: Int64;
+begin
+  ClearState();
+  // No JSON is involved (the GGUF reader handles raw bytes), so the fpjson
+  // key-mangling probe would be wasted, like the .model path.
+  Reader := TNNetGGUFReader.Create(FileName);
+  try
+    Model := Reader.GetMetaString('tokenizer.ggml.model', '');
+    if Model = '' then
+      raise EHFTokenizerError.Create('GGUF: no tokenizer.ggml.model metadata ' +
+        'in ' + FileName + ' (file carries no embedded tokenizer).');
+
+    TokCount := integer(Reader.GetMetaArrayCount('tokenizer.ggml.tokens'));
+    if TokCount = 0 then
+      raise EHFTokenizerError.Create('GGUF: tokenizer.ggml.tokens is empty ' +
+        'in ' + FileName + '.');
+
+    ScoreCount := Reader.GetMetaArrayCount('tokenizer.ggml.scores');
+    TypeCount := Reader.GetMetaArrayCount('tokenizer.ggml.token_type');
+    HasScores := ScoreCount = TokCount;
+    HasTypes := TypeCount = TokCount;
+
+    // ---- vocab (the 0-based array index IS the id) ----
+    SetLength(FIdToToken, TokCount);
+    for Cnt := 0 to TokCount - 1 do
+    begin
+      Content := Reader.GetMetaArrayString('tokenizer.ggml.tokens', Cnt);
+      FVocab.AddObject(Content, TObject(PtrInt(Cnt)));
+      FIdToToken[Cnt] := Content;
+    end;
+
+    // ---- special-token ids (authoritative scalar metadata) ----
+    MetaBos := Reader.GetMetaInt('tokenizer.ggml.bos_token_id', -1);
+    MetaEos := Reader.GetMetaInt('tokenizer.ggml.eos_token_id', -1);
+    MetaUnk := Reader.GetMetaInt('tokenizer.ggml.unknown_token_id', -1);
+    if MetaBos >= 0 then FBosId := integer(MetaBos);
+    if MetaEos >= 0 then FEosId := integer(MetaEos);
+    if MetaUnk >= 0 then FUnkId := integer(MetaUnk);
+
+    if Model = 'llama' then
+    begin
+      // SentencePiece-with-scores -> the Unigram (Viterbi) path, exactly like
+      // the raw .model reader: metaspace U+2581, <0xNN> byte fallback.
+      FUnigram := true;
+      FByteFallback := true;
+      SetLength(FUniScore, TokCount);
+      FUniMinScore := 0;
+      for Cnt := 0 to TokCount - 1 do
+      begin
+        if HasScores
+        then FUniScore[Cnt] :=
+          Reader.GetMetaArrayNumber('tokenizer.ggml.scores', Cnt)
+        else FUniScore[Cnt] := 0;
+        if (Cnt = 0) or (FUniScore[Cnt] < FUniMinScore) then
+          FUniMinScore := FUniScore[Cnt];
+      end;
+
+      // Metaspace pre-tokenizer + decoder (same wiring the .model path uses).
+      FMetaspacePreTok := true;
+      FMSReplacement := csMetaspace;
+      FMSPrependScheme := 'always';
+      FMSSplit := true;
+      SetLength(FDecReplaceFrom, 1);
+      SetLength(FDecReplaceTo, 1);
+      FDecReplaceFrom[0] := csMetaspace;
+      FDecReplaceTo[0] := ' ';
+      FDecStripLeft := 1;
+
+      // Expose CONTROL / UNKNOWN / USER_DEFINED pieces as added tokens.
+      SetLength(FAddedTokens, 0);
+      for Cnt := 0 to TokCount - 1 do
+      begin
+        if HasTypes
+        then TokType := integer(Round(
+          Reader.GetMetaArrayNumber('tokenizer.ggml.token_type', Cnt)))
+        else TokType := 1;
+        if (TokType = 2) or (TokType = 3) or (TokType = 4) then
+        begin
+          SetLength(FAddedTokens, Length(FAddedTokens) + 1);
+          FAddedTokens[High(FAddedTokens)].Content := FIdToToken[Cnt];
+          FAddedTokens[High(FAddedTokens)].Id := Cnt;
+          FAddedTokens[High(FAddedTokens)].Special := true;
+        end;
+      end;
+    end
+    else if Model = 'gpt2' then
+    begin
+      // Byte-level BPE: GPT-2 bytes<->unicode table + the cl100k Split
+      // pre-tokenizer + the merges array.
+      FByteLevel := true;
+      FSplitPreTok := true;
+      FSplitDigitsMax := 3;
+      MergeCount := Reader.GetMetaArrayCount('tokenizer.ggml.merges');
+      for Cnt := 0 to MergeCount - 1 do
+      begin
+        MergeStr := Reader.GetMetaArrayString('tokenizer.ggml.merges', Cnt);
+        SpacePos := Pos(' ', MergeStr);
+        if SpacePos <= 0 then continue;
+        Left := Copy(MergeStr, 1, SpacePos - 1);
+        Right := Copy(MergeStr, SpacePos + 1, Length(MergeStr));
+        FMerges.AddObject(Left + csMergeSep + Right, TObject(PtrInt(Cnt)));
+      end;
+
+      // Expose CONTROL / USER_DEFINED pieces as added special tokens so they
+      // round-trip verbatim (e.g. <|endoftext|>); fall back to id-based
+      // special wiring below.
+      SetLength(FAddedTokens, 0);
+      for Cnt := 0 to TokCount - 1 do
+      begin
+        if HasTypes
+        then TokType := integer(Round(
+          Reader.GetMetaArrayNumber('tokenizer.ggml.token_type', Cnt)))
+        else TokType := 1;
+        if (TokType = 3) or (TokType = 4) then
+        begin
+          SetLength(FAddedTokens, Length(FAddedTokens) + 1);
+          FAddedTokens[High(FAddedTokens)].Content := FIdToToken[Cnt];
+          FAddedTokens[High(FAddedTokens)].Id := Cnt;
+          FAddedTokens[High(FAddedTokens)].Special := true;
+        end;
+      end;
+      // GPT-2 family: <|endoftext|> doubles as BOS when no explicit bos id.
+      if (FBosId < 0) and (FEosId >= 0) then FBosId := FEosId;
+    end
+    else
+      raise EHFTokenizerError.Create('GGUF tokenizer.ggml.model "' + Model +
+        '" is not supported (only "llama" SentencePiece-with-scores and ' +
+        '"gpt2" byte-level BPE; "bert"/"no_vocab" are deferred).');
+  finally
+    Reader.Free;
+  end;
 end;
 
 function TNeuralHFTokenizer.FindAddedToken(const Text: string;

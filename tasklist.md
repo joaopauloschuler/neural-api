@@ -200,10 +200,23 @@ rather than acted on.
       ship raw sentencepiece .model and are Unigram). (c) exact full-Unicode \p{L}/\p{N} tables (current
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
       Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
-      punctuation class of the GPT-2 regex); (d) build a tokenizer from
-      GGUF tokenizer.ggml.* metadata (tokens/merges/scores arrays are
-      already readable via TNNetGGUFReader) so a single .gguf file is
-      fully self-contained for generation without tokenizer.json.
+      punctuation class of the GPT-2 regex); (d) DONE — build a tokenizer from
+      GGUF tokenizer.ggml.* metadata (TNeuralHFTokenizer.LoadFromGGUF: opens
+      via TNNetGGUFReader, reads tokenizer.ggml.model + tokens/scores/
+      token_type [+ merges] and the bos/eos/unknown_token_id scalars, and
+      populates the SAME internal structures the tokenizer.json/.model loaders
+      use), so a single .gguf is self-contained for generation. SUPPORTED
+      tokenizer.ggml.model values: "llama" (SentencePiece-with-scores →
+      Unigram/Viterbi path: metaspace U+2581, <0xNN> byte fallback, CONTROL/
+      UNKNOWN/USER_DEFINED pieces exposed as added tokens) and "gpt2" (byte-
+      level BPE → GPT-2 byte table + cl100k Split pre-tokenizer + merges).
+      DEFERRED: "bert" (WordPiece) and "no_vocab" raise EHFTokenizerError;
+      gpt2 path assumes the cl100k Split pre-tok (GGUF carries no pre-tok
+      config). Oracle = write-then-read round-trip: a tokenizer.json fixture's
+      vocab/scores(+merges) is emitted to a temp .gguf via TNNetGGUFWriter and
+      read back, then Encode/Decode are asserted id-identical to the
+      tokenizer.json source (TestLoadFromGGUF{Llama,Gpt2}RoundTrip,
+      TestLoadFromGGUFRejectsUnsupportedModel in TestNeuralHFTokenizer.pas).
 - [ ] neuralhftokenizer.pas pre_tokenizer leftovers from the Split/Metaspace
       batch: (a) a STANDALONE ByteLevel pre_tokenizer with use_regex=false
       silently applies the GPT-2 regex anyway (the flag is only honored
