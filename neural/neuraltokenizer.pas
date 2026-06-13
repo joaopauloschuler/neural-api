@@ -30,6 +30,13 @@ type
 
   { TNeuralTokenizer }
   TNeuralTokenizer = class(TStringListInt)
+    protected
+      // BPE-dropout (Provilkov et al. 2020): probability of skipping each
+      // applicable merge during TRAINING tokenization so the model sees
+      // alternative segmentations of the same text. Default 0.0 = OFF, which
+      // keeps eval/inference tokenization bit-identical to the deterministic
+      // tokenizer. Only applied when FDropoutProb > 0.
+      FDropoutProb: TNeuralFloat;
     public
       function GetVocabCount(): integer; override;
       procedure Tokenize(const pText: string; Result: TIntegerList); overload;
@@ -42,6 +49,10 @@ type
       procedure FitOnFile(const FileName: string; VocabSize: integer;
         WriteDebug: boolean = true);
       procedure TokenizeFileToCsv(const InputFileName, OutputFileName: string);
+      // BPE-dropout merge-skip probability. 0.0 (default) = deterministic /
+      // OFF; set to e.g. 0.1 during training only. Uses the global RNG, so
+      // reseed RandSeed for reproducible segmentations.
+      property DropoutProb: TNeuralFloat read FDropoutProb write FDropoutProb;
       // This function will be removed - do not use it.
       procedure Test;
   end;
@@ -271,7 +282,13 @@ begin
     else if TokenLen>1 then
     begin
       KeyName := current;
-      TokenId := Self.IndexOf(KeyName);
+      // With BPE-dropout active, skip the whole-word fast path so the greedy
+      // merge loop in TokenizeWord runs and dropout can produce an alternative
+      // segmentation. When FDropoutProb = 0 this branch is taken as before.
+      if FDropoutProb > 0 then
+        TokenId := -1
+      else
+        TokenId := Self.IndexOf(KeyName);
       if TokenId >= 0 then
       begin
         //WriteLn(current, ' -> Fast ID: ', TokenId+128);
@@ -353,6 +370,14 @@ begin
         CurrentTokenId := LocalTokenId;
         Inc(CurrentPos);
         LocalTokenId := Self.WordToInteger(copy(LocalText, 1, CurrentPos));
+        // BPE-dropout: when a longer merge is applicable, randomly skip it so
+        // the segmentation falls back to the shorter token already accepted in
+        // CurrentTokenId. Train-time only (FDropoutProb > 0); the remaining
+        // characters are re-processed by the outer loop, so the result still
+        // decodes back to the original word.
+        if (FDropoutProb > 0) and (LocalTokenId > -1) and
+           (Random < FDropoutProb) then
+          LocalTokenId := -1;
       end;
       if (CurrentPos > 2) then
       begin

@@ -647,7 +647,7 @@ rather than acted on.
       way to pretrain on corpora bigger than RAM. Assert: same model
       quality on a small corpus vs the in-memory path at matched
       examples-seen, and bounded RSS on a corpus larger than the buffer.
-- [ ] BPE-dropout subword regularization (Provilkov et al. 2020): during
+- [X] BPE-dropout subword regularization (Provilkov et al. 2020): during
       TRAINING tokenization randomly skip each applicable merge with
       p~0.1 so the model sees alternative segmentations of the same text;
       well-known robustness/quality win, ~20 lines in the existing
@@ -655,6 +655,16 @@ rather than acted on.
       unchanged). Test: p=0 is bit-identical to the deterministic
       tokenizer; p>0 at fixed seed yields a pinned alternative
       segmentation.
+      DONE: TNeuralTokenizer.DropoutProb property (default 0.0 = OFF, so
+      eval/inference is bit-identical). Hook in TokenizeWord's greedy merge
+      loop randomly stops extending a longer match with prob p, falling back
+      to the shorter token; the whole-word fast path in Tokenize is bypassed
+      when dropout is active. Tests in tests/TestNeuralTokenizer.pas (p=0
+      pinned ids, p>0 pinned alternative segmentation at RandSeed 424242, and
+      round-trip decode). FOLLOW-UP: TNeuralHFTokenizer (neuralhftokenizer.pas)
+      has its own rank-based BPE merge loop and was scoped out per the
+      tasklist wording ("the existing neuraltokenizer BPE merge loop"); adding
+      BPE-dropout there is a separate task.
 - [ ] MinHash near-duplicate corpus dedup tool: the C4/Pile hygiene step —
       shingle each document, MinHash signatures, LSH banding to find
       near-duplicate clusters, keep one representative. Small standalone
