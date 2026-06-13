@@ -123,60 +123,14 @@ rather than acted on.
       mixed image+text prompt vs HF float64, and an examples/LlavaDescribe
       demo that captions a small image on CPU. First image-in/text-out
       model in the repo; opens the door to Qwen-VL/PaliGemma later.
-- [X] Cohere Command-R / Aya importer (BuildCohereFromSafeTensors[Ex],
-      model_type "cohere", and the "cohere2" Command-R7B variant): the leading
-      open MULTILINGUAL instruct family (C4AI Command-R, Aya-Expanse-8B,
-      Command-R7B), absent from the landed importer set and architecturally
-      distinct enough to not be a Llama clone. The genuinely new pieces are
-      few but real: (a) a PARALLEL residual where attention AND MLP both read
-      ONE input LayerNorm and sum into the residual (x = x + Attn(LN(x)) +
-      MLP(LN(x))) — the GPTNeoX parallel-residual path already in-repo, reused
-      here; (b) Cohere's LayerNorm is bias-free and weight-only (no
-      learned shift) — confirm TNNetLayerNorm with SuppressBias maps it, else a
-      small flag; (c) a scalar logit_scale that multiplies the final logits
-      before softmax — fold into the tied LM head the way query_pre_attn_scalar
-      folding is done for Gemma (see [[gemma3-importer]]); (d) tied input/output
-      embeddings and NO attention/MLP biases. The cohere2 (Command-R7B) variant
-      adds the alternating sliding-window/global pattern already wired for
-      Gemma-2/3 (reuse SlidingWindowPattern, see [[gemma2-alternating-local-global]])
-      plus an order_of_interleaved_layers config. RoPE is standard full-rotary.
-      Tokenizer is a BPE tokenizer.json the landed TNeuralHFTokenizer reads.
-      Deliverables: BuildCohereFromSafeTensors[Ex] on the parallel-residual path,
-      a pico parity fixture (make_pico_*_fixture.py recipe, see
-      [[pico-import-fixtures]]) asserting hidden states AND logit_scale-scaled
-      next-token logits vs HF float64 for both cohere and cohere2 configs, and a
-      short multilingual-generation snippet in the importer example. Closes the
-      last big mainstream decoder gap and validates logit_scale handling reusable
-      for future families.
-      DONE (a3): BuildCohereFromSafeTensors[Ex]/WithConfig on a DEDICATED
-      parallel-residual builder (NOT the Llama path - too many fundamental
-      differences). Key findings vs the simplified task spec, all verified
-      against HF modeling_cohere/cohere2: (1) Cohere's norm is a TRUE
-      mean-subtracting LayerNorm (CohereLayerNorm), bias-free weight-only ->
-      TNNetTokenLayerNorm with beta forced to 0 (NOT TNNetLayerNorm/SuppressBias,
-      NOT RMSNorm); a small LoadCohereLayerNormWeights helper loads gamma only.
-      (2) RoPE is the GPT-J INTERLEAVED pair layout (rotate_half = even/odd
-      stack + repeat_interleave(freqs,2)) = TNNetRotaryEmbedding's NATIVE layout,
-      so q/k rows load STRAIGHT (RotaryHeadDim=0, NO rotate_half permutation -
-      OPPOSITE of the Llama/NeoX half-split path). (3) logit_scale folds into the
-      tied LM-head weight rows (logits = (h.embed^T)*scale; exact since bias-free
-      and tied). (4) cohere qk_norm is a PER-HEAD mean-subtracting CohereLayerNorm
-      over head_dim with PER-HEAD DISTINCT gains. (5) cohere2 CRUCIAL: RoPE is
-      applied ONLY on the sliding (local) layers - the GLOBAL layers use NoPE (no
-      positional embedding at all); cohere2 has NO qk_norm. Fixtures
-      tools/cohere_tiny_fixture.py -> tests/fixtures/tiny_cohere{,2}.* (synthetic
-      config-faithful random-weight pico checkpoints cross-checked against HF's
-      own float64 forward; HF std-0.02 init is vacuous at pico scale so weights
-      re-randomized to O(1), every delta asserted non-vacuous). Tests
-      TestCohereConfigFromJSONFile / TestCohereLogitParity / TestCohere2LogitParity
-      in TestNeuralPretrained.pas: max |logit diff| 3.96e-7 (cohere) / 2.15e-7
-      (cohere2) vs the float64 oracle (gate 1e-4). Dispatch wired in
-      BuildFromPretrained; multilingual session snippet added to
-      examples/ChatTerminal/README.md. Follow-up: a REAL-checkpoint slicer for
-      Aya-Expanse-8B / Command-R7B (like slice_llama.py) would add real-weight
-      parity on top of the synthetic fixture; order_of_interleaved_layers (legacy
-      cohere2 spelling) maps to sliding_window_pattern but was not seen in a
-      published config, so only sliding_window_pattern is read.
+- [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
+      for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
+      parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
+      pico fixtures): add a real-weight slicer for Aya-Expanse-8B /
+      Command-R7B (like slice_llama.py) so parity is checked against real
+      Cohere weights on top of the synthetic fixture. Also: order_of_interleaved_layers
+      (legacy cohere2 spelling) maps to sliding_window_pattern but was not seen
+      in a published config — wire it if one surfaces.
 - [ ] DeBERTa-v3 importer + disentangled attention (BuildDebertaV2FromSafeTensors,
       model_type "deberta-v2"): the dominant small-encoder family for
       NLU/classification/NER/reranking (deberta-v3-base/small, the ms-marco
@@ -202,21 +156,6 @@ rather than acted on.
       float64, and a cross-encoder RERANKING example over the landed
       BuildBertForSequenceClassification scoring path (query+passage -> relevance
       score), the canonical RAG-reranker demo the encoder importers enable.
-- [X] BART-family follow-up (a) Pegasus — BuildPegasusFromSafeTensors[Ex]
-      landed in neuralpretrained.pas (two-net PRE-norm encoder-decoder:
-      LayerNorm before each sub-layer, raw residual after; STATIC half-split
-      sinusoidal positions via FillMarianSinusoidalPositions, no +2 offset; NO
-      layernorm_embedding; a FINAL encoder AND decoder layer_norm closing each
-      pre-norm stack; scale_embedding on; erf-GELU FFN; tied embeddings +
-      final_logits_bias; .bin + multi-shard index.json via the shared reader).
-      Parity test TestPegasusParity + TestPegasusConfigFromJSONFile at
-      <1e-4 (encoder hidden AND decoder logits vs HF float64); fixture
-      tools/pegasus_tiny_fixture.py with per-quirk non-vacuity self-checks
-      (half-split sinusoid layout, pre-norm placement, final enc/dec
-      layer_norm, scale_embedding, gelu-vs-relu/silu, cross-attn, causality).
-      examples/Summarize README + examples/README.md document the
-      same-path beam-search decode (model math landed; end-to-end TEXT gated on
-      the SentencePiece tokenizer task below).
 - [ ] BART-family follow-up (b) mBART/NLLB — pre-norm + an EXTRA final encoder
       AND decoder LayerNorm (same pre-norm shape the Pegasus importer now ships,
       so it should reuse BuildPegasusStackBlocks) + a SentencePiece tokenizer,
@@ -485,21 +424,6 @@ rather than acted on.
       mask and left-padded-generation tasks: this is the TRAINING data-side
       half. Test: identical loss trajectory vs naive padding at fixed seed
       modulo batch order, plus a padded-token-count reduction assert.
-- [X] Best-of-N / self-consistency reranking utility in
-      neural/neuraldecode.pas: sample N completions, rerank by
-      length-normalized sequence logprob (LengthPenaltyDenominator already
-      exists) or by an external scorer callback — the standard
-      test-time-compute baseline, and the natural consumer of the
-      Bradley-Terry reward model from the GRPO task. Self-consistency
-      variant: majority-vote over extracted answers. Sampled generation is
-      already landed, so this is mostly harness work; worth its own entry as
-      the canonical harness.
-      LANDED: DecodeSampled (stochastic sibling of DecodeGreedy),
-      SampleNCompletions, DecodeBestOfN (length-normalized logprob OR
-      TNNetSequenceScorer callback), DecodeSelfConsistency (majority vote via
-      TNNetAnswerExtractor). 3 deterministic tests. FOLLOW-UP: wire a concrete
-      Bradley-Terry reward model as the TNNetSequenceScorer once the GRPO task
-      lands its reward head.
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (the rebuild-same-
       architecture-at-a-new-width idiom this list already notes near the
@@ -588,26 +512,12 @@ rather than acted on.
       static exit layer + confidence threshold; follow-up: per-token
       adaptive exit. Report tokens/sec vs full-depth at matched output
       quality.
-- [X] DoLa decoding (Decoding by Contrasting Layers, Chuang et al. 2023;
-      transformers `generate(dola_layers=...)`): improve FACTUALITY (not
-      speed — distinct from the early-exit task above and from contrastive
-      search, which contrasts against context tokens) by reading logits at
-      a premature layer via the same LogitLens "logits at layer k" splice,
-      then scoring next tokens by log p_final - log p_premature over an
-      adaptive head-candidate set (tokens above an alpha fraction of the
-      final layer's max prob); pick the premature layer per step as the
-      one with max Jensen-Shannon divergence from the final distribution
-      over a small candidate bucket. Pure decode-time composition of
-      landed primitives — no new weights, no training. v1 in
-      neural/neuraldecode.pas with fixed candidate-layer bucket; test:
-      on a toy LM with a planted shallow-layer bias, DoLa flips the
-      biased completion while greedy full-depth decode does not, and
-      alpha=0/empty-bucket degrades exactly to standard greedy.
-      LANDED: DecodeDoLa in neural/neuraldecode.pas (LogitLens splice idiom;
-      per-step max-JS premature layer over a fixed Output.Size-matched bucket;
-      adaptive head set; Alpha<=0/empty-bucket = bit-identical greedy). 3 tests.
-      FOLLOW-UP: per-step ADAPTIVE candidate-layer selection beyond the fixed
-      bucket (e.g. dynamic high/low buckets like the paper's DoLa-low/high).
+- [ ] DoLa decoding follow-up (DecodeDoLa LANDED in neural/neuraldecode.pas:
+      LogitLens splice idiom; per-step max-JS premature layer over a fixed
+      Output.Size-matched candidate bucket; adaptive head set; Alpha<=0 /
+      empty-bucket = bit-identical greedy; 3 tests incl. planted shallow-bias
+      flip): add per-step ADAPTIVE candidate-layer selection beyond the fixed
+      bucket — the paper's DoLa-low / DoLa-high dynamic high/low layer buckets.
 - [ ] Grammar/regex-constrained decoding (GBNF-style): generalize the
       landed hand-written JSON state machine — TNNetTokenConstraint's
       Reset/MaskAllowed/Commit interface (plus the copy-on-fork support
@@ -647,24 +557,14 @@ rather than acted on.
       way to pretrain on corpora bigger than RAM. Assert: same model
       quality on a small corpus vs the in-memory path at matched
       examples-seen, and bounded RSS on a corpus larger than the buffer.
-- [X] BPE-dropout subword regularization (Provilkov et al. 2020): during
-      TRAINING tokenization randomly skip each applicable merge with
-      p~0.1 so the model sees alternative segmentations of the same text;
-      well-known robustness/quality win, ~20 lines in the existing
-      neuraltokenizer BPE merge loop, train-time only (eval tokenization
-      unchanged). Test: p=0 is bit-identical to the deterministic
-      tokenizer; p>0 at fixed seed yields a pinned alternative
-      segmentation.
-      DONE: TNeuralTokenizer.DropoutProb property (default 0.0 = OFF, so
-      eval/inference is bit-identical). Hook in TokenizeWord's greedy merge
-      loop randomly stops extending a longer match with prob p, falling back
-      to the shorter token; the whole-word fast path in Tokenize is bypassed
-      when dropout is active. Tests in tests/TestNeuralTokenizer.pas (p=0
-      pinned ids, p>0 pinned alternative segmentation at RandSeed 424242, and
-      round-trip decode). FOLLOW-UP: TNeuralHFTokenizer (neuralhftokenizer.pas)
-      has its own rank-based BPE merge loop and was scoped out per the
-      tasklist wording ("the existing neuraltokenizer BPE merge loop"); adding
-      BPE-dropout there is a separate task.
+- [ ] BPE-dropout follow-up for TNeuralHFTokenizer (Provilkov et al. 2020;
+      v1 LANDED as TNeuralTokenizer.DropoutProb, default 0.0 = OFF, hook in
+      TokenizeWord's greedy merge loop, train-time only, tests in
+      TestNeuralTokenizer.pas): TNeuralHFTokenizer (neuralhftokenizer.pas) has
+      its own SEPARATE rank-based BPE merge loop and was scoped out of v1; add
+      the same per-merge random-skip there (default p=0 = bit-identical eval),
+      so byte-level-BPE imported tokenizers can also subword-regularize at
+      train time.
 - [ ] MinHash near-duplicate corpus dedup tool: the C4/Pile hygiene step —
       shingle each document, MinHash signatures, LSH banding to find
       near-duplicate clusters, keep one representative. Small standalone
