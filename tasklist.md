@@ -331,10 +331,16 @@ rather than acted on.
       last-hidden-state from the streamed window — no re-encode, no
       per-candidate forwards. Shares the fork/snapshot primitive the KV-cache
       beam + best-of-N tasks want.
-- [ ] Diverse beam search (Hamming-diversity groups) + constrained beam
+- [X] Diverse beam search (Hamming-diversity groups) + constrained beam
       search (force_words_ids: force given phrases to APPEAR anywhere in the
       output — stronger than the existing TNNetTokenConstraint prefix/mask
       machinery) in neural/neuraldecode.pas as DecodeBeamSearch variants.
+      DONE: DecodeDiverseBeamSearch[All] (Vijayakumar groups, NumGroups=1 &
+      lambda=0 bit-identical to DecodeBeamSearchAll; lambda>0 force distinct
+      group first-tokens) and DecodeConstrainedBeamSearch[All] (banked
+      force-completion via monotone ForcedProgress; empty ForceTokens
+      bit-identical to beam; phrase provably emitted). Tested in
+      tests/TestNeuralDecode.pas.
 - [ ] Batched generation with left-padding in neural/neuraldecode.pas:
       generate for N prompts in one forward pass per step (today's decode
       paths look single-sample). Makes evaluation sweeps cheap and is a

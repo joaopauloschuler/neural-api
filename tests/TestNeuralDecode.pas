@@ -79,6 +79,13 @@ type
     procedure TestGreedyReturnsBoundedFiniteResult;
     procedure TestBeamSearchAllSortedDescending;
     procedure TestBeamSearchScoreNoWorseThanGreedy;
+    // Diverse beam search (Hamming-diversity groups).
+    procedure TestDiverseBeamLambdaZeroMatchesBeam;
+    procedure TestDiverseBeamGroupsDifferInFirstToken;
+    // Constrained beam search (force_words_ids).
+    procedure TestConstrainedBeamNoForceMatchesBeam;
+    procedure TestConstrainedBeamForcesPhrasePresence;
+    procedure TestConstrainedBeamForcesMultiplePhrases;
     // Contrastive search (penalty_alpha) decoding.
     procedure TestContrastiveAlphaZeroMatchesGreedy;
     procedure TestContrastiveAlphaChangesSelection;
@@ -288,6 +295,177 @@ begin
     G := DecodeGreedy(NN, 'ab', 6);
     B := DecodeBeamSearch(NN, 'ab', 6, 4, 0.0);
     AssertTrue('beam score >= greedy score', B.Score >= G.Score - 1e-4);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Constant-logit net: zeroed weights -> input-independent logits set purely by
+// the LM head bias, peaked on token PeakTok. Used for the diverse / constrained
+// beam planted setups where the model "prefers" one specific continuation.
+function BuildPeakedLogitNet(ContextLen, Vocab, PeakTok: integer): TNNet;
+var
+  L1: TNNetLayer;
+  N: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, Vocab));
+  L1 := Result.AddLayer(TNNetFullConnectLinear.Create(Vocab));
+  Result.AddLayer(TNNetSoftMax.Create());
+  Result.InitWeights();
+  for N := 0 to L1.Neurons.Count - 1 do
+  begin
+    L1.Neurons[N].Weights.Fill(0);
+    // A mild monotone ramp so the runner-up ordering is deterministic, with a
+    // strong peak on PeakTok (the token the unconstrained beam will emit).
+    L1.Neurons[N].BiasWeight := 0.01 * N;
+  end;
+  L1.Neurons[PeakTok].BiasWeight := 8.0;
+  L1.MulWeights(1.0);
+end;
+
+procedure TTestNeuralDecode.TestDiverseBeamLambdaZeroMatchesBeam;
+var
+  NN: TNNet;
+  Beam, Dvb: TNNetDecodeResultArray;
+  I: integer;
+begin
+  // Degrade-to-beam invariant: one group (NumGroups=1) with Diversity=0 is
+  // BIT-FOR-BIT ordinary beam search, element for element.
+  RandSeed := 424242;
+  NN := BuildTinyNet(4, 8);
+  try
+    Beam := DecodeBeamSearchAll(NN, 'ab', 6, 4, 0.0);
+    Dvb := DecodeDiverseBeamSearchAll(NN, 'ab', 6, 4, 1, 0.0, 0.0);
+    AssertEquals('same beam count', Length(Beam), Length(Dvb));
+    for I := 0 to High(Beam) do
+    begin
+      AssertEquals('text matches', Beam[I].Text, Dvb[I].Text);
+      AssertEquals('score matches', Beam[I].Score, Dvb[I].Score, 1e-7);
+      AssertEquals('sumlogprob matches', Beam[I].SumLogProb,
+        Dvb[I].SumLogProb, 1e-7);
+      AssertEquals('finished matches', Ord(Beam[I].Finished),
+        Ord(Dvb[I].Finished));
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestDiverseBeamGroupsDifferInFirstToken;
+var
+  NN: TNNet;
+  D0, D1: TNNetDecodeResultArray;
+  I, NDistinct0, NDistinct1: integer;
+  Seen: array[0..255] of boolean;
+  C: char;
+begin
+  // With Diversity=0 the two groups, each width 1, both follow the single most
+  // probable first token (peaked on token 5) -> their first chars coincide.
+  // A strong Diversity penalty pushes the SECOND group off token 5 onto a
+  // different first token, so the kept beams now start with >1 distinct char.
+  RandSeed := 424242;
+  NN := BuildPeakedLogitNet(4, 8, 5);
+  try
+    D0 := DecodeDiverseBeamSearchAll(NN, 'ab', 4, 2, 2, 0.0, 0.0);
+    D1 := DecodeDiverseBeamSearchAll(NN, 'ab', 4, 2, 2, 50.0, 0.0);
+
+    for I := 0 to 255 do Seen[I] := False;
+    NDistinct0 := 0;
+    for I := 0 to High(D0) do
+      if Length(D0[I].Text) >= 1 then
+      begin
+        C := D0[I].Text[1];
+        if not Seen[Ord(C)] then begin Seen[Ord(C)] := True; Inc(NDistinct0); end;
+      end;
+
+    for I := 0 to 255 do Seen[I] := False;
+    NDistinct1 := 0;
+    for I := 0 to High(D1) do
+      if Length(D1[I].Text) >= 1 then
+      begin
+        C := D1[I].Text[1];
+        if not Seen[Ord(C)] then begin Seen[Ord(C)] := True; Inc(NDistinct1); end;
+      end;
+
+    AssertEquals('lambda=0 groups share the single best first token',
+      1, NDistinct0);
+    AssertTrue('lambda>0 groups produce different first tokens',
+      NDistinct1 > NDistinct0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestConstrainedBeamNoForceMatchesBeam;
+var
+  NN: TNNet;
+  Beam, Con: TNNetDecodeResultArray;
+  NoForce: array of string;
+  I: integer;
+begin
+  // With no forced phrases the constrained routine is bit-for-bit ordinary beam.
+  RandSeed := 424242;
+  SetLength(NoForce, 0);
+  NN := BuildTinyNet(4, 8);
+  try
+    Beam := DecodeBeamSearchAll(NN, 'ab', 6, 4, 0.0);
+    Con := DecodeConstrainedBeamSearchAll(NN, 'ab', 6, 4, NoForce, 0.0);
+    AssertEquals('same beam count', Length(Beam), Length(Con));
+    for I := 0 to High(Beam) do
+    begin
+      AssertEquals('text matches', Beam[I].Text, Con[I].Text);
+      AssertEquals('score matches', Beam[I].Score, Con[I].Score, 1e-7);
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestConstrainedBeamForcesPhrasePresence;
+var
+  NN: TNNet;
+  Uncon, Con: TNNetDecodeResult;
+  Force, NoForce: array of string;
+  Phrase: string;
+begin
+  // Planted setup: the net is peaked on token 'Z'=Ord 90; an unconstrained beam
+  // emits an all-'Z' run and would NEVER produce the phrase 'xyz'. The
+  // constrained beam MUST contain 'xyz' somewhere in its output.
+  RandSeed := 424242;
+  Phrase := 'xyz';
+  SetLength(NoForce, 0);
+  SetLength(Force, 1);
+  Force[0] := Phrase;
+  NN := BuildPeakedLogitNet(8, 128, Ord('Z'));
+  try
+    Uncon := DecodeBeamSearch(NN, 'ab', 10, 4, 0.0);
+    AssertEquals('unconstrained beam never emits the phrase',
+      0, Pos(Phrase, Uncon.Text));
+    Con := DecodeConstrainedBeamSearch(NN, 'ab', 10, 4, Force, 0.0);
+    AssertTrue('constrained beam emits the forced phrase',
+      Pos(Phrase, Con.Text) > 0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestConstrainedBeamForcesMultiplePhrases;
+var
+  NN: TNNet;
+  Con: TNNetDecodeResult;
+  Force: array of string;
+begin
+  // Two disjoint forced phrases must BOTH appear in the single best output.
+  RandSeed := 424242;
+  SetLength(Force, 2);
+  Force[0] := 'xy';
+  Force[1] := 'qrs';
+  NN := BuildPeakedLogitNet(12, 128, Ord('Z'));
+  try
+    Con := DecodeConstrainedBeamSearch(NN, 'ab', 16, 4, Force, 0.0);
+    AssertTrue('first forced phrase present', Pos('xy', Con.Text) > 0);
+    AssertTrue('second forced phrase present', Pos('qrs', Con.Text) > 0);
   finally
     NN.Free;
   end;

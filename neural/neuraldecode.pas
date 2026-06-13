@@ -764,6 +764,68 @@ function DecodeBeamSearchAll(NN: TNNet; const Prompt: string;
   MaxLen: integer; BeamWidth: integer;
   LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
 
+// DIVERSE beam search (Vijayakumar et al. 2018, "Diverse Beam Search"). The
+// BeamWidth beams are partitioned into NumGroups equal groups of size
+// BeamWidth div NumGroups; the groups are expanded one after another within a
+// step, and when scoring group g (g>0) each candidate token's length-penalised
+// score has a HAMMING DIVERSITY PENALTY subtracted:
+//     score'(t) = score(t) - Diversity * (count of token t already chosen by
+//                                         the earlier groups 0..g-1 this step)
+// so later groups are pushed away from tokens the earlier groups already took,
+// giving a diverse set of completions instead of B near-duplicates.
+// DEGRADE-TO-BEAM invariant: NumGroups=1 (a single group) with Diversity=0 is
+// BIT-FOR-BIT the ordinary DecodeBeamSearchAll(NN,Prompt,MaxLen,BeamWidth,..);
+// Diversity=0 with any NumGroups removes the penalty (groups then differ only
+// through the per-group width split). Returns the whole final ranked beam
+// (finished + surviving), sorted best-first, exactly like DecodeBeamSearchAll.
+//   NumGroups : G, the number of diversity groups (clamped to [1, BeamWidth]).
+//   Diversity : lambda >= 0, the per-collision Hamming penalty (0 = none).
+// Coded by Claude (AI).
+function DecodeDiverseBeamSearchAll(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer; NumGroups: integer;
+  Diversity: TNeuralFloat;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+
+// Single-best diverse beam search: the highest-Score result of
+// DecodeDiverseBeamSearchAll (same relation as DecodeBeamSearch to
+// DecodeBeamSearchAll). Coded by Claude (AI).
+function DecodeDiverseBeamSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer; NumGroups: integer;
+  Diversity: TNeuralFloat;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+
+// CONSTRAINED beam search with FORCE-WORDS (force_words_ids; Anderson et al.
+// 2017 constrained beam search / HF PhrasalConstraint banking). Guarantees
+// that EVERY one of the required phrases in ForceTokens APPEARS somewhere in
+// the generated output (a phrase is a token sequence; here token id =
+// character code, so each phrase is a string). Unlike TNNetTokenConstraint
+// (which constrains a PREFIX / per-step allowed set) this forces phrases to
+// occur ANYWHERE in the completion, even when an unconstrained beam would
+// never emit them.
+// V1 GUARANTEE ("force completion before EOS"): each hypothesis tracks its
+// progress through every required phrase (how many leading characters of each
+// phrase it has emitted as a contiguous run). A beam may only emit EOS / be
+// counted finished once ALL phrases have been fully emitted; while phrases
+// remain unmet, EOS is blocked and the beam is additionally expanded with the
+// next needed phrase character so a satisfying continuation is always present
+// in the candidate pool. The standard length-penalised beam ranking then picks
+// the best satisfying completion. With ForceTokens empty the routine is
+// BIT-FOR-BIT DecodeBeamSearchAll.
+//   ForceTokens : the required phrases (strings); empty = ordinary beam search.
+// Returns the whole final ranked beam, sorted best-first.
+// Coded by Claude (AI).
+function DecodeConstrainedBeamSearchAll(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer;
+  const ForceTokens: array of string;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+
+// Single-best constrained beam search (highest-Score result of
+// DecodeConstrainedBeamSearchAll). Coded by Claude (AI).
+function DecodeConstrainedBeamSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer;
+  const ForceTokens: array of string;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+
 // CONTRASTIVE SEARCH decoding (Su et al. 2022, "A Contrastive Framework for
 // Neural Text Generation"; the transformers `penalty_alpha` decoder). Each
 // step re-ranks the TopK most probable next-token candidates by
@@ -3504,6 +3566,421 @@ var
   All: TNNetDecodeResultArray;
 begin
   All := DecodeBeamSearchAll(NN, Prompt, MaxLen, BeamWidth, LengthPenalty);
+  if Length(All) > 0 then
+    Result := All[0]
+  else
+  begin
+    Result.Text := '';
+    Result.SumLogProb := 0;
+    Result.Score := 0;
+    Result.Finished := False;
+  end;
+end;
+
+function DecodeDiverseBeamSearchAll(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer; NumGroups: integer;
+  Diversity: TNeuralFloat;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  LogProbs: array of TNeuralFloat;
+  TokenTaken: array of integer;   // per-token collision count, this step
+  VocabSize, Step, I, T, B, GroupSize, G, GroupLo, GroupHi: integer;
+  Live: TBeamArray;      // still-growing beams, contiguous by group
+  NewLive: TBeamArray;   // frontier being assembled this step
+  Finished: TBeamArray;  // beams that emitted EOS
+  Cand: TBeamArray;      // expansion candidates for the CURRENT group
+  NewBeam: TBeam;
+  Pen: TNeuralFloat;
+begin
+  if BeamWidth < 1 then BeamWidth := 1;
+  if NumGroups < 1 then NumGroups := 1;
+  if NumGroups > BeamWidth then NumGroups := BeamWidth;
+  // Single group with no diversity penalty is ordinary beam search; delegate so
+  // the degenerate case is BIT-FOR-BIT DecodeBeamSearchAll (incl. early-stop).
+  if (NumGroups = 1) and (Diversity = 0) then
+  begin
+    Result := DecodeBeamSearchAll(NN, Prompt, MaxLen, BeamWidth, LengthPenalty);
+    Exit;
+  end;
+  GroupSize := BeamWidth div NumGroups;
+  if GroupSize < 1 then GroupSize := 1;
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  VocabSize := OutputVolume.Size;
+  SetLength(LogProbs, VocabSize);
+  SetLength(TokenTaken, VocabSize);
+  try
+    SetLength(Live, 1);
+    Live[0].Text := '';
+    Live[0].SumLogProb := 0;
+    Live[0].Score := 0;
+    Live[0].Finished := False;
+    SetLength(Finished, 0);
+
+    for Step := 1 to MaxLen do
+    begin
+      if Length(Live) = 0 then Break;
+      for T := 0 to VocabSize - 1 do TokenTaken[T] := 0;
+      SetLength(NewLive, 0);
+
+      // Expand group-by-group; each group contributes up to GroupSize survivors
+      // and its chosen first tokens raise TokenTaken so LATER groups are pushed
+      // away from them (Hamming diversity penalty).
+      for G := 0 to NumGroups - 1 do
+      begin
+        GroupLo := G * GroupSize;
+        GroupHi := GroupLo + GroupSize - 1;
+        if GroupLo > High(Live) then
+        begin
+          // No dedicated parents yet (early steps where the live frontier is
+          // smaller than the full beam, e.g. the single seed at step 1): the
+          // group still explores from the WHOLE current frontier so the
+          // diversity penalty can steer it off the earlier groups' tokens.
+          GroupLo := 0;
+          GroupHi := High(Live);
+        end
+        else if GroupHi > High(Live) then
+          GroupHi := High(Live);
+
+        SetLength(Cand, 0);
+        for B := GroupLo to GroupHi do
+        begin
+          NextLogProbs(NN, Prompt + Live[B].Text,
+            InputVolume, OutputVolume, LogProbs);
+          for T := 0 to VocabSize - 1 do
+          begin
+            NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+            if T = csDecodeEOSToken then
+            begin
+              NewBeam.Text := Live[B].Text;
+              NewBeam.Finished := True;
+              NewBeam.Score := NewBeam.SumLogProb /
+                LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+              SetLength(Finished, Length(Finished) + 1);
+              Finished[High(Finished)] := NewBeam;
+            end
+            else
+            begin
+              NewBeam.Text := Live[B].Text + Chr(T);
+              NewBeam.Finished := False;
+              // Length-penalised base score, minus the diversity penalty for
+              // collisions with earlier groups at THIS step (g=0: no penalty).
+              Pen := Diversity * TokenTaken[T];
+              NewBeam.Score := NewBeam.SumLogProb /
+                LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty)
+                - Pen;
+              SetLength(Cand, Length(Cand) + 1);
+              Cand[High(Cand)] := NewBeam;
+            end;
+          end;
+        end;
+
+        SortBeamsByScore(Cand);
+        if Length(Cand) > GroupSize then SetLength(Cand, GroupSize);
+        // Register this group's chosen first tokens for the diversity penalty
+        // and append the survivors to the next frontier.
+        for I := 0 to High(Cand) do
+        begin
+          Inc(TokenTaken[Ord(Cand[I].Text[Length(Cand[I].Text)])]);
+          SetLength(NewLive, Length(NewLive) + 1);
+          NewLive[High(NewLive)] := Cand[I];
+        end;
+      end;
+
+      // Pruning is per-group (each group keeps GroupSize); the new frontier is
+      // the concatenation. No global re-prune so groups stay independent.
+      Live := Copy(NewLive, 0, Length(NewLive));
+    end;
+
+    for B := 0 to High(Live) do
+    begin
+      SetLength(Finished, Length(Finished) + 1);
+      Finished[High(Finished)] := Live[B];
+    end;
+
+    SortBeamsByScore(Finished);
+    SetLength(Result, Length(Finished));
+    for I := 0 to High(Finished) do
+    begin
+      Result[I].Text := Finished[I].Text;
+      Result[I].SumLogProb := Finished[I].SumLogProb;
+      Result[I].Score := Finished[I].Score;
+      Result[I].Finished := Finished[I].Finished;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+  end;
+end;
+
+function DecodeDiverseBeamSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer; NumGroups: integer;
+  Diversity: TNeuralFloat;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+var
+  All: TNNetDecodeResultArray;
+begin
+  All := DecodeDiverseBeamSearchAll(NN, Prompt, MaxLen, BeamWidth,
+    NumGroups, Diversity, LengthPenalty);
+  if Length(All) > 0 then
+    Result := All[0]
+  else
+  begin
+    Result.Text := '';
+    Result.SumLogProb := 0;
+    Result.Score := 0;
+    Result.Finished := False;
+  end;
+end;
+
+// True when every required phrase in ForceTokens occurs as a substring of Text.
+function AllForcedPhrasesPresent(const Text: string;
+  const ForceTokens: array of string): boolean;
+var
+  K: integer;
+begin
+  Result := True;
+  for K := 0 to High(ForceTokens) do
+    if (Length(ForceTokens[K]) > 0) and (Pos(ForceTokens[K], Text) = 0) then
+    begin
+      Result := False;
+      Exit;
+    end;
+end;
+
+// Of the still-unmet phrases, returns the set of characters that can MAKE
+// PROGRESS when appended to Text (the next char of any phrase given Text's
+// current longest matching prefix-of-a-phrase suffix). Used to inject
+// guaranteed-satisfying continuations into the candidate pool. Returns the
+// distinct next-chars as a string (each char at most once).
+function NeededNextChars(const Text: string;
+  const ForceTokens: array of string): string;
+var
+  K, P, MatchLen: integer;
+  Phrase, Tail: string;
+  C: char;
+begin
+  Result := '';
+  for K := 0 to High(ForceTokens) do
+  begin
+    Phrase := ForceTokens[K];
+    if (Length(Phrase) = 0) or (Pos(Phrase, Text) > 0) then Continue; // met
+    // Longest prefix of Phrase that is a suffix of Text (how far an in-progress
+    // emission of this phrase has got); 0 means "start the phrase fresh".
+    MatchLen := 0;
+    for P := Length(Phrase) - 1 downto 1 do
+      if (Length(Text) >= P) and
+         (Copy(Text, Length(Text) - P + 1, P) = Copy(Phrase, 1, P)) then
+      begin
+        MatchLen := P;
+        Break;
+      end;
+    C := Phrase[MatchLen + 1];
+    Tail := Result;
+    if Pos(C, Tail) = 0 then Result := Result + C;
+  end;
+end;
+
+// A monotone PROGRESS metric toward satisfying all forced phrases: for each
+// phrase, its full length once it is present as a substring, otherwise the
+// length of the longest phrase-prefix that is a suffix of Text (an in-progress
+// emission). Summed over phrases. Increases as phrases get emitted and reaches
+// Sum(Length(phrase)) exactly when all are satisfied.
+function ForcedProgress(const Text: string;
+  const ForceTokens: array of string): integer;
+var
+  K, P: integer;
+  Phrase: string;
+begin
+  Result := 0;
+  for K := 0 to High(ForceTokens) do
+  begin
+    Phrase := ForceTokens[K];
+    if Length(Phrase) = 0 then Continue;
+    if Pos(Phrase, Text) > 0 then
+      Inc(Result, Length(Phrase))
+    else
+      for P := Length(Phrase) - 1 downto 1 do
+        if (Length(Text) >= P) and
+           (Copy(Text, Length(Text) - P + 1, P) = Copy(Phrase, 1, P)) then
+        begin
+          Inc(Result, P);
+          Break;
+        end;
+  end;
+end;
+
+function DecodeConstrainedBeamSearchAll(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer;
+  const ForceTokens: array of string;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  LogProbs: array of TNeuralFloat;
+  VocabSize, Step, I, T, B, RealForced, BestProg, KeptProg: integer;
+  Live: TBeamArray;
+  Finished: TBeamArray;
+  Cand: TBeamArray;
+  NewBeam: TBeam;
+  Needed: string;
+begin
+  if BeamWidth < 1 then BeamWidth := 1;
+  // Count real (non-empty) phrases; none -> ordinary beam search, bit-identical.
+  RealForced := 0;
+  for I := 0 to High(ForceTokens) do
+    if Length(ForceTokens[I]) > 0 then Inc(RealForced);
+  if RealForced = 0 then
+  begin
+    Result := DecodeBeamSearchAll(NN, Prompt, MaxLen, BeamWidth, LengthPenalty);
+    Exit;
+  end;
+
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  VocabSize := OutputVolume.Size;
+  SetLength(LogProbs, VocabSize);
+  try
+    SetLength(Live, 1);
+    Live[0].Text := '';
+    Live[0].SumLogProb := 0;
+    Live[0].Score := 0;
+    Live[0].Finished := False;
+    SetLength(Finished, 0);
+
+    for Step := 1 to MaxLen do
+    begin
+      if Length(Live) = 0 then Break;
+
+      SetLength(Cand, 0);
+      for B := 0 to High(Live) do
+      begin
+        NextLogProbs(NN, Prompt + Live[B].Text,
+          InputVolume, OutputVolume, LogProbs);
+        // Characters that advance an unmet phrase: each is FORCE-INJECTED as a
+        // candidate (even if the model assigns it ~0 probability) so a path that
+        // makes progress toward every phrase always exists in the pool.
+        Needed := NeededNextChars(Live[B].Text, ForceTokens);
+        for I := 1 to Length(Needed) do
+        begin
+          T := Ord(Needed[I]);
+          NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+          NewBeam.Text := Live[B].Text + Chr(T);
+          NewBeam.Finished := False;
+          NewBeam.Score := NewBeam.SumLogProb /
+            LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+          SetLength(Cand, Length(Cand) + 1);
+          Cand[High(Cand)] := NewBeam;
+        end;
+        for T := 0 to VocabSize - 1 do
+        begin
+          NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+          if T = csDecodeEOSToken then
+          begin
+            // EOS only allowed once ALL phrases are present; otherwise the
+            // hypothesis must keep generating to satisfy the constraint.
+            if not AllForcedPhrasesPresent(Live[B].Text, ForceTokens) then
+              Continue;
+            NewBeam.Text := Live[B].Text;
+            NewBeam.Finished := True;
+            NewBeam.Score := NewBeam.SumLogProb /
+              LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+            SetLength(Finished, Length(Finished) + 1);
+            Finished[High(Finished)] := NewBeam;
+          end
+          else
+          begin
+            // Skip a token already added through the force-injection pass above
+            // (it is a needed next-char) to avoid a duplicate candidate.
+            if Pos(Chr(T), Needed) > 0 then Continue;
+            NewBeam.Text := Live[B].Text + Chr(T);
+            NewBeam.Finished := False;
+            NewBeam.Score := NewBeam.SumLogProb /
+              LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+            SetLength(Cand, Length(Cand) + 1);
+            Cand[High(Cand)] := NewBeam;
+          end;
+        end;
+      end;
+
+      // Bank-aware prune. Keep the global top-BeamWidth by score, BUT GUARANTEE
+      // MONOTONE PROGRESS toward the forced phrases: compute the maximum
+      // ForcedProgress reachable this step (over ALL candidates, including the
+      // force-injected needed-char ones) and ensure at least one survivor
+      // attains it. If the plain top-B prune drops every max-progress
+      // candidate, force-keep the best-scoring one in the last slot. Because a
+      // strictly-more-advanced hypothesis thus survives every step (and EOS is
+      // blocked until all phrases are present), the progress is non-decreasing
+      // and reaches Sum(Length(phrase)) - i.e. full satisfaction - within
+      // MaxLen (given MaxLen >= total phrase length).
+      SortBeamsByScore(Cand);
+      if Length(Cand) > BeamWidth then
+      begin
+        BestProg := 0;
+        for I := 0 to High(Cand) do
+          if ForcedProgress(Cand[I].Text, ForceTokens) > BestProg then
+            BestProg := ForcedProgress(Cand[I].Text, ForceTokens);
+        SetLength(Live, BeamWidth);
+        for I := 0 to BeamWidth - 1 do Live[I] := Cand[I];
+        KeptProg := 0;
+        for I := 0 to High(Live) do
+          if ForcedProgress(Live[I].Text, ForceTokens) > KeptProg then
+            KeptProg := ForcedProgress(Live[I].Text, ForceTokens);
+        if KeptProg < BestProg then
+          // Best-scoring candidate that attains the max progress (Cand is
+          // score-sorted) takes the final slot.
+          for I := BeamWidth to High(Cand) do
+            if ForcedProgress(Cand[I].Text, ForceTokens) = BestProg then
+            begin
+              Live[BeamWidth - 1] := Cand[I];
+              Break;
+            end;
+      end
+      else
+        Live := Copy(Cand, 0, Length(Cand));
+    end;
+
+    // Merge surviving live beams that SATISFY the constraint into the pool; an
+    // unsatisfied live beam is dropped (it never met the forced phrases within
+    // MaxLen). If nothing satisfied, fall back to keeping the surviving beams so
+    // the caller still gets a (best-effort) result rather than empty.
+    for B := 0 to High(Live) do
+      if AllForcedPhrasesPresent(Live[B].Text, ForceTokens) then
+      begin
+        SetLength(Finished, Length(Finished) + 1);
+        Finished[High(Finished)] := Live[B];
+      end;
+    if Length(Finished) = 0 then
+      for B := 0 to High(Live) do
+      begin
+        SetLength(Finished, Length(Finished) + 1);
+        Finished[High(Finished)] := Live[B];
+      end;
+
+    SortBeamsByScore(Finished);
+    SetLength(Result, Length(Finished));
+    for I := 0 to High(Finished) do
+    begin
+      Result[I].Text := Finished[I].Text;
+      Result[I].SumLogProb := Finished[I].SumLogProb;
+      Result[I].Score := Finished[I].Score;
+      Result[I].Finished := Finished[I].Finished;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+  end;
+end;
+
+function DecodeConstrainedBeamSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer;
+  const ForceTokens: array of string;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+var
+  All: TNNetDecodeResultArray;
+begin
+  All := DecodeConstrainedBeamSearchAll(NN, Prompt, MaxLen, BeamWidth,
+    ForceTokens, LengthPenalty);
   if Length(All) > 0 then
     Result := All[0]
   else
