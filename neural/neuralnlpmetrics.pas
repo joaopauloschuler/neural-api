@@ -32,11 +32,24 @@ conventions already in the codebase:
   softmax). Tokens are Ord(ch); for these char-level models
   bits-per-token IS bits-per-character (BPC).
 
+  PerplexityStrided(NN, Dict, Corpus, Stride): the HF "Perplexity of fixed-
+  length models" recipe for the per-position head. The corpus is tokenized and
+  CONCATENATED into one stream, then a window of length W (input SizeX) slides
+  over it with the given Stride. Each window runs one forward but only scores
+  the targets the previous window did not, so every token past the first
+  window carries up to W-1 tokens of real left context instead of the disjoint
+  chop. Stride = W reproduces the disjoint Perplexity() baseline EXACTLY (each
+  window's first token unscored); Stride < W re-scores those window-first
+  tokens too (a SUPERSET of the disjoint set - every stream position is scored
+  exactly once), so MeanNLL can only drop for a model with genuine long-range
+  structure. Per-position heads only (single next-token heads already see the
+  full prefix per position).
+
   Shared conventions (both functions):
   - TRUNCATION (v1): each sample is truncated to the model's context window
     (input SizeX); positions beyond the window are NOT scored (no sliding
-    re-evaluation). Documented trade-off: simple, cheap, and unbiased for
-    samples that fit the window.
+    re-evaluation - PerplexityStrided is the sliding-window remedy). Documented
+    trade-off: simple, cheap, and unbiased for samples that fit the window.
   - SPECIAL TOKENS: target tokens < 2 (the codebase-wide pad=0 / EOS=1
     convention, "NextTokenInt < 2") and out-of-vocab targets are EXCLUDED
     from the average (counted in SkippedTokens) when ExcludeSpecialTokens
@@ -254,6 +267,26 @@ function PerplexityFromChars(NN: TNNet; Corpus: TStrings;
   MinContext: integer = 1;
   ExcludeSpecialTokens: boolean = true): TNNetPerplexityStats;
 
+// Strided sliding-window perplexity (HF "Perplexity of fixed-length models"
+// recipe) for per-position teacher-forced LMs. The whole Corpus is tokenized
+// and CONCATENATED into one token stream, then a window of length W (the model
+// context = input SizeX) is slid over the stream with the given Stride. Each
+// window runs ONE forward; only the target positions NOT already scored by the
+// previous window are counted, so every scored token after the first window
+// carries up to W-1 tokens of real left context (instead of the disjoint-
+// window chop the per-line truncation in Perplexity() implies). With
+// Stride = W the windows are disjoint and this reproduces the disjoint
+// baseline EXACTLY (each window's first token is unscored, exactly the chop);
+// with Stride < W every token past the first window is re-scored with MORE
+// left context, so the MeanNLL can only drop for a model with genuine long-
+// range structure. Each stream token is scored EXACTLY once (no double-
+// counting): the scored set is identical to the disjoint baseline, only the
+// available left context differs. Per-position heads only (single next-token
+// heads already condition on the full prefix per position, so striding is a
+// no-op); Stride is clamped to [1, W].
+function PerplexityStrided(NN: TNNet; Dict: TStringListInt; Corpus: TStrings;
+  Stride: integer; ExcludeSpecialTokens: boolean = true): TNNetPerplexityStats;
+
 // Per-token log-probabilities ln p(Tokens[i] | Tokens[0..i-1]) of an
 // already-tokenized sequence (teacher-forced; no generation). Result has the
 // same length as Tokens; Result[0] is 0 (never scored). Raises EArgumentException
@@ -413,6 +446,44 @@ end;
 // Perplexity
 // ---------------------------------------------------------------------------
 
+// Teacher-forced forward of one window of token ids through a per-position
+// head, accumulating the NLL of the targets at window-relative positions
+// FirstTgt..LastTgt (output row Pos-1 predicts token Pos). Shared by Perplexity
+// and PerplexityStrided so the per-row softmax / re-normalisation / special-
+// token math lives in exactly one place. InV is reused (caller owns it).
+procedure ScorePerPositionWindow(NN: TNNet; InV: TNNetVolume; Last: TNNetLayer;
+  const WindowToks: TNeuralIntegerArray; FirstTgt, LastTgt, InDepth,
+  VocabSize: integer; ExcludeSpecial: boolean; var SumNLL: TNeuralFloat;
+  var Stats: TNNetPerplexityStats);
+var
+  Pos, D, Tgt: integer;
+  RowSum, Prob: TNeuralFloat;
+begin
+  InV.Fill(0);
+  if InDepth = 1
+  then InV.CopyNoChecksIntArr(WindowToks)   // token ids -> embedding
+  else InV.OneHotEncoding(WindowToks);       // one-hot, left-aligned
+  NN.Compute(InV);
+  for Pos := FirstTgt to LastTgt do
+  begin
+    Tgt := WindowToks[Pos];
+    if SkipTarget(Tgt, VocabSize, ExcludeSpecial) then
+    begin
+      Inc(Stats.SkippedTokens);
+      continue;
+    end;
+    // Output row Pos-1 predicts token Pos. Defensive re-normalisation keeps
+    // the math honest even for near-softmax heads.
+    RowSum := 0;
+    for D := 0 to VocabSize - 1 do
+      RowSum := RowSum + Last.Output[Pos - 1, 0, D];
+    if RowSum <= 0 then RowSum := 1.0;
+    Prob := Last.Output[Pos - 1, 0, Tgt] / RowSum;
+    SumNLL := SumNLL - SafeLogProb(Prob);
+    Inc(Stats.PredictedTokens);
+  end;
+end;
+
 function Perplexity(NN: TNNet; Dict: TStringListInt; Corpus: TStrings;
   ExcludeSpecialTokens: boolean = true): TNNetPerplexityStats;
 var
@@ -421,7 +492,7 @@ var
   Toks, Prefix: TNeuralIntegerArray;
   ContextLen, InDepth, VocabSize: integer;
   PerPosition: boolean;
-  LineIdx, SampleLen, ClippedLen, Pos, D, Tgt: integer;
+  LineIdx, SampleLen, ClippedLen, Pos, Tgt: integer;
   RowSum, Prob, SumNLL: TNeuralFloat;
 begin
   ZeroStats(Result);
@@ -451,29 +522,8 @@ begin
         // v1 truncation: only the first ContextLen tokens are scored.
         ClippedLen := Min(SampleLen, ContextLen);
         Prefix := Copy(Toks, 0, ClippedLen);
-        InV.Fill(0);
-        if InDepth = 1
-        then InV.CopyNoChecksIntArr(Prefix)       // token ids -> embedding
-        else InV.OneHotEncoding(Prefix);          // one-hot, left-aligned
-        NN.Compute(InV);
-        for Pos := 1 to ClippedLen - 1 do
-        begin
-          Tgt := Toks[Pos];
-          if SkipTarget(Tgt, VocabSize, ExcludeSpecialTokens) then
-          begin
-            Inc(Result.SkippedTokens);
-            continue;
-          end;
-          // Output row Pos-1 predicts token Pos. Defensive re-normalisation
-          // keeps the math honest even for near-softmax heads.
-          RowSum := 0;
-          for D := 0 to VocabSize - 1 do
-            RowSum := RowSum + Last.Output[Pos - 1, 0, D];
-          if RowSum <= 0 then RowSum := 1.0;
-          Prob := Last.Output[Pos - 1, 0, Tgt] / RowSum;
-          SumNLL := SumNLL - SafeLogProb(Prob);
-          Inc(Result.PredictedTokens);
-        end;
+        ScorePerPositionWindow(NN, InV, Last, Prefix, 1, ClippedLen - 1,
+          InDepth, VocabSize, ExcludeSpecialTokens, SumNLL, Result);
       end
       else
       begin
@@ -560,6 +610,83 @@ begin
   finally
     InV.Free;
   end;
+  FinishStats(SumNLL, Result);
+end;
+
+function PerplexityStrided(NN: TNNet; Dict: TStringListInt; Corpus: TStrings;
+  Stride: integer; ExcludeSpecialTokens: boolean = true): TNNetPerplexityStats;
+var
+  InV: TNNetVolume;
+  Last: TNNetLayer;
+  Stream, Toks, Window: TNeuralIntegerArray;
+  ContextLen, InDepth, VocabSize: integer;
+  PerPosition: boolean;
+  LineIdx, StreamLen, WinStart, WinLen, FirstTgt, LastTgt: integer;
+  PrevEndAbs: integer; // last ABSOLUTE stream position already scored
+  SumNLL: TNeuralFloat;
+begin
+  ZeroStats(Result);
+  if (NN = nil) or (Dict = nil) or (Corpus = nil) then Exit;
+  if NN.CountLayers() < 2 then Exit;
+  ContextLen := NN.GetFirstLayer().Output.SizeX;
+  InDepth := NN.GetFirstLayer().Output.Depth;
+  Last := NN.GetLastLayer();
+  // Strided sliding window only applies to per-position teacher-forced heads;
+  // see the unit header for the head-shape auto-detection.
+  PerPosition := (ContextLen > 1) and (Last.Output.SizeX = ContextLen) and
+    (Last.Output.Depth >= 2);
+  if not PerPosition then Exit;
+  VocabSize := Last.Output.Depth;
+  if VocabSize < 2 then Exit;
+  // Clamp the stride into [1, W]: Stride = W is the disjoint baseline.
+  if Stride < 1 then Stride := 1;
+  if Stride > ContextLen then Stride := ContextLen;
+  // Concatenate the whole corpus into one token stream (the HF recipe scores
+  // the corpus as a single sequence, not per line).
+  StreamLen := 0;
+  for LineIdx := 0 to Corpus.Count - 1 do
+  begin
+    Dict.Tokenize(Corpus[LineIdx], Toks);
+    if Length(Toks) = 0 then continue;
+    SetLength(Stream, StreamLen + Length(Toks));
+    Move(Toks[0], Stream[StreamLen], Length(Toks) * SizeOf(integer));
+    StreamLen := StreamLen + Length(Toks);
+  end;
+  if StreamLen < 2 then Exit;
+  SumNLL := 0;
+  // PrevEndAbs tracks the last stream position already scored. The first
+  // window scores all its predictable positions (1..WinLen-1); each later
+  // window scores only positions strictly past PrevEndAbs, so every token is
+  // scored exactly once and (after the first window) with bounded left
+  // context (its window start sits up to W-1 tokens before it).
+  PrevEndAbs := 0; // position 0 has no left context and is never a target
+  InV := TNNetVolume.Create(NN.GetFirstLayer().Output);
+  try
+    WinStart := 0;
+    while WinStart < StreamLen - 1 do
+    begin
+      WinLen := Min(ContextLen, StreamLen - WinStart);
+      Window := Copy(Stream, WinStart, WinLen);
+      // Window-relative target positions to score (1..WinLen-1 absolute
+      // WinStart+1..WinStart+WinLen-1). Skip the ones already scored by a
+      // previous window so no token is double-counted.
+      FirstTgt := Max(1, PrevEndAbs + 1 - WinStart);
+      LastTgt := WinLen - 1;
+      if LastTgt >= FirstTgt then
+      begin
+        ScorePerPositionWindow(NN, InV, Last, Window, FirstTgt, LastTgt,
+          InDepth, VocabSize, ExcludeSpecialTokens, SumNLL, Result);
+        PrevEndAbs := WinStart + LastTgt;
+      end;
+      if WinStart + WinLen >= StreamLen then break; // last window reached
+      WinStart := WinStart + Stride;
+    end;
+  finally
+    InV.Free;
+  end;
+  SetLength(Stream, 0);
+  SetLength(Toks, 0);
+  SetLength(Window, 0);
   FinishStats(SumNLL, Result);
 end;
 

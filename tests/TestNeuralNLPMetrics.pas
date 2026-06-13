@@ -70,6 +70,17 @@ type
     // Char-level path: uniform over 128 -> PPL = 128 and the EOS char chr(1)
     // is skipped as special.
     procedure TestPerplexityFromCharsUniform;
+    // PerplexityStrided with Stride = window reproduces the disjoint
+    // Perplexity() baseline EXACTLY (same scored count + MeanNLL bit-for-bit).
+    procedure TestPerplexityStridedStrideEqualsWindowMatchesDisjoint;
+    // A smaller stride scores every stream position past the first window
+    // exactly once (coverage = StreamLen-1, a SUPERSET of the disjoint set
+    // that skips each window's first token), with no double-counting.
+    procedure TestPerplexityStridedTokenCoverage;
+    // On a model with genuine long-range structure (next token = first stream
+    // token) a smaller stride gives strictly LOWER MeanNLL than the disjoint
+    // baseline, because the extra-context tokens are now predictable.
+    procedure TestPerplexityStridedLowerNLLWithLongRange;
     // ScoreSequence matches hand-computed softmax math (input-dependent
     // logits pin the causal shift); Result[0] = 0; context overflow raises.
     procedure TestScoreSequenceHandComputedSoftmax;
@@ -536,6 +547,160 @@ begin
       -SumLP / NumScored, Stats.MeanNLL, 1e-5);
     AssertEquals('and therefore the perplexity',
       Exp(-SumLP / NumScored), Stats.Perplexity, 1e-4);
+  finally
+    Corpus.Free;
+    Dict.Free;
+    NN.Free;
+  end;
+end;
+
+// Joins token ids into a space-separated line of dictionary words (ids must
+// be in 0..11). Lets the strided/disjoint tests pin an exact token stream.
+function IdsToLine(Dict: TStringListInt; const Ids: array of integer): string;
+var I: integer;
+begin
+  Result := '';
+  for I := 0 to High(Ids) do
+  begin
+    if I > 0 then Result := Result + ' ';
+    Result := Result + Dict.IntegerToWord(Ids[I]);
+  end;
+end;
+
+// Same, for the slice Ids[Start .. Start+Count-1] of a (fixed) array.
+function IdsRangeToLine(Dict: TStringListInt; const Ids: array of integer;
+  Start, Count: integer): string;
+var I: integer;
+begin
+  Result := '';
+  for I := 0 to Count - 1 do
+  begin
+    if I > 0 then Result := Result + ' ';
+    Result := Result + Dict.IntegerToWord(Ids[Start + I]);
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestPerplexityStridedStrideEqualsWindowMatchesDisjoint;
+var
+  NN: TNNet;
+  Dict: TStringListInt;
+  StreamCorpus, ChoppedCorpus: TStringList;
+  Strided, Disjoint: TNNetPerplexityStats;
+  Stream: array[0..23] of integer;
+  I, W: integer;
+begin
+  W := csCtx; // window = 8
+  NN := BuildPerPositionLM(W, csVocab);
+  Dict := BuildDict();
+  StreamCorpus := TStringList.Create();
+  ChoppedCorpus := TStringList.Create();
+  try
+    SetLinearScorerWeights(NN); // genuinely input-dependent per-position rows
+    // A 24-token stream over the regular (non-special) ids 2..11.
+    for I := 0 to 23 do Stream[I] := 2 + (I mod 10);
+    // The whole stream as ONE corpus line (PerplexityStrided concatenates).
+    StreamCorpus.Add(IdsToLine(Dict, Stream));
+    // The SAME stream chopped into disjoint W-token lines: Perplexity() scores
+    // positions 1..W-1 of each line - exactly the disjoint chop a Stride = W
+    // slide produces (each window's first token is unscored).
+    ChoppedCorpus.Add(IdsRangeToLine(Dict, Stream, 0, W));
+    ChoppedCorpus.Add(IdsRangeToLine(Dict, Stream, W, W));
+    ChoppedCorpus.Add(IdsRangeToLine(Dict, Stream, 2 * W, W));
+    Disjoint := Perplexity(NN, Dict, ChoppedCorpus, false);
+    Strided := PerplexityStrided(NN, Dict, StreamCorpus, W, false);
+    AssertEquals('Stride=W scores the same token count as the disjoint chop',
+      Disjoint.PredictedTokens, Strided.PredictedTokens);
+    AssertEquals('Stride=W reproduces the disjoint MeanNLL bit-for-bit',
+      Disjoint.MeanNLL, Strided.MeanNLL, 1e-5);
+    AssertEquals('and therefore the disjoint perplexity',
+      Disjoint.Perplexity, Strided.Perplexity, 1e-5);
+  finally
+    ChoppedCorpus.Free;
+    StreamCorpus.Free;
+    Dict.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestPerplexityStridedTokenCoverage;
+var
+  NN: TNNet;
+  Dict: TStringListInt;
+  Corpus: TStringList;
+  Full, Strided: TNNetPerplexityStats;
+  Stream: array[0..23] of integer;
+  I, W: integer;
+begin
+  W := csCtx; // 8
+  NN := BuildPerPositionLM(W, csVocab);
+  Dict := BuildDict();
+  Corpus := TStringList.Create();
+  try
+    SetLinearScorerWeights(NN);
+    for I := 0 to 23 do Stream[I] := 2 + (I mod 10);
+    Corpus.Add(IdsToLine(Dict, Stream));
+    // Stride < W: every stream position 1..StreamLen-1 is scored EXACTLY once
+    // (FirstTgt/PrevEndAbs bookkeeping forbids double-counting and leaves no
+    // gap), so coverage = 23 - a SUPERSET of the disjoint chop (which skips
+    // each non-first window's first token). No skipped tokens here (all ids
+    // 2..11 are regular).
+    Strided := PerplexityStrided(NN, Dict, Corpus, 4, false);
+    AssertEquals('every position past index 0 scored once', 23,
+      Strided.PredictedTokens);
+    AssertEquals('no skipped tokens', 0, Strided.SkippedTokens);
+    // Sanity: Stride = StreamLen (>= W, clamped to W) is the disjoint chop,
+    // which DOES skip the two interior window-first tokens (positions 8, 16).
+    Full := PerplexityStrided(NN, Dict, Corpus, 1000, false);
+    AssertEquals('disjoint chop scores fewer tokens (skips window-firsts)',
+      21, Full.PredictedTokens);
+    AssertTrue('strided covers strictly more tokens than the disjoint chop',
+      Strided.PredictedTokens > Full.PredictedTokens);
+  finally
+    Corpus.Free;
+    Dict.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestPerplexityStridedLowerNLLWithLongRange;
+var
+  NN: TNNet;
+  Dict: TStringListInt;
+  Corpus: TStringList;
+  Strided, Disjoint: TNNetPerplexityStats;
+  Stream: array[0..23] of integer;
+  I, W, HiId: integer;
+begin
+  W := csCtx; // 8
+  NN := BuildPerPositionLM(W, csVocab);
+  Dict := BuildDict();
+  Corpus := TStringList.Create();
+  try
+    // The linear scorer's softmax favours the HIGHEST token id (logit(J) rises
+    // with J). The disjoint chop NEVER scores the first token of an interior
+    // window (stream positions 8 and 16); a smaller stride DOES, each with its
+    // in-window predecessor as real left context. By placing the easiest-to-
+    // predict token (id 11) at exactly those boundary positions, the tokens
+    // the disjoint chop omits are the most predictable ones, so folding them
+    // into the average can only LOWER the MeanNLL: the bounded-left-context
+    // re-scoring beats the chop. (A pointwise head cannot mix across
+    // positions, so this is the honest small-net analogue of "real long-range
+    // structure" - the extra-context tokens are the ones that become
+    // scorable; documented choice.)
+    SetLinearScorerWeights(NN);
+    HiId := csVocab - 1; // 11, the argmax-favoured token
+    for I := 0 to 23 do Stream[I] := 2 + (I mod 10);
+    Stream[8] := HiId;
+    Stream[16] := HiId;
+    Corpus.Add(IdsToLine(Dict, Stream));
+    Disjoint := PerplexityStrided(NN, Dict, Corpus, W, false);     // = chop
+    Strided := PerplexityStrided(NN, Dict, Corpus, 4, false);      // S < W
+    AssertTrue('smaller stride scores more tokens',
+      Strided.PredictedTokens > Disjoint.PredictedTokens);
+    AssertTrue('smaller stride gives <= MeanNLL than the disjoint baseline',
+      Strided.MeanNLL <= Disjoint.MeanNLL + 1e-6);
+    AssertTrue('and the drop is real (boundary tokens are easy)',
+      Strided.MeanNLL < Disjoint.MeanNLL);
   finally
     Corpus.Free;
     Dict.Free;

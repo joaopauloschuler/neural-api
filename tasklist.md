@@ -425,7 +425,7 @@ rather than acted on.
       list ranked by start+end logit, end>=start + length cap, in
       neuralnlpmetrics.pas. Maps back to text via EncodeWithOffsets (Task A).
       Tests TestExtractQASpansPinned / TestExtractQASpansMaxLenAndOrder.
-- [ ] Strided sliding-window perplexity in neural/neuralnlpmetrics.pas
+- [X] Strided sliding-window perplexity in neural/neuralnlpmetrics.pas
       (the HF-docs-standard evaluation): for corpora longer than the model
       context, slide a window with stride < window and score only the
       non-overlapping tail tokens, so every token gets (bounded) left
