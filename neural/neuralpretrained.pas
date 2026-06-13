@@ -589,6 +589,22 @@ function BuildGPT2FromSafeTensorsEx(const FileName: string;
   pSeqClsHead: boolean = false; pExactGelu: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// Exports a TNNet previously wired by BuildGPT2FromSafeTensors[Ex] back to a
+// .safetensors file carrying the HF GPT-2 tensor NAMES (wte.weight, wpe.weight,
+// h.N.ln_1.weight/bias, h.N.attn.c_attn.weight/bias, h.N.attn.c_proj.*,
+// h.N.mlp.c_fc.*, h.N.mlp.c_proj.*, ln_f.weight/bias). It is the exact inverse
+// of the importer: HF Conv1D weights are stored [in, out] (the TRANSPOSE of the
+// Pascal neuron-major layout), so each c_* matrix is written W[i*out + j] =
+// Neuron[j].Weights[i]. The LM head is tied (= wte) and emitted as the unprefixed
+// lm_head.weight buffer. Config supplies the dimensions (pass the one returned
+// by BuildGPT2FromSafeTensorsEx); the named layers are recovered from the wired
+// net by walking it in the same order the importer built it. pDType selects the
+// on-disk encoding (stwF32 lossless default). Round-trips bit-exact through
+// BuildGPT2FromSafeTensors (see TestGPT2SafeTensorsRoundTrip).
+// Coded by Claude (AI).
+procedure SaveGPT2ToSafeTensors(Net: TNNet; const Config: TGPT2Config;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
 type
   // Parsed HF config.json "rope_scaling" (long-context extension), mapped
   // onto TNNetRotaryEmbedding's scaling-mode constructor arguments:
@@ -3441,6 +3457,170 @@ begin
   Result := BuildGPT2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pNumHeads, pInferenceOnly, {pSeqClsHead=}false, pExactGelu,
     pQuantizeInt8);
+end;
+
+// Writes a HF Conv1D weight [InDim, OutDim] (+ bias [OutDim]) pair to Writer
+// from a TNNetPointwiseConvLinear with OutDim neurons of InDim weights each -
+// the exact inverse of LoadConv1DWeights: HF stores W[in][out] row-major while
+// the Pascal side is neuron-major, so W[i*out + j] = Neuron[j].Weights[i].
+// Coded by Claude (AI).
+procedure SaveConv1DWeights(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
+  const WName, BName: string; InDim, OutDim: integer;
+  pDType: TSafeTensorsWriteDType);
+var
+  W, B: TNNetVolume;
+  i, j: integer;
+begin
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('GPT-2 export: layer for "' + WName + '" has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    W.ReSize(InDim, OutDim, 1);   // flat [InDim, OutDim] row-major
+    B.ReSize(OutDim, 1, 1);
+    for j := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[j].Weights.Size <> InDim then
+        ImportError('GPT-2 export: neuron ' + IntToStr(j) + ' for "' + WName +
+          '" has ' + IntToStr(Layer.Neurons[j].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for i := 0 to InDim - 1 do
+        W.FData[i * OutDim + j] := Layer.Neurons[j].Weights.FData[i];
+      B.FData[j] := Layer.Neurons[j].BiasWeight;
+    end;
+    Writer.AddTensorFlat(WName, [InDim, OutDim], W, pDType);
+    Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+  finally
+    B.Free;
+    W.Free;
+  end;
+end;
+
+// Writes a HF LayerNorm weight/bias pair to Writer from a TNNetTokenLayerNorm
+// (gamma in Neurons[0], beta in Neurons[1]) - inverse of LoadLayerNormWeights.
+// Coded by Claude (AI).
+procedure SaveLayerNormWeights(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
+  const WName, BName: string; d_model: integer;
+  pDType: TSafeTensorsWriteDType);
+begin
+  if (Layer.Neurons[0].Weights.Size <> d_model) or
+     (Layer.Neurons[1].Weights.Size <> d_model) then
+    ImportError('GPT-2 export: LayerNorm "' + WName + '" gamma/beta size ' +
+      'mismatch (expected ' + IntToStr(d_model) + ').');
+  Writer.AddTensorFlat(WName, [d_model], Layer.Neurons[0].Weights, pDType);
+  Writer.AddTensorFlat(BName, [d_model], Layer.Neurons[1].Weights, pDType);
+end;
+
+procedure SaveGPT2ToSafeTensors(Net: TNNet; const Config: TGPT2Config;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  LayerNorms, PwConvs: array of TNNetLayer;
+  EmbeddingLayer, PosLayer: TNNetLayer;
+  L, WteVol: TNNetVolume;
+  i, BlockCnt, PwBase, NumLN, NumPw, ExpectLN, ExpectPw: integer;
+  BlockPrefix: string;
+begin
+  // Recover the named layers by walking the net in the importer's build order:
+  // the only TNNetTokenLayerNorm layers are LN1/LN2 per block then ln_f, and
+  // the only TNNetPointwiseConvLinear layers are c_attn, attn.c_proj, mlp.c_fc,
+  // mlp.c_proj per block then the LM head (the MHA builder adds no other
+  // PointwiseConvLinear for the GPT-2 non-RoPE path).
+  EmbeddingLayer := nil;
+  PosLayer := nil;
+  SetLength(LayerNorms, 0);
+  SetLength(PwConvs, 0);
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if (EmbeddingLayer = nil) and (Net.Layers[i] is TNNetEmbedding) then
+      EmbeddingLayer := Net.Layers[i]
+    else if (PosLayer = nil) and
+            (Net.Layers[i] is TNNetLearnedPositionalEmbedding) then
+      PosLayer := Net.Layers[i]
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LayerNorms, Length(LayerNorms) + 1);
+      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if EmbeddingLayer = nil then
+    ImportError('GPT-2 export: no TNNetEmbedding (wte) layer found.');
+  if PosLayer = nil then
+    ImportError('GPT-2 export: no TNNetLearnedPositionalEmbedding (wpe) layer.');
+  NumLN := Length(LayerNorms);
+  NumPw := Length(PwConvs);
+  ExpectLN := 2 * Config.NLayers + 1;          // LN1+LN2 per block + ln_f
+  ExpectPw := 4 * Config.NLayers + 1;          // c_attn,c_proj,c_fc,c_proj + LM head
+  if NumLN <> ExpectLN then
+    ImportError('GPT-2 export: found ' + IntToStr(NumLN) + ' LayerNorm layers, ' +
+      'expected ' + IntToStr(ExpectLN) + ' for n_layer=' +
+      IntToStr(Config.NLayers) + '. Was this net built by BuildGPT2FromSafeTensors?');
+  if NumPw <> ExpectPw then
+    ImportError('GPT-2 export: found ' + IntToStr(NumPw) + ' PointwiseConvLinear ' +
+      'layers, expected ' + IntToStr(ExpectPw) + ' for n_layer=' +
+      IntToStr(Config.NLayers) + '. Was this net built by BuildGPT2FromSafeTensors?');
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/gpt2');
+    // wte: the embedding table is one neuron of [vocab*d] flat row-major.
+    WteVol := EmbeddingLayer.Neurons[0].Weights;
+    if WteVol.Size <> Config.VocabSize * Config.NEmbd then
+      ImportError('GPT-2 export: wte size ' + IntToStr(WteVol.Size) +
+        ' <> vocab*d = ' + IntToStr(Config.VocabSize * Config.NEmbd) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'wte.weight',
+      [Config.VocabSize, Config.NEmbd], WteVol, pDType);
+    // wpe: the learned positional table, [n_ctx, d] flat row-major.
+    L := PosLayer.Neurons[0].Weights;
+    if L.Size <> Config.NCtx * Config.NEmbd then
+      ImportError('GPT-2 export: wpe size ' + IntToStr(L.Size) +
+        ' <> n_ctx*d = ' + IntToStr(Config.NCtx * Config.NEmbd) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'wpe.weight',
+      [Config.NCtx, Config.NEmbd], L, pDType);
+    // Tied LM head: re-emit wte under the unprefixed lm_head.weight name the
+    // importer treats as an ignorable duplicate (HF tie_word_embeddings).
+    Writer.AddTensorFlat('lm_head.weight',
+      [Config.VocabSize, Config.NEmbd], WteVol, pDType);
+
+    for BlockCnt := 0 to Config.NLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+      PwBase := BlockCnt * 4;
+      SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2],
+        BlockPrefix + 'ln_1.weight', BlockPrefix + 'ln_1.bias',
+        Config.NEmbd, pDType);
+      SaveConv1DWeights(Writer, PwConvs[PwBase + 0],
+        BlockPrefix + 'attn.c_attn.weight', BlockPrefix + 'attn.c_attn.bias',
+        Config.NEmbd, 3 * Config.NEmbd, pDType);
+      SaveConv1DWeights(Writer, PwConvs[PwBase + 1],
+        BlockPrefix + 'attn.c_proj.weight', BlockPrefix + 'attn.c_proj.bias',
+        Config.NEmbd, Config.NEmbd, pDType);
+      SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 1],
+        BlockPrefix + 'ln_2.weight', BlockPrefix + 'ln_2.bias',
+        Config.NEmbd, pDType);
+      SaveConv1DWeights(Writer, PwConvs[PwBase + 2],
+        BlockPrefix + 'mlp.c_fc.weight', BlockPrefix + 'mlp.c_fc.bias',
+        Config.NEmbd, 4 * Config.NEmbd, pDType);
+      SaveConv1DWeights(Writer, PwConvs[PwBase + 3],
+        BlockPrefix + 'mlp.c_proj.weight', BlockPrefix + 'mlp.c_proj.bias',
+        4 * Config.NEmbd, Config.NEmbd, pDType);
+    end;
+    // Final ln_f is the last TokenLayerNorm.
+    SaveLayerNormWeights(Writer, LayerNorms[NumLN - 1],
+      Config.Prefix + 'ln_f.weight', Config.Prefix + 'ln_f.bias',
+      Config.NEmbd, pDType);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
 end;
 
 // ===================== ROPE SCALING (config.json) ==========================

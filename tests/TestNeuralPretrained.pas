@@ -105,6 +105,7 @@ type
     procedure TestImporterFailsOnMissingTensor;
     procedure TestGPT2ConfigFromFixture;
     procedure TestGPT2LogitParity;
+    procedure TestGPT2SafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -1432,6 +1433,63 @@ begin
     Output.Free;
     Input.Free;
     RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Round-trips the imported pico GPT-2 through the HF-names exporter
+// (SaveGPT2ToSafeTensors): import -> export to a temp .safetensors -> re-import
+// with BuildGPT2FromSafeTensors and assert next-token logits match the original
+// bit-tight on a pinned input. Proves the name map + Conv1D [in,out] transpose
+// is exactly the inverse of the importer.
+procedure TTestNeuralPretrained.TestGPT2SafeTensorsRoundTrip;
+var
+  NN, NN2: TNNet;
+  Config: TGPT2Config;
+  Input, Out1, Out2: TNNetVolume;
+  TmpPath: string;
+  i: integer;
+  Diff, MaxDiff: single;
+begin
+  RandSeed := 424242;
+  TmpPath := GetTempDir(false) + 'cai_gpt2_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  NN := BuildGPT2FromSafeTensorsEx(FixturePath('tiny_gpt2.safetensors'),
+    Config, {SeqLen=}0, {NumHeads=}2);
+  Input := TNNetVolume.Create;
+  Out1 := TNNetVolume.Create;
+  Out2 := TNNetVolume.Create;
+  NN2 := nil;
+  try
+    // Pinned input within the pico context length and vocab.
+    Input.ReSize(Config.NCtx, 1, 1);
+    for i := 0 to Config.NCtx - 1 do
+      Input.FData[i] := i mod Config.VocabSize;
+    NN.Compute(Input);
+    NN.GetOutput(Out1);
+
+    SaveGPT2ToSafeTensors(NN, Config, TmpPath);
+    NN2 := BuildGPT2FromSafeTensors(TmpPath, {SeqLen=}0, {NumHeads=}2);
+    NN2.Compute(Input);
+    NN2.GetOutput(Out2);
+
+    AssertEquals('round-trip output size', Out1.Size, Out2.Size);
+    MaxDiff := 0;
+    for i := 0 to Out1.Size - 1 do
+    begin
+      Diff := Abs(Out1.FData[i] - Out2.FData[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // F32 -> F32 round-trip with an exact name/transpose inverse is bit-exact;
+    // allow a tiny epsilon for any non-determinism, far under the 1e-3 ceiling.
+    AssertTrue('GPT-2 safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    Out2.Free;
+    Out1.Free;
+    Input.Free;
+    NN2.Free;
     NN.Free;
   end;
 end;

@@ -285,11 +285,18 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [ ] HF-names safetensors exporter: export an imported pico-GPT-2 back to
+- [X] HF-names safetensors exporter: export an imported pico-GPT-2 back to
       HF tensor names (wte.weight, h.N.attn.c_attn.weight, ...), reload via
       BuildGPT2FromSafeTensors and compare logits; generalize per-importer
       name maps later. The generic writer landed; only the naming/transpose
       mapping (Pascal neuron-major vs HF [in,out] Conv1D) is missing.
+      DONE (GPT-2): SaveGPT2ToSafeTensors in neuralpretrained.pas is the exact
+      inverse of the importer (Conv1D [in,out] transpose W[i*out+j]=Neuron[j][i],
+      LayerNorm gamma/beta neurons, tied lm_head re-emit); recovers the named
+      layers by walking the wired net. TestGPT2SafeTensorsRoundTrip round-trips
+      bit-exact (max |diff| < 1e-5). STILL OPEN: per-importer name maps for the
+      other architectures (Llama/Qwen3/BERT/...) - each needs its own
+      layer->HF-name + transpose inverse (the "generalize later" clause).
 - [X] GGUF writer follow-up: export an arbitrary trained/in-memory TNNet
       (the layer->HF inverse mapping — q/k de-permute + SwiGLU un-fuse —
       reading weights back out of the WIRED Llama layers) rather than only an
