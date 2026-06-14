@@ -151,6 +151,7 @@ type
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestGGUFWriterRoundTrip;
     procedure TestBuildFromGGUFQwen2RoundTrip;
+    procedure TestBuildFromGGUFGemma2RoundTrip;
     procedure TestBuildFromGGUFRejectsUnknownArch;
     procedure TestGGUFWriterGpt2TokenizerRoundTrip;
     procedure TestTNNetGGUFWriterRoundTrip;
@@ -4385,6 +4386,125 @@ begin
           MaxDiff := Abs(OutR.FData[i] - OutG.FData[i]);
     end;
     AssertTrue('Qwen2 GGUF dispatch round-trip max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutG.Free; OutR.Free; Input.Free;
+    NNG.Free; NNRef.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+// Offline write->read parity oracle for the gemma2 GGUF import path. Mirrors
+// TestBuildFromGGUFQwen2RoundTrip: export the HF-verified pico Gemma-2 fixture
+// (tiny_gemma2.*) to a temp .gguf via SaveLlamaToGGUF (now emitting the Gemma
+// deltas), read it back through BuildFromGGUF, and assert next-token logits
+// match the safetensors-built reference to < 1e-4 over 3 prompts. This
+// exercises EVERY Gemma-specific delta end to end through the GGUF container:
+//   - general.architecture "gemma2" dispatch (re-derives GegluFFN /
+//     RMSNormAddOne / SandwichNorm / AltSlidingWindow / sqrt(d) EmbedScale);
+//   - the four-norm sandwich tensors (attn_norm / post_attention_norm /
+//     ffn_norm=pre_feedforward / post_ffw_norm);
+//   - NEOX rope: q/k rows written WITHOUT the interleave permute the llama/
+//     qwen2 path applies (a wrong permute here would corrupt RoPE and blow
+//     the gate, since the fixture's per-head deltas are >1e-1);
+//   - the numeric deltas keyed under gemma2.*: attention.sliding_window=4
+//     (local window on the even layer), attention.query_pre_attn_scalar=12
+//     (!= head_dim=6, folded into W_q at load), attn_logit_softcapping=5.0,
+//     final_logit_softcapping=0.5.
+// The tiny_gemma2_fixture generator asserts each delta moves the logits by
+// more than the 1e-4 gate, so a dropped or misrouted delta FAILS here.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestBuildFromGGUFGemma2RoundTrip;
+var
+  NNRef, NNG: TNNet;
+  Config, ConfigG: TLlamaConfig;
+  GGUFPath: string;
+  Input, OutR, OutG: TNNetVolume;
+  i, s, SeqLen, Vocab, SDPACnt: integer;
+  MaxDiff: double;
+  Reader: TNNetSafeTensorsReader;
+begin
+  RandSeed := 424242;
+  GGUFPath := GetTempDir(false) + 'cai_buildfromgguf_gemma2_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Config := ReadLlamaConfigFromJSONFile(FixturePath('tiny_gemma2_config.json'));
+  Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_gemma2.safetensors'));
+  try
+    if Config.VocabSize <= 0 then
+      Config.VocabSize := integer(
+        Reader.DimSize('model.embed_tokens.weight', 0));
+    SaveLlamaToGGUF(Reader, Config, GGUFPath);
+  finally
+    Reader.Free;
+  end;
+
+  NNRef := BuildGemma2FromSafeTensorsEx(FixturePath('tiny_gemma2.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_gemma2_config.json'));
+  NNG := BuildFromGGUFEx(GGUFPath, ConfigG);
+  Input := TNNetVolume.Create;
+  OutR := TNNetVolume.Create;
+  OutG := TNNetVolume.Create;
+  try
+    // The dispatch must re-derive the full Gemma-2 config from the file.
+    AssertEquals('dispatch model_type', 'gemma2', ConfigG.ModelType);
+    AssertTrue('dispatch geglu_ffn', ConfigG.GegluFFN);
+    AssertTrue('dispatch rmsnorm_add_one', ConfigG.RMSNormAddOne);
+    AssertTrue('dispatch sandwich_norm', ConfigG.SandwichNorm);
+    AssertTrue('dispatch alt_sliding_window', ConfigG.AltSlidingWindow);
+    AssertEquals('round-trip embed_scale', Sqrt(Config.HiddenSize),
+      ConfigG.EmbedScale, 1e-5);
+    AssertEquals('round-trip sliding_window', Config.SlidingWindow,
+      ConfigG.SlidingWindow);
+    AssertEquals('round-trip query_pre_attn_scalar',
+      Config.QueryPreAttnScalar, ConfigG.QueryPreAttnScalar, 1e-6);
+    AssertEquals('round-trip attn_logit_softcapping',
+      Config.AttnLogitSoftCap, ConfigG.AttnLogitSoftCap, 1e-6);
+    AssertEquals('round-trip final_logit_softcapping',
+      Config.FinalLogitSoftCap, ConfigG.FinalLogitSoftCap, 1e-6);
+    AssertEquals('round-trip hidden', Config.HiddenSize, ConfigG.HiddenSize);
+    AssertEquals('round-trip layers', Config.NumLayers, ConfigG.NumLayers);
+    AssertEquals('round-trip kv_heads', Config.NumKVHeads, ConfigG.NumKVHeads);
+    AssertEquals('round-trip head_dim', Config.HeadDim, ConfigG.HeadDim);
+    AssertEquals('round-trip vocab', Config.VocabSize, ConfigG.VocabSize);
+    AssertTrue('round-trip tied head', ConfigG.TieWordEmbeddings);
+    // The local/global window must survive into the built SDPA heads: the
+    // first NumHeads SDPAs (layer 0) carry Window=SlidingWindow, the rest 0.
+    SDPACnt := 0;
+    for i := 0 to NNG.Layers.Count - 1 do
+      if NNG.Layers[i].ClassType = TNNetScaledDotProductAttention then
+      begin
+        if SDPACnt < ConfigG.NumHeads then
+          AssertEquals('GGUF layer-0 SDPA head local window',
+            Config.SlidingWindow,
+            TNNetScaledDotProductAttention(NNG.Layers[i]).Window)
+        else
+          AssertEquals('GGUF layer-1 SDPA head global window', 0,
+            TNNetScaledDotProductAttention(NNG.Layers[i]).Window);
+        AssertEquals('GGUF SDPA score soft-cap', Config.AttnLogitSoftCap,
+          TNNetScaledDotProductAttention(NNG.Layers[i]).ScoreSoftCap, 1e-6);
+        Inc(SDPACnt);
+      end;
+    AssertEquals('GGUF SDPA head count', 4, SDPACnt);
+
+    SeqLen := ConfigG.MaxPositions;
+    Vocab := ConfigG.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      NNRef.Compute(Input);
+      NNRef.GetOutput(OutR);
+      NNG.Compute(Input);
+      NNG.GetOutput(OutG);
+      AssertEquals('round-trip output size', OutR.Size, OutG.Size);
+      for i := 0 to OutR.Size - 1 do
+        if Abs(OutR.FData[i] - OutG.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutR.FData[i] - OutG.FData[i]);
+    end;
+    AssertTrue('Gemma2 GGUF dispatch round-trip max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutG.Free; OutR.Free; Input.Free;

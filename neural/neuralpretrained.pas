@@ -1084,13 +1084,19 @@ function BuildFromGGUF(const FileName: string;
 // reproduces logits. pDType selects the matrix encoding (gwF32 lossless,
 // gwF16, gwQ8_0); 1-D norm gains always stay F32.
 //
-// SCOPE: Llama-family decoders only (model_type llama/mistral/qwen2 with the
-// standard SwiGLU MLP, separate q/k/v, single RoPE theta). The exotic deltas
-// (MoE, fused qkv/gate-up, sandwich/post norms, QK-norm, partial rotary,
-// per-layer theta, soft-capping, embed scale) are NOT serialized and are
-// rejected loudly - exporting those is out of scope for v1, same as the
-// ONNX-export task. Q8_0 is quantized on write (max|x|/127 + round, the
-// ggml quantize_row_q8_0 reference).
+// SCOPE: the Llama BACKBONE plus its qwen2 and gemma2 siblings - the three
+// families BuildFromGGUF can read back. The architecture is selected from the
+// config: plain Llama/Mistral (SwiGLU, separate q/k/v, single theta);
+// "qwen2" when Config.QKVBias (adds the q/k/v projection biases); "gemma2"
+// when Config.GegluFFN (then RMSNormAddOne + SandwichNorm + AltSlidingWindow
+// are required) - it serializes the gated-GELU FFN, sqrt(d) embed scale, the
+// four-norm sandwich tensors, NEOX-order (unpermuted) q/k rows, and the
+// gemma2.* numeric deltas (sliding_window, query_pre_attn_scalar, attn/final
+// soft-caps). The remaining exotic deltas (MoE, fused qkv/gate-up, QK-norm,
+// partial rotary, per-layer theta, GLM-4/OLMo-2 norms) are NOT serialized and
+// are rejected loudly - out of scope for v1. Each emitted family is offline
+// round-trip-verified (write -> BuildFromGGUF -> logits) to < 1e-4. Q8_0 is
+// quantized on write (max|x|/127 + round, the ggml quantize_row_q8_0 ref).
 // The optional Tokenizer argument, when non-nil, takes precedence over the
 // plain Tokens array and routes the FULL tokenizer block through
 // TNeuralHFTokenizer.SaveTokenizerToGGUF - a byte-level-BPE tokenizer emits a
@@ -8097,14 +8103,16 @@ begin
     end
     else // gemma2
     begin
-      // NOTE: the gemma2 path reuses the HF-verified Gemma-2 config flags
-      // (BuildGemma2FromSafeTensors is tested against HF float64 logits), but
-      // the GGUF SIDE is NOT round-trip-verified offline: the landed GGUF
-      // writer does not emit Gemma deltas (gated-GELU / embed scale / soft-
-      // caps), so there is no write->read oracle the way qwen2 has. The
-      // metadata key names below and the "no q/k de-interleave" choice follow
-      // llama.cpp's gemma2 convert convention; treat real-gemma2-GGUF parity
-      // as PENDING a fixture before trusting it in production.
+      // The gemma2 path reuses the HF-verified Gemma-2 config flags
+      // (BuildGemma2FromSafeTensors is tested against HF float64 logits) AND
+      // is now round-trip-verified offline: SaveLlamaToGGUFEx emits the Gemma
+      // deltas (gated-GELU / sqrt(d) embed scale / sandwich-norm tensors /
+      // unpermuted NEOX q/k rows / sliding_window / query_pre_attn_scalar /
+      // attn+final soft-caps), and TestBuildFromGGUFGemma2RoundTrip exports
+      // the pico Gemma-2 fixture through the writer, reads it back here, and
+      // asserts next-token logits match the safetensors-built net to < 1e-4.
+      // The metadata key names below and the "no q/k de-interleave" choice
+      // follow llama.cpp's gemma2 convert convention.
       // Gemma-2 deltas (match BuildGemma2FromSafeTensors): gated-GELU MLP,
       // zero-centered RMSNorm, sqrt(d_model) embed scale, sandwich norms,
       // 1:1 alternating local/global sliding window, query pre-attn scalar
@@ -8226,6 +8234,7 @@ var
   BlockPrefix, GGUFBlock: string;
   Scores: array of single;
   TokenTypes: array of Int64;
+  Gemma2: boolean;
 
   // Builds a "<arch>.<suffix>" metadata key (llama.cpp keys all the
   // hyperparameters under the architecture prefix).
@@ -8374,35 +8383,63 @@ var
   end;
 
 begin
+  // A Gemma-2 export rides the SAME writer with a handful of deltas (gated-
+  // GELU FFN, sqrt(d) embed scale, sandwich norms, query pre-attn scalar,
+  // attn/final soft-caps, NEOX rope so the q/k rows are NOT permuted). It is
+  // recognized by Config.GegluFFN (the FFN gate is the defining structural
+  // delta); the remaining Gemma flags are then REQUIRED so a half-configured
+  // net cannot silently emit a malformed "gemma2" file. The reader
+  // (BuildFromGGUF) re-derives EmbedScale / RMSNormAddOne / SandwichNorm /
+  // AltSlidingWindow from general.architecture "gemma2", so those need no
+  // explicit metadata; only the numeric soft-caps / scalar / window are keyed.
+  Gemma2 := Config.GegluFFN;
+  if Gemma2 then
+  begin
+    if not (Config.RMSNormAddOne and Config.SandwichNorm and
+            Config.AltSlidingWindow) then
+      ImportError('Llama GGUF export: a gemma2 export (GegluFFN set) also ' +
+        'requires RMSNormAddOne + SandwichNorm + AltSlidingWindow; this ' +
+        'config is only partially Gemma-2.');
+    if Config.InterleavedRotary then
+      ImportError('Llama GGUF export: gemma2 uses NEOX rope; ' +
+        'InterleavedRotary must be off.');
+    if Config.QKNorm or Config.QKNormFullWidth then
+      ImportError('Llama GGUF export: gemma2 with q/k RMSNorm (gemma3) is ' +
+        'out of scope for v1.');
+    if Config.RopeLocalTheta > 0 then
+      ImportError('Llama GGUF export: per-layer RoPE theta (Gemma-3) is out ' +
+        'of scope for v1.');
+  end;
+
   // ---- reject the out-of-scope architecture deltas (v1 = plain Llama) ----
   if Config.IsMoE then
     ImportError('Llama GGUF export: MoE models are out of scope for v1.');
   if Config.FusedQKVGateUp or Config.FusedGateUp then
     ImportError('Llama GGUF export: fused qkv/gate-up projections are out ' +
       'of scope for v1.');
-  if Config.SandwichNorm or Config.GLM4SandwichNorm or
-     Config.PostNormReordered then
+  if (not Gemma2) and (Config.SandwichNorm or Config.GLM4SandwichNorm or
+     Config.PostNormReordered) then
     ImportError('Llama GGUF export: sandwich/reordered norms are out of ' +
       'scope for v1.');
-  if Config.QKNorm or Config.QKNormFullWidth then
+  if (not Gemma2) and (Config.QKNorm or Config.QKNormFullWidth) then
     ImportError('Llama GGUF export: q/k RMSNorm models are out of scope ' +
       'for v1.');
   if (Config.PartialRotaryFactor > 0) and (Config.PartialRotaryFactor < 1) then
     ImportError('Llama GGUF export: partial rotary is out of scope for v1.');
-  if Config.InterleavedRotary then
+  if (not Gemma2) and Config.InterleavedRotary then
     ImportError('Llama GGUF export: interleaved-rotary families (GLM-4/' +
       'Cohere) are out of scope for v1.');
-  if Config.GegluFFN then
+  if (not Gemma2) and Config.GegluFFN then
     ImportError('Llama GGUF export: gated-GELU FFN (Gemma) is out of scope ' +
       'for v1.');
-  if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1) then
+  if (not Gemma2) and (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1) then
     ImportError('Llama GGUF export: embedding scaling (Gemma) is out of ' +
       'scope for v1.');
-  if (Config.QueryPreAttnScalar <> 0) or (Config.AttnLogitSoftCap <> 0) or
-     (Config.FinalLogitSoftCap <> 0) then
+  if (not Gemma2) and ((Config.QueryPreAttnScalar <> 0) or
+     (Config.AttnLogitSoftCap <> 0) or (Config.FinalLogitSoftCap <> 0)) then
     ImportError('Llama GGUF export: Gemma-2 score scaling / soft-capping ' +
       'is out of scope for v1.');
-  if Config.RopeLocalTheta > 0 then
+  if (not Gemma2) and (Config.RopeLocalTheta > 0) then
     ImportError('Llama GGUF export: per-layer RoPE theta (Gemma-3) is out ' +
       'of scope for v1.');
 
@@ -8426,7 +8463,9 @@ begin
     // round-trip reader (BuildFromGGUF) re-derives the QKVBias flag from the
     // architecture name rather than guessing from the presence of bias
     // tensors. Everything else stays "llama".
-    if Config.QKVBias then Arch := 'qwen2' else Arch := 'llama';
+    if Gemma2 then Arch := 'gemma2'
+    else if Config.QKVBias then Arch := 'qwen2'
+    else Arch := 'llama';
     Writer.AddMetaString('general.architecture', Arch);
     Writer.AddMetaString('general.name', 'cai-neural-api-export');
     Writer.AddMetaUInt32(MetaKey('block_count'), Config.NumLayers);
@@ -8454,6 +8493,24 @@ begin
       ImportError('Llama GGUF export: rope_scaling mode ' +
         IntToStr(Ord(Config.RopeScaling.Mode)) + ' is out of scope for v1 ' +
         '(only none / linear).');
+
+    // ---- gemma2 numeric deltas (the reader keys these under gemma2.*) ----
+    // EmbedScale / RMSNormAddOne / SandwichNorm / AltSlidingWindow are
+    // re-derived from general.architecture "gemma2" on read and need no key;
+    // only the per-model numbers are emitted. The 1:1 local/global pattern is
+    // implied by the architecture (the reader sets AltSlidingWindow), so the
+    // sliding_window key carries just the local window span.
+    if Gemma2 then
+    begin
+      Writer.AddMetaUInt32(MetaKey('attention.sliding_window'),
+        Config.SlidingWindow);
+      Writer.AddMetaFloat32(MetaKey('attention.query_pre_attn_scalar'),
+        Config.QueryPreAttnScalar);
+      Writer.AddMetaFloat32(MetaKey('attn_logit_softcapping'),
+        Config.AttnLogitSoftCap);
+      Writer.AddMetaFloat32(MetaKey('final_logit_softcapping'),
+        Config.FinalLogitSoftCap);
+    end;
 
     // ---- a self-contained tokenizer block ----
     // A supplied TNeuralHFTokenizer takes precedence over the plain Tokens
@@ -8492,10 +8549,23 @@ begin
       GGUFBlock := 'blk.' + IntToStr(b) + '.';
       WriteNorm(BlockPrefix + 'input_layernorm.weight',
         GGUFBlock + 'attn_norm.weight', Config.HiddenSize);
-      WriteQKMatrix(BlockPrefix + 'self_attn.q_proj.weight',
-        GGUFBlock + 'attn_q.weight', QWidth, Config.HiddenSize);
-      WriteQKMatrix(BlockPrefix + 'self_attn.k_proj.weight',
-        GGUFBlock + 'attn_k.weight', KVWidth, Config.HiddenSize);
+      // Gemma uses NEOX rope and is stored in HF row order, so its q/k rows are
+      // NOT permuted (no interleave); the interleaved-rope families (llama/
+      // qwen2) get the per-head row permutation that the reader undoes.
+      if Gemma2 then
+      begin
+        WriteMatrix(BlockPrefix + 'self_attn.q_proj.weight',
+          GGUFBlock + 'attn_q.weight', QWidth, Config.HiddenSize);
+        WriteMatrix(BlockPrefix + 'self_attn.k_proj.weight',
+          GGUFBlock + 'attn_k.weight', KVWidth, Config.HiddenSize);
+      end
+      else
+      begin
+        WriteQKMatrix(BlockPrefix + 'self_attn.q_proj.weight',
+          GGUFBlock + 'attn_q.weight', QWidth, Config.HiddenSize);
+        WriteQKMatrix(BlockPrefix + 'self_attn.k_proj.weight',
+          GGUFBlock + 'attn_k.weight', KVWidth, Config.HiddenSize);
+      end;
       WriteMatrix(BlockPrefix + 'self_attn.v_proj.weight',
         GGUFBlock + 'attn_v.weight', KVWidth, Config.HiddenSize);
       // Qwen2 q/k/v projection biases (o_proj stays bias-free). q/k biases are
@@ -8511,8 +8581,23 @@ begin
       end;
       WriteMatrix(BlockPrefix + 'self_attn.o_proj.weight',
         GGUFBlock + 'attn_output.weight', Config.HiddenSize, QWidth);
-      WriteNorm(BlockPrefix + 'post_attention_layernorm.weight',
-        GGUFBlock + 'ffn_norm.weight', Config.HiddenSize);
+      if Gemma2 then
+      begin
+        // Gemma-2 sandwich: post_attention_layernorm closes the attention
+        // branch (attn_norm above is its pre-norm); pre_feedforward_layernorm
+        // is the FFN pre-norm (the ggml "ffn_norm" slot) and
+        // post_feedforward_layernorm closes the FFN branch. These match the
+        // reader's blk.N.{post_attention_norm,ffn_norm,post_ffw_norm} renames.
+        WriteNorm(BlockPrefix + 'post_attention_layernorm.weight',
+          GGUFBlock + 'post_attention_norm.weight', Config.HiddenSize);
+        WriteNorm(BlockPrefix + 'pre_feedforward_layernorm.weight',
+          GGUFBlock + 'ffn_norm.weight', Config.HiddenSize);
+        WriteNorm(BlockPrefix + 'post_feedforward_layernorm.weight',
+          GGUFBlock + 'post_ffw_norm.weight', Config.HiddenSize);
+      end
+      else
+        WriteNorm(BlockPrefix + 'post_attention_layernorm.weight',
+          GGUFBlock + 'ffn_norm.weight', Config.HiddenSize);
       WriteMatrix(BlockPrefix + 'mlp.gate_proj.weight',
         GGUFBlock + 'ffn_gate.weight', Config.IntermediateSize,
         Config.HiddenSize);
