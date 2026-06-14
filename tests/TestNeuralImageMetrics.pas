@@ -52,6 +52,16 @@ type
     procedure TestISUniformIsOne;
     // IS over the mixed case (with splits) matches the numpy oracle.
     procedure TestISMixedVsOracle;
+    // SSIM/PSNR vs the numpy float64 oracle on pinned image pairs.
+    procedure TestSSIMvsOracle;
+    procedure TestPSNRvsOracle;
+    // MS-SSIM vs the per-scale-product numpy oracle.
+    procedure TestMSSSIMvsOracle;
+    // Identical images -> SSIM 1.0 and PSNR +Inf.
+    procedure TestSSIMIdenticalIsOne;
+    procedure TestPSNRIdenticalIsInf;
+    // 1-SSIM loss gradient matches a central difference.
+    procedure TestSSIMLossGradient;
   end;
 
 implementation
@@ -304,6 +314,142 @@ begin
   finally
     Root.Free;
   end;
+end;
+
+procedure TTestNeuralImageMetrics.TestSSIMvsOracle;
+var
+  Root: TJSONData;
+  cases: TJSONArray;
+  c: TJSONObject;
+  ia, ib: TIMDoubleArray;
+  expected, got: Double;
+  i: integer;
+begin
+  if not LoadFixture(Root) then begin Ignore('fixture absent'); Exit; end;
+  try
+    cases := TJSONObject(Root).Arrays['ssim_cases'];
+    for i := 0 to cases.Count - 1 do
+    begin
+      c := cases.Objects[i];
+      ia := JArrToDoubleArr(c.Arrays['imgA']);
+      ib := JArrToDoubleArr(c.Arrays['imgB']);
+      expected := c.Floats['ssim'];
+      got := ComputeSSIM(ia, ib, c.Integers['H'], c.Integers['W'],
+        c.Integers['C'], c.Floats['dataRange']);
+      AssertEquals('SSIM ' + c.Strings['name'], expected, got, 1e-6);
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestPSNRvsOracle;
+var
+  Root: TJSONData;
+  cases: TJSONArray;
+  c: TJSONObject;
+  ia, ib: TIMDoubleArray;
+  expected, got: Double;
+  i: integer;
+begin
+  if not LoadFixture(Root) then begin Ignore('fixture absent'); Exit; end;
+  try
+    cases := TJSONObject(Root).Arrays['ssim_cases'];
+    for i := 0 to cases.Count - 1 do
+    begin
+      c := cases.Objects[i];
+      ia := JArrToDoubleArr(c.Arrays['imgA']);
+      ib := JArrToDoubleArr(c.Arrays['imgB']);
+      expected := c.Floats['psnr'];
+      got := ComputePSNR(ia, ib, c.Integers['H'], c.Integers['W'],
+        c.Integers['C'], c.Floats['dataRange']);
+      AssertEquals('PSNR ' + c.Strings['name'], expected, got, 1e-5);
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestMSSSIMvsOracle;
+var
+  Root: TJSONData;
+  c: TJSONObject;
+  ia, ib: TIMDoubleArray;
+  expected, got: Double;
+begin
+  if not LoadFixture(Root) then begin Ignore('fixture absent'); Exit; end;
+  try
+    // gray_40x40 case carries the larger MS-SSIM plane in imgMA/imgMB/Hm/Wm.
+    c := TJSONObject(Root).Arrays['ssim_cases'].Objects[0];
+    ia := JArrToDoubleArr(c.Arrays['imgMA']);
+    ib := JArrToDoubleArr(c.Arrays['imgMB']);
+    expected := c.Floats['msssim'];
+    got := ComputeMSSSIM(ia, ib, c.Integers['Hm'], c.Integers['Wm'], 1,
+      c.Floats['dataRange']);
+    AssertEquals('MS-SSIM gray', expected, got, 1e-6);
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestSSIMIdenticalIsOne;
+var
+  img: TIMDoubleArray;
+  i: integer;
+begin
+  SetLength(img, 20 * 20);
+  RandSeed := 123456;
+  for i := 0 to Length(img) - 1 do img[i] := Random;
+  AssertEquals('SSIM identical == 1', 1.0,
+    ComputeSSIM(img, img, 20, 20, 1, 1.0), 1e-12);
+end;
+
+procedure TTestNeuralImageMetrics.TestPSNRIdenticalIsInf;
+var
+  img: TIMDoubleArray;
+  i: integer;
+  v: Double;
+begin
+  SetLength(img, 16 * 16);
+  for i := 0 to Length(img) - 1 do img[i] := i / 256.0;
+  v := ComputePSNR(img, img, 16, 16, 1, 1.0);
+  AssertTrue('PSNR identical == +Inf', IsInfinite(v) and (v > 0));
+end;
+
+procedure TTestNeuralImageMetrics.TestSSIMLossGradient;
+var
+  ia, ib, grad, ia2: TIMDoubleArray;
+  loss, lp, lm, numg: Double;
+  i, n: integer;
+  eps: Double;
+  maxErr: Double;
+  dummy: TIMDoubleArray;
+begin
+  // Small 16x16 single-channel pair; central-difference check on a few pixels.
+  n := 16 * 16;
+  SetLength(ia, n); SetLength(ib, n);
+  RandSeed := 778899; Random;  // defensive reseed (FPC mtwist), see memory note
+  RandSeed := 778800;
+  for i := 0 to n - 1 do begin ia[i] := Random; ib[i] := Random; end;
+  loss := ComputeSSIMLossAndGradient(ia, ib, 16, 16, 1, grad, 1.0);
+  AssertTrue('loss in [0,2]', (loss >= 0) and (loss <= 2));
+  eps := 1e-6;
+  maxErr := 0;
+  // probe a deterministic spread of pixels
+  for i := 0 to 9 do
+  begin
+    SetLength(ia2, n);
+    Move(ia[0], ia2[0], n * SizeOf(Double));
+    ia2[i * 25 + 7] := ia2[i * 25 + 7] + eps;
+    lp := ComputeSSIMLossAndGradient(ia2, ib, 16, 16, 1, dummy, 1.0);
+    ia2[i * 25 + 7] := ia2[i * 25 + 7] - 2 * eps;
+    lm := ComputeSSIMLossAndGradient(ia2, ib, 16, 16, 1, dummy, 1.0);
+    numg := (lp - lm) / (2 * eps);
+    if Abs(numg - grad[i * 25 + 7]) > maxErr then
+      maxErr := Abs(numg - grad[i * 25 + 7]);
+  end;
+  AssertTrue('SSIM loss grad vs central diff (maxErr=' +
+    FloatToStr(maxErr) + ')', maxErr < 1e-4);
 end;
 
 initialization

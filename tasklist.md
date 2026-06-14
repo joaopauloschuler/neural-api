@@ -384,7 +384,7 @@ rather than acted on.
       linear-head weights (lin layers of richzhang/PerceptualSimilarity) as a tiny
       imported tensor. Parity vs the reference LPIPS on one image pair; also expose
       it as a training loss so SR examples can opt into perceptual fine-tuning.
-- [ ] SSIM / MS-SSIM (+ PSNR) full-reference image-quality metrics — the classic
+- [X] SSIM / MS-SSIM (+ PSNR) full-reference image-quality metrics — the classic
       pixel/structure quality metrics complementing the FEATURE-space FID/IS
       (landed) and the planned perceptual LPIPS. Add to neural/neuralimagemetrics.pas:
       ComputeSSIM(imgA, imgB) over the standard 11x11 Gaussian-windowed local mean /

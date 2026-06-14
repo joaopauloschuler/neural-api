@@ -146,10 +146,143 @@ is_cases.append({
     "std": sd,
 })
 
+# ---------------------------------------------------------------------------
+# SSIM / MS-SSIM / PSNR oracle. skimage is NOT in the project venv, so this
+# hand-writes the 11x11 Gaussian-windowed SSIM exactly as neuralimagemetrics.pas
+# implements it: normalised Gaussian window, biased (1/sum-w) local moments,
+# 'valid' window map (mean over fully-inside positions). MS-SSIM uses the
+# Wang 2003 weights with 2x2 average-pool downsampling between scales.
+# ---------------------------------------------------------------------------
+WIN = 11
+SIGMA = 1.5
+K1, K2 = 0.01, 0.03
+
+
+def gauss_window():
+    half = WIN // 2
+    ax = np.arange(-half, half + 1)
+    xx, yy = np.meshgrid(ax, ax)
+    g = np.exp(-(xx**2 + yy**2) / (2 * SIGMA * SIGMA))
+    return (g / g.sum()).ravel()  # length 121, row-major
+
+
+def ssim_plane_mean(A, B, C1, C2):
+    H, Wd = A.shape
+    w = gauss_window()
+    oh, ow = H - WIN + 1, Wd - WIN + 1
+    acc = 0.0
+    for oy in range(oh):
+        for ox in range(ow):
+            a = A[oy:oy+WIN, ox:ox+WIN].ravel()
+            b = B[oy:oy+WIN, ox:ox+WIN].ravel()
+            mx = float(np.dot(w, a)); my = float(np.dot(w, b))
+            sxx = float(np.dot(w, a*a)) - mx*mx
+            syy = float(np.dot(w, b*b)) - my*my
+            sxy = float(np.dot(w, a*b)) - mx*my
+            a1 = 2*mx*my + C1; a2 = 2*sxy + C2
+            b1 = mx*mx + my*my + C1; b2 = sxx + syy + C2
+            acc += (a1*a2)/(b1*b2)
+    return acc / (oh*ow)
+
+
+def ssim_plane_lcs(A, B, C1, C2):
+    H, Wd = A.shape
+    w = gauss_window()
+    oh, ow = H - WIN + 1, Wd - WIN + 1
+    lsum = 0.0; cssum = 0.0
+    for oy in range(oh):
+        for ox in range(ow):
+            a = A[oy:oy+WIN, ox:ox+WIN].ravel()
+            b = B[oy:oy+WIN, ox:ox+WIN].ravel()
+            mx = float(np.dot(w, a)); my = float(np.dot(w, b))
+            sxx = float(np.dot(w, a*a)) - mx*mx
+            syy = float(np.dot(w, b*b)) - my*my
+            sxy = float(np.dot(w, a*b)) - mx*my
+            lsum += (2*mx*my + C1)/(mx*mx + my*my + C1)
+            cssum += (2*sxy + C2)/(sxx + syy + C2)
+    return lsum/(oh*ow), cssum/(oh*ow)
+
+
+def avgpool2x2(P):
+    H, Wd = P.shape
+    oh, ow = H//2, Wd//2
+    P = P[:2*oh, :2*ow]
+    return 0.25*(P[0::2,0::2] + P[0::2,1::2] + P[1::2,0::2] + P[1::2,1::2])
+
+
+def msssim_plane(A, B, C1, C2):
+    weights = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]
+    prod = 1.0
+    for s in range(5):
+        l, cs = ssim_plane_lcs(A, B, C1, C2)
+        if s < 4:
+            prod *= cs ** weights[s]
+            A = avgpool2x2(A); B = avgpool2x2(B)
+        else:
+            prod *= (l*cs) ** weights[s]
+    return prod
+
+
+def ssim_multichannel(A, B, C, fn, C1, C2):
+    return float(np.mean([fn(A[..., c], B[..., c], C1, C2) for c in range(C)]))
+
+
+def psnr(A, B, L):
+    mse = float(np.mean((A - B)**2))
+    if mse <= 0:
+        return float("inf")
+    return 10.0 * np.log10(L*L/mse)
+
+
+ssim_cases = []
+np.random.seed(424242)
+# Single-channel 40x40 random pair, DataRange 1.0.
+H, Wd = 40, 40
+imgA = np.random.rand(H, Wd)
+imgB = imgA + 0.15 * np.random.randn(H, Wd)
+imgB = np.clip(imgB, 0, 1)
+L = 1.0
+C1 = (K1*L)**2; C2 = (K2*L)**2
+# MS-SSIM needs each scale >= 11; 40 -> 20 -> 10 fails at scale 3. Use a
+# larger plane for MS-SSIM (>= 11*2^4 = 176 to be safe over 5 scales).
+Hm, Wm = 180, 180
+mA = np.random.rand(Hm, Wm)
+mB = mA + 0.1 * np.random.randn(Hm, Wm)
+mB = np.clip(mB, 0, 1)
+ssim_cases.append({
+    "name": "gray_40x40",
+    "H": H, "W": Wd, "C": 1, "dataRange": L,
+    "imgA": imgA.ravel().tolist(),
+    "imgB": imgB.ravel().tolist(),
+    "ssim": ssim_plane_mean(imgA, imgB, C1, C2),
+    "psnr": psnr(imgA, imgB, L),
+    "Hm": Hm, "Wm": Wm,
+    "imgMA": mA.ravel().tolist(),
+    "imgMB": mB.ravel().tolist(),
+    "msssim": msssim_plane(mA, mB, C1, C2),
+})
+# 3-channel 30x30 pair, DataRange 1.0 (SSIM + PSNR only).
+H3, W3, Cc = 30, 30, 3
+cA = np.random.rand(H3, W3, Cc)
+cB = cA + 0.2 * np.random.randn(H3, W3, Cc)
+cB = np.clip(cB, 0, 1)
+ssim_cases.append({
+    "name": "rgb_30x30",
+    "H": H3, "W": W3, "C": Cc, "dataRange": L,
+    "imgA": cA.ravel().tolist(),   # channel-last flatten
+    "imgB": cB.ravel().tolist(),
+    "ssim": ssim_multichannel(cA, cB, Cc, ssim_plane_mean, C1, C2),
+    "psnr": psnr(cA, cB, L),
+})
+
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, "w") as f:
-    json.dump({"fid_cases": cases, "is_cases": is_cases}, f)
+    json.dump({"fid_cases": cases, "is_cases": is_cases,
+               "ssim_cases": ssim_cases}, f)
 print("wrote", os.path.abspath(OUT))
+for c in ssim_cases:
+    print("SSIM", c["name"], c["ssim"], "PSNR", c["psnr"],
+          "MSSSIM", c.get("msssim"))
 for c in cases:
     print("FID", c["name"], c["fid"], "self", c["fid_self"])
 for c in is_cases:

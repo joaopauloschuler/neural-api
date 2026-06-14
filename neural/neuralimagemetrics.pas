@@ -135,6 +135,56 @@ procedure ComputeInceptionScore(const Probs: TIMDoubleMatrix;
 function InceptionScore(const Probs: TIMDoubleMatrix;
   NumSplits: integer = 1): Double;
 
+// --- PSNR / SSIM / MS-SSIM (full-reference signal-statistics metrics) ---
+//
+// These are the classic PIXEL/STRUCTURE quality metrics (Wang et al. 2004,
+// 2003), complementing the FEATURE-space FID/IS above. No backbone: they are
+// pure statistics on the two images themselves. Images are passed as flat
+// row-major Double arrays with explicit H, W, Channels (channel-last:
+// index = (y*W + x)*Channels + c). DataRange (L) is the dynamic range of the
+// signal (max-min): 1.0 for [0,1]-normalised images (the default convention
+// in this repo), 255.0 for 8-bit. All math is float64.
+// Coded by Claude (AI).
+
+// Peak Signal-to-Noise Ratio: 10*log10(L^2/MSE). Identical images -> MSE 0 ->
+// returns Math.Infinity (+Inf). Multi-channel MSE is over all pixels and
+// channels jointly (the standard definition).
+function ComputePSNR(const ImgA, ImgB: TIMDoubleArray;
+  H, W, Channels: integer; DataRange: Double = 1.0): Double;
+
+// Structural Similarity index, 11x11 Gaussian window (sigma 1.5),
+// C1=(K1*L)^2, C2=(K2*L)^2 with K1=0.01, K2=0.03. Border handling matches
+// skimage.metrics.structural_similarity(gaussian_weights=True) DEFAULT, i.e.
+// 'valid'-style: the window slides only over fully-inside positions, so the
+// SSIM map is (H-10) x (W-10) and the result is its mean. Multi-channel:
+// SSIM is computed per channel and averaged (channel_axis behaviour).
+function ComputeSSIM(const ImgA, ImgB: TIMDoubleArray;
+  H, W, Channels: integer; DataRange: Double = 1.0): Double;
+
+// Multi-Scale SSIM (Wang et al. 2003), 5 scales with the canonical weights
+// [0.0448, 0.2856, 0.3001, 0.2363, 0.1333]. At each scale the contrast (c)
+// and structure (s) terms are formed from the same 11x11 Gaussian window;
+// between scales the images are downsampled by a 2x2 average pool. The score
+// is prod_{j=1..M-1} (cs_j)^w_j * (l_M * cs_M)^w_M, i.e. only the
+// contrast-structure term is kept at every scale except the last, which also
+// contributes the luminance (l) term. cs and l are the means over the valid
+// window map at that scale. Multi-channel images are averaged over channels.
+function ComputeMSSSIM(const ImgA, ImgB: TIMDoubleArray;
+  H, W, Channels: integer; DataRange: Double = 1.0): Double;
+
+// Differentiable 1 - SSIM training-loss helper. Fills GradA (same length as
+// ImgA, channel-last) with d(1-SSIM)/d(ImgA) so a restoration trainer can use
+// structural similarity as the objective instead of pixel MSE; returns the
+// scalar loss 1 - mean(SSIM map). ImgA is the prediction, ImgB the target
+// (treated as constant). Gradient is w.r.t. the single-channel-averaged SSIM
+// with the same 'valid' window map as ComputeSSIM. Verified against a central
+// difference. (A loss HELPER rather than a TNNet* layer: the windowed SSIM
+// gradient is heavy and self-contained, and the task explicitly permits a
+// documented ComputeSSIMLossAndGradient helper.)
+function ComputeSSIMLossAndGradient(const ImgA, ImgB: TIMDoubleArray;
+  H, W, Channels: integer; out GradA: TIMDoubleArray;
+  DataRange: Double = 1.0): Double;
+
 implementation
 
 const
@@ -551,6 +601,370 @@ var
   sd: Double;
 begin
   ComputeInceptionScore(Probs, NumSplits, Result, sd);
+end;
+
+{ PSNR / SSIM / MS-SSIM }
+
+const
+  cSSIMWin   = 11;     // window side
+  cSSIMSigma = 1.5;    // Gaussian sigma
+  cSSIM_K1   = 0.01;
+  cSSIM_K2   = 0.03;
+
+// Build the normalised 11x11 Gaussian window (sum = 1), row-major length 121.
+procedure BuildGaussianWindow(out W: TIMDoubleArray);
+var
+  half, x, y, idx: integer;
+  s, v, sum: Double;
+begin
+  SetLength(W, cSSIMWin * cSSIMWin);
+  half := cSSIMWin div 2;
+  s := 2.0 * cSSIMSigma * cSSIMSigma;
+  sum := 0;
+  idx := 0;
+  for y := -half to half do
+    for x := -half to half do
+    begin
+      v := Exp(-(x * x + y * y) / s);
+      W[idx] := v;
+      sum := sum + v;
+      Inc(idx);
+    end;
+  for idx := 0 to cSSIMWin * cSSIMWin - 1 do
+    W[idx] := W[idx] / sum;
+end;
+
+// Extract one channel of a channel-last flat image into a dense H*W plane.
+procedure ExtractChannel(const Img: TIMDoubleArray; H, W, Channels, C: integer;
+  out Plane: TIMDoubleArray);
+var
+  y, x: integer;
+begin
+  SetLength(Plane, H * W);
+  for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+      Plane[y * W + x] := Img[(y * W + x) * Channels + C];
+end;
+
+function ComputePSNR(const ImgA, ImgB: TIMDoubleArray;
+  H, W, Channels: integer; DataRange: Double): Double;
+var
+  i, n: integer;
+  mse, d: Double;
+begin
+  n := H * W * Channels;
+  if (Length(ImgA) < n) or (Length(ImgB) < n) then
+    raise Exception.Create('ComputePSNR: image array too small for H*W*Channels');
+  mse := 0;
+  for i := 0 to n - 1 do
+  begin
+    d := ImgA[i] - ImgB[i];
+    mse := mse + d * d;
+  end;
+  mse := mse / n;
+  if mse <= 0 then
+    Exit(Infinity);  // identical images
+  Result := 10.0 * Log10((DataRange * DataRange) / mse);
+end;
+
+// Mean SSIM of a single H*W plane pair, 'valid' window map (returns the mean
+// over the (H-win+1)*(W-win+1) fully-inside positions). Raises if too small.
+function SSIMPlaneMean(const PA, PB: TIMDoubleArray; H, W: integer;
+  C1, C2: Double): Double;
+var
+  Win: TIMDoubleArray;
+  half, oy, ox, wy, wx, wi, pix: integer;
+  outH, outW, cnt: integer;
+  mx, my, sxx, syy, sxy, gw, a, b: Double;
+  a1, a2, b1, b2, ssimSum: Double;
+begin
+  if (H < cSSIMWin) or (W < cSSIMWin) then
+    raise Exception.CreateFmt(
+      'SSIM: image %dx%d smaller than %dx%d window', [H, W, cSSIMWin, cSSIMWin]);
+  BuildGaussianWindow(Win);
+  half := cSSIMWin div 2;
+  outH := H - cSSIMWin + 1;
+  outW := W - cSSIMWin + 1;
+  ssimSum := 0;
+  cnt := 0;
+  for oy := 0 to outH - 1 do
+    for ox := 0 to outW - 1 do
+    begin
+      mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
+      wi := 0;
+      for wy := 0 to cSSIMWin - 1 do
+        for wx := 0 to cSSIMWin - 1 do
+        begin
+          pix := (oy + wy) * W + (ox + wx);
+          gw := Win[wi];
+          a := PA[pix];
+          b := PB[pix];
+          mx := mx + gw * a;
+          my := my + gw * b;
+          sxx := sxx + gw * a * a;
+          syy := syy + gw * b * b;
+          sxy := sxy + gw * a * b;
+          Inc(wi);
+        end;
+      sxx := sxx - mx * mx;
+      syy := syy - my * my;
+      sxy := sxy - mx * my;
+      a1 := 2.0 * mx * my + C1;
+      a2 := 2.0 * sxy + C2;
+      b1 := mx * mx + my * my + C1;
+      b2 := sxx + syy + C2;
+      ssimSum := ssimSum + (a1 * a2) / (b1 * b2);
+      Inc(cnt);
+    end;
+  Result := ssimSum / cnt;
+end;
+
+function ComputeSSIM(const ImgA, ImgB: TIMDoubleArray;
+  H, W, Channels: integer; DataRange: Double): Double;
+var
+  c: integer;
+  PA, PB: TIMDoubleArray;
+  C1, C2, acc: Double;
+begin
+  if (Length(ImgA) < H * W * Channels) or (Length(ImgB) < H * W * Channels) then
+    raise Exception.Create('ComputeSSIM: image array too small');
+  C1 := Sqr(cSSIM_K1 * DataRange);
+  C2 := Sqr(cSSIM_K2 * DataRange);
+  acc := 0;
+  for c := 0 to Channels - 1 do
+  begin
+    ExtractChannel(ImgA, H, W, Channels, c, PA);
+    ExtractChannel(ImgB, H, W, Channels, c, PB);
+    acc := acc + SSIMPlaneMean(PA, PB, H, W, C1, C2);
+  end;
+  Result := acc / Channels;
+end;
+
+// 2x2 average-pool a single H*W plane (floor dims). Used between MS-SSIM scales.
+procedure AvgPool2x2(const Plane: TIMDoubleArray; H, W: integer;
+  out OutPlane: TIMDoubleArray; out OH, OW: integer);
+var
+  y, x: integer;
+begin
+  OH := H div 2;
+  OW := W div 2;
+  SetLength(OutPlane, OH * OW);
+  for y := 0 to OH - 1 do
+    for x := 0 to OW - 1 do
+      OutPlane[y * OW + x] := 0.25 *
+        (Plane[(2 * y) * W + (2 * x)] +
+         Plane[(2 * y) * W + (2 * x + 1)] +
+         Plane[(2 * y + 1) * W + (2 * x)] +
+         Plane[(2 * y + 1) * W + (2 * x + 1)]);
+end;
+
+// Per-scale luminance (l) and contrast-structure (cs) means over the valid
+// window map for one plane pair.
+procedure SSIMPlaneLCS(const PA, PB: TIMDoubleArray; H, W: integer;
+  C1, C2: Double; out LMean, CSMean: Double);
+var
+  Win: TIMDoubleArray;
+  oy, ox, wy, wx, wi, pix: integer;
+  outH, outW, cnt: integer;
+  mx, my, sxx, syy, sxy, gw, a, b: Double;
+  lSum, csSum: Double;
+begin
+  if (H < cSSIMWin) or (W < cSSIMWin) then
+    raise Exception.CreateFmt(
+      'MS-SSIM: scale %dx%d smaller than %dx%d window', [H, W, cSSIMWin, cSSIMWin]);
+  BuildGaussianWindow(Win);
+  outH := H - cSSIMWin + 1;
+  outW := W - cSSIMWin + 1;
+  lSum := 0; csSum := 0; cnt := 0;
+  for oy := 0 to outH - 1 do
+    for ox := 0 to outW - 1 do
+    begin
+      mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
+      wi := 0;
+      for wy := 0 to cSSIMWin - 1 do
+        for wx := 0 to cSSIMWin - 1 do
+        begin
+          pix := (oy + wy) * W + (ox + wx);
+          gw := Win[wi];
+          a := PA[pix];
+          b := PB[pix];
+          mx := mx + gw * a;
+          my := my + gw * b;
+          sxx := sxx + gw * a * a;
+          syy := syy + gw * b * b;
+          sxy := sxy + gw * a * b;
+          Inc(wi);
+        end;
+      sxx := sxx - mx * mx;
+      syy := syy - my * my;
+      sxy := sxy - mx * my;
+      lSum := lSum + (2.0 * mx * my + C1) / (mx * mx + my * my + C1);
+      csSum := csSum + (2.0 * sxy + C2) / (sxx + syy + C2);
+      Inc(cnt);
+    end;
+  LMean := lSum / cnt;
+  CSMean := csSum / cnt;
+end;
+
+function MSSSIMPlane(const PA0, PB0: TIMDoubleArray; H0, W0: integer;
+  C1, C2: Double): Double;
+const
+  Weights: array[0..4] of Double = (0.0448, 0.2856, 0.3001, 0.2363, 0.1333);
+var
+  scale, H, W, OH, OW: integer;
+  PA, PB, NA, NB: TIMDoubleArray;
+  l, cs, prod: Double;
+begin
+  PA := Copy(PA0);
+  PB := Copy(PB0);
+  H := H0; W := W0;
+  prod := 1.0;
+  for scale := 0 to 4 do
+  begin
+    SSIMPlaneLCS(PA, PB, H, W, C1, C2, l, cs);
+    if scale < 4 then
+      prod := prod * Power(cs, Weights[scale])
+    else
+      prod := prod * Power(l * cs, Weights[scale]);
+    if scale < 4 then
+    begin
+      AvgPool2x2(PA, H, W, NA, OH, OW);
+      AvgPool2x2(PB, H, W, NB, OH, OW);
+      PA := NA; PB := NB; H := OH; W := OW;
+    end;
+  end;
+  Result := prod;
+end;
+
+function ComputeMSSSIM(const ImgA, ImgB: TIMDoubleArray;
+  H, W, Channels: integer; DataRange: Double): Double;
+var
+  c: integer;
+  PA, PB: TIMDoubleArray;
+  C1, C2, acc: Double;
+begin
+  if (Length(ImgA) < H * W * Channels) or (Length(ImgB) < H * W * Channels) then
+    raise Exception.Create('ComputeMSSSIM: image array too small');
+  C1 := Sqr(cSSIM_K1 * DataRange);
+  C2 := Sqr(cSSIM_K2 * DataRange);
+  acc := 0;
+  for c := 0 to Channels - 1 do
+  begin
+    ExtractChannel(ImgA, H, W, Channels, c, PA);
+    ExtractChannel(ImgB, H, W, Channels, c, PB);
+    acc := acc + MSSSIMPlane(PA, PB, H, W, C1, C2);
+  end;
+  Result := acc / Channels;
+end;
+
+// 1 - SSIM loss + gradient w.r.t. PA (single channel). Accumulates the
+// per-window SSIM gradient back to each contributing pixel of PA. The mean
+// SSIM is (1/Nwin) sum_p S_p; for each window, with normalised weights w_i,
+//   dS_p/dx_i = (dS_p/dmx) w_i + (dS_p/dsxx) 2 w_i (x_i - mx)
+//             + (dS_p/dsxy) w_i (y_i - my)
+// where S_p = (A1 A2)/(B1 B2), A1=2 mx my+C1, A2=2 sxy+C2,
+// B1=mx^2+my^2+C1, B2=sxx+syy+C2, and
+//   dS/dmx = [(2 my)A2 B1 B2 - A1 A2 (2 mx) B2] / (B1 B2)^2
+//   dS/dsxy = (2 A1)/(B1 B2)
+//   dS/dsxx = -(A1 A2)/(B1 B2^2)
+// (note dmx, dsxx, dsxy each also pull mx through their definitions, already
+// folded into the per-pixel chain above).
+function SSIMPlaneLossGrad(const PA, PB: TIMDoubleArray; H, W: integer;
+  C1, C2: Double; var GA: TIMDoubleArray; OffStride, Off: integer): Double;
+var
+  Win: TIMDoubleArray;
+  oy, ox, wy, wx, wi, pix, gpix: integer;
+  outH, outW, cnt: integer;
+  mx, my, sxx, syy, sxy, gw, a, b: Double;
+  a1, a2, b1, b2, bb, sp, ssimSum: Double;
+  dSdmx, dSdsxx, dSdsxy, gi: Double;
+begin
+  BuildGaussianWindow(Win);
+  outH := H - cSSIMWin + 1;
+  outW := W - cSSIMWin + 1;
+  cnt := outH * outW;
+  ssimSum := 0;
+  for oy := 0 to outH - 1 do
+    for ox := 0 to outW - 1 do
+    begin
+      mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
+      wi := 0;
+      for wy := 0 to cSSIMWin - 1 do
+        for wx := 0 to cSSIMWin - 1 do
+        begin
+          pix := (oy + wy) * W + (ox + wx);
+          gw := Win[wi];
+          a := PA[pix]; b := PB[pix];
+          mx := mx + gw * a; my := my + gw * b;
+          sxx := sxx + gw * a * a; syy := syy + gw * b * b;
+          sxy := sxy + gw * a * b;
+          Inc(wi);
+        end;
+      sxx := sxx - mx * mx; syy := syy - my * my; sxy := sxy - mx * my;
+      a1 := 2.0 * mx * my + C1;
+      a2 := 2.0 * sxy + C2;
+      b1 := mx * mx + my * my + C1;
+      b2 := sxx + syy + C2;
+      bb := b1 * b2;
+      sp := (a1 * a2) / bb;
+      ssimSum := ssimSum + sp;
+      // partial derivatives of S_p w.r.t. the three moments (treating mx,sxx,
+      // sxy as the independent aggregates; the mx coupling inside sxx/sxy is
+      // handled per-pixel below).
+      dSdmx  := (2.0 * my * a2 * bb - a1 * a2 * (2.0 * mx) * b2) / (bb * bb);
+      dSdsxy := (2.0 * a1) / bb;
+      dSdsxx := -(a1 * a2) / (b1 * b2 * b2);
+      // scatter to pixels of PA
+      wi := 0;
+      for wy := 0 to cSSIMWin - 1 do
+        for wx := 0 to cSSIMWin - 1 do
+        begin
+          pix := (oy + wy) * W + (ox + wx);
+          gw := Win[wi];
+          a := PA[pix]; b := PB[pix];
+          // dmx/dx_i = w; dsxx/dx_i = 2 w (a - mx); dsxy/dx_i = w (b - my)
+          gi := dSdmx * gw
+              + dSdsxx * (2.0 * gw * (a - mx))
+              + dSdsxy * (gw * (b - my));
+          gpix := pix * OffStride + Off;
+          GA[gpix] := GA[gpix] - gi / cnt;  // d(1-SSIM) = -dSSIM
+          Inc(wi);
+        end;
+    end;
+  Result := ssimSum / cnt;
+end;
+
+function ComputeSSIMLossAndGradient(const ImgA, ImgB: TIMDoubleArray;
+  H, W, Channels: integer; out GradA: TIMDoubleArray;
+  DataRange: Double): Double;
+var
+  c, i, n: integer;
+  PA, PB: TIMDoubleArray;
+  C1, C2, ssimAcc: Double;
+begin
+  n := H * W * Channels;
+  if (Length(ImgA) < n) or (Length(ImgB) < n) then
+    raise Exception.Create('ComputeSSIMLossAndGradient: image array too small');
+  if (H < cSSIMWin) or (W < cSSIMWin) then
+    raise Exception.CreateFmt(
+      'ComputeSSIMLossAndGradient: image %dx%d smaller than window', [H, W]);
+  C1 := Sqr(cSSIM_K1 * DataRange);
+  C2 := Sqr(cSSIM_K2 * DataRange);
+  SetLength(GradA, n);
+  for i := 0 to n - 1 do GradA[i] := 0;
+  ssimAcc := 0;
+  for c := 0 to Channels - 1 do
+  begin
+    ExtractChannel(ImgA, H, W, Channels, c, PA);
+    ExtractChannel(ImgB, H, W, Channels, c, PB);
+    // SSIM averaged over channels, so each channel's loss & grad scale by
+    // 1/Channels.
+    ssimAcc := ssimAcc +
+      SSIMPlaneLossGrad(PA, PB, H, W, C1, C2, GradA, Channels, c);
+  end;
+  // average over channels
+  for i := 0 to n - 1 do GradA[i] := GradA[i] / Channels;
+  Result := 1.0 - ssimAcc / Channels;
 end;
 
 end.
