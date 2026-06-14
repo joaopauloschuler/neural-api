@@ -585,10 +585,15 @@ rather than acted on.
 - [ ] ColBERT late-interaction retrieval follow-ups (core import +
       BuildColBERTFromSafeTensors[Ex] + MaxSim scorer + ColBERTRetrievalReport
       + parity fixture + examples/ColBERTSearch all LANDED a3, commit 442af2c):
-      (a) attention-padding-mask support so a document shorter than the net's
-      SeqLen is encoded exactly — today real tokens attend to the [PAD] rows
-      (the same approximation examples/SemanticSearch documents); this also
-      unblocks faithful batch-encoding of mixed-length docs in one net; (b) a
+      (a) DONE — opt-in pPaddingMask on BuildColBERTFromSafeTensors[Ex] /
+      BuildBertFromSafeTensorsWithConfig threads the existing SDPA
+      pSegmentSource key-padding/segment mask (real tokens segment 0, [PAD]
+      tail segment 1) into every bidirectional attention block via a new
+      SegmentSource arg on AddMultiHeadSelfAttention/AddMultiHeadSDPAConcat;
+      ColBERTEmbedTokens fills the (SeqLen,1,3) mask channel automatically.
+      A short doc is now encoded EXACTLY (TestColBERTPaddingMaskExactEncode:
+      masked padded encode == unpadded encode on real tokens < 1e-5, unmasked
+      control differs). NO new layer type (extended existing builders). (b) a
       library-side end-to-end "encode corpus -> cache doc matrices -> score
       query" helper in neuralpretrained.pas (today only the examples/ColBERTSearch
       demo wires this; ColBERTEmbedTokens + ColBERTMaxSimScore exist but the

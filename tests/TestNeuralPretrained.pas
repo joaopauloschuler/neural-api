@@ -286,6 +286,7 @@ type
     procedure TestRerankerPairLogitParity;
     procedure TestRerankReportLift;
     procedure TestColBERTParity;
+    procedure TestColBERTPaddingMaskExactEncode;
     procedure TestColBERTMaxSimScore;
     procedure TestColBERTRetrievalReport;
     procedure TestColBERTBuildInput;
@@ -10359,6 +10360,119 @@ begin
     DMat.Free; QMat.Free; Out.Free; Input.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// Decisive key-padding-mask correctness test (follow-up (a)). Build the
+// ColBERT encoder WITH the attention padding mask at the fixture SeqLen and
+// encode a SHORT document (DReal real tokens, the rest [PAD]); then build a
+// SECOND encoder at the EXACT short length DReal (no padding at all) and
+// encode the same DReal real tokens. The padding mask must make the per-token
+// projected embeddings of the real tokens BIT-IDENTICAL (< 1e-5) to the
+// unpadded encode: real tokens never attend the [PAD] rows. As a control,
+// also confirm the UNMASKED padded encode DIFFERS (the approximation the mask
+// fixes).
+procedure TTestNeuralPretrained.TestColBERTPaddingMaskExactEncode;
+var
+  NNMasked, NNUnmasked, NNExact: TNNet;
+  Config: TBertConfig;
+  ProjDim, ProjDim2, SeqLen, DReal, P, Ch: integer;
+  RefRoot: TJSONData;
+  RefObj: TJSONObject;
+  DIds: TJSONArray;
+  RefJson: TStringList;
+  InMasked, InExact, OutMasked, OutUnmasked, OutExact: TNNetVolume;
+  MaskedDiff, UnmaskedDiff, D: double;
+begin
+  RandSeed := 424242;
+  NNMasked := nil; NNUnmasked := nil; NNExact := nil;
+  RefJson := TStringList.Create;
+  InMasked := TNNetVolume.Create;
+  InExact := TNNetVolume.Create;
+  OutMasked := TNNetVolume.Create;
+  OutUnmasked := TNNetVolume.Create;
+  OutExact := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_colbert_score.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    SeqLen := RefObj.Find('seq_len').AsInteger;
+    DReal := RefObj.Find('doc_real_tokens').AsInteger;
+    DIds := TJSONArray(RefObj.Find('doc_ids'));
+    AssertTrue('fixture must have a SHORT doc (DReal < SeqLen) to exercise ' +
+      'padding', DReal < SeqLen);
+
+    // (1) padded encode WITH the key-padding mask: input (SeqLen,1,3),
+    //     channel 2 = 1 on the [PAD] tail.
+    NNMasked := BuildColBERTFromSafeTensorsEx(
+      FixturePath('tiny_colbert.safetensors'),
+      Config, ProjDim, {pSeqLen=}SeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_colbert_config.json'), {pPaddingMask=}true);
+    AssertEquals('masked net input depth', 3, NNMasked.Layers[0].Output.Depth);
+    InMasked.ReSize(SeqLen, 1, 3);
+    InMasked.Fill(0);
+    for P := 0 to SeqLen - 1 do
+    begin
+      InMasked.FData[P * 3] := DIds.Items[P].AsInteger;
+      if P >= DReal then InMasked.FData[P * 3 + 2] := 1; // [PAD] -> segment 1
+    end;
+    NNMasked.Compute(InMasked);
+    NNMasked.GetOutput(OutMasked);
+
+    // (2) padded encode WITHOUT the mask (today's approximation): input
+    //     (SeqLen,1,2), real tokens attend the [PAD] rows.
+    NNUnmasked := BuildColBERTFromSafeTensorsEx(
+      FixturePath('tiny_colbert.safetensors'),
+      Config, ProjDim2, {pSeqLen=}SeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_colbert_config.json'), {pPaddingMask=}false);
+    InExact.ReSize(SeqLen, 1, 2);
+    InExact.Fill(0);
+    for P := 0 to SeqLen - 1 do
+      InExact.FData[P * 2] := DIds.Items[P].AsInteger;
+    NNUnmasked.Compute(InExact);
+    NNUnmasked.GetOutput(OutUnmasked);
+
+    // (3) the GROUND TRUTH: encode the DReal real tokens at the EXACT length
+    //     (no padding rows exist at all).
+    NNExact := BuildColBERTFromSafeTensorsEx(
+      FixturePath('tiny_colbert.safetensors'),
+      Config, ProjDim2, {pSeqLen=}DReal, {pInferenceOnly=}false,
+      FixturePath('tiny_colbert_config.json'), {pPaddingMask=}false);
+    AssertEquals('exact net seqlen', DReal, NNExact.Layers[0].Output.SizeX);
+    InExact.ReSize(DReal, 1, 2);
+    InExact.Fill(0);
+    for P := 0 to DReal - 1 do
+      InExact.FData[P * 2] := DIds.Items[P].AsInteger;
+    NNExact.Compute(InExact);
+    NNExact.GetOutput(OutExact);
+
+    // Masked padded encode == exact unpadded encode on the real tokens.
+    MaskedDiff := 0; UnmaskedDiff := 0;
+    for P := 0 to DReal - 1 do
+      for Ch := 0 to ProjDim - 1 do
+      begin
+        D := Abs(OutMasked.FData[P * ProjDim + Ch] -
+                 OutExact.FData[P * ProjDim + Ch]);
+        if D > MaskedDiff then MaskedDiff := D;
+        D := Abs(OutUnmasked.FData[P * ProjDim + Ch] -
+                 OutExact.FData[P * ProjDim + Ch]);
+        if D > UnmaskedDiff then UnmaskedDiff := D;
+      end;
+    AssertTrue('padding-masked padded encode must equal the exact unpadded ' +
+      'encode on real tokens: max |diff| = ' + FloatToStr(MaskedDiff) +
+      ' must be < 1e-5', MaskedDiff < 1e-5);
+    // Control: the UNMASKED padded encode is the approximation - it should
+    // visibly differ (otherwise the test would not be exercising the mask).
+    AssertTrue('unmasked padded encode is expected to DIFFER from exact ' +
+      '(control): max |diff| = ' + FloatToStr(UnmaskedDiff) +
+      ' should be > 1e-5', UnmaskedDiff > 1e-5);
+  finally
+    RefRoot.Free;
+    OutExact.Free; OutUnmasked.Free; OutMasked.Free;
+    InExact.Free; InMasked.Free;
+    RefJson.Free;
+    NNExact.Free; NNUnmasked.Free; NNMasked.Free;
   end;
 end;
 

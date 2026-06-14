@@ -2103,10 +2103,22 @@ function BertConfigToString(const Config: TBertConfig): string;
 // [CLS] / <s> position) carries HF's class logits (see the SEQUENCE
 // CLASSIFICATION IMPORT section). num_labels is inferred from the final
 // classifier weight shape.
+// pPaddingMask (default false) is an OPT-IN key-padding-mask mode. With it
+// OFF the input is (SeqLen,1,2) (token ids, token-type ids) and the behavior
+// is bit-identical to before. With it ON the input becomes (SeqLen,1,3): the
+// EXTRA channel 2 carries a per-position segment id (0 = a real token, any
+// other value = a position to be excluded as a KEY from every real query's
+// softmax). That channel is threaded as the per-sample segment-mask source
+// into every bidirectional-attention block (the existing
+// TNNetScaledDotProductAttention segment mask), so a document shorter than
+// SeqLen is encoded EXACTLY (real tokens never attend to the [PAD] rows). The
+// caller fills channel 2 with 0 for the real prefix and 1 for the padding
+// tail (see ColBERTEmbedTokens).
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
-  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false;
+  pPaddingMask: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
@@ -2266,13 +2278,22 @@ function RetrievalReport(QueryEmb, PassageEmb: array of TNNetVolume;
 // "linear.weight" must be present in the checkpoint ([ProjDim, hidden]).
 // ProjDim is read from that tensor (0 in/out below = autodetected). Config
 // is returned. ConfigFileName '' = "config.json" next to FileName.
+// pPaddingMask (default false, behavior bit-identical to before) turns on the
+// key-padding-mask mode of the BERT backbone: the net input becomes
+// (SeqLen,1,3) and channel 2 carries a per-position segment id (0 = real
+// token, 1 = a [PAD] position). Real tokens then never attend to the [PAD]
+// rows, so a document shorter than SeqLen is encoded EXACTLY (the per-token
+// embeddings of the real tokens equal running the encoder on the unpadded
+// sequence). ColBERTEmbedTokens fills channel 2 automatically when the net
+// was built with this flag.
 function BuildColBERTFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pPaddingMask: boolean = false): TNNet;
 
 function BuildColBERTFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pPaddingMask: boolean = false): TNNet;
 
 // ColBERT marker-token convention: a query is [CLS][Q] tokens... [SEP] then
 // PADDED with [MASK] to the net's SeqLen (query augmentation - the [MASK] rows
@@ -13922,12 +13943,13 @@ type
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
-  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false;
+  pPaddingMask: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TBertBlockLayers;
-  InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN: TNNetLayer;
+  InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN, SegMaskSrc: TNNetLayer;
   PoolerDense, ClassifierDense, ClsHeadDense: TNNetLayer;
   ClsHeadName, ClsOutName: string;
   IncludePooler: boolean;
@@ -14052,10 +14074,24 @@ begin
       // Channel 0 = token ids, channel 1 = token-type (segment) ids
       // (IGNORED when the family has no token-type embeddings - the
       // distilbert case; the shape stays (SeqLen,1,2) for API uniformity).
-      InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
+      // pPaddingMask adds channel 2 = the per-position KEY-PADDING segment id
+      // (0 = real token, !=0 = a position excluded as a key from every real
+      // query's attention softmax); it is extracted below as the segment-mask
+      // source threaded into every attention block.
+      if pPaddingMask then
+        InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 3) )
+      else
+        InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
+      SegMaskSrc := nil;
+      if pPaddingMask then
+        // (SeqLen,1,1) per-sample segment-id source; varies across the batch.
+        SegMaskSrc := NN.AddLayerAfter(
+          TNNetSplitChannels.Create([2]), InputLayer);
       // Word branch: tokens -> embedding -> + learned absolute positions.
       // EncodeZero=1: token id 0 is [PAD], a REAL row in the BERT vocab.
-      NN.AddLayer( TNNetSplitChannels.Create([0]) );
+      // Anchored explicitly to InputLayer (GetLastLayer may be the segment
+      // mask source when pPaddingMask is on).
+      NN.AddLayerAfter( TNNetSplitChannels.Create([0]), InputLayer );
       WordEmb := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
       // The structural table only carries the USABLE rows: row p is
@@ -14087,9 +14123,15 @@ begin
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].QKV := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
-        // CausalMask=false: every position attends to all SeqLen keys.
+        // CausalMask=false: every position attends to all SeqLen keys
+        // (INTERSECTED with the key-padding segment mask when pPaddingMask is
+        // on - SegMaskSrc excludes the [PAD] key positions from every real
+        // query, so a short document is encoded exactly).
         Blocks[BlockCnt].AttnDense := NN.AddMultiHeadSelfAttention(
-          Config.NumHeads, {CausalMask=}false);
+          Config.NumHeads, {CausalMask=}false, {UseRoPE=}false, avSDPA,
+          {NumSinks=}1, {Window=}0, {RelPosNumBuckets=}32,
+          {RelPosMaxDistance=}128, {QKRMSNorm=}false,
+          {SegmentSource=}SegMaskSrc);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].AttnLN := NN.AddLayer(
           TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
@@ -14790,7 +14832,7 @@ end;
 function BuildColBERTFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''): TNNet;
+  const ConfigFileName: string = ''; pPaddingMask: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   ProjLayer: TNNetLayer;
@@ -14804,7 +14846,7 @@ begin
   Config := ReadBertConfigFromJSONFile(ConfigPath);
   Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
     {pInferenceOnly=}false, {pIncludePooler=}false, {pSeqClsHead=}false,
-    {pQuantizeInt8=}false);
+    {pQuantizeInt8=}false, {pPaddingMask=}pPaddingMask);
   ProjDim := 0;
   try
     // Read ProjDim from "linear.weight" ([ProjDim, hidden], no bias).
@@ -14847,13 +14889,14 @@ begin
 end;
 
 function BuildColBERTFromSafeTensors(const FileName: string;
-  pSeqLen: integer = 0; pInferenceOnly: boolean = false): TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pPaddingMask: boolean = false): TNNet;
 var
   IgnoredConfig: TBertConfig;
   IgnoredDim: integer;
 begin
   Result := BuildColBERTFromSafeTensorsEx(FileName, IgnoredConfig, IgnoredDim,
-    pSeqLen, pInferenceOnly, '');
+    pSeqLen, pInferenceOnly, '', pPaddingMask);
 end;
 
 function ColBERTDefaultMarkers(Tokenizer: TNeuralHFTokenizer):
@@ -14940,21 +14983,30 @@ procedure ColBERTEmbedTokens(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 var
   TokenIds: TNeuralIntegerArray;
   Input, Proj: TNNetVolume;
-  SeqLen, Dim, RealTokens, PosCnt, ChanCnt: integer;
+  SeqLen, Dim, RealTokens, PosCnt, ChanCnt, InDepth: integer;
 begin
   SeqLen := Net.Layers[0].Output.SizeX;
-  if Net.Layers[0].Output.Depth <> 2 then
-    ImportError('ColBERTEmbedTokens: net input is not (SeqLen,1,2) - not a ' +
-      'BuildColBERTFromSafeTensors encoder?');
+  InDepth := Net.Layers[0].Output.Depth;
+  if (InDepth <> 2) and (InDepth <> 3) then
+    ImportError('ColBERTEmbedTokens: net input is not (SeqLen,1,2) or ' +
+      '(SeqLen,1,3) - not a BuildColBERTFromSafeTensors encoder?');
   TokenIds := ColBERTBuildInput(Tokenizer, Text, IsQuery, Markers, SeqLen,
     RealTokens);
   Input := TNNetVolume.Create();
   Proj := TNNetVolume.Create();
   try
-    Input.ReSize(SeqLen, 1, 2);
+    Input.ReSize(SeqLen, 1, InDepth);
     Input.Fill(0); // single segment: token-type channel all zeros
     for PosCnt := 0 to SeqLen - 1 do
-      Input.FData[PosCnt * 2] := TokenIds[PosCnt];
+      Input.FData[PosCnt * InDepth] := TokenIds[PosCnt];
+    // Key-padding-mask channel (only present when the net was built with
+    // pPaddingMask): real prefix (positions < RealTokens) = segment 0, the
+    // [PAD] tail = segment 1 so real tokens never attend the pad rows. A
+    // query has RealTokens = SeqLen, so its mask is all-zero (no change).
+    if InDepth = 3 then
+      for PosCnt := 0 to SeqLen - 1 do
+        if PosCnt >= RealTokens then
+          Input.FData[PosCnt * InDepth + 2] := 1;
     Net.Compute(Input);
     Net.GetOutput(Proj);
     Dim := Proj.Depth;

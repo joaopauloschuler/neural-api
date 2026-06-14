@@ -12122,6 +12122,15 @@ type
       // from avQKNorm, which L2-normalises q/k with a single learnable
       // temperature inside the attention layer: QKRMSNorm carries a gain
       // VECTOR of d_k weights per norm and keeps plain SDPA scaling.
+      // SegmentSource (default nil) threads a per-sample key-padding /
+      // block-diagonal segment mask into EVERY per-head plain-SDPA leaf (the
+      // pSegmentSource argument of TNNetScaledDotProductAttention): a
+      // (SeqLen,1,1) layer whose value at position j is the integer segment id
+      // of token j; query i then attends key j only when seg[i]=seg[j] (a key
+      // at a [PAD] position carrying a distinct segment id is excluded from
+      // every real query's softmax). Only honored for Variant=avSDPA (the
+      // other drop-in variants do not implement segment masking); passing it
+      // with another variant is rejected.
       function AddMultiHeadSDPAConcat(Heads: integer;
         CausalMask: boolean = false; SourceLayer: TNNetLayer = nil;
         UseRoPE: boolean = false;
@@ -12130,7 +12139,8 @@ type
         Window: integer = 0;
         RelPosNumBuckets: integer = 32;
         RelPosMaxDistance: integer = 128;
-        QKRMSNorm: boolean = false): TNNetLayer;
+        QKRMSNorm: boolean = false;
+        SegmentSource: TNNetLayer = nil): TNNetLayer;
       // Full multi-head self-attention block over a (SeqLen,1,3*d_model) Q|K|V
       // slab: per-head split -> per-head SDPA -> concat -> token-wise linear
       // out-projection to depth d_model. Returns the out-projection layer.
@@ -12172,6 +12182,9 @@ type
       // QKRMSNorm=True inserts a learnable-scale per-head RMSNorm on each
       // head's Q and K slices BEFORE RoPE (Gemma-3 / Qwen3 per-head QK-norm;
       // see AddMultiHeadSDPAConcat).
+      // SegmentSource (default nil) threads a per-sample key-padding /
+      // block-diagonal segment mask into every per-head plain SDPA leaf (see
+      // AddMultiHeadSDPAConcat); only honored for Variant=avSDPA.
       function AddMultiHeadSelfAttention(Heads: integer;
         CausalMask: boolean = false; UseRoPE: boolean = false;
         Variant: TNNetAttentionVariant = avSDPA;
@@ -12179,7 +12192,8 @@ type
         Window: integer = 0;
         RelPosNumBuckets: integer = 32;
         RelPosMaxDistance: integer = 128;
-        QKRMSNorm: boolean = false): TNNetLayer;
+        QKRMSNorm: boolean = false;
+        SegmentSource: TNNetLayer = nil): TNNetLayer;
       // Multi-head LINFORMER self-attention (Wang et al. 2020, arXiv:2006.04768)
       // over a (SeqLen,1,3*d_model) Q|K|V slab. Linformer keeps the softmax but
       // projects K and V DOWN the sequence axis to a fixed rank k (k << SeqLen)
@@ -50354,7 +50368,8 @@ function TNNet.AddMultiHeadSDPAConcat(Heads: integer;
   Window: integer = 0;
   RelPosNumBuckets: integer = 32;
   RelPosMaxDistance: integer = 128;
-  QKRMSNorm: boolean = false): TNNetLayer;
+  QKRMSNorm: boolean = false;
+  SegmentSource: TNNetLayer = nil): TNNetLayer;
 var
   d_model, d_k, HeadCnt, d: integer;
   SliceLayers, HeadOutputs: array of TNNetLayer;
@@ -50395,13 +50410,18 @@ var
           AfterLayer);
     else
       Result := AddLayerAfter(
-        TNNetScaledDotProductAttention.Create(d_k, CausalMask, Window),
+        TNNetScaledDotProductAttention.Create(d_k, CausalMask, Window,
+          0, false, SegmentSource),
         AfterLayer);
     end;
   end;
 
 begin
   if SourceLayer = nil then SourceLayer := GetLastLayer();
+  if (SegmentSource <> nil) and (Variant <> avSDPA) then
+    FErrorProc('AddMultiHeadSDPAConcat with SegmentSource requires ' +
+      'Variant = avSDPA (the drop-in variants do not implement segment ' +
+      'masking).');
   // Source is the Q|K|V slab, so its depth is 3*d_model.
   d_model := SourceLayer.Output.Depth div 3;
   d_k := d_model div Heads;
@@ -50480,7 +50500,8 @@ function TNNet.AddMultiHeadSelfAttention(Heads: integer;
   Window: integer = 0;
   RelPosNumBuckets: integer = 32;
   RelPosMaxDistance: integer = 128;
-  QKRMSNorm: boolean = false): TNNetLayer;
+  QKRMSNorm: boolean = false;
+  SegmentSource: TNNetLayer = nil): TNNetLayer;
 var
   d_model: integer;
 begin
@@ -50488,7 +50509,7 @@ begin
   d_model := GetLastLayer().Output.Depth div 3;
   AddMultiHeadSDPAConcat(Heads, CausalMask, GetLastLayer(), UseRoPE,
     Variant, NumSinks, Window, RelPosNumBuckets, RelPosMaxDistance,
-    QKRMSNorm);
+    QKRMSNorm, SegmentSource);
   // Token-wise linear out-projection (see header note: FullConnectLinear would
   // flatten the sequence axis; PointwiseConvLinear projects each token).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
