@@ -99,29 +99,29 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] Llama 4 (text) importer — `BuildLlama4FromSafeTensors[Ex]`, model_type
-      `llama4`/`llama4_text` (meta-llama/Llama-4-Scout/Maverick, also the smaller
-      community redistills). This is NOT a near-duplicate of the existing Llama
-      builder: it needs genuinely new wiring that no current importer has, namely
-      (a) **iRoPE** — interleaved attention where most layers use RoPE but every
-      `no_rope_layers`-th layer is a global **NoPE** layer (no positional
-      encoding at all), so the per-layer rope-on/off pattern must be threaded
-      through the attention builder (cf. the Gemma-3 SlidingWindowPattern and
-      Cohere2 NoPE wiring, but a new combination); (b) **attention temperature
-      tuning** on the NoPE layers (`attn_temperature_tuning` /
-      `floor_scale`/`attn_scale` — query scaled by a log-of-position factor)
-      which folds into the SDPA scale; (c) **L2 QK-norm** (`use_qk_norm`) on the
-      RoPE layers only — reuse the per-head TokenRMSNorm/QKNorm path but gate it
-      per layer; (d) the **MoE FFN with a shared expert** that runs on every
-      token in parallel with the routed top-k experts (reuse the
-      granitemoe/DeepSeek shared-expert + Mixtral MoE WIRING, fused 3-D
-      `gate_up_proj`/`down_proj` expert slabs sliced like Granite). Dense
-      first-`interleave_moe_layer_step` layers, MoE thereafter. Tokenizer is the
-      TikToken-style byte-level BPE already supported via the GPT-2 path. Verify
-      with a HAND-BUILT pico fixture (Scout config is huge; slice/re-randomize to
-      O(1)-scale weights like the ModernBERT fixture) asserting next-token logits
-      < 1e-4 vs a float64 reference: `TestLlama4{Config,Logit,MoeLogit}Parity`.
-      Vision tower is OUT OF SCOPE (text-only first, like the LLaVA staging).
+- [X] Llama 4 (text) importer — LANDED. `BuildLlama4FromSafeTensors[Ex]` +
+      `ReadLlama4ConfigFromJSONFile` + BuildFromPretrained dispatch in
+      neural/neuralpretrained.pas, model_type `llama4`/`llama4_text`. New layer
+      `TNNetLlama4AttnTemperature` (NoPE per-position query temperature). New
+      TLlamaConfig deltas: NoRopeLayers (iRoPE per-layer rope on/off),
+      Llama4QKL2Norm (L2 QK-norm after RoPE on RoPE layers, gain=1 TokenRMSNorm),
+      AttnTempTuning/AttnFloorScale/AttnScale, AttnChunkSize, MoESigmoidGate
+      (sigmoid router, no renorm), MoEScaleInput (gate scales expert INPUT, since
+      SwiGLU is nonlinear: experts(g*x) != g*experts(x)), MoEGateUpTransposed
+      (Llama-4 fused 3-D slab gate_up_proj [E,H,2I] / down_proj [E,I,H] +
+      feed_forward.router, sliced by new LoadLlama4MoEExperts), IntermediateSizeMLP
+      (wider dense width). Shared expert reuses the granite shared-expert layer
+      wiring with Llama-4's separate 2-D shared_expert.{gate,up,down}_proj load.
+      RoPE layers use InterleavedRotary (no rotate_half permute). Verified vs HF
+      transformers 5.11 float64 oracle: TestLlama4{Config,Logit,Moe}LogitParity
+      (max |logit diff| 1.84e-6, gate 1e-4) on the hand-built pico fixture
+      tools/llama4_tiny_fixture.py (interleaves RoPE/NoPE AND dense/MoE; pins
+      qk-norm/temperature/shared-expert non-vacuously). OPEN FOLLOW-UPS: the NoPE
+      chunked-attention BOUNDARY is not modeled (the fixture keeps seq_len <
+      attention_chunk_size where chunked == full causal — a real block-diagonal
+      chunk mask is a TNNetScaledDotProductAttention enhancement); multimodal
+      `llama4` checkpoints with a `language_model.model.` prefix / vision tower;
+      a real-checkpoint slicer for Scout/Maverick.
 - [ ] InternLM2 / InternLM2.5 importer follow-up (`BuildInternLM2FromSafeTensors[Ex]`,
       model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — LANDED.
       A plain Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONLY

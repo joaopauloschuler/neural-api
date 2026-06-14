@@ -846,6 +846,52 @@ type
     ReGLUSquaredFFN: boolean;  // BitNet relu2 FFN: the SwiGLU activation slot is
                                // replaced by TNNetReGLUSquared (up*ReLU(gate)^2,
                                // ACT2FN "relu2") instead of SiLU SwiGLU
+    // ---- Llama-4 (text) deltas (all default off for the other families) ----
+    // Llama-4 interleaves RoPE and NoPE (no positional) attention layers,
+    // adds NoPE-layer temperature tuning + L2 QK-norm on the RoPE layers, and
+    // a sigmoid-gated top-k MoE with an always-on shared expert. See
+    // BuildLlama4FromSafeTensors. The RoPE layers use the INTERLEAVED
+    // (even/odd pair) rotary layout, so q/k load STRAIGHT (set via
+    // InterleavedRotary, shared with Cohere/GLM-4 - no rotate_half permute).
+    NoRopeLayers: array of boolean; // per-layer rope on/off (Llama-4
+                               // no_rope_layers; element i TRUE = layer i uses
+                               // RoPE, FALSE = NoPE/no positional at all).
+                               // Empty = every layer uses RoPE (vanilla).
+    Llama4QKL2Norm: boolean;   // use_qk_norm: an UNWEIGHTED L2 RMS-norm over
+                               // each q/k head (head_dim) applied AFTER RoPE on
+                               // the RoPE layers ONLY (Llama4TextL2Norm; the
+                               // NoPE layers and the 128E model skip it). Wired
+                               // as a gain=1 TNNetTokenRMSNorm per head.
+    AttnTempTuning: boolean;   // attn_temperature_tuning: on the NoPE layers
+                               // scale every query vector by the per-position
+                               // log-of-position factor (TNNetLlama4AttnTemperature)
+    AttnFloorScale: TNeuralFloat; // floor_scale (default 8192) for the above
+    AttnScale: TNeuralFloat;   // attn_scale (default 0.1) for the above
+    AttnChunkSize: integer;    // attention_chunk_size: the NoPE (chunked)
+                               // layers attend within blocks of this many
+                               // tokens; 0 = full attention. (A sequence no
+                               // longer than the chunk attends fully.)
+    MoESigmoidGate: boolean;   // Llama-4 router: top-k over the router logits
+                               // then SIGMOID of the survivors (not Mixtral's
+                               // softmax-then-renorm). Wired as PointwiseSigmoid
+                               // -> raw TNNetTopKGate (sigmoid is monotonic so
+                               // top-k selection is unchanged).
+    MoEScaleInput: boolean;    // Llama-4: the routed gate weight scales the
+                               // expert INPUT (HF: routed_out =
+                               // experts(g * x)), not the output. Because the
+                               // expert is a nonlinear SwiGLU, expert(g*x) !=
+                               // g*expert(x) - so the gate must ride the input.
+                               // Mixtral/Qwen3/granite scale the OUTPUT (off).
+    MoEGateUpTransposed: boolean; // Llama-4 fused expert slab layout
+                               // gate_up_proj [E, H, 2I] (hidden-major, gate
+                               // FIRST then up) and down_proj [E, I, H], vs
+                               // granitemoe's [E, 2I, H] / [E, H, I]. router is
+                               // a plain mlp.router or feed_forward.router
+                               // [E, H] linear (see the Llama-4 loader).
+    IntermediateSizeMLP: integer; // intermediate_size_mlp: the DENSE-layer
+                               // SwiGLU width (Llama-4's dense FFN is wider than
+                               // an MoE expert, whose width is IntermediateSize);
+                               // 0 = use IntermediateSize.
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -1136,6 +1182,39 @@ function BuildQwen3MoeFromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildQwen3MoeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// Llama-4 text decoder (model_type "llama4" / "llama4_text",
+// meta-llama/Llama-4-Scout-17B-16E and the community redistills). Text-only -
+// the vision tower is OUT OF SCOPE. Rides the core Llama builder with five
+// genuinely new pieces no other importer combines:
+//  (a) iRoPE - interleaved attention: most layers use RoPE, but the NoPE
+//      layers (no_rope_layers[i]=0, every no_rope_layer_interval-th layer)
+//      carry NO positional encoding and switch to a CHUNKED-causal mask of
+//      width attention_chunk_size. The RoPE layers use the INTERLEAVED rotary
+//      layout (q/k load straight, no rotate_half permutation).
+//  (b) attn_temperature_tuning - on the NoPE layers each query is scaled by a
+//      per-position log factor (TNNetLlama4AttnTemperature, floor_scale /
+//      attn_scale).
+//  (c) use_qk_norm - an UNWEIGHTED L2 RMS-norm over each q/k head AFTER RoPE,
+//      on the RoPE layers ONLY (a gain=1 TNNetTokenRMSNorm).
+//  (d) sigmoid-gated top-k MoE (top-k logits -> sigmoid, no renorm) with an
+//      always-on SHARED EXPERT summed onto the routed output (the Llama-4
+//      transposed fused 3-D expert slabs gate_up_proj [E,H,2I] / down_proj
+//      [E,I,H]); the dense (non-MoE) layers use the wider intermediate_size_mlp.
+//      Dense for the first interleave_moe_layer_step-1 layers, MoE thereafter
+//      (moe_layers).
+//  (e) the TikToken byte-level BPE tokenizer (the GPT-2 path).
+// Tied embeddings. Thin wrappers that ASSERT model_type is llama4/llama4_text.
+function ReadLlama4ConfigFromJSONFile(const FileName: string): TLlamaConfig;
+
+function BuildLlama4FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildLlama4FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -5282,6 +5361,18 @@ begin
     Result.MoENormTopK := False;
     Result.MoEDecoderSparseStep := 1;
     SetLength(Result.MoEMlpOnlyLayers, 0);
+    // Llama-4 MoE/attention deltas: off for every family this reader handles
+    // (Llama-4 has its OWN reader, ReadLlama4ConfigFromJSONFile).
+    Result.MoESigmoidGate := False;
+    Result.MoEScaleInput := False;
+    Result.MoEGateUpTransposed := False;
+    Result.IntermediateSizeMLP := 0;
+    SetLength(Result.NoRopeLayers, 0);
+    Result.Llama4QKL2Norm := False;
+    Result.AttnTempTuning := False;
+    Result.AttnFloorScale := 0;
+    Result.AttnScale := 0;
+    Result.AttnChunkSize := 0;
     Result.GLM4SandwichNorm := False;
     Result.FusedGateUp := False;
     Result.InterleavedRotary := False;
@@ -6401,31 +6492,58 @@ begin
   // (Mixtral always renormalizes; Qwen3-MoE follows norm_topk_prob).
   Block.GateConv := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(Config.NumLocalExperts), MoESource);
-  NN.AddLayer( TNNetPointwiseSoftMax.Create() );
-  GateTopK := NN.AddLayer( TNNetTopKGate.Create(
-    Config.MoEExpertsPerTok, {pRenormalize=}Config.MoENormTopK) );
+  // Config.MoESigmoidGate (Llama-4): HF keeps the top-k LOGITS, scatters them
+  // into a -inf tensor and applies SIGMOID (the non-survivors -> sigmoid(-inf)
+  // = 0). Sigmoid is monotonic so top-k SELECTION on sigmoid(logit) equals
+  // top-k on the raw logit; raw (no-renorm) TopKGate then keeps sigmoid(logit)
+  // for survivors and zeros the rest - exactly HF's router_scores. Mixtral /
+  // Qwen3-MoE / granitemoe instead softmax over ALL experts before the gate.
+  if Config.MoESigmoidGate then
+  begin
+    NN.AddLayer( TNNetSigmoid.Create() );
+    GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+      Config.MoEExpertsPerTok, {pRenormalize=}false) );
+  end
+  else
+  begin
+    NN.AddLayer( TNNetPointwiseSoftMax.Create() );
+    GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+      Config.MoEExpertsPerTok, {pRenormalize=}Config.MoENormTopK) );
+  end;
   for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
   begin
-    // Per-expert SwiGLU MLP. TNNetSwiGLU computes FIRSTHALF * silu(SECONDHALF):
-    // the fused projection holds w3 (up) in neurons 0..I-1 and w1 (gate) in
-    // I..2I-1; w2 is the down projection (loaded below).
-    Block.ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(2 * ExpertWidth), MoESource);
-    NN.AddLayer( TNNetSwiGLU.Create() );
-    Block.ExpertDown[ExpertCnt] := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
-    ExpertOut := NN.GetLastLayer();
-    // Slice this expert's renormalized top-k gate weight g[e], broadcast it
-    // across d_model and cell-multiply it in (zero for non-selected experts).
+    // Slice this expert's top-k gate weight g[e] and broadcast it across
+    // d_model (zero for non-selected experts).
     GateE := NN.AddLayerAfter(
       TNNetSplitChannels.Create(ExpertCnt, 1), GateTopK);
     GateEBroadcast := NN.AddLayer(
       TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
-    MoEBranches[ExpertCnt] := NN.AddLayer(
-      TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+    // Per-expert SwiGLU MLP. TNNetSwiGLU computes FIRSTHALF * silu(SECONDHALF):
+    // the fused projection holds w3 (up) in neurons 0..I-1 and w1 (gate) in
+    // I..2I-1; w2 is the down projection (loaded below).
+    // Config.MoEScaleInput (Llama-4): the gate scales the expert INPUT
+    // (experts(g*x)); else (Mixtral/Qwen3/granite) it scales the OUTPUT
+    // (g*expert(x)). expert(0)=0 (bias-free) so non-selected always vanish.
+    if Config.MoEScaleInput then
+      ExpertOut := NN.AddLayer(
+        TNNetCellMulByCell.Create(MoESource, GateEBroadcast) )
+    else
+      ExpertOut := MoESource;
+    Block.ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(2 * ExpertWidth), ExpertOut);
+    NN.AddLayer( TNNetSwiGLU.Create() );
+    Block.ExpertDown[ExpertCnt] := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    ExpertOut := NN.GetLastLayer();
+    if Config.MoEScaleInput then
+      MoEBranches[ExpertCnt] := ExpertOut
+    else
+      MoEBranches[ExpertCnt] := NN.AddLayer(
+        TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
   end;
-  // y = Sum_e gTopK[e] * Expert_e(x). (NumExpertsPerTok>=2 routing implies
-  // NumLocalExperts>=2; a single-expert sum is still valid for safety.)
+  // y = Sum_e Expert_e(gTopK[e] * x)  (MoEScaleInput) or Sum_e gTopK[e] *
+  // Expert_e(x). (NumExpertsPerTok>=2 implies NumLocalExperts>=2; a
+  // single-expert sum is still valid for safety.)
   RoutedOut := NN.AddLayer( TNNetSum.Create(MoEBranches) );
   SetLength(MoEBranches, 0);
   // granitemoe shared expert (GraniteMoeShared, Config.SharedIntermediateSize
@@ -6553,6 +6671,106 @@ begin
   end;
 end;
 
+// Loads Llama-4's FUSED 3-D expert slab for one block. HF Llama4TextExperts
+// stores the experts TRANSPOSED relative to granitemoe (the weights are
+// bmm-ed as hidden @ W, so each per-expert matrix is [in, out] not [out, in]):
+//   feed_forward.experts.gate_up_proj  [E, H, 2I]  (per expert [H, 2I]; HF
+//       chunks the LAST axis into gate (cols 0..I-1) then up (cols I..2I-1)
+//       and computes up * silu(gate));
+//   feed_forward.experts.down_proj     [E, I, H]   (per expert [I, H]);
+//   feed_forward.router.weight         [E, H]      (a plain nn.Linear [out=E,
+//       in=H], the only NON-transposed slab).
+// TNNetSwiGLU computes FIRSTHALF*silu(SECONDHALF), so the UP columns load into
+// expert neurons 0..I-1 and the GATE columns into I..2I-1 (matching every
+// other fused gate|up here). Llama-4 has no residual_multiplier, so the down
+// rows load straight. Coded by Claude (AI).
+procedure LoadLlama4MoEExperts(Reader: TNNetSafeTensorsReader;
+  var Block: TLlamaBlockLayers; const BlockPrefix: string;
+  NumExperts, HiddenSize, ExpertWidth: integer; Consumed: TStringList);
+var
+  InName, OutName, RouterName: string;
+  W: TNNetVolume;
+  e, j, i, TwoI: integer;
+begin
+  TwoI := 2 * ExpertWidth;
+  InName := BlockPrefix + 'feed_forward.experts.gate_up_proj';
+  OutName := BlockPrefix + 'feed_forward.experts.down_proj';
+  RouterName := BlockPrefix + 'feed_forward.router.weight';
+  // ---- router gate [E, H] (a plain bias-free nn.Linear over experts) ----
+  if (Reader.DimCount(RouterName) <> 2) or
+     (Reader.DimSize(RouterName, 0) <> NumExperts) or
+     (Reader.DimSize(RouterName, 1) <> HiddenSize) then
+    ImportError('Llama import: "' + RouterName + '" must have shape [' +
+      IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + '], got ' +
+      Reader.ShapeAsString(RouterName));
+  W := TNNetVolume.Create;
+  try
+    EnsureWritableImportWeights(Block.GateConv);
+    Reader.LoadTensorFlat(RouterName, W);
+    for e := 0 to NumExperts - 1 do
+    begin
+      for i := 0 to HiddenSize - 1 do
+        Block.GateConv.Neurons[e].Weights.FData[i] :=
+          W.FData[e * HiddenSize + i];
+      Block.GateConv.Neurons[e].BiasWeight := 0;
+    end;
+    Block.GateConv.FlushWeightCache();
+    Consumed.Add(RouterName);
+    // ---- gate_up_proj [E, H, 2I]: per expert gate|up COLUMNS -> up|gate
+    //      neurons (the slab is [in=H, out=2I] so we read down COLUMNS) ----
+    if (Reader.DimCount(InName) <> 3) or
+       (Reader.DimSize(InName, 0) <> NumExperts) or
+       (Reader.DimSize(InName, 1) <> HiddenSize) or
+       (Reader.DimSize(InName, 2) <> TwoI) then
+      ImportError('Llama import: "' + InName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + ', ' +
+        IntToStr(TwoI) + '], got ' + Reader.ShapeAsString(InName));
+    Reader.LoadTensorFlat(InName, W); // flat [E*H, 2I]
+    for e := 0 to NumExperts - 1 do
+    begin
+      EnsureWritableImportWeights(Block.ExpertGateUp[e]);
+      for j := 0 to ExpertWidth - 1 do
+        for i := 0 to HiddenSize - 1 do
+        begin
+          // UP column (gate_up_proj col I+j) -> neuron j.
+          Block.ExpertGateUp[e].Neurons[j].Weights.FData[i] :=
+            W.FData[(e * HiddenSize + i) * TwoI + ExpertWidth + j];
+          Block.ExpertGateUp[e].Neurons[j].BiasWeight := 0;
+          // GATE column (gate_up_proj col j) -> neuron I+j.
+          Block.ExpertGateUp[e].Neurons[ExpertWidth + j].Weights.FData[i] :=
+            W.FData[(e * HiddenSize + i) * TwoI + j];
+          Block.ExpertGateUp[e].Neurons[ExpertWidth + j].BiasWeight := 0;
+        end;
+      Block.ExpertGateUp[e].FlushWeightCache();
+    end;
+    Consumed.Add(InName);
+    // ---- down_proj [E, I, H]: per expert [in=I, out=H] -> read COLUMNS ----
+    if (Reader.DimCount(OutName) <> 3) or
+       (Reader.DimSize(OutName, 0) <> NumExperts) or
+       (Reader.DimSize(OutName, 1) <> ExpertWidth) or
+       (Reader.DimSize(OutName, 2) <> HiddenSize) then
+      ImportError('Llama import: "' + OutName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(ExpertWidth) + ', ' +
+        IntToStr(HiddenSize) + '], got ' + Reader.ShapeAsString(OutName));
+    Reader.LoadTensorFlat(OutName, W); // flat [E*I, H]
+    for e := 0 to NumExperts - 1 do
+    begin
+      EnsureWritableImportWeights(Block.ExpertDown[e]);
+      for j := 0 to HiddenSize - 1 do
+      begin
+        for i := 0 to ExpertWidth - 1 do
+          Block.ExpertDown[e].Neurons[j].Weights.FData[i] :=
+            W.FData[(e * ExpertWidth + i) * HiddenSize + j];
+        Block.ExpertDown[e].Neurons[j].BiasWeight := 0;
+      end;
+      Block.ExpertDown[e].FlushWeightCache();
+    end;
+    Consumed.Add(OutName);
+  finally
+    W.Free;
+  end;
+end;
+
 // The Llama builder core: builds the net and loads every weight from the
 // ALREADY-OPEN pReader (whose tensor table must use the HF tensor names).
 // Takes OWNERSHIP of pReader (frees it on every path). FileName is used in
@@ -6576,7 +6794,7 @@ var
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, RotaryDims, LayerWindow, i, j, d: integer;
   RotaryHeadDimArg: integer;
-  LayerIsLocal: boolean;
+  LayerIsLocal, LayerUseRoPE: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
   LogitScaleFold: TNeuralFloat;
   LayerRoPEScaling: TRoPEScalingConfig;
@@ -6766,6 +6984,21 @@ begin
           LayerTheta := Config.RopeTheta;
           LayerRoPEScaling := Config.RopeScaling;
         end;
+        // Llama-4 iRoPE: Config.NoRopeLayers (when non-empty) is the per-layer
+        // rope on/off pattern (element BlockCnt TRUE = RoPE, FALSE = NoPE/no
+        // positional). The NoPE layers also switch to a CHUNKED-causal mask of
+        // width Config.AttnChunkSize (HF Llama4 layer_types: "chunked_attention"
+        // iff no_rope, else "full_attention"); a sequence no longer than the
+        // chunk attends fully. Every other family leaves NoRopeLayers empty and
+        // uses RoPE on every layer.
+        if Length(Config.NoRopeLayers) > 0 then
+        begin
+          LayerUseRoPE := Config.NoRopeLayers[BlockCnt];
+          if not LayerUseRoPE then
+            LayerWindow := Config.AttnChunkSize;
+        end
+        else
+          LayerUseRoPE := True;
         BranchInput := NN.GetLastLayer();
         // Config.PostNormReordered (OLMo-2): NO input_layernorm - the
         // attention sub-block reads the raw residual stream and the RMSNorm
@@ -6854,8 +7087,20 @@ begin
                 TNNetTokenRMSNorm.Create(Config.RmsNormEps), KSlice);
               KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
             end;
-            KRotated[KVHeadCnt] := NN.AddLayerAfter(
-              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), KSlice);
+            // Llama-4 iRoPE: RoPE only on the RoPE layers (NoPE layers carry no
+            // positional encoding); RotaryEmbedding's native (2k,2k+1) layout
+            // matches Llama-4's view_as_complex pairing (Config.InterleavedRotary
+            // loads q/k straight - no rotate_half permutation).
+            if LayerUseRoPE then
+              KSlice := NN.AddLayerAfter(
+                CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), KSlice);
+            // Config.Llama4QKL2Norm (use_qk_norm): UNWEIGHTED L2 RMS-norm over
+            // the head AFTER RoPE, on the RoPE layers only (Llama4TextL2Norm).
+            // A gain=1 TNNetTokenRMSNorm = x*rsqrt(mean(x^2)+eps).
+            if Config.Llama4QKL2Norm and LayerUseRoPE then
+              KSlice := NN.AddLayerAfter(
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps), KSlice);
+            KRotated[KVHeadCnt] := KSlice;
           end;
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
@@ -6891,8 +7136,21 @@ begin
                 TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
               QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
             end;
-            QSlice := NN.AddLayerAfter(
-              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), QSlice);
+            // Llama-4 iRoPE: RoPE only on the RoPE layers (see the K path).
+            if LayerUseRoPE then
+              QSlice := NN.AddLayerAfter(
+                CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), QSlice);
+            if Config.Llama4QKL2Norm and LayerUseRoPE then
+              QSlice := NN.AddLayerAfter(
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
+            // Config.AttnTempTuning (attn_temperature_tuning): on the NoPE
+            // layers scale the query by the per-position log factor BEFORE SDPA
+            // (HF Llama4TextAttention: applied iff attn_temperature_tuning and
+            // NOT use_rope).
+            if Config.AttnTempTuning and (not LayerUseRoPE) then
+              QSlice := NN.AddLayerAfter(
+                TNNetLlama4AttnTemperature.Create(
+                  Config.AttnFloorScale, Config.AttnScale), QSlice);
           end;
           // Pack [Q_h | K_group | V_group] (width 3*head_dim) for SDPA.
           HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
@@ -6951,8 +7209,13 @@ begin
             Config)
         else
         begin
+          // Llama-4 dense layers use intermediate_size_mlp (wider than an MoE
+          // expter's intermediate_size); 0 = use IntermediateSize (every other
+          // family, whose dense FFN is the standard width).
+          if Config.IntermediateSizeMLP > 0 then j := Config.IntermediateSizeMLP
+          else j := Config.IntermediateSize;
           Blocks[BlockCnt].GateUp := NN.AddLayer(
-            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+            TNNetPointwiseConvLinear.Create(2 * j) );
           if Config.ReGLUSquaredFFN then
             // BitNet b1.58 relu2 FFN: down(ffn_sub_norm(relu2(gate)*up)). The
             // fused projection packs up in neurons 0..I-1 and gate in I..2I-1
@@ -7297,6 +7560,36 @@ begin
           // loads into neurons 0..I-1 and the GATE half into neurons I..2I-1.
           if Config.MoEIntermediateSize > 0 then i := Config.MoEIntermediateSize
           else i := Config.IntermediateSize;
+          if Config.MoEGateUpTransposed then
+          begin
+            // Llama-4: TRANSPOSED fused 3-D expert slabs (gate_up_proj
+            // [E,H,2I] / down_proj [E,I,H]) + a plain feed_forward.router. The
+            // shared expert is a SEPARATE 2-D SwiGLU MLP (shared_expert.gate_proj
+            // / up_proj / down_proj), distinct from granitemoe's fused
+            // shared_mlp slab.
+            LoadLlama4MoEExperts(Reader, Blocks[BlockCnt], BlockPrefix,
+              Config.NumLocalExperts, Config.HiddenSize, i, Consumed);
+            if Config.SharedIntermediateSize > 0 then
+            begin
+              TensorNameStr := BlockPrefix + 'feed_forward.shared_expert.';
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+                TensorNameStr + 'up_proj.weight',
+                Config.HiddenSize, Config.SharedIntermediateSize,
+                0, 2 * Config.SharedIntermediateSize);
+              MarkConsumed(TensorNameStr + 'up_proj.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+                TensorNameStr + 'gate_proj.weight',
+                Config.HiddenSize, Config.SharedIntermediateSize,
+                Config.SharedIntermediateSize, 2 * Config.SharedIntermediateSize);
+              MarkConsumed(TensorNameStr + 'gate_proj.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedDown,
+                TensorNameStr + 'down_proj.weight',
+                Config.SharedIntermediateSize, Config.HiddenSize);
+              MarkConsumed(TensorNameStr + 'down_proj.weight');
+            end;
+            if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+            continue;
+          end;
           if Config.MoEGraniteNaming then
           begin
             // granitemoe: ONE fused 3-D slab per block (input_linear /
@@ -7398,6 +7691,14 @@ begin
           if pQuantizeInt8 then NN.QuantizeWeightsInt8();
           continue;
         end;
+        // Dense FFN width: Llama-4 dense layers carry intermediate_size_mlp
+        // (wider than an MoE expert); every other family uses intermediate_size.
+        // Llama-4 also names the dense FFN tensors under "feed_forward." (not
+        // "mlp."); MoEGateUpTransposed marks the Llama-4 layout.
+        if Config.IntermediateSizeMLP > 0 then i := Config.IntermediateSizeMLP
+        else i := Config.IntermediateSize;
+        if Config.MoEGateUpTransposed then TensorNameStr := BlockPrefix + 'feed_forward.'
+        else TensorNameStr := BlockPrefix + 'mlp.';
         // Fused gate/up: up_proj -> neurons 0..I-1 (SwiGLU's linear half),
         // gate_proj -> neurons I..2I-1 (SwiGLU's Swish-gated half).
         // Phi-3 (FusedQKVGateUp) AND GLM-4 (FusedGateUp - qkv stays split)
@@ -7409,35 +7710,35 @@ begin
           // UP half lands in neurons 0..I-1 and the GATE half in
           // neurons I..2I-1 (TNNetSwiGLU computes FIRSTHALF *
           // silu(SECONDHALF)).
-          FusedName := BlockPrefix + 'mlp.gate_up_proj.weight';
+          FusedName := TensorNameStr + 'gate_up_proj.weight';
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp, FusedName,
-            Config.HiddenSize, Config.IntermediateSize,
-            0, 2 * Config.IntermediateSize, 0, '', 1.0, 0,
-            Config.IntermediateSize, 2 * Config.IntermediateSize);
+            Config.HiddenSize, i,
+            0, 2 * i, 0, '', 1.0, 0,
+            i, 2 * i);
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp, FusedName,
-            Config.HiddenSize, Config.IntermediateSize,
-            Config.IntermediateSize, 2 * Config.IntermediateSize,
-            0, '', 1.0, 0, 0, 2 * Config.IntermediateSize);
+            Config.HiddenSize, i,
+            i, 2 * i,
+            0, '', 1.0, 0, 0, 2 * i);
           MarkConsumed(FusedName);
         end
         else
         begin
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
-            BlockPrefix + 'mlp.up_proj.weight',
-            Config.HiddenSize, Config.IntermediateSize,
-            0, 2 * Config.IntermediateSize);
-          MarkConsumed(BlockPrefix + 'mlp.up_proj.weight');
+            TensorNameStr + 'up_proj.weight',
+            Config.HiddenSize, i,
+            0, 2 * i);
+          MarkConsumed(TensorNameStr + 'up_proj.weight');
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
-            BlockPrefix + 'mlp.gate_proj.weight',
-            Config.HiddenSize, Config.IntermediateSize,
-            Config.IntermediateSize, 2 * Config.IntermediateSize);
-          MarkConsumed(BlockPrefix + 'mlp.gate_proj.weight');
+            TensorNameStr + 'gate_proj.weight',
+            Config.HiddenSize, i,
+            i, 2 * i);
+          MarkConsumed(TensorNameStr + 'gate_proj.weight');
         end;
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
-          BlockPrefix + 'mlp.down_proj.weight',
-          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0, '',
+          TensorNameStr + 'down_proj.weight',
+          i, Config.HiddenSize, 0, -1, 0, '',
           Config.ResidualMultiplier);
-        MarkConsumed(BlockPrefix + 'mlp.down_proj.weight');
+        MarkConsumed(TensorNameStr + 'down_proj.weight');
         // Re-quantize the block just refilled with checkpoint weights.
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
@@ -15330,6 +15631,181 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildQwen3MoeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function ReadLlama4ConfigFromJSONFile(const FileName: string): TLlamaConfig;
+var
+  JsonText: TStringList;
+  Root, TextRoot: TJSONData;
+  Obj, Outer: TJSONObject;
+  ModelType, HiddenAct: string;
+  Field: TJSONData;
+  i, Step, Interval: integer;
+  IsMoELayer: boolean;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Llama4 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Llama4 import: config field "' + FieldName +
+        '" must be a positive integer, got ' + Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  Result := Default(TLlamaConfig);
+  if not FileExists(FileName) then
+    ImportError('Llama4 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Llama4 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Llama4 import: config "' + FileName +
+        '" is not a JSON object.');
+    Outer := TJSONObject(Root);
+    ModelType := Outer.Get('model_type', '');
+    // Multimodal "llama4" configs nest the decoder under "text_config"; the
+    // text-only "llama4_text" config is flat. The vision tower is out of scope.
+    Obj := Outer;
+    TextRoot := Outer.Find('text_config');
+    if (TextRoot <> nil) and (TextRoot is TJSONObject) then
+      Obj := TJSONObject(TextRoot);
+    if (ModelType <> 'llama4') and (ModelType <> 'llama4_text') then
+    begin
+      ModelType := Obj.Get('model_type', ModelType);
+      if (ModelType <> 'llama4') and (ModelType <> 'llama4_text') then
+        ImportError('Llama4 import: config model_type is "' + ModelType +
+          '", expected "llama4" or "llama4_text" (text-only; the vision ' +
+          'tower is out of scope - point at a llama4_text checkpoint).');
+    end;
+    Result.ModelType := 'llama4_text';
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5);
+    Result.RopeTheta := Obj.Get('rope_theta', 500000.0);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', false);
+    Result.HeadDim := Obj.Get('head_dim', 128);
+    if Result.HeadDim < 1 then
+      ImportError('Llama4 import: head_dim must be positive.');
+    HiddenAct := Obj.Get('hidden_act', 'silu');
+    if HiddenAct <> 'silu' then
+      ImportError('Llama4 import: hidden_act "' + HiddenAct +
+        '" is not supported (only "silu" / SwiGLU).');
+    if Obj.Get('attention_bias', false) then
+      ImportError('Llama4 import: attention_bias=true is not supported ' +
+        '(would bias o_proj too).');
+    // ---- iRoPE: Config.InterleavedRotary (view_as_complex pairing) ----
+    Result.InterleavedRotary := True;
+    // no_rope_layers: explicit list, else built from no_rope_layer_interval
+    // (default 4): element i = ((i+1) mod interval != 0) (1 = RoPE, 0 = NoPE).
+    SetLength(Result.NoRopeLayers, Result.NumLayers);
+    Field := Obj.Find('no_rope_layers');
+    if (Field <> nil) and (Field is TJSONArray) and (TJSONArray(Field).Count > 0) then
+    begin
+      if TJSONArray(Field).Count <> Result.NumLayers then
+        ImportError('Llama4 import: no_rope_layers length <> num_hidden_layers.');
+      for i := 0 to Result.NumLayers - 1 do
+        Result.NoRopeLayers[i] := TJSONArray(Field).Integers[i] <> 0;
+    end
+    else
+    begin
+      Interval := Obj.Get('no_rope_layer_interval', 4);
+      if Interval < 1 then Interval := 1;
+      for i := 0 to Result.NumLayers - 1 do
+        Result.NoRopeLayers[i] := ((i + 1) mod Interval) <> 0;
+    end;
+    // QK L2-norm (use_qk_norm, default true) on the RoPE layers.
+    Result.Llama4QKL2Norm := Obj.Get('use_qk_norm', true);
+    // attn_temperature_tuning (default true) on the NoPE layers.
+    Result.AttnTempTuning := Obj.Get('attn_temperature_tuning', true);
+    Result.AttnFloorScale := Obj.Get('floor_scale', 8192.0);
+    Result.AttnScale := Obj.Get('attn_scale', 0.1);
+    Result.AttnChunkSize := Obj.Get('attention_chunk_size', 8192);
+    // ---- MoE: sigmoid-gated top-k + always-on shared expert ----
+    Result.IsMoE := True;
+    Result.MoESigmoidGate := True;
+    Result.MoEScaleInput := True;
+    Result.MoEGateUpTransposed := True;
+    Result.NumLocalExperts := Obj.Get('num_local_experts', 16);
+    Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 1);
+    if Result.MoEExpertsPerTok > Result.NumLocalExperts then
+      ImportError('Llama4 import: num_experts_per_tok > num_local_experts.');
+    // Per-expert SwiGLU width = intermediate_size; dense layers use
+    // intermediate_size_mlp (wider).
+    Result.MoEIntermediateSize := Result.IntermediateSize;
+    Result.IntermediateSizeMLP := Obj.Get('intermediate_size_mlp',
+      Result.IntermediateSize);
+    // Shared expert width = intermediate_size (Llama4TextMLP default).
+    Result.SharedIntermediateSize := Result.IntermediateSize;
+    // moe_layers: explicit list, else interleave_moe_layer_step (default 1):
+    // range(step-1, num_layers, step). Translate into MoEDecoderSparseStep +
+    // MoEMlpOnlyLayers so LlamaLayerIsMoE selects them.
+    Step := Obj.Get('interleave_moe_layer_step', 1);
+    if Step < 1 then Step := 1;
+    Field := Obj.Find('moe_layers');
+    SetLength(Result.MoEMlpOnlyLayers, 0);
+    if (Field <> nil) and (Field is TJSONArray) then
+    begin
+      // Build the explicit dense (mlp-only) list = complement of moe_layers.
+      Result.MoEDecoderSparseStep := 1; // step handled via the explicit list
+      for i := 0 to Result.NumLayers - 1 do
+      begin
+        IsMoELayer := False;
+        for Step := 0 to TJSONArray(Field).Count - 1 do
+          if TJSONArray(Field).Integers[Step] = i then IsMoELayer := True;
+        if not IsMoELayer then
+        begin
+          SetLength(Result.MoEMlpOnlyLayers, Length(Result.MoEMlpOnlyLayers) + 1);
+          Result.MoEMlpOnlyLayers[High(Result.MoEMlpOnlyLayers)] := i;
+        end;
+      end;
+    end
+    else
+      // range(step-1, n, step) = layers with (i+1) mod step = 0.
+      Result.MoEDecoderSparseStep := Step;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BuildLlama4FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadLlama4ConfigFromJSONFile(ConfigPath);
+  Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildLlama4FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildLlama4FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -26480,6 +26956,15 @@ begin
     // names + separate W_q/W_k/W_v by the InternLM2 reader, then ridden over
     // the Llama path. See BuildInternLM2FromSafeTensors.
     Result := BuildInternLM2FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if (ModelType = 'llama4') or (ModelType = 'llama4_text') then
+    // Llama-4 text decoder (architectures ["Llama4ForCausalLM"],
+    // meta-llama/Llama-4-Scout-17B-16E + redistills; text-only - the vision
+    // tower is out of scope). iRoPE (interleaved RoPE / NoPE chunked layers),
+    // NoPE attention temperature tuning, L2 QK-norm on the RoPE layers, and a
+    // sigmoid-gated top-k MoE with an always-on shared expert. See
+    // BuildLlama4FromSafeTensors.
+    Result := BuildLlama4FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or

@@ -165,6 +165,9 @@ type
     procedure TestQwen3LogitParity;
     procedure TestQwen3MoeLogitParity;
     procedure TestQwen3MoeMixedLogitParity;
+    procedure TestLlama4ConfigParity;
+    procedure TestLlama4LogitParity;
+    procedure TestLlama4MoeLogitParity;
     procedure TestQwen3MoeWindowLogitParity;
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
@@ -5601,6 +5604,119 @@ begin
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_moe_mixed_logits.json'), Config.MaxPositions,
       Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Llama-4 text fixture seq len (< attention_chunk_size so chunked == causal).
+const LLAMA4_SEQ = 12;
+
+// Pins the Llama-4 (text) config reader: model_type, the iRoPE no_rope_layers
+// pattern (every NOROPE_INTERVAL-th layer NoPE), the dense/MoE interleave
+// (interleave_moe_layer_step), the dense-vs-expert widths, the shared expert,
+// the L2 QK-norm / temperature-tuning flags and the sigmoid-MoE flags.
+procedure TTestNeuralPretrained.TestLlama4ConfigParity;
+var
+  Config: TLlamaConfig;
+begin
+  Config := ReadLlama4ConfigFromJSONFile(
+    FixturePath('tiny_llama4_config.json'));
+  AssertEquals('model_type', 'llama4_text', Config.ModelType);
+  AssertEquals('layers', 4, Config.NumLayers);
+  AssertEquals('hidden', 8, Config.HiddenSize);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('kv heads', 1, Config.NumKVHeads);
+  AssertEquals('head_dim', 6, Config.HeadDim);
+  AssertEquals('expert width (intermediate_size)', 5, Config.IntermediateSize);
+  AssertEquals('dense width (intermediate_size_mlp)', 12,
+    Config.IntermediateSizeMLP);
+  AssertEquals('shared expert width', 5, Config.SharedIntermediateSize);
+  AssertEquals('num_experts', 4, Config.NumLocalExperts);
+  AssertEquals('experts per tok', 2, Config.MoEExpertsPerTok);
+  AssertTrue('is_moe', Config.IsMoE);
+  AssertTrue('sigmoid gate', Config.MoESigmoidGate);
+  AssertTrue('transposed expert slab', Config.MoEGateUpTransposed);
+  AssertTrue('L2 qk-norm', Config.Llama4QKL2Norm);
+  AssertTrue('temperature tuning', Config.AttnTempTuning);
+  AssertTrue('interleaved rotary', Config.InterleavedRotary);
+  // no_rope_layers = [1,0,1,0] (interval 2, HF (i+1) mod interval != 0):
+  // layers 0,2 RoPE; layers 1,3 NoPE.
+  AssertEquals('no_rope_layers length', 4, Length(Config.NoRopeLayers));
+  AssertTrue('layer0 RoPE', Config.NoRopeLayers[0]);
+  AssertTrue('layer1 NoPE', not Config.NoRopeLayers[1]);
+  AssertTrue('layer2 RoPE', Config.NoRopeLayers[2]);
+  AssertTrue('layer3 NoPE', not Config.NoRopeLayers[3]);
+  // moe_layers = [1,3] (step 2): a layer is MoE iff (i+1) mod step = 0, so
+  // layers 0,2 dense; layers 1,3 MoE.
+  AssertEquals('decoder sparse step', 2, Config.MoEDecoderSparseStep);
+  AssertEquals('mlp_only_layers empty (step rule, not explicit)',
+    0, Length(Config.MoEMlpOnlyLayers));
+  AssertEquals('temperature floor_scale', 4.0, Config.AttnFloorScale, 1e-5);
+  AssertEquals('temperature attn_scale', 0.7, Config.AttnScale, 1e-5);
+end;
+
+// Flagship Llama-4 (text) float64 logit parity: rides BuildLlama4FromSafeTensors
+// over the hand-built pico fixture (tools/llama4_tiny_fixture.py) which
+// interleaves RoPE/NoPE AND dense/MoE layers. Max |logit diff| < 1e-4 vs the HF
+// float64 oracle pins iRoPE, the NoPE temperature tuning, the L2 QK-norm and
+// the sigmoid-gated shared-expert MoE end to end.
+procedure TTestNeuralPretrained.TestLlama4LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildLlama4FromSafeTensorsEx(
+    FixturePath('tiny_llama4.safetensors'),
+    Config, {SeqLen=}LLAMA4_SEQ, {pInferenceOnly=}false,
+    FixturePath('tiny_llama4_config.json'));
+  try
+    AssertEquals('model_type', 'llama4_text', Config.ModelType);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_llama4_logits.json'), LLAMA4_SEQ, Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Pins the Llama-4 MoE wiring structurally: the sigmoid-gated routers
+// (TNNetSigmoid + raw TNNetTopKGate, NOT softmax) appear ONCE per MoE layer,
+// the NoPE layers carry the temperature-tuning layer (and no RoPE), and the
+// RoPE layers carry the L2 QK-norm. Then re-asserts float64 logit parity so the
+// counts cannot drift away from a correct net.
+procedure TTestNeuralPretrained.TestLlama4MoeLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, GateCnt, SigmoidCnt, SoftMaxCnt, TempCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildLlama4FromSafeTensorsEx(
+    FixturePath('tiny_llama4.safetensors'),
+    Config, {SeqLen=}LLAMA4_SEQ, {pInferenceOnly=}false,
+    FixturePath('tiny_llama4_config.json'));
+  try
+    GateCnt := 0; SigmoidCnt := 0; SoftMaxCnt := 0; TempCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetSigmoid then Inc(SigmoidCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetPointwiseSoftMax then
+        Inc(SoftMaxCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetLlama4AttnTemperature then
+        Inc(TempCnt);
+    end;
+    // 2 MoE layers (1, 3): one sigmoid-gated router each, NO router softmax.
+    AssertEquals('two top-k routers (MoE layers 1,3)', 2, GateCnt);
+    AssertEquals('two router sigmoids (no softmax gate)', 2, SigmoidCnt);
+    AssertEquals('no router softmax (Llama-4 uses sigmoid)', 0, SoftMaxCnt);
+    // 2 NoPE layers (1, 3): one temperature-tuning layer per query head
+    // (NumHeads = 2) on each NoPE layer = 4 total.
+    AssertEquals('temperature layers = heads * NoPE layers (2*2)',
+      4, TempCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_llama4_logits.json'), LLAMA4_SEQ, Config.VocabSize);
   finally
     NN.Free;
   end;

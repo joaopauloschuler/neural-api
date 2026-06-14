@@ -4795,6 +4795,33 @@ type
       procedure InitDefault(); override;
   end;
 
+  /// Llama-4 NoPE attention temperature tuning (arXiv:2501.19399, "Scaling
+  /// Stable Llama"). On the NoPE (no-RoPE) layers Llama-4 multiplies every
+  /// query vector by a per-POSITION scalar before SDPA so that very long
+  /// contexts keep stable attention temperature:
+  ///   f(pos) = log1p( floor( (pos + 1) / floor_scale ) ) * attn_scale + 1
+  /// (HF Llama4TextAttention.forward, attn_temperature_tuning branch). The
+  /// scalar is the SAME for every channel of a token, so this is a weightless
+  /// per-row rescale of the (SeqLen,1,head_dim) query slice; the backward
+  /// multiplies the incoming gradient by the same f(pos). floor_scale lives in
+  /// FFloatSt[0] and attn_scale in FFloatSt[1]. PositionOffset (default 0, NOT
+  /// serialized) shifts pos for KV-cache incremental decode exactly like
+  /// TNNetRotaryEmbedding (a streamed length-1 token must use its ABSOLUTE
+  /// position). No trainable parameters; output shape equals input shape.
+  // Coded by Claude (AI).
+  TNNetLlama4AttnTemperature = class(TNNetIdentity)
+    private
+      FFloorScale: TNeuralFloat;
+      FAttnScale: TNeuralFloat;
+      FPositionOffset: integer;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pFloorScale, pAttnScale: TNeuralFloat); overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+      property PositionOffset: integer read FPositionOffset write FPositionOffset;
+  end;
+
   /// Unparameterised per-sample z-score normalization — the core of
   // TNNetLayerNorm without the learnable gamma/beta. Each input sample
   // (all elements across SizeX*SizeY*Depth) is shifted to zero mean and
@@ -46472,6 +46499,78 @@ begin
   AfterWeightUpdate();
 end;
 
+{ TNNetLlama4AttnTemperature }
+constructor TNNetLlama4AttnTemperature.Create();
+begin
+  inherited Create();
+  FFloorScale := 8192;
+  FAttnScale := 0.1;
+  FPositionOffset := 0;
+  FFloatSt[0] := FFloorScale;
+  FFloatSt[1] := FAttnScale;
+end;
+
+constructor TNNetLlama4AttnTemperature.Create(pFloorScale, pAttnScale: TNeuralFloat);
+begin
+  Create();
+  if pFloorScale > 0 then FFloorScale := pFloorScale;
+  FAttnScale := pAttnScale;
+  FFloatSt[0] := FFloorScale;
+  FFloatSt[1] := FAttnScale;
+end;
+
+procedure TNNetLlama4AttnTemperature.Compute();
+var
+  StartTime: double;
+  SeqLen, Depth, pos, k, BaseIdx: integer;
+  Scale: TNeuralFloat;
+begin
+  StartTime := Now();
+  inherited Compute; // copies FPrevLayer.FOutput into FOutput
+  SeqLen := FOutput.SizeX;
+  Depth := FOutput.Depth;
+  for pos := 0 to SeqLen - 1 do
+  begin
+    // f(pos) = log1p(floor((pos+1)/floor_scale))*attn_scale + 1.
+    Scale := Ln(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
+      FAttnScale + 1;
+    BaseIdx := pos * Depth;
+    for k := 0 to Depth - 1 do
+      FOutput.FData[BaseIdx + k] := FOutput.FData[BaseIdx + k] * Scale;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetLlama4AttnTemperature.Backpropagate();
+var
+  StartTime: double;
+  SeqLen, Depth, pos, k, BaseIdx: integer;
+  Scale: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if Assigned(FPrevLayer) and
+     (FPrevLayer.OutputError.Size > 0) and
+     (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    StartTime := Now();
+    SeqLen := FOutput.SizeX;
+    Depth := FOutput.Depth;
+    for pos := 0 to SeqLen - 1 do
+    begin
+      Scale := Ln(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
+        FAttnScale + 1;
+      BaseIdx := pos * Depth;
+      for k := 0 to Depth - 1 do
+        FPrevLayer.FOutputError.FData[BaseIdx + k] :=
+          FPrevLayer.FOutputError.FData[BaseIdx + k] +
+          Scale * FOutputError.FData[BaseIdx + k];
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+end;
+
 { TNNetRMSNormGated }
 constructor TNNetRMSNormGated.Create();
 begin
@@ -86561,6 +86660,7 @@ begin
       'TNNetTokenLayerNorm':        Result := TNNetTokenLayerNorm.Create(Ft[0]);
       'TNNetRMSNorm':               Result := TNNetRMSNorm.Create();
       'TNNetTokenRMSNorm':          Result := TNNetTokenRMSNorm.Create(Ft[0]);
+      'TNNetLlama4AttnTemperature': Result := TNNetLlama4AttnTemperature.Create(Ft[0], Ft[1]);
       'TNNetRMSNormGated':          Result := TNNetRMSNormGated.Create();
       'TNNetSwitchableNorm':        Result := TNNetSwitchableNorm.Create();
       'TNNetZScore':                Result := TNNetZScore.Create();
@@ -86953,6 +87053,7 @@ begin
       if S[0] = 'TNNetTokenLayerNorm' then Result := TNNetTokenLayerNorm.Create(Ft[0]) else
       if S[0] = 'TNNetRMSNorm' then Result := TNNetRMSNorm.Create() else
       if S[0] = 'TNNetTokenRMSNorm' then Result := TNNetTokenRMSNorm.Create(Ft[0]) else
+      if S[0] = 'TNNetLlama4AttnTemperature' then Result := TNNetLlama4AttnTemperature.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetRMSNormGated' then Result := TNNetRMSNormGated.Create() else
       if S[0] = 'TNNetSwitchableNorm' then Result := TNNetSwitchableNorm.Create() else
       if S[0] = 'TNNetZScore' then Result := TNNetZScore.Create() else
