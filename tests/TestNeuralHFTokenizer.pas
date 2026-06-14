@@ -135,6 +135,10 @@ type
     procedure TestInterpreterUnsupportedConstructRaises;
     procedure TestInterpreterWhitespaceControlTrimming;
     procedure TestApplyChatTemplateStringFallback;
+    // chat templates v2 follow-ups
+    procedure TestQwenDefaultSystemInjection;
+    procedure TestContinueFinalMessage;
+    procedure TestReturnAssistantTokensMask;
   end;
 
 implementation
@@ -2047,6 +2051,177 @@ begin
     on E: EChatTemplateError do Raised := true;
   end;
   AssertTrue('empty template raises EChatTemplateError', Raised);
+end;
+
+// cfQwen reproduces Qwen2.5/Qwen-Instruct's default-system injection: a
+// conversation with NO leading system message gets a default
+// '<|im_start|>system\nYou are Qwen...<|im_end|>\n' header prepended; a
+// conversation WITH a system message is rendered like plain ChatML (the
+// supplied system is NOT duplicated). Ground truth: jinja2 render of the
+// authentic Qwen2.5-Instruct chat_template (default-system + ChatML loop +
+// loop.first system guard) through the transformers environment
+// (trim_blocks + lstrip_blocks), generated with /home/bpsa/x/bin/python.
+procedure TTestNeuralChat.TestQwenDefaultSystemInjection;
+const
+  QwenDefSys =
+    '<|im_start|>system' + #10 +
+    'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' +
+    '<|im_end|>' + #10;
+var
+  Messages: TChatMessages;
+  Rendered: string;
+begin
+  // NO system message -> default system header is injected first.
+  SetLength(Messages, 3);
+  Messages[0] := ChatMessage('user', 'Hi!');
+  Messages[1] := ChatMessage('assistant', 'Hello.');
+  Messages[2] := ChatMessage('user', 'Bye');
+  Rendered := ApplyChatTemplate(cfQwen, Messages, true);
+  AssertEquals('qwen default-system injected (no sys)',
+    QwenDefSys +
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10 + 'Hello.<|im_end|>' + #10 +
+    '<|im_start|>user' + #10 + 'Bye<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10,
+    Rendered);
+
+  // WITH a system message -> NO default, NO duplication.
+  SetLength(Messages, 2);
+  Messages[0] := ChatMessage('system', 'Be brief.');
+  Messages[1] := ChatMessage('user', 'Hi!');
+  Rendered := ApplyChatTemplate(cfQwen, Messages, true);
+  AssertEquals('qwen does not duplicate explicit system',
+    '<|im_start|>system' + #10 + 'Be brief.<|im_end|>' + #10 +
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10,
+    Rendered);
+  AssertEquals('explicit-system render has no Qwen default text',
+    0, Pos('You are Qwen', Rendered));
+
+  // plain cfChatML must NOT inject the default system (no regression).
+  SetLength(Messages, 1);
+  Messages[0] := ChatMessage('user', 'Hi!');
+  AssertEquals('cfChatML stays default-system-free',
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10,
+    ApplyChatTemplate(cfChatML, Messages, true));
+
+  // round-trip + fingerprint detection of the authentic Qwen template.
+  AssertTrue('qwen name round-trips',
+    ChatFormatFromName(ChatFormatName(cfQwen)) = cfQwen);
+  AssertTrue('authentic qwen template detected as cfQwen',
+    DetectChatFormat(
+      '{%- if messages[0].role == ''system'' %}...{%- else %}' +
+      '<|im_start|>system' + #10 +
+      'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' +
+      '<|im_end|>{%- endif %}') = cfQwen);
+end;
+
+// continue_final_message: the final (assistant) message is a PREFIX to be
+// continued, so NO end-of-turn token / generation prompt is appended after
+// it. Ground truth: HF apply_chat_template(continue_final_message=True)
+// renders with add_generation_prompt forced off, tags the final content,
+// truncates at the tag and rstrips -- reproduced here. Derivation verified
+// against jinja2 + the HF render_jinja_template algorithm with
+// /home/bpsa/x/bin/python.
+procedure TTestNeuralChat.TestContinueFinalMessage;
+var
+  Messages: TChatMessages;
+  Opt: TChatTemplateOptions;
+  Cont, Normal: string;
+begin
+  SetLength(Messages, 2);
+  Messages[0] := ChatMessage('user', 'Hi!');
+  Messages[1] := ChatMessage('assistant', 'Hello, how can');
+
+  // ChatML continue: ends exactly at the assistant prefix, no <|im_end|> and
+  // no trailing generation prompt.
+  Opt := ChatTemplateOptions({AddGenerationPrompt=}false,
+    {ContinueFinalMessage=}true);
+  Cont := ApplyChatTemplate(cfChatML, Messages, Opt);
+  AssertEquals('chatml continue_final_message',
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10 + 'Hello, how can',
+    Cont);
+
+  // The normal (add_generation_prompt) render appends <|im_end|> + a fresh
+  // assistant prompt -- continue must omit both.
+  Normal := ApplyChatTemplate(cfChatML, Messages, true);
+  AssertTrue('continue is a strict prefix of nothing-extra',
+    Pos('<|im_end|>' + #10 + '<|im_start|>assistant' + #10, Normal) > 0);
+  AssertEquals('continue has no end-of-turn after the prefix',
+    0, Pos('Hello, how can<|im_end|>', Cont));
+
+  // Qwen continue: default-system header still present, assistant prefix kept.
+  Opt := ChatTemplateOptions(false, true);
+  Cont := ApplyChatTemplate(cfQwen, Messages, Opt);
+  AssertEquals('qwen continue_final_message',
+    '<|im_start|>system' + #10 +
+    'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' +
+    '<|im_end|>' + #10 +
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10 + 'Hello, how can',
+    Cont);
+
+  // The default options overload is backward-compatible with the v1 boolean.
+  AssertEquals('options overload == boolean overload (default)',
+    ApplyChatTemplate(cfChatML, Messages, true),
+    ApplyChatTemplate(cfChatML, Messages, ChatTemplateOptions(true, false)));
+end;
+
+// return_assistant_tokens_mask: EncodeChatWithMask returns a parallel 0/1
+// mask flagging the token span of every assistant message's CONTENT (the
+// {% generation %} span in HF). Pins a 2-turn ChatML conversation on the
+// Qwen2-style fixture tokenizer and asserts the mask covers exactly the
+// assistant-content tokens (and that those tokens decode back to the
+// assistant content).
+procedure TTestNeuralChat.TestReturnAssistantTokensMask;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids, Mask: TNeuralIntegerArray;
+  Messages: TChatMessages;
+  Cnt, MaskOnes: integer;
+  AsstText, Decoded: string;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_split_qwen2_tokenizer.json'));
+    SetLength(Messages, 4);
+    Messages[0] := ChatMessage('user', 'the cat');
+    Messages[1] := ChatMessage('assistant', 'the dog');
+    Messages[2] := ChatMessage('user', 'a fish');
+    Messages[3] := ChatMessage('assistant', 'a bird');
+
+    Ids := EncodeChatWithMask(Tok, cfChatML, Messages, false, Mask);
+    AssertTrue('ids produced', Length(Ids) > 0);
+    AssertEquals('mask is parallel to ids', Length(Ids), Length(Mask));
+
+    // The mask must flag at least one token and exclude the role/control
+    // tokens -- the very first token (<|im_start|> or its text) is never
+    // assistant content.
+    MaskOnes := 0;
+    for Cnt := 0 to High(Mask) do
+      if Mask[Cnt] = 1 then Inc(MaskOnes);
+    AssertTrue('some assistant tokens flagged', MaskOnes > 0);
+    AssertEquals('first token (control) not flagged', 0, Mask[0]);
+
+    // Every flagged token must decode to text that belongs to one of the
+    // assistant contents; reconstruct the flagged run and check it equals
+    // the concatenation of assistant contents (token order preserved).
+    AsstText := 'the dog' + 'a bird';
+    Decoded := '';
+    for Cnt := 0 to High(Ids) do
+      if Mask[Cnt] = 1 then
+        Decoded := Decoded + Tok.Decode([Ids[Cnt]]);
+    // Decoded may carry the tokenizer's metaspace/leading-space artifacts;
+    // compare after stripping ASCII spaces so the assertion is robust to the
+    // BPE space-prefix convention while still proving content coverage.
+    AssertEquals('flagged tokens decode to the assistant contents',
+      StringReplace(AsstText, ' ', '', [rfReplaceAll]),
+      StringReplace(Decoded, ' ', '', [rfReplaceAll]));
+  finally
+    Tok.Free;
+  end;
 end;
 
 initialization

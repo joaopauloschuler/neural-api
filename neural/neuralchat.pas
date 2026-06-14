@@ -67,6 +67,24 @@ Coded by Claude (AI).
 //             Phi-4-mini-instruct ChatML-style tool-aware template; like
 //             cfPhi3 but the tags carry NO trailing newline and there is no
 //             eos fallback when add_generation_prompt is false.
+//   cfQwen    Identical ChatML turn format to cfChatML, but reproduces the
+//             Qwen2.5/Qwen2/Qwen3-Instruct default-system injection: when the
+//             conversation has NO leading system message, a default
+//             '<|im_start|>system\nYou are Qwen, created by Alibaba Cloud.
+//             You are a helpful assistant.<|im_end|>\n' header is emitted
+//             first (matching apply_chat_template byte for byte). A system
+//             message supplied explicitly is NOT duplicated.
+//
+// Two HF apply_chat_template options are also reproduced (additively, via the
+// TChatTemplateOptions record overload + EncodeChatWithMask):
+//   * ContinueFinalMessage -- the final (assistant) message is a PREFIX to be
+//     continued, so no end-of-turn token / generation prompt is appended after
+//     it; generation resumes mid-message. Implemented exactly like HF: render
+//     with add_generation_prompt forced off, then truncate after the final
+//     message content and rstrip.
+//   * ReturnAssistantTokensMask -- EncodeChatWithMask returns a parallel 0/1
+//     mask flagging the token span of every assistant message's CONTENT (the
+//     {% generation %} span in HF), for SFT loss masking.
 //
 // Auto-detection does NOT interpret Jinja: DetectChatFormat fingerprints
 // the chat_template string from tokenizer_config.json by its distinctive
@@ -99,7 +117,8 @@ type
     cfPhi3,     // Phi-3-mini-instruct <|user|>...<|end|>
     cfMistral,  // Mistral-7B-Instruct [INST] without system
     cfDeepSeek, // DeepSeek-V2/V3-Chat <｜begin▁of▁sentence｜>User: ...
-    cfPhi4Mini  // Phi-4-mini-instruct ChatML-style (no-newline tags)
+    cfPhi4Mini, // Phi-4-mini-instruct ChatML-style (no-newline tags)
+    cfQwen      // Qwen2.5/Qwen-style ChatML + default-system injection
   );
 
   TChatMessage = record
@@ -107,6 +126,22 @@ type
     Content: string;
   end;
   TChatMessages = array of TChatMessage;
+
+  // Optional knobs for the apply_chat_template overload (all default to the
+  // v1 behavior, so existing callers are unaffected).
+  TChatTemplateOptions = record
+    AddGenerationPrompt: boolean;
+    // When true, the final message is treated as a prefix to CONTINUE: no
+    // end-of-turn token / generation prompt is appended after it. Mutually
+    // exclusive with AddGenerationPrompt (HF raises; here ContinueFinalMessage
+    // wins and the generation prompt is suppressed).
+    ContinueFinalMessage: boolean;
+  end;
+
+// Default options: AddGenerationPrompt as given, ContinueFinalMessage off.
+function ChatTemplateOptions(
+  AddGenerationPrompt: boolean = true;
+  ContinueFinalMessage: boolean = false): TChatTemplateOptions;
 
 // Convenience constructor: ChatMessage('user', 'Hi!').
 function ChatMessage(const Role, Content: string): TChatMessage;
@@ -120,7 +155,14 @@ function ChatMessage(const Role, Content: string): TChatMessage;
 // cfMistral non-user/assistant role).
 function ApplyChatTemplate(ChatFormat: TNeuralChatFormat;
   const Messages: array of TChatMessage;
-  AddGenerationPrompt: boolean = true): string;
+  AddGenerationPrompt: boolean = true): string; overload;
+
+// Options overload: same renderers, plus ContinueFinalMessage (the final
+// message is continued, so the trailing end-of-turn token / generation prompt
+// is omitted -- matching HF apply_chat_template(continue_final_message=True)).
+function ApplyChatTemplate(ChatFormat: TNeuralChatFormat;
+  const Messages: array of TChatMessage;
+  const Options: TChatTemplateOptions): string; overload;
 
 // Resolves an arbitrary chat_template string to a rendered prompt. First
 // tries DetectChatFormat: a recognized family routes to the fast hardcoded
@@ -198,10 +240,25 @@ function EncodeChat(Tokenizer: TNeuralHFTokenizer;
   ChatFormat: TNeuralChatFormat; const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean = true): TNeuralIntegerArray; overload;
 
+// EncodeChat that also returns a parallel 0/1 assistant-tokens mask: mask[i]=1
+// iff token i belongs to the CONTENT of an assistant message (HF's
+// return_assistant_tokens_mask / {% generation %} span), so it can drive SFT
+// loss masking. Length(AssistantMask) = Length(result ids). The mask is built
+// from the character spans the renderer assigns to each assistant message's
+// content. The rendered prompt is encoded in segments split at the span
+// boundaries (each segment encoded independently), so the mask is exact for
+// any tokenizer; note that this segmented encoding can differ by a token or
+// two from a single whole-string Encode when a BPE merge would have spanned a
+// segment boundary -- use the returned ids, not a separate EncodeChat call.
+function EncodeChatWithMask(Tokenizer: TNeuralHFTokenizer;
+  ChatFormat: TNeuralChatFormat; const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean;
+  out AssistantMask: TNeuralIntegerArray): TNeuralIntegerArray;
+
 implementation
 
 uses
-  fpjson;
+  StrUtils, fpjson;
 
 const
   csAlternateError =
@@ -240,6 +297,20 @@ begin
   Result.Content := Content;
 end;
 
+function ChatTemplateOptions(
+  AddGenerationPrompt: boolean = true;
+  ContinueFinalMessage: boolean = false): TChatTemplateOptions;
+begin
+  Result.AddGenerationPrompt := AddGenerationPrompt;
+  Result.ContinueFinalMessage := ContinueFinalMessage;
+end;
+
+// The Qwen2.5/Qwen default system message, injected verbatim when the
+// conversation has no leading system turn (apply_chat_template parity).
+const
+  csQwenDefaultSystem =
+    'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.';
+
 function ChatFormatName(ChatFormat: TNeuralChatFormat): string;
 begin
   case ChatFormat of
@@ -252,6 +323,7 @@ begin
     cfMistral: Result := 'mistral';
     cfDeepSeek: Result := 'deepseek';
     cfPhi4Mini: Result := 'phi4mini';
+    cfQwen: Result := 'qwen';
     else Result := 'unknown';
   end;
 end;
@@ -270,6 +342,7 @@ begin
   else if Lowered = 'mistral' then Result := cfMistral
   else if Lowered = 'deepseek' then Result := cfDeepSeek
   else if Lowered = 'phi4mini' then Result := cfPhi4Mini
+  else if Lowered = 'qwen' then Result := cfQwen
   else Result := cfUnknown;
 end;
 
@@ -279,7 +352,14 @@ begin
   // family among the published templates (cfZephyr and cfPhi3 share
   // '<|user|>', so cfPhi3's '<|end|>' is tested first; '[INST]' is
   // shared by cfLlama2 and cfMistral, so cfLlama2's '<<SYS>>' wins).
-  if Pos('<|im_start|>', ChatTemplate) > 0 then Result := cfChatML
+  // Qwen is ChatML PLUS the default-system literal; test it first so the
+  // generic '<|im_start|>' branch does not swallow it. The unique fingerprint
+  // is the 'You are Qwen, created by Alibaba Cloud' default-system string the
+  // Qwen2/2.5/3 templates embed for the no-system case.
+  if (Pos('<|im_start|>', ChatTemplate) > 0) and
+    (Pos('You are Qwen, created by Alibaba Cloud', ChatTemplate) > 0) then
+    Result := cfQwen
+  else if Pos('<|im_start|>', ChatTemplate) > 0 then Result := cfChatML
   else if Pos('<|start_header_id|>', ChatTemplate) > 0 then
     Result := cfLlama3
   else if Pos('<<SYS>>', ChatTemplate) > 0 then Result := cfLlama2
@@ -379,17 +459,56 @@ end;
 // One renderer per format; each mirrors its Jinja template line by line
 // (the comment above every branch quotes the construct it reproduces).
 
+// One (Start,Length) char span (1-based, like TNeuralTokenOffset) over the
+// rendered string, marking an assistant message's CONTENT.
+type
+  TChatSpan = record Start, Len: integer; end;
+  TChatSpanArray = array of TChatSpan;
+
+// Appends a span to the dynamic array.
+procedure AddSpan(var Spans: TChatSpanArray; Start, Len: integer);
+begin
+  if Len <= 0 then exit;
+  SetLength(Spans, Length(Spans) + 1);
+  Spans[High(Spans)].Start := Start;
+  Spans[High(Spans)].Len := Len;
+end;
+
+// Shared ChatML body used by both cfChatML and cfQwen. InjectQwenDefaultSystem
+// prepends the Qwen default-system header when the conversation has no leading
+// system message. Records assistant-content spans into Spans (1-based offsets
+// into Result) for return_assistant_tokens_mask.
+function RenderChatMLCore(const Messages: array of TChatMessage;
+  AddGenerationPrompt, InjectQwenDefaultSystem: boolean;
+  var Spans: TChatSpanArray): string;
+var
+  Cnt, ContentStart: integer;
+begin
+  Result := '';
+  SetLength(Spans, 0);
+  if InjectQwenDefaultSystem and
+    not ((Length(Messages) > 0) and (Messages[0].Role = 'system')) then
+    Result := Result + '<|im_start|>system' + #10 + csQwenDefaultSystem +
+      '<|im_end|>' + #10;
+  for Cnt := 0 to High(Messages) do
+  begin
+    Result := Result + '<|im_start|>' + Messages[Cnt].Role + #10;
+    ContentStart := Length(Result) + 1;
+    Result := Result + Messages[Cnt].Content;
+    if Messages[Cnt].Role = 'assistant' then
+      AddSpan(Spans, ContentStart, Length(Messages[Cnt].Content));
+    Result := Result + '<|im_end|>' + #10;
+  end;
+  if AddGenerationPrompt then
+    Result := Result + '<|im_start|>assistant' + #10;
+end;
+
 function RenderChatML(const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean): string;
 var
-  Cnt: integer;
+  Spans: TChatSpanArray;
 begin
-  Result := '';
-  for Cnt := 0 to High(Messages) do
-    Result := Result + '<|im_start|>' + Messages[Cnt].Role + #10 +
-      Messages[Cnt].Content + '<|im_end|>' + #10;
-  if AddGenerationPrompt then
-    Result := Result + '<|im_start|>assistant' + #10;
+  Result := RenderChatMLCore(Messages, AddGenerationPrompt, false, Spans);
 end;
 
 function RenderLlama2(const Messages: array of TChatMessage): string;
@@ -1505,12 +1624,17 @@ begin
   end;
 end;
 
-function ApplyChatTemplate(ChatFormat: TNeuralChatFormat;
+// Dispatches to the per-format renderer for a plain (no options) render.
+function RenderFormat(ChatFormat: TNeuralChatFormat;
   const Messages: array of TChatMessage;
-  AddGenerationPrompt: boolean = true): string;
+  AddGenerationPrompt: boolean): string;
+var
+  Spans: TChatSpanArray;
 begin
   case ChatFormat of
     cfChatML: Result := RenderChatML(Messages, AddGenerationPrompt);
+    cfQwen: Result := RenderChatMLCore(Messages, AddGenerationPrompt,
+      {InjectQwenDefaultSystem=}true, Spans);
     cfLlama2: Result := RenderLlama2(Messages);
     cfLlama3: Result := RenderLlama3(Messages, AddGenerationPrompt);
     cfZephyr: Result := RenderZephyr(Messages, AddGenerationPrompt);
@@ -1522,10 +1646,92 @@ begin
     else
       raise ENeuralChatError.Create('Unknown chat format. Pass one of ' +
         'cfChatML/cfLlama2/cfLlama3/cfZephyr/cfGemma/cfPhi3/cfMistral/' +
-        'cfDeepSeek/cfPhi4Mini ' +
+        'cfDeepSeek/cfPhi4Mini/cfQwen ' +
         '(auto-detection via DetectChatFormat did not recognize the ' +
         'model''s chat_template).');
   end;
+end;
+
+// Renders ChatFormat and also records the assistant-content char spans
+// (1-based, into Result) for return_assistant_tokens_mask. For the ChatML
+// family the span tracking is exact; for every other format the assistant
+// content is located by walking the rendered output once, in message order,
+// from a moving cursor (content substrings are matched left to right).
+function RenderFormatWithSpans(ChatFormat: TNeuralChatFormat;
+  const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean; out Spans: TChatSpanArray): string;
+var
+  Cnt, FoundAt, Cursor: integer;
+begin
+  SetLength(Spans, 0);
+  if (ChatFormat = cfChatML) or (ChatFormat = cfQwen) then
+  begin
+    Result := RenderChatMLCore(Messages, AddGenerationPrompt,
+      {InjectQwenDefaultSystem=}ChatFormat = cfQwen, Spans);
+    exit;
+  end;
+  Result := RenderFormat(ChatFormat, Messages, AddGenerationPrompt);
+  // Generic span recovery: locate each assistant message's content in order.
+  Cursor := 1;
+  for Cnt := 0 to High(Messages) do
+    if Messages[Cnt].Role = 'assistant' then
+    begin
+      if Messages[Cnt].Content = '' then continue;
+      FoundAt := PosEx(Messages[Cnt].Content, Result, Cursor);
+      if FoundAt > 0 then
+      begin
+        AddSpan(Spans, FoundAt, Length(Messages[Cnt].Content));
+        Cursor := FoundAt + Length(Messages[Cnt].Content);
+      end;
+    end;
+end;
+
+// continue_final_message: HF appends a sentinel to the final message content,
+// renders with add_generation_prompt forced off, finds the sentinel and keeps
+// only the prefix up to it, then rstrips. Net effect: render the conversation
+// (no generation prompt), then chop everything after the final message's
+// content and rstrip. We compute it directly by rendering with the final
+// message empty so we can find exactly where its content ends.
+function RenderContinueFinal(ChatFormat: TNeuralChatFormat;
+  const Messages: array of TChatMessage): string;
+var
+  Sentinel, Rendered: string;
+  Tagged: TChatMessages;
+  Cnt, TagLoc: integer;
+begin
+  if Length(Messages) = 0 then
+    raise ENeuralChatError.Create(
+      'continue_final_message set but there is no final message to continue');
+  // Tag the final message content with a sentinel, render without a
+  // generation prompt, then truncate at the sentinel and rstrip (HF-exact).
+  Sentinel := 'CONTINUE_FINAL_MESSAGE_TAG ';
+  SetLength(Tagged, Length(Messages));
+  for Cnt := 0 to High(Messages) do Tagged[Cnt] := Messages[Cnt];
+  Tagged[High(Tagged)].Content := Tagged[High(Tagged)].Content + Sentinel;
+  Rendered := RenderFormat(ChatFormat, Tagged, {AddGenerationPrompt=}false);
+  TagLoc := Pos(Trim(Sentinel), Rendered);
+  if TagLoc = 0 then
+    raise ENeuralChatError.Create(
+      'continue_final_message: the final message did not appear in the ' +
+      'rendered chat');
+  Result := PyStrip(Copy(Rendered, 1, TagLoc - 1));
+end;
+
+function ApplyChatTemplate(ChatFormat: TNeuralChatFormat;
+  const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean = true): string;
+begin
+  Result := RenderFormat(ChatFormat, Messages, AddGenerationPrompt);
+end;
+
+function ApplyChatTemplate(ChatFormat: TNeuralChatFormat;
+  const Messages: array of TChatMessage;
+  const Options: TChatTemplateOptions): string;
+begin
+  if Options.ContinueFinalMessage then
+    Result := RenderContinueFinal(ChatFormat, Messages)
+  else
+    Result := RenderFormat(ChatFormat, Messages, Options.AddGenerationPrompt);
 end;
 
 function ApplyChatTemplateString(const ChatTemplate: string;
@@ -1563,6 +1769,67 @@ function EncodeChat(Tokenizer: TNeuralHFTokenizer;
 begin
   Result := Tokenizer.Encode(
     ApplyChatTemplate(ChatFormat, Messages, AddGenerationPrompt));
+end;
+
+function EncodeChatWithMask(Tokenizer: TNeuralHFTokenizer;
+  ChatFormat: TNeuralChatFormat; const Messages: array of TChatMessage;
+  AddGenerationPrompt: boolean;
+  out AssistantMask: TNeuralIntegerArray): TNeuralIntegerArray;
+var
+  Spans: TChatSpanArray;
+  Rendered: string;
+  SegIds: TIntegerList;
+  K, Cursor, EmitCnt: integer;
+
+  // Encodes the substring Rendered[FromPos..ToPos) and appends its ids to
+  // Result, setting the mask for the run to Assist.
+  procedure EmitSegment(FromPos, ToPos: integer; Assist: boolean);
+  var
+    J: integer;
+  begin
+    if ToPos <= FromPos then exit;
+    SegIds.Clear;
+    Tokenizer.Encode(Copy(Rendered, FromPos, ToPos - FromPos), SegIds);
+    for J := 0 to SegIds.Count - 1 do
+    begin
+      if EmitCnt > High(Result) then
+      begin
+        SetLength(Result, EmitCnt + 64);
+        SetLength(AssistantMask, EmitCnt + 64);
+      end;
+      Result[EmitCnt] := SegIds[J];
+      if Assist then AssistantMask[EmitCnt] := 1
+      else AssistantMask[EmitCnt] := 0;
+      Inc(EmitCnt);
+    end;
+  end;
+
+begin
+  // Render once with assistant-content spans, then encode the string in
+  // segments split at every span boundary: the assistant-content segments
+  // carry mask=1, everything else mask=0. Segmented encoding (rather than
+  // post-hoc offset alignment) is exact regardless of how the tokenizer
+  // matches control/added tokens, since each segment is encoded independently.
+  Rendered := RenderFormatWithSpans(ChatFormat, Messages,
+    AddGenerationPrompt, Spans);
+  SetLength(Result, 0);
+  SetLength(AssistantMask, 0);
+  EmitCnt := 0;
+  SegIds := TIntegerList.Create;
+  try
+    Cursor := 1; // 1-based position into Rendered
+    for K := 0 to High(Spans) do
+    begin
+      EmitSegment(Cursor, Spans[K].Start, false);     // pre-span text
+      EmitSegment(Spans[K].Start, Spans[K].Start + Spans[K].Len, true);
+      Cursor := Spans[K].Start + Spans[K].Len;
+    end;
+    EmitSegment(Cursor, Length(Rendered) + 1, false);  // trailing text
+  finally
+    SegIds.Free;
+  end;
+  SetLength(Result, EmitCnt);
+  SetLength(AssistantMask, EmitCnt);
 end;
 
 end.

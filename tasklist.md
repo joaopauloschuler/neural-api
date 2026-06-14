@@ -465,7 +465,7 @@ rather than acted on.
       generate for N prompts in one forward pass per step (today's decode
       paths look single-sample). Makes evaluation sweeps cheap and is a
       prerequisite for an efficient speculative-decoding verify step.
-- [ ] Chat templates v2 (v1 is landed in neural/neuralchat.pas —
+- [X] Chat templates v2 (v1 is landed in neural/neuralchat.pas —
       ApplyChatTemplate with seven hardcoded formats + DetectChatFormat
       fingerprinting + EncodeChat): ~~a mini-Jinja subset interpreter for
       unrecognized chat_template strings (must pass ground truth for all
@@ -475,11 +475,17 @@ rather than acted on.
       whitespace control, raises EChatTemplateError on unsupported
       constructs; tests in TestNeuralHFTokenizer.pas]; more
       formats (~~DeepSeek~~ [DONE: cfDeepSeek], ~~Phi-4-mini's tool-aware
-      ChatML variant~~ [DONE: cfPhi4Mini], Qwen's default-system injection);
+      ChatML variant~~ [DONE: cfPhi4Mini], ~~Qwen's default-system injection~~
+      [DONE: cfQwen -- ChatML + default-system header when no leading system
+      message; DetectChatFormat fingerprints the "You are Qwen..." literal]);
       ~~read the separate chat_template.jinja file newer transformers exports
       alongside tokenizer_config.json~~ [DONE: LoadChatTemplateString sibling
-      fallback]; continue_final_message / return_assistant_tokens_mask
-      equivalents.
+      fallback]; ~~continue_final_message~~ [DONE: TChatTemplateOptions
+      .ContinueFinalMessage + ApplyChatTemplate options overload; HF-exact
+      render-no-genprompt + truncate-at-final-content + rstrip] /
+      ~~return_assistant_tokens_mask~~ [DONE: EncodeChatWithMask returns a
+      parallel 0/1 assistant-content mask via segmented encoding] equivalents.
+      (Chat templates v2 fully landed; tests in TestNeuralHFTokenizer.pas.)
 - [ ] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
       with forward/backward wall-time and parameter/activation memory per
       layer (introspection-report pattern). Directly serves the open
