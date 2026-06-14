@@ -217,48 +217,16 @@ rather than acted on.
       is forward-only — add backward through the dt/B/C RMSNorms for fine-tuning;
       (c) no Jamba-specific tokenizer demo (raw ids work); (d) no real-checkpoint
       slicer fixture (parity uses a random pico model).
-- [X] Nemotron-H hybrid Mamba-2 + attention importer
-      (`BuildNemotronHFromSafeTensors[Ex]`, model_type "nemotron_h"; e.g.
-      nvidia/Nemotron-H-8B-Base / the 4B/47B siblings) — the open Mamba-2-hybrid
-      follow-up the README's Mamba-2 entry names but the tasklist has no entry for.
-      ARCHITECTURALLY DISTINCT from the landed Jamba (which is Mamba-**1** +
-      attention + MoE on a periodic schedule): Nemotron-H interleaves the landed
-      `TNNetMamba2` selective-SSD mixer, full softmax-attention, and plain MLP
-      layers on an EXPLICIT per-layer string schedule (the config `hybrid_override_pattern`,
-      e.g. "M-M-M*-M-..." with 'M'=Mamba2, '*'=attention, '-'=MLP), so the new work
-      is the schedule parser + per-layer dispatch (NOT a new mixer — TNNetMamba2 and
-      the BERT-style attention/MLP blocks already exist). Genuinely new vs every
-      landed importer: (a) the override-pattern string driving heterogeneous block
-      placement (unlike Jamba's `attn_layer_period`/`offset` arithmetic schedule),
-      (b) a **squared-ReLU (relu2) non-gated MLP** — `up -> ReLU(x)^2 -> down` with
-      NO gate projection (reuse the `TNNetReGLUSquared` activation but on the
-      single-projection MLP path, not the gated SwiGLU path), (c) NoPE on the
-      attention layers (Mamba-2 mixers carry order; attention is position-encoding-free
-      like Jamba), RMSNorm, GQA. Tokenizer is a tokenizer.json BPE (already
-      supported). Deliverables: pico parity fixture via the make_pico_*_fixture.py
-      recipe asserting hidden states AND next-token logits < 1e-4 vs HF float64
-      `NemotronHForCausalLM`; wire model_type "nemotron_h" into `BuildFromPretrained`.
-      Opens Zamba2 (the sibling Mamba-2 hybrid, which additionally adds shared
-      transformer blocks with per-invocation LoRA — a separate, larger follow-up).
-      LANDED 2026-06-14 (branch a3): `BuildNemotronHFromSafeTensors[Ex]` +
-      `ReadNemotronHConfigFromJSONFile` + `TNemotronHConfig`, override-pattern
-      parser (`hybrid_override_pattern` string OR `layers_block_type` list) with
-      per-layer M/*/- dispatch, single pre-norm residual per block; relu2 MLP =
-      up_proj -> TNNetReLU -> TNNetSquare -> down_proj (ReLU(x)^2, no gate, no new
-      class); NoPE bias-free GQA with explicit `head_dim`; reuses the standalone
-      Mamba-2 mixer construction + TNNetMamba2 leaf. Wired into BuildFromPretrained.
-      Pico parity test `TestNemotronHLogitParity` (tools/make_pico_nemotronh_fixture.py,
-      pattern "M*-M" covering all three block types) passes < 1e-4 vs REAL HF
-      float64 `NemotronHForCausalLM` (naive CPU path). Suite green (1982 tests).
-  - [ ] Nemotron-H-MoE ('E' block type) — the importer currently REJECTS the 'E'
-        (MoE) block type with a clear message. Add the DeepSeek/Mixtral-style
-        top-k MoE FFN block (n_routed_experts, num_experts_per_tok,
-        norm_topk_prob, routed_scaling_factor, n_shared_experts) on the
-        Nemotron-H schedule path; reuse the landed TopKGate/expert machinery.
-  - [ ] Zamba2 importer (model_type "zamba2") — the sibling Mamba-2 hybrid that
-        additionally shares a small set of transformer blocks across depth with a
-        per-invocation LoRA adapter; needs a shared-block + LoRA wiring helper
-        (larger than Nemotron-H, distinct from the per-layer-independent schedule).
+- [ ] Nemotron-H-MoE ('E' block type) follow-up to the landed
+      BuildNemotronHFromSafeTensors — the importer currently REJECTS the 'E'
+      (MoE) block type with a clear message. Add the DeepSeek/Mixtral-style
+      top-k MoE FFN block (n_routed_experts, num_experts_per_tok,
+      norm_topk_prob, routed_scaling_factor, n_shared_experts) on the
+      Nemotron-H schedule path; reuse the landed TopKGate/expert machinery.
+- [ ] Zamba2 importer (model_type "zamba2") — the sibling Mamba-2 hybrid that
+      additionally shares a small set of transformer blocks across depth with a
+      per-invocation LoRA adapter; needs a shared-block + LoRA wiring helper
+      (larger than Nemotron-H, distinct from the per-layer-independent schedule).
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
@@ -434,88 +402,15 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [X] HF-names safetensors exporter — per-importer name maps follow-up
-      (GPT-2 SaveGPT2ToSafeTensors and Llama SaveLlamaToSafeTensors landed as the
-      exact inverses of their importers — Llama via the shared
-      BuildLlamaMemTensorReader walk that also backs the GGUF exporter, undoing
-      the q/k rotate_half de-permute + SwiGLU gate|up un-fuse + Gemma RMSNorm
-      gain offset; round-trip gated by TestLlamaSafeTensorsRoundTrip; QWEN3
-      SaveQwen3ToSafeTensors LANDED via the dedicated BuildQwen3MemTensorReader
-      walk — same q/k rotate_half de-permute + SwiGLU gate|up un-fuse PLUS the
-      per-head q/k RMSNorm gain un-permute, round-trip gated by
-      TestQwen3SafeTensorsRoundTrip; BERT SaveBertToSafeTensors LANDED as the
-      exact inverse of BuildBertFromSafeTensors — walks the encoder, un-fuses the
-      Q|K|V slab into the three nn.Linear tensors and dumps straight [out,in]
-      linears (+bias) / LayerNorm gamma-beta / word|type|position embeddings
-      under the family name map (bert/distilbert/roberta prefixes), round-trip
-      gated by TestBertSafeTensorsRoundTrip; GPT-NeoX SaveGPTNeoXToSafeTensors
-      LANDED as the exact inverse of BuildGPTNeoXFromSafeTensors — collects the
-      decoder's typed layers in build order and RE-FUSES the per-head Q|K|V slab
-      back into the single interleaved query_key_value tensor (inverting the
-      partial rotate_half permutation of LoadGPTNeoXQKVWeights) plus straight
-      [out,in] dense/dense_h_to_4h/dense_4h_to_h linears, LayerNorm gamma|beta,
-      embed_in / embed_out under the gpt_neox.* name map, round-trip gated by
-      TestGPTNeoXSafeTensorsRoundTrip over BOTH parallel and sequential
-      configs; BLOOM SaveBloomToSafeTensors LANDED as the exact inverse of
-      BuildBloomFromSafeTensors — collects the decoder's typed layers in build
-      order and RE-FUSES the per-head Q|K|V slab back into the single
-      query_key_value tensor (NO rotate_half — BLOOM is ALiBi, not rotary) plus
-      straight [out,in] dense/dense_h_to_4h/dense_4h_to_h linears, LayerNorm
-      gamma|beta INCLUDING the word_embeddings_layernorm, tied word_embeddings
-      (no separate lm_head tensor) and ln_f under the transformer.* name map,
-      round-trip gated by TestBloomSafeTensorsRoundTrip; Mamba
-      SaveMambaToSafeTensors LANDED as the exact inverse of
-      BuildMambaFromSafeTensors — the first NON-TRANSFORMER exporter: walks the
-      typed layers (Embedding / per-block TokenRMSNorm+in_proj PointwiseConvLinear
-      +DepthwiseConv1D+SelectiveSSM+out_proj / norm_f / LM head) in build order
-      and emits the backbone.* name map; A_log/D/dt_proj.bias and the B|C x_proj
-      rows round-trip RAW, conv1d/in_proj/out_proj are straight dumps, and the
-      one non-trivial inversion — the importer's FOLD of dt_proj.weight @
-      x_proj.weight[0:dt_rank] into the single rank-<=dt_rank [d_inner,d_inner]
-      W_d — is re-factored EXACTLY at export by Gaussian elimination (emit
-      dt_proj.weight=L, x_proj rows[0:dt_rank]=U with L@U=W_d); tied
-      tie_word_embeddings emits no lm_head tensor; round-trip gated by
-      TestMambaSafeTensorsRoundTrip, max |logit diff| = 4.4e-6 (single-precision
-      rounding of the factor product, well under 1e-5); RWKV
-      SaveRWKVToSafeTensors LANDED as the exact inverse of
-      BuildRWKVFromSafeTensors — the second NON-TRANSFORMER exporter: walks the
-      typed layers (Embedding / ln0 pre_ln / per-block ln1+ln2 TokenLayerNorm,
-      5 TokenShift lerp vectors, 7 PointwiseConvLinear projections, WKV / ln_out
-      / tied|untied head) in build order and emits the rwkv.* name map; every
-      tensor round-trips RAW except time_decay, which is reconstructed by the
-      FORWARD softplus time_decay=ln(softplus(w_raw)) — the EXACT inverse of
-      LoadWKVDecay's invsoftplus (same w_raw>30 and exp-limit branch bounds), so
-      the round-trip is BIT-EXACT; LayerNorms dump gamma|beta, projections are
-      straight bias-free [out,in] dumps, time_first bonus and token-shift lerps
-      round-trip raw, tied tie_word_embeddings emits no head.weight tensor;
-      round-trip gated by TestRWKVSafeTensorsRoundTrip, max |logit diff| = 0
-      (bit-exact)): the FINAL piece — the ENCODER-DECODER exporters — LANDED.
-      SaveT5ToSafeTensors is the exact inverse of BuildT5FromSafeTensors: it
-      walks BOTH nets' typed layers (Embedding / per-block TokenRMSNorm +
-      q/k/v/o PointwiseConvLinear + per-head T5RelPosBiasAttention + wi/wo /
-      final norm / decoder LM head) in build order under the encoder.* /
-      decoder.* name map, un-folds the q-projection sqrt(d_kv) scale, un-fuses
-      the gated-GELU wi_0|wi_1 halves, and re-emits the SHARED
-      relative_attention_bias table [NumBuckets,NumHeads] from block 0's
-      per-head bucket columns; tie_word_embeddings emits NO lm_head (the
-      importer regenerates the d_model^-0.5-scaled head from shared.weight),
-      untied dumps a straight bias-free head. SaveMarianToSafeTensors is the
-      exact inverse of BuildMarianFromSafeTensors: walks both nets (Embedding /
-      per-block biased q/k/v/out + post-residual TokenLayerNorm + fc1/fc2 /
-      decoder LM head) under the model.encoder.layers.* / model.decoder.layers.*
-      map, UN-FOLDS the scale_embedding sqrt(d_model) on model.shared.weight,
-      re-derives final_logits_bias from the tied head's per-neuron biases, and
-      deliberately OMITS the static half-split sinusoidal position tables (not
-      learned parameters — the importer regenerates them). Round-trips gated by
-      TestT5SafeTensorsRoundTrip (BOTH the untied gated-GELU Flan-T5 and the
-      tied ReLU v1.0 fixtures) and TestMarianSafeTensorsRoundTrip, both
-      bit-exact (max |logit diff| under 1e-5). Open follow-ups: Pegasus/mBART
-      exporters (Pegasus = pre-norm + sinusoidal final-norm twist; mBART =
-      pre-norm + extra final LayerNorms + learned +2-offset positions) and BART
-      SaveBartToSafeTensors ride the SAME Marian post-norm skeleton but were not
-      done here — they reuse the LoadMarianStack/Attn layout so a future
-      SaveBartToSafeTensors can share DumpStack with the +2-offset learned
-      position table re-emitted.
+- [ ] Encoder-decoder safetensors exporter follow-ups (the GPT-2 / Llama /
+      Qwen3 / BERT / GPT-NeoX / BLOOM / Mamba / RWKV / T5 / Marian HF-names
+      exporters all LANDED as exact inverses of their importers, round-trips
+      bit-exact): Pegasus / mBART exporters (Pegasus = pre-norm + sinusoidal
+      final-norm twist; mBART = pre-norm + extra final LayerNorms + learned
+      +2-offset positions) and BART SaveBartToSafeTensors, which ride the SAME
+      Marian post-norm skeleton (reuse LoadMarianStack/Attn + DumpStack with the
+      +2-offset learned position table re-emitted) but were not done in the
+      landed batch.
 - [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
       (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
       llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
@@ -684,27 +579,6 @@ rather than acted on.
       — the projection head is always f32 while the BERT backbone already
       supports int8.
 
-- [X] Wav2Vec2 / HuBERT CTC ASR importer (`BuildWav2Vec2FromSafeTensors[Ex/
-      WithConfig]`, model_type "wav2vec2"/"hubert") — LANDED. The SECOND speech
-      import family and first SELF-SUPERVISED-encoder ASR: a raw-waveform CONV
-      FEATURE EXTRACTOR -> transformer ENCODER -> linear CTC head, no decoder.
-      Built in neuralpretrained.pas reusing existing layers: (a) multi-layer
-      strided 1-D conv feature extractor (TNNetConvolutionLinear bias-free on the
-      (T,1,C) grid; first conv -> TNNetGroupNorm(channels) per-channel-over-time
-      GroupNorm -> GELU, rest conv -> GELU); (b) feature projection
-      (TNNetTokenLayerNorm + Linear); (c) conv-based relative POSITIONAL EMBEDDING
-      (grouped conv1d, weight-norm reconstructed from original0/original1 dim=2,
-      even-kernel SamePad via TNNetCrop) added then encoder.layer_norm; (d) the
-      BERT post-LN bidirectional encoder block math (exact erf GELU); (e) linear
-      CTC head decoded with DecodeCTCGreedy. HuBERT = same importer + IsHubert
-      flag. Wired into BuildFromPretrained (pSeqLen reinterpreted as raw sample
-      count). Deliverables DONE: tools/wav2vec2_tiny_fixture.py builds committed
-      pico fixtures (tiny_wav2vec2.*, tiny_hubert.*); TestWav2Vec2ConfigFromJSONFile
-      + TestWav2Vec2CTCParity + TestHubertCTCParity assert encoder hidden 2.3e-6 /
-      CTC logits 1.2e-7 (wav2vec2) and 2.6e-6 / 2.0e-7 (hubert) < 1e-4 vs HF
-      float64 Wav2Vec2ForCTC/HubertForCTC; examples/Wav2Vec2Transcribe transcribes
-      a WAV (LoadWav16ToVolume raw path) with a self-contained pico smoke test;
-      examples/README.md updated. Tokenizer is the tiny char vocab.json.
 - [ ] Wav2Vec2 -large / robust LayerNorm variant + pretraining (follow-up to the
       landed Wav2Vec2/HuBERT CTC importer, which supports ONLY the wav2vec2-base
       "group" feat_extract_norm + post-norm encoder; ReadWav2Vec2ConfigFromJSONFile
