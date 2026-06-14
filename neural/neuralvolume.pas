@@ -514,6 +514,11 @@ type
       function GetToken(Origin: TNNetVolume): integer; virtual; abstract;
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; virtual; abstract;
       procedure SortTokenArray();
+      // State-init hook for STATEFUL samplers (e.g. TNNetSamplerMirostat carries
+      // a running mu across the generation). The streamed decode path calls this
+      // at the start of every fresh sequence (right where it Reset()s the
+      // session). Stateless samplers inherit the no-op default.
+      procedure Reset(); virtual;
       destructor Destroy(); override;
   end;
 
@@ -584,6 +589,75 @@ type
       constructor Create(TopK: integer);
       function GetToken(Origin: TNNetVolume): integer; override;
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
+  end;
+
+  { TNNetSamplerTypical }
+  // Locally-typical sampling (Meister et al. 2023, "Locally Typical Sampling").
+  // Operates on PROBABILITIES (a post-softmax volume, same convention as
+  // TNNetSamplerTopP / TNNetSamplerMinP). Unlike top-k / top-p (truncate by RANK
+  // or CUMULATIVE MASS), typical sampling truncates by how close each token's
+  // surprise -log p is to the distribution's conditional (Shannon) entropy
+  // H = -sum_t p_t log p_t: it keeps the SMALLEST set of tokens (sorted by
+  // ascending |(-log p) - H|) whose cumulative probability first reaches FMass,
+  // then draws PROPORTIONALLY to the renormalized kept mass. FMass in (0,1];
+  // FMass >= 1 keeps the whole row (full ancestral sampling). The kept set is
+  // the "locally typical" set: tokens that are neither surprisingly likely nor
+  // surprisingly unlikely given the model's own uncertainty.
+  // Coded by Claude (AI).
+  TNNetSamplerTypical = class (TNNetSamplerBase)
+    protected
+      FMass: TNeuralFloat;
+      // Build the typical set from FTokenArr (any order) and draw from it.
+      function SampleTypical(): integer;
+    public
+      constructor Create(Mass: TNeuralFloat);
+      function GetToken(Origin: TNNetVolume): integer; override;
+      function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
+  end;
+
+  // Mirostat version selector for TNNetSamplerMirostat.
+  TNNetMirostatVersion = (mvV1, mvV2);
+
+  { TNNetSamplerMirostat }
+  // Mirostat sampling (Basu et al. 2021, "Mirostat: A Neural Text Decoding
+  // Algorithm that Directly Controls Perplexity"). A STATEFUL sampler: it
+  // carries a running estimate Mu across the generation and, each step, picks a
+  // truncation that drives the OBSERVED surprise -log p(chosen) toward the
+  // target FTau (target surprise / cross-entropy in nats; perplexity = e^tau).
+  // After each draw it updates Mu := Mu - FEta * (observedSurprise - FTau), a
+  // simple feedback controller, so output entropy is held near FTau over time.
+  // Operates on PROBABILITIES (post-softmax volume, same convention as the other
+  // probability samplers). TWO versions:
+  //   mvV1: estimates the Zipf exponent s from the top tokens, computes a
+  //         target truncation size k from (Mu, s, vocab) and samples uniformly-
+  //         then-weighted among the top-k (the original paper's algorithm).
+  //   mvV2: the version-2 simplification - keep every token whose surprise
+  //         -log p <= Mu, draw proportionally from that kept set (no Zipf
+  //         estimate; the common llama.cpp default). FEta and FTau identical.
+  // Mu is initialized to 2*FTau by Reset() (the paper's init) and the streamed
+  // decode path calls Reset() at the start of each fresh sequence.
+  // Coded by Claude (AI).
+  TNNetSamplerMirostat = class (TNNetSamplerBase)
+    protected
+      FTau: TNeuralFloat;        // target surprise (nats)
+      FEta: TNeuralFloat;        // learning rate of the Mu feedback loop
+      FMu: TNeuralFloat;         // running surprise budget (state)
+      FVersion: TNNetMirostatVersion;
+      // Draw on the (descending-sorted) FTokenArr, update FMu from the chosen
+      // token's surprise, return the token id.
+      function SampleAndUpdate(): integer;
+    public
+      // Tau = target surprise in nats (e.g. 3.0). Eta = feedback learning rate
+      // (e.g. 0.1). Version selects v1 / v2 (default v2).
+      constructor Create(Tau: TNeuralFloat; Eta: TNeuralFloat = 0.1;
+        Version: TNNetMirostatVersion = mvV2);
+      // Re-arm the controller (Mu := 2*Tau) for a fresh generation.
+      procedure Reset(); override;
+      function GetToken(Origin: TNNetVolume): integer; override;
+      function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; override;
+      // Read-only state introspection (tests assert Mu converges toward Tau).
+      property Mu: TNeuralFloat read FMu;
+      property Tau: TNeuralFloat read FTau;
   end;
 
   { TNNetTokenHistoryPenalty }
@@ -2405,11 +2479,242 @@ begin
   Result := SampleFromSorted();
 end;
 
+{ TNNetSamplerTypical }
+
+constructor TNNetSamplerTypical.Create(Mass: TNeuralFloat);
+begin
+  inherited Create();
+  FMass := Mass;
+end;
+
+function TNNetSamplerTypical.SampleTypical(): integer;
+var
+  Entropy, P, Surprise, KeptSum, Roll, Cumulative: TNeuralFloat;
+  Dist: array of TNeuralFloat; // |surprise - entropy| per FTokenArr entry
+  Order: array of integer;     // FTokenArr indices sorted by ascending Dist
+  I, J, KeptCount, Tmp, N: integer;
+begin
+  N := Length(FTokenArr);
+  if N = 0 then
+  begin
+    Result := 0; // defensive: empty distribution
+    exit;
+  end;
+  // Conditional (Shannon) entropy of the row, in nats.
+  Entropy := 0;
+  for I := 0 to N - 1 do
+  begin
+    P := FTokenArr[I].Score;
+    if P > 0 then Entropy := Entropy - P * Ln(P);
+  end;
+  // Per-token distance |(-log p) - H|.
+  SetLength(Dist, N);
+  SetLength(Order, N);
+  for I := 0 to N - 1 do
+  begin
+    P := FTokenArr[I].Score;
+    if P > 0 then Surprise := -Ln(P) else Surprise := 1e30; // p=0 => infinite
+    Dist[I] := Abs(Surprise - Entropy);
+    Order[I] := I;
+  end;
+  // Selection sort of Order by ascending Dist (vocab-sized but only run once
+  // per step; mirrors the simple sort style used elsewhere in this unit).
+  for I := 0 to N - 2 do
+    for J := I + 1 to N - 1 do
+      if Dist[Order[J]] < Dist[Order[I]] then
+      begin
+        Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
+      end;
+  // Smallest prefix (by ascending distance) whose cumulative mass reaches FMass.
+  KeptCount := 0;
+  KeptSum := 0;
+  for I := 0 to N - 1 do
+  begin
+    Inc(KeptCount);
+    KeptSum := KeptSum + FTokenArr[Order[I]].Score;
+    if KeptSum >= FMass then Break;
+  end;
+  if (KeptCount = 0) or (KeptSum <= 0) then
+  begin
+    Result := FTokenArr[Order[0]].Token; // fallback: degenerate distribution
+    exit;
+  end;
+  // Weighted draw proportional to the renormalized kept mass.
+  Roll := Random * KeptSum;
+  Cumulative := 0;
+  Result := FTokenArr[Order[KeptCount - 1]].Token; // numeric-safety fallback
+  for I := 0 to KeptCount - 1 do
+  begin
+    Cumulative := Cumulative + FTokenArr[Order[I]].Score;
+    if Roll < Cumulative then
+    begin
+      Result := FTokenArr[Order[I]].Token;
+      exit;
+    end;
+  end;
+end;
+
+function TNNetSamplerTypical.GetToken(Origin: TNNetVolume): integer;
+begin
+  Origin.GetTokenArray(FTokenArr);
+  Result := SampleTypical();
+end;
+
+function TNNetSamplerTypical.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
+  PixelY: integer): integer;
+begin
+  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  Result := SampleTypical();
+end;
+
+{ TNNetSamplerMirostat }
+
+constructor TNNetSamplerMirostat.Create(Tau: TNeuralFloat; Eta: TNeuralFloat;
+  Version: TNNetMirostatVersion);
+begin
+  inherited Create();
+  FTau := Tau;
+  FEta := Eta;
+  FVersion := Version;
+  FMu := 2 * FTau; // paper init; Reset() re-arms it per generation
+end;
+
+procedure TNNetSamplerMirostat.Reset();
+begin
+  FMu := 2 * FTau;
+end;
+
+function TNNetSamplerMirostat.SampleAndUpdate(): integer;
+var
+  KeptSum, Roll, Cumulative, P, Surprise: TNeuralFloat;
+  SumLogP, SumLogRank, SumLogPLogRank, SumLogRankSq, LogRank, LogP: TNeuralFloat;
+  S, Epsilon, KFloat, ChosenScore: TNeuralFloat;
+  I, KeptCount, N, NumFit, K: integer;
+begin
+  N := Length(FTokenArr);
+  if N = 0 then
+  begin
+    Result := 0; // defensive
+    exit;
+  end;
+  // FTokenArr is sorted DESCENDING: [0] is the max probability.
+  if FVersion = mvV2 then
+  begin
+    // v2: keep every token with surprise -log p <= Mu.
+    KeptCount := 0;
+    KeptSum := 0;
+    for I := 0 to N - 1 do
+    begin
+      P := FTokenArr[I].Score;
+      if P <= 0 then Break; // descending: nothing later is larger
+      if -Ln(P) <= FMu then
+      begin
+        Inc(KeptCount);
+        KeptSum := KeptSum + P;
+      end
+      else Break; // surprise grows as p shrinks => monotone in this sorted order
+    end;
+    if KeptCount = 0 then
+    begin
+      KeptCount := 1; // always keep the most-likely token
+      KeptSum := FTokenArr[0].Score;
+    end;
+  end
+  else
+  begin
+    // v1: estimate Zipf exponent s from the head of the distribution, then a
+    // target truncation size k = ((eps * 2^Mu) / (1 - N^(-eps)))^(1/s).
+    NumFit := N;
+    if NumFit > 100 then NumFit := 100; // fit on the head (paper uses ~100)
+    SumLogP := 0; SumLogRank := 0; SumLogPLogRank := 0; SumLogRankSq := 0;
+    K := 0;
+    for I := 0 to NumFit - 2 do
+    begin
+      P := FTokenArr[I].Score;
+      if (P <= 0) or (FTokenArr[I + 1].Score <= 0) then Break;
+      // t_i = log(p_i / p_{i+1}) regressed on log((i+2)/(i+1)) gives s.
+      LogP := Ln(P / FTokenArr[I + 1].Score);
+      LogRank := Ln((I + 2) / (I + 1));
+      SumLogP := SumLogP + LogP;
+      SumLogRank := SumLogRank + LogRank;
+      SumLogPLogRank := SumLogPLogRank + LogP * LogRank;
+      SumLogRankSq := SumLogRankSq + LogRank * LogRank;
+      Inc(K);
+    end;
+    if (K > 0) and (SumLogRankSq > 0) then
+      S := SumLogPLogRank / SumLogRankSq
+    else
+      S := 1.0;
+    if S <= 0 then S := 1.0;
+    Epsilon := S - 1.0;
+    // k from the paper's closed form; clamp into [1, N].
+    if Abs(Epsilon) < 1e-6 then
+      KFloat := Exp(FMu)            // s ~ 1 limit
+    else
+      KFloat := Exp( Ln( (Epsilon * Exp(FMu * Ln(2.0))) /
+                         (1 - Power(N, -Epsilon)) ) / S );
+    if KFloat < 1 then KFloat := 1;
+    KeptCount := Round(KFloat);
+    if KeptCount < 1 then KeptCount := 1;
+    if KeptCount > N then KeptCount := N;
+    KeptSum := 0;
+    for I := 0 to KeptCount - 1 do
+      KeptSum := KeptSum + FTokenArr[I].Score;
+  end;
+
+  if KeptSum <= 0 then
+  begin
+    Result := FTokenArr[0].Token;
+    ChosenScore := FTokenArr[0].Score;
+  end
+  else
+  begin
+    // Weighted draw proportional to the renormalized kept mass.
+    Roll := Random * KeptSum;
+    Cumulative := 0;
+    Result := FTokenArr[KeptCount - 1].Token;        // numeric-safety fallback
+    ChosenScore := FTokenArr[KeptCount - 1].Score;
+    for I := 0 to KeptCount - 1 do
+    begin
+      Cumulative := Cumulative + FTokenArr[I].Score;
+      if Roll < Cumulative then
+      begin
+        Result := FTokenArr[I].Token;
+        ChosenScore := FTokenArr[I].Score;
+        Break;
+      end;
+    end;
+  end;
+  // Feedback update: drive observed surprise toward Tau.
+  if ChosenScore > 0 then Surprise := -Ln(ChosenScore) else Surprise := FMu;
+  FMu := FMu - FEta * (Surprise - FTau);
+end;
+
+function TNNetSamplerMirostat.GetToken(Origin: TNNetVolume): integer;
+begin
+  Origin.GetTokenArray(FTokenArr);
+  SortTokenArray();
+  Result := SampleAndUpdate();
+end;
+
+function TNNetSamplerMirostat.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
+  PixelY: integer): integer;
+begin
+  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  SortTokenArray();
+  Result := SampleAndUpdate();
+end;
+
 { TNNetSamplerBase }
 
 procedure TNNetSamplerBase.SortTokenArray;
 begin
   QuickSortTokenArray(FTokenArr, Low(FTokenArr), High(FTokenArr));
+end;
+
+procedure TNNetSamplerBase.Reset();
+begin
+  // No-op default: stateless samplers have nothing to re-arm.
 end;
 
 destructor TNNetSamplerBase.Destroy;

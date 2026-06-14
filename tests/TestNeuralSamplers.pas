@@ -5,7 +5,7 @@ unit TestNeuralSamplers;
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry, neuralvolume;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralvolume;
 
 type
   TTestNeuralSamplers = class(TTestCase)
@@ -60,6 +60,18 @@ type
     procedure TestWeightedTopKSequenceReproducible;
     procedure TestWeightedTopKNeverDrawsOutsideTopK;
     procedure TestWeightedTopKGetTokenOnPixel;
+
+    // TNNetSamplerTypical (locally-typical sampling) tests
+    procedure TestTypicalKeepsExactlyExpectedSet;
+    procedure TestTypicalExcludesMostLikelyToken;
+    procedure TestTypicalGetTokenOnPixel;
+
+    // TNNetSamplerMirostat tests
+    procedure TestMirostatV2KeepsExactlyExpectedSet;
+    procedure TestMirostatV2NarrowerMuKeepsFewer;
+    procedure TestMirostatResetReArmsMu;
+    procedure TestMirostatV2MuConvergesTowardTau;
+    procedure TestMirostatV1MuStaysBounded;
   end;
 
 implementation
@@ -996,6 +1008,295 @@ begin
       Token := Sampler.GetTokenOnPixel(V, 2, 1);
       AssertEquals('K=1 weighted top-k on pixel (2,1) must return token 7',
         7, Token);
+    end;
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTypicalKeepsExactlyExpectedSet;
+var
+  Sampler: TNNetSamplerTypical;
+  V: TNNetVolume;
+  Token, I: integer;
+  Seen: array[0..4] of boolean;
+begin
+  // probs = [0.4, 0.3, 0.2, 0.07, 0.03]; H = 1.3409 nats. Ordered by ascending
+  // |(-log p) - H| the head is tok1, tok2, tok0 (NOT rank order: the most-likely
+  // tok0 is NOT first). For Mass = 0.9 the cumulative mass reaches 0.9 exactly at
+  // {1, 2, 0}, so the typical set is {0, 1, 2}; tokens 3 and 4 must NEVER be
+  // drawn. This is a truncation by surprise-distance, not by rank/cumulative
+  // mass, which is what makes typical sampling distinct.
+  RandSeed := 20260614;
+  Sampler := TNNetSamplerTypical.Create(0.9);
+  V := TNNetVolume.Create(5, 1, 1);
+  try
+    V.Raw[0] := 0.4;
+    V.Raw[1] := 0.3;
+    V.Raw[2] := 0.2;
+    V.Raw[3] := 0.07;
+    V.Raw[4] := 0.03;
+    for I := 0 to 4 do Seen[I] := false;
+    for I := 1 to 400 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('typical(0.9) must only draw from {0,1,2}, got ' +
+        IntToStr(Token), (Token >= 0) and (Token <= 2));
+      Seen[Token] := true;
+    end;
+    AssertTrue('typical token 0 drawn', Seen[0]);
+    AssertTrue('typical token 1 drawn', Seen[1]);
+    AssertTrue('typical token 2 drawn', Seen[2]);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTypicalExcludesMostLikelyToken;
+var
+  Sampler: TNNetSamplerTypical;
+  V: TNNetVolume;
+  Token, I: integer;
+begin
+  // Same row, but Mass = 0.5. The cumulative mass of the surprise-sorted head
+  // reaches 0.5 at {tok1 (0.3), tok2 (0.2)} = exactly {1, 2}. The MOST-LIKELY
+  // token 0 is EXCLUDED (its surprise 0.916 is too far below H = 1.341). No
+  // rank/cumulative-mass sampler would ever drop the argmax while keeping
+  // lower-probability tokens - this is the signature of typical sampling.
+  RandSeed := 20260614;
+  Sampler := TNNetSamplerTypical.Create(0.5);
+  V := TNNetVolume.Create(5, 1, 1);
+  try
+    V.Raw[0] := 0.4;
+    V.Raw[1] := 0.3;
+    V.Raw[2] := 0.2;
+    V.Raw[3] := 0.07;
+    V.Raw[4] := 0.03;
+    for I := 1 to 400 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('typical(0.5) must draw only from {1,2}, got ' +
+        IntToStr(Token), (Token = 1) or (Token = 2));
+    end;
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTypicalGetTokenOnPixel;
+var
+  Sampler: TNNetSamplerTypical;
+  V: TNNetVolume;
+  Token, I: integer;
+begin
+  // Pixel-addressed variant. A spiked, near-deterministic row (one token holds
+  // almost all mass) has tiny entropy, so the typical set collapses to that
+  // dominant token: the draw is effectively deterministic.
+  RandSeed := 20260614;
+  Sampler := TNNetSamplerTypical.Create(0.9);
+  V := TNNetVolume.Create(4, 4, 10);
+  try
+    V.Fill(0.001);
+    V[2, 1, 7] := 0.991;
+    for I := 1 to 30 do
+    begin
+      Token := Sampler.GetTokenOnPixel(V, 2, 1);
+      AssertEquals('typical on spiked pixel (2,1) must return token 7',
+        7, Token);
+    end;
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMirostatV2KeepsExactlyExpectedSet;
+var
+  Sampler: TNNetSamplerMirostat;
+  V: TNNetVolume;
+  Token, I: integer;
+  Seen: array[0..4] of boolean;
+begin
+  // v2 keeps every token with surprise -log p <= Mu. A fresh sampler has
+  // Mu = 2*Tau. probs = [0.5, 0.25, 0.15, 0.07, 0.03] -> surprises
+  // [0.693, 1.386, 1.897, 2.659, 3.507]. Tau = 1.1 -> Mu = 2.2 keeps exactly
+  // {0, 1, 2} (surprise <= 2.2); tokens 3 and 4 are above Mu. We assert ONLY on
+  // the first draw set per fresh-reset so the feedback update cannot move Mu
+  // out from under the documented cut.
+  RandSeed := 20260614;
+  for I := 0 to 4 do Seen[I] := false;
+  V := TNNetVolume.Create(5, 1, 1);
+  try
+    V.Raw[0] := 0.5;
+    V.Raw[1] := 0.25;
+    V.Raw[2] := 0.15;
+    V.Raw[3] := 0.07;
+    V.Raw[4] := 0.03;
+    for I := 1 to 400 do
+    begin
+      Sampler := TNNetSamplerMirostat.Create(1.1, 0.1, mvV2);
+      try
+        Token := Sampler.GetToken(V);  // first step: Mu = 2.2 exactly
+      finally
+        Sampler.Free;
+      end;
+      AssertTrue('Mirostat v2 (Mu=2.2) first draw must be in {0,1,2}, got ' +
+        IntToStr(Token), (Token >= 0) and (Token <= 2));
+      Seen[Token] := true;
+    end;
+    AssertTrue('Mirostat v2 kept token 0', Seen[0]);
+    AssertTrue('Mirostat v2 kept token 1', Seen[1]);
+    AssertTrue('Mirostat v2 kept token 2', Seen[2]);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMirostatV2NarrowerMuKeepsFewer;
+var
+  Sampler: TNNetSamplerMirostat;
+  V: TNNetVolume;
+  Token, I: integer;
+begin
+  // Same row; Tau = 0.8 -> Mu = 1.6 keeps only {0, 1} (surprises 0.693, 1.386
+  // <= 1.6; token 2's 1.897 > 1.6). A smaller Tau truncates harder.
+  RandSeed := 20260614;
+  V := TNNetVolume.Create(5, 1, 1);
+  try
+    V.Raw[0] := 0.5;
+    V.Raw[1] := 0.25;
+    V.Raw[2] := 0.15;
+    V.Raw[3] := 0.07;
+    V.Raw[4] := 0.03;
+    for I := 1 to 400 do
+    begin
+      Sampler := TNNetSamplerMirostat.Create(0.8, 0.1, mvV2);
+      try
+        Token := Sampler.GetToken(V);
+      finally
+        Sampler.Free;
+      end;
+      AssertTrue('Mirostat v2 (Mu=1.6) first draw must be in {0,1}, got ' +
+        IntToStr(Token), (Token = 0) or (Token = 1));
+    end;
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMirostatResetReArmsMu;
+var
+  Sampler: TNNetSamplerMirostat;
+  V: TNNetVolume;
+  I: integer;
+begin
+  // Mirostat is STATEFUL: Mu drifts as tokens are drawn. Reset() must re-arm it
+  // to 2*Tau (the paper's init), restoring the start-of-generation state.
+  RandSeed := 20260614;
+  Sampler := TNNetSamplerMirostat.Create(3.0, 0.1, mvV2);
+  V := TNNetVolume.Create(8, 1, 1);
+  try
+    AssertEquals('fresh Mirostat Mu must be 2*Tau', 6.0, Sampler.Mu, 0.0001);
+    V.Fill(0.1);
+    V.Raw[0] := 0.3;
+    // Draw a bunch so Mu drifts away from 6.0.
+    for I := 1 to 30 do Sampler.GetToken(V);
+    AssertTrue('Mu must have drifted from its init after drawing',
+      Abs(Sampler.Mu - 6.0) > 0.001);
+    Sampler.Reset();
+    AssertEquals('Reset must re-arm Mu to 2*Tau', 6.0, Sampler.Mu, 0.0001);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMirostatV2MuConvergesTowardTau;
+var
+  Sampler: TNNetSamplerMirostat;
+  V: TNNetVolume;
+  Token, I, J, V_SIZE: integer;
+  Raw, Sum, AvgSurprise, SumSurprise, P: TNeuralFloat;
+  NTail: integer;
+begin
+  // The Mirostat guarantee: on a synthetic stream with a RANGE of surprises the
+  // feedback loop drives the OBSERVED surprise (and thus output entropy) toward
+  // Tau. We stream a fresh power-law-ish row each step (mild per-step noise),
+  // run the controller, and assert the running-average observed surprise over
+  // the converged tail sits near Tau. Mu must also stay BOUNDED (not diverge).
+  RandSeed := 20260614;
+  V_SIZE := 80;
+  Sampler := TNNetSamplerMirostat.Create(3.0, 0.1, mvV2);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    Sampler.Reset();
+    SumSurprise := 0;
+    NTail := 0;
+    for I := 1 to 800 do
+    begin
+      // Power-law p_j ~ 1/(j+1)^1.1 with small noise, renormalized.
+      Sum := 0;
+      for J := 0 to V_SIZE - 1 do
+      begin
+        Raw := (1.0 / Power(J + 1, 1.1)) * (1.0 + 0.05 * Random);
+        V.Raw[J] := Raw;
+        Sum := Sum + Raw;
+      end;
+      for J := 0 to V_SIZE - 1 do V.Raw[J] := V.Raw[J] / Sum;
+      Token := Sampler.GetToken(V);
+      // Accumulate observed surprise over the converged tail (last 300 steps).
+      if I > 500 then
+      begin
+        P := V.Raw[Token];
+        if P > 0 then SumSurprise := SumSurprise - Ln(P);
+        Inc(NTail);
+        AssertTrue('Mu must stay bounded (no divergence)',
+          (Sampler.Mu > -50) and (Sampler.Mu < 50));
+      end;
+    end;
+    AvgSurprise := SumSurprise / NTail;
+    // Observed surprise must converge near Tau = 3.0 (the controller's target).
+    AssertEquals('average observed surprise must converge toward Tau',
+      3.0, AvgSurprise, 0.6);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMirostatV1MuStaysBounded;
+var
+  Sampler: TNNetSamplerMirostat;
+  V: TNNetVolume;
+  Token, I, J, V_SIZE: integer;
+  Raw, Sum: TNeuralFloat;
+begin
+  // v1 (Zipf-estimate truncation) on the same power-law stream must also remain
+  // a well-behaved controller: Mu stays bounded and every draw is a valid token.
+  RandSeed := 20260614;
+  V_SIZE := 80;
+  Sampler := TNNetSamplerMirostat.Create(3.0, 0.1, mvV1);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    Sampler.Reset();
+    for I := 1 to 600 do
+    begin
+      Sum := 0;
+      for J := 0 to V_SIZE - 1 do
+      begin
+        Raw := (1.0 / Power(J + 1, 1.1)) * (1.0 + 0.05 * Random);
+        V.Raw[J] := Raw;
+        Sum := Sum + Raw;
+      end;
+      for J := 0 to V_SIZE - 1 do V.Raw[J] := V.Raw[J] / Sum;
+      Token := Sampler.GetToken(V);
+      AssertTrue('v1 draw must be a valid token',
+        (Token >= 0) and (Token < V_SIZE));
+      AssertTrue('v1 Mu must stay bounded',
+        (Sampler.Mu > -100) and (Sampler.Mu < 100));
     end;
   finally
     V.Free;

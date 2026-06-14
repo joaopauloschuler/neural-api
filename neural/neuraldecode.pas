@@ -4662,7 +4662,9 @@ begin
     InV.Fill(0);
     Session.Reset();
     // A fresh sequence for the whole pipeline: penalties clear their history
-    // and register the prompt, stateful grammars rewind (see the adapters).
+    // and register the prompt, stateful grammars rewind (see the adapters), and
+    // STATEFUL samplers (e.g. TNNetSamplerMirostat) re-arm their running state.
+    if Assigned(Sampler) then Sampler.Reset();
     if Assigned(Processors) then
       Processors.Reset(Copy(Tokens, 0, PromptLen));
     // Prefill tokens 0..PromptLen-2 one at a time; the LAST prompt token is

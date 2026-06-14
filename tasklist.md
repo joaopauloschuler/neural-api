@@ -639,7 +639,7 @@ rather than acted on.
       the WhisperTranscribe audio-loading path; edit examples/README.md not the
       main README). Opens HuBERT (identical CTC head, same importer with a flag)
       and later wav2vec2 pretraining.
-- [ ] Sampler zoo expansion (only greedy/top-k/top-p/min-p/weighted-top-k exist):
+- [X] Sampler zoo expansion (only greedy/top-k/top-p/min-p/weighted-top-k exist):
       add the genuinely-distinct truncation algorithms that the existing samplers
       do NOT cover — (a) `TNNetSamplerMirostat` (Mirostat v1 AND v2, the
       perplexity/surprise feedback controller that adapts the truncation each step
