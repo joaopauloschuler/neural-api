@@ -96,23 +96,10 @@ rather than acted on.
 ## Infrastructure / dev experience
 
 - [ ] Gradient checkpointing for training deeper nets in less memory
-- [X] GGUF model import beyond Llama — `BuildFromGGUF` architecture dispatch.
-      LANDED (commit a14e003): `BuildFromGGUF`/`BuildFromGGUFEx` in neuralpretrained.pas
-      read `general.architecture` and dispatch. `llama` + `qwen2` wired AND verified
-      (qwen2 GGUF write->read round-trip < 1e-4, TestBuildFromGGUFQwen2RoundTrip;
-      the writer now emits arch="qwen2" + q/k/v biases when Config.QKVBias set, giving
-      a parity oracle; reader RegisterRowDeinterleave handles 1-D bias rows). `gemma2`
-      dispatch + config flags (gated-GELU, 1+w RMSNorm, sqrt(d) embed scale, sandwich
-      norms, 1:1 local/global window, query_pre_attn_scalar, attn/final soft-caps,
-      NEOX rope no-permute) wired but OFFLINE-UNVERIFIED (writer emits no Gemma deltas
-      -> no round-trip oracle; flagged PENDING-a-fixture in-code). Unknown archs raise
-      a clear error. Remaining OPEN follow-ups:
-  - [X] Gemma-2 GGUF parity fixture: LANDED (commit f87bdba). SaveLlamaToGGUFEx now
-        emits gemma2 deltas (arch="gemma2", four sandwich norms, unpermuted NEOX q/k,
-        sliding_window/query_pre_attn_scalar/attn+final softcapping, GQA, tied head);
-        TestBuildFromGGUFGemma2RoundTrip asserts write->read logits at max |diff| = 0.0
-        (< 1e-4). 1959 tests pass. Open: F16/Q8_0 gemma2 export-drift test (mirror
-        TestGGUFLlamaQ8AndF16ImportDrift); cross-tool llama.cpp gemma2 GGUF parity.
+- [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
+      arch dispatch with llama/qwen2/gemma2 LANDED & verified):
+  - [ ] F16/Q8_0 gemma2 export-drift test (mirror TestGGUFLlamaQ8AndF16ImportDrift);
+        cross-tool llama.cpp gemma2 GGUF parity.
   - [ ] starcoder2 GGUF (out of scope for v1): needs LayerNorm-not-RMSNorm + full
         per-projection biases + non-gated GELU on the GGUF import path.
   - [ ] Extend dispatch to more Llama-backbone GGUF archs (phi3, qwen3, gemma3,
@@ -545,43 +532,16 @@ rather than acted on.
       at 1M-33M params the comparison runs against FULL checkpoints
       instead of sliced fixtures, the only importer family where that is
       true.
-- [X] RWKV-4 decode-side demo: flat-memory recurrent decoding vs a
-      transformer of equal size (constant-memory headline of the landed
-      BuildRWKVFromSafeTensors importer; needs an incremental TNNetWKV
-      state-carry path). LANDED (commit 62165c1): TNNetWKV gains an O(1)-per-step
-      incremental decode API (BeginIncrementalDecode/ComputeIncremental/ResetState/
-      ResetCache/EndIncrementalDecode + CaptureState/RestoreState for session
-      forking), mirroring TNNetDiagonalSSM. Token-by-token decode is BIT-EXACT vs
-      full-scan (err 0.0, TestWKVIncrementalDecodeEquivalence). examples/RWKVDecode
-      demos exact equivalence + flat per-step timing/memory (3*C-float carried state)
-      across positions 64->448. 1957 tests pass. OPEN follow-ups:
+- [ ] RWKV/recurrent decode follow-ups (O(1) incremental decode for TNNetWKV +
+      TNNetTokenShift + net-wide TNNet.BeginIncrementalDecode driver over
+      TokenShift/WKV/SelectiveSSM/DiagonalSSM LANDED, commits 62165c1/cc1bfcb):
   - [ ] TNNetCrossWKV incremental path (two-source + asymmetric modes + receptance
         gate — non-trivial, deferred).
-  - [X] Block-level token-by-token decode through AddRWKVTimeMix (needs TNNetTokenShift
-        to carry its one-token shift state). LANDED: TNNetTokenShift gains the same
-        O(1)-per-step incremental API as TNNetWKV (BeginIncrementalDecode/
-        ComputeIncremental/ResetState/ResetCache/EndIncrementalDecode +
-        CaptureState/RestoreState; carried state = one Depth-long prev-token buffer,
-        bit-exact vs full-scan). New net-wide driver TNNet.BeginIncrementalDecode/
-        ResetIncrementalDecode/EndIncrementalDecode broadcasts the decode mode to every
-        zero-arg recurrent leaf (TokenShift+WKV+SelectiveSSM+DiagonalSSM), so a full
-        AddRWKVBlock decodes token-by-token with all stateful layers in lockstep.
-        Tests TestTokenShiftIncrementalDecodeEquivalence + TestRWKVBlockIncrementalDecode
-        Equivalence (both max abs err 0.0), examples/RWKVGenerate. FOLLOW-UP: wire this
-        net-wide recurrent driver INTO TNNetStreamingDecoder so GenerateTokens* drives
-        TokenShift/WKV/SSM uniformly alongside the SDPA KV-cache (decoder currently
-        only collects SDPA + TNNetDiagonalSSM, not TokenShift/WKV/SelectiveSSM).
-- [X] Mamba decode-side demo: tokens/sec flat in context length where a
-      transformer of equal size slows (constant-memory headline of the
-      landed BuildMambaFromSafeTensors importer; needs an incremental
-      TNNetSelectiveSSM state-carry path, the sibling of the RWKV-4
-      decode demo task above). LANDED (commit 27ba256): TNNetSelectiveSSM gains the
-      same O(1)-per-step incremental API as TNNetWKV (BeginIncrementalDecode/
-      ComputeIncremental/ResetState/ResetCache/EndIncrementalDecode + CaptureState/
-      RestoreState). Bit-exact vs full-scan (err 0.0) for DState=1, DState=4, AND a
-      fork round-trip (TestSelectiveSSMIncrementalDecodeEquivalence). examples/MambaDecode
-      demos exact equivalence + flat per-step timing across start_pos 64->60064.
-      1958 tests pass. OPEN follow-up:
+  - [ ] Wire the net-wide recurrent driver INTO TNNetStreamingDecoder so GenerateTokens*
+        drives TokenShift/WKV/SSM uniformly alongside the SDPA KV-cache (decoder
+        currently only collects SDPA + TNNetDiagonalSSM, not TokenShift/WKV/SelectiveSSM).
+- [ ] Mamba decode follow-up (O(1) incremental TNNetSelectiveSSM state-carry decode
+      LANDED, commit 27ba256):
   - [ ] Full Mamba-BLOCK token-by-token decode: causal DepthwiseConv1D must carry
         its (kernel-1)-token ring buffer + in/out projections driven one token at a
         time, then wire into TNNetStreamingDecoder (mirrors the RWKV TokenShift
