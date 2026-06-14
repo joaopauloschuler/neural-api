@@ -1855,6 +1855,70 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// Connectionist Temporal Classification (CTC) loss output head — the
+  // alignment-free sequence loss (Graves et al. 2006) used for speech / OCR /
+  // handwriting where the input frame count T is much larger than, and not
+  // aligned to, the target label length L.
+  //
+  // INPUT LAYOUT: per-frame LOG-probabilities over the vocabulary, packed as a
+  // volume of shape (SizeX = T frames, SizeY = 1, Depth = vocab). Like
+  // TNNetNLLLoss this head is the companion of TNNetLogSoftMax: stack
+  //   ... -> TNNetLogSoftMax -> TNNetCTCLoss
+  // so the input is already in log-space and this head's -occupancy gradient,
+  // composed with LogSoftMax's backward, yields the textbook CTC logit gradient
+  //   dL/d(logit_{t,k}) = y_{t,k} - gamma_{t,k}
+  // where y = softmax(logits) and gamma_{t,k} = sum over label positions whose
+  // symbol is k of the forward-backward posterior occupancy.
+  //
+  // BLANK label: index stored in FStruct[0]. The default (-1) means "last
+  // vocabulary index" (vocab-1), the convention HF/CTC ASR heads use; pass an
+  // explicit index to Create(Blank) otherwise.
+  //
+  // TARGET (label sequence): CTC targets are VARIABLE-LENGTH integer label
+  // sequences, which do not fit the framework's fixed-shape (output - target)
+  // seeding directly. They are therefore encoded into the SAME-SHAPE target
+  // volume the framework subtracts, in frame 0 only:
+  //   target[0,0,0]     = L            (number of labels, an integer >= 0)
+  //   target[0,0,1+i]   = label_i      (i = 0 .. L-1, an integer in [0,vocab))
+  // all other entries 0. Build it with the class method EncodeTarget (and read
+  // it back with DecodeTarget). Because the framework seeds
+  //   FOutputError := FOutput - target,
+  // Backpropagate recovers the labels as (FOutput - FOutputError) at frame 0,
+  // runs the log-space forward-backward over the blank-interleaved extended
+  // label sequence l' = (blank, l_0, blank, l_1, ..., l_{L-1}, blank), and
+  // OVERWRITES every FOutputError element with the +gradient w.r.t. the input
+  // log-prob: dL/d(logy_{t,k}) = -gamma_{t,k} (negated occupancy, exactly the
+  // -target convention of TNNetNLLLoss). The whole lattice is computed in
+  // log-space with a numerically-stable log-sum-exp, so very long sequences do
+  // not underflow. When L = 0, or when L*2+1 > T makes the target unalignable,
+  // the gradient is left at zero for that sample (the loss is +inf / undefined).
+  //
+  // The scalar CTC loss itself (-log p(l|x)) is exposed by the class method
+  // ForwardBackwardLogLoss for diagnostics / the numerical-gradient test.
+  // No trainable parameters; output shape equals input shape.
+  // Coded by Claude (AI).
+  TNNetCTCLoss = class(TNNetIdentity)
+  public
+    constructor Create(); overload; override;
+    constructor Create(Blank: integer); overload;
+    procedure Backpropagate(); override;
+    // Returns the configured blank index resolved against the input depth
+    // (i.e. vocab-1 when the stored FStruct[0] sentinel is -1).
+    function BlankIndex(): integer;
+    // Builds the (T,1,Vocab) target volume encoding label sequence Labels for
+    // the CTC backward (see the layout above). T and Vocab must match the head.
+    class procedure EncodeTarget(ATarget: TNNetVolume; const Labels: array of integer;
+      T, Vocab: integer);
+    // Recovers the label sequence encoded by EncodeTarget from a target volume.
+    class procedure DecodeTarget(ATarget: TNNetVolume; out Labels: TNeuralIntegerArray);
+    // Stand-alone log-space forward-backward. ALogProbs is (T,1,Vocab) per-frame
+    // LOG-probabilities; returns the CTC loss -log p(Labels|ALogProbs) and, when
+    // AGrad <> nil, fills it (same shape) with dL/d(logp) = -gamma_{t,k}. Returns
+    // a large positive sentinel (and zero grad) when the target is unalignable.
+    class function ForwardBackwardLogLoss(ALogProbs: TNNetVolume;
+      const Labels: array of integer; Blank: integer; AGrad: TNNetVolume): TNeuralFloat;
+  end;
+
   /// Kullback-Leibler divergence loss output layer.
   // Operates on probability-space inputs: the layer's input q is the model's
   // predicted distribution (e.g. the output of a SoftMax) and the supplied
@@ -19474,6 +19538,211 @@ begin
     Target := LogP - Seeded;
     FOutputError.FData[Idx] := -Target;
   end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetCTCLoss }
+
+constructor TNNetCTCLoss.Create();
+begin
+  Create(-1);
+end;
+
+constructor TNNetCTCLoss.Create(Blank: integer);
+begin
+  inherited Create();
+  // -1 is the sentinel meaning "last vocabulary index" (resolved at runtime).
+  FStruct[0] := Blank;
+end;
+
+function TNNetCTCLoss.BlankIndex(): integer;
+begin
+  Result := FStruct[0];
+  if Result < 0 then Result := FOutput.Depth - 1;
+end;
+
+class procedure TNNetCTCLoss.EncodeTarget(ATarget: TNNetVolume;
+  const Labels: array of integer; T, Vocab: integer);
+var
+  L, i: integer;
+begin
+  L := Length(Labels);
+  ATarget.ReSize(T, 1, Vocab);
+  ATarget.Fill(0);
+  // Frame 0 carries L then the labels. There must be room for L+1 entries.
+  if (L + 1) > Vocab then
+    raise Exception.Create('TNNetCTCLoss.EncodeTarget: vocab too small to hold label header.');
+  ATarget[0, 0, 0] := L;
+  for i := 0 to L - 1 do
+    ATarget[0, 0, 1 + i] := Labels[i];
+end;
+
+class procedure TNNetCTCLoss.DecodeTarget(ATarget: TNNetVolume;
+  out Labels: TNeuralIntegerArray);
+var
+  L, i: integer;
+begin
+  L := Round(ATarget[0, 0, 0]);
+  if L < 0 then L := 0;
+  SetLength(Labels, L);
+  for i := 0 to L - 1 do
+    Labels[i] := Round(ATarget[0, 0, 1 + i]);
+end;
+
+class function TNNetCTCLoss.ForwardBackwardLogLoss(ALogProbs: TNNetVolume;
+  const Labels: array of integer; Blank: integer; AGrad: TNNetVolume): TNeuralFloat;
+const
+  cCTCUnalignable = 1e30; // returned when L*2+1 > T (target cannot be aligned)
+  cNegInf = -1e30;
+var
+  NT, Vocab, L, NS, ti, si, i, k: integer;
+  Ext: array of integer;          // extended label l' (blank-interleaved), length NS
+  Alpha, Beta: array of array of double; // [ti][si] log-space lattice
+  LogLike, av, bv, occ, lse: double;
+  Gamma: array of array of double; // [ti][si] = exp(alpha+beta-LogLike)
+  function LP(tt, kk: integer): double; inline;
+  begin
+    Result := ALogProbs[tt, 0, kk];
+  end;
+  function LogAdd(x, y: double): double; inline;
+  begin
+    if x <= cNegInf then Result := y
+    else if y <= cNegInf then Result := x
+    else if x > y then Result := x + Ln(1 + Exp(y - x))
+    else Result := y + Ln(1 + Exp(x - y));
+  end;
+begin
+  NT := ALogProbs.SizeX;
+  Vocab := ALogProbs.Depth;
+  L := Length(Labels);
+  if Assigned(AGrad) then
+  begin
+    AGrad.ReSize(ALogProbs);
+    AGrad.Fill(0);
+  end;
+  // Build extended label sequence: blank l_0 blank l_1 ... l_{L-1} blank.
+  NS := 2 * L + 1;
+  if NS > NT then
+  begin
+    Result := cCTCUnalignable;
+    Exit;
+  end;
+  SetLength(Ext, NS);
+  for i := 0 to L - 1 do
+  begin
+    Ext[2 * i] := Blank;
+    Ext[2 * i + 1] := Labels[i];
+  end;
+  Ext[NS - 1] := Blank;
+
+  SetLength(Alpha, NT, NS);
+  SetLength(Beta, NT, NS);
+  for ti := 0 to NT - 1 do
+    for si := 0 to NS - 1 do
+    begin
+      Alpha[ti][si] := cNegInf;
+      Beta[ti][si] := cNegInf;
+    end;
+
+  // Forward (alpha). Init: at ti=0 only the first blank or first label.
+  Alpha[0][0] := LP(0, Ext[0]);
+  if NS > 1 then Alpha[0][1] := LP(0, Ext[1]);
+  for ti := 1 to NT - 1 do
+    for si := 0 to NS - 1 do
+    begin
+      av := Alpha[ti - 1][si];
+      if si >= 1 then av := LogAdd(av, Alpha[ti - 1][si - 1]);
+      // Skip transition allowed only between two DISTINCT non-blank labels.
+      if (si >= 2) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si - 2]) then
+        av := LogAdd(av, Alpha[ti - 1][si - 2]);
+      Alpha[ti][si] := av + LP(ti, Ext[si]);
+    end;
+
+  // Backward (beta). Init: at ti=NT-1 only the last blank or last label.
+  Beta[NT - 1][NS - 1] := 0;
+  if NS > 1 then Beta[NT - 1][NS - 2] := 0;
+  for ti := NT - 2 downto 0 do
+    for si := NS - 1 downto 0 do
+    begin
+      bv := Beta[ti + 1][si] + LP(ti + 1, Ext[si]);
+      if si + 1 <= NS - 1 then
+        bv := LogAdd(bv, Beta[ti + 1][si + 1] + LP(ti + 1, Ext[si + 1]));
+      if (si + 2 <= NS - 1) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si + 2]) then
+        bv := LogAdd(bv, Beta[ti + 1][si + 2] + LP(ti + 1, Ext[si + 2]));
+      Beta[ti][si] := bv;
+    end;
+
+  // Total log-likelihood = LogAdd of the two valid end states (last blank and
+  // last label) at ti=NT-1 via alpha.
+  LogLike := Alpha[NT - 1][NS - 1];
+  if NS > 1 then LogLike := LogAdd(LogLike, Alpha[NT - 1][NS - 2]);
+
+  Result := -LogLike;
+
+  if not Assigned(AGrad) then Exit;
+  if LogLike <= cNegInf then Exit; // degenerate, leave grad at zero
+
+  // Posterior occupancy gamma[ti][si] = exp(alpha+beta-LogLike); per symbol k,
+  // dL/d(logp_{ti,k}) = -sum_{si: Ext[si]=k} gamma[ti][si].
+  SetLength(Gamma, NT, NS);
+  for ti := 0 to NT - 1 do
+    for si := 0 to NS - 1 do
+    begin
+      occ := Alpha[ti][si] + Beta[ti][si] - LogLike;
+      if occ <= cNegInf then Gamma[ti][si] := 0
+      else Gamma[ti][si] := Exp(occ);
+    end;
+
+  for ti := 0 to NT - 1 do
+    for k := 0 to Vocab - 1 do
+    begin
+      lse := 0;
+      for si := 0 to NS - 1 do
+        if Ext[si] = k then lse := lse + Gamma[ti][si];
+      AGrad[ti, 0, k] := -lse;
+    end;
+end;
+
+procedure TNNetCTCLoss.Backpropagate();
+var
+  StartTime: double;
+  Labels: TNeuralIntegerArray;
+  Target, Grad: TNNetVolume;
+  Idx, SizeM1: integer;
+  LogP, Seeded: TNeuralFloat;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  // Recover the target volume (target = output - seeded error), then the labels
+  // from its frame-0 header.
+  Target := TNNetVolume.Create(FOutput);
+  try
+    SizeM1 := FOutputError.Size - 1;
+    for Idx := 0 to SizeM1 do
+    begin
+      LogP := FOutput.FData[Idx];
+      Seeded := FOutputError.FData[Idx];
+      Target.FData[Idx] := LogP - Seeded;
+    end;
+    TNNetCTCLoss.DecodeTarget(Target, Labels);
+  finally
+    Target.Free;
+  end;
+
+  // Run the log-space forward-backward and write -gamma into FOutputError.
+  Grad := TNNetVolume.Create(FOutput);
+  try
+    TNNetCTCLoss.ForwardBackwardLogLoss(FOutput, Labels, BlankIndex(), Grad);
+    SizeM1 := FOutputError.Size - 1;
+    for Idx := 0 to SizeM1 do
+      FOutputError.FData[Idx] := Grad.FData[Idx];
+  finally
+    Grad.Free;
+  end;
+
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
 end;
@@ -87041,6 +87310,7 @@ begin
       'TNNetMultiQuantileLoss' :    Result := BuildMultiQuantileLoss(St[0], Ft);
       'TNNetFocalLoss' :            Result := TNNetFocalLoss.Create(Ft[0], Ft[1]);
       'TNNetNLLLoss' :              Result := TNNetNLLLoss.Create();
+      'TNNetCTCLoss' :              Result := TNNetCTCLoss.Create(St[0]);
       'TNNetKLDivergence' :         Result := TNNetKLDivergence.Create();
       'TNNetPonderCostLoss' :       Result := TNNetPonderCostLoss.Create(Ft[0]);
       'TNNetTverskyLoss' :          Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]);
@@ -87432,6 +87702,7 @@ begin
       if S[0] = 'TNNetMultiQuantileLoss' then Result := BuildMultiQuantileLoss(St[0], Ft) else
       if S[0] = 'TNNetFocalLoss' then Result := TNNetFocalLoss.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetNLLLoss' then Result := TNNetNLLLoss.Create() else
+      if S[0] = 'TNNetCTCLoss' then Result := TNNetCTCLoss.Create(St[0]) else
       if S[0] = 'TNNetKLDivergence' then Result := TNNetKLDivergence.Create() else
       if S[0] = 'TNNetPonderCostLoss' then Result := TNNetPonderCostLoss.Create(Ft[0]) else
       if S[0] = 'TNNetTverskyLoss' then Result := TNNetTverskyLoss.Create(Ft[0], Ft[1], Ft[2]) else

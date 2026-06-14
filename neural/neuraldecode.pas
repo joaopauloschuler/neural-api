@@ -1485,6 +1485,26 @@ function DecodePromptLookup(NN: TNNet; const Prompt: string;
   const StopStrings: array of string): TNNetDecodeResult;
 
 // ---------------------------------------------------------------------------
+// CTC DECODE: turn a (T,1,vocab) per-frame score volume (logits, log-probs or
+// probabilities - argmax/beam ranking is invariant to a monotone transform of
+// the score, and the beam search below works in either log- or probability-
+// space) into a label sequence, applying the CTC collapse rule (merge adjacent
+// repeats, then drop blanks). The blank index defaults to vocab-1 (Blank < 0),
+// matching TNNetCTCLoss.
+//
+// DecodeCTCGreedy: argmax per frame, then collapse repeats and drop blank -
+// the O(T*vocab) best-path approximation (exact when one alignment dominates).
+//
+// DecodeCTCBeamSearch: prefix beam search (Graves & Jaitly 2014 / Hannun 2017)
+// that sums the probability mass of all alignments collapsing to the same
+// prefix; BeamWidth prefixes are kept per frame. The input is treated as
+// LOG-probabilities when LogInput is true, else probabilities. More accurate
+// than greedy when several alignments compete; returns the single best prefix.
+function DecodeCTCGreedy(Scores: TNNetVolume; Blank: integer = -1): TNeuralIntegerArray;
+function DecodeCTCBeamSearch(Scores: TNNetVolume; BeamWidth: integer;
+  Blank: integer = -1; LogInput: boolean = true): TNeuralIntegerArray;
+
+// ---------------------------------------------------------------------------
 // STREAMED GENERATION: the KV-cache / SSM-state counterpart of neuraldatasets'
 // GenerateStringFromCasualNN, driven by a TNNetStreamingDecoder session.
 //
@@ -1957,6 +1977,198 @@ uses
 // Forward declarations for helpers used before their definition.
 function ContrastiveHiddenLayer(NN: TNNet): TNNetLayer; forward;
 function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat; forward;
+
+function DecodeCTCGreedy(Scores: TNNetVolume; Blank: integer): TNeuralIntegerArray;
+var
+  NumT, Vocab, ti, k, ArgMax, Prev, Count: integer;
+  Best, V: TNeuralFloat;
+  Path: TNeuralIntegerArray;
+begin
+  NumT := Scores.SizeX;
+  Vocab := Scores.Depth;
+  if Blank < 0 then Blank := Vocab - 1;
+  SetLength(Path, NumT);
+  // Argmax per frame.
+  for ti := 0 to NumT - 1 do
+  begin
+    ArgMax := 0;
+    Best := Scores[ti, 0, 0];
+    for k := 1 to Vocab - 1 do
+    begin
+      V := Scores[ti, 0, k];
+      if V > Best then
+      begin
+        Best := V;
+        ArgMax := k;
+      end;
+    end;
+    Path[ti] := ArgMax;
+  end;
+  // Collapse adjacent repeats, then drop blanks.
+  SetLength(Result, NumT);
+  Count := 0;
+  Prev := -1;
+  for ti := 0 to NumT - 1 do
+  begin
+    if (Path[ti] <> Prev) and (Path[ti] <> Blank) then
+    begin
+      Result[Count] := Path[ti];
+      Inc(Count);
+    end;
+    Prev := Path[ti];
+  end;
+  SetLength(Result, Count);
+end;
+
+function DecodeCTCBeamSearch(Scores: TNNetVolume; BeamWidth: integer;
+  Blank: integer; LogInput: boolean): TNeuralIntegerArray;
+type
+  TCTCBeam = record
+    Prefix: TNeuralIntegerArray;
+    PB: double;   // probability prefix ends in blank
+    PNB: double;  // probability prefix ends in a non-blank
+  end;
+var
+  NumT, Vocab, ti, k, i, j, bi, LastSym: integer;
+  Beams, Next: array of TCTCBeam;
+  Prob: array of double; // current frame probabilities
+  BestIdx: integer;
+  BestScore, Total, Sum: double;
+  function KeyOf(const P: TNeuralIntegerArray): string;
+  var n: integer; s: string;
+  begin
+    s := '';
+    for n := 0 to High(P) do s := s + IntToStr(P[n]) + ',';
+    Result := s;
+  end;
+  function FindNext(const P: TNeuralIntegerArray): integer;
+  var n: integer; ky: string;
+  begin
+    ky := KeyOf(P);
+    for n := 0 to High(Next) do
+      if KeyOf(Next[n].Prefix) = ky then Exit(n);
+    Result := -1;
+  end;
+  procedure AddNext(const P: TNeuralIntegerArray; AddPB, AddPNB: double);
+  var n: integer;
+  begin
+    n := FindNext(P);
+    if n < 0 then
+    begin
+      SetLength(Next, Length(Next) + 1);
+      Next[High(Next)].Prefix := Copy(P, 0, Length(P));
+      Next[High(Next)].PB := AddPB;
+      Next[High(Next)].PNB := AddPNB;
+    end
+    else
+    begin
+      Next[n].PB := Next[n].PB + AddPB;
+      Next[n].PNB := Next[n].PNB + AddPNB;
+    end;
+  end;
+  function ExtendOne(const P: TNeuralIntegerArray; sym: integer): TNeuralIntegerArray;
+  var n: integer;
+  begin
+    SetLength(Result, Length(P) + 1);
+    for n := 0 to High(P) do Result[n] := P[n];
+    Result[High(Result)] := sym;
+  end;
+begin
+  NumT := Scores.SizeX;
+  Vocab := Scores.Depth;
+  if Blank < 0 then Blank := Vocab - 1;
+  if BeamWidth < 1 then BeamWidth := 1;
+  SetLength(Prob, Vocab);
+
+  // Initial beam: empty prefix, all mass on "ends in blank".
+  SetLength(Beams, 1);
+  SetLength(Beams[0].Prefix, 0);
+  Beams[0].PB := 1.0;
+  Beams[0].PNB := 0.0;
+
+  for ti := 0 to NumT - 1 do
+  begin
+    // Materialise this frame's probabilities (exp the log-probs if needed).
+    for k := 0 to Vocab - 1 do
+      if LogInput then Prob[k] := Exp(Scores[ti, 0, k])
+      else Prob[k] := Scores[ti, 0, k];
+
+    SetLength(Next, 0);
+    for bi := 0 to High(Beams) do
+    begin
+      if Length(Beams[bi].Prefix) > 0 then
+        LastSym := Beams[bi].Prefix[High(Beams[bi].Prefix)]
+      else
+        LastSym := -1;
+
+      // 1) Add blank: prefix unchanged, accrues to PB.
+      AddNext(Beams[bi].Prefix,
+        (Beams[bi].PB + Beams[bi].PNB) * Prob[Blank], 0.0);
+
+      // 2) Repeat the last symbol: prefix unchanged, accrues to PNB (only the
+      //    non-blank-ending mass can repeat without inserting a separator).
+      if LastSym >= 0 then
+        AddNext(Beams[bi].Prefix, 0.0, Beams[bi].PNB * Prob[LastSym]);
+
+      // 3) Extend by each non-blank symbol k.
+      for k := 0 to Vocab - 1 do
+      begin
+        if k = Blank then Continue;
+        if k = LastSym then
+          // Same as last: only blank-ending mass may extend (else it merges).
+          AddNext(ExtendOne(Beams[bi].Prefix, k), 0.0, Beams[bi].PB * Prob[k])
+        else
+          AddNext(ExtendOne(Beams[bi].Prefix, k), 0.0,
+            (Beams[bi].PB + Beams[bi].PNB) * Prob[k]);
+      end;
+    end;
+
+    // Prune to BeamWidth by total probability: copy Next -> Beams, sort
+    // descending by (PB+PNB) with a selection sort (BeamWidth is small), then
+    // truncate.
+    SetLength(Beams, Length(Next));
+    for i := 0 to High(Next) do Beams[i] := Next[i];
+    // Sort descending by total prob (selection sort over the whole list).
+    for i := 0 to High(Beams) - 1 do
+    begin
+      BestIdx := i;
+      BestScore := Beams[i].PB + Beams[i].PNB;
+      for j := i + 1 to High(Beams) do
+      begin
+        Total := Beams[j].PB + Beams[j].PNB;
+        if Total > BestScore then
+        begin
+          BestScore := Total;
+          BestIdx := j;
+        end;
+      end;
+      if BestIdx <> i then
+      begin
+        Next[0] := Beams[i];        // reuse Next[0] as temp
+        Beams[i] := Beams[BestIdx];
+        Beams[BestIdx] := Next[0];
+      end;
+    end;
+    if Length(Beams) > BeamWidth then SetLength(Beams, BeamWidth);
+  end;
+
+  // Best prefix = highest total probability.
+  BestIdx := 0;
+  BestScore := -1;
+  for i := 0 to High(Beams) do
+  begin
+    Sum := Beams[i].PB + Beams[i].PNB;
+    if Sum > BestScore then
+    begin
+      BestScore := Sum;
+      BestIdx := i;
+    end;
+  end;
+  if Length(Beams) > 0 then
+    Result := Copy(Beams[BestIdx].Prefix, 0, Length(Beams[BestIdx].Prefix))
+  else
+    SetLength(Result, 0);
+end;
 
 function LengthPenaltyDenominator(L: integer; Alpha: TNeuralFloat): TNeuralFloat;
 begin

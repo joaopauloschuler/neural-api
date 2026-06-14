@@ -6,7 +6,7 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, neuralnetwork, neuralvolume,
-  neuralabfun;
+  neuralabfun, neuraldecode;
 
 type
   TTestNeuralNumerical = class(TTestCase)
@@ -651,6 +651,11 @@ type
     procedure TestNLLLossGradient;
     procedure TestNLLLossLogSoftMaxCrossEntropyConsistency;
     procedure TestNLLLossLoadFromString;
+    procedure TestCTCLossForwardPassthrough;
+    procedure TestCTCLossGradient;
+    procedure TestCTCLossLoadFromString;
+    procedure TestCTCDecodeGreedyRoundTrip;
+    procedure TestCTCDecodeBeamSearch;
     procedure TestKLDivergenceForwardPassthrough;
     procedure TestKLDivergenceGradient;
     procedure TestKLDivergenceLoadFromString;
@@ -41198,6 +41203,270 @@ begin
     NN2.Free;
     Input.Free;
     Target.Free;
+  end;
+end;
+
+// Reference float64 forward-backward returning ONLY the CTC scalar loss, used
+// by the numerical-gradient test to central-difference the loss w.r.t. each
+// input logit. Independent re-implementation (not the layer's) so the test is a
+// genuine oracle; LogProbs is (T,1,Vocab) per-frame log-probabilities.
+function CTCRefLoss(LogProbs: TNNetVolume; const Labels: array of integer;
+  Blank: integer): double;
+const
+  cNegInf = -1e30;
+var
+  NT, NS, L, ti, si, i: integer;
+  Ext: array of integer;
+  Alpha: array of array of double;
+  av, ll: double;
+  function LogAdd(x, y: double): double;
+  begin
+    if x <= cNegInf then Result := y
+    else if y <= cNegInf then Result := x
+    else if x > y then Result := x + Ln(1 + Exp(y - x))
+    else Result := y + Ln(1 + Exp(x - y));
+  end;
+begin
+  NT := LogProbs.SizeX;
+  L := Length(Labels);
+  NS := 2 * L + 1;
+  SetLength(Ext, NS);
+  for i := 0 to L - 1 do begin Ext[2*i] := Blank; Ext[2*i+1] := Labels[i]; end;
+  Ext[NS-1] := Blank;
+  SetLength(Alpha, NT, NS);
+  for ti := 0 to NT - 1 do for si := 0 to NS - 1 do Alpha[ti][si] := cNegInf;
+  Alpha[0][0] := LogProbs[0,0,Ext[0]];
+  if NS > 1 then Alpha[0][1] := LogProbs[0,0,Ext[1]];
+  for ti := 1 to NT - 1 do
+    for si := 0 to NS - 1 do
+    begin
+      av := Alpha[ti-1][si];
+      if si >= 1 then av := LogAdd(av, Alpha[ti-1][si-1]);
+      if (si >= 2) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si-2]) then
+        av := LogAdd(av, Alpha[ti-1][si-2]);
+      Alpha[ti][si] := av + LogProbs[ti,0,Ext[si]];
+    end;
+  ll := Alpha[NT-1][NS-1];
+  if NS > 1 then ll := LogAdd(ll, Alpha[NT-1][NS-2]);
+  Result := -ll;
+end;
+
+// Helper: fill a (T,1,Vocab) log-prob volume from a logit grid via softmax.
+procedure CTCLogitsToLogProbs(Logits, LogProbs: TNNetVolume);
+var
+  ti, k, T, Vocab: integer;
+  MaxV, SumExp: double;
+begin
+  T := Logits.SizeX; Vocab := Logits.Depth;
+  LogProbs.ReSize(Logits);
+  for ti := 0 to T - 1 do
+  begin
+    MaxV := Logits[ti,0,0];
+    for k := 1 to Vocab - 1 do if Logits[ti,0,k] > MaxV then MaxV := Logits[ti,0,k];
+    SumExp := 0;
+    for k := 0 to Vocab - 1 do SumExp := SumExp + Exp(Logits[ti,0,k] - MaxV);
+    for k := 0 to Vocab - 1 do
+      LogProbs[ti,0,k] := (Logits[ti,0,k] - MaxV) - Ln(SumExp);
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCLossForwardPassthrough;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetCTCLoss forward is an identity passthrough of the input log-probs.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 4, 1));
+    NN.AddLayer(TNNetCTCLoss.Create());
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := -0.5 - 0.1 * i;
+    NN.Compute(Input);
+    for i := 0 to Input.Size - 1 do
+      AssertEquals('CTCLoss forward passthrough at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCLossGradient;
+const
+  cT = 8;         // need T >= 2*L+1 = 7 for labels [0,1,2] to be alignable
+  cVocab = 4;     // labels 0..2, blank = 3
+  cBlank = 3;
+  cEps = 1e-3;
+var
+  NN: TNNet;
+  Input, Target, Logits, LPPlus, LPMinus: TNNetVolume;
+  LLogits: TNNetIdentity;
+  Labels: array[0..2] of integer;
+  ti, k, idx: integer;
+  AnalyticGrad, NumGrad, LPlus, LMinus, saved: double;
+begin
+  // Numerical-gradient gate: build Input -> LogSoftMax -> CTCLoss on a small
+  // logit grid, then verify the error flowing into the LOGITS layer equals the
+  // central-difference of the CTC scalar loss w.r.t. each logit (oracle =
+  // independent float64 forward-backward CTCRefLoss). Target = labels [0,1,2].
+  Labels[0] := 0; Labels[1] := 1; Labels[2] := 2;
+
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input  := TNNetVolume.Create(cT, 1, cVocab);
+  Target := TNNetVolume.Create(cT, 1, cVocab);
+  Logits := TNNetVolume.Create(cT, 1, cVocab);
+  LPPlus := TNNetVolume.Create(cT, 1, cVocab);
+  LPMinus := TNNetVolume.Create(cT, 1, cVocab);
+  try
+    NN.AddLayer(TNNetInput.Create(cT, 1, cVocab, 1));
+    LLogits := TNNetIdentity.Create();
+    NN.AddLayer(LLogits);
+    NN.AddLayer(TNNetLogSoftMax.Create());
+    NN.AddLayer(TNNetCTCLoss.Create(cBlank));
+
+    // A fixed, well-separated logit grid (deterministic).
+    for ti := 0 to cT - 1 do
+      for k := 0 to cVocab - 1 do
+        Logits[ti, 0, k] := 0.3 * (ti + 1) - 0.7 * k + 0.15 * ((ti * 7 + k * 3) mod 5);
+
+    for idx := 0 to Input.Size - 1 do Input.Raw[idx] := Logits.Raw[idx];
+
+    // Encode the CTC target into the (T,1,Vocab) target volume.
+    TNNetCTCLoss.EncodeTarget(Target, Labels, cT, cVocab);
+
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+
+    // Central-difference the scalar loss w.r.t. each logit and compare to the
+    // analytic error sitting in the logits layer (= softmax - gamma).
+    for idx := 0 to Logits.Size - 1 do
+    begin
+      AnalyticGrad := LLogits.OutputError.Raw[idx];
+
+      saved := Logits.Raw[idx];
+      Logits.Raw[idx] := saved + cEps;
+      CTCLogitsToLogProbs(Logits, LPPlus);
+      LPlus := CTCRefLoss(LPPlus, Labels, cBlank);
+
+      Logits.Raw[idx] := saved - cEps;
+      CTCLogitsToLogProbs(Logits, LPMinus);
+      LMinus := CTCRefLoss(LPMinus, Labels, cBlank);
+
+      Logits.Raw[idx] := saved;
+      NumGrad := (LPlus - LMinus) / (2 * cEps);
+
+      AssertEquals('CTC logit gradient at ' + IntToStr(idx),
+        NumGrad, AnalyticGrad, 2e-3);
+    end;
+  finally
+    NN.Free;
+    Input.Free; Target.Free; Logits.Free;
+    LPPlus.Free; LPMinus.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCLossLoadFromString;
+var
+  NN, NN2: TNNet;
+  Saved: string;
+  CTC: TNNetCTCLoss;
+begin
+  // SaveStructureToString -> LoadFromString round-trip must preserve the layer
+  // type AND the configured blank index (FStruct[0]).
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 5, 1));
+    NN.AddLayer(TNNetLogSoftMax.Create());
+    NN.AddLayer(TNNetCTCLoss.Create(2)); // explicit non-default blank index
+
+    Saved := NN.SaveToString();
+    NN2.LoadFromString(Saved);
+
+    AssertTrue('Loaded last layer is TNNetCTCLoss',
+      NN2.GetLastLayer is TNNetCTCLoss);
+    CTC := NN2.GetLastLayer as TNNetCTCLoss;
+    AssertEquals('CTCLoss blank index round-trips', 2, CTC.BlankIndex());
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCDecodeGreedyRoundTrip;
+const
+  cT = 7;
+  cVocab = 4;   // labels 0..2, blank = 3
+  cBlank = 3;
+var
+  Scores: TNNetVolume;
+  Path: array[0..6] of integer;
+  Decoded: TNeuralIntegerArray;
+  Expected: array[0..2] of integer;
+  ti, k: integer;
+begin
+  // Alignment round-trip: plant a clean argmax path that, under the CTC collapse
+  // rule (merge repeats, drop blank), must decode to the planted label sequence.
+  // Path: 0 0 blank 1 1 2 blank  ->  collapse -> 0 1 2.
+  Path[0] := 0; Path[1] := 0; Path[2] := cBlank;
+  Path[3] := 1; Path[4] := 1; Path[5] := 2; Path[6] := cBlank;
+  Expected[0] := 0; Expected[1] := 1; Expected[2] := 2;
+
+  Scores := TNNetVolume.Create(cT, 1, cVocab);
+  try
+    // Make each frame's argmax exactly the planted symbol.
+    Scores.Fill(-5.0);
+    for ti := 0 to cT - 1 do
+      Scores[ti, 0, Path[ti]] := 5.0;
+
+    Decoded := DecodeCTCGreedy(Scores, cBlank);
+    AssertEquals('Greedy CTC decode length', 3, Length(Decoded));
+    for k := 0 to 2 do
+      AssertEquals('Greedy CTC decode label ' + IntToStr(k),
+        Expected[k], Decoded[k]);
+
+    // Default blank (-1 -> vocab-1 = 3) must give the same result.
+    Decoded := DecodeCTCGreedy(Scores);
+    AssertEquals('Greedy CTC decode (default blank) length', 3, Length(Decoded));
+  finally
+    Scores.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCDecodeBeamSearch;
+const
+  cT = 7;
+  cVocab = 4;
+  cBlank = 3;
+var
+  Scores, LP: TNNetVolume;
+  Path: array[0..6] of integer;
+  Decoded: TNeuralIntegerArray;
+  ti: integer;
+begin
+  // On a near-deterministic distribution the prefix-beam search must agree with
+  // greedy (and the planted target 0 1 2). Beam search consumes log-probs.
+  Path[0] := 0; Path[1] := 0; Path[2] := cBlank;
+  Path[3] := 1; Path[4] := 1; Path[5] := 2; Path[6] := cBlank;
+
+  Scores := TNNetVolume.Create(cT, 1, cVocab);
+  LP := TNNetVolume.Create(cT, 1, cVocab);
+  try
+    Scores.Fill(-5.0);
+    for ti := 0 to cT - 1 do Scores[ti, 0, Path[ti]] := 5.0;
+    CTCLogitsToLogProbs(Scores, LP);
+
+    Decoded := DecodeCTCBeamSearch(LP, 8, cBlank, true);
+    AssertEquals('Beam CTC decode length', 3, Length(Decoded));
+    AssertEquals('Beam CTC label 0', 0, Decoded[0]);
+    AssertEquals('Beam CTC label 1', 1, Decoded[1]);
+    AssertEquals('Beam CTC label 2', 2, Decoded[2]);
+  finally
+    Scores.Free;
+    LP.Free;
   end;
 end;
 

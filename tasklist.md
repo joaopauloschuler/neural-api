@@ -589,9 +589,27 @@ rather than acted on.
       — the projection head is always f32 while the BERT backbone already
       supports int8.
 
-- [ ] CTC (Connectionist Temporal Classification) loss head + decode — a genuine
-      gap: the loss zoo (NLLLoss/FocalLoss/Dice/...) has no alignment-free
-      sequence loss, and there is no CTC decode. Add `TNNetCTCLoss` following the
+- [X] CTC (Connectionist Temporal Classification) loss head + decode — LANDED.
+      `TNNetCTCLoss` (TNNetIdentity loss head, after a `TNNetLogSoftMax`): forward
+      identity passthrough, backward runs the log-space forward-backward over the
+      blank-interleaved label lattice (stable log-sum-exp) and writes the
+      `-gamma` occupancy gradient (composed with LogSoftMax -> textbook
+      `softmax - gamma` logit gradient). Blank index in `FStruct[0]` (default -1 =
+      last vocab); variable-length targets encoded into the same-shape target
+      volume via class method `EncodeTarget`/`DecodeTarget`; the scalar loss and
+      grad are exposed by class method `ForwardBackwardLogLoss`. Registered in
+      BOTH dispatch tables (round-trip preserves blank index). `DecodeCTCGreedy`
+      (argmax-per-frame -> collapse repeats -> drop blank) and
+      `DecodeCTCBeamSearch` (prefix beam, Graves/Hannun, summing alignment mass)
+      added in neuraldecode.pas. Tests in TestNeuralNumerical.pas:
+      TestCTCLossGradient (central-difference of the CTC loss on an 8x4 logit grid
+      vs an independent float64 forward-backward oracle, tol 2e-3),
+      TestCTCDecodeGreedyRoundTrip (clean argmax path decodes to the planted
+      target), TestCTCLossForwardPassthrough, TestCTCLossLoadFromString,
+      TestCTCDecodeBeamSearch. Original note: the loss zoo
+      (NLLLoss/FocalLoss/Dice/...) had no alignment-free
+      sequence loss, and there was no CTC decode. Followed the
+      loss-layer pattern (Identity passthrough forward + backward rewrite over the
       loss-layer pattern (Identity passthrough forward + backward rewrite over the
       forward-backward alpha/beta lattice in log-space, with the standard blank
       label and label-collapsing rule) plus a `DecodeCTCGreedy` (argmax-per-frame
