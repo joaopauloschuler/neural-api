@@ -230,6 +230,8 @@ type
     procedure TestGraniteLogitParity;
     procedure TestGraniteMoeLogitParity;
     procedure TestGraniteMoeSharedLogitParity;
+    procedure TestMiniCPMConfigParity;
+    procedure TestMiniCPMLogitParity;
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
@@ -8628,6 +8630,96 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_granitemoeshared_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the MiniCPM config reader (HF MiniCPMForCausalLM, model_type
+// "minicpm"): the Llama backbone fields plus OpenBMB's muP-style rescaling
+// folded onto the existing Granite multiplier slots. scale_emb maps to the
+// embedding multiplier, scale_depth/sqrt(num_layers) to the per-sublayer
+// residual multiplier, and hidden_size/dim_model_base to the dividing
+// logits-scaling slot (attention_multiplier stays 0 = default SDPA scale).
+procedure TTestNeuralPretrained.TestMiniCPMConfigParity;
+var
+  Config: TLlamaConfig;
+  ExpectedResMult: TNeuralFloat;
+begin
+  Config := ReadLlamaConfigFromJSONFile(
+    FixturePath('tiny_minicpm_config.json'));
+  AssertEquals('model_type', 'minicpm', Config.ModelType);
+  AssertEquals('hidden_size', 8, Config.HiddenSize);
+  AssertEquals('intermediate_size', 12, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('num_key_value_heads', 1, Config.NumKVHeads);
+  AssertEquals('vocab_size', 13, Config.VocabSize);
+  AssertTrue('tied lm_head', Config.TieWordEmbeddings);
+  AssertFalse('not MoE (dense FFN)', Config.IsMoE);
+  // scale_emb (1.7) -> embedding multiplier.
+  AssertEquals('scale_emb -> embedding_multiplier', 1.7,
+    Config.EmbeddingMultiplier, 1e-6);
+  // scale_depth (1.4) / sqrt(num_layers=2) -> per-sublayer residual multiplier.
+  ExpectedResMult := 1.4 / Sqrt(2.0);
+  AssertEquals('scale_depth/sqrt(L) -> residual_multiplier', ExpectedResMult,
+    Config.ResidualMultiplier, 1e-6);
+  // hidden_size (8) / dim_model_base (5) -> dividing logits scale.
+  AssertEquals('hidden_size/dim_model_base -> logits_scaling', 8.0 / 5.0,
+    Config.LogitsScaling, 1e-6);
+  // No attention_multiplier fold: SDPA keeps its default 1/sqrt(head_dim).
+  AssertEquals('no attention_multiplier', 0.0,
+    Config.AttentionMultiplier, 1e-6);
+end;
+
+// Verifies the MiniCPM import target (HF MiniCPMForCausalLM, model_type
+// "minicpm"): tests/fixtures/tiny_minicpm.* is a pico randomly-initialized
+// model (2 layers, 2 query heads sharing 1 kv head x 4 dims - GQA, hidden 8,
+// vocab 13, TIED lm_head) on the Llama path with the three MiniCPM muP folds
+// set to non-trivial values; the generator tools/minicpm_tiny_fixture.py
+// ASSERTS each fold moves the reference logits, so a fold-blind import cannot
+// reach parity. All three are load-time folds reusing the Granite machinery
+// (scale_emb -> embedding rows; scale_depth/sqrt(L) -> o_proj/down_proj rows;
+// hidden_size/dim_model_base -> 1/scale into the tied LM head). Reference
+// logits come from a float64 MiniCPM forward (MiniCPM ships via
+// trust_remote_code, so the oracle is the documented muP math, not an HF
+// class).
+procedure TTestNeuralPretrained.TestMiniCPMLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildMiniCPMFromSafeTensorsEx(
+    FixturePath('tiny_minicpm.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_minicpm_config.json'));
+  try
+    AssertEquals('model_type', 'minicpm', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertTrue('tied lm_head', Config.TieWordEmbeddings);
+    AssertEquals('embedding_multiplier', 1.7,
+      Config.EmbeddingMultiplier, 1e-6);
+    AssertEquals('residual_multiplier', 1.4 / Sqrt(2.0),
+      Config.ResidualMultiplier, 1e-6);
+    AssertEquals('logits_scaling', 8.0 / 5.0, Config.LogitsScaling, 1e-6);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_minicpm_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "minicpm" (architectures ["MiniCPMForCausalLM"]) onto the Llama path.
+  NN := BuildFromPretrained(FixturePath('tiny_minicpm.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_minicpm_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_minicpm_logits.json'), 16, 13);
   finally
     NN.Free;
   end;

@@ -1559,6 +1559,19 @@ function BuildGraniteFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// MiniCPM (openbmb/MiniCPM-1.2B / 2B-sft/dpo, model_type "minicpm"): the Llama
+// backbone with OpenBMB's muP-style depth/width rescaling (scale_emb,
+// scale_depth/sqrt(num_layers), hidden_size/dim_model_base) folded into the
+// existing Granite-style multiplier slots at load (no new layer types).
+function BuildMiniCPMFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildMiniCPMFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
 type
   // GPT-OSS (OpenAI gpt-oss, model_type "gpt_oss"; openai/gpt-oss-20b and
   // gpt-oss-120b). A sparse top-k MoE decoder that CROSSES several subsystems:
@@ -5513,6 +5526,7 @@ var
   HeadDimField, SlidingWindowField, FloatField: TJSONData;
   MoEMlpOnlyArr, ClipQKVField: TJSONData;
   i: integer;
+  DimModelBase: integer;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -5554,12 +5568,13 @@ begin
        (ModelType <> 'mixtral') and
        (ModelType <> 'glm4') and (ModelType <> 'glm') and
        (ModelType <> 'granite') and (ModelType <> 'granitemoe') and
-       (ModelType <> 'bitnet') and (ModelType <> 'internlm2') then
+       (ModelType <> 'bitnet') and (ModelType <> 'internlm2') and
+       (ModelType <> 'minicpm') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", ' +
         '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "olmoe", ' +
-        '"mixtral", "glm4", "granite", "granitemoe", "bitnet" and ' +
-        '"internlm2" are supported here ' +
+        '"mixtral", "glm4", "granite", "granitemoe", "bitnet", ' +
+        '"internlm2" and "minicpm" are supported here ' +
         '(see BuildFromPretrained for the full dispatch; multimodal ' +
         '"gemma3" configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
@@ -6166,6 +6181,57 @@ begin
       if (FloatField <> nil) and (FloatField is TJSONObject) then
         Result.RopeTheta :=
           TJSONObject(FloatField).Get('rope_theta', Result.RopeTheta);
+    end
+    else if ModelType = 'minicpm' then
+    begin
+      // MiniCPM (model_type "minicpm", e.g. openbmb/MiniCPM-1.2B / 2B-sft/dpo):
+      // a plain Llama backbone (RMSNorm + RoPE + SwiGLU, GQA, tied embeddings,
+      // no q/k/v bias) plus OpenBMB's muP-style depth/width rescaling. All
+      // three knobs are constant FOLDS into existing weights at load - the
+      // SAME fold machinery Granite uses (no new layer types):
+      //   - scale_emb multiplies the token embeddings after lookup -> reuse
+      //     EmbeddingMultiplier (folded into the embedding rows; the tied LM
+      //     head reads the UNSCALED rows, matching HF MiniCPMForCausalLM).
+      //   - scale_depth / sqrt(num_hidden_layers) rescales EVERY residual
+      //     branch (each attention AND each MLP sublayer output) -> reuse
+      //     ResidualMultiplier (folded per-block into o_proj and down_proj).
+      //     This is a PER-SUBLAYER residual scale; the constant is the same
+      //     for every block, so Granite's per-block fold reproduces it exactly.
+      //   - logits divide by hidden_size / dim_model_base -> reuse
+      //     LogitsScaling (DIVIDES the final logits, folded as
+      //     1/LogitsScaling into the tied LM head rows, like Granite).
+      // attention_multiplier is NOT part of MiniCPM (the SDPA score scale
+      // stays the default 1/sqrt(head_dim)).
+      Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+      Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5);
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      if Result.QKVBias then
+        ImportError('Llama import: MiniCPM attention_bias=true is not wired ' +
+          'into this importer - every released minicpm checkpoint is ' +
+          'bias-free.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: MiniCPM hidden_act "' + HiddenAct +
+          '" is not supported - every released minicpm checkpoint uses ' +
+          '"silu" (SwiGLU).');
+      Result.AttentionMultiplier := 0; // default 1/sqrt(head_dim) score scale
+      // scale_emb -> embedding multiplier (default 1.0 = off).
+      Result.EmbeddingMultiplier := Obj.Get('scale_emb', 1.0);
+      // scale_depth / sqrt(num_hidden_layers) -> per-sublayer residual scale.
+      if Result.NumLayers < 1 then
+        ImportError('Llama import: MiniCPM num_hidden_layers must be >= 1.');
+      Result.ResidualMultiplier :=
+        Obj.Get('scale_depth', 1.0) / Sqrt(Result.NumLayers);
+      // logits divide by hidden_size / dim_model_base (DIVIDING LM-head scale).
+      DimModelBase := Obj.Get('dim_model_base', Result.HiddenSize);
+      if DimModelBase <= 0 then
+        ImportError('Llama import: MiniCPM dim_model_base must be > 0, got ' +
+          IntToStr(DimModelBase) + '.');
+      Result.LogitsScaling := Result.HiddenSize / DimModelBase;
+      if Result.LogitsScaling = 0 then
+        ImportError('Llama import: MiniCPM logits scale (hidden_size / ' +
+          'dim_model_base) must be non-zero.');
     end
     else if ModelType = 'internlm2' then
     begin
@@ -16906,6 +16972,46 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildGraniteFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ============================ MiniCPM IMPORT ===============================
+
+// MiniCPM (openbmb/MiniCPM-1.2B / 2B-sft/dpo, HF MiniCPMForCausalLM): the
+// Llama block (RMSNorm + RoPE + SwiGLU, GQA, tied embeddings, bias-free) plus
+// OpenBMB's muP-style depth/width rescaling, all folded into existing weights
+// at load (no new layer types - the Granite fold machinery is reused):
+//   scale_emb                        -> embedding multiplier (embedding rows)
+//   scale_depth / sqrt(num_layers)   -> per-sublayer residual scale (o_proj
+//                                       and down_proj rows of every block)
+//   hidden_size / dim_model_base     -> DIVIDES the final logits (folded as
+//                                       1/scale into the tied LM head rows)
+// The standard SentencePiece .model tokenizer applies. See
+// ReadLlamaConfigFromJSONFile's "minicpm" branch for the three folds.
+function BuildMiniCPMFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFromSafeTensorsEx(FileName, Config, pSeqLen,
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+  if Config.ModelType <> 'minicpm' then
+  begin
+    Result.Free;
+    Result := nil;
+    ImportError('minicpm import: config model_type is "' + Config.ModelType +
+      '", expected "minicpm" - use the matching builder or ' +
+      'BuildFromPretrained.');
+  end;
+end;
+
+function BuildMiniCPMFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildMiniCPMFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -29223,6 +29329,7 @@ begin
           (ModelType = 'mixtral') or
           (ModelType = 'glm4') or
           (ModelType = 'granite') or (ModelType = 'granitemoe') or
+          (ModelType = 'minicpm') or
           (ModelType = 'bitnet') then
     // 'glm4' (architectures ["Glm4ForCausalLM"], THUDM/GLM-4-9B-0414 etc.)
     // raises the four-norm sandwich (post_self_attn_layernorm /

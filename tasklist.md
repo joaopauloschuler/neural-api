@@ -108,7 +108,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] MiniCPM importer (`BuildMiniCPMFromSafeTensors[Ex]`, model_type
+- [X] MiniCPM importer (`BuildMiniCPMFromSafeTensors[Ex]`, model_type
       `minicpm`; openbmb/MiniCPM-1.2B/2B-sft/dpo) — a genuinely CPU-runnable
       (1.2B/2B) Llama-backbone family (RMSNorm + RoPE + SwiGLU, tied
       embeddings) whose distinguishing piece is OpenBMB's μP-style
