@@ -332,7 +332,7 @@ rather than acted on.
       / the ReZero-style scale already in the repo) and the preprocessing helper.
       Pico parity vs HF float64; demo: nearest-neighbour image retrieval over a
       handful of committed thumbnails.
-- [ ] DDPM diffusion image-generation example (examples/DiffusionMNIST) — the
+- [X] DDPM diffusion image-generation example (examples/DiffusionMNIST) — the
       first GENERATIVE-by-diffusion example; TNNetSinusoidalTimeEmbedding already
       exists in neuralnetwork.pas specifically for this (Ho et al. 2020) but no
       example uses it. Train a small U-Net (downsample conv blocks + GroupNorm +
