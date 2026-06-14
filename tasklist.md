@@ -107,9 +107,12 @@ rather than acted on.
       NEOX rope no-permute) wired but OFFLINE-UNVERIFIED (writer emits no Gemma deltas
       -> no round-trip oracle; flagged PENDING-a-fixture in-code). Unknown archs raise
       a clear error. Remaining OPEN follow-ups:
-  - [ ] Gemma-2 GGUF parity fixture: extend the writer to emit Gemma deltas (or commit
-        a pico gemma2 .gguf via a Python helper) + a round-trip parity test to promote
-        the gemma2 path from wired-but-unverified to verified.
+  - [X] Gemma-2 GGUF parity fixture: LANDED (commit f87bdba). SaveLlamaToGGUFEx now
+        emits gemma2 deltas (arch="gemma2", four sandwich norms, unpermuted NEOX q/k,
+        sliding_window/query_pre_attn_scalar/attn+final softcapping, GQA, tied head);
+        TestBuildFromGGUFGemma2RoundTrip asserts write->read logits at max |diff| = 0.0
+        (< 1e-4). 1959 tests pass. Open: F16/Q8_0 gemma2 export-drift test (mirror
+        TestGGUFLlamaQ8AndF16ImportDrift); cross-tool llama.cpp gemma2 GGUF parity.
   - [ ] starcoder2 GGUF (out of scope for v1): needs LayerNorm-not-RMSNorm + full
         per-projection biases + non-gated GELU on the GGUF import path.
   - [ ] Extend dispatch to more Llama-backbone GGUF archs (phi3, qwen3, gemma3,
