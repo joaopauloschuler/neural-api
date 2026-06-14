@@ -291,7 +291,7 @@ rather than acted on.
       ad-hoc PadXY+Crop folding is NOT this (it bakes a fixed square resize into
       pos row 0). Deliverable: one tested helper + a parity check vs
       torchvision/PIL on a committed tiny image.
-- [ ] First trained-CNN classifier importer from torchvision/timm — every
+- [X] First trained-CNN classifier importer from torchvision/timm — every
       importer in the repo today is a transformer/LLM (or CLIP/SigLIP ViT); the
       ResNet example BUILDS from scratch, it does not IMPORT weights. Add
       BuildResNetFromSafeTensors (torchvision resnet18/50 state_dict: conv-bn
@@ -302,6 +302,18 @@ rather than acted on.
       fixture (make_pico_*_fixture.py recipe) and on one real image through the
       new preprocessing helper. ConvNeXt (LayerScale + GRN + depthwise 7x7,
       TNNetGRN already exists) is the modern-CNN stretch goal on the same path.
+      LANDED (commit 317a19c): BuildResNetFromSafeTensors[Ex] + config
+      reader/ToString, conv-BN fold at load, resnet18 parity 1.0e-6 vs a numpy
+      float64 oracle (torchvision not installed). Follow-ups:
+  - [ ] resnet50 Bottleneck (expansion 4) is CODED but not parity-tested — add a
+        pico Bottleneck fixture + TestResNet50...Parity. resnet34 likewise coded,
+        untested. resnet101/152 + ConvNeXt remain out of scope.
+  - [ ] real torchvision .pth (pickle) load path: today the importer reads
+        safetensors only; the pico fixture is a numpy float64 oracle (no
+        torchvision). Also: CAI maxpool (ceil sizing + edge-clamped windows + zero
+        pad) diverges from PyTorch maxpool (floor + -inf pad) — the parity test
+        mirrors CAI semantics; a real-checkpoint top-1 check needs reconciling the
+        stem maxpool or documenting the gap.
 - [X] Standalone ViT image-classification importer
       (google/vit-base-patch16-224 / timm vit) — BuildViTForImageClassification
       reusing the BuildClipVisionTower ViT path (patch-embed conv + learned pos
