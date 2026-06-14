@@ -3800,6 +3800,54 @@ type
     property Slope: TNeuralFloat read FSlope;
   end;
 
+  /// Window self-attention with an additive per-(query,key) score bias, the
+  // core attention block of the Swin Transformer (Liu et al. 2021,
+  // "Swin Transformer: Hierarchical Vision Transformer using Shifted Windows",
+  // https://arxiv.org/abs/2103.14030). A drop-in variant of
+  // TNNetScaledDotProductAttention over ONE window of SeqLen = window*window
+  // tokens that ADDS a FIXED (non-trainable) bias matrix to every pre-softmax
+  // logit:
+  //   scores[i,j] = (Q[i].K[j]) / sqrt(d_k) + Bias[i,j]
+  // where Bias is a SeqLen x SeqLen matrix supplied by the caller after the
+  // layer is built (SetBiasMatrix). In a Swin layer Bias[i,j] is the SUM of
+  //   - the per-head relative_position_bias (gathered from the learned
+  //     relative_position_bias_table via the fixed relative_position_index),
+  //     identical for every window in the layer; and
+  //   - the cyclic-shift attention mask (0 for an allowed (i,j) pair, -100 in
+  //     HF / our -1e9 sentinel for a pair whose two tokens come from different
+  //     image regions after the roll), which DIFFERS per window position. Since
+  //     the mask depends on the window, the per-window bias matrices differ;
+  //     this layer therefore attends ONE window and a Swin layer instantiates
+  //     one TNNetWindowAttention per (head, window) with its own bias matrix.
+  // The bias is a CONSTANT added to the score, so - exactly as for ALiBi - the
+  // backward pass is the parent's unchanged: d(const)/dscore vanishes and the
+  // softmax Jacobian already accounts for the post-softmax weights. The bias
+  // matrix is stored flattened in the single neuron FNeurons[0] (SeqLen*SeqLen
+  // weights) so it round-trips through the standard weight save/load; it is
+  // marked non-trainable (its gradient is never accumulated). There is NO
+  // causal mask and NO KV-cache (Swin is a bidirectional encoder). Input
+  // layout (same as SDPA): SizeY = 1, SizeX = SeqLen, Depth = 3 * d_k
+  // (Q | K | V). Output shape: SeqLen x 1 x d_k. SeqLen is stored in
+  // FStruct[5] (FStruct[0..2] = d_k / causal / window as in the parent).
+  // Coded by Claude (AI).
+  TNNetWindowAttention = class(TNNetScaledDotProductAttention)
+  private
+    FSeqLen: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(d_k: integer; pSeqLen: integer); overload;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    // Copy a SeqLen x SeqLen bias matrix (row i = query, col j = key) into the
+    // layer's storage neuron. Bias must already include both the
+    // relative-position bias and (when applicable) the cyclic-shift mask.
+    procedure SetBiasMatrix(const Bias: TNNetVolume);
+    // Read-only accessor: Bias[i,j] = FNeurons[0].Weights[i*SeqLen + j].
+    function BiasAt(QueryI, KeyJ: integer): TNeuralFloat;
+    property SeqLen: integer read FSeqLen;
+  end;
+
   /// Attention with learnable "attention sink" slots (StreamingLLM,
   // Xiao et al. 2023, https://arxiv.org/abs/2309.17453).
   // A drop-in variant of TNNetScaledDotProductAttention that prepends K
@@ -7673,6 +7721,35 @@ type
     public
       constructor Create(); overload; override;
       constructor Create(pChannels: array of integer); overload;
+      destructor Destroy(); override;
+
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+
+      function SaveStructureToString(): string; override;
+  end;
+
+  /// Token-axis gather/reorder layer. The X-axis analogue of
+  // TNNetGatherChannels: selects an ORDERED SUBSET of positions along the SizeX
+  // (token/sequence) axis of a (SizeX, 1, Depth) sequence, producing an output
+  // of shape (N, 1, Depth) where N = number of indices:
+  //   Output[k, 0, d] := Input[Tokens[k], 0, d].
+  // This is the token-reordering primitive behind the Swin Transformer's
+  // window-partition / window-reverse and cyclic-shift: a fixed permutation of
+  // the (H*W,1,C) token grid into window-contiguous order (and its inverse) is
+  // just a TNNetGatherTokens with the right index list. Backward SCATTERS each
+  // output position's error back to its source position with Add (so repeated
+  // indices accumulate correctly). The index list lives in its own
+  // structure-string segment (no fixed cap). Requires SizeY = 1 and every index
+  // in 0 <= idx < Input.SizeX. The parameterless constructor selects position 0.
+  // Coded by Claude (AI).
+  TNNetGatherTokens = class(TNNetIdentity)
+    private
+      FTokens: TNeuralIntegerArray;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pTokens: array of integer); overload;
       destructor Destroy(); override;
 
       procedure Compute(); override;
@@ -27452,6 +27529,137 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+{ TNNetWindowAttention }
+
+constructor TNNetWindowAttention.Create(d_k: integer; pSeqLen: integer);
+begin
+  // No causal mask, no sliding window: Swin window attention is bidirectional
+  // over the SeqLen tokens of one window. The (query,key) bias matrix (and any
+  // cyclic-shift mask) is supplied via SetBiasMatrix after the net is built.
+  inherited Create(d_k, {CausalMask=}false, {pWindow=}0);
+  FSeqLen := pSeqLen;
+  if FSeqLen < 1 then
+    FErrorProc('TNNetWindowAttention requires SeqLen >= 1. SeqLen=' +
+      IntToStr(FSeqLen));
+  FStruct[5] := FSeqLen;
+end;
+
+procedure TNNetWindowAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.SizeX <> FSeqLen then
+    FErrorProc('TNNetWindowAttention: previous layer SizeX=' +
+      IntToStr(pPrevLayer.FOutput.SizeX) + ' does not match SeqLen=' +
+      IntToStr(FSeqLen) + '.');
+  // One neuron holding the flattened SeqLen x SeqLen bias matrix
+  // (row-major: Bias[i,j] = weight[i*SeqLen + j]); storing it as neuron
+  // weights makes it round-trip through the standard weight save/load. The
+  // bias is a constant (zero gradient), so it is never stepped by the
+  // optimizer.
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, FSeqLen * FSeqLen);
+  FNeurons[0].FWeights.Fill(0); // zero bias = bit-for-bit plain SDPA
+  AfterWeightUpdate();
+end;
+
+procedure TNNetWindowAttention.InitDefault();
+begin
+  // The bias matrix starts at ZERO (an untrained layer scores exactly like a
+  // plain SDPA); do NOT randomize like the base InitDefault would.
+  if FNeurons.Count > 0 then
+  begin
+    FNeurons[0].FWeights.Fill(0);
+    AfterWeightUpdate();
+  end;
+end;
+
+procedure TNNetWindowAttention.SetBiasMatrix(const Bias: TNNetVolume);
+var
+  i: integer;
+begin
+  if FNeurons.Count < 1 then AddMissingNeurons(1);
+  SetNumWeightsForAllNeurons(1, 1, FSeqLen * FSeqLen);
+  if Bias.Size <> FSeqLen * FSeqLen then
+    FErrorProc('TNNetWindowAttention.SetBiasMatrix expects ' +
+      IntToStr(FSeqLen * FSeqLen) + ' values, got ' + IntToStr(Bias.Size) +
+      '.');
+  for i := 0 to FSeqLen * FSeqLen - 1 do
+    FNeurons[0].FWeights.FData[i] := Bias.FData[i];
+  AfterWeightUpdate();
+end;
+
+function TNNetWindowAttention.BiasAt(QueryI, KeyJ: integer): TNeuralFloat;
+begin
+  Result := FNeurons[0].FWeights.FData[QueryI * FSeqLen + KeyJ];
+end;
+
+procedure TNNetWindowAttention.Compute();
+const
+  cMaskFloor = -1e8; // same all-masked-row floor as the parent
+var
+  StartTime: double;
+  SeqN, i, j, d: integer;
+  Score, MaxScore, SumExp: TNeuralFloat;
+  Prev: TNNetVolume;
+  OutPtr, Bias, BiasRow: TNeuralFloatArrPtr;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqN := Prev.SizeX;
+  Bias := FNeurons[0].FWeights.GetRawPtr(0, 0, 0);
+  // Same forward as the parent except that the fixed (query,key) bias matrix
+  // (relative-position bias plus optional cyclic-shift mask) is ADDED to every
+  // scaled logit. The shift mask is baked into Bias as a large negative value
+  // for cross-region pairs, so masked positions are handled by the bias itself
+  // (and the parent's all-masked-row policy still applies).
+  for i := 0 to SeqN - 1 do
+  begin
+    BiasRow := @Bias^[i * SeqN];
+    MaxScore := -1e30;
+    for j := 0 to SeqN - 1 do
+    begin
+      Score := TNNetVolume.DotProduct(
+        Prev.GetRawPtr(i, 0, 0), Prev.GetRawPtr(j, 0, FDk), FDk);
+      Score := Score * FInvSqrtDk + BiasRow^[j];
+      FAttn[j, i, 0] := Score;
+      if Score > MaxScore then MaxScore := Score;
+    end;
+    if MaxScore <= cMaskFloor then
+    begin
+      for j := 0 to SeqN - 1 do
+        FAttn[j, i, 0] := 0;
+    end
+    else
+    begin
+      SumExp := 0;
+      for j := 0 to SeqN - 1 do
+      begin
+        Score := pcr_expf(FAttn[j, i, 0] - MaxScore);
+        FAttn[j, i, 0] := Score;
+        SumExp := SumExp + Score;
+      end;
+      if SumExp > 0 then
+        for j := 0 to SeqN - 1 do
+          FAttn[j, i, 0] := FAttn[j, i, 0] / SumExp;
+    end;
+    OutPtr := FOutput.GetRawPtr(i, 0, 0);
+    for d := 0 to FDk - 1 do
+      OutPtr^[d] := 0;
+    for j := 0 to SeqN - 1 do
+      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(j, 0, 2 * FDk),
+        FAttn[j, i, 0], FDk);
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetWindowAttention.Backpropagate();
+begin
+  // The additive bias matrix is a CONSTANT (zero self-gradient) and the
+  // post-softmax weights FAttn are already cached, so the score/Q/K/V backward
+  // is byte-identical to the parent SDPA. The bias neuron is never stepped.
+  inherited Backpropagate();
+end;
+
 { TNNetSinkAttention }
 
 constructor TNNetSinkAttention.Create(d_k: integer; pCausalMask: boolean;
@@ -30955,6 +31163,117 @@ begin
     ChannelsStr := ChannelsStr + IntToStr(FChannels[I]);
   end;
   Result := StringReplace(inherited SaveStructureToString,'::',':'+ChannelsStr+':',[rfReplaceAll]);
+end;
+
+{ TNNetGatherTokens }
+
+constructor TNNetGatherTokens.Create();
+begin
+  Create([0]);
+end;
+
+constructor TNNetGatherTokens.Create(pTokens: array of integer);
+var
+  I: integer;
+begin
+  inherited Create();
+  SetLength(FTokens, Length(pTokens));
+  for I := 0 to High(pTokens) do
+    FTokens[I] := pTokens[I];
+end;
+
+destructor TNNetGatherTokens.Destroy();
+begin
+  SetLength(FTokens, 0);
+  inherited Destroy();
+end;
+
+procedure TNNetGatherTokens.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  I, Tok, SeqLen, OutLen: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  SeqLen := pPrevLayer.Output.SizeX;
+  OutLen := Length(FTokens);
+  if OutLen = 0 then
+  begin
+    FErrorProc('TNNetGatherTokens requires a non-empty index list');
+    Exit;
+  end;
+  if pPrevLayer.Output.SizeY <> 1 then
+    FErrorProc('TNNetGatherTokens requires a (SizeX,1,Depth) sequence, got ' +
+      'SizeY=' + IntToStr(pPrevLayer.Output.SizeY));
+  for I := 0 to OutLen - 1 do
+  begin
+    Tok := FTokens[I];
+    if (Tok < 0) or (Tok >= SeqLen) then
+    begin
+      FErrorProc('TNNetGatherTokens requires 0 <= idx < Input.SizeX, got idx=' +
+        IntToStr(Tok) + ' SizeX=' + IntToStr(SeqLen));
+      Exit;
+    end;
+  end;
+  FOutput.ReSize(OutLen, 1, pPrevLayer.Output.Depth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetGatherTokens.Compute();
+var
+  StartTime: double;
+  X, D, MaxX, MaxD: integer;
+  Prev: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.Output;
+  MaxX := Length(FTokens) - 1;
+  MaxD := Prev.Depth - 1;
+  for X := 0 to MaxX do
+    for D := 0 to MaxD do
+      FOutput[X, 0, D] := Prev[FTokens[X], 0, D];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGatherTokens.Backpropagate();
+var
+  StartTime: double;
+  X, D, MaxX, MaxD: integer;
+  PrevErr: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  if Assigned(FPrevLayer) and
+    (FPrevLayer.OutputError.Size > 0) and
+    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
+  begin
+    PrevErr := FPrevLayer.OutputError;
+    MaxX := FOutput.SizeX - 1;
+    MaxD := FOutput.Depth - 1;
+    // Scatter each output position's error back to its source position. Add (not
+    // assign) so repeated indices correctly accumulate onto the shared source.
+    for X := 0 to MaxX do
+      for D := 0 to MaxD do
+        PrevErr.Add(FTokens[X], 0, D, FOutputError[X, 0, D]);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+function TNNetGatherTokens.SaveStructureToString(): string;
+var
+  I, MaxTokens: integer;
+  TokensStr: string;
+begin
+  TokensStr := '';
+  MaxTokens := Length(FTokens) - 1;
+  for I := 0 to MaxTokens do
+  begin
+    if I > 0 then TokensStr := TokensStr + ';';
+    TokensStr := TokensStr + IntToStr(FTokens[I]);
+  end;
+  Result := StringReplace(inherited SaveStructureToString,'::',':'+TokensStr+':',[rfReplaceAll]);
 end;
 
 { TNNetChannelShuffle }
@@ -87622,6 +87941,7 @@ begin
       'TNNetT5RelPosBiasAttention' : Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
       'TNNetDisentangledAttention' : Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]);
       'TNNetALiBiAttention' :       Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]);
+      'TNNetWindowAttention' :      Result := TNNetWindowAttention.Create(St[0], St[5]);
       'TNNetSinkAttention' :        Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetGptOssSinkAttention' :  Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]);
       'TNNetDifferentialAttention' : Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]);
@@ -87779,10 +88099,11 @@ begin
       'TNNetMaskedMean':            Result := TNNetMaskedMean.Create();
       'TNNetMaskedMax':             Result := TNNetMaskedMax.Create();
       'TNNetMinChannel':            Result := TNNetMinChannel.Create();
-      'TNNetConcat' :               Result := TNNetConcat.Create(aL);
+      'TNNetConcat' :               Result := TNNetConcat.Create(St[0], St[1], St[2], aL);
       'TNNetDeepConcat' :           Result := TNNetDeepConcat.Create(aL);
       'TNNetGather' :               Result := TNNetGather.Create(St[0]);
       'TNNetGatherChannels' :       Result := TNNetGatherChannels.Create(aIdx);
+      'TNNetGatherTokens' :         Result := TNNetGatherTokens.Create(aIdx);
       'TNNetInterleaveChannels' :   Result := TNNetInterleaveChannels.Create(St[0]);
       'TNNetSpaceToDepth' :         Result := TNNetSpaceToDepth.Create(St[0]);
       'TNNetDepthToSpace' :         Result := TNNetDepthToSpace.Create(St[0]);
@@ -88015,6 +88336,7 @@ begin
       if S[0] = 'TNNetT5RelPosBiasAttention' then Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else
       if S[0] = 'TNNetDisentangledAttention' then Result := TNNetDisentangledAttention.Create(St[0], St[1] = 1, St[3], St[4], St[5]) else
       if S[0] = 'TNNetALiBiAttention' then Result := TNNetALiBiAttention.Create(St[0], St[1] = 1, Ft[1], St[2]) else
+      if S[0] = 'TNNetWindowAttention' then Result := TNNetWindowAttention.Create(St[0], St[5]) else
       if S[0] = 'TNNetSinkAttention' then Result := TNNetSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetGptOssSinkAttention' then Result := TNNetGptOssSinkAttention.Create(St[0], St[1] = 1, St[2]) else
       if S[0] = 'TNNetDifferentialAttention' then Result := TNNetDifferentialAttention.Create(St[0], St[1] = 1, Ft[0]) else
@@ -88174,9 +88496,10 @@ begin
       if S[0] = 'TNNetMaskedMean' then Result := TNNetMaskedMean.Create() else
       if S[0] = 'TNNetMaskedMax' then Result := TNNetMaskedMax.Create() else
       if S[0] = 'TNNetMinChannel' then Result := TNNetMinChannel.Create() else
-      if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(aL) else
+      if S[0] = 'TNNetConcat' then Result := TNNetConcat.Create(St[0], St[1], St[2], aL) else
       if S[0] = 'TNNetGather' then Result := TNNetGather.Create(St[0]) else
       if S[0] = 'TNNetGatherChannels' then Result := TNNetGatherChannels.Create(aIdx) else
+      if S[0] = 'TNNetGatherTokens' then Result := TNNetGatherTokens.Create(aIdx) else
       if S[0] = 'TNNetInterleaveChannels' then Result := TNNetInterleaveChannels.Create(St[0]) else
       if S[0] = 'TNNetSpaceToDepth' then Result := TNNetSpaceToDepth.Create(St[0]) else
       if S[0] = 'TNNetDepthToSpace' then Result := TNNetDepthToSpace.Create(St[0]) else

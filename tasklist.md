@@ -320,12 +320,25 @@ rather than acted on.
       the ViT encoder path; the new code is the convolutional fusion decoder.
       Pico parity vs HF float64 + a real-image relative-depth sanity check;
       demo: examples/DepthEstimation writes a depth map for one CPU image.
-- [ ] Swin Transformer importer (microsoft/swin-tiny-patch4-window7-224) —
+- [X] Swin Transformer importer (microsoft/swin-tiny-patch4-window7-224) —
       hierarchical shifted-window ViT, structurally distinct from the plain ViT
       / DINOv2 / SigLIP towers already landed (patch-merging downsampling +
       window partition + the cyclic-shift mask + relative-position-bias table).
       Needs a window-partition/reverse helper and the shifted-window attention
       mask; relative position bias maps onto an additive-bias attention path.
+      DONE: BuildSwinFromSafeTensors[Ex] + TSwinConfig + ReadSwinConfigFromJSON
+      File + SwinConfigToString (model_type "swin"). FULL shifted-window path
+      (W-MSA + SW-MSA with cyclic-shift mask), per-head relative_position_bias,
+      patch-merging, mean-pool + classifier. New layers: TNNetWindowAttention
+      (additive per-(query,key) bias = rel-pos bias + shift mask, SDPA subclass)
+      and TNNetGatherTokens (X-axis token reorder for window partition/reverse/
+      merge). Pico parity (tools/swin_tiny_fixture.py, HF float64 oracle): max
+      |logit diff| ~9e-9 < 1e-4. Tests TestSwinConfigFromJSONFile +
+      TestSwinImageClassificationParity. Follow-ups: window attention currently
+      instantiates one TNNetWindowAttention per (window,head) — a single
+      block-diagonal window-attention layer would shrink the graph for the full
+      swin-tiny (56x56 grid, 64 windows); also Swin-v2 (cosine attention +
+      log-spaced continuous position bias) and the masked-image-modeling head.
       Pico parity vs HF float64 producing ImageNet-1k logits; reuses the vision
       preprocessing helper. Hierarchical backbone also unblocks SegFormer/DETR.
 - [X] MobileNetV3 importer (torchvision) — DONE: BuildMobileNetV3[FromSafeTensors

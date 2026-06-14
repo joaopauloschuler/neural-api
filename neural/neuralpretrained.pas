@@ -5015,6 +5015,54 @@ function BuildMobileNetV3FromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// SWIN TRANSFORMER IMPORT (microsoft/swin-* "swin"): hierarchical shifted-
+// window vision transformer. Structurally distinct from the plain ViT towers
+// (CLIP/SigLIP/DINOv2): patch-merging downsampling between stages, window
+// partition + cyclic-shift attention mask, and a per-head relative-position-
+// bias table. Window attention is the new TNNetWindowAttention layer (additive
+// per-(query,key) bias = relative-position bias + shift mask); token reordering
+// for window partition / reverse is the new TNNetGatherTokens layer.
+// ---------------------------------------------------------------------------
+type
+  TSwinConfig = record
+    ModelType: string;     // 'swin'
+    ImageSize: integer;    // 224 canonical
+    PatchSize: integer;    // 4
+    NumChannels: integer;  // 3
+    EmbedDim: integer;     // stage-0 hidden dim (96 for swin-tiny)
+    Depths: array of integer;     // blocks per stage, e.g. [2,2,6,2]
+    NumHeads: array of integer;   // heads per stage, e.g. [3,6,12,24]
+    WindowSize: integer;   // 7
+    MlpRatio: TNeuralFloat;// 4.0
+    QkvBias: boolean;      // true
+    HiddenAct: string;     // 'gelu'
+    LayerNormEps: TNeuralFloat; // 1e-5
+    NumLabels: integer;    // 1000 ImageNet-1k
+  end;
+
+// Reads a HF "swin" config.json. Required-ish keys: image_size, patch_size,
+// num_channels, embed_dim, depths (array), num_heads (array), window_size,
+// mlp_ratio, qkv_bias, hidden_act, layer_norm_eps, num_labels / id2label.
+function ReadSwinConfigFromJSONFile(const FileName: string): TSwinConfig;
+
+function SwinConfigToString(const Config: TSwinConfig): string;
+
+// Builds the Swin classifier described by Config and loads every weight from
+// Reader (caller owns Reader). The net takes an (ImageSize, ImageSize,
+// NumChannels) normalized RGB volume and outputs (1, 1, NumLabels) logits.
+function BuildSwinFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TSwinConfig; pInferenceOnly: boolean = false): TNNet; overload;
+
+// Builds + loads the Swin classifier from a checkpoint file. Config supplied by
+// the caller (Ex) or read from ConfigFileName ('' = "config.json" beside it).
+function BuildSwinFromSafeTensorsEx(const FileName: string;
+  const Config: TSwinConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildSwinFromSafeTensors(const FileName: string;
+  out Config: TSwinConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+// ---------------------------------------------------------------------------
 // VGG-16 / VGG-19 IMPORT (torchvision / timm "vgg", the canonical perceptual-
 // feature backbone and the prerequisite for LPIPS + neural style transfer).
 // The architecture is a STRAIGHT stack with NO residuals or norm bookkeeping:
@@ -32125,6 +32173,531 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMobileNetV3ConfigFromJSONFile(ConfigPath);
   Result := BuildMobileNetV3FromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// SWIN TRANSFORMER IMPORT
+// ===========================================================================
+
+function ReadSwinConfigFromJSONFile(const FileName: string): TSwinConfig;
+var
+  JsonText: TStringList;
+  Root, ArrData, LabelObj: TJSONData;
+  Obj: TJSONObject;
+  Arr: TJSONArray;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('Swin import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Swin import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Swin import: config "' + FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'swin');
+    Result.ImageSize := Obj.Get('image_size', 224);
+    Result.PatchSize := Obj.Get('patch_size', 4);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.EmbedDim := Obj.Get('embed_dim', 96);
+    Result.WindowSize := Obj.Get('window_size', 7);
+    Result.MlpRatio := Obj.Get('mlp_ratio', TJSONFloat(4.0));
+    Result.QkvBias := Obj.Get('qkv_bias', true);
+    Result.HiddenAct := Obj.Get('hidden_act', 'gelu');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', TJSONFloat(1e-5));
+    // depths
+    ArrData := Obj.Find('depths');
+    if (ArrData = nil) or not (ArrData is TJSONArray) then
+      ImportError('Swin import: config is missing the required "depths" array.');
+    Arr := TJSONArray(ArrData);
+    if Arr.Count < 1 then ImportError('Swin import: "depths" must be non-empty.');
+    SetLength(Result.Depths, Arr.Count);
+    for i := 0 to Arr.Count - 1 do Result.Depths[i] := Arr.Integers[i];
+    // num_heads
+    ArrData := Obj.Find('num_heads');
+    if (ArrData = nil) or not (ArrData is TJSONArray) then
+      ImportError('Swin import: config is missing the required "num_heads" array.');
+    Arr := TJSONArray(ArrData);
+    if Arr.Count <> Length(Result.Depths) then
+      ImportError('Swin import: "num_heads" length must match "depths".');
+    SetLength(Result.NumHeads, Arr.Count);
+    for i := 0 to Arr.Count - 1 do Result.NumHeads[i] := Arr.Integers[i];
+    // num_labels
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+    if LowerCase(Result.HiddenAct) <> 'gelu' then
+      ImportError('Swin import: only hidden_act="gelu" is supported (got "' +
+        Result.HiddenAct + '").');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function SwinConfigToString(const Config: TSwinConfig): string;
+var
+  i: integer;
+  DStr, HStr: string;
+begin
+  DStr := ''; HStr := '';
+  for i := 0 to High(Config.Depths) do
+  begin
+    if i > 0 then begin DStr := DStr + ','; HStr := HStr + ','; end;
+    DStr := DStr + IntToStr(Config.Depths[i]);
+    HStr := HStr + IntToStr(Config.NumHeads[i]);
+  end;
+  Result := 'swin config: embed_dim=' + IntToStr(Config.EmbedDim) +
+    ', depths=[' + DStr + '], num_heads=[' + HStr + ']' +
+    ', window=' + IntToStr(Config.WindowSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', mlp_ratio=' + FloatToStr(Config.MlpRatio) +
+    ', num_labels=' + IntToStr(Config.NumLabels) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps);
+end;
+
+// Builds, for one Swin block at the given grid resolution and window/shift, the
+// per-(query,key) relative_position_index (HF _create_relative_position_index)
+// AND the cyclic-shift image-region id of every window token. The window order
+// is HF window_partition order: windows iterate (window-row outer, window-col
+// inner); within a window the tokens iterate (iy outer, ix inner). Tokens are
+// laid out in the flat sequence in row-major (y*Grid + x) order. The returned
+// SwinTokenPerm maps output sequence position -> source flat token index
+// (with the cyclic roll by -ShiftSize baked in when Shifted), so a
+// TNNetGatherTokens(SwinTokenPerm) reorders the sequence into window-contiguous
+// (and shifted) order; its inverse undoes it.
+procedure SwinBuildWindowLayout(Grid, WindowSize, ShiftSize: integer;
+  Shifted: boolean; out TokenPerm: TNeuralIntegerArray;
+  out InvPerm: TNeuralIntegerArray; out RelPosIndex: TNeuralIntegerArray;
+  out RegionId: TNeuralIntegerArray; out NumWindows: integer);
+var
+  WPerSide, ws2, w, wy, wx, iy, ix, gy, gx, srcY, srcX, outPos, i, j: integer;
+  qy, qx, ky, kx, dy, dx, idx: integer;
+begin
+  WPerSide := Grid div WindowSize;
+  NumWindows := WPerSide * WPerSide;
+  ws2 := WindowSize * WindowSize;
+  // ---- token permutation (window partition + optional cyclic roll) ----
+  SetLength(TokenPerm, Grid * Grid);
+  SetLength(InvPerm, Grid * Grid);
+  SetLength(RegionId, NumWindows * ws2);
+  outPos := 0;
+  for wy := 0 to WPerSide - 1 do
+    for wx := 0 to WPerSide - 1 do
+      for iy := 0 to WindowSize - 1 do
+        for ix := 0 to WindowSize - 1 do
+        begin
+          // position in the (possibly shifted) padded grid
+          gy := wy * WindowSize + iy;
+          gx := wx * WindowSize + ix;
+          if Shifted then
+          begin
+            // HF rolls hidden_states by (-shift,-shift) BEFORE partition, so the
+            // token at shifted position (gy,gx) is the original token at
+            // ((gy+shift) mod Grid, (gx+shift) mod Grid).
+            srcY := (gy + ShiftSize) mod Grid;
+            srcX := (gx + ShiftSize) mod Grid;
+          end
+          else
+          begin
+            srcY := gy; srcX := gx;
+          end;
+          TokenPerm[outPos] := srcY * Grid + srcX;
+          outPos := outPos + 1;
+        end;
+  for i := 0 to Grid * Grid - 1 do
+    InvPerm[TokenPerm[i]] := i;
+  // ---- relative position index (one window; same for every window) ----
+  SetLength(RelPosIndex, ws2 * ws2);
+  for qy := 0 to WindowSize - 1 do
+    for qx := 0 to WindowSize - 1 do
+      for ky := 0 to WindowSize - 1 do
+        for kx := 0 to WindowSize - 1 do
+        begin
+          i := qy * WindowSize + qx;   // query within-window index
+          j := ky * WindowSize + kx;   // key within-window index
+          dy := (qy - ky) + (WindowSize - 1);
+          dx := (qx - kx) + (WindowSize - 1);
+          idx := dy * (2 * WindowSize - 1) + dx;
+          RelPosIndex[i * ws2 + j] := idx;
+        end;
+  // ---- cyclic-shift region ids (HF get_attn_mask img_mask) ----
+  // For the shifted layer, partition the GRID into 9 regions via the three
+  // height/width slices [0:-ws], [-ws:-shift], [-shift:] and assign an
+  // increasing count to each (region-row outer, region-col inner). Tokens in
+  // the SAME window may only attend when they share a region id.
+  if Shifted then
+  begin
+    outPos := 0;
+    for wy := 0 to WPerSide - 1 do
+      for wx := 0 to WPerSide - 1 do
+        for iy := 0 to WindowSize - 1 do
+          for ix := 0 to WindowSize - 1 do
+          begin
+            gy := wy * WindowSize + iy;
+            gx := wx * WindowSize + ix;
+            // region row/col id from the HF slice boundaries
+            if gy < Grid - WindowSize then i := 0
+            else if gy < Grid - ShiftSize then i := 1
+            else i := 2;
+            if gx < Grid - WindowSize then j := 0
+            else if gx < Grid - ShiftSize then j := 1
+            else j := 2;
+            RegionId[outPos] := i * 3 + j;
+            outPos := outPos + 1;
+          end;
+  end
+  else
+    for i := 0 to NumWindows * ws2 - 1 do RegionId[i] := 0;
+end;
+
+// Loads the relative_position_bias_table [(2*ws-1)^2, NumHeads] for one block
+// and, for the given head, gathers + adds the cyclic-shift mask of window W to
+// produce the ws2 x ws2 bias matrix consumed by TNNetWindowAttention.
+procedure SwinSetWindowBias(WinAttn: TNNetLayer; BiasTable: TNNetVolume;
+  const RelPosIndex, RegionId: TNeuralIntegerArray;
+  HeadIdx, NumHeads, WindowSize, WindowOfs: integer);
+var
+  ws2, i, j, idx: integer;
+  Mat: TNNetVolume;
+  RegBase: integer;
+  qReg, kReg: integer;
+begin
+  ws2 := WindowSize * WindowSize;
+  RegBase := WindowOfs * ws2;
+  Mat := TNNetVolume.Create(ws2 * ws2, 1, 1);
+  try
+    for i := 0 to ws2 - 1 do
+      for j := 0 to ws2 - 1 do
+      begin
+        idx := RelPosIndex[i * ws2 + j];
+        // BiasTable row = idx, column = head: flat index idx*NumHeads + head.
+        Mat.FData[i * ws2 + j] := BiasTable.FData[idx * NumHeads + HeadIdx];
+        // cyclic-shift mask: -100 (HF) when the two tokens are in different
+        // image regions. We use a large negative sentinel.
+        qReg := RegionId[RegBase + i];
+        kReg := RegionId[RegBase + j];
+        if qReg <> kReg then
+          Mat.FData[i * ws2 + j] := Mat.FData[i * ws2 + j] - 1e9;
+      end;
+    TNNetWindowAttention(WinAttn).SetBiasMatrix(Mat);
+  finally
+    Mat.Free;
+  end;
+end;
+
+// Loads the biased patch-embedding conv bias [EmbedDim] into each neuron's
+// BiasWeight (LoadClipPatchConv zeroes the bias; Swin's projection IS biased).
+procedure LoadSwinPatchConvBias(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const BiasName: string; EmbedDim: integer);
+var
+  Tmp: TNNetVolume;
+  ci: integer;
+begin
+  if not Reader.HasTensor(BiasName) then
+    ImportError('Swin import: missing tensor "' + BiasName + '".');
+  if (Reader.DimCount(BiasName) <> 1) or
+     (Reader.DimSize(BiasName, 0) <> EmbedDim) then
+    ImportError('Swin import: "' + BiasName + '" must have shape [' +
+      IntToStr(EmbedDim) + '], got ' + Reader.ShapeAsString(BiasName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(BiasName, Tmp);
+    for ci := 0 to EmbedDim - 1 do
+      Layer.Neurons[ci].BiasWeight := Tmp.FData[ci];
+    Layer.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+end;
+
+function BuildSwinFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TSwinConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  PatchConv, EmbNorm, FinalNorm, Classifier, Pooled, GridMap: TNNetLayer;
+  StageIn: TNNetLayer;
+  NumStages, StageIdx, BlockIdx, Grid, Dim, Heads, HeadDim, ws, NumWindows: integer;
+  ShiftSize, EffWindow, EffShift: integer;
+  Shifted: boolean;
+  ws2, h, wIdx, ci, NumTokens, MlpHidden: integer;
+  Prefix, BPrefix: string;
+  TokenPerm, InvPerm, RelPosIndex, RegionId, Channels: TNeuralIntegerArray;
+  ShortcutA, NormBefore, Reordered, WinSlice, QProj, KProj, VProj: TNNetLayer;
+  QSlice, KSlice, VSlice, QKV, HeadAttn, AttnConcat, OProj: TNNetLayer;
+  WindowOuts: array of TNNetLayer;
+  HeadOuts: array of TNNetLayer;
+  WinAttnLayers: array of TNNetLayer;
+  WinLayerW: array of integer;
+  WinLayerH: array of integer;
+  AllWindowConcat, ReorderBack, AttnResidual: TNNetLayer;
+  NormAfter, Fc1, Fc2, MlpResidual: TNNetLayer;
+  MergeNorm, MergeReduce: TNNetLayer;
+  MergePerm: TNeuralIntegerArray;
+  BiasTable: TNNetVolume;
+  gy, gx, ny, nx, half: integer;
+  PatchGrid: integer;
+begin
+  NumStages := Length(Config.Depths);
+  if (Config.EmbedDim < 1) or (Config.NumHeads[0] < 1) or
+     ((Config.EmbedDim mod Config.NumHeads[0]) <> 0) then
+    ImportError('Swin import: embed_dim=' + IntToStr(Config.EmbedDim) +
+      ' must be divisible by num_heads[0].');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0) then
+    ImportError('Swin import: image_size not a multiple of patch_size.');
+  PatchGrid := Config.ImageSize div Config.PatchSize;
+  ws := Config.WindowSize;
+  NN := TNNet.Create();
+  SetLength(WinAttnLayers, 0);
+  SetLength(WinLayerW, 0);
+  SetLength(WinLayerH, 0);
+  try
+    // ---------------- Patch embedding ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.EmbedDim, Config.PatchSize, 0, Config.PatchSize, 0) );
+    // Flatten the (gridW, gridH, C) map to a (gridW*gridH, 1, C) token sequence
+    // in row-major (y*Grid + x) order (HF flatten(2).transpose).
+    NN.AddLayer( TNNetReshape.Create(PatchGrid * PatchGrid, 1, Config.EmbedDim) );
+    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    StageIn := EmbNorm;
+    Grid := PatchGrid;
+    Dim := Config.EmbedDim;
+
+    // ---------------- Stages ----------------
+    for StageIdx := 0 to NumStages - 1 do
+    begin
+      Heads := Config.NumHeads[StageIdx];
+      HeadDim := Dim div Heads;
+      // HF clamps window (and zeroes shift) when the grid <= window.
+      if Grid <= ws then
+      begin
+        EffWindow := Grid;
+        ShiftSize := 0;
+      end
+      else
+      begin
+        EffWindow := ws;
+        ShiftSize := ws div 2;
+      end;
+      ws2 := EffWindow * EffWindow;
+      Prefix := 'encoder.layers.' + IntToStr(StageIdx) + '.';
+      for BlockIdx := 0 to Config.Depths[StageIdx] - 1 do
+      begin
+        Shifted := (Odd(BlockIdx)) and (ShiftSize > 0);
+        if Shifted then EffShift := ShiftSize else EffShift := 0;
+        BPrefix := Prefix + 'blocks.' + IntToStr(BlockIdx) + '.';
+        SwinBuildWindowLayout(Grid, EffWindow, EffShift, Shifted,
+          TokenPerm, InvPerm, RelPosIndex, RegionId, NumWindows);
+
+        ShortcutA := StageIn;
+        // --- W-MSA / SW-MSA ---
+        NormBefore := NN.AddLayerAfter(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps), StageIn);
+        // Reorder tokens into window-contiguous (and shifted) order.
+        Reordered := NN.AddLayer( TNNetGatherTokens.Create(TokenPerm) );
+        SetLength(WindowOuts, NumWindows);
+        for wIdx := 0 to NumWindows - 1 do
+        begin
+          // crop this window's ws2 contiguous tokens (X-slice)
+          WinSlice := NN.AddLayerAfter(
+            TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
+          // per-token Q/K/V projections (Linear over depth)
+          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
+          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
+          SetLength(HeadOuts, Heads);
+          SetLength(Channels, HeadDim);
+          for h := 0 to Heads - 1 do
+          begin
+            for ci := 0 to HeadDim - 1 do Channels[ci] := h * HeadDim + ci;
+            QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), QProj);
+            KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), KProj);
+            VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), VProj);
+            QKV := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+            HeadAttn := NN.AddLayer( TNNetWindowAttention.Create(HeadDim, ws2) );
+            SetLength(WinAttnLayers, Length(WinAttnLayers) + 1);
+            WinAttnLayers[High(WinAttnLayers)] := HeadAttn;
+            SetLength(WinLayerW, Length(WinLayerW) + 1);
+            WinLayerW[High(WinLayerW)] := wIdx;
+            SetLength(WinLayerH, Length(WinLayerH) + 1);
+            WinLayerH[High(WinLayerH)] := h;
+            HeadOuts[h] := HeadAttn;
+          end;
+          AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
+          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+          WindowOuts[wIdx] := OProj;
+          // load q/k/v/o weights for this window (shared across windows -> the
+          // same checkpoint tensors load into every window's projections)
+          LoadLlamaLinearWeights(Reader, QProj, BPrefix + 'attention.q_proj.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.q_proj.bias');
+          LoadLlamaLinearWeights(Reader, KProj, BPrefix + 'attention.k_proj.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.k_proj.bias');
+          LoadLlamaLinearWeights(Reader, VProj, BPrefix + 'attention.v_proj.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.v_proj.bias');
+          LoadLlamaLinearWeights(Reader, OProj, BPrefix + 'attention.o_proj.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.o_proj.bias');
+        end;
+        // concatenate all windows back along X (explicit (NumWindows*ws2,1,Dim)
+        // target so ConcatInto preserves depth: each window output is
+        // (ws2,1,Dim) and the flat concat lands token w*ws2+t at the right
+        // place), then invert the reorder.
+        AllWindowConcat := NN.AddLayer(
+          TNNetConcat.Create(NumWindows * ws2, 1, Dim, WindowOuts) );
+        ReorderBack := NN.AddLayer( TNNetGatherTokens.Create(InvPerm) );
+        AttnResidual := NN.AddLayer( TNNetSum.Create([ReorderBack, ShortcutA]) );
+
+        // --- MLP ---
+        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        MlpHidden := Round(Dim * Config.MlpRatio);
+        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden) );
+        NN.AddLayer( TNNetGELU.Create() );
+        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+        MlpResidual := NN.AddLayer( TNNetSum.Create([Fc2, AttnResidual]) );
+        StageIn := MlpResidual;
+
+        // load relative_position_bias_table for this block + set each head's
+        // bias matrix (per window, includes the cyclic-shift mask).
+        BiasTable := TNNetVolume.Create;
+        try
+          Reader.LoadTensorFlat(BPrefix +
+            'attention.relative_position_bias.relative_position_bias_table',
+            BiasTable);
+          // The just-added attention layers for this block are the last
+          // NumWindows*Heads entries of WinAttnLayers (appended outer window,
+          // inner head).
+          for wIdx := 0 to NumWindows - 1 do
+            for h := 0 to Heads - 1 do
+            begin
+              ci := Length(WinAttnLayers) - NumWindows * Heads + wIdx * Heads + h;
+              SwinSetWindowBias(WinAttnLayers[ci], BiasTable,
+                RelPosIndex, RegionId, h, Heads, EffWindow, wIdx);
+            end;
+        finally
+          BiasTable.Free;
+        end;
+        // load this block's layernorms + mlp
+        LoadLayerNormWeights(Reader, NormBefore,
+          BPrefix + 'layernorm_before.weight', BPrefix + 'layernorm_before.bias', Dim);
+        LoadLayerNormWeights(Reader, NormAfter,
+          BPrefix + 'layernorm_after.weight', BPrefix + 'layernorm_after.bias', Dim);
+        LoadLlamaLinearWeights(Reader, Fc1, BPrefix + 'mlp.fc1.weight',
+          Dim, MlpHidden, 0, -1, 0, BPrefix + 'mlp.fc1.bias');
+        LoadLlamaLinearWeights(Reader, Fc2, BPrefix + 'mlp.fc2.weight',
+          MlpHidden, Dim, 0, -1, 0, BPrefix + 'mlp.fc2.bias');
+      end;
+
+      // ---------------- Patch merging (between stages) ----------------
+      if StageIdx < NumStages - 1 then
+      begin
+        half := Grid div 2;
+        // HF concat order: cat([x[r::2,c::2] for col in range(2) for row in range(2)])
+        // i.e. groups (col,row) = (0,0),(0,1),(1,0),(1,1) -> 4 channel blocks.
+        // We reorder the (Grid*Grid,1,Dim) tokens so each merged token's 4
+        // sources are contiguous, then a reshape packs them into depth 4*Dim.
+        SetLength(MergePerm, Grid * Grid);
+        ci := 0;
+        for ny := 0 to half - 1 do
+          for nx := 0 to half - 1 do
+          begin
+            // for this output token (ny,nx), the 4 sources in HF order:
+            // (col=0,row=0):(2ny,2nx) (col=0,row=1):(2ny+1,2nx)
+            // (col=1,row=0):(2ny,2nx+1) (col=1,row=1):(2ny+1,2nx+1)
+            gy := 2 * ny;     gx := 2 * nx;     MergePerm[ci] := gy * Grid + gx; Inc(ci);
+            gy := 2 * ny + 1; gx := 2 * nx;     MergePerm[ci] := gy * Grid + gx; Inc(ci);
+            gy := 2 * ny;     gx := 2 * nx + 1; MergePerm[ci] := gy * Grid + gx; Inc(ci);
+            gy := 2 * ny + 1; gx := 2 * nx + 1; MergePerm[ci] := gy * Grid + gx; Inc(ci);
+          end;
+        NN.AddLayer( TNNetGatherTokens.Create(MergePerm) );
+        // pack each group of 4 contiguous tokens (4*Dim values) into one token
+        // of depth 4*Dim: (4*half*half,1,Dim) -> (half*half,1,4*Dim).
+        NN.AddLayer( TNNetReshape.Create(half * half, 1, 4 * Dim) );
+        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim) );
+        LoadLayerNormWeights(Reader, MergeNorm,
+          Prefix + 'downsample.norm.weight', Prefix + 'downsample.norm.bias', 4 * Dim);
+        // reduction is a bias-free Linear [2*Dim, 4*Dim]
+        LoadLlamaLinearWeights(Reader, MergeReduce,
+          Prefix + 'downsample.reduction.weight', 4 * Dim, 2 * Dim);
+        StageIn := MergeReduce;
+        Grid := half;
+        Dim := 2 * Dim;
+      end;
+    end;
+
+    // ---------------- Head ----------------
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    NumTokens := Grid * Grid;
+    // mean-pool over tokens: reshape the (NumTokens,1,Dim) sequence into the
+    // square (Grid,Grid,Dim) map so TNNetAvgChannel (pool = Grid, divides by
+    // Grid*Grid = NumTokens) is the EXACT global token mean.
+    GridMap := NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
+    Pooled := NN.AddLayer( TNNetAvgChannel.Create() );
+    Classifier := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels) );
+    LoadLayerNormWeights(Reader, FinalNorm,
+      'layernorm.weight', 'layernorm.bias', Dim);
+    LoadLlamaLinearWeights(Reader, Classifier, 'classifier.weight',
+      Dim, Config.NumLabels, 0, -1, 0, 'classifier.bias');
+
+    // patch conv weights
+    LoadClipPatchConv(Reader, PatchConv,
+      'embeddings.patch_embeddings.projection.weight',
+      Config.NumChannels, Config.PatchSize, Config.EmbedDim);
+    LoadSwinPatchConvBias(Reader, PatchConv,
+      'embeddings.patch_embeddings.projection.bias', Config.EmbedDim);
+    LoadLayerNormWeights(Reader, EmbNorm,
+      'embeddings.norm.weight', 'embeddings.norm.bias', Config.EmbedDim);
+
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    if (GridMap = nil) or (Pooled = nil) then ; // silence unused
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildSwinFromSafeTensorsEx(const FileName: string;
+  const Config: TSwinConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildSwinFromSafeTensors(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildSwinFromSafeTensors(const FileName: string;
+  out Config: TSwinConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSwinConfigFromJSONFile(ConfigPath);
+  Result := BuildSwinFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

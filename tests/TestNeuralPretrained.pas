@@ -276,6 +276,8 @@ type
     procedure TestResNet18ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
     procedure TestMobileNetV3ImageClassificationParity;
+    procedure TestSwinConfigFromJSONFile;
+    procedure TestSwinImageClassificationParity;
     procedure TestVGGConfigParity;
     procedure TestVGGLogitParity;
     procedure TestVGGFeatureTaps;
@@ -12723,6 +12725,101 @@ begin
       NN.GetLastLayer().Output.Size);
 
     RefJson.LoadFromFile(FixturePath('tiny_mobilenetv3_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadSwinConfigFromJSONFile on the committed pico Swin config.
+procedure TTestNeuralPretrained.TestSwinConfigFromJSONFile;
+var
+  Config: TSwinConfig;
+begin
+  Config := ReadSwinConfigFromJSONFile(FixturePath('tiny_swin_config.json'));
+  AssertEquals('model_type', 'swin', Config.ModelType);
+  AssertEquals('image_size', 8, Config.ImageSize);
+  AssertEquals('patch_size', 2, Config.PatchSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('embed_dim', 4, Config.EmbedDim);
+  AssertEquals('window_size', 2, Config.WindowSize);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('num stages', 2, Length(Config.Depths));
+  AssertEquals('depth0', 2, Config.Depths[0]);
+  AssertEquals('depth1', 2, Config.Depths[1]);
+  AssertEquals('heads0', 2, Config.NumHeads[0]);
+  AssertEquals('heads1', 4, Config.NumHeads[1]);
+  AssertTrue('qkv_bias', Config.QkvBias);
+end;
+
+// Swin Transformer image-classification parity test. tests/fixtures/tiny_swin.*
+// is a pico random-init SwinForImageClassification (image 8, patch 2 -> 4x4
+// grid, embed_dim 4, depths [2,2], num_heads [2,4], window 2, 5 labels). The
+// fixture (tools/swin_tiny_fixture.py) uses the REAL HF Swin model cast to
+// float64 as the oracle. The config deliberately exercises the full shifted-
+// window path: stage 0 has an even block (W-MSA) and an odd block (SW-MSA with
+// cyclic shift + attention mask), a patch-merging downsample, the per-head
+// relative_position_bias_table, and a stage-1 grid that clamps the window.
+// Asserts the (1,1,num_labels) logits match the HF reference < 1e-4 - exercising
+// TNNetWindowAttention (rel-pos bias + shift mask) and TNNetGatherTokens
+// (window partition / reverse / patch-merge reorder).
+procedure TTestNeuralPretrained.TestSwinImageClassificationParity;
+var
+  NN: TNNet;
+  Config: TSwinConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildSwinFromSafeTensors(
+    FixturePath('tiny_swin.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_swin_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_swin_logits.json'));
     RefRoot := GetJSON(RefJson.Text);
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     LogitsArr := TJSONArray(TJSONArray(
