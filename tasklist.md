@@ -871,6 +871,72 @@ rather than acted on.
       ulimit-bounded demo that generates one small image from a hard-coded prompt is
       the capstone proving the CV-generative stack composes. Edit examples/README.md.
 
+- [ ] Mask R-CNN instance-segmentation importer + a RoIAlign primitive
+      (BuildMaskRCNNFromSafeTensors, e.g. torchvision maskrcnn_resnet50_fpn) — the
+      FIRST instance-segmentation vertical (per-OBJECT binary masks, distinct from
+      DETR's boxes-only, SegFormer's single dense class map, and SAM's prompt-driven
+      mask). Reuses two landed pieces — the ResNet-50 backbone importer and the
+      conv-BN-fold loader — and adds the FPN top-down feature pyramid (lateral 1x1 +
+      3x3 + nearest upsample, same blocks the tracked YOLO neck needs) plus the new
+      RoIAlign pooling primitive (bilinear-sampled fixed-size crop of a proposal box
+      from the chosen pyramid level — the genuinely new layer, sibling to the landed
+      DeformableConv bilinear sampler, with full input numerical-gradient coverage in
+      TestNeuralNumerical.pas). Scope v1 to INFERENCE with externally supplied
+      proposal boxes (skip training the RPN/anchors; feed a handful of boxes) ->
+      RoIAlign -> the box head (class + refined box) and the small mask head (4x conv
+      -> deconv -> per-class HxW mask). Pico parity vs a torchvision float64 oracle on
+      the mask-head logits for a fixed proposal + an examples/InstanceSegmentation that
+      overlays one object mask on a tiny CPU image. RoIAlign also unblocks any future
+      two-stage detector (Faster R-CNN box head).
+
+- [ ] TrOCR optical-character-recognition importer (BuildTrOCRFromSafeTensors, e.g.
+      microsoft/trocr-small-printed / trocr-small-handwritten) — the FIRST OCR /
+      image-to-text vertical: a cropped text-line image -> a transcribed string,
+      structurally an encoder-decoder seq2seq with a VISION encoder (unlike the landed
+      text-only T5/Marian/Pegasus/mBART seq2seq importers). Reuses almost everything:
+      the encoder is a stock ViT/DeiT/BEiT patch-embedding transformer
+      (BuildClipVisionTower / BuildViTFromSafeTensors path, no CLS-pool — the decoder
+      cross-attends ALL patch tokens), the decoder is a stock RoBERTa-style causal
+      transformer with cross-attention (the same two-source cross-attn the T5/Marian
+      importers already wire), and decode is the landed DecodeSeq2SeqGreedy/BeamSearch
+      with an encoder-states input (T5EncoderStatesInput convention). The only new code
+      is the TrOCR tensor-name mapping (encoder.* DeiT names + decoder.* with learned
+      absolute position embeddings, NOT RoPE) and the GPT-2-byte-level decoder
+      tokenizer wiring. Pico parity vs HF float64 on the decoder logits for a fixed
+      image + first token + an examples/OCRTranscribe that reads text off one small CPU
+      image. First image-in/text-out generative importer alongside the tracked LLaVA.
+
+- [ ] EfficientNet (timm / torchvision efficientnet_b0..b7) real-checkpoint importer
+      (BuildEfficientNetFromSafeTensors) — promotes the documented MBConv follow-up
+      noted in neuralpretrained.pas (above the MobileNetV3 importer) into a real
+      importer of a top-tier CNN backbone family that CANNOT be imported today. Reuses
+      the landed MBConv primitives + conv-BN-fold loader wholesale; the genuine deltas
+      vs MobileNetV3 are small and well-scoped: the squeeze-excite uses SiLU(swish) +
+      plain sigmoid (not MobileNetV3's ReLU + hard-sigmoid), stochastic-depth survival
+      prob is a forward no-op at inference, and the per-block expand/kernel/stride/SE
+      table comes from the b0..b7 compound-scaling config (read from JSON like the
+      MobileNetV3 block table). Pico parity vs a torchvision float64 oracle on the
+      logits + reuse of the tracked ImageNet eval harness for a real-checkpoint top-1
+      check. Adds a major missing backbone (also a common detection/segmentation
+      backbone) with minimal new code.
+
+- [ ] StyleGAN2 generator importer (BuildStyleGAN2Generator, e.g. a small
+      stylegan2-ffhq / a config-faithful pico) — the repo's only GANs are the
+      UNCONDITIONAL VisualGAN (noise -> CIFAR) and the tracked Pix2Pix conditional
+      translation; there is no STYLE-BASED synthesis import and no way to run a real
+      pretrained GAN generator. The genuinely new primitive is the MODULATED /
+      DEMODULATED convolution (per-layer style vector scales the conv weights, then a
+      demodulation normalization divides by the per-output-filter RMS — a weight-space
+      operation, not an activation; add it as a leaf layer with input numerical-gradient
+      coverage). The rest composes from landed pieces: the 8-layer mapping MLP
+      (z -> w latent), per-block upsample (TNNetUpsample) + modulated conv + per-pixel
+      noise injection (a scaled noise add) + leaky-ReLU, and the toRGB skip-sum tower.
+      Scope v1 to inference-only synthesis (no discriminator, no path-length reg). Pico
+      parity vs a reference float64 oracle on one generated tensor + an
+      examples/StyleGAN2Generate that writes one synthesized image on CPU from a fixed
+      latent. First style-based generative import; the modulated conv also underpins
+      later StyleGAN3 / diffusion-with-modulation work.
+
 ## Layer follow-ups that fix real limitations
 
 - [X] Asymmetric-kernel convolution (1xN / Nx1 factorized convs) — CAI
