@@ -385,10 +385,27 @@ rather than acted on.
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the
       source layers already hold int8 blocks).
-- [ ] GGUF writer follow-up: wire tools/verify_gguf_writer.py to assert
+- [X] GGUF writer follow-up: wire tools/verify_gguf_writer.py to assert
       next-token-logit parity against the Pascal model via llama-cpp-python
       (when installed), and emit the BPE merges array for byte-level-BPE
       tokenizers (v1 emits SP-style tokens/scores/token_type only).
+      DONE: TNeuralHFTokenizer.SaveTokenizerToGGUF emits model "gpt2" +
+      tokenizer.ggml.merges (rank-ordered) + tokens/scores/token_type + special
+      ids (the exact inverse of LoadFromGGUF), and "llama" Unigram-with-scores;
+      WordPiece rejected. Round-trip test TestSaveTokenizerToGGUFGpt2RoundTrip
+      (Pascal tokenizer -> writer -> reader, Encode/Decode id-identical) passes.
+      verify_gguf_writer.py now cross-checks next-token-logit parity (greedy
+      argmax + top-k ranking) via llama-cpp-python when importable and SKIPS
+      gracefully otherwise; the Pascal sidecar carries parity_prompt +
+      parity_next_token_logits. NOTE: the llama-cpp-python parity arm is wired
+      but UNVERIFIED end-to-end here (lib not installed in this env, and the
+      pico demo GGUF may be too small for llama.cpp to load) - it is written to
+      skip-not-fail; revisit once llama-cpp-python is available to confirm the
+      argmax/ranking actually agree on a real checkpoint.
+      Still open: SaveLlamaToGGUFEx itself still only takes a plain `Tokens`
+      array (SP "llama" model); a byte-level-BPE end-to-end model export would
+      route the gpt2 tokenizer block through SaveTokenizerToGGUF from the model
+      exporter, not just the tokenizer unit test.
 - [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.

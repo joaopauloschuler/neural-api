@@ -273,6 +273,17 @@ type
       //     tokenizer.ggml.{bos,eos,unknown,padding}_token_id when present.
       procedure LoadFromGGUF(const FileName: string);
 
+      // Emits this tokenizer's vocabulary as a GGUF tokenizer.ggml.* metadata
+      // block on an open TNNetGGUFWriter, the exact inverse of LoadFromGGUF.
+      // Writes tokenizer.ggml.model ("gpt2" for byte-level BPE, "llama" for
+      // Unigram-with-scores), the id-indexed .tokens / .scores / .token_type
+      // arrays, the .merges array (byte-level BPE only, ordered by rank), and
+      // the scalar bos/eos/unknown token ids when present. The caller adds the
+      // rest of the file (general.* metadata + tensors) and calls SaveToFile.
+      // Raises EHFTokenizerError for the WordPiece path (no GGUF "bert" model
+      // support yet) - mirrors LoadFromGGUF's supported-model set.
+      procedure SaveTokenizerToGGUF(Writer: TNNetGGUFWriter);
+
       // Text -> token ids. Special tokens are matched if present verbatim
       // in the text but never auto-injected.
       procedure Encode(const Text: string; Ids: TIntegerList); overload;
@@ -2008,6 +2019,99 @@ begin
   finally
     Reader.Free;
   end;
+end;
+
+procedure TNeuralHFTokenizer.SaveTokenizerToGGUF(Writer: TNNetGGUFWriter);
+// Inverse of LoadFromGGUF: serialize the in-memory vocab/merges/specials into
+// a tokenizer.ggml.* metadata block. token_type follows the llama.cpp enum
+// (1=NORMAL, 2=UNKNOWN, 3=CONTROL); added special pieces are tagged CONTROL
+// (the unk piece UNKNOWN) so the reader re-exposes them as added tokens.
+var
+  TokCount, Cnt, SepPos, Rank, MaxRank, Mi: integer;
+  Tokens, Merges: array of string;
+  Scores: array of single;
+  Types: array of Int64;
+  Sep, Combined, Left, Right: string;
+begin
+  if Writer = nil then
+    raise EHFTokenizerError.Create('SaveTokenizerToGGUF: nil writer.');
+  if FWordPiece then
+    raise EHFTokenizerError.Create('SaveTokenizerToGGUF: the WordPiece (BERT) ' +
+      'path has no GGUF "bert" tokenizer.ggml.model yet (only byte-level BPE ' +
+      '"gpt2" and Unigram-with-scores "llama").');
+
+  TokCount := Length(FIdToToken);
+  if TokCount = 0 then
+    raise EHFTokenizerError.Create('SaveTokenizerToGGUF: empty vocabulary ' +
+      '(load a tokenizer first).');
+
+  // ---- id-indexed tokens / scores / token_type ----
+  SetLength(Tokens, TokCount);
+  SetLength(Scores, TokCount);
+  SetLength(Types, TokCount);
+  for Cnt := 0 to TokCount - 1 do
+  begin
+    Tokens[Cnt] := FIdToToken[Cnt];
+    if FUnigram and (Cnt <= High(FUniScore))
+    then Scores[Cnt] := FUniScore[Cnt]
+    else Scores[Cnt] := 0;
+    Types[Cnt] := 1; // NORMAL (overridden below for added/special pieces)
+  end;
+  // Tag added pieces: special -> CONTROL (3); the unk piece -> UNKNOWN (2).
+  for Cnt := 0 to High(FAddedTokens) do
+    if (FAddedTokens[Cnt].Id >= 0) and (FAddedTokens[Cnt].Id <= High(Types)) then
+    begin
+      if FAddedTokens[Cnt].Id = FUnkId then Types[FAddedTokens[Cnt].Id] := 2
+      else if FAddedTokens[Cnt].Special then Types[FAddedTokens[Cnt].Id] := 3;
+    end;
+  if (FUnkId >= 0) and (FUnkId <= High(Types)) and (Types[FUnkId] = 1) then
+    Types[FUnkId] := 2;
+
+  if FByteLevel then Writer.AddMetaString('tokenizer.ggml.model', 'gpt2')
+  else if FUnigram then Writer.AddMetaString('tokenizer.ggml.model', 'llama')
+  else
+    raise EHFTokenizerError.Create('SaveTokenizerToGGUF: this tokenizer is ' +
+      'neither byte-level BPE nor Unigram; no GGUF model mapping.');
+
+  Writer.AddMetaStringArray('tokenizer.ggml.tokens', Tokens);
+  Writer.AddMetaFloat32Array('tokenizer.ggml.scores', Scores);
+  Writer.AddMetaInt32Array('tokenizer.ggml.token_type', Types);
+
+  // ---- merges (byte-level BPE only), restored to rank order ----
+  if FByteLevel and (FMerges.Count > 0) then
+  begin
+    Sep := csMergeSep;
+    MaxRank := 0;
+    for Cnt := 0 to FMerges.Count - 1 do
+    begin
+      Rank := integer(PtrInt(FMerges.Objects[Cnt]));
+      if Rank > MaxRank then MaxRank := Rank;
+    end;
+    // Ranks are dense 0..N-1 (LoadFromFile/LoadFromGGUF assign the array
+    // index); slot each "Left Right" string back into its rank position.
+    SetLength(Merges, MaxRank + 1);
+    for Cnt := 0 to High(Merges) do Merges[Cnt] := '';
+    for Mi := 0 to FMerges.Count - 1 do
+    begin
+      Combined := FMerges[Mi];
+      Rank := integer(PtrInt(FMerges.Objects[Mi]));
+      SepPos := Pos(Sep, Combined);
+      if SepPos <= 0 then continue;
+      Left := Copy(Combined, 1, SepPos - 1);
+      Right := Copy(Combined, SepPos + Length(Sep), Length(Combined));
+      if (Rank >= 0) and (Rank <= High(Merges)) then
+        Merges[Rank] := Left + ' ' + Right;
+    end;
+    Writer.AddMetaStringArray('tokenizer.ggml.merges', Merges);
+  end;
+
+  // ---- scalar special-token ids ----
+  if FBosId >= 0 then
+    Writer.AddMetaUInt32('tokenizer.ggml.bos_token_id', cardinal(FBosId));
+  if FEosId >= 0 then
+    Writer.AddMetaUInt32('tokenizer.ggml.eos_token_id', cardinal(FEosId));
+  if FUnkId >= 0 then
+    Writer.AddMetaUInt32('tokenizer.ggml.unknown_token_id', cardinal(FUnkId));
 end;
 
 function TNeuralHFTokenizer.FindAddedToken(const Text: string;

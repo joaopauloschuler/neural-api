@@ -72,6 +72,10 @@ type
     procedure TestLoadFromGGUFLlamaRoundTrip;
     procedure TestLoadFromGGUFGpt2RoundTrip;
     procedure TestLoadFromGGUFRejectsUnsupportedModel;
+    // Writer-side complement of TestLoadFromGGUFGpt2RoundTrip: emit a loaded
+    // byte-level-BPE tokenizer's vocab+merges via SaveTokenizerToGGUF, read it
+    // back with LoadFromGGUF, and assert Encode/Decode stay id-identical.
+    procedure TestSaveTokenizerToGGUFGpt2RoundTrip;
   end;
 
   // Tests for the chat templates in neuralchat.pas. The flagship tests
@@ -1209,6 +1213,70 @@ begin
     AssertTrue('gguf bert tokenizer model rejected', Raised);
   finally
     Gguf.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestSaveTokenizerToGGUFGpt2RoundTrip;
+// Pascal tokenizer -> SaveTokenizerToGGUF (writer) -> LoadFromGGUF (reader),
+// asserting the merges array survives the write side intact.
+var
+  Src, Gguf: TNeuralHFTokenizer;
+  GGUFPath: string;
+  Texts: array[0..3] of string;
+  T, K: integer;
+  IdsSrc, IdsG: TNeuralIntegerArray;
+  Writer: TNNetGGUFWriter;
+  Dummy: TNNetVolume;
+begin
+  Texts[0] := 'the cat sat on the mat';
+  Texts[1] := 'Hello, world!';
+  Texts[2] := 'a man and a dog 123';
+  Texts[3] := 'the dog ran';
+  GGUFPath := GetTempDir(false) + 'cai_tok_gguf_wgpt2_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Src := TNeuralHFTokenizer.Create();
+  Gguf := TNeuralHFTokenizer.Create();
+  try
+    Src.LoadFromFile(FixturePath('tiny_bpe_split_cl100k_tokenizer.json'));
+
+    // Emit the loaded tokenizer's block (model "gpt2" + tokens + merges +
+    // ids) straight through the production writer method.
+    Writer := TNNetGGUFWriter.Create(GGUFPath);
+    Dummy := TNNetVolume.Create(4, 1, 1);
+    try
+      Writer.AddMetaString('general.architecture', 'llama');
+      Src.SaveTokenizerToGGUF(Writer);
+      Dummy.Fill(0);
+      Writer.AddTensorFlat('token_embd.weight', [1, 4], Dummy, gwF32);
+      Writer.SaveToFile;
+    finally
+      Dummy.Free;
+      Writer.Free;
+    end;
+
+    Gguf.LoadFromGGUF(GGUFPath);
+
+    AssertTrue('writer gguf gpt2 byte-level flag', Gguf.IsByteLevel);
+    AssertEquals('writer gguf gpt2 vocab size', Src.GetVocabSize(),
+      Gguf.GetVocabSize());
+    AssertEquals('writer gguf gpt2 eos id', Src.EosId, Gguf.EosId);
+
+    for T := 0 to High(Texts) do
+    begin
+      IdsSrc := Src.Encode(Texts[T]);
+      IdsG := Gguf.Encode(Texts[T]);
+      AssertEquals('writer gguf gpt2 id count "' + Texts[T] + '"',
+        Length(IdsSrc), Length(IdsG));
+      for K := 0 to High(IdsSrc) do
+        AssertEquals('writer gguf gpt2 id[' + IntToStr(K) + '] "' +
+          Texts[T] + '"', IdsSrc[K], IdsG[K]);
+      AssertEquals('writer gguf gpt2 decode "' + Texts[T] + '"',
+        Src.Decode(IdsSrc, true), Gguf.Decode(IdsG, true));
+    end;
+  finally
+    Gguf.Free;
+    Src.Free;
     DeleteFile(GGUFPath);
   end;
 end;

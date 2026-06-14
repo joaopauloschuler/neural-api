@@ -270,11 +270,17 @@ implementation
 // that must round-trip (block_count / embedding_length / head counts /
 // vocab / rms eps / rope base) and the expected tied-head flag.
 procedure WriteGGUFWriterSidecar(const SidecarPath, GGUFPath: string;
-  const Config: TLlamaConfig);
+  const Config: TLlamaConfig;
+  const ParityPrompt: array of integer; ParityLogits: TNNetVolume);
+// ParityLogits (when non-nil) is the Pascal model's next-token logit row over
+// the LAST position of ParityPrompt - dumped so tools/verify_gguf_writer.py
+// can cross-check next-token-logit parity with llama-cpp-python WHEN it is
+// importable (the script skips that block gracefully otherwise).
 var
   SL: TStringList;
   FS: TFormatSettings;
-  Tied: string;
+  Tied, Row: string;
+  i: integer;
 begin
   FS := DefaultFormatSettings;
   FS.DecimalSeparator := '.';
@@ -296,6 +302,25 @@ begin
     SL.Add('  "rope_freq_base": ' +
       FloatToStr(Config.RopeTheta, FS) + ',');
     SL.Add('  "tie_word_embeddings": ' + Tied);
+    // Optional next-token-logit parity oracle (last position of the prompt).
+    if (Length(ParityPrompt) > 0) and (ParityLogits <> nil) then
+    begin
+      Row := '';
+      for i := 0 to High(ParityPrompt) do
+      begin
+        if i > 0 then Row := Row + ', ';
+        Row := Row + IntToStr(ParityPrompt[i]);
+      end;
+      SL[SL.Count - 1] := SL[SL.Count - 1] + ',';
+      SL.Add('  "parity_prompt": [' + Row + '],');
+      Row := '';
+      for i := 0 to ParityLogits.Size - 1 do
+      begin
+        if i > 0 then Row := Row + ', ';
+        Row := Row + FloatToStr(ParityLogits.FData[i], FS);
+      end;
+      SL.Add('  "parity_next_token_logits": [' + Row + ']');
+    end;
     SL.Add('}');
     SL.SaveToFile(SidecarPath);
   finally
@@ -4138,9 +4163,10 @@ var
   Reader: TNNetSafeTensorsReader;
   Tokens: array of string;
   GGUFPath: string;
-  Input, OutR, OutG: TNNetVolume;
+  Input, OutR, OutG, ParityLogits: TNNetVolume;
   i, s, SeqLen, Vocab: integer;
   MaxDiff, MaxAbsLogit, Drift: double;
+  ParityPrompt: array of integer;
 begin
   RandSeed := 424242;
   // ---- (a) F32 lossless round-trip on the untied tiny_llama fixture ----
@@ -4163,8 +4189,6 @@ begin
   finally
     Reader.Free;
   end;
-  WriteGGUFWriterSidecar(GetTempDir(false) + 'cai_gguf_writer_demo.json',
-    GGUFPath, Config);
 
   NNRef := BuildLlamaFromSafeTensorsEx(
     FixturePath('tiny_llama.safetensors'), Config, {SeqLen=}0,
@@ -4198,6 +4222,24 @@ begin
     // F32 + invertible permute -> identical logits (allow tiny FP slack).
     AssertTrue('F32 GGUF writer round-trip max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+
+    // Dump the metadata sidecar with a next-token-logit parity oracle (the
+    // last position of a fixed prompt) for tools/verify_gguf_writer.py.
+    SetLength(ParityPrompt, SeqLen);
+    for i := 0 to SeqLen - 1 do
+      ParityPrompt[i] := (i * 3 + 1) mod Vocab;
+    for i := 0 to SeqLen - 1 do Input.FData[i] := ParityPrompt[i];
+    NNRef.Compute(Input);
+    NNRef.GetOutput(OutR);
+    ParityLogits := TNNetVolume.Create(Vocab, 1, 1);
+    try
+      for i := 0 to Vocab - 1 do
+        ParityLogits.FData[i] := OutR.FData[(SeqLen - 1) * Vocab + i];
+      WriteGGUFWriterSidecar(GetTempDir(false) + 'cai_gguf_writer_demo.json',
+        GGUFPath, Config, ParityPrompt, ParityLogits);
+    finally
+      ParityLogits.Free;
+    end;
   finally
     OutG.Free; OutR.Free; Input.Free;
     NNG.Free; NNRef.Free;

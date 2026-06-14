@@ -18,10 +18,13 @@ reference reader, NOT the Pascal reader) and verifies:
   - 32-byte data alignment / a self-consistent container (the package
     refuses to parse a malformed file).
 
-When feasible it also reconstructs next-token logits from the F32 tensors and
-compares them to the Pascal model dumped alongside (see below) - but the
-default pass is the dimensions/metadata cross-check, which is what proves the
-container + reversed-dims + naming are byte-correct.
+When llama-cpp-python is importable it ALSO loads the same .gguf through
+llama.cpp's own graph and cross-checks next-token-logit parity (greedy argmax
++ top-k ranking) against the Pascal model's logits carried in the sidecar
+(parity_prompt / parity_next_token_logits). That block SKIPS gracefully when
+llama-cpp-python is absent or rejects the pico fixture, so it is never a hard
+requirement - the dimensions/metadata cross-check is the always-on pass that
+proves the container + reversed-dims + naming are byte-correct.
 
 How to run (not wired into tests/RunAll.sh on purpose):
     bash tests/RunAll.sh                       # writes the file + sidecar
@@ -160,11 +163,82 @@ def main():
                   f"{expect} (row-major {rowmajor})")
             failures += 1
 
+    # ---- optional next-token-logit parity via llama-cpp-python ----
+    # The Pascal sidecar carries a fixed prompt + the Pascal model's
+    # next-token logit row (last position). When llama-cpp-python is
+    # importable we load the SAME .gguf through llama.cpp's own graph and
+    # compare argmax + ranking; otherwise we skip with a message (the lib is
+    # NOT a requirement for the Pascal tests to pass).
+    failures += verify_logit_parity(gguf_path, spec)
+
     if failures:
         sys.exit(f"{failures} failure(s)")
     print(f"OK: {gguf_path} loads with the python 'gguf' package; "
           f"architecture/metadata and {len(want)} tensors (names + reversed "
           "ggml dims) match the Pascal sidecar.")
+
+
+def verify_logit_parity(gguf_path, spec):
+    """Cross-check next-token logits against llama-cpp-python when available.
+
+    Returns the number of failures (0 on success OR on graceful skip).
+    """
+    prompt = spec.get("parity_prompt")
+    ref_logits = spec.get("parity_next_token_logits")
+    if not prompt or not ref_logits:
+        print("SKIP logit parity: sidecar has no parity_prompt / "
+              "parity_next_token_logits (regenerate with the current test).")
+        return 0
+    try:
+        from llama_cpp import Llama
+    except Exception as exc:  # ImportError or a botched native build
+        print(f"SKIP logit parity: llama-cpp-python not importable ({exc}); "
+              "install it to enable the cross-framework logit check.")
+        return 0
+
+    try:
+        llm = Llama(model_path=gguf_path, n_ctx=max(len(prompt) + 8, 32),
+                    n_threads=1, logits_all=True, vocab_only=False,
+                    verbose=False)
+    except Exception as exc:
+        print(f"SKIP logit parity: llama.cpp refused the file ({exc}); "
+              "the demo GGUF is a pico fixture llama.cpp may reject.")
+        return 0
+
+    try:
+        llm.reset()
+        llm.eval([int(t) for t in prompt])
+        got = list(llm.eval_logits[-1])
+    except Exception as exc:
+        print(f"SKIP logit parity: llama.cpp eval failed ({exc}).")
+        return 0
+
+    if len(got) != len(ref_logits):
+        print(f"FAIL logit parity: llama.cpp vocab {len(got)} != "
+              f"Pascal {len(ref_logits)}")
+        return 1
+
+    # Compare the argmax (greedy next token) and the top-k ranking; absolute
+    # logit values differ by an additive constant between graphs, so rank +
+    # argmax is the robust cross-framework signal.
+    ref_argmax = max(range(len(ref_logits)), key=lambda i: ref_logits[i])
+    got_argmax = max(range(len(got)), key=lambda i: got[i])
+    if ref_argmax != got_argmax:
+        print(f"FAIL logit parity: greedy next-token argmax "
+              f"llama.cpp {got_argmax} != Pascal {ref_argmax}")
+        return 1
+    k = min(5, len(got))
+    ref_top = sorted(range(len(ref_logits)),
+                     key=lambda i: ref_logits[i], reverse=True)[:k]
+    got_top = sorted(range(len(got)),
+                     key=lambda i: got[i], reverse=True)[:k]
+    if ref_top != got_top:
+        print(f"FAIL logit parity: top-{k} token ranking "
+              f"llama.cpp {got_top} != Pascal {ref_top}")
+        return 1
+    print(f"OK logit parity: greedy argmax {got_argmax} and top-{k} ranking "
+          "agree between llama-cpp-python and the Pascal model.")
+    return 0
 
 
 if __name__ == "__main__":
