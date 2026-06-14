@@ -96,28 +96,24 @@ rather than acted on.
 ## Infrastructure / dev experience
 
 - [ ] Gradient checkpointing for training deeper nets in less memory
-- [ ] GGUF model import beyond Llama — `BuildFromGGUF` architecture dispatch.
-      Today `BuildLlamaFromGGUF` is the ONLY GGUF model builder, yet GGUF is the
-      dominant distribution format for community-quantized checkpoints (Qwen2/2.5,
-      Gemma-2/3, Phi-3, StarCoder2, GPT-2/NeoX, etc. all ship as .gguf). Nearly
-      everything is in place: TNNetGGUFReader already dequantizes F32/F16/Q8_0 +
-      the k-quants at load, TNeuralHFTokenizer.LoadFromGGUF builds the tokenizer
-      from the embedded tokenizer.ggml.* metadata, and every target architecture
-      already has a safetensors builder. The missing piece is a `BuildFromGGUF`
-      entry point that reads `general.architecture` (+ the per-arch
-      `<arch>.attention.head_count` / `block_count` / `feed_forward_length` /
-      rope/norm-eps GGUF metadata keys) and dispatches to the existing builder
-      paths, plus a GGUF->HF tensor-name + shape map per family (the inverse of
-      the SaveLlamaToGGUF reversed-dims / rotate_half->interleaved q/k permute that
-      the GGUF WRITER already encodes — reuse that permutation knowledge). Start
-      with the Llama-backbone families that need NO new layer (qwen2, gemma2,
-      starcoder2 — same blocks as their safetensors importers, only the tensor
-      names + GGUF metadata key prefixes differ); document which architectures
-      stay out of scope for v1. Parity: load a pico fixture exported by the landed
-      TNNetGGUFWriter for a non-Llama arch and assert next-token logits match the
-      safetensors-built net < 1e-4 (write-then-read oracle, the same stance the
-      GGUF tokenizer round-trip tests already use). High leverage: one dispatch
-      unlocks dozens of ready-to-run quantized checkpoints with no Python step.
+- [X] GGUF model import beyond Llama — `BuildFromGGUF` architecture dispatch.
+      LANDED (commit a14e003): `BuildFromGGUF`/`BuildFromGGUFEx` in neuralpretrained.pas
+      read `general.architecture` and dispatch. `llama` + `qwen2` wired AND verified
+      (qwen2 GGUF write->read round-trip < 1e-4, TestBuildFromGGUFQwen2RoundTrip;
+      the writer now emits arch="qwen2" + q/k/v biases when Config.QKVBias set, giving
+      a parity oracle; reader RegisterRowDeinterleave handles 1-D bias rows). `gemma2`
+      dispatch + config flags (gated-GELU, 1+w RMSNorm, sqrt(d) embed scale, sandwich
+      norms, 1:1 local/global window, query_pre_attn_scalar, attn/final soft-caps,
+      NEOX rope no-permute) wired but OFFLINE-UNVERIFIED (writer emits no Gemma deltas
+      -> no round-trip oracle; flagged PENDING-a-fixture in-code). Unknown archs raise
+      a clear error. Remaining OPEN follow-ups:
+  - [ ] Gemma-2 GGUF parity fixture: extend the writer to emit Gemma deltas (or commit
+        a pico gemma2 .gguf via a Python helper) + a round-trip parity test to promote
+        the gemma2 path from wired-but-unverified to verified.
+  - [ ] starcoder2 GGUF (out of scope for v1): needs LayerNorm-not-RMSNorm + full
+        per-projection biases + non-gated GELU on the GGUF import path.
+  - [ ] Extend dispatch to more Llama-backbone GGUF archs (phi3, qwen3, gemma3,
+        gpt2/neox, MoE families) once each has an offline parity oracle.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
