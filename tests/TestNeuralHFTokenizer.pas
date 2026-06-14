@@ -59,6 +59,7 @@ type
     procedure TestEncodeIntegerArrayHelper;
     procedure TestOffsetMappingRoundTrip;
     procedure TestOffsetMappingWordIds;
+    procedure TestOffsetMappingByteFallbackExact;
     // BPE-dropout (Provilkov et al. 2020): p=0 is bit-identical to eval;
     // p=1 is the maximally-split per-byte tokenization; a seeded mid-value
     // run is deterministic and differs from p=0.
@@ -894,7 +895,8 @@ var
 begin
   // Byte-level path: every mapped token's (Start,Length) must slice back to a
   // non-empty substring, spans must be monotonic, and concatenating the mapped
-  // surfaces in order must reproduce the input with whitespace removed.
+  // surfaces in order must reproduce the input VERBATIM (byte-exact tracing now
+  // claims the inter-word spaces too -- no gaps).
   Tok := TNeuralHFTokenizer.Create();
   try
     Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
@@ -912,8 +914,7 @@ begin
             Offsets[I].Start >= Offsets[I - 1].Start);
         Joined := Joined + Slice;
       end;
-    AssertEquals('mapped surfaces reconstruct non-space input',
-      StringReplace(Text, ' ', '', [rfReplaceAll]), Joined);
+    AssertEquals('mapped surfaces reconstruct the full input', Text, Joined);
   finally
     Tok.Free;
   end;
@@ -957,6 +958,75 @@ begin
         MaxWord := Offsets[I].WordId;
       end;
     AssertEquals('three whitespace words -> max word id 2', 2, MaxWord);
+  finally
+    Tok.Free;
+  end;
+end;
+
+// Byte-exact offset tracing on the byte-fallback Unigram path. The pinned
+// string 'the cafe' (with a real accented e -> UTF-8 C3 A9) tokenizes with the
+// two bytes of the accented char split across two <0xNN> byte-fallback tokens
+// (ids 198, 172 for this fixture) -- exactly the case the old surface-PosEx
+// heuristic left UNMAPPED. Asserts: every non-special token gets a non-zero
+// span, the two split-char byte tokens each map to their own single source
+// byte of the same char, and concatenating every mapped span (in order)
+// reproduces the input verbatim (no gaps), cross-checked against decode.
+procedure TTestNeuralHFTokenizer.TestOffsetMappingByteFallbackExact;
+var
+  Tok: TNeuralHFTokenizer;
+  Offsets: TNeuralTokenOffsetArray;
+  Text, Joined, Slice: string;
+  I, Mapped, ByteFrag, AccentStart: integer;
+begin
+  // Build the pinned input from explicit bytes so the multi-byte char survives
+  // regardless of source-file re-encoding: 'the ' + 'caf' + U+00E9 (C3 A9).
+  Text := 'the caf' + Chr($C3) + Chr($A9);
+  AccentStart := 8; // 1-based byte index of the first byte (C3) of the accent
+
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_spm_bytefallback.model'));
+    AssertTrue('byte-fallback unigram fixture', Tok.IsUnigram);
+    Offsets := Tok.EncodeWithOffsets(Text);
+    AssertTrue('offsets emitted', Length(Offsets) > 0);
+
+    Joined := '';
+    Mapped := 0;
+    ByteFrag := 0;
+    for I := 0 to High(Offsets) do
+    begin
+      // EVERY token must be mapped (no gaps / unmapped sentinels).
+      AssertTrue('token ' + IntToStr(I) + ' has a span',
+        Offsets[I].Length > 0);
+      AssertTrue('span ' + IntToStr(I) + ' in bounds',
+        (Offsets[I].Start >= 1) and
+        (Offsets[I].Start + Offsets[I].Length - 1 <= Length(Text)));
+      if I > 0 then
+        AssertTrue('monotonic start ' + IntToStr(I),
+          Offsets[I].Start >= Offsets[I - 1].Start);
+      Inc(Mapped);
+      // Each byte token of the accented char spans exactly ONE source byte and
+      // points inside that char's byte range (per-byte split convention).
+      if (Offsets[I].Start >= AccentStart) and (Offsets[I].Length = 1) then
+      begin
+        Inc(ByteFrag);
+        AssertTrue('byte fragment inside accent char',
+          (Offsets[I].Start = AccentStart) or
+          (Offsets[I].Start = AccentStart + 1));
+      end;
+      Slice := Copy(Text, Offsets[I].Start, Offsets[I].Length);
+      Joined := Joined + Slice;
+    end;
+
+    AssertEquals('every token mapped', Length(Offsets), Mapped);
+    AssertTrue('accent char split into >=2 byte fragments', ByteFrag >= 2);
+    // Every byte of the input is claimed exactly once (the metaspace boundary
+    // token carries the inter-word space), so concatenating the mapped spans in
+    // order reproduces the input VERBATIM -- no gaps, no unmapped tokens.
+    AssertEquals('mapped spans reconstruct the full input', Text, Joined);
+    // Cross-check: the decode round-trip recovers the original string.
+    AssertEquals('decode round-trips the input',
+      Text, Tok.Decode(Tok.Encode(Text), true));
   finally
     Tok.Free;
   end;

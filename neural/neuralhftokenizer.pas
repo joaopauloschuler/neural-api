@@ -298,14 +298,18 @@ type
 
       // Encode + offset mapping (HF return_offsets_mapping + word_ids
       // equivalent). Returns one TNeuralTokenOffset per emitted token id with
-      // the (Start,Length) char span in Text and the whitespace word index.
-      // Implemented post-hoc and tokenizer-agnostic: every token's surface
-      // text (DecodeToken, leading metaspace/'##' stripped) is greedily matched
-      // forward into Text from the running cursor, skipping intervening
-      // whitespace. A token whose surface is empty or not found at/after the
-      // cursor (added/special tokens, byte-fallback fragments) gets Start=0,
-      // Length=0, WordId=-1. Works for the byte-level BPE, metaspace BPE and
-      // WordPiece paths.
+      // the (Start,Length) byte span in Text and the whitespace word index.
+      // Alignment is byte-exact: each non-special token's decoded surface bytes
+      // are consumed, byte for byte, against the original text from a running
+      // cursor (NOT a post-hoc whole-surface search), so byte-fallback
+      // fragments and metaspace/leading-space tokens that the old heuristic
+      // left unmapped now all get a span. A multi-byte UTF-8 char split across
+      // several <0xNN> byte tokens yields a per-byte span on each fragment
+      // (each points at its byte sub-range of that same source char). Synthetic
+      // prepended spaces (add_dummy_prefix / AddPrefixSpace) are dropped.
+      // Added/special tokens and a true unk with no source bytes keep
+      // Start=0/Length=0/WordId=-1. Works for the byte-level BPE, metaspace
+      // BPE, byte-fallback Unigram and WordPiece paths.
       function EncodeWithOffsets(const Text: string): TNeuralTokenOffsetArray;
 
       // Token ids -> text. SkipSpecialTokens drops added special tokens
@@ -3572,10 +3576,19 @@ function TNeuralHFTokenizer.EncodeWithOffsets(
 var
   Ids: TIntegerList;
   WordOf: array of integer;   // 1-based byte pos -> 0-based word index
-  Cnt, Cursor, TokenIndex, MatchPos, SurfStart, SurfLen: integer;
+  Cnt, Cursor, TokenIndex, SurfPos, SurfLen, StartPos, WordStart: integer;
   InWord: boolean;
   WordCnt: integer;
   Surface: string;
+  C: char;
+  Matched: boolean;
+
+  // Is byte C whitespace in the original text / a decoded surface?
+  function IsWs(Ch: char): boolean; inline;
+  begin
+    Result := Ch in [' ', #9, #10, #13];
+  end;
+
 begin
   Ids := TIntegerList.Create();
   try
@@ -3589,7 +3602,7 @@ begin
     InWord := false;
     for Cnt := 1 to Length(Text) do
     begin
-      if Text[Cnt] in [' ', #9, #10, #13] then
+      if IsWs(Text[Cnt]) then
         InWord := false
       else
       begin
@@ -3598,6 +3611,23 @@ begin
       if InWord then WordOf[Cnt] := WordCnt else WordOf[Cnt] := -1;
     end;
 
+    // Byte-exact alignment by surface-byte consumption (not a post-hoc whole-
+    // surface PosEx search). Every non-special token's decoded surface bytes
+    // are matched, byte for byte, against the original text starting at a
+    // running Cursor; the matched byte span becomes the token's offset. This
+    // guarantees a span for byte-fallback fragments and metaspace tokens that
+    // the old surface-PosEx heuristic left unmapped:
+    //   * a multi-byte UTF-8 char split across several <0xNN> byte tokens: each
+    //     byte token consumes exactly its one source byte, so every fragment
+    //     points at its byte sub-range of that same source char (CONVENTION:
+    //     split-char tokens get a per-byte span, not the whole-char span).
+    //   * metaspace ('_' U+2581) and byte-level leading-space tokens: the
+    //     surface space is matched against a source space, or, when it is a
+    //     synthetic prepended space (add_dummy_prefix / AddPrefixSpace) with no
+    //     source space at the cursor, it is skipped without advancing.
+    //   * '##' WordPiece continuation prefix is stripped before matching.
+    // A token whose surface still cannot be aligned (true unk with no source
+    // bytes, e.g. unk_surface) keeps Start=0/Length=0/WordId=-1.
     Cursor := 1;
     for Cnt := 0 to Ids.Count - 1 do
     begin
@@ -3611,33 +3641,69 @@ begin
 
       Surface := DecodeToken(Ids[Cnt]);
       // Strip the WordPiece continuation prefix ('##') so the surface is the
-      // raw substring; metaspace/leading-space surfaces are trimmed below.
+      // raw substring (WordPiece tokens carry no leading-space byte).
       if FWordPiece and (FWPPrefix <> '') and
         (Copy(Surface, 1, Length(FWPPrefix)) = FWPPrefix) then
         Surface := Copy(Surface, Length(FWPPrefix) + 1, MaxInt);
-      // Trim leading whitespace from the surface (byte-level / metaspace tokens
-      // carry the preceding space); we anchor on the first real char.
-      while (Surface <> '') and (Surface[1] in [' ', #9, #10, #13]) do
-        Delete(Surface, 1, 1);
       if Surface = '' then Continue;
 
-      // Greedy forward match: find Surface at/after Cursor, allowing only
-      // whitespace to be skipped in between.
-      SurfStart := Cursor;
-      while (SurfStart <= Length(Text)) and
-            (Text[SurfStart] in [' ', #9, #10, #13]) do
-        Inc(SurfStart);
-      MatchPos := PosEx(Surface, Text, SurfStart);
-      // Accept only if it lands at the skipped-whitespace anchor (so token
-      // order and char positions stay monotonic); otherwise leave unmapped.
-      if MatchPos = SurfStart then
+      // Consume Surface byte by byte against Text[Cursor..].
+      SurfPos := 1;
+      SurfLen := Length(Surface);
+      StartPos := 0;          // first matched source byte (0 = none yet)
+      WordStart := 0;         // first matched NON-whitespace byte (for WordId)
+      Matched := true;
+      while SurfPos <= SurfLen do
       begin
-        SurfLen := Length(Surface);
-        Result[Cnt].Start := MatchPos;
-        Result[Cnt].Length := SurfLen;
-        if (MatchPos >= 1) and (MatchPos <= Length(Text)) then
-          Result[Cnt].WordId := WordOf[MatchPos];
-        Cursor := MatchPos + SurfLen;
+        C := Surface[SurfPos];
+        if IsWs(C) then
+        begin
+          // A surface whitespace byte: the leading metaspace/prefix space, a
+          // real inter-word space, or a pure word-boundary token (whose whole
+          // surface is just that space). Claim one source whitespace byte if
+          // the source has whitespace at the cursor; if not, it is a synthetic
+          // prepended space -- drop it from the surface without advancing.
+          if (Cursor <= Length(Text)) and IsWs(Text[Cursor]) then
+          begin
+            if StartPos = 0 then StartPos := Cursor;
+            Inc(Cursor);
+            // collapse any further source whitespace into this one span
+            while (Cursor <= Length(Text)) and IsWs(Text[Cursor]) do
+              Inc(Cursor);
+          end;
+          Inc(SurfPos);
+          Continue;
+        end;
+        // A non-whitespace surface byte must match the source byte exactly.
+        // Skip leading source whitespace once (token order stays monotonic).
+        while (Cursor <= Length(Text)) and IsWs(Text[Cursor]) do
+          Inc(Cursor);
+        if (Cursor <= Length(Text)) and (Text[Cursor] = C) then
+        begin
+          if StartPos = 0 then StartPos := Cursor;
+          if WordStart = 0 then WordStart := Cursor;
+          Inc(Cursor);
+          Inc(SurfPos);
+        end
+        else
+        begin
+          Matched := false;
+          break;
+        end;
+      end;
+
+      if Matched and (StartPos > 0) then
+      begin
+        Result[Cnt].Start := StartPos;
+        Result[Cnt].Length := Cursor - StartPos;
+        // Subword -> word alignment off the first real (non-whitespace) byte:
+        // a leading-space byte-level/metaspace token (surface " cat") carries
+        // the word of "cat", not the inter-word space. A pure word-boundary
+        // token (whole surface is whitespace) has no word -> -1.
+        if WordStart > 0 then
+          Result[Cnt].WordId := WordOf[WordStart]
+        else
+          Result[Cnt].WordId := -1;
       end;
     end;
   finally
