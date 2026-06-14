@@ -223,6 +223,11 @@ rather than acted on.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
+      UNBLOCKED FURTHER: the SigLIP vision tower now LANDED
+      (BuildSigLIPVisionTower with a pVisionFeatures skip-pooling/
+      select-hidden-layer mode — exactly the LLaVA-needs select-hidden mode);
+      most modern open VLMs (PaliGemma/SmolVLM/Idefics) use SigLIP, not CLIP,
+      as the tower, so prefer BuildSigLIPVisionTower for Step 4's checkpoint.
       Target a small open checkpoint on the classic LLaVA recipe (e.g.
       llava-hf/llava-interleave-qwen-0.5b-hf or a SmolVLM-class model —
       whichever config maps cleanest onto existing paths): ViT vision
