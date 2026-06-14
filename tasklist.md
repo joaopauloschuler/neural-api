@@ -386,6 +386,76 @@ rather than acted on.
       linear-head weights (lin layers of richzhang/PerceptualSimilarity) as a tiny
       imported tensor. Parity vs the reference LPIPS on one image pair; also expose
       it as a training loss so SR examples can opt into perceptual fine-tuning.
+- [ ] SSIM / MS-SSIM (+ PSNR) full-reference image-quality metrics — the classic
+      pixel/structure quality metrics complementing the FEATURE-space FID/IS
+      (landed) and the planned perceptual LPIPS. Add to neural/neuralimagemetrics.pas:
+      ComputeSSIM(imgA, imgB) over the standard 11x11 Gaussian-windowed local mean /
+      variance / covariance with the C1,C2 stabilizers, MS-SSIM as the 5-scale
+      downsampled product (Wang et al. 2003 weights), and a trivial ComputePSNR.
+      Distinct from FID/IS/LPIPS (no backbone — pure signal statistics on the two
+      images), and the standard reporting metric for the landed SuperResolution /
+      SubPixelSuperRes / Real-ESRGAN / WaveletDenoise restoration work. Also expose
+      a differentiable 1-SSIM training-loss head (TNNetSSIMLoss or a loss helper) so
+      restoration examples can optimize structural similarity directly instead of
+      pixel MSE. Validate ComputeSSIM/PSNR against a numpy/skimage float64 oracle on
+      a pinned image pair (identical -> SSIM 1.0 / PSNR inf), MS-SSIM vs the per-scale
+      product; tests/TestNeuralImageMetrics.pas.
+- [ ] KID (Kernel Inception Distance) generative metric — the small-sample-unbiased
+      complement to the landed FID (FID's plug-in covariance estimate is biased at
+      the few-hundred-sample sizes a CPU demo can afford; KID is an unbiased
+      polynomial-kernel MMD^2 estimator, Binkowski et al. 2018). Add to
+      neural/neuralimagemetrics.pas: ComputeKID(featuresR, featuresG) with the cubic
+      kernel k(x,y)=(x.y/d + 1)^3, the unbiased U-statistic MMD^2 (no diagonal terms),
+      and a subset-bootstrap mean+std over m splits like InceptionScore. Backbone-
+      agnostic (same caller-supplies-features convention as ComputeFID). Validate the
+      MMD^2 math against a numpy float64 oracle on synthetic Gaussian feature sets
+      (KID-self ~0, ordering preserved); tests/TestNeuralImageMetrics.pas.
+- [ ] CLIPScore text-image-alignment generative metric — the standard reference-free
+      metric for text-to-image quality (how well a generated image matches its
+      prompt), reusing the LANDED CLIP dual-encoder (BuildClipFromSafeTensors). Add a
+      helper that runs the image through the vision tower and the prompt through the
+      text tower, L2-normalizes both, and returns max(0, w * cos) (Hessel et al. 2021,
+      w=2.5); plus a RefCLIPScore variant (harmonic mean with the reference-caption
+      cosine) for captioning. Complements the IMAGE-only FID/IS/KID with a
+      semantic image<->text score; demo: score a handful of (image, prompt) pairs and
+      show mismatched prompts score lower. Parity vs a torch CLIP float64 cosine on a
+      pinned image+text pair.
+- [ ] Pix2Pix conditional image-to-image translation example (examples/Pix2Pix) —
+      the repo's only GAN (VisualGAN) is UNCONDITIONAL (noise -> CIFAR image); there
+      is no PAIRED image-to-image translation. Train a conditional GAN that maps an
+      input image to an output image (edges->shapes, grayscale->color, or a synthetic
+      mask->image task on CPU): a U-Net generator (reuses the landed TNNet.AddUNet)
+      conditioned on the input image, an L1 reconstruction term + adversarial loss,
+      and a PatchGAN discriminator (a small fully-convolutional net scoring NxN
+      overlapping patches as real/fake instead of one global logit — a builder /
+      thin example head, NOT a new leaf class). Isola et al. 2017; foundational
+      conditional-generation recipe distinct from the unconditional VisualGAN and the
+      diffusion examples. Edit examples/README.md.
+- [ ] AdaIN (adaptive instance normalization) two-input layer + fast arbitrary
+      style-transfer example — the landed StyleTransfer is Gatys ITERATIVE pixel
+      optimization (minutes per image, one fixed style); AdaIN enables a single
+      feed-forward pass for ARBITRARY styles (Huang & Belongie 2017). Add
+      TNNetAdaIN: a two-source layer that instance-normalizes the CONTENT feature map
+      (per-channel zero-mean/unit-var over H,W) then re-scales/re-shifts it by the
+      per-channel mean/std computed from a STYLE feature map (second input) — NO
+      learned parameters, distinct from FiLM (learned projection of a conditioning
+      vector) and the trainable TNNetInstanceNorm. Wire a small encoder(VGG relu4_1)
+      -> AdaIN -> decoder example that stylizes a content image with a style image in
+      one forward pass; full input-gradient numerical coverage for the layer in
+      tests/TestNeuralNumerical.pas. Edit examples/README.md.
+- [ ] VQGAN / pretrained discrete image-tokenizer importer
+      (BuildVqModelFromSafeTensors, diffusers VQModel / taming-transformers VQGAN) —
+      the repo TRAINS a VQ-VAE (examples/VQVAE) but cannot IMPORT a pretrained
+      discrete image tokenizer, the encoder used by most autoregressive / masked
+      image generators (MaskGIT, Parti, LlamaGen) to turn an image into a grid of
+      codebook token IDs and back. Reuses the landed VAE encoder/decoder ResNet+attn
+      blocks (BuildVaeEncoder/Decoder are the continuous-KL siblings); the genuinely
+      new pieces are the nearest-neighbor codebook lookup (image -> token-id grid via
+      argmin L2 to the embedding table) and the inverse (token-ids -> embeddings ->
+      decoder -> image). Exposes EncodeImageToTokens / DecodeTokensToImage so an
+      imported autoregressive image LM (stock Llama/GPT path) could generate image
+      tokens end-to-end. Pico parity vs a numpy float64 oracle on the encode (token
+      ids) + decode (pixels); demo round-trips a tiny image through the codebook.
 - [ ] DETR object-detection importer (BuildDetrFromSafeTensors,
       facebook/detr-resnet-50) — the FIRST object-detection importer, a wholly new
       CV vertical (bounding boxes + class per box, not a single label / dense map).
