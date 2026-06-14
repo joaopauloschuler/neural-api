@@ -13179,7 +13179,25 @@ type
       procedure ResetIncrementalDecode();
       procedure SetL2Decay(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2DecayToConvolutionalLayers(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
-      procedure ComputeL2Decay(); {$IFDEF Release} inline; {$ENDIF}
+      procedure ComputeL2Decay(); overload;
+      // Parameter-group-aware L2 weight decay (a PyTorch-style param_groups
+      // port). Behaves like ComputeL2Decay() but, when ExcludeBias is true,
+      // the per-neuron bias term is left untouched (only the weight tensor is
+      // shrunk). Normalization layers (TNNetIdentityWithoutL2 descendants such
+      // as TNNetLayerNorm/RMSNorm/GroupNorm) are skipped exactly as in
+      // ComputeL2Decay() because their ComputeL2Decay() override is a no-op, so
+      // norm gains are never decayed. With ExcludeBias = false this is
+      // bit-identical to ComputeL2Decay(). Used by TNeuralFitBase when
+      // ExcludeBiasAndNormFromWeightDecay is enabled.
+      procedure ComputeL2Decay(ExcludeBias: boolean); overload;
+      // Multiplies the per-layer LearningRate of every normalization layer
+      // (TNNetIdentityWithoutL2 descendant carrying trainable gain/bias neurons,
+      // e.g. TNNetLayerNorm / TNNetRMSNorm / TNNetGroupNorm) by Mul, implementing
+      // the per-group learning-rate multiplier of a PyTorch-style param_group.
+      // Mul = 1 is a no-op. Call AFTER SetLearningRate(), which resets every
+      // layer to the base rate, so the multiplier is reapplied each step.
+      // Returns the number of layers whose rate was scaled.
+      function ScaleNormLayerLearningRate(Mul: TNeuralFloat): integer;
       procedure SetSmoothErrorPropagation(p:boolean); {$IFDEF Release} inline; {$ENDIF}
       procedure ClearTime(); {$IFDEF Release} inline; {$ENDIF}
       procedure Clear();
@@ -70595,6 +70613,56 @@ begin
   for LayerCnt := 1 to GetLastLayerIdx() do
   begin
     FLayers[LayerCnt].ComputeL2Decay();
+  end;
+end;
+
+procedure TNNet.ComputeL2Decay(ExcludeBias: boolean);
+var
+  LayerCnt, NeuronCnt: integer;
+  CurrentLayer: TNNetLayer;
+  Factor: TNeuralFloat;
+begin
+  if not ExcludeBias then
+  begin
+    // Bit-identical to the default uniform path.
+    ComputeL2Decay();
+    Exit;
+  end;
+  // Parameter-group path: shrink weights but never the bias term. Norm layers
+  // (TNNetIdentityWithoutL2 descendants) override ComputeL2Decay() to a no-op,
+  // so their gains are skipped here too - we honour that by skipping any layer
+  // whose ComputeL2Decay() does nothing, i.e. TNNetIdentityWithoutL2.
+  for LayerCnt := 1 to GetLastLayerIdx() do
+  begin
+    CurrentLayer := FLayers[LayerCnt];
+    if CurrentLayer is TNNetIdentityWithoutL2 then Continue;
+    if (CurrentLayer.Neurons.Count = 0) or (CurrentLayer.L2Decay <= 0) then Continue;
+    Factor := 1 - (CurrentLayer.L2Decay * CurrentLayer.LearningRate);
+    for NeuronCnt := 0 to CurrentLayer.Neurons.Count - 1 do
+    begin
+      CurrentLayer.Neurons[NeuronCnt].Weights.Mul(Factor);
+      // Bias deliberately untouched (excluded from weight decay).
+    end;
+    CurrentLayer.AfterWeightUpdate();
+  end;
+end;
+
+function TNNet.ScaleNormLayerLearningRate(Mul: TNeuralFloat): integer;
+var
+  LayerCnt: integer;
+  CurrentLayer: TNNetLayer;
+begin
+  Result := 0;
+  if Mul = 1 then Exit;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    CurrentLayer := FLayers[LayerCnt];
+    if (CurrentLayer is TNNetIdentityWithoutL2) and
+       (CurrentLayer.Neurons.Count > 0) then
+    begin
+      CurrentLayer.LearningRate := CurrentLayer.LearningRate * Mul;
+      Inc(Result);
+    end;
   end;
 end;
 

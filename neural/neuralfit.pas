@@ -180,7 +180,13 @@ type
       FEMA: TNNetEMAWrapper;            // lazily created on the first update
       FEMASwapped: boolean;             // true while EMA weights are swapped in
       FEMASaved: TNNet;                 // live weights stashed during a swap
+      // Parameter-group (PyTorch param_groups) support. Off by default.
+      FExcludeBiasAndNormFromWeightDecay: boolean;
+      FNormAndBiasLearningRateMul: TNeuralFloat;
       procedure UpdateEMA();            // called once per real weight update
+      // Reapplies the per-group norm-layer LR multiplier after the base LR has
+      // been broadcast to every layer. No-op when the multiplier is 1.
+      procedure ApplyParamGroupLearningRate();
       procedure SetAccumulationSteps(Value: integer);
       procedure CheckLearningRate(iEpochCount: integer);
       procedure Optimize();
@@ -290,6 +296,26 @@ type
       // EMA decay factor (typical 0.999 / 0.9999). 0 makes the shadow equal the
       // live weights after one update; values in (0,1) keep a decaying memory.
       property EMADecay: TNeuralFloat read FEMADecay write FEMADecay;
+      // Parameter groups (PyTorch param_groups port). When enabled, weight
+      // decay (both the L2Decay path and AdamW's decoupled decay) is EXCLUDED
+      // from (a) normalization-layer gains/bias (TNNetLayerNorm / TNNetRMSNorm /
+      // TNNetGroupNorm etc., which already opt out of decay) and (b) the
+      // per-neuron BIAS term of ordinary weight layers - the standard recipe
+      // that decays only matrix weights. AdamW's ApplyDecoupledWeightDecay
+      // already skips bias and norm layers, so for the AdamW optimizer the flag
+      // only documents intent; the behavioural change is on the L2Decay path,
+      // which otherwise shrinks the bias too. OFF by default => the decay path
+      // is bit-for-bit unchanged.
+      property ExcludeBiasAndNormFromWeightDecay: boolean
+        read FExcludeBiasAndNormFromWeightDecay
+        write FExcludeBiasAndNormFromWeightDecay;
+      // Per-group learning-rate multiplier applied to normalization layers
+      // (the param_group LR scaling). 1.0 (default) is a no-op. Reapplied each
+      // optimizer step after the base learning rate is broadcast to all layers.
+      // Independent of ExcludeBiasAndNormFromWeightDecay.
+      property NormAndBiasLearningRateMul: TNeuralFloat
+        read FNormAndBiasLearningRateMul
+        write FNormAndBiasLearningRateMul;
       // The shadow network holding the EMA weights (nil until the first update;
       // owned by the wrapper). Read-only convenience accessor.
       function EMAShadowNet(): TNNet;
@@ -802,10 +828,23 @@ begin
   FOptimizer.SetNN(FNN, Self);
   FOptimizer.Optimize();
   //Write(FNN.ForceMaxAbsoluteWeight(2):3:2,' ');
-  if FL2Decay > 0.0 then FNN.ComputeL2Decay();
+  // Parameter-group weight decay: when enabled, exclude the per-neuron bias
+  // from the L2 decay (norm-layer gains are already excluded by their no-op
+  // ComputeL2Decay override). When off, the call is bit-identical to the
+  // legacy uniform-decay path.
+  if FL2Decay > 0.0 then FNN.ComputeL2Decay(FExcludeBiasAndNormFromWeightDecay);
   // EMA shadow update runs on the SAME cadence as the live weight update
   // (once per real optimizer step), right after the live weights changed.
   if FEnableEMA then UpdateEMA();
+end;
+
+procedure TNeuralFitBase.ApplyParamGroupLearningRate();
+begin
+  // The real weight update runs on FNN (thread clones only accumulate deltas
+  // that are summed back into FNN before Optimize), so scaling FNN's norm-layer
+  // LearningRate is what governs the effective per-group step size.
+  if FNormAndBiasLearningRateMul = 1.0 then Exit;
+  if Assigned(FNN) then FNN.ScaleNormLayerLearningRate(FNormAndBiasLearningRateMul);
 end;
 
 procedure TNeuralFitBase.UpdateEMA();
@@ -1874,6 +1913,7 @@ begin
 
   FNN.SetL2Decay(FL2Decay);
   FNN.SetLearningRate(FCurrentLearningRate, FInertia);
+  ApplyParamGroupLearningRate();
 end;
 
 procedure TNeuralDataLoadingFit.AllocateMemory(pNN: TNNet; pBatchSize: integer;
@@ -2236,6 +2276,8 @@ begin
   FEMA := nil;
   FEMASwapped := false;
   FEMASaved := nil;
+  FExcludeBiasAndNormFromWeightDecay := false;
+  FNormAndBiasLearningRateMul := 1.0;
 end;
 
 procedure TNeuralFitBase.SetAccumulationSteps(Value: integer);
@@ -2350,6 +2392,7 @@ begin
     FCurrentLearningRate := fNewLearningRate;
     FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
     FNN.SetLearningRate(FCurrentLearningRate, FInertia);
+    ApplyParamGroupLearningRate();
     if Assigned(FOptimizer) then
     begin
       if (not Assigned(FOptimizer.FNN)) then
@@ -2570,6 +2613,7 @@ begin
 
   FNN.SetL2Decay(FL2Decay);
   FNN.SetLearningRate(FCurrentLearningRate, FInertia);
+  ApplyParamGroupLearningRate();
 
   if FVerbose then
   begin

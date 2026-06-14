@@ -424,9 +424,19 @@ rather than acted on.
       same approximation stance as the cl100k splitter; would need the exact
       DeepSeek letter-class range table ported to Pascal). Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
-- [ ] Parameter groups for the optimizer (PyTorch param_groups port):
+- [X] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
+      LANDED: opt-in TNeuralFitBase.ExcludeBiasAndNormFromWeightDecay routes the
+      L2Decay path through TNNet.ComputeL2Decay(ExcludeBias) which skips the
+      per-neuron bias (norm gains were already excluded via the
+      TNNetIdentityWithoutL2 no-op override; AdamW's ApplyDecoupledWeightDecay
+      already skipped both). NormAndBiasLearningRateMul (default 1.0) reapplies
+      a per-group LR multiplier to norm layers via
+      TNNet.ScaleNormLayerLearningRate after each base-LR broadcast. Both OFF by
+      default (bit-identical legacy path). Tests TestParamGroupDefaultsOff /
+      TestL2DecayDefaultDecaysBias / TestL2DecayExcludeBiasKeepsBias /
+      TestNormLayerLearningRateMultiplier in tests/TestNeuralFit.pas.
 - [ ] Encoder-decoder safetensors exporter follow-ups (GPT-2 / Llama / Qwen3 /
       BERT / GPT-NeoX / BLOOM / Mamba / RWKV / T5 / Marian / BART / mBART /
       Pegasus HF-names exporters all LANDED as exact bit-for-bit inverses of

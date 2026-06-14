@@ -129,6 +129,12 @@ type
     procedure TestEMAConvexBlend;
     procedure TestEMAApplyRestoreRoundTrip;
     procedure TestEMADisabledIsBitIdentical;
+
+    // Parameter groups (PyTorch param_groups port)
+    procedure TestParamGroupDefaultsOff;
+    procedure TestL2DecayExcludeBiasKeepsBias;
+    procedure TestL2DecayDefaultDecaysBias;
+    procedure TestNormLayerLearningRateMultiplier;
   end;
 
 implementation
@@ -1474,6 +1480,147 @@ begin
     WA.Free; WB.Free; WOn.Free;
     DummyA.Free; DummyB.Free; ShadowOn.Free;
     NetA.Free; NetB.Free; NetOn.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestParamGroupDefaultsOff;
+var
+  Fit: TNeuralFit;
+begin
+  // The parameter-group feature must be OFF by default so existing training
+  // paths are unchanged.
+  Fit := TNeuralFit.Create();
+  try
+    AssertFalse('ExcludeBiasAndNormFromWeightDecay must default OFF',
+      Fit.ExcludeBiasAndNormFromWeightDecay);
+    AssertEquals('NormAndBiasLearningRateMul must default to 1.0',
+      1.0, Fit.NormAndBiasLearningRateMul, 0);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestL2DecayDefaultDecaysBias;
+var
+  NN: TNNet;
+  OldW, OldB, Factor: TNeuralFloat;
+const
+  cL2 = 0.1;
+  cLR = 0.5;
+begin
+  // DEFAULT (off) path: ComputeL2Decay() / ComputeL2Decay(False) must be
+  // bit-identical to the legacy behaviour, which shrinks BOTH weights AND the
+  // bias by (1 - L2Decay*LearningRate).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.SetL2Decay(cL2);
+    NN.SetLearningRate(cLR, 0.9);
+    Factor := 1 - (cL2 * cLR);
+
+    OldW := NN.Layers[1].Neurons[0].Weights.FData[0];
+    OldB := NN.Layers[1].Neurons[0].BiasWeight;
+
+    NN.ComputeL2Decay(False); // ExcludeBias = false == legacy path
+
+    AssertEquals('Default path must shrink weight by (1-L2*LR)',
+      OldW * Factor, NN.Layers[1].Neurons[0].Weights.FData[0], 1e-7);
+    AssertEquals('Default path must ALSO shrink the bias (legacy behaviour)',
+      OldB * Factor, NN.Layers[1].Neurons[0].BiasWeight, 1e-7);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestL2DecayExcludeBiasKeepsBias;
+var
+  NN: TNNet;
+  OldW, OldB, OldLN, Factor: TNeuralFloat;
+  I: integer;
+  OldWAll: TNNetVolume;
+const
+  cL2 = 0.1;
+  cLR = 0.5;
+begin
+  // PARAMETER-GROUP path: with ExcludeBias = true the matrix weights are still
+  // decayed exactly by (1 - L2*LR), but the bias term receives NO shrinkage,
+  // and the normalization layer's gain is untouched as well.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  OldWAll := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetLayerNorm.Create());
+    NN.SetL2Decay(cL2);
+    NN.SetLearningRate(cLR, 0.9);
+    Factor := 1 - (cL2 * cLR);
+
+    OldWAll.Copy(NN.Layers[1].Neurons[0].Weights);
+    OldW := OldWAll.FData[0];
+    OldB := NN.Layers[1].Neurons[0].BiasWeight;
+    OldLN := NN.Layers[2].Neurons[0].Weights.FData[0];
+
+    NN.ComputeL2Decay(True); // ExcludeBias
+
+    // (a) matrix weights: still decayed exactly.
+    for I := 0 to OldWAll.Size - 1 do
+      AssertEquals('Excluded path must still decay matrix weights',
+        OldWAll.FData[I] * Factor,
+        NN.Layers[1].Neurons[0].Weights.FData[I], 1e-7);
+    AssertEquals('Weight[0] sanity', OldW * Factor,
+      NN.Layers[1].Neurons[0].Weights.FData[0], 1e-7);
+    // (b) bias: NO shrinkage (the whole point of the param group).
+    AssertEquals('Bias must NOT be decayed when excluded', OldB,
+      NN.Layers[1].Neurons[0].BiasWeight, 0);
+    // (c) norm-layer gain: untouched.
+    AssertEquals('Norm-layer gain must NOT be decayed', OldLN,
+      NN.Layers[2].Neurons[0].Weights.FData[0], 0);
+  finally
+    OldWAll.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestNormLayerLearningRateMultiplier;
+var
+  NN: TNNet;
+  Scaled: integer;
+const
+  cLR = 0.5;
+  cMul = 0.1;
+begin
+  // The per-group LR multiplier scales ONLY normalization layers that carry
+  // trainable neurons; ordinary weight layers keep the base learning rate.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetLayerNorm.Create());
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.SetLearningRate(cLR, 0.9);
+
+    Scaled := NN.ScaleNormLayerLearningRate(cMul);
+
+    AssertEquals('Exactly one norm layer must be scaled', 1, Scaled);
+    AssertEquals('FullConnect LR must stay at base', cLR,
+      NN.Layers[1].LearningRate, 0);
+    AssertEquals('Norm-layer LR must be multiplied', cLR * cMul,
+      NN.Layers[2].LearningRate, 1e-7);
+    AssertEquals('Second FullConnect LR must stay at base', cLR,
+      NN.Layers[3].LearningRate, 0);
+
+    // Mul = 1 is a no-op and reports zero scaled layers.
+    NN.SetLearningRate(cLR, 0.9);
+    AssertEquals('Mul=1 must be a no-op', 0,
+      NN.ScaleNormLayerLearningRate(1.0));
+    AssertEquals('Norm-layer LR unchanged by no-op', cLR,
+      NN.Layers[2].LearningRate, 0);
+  finally
+    NN.Free;
   end;
 end;
 
