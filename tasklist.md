@@ -108,6 +108,30 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] MiniCPM importer (`BuildMiniCPMFromSafeTensors[Ex]`, model_type
+      `minicpm`; openbmb/MiniCPM-1.2B/2B-sft/dpo) — a genuinely CPU-runnable
+      (1.2B/2B) Llama-backbone family (RMSNorm + RoPE + SwiGLU, tied
+      embeddings) whose distinguishing piece is OpenBMB's μP-style
+      depth/width rescaling, which is NOT the same mechanism as the already-
+      landed Granite multipliers and must be wired, not reused verbatim:
+        - `scale_emb` multiplies the token embeddings (one constant fold on
+          the embedding matrix — overlaps Granite's embedding multiplier);
+        - `scale_depth / sqrt(num_hidden_layers)` rescales EVERY residual
+          branch (each attention and each MLP sublayer output) — this is a
+          PER-SUBLAYER residual scale (2*num_layers folds), distinct from
+          Granite's single constant residual multiplier; fold it into the
+          out-projection (`o_proj` and `down_proj`) of each block so no new
+          layer is needed;
+        - logits divide by `hidden_size / dim_model_base` (a DIVIDING LM-head
+          scale, foldable through the existing QScale/W_q slot like Granite's
+          logits_scaling).
+      Reuse the core Llama builder + the standard SentencePiece `.model`
+      tokenizer; the only new code is the config record + the four fold
+      points. Verify with a HAND-BUILT pico fixture (tools/minicpm_tiny_
+      fixture.py, MiniCPM IS in transformers so reference can be a live
+      float64 forward) asserting next-token logits < 1e-4:
+      TestMiniCPM{Config,Logit}Parity. Note: MiniCPM4 / MiniCPM-MoE are
+      separate follow-ups (do not scope here).
 - [ ] InternLM2 / InternLM2.5 importer follow-up (`BuildInternLM2FromSafeTensors[Ex]`,
       model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — LANDED.
       A plain Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONLY
