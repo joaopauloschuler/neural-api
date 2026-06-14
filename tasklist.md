@@ -343,15 +343,18 @@ rather than acted on.
       convs, BN after every conv). Reuses the landed conv + BN + Concat path; the
       new work is the branch-concatenation block builder. Needed in its own right
       and as the pooled-feature backbone for FID below. Pico parity vs HF float64.
-- [ ] LPIPS perceptual distance (TNNetLPIPS or a metric helper) — the standard
-      perceptual image-similarity metric for super-resolution / restoration /
-      generative quality, complementing the landed SuperResolution / SubPixelSuperRes
-      / Real-ESRGAN work where pixel MSE is known to be a poor quality proxy.
-      Compute the weighted L2 distance between unit-normalized VGG feature maps
-      (reusing the landed VGG importer) across the relu taps; ship the official
-      linear-head weights (lin layers of richzhang/PerceptualSimilarity) as a tiny
-      imported tensor. Parity vs the reference LPIPS on one image pair; also expose
-      it as a training loss so SR examples can opt into perceptual fine-tuning.
+- [ ] LPIPS follow-ups — the metric LANDED (ComputeLPIPSDistance /
+      LPIPSStageDistance / LPIPSUnitNormalize in neuralpretrained.pas, reusing the
+      VGG importer's 5 relu taps; unit-normalize -> squared-diff -> per-stage lin
+      head -> spatial-mean -> sum; parity test TestLPIPSDistanceParity vs a numpy
+      float64 oracle, LPIPS(x,x)=0). The lin head is a LOADABLE per-stage weight
+      vector; nil = the unweighted (1/C channel-mean) lpips lin_layers=False
+      baseline (what the oracle pins). OPEN: (a) ship/import the OFFICIAL
+      richzhang/PerceptualSimilarity lin{0..4}.model 1x1-conv weights + parity vs
+      the reference calibrated LPIPS (needs the `lpips` weights, unobtainable
+      offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
+      examples can opt into perceptual fine-tuning (the VGG build already enables
+      input/error collection, so the gradient path exists).
 - [ ] Pix2Pix conditional image-to-image translation example (examples/Pix2Pix) —
       the repo's only GAN (VisualGAN) is UNCONDITIONAL (noise -> CIFAR image); there
       is no PAIRED image-to-image translation. Train a conditional GAN that maps an

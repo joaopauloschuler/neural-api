@@ -5186,6 +5186,61 @@ function BuildVGGFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// LPIPS PERCEPTUAL DISTANCE (Zhang et al. 2018, "The Unreasonable Effectiveness
+// of Deep Features as a Perceptual Metric" - richzhang/PerceptualSimilarity).
+// The standard learned perceptual image-similarity metric for super-resolution
+// / restoration / generative quality, complementing the SSIM/PSNR pixel/struct
+// metrics (neuralimagemetrics.pas) where pixel MSE is a poor quality proxy.
+//
+// LPIPS-VGG runs both images through the SAME VGG-16 backbone (the importer
+// above), reads the 5 per-stage relu taps (relu1_2/relu2_2/relu3_3/relu4_3/
+// relu5_3, == BuildVGG's TapLayerIdx[0..4]), and at every tap:
+//   1. unit-normalizes each feature map ALONG THE CHANNEL AXIS at every spatial
+//      location: f_hat = f / sqrt(sum_c f_c^2 + eps)   (eps = 1e-10);
+//   2. takes the squared per-channel difference d_c = (a_hat_c - b_hat_c)^2;
+//   3. applies the learned per-stage "lin" 1x1 conv (one non-negative scalar
+//      weight w_c per channel): s = sum_c w_c * d_c at each location;
+//   4. spatial-averages s over H*W.
+// The distance is the SUM of the 5 spatial-mean stage scores. This is exactly
+// lpips.LPIPS(net='vgg', lin_layers=True).forward with spatial=False.
+//
+// LIN WEIGHTS: TLPIPSLinWeights is one TNeuralFloatArray per stage (length =
+// that stage's channel count: 64,128,256,512,512 for canonical VGG-16). The
+// official richzhang lin weights are tiny but are NOT obtainable offline here,
+// so they are a LOADABLE parameter. Pass nil (the default) for the UNWEIGHTED
+// variant: every channel weight is 1/C (the per-channel MEAN of d_c), which is
+// the lpips lin_layers=False / "uncalibrated" baseline and is fully testable
+// against a self-contained float64 oracle. Supply the official per-channel
+// weights (e.g. loaded from lin{0..4}.model 1x1-conv tensors) for calibrated
+// LPIPS. ComputeLPIPSDistance(x,x) == 0 for any weights.
+//
+// Both images must be ImageNet-normalized RGB volumes of the VGG input size;
+// the helper runs NN.Compute twice and reads the taps, so NN must be a FULL or
+// >= stage-5 VGG build (TapLayerIdx[4] set).
+type
+  TNeuralFloatArray = array of TNeuralFloat;
+  TLPIPSLinWeights = array of TNeuralFloatArray;   // [stage][channel]
+
+// Channel-unit-normalizes Feat in place at every (x,y) location:
+//   Feat[...,c] := Feat[...,c] / sqrt(sum_c Feat[...,c]^2 + eps).
+procedure LPIPSUnitNormalize(Feat: TNNetVolume; Eps: TNeuralFloat = 1e-10);
+
+// Per-stage LPIPS term: the spatial mean of sum_c w_c*(a_hat_c - b_hat_c)^2
+// over the two ALREADY-UNIT-NORMALIZED tap maps A, B (same shape). When
+// LinWeights = nil the weights are 1/Depth (the unweighted channel-mean
+// baseline). A and B are not modified.
+function LPIPSStageDistance(A, B: TNNetVolume;
+  const LinWeights: TNeuralFloatArray): TNeuralFloat;
+
+// Full LPIPS-VGG distance between two ImageNet-normalized RGB volumes ImgA,
+// ImgB using the imported VGG net NN (TapLayerIdx[0..4] from BuildVGG). Runs
+// NN.Compute on each image, reads + unit-normalizes the 5 relu taps, applies
+// the (optional) per-stage lin weights and sums the 5 spatial-mean stage
+// scores. LinWeights = nil -> unweighted (per-channel-mean) variant.
+function ComputeLPIPSDistance(NN: TNNet; const TapLayerIdx: array of integer;
+  ImgA, ImgB: TNNetVolume; const LinWeights: TLPIPSLinWeights = nil): TNeuralFloat;
+
+// ---------------------------------------------------------------------------
 // STABLE DIFFUSION VAE DECODER IMPORT (diffusers AutoencoderKL DECODER only,
 // model_type / _class_name "AutoencoderKL", e.g. stabilityai/sd-vae-ft-mse).
 // This is the modular generative decoder that maps a 4-channel latent to an
@@ -33108,6 +33163,114 @@ begin
   Config := ReadVGGConfigFromJSONFile(ConfigPath);
   Result := BuildVGGFromSafeTensorsEx(FileName, Config, TapLayerIdx,
     pInferenceOnly);
+end;
+
+// ===========================================================================
+// LPIPS PERCEPTUAL DISTANCE (over the VGG backbone above)
+// ===========================================================================
+procedure LPIPSUnitNormalize(Feat: TNNetVolume; Eps: TNeuralFloat = 1e-10);
+var
+  Loc, c, D, NumLoc: integer;
+  Base: integer;
+  SumSq, InvNorm: TNeuralFloat;
+begin
+  D := Feat.Depth;
+  if D < 1 then exit;
+  NumLoc := Feat.SizeX * Feat.SizeY;
+  // The depth axis is contiguous: location Loc occupies FData[Loc*D .. Loc*D+D-1].
+  for Loc := 0 to NumLoc - 1 do
+  begin
+    Base := Loc * D;
+    SumSq := 0;
+    for c := 0 to D - 1 do
+      SumSq := SumSq + Feat.FData[Base + c] * Feat.FData[Base + c];
+    InvNorm := 1.0 / Sqrt(SumSq + Eps);
+    for c := 0 to D - 1 do
+      Feat.FData[Base + c] := Feat.FData[Base + c] * InvNorm;
+  end;
+end;
+
+function LPIPSStageDistance(A, B: TNNetVolume;
+  const LinWeights: TNeuralFloatArray): TNeuralFloat;
+var
+  Loc, c, D, NumLoc, Base: integer;
+  Acc, Diff, W: TNeuralFloat;
+  UseMean: boolean;
+begin
+  if (A.Depth <> B.Depth) or (A.Size <> B.Size) then
+    ImportError('LPIPS: tap feature maps must have the same shape.');
+  D := A.Depth;
+  NumLoc := A.SizeX * A.SizeY;
+  UseMean := Length(LinWeights) = 0;
+  if (not UseMean) and (Length(LinWeights) <> D) then
+    ImportError('LPIPS: lin weight vector length (' +
+      IntToStr(Length(LinWeights)) + ') must equal the stage channel count (' +
+      IntToStr(D) + ').');
+  Acc := 0;
+  for Loc := 0 to NumLoc - 1 do
+  begin
+    Base := Loc * D;
+    for c := 0 to D - 1 do
+    begin
+      Diff := A.FData[Base + c] - B.FData[Base + c];
+      if UseMean then W := 1.0 / D else W := LinWeights[c];
+      Acc := Acc + W * Diff * Diff;
+    end;
+  end;
+  // Spatial mean over H*W (channel weighting already applied per location).
+  if NumLoc > 0 then
+    Result := Acc / NumLoc
+  else
+    Result := 0;
+end;
+
+function ComputeLPIPSDistance(NN: TNNet; const TapLayerIdx: array of integer;
+  ImgA, ImgB: TNNetVolume; const LinWeights: TLPIPSLinWeights = nil): TNeuralFloat;
+var
+  Stage: integer;
+  TapA, TapB: array[0..4] of TNNetVolume;
+  StageW: TNeuralFloatArray;
+begin
+  for Stage := 0 to 4 do
+  begin
+    TapA[Stage] := nil;
+    TapB[Stage] := nil;
+  end;
+  for Stage := 0 to 4 do
+    if (Stage > High(TapLayerIdx)) or (TapLayerIdx[Stage] < 0) then
+      ImportError('LPIPS: VGG tap index ' + IntToStr(Stage) + ' is unset - ' +
+        'pass a FULL (or >= stage-5) VGG build so all 5 relu taps exist.');
+  try
+    // Image A: compute once, snapshot + unit-normalize every tap.
+    NN.Compute(ImgA);
+    for Stage := 0 to 4 do
+    begin
+      TapA[Stage] := TNNetVolume.Create;
+      TapA[Stage].Copy(NN.Layers[TapLayerIdx[Stage]].Output);
+      LPIPSUnitNormalize(TapA[Stage]);
+    end;
+    // Image B: same.
+    NN.Compute(ImgB);
+    for Stage := 0 to 4 do
+    begin
+      TapB[Stage] := TNNetVolume.Create;
+      TapB[Stage].Copy(NN.Layers[TapLayerIdx[Stage]].Output);
+      LPIPSUnitNormalize(TapB[Stage]);
+    end;
+    Result := 0;
+    for Stage := 0 to 4 do
+    begin
+      if Stage <= High(LinWeights) then StageW := LinWeights[Stage]
+      else StageW := nil;
+      Result := Result + LPIPSStageDistance(TapA[Stage], TapB[Stage], StageW);
+    end;
+  finally
+    for Stage := 0 to 4 do
+    begin
+      TapA[Stage].Free;
+      TapB[Stage].Free;
+    end;
+  end;
 end;
 
 // ===========================================================================

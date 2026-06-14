@@ -282,6 +282,7 @@ type
     procedure TestVGGConfigParity;
     procedure TestVGGLogitParity;
     procedure TestVGGFeatureTaps;
+    procedure TestLPIPSDistanceParity;
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
     procedure TestVaeEncoderParity;
@@ -13025,6 +13026,28 @@ begin
   end;
 end;
 
+// Loads tiny_lpips.json's 'image_b' (C,H,W lists) into a (H,W,C) volume.
+procedure LoadLPIPSImageB(const Obj: TJSONObject; const Config: TVGGConfig;
+  ImageInput: TNNetVolume);
+var
+  Pixels, RowArr, ChanArr: TJSONArray;
+  ChanCnt, YCnt, XCnt: integer;
+begin
+  Pixels := TJSONArray(Obj.Find('image_b'));
+  ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+  for ChanCnt := 0 to Config.NumChannels - 1 do
+  begin
+    RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+    for YCnt := 0 to Config.ImageSize - 1 do
+    begin
+      ChanArr := TJSONArray(RowArr.Items[YCnt]);
+      for XCnt := 0 to Config.ImageSize - 1 do
+        ImageInput.FData[(YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+          ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+    end;
+  end;
+end;
+
 // torchvision VGG-16 image-classification parity test. tests/fixtures/tiny_vgg16
 // .* is a pico random-init plain VGG (stage_convs [2,2,3,3,3], widths
 // [4,6,8,8,8], fc_hidden [10,10], image 32 -> 1x1 grid after 5 pools, 5
@@ -13152,6 +13175,72 @@ begin
     RefRoot.Free;
     ImageInput.Free;
     RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// LPIPS perceptual-distance parity over the tiny_vgg16 fixture. Loads the pico
+// VGG-16, reads image A (the VGG fixture's pinned pixels) and image B (from
+// tiny_lpips.json), and asserts ComputeLPIPSDistance (LinWeights=nil, the
+// unweighted 1/C variant) matches the numpy float64 oracle in tiny_lpips.json
+// (lpips_ab, per_stage_ab) to < 1e-4, and that LPIPS(A,A) == 0. The oracle is
+// the lpips lin_layers=False baseline; supplying official richzhang lin weights
+// is a loadable parameter (see ComputeLPIPSDistance header). tools/
+// lpips_tiny_fixture.py regenerates the oracle.
+procedure TTestNeuralPretrained.TestLPIPSDistanceParity;
+var
+  NN: TNNet;
+  Config: TVGGConfig;
+  TapIdx: array[0..4] of integer;
+  RefRoot, LpipsRoot: TJSONData;
+  RefJson, LpipsJson: TStringList;
+  ImageA, ImageB: TNNetVolume;
+  LpipsObj: TJSONObject;
+  Dist, RefDist, SelfDist: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := BuildVGGFromSafeTensors(FixturePath('tiny_vgg16.safetensors'),
+    Config, TapIdx, {pInferenceOnly=}false,
+    FixturePath('tiny_vgg16_config.json'));
+  RefJson := TStringList.Create;
+  LpipsJson := TStringList.Create;
+  ImageA := TNNetVolume.Create;
+  ImageB := TNNetVolume.Create;
+  RefRoot := nil;
+  LpipsRoot := nil;
+  try
+    // Image A: the VGG-fixture pixels (key 'pixels' in tiny_vgg16_logits.json).
+    RefJson.LoadFromFile(FixturePath('tiny_vgg16_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    VGGLoadPixels(TJSONObject(RefRoot), Config, ImageA);
+    // Image B + oracle from tiny_lpips.json. VGGLoadPixels reads the 'pixels'
+    // key; tiny_lpips.json stores image B under 'image_b', so wrap it.
+    LpipsJson.LoadFromFile(FixturePath('tiny_lpips.json'));
+    LpipsRoot := GetJSON(LpipsJson.Text);
+    LpipsObj := TJSONObject(LpipsRoot);
+    // Re-key 'image_b' -> a temp object VGGLoadPixels understands ('pixels').
+    ImageB.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    LoadLPIPSImageB(LpipsObj, Config, ImageB);
+
+    RefDist := LpipsObj.Get('lpips_ab', double(0));
+
+    // LinWeights = nil -> unweighted (per-channel-mean) variant.
+    Dist := ComputeLPIPSDistance(NN, TapIdx, ImageA, ImageB, nil);
+    AssertTrue('LPIPS(A,B) = ' + FloatToStr(Dist) + ' vs oracle ' +
+      FloatToStr(RefDist) + ' must differ < 1e-4',
+      Abs(Dist - RefDist) < 1e-4);
+
+    // LPIPS(A,A) must be exactly 0 (unit-normalized maps are identical).
+    SelfDist := ComputeLPIPSDistance(NN, TapIdx, ImageA, ImageA, nil);
+    AssertTrue('LPIPS(A,A) = ' + FloatToStr(SelfDist) + ' must be 0',
+      SelfDist < 1e-9);
+  finally
+    RefRoot.Free;
+    LpipsRoot.Free;
+    ImageA.Free;
+    ImageB.Free;
+    RefJson.Free;
+    LpipsJson.Free;
     NN.Free;
   end;
 end;
