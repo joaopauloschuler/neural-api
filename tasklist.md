@@ -199,6 +199,29 @@ rather than acted on.
       is forward-only — add backward through the dt/B/C RMSNorms for fine-tuning;
       (c) no Jamba-specific tokenizer demo (raw ids work); (d) no real-checkpoint
       slicer fixture (parity uses a random pico model).
+- [ ] Nemotron-H hybrid Mamba-2 + attention importer
+      (`BuildNemotronHFromSafeTensors[Ex]`, model_type "nemotron_h"; e.g.
+      nvidia/Nemotron-H-8B-Base / the 4B/47B siblings) — the open Mamba-2-hybrid
+      follow-up the README's Mamba-2 entry names but the tasklist has no entry for.
+      ARCHITECTURALLY DISTINCT from the landed Jamba (which is Mamba-**1** +
+      attention + MoE on a periodic schedule): Nemotron-H interleaves the landed
+      `TNNetMamba2` selective-SSD mixer, full softmax-attention, and plain MLP
+      layers on an EXPLICIT per-layer string schedule (the config `hybrid_override_pattern`,
+      e.g. "M-M-M*-M-..." with 'M'=Mamba2, '*'=attention, '-'=MLP), so the new work
+      is the schedule parser + per-layer dispatch (NOT a new mixer — TNNetMamba2 and
+      the BERT-style attention/MLP blocks already exist). Genuinely new vs every
+      landed importer: (a) the override-pattern string driving heterogeneous block
+      placement (unlike Jamba's `attn_layer_period`/`offset` arithmetic schedule),
+      (b) a **squared-ReLU (relu2) non-gated MLP** — `up -> ReLU(x)^2 -> down` with
+      NO gate projection (reuse the `TNNetReGLUSquared` activation but on the
+      single-projection MLP path, not the gated SwiGLU path), (c) NoPE on the
+      attention layers (Mamba-2 mixers carry order; attention is position-encoding-free
+      like Jamba), RMSNorm, GQA. Tokenizer is a tokenizer.json BPE (already
+      supported). Deliverables: pico parity fixture via the make_pico_*_fixture.py
+      recipe asserting hidden states AND next-token logits < 1e-4 vs HF float64
+      `NemotronHForCausalLM`; wire model_type "nemotron_h" into `BuildFromPretrained`.
+      Opens Zamba2 (the sibling Mamba-2 hybrid, which additionally adds shared
+      transformer blocks with per-invocation LoRA — a separate, larger follow-up).
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
