@@ -489,10 +489,12 @@ rather than acted on.
       but NN.Compute has no SIMD batch axis on the char path, so each step still
       pays one forward per running row. The vectorized batch is the actual
       prerequisite for an efficient speculative-decoding verify step.
-- [ ] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
-      with forward/backward wall-time and parameter/activation memory per
-      layer (introspection-report pattern). Directly serves the open
-      chunked-forward throughput tasks by showing where time actually goes.
+- [X] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
+      LANDED (commit f34dcae): class function ProfileReport(NN, Sample, Target=nil,
+      Iterations=20): string — per-layer table (index/class/shape/us-fwd/us-bwd/
+      param elems+bytes/activation elems+bytes + TOTAL), reusing the framework
+      FForwardTime/FBackwardTime accumulators (combines the pre-existing
+      LayerTimingReport + MemoryFootprintReport). Test TestProfileReportStructureAndCounts.
 - [ ] FlashAttention-style tiled online-softmax SDPA forward: opt-in fast
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
