@@ -556,11 +556,21 @@ rather than acted on.
         gate — non-trivial, deferred).
   - [ ] Block-level token-by-token decode through AddRWKVTimeMix (needs TNNetTokenShift
         to carry its one-token shift state) + wiring into TNNetStreamingDecoder.
-- [ ] Mamba decode-side demo: tokens/sec flat in context length where a
+- [X] Mamba decode-side demo: tokens/sec flat in context length where a
       transformer of equal size slows (constant-memory headline of the
       landed BuildMambaFromSafeTensors importer; needs an incremental
       TNNetSelectiveSSM state-carry path, the sibling of the RWKV-4
-      decode demo task above).
+      decode demo task above). LANDED (commit 27ba256): TNNetSelectiveSSM gains the
+      same O(1)-per-step incremental API as TNNetWKV (BeginIncrementalDecode/
+      ComputeIncremental/ResetState/ResetCache/EndIncrementalDecode + CaptureState/
+      RestoreState). Bit-exact vs full-scan (err 0.0) for DState=1, DState=4, AND a
+      fork round-trip (TestSelectiveSSMIncrementalDecodeEquivalence). examples/MambaDecode
+      demos exact equivalence + flat per-step timing across start_pos 64->60064.
+      1958 tests pass. OPEN follow-up:
+  - [ ] Full Mamba-BLOCK token-by-token decode: causal DepthwiseConv1D must carry
+        its (kernel-1)-token ring buffer + in/out projections driven one token at a
+        time, then wire into TNNetStreamingDecoder (mirrors the RWKV TokenShift
+        block-integration follow-up).
 - [ ] Forced-prefix seq2seq decode + KV cache for Whisper-style decoders:
       DecodeSeq2SeqGreedy/Sampled assume a text encoder input and a
       single BOS start token, so examples/WhisperTranscribe hand-rolls
