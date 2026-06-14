@@ -31816,6 +31816,13 @@ begin
     // ---------------- Architecture ----------------
     NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
       Config.NumChannels) );
+    // For a trainable build, enable input error collection BEFORE the first conv
+    // is wired: a convolution sizes its prev-layer-error scratch buffer from the
+    // prev layer's OutputError size at SetPrevLayer time, so collection must be
+    // on now for backprop-to-the-input (perceptual / style-transfer gradient
+    // ascent) to reach the pixels. Harmless for plain forward inference.
+    if not pInferenceOnly then
+      TNNetInput(NN.GetLastLayer()).EnableErrorCollection();
     RefCount := 0;
     InWidth := Config.NumChannels;
     for Stage := 0 to LastStage do
