@@ -402,7 +402,7 @@ rather than acted on.
       closure). Validate the alpha-bar/beta math + a DDIM trajectory against a numpy
       oracle; refactor DiffusionMNIST to call it. This is the missing piece (with
       the already-tracked SD-UNet follow-up) for end-to-end imported text-to-image.
-- [ ] TNNet.AddUNet builder (symmetric conv encoder–decoder with skip
+- [X] TNNet.AddUNet builder (symmetric conv encoder–decoder with skip
       concatenations) — the repo's only segmentation example (DiceSegmentation) is a
       FLAT fully-convolutional net with no down/upsampling, and there is no reusable
       U-Net. Add a builder: N encoder stages (2x Conv3x3-Norm-ReLU + 2x2 stride-2

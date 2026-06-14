@@ -1224,6 +1224,7 @@ type
     procedure TestCopyToChannelsNumerical;
     procedure TestSEBlockShapeAndForward;
     procedure TestCBAMShapeForwardAndGradFlow;
+    procedure TestUNetDimsChannelsSkipsAndGradFlow;
     procedure TestConfusionMatrixReportArithmetic;
     procedure TestGradientNormReportSmoke;
     procedure TestPerplexityReportSmoke;
@@ -6749,6 +6750,103 @@ begin
       GradSumAbs := GradSumAbs + Abs(OutVal);
     end;
     AssertTrue('CBAM produces non-zero input gradient flow', GradSumAbs > 1e-8);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestUNetDimsChannelsSkipsAndGradFlow;
+const
+  W = 16; H = 16; C = 1; Depth = 2; Base = 4; OutCh = 3;
+var
+  NN: TNNet;
+  InputLayer, UOut: TNNetLayer;
+  Input, Desired: TNNetVolume;
+  Taps: TNeuralIntegerArray;
+  Idx, Stage, ConcatHits, LayerI: integer;
+  OutVal, GradSumAbs: TNeuralFloat;
+  Concat: TNNetConcatBase;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, C);
+  Desired := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(W, H, C, 1));
+    UOut := NN.AddUNet(Depth, Base, OutCh, Taps);
+
+    // Defining U-Net property: output spatial dims equal input spatial dims.
+    AssertEquals('U-Net output SizeX equals input', W, UOut.Output.SizeX);
+    AssertEquals('U-Net output SizeY equals input', H, UOut.Output.SizeY);
+    // Head produces the requested number of output channels.
+    AssertEquals('U-Net output Depth equals OutputChannels', OutCh, UOut.Output.Depth);
+
+    // Skip wiring: one tap per encoder stage, every tap index valid.
+    AssertEquals('U-Net returns one tap per encoder stage', Depth, Length(Taps));
+    for Stage := 0 to Depth - 1 do
+    begin
+      AssertTrue('tap index in range (low)', Taps[Stage] >= 0);
+      AssertTrue('tap index in range (high)', Taps[Stage] < NN.CountLayers());
+      // The recorded tap must have the spatial size of its resolution
+      // (W shrinks by 2 per stage) and feature count Base*2^stage.
+      AssertEquals('tap SizeX at stage', W shr Stage,
+        NN.Layers[Taps[Stage]].Output.SizeX);
+      AssertEquals('tap Depth at stage', Base shl Stage,
+        NN.Layers[Taps[Stage]].Output.Depth);
+    end;
+
+    // Skip wiring: there must be exactly Depth concat layers, and each encoder
+    // tap index must appear as an input to one of them. The concat serialized
+    // structure encodes its input layer indices, so the full net structure
+    // string is searched for each tap index in a concat context.
+    ConcatHits := 0;
+    for LayerI := 0 to NN.CountLayers() - 1 do
+      if NN.Layers[LayerI] is TNNetConcatBase then
+      begin
+        Concat := TNNetConcatBase(NN.Layers[LayerI]);
+        // A concat's serialized inputs include the tap index. Its output depth
+        // must exceed any single tap's depth (i.e. it really concatenated the
+        // skip onto the upsampled path), confirming the skip is consumed.
+        for Stage := 0 to Depth - 1 do
+          if (Pos(':' + IntToStr(Taps[Stage]) + ':', Concat.SaveStructureToString()) > 0) or
+             (Pos(':' + IntToStr(Taps[Stage]) + ';', Concat.SaveStructureToString()) > 0) or
+             (Pos(';' + IntToStr(Taps[Stage]) + ':', Concat.SaveStructureToString()) > 0) then
+            Inc(ConcatHits);
+      end;
+    AssertEquals('every encoder tap is consumed by a concat skip', Depth, ConcatHits);
+
+    // Forward must be finite everywhere.
+    for Idx := 0 to Input.Size - 1 do
+      Input.FData[Idx] := (Random - 0.5) * 2.0;
+    NN.Compute(Input);
+    for Idx := 0 to UOut.Output.Size - 1 do
+    begin
+      OutVal := UOut.Output.FData[Idx];
+      AssertFalse('U-Net output contains NaN', IsNaN(OutVal));
+      AssertFalse('U-Net output contains Inf', IsInfinite(OutVal));
+    end;
+
+    // Clean backward pass with finite, non-trivial input-gradient flow.
+    Desired.ReSize(UOut.Output);
+    for Idx := 0 to Desired.Size - 1 do
+      Desired.FData[Idx] := Cos(Idx * 0.5);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    NN.Compute(Input);
+    InputLayer.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    GradSumAbs := 0;
+    for Idx := 0 to InputLayer.OutputError.Size - 1 do
+    begin
+      OutVal := InputLayer.OutputError.FData[Idx];
+      AssertFalse('U-Net input gradient contains NaN', IsNaN(OutVal));
+      AssertFalse('U-Net input gradient contains Inf', IsInfinite(OutVal));
+      GradSumAbs := GradSumAbs + Abs(OutVal);
+    end;
+    AssertTrue('U-Net produces non-zero input gradient flow', GradSumAbs > 1e-8);
   finally
     NN.Free;
     Input.Free;

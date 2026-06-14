@@ -43,6 +43,13 @@ examples/ConditionalDiffusion/*.log
 examples/ConditionalDiffusion/*.o
 examples/ConditionalDiffusion/*.ppu
 
+# UNetSegmentation example: binary + generated visualization/build artifacts
+examples/UNetSegmentation/UNetSegmentation
+examples/UNetSegmentation/*.png
+examples/UNetSegmentation/*.ppm
+examples/UNetSegmentation/*.o
+examples/UNetSegmentation/*.ppu
+
 # Claude Code (created at repo root)
 .claude/
 

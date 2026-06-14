@@ -11602,6 +11602,31 @@ type
       // CHANNEL branch's TNNetMaxChannel assumes square maps (SizeX=SizeY).
       function AddCBAM(InputLayer: TNNetLayer; ReductionRatio: integer = 16;
         SpatialKernelSize: integer = 7): TNNetLayer;
+      // Symmetric convolutional encoder-decoder U-Net (Ronneberger et al. 2015)
+      // built from existing tested layers; it is SHAPE-PRESERVING in space
+      // (output SizeX,SizeY = input SizeX,SizeY) with OutputChannels depth.
+      // Structure (Depth stages):
+      //   encoder stage i = 2x [ Conv3x3(pad1) -> Norm -> ReLU ] then a
+      //     2x2 stride-2 MaxPool downsample; feature count DOUBLES each stage
+      //     (BaseFeatures, 2*BaseFeatures, ...). The pre-pool feature map of
+      //     every stage is recorded as a SKIP tap.
+      //   bottleneck = 2x [ Conv3x3(pad1) -> NormLayer -> ReLU ].
+      //   decoder stage i = 2x nearest upsample (TNNetDeMaxPool) -> TNNetDeepConcat
+      //     with the matching encoder tap (the skip; depth-axis concat) -> 2x
+      //     [ Conv3x3 -> Norm ->
+      //     ReLU ]; feature count HALVES each stage.
+      //   head = 1x1 ConvolutionLinear -> OutputChannels (a per-pixel logit map;
+      //     wire a Sigmoid + TNNetDiceLoss after it for binary segmentation).
+      // EncoderTaps (out) returns the layer INDICES of the recorded skip taps,
+      // shallow->deep, so callers can inspect/re-wire the skip connections.
+      // CONSTRAINT: the incoming SizeX and SizeY must each be divisible by
+      // 2^Depth so every downsample/upsample round-trips exactly.
+      // UseNorm (default true) inserts a TNNetMovingStdNormalization after each
+      // conv; set false for a plain conv->ReLU U-Net.
+      // Coded by Claude (AI).
+      function AddUNet(Depth, BaseFeatures, OutputChannels: integer;
+        out EncoderTaps: TNeuralIntegerArray;
+        UseNorm: boolean = true): TNNetLayer;
       // SwiGLU feed-forward block: FullConnectLinear(2*D_hidden) -> SwiGLU -> FullConnectLinear(D_out).
       // D_in is informational only; the first FullConnect infers its input from the previous layer.
       function AddSwiGLUFeedForward(D_in, D_hidden, D_out: integer): TNNetLayer;
@@ -50283,6 +50308,67 @@ begin
   // with the (SizeX,SizeY,C) channel-refined map.
   SpatialMask := AddLayer( TNNetDeepConcat.Replicate(Channels, SpatialGate) );
   Result := AddLayer( TNNetCellMulByCell.Create(ChannelRefined, SpatialMask) );
+end;
+
+function TNNet.AddUNet(Depth, BaseFeatures, OutputChannels: integer;
+  out EncoderTaps: TNeuralIntegerArray;
+  UseNorm: boolean): TNNetLayer;
+var
+  Stage, Features: integer;
+  Tap: TNNetLayer;
+
+  // 2x [ Conv3x3(pad1,stride1) -> (optional Norm) -> ReLU ], shape-preserving
+  // in space.
+  procedure DoubleConv(F: integer);
+  begin
+    AddLayer( TNNetConvolutionLinear.Create(F, 3, 1, 1) );
+    if UseNorm then AddLayer( TNNetMovingStdNormalization.Create() );
+    AddLayer( TNNetReLU.Create() );
+    AddLayer( TNNetConvolutionLinear.Create(F, 3, 1, 1) );
+    if UseNorm then AddLayer( TNNetMovingStdNormalization.Create() );
+    AddLayer( TNNetReLU.Create() );
+  end;
+
+begin
+  if Depth < 1 then
+    FErrorProc('AddUNet requires Depth >= 1. Depth=' + IntToStr(Depth));
+  if BaseFeatures < 1 then
+    FErrorProc('AddUNet requires BaseFeatures >= 1. BaseFeatures=' + IntToStr(BaseFeatures));
+  if OutputChannels < 1 then
+    FErrorProc('AddUNet requires OutputChannels >= 1. OutputChannels=' + IntToStr(OutputChannels));
+
+  SetLength(EncoderTaps, Depth);
+
+  // ---- ENCODER: Depth stages, each doubling features, each pooling x2 ------
+  Features := BaseFeatures;
+  for Stage := 0 to Depth - 1 do
+  begin
+    DoubleConv(Features);
+    // Record the PRE-pool feature map as the skip tap for this resolution.
+    Tap := GetLastLayer();
+    EncoderTaps[Stage] := Tap.LayerIdx;
+    AddLayer( TNNetMaxPool.Create(2) ); // 2x2 stride-2 downsample.
+    Features := Features * 2;
+  end;
+
+  // ---- BOTTLENECK ---------------------------------------------------------
+  DoubleConv(Features);
+
+  // ---- DECODER: Depth stages, each halving features, each upsampling x2 ----
+  for Stage := Depth - 1 downto 0 do
+  begin
+    Features := Features div 2;
+    // TNNetDeMaxPool(2) with default spacing replicates each cell into a 2x2
+    // block: a nearest-neighbour x2 spatial upsample that PRESERVES depth
+    // (unlike TNNetUpsample, which is a depth->space pixel-shuffle).
+    AddLayer( TNNetDeMaxPool.Create(2) );
+    // Skip connection: concatenate the matching encoder tap on the depth axis.
+    AddLayer( TNNetDeepConcat.Create([ GetLastLayer(), FLayers[EncoderTaps[Stage]] ]) );
+    DoubleConv(Features);
+  end;
+
+  // ---- HEAD: 1x1 conv to the requested output-channel logit map -----------
+  Result := AddLayer( TNNetConvolutionLinear.Create(OutputChannels, 1, 0, 1) );
 end;
 
 function TNNet.AddLoRAAdapter(FrozenLayer: TNNetLayer; Rank: integer;
