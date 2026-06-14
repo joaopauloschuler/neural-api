@@ -403,6 +403,62 @@ rather than acted on.
       the landed TNNetMinLSTM but with conv instead of dense gates and a spatial
       cell state); otherwise compose from existing conv + gating layers. Generates
       a short MNIST-digit-trajectory rollout on CPU.
+- [ ] VGG-16/19 importer (BuildVGGFromSafeTensors, torchvision/timm) — the
+      canonical perceptual-feature backbone that is conspicuously absent (ResNet,
+      ViT, DINOv2 are landed but the plain VGG conv stack is not). Trivial on the
+      existing conv-import idiom (straight Conv3x3-ReLU + MaxPool stack, no residual
+      / norm bookkeeping), and it is the prerequisite feature extractor for
+      perceptual loss, LPIPS and neural style transfer below. Pico parity vs HF
+      float64 + an ImageNet-class top-1 sanity check on one real image. Expose the
+      intermediate ReLU feature maps (relu1_2/2_2/3_3/4_3) as named taps so the
+      perceptual-loss consumers can read them.
+- [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
+      torchvision) — structurally distinct from every landed CNN (parallel
+      multi-branch Inception modules with 1x1 / 3x3 / 5x5(as two 3x3) / pool
+      branches concatenated on the channel axis, asymmetric 1xN/Nx1 factorized
+      convs, BN after every conv). Reuses the landed conv + BN + Concat path; the
+      new work is the branch-concatenation block builder. Needed in its own right
+      and as the pooled-feature backbone for FID below. Pico parity vs HF float64.
+- [ ] Generative-image quality metrics — FID (Fréchet Inception Distance) +
+      Inception Score (examples/GenerativeImageMetrics or a neural*metrics unit).
+      The repo has a deep NLP-eval bench (perplexity / MMLU / HellaSwag) and CV
+      classification reports, but ZERO image-generative quality metrics, so
+      VisualGAN / DiffusionMNIST / FlowMatching / VisualAutoencoder cannot be
+      compared except by eye. Pool the Inception-v3 (or a smaller landed CNN as a
+      documented proxy) 2048-d features over a real and a generated image set,
+      compute per-set mean + covariance and the Fréchet distance
+      ||mu_r-mu_g||^2 + Tr(Cr+Cg-2 sqrt(Cr Cg)); add Inception Score
+      (exp E_x KL(p(y|x)||p(y))) from the softmax. New code is the matrix
+      square-root (eigendecomposition of a small SPD covariance) and the feature
+      accumulator; validate the Fréchet formula against a numpy/scipy oracle on
+      synthetic Gaussian feature sets.
+- [ ] LPIPS perceptual distance (TNNetLPIPS or a metric helper) — the standard
+      perceptual image-similarity metric for super-resolution / restoration /
+      generative quality, complementing the landed SuperResolution / SubPixelSuperRes
+      / Real-ESRGAN work where pixel MSE is known to be a poor quality proxy.
+      Compute the weighted L2 distance between unit-normalized VGG feature maps
+      (reusing the VGG importer above) across the relu taps; ship the official
+      linear-head weights (lin layers of richzhang/PerceptualSimilarity) as a tiny
+      imported tensor. Parity vs the reference LPIPS on one image pair; also expose
+      it as a training loss so SR examples can opt into perceptual fine-tuning.
+- [ ] Neural style transfer example (examples/StyleTransfer, Gatys et al.) — a
+      classic, self-contained, visually-compelling CV-generative example with no
+      training loop: optimize the PIXELS of a canvas image (gradient ascent on the
+      input, the infra the GradientAscent example already exercises) to jointly
+      match content activations and style Gram matrices of a reference pair, using
+      the VGG feature taps above. New code is the Gram-matrix layer/helper and the
+      content+style loss; produces a stylized PNG of a tiny CPU image. Reuses the
+      perceptual-feature backbone and closes the loop on "what is VGG good for here".
+- [ ] DETR object-detection importer (BuildDetrFromSafeTensors,
+      facebook/detr-resnet-50) — the FIRST object-detection importer, a wholly new
+      CV vertical (bounding boxes + class per box, not a single label / dense map).
+      Reuses two landed pieces directly: the ResNet-50 backbone importer and the
+      transformer encoder-decoder stack; the genuinely new code is the fixed set of
+      learned object queries, the 2-D sinusoidal position embedding over the feature
+      grid, and the box-regression (sigmoid cxcywh) + class heads. Inference needs no
+      Hungarian matcher (that is training-only) — just threshold the per-query class
+      softmax. Pico parity vs HF float64 + an examples/ObjectDetection demo that
+      draws boxes on one CPU image.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
