@@ -929,6 +929,10 @@ type
     procedure TestAffineGridSampleSourceGradientCheck;
     procedure TestAffineGridSampleThetaGradientCheck;
     procedure TestAffineGridSampleLoadFromString;
+    procedure TestAdaINForwardStatistics;
+    procedure TestAdaINContentGradientCheck;
+    procedure TestAdaINStyleGradientCheck;
+    procedure TestAdaINLoadFromString;
     procedure TestHyperLinearMainInputGradientCheck;
     procedure TestHyperLinearGeneratedWeightsGradientCheck;
     procedure TestHyperLinearLoadFromString;
@@ -17813,6 +17817,273 @@ begin
     end;
   finally
     NN.Free; Img.Free; Theta.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINForwardStatistics;
+// After AdaIN the output of each channel must have the STYLE channel's mean and
+// std (the defining property of adaptive instance normalization). Content and
+// style use DIFFERENT spatial sizes to exercise the M<>N path.
+var
+  NN: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  Content, Style: TNNetVolume;
+  CW, CH, SW, SH, D, c, x, y, n: integer;
+  outMean, outVar, styMean, styVar, v: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  CW := 4; CH := 3; SW := 5; SH := 2; D := 3;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+
+    for n := 0 to Content.Size - 1 do Content.Raw[n] := Sin(n * 0.53) * 0.9 + 0.1;
+    for n := 0 to Style.Size - 1 do Style.Raw[n] := Cos(n * 0.37) * 1.7 - 0.4;
+    ContentInput.Output.Copy(Content);
+    StyleInput.Output.Copy(Style);
+    NN.Compute(ContentInput.Output);
+
+    AssertTrue('AdaIN output keeps content shape',
+      (NN.GetLastLayer.Output.SizeX = CW) and
+      (NN.GetLastLayer.Output.SizeY = CH) and
+      (NN.GetLastLayer.Output.Depth = D));
+
+    for c := 0 to D - 1 do
+    begin
+      // Style channel statistics.
+      styMean := 0;
+      for x := 0 to SW - 1 do for y := 0 to SH - 1 do styMean := styMean + Style[x, y, c];
+      styMean := styMean / (SW * SH);
+      styVar := 0;
+      for x := 0 to SW - 1 do for y := 0 to SH - 1 do styVar := styVar + Sqr(Style[x, y, c] - styMean);
+      styVar := styVar / (SW * SH);
+      // Output channel statistics.
+      outMean := 0;
+      for x := 0 to CW - 1 do for y := 0 to CH - 1 do
+        outMean := outMean + NN.GetLastLayer.Output[x, y, c];
+      outMean := outMean / (CW * CH);
+      outVar := 0;
+      for x := 0 to CW - 1 do for y := 0 to CH - 1 do
+      begin
+        v := NN.GetLastLayer.Output[x, y, c] - outMean;
+        outVar := outVar + v * v;
+      end;
+      outVar := outVar / (CW * CH);
+      AssertEquals('AdaIN output mean matches style mean (channel ' +
+        IntToStr(c) + ')', styMean, outMean, 1e-4);
+      // Output std equals style std (up to the eps in both std computations).
+      AssertTrue('AdaIN output std matches style std (channel ' + IntToStr(c) +
+        ') outvar=' + FloatToStr(outVar) + ' styvar=' + FloatToStr(styVar),
+        Abs(Sqrt(outVar) - Sqrt(styVar)) < 1e-3);
+    end;
+  finally
+    NN.Free; Content.Free; Style.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINContentGradientCheck;
+// Central-difference check of d(loss)/d(content) through AdaIN (the instance-norm
+// Jacobian scaled per channel by style_std/content_std).
+var
+  NN: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  Content, ContentPlus, Style, Desired: TNNetVolume;
+  CW, CH, SW, SH, D, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AContent: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ContentInput.Output.Copy(AContent);
+    StyleInput.Output.Copy(Style);
+    NN.Compute(ContentInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  CW := 4; CH := 3; SW := 5; SH := 2; D := 3;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  ContentPlus := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  Desired := TNNetVolume.Create(CW, CH, D);
+  epsilon := 0.001; maxErr := 0;
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Content.Size - 1 do Content.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Style.Size - 1 do Style.Raw[i] := Cos(i * 0.37) * 1.7 - 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Content.Size - 1 do
+    begin
+      ContentPlus.Copy(Content);
+      ContentPlus.Raw[i] := Content.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(ContentPlus);
+      ContentPlus.Raw[i] := Content.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(ContentPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ContentInput.Output.Copy(Content);
+      StyleInput.Output.Copy(Style);
+      NN.Compute(ContentInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Layers[1].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := ContentInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('AdaIN content gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestAdaINContentGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Content.Free; ContentPlus.Free; Style.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINStyleGradientCheck;
+// Central-difference check of d(loss)/d(style) through AdaIN: the style gradient
+// flows through style_mean (uniform 1/M spread) and style_std.
+var
+  NN: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  Content, Style, StylePlus, Desired: TNNetVolume;
+  CW, CH, SW, SH, D, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AStyle: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ContentInput.Output.Copy(Content);
+    StyleInput.Output.Copy(AStyle);
+    NN.Compute(ContentInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  CW := 4; CH := 3; SW := 5; SH := 2; D := 3;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  StylePlus := TNNetVolume.Create(SW, SH, D);
+  Desired := TNNetVolume.Create(CW, CH, D);
+  epsilon := 0.001; maxErr := 0;
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Content.Size - 1 do Content.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Style.Size - 1 do Style.Raw[i] := Cos(i * 0.37) * 1.7 - 0.4;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+
+    for i := 0 to Style.Size - 1 do
+    begin
+      StylePlus.Copy(Style);
+      StylePlus.Raw[i] := Style.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(StylePlus);
+      StylePlus.Raw[i] := Style.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(StylePlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ContentInput.Output.Copy(Content);
+      StyleInput.Output.Copy(Style);
+      NN.Compute(ContentInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Layers[1].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := StyleInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('AdaIN style gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestAdaINStyleGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Content.Free; Style.Free; StylePlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINLoadFromString;
+// The AdaIN style source-layer index must survive SaveToString -> LoadFromString
+// (serialized via FStruct like the other two-source layers), and the reloaded
+// net must reproduce the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  ContentInput, StyleInput: TNNetLayer;
+  Content, Style: TNNetVolume;
+  CW, CH, SW, SH, D, i: integer;
+  Saved, Saved2: string;
+  FoundAdaIN: boolean;
+begin
+  RandSeed := 424242;
+  CW := 4; CH := 3; SW := 5; SH := 2; D := 3;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+
+    for i := 0 to Content.Size - 1 do Content.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Style.Size - 1 do Style.Raw[i] := Cos(i * 0.37) * 1.7 - 0.4;
+    ContentInput.Output.Copy(Content);
+    StyleInput.Output.Copy(Style);
+    NN.Compute(ContentInput.Output);
+
+    FoundAdaIN := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetAdaIN then FoundAdaIN := true;
+    AssertTrue('AdaIN layer present', FoundAdaIN);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('AdaIN SaveToString round-trip equality', Saved, Saved2);
+
+      NN2.Layers[0].Output.Copy(Content);
+      NN2.Layers[1].Output.Copy(Style);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('AdaIN round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Content.Free; Style.Free;
   end;
 end;
 

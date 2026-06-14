@@ -429,7 +429,7 @@ rather than acted on.
       thin example head, NOT a new leaf class). Isola et al. 2017; foundational
       conditional-generation recipe distinct from the unconditional VisualGAN and the
       diffusion examples. Edit examples/README.md.
-- [ ] AdaIN (adaptive instance normalization) two-input layer + fast arbitrary
+- [X] AdaIN (adaptive instance normalization) two-input layer + fast arbitrary
       style-transfer example — the landed StyleTransfer is Gatys ITERATIVE pixel
       optimization (minutes per image, one fixed style); AdaIN enables a single
       feed-forward pass for ARBITRARY styles (Huang & Belongie 2017). Add

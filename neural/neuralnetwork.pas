@@ -7572,6 +7572,39 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// TNNetAdaIN: Adaptive Instance Normalization (Huang & Belongie 2017).
+  // A TWO-SOURCE layer with NO learnable parameters. The first source is the
+  // CONTENT feature map and the second source is the STYLE feature map (both
+  // must have the same Depth; the spatial sizes may differ). For every sample
+  // and every channel c the content map is instance-normalized over its spatial
+  // positions and then re-scaled / re-shifted by the per-channel statistics of
+  // the style map:
+  //   out = style_std[c] * (content - content_mean[c]) / content_std[c]
+  //         + style_mean[c]
+  // An epsilon stabilizes both standard deviations. The full input gradient is
+  // propagated to BOTH sources: the content gradient is the instance-norm
+  // Jacobian scaled by style_std per channel, and the style gradient flows
+  // through style_mean (uniform 1/M spread) and style_std
+  // ( (s-style_mean)/(M*style_std) reduction ).
+  // Coded by Claude (AI).
+  TNNetAdaIN = class(TNNetIdentityWithoutL2)
+    private
+      FContentIdx, FStyleIdx: integer;
+      FContentLayer, FStyleLayer: TNNetLayer;
+      // Per-sample-per-channel statistics cached for the backward pass.
+      FContentMean, FContentInvStd: TNNetVolume; // (1,1,Depth)
+      FStyleMean, FStyleStd: TNNetVolume;         // (1,1,Depth)
+      FNormContent: TNNetVolume;                  // normalized content (xhat)
+      FAdaEpsilon: TNeuralFloat;
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(ContentLayer, StyleLayer: TNNetLayer); overload;
+      constructor Create(ContentIdx, StyleIdx: integer); overload;
+      destructor Destroy(); override;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// This layer adds a trainable bias to each output cell. Placing
   // this layer before and after convolutions can speed up learning.
   // It's useless placing this layer after fully connected layers with bias.
@@ -32732,6 +32765,186 @@ begin
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   FLayerA.Backpropagate();
   FLayerB.Backpropagate();
+end;
+
+{ TNNetAdaIN }
+constructor TNNetAdaIN.Create(ContentLayer, StyleLayer: TNNetLayer);
+begin
+  Self.Create(ContentLayer.LayerIdx, StyleLayer.LayerIdx);
+end;
+
+constructor TNNetAdaIN.Create(ContentIdx, StyleIdx: integer);
+begin
+  inherited Create();
+  FContentIdx := ContentIdx;
+  FStyleIdx := StyleIdx;
+  FStruct[0] := ContentIdx;
+  FStruct[1] := StyleIdx;
+  FAdaEpsilon := 1e-5;
+  FContentMean := TNNetVolume.Create();
+  FContentInvStd := TNNetVolume.Create();
+  FStyleMean := TNNetVolume.Create();
+  FStyleStd := TNNetVolume.Create();
+  FNormContent := TNNetVolume.Create();
+end;
+
+destructor TNNetAdaIN.Destroy();
+begin
+  FContentMean.Free;
+  FContentInvStd.Free;
+  FStyleMean.Free;
+  FStyleStd.Free;
+  FNormContent.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetAdaIN.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  FContentLayer := pPrevLayer.NN.Layers[FContentIdx];
+  FStyleLayer := pPrevLayer.NN.Layers[FStyleIdx];
+  FContentLayer.IncDepartingBranchesCnt();
+  FStyleLayer.IncDepartingBranchesCnt();
+  // The content layer drives the output shape.
+  inherited SetPrevLayer(FContentLayer);
+  if FContentLayer.Output.Depth <> FStyleLayer.Output.Depth then
+  begin
+    FErrorProc('TNNetAdaIN - content channels ' +
+      IntToStr(FContentLayer.Output.Depth) +
+      ' do not match style channels ' + IntToStr(FStyleLayer.Output.Depth)
+    );
+  end;
+  FContentMean.ReSize(1, 1, FContentLayer.Output.Depth);
+  FContentInvStd.ReSize(1, 1, FContentLayer.Output.Depth);
+  FStyleMean.ReSize(1, 1, FContentLayer.Output.Depth);
+  FStyleStd.ReSize(1, 1, FContentLayer.Output.Depth);
+  FNormContent.ReSize(FContentLayer.Output);
+  FOutputError.ReSize(FContentLayer.Output);
+  FOutputErrorDeriv.ReSize(FContentLayer.Output);
+end;
+
+procedure TNNetAdaIN.Compute();
+var
+  StartTime: double;
+  C, ContentN, StyleM: integer;
+  CntX, CntY: integer;
+  Mean, Variance, InvStd, StyleMean, StyleVar: TNeuralFloat;
+  Depth: integer;
+  ContentOut, StyleOut: TNNetVolume;
+begin
+  StartTime := Now();
+  // inherited Compute copies the content layer output into FOutput.
+  inherited Compute;
+  ContentOut := FContentLayer.Output;
+  StyleOut := FStyleLayer.Output;
+  Depth := ContentOut.Depth;
+  ContentN := ContentOut.SizeX * ContentOut.SizeY;
+  StyleM := StyleOut.SizeX * StyleOut.SizeY;
+  for C := 0 to Depth - 1 do
+  begin
+    // Content statistics over its spatial positions.
+    Mean := 0;
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+        Mean := Mean + ContentOut[CntX, CntY, C];
+    Mean := Mean / ContentN;
+    Variance := 0;
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+        Variance := Variance +
+          Sqr(ContentOut[CntX, CntY, C] - Mean);
+    Variance := Variance / ContentN;
+    InvStd := 1 / Sqrt(Variance + FAdaEpsilon);
+    FContentMean.FData[C] := Mean;
+    FContentInvStd.FData[C] := InvStd;
+    // Style statistics over its (possibly different size) spatial positions.
+    StyleMean := 0;
+    for CntX := 0 to StyleOut.SizeX - 1 do
+      for CntY := 0 to StyleOut.SizeY - 1 do
+        StyleMean := StyleMean + StyleOut[CntX, CntY, C];
+    StyleMean := StyleMean / StyleM;
+    StyleVar := 0;
+    for CntX := 0 to StyleOut.SizeX - 1 do
+      for CntY := 0 to StyleOut.SizeY - 1 do
+        StyleVar := StyleVar + Sqr(StyleOut[CntX, CntY, C] - StyleMean);
+    StyleVar := StyleVar / StyleM;
+    FStyleMean.FData[C] := StyleMean;
+    FStyleStd.FData[C] := Sqrt(StyleVar + FAdaEpsilon);
+    // out = style_std * (content - content_mean) * inv_content_std + style_mean
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+      begin
+        FNormContent[CntX, CntY, C] :=
+          (ContentOut[CntX, CntY, C] - Mean) * InvStd;
+        FOutput[CntX, CntY, C] :=
+          FStyleStd.FData[C] * FNormContent[CntX, CntY, C] + StyleMean;
+      end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetAdaIN.Backpropagate();
+var
+  StartTime: double;
+  C, ContentN, StyleM, Depth: integer;
+  CntX, CntY: integer;
+  G, XHat, SHat: TNeuralFloat;
+  SumG, SumGXHat: TNeuralFloat;
+  StyleMean, StyleStd, ContentInvStd: TNeuralFloat;
+  ContentErr, StyleErr: TNNetVolume;
+  ContentOut, StyleOut: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  ContentErr := FContentLayer.OutputError;
+  StyleErr := FStyleLayer.OutputError;
+  ContentOut := FContentLayer.Output;
+  StyleOut := FStyleLayer.Output;
+  Depth := ContentOut.Depth;
+  ContentN := ContentOut.SizeX * ContentOut.SizeY;
+  StyleM := StyleOut.SizeX * StyleOut.SizeY;
+  for C := 0 to Depth - 1 do
+  begin
+    StyleMean := FStyleMean.FData[C];
+    StyleStd := FStyleStd.FData[C];
+    ContentInvStd := FContentInvStd.FData[C];
+    // Reductions of the upstream gradient over the CONTENT spatial positions.
+    SumG := 0;
+    SumGXHat := 0;
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+      begin
+        G := FOutputError[CntX, CntY, C];
+        SumG := SumG + G;
+        SumGXHat := SumGXHat + G * FNormContent[CntX, CntY, C];
+      end;
+    // d out / d content : instance-norm Jacobian scaled by style_std/content_std.
+    //   dx_i = (style_std * inv_content_std / N) *
+    //          ( N*g_i - sum(g) - xhat_i * sum(g*xhat) )
+    for CntX := 0 to ContentOut.SizeX - 1 do
+      for CntY := 0 to ContentOut.SizeY - 1 do
+      begin
+        G := FOutputError[CntX, CntY, C];
+        XHat := FNormContent[CntX, CntY, C];
+        ContentErr[CntX, CntY, C] := ContentErr[CntX, CntY, C] +
+          (StyleStd * ContentInvStd / ContentN) *
+          (ContentN * G - SumG - XHat * SumGXHat);
+      end;
+    // d out / d style : flows through style_mean (1/M spread) and style_std.
+    //   ds_j = sum(g)/M + sum(g*xhat) * shat_j / M
+    //   where shat_j = (s_j - style_mean) / style_std.
+    for CntX := 0 to StyleOut.SizeX - 1 do
+      for CntY := 0 to StyleOut.SizeY - 1 do
+      begin
+        SHat := (StyleOut[CntX, CntY, C] - StyleMean) / StyleStd;
+        StyleErr[CntX, CntY, C] := StyleErr[CntX, CntY, C] +
+          (SumG / StyleM) + (SumGXHat * SHat / StyleM);
+      end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FContentLayer.Backpropagate();
+  FStyleLayer.Backpropagate();
 end;
 
 { TNNetForByteProcessing }
@@ -88198,6 +88411,7 @@ begin
       'TNNetCellBias':              Result := TNNetCellBias.Create();
       'TNNetCellMul':               Result := TNNetCellMul.Create();
       'TNNetCellMulByCell':         Result := TNNetCellMulByCell.Create(St[0], St[1]);
+      'TNNetAdaIN':                 Result := TNNetAdaIN.Create(St[0], St[1]);
       'TNNetRandomMulAdd':          Result := TNNetRandomMulAdd.Create(St[0], St[1]);
       'TNNetChannelRandomMulAdd':   Result := TNNetChannelRandomMulAdd.Create(St[0], St[1]);
       'TNNetChannelZeroCenter':     Result := TNNetChannelZeroCenter.Create();
@@ -88595,6 +88809,7 @@ begin
       if S[0] = 'TNNetCellBias' then Result := TNNetCellBias.Create() else
       if S[0] = 'TNNetCellMul' then Result := TNNetCellMul.Create() else
       if S[0] = 'TNNetCellMulByCell' then Result := TNNetCellMulByCell.Create(St[0], St[1]) else
+      if S[0] = 'TNNetAdaIN' then Result := TNNetAdaIN.Create(St[0], St[1]) else
       if S[0] = 'TNNetRandomMulAdd' then Result := TNNetRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelRandomMulAdd' then Result := TNNetChannelRandomMulAdd.Create(St[0], St[1]) else
       if S[0] = 'TNNetChannelZeroCenter' then Result := TNNetChannelZeroCenter.Create() else
