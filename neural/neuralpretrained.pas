@@ -2237,6 +2237,65 @@ function BuildBertForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
+// =================== CROSS-ENCODER RERANKER ==============================
+// The cross-encoder reranker (cross-encoder/ms-marco-MiniLM-L-6-v2,
+// BAAI/bge-reranker-base, mixedbread/mxbai-rerank) is the SECOND-stage
+// precision scorer of a retrieve-then-rerank RAG pipeline: a single
+// BERT-family trunk encodes the query and ONE candidate passage JOINTLY as
+//   [CLS] query [SEP] passage [SEP]
+// (with token_type/segment id 0 on the query span and 1 on the passage
+// span) and emits ONE relevance logit from the [CLS] row. This is the SAME
+// architecture as BuildBertForSequenceClassificationFromSafeTensors with
+// num_labels=1 - the genuinely new pieces below are the sentence-PAIR
+// encoding (the segment-id=1 path, exercised here for the first time: the
+// importer already wires channel 1 of its (SeqLen,1,2) input into the
+// token_type_embeddings table) and the batch rerank scorer / report.
+
+// Tokenizes a sentence PAIR into a BERT joint sequence
+//   [CLS] TextA [SEP] TextB [SEP]
+// returning the token ids in TokenIds and the parallel SEGMENT ids in
+// SegmentIds (0 over "[CLS] TextA [SEP]", 1 over "TextB [SEP]" - HF's
+// token_type_ids convention). MaxTokens>0 caps the TOTAL length, truncating
+// the longer segment first (the HF "longest_first" default) while always
+// keeping [CLS] and both [SEP]s. Raises when the tokenizer lacks [CLS]/[SEP].
+procedure BertTokenizePair(Tokenizer: TNeuralHFTokenizer;
+  const TextA, TextB: string; out TokenIds, SegmentIds: TNeuralIntegerArray;
+  MaxTokens: integer = 0);
+
+// CrossEncoderScore: joint relevance of (Query, Passage) under a num_labels=1
+// reranker net (BuildBertForSequenceClassificationFromSafeTensors). Encodes
+// the pair (BertTokenizePair) into the net's (SeqLen,1,2) input - channel 0
+// token ids, channel 1 segment ids - runs ONE forward and returns the [CLS]
+// (row 0) logit. ApplySigmoid=True maps it to a (0,1) probability (the
+// standard reranker output); False returns the raw logit (use for exact
+// parity checks / when ordering only).
+function CrossEncoderScore(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query, Passage: string;
+  ApplySigmoid: boolean = True): TNeuralFloat;
+
+// RerankPassages: scores Query against EACH candidate in Passages with one
+// joint cross-encoder forward (CrossEncoderScore, sigmoid applied), then
+// returns the passages reordered most-relevant first. Order[r] is the index
+// (into Passages) of the rank-r passage; Scores[r] is its sigmoid relevance.
+// Both out arrays have Length(Passages) entries. Stable: equal scores keep
+// the original (retrieval) order. Use the net's pQuantizeInt8 build for an
+// int8 backbone - the scorer is agnostic to the backbone's precision.
+procedure RerankPassages(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query: string; const Passages: array of string;
+  out Order: TNeuralIntegerArray; out Scores: TNeuralFloatDynArr);
+
+// RerankReport: quantifies the precision lift a cross-encoder gives over the
+// first-stage (bi-encoder) order. Passages is the candidate list IN ITS
+// INITIAL (retrieval) RANK; Relevant lists the indices (into Passages) of the
+// gold-relevant candidates. Reports MRR and nDCG@k (each k in KList) for the
+// BEFORE order (Passages as given) vs the AFTER order (RerankPassages). One
+// query per call (the per-query lift is the interesting signal); average over
+// queries by combining calls. Returns a formatted multi-line report.
+function RerankReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query: string; const Passages: array of string;
+  const Relevant: TNeuralIntegerArray;
+  const KList: array of integer): string;
+
 // Builds the FULL GPT2ForSequenceClassification stack: GPT-2 trunk + the
 // bias-free score head instead of the LM head. Output is per-position
 // class logits (SeqLen,1,num_labels); HF's logits are the LAST non-pad row
@@ -14041,6 +14100,206 @@ var
 begin
   Result := BuildBertForSequenceClassificationFromSafeTensorsEx(FileName,
     IgnoredConfig, nil, pSeqLen, pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ----------------------- CROSS-ENCODER RERANKER --------------------------
+
+procedure BertTokenizePair(Tokenizer: TNeuralHFTokenizer;
+  const TextA, TextB: string; out TokenIds, SegmentIds: TNeuralIntegerArray;
+  MaxTokens: integer = 0);
+var
+  IdsA, IdsB: TNeuralIntegerArray;
+  ClsId, SepId, LenA, LenB, Cnt, Pos, Budget: integer;
+begin
+  ClsId := Tokenizer.TokenToId('[CLS]');
+  SepId := Tokenizer.TokenToId('[SEP]');
+  if (ClsId < 0) or (SepId < 0) then
+    ImportError('BertTokenizePair: tokenizer has no [CLS]/[SEP] special ' +
+      'tokens (not a BERT-family tokenizer.json?).');
+  if (MaxTokens > 0) and (MaxTokens < 3) then
+    ImportError('BertTokenizePair: MaxTokens must be 0 or >= 3 ([CLS] and ' +
+      'two [SEP]s alone need three positions).');
+  IdsA := Tokenizer.Encode(TextA);
+  IdsB := Tokenizer.Encode(TextB);
+  LenA := Length(IdsA);
+  LenB := Length(IdsB);
+  // HF "longest_first" truncation: 3 positions reserved for [CLS]/[SEP]/[SEP],
+  // then drop the LONGER segment's tail one token at a time until it fits.
+  if MaxTokens > 0 then
+  begin
+    Budget := MaxTokens - 3;
+    while LenA + LenB > Budget do
+      if LenA >= LenB then Dec(LenA) else Dec(LenB);
+    if LenA < 0 then LenA := 0;
+    if LenB < 0 then LenB := 0;
+  end;
+  // [CLS] A [SEP] B [SEP] - segment 0 over "[CLS] A [SEP]", 1 over "B [SEP]".
+  SetLength(TokenIds, LenA + LenB + 3);
+  SetLength(SegmentIds, LenA + LenB + 3);
+  Pos := 0;
+  TokenIds[Pos] := ClsId; SegmentIds[Pos] := 0; Inc(Pos);
+  for Cnt := 0 to LenA - 1 do
+  begin
+    TokenIds[Pos] := IdsA[Cnt]; SegmentIds[Pos] := 0; Inc(Pos);
+  end;
+  TokenIds[Pos] := SepId; SegmentIds[Pos] := 0; Inc(Pos);
+  for Cnt := 0 to LenB - 1 do
+  begin
+    TokenIds[Pos] := IdsB[Cnt]; SegmentIds[Pos] := 1; Inc(Pos);
+  end;
+  TokenIds[Pos] := SepId; SegmentIds[Pos] := 1; Inc(Pos);
+end;
+
+function CrossEncoderScore(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query, Passage: string;
+  ApplySigmoid: boolean = True): TNeuralFloat;
+var
+  TokenIds, SegmentIds: TNeuralIntegerArray;
+  Input, Output: TNNetVolume;
+  SeqLen, PadId, Pos: integer;
+begin
+  SeqLen := Net.Layers[0].Output.SizeX;
+  if Net.Layers[0].Output.Depth <> 2 then
+    ImportError('CrossEncoderScore: net input is not (SeqLen,1,2) - not a ' +
+      'BuildBertForSequenceClassification reranker?');
+  BertTokenizePair(Tokenizer, Query, Passage, TokenIds, SegmentIds, SeqLen);
+  PadId := Tokenizer.TokenToId('[PAD]');
+  if PadId < 0 then PadId := 0; // BERT-family [PAD] is id 0 anyway
+  Input := TNNetVolume.Create();
+  Output := TNNetVolume.Create();
+  try
+    Input.ReSize(SeqLen, 1, 2);
+    Input.Fill(0); // pad rows: token=PadId below, segment 0
+    for Pos := 0 to SeqLen - 1 do
+      if Pos < Length(TokenIds) then
+      begin
+        Input.FData[Pos * 2]     := TokenIds[Pos];
+        Input.FData[Pos * 2 + 1] := SegmentIds[Pos];
+      end
+      else
+        Input.FData[Pos * 2] := PadId;
+    Net.Compute(Input);
+    Net.GetOutput(Output);
+    // num_labels=1: the [CLS] (row 0) relevance logit.
+    Result := Output.FData[0];
+    if ApplySigmoid then Result := Sigmoid(Result);
+  finally
+    Output.Free;
+    Input.Free;
+  end;
+end;
+
+procedure RerankPassages(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query: string; const Passages: array of string;
+  out Order: TNeuralIntegerArray; out Scores: TNeuralFloatDynArr);
+var
+  NP, Pj, i, j, Tmp: integer;
+  RawScores: TNeuralFloatDynArr;
+begin
+  NP := Length(Passages);
+  if NP < 1 then
+    ImportError('RerankPassages: need at least one candidate passage.');
+  SetLength(RawScores, NP);
+  SetLength(Order, NP);
+  for Pj := 0 to NP - 1 do
+  begin
+    RawScores[Pj] := CrossEncoderScore(Net, Tokenizer, Query, Passages[Pj],
+      {ApplySigmoid=}True);
+    Order[Pj] := Pj;
+  end;
+  // descending stable insertion sort by score (ties keep original order).
+  for i := 1 to NP - 1 do
+  begin
+    Tmp := Order[i];
+    j := i - 1;
+    while (j >= 0) and (RawScores[Order[j]] < RawScores[Tmp]) do
+    begin
+      Order[j + 1] := Order[j];
+      Dec(j);
+    end;
+    Order[j + 1] := Tmp;
+  end;
+  SetLength(Scores, NP);
+  for i := 0 to NP - 1 do Scores[i] := RawScores[Order[i]];
+end;
+
+function RerankReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query: string; const Passages: array of string;
+  const Relevant: TNeuralIntegerArray;
+  const KList: array of integer): string;
+var
+  NP, NumRel, RelIdx, Pj, Ki, RankPos: integer;
+  IsRel: array of boolean;
+  Order: TNeuralIntegerArray;
+  Scores: TNeuralFloatDynArr;
+
+  function ReciprocalRank(const Ord: array of integer): TNeuralFloat;
+  var r: integer;
+  begin
+    Result := 0;
+    for r := 0 to High(Ord) do
+      if IsRel[Ord[r]] then begin Result := 1 / (r + 1); Exit; end;
+  end;
+
+  function NDCGAtK(const Ord: array of integer; K: integer): TNeuralFloat;
+  var r: integer; DCG, IDCG: TNeuralFloat;
+  begin
+    DCG := 0;
+    for r := 0 to K - 1 do
+      if (r < Length(Ord)) and IsRel[Ord[r]] then
+        DCG := DCG + 1 / (Ln(r + 2) / Ln(2)); // log2(rank+1), rank 1-based
+    IDCG := 0;
+    for r := 0 to K - 1 do
+      if r < NumRel then IDCG := IDCG + 1 / (Ln(r + 2) / Ln(2));
+    if IDCG > 0 then Result := DCG / IDCG else Result := 0;
+  end;
+
+var
+  BeforeOrder: TNeuralIntegerArray;
+  r: integer;
+begin
+  NP := Length(Passages);
+  if NP < 1 then ImportError('RerankReport: need >=1 passage.');
+  if Length(KList) < 1 then
+    ImportError('RerankReport: KList must list at least one k.');
+  SetLength(IsRel, NP);
+  for Pj := 0 to NP - 1 do IsRel[Pj] := False;
+  NumRel := Length(Relevant);
+  for RelIdx := 0 to NumRel - 1 do
+  begin
+    Pj := Relevant[RelIdx];
+    if (Pj < 0) or (Pj >= NP) then
+      ImportError('RerankReport: relevant index ' + IntToStr(Pj) +
+        ' out of range 0..' + IntToStr(NP - 1) + '.');
+    IsRel[Pj] := True;
+  end;
+  // BEFORE = the initial (retrieval) order: identity.
+  SetLength(BeforeOrder, NP);
+  for r := 0 to NP - 1 do BeforeOrder[r] := r;
+  // AFTER = cross-encoder rerank.
+  RerankPassages(Net, Tokenizer, Query, Passages, Order, Scores);
+  Result :=
+    '=== Rerank Report ===' + sLineBreak +
+    'candidates: ' + IntToStr(NP) + sLineBreak +
+    'relevant:   ' + IntToStr(NumRel) + sLineBreak +
+    'MRR    before -> after: ' +
+      FloatToStrF(ReciprocalRank(BeforeOrder), ffFixed, 8, 4) + ' -> ' +
+      FloatToStrF(ReciprocalRank(Order), ffFixed, 8, 4) + sLineBreak;
+  for Ki := 0 to High(KList) do
+    Result := Result + 'nDCG@' + IntToStr(KList[Ki]) +
+      ' before -> after: ' +
+      FloatToStrF(NDCGAtK(BeforeOrder, KList[Ki]), ffFixed, 8, 4) + ' -> ' +
+      FloatToStrF(NDCGAtK(Order, KList[Ki]), ffFixed, 8, 4) + sLineBreak;
+  // top-ranked-after listing for eyeballing.
+  Result := Result + 'top-after: ';
+  for RankPos := 0 to NP - 1 do
+  begin
+    if RankPos >= 3 then Break;
+    Result := Result + '#' + IntToStr(Order[RankPos]) + '(' +
+      FloatToStrF(Scores[RankPos], ffFixed, 8, 3) + ')';
+    if (RankPos < 2) and (RankPos < NP - 1) then Result := Result + ' ';
+  end;
+  Result := Result + sLineBreak;
 end;
 
 function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(

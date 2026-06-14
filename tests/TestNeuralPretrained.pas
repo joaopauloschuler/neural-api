@@ -257,6 +257,9 @@ type
     procedure TestSTSReport;
     procedure TestRetrievalReport;
     procedure TestE5EmbeddingParity;
+    procedure TestBertTokenizePairSegmentIds;
+    procedure TestRerankerPairLogitParity;
+    procedure TestRerankReportLift;
     procedure TestColBERTParity;
     procedure TestColBERTMaxSimScore;
     procedure TestColBERTRetrievalReport;
@@ -8941,6 +8944,179 @@ begin
   finally
     for i := 0 to 0 do Q[i].Free;
     for i := 0 to 3 do P[i].Free;
+  end;
+end;
+
+// BertTokenizePair lays out [CLS] A [SEP] B [SEP] with token_type 0 over
+// "[CLS] A [SEP]" and 1 over "B [SEP]" - the HF sentence-pair convention the
+// cross-encoder reranker depends on. Verifies the [CLS]/[SEP] placement and
+// the segment-id boundary.
+procedure TTestNeuralPretrained.TestBertTokenizePairSegmentIds;
+var
+  Tok: TNeuralHFTokenizer;
+  TokenIds, SegmentIds: TNeuralIntegerArray;
+  ClsId, SepId, i, NumSep, FirstOne: integer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    ClsId := Tok.TokenToId('[CLS]');
+    SepId := Tok.TokenToId('[SEP]');
+    BertTokenizePair(Tok, 'the quick brown fox', 'jumped over', TokenIds,
+      SegmentIds, {MaxTokens=}0);
+    AssertEquals('token/segment arrays parallel', Length(TokenIds),
+      Length(SegmentIds));
+    AssertEquals('row 0 is [CLS]', ClsId, TokenIds[0]);
+    AssertEquals('[CLS] is segment 0', 0, SegmentIds[0]);
+    AssertEquals('last row is [SEP]', SepId, TokenIds[High(TokenIds)]);
+    AssertEquals('final [SEP] is segment 1', 1, SegmentIds[High(SegmentIds)]);
+    // exactly two [SEP]s; the FIRST is segment 0, everything after it is 1.
+    NumSep := 0; FirstOne := -1;
+    for i := 0 to High(TokenIds) do
+    begin
+      if TokenIds[i] = SepId then Inc(NumSep);
+      if (FirstOne < 0) and (SegmentIds[i] = 1) then FirstOne := i;
+    end;
+    AssertEquals('two [SEP] separators', 2, NumSep);
+    // the first segment-1 row must be the token AFTER the first [SEP].
+    AssertTrue('segment flips to 1 after the first [SEP]',
+      (FirstOne > 1) and (TokenIds[FirstOne - 1] = SepId));
+    // monotone: once segment 1 starts it never reverts to 0.
+    for i := FirstOne to High(SegmentIds) do
+      AssertEquals('segment monotone after boundary', 1, SegmentIds[i]);
+  finally
+    Tok.Free;
+  end;
+end;
+
+// Cross-encoder reranker PAIR parity: the genuinely new path is the
+// per-position SEGMENT id 1 (the document segment) feeding the BERT
+// token_type_embeddings table. The fixture pins a (query, doc) PAIR already
+// laid out [CLS] q [SEP] d [SEP] with token_type 1 on the doc segment; the
+// Pascal num_labels=1 reranker's [CLS] (row 0) logit must match HF's float64
+// AutoModelForSequenceClassification logit < 1e-4. The fixture also pins the
+// all-segment-0 logit, asserted DIFFERENT here so the segment-1 path is
+// proven live (not a vacuous test). 1e-4 gate; never loosen past 1e-3.
+procedure TTestNeuralPretrained.TestRerankerPairLogitParity;
+var
+  NN: TNNet;
+  Config: TBertConfig;
+  RefRoot: TJSONData;
+  Obj: TJSONObject;
+  IdsArr, TypesArr: TJSONArray;
+  RefJson: TStringList;
+  Input, Output: TNNetVolume;
+  SeqLen, PosCnt: integer;
+  RefLogit, RefSeg0, RefProb, GotLogit, GotProb, Diff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := BuildBertForSequenceClassificationFromSafeTensorsEx(
+    FixturePath('tiny_bert_reranker.safetensors'), Config, nil,
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_bert_reranker_config.json'));
+  try
+    AssertEquals('num_labels=1 reranker output depth', 1,
+      NN.GetLastLayer().Output.Depth);
+    RefJson.LoadFromFile(FixturePath('tiny_bert_reranker_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Obj := TJSONObject(RefRoot);
+    IdsArr := TJSONArray(Obj.Find('input_ids'));
+    TypesArr := TJSONArray(Obj.Find('token_type_ids'));
+    RefLogit := Obj.Get('logit', 0.0);
+    RefSeg0 := Obj.Get('logit_all_seg0', 0.0);
+    RefProb := Obj.Get('prob', 0.0);
+    SeqLen := NN.Layers[0].Output.SizeX;
+    AssertEquals('fixture length matches net SeqLen', SeqLen, IdsArr.Count);
+    Input.ReSize(SeqLen, 1, 2);
+    for PosCnt := 0 to SeqLen - 1 do
+    begin
+      Input.FData[PosCnt * 2]     := IdsArr.Items[PosCnt].AsInteger;
+      Input.FData[PosCnt * 2 + 1] := TypesArr.Items[PosCnt].AsInteger;
+    end;
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+    GotLogit := Output.FData[0]; // [CLS] (row 0) relevance logit
+    Diff := Abs(GotLogit - RefLogit);
+    AssertTrue('reranker PAIR [CLS] logit parity: max |diff| = ' +
+      FloatToStr(Diff) + ' must be < 1e-4', Diff < 1e-4);
+    // sigmoid relevance matches HF too.
+    GotProb := 1.0 / (1.0 + Exp(-GotLogit));
+    AssertTrue('reranker sigmoid relevance parity',
+      Abs(GotProb - RefProb) < 1e-4);
+    // segment-1 path is live: the all-seg0 logit is genuinely different.
+    AssertTrue('segment-1 token_type path materially changes the logit',
+      Abs(RefLogit - RefSeg0) > 1e-3);
+  finally
+    if RefRoot <> nil then RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// RerankReport precision lift: a hand-wired num_labels=1 reranker whose
+// relevance logit is the mean-pooled embedding of the joint (query, doc)
+// sequence. Only the GOLD candidate contains the marker word ('fox'), which
+// carries a large embedding, so the cross-encoder scores it highest. The
+// gold candidate is placed LAST in the initial (retrieval) order; after
+// reranking it must come first, so MRR/nDCG@1 jump from low to 1.0000.
+// CrossEncoderScore reads ROW 0 of the net output, so the net must collapse
+// the sequence to a single row: TNNetAvgChannel -> (1,1,4) handles that.
+procedure TTestNeuralPretrained.TestRerankReportLift;
+var
+  Tok: TNeuralHFTokenizer;
+  NN: TNNet;
+  Emb, Cls: TNNetLayer;
+  V, i, GoldFirstId: integer;
+  Passages: array[0..2] of string;
+  Relevant: TNeuralIntegerArray;
+  KList: array[0..0] of integer;
+  Rep: string;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  NN := TNNet.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    V := 255;
+    NN.AddLayer(TNNetInput.Create(16, 1, 2));
+    NN.AddLayer(TNNetSplitChannels.Create([0]));
+    Emb := NN.AddLayer(TNNetEmbedding.Create(V, 4, {EncodeZero=}1));
+    NN.AddLayer(TNNetAvgChannel.Create()); // (16,1,4) -> (1,1,4): mean over seq
+    Cls := NN.AddLayer(TNNetPointwiseConvLinear.Create(1)); // -> (1,1,1)
+    // logit = sum over the 4 mean-pooled channels (all weights 1, no bias).
+    for i := 0 to 3 do Cls.Neurons[0].Weights.FData[i] := 1.0;
+    Cls.Neurons[0].BiasWeight := 0;
+    Cls.FlushWeightCache();
+    // Embedding: every token contributes 0 except the gold marker word, which
+    // contributes a large positive value in all 4 channels.
+    for i := 0 to V * 4 - 1 do Emb.Neurons[0].Weights.FData[i] := 0.0;
+    GoldFirstId := Tok.TokenToId('fox');
+    AssertTrue('gold marker in vocab', GoldFirstId >= 0);
+    for i := 0 to 3 do Emb.Neurons[0].Weights.FData[GoldFirstId * 4 + i] := 9.0;
+    Emb.FlushWeightCache();
+
+    // Candidate docs: only the GOLD one contains 'fox', so its joint
+    // (query, doc) mean-pooled logit is the highest.
+    Passages[0] := 'the quick brown dog';
+    Passages[1] := 'lazy river runs slow';
+    Passages[2] := 'a clever fox appears';   // gold, contains the marker
+    SetLength(Relevant, 1); Relevant[0] := 2; // gold sits LAST initially
+    KList[0] := 1;
+    Rep := RerankReport(NN, Tok, 'what jumped', Passages, Relevant, KList);
+    AssertTrue('report header', Pos('Rerank Report', Rep) > 0);
+    // BEFORE: gold at rank 3 -> MRR 1/3 = 0.3333; AFTER: gold first -> 1.0000.
+    AssertTrue('MRR lift to 1 after rerank',
+      Pos('MRR    before -> after: 0.3333 -> 1.0000', Rep) > 0);
+    AssertTrue('nDCG@1 lift to 1 after rerank',
+      Pos('nDCG@1 before -> after: 0.0000 -> 1.0000', Rep) > 0);
+  finally
+    NN.Free;
+    Tok.Free;
   end;
 end;
 

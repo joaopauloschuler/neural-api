@@ -635,7 +635,30 @@ rather than acted on.
       caching loop lives in the example); (c) pQuantizeInt8 for the ColBERT path
       — the projection head is always f32 while the BERT backbone already
       supports int8.
-- [ ] Cross-encoder RERANKER import + rerank scorer — the missing rung of the
+- [X] Cross-encoder RERANKER import + rerank scorer — LANDED a3. The
+      num_labels=1 BERT reranker reuses BuildBertForSequenceClassificationFrom-
+      SafeTensors; the genuinely new pieces all landed in neuralpretrained.pas
+      CROSS-ENCODER RERANKER section: (a) BertTokenizePair lays out
+      [CLS] q [SEP] d [SEP] + parallel segment ids (0 over query, 1 over doc,
+      HF longest_first truncation) - the importer's token_type channel-1 path
+      was ALREADY wired into token_type_embeddings, so no importer change was
+      needed, only verified/exercised; (b) CrossEncoderScore (one joint forward,
+      [CLS] logit, sigmoid) + RerankPassages (batch scorer, sorted, int8 via the
+      backbone pQuantizeInt8); (c) RerankReport (MRR/nDCG@k before-vs-after,
+      introspection-report style, sibling of RetrievalReport). Parity: pico
+      fixture tools/bert_reranker_tiny_fixture.py pins the PAIR/segment-1 [CLS]
+      logit to HF float64 AutoModelForSequenceClassification <1e-4
+      (TestRerankerPairLogitParity; the fixture boosts token_type embeddings so
+      the segment-1 path measurably moves the logit + asserts seg0!=seg-mixed so
+      the test is not vacuous), plus TestBertTokenizePairSegmentIds and
+      TestRerankReportLift. Demo examples/Rerank (bi-encoder shortlist ->
+      cross-encoder reorder, -demo runs offline on the pico fixture); documented
+      in examples/README.md. Possible follow-up: attention-padding-mask so a
+      short passage doesn't attend to [PAD] rows (the SemanticSearch/ColBERT
+      approximation), which would let RerankPassages batch mixed-length docs in
+      one net instead of one forward each.
+  Original task description:
+  Cross-encoder RERANKER import + rerank scorer — the missing rung of the
       RAG retrieval stack. The repo already ships the two BI-encoder paths
       (separate query/doc towers: examples/SemanticSearch + the embedding-eval
       RetrievalReport) and the late-interaction path (ColBERT MaxSim), but NOT
