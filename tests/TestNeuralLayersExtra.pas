@@ -99,6 +99,7 @@ type
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
     procedure TestMagnitudePruningReportSmoke;
+    procedure TestPersistentPruneMask;
     procedure TestMCDropoutUncertaintyReportSmoke;
     procedure TestEquivarianceReportSmoke;
     procedure TestTTAReportSmoke;
@@ -2443,6 +2444,124 @@ begin
     Before.Free;
     Labels.Free;
     Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestPersistentPruneMask;
+var
+  NN: TNNet;
+  X, Y: TNNetVolume;
+  PrunedW: array of TNeuralFloat;
+  PrunedLayer, PrunedNeuron, PrunedIdx: array of integer;
+  KeptLayer, KeptNeuron, KeptIdx: integer;
+  KeptBefore: TNeuralFloat;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  L, NIdx, WIdx, I, Step, PrunedCount, NonZero: integer;
+  PrunedTarget: integer;
+begin
+  NN := TNNet.Create();
+  X := TNNetVolume.Create(6, 1, 1);
+  Y := TNNetVolume.Create(3, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.InitWeights();
+    NN.SetLearningRate(0.1, 0.0);
+
+    // Train a few steps so weights have a magnitude spread.
+    for Step := 0 to 39 do
+    begin
+      X.Fill(0); Y.Fill(0);
+      for I := 0 to X.Size - 1 do X.Raw[I] := Random - 0.5;
+      Y.Raw[Random(3)] := 1.0;
+      NN.Compute(X);
+      NN.Backpropagate(Y);
+    end;
+
+    // Prune to 50% sparsity (global magnitude) with a persistent mask.
+    PrunedCount := NN.PruneWeightsByMagnitude(0.5, False);
+    AssertTrue('something was pruned', PrunedCount > 0);
+    AssertTrue('mask present', NN.HasPruneMasks());
+    AssertEquals('CountPrunedWeights matches return value',
+      PrunedCount, NN.CountPrunedWeights());
+    AssertTrue('sparsity ~ 0.5',
+      (NN.GetPruneSparsity() >= 0.45) and (NN.GetPruneSparsity() <= 0.60));
+
+    // Record the exact set of pruned weights (must be zero now) and one kept,
+    // non-zero weight (must change during fine-tuning).
+    SetLength(PrunedW, 0);
+    SetLength(PrunedLayer, 0);
+    SetLength(PrunedNeuron, 0);
+    SetLength(PrunedIdx, 0);
+    KeptLayer := -1; KeptNeuron := -1; KeptIdx := -1; KeptBefore := 0;
+    for L := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[L];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      for NIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NIdx];
+        for WIdx := 0 to Neuron.Weights.Size - 1 do
+        begin
+          if Neuron.Weights.FData[WIdx] = 0 then
+          begin
+            SetLength(PrunedLayer, Length(PrunedLayer) + 1);
+            SetLength(PrunedNeuron, Length(PrunedNeuron) + 1);
+            SetLength(PrunedIdx, Length(PrunedIdx) + 1);
+            PrunedLayer[High(PrunedLayer)] := L;
+            PrunedNeuron[High(PrunedNeuron)] := NIdx;
+            PrunedIdx[High(PrunedIdx)] := WIdx;
+          end
+          else if KeptLayer < 0 then
+          begin
+            KeptLayer := L; KeptNeuron := NIdx; KeptIdx := WIdx;
+            KeptBefore := Neuron.Weights.FData[WIdx];
+          end;
+        end;
+      end;
+    end;
+    PrunedTarget := Length(PrunedLayer);
+    AssertTrue('pruned-weight set non-empty', PrunedTarget > 0);
+    AssertTrue('a kept non-zero weight exists', KeptLayer >= 0);
+
+    // Fine-tune several steps; the mask must survive.
+    for Step := 0 to 59 do
+    begin
+      X.Fill(0); Y.Fill(0);
+      for I := 0 to X.Size - 1 do X.Raw[I] := Random - 0.5;
+      Y.Raw[Random(3)] := 1.0;
+      NN.Compute(X);
+      NN.Backpropagate(Y);
+    end;
+
+    // All originally-pruned weights are STILL exactly zero.
+    NonZero := 0;
+    for I := 0 to PrunedTarget - 1 do
+    begin
+      Neuron := NN.Layers[PrunedLayer[I]].Neurons[PrunedNeuron[I]];
+      if Neuron.Weights.FData[PrunedIdx[I]] <> 0 then Inc(NonZero);
+    end;
+    AssertEquals('pruned weights stay exactly zero after fine-tuning', 0, NonZero);
+    AssertEquals('count of pruned weights unchanged',
+      PrunedTarget, NN.CountPrunedWeights());
+
+    // The kept weight DID change (training actually progressed).
+    Neuron := NN.Layers[KeptLayer].Neurons[KeptNeuron];
+    AssertTrue('kept (unpruned) weight changed during fine-tuning',
+      Abs(Neuron.Weights.FData[KeptIdx] - KeptBefore) > 1e-7);
+
+    // Clearing the mask removes enforcement.
+    NN.ClearPruneMasks();
+    AssertTrue('mask cleared', not NN.HasPruneMasks());
+    AssertEquals('no pruned weights after clear', 0, NN.CountPrunedWeights());
+  finally
+    Y.Free;
+    X.Free;
     NN.Free;
   end;
 end;

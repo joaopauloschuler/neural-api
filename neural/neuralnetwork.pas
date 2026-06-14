@@ -258,6 +258,11 @@ type
       FCanNormalizeDelta: boolean;
       FCanSetNumWeightsForAllNeurons: boolean;
       FNN: TNNet;
+      // Persistent magnitude-pruning mask: one volume per neuron (parallel to
+      // FNeurons), each element 1.0 = keep, 0.0 = pruned. nil = no mask on this
+      // layer. Built by BuildPruneMaskFromMagnitude and re-enforced after every
+      // weight update via ApplyPruneMask. (Coded by Claude (AI).)
+      FPruneMask: TNNetVolumeList;
 
       procedure InitStruct();
     private
@@ -275,6 +280,9 @@ type
       procedure ApplyActivationFunctionToOutput(); virtual;
       procedure BuildArrNeurons();
       procedure AfterWeightUpdate(); virtual;
+      // Zeroes weights (and their gradient/inertia) flagged by FPruneMask,
+      // WITHOUT calling AfterWeightUpdate (so it can be called FROM it).
+      procedure ZeroPrunedWeights(); // Coded by Claude (AI).
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -349,6 +357,25 @@ type
       // the pretrained-checkpoint importer in neuralpretrained.pas.
       // (Coded by Claude (AI).)
       procedure FlushWeightCache();
+      // --- Persistent magnitude pruning (torch.nn.utils.prune style). ----------
+      // Builds a binary keep/prune mask for this layer's neuron weights: the
+      // smallest-magnitude weights are flagged for pruning. Threshold is
+      // |w| <= aThreshold -> pruned (set 0). The mask is STORED so that
+      // ApplyPruneMask can re-enforce it after every training step. Returns the
+      // number of weights pruned. Biases are never pruned. (Coded by Claude (AI).)
+      function BuildPruneMaskFromThreshold(aThreshold: TNeuralFloat): integer;
+      // Re-applies the stored prune mask: zeroes every pruned weight, and (so
+      // momentum/inertia can't slowly regrow them) zeroes the matching delta /
+      // inertia entries. No-op when no mask is set. (Coded by Claude (AI).)
+      procedure ApplyPruneMask();
+      // True when a persistent prune mask is set on this layer.
+      function HasPruneMask(): boolean;
+      // Frees the stored prune mask (weights keep their current, possibly-zero,
+      // values but are no longer held at zero). (Coded by Claude (AI).)
+      procedure ClearPruneMask();
+      // Counts weights flagged as pruned (mask = 0) in the stored mask; 0 when
+      // no mask. (Coded by Claude (AI).)
+      function CountPrunedWeights(): integer;
       procedure ClearTimes(); {$IFDEF Release} inline; {$ENDIF}
       procedure AddTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
       procedure CopyTimes(Origin: TNNetLayer); {$IFDEF Release} inline; {$ENDIF}
@@ -14331,6 +14358,30 @@ type
         PerLayer: boolean = False;
         MaxSamples: integer = 256
       ): string;
+      // --- Persistent magnitude pruning (torch.nn.utils.prune port). -----------
+      // Builds and APPLIES persistent prune masks so the smallest-magnitude
+      // weights are zeroed AND HELD at zero through subsequent training (unlike
+      // MagnitudePruningReport, which restores the weights). Sparsity in [0,1)
+      // is the fraction of weights to prune. When PerLayer = False (default) the
+      // threshold is a GLOBAL magnitude percentile pooled over the whole network;
+      // when True each trainable layer is pruned to Sparsity independently.
+      // Biases are never pruned. Re-enforced automatically after each weight
+      // update (see ApplyPruneMasks, called from UpdateWeights/UpdateWeightsAdam).
+      // Returns the number of weights pruned. (Coded by Claude (AI).)
+      function PruneWeightsByMagnitude(Sparsity: TNeuralFloat;
+        PerLayer: boolean = False): integer;
+      // Re-applies every layer's persistent prune mask (zeroes pruned weights and
+      // their gradients/inertia). Called for you after each weight update; you
+      // only need it if you mutate weights by hand. (Coded by Claude (AI).)
+      procedure ApplyPruneMasks();
+      // True when any layer carries a persistent prune mask.
+      function HasPruneMasks(): boolean;
+      // Frees all persistent prune masks (weights keep current values).
+      procedure ClearPruneMasks();
+      // Total number of weights held at zero by persistent masks, and that count
+      // as a fraction of all trainable weights. (Coded by Claude (AI).)
+      function CountPrunedWeights(): integer;
+      function GetPruneSparsity(): TNeuralFloat;
       // Monte-Carlo-Dropout *epistemic* uncertainty diagnostic (Gal &
       // Ghahramani 2016). Unlike the rest of the report family this one
       // deliberately KEEPS the stochastic (dropout / noise) layers ACTIVE at
@@ -80821,6 +80872,170 @@ begin
   end;
 end;
 
+function TNNet.PruneWeightsByMagnitude(Sparsity: TNeuralFloat;
+  PerLayer: boolean = False): integer;
+var
+  LayerCnt, NeuronCnt, WeightCnt, K, CutIdx, TotalWeights: integer;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  AllAbs: array of TNeuralFloat;
+  Threshold: TNeuralFloat;
+
+  procedure SortAsc(var Arr: array of TNeuralFloat; N: integer);
+  var A, B: integer; SwapF: TNeuralFloat;
+  begin
+    for A := 0 to N - 2 do
+      for B := 0 to N - 2 - A do
+        if Arr[B] > Arr[B + 1] then
+        begin
+          SwapF := Arr[B]; Arr[B] := Arr[B + 1]; Arr[B + 1] := SwapF;
+        end;
+  end;
+
+begin
+  Result := 0;
+  if Sparsity <= 0 then
+  begin
+    ClearPruneMasks();
+    Exit;
+  end;
+  if Sparsity >= 1 then Sparsity := 0.999999;
+
+  if not PerLayer then
+  begin
+    // GLOBAL: pool |w| over the whole net, threshold at the Sparsity percentile.
+    TotalWeights := 0;
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Layer := FLayers[LayerCnt];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+        TotalWeights := TotalWeights + Layer.Neurons[NeuronCnt].Weights.Size;
+    end;
+    if TotalWeights = 0 then Exit;
+    SetLength(AllAbs, TotalWeights);
+    K := 0;
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Layer := FLayers[LayerCnt];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronCnt];
+        for WeightCnt := 0 to Neuron.Weights.Size - 1 do
+        begin
+          AllAbs[K] := Abs(Neuron.Weights.FData[WeightCnt]);
+          Inc(K);
+        end;
+      end;
+    end;
+    SortAsc(AllAbs, TotalWeights);
+    CutIdx := Trunc(Sparsity * TotalWeights);
+    if CutIdx < 1 then CutIdx := 1;
+    if CutIdx > TotalWeights then CutIdx := TotalWeights;
+    // Threshold = magnitude of the largest weight we still prune.
+    Threshold := AllAbs[CutIdx - 1];
+    for LayerCnt := 0 to GetLastLayerIdx() do
+      Result := Result +
+        FLayers[LayerCnt].BuildPruneMaskFromThreshold(Threshold);
+  end
+  else
+  begin
+    // PER-LAYER: each trainable layer pruned to Sparsity independently.
+    for LayerCnt := 0 to GetLastLayerIdx() do
+    begin
+      Layer := FLayers[LayerCnt];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      TotalWeights := 0;
+      for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+        TotalWeights := TotalWeights + Layer.Neurons[NeuronCnt].Weights.Size;
+      if TotalWeights = 0 then Continue;
+      SetLength(AllAbs, TotalWeights);
+      K := 0;
+      for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NeuronCnt];
+        for WeightCnt := 0 to Neuron.Weights.Size - 1 do
+        begin
+          AllAbs[K] := Abs(Neuron.Weights.FData[WeightCnt]);
+          Inc(K);
+        end;
+      end;
+      SortAsc(AllAbs, TotalWeights);
+      CutIdx := Trunc(Sparsity * TotalWeights);
+      if CutIdx < 1 then CutIdx := 1;
+      if CutIdx > TotalWeights then CutIdx := TotalWeights;
+      Threshold := AllAbs[CutIdx - 1];
+      Result := Result + Layer.BuildPruneMaskFromThreshold(Threshold);
+    end;
+  end;
+end;
+
+procedure TNNet.ApplyPruneMasks();
+var
+  LayerCnt: integer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+    if FLayers[LayerCnt].HasPruneMask() then
+      FLayers[LayerCnt].ApplyPruneMask();
+end;
+
+function TNNet.HasPruneMasks(): boolean;
+var
+  LayerCnt: integer;
+begin
+  Result := False;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+    if FLayers[LayerCnt].HasPruneMask() then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+procedure TNNet.ClearPruneMasks();
+var
+  LayerCnt: integer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+    FLayers[LayerCnt].ClearPruneMask();
+end;
+
+function TNNet.CountPrunedWeights(): integer;
+var
+  LayerCnt: integer;
+begin
+  Result := 0;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+    Result := Result + FLayers[LayerCnt].CountPrunedWeights();
+end;
+
+function TNNet.GetPruneSparsity(): TNeuralFloat;
+var
+  LayerCnt, NeuronCnt, TotalWeights: integer;
+  Layer: TNNetLayer;
+begin
+  Result := 0;
+  TotalWeights := 0;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    Layer := FLayers[LayerCnt];
+    if Layer.Neurons.Count = 0 then Continue;
+    if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+      then Continue;
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      TotalWeights := TotalWeights + Layer.Neurons[NeuronCnt].Weights.Size;
+  end;
+  if TotalWeights > 0 then
+    Result := CountPrunedWeights() / TotalWeights;
+end;
+
 class function TNNet.MagnitudePruningReport(
   NN: TNNet;
   Samples: TNNetVolumeList;
@@ -90078,6 +90293,7 @@ constructor TNNetLayer.Create();
 begin
   inherited Create();
   InitStruct();
+  FPruneMask := nil;
   FOutput := TNNetVolume.Create(1,1,1);
   FOutputRaw := TNNetGroupedVolume.Create(1,1,1);
   FOutputError := TNNetVolume.Create(1,1,1);
@@ -90121,6 +90337,7 @@ begin
   FOutputRaw.Free;
   FOutput.Free;
   FNeurons.Free;
+  if Assigned(FPruneMask) then FPruneMask.Free;
   inherited Destroy();
 end;
 
@@ -91516,7 +91733,120 @@ end;
 
 procedure TNNetLayer.AfterWeightUpdate();
 begin
-  // to be implemented in descending classes.
+  // Persistent magnitude pruning: zero the pruned weights on EVERY weight
+  // update. Subclasses that override AfterWeightUpdate (e.g. the concatenated-
+  // weight full-connect/conv cache rebuild) call inherited AfterWeightUpdate
+  // FIRST, so the weights are re-zeroed before any cache is rebuilt from them.
+  // This is the single hook that covers both the batch path (TNNet.UpdateWeights)
+  // and the inline online path (TNNetFullConnect.BackpropagateCPU). Re-zeroing
+  // is idempotent and does NOT recurse (it never calls AfterWeightUpdate).
+  // (Coded by Claude (AI).)
+  if Assigned(FPruneMask) then ZeroPrunedWeights();
+end;
+
+function TNNetLayer.BuildPruneMaskFromThreshold(aThreshold: TNeuralFloat): integer;
+var
+  NeuronCnt, WeightCnt, WSize: integer;
+  Neuron: TNNetNeuron;
+  Mask: TNNetVolume;
+begin
+  Result := 0;
+  if FNeurons.Count = 0 then Exit;
+  if (FNeurons[0].Weights = nil) or (FNeurons[0].Weights.Size = 0) then Exit;
+  if not Assigned(FPruneMask) then
+    FPruneMask := TNNetVolumeList.Create();
+  // (re)size the mask list to one volume per neuron.
+  while FPruneMask.Count < FNeurons.Count do
+    FPruneMask.Add(TNNetVolume.Create(1, 1, 1));
+  while FPruneMask.Count > FNeurons.Count do
+    FPruneMask.Delete(FPruneMask.Count - 1);
+  for NeuronCnt := 0 to FNeurons.Count - 1 do
+  begin
+    Neuron := FNeurons[NeuronCnt];
+    Mask := FPruneMask[NeuronCnt];
+    WSize := Neuron.Weights.Size;
+    Mask.ReSize(Neuron.Weights);
+    for WeightCnt := 0 to WSize - 1 do
+    begin
+      if Abs(Neuron.Weights.FData[WeightCnt]) <= aThreshold then
+      begin
+        Mask.FData[WeightCnt] := 0;
+        Inc(Result);
+      end
+      else
+        Mask.FData[WeightCnt] := 1;
+    end;
+  end;
+  ApplyPruneMask();
+end;
+
+procedure TNNetLayer.ZeroPrunedWeights();
+var
+  NeuronCnt, WeightCnt, WSize: integer;
+  Neuron: TNNetNeuron;
+  Mask: TNNetVolume;
+begin
+  if not Assigned(FPruneMask) then Exit;
+  for NeuronCnt := 0 to FNeurons.Count - 1 do
+  begin
+    if NeuronCnt >= FPruneMask.Count then Break;
+    Neuron := FNeurons[NeuronCnt];
+    Mask := FPruneMask[NeuronCnt];
+    WSize := Neuron.Weights.Size;
+    if Mask.Size <> WSize then Continue;
+    for WeightCnt := 0 to WSize - 1 do
+    begin
+      if Mask.FData[WeightCnt] = 0 then
+      begin
+        Neuron.Weights.FData[WeightCnt] := 0;
+        // Hold the gradient / momentum at zero too so inertia and Adam moment
+        // estimates cannot slowly regrow a pruned weight.
+        if Neuron.FDelta.Size = WSize then Neuron.FDelta.FData[WeightCnt] := 0;
+        if Neuron.FBackInertia.Size = WSize then
+          Neuron.FBackInertia.FData[WeightCnt] := 0;
+        if Neuron.FBackInertia2.Size = WSize then
+          Neuron.FBackInertia2.FData[WeightCnt] := 0;
+      end;
+    end;
+  end;
+end;
+
+procedure TNNetLayer.ApplyPruneMask();
+begin
+  if not Assigned(FPruneMask) then Exit;
+  ZeroPrunedWeights();
+  // Rebuild any weight caches (e.g. concatenated conv/full-connect copies) so
+  // the forward pass reads the zeroed weights.
+  AfterWeightUpdate();
+end;
+
+function TNNetLayer.HasPruneMask(): boolean;
+begin
+  Result := Assigned(FPruneMask) and (FPruneMask.Count > 0);
+end;
+
+procedure TNNetLayer.ClearPruneMask();
+begin
+  if Assigned(FPruneMask) then
+  begin
+    FPruneMask.Free;
+    FPruneMask := nil;
+  end;
+end;
+
+function TNNetLayer.CountPrunedWeights(): integer;
+var
+  NeuronCnt, WeightCnt: integer;
+  Mask: TNNetVolume;
+begin
+  Result := 0;
+  if not Assigned(FPruneMask) then Exit;
+  for NeuronCnt := 0 to FPruneMask.Count - 1 do
+  begin
+    Mask := FPruneMask[NeuronCnt];
+    for WeightCnt := 0 to Mask.Size - 1 do
+      if Mask.FData[WeightCnt] = 0 then Inc(Result);
+  end;
 end;
 
 { TNNetNeuron }

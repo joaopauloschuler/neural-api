@@ -459,12 +459,23 @@ rather than acted on.
       alongside tokenizer_config.json~~ [DONE: LoadChatTemplateString sibling
       fallback]; continue_final_message / return_assistant_tokens_mask
       equivalents.
-- [ ] Magnitude pruning (torch.nn.utils.prune port): PERSISTENT global or
-      per-layer magnitude masks applied during training/inference — the
-      diagnostics half is landed (TNNet.MagnitudePruningReport +
-      examples/MagnitudePruning prune-and-restore sweep); still open are
-      masks that stay applied (instead of restoring weights after the
-      sweep) and a fine-tune-after-prune example showing accuracy recovery.
+- [X] Magnitude pruning (torch.nn.utils.prune port): DONE.
+      [X] diagnostics half (TNNet.MagnitudePruningReport +
+          examples/MagnitudePruning prune-and-restore sweep);
+      [X] PERSISTENT global or per-layer magnitude masks that STAY applied
+          through training/inference — TNNet.PruneWeightsByMagnitude(Sparsity,
+          PerLayer) installs a per-layer keep/prune mask (TNNetLayer.FPruneMask),
+          re-enforced via TNNetLayer.ZeroPrunedWeights() inside the base
+          AfterWeightUpdate hook (covers both the batch UpdateWeights path and
+          the inline online TNNetFullConnect.BackpropagateCPU path); pruned
+          weights AND their delta/inertia/Adam-moment entries are zeroed so they
+          never regrow. Helpers: ApplyPruneMasks/HasPruneMasks/ClearPruneMasks/
+          CountPrunedWeights/GetPruneSparsity (+ layer-level
+          BuildPruneMaskFromThreshold/ApplyPruneMask/HasPruneMask/ClearPruneMask/
+          CountPrunedWeights). Test: TestPersistentPruneMask;
+      [X] fine-tune-after-prune example showing accuracy recovery —
+          examples/MagnitudePruneFineTune (dense -> prune -> fine-tune with mask
+          enforced, before/after accuracy printed per sparsity).
 - [ ] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
       with forward/backward wall-time and parameter/activation memory per
       layer (introspection-report pattern). Directly serves the open
