@@ -490,6 +490,64 @@ rather than acted on.
       (b) the lightweight all-MLP decode head (project each of the 4 stages to a
       common dim, upsample, concat, fuse, 1x1 to num_classes). Pico parity vs HF
       float64 + an examples/SemanticSegmentation that colors a tiny CPU image.
+- [ ] ViTPose human-pose keypoint-estimation importer (BuildViTPoseFromSafeTensors,
+      e.g. usyd-community/vitpose-base-simple) — the FIRST keypoint/pose vertical, a
+      new output modality (per-joint 2-D heatmaps, not a class label, a box, or a
+      dense class map). Top-down single-person recipe: the landed ViT backbone
+      (BuildViTFromSafeTensors / BuildClipVisionTower path) over the cropped person
+      image -> a tiny deconvolution head (2 transpose-conv upsample stages, reuse
+      TNNetDeconvolution / TNNetDeMaxPool) -> one HxW heatmap per joint -> argmax
+      decode to (x, y) keypoint coordinates on the CPU. The only genuinely new code
+      is the deconv heatmap head + the spatial-argmax-to-coordinate decode (NOT a
+      new layer). Pico parity vs HF float64 on the heatmaps + an examples/PoseEstimation
+      that draws a 17-keypoint COCO skeleton on one CPU image. Reuses the ViT path and
+      the vision preprocessing helper; distinct from classification / detection /
+      segmentation outputs already tracked.
+- [ ] RAFT optical-flow importer (BuildRaftFromSafeTensors, e.g. princeton-vl/raft or
+      the torchvision raft_small weights) — the FIRST optical-flow vertical and the
+      first model with a TWO-image input producing a dense 2-channel (dx, dy) motion
+      field. Structurally distinct from every landed model: a shared feature encoder
+      over both frames -> an all-pairs 4-D CORRELATION volume (the genuinely new
+      primitive: dot-products between every pair of feature locations across a
+      multi-scale pyramid) -> an iterative ConvGRU update operator that refines the
+      flow over N steps (a convolutional recurrent cell over an (H,W,C) state —
+      reuse / add a minimal conv-gated recurrent cell, the same building block the
+      tracked Next-frame VideoPrediction ConvLSTM needs). Scope v1 to raft_small +
+      a fixed small iteration count, inference-only (no upsampling-mask training
+      path needed). Pico parity vs a torchvision float64 oracle on the predicted
+      flow + an examples/OpticalFlow that warps one tiny frame toward the next and
+      writes a color-coded flow map. Unblocks video-stabilization / frame-interp work.
+- [ ] Image inpainting example (examples/Inpainting) — the repo has unconditional
+      (VisualGAN) and, once landed, paired (tracked Pix2Pix) image translation, but
+      NO free-form mask completion (fill a hole in an image from its surroundings).
+      Train a small context-encoder / partial-convolution U-Net that takes a masked
+      image + binary mask and reconstructs the missing region, supervised by
+      reconstruction loss (L1 + the landed SSIM loss) plus an optional adversarial
+      term reusing the VisualGAN discriminator wiring. New code is the random
+      rectangular-mask generator and the masked-region-weighted loss; the network is
+      stock conv encoder-decoder + skip connections. CPU-friendly on CIFAR-10 /
+      Tiny ImageNet; writes before/after triplets. Edit examples/README.md.
+- [ ] Image colorization example (examples/Colorization) — a self-supervised
+      generative-vision gap: predict the chroma (CIELAB a*b* channels) of an image
+      from its luminance (L) channel, so any grayscale photo can be auto-colorized.
+      A conv encoder-decoder (or the landed U-Net) trained with per-pixel regression
+      on the a*b* channels (or the classic quantized-bin classification head for
+      more vivid output). New code is the RGB<->Lab conversion helper in
+      neuralvolume / neuraldatasets and the L-in / ab-out data pipeline; the network
+      reuses existing conv layers. CPU-friendly on CIFAR-10 / Tiny ImageNet; writes
+      grayscale-input vs colorized-output pairs. Edit examples/README.md.
+- [ ] VideoMAE / TimeSformer spatiotemporal-transformer importer
+      (BuildVideoMAEFromSafeTensors, e.g. MCG-NJU/videomae-base-finetuned-kinetics)
+      — the FIRST video-classification importer (a clip of T frames -> an action
+      label), the natural pay-off of the tracked TNNetConvolution3D layer. Tubelet
+      embedding (a 3-D conv that splits the clip into TxPxP space-time patches —
+      exactly the tracked Conv3D primitive) -> the stock transformer encoder stack
+      (reuses the ViT/BERT encoder path) with joint or divided space-time attention
+      (TimeSformer) -> mean-pool + classifier. The only genuinely new code is the
+      tubelet patchifier wiring + the (divided) space-time attention factorization;
+      everything else is landed. Depends on the tracked Conv3D task. Pico parity vs
+      HF float64 on the logits + an examples/VideoAction that classifies a short
+      Moving-MNIST-tubelet or a tiny clip on CPU. First image-sequence-in importer.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
