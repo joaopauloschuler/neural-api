@@ -117,6 +117,8 @@ type
     procedure TestBloomSafeTensorsRoundTrip;
     procedure TestMambaSafeTensorsRoundTrip;
     procedure TestRWKVSafeTensorsRoundTrip;
+    procedure TestT5SafeTensorsRoundTrip;
+    procedure TestMarianSafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -2012,6 +2014,133 @@ begin
     Input.Free;
     NN2.Free;
     NN.Free;
+  end;
+end;
+
+// SaveT5ToSafeTensors round-trip: import a pico T5 ENCODER+DECODER pair,
+// export both nets to one HF-name file, re-import, and assert identical
+// logits through RunT5. Runs the UNTIED gated-GELU Flan-T5 fixture (emits
+// lm_head, un-fuses wi_0|wi_1) AND the TIED ReLU v1.0 fixture (no lm_head;
+// the importer regenerates the d_model^-0.5-scaled head from shared.weight).
+// The q-projection sqrt(d_kv) fold and the shared relative-position-bias
+// table both round-trip exactly.
+procedure TTestNeuralPretrained.TestT5SafeTensorsRoundTrip;
+var
+  Enc, Dec, Enc2, Dec2: TNNet;
+  Config, Config2: TT5Config;
+  EncInput, DecInput, L1, L2: TNNetVolume;
+  TmpPath, CfgName, StName: string;
+  ci, i, s, EncSeqLen, DecSeqLen, Vocab: integer;
+  MaxDiff: double;
+const
+  Fix: array[0..1] of string = ('tiny_flan_t5', 'tiny_t5v10');
+begin
+  EncSeqLen := 10;
+  DecSeqLen := 6;
+  for ci := 0 to High(Fix) do
+  begin
+    RandSeed := 424242;
+    CfgName := FixturePath(Fix[ci] + '_config.json');
+    StName := FixturePath(Fix[ci] + '.safetensors');
+    TmpPath := GetTempDir(false) + 'cai_t5_roundtrip_' +
+      IntToStr(Random(1000000)) + '.safetensors';
+    BuildT5FromSafeTensors(StName, Enc, Dec, Config, EncSeqLen, DecSeqLen,
+      {pInferenceOnly=}false, CfgName);
+    EncInput := TNNetVolume.Create;
+    DecInput := TNNetVolume.Create;
+    L1 := TNNetVolume.Create;
+    L2 := TNNetVolume.Create;
+    Enc2 := nil; Dec2 := nil;
+    try
+      SaveT5ToSafeTensors(Enc, Dec, Config, TmpPath);
+      BuildT5FromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
+        DecSeqLen, {pInferenceOnly=}false, CfgName);
+      Vocab := Config.VocabSize;
+      EncInput.ReSize(EncSeqLen, 1, 1);
+      DecInput.ReSize(DecSeqLen, 1, 1);
+      MaxDiff := 0;
+      for s := 0 to 2 do
+      begin
+        for i := 0 to EncSeqLen - 1 do
+          EncInput.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+        for i := 0 to DecSeqLen - 1 do
+          DecInput.FData[i] := (s * 7 + i * 2 + 1) mod Vocab;
+        RunT5(Enc, Dec, EncInput, DecInput, L1);
+        RunT5(Enc2, Dec2, EncInput, DecInput, L2);
+        AssertEquals('t5 round-trip logits size', L1.Size, L2.Size);
+        for i := 0 to L1.Size - 1 do
+          if Abs(L1.FData[i] - L2.FData[i]) > MaxDiff then
+            MaxDiff := Abs(L1.FData[i] - L2.FData[i]);
+      end;
+      // F32 + invertible q-scale/gated-FFN un-fuse + straight dumps -> exact.
+      AssertTrue('T5 safetensors round-trip (' + Fix[ci] + '): max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      if FileExists(TmpPath) then DeleteFile(TmpPath);
+      L2.Free; L1.Free; DecInput.Free; EncInput.Free;
+      Dec2.Free; Enc2.Free; Dec.Free; Enc.Free;
+    end;
+  end;
+end;
+
+// SaveMarianToSafeTensors round-trip: import the pico Marian ENCODER+DECODER
+// pair, export both nets to one HF-name file, re-import, and assert identical
+// logits through RunT5. Exercises the scale_embedding sqrt(d_model) un-fold,
+// the per-block biased linears + post-norms, the tied head's
+// final_logits_bias re-derivation, and the deliberate OMISSION of the static
+// sinusoidal position tables (the re-import regenerates them).
+procedure TTestNeuralPretrained.TestMarianSafeTensorsRoundTrip;
+var
+  Enc, Dec, Enc2, Dec2: TNNet;
+  Config, Config2: TMarianConfig;
+  EncInput, DecInput, L1, L2: TNNetVolume;
+  TmpPath: string;
+  i, s, EncSeqLen, DecSeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  EncSeqLen := 10;
+  DecSeqLen := 6;
+  TmpPath := GetTempDir(false) + 'cai_marian_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  BuildMarianFromSafeTensors(FixturePath('tiny_marian.safetensors'),
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    FixturePath('tiny_marian_config.json'));
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  L1 := TNNetVolume.Create;
+  L2 := TNNetVolume.Create;
+  Enc2 := nil; Dec2 := nil;
+  try
+    SaveMarianToSafeTensors(Enc, Dec, Config, TmpPath);
+    BuildMarianFromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
+      DecSeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_marian_config.json'));
+    Vocab := Config.VocabSize;
+    EncInput.ReSize(EncSeqLen, 1, 1);
+    DecInput.ReSize(DecSeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to EncSeqLen - 1 do
+        EncInput.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      for i := 0 to DecSeqLen - 1 do
+        DecInput.FData[i] := (s * 7 + i * 2 + 1) mod Vocab;
+      RunT5(Enc, Dec, EncInput, DecInput, L1);
+      RunT5(Enc2, Dec2, EncInput, DecInput, L2);
+      AssertEquals('marian round-trip logits size', L1.Size, L2.Size);
+      for i := 0 to L1.Size - 1 do
+        if Abs(L1.FData[i] - L2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(L1.FData[i] - L2.FData[i]);
+    end;
+    // F32 + invertible scale_embedding un-fold + straight biased dumps +
+    // regenerated sinusoids -> exact.
+    AssertTrue('Marian safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    L2.Free; L1.Free; DecInput.Free; EncInput.Free;
+    Dec2.Free; Enc2.Free; Dec.Free; Enc.Free;
   end;
 end;
 

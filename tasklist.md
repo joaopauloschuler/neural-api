@@ -410,7 +410,7 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [ ] HF-names safetensors exporter — per-importer name maps follow-up
+- [X] HF-names safetensors exporter — per-importer name maps follow-up
       (GPT-2 SaveGPT2ToSafeTensors and Llama SaveLlamaToSafeTensors landed as the
       exact inverses of their importers — Llama via the shared
       BuildLlamaMemTensorReader walk that also backs the GGUF exporter, undoing
@@ -465,9 +465,33 @@ rather than acted on.
       straight bias-free [out,in] dumps, time_first bonus and token-shift lerps
       round-trip raw, tied tie_word_embeddings emits no head.weight tensor;
       round-trip gated by TestRWKVSafeTensorsRoundTrip, max |logit diff| = 0
-      (bit-exact)): add a layer->HF-name + transpose inverse map for the
-      REMAINING architectures — only the ENCODER-DECODER importers (T5/Marian,
-      each its own two-net map) now remain on this entry.
+      (bit-exact)): the FINAL piece — the ENCODER-DECODER exporters — LANDED.
+      SaveT5ToSafeTensors is the exact inverse of BuildT5FromSafeTensors: it
+      walks BOTH nets' typed layers (Embedding / per-block TokenRMSNorm +
+      q/k/v/o PointwiseConvLinear + per-head T5RelPosBiasAttention + wi/wo /
+      final norm / decoder LM head) in build order under the encoder.* /
+      decoder.* name map, un-folds the q-projection sqrt(d_kv) scale, un-fuses
+      the gated-GELU wi_0|wi_1 halves, and re-emits the SHARED
+      relative_attention_bias table [NumBuckets,NumHeads] from block 0's
+      per-head bucket columns; tie_word_embeddings emits NO lm_head (the
+      importer regenerates the d_model^-0.5-scaled head from shared.weight),
+      untied dumps a straight bias-free head. SaveMarianToSafeTensors is the
+      exact inverse of BuildMarianFromSafeTensors: walks both nets (Embedding /
+      per-block biased q/k/v/out + post-residual TokenLayerNorm + fc1/fc2 /
+      decoder LM head) under the model.encoder.layers.* / model.decoder.layers.*
+      map, UN-FOLDS the scale_embedding sqrt(d_model) on model.shared.weight,
+      re-derives final_logits_bias from the tied head's per-neuron biases, and
+      deliberately OMITS the static half-split sinusoidal position tables (not
+      learned parameters — the importer regenerates them). Round-trips gated by
+      TestT5SafeTensorsRoundTrip (BOTH the untied gated-GELU Flan-T5 and the
+      tied ReLU v1.0 fixtures) and TestMarianSafeTensorsRoundTrip, both
+      bit-exact (max |logit diff| under 1e-5). Open follow-ups: Pegasus/mBART
+      exporters (Pegasus = pre-norm + sinusoidal final-norm twist; mBART =
+      pre-norm + extra final LayerNorms + learned +2-offset positions) and BART
+      SaveBartToSafeTensors ride the SAME Marian post-norm skeleton but were not
+      done here — they reuse the LoadMarianStack/Attn layout so a future
+      SaveBartToSafeTensors can share DumpStack with the +2-offset learned
+      position table re-emitted.
 - [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
       (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
       llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still

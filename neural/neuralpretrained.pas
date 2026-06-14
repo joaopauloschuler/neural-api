@@ -2706,6 +2706,29 @@ procedure BuildMarianFromSafeTensors(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
+// Exports a T5 ENCODER+DECODER pair (built by BuildT5FromSafeTensors) back to
+// a single HF-name safetensors file - the exact inverse of the importer.
+// Walks the typed layers of BOTH nets in build order, undoing every load
+// transform: the q-projection's folded sqrt(d_kv) compensation, the gated-FFN
+// wi_0|wi_1 fusion, the per-head shared relative-position-bias columns, and
+// (v1.0 tied) the d_model^-0.5 head scaling. EncoderNet/DecoderNet are the two
+// nets returned by the importer; Config the same record. Round-trip gated by
+// TestT5SafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveT5ToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TT5Config; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
+// Exports a Marian ENCODER+DECODER pair (built by BuildMarianFromSafeTensors)
+// back to a single HF-name safetensors file - the exact inverse of the
+// importer. The STATIC half-split sinusoidal position tables are NOT emitted
+// (HF regenerates them; they are not learned parameters). Undoes the
+// scale_embedding sqrt(d_model) fold on the shared matrix and re-derives
+// final_logits_bias from the tied head's per-neuron biases. Round-trip gated
+// by TestMarianSafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveMarianToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TMarianConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
 // ---------------------------------------------------------------------------
 // BART IMPORT (model_type "bart": the facebook/bart-large-cnn and
 // sshleifer/distilbart-cnn-* abstractive-summarization checkpoints;
@@ -18763,6 +18786,452 @@ begin
   Config := ReadMarianConfigFromJSONFile(ConfigPath);
   BuildMarianFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
     DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+// ===========================================================================
+// T5 EXPORT (inverse of BuildT5FromSafeTensors)
+// ===========================================================================
+// Walks one T5 stack (encoder or decoder) collected as typed arrays and emits
+// every HF tensor for it. The collection mirrors the importer build order:
+//   PointwiseConvLinear per block: enc = Q,K,V,O(self),Wi,Wo (6);
+//     dec = Q,K,V,O(self),Q,K,V,O(cross),Wi,Wo (10); + the decoder LM head.
+//   TokenRMSNorm per block: enc = SelfAttnNorm,FFNNorm (2);
+//     dec = SelfAttnNorm,CrossAttnNorm,FFNNorm (3); + one final stack norm.
+//   T5RelPosBiasAttention leaves: NumHeads per block (only block 0's are
+//     emitted - the SHARED relative_attention_bias table, [NumBuckets,Heads]).
+// Coded by Claude (AI).
+
+type
+  TT5ExportLayerArray = array of TNNetLayer;
+
+// Writes a bias-free HF nn.Linear [OutDim, InDim] STRAIGHT from OutDim
+// consecutive neurons of Layer starting at NeuronBase, optionally dividing
+// every weight by InvScale (the T5 q-projection un-folds its sqrt(d_kv)
+// compensation this way). Inverse of LoadLlamaLinearWeights (bias-free).
+procedure DumpT5Linear(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
+  NeuronBase, OutDim, InDim: integer; const WName: string;
+  InvScale: TNeuralFloat; pDType: TSafeTensorsWriteDType);
+var
+  W: TNNetVolume;
+  jj, ii: integer;
+begin
+  W := TNNetVolume.Create;
+  try
+    W.ReSize(OutDim * InDim, 1, 1);
+    for jj := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+        ImportError('T5 export: neuron ' + IntToStr(NeuronBase + jj) +
+          ' for "' + WName + '" has ' +
+          IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for ii := 0 to InDim - 1 do
+        W.FData[jj * InDim + ii] :=
+          Layer.Neurons[NeuronBase + jj].Weights.FData[ii] * InvScale;
+    end;
+    Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+  finally
+    W.Free;
+  end;
+end;
+
+// Writes a T5 RMSNorm gain ([d_model], no beta) from Neurons[0].
+procedure DumpT5RMSNorm(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
+  const WName: string; d_model: integer; pDType: TSafeTensorsWriteDType);
+begin
+  if Layer.Neurons[0].Weights.Size <> d_model then
+    ImportError('T5 export: RMSNorm "' + WName + '" gain size ' +
+      IntToStr(Layer.Neurons[0].Weights.Size) + ' <> d_model ' +
+      IntToStr(d_model) + '.');
+  Writer.AddTensorFlat(WName, [d_model], Layer.Neurons[0].Weights, pDType);
+end;
+
+procedure SaveT5ToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TT5Config; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  InnerDim: integer;
+  QInvScale: TNeuralFloat;
+  RelBias: TNNetVolume;
+  HeadCnt, BucketCnt: integer;
+
+  // Collects, for one stack, the typed layers in build order, then emits all
+  // its HF tensors under StackPrefix ('encoder.' / 'decoder.').
+  procedure DumpStack(Net: TNNet; IsDecoder: boolean;
+    const StackPrefix: string; NumBlocks: integer;
+    out LMHead: TNNetLayer; out RelHeads0: TT5ExportLayerArray);
+  var
+    PwConvs, Norms, RelHeads: array of TNNetLayer;
+    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock: integer;
+    BP, FFNPrefix, SAP, CAP: string;
+    FFNIdx: integer;
+  begin
+    SetLength(PwConvs, 0);
+    SetLength(Norms, 0);
+    SetLength(RelHeads, 0);
+    for li := 0 to Net.CountLayers - 1 do
+    begin
+      if Net.Layers[li] is TNNetT5RelPosBiasAttention then
+      begin
+        SetLength(RelHeads, Length(RelHeads) + 1);
+        RelHeads[High(RelHeads)] := Net.Layers[li];
+      end
+      else if Net.Layers[li] is TNNetTokenRMSNorm then
+      begin
+        SetLength(Norms, Length(Norms) + 1);
+        Norms[High(Norms)] := Net.Layers[li];
+      end
+      else if Net.Layers[li] is TNNetPointwiseConvLinear then
+      begin
+        SetLength(PwConvs, Length(PwConvs) + 1);
+        PwConvs[High(PwConvs)] := Net.Layers[li];
+      end;
+    end;
+    if IsDecoder then
+    begin
+      PwPerBlock := 10; NormPerBlock := 3; FFNIdx := 2;
+    end
+    else
+    begin
+      PwPerBlock := 6; NormPerBlock := 2; FFNIdx := 1;
+    end;
+    if Length(PwConvs) <> PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0) then
+      ImportError('T5 export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(PwConvs)) + ' PointwiseConvLinear layers, expected ' +
+        IntToStr(PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0)) + '.');
+    if Length(Norms) <> NormPerBlock * NumBlocks + 1 then
+      ImportError('T5 export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(Norms)) + ' TokenRMSNorm layers, expected ' +
+        IntToStr(NormPerBlock * NumBlocks + 1) + '.');
+    if Length(RelHeads) <> Config.NumHeads * NumBlocks then
+      ImportError('T5 export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(RelHeads)) + ' relpos heads, expected ' +
+        IntToStr(Config.NumHeads * NumBlocks) + '.');
+    for BlockCnt := 0 to NumBlocks - 1 do
+    begin
+      BP := StackPrefix + 'block.' + IntToStr(BlockCnt) + '.';
+      PwBase := BlockCnt * PwPerBlock;
+      NormBase := BlockCnt * NormPerBlock;
+      SAP := BP + 'layer.0.SelfAttention.';
+      DumpT5RMSNorm(Writer, Norms[NormBase + 0],
+        BP + 'layer.0.layer_norm.weight', Config.DModel, pDType);
+      // q un-folds its sqrt(d_kv) scale; k/v/o are straight.
+      DumpT5Linear(Writer, PwConvs[PwBase + 0], 0, InnerDim, Config.DModel,
+        SAP + 'q.weight', QInvScale, pDType);
+      DumpT5Linear(Writer, PwConvs[PwBase + 1], 0, InnerDim, Config.DModel,
+        SAP + 'k.weight', 1.0, pDType);
+      DumpT5Linear(Writer, PwConvs[PwBase + 2], 0, InnerDim, Config.DModel,
+        SAP + 'v.weight', 1.0, pDType);
+      DumpT5Linear(Writer, PwConvs[PwBase + 3], 0, Config.DModel, InnerDim,
+        SAP + 'o.weight', 1.0, pDType);
+      if IsDecoder then
+      begin
+        CAP := BP + 'layer.1.EncDecAttention.';
+        DumpT5RMSNorm(Writer, Norms[NormBase + 1],
+          BP + 'layer.1.layer_norm.weight', Config.DModel, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + 4], 0, InnerDim, Config.DModel,
+          CAP + 'q.weight', QInvScale, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + 5], 0, InnerDim, Config.DModel,
+          CAP + 'k.weight', 1.0, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + 6], 0, InnerDim, Config.DModel,
+          CAP + 'v.weight', 1.0, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + 7], 0, Config.DModel, InnerDim,
+          CAP + 'o.weight', 1.0, pDType);
+      end;
+      FFNPrefix := BP + 'layer.' + IntToStr(FFNIdx) + '.';
+      DumpT5RMSNorm(Writer, Norms[NormBase + NormPerBlock - 1],
+        FFNPrefix + 'layer_norm.weight', Config.DModel, pDType);
+      if Config.GatedFFN then
+      begin
+        // TNNetGEGLU fused: neurons 0..d_ff-1 = wi_1 (linear half),
+        // d_ff..2*d_ff-1 = wi_0 (gated half) - inverse of the importer.
+        DumpT5Linear(Writer, PwConvs[PwBase + PwPerBlock - 2], Config.DFF,
+          Config.DFF, Config.DModel,
+          FFNPrefix + 'DenseReluDense.wi_0.weight', 1.0, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + PwPerBlock - 2], 0,
+          Config.DFF, Config.DModel,
+          FFNPrefix + 'DenseReluDense.wi_1.weight', 1.0, pDType);
+      end
+      else
+        DumpT5Linear(Writer, PwConvs[PwBase + PwPerBlock - 2], 0,
+          Config.DFF, Config.DModel,
+          FFNPrefix + 'DenseReluDense.wi.weight', 1.0, pDType);
+      DumpT5Linear(Writer, PwConvs[PwBase + PwPerBlock - 1], 0,
+        Config.DModel, Config.DFF,
+        FFNPrefix + 'DenseReluDense.wo.weight', 1.0, pDType);
+    end;
+    DumpT5RMSNorm(Writer, Norms[High(Norms)],
+      StackPrefix + 'final_layer_norm.weight', Config.DModel, pDType);
+    // The block-0 per-head rel-pos columns (the SHARED table for the stack).
+    SetLength(RelHeads0, Config.NumHeads);
+    for li := 0 to Config.NumHeads - 1 do
+      RelHeads0[li] := RelHeads[li];
+    if IsDecoder then LMHead := PwConvs[High(PwConvs)] else LMHead := nil;
+  end;
+
+var
+  EncEmbed, DecEmbed: TNNetLayer;
+  EncLMHead, DecLMHead: TNNetLayer;
+  EncRelHeads0, DecRelHeads0: TT5ExportLayerArray;
+  i: integer;
+begin
+  InnerDim := Config.NumHeads * Config.DKV;
+  // The importer multiplies every q weight by sqrt(d_kv); un-fold by dividing.
+  QInvScale := 1.0 / Sqrt(Config.DKV);
+
+  // ---- find the embeddings ----
+  EncEmbed := nil; DecEmbed := nil;
+  for i := 0 to EncoderNet.CountLayers - 1 do
+    if EncoderNet.Layers[i] is TNNetEmbedding then
+    begin EncEmbed := EncoderNet.Layers[i]; break; end;
+  for i := 0 to DecoderNet.CountLayers - 1 do
+    if DecoderNet.Layers[i] is TNNetEmbedding then
+    begin DecEmbed := DecoderNet.Layers[i]; break; end;
+  if (EncEmbed = nil) or (DecEmbed = nil) then
+    ImportError('T5 export: missing embedding layer - not a ' +
+      'BuildT5FromSafeTensors pair?');
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  RelBias := TNNetVolume.Create;
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/t5');
+    // ---- shared embedding (unscaled in T5) ----
+    if EncEmbed.Neurons[0].Weights.Size <> Config.VocabSize * Config.DModel then
+      ImportError('T5 export: embedding size mismatch.');
+    Writer.AddTensorFlat('shared.weight',
+      [Config.VocabSize, Config.DModel], EncEmbed.Neurons[0].Weights, pDType);
+
+    DumpStack(EncoderNet, {IsDecoder=}false, 'encoder.', Config.NumLayers,
+      EncLMHead, EncRelHeads0);
+    DumpStack(DecoderNet, {IsDecoder=}true, 'decoder.',
+      Config.NumDecoderLayers, DecLMHead, DecRelHeads0);
+
+    // ---- shared relative-position bias tables (block 0 of each stack) ----
+    // HF [NumBuckets, NumHeads]: T[bucket, h] = head h's bucket bias.
+    RelBias.ReSize(Config.RelPosNumBuckets * Config.NumHeads, 1, 1);
+    for HeadCnt := 0 to Config.NumHeads - 1 do
+    begin
+      if EncRelHeads0[HeadCnt].Neurons[0].Weights.Size <>
+         Config.RelPosNumBuckets then
+        ImportError('T5 export: encoder relpos head ' + IntToStr(HeadCnt) +
+          ' bucket count mismatch.');
+      for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
+        RelBias.FData[BucketCnt * Config.NumHeads + HeadCnt] :=
+          EncRelHeads0[HeadCnt].Neurons[0].Weights.FData[BucketCnt];
+    end;
+    Writer.AddTensorFlat('encoder.block.0.layer.0.SelfAttention.' +
+      'relative_attention_bias.weight',
+      [Config.RelPosNumBuckets, Config.NumHeads], RelBias, pDType);
+    for HeadCnt := 0 to Config.NumHeads - 1 do
+      for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
+        RelBias.FData[BucketCnt * Config.NumHeads + HeadCnt] :=
+          DecRelHeads0[HeadCnt].Neurons[0].Weights.FData[BucketCnt];
+    Writer.AddTensorFlat('decoder.block.0.layer.0.SelfAttention.' +
+      'relative_attention_bias.weight',
+      [Config.RelPosNumBuckets, Config.NumHeads], RelBias, pDType);
+
+    // ---- LM head ----
+    // Tied v1.0: the head holds shared rows scaled by d_model^-0.5; the
+    // importer REGENERATES it from shared.weight, so emit nothing (the
+    // un-scaled shared.weight already round-trips). Untied (Flan/v1.1): a
+    // straight bias-free [vocab, d_model] head.
+    if not Config.TieWordEmbeddings then
+      DumpT5Linear(Writer, DecLMHead, 0, Config.VocabSize, Config.DModel,
+        'lm_head.weight', 1.0, pDType);
+
+    Writer.SaveToFile;
+  finally
+    RelBias.Free;
+    Writer.Free;
+  end;
+end;
+
+// ===========================================================================
+// MARIAN EXPORT (inverse of BuildMarianFromSafeTensors)
+// ===========================================================================
+
+procedure SaveMarianToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TMarianConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  EncEmbed, DecEmbed, LMHead: TNNetLayer;
+  Shared, FinalBias: TNNetVolume;
+  EmbedScale, InvEmbedScale: TNeuralFloat;
+  i, j: integer;
+
+  // Writes a HF nn.Linear [OutDim, InDim] (+bias [OutDim]) from OutDim
+  // neurons of Layer (biased - the Marian convention).
+  procedure DumpLinearB(Layer: TNNetLayer; OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[jj].Weights.Size <> InDim then
+          ImportError('Marian export: neuron ' + IntToStr(jj) + ' for "' +
+            WName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Walks one Marian stack and emits its HF tensors. PointwiseConvLinear per
+  // block: enc = Q,K,V,O(self),Fc1,Fc2 (6); dec = Q,K,V,O(self),Q,K,V,O
+  // (cross),Fc1,Fc2 (10) + the decoder LM head. TokenLayerNorm per block:
+  // enc = SelfNorm,FFNNorm (2); dec = SelfNorm,CrossNorm,FFNNorm (3).
+  procedure DumpStack(Net: TNNet; IsDecoder: boolean;
+    const StackPrefix: string; NumBlocks, NumHeads, FFNDim: integer;
+    out LMHeadOut: TNNetLayer);
+  var
+    PwConvs, Norms: array of TNNetLayer;
+    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock: integer;
+    BP: string;
+  begin
+    SetLength(PwConvs, 0);
+    SetLength(Norms, 0);
+    for li := 0 to Net.CountLayers - 1 do
+    begin
+      if Net.Layers[li] is TNNetTokenLayerNorm then
+      begin
+        SetLength(Norms, Length(Norms) + 1);
+        Norms[High(Norms)] := Net.Layers[li];
+      end
+      else if Net.Layers[li] is TNNetPointwiseConvLinear then
+      begin
+        SetLength(PwConvs, Length(PwConvs) + 1);
+        PwConvs[High(PwConvs)] := Net.Layers[li];
+      end;
+    end;
+    if IsDecoder then
+    begin
+      PwPerBlock := 10; NormPerBlock := 3;
+    end
+    else
+    begin
+      PwPerBlock := 6; NormPerBlock := 2;
+    end;
+    if Length(PwConvs) <> PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0) then
+      ImportError('Marian export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(PwConvs)) + ' PointwiseConvLinear layers, expected ' +
+        IntToStr(PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0)) + '.');
+    if Length(Norms) <> NormPerBlock * NumBlocks then
+      ImportError('Marian export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(Norms)) + ' TokenLayerNorm layers, expected ' +
+        IntToStr(NormPerBlock * NumBlocks) + '.');
+    for BlockCnt := 0 to NumBlocks - 1 do
+    begin
+      BP := StackPrefix + IntToStr(BlockCnt) + '.';
+      PwBase := BlockCnt * PwPerBlock;
+      NormBase := BlockCnt * NormPerBlock;
+      DumpLinearB(PwConvs[PwBase + 0], Config.DModel, Config.DModel,
+        BP + 'self_attn.q_proj.weight', BP + 'self_attn.q_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 1], Config.DModel, Config.DModel,
+        BP + 'self_attn.k_proj.weight', BP + 'self_attn.k_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 2], Config.DModel, Config.DModel,
+        BP + 'self_attn.v_proj.weight', BP + 'self_attn.v_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 3], Config.DModel, Config.DModel,
+        BP + 'self_attn.out_proj.weight', BP + 'self_attn.out_proj.bias');
+      SaveLayerNormWeights(Writer, Norms[NormBase + 0],
+        BP + 'self_attn_layer_norm.weight', BP + 'self_attn_layer_norm.bias',
+        Config.DModel, pDType);
+      if IsDecoder then
+      begin
+        DumpLinearB(PwConvs[PwBase + 4], Config.DModel, Config.DModel,
+          BP + 'encoder_attn.q_proj.weight', BP + 'encoder_attn.q_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 5], Config.DModel, Config.DModel,
+          BP + 'encoder_attn.k_proj.weight', BP + 'encoder_attn.k_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 6], Config.DModel, Config.DModel,
+          BP + 'encoder_attn.v_proj.weight', BP + 'encoder_attn.v_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 7], Config.DModel, Config.DModel,
+          BP + 'encoder_attn.out_proj.weight',
+          BP + 'encoder_attn.out_proj.bias');
+        SaveLayerNormWeights(Writer, Norms[NormBase + 1],
+          BP + 'encoder_attn_layer_norm.weight',
+          BP + 'encoder_attn_layer_norm.bias', Config.DModel, pDType);
+      end;
+      DumpLinearB(PwConvs[PwBase + PwPerBlock - 2], FFNDim, Config.DModel,
+        BP + 'fc1.weight', BP + 'fc1.bias');
+      DumpLinearB(PwConvs[PwBase + PwPerBlock - 1], Config.DModel, FFNDim,
+        BP + 'fc2.weight', BP + 'fc2.bias');
+      SaveLayerNormWeights(Writer, Norms[NormBase + NormPerBlock - 1],
+        BP + 'final_layer_norm.weight', BP + 'final_layer_norm.bias',
+        Config.DModel, pDType);
+    end;
+    if IsDecoder then LMHeadOut := PwConvs[High(PwConvs)]
+    else LMHeadOut := nil;
+  end;
+
+begin
+  // ---- find embeddings ----
+  EncEmbed := nil; DecEmbed := nil;
+  for i := 0 to EncoderNet.CountLayers - 1 do
+    if EncoderNet.Layers[i] is TNNetEmbedding then
+    begin EncEmbed := EncoderNet.Layers[i]; break; end;
+  for i := 0 to DecoderNet.CountLayers - 1 do
+    if DecoderNet.Layers[i] is TNNetEmbedding then
+    begin DecEmbed := DecoderNet.Layers[i]; break; end;
+  if (EncEmbed = nil) or (DecEmbed = nil) then
+    ImportError('Marian export: missing embedding layer - not a ' +
+      'BuildMarianFromSafeTensors pair?');
+
+  if Config.ScaleEmbedding then EmbedScale := Sqrt(Config.DModel)
+  else EmbedScale := 1.0;
+  InvEmbedScale := 1.0 / EmbedScale;
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  Shared := TNNetVolume.Create;
+  FinalBias := TNNetVolume.Create;
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/marian');
+    // ---- shared embedding: un-fold the scale_embedding sqrt(d_model). ----
+    if EncEmbed.Neurons[0].Weights.Size <> Config.VocabSize * Config.DModel then
+      ImportError('Marian export: embedding size mismatch.');
+    Shared.ReSize(Config.VocabSize * Config.DModel, 1, 1);
+    for i := 0 to Shared.Size - 1 do
+      Shared.FData[i] := EncEmbed.Neurons[0].Weights.FData[i] * InvEmbedScale;
+    Writer.AddTensorFlat('model.shared.weight',
+      [Config.VocabSize, Config.DModel], Shared, pDType);
+
+    DumpStack(EncoderNet, {IsDecoder=}false, 'model.encoder.layers.',
+      Config.EncoderLayers, Config.EncoderHeads, Config.EncoderFFNDim, LMHead);
+    DumpStack(DecoderNet, {IsDecoder=}true, 'model.decoder.layers.',
+      Config.DecoderLayers, Config.DecoderHeads, Config.DecoderFFNDim, LMHead);
+
+    // ---- final_logits_bias: the tied head's per-neuron biases ([1,vocab]).
+    FinalBias.ReSize(Config.VocabSize, 1, 1);
+    for j := 0 to Config.VocabSize - 1 do
+      FinalBias.FData[j] := LMHead.Neurons[j].BiasWeight;
+    Writer.AddTensorFlat('final_logits_bias',
+      [1, Config.VocabSize], FinalBias, pDType);
+    // The static half-split sinusoidal position tables are NOT learned
+    // parameters (HF _keys_to_ignore_on_save); the importer regenerates them,
+    // so we deliberately emit nothing for embed_positions.
+
+    Writer.SaveToFile;
+  finally
+    FinalBias.Free;
+    Shared.Free;
+    Writer.Free;
+  end;
 end;
 
 // ===========================================================================
