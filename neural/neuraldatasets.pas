@@ -646,6 +646,118 @@ type
       property VocabSize: integer read FVocabSize;
   end;
 
+  { TNNetLengthGroupedBatcher }
+  // Length-grouped batching with dynamic (per-batch) padding for variable-length
+  // sequence training. A port of HuggingFace transformers LengthGroupedSampler
+  // plus DataCollatorWithPadding: it is the TRAINING data-side throughput
+  // optimization (distinct from per-sample attention masks or left-padded
+  // generation). Instead of padding every sample to the GLOBAL maximum length,
+  // it batches samples of SIMILAR length together and pads each emitted batch
+  // only to THAT batch's own maximum length, which sharply reduces the wasted
+  // pad-token compute on a length-skewed corpus.
+  //
+  // Ordering is the transformers "megabatch" shuffle, which keeps the data
+  // stochastic across epochs while still grouping by length:
+  //   1. shuffle all sample indices,
+  //   2. cut the shuffled stream into mega-batches of MegaBatchMult * BatchSize,
+  //   3. sort each mega-batch by sample length (descending), and
+  //   4. (transformers detail) swap the single longest sample into the first
+  //      mega-batch so the very first emitted batch contains the global longest
+  //      sample (surfaces an out-of-memory early rather than mid-epoch),
+  //   5. yield consecutive BatchSize chunks of the resulting index order.
+  // A fresh Reseed reproduces the order bit-for-bit; the internal LCG is the
+  // same one the sibling collators use, independent of the global RandSeed so
+  // batching never perturbs weight-init randomness.
+  //
+  // The token-id convention matches the rest of the NLP pipeline (pad = 0 by
+  // default; real corpus tokens carry their own ids). Each stored sample is one
+  // variable-length token sequence; GetBatchPair emits a per-position causal-LM
+  // training pair for the whole batch: every sample padded (on the right) to the
+  // batch's BatchSeqLen, input = token ids, target = per-position one-hot of the
+  // next token, with pad-target rows left all-zero for ApplyLossMask.
+  // Coded by Claude (AI).
+  TNNetLengthGroupedBatcher = class(TObject)
+    private
+      FSamples: array of TNeuralIntegerArray;
+      FSampleCount: integer;
+      FPadToken: integer;
+      FVocabSize: integer;
+      FBatchSize: integer;
+      FMegaBatchMult: integer;
+      FRngState: cardinal;
+      FOrder: TNeuralIntegerArray;   // sample indices in emission order
+      FBatchCount: integer;
+      FIsBuilt: boolean;
+      function NextRandom(): TNeuralFloat;
+      function NextRandomInt(N: integer): integer;
+      procedure RequireBuilt();
+      procedure ShuffleOrder();
+      procedure SortRangeByLenDesc(Lo, Hi: integer);
+    public
+      // pVocabSize: number of token ids (only used to size one-hot targets).
+      // pBatchSize: samples per emitted batch. pMegaBatchMult: mega-batch size
+      // is pMegaBatchMult * pBatchSize (transformers default 50); a larger
+      // multiplier groups lengths more tightly but reduces shuffle randomness.
+      constructor Create(pVocabSize: integer; pBatchSize: integer;
+        pMegaBatchMult: integer = 50; pPadToken: integer = 0);
+      destructor Destroy; override;
+      // Removes all samples and any built batch order.
+      procedure Clear();
+      // Adds one variable-length token sequence (stored as-is; no separator is
+      // appended). At least one token is required.
+      procedure AddSample(const Tokens: array of integer);
+      // Char-level convenience: sample tokens are Ord() of each character.
+      procedure AddSampleFromString(const Str: string);
+      // Reseeds the internal RNG for a reproducible megabatch shuffle.
+      procedure Reseed(Seed: cardinal);
+      // Builds the megabatch-shuffled emission order and the batch partition.
+      // Call once per epoch (Reseed first for a different shuffle each epoch).
+      procedure BuildBatches();
+      function BatchCount(): integer;
+      // Number of samples in batch BatchIdx (BatchSize, except possibly the
+      // last batch when SampleCount is not a multiple of BatchSize).
+      function BatchSize(BatchIdx: integer): integer;
+      // Pad length of batch BatchIdx: the maximum sample length in that batch
+      // (every sample in the batch is right-padded to this length).
+      function BatchSeqLen(BatchIdx: integer): integer;
+      // Original sample index of the WithinIdx-th member of batch BatchIdx.
+      function SampleIndexOf(BatchIdx, WithinIdx: integer): integer;
+      // Length (real token count, no padding) of the WithinIdx-th sample of
+      // batch BatchIdx.
+      function SampleLenOf(BatchIdx, WithinIdx: integer): integer;
+      // Fills a per-position causal-LM training pair for ONE sample (the
+      // WithinIdx-th member of batch BatchIdx), padded to the batch's
+      // BatchSeqLen. Same volume layout as TNNetSequencePacker.GetTrainingPair:
+      // pInput/pTarget have SizeX = BatchSeqLen, SizeY = 1. Input carries token
+      // ids on the X axis when pInput.Depth = 1 (embedding pipelines) or one-hot
+      // across the depth axis otherwise; pad positions hold the pad token.
+      // Target: per-position one-hot of the next token within the sample, with
+      // pad-target rows (everything from the sample's last real token onward)
+      // left all-zero so a softmax head with ApplyLossMask trains only on the
+      // real next-token targets.
+      procedure GetTrainingPair(BatchIdx, WithinIdx: integer;
+        pInput, pTarget: TNNetVolume);
+      // Copies the network output into Desired at every non-predictable position
+      // of the WithinIdx-th sample of batch BatchIdx (positions at/after the
+      // sample's last real token), so e = Output - Desired is zero there (same
+      // contract as TNNetSequencePacker.ApplyLossMask).
+      procedure ApplyLossMask(BatchIdx, WithinIdx: integer;
+        Desired, Actual: TNNetVolume);
+      // Total pad tokens emitted across all batches with the current dynamic
+      // (per-batch) padding: sum over batches of
+      // (BatchSeqLen * BatchSize - real tokens in the batch).
+      function TotalPadTokens(): int64;
+      // Pad tokens that NAIVE global padding would emit on the same corpus:
+      // (global max length) * SampleCount - total real tokens. The dynamic
+      // batching above is guaranteed <= this (and strictly less whenever the
+      // corpus has any length variation across batches).
+      function NaiveTotalPadTokens(): int64;
+      property SampleCount: integer read FSampleCount;
+      property PadToken: integer read FPadToken;
+      property VocabSize: integer read FVocabSize;
+      property MegaBatchMult: integer read FMegaBatchMult;
+  end;
+
 implementation
 
 uses
@@ -1665,6 +1777,304 @@ begin
       pTarget[P, 0, 0] := TargetIds[P]
     else
       pTarget[P, 0, TargetIds[P]] := 1;
+end;
+
+{ TNNetLengthGroupedBatcher }
+
+constructor TNNetLengthGroupedBatcher.Create(pVocabSize: integer;
+  pBatchSize: integer; pMegaBatchMult: integer; pPadToken: integer);
+begin
+  inherited Create();
+  if pVocabSize < 2 then
+    raise Exception.Create('TNNetLengthGroupedBatcher: VocabSize must be >= 2.');
+  if pBatchSize < 1 then
+    raise Exception.Create('TNNetLengthGroupedBatcher: BatchSize must be >= 1.');
+  if pMegaBatchMult < 1 then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher: MegaBatchMult must be >= 1.');
+  FVocabSize := pVocabSize;
+  FBatchSize := pBatchSize;
+  FMegaBatchMult := pMegaBatchMult;
+  FPadToken := pPadToken;
+  FSampleCount := 0;
+  FBatchCount := 0;
+  FIsBuilt := false;
+  FRngState := 314159265;
+  SetLength(FSamples, 0);
+  SetLength(FOrder, 0);
+end;
+
+destructor TNNetLengthGroupedBatcher.Destroy;
+begin
+  Clear();
+  inherited Destroy;
+end;
+
+procedure TNNetLengthGroupedBatcher.Clear();
+begin
+  SetLength(FSamples, 0);
+  SetLength(FOrder, 0);
+  FSampleCount := 0;
+  FBatchCount := 0;
+  FIsBuilt := false;
+end;
+
+procedure TNNetLengthGroupedBatcher.AddSample(const Tokens: array of integer);
+var
+  I: integer;
+begin
+  if Length(Tokens) < 1 then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.AddSample: a sample must have >= 1 token.');
+  if FSampleCount >= Length(FSamples) then
+    SetLength(FSamples, (FSampleCount + 1) * 2);
+  SetLength(FSamples[FSampleCount], Length(Tokens));
+  for I := 0 to Length(Tokens) - 1 do
+    FSamples[FSampleCount][I] := Tokens[I];
+  Inc(FSampleCount);
+  FIsBuilt := false;
+end;
+
+procedure TNNetLengthGroupedBatcher.AddSampleFromString(const Str: string);
+var
+  Tokens: TNeuralIntegerArray;
+  I: integer;
+begin
+  SetLength(Tokens, Length(Str));
+  for I := 1 to Length(Str) do
+    Tokens[I - 1] := Ord(Str[I]);
+  AddSample(Tokens);
+end;
+
+procedure TNNetLengthGroupedBatcher.Reseed(Seed: cardinal);
+begin
+  FRngState := Seed;
+  FIsBuilt := false;
+end;
+
+function TNNetLengthGroupedBatcher.NextRandom(): TNeuralFloat;
+begin
+  // Same Numerical Recipes LCG as the sibling collators; independent of the
+  // global RandSeed so the shuffle never perturbs weight-init randomness.
+  FRngState := FRngState * 1664525 + 1013904223;
+  Result := (FRngState shr 8) / 16777216.0; // top 24 bits / 2^24
+end;
+
+function TNNetLengthGroupedBatcher.NextRandomInt(N: integer): integer;
+begin
+  if N <= 1 then begin Result := 0; exit; end;
+  Result := Trunc(NextRandom() * N);
+  if Result >= N then Result := N - 1;
+end;
+
+procedure TNNetLengthGroupedBatcher.RequireBuilt();
+begin
+  if not FIsBuilt then
+    raise Exception.Create('TNNetLengthGroupedBatcher: call BuildBatches first.');
+end;
+
+procedure TNNetLengthGroupedBatcher.ShuffleOrder();
+var
+  I, J, Tmp: integer;
+begin
+  // Fisher-Yates over the sample indices using the internal LCG.
+  for I := 0 to FSampleCount - 1 do FOrder[I] := I;
+  for I := FSampleCount - 1 downto 1 do
+  begin
+    J := NextRandomInt(I + 1);
+    Tmp := FOrder[I]; FOrder[I] := FOrder[J]; FOrder[J] := Tmp;
+  end;
+end;
+
+procedure TNNetLengthGroupedBatcher.SortRangeByLenDesc(Lo, Hi: integer);
+var
+  I, J, PivotLen, Tmp: integer;
+begin
+  // Plain quicksort on FOrder[Lo..Hi] keyed by descending sample length.
+  if Lo >= Hi then exit;
+  PivotLen := Length(FSamples[FOrder[(Lo + Hi) div 2]]);
+  I := Lo; J := Hi;
+  repeat
+    while Length(FSamples[FOrder[I]]) > PivotLen do Inc(I);
+    while Length(FSamples[FOrder[J]]) < PivotLen do Dec(J);
+    if I <= J then
+    begin
+      Tmp := FOrder[I]; FOrder[I] := FOrder[J]; FOrder[J] := Tmp;
+      Inc(I); Dec(J);
+    end;
+  until I > J;
+  SortRangeByLenDesc(Lo, J);
+  SortRangeByLenDesc(I, Hi);
+end;
+
+procedure TNNetLengthGroupedBatcher.BuildBatches();
+var
+  Mega, Lo, Hi, I, LongestPos, Tmp: integer;
+begin
+  if FSampleCount < 1 then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.BuildBatches: no samples added.');
+  SetLength(FOrder, FSampleCount);
+  // 1. shuffle all indices.
+  ShuffleOrder();
+  // 2-3. cut into mega-batches and sort each by length (descending).
+  Mega := FMegaBatchMult * FBatchSize;
+  Lo := 0;
+  while Lo < FSampleCount do
+  begin
+    Hi := Lo + Mega - 1;
+    if Hi > FSampleCount - 1 then Hi := FSampleCount - 1;
+    SortRangeByLenDesc(Lo, Hi);
+    Lo := Lo + Mega;
+  end;
+  // 4. transformers detail: ensure the GLOBAL longest sample sits in the first
+  //    mega-batch (now at FOrder[0], since each mega-batch is length-sorted) so
+  //    the very first emitted batch surfaces a worst-case OOM immediately.
+  if FSampleCount > 1 then
+  begin
+    LongestPos := 0;
+    for I := 1 to FSampleCount - 1 do
+      if Length(FSamples[FOrder[I]]) > Length(FSamples[FOrder[LongestPos]]) then
+        LongestPos := I;
+    if LongestPos <> 0 then
+    begin
+      Tmp := FOrder[0]; FOrder[0] := FOrder[LongestPos]; FOrder[LongestPos] := Tmp;
+    end;
+  end;
+  // 5. partition into BatchSize chunks.
+  FBatchCount := (FSampleCount + FBatchSize - 1) div FBatchSize;
+  FIsBuilt := true;
+end;
+
+function TNNetLengthGroupedBatcher.BatchCount(): integer;
+begin
+  RequireBuilt();
+  Result := FBatchCount;
+end;
+
+function TNNetLengthGroupedBatcher.BatchSize(BatchIdx: integer): integer;
+begin
+  RequireBuilt();
+  if (BatchIdx < 0) or (BatchIdx >= FBatchCount) then
+    raise Exception.Create('TNNetLengthGroupedBatcher.BatchSize: bad batch index.');
+  Result := FBatchSize;
+  if (BatchIdx = FBatchCount - 1) and (FSampleCount mod FBatchSize <> 0) then
+    Result := FSampleCount mod FBatchSize;
+end;
+
+function TNNetLengthGroupedBatcher.SampleIndexOf(BatchIdx, WithinIdx: integer): integer;
+var
+  Flat: integer;
+begin
+  RequireBuilt();
+  if (WithinIdx < 0) or (WithinIdx >= BatchSize(BatchIdx)) then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.SampleIndexOf: bad within-batch index.');
+  Flat := BatchIdx * FBatchSize + WithinIdx;
+  Result := FOrder[Flat];
+end;
+
+function TNNetLengthGroupedBatcher.SampleLenOf(BatchIdx, WithinIdx: integer): integer;
+begin
+  Result := Length(FSamples[SampleIndexOf(BatchIdx, WithinIdx)]);
+end;
+
+function TNNetLengthGroupedBatcher.BatchSeqLen(BatchIdx: integer): integer;
+var
+  W, L: integer;
+begin
+  RequireBuilt();
+  Result := 0;
+  for W := 0 to BatchSize(BatchIdx) - 1 do
+  begin
+    L := SampleLenOf(BatchIdx, W);
+    if L > Result then Result := L;
+  end;
+end;
+
+procedure TNNetLengthGroupedBatcher.GetTrainingPair(BatchIdx, WithinIdx: integer;
+  pInput, pTarget: TNNetVolume);
+var
+  Sample: TNeuralIntegerArray;
+  SeqLen, Len, Pos, Token: integer;
+begin
+  RequireBuilt();
+  SeqLen := BatchSeqLen(BatchIdx);
+  if pInput.SizeX < SeqLen then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.GetTrainingPair: input SizeX (' +
+      IntToStr(pInput.SizeX) + ') < batch seq len (' + IntToStr(SeqLen) + ').');
+  if pTarget.SizeX < SeqLen then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.GetTrainingPair: target SizeX (' +
+      IntToStr(pTarget.SizeX) + ') < batch seq len (' + IntToStr(SeqLen) + ').');
+  Sample := FSamples[SampleIndexOf(BatchIdx, WithinIdx)];
+  Len := Length(Sample);
+  // Input: real tokens then right-padding to the batch's seq len.
+  pInput.Fill(0);
+  for Pos := 0 to SeqLen - 1 do
+  begin
+    if Pos < Len then Token := Sample[Pos] else Token := FPadToken;
+    if pInput.Depth = 1
+    then pInput[Pos, 0, 0] := Token
+    else if (Token >= 0) and (Token < pInput.Depth)
+    then pInput[Pos, 0, Token] := 1;
+  end;
+  // Target: per-position one-hot of the NEXT real token (positions 0..Len-2);
+  // every padded position and the sample's last real token carry no target.
+  pTarget.Fill(0);
+  for Pos := 0 to Len - 2 do
+  begin
+    Token := Sample[Pos + 1];
+    if (Token >= 0) and (Token < pTarget.Depth) then pTarget[Pos, 0, Token] := 1;
+  end;
+end;
+
+procedure TNNetLengthGroupedBatcher.ApplyLossMask(BatchIdx, WithinIdx: integer;
+  Desired, Actual: TNNetVolume);
+var
+  SeqLen, Len, Pos, D: integer;
+begin
+  RequireBuilt();
+  SeqLen := BatchSeqLen(BatchIdx);
+  Len := SampleLenOf(BatchIdx, WithinIdx);
+  for Pos := 0 to SeqLen - 1 do
+  begin
+    // Predictable iff a next real token exists: Pos in 0..Len-2.
+    if Pos > Len - 2 then
+      for D := 0 to Desired.Depth - 1 do
+        Desired[Pos, 0, D] := Actual[Pos, 0, D];
+  end;
+end;
+
+function TNNetLengthGroupedBatcher.TotalPadTokens(): int64;
+var
+  B, W, SeqLen: integer;
+begin
+  RequireBuilt();
+  Result := 0;
+  for B := 0 to FBatchCount - 1 do
+  begin
+    SeqLen := BatchSeqLen(B);
+    for W := 0 to BatchSize(B) - 1 do
+      Result := Result + (SeqLen - SampleLenOf(B, W));
+  end;
+end;
+
+function TNNetLengthGroupedBatcher.NaiveTotalPadTokens(): int64;
+var
+  I, GlobalMax, L: integer;
+  RealTokens: int64;
+begin
+  GlobalMax := 0;
+  RealTokens := 0;
+  for I := 0 to FSampleCount - 1 do
+  begin
+    L := Length(FSamples[I]);
+    if L > GlobalMax then GlobalMax := L;
+    RealTokens := RealTokens + L;
+  end;
+  Result := int64(GlobalMax) * FSampleCount - RealTokens;
 end;
 
 procedure CreateVolumesFromImagesFromFolder(out ImgTrainingVolumes, ImgValidationVolumes,
