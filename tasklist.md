@@ -379,7 +379,7 @@ rather than acted on.
       eps_uncond)); (c) add a DDIM sampler (deterministic, 10-50 steps vs the
       1000-step ancestral loop). Deliverable: generate a chosen digit on demand,
       far fewer sampling steps. Opens latent-diffusion (reuse the SD VAE) next.
-- [ ] Flow Matching / Rectified Flow generative example (examples/FlowMatching)
+- [X] Flow Matching / Rectified Flow generative example (examples/FlowMatching)
       — the modern ODE/transport alternative to DDPM: train a velocity field
       v_theta(x_t, t) to match (x1 - x0) along straight interpolation paths
       x_t = (1-t)x0 + t*x1, then sample by Euler-integrating the ODE from noise.
