@@ -5503,6 +5503,124 @@ function BuildVaeEncoderFromSafeTensors(const FileName: string;
   out Config: TVaeDecoderConfig; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
 
+// ===========================================================================
+// DiT IMPORT (class-conditional Diffusion Transformer, Peebles & Xie 2023,
+// "Scalable Diffusion Models with Transformers", arXiv:2212.09748 - the
+// facebook/DiT-XL-2-256 architecture, the transformer latent denoiser behind
+// SD3 / Sora). This is the modern transformer BACKBONE that replaces the
+// from-scratch convolutional UNets the repo's diffusion examples
+// (DiffusionMNIST / ConditionalDiffusion) ship; the existing sampling side
+// (neuraldiffusion.pas TNNetDiffusionScheduler, DDPM/DDIM/DPM-Solver++(2M))
+// and the VAE encoder/decoder importers complete the pipeline.
+//
+// v1 SCOPE: the CLASS-CONDITIONAL DiT (the clean adaLN-Zero recipe), whose
+// conditioning is c = timestep_embed + class_embed (NO text encoder). The
+// TEXT-conditioned PixArt-alpha variant (T5 cross-attention) and the
+// end-to-end LatentTextToImage example are deferred follow-ups (tasklist.md).
+//
+// Architecture (all LayerNorms here are elementwise_affine=False - NO learned
+// gain/bias - the adaLN modulation supplies the per-token scale/shift):
+//   x_embedder: Conv2d(in_channels -> hidden, kernel=stride=patch_size) over
+//     the (in_channels, H, W) VAE latent -> (Grid*Grid) tokens row-major (h,w)
+//     + a FIXED 2-D sin-cos position embedding (the "pos_embed" buffer);
+//   t_embedder: sinusoidal(t) -> Linear -> SiLU -> Linear (width hidden). DiT's
+//     sinusoidal order is [cos | sin] (the HALF-SPLIT, cos FIRST); the framework
+//     TNNetSinusoidalTimeEmbedding emits [sin | cos], so the importer SWAPS the
+//     two halves of t_embedder.mlp.0's input columns at load (exact);
+//   y_embedder: nn.Embedding(num_classes -> hidden). c = t_emb + y_emb;
+//   N x DiTBlock (adaLN-Zero):
+//     (sh_msa,sc_msa,g_msa,sh_mlp,sc_mlp,g_mlp)=chunk(Linear(SiLU(c)),6)  (the
+//        block's adaLN_modulation.1, regressed from the conditioning vector);
+//     x = x + g_msa * Attn( modulate(LN(x), sh_msa, sc_msa) )
+//     x = x + g_mlp * MLP ( modulate(LN(x), sh_mlp, sc_mlp) )
+//       modulate(h,shift,scale)=h*(1+scale)+shift; Attn = standard MHSA
+//       (1/sqrt(head_dim)); MLP = fc2( gelu_tanh( fc1(.) ) ) - DiT uses
+//       nn.GELU(approximate='tanh') = TNNetGELU (NOT the erf TNNetGELUErf);
+//   final_layer: (shift,scale)=chunk(Linear(SiLU(c)),2), x=modulate(LN(x),
+//     shift,scale), Linear(hidden -> patch^2 * out_channels), unpatchify.
+//   learn_sigma=True: out_channels = 2*in_channels (eps in the first
+//     in_channels, the predicted variance in the second half).
+//
+// HOW adaLN MODULATION IS EXPRESSED (pure COMPOSITION - no new leaf class):
+//   modulate is TNNetFiLM([LN(x), cond]) where cond is the (1,1,2*hidden)
+//   gamma|beta vector with gamma=(1+scale) (a TNNetAddConstant(1) on the scale
+//   slice) and beta=shift, assembled by TNNetSplitChannels + TNNetConcat. FiLM
+//   already broadcasts gamma/beta across the token (X) axis - exactly per-token
+//   adaLN. The per-channel gate (g_msa/g_mlp, a (1,1,hidden) vector) is applied
+//   with TNNetChannelMulByLayer(branch_out, gate). The "-Zero" gate-init-0 only
+//   matters for from-scratch training; IMPORT loads trained weights, so only
+//   the arithmetic is wired.
+//
+// The net has THREE TNNetInput layers (all filled manually before Compute,
+// the T5EncoderStatesInput multi-input convention): input0 = the
+// (LatentSize,LatentSize,in_channels) latent; input1 = the (1,1,1) scalar
+// timestep t; input2 = the (1,1,1) class id. The t_embedder MLP and the label
+// table run INSIDE the net (their sum is the conditioning vector c every block
+// reads), so a single Net.Compute does the whole forward. DiTConditioning
+// fills input1/input2; DiTDenoise fills all three, Computes, and reads the
+// (in_channels) eps half so the existing scheduler can drive a latent-noise
+// -> denoise trajectory.
+// ---------------------------------------------------------------------------
+type
+  TDiTConfig = record
+    HiddenSize: integer;        // hidden_size (transformer width)
+    NumLayers: integer;         // depth (number of DiT blocks)
+    NumHeads: integer;          // num_heads
+    MlpRatio: integer;          // mlp_ratio (4) -> mlp hidden = ratio*hidden
+    PatchSize: integer;         // patch_size (2)
+    InChannels: integer;        // in_channels of the latent (4)
+    OutChannels: integer;       // 2*in_channels if learn_sigma else in_channels
+    LearnSigma: boolean;        // learn_sigma
+    LatentSize: integer;        // latent grid H=W (input_size)
+    NumClasses: integer;        // num_classes (label table rows)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-6)
+    ModelType: string;          // 'DiT'
+  end;
+
+// Reads a DiT config.json (the fields above). Required: hidden_size, depth,
+// num_heads, patch_size, in_channels, input_size (latent grid), num_classes.
+// Optional: mlp_ratio (4), learn_sigma (true), layer_norm_eps (1e-6).
+function ReadDiTConfigFromJSONFile(const FileName: string): TDiTConfig;
+
+function DiTConfigToString(const Config: TDiTConfig): string;
+
+// Builds the class-conditional DiT described by Config and loads every weight
+// from Reader (caller owns Reader). The net has TWO inputs: input0 the
+// (LatentSize, LatentSize, InChannels) latent and input1 the (1,1,HiddenSize)
+// conditioning vector c; it outputs the (LatentSize, LatentSize, OutChannels)
+// raw prediction. Use DiTConditioning to fill input1 and DiTDenoise to run a
+// full step. pInferenceOnly frees training volumes during construction.
+function BuildDiT(Reader: TNNetSafeTensorsReader; const Config: TDiTConfig;
+  pInferenceOnly: boolean = false): TNNet;
+
+function BuildDiTFromSafeTensorsEx(const FileName: string;
+  const Config: TDiTConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildDiTFromSafeTensors(const FileName: string;
+  out Config: TDiTConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// Returns the DiT net's timestep input (the (1,1,1) scalar t input, the net's
+// SECOND TNNetInput) and class-id input (the (1,1,1) class id, the THIRD
+// TNNetInput) respectively.
+function DiTTimestepInput(Net: TNNet): TNNetLayer;
+function DiTClassInput(Net: TNNet): TNNetLayer;
+
+// Fills the net's timestep input with t and class-id input with ClassId (in
+// [0, NumClasses)). t is the scalar (continuous) timestep. Call once before
+// DiTDenoise / Net.Compute; the conditioning vector c = t_embedder(t) +
+// y_embedder(ClassId) is then formed inside the net during Compute.
+procedure DiTConditioning(Net: TNNet; t: TNeuralFloat; ClassId: integer);
+
+// Full DiT forward: fills input0 with Latent ((LatentSize,LatentSize,
+// InChannels)), the timestep + class inputs (DiTConditioning), Net.Compute,
+// and copies the EPS half (the first InChannels channels) of the
+// (.,.,OutChannels) output into EpsOut ((LatentSize,LatentSize,InChannels)).
+// This is the TNNetDenoiseCallback-shaped denoiser the scheduler drives (wrap
+// it in a closure that captures ClassId). EpsOut is resized.
+procedure DiTDenoise(Net: TNNet; const Config: TDiTConfig;
+  Latent: TNNetVolume; t: TNeuralFloat; ClassId: integer; EpsOut: TNNetVolume);
+
 // ---------------------------------------------------------------------------
 // VQGAN / DISCRETE IMAGE-TOKENIZER IMPORT (diffusers VQModel, the encoder used
 // by autoregressive / masked image generators - MaskGIT, Parti, LlamaGen - to
@@ -36583,6 +36701,435 @@ begin
       'mamba, bloom, falcon, bert, distilbert, roberta, modernbert, ' +
       'deepseek_v2, olmo2, wav2vec2, hubert.');
   end;
+end;
+
+// ===========================================================================
+// DiT IMPORT implementation
+// ===========================================================================
+
+function ReadDiTConfigFromJSONFile(const FileName: string): TDiTConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.MlpRatio := 4;
+  Result.LearnSigma := true;
+  Result.LayerNormEps := 1e-6;
+  Result.ModelType := 'DiT';
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('DiT import: ' + FileName + ' is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.HiddenSize := Obj.Get('hidden_size', 0);
+    Result.NumLayers := Obj.Get('depth', 0);
+    Result.NumHeads := Obj.Get('num_heads', 0);
+    Result.MlpRatio := Obj.Get('mlp_ratio', Result.MlpRatio);
+    Result.PatchSize := Obj.Get('patch_size', 0);
+    Result.InChannels := Obj.Get('in_channels', 0);
+    Result.LatentSize := Obj.Get('input_size', 0);
+    Result.NumClasses := Obj.Get('num_classes', 0);
+    Result.LearnSigma := Obj.Get('learn_sigma', Result.LearnSigma);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', double(Result.LayerNormEps));
+    if Obj.Find('_class_name') <> nil then
+      Result.ModelType := Obj.Get('_class_name', Result.ModelType);
+    if Result.LearnSigma then Result.OutChannels := 2 * Result.InChannels
+    else Result.OutChannels := Result.InChannels;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  if (Result.HiddenSize <= 0) or (Result.NumLayers <= 0) or
+     (Result.NumHeads <= 0) or (Result.PatchSize <= 0) or
+     (Result.InChannels <= 0) or (Result.LatentSize <= 0) or
+     (Result.NumClasses <= 0) then
+    ImportError('DiT import: ' + FileName + ' is missing one of the ' +
+      'required keys hidden_size/depth/num_heads/patch_size/in_channels/' +
+      'input_size/num_classes.');
+end;
+
+function DiTConfigToString(const Config: TDiTConfig): string;
+begin
+  Result := Config.ModelType + ' config: d=' + IntToStr(Config.HiddenSize) +
+    ', depth=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', mlp_ratio=' + IntToStr(Config.MlpRatio) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', in_ch=' + IntToStr(Config.InChannels) +
+    ', out_ch=' + IntToStr(Config.OutChannels) +
+    ', learn_sigma=' + BoolToStr(Config.LearnSigma, true) +
+    ', latent=' + IntToStr(Config.LatentSize) +
+    ', classes=' + IntToStr(Config.NumClasses);
+end;
+
+// One DiT adaLN-Zero block, wired by pure composition. CondLayer is the
+// (1,1,hidden) conditioning vector c (shared by every block). XInput is the
+// block's input token sequence (NumPatches,1,hidden). Records the layers that
+// need weights loaded (the adaLN Linear, QKV slab, attn out, the two MLP
+// linears). Returns the block-output layer.
+type
+  TDiTBlockLayers = record
+    AdaLN: TNNetLayer;     // adaLN_modulation.1 Linear (hidden -> 6*hidden)
+    QKV: TNNetLayer;       // attn.qkv (hidden -> 3*hidden)
+    AttnProj: TNNetLayer;  // attn.proj (hidden -> hidden)
+    Fc1: TNNetLayer;       // mlp.fc1 (hidden -> mlp_hidden)
+    Fc2: TNNetLayer;       // mlp.fc2 (mlp_hidden -> hidden)
+  end;
+
+// Builds the (1,1,2*hidden) gamma|beta conditioning vector for one modulate:
+// gamma = 1 + scale (the scale slice + TNNetAddConstant(1)), beta = shift.
+// ScaleStart/ShiftStart are the channel offsets of the scale/shift slices in
+// the 6*hidden adaLN output.
+function DiTModCond(NN: TNNet; ModLayer: TNNetLayer;
+  ScaleStart, ShiftStart, Hidden: integer): TNNetLayer;
+var
+  ScaleSlice, ShiftSlice, GammaSlice: TNNetLayer;
+begin
+  ScaleSlice := NN.AddLayerAfter(
+    TNNetSplitChannels.Create(ScaleStart, Hidden), ModLayer);
+  GammaSlice := NN.AddLayerAfter(TNNetAddConstant.Create(1.0), ScaleSlice);
+  ShiftSlice := NN.AddLayerAfter(
+    TNNetSplitChannels.Create(ShiftStart, Hidden), ModLayer);
+  // concat gamma|beta on DEPTH -> (1,1,2*hidden), the TNNetFiLM layout.
+  Result := NN.AddLayer( TNNetDeepConcat.Create([GammaSlice, ShiftSlice]) );
+end;
+
+function AddDiTBlock(NN: TNNet; XInput, CondLayer: TNNetLayer;
+  const Config: TDiTConfig; var Block: TDiTBlockLayers;
+  pInferenceOnly: boolean): TNNetLayer;
+var
+  d, MlpHidden: integer;
+  SiluC, LN1, Mod1, FiLM1, Attn, Gate1Slice, Gated1, Res1: TNNetLayer;
+  LN2, Mod2, FiLM2, FfHidden, FfOut, Gate2Slice, Gated2: TNNetLayer;
+begin
+  d := Config.HiddenSize;
+  MlpHidden := Config.MlpRatio * d;
+  // adaLN_modulation: Linear(SiLU(c)) -> 6*hidden.
+  SiluC := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
+  Block.AdaLN := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(6 * d), SiluC);
+  // chunk layout: [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
+  // gate_mlp] each of width d (matches DiT's chunk(6) order).
+  // ---- attention sub-block ----
+  LN1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), XInput);
+  Mod1 := DiTModCond(NN, Block.AdaLN, {scale}1 * d, {shift}0 * d, d);
+  FiLM1 := NN.AddLayer( TNNetFiLM.Create([LN1, Mod1]) );
+  Block.QKV := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(3 * d), FiLM1);
+  Block.AttnProj := NN.AddMultiHeadSelfAttention(Config.NumHeads,
+    {CausalMask=}false);
+  Attn := NN.GetLastLayer();
+  // gate_msa (channels [2d..3d)) per-channel multiply.
+  Gate1Slice := NN.AddLayerAfter(
+    TNNetSplitChannels.Create(2 * d, d), Block.AdaLN);
+  Gated1 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Attn, Gate1Slice) );
+  Res1 := NN.AddLayer( TNNetSum.Create([Gated1, XInput]) );
+  // ---- MLP sub-block ----
+  LN2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), Res1);
+  Mod2 := DiTModCond(NN, Block.AdaLN, {scale}4 * d, {shift}3 * d, d);
+  FiLM2 := NN.AddLayer( TNNetFiLM.Create([LN2, Mod2]) );
+  Block.Fc1 := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(MlpHidden), FiLM2);
+  NN.AddLayer( TNNetGELU.Create() ); // DiT gelu_tanh
+  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+  FfOut := NN.GetLastLayer();
+  // gate_mlp (channels [5d..6d)).
+  Gate2Slice := NN.AddLayerAfter(
+    TNNetSplitChannels.Create(5 * d, d), Block.AdaLN);
+  Gated2 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(FfOut, Gate2Slice) );
+  Result := NN.AddLayer( TNNetSum.Create([Gated2, Res1]) );
+  if pInferenceOnly then NN.MakeInferenceOnly();
+end;
+
+// Transposes the patch sub-axes of the final-linear output neurons: the
+// reference DiT stores them as (ph*P + pw)*out_ch + ic (sub-height major);
+// TNNetDepthToSpace reads (pw*P + ph)*out_ch + ic. Reorders the neuron list in
+// place (each neuron carries one output row's weights + bias).
+procedure PermuteFinalLinPatchAxes(Layer: TNNetLayer; P, OutCh: integer);
+var
+  Saved: array of TNNetVolume;
+  SavedBias: array of TNeuralFloat;
+  ph, pw, ic, SrcIdx, DstIdx, N: integer;
+begin
+  N := P * P * OutCh;
+  if Layer.Neurons.Count <> N then
+    ImportError('DiT import: internal error - final linear has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' + IntToStr(N) + '.');
+  SetLength(Saved, N);
+  SetLength(SavedBias, N);
+  for SrcIdx := 0 to N - 1 do
+  begin
+    Saved[SrcIdx] := TNNetVolume.Create;
+    Saved[SrcIdx].Copy(Layer.Neurons[SrcIdx].Weights);
+    SavedBias[SrcIdx] := Layer.Neurons[SrcIdx].BiasWeight;
+  end;
+  try
+    for ph := 0 to P - 1 do
+      for pw := 0 to P - 1 do
+        for ic := 0 to OutCh - 1 do
+        begin
+          SrcIdx := (ph * P + pw) * OutCh + ic;  // reference order
+          DstIdx := (pw * P + ph) * OutCh + ic;  // DepthToSpace order
+          Layer.Neurons[DstIdx].Weights.Copy(Saved[SrcIdx]);
+          Layer.Neurons[DstIdx].BiasWeight := SavedBias[SrcIdx];
+        end;
+    Layer.FlushWeightCache();
+  finally
+    for SrcIdx := 0 to N - 1 do Saved[SrcIdx].Free;
+  end;
+end;
+
+function BuildDiT(Reader: TNNetSafeTensorsReader; const Config: TDiTConfig;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  LatentInput, TInput, YInput, PatchConv, PosEmb: TNNetLayer;
+  TSin, TFc0, TSilu, TFc2, YEmb, CondSum: TNNetLayer;
+  FinalSilu, FinalMod, FinalLN, FinalFiLM, FinalLin: TNNetLayer;
+  XLayer: TNNetLayer;
+  Blocks: array of TDiTBlockLayers;
+  FinalModLayer: TNNetLayer;
+  Tmp, WVol: TNNetVolume;
+  SwapTmp: TNeuralFloat;
+  d, Grid, NumPatches, MlpHidden, half, i, ci, BlockCnt: integer;
+  PatchBiasName, p: string;
+begin
+  d := Config.HiddenSize;
+  MlpHidden := Config.MlpRatio * d;
+  if (Config.NumHeads < 1) or ((d mod Config.NumHeads) <> 0) then
+    ImportError('DiT import: hidden_size=' + IntToStr(d) +
+      ' not divisible by num_heads=' + IntToStr(Config.NumHeads) + '.');
+  if (Config.PatchSize < 1) or ((Config.LatentSize mod Config.PatchSize) <> 0)
+  then
+    ImportError('DiT import: input_size=' + IntToStr(Config.LatentSize) +
+      ' not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
+  Grid := Config.LatentSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    // input0: the (LatentSize, LatentSize, in_channels) latent.
+    LatentInput := NN.AddLayer( TNNetInput.Create(
+      Config.LatentSize, Config.LatentSize, Config.InChannels) );
+    // x_embedder: biased patch conv -> (Grid,Grid,d) -> tokens (NumPatches,1,d)
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
+      {pSuppressBias=}0) );
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    // + fixed 2-D sin-cos position embedding (loaded into a learned table).
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(NumPatches) );
+    XLayer := PosEmb;
+
+    // input1: scalar timestep t -> t_embedder MLP.
+    TInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
+    TSin := NN.AddLayer( TNNetSinusoidalTimeEmbedding.Create(d) );
+    TFc0 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    TSilu := NN.AddLayer( TNNetSiLU.Create() );
+    TFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+    // input2: class id -> label embedding table.
+    YInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
+    YEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumClasses, d,
+      {EncodeZero=}1, {ScaleEmbedding=}1.0) );
+    // conditioning vector c = t_emb + y_emb (1,1,d).
+    CondSum := NN.AddLayer( TNNetSum.Create([TFc2, YEmb]) );
+
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---- DiT blocks ----
+    SetLength(Blocks, Config.NumLayers);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      XLayer := AddDiTBlock(NN, XLayer, CondSum, Config, Blocks[BlockCnt],
+        pInferenceOnly);
+
+    // ---- final layer: adaLN (shift,scale) + linear + unpatchify ----
+    FinalSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondSum);
+    FinalModLayer := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(2 * d) ); // [shift, scale]
+    FinalLN := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps), XLayer);
+    FinalMod := DiTModCond(NN, FinalModLayer, {scale}1 * d, {shift}0 * d, d);
+    FinalFiLM := NN.AddLayer( TNNetFiLM.Create([FinalLN, FinalMod]) );
+    FinalLin := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(
+        Config.PatchSize * Config.PatchSize * Config.OutChannels), FinalFiLM);
+    // unpatchify: (NumPatches,1,p*p*out) -> (Grid,Grid,p*p*out) -> DepthToSpace
+    NN.AddLayer( TNNetReshape.Create(Grid, Grid,
+      Config.PatchSize * Config.PatchSize * Config.OutChannels) );
+    NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    // patch conv (biased).
+    LoadClipPatchConv(Reader, PatchConv, 'x_embedder.proj.weight',
+      Config.InChannels, Config.PatchSize, d);
+    PatchBiasName := 'x_embedder.proj.bias';
+    if not Reader.HasTensor(PatchBiasName) then
+      ImportError('DiT import: missing tensor "' + PatchBiasName + '".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(PatchBiasName, Tmp);
+      for ci := 0 to d - 1 do PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // pos_embed buffer [1, NumPatches, d] -> the learned table.
+    if not Reader.HasTensor('pos_embed') then
+      ImportError('DiT import: missing tensor "pos_embed".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('pos_embed', Tmp);
+      if Tmp.Size <> NumPatches * d then
+        ImportError('DiT import: "pos_embed" must have ' +
+          IntToStr(NumPatches * d) + ' elements, got ' +
+          IntToStr(Tmp.Size) + '.');
+      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // t_embedder.mlp.0: DiT sinusoidal order is [cos|sin] but the framework
+    // TNNetSinusoidalTimeEmbedding emits [sin|cos]; swap the two input-column
+    // halves of the first Linear so the loaded weights consume [sin|cos].
+    half := d div 2;
+    LoadLlamaLinearWeights(Reader, TFc0, 't_embedder.mlp.0.weight', d, d,
+      0, -1, 0, 't_embedder.mlp.0.bias');
+    // permute the in-columns: new[:, 0:half]=old[:, half:d]; new[:,half:d]=old[:,0:half]
+    for i := 0 to d - 1 do
+    begin
+      WVol := TFc0.Neurons[i].Weights;
+      for ci := 0 to half - 1 do
+      begin
+        // swap input column ci with column half+ci
+        SwapTmp := WVol.FData[ci];
+        WVol.FData[ci] := WVol.FData[half + ci];
+        WVol.FData[half + ci] := SwapTmp;
+      end;
+    end;
+    TFc0.FlushWeightCache();
+    LoadLlamaLinearWeights(Reader, TFc2, 't_embedder.mlp.2.weight', d, d,
+      0, -1, 0, 't_embedder.mlp.2.bias');
+    // label table.
+    LoadClipEmbeddingTable(Reader, YEmb,
+      'y_embedder.embedding_table.weight', Config.NumClasses, d);
+    // blocks.
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      p := 'blocks.' + IntToStr(BlockCnt) + '.';
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AdaLN,
+        p + 'adaLN_modulation.1.weight', d, 6 * d, 0, -1, 0,
+        p + 'adaLN_modulation.1.bias');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+        p + 'attn.qkv.weight', d, 3 * d, 0, -1, 0, p + 'attn.qkv.bias');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnProj,
+        p + 'attn.proj.weight', d, d, 0, -1, 0, p + 'attn.proj.bias');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc1,
+        p + 'mlp.fc1.weight', d, MlpHidden, 0, -1, 0, p + 'mlp.fc1.bias');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
+        p + 'mlp.fc2.weight', MlpHidden, d, 0, -1, 0, p + 'mlp.fc2.bias');
+    end;
+    // final layer.
+    LoadLlamaLinearWeights(Reader, FinalModLayer,
+      'final_layer.adaLN_modulation.1.weight', d, 2 * d, 0, -1, 0,
+      'final_layer.adaLN_modulation.1.bias');
+    LoadLlamaLinearWeights(Reader, FinalLin, 'final_layer.linear.weight',
+      d, Config.PatchSize * Config.PatchSize * Config.OutChannels,
+      0, -1, 0, 'final_layer.linear.bias');
+    // DiT's unpatchify packs the final-linear output channels as
+    // (ph*P + pw)*out_ch + ic (sub-HEIGHT major), but TNNetDepthToSpace reads
+    // them as (sx*P + sy)*out_ch + ic with sx = sub-WIDTH, sy = sub-height -
+    // i.e. the two patch sub-axes are transposed. Permute the output neurons
+    // (ph,pw) -> (pw,ph) so DepthToSpace reconstructs the image correctly.
+    PermuteFinalLinPatchAxes(FinalLin, Config.PatchSize, Config.OutChannels);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildDiTFromSafeTensorsEx(const FileName: string;
+  const Config: TDiTConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDiT(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildDiTFromSafeTensors(const FileName: string;
+  out Config: TDiTConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDiTConfigFromJSONFile(ConfigPath);
+  Result := BuildDiTFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// Returns the Nth TNNetInput layer (0-based) of Net.
+function DiTNthInput(Net: TNNet; N: integer): TNNetLayer;
+var
+  i, Cnt: integer;
+begin
+  Result := nil;
+  Cnt := 0;
+  for i := 0 to Net.CountLayers() - 1 do
+    if Net.Layers[i] is TNNetInput then
+    begin
+      if Cnt = N then begin Result := Net.Layers[i]; Exit; end;
+      Inc(Cnt);
+    end;
+  ImportError('DiT: net has no TNNetInput #' + IntToStr(N) + '.');
+end;
+
+function DiTTimestepInput(Net: TNNet): TNNetLayer;
+begin
+  Result := DiTNthInput(Net, 1);
+end;
+
+function DiTClassInput(Net: TNNet): TNNetLayer;
+begin
+  Result := DiTNthInput(Net, 2);
+end;
+
+procedure DiTConditioning(Net: TNNet; t: TNeuralFloat; ClassId: integer);
+begin
+  DiTTimestepInput(Net).Output.FData[0] := t;
+  DiTClassInput(Net).Output.FData[0] := ClassId;
+end;
+
+procedure DiTDenoise(Net: TNNet; const Config: TDiTConfig;
+  Latent: TNNetVolume; t: TNeuralFloat; ClassId: integer; EpsOut: TNNetVolume);
+var
+  Output: TNNetVolume;
+  x, y, c: integer;
+begin
+  DiTNthInput(Net, 0).Output.CopyNoChecks(Latent);
+  DiTConditioning(Net, t, ClassId);
+  Net.Compute(DiTNthInput(Net, 0).Output);
+  Output := Net.GetLastLayer().Output;
+  EpsOut.Resize(Config.LatentSize, Config.LatentSize, Config.InChannels);
+  for x := 0 to Config.LatentSize - 1 do
+    for y := 0 to Config.LatentSize - 1 do
+      for c := 0 to Config.InChannels - 1 do
+        EpsOut[x, y, c] := Output[x, y, c];
 end;
 
 end.

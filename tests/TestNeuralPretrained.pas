@@ -19,7 +19,7 @@ uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralpretrained, neuralhftokenizer, neuralaudio,
-  neuraldecode;
+  neuraldecode, neuraldiffusion;
 
 type
   TTestNeuralPretrained = class(TTestCase)
@@ -296,6 +296,9 @@ type
     procedure TestVqModelEncodeParity;
     procedure TestVqModelDecodeParity;
     procedure TestVqModelRoundTrip;
+    procedure TestDiTConfigFromJSONFile;
+    procedure TestDiTParity;
+    procedure TestDiTSchedulerSmoke;
     procedure TestRRDBNetParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
@@ -13979,6 +13982,154 @@ begin
     ImgInput.Free;
     RefJson.Free;
     Vq.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestDiTConfigFromJSONFile;
+var
+  Config: TDiTConfig;
+begin
+  Config := ReadDiTConfigFromJSONFile(FixturePath('tiny_dit_config.json'));
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('depth', 2, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('patch', 2, Config.PatchSize);
+  AssertEquals('in_ch', 4, Config.InChannels);
+  AssertEquals('out_ch (learn_sigma)', 8, Config.OutChannels);
+  AssertTrue('learn_sigma', Config.LearnSigma);
+  AssertEquals('latent', 6, Config.LatentSize);
+  AssertEquals('classes', 5, Config.NumClasses);
+end;
+
+// Parity test for the class-conditional DiT importer (BuildDiTFromSafeTensors)
+// against the committed tiny float64 numpy oracle (tools/make_pico_dit_fixture
+// .py: hidden 16, depth 2, heads 2, patch 2, in_ch 4, learn_sigma -> out_ch 8,
+// 6x6 latent -> 3x3 patch grid, 5 classes). diffusers is NOT installed; the
+// oracle re-implements the canonical DiT forward (patchify + 2-D sin-cos pos,
+// timestep MLP, label table, adaLN-Zero blocks, final adaLN + unpatchify).
+// Exercises: the FiLM-expressed modulate(h)=h*(1+scale)+shift, the per-channel
+// ChannelMulByLayer gate, the [sin|cos]<->[cos|sin] timestep-MLP column swap,
+// gelu_tanh (TNNetGELU), and TNNetDepthToSpace unpatchify. Asserts < 1e-4 on
+// the FULL out_channels output.
+procedure TTestNeuralPretrained.TestDiTParity;
+var
+  NN: TNNet;
+  Config: TDiTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, OneCase, LatArr, OutArr: TJSONArray;
+  CaseObj: TJSONObject;
+  LatentInput, Output: TNNetVolume;
+  t, RefVal, GotVal, Diff, MaxDiff: double;
+  y, CaseCnt, x, yy, c, FlatIdx, HW: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildDiTFromSafeTensors(FixturePath('tiny_dit.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_dit_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_dit_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    HW := Config.LatentSize;
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      LatArr := TJSONArray(CaseObj.Find('latent'));   // flat (C,H,W)
+      OutArr := TJSONArray(CaseObj.Find('output'));   // flat (out_ch,H,W)
+      t := CaseObj.Get('t', double(0));
+      y := CaseObj.Get('y', 0);
+      // Load the flat (C,H,W) latent into the CAI (x,y,depth) volume.
+      LatentInput.ReSize(HW, HW, Config.InChannels);
+      for c := 0 to Config.InChannels - 1 do
+        for yy := 0 to HW - 1 do
+          for x := 0 to HW - 1 do
+          begin
+            FlatIdx := c * HW * HW + yy * HW + x;
+            LatentInput.FData[(yy * HW + x) * Config.InChannels + c] :=
+              LatArr.Items[FlatIdx].AsFloat;
+          end;
+      DiTConditioning(NN, t, y);
+      NN.Compute(LatentInput);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('output grid', HW, Output.SizeX);
+      AssertEquals('output channels', Config.OutChannels, Output.Depth);
+      for c := 0 to Config.OutChannels - 1 do
+        for yy := 0 to HW - 1 do
+          for x := 0 to HW - 1 do
+          begin
+            FlatIdx := c * HW * HW + yy * HW + x;
+            RefVal := OutArr.Items[FlatIdx].AsFloat;
+            GotVal := Output.FData[(yy * HW + x) * Config.OutChannels + c];
+            Diff := Abs(GotVal - RefVal);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+    end;
+    AssertTrue('DiT output: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Smoke test: the imported DiT drives the existing TNNetDiffusionScheduler over
+// a few DDIM steps from latent noise and produces a finite (LatentSize,
+// LatentSize,InChannels) eps prediction at the right shape - the
+// latent-noise -> denoise loop the SD3/Sora pipeline runs (VAE-decode is a
+// separate importer and not exercised here to keep the test tiny).
+procedure TTestNeuralPretrained.TestDiTSchedulerSmoke;
+var
+  NN: TNNet;
+  Config: TDiTConfig;
+  Scheduler: TNNetDiffusionScheduler;
+  Latent, Eps: TNNetVolume;
+  StepCnt, NumSteps, T, TPrev, x, yy, c, HW: integer;
+  AllFinite: boolean;
+begin
+  RandSeed := 424242;
+  NN := BuildDiTFromSafeTensors(FixturePath('tiny_dit.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_dit_config.json'));
+  Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
+  Latent := TNNetVolume.Create;
+  Eps := TNNetVolume.Create;
+  try
+    HW := Config.LatentSize;
+    Latent.ReSize(HW, HW, Config.InChannels);
+    Latent.RandomizeGaussian(1.0);
+    NumSteps := 4;
+    Scheduler.ResetMultistep;
+    for StepCnt := 0 to NumSteps - 1 do
+    begin
+      T := Scheduler.NumTimesteps -
+        (StepCnt * Scheduler.NumTimesteps) div NumSteps;
+      if StepCnt = NumSteps - 1 then TPrev := 0
+      else TPrev := Scheduler.NumTimesteps -
+        ((StepCnt + 1) * Scheduler.NumTimesteps) div NumSteps;
+      DiTDenoise(NN, Config, Latent, T, {ClassId=}1, Eps);
+      AssertEquals('eps grid', HW, Eps.SizeX);
+      AssertEquals('eps channels', Config.InChannels, Eps.Depth);
+      Scheduler.Step(Latent, Eps, T, TPrev, smDDIM, 0.0);
+    end;
+    // Final latent (the sampled x0) must be all-finite.
+    AllFinite := true;
+    for c := 0 to Config.InChannels - 1 do
+      for yy := 0 to HW - 1 do
+        for x := 0 to HW - 1 do
+          if not (Latent[x, yy, c] = Latent[x, yy, c]) then AllFinite := false;
+    AssertTrue('denoised latent is finite', AllFinite);
+  finally
+    Eps.Free;
+    Latent.Free;
+    Scheduler.Free;
+    NN.Free;
   end;
 end;
 

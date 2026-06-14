@@ -791,20 +791,36 @@ rather than acted on.
       examples/TreeSpeculativeDecoding demo reporting the accepted-tokens/forward
       speedup vs the linear self-speculative baseline.
 
-- [ ] DiT / PixArt diffusion-transformer importer (BuildDiTFromSafeTensors, e.g.
-      facebook/DiT-XL-2-256 or PixArt-alpha) — the repo already has the full
-      sampling side (neuraldiffusion.pas TNNetDiffusionScheduler with DDPM / DDIM /
-      DPM-Solver++(2M)) and the VAE-encoder/decoder importers, but every diffusion
-      BACKBONE it can run is a from-scratch convolutional UNet (DiffusionMNIST /
-      ConditionalDiffusion). DiT is the transformer-based latent denoiser behind
-      SD3 / Sora and is the modern SOTA gap. New pieces: patchify the VAE latent
-      into a token sequence, the timestep + class/text embedding MLP, and the
-      adaLN-Zero conditioning block (per-token scale/shift/gate regressed from the
-      conditioning vector — TNNetFiLM already provides the per-channel affine
-      modulation primitive, the "-Zero" part is the gate initialized to 0). Wire the
-      ViT backbone (BuildViTFromSafeTensors infra) plus the final linear unpatchify
-      head. Verify on a pico-sliced fixture (make_pico_*_fixture.py pattern); a
-      latent-noise -> denoise -> VAE-decode smoke test reuses the existing scheduler.
+- [X] DiT diffusion-transformer importer (BuildDiTFromSafeTensors[Ex] +
+      TDiTConfig + ReadDiTConfigFromJSONFile/DiTConfigToString in
+      neuralpretrained.pas), v1 scoped to the CLASS-CONDITIONAL DiT (the
+      facebook/DiT-XL-2-256 architecture — the clean adaLN-Zero recipe, NO text
+      encoder: conditioning c = timestep_embed + class_embed). The transformer
+      latent denoiser behind SD3/Sora, replacing the from-scratch convolutional
+      UNets (DiffusionMNIST/ConditionalDiffusion). Landed pieces: patchify
+      (biased patch conv -> token sequence + a FIXED 2-D sin-cos pos_embed
+      buffer); the t_embedder (TNNetSinusoidalTimeEmbedding -> Linear -> SiLU ->
+      Linear, with a [sin|cos]<->[cos|sin] input-column swap at load since DiT's
+      sinusoidal order is cos-first) + the y_embedder label table; the adaLN-Zero
+      block expressed by PURE COMPOSITION (no new leaf class): modulate(h)=
+      h*(1+scale)+shift is TNNetFiLM([LN(x),cond]) with cond=concat[(1+scale),
+      shift] (TNNetSplitChannels + TNNetAddConstant(1) + TNNetDeepConcat), the
+      per-channel gate is TNNetChannelMulByLayer, the affine-free LayerNorms are
+      TNNetTokenLayerNorm at its gamma=1/beta=0 init; standard MHSA
+      (AddMultiHeadSelfAttention) + gelu_tanh MLP (TNNetGELU, DiT uses
+      nn.GELU(approximate='tanh')); the final adaLN + linear + unpatchify
+      (TNNetDepthToSpace, with a patch sub-axis (ph,pw)->(pw,ph) neuron permute
+      at load to match DepthToSpace's ordering); learn_sigma out_channels =
+      2*in_channels. THREE-input net (latent + scalar t + class id);
+      DiTConditioning/DiTDenoise drive a full step, DiTDenoise feeds the existing
+      TNNetDiffusionScheduler. Verified: tools/make_pico_dit_fixture.py committed
+      pico fixture (hidden 16, depth 2, heads 2, patch 2, 6x6 latent, 5 classes;
+      diffusers NOT installed so a self-contained float64 numpy oracle) +
+      TestDiTParity (max |diff| = 2.8e-5 < 1e-4) + TestDiTSchedulerSmoke
+      (latent-noise -> 4 DDIM steps -> finite eps). DEFERRED follow-ups: the
+      TEXT-conditioned PixArt-alpha variant (T5 cross-attention, much larger) and
+      the end-to-end LatentTextToImage example (DiT denoise -> VAE-decode ->
+      image) — the VAE-decode tail and scheduler are already in place.
 
 - [X] ConvNeXt-v1/v2 image-classification backbone importer
       (BuildConvNeXtFromSafeTensors[Ex] + TConvNeXtConfig + ReadConvNeXtConfigFrom
