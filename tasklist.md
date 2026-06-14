@@ -186,9 +186,7 @@ rather than acted on.
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and
       round-trips a translation on CPU via DecodeSeq2SeqGreedy/BeamSearch, plus
       verifying the importer against a downloaded sentencepiece.bpe.model vocab
-      (the parity fixture today uses raw token ids only). The BPE-in-.model
-      tokenizer support for NLLB-BPE variants has landed (see the
-      neuralhftokenizer Tokenizer follow-up (b) entry), so this is unblocked.
+      (the parity fixture today uses raw token ids only).
 - [ ] GPT-OSS importer follow-ups (BuildGptOssFromSafeTensors[Ex] LANDED,
       model_type "gpt_oss", with TNNetGptOssSinkAttention per-head scalar sink +
       alternating sliding/full window + YaRN truncate flag + top-k MoE +
@@ -223,11 +221,10 @@ rather than acted on.
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
-      UNBLOCKED FURTHER: the SigLIP vision tower now LANDED
-      (BuildSigLIPVisionTower with a pVisionFeatures skip-pooling/
-      select-hidden-layer mode — exactly the LLaVA-needs select-hidden mode);
-      most modern open VLMs (PaliGemma/SmolVLM/Idefics) use SigLIP, not CLIP,
-      as the tower, so prefer BuildSigLIPVisionTower for Step 4's checkpoint.
+      Prefer the SigLIP vision tower (BuildSigLIPVisionTower with a
+      pVisionFeatures skip-pooling/select-hidden-layer mode — exactly the
+      LLaVA select-hidden mode) for Step 4's checkpoint: most modern open VLMs
+      (PaliGemma/SmolVLM/Idefics) use SigLIP, not CLIP, as the tower.
       Target a small open checkpoint on the classic LLaVA recipe (e.g.
       llava-hf/llava-interleave-qwen-0.5b-hf or a SmolVLM-class model —
       whichever config maps cleanest onto existing paths): ViT vision
@@ -578,36 +575,10 @@ rather than acted on.
 - [ ] NumPy .npz follow-up (neural/neuralnumpy.pas reader/writer landed; WRITER
       is STORED-only): DEFLATE-compressed .npz WRITER (savez_compressed) +
       zip64 / >4GB archive support (reader currently rejects zip64).
-- [X] MMLU few-shot accuracy benchmark harness + example (NLP eval gap;
-      complements the landed examples/HellaSwagEval + examples/PerplexityEval
-      and the EvaluateMultipleChoice / ScoreSequence primitives, but is a
-      DISTINCT benchmark, not a near-duplicate): MMLU is the canonical
-      knowledge benchmark and the missing piece for validating the large
-      imported instruct-model fleet (Llama/Qwen3/Gemma3/Phi3/Mistral/...)
-      against published numbers rather than only against tiny pico-fixture
-      logit parity. Scope:
-        - a TMMLUEvaluator-style harness in neuralnlpmetrics.pas (or a small
-          new unit) that, for each 4-choice question, builds the standard
-          k-shot prompt ("Question ... A. .. B. .. C. .. D. ..\nAnswer:")
-          from same-subject dev examples and scores by the single-token
-          A/B/C/D answer-letter logprob (the HF lm-eval convention), NOT by
-          full-continuation perplexity (that is what HellaSwagEval already
-          does — keep the two scoring modes clearly separate).
-        - per-subject accuracy + macro-average over the 57 subjects, plus a
-          micro-average, printed as a small report (reuse the existing
-          PerplexityReport / *Report formatting idiom).
-        - examples/MMLUEval reading the cais/mmlu (or hendrycks_test) splits
-          via the venv-x datasets/transformers already available; default to
-          a tiny embedded smoke subset so the example compiles/runs in CI
-          without a network fetch, with a flag to point at the full dataset.
-        - 0-shot and 5-shot modes (5-shot is the headline setting); reuse the
-          left-padded DecodeBatchGreedy / KV-cache path so large models stay
-          tractable. Follow-ups (separate tasks): LAMBADA last-word accuracy,
-          ARC/PIQA/WinoGrande on the same answer-letter scoring core.
-      LANDED: EvaluateMMLU + MMLUReport (single-token A/B/C/D answer-letter
-      scoring, per-subject + macro + micro, 0/5-shot) in neuralnlpmetrics.pas,
-      TestNeuralNLPMetrics MMLU tests, examples/MMLUEval (tiny embedded smoke
-      subset, char-level toy model). Open follow-ups:
+- [ ] MMLU few-shot eval follow-ups (EvaluateMMLU + MMLUReport single-token
+      A/B/C/D answer-letter scoring, per-subject + macro + micro, 0/5-shot, in
+      neuralnlpmetrics.pas; TestNeuralNLPMetrics MMLU tests; examples/MMLUEval
+      tiny embedded smoke subset — all LANDED):
   - [ ] examples/MMLUEval --full <path> hook: dump cais/mmlu (hendrycks_test)
         dev+test splits to a small text file via the venv-x datasets package and
         feed the questions through the same FormatQuestion/BuildPrompt builder
