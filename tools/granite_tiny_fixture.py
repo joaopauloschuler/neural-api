@@ -37,7 +37,8 @@ import json
 import torch
 from safetensors.torch import save_file
 from transformers import (GraniteConfig, GraniteForCausalLM,
-                          GraniteMoeConfig, GraniteMoeForCausalLM)
+                          GraniteMoeConfig, GraniteMoeForCausalLM,
+                          GraniteMoeSharedConfig, GraniteMoeSharedForCausalLM)
 
 N_LAYER = 2
 N_HEAD = 2
@@ -167,3 +168,44 @@ build_and_dump('granitemoe', moe_cfg, mmodel)
 assert_multipliers_matter('granitemoe', GraniteMoeForCausalLM, GraniteMoeConfig,
                           {k: v for k, v in moe_cfg.items()
                            if k != 'architectures'}, mmodel)
+
+# ---------------- granitemoeshared ----------------
+# GraniteMoeShared = granitemoe + an always-on parallel SHARED SwiGLU expert
+# (shared_intermediate_size > 0): hidden = block_sparse_moe(h) + shared_mlp(h).
+# shared_mlp.input_linear is the FUSED [2*S, H] gate|up slab, .output_linear
+# is [H, S] (down). Re-randomized so the shared expert MOVES the logits.
+SHARED_FF = 10  # shared_intermediate_size (distinct from D_FF to catch swaps)
+torch.manual_seed(20260615)
+shared_cfg = common_cfg('granitemoe')
+shared_cfg['architectures'] = ['GraniteMoeSharedForCausalLM']
+shared_cfg['num_local_experts'] = 3
+shared_cfg['num_experts_per_tok'] = 2
+shared_cfg['shared_intermediate_size'] = SHARED_FF
+smodel = GraniteMoeSharedForCausalLM(GraniteMoeSharedConfig(
+    **{k: v for k, v in shared_cfg.items() if k != 'architectures'},
+    attn_implementation='eager'))
+randomize_norms(smodel)
+build_and_dump('granitemoeshared', shared_cfg, smodel)
+assert_multipliers_matter('granitemoeshared', GraniteMoeSharedForCausalLM,
+                          GraniteMoeSharedConfig,
+                          {k: v for k, v in shared_cfg.items()
+                           if k != 'architectures'}, smodel)
+
+# The shared expert must MOVE the logits: turning shared_intermediate_size to 0
+# (no shared expert) must change them, or the parity test could pass while the
+# shared branch is silently dropped.
+with torch.no_grad():
+    base = smodel(input_ids=torch.tensor([SEQUENCES[0]])).logits
+    d = {k: v for k, v in shared_cfg.items() if k != 'architectures'}
+    d['shared_intermediate_size'] = 0
+    m0 = GraniteMoeSharedForCausalLM(GraniteMoeSharedConfig(
+        **d, attn_implementation='eager'))
+    # copy every NON-shared weight; the no-shared model has no shared_mlp.
+    m0.load_state_dict({k: v for k, v in smodel.state_dict().items()
+                        if 'shared_mlp' not in k})
+    m0.double().eval()
+    eff = (base - m0(input_ids=torch.tensor([SEQUENCES[0]])).logits)\
+        .abs().max().item()
+    assert eff > 1e-3, \
+        f'granitemoeshared: shared expert had no effect on the logits ({eff})'
+    print(f'granitemoeshared: shared-expert effect: max |diff| = {eff:.4f}')

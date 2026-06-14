@@ -209,6 +209,7 @@ type
     procedure TestGraniteConfigFromJSONFile;
     procedure TestGraniteLogitParity;
     procedure TestGraniteMoeLogitParity;
+    procedure TestGraniteMoeSharedLogitParity;
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
@@ -7447,6 +7448,52 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_granitemoe_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the GraniteMoeShared import target (HF GraniteMoeSharedForCausalLM,
+// model_type "granitemoe" with shared_intermediate_size > 0): the granitemoe
+// sparse MoE FFN PLUS an always-on parallel shared SwiGLU expert
+// (shared_mlp.input_linear [2S,H] fused gate|up, shared_mlp.output_linear
+// [H,S] down) whose output is ADDED to the routed-MoE output
+// before the FFN residual close (HF: hidden = block_sparse_moe(h) +
+// shared_mlp(h)). The fixture re-randomizes the shared expert and ASSERTS it
+// moves the HF logits (so this test cannot pass while the shared branch is
+// silently dropped). Reference logits come from HF transformers
+// (GraniteMoeSharedForCausalLM) in float64.
+procedure TTestNeuralPretrained.TestGraniteMoeSharedLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildGraniteFromSafeTensorsEx(
+    FixturePath('tiny_granitemoeshared.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_granitemoeshared_config.json'));
+  try
+    AssertEquals('model_type', 'granitemoe', Config.ModelType);
+    AssertTrue('is MoE', Config.IsMoE);
+    AssertTrue('fused granite naming', Config.MoEGraniteNaming);
+    AssertEquals('experts', 3, Config.NumLocalExperts);
+    AssertEquals('experts_per_tok', 2, Config.MoEExpertsPerTok);
+    AssertEquals('shared_intermediate_size', 10,
+      Config.SharedIntermediateSize);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_granitemoeshared_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route.
+  NN := BuildFromPretrained(
+    FixturePath('tiny_granitemoeshared.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_granitemoeshared_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_granitemoeshared_logits.json'), 16, 13);
   finally
     NN.Free;
   end;

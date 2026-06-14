@@ -822,6 +822,16 @@ type
                                // the LM head rows as 1/logits_scaling, exactly
                                // like Cohere's logit_scale fold but DIVIDING).
                                // 1.0 = off
+    SharedIntermediateSize: integer; // granitemoe shared_intermediate_size:
+                               // an always-on shared-expert SwiGLU MLP (width
+                               // shared_intermediate_size) that runs in
+                               // PARALLEL with the routed experts; its output
+                               // is ADDED to the routed-MoE output before the
+                               // FFN residual close (HF GraniteMoeShared:
+                               // hidden = moe(h) + shared_mlp(h)). Tensors:
+                               // shared_mlp.input_linear [2*S, H] (fused
+                               // gate|up) + shared_mlp.output_linear [H, S]
+                               // (down). 0 = no shared expert
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -1325,8 +1335,10 @@ function BuildMixtralFromSafeTensors(const FileName: string;
 // unchanged. granitemoe carries the same four multipliers and a fused 3-D
 // expert slab (block_sparse_moe.input_linear/output_linear/router); its
 // gating (softmax over the top-k logits) is identical to Mixtral's top-k
-// renorm. A non-zero shared_intermediate_size (parallel shared expert) is
-// rejected - not wired yet.
+// renorm. A non-zero shared_intermediate_size (GraniteMoeShared) adds an
+// always-on full-width SwiGLU shared expert (shared_mlp.input_linear/
+// output_linear) run in PARALLEL with the routed experts and
+// SUMMED with the routed output before the FFN residual close.
 function BuildGraniteFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
@@ -5081,6 +5093,7 @@ begin
     Result.ResidualMultiplier := 1.0;
     Result.AttentionMultiplier := 0; // 0 = use SDPA's default 1/sqrt(head_dim)
     Result.LogitsScaling := 1.0;
+    Result.SharedIntermediateSize := 0; // granitemoe: no shared expert
     if ModelType = 'mixtral' then
     begin
       // Mixtral: a stock Mistral decoder (full MHA/GQA, RoPE, sliding
@@ -5543,15 +5556,20 @@ begin
           ImportError('Llama import: granitemoe num_experts_per_tok=' +
             IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, ' +
             'num_local_experts=' + IntToStr(Result.NumLocalExperts) + '].');
-        // shared_intermediate_size > 0 would add an always-on shared expert
-        // (GraniteMoeShared) that runs in PARALLEL with the routed experts.
-        // It is NOT wired here; reject a non-zero value rather than silently
-        // dropping it. The reference granitemoe checkpoints (e.g.
-        // granite-3.0-1b/3b-a800m) ship shared_intermediate_size=0.
-        if Obj.Get('shared_intermediate_size', 0) <> 0 then
-          ImportError('Llama import: granitemoe shared_intermediate_size>0 ' +
-            '(a parallel always-on shared expert, GraniteMoeShared) is not ' +
-            'wired into this importer yet.');
+        // shared_intermediate_size > 0 adds an always-on shared expert
+        // (GraniteMoeShared, e.g. granite-3.0-3b-a800m): an ordinary SwiGLU
+        // MLP of width shared_intermediate_size that runs in PARALLEL with
+        // the routed experts; its output is ADDED to the routed-MoE output
+        // before the FFN residual close (HF: hidden = moe(h) +
+        // shared_mlp(h)). The reference dense-MoE checkpoints (e.g.
+        // granite-3.0-1b/3b-a800m without "Shared") ship
+        // shared_intermediate_size=0 (no shared expert).
+        Result.SharedIntermediateSize :=
+          Obj.Get('shared_intermediate_size', 0);
+        if Result.SharedIntermediateSize < 0 then
+          ImportError('Llama import: granitemoe shared_intermediate_size ' +
+            'must be >= 0, got ' +
+            IntToStr(Result.SharedIntermediateSize) + '.');
       end;
     end
     else // llama
@@ -6043,6 +6061,10 @@ type
     // per-expert fused gate|up and down projections; empty otherwise.
     GateConv: TNNetLayer;
     ExpertGateUp, ExpertDown: array of TNNetLayer;
+    // granitemoe shared expert (Config.SharedIntermediateSize > 0): an
+    // always-on SwiGLU MLP whose output is summed with the routed output;
+    // nil otherwise.
+    SharedGateUp, SharedDown: TNNetLayer;
   end;
 
 // Wires Mixtral's block_sparse_moe FFN from primitives onto MoESource (the
@@ -6081,7 +6103,7 @@ end;
 procedure BuildMixtralMoEBranch(NN: TNNet; var Block: TLlamaBlockLayers;
   MoESource: TNNetLayer; const Config: TLlamaConfig);
 var
-  GateTopK, ExpertOut, GateE, GateEBroadcast: TNNetLayer;
+  GateTopK, ExpertOut, GateE, GateEBroadcast, RoutedOut: TNNetLayer;
   MoEBranches: array of TNNetLayer;
   ExpertCnt, ExpertWidth: integer;
 begin
@@ -6123,8 +6145,28 @@ begin
   end;
   // y = Sum_e gTopK[e] * Expert_e(x). (NumExpertsPerTok>=2 routing implies
   // NumLocalExperts>=2; a single-expert sum is still valid for safety.)
-  NN.AddLayer( TNNetSum.Create(MoEBranches) );
+  RoutedOut := NN.AddLayer( TNNetSum.Create(MoEBranches) );
   SetLength(MoEBranches, 0);
+  // granitemoe shared expert (GraniteMoeShared, Config.SharedIntermediateSize
+  // > 0): an always-on full-width SwiGLU MLP reading the SAME pre-FFN-normed
+  // residual stream as the router, run in PARALLEL with the routed experts.
+  // HF GraniteMoeSharedDecoderLayer: hidden = block_sparse_moe(h) +
+  // shared_mlp(h). shared_mlp.input_linear is the FUSED [2*S, H] gate|up slab
+  // (HF chunks it into (gate, up) and computes silu(gate)*up); TNNetSwiGLU
+  // computes FIRSTHALF*silu(SECONDHALF), so the UP half loads into neurons
+  // 0..S-1 and the GATE half into S..2S-1 (the same convention as every
+  // other fused gate|up here). residual_multiplier folds into the shared
+  // down (output_linear) rows, matching the routed experts.
+  if Config.SharedIntermediateSize > 0 then
+  begin
+    Block.SharedGateUp := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(2 * Config.SharedIntermediateSize),
+      MoESource);
+    NN.AddLayer( TNNetSwiGLU.Create() );
+    Block.SharedDown := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    NN.AddLayer( TNNetSum.Create([RoutedOut, NN.GetLastLayer()]) );
+  end;
 end;
 
 // Loads granitemoe's FUSED 3-D expert slab for one block (no Mixtral-style
@@ -6946,6 +6988,42 @@ begin
             LoadGraniteMoEExperts(Reader, Blocks[BlockCnt], BlockPrefix,
               Config.NumLocalExperts, Config.HiddenSize, i,
               Config.ResidualMultiplier, Consumed);
+            // granitemoe shared expert (GraniteMoeShared): a 2-D FUSED SwiGLU
+            // MLP, shared_mlp.input_linear [2S, H] (gate rows 0..S-1 then up
+            // rows S..2S-1; HF chunks (gate, up) and computes silu(gate)*up)
+            // and shared_mlp.output_linear [H, S] (down). The shared_mlp keys
+            // sit DIRECTLY under the layer prefix (NOT under
+            // block_sparse_moe). TNNetSwiGLU is FIRSTHALF*silu(SECONDHALF),
+            // so UP (rows S..2S-1) -> neurons 0..S-1 and GATE (rows 0..S-1) ->
+            // neurons S..2S-1. The down rows carry residual_multiplier like
+            // the routed expert down.
+            if Config.SharedIntermediateSize > 0 then
+            begin
+              TensorNameStr := BlockPrefix + 'shared_mlp.';
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+                TensorNameStr + 'input_linear.weight',
+                Config.HiddenSize, Config.SharedIntermediateSize,
+                {NeuronBase=}0, {ExpectedNeurons=}2 * Config.SharedIntermediateSize,
+                {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+                {SrcRowBase=}Config.SharedIntermediateSize,
+                {SrcRows=}2 * Config.SharedIntermediateSize); // UP rows
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+                TensorNameStr + 'input_linear.weight',
+                Config.HiddenSize, Config.SharedIntermediateSize,
+                {NeuronBase=}Config.SharedIntermediateSize,
+                {ExpectedNeurons=}2 * Config.SharedIntermediateSize,
+                {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+                {SrcRowBase=}0,
+                {SrcRows=}2 * Config.SharedIntermediateSize); // GATE rows
+              MarkConsumed(TensorNameStr + 'input_linear.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedDown,
+                TensorNameStr + 'output_linear.weight',
+                Config.SharedIntermediateSize, Config.HiddenSize,
+                {NeuronBase=}0, {ExpectedNeurons=}Config.HiddenSize,
+                {RotaryHeadDim=}0, {BiasName=}'',
+                {Scale=}Config.ResidualMultiplier);
+              MarkConsumed(TensorNameStr + 'output_linear.weight');
+            end;
             if pQuantizeInt8 then NN.QuantizeWeightsInt8();
             continue;
           end;

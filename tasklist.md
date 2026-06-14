@@ -107,10 +107,13 @@ rather than acted on.
       with a dedicated LoadGraniteMoEExperts loader for its fused 3-D slabs;
       pico parity TestGranite{Config,Logit,MoeLogit}Parity < 1e-4 vs float64
       HF transformers):
-  - [ ] granitemoe `shared_intermediate_size` > 0 (an always-on parallel
-        shared expert, GraniteMoeShared / granite-3.0-3b-a800m) is REJECTED,
-        not wired — needs the shared SwiGLU branch summed with the routed
-        output. The pico fixture ships shared_intermediate_size=0.
+  - [X] granitemoe `shared_intermediate_size` > 0 (an always-on parallel
+        shared expert, GraniteMoeShared / granite-3.0-3b-a800m) wired: the
+        shared SwiGLU branch (shared_mlp.input_linear [2S,H] fused gate|up +
+        shared_mlp.output_linear [H,S] down, residual_multiplier folded into
+        down) is summed with the routed-MoE output before the FFN residual
+        close. tiny_granitemoeshared.* pico fixture + TestGraniteMoeShared-
+        LogitParity < 1e-4 vs float64 HF GraniteMoeSharedForCausalLM.
   - [ ] real-checkpoint slicer (make_pico_*_fixture.py reuse) to parity-check
         a sliced ibm-granite/granite-3.1-* against the random pico fixture.
 - [X] OLMoE importer (`BuildOlmoeFromSafeTensors[Ex]`, model_type `olmoe`) —
