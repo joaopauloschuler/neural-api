@@ -3,7 +3,9 @@ program DiffusionMNIST;
 DiffusionMNIST: the repository's first GENERATIVE-BY-DIFFUSION example -- a
 Denoising Diffusion Probabilistic Model (DDPM, Ho et al. 2020,
 https://arxiv.org/abs/2006.11239) that learns to synthesise 28x28 MNIST
-digits from pure Gaussian noise.
+digits from pure Gaussian noise. It now also supports CLASS-CONDITIONAL
+generation (pick the digit you want) via classifier-free guidance (CFG) and a
+DETERMINISTIC DDIM fast sampler (10-50 steps instead of the full ancestral loop).
 
 WHAT A DDPM IS (in one paragraph). A fixed FORWARD process gradually corrupts
 a clean image x_0 into pure noise x_T over T steps by repeatedly adding a
@@ -13,10 +15,30 @@ The closed form jumps directly to any timestep t:
     x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * eps,  eps~N(0,I)
 
 where alpha_t = 1 - beta_t and alpha_bar_t = prod_{s<=t} alpha_s. A neural
-network eps_theta(x_t, t) is trained to PREDICT the noise eps that was added
+network eps_theta(x_t, t, y) is trained to PREDICT the noise eps that was added
 (the simple epsilon-prediction MSE objective). Once it can denoise, we run the
 REVERSE (ancestral / DDPM) sampling loop from x_T~N(0,I) back down to x_0,
 subtracting the predicted noise step by step, to draw fresh digits.
+
+CLASS CONDITIONING + CLASSIFIER-FREE GUIDANCE (CFG). The network additionally
+takes the digit label y (0..9) so we can ask for a SPECIFIC digit. We embed y
+with a TNNetEmbedding and ADD that vector to the sinusoidal time embedding
+BEFORE the shared cond MLP, so a single FiLM cond vector carries both "how much
+noise" and "which digit". To get CFG we reserve label index 10 as a special
+NULL / unconditional token and, during training, with probability ~0.1 replace
+the real label with 10 (LABEL DROPOUT). The one network thus learns both the
+conditional branch eps(x_t,t,y) and the unconditional branch eps(x_t,t,null).
+At sampling time we run it TWICE per step and extrapolate:
+
+    eps = eps_uncond + s * (eps_cond - eps_uncond)        (guidance scale s)
+
+DDIM FAST SAMPLER. Instead of the T-step stochastic ancestral loop we use the
+DETERMINISTIC DDIM update (eta=0) over a short STRIDED subsequence of timesteps:
+
+    x0_pred    = (x_t - sqrt(1-abar_t) * eps) / sqrt(abar_t)
+    x_{t_prev} = sqrt(abar_{t_prev}) * x0_pred + sqrt(1-abar_{t_prev}) * eps
+
+which produces good digits in 10-50 steps. DDIM is combined with CFG above.
 
 TIME CONDITIONING. The integer timestep t must be fed to the network so it
 knows how much noise to expect. This example USES TNNetSinusoidalTimeEmbedding
@@ -25,10 +47,11 @@ then injects it into every U-Net block as a per-channel scale/shift via
 TNNet.AddFiLMConditioned (Feature-wise Linear Modulation / TNNetFiLM). This is
 the standard DDPM time-embedding -> FiLM recipe.
 
-THE NETWORK is a small two-input U-Net (image branch + timestep branch):
+THE NETWORK is a small three-input U-Net (image + timestep + label branch):
 
   image  (28,28,1) -- TNNetInput
-  t      (1,1,1)   -- TNNetInput  -> TNNetSinusoidalTimeEmbedding(cEmbDim)
+  t      (1,1,1)   -- TNNetInput  -> TNNetSinusoidalTimeEmbedding(cEmbDim)  --\
+  y      (1,1,1)   -- TNNetInput  -> TNNetEmbedding(11 -> cEmbDim)  ----------> Sum
                                    -> FullConnect MLP (shared cond vector)
 
   enc1: Conv(C1,28x28) -> GroupNorm -> FiLM(t) -> Conv(C1)   ........ skip A
@@ -82,6 +105,16 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
 const
   cImgSize   = 28;
   cEmbDim    = 64;          // sinusoidal time-embedding width (must be even)
+
+  // Class conditioning. Labels 0..9 are the real digits; index 10 is the
+  // special NULL / unconditional token used for label dropout and CFG.
+  cNumClasses = 11;         // 10 digits + 1 null token
+  cNullLabel  = 10;
+  cLabelDrop  = 0.1;        // prob of replacing the label with null during train
+
+  // Classifier-free guidance scale and DDIM step count used at sampling time.
+  cGuidance   = 3.0;        // s in eps_uncond + s*(eps_cond - eps_uncond)
+  cDDIMSteps  = 25;         // strided reverse steps (<< cT)
   // Channel widths per U-Net level (kept small so the smoke run is fast).
   cC1        = 16;
   cC2        = 32;
@@ -96,24 +129,26 @@ const
   cInertia   = 0.9;
 
   // Default = fast smoke. --full overrides via cmd line below.
+  // Grid width is fixed to 10 so each row r requests digit (r mod 10): a
+  // 10x10 grid then shows every class 0..9 across the rows.
   cSmokeSteps = 500;
   cSmokeBatch = 16;
-  cSmokeGrid  = 4;          // 4x4 = 16 generated digits
+  cSmokeGrid  = 10;         // 10x10 = each row a requested digit 0..9
 
   cFullSteps  = 6000;
   cFullBatch  = 32;
-  cFullGrid   = 8;          // 8x8 = 64 generated digits
+  cFullGrid   = 10;         // 10x10 class-conditional grid
 
 var
   // Precomputed schedule tables, index 1..cT (index 0 unused / = identity).
   Beta, Alpha, AlphaBar, SqrtAlphaBar, SqrtOneMinusAlphaBar: array[0..cT] of TNeuralFloat;
 
   NN: TNNet;
-  ImgIn, TimeIn, TimeEmb: TNNetLayer;
+  ImgIn, TimeIn, LabelIn, TimeEmb: TNNetLayer;
   TrainV, ValV, TestV: TNNetVolumeList;
 
   // Reusable working volumes for the training/sampling loops.
-  Img0, ImgT, EpsTrue, TimeVol: TNNetVolume;
+  Img0, ImgT, EpsTrue, TimeVol, LabelVol: TNNetVolume;
 
   Steps, BatchSz, GridN: integer;
   FullMode: boolean;
@@ -157,15 +192,22 @@ var
 
   procedure BuildNet;
   var
-    SkipA, SkipB: TNNetLayer;
+    SkipA, SkipB, LabelEmb: TNNetLayer;
   begin
     NN := TNNet.Create();
-    // Two inputs: the (noisy) image and the scalar timestep.
-    ImgIn  := NN.AddLayer(TNNetInput.Create(cImgSize, cImgSize, 1, 1));
-    TimeIn := NN.AddLayerAfter(TNNetInput.Create(1, 1, 1, 1), 0);
+    // Three inputs: the (noisy) image, the scalar timestep and the class label.
+    ImgIn   := NN.AddLayer(TNNetInput.Create(cImgSize, cImgSize, 1, 1));
+    TimeIn  := NN.AddLayerAfter(TNNetInput.Create(1, 1, 1, 1), 0);
+    LabelIn := NN.AddLayerAfter(TNNetInput.Create(1, 1, 1, 1), 0);
 
-    // Shared time-embedding branch: scalar t -> sinusoidal vector -> small MLP.
+    // Time branch: scalar t -> sinusoidal vector (shape 1 x 1 x cEmbDim).
     TimeEmb := NN.AddLayerAfter(TNNetSinusoidalTimeEmbedding.Create(cEmbDim), TimeIn);
+    // Label branch: integer y -> embedding row (shape 1 x 1 x cEmbDim). Index 10
+    // is the null/unconditional token; EncodeZero=1 so label 0 is also embedded.
+    LabelEmb := NN.AddLayerAfter(TNNetEmbedding.Create(cNumClasses, cEmbDim, 1), LabelIn);
+    // ADD the label embedding onto the time embedding, then a shared cond MLP.
+    // A single FiLM cond vector therefore carries both t and y information.
+    TimeEmb := NN.AddLayer(TNNetSum.Create([TimeEmb, LabelEmb]));
     TimeEmb := NN.AddLayerAfter(TNNetFullConnectReLU.Create(cEmbDim), TimeEmb);
     TimeEmb := NN.AddLayerAfter(TNNetFullConnectReLU.Create(cEmbDim), TimeEmb);
 
@@ -197,10 +239,11 @@ var
     NN.SetBatchUpdate(true);
   end;
 
-  // Pull a clean MNIST digit into Img0 rescaled to [-1, 1].
+  // Pull a clean MNIST digit into Img0 rescaled to [-1, 1] and return its digit
+  // label (0..9). The label lives in the volume's Tag (set by CreateMNISTVolumes).
   // The loader stores pixels as byte/64 - 2, so byte = (v+2)*64 and the
   // [-1,1] target is byte/127.5 - 1.
-  procedure LoadCleanDigit(Src: TNNetVolume);
+  function LoadCleanDigit(Src: TNNetVolume): integer;
   var
     x, y: integer;
     v, b: TNeuralFloat;
@@ -214,6 +257,7 @@ var
         if b > 255 then b := 255;
         Img0[x, y, 0] := b / 127.5 - 1.0;
       end;
+    Result := Src.Tag;
   end;
 
   // Forward-noise Img0 to timestep t: ImgT = sqrt(ab)*x0 + sqrt(1-ab)*eps,
@@ -255,9 +299,16 @@ var
     TimeIn.Output.FData[0] := t;
   end;
 
+  // Set the class-label input (0..9, or cNullLabel=10 for unconditional).
+  procedure SetLabelInput(y: integer);
+  begin
+    LabelVol.FData[0] := y;
+    LabelIn.Output.FData[0] := y;
+  end;
+
   procedure TrainLoop;
   var
-    Step, B, t, Idx: integer;
+    Step, B, t, Idx, y: integer;
     SumLoss: TNeuralFloat;
     StartTime, Elapsed: double;
   begin
@@ -271,18 +322,25 @@ var
       for B := 1 to BatchSz do
       begin
         Idx := Random(TrainV.Count);
-        LoadCleanDigit(TrainV[Idx]);
+        y := LoadCleanDigit(TrainV[Idx]);    // real digit label 0..9
+        // Label dropout: with prob cLabelDrop train the UNCONDITIONAL branch by
+        // replacing the real label with the null token. This is what lets the
+        // single network produce both eps(.,.,y) and eps(.,.,null) for CFG.
+        if Random < cLabelDrop then y := cNullLabel;
         t := 1 + Random(cT);                 // uniform timestep in 1..T
         NoiseToTimestep(t);
         SetTimestepInput(t);
-        NN.Compute([ImgT, TimeVol]);         // two-input forward
+        SetLabelInput(y);
+        NN.Compute([ImgT, TimeVol, LabelVol]); // three-input forward
         SumLoss := SumLoss + EpsMSE;
         // Train eps-prediction: target is the sampled noise EpsTrue.
         NN.Backpropagate(EpsTrue);
       end;
       // Tame the early gradient spikes a from-scratch diffusion net produces
-      // before the noise-schedule statistics settle.
-      NN.ForceMaxAbsoluteDelta(0.05);
+      // before the noise-schedule statistics settle. The extra label-embedding
+      // path makes the cold start a touch more volatile, so the clamp is a bit
+      // tighter than the unconditional example.
+      NN.ForceMaxAbsoluteDelta(0.03);
       NN.UpdateWeights();
       if (Step = 1) or (Step mod 25 = 0) or (Step = Steps) then
       begin
@@ -293,13 +351,42 @@ var
     end;
   end;
 
-  // Ancestral DDPM reverse sampling for ONE image, leaving x_0 in Dst.
+  // Classifier-free-guided noise prediction for image Xt at timestep t and
+  // class y. Runs the net TWICE -- once with the wanted label y, once with the
+  // null label -- and stores the guided eps into EpsCFG:
+  //   eps = eps_uncond + s * (eps_cond - eps_uncond).
+  // When s = 0 (or y is already the null token) this reduces to the plain
+  // unconditional prediction; s > 1 sharpens the requested class.
+  procedure PredictEpsCFG(Xt, EpsCFG: TNNetVolume; t, y: integer; s: TNeuralFloat);
+  var
+    i: integer;
+    Cond: TNNetVolume;
+  begin
+    SetTimestepInput(t);
+    // Conditional pass eps(x_t, t, y).
+    SetLabelInput(y);
+    NN.Compute([Xt, TimeVol, LabelVol]);
+    Cond := NN.GetLastLayer.Output;
+    EpsCFG.Copy(Cond);                          // EpsCFG := eps_cond
+    if (s <> 0) and (y <> cNullLabel) then
+    begin
+      // Unconditional pass eps(x_t, t, null) and extrapolate.
+      SetLabelInput(cNullLabel);
+      NN.Compute([Xt, TimeVol, LabelVol]);
+      Cond := NN.GetLastLayer.Output;           // now eps_uncond
+      for i := 0 to EpsCFG.Size - 1 do
+        EpsCFG.FData[i] := Cond.FData[i] +
+          s * (EpsCFG.FData[i] - Cond.FData[i]);
+    end;
+  end;
+
+  // Ancestral DDPM reverse sampling for ONE image of class y, leaving x_0 in
+  // Dst. Uses CFG at each step.
   // x_{t-1} = 1/sqrt(alpha_t) * (x_t - beta_t/sqrt(1-ab_t) * eps_hat)
   //           + sqrt(beta_t) * z     (z=0 at t=1)
-  procedure SampleOne(Dst: TNNetVolume);
+  procedure SampleOne(Dst: TNNetVolume; y: integer; Eps: TNNetVolume);
   var
     t, i: integer;
-    Pred: TNNetVolume;
     coef, invSqrtAlpha, sigma, z: TNeuralFloat;
   begin
     // Start from pure Gaussian noise x_T.
@@ -307,9 +394,7 @@ var
       Dst.FData[i] := RandG(0, 1);
     for t := cT downto 1 do
     begin
-      SetTimestepInput(t);
-      NN.Compute([Dst, TimeVol]);
-      Pred := NN.GetLastLayer.Output;
+      PredictEpsCFG(Dst, Eps, t, y, cGuidance);
       invSqrtAlpha := 1.0 / Sqrt(Alpha[t]);
       coef := Beta[t] / SqrtOneMinusAlphaBar[t];
       if t > 1 then sigma := Sqrt(Beta[t]) else sigma := 0;
@@ -317,30 +402,74 @@ var
       begin
         if t > 1 then z := RandG(0, 1) else z := 0;
         Dst.FData[i] := invSqrtAlpha *
-          (Dst.FData[i] - coef * Pred.FData[i]) + sigma * z;
+          (Dst.FData[i] - coef * Eps.FData[i]) + sigma * z;
       end;
     end;
   end;
 
-  // Sample GridN*GridN digits and save them as one grayscale PNG grid.
-  procedure SampleGridToPng(const FileName: string);
+  // DETERMINISTIC DDIM (eta=0) sampling for ONE image of class y, leaving x_0 in
+  // Dst, over a strided subsequence of NumSteps timesteps (NumSteps << cT). Uses
+  // CFG at each step. DDIM update with t_prev the previous timestep in the
+  // subsequence (0 at the end):
+  //   x0_pred    = (x_t - sqrt(1-abar_t)*eps) / sqrt(abar_t)
+  //   x_{t_prev} = sqrt(abar_{t_prev})*x0_pred + sqrt(1-abar_{t_prev})*eps
+  procedure SampleOneDDIM(Dst: TNNetVolume; y, NumSteps: integer; Eps: TNNetVolume);
   var
-    Grid, One: TNNetVolume;
-    r, c, x, y, gx, gy: integer;
+    k, i, t, tPrev: integer;
+    x0, abT, abPrev, sqrtAbPrev, sqrtOneAbPrev: TNeuralFloat;
+  begin
+    for i := 0 to Dst.Size - 1 do
+      Dst.FData[i] := RandG(0, 1);
+    for k := NumSteps - 1 downto 0 do
+    begin
+      // Map subsequence index k to an actual timestep in 1..cT (evenly strided).
+      t := 1 + Round(k * (cT - 1) / (NumSteps - 1));
+      if k > 0
+        then tPrev := 1 + Round((k - 1) * (cT - 1) / (NumSteps - 1))
+        else tPrev := 0;                        // 0 -> abar=1 (clean image)
+      PredictEpsCFG(Dst, Eps, t, y, cGuidance);
+      abT := AlphaBar[t];
+      abPrev := AlphaBar[tPrev];                // AlphaBar[0] = 1
+      sqrtAbPrev := Sqrt(abPrev);
+      sqrtOneAbPrev := Sqrt(1.0 - abPrev);
+      for i := 0 to Dst.Size - 1 do
+      begin
+        x0 := (Dst.FData[i] - SqrtOneMinusAlphaBar[t] * Eps.FData[i]) / Sqrt(abT);
+        Dst.FData[i] := sqrtAbPrev * x0 + sqrtOneAbPrev * Eps.FData[i];
+      end;
+    end;
+  end;
+
+  // Sample a CLASS-CONDITIONAL grid: each ROW r requests the same digit
+  // (r mod 10), each COLUMN is an independent sample, so a 10-wide grid shows
+  // every digit 0..9. UseDDIM picks the fast deterministic sampler (cDDIMSteps)
+  // over the full ancestral loop. Saved as one grayscale PNG grid.
+  procedure SampleGridToPng(const FileName: string; UseDDIM: boolean);
+  var
+    Grid, One, Eps: TNNetVolume;
+    r, c, x, y, gx, gy, digit: integer;
     v, px: TNeuralFloat;
     NumNan: integer;
   begin
     Grid := TNNetVolume.Create(GridN * cImgSize, GridN * cImgSize, 3);
     One  := TNNetVolume.Create(cImgSize, cImgSize, 1);
+    Eps  := TNNetVolume.Create(cImgSize, cImgSize, 1);
     Grid.Fill(0);
     NumNan := 0;
     try
-      WriteLn(Format('Sampling a %dx%d grid via %d-step ancestral DDPM...',
-        [GridN, GridN, cT]));
+      if UseDDIM
+        then WriteLn(Format('Sampling a %dx%d class-conditional grid via ' +
+               '%d-step DDIM + CFG (s=%.1f)...', [GridN, GridN, cDDIMSteps, cGuidance]))
+        else WriteLn(Format('Sampling a %dx%d class-conditional grid via ' +
+               '%d-step ancestral DDPM + CFG (s=%.1f)...', [GridN, GridN, cT, cGuidance]));
       for r := 0 to GridN - 1 do
+      begin
+        digit := r mod 10;                       // requested class for this row
         for c := 0 to GridN - 1 do
         begin
-          SampleOne(One);
+          if UseDDIM
+            then SampleOneDDIM(One, digit, cDDIMSteps, Eps)
+            else SampleOne(One, digit, Eps);
           for y := 0 to cImgSize - 1 do
             for x := 0 to cImgSize - 1 do
             begin
@@ -357,6 +486,7 @@ var
               Grid[gx, gy, 2] := px;
             end;
         end;
+      end;
       if SaveImageFromVolumeIntoFile(Grid, FileName)
         then WriteLn('Wrote sample grid: ', FileName)
         else WriteLn('FAILED to write: ', FileName);
@@ -366,6 +496,7 @@ var
     finally
       Grid.Free;
       One.Free;
+      Eps.Free;
     end;
   end;
 
@@ -391,7 +522,8 @@ begin
     Steps := cSmokeSteps; BatchSz := cSmokeBatch; GridN := cSmokeGrid;
     WriteLn('DiffusionMNIST [SMOKE mode -- pass --full for real training]');
   end;
-  WriteLn('DDPM epsilon-prediction (Ho et al. 2020), tiny time-conditioned U-Net.');
+  WriteLn('DDPM epsilon-prediction (Ho et al. 2020), tiny time/label-conditioned U-Net.');
+  WriteLn('Class-conditional via label embedding + label dropout; sampling uses CFG + DDIM.');
   WriteLn;
 
   if not (CheckMNISTFile('train')) or not (CheckMNISTFile('t10k')) then
@@ -413,14 +545,17 @@ begin
   Img0    := TNNetVolume.Create(cImgSize, cImgSize, 1);
   ImgT    := TNNetVolume.Create(cImgSize, cImgSize, 1);
   EpsTrue := TNNetVolume.Create(cImgSize, cImgSize, 1);
-  TimeVol := TNNetVolume.Create(1, 1, 1);
+  TimeVol  := TNNetVolume.Create(1, 1, 1);
+  LabelVol := TNNetVolume.Create(1, 1, 1);
   try
     TrainLoop;
     WriteLn;
+    // Default deliverable: a class-conditional grid via fast DDIM + CFG, each
+    // row a requested digit 0..9.
     PngName := 'diffusion_samples.png';
-    SampleGridToPng(PngName);
+    SampleGridToPng(PngName, {UseDDIM=}true);
     WriteLn;
-    WriteLn('Done. View ', PngName, ' to inspect the generated digits.');
+    WriteLn('Done. View ', PngName, ' (row r = requested digit r mod 10).');
     if not FullMode then
       WriteLn('(Smoke samples are noisy; run with --full for sharp digits.)');
   finally
@@ -428,6 +563,7 @@ begin
     ImgT.Free;
     EpsTrue.Free;
     TimeVol.Free;
+    LabelVol.Free;
     NN.Free;
     TrainV.Free;
     ValV.Free;

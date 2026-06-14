@@ -371,7 +371,7 @@ rather than acted on.
       FOLLOW-UPS: (a) realesrgan .pth pickle load (TNNetTorchBinReader path);
       (b) real x4 upscale of a tiny PNG end-to-end example; (c) scale=2 / other
       scales (currently only scale=4 = two upsample stages wired).
-- [ ] Class-conditional DiffusionMNIST follow-up: classifier-free guidance (CFG)
+- [X] Class-conditional DiffusionMNIST follow-up: classifier-free guidance (CFG)
       + DDIM deterministic fast sampler. Extends the landed unconditional DDPM
       example — (a) condition the U-Net on a digit label embedding added to the
       sinusoidal time embedding, trained with label-dropout (~10%) for the
