@@ -345,9 +345,11 @@ rather than acted on.
       tap via out PoolFeatureIdx, and a pico parity test <1e-4 vs a numpy float64
       oracle on the InceptionA-shaped sub-net. NOT yet a usable real-checkpoint
       importer. REMAINING to import a real torchvision inception_v3:
-  - [ ] Asymmetric (1xN / Nx1) factorized convolutions — BLOCKER for InceptionC
-        (the 1x7/7x1 branches); CAI TNNetConvolution is square-kernel only. See the
-        dedicated "Asymmetric-kernel convolution" task under Layer follow-ups.
+  - [X] Asymmetric (1xN / Nx1) factorized convolutions — was the BLOCKER for
+        InceptionC (the 1x7/7x1 branches). UNBLOCKED: TNNetConvolutionRectangular
+        / TNNetConvolutionRectangularReLU now take independent FeatureSizeX /
+        FeatureSizeY (see the "Asymmetric-kernel convolution" task under Layer
+        follow-ups). The InceptionC 1x7 + 7x1 branches can now be built directly.
   - [ ] Strided grid-reduction modules InceptionB / InceptionD (parallel
         stride-2 conv + pool branches), the full stem (Conv2d_1a..4a + maxpools),
         InceptionE, and the torchvision avg-pool branch (the pico used a
@@ -843,15 +845,23 @@ rather than acted on.
 
 ## Layer follow-ups that fix real limitations
 
-- [ ] Asymmetric-kernel convolution (1xN / Nx1 factorized convs) — CAI
-      TNNetConvolution is square-kernel only (one FeatureSize controls both axes),
-      which blocks the spatially-factorized convs used across modern CNNs:
+- [X] Asymmetric-kernel convolution (1xN / Nx1 factorized convs) — CAI
+      TNNetConvolution was square-kernel only (one FeatureSize controls both axes),
+      which blocked the spatially-factorized convs used across modern CNNs:
       Inception-v3's InceptionC 1x7/7x1 branches (the BLOCKER for finishing the
       partial Inception-v3 importer), the SegFormer/Mix-FFN depthwise variants, and
-      cheap large-receptive-field stems. Add a rectangular-kernel conv (separate
-      FeatureSizeX / FeatureSizeY, AVX-vectorized along the contiguous channel axis
-      like the square conv) with full input+weight numerical-gradient coverage in
-      TestNeuralNumerical.pas. Unblocks the Inception-v3 InceptionC branches.
+      cheap large-receptive-field stems. DONE: added TNNetConvolutionRectangular
+      (Linear) and TNNetConvolutionRectangularReLU leaf classes taking independent
+      pFeatureSizeX / pFeatureSizeY. The shared TNNetConvolution forward im2col and
+      backward gradient loops already indexed FFeatureSizeX/FFeatureSizeY
+      separately, so the AVX dot-product path (over the flattened
+      FeatureSizeX*FeatureSizeY*InDepth channel vector) is preserved unchanged for
+      the square case. Serialization stores FeatureSizeX in FStruct[1] and
+      FeatureSizeY in the free FStruct[5] slot, so X<>Y kernels round-trip via both
+      LoadFromString dispatch tables. Coverage in TestNeuralNumerical.pas: forward
+      shape check, 1x3 and 3x1 input+weight numerical-gradient checks (tol 0.01),
+      and an X<>Y (1x7) save/load round-trip. Unblocks the Inception-v3 InceptionC
+      branches.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)

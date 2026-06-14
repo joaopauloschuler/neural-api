@@ -10,6 +10,9 @@ uses
 
 type
   TTestNeuralNumerical = class(TTestCase)
+  private
+    // Shared input+weight finite-difference check for an asymmetric kernel.
+    procedure RectangularConvGradientCheckXY(pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
   published
     // Convolution numerical tests with known weights
     procedure TestConvolutionNumericalValues;
@@ -136,6 +139,10 @@ type
     procedure TestWeightStandardizationConvForward;
     procedure TestWeightStandardizationConvGradientCheck;
     procedure TestWeightStandardizationConvSerializationRoundTrip;
+    procedure TestRectangularConvForwardShape;
+    procedure TestRectangularConv1x3GradientCheck;
+    procedure TestRectangularConv3x1GradientCheck;
+    procedure TestRectangularConvSerializationRoundTrip;
     procedure TestWeightNormLinearForward;
     procedure TestWeightNormLinearGradientCheck;
     procedure TestWeightNormLinearSerializationRoundTrip;
@@ -47474,6 +47481,205 @@ begin
       AssertEquals('WeightStandardizationConv SaveToString round-trip', Saved, Saved2);
       AssertTrue('WeightStandardizationConv class token present in serialized string',
         Pos('TNNetWeightStandardizationConv', Saved) > 0);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRectangularConvForwardShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv1x3, Conv3x1: TNNetConvolutionRectangular;
+begin
+  // A 1x3 (width=3,height=1) kernel over a 5x4 input (no padding, stride 1)
+  // must shrink only the X axis: 5-3+1=3 wide, 4 tall. A 3x1 kernel must shrink
+  // only the Y axis. This pins the asymmetric output geometry.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 4, 2));
+    // pFeatureSizeX=3, pFeatureSizeY=1 -> 1x3 horizontal kernel.
+    Conv1x3 := TNNetConvolutionRectangular.Create(6, 3, 1, 0, 1);
+    NN.AddLayer(Conv1x3);
+    AssertEquals('1x3 conv output SizeX', 3, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('1x3 conv output SizeY', 4, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('1x3 conv output Depth', 6, NN.GetLastLayer.Output.Depth);
+    AssertEquals('1x3 conv weights/filter = X*Y*InDepth', 3 * 1 * 2,
+      Conv1x3.Neurons[0].Weights.Size);
+
+    // pFeatureSizeX=1, pFeatureSizeY=3 -> 3x1 vertical kernel on the 3x4x6 map.
+    Conv3x1 := TNNetConvolutionRectangular.Create(5, 1, 3, 0, 1);
+    NN.AddLayer(Conv3x1);
+    AssertEquals('3x1 conv output SizeX', 3, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('3x1 conv output SizeY', 2, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('3x1 conv output Depth', 5, NN.GetLastLayer.Output.Depth);
+    AssertEquals('3x1 conv weights/filter = X*Y*InDepth', 1 * 3 * 6,
+      Conv3x1.Neurons[0].Weights.Size);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.RectangularConvGradientCheckXY(
+  pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  Conv: TNNetConvolutionRectangular;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, o: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  epsilon := 0.0001;
+  NN := TNNet.Create();
+  // 4x4x2 input, asymmetric kernel, no padding, stride 1.
+  Input := TNNetVolume.Create(4, 4, 2);
+  InputPlus := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2, 1)); // pError=1 resizes error volumes
+    // Linear activation rectangular conv so the gradient is exact (no
+    // activation kink) for the finite-difference comparison.
+    Conv := TNNetConvolutionRectangular.Create(3, pFeatureSizeX, pFeatureSizeY, 0, 1);
+    NN.AddLayer(Conv);
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    // Small inputs/targets keep loss and gradients O(1) for single-precision FD.
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := (Sin(i * 0.41) * 0.5 + 0.1) * 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.1;
+    for o := 0 to Conv.Neurons.Count - 1 do
+      for i := 0 to Conv.Neurons[o].Weights.Size - 1 do
+        Conv.Neurons[o].Weights.Raw[i] := Sin(o * 0.7 + i * 0.3) * 0.2;
+    Conv.FlushWeightCache();
+
+    // ---- Gradient w.r.t. the input ----
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue(ALabel + ' input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+
+    // ---- Gradient w.r.t. the RAW weights ----
+    for o := 0 to Conv.Neurons.Count - 1 do
+      for i := 0 to Conv.Neurons[o].Weights.Size - 1 do
+      begin
+        Conv.Neurons[o].Weights.Raw[i] := Conv.Neurons[o].Weights.Raw[i] + epsilon;
+        Conv.FlushWeightCache();
+        lossPlus := ComputeLoss(Input);
+        Conv.Neurons[o].Weights.Raw[i] := Conv.Neurons[o].Weights.Raw[i] - 2 * epsilon;
+        Conv.FlushWeightCache();
+        lossMinus := ComputeLoss(Input);
+        Conv.Neurons[o].Weights.Raw[i] := Conv.Neurons[o].Weights.Raw[i] + epsilon;
+        Conv.FlushWeightCache();
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        Conv.Neurons[o].ClearDelta;
+        NN.Backpropagate(Desired);
+        // Delta := Delta - LearningRate*gradient; LR=1 -> gradient = -Delta.
+        analyticalGrad := -Conv.Neurons[o].Delta.Raw[i];
+
+        AssertTrue(ALabel + ' weight gradient check (' + IntToStr(o) + ',' +
+          IntToStr(i) + ') num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRectangularConv1x3GradientCheck;
+begin
+  // Width-3, height-1 horizontal kernel.
+  RectangularConvGradientCheckXY(3, 1, 'RectangularConv 1x3');
+end;
+
+procedure TTestNeuralNumerical.TestRectangularConv3x1GradientCheck;
+begin
+  // Width-1, height-3 vertical kernel.
+  RectangularConvGradientCheckXY(1, 3, 'RectangularConv 3x1');
+end;
+
+procedure TTestNeuralNumerical.TestRectangularConvSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Conv: TNNetConvolutionRectangularReLU;
+  Saved, Saved2: string;
+  o, i: integer;
+begin
+  // Round-trip with X <> Y (1x7 kernel): SaveToString -> LoadFromString ->
+  // SaveToString must be string-equal, and the reloaded layer must keep the
+  // asymmetric extents (FeatureSizeX=7, FeatureSizeY=1).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(9, 9, 3, 1));
+    Conv := TNNetConvolutionRectangularReLU.Create({pNumFeatures=}4,
+      {pFeatureSizeX=}7, {pFeatureSizeY=}1, {pInputPadding=}0, {pStride=}1);
+    NN.AddLayer(Conv);
+    AssertEquals('Rectangular conv FeatureSizeX', 7, Conv.FeatureSizeX);
+    AssertEquals('Rectangular conv FeatureSizeY', 1, Conv.FeatureSizeY);
+
+    for o := 0 to Conv.Neurons.Count - 1 do
+      for i := 0 to Conv.Neurons[o].Weights.Size - 1 do
+        Conv.Neurons[o].Weights.Raw[i] := 0.11 * (o + 1) - 0.05 * i;
+    Conv.FlushWeightCache();
+
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Rectangular conv SaveToString round-trip', Saved, Saved2);
+      AssertTrue('Rectangular conv class token present in serialized string',
+        Pos('TNNetConvolutionRectangularReLU', Saved) > 0);
+      AssertEquals('Reloaded FeatureSizeX',
+        7, TNNetConvolutionRectangular(NN2.Layers[1]).FeatureSizeX);
+      AssertEquals('Reloaded FeatureSizeY',
+        1, TNNetConvolutionRectangular(NN2.Layers[1]).FeatureSizeY);
     finally
       NN2.Free;
     end;

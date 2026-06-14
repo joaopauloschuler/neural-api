@@ -9462,8 +9462,15 @@ type
       procedure RefreshCalculatePrevLayerError();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure RefreshPrevSizeXDepthBytes();
+    protected
+      // Sets a rectangular (asymmetric) kernel. Must be called by a leaf
+      // constructor BEFORE SetPrevLayer is ever invoked, otherwise the neuron
+      // weight count and output geometry are already locked to the square size.
+      procedure SetFeatureSizeXY(pFeatureSizeX, pFeatureSizeY: integer);
     public
       constructor Create(pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload;
+      property FeatureSizeX: integer read FFeatureSizeX;
+      property FeatureSizeY: integer read FFeatureSizeY;
       destructor Destroy(); override;
       procedure InitDefault(); override;
   end;
@@ -9636,6 +9643,34 @@ type
   TNNetConvolutionLinear = class(TNNetConvolution)
   public
     constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
+  end;
+
+  /// RECTANGULAR (asymmetric) kernel convolution -- the spatially-factorized
+  /// sibling of the square TNNetConvolution. The square conv exposes a single
+  /// FeatureSize that drives BOTH spatial axes; this layer takes independent
+  /// pFeatureSizeX (kernel width) and pFeatureSizeY (kernel height), enabling
+  /// the 1xN / Nx1 factorized convolutions used across modern CNNs (e.g.
+  /// Inception-v3's InceptionC 1x7 + 7x1 branches, SegFormer/Mix-FFN depthwise
+  /// variants, and cheap large-receptive-field stems). The forward im2col
+  /// (PrepareInputForConvolutionFast) and backward gradient loops in the shared
+  /// TNNetConvolution base already index the X and Y kernel extents separately
+  /// via FFeatureSizeX/FFeatureSizeY, so this class only has to override the
+  /// square constraint at construction time and restore both extents on
+  /// load (FStruct[1]=FeatureSizeX, FStruct[5]=FeatureSizeY). The AVX
+  /// dot-product path operates on the flattened (FeatureSizeX*FeatureSizeY*
+  /// InDepth) channel vector exactly as the square case, so vectorization is
+  /// preserved. This variant has Linear (Identity) activation.
+  // Coded by Claude (AI).
+  TNNetConvolutionRectangular = class(TNNetConvolution)
+  public
+    constructor Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
+  end;
+
+  /// Rectangular (asymmetric) kernel convolution with ReLU activation.
+  // Coded by Claude (AI).
+  TNNetConvolutionRectangularReLU = class(TNNetConvolutionRectangular)
+  public
+    constructor Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0); override;
   end;
 
   /// QUATERNION CONVOLUTION layer -- the spatial sibling of the dense
@@ -50358,6 +50393,35 @@ begin
   FActivationFnDerivative := @IdentityDerivative;
 end;
 
+{ TNNetConvolutionRectangular }
+constructor TNNetConvolutionRectangular.Create(pNumFeatures, pFeatureSizeX,
+  pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+begin
+  // Build through the square base using the LARGER spatial extent so that the
+  // base never mistakes a 1xN / Nx1 kernel for a pointwise (1x1) convolution
+  // (which would skip the im2col step). Then override both extents with the
+  // true asymmetric values before the layer is wired to a previous layer.
+  inherited Create(pNumFeatures, Max(pFeatureSizeX, pFeatureSizeY), pInputPadding, pStride, pSuppressBias);
+  SetFeatureSizeXY(pFeatureSizeX, pFeatureSizeY);
+  FPointwise := (FFeatureSizeX = 1) and (FFeatureSizeY = 1) and
+    (FPadding = 0) and (FStride = 1);
+  // Serialize the X extent in the usual feature-size slot and the Y extent in
+  // a free slot so a saved rectangular conv round-trips with X <> Y.
+  FStruct[1] := FFeatureSizeX;
+  FStruct[5] := FFeatureSizeY;
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
+{ TNNetConvolutionRectangularReLU }
+constructor TNNetConvolutionRectangularReLU.Create(pNumFeatures, pFeatureSizeX,
+  pFeatureSizeY, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
+begin
+  inherited Create(pNumFeatures, pFeatureSizeX, pFeatureSizeY, pInputPadding, pStride, pSuppressBias);
+  FActivationFn := @RectifiedLinearUnit;
+  FActivationFnDerivative := @RectifiedLinearUnitDerivative;
+end;
+
 { THistoricalNets }
 procedure THistoricalNets.AddLeCunLeNet5(IncludeInput: boolean);
 begin
@@ -70479,6 +70543,14 @@ begin
   FPrevLayerErrorPadded := TNNetVolume.Create;
 end;
 
+procedure TNNetConvolutionAbstract.SetFeatureSizeXY(pFeatureSizeX, pFeatureSizeY: integer);
+begin
+  FFeatureSizeX := Max(pFeatureSizeX, 1);
+  FFeatureSizeY := Max(pFeatureSizeY, 1);
+  FFeatureSizeXMinus1 := FFeatureSizeX - 1;
+  FFeatureSizeYMinus1 := FFeatureSizeY - 1;
+end;
+
 destructor TNNetConvolutionAbstract.Destroy();
 begin
   if FPadding > 0 then
@@ -88273,6 +88345,8 @@ begin
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionReLU' :      Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetConvolutionLinear' :    Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]);
+      'TNNetConvolutionRectangular' :     Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
+      'TNNetConvolutionRectangularReLU' : Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]);
       'TNNetComplexConv' :          Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetQuaternionConv' :       Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetOctonionConv' :         Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -88671,6 +88745,8 @@ begin
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionReLU' then Result := TNNetConvolutionReLU.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetConvolutionLinear' then Result := TNNetConvolutionLinear.Create(St[0], St[1], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolutionRectangular' then Result := TNNetConvolutionRectangular.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
+      if S[0] = 'TNNetConvolutionRectangularReLU' then Result := TNNetConvolutionRectangularReLU.Create(St[0], St[1], St[5], St[2], St[3], St[4]) else
       if S[0] = 'TNNetComplexConv' then Result := TNNetComplexConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetQuaternionConv' then Result := TNNetQuaternionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetOctonionConv' then Result := TNNetOctonionConv.Create(St[0], St[1], St[2], St[3], St[4]) else
