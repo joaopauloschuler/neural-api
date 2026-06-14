@@ -418,6 +418,7 @@ type
     procedure TestSelectiveSSMDStateInputGradientCheck;
     procedure TestSelectiveSSMDStateWeightGradientCheck;
     procedure TestSelectiveSSMDStateSerializationRoundTrip;
+    procedure TestSelectiveSSMIncrementalDecodeEquivalence;
     procedure TestMamba2InputGradientCheck;
     procedure TestMamba2WeightGradientCheck;
     procedure TestMamba2SerializationRoundTrip;
@@ -31522,6 +31523,176 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetSelectiveSSM.Create(4), 'SelectiveSSM-DState4', 4, 1, 3, 1e-5);
+end;
+
+// Headline correctness for the O(1)-per-step incremental decode path: feeding a
+// sequence token-by-token through ComputeIncremental() (the carried
+// [d_inner x d_state] hidden state h resuming across calls) must reproduce the
+// full causal-scan Compute() output BIT-CLOSE. This is the exact-vs-fast
+// equivalence assert mirroring TestWKVIncrementalDecodeEquivalence. Both the
+// DState=1 legacy and DState>1 (real Mamba) recurrences are checked, plus a
+// CaptureState/RestoreState session fork.
+procedure TTestNeuralNumerical.TestSelectiveSSMIncrementalDecodeEquivalence;
+
+  // Run the full-scan vs token-by-token equivalence for one DState setting and
+  // return the max abs output error.
+  function ScanError(NS: integer): TNeuralFloat;
+  var
+    NNFull, NNInc: TNNet;
+    InFull, InInc: TNNetInput;
+    LFull, LInc: TNNetSelectiveSSM;
+    SeqLen, Depth, t, d, nn: integer;
+    e: TNeuralFloat;
+  begin
+    SeqLen := 12;
+    Depth := 4;
+    Result := 0;
+    NNFull := TNNet.Create();
+    NNInc := TNNet.Create();
+    try
+      InFull := TNNetInput.Create(SeqLen, 1, Depth, 1);
+      NNFull.AddLayer(InFull);
+      LFull := TNNetSelectiveSSM.Create(NS);
+      NNFull.AddLayer(LFull);
+
+      // A second net with a SINGLE-token input (the decode-step shape) sharing
+      // the same weights so the two paths are weight-identical.
+      InInc := TNNetInput.Create(1, 1, Depth, 1);
+      NNInc.AddLayer(InInc);
+      LInc := TNNetSelectiveSSM.Create(NS);
+      NNInc.AddLayer(LInc);
+
+      if NS = 1 then SeedSelectiveSSM(LFull, Depth)
+      else SeedSelectiveSSMDState(LFull, Depth, NS);
+      for nn := 0 to LFull.Neurons.Count - 1 do
+        LInc.Neurons[nn].Weights.Copy(LFull.Neurons[nn].Weights);
+
+      // Random input sequence; the same rows feed both paths.
+      for t := 0 to SeqLen - 1 do
+        for d := 0 to Depth - 1 do
+          InFull.Output[t, 0, d] := 1.5 * (Random - 0.5);
+
+      // Full-sequence parallel/prefill scan in one Compute().
+      NNFull.Compute(InFull.Output);
+
+      // Incremental path: one token at a time, state carried across calls.
+      LInc.BeginIncrementalDecode();
+      for t := 0 to SeqLen - 1 do
+      begin
+        for d := 0 to Depth - 1 do
+          InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+        NNInc.Compute(InInc.Output);
+        for d := 0 to Depth - 1 do
+        begin
+          e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+          if e > Result then Result := e;
+        end;
+      end;
+      LInc.EndIncrementalDecode();
+    finally
+      NNInc.Free;
+      NNFull.Free;
+    end;
+  end;
+
+var
+  NN: TNNet;
+  In1: TNNetInput;
+  L: TNNetSelectiveSSM;
+  SeqLen, Depth, NS, t, d: integer;
+  e, maxErr: TNeuralFloat;
+  Seq, RefOut: TNNetVolume;
+  Snap: TNNetVolume;
+  Steps: integer;
+begin
+  RandSeed := 424242;
+  // (A) DState=1 legacy recurrence.
+  e := ScanError(1);
+  WriteLn('SelectiveSSM (DState=1) incremental-decode vs full-scan max abs error: ',
+    e:0:10);
+  AssertTrue('SelectiveSSM DState=1 incremental decode matches full scan (< 1e-5)',
+    e < 1e-5);
+  // (B) DState>1 real-Mamba per-(channel,state) recurrence.
+  e := ScanError(4);
+  WriteLn('SelectiveSSM (DState=4) incremental-decode vs full-scan max abs error: ',
+    e:0:10);
+  AssertTrue('SelectiveSSM DState=4 incremental decode matches full scan (< 1e-5)',
+    e < 1e-5);
+
+  // (C) CaptureState/RestoreState fork: snapshot the carried h mid-stream,
+  // advance to the end, restore the snapshot and re-advance the tail; the
+  // re-run outputs must match the recorded reference (state forking is exact).
+  SeqLen := 10;
+  Depth := 4;
+  NS := 4;
+  NN := TNNet.Create();
+  Seq := TNNetVolume.Create();
+  RefOut := TNNetVolume.Create();
+  Snap := TNNetVolume.Create();
+  try
+    In1 := TNNetInput.Create(1, 1, Depth, 1);
+    NN.AddLayer(In1);
+    L := TNNetSelectiveSSM.Create(NS);
+    NN.AddLayer(L);
+    SeedSelectiveSSMDState(L, Depth, NS);
+    Seq.ReSize(SeqLen, 1, Depth);
+    RefOut.ReSize(SeqLen, 1, Depth);
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Seq.Raw[(t * Depth) + d] := 1.5 * (Random - 0.5);
+
+    L.BeginIncrementalDecode();
+    // Decode the whole stream once, recording the reference tail outputs.
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to Depth - 1 do
+        In1.Output[0, 0, d] := Seq.Raw[(t * Depth) + d];
+      NN.Compute(In1.Output);
+      for d := 0 to Depth - 1 do
+        RefOut.Raw[(t * Depth) + d] := L.Output[0, 0, d];
+    end;
+
+    // Re-run the prefix, snapshot at t=5, advance to the end (perturbing the
+    // live state), then restore the snapshot and re-decode the tail.
+    L.ResetState();
+    for t := 0 to 4 do
+    begin
+      for d := 0 to Depth - 1 do
+        In1.Output[0, 0, d] := Seq.Raw[(t * Depth) + d];
+      NN.Compute(In1.Output);
+    end;
+    L.CaptureState(Snap, Steps);
+    AssertEquals('SelectiveSSM CaptureState step count', 5, Steps);
+    // Burn the live state by running the tail once.
+    for t := 5 to SeqLen - 1 do
+    begin
+      for d := 0 to Depth - 1 do
+        In1.Output[0, 0, d] := Seq.Raw[(t * Depth) + d];
+      NN.Compute(In1.Output);
+    end;
+    // Restore and re-decode the tail; outputs must match the reference.
+    L.RestoreState(Snap, Steps);
+    maxErr := 0;
+    for t := 5 to SeqLen - 1 do
+    begin
+      for d := 0 to Depth - 1 do
+        In1.Output[0, 0, d] := Seq.Raw[(t * Depth) + d];
+      NN.Compute(In1.Output);
+      for d := 0 to Depth - 1 do
+      begin
+        e := Abs(L.Output[0, 0, d] - RefOut.Raw[(t * Depth) + d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    L.EndIncrementalDecode();
+    AssertTrue('SelectiveSSM restored-state tail matches reference (< 1e-5)',
+      maxErr < 1e-5);
+  finally
+    Snap.Free;
+    RefOut.Free;
+    Seq.Free;
+    NN.Free;
+  end;
 end;
 
 // --- TNNetMamba2 (Mamba-2 / SSD multi-head state-space mixer) ---------------

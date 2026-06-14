@@ -7124,10 +7124,19 @@ type
       FGbT, FGcT: TNNetVolume; // per-timestep dL/db_t, dL/dc_t (DState>1 only)
       FGradWd, FGradWB, FGradWC: TNNetVolume; // projection grad accumulators
       FGradBd, FGradA, FGradE: TNNetVolume;   // per-channel(-state) grad accums
+      // --- incremental-decode state (inference only, not serialized) ---
+      FDecodeEnabled: boolean;
+      FDecodeSteps: integer;  // tokens consumed since Begin/ResetState
+      FDecH: TNNetVolume;     // persisted running state h, Depth*N-long
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-      procedure ComputeMultiState();
-      procedure ComputeJambaInner();
+      // pResetState=true zeroes the running state h before the scan (the normal
+      // full-sequence forward); pResetState=false resumes h from FH (incremental
+      // decode). The arithmetic per token is otherwise identical.
+      procedure ComputeLegacy(pResetState: boolean = true);
+      procedure ComputeMultiState(pResetState: boolean = true);
+      procedure ComputeJambaInner(pResetState: boolean = true);
       procedure BackpropagateMultiState();
+      procedure ComputeIncremental();
     public
       constructor Create(pDState: integer = 1); reintroduce; overload;
       // Jamba hybrid mixer: DState states, an unfolded dt path of rank pDtRank
@@ -7138,6 +7147,27 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      // Enable the O(1)-per-step incremental-decode path. The carried SSM state
+      // is the fixed [d_inner x d_state] hidden matrix h (Depth*N floats),
+      // INDEPENDENT of position, so there is no MaxContext budget (contrast the
+      // attention KV cache). The sequence starts fresh (h = 0). Mirrors
+      // TNNetWKV / TNNetDiagonalSSM / TNNetScaledDotProductAttention
+      // Begin/End/Reset so a decoder can drive every recurrent layer uniformly.
+      procedure BeginIncrementalDecode();
+      // Disable the incremental path; return to the normal full-sequence forward.
+      procedure EndIncrementalDecode();
+      // Start a fresh sequence (h = 0).
+      procedure ResetState();
+      // Alias for ResetState() to match the SDPA cache vocabulary.
+      procedure ResetCache();
+      // Session snapshot / fork support (mirrors TNNetWKV / TNNetDiagonalSSM):
+      // CaptureState copies the persisted h matrix and step count out;
+      // RestoreState copies them back so a continuation resumes from the
+      // snapshot. Dst is sized (1,1,Depth*N). A deep copy, so one snapshot forks
+      // many sessions.
+      procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
+      procedure RestoreState(Src: TNNetVolume; Steps: integer);
+      property DecodeEnabled: boolean read FDecodeEnabled;
   end;
 
   /// TNNetMamba2: the Mamba-2 / State-Space Duality (SSD) sequence mixer
@@ -44101,6 +44131,9 @@ begin
   FGradBd := TNNetVolume.Create();
   FGradA := TNNetVolume.Create();
   FGradE := TNNetVolume.Create();
+  FDecH := TNNetVolume.Create();
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
   // Depth-dependent weight buffers are (re)allocated in SetPrevLayer.
   AddMissingNeurons(6);
 end;
@@ -44120,6 +44153,7 @@ end;
 
 destructor TNNetSelectiveSSM.Destroy();
 begin
+  FDecH.Free;
   FGcT.Free;
   FGbT.Free;
   FGradE.Free;
@@ -44199,6 +44233,7 @@ begin
   FCt.ReSize(FOutput.SizeX, 1, BCRows);
   FAt.ReSize(FOutput.SizeX, 1, Depth * NS);
   FH.ReSize(1, 1, Depth * NS);
+  FDecH.ReSize(1, 1, Depth * NS);
   FGh.ReSize(1, 1, Depth * NS);
   FExpA.ReSize(1, 1, Depth * NS);
   FGbT.ReSize(1, 1, BCRows);
@@ -44213,14 +44248,12 @@ begin
 end;
 
 procedure TNNetSelectiveSSM.Compute();
-var
-  StartTime: double;
-  Wd, WB, WC, Bd, Ar, Ee, Prev: TNNetVolume;
-  SeqLen, Depth, t, d, j: integer;
-  pre, sp, xj, acc, hprev, bbar: TNeuralFloat;
-  XtPtr, OutPtr: TNeuralFloatArrPtr;
-  WdRow, WBRow, WCRow: TNeuralFloatArrPtr;
 begin
+  if FDecodeEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
   if FJambaInner = 1 then
   begin
     ComputeJambaInner();
@@ -44231,6 +44264,20 @@ begin
     ComputeMultiState();
     exit;
   end;
+  ComputeLegacy();
+end;
+
+// DState=1 (legacy per-channel-scalar) forward. pResetState=false resumes the
+// running state h from FH for incremental decode (see ComputeIncremental).
+procedure TNNetSelectiveSSM.ComputeLegacy(pResetState: boolean = true);
+var
+  StartTime: double;
+  Wd, WB, WC, Bd, Ar, Ee, Prev: TNNetVolume;
+  SeqLen, Depth, t, d, j: integer;
+  pre, sp, xj, acc, hprev, bbar: TNeuralFloat;
+  XtPtr, OutPtr: TNeuralFloatArrPtr;
+  WdRow, WBRow, WCRow: TNeuralFloatArrPtr;
+begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   Wd := FNeurons[0].FWeights;
@@ -44245,7 +44292,7 @@ begin
   // overflow if A_raw drifts large during training.
   for d := 0 to Depth - 1 do
     FExpA.FData[d] := Exp(Min(Ar.FData[d], 10));
-  FH.Fill(0);
+  if pResetState then FH.Fill(0);
   for t := 0 to SeqLen - 1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0, 0);
@@ -44292,7 +44339,7 @@ end;
 
 // DState=N>1 forward (HF MambaMixer semantics): B_t/C_t in R^N shared across
 // channels, per-(channel,state) decay. See the class comment for the formulas.
-procedure TNNetSelectiveSSM.ComputeMultiState();
+procedure TNNetSelectiveSSM.ComputeMultiState(pResetState: boolean = true);
 var
   StartTime: double;
   Wd, WB, WC, Bd, Ar, Ee, Prev: TNNetVolume;
@@ -44314,7 +44361,7 @@ begin
   // Precompute exp(A_raw[d,s]), clamped against overflow during training.
   for j := 0 to Ar.Size - 1 do
     FExpA.FData[j] := Exp(Min(Ar.FData[j], 10));
-  FH.Fill(0);
+  if pResetState then FH.Fill(0);
   for t := 0 to SeqLen - 1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0, 0);
@@ -44363,7 +44410,7 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
-procedure TNNetSelectiveSSM.ComputeJambaInner();
+procedure TNNetSelectiveSSM.ComputeJambaInner(pResetState: boolean = true);
 // HF JambaMambaMixer slow_forward (the recurrence part). The conv1d + SiLU
 // gating live in surrounding layers (the importer wires them); this layer
 // takes the conv'd hidden_states x_conv (Depth-long per timestep) and runs:
@@ -44410,7 +44457,7 @@ begin
   if eps <= 0 then eps := 1e-6;
   for s := 0 to Ar.Size - 1 do
     FExpA.FData[s] := Exp(Min(Ar.FData[s], 10));
-  FH.Fill(0);
+  if pResetState then FH.Fill(0);
   for t := 0 to SeqLen - 1 do
   begin
     XtPtr := Prev.GetRawPtr(t, 0, 0);
@@ -44473,6 +44520,71 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Inference-only stateful forward. The per-token recurrence is ALGEBRAICALLY
+// IDENTICAL to one step of the normal full-sequence scan: the SSM carries the
+// fixed [d_inner x d_state] hidden matrix h (Depth*N floats). Here h RESUMES
+// from the PERSISTED FDecH (carried across calls) instead of restarting at 0,
+// the BPTT caches (FState/FAt/FDelta) hold only this call's tokens, and the
+// loop is O(1) in past context (it sweeps just the SeqLen supplied this call -
+// one token for a decode step, many for a prompt prefill). Driving the whole
+// sequence token-by-token through this path reproduces the full-scan output
+// bit-for-bit. Dispatches by mode exactly as Compute() does, but with the
+// state-reset suppressed so each call continues the recurrence.
+procedure TNNetSelectiveSSM.ComputeIncremental();
+begin
+  // Resume the running state h from the persisted snapshot, then run one of the
+  // shared scans with pResetState=false (h is NOT re-zeroed) and persist the
+  // advanced h back. The arithmetic per token is identical to Compute()'s.
+  FH.Copy(FDecH);
+  if FJambaInner = 1 then
+    ComputeJambaInner(false)
+  else if FDState > 1 then
+    ComputeMultiState(false)
+  else
+    ComputeLegacy(false);
+  FDecH.Copy(FH);
+  Inc(FDecodeSteps, FOutput.SizeX);
+end;
+
+procedure TNNetSelectiveSSM.BeginIncrementalDecode();
+begin
+  // The carried state is one Depth*N matrix; no MaxContext budget is needed
+  // (contrast the attention KV cache). FDecH is already sized by SetPrevLayer;
+  // ReSize is a safety net for layers wired manually.
+  FDecH.ReSize(FH);
+  ResetState();
+  FDecodeEnabled := true;
+end;
+
+procedure TNNetSelectiveSSM.EndIncrementalDecode();
+begin
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetSelectiveSSM.ResetState();
+begin
+  FDecH.Fill(0);            // h_{-1} = 0
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetSelectiveSSM.ResetCache();
+begin
+  ResetState();
+end;
+
+procedure TNNetSelectiveSSM.CaptureState(Dst: TNNetVolume; out Steps: integer);
+begin
+  Dst.Copy(FDecH);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetSelectiveSSM.RestoreState(Src: TNNetVolume; Steps: integer);
+begin
+  FDecH.Copy(Src);
+  FDecodeSteps := Steps;
 end;
 
 procedure TNNetSelectiveSSM.Backpropagate();
