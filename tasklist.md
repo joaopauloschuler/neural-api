@@ -433,11 +433,13 @@ rather than acted on.
       their importers; SaveBart/Pegasus/MBartToSafeTensors share one
       SaveBartFamilyToSafeTensors worker, round-trip tests in
       TestNeuralPretrained.pas):
-  - [ ] M2M100/NLLB safetensors exporter (SaveM2M100ToSafeTensors) — the last
-        open encoder-decoder exporter; ride the same SaveBartFamilyToSafeTensors
-        worker (M2M100 = pre-norm + sinusoidal positions + the M2M100 tensor
-        names), inverting BuildM2M100FromSafeTensors. Round-trip bit-exact test
-        like the BART/mBART/Pegasus trio.
+  - [X] M2M100/NLLB safetensors exporter (SaveM2M100ToSafeTensors) — the last
+        open encoder-decoder exporter; rides the same SaveBartFamilyToSafeTensors
+        worker via the Pegasus parameter set (no layernorm_embedding, final
+        per-stack layer_norm, PosOffset<0 so sinusoidal positions are
+        regenerated not serialized), inverting BuildM2M100FromSafeTensors.
+        Round-trip bit-exact test TestM2M100SafeTensorsRoundTrip like the
+        BART/mBART/Pegasus trio.
 - [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
       (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
       llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still

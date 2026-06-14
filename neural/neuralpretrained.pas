@@ -3125,6 +3125,18 @@ procedure BuildM2M100FromSafeTensors(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
+// Exports an M2M100/NLLB ENCODER+DECODER pair (built by
+// BuildM2M100FromSafeTensors) back to a single HF-name safetensors file - the
+// exact inverse of the importer. Pegasus-shaped front-end (NO
+// layernorm_embedding, STATIC sinusoidal positions that are regenerated on
+// import so NO position table is emitted) over PRE-norm relu stacks that close
+// with a FINAL encoder/decoder layer_norm; undoes the scale_embedding fold and
+// re-derives final_logits_bias. Round-trip gated by
+// TestM2M100SafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveM2M100ToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TM2M100Config; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
 // ---------------------------------------------------------------------------
 // WHISPER IMPORT (model_type "whisper": the openai/whisper-* speech-to-text
 // checkpoints; architectures ["WhisperForConditionalGeneration"]) - the
@@ -19753,6 +19765,22 @@ begin
     Config.EncoderLayers, Config.DecoderLayers,
     Config.EncoderFFNDim, Config.DecoderFFNDim, Config.ScaleEmbedding,
     {HasEmbLN=}true, {HasFinalLN=}true, {PosOffset=}2, pDType);
+end;
+
+procedure SaveM2M100ToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TM2M100Config; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+begin
+  // M2M100/NLLB rides the Pegasus parameterisation exactly: NO
+  // layernorm_embedding, a FINAL per-stack pre-norm layer_norm, and STATIC
+  // half-split sinusoidal positions (PosOffset < 0 => emit NO position table;
+  // the importer regenerates them). The relu vs erf-GELU FFN difference is
+  // structural only - it does not change which weights are serialized.
+  SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet, FileName, 'M2M100',
+    Config.DModel, Config.VocabSize, Config.MaxPositionEmbeddings,
+    Config.EncoderLayers, Config.DecoderLayers,
+    Config.EncoderFFNDim, Config.DecoderFFNDim, Config.ScaleEmbedding,
+    {HasEmbLN=}false, {HasFinalLN=}true, {PosOffset=}-1, pDType);
 end;
 
 // ===========================================================================

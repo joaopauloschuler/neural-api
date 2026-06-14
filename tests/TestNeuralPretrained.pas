@@ -122,6 +122,7 @@ type
     procedure TestBartSafeTensorsRoundTrip;
     procedure TestPegasusSafeTensorsRoundTrip;
     procedure TestMBartSafeTensorsRoundTrip;
+    procedure TestM2M100SafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -2315,6 +2316,64 @@ begin
           MaxDiff := Abs(L1.FData[i] - L2.FData[i]);
     end;
     AssertTrue('mBART safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    L2.Free; L1.Free; DecInput.Free; EncInput.Free;
+    Dec2.Free; Enc2.Free; Dec.Free; Enc.Free;
+  end;
+end;
+
+// SaveM2M100ToSafeTensors round-trip: import the pico M2M100/NLLB pair,
+// export, re-import, assert identical logits. Exercises the Pegasus-shaped
+// front-end (NO layernorm_embedding, STATIC sinusoidal positions that are NOT
+// serialized but regenerated on import) over PRE-norm relu stacks closed by a
+// FINAL encoder/decoder layer_norm, plus the tied head + final_logits_bias.
+procedure TTestNeuralPretrained.TestM2M100SafeTensorsRoundTrip;
+var
+  Enc, Dec, Enc2, Dec2: TNNet;
+  Config, Config2: TM2M100Config;
+  EncInput, DecInput, L1, L2: TNNetVolume;
+  TmpPath: string;
+  i, s, EncSeqLen, DecSeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  EncSeqLen := 10;
+  DecSeqLen := 6;
+  TmpPath := GetTempDir(false) + 'cai_m2m100_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  BuildM2M100FromSafeTensors(FixturePath('tiny_m2m100.safetensors'),
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    FixturePath('tiny_m2m100_config.json'));
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  L1 := TNNetVolume.Create;
+  L2 := TNNetVolume.Create;
+  Enc2 := nil; Dec2 := nil;
+  try
+    SaveM2M100ToSafeTensors(Enc, Dec, Config, TmpPath);
+    BuildM2M100FromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
+      DecSeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_m2m100_config.json'));
+    Vocab := Config.VocabSize;
+    EncInput.ReSize(EncSeqLen, 1, 1);
+    DecInput.ReSize(DecSeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to EncSeqLen - 1 do
+        EncInput.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      for i := 0 to DecSeqLen - 1 do
+        DecInput.FData[i] := (s * 7 + i * 2 + 1) mod Vocab;
+      RunT5(Enc, Dec, EncInput, DecInput, L1);
+      RunT5(Enc2, Dec2, EncInput, DecInput, L2);
+      AssertEquals('m2m100 round-trip logits size', L1.Size, L2.Size);
+      for i := 0 to L1.Size - 1 do
+        if Abs(L1.FData[i] - L2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(L1.FData[i] - L2.FData[i]);
+    end;
+    AssertTrue('M2M100 safetensors round-trip: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
   finally
     if FileExists(TmpPath) then DeleteFile(TmpPath);
