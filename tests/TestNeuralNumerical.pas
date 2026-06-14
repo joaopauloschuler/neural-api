@@ -88,6 +88,7 @@ type
     procedure TestTanhNumericalRange;
     procedure TestSwishNumericalValues;
     procedure TestHardSwishNumericalValues;
+    procedure TestHardSigmoidNumericalValues;
     procedure TestGELUNumericalValues;
     procedure TestMishNumericalValues;
     procedure TestSoftPlusNumericalValues;
@@ -101,6 +102,7 @@ type
     procedure TestSwishGradientCheck;
     procedure TestSwish6GradientCheck;
     procedure TestHardSwishGradientCheck;
+    procedure TestHardSigmoidGradientCheck;
     procedure TestSELUGradientCheck;
     procedure TestLeakyReLUGradientCheck;
     procedure TestVeryLeakyReLUGradientCheck;
@@ -1967,6 +1969,37 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestHardSigmoidNumericalValues;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5));
+    NN.AddLayer(TNNetHardSigmoid.Create());
+
+    Input.Raw[0] := 0.0;
+    Input.Raw[1] := 3.0;
+    Input.Raw[2] := -3.0;
+    Input.Raw[3] := 6.0;
+    Input.Raw[4] := -6.0;
+
+    NN.Compute(Input);
+
+    // HardSigmoid(x) = clamp((x + 3) / 6, 0, 1)
+    AssertEquals('HardSigmoid(0) = 0.5', 0.5, NN.GetLastLayer.Output.Raw[0], 0.001);
+    AssertEquals('HardSigmoid(3) = 1', 1.0, NN.GetLastLayer.Output.Raw[1], 0.001);
+    AssertEquals('HardSigmoid(-3) = 0', 0.0, NN.GetLastLayer.Output.Raw[2], 0.001);
+    AssertEquals('HardSigmoid(6) saturates at 1', 1.0, NN.GetLastLayer.Output.Raw[3], 0.001);
+    AssertEquals('HardSigmoid(-6) saturates at 0', 0.0, NN.GetLastLayer.Output.Raw[4], 0.001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestGELUNumericalValues;
 var
   NN: TNNet;
@@ -2269,6 +2302,13 @@ begin
   // Avoid the non-differentiable kinks at x = -3 and x = 3.
   ActivationGradientCheck(Self, TNNetHardSwish.Create(), 'HardSwish',
     [0.5, -0.5, 1.0, -2.0, 2.0, 4.0], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestHardSigmoidGradientCheck;
+begin
+  // Avoid the non-differentiable kinks at x = -3 and x = 3 (slope 1/6 between).
+  ActivationGradientCheck(Self, TNNetHardSigmoid.Create(), 'HardSigmoid',
+    [0.5, -0.5, 1.0, -2.0, 2.0], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestSoftPlusGradientCheck;

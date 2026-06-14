@@ -864,6 +864,16 @@ type
     procedure Compute(); override;
   end;
 
+  /// Hard Sigmoid activation: HardSigmoid(x) = clamp((x + 3) / 6, 0, 1).
+  // The piecewise-linear approximation of the logistic sigmoid used by
+  // MobileNetV3 / EfficientNet-lite squeeze-excite gating (torch.nn.Hardsigmoid).
+  // Cheaper than the exp-based sigmoid and the gate that pairs with HardSwish.
+  // Coded by Claude (AI).
+  TNNetHardSigmoid = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+  end;
+
   /// Gaussian Error Linear Unit (GELU) activation function.
   // A smooth activation function popular in transformer models like BERT and GPT.
   // Uses the tanh approximation formula: GELU(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
@@ -17008,6 +17018,59 @@ begin
       begin
         FOutput.FData[OutputCnt] := x*(x + 3)/6;
       end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{ TNNetHardSigmoid }
+
+procedure TNNetHardSigmoid.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x: TNeuralFloat;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 3 then
+      begin
+        FOutput.FData[OutputCnt] := 1;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else if x < -3 then
+      begin
+        FOutput.FData[OutputCnt] := 0;
+        FOutputErrorDeriv.FData[OutputCnt] := 0;
+      end
+      else
+      begin
+        FOutput.FData[OutputCnt] := (x + 3)/6;
+        FOutputErrorDeriv.FData[OutputCnt] := 1/6;
+      end;
+    end;
+  end
+  else
+  begin
+    // can't calculate error on input layers.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 3 then
+        FOutput.FData[OutputCnt] := 1
+      else if x < -3 then
+        FOutput.FData[OutputCnt] := 0
+      else
+        FOutput.FData[OutputCnt] := (x + 3)/6;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -87456,6 +87519,7 @@ begin
       'TNNetISRU' :                 Result := TNNetISRU.Create(Ft[0]);
       'TNNetISRLU' :                Result := TNNetISRLU.Create(Ft[0]);
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
+      'TNNetHardSigmoid' :          Result := TNNetHardSigmoid.Create();
       'TNNetGELU' :                 Result := TNNetGELU.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
       'TNNetPhish' :                Result := TNNetPhish.Create();
@@ -87848,6 +87912,7 @@ begin
       if S[0] = 'TNNetISRU' then Result := TNNetISRU.Create(Ft[0]) else
       if S[0] = 'TNNetISRLU' then Result := TNNetISRLU.Create(Ft[0]) else
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
+      if S[0] = 'TNNetHardSigmoid' then Result := TNNetHardSigmoid.Create() else
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
       if S[0] = 'TNNetPhish' then Result := TNNetPhish.Create() else

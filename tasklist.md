@@ -328,14 +328,17 @@ rather than acted on.
       mask; relative position bias maps onto an additive-bias attention path.
       Pico parity vs HF float64 producing ImageNet-1k logits; reuses the vision
       preprocessing helper. Hierarchical backbone also unblocks SegFormer/DETR.
-- [ ] MobileNetV3 / EfficientNet importer (timm/torchvision) — the efficient
-      mobile-CNN family, structurally distinct from the landed ResNet importer:
-      inverted-residual MBConv blocks (expand 1x1 -> depthwise -> squeeze-excite
-      -> project 1x1, no ReLU after project) + hard-swish/SiLU activations + SE
-      gating (TNNetChannelMul already exists). conv-BN fold reuses the ResNet
-      loader path. Pico parity vs a numpy float64 oracle producing ImageNet-1k
-      logits; depthwise conv groups must map onto the existing grouped/separable
-      conv layers (verify the channel-grouping math first).
+- [X] MobileNetV3 importer (torchvision) — DONE: BuildMobileNetV3[FromSafeTensors
+      [Ex]] + TMobileNetV3Config/ReadMobileNetV3ConfigFromJSONFile in
+      neuralpretrained.pas; new TNNetHardSigmoid activation. Inverted-residual
+      MBConv blocks (optional expand 1x1 -> depthwise kxk -> optional squeeze-
+      excite -> project 1x1, no act after project) + hard-swish/ReLU + SE gating
+      via TNNetChannelMulByLayer; conv-BN fold reuses the ResNet loader (depthwise
+      BN shift rides a TNNetChannelBias). Pico parity vs a numpy float64 oracle
+      (tools/mobilenetv3_tiny_fixture.py) covering every branch combo, asserted
+      < 1e-4 in TestMobileNetV3ImageClassificationParity. EfficientNet (SiLU SE +
+      stochastic depth) maps onto the same MBConv primitives and remains a
+      follow-up.
 - [ ] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
       + TRRDBNetConfig LANDED in neuralpretrained.pas; RRDBNet x4 with
       NEAREST-interpolate conv upsampling via TNNetDeMaxPool(2), parametrized

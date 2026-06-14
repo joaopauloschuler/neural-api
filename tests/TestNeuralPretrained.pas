@@ -274,6 +274,8 @@ type
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
     procedure TestResNet18ImageClassificationParity;
+    procedure TestMobileNetV3ConfigFromJSONFile;
+    procedure TestMobileNetV3ImageClassificationParity;
     procedure TestVGGConfigParity;
     procedure TestVGGLogitParity;
     procedure TestVGGFeatureTaps;
@@ -12613,6 +12615,114 @@ begin
       NN.GetLastLayer().Output.Size);
 
     RefJson.LoadFromFile(FixturePath('tiny_resnet18_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadMobileNetV3ConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestMobileNetV3ConfigFromJSONFile;
+var
+  Config: TMobileNetV3Config;
+begin
+  Config := ReadMobileNetV3ConfigFromJSONFile(
+    FixturePath('tiny_mobilenetv3_config.json'));
+  AssertEquals('model_type', 'mobilenet_v3', Config.ModelType);
+  AssertEquals('variant', 'small', Config.Variant);
+  AssertEquals('image_size', 32, Config.ImageSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('stem_width', 4, Config.StemWidth);
+  AssertEquals('head_conv_width', 24, Config.HeadConvWidth);
+  AssertEquals('classifier_hidden', 12, Config.ClassifierHidden);
+  // BatchNorm2d eps must be torchvision's 1e-3, not the 1e-5 default.
+  AssertTrue('bn_eps = 1e-3', Abs(Config.BnEps - 0.001) < 1e-9);
+  AssertEquals('block count', 4, Length(Config.Blocks));
+  // blk0: no expand (exp==stem), SE, stride1, ReLU.
+  AssertEquals('blk0 exp', 4, Config.Blocks[0].ExpChannels);
+  AssertEquals('blk0 out', 8, Config.Blocks[0].OutChannels);
+  AssertTrue('blk0 SE', Config.Blocks[0].UseSE);
+  AssertFalse('blk0 ReLU', Config.Blocks[0].UseHardSwish);
+  // blk1: expand, no SE, stride2, hard-swish.
+  AssertEquals('blk1 stride', 2, Config.Blocks[1].Stride);
+  AssertFalse('blk1 no SE', Config.Blocks[1].UseSE);
+  AssertTrue('blk1 hswish', Config.Blocks[1].UseHardSwish);
+  // blk2: expand, SE, stride1, in==out residual, kernel 5, hard-swish.
+  AssertEquals('blk2 kernel', 5, Config.Blocks[2].Kernel);
+  AssertTrue('blk2 SE', Config.Blocks[2].UseSE);
+  AssertEquals('blk2 se_channels', 8, Config.Blocks[2].SEChannels);
+  AssertEquals('blk2 out', 12, Config.Blocks[2].OutChannels);
+end;
+
+// torchvision MobileNetV3 image-classification parity test. The committed
+// fixture tests/fixtures/tiny_mobilenetv3.* is a pico random-init MobileNetV3
+// exercising every importer branch (no-expand / expand / SE / no-SE / stride 2
+// / stride-1 residual / ReLU / hard-swish blocks) whose state_dict mirrors the
+// torchvision key scheme. Each BatchNorm (eps 1e-3) is FOLDED into its conv at
+// load time; the depthwise BN shift rides a TNNetChannelBias. The generator
+// tools/mobilenetv3_tiny_fixture.py computes the reference logits with a self-
+// contained numpy float64 oracle (torchvision is not installed) replicating the
+// CAI forward path: hard-swish/hard-sigmoid, SE gating, global avg pool
+// (square maps so TNNetAvgChannel is an exact mean), residual add. Asserts the
+// (1,1,num_labels) logits match the oracle < 1e-4.
+procedure TTestNeuralPretrained.TestMobileNetV3ImageClassificationParity;
+var
+  NN: TNNet;
+  Config: TMobileNetV3Config;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildMobileNetV3FromSafeTensors(
+    FixturePath('tiny_mobilenetv3.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_mobilenetv3_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_mobilenetv3_logits.json'));
     RefRoot := GetJSON(RefJson.Text);
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     LogitsArr := TJSONArray(TJSONArray(

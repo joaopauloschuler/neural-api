@@ -792,6 +792,7 @@ The CAI Neural API supports various types of activation functions, as per the be
 | `TNNetSwish`                 | 1D, 2D, or 3D               | Swish         | Swish activation function.                                                                             |
 | `TNNetSwish6`                | 1D, 2D, or 3D               | Swish 6       | Swish activation clipped at 6.                                                                         |
 | `TNNetHardSwish`             | 1D, 2D, or 3D               | Hard Swish    | Hard version of Swish activation.                                                                      |
+| `TNNetHardSigmoid`           | 1D, 2D, or 3D               | Hard Sigmoid  | Piecewise-linear sigmoid `clamp((x + 3) / 6, 0, 1)`. The MobileNetV3 / EfficientNet squeeze-excite gate; cheaper than the exp-based sigmoid. |
 | `TNNetESwish`                | 1D, 2D, or 3D               | ESwish        | Beta-generalized Swish: `y = beta * x * sigmoid(beta * x)`. Created with `TNNetESwish.Create(beta)` (default `beta = 1.25`). |
 | `TNNetHyperbolicTangent`     | 1D, 2D, or 3D               | tanh          | Hyperbolic tangent activation function.                                                                |
 | `TNNetLeCunTanh`             | 1D, 2D, or 3D               | LeCunTanh     | LeCun scaled tanh: `y = 1.7159 * tanh((2/3) * x)`, tuned so `f(+/-1) ~= +/-1` (LeCun et al., "Efficient Backprop", 1998). Created with `TNNetLeCunTanh.Create()`. |

@@ -4921,6 +4921,100 @@ function BuildResNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// MOBILENETV3 IMPORT (torchvision "mobilenet_v3_small" / "mobilenet_v3_large").
+// The efficient mobile-CNN family, structurally distinct from ResNet: the body
+// is a stack of inverted-residual MBConv blocks, each:
+//   expand 1x1 conv+BN+act (SKIPPED when exp_channels == in_channels) ->
+//   depthwise kxk conv+BN+act (the stride lives here) ->
+//   optional squeeze-excite (AdaptiveAvgPool -> 1x1 fc_reduce -> ReLU ->
+//     1x1 fc_expand -> HARD-sigmoid -> per-channel multiply) ->
+//   project 1x1 conv+BN  (NO activation after project) ->
+//   residual add when stride == 1 and in_channels == out_channels.
+// Activations alternate ReLU (early blocks) and HARD-SWISH (later blocks), per
+// the torchvision config. Stem = conv 3x3 s2 p1 +BN +hard-swish. Head =
+// conv 1x1 +BN +hard-swish -> global avg pool -> Linear -> hard-swish ->
+// Linear(num_labels). Every conv has bias=False with a following BatchNorm2d
+// that is FOLDED into the conv at load (reusing the ResNet conv-BN fold path).
+//
+// DEPTHWISE / CHANNEL-GROUPING math: a torchvision depthwise conv has weight
+// [C,1,kh,kw] with groups==C; CAI's TNNetDepthwiseConvLinear(multiplier=1,k,
+// pad,stride) carries ONE neuron whose weight volume is (k,k,C) and computes
+// out[c] = sum_{ky,kx} in[c]*w[ky,kx,c] -- exactly the per-channel depthwise
+// conv (verified against the layer's ComputeCPUAtOutputPos depth-wise MulAdd).
+// The loader transposes [C,1,ky,kx] -> w[(ky*k+kx)*C + c].
+//
+// SE reduced dim + gating: torchvision SqueezeExcitation uses two 1x1 CONVS
+// (fc1 reduce + fc2 expand), ReLU between, and a HARD-SIGMOID gate (NOT the
+// plain sigmoid that TNNet.AddSEBlock uses), with the reduced dim taken
+// straight from the checkpoint's fc1 out-channels (config-driven here, the
+// _make_divisible(exp//4, 8) rounding is baked into the per-block exp/se dims).
+//
+// v1 targets ONE concrete config: a config-faithful mobilenet_v3_small-shaped
+// model whose per-block table (kernel/exp/out/stride/se/hswish) is read from
+// JSON, so the canonical 224x224 small/large nets AND the pico parity fixture
+// share one builder. The torchvision state_dict key scheme is mirrored:
+//   features.0.0 (stem conv) / features.0.1 (stem BN);
+//   features.{i}.block.{j}... for each MBConv (the j indices shift with the
+//     optional expand sub-block and SE -- see the loader);
+//   features.{last}.0/.1 (head conv+BN);
+//   classifier.0 (Linear) / classifier.3 (Linear).
+// EfficientNet (timm/torchvision) maps onto the SAME MBConv primitives and is
+// a documented follow-up (its SE uses SiLU+sigmoid and a stochastic-depth
+// survival prob that is a forward no-op at inference).
+type
+  TMobileNetV3Block = record
+    Kernel: integer;       // depthwise kernel (3 or 5)
+    ExpChannels: integer;  // expanded (hidden) channels
+    OutChannels: integer;  // projected output channels
+    Stride: integer;       // depthwise stride (1 or 2)
+    UseSE: boolean;        // squeeze-excite present
+    SEChannels: integer;   // SE reduced dim (fc1 out); ignored when not UseSE
+    UseHardSwish: boolean; // true = hard-swish, false = ReLU for this block
+  end;
+
+  TMobileNetV3Config = record
+    Variant: string;       // 'small' / 'large' (informational)
+    StemWidth: integer;    // features.0 out channels
+    Blocks: array of TMobileNetV3Block;
+    HeadConvWidth: integer;// features.{last} conv out channels
+    ClassifierHidden: integer; // classifier.0 out (Linear hidden before head act)
+    ImageSize: integer;    // 224 canonical
+    NumChannels: integer;  // 3
+    NumLabels: integer;    // 1000 ImageNet-1k
+    BnEps: TNeuralFloat;   // BatchNorm2d eps (1e-3 in torchvision mobilenet!)
+    ModelType: string;     // 'mobilenet_v3'
+  end;
+
+// Reads a torchvision-style MobileNetV3 config. The block table is supplied via
+// a "blocks" array of objects {kernel,exp,out,stride,se,se_channels,hswish}
+// (REQUIRED -- there is no canonical-by-name expansion in v1 so the one
+// concrete config is fully described). Optional: stem_width, head_conv_width,
+// classifier_hidden, image_size (224), num_channels (3), num_labels (1000),
+// bn_eps (1e-3), variant.
+function ReadMobileNetV3ConfigFromJSONFile(
+  const FileName: string): TMobileNetV3Config;
+
+function MobileNetV3ConfigToString(const Config: TMobileNetV3Config): string;
+
+// Builds the MobileNetV3 described by Config and loads every weight from Reader
+// (caller owns Reader), folding each BatchNorm into its conv. The net takes an
+// (ImageSize, ImageSize, NumChannels) ImageNet-normalized RGB volume and
+// outputs (1, 1, NumLabels) class logits.
+function BuildMobileNetV3(Reader: TNNetSafeTensorsReader;
+  const Config: TMobileNetV3Config; pInferenceOnly: boolean = false): TNNet;
+
+// Builds + loads the MobileNetV3 classifier from the checkpoint at FileName
+// (.safetensors / sharded index / pytorch_model.bin). Config is supplied by the
+// caller (Ex) or read from ConfigFileName ('' = "config.json" beside FileName)
+// and returned. Net owned by caller. Output: (1,1,num_labels).
+function BuildMobileNetV3FromSafeTensorsEx(const FileName: string;
+  const Config: TMobileNetV3Config; pInferenceOnly: boolean = false): TNNet;
+
+function BuildMobileNetV3FromSafeTensors(const FileName: string;
+  out Config: TMobileNetV3Config; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // VGG-16 / VGG-19 IMPORT (torchvision / timm "vgg", the canonical perceptual-
 // feature backbone and the prerequisite for LPIPS + neural style transfer).
 // The architecture is a STRAIGHT stack with NO residuals or norm bookkeeping:
@@ -31617,6 +31711,420 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadResNetConfigFromJSONFile(ConfigPath);
   Result := BuildResNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// MOBILENETV3 IMPORT (torchvision mobilenet_v3_small / mobilenet_v3_large)
+// ===========================================================================
+
+function ReadMobileNetV3ConfigFromJSONFile(
+  const FileName: string): TMobileNetV3Config;
+var
+  JsonText: TStringList;
+  Root, BlockData, LabelObj: TJSONData;
+  Obj, BObj: TJSONObject;
+  BlocksArr: TJSONArray;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('MobileNetV3 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('MobileNetV3 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('MobileNetV3 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'mobilenet_v3');
+    Result.Variant := Obj.Get('variant', 'small');
+    Result.ImageSize := Obj.Get('image_size', 224);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    // torchvision MobileNetV3 uses BatchNorm2d eps = 0.001 (NOT 1e-5).
+    Result.BnEps := Obj.Get('bn_eps', 0.001);
+    BlockData := Obj.Find('blocks');
+    if (BlockData = nil) or not (BlockData is TJSONArray) then
+      ImportError('MobileNetV3 import: config "' + FileName +
+        '" is missing the required "blocks" array (per-MBConv table).');
+    BlocksArr := TJSONArray(BlockData);
+    if BlocksArr.Count < 1 then
+      ImportError('MobileNetV3 import: "blocks" must have >= 1 entry.');
+    SetLength(Result.Blocks, BlocksArr.Count);
+    for i := 0 to BlocksArr.Count - 1 do
+    begin
+      if not (BlocksArr.Items[i] is TJSONObject) then
+        ImportError('MobileNetV3 import: blocks[' + IntToStr(i) +
+          '] is not a JSON object.');
+      BObj := TJSONObject(BlocksArr.Items[i]);
+      Result.Blocks[i].Kernel := BObj.Get('kernel', 3);
+      Result.Blocks[i].ExpChannels := BObj.Get('exp', 0);
+      Result.Blocks[i].OutChannels := BObj.Get('out', 0);
+      Result.Blocks[i].Stride := BObj.Get('stride', 1);
+      Result.Blocks[i].UseSE := BObj.Get('se', false);
+      Result.Blocks[i].SEChannels := BObj.Get('se_channels', 0);
+      Result.Blocks[i].UseHardSwish := BObj.Get('hswish', false);
+      if (Result.Blocks[i].ExpChannels < 1) or
+         (Result.Blocks[i].OutChannels < 1) then
+        ImportError('MobileNetV3 import: blocks[' + IntToStr(i) +
+          '] needs positive "exp" and "out".');
+      if Result.Blocks[i].UseSE and (Result.Blocks[i].SEChannels < 1) then
+        ImportError('MobileNetV3 import: blocks[' + IntToStr(i) +
+          '] has se=true but no positive "se_channels".');
+    end;
+    Result.StemWidth := Obj.Get('stem_width', Result.Blocks[0].ExpChannels);
+    Result.HeadConvWidth := Obj.Get('head_conv_width',
+      Result.Blocks[High(Result.Blocks)].OutChannels * 6);
+    Result.ClassifierHidden := Obj.Get('classifier_hidden',
+      Result.HeadConvWidth);
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MobileNetV3ConfigToString(const Config: TMobileNetV3Config): string;
+begin
+  Result := 'mobilenet_v3_' + Config.Variant + ' config: ' +
+    IntToStr(Length(Config.Blocks)) + ' MBConv blocks' +
+    ', stem=' + IntToStr(Config.StemWidth) +
+    ', head_conv=' + IntToStr(Config.HeadConvWidth) +
+    ', classifier_hidden=' + IntToStr(Config.ClassifierHidden) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', num_labels=' + IntToStr(Config.NumLabels) +
+    ', bn_eps=' + FloatToStr(Config.BnEps);
+end;
+
+// Loads a torchvision DEPTHWISE Conv2d (weight [C,1,kh,kw], groups==C, bias
+// False) into a CAI TNNetDepthwiseConv. The depthwise layer has NO per-output-
+// channel bias (one neuron, weight volume (k,k,C)), so the following BatchNorm
+// is folded as: the per-channel SCALE multiplies that channel's weights, and
+// the per-channel SHIFT is returned in OutShift[] for the caller to load into a
+// following TNNetChannelBias. The neuron weight layout is w[(ky*k+kx)*C + c].
+procedure LoadMobileNetDepthwiseFoldBN(Reader: TNNetSafeTensorsReader;
+  DwLayer: TNNetLayer; const ConvWName, BnPrefix: string;
+  Channels, K: integer; BnEps: TNeuralFloat; out OutShift: TNNetVolume);
+var
+  W, Gamma, Beta, Mean, Var_: TNNetVolume;
+  c, ky, kx: integer;
+  Scale, Denom: TNeuralFloat;
+begin
+  EnsureWritableImportWeights(DwLayer);
+  if not Reader.HasTensor(ConvWName) then
+    ImportError('MobileNetV3 import: missing tensor "' + ConvWName + '".');
+  if (Reader.DimCount(ConvWName) <> 4) or
+     (Reader.DimSize(ConvWName, 0) <> Channels) or
+     (Reader.DimSize(ConvWName, 1) <> 1) or
+     (Reader.DimSize(ConvWName, 2) <> K) or
+     (Reader.DimSize(ConvWName, 3) <> K) then
+    ImportError('MobileNetV3 import: depthwise "' + ConvWName +
+      '" must have shape [' + IntToStr(Channels) + ', 1, ' + IntToStr(K) +
+      ', ' + IntToStr(K) + '], got ' + Reader.ShapeAsString(ConvWName));
+  if DwLayer.Neurons.Count <> 1 then
+    ImportError('MobileNetV3 import: internal error - depthwise "' +
+      ConvWName + '" target has ' + IntToStr(DwLayer.Neurons.Count) +
+      ' neurons, expected 1.');
+  if DwLayer.Neurons[0].Weights.Size <> K * K * Channels then
+    ImportError('MobileNetV3 import: internal error - depthwise "' +
+      ConvWName + '" neuron has ' + IntToStr(DwLayer.Neurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(K * K * Channels) + '.');
+  W := TNNetVolume.Create;
+  Gamma := TNNetVolume.Create;
+  Beta := TNNetVolume.Create;
+  Mean := TNNetVolume.Create;
+  Var_ := TNNetVolume.Create;
+  OutShift := TNNetVolume.Create;
+  OutShift.ReSize(1, 1, Channels);
+  try
+    Reader.LoadTensorFlat(ConvWName, W);
+    Reader.LoadTensorFlat(BnPrefix + '.weight', Gamma);
+    Reader.LoadTensorFlat(BnPrefix + '.bias', Beta);
+    Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
+    Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
+    if (Gamma.Size <> Channels) or (Beta.Size <> Channels) or
+       (Mean.Size <> Channels) or (Var_.Size <> Channels) then
+      ImportError('MobileNetV3 import: BatchNorm "' + BnPrefix +
+        '" parameters must each have ' + IntToStr(Channels) + ' elements.');
+    for c := 0 to Channels - 1 do
+    begin
+      Denom := Sqrt(Var_.FData[c] + BnEps);
+      Scale := Gamma.FData[c] / Denom;
+      OutShift.FData[c] := Beta.FData[c] - Gamma.FData[c] * Mean.FData[c] / Denom;
+      // torch [c,0,ky,kx] -> CAI w[(ky*K+kx)*C + c], scaled per channel.
+      for ky := 0 to K - 1 do
+        for kx := 0 to K - 1 do
+          DwLayer.Neurons[0].Weights.FData[(ky * K + kx) * Channels + c] :=
+            W.FData[(c * K + ky) * K + kx] * Scale;
+    end;
+    DwLayer.FlushWeightCache();
+  finally
+    W.Free; Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
+  end;
+end;
+
+// Loads a per-channel additive bias volume into a TNNetChannelBias layer (one
+// neuron, weight depth == channels). Shift is consumed (freed) here.
+procedure LoadChannelBiasFromShift(BiasLayer: TNNetLayer; Shift: TNNetVolume);
+var
+  c: integer;
+begin
+  EnsureWritableImportWeights(BiasLayer);
+  try
+    if BiasLayer.Neurons[0].Weights.Size <> Shift.Size then
+      ImportError('MobileNetV3 import: internal error - ChannelBias has ' +
+        IntToStr(BiasLayer.Neurons[0].Weights.Size) + ' weights, expected ' +
+        IntToStr(Shift.Size) + '.');
+    for c := 0 to Shift.Size - 1 do
+      BiasLayer.Neurons[0].Weights.FData[c] := Shift.FData[c];
+    BiasLayer.FlushWeightCache();
+  finally
+    Shift.Free;
+  end;
+end;
+
+// Loads a torchvision 1x1 SE conv (Conv2d WITH bias, weight [O,I,1,1]) into a
+// CAI 1x1 conv. Reuses the no-fold branch of LoadResNetConvFoldBN by passing
+// BnPrefix='', then loads the conv bias into each neuron's BiasWeight.
+procedure LoadMobileNetSEConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const ConvWName, ConvBName: string; OutCh, InCh: integer);
+var
+  B: TNNetVolume;
+  o: integer;
+begin
+  LoadResNetConvFoldBN(Reader, Layer, ConvWName, '', OutCh, InCh, 1, 0);
+  B := TNNetVolume.Create;
+  try
+    if not Reader.HasTensor(ConvBName) then
+      ImportError('MobileNetV3 import: missing SE conv bias "' + ConvBName + '".');
+    Reader.LoadTensorFlat(ConvBName, B);
+    if B.Size <> OutCh then
+      ImportError('MobileNetV3 import: SE conv bias "' + ConvBName +
+        '" must have ' + IntToStr(OutCh) + ' elements.');
+    for o := 0 to OutCh - 1 do
+      Layer.Neurons[o].BiasWeight := B.FData[o];
+    Layer.FlushWeightCache();
+  finally
+    B.Free;
+  end;
+end;
+
+type
+  TMobileNetBlockLayers = record
+    Expand, Dw, DwBias, SEReduce, SEExpand, Project, ProjBias: TNNetLayer;
+    HasExpand, HasSE, HasResidual: boolean;
+  end;
+
+// Adds one inverted-residual MBConv block (architecture only). Returns the
+// layer refs the weight loader needs.
+procedure AddMobileNetMBConv(NN: TNNet; const Blk: TMobileNetV3Block;
+  InChannels: integer; out Refs: TMobileNetBlockLayers);
+var
+  Input, Branch, Pooled, Gate: TNNetLayer;
+  Pad: integer;
+
+  function ActLayer: TNNetLayer;
+  begin
+    if Blk.UseHardSwish then Result := TNNetHardSwish.Create()
+    else Result := TNNetReLU.Create();
+  end;
+
+begin
+  FillChar(Refs, SizeOf(Refs), 0);
+  Refs.HasExpand := Blk.ExpChannels <> InChannels;
+  Refs.HasSE := Blk.UseSE;
+  Refs.HasResidual := (Blk.Stride = 1) and (InChannels = Blk.OutChannels);
+  Pad := Blk.Kernel div 2;
+  Input := NN.GetLastLayer();
+  // 1) expand 1x1 (skipped when exp == in) -> BN(folded into conv bias) -> act
+  if Refs.HasExpand then
+  begin
+    Refs.Expand := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Blk.ExpChannels, 1, 0, 1, 0));
+    NN.AddLayer(ActLayer);
+  end;
+  // 2) depthwise kxk (stride) -> BN(scale folded in weights, shift via bias)
+  Refs.Dw := NN.AddLayer(
+    TNNetDepthwiseConvLinear.Create({multiplier=}1, Blk.Kernel, Pad, Blk.Stride));
+  Refs.DwBias := NN.AddLayer(TNNetChannelBias.Create());
+  NN.AddLayer(ActLayer);
+  // 3) squeeze-excite: pool -> 1x1 reduce -> ReLU -> 1x1 expand -> h-sigmoid
+  //    -> per-channel multiply with the (post-activation) depthwise output.
+  if Refs.HasSE then
+  begin
+    Branch := NN.GetLastLayer();
+    Pooled := NN.AddLayerAfter(TNNetAvgChannel.Create(), Branch);
+    Refs.SEReduce := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Blk.SEChannels, 1, 0, 1, 0));
+    NN.AddLayer(TNNetReLU.Create());
+    Refs.SEExpand := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Blk.ExpChannels, 1, 0, 1, 0));
+    Gate := NN.AddLayer(TNNetHardSigmoid.Create());
+    NN.AddLayer(TNNetChannelMulByLayer.Create(Branch, Gate));
+  end;
+  // 4) project 1x1 -> BN (NO activation after project)
+  Refs.Project := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Blk.OutChannels, 1, 0, 1, 0));
+  Branch := NN.GetLastLayer();
+  // 5) residual add when stride 1 and in == out
+  if Refs.HasResidual then
+    NN.AddLayer(TNNetSum.Create([Branch, Input]));
+end;
+
+function BuildMobileNetV3(Reader: TNNetSafeTensorsReader;
+  const Config: TMobileNetV3Config; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  StemConv, HeadConv, FC0, FC1: TNNetLayer;
+  BlockRefs: array of TMobileNetBlockLayers;
+  i, InChannels, LastFeatIdx: integer;
+  Prefix, P: string;
+  Shift: TNNetVolume;
+begin
+  if Config.NumChannels < 1 then
+    ImportError('MobileNetV3 import: num_channels must be >= 1.');
+  if Config.NumLabels < 1 then
+    ImportError('MobileNetV3 import: num_labels must be >= 1.');
+  SetLength(BlockRefs, Length(Config.Blocks));
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels));
+    // Stem: conv 3x3 stride2 pad1 (+folded BN bias) -> hard-swish.
+    StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0));
+    NN.AddLayer(TNNetHardSwish.Create());
+    InChannels := Config.StemWidth;
+    for i := 0 to High(Config.Blocks) do
+    begin
+      AddMobileNetMBConv(NN, Config.Blocks[i], InChannels, BlockRefs[i]);
+      InChannels := Config.Blocks[i].OutChannels;
+    end;
+    // Head: conv 1x1 +BN +hard-swish -> global avg pool -> Linear -> hard-swish
+    //       -> Linear(num_labels).
+    HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.HeadConvWidth, 1, 0, 1, 0));
+    NN.AddLayer(TNNetHardSwish.Create());
+    NN.AddLayer(TNNetAvgChannel.Create());
+    FC0 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.ClassifierHidden));
+    NN.AddLayer(TNNetHardSwish.Create());
+    FC1 := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    // features.0.0 = stem conv, features.0.1 = stem BN.
+    LoadResNetConvFoldBN(Reader, StemConv, 'features.0.0.weight',
+      'features.0.1', Config.StemWidth, Config.NumChannels, 3, Config.BnEps);
+    InChannels := Config.StemWidth;
+    for i := 0 to High(Config.Blocks) do
+    begin
+      // MBConv body keys: features.{i+1}.block.{j}...; j advances over the
+      // optional expand sub-block (ConvNormActivation = .0 conv .1 bn), the
+      // depthwise sub-block, the optional SE module, and the project sub-block.
+      Prefix := 'features.' + IntToStr(i + 1) + '.block.';
+      // expand (j=0) when present, then depthwise; else depthwise is j=0.
+      if BlockRefs[i].HasExpand then
+      begin
+        LoadResNetConvFoldBN(Reader, BlockRefs[i].Expand,
+          Prefix + '0.0.weight', Prefix + '0.1',
+          Config.Blocks[i].ExpChannels, InChannels, 1, Config.BnEps);
+        P := Prefix + '1';   // depthwise sub-block index
+      end
+      else
+        P := Prefix + '0';
+      LoadMobileNetDepthwiseFoldBN(Reader, BlockRefs[i].Dw,
+        P + '.0.weight', P + '.1',
+        Config.Blocks[i].ExpChannels, Config.Blocks[i].Kernel,
+        Config.BnEps, Shift);
+      LoadChannelBiasFromShift(BlockRefs[i].DwBias, Shift);
+      if BlockRefs[i].HasSE then
+      begin
+        // SE module sub-block index = depthwise idx + 1; project = + 2.
+        // torchvision SqueezeExcitation: fc1 (reduce) / fc2 (expand), 1x1 convs
+        // with bias.
+        if BlockRefs[i].HasExpand then P := Prefix + '2'
+        else P := Prefix + '1';
+        LoadMobileNetSEConv(Reader, BlockRefs[i].SEReduce,
+          P + '.fc1.weight', P + '.fc1.bias',
+          Config.Blocks[i].SEChannels, Config.Blocks[i].ExpChannels);
+        LoadMobileNetSEConv(Reader, BlockRefs[i].SEExpand,
+          P + '.fc2.weight', P + '.fc2.bias',
+          Config.Blocks[i].ExpChannels, Config.Blocks[i].SEChannels);
+        if BlockRefs[i].HasExpand then P := Prefix + '3'
+        else P := Prefix + '2';
+      end
+      else
+      begin
+        if BlockRefs[i].HasExpand then P := Prefix + '2'
+        else P := Prefix + '1';
+      end;
+      // project sub-block (P set above): conv .0 + BN .1, NO activation.
+      LoadResNetConvFoldBN(Reader, BlockRefs[i].Project,
+        P + '.0.weight', P + '.1',
+        Config.Blocks[i].OutChannels, Config.Blocks[i].ExpChannels, 1,
+        Config.BnEps);
+      InChannels := Config.Blocks[i].OutChannels;
+    end;
+    // head conv+BN: features.{last}.0 / .1
+    LastFeatIdx := Length(Config.Blocks) + 1;
+    LoadResNetConvFoldBN(Reader, HeadConv,
+      'features.' + IntToStr(LastFeatIdx) + '.0.weight',
+      'features.' + IntToStr(LastFeatIdx) + '.1',
+      Config.HeadConvWidth, InChannels, 1, Config.BnEps);
+    // classifier.0 (Linear, with bias) -> hard-swish -> classifier.3 (Linear).
+    LoadLlamaLinearWeights(Reader, FC0, 'classifier.0.weight',
+      Config.HeadConvWidth, Config.ClassifierHidden, 0, -1, 0,
+      'classifier.0.bias');
+    LoadLlamaLinearWeights(Reader, FC1, 'classifier.3.weight',
+      Config.ClassifierHidden, Config.NumLabels, 0, -1, 0,
+      'classifier.3.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildMobileNetV3FromSafeTensorsEx(const FileName: string;
+  const Config: TMobileNetV3Config; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildMobileNetV3(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildMobileNetV3FromSafeTensors(const FileName: string;
+  out Config: TMobileNetV3Config; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMobileNetV3ConfigFromJSONFile(ConfigPath);
+  Result := BuildMobileNetV3FromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================
