@@ -606,18 +606,30 @@ rather than acted on.
       is also what best-of-N and the speculative-decoding verify step
       want. Assert ranked beam output is identical to the re-encoding
       implementation.
-- [ ] Prefix/session cache reuse in TNNetStreamingDecoder: no way today to
-      save/restore or fork a session, so a shared system prompt is
-      re-prefilled for every generation. Add snapshot-after-prefill +
-      clone-per-request (and optional save/load to disk for a persistent
-      system-prompt cache). The single biggest practical speedup for the
-      landed chat-templates use case; shares the fork primitive with the
-      KV-cache beam task above. Assert a forked session's continuation is
-      bit-identical to a fresh prefill. Related consumer: the landed
-      examples/ChatTerminal decodes with one full fixed-width forward per
-      token because importers build at full context width — an importer
-      option to build a width-1 decode twin (or build-twice +
-      CopyWeights) would let chat ride TNNetStreamingDecoder.
+- [X] Prefix/session cache reuse in TNNetStreamingDecoder. LANDED: in-memory
+      snapshot-after-prefill + clone-per-request fork. TNNetStreamingDecoder
+      .Snapshot() deep-copies the session's FULL live state (every attention
+      layer's K/V cache + live length + eviction sinks/window, every SSM layer's
+      recurrent state h + step count) into an owned TNNetDecoderSessionSnapshot;
+      .RestoreSnapshot(Snap) copies it back so the next StepForward continues
+      exactly where the snapshot was taken. Built on new public
+      TNNetScaledDotProductAttention.CaptureCacheState/RestoreCacheState and
+      TNNetDiagonalSSM.CaptureState/RestoreState (so the snapshot stays decoupled
+      from the layer privates). Snapshot is an independent copy -> restorable into
+      MANY sessions (the per-request fork AND the per-hypothesis fork the KV-cache
+      beam task wants). Eviction-aware: it captures+restores the sinks/window so a
+      forked session keeps the source's eviction policy (capturing past the cap is
+      fine - the snapshot holds whatever the live cache holds). RoPE PositionOffset
+      is NOT stored (set per-StepForward from AbsPos). Tests (TestNeuralDecode):
+      forked continuation BIT-IDENTICAL (exact float equality, tol 0) to a fresh
+      prefill of the whole prefix for both a RoPE transformer and an SSM; one
+      snapshot forks two independent continuations and survives both untouched.
+      DELIBERATE LIMITATION: in-memory only; save/load of a snapshot to disk (a
+      persistent system-prompt cache) is a documented follow-up. Related consumer
+      still open: examples/ChatTerminal decodes one full fixed-width forward per
+      token because importers build at full context width — an importer option to
+      build a width-1 decode twin (or build-twice + CopyWeights) would let chat
+      ride TNNetStreamingDecoder.
 - [ ] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
       easy tokens from an intermediate layer through the LM head, fall
       back to full depth when confidence is low — the model becomes its

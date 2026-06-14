@@ -857,6 +857,50 @@ type
     TokenHealing: boolean;
   end;
 
+  // TNNetDecoderSessionSnapshot: an opaque, owned, deep copy of a
+  // TNNetStreamingDecoder's live per-layer KV-cache / SSM state, captured at one
+  // point in a sequence (typically right after prefilling a shared system
+  // prompt). It is the prefix-cache-reuse / cache-fork primitive: prefill a
+  // prompt P once, Snapshot it, then for each request RestoreSnapshot it into a
+  // session and generate the continuation - the system prompt is NOT re-prefilled
+  // per request. The same snapshot can be restored any number of times (it is an
+  // independent copy, untouched by the session it forked from), so it doubles as
+  // the per-hypothesis fork the KV-cache beam / best-of-N tasks want.
+  //
+  // CONTENTS. One captured (K-cache, V-cache, live length, eviction sinks,
+  // eviction window) tuple per collected attention layer, and one (recurrent
+  // state h, step count) pair per collected SSM layer - i.e. the FULL live state
+  // a StepForward reads, including any eviction policy armed on the source
+  // session. RoPE PositionOffset is NOT stored (it is set per-StepForward from
+  // the caller's AbsPos, not session state).
+  //
+  // CORRECTNESS. Restoring a snapshot and continuing is BIT-IDENTICAL to a fresh
+  // prefill of the whole prefix followed by the same continuation (the cache
+  // buffers are byte-copied and the live length is restored, so the next token
+  // appends at exactly the same slot it would in the unforked session). The
+  // shape contract is the source and destination sessions wrap the SAME
+  // architecture at the SAME MaxCacheLen (the natural case: one twin built once,
+  // or two twins CopyWeights'd from the same trained net). Disk persistence of a
+  // snapshot (a system-prompt cache on disk) is a documented follow-up; this is
+  // the in-memory fork. Coded by Claude (AI).
+  TNNetDecoderSessionSnapshot = class(TObject)
+  private
+    FK: array of TNNetVolume;        // per-attention-layer cached keys (deep copy)
+    FV: array of TNNetVolume;        // per-attention-layer cached values
+    FLen: array of integer;          // per-attention-layer live cache length
+    FSinks: array of integer;        // per-attention-layer eviction sink count
+    FWindow: array of integer;       // per-attention-layer eviction window
+    FH: array of TNNetVolume;        // per-SSM-layer recurrent state h (deep copy)
+    FSteps: array of integer;        // per-SSM-layer step count
+    function GetSDPACount(): integer;
+    function GetSSMCount(): integer;
+  public
+    destructor Destroy(); override;
+    // Number of attention / SSM layers captured (diagnostics / tests).
+    property SDPACount: integer read GetSDPACount;
+    property SSMCount: integer read GetSSMCount;
+  end;
+
   // TNNetStreamingDecoder: a reusable incremental-decode "streaming session"
   // over a causal next-token net, replacing the hand-rolled step-net plumbing
   // every streaming example repeats (build a short-width twin, CopyWeights,
@@ -968,6 +1012,22 @@ type
     // tests: with eviction on this is pinned at SinkTokens + RecentWindow once
     // the stream passes that length).
     function SDPACacheLength(Index: integer): integer;
+    // PREFIX-CACHE REUSE / cache fork. Snapshot() deep-copies this session's
+    // entire live state (every attention layer's KV cache + length + eviction
+    // policy, every SSM layer's recurrent state + step count) into a new owned
+    // TNNetDecoderSessionSnapshot the caller must Free. Typical use: prefill a
+    // shared system prompt once, Snapshot it, then for each request
+    // RestoreSnapshot it and generate just the continuation - the prompt is not
+    // re-prefilled per request. RestoreSnapshot(Snap) copies the snapshot back
+    // into this session (overwriting the live state), so the next StepForward
+    // continues EXACTLY where the snapshot was taken; restoring is BIT-IDENTICAL
+    // to a fresh prefill of the whole snapshotted prefix. The snapshot is an
+    // independent copy, so it can be restored into many sessions (the per-request
+    // fork, and the per-hypothesis fork the KV-cache beam task wants). The
+    // snapshot must come from a session wrapping the SAME architecture at the
+    // SAME MaxCacheLen (e.g. the same twin, or twins CopyWeights'd from one net).
+    function Snapshot(): TNNetDecoderSessionSnapshot;
+    procedure RestoreSnapshot(Snap: TNNetDecoderSessionSnapshot);
     // Convenience: the net's last layer output (e.g. the softmax row(s) of
     // the window just computed).
     function Output(): TNNetVolume;
@@ -3920,6 +3980,31 @@ begin
   Inc(FAbsPos);
 end;
 
+{ TNNetDecoderSessionSnapshot }
+
+destructor TNNetDecoderSessionSnapshot.Destroy();
+var
+  i: integer;
+begin
+  for i := 0 to High(FK) do FK[i].Free;
+  for i := 0 to High(FV) do FV[i].Free;
+  for i := 0 to High(FH) do FH[i].Free;
+  SetLength(FK, 0);
+  SetLength(FV, 0);
+  SetLength(FH, 0);
+  inherited Destroy();
+end;
+
+function TNNetDecoderSessionSnapshot.GetSDPACount(): integer;
+begin
+  Result := Length(FK);
+end;
+
+function TNNetDecoderSessionSnapshot.GetSSMCount(): integer;
+begin
+  Result := Length(FH);
+end;
+
 { TNNetStreamingDecoder }
 
 constructor TNNetStreamingDecoder.Create(pNet: TNNet; pMaxCacheLen: integer);
@@ -4019,6 +4104,55 @@ end;
 function TNNetStreamingDecoder.SDPACacheLength(Index: integer): integer;
 begin
   Result := FSDPAs[Index].CacheLength;
+end;
+
+function TNNetStreamingDecoder.Snapshot(): TNNetDecoderSessionSnapshot;
+var
+  i: integer;
+begin
+  Result := TNNetDecoderSessionSnapshot.Create();
+  SetLength(Result.FK, Length(FSDPAs));
+  SetLength(Result.FV, Length(FSDPAs));
+  SetLength(Result.FLen, Length(FSDPAs));
+  SetLength(Result.FSinks, Length(FSDPAs));
+  SetLength(Result.FWindow, Length(FSDPAs));
+  for i := 0 to High(FSDPAs) do
+  begin
+    Result.FK[i] := TNNetVolume.Create();
+    Result.FV[i] := TNNetVolume.Create();
+    FSDPAs[i].CaptureCacheState(Result.FK[i], Result.FV[i],
+      Result.FLen[i], Result.FSinks[i], Result.FWindow[i]);
+  end;
+  SetLength(Result.FH, Length(FSSMs));
+  SetLength(Result.FSteps, Length(FSSMs));
+  for i := 0 to High(FSSMs) do
+  begin
+    Result.FH[i] := TNNetVolume.Create();
+    FSSMs[i].CaptureState(Result.FH[i], Result.FSteps[i]);
+  end;
+end;
+
+procedure TNNetStreamingDecoder.RestoreSnapshot(Snap: TNNetDecoderSessionSnapshot);
+var
+  i: integer;
+begin
+  if Length(Snap.FK) <> Length(FSDPAs) then
+  begin
+    raise Exception.Create('TNNetStreamingDecoder.RestoreSnapshot: snapshot has ' +
+      IntToStr(Length(Snap.FK)) + ' attention layers but this session has ' +
+      IntToStr(Length(FSDPAs)) + ' (mismatched architecture).');
+  end;
+  if Length(Snap.FH) <> Length(FSSMs) then
+  begin
+    raise Exception.Create('TNNetStreamingDecoder.RestoreSnapshot: snapshot has ' +
+      IntToStr(Length(Snap.FH)) + ' SSM layers but this session has ' +
+      IntToStr(Length(FSSMs)) + ' (mismatched architecture).');
+  end;
+  for i := 0 to High(FSDPAs) do
+    FSDPAs[i].RestoreCacheState(Snap.FK[i], Snap.FV[i],
+      Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
+  for i := 0 to High(FSSMs) do
+    FSSMs[i].RestoreState(Snap.FH[i], Snap.FSteps[i]);
 end;
 
 function TNNetStreamingDecoder.Output(): TNNetVolume;

@@ -2818,6 +2818,20 @@ type
     // length do generated tokens diverge (by design - the middle is gone).
     procedure EnableEviction(SinkTokens, RecentWindow: integer);
     procedure DisableEviction();
+    // Session snapshot / fork support. CaptureCacheState copies the layer's
+    // full live KV-cache state (the cached keys/values, the live length, and
+    // the eviction config) into the supplied destination volumes / out params
+    // so a caller can save a prefilled session; RestoreCacheState copies that
+    // state back in, so continuation resumes EXACTLY where the snapshot was
+    // taken (the next appended token lands at slot Len, the eviction policy is
+    // re-armed). Both require the cached path (call after BeginIncrementalDecode)
+    // and the destination/source K/V volumes are sized to MaxContext x 1 x Dk.
+    // The fork is a deep copy: the snapshot is independent of the live layer,
+    // so the same snapshot can be restored into many sessions. Coded by Claude (AI).
+    procedure CaptureCacheState(DstK, DstV: TNNetVolume;
+      out Len, Sinks, Window: integer);
+    procedure RestoreCacheState(SrcK, SrcV: TNNetVolume;
+      Len, Sinks, Window: integer);
     // Read-only access to the post-softmax attention map populated by
     // Compute(). Layout: X=key index j, Y=query index i, attn[j,i,0]; rows
     // (fixed i) sum to 1. Used by TNNet.AttentionEntropyReport.
@@ -5683,6 +5697,13 @@ type
       procedure EndIncrementalDecode();
       // Start a fresh sequence: zeroes the persisted state h.
       procedure ResetState();
+      // Session snapshot / fork support (mirrors the SDPA cache capture/restore):
+      // CaptureState copies the persisted recurrent state h and the step count
+      // into Dst / out param; RestoreState copies them back so continuation
+      // resumes from the snapshot. A deep copy, so one snapshot forks many
+      // sessions. Coded by Claude (AI).
+      procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
+      procedure RestoreState(Src: TNNetVolume; Steps: integer);
       property DecodeEnabled: boolean read FDecodeEnabled;
       property DecodeSteps: integer read FDecodeSteps;
   end;
@@ -22377,6 +22398,45 @@ begin
   FEvictWindow := 0;
 end;
 
+procedure TNNetScaledDotProductAttention.CaptureCacheState(DstK, DstV: TNNetVolume;
+  out Len, Sinks, Window: integer);
+begin
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.CaptureCacheState requires the ' +
+      'cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  DstK.Copy(FKCache);
+  DstV.Copy(FVCache);
+  Len := FCacheLen;
+  Sinks := FEvictSinks;
+  Window := FEvictWindow;
+end;
+
+procedure TNNetScaledDotProductAttention.RestoreCacheState(SrcK, SrcV: TNNetVolume;
+  Len, Sinks, Window: integer);
+begin
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheState requires the ' +
+      'cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if (Len < 0) or (Len > FCacheMax) then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheState: snapshot ' +
+      'length ' + IntToStr(Len) + ' exceeds this session''s MaxContext (' +
+      IntToStr(FCacheMax) + ').');
+    exit;
+  end;
+  FKCache.Copy(SrcK);
+  FVCache.Copy(SrcV);
+  FCacheLen := Len;
+  FEvictSinks := Sinks;
+  FEvictWindow := Window;
+end;
+
 // Inference-only cached forward. Appends each input token's K and V slice to
 // the persistent cache and attends its query over ALL cached positions
 // [0..t]. Works for a one-token decode step (the headline O(1)-per-step use)
@@ -37079,6 +37139,18 @@ procedure TNNetDiagonalSSM.ResetState();
 begin
   FDecodeH.Fill(0);
   FDecodeSteps := 0;
+end;
+
+procedure TNNetDiagonalSSM.CaptureState(Dst: TNNetVolume; out Steps: integer);
+begin
+  Dst.Copy(FDecodeH);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetDiagonalSSM.RestoreState(Src: TNNetVolume; Steps: integer);
+begin
+  FDecodeH.Copy(Src);
+  FDecodeSteps := Steps;
 end;
 
 procedure TNNetDiagonalSSM.Backpropagate();

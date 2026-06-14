@@ -132,6 +132,10 @@ type
     procedure TestStreamingDecoderSSMMatchesFullForward;
     procedure TestStreamingDecoderResetStartsFreshSequence;
     procedure TestStreamingDecoderTruncateToRollsBack;
+    // Prefix-cache reuse / cache fork (Snapshot / RestoreSnapshot).
+    procedure TestStreamingDecoderForkContinuationBitIdenticalTransformer;
+    procedure TestStreamingDecoderForkContinuationBitIdenticalSSM;
+    procedure TestStreamingDecoderSnapshotForksManyIndependentSessions;
     // StreamingLLM KV-cache eviction (attention sinks + rolling window).
     procedure TestStreamingEvictionWithinWindowBitIdenticalToUnbounded;
     procedure TestStreamingEvictionCapsCacheLengthPastWindow;
@@ -2253,6 +2257,227 @@ begin
     Session.Free;
     Twin.Free;
     Full.Free;
+  end;
+end;
+
+// Prefix-cache reuse / cache fork, the headline correctness gate: prefill a
+// shared prompt P, Snapshot, then RestoreSnapshot into a FRESH session and
+// generate continuation C. Every continuation output row must be BIT-IDENTICAL
+// (exact float equality, tolerance 0) to streaming the WHOLE P+C through a
+// session that never forked - i.e. the fork is indistinguishable from a fresh
+// prefill of the whole prefix. RoPE transformer, so the absolute-position
+// contract is exercised across the snapshot boundary too.
+procedure TTestNeuralDecode.TestStreamingDecoderForkContinuationBitIdenticalTransformer;
+const
+  PromptLen = 4;
+  TotalLen  = 9;
+  Toks: array[0..8] of integer = (3, 7, 1, 9, 4, 11, 2, 6, 8);
+var
+  Twin: TNNet;
+  RefSession, ForkSession: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  RefOut: array[PromptLen..TotalLen - 1] of array of TNeuralFloat;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyCausalLM(1);
+  RefSession := nil; ForkSession := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    // --- Reference: one session prefills P then continues C, recording every
+    // continuation output row (the "fresh prefill of the whole prefix" path). ---
+    RefSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    RefSession.Reset();
+    for T := 0 to TotalLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      RefSession.StepForward(StepIn, T);
+      if T >= PromptLen then
+      begin
+        SetLength(RefOut[T], RefSession.Output().Size);
+        for D := 0 to RefSession.Output().Size - 1 do
+          RefOut[T][D] := RefSession.Output().FData[D];
+      end;
+    end;
+    RefSession.Free; RefSession := nil;
+
+    // --- Fork: prefill ONLY P, Snapshot, then restore into a brand-new session
+    // and generate C. Must reproduce the recorded rows bit-for-bit. ---
+    ForkSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    ForkSession.Reset();
+    for T := 0 to PromptLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      ForkSession.StepForward(StepIn, T);
+    end;
+    Snap := ForkSession.Snapshot();
+    AssertEquals('snapshot captured every attention layer',
+      ForkSession.SDPACount, Snap.SDPACount);
+    ForkSession.Free; ForkSession := nil;
+
+    ForkSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    ForkSession.Reset();           // deliberately a different live state...
+    ForkSession.RestoreSnapshot(Snap);   // ...overwritten by the snapshot.
+    for T := PromptLen to TotalLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      ForkSession.StepForward(StepIn, T);
+      AssertEquals('forked continuation size pos ' + IntToStr(T),
+        Length(RefOut[T]), ForkSession.Output().Size);
+      for D := 0 to ForkSession.Output().Size - 1 do
+        AssertTrue('BIT-IDENTICAL pos ' + IntToStr(T) + ' dim ' + IntToStr(D) +
+          ' ref=' + FloatToStr(RefOut[T][D]) + ' fork=' +
+          FloatToStr(ForkSession.Output().FData[D]),
+          RefOut[T][D] = ForkSession.Output().FData[D]);
+    end;
+  finally
+    Snap.Free;
+    ForkSession.Free;
+    RefSession.Free;
+    StepIn.Free;
+    Twin.Free;
+  end;
+end;
+
+// Same bit-identical fork gate for the recurrent (SSM) family: the snapshot must
+// also carry the persisted recurrent state h, so continuation from a fork equals
+// continuation from a session that streamed the whole prefix.
+procedure TTestNeuralDecode.TestStreamingDecoderForkContinuationBitIdenticalSSM;
+const
+  PromptLen = 4;
+  TotalLen  = 9;
+  Toks: array[0..8] of integer = (5, 2, 9, 9, 1, 7, 3, 10, 6);
+var
+  Twin: TNNet;
+  RefSession, ForkSession: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  RefOut: array[PromptLen..TotalLen - 1] of array of TNeuralFloat;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinySSMLM(1);
+  RefSession := nil; ForkSession := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    RefSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    RefSession.Reset();
+    for T := 0 to TotalLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      RefSession.StepForward(StepIn, T);
+      if T >= PromptLen then
+      begin
+        SetLength(RefOut[T], RefSession.Output().Size);
+        for D := 0 to RefSession.Output().Size - 1 do
+          RefOut[T][D] := RefSession.Output().FData[D];
+      end;
+    end;
+    RefSession.Free; RefSession := nil;
+
+    ForkSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    ForkSession.Reset();
+    for T := 0 to PromptLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      ForkSession.StepForward(StepIn, T);
+    end;
+    Snap := ForkSession.Snapshot();
+    AssertEquals('snapshot captured the SSM layer', ForkSession.SSMCount,
+      Snap.SSMCount);
+    ForkSession.Free; ForkSession := nil;
+
+    ForkSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    ForkSession.Reset();
+    ForkSession.RestoreSnapshot(Snap);
+    for T := PromptLen to TotalLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      ForkSession.StepForward(StepIn, T);
+      for D := 0 to ForkSession.Output().Size - 1 do
+        AssertTrue('SSM BIT-IDENTICAL pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          RefOut[T][D] = ForkSession.Output().FData[D]);
+    end;
+  finally
+    Snap.Free;
+    ForkSession.Free;
+    RefSession.Free;
+    StepIn.Free;
+    Twin.Free;
+  end;
+end;
+
+// One snapshot forks MANY independent sessions: prefill a shared prompt once,
+// snapshot it, then restore it into the SAME session twice with DIFFERENT
+// continuations. The snapshot must be untouched by the first continuation (the
+// fork is a deep copy, not a move), so the second restore reproduces the first
+// continuation's outputs exactly when fed the same tokens - proving the prompt
+// was prefilled once and reused, not consumed.
+procedure TTestNeuralDecode.TestStreamingDecoderSnapshotForksManyIndependentSessions;
+const
+  PromptLen = 4;
+  ContLen   = 3;
+  Toks:  array[0..6] of integer = (3, 7, 1, 9, 4, 11, 2);
+  ContB: array[0..2] of integer = (8, 5, 6);   // a DIFFERENT continuation
+var
+  Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  RunA: array[PromptLen..PromptLen + ContLen - 1] of array of TNeuralFloat;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyCausalLM(1);
+  Session := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Session := TNNetStreamingDecoder.Create(Twin, PromptLen + ContLen);
+    Session.Reset();
+    for T := 0 to PromptLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session.StepForward(StepIn, T);
+    end;
+    Snap := Session.Snapshot();
+
+    // Run A: continuation = the prompt's natural tail tokens.
+    Session.RestoreSnapshot(Snap);
+    for T := PromptLen to PromptLen + ContLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session.StepForward(StepIn, T);
+      SetLength(RunA[T], Session.Output().Size);
+      for D := 0 to Session.Output().Size - 1 do
+        RunA[T][D] := Session.Output().FData[D];
+    end;
+
+    // Run B: a DIFFERENT continuation off the SAME snapshot (perturbs the
+    // live cache well past the snapshot length).
+    Session.RestoreSnapshot(Snap);
+    for T := 0 to ContLen - 1 do
+    begin
+      StepIn.FData[0] := ContB[T];
+      Session.StepForward(StepIn, PromptLen + T);
+    end;
+
+    // Run A again off the same snapshot: must reproduce RunA bit-for-bit,
+    // proving the snapshot survived both prior restores untouched.
+    Session.RestoreSnapshot(Snap);
+    for T := PromptLen to PromptLen + ContLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session.StepForward(StepIn, T);
+      for D := 0 to Session.Output().Size - 1 do
+        AssertTrue('reusable snapshot pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          RunA[T][D] = Session.Output().FData[D]);
+    end;
+  finally
+    Snap.Free;
+    Session.Free;
+    StepIn.Free;
+    Twin.Free;
   end;
 end;
 
