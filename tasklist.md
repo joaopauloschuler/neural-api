@@ -311,7 +311,7 @@ rather than acted on.
       / layernorm / classifier). First image-in/class-out importer with a real
       label head; reuses the new preprocessing helper. Pico parity vs HF
       float64 + a real-image top-1 sanity check (e.g. a known ImageNet photo).
-- [ ] DINOv2 self-supervised ViT importer (facebook/dinov2-small) for visual
+- [X] DINOv2 self-supervised ViT importer (facebook/dinov2-small) for visual
       embeddings — distinct from CLIP/SigLIP (no text tower, no contrastive
       head; LayerScale on every block, SwiGLU-or-MLP FFN per config, optional
       register tokens, and the CLS+patch tokens are the OUTPUT). Produces
