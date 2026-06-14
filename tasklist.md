@@ -132,6 +132,13 @@ rather than acted on.
       float64 forward) asserting next-token logits < 1e-4:
       TestMiniCPM{Config,Logit}Parity. Note: MiniCPM4 / MiniCPM-MoE are
       separate follow-ups (do not scope here).
+  - [ ] MiniCPM real-checkpoint slicer follow-up (slice_llama.py reuse) to
+        parity-check a sliced openbmb/MiniCPM-1.2B/2B against the random pico
+        fixture (network/RAM-gated; the landed parity is the hand-built pico
+        oracle only).
+  - [ ] MiniCPM4 / MiniCPM-MoE importers (separate model families; MiniCPM4
+        adds its own long-context/sparse-attention pieces, MiniCPM-MoE adds the
+        Mixtral-style MoE FFN — neither is the dense-1.2B/2B path landed here).
 - [ ] InternLM2 / InternLM2.5 importer follow-up (`BuildInternLM2FromSafeTensors[Ex]`,
       model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — LANDED.
       A plain Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONLY
@@ -231,6 +238,11 @@ rather than acted on.
       TestNemotronHMoELogitParity (schedule "M*E-", all four block types) vs a
       float64 HF oracle < 1e-4 (tools/make_pico_nemotronh_moe_fixture.py;
       each MoE knob asserted non-vacuous).
+  - [ ] Nemotron-H-MoE grouped-routing follow-up: the importer REJECTS
+        n_group>1 and moe_latent_size with a clear message. Wire the
+        group-limited / latent-MoE routing path if a real Nemotron-H-MoE
+        checkpoint needs it (DeepSeek-V2-style grouped topk gate is landed —
+        reuse it).
 - [ ] Zamba2 importer (model_type "zamba2") — the sibling Mamba-2 hybrid that
       additionally shares a small set of transformer blocks across depth with a
       per-invocation LoRA adapter; needs a shared-block + LoRA wiring helper
@@ -427,7 +439,11 @@ rather than acted on.
       ~0): TestBartSafeTensorsRoundTrip / TestPegasusSafeTensorsRoundTrip /
       TestMBartSafeTensorsRoundTrip in TestNeuralPretrained.pas (import pico
       fixture -> Save* -> re-import -> RunT5 logits identical &lt; 1e-5).
-      M2M100/NLLB exporter remains a separate open follow-up.
+  - [ ] M2M100/NLLB safetensors exporter (SaveM2M100ToSafeTensors) — the last
+        open encoder-decoder exporter; ride the same SaveBartFamilyToSafeTensors
+        worker (M2M100 = pre-norm + sinusoidal positions + the M2M100 tensor
+        names), inverting BuildM2M100FromSafeTensors. Round-trip bit-exact test
+        like the BART/mBART/Pegasus trio.
 - [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
       (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
       llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
