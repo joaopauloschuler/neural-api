@@ -302,7 +302,7 @@ rather than acted on.
       fixture (make_pico_*_fixture.py recipe) and on one real image through the
       new preprocessing helper. ConvNeXt (LayerScale + GRN + depthwise 7x7,
       TNNetGRN already exists) is the modern-CNN stretch goal on the same path.
-- [ ] Standalone ViT image-classification importer
+- [X] Standalone ViT image-classification importer
       (google/vit-base-patch16-224 / timm vit) — BuildViTForImageClassification
       reusing the BuildClipVisionTower ViT path (patch-embed conv + learned pos
       table + pre-norm encoder) plus the missing pieces: a prepended CLS token,
