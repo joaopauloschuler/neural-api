@@ -3751,12 +3751,21 @@ function BuildJambaFromSafeTensors(const FileName: string;
 // and an explicit config head_dim (NOT hidden/num_heads), scaling head_dim^-0.5.
 // RMSNorm throughout. Tokenizer is a tokenizer.json BPE (already supported).
 //
-// v1 supports the M/*/- block types (the dense Nemotron-H base/4B/8B/47B).
-// The 'E'=MoE block type (Nemotron-H-MoE) is rejected with a clear message;
-// it is a separate follow-up alongside Zamba2 (Mamba-2 + shared LoRA blocks).
+// Supports the M/*/- block types (the dense Nemotron-H base/4B/8B/47B) AND
+// the 'E'=MoE block type (Nemotron-H-MoE). The MoE block is a DeepSeek-V3-style
+// SPARSE FFN that reuses the NON-GATED relu2 expert (down(ReLU(up(x))^2), no
+// gate proj - the sparse counterpart of the dense '-' MLP): a SIGMOID router
+// (NOT softmax) -> top-k selection on (sigmoid + e_score_correction_bias) ->
+// raw-sigmoid combine weights (renormalized iff norm_topk_prob) scaled by
+// routed_scaling_factor, PLUS an always-on shared expert (its own non-gated
+// relu2 MLP at moe_shared_expert_intermediate_size) summed in. Wired with the
+// landed TNNetTopKGate / TNNetBiasBalancedTopKGate (selection-bias = the
+// e_score_correction_bias, combine renormalized) + TNNetSigmoid + a
+// routed_scaling_factor TNNetMulByConstant - NO new layer. Grouped routing
+// (n_group>1) and moe_latent_size are rejected with a clear message.
 // Coded by Claude (AI).
 type
-  TNemotronHBlockType = (nhMamba2, nhAttention, nhMLP);
+  TNemotronHBlockType = (nhMamba2, nhAttention, nhMLP, nhMoE);
   TNemotronHBlockTypeArray = array of TNemotronHBlockType;
 
   TNemotronHConfig = record
@@ -3770,6 +3779,14 @@ type
     HeadDim: integer;             // head_dim (explicit, may != hidden/heads)
     // MLP
     IntermediateSize: integer;    // intermediate_size (relu2 MLP width)
+    // MoE ('E' block) - DeepSeek-V3-style sigmoid-router sparse relu2 FFN
+    NumRoutedExperts: integer;    // n_routed_experts (0 = no MoE block present)
+    NumExpertsPerTok: integer;    // num_experts_per_tok (top-k)
+    MoEIntermediateSize: integer; // moe_intermediate_size (routed-expert width)
+    NumSharedExperts: integer;    // n_shared_experts (0 or 1)
+    SharedExpertInterSize: integer; // moe_shared_expert_intermediate_size
+    NormTopKProb: boolean;        // norm_topk_prob (renormalize the top-k probs)
+    RoutedScalingFactor: double;  // routed_scaling_factor
     // mamba2 mixer
     StateSize: integer;           // ssm_state_size (d_state)
     MambaNumHeads: integer;       // mamba_num_heads
@@ -25270,6 +25287,18 @@ end;
 
 // ====================== NEMOTRON-H IMPORT (impl) =========================
 
+// True iff the parsed Nemotron-H schedule contains at least one block of the
+// given type. Used to make MoE-specific config keys required ONLY when an 'E'
+// block is actually on the schedule.
+function NemotronHHasBlock(const Config: TNemotronHConfig;
+  Bt: TNemotronHBlockType): boolean;
+var i: integer;
+begin
+  Result := False;
+  for i := 0 to Length(Config.BlockTypes) - 1 do
+    if Config.BlockTypes[i] = Bt then exit(True);
+end;
+
 function ReadNemotronHConfigFromJSONFile(
   const FileName: string): TNemotronHConfig;
 var
@@ -25354,13 +25383,10 @@ begin
       if ch = 'M' then Result.BlockTypes[i - 1] := nhMamba2
       else if ch = '*' then Result.BlockTypes[i - 1] := nhAttention
       else if ch = '-' then Result.BlockTypes[i - 1] := nhMLP
-      else if ch = 'E' then
-        ImportError('Nemotron-H import: block type ''E'' (MoE) is not wired ' +
-          'in v1 (the dense Nemotron-H base/4B/8B/47B use only M/*/-); ' +
-          'Nemotron-H-MoE is a separate follow-up.')
+      else if ch = 'E' then Result.BlockTypes[i - 1] := nhMoE
       else
         ImportError('Nemotron-H import: unknown block-type char "' + ch +
-          '" in pattern "' + Pattern + '" (expected M, *, -).');
+          '" in pattern "' + Pattern + '" (expected M, *, -, E).');
     end;
 
     Result.HiddenSize := RequiredInt('hidden_size');
@@ -25379,6 +25405,48 @@ begin
     else
       Result.HeadDim := RequiredInt('head_dim');
     Result.IntermediateSize := RequiredInt('intermediate_size');
+
+    // ---- MoE ('E' block) config (only required if the schedule has an 'E') ----
+    Result.NumRoutedExperts := Obj.Get('n_routed_experts', 0);
+    Result.NumExpertsPerTok := Obj.Get('num_experts_per_tok', 0);
+    Result.MoEIntermediateSize := Obj.Get('moe_intermediate_size', 0);
+    Result.NumSharedExperts := Obj.Get('n_shared_experts', 0);
+    Result.SharedExpertInterSize := Obj.Get('moe_shared_expert_intermediate_size',
+      Result.MoEIntermediateSize);
+    Result.NormTopKProb := Obj.Get('norm_topk_prob', True);
+    Field := Obj.Find('routed_scaling_factor');
+    if (Field <> nil) and (Field.JSONType in [jtNumber]) then
+      Result.RoutedScalingFactor := Field.AsFloat
+    else
+      Result.RoutedScalingFactor := 1.0;
+    if NemotronHHasBlock(Result, nhMoE) then
+    begin
+      if Result.NumRoutedExperts < 1 then
+        ImportError('Nemotron-H import: an ''E'' (MoE) block is on the schedule ' +
+          'but n_routed_experts (' + IntToStr(Result.NumRoutedExperts) +
+          ') is < 1.');
+      if (Result.NumExpertsPerTok < 1) or
+         (Result.NumExpertsPerTok > Result.NumRoutedExperts) then
+        ImportError('Nemotron-H import: num_experts_per_tok (' +
+          IntToStr(Result.NumExpertsPerTok) + ') must be in 1..n_routed_experts (' +
+          IntToStr(Result.NumRoutedExperts) + ').');
+      if Result.MoEIntermediateSize < 1 then
+        ImportError('Nemotron-H import: moe_intermediate_size must be >= 1 ' +
+          'for an ''E'' block.');
+      if Obj.Get('n_group', 1) > 1 then
+        ImportError('Nemotron-H import: grouped routing (n_group>1) is not ' +
+          'wired; only the ungrouped DeepSeek-V3-style top-k path is supported.');
+      Field := Obj.Find('moe_latent_size');
+      if (Field <> nil) and (not Field.IsNull) and (Field.AsInteger > 0) then
+        ImportError('Nemotron-H import: moe_latent_size (latent expert ' +
+          'projection) is not wired.');
+      if Result.NumSharedExperts > 1 then
+        ImportError('Nemotron-H import: n_shared_experts>1 is not wired (the ' +
+          'published Nemotron-H-MoE checkpoints carry a single shared expert).');
+      if Obj.Get('moe_bias', False) or Obj.Get('mlp_bias', False) then
+        ImportError('Nemotron-H import: biased MoE/MLP projections are not ' +
+          'wired (the published checkpoints keep the relu2 experts bias-free).');
+    end;
 
     Result.StateSize := Obj.Get('ssm_state_size', 128);
     if Result.StateSize < 1 then
@@ -25435,6 +25503,15 @@ begin
     ', conv_bias=' + BoolToStr(Config.UseConvBias, true) +
     ', bias=' + BoolToStr(Config.UseBias, true) +
     ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if NemotronHHasBlock(Config, nhMoE) then
+    Result := Result +
+      ', routed_experts=' + IntToStr(Config.NumRoutedExperts) +
+      ', experts_per_tok=' + IntToStr(Config.NumExpertsPerTok) +
+      ', moe_inter=' + IntToStr(Config.MoEIntermediateSize) +
+      ', shared_experts=' + IntToStr(Config.NumSharedExperts) +
+      ', shared_inter=' + IntToStr(Config.SharedExpertInterSize) +
+      ', norm_topk=' + BoolToStr(Config.NormTopKProb, true) +
+      ', routed_scale=' + FloatToStr(Config.RoutedScalingFactor);
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -25448,6 +25525,10 @@ type
     QProj, KProj, VProj, OProj: TNNetLayer;
     // relu2 MLP
     UpProj, DownProj: TNNetLayer;
+    // MoE ('E' block): router + per-expert up/down + shared-expert up/down
+    GateConv: TNNetLayer;
+    SharedUp, SharedDown: TNNetLayer;
+    ExpertUp, ExpertDown: array of TNNetLayer;
   end;
 
 function BuildNemotronHFromSafeTensorsWithConfig(const FileName: string;
@@ -25460,11 +25541,12 @@ var
   EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
   BranchInput, NormedSrc, XBCConv, DtSplit, GateSplit: TNNetLayer;
   QSlice, HeadPack: TNNetLayer;
-  KSlices, VSlices, HeadOutputs: array of TNNetLayer;
+  GateTopK, GateScaled, SharedOut, ExpertOut, GateE, GateEB: TNNetLayer;
+  KSlices, VSlices, HeadOutputs, MoEBranches: array of TNNetLayer;
   BlockCnt, SeqLen, i, j, d, ConvDim, ProjSize, ConvBiasSuppress: integer;
-  QWidth, KVWidth, GroupSize, HeadCnt, KVHeadCnt, KVGroup: integer;
-  Tmp: TNNetVolume;
-  MixPrefix, LayerP, AttP, TensorNameStr, InBias, OutBias: string;
+  QWidth, KVWidth, GroupSize, HeadCnt, KVHeadCnt, KVGroup, e: integer;
+  Tmp, BiasVec: TNNetVolume;
+  MixPrefix, LayerP, AttP, TensorNameStr, InBias, OutBias, MoeP: string;
   Consumed: TStringList;
   SliceChannels: array of integer;
 
@@ -25525,10 +25607,40 @@ var
     Layer.FlushWeightCache();
   end;
 
+  // Loads expert ExpertIdx's [OutDim, InDim] slice from a 3D MoE expert slab
+  // [NumExperts, OutDim, InDim] (PyTorch nn.Parameter, weight rows = outputs)
+  // into a TNNetPointwiseConvLinear (neuron o = output channel, bias-free).
+  procedure LoadMoEExpertSlice(Layer: TNNetLayer; const TName: string;
+    ExpertIdx, NumExperts, OutDim, InDim: integer);
+  var oo, ii, ExpertBase: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('Nemotron-H import: missing tensor "' + TName + '".');
+    if (Reader.DimCount(TName) <> 3) or
+       (Reader.DimSize(TName, 0) <> NumExperts) or
+       (Reader.DimSize(TName, 1) <> OutDim) or
+       (Reader.DimSize(TName, 2) <> InDim) then
+      ImportError('Nemotron-H import: MoE expert slab "' + TName +
+        '" must have shape [' + IntToStr(NumExperts) + ', ' + IntToStr(OutDim) +
+        ', ' + IntToStr(InDim) + '], got ' + Reader.ShapeAsString(TName));
+    Reader.LoadTensorFlat(TName, Tmp);
+    EnsureWritableImportWeights(Layer);
+    ExpertBase := ExpertIdx * OutDim * InDim;
+    for oo := 0 to OutDim - 1 do
+    begin
+      for ii := 0 to InDim - 1 do
+        Layer.Neurons[oo].Weights.FData[ii] :=
+          Tmp.FData[ExpertBase + oo * InDim + ii];
+      Layer.Neurons[oo].BiasWeight := 0;
+    end;
+    Layer.FlushWeightCache();
+  end;
+
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
   Tmp := TNNetVolume.Create;
+  BiasVec := TNNetVolume.Create;
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
   Consumed.Duplicates := dupIgnore;
@@ -25659,6 +25771,72 @@ begin
             Blocks[BlockCnt].DownProj := NN.AddLayer(
               TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
           end;
+          nhMoE:
+          begin
+            // DeepSeek-V3-style sparse FFN with NON-GATED relu2 experts.
+            //   router  : Linear(E) -> sigmoid -> top-k on (sig + e_score
+            //             correction bias) -> raw-sigmoid combine weights
+            //             (renormalized iff norm_topk_prob) * routed_scaling.
+            //   experts : down(ReLU(up(x))^2), bias-free, NO gate proj.
+            //   shared  : one always-on non-gated relu2 MLP, summed in.
+            SetLength(Blocks[BlockCnt].ExpertUp, Config.NumRoutedExperts);
+            SetLength(Blocks[BlockCnt].ExpertDown, Config.NumRoutedExperts);
+            SetLength(MoEBranches, Config.NumRoutedExperts +
+              Ord(Config.NumSharedExperts > 0));
+            // Always-on shared expert (its own relu2 MLP) - the residual
+            // (PRE-router) source is NormedSrc, same as the routed experts.
+            if Config.NumSharedExperts > 0 then
+            begin
+              Blocks[BlockCnt].SharedUp := NN.AddLayerAfter(
+                TNNetPointwiseConvLinear.Create(Config.SharedExpertInterSize, 1),
+                NormedSrc);
+              NN.AddLayer( TNNetReLU.Create() );
+              NN.AddLayer( TNNetSquare.Create() );
+              Blocks[BlockCnt].SharedDown := NN.AddLayer(
+                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+              SharedOut := NN.GetLastLayer();
+            end
+            else SharedOut := nil;
+            // Router: sigmoid logits -> top-k gate. The selection bias (the
+            // e_score_correction_bias) lives on a TNNetBiasBalancedTopKGate;
+            // when norm_topk_prob the gate already renormalizes the survivors.
+            Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(Config.NumRoutedExperts, 1),
+              NormedSrc);
+            NN.AddLayer( TNNetSigmoid.Create() );
+            if Config.NormTopKProb then
+              GateTopK := NN.AddLayer( TNNetBiasBalancedTopKGate.Create(
+                Config.NumExpertsPerTok, {BalanceBiasSpeed=}0) )
+            else
+              GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+                Config.NumExpertsPerTok, {pRenormalize=}false) );
+            if Config.RoutedScalingFactor <> 1.0 then
+              GateScaled := NN.AddLayer(
+                TNNetMulByConstant.Create(Config.RoutedScalingFactor) )
+            else
+              GateScaled := GateTopK;
+            for e := 0 to Config.NumRoutedExperts - 1 do
+            begin
+              Blocks[BlockCnt].ExpertUp[e] := NN.AddLayerAfter(
+                TNNetPointwiseConvLinear.Create(Config.MoEIntermediateSize, 1),
+                NormedSrc);
+              NN.AddLayer( TNNetReLU.Create() );
+              NN.AddLayer( TNNetSquare.Create() );
+              Blocks[BlockCnt].ExpertDown[e] := NN.AddLayer(
+                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+              ExpertOut := NN.GetLastLayer();
+              GateE := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(e, 1), GateScaled);
+              GateEB := NN.AddLayer(
+                TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
+              MoEBranches[e] := NN.AddLayer(
+                TNNetCellMulByCell.Create(ExpertOut, GateEB) );
+            end;
+            if SharedOut <> nil then
+              MoEBranches[Config.NumRoutedExperts] := SharedOut;
+            NN.AddLayer( TNNetSum.Create(MoEBranches) );
+            SetLength(MoEBranches, 0);
+          end;
         end;
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if pInferenceOnly then NN.MakeInferenceOnly();
@@ -25757,6 +25935,68 @@ begin
             MarkConsumed(MixPrefix + 'up_proj.weight');
             MarkConsumed(MixPrefix + 'down_proj.weight');
           end;
+          nhMoE:
+          begin
+            MoeP := LayerP + 'mixer.';
+            // Router (bias-free Linear): logits = gate.weight @ x.
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateConv,
+              MoeP + 'gate.weight', Config.HiddenSize, Config.NumRoutedExperts);
+            MarkConsumed(MoeP + 'gate.weight');
+            // Per-expert selection bias (e_score_correction_bias). When
+            // norm_topk_prob the gate is a TNNetBiasBalancedTopKGate whose
+            // neuron[0] holds the per-expert additive selection bias; when not
+            // there is no bias slot, so a non-zero bias would be silently
+            // dropped - reject it rather than import incorrectly.
+            if Reader.HasTensor(MoeP + 'gate.e_score_correction_bias') then
+            begin
+              Reader.LoadTensorFlat(MoeP + 'gate.e_score_correction_bias',
+                BiasVec);
+              if BiasVec.Size <> Config.NumRoutedExperts then
+                ImportError('Nemotron-H import: "' + MoeP +
+                  'gate.e_score_correction_bias" must carry ' +
+                  IntToStr(Config.NumRoutedExperts) + ' elements.');
+              if Config.NormTopKProb then
+              begin
+                EnsureWritableImportWeights(GateTopK);
+                for e := 0 to Config.NumRoutedExperts - 1 do
+                  GateTopK.Neurons[0].Weights.FData[e] := BiasVec.FData[e];
+                GateTopK.FlushWeightCache();
+              end
+              else
+              begin
+                for e := 0 to Config.NumRoutedExperts - 1 do
+                  if BiasVec.FData[e] <> 0 then
+                    ImportError('Nemotron-H import: a non-zero ' +
+                      'e_score_correction_bias with norm_topk_prob=false is ' +
+                      'not wired (no biased non-renormalizing gate variant).');
+              end;
+              MarkConsumed(MoeP + 'gate.e_score_correction_bias');
+            end;
+            // Routed experts: 3D slabs [E, *, *].
+            for e := 0 to Config.NumRoutedExperts - 1 do
+            begin
+              LoadMoEExpertSlice(Blocks[BlockCnt].ExpertUp[e],
+                MoeP + 'experts.up_proj', e, Config.NumRoutedExperts,
+                Config.MoEIntermediateSize, Config.HiddenSize);
+              LoadMoEExpertSlice(Blocks[BlockCnt].ExpertDown[e],
+                MoeP + 'experts.down_proj', e, Config.NumRoutedExperts,
+                Config.HiddenSize, Config.MoEIntermediateSize);
+            end;
+            MarkConsumed(MoeP + 'experts.up_proj');
+            MarkConsumed(MoeP + 'experts.down_proj');
+            // Shared expert (a plain non-gated relu2 MLP).
+            if Config.NumSharedExperts > 0 then
+            begin
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedUp,
+                MoeP + 'shared_experts.up_proj.weight', Config.HiddenSize,
+                Config.SharedExpertInterSize);
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedDown,
+                MoeP + 'shared_experts.down_proj.weight',
+                Config.SharedExpertInterSize, Config.HiddenSize);
+              MarkConsumed(MoeP + 'shared_experts.up_proj.weight');
+              MarkConsumed(MoeP + 'shared_experts.down_proj.weight');
+            end;
+          end;
         end;
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
@@ -25782,6 +26022,7 @@ begin
   finally
     NN.Free;
     Consumed.Free;
+    BiasVec.Free;
     Tmp.Free;
     Reader.Free;
   end;

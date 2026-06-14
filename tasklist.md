@@ -217,12 +217,20 @@ rather than acted on.
       is forward-only — add backward through the dt/B/C RMSNorms for fine-tuning;
       (c) no Jamba-specific tokenizer demo (raw ids work); (d) no real-checkpoint
       slicer fixture (parity uses a random pico model).
-- [ ] Nemotron-H-MoE ('E' block type) follow-up to the landed
-      BuildNemotronHFromSafeTensors — the importer currently REJECTS the 'E'
-      (MoE) block type with a clear message. Add the DeepSeek/Mixtral-style
-      top-k MoE FFN block (n_routed_experts, num_experts_per_tok,
-      norm_topk_prob, routed_scaling_factor, n_shared_experts) on the
-      Nemotron-H schedule path; reuse the landed TopKGate/expert machinery.
+- [X] Nemotron-H-MoE ('E' block type) follow-up to the landed
+      BuildNemotronHFromSafeTensors — the 'E' (MoE) block is now wired as a
+      DeepSeek-V3-style sparse FFN with NON-GATED relu2 experts: sigmoid router
+      -> top-k selection on (sigmoid + e_score_correction_bias) -> raw-sigmoid
+      combine weights renormalized iff norm_topk_prob then scaled by
+      routed_scaling_factor, plus an always-on shared expert. Config keys
+      n_routed_experts/num_experts_per_tok/moe_intermediate_size/
+      norm_topk_prob/routed_scaling_factor/n_shared_experts wired; reuses the
+      landed TNNetBiasBalancedTopKGate/TNNetTopKGate + TNNetSigmoid +
+      TNNetMulByConstant (NO new layer). Grouped routing (n_group>1) and
+      moe_latent_size rejected with a clear message. Verified by
+      TestNemotronHMoELogitParity (schedule "M*E-", all four block types) vs a
+      float64 HF oracle < 1e-4 (tools/make_pico_nemotronh_moe_fixture.py;
+      each MoE knob asserted non-vacuous).
 - [ ] Zamba2 importer (model_type "zamba2") — the sibling Mamba-2 hybrid that
       additionally shares a small set of transformer blocks across depth with a
       per-invocation LoRA adapter; needs a shared-block + LoRA wiring helper
