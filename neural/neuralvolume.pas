@@ -57,6 +57,7 @@ const
 type
   TNeuralFloat = Single;
   TNeuralFloatDynArr = array of TNeuralFloat;
+  TInt8DynArr = array of ShortInt;
   TNeuralFloatPtr = ^TNeuralFloat;
 
   TNeuralFloat4 = array[0..3] of TNeuralFloat;

@@ -537,6 +537,14 @@ type
       // Bytes held by the int8 container (codes + scales).
       // Coded by Claude (AI).
       function Int8QuantizedSizeBytes(): int64;
+      // Copies the int8 weight-only storage out for direct re-export (e.g.
+      // the GGUF writer's Q8_0-from-int8 path) without dequantizing: pCodes
+      // receives NumRows*VS row-major symmetric codes, pScales the NumRows
+      // per-output-row FP32 scales (dequant value = code * scale). Returns
+      // false (and leaves the args empty) when the layer is not int8
+      // quantized. // Coded by Claude (AI).
+      function GetInt8QuantData(out pCodes: TInt8DynArr;
+        out pScales: TNeuralFloatDynArr; out NumRows, VS: integer): boolean;
       property WeightsQuantizedInt8: boolean read FQuantInt8;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
@@ -47219,6 +47227,25 @@ function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
 begin
   Result := int64(Length(FQuantCodes)) * SizeOf(ShortInt) +
     int64(Length(FQuantScales)) * SizeOf(TNeuralFloat);
+end;
+
+function TNNetLayerConcatedWeights.GetInt8QuantData(out pCodes: TInt8DynArr;
+  out pScales: TNeuralFloatDynArr; out NumRows, VS: integer): boolean;
+var
+  i: integer;
+begin
+  SetLength(pCodes, 0);
+  SetLength(pScales, 0);
+  NumRows := 0;
+  VS := 0;
+  Result := FQuantInt8;
+  if not Result then exit;
+  NumRows := FNeurons.Count;
+  VS := FQuantVectorSize;
+  SetLength(pCodes, Length(FQuantCodes));
+  for i := 0 to Length(FQuantCodes) - 1 do pCodes[i] := FQuantCodes[i];
+  SetLength(pScales, Length(FQuantScales));
+  for i := 0 to Length(FQuantScales) - 1 do pScales[i] := FQuantScales[i];
 end;
 
 procedure TNNetLayerConcatedWeights.BuildBiasOutput();

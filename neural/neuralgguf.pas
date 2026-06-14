@@ -259,6 +259,24 @@ type
     // freed/reused immediately.
     procedure AddTensorFlat(const pName: string; const pShape: array of Int64;
       Src: TNNetVolume; pDType: TGGUFWriteDType = gwF32);
+    // Queues a Q8_0 tensor built DIRECTLY from int8 weight-only storage
+    // (TNNetLayerConcatedWeights.QuantizeWeightsInt8: per-output-row symmetric
+    // codes + one FP32 scale per row, dequant value = code * RowScale[r]),
+    // without materializing the FP32 matrix. pShape is [out, in] (row-major,
+    // as the reader serves it); the contiguous (last = in) dimension must be a
+    // multiple of 32 AND each int8 row is exactly one output channel, so a
+    // Q8_0 32-block never crosses a row boundary. pCodes holds NumRows * VS
+    // codes in row-major order (row r at pCodes[r*VS .. r*VS+VS-1]); pScales
+    // holds NumRows scales. The FAITHFUL mapping is NOT a byte copy (Q8_0 uses
+    // one f16 scale per 32-block, int8 storage uses one scale per row): for
+    // each block we recompute blockscale = max|code|*RowScale/127 and emit
+    // q[i] = round(code[i]*127 / max|code|) (the row scale cancels in the
+    // quants, surviving only in the f16 d). This reproduces the SAME bytes the
+    // gwQ8_0 path would emit from the DEQUANTIZED FP32 row, within Q8_0
+    // rounding. Coded by Claude (AI).
+    procedure AddTensorFlatInt8(const pName: string;
+      const pShape: array of Int64; const pCodes: array of ShortInt;
+      const pScales: array of single; NumRows, VS: integer);
     function Count: integer;
     // Writes the queued metadata and tensors to FileName. Call once.
     procedure SaveToFile;
@@ -1395,6 +1413,122 @@ begin
           QuantPtr^ := ShortInt(e);
           Inc(QuantPtr);
         end;
+      end;
+    end;
+  end;
+
+  Idx := Length(FTensors);
+  SetLength(FTensors, Idx + 1);
+  FTensors[Idx] := Pending;
+end;
+
+procedure TNNetGGUFWriter.AddTensorFlatInt8(const pName: string;
+  const pShape: array of Int64; const pCodes: array of ShortInt;
+  const pScales: array of single; NumRows, VS: integer);
+var
+  Idx, i, ContigDim, r, AbsMaxCode, c: integer;
+  NumElements, NumBlocks, RowBlocks, b, RowBase, BlockBase, e: Int64;
+  QuantPtr: PShortInt;
+  ScalePtr: PWord;
+  Scale, Q: single;
+  Pending: TGGUFPendingTensor;
+begin
+  if FSaved then
+    raise EGGUFError.Create('gguf writer: AddTensorFlatInt8 after SaveToFile.');
+  if pName = '' then
+    raise EGGUFError.Create('gguf writer: empty tensor name.');
+  if FindTensor(pName) >= 0 then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: duplicate tensor name "%s".', [pName]);
+  if Length(pShape) = 0 then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: tensor "%s" needs at least one dimension.', [pName]);
+  if (NumRows <= 0) or (VS <= 0) then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: tensor "%s" int8 source has non-positive geometry ' +
+      '(%d rows x %d).', [pName, NumRows, VS]);
+  NumElements := 1;
+  for i := 0 to High(pShape) do
+  begin
+    if pShape[i] <= 0 then
+      raise EGGUFError.CreateFmt(
+        'gguf writer: tensor "%s" has a non-positive dimension %d.',
+        [pName, pShape[i]]);
+    NumElements := NumElements * pShape[i];
+  end;
+  if NumElements <> Int64(NumRows) * VS then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: tensor "%s" shape implies %d elements but the int8 ' +
+      'source holds %d rows x %d = %d.',
+      [pName, NumElements, NumRows, VS, Int64(NumRows) * VS]);
+  if Length(pCodes) < NumRows * VS then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: tensor "%s" int8 source has %d codes, expected %d.',
+      [pName, Length(pCodes), NumRows * VS]);
+  if Length(pScales) < NumRows then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: tensor "%s" int8 source has %d scales, expected %d.',
+      [pName, Length(pScales), NumRows]);
+  // The int8 storage is per-row symmetric; a Q8_0 32-block must stay inside
+  // one row so its f16 scale derives from a single row scale. The contiguous
+  // (last) dimension MUST equal the int8 vector size AND be a 32 multiple.
+  ContigDim := integer(pShape[High(pShape)]);
+  if ContigDim <> VS then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: tensor "%s" Q8_0-from-int8 needs the contiguous ' +
+      'dimension (%d) to equal the int8 vector size (%d) so 32-blocks do ' +
+      'not cross row boundaries.', [pName, ContigDim, VS]);
+  if (VS mod GGUF_Q8_0_BLOCK_ELEMS) <> 0 then
+    raise EGGUFError.CreateFmt(
+      'gguf writer: tensor "%s" is Q8_0 but its contiguous dimension %d is ' +
+      'not a multiple of the block size %d.',
+      [pName, VS, GGUF_Q8_0_BLOCK_ELEMS]);
+
+  Pending := Default(TGGUFPendingTensor);
+  Pending.Name := pName;
+  SetLength(Pending.Shape, Length(pShape));
+  for i := 0 to High(pShape) do Pending.Shape[i] := pShape[i];
+  Pending.GGMLType := GGML_TYPE_Q8_0;
+  NumBlocks := NumElements div GGUF_Q8_0_BLOCK_ELEMS;
+  SetLength(Pending.Data, NumBlocks * GGUF_Q8_0_BLOCK_BYTES);
+  RowBlocks := VS div GGUF_Q8_0_BLOCK_ELEMS;
+  for r := 0 to NumRows - 1 do
+  begin
+    RowBase := Int64(r) * VS;
+    for b := 0 to RowBlocks - 1 do
+    begin
+      BlockBase := RowBase + b * GGUF_Q8_0_BLOCK_ELEMS;
+      // Per-block absmax over the int8 CODES; the true FP32 value is
+      // code * RowScale, so max|x| = AbsMaxCode * RowScale and the Q8_0
+      // block scale = max|x|/127. The row scale rides into d only; the
+      // quants q[i] = round(code[i]*127 / AbsMaxCode) are scale-invariant.
+      AbsMaxCode := 0;
+      for i := 0 to GGUF_Q8_0_BLOCK_ELEMS - 1 do
+      begin
+        c := pCodes[BlockBase + i];
+        if c < 0 then c := -c;
+        if c > AbsMaxCode then AbsMaxCode := c;
+      end;
+      Scale := (AbsMaxCode * pScales[r]) / 127.0;
+      ScalePtr := PWord(@Pending.Data[(Int64(r) * RowBlocks + b) *
+        GGUF_Q8_0_BLOCK_BYTES]);
+      ScalePtr^ := EncodeF16(Scale);
+      QuantPtr := PShortInt(@Pending.Data[(Int64(r) * RowBlocks + b) *
+        GGUF_Q8_0_BLOCK_BYTES + 2]);
+      for i := 0 to GGUF_Q8_0_BLOCK_ELEMS - 1 do
+      begin
+        if AbsMaxCode = 0 then
+          e := 0
+        else
+        begin
+          Q := (pCodes[BlockBase + i] * 127.0) / AbsMaxCode;
+          // round-half-away-from-zero then clamp to [-127, 127]
+          if Q >= 0 then e := Trunc(Q + 0.5) else e := Trunc(Q - 0.5);
+          if e > 127 then e := 127;
+          if e < -127 then e := -127;
+        end;
+        QuantPtr^ := ShortInt(e);
+        Inc(QuantPtr);
       end;
     end;
   end;

@@ -152,6 +152,7 @@ type
     procedure TestGGUFWriterRoundTrip;
     procedure TestGGUFWriterGpt2TokenizerRoundTrip;
     procedure TestTNNetGGUFWriterRoundTrip;
+    procedure TestGGUFWriterQ8FromInt8;
     procedure TestMXFP4DequantHandBlock;
     procedure TestMXFP4DequantNaNScale;
     procedure TestShardedReaderMatchesSingleFile;
@@ -4304,6 +4305,128 @@ begin
     OutG.Free; OutR.Free; Input.Free;
     NNG.Free; NNRef.Free;
     DeleteFile(GGUFPath);
+  end;
+end;
+
+// Q8_0-direct-from-int8 writer path: when a layer already holds the int8
+// weight-only blocks (per-output-row symmetric codes + one FP32 scale per
+// row), TNNetGGUFWriter.AddTensorFlatInt8 builds Q8_0 WITHOUT materializing
+// the FP32 matrix. The scale granularities differ (Q8_0: one f16 d per
+// 32-block; int8 storage: one scale per row), so the mapping is not a byte
+// copy - it recomputes a per-block scale from the int8 codes' magnitude. This
+// asserts that the int8-sourced Q8_0 bytes EQUAL the Q8_0 bytes the existing
+// F32->Q8_0 path emits from the DEQUANTIZED row (the faithful equivalence),
+// and that a reader round-trip reproduces the dequantized weights within Q8_0
+// tolerance. // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestGGUFWriterQ8FromInt8;
+const
+  InDim = 64;   // multiple of 32 so a Q8_0 block stays inside one row
+  OutDim = 5;
+var
+  NN: TNNet;
+  FCLayer: TNNetLayer;
+  QL: TNNetLayerConcatedWeights;
+  Codes: TInt8DynArr;
+  Scales: TNeuralFloatDynArr;
+  NumRows, VS, n, i: integer;
+  DequantFlat: TNNetVolume;
+  WInt8, WF32: TNNetGGUFWriter;
+  Reader: TNNetGGUFReader;
+  ReadInt8, ReadF32, Dequant: TNNetVolume;
+  PathInt8, PathF32: string;
+  MaxByteDiff, MaxValDiff, MaxAbsW: double;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(InDim, 1, 1) );
+  FCLayer := NN.AddLayer( TNNetFullConnect.Create(OutDim) );
+  DequantFlat := TNNetVolume.Create(OutDim * InDim, 1, 1);
+  Dequant := TNNetVolume.Create(OutDim * InDim, 1, 1);
+  ReadInt8 := TNNetVolume.Create;
+  ReadF32 := TNNetVolume.Create;
+  PathInt8 := GetTempDir(false) + 'cai_q8_from_int8_a_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  PathF32 := GetTempDir(false) + 'cai_q8_from_int8_b_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  try
+    // Asymmetric weights with a NEGATIVE largest-magnitude element per row
+    // (exercises the GetMaxAbs-driven scale too).
+    for n := 0 to OutDim - 1 do
+      for i := 0 to InDim - 1 do
+        FCLayer.Neurons[n].Weights.FData[i] := -Cos(0.37 * (n * InDim + i)) * 0.8;
+
+    QL := TNNetLayerConcatedWeights(FCLayer);
+    QL.QuantizeWeightsInt8();
+    AssertTrue('layer quantized', QL.WeightsQuantizedInt8);
+    AssertTrue('int8 data extracted',
+      QL.GetInt8QuantData(Codes, Scales, NumRows, VS));
+    AssertEquals('rows', OutDim, NumRows);
+    AssertEquals('vector size', InDim, VS);
+
+    // Build the reference FP32 dequantized matrix [out, in] row-major from the
+    // SAME int8 codes/scales (value = code * row scale).
+    for n := 0 to NumRows - 1 do
+      for i := 0 to VS - 1 do
+        DequantFlat.FData[n * VS + i] := Codes[n * VS + i] * Scales[n];
+    Dequant.Copy(DequantFlat);
+
+    // Path A: Q8_0 straight from int8 storage (no FP32 round trip).
+    WInt8 := TNNetGGUFWriter.Create(PathInt8);
+    try
+      WInt8.AddTensorFlatInt8('w', [OutDim, InDim], Codes, Scales, NumRows, VS);
+      WInt8.SaveToFile;
+    finally
+      WInt8.Free;
+    end;
+    // Path B: the existing F32->Q8_0 quantizer fed the dequantized FP32 row.
+    WF32 := TNNetGGUFWriter.Create(PathF32);
+    try
+      WF32.AddTensorFlat('w', [OutDim, InDim], DequantFlat, gwQ8_0);
+      WF32.SaveToFile;
+    finally
+      WF32.Free;
+    end;
+
+    // (1) The encoded Q8_0 payloads must DECODE identically (the faithful
+    // equivalence: same f16 block scales and same int8 quants).
+    Reader := TNNetGGUFReader.Create(PathInt8);
+    try
+      AssertEquals('int8-sourced tensor is Q8_0', GGML_TYPE_Q8_0,
+        Reader.TensorGGMLType('w'));
+      Reader.LoadTensorFlat('w', ReadInt8);
+    finally
+      Reader.Free;
+    end;
+    Reader := TNNetGGUFReader.Create(PathF32);
+    try
+      Reader.LoadTensorFlat('w', ReadF32);
+    finally
+      Reader.Free;
+    end;
+    AssertEquals('decoded sizes match', ReadF32.Size, ReadInt8.Size);
+    MaxByteDiff := 0;
+    for i := 0 to ReadInt8.Size - 1 do
+      if Abs(ReadInt8.FData[i] - ReadF32.FData[i]) > MaxByteDiff then
+        MaxByteDiff := Abs(ReadInt8.FData[i] - ReadF32.FData[i]);
+    AssertTrue('int8-sourced Q8_0 must decode IDENTICALLY to F32-sourced ' +
+      'Q8_0 (max |diff| = ' + FloatToStr(MaxByteDiff) + ')',
+      MaxByteDiff < 1e-6);
+
+    // (2) Read-back must reproduce the dequantized weights within Q8_0
+    // tolerance (one int8 step of the per-block scale ~= max|row|/127).
+    MaxValDiff := 0; MaxAbsW := 0;
+    for i := 0 to Dequant.Size - 1 do
+    begin
+      if Abs(Dequant.FData[i]) > MaxAbsW then MaxAbsW := Abs(Dequant.FData[i]);
+      if Abs(ReadInt8.FData[i] - Dequant.FData[i]) > MaxValDiff then
+        MaxValDiff := Abs(ReadInt8.FData[i] - Dequant.FData[i]);
+    end;
+    AssertTrue('reference non-degenerate', MaxAbsW > 1e-3);
+    AssertTrue('Q8_0 read-back of int8 weights within tolerance (rel ' +
+      FloatToStr(MaxValDiff / MaxAbsW) + ')', MaxValDiff / MaxAbsW < 2e-2);
+  finally
+    DequantFlat.Free; Dequant.Free; ReadInt8.Free; ReadF32.Free; NN.Free;
+    DeleteFile(PathInt8); DeleteFile(PathF32);
   end;
 end;
 
