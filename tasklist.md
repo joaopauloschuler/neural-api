@@ -99,7 +99,7 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] InternLM2 / InternLM2.5 importer (`BuildInternLM2FromSafeTensors[Ex]`,
+- [ ] InternLM2 / InternLM2.5 importer follow-up (`BuildInternLM2FromSafeTensors[Ex]`,
       model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — LANDED.
       A plain Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONLY
       genuinely new piece is the checkpoint LAYOUT, resolved by an
@@ -265,11 +265,6 @@ rather than acted on.
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
-- [X] Quantized inference follow-up: TVolume.GetMaxAbs signed-seed fix LANDED
-      (commit a0d4d40): now seeds with abs(FData[0]) so a negative
-      largest-magnitude element 0 is not missed. Caller audit confirmed all
-      consumers (ForceMaxAbs/NormalizeMax/int8 scale/csErrorOverflowBackpropProtection)
-      treat the result as a magnitude. Test TestVolumeMaxAbsNegativeFirst.
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
       (b) DONE — raw SentencePiece .model protobuf path landed
       (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
@@ -432,12 +427,6 @@ rather than acted on.
       (bit-exact)): add a layer->HF-name + transpose inverse map for the
       REMAINING architectures — only the ENCODER-DECODER importers (T5/Marian,
       each its own two-net map) now remain on this entry.
-- [X] GGUF writer follow-up: write Q8_0 STRAIGHT from int8 weight-only storage
-      LANDED (commit 5f6fd0b): TNNetGGUFWriter.AddTensorFlatInt8 +
-      TNNetLayerConcatedWeights.GetInt8QuantData build Q8_0 from int8 codes +
-      per-row scales with NO F32 matrix materialization. Per-row scale cancels in
-      the quants (survives only in the f16 d), so output is bit-identical to the
-      F32->Q8_0 path. Test TestGGUFWriterQ8FromInt8.
 - [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
       (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
       llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
@@ -489,12 +478,6 @@ rather than acted on.
       but NN.Compute has no SIMD batch axis on the char path, so each step still
       pays one forward per running row. The vectorized batch is the actual
       prerequisite for an efficient speculative-decoding verify step.
-- [X] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
-      LANDED (commit f34dcae): class function ProfileReport(NN, Sample, Target=nil,
-      Iterations=20): string — per-layer table (index/class/shape/us-fwd/us-bwd/
-      param elems+bytes/activation elems+bytes + TOTAL), reusing the framework
-      FForwardTime/FBackwardTime accumulators (combines the pre-existing
-      LayerTimingReport + MemoryFootprintReport). Test TestProfileReportStructureAndCounts.
 - [ ] FlashAttention-style tiled online-softmax SDPA forward: opt-in fast
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
@@ -536,62 +519,6 @@ rather than acted on.
       plumbing, tests in tests/TestNeuralGRPO.pas): ORPO / SimPO / KTO
       loss-formula deltas on the landed DPO trainer, and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real (learned) rewards.
-- [X] Offset-mapping follow-up: EncodeWithOffsets byte-exact — LANDED
-      (commit fdc4e5d). Rewrote the post-hoc decoded-surface PosEx search into a
-      per-token byte-consumption walk: DecodeToken surface bytes matched
-      byte-for-byte against the original text from a running cursor, giving every
-      token (byte-fallback fragments, metaspace/leading-space, split multi-byte
-      chars, WordPiece ##) a non-degenerate span. Convention: each byte token of a
-      split char maps to its own source-byte sub-range; concatenated spans
-      reproduce the input verbatim. Test TestOffsetMappingByteFallbackExact on the
-      tiny_spm_bytefallback.model fixture.
-- [X] JSON-Schema -> GBNF compiler for structured / function-calling output
-      LANDED (commit b53f3a5): CompileJSONSchemaToGBNF + CreateJSONSchemaConstraint
-      in neuraldecode.pas (TJSONSchemaCompiler walk), examples/StructuredOutput,
-      tests TestSchemaGBNF*. Covers object/array/string(enum,pattern)/number/
-      integer/boolean/null/anyOf/oneOf/$ref+$defs recursion; allOf/format/numeric
-      bounds documented out-of-scope.
-      (the one piece of the "JSON mode" stack still missing). The decode side
-      is fully landed: TNNetGrammar compiles GBNF text to a flat pushdown and
-      TNNetGrammarConstraint masks logits to grammar-legal tokens, plus the
-      hardcoded TNNetJSONConstraint for free-form JSON. What is absent is the
-      bridge every serving stack ships (llama.cpp json-schema-to-grammar.cpp /
-      Outlines / vLLM guided_json): take a JSON Schema and EMIT a GBNF string
-      that the existing TNNetGrammar already consumes — so a model can be
-      constrained to a CALLER-SUPPLIED shape (tool-call arguments, typed
-      extraction) instead of just "some JSON". A standalone
-      CompileJSONSchemaToGBNF(SchemaJSON: string): string in neuraldecode.pas
-      (parse the schema via the same TJSONParser(s,[]) the tokenizer uses, walk
-      it to GBNF rules), covering the practical subset: object with
-      properties + required (ordered prop rules, optional props), array with
-      items + minItems/maxItems, string (+ enum -> literal alternation, +
-      pattern -> char-class rule), number/integer, boolean, null,
-      anyOf/oneOf -> alternation, $ref/$defs for recursion, and additional
-      properties:false. Out of scope for v1 (document): allOf, format
-      validators, numeric min/max bound enforcement. Deliverables: the
-      compiler + a convenience CreateJSONSchemaConstraint(SchemaJSON, Dict)
-      that chains compile -> TNNetGrammarConstraint; tests asserting (a) the
-      emitted grammar ACCEPTS a set of pinned schema-valid JSON strings and
-      REJECTS malformed/extra-field ones via the compiled pushdown, and
-      (b) a tiny greedy decode under the constraint is byte-legal for a
-      two-field tool-call schema; an examples/StructuredOutput demo extending
-      examples/ConstrainedDecoding to a function-call-arguments schema (edit
-      examples/README.md, not the main README). High practical value: turns the
-      landed chat/tool-template work into reliable structured output.
-- [X] Length-grouped batching + dynamic padding collator (transformers
-      LengthGroupedSampler + DataCollatorWithPadding port).
-      LANDED (commit 2e5d900): TNNetLengthGroupedBatcher in neuraldatasets.pas
-      (sibling of the packer/collators) — megabatch shuffle (shuffle -> mega-
-      batch -> sort by length desc -> swap global-longest into the first mega-
-      batch -> yield BatchSize chunks) over variable-length token samples, with
-      GetTrainingPair padding each emitted batch only to its OWN BatchSeqLen
-      (per-position causal LM pair + ApplyLossMask). TotalPadTokens /
-      NaiveTotalPadTokens expose the pad-saving. Tests TestNeuralLengthGrouped
-      (6): each batch padded to its own max, no sample dropped/duplicated, pair
-      internally consistent, loss-mask zeroes pad targets, dynamic pad < naive
-      global pad, reproducible order. Internal LCG (independent of global
-      RandSeed) so the shuffle never perturbs weight init. (TRAINING data-side
-      half; distinct from per-sample attn-mask and left-padded-generation.)
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (the rebuild-same-
       architecture-at-a-new-width idiom this list already notes near the
