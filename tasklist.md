@@ -427,6 +427,61 @@ rather than acted on.
       Hungarian matcher (that is training-only) — just threshold the per-query class
       softmax. Pico parity vs HF float64 + an examples/ObjectDetection demo that
       draws boxes on one CPU image.
+- [ ] Diffusion sampler / noise-scheduler unit (neuraldiffusion.pas) — the repo
+      has the diffusion/flow EXAMPLES (DiffusionMNIST, FlowMatching) but every one
+      hand-rolls its own noising loop inline; there is NO reusable, tested sampler.
+      Add a small unit with the standard reverse-process schedulers — DDPM
+      (ancestral), DDIM (deterministic, eta arg), and DPM-Solver++(2M) — over a
+      configurable beta schedule (linear / scaled-linear / cosine), plus
+      classifier-free guidance mixing (eps_uncond + w*(eps_cond-eps_uncond)) given
+      two model evals. Pure CPU, model-agnostic (caller supplies an eps/v predictor
+      closure). Validate the alpha-bar/beta math + a DDIM trajectory against a numpy
+      oracle; refactor DiffusionMNIST to call it. This is the missing piece (with
+      the already-tracked SD-UNet follow-up) for end-to-end imported text-to-image.
+- [ ] TNNet.AddUNet builder (symmetric conv encoder–decoder with skip
+      concatenations) — the repo's only segmentation example (DiceSegmentation) is a
+      FLAT fully-convolutional net with no down/upsampling, and there is no reusable
+      U-Net. Add a builder: N encoder stages (2x Conv3x3-Norm-ReLU + 2x2 stride-2
+      downsample, doubling features), a bottleneck, N decoder stages (DeMaxPool/
+      transpose upsample + TNNetConcat of the matching encoder tap + 2x Conv), and a
+      1x1 head. Returns the tap layer indices so callers can wire skips. Ship an
+      examples/UNetSegmentation that trains on a small synthetic-shapes or
+      medical-style mask dataset and reports Dice/IoU; reuses the landed Dice loss.
+      Foundational for SD-UNet, SegFormer decode heads, and medical imaging.
+- [ ] TNNetConvolution3D layer (spatiotemporal / volumetric conv, depth axis =
+      time or Z) — the repo has zero 3-D conv, which blocks proper video models and
+      volumetric (CT/MRI) imaging. Add a (T,H,W,C) conv with TxKxK kernels (and a
+      pConvolution1D-style temporal-only special case), AVX-vectorized along the
+      contiguous channel axis like the 2-D conv, full input+weight numerical-gradient
+      coverage in TestNeuralNumerical.pas, and a tiny examples/VideoActionTiny (or
+      Moving-MNIST tubelet) classifier. Unblocks I3D/C3D/VideoMAE-style importers and
+      gives the tracked Next-frame VideoPrediction task a true spatiotemporal option.
+- [ ] YOLO single-shot object-detection importer (ultralytics YOLOv8n safetensors)
+      — a detection family STRUCTURALLY DISTINCT from the tracked DETR importer
+      (anchor-free fully-convolutional one-stage detector, no transformer): the
+      CSP/C2f backbone + PANet feature-pyramid neck + the decoupled detect head
+      (per-cell box distribution via DFL + class logits over 3 strides). New code is
+      the C2f/SPPF blocks, the FPN top-down+bottom-up fusion (reuses Concat +
+      upsample), and DFL box decoding; NMS is a small CPU post-process. Pico parity
+      vs an ultralytics float64 oracle on the head outputs + an examples/YoloDetect
+      that draws boxes on one CPU image. Reuses the conv-BN-fold loader path.
+- [ ] SegFormer semantic-segmentation importer (nvidia/segformer-b0-finetuned-ade)
+      — the FIRST dense semantic-segmentation importer (per-pixel class map), the
+      vertical explicitly flagged as "unblocked" by the hierarchical backbone work.
+      Two pieces: (a) the MiT (Mix Transformer) hierarchical encoder — overlap-patch
+      embeddings + efficient-attention with spatial-reduction (sequence-reduction
+      ratio sr) + Mix-FFN (depthwise 3x3 inside the FFN, no positional embedding);
+      (b) the lightweight all-MLP decode head (project each of the 4 stages to a
+      common dim, upsample, concat, fuse, 1x1 to num_classes). Pico parity vs HF
+      float64 + an examples/SemanticSegmentation that colors a tiny CPU image.
+- [ ] Class-conditional image generation example (examples/ConditionalDiffusion) —
+      the landed generative image examples (VisualGAN, DiffusionMNIST, FlowMatching)
+      are all UNCONDITIONAL; there is no example of steering generation by a class
+      label. Train a small label-conditioned denoiser on MNIST (inject the class via
+      a learned label embedding added to the timestep embedding, with label-dropout
+      for classifier-free guidance), then sample a chosen digit and show that the CFG
+      weight trades diversity for class fidelity. Reuses FiLMConditioning + the new
+      diffusion-sampler unit; demonstrates conditional generation + CFG end-to-end.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
