@@ -277,21 +277,6 @@ rather than acted on.
 
 ### Computer vision & generative models
 
-- [X] Standard vision-model image preprocessing helper in neuraldatasets.pas —
-      DONE: PreprocessImageForVisionModel(Src,Dst,ResizeShorterSide,CropSize,
-      Mean,Std) does aspect-preserving shorter-side resize -> center-crop NxN ->
-      per-channel (x/255-mean)/std. Constants csImageNetMean/Std and
-      csClipMean/Std are exported; ReadImagePreprocessConfig reads
-      size/crop_size/image_mean/image_std from a HF preprocessor_config.json
-      (size/crop_size as int or {shortest_edge}/{height,width}); convenience
-      LoadImageForVisionModel loads a file straight to a normalized volume. This
-      is the clean reusable version of LLaVA Step "(b)" — distinct from the CLIP
-      importer's ad-hoc PadXY+Crop fold into pos row 0. NOTE: torchvision is NOT
-      installable here, so the "parity vs torchvision/PIL on a committed tiny
-      image" check was substituted with a SYNTHETIC, hand-computed oracle
-      (geometry: output dims + center-crop offsets; normalization: known pixel
-      -> (v/255-mean)/std, float64 oracle from an inlined python3 snippet). Test:
-      tests/TestNeuralImagePreprocess.pas (6 cases, all pass; full suite green).
 - [ ] ResNet importer follow-ups (BuildResNetFromSafeTensors[Ex] LANDED, commit
       317a19c: torchvision resnet18/50 state_dict, conv-BN fold at load, config
       reader/ToString, resnet18 parity 1.0e-6 vs a numpy float64 oracle —
@@ -313,10 +298,6 @@ rather than acted on.
       upsample = TNNetDeMaxPool(2) FSpacing=0; mid attention flattens (H,W,C)->
       (H*W,1,C) per-token SDPA; added GroupNormEpsilon to TNNetGroupNorm to pin
       diffusers eps 1e-6); TestVaeDecoderParity <1e-4 vs a numpy float64 oracle):
-  - [X] BuildVaeEncoder (Down blocks + DiagonalGaussianDistribution mean) +
-        wire encoder+decoder into a full AutoencoderKL round-trip.
-        (neuralpretrained.pas; asymmetric (0,1,0,1) downsample via PadXY+Crop;
-        TestVaeEncoderParity <1e-4 + TestVaeRoundTrip; tools/vae_encoder_tiny_fixture.py)
   - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
         installable; SDXL VAE uses different group counts / multi-head attention.
   - [ ] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).
@@ -355,38 +336,14 @@ rather than acted on.
       loader path. Pico parity vs a numpy float64 oracle producing ImageNet-1k
       logits; depthwise conv groups must map onto the existing grouped/separable
       conv layers (verify the channel-grouping math first).
-- [X] Real-ESRGAN / ESRGAN super-resolution model importer (RRDBNet,
-      xinntao/Real-ESRGAN x4) — first IMPORTED generative-image model that runs
-      end-to-end on CPU (no diffusion loop): Residual-in-Residual Dense Blocks
-      (RDB = 5 conv layers with dense channel-concat skip via TNNetDeepConcat +
-      residual scaling 0.2). LANDED: BuildRRDBNet[FromSafeTensors][Ex] +
-      TRRDBNetConfig in neuralpretrained.pas (reuse-only; LoadVaeConv conv loader,
-      TNNetSum residuals, TNNetMulByConstant(0.2) scaling). NOTE: canonical
-      xinntao RRDBNet x4 weights use NEAREST-interpolate + conv upsampling, NOT
-      pixel-shuffle, so it is wired with TNNetDeMaxPool(2) (spacing 0 = nearest),
-      same idiom as the SD VAE decoder; added a parametrized TNNetLeakyReLU.Create
-      (pAlpha) for the 0.2 negative slope (serialized via FFloatSt[0]). Pico
-      parity TestRRDBNetParity (max|diff| < 1e-4) vs a numpy float64 oracle
-      (tools/rrdbnet_tiny_fixture.py, committed ~58KB safetensors fixture).
-      FOLLOW-UPS: (a) realesrgan .pth pickle load (TNNetTorchBinReader path);
-      (b) real x4 upscale of a tiny PNG end-to-end example; (c) scale=2 / other
-      scales (currently only scale=4 = two upsample stages wired).
-- [X] Class-conditional DiffusionMNIST follow-up: classifier-free guidance (CFG)
-      + DDIM deterministic fast sampler. Extends the landed unconditional DDPM
-      example — (a) condition the U-Net on a digit label embedding added to the
-      sinusoidal time embedding, trained with label-dropout (~10%) for the
-      unconditional branch; (b) sample with CFG (eps = eps_uncond + s*(eps_cond -
-      eps_uncond)); (c) add a DDIM sampler (deterministic, 10-50 steps vs the
-      1000-step ancestral loop). Deliverable: generate a chosen digit on demand,
-      far fewer sampling steps. Opens latent-diffusion (reuse the SD VAE) next.
-- [X] Flow Matching / Rectified Flow generative example (examples/FlowMatching)
-      — the modern ODE/transport alternative to DDPM: train a velocity field
-      v_theta(x_t, t) to match (x1 - x0) along straight interpolation paths
-      x_t = (1-t)x0 + t*x1, then sample by Euler-integrating the ODE from noise.
-      Reuses the DiffusionMNIST U-Net + sinusoidal time embedding; the only new
-      code is the linear-interpolant loss and the ODE integrator (no noise
-      schedule, far fewer sampling steps than DDPM). A clean, self-contained
-      generative example distinct from the score/DDPM formulation.
+- [ ] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
+      + TRRDBNetConfig LANDED in neuralpretrained.pas; RRDBNet x4 with
+      NEAREST-interpolate conv upsampling via TNNetDeMaxPool(2), parametrized
+      TNNetLeakyReLU.Create(pAlpha) 0.2 slope; pico parity TestRRDBNetParity
+      max|diff| < 1e-4 vs a numpy float64 oracle): (a) realesrgan .pth pickle load
+      (TNNetTorchBinReader path); (b) real x4 upscale of a tiny PNG end-to-end
+      example; (c) scale=2 / other scales (currently only scale=4 = two upsample
+      stages wired).
 - [ ] VQ-VAE discrete image autoencoder + autoregressive prior example
       (examples/VQVAE) — goes beyond the existing VQCodebookUsage/Collapse
       DIAGNOSTIC examples: train a full encoder -> vector-quantizer -> decoder to
