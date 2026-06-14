@@ -487,7 +487,7 @@ rather than acted on.
       blocks to int8 on append, dequantize on read inside
       TNNetStreamingDecoder; assert logit drift vs the FP32 cache stays
       within a documented tolerance on the pico-Llama parity fixture.
-- [ ] GRPO trainer (DeepSeekMath/R1-style group-relative policy
+- [X] GRPO trainer (DeepSeekMath/R1-style group-relative policy
       optimization) in neural/neuraldpo.pas or a sibling unit: sample N
       completions per prompt, advantage = (reward - group mean)/group std,
       policy-gradient step with a KL penalty against the reference — no
@@ -497,6 +497,16 @@ rather than acted on.
       in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
       (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real rewards.
+      LANDED: TNeuralGRPOTrainer sibling class in neural/neuraldpo.pas
+      (configurable GroupSize/Beta/ClipEpsilon/MaxNewTokens/Temperature,
+      pluggable TNeuralGRPORewardEvent method-ref reward, TrainOnPrompt that
+      samples the group, computes group-relative advantages, and does the
+      PG + DeepSeek-k3 per-token KL backward reusing the DPO softmax-backward
+      plumbing). Tests in tests/TestNeuralGRPO.pas (advantage normalization,
+      zero-variance->zero-advantage, learning-signal P(target token) up).
+      STILL OPEN cheap follow-ups: ORPO / SimPO / KTO loss-formula deltas on
+      the landed DPO trainer, and a Bradley-Terry pairwise reward-model
+      trainer to feed GRPO real (learned) rewards.
 - [ ] Offset-mapping follow-up: EncodeWithOffsets (commit 1e90b8a) is a
       post-hoc surface-match heuristic (each token's DecodeToken surface
       located forward at the running cursor), so it leaves tokens unmapped
