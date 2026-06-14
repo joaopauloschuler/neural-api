@@ -505,16 +505,31 @@ rather than acted on.
       serialized string. Assert the twin's logits match the source on a pinned
       input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
       template).
-- [ ] KV-cache eviction for unbounded streaming: attention sinks + rolling
-      window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder
-      — today the per-SDPA-layer cache grows without bound. Keep the first
-      NumSinks tokens plus a fixed window, evicting the middle, so streamed
-      generation runs forever in constant memory. Note TNNetSinkAttention is
-      the TRAINING-side cousin (learnable sink logits); this is the
-      decode-side cache policy and needs care with RoPE positions after
-      eviction (re-rotate or cache pre-RoPE K). Assert: while output length
-      <= window the streamed tokens are bit-identical to the unbounded
-      cache, and memory stays flat past it.
+- [X] KV-cache eviction for unbounded streaming: attention sinks + rolling
+      window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder.
+      LANDED: TNNetScaledDotProductAttention.EnableEviction(SinkTokens,
+      RecentWindow)/DisableEviction on the KV-cache decode path + the matching
+      TNNetStreamingDecoder.EnableEviction/DisableEviction/SDPACacheLength
+      pass-throughs. After each appended token, once CacheLength would exceed
+      SinkTokens+RecentWindow the OLDEST window key is dropped (slots
+      [Sinks+1..] shifted left by one over slot Sinks); the first SinkTokens
+      slots are never touched, so live cache is pinned at Sinks+RecentWindow
+      forever (constant memory). OFF by default (SinkTokens=0 => unbounded,
+      bit-identical to before). RoPE-after-eviction strategy = "keep original
+      positions" (NOT re-rotation, NOT pre-RoPE caching): this layer caches K
+      AFTER positional encoding and StepForward rotates the query at its TRUE
+      absolute position, so retained keys keep their original rotation and every
+      surviving query/key pair attends at its EXACT relative distance — correct
+      for RoPE/ALiBi/absolute/learned uniformly with no SDPA<->RoPE coupling.
+      DELIBERATE LIMITATION: the StreamingLLM paper's optional position
+      RE-INDEXING inside the cache (closing the sink<->window gap) is a
+      perplexity refinement, not a correctness requirement, and is NOT done.
+      Rejects combining with the sliding-window mask. Tests
+      (TestStreamingEviction*): (1) within Sinks+RecentWindow the eviction
+      session is BIT-IDENTICAL (=, not approx) to the unbounded session and to
+      the full causal forward; (2) streaming 30 steps past the cap pins every
+      attention layer's CacheLength at Sinks+RecentWindow. Note TNNetSinkAttention
+      remains the TRAINING-side cousin (learnable sink logits), untouched.
 - [ ] KV-cache quantization (int8 cache with per-channel scales): the
       landed int8 quantized inference covers WEIGHT storage; for long-context
       decode the KV cache dominates memory instead. Quantize cached K/V

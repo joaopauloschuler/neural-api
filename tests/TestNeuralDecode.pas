@@ -132,6 +132,9 @@ type
     procedure TestStreamingDecoderSSMMatchesFullForward;
     procedure TestStreamingDecoderResetStartsFreshSequence;
     procedure TestStreamingDecoderTruncateToRollsBack;
+    // StreamingLLM KV-cache eviction (attention sinks + rolling window).
+    procedure TestStreamingEvictionWithinWindowBitIdenticalToUnbounded;
+    procedure TestStreamingEvictionCapsCacheLengthPastWindow;
     // GenerateTokensStreamed / GenerateStringStreamed: streamed generation.
     procedure TestGenerateTokensStreamedTransformerMatchesFullGreedy;
     procedure TestGenerateTokensStreamedSSMMatchesFullGreedy;
@@ -2250,6 +2253,125 @@ begin
     Session.Free;
     Twin.Free;
     Full.Free;
+  end;
+end;
+
+// StreamingLLM eviction: while the streamed length stays within the sink+window
+// budget, eviction never fires, so an eviction-enabled session must be
+// BIT-IDENTICAL (not just close) to the unbounded-cache session AND to the
+// full-width causal forward. Uses a RoPE causal transformer so the test also
+// exercises the "keep original positions" RoPE-after-eviction contract.
+procedure TTestNeuralDecode.TestStreamingEvictionWithinWindowBitIdenticalToUnbounded;
+const
+  Sinks = 2;
+  Window = 4;
+  // Streamed length (6) equals Sinks+Window exactly: still no eviction (we
+  // evict only when CacheLength would EXCEED the cap), so it must match.
+  SeqLen = 6;
+  Toks: array[0..5] of integer = (3, 7, 1, 9, 4, 11);
+var
+  Full, TwinA, TwinB: TNNet;
+  Plain, Evict: TNNetStreamingDecoder;
+  FullIn, FullOut, StepIn: TNNetVolume;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  TwinA := BuildTinyCausalLM(1);
+  TwinB := BuildTinyCausalLM(1);
+  Plain := nil; Evict := nil;
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  FullOut := TNNetVolume.Create();
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    TwinA.CopyWeights(Full);
+    TwinB.CopyWeights(Full);
+    for T := 0 to SeqLen - 1 do FullIn.FData[T] := Toks[T];
+    Full.Compute(FullIn);
+    Full.GetOutput(FullOut);
+
+    Plain := TNNetStreamingDecoder.Create(TwinA, SeqLen);
+    Evict := TNNetStreamingDecoder.Create(TwinB, SeqLen);
+    Evict.EnableEviction(Sinks, Window);
+    AssertTrue('has attention layers', Evict.SDPACount > 0);
+    Plain.Reset();
+    Evict.Reset();
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Plain.StepForward(StepIn, T);
+      StepIn.FData[0] := Toks[T];
+      Evict.StepForward(StepIn, T);
+      // (1) Bit-identical to the unbounded session.
+      for D := 0 to FullOut.Depth - 1 do
+        AssertTrue('evict==plain pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          Plain.Output()[0, 0, D] = Evict.Output()[0, 0, D]);
+      // ... and both reproduce the full causal forward (sanity).
+      for D := 0 to FullOut.Depth - 1 do
+        AssertEquals('evict==full pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          FullOut[T, 0, D], Evict.Output()[0, 0, D], 1e-5);
+    end;
+  finally
+    StepIn.Free;
+    FullOut.Free;
+    FullIn.Free;
+    Plain.Free;
+    Evict.Free;
+    TwinA.Free;
+    TwinB.Free;
+    Full.Free;
+  end;
+end;
+
+// StreamingLLM eviction: stream far PAST the sink+window budget and assert every
+// attention layer's CacheLength is pinned at Sinks+Window (constant memory),
+// while the unbounded session grows linearly. The first Sinks slots are
+// untouched and the middle is evicted, so generation continues forever.
+procedure TTestNeuralDecode.TestStreamingEvictionCapsCacheLengthPastWindow;
+const
+  Sinks = 2;
+  Window = 4;
+  Cap = Sinks + Window;   // 6
+  Steps = 30;             // well past the cap
+  Budget = 64;            // MaxCacheLen >= Cap; covers the unbounded session too
+var
+  Twin: TNNet;
+  Evict: TNNetStreamingDecoder;
+  StepIn: TNNetVolume;
+  T, L: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyCausalLM(1);
+  Evict := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Evict := TNNetStreamingDecoder.Create(Twin, Budget);
+    Evict.EnableEviction(Sinks, Window);
+    Evict.Reset();
+    for T := 0 to Steps - 1 do
+    begin
+      StepIn.FData[0] := (T * 7 + 3) mod csStreamVocab;
+      Evict.StepForward(StepIn, T);
+      // Every attention layer's live cache is capped at the budget once we pass
+      // it, and never below min(T+1, Cap) before.
+      for L := 0 to Evict.SDPACount - 1 do
+      begin
+        if T + 1 <= Cap then
+          AssertEquals('pre-cap len layer ' + IntToStr(L) + ' step ' + IntToStr(T),
+            T + 1, Evict.SDPACacheLength(L))
+        else
+          AssertEquals('capped len layer ' + IntToStr(L) + ' step ' + IntToStr(T),
+            Cap, Evict.SDPACacheLength(L));
+      end;
+    end;
+    // Final state: pinned at the cap, not Steps.
+    for L := 0 to Evict.SDPACount - 1 do
+      AssertEquals('flat memory layer ' + IntToStr(L), Cap,
+        Evict.SDPACacheLength(L));
+  finally
+    StepIn.Free;
+    Evict.Free;
+    Twin.Free;
   end;
 end;
 

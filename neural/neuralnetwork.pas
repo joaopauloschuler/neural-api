@@ -2686,6 +2686,21 @@ type
     FKCache: TNNetVolume;        // cached keys   [MaxContext x 1 x d_k]
     FVCache: TNNetVolume;        // cached values [MaxContext x 1 x d_k]
     FCacheScores: array of TNeuralFloat; // per-step softmax scratch row
+    // --- StreamingLLM attention-sink + rolling-window eviction (opt-in) ---
+    // FEvictSinks = 0 (default) => eviction OFF, the cache grows to MaxContext
+    // and overflowing it is an error (the original unbounded behavior). When
+    // FEvictSinks > 0 the cache holds at most FEvictSinks + FEvictWindow live
+    // tokens forever: after each append, if FCacheLen exceeds that cap, the
+    // OLDEST window key (slot FEvictSinks) is dropped and the rest of the
+    // window is shifted left by one, leaving the first FEvictSinks tokens
+    // (the attention "sinks") untouched. The retained keys keep their ORIGINAL
+    // post-RoPE rotation (this layer caches K already position-encoded) and the
+    // query keeps its true absolute rotation (StreamingDecoder sets RoPE
+    // PositionOffset := AbsPos), so every retained query/key pair attends at
+    // its EXACT relative distance regardless of which positional scheme fed the
+    // layer (RoPE/ALiBi/absolute/learned). See EnableEviction for the full note.
+    FEvictSinks: integer;        // 0 = eviction off; >0 = number of sink slots
+    FEvictWindow: integer;       // rolling window of most-recent tokens kept
     procedure ComputeIncremental();
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -2772,6 +2787,37 @@ type
     // and must be discarded before verification continues from the last
     // committed token. TruncateCache(0) is equivalent to ResetCache().
     procedure TruncateCache(NewLength: integer);
+    // StreamingLLM-style KV-cache eviction for UNBOUNDED streaming (Xiao et al.
+    // 2023; transformers SinkCache). With eviction OFF (the default) the cache
+    // grows to MaxContext and overflowing it is an error. EnableEviction(S, W)
+    // turns on the "attention sink + rolling window" policy: the cache keeps the
+    // first S tokens (the sinks - a handful of initial tokens that absorb a
+    // disproportionate share of attention mass; evicting them collapses the
+    // softmax and wrecks quality) PLUS the W most-recent tokens, and evicts the
+    // MIDDLE. Total live tokens never exceed S + W, so a stream can run forever
+    // in constant memory. Requires the cached path (call after
+    // BeginIncrementalDecode) and S + W <= MaxContext. S = 0 disables eviction
+    // (back to the unbounded cache). Combining with the sliding Window mask is
+    // rejected (both bound the attended span; pick one). DisableEviction() turns
+    // it back off.
+    //   RoPE-AFTER-EVICTION CHOICE. This layer caches K AFTER positional
+    // encoding (the SDPA positional contract: Q|K|V arrive already encoded), and
+    // the StreamingDecoder rotates the query at its TRUE absolute position. The
+    // eviction here therefore does NOT re-rotate: it keeps each retained key's
+    // ORIGINAL absolute rotation and simply drops the middle slots. Because both
+    // the query and every retained key were rotated at consistent absolute
+    // positions, each surviving query/key pair attends at its EXACT relative
+    // distance - so the result is correct for RoPE AND ALiBi AND absolute AND
+    // learned encodings uniformly, with no SDPA<->RoPE coupling. This is the
+    // simplest correct StreamingLLM variant ("keep original positions"); the
+    // paper's optional extra of RE-INDEXING positions inside the cache to close
+    // the sink<->window gap is a perplexity refinement, not a correctness
+    // requirement, and is deliberately NOT done here.
+    //   While the total streamed length stays <= S + W eviction never triggers,
+    // so the cached path is BIT-IDENTICAL to the unbounded cache; only PAST that
+    // length do generated tokens diverge (by design - the middle is gone).
+    procedure EnableEviction(SinkTokens, RecentWindow: integer);
+    procedure DisableEviction();
     // Read-only access to the post-softmax attention map populated by
     // Compute(). Layout: X=key index j, Y=query index i, attn[j,i,0]; rows
     // (fixed i) sum to 1. Used by TNNet.AttentionEntropyReport.
@@ -2785,6 +2831,10 @@ type
     property CacheEnabled: boolean read FCacheEnabled;
     property CacheLength: integer read FCacheLen;
     property MaxContext: integer read FCacheMax;
+    // Eviction config (0 sinks = eviction off). EvictionCap is the steady-state
+    // upper bound on CacheLength once eviction is on (SinkTokens + RecentWindow).
+    property EvictionSinks: integer read FEvictSinks;
+    property EvictionWindow: integer read FEvictWindow;
   end;
 
   /// Cross-Attention (single head, parameter-free) with SEPARATE query and
@@ -22241,12 +22291,18 @@ begin
   FCacheMax := MaxContext;
   FCacheLen := 0;
   FCacheEnabled := true;
+  // Eviction is opt-in and starts OFF (unbounded cache); EnableEviction turns
+  // it on after this.
+  FEvictSinks := 0;
+  FEvictWindow := 0;
 end;
 
 procedure TNNetScaledDotProductAttention.EndIncrementalDecode();
 begin
   FCacheEnabled := false;
   FCacheLen := 0;
+  FEvictSinks := 0;
+  FEvictWindow := 0;
 end;
 
 procedure TNNetScaledDotProductAttention.ResetCache();
@@ -22274,6 +22330,53 @@ begin
   FCacheLen := NewLength;
 end;
 
+procedure TNNetScaledDotProductAttention.EnableEviction(SinkTokens, RecentWindow: integer);
+begin
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.EnableEviction requires the ' +
+      'cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if SinkTokens <= 0 then
+  begin
+    // S <= 0 means "no eviction": revert to the unbounded cache.
+    DisableEviction();
+    exit;
+  end;
+  if RecentWindow < 1 then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.EnableEviction requires ' +
+      'RecentWindow >= 1. Got ' + IntToStr(RecentWindow));
+    exit;
+  end;
+  if SinkTokens + RecentWindow > FCacheMax then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.EnableEviction: SinkTokens (' +
+      IntToStr(SinkTokens) + ') + RecentWindow (' + IntToStr(RecentWindow) +
+      ') = ' + IntToStr(SinkTokens + RecentWindow) + ' must be <= MaxContext (' +
+      IntToStr(FCacheMax) + ').');
+    exit;
+  end;
+  if FWindow > 0 then
+  begin
+    // The sliding-window mask and the eviction window both bound the attended
+    // span; honoring both at once is ambiguous, so it is rejected.
+    FErrorProc('TNNetScaledDotProductAttention.EnableEviction is incompatible ' +
+      'with the sliding-window attention mask (Window > 0). Use one or the ' +
+      'other.');
+    exit;
+  end;
+  FEvictSinks := SinkTokens;
+  FEvictWindow := RecentWindow;
+end;
+
+procedure TNNetScaledDotProductAttention.DisableEviction();
+begin
+  FEvictSinks := 0;
+  FEvictWindow := 0;
+end;
+
 // Inference-only cached forward. Appends each input token's K and V slice to
 // the persistent cache and attends its query over ALL cached positions
 // [0..t]. Works for a one-token decode step (the headline O(1)-per-step use)
@@ -22290,7 +22393,14 @@ begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
-  if FCacheLen + SeqLen > FCacheMax then
+  // Eviction OFF: the cache must hold the whole prefix, so overflowing the
+  // preallocation is a hard error (unchanged unbounded behavior). Eviction ON:
+  // the cap is FEvictSinks + FEvictWindow and the middle is dropped per token,
+  // so the cache never exceeds the cap and there is nothing to overflow (the
+  // append below uses one transient extra slot, always < MaxContext since the
+  // cap itself is <= MaxContext - 1 is NOT required because we evict BEFORE
+  // appending the next token).
+  if (FEvictSinks = 0) and (FCacheLen + SeqLen > FCacheMax) then
   begin
     FErrorProc('TNNetScaledDotProductAttention KV cache overflow: ' +
       IntToStr(FCacheLen) + ' cached + ' + IntToStr(SeqLen) + ' new > MaxContext=' +
@@ -22299,6 +22409,24 @@ begin
   end;
   for p := 0 to SeqLen - 1 do
   begin
+    // StreamingLLM eviction (opt-in). Before appending token p, if the cache is
+    // already at its cap (sinks + window), drop the OLDEST window key to make
+    // room: shift slots [FEvictSinks+1 .. FCacheLen-1] left by one over slot
+    // FEvictSinks. The first FEvictSinks (sink) slots are never touched. After
+    // this the live length is cap-1, the append below brings it back to cap, so
+    // CacheLength is pinned at sinks + window forever. Retained keys keep their
+    // original post-RoPE rotation (see EnableEviction's RoPE note).
+    if (FEvictSinks > 0) and (FCacheLen >= FEvictSinks + FEvictWindow) then
+    begin
+      for j := FEvictSinks to FCacheLen - 2 do
+      begin
+        Move(FKCache.GetRawPtr(j + 1, 0, 0)^, FKCache.GetRawPtr(j, 0, 0)^,
+          FDk * SizeOf(TNeuralFloat));
+        Move(FVCache.GetRawPtr(j + 1, 0, 0)^, FVCache.GetRawPtr(j, 0, 0)^,
+          FDk * SizeOf(TNeuralFloat));
+      end;
+      Dec(FCacheLen);
+    end;
     // Append this token's K and V to the cache; its global position is the
     // running cache length. Depth is contiguous, so each slice is one Move.
     Move(Prev.GetRawPtr(p, 0, FDk)^, FKCache.GetRawPtr(FCacheLen, 0, 0)^,

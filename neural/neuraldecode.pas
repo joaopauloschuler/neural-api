@@ -943,6 +943,31 @@ type
     // attention layer, discarding the K/V of rejected/pad tokens. No-op when
     // the net has no attention layers.
     procedure TruncateTo(CommittedLen: integer);
+    // StreamingLLM unbounded streaming: turn on the attention-sink + rolling-
+    // window KV-cache eviction policy on EVERY collected attention layer, so a
+    // stream can run forever in constant memory. SinkTokens (the first tokens,
+    // always retained - a few initial tokens absorb a disproportionate share of
+    // attention mass) plus RecentWindow (the most-recent tokens) are kept and
+    // the middle is evicted; total live tokens per layer is pinned at
+    // SinkTokens + RecentWindow once the stream passes that length. OFF by
+    // default (SinkTokens = 0), leaving the unbounded cache (the current
+    // behavior). SinkTokens + RecentWindow must be <= the session's MaxCacheLen.
+    //   RoPE is handled by the "keep original positions" rule (retained keys
+    // keep their post-RoPE rotation, the query keeps its true absolute rotation
+    // via StepForward's PositionOffset := AbsPos), so each surviving query/key
+    // pair attends at its exact relative distance - correct for RoPE/ALiBi/
+    // absolute/learned encodings alike. See TNNetScaledDotProductAttention.
+    // EnableEviction for the full note. No-op when the net has no attention
+    // layers (a pure-SSM model already decodes in constant memory).
+    //   While the streamed length stays <= SinkTokens + RecentWindow eviction
+    // never fires, so output is BIT-IDENTICAL to the unbounded session; only
+    // past that length does it diverge (by design - the middle is gone).
+    procedure EnableEviction(SinkTokens, RecentWindow: integer);
+    procedure DisableEviction();
+    // Live cache length of the Index-th collected attention layer (diagnostics /
+    // tests: with eviction on this is pinned at SinkTokens + RecentWindow once
+    // the stream passes that length).
+    function SDPACacheLength(Index: integer): integer;
     // Convenience: the net's last layer output (e.g. the softmax row(s) of
     // the window just computed).
     function Output(): TNNetVolume;
@@ -3975,6 +4000,25 @@ var
   i: integer;
 begin
   for i := 0 to High(FSDPAs) do FSDPAs[i].TruncateCache(CommittedLen);
+end;
+
+procedure TNNetStreamingDecoder.EnableEviction(SinkTokens, RecentWindow: integer);
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].EnableEviction(SinkTokens, RecentWindow);
+end;
+
+procedure TNNetStreamingDecoder.DisableEviction();
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].DisableEviction();
+end;
+
+function TNNetStreamingDecoder.SDPACacheLength(Index: integer): integer;
+begin
+  Result := FSDPAs[Index].CacheLength;
 end;
 
 function TNNetStreamingDecoder.Output(): TNNetVolume;
