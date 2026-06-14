@@ -313,8 +313,10 @@ rather than acted on.
       upsample = TNNetDeMaxPool(2) FSpacing=0; mid attention flattens (H,W,C)->
       (H*W,1,C) per-token SDPA; added GroupNormEpsilon to TNNetGroupNorm to pin
       diffusers eps 1e-6); TestVaeDecoderParity <1e-4 vs a numpy float64 oracle):
-  - [ ] BuildVaeEncoder (Down blocks + DiagonalGaussianDistribution sampling) +
+  - [X] BuildVaeEncoder (Down blocks + DiagonalGaussianDistribution mean) +
         wire encoder+decoder into a full AutoencoderKL round-trip.
+        (neuralpretrained.pas; asymmetric (0,1,0,1) downsample via PadXY+Crop;
+        TestVaeEncoderParity <1e-4 + TestVaeRoundTrip; tools/vae_encoder_tiny_fixture.py)
   - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
         installable; SDXL VAE uses different group counts / multi-head attention.
   - [ ] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).

@@ -4996,6 +4996,56 @@ function BuildVaeDecoderFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// STABLE DIFFUSION VAE ENCODER IMPORT (diffusers AutoencoderKL ENCODER), the
+// mirror image of the decoder above; together they form a full AutoencoderKL
+// round-trip. The encoder maps an RGB image to the latent moments and reuses
+// every decoder helper (conv loader, ResnetBlock2D builder, MID self-attention
+// builder, GroupNorm). The architecture (forward U-Net):
+//
+//   x (OutChannels=in_channels, IMG, IMG)
+//     encoder.conv_in  (3x3, in -> C[0])
+//   DOWN block d (d = 0..N-1), width C[d]:
+//     layers_per_block ResNet blocks
+//     encoder.down_blocks.d.downsamplers.0.conv  (stride-2 3x3) -- every down
+//       block EXCEPT the last (highest-index) has a downsampler.
+//   MID: resnet -> self-attn(H*W tokens) -> resnet                 (width C[-1])
+//   OUT: encoder.conv_norm_out (GroupNorm) -> SiLU ->
+//        encoder.conv_out (3x3 -> 2*latent_channels)
+//        quant_conv (1x1, 2*lat -> 2*lat)
+//   DiagonalGaussianDistribution: channels split into mean[0:lat] and
+//     logvar[lat:2*lat]. The deterministic latent (importer/parity path) is
+//     mean * scaling_factor; the net's RAW output is the 2*lat moments volume,
+//     and BuildVaeEncoder exposes a TNNetCrop to mean (first lat channels)
+//     scaled by scaling_factor as its final layer.
+//
+// diffusers' Downsample2D uses an ASYMMETRIC pad=(0,1,0,1) (right/bottom only)
+// before a stride-2 pad-0 3x3 conv. CAI's convolution pad is symmetric, so the
+// importer reproduces the asymmetric pad EXACTLY with TNNetPadXY(1,1) (pads all
+// four sides by 1) followed by TNNetCrop(1,1,..) (drops the leading top/left
+// pad), leaving the diffusers [data, 0]-on-right/bottom layout, then a stride-2
+// pad-0 conv. This is bit-for-bit the diffusers grid alignment (verified by the
+// parity test, whose oracle pads (0,1,0,1)).
+//
+// The Config record (TVaeDecoderConfig) is reused: OutChannels = in_channels
+// (RGB=3); LatentGrid here is the LATENT grid (= sample_size / 2^(N-1)); the
+// encoder Input grid is LatentGrid * 2^(N-1).
+function ReadVaeEncoderConfigFromJSONFile(
+  const FileName: string): TVaeDecoderConfig;
+
+// Builds the AutoencoderKL ENCODER. Input is an (ImgGrid, ImgGrid, in_channels)
+// image; output is the deterministic (LatentGrid, LatentGrid, LatentChannels)
+// latent = mean * scaling_factor. ImgGrid = LatentGrid * 2^(NumBlockOut-1).
+function BuildVaeEncoder(Reader: TNNetSafeTensorsReader;
+  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildVaeEncoderFromSafeTensorsEx(const FileName: string;
+  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildVaeEncoderFromSafeTensors(const FileName: string;
+  out Config: TVaeDecoderConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // REAL-ESRGAN / ESRGAN SUPER-RESOLUTION IMPORT (RRDBNet, e.g.
 // xinntao/Real-ESRGAN x4). The FIRST imported generative-image model that runs
 // end-to-end on CPU with NO diffusion loop - it is a pure-convolutional
@@ -31892,6 +31942,187 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVaeDecoderConfigFromJSONFile(ConfigPath);
   Result := BuildVaeDecoderFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// STABLE DIFFUSION VAE ENCODER IMPORT (diffusers AutoencoderKL, encoder only)
+// ===========================================================================
+
+// Reads a diffusers AutoencoderKL config for the ENCODER. Reuses the decoder
+// reader (same diffusers config) but resolves the IMAGE grid: a real config
+// gives "sample_size" (image size) and LatentGrid = sample_size / 2^(N-1); the
+// pico fixture pins "image_size" (and "latent_size"/"sample_size"). OutChannels
+// is repurposed as in_channels (RGB=3).
+function ReadVaeEncoderConfigFromJSONFile(
+  const FileName: string): TVaeDecoderConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ImgSize: integer;
+begin
+  // The shared reader already resolves LatentGrid and validates the config;
+  // re-read in_channels (decoder reader stored out_channels=3).
+  Result := ReadVaeDecoderConfigFromJSONFile(FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    Obj := TJSONObject(Root);
+    Result.OutChannels := Obj.Get('in_channels', 3); // RGB input channels
+    // If the config pins the image grid directly, recompute LatentGrid from it.
+    ImgSize := Obj.Get('image_size', 0);
+    if ImgSize <= 0 then ImgSize := Obj.Get('sample_size', 0);
+    if ImgSize > 0 then
+      Result.LatentGrid := ImgSize shr (Result.NumBlockOut - 1);
+    if Result.LatentGrid < 1 then
+      ImportError('VAE encoder import: resolved latent grid is ' +
+        IntToStr(Result.LatentGrid) + ' (must be >= 1).');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BuildVaeEncoder(Reader: TNNetSafeTensorsReader;
+  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  ConvIn, NormOut, ConvOut, QuantConv: TNNetLayer;
+  MidRes1, MidRes2: TVaeResnetLayers;
+  MidAttn: TVaeAttnLayers;
+  DownRes: array of array of TVaeResnetLayers;
+  DownConv: array of TNNetLayer;
+  TopC, InCh, OutCh, d, m, nResnet, b, ImgGrid, Out2, H: integer;
+  Prefix: string;
+begin
+  if Config.NumBlockOut < 1 then
+    ImportError('VAE encoder import: block_out_channels is empty.');
+  if Config.LatentChannels < 1 then
+    ImportError('VAE encoder import: latent_channels must be >= 1.');
+  TopC := Config.BlockOutChannels[Config.NumBlockOut - 1];
+  nResnet := Config.LayersPerBlock; // encoder: layers_per_block (no +1)
+  Out2 := 2 * Config.LatentChannels;
+  ImgGrid := Config.LatentGrid shl (Config.NumBlockOut - 1);
+  SetLength(DownRes, Config.NumBlockOut);
+  SetLength(DownConv, Config.NumBlockOut);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(ImgGrid, ImgGrid, Config.OutChannels) );
+    ConvIn := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0) );
+    // DOWN blocks: block_out_channels in low->high order. Block d has nResnet
+    // ResNet blocks; every block EXCEPT the last (d = N-1) ends with a
+    // stride-2 3x3 conv DOWNSAMPLE using diffusers' asymmetric (0,1,0,1) pad.
+    InCh := Config.BlockOutChannels[0];
+    for d := 0 to Config.NumBlockOut - 1 do
+    begin
+      OutCh := Config.BlockOutChannels[d];
+      SetLength(DownRes[d], nResnet);
+      for m := 0 to nResnet - 1 do
+      begin
+        if m = 0 then b := InCh else b := OutCh;
+        AddVaeResnetBlock(NN, Config, b, OutCh, DownRes[d][m]);
+      end;
+      InCh := OutCh;
+      if d < Config.NumBlockOut - 1 then
+      begin
+        // diffusers Downsample2D: asymmetric pad (0,1,0,1) then stride-2 3x3
+        // conv (pad 0). Reproduce by padding ALL sides by 1 (PadXY) then
+        // cropping off the top/left pad (Crop start (1,1)), leaving the
+        // right/bottom-only pad, then a stride-2 pad-0 conv.
+        H := NN.GetLastLayer().Output.SizeY;
+        NN.AddLayer( TNNetPadXY.Create(1, 1) );
+        NN.AddLayer( TNNetCrop.Create(1, 1, H + 1, H + 1) );
+        DownConv[d] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0) );
+      end
+      else
+        DownConv[d] := nil;
+    end;
+    // MID: resnet -> attention -> resnet (all at width TopC).
+    AddVaeResnetBlock(NN, Config, TopC, TopC, MidRes1);
+    AddVaeAttention(NN, Config, TopC, MidAttn);
+    AddVaeResnetBlock(NN, Config, TopC, TopC, MidRes2);
+    // OUT: conv_norm_out (GroupNorm) -> SiLU -> conv_out (3x3 -> 2*lat) ->
+    // quant_conv (1x1).
+    NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
+    NN.AddLayer( TNNetSiLU.Create() );
+    ConvOut := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Out2, 3, 1, 1, 0) );
+    QuantConv := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Out2, 1, 0, 1, 0) );
+    // DiagonalGaussianDistribution deterministic latent: take the mean (first
+    // LatentChannels channels) and apply the SD scaling_factor.
+    NN.AddLayer( TNNetSplitChannels.Create(0, Config.LatentChannels) );
+    NN.AddLayer( TNNetMulByConstant.Create(Config.ScalingFactor) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadVaeConv(Reader, ConvIn, 'encoder.conv_in.weight',
+      'encoder.conv_in.bias', Config.BlockOutChannels[0], Config.OutChannels, 3);
+    InCh := Config.BlockOutChannels[0];
+    for d := 0 to Config.NumBlockOut - 1 do
+    begin
+      OutCh := Config.BlockOutChannels[d];
+      for m := 0 to nResnet - 1 do
+      begin
+        if m = 0 then b := InCh else b := OutCh;
+        Prefix := 'encoder.down_blocks.' + IntToStr(d) + '.resnets.' +
+          IntToStr(m) + '.';
+        LoadVaeResnetBlock(Reader, DownRes[d][m], Prefix, b, OutCh, Config);
+      end;
+      InCh := OutCh;
+      if DownConv[d] <> nil then
+        LoadVaeConv(Reader, DownConv[d],
+          'encoder.down_blocks.' + IntToStr(d) + '.downsamplers.0.conv.weight',
+          'encoder.down_blocks.' + IntToStr(d) + '.downsamplers.0.conv.bias',
+          OutCh, OutCh, 3);
+    end;
+    LoadVaeResnetBlock(Reader, MidRes1, 'encoder.mid_block.resnets.0.',
+      TopC, TopC, Config);
+    LoadVaeAttention(Reader, MidAttn, 'encoder.mid_block.attentions.0.',
+      TopC, Config);
+    LoadVaeResnetBlock(Reader, MidRes2, 'encoder.mid_block.resnets.1.',
+      TopC, TopC, Config);
+    LoadVaeGroupNorm(Reader, NormOut, 'encoder.conv_norm_out', TopC,
+      Config.NormEps);
+    LoadVaeConv(Reader, ConvOut, 'encoder.conv_out.weight',
+      'encoder.conv_out.bias', Out2, TopC, 3);
+    LoadVaeConv(Reader, QuantConv, 'quant_conv.weight', 'quant_conv.bias',
+      Out2, Out2, 1);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildVaeEncoderFromSafeTensorsEx(const FileName: string;
+  const Config: TVaeDecoderConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildVaeEncoder(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildVaeEncoderFromSafeTensors(const FileName: string;
+  out Config: TVaeDecoderConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadVaeEncoderConfigFromJSONFile(ConfigPath);
+  Result := BuildVaeEncoderFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

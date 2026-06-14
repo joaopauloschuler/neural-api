@@ -276,6 +276,8 @@ type
     procedure TestResNet18ImageClassificationParity;
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
+    procedure TestVaeEncoderParity;
+    procedure TestVaeRoundTrip;
     procedure TestRRDBNetParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
@@ -12749,6 +12751,164 @@ begin
     LatentInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// Stable Diffusion VAE ENCODER parity test (diffusers AutoencoderKL encoder),
+// the mirror of TestVaeDecoderParity. tests/fixtures/tiny_vae_encoder.* is a
+// pico randomly-initialized encoder (block_out_channels [8,16],
+// layers_per_block 1, norm_num_groups 4, 16x16 RGB image -> 8x8 latent after
+// one asymmetric stride-2 downsample, 4 latent channels). The generator
+// tools/vae_encoder_tiny_fixture.py builds a self-contained numpy float64
+// oracle (diffusers is not installed). Checks conv_in, down-block resnets +
+// asymmetric (0,1,0,1) stride-2 downsample, the MID resnet/attention/resnet,
+// conv_norm_out -> SiLU -> conv_out, quant_conv, and the DiagonalGaussian mean
+// * scaling_factor latent, end to end < 1e-4 vs oracle.
+procedure TTestNeuralPretrained.TestVaeEncoderParity;
+var
+  NN: TNNet;
+  Config: TVaeDecoderConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  ImgArr, ChanArr, RowArr, LatArr: TJSONArray;
+  ImgInput: TNNetVolume;
+  ImgGrid, LatGrid: integer;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildVaeEncoderFromSafeTensors(
+    FixturePath('tiny_vae_encoder.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_vae_encoder_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    LatGrid := Config.LatentGrid;
+    ImgGrid := LatGrid shl (Config.NumBlockOut - 1);
+    AssertEquals('image grid', ImgGrid, NN.Layers[0].Output.SizeX);
+    AssertEquals('latent grid', LatGrid, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('latent channels', Config.LatentChannels,
+      NN.GetLastLayer().Output.Depth);
+    RefJson.LoadFromFile(FixturePath('tiny_vae_encoder_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
+    LatArr := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    AssertTrue('image present', ImgArr <> nil);
+
+    // Load the (C,H,W) image into the CAI (x,y,depth)-indexed volume.
+    ImgInput.ReSize(ImgGrid, ImgGrid, Config.OutChannels);
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(ImgArr.Items[ChanCnt]);
+      for YCnt := 0 to ImgGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to ImgGrid - 1 do
+          ImgInput.FData[(YCnt * ImgGrid + XCnt) * Config.OutChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImgInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.LatentChannels - 1 do
+    begin
+      RowArr := TJSONArray(LatArr.Items[ChanCnt]);
+      for YCnt := 0 to LatGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to LatGrid - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := NN.GetLastLayer().Output.FData[
+            (YCnt * LatGrid + XCnt) * Config.LatentChannels + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('encoded latent: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Full AutoencoderKL round-trip: encode the encoder-fixture image to a mean
+// latent, feed that latent into the (separately-fixtured) decoder, and assert
+// the reconstruction has the expected RGB shape. The two pico fixtures share
+// the same latent grid (8x8) and latent channels (4), so they wire together.
+// This exercises BuildVaeEncoder -> BuildVaeDecoder end to end.
+procedure TTestNeuralPretrained.TestVaeRoundTrip;
+var
+  Enc, Dec: TNNet;
+  EncCfg, DecCfg: TVaeDecoderConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  ImgArr, ChanArr, RowArr: TJSONArray;
+  ImgInput, Latent: TNNetVolume;
+  ImgGrid, LatGrid, ExpImg: integer;
+  ChanCnt, YCnt, XCnt: integer;
+begin
+  RandSeed := 424242;
+  Enc := nil; Dec := nil; RefRoot := nil;
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  Latent := TNNetVolume.Create;
+  try
+    Enc := BuildVaeEncoderFromSafeTensors(
+      FixturePath('tiny_vae_encoder.safetensors'), EncCfg,
+      {pInferenceOnly=}false, FixturePath('tiny_vae_encoder_config.json'));
+    Dec := BuildVaeDecoderFromSafeTensors(
+      FixturePath('tiny_vae_decoder.safetensors'), DecCfg,
+      {pInferenceOnly=}false, FixturePath('tiny_vae_decoder_config.json'));
+    LatGrid := EncCfg.LatentGrid;
+    ImgGrid := LatGrid shl (EncCfg.NumBlockOut - 1);
+    AssertEquals('encoder latent grid == decoder latent grid',
+      DecCfg.LatentGrid, LatGrid);
+    AssertEquals('encoder latent ch == decoder latent ch',
+      DecCfg.LatentChannels, EncCfg.LatentChannels);
+
+    RefJson.LoadFromFile(FixturePath('tiny_vae_encoder_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
+    ImgInput.ReSize(ImgGrid, ImgGrid, EncCfg.OutChannels);
+    for ChanCnt := 0 to EncCfg.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(ImgArr.Items[ChanCnt]);
+      for YCnt := 0 to ImgGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to ImgGrid - 1 do
+          ImgInput.FData[(YCnt * ImgGrid + XCnt) * EncCfg.OutChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    Enc.Compute(ImgInput);
+    // Feed the encoder's mean-latent straight into the decoder.
+    Latent.Copy(Enc.GetLastLayer().Output);
+    AssertEquals('latent grid into decoder', LatGrid, Latent.SizeX);
+    AssertEquals('latent channels into decoder', DecCfg.LatentChannels,
+      Latent.Depth);
+    Dec.Compute(Latent);
+    ExpImg := LatGrid shl (DecCfg.NumBlockOut - 1);
+    AssertEquals('reconstructed image grid', ExpImg,
+      Dec.GetLastLayer().Output.SizeX);
+    AssertEquals('reconstructed RGB channels', DecCfg.OutChannels,
+      Dec.GetLastLayer().Output.Depth);
+    AssertTrue('reconstruction finite',
+      not IsNan(Dec.GetLastLayer().Output.FData[0]));
+  finally
+    RefRoot.Free;
+    Latent.Free;
+    ImgInput.Free;
+    RefJson.Free;
+    Enc.Free;
+    Dec.Free;
   end;
 end;
 
