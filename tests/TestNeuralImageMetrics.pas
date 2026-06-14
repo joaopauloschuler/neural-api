@@ -62,6 +62,12 @@ type
     procedure TestPSNRIdenticalIsInf;
     // 1-SSIM loss gradient matches a central difference.
     procedure TestSSIMLossGradient;
+    // KID unbiased MMD^2 vs the numpy float64 oracle on Gaussian sets.
+    procedure TestKIDMMD2vsOracle;
+    // KID ordering: self ~ small < same-distribution < shifted-distribution.
+    procedure TestKIDOrdering;
+    // KID subset-bootstrap mean is close to the full-set estimate.
+    procedure TestKIDSubsetBootstrap;
   end;
 
 implementation
@@ -450,6 +456,80 @@ begin
   end;
   AssertTrue('SSIM loss grad vs central diff (maxErr=' +
     FloatToStr(maxErr) + ')', maxErr < 1e-4);
+end;
+
+procedure TTestNeuralImageMetrics.TestKIDMMD2vsOracle;
+var
+  Root: TJSONData;
+  c: TJSONObject;
+  fr, fs, ff: TIMDoubleMatrix;
+begin
+  if not LoadFixture(Root) then begin Ignore('fixture absent'); Exit; end;
+  try
+    c := TJSONObject(Root).Arrays['kid_cases'].Objects[0];
+    fr := JArrToMatrix(c.Arrays['featuresR']);
+    fs := JArrToMatrix(c.Arrays['featuresGsame']);
+    ff := JArrToMatrix(c.Arrays['featuresGfar']);
+    AssertEquals('KID MMD2 self', c.Floats['mmd2_self'],
+      ComputeKIDMMD2(fr, fr), 1e-6);
+    AssertEquals('KID MMD2 same', c.Floats['mmd2_same'],
+      ComputeKIDMMD2(fr, fs), 1e-6);
+    AssertEquals('KID MMD2 far', c.Floats['mmd2_far'],
+      ComputeKIDMMD2(fr, ff), 1e-4);
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestKIDOrdering;
+var
+  Root: TJSONData;
+  c: TJSONObject;
+  fr, fs, ff: TIMDoubleMatrix;
+  kSelf, kSame, kFar: Double;
+begin
+  if not LoadFixture(Root) then begin Ignore('fixture absent'); Exit; end;
+  try
+    c := TJSONObject(Root).Arrays['kid_cases'].Objects[0];
+    fr := JArrToMatrix(c.Arrays['featuresR']);
+    fs := JArrToMatrix(c.Arrays['featuresGsame']);
+    ff := JArrToMatrix(c.Arrays['featuresGfar']);
+    kSelf := ComputeKIDMMD2(fr, fr);
+    kSame := ComputeKIDMMD2(fr, fs);
+    kFar := ComputeKIDMMD2(fr, ff);
+    // self ~ 0 (unbiased estimator can be slightly negative)
+    AssertTrue('KID self near zero', Abs(kSelf) < 1.0);
+    // increasing distribution separation -> increasing KID
+    AssertTrue('KID self < same', kSelf < kSame);
+    AssertTrue('KID same < far', kSame < kFar);
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralImageMetrics.TestKIDSubsetBootstrap;
+var
+  Root: TJSONData;
+  c: TJSONObject;
+  fr, ff: TIMDoubleMatrix;
+  full, score, sd: Double;
+begin
+  if not LoadFixture(Root) then begin Ignore('fixture absent'); Exit; end;
+  try
+    c := TJSONObject(Root).Arrays['kid_cases'].Objects[0];
+    fr := JArrToMatrix(c.Arrays['featuresR']);
+    ff := JArrToMatrix(c.Arrays['featuresGfar']);
+    full := ComputeKIDMMD2(fr, ff);
+    RandSeed := 20260615; Random;  // defensive reseed (FPC mtwist)
+    RandSeed := 20260600;
+    ComputeKID(fr, ff, 40, 20, score, sd);
+    // bootstrap mean should be in the ballpark of the full-set estimate
+    AssertTrue('KID bootstrap mean ~ full (' + FloatToStr(score) + ' vs ' +
+      FloatToStr(full) + ')', Abs(score - full) < 0.3 * Abs(full));
+    AssertTrue('KID bootstrap std >= 0', sd >= 0);
+  finally
+    Root.Free;
+  end;
 end;
 
 initialization

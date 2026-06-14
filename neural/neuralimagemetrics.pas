@@ -185,6 +185,31 @@ function ComputeSSIMLossAndGradient(const ImgA, ImgB: TIMDoubleArray;
   H, W, Channels: integer; out GradA: TIMDoubleArray;
   DataRange: Double = 1.0): Double;
 
+// --- KID (Kernel Inception Distance) ---
+//
+// The small-sample-UNBIASED complement to FID (Binkowski et al. 2018).
+// Backbone-agnostic, same caller-supplies-features convention as ComputeFID:
+// FeaturesR/FeaturesG are [sample][dim] matrices. Uses the cubic polynomial
+// kernel k(x,y) = (x.y/d + 1)^3 (d = feature dimension) and the UNBIASED
+// U-statistic MMD^2 estimator (NO diagonal self-terms):
+//   MMD^2 = sum_{i<>j} k(x_i,x_j)/(m(m-1))
+//         + sum_{i<>j} k(y_i,y_j)/(n(n-1))
+//         - 2 sum_{i,j} k(x_i,y_j)/(m n).
+// KID reports the mean +/- std of this estimator over NumSubsets random
+// equal-size splits (subset size = SubsetSize, clipped to each set's count),
+// mirroring ComputeInceptionScore's mean+std reporting. With NumSubsets=1 and
+// SubsetSize>=both counts it is the single full-set unbiased estimate and
+// StdDev=0. Coded by Claude (AI).
+
+// Single unbiased MMD^2 estimate over the two full feature matrices (the math
+// core; public so tests can hit it directly).
+function ComputeKIDMMD2(const FeaturesR, FeaturesG: TIMDoubleMatrix): Double;
+
+// Subset-bootstrap KID: mean + population std over NumSubsets random splits
+// of SubsetSize samples drawn (without replacement) from each set.
+procedure ComputeKID(const FeaturesR, FeaturesG: TIMDoubleMatrix;
+  SubsetSize, NumSubsets: integer; out Score: Double; out StdDev: Double);
+
 implementation
 
 const
@@ -965,6 +990,127 @@ begin
   // average over channels
   for i := 0 to n - 1 do GradA[i] := GradA[i] / Channels;
   Result := 1.0 - ssimAcc / Channels;
+end;
+
+{ KID }
+
+// Cubic polynomial kernel k(x,y) = (x.y/d + 1)^3.
+function PolyKernel(const X, Y: TIMDoubleArray; d: integer): Double;
+var
+  i: integer;
+  dot, t: Double;
+begin
+  dot := 0;
+  for i := 0 to d - 1 do dot := dot + X[i] * Y[i];
+  t := dot / d + 1.0;
+  Result := t * t * t;
+end;
+
+// Unbiased within-set term sum_{i<>j} k(x_i,x_j) / (m(m-1)).
+function UnbiasedSelfTerm(const F: TIMDoubleMatrix; d: integer): Double;
+var
+  m, i, j: integer;
+  s, k: Double;
+begin
+  m := Length(F);
+  if m < 2 then
+    raise Exception.Create('KID: each set needs at least 2 samples');
+  s := 0;
+  for i := 0 to m - 1 do
+    for j := 0 to m - 1 do
+      if i <> j then
+      begin
+        k := PolyKernel(F[i], F[j], d);
+        s := s + k;
+      end;
+  Result := s / (m * (m - 1));
+end;
+
+function ComputeKIDMMD2(const FeaturesR, FeaturesG: TIMDoubleMatrix): Double;
+var
+  m, n, d, i, j: integer;
+  termR, termG, cross: Double;
+begin
+  if (Length(FeaturesR) = 0) or (Length(FeaturesG) = 0) then
+    raise Exception.Create('ComputeKIDMMD2: empty feature set');
+  d := Length(FeaturesR[0]);
+  if Length(FeaturesG[0]) <> d then
+    raise Exception.Create('ComputeKIDMMD2: feature dimension mismatch');
+  m := Length(FeaturesR);
+  n := Length(FeaturesG);
+  termR := UnbiasedSelfTerm(FeaturesR, d);
+  termG := UnbiasedSelfTerm(FeaturesG, d);
+  cross := 0;
+  for i := 0 to m - 1 do
+    for j := 0 to n - 1 do
+      cross := cross + PolyKernel(FeaturesR[i], FeaturesG[j], d);
+  cross := cross / (m * n);
+  Result := termR + termG - 2.0 * cross;
+end;
+
+// Draw, without replacement, SubsetSize row indices from [0..Count-1].
+procedure SampleIndices(Count, SubsetSize: integer; out Idx: array of integer);
+var
+  pool: array of integer;
+  i, j, tmp: integer;
+begin
+  SetLength(pool, Count);
+  for i := 0 to Count - 1 do pool[i] := i;
+  // partial Fisher-Yates
+  for i := 0 to SubsetSize - 1 do
+  begin
+    j := i + Random(Count - i);
+    tmp := pool[i]; pool[i] := pool[j]; pool[j] := tmp;
+    Idx[i] := pool[i];
+  end;
+end;
+
+procedure ComputeKID(const FeaturesR, FeaturesG: TIMDoubleMatrix;
+  SubsetSize, NumSubsets: integer; out Score: Double; out StdDev: Double);
+var
+  m, n, sub, s, i: integer;
+  idxR, idxG: array of integer;
+  subR, subG: TIMDoubleMatrix;
+  scores: TIMDoubleArray;
+  mean, varSum: Double;
+begin
+  if (Length(FeaturesR) = 0) or (Length(FeaturesG) = 0) then
+    raise Exception.Create('ComputeKID: empty feature set');
+  m := Length(FeaturesR);
+  n := Length(FeaturesG);
+  if NumSubsets < 1 then NumSubsets := 1;
+  if SubsetSize < 2 then SubsetSize := 2;
+  sub := SubsetSize;
+  if sub > m then sub := m;
+  if sub > n then sub := n;
+
+  SetLength(scores, NumSubsets);
+  SetLength(idxR, sub);
+  SetLength(idxG, sub);
+  SetLength(subR, sub);
+  SetLength(subG, sub);
+  for s := 0 to NumSubsets - 1 do
+  begin
+    SampleIndices(m, sub, idxR);
+    SampleIndices(n, sub, idxG);
+    for i := 0 to sub - 1 do
+    begin
+      subR[i] := FeaturesR[idxR[i]];
+      subG[i] := FeaturesG[idxG[i]];
+    end;
+    scores[s] := ComputeKIDMMD2(subR, subG);
+  end;
+
+  mean := 0;
+  for i := 0 to NumSubsets - 1 do mean := mean + scores[i];
+  mean := mean / NumSubsets;
+  varSum := 0;
+  for i := 0 to NumSubsets - 1 do varSum := varSum + Sqr(scores[i] - mean);
+  Score := mean;
+  if NumSubsets > 1 then
+    StdDev := Sqrt(varSum / NumSubsets)  // population std (mirrors IS report)
+  else
+    StdDev := 0;
 end;
 
 end.

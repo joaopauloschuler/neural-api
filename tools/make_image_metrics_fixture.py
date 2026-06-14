@@ -275,10 +275,53 @@ ssim_cases.append({
     "psnr": psnr(cA, cB, L),
 })
 
+# ---------------------------------------------------------------------------
+# KID (Kernel Inception Distance): unbiased polynomial-kernel MMD^2.
+# k(x,y) = (x.y/d + 1)^3; unbiased U-statistic (no diagonal self-terms).
+# Validated against the full-set MMD^2 (ComputeKIDMMD2), so no random subset
+# bootstrap is needed for parity.
+# ---------------------------------------------------------------------------
+def poly_kernel_matrix(X, Y):
+    d = X.shape[1]
+    return (X @ Y.T / d + 1.0) ** 3
+
+
+def kid_mmd2(X, Y):
+    m, n = X.shape[0], Y.shape[0]
+    Kxx = poly_kernel_matrix(X, X)
+    Kyy = poly_kernel_matrix(Y, Y)
+    Kxy = poly_kernel_matrix(X, Y)
+    np.fill_diagonal(Kxx, 0.0)
+    np.fill_diagonal(Kyy, 0.0)
+    termR = Kxx.sum() / (m * (m - 1))
+    termG = Kyy.sum() / (n * (n - 1))
+    cross = Kxy.sum() / (m * n)
+    return float(termR + termG - 2.0 * cross)
+
+
+kid_cases = []
+np.random.seed(20260615)
+dk = 16
+# Reference set.
+XR = np.random.randn(80, dk)
+# Same distribution (KID-self / same-dist ~ small).
+XGsame = np.random.randn(70, dk)
+# Shifted distribution (larger KID).
+XGfar = np.random.randn(70, dk) + 3.0
+kid_cases.append({
+    "name": "gauss_dim16",
+    "featuresR": XR.tolist(),
+    "featuresGsame": XGsame.tolist(),
+    "featuresGfar": XGfar.tolist(),
+    "mmd2_self": kid_mmd2(XR, XR),
+    "mmd2_same": kid_mmd2(XR, XGsame),
+    "mmd2_far": kid_mmd2(XR, XGfar),
+})
+
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, "w") as f:
     json.dump({"fid_cases": cases, "is_cases": is_cases,
-               "ssim_cases": ssim_cases}, f)
+               "ssim_cases": ssim_cases, "kid_cases": kid_cases}, f)
 print("wrote", os.path.abspath(OUT))
 for c in ssim_cases:
     print("SSIM", c["name"], c["ssim"], "PSNR", c["psnr"],

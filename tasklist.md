@@ -398,7 +398,7 @@ rather than acted on.
       pixel MSE. Validate ComputeSSIM/PSNR against a numpy/skimage float64 oracle on
       a pinned image pair (identical -> SSIM 1.0 / PSNR inf), MS-SSIM vs the per-scale
       product; tests/TestNeuralImageMetrics.pas.
-- [ ] KID (Kernel Inception Distance) generative metric — the small-sample-unbiased
+- [X] KID (Kernel Inception Distance) generative metric — the small-sample-unbiased
       complement to the landed FID (FID's plug-in covariance estimate is biased at
       the few-hundred-sample sizes a CPU demo can afford; KID is an unbiased
       polynomial-kernel MMD^2 estimator, Binkowski et al. 2018). Add to
