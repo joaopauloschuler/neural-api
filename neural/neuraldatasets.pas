@@ -202,6 +202,61 @@ type
     ImageFileName:string; V:TNNetVolume; SizeX, SizeY: integer;
     EncodeNeuronalInput: integer = -1):boolean; overload;
 
+// ---------------------------------------------------------------------------
+// Standard vision-model image preprocessing (the timm/torchvision/CLIP
+// inference transform). Plain LoadImageFromFileIntoVolume only does a stretch
+// resize to (SizeX,SizeY); the helpers below do the canonical pipeline every
+// vision importer expects:
+//   (1) aspect-ratio-preserving resize of the SHORTER side to ResizeShorterSide
+//   (2) center-crop to (CropSize x CropSize)
+//   (3) per-channel normalization (x/255 - mean)/std.
+// Mean/Std are 3-element RGB arrays; the published defaults are below.
+// ---------------------------------------------------------------------------
+const
+  // torchvision/timm ImageNet normalization (the classifier default).
+  csImageNetMean: array[0..2] of TNeuralFloat = (0.485, 0.456, 0.406);
+  csImageNetStd:  array[0..2] of TNeuralFloat = (0.229, 0.224, 0.225);
+  // OpenAI CLIP normalization.
+  csClipMean: array[0..2] of TNeuralFloat =
+    (0.48145466, 0.4578275, 0.40821073);
+  csClipStd:  array[0..2] of TNeuralFloat =
+    (0.26862954, 0.26130258, 0.27577711);
+
+type
+  // Scalars read straight from a HuggingFace preprocessor_config.json so the
+  // transform drops into the importers (image classifiers, CLIP, ViT, ...).
+  TNNetImagePreprocess = record
+    ResizeShorterSide: integer;     // size.shortest_edge (resize target)
+    CropSize: integer;              // crop_size (square)
+    Mean: array[0..2] of TNeuralFloat;  // image_mean (RGB)
+    Std: array[0..2] of TNeuralFloat;   // image_std (RGB)
+  end;
+
+// Applies the standard inference transform to Src (an (W,H,3) RGB volume with
+// 0..255 byte-valued channels, the layout LoadImageFromFileIntoVolume yields)
+// and writes the (CropSize,CropSize,3) normalized result into Dst:
+//   shorter-side resize to ResizeShorterSide (aspect preserved, bilinear) ->
+//   center-crop to CropSize -> (x/255 - Mean[c])/Std[c] per channel.
+// Mean/Std are RGB triples (e.g. csImageNetMean / csImageNetStd). Src and Dst
+// may NOT be the same volume.
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat);
+
+// Reads the standard inference transform straight into a TNNetImagePreprocess
+// from a HuggingFace preprocessor_config.json. Handles size as an int, as
+// {"shortest_edge":N} or as {"height":..,"width":..}, and crop_size as an int
+// or {"height":..,"width":..}. Defaults follow CLIPImageProcessor (shortest
+// edge / crop 224, the OpenAI image_mean/image_std) when a field is absent.
+function ReadImagePreprocessConfig(
+  const FileName: string): TNNetImagePreprocess;
+
+// Convenience: load an image file straight to a vision-model-ready normalized
+// volume (LoadImageFromFileIntoVolume + PreprocessImageForVisionModel).
+function LoadImageForVisionModel(const ImageFileName: string; V: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat): boolean;
+
 // Writes the header of a confusion matrix into a CSV file
 procedure ConfusionWriteCSVHeader(var CSVConfusion: TextFile; Labels: array of string);
 
@@ -762,7 +817,7 @@ implementation
 
 uses
   math, neuralthread,
-  {$IFDEF FPC}SysUtils,fileutil{$ELSE}
+  {$IFDEF FPC}Classes,SysUtils,fileutil,fpjson,jsonparser{$ELSE}
   SysUtils,
   IOUtils,
   Types
@@ -3073,6 +3128,196 @@ begin
   else
   begin
     Result := false;
+  end;
+end;
+
+procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat);
+var
+  Work: TNNetVolume;
+  ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
+  Scale, Fx, Fy, V: TNeuralFloat;
+begin
+  if (Src = nil) or (Dst = nil) then
+    raise Exception.Create('PreprocessImageForVisionModel: nil volume.');
+  if Src = Dst then
+    raise Exception.Create(
+      'PreprocessImageForVisionModel: Src and Dst must differ.');
+  if Src.Depth <> 3 then
+    raise Exception.Create(
+      'PreprocessImageForVisionModel: source must have depth 3 (RGB), got ' +
+      IntToStr(Src.Depth) + '.');
+  if (Length(Mean) < 3) or (Length(Std) < 3) then
+    raise Exception.Create(
+      'PreprocessImageForVisionModel: Mean/Std need 3 elements.');
+
+  Work := TNNetVolume.Create;
+  try
+    // ---- (1) resize: shorter edge -> ResizeShorterSide, aspect preserved.
+    // PIL/torchvision default is bicubic; this is bilinear (identity when the
+    // source is already at the target size, so a pre-resized Src is exact).
+    if (Src.SizeX <> ResizeShorterSide) or (Src.SizeY <> ResizeShorterSide) then
+    begin
+      if Src.SizeX <= Src.SizeY then
+      begin
+        Scale := ResizeShorterSide / Src.SizeX;
+        ResizeW := ResizeShorterSide;
+        ResizeH := Round(Src.SizeY * Scale);
+      end
+      else
+      begin
+        Scale := ResizeShorterSide / Src.SizeY;
+        ResizeH := ResizeShorterSide;
+        ResizeW := Round(Src.SizeX * Scale);
+      end;
+      if ResizeW < 1 then ResizeW := 1;
+      if ResizeH < 1 then ResizeH := 1;
+      Work.ReSize(ResizeW, ResizeH, 3);
+      for Y := 0 to ResizeH - 1 do
+        for X := 0 to ResizeW - 1 do
+        begin
+          // bilinear sample location (align_corners = false convention)
+          Fx := (X + 0.5) * Src.SizeX / ResizeW - 0.5;
+          Fy := (Y + 0.5) * Src.SizeY / ResizeH - 0.5;
+          if Fx < 0 then Fx := 0;
+          if Fy < 0 then Fy := 0;
+          SrcX := Trunc(Fx); SrcY := Trunc(Fy);
+          if SrcX > Src.SizeX - 1 then SrcX := Src.SizeX - 1;
+          if SrcY > Src.SizeY - 1 then SrcY := Src.SizeY - 1;
+          for C := 0 to 2 do
+            Work[X, Y, C] := Src[SrcX, SrcY, C];
+        end;
+    end
+    else
+      Work.Copy(Src);
+
+    // ---- (2) center crop to (CropSize, CropSize).
+    OffX := (Work.SizeX - CropSize) div 2;
+    OffY := (Work.SizeY - CropSize) div 2;
+    Dst.ReSize(CropSize, CropSize, 3);
+    for Y := 0 to CropSize - 1 do
+      for X := 0 to CropSize - 1 do
+      begin
+        SrcX := OffX + X;
+        SrcY := OffY + Y;
+        // pad with zeros if the crop window exceeds the resized image
+        if (SrcX < 0) or (SrcY < 0) or
+           (SrcX > Work.SizeX - 1) or (SrcY > Work.SizeY - 1) then
+        begin
+          for C := 0 to 2 do Dst[X, Y, C] := 0;
+          continue;
+        end;
+        // ---- (3) rescale by 1/255 then per-channel normalize.
+        for C := 0 to 2 do
+        begin
+          V := Work[SrcX, SrcY, C] / 255.0;
+          Dst[X, Y, C] := (V - Mean[C]) / Std[C];
+        end;
+      end;
+  finally
+    Work.Free;
+  end;
+end;
+
+function LoadImageForVisionModel(const ImageFileName: string; V: TNNetVolume;
+  ResizeShorterSide, CropSize: integer;
+  const Mean, Std: array of TNeuralFloat): boolean;
+var
+  Raw: TNNetVolume;
+begin
+  Raw := TNNetVolume.Create;
+  try
+    Result := LoadImageFromFileIntoVolume(ImageFileName, Raw);
+    if Result then
+      PreprocessImageForVisionModel(Raw, V, ResizeShorterSide, CropSize,
+        Mean, Std);
+  finally
+    Raw.Free;
+  end;
+end;
+
+function ReadImagePreprocessConfig(
+  const FileName: string): TNNetImagePreprocess;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+
+  // Reads a size-like field that may be an int (square) or an object with
+  // shortest_edge / height / width. Returns the resolved edge length.
+  function ReadEdge(const FieldName: string; DefaultEdge: integer): integer;
+  var
+    Data: TJSONData;
+    O: TJSONObject;
+  begin
+    Result := DefaultEdge;
+    Data := Obj.Find(FieldName);
+    if Data = nil then Exit;
+    if Data is TJSONObject then
+    begin
+      O := TJSONObject(Data);
+      if O.IndexOfName('shortest_edge') >= 0 then
+        Result := O.Get('shortest_edge', DefaultEdge)
+      else if O.IndexOfName('height') >= 0 then
+        Result := O.Get('height', DefaultEdge)
+      else if O.IndexOfName('width') >= 0 then
+        Result := O.Get('width', DefaultEdge);
+    end
+    else if Data.JSONType = jtNumber then
+      Result := Data.AsInteger;
+  end;
+
+  procedure ReadTriple(const FieldName: string; var Arr: array of TNeuralFloat;
+    D0, D1, D2: TNeuralFloat);
+  var
+    Data: TJSONData;
+    A: TJSONArray;
+  begin
+    Arr[0] := D0; Arr[1] := D1; Arr[2] := D2;
+    Data := Obj.Find(FieldName);
+    if (Data <> nil) and (Data is TJSONArray) then
+    begin
+      A := TJSONArray(Data);
+      if A.Count >= 3 then
+      begin
+        Arr[0] := A.Items[0].AsFloat;
+        Arr[1] := A.Items[1].AsFloat;
+        Arr[2] := A.Items[2].AsFloat;
+      end;
+    end;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    raise Exception.Create(
+      'ReadImagePreprocessConfig: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        raise Exception.Create('ReadImagePreprocessConfig: config "' +
+          FileName + '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      raise Exception.Create('ReadImagePreprocessConfig: config "' +
+        FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+
+    Result.ResizeShorterSide := ReadEdge('size', 224);
+    Result.CropSize := ReadEdge('crop_size', Result.ResizeShorterSide);
+    // Defaults follow CLIPImageProcessor (the OpenAI image_mean/image_std).
+    ReadTriple('image_mean', Result.Mean,
+      csClipMean[0], csClipMean[1], csClipMean[2]);
+    ReadTriple('image_std', Result.Std,
+      csClipStd[0], csClipStd[1], csClipStd[2]);
+  finally
+    Root.Free;
+    JsonText.Free;
   end;
 end;
 

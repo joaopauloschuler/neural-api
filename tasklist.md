@@ -277,20 +277,21 @@ rather than acted on.
 
 ### Computer vision & generative models
 
-- [ ] Standard vision-model image preprocessing helper in neuraldatasets.pas —
-      the timm/torchvision/CLIP inference transform that EVERY vision importer
-      below needs and that is currently missing (LoadImageFromFileIntoVolume
-      only does a plain stretch-resize to SizeX,SizeY). Add a helper that does
-      aspect-ratio-preserving resize-shorter-side-to-N then center-crop-to-NxN,
-      followed by per-channel (x/255 - mean)/std normalization with configurable
-      mean/std (ImageNet defaults 0.485/0.456/0.406, 0.229/0.224/0.225; CLIP
-      0.48145.../0.26862...). Read the three scalars straight from a HF
-      preprocessor_config.json (image_mean/image_std/size/crop_size) so it
-      drops into the importers. This is exactly LLaVA Step "(b) image
-      preprocessing" pulled out as a reusable foundation; the CLIP importer's
-      ad-hoc PadXY+Crop folding is NOT this (it bakes a fixed square resize into
-      pos row 0). Deliverable: one tested helper + a parity check vs
-      torchvision/PIL on a committed tiny image.
+- [X] Standard vision-model image preprocessing helper in neuraldatasets.pas —
+      DONE: PreprocessImageForVisionModel(Src,Dst,ResizeShorterSide,CropSize,
+      Mean,Std) does aspect-preserving shorter-side resize -> center-crop NxN ->
+      per-channel (x/255-mean)/std. Constants csImageNetMean/Std and
+      csClipMean/Std are exported; ReadImagePreprocessConfig reads
+      size/crop_size/image_mean/image_std from a HF preprocessor_config.json
+      (size/crop_size as int or {shortest_edge}/{height,width}); convenience
+      LoadImageForVisionModel loads a file straight to a normalized volume. This
+      is the clean reusable version of LLaVA Step "(b)" — distinct from the CLIP
+      importer's ad-hoc PadXY+Crop fold into pos row 0. NOTE: torchvision is NOT
+      installable here, so the "parity vs torchvision/PIL on a committed tiny
+      image" check was substituted with a SYNTHETIC, hand-computed oracle
+      (geometry: output dims + center-crop offsets; normalization: known pixel
+      -> (v/255-mean)/std, float64 oracle from an inlined python3 snippet). Test:
+      tests/TestNeuralImagePreprocess.pas (6 cases, all pass; full suite green).
 - [ ] ResNet importer follow-ups (BuildResNetFromSafeTensors[Ex] LANDED, commit
       317a19c: torchvision resnet18/50 state_dict, conv-BN fold at load, config
       reader/ToString, resnet18 parity 1.0e-6 vs a numpy float64 oracle —
