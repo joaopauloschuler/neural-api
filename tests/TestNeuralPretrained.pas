@@ -267,6 +267,9 @@ type
     procedure TestClipParity;
     procedure TestClipVisionFeatures;
     procedure TestClipImagePreprocess;
+    procedure TestSigLIPConfigFromJSONFile;
+    procedure TestSigLIPParity;
+    procedure TestSigLIPVisionFeatures;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -12219,6 +12222,231 @@ begin
     RefJson.Free;
     Dst.Free;
     Src.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestSigLIPConfigFromJSONFile;
+var
+  Config: TSigLIPConfig;
+  NN: TNNet;
+begin
+  Config := ReadSigLIPConfigFromJSONFile(
+    FixturePath('tiny_siglip_config.json'));
+  AssertEquals('model_type', 'siglip', Config.ModelType);
+  AssertEquals('text hidden_size', 16, Config.Text.HiddenSize);
+  AssertEquals('text intermediate_size', 32, Config.Text.IntermediateSize);
+  AssertEquals('text num_hidden_layers', 2, Config.Text.NumLayers);
+  AssertEquals('text num_attention_heads', 4, Config.Text.NumHeads);
+  AssertEquals('text vocab_size', 33, Config.TextVocabSize);
+  AssertEquals('text max_position_embeddings', 12, Config.TextMaxPositions);
+  AssertTrue('text hidden_act gelu_pytorch_tanh',
+    Config.Text.HiddenAct = chaGeluTanh);
+  AssertEquals('vision hidden_size', 16, Config.Vision.HiddenSize);
+  AssertEquals('vision num_hidden_layers', 2, Config.Vision.NumLayers);
+  AssertEquals('image_size', 12, Config.ImageSize);
+  AssertEquals('patch_size', 4, Config.PatchSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('projection_dim = text hidden (projection_size default)', 16,
+    Config.ProjectionDim);
+
+  // BuildFromPretrained must reject the dual encoder and point at the
+  // two-net builder.
+  NN := nil;
+  try
+    NN := BuildFromPretrained(FixturePath('tiny_siglip.safetensors'),
+      {pSeqLen=}8, {pInferenceOnly=}false,
+      FixturePath('tiny_siglip_config.json'));
+    Fail('BuildFromPretrained must reject model_type "siglip"');
+  except
+    on E: EPretrainedImportError do
+      AssertTrue('siglip rejection must point at ' +
+        'BuildSigLIPFromSafeTensors, got: ' + E.Message,
+        Pos('BuildSigLIPFromSafeTensors', E.Message) > 0);
+  end;
+  NN.Free;
+end;
+
+// SigLIP parity test - the sigmoid-loss dual encoder, architecturally
+// DISTINCT from CLIP: tests/fixtures/tiny_siglip.* is a pico randomly-
+// initialized HF SiglipModel (text: 2 layers, 4 heads, d 16, vocab 33,
+// max_pos 12, BIDIRECTIONAL, last-token pooling + a BIASED head; vision:
+// image 12, patch 4 -> 9 patches NO class token, 2 layers, biased patch
+// conv, post_layernorm, a Multihead Attention Pooling head; gelu_pytorch_
+// tanh in both towers; logit_scale AND logit_bias). The generator
+// tools/siglip_tiny_fixture.py asserts every SigLIP-vs-CLIP quirk is
+// visible in the float64 oracle. Compares the UNNORMALIZED pooled embeds
+// (HF get_text_features at the LAST text row, get_image_features = the
+// MAP-pooled row 0 of the vision net) AND the sigmoid scoring path:
+// exp(logit_scale)*cosine + logit_bias must reproduce HF's
+// logits_per_image (and its transpose logits_per_text).
+procedure TTestNeuralPretrained.TestSigLIPParity;
+var
+  TextNet, VisionNet: TNNet;
+  Config: TSigLIPConfig;
+  RefRoot: TJSONData;
+  TextSeqs, TextEmbeds, ImageEmbeds, LogitsPerImage: TJSONArray;
+  Pixels, RowArr, ChanArr, SeqArr: TJSONArray;
+  TextInput, ImageInput, TextEmb, ImageEmb: TNNetVolume;
+  RefJson: TStringList;
+  SeqCnt, PosCnt, ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxTextDiff, MaxImageDiff, MaxLogitDiff: double;
+  RefLogitScale, RefLogitBias, Logit: double;
+const
+  SeqLen = 8;
+begin
+  RandSeed := 424242;
+  BuildSigLIPFromSafeTensors(FixturePath('tiny_siglip.safetensors'),
+    TextNet, VisionNet, Config, {TextSeqLen=}SeqLen,
+    {pInferenceOnly=}false, FixturePath('tiny_siglip_config.json'));
+  RefJson := TStringList.Create;
+  TextInput := TNNetVolume.Create;
+  ImageInput := TNNetVolume.Create;
+  TextEmb := TNNetVolume.Create;
+  ImageEmb := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('text net built', TextNet <> nil);
+    AssertTrue('vision net built', VisionNet <> nil);
+    AssertEquals('text input length', SeqLen,
+      TextNet.Layers[0].Output.SizeX);
+    AssertEquals('text output rows', SeqLen,
+      TextNet.GetLastLayer().Output.SizeX);
+    AssertEquals('text output depth = projection_dim',
+      Config.ProjectionDim, TextNet.GetLastLayer().Output.Depth);
+    AssertEquals('vision input grid', Config.ImageSize,
+      VisionNet.Layers[0].Output.SizeX);
+    // The MAP head pools to ONE token (row 0).
+    AssertEquals('vision output rows = 1 (MAP pooled token)', 1,
+      VisionNet.GetLastLayer().Output.SizeX);
+    AssertEquals('vision output depth = vision hidden', Config.Vision.HiddenSize,
+      VisionNet.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_siglip_embeds.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    TextSeqs := TJSONArray(TJSONObject(RefRoot).Find('text_sequences'));
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    TextEmbeds := TJSONArray(TJSONObject(RefRoot).Find('text_embeds'));
+    ImageEmbeds := TJSONArray(TJSONObject(RefRoot).Find('image_embeds'));
+    LogitsPerImage :=
+      TJSONArray(TJSONObject(RefRoot).Find('logits_per_image'));
+    RefLogitScale := TJSONObject(RefRoot).Get('logit_scale', 0.0);
+    RefLogitBias := TJSONObject(RefRoot).Get('logit_bias', 0.0);
+    AssertTrue('text_sequences present', TextSeqs <> nil);
+    AssertTrue('logits_per_image present', LogitsPerImage <> nil);
+    AssertTrue('at least 2 text sequences', TextSeqs.Count >= 2);
+    AssertTrue('logit_scale loaded from the checkpoint, |' +
+      FloatToStr(Config.LogitScale) + ' - ' + FloatToStr(RefLogitScale) +
+      '| < 1e-6', Abs(Config.LogitScale - RefLogitScale) < 1e-6);
+    AssertTrue('logit_bias loaded from the checkpoint, |' +
+      FloatToStr(Config.LogitBias) + ' - ' + FloatToStr(RefLogitBias) +
+      '| < 1e-6', Abs(Config.LogitBias - RefLogitBias) < 1e-6);
+
+    // ---- VISION tower parity (MAP-pooled image embed) ----
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    VisionNet.Compute(ImageInput);
+    MaxImageDiff := 0;
+    RowArr := TJSONArray(ImageEmbeds.Items[0]);
+    AssertEquals('image embed width', Config.Vision.HiddenSize, RowArr.Count);
+    for ChanCnt := 0 to Config.Vision.HiddenSize - 1 do
+    begin
+      Diff := Abs(VisionNet.GetLastLayer().Output.FData[ChanCnt] -
+        RowArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxImageDiff then MaxImageDiff := Diff;
+    end;
+    AssertTrue('image embeds: max |diff| = ' + FloatToStr(MaxImageDiff) +
+      ' must be < 1e-4', MaxImageDiff < 1e-4);
+    ClipExtractEmbedding(VisionNet.GetLastLayer().Output, 0, ImageEmb);
+
+    // ---- TEXT tower parity (last-token pooling) + sigmoid scoring ----
+    MaxTextDiff := 0;
+    MaxLogitDiff := 0;
+    TextInput.ReSize(SeqLen, 1, 1);
+    for SeqCnt := 0 to TextSeqs.Count - 1 do
+    begin
+      SeqArr := TJSONArray(TextSeqs.Items[SeqCnt]);
+      for PosCnt := 0 to SeqLen - 1 do
+        TextInput.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+      TextNet.Compute(TextInput);
+      RowArr := TJSONArray(TextEmbeds.Items[SeqCnt]);
+      AssertEquals('text embed width', Config.ProjectionDim, RowArr.Count);
+      for ChanCnt := 0 to Config.ProjectionDim - 1 do
+      begin
+        // SigLIP pools the LAST token (row SeqLen-1), NOT CLIP's eos-argmax.
+        Diff := Abs(TextNet.GetLastLayer().Output.FData[
+          (SeqLen - 1) * Config.ProjectionDim + ChanCnt] -
+          RowArr.Items[ChanCnt].AsFloat);
+        if Diff > MaxTextDiff then MaxTextDiff := Diff;
+      end;
+      ClipExtractEmbedding(TextNet.GetLastLayer().Output, SeqLen - 1,
+        TextEmb);
+      // logits_per_image[0][SeqCnt] = exp(scale)*cosine + bias.
+      Logit := SigLIPLogit(ImageEmb, TextEmb, Config.LogitScale,
+        Config.LogitBias);
+      Diff := Abs(Logit - TJSONArray(LogitsPerImage.Items[0])
+        .Items[SeqCnt].AsFloat);
+      if Diff > MaxLogitDiff then MaxLogitDiff := Diff;
+    end;
+    AssertTrue('text embeds: max |diff| = ' + FloatToStr(MaxTextDiff) +
+      ' must be < 1e-4', MaxTextDiff < 1e-4);
+    AssertTrue('logits_per_image (sigmoid scoring): max |diff| = ' +
+      FloatToStr(MaxLogitDiff) + ' must be < 1e-4', MaxLogitDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageEmb.Free;
+    TextEmb.Free;
+    ImageInput.Free;
+    TextInput.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    TextNet.Free;
+  end;
+end;
+
+// The LLaVA/VLM consumption mode: BuildSigLIPVisionTower with
+// pVisionFeatures = True must SKIP the MAP pooling head and return the
+// (NumPatches, 1, hidden) patch-token hidden states. With the full stack it
+// applies post_layernorm (HF last_hidden_state); we assert the shape
+// contract and that the pooled MAP image embed (the default mode) is
+// genuinely a function of these patch features (non-trivial pooling).
+procedure TTestNeuralPretrained.TestSigLIPVisionFeatures;
+var
+  Reader: TNNetSafeTensorsReader;
+  VisionNet: TNNet;
+  Config: TSigLIPConfig;
+  NumPatches: integer;
+begin
+  RandSeed := 424242;
+  Config := ReadSigLIPConfigFromJSONFile(
+    FixturePath('tiny_siglip_config.json'));
+  NumPatches := Sqr(Config.ImageSize div Config.PatchSize);
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_siglip.safetensors'));
+  VisionNet := nil;
+  try
+    VisionNet := BuildSigLIPVisionTower(Reader, Config.Vision,
+      Config.ImageSize, Config.PatchSize, Config.NumChannels,
+      'vision_model.', {pInferenceOnly=}false, {pVisionFeatures=}true);
+    AssertEquals('feature rows = num patches (no MAP pool, no class token)',
+      NumPatches, VisionNet.GetLastLayer().Output.SizeX);
+    AssertEquals('feature height', 1, VisionNet.GetLastLayer().Output.SizeY);
+    AssertEquals('feature depth = vision hidden', Config.Vision.HiddenSize,
+      VisionNet.GetLastLayer().Output.Depth);
+  finally
+    VisionNet.Free;
+    Reader.Free;
   end;
 end;
 

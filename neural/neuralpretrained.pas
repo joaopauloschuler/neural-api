@@ -4633,6 +4633,99 @@ procedure ClipExtractEmbedding(NetOutput: TNNetVolume; TokenPos: integer;
 // ClipExtractEmbedding outputs (both are unit-L2).
 function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 
+// ===========================================================================
+// SigLIP IMPORT (model_type "siglip" / "siglip2": google/siglip-base-
+// patch16-224 and siblings) - a sigmoid-loss image-text dual encoder. It
+// REUSES the CLIP pre-LN encoder block (TClipTowerConfig / AddClipEncoder
+// block / LoadClipEncoderBlockWeights) but the heads/pooling/embeddings are
+// architecturally DISTINCT from CLIP and are NOT force-fit onto the CLIP path:
+//   (a) loss head: a learnable logit_scale AND logit_bias (CLIP has scale
+//       only); SigLIPLogits applies logits = exp(scale)*cosine + bias;
+//   (b) TEXT tower: BIDIRECTIONAL (no causal mask, unlike CLIP), pools the
+//       LAST token's hidden state (NOT CLIP's eos-argmax) through a BIASED
+//       head nn.Linear (text_model.head); VISION tower pools via a Multihead
+//       Attention Pooling head (MAP: one learnable probe query cross-attends
+//       over the patch tokens, then out = attn + mlp(LayerNorm(attn)), row 0)
+//       - NOT a CLS token;
+//   (c) MLP activation is gelu_pytorch_tanh (the tanh-approx GELU), not
+//       CLIP's quick_gelu;
+//   (d) patch embedding is BIASED, has NO class token, and the learned
+//       position table covers exactly num_patches rows (no +1); a prenorm
+//       encoder with a final post_layernorm.
+// v1 scopes to the FIXED-resolution siglip / siglip2 base configs; NaFlex /
+// variable-resolution siglip2 is an explicit follow-up (tasklist.md).
+// ---------------------------------------------------------------------------
+type
+  TSigLIPConfig = record
+    Text: TClipTowerConfig;     // text_config (encoder block shape; HiddenAct
+                                // forced to gelu_pytorch_tanh)
+    Vision: TClipTowerConfig;   // vision_config
+    TextVocabSize: integer;     // text_config.vocab_size
+    TextMaxPositions: integer;  // text_config.max_position_embeddings (64)
+    ImageSize: integer;         // vision_config.image_size (224)
+    PatchSize: integer;         // vision_config.patch_size (16/14)
+    NumChannels: integer;       // vision_config.num_channels (3)
+    ProjectionDim: integer;     // text head out width = projection_size
+                                // (= text hidden_size in published SigLIPs);
+                                // the IMAGE embed width is vision hidden_size
+    LogitScale: TNeuralFloat;   // RAW logit_scale tensor (pre-exp)
+    LogitBias: TNeuralFloat;    // RAW logit_bias tensor (added after scaling)
+    ModelType: string;          // 'siglip' / 'siglip2'
+  end;
+
+// Reads a HF SigLIP config.json (model_type "siglip"/"siglip2"). Required
+// per tower (text_config / vision_config): hidden_size, intermediate_size,
+// num_hidden_layers, num_attention_heads, plus text vocab_size +
+// max_position_embeddings and vision image_size + patch_size. Defaults:
+// hidden_act "gelu_pytorch_tanh", layer_norm_eps 1e-6, num_channels 3,
+// projection_size = text hidden_size. The hidden_act is forced to the
+// tanh-GELU (every published SigLIP); any other value is rejected.
+function ReadSigLIPConfigFromJSONFile(const FileName: string): TSigLIPConfig;
+
+function SigLIPConfigToString(const Config: TSigLIPConfig): string;
+
+// Builds the SigLIP TEXT and VISION nets described by Config and loads every
+// weight from the checkpoint at FileName. TextSeqLen <= 0 uses the full
+// max_position_embeddings context. Both nets are owned by the caller.
+// pInferenceOnly frees training volumes during construction. The TEXT net
+// outputs (SeqLen,1,ProjectionDim): the per-token final_layer_norm + biased
+// head; the IMAGE embed is the VISION net's row-0 output (the MAP pooled
+// token), shape (1,1,vision hidden). Config.LogitScale / LogitBias are
+// updated from the checkpoint tensors.
+procedure BuildSigLIPFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TSigLIPConfig; out TextNet, VisionNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+procedure BuildSigLIPFromSafeTensors(const FileName: string;
+  out TextNet, VisionNet: TNNet; out Config: TSigLIPConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Builds + loads the SigLIP ViT VISION tower alone (the reusable half, the
+// SigLIP-flavoured ViT: biased patch conv, no class token, prenorm encoder,
+// post_layernorm). Prefix is the tensor-name prefix ('vision_model.').
+// pVisionFeatures = True is the LLaVA/VLM mode: the tower SKIPS the MAP
+// pooling head and returns the (NumPatches,1,hidden) patch-token hidden
+// states straight after the encoder (SelectHiddenLayer picks how many
+// encoder blocks to run: <=0 = the full stack then post_layernorm; a
+// positive N runs the first N blocks and omits post_layernorm, matching HF
+// output_hidden_states[N]). Default (pVisionFeatures = False) returns the
+// MAP-pooled (1,1,hidden) image embedding token at row 0.
+function BuildSigLIPVisionTower(Reader: TNNetSafeTensorsReader;
+  const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels: integer;
+  const Prefix: string; pInferenceOnly: boolean = false;
+  pVisionFeatures: boolean = false;
+  SelectHiddenLayer: integer = 0): TNNet;
+
+// SigLIP scoring: image/text embeds are L2-normalized (ClipExtractEmbedding),
+// then logit = exp(LogitScale) * cosine(ImageEmb, TextEmb) + LogitBias. This
+// is HF's logits_per_image[i][t] entry; the sigmoid probability is
+// 1/(1+exp(-logit)).
+function SigLIPLogit(ImageEmb, TextEmb: TNNetVolume;
+  LogitScale, LogitBias: TNeuralFloat): TNeuralFloat;
+
 // ---------------------------------------------------------------------------
 // CLIP / LLaVA image preprocessing (LLaVA Step 2)
 // ---------------------------------------------------------------------------
@@ -29822,6 +29915,467 @@ begin
     Result := Result + EmbA.FData[ChanCnt] * EmbB.FData[ChanCnt];
 end;
 
+// ===========================================================================
+// SigLIP IMPORT (see the interface header). Reuses TClipTowerConfig and the
+// CLIP encoder-block builder/loader; only the embeddings, heads, pooling and
+// scoring differ.
+// ===========================================================================
+
+function SigLIPHiddenActFromString(const ActStr: string): TClipHiddenAct;
+begin
+  // Every published SigLIP uses gelu_pytorch_tanh (the tanh-approx GELU).
+  // gelu_new is an accepted spelling of the same; the exact erf gelu and
+  // quick_gelu are visibly different (see the fixture self-checks) and are
+  // rejected so a mislabelled config fails loudly rather than silently.
+  if (ActStr = 'gelu_pytorch_tanh') or (ActStr = 'gelu_new') then
+    Result := chaGeluTanh
+  else
+  begin
+    Result := chaGeluTanh;
+    ImportError('SigLIP import: hidden_act "' + ActStr + '" is not ' +
+      'supported - SigLIP uses "gelu_pytorch_tanh".');
+  end;
+end;
+
+function ReadSigLIPConfigFromJSONFile(const FileName: string): TSigLIPConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, TowerObj: TJSONObject;
+  ModelType: string;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(FieldName);
+    if (Data = nil) or not (Data is TJSONObject) then
+      ImportError('SigLIP import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(Data);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('SigLIP import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('SigLIP import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        O.Find(FieldName).AsJSON + '.');
+  end;
+
+  procedure ReadTower(O: TJSONObject; var Tower: TClipTowerConfig);
+  begin
+    Tower.HiddenSize := RequiredInt(O, 'hidden_size');
+    Tower.IntermediateSize := RequiredInt(O, 'intermediate_size');
+    Tower.NumLayers := RequiredInt(O, 'num_hidden_layers');
+    Tower.NumHeads := RequiredInt(O, 'num_attention_heads');
+    Tower.LayerNormEps := O.Get('layer_norm_eps', 0.000001);
+    Tower.HiddenAct := SigLIPHiddenActFromString(
+      O.Get('hidden_act', 'gelu_pytorch_tanh'));
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('SigLIP import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('SigLIP import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('SigLIP import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'siglip');
+    if (ModelType <> 'siglip') and (ModelType <> 'siglip2') then
+      ImportError('SigLIP import: config model_type is "' + ModelType +
+        '" - only "siglip" / "siglip2" are supported here.');
+    Result.ModelType := ModelType;
+    TowerObj := RequiredSubObject('text_config');
+    ReadTower(TowerObj, Result.Text);
+    Result.TextVocabSize := RequiredInt(TowerObj, 'vocab_size');
+    Result.TextMaxPositions :=
+      RequiredInt(TowerObj, 'max_position_embeddings');
+    // SigLIP's text head out width is projection_size (defaults to the text
+    // hidden_size in every published SigLIP).
+    Result.ProjectionDim :=
+      TowerObj.Get('projection_size', Result.Text.HiddenSize);
+    TowerObj := RequiredSubObject('vision_config');
+    ReadTower(TowerObj, Result.Vision);
+    Result.ImageSize := RequiredInt(TowerObj, 'image_size');
+    Result.PatchSize := RequiredInt(TowerObj, 'patch_size');
+    Result.NumChannels := TowerObj.Get('num_channels', 3);
+    Result.LogitScale := 0;   // overwritten from the checkpoint tensor
+    Result.LogitBias := 0;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function SigLIPConfigToString(const Config: TSigLIPConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'siglip'
+  else Result := Config.ModelType;
+  Result := Result + ' config: text(d=' + IntToStr(Config.Text.HiddenSize) +
+    ', layers=' + IntToStr(Config.Text.NumLayers) +
+    ', heads=' + IntToStr(Config.Text.NumHeads) +
+    ', ffn=' + IntToStr(Config.Text.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.TextVocabSize) +
+    ', max_pos=' + IntToStr(Config.TextMaxPositions) +
+    '), vision(d=' + IntToStr(Config.Vision.HiddenSize) +
+    ', layers=' + IntToStr(Config.Vision.NumLayers) +
+    ', heads=' + IntToStr(Config.Vision.NumHeads) +
+    ', ffn=' + IntToStr(Config.Vision.IntermediateSize) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    '), proj_dim=' + IntToStr(Config.ProjectionDim) +
+    ', logit_scale=' + FloatToStrF(Config.LogitScale, ffGeneral, 6, 0) +
+    ', logit_bias=' + FloatToStrF(Config.LogitBias, ffGeneral, 6, 0);
+end;
+
+function SigLIPLogit(ImageEmb, TextEmb: TNNetVolume;
+  LogitScale, LogitBias: TNeuralFloat): TNeuralFloat;
+begin
+  Result := Exp(LogitScale) * ClipSimilarity(ImageEmb, TextEmb) + LogitBias;
+end;
+
+function BuildSigLIPVisionTower(Reader: TNNetSafeTensorsReader;
+  const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels: integer;
+  const Prefix: string; pInferenceOnly: boolean = false;
+  pVisionFeatures: boolean = false;
+  SelectHiddenLayer: integer = 0): TNNet;
+var
+  NN: TNNet;
+  PatchConv, PosEmb, PostLN: TNNetLayer;
+  Probe, ProbeQ, PatchKV: TNNetLayer;
+  MapQProj, MapKProj, MapVProj, MapOut: TNNetLayer;
+  MapLN, MapInter, MapFc2, AttnSum, MlpSum: TNNetLayer;
+  QSlice, KSlice, VSlice, KVPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+   Channels: array of integer;
+  Blocks: TClipBlockLayersArray;
+  Tmp: TNNetVolume;
+  d, dk, HeadCnt, ci, Grid, NumPatches, BuiltLayers, BlockCnt: integer;
+  PatchBiasName: string;
+begin
+  d := Tower.HiddenSize;
+  if (Tower.NumHeads < 1) or ((d mod Tower.NumHeads) <> 0) then
+    ImportError('SigLIP import: vision hidden_size=' + IntToStr(d) +
+      ' is not divisible by num_attention_heads=' +
+      IntToStr(Tower.NumHeads) + '.');
+  if (PatchSize < 1) or ((ImageSize mod PatchSize) <> 0) then
+    ImportError('SigLIP import: image_size=' + IntToStr(ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(PatchSize) + '.');
+  Grid := ImageSize div PatchSize;
+  NumPatches := Grid * Grid;
+  dk := d div Tower.NumHeads;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(ImageSize, ImageSize, NumChannels) );
+    // BIASED patch embedding (unlike CLIP): kernel = stride = patch_size.
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      d, PatchSize, {pInputPadding=}0, {pStride=}PatchSize,
+      {pSuppressBias=}0) );
+    // Row-major (y,x) patch grid = HF flatten(2).transpose order. NO class
+    // token (unlike CLIP): the position table covers exactly NumPatches rows.
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(NumPatches) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    // SigLIP's vision encoder is a PRENORM stack like CLIP but WITHOUT a
+    // pre_layrnorm before block 0. In LLaVA/VLM feature mode a positive
+    // SelectHiddenLayer runs only the first N blocks (HF
+    // output_hidden_states[N]); default runs the full stack.
+    if pVisionFeatures and (SelectHiddenLayer > 0) then
+      BuiltLayers := SelectHiddenLayer
+    else
+      BuiltLayers := Tower.NumLayers;
+    if BuiltLayers > Tower.NumLayers then BuiltLayers := Tower.NumLayers;
+    SetLength(Blocks, BuiltLayers);
+    for BlockCnt := 0 to BuiltLayers - 1 do
+      AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
+        Blocks[BlockCnt], pInferenceOnly);
+    PostLN := nil;
+    if pVisionFeatures then
+    begin
+      // VLM feature mode: return the (NumPatches,1,hidden) patch hidden
+      // states. The full-stack case (SelectHiddenLayer<=0) applies the final
+      // post_layernorm (HF last_hidden_state); a selected earlier layer is
+      // returned RAW (HF hidden_states[N] is pre-post_layernorm).
+      if SelectHiddenLayer <= 0 then
+        PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    end
+    else
+    begin
+      // Inference embedding path: post_layernorm over every patch token,
+      // then the Multihead Attention Pooling (MAP) head.
+      PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+      PatchKV := NN.GetLastLayer();    // (NumPatches,1,d) K/V source
+      // The learnable probe (one virtual query token) prepended to the patch
+      // sequence by TNNetSoftPrompt; we then crop it back out as the query.
+      Probe := NN.AddLayer( TNNetSoftPrompt.Create(1, d) );
+      ProbeQ := NN.AddLayer(
+        TNNetCrop.Create({StartX=}0, {StartY=}0, {LenX=}1, {LenY=}1) );
+      // MAP cross-attention: probe (1 token) attends over the NumPatches
+      // patch tokens. Built manually (mirroring AddMultiHeadCrossAttention)
+      // so the per-head Q/K/V projections can be loaded from nn.Multihead
+      // Attention's packed in_proj_weight [3d, d].
+      MapQProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(d), ProbeQ);
+      MapKProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(d), PatchKV);
+      MapVProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(d), PatchKV);
+      SetLength(HeadOutputs, Tower.NumHeads);
+      SetLength(Channels, dk);
+      for HeadCnt := 0 to Tower.NumHeads - 1 do
+      begin
+        for ci := 0 to dk - 1 do Channels[ci] := HeadCnt * dk + ci;
+        QSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(Channels), MapQProj);
+        KSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(Channels), MapKProj);
+        VSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(Channels), MapVProj);
+        KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+        HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+          TNNetCrossAttention.Create(dk, {CausalMask=}false, KVPack), QSlice);
+      end;
+      NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+      MapOut := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+      SetLength(HeadOutputs, 0);
+      SetLength(Channels, 0);
+      // residual = attn; out = residual + mlp(layernorm(attn)); take row 0.
+      AttnSum := MapOut;
+      MapLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+      MapInter := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Tower.IntermediateSize) );
+      AddClipHiddenAct(NN, Tower.HiddenAct);
+      MapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+      MlpSum := NN.AddLayer( TNNetSum.Create([MapFc2, AttnSum]) );
+      // The pooled output is row 0 (the single probe row); already (1,1,d).
+      if MlpSum = nil then ;  // (silence unused warning paths)
+    end;
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    PatchBiasName := Prefix + 'embeddings.patch_embedding.bias';
+    LoadClipPatchConv(Reader, PatchConv,
+      Prefix + 'embeddings.patch_embedding.weight',
+      NumChannels, PatchSize, d);
+    // SigLIP's patch conv IS biased (LoadClipPatchConv zeroes the bias for
+    // CLIP); load the per-output-channel bias into each neuron's BiasWeight.
+    if not Reader.HasTensor(PatchBiasName) then
+      ImportError('SigLIP import: missing tensor "' + PatchBiasName + '".')
+    else
+    begin
+      if (Reader.DimCount(PatchBiasName) <> 1) or
+         (Reader.DimSize(PatchBiasName, 0) <> d) then
+        ImportError('SigLIP import: "' + PatchBiasName + '" must have shape ['
+          + IntToStr(d) + '], got ' + Reader.ShapeAsString(PatchBiasName));
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(PatchBiasName, Tmp);
+        for ci := 0 to d - 1 do
+          PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+        PatchConv.FlushWeightCache();
+      finally
+        Tmp.Free;
+      end;
+    end;
+    LoadClipEmbeddingTable(Reader, PosEmb,
+      Prefix + 'embeddings.position_embedding.weight', NumPatches, d);
+    for BlockCnt := 0 to BuiltLayers - 1 do
+      LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
+        Prefix + 'encoder.layers.' + IntToStr(BlockCnt) + '.', Tower);
+    if PostLN <> nil then
+      LoadLayerNormWeights(Reader, PostLN,
+        Prefix + 'post_layernorm.weight',
+        Prefix + 'post_layernorm.bias', d);
+    if not pVisionFeatures then
+    begin
+      // probe [1,1,d] -> the SoftPrompt bank row 0 (d values, flattened).
+      if not Reader.HasTensor(Prefix + 'head.probe') then
+        ImportError('SigLIP import: missing tensor "' + Prefix +
+          'head.probe".');
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Prefix + 'head.probe', Tmp);
+        if Tmp.Size <> d then
+          ImportError('SigLIP import: "' + Prefix + 'head.probe" must have ' +
+            IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
+        for ci := 0 to d - 1 do
+          Probe.Neurons[0].Weights.FData[ci] := Tmp.FData[ci];
+        Probe.FlushWeightCache();
+      finally
+        Tmp.Free;
+      end;
+      // nn.MultiheadAttention in_proj_weight [3d, d] = [Wq; Wk; Wv] row
+      // blocks; in_proj_bias [3d] likewise. Slice each block into Q/K/V.
+      LoadLlamaLinearWeights(Reader, MapQProj,
+        Prefix + 'head.attention.in_proj_weight', d, d, 0, d, 0,
+        Prefix + 'head.attention.in_proj_bias', 1.0, 0, 0, 3 * d);
+      LoadLlamaLinearWeights(Reader, MapKProj,
+        Prefix + 'head.attention.in_proj_weight', d, d, 0, d, 0,
+        Prefix + 'head.attention.in_proj_bias', 1.0, 0, d, 3 * d);
+      LoadLlamaLinearWeights(Reader, MapVProj,
+        Prefix + 'head.attention.in_proj_weight', d, d, 0, d, 0,
+        Prefix + 'head.attention.in_proj_bias', 1.0, 0, 2 * d, 3 * d);
+      LoadLlamaLinearWeights(Reader, MapOut,
+        Prefix + 'head.attention.out_proj.weight', d, d, 0, -1, 0,
+        Prefix + 'head.attention.out_proj.bias');
+      LoadLayerNormWeights(Reader, MapLN,
+        Prefix + 'head.layernorm.weight',
+        Prefix + 'head.layernorm.bias', d);
+      LoadLlamaLinearWeights(Reader, MapInter,
+        Prefix + 'head.mlp.fc1.weight', d, Tower.IntermediateSize, 0, -1, 0,
+        Prefix + 'head.mlp.fc1.bias');
+      LoadLlamaLinearWeights(Reader, MapFc2,
+        Prefix + 'head.mlp.fc2.weight', Tower.IntermediateSize, d, 0, -1, 0,
+        Prefix + 'head.mlp.fc2.bias');
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+procedure BuildSigLIPFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TSigLIPConfig; out TextNet, VisionNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  TokEmb, PosEmb, FinalLN, Head: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  Tmp: TNNetVolume;
+  SeqLen, BlockCnt: integer;
+begin
+  TextNet := nil;
+  VisionNet := nil;
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  try
+    try
+      if (Config.Text.NumHeads < 1) or
+         ((Config.Text.HiddenSize mod Config.Text.NumHeads) <> 0) then
+        ImportError('SigLIP import: text hidden_size=' +
+          IntToStr(Config.Text.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.Text.NumHeads) + '.');
+      if TextSeqLen <= 0 then SeqLen := Config.TextMaxPositions
+      else SeqLen := TextSeqLen;
+      if SeqLen > Config.TextMaxPositions then
+        ImportError('SigLIP import: requested TextSeqLen=' +
+          IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
+          IntToStr(Config.TextMaxPositions) + '.');
+
+      // ---------------- TEXT tower architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
+      TokEmb := NN.AddLayer( TNNetEmbedding.Create(
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1) );
+      PosEmb := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.Text.NumLayers);
+      // BIDIRECTIONAL (no causal mask), unlike CLIP's text tower.
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+        AddClipEncoderBlock(NN, Config.Text, {CausalMask=}false,
+          Blocks[BlockCnt], pInferenceOnly);
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      // BIASED head nn.Linear applied PER TOKEN; HF's text_embeds is the row
+      // at the LAST position (SigLIPExtractEmbedding: TokenPos = SeqLen-1).
+      Head := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- TEXT tower weights ----------------
+      LoadClipEmbeddingTable(Reader, TokEmb,
+        'text_model.embeddings.token_embedding.weight',
+        Config.TextVocabSize, Config.Text.HiddenSize);
+      LoadClipEmbeddingTable(Reader, PosEmb,
+        'text_model.embeddings.position_embedding.weight',
+        Config.TextMaxPositions, Config.Text.HiddenSize);
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+        LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
+          'text_model.encoder.layers.' + IntToStr(BlockCnt) + '.',
+          Config.Text);
+      LoadLayerNormWeights(Reader, FinalLN,
+        'text_model.final_layer_norm.weight',
+        'text_model.final_layer_norm.bias', Config.Text.HiddenSize);
+      LoadLlamaLinearWeights(Reader, Head, 'text_model.head.weight',
+        Config.Text.HiddenSize, Config.ProjectionDim, 0, -1, 0,
+        'text_model.head.bias');  // BIASED (unlike CLIP's text_projection)
+      TextNet := NN;
+      NN := nil;
+
+      // ---------------- VISION tower ----------------
+      VisionNet := BuildSigLIPVisionTower(Reader, Config.Vision,
+        Config.ImageSize, Config.PatchSize, Config.NumChannels,
+        'vision_model.', pInferenceOnly);
+
+      // ---------------- logit_scale / logit_bias ----------------
+      if Reader.HasTensor('logit_scale') then
+      begin
+        Tmp := TNNetVolume.Create;
+        try
+          Reader.LoadTensorFlat('logit_scale', Tmp);
+          if Tmp.Size >= 1 then Config.LogitScale := Tmp.FData[0];
+        finally
+          Tmp.Free;
+        end;
+      end;
+      if Reader.HasTensor('logit_bias') then
+      begin
+        Tmp := TNNetVolume.Create;
+        try
+          Reader.LoadTensorFlat('logit_bias', Tmp);
+          if Tmp.Size >= 1 then Config.LogitBias := Tmp.FData[0];
+        finally
+          Tmp.Free;
+        end;
+      end;
+    except
+      NN.Free;
+      TextNet.Free;
+      TextNet := nil;
+      VisionNet.Free;
+      VisionNet := nil;
+      raise;
+    end;
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure BuildSigLIPFromSafeTensors(const FileName: string;
+  out TextNet, VisionNet: TNNet; out Config: TSigLIPConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSigLIPConfigFromJSONFile(ConfigPath);
+  BuildSigLIPFromSafeTensorsWithConfig(FileName, Config, TextNet, VisionNet,
+    TextSeqLen, pInferenceOnly);
+end;
+
 function ReadClipImageProcessorConfig(
   const FileName: string): TClipImageProcessorConfig;
 var
@@ -30453,6 +31007,17 @@ begin
       'BuildClipFromSafeTensors (returns both nets; pool/score with ' +
       'ClipTextEosPosition, ClipExtractEmbedding and ClipSimilarity) ' +
       'instead of this single-net dispatch.');
+  end
+  else if (ModelType = 'siglip') or (ModelType = 'siglip2') then
+  begin
+    // SigLIP is a sigmoid-loss dual encoder: the import builds TWO nets
+    // (text + vision), which this single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "' + ModelType +
+      '" builds a TWO-net dual encoder (text + vision) - call ' +
+      'BuildSigLIPFromSafeTensors (returns both nets; pool with ' +
+      'ClipExtractEmbedding - text row SeqLen-1, image row 0 - and score ' +
+      'with SigLIPLogit) instead of this single-net dispatch.');
   end
   else
   begin

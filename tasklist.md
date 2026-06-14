@@ -264,38 +264,37 @@ rather than acted on.
         ChatML-with-image) in neuralchat.pas + examples/LlavaDescribe demo that
         captions a small image on CPU (ulimit-bounded). Edit examples/README.md
         (NOT the main README) for the new example.
-- [ ] SigLIP image-text dual-encoder importer (model_type "siglip" /
+- [X] SigLIP image-text dual-encoder importer (model_type "siglip" /
       "siglip2"; google/siglip-base-patch16-224, siglip-so400m-patch14-384).
-      SigLIP is the de-facto vision tower of modern open VLMs (PaliGemma,
-      SmolVLM, Idefics2/3, many LLaVA-Next variants), so this is the import
-      that actually unblocks the open LLaVA/VLM tasks above with a
-      production-grade tower — the landed CLIP importer (BuildClipFromSafeTensors,
-      BuildClipVisionTower) is the scaffolding, but SigLIP is architecturally
-      DISTINCT and must NOT be force-fit onto the CLIP path:
-        (a) loss/head: SigLIP uses a sigmoid pairwise loss with a learnable
-            logit_scale AND logit_bias (CLIP has scale only, softmax CE) — for
-            inference both reduce to a fold, but the bias must be loaded;
-        (b) pooling: the text tower has NO causal mask (bidirectional) and
-            pools the LAST token's hidden state through a final head LINEAR
-            (text_model.head) — NOT CLIP's eos-argmax; the vision tower pools
-            via a Multihead Attention Pooling head (MAP: a single learnable
-            probe query attends over patch tokens, then LayerNorm+MLP) rather
-            than a CLS token — needs a small attention-pooling builder (in-repo
-            precedent: TNNetAttentionPooling / AddAttentionPooling, PMA);
-        (c) activations: MLP uses gelu_pytorch_tanh (tanh-approx GELU), not
-            CLIP's quick_gelu;
-        (d) patch embedding: learned absolute position embeddings, NO class
-            token folded into row 0 (unlike the CLIP class-token-into-pos-row-0
-            fold), prenorm encoder with a final post-LayerNorm.
-      Deliverables: ReadSigLIPConfigFromJSONFile + TSigLIPConfig, two nets
-      (vision + text) via a reusable BuildSigLIPVisionTower (consumable by the
-      VLM tasks, with a skip-pooling/select-hidden-layer mode like LLaVA needs),
-      a pico parity fixture (make_pico_*_fixture.py recipe) asserting both
-      image and text embeddings AND the image/text logit matrix vs HF float64
-      < 1e-4, and an examples/SigLIPZeroShot zero-shot classification demo
-      (edit examples/README.md, not the main README). siglip2 adds a NaFlex/
-      variable-resolution variant — scope v1 to the fixed-resolution
-      siglip/siglip2 base configs and list NaFlex as an explicit follow-up.
+      LANDED: BuildSigLIPFromSafeTensors[WithConfig] + ReadSigLIPConfigFrom
+      JSONFile/TSigLIPConfig/SigLIPConfigToString + reusable
+      BuildSigLIPVisionTower (with a pVisionFeatures skip-pooling/select-hidden
+      -layer mode for LLaVA/VLM consumers) + SigLIPLogit, in neuralpretrained.pas.
+      Reuses CLIP's pre-LN encoder block (TClipTowerConfig / AddClipEncoderBlock
+      / LoadClipEncoderBlockWeights) but keeps SigLIP's DISTINCT heads on their
+      own path (NOT force-fit onto CLIP): (a) logit_scale AND logit_bias both
+      loaded, score = exp(scale)*cosine + bias (per-pair sigmoid); (b) text
+      tower BIDIRECTIONAL, pools the LAST token through a BIASED head; vision
+      MAP head = TNNetSoftPrompt probe + manually-built TNNetCrossAttention
+      (probe Q over patch K/V, nn.MultiheadAttention in_proj_weight sliced into
+      Q/K/V) then out = attn + mlp(LayerNorm(attn)), row 0 — no new layer TYPE;
+      (c) gelu_pytorch_tanh (chaGeluTanh); (d) BIASED patch conv, NO class
+      token, position table = num_patches rows, post_layernorm. Pico fixture
+      tools/siglip_tiny_fixture.py + tests/fixtures/tiny_siglip.* (HF float64
+      SiglipModel oracle, every SigLIP-vs-CLIP quirk self-checked); parity
+      tests TestSigLIP{ConfigFromJSONFile,Parity,VisionFeatures} all < 1e-4
+      (image embed, text embed, logit matrix, logit_scale+logit_bias load).
+      examples/SigLIPZeroShot zero-shot demo (sigmoid + softmax columns), runs
+      offline on the fixture; examples/README.md updated. BuildFromPretrained
+      rejects siglip/siglip2 (two-net) pointing at the builder.
+  - [ ] SigLIP follow-up: NaFlex / variable-resolution siglip2. v1 scopes to
+        the FIXED-resolution siglip/siglip2 base configs (square image_size,
+        learned position table over a fixed num_patches grid). NaFlex siglip2
+        supports per-image patch counts (aspect-ratio-preserving resize to a
+        variable token grid) with attention pooling over the variable grid and
+        a padding/attention mask — needs a variable-SeqLen vision input, an
+        interpolated/resampled position table, and key-padding-masked MAP
+        pooling. Not yet wired.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
