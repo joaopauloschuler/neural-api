@@ -79,13 +79,9 @@ var
   ModelDir, WeightsPath, Query: string;
   Tokenizer: TNeuralHFTokenizer;
   Net: TNNet;
-  Markers: TColBERTMarkers;
-  DocMats: array[0..csCorpusSize - 1] of TNNetVolume;
-  QueryMat: TNNetVolume;
-  ParamPos, SeqLen, DocCnt, BestIdx, i, j, TmpI: integer;
-  Score, BestScore: TNeuralFloat;
-  Scores: array[0..csCorpusSize - 1] of TNeuralFloat;
-  Order: array[0..csCorpusSize - 1] of integer;
+  Index: TColBERTIndex;
+  Hits: TColBERTHitArray;
+  ParamPos, SeqLen, i: integer;
 
 begin
   DefaultFormatSettings.DecimalSeparator := '.';
@@ -130,55 +126,28 @@ begin
   WriteLn('Building ColBERT encoder (SeqLen ', SeqLen, ') ...');
   Net := BuildColBERTFromSafeTensors(WeightsPath, SeqLen,
     {pInferenceOnly=}true);
-  Markers := ColBERTDefaultMarkers(Tokenizer);
 
-  // Pre-encode the corpus ONCE: per-token L2-normalized doc matrices.
-  WriteLn('Pre-encoding ', csCorpusSize, ' passages ...');
-  for DocCnt := 0 to csCorpusSize - 1 do
-  begin
-    DocMats[DocCnt] := TNNetVolume.Create();
-    ColBERTEmbedTokens(Net, Tokenizer, csCorpus[DocCnt], {IsQuery=}false,
-      Markers, DocMats[DocCnt]);
-  end;
-
-  // Encode the query and score every passage by MaxSim.
-  QueryMat := TNNetVolume.Create();
+  // TColBERTIndex wraps the encoder + tokenizer and owns the cached per-token
+  // doc matrices: AddCorpus encodes every passage ONCE, Search encodes the
+  // query and ranks the corpus by MaxSim. (The encode-cache-score loop now
+  // lives in the library, neuralpretrained.pas.)
+  Index := TColBERTIndex.Create(Net, Tokenizer);
   try
-    ColBERTEmbedTokens(Net, Tokenizer, Query, {IsQuery=}true, Markers,
-      QueryMat);
+    WriteLn('Pre-encoding ', csCorpusSize, ' passages ...');
+    Index.AddCorpus(csCorpus);
+
     WriteLn;
     WriteLn('Query: ', Query);
     WriteLn('-----------------------------------------------------------');
-    BestIdx := 0; BestScore := -1e30;
-    for DocCnt := 0 to csCorpusSize - 1 do
-    begin
-      Scores[DocCnt] := ColBERTMaxSimScore(QueryMat, DocMats[DocCnt]);
-      Order[DocCnt] := DocCnt;
-      if Scores[DocCnt] > BestScore then
-      begin
-        BestScore := Scores[DocCnt]; BestIdx := DocCnt;
-      end;
-    end;
-    // descending sort (insertion) for the ranked listing
-    for i := 1 to csCorpusSize - 1 do
-    begin
-      TmpI := Order[i]; j := i - 1;
-      while (j >= 0) and (Scores[Order[j]] < Scores[TmpI]) do
-      begin
-        Order[j + 1] := Order[j]; Dec(j);
-      end;
-      Order[j + 1] := TmpI;
-    end;
-    for i := 0 to csCorpusSize - 1 do
-      WriteLn('  MaxSim=', FloatToStrF(Scores[Order[i]], ffFixed, 8, 4),
-        '  ', csCorpus[Order[i]]);
+    Hits := Index.Search(Query, {TopK=}Index.Count);
+    for i := 0 to High(Hits) do
+      WriteLn('  MaxSim=', FloatToStrF(Hits[i].Score, ffFixed, 8, 4),
+        '  ', Hits[i].Text);
     WriteLn('-----------------------------------------------------------');
-    Score := BestScore;
-    WriteLn('Best match (MaxSim=', FloatToStrF(Score, ffFixed, 8, 4), '): ',
-      csCorpus[BestIdx]);
+    WriteLn('Best match (MaxSim=', FloatToStrF(Hits[0].Score, ffFixed, 8, 4),
+      '): ', Hits[0].Text);
   finally
-    QueryMat.Free;
-    for DocCnt := 0 to csCorpusSize - 1 do DocMats[DocCnt].Free;
+    Index.Free;
     Net.Free;
     Tokenizer.Free;
   end;

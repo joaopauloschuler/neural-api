@@ -291,6 +291,8 @@ type
     procedure TestColBERTMaxSimScore;
     procedure TestColBERTRetrievalReport;
     procedure TestColBERTBuildInput;
+    procedure TestColBERTIndexHelper;
+    procedure TestColBERTIndexInt8;
     procedure TestBertTokenizeSentence;
     procedure TestBuildFromPretrainedDispatch;
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
@@ -10646,6 +10648,174 @@ begin
     AssertEquals('doc [SEP]', M.SepId, DRow[Length(Content) + 2]);
     AssertEquals('doc [PAD] pad', M.PadId, DRow[High(DRow)]);
   finally
+    Tok.Free;
+  end;
+end;
+
+// Follow-up (b): the library TColBERTIndex helper must reproduce EXACTLY the
+// encode-corpus / cache / score-by-MaxSim loop that examples/ColBERTSearch used
+// to hand-roll. Build the encoder + tokenizer from the pico fixtures, index a
+// small corpus, then for the same query compare (1) Index.ScoreAll against a
+// hand-rolled ColBERTEmbedTokens + ColBERTMaxSimScore loop (bit-identical) and
+// (2) Index.Search ranking against the same loop sorted descending.
+procedure TTestNeuralPretrained.TestColBERTIndexHelper;
+const
+  csN = 4;
+  csCorpus: array[0..csN - 1] of string = (
+    'the quick brown fox',
+    'a lazy dog sleeps',
+    'the brown fox runs fast',
+    'rain falls on the city');
+  csQuery = 'brown fox jumps';
+var
+  NN: TNNet;
+  Tok: TNeuralHFTokenizer;
+  Index: TColBERTIndex;
+  Markers: TColBERTMarkers;
+  Config: TBertConfig;
+  ProjDim: integer;
+  QMat, DMat: TNNetVolume;
+  RefScores, IdxScores: TNeuralFloatDynArr;
+  Hits: TColBERTHitArray;
+  i, j, Tmp, SeqLen: integer;
+  RefOrder: array of integer;
+begin
+  RandSeed := 424242;
+  SeqLen := 12;
+  NN := nil; Tok := nil; Index := nil;
+  QMat := TNNetVolume.Create;
+  DMat := TNNetVolume.Create;
+  try
+    Tok := TNeuralHFTokenizer.Create();
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    NN := BuildColBERTFromSafeTensorsEx(
+      FixturePath('tiny_colbert.safetensors'), Config, ProjDim,
+      SeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_colbert_config.json'));
+    Markers := ColBERTDefaultMarkers(Tok);
+
+    // Reference: the hand-rolled loop (what the example did).
+    SetLength(RefScores, csN);
+    ColBERTEmbedTokens(NN, Tok, csQuery, {IsQuery=}true, Markers, QMat);
+    for i := 0 to csN - 1 do
+    begin
+      ColBERTEmbedTokens(NN, Tok, csCorpus[i], {IsQuery=}false, Markers, DMat);
+      RefScores[i] := ColBERTMaxSimScore(QMat, DMat);
+    end;
+    // descending ref ranking
+    SetLength(RefOrder, csN);
+    for i := 0 to csN - 1 do RefOrder[i] := i;
+    for i := 1 to csN - 1 do
+    begin
+      Tmp := RefOrder[i]; j := i - 1;
+      while (j >= 0) and (RefScores[RefOrder[j]] < RefScores[Tmp]) do
+      begin RefOrder[j + 1] := RefOrder[j]; Dec(j); end;
+      RefOrder[j + 1] := Tmp;
+    end;
+
+    // Library helper.
+    Index := TColBERTIndex.Create(NN, Tok);
+    Index.AddCorpus(csCorpus);
+    AssertEquals('index count', csN, Index.Count);
+    Index.ScoreAll(csQuery, IdxScores);
+    AssertEquals('ScoreAll length', csN, Length(IdxScores));
+    for i := 0 to csN - 1 do
+      AssertTrue('ScoreAll[' + IntToStr(i) + '] matches hand-rolled: ' +
+        FloatToStr(IdxScores[i]) + ' vs ' + FloatToStr(RefScores[i]),
+        Abs(IdxScores[i] - RefScores[i]) < 1e-5);
+
+    Hits := Index.Search(csQuery, {TopK=}csN);
+    AssertEquals('Search returns all', csN, Length(Hits));
+    for i := 0 to csN - 1 do
+    begin
+      AssertEquals('Search rank ' + IntToStr(i) + ' doc index',
+        RefOrder[i], Hits[i].DocIndex);
+      AssertEquals('Search rank ' + IntToStr(i) + ' text',
+        csCorpus[RefOrder[i]], Hits[i].Text);
+      AssertTrue('Search rank ' + IntToStr(i) + ' score',
+        Abs(Hits[i].Score - RefScores[RefOrder[i]]) < 1e-5);
+    end;
+    // descending invariant
+    for i := 1 to csN - 1 do
+      AssertTrue('descending', Hits[i - 1].Score >= Hits[i].Score - 1e-6);
+    // TopK truncation
+    Hits := Index.Search(csQuery, 2);
+    AssertEquals('TopK=2', 2, Length(Hits));
+    AssertEquals('TopK=2 best is overall best', RefOrder[0], Hits[0].DocIndex);
+  finally
+    Index.Free;
+    DMat.Free; QMat.Free;
+    NN.Free;
+    Tok.Free;
+  end;
+end;
+
+// Follow-up (c): pQuantizeInt8 threaded through BuildColBERTFromSafeTensors
+// must cover the projection head (a TNNetPointwiseConvLinear) too. Build an
+// f32 index and an int8 index on the same fixture, index the same corpus and
+// score the same query; the int8 ranking must MATCH f32 and the per-doc scores
+// must be within the pico-fixture int8 drift tolerance (5e-2, as the int8
+// drift tests use).
+procedure TTestNeuralPretrained.TestColBERTIndexInt8;
+const
+  csN = 4;
+  csCorpus: array[0..csN - 1] of string = (
+    'the quick brown fox',
+    'a lazy dog sleeps',
+    'the brown fox runs fast',
+    'rain falls on the city');
+  csQuery = 'brown fox jumps';
+var
+  NNf, NNq: TNNet;
+  Tok: TNeuralHFTokenizer;
+  IdxF, IdxQ: TColBERTIndex;
+  HitsF, HitsQ: TColBERTHitArray;
+  ScoresF, ScoresQ: TNeuralFloatDynArr;
+  ConfigF, ConfigQ: TBertConfig;
+  ProjDimF, ProjDimQ: integer;
+  i, SeqLen: integer;
+  MaxDrift: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 12;
+  NNf := nil; NNq := nil; Tok := nil; IdxF := nil; IdxQ := nil;
+  try
+    Tok := TNeuralHFTokenizer.Create();
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+
+    NNf := BuildColBERTFromSafeTensorsEx(
+      FixturePath('tiny_colbert.safetensors'), ConfigF, ProjDimF,
+      SeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_colbert_config.json'), {pPaddingMask=}false,
+      {pQuantizeInt8=}false);
+    NNq := BuildColBERTFromSafeTensorsEx(
+      FixturePath('tiny_colbert.safetensors'), ConfigQ, ProjDimQ,
+      SeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_colbert_config.json'), {pPaddingMask=}false,
+      {pQuantizeInt8=}true);
+
+    IdxF := TColBERTIndex.Create(NNf, Tok);
+    IdxQ := TColBERTIndex.Create(NNq, Tok);
+    IdxF.AddCorpus(csCorpus);
+    IdxQ.AddCorpus(csCorpus);
+
+    IdxF.ScoreAll(csQuery, ScoresF);
+    IdxQ.ScoreAll(csQuery, ScoresQ);
+    MaxDrift := 0;
+    for i := 0 to csN - 1 do
+      if Abs(ScoresQ[i] - ScoresF[i]) > MaxDrift then
+        MaxDrift := Abs(ScoresQ[i] - ScoresF[i]);
+    AssertTrue('int8 ColBERT score drift ' + FloatToStr(MaxDrift) +
+      ' must be < 5e-2', MaxDrift < 5e-2);
+
+    HitsF := IdxF.Search(csQuery, csN);
+    HitsQ := IdxQ.Search(csQuery, csN);
+    // top-1 must agree (the decisive ranking property)
+    AssertEquals('int8 top-1 matches f32', HitsF[0].DocIndex,
+      HitsQ[0].DocIndex);
+  finally
+    IdxQ.Free; IdxF.Free;
+    NNq.Free; NNf.Free;
     Tok.Free;
   end;
 end;

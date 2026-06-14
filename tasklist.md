@@ -594,24 +594,6 @@ rather than acted on.
       task above; report duplicate-cluster stats. Test: planted
       near-duplicates (one-word edits) are found, distinct documents are
       not merged.
-- [ ] ColBERT late-interaction retrieval follow-ups (core import +
-      BuildColBERTFromSafeTensors[Ex] + MaxSim scorer + ColBERTRetrievalReport
-      + parity fixture + examples/ColBERTSearch all LANDED a3, commit 442af2c):
-      (a) DONE — opt-in pPaddingMask on BuildColBERTFromSafeTensors[Ex] /
-      BuildBertFromSafeTensorsWithConfig threads the existing SDPA
-      pSegmentSource key-padding/segment mask (real tokens segment 0, [PAD]
-      tail segment 1) into every bidirectional attention block via a new
-      SegmentSource arg on AddMultiHeadSelfAttention/AddMultiHeadSDPAConcat;
-      ColBERTEmbedTokens fills the (SeqLen,1,3) mask channel automatically.
-      A short doc is now encoded EXACTLY (TestColBERTPaddingMaskExactEncode:
-      masked padded encode == unpadded encode on real tokens < 1e-5, unmasked
-      control differs). NO new layer type (extended existing builders). (b) a
-      library-side end-to-end "encode corpus -> cache doc matrices -> score
-      query" helper in neuralpretrained.pas (today only the examples/ColBERTSearch
-      demo wires this; ColBERTEmbedTokens + ColBERTMaxSimScore exist but the
-      caching loop lives in the example); (c) pQuantizeInt8 for the ColBERT path
-      — the projection head is always f32 while the BERT backbone already
-      supports int8.
 
 - [ ] Wav2Vec2 -large / robust LayerNorm variant + pretraining (follow-up to the
       landed Wav2Vec2/HuBERT CTC importer, which supports ONLY the wav2vec2-base

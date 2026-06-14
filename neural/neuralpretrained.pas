@@ -2286,14 +2286,19 @@ function RetrievalReport(QueryEmb, PassageEmb: array of TNNetVolume;
 // embeddings of the real tokens equal running the encoder on the unpadded
 // sequence). ColBERTEmbedTokens fills channel 2 automatically when the net
 // was built with this flag.
+// pQuantizeInt8 (default false) applies the same weight-only int8 quantization
+// the BERT backbone supports to the WHOLE net INCLUDING the [hidden -> ProjDim]
+// projection head (a TNNetPointwiseConvLinear, covered by the int8 sweep), so
+// the projection head is no longer forced to stay f32.
 function BuildColBERTFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''; pPaddingMask: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pPaddingMask: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 function BuildColBERTFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  pPaddingMask: boolean = false): TNNet;
+  pPaddingMask: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // ColBERT marker-token convention: a query is [CLS][Q] tokens... [SEP] then
 // PADDED with [MASK] to the net's SeqLen (query augmentation - the [MASK] rows
@@ -2349,6 +2354,70 @@ function ColBERTMaxSimScore(QueryMat, DocMat: TNNetVolume): TNeuralFloat;
 function ColBERTRetrievalReport(QueryMats, DocMats: array of TNNetVolume;
   const Relevant: array of TNeuralIntegerArray;
   const KList: array of integer): string;
+
+type
+  // A single ranked hit from TColBERTIndex.Search: the corpus document index,
+  // its MaxSim score and its (cached) text.
+  TColBERTHit = record
+    DocIndex: integer;
+    Score: TNeuralFloat;
+    Text: string;
+  end;
+  TColBERTHitArray = array of TColBERTHit;
+
+  // End-to-end ColBERT corpus index: wraps a built ColBERT encoder + tokenizer
+  // and caches one per-token L2-normalized doc matrix (ColBERTEmbedTokens) per
+  // added document, so a query is scored against the whole corpus by MaxSim
+  // without re-encoding the documents. This lifts the encode-corpus / cache /
+  // score loop out of examples/ColBERTSearch into the library.
+  //
+  // The index does NOT own the Net or Tokenizer (the caller builds/frees them;
+  // typically Net = BuildColBERTFromSafeTensors). It DOES own the cached doc
+  // matrices it allocates and frees them on Clear/Free. Markers default to
+  // ColBERTDefaultMarkers(Tokenizer) but can be overridden via Create.
+  // Coded by Claude (AI).
+  TColBERTIndex = class(TObject)
+  private
+    FNet: TNNet;
+    FTokenizer: TNeuralHFTokenizer;
+    FMarkers: TColBERTMarkers;
+    FDocMats: array of TNNetVolume;
+    FDocTexts: array of string;
+    FCount: integer;
+    function GetDocText(Index: integer): string;
+    function GetDocMatrix(Index: integer): TNNetVolume;
+  public
+    constructor Create(ANet: TNNet; ATokenizer: TNeuralHFTokenizer);
+    constructor CreateWithMarkers(ANet: TNNet;
+      ATokenizer: TNeuralHFTokenizer; const AMarkers: TColBERTMarkers);
+    destructor Destroy; override;
+    // Encodes Text as a document, caches its per-token matrix and returns the
+    // new document's index.
+    function AddDocument(const Text: string): integer;
+    // Adds every entry of Corpus in order (calls AddDocument for each).
+    procedure AddCorpus(const Corpus: array of string);
+    // Frees all cached doc matrices and empties the index.
+    procedure Clear;
+    // Encodes Query and returns its MaxSim score against the cached document
+    // DocIndex (no re-encoding of the document).
+    function ScoreQuery(const Query: string; DocIndex: integer): TNeuralFloat;
+    // Encodes Query into a caller-owned (Rows,1,Dim) matrix (so callers can
+    // score it themselves / reuse it). QueryMat is resized as needed.
+    procedure EncodeQuery(const Query: string; QueryMat: TNNetVolume);
+    // Encodes Query and scores it against EVERY cached document, returning the
+    // raw MaxSim scores in corpus order into Scores (resized to Count).
+    procedure ScoreAll(const Query: string; out Scores: TNeuralFloatDynArr);
+    // Encodes Query, scores the whole corpus and returns the TopK best hits
+    // sorted by descending MaxSim (DocIndex + Score + Text). TopK <= 0 or
+    // TopK > Count returns all documents ranked.
+    function Search(const Query: string; TopK: integer): TColBERTHitArray;
+    property Count: integer read FCount;
+    property DocText[Index: integer]: string read GetDocText;
+    property DocMatrix[Index: integer]: TNNetVolume read GetDocMatrix;
+    property Net: TNNet read FNet;
+    property Tokenizer: TNeuralHFTokenizer read FTokenizer;
+    property Markers: TColBERTMarkers read FMarkers;
+  end;
 
 // =================== SEQUENCE CLASSIFICATION IMPORT =======================
 // Fine-tuned classifier checkpoints (see the unit-header section of the
@@ -14844,7 +14913,8 @@ end;
 function BuildColBERTFromSafeTensorsEx(const FileName: string;
   out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
-  const ConfigFileName: string = ''; pPaddingMask: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pPaddingMask: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   ProjLayer: TNNetLayer;
@@ -14852,7 +14922,7 @@ var
 begin
   // Build the stock BERT encoder (no pooler/seq-cls head). DEFER the
   // inference-only/quantization pass: the projection head appended below must
-  // be loaded with writable weights first.
+  // be loaded with writable weights first (the QA-head pattern).
   if ConfigFileName <> '' then ConfigPath := ConfigFileName
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadBertConfigFromJSONFile(ConfigPath);
@@ -14898,17 +14968,20 @@ begin
     end;
   end;
   if pInferenceOnly then Result.MakeInferenceOnly();
+  // Quantize AFTER the projection head is loaded so the int8 sweep covers it
+  // too (the projection head is a TNNetPointwiseConvLinear).
+  if pQuantizeInt8 then Result.QuantizeWeightsInt8();
 end;
 
 function BuildColBERTFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
-  pPaddingMask: boolean = false): TNNet;
+  pPaddingMask: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 var
   IgnoredConfig: TBertConfig;
   IgnoredDim: integer;
 begin
   Result := BuildColBERTFromSafeTensorsEx(FileName, IgnoredConfig, IgnoredDim,
-    pSeqLen, pInferenceOnly, '', pPaddingMask);
+    pSeqLen, pInferenceOnly, '', pPaddingMask, pQuantizeInt8);
 end;
 
 function ColBERTDefaultMarkers(Tokenizer: TNeuralHFTokenizer):
@@ -15157,6 +15230,165 @@ begin
       FloatToStrF(RecallSum[Ki] / NQ, ffFixed, 8, 4) + sLineBreak;
   Result := Result + 'nDCG@10:  ' +
     FloatToStrF(NDCGSum / NQ, ffFixed, 8, 4) + sLineBreak;
+end;
+
+{ TColBERTIndex }
+
+constructor TColBERTIndex.Create(ANet: TNNet;
+  ATokenizer: TNeuralHFTokenizer);
+begin
+  CreateWithMarkers(ANet, ATokenizer, ColBERTDefaultMarkers(ATokenizer));
+end;
+
+constructor TColBERTIndex.CreateWithMarkers(ANet: TNNet;
+  ATokenizer: TNeuralHFTokenizer; const AMarkers: TColBERTMarkers);
+begin
+  inherited Create();
+  if ANet = nil then
+    ImportError('TColBERTIndex: Net must not be nil.');
+  if ATokenizer = nil then
+    ImportError('TColBERTIndex: Tokenizer must not be nil.');
+  FNet := ANet;
+  FTokenizer := ATokenizer;
+  FMarkers := AMarkers;
+  FCount := 0;
+  SetLength(FDocMats, 0);
+  SetLength(FDocTexts, 0);
+end;
+
+destructor TColBERTIndex.Destroy;
+begin
+  Clear();
+  inherited Destroy;
+end;
+
+procedure TColBERTIndex.Clear;
+var
+  i: integer;
+begin
+  for i := 0 to FCount - 1 do
+    if FDocMats[i] <> nil then FDocMats[i].Free;
+  SetLength(FDocMats, 0);
+  SetLength(FDocTexts, 0);
+  FCount := 0;
+end;
+
+function TColBERTIndex.GetDocText(Index: integer): string;
+begin
+  if (Index < 0) or (Index >= FCount) then
+    ImportError('TColBERTIndex.DocText: index ' + IntToStr(Index) +
+      ' out of range [0,' + IntToStr(FCount - 1) + '].');
+  Result := FDocTexts[Index];
+end;
+
+function TColBERTIndex.GetDocMatrix(Index: integer): TNNetVolume;
+begin
+  if (Index < 0) or (Index >= FCount) then
+    ImportError('TColBERTIndex.DocMatrix: index ' + IntToStr(Index) +
+      ' out of range [0,' + IntToStr(FCount - 1) + '].');
+  Result := FDocMats[Index];
+end;
+
+function TColBERTIndex.AddDocument(const Text: string): integer;
+var
+  Mat: TNNetVolume;
+begin
+  Mat := TNNetVolume.Create();
+  try
+    ColBERTEmbedTokens(FNet, FTokenizer, Text, {IsQuery=}false, FMarkers, Mat);
+  except
+    Mat.Free;
+    raise;
+  end;
+  Result := FCount;
+  SetLength(FDocMats, FCount + 1);
+  SetLength(FDocTexts, FCount + 1);
+  FDocMats[FCount] := Mat;
+  FDocTexts[FCount] := Text;
+  Inc(FCount);
+end;
+
+procedure TColBERTIndex.AddCorpus(const Corpus: array of string);
+var
+  i: integer;
+begin
+  for i := 0 to High(Corpus) do
+    AddDocument(Corpus[i]);
+end;
+
+procedure TColBERTIndex.EncodeQuery(const Query: string;
+  QueryMat: TNNetVolume);
+begin
+  if QueryMat = nil then
+    ImportError('TColBERTIndex.EncodeQuery: QueryMat must not be nil.');
+  ColBERTEmbedTokens(FNet, FTokenizer, Query, {IsQuery=}true, FMarkers,
+    QueryMat);
+end;
+
+function TColBERTIndex.ScoreQuery(const Query: string;
+  DocIndex: integer): TNeuralFloat;
+var
+  QueryMat: TNNetVolume;
+begin
+  if (DocIndex < 0) or (DocIndex >= FCount) then
+    ImportError('TColBERTIndex.ScoreQuery: DocIndex ' + IntToStr(DocIndex) +
+      ' out of range [0,' + IntToStr(FCount - 1) + '].');
+  QueryMat := TNNetVolume.Create();
+  try
+    EncodeQuery(Query, QueryMat);
+    Result := ColBERTMaxSimScore(QueryMat, FDocMats[DocIndex]);
+  finally
+    QueryMat.Free;
+  end;
+end;
+
+procedure TColBERTIndex.ScoreAll(const Query: string;
+  out Scores: TNeuralFloatDynArr);
+var
+  QueryMat: TNNetVolume;
+  i: integer;
+begin
+  SetLength(Scores, FCount);
+  if FCount = 0 then Exit;
+  QueryMat := TNNetVolume.Create();
+  try
+    EncodeQuery(Query, QueryMat);
+    for i := 0 to FCount - 1 do
+      Scores[i] := ColBERTMaxSimScore(QueryMat, FDocMats[i]);
+  finally
+    QueryMat.Free;
+  end;
+end;
+
+function TColBERTIndex.Search(const Query: string;
+  TopK: integer): TColBERTHitArray;
+var
+  Scores: TNeuralFloatDynArr;
+  Order: array of integer;
+  i, j, Tmp: integer;
+begin
+  ScoreAll(Query, Scores);
+  SetLength(Order, FCount);
+  for i := 0 to FCount - 1 do Order[i] := i;
+  // descending insertion sort by score (stable for the small corpora ColBERT
+  // demos use; matches the example's hand-rolled ranking exactly).
+  for i := 1 to FCount - 1 do
+  begin
+    Tmp := Order[i]; j := i - 1;
+    while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
+    begin
+      Order[j + 1] := Order[j]; Dec(j);
+    end;
+    Order[j + 1] := Tmp;
+  end;
+  if (TopK <= 0) or (TopK > FCount) then TopK := FCount;
+  SetLength(Result, TopK);
+  for i := 0 to TopK - 1 do
+  begin
+    Result[i].DocIndex := Order[i];
+    Result[i].Score := Scores[Order[i]];
+    Result[i].Text := FDocTexts[Order[i]];
+  end;
 end;
 
 // =================== SEQUENCE CLASSIFICATION IMPORT =======================

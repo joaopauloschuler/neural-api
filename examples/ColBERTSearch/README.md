@@ -33,10 +33,19 @@ Helpers in `neural/neuralpretrained.pas`, COLBERT LATE INTERACTION section:
      SeqLen (query **augmentation** -- those `[MASK]` rows are real inputs and
      DO contribute to MaxSim);
 2. `BuildColBERTFromSafeTensors` builds the stock BERT encoder + the ColBERT
-   `linear` head (a bias-free `[hidden -> 128]` dense applied per token);
+   `linear` head (a bias-free `[hidden -> 128]` dense applied per token).
+   Pass `pQuantizeInt8=true` to store the WHOLE net -- backbone **and**
+   projection head -- as weight-only int8;
 3. `ColBERTEmbedTokens` returns the per-token L2-normalized projected matrix
    `(RealTokens, 1, 128)` -- NO pooling;
 4. `ColBERTMaxSimScore(query, doc)` ranks the corpus.
+
+The encode-corpus / cache / score-by-MaxSim loop is wrapped by the library
+class **`TColBERTIndex`** (also in `neuralpretrained.pas`): construct it with a
+built ColBERT net + tokenizer, call `AddCorpus`/`AddDocument` to pre-encode and
+cache the per-token doc matrices once, then `Search(query, TopK)` returns the
+ranked `TColBERTHit` list (doc index + MaxSim score + text). This example drives
+that class.
 
 The imported encoder carries NO attention padding mask (like SemanticSearch):
 documents are `[PAD]`-filled to the net's SeqLen and the pad rows are skipped
