@@ -207,6 +207,8 @@ type
     procedure TestPhi3LongRoPELogitParity;
     procedure TestBitNetConfigParity;
     procedure TestBitNetLogitParity;
+    procedure TestInternLM2ConfigParity;
+    procedure TestInternLM2LogitParity;
     procedure TestGLM4ConfigFromJSONFile;
     procedure TestGLM4LogitParity;
     procedure TestGraniteConfigFromJSONFile;
@@ -7459,6 +7461,77 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_bitnet_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInternLM2ConfigParity;
+var
+  Config: TLlamaConfig;
+begin
+  Config := ReadLlamaConfigFromJSONFile(
+    FixturePath('tiny_internlm2_config.json'));
+  AssertEquals('model_type', 'internlm2', Config.ModelType);
+  AssertEquals('layers', 2, Config.NumLayers);
+  AssertEquals('heads', 4, Config.NumHeads);
+  AssertEquals('kv_heads', 2, Config.NumKVHeads);
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('intermediate', 24, Config.IntermediateSize);
+  AssertEquals('vocab', 13, Config.VocabSize);
+  AssertEquals('rms_norm_eps', 1.0e-5, Config.RmsNormEps, 1e-12);
+  AssertEquals('rope_theta', 10000.0, Config.RopeTheta, 1e-3);
+  // InternLM2 rides the PLAIN Llama path - none of the architectural-delta
+  // flags fire (the only InternLM2 difference is the checkpoint layout,
+  // resolved by the translating reader, not by config flags).
+  AssertFalse('qkv_bias (internlm2 is bias-free)', Config.QKVBias);
+  AssertFalse('not fused qkv/gate-up', Config.FusedQKVGateUp);
+  AssertFalse('not fused gate-up', Config.FusedGateUp);
+  AssertFalse('not qk-norm', Config.QKNorm);
+  AssertFalse('not interleaved rotary', Config.InterleavedRotary);
+  AssertFalse('not MoE', Config.IsMoE);
+  AssertFalse('untied (internlm2 default)', Config.TieWordEmbeddings);
+end;
+
+// InternLM2 / InternLM2.5 logit parity. The hand-built pico fixture
+// (tools/internlm2_tiny_fixture.py) packs its attention.wqkv in the exact
+// InternLM2 group-interleaved layout ([num_kv_heads, q_per_kv+2, head_dim,
+// hidden]) and pins next-token logits from a self-contained numpy float64
+// forward (InternLM2's modeling code is not in transformers). Matching it
+// proves the translating reader unpacks wqkv into the right separate
+// W_q/W_k/W_v rows (group-major, HF rotate_half order) and that the renamed
+// pass-through tensors (tok_embeddings/wo/feed_forward/attention_norm/
+// ffn_norm/output) land on the standard Llama path. The fixture asserts the
+// group-interleaved split differs from the naive contiguous-thirds split, so
+// a wrong repack would miss the < 1e-4 gate.
+procedure TTestNeuralPretrained.TestInternLM2LogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildInternLM2FromSafeTensorsEx(
+    FixturePath('tiny_internlm2.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_internlm2_config.json'));
+  try
+    AssertEquals('model_type', 'internlm2', Config.ModelType);
+    AssertEquals('kv_heads', 2, Config.NumKVHeads);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_internlm2_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "internlm2" (architectures ["InternLM2ForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_internlm2.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_internlm2_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_internlm2_logits.json'), 16, 13);
   finally
     NN.Free;
   end;

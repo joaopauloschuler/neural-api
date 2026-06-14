@@ -1328,6 +1328,38 @@ function BuildBitNetFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// InternLM2 / InternLM2.5 (model_type "internlm2", e.g.
+// internlm/internlm2_5-1_8b / internlm2_5-7b / internlm2_5-20b): a plain
+// Llama backbone (RMSNorm + RoPE + SwiGLU, GQA, untied output head) whose
+// ONLY genuinely new piece is the checkpoint TENSOR LAYOUT - the math rides
+// the existing Llama path unchanged. Two layout differences, both resolved
+// by an InternLM2->HF translating reader BEFORE the core builder runs:
+// (a) the FUSED attention.wqkv slab. It is reshaped
+//     [num_kv_heads, (q_per_kv + 2), head_dim, hidden] and concatenates,
+//     PER KV GROUP, that group's q_per_kv query slices, then its single K,
+//     then its single V slice - so the rows are NEITHER contiguous Q|K|V
+//     thirds NOR GPT-NeoX per-head interleaving. The reader gathers all Q
+//     rows of all groups (group-major), then all K, then all V into standard
+//     separate W_q/W_k/W_v in HF rotate_half order; the core builder then
+//     applies its usual rotate_half->interleaved q/k de-permute for RoPE.
+// (b) the InternLM2 tensor NAMES (model.tok_embeddings / attention.wqkv|wo /
+//     feed_forward.w1=gate|w2=down|w3=up / attention_norm / ffn_norm /
+//     output) are renamed to the standard HF Llama names the core builder
+//     reads (embed_tokens / self_attn.{q,k,v,o}_proj / mlp.{gate,up,down}_proj
+//     / input_layernorm / post_attention_layernorm / lm_head). The tokenizer
+//     is a SentencePiece .model (already supported). attention biases
+//     (config "bias"=true) are rejected (the released checkpoints are
+//     bias-free). Thin wrappers over the Llama path that ASSERT the config's
+//     model_type is 'internlm2'.
+function BuildInternLM2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildInternLM2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
 // GLM-4 (model_type "glm4", e.g. THUDM/GLM-4-9B-0414 / zai-org/GLM-4 text
 // checkpoints - NOT the older two-norm "glm"): the Llama skeleton (GQA,
 // SwiGLU, RoPE, model.norm + untied lm_head) with four architectural deltas
@@ -5076,12 +5108,12 @@ begin
        (ModelType <> 'mixtral') and
        (ModelType <> 'glm4') and (ModelType <> 'glm') and
        (ModelType <> 'granite') and (ModelType <> 'granitemoe') and
-       (ModelType <> 'bitnet') then
+       (ModelType <> 'bitnet') and (ModelType <> 'internlm2') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", ' +
         '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "olmoe", ' +
-        '"mixtral", "glm4", "granite", "granitemoe" and "bitnet" are ' +
-        'supported here ' +
+        '"mixtral", "glm4", "granite", "granitemoe", "bitnet" and ' +
+        '"internlm2" are supported here ' +
         '(see BuildFromPretrained for the full dispatch; multimodal ' +
         '"gemma3" configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
@@ -5676,6 +5708,35 @@ begin
       if (FloatField <> nil) and (FloatField is TJSONObject) then
         Result.RopeTheta :=
           TJSONObject(FloatField).Get('rope_theta', Result.RopeTheta);
+    end
+    else if ModelType = 'internlm2' then
+    begin
+      // InternLM2 / InternLM2.5 (model_type "internlm2", e.g.
+      // internlm/internlm2_5-1_8b/7b/20b): a plain Llama backbone (RMSNorm +
+      // RoPE + SwiGLU, GQA) with NO architectural delta on the math - the
+      // ONLY difference is the checkpoint TENSOR LAYOUT, handled entirely by
+      // the InternLM2 translating reader (see BuildInternLM2FromSafeTensors):
+      //   - the fused attention.wqkv slab (group-interleaved q/k/v packing,
+      //     NOT contiguous thirds and NOT NeoX per-head interleaving) is
+      //     unpacked into standard separate W_q/W_k/W_v rows in HF rotate_half
+      //     order BEFORE the core builder sees them;
+      //   - the InternLM2 names (tok_embeddings / attention.wqkv|wo /
+      //     feed_forward.w1|w2|w3 / attention_norm / ffn_norm / output) are
+      //     renamed to the standard HF Llama names the core builder reads.
+      // So the config carries NO extra flags - the standard separate-
+      // projection Llama path loads the repacked tensors. "bias" gates the
+      // q/k/v projection biases (InternLM2 default false); a true value is
+      // rejected (the released checkpoints are bias-free).
+      Result.QKVBias := Obj.Get('bias', False);
+      if Result.QKVBias then
+        ImportError('Llama import: InternLM2 bias=true (q/k/v projection ' +
+          'biases) is not wired into this importer - every released ' +
+          'internlm2 / internlm2.5 checkpoint is bias-free.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: InternLM2 hidden_act "' + HiddenAct +
+          '" is not supported - every released internlm2 checkpoint uses ' +
+          '"silu" (SwiGLU).');
     end
     else // llama
       Result.QKVBias := Obj.Get('attention_bias', False);
@@ -15095,6 +15156,254 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildBitNetFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+type
+  // Translates an InternLM2 / InternLM2.5 checkpoint into the standard HF
+  // Llama tensor names + layout the core Llama builder
+  // (BuildLlamaFromTensorReaderWithConfig) expects, so InternLM2 rides that
+  // path with NO new layer class. It wraps an inner real reader (the actual
+  // .safetensors / .bin checkpoint) and presents a SYNTHETIC tensor table
+  // under HF names; LoadTensorFlat either delegates a renamed pass-through
+  // tensor to the inner reader or, for the three q/k/v projections, unpacks
+  // the fused attention.wqkv slab on the fly.
+  //
+  // wqkv layout (modeling_internlm2.InternLM2Attention): the slab is
+  // [num_kv_heads*(q_per_kv+2)*head_dim, hidden], viewed as
+  // [num_kv_heads, q_per_kv+2, head_dim, hidden]; per KV group the first
+  // q_per_kv (head_dim)-row slices are that group's query heads, the next is
+  // its single K head, the last its single V head. Standard separate W_q is
+  // the group-major concatenation of all query slices (rows
+  // [num_heads*head_dim, hidden]), W_k / W_v the concatenation of the single
+  // K / V slice per group ([num_kv_heads*head_dim, hidden]). These are HF
+  // rotate_half-order rows - the core builder applies its own
+  // rotate_half->interleaved q/k permutation for RoPE, exactly as for a
+  // native Llama q_proj/k_proj.
+  // Coded by Claude (AI).
+  TNNetInternLM2Reader = class(TNNetSafeTensorsReader)
+  private
+    FInner: TNNetSafeTensorsReader;     // the real checkpoint (owned)
+    FNumKVHeads, FQPerKV, FHeadDim, FHidden: integer;
+    // For each synthetic tensor: the inner source name it delegates to, and
+    // a "kind" (0 = straight pass-through; 1/2/3 = Q/K/V slice of wqkv).
+    FSrcNames: array of string;
+    FKinds: array of integer;
+    procedure AddSynthetic(const HFName, SrcName: string; Kind: integer;
+      const Shape: array of Int64);
+  public
+    constructor Create(Inner: TNNetSafeTensorsReader; NumLayers, NumHeads,
+      NumKVHeads, HeadDim, Hidden, VocabSize: integer; TieWordEmbeddings:
+      boolean);
+    destructor Destroy; override;
+    procedure LoadTensorFlat(const pName: string;
+      Dest: TNNetVolume); override;
+  end;
+
+procedure TNNetInternLM2Reader.AddSynthetic(const HFName, SrcName: string;
+  Kind: integer; const Shape: array of Int64);
+var
+  Idx, i: integer;
+begin
+  if not FInner.HasTensor(SrcName) then
+    ImportError('InternLM2 import: missing tensor "' + SrcName + '" in ' +
+      FInner.FileName + '.');
+  Idx := Length(FTensors);
+  SetLength(FTensors, Idx + 1);
+  SetLength(FSrcNames, Idx + 1);
+  SetLength(FKinds, Idx + 1);
+  FTensors[Idx].Name := HFName;
+  FTensors[Idx].DType := 'F32';
+  FTensors[Idx].Shard := 0;
+  FTensors[Idx].DataBegin := 0;
+  FTensors[Idx].DataEnd := 0;
+  SetLength(FTensors[Idx].Shape, Length(Shape));
+  for i := 0 to High(Shape) do FTensors[Idx].Shape[i] := Shape[i];
+  FSrcNames[Idx] := SrcName;
+  FKinds[Idx] := Kind;
+end;
+
+constructor TNNetInternLM2Reader.Create(Inner: TNNetSafeTensorsReader;
+  NumLayers, NumHeads, NumKVHeads, HeadDim, Hidden, VocabSize: integer;
+  TieWordEmbeddings: boolean);
+var
+  b, WqkvRows: integer;
+  P, Src: string;
+begin
+  inherited CreateBare;
+  FInner := Inner;
+  FFileName := Inner.FileName;
+  FNumKVHeads := NumKVHeads;
+  FQPerKV := NumHeads div NumKVHeads;
+  FHeadDim := HeadDim;
+  FHidden := Hidden;
+  WqkvRows := NumKVHeads * (FQPerKV + 2) * HeadDim;
+  // Token embedding + final norm + output head.
+  AddSynthetic('model.embed_tokens.weight', 'model.tok_embeddings.weight',
+    0, [VocabSize, Hidden]);
+  AddSynthetic('model.norm.weight', 'model.norm.weight', 0, [Hidden]);
+  if not TieWordEmbeddings then
+    AddSynthetic('lm_head.weight', 'output.weight', 0, [VocabSize, Hidden]);
+  for b := 0 to NumLayers - 1 do
+  begin
+    P := 'model.layers.' + IntToStr(b) + '.';
+    Src := P + 'attention.wqkv.weight';
+    if not FInner.HasTensor(Src) then
+      ImportError('InternLM2 import: missing tensor "' + Src + '" in ' +
+        FInner.FileName + '.');
+    if (FInner.DimCount(Src) <> 2) or (FInner.DimSize(Src, 0) <> WqkvRows) or
+       (FInner.DimSize(Src, 1) <> Hidden) then
+      ImportError('InternLM2 import: "' + Src + '" must have shape [' +
+        IntToStr(WqkvRows) + ', ' + IntToStr(Hidden) + '] (num_kv_heads*' +
+        '(q_per_kv+2)*head_dim x hidden), got ' + FInner.ShapeAsString(Src));
+    AddSynthetic(P + 'self_attn.q_proj.weight', Src, 1,
+      [NumHeads * HeadDim, Hidden]);
+    AddSynthetic(P + 'self_attn.k_proj.weight', Src, 2,
+      [NumKVHeads * HeadDim, Hidden]);
+    AddSynthetic(P + 'self_attn.v_proj.weight', Src, 3,
+      [NumKVHeads * HeadDim, Hidden]);
+    AddSynthetic(P + 'self_attn.o_proj.weight', P + 'attention.wo.weight',
+      0, [Hidden, NumHeads * HeadDim]);
+    AddSynthetic(P + 'input_layernorm.weight', P + 'attention_norm.weight',
+      0, [Hidden]);
+    AddSynthetic(P + 'post_attention_layernorm.weight',
+      P + 'ffn_norm.weight', 0, [Hidden]);
+    // feed_forward: w1 = gate, w3 = up, w2 = down.
+    AddSynthetic(P + 'mlp.gate_proj.weight', P + 'feed_forward.w1.weight',
+      0, [FInner.DimSize(P + 'feed_forward.w1.weight', 0), Hidden]);
+    AddSynthetic(P + 'mlp.up_proj.weight', P + 'feed_forward.w3.weight',
+      0, [FInner.DimSize(P + 'feed_forward.w3.weight', 0), Hidden]);
+    AddSynthetic(P + 'mlp.down_proj.weight', P + 'feed_forward.w2.weight',
+      0, [Hidden, FInner.DimSize(P + 'feed_forward.w2.weight', 1)]);
+  end;
+end;
+
+destructor TNNetInternLM2Reader.Destroy;
+begin
+  FInner.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetInternLM2Reader.LoadTensorFlat(const pName: string;
+  Dest: TNNetVolume);
+var
+  Idx, Kind: integer;
+  Wqkv: TNNetVolume;
+  GroupStride, KOffset, VOffset: integer;
+  g, q, r, c, DstRow: integer;
+  SrcBase: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    ImportError('InternLM2 import: tensor "' + pName + '" not found in ' +
+      FFileName + '.');
+  Kind := FKinds[Idx];
+  if Kind = 0 then
+  begin
+    // Straight pass-through under the renamed source.
+    FInner.LoadTensorFlat(FSrcNames[Idx], Dest);
+    exit;
+  end;
+  // Q/K/V slice of the fused wqkv slab. wqkv is laid out, per KV group, as
+  // q_per_kv query (head_dim)-row blocks, then one K block, then one V
+  // block (rows contiguous, each row Hidden wide).
+  Wqkv := TNNetVolume.Create;
+  try
+    FInner.LoadTensorFlat(FSrcNames[Idx], Wqkv);
+    GroupStride := (FQPerKV + 2) * FHeadDim;   // rows per KV group
+    KOffset := FQPerKV * FHeadDim;             // K block start within a group
+    VOffset := (FQPerKV + 1) * FHeadDim;       // V block start within a group
+    if Kind = 1 then
+      Dest.ReSize(FNumKVHeads * FQPerKV * FHeadDim * FHidden, 1, 1)
+    else
+      Dest.ReSize(FNumKVHeads * FHeadDim * FHidden, 1, 1);
+    DstRow := 0;
+    for g := 0 to FNumKVHeads - 1 do
+    begin
+      SrcBase := g * GroupStride;
+      if Kind = 1 then
+      begin
+        // all q_per_kv query head-rows of this group (group-major)
+        for q := 0 to FQPerKV * FHeadDim - 1 do
+        begin
+          for c := 0 to FHidden - 1 do
+            Dest.FData[DstRow * FHidden + c] :=
+              Wqkv.FData[(SrcBase + q) * FHidden + c];
+          Inc(DstRow);
+        end;
+      end
+      else
+      begin
+        if Kind = 2 then r := SrcBase + KOffset
+        else r := SrcBase + VOffset;
+        for q := 0 to FHeadDim - 1 do
+        begin
+          for c := 0 to FHidden - 1 do
+            Dest.FData[DstRow * FHidden + c] :=
+              Wqkv.FData[(r + q) * FHidden + c];
+          Inc(DstRow);
+        end;
+      end;
+    end;
+  finally
+    Wqkv.Free;
+  end;
+end;
+
+function BuildInternLM2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+  Inner: TNNetSafeTensorsReader;
+  Reader: TNNetInternLM2Reader;
+  HeadDim: integer;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadLlamaConfigFromJSONFile(ConfigPath);
+  if Config.ModelType <> 'internlm2' then
+  begin
+    ImportError('internlm2 import: config model_type is "' +
+      Config.ModelType + '", expected "internlm2" - use the matching ' +
+      'builder or BuildFromPretrained.');
+    Result := nil;
+    exit;
+  end;
+  if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+  else
+  begin
+    if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+      ImportError('InternLM2 import: hidden_size=' +
+        IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+        'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+    HeadDim := Config.HiddenSize div Config.NumHeads;
+  end;
+  Inner := CreatePretrainedTensorReader(FileName);
+  Reader := nil;
+  try
+    Reader := TNNetInternLM2Reader.Create(Inner, Config.NumLayers,
+      Config.NumHeads, Config.NumKVHeads, HeadDim, Config.HiddenSize,
+      Config.VocabSize, Config.TieWordEmbeddings);
+    Inner := nil; // ownership transferred to Reader
+  except
+    Inner.Free;
+    Reader.Free;
+    raise;
+  end;
+  // The core builder takes ownership of Reader (it frees it in its finally).
+  Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
+    pSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildInternLM2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildInternLM2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -25631,6 +25940,15 @@ begin
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'phi' then
     Result := BuildPhiFromSafeTensorsEx(WeightsPath, IgnoredPhiConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'internlm2' then
+    // InternLM2 / InternLM2.5 (architectures ["InternLM2ForCausalLM"],
+    // internlm/internlm2_5-*): a plain Llama backbone whose ONLY new piece is
+    // the checkpoint layout - the fused group-interleaved attention.wqkv slab
+    // and the InternLM2 tensor names - both translated to standard HF Llama
+    // names + separate W_q/W_k/W_v by the InternLM2 reader, then ridden over
+    // the Llama path. See BuildInternLM2FromSafeTensors.
+    Result := BuildInternLM2FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or

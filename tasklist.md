@@ -99,24 +99,31 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] InternLM2 / InternLM2.5 importer (`BuildInternLM2FromSafeTensors[Ex]`,
-      model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — a current,
-      widely-used Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONE
-      genuinely new piece is the fused `attention.wqkv` packing, which is NOT the
-      contiguous Q|K|V thirds (ModernBERT/BERT slabs) NOR the GPT-NeoX per-head
-      interleaved qkv any existing slicer handles: InternLM2 reshapes wqkv as
-      `[num_kv_heads, (q_per_kv + 2), head_dim, hidden]` and concatenates each
-      KV-group's `q_per_kv` query slices followed by its single K then single V
-      slice — so unpacking to the standard separate W_q/W_k/W_v needs a new
-      group-interleaved slicer (rows reordered so all Q heads precede all K then
-      all V, then the usual rotate_half q/k de-permute for RoPE). The rest rides
-      the landed Llama path: `wo`/`w1`(gate)/`w2`(down)/`w3`(up) names map onto
-      the existing SwiGLU separate-projection loader, `attention_norm`/`ffn_norm`
-      are the standard pre-norms, and the tokenizer is a SentencePiece `.model`
-      (already supported). Pico parity fixture via the make_pico_*_fixture.py
-      recipe asserting next-token logits < 1e-4 vs float64 HF
-      InternLM2ForCausalLM, plus a TLlamaConfig-style round-trip. Reuses
-      everything except the wqkv group slicer; no new layer class.
+- [X] InternLM2 / InternLM2.5 importer (`BuildInternLM2FromSafeTensors[Ex]`,
+      model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — LANDED.
+      A plain Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONLY
+      genuinely new piece is the checkpoint LAYOUT, resolved by an
+      InternLM2->HF translating reader (`TNNetInternLM2Reader`, a
+      `TNNetSafeTensorsReader` subclass) that rides the existing core Llama
+      builder with NO new layer/config flags. It (a) unpacks the fused
+      `attention.wqkv` (reshaped `[num_kv_heads, q_per_kv+2, head_dim, hidden]`,
+      per-group q slices then single K then single V) into standard separate
+      W_q/W_k/W_v with the group-interleaved row reorder (all Q heads
+      group-major, then all K, then all V — HF rotate_half order, so the core
+      builder's own rotate_half→interleaved q/k de-permute for RoPE applies
+      unchanged), and (b) renames the InternLM2 tensors (tok_embeddings /
+      wo / feed_forward.w1=gate|w2=down|w3=up / attention_norm / ffn_norm /
+      output) to the HF Llama names the core builder reads. Tokenizer is a
+      SentencePiece `.model` (already supported); `bias=true` rejected.
+      Verified by a HAND-BUILT pico fixture (tools/internlm2_tiny_fixture.py —
+      InternLM2 is NOT in transformers, needs trust_remote_code offline, so the
+      reference is a self-contained numpy float64 forward) asserting next-token
+      logits < 1e-4: tests `TestInternLM2ConfigParity` / `TestInternLM2LogitParity`.
+  - [ ] real-checkpoint slicer not exercised: the translating reader's wqkv
+        unpack rematerializes each q/k/v slice in RAM per tensor (fine at pico
+        and 1.8B/7B widths); a streaming/int8 path for the 20B checkpoint and a
+        live trust_remote_code parity run against a downloaded internlm2_5-* are
+        left open.
 - [ ] IBM Granite 3.x importer follow-ups (`BuildGraniteFromSafeTensors[Ex]`
       LANDED, model_type `granite`/`granitemoe`; four multipliers folded at
       load on the Llama path — embedding/residual/attention multipliers + a
