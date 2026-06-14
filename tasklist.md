@@ -320,38 +320,6 @@ rather than acted on.
       the ViT encoder path; the new code is the convolutional fusion decoder.
       Pico parity vs HF float64 + a real-image relative-depth sanity check;
       demo: examples/DepthEstimation writes a depth map for one CPU image.
-- [X] Swin Transformer importer (microsoft/swin-tiny-patch4-window7-224) —
-      hierarchical shifted-window ViT, structurally distinct from the plain ViT
-      / DINOv2 / SigLIP towers already landed (patch-merging downsampling +
-      window partition + the cyclic-shift mask + relative-position-bias table).
-      Needs a window-partition/reverse helper and the shifted-window attention
-      mask; relative position bias maps onto an additive-bias attention path.
-      DONE: BuildSwinFromSafeTensors[Ex] + TSwinConfig + ReadSwinConfigFromJSON
-      File + SwinConfigToString (model_type "swin"). FULL shifted-window path
-      (W-MSA + SW-MSA with cyclic-shift mask), per-head relative_position_bias,
-      patch-merging, mean-pool + classifier. New layers: TNNetWindowAttention
-      (additive per-(query,key) bias = rel-pos bias + shift mask, SDPA subclass)
-      and TNNetGatherTokens (X-axis token reorder for window partition/reverse/
-      merge). Pico parity (tools/swin_tiny_fixture.py, HF float64 oracle): max
-      |logit diff| ~9e-9 < 1e-4. Tests TestSwinConfigFromJSONFile +
-      TestSwinImageClassificationParity. Follow-ups: window attention currently
-      instantiates one TNNetWindowAttention per (window,head) — a single
-      block-diagonal window-attention layer would shrink the graph for the full
-      swin-tiny (56x56 grid, 64 windows); also Swin-v2 (cosine attention +
-      log-spaced continuous position bias) and the masked-image-modeling head.
-      Pico parity vs HF float64 producing ImageNet-1k logits; reuses the vision
-      preprocessing helper. Hierarchical backbone also unblocks SegFormer/DETR.
-- [X] MobileNetV3 importer (torchvision) — DONE: BuildMobileNetV3[FromSafeTensors
-      [Ex]] + TMobileNetV3Config/ReadMobileNetV3ConfigFromJSONFile in
-      neuralpretrained.pas; new TNNetHardSigmoid activation. Inverted-residual
-      MBConv blocks (optional expand 1x1 -> depthwise kxk -> optional squeeze-
-      excite -> project 1x1, no act after project) + hard-swish/ReLU + SE gating
-      via TNNetChannelMulByLayer; conv-BN fold reuses the ResNet loader (depthwise
-      BN shift rides a TNNetChannelBias). Pico parity vs a numpy float64 oracle
-      (tools/mobilenetv3_tiny_fixture.py) covering every branch combo, asserted
-      < 1e-4 in TestMobileNetV3ImageClassificationParity. EfficientNet (SiLU SE +
-      stochastic depth) maps onto the same MBConv primitives and remains a
-      follow-up.
 - [ ] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
       + TRRDBNetConfig LANDED in neuralpretrained.pas; RRDBNet x4 with
       NEAREST-interpolate conv upsampling via TNNetDeMaxPool(2), parametrized
@@ -384,30 +352,6 @@ rather than acted on.
       linear-head weights (lin layers of richzhang/PerceptualSimilarity) as a tiny
       imported tensor. Parity vs the reference LPIPS on one image pair; also expose
       it as a training loss so SR examples can opt into perceptual fine-tuning.
-- [X] SSIM / MS-SSIM (+ PSNR) full-reference image-quality metrics — the classic
-      pixel/structure quality metrics complementing the FEATURE-space FID/IS
-      (landed) and the planned perceptual LPIPS. Add to neural/neuralimagemetrics.pas:
-      ComputeSSIM(imgA, imgB) over the standard 11x11 Gaussian-windowed local mean /
-      variance / covariance with the C1,C2 stabilizers, MS-SSIM as the 5-scale
-      downsampled product (Wang et al. 2003 weights), and a trivial ComputePSNR.
-      Distinct from FID/IS/LPIPS (no backbone — pure signal statistics on the two
-      images), and the standard reporting metric for the landed SuperResolution /
-      SubPixelSuperRes / Real-ESRGAN / WaveletDenoise restoration work. Also expose
-      a differentiable 1-SSIM training-loss head (TNNetSSIMLoss or a loss helper) so
-      restoration examples can optimize structural similarity directly instead of
-      pixel MSE. Validate ComputeSSIM/PSNR against a numpy/skimage float64 oracle on
-      a pinned image pair (identical -> SSIM 1.0 / PSNR inf), MS-SSIM vs the per-scale
-      product; tests/TestNeuralImageMetrics.pas.
-- [X] KID (Kernel Inception Distance) generative metric — the small-sample-unbiased
-      complement to the landed FID (FID's plug-in covariance estimate is biased at
-      the few-hundred-sample sizes a CPU demo can afford; KID is an unbiased
-      polynomial-kernel MMD^2 estimator, Binkowski et al. 2018). Add to
-      neural/neuralimagemetrics.pas: ComputeKID(featuresR, featuresG) with the cubic
-      kernel k(x,y)=(x.y/d + 1)^3, the unbiased U-statistic MMD^2 (no diagonal terms),
-      and a subset-bootstrap mean+std over m splits like InceptionScore. Backbone-
-      agnostic (same caller-supplies-features convention as ComputeFID). Validate the
-      MMD^2 math against a numpy float64 oracle on synthetic Gaussian feature sets
-      (KID-self ~0, ordering preserved); tests/TestNeuralImageMetrics.pas.
 - [ ] CLIPScore text-image-alignment generative metric — the standard reference-free
       metric for text-to-image quality (how well a generated image matches its
       prompt), reusing the LANDED CLIP dual-encoder (BuildClipFromSafeTensors). Add a
@@ -429,18 +373,6 @@ rather than acted on.
       thin example head, NOT a new leaf class). Isola et al. 2017; foundational
       conditional-generation recipe distinct from the unconditional VisualGAN and the
       diffusion examples. Edit examples/README.md.
-- [X] AdaIN (adaptive instance normalization) two-input layer + fast arbitrary
-      style-transfer example — the landed StyleTransfer is Gatys ITERATIVE pixel
-      optimization (minutes per image, one fixed style); AdaIN enables a single
-      feed-forward pass for ARBITRARY styles (Huang & Belongie 2017). Add
-      TNNetAdaIN: a two-source layer that instance-normalizes the CONTENT feature map
-      (per-channel zero-mean/unit-var over H,W) then re-scales/re-shifts it by the
-      per-channel mean/std computed from a STYLE feature map (second input) — NO
-      learned parameters, distinct from FiLM (learned projection of a conditioning
-      vector) and the trainable TNNetInstanceNorm. Wire a small encoder(VGG relu4_1)
-      -> AdaIN -> decoder example that stylizes a content image with a style image in
-      one forward pass; full input-gradient numerical coverage for the layer in
-      tests/TestNeuralNumerical.pas. Edit examples/README.md.
 - [ ] VQGAN / pretrained discrete image-tokenizer importer
       (BuildVqModelFromSafeTensors, diffusers VQModel / taming-transformers VQGAN) —
       the repo TRAINS a VQ-VAE (examples/VQVAE) but cannot IMPORT a pretrained
