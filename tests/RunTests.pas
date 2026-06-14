@@ -19,7 +19,7 @@ uses
   TestNeuralMaskedLM,
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy,
   TestNeuralTokenizer, TestNeuralImagePreprocess,
-  TestNeuralDiffusion;
+  TestNeuralDiffusion, TestNeuralImageMetrics;
 
 type
   TMyTestRunner = class(TTestRunner)

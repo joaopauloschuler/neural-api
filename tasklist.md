@@ -359,19 +359,24 @@ rather than acted on.
       convs, BN after every conv). Reuses the landed conv + BN + Concat path; the
       new work is the branch-concatenation block builder. Needed in its own right
       and as the pooled-feature backbone for FID below. Pico parity vs HF float64.
-- [ ] Generative-image quality metrics — FID (Fréchet Inception Distance) +
-      Inception Score (examples/GenerativeImageMetrics or a neural*metrics unit).
-      The repo has a deep NLP-eval bench (perplexity / MMLU / HellaSwag) and CV
-      classification reports, but ZERO image-generative quality metrics, so
-      VisualGAN / DiffusionMNIST / FlowMatching / VisualAutoencoder cannot be
-      compared except by eye. Pool the Inception-v3 (or a smaller landed CNN as a
-      documented proxy) 2048-d features over a real and a generated image set,
-      compute per-set mean + covariance and the Fréchet distance
-      ||mu_r-mu_g||^2 + Tr(Cr+Cg-2 sqrt(Cr Cg)); add Inception Score
-      (exp E_x KL(p(y|x)||p(y))) from the softmax. New code is the matrix
-      square-root (eigendecomposition of a small SPD covariance) and the feature
-      accumulator; validate the Fréchet formula against a numpy/scipy oracle on
-      synthetic Gaussian feature sets.
+- [X] Generative-image quality metrics — FID (Fréchet Inception Distance) +
+      Inception Score. Landed as neural/neuralimagemetrics.pas (backbone-agnostic:
+      caller supplies feature vectors for FID and softmax prob vectors for IS).
+      TFIDFeatureAccumulator (streaming running sum + outer-product -> unbiased
+      mean + covariance); ComputeFID(meanR,covR,meanG,covG) +
+      ComputeFIDFromAccumulators/FromFeatures; matrix square-root via a symmetric
+      Jacobi eigendecomposition (sqrt clamped eigenvalues, V*diag*V^T) with the
+      stable Tr(sqrt(A*B)) = sum sqrt(eig(sqrtA*B*sqrtA)) cross-trace; all double
+      precision. ComputeInceptionScore(probs,NumSplits) = exp(E_x KL(p(y|x)||pbar))
+      with mean+std over splits. Inception-v3 backbone is NOT in-repo yet, so the
+      DOCUMENTED proxy is any landed classifier CNN (late pooled hidden layer for
+      FID features, final softmax for IS) — FID is backbone-relative; ordering is
+      preserved. Validated against a numpy float64 oracle (scipy absent; oracle's
+      matrix sqrt = numpy eigendecomposition) on synthetic Gaussian feature sets:
+      tests/TestNeuralImageMetrics.pas (7 tests, FID < 1e-4 vs oracle, FID-self ~0,
+      IS==K / IS==1 analytic), tools/make_image_metrics_fixture.py +
+      tests/fixtures/image_metrics_oracle.json. SKIPPED the optional
+      examples/GenerativeImageMetrics demo (unit + tests are the core deliverable).
 - [ ] LPIPS perceptual distance (TNNetLPIPS or a metric helper) — the standard
       perceptual image-similarity metric for super-resolution / restoration /
       generative quality, complementing the landed SuperResolution / SubPixelSuperRes
