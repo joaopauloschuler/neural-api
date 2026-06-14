@@ -239,9 +239,25 @@ rather than acted on.
       structures as the tokenizer.json path; pico fixture + spm-oracle parity
       test (tools/make_pico_spm_fixture.py, tests/fixtures/tiny_spm.model,
       TestSentencePieceModelParity). UNIGRAM model_type only; a BPE/WORD/CHAR
-      ModelProto raises EHFTokenizerError ("use tokenizer.json"). OPEN
-      follow-ups: BPE-in-.model (NLLB/mBART-BPE exports — needs the merges
-      decoded from the ModelProto pieces or via tokenizer.json). BYTE
+      ModelProto raises EHFTokenizerError ("use tokenizer.json").
+      BPE-in-.model is now DONE — model_type=BPE (NLLB/mBART-BPE/DeBERTa-v3
+      sentencepiece.bpe.model exports): LoadSentencePieceModel reconstructs the
+      merges from the scored pieces (ReconstructBPEMerges, byte-for-byte the
+      HF transformers generate_merges algorithm — per piece, every codepoint
+      split whose both halves are in the vocab becomes a candidate ordered by
+      (id_l,id_r), then a stable sort by (piece_id,len_l,len_r) gives the merge
+      rank), sets FUnigram=false and routes encode/decode through the SAME
+      metaspace + byte-level-BPE (BPEWord/EmitTokenOrFallback) machinery the
+      tokenizer.json/GGUF-gpt2 BPE paths use; byte_fallback (type-6 pieces)
+      covers non-ASCII via <0xNN>. Pico fixture tiny_spm_bpe.model
+      (tools/make_pico_spm_fixture.py BPE variant) + TestSentencePieceBPEModelParity.
+      Parity is FULL (exact), NOT an approximation: verified id-identical to the
+      sentencepiece encoder over ASCII *and* non-ASCII (café/CJK/emoji/control-
+      byte) inputs, and that encoder is itself id-identical to a tokenizers BPE
+      model built from these same reconstructed merges. WORD/CHAR model_types
+      still raise EHFTokenizerError. This now partially UNBLOCKS the mBART/NLLB
+      BART-family follow-up (a, above) and the DeBERTa-v3 import. No residual
+      non-ASCII parity gap. BYTE
       (type=6) byte-fallback is now DONE: LoadSentencePieceModel sets
       FByteFallback when any type-6 piece is present, so (1) encode routes
       unknown chars through the <0xNN> BYTE pieces — the Unigram Viterbi

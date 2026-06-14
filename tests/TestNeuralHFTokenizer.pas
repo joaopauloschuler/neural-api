@@ -37,6 +37,7 @@ type
     // for the unk-free cases, and special ids come from trainer_spec.
     procedure TestSentencePieceModelParity;
     procedure TestSentencePieceByteFallbackRoundTrip;
+    procedure TestSentencePieceBPEModelParity;
     procedure TestSplitQwen2ParityWithHF;
     procedure TestSplitCl100kParityWithHF;
     procedure TestSplitDeepSeekParityWithHF;
@@ -394,6 +395,85 @@ begin
       if not HasUnk then
         AssertEquals(Context + ': decode',
           CaseObj.Get('decoded', ''), Tok.Decode(Ids, true));
+    end;
+  finally
+    Ids.Free;
+    Tok.Free;
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestSentencePieceBPEModelParity;
+var
+  Tok: TNeuralHFTokenizer;
+  Root: TJSONData;
+  Group, CaseObj: TJSONObject;
+  Cases, ExpectedIds: TJSONArray;
+  Ids: TIntegerList;
+  CaseCnt, IdCnt: integer;
+  Text, Context, JsonStr: string;
+  SS: TStringStream;
+  Parser: TJSONParser;
+begin
+  // model_type=BPE SentencePiece .model: the .model carries ONLY scored
+  // pieces (no merge list), so LoadSentencePieceModel reconstructs the merges
+  // from the pieces (ReconstructBPEMerges, the HF generate_merges algorithm)
+  // and routes encode/decode through the metaspace byte-level-BPE machinery.
+  // Parity is asserted against the sentencepiece encoder (the oracle pinned at
+  // fixture-build time), which we verified is id-identical to a tokenizers BPE
+  // model built from those same reconstructed merges -- over ASCII AND
+  // non-ASCII (<0xNN> byte-fallback) inputs, so this is FULL byte parity, not
+  // an approximation. This is the flavour NLLB / mBART-BPE / DeBERTa-v3 ship.
+  //
+  // Raw-bytes load via TJSONParser(s, []): the cases include non-ASCII text
+  // (cafe / CJK / emoji / a raw control byte) that must survive verbatim --
+  // GetJSON would corrupt multi-byte UTF-8 (see byte-fallback test).
+  SS := TStringStream.Create('');
+  try
+    SS.LoadFromFile(FixturePath('hf_tokenizer_cases.json'));
+    JsonStr := SS.DataString;
+  finally
+    SS.Free;
+  end;
+  Parser := TJSONParser.Create(JsonStr, []);
+  try
+    Root := Parser.Parse;
+  finally
+    Parser.Free;
+  end;
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Group := TJSONObject(Root).Objects['spm_bpe_model'];
+    // LoadFromFile must auto-dispatch the '.model' extension to the protobuf
+    // reader, which then dispatches model_type=BPE to the merge path.
+    Tok.LoadFromFile(FixturePath(Group.Get('tokenizer', '')));
+    AssertTrue('not unigram (BPE)', not Tok.IsUnigram);
+    AssertTrue('not byte-level (metaspace BPE)', not Tok.IsByteLevel);
+    AssertTrue('byte-fallback vocab loaded', Tok.GetVocabSize() > 256);
+    // trainer_spec ids (unk=0, bos=1, eos=2 in the fixture).
+    AssertEquals('unk id from trainer_spec', 0, Tok.UnkId);
+    AssertEquals('bos id from trainer_spec', 1, Tok.BosId);
+    AssertEquals('eos id from trainer_spec', 2, Tok.EosId);
+
+    Cases := Group.Arrays['cases'];
+    AssertTrue('no cases pinned', Cases.Count >= 10);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Text := CaseObj.Get('text', '');
+      ExpectedIds := CaseObj.Arrays['ids'];
+      Context := 'spm-bpe case ' + IntToStr(CaseCnt) + ' "' + Text + '"';
+      Ids.Clear;
+      Tok.Encode(Text, Ids);
+      // encode parity with the sentencepiece BPE oracle (incl. byte fallback)
+      AssertEquals(Context + ': id count', ExpectedIds.Count, Ids.Count);
+      for IdCnt := 0 to ExpectedIds.Count - 1 do
+        AssertEquals(Context + ': id[' + IntToStr(IdCnt) + ']',
+          ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+      // round-trip: pieces + byte pieces reassemble the original UTF-8 text
+      AssertEquals(Context + ': round-trip decode', Text,
+        Tok.Decode(Ids, true));
     end;
   finally
     Ids.Free;

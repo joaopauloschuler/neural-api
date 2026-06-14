@@ -3322,5 +3322,178 @@
     "decoded": ""
    }
   ]
+ },
+ "spm_bpe_model": {
+  "tokenizer": "tiny_spm_bpe.model",
+  "cases": [
+   {
+    "text": "the cat sat",
+    "ids": [
+     264,
+     275,
+     282
+    ],
+    "decoded": "the cat sat"
+   },
+   {
+    "text": "the cat sat on the mat",
+    "ids": [
+     264,
+     275,
+     282,
+     292,
+     264,
+     281
+    ],
+    "decoded": "the cat sat on the mat"
+   },
+   {
+    "text": "running and jumping",
+    "ids": [
+     267,
+     313,
+     300,
+     280,
+     276,
+     297,
+     317,
+     313,
+     309,
+     294
+    ],
+    "decoded": "running and jumping"
+   },
+   {
+    "text": "the morning meeting",
+    "ids": [
+     264,
+     273,
+     305,
+     306,
+     280,
+     273,
+     277,
+     274
+    ],
+    "decoded": "the morning meeting"
+   },
+   {
+    "text": "nation station",
+    "ids": [
+     297,
+     300,
+     271,
+     268,
+     298,
+     271
+    ],
+    "decoded": "nation station"
+   },
+   {
+    "text": "a fat cat",
+    "ids": [
+     265,
+     297,
+     311,
+     259,
+     275
+    ],
+    "decoded": "a fat cat"
+   },
+   {
+    "text": "the dog",
+    "ids": [
+     264,
+     297,
+     308,
+     287
+    ],
+    "decoded": "the dog"
+   },
+   {
+    "text": "cat",
+    "ids": [
+     275
+    ],
+    "decoded": "cat"
+   },
+   {
+    "text": "the qxz cat",
+    "ids": [
+     264,
+     297,
+     116,
+     123,
+     125,
+     275
+    ],
+    "decoded": "the qxz cat"
+   },
+   {
+    "text": "café",
+    "ids": [
+     269,
+     299,
+     311,
+     198,
+     172
+    ],
+    "decoded": "café"
+   },
+   {
+    "text": "the 你好 cat",
+    "ids": [
+     264,
+     297,
+     231,
+     192,
+     163,
+     232,
+     168,
+     192,
+     275
+    ],
+    "decoded": "the 你好 cat"
+   },
+   {
+    "text": "smile 😀 now",
+    "ids": [
+     268,
+     309,
+     302,
+     312,
+     301,
+     297,
+     243,
+     162,
+     155,
+     131,
+     297,
+     300,
+     305,
+     315
+    ],
+    "decoded": "smile 😀 now"
+   },
+   {
+    "text": "bell\u0007ring",
+    "ids": [
+     297,
+     316,
+     301,
+     312,
+     312,
+     10,
+     306,
+     263
+    ],
+    "decoded": "bell\u0007ring"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   }
+  ]
  }
 }

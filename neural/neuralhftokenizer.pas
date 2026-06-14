@@ -69,18 +69,22 @@ Coded by Claude (AI).
 //     trainer_spec unk/bos/eos ids -- and the SentencePiece Metaspace
 //     convention is wired so Encode/Decode behave identically. This is what
 //     T5 / ALBERT / XLNet / DeBERTa-v3 / mBART(-Unigram) checkpoints ship
-//     when they carry NO tokenizer.json. Only the UNIGRAM model_type is
-//     read; a BPE/WORD/CHAR ModelProto raises EHFTokenizerError. The
-//     SentencePiece precompiled_charsmap (an opaque per-model normalization
-//     trie, usually NFKC-derived) is NOT parsed/applied here; a tokenizer.json
-//     that declares a standard NFKC/NFKD normalizer IS applied in full (see
-//     UnicodeNormalize).
+//     when they carry NO tokenizer.json. Both UNIGRAM and BPE model_types are
+//     read; a WORD/CHAR ModelProto raises EHFTokenizerError. A BPE .model
+//     stores only scored pieces (no merge list), so the merges are
+//     reconstructed from the pieces (ReconstructBPEMerges, matching HF's
+//     generate_merges) and routed through the metaspace byte-level-BPE path --
+//     this covers the NLLB / mBART-BPE / DeBERTa-v3 sentencepiece.bpe.model
+//     exports. The SentencePiece precompiled_charsmap (an opaque per-model
+//     normalization trie, usually NFKC-derived) is NOT parsed/applied here; a
+//     tokenizer.json that declares a standard NFKC/NFKD normalizer IS applied
+//     in full (see UnicodeNormalize).
 //
 // NOT supported (raises EHFTokenizerError with a clear message):
 //   * model.type <> "BPE"/"WordPiece"/"Unigram".
-//   * A raw SentencePiece .model whose trainer_spec.model_type is BPE / WORD
-//     / CHAR (only UNIGRAM is read from the protobuf -- use tokenizer.json
-//     for the BPE-in-.model case, e.g. some NLLB exports).
+//   * A raw SentencePiece .model whose trainer_spec.model_type is WORD / CHAR
+//     (only UNIGRAM and BPE are read from the protobuf -- use tokenizer.json
+//     for WORD/CHAR).
 //
 // Unicode \p{L} / \p{N} classification for the GPT-2 regex is implemented
 // over explicit ranges covering Latin (incl. Latin-1/Extended), Greek,
@@ -212,6 +216,9 @@ type
       function VocabFind(const Token: string): integer; // id or -1
       function MergeRank(const A, B: string): integer;  // rank or MaxInt
       procedure BPEWord(const Symbols: TStringList; Ids: TIntegerList);
+      // Reconstructs FMerges from BPE-.model pieces (HF generate_merges).
+      procedure ReconstructBPEMerges(const PieceTextV: array of string;
+        APieceCount: integer);
       procedure UnigramWord(const PieceText: string; Ids: TIntegerList);
       procedure EmitTokenOrFallback(const Symbol: string; Ids: TIntegerList);
       function BertNormalize(const Segment: string): string;
@@ -1597,6 +1604,129 @@ begin
   end;
 end;
 
+// Reconstructs the byte-level-BPE merge table (FMerges) from a BPE
+// SentencePiece ModelProto's scored pieces. A BPE .model carries NO explicit
+// merge list, so we derive it byte-for-byte the way HuggingFace's
+// transformers.tokenization_utils_base.generate_merges does for the BPE
+// branch of SpmConverter (called with vocab only -> ascending rank order):
+//
+//   merges = []
+//   for piece (in id order):
+//     local = [(l, r, piece_id) for each codepoint split where both halves
+//              are in the vocab]              # piece_id stands in for "score"
+//     local.sort(key=(id_l, id_r))
+//     merges += local
+//   merges.sort(key=(piece_id, len_cp(l), len_cp(r)))   # STABLE, ascending
+//   rank = position in the final list
+//
+// Both Python len() and slicing are over CODEPOINTS, so the split scan and the
+// length keys here iterate codepoints (NextCodePoint), not raw bytes -- this
+// matters for the multi-byte learned pieces. Verified id-identical to the
+// sentencepiece encoder (TestSentencePieceBPEModelParity) including the
+// non-ASCII byte-fallback path; no approximation.
+procedure TNeuralHFTokenizer.ReconstructBPEMerges(
+  const PieceTextV: array of string; APieceCount: integer);
+type
+  TMergeCand = record
+    Left, Right: string;
+    LeftId, RightId, PieceId, LenL, LenR, Seq: integer;
+  end;
+var
+  Cands: array of TMergeCand;
+  Boundaries: array of integer; // 1-based byte offsets of codepoint starts
+  NumCP, Pos, CnPiece, SplitI, ByteSplit, LId, RId, NLocal, I, J, Seq: integer;
+  L, R, Piece: string;
+  Tmp: TMergeCand;
+  LocalStart: integer;
+begin
+  Seq := 0;
+  SetLength(Cands, 0);
+  for CnPiece := 0 to APieceCount - 1 do
+  begin
+    Piece := PieceTextV[CnPiece];
+    if Piece = '' then continue;
+    // Codepoint boundary table (1-based byte offsets, plus end sentinel).
+    SetLength(Boundaries, Length(Piece) + 1);
+    NumCP := 0;
+    Pos := 1;
+    while Pos <= Length(Piece) do
+    begin
+      Boundaries[NumCP] := Pos;
+      NextCodePoint(Piece, Pos);
+      Inc(NumCP);
+    end;
+    Boundaries[NumCP] := Pos;
+    if NumCP < 2 then continue;  // single codepoint -> no split
+    LocalStart := Length(Cands);
+    // Each codepoint split (1..NumCP-1) where both halves are in the vocab.
+    for SplitI := 1 to NumCP - 1 do
+    begin
+      ByteSplit := Boundaries[SplitI];
+      L := Copy(Piece, 1, ByteSplit - 1);
+      R := Copy(Piece, ByteSplit, Length(Piece) - ByteSplit + 1);
+      LId := VocabFind(L);
+      if LId < 0 then continue;
+      RId := VocabFind(R);
+      if RId < 0 then continue;
+      SetLength(Cands, Length(Cands) + 1);
+      with Cands[High(Cands)] do
+      begin
+        Left := L; Right := R;
+        LeftId := LId; RightId := RId;
+        PieceId := CnPiece;
+        LenL := SplitI;            // codepoint length of L
+        LenR := NumCP - SplitI;    // codepoint length of R
+        Seq := 0;                  // filled after local sort
+      end;
+    end;
+    // local sort by (LeftId, RightId) -- insertion sort over this piece's run.
+    NLocal := Length(Cands) - LocalStart;
+    for I := LocalStart + 1 to High(Cands) do
+    begin
+      Tmp := Cands[I];
+      J := I - 1;
+      while (J >= LocalStart) and
+        ((Cands[J].LeftId > Tmp.LeftId) or
+         ((Cands[J].LeftId = Tmp.LeftId) and (Cands[J].RightId > Tmp.RightId)))
+      do
+      begin
+        Cands[J + 1] := Cands[J];
+        Dec(J);
+      end;
+      Cands[J + 1] := Tmp;
+    end;
+    if NLocal = 0 then ;  // silence unused-warning path
+  end;
+
+  // Stamp the append/sequence order (after all local sorts) so the final
+  // sort can keep ties stable (Python's sort is stable).
+  for I := 0 to High(Cands) do Cands[I].Seq := I;
+
+  // Final stable sort by (PieceId, LenL, LenR, Seq) ascending -> merge rank.
+  for I := 1 to High(Cands) do
+  begin
+    Tmp := Cands[I];
+    J := I - 1;
+    while (J >= 0) and
+      ((Cands[J].PieceId > Tmp.PieceId) or
+       ((Cands[J].PieceId = Tmp.PieceId) and (Cands[J].LenL > Tmp.LenL)) or
+       ((Cands[J].PieceId = Tmp.PieceId) and (Cands[J].LenL = Tmp.LenL) and
+        (Cands[J].LenR > Tmp.LenR)) or
+       ((Cands[J].PieceId = Tmp.PieceId) and (Cands[J].LenL = Tmp.LenL) and
+        (Cands[J].LenR = Tmp.LenR) and (Cands[J].Seq > Tmp.Seq))) do
+    begin
+      Cands[J + 1] := Cands[J];
+      Dec(J);
+    end;
+    Cands[J + 1] := Tmp;
+  end;
+
+  // Position in the final list IS the rank (lower rank = applied first).
+  for I := 0 to High(Cands) do
+    FMerges.AddObject(Cands[I].Left + csMergeSep + Cands[I].Right,
+      TObject(PtrInt(I)));
+end;
+
 { ---------------------------------------------------------------- }
 { Raw SentencePiece ModelProto protobuf reader                      }
 { ---------------------------------------------------------------- }
@@ -1809,18 +1939,19 @@ begin
   SpmEos := -1;
   ParseModelProto();
 
-  if ModelType <> 1 then
+  if (ModelType <> 1) and (ModelType <> 2) then
     raise EHFTokenizerError.Create(
-      'SentencePiece .model: only the UNIGRAM model_type is supported by ' +
-      'the raw-.model reader (model_type=' + IntToStr(ModelType) +
-      '; BPE/WORD/CHAR not supported -- use tokenizer.json instead).');
+      'SentencePiece .model: only the UNIGRAM and BPE model_types are ' +
+      'supported by the raw-.model reader (model_type=' + IntToStr(ModelType) +
+      '; WORD/CHAR not supported -- use tokenizer.json instead).');
   if PieceCount = 0 then
     raise EHFTokenizerError.Create('SentencePiece .model: no pieces found.');
 
-  // Populate the SAME internal Unigram structures the tokenizer.json path
-  // uses: FVocab (token->id), FIdToToken (id->token), FUniScore (id->score),
-  // FUniMinScore. The 0-based piece index IS the id.
-  FUnigram := true;
+  // Populate the SAME internal structures the tokenizer.json path uses:
+  // FVocab (token->id), FIdToToken (id->token); for UNIGRAM also FUniScore /
+  // FUniMinScore; for BPE the reconstructed FMerges (see below). The 0-based
+  // piece index IS the id.
+  FUnigram := ModelType = 1;
   SetLength(FIdToToken, PieceCount);
   SetLength(FUniScore, PieceCount);
   FUniMinScore := 0;
@@ -1838,6 +1969,26 @@ begin
     // pieces reassembles the original multi-byte UTF-8 sequence.
     if PieceTypeV[Cnt] = 6 then FByteFallback := true;
   end;
+
+  // model_type=BPE: the ModelProto stores ONLY scored pieces -- no explicit
+  // merge list (unlike a tokenizer.json BPE model). Reconstruct the merges
+  // from the pieces, byte-for-byte matching HuggingFace's
+  // transformers.tokenization_utils_base.generate_merges (the algorithm
+  // SpmConverter uses for model_type==BPE):
+  //   * vocab = {piece -> id}; iterate pieces in id order.
+  //   * for each piece, for every split point (l, r) with BOTH halves in the
+  //     vocab, collect a candidate merge; within one piece the candidates are
+  //     ordered by (id_l, id_r).
+  //   * concatenate all candidates (pieces in id order), then STABLE-sort the
+  //     whole list by (id of the merged piece, len(l), len(r)) ascending --
+  //     the resulting order IS the merge rank.
+  // The metaspace + reconstructed-merge + byte-fallback path is then routed
+  // through the SAME BPEWord / EmitTokenOrFallback machinery the GGUF "gpt2"
+  // and tokenizer.json BPE paths use. Verified id-identical to the
+  // sentencepiece encoder over ASCII *and* non-ASCII (byte-fallback) inputs
+  // by TestSentencePieceBPEModelParity -- no approximation, full parity.
+  if ModelType = 2 then
+    ReconstructBPEMerges(PieceTextV, PieceCount);
 
   // Special-token ids straight from trainer_spec (authoritative for SPM).
   if SpmUnk >= 0 then FUnkId := SpmUnk;

@@ -27,6 +27,12 @@ The byte_fallback variant (tiny_spm_bytefallback.model) carries the 256
 <0x00>..<0xFF> BYTE pieces (type 6) so the Pascal <0xNN> byte-fallback
 encode/decode path is exercised by a round-trip parity test.
 
+The BPE variant (tiny_spm_bpe.model, model_type=BPE) has NO explicit merge
+list -- only scored pieces -- so the Pascal reader reconstructs merges from
+the pieces (HF generate_merges algorithm) and routes through the metaspace
+byte-level-BPE machinery. byte_fallback is forced on so non-ASCII inputs hit
+the <0xNN> pieces. NLLB / mBART-BPE / DeBERTa-v3 ship this flavour.
+
 Coded by Claude (AI).
 """
 import json
@@ -79,23 +85,52 @@ BYTE_FALLBACK_CASES = [
 ]
 
 
-def build_model(path, byte_fallback=False):
+# BPE .model cases: ASCII pieces exercise the reconstructed-merge ranking;
+# the non-ASCII tail (cafe / CJK / emoji / control byte) exercises the BPE
+# path's <0xNN> byte fallback (byte_fallback is forced on for BPE models).
+BPE_CASES = [
+    "the cat sat",
+    "the cat sat on the mat",
+    "running and jumping",
+    "the morning meeting",
+    "nation station",
+    "a fat cat",
+    "the dog",
+    "cat",
+    "the qxz cat",
+    "café",
+    "the 你好 cat",
+    "smile \U0001f600 now",
+    "bell\x07ring",
+    "",
+]
+
+
+def build_model(path, byte_fallback=False, model_type="unigram"):
     corpus_path = path + '.corpus.txt'
     with open(corpus_path, 'w') as f:
         f.write("\n".join(CORPUS))
     prefix = path[:-len('.model')]
+    # BPE models always need byte_fallback to cover the 256-byte alphabet so
+    # non-ASCII test cases (cafe / CJK / emoji) decompose to <0xNN> pieces --
+    # exactly like the real NLLB/mBART-BPE sentencepiece.bpe.model exports.
+    bf = byte_fallback or (model_type == "bpe")
+    # vocab budget: byte_fallback adds the 256 <0x00>..<0xFF> BYTE pieces
+    # (type 6) on top of the ~23-char learned alphabet, so it must clear 282.
+    if bf:
+        vocab_size = 320
+    else:
+        vocab_size = 60
     kwargs = dict(
         input=corpus_path,
         model_prefix=prefix,
-        vocab_size=300 if byte_fallback else 60,
-        model_type="unigram",
+        vocab_size=vocab_size,
+        model_type=model_type,
         character_coverage=1.0,
         normalization_rule_name="identity",  # no NFKC charsmap -> tiny .model
         unk_id=0, bos_id=1, eos_id=2, pad_id=-1,
         unk_piece="<unk>", bos_piece="<s>", eos_piece="</s>")
-    if byte_fallback:
-        # byte_fallback adds the 256 <0x00>..<0xFF> BYTE pieces (type 6);
-        # vocab must leave room for them on top of the learned pieces.
+    if bf:
         kwargs['byte_fallback'] = True
     spm.SentencePieceTrainer.train(**kwargs)
     os.remove(corpus_path)
@@ -130,6 +165,20 @@ def main():
     bf_sp = spm.SentencePieceProcessor(model_file=bf_path)  # verify (re)load
     bf_cases = dump_cases(bf_sp, BYTE_FALLBACK_CASES)
 
+    # BPE SentencePiece .model (model_type=BPE). NLLB/mBART-BPE and DeBERTa-v3
+    # ship this flavour. The .model stores only scored pieces -- no explicit
+    # merge list -- so the Pascal reader reconstructs merges from the pieces
+    # the same way HF's transformers.tokenization_utils_base.generate_merges
+    # does for BPE SpmConverter models. We verified (tools comment / commit)
+    # that SentencePiece's own encode is id-identical to a tokenizers BPE model
+    # built from those reconstructed merges over ASCII *and* non-ASCII (byte
+    # fallback) inputs, so the sentencepiece encoder is a faithful oracle here.
+    bpe_path = os.path.join(FIXDIR, 'tiny_spm_bpe.model')
+    if not os.path.exists(bpe_path):
+        build_model(bpe_path, model_type="bpe")
+    bpe_sp = spm.SentencePieceProcessor(model_file=bpe_path)  # verify (re)load
+    bpe_cases = dump_cases(bpe_sp, BPE_CASES)
+
     cases_path = os.path.join(FIXDIR, 'hf_tokenizer_cases.json')
     out = {}
     if os.path.exists(cases_path):
@@ -138,6 +187,8 @@ def main():
     out["spm_model"] = {"tokenizer": os.path.basename(path), "cases": cases}
     out["spm_bytefallback"] = {"tokenizer": os.path.basename(bf_path),
                                "cases": bf_cases}
+    out["spm_bpe_model"] = {"tokenizer": os.path.basename(bpe_path),
+                            "cases": bpe_cases}
     with open(cases_path, 'w') as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
     print(path, os.path.getsize(path), 'bytes')
@@ -145,6 +196,8 @@ def main():
           'unk/bos/eos', sp.unk_id(), sp.bos_id(), sp.eos_id())
     print(bf_path, os.path.getsize(bf_path), 'bytes',
           'vocab', bf_sp.get_piece_size())
+    print(bpe_path, os.path.getsize(bpe_path), 'bytes',
+          'vocab', bpe_sp.get_piece_size())
     print(cases_path, os.path.getsize(cases_path), 'bytes')
 
 
