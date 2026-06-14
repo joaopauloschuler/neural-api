@@ -345,11 +345,6 @@ rather than acted on.
       tap via out PoolFeatureIdx, and a pico parity test <1e-4 vs a numpy float64
       oracle on the InceptionA-shaped sub-net. NOT yet a usable real-checkpoint
       importer. REMAINING to import a real torchvision inception_v3:
-  - [X] Asymmetric (1xN / Nx1) factorized convolutions — was the BLOCKER for
-        InceptionC (the 1x7/7x1 branches). UNBLOCKED: TNNetConvolutionRectangular
-        / TNNetConvolutionRectangularReLU now take independent FeatureSizeX /
-        FeatureSizeY (see the "Asymmetric-kernel convolution" task under Layer
-        follow-ups). The InceptionC 1x7 + 7x1 branches can now be built directly.
   - [ ] Strided grid-reduction modules InceptionB / InceptionD (parallel
         stride-2 conv + pool branches), the full stem (Conv2d_1a..4a + maxpools),
         InceptionE, and the torchvision avg-pool branch (the pico used a
@@ -791,62 +786,6 @@ rather than acted on.
       examples/TreeSpeculativeDecoding demo reporting the accepted-tokens/forward
       speedup vs the linear self-speculative baseline.
 
-- [X] DiT diffusion-transformer importer (BuildDiTFromSafeTensors[Ex] +
-      TDiTConfig + ReadDiTConfigFromJSONFile/DiTConfigToString in
-      neuralpretrained.pas), v1 scoped to the CLASS-CONDITIONAL DiT (the
-      facebook/DiT-XL-2-256 architecture — the clean adaLN-Zero recipe, NO text
-      encoder: conditioning c = timestep_embed + class_embed). The transformer
-      latent denoiser behind SD3/Sora, replacing the from-scratch convolutional
-      UNets (DiffusionMNIST/ConditionalDiffusion). Landed pieces: patchify
-      (biased patch conv -> token sequence + a FIXED 2-D sin-cos pos_embed
-      buffer); the t_embedder (TNNetSinusoidalTimeEmbedding -> Linear -> SiLU ->
-      Linear, with a [sin|cos]<->[cos|sin] input-column swap at load since DiT's
-      sinusoidal order is cos-first) + the y_embedder label table; the adaLN-Zero
-      block expressed by PURE COMPOSITION (no new leaf class): modulate(h)=
-      h*(1+scale)+shift is TNNetFiLM([LN(x),cond]) with cond=concat[(1+scale),
-      shift] (TNNetSplitChannels + TNNetAddConstant(1) + TNNetDeepConcat), the
-      per-channel gate is TNNetChannelMulByLayer, the affine-free LayerNorms are
-      TNNetTokenLayerNorm at its gamma=1/beta=0 init; standard MHSA
-      (AddMultiHeadSelfAttention) + gelu_tanh MLP (TNNetGELU, DiT uses
-      nn.GELU(approximate='tanh')); the final adaLN + linear + unpatchify
-      (TNNetDepthToSpace, with a patch sub-axis (ph,pw)->(pw,ph) neuron permute
-      at load to match DepthToSpace's ordering); learn_sigma out_channels =
-      2*in_channels. THREE-input net (latent + scalar t + class id);
-      DiTConditioning/DiTDenoise drive a full step, DiTDenoise feeds the existing
-      TNNetDiffusionScheduler. Verified: tools/make_pico_dit_fixture.py committed
-      pico fixture (hidden 16, depth 2, heads 2, patch 2, 6x6 latent, 5 classes;
-      diffusers NOT installed so a self-contained float64 numpy oracle) +
-      TestDiTParity (max |diff| = 2.8e-5 < 1e-4) + TestDiTSchedulerSmoke
-      (latent-noise -> 4 DDIM steps -> finite eps). DEFERRED follow-ups: the
-      TEXT-conditioned PixArt-alpha variant (T5 cross-attention, much larger) and
-      the end-to-end LatentTextToImage example (DiT denoise -> VAE-decode ->
-      image) — the VAE-decode tail and scheduler are already in place.
-
-- [X] ConvNeXt-v1/v2 image-classification backbone importer
-      (BuildConvNeXtFromSafeTensors[Ex] + TConvNeXtConfig + ReadConvNeXtConfigFrom
-      JSONFile/ConvNeXtConfigToString in neuralpretrained.pas). BOTH variants land:
-      v1 uses the per-channel LayerScale gamma (TNNetChannelMul) and v2 uses GRN
-      (the existing TNNetGRN, inserted between GELU and the project pointwise, with
-      NO layer_scale_parameter) — model_type "convnextv2" auto-selects the GRN path.
-      Block wiring: depthwise 7x7 pad-3 (TNNetDepthwiseConvLinear) + per-channel
-      bias (TNNetChannelBias) -> channel LayerNorm (TNNetTokenLayerNorm, per-(x,y)
-      over Depth) -> pointwise expand-4x (TNNetPointwiseConvLinear) -> EXACT-erf
-      GELU (new TNNetGELUErf — HF "gelu", needed for <1e-4; the tanh-approx
-      TNNetGELU is too coarse) -> [v2 GRN] -> pointwise project -> [v1 LayerScale]
-      -> residual. Plus patchify stem (PxP stride-P conv -> LayerNorm), 2x2 stride-2
-      downsample transitions (LayerNorm -> conv) before stages 1..3, and the head
-      (global avg pool -> LayerNorm -> Linear). HF "convnext."/"convnextv2." tensor
-      names. Verified <1e-4 against the REAL HF ConvNext(V2)ForImageClassification
-      forward via committed pico fixtures (tools/convnext_tiny_fixture.py +
-      tests/fixtures/tiny_convnext{,v2}.* + TestConvNeXt{Config,V1,V2}* — v1 max
-      |diff| and v2 both PASS). GEOMETRY NOTE: CAI clamps a conv kernel to the input
-      spatial size, so every stage must stay >=7 wide for the 7x7 depthwise (true at
-      the stock 224 input); the pico uses patch_size 1 + image 56 (stages 56/28/14/7)
-      to keep that property at KB scale. DEFERRED follow-up: a real-checkpoint slicer
-      (make_pico_*_fixture.py-style) to commit a sub-slice of facebook/convnext-tiny-
-      224 for an end-to-end ImageNet sample check (covered by the ImageNet eval
-      harness task below).
-
 - [ ] ImageNet top-1 / top-5 parity eval harness for the imported vision backbones
       (EvaluateImageNet + ImageNetReport in neuralimagemetrics.pas or a sibling, plus
       examples/ImageNetEval). Today there is NO end-to-end accuracy check for the
@@ -938,24 +877,6 @@ rather than acted on.
       later StyleGAN3 / diffusion-with-modulation work.
 
 ## Layer follow-ups that fix real limitations
-
-- [X] Asymmetric-kernel convolution (1xN / Nx1 factorized convs) — CAI
-      TNNetConvolution was square-kernel only (one FeatureSize controls both axes),
-      which blocked the spatially-factorized convs used across modern CNNs:
-      Inception-v3's InceptionC 1x7/7x1 branches (the BLOCKER for finishing the
-      partial Inception-v3 importer), the SegFormer/Mix-FFN depthwise variants, and
-      cheap large-receptive-field stems. DONE: added TNNetConvolutionRectangular
-      (Linear) and TNNetConvolutionRectangularReLU leaf classes taking independent
-      pFeatureSizeX / pFeatureSizeY. The shared TNNetConvolution forward im2col and
-      backward gradient loops already indexed FFeatureSizeX/FFeatureSizeY
-      separately, so the AVX dot-product path (over the flattened
-      FeatureSizeX*FeatureSizeY*InDepth channel vector) is preserved unchanged for
-      the square case. Serialization stores FeatureSizeX in FStruct[1] and
-      FeatureSizeY in the free FStruct[5] slot, so X<>Y kernels round-trip via both
-      LoadFromString dispatch tables. Coverage in TestNeuralNumerical.pas: forward
-      shape check, 1x3 and 3x1 input+weight numerical-gradient checks (tol 0.01),
-      and an X<>Y (1x7) save/load round-trip. Unblocks the Inception-v3 InceptionC
-      branches.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
