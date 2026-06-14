@@ -5972,8 +5972,13 @@ begin
   begin
     auxSingle := FData[0];
     FLastPos := 0;
-    Result := auxSingle;
     if auxSingle < 0 then auxSingle := -auxSingle;
+    // Seed the running max with the MAGNITUDE of element 0, not its signed
+    // value: a negative element 0 of largest magnitude would otherwise be
+    // missed (the returned max-abs would be too small for the scale users -
+    // ForceMaxAbs / NormalizeMax / int8 quantization / backprop overflow
+    // protection - that all expect a true non-negative magnitude).
+    Result := auxSingle;
     vHigh := High(FData);
     if vHigh > 0 then
     begin

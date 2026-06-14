@@ -22,6 +22,7 @@ type
     procedure TestVolumeResize;
     procedure TestVolumeStatistics;
     procedure TestVolumeMinMax;
+    procedure TestVolumeMaxAbsNegativeFirst;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -263,6 +264,28 @@ begin
     AssertEquals('Min should be -7.0', -7.0, MinVal, 0.0001);
     AssertEquals('Max should be 5.0', 5.0, MaxVal, 0.0001);
     AssertEquals('MaxAbs should be 7.0', 7.0, MaxAbsVal, 0.0001);
+  finally
+    V.Free;
+  end;
+end;
+
+// Regression: GetMaxAbs used to seed its running max with the SIGNED first
+// element, so a negative element 0 of largest magnitude was missed and the
+// returned max-abs was too small (it would have returned 2.0 below). The
+// pinned vector has element 0 = -8.0 as the unique largest magnitude. This
+// FAILS against the pre-fix code and passes after seeding with abs(FData[0]).
+procedure TTestNeuralVolume.TestVolumeMaxAbsNegativeFirst;
+var
+  V: TNNetVolume;
+begin
+  V := TNNetVolume.Create(4, 1, 1);
+  try
+    V.Raw[0] := -8.0; // largest magnitude AND negative AND first
+    V.Raw[1] := 2.0;
+    V.Raw[2] := -1.0;
+    V.Raw[3] := 0.5;
+    AssertEquals('MaxAbs must be 8.0 (negative element 0)', 8.0,
+      V.GetMaxAbs(), 0.0001);
   finally
     V.Free;
   end;
