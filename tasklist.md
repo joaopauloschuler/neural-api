@@ -124,6 +124,30 @@ rather than acted on.
         output. The pico fixture ships shared_intermediate_size=0.
   - [ ] real-checkpoint slicer (make_pico_*_fixture.py reuse) to parity-check
         a sliced ibm-granite/granite-3.1-* against the random pico fixture.
+- [ ] OLMoE importer (`BuildOlmoeFromSafeTensors[Ex]`, model_type `olmoe`) —
+      the SPARSE sibling of the landed dense OLMo-2 importer
+      (BuildOlmo2FromSafeTensors). OLMoE-1B-7B (allenai/OLMoE-1B-0924) is a
+      fully-open Apache-2.0 MoE LLM, ideal for real-weight parity (small active
+      footprint, public weights + configs). Architecturally it is the OLMo
+      backbone REUSING two landed pieces with NO new layer class: (a) the
+      attention/norm placement is the OLMo line — QK-norm over the FULL head
+      width (the QKNormFullWidth flag already wired for OLMo-2) and RMSNorm; and
+      (b) the FFN is a Mixtral-style top-k router over E experts (reuse the
+      AddTopKMixtureOfExperts / Mixtral MoE WIRING exactly as Qwen3-MoE did =
+      Qwen3 attention × Mixtral MoE). Open the importer on the existing Llama/
+      OLMo path with the three MoE knobs (num_experts, num_experts_per_tok,
+      norm_topk_prob) read from config; gate softmax-over-top-k-logits ==
+      top-k-renorm like the other MoE importers. CHECK FIRST whether OLMoE uses
+      OLMo-2's PostNormReordered (x + Norm(Attn(x))) or the original-OLMo
+      pre-norm placement and wire whichever the HF config/impl dictates — this
+      is the one genuinely model-specific decision. Deliverables: pico parity
+      fixture via the make_pico_*_fixture.py recipe (re-randomized non-trivial
+      router + expert weights asserted to move the HF logits) +
+      TestOlmoe{Config,Logit}Parity < 1e-4 vs float64 HF transformers
+      (OlmoeForCausalLM), plus a real-checkpoint slicer (slice_llama.py reuse)
+      to parity-check a sliced allenai/OLMoE-1B-0924 against the random pico
+      fixture. Pairs with the open Qwen3-MoE "uniform all-MoE only" stance: if
+      OLMoE is also uniformly-MoE this needs no per-layer dense/MoE switching.
 - [ ] M2M100/NLLB translate demo + real-vocab check (follow-up to the landed
       BuildM2M100FromSafeTensors, commit cb21550): an examples/NLLBTranslate
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and
