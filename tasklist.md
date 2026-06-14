@@ -558,6 +558,32 @@ rather than acted on.
 - [ ] NumPy .npz follow-up (neural/neuralnumpy.pas reader/writer landed; WRITER
       is STORED-only): DEFLATE-compressed .npz WRITER (savez_compressed) +
       zip64 / >4GB archive support (reader currently rejects zip64).
+- [ ] MMLU few-shot accuracy benchmark harness + example (NLP eval gap;
+      complements the landed examples/HellaSwagEval + examples/PerplexityEval
+      and the EvaluateMultipleChoice / ScoreSequence primitives, but is a
+      DISTINCT benchmark, not a near-duplicate): MMLU is the canonical
+      knowledge benchmark and the missing piece for validating the large
+      imported instruct-model fleet (Llama/Qwen3/Gemma3/Phi3/Mistral/...)
+      against published numbers rather than only against tiny pico-fixture
+      logit parity. Scope:
+        - a TMMLUEvaluator-style harness in neuralnlpmetrics.pas (or a small
+          new unit) that, for each 4-choice question, builds the standard
+          k-shot prompt ("Question ... A. .. B. .. C. .. D. ..\nAnswer:")
+          from same-subject dev examples and scores by the single-token
+          A/B/C/D answer-letter logprob (the HF lm-eval convention), NOT by
+          full-continuation perplexity (that is what HellaSwagEval already
+          does — keep the two scoring modes clearly separate).
+        - per-subject accuracy + macro-average over the 57 subjects, plus a
+          micro-average, printed as a small report (reuse the existing
+          PerplexityReport / *Report formatting idiom).
+        - examples/MMLUEval reading the cais/mmlu (or hendrycks_test) splits
+          via the venv-x datasets/transformers already available; default to
+          a tiny embedded smoke subset so the example compiles/runs in CI
+          without a network fetch, with a flag to point at the full dataset.
+        - 0-shot and 5-shot modes (5-shot is the headline setting); reuse the
+          left-padded DecodeBatchGreedy / KV-cache path so large models stay
+          tractable. Follow-ups (separate tasks): LAMBADA last-word accuracy,
+          ARC/PIQA/WinoGrande on the same answer-letter scoring core.
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
       the GPT-Neo route; the published pytorch_model.bin-only checkpoints
