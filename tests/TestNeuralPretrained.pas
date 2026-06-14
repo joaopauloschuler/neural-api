@@ -289,6 +289,9 @@ type
     procedure TestVaeDecoderParity;
     procedure TestVaeEncoderParity;
     procedure TestVaeRoundTrip;
+    procedure TestVqModelEncodeParity;
+    procedure TestVqModelDecodeParity;
+    procedure TestVqModelRoundTrip;
     procedure TestRRDBNetParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
@@ -13627,6 +13630,233 @@ begin
     RefJson.Free;
     Enc.Free;
     Dec.Free;
+  end;
+end;
+
+// Loads the (C,H,W) array NamedArr from the VQModel io fixture into a CAI
+// (x,y,depth)-indexed volume of the given grid/channels.
+procedure LoadVqImageVolume(RootObj: TJSONObject; const Name: string;
+  Grid, Channels: integer; Vol: TNNetVolume);
+var
+  Arr, RowArr, ColArr: TJSONArray;
+  ChanCnt, YCnt, XCnt: integer;
+begin
+  Arr := TJSONArray(RootObj.Find(Name));
+  Vol.ReSize(Grid, Grid, Channels);
+  for ChanCnt := 0 to Channels - 1 do
+  begin
+    RowArr := TJSONArray(Arr.Items[ChanCnt]);
+    for YCnt := 0 to Grid - 1 do
+    begin
+      ColArr := TJSONArray(RowArr.Items[YCnt]);
+      for XCnt := 0 to Grid - 1 do
+        Vol.FData[(YCnt * Grid + XCnt) * Channels + ChanCnt] :=
+          ColArr.Items[XCnt].AsFloat;
+    end;
+  end;
+end;
+
+// VQGAN / discrete image-tokenizer ENCODE parity (diffusers VQModel).
+// tests/fixtures/tiny_vqmodel.* is a pico randomly-initialized VQModel
+// (block_out_channels [8,16], 1 layer/block, 4 groups, 16x16 RGB image -> 8x8
+// latent, vq_embed_dim 4, codebook n_e 16). The generator
+// tools/vqmodel_tiny_fixture.py builds a self-contained numpy float64 oracle
+// (diffusers not installed). Token ids are INTEGERS so the match is EXACT: the
+// importer's encoder + quant_conv + nearest-neighbour argmin-L2 codebook lookup
+// must reproduce the oracle's id grid bit-for-bit.
+procedure TTestNeuralPretrained.TestVqModelEncodeParity;
+var
+  Vq: TNNetVqModel;
+  Config: TVqModelConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  IdRowArr: TJSONArray;
+  RootObj: TJSONObject;
+  ImgInput: TNNetVolume;
+  Grid, ImgGrid, y, x, RefId, GotId, Mismatches: integer;
+  Ids: TNeuralIntegerArray;
+begin
+  RandSeed := 424242;
+  Vq := BuildVqModelFromSafeTensors(
+    FixturePath('tiny_vqmodel.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_vqmodel_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('model built', Vq <> nil);
+    Grid := Config.LatentGrid;
+    ImgGrid := Grid shl (Config.NumBlockOut - 1);
+    AssertEquals('image grid', ImgGrid, Vq.Encoder.Layers[0].Output.SizeX);
+    AssertEquals('latent grid', Grid,
+      Vq.Encoder.GetLastLayer().Output.SizeX);
+    AssertEquals('vq embed dim', Config.VqEmbedDim,
+      Vq.Encoder.GetLastLayer().Output.Depth);
+    RefJson.LoadFromFile(FixturePath('tiny_vqmodel_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RootObj := TJSONObject(RefRoot);
+    LoadVqImageVolume(RootObj, 'image', ImgGrid, Config.InChannels, ImgInput);
+    Vq.EncodeImageToTokenList(ImgInput, Ids);
+
+    Mismatches := 0;
+    for y := 0 to Grid - 1 do
+    begin
+      IdRowArr := TJSONArray(TJSONArray(RootObj.Find('token_ids')).Items[y]);
+      for x := 0 to Grid - 1 do
+      begin
+        RefId := IdRowArr.Items[x].AsInteger;
+        GotId := Ids[y * Grid + x];
+        if RefId <> GotId then Inc(Mismatches);
+      end;
+    end;
+    AssertEquals('VQ token ids: mismatches must be 0 (exact integer match)',
+      0, Mismatches);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    RefJson.Free;
+    Vq.Free;
+  end;
+end;
+
+// VQGAN DECODE parity: gather codebook embeddings for the oracle's token-id
+// grid, run post_quant_conv + decoder, and assert the RGB pixels match the
+// float64 oracle < 1e-4.
+procedure TTestNeuralPretrained.TestVqModelDecodeParity;
+var
+  Vq: TNNetVqModel;
+  Config: TVqModelConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  IdRowArr, ChanArr, RowArr: TJSONArray;
+  RootObj: TJSONObject;
+  OutImage: TNNetVolume;
+  Grid, ImgGrid, y, x, c: integer;
+  Ids: TNeuralIntegerArray;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  Vq := BuildVqModelFromSafeTensors(
+    FixturePath('tiny_vqmodel.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_vqmodel_config.json'));
+  RefJson := TStringList.Create;
+  OutImage := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    Grid := Config.LatentGrid;
+    ImgGrid := Grid shl (Config.NumBlockOut - 1);
+    RefJson.LoadFromFile(FixturePath('tiny_vqmodel_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RootObj := TJSONObject(RefRoot);
+    // Feed the oracle's token-id grid straight into the decoder.
+    SetLength(Ids, Grid * Grid);
+    for y := 0 to Grid - 1 do
+    begin
+      IdRowArr := TJSONArray(TJSONArray(RootObj.Find('token_ids')).Items[y]);
+      for x := 0 to Grid - 1 do
+        Ids[y * Grid + x] := IdRowArr.Items[x].AsInteger;
+    end;
+    Vq.DecodeTokensToImage(Ids, OutImage);
+    AssertEquals('decoded image grid', ImgGrid, OutImage.SizeX);
+    AssertEquals('decoded RGB channels', Config.OutChannels, OutImage.Depth);
+
+    MaxDiff := 0;
+    for c := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(TJSONArray(RootObj.Find('decoded')).Items[c]);
+      for y := 0 to ImgGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[y]);
+        for x := 0 to ImgGrid - 1 do
+        begin
+          RefVal := ChanArr.Items[x].AsFloat;
+          GotVal := OutImage.FData[(y * ImgGrid + x) * Config.OutChannels + c];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('decoded RGB: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    OutImage.Free;
+    RefJson.Free;
+    Vq.Free;
+  end;
+end;
+
+// Full VQModel round-trip: image -> token grid -> image through the codebook,
+// using the imported model end to end (exercises EncodeImageToTokens then
+// DecodeTokensToImage). The encode ids must match the oracle exactly and the
+// decoded pixels must match the oracle < 1e-4.
+procedure TTestNeuralPretrained.TestVqModelRoundTrip;
+var
+  Vq: TNNetVqModel;
+  Config: TVqModelConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  IdRowArr, ChanArr, RowArr: TJSONArray;
+  RootObj: TJSONObject;
+  ImgInput, OutImage: TNNetVolume;
+  Grid, ImgGrid, y, x, c, Mismatches, RefId: integer;
+  Ids: TNeuralIntegerArray;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  Vq := BuildVqModelFromSafeTensors(
+    FixturePath('tiny_vqmodel.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_vqmodel_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  OutImage := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    Grid := Config.LatentGrid;
+    ImgGrid := Grid shl (Config.NumBlockOut - 1);
+    RefJson.LoadFromFile(FixturePath('tiny_vqmodel_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RootObj := TJSONObject(RefRoot);
+    LoadVqImageVolume(RootObj, 'image', ImgGrid, Config.InChannels, ImgInput);
+
+    Vq.EncodeImageToTokenList(ImgInput, Ids);
+    Mismatches := 0;
+    for y := 0 to Grid - 1 do
+    begin
+      IdRowArr := TJSONArray(TJSONArray(RootObj.Find('token_ids')).Items[y]);
+      for x := 0 to Grid - 1 do
+      begin
+        RefId := IdRowArr.Items[x].AsInteger;
+        if Ids[y * Grid + x] <> RefId then Inc(Mismatches);
+      end;
+    end;
+    AssertEquals('round-trip token ids exact', 0, Mismatches);
+
+    Vq.DecodeTokensToImage(Ids, OutImage);
+    MaxDiff := 0;
+    for c := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(TJSONArray(RootObj.Find('decoded')).Items[c]);
+      for y := 0 to ImgGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[y]);
+        for x := 0 to ImgGrid - 1 do
+        begin
+          RefVal := ChanArr.Items[x].AsFloat;
+          GotVal := OutImage.FData[(y * ImgGrid + x) * Config.OutChannels + c];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('round-trip decoded RGB: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    OutImage.Free;
+    ImgInput.Free;
+    RefJson.Free;
+    Vq.Free;
   end;
 end;
 

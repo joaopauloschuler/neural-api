@@ -5450,6 +5450,127 @@ function BuildVaeEncoderFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// VQGAN / DISCRETE IMAGE-TOKENIZER IMPORT (diffusers VQModel, the encoder used
+// by autoregressive / masked image generators - MaskGIT, Parti, LlamaGen - to
+// turn an image into a grid of codebook token IDs and back).
+//
+// A diffusers VQModel reuses the SAME encoder/decoder ResNet+attention blocks
+// as AutoencoderKL (above), but with a DISCRETE quantizer between them and NO
+// 0.18215 latent scaling (that scaling is AutoencoderKL-only):
+//
+//   ENCODE (image -> token-id grid):
+//     encoder (identical to BuildVaeEncoder up to conv_out, but conv_out emits
+//       latent_channels, NOT 2*latent_channels - VQModel has double_z=False)
+//     quant_conv (1x1, latent_channels -> vq_embed_dim)  -> continuous latent
+//     VectorQuantizer: for each spatial position z (a vq_embed_dim vector),
+//       pick the codebook row e_k that minimises ||z - e_k||^2 (squared L2) ->
+//       integer token id. The codebook is quantize.embedding.weight, shape
+//       [num_vq_embeddings (n_e), vq_embed_dim].
+//
+//   DECODE (token-id grid -> image):
+//     gather each id's codebook embedding -> (vq_embed_dim, H', W') latent
+//     post_quant_conv (1x1, vq_embed_dim -> latent_channels)
+//     decoder (identical to BuildVaeDecoder, but WITHOUT the 1/scaling_factor)
+//       -> raw RGB.
+//
+// The encoder/decoder halves reuse every VAE builder helper (conv loader,
+// ResnetBlock2D, MID self-attention, GroupNorm, asymmetric downsample, nearest
+// upsample). The genuinely new pieces are the nearest-neighbour codebook lookup
+// (argmin L2, plain Pascal) and the inverse gather, exposed as EncodeImageToTokens
+// / DecodeTokensToImage on the holder class TNNetVqModel so an imported
+// autoregressive image LM (stock Llama/GPT path) can generate image tokens
+// end to end.
+type
+  TVqModelConfig = record
+    LatentChannels: integer;                  // encoder conv_out width
+    VqEmbedDim: integer;                      // codebook vector dim (vq_embed_dim)
+    NumVqEmbeddings: integer;                 // codebook size n_e
+    InChannels: integer;                      // RGB input channels (3)
+    OutChannels: integer;                     // RGB output channels (3)
+    NumBlockOut: integer;                     // length of BlockOutChannels (<=8)
+    BlockOutChannels: array[0..7] of integer; // diffusers block_out_channels
+    LayersPerBlock: integer;                  // ResNet blocks per block
+    NormNumGroups: integer;                   // GroupNorm groups
+    LatentGrid: integer;                      // LATENT grid H=W
+    NormEps: TNeuralFloat;                    // GroupNorm eps (1e-6)
+    ModelType: string;                        // 'VQModel'
+  end;
+
+// Reads a diffusers VQModel config. Required keys: block_out_channels,
+// layers_per_block. Optional: latent_channels (4), vq_embed_dim (=latent_channels),
+// num_vq_embeddings, in/out_channels (3), norm_num_groups (32), norm_eps (1e-6).
+// The latent grid is pinned by "latent_size" or derived from "sample_size" /
+// "image_size" as sample_size / 2^(num_block-1).
+function ReadVqModelConfigFromJSONFile(const FileName: string): TVqModelConfig;
+
+function VqModelConfigToString(const Config: TVqModelConfig): string;
+
+// The imported VQGAN / discrete image tokenizer: an encoder net (image ->
+// continuous vq_embed_dim latent, ending at quant_conv), a decoder net
+// (gathered vq_embed_dim latent -> RGB, starting at post_quant_conv) and the
+// codebook embedding table. Owns both nets and the codebook; Free releases all.
+// Coded by Claude (AI).
+type
+  TNNetVqModel = class(TObject)
+  private
+    FEncoder: TNNet;        // image -> (LatentGrid,LatentGrid,VqEmbedDim) latent
+    FDecoder: TNNet;        // (LatentGrid,LatentGrid,VqEmbedDim) latent -> RGB
+    FCodebook: TNNetVolume; // [NumVqEmbeddings][VqEmbedDim] (row-major in Depth)
+    FConfig: TVqModelConfig;
+  public
+    constructor Create(AEncoder, ADecoder: TNNet; ACodebook: TNNetVolume;
+      const AConfig: TVqModelConfig);
+    destructor Destroy; override;
+    // Runs the encoder + quant_conv on Image (ImgGrid,ImgGrid,InChannels) and
+    // returns the (LatentGrid x LatentGrid) grid of codebook token ids (argmin
+    // squared-L2 to the embedding table). TokenIds is resized to
+    // [LatentGrid][LatentGrid] (row y, col x).
+    procedure EncodeImageToTokens(Image: TNNetVolume;
+      var TokenIds: array of integer);
+    // Convenience: returns the flat row-major (y*LatentGrid + x) id list.
+    procedure EncodeImageToTokenList(Image: TNNetVolume;
+      out Ids: TNeuralIntegerArray);
+    // Gathers each id's codebook embedding into a (LatentGrid,LatentGrid,
+    // VqEmbedDim) latent and runs post_quant_conv + decoder -> raw RGB image
+    // (resized into OutImage). Ids is the flat row-major id list.
+    procedure DecodeTokensToImage(const Ids: array of integer;
+      OutImage: TNNetVolume);
+    property Encoder: TNNet read FEncoder;
+    property Decoder: TNNet read FDecoder;
+    property Codebook: TNNetVolume read FCodebook;
+    property Config: TVqModelConfig read FConfig;
+  end;
+
+// Builds the VQModel encoder net (image -> continuous vq_embed_dim latent),
+// ending at quant_conv. Reuses the VAE encoder helpers; double_z=False so
+// conv_out emits latent_channels and quant_conv maps to vq_embed_dim.
+function BuildVqEncoderNet(Reader: TNNetSafeTensorsReader;
+  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNet;
+
+// Builds the VQModel decoder net (gathered vq_embed_dim latent -> RGB), starting
+// at post_quant_conv. Reuses the VAE decoder helpers; no 1/scaling_factor.
+function BuildVqDecoderNet(Reader: TNNetSafeTensorsReader;
+  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNet;
+
+// Reads the codebook embedding table quantize.embedding.weight ([n_e, e_dim])
+// into a [n_e][e_dim] volume (entry k at Depth-row k*e_dim..).
+function ReadVqCodebook(Reader: TNNetSafeTensorsReader;
+  const Config: TVqModelConfig): TNNetVolume;
+
+// Builds the full discrete image tokenizer (encoder + decoder + codebook) from
+// an open safetensors Reader (caller owns Reader). The returned TNNetVqModel
+// owns its nets and codebook.
+function BuildVqModel(Reader: TNNetSafeTensorsReader;
+  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNetVqModel;
+
+function BuildVqModelFromSafeTensorsEx(const FileName: string;
+  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNetVqModel;
+
+function BuildVqModelFromSafeTensors(const FileName: string;
+  out Config: TVqModelConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNetVqModel;
+
+// ---------------------------------------------------------------------------
 // REAL-ESRGAN / ESRGAN SUPER-RESOLUTION IMPORT (RRDBNet, e.g.
 // xinntao/Real-ESRGAN x4). The FIRST imported generative-image model that runs
 // end-to-end on CPU with NO diffusion loop - it is a pure-convolutional
@@ -34194,6 +34315,519 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVaeEncoderConfigFromJSONFile(ConfigPath);
   Result := BuildVaeEncoderFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// VQGAN / DISCRETE IMAGE-TOKENIZER IMPORT (diffusers VQModel)
+// ===========================================================================
+
+function ReadVqModelConfigFromJSONFile(const FileName: string): TVqModelConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ArrData: TJSONData;
+  Arr: TJSONArray;
+  ClassName: string;
+  i, SampleSize: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('VQModel import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('VQModel import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('VQModel import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ClassName := Obj.Get('_class_name', Obj.Get('model_type', 'VQModel'));
+    if (ClassName <> 'VQModel') and (ClassName <> 'VQGAN') and
+       (ClassName <> 'vqvae') then
+      ImportError('VQModel import: _class_name is "' + ClassName +
+        '" - only VQModel is supported here.');
+    Result.ModelType := ClassName;
+    ArrData := Obj.Find('block_out_channels');
+    if (ArrData = nil) or not (ArrData is TJSONArray) then
+      ImportError('VQModel import: config "' + FileName +
+        '" is missing the required array "block_out_channels".');
+    Arr := TJSONArray(ArrData);
+    if (Arr.Count < 1) or (Arr.Count > 8) then
+      ImportError('VQModel import: "block_out_channels" must have 1..8 ' +
+        'entries, got ' + IntToStr(Arr.Count) + '.');
+    Result.NumBlockOut := Arr.Count;
+    for i := 0 to Arr.Count - 1 do Result.BlockOutChannels[i] := Arr.Integers[i];
+    if Obj.IndexOfName('layers_per_block') < 0 then
+      ImportError('VQModel import: config "' + FileName +
+        '" is missing the required field "layers_per_block".');
+    Result.LayersPerBlock := Obj.Get('layers_per_block', 0);
+    if Result.LayersPerBlock < 1 then
+      ImportError('VQModel import: "layers_per_block" must be >= 1.');
+    Result.LatentChannels := Obj.Get('latent_channels', 4);
+    // vq_embed_dim defaults to latent_channels (diffusers VQModel.__init__).
+    Result.VqEmbedDim := Obj.Get('vq_embed_dim', Result.LatentChannels);
+    Result.NumVqEmbeddings := Obj.Get('num_vq_embeddings', 0);
+    Result.InChannels := Obj.Get('in_channels', 3);
+    Result.OutChannels := Obj.Get('out_channels', 3);
+    Result.NormNumGroups := Obj.Get('norm_num_groups', 32);
+    Result.NormEps := Obj.Get('norm_eps', 0.000001);
+    if Obj.IndexOfName('latent_size') >= 0 then
+      Result.LatentGrid := Obj.Get('latent_size', 0)
+    else
+    begin
+      SampleSize := Obj.Get('sample_size', 0);
+      if SampleSize <= 0 then SampleSize := Obj.Get('image_size', 0);
+      if SampleSize <= 0 then
+        ImportError('VQModel import: config "' + FileName + '" needs either ' +
+          '"latent_size" (latent grid) or "sample_size" (image size).');
+      Result.LatentGrid := SampleSize shr (Result.NumBlockOut - 1);
+    end;
+    if Result.LatentGrid < 1 then
+      ImportError('VQModel import: resolved latent grid is ' +
+        IntToStr(Result.LatentGrid) + ' (must be >= 1).');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function VqModelConfigToString(const Config: TVqModelConfig): string;
+var
+  i: integer;
+begin
+  Result := Config.ModelType + ' config: block_out_channels=[';
+  for i := 0 to Config.NumBlockOut - 1 do
+  begin
+    if i > 0 then Result := Result + ',';
+    Result := Result + IntToStr(Config.BlockOutChannels[i]);
+  end;
+  Result := Result + '], layers_per_block=' + IntToStr(Config.LayersPerBlock) +
+    ', latent_channels=' + IntToStr(Config.LatentChannels) +
+    ', vq_embed_dim=' + IntToStr(Config.VqEmbedDim) +
+    ', num_vq_embeddings=' + IntToStr(Config.NumVqEmbeddings) +
+    ', norm_num_groups=' + IntToStr(Config.NormNumGroups) +
+    ', latent_grid=' + IntToStr(Config.LatentGrid);
+end;
+
+// Builds the TVaeDecoderConfig the shared VAE helpers expect from a VQ config.
+function VqToVaeConfig(const Config: TVqModelConfig): TVaeDecoderConfig;
+var
+  i: integer;
+begin
+  Result.LatentChannels := Config.LatentChannels;
+  Result.OutChannels := Config.OutChannels;
+  Result.NumBlockOut := Config.NumBlockOut;
+  for i := 0 to 7 do Result.BlockOutChannels[i] := Config.BlockOutChannels[i];
+  Result.LayersPerBlock := Config.LayersPerBlock;
+  Result.NormNumGroups := Config.NormNumGroups;
+  Result.LatentGrid := Config.LatentGrid;
+  Result.ScalingFactor := 1.0;   // VQModel has NO latent scaling
+  Result.NormEps := Config.NormEps;
+  Result.ModelType := Config.ModelType;
+end;
+
+function BuildVqEncoderNet(Reader: TNNetSafeTensorsReader;
+  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Vae: TVaeDecoderConfig;
+  ConvIn, NormOut, ConvOut, QuantConv: TNNetLayer;
+  MidRes1, MidRes2: TVaeResnetLayers;
+  MidAttn: TVaeAttnLayers;
+  DownRes: array of array of TVaeResnetLayers;
+  DownConv: array of TNNetLayer;
+  TopC, InCh, OutCh, d, m, nResnet, b, ImgGrid, H: integer;
+  Prefix: string;
+begin
+  if Config.NumBlockOut < 1 then
+    ImportError('VQModel encoder import: block_out_channels is empty.');
+  if Config.LatentChannels < 1 then
+    ImportError('VQModel encoder import: latent_channels must be >= 1.');
+  Vae := VqToVaeConfig(Config);
+  TopC := Config.BlockOutChannels[Config.NumBlockOut - 1];
+  nResnet := Config.LayersPerBlock; // encoder: layers_per_block (no +1)
+  ImgGrid := Config.LatentGrid shl (Config.NumBlockOut - 1);
+  SetLength(DownRes, Config.NumBlockOut);
+  SetLength(DownConv, Config.NumBlockOut);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture (mirror of BuildVaeEncoder) ----------------
+    NN.AddLayer( TNNetInput.Create(ImgGrid, ImgGrid, Config.InChannels) );
+    ConvIn := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.BlockOutChannels[0], 3, 1, 1, 0) );
+    InCh := Config.BlockOutChannels[0];
+    for d := 0 to Config.NumBlockOut - 1 do
+    begin
+      OutCh := Config.BlockOutChannels[d];
+      SetLength(DownRes[d], nResnet);
+      for m := 0 to nResnet - 1 do
+      begin
+        if m = 0 then b := InCh else b := OutCh;
+        AddVaeResnetBlock(NN, Vae, b, OutCh, DownRes[d][m]);
+      end;
+      InCh := OutCh;
+      if d < Config.NumBlockOut - 1 then
+      begin
+        H := NN.GetLastLayer().Output.SizeY;
+        NN.AddLayer( TNNetPadXY.Create(1, 1) );
+        NN.AddLayer( TNNetCrop.Create(1, 1, H + 1, H + 1) );
+        DownConv[d] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(OutCh, 3, {pad=}0, {stride=}2, 0) );
+      end
+      else
+        DownConv[d] := nil;
+    end;
+    AddVaeResnetBlock(NN, Vae, TopC, TopC, MidRes1);
+    AddVaeAttention(NN, Vae, TopC, MidAttn);
+    AddVaeResnetBlock(NN, Vae, TopC, TopC, MidRes2);
+    NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
+    NN.AddLayer( TNNetSiLU.Create() );
+    // VQModel double_z=False: conv_out -> latent_channels (NOT 2*lat).
+    ConvOut := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.LatentChannels, 3, 1, 1, 0) );
+    // quant_conv (1x1, latent_channels -> vq_embed_dim). The net's output is
+    // the continuous pre-quantize latent; the codebook lookup is done by the
+    // holder class (plain Pascal argmin).
+    QuantConv := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.VqEmbedDim, 1, 0, 1, 0) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadVaeConv(Reader, ConvIn, 'encoder.conv_in.weight',
+      'encoder.conv_in.bias', Config.BlockOutChannels[0], Config.InChannels, 3);
+    InCh := Config.BlockOutChannels[0];
+    for d := 0 to Config.NumBlockOut - 1 do
+    begin
+      OutCh := Config.BlockOutChannels[d];
+      for m := 0 to nResnet - 1 do
+      begin
+        if m = 0 then b := InCh else b := OutCh;
+        Prefix := 'encoder.down_blocks.' + IntToStr(d) + '.resnets.' +
+          IntToStr(m) + '.';
+        LoadVaeResnetBlock(Reader, DownRes[d][m], Prefix, b, OutCh, Vae);
+      end;
+      InCh := OutCh;
+      if DownConv[d] <> nil then
+        LoadVaeConv(Reader, DownConv[d],
+          'encoder.down_blocks.' + IntToStr(d) + '.downsamplers.0.conv.weight',
+          'encoder.down_blocks.' + IntToStr(d) + '.downsamplers.0.conv.bias',
+          OutCh, OutCh, 3);
+    end;
+    LoadVaeResnetBlock(Reader, MidRes1, 'encoder.mid_block.resnets.0.',
+      TopC, TopC, Vae);
+    LoadVaeAttention(Reader, MidAttn, 'encoder.mid_block.attentions.0.',
+      TopC, Vae);
+    LoadVaeResnetBlock(Reader, MidRes2, 'encoder.mid_block.resnets.1.',
+      TopC, TopC, Vae);
+    LoadVaeGroupNorm(Reader, NormOut, 'encoder.conv_norm_out', TopC,
+      Config.NormEps);
+    LoadVaeConv(Reader, ConvOut, 'encoder.conv_out.weight',
+      'encoder.conv_out.bias', Config.LatentChannels, TopC, 3);
+    LoadVaeConv(Reader, QuantConv, 'quant_conv.weight', 'quant_conv.bias',
+      Config.VqEmbedDim, Config.LatentChannels, 1);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildVqDecoderNet(Reader: TNNetSafeTensorsReader;
+  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Vae: TVaeDecoderConfig;
+  PostQuant, ConvIn, NormOut, ConvOut: TNNetLayer;
+  MidRes1, MidRes2: TVaeResnetLayers;
+  MidAttn: TVaeAttnLayers;
+  UpRes: array of array of TVaeResnetLayers;
+  UpConv: array of TNNetLayer;
+  TopC, InCh, OutCh, r, m, RevIdx, nResnet, b: integer;
+  Prefix: string;
+begin
+  if Config.NumBlockOut < 1 then
+    ImportError('VQModel decoder import: block_out_channels is empty.');
+  Vae := VqToVaeConfig(Config);
+  TopC := Config.BlockOutChannels[Config.NumBlockOut - 1];
+  nResnet := Config.LayersPerBlock + 1;
+  SetLength(UpRes, Config.NumBlockOut);
+  SetLength(UpConv, Config.NumBlockOut);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture (mirror of BuildVaeDecoder, no scaling) ----
+    // Input is the GATHERED codebook latent (vq_embed_dim channels).
+    NN.AddLayer( TNNetInput.Create(Config.LatentGrid, Config.LatentGrid,
+      Config.VqEmbedDim) );
+    PostQuant := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.LatentChannels, 1, 0, 1, 0) );
+    ConvIn := NN.AddLayer(
+      TNNetConvolutionLinear.Create(TopC, 3, 1, 1, 0) );
+    AddVaeResnetBlock(NN, Vae, TopC, TopC, MidRes1);
+    AddVaeAttention(NN, Vae, TopC, MidAttn);
+    AddVaeResnetBlock(NN, Vae, TopC, TopC, MidRes2);
+    InCh := TopC;
+    for r := 0 to Config.NumBlockOut - 1 do
+    begin
+      RevIdx := Config.NumBlockOut - 1 - r;
+      OutCh := Config.BlockOutChannels[RevIdx];
+      SetLength(UpRes[r], nResnet);
+      for m := 0 to nResnet - 1 do
+      begin
+        if m = 0 then b := InCh else b := OutCh;
+        AddVaeResnetBlock(NN, Vae, b, OutCh, UpRes[r][m]);
+      end;
+      InCh := OutCh;
+      if r < Config.NumBlockOut - 1 then
+      begin
+        NN.AddLayer( TNNetDeMaxPool.Create(2) );
+        UpConv[r] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(OutCh, 3, 1, 1, 0) );
+      end
+      else
+        UpConv[r] := nil;
+    end;
+    NormOut := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
+    NN.AddLayer( TNNetSiLU.Create() );
+    ConvOut := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1, 0) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadVaeConv(Reader, PostQuant, 'post_quant_conv.weight',
+      'post_quant_conv.bias', Config.LatentChannels, Config.VqEmbedDim, 1);
+    LoadVaeConv(Reader, ConvIn, 'decoder.conv_in.weight',
+      'decoder.conv_in.bias', TopC, Config.LatentChannels, 3);
+    LoadVaeResnetBlock(Reader, MidRes1, 'decoder.mid_block.resnets.0.',
+      TopC, TopC, Vae);
+    LoadVaeAttention(Reader, MidAttn, 'decoder.mid_block.attentions.0.',
+      TopC, Vae);
+    LoadVaeResnetBlock(Reader, MidRes2, 'decoder.mid_block.resnets.1.',
+      TopC, TopC, Vae);
+    InCh := TopC;
+    for r := 0 to Config.NumBlockOut - 1 do
+    begin
+      RevIdx := Config.NumBlockOut - 1 - r;
+      OutCh := Config.BlockOutChannels[RevIdx];
+      for m := 0 to nResnet - 1 do
+      begin
+        if m = 0 then b := InCh else b := OutCh;
+        Prefix := 'decoder.up_blocks.' + IntToStr(r) + '.resnets.' +
+          IntToStr(m) + '.';
+        LoadVaeResnetBlock(Reader, UpRes[r][m], Prefix, b, OutCh, Vae);
+      end;
+      InCh := OutCh;
+      if UpConv[r] <> nil then
+        LoadVaeConv(Reader, UpConv[r],
+          'decoder.up_blocks.' + IntToStr(r) + '.upsamplers.0.conv.weight',
+          'decoder.up_blocks.' + IntToStr(r) + '.upsamplers.0.conv.bias',
+          OutCh, OutCh, 3);
+    end;
+    LoadVaeGroupNorm(Reader, NormOut, 'decoder.conv_norm_out',
+      Config.BlockOutChannels[0], Config.NormEps);
+    LoadVaeConv(Reader, ConvOut, 'decoder.conv_out.weight',
+      'decoder.conv_out.bias', Config.OutChannels,
+      Config.BlockOutChannels[0], 3);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function ReadVqCodebook(Reader: TNNetSafeTensorsReader;
+  const Config: TVqModelConfig): TNNetVolume;
+var
+  W: TNNetVolume;
+  NE, ED: integer;
+begin
+  if not Reader.HasTensor('quantize.embedding.weight') then
+    ImportError('VQModel import: missing tensor "quantize.embedding.weight".');
+  if Reader.DimCount('quantize.embedding.weight') <> 2 then
+    ImportError('VQModel import: "quantize.embedding.weight" must be 2-D ' +
+      '[n_e, e_dim], got ' + Reader.ShapeAsString('quantize.embedding.weight'));
+  NE := Reader.DimSize('quantize.embedding.weight', 0);
+  ED := Reader.DimSize('quantize.embedding.weight', 1);
+  if ED <> Config.VqEmbedDim then
+    ImportError('VQModel import: codebook e_dim ' + IntToStr(ED) +
+      ' <> vq_embed_dim ' + IntToStr(Config.VqEmbedDim) + '.');
+  if (Config.NumVqEmbeddings > 0) and (NE <> Config.NumVqEmbeddings) then
+    ImportError('VQModel import: codebook n_e ' + IntToStr(NE) +
+      ' <> num_vq_embeddings ' + IntToStr(Config.NumVqEmbeddings) + '.');
+  W := TNNetVolume.Create;
+  try
+    // Store as a (1,1,NE*ED) flat volume; entry k occupies [k*ED .. k*ED+ED-1].
+    Reader.LoadTensorFlat('quantize.embedding.weight', W);
+    W.ReSize(1, 1, NE * ED);
+    Result := W;
+  except
+    W.Free;
+    raise;
+  end;
+end;
+
+constructor TNNetVqModel.Create(AEncoder, ADecoder: TNNet;
+  ACodebook: TNNetVolume; const AConfig: TVqModelConfig);
+begin
+  inherited Create;
+  FEncoder := AEncoder;
+  FDecoder := ADecoder;
+  FCodebook := ACodebook;
+  FConfig := AConfig;
+end;
+
+destructor TNNetVqModel.Destroy;
+begin
+  FEncoder.Free;
+  FDecoder.Free;
+  FCodebook.Free;
+  inherited Destroy;
+end;
+
+// Nearest-neighbour codebook lookup: for the vq_embed_dim vector at flat index
+// Pos in Latent (CAI (x,y,depth) layout), return argmin_k ||z - e_k||^2.
+function VqArgminCodebook(Latent: TNNetVolume; Pos, EDim: integer;
+  Codebook: TNNetVolume; NumEmb: integer): integer;
+var
+  k, c, Best: integer;
+  Dist, BestDist, Diff: TNeuralFloat;
+  ZBase, EBase: integer;
+begin
+  ZBase := Pos * EDim;
+  Best := 0;
+  BestDist := 1e30;
+  for k := 0 to NumEmb - 1 do
+  begin
+    EBase := k * EDim;
+    Dist := 0;
+    for c := 0 to EDim - 1 do
+    begin
+      Diff := Latent.FData[ZBase + c] - Codebook.FData[EBase + c];
+      Dist := Dist + Diff * Diff;
+    end;
+    if Dist < BestDist then
+    begin
+      BestDist := Dist;
+      Best := k;
+    end;
+  end;
+  Result := Best;
+end;
+
+procedure TNNetVqModel.EncodeImageToTokens(Image: TNNetVolume;
+  var TokenIds: array of integer);
+var
+  Latent: TNNetVolume;
+  G, EDim, NE, y, x, Pos: integer;
+begin
+  G := FConfig.LatentGrid;
+  EDim := FConfig.VqEmbedDim;
+  NE := FCodebook.Size div EDim;
+  if Length(TokenIds) < G * G then
+    ImportError('EncodeImageToTokens: TokenIds needs ' + IntToStr(G * G) +
+      ' entries, got ' + IntToStr(Length(TokenIds)) + '.');
+  FEncoder.Compute(Image);
+  Latent := FEncoder.GetLastLayer().Output;
+  // Latent is (G,G,EDim) in CAI (x,y,depth); flat pos = y*G + x.
+  for y := 0 to G - 1 do
+    for x := 0 to G - 1 do
+    begin
+      Pos := y * G + x;
+      TokenIds[Pos] := VqArgminCodebook(Latent, Pos, EDim, FCodebook, NE);
+    end;
+end;
+
+procedure TNNetVqModel.EncodeImageToTokenList(Image: TNNetVolume;
+  out Ids: TNeuralIntegerArray);
+var
+  G: integer;
+begin
+  G := FConfig.LatentGrid;
+  SetLength(Ids, G * G);
+  EncodeImageToTokens(Image, Ids);
+end;
+
+procedure TNNetVqModel.DecodeTokensToImage(const Ids: array of integer;
+  OutImage: TNNetVolume);
+var
+  Latent: TNNetVolume;
+  G, EDim, NE, y, x, Pos, c, Id, EBase: integer;
+begin
+  G := FConfig.LatentGrid;
+  EDim := FConfig.VqEmbedDim;
+  NE := FCodebook.Size div EDim;
+  if Length(Ids) < G * G then
+    ImportError('DecodeTokensToImage: Ids needs ' + IntToStr(G * G) +
+      ' entries, got ' + IntToStr(Length(Ids)) + '.');
+  Latent := TNNetVolume.Create;
+  try
+    Latent.ReSize(G, G, EDim);
+    for y := 0 to G - 1 do
+      for x := 0 to G - 1 do
+      begin
+        Pos := y * G + x;
+        Id := Ids[Pos];
+        if (Id < 0) or (Id >= NE) then
+          ImportError('DecodeTokensToImage: token id ' + IntToStr(Id) +
+            ' out of range [0,' + IntToStr(NE - 1) + '].');
+        EBase := Id * EDim;
+        for c := 0 to EDim - 1 do
+          Latent.FData[Pos * EDim + c] := FCodebook.FData[EBase + c];
+      end;
+    FDecoder.Compute(Latent);
+    OutImage.Copy(FDecoder.GetLastLayer().Output);
+  finally
+    Latent.Free;
+  end;
+end;
+
+function BuildVqModel(Reader: TNNetSafeTensorsReader;
+  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNetVqModel;
+var
+  Enc, Dec: TNNet;
+  Codebook: TNNetVolume;
+begin
+  Enc := nil; Dec := nil; Codebook := nil;
+  try
+    Enc := BuildVqEncoderNet(Reader, Config, pInferenceOnly);
+    Dec := BuildVqDecoderNet(Reader, Config, pInferenceOnly);
+    Codebook := ReadVqCodebook(Reader, Config);
+    Result := TNNetVqModel.Create(Enc, Dec, Codebook, Config);
+  except
+    Enc.Free; Dec.Free; Codebook.Free;
+    raise;
+  end;
+end;
+
+function BuildVqModelFromSafeTensorsEx(const FileName: string;
+  const Config: TVqModelConfig; pInferenceOnly: boolean = false): TNNetVqModel;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildVqModel(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildVqModelFromSafeTensors(const FileName: string;
+  out Config: TVqModelConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNetVqModel;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadVqModelConfigFromJSONFile(ConfigPath);
+  Result := BuildVqModelFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

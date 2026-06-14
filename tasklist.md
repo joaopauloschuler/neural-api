@@ -371,7 +371,12 @@ rather than acted on.
       thin example head, NOT a new leaf class). Isola et al. 2017; foundational
       conditional-generation recipe distinct from the unconditional VisualGAN and the
       diffusion examples. Edit examples/README.md.
-- [ ] VQGAN / pretrained discrete image-tokenizer importer
+- [X] VQGAN / pretrained discrete image-tokenizer importer LANDED
+      (BuildVqModelFromSafeTensors + TNNetVqModel.EncodeImageToTokens /
+      DecodeTokensToImage; reuses the VAE encoder/decoder helpers, plain-Pascal
+      argmin-L2 codebook lookup + gather, no new TNNet* layer; pico fixture
+      tools/vqmodel_tiny_fixture.py + TestVqModel{Encode,Decode,RoundTrip}Parity
+      exact-id encode / <1e-4 decode; examples/VQModelImport demo)
       (BuildVqModelFromSafeTensors, diffusers VQModel / taming-transformers VQGAN) —
       the repo TRAINS a VQ-VAE (examples/VQVAE) but cannot IMPORT a pretrained
       discrete image tokenizer, the encoder used by most autoregressive / masked
