@@ -360,6 +360,81 @@ rather than acted on.
   - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
         installable; SDXL VAE uses different group counts / multi-head attention.
   - [ ] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).
+- [ ] Segment Anything (SAM) image-encoder + mask-decoder importer
+      (facebook/sam-vit-base) — first PROMPTABLE-segmentation importer, a new
+      output modality (dense binary masks, not class logits or embeddings).
+      Two pieces: (a) the ViT-H/L/B image encoder (windowed attention + a few
+      global-attention blocks + the neck 1x1+3x3 conv to a 256-ch image
+      embedding) reusing the landed BuildClipVisionTower ViT path; (b) the
+      lightweight two-way mask decoder (point/box prompt embeddings -> a couple
+      of cross-attention blocks -> upscaled mask). Scope v1 to a single point
+      prompt + single mask output to keep the decoder small. Pico parity vs HF
+      float64 on the encoder embedding first (decoder is the stretch); demo:
+      examples/SegmentAnything segments an object from one click on a tiny image.
+- [ ] Monocular depth importer (DPT / Depth-Anything, e.g. Intel/dpt-hybrid-midas
+      or depth-anything/Depth-Anything-V2-Small) — first DENSE-REGRESSION vision
+      importer (per-pixel depth, not classification). ViT/DINOv2 backbone (both
+      already importable) + the DPT reassemble/fusion neck (4 hooked stages ->
+      transpose-conv resample -> RefineNet-style additive fusion -> head). Reuses
+      the ViT encoder path; the new code is the convolutional fusion decoder.
+      Pico parity vs HF float64 + a real-image relative-depth sanity check;
+      demo: examples/DepthEstimation writes a depth map for one CPU image.
+- [ ] Swin Transformer importer (microsoft/swin-tiny-patch4-window7-224) —
+      hierarchical shifted-window ViT, structurally distinct from the plain ViT
+      / DINOv2 / SigLIP towers already landed (patch-merging downsampling +
+      window partition + the cyclic-shift mask + relative-position-bias table).
+      Needs a window-partition/reverse helper and the shifted-window attention
+      mask; relative position bias maps onto an additive-bias attention path.
+      Pico parity vs HF float64 producing ImageNet-1k logits; reuses the vision
+      preprocessing helper. Hierarchical backbone also unblocks SegFormer/DETR.
+- [ ] MobileNetV3 / EfficientNet importer (timm/torchvision) — the efficient
+      mobile-CNN family, structurally distinct from the landed ResNet importer:
+      inverted-residual MBConv blocks (expand 1x1 -> depthwise -> squeeze-excite
+      -> project 1x1, no ReLU after project) + hard-swish/SiLU activations + SE
+      gating (TNNetChannelMul already exists). conv-BN fold reuses the ResNet
+      loader path. Pico parity vs a numpy float64 oracle producing ImageNet-1k
+      logits; depthwise conv groups must map onto the existing grouped/separable
+      conv layers (verify the channel-grouping math first).
+- [ ] Real-ESRGAN / ESRGAN super-resolution model importer (RRDBNet,
+      xinntao/Real-ESRGAN x4) — first IMPORTED generative-image model that runs
+      end-to-end on CPU (no diffusion loop): Residual-in-Residual Dense Blocks
+      (RDB = 5 conv layers with dense skip + residual scaling 0.2) + pixel-shuffle
+      upsampling (TNNetUpsample is already pixel-shuffle). Pure-conv, fully
+      reuse-only; pico parity vs a numpy float64 oracle, then a real x4 upscale
+      of a tiny image. Complements the from-scratch SubPixelSuperRes/SuperResolution
+      training examples with a pretrained-weight inference path.
+- [ ] Class-conditional DiffusionMNIST follow-up: classifier-free guidance (CFG)
+      + DDIM deterministic fast sampler. Extends the landed unconditional DDPM
+      example — (a) condition the U-Net on a digit label embedding added to the
+      sinusoidal time embedding, trained with label-dropout (~10%) for the
+      unconditional branch; (b) sample with CFG (eps = eps_uncond + s*(eps_cond -
+      eps_uncond)); (c) add a DDIM sampler (deterministic, 10-50 steps vs the
+      1000-step ancestral loop). Deliverable: generate a chosen digit on demand,
+      far fewer sampling steps. Opens latent-diffusion (reuse the SD VAE) next.
+- [ ] Flow Matching / Rectified Flow generative example (examples/FlowMatching)
+      — the modern ODE/transport alternative to DDPM: train a velocity field
+      v_theta(x_t, t) to match (x1 - x0) along straight interpolation paths
+      x_t = (1-t)x0 + t*x1, then sample by Euler-integrating the ODE from noise.
+      Reuses the DiffusionMNIST U-Net + sinusoidal time embedding; the only new
+      code is the linear-interpolant loss and the ODE integrator (no noise
+      schedule, far fewer sampling steps than DDPM). A clean, self-contained
+      generative example distinct from the score/DDPM formulation.
+- [ ] VQ-VAE discrete image autoencoder + autoregressive prior example
+      (examples/VQVAE) — goes beyond the existing VQCodebookUsage/Collapse
+      DIAGNOSTIC examples: train a full encoder -> vector-quantizer -> decoder to
+      reconstruct MNIST/CIFAR into a grid of discrete codebook indices (commitment
+      loss + straight-through estimator), then fit a small autoregressive prior
+      (the landed TinyGPT/decoder stack) over the index grid to GENERATE new
+      images by sampling tokens and decoding. First discrete-latent generative
+      pipeline; precursor to VQGAN/MaskGIT.
+- [ ] Next-frame video prediction example (examples/VideoPrediction, Moving-MNIST)
+      — fills the VIDEO gap (the repo has no spatiotemporal example). A
+      ConvLSTM-style recurrent encoder-decoder that watches N frames and predicts
+      the next K. If a convolutional recurrent cell does not yet exist, add a
+      minimal TNNetConvLSTMCell (conv gates over a (H,W,C) state, analogous to
+      the landed TNNetMinLSTM but with conv instead of dense gates and a spatial
+      cell state); otherwise compose from existing conv + gating layers. Generates
+      a short MNIST-digit-trajectory rollout on CPU.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
