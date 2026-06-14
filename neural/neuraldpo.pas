@@ -52,6 +52,45 @@ softmax distribution y. Since d log y_target / d logit_i = (onehot_i - y_i),
 i.e. the standard scaled cross-entropy (softmax - onehot) gradient with a
 positive sign on chosen and a negative sign on rejected tokens.
 
+LOSS-FORMULA SIBLINGS (select with TNeuralDPOTrainer.LossMode)
+--------------------------------------------------------------------------
+The same per-token softmax-backward plumbing drives three additional
+preference losses; they differ only in the scalar loss and the
+per-completion log-prob gradient ErrScale = dLoss/d(sumlogp):
+
+ * plmSimPO (Meng et al. 2024, https://arxiv.org/abs/2405.14734) -
+   REFERENCE-FREE. The implicit reward is the LENGTH-NORMALIZED average
+   log-prob: r(y) = (beta/|y|) sum logp(y). With a target margin gamma,
+     loss = -ln sigmoid( r(y_w) - r(y_l) - gamma ).
+   ErrScale_chosen = -s*beta/|y_w|, ErrScale_rejected = +s*beta/|y_l|,
+   s = sigmoid(-(r_w - r_l - gamma)). No reference net needed.
+
+ * plmORPO (Hong et al. 2024, https://arxiv.org/abs/2403.07691) -
+   REFERENCE-FREE. L = L_SFT(chosen) + lambda * L_OR, where
+     L_SFT = -(1/|y_w|) sum logp(y_w)  (length-normalized NLL), and
+     L_OR  = -ln sigmoid( log_odds(y_w) - log_odds(y_l) ),
+   with log_odds(y) = L_n(y) - ln(1 - exp(L_n(y))) computed from the
+   length-normalized log-prob L_n(y) = (1/|y|) sum logp(y) (the ln(1-exp)
+   denominator uses a numerically stable StableLog1mExp).
+   d log_odds/d L_n = 1/(1 - exp(L_n)) = 1/(1 - P), so
+     ErrScale_chosen   = -1/|y_w| + lambda*(-s_or)/((1-P_w)|y_w|),
+     ErrScale_rejected = lambda*(+s_or)/((1-P_l)|y_l|).
+
+ * plmKTO (Ethayarajh et al. 2024, https://arxiv.org/abs/2402.01306) -
+   REFERENCE-based, Kahneman-Tversky value function. THIS UNIT IMPLEMENTS
+   THE PAIRED-BATCH SIMPLIFICATION: the chosen completion is treated as one
+   DESIRABLE example and the rejected as one UNDESIRABLE example. The
+   implicit reward is r = sumlogp_policy - sumlogp_ref; the KL reference
+   point z0 (full KTO: the batch-mean implicit reward, detached) is here the
+   detached pair-mean z0 = mean(r_w, r_l). With desirable/undesirable
+   weights w_d/w_u,
+     L = w_d*(1 - sigmoid(beta(r_w - z0))) + w_u*(1 - sigmoid(beta(z0 - r_l))).
+   DELTA vs full KTO: full KTO estimates z0 over an independently-shuffled
+   minibatch of UNPAIRED examples (so the desirable/undesirable counts need
+   not match); the paired form reuses the pair as its own KL batch. The
+   value-function shape, the detached KL point, and the per-class weighting
+   are faithful. A full unpaired-batch KTO trainer is left as a follow-up.
+
 This codebase's networks end in a softmax LAYER (probabilities, not
 logits), and TNNet.Backpropagate(pDesired) forms the output error as
 (Output - pDesired) ON THE SOFTMAX OUTPUT, which the softmax layer then
@@ -115,7 +154,19 @@ uses
 type
   TNeuralDPOTokenArray = array of integer;
 
-  /// Trainer-level helper implementing the DPO update for next-token LMs.
+  // Preference loss formula selected on TNeuralDPOTrainer.
+  //   plmDPO   : Direct Preference Optimization (reference model REQUIRED).
+  //   plmSimPO : Simple Preference Optimization (reference-FREE; Meng 2024).
+  //   plmORPO  : Odds-Ratio Preference Optimization (reference-FREE; Hong 2024).
+  //   plmKTO   : Kahneman-Tversky Optimization (reference model REQUIRED;
+  //              paired-batch simplification - see the unit header).
+  TNeuralPreferenceLossMode = (plmDPO, plmSimPO, plmORPO, plmKTO);
+
+  /// Trainer-level helper implementing DPO and its reference-free / unpaired
+  /// loss-formula siblings (SimPO, ORPO, KTO) for next-token LMs. All four
+  /// modes share the same per-token softmax-backward plumbing; they differ
+  /// only in how the scalar loss and the per-completion log-prob gradient
+  /// scale (ErrScale) are computed. Select with the LossMode property.
   // Coded by Claude (AI).
   TNeuralDPOTrainer = class(TObject)
     private
@@ -125,13 +176,24 @@ type
       FBeta: TNeuralFloat;
       FProbFloor: TNeuralFloat;
       FSkipDerivSoftmax: boolean;
+      FLossMode: TNeuralPreferenceLossMode;
+      FSimPOGamma: TNeuralFloat;       // SimPO target reward margin gamma
+      FORPOLambda: TNeuralFloat;       // ORPO weight on the odds-ratio term
+      FKTODesirableWeight: TNeuralFloat;
+      FKTOUndesirableWeight: TNeuralFloat;
       FLastLoss: TNeuralFloat;
       FLastMargin: TNeuralFloat;
       FLastScale: TNeuralFloat;
       FLastPolicyChosen, FLastPolicyRejected: TNeuralFloat;
       FLastRefChosen, FLastRefRejected: TNeuralFloat;
+      FLastErrScaleChosen, FLastErrScaleRejected: TNeuralFloat;
       FInput: TNNetVolume;
       FPseudoTarget: TNNetVolume;
+      // Computes the scalar loss, refreshes Last* diagnostics, and returns the
+      // per-completion log-prob gradient ErrScale = dLoss/d(sumlogp) for the
+      // chosen and rejected completions, dispatched on FLossMode.
+      function EvalLoss(const Prompt, Chosen, Rejected: array of integer;
+        out ErrChosen, ErrRejected: TNeuralFloat): TNeuralFloat;
       // Concatenates prompt + completion[0..UpToTokenCount-1], keeps the most
       // recent ContextLen tokens and one-hot encodes them into FInput.
       procedure EncodePrefix(NN: TNNet;
@@ -149,6 +211,11 @@ type
       // Clones the policy into an owned, frozen reference net.
       constructor CreateWithClonedReference(pPolicy: TNNet;
         pBeta: TNeuralFloat = 0.5);
+      // Reference-FREE trainer (no reference net): valid only for plmSimPO and
+      // plmORPO. Sets LossMode to pLossMode (defaults to SimPO).
+      constructor CreateReferenceFree(pPolicy: TNNet;
+        pLossMode: TNeuralPreferenceLossMode = plmSimPO;
+        pBeta: TNeuralFloat = 2.0);
       destructor Destroy(); override;
 
       // Summed log-probability of Completion given Prompt under NN
@@ -175,11 +242,25 @@ type
 
       property Beta: TNeuralFloat read FBeta write FBeta;
       property ProbFloor: TNeuralFloat read FProbFloor write FProbFloor;
+      // Loss formula. plmDPO and plmKTO need a reference net; plmSimPO and
+      // plmORPO are reference-free (Reference may be nil for those modes).
+      property LossMode: TNeuralPreferenceLossMode
+        read FLossMode write FLossMode;
+      property SimPOGamma: TNeuralFloat read FSimPOGamma write FSimPOGamma;
+      property ORPOLambda: TNeuralFloat read FORPOLambda write FORPOLambda;
+      property KTODesirableWeight: TNeuralFloat
+        read FKTODesirableWeight write FKTODesirableWeight;
+      property KTOUndesirableWeight: TNeuralFloat
+        read FKTOUndesirableWeight write FKTOUndesirableWeight;
       property Policy: TNNet read FPolicy;
       property Reference: TNNet read FReference;
       property LastLoss: TNeuralFloat read FLastLoss;
       property LastMargin: TNeuralFloat read FLastMargin;
       property LastScale: TNeuralFloat read FLastScale;
+      // Per-completion log-prob gradients of the LAST loss evaluation
+      // (dLoss/d(sumlogp(chosen)) and dLoss/d(sumlogp(rejected))).
+      property LastErrScaleChosen: TNeuralFloat read FLastErrScaleChosen;
+      property LastErrScaleRejected: TNeuralFloat read FLastErrScaleRejected;
       property LastPolicyChosenLogProb: TNeuralFloat read FLastPolicyChosen;
       property LastPolicyRejectedLogProb: TNeuralFloat read FLastPolicyRejected;
       property LastRefChosenLogProb: TNeuralFloat read FLastRefChosen;
@@ -330,6 +411,25 @@ begin
   else Result := Exp(X) / (1 + Exp(X));
 end;
 
+// exp(X)-1 (FPC has no Expm1). Series for |X| small to avoid cancellation.
+function Expm1Approx(X: TNeuralFloat): TNeuralFloat;
+begin
+  if Abs(X) < 1e-5
+  then Result := X * (1 + 0.5 * X)        // 1st-order series, exact enough
+  else Result := Exp(X) - 1;
+end;
+
+// Numerically stable ln(1 - exp(X)) for X < 0 (Maechler 2012). Used for the
+// log-odds denominator log(1 - P) with P = exp(X), X = length-normalized
+// log-prob in (-inf, 0]. Returns a large negative number as X -> 0- (P -> 1).
+function StableLog1mExp(X: TNeuralFloat): TNeuralFloat;
+begin
+  if X >= 0 then begin Result := -700; Exit; end;          // P>=1: clamp
+  // LnXP1(t) = ln(1+t); with t = -exp(X) this is ln(1 - exp(X)) and stays
+  // accurate for all X < 0 (FPC has no Expm1).
+  Result := LnXP1(-Exp(X));
+end;
+
 { TNeuralDPOTrainer }
 
 constructor TNeuralDPOTrainer.Create(pPolicy, pReference: TNNet;
@@ -341,9 +441,15 @@ begin
   FOwnsReference := pOwnsReference;
   FBeta := pBeta;
   FProbFloor := 1e-9;
+  FLossMode := plmDPO;
+  FSimPOGamma := 0.5;
+  FORPOLambda := 0.1;
+  FKTODesirableWeight := 1.0;
+  FKTOUndesirableWeight := 1.0;
   FLastLoss := 0; FLastMargin := 0; FLastScale := 0.5;
   FLastPolicyChosen := 0; FLastPolicyRejected := 0;
   FLastRefChosen := 0; FLastRefRejected := 0;
+  FLastErrScaleChosen := 0; FLastErrScaleRejected := 0;
   FInput := TNNetVolume.Create();
   FPseudoTarget := TNNetVolume.Create();
   DetectSoftmaxVariant();
@@ -353,6 +459,15 @@ constructor TNeuralDPOTrainer.CreateWithClonedReference(pPolicy: TNNet;
   pBeta: TNeuralFloat);
 begin
   Create(pPolicy, pPolicy.Clone(), pBeta, {pOwnsReference=}true);
+end;
+
+constructor TNeuralDPOTrainer.CreateReferenceFree(pPolicy: TNNet;
+  pLossMode: TNeuralPreferenceLossMode; pBeta: TNeuralFloat);
+begin
+  if not (pLossMode in [plmSimPO, plmORPO]) then
+    raise Exception.Create('CreateReferenceFree supports only plmSimPO/plmORPO.');
+  Create(pPolicy, {pReference=}nil, pBeta, {pOwnsReference=}false);
+  FLossMode := pLossMode;
 end;
 
 destructor TNeuralDPOTrainer.Destroy();
@@ -429,21 +544,122 @@ begin
   end;
 end;
 
+function TNeuralDPOTrainer.EvalLoss(
+  const Prompt, Chosen, Rejected: array of integer;
+  out ErrChosen, ErrRejected: TNeuralFloat): TNeuralFloat;
+var
+  Z, S: TNeuralFloat;
+  LenW, LenL: integer;
+  RewW, RewL, NormW, NormL: TNeuralFloat;
+  LogOddsW, LogOddsL, DOdds, SOr, InvOmpW, InvOmpL: TNeuralFloat;
+  RW, RL, Z0, AW, AL, SigW, SigL: TNeuralFloat;
+begin
+  if (FLossMode in [plmDPO, plmKTO]) and (FReference = nil) then
+    raise Exception.Create('TNeuralDPOTrainer: this loss mode requires a ' +
+      'reference net (use a DPO/KTO constructor with a reference).');
+  LenW := Max(1, Length(Chosen));
+  LenL := Max(1, Length(Rejected));
+  FLastPolicyChosen   := SequenceLogProb(FPolicy, Prompt, Chosen);
+  FLastPolicyRejected := SequenceLogProb(FPolicy, Prompt, Rejected);
+  if FReference <> nil then
+  begin
+    FLastRefChosen   := SequenceLogProb(FReference, Prompt, Chosen);
+    FLastRefRejected := SequenceLogProb(FReference, Prompt, Rejected);
+  end
+  else begin FLastRefChosen := 0; FLastRefRejected := 0; end;
+
+  case FLossMode of
+    plmDPO:
+      begin
+        FLastMargin := (FLastPolicyChosen - FLastRefChosen)
+                     - (FLastPolicyRejected - FLastRefRejected);
+        Z := FBeta * FLastMargin;
+        FLastLoss := StableSoftplus(-Z);     // -ln sigmoid(z)
+        S := StableSigmoid(-Z);              // s
+        FLastScale := S;
+        // dLoss/d sumlogp(chosen) = -s*beta ; rejected = +s*beta.
+        ErrChosen   := -S * FBeta;
+        ErrRejected := +S * FBeta;
+      end;
+
+    plmSimPO:
+      begin
+        // Reference-FREE. Implicit reward = (beta/|y|) * sumlogp(y).
+        RewW := (FBeta / LenW) * FLastPolicyChosen;
+        RewL := (FBeta / LenL) * FLastPolicyRejected;
+        FLastMargin := RewW - RewL - FSimPOGamma;
+        FLastLoss := StableSoftplus(-FLastMargin);   // -ln sigmoid(margin)
+        S := StableSigmoid(-FLastMargin);
+        FLastScale := S;
+        // dLoss/dmargin = -s ; dmargin/dsumlogp(chosen) = beta/|y_w|.
+        ErrChosen   := -S * (FBeta / LenW);
+        ErrRejected := +S * (FBeta / LenL);
+      end;
+
+    plmORPO:
+      begin
+        // Reference-FREE. L = L_SFT(chosen) + lambda * L_OR.
+        NormW := FLastPolicyChosen / LenW;            // length-normalized logp
+        NormL := FLastPolicyRejected / LenL;
+        // log odds(y) = L_n(y) - ln(1 - exp(L_n(y))).
+        LogOddsW := NormW - StableLog1mExp(NormW);
+        LogOddsL := NormL - StableLog1mExp(NormL);
+        DOdds := LogOddsW - LogOddsL;
+        SOr := StableSigmoid(-DOdds);                 // gradient scale of L_OR
+        FLastMargin := DOdds;
+        FLastScale := SOr;
+        // L_SFT = -(1/|y_w|) sumlogp(y_w) ; L_OR = -ln sigmoid(DOdds).
+        FLastLoss := -(FLastPolicyChosen / LenW)
+                   + FORPOLambda * StableSoftplus(-DOdds);
+        // d log_odds(y)/d L_n(y) = 1/(1 - exp(L_n)) = 1/(1 - P).
+        InvOmpW := 1.0 / Max(1e-9, -Expm1Approx(NormW));
+        InvOmpL := 1.0 / Max(1e-9, -Expm1Approx(NormL));
+        // dL/dsumlogp(chosen) = -1/|y_w|  (SFT)
+        //   + lambda * (-s_or) * (1/(1-P_w)) * (1/|y_w|)  (OR).
+        ErrChosen := (-1.0 / LenW)
+                   + FORPOLambda * (-SOr) * InvOmpW * (1.0 / LenW);
+        ErrRejected := FORPOLambda * (+SOr) * InvOmpL * (1.0 / LenL);
+      end;
+
+    plmKTO:
+      begin
+        // Reference-based, paired-batch simplification (see unit header):
+        // chosen = one DESIRABLE example, rejected = one UNDESIRABLE example.
+        // Implicit reward r = sumlogp_policy - sumlogp_ref. The KL reference
+        // point z0 is the (detached) batch-mean reward; in the paired
+        // simplification z0 = mean(r_w, r_l).
+        RW := FLastPolicyChosen   - FLastRefChosen;
+        RL := FLastPolicyRejected - FLastRefRejected;
+        Z0 := 0.5 * (RW + RL);                        // detached below
+        AW := FBeta * (RW - Z0);
+        AL := FBeta * (Z0 - RL);
+        SigW := StableSigmoid(AW);
+        SigL := StableSigmoid(AL);
+        FLastMargin := RW - RL;
+        FLastScale := 0.5 * (SigW + SigL);
+        // L = w_d*(1 - sigmoid(beta(r_w - z0))) + w_u*(1 - sigmoid(beta(z0 - r_l))).
+        FLastLoss := FKTODesirableWeight * (1 - SigW)
+                   + FKTOUndesirableWeight * (1 - SigL);
+        // z0 detached -> dr_w-only and dr_l-only derivatives:
+        //   dL/dr_w = -w_d*beta*SigW*(1-SigW); dr_w/dsumlogp(chosen) = 1.
+        //   dL/dr_l = +w_u*beta*SigL*(1-SigL); dr_l/dsumlogp(rejected) = 1.
+        ErrChosen   := -FKTODesirableWeight   * FBeta * SigW * (1 - SigW);
+        ErrRejected := +FKTOUndesirableWeight * FBeta * SigL * (1 - SigL);
+      end;
+  else
+    raise Exception.Create('TNeuralDPOTrainer: unknown loss mode.');
+  end;
+  FLastErrScaleChosen := ErrChosen;
+  FLastErrScaleRejected := ErrRejected;
+  Result := FLastLoss;
+end;
+
 function TNeuralDPOTrainer.ComputeLoss(
   const Prompt, Chosen, Rejected: array of integer): TNeuralFloat;
 var
-  Z: TNeuralFloat;
+  ErrChosen, ErrRejected: TNeuralFloat;
 begin
-  FLastPolicyChosen   := SequenceLogProb(FPolicy,    Prompt, Chosen);
-  FLastPolicyRejected := SequenceLogProb(FPolicy,    Prompt, Rejected);
-  FLastRefChosen      := SequenceLogProb(FReference, Prompt, Chosen);
-  FLastRefRejected    := SequenceLogProb(FReference, Prompt, Rejected);
-  FLastMargin := (FLastPolicyChosen - FLastRefChosen)
-               - (FLastPolicyRejected - FLastRefRejected);
-  Z := FBeta * FLastMargin;
-  FLastLoss := StableSoftplus(-Z);   // -ln sigmoid(z) = softplus(-z)
-  FLastScale := StableSigmoid(-Z);   // gradient scale s
-  Result := FLastLoss;
+  Result := EvalLoss(Prompt, Chosen, Rejected, ErrChosen, ErrRejected);
 end;
 
 procedure TNeuralDPOTrainer.BackpropagateCompletion(
@@ -484,14 +700,16 @@ end;
 function TNeuralDPOTrainer.AccumulateGradients(
   const Prompt, Chosen, Rejected: array of integer): TNeuralFloat;
 var
-  ErrScale: TNeuralFloat;
+  ErrChosen, ErrRejected: TNeuralFloat;
 begin
-  Result := ComputeLoss(Prompt, Chosen, Rejected);
-  ErrScale := FLastScale * FBeta;
-  // dL/dlogit = +s*beta*(y - onehot) on chosen tokens (BackpropagateCompletion
-  // produces -ErrScale*(y - onehot)) and the opposite sign on rejected ones.
-  BackpropagateCompletion(Prompt, Chosen,   -ErrScale);
-  BackpropagateCompletion(Prompt, Rejected, +ErrScale);
+  Result := EvalLoss(Prompt, Chosen, Rejected, ErrChosen, ErrRejected);
+  // ErrChosen/ErrRejected = dLoss/d(sumlogp). Since d(sumlogp)/dlogit =
+  // (onehot - y), dLoss/dlogit = ErrScale*(onehot - y) = -ErrScale*(y-onehot),
+  // and BackpropagateCompletion(arg) emits exactly -arg*(y-onehot); pass the
+  // log-prob gradient directly. (For plain DPO this reduces to the previous
+  // -s*beta / +s*beta calls.)
+  BackpropagateCompletion(Prompt, Chosen,   ErrChosen);
+  BackpropagateCompletion(Prompt, Rejected, ErrRejected);
 end;
 
 function TNeuralDPOTrainer.Step(

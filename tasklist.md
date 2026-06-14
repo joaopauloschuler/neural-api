@@ -565,9 +565,13 @@ rather than acted on.
 - [ ] Preference-optimization follow-ups on the landed DPO/GRPO trainers
       (TNeuralGRPOTrainer in neural/neuraldpo.pas LANDED: group-relative
       advantages + PG + DeepSeek-k3 per-token KL reusing the DPO softmax-backward
-      plumbing, tests in tests/TestNeuralGRPO.pas): ORPO / SimPO / KTO
-      loss-formula deltas on the landed DPO trainer, and a Bradley-Terry pairwise
-      reward-model trainer to feed GRPO real (learned) rewards.
+      plumbing, tests in tests/TestNeuralGRPO.pas). ORPO / SimPO / KTO
+      loss-formula deltas LANDED on TNeuralDPOTrainer as a TNeuralPreferenceLossMode
+      (plmSimPO/plmORPO are reference-free via CreateReferenceFree; plmKTO uses a
+      reference, paired-batch simplification documented in the unit header), tests
+      in tests/TestNeuralPreference.pas. REMAINING: a Bradley-Terry pairwise
+      reward-model trainer to feed GRPO real (learned) rewards; and a full
+      unpaired-batch KTO variant (current KTO uses the paired pair-mean KL point).
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (the rebuild-same-
       architecture-at-a-new-width idiom this list already notes near the
