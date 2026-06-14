@@ -99,6 +99,24 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] InternLM2 / InternLM2.5 importer (`BuildInternLM2FromSafeTensors[Ex]`,
+      model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — a current,
+      widely-used Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONE
+      genuinely new piece is the fused `attention.wqkv` packing, which is NOT the
+      contiguous Q|K|V thirds (ModernBERT/BERT slabs) NOR the GPT-NeoX per-head
+      interleaved qkv any existing slicer handles: InternLM2 reshapes wqkv as
+      `[num_kv_heads, (q_per_kv + 2), head_dim, hidden]` and concatenates each
+      KV-group's `q_per_kv` query slices followed by its single K then single V
+      slice — so unpacking to the standard separate W_q/W_k/W_v needs a new
+      group-interleaved slicer (rows reordered so all Q heads precede all K then
+      all V, then the usual rotate_half q/k de-permute for RoPE). The rest rides
+      the landed Llama path: `wo`/`w1`(gate)/`w2`(down)/`w3`(up) names map onto
+      the existing SwiGLU separate-projection loader, `attention_norm`/`ffn_norm`
+      are the standard pre-norms, and the tokenizer is a SentencePiece `.model`
+      (already supported). Pico parity fixture via the make_pico_*_fixture.py
+      recipe asserting next-token logits < 1e-4 vs float64 HF
+      InternLM2ForCausalLM, plus a TLlamaConfig-style round-trip. Reuses
+      everything except the wqkv group slicer; no new layer class.
 - [ ] IBM Granite 3.x importer follow-ups (`BuildGraniteFromSafeTensors[Ex]`
       LANDED, model_type `granite`/`granitemoe`; four multipliers folded at
       load on the Llama path — embedding/residual/attention multipliers + a
