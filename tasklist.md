@@ -291,6 +291,38 @@ rather than acted on.
         ChatML-with-image) in neuralchat.pas + examples/LlavaDescribe demo that
         captions a small image on CPU (ulimit-bounded). Edit examples/README.md
         (NOT the main README) for the new example.
+- [ ] SigLIP image-text dual-encoder importer (model_type "siglip" /
+      "siglip2"; google/siglip-base-patch16-224, siglip-so400m-patch14-384).
+      SigLIP is the de-facto vision tower of modern open VLMs (PaliGemma,
+      SmolVLM, Idefics2/3, many LLaVA-Next variants), so this is the import
+      that actually unblocks the open LLaVA/VLM tasks above with a
+      production-grade tower — the landed CLIP importer (BuildClipFromSafeTensors,
+      BuildClipVisionTower) is the scaffolding, but SigLIP is architecturally
+      DISTINCT and must NOT be force-fit onto the CLIP path:
+        (a) loss/head: SigLIP uses a sigmoid pairwise loss with a learnable
+            logit_scale AND logit_bias (CLIP has scale only, softmax CE) — for
+            inference both reduce to a fold, but the bias must be loaded;
+        (b) pooling: the text tower has NO causal mask (bidirectional) and
+            pools the LAST token's hidden state through a final head LINEAR
+            (text_model.head) — NOT CLIP's eos-argmax; the vision tower pools
+            via a Multihead Attention Pooling head (MAP: a single learnable
+            probe query attends over patch tokens, then LayerNorm+MLP) rather
+            than a CLS token — needs a small attention-pooling builder (in-repo
+            precedent: TNNetAttentionPooling / AddAttentionPooling, PMA);
+        (c) activations: MLP uses gelu_pytorch_tanh (tanh-approx GELU), not
+            CLIP's quick_gelu;
+        (d) patch embedding: learned absolute position embeddings, NO class
+            token folded into row 0 (unlike the CLIP class-token-into-pos-row-0
+            fold), prenorm encoder with a final post-LayerNorm.
+      Deliverables: ReadSigLIPConfigFromJSONFile + TSigLIPConfig, two nets
+      (vision + text) via a reusable BuildSigLIPVisionTower (consumable by the
+      VLM tasks, with a skip-pooling/select-hidden-layer mode like LLaVA needs),
+      a pico parity fixture (make_pico_*_fixture.py recipe) asserting both
+      image and text embeddings AND the image/text logit matrix vs HF float64
+      < 1e-4, and an examples/SigLIPZeroShot zero-shot classification demo
+      (edit examples/README.md, not the main README). siglip2 adds a NaFlex/
+      variable-resolution variant — scope v1 to the fixed-resolution
+      siglip/siglip2 base configs and list NaFlex as an explicit follow-up.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
