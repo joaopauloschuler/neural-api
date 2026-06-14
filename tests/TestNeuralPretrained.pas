@@ -265,6 +265,7 @@ type
     procedure TestHubertCTCParity;
     procedure TestClipConfigFromJSONFile;
     procedure TestClipParity;
+    procedure TestClipScore;
     procedure TestClipVisionFeatures;
     procedure TestClipImagePreprocess;
     procedure TestSigLIPConfigFromJSONFile;
@@ -12036,6 +12037,128 @@ begin
     RefRoot.Free;
     ImageEmb.Free;
     TextEmb.Free;
+    ImageInput.Free;
+    TextInput.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    TextNet.Free;
+  end;
+end;
+
+// CLIPScore (Hessel et al. 2021) parity on the SAME tiny_clip pico fixture.
+// The torch float64 oracle ships ALREADY: tiny_clip_embeds.json's
+// logits_per_image = exp(logit_scale) * cosine(image, text), so the pure
+// cosine = logit / exp(logit_scale) and CLIPScore = max(0, 2.5 * cosine).
+// Asserts (a) the end-to-end ClipScore (runs both towers) reproduces that
+// oracle, (b) the mismatched prompt (sequence 0, NEGATIVE cosine) clips to
+// 0 while the better-matching prompt (sequence 1) scores higher, and (c)
+// RefClipScoreFromEmbeddings is the harmonic mean of the image-term
+// CLIPScore and the candidate<->reference cosine.
+procedure TTestNeuralPretrained.TestClipScore;
+var
+  TextNet, VisionNet: TNNet;
+  Config: TClipConfig;
+  RefRoot: TJSONData;
+  TextSeqs, Pixels, LogitsPerImage, RowArr, ChanArr, SeqArr: TJSONArray;
+  TextInput, ImageInput, ImageEmb, TextEmb0, TextEmb1: TNNetVolume;
+  RefJson: TStringList;
+  PosCnt, ChanCnt, YCnt, XCnt, EosPos: integer;
+  RefLogitScale, Cos0, Cos1, ExpScore0, ExpScore1: double;
+  ImageTerm, RefTerm, ExpRef: double;
+  Score0, Score1, RefScore: TNeuralFloat;
+const
+  SeqLen = 8;
+begin
+  RandSeed := 424242;
+  BuildClipFromSafeTensors(FixturePath('tiny_clip.safetensors'),
+    TextNet, VisionNet, Config, {TextSeqLen=}SeqLen,
+    {pInferenceOnly=}false, FixturePath('tiny_clip_config.json'));
+  RefJson := TStringList.Create;
+  TextInput := TNNetVolume.Create;
+  ImageInput := TNNetVolume.Create;
+  ImageEmb := TNNetVolume.Create;
+  TextEmb0 := TNNetVolume.Create;
+  TextEmb1 := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_clip_embeds.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    TextSeqs := TJSONArray(TJSONObject(RefRoot).Find('text_sequences'));
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsPerImage :=
+      TJSONArray(TJSONObject(RefRoot).Find('logits_per_image'));
+    RefLogitScale := TJSONObject(RefRoot).Get('logit_scale', 0.0);
+    // Pure cosines from the float64 oracle: cos = logit / exp(logit_scale).
+    Cos0 := TJSONArray(LogitsPerImage.Items[0]).Items[0].AsFloat /
+      Exp(RefLogitScale);
+    Cos1 := TJSONArray(LogitsPerImage.Items[0]).Items[1].AsFloat /
+      Exp(RefLogitScale);
+    ExpScore0 := 2.5 * Cos0;
+    if ExpScore0 < 0 then ExpScore0 := 0;
+    ExpScore1 := 2.5 * Cos1;
+    if ExpScore1 < 0 then ExpScore1 := 0;
+
+    // Build the CLIP-preprocessed image volume (fixture (chan,H,W) layout).
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+
+    // Sequence 0 = the MISMATCHED prompt (negative oracle cosine), 1 better.
+    TextInput.ReSize(SeqLen, 1, 1);
+    SeqArr := TJSONArray(TextSeqs.Items[0]);
+    for PosCnt := 0 to SeqLen - 1 do
+      TextInput.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+    Score0 := ClipScore(TextNet, VisionNet, ImageInput, TextInput,
+      Config.EosTokenId);
+    // Capture the unit-L2 embeddings for the RefCLIPScore check too.
+    ClipExtractEmbedding(VisionNet.GetLastLayer().Output, 0, ImageEmb);
+    EosPos := ClipTextEosPosition(TextInput, Config.EosTokenId);
+    ClipExtractEmbedding(TextNet.GetLastLayer().Output, EosPos, TextEmb0);
+
+    SeqArr := TJSONArray(TextSeqs.Items[1]);
+    for PosCnt := 0 to SeqLen - 1 do
+      TextInput.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+    Score1 := ClipScore(TextNet, VisionNet, ImageInput, TextInput,
+      Config.EosTokenId);
+    EosPos := ClipTextEosPosition(TextInput, Config.EosTokenId);
+    ClipExtractEmbedding(TextNet.GetLastLayer().Output, EosPos, TextEmb1);
+
+    AssertTrue('CLIPScore seq0 = ' + FloatToStr(Score0) + ' vs oracle ' +
+      FloatToStr(ExpScore0) + ' (< 1e-4)', Abs(Score0 - ExpScore0) < 1e-4);
+    AssertTrue('CLIPScore seq1 = ' + FloatToStr(Score1) + ' vs oracle ' +
+      FloatToStr(ExpScore1) + ' (< 1e-4)', Abs(Score1 - ExpScore1) < 1e-4);
+    // The mismatched prompt's negative cosine clips to exactly 0.
+    AssertEquals('mismatched prompt CLIPScore clips to 0', 0.0, Score0);
+    AssertTrue('better-matching prompt scores higher', Score1 > Score0);
+
+    // RefCLIPScore = harmonic mean of the (image, text1) CLIPScore and the
+    // (text1, text0-as-reference) cosine. Cross-check against the formula.
+    RefScore := RefClipScoreFromEmbeddings(ImageEmb, TextEmb1, TextEmb0);
+    ImageTerm := Score1;
+    RefTerm := ClipSimilarity(TextEmb1, TextEmb0);
+    if RefTerm < 0 then RefTerm := 0;
+    if (ImageTerm + RefTerm) > 0 then
+      ExpRef := 2 * ImageTerm * RefTerm / (ImageTerm + RefTerm)
+    else
+      ExpRef := 0;
+    AssertTrue('RefCLIPScore = ' + FloatToStr(RefScore) +
+      ' harmonic-mean ' + FloatToStr(ExpRef) + ' (< 1e-5)',
+      Abs(RefScore - ExpRef) < 1e-5);
+  finally
+    RefRoot.Free;
+    TextEmb1.Free;
+    TextEmb0.Free;
+    ImageEmb.Free;
     ImageInput.Free;
     TextInput.Free;
     RefJson.Free;

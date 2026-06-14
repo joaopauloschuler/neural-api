@@ -4633,6 +4633,46 @@ procedure ClipExtractEmbedding(NetOutput: TNNetVolume; TokenPos: integer;
 // ClipExtractEmbedding outputs (both are unit-L2).
 function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 
+// ---------------------------------------------------------------------------
+// CLIPScore (Hessel et al. 2021, "CLIPScore: A Reference-free Evaluation
+// Metric for Image Captioning"): the standard reference-free text<->image
+// alignment metric for text-to-image / captioning quality. Given a CLIP
+// IMAGE embedding and a CLIP TEXT embedding (BOTH unit-L2, i.e.
+// ClipExtractEmbedding outputs) it is w * max(0, cos(image, text)) with the
+// paper's w = 2.5 (chosen so the score's range tends to fall in [0, 1]).
+// Unlike the IMAGE-only FID / IS / KID it is a SEMANTIC score: how well a
+// generated image matches its prompt. The max(0, .) clips the (rare on real
+// CLIP) negative cosines to zero.
+// ---------------------------------------------------------------------------
+
+// CLIPScore from two pre-extracted unit-L2 embeddings (ClipExtractEmbedding
+// outputs - image row 0 of the vision net, text row ClipTextEosPosition of
+// the text net). Weight defaults to the paper's 2.5.
+function ClipScoreFromEmbeddings(ImageEmb, TextEmb: TNNetVolume;
+  Weight: TNeuralFloat = 2.5): TNeuralFloat;
+
+// CLIPScore end-to-end: runs ImageInput through VisionNet and TokenIds
+// through TextNet (the two nets BuildClipFromSafeTensors returns), pools +
+// L2-normalizes both (vision row 0, text row ClipTextEosPosition(TokenIds,
+// EosTokenId) - pass Config.EosTokenId, 2 for every published OpenAI CLIP)
+// and returns Weight * max(0, cosine). ImageInput is the CLIP-preprocessed
+// (image_size,image_size,num_channels) pixel volume; TokenIds is the
+// (SeqLen,1,1) text-net input. Both nets are Compute()d (forward only).
+function ClipScore(TextNet, VisionNet: TNNet; ImageInput, TokenIds: TNNetVolume;
+  EosTokenId: integer; Weight: TNeuralFloat = 2.5): TNeuralFloat;
+
+// RefCLIPScore (Hessel et al. 2021, sec. 4): the captioning variant that
+// folds in reference captions. It is the HARMONIC MEAN of the (image,
+// candidate-text) CLIPScore and the maximal (candidate-text, reference-text)
+// cosine clipped at 0 - rewarding captions that match BOTH the image and the
+// human references. All three arguments are unit-L2 embeddings; RefTextEmb is
+// the best-matching reference's embedding (the caller takes the max cosine
+// over the reference set before calling). Returns 0 when either term is 0
+// (the harmonic mean's natural value). Weight scales only the image term, as
+// in the paper (the reference cosine enters unweighted).
+function RefClipScoreFromEmbeddings(ImageEmb, TextEmb, RefTextEmb: TNNetVolume;
+  Weight: TNeuralFloat = 2.5): TNeuralFloat;
+
 // ===========================================================================
 // SigLIP IMPORT (model_type "siglip" / "siglip2": google/siglip-base-
 // patch16-224 and siblings) - a sigmoid-loss image-text dual encoder. It
@@ -30553,6 +30593,55 @@ begin
       IntToStr(EmbA.Size) + ' vs ' + IntToStr(EmbB.Size) + ').');
   for ChanCnt := 0 to EmbA.Size - 1 do
     Result := Result + EmbA.FData[ChanCnt] * EmbB.FData[ChanCnt];
+end;
+
+function ClipScoreFromEmbeddings(ImageEmb, TextEmb: TNNetVolume;
+  Weight: TNeuralFloat): TNeuralFloat;
+begin
+  // Both embeddings are unit-L2, so ClipSimilarity is the cosine; clip the
+  // negative tail at zero and scale by Weight (paper default 2.5).
+  Result := Weight * ClipSimilarity(ImageEmb, TextEmb);
+  if Result < 0 then Result := 0;
+end;
+
+function ClipScore(TextNet, VisionNet: TNNet;
+  ImageInput, TokenIds: TNNetVolume;
+  EosTokenId: integer; Weight: TNeuralFloat): TNeuralFloat;
+var
+  ImageEmb, TextEmb: TNNetVolume;
+begin
+  ImageEmb := TNNetVolume.Create;
+  TextEmb := TNNetVolume.Create;
+  try
+    VisionNet.Compute(ImageInput);
+    // VISION pooled row = 0 (the class token); image_embeds.
+    ClipExtractEmbedding(VisionNet.GetLastLayer().Output, 0, ImageEmb);
+    TextNet.Compute(TokenIds);
+    // TEXT pooled row = the eot position (modeling_clip's pooling).
+    ClipExtractEmbedding(TextNet.GetLastLayer().Output,
+      ClipTextEosPosition(TokenIds, EosTokenId), TextEmb);
+    Result := ClipScoreFromEmbeddings(ImageEmb, TextEmb, Weight);
+  finally
+    TextEmb.Free;
+    ImageEmb.Free;
+  end;
+end;
+
+function RefClipScoreFromEmbeddings(ImageEmb, TextEmb, RefTextEmb: TNNetVolume;
+  Weight: TNeuralFloat): TNeuralFloat;
+var
+  ImageTerm, RefTerm: TNeuralFloat;
+begin
+  // Image term = the (weighted, clipped) CLIPScore; reference term = the
+  // candidate<->reference cosine clipped at 0 (UNweighted, per the paper).
+  ImageTerm := ClipScoreFromEmbeddings(ImageEmb, TextEmb, Weight);
+  RefTerm := ClipSimilarity(TextEmb, RefTextEmb);
+  if RefTerm < 0 then RefTerm := 0;
+  // Harmonic mean H(a,b) = 2ab/(a+b); 0 when either term is 0.
+  if (ImageTerm + RefTerm) > 0 then
+    Result := 2 * ImageTerm * RefTerm / (ImageTerm + RefTerm)
+  else
+    Result := 0;
 end;
 
 // ===========================================================================

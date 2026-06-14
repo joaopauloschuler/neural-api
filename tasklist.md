@@ -352,16 +352,6 @@ rather than acted on.
       linear-head weights (lin layers of richzhang/PerceptualSimilarity) as a tiny
       imported tensor. Parity vs the reference LPIPS on one image pair; also expose
       it as a training loss so SR examples can opt into perceptual fine-tuning.
-- [ ] CLIPScore text-image-alignment generative metric — the standard reference-free
-      metric for text-to-image quality (how well a generated image matches its
-      prompt), reusing the LANDED CLIP dual-encoder (BuildClipFromSafeTensors). Add a
-      helper that runs the image through the vision tower and the prompt through the
-      text tower, L2-normalizes both, and returns max(0, w * cos) (Hessel et al. 2021,
-      w=2.5); plus a RefCLIPScore variant (harmonic mean with the reference-caption
-      cosine) for captioning. Complements the IMAGE-only FID/IS/KID with a
-      semantic image<->text score; demo: score a handful of (image, prompt) pairs and
-      show mismatched prompts score lower. Parity vs a torch CLIP float64 cosine on a
-      pinned image+text pair.
 - [ ] Pix2Pix conditional image-to-image translation example (examples/Pix2Pix) —
       the repo's only GAN (VisualGAN) is UNCONDITIONAL (noise -> CIFAR image); there
       is no PAIRED image-to-image translation. Train a conditional GAN that maps an
