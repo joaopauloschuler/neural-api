@@ -4094,11 +4094,17 @@ procedure BuildClipFromSafeTensors(const FileName: string;
 // post LayerNorm ('visual_projection.weight' for CLIP; '' skips the
 // projection and the net outputs (num_patches+1,1,hidden) post-LN hidden
 // states - the plain ViT contract). The CLASS-token row is row 0.
+// When pVisionFeatures is true the tower returns LLaVA's vision feature:
+// the penultimate hidden state (HF output_hidden_states[-2]) - the encoder
+// stack with the LAST block omitted - WITHOUT the CLS row and WITHOUT
+// post_layernorm/projection. The result shape is (NumPatches, 1, hidden);
+// ProjectionTensorName/ProjectionDim are ignored in this mode.
 function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
   const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
   ProjectionDim: integer; const Prefix: string;
   const ProjectionTensorName: string = '';
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false;
+  pVisionFeatures: boolean = false): TNNet;
 
 // The text-pooling position of modeling_clip: EosTokenId = 2 (the legacy
 // id of every published OpenAI CLIP) returns the position of the FIRST
@@ -25613,13 +25619,14 @@ function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
   const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
   ProjectionDim: integer; const Prefix: string;
   const ProjectionTensorName: string = '';
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false;
+  pVisionFeatures: boolean = false): TNNet;
 var
   NN: TNNet;
   PatchConv, PosEmb, PreLN, PostLN, Proj: TNNetLayer;
   Blocks: TClipBlockLayersArray;
   Tbl: TNNetVolume;
-  Grid, NumPatches, BlockCnt, ChanCnt: integer;
+  Grid, NumPatches, BlockCnt, BuiltLayers, ChanCnt: integer;
   PreLNName: string;
 begin
   if (Tower.NumHeads < 1) or
@@ -25655,18 +25662,39 @@ begin
     PreLN := NN.AddLayer(
       TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
     if pInferenceOnly then NN.MakeInferenceOnly();
-    SetLength(Blocks, Tower.NumLayers);
-    for BlockCnt := 0 to Tower.NumLayers - 1 do
+    // LLaVA's vision feature is the penultimate hidden state
+    // (output_hidden_states[-2]) WITHOUT the CLS row and WITHOUT
+    // post_layernorm/projection: that is the output of the stack with the
+    // LAST encoder block omitted. In feature mode build NumLayers-1 blocks,
+    // skip post_layernorm + projection, and crop the class-token row so the
+    // net returns exactly (NumPatches, 1, hidden) patch tokens.
+    if pVisionFeatures then
+      BuiltLayers := Tower.NumLayers - 1
+    else
+      BuiltLayers := Tower.NumLayers;
+    if BuiltLayers < 0 then BuiltLayers := 0;
+    SetLength(Blocks, BuiltLayers);
+    for BlockCnt := 0 to BuiltLayers - 1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
         Blocks[BlockCnt], pInferenceOnly);
-    // HF applies post_layernorm (and the projection) only to the pooled
-    // class token; applying them PER TOKEN is exact for row 0.
-    PostLN := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    PostLN := nil;
     Proj := nil;
-    if ProjectionTensorName <> '' then
-      Proj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(ProjectionDim) );
+    if pVisionFeatures then
+    begin
+      // Drop the class-token slot (row 0); keep the NumPatches patch rows.
+      NN.AddLayer( TNNetCrop.Create({StartX=}1, {StartY=}0,
+        {LenX=}NumPatches, {LenY=}1) );
+    end
+    else
+    begin
+      // HF applies post_layernorm (and the projection) only to the pooled
+      // class token; applying them PER TOKEN is exact for row 0.
+      PostLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+      if ProjectionTensorName <> '' then
+        Proj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(ProjectionDim) );
+    end;
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -25702,12 +25730,13 @@ begin
       PreLNName := Prefix + 'pre_layernorm';
     LoadLayerNormWeights(Reader, PreLN, PreLNName + '.weight',
       PreLNName + '.bias', Tower.HiddenSize);
-    for BlockCnt := 0 to Tower.NumLayers - 1 do
+    for BlockCnt := 0 to BuiltLayers - 1 do
       LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
         Prefix + 'encoder.layers.' + IntToStr(BlockCnt) + '.', Tower);
-    LoadLayerNormWeights(Reader, PostLN,
-      Prefix + 'post_layernorm.weight',
-      Prefix + 'post_layernorm.bias', Tower.HiddenSize);
+    if PostLN <> nil then
+      LoadLayerNormWeights(Reader, PostLN,
+        Prefix + 'post_layernorm.weight',
+        Prefix + 'post_layernorm.bias', Tower.HiddenSize);
     if Proj <> nil then
       LoadLlamaLinearWeights(Reader, Proj, ProjectionTensorName,
         Tower.HiddenSize, ProjectionDim); // bias-free: CAI biases zeroed

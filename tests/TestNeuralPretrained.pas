@@ -241,6 +241,7 @@ type
     procedure TestWhisperParity;
     procedure TestClipConfigFromJSONFile;
     procedure TestClipParity;
+    procedure TestClipVisionFeatures;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -10474,6 +10475,99 @@ begin
     RefJson.Free;
     VisionNet.Free;
     TextNet.Free;
+  end;
+end;
+
+// Step 1 of the LLaVA import: BuildClipVisionTower in pVisionFeatures mode
+// must return the penultimate vision hidden state with the CLS row dropped
+// and NO post_layernorm/projection - HF vision_tower
+// output_hidden_states[-2][:, 1:]. The oracle (vision_features in
+// tiny_clip_embeds.json) is computed by tools/clip_tiny_fixture.py on the
+// SAME random pico checkpoint. Shape must be (num_patches, 1, hidden).
+procedure TTestNeuralPretrained.TestClipVisionFeatures;
+var
+  Reader: TNNetSafeTensorsReader;
+  VisionNet: TNNet;
+  Config: TClipConfig;
+  RefRoot: TJSONData;
+  Pixels, Feats, RowArr, ChanArr, PatchArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  RefJson: TStringList;
+  ChanCnt, YCnt, XCnt, PatchCnt, NumPatches: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  Config := ReadClipConfigFromJSONFile(FixturePath('tiny_clip_config.json'));
+  NumPatches := Sqr(Config.ImageSize div Config.PatchSize);
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_clip.safetensors'));
+  VisionNet := nil;
+  ImageInput := TNNetVolume.Create;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    VisionNet := BuildClipVisionTower(Reader, Config.Vision,
+      Config.ImageSize, Config.PatchSize, Config.NumChannels,
+      Config.ProjectionDim, 'vision_model.',
+      {ProjectionTensorName=}'visual_projection.weight',
+      {pInferenceOnly=}false, {pVisionFeatures=}true);
+
+    // Shape contract: (num_patches, 1, hidden), no CLS row, no projection.
+    AssertEquals('feature rows = num patches (CLS dropped)',
+      NumPatches, VisionNet.GetLastLayer().Output.SizeX);
+    AssertEquals('feature height', 1,
+      VisionNet.GetLastLayer().Output.SizeY);
+    AssertEquals('feature depth = vision hidden (not projection_dim)',
+      Config.Vision.HiddenSize, VisionNet.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_clip_embeds.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    Feats := TJSONArray(TJSONObject(RefRoot).Find('vision_features'));
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertTrue('vision_features present', Feats <> nil);
+    AssertEquals('oracle has num_patches rows', NumPatches, Feats.Count);
+
+    // Load pixels (fixture stores (channels, H, W); input volume is
+    // (W, H, channels)).
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    VisionNet.Compute(ImageInput);
+
+    MaxDiff := 0;
+    for PatchCnt := 0 to NumPatches - 1 do
+    begin
+      PatchArr := TJSONArray(Feats.Items[PatchCnt]);
+      AssertEquals('feature width', Config.Vision.HiddenSize,
+        PatchArr.Count);
+      for ChanCnt := 0 to Config.Vision.HiddenSize - 1 do
+      begin
+        Diff := Abs(VisionNet.GetLastLayer().Output.FData[
+          PatchCnt * Config.Vision.HiddenSize + ChanCnt] -
+          PatchArr.Items[ChanCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('vision features: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    ImageInput.Free;
+    VisionNet.Free;
+    Reader.Free;
   end;
 end;
 
