@@ -3204,5 +3204,123 @@
     "decoded": "xy"
    }
   ]
+ },
+ "spm_bytefallback": {
+  "tokenizer": "tiny_spm_bytefallback.model",
+  "cases": [
+   {
+    "text": "the cat sat",
+    "ids": [
+     260,
+     267,
+     264,
+     262
+    ],
+    "decoded": "the cat sat"
+   },
+   {
+    "text": "café",
+    "ids": [
+     259,
+     297,
+     294,
+     296,
+     198,
+     172
+    ],
+    "decoded": "café"
+   },
+   {
+    "text": "the 你好 cat",
+    "ids": [
+     260,
+     259,
+     231,
+     192,
+     163,
+     232,
+     168,
+     192,
+     267
+    ],
+    "decoded": "the 你好 cat"
+   },
+   {
+    "text": "smile 😀 now",
+    "ids": [
+     264,
+     277,
+     299,
+     270,
+     288,
+     259,
+     243,
+     162,
+     155,
+     131,
+     259,
+     265,
+     276,
+     295
+    ],
+    "decoded": "smile 😀 now"
+   },
+   {
+    "text": "bell\u0007ring",
+    "ids": [
+     259,
+     290,
+     288,
+     270,
+     270,
+     10,
+     285,
+     263
+    ],
+    "decoded": "bell\u0007ring"
+   },
+   {
+    "text": "naïve résumé café",
+    "ids": [
+     259,
+     265,
+     294,
+     198,
+     178,
+     292,
+     288,
+     271,
+     198,
+     172,
+     275,
+     287,
+     277,
+     198,
+     172,
+     259,
+     297,
+     294,
+     296,
+     198,
+     172
+    ],
+    "decoded": "naïve résumé café"
+   },
+   {
+    "text": "the dog",
+    "ids": [
+     260,
+     259,
+     269,
+     283
+    ],
+    "decoded": "the dog"
+   },
+   {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+   }
+  ]
  }
 }

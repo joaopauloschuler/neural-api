@@ -1813,12 +1813,19 @@ begin
   SetLength(FIdToToken, PieceCount);
   SetLength(FUniScore, PieceCount);
   FUniMinScore := 0;
+  FByteFallback := false;
   for Cnt := 0 to PieceCount - 1 do
   begin
     FVocab.AddObject(PieceTextV[Cnt], TObject(PtrInt(Cnt)));
     FIdToToken[Cnt] := PieceTextV[Cnt];
     if (Cnt = 0) or (FUniScore[Cnt] < FUniMinScore) then
       FUniMinScore := FUniScore[Cnt];
+    // SentencePiece BYTE pieces (type 6) are the <0x00>..<0xFF> byte-
+    // fallback alphabet. Their presence means byte_fallback=true: unknown
+    // bytes route through <0xNN> on encode and those pieces decode back to
+    // their raw byte (EmitTokenOrFallback / DecodeToken), so a run of byte
+    // pieces reassembles the original multi-byte UTF-8 sequence.
+    if PieceTypeV[Cnt] = 6 then FByteFallback := true;
   end;
 
   // Special-token ids straight from trainer_spec (authoritative for SPM).
@@ -2792,6 +2799,7 @@ const
 var
   CPStart: array of integer;  // byte offset (1-based) where char i starts
   SegId: array of integer;    // backtracked ids, collected in reverse
+  SegStart: array of integer; // backtracked start CHAR index of each segment
   Total, Position, SegCnt, I, J, BestPrev, TokenId: integer;
   BestScore: array of double; // best score to reach char-boundary J (0..Total)
   BackPtr: array of integer;  // start char index of the piece ending at J
@@ -2799,6 +2807,30 @@ var
   CandScore, UnkScore: double;
   Sub: string;
   LastWasUnk: boolean;
+
+  // Emits the SentencePiece <0xNN> BYTE pieces for the raw bytes of the
+  // single-char unk span [CharStart, CharEnd) (char indices). Returns True
+  // when every needed byte piece exists; False otherwise (caller falls back
+  // to <unk>). byte_fallback ALWAYS covers all 256 bytes, so this succeeds
+  // whenever FByteFallback is set on a real model.
+  function EmitByteFallback(CharStart, CharEnd: integer): boolean;
+  var
+    K, BId: integer;
+  begin
+    Result := false;
+    if not FByteFallback then Exit;
+    // verify all byte pieces exist before emitting any
+    for K := CPStart[CharStart] to CPStart[CharEnd] - 1 do
+      if VocabFind('<0x' + IntToHex(Ord(PieceText[K]), 2) + '>') < 0 then
+        Exit;
+    for K := CPStart[CharStart] to CPStart[CharEnd] - 1 do
+    begin
+      BId := VocabFind('<0x' + IntToHex(Ord(PieceText[K]), 2) + '>');
+      Ids.Add(BId);
+    end;
+    Result := true;
+  end;
+
 begin
   if PieceText = '' then exit;
   // Char-boundary table: CPStart[i] is the 1-based byte offset of char i,
@@ -2855,6 +2887,7 @@ begin
   // Backtrack (collect ids in reverse), then emit forward, fusing adjacent
   // unk ids into one.
   SetLength(SegId, Total);
+  SetLength(SegStart, Total);
   SegCnt := 0;
   J := Total;
   while J > 0 do
@@ -2862,6 +2895,7 @@ begin
     BestPrev := BackPtr[J];
     if BestPrev < 0 then BestPrev := J - 1; // safety (shouldn't happen)
     SegId[SegCnt] := BackId[J];
+    SegStart[SegCnt] := BestPrev; // start char index (unk spans 1 char)
     Inc(SegCnt);
     J := BestPrev;
   end;
@@ -2869,8 +2903,15 @@ begin
   for I := SegCnt - 1 downto 0 do
     if SegId[I] < 0 then
     begin
-      if (FUnkId >= 0) and (not LastWasUnk) then Ids.Add(FUnkId);
-      LastWasUnk := true;
+      // Unknown char: with byte_fallback, decompose it into its <0xNN> BYTE
+      // pieces (SentencePiece behavior) instead of emitting one fused <unk>.
+      if EmitByteFallback(SegStart[I], SegStart[I] + 1) then
+        LastWasUnk := false
+      else
+      begin
+        if (FUnkId >= 0) and (not LastWasUnk) then Ids.Add(FUnkId);
+        LastWasUnk := true;
+      end;
     end
     else
     begin

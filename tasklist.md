@@ -218,11 +218,21 @@ rather than acted on.
       TestSentencePieceModelParity). UNIGRAM model_type only; a BPE/WORD/CHAR
       ModelProto raises EHFTokenizerError ("use tokenizer.json"). OPEN
       follow-ups: BPE-in-.model (NLLB/mBART-BPE exports — needs the merges
-      decoded from the ModelProto pieces or via tokenizer.json), and BYTE
-      (type=6) byte-fallback pieces are loaded as plain pieces but not wired
-      to <0xNN> byte-fallback decoding. This partially UNBLOCKS the
-      mBART/NLLB BART-family follow-up (b) and the DeBERTa-v3 import (both
-      ship raw sentencepiece .model and are Unigram). (c) exact full-Unicode \p{L}/\p{N} tables (current
+      decoded from the ModelProto pieces or via tokenizer.json). BYTE
+      (type=6) byte-fallback is now DONE: LoadSentencePieceModel sets
+      FByteFallback when any type-6 piece is present, so (1) encode routes
+      unknown chars through the <0xNN> BYTE pieces — the Unigram Viterbi
+      unk node now decomposes the char into its UTF-8 bytes via byte
+      pieces (EmitByteFallback) instead of one fused <unk>; and (2) decode
+      emits the RAW byte for each <0xNN> piece (DecodeToken), so a run of
+      byte pieces reassembles into the original multi-byte UTF-8 string
+      (the metaspace U+2581 handling is unaffected). Round-trip parity test
+      TestSentencePieceByteFallbackRoundTrip + tiny_spm_bytefallback.model
+      fixture (tools/make_pico_spm_fixture.py byte_fallback variant; cases
+      read via TJSONParser(s,[]) to keep their UTF-8 bytes intact). This
+      partially UNBLOCKS the mBART/NLLB BART-family follow-up (b) and the
+      DeBERTa-v3 import (both ship raw sentencepiece .model and are
+      Unigram). (c) exact full-Unicode \p{L}/\p{N} tables (current
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
       Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
       punctuation class of the GPT-2 regex); (d) DONE — build a tokenizer from

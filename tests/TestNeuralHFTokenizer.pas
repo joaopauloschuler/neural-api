@@ -36,6 +36,7 @@ type
     // case (fixture by tools/make_pico_spm_fixture.py), decode must match
     // for the unk-free cases, and special ids come from trainer_spec.
     procedure TestSentencePieceModelParity;
+    procedure TestSentencePieceByteFallbackRoundTrip;
     procedure TestSplitQwen2ParityWithHF;
     procedure TestSplitCl100kParityWithHF;
     procedure TestSplitDeepSeekParityWithHF;
@@ -250,6 +251,74 @@ end;
 // (id 0): the Pascal Decode follows the HF tokenizers metaspace convention
 // (unk -> empty surface), whereas the spm reference renders <unk> as its
 // unk_surface ' ⁇ ', so the two intentionally differ there.
+// A raw SentencePiece .model with byte_fallback=True ships the 256
+// <0x00>..<0xFF> BYTE pieces (type 6). The .model reader must flag
+// FByteFallback so (1) unknown bytes route through <0xNN> on encode and
+// (2) those byte pieces decode back to their RAW byte, reassembling the
+// original multi-byte UTF-8 string (instead of emitting the literal text
+// "<0xNN>"). Verified by full id-parity vs the sentencepiece oracle AND an
+// encode->decode round-trip over 2/3/4-byte UTF-8 chars + a raw control byte.
+procedure TTestNeuralHFTokenizer.TestSentencePieceByteFallbackRoundTrip;
+var
+  Tok: TNeuralHFTokenizer;
+  Root: TJSONData;
+  Group, CaseObj: TJSONObject;
+  Cases, ExpectedIds: TJSONArray;
+  Ids: TIntegerList;
+  CaseCnt, IdCnt: integer;
+  Text, Context, JsonStr: string;
+  SS: TStringStream;
+  Parser: TJSONParser;
+begin
+  // Read the cases via TJSONParser(s, []) over the RAW file bytes: the
+  // non-ASCII byte-fallback test strings are UTF-8 and must survive verbatim.
+  // GetJSON (both the TStream and the joUTF8 string overloads) re-emits
+  // multi-byte UTF-8 as a single Latin-1 byte and would corrupt the input.
+  SS := TStringStream.Create('');
+  try
+    SS.LoadFromFile(FixturePath('hf_tokenizer_cases.json'));
+    JsonStr := SS.DataString;
+  finally
+    SS.Free;
+  end;
+  Parser := TJSONParser.Create(JsonStr, []);
+  try
+    Root := Parser.Parse;
+  finally
+    Parser.Free;
+  end;
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Group := TJSONObject(Root).Objects['spm_bytefallback'];
+    Tok.LoadFromFile(FixturePath(Group.Get('tokenizer', '')));
+    AssertTrue('spm flag', Tok.IsUnigram);
+    AssertTrue('vocab loaded', Tok.GetVocabSize() > 256);
+    Cases := Group.Arrays['cases'];
+    AssertTrue('no cases pinned', Cases.Count >= 6);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Text := CaseObj.Get('text', '');
+      ExpectedIds := CaseObj.Arrays['ids'];
+      Context := 'spm-bf case ' + IntToStr(CaseCnt) + ' "' + Text + '"';
+      Ids.Clear;
+      Tok.Encode(Text, Ids);
+      // encode parity with the sentencepiece byte-fallback oracle
+      AssertEquals(Context + ': id count', ExpectedIds.Count, Ids.Count);
+      for IdCnt := 0 to ExpectedIds.Count - 1 do
+        AssertEquals(Context + ': id[' + IntToStr(IdCnt) + ']',
+          ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+      // round-trip: byte pieces must reassemble into the original UTF-8
+      AssertEquals(Context + ': round-trip decode', Text, Tok.Decode(Ids, true));
+    end;
+  finally
+    Ids.Free;
+    Tok.Free;
+    Root.Free;
+  end;
+end;
+
 procedure TTestNeuralHFTokenizer.TestSentencePieceModelParity;
 var
   Tok: TNeuralHFTokenizer;
