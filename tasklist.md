@@ -567,14 +567,20 @@ rather than acted on.
       examples/ConstrainedDecoding to a function-call-arguments schema (edit
       examples/README.md, not the main README). High practical value: turns the
       landed chat/tool-template work into reliable structured output.
-- [ ] Length-grouped batching + dynamic padding collator (transformers
-      LengthGroupedSampler + DataCollatorWithPadding port) in neuralfit:
-      sort/bucket variable-length text by length, batch neighbors, pad each
-      batch only to its own max (not the global max) — a large real-world
-      throughput win. Complements (distinct from) the per-sample-attention-
-      mask and left-padded-generation tasks: this is the TRAINING data-side
-      half. Test: identical loss trajectory vs naive padding at fixed seed
-      modulo batch order, plus a padded-token-count reduction assert.
+- [X] Length-grouped batching + dynamic padding collator (transformers
+      LengthGroupedSampler + DataCollatorWithPadding port).
+      LANDED (commit 2e5d900): TNNetLengthGroupedBatcher in neuraldatasets.pas
+      (sibling of the packer/collators) — megabatch shuffle (shuffle -> mega-
+      batch -> sort by length desc -> swap global-longest into the first mega-
+      batch -> yield BatchSize chunks) over variable-length token samples, with
+      GetTrainingPair padding each emitted batch only to its OWN BatchSeqLen
+      (per-position causal LM pair + ApplyLossMask). TotalPadTokens /
+      NaiveTotalPadTokens expose the pad-saving. Tests TestNeuralLengthGrouped
+      (6): each batch padded to its own max, no sample dropped/duplicated, pair
+      internally consistent, loss-mask zeroes pad targets, dynamic pad < naive
+      global pad, reproducible order. Internal LCG (independent of global
+      RandSeed) so the shuffle never perturbs weight init. (TRAINING data-side
+      half; distinct from per-sample attn-mask and left-padded-generation.)
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (the rebuild-same-
       architecture-at-a-new-width idiom this list already notes near the
