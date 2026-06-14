@@ -134,29 +134,17 @@ rather than acted on.
       OlmoeForCausalLM): the pico fixture is random-init only — add a real
       allenai/OLMoE-1B-0924 slicer (slice_llama.py reuse) to parity-check a
       sliced real checkpoint against the random pico fixture.
-- [X] BitNet b1.58 importer (`BuildBitNetFromSafeTensors[Ex]` LANDED,
-      model_type "bitnet" / the released `microsoft/bitnet-b1.58-2B-4T`) — the
-      ternary-weight LLM family, mapped onto the Llama backbone (RMSNorm, RoPE)
-      with the BitNet deltas wired onto the existing builder slots:
-      (a) the SubLN "norm-before-quantized-linear" RMSNorm — attn_sub_norm on
-      the concatenated head outputs BEFORE o_proj and ffn_sub_norm on the gated
-      activation BEFORE down_proj (Config.BitNetSubLN, distinct from the
-      Gemma-2/OLMo-2 post-norms; no new layer class, reuses TNNetTokenRMSNorm);
-      (b) the relu2 gated FFN (hidden_act "relu2") via the new
-      TNNetReGLUSquared activation (up*ReLU(gate)^2) with SEPARATE
-      gate_proj/up_proj on the standard separate-projection loader path; and
-      (c) rope_theta read from the transformers-5.x rope_parameters dict
-      (default 500000). The ternary weights ride the standard de-quant-at-load
-      convention (the GGUF Q8_0 / MXFP4 precedent): the HF transformers
-      BitNetForCausalLM checkpoint is the FP "shadow" form storing the
-      already-ternary effective weights (scale*{-1,0,+1}) and runs them through
-      plain nn.Linear, so loading them straight is bit-for-bit (the absmean
-      ternarize is a no-op round-trip on already-ternary weights). Pico parity
-      fixture tools/bitnet_tiny_fixture.py re-randomizes + ternarizes the
-      projections and ASSERTS the ternarization moves the HF logits
-      (non-vacuous); TestBitNet{Config,Logit}Parity < 1e-4 vs float64 HF
-      BitNetForCausalLM, both passing. Headline: a 2B model that resides in
-      well under 1GB, dovetailing with the int8/GGUF "commodity RAM" theme.
+- [ ] BitNet b1.58 importer follow-ups (`BuildBitNetFromSafeTensors[Ex]` LANDED,
+      model_type "bitnet" / the released `microsoft/bitnet-b1.58-2B-4T`; the
+      ternary-weight LLM mapped onto the Llama backbone with the SubLN
+      norm-before-quantized-linear RMSNorms (attn_sub_norm before o_proj,
+      ffn_sub_norm before down_proj via Config.BitNetSubLN, reusing
+      TNNetTokenRMSNorm), the relu2 gated FFN via the new TNNetReGLUSquared
+      activation (up*ReLU(gate)^2) on the separate-projection loader, and
+      rope_theta from the transformers-5.x rope_parameters dict; the FP "shadow"
+      checkpoint loads bit-for-bit since the absmean ternarize is a no-op on
+      already-ternary weights; pico parity TestBitNet{Config,Logit}Parity < 1e-4
+      vs float64 HF BitNetForCausalLM):
   - [ ] native I2_S packed-ternary de-quant-at-load (2-bit unpack: 4 ternary
         values per byte + a separate weight_scale tensor). The shadow-weight
         (FP effective-weights) path is covered; the GGUF/bitnet.cpp-style I2_S
