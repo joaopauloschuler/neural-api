@@ -591,6 +591,34 @@ rather than acted on.
       byte-level-BPE merge state for a guaranteed alignment, and a test over
       a pinned string with a byte-fallback / multi-byte-UTF8 token that the
       heuristic currently leaves unmapped.
+- [ ] JSON-Schema -> GBNF compiler for structured / function-calling output
+      (the one piece of the "JSON mode" stack still missing). The decode side
+      is fully landed: TNNetGrammar compiles GBNF text to a flat pushdown and
+      TNNetGrammarConstraint masks logits to grammar-legal tokens, plus the
+      hardcoded TNNetJSONConstraint for free-form JSON. What is absent is the
+      bridge every serving stack ships (llama.cpp json-schema-to-grammar.cpp /
+      Outlines / vLLM guided_json): take a JSON Schema and EMIT a GBNF string
+      that the existing TNNetGrammar already consumes — so a model can be
+      constrained to a CALLER-SUPPLIED shape (tool-call arguments, typed
+      extraction) instead of just "some JSON". A standalone
+      CompileJSONSchemaToGBNF(SchemaJSON: string): string in neuraldecode.pas
+      (parse the schema via the same TJSONParser(s,[]) the tokenizer uses, walk
+      it to GBNF rules), covering the practical subset: object with
+      properties + required (ordered prop rules, optional props), array with
+      items + minItems/maxItems, string (+ enum -> literal alternation, +
+      pattern -> char-class rule), number/integer, boolean, null,
+      anyOf/oneOf -> alternation, $ref/$defs for recursion, and additional
+      properties:false. Out of scope for v1 (document): allOf, format
+      validators, numeric min/max bound enforcement. Deliverables: the
+      compiler + a convenience CreateJSONSchemaConstraint(SchemaJSON, Dict)
+      that chains compile -> TNNetGrammarConstraint; tests asserting (a) the
+      emitted grammar ACCEPTS a set of pinned schema-valid JSON strings and
+      REJECTS malformed/extra-field ones via the compiled pushdown, and
+      (b) a tiny greedy decode under the constraint is byte-legal for a
+      two-field tool-call schema; an examples/StructuredOutput demo extending
+      examples/ConstrainedDecoding to a function-call-arguments schema (edit
+      examples/README.md, not the main README). High practical value: turns the
+      landed chat/tool-template work into reliable structured output.
 - [ ] Length-grouped batching + dynamic padding collator (transformers
       LengthGroupedSampler + DataCollatorWithPadding port) in neuralfit:
       sort/bucket variable-length text by length, batch neighbors, pad each
