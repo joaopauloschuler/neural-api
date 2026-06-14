@@ -336,18 +336,25 @@ rather than acted on.
       the landed TNNetMinLSTM but with conv instead of dense gates and a spatial
       cell state); otherwise compose from existing conv + gating layers. Generates
       a short MNIST-digit-trajectory rollout on CPU.
-- [X] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
-      torchvision) — LANDED: branch-concatenation block builder (AddInceptionAModule)
-      runs 4 parallel branches (1x1 / 5x5 / 3x3dbl=5x5-as-two-3x3 / pool)
-      concatenated on the channel axis via TNNetDeepConcat; reuses the ResNet
-      conv-BN fold (LoadResNetConvFoldBN) + config reader/ToString. Pooled-feature
-      (FID backbone) tap exposed via out PoolFeatureIdx. Pico parity vs numpy
-      float64 oracle <1e-4 (logits + pooled feature). FOLLOW-UPS: CAI conv is
-      square-kernel only so InceptionC asymmetric 1x7/7x1 factorized convs and the
-      strided grid-reduction modules (InceptionB/D) are deferred; full stem
-      (Conv2d_1a..4a + maxpools) and torchvision avg-pool branch (pico uses a
-      grid-preserving portable maxpool) are deferred. Rewiring neuralimagemetrics
-      FID onto this backbone is a separate follow-up.
+- [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
+      torchvision) — PARTIAL (commit 503540b): the branch-concatenation block
+      builder LANDED (AddInceptionAModule runs 4 parallel branches
+      1x1 / 5x5 / 3x3dbl=5x5-as-two-3x3 / pool concatenated on the channel axis
+      via TNNetDeepConcat), plus BuildInceptionV3 scaffold, config reader/ToString,
+      ResNet conv-BN fold reuse (LoadResNetConvFoldBN), pooled-feature (FID backbone)
+      tap via out PoolFeatureIdx, and a pico parity test <1e-4 vs a numpy float64
+      oracle on the InceptionA-shaped sub-net. NOT yet a usable real-checkpoint
+      importer. REMAINING to import a real torchvision inception_v3:
+  - [ ] Asymmetric (1xN / Nx1) factorized convolutions — BLOCKER for InceptionC
+        (the 1x7/7x1 branches); CAI TNNetConvolution is square-kernel only. See the
+        dedicated "Asymmetric-kernel convolution" task under Layer follow-ups.
+  - [ ] Strided grid-reduction modules InceptionB / InceptionD (parallel
+        stride-2 conv + pool branches), the full stem (Conv2d_1a..4a + maxpools),
+        InceptionE, and the torchvision avg-pool branch (the pico used a
+        grid-preserving portable maxpool); wire the full module sequence + real
+        weight loading and parity-test against a full-size float64 oracle.
+  - [ ] Rewire neuralimagemetrics FID onto this backbone once the full net lands
+        (today FID uses placeholder features).
 - [ ] LPIPS follow-ups — the metric LANDED (ComputeLPIPSDistance /
       LPIPSStageDistance / LPIPSUnitNormalize in neuralpretrained.pas, reusing the
       VGG importer's 5 relu taps; unit-normalize -> squared-diff -> per-stage lin
@@ -810,6 +817,16 @@ rather than acted on.
       speedup vs the linear self-speculative baseline.
 
 ## Layer follow-ups that fix real limitations
+
+- [ ] Asymmetric-kernel convolution (1xN / Nx1 factorized convs) — CAI
+      TNNetConvolution is square-kernel only (one FeatureSize controls both axes),
+      which blocks the spatially-factorized convs used across modern CNNs:
+      Inception-v3's InceptionC 1x7/7x1 branches (the BLOCKER for finishing the
+      partial Inception-v3 importer), the SegFormer/Mix-FFN depthwise variants, and
+      cheap large-receptive-field stems. Add a rectangular-kernel conv (separate
+      FeatureSizeX / FeatureSizeY, AVX-vectorized along the contiguous channel axis
+      like the square conv) with full input+weight numerical-gradient coverage in
+      TestNeuralNumerical.pas. Unblocks the Inception-v3 InceptionC branches.
 
 (The sub-quadratic / chunked-forward family below is one coherent systems effort:
 every recurrence currently trains as a strict per-token left-to-right scan.)
