@@ -99,32 +99,31 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [ ] IBM Granite 3.x importer (`BuildGraniteFromSafeTensors[Ex]`, model_type
-      `granite`/`granitemoe`) — genuinely DISTINCT from the landed Llama path,
-      NOT a near-duplicate. Granite keeps Llama's RMSNorm + RoPE + SwiGLU
-      attention block but multiplies four scalar knobs that Llama lacks and
-      that materially change the forward pass: `embedding_multiplier` (scale
-      token embeddings after lookup), `residual_multiplier` (scale each
-      attention/FFN sublayer output BEFORE the residual add — a per-block
-      gain, not LayerScale weights), `attention_multiplier` (replaces the
-      default `1/sqrt(head_dim)` SDPA scale — wire through the existing SDPA
-      `Scale`/FStruct slot, do NOT hardcode), and `logits_scaling` (divide
-      final logits by this before softmax — fold into the output projection
-      like the Cohere `logit_scale` fold already does). Reuse
-      LoadLlamaHeadRMSNormWeights / SwiGLU up|gate packing / rotate_half q/k
-      permutation unchanged; the only new code is the four multipliers (three
-      are constant-scale folds into existing weights at load time, so no new
-      layer types needed — fold embedding_multiplier into the embedding
-      weights, residual_multiplier into each sublayer's output projection,
-      logits_scaling into the LM head). `granitemoe` swaps the FFN for the
-      Mixtral-style MoE block already imported by BuildMixtralFromSafeTensors,
-      so the MoE variant is mostly config plumbing. Add a pico fixture via the
-      existing make_pico_*_fixture.py recipe and a parity check against HF
-      `transformers` GraniteForCausalLM in venv x. Value: Granite 3.x is a
-      widely-deployed enterprise/code model family and the multiplier knobs
-      are exactly the kind of silent-wrong-output trap (logits off by a
-      constant factor → wrong sampling temperature behaviour) that a tested
-      importer prevents.
+- [X] IBM Granite 3.x importer (`BuildGraniteFromSafeTensors[Ex]`, model_type
+      `granite`/`granitemoe`) — DONE. Four multipliers folded at load on the
+      Llama path (embedding_multiplier→embedding rows; residual_multiplier→
+      o_proj/down_proj/expert-down rows; attention_multiplier→W_q as
+      multiplier·sqrt(head_dim) so SDPA's structural 1/sqrt(head_dim) yields
+      the requested scale — wired through the existing QScale/W_q slot, not
+      hardcoded; logits_scaling→1/logits_scaling into the LM head, like the
+      Cohere fold but DIVIDING). granitemoe reuses the Mixtral MoE block
+      WIRING but with a dedicated loader (LoadGraniteMoEExperts) for its FUSED
+      3-D slabs (block_sparse_moe.input_linear [E,2I,H] / output_linear
+      [E,H,I] / router.layer.weight [E,H]) — Mixtral's per-expert 2-D w1/w2/w3
+      tensors do NOT apply; gating is identical (softmax over top-k logits ==
+      top-k renorm). Pico fixtures tools/granite_tiny_fixture.py (both
+      variants, all four multipliers re-randomized non-1.0 and asserted to
+      move the HF logits) + TestGranite{Config,Logit,MoeLogit}Parity, all <
+      1e-4 vs float64 HF transformers (Granite{,Moe}ForCausalLM). Defaults of
+      1.0 keep vanilla-Llama configs unchanged; a 0/unset multiplier from the
+      GGUF (Default-record) config path is normalized to its no-op in the
+      builder so non-Granite imports are untouched. Open follow-ups:
+  - [ ] granitemoe `shared_intermediate_size` > 0 (an always-on parallel
+        shared expert, GraniteMoeShared / granite-3.0-3b-a800m) is REJECTED,
+        not wired — needs the shared SwiGLU branch summed with the routed
+        output. The pico fixture ships shared_intermediate_size=0.
+  - [ ] real-checkpoint slicer (make_pico_*_fixture.py reuse) to parity-check
+        a sliced ibm-granite/granite-3.1-* against the random pico fixture.
 - [ ] M2M100/NLLB translate demo + real-vocab check (follow-up to the landed
       BuildM2M100FromSafeTensors, commit cb21550): an examples/NLLBTranslate
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and

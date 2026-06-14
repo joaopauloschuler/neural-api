@@ -146,6 +146,18 @@ unit neuralpretrained;
 //     factored as the reusable BuildClipVisionTower). L2-normalized
 //     cosine scoring via ClipExtractEmbedding/ClipSimilarity +
 //     exp(logit_scale). See the CLIP IMPORT section below.
+//   - IBM Granite 3.x (model_type "granite", dense FFN; "granitemoe",
+//     Mixtral-style MoE FFN; e.g. ibm-granite/granite-3.1-* and
+//     granite-3.0-*-a800m) - BuildGraniteFromSafeTensors. The Llama block
+//     (RMSNorm + RoPE + SwiGLU, GQA, bias-free attention) plus FOUR scalar
+//     multipliers Llama lacks, all CONSTANT-SCALE folds at load (no new layer
+//     types): embedding_multiplier (embedding rows), residual_multiplier
+//     (o_proj / down_proj rows), attention_multiplier (replaces SDPA's
+//     1/sqrt(head_dim) score scale, folded into W_q) and logits_scaling
+//     (DIVIDES the final logits, folded as 1/logits_scaling into the LM
+//     head). granitemoe adds the fused 3-D expert slab
+//     (block_sparse_moe.input_linear/output_linear/router). See the LLAMA
+//     IMPORT section below.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -737,6 +749,15 @@ type
     MoEExpertsPerTok: integer; // num_experts_per_tok routed per token
                                // (Mixtral: 2); the renormalized top-k
     // ---- Qwen3-MoE deltas (Mixtral-MoE FFN, Qwen3 QK-norm attention) ----
+    MoEGraniteNaming: boolean; // granitemoe FUSED experts: a single 3-D
+                               // block_sparse_moe.input_linear [E, 2I, H]
+                               // (gate|up per expert), output_linear
+                               // [E, H, I] (down per expert) and router
+                               // block_sparse_moe.router.layer.weight [E, H]
+                               // instead of Mixtral's per-expert 2-D w1/w2/w3.
+                               // Same MoE MATH as Mixtral (softmax over the
+                               // top-k logits = top-k renorm), only the slab
+                               // layout differs (see the granitemoe loader)
     MoEQwen3Naming: boolean;   // experts use the Qwen3-MoE tensor names
                                // (mlp.gate.weight router +
                                // mlp.experts.{i}.gate_proj/up_proj/down_proj
@@ -777,6 +798,30 @@ type
                                // (no rotate_half row permutation) - GLM-4 (and
                                // Cohere) rotate consecutive channel pairs, the
                                // exact layout TNNetRotaryEmbedding expects
+    // ---- IBM Granite-3.x deltas (all default 1.0 = vanilla Llama) ----
+    // Granite keeps the Llama block (RMSNorm + RoPE + SwiGLU, dense or
+    // Mixtral-style MoE FFN) but multiplies four scalar knobs Llama lacks;
+    // all four are constant-scale FOLDS into existing weights at load time
+    // (no new layer types - see BuildGraniteFromSafeTensors):
+    EmbeddingMultiplier: TNeuralFloat; // embedding_multiplier: scale token
+                               // embeddings AFTER lookup (folded into the
+                               // embedding rows, like Gemma's EmbedScale but
+                               // an arbitrary scalar); the tied LM head reads
+                               // the UNSCALED rows. 1.0 = off
+    ResidualMultiplier: TNeuralFloat;  // residual_multiplier: scale EACH
+                               // attention/FFN sublayer output BEFORE the
+                               // residual add (folded into o_proj and
+                               // down_proj / expert down rows). 1.0 = off
+    AttentionMultiplier: TNeuralFloat; // attention_multiplier: REPLACES the
+                               // default 1/sqrt(head_dim) SDPA scale (folded
+                               // into W_q as attention_multiplier*sqrt(head_dim)
+                               // so SDPA's structural 1/sqrt(head_dim) yields
+                               // the requested scale). 0/absent = default
+    LogitsScaling: TNeuralFloat;       // logits_scaling: DIVIDE the final
+                               // logits by this before softmax (folded into
+                               // the LM head rows as 1/logits_scaling, exactly
+                               // like Cohere's logit_scale fold but DIVIDING).
+                               // 1.0 = off
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -1232,6 +1277,36 @@ function BuildMixtralFromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMixtralFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// Builds an IBM Granite 3.x decoder (HF GraniteForCausalLM, model_type
+// "granite", dense FFN; or GraniteMoeForCausalLM, model_type "granitemoe",
+// Mixtral-style sparse top-k MoE FFN). Granite is the Llama block (RMSNorm +
+// RoPE + SwiGLU, GQA, bias-free attention) plus FOUR scalar multipliers Llama
+// lacks, all CONSTANT-SCALE folds at load (no new layer types):
+//   embedding_multiplier  - scale token embeddings after lookup (folded into
+//                           the embedding rows; NOT into the tied LM head);
+//   residual_multiplier   - scale each attention/FFN sublayer output before
+//                           the residual add (folded into o_proj and the
+//                           FFN down_proj / expert output_linear rows);
+//   attention_multiplier  - replaces SDPA's 1/sqrt(head_dim) score scale
+//                           (folded into W_q as multiplier*sqrt(head_dim));
+//   logits_scaling        - DIVIDES the final logits before softmax (folded
+//                           into the LM head rows as 1/logits_scaling, like
+//                           Cohere's logit_scale fold but dividing).
+// All four default to 1.0 (absent) so a vanilla-Llama-shaped config imports
+// unchanged. granitemoe carries the same four multipliers and a fused 3-D
+// expert slab (block_sparse_moe.input_linear/output_linear/router); its
+// gating (softmax over the top-k logits) is identical to Mixtral's top-k
+// renorm. A non-zero shared_intermediate_size (parallel shared expert) is
+// rejected - not wired yet.
+function BuildGraniteFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildGraniteFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -4902,11 +4977,12 @@ begin
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
        (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') and
        (ModelType <> 'olmo2') and (ModelType <> 'mixtral') and
-       (ModelType <> 'glm4') and (ModelType <> 'glm') then
+       (ModelType <> 'glm4') and (ModelType <> 'glm') and
+       (ModelType <> 'granite') and (ModelType <> 'granitemoe') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", ' +
-        '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "mixtral" and ' +
-        '"glm4" are supported here ' +
+        '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "mixtral", ' +
+        '"glm4", "granite" and "granitemoe" are supported here ' +
         '(see BuildFromPretrained for the full dispatch; multimodal ' +
         '"gemma3" configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
@@ -4962,6 +5038,7 @@ begin
     Result.IsMoE := False;
     Result.NumLocalExperts := 0;
     Result.MoEExpertsPerTok := 0;
+    Result.MoEGraniteNaming := False;
     Result.MoEQwen3Naming := False;
     Result.MoEIntermediateSize := 0;
     Result.MoENormTopK := False;
@@ -4970,6 +5047,13 @@ begin
     Result.GLM4SandwichNorm := False;
     Result.FusedGateUp := False;
     Result.InterleavedRotary := False;
+    // Granite multipliers default to 1.0 (no-op) so a vanilla Llama-shaped
+    // config still imports unchanged; the granite/granitemoe branch reads the
+    // real values below.
+    Result.EmbeddingMultiplier := 1.0;
+    Result.ResidualMultiplier := 1.0;
+    Result.AttentionMultiplier := 0; // 0 = use SDPA's default 1/sqrt(head_dim)
+    Result.LogitsScaling := 1.0;
     if ModelType = 'mixtral' then
     begin
       // Mixtral: a stock Mistral decoder (full MHA/GQA, RoPE, sliding
@@ -5328,6 +5412,62 @@ begin
       ImportError('Llama import: model_type "glm" (the two-norm GLM, ' +
         'HF GlmForCausalLM) is not supported - this importer targets ' +
         'model_type "glm4" (the four-norm sandwich block).')
+    else if (ModelType = 'granite') or (ModelType = 'granitemoe') then
+    begin
+      // IBM Granite 3.x (HF GraniteForCausalLM / GraniteMoeForCausalLM): the
+      // Llama block (RMSNorm + RoPE + SwiGLU, GQA, no q/k/v bias) plus FOUR
+      // scalar multipliers Llama lacks (all folds at load - see
+      // BuildGraniteFromSafeTensors): embedding_multiplier (scale embeddings
+      // after lookup), residual_multiplier (scale each sublayer output before
+      // the residual add), attention_multiplier (replaces 1/sqrt(head_dim) in
+      // the SDPA score scale) and logits_scaling (DIVIDE the final logits).
+      // rope_theta defaults 10000000 (Granite's HF default), rms_norm_eps
+      // 1e-6, tie_word_embeddings true (the released checkpoints tie).
+      Result.RopeTheta := Obj.Get('rope_theta', 10000000.0);
+      Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      Result.EmbeddingMultiplier := Obj.Get('embedding_multiplier', 1.0);
+      Result.ResidualMultiplier := Obj.Get('residual_multiplier', 1.0);
+      Result.AttentionMultiplier := Obj.Get('attention_multiplier', 0.0);
+      Result.LogitsScaling := Obj.Get('logits_scaling', 1.0);
+      if Result.LogitsScaling = 0 then
+        ImportError('Llama import: Granite logits_scaling must be non-zero ' +
+          '(the final logits are DIVIDED by it).');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: Granite hidden_act "' + HiddenAct +
+          '" is not supported - every released granite checkpoint uses ' +
+          '"silu" (SwiGLU).');
+      if ModelType = 'granitemoe' then
+      begin
+        // granitemoe FFN = Mixtral-style sparse top-k MoE (softmax over the
+        // top-k logits == Mixtral's top-k renorm, so MoENormTopK) but with
+        // granitemoe's FUSED 3-D expert slabs (see MoEGraniteNaming). NO
+        // q/k/v bias, no per-expert bias.
+        Result.IsMoE := True;
+        Result.MoEGraniteNaming := True;
+        Result.MoENormTopK := True;
+        Result.NumLocalExperts := Obj.Get('num_local_experts', 8);
+        Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 2);
+        if Result.NumLocalExperts < 1 then
+          ImportError('Llama import: granitemoe num_local_experts must be ' +
+            '>= 1, got ' + IntToStr(Result.NumLocalExperts) + '.');
+        if (Result.MoEExpertsPerTok < 1) or
+           (Result.MoEExpertsPerTok > Result.NumLocalExperts) then
+          ImportError('Llama import: granitemoe num_experts_per_tok=' +
+            IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, ' +
+            'num_local_experts=' + IntToStr(Result.NumLocalExperts) + '].');
+        // shared_intermediate_size > 0 would add an always-on shared expert
+        // (GraniteMoeShared) that runs in PARALLEL with the routed experts.
+        // It is NOT wired here; reject a non-zero value rather than silently
+        // dropping it. The reference granitemoe checkpoints (e.g.
+        // granite-3.0-1b/3b-a800m) ship shared_intermediate_size=0.
+        if Obj.Get('shared_intermediate_size', 0) <> 0 then
+          ImportError('Llama import: granitemoe shared_intermediate_size>0 ' +
+            '(a parallel always-on shared expert, GraniteMoeShared) is not ' +
+            'wired into this importer yet.');
+      end;
+    end
     else // llama
       Result.QKVBias := Obj.Get('attention_bias', False);
     Result.Prefix := ''; // detected from the checkpoint by the builder
@@ -5901,6 +6041,109 @@ begin
   SetLength(MoEBranches, 0);
 end;
 
+// Loads granitemoe's FUSED 3-D expert slab for one block (no Mixtral-style
+// per-expert 2-D tensors). HF GraniteMoeParallelExperts stack every expert
+// into one tensor:
+//   block_sparse_moe.input_linear.weight  [E, 2I, H]  (per expert: gate rows
+//       0..I-1 then up rows I..2I-1; HF chunks input_linear into (gate, up)
+//       and computes silu(gate)*up);
+//   block_sparse_moe.output_linear.weight [E, H, I]   (per expert down);
+//   block_sparse_moe.router.layer.weight  [E, H]      (the router gate).
+// TNNetSwiGLU computes FIRSTHALF*silu(SECONDHALF), so the UP half loads into
+// expert neurons 0..I-1 and the GATE half into I..2I-1 (the same convention
+// as the dense fused gate_up). ResidualScale folds Granite's
+// residual_multiplier into the down (output_linear) rows. Coded by Claude (AI).
+procedure LoadGraniteMoEExperts(Reader: TNNetSafeTensorsReader;
+  var Block: TLlamaBlockLayers; const BlockPrefix: string;
+  NumExperts, HiddenSize, ExpertWidth: integer; ResidualScale: TNeuralFloat;
+  Consumed: TStringList);
+var
+  InName, OutName, RouterName: string;
+  W: TNNetVolume;
+  e, j, i, SrcRow, TwoI: integer;
+begin
+  TwoI := 2 * ExpertWidth;
+  InName := BlockPrefix + 'block_sparse_moe.input_linear.weight';
+  OutName := BlockPrefix + 'block_sparse_moe.output_linear.weight';
+  RouterName := BlockPrefix + 'block_sparse_moe.router.layer.weight';
+  // ---- router gate [E, H] (a plain bias-free nn.Linear over experts) ----
+  if (Reader.DimCount(RouterName) <> 2) or
+     (Reader.DimSize(RouterName, 0) <> NumExperts) or
+     (Reader.DimSize(RouterName, 1) <> HiddenSize) then
+    ImportError('Llama import: "' + RouterName + '" must have shape [' +
+      IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + '], got ' +
+      Reader.ShapeAsString(RouterName));
+  W := TNNetVolume.Create;
+  try
+    EnsureWritableImportWeights(Block.GateConv);
+    Reader.LoadTensorFlat(RouterName, W);
+    for e := 0 to NumExperts - 1 do
+    begin
+      for i := 0 to HiddenSize - 1 do
+        Block.GateConv.Neurons[e].Weights.FData[i] :=
+          W.FData[e * HiddenSize + i];
+      Block.GateConv.Neurons[e].BiasWeight := 0;
+    end;
+    Block.GateConv.FlushWeightCache();
+    Consumed.Add(RouterName);
+    // ---- input_linear [E, 2I, H]: per expert gate|up -> up|gate neurons ----
+    if (Reader.DimCount(InName) <> 3) or
+       (Reader.DimSize(InName, 0) <> NumExperts) or
+       (Reader.DimSize(InName, 1) <> TwoI) or
+       (Reader.DimSize(InName, 2) <> HiddenSize) then
+      ImportError('Llama import: "' + InName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(TwoI) + ', ' +
+        IntToStr(HiddenSize) + '], got ' + Reader.ShapeAsString(InName));
+    Reader.LoadTensorFlat(InName, W); // flat [E*2I, H]
+    for e := 0 to NumExperts - 1 do
+    begin
+      EnsureWritableImportWeights(Block.ExpertGateUp[e]);
+      for j := 0 to ExpertWidth - 1 do
+      begin
+        // UP half (input_linear rows I..2I-1) -> neurons 0..I-1.
+        SrcRow := e * TwoI + ExpertWidth + j;
+        for i := 0 to HiddenSize - 1 do
+          Block.ExpertGateUp[e].Neurons[j].Weights.FData[i] :=
+            W.FData[SrcRow * HiddenSize + i];
+        Block.ExpertGateUp[e].Neurons[j].BiasWeight := 0;
+        // GATE half (input_linear rows 0..I-1) -> neurons I..2I-1.
+        SrcRow := e * TwoI + j;
+        for i := 0 to HiddenSize - 1 do
+          Block.ExpertGateUp[e].Neurons[ExpertWidth + j].Weights.FData[i] :=
+            W.FData[SrcRow * HiddenSize + i];
+        Block.ExpertGateUp[e].Neurons[ExpertWidth + j].BiasWeight := 0;
+      end;
+      Block.ExpertGateUp[e].FlushWeightCache();
+    end;
+    Consumed.Add(InName);
+    // ---- output_linear [E, H, I]: per expert down (residual_multiplier) ----
+    if (Reader.DimCount(OutName) <> 3) or
+       (Reader.DimSize(OutName, 0) <> NumExperts) or
+       (Reader.DimSize(OutName, 1) <> HiddenSize) or
+       (Reader.DimSize(OutName, 2) <> ExpertWidth) then
+      ImportError('Llama import: "' + OutName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + ', ' +
+        IntToStr(ExpertWidth) + '], got ' + Reader.ShapeAsString(OutName));
+    Reader.LoadTensorFlat(OutName, W); // flat [E*H, I]
+    for e := 0 to NumExperts - 1 do
+    begin
+      EnsureWritableImportWeights(Block.ExpertDown[e]);
+      for j := 0 to HiddenSize - 1 do
+      begin
+        SrcRow := e * HiddenSize + j;
+        for i := 0 to ExpertWidth - 1 do
+          Block.ExpertDown[e].Neurons[j].Weights.FData[i] :=
+            ResidualScale * W.FData[SrcRow * ExpertWidth + i];
+        Block.ExpertDown[e].Neurons[j].BiasWeight := 0;
+      end;
+      Block.ExpertDown[e].FlushWeightCache();
+    end;
+    Consumed.Add(OutName);
+  finally
+    W.Free;
+  end;
+end;
+
 // The Llama builder core: builds the net and loads every weight from the
 // ALREADY-OPEN pReader (whose tensor table must use the HF tensor names).
 // Takes OWNERSHIP of pReader (frees it on every path). FileName is used in
@@ -5926,6 +6169,7 @@ var
   RotaryHeadDimArg: integer;
   LayerIsLocal: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
+  LogitScaleFold: TNeuralFloat;
   LayerRoPEScaling: TRoPEScalingConfig;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr, LMHeadName, FusedName: string;
@@ -6014,6 +6258,14 @@ begin
       QWidth := Config.NumHeads * HeadDim;
       KVWidth := Config.NumKVHeads * HeadDim;
       GroupSize := Config.NumHeads div Config.NumKVHeads;
+      // The Granite multipliers default to 1.0 (no-op) in the JSON config
+      // reader, but config builders that start from Default(TLlamaConfig)
+      // (e.g. the GGUF path) leave them 0. Normalize a 0/unset multiplier to
+      // its no-op so EVERY non-Granite path is unaffected by the folds below.
+      if Config.EmbeddingMultiplier = 0 then Config.EmbeddingMultiplier := 1.0;
+      if Config.ResidualMultiplier = 0 then Config.ResidualMultiplier := 1.0;
+      if Config.LogitsScaling = 0 then Config.LogitsScaling := 1.0;
+      // AttentionMultiplier 0 stays 0 = "use SDPA's default 1/sqrt(head_dim)".
       if Reader.HasTensor('model.embed_tokens.weight') then
         Config.Prefix := 'model.'
       else if Reader.HasTensor('embed_tokens.weight') then
@@ -6329,7 +6581,15 @@ begin
       // (Gemma-3 combines it with QueryPreAttnScalar) the fold moves into
       // the per-head q_norm GAINS instead (still ahead of RoPE, which
       // commutes with a scalar).
-      if Config.QueryPreAttnScalar > 0 then
+      // Config.AttentionMultiplier (Granite): HF replaces SDPA's structural
+      // 1/sqrt(head_dim) score scale with attention_multiplier. SDPA here
+      // still divides by sqrt(head_dim), so folding QScale =
+      // attention_multiplier*sqrt(head_dim) into W_q makes the EFFECTIVE
+      // scale attention_multiplier (the same W_q-fold trick as Gemma-2's
+      // query_pre_attn_scalar; the two never co-occur). 0 = the default.
+      if Config.AttentionMultiplier > 0 then
+        QScale := Config.AttentionMultiplier * Sqrt(HeadDim)
+      else if Config.QueryPreAttnScalar > 0 then
         QScale := Sqrt(HeadDim / Config.QueryPreAttnScalar)
       else
         QScale := 1.0;
@@ -6354,17 +6614,32 @@ begin
         // matching HF GemmaForCausalLM (the head ties to the raw matrix).
         if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
           EmbeddingLayer.Neurons[0].Weights.Mul(Config.EmbedScale);
+        // Config.EmbeddingMultiplier (Granite): scale token embeddings AFTER
+        // lookup - folded into the embedding rows like EmbedScale (and, like
+        // EmbedScale, NOT into the tied LM head, which reads the raw Tmp rows
+        // matching HF GraniteForCausalLM tying to the unscaled matrix).
+        if (Config.EmbeddingMultiplier <> 0) and
+           (Config.EmbeddingMultiplier <> 1.0) then
+          EmbeddingLayer.Neurons[0].Weights.Mul(Config.EmbeddingMultiplier);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+        // Config.LogitsScaling (Granite): HF DIVIDES the final logits by
+        // logits_scaling before softmax. Fold 1/logits_scaling into the LM
+        // head rows (exactly the Cohere logit_scale fold, but dividing).
+        if Config.LogitsScaling <> 0 then
+          LogitScaleFold := 1.0 / Config.LogitsScaling
+        else
+          LogitScaleFold := 1.0;
         if Config.TieWordEmbeddings then
         begin
-          // Tied LM head: logits = h . embed^T (rows copied, bias-free).
+          // Tied LM head: logits = (h . embed^T) / logits_scaling (rows
+          // copied with the 1/logits_scaling fold, bias-free).
           EnsureWritableImportWeights(LMHead);
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
               LMHead.Neurons[j].Weights.FData[i] :=
-                Tmp.FData[j * Config.HiddenSize + i];
+                LogitScaleFold * Tmp.FData[j * Config.HiddenSize + i];
             LMHead.Neurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
@@ -6374,7 +6649,7 @@ begin
         else
         begin
           LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
-            Config.HiddenSize, Config.VocabSize);
+            Config.HiddenSize, Config.VocabSize, 0, -1, 0, '', LogitScaleFold);
           MarkConsumed(LMHeadName);
         end;
       finally
@@ -6493,9 +6768,12 @@ begin
           MarkConsumed(BlockPrefix + 'self_attn.v_proj.weight');
           if VBiasName <> '' then MarkConsumed(VBiasName);
         end;
+        // Config.ResidualMultiplier (Granite): scale the attention sublayer
+        // output before the residual add - folded into the o_proj rows (and
+        // the FFN down_proj / expert down rows below). 1.0 = off.
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
           BlockPrefix + 'self_attn.o_proj.weight',
-          QWidth, Config.HiddenSize);
+          QWidth, Config.HiddenSize, 0, -1, 0, '', Config.ResidualMultiplier);
         MarkConsumed(BlockPrefix + 'self_attn.o_proj.weight');
         if Config.GLM4SandwichNorm then
         begin
@@ -6574,6 +6852,17 @@ begin
           // loads into neurons 0..I-1 and the GATE half into neurons I..2I-1.
           if Config.MoEIntermediateSize > 0 then i := Config.MoEIntermediateSize
           else i := Config.IntermediateSize;
+          if Config.MoEGraniteNaming then
+          begin
+            // granitemoe: ONE fused 3-D slab per block (input_linear /
+            // output_linear / router). residual_multiplier folds into the
+            // down (output_linear) rows.
+            LoadGraniteMoEExperts(Reader, Blocks[BlockCnt], BlockPrefix,
+              Config.NumLocalExperts, Config.HiddenSize, i,
+              Config.ResidualMultiplier, Consumed);
+            if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+            continue;
+          end;
           if Config.MoEQwen3Naming then
           begin
             // Router gate: bias-free [num_experts, hidden] nn.Linear.
@@ -6665,7 +6954,8 @@ begin
         end;
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
           BlockPrefix + 'mlp.down_proj.weight',
-          Config.IntermediateSize, Config.HiddenSize);
+          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0, '',
+          Config.ResidualMultiplier);
         MarkConsumed(BlockPrefix + 'mlp.down_proj.weight');
         // Re-quantize the block just refilled with checkpoint weights.
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
@@ -14471,6 +14761,35 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildMixtralFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildGraniteFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  // The config reader accepts both 'granite' (dense FFN) and 'granitemoe'
+  // (Mixtral-style MoE FFN); accept whichever the checkpoint declares.
+  Result := BuildLlamaFromSafeTensorsEx(FileName, Config, pSeqLen,
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+  if (Config.ModelType <> 'granite') and (Config.ModelType <> 'granitemoe') then
+  begin
+    Result.Free;
+    Result := nil;
+    ImportError('granite import: config model_type is "' + Config.ModelType +
+      '", expected "granite" or "granitemoe" - use the matching builder or ' +
+      'BuildFromPretrained.');
+  end;
+end;
+
+function BuildGraniteFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildGraniteFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -24947,7 +25266,8 @@ begin
           (ModelType = 'gemma') or (ModelType = 'gemma2') or
           (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
           (ModelType = 'olmo2') or (ModelType = 'mixtral') or
-          (ModelType = 'glm4') then
+          (ModelType = 'glm4') or
+          (ModelType = 'granite') or (ModelType = 'granitemoe') then
     // 'glm4' (architectures ["Glm4ForCausalLM"], THUDM/GLM-4-9B-0414 etc.)
     // raises the four-norm sandwich (post_self_attn_layernorm /
     // post_mlp_layernorm INSIDE the residual branches), partial+interleaved
@@ -24969,6 +25289,10 @@ begin
     // full-width q/k RMSNorm flags. 'mixtral' (["MixtralForCausalLM"])
     // raises the block_sparse_moe flags (per-FFN router gate +
     // num_local_experts SwiGLU experts, renormalized top-k routing).
+    // 'granite' (["GraniteForCausalLM"]) / 'granitemoe'
+    // (["GraniteMoeForCausalLM"]) raise the four Granite scalar multipliers
+    // (embedding / residual / attention / logits), all load-time folds; the
+    // MoE variant adds the fused 3-D expert slab.
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or

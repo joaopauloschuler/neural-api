@@ -205,6 +205,9 @@ type
     procedure TestPhi3LongRoPELogitParity;
     procedure TestGLM4ConfigFromJSONFile;
     procedure TestGLM4LogitParity;
+    procedure TestGraniteConfigFromJSONFile;
+    procedure TestGraniteLogitParity;
+    procedure TestGraniteMoeLogitParity;
     procedure TestBertConfigFromJSONFile;
     procedure TestBertHiddenStateParity;
     procedure TestBertPoolerParity;
@@ -7214,6 +7217,135 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_glm4_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestGraniteConfigFromJSONFile;
+var
+  Config: TLlamaConfig;
+begin
+  Config := ReadLlamaConfigFromJSONFile(
+    FixturePath('tiny_granite_config.json'));
+  AssertEquals('model_type', 'granite', Config.ModelType);
+  AssertEquals('hidden_size', 8, Config.HiddenSize);
+  AssertEquals('intermediate_size', 12, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('num_key_value_heads', 1, Config.NumKVHeads);
+  AssertEquals('vocab_size', 13, Config.VocabSize);
+  AssertTrue('tied lm_head', Config.TieWordEmbeddings);
+  AssertFalse('not MoE (dense FFN)', Config.IsMoE);
+  // The four Granite scalar multipliers are read straight from the config.
+  AssertEquals('embedding_multiplier', 1.7, Config.EmbeddingMultiplier, 1e-6);
+  AssertEquals('residual_multiplier', 0.6, Config.ResidualMultiplier, 1e-6);
+  AssertEquals('attention_multiplier', 2.0, Config.AttentionMultiplier, 1e-6);
+  AssertEquals('logits_scaling', 2.5, Config.LogitsScaling, 1e-6);
+  // The granitemoe variant: same multipliers + the fused MoE flags.
+  Config := ReadLlamaConfigFromJSONFile(
+    FixturePath('tiny_granitemoe_config.json'));
+  AssertEquals('moe model_type', 'granitemoe', Config.ModelType);
+  AssertTrue('granitemoe is MoE', Config.IsMoE);
+  AssertTrue('granitemoe fused naming', Config.MoEGraniteNaming);
+  AssertTrue('granitemoe top-k renorm', Config.MoENormTopK);
+  AssertEquals('num_local_experts', 3, Config.NumLocalExperts);
+  AssertEquals('num_experts_per_tok', 2, Config.MoEExpertsPerTok);
+  AssertEquals('moe embedding_multiplier', 1.7,
+    Config.EmbeddingMultiplier, 1e-6);
+  AssertEquals('moe logits_scaling', 2.5, Config.LogitsScaling, 1e-6);
+end;
+
+// Verifies the IBM Granite 3.x dense import target (HF GraniteForCausalLM,
+// model_type "granite"): tests/fixtures/tiny_granite.* is a pico randomly-
+// initialized model (2 layers, 2 query heads sharing 1 kv head x 4 dims - GQA,
+// hidden 8, vocab 13, TIED lm_head) on the Llama path with the FOUR Granite
+// scalar multipliers RE-RANDOMIZED to non-1.0 values; the generator
+// tools/granite_tiny_fixture.py ASSERTS each multiplier moves the HF logits,
+// so a multiplier-blind import cannot reach parity. All four are load-time
+// folds (embedding_multiplier -> embedding rows; residual_multiplier ->
+// o_proj/down_proj rows; attention_multiplier -> W_q score scale;
+// logits_scaling -> 1/logits_scaling into the tied LM head). Reference logits
+// come from HF transformers (GraniteForCausalLM) in float64.
+procedure TTestNeuralPretrained.TestGraniteLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildGraniteFromSafeTensorsEx(
+    FixturePath('tiny_granite.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_granite_config.json'));
+  try
+    AssertEquals('model_type', 'granite', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertTrue('tied lm_head', Config.TieWordEmbeddings);
+    AssertEquals('embedding_multiplier', 1.7,
+      Config.EmbeddingMultiplier, 1e-6);
+    AssertEquals('residual_multiplier', 0.6,
+      Config.ResidualMultiplier, 1e-6);
+    AssertEquals('attention_multiplier', 2.0,
+      Config.AttentionMultiplier, 1e-6);
+    AssertEquals('logits_scaling', 2.5, Config.LogitsScaling, 1e-6);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_granite_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "granite" (architectures ["GraniteForCausalLM"]) onto the Llama path.
+  NN := BuildFromPretrained(FixturePath('tiny_granite.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_granite_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_granite_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the granitemoe import target (HF GraniteMoeForCausalLM, model_type
+// "granitemoe"): the same four scalar multipliers on a Mixtral-style sparse
+// top-k MoE FFN whose experts live in FUSED 3-D slabs
+// (block_sparse_moe.input_linear [E,2I,H] gate|up, output_linear [E,H,I]
+// down, router.layer.weight [E,H]). granitemoe's gating (softmax over the
+// top-k logits) is identical to Mixtral's top-k renorm. Reference logits come
+// from HF transformers (GraniteMoeForCausalLM) in float64.
+procedure TTestNeuralPretrained.TestGraniteMoeLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildGraniteFromSafeTensorsEx(
+    FixturePath('tiny_granitemoe.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_granitemoe_config.json'));
+  try
+    AssertEquals('model_type', 'granitemoe', Config.ModelType);
+    AssertTrue('is MoE', Config.IsMoE);
+    AssertTrue('fused granite naming', Config.MoEGraniteNaming);
+    AssertEquals('experts', 3, Config.NumLocalExperts);
+    AssertEquals('experts_per_tok', 2, Config.MoEExpertsPerTok);
+    AssertEquals('logits_scaling', 2.5, Config.LogitsScaling, 1e-6);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_granitemoe_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route.
+  NN := BuildFromPretrained(FixturePath('tiny_granitemoe.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_granitemoe_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_granitemoe_logits.json'), 16, 13);
   finally
     NN.Free;
   end;
