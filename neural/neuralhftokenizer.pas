@@ -176,6 +176,9 @@ type
       // DeepSeek-V2/V3 multi-Split+Digits pre-tokenizer (a distinct splitter
       // from the cl100k family -- see SplitDeepSeekPieces).
       FDeepSeekPreTok: boolean;
+      // o200k_base / GPT-4o-family Split pattern (case-aware letter runs --
+      // see SplitO200kPieces).
+      FO200kPreTok: boolean;
       // Metaspace pre-tokenizer (Llama-2 / Mistral SentencePiece-BPE)
       FMetaspacePreTok: boolean;
       FMSReplacement: string;     // usually U+2581
@@ -220,6 +223,8 @@ type
       procedure SplitCl100kPieces(const Segment: string;
         Pieces: TStringList);
       procedure SplitDeepSeekPieces(const Segment: string;
+        Pieces: TStringList);
+      procedure SplitO200kPieces(const Segment: string;
         Pieces: TStringList);
       function MapPieceToByteLevel(const Piece: string): TStringList;
       function FindAddedToken(const Text: string; Position: integer;
@@ -350,6 +355,18 @@ const
   csCl100kSplitPattern =
     '(?i:''s|''t|''re|''ve|''m|''ll|''d)|[^\r\n\p{L}\p{N}]?\p{L}+|' +
     '\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+';
+  // o200k_base / GPT-4o family (gpt-4o, gpt-4o-mini, o1/o3). Differs from
+  // cl100k: the single letter-run alternation is split into two case-aware
+  // alternations ([\p{Lu}...]*[\p{Ll}...]+ and [\p{Lu}...]+[\p{Ll}...]*),
+  // the contraction suffix rides each letter run, \p{N}{1,3} digit groups,
+  // and the punct run trails [\r\n/]* (note the extra '/'). Matched VERBATIM
+  // -- dispatched to SplitO200kPieces.
+  csO200kSplitPattern =
+    '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*' +
+    '[\p{Ll}\p{Lo}\p{M}]+(?i:''s|''t|''re|''ve|''m|''ll|''d)?|' +
+    '[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+' +
+    '[\p{Ll}\p{Lo}\p{M}]*(?i:''s|''t|''re|''ve|''m|''ll|''d)?|' +
+    '\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+';
 
 // Compact CANONICAL Unicode tables (decomposition, composition, combining
 // class) backing the NFD/NFC normalizers below. AUTO-GENERATED from Python
@@ -1008,6 +1025,7 @@ begin
   FSplitPreTok := false;
   FSplitDigitsMax := 1;
   FDeepSeekPreTok := false;
+  FO200kPreTok := false;
   FMetaspacePreTok := false;
   FMSReplacement := csMetaspace;
   FMSPrependScheme := 'always';
@@ -1325,14 +1343,22 @@ var
           'Unsupported Split pre_tokenizer behavior "' +
           PreObj.Get('behavior', '') + '" (only Isolated, invert=false)');
       if Pattern = csQwen2SplitPattern then
-        FSplitDigitsMax := 1
+      begin
+        FSplitDigitsMax := 1;
+        FSplitPreTok := true;
+      end
       else if Pattern = csCl100kSplitPattern then
-        FSplitDigitsMax := 3
+      begin
+        FSplitDigitsMax := 3;
+        FSplitPreTok := true;
+      end
+      else if Pattern = csO200kSplitPattern then
+        // case-aware multi-alternation splitter (distinct from cl100k)
+        FO200kPreTok := true
       else
         raise EHFTokenizerError.Create(
-          'Unsupported Split pre_tokenizer pattern (only the Qwen2 and ' +
-          'Llama-3/cl100k patterns are recognized): ' + Pattern);
-      FSplitPreTok := true;
+          'Unsupported Split pre_tokenizer pattern (only the Qwen2, ' +
+          'Llama-3/cl100k and o200k patterns are recognized): ' + Pattern);
     end
     else
       raise EHFTokenizerError.Create(
@@ -2448,6 +2474,217 @@ begin
   end;
 end;
 
+// Splits a segment with the o200k_base / GPT-4o-family Split pre_tokenizer
+// pattern:
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lo}\p{M}]+
+//                                                       (?i:contraction)? |
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lo}\p{M}]*
+//                                                       (?i:contraction)? |
+//   \p{N}{1,3} |  ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+// Hand-written ordered-alternation matcher (no regex engine). EXACT byte
+// parity is guaranteed only over ASCII letters/digits/punct/whitespace and
+// CJK -- the same approximation stance as SplitCl100kPieces/SplitDeepSeek-
+// Pieces. The Lu/Ll case distinction uses the ASCII case tables; non-ASCII
+// letters are treated as the Ll/Lo (lowercase) class (CJK is Lo, and most
+// accented Latin in the test corpus is lowercase), so the two letter
+// alternations collapse to the cl100k single letter run for those scripts.
+// \p{M} combining marks are treated as letters (no separate table).
+procedure TNeuralHFTokenizer.SplitO200kPieces(const Segment: string;
+  Pieces: TStringList);
+var
+  CPs: array of cardinal;
+  CPStr: array of string;
+  Total, Position, Idx, RunEnd, LastNL: integer;
+
+  function Collect(StartIdx, EndIdx: integer): string;
+  var
+    J: integer;
+  begin
+    Result := '';
+    for J := StartIdx to EndIdx do Result := Result + CPStr[J];
+  end;
+
+  function LowerAscii(CP: cardinal): cardinal;
+  begin
+    if (CP >= Ord('A')) and (CP <= Ord('Z')) then Result := CP + 32
+    else Result := CP;
+  end;
+
+  // \p{Lu}\p{Lt}\p{Lm} approximated by ASCII A-Z.
+  function IsUpperLetterCP(CP: cardinal): boolean;
+  begin
+    Result := (CP >= Ord('A')) and (CP <= Ord('Z'));
+  end;
+
+  // \p{Ll}\p{Lo}\p{M} approximated: any letter that is not ASCII-upper.
+  function IsLowerLetterCP(CP: cardinal): boolean;
+  begin
+    Result := IsLetterCP(CP) and (not IsUpperLetterCP(CP));
+  end;
+
+  function IsNewlineCP(CP: cardinal): boolean;
+  begin
+    Result := (CP = 10) or (CP = 13);
+  end;
+
+  // (?i:'s|'t|'re|'ve|'m|'ll|'d) at StartIdx -- match length or 0.
+  function MatchContractionCI(StartIdx: integer): integer;
+  var
+    C1, C2: cardinal;
+  begin
+    Result := 0;
+    if StartIdx > High(CPs) then Exit;
+    if CPs[StartIdx] <> Ord('''') then Exit;
+    if StartIdx + 1 > High(CPs) then Exit;
+    C1 := LowerAscii(CPs[StartIdx + 1]);
+    if (C1 = Ord('s')) or (C1 = Ord('t')) or (C1 = Ord('m')) or
+      (C1 = Ord('d')) then Exit(2);
+    if StartIdx + 2 > High(CPs) then Exit;
+    C2 := LowerAscii(CPs[StartIdx + 2]);
+    if ((C1 = Ord('r')) and (C2 = Ord('e'))) or
+      ((C1 = Ord('v')) and (C2 = Ord('e'))) or
+      ((C1 = Ord('l')) and (C2 = Ord('l'))) then Exit(3);
+  end;
+
+  // Tries the two letter alternations starting at Idx. Returns the index of
+  // the LAST matched codepoint (>= Idx) or -1 when neither alternation
+  // matches. HasLead := the segment may start with ONE optional
+  // [^\r\n\p{L}\p{N}] char glued to the letter run.
+  function MatchLetterAlt(Idx: integer): integer;
+  var
+    P, UpperEnd, LowerEnd: integer;
+    LeadOk: boolean;
+  begin
+    Result := -1;
+    P := Idx;
+    LeadOk := false;
+    // optional leading non-CR/LF non-letter non-number char
+    if (P <= High(CPs)) and (not IsNewlineCP(CPs[P])) and
+      (not IsLetterCP(CPs[P])) and (not IsNumberCP(CPs[P])) then
+    begin
+      LeadOk := true;
+      Inc(P);
+    end;
+    // [\p{Lu}...]* greedy uppercase run
+    UpperEnd := P - 1;
+    while (P <= High(CPs)) and IsUpperLetterCP(CPs[P]) do
+    begin
+      UpperEnd := P;
+      Inc(P);
+    end;
+    // [\p{Ll}...]+ : alt 1 requires >=1 lowercase letter here
+    LowerEnd := P - 1;
+    while (P <= High(CPs)) and IsLowerLetterCP(CPs[P]) do
+    begin
+      LowerEnd := P;
+      Inc(P);
+    end;
+    if LowerEnd >= UpperEnd + 1 then
+    begin
+      // alt 1 matched (had at least one lowercase letter). End = LowerEnd
+      // (+ optional contraction).
+      Result := LowerEnd;
+      Inc(Result, MatchContractionCI(Result + 1));
+      Exit;
+    end;
+    // alt 2: [\p{Lu}...]+[\p{Ll}...]* -- needs >=1 uppercase letter (no
+    // lowercase was consumed because alt 1 failed). The uppercase run above
+    // already is the [\p{Lu}...]+; lowercase run is empty.
+    if UpperEnd >= Idx then
+    begin
+      Result := UpperEnd;
+      Inc(Result, MatchContractionCI(Result + 1));
+      Exit;
+    end;
+    // Neither letter alternation produced a letter. If the only thing
+    // matched was the optional lead char, the alternation does NOT apply
+    // (the lead char is part of the punct alternation instead).
+    if LeadOk then Result := -1;
+  end;
+
+begin
+  // decode UTF-8 into codepoint arrays
+  SetLength(CPs, Length(Segment));
+  SetLength(CPStr, Length(Segment));
+  Total := 0;
+  Position := 1;
+  while Position <= Length(Segment) do
+  begin
+    LastNL := Position;
+    CPs[Total] := NextCodePoint(Segment, Position);
+    CPStr[Total] := Copy(Segment, LastNL, Position - LastNL);
+    Inc(Total);
+  end;
+  SetLength(CPs, Total);
+  SetLength(CPStr, Total);
+
+  Idx := 0;
+  while Idx < Total do
+  begin
+    // 1+2. letter alternations (case-aware) -- tried before everything else
+    RunEnd := MatchLetterAlt(Idx);
+    if RunEnd >= Idx then
+    begin
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
+      continue;
+    end;
+    // 3. \p{N}{1,3}
+    if IsNumberCP(CPs[Idx]) then
+    begin
+      RunEnd := Idx;
+      while (RunEnd + 1 < Total) and (RunEnd - Idx + 1 < 3) and
+        IsNumberCP(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
+    end
+    // 4.  ?[^\s\p{L}\p{N}]+[\r\n/]*   (note: trailing run includes '/')
+    else if IsOtherCP(CPs[Idx]) or ((CPs[Idx] = 32) and (Idx + 1 < Total)
+      and IsOtherCP(CPs[Idx + 1])) then
+    begin
+      RunEnd := Idx; // optional leading space or first punct char
+      while (RunEnd + 1 < Total) and IsOtherCP(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      while (RunEnd + 1 < Total) and (IsNewlineCP(CPs[RunEnd + 1]) or
+        (CPs[RunEnd + 1] = Ord('/'))) do
+        Inc(RunEnd);
+      Pieces.Add(Collect(Idx, RunEnd));
+      Idx := RunEnd + 1;
+    end
+    else
+    begin // whitespace alternatives over the run [Idx..RunEnd]
+      RunEnd := Idx;
+      while (RunEnd + 1 < Total) and IsWhitespaceCP(CPs[RunEnd + 1]) do
+        Inc(RunEnd);
+      // 5. \s*[\r\n]+ : up to (and including) the LAST newline in the run
+      LastNL := -1;
+      for Position := Idx to RunEnd do
+        if IsNewlineCP(CPs[Position]) then LastNL := Position;
+      if LastNL >= 0 then
+      begin
+        Pieces.Add(Collect(Idx, LastNL));
+        Idx := LastNL + 1;
+      end
+      else if RunEnd + 1 >= Total then
+      begin // 6. \s+(?!\S) : trailing whitespace takes the whole run
+        Pieces.Add(Collect(Idx, RunEnd));
+        Idx := RunEnd + 1;
+      end
+      else if RunEnd > Idx then
+      begin // 6. \s+(?!\S) : leave the last char to attach to what follows
+        Pieces.Add(Collect(Idx, RunEnd - 1));
+        Idx := RunEnd;
+      end
+      else
+      begin // 7. \s+ : a single whitespace char before non-space
+        Pieces.Add(CPStr[Idx]);
+        Inc(Idx);
+      end;
+    end;
+  end;
+end;
+
 // Maps a raw piece to its byte-level alphabet symbols (one mapped
 // codepoint per input byte). Caller frees the result.
 function TNeuralHFTokenizer.MapPieceToByteLevel(
@@ -2841,6 +3078,27 @@ begin
     Pieces := TStringList.Create();
     try
       SplitDeepSeekPieces(Seg, Pieces);
+      for Cnt := 0 to Pieces.Count - 1 do
+      begin
+        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
+        try
+          BPEWord(Symbols, Ids);
+        finally
+          Symbols.Free;
+        end;
+      end;
+    finally
+      Pieces.Free;
+    end;
+  end
+  else if FO200kPreTok then
+  begin
+    // Sequence[Split(o200k-style), ByteLevel(use_regex=false)]:
+    // case-aware hand-written splitter, then byte-level alphabet + BPE
+    // per piece (NO GPT-2 regex pass).
+    Pieces := TStringList.Create();
+    try
+      SplitO200kPieces(Seg, Pieces);
       for Cnt := 0 to Pieces.Count - 1 do
       begin
         Symbols := MapPieceToByteLevel(Pieces[Cnt]);

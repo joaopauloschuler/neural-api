@@ -259,8 +259,21 @@ rather than acted on.
       a WHOLE (MatchesDeepSeekSequence) and dispatched to SplitDeepSeekPieces
       (a distinct splitter: \s?-prefixed letter/punct runs, separate CJK run,
       individual digits, \s+$ trailing). Test TestSplitDeepSeekParityWithHF +
-      split_deepseek fixture. REMAINING sub-tasks: (i) o200k (GPT-4o-family)
-      Split pattern — add when a GPT-4o checkpoint matters; (ii) DeepSeek-V3
+      split_deepseek fixture. REMAINING sub-tasks: (i) DONE — o200k_base
+      (GPT-4o family: gpt-4o/gpt-4o-mini/o1/o3) Split pattern recognized
+      verbatim (csO200kSplitPattern) and dispatched to a dedicated
+      case-aware SplitO200kPieces splitter (two letter alternations
+      [\p{Lu}...]*[\p{Ll}...]+ and [\p{Lu}...]+[\p{Ll}...]*, \p{N}{1,3}
+      digits, the [\r\n/]* punct trailing run that adds '/'). The Lu/Ll
+      split uses the ASCII case tables; non-ASCII letters fall into the
+      Ll/Lo class, so byte parity is guaranteed over ASCII letters (incl
+      case transitions like HelloWorld->Hello+World, iPhone->i+Phone),
+      digits, punct (incl '/'), and whitespace — the SAME approximation
+      stance as the cl100k/DeepSeek splitters. Test
+      TestSplitO200kParityWithHF + split_o200k fixture group
+      (tools/hf_pretok_fixture.py build_o200k_split). RESIDUAL GAP: non-ASCII
+      Latin AND CJK parity for SplitO200kPieces (would need the exact o200k
+      Lu/Ll/Lo class tables ported to Pascal); (ii) DeepSeek-V3
       pre-tokenizer (different shape: \p{N}{1,3} + packed punct+letter Split,
       NO Digits stage) — not matched by MatchesDeepSeekSequence, falls through
       and raises; add a V3 variant when V3 is imported; (iii) non-ASCII Latin

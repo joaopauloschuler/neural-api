@@ -39,6 +39,7 @@ type
     procedure TestSplitQwen2ParityWithHF;
     procedure TestSplitCl100kParityWithHF;
     procedure TestSplitDeepSeekParityWithHF;
+    procedure TestSplitO200kParityWithHF;
     procedure TestByteLevelNoRegexParityWithHF;
     procedure TestMetaspacePreTokenizerParityWithHF;
     procedure TestRejectsUnknownSplitPattern;
@@ -332,6 +333,15 @@ end;
 procedure TTestNeuralHFTokenizer.TestSplitDeepSeekParityWithHF;
 begin
   RunParityBattery('split_deepseek');
+end;
+
+// o200k_base / GPT-4o-family Split pattern (case-aware letter alternations,
+// \p{N}{1,3} digits, [\r\n/]* punct trailing). Cases are restricted to the
+// classes SplitO200kPieces reproduces exactly: ASCII letters (with case
+// transitions), digits, punct (incl '/'), whitespace incl tabs/CR/LF, CJK.
+procedure TTestNeuralHFTokenizer.TestSplitO200kParityWithHF;
+begin
+  RunParityBattery('split_o200k');
 end;
 
 // STANDALONE ByteLevel(use_regex=false): the GPT-2 regex split must be

@@ -36,6 +36,14 @@ QWEN2_PATTERN = (
 CL100K_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
     r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+# o200k_base / GPT-4o family (gpt-4o, gpt-4o-mini, o1/o3). The canonical
+# tiktoken o200k_base pat_str, ported to the HF `tokenizers` Split form.
+O200K_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*"
+    r"[\p{Ll}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+"
+    r"[\p{Ll}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+    r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+")
 
 # The DeepSeek-V2 / V2-Lite pre_tokenizer is a Sequence of several Split
 # stages with huge explicit Unicode letter/punct/CJK ranges + a
@@ -176,6 +184,56 @@ DEEPSEEK_CASES = [
 ]
 
 
+# o200k cases: ASCII letters (with case transitions to exercise the two
+# case-aware letter alternations), digits, punct (incl '/' for the [\r\n/]*
+# trailing run) and whitespace -- the classes SplitO200kPieces reproduces
+# EXACTLY. Non-ASCII (accented Latin AND CJK) is intentionally avoided: the
+# HF onig engine distinguishes \p{Lu}/\p{Ll}/\p{Lo} per script while the
+# Pascal classifier treats every non-ASCII letter as the Ll/Lo class, so byte
+# parity is only guaranteed over ASCII letters/digits/punct/whitespace (the
+# same approximation stance as the cl100k/DeepSeek splitters).
+O200K_CASES = [
+    "Hello world",
+    "HelloWorld and ABCdef",
+    "iPhone XMLParser HTTPSConnection",
+    "the cat SAT on the MAT",
+    "Don't stop, DON'T ever STOP! it'LL be",
+    "numbers 12345 and 3.14 and 1000000",
+    "path/to/file and a/b/c/d",
+    "  leading and  multiple   spaces",
+    "trailing space ",
+    "tabs\tand\nnewlines",
+    "lines\n\n  with blanks\r\nand CRLF\n",
+    "punct!!?\n\nthen text",
+    "slash//then/text and ///",
+    "a !!! b  .  c",
+    "MixedCASE123and456Words",
+    "ALLCAPS then lower then Title Case",
+    "",
+]
+
+
+def build_o200k_split():
+    name = 'tiny_bpe_split_o200k_tokenizer.json'
+    path = os.path.join(FIXDIR, name)
+    if not os.path.exists(path):
+        tok = Tokenizer(models.BPE())
+        tok.pre_tokenizer = pre_tokenizers.Sequence([
+            pre_tokenizers.Split(Regex(O200K_PATTERN), behavior="isolated",
+                                 invert=False),
+            pre_tokenizers.ByteLevel(add_prefix_space=False,
+                                     use_regex=False),
+        ])
+        tok.decoder = decoders.ByteLevel()
+        trainer = trainers.BpeTrainer(
+            vocab_size=400, special_tokens=["<|endoftext|>", "<|im_end|>"],
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+        tok.train_from_iterator(CORPUS + ["你好世界", "中文测试"], trainer)
+        tok.save(path)
+    tok = Tokenizer.from_file(path)  # verify (re)load
+    return path, dump_cases(tok, O200K_CASES, ["x<|im_end|>y"])
+
+
 def build_deepseek_split():
     path = os.path.join(FIXDIR, 'tiny_bpe_split_deepseek_tokenizer.json')
     if not os.path.exists(path):
@@ -271,6 +329,7 @@ def main():
                                   QWEN2_PATTERN)
     c_path, c_cases = build_split('tiny_bpe_split_cl100k_tokenizer.json',
                                   CL100K_PATTERN)
+    o_path, o_cases = build_o200k_split()
     d_path, d_cases = build_deepseek_split()
     b_path, b_cases = build_bytelevel_noregex()
     m_path, m_cases = build_metaspace_pretok()
@@ -281,6 +340,8 @@ def main():
                           "cases": q_cases}
     out["split_cl100k"] = {"tokenizer": os.path.basename(c_path),
                            "cases": c_cases}
+    out["split_o200k"] = {"tokenizer": os.path.basename(o_path),
+                          "cases": o_cases}
     out["split_deepseek"] = {"tokenizer": os.path.basename(d_path),
                              "cases": d_cases}
     out["bytelevel_noregex"] = {"tokenizer": os.path.basename(b_path),
@@ -289,7 +350,7 @@ def main():
                                "cases": m_cases}
     with open(cases_path, 'w') as f:
         json.dump(out, f, ensure_ascii=False, indent=1)
-    for p in (q_path, c_path, d_path, b_path, m_path, cases_path):
+    for p in (q_path, c_path, o_path, d_path, b_path, m_path, cases_path):
         print(p, os.path.getsize(p), 'bytes')
 
 
