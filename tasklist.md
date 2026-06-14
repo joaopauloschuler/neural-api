@@ -391,7 +391,7 @@ rather than acted on.
       Hungarian matcher (that is training-only) — just threshold the per-query class
       softmax. Pico parity vs HF float64 + an examples/ObjectDetection demo that
       draws boxes on one CPU image.
-- [ ] Diffusion sampler / noise-scheduler unit (neuraldiffusion.pas) — the repo
+- [X] Diffusion sampler / noise-scheduler unit (neuraldiffusion.pas) — the repo
       has the diffusion/flow EXAMPLES (DiffusionMNIST, FlowMatching) but every one
       hand-rolls its own noising loop inline; there is NO reusable, tested sampler.
       Add a small unit with the standard reverse-process schedulers — DDPM

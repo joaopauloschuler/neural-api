@@ -100,6 +100,7 @@ uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
   neuralnetwork,
   neuralvolume,
+  neuraldiffusion,
   neuraldatasets;
 
 const
@@ -139,9 +140,22 @@ const
   cFullBatch  = 32;
   cFullGrid   = 10;         // 10x10 class-conditional grid
 
+type
+  // Wraps the network's classifier-free-guided eps prediction as a
+  // TNNetDenoiseCallback (procedure-of-object) so the reusable
+  // TNNetDiffusionScheduler can drive the reverse process. ReqDigit is the
+  // class requested for the current sampling trajectory.
+  // Coded by Claude (AI).
+  TCFGDenoiser = class(TObject)
+  public
+    ReqDigit: integer;
+    procedure Denoise(Xt, Output: TNNetVolume; t: integer);
+  end;
+
 var
-  // Precomputed schedule tables, index 1..cT (index 0 unused / = identity).
-  Beta, Alpha, AlphaBar, SqrtAlphaBar, SqrtOneMinusAlphaBar: array[0..cT] of TNeuralFloat;
+  // Reusable scheduler holding the precomputed beta/alpha/alpha_bar tables.
+  Sched: TNNetDiffusionScheduler;
+  Denoiser: TCFGDenoiser;
 
   NN: TNNet;
   ImgIn, TimeIn, LabelIn, TimeEmb: TNNetLayer;
@@ -152,26 +166,6 @@ var
 
   Steps, BatchSz, GridN: integer;
   FullMode: boolean;
-
-  // Build the linear-beta schedule and its derived alpha_bar tables.
-  procedure BuildSchedule;
-  var
-    i: integer;
-    Prod: TNeuralFloat;
-  begin
-    Beta[0] := 0; Alpha[0] := 1; AlphaBar[0] := 1;
-    SqrtAlphaBar[0] := 1; SqrtOneMinusAlphaBar[0] := 0;
-    Prod := 1.0;
-    for i := 1 to cT do
-    begin
-      Beta[i]  := cBeta1 + (cBetaT - cBeta1) * (i - 1) / (cT - 1);
-      Alpha[i] := 1.0 - Beta[i];
-      Prod     := Prod * Alpha[i];
-      AlphaBar[i] := Prod;
-      SqrtAlphaBar[i]         := Sqrt(Prod);
-      SqrtOneMinusAlphaBar[i] := Sqrt(1.0 - Prod);
-    end;
-  end;
 
   // One conv -> GroupNorm -> FiLM(time) -> conv block at the current spatial
   // resolution. Returns the block output layer (the post-FiLM refinement).
@@ -261,19 +255,11 @@ var
   end;
 
   // Forward-noise Img0 to timestep t: ImgT = sqrt(ab)*x0 + sqrt(1-ab)*eps,
-  // filling EpsTrue with the sampled noise (the training target).
+  // filling EpsTrue with the sampled noise (the training target). The forward
+  // process now comes from the reusable scheduler (q_sample).
   procedure NoiseToTimestep(t: integer);
-  var
-    i: integer;
-    eps: TNeuralFloat;
   begin
-    for i := 0 to Img0.Size - 1 do
-    begin
-      eps := RandG(0, 1);       // mean 0, std 1
-      EpsTrue.FData[i] := eps;
-      ImgT.FData[i] := SqrtAlphaBar[t] * Img0.FData[i] +
-                       SqrtOneMinusAlphaBar[t] * eps;
-    end;
+    Sched.AddNoise(Img0, ImgT, t, {NoiseOut=}EpsTrue);
   end;
 
   // Mean-squared error between the network's eps_hat and EpsTrue.
@@ -380,64 +366,35 @@ var
     end;
   end;
 
-  // Ancestral DDPM reverse sampling for ONE image of class y, leaving x_0 in
-  // Dst. Uses CFG at each step.
-  // x_{t-1} = 1/sqrt(alpha_t) * (x_t - beta_t/sqrt(1-ab_t) * eps_hat)
-  //           + sqrt(beta_t) * z     (z=0 at t=1)
-  procedure SampleOne(Dst: TNNetVolume; y: integer; Eps: TNNetVolume);
-  var
-    t, i: integer;
-    coef, invSqrtAlpha, sigma, z: TNeuralFloat;
+  // TNNetDenoiseCallback adapter: produce the CFG-guided eps for the digit set
+  // in Denoiser.ReqDigit. This is the single model hook the reusable scheduler
+  // calls at each reverse step.
+  procedure TCFGDenoiser.Denoise(Xt, Output: TNNetVolume; t: integer);
   begin
-    // Start from pure Gaussian noise x_T.
+    PredictEpsCFG(Xt, Output, t, ReqDigit, cGuidance);
+  end;
+
+  // Ancestral DDPM reverse sampling for ONE image of class y, leaving x_0 in
+  // Dst, via the reusable scheduler (full T-step ancestral loop + CFG).
+  procedure SampleOne(Dst: TNNetVolume; y: integer; Eps: TNNetVolume);
+  var i: integer;
+  begin
     for i := 0 to Dst.Size - 1 do
-      Dst.FData[i] := RandG(0, 1);
-    for t := cT downto 1 do
-    begin
-      PredictEpsCFG(Dst, Eps, t, y, cGuidance);
-      invSqrtAlpha := 1.0 / Sqrt(Alpha[t]);
-      coef := Beta[t] / SqrtOneMinusAlphaBar[t];
-      if t > 1 then sigma := Sqrt(Beta[t]) else sigma := 0;
-      for i := 0 to Dst.Size - 1 do
-      begin
-        if t > 1 then z := RandG(0, 1) else z := 0;
-        Dst.FData[i] := invSqrtAlpha *
-          (Dst.FData[i] - coef * Eps.FData[i]) + sigma * z;
-      end;
-    end;
+      Dst.FData[i] := RandG(0, 1);              // start from pure noise x_T
+    Denoiser.ReqDigit := y;
+    Sched.Sample(Dst, @Denoiser.Denoise, cT, smDDPM, 0.0);
   end;
 
   // DETERMINISTIC DDIM (eta=0) sampling for ONE image of class y, leaving x_0 in
-  // Dst, over a strided subsequence of NumSteps timesteps (NumSteps << cT). Uses
-  // CFG at each step. DDIM update with t_prev the previous timestep in the
-  // subsequence (0 at the end):
-  //   x0_pred    = (x_t - sqrt(1-abar_t)*eps) / sqrt(abar_t)
-  //   x_{t_prev} = sqrt(abar_{t_prev})*x0_pred + sqrt(1-abar_{t_prev})*eps
+  // Dst, over a strided subsequence of NumSteps timesteps (NumSteps << cT), via
+  // the reusable scheduler. Uses CFG at each step.
   procedure SampleOneDDIM(Dst: TNNetVolume; y, NumSteps: integer; Eps: TNNetVolume);
-  var
-    k, i, t, tPrev: integer;
-    x0, abT, abPrev, sqrtAbPrev, sqrtOneAbPrev: TNeuralFloat;
+  var i: integer;
   begin
     for i := 0 to Dst.Size - 1 do
       Dst.FData[i] := RandG(0, 1);
-    for k := NumSteps - 1 downto 0 do
-    begin
-      // Map subsequence index k to an actual timestep in 1..cT (evenly strided).
-      t := 1 + Round(k * (cT - 1) / (NumSteps - 1));
-      if k > 0
-        then tPrev := 1 + Round((k - 1) * (cT - 1) / (NumSteps - 1))
-        else tPrev := 0;                        // 0 -> abar=1 (clean image)
-      PredictEpsCFG(Dst, Eps, t, y, cGuidance);
-      abT := AlphaBar[t];
-      abPrev := AlphaBar[tPrev];                // AlphaBar[0] = 1
-      sqrtAbPrev := Sqrt(abPrev);
-      sqrtOneAbPrev := Sqrt(1.0 - abPrev);
-      for i := 0 to Dst.Size - 1 do
-      begin
-        x0 := (Dst.FData[i] - SqrtOneMinusAlphaBar[t] * Eps.FData[i]) / Sqrt(abT);
-        Dst.FData[i] := sqrtAbPrev * x0 + sqrtOneAbPrev * Eps.FData[i];
-      end;
-    end;
+    Denoiser.ReqDigit := y;
+    Sched.Sample(Dst, @Denoiser.Denoise, NumSteps, smDDIM, 0.0);
   end;
 
   // Sample a CLASS-CONDITIONAL grid: each ROW r requests the same digit
@@ -532,7 +489,10 @@ begin
     Exit;
   end;
 
-  BuildSchedule;
+  // Reusable linear-beta scheduler (neuraldiffusion.pas) replaces the former
+  // hand-rolled inline schedule tables and sampling loops.
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  Denoiser := TCFGDenoiser.Create;
 
   CreateMNISTVolumes(TrainV, ValV, TestV, 'train', 't10k');
   WriteLn('Loaded MNIST: ', TrainV.Count, ' train digits.');
@@ -565,6 +525,8 @@ begin
     TimeVol.Free;
     LabelVol.Free;
     NN.Free;
+    Sched.Free;
+    Denoiser.Free;
     TrainV.Free;
     ValV.Free;
     TestV.Free;

@@ -18,7 +18,8 @@ uses
   TestNeuralLengthGrouped,
   TestNeuralMaskedLM,
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy,
-  TestNeuralTokenizer, TestNeuralImagePreprocess;
+  TestNeuralTokenizer, TestNeuralImagePreprocess,
+  TestNeuralDiffusion;
 
 type
   TMyTestRunner = class(TTestRunner)
