@@ -269,37 +269,14 @@ rather than acted on.
         ChatML-with-image) in neuralchat.pas + examples/LlavaDescribe demo that
         captions a small image on CPU (ulimit-bounded). Edit examples/README.md
         (NOT the main README) for the new example.
-- [X] SigLIP image-text dual-encoder importer (model_type "siglip" /
-      "siglip2"; google/siglip-base-patch16-224, siglip-so400m-patch14-384).
-      LANDED: BuildSigLIPFromSafeTensors[WithConfig] + ReadSigLIPConfigFrom
-      JSONFile/TSigLIPConfig/SigLIPConfigToString + reusable
-      BuildSigLIPVisionTower (with a pVisionFeatures skip-pooling/select-hidden
-      -layer mode for LLaVA/VLM consumers) + SigLIPLogit, in neuralpretrained.pas.
-      Reuses CLIP's pre-LN encoder block (TClipTowerConfig / AddClipEncoderBlock
-      / LoadClipEncoderBlockWeights) but keeps SigLIP's DISTINCT heads on their
-      own path (NOT force-fit onto CLIP): (a) logit_scale AND logit_bias both
-      loaded, score = exp(scale)*cosine + bias (per-pair sigmoid); (b) text
-      tower BIDIRECTIONAL, pools the LAST token through a BIASED head; vision
-      MAP head = TNNetSoftPrompt probe + manually-built TNNetCrossAttention
-      (probe Q over patch K/V, nn.MultiheadAttention in_proj_weight sliced into
-      Q/K/V) then out = attn + mlp(LayerNorm(attn)), row 0 — no new layer TYPE;
-      (c) gelu_pytorch_tanh (chaGeluTanh); (d) BIASED patch conv, NO class
-      token, position table = num_patches rows, post_layernorm. Pico fixture
-      tools/siglip_tiny_fixture.py + tests/fixtures/tiny_siglip.* (HF float64
-      SiglipModel oracle, every SigLIP-vs-CLIP quirk self-checked); parity
-      tests TestSigLIP{ConfigFromJSONFile,Parity,VisionFeatures} all < 1e-4
-      (image embed, text embed, logit matrix, logit_scale+logit_bias load).
-      examples/SigLIPZeroShot zero-shot demo (sigmoid + softmax columns), runs
-      offline on the fixture; examples/README.md updated. BuildFromPretrained
-      rejects siglip/siglip2 (two-net) pointing at the builder.
-  - [ ] SigLIP follow-up: NaFlex / variable-resolution siglip2. v1 scopes to
-        the FIXED-resolution siglip/siglip2 base configs (square image_size,
-        learned position table over a fixed num_patches grid). NaFlex siglip2
-        supports per-image patch counts (aspect-ratio-preserving resize to a
-        variable token grid) with attention pooling over the variable grid and
-        a padding/attention mask — needs a variable-SeqLen vision input, an
-        interpolated/resampled position table, and key-padding-masked MAP
-        pooling. Not yet wired.
+- [ ] SigLIP follow-up: NaFlex / variable-resolution siglip2 (the landed
+      BuildSigLIPFromSafeTensors scopes to the FIXED-resolution siglip/siglip2
+      base configs: square image_size, learned position table over a fixed
+      num_patches grid). NaFlex siglip2 supports per-image patch counts
+      (aspect-ratio-preserving resize to a variable token grid) with attention
+      pooling over the variable grid and a padding/attention mask — needs a
+      variable-SeqLen vision input, an interpolated/resampled position table,
+      and key-padding-masked MAP pooling. Not yet wired.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
@@ -428,32 +405,6 @@ rather than acted on.
       same approximation stance as the cl100k splitter; would need the exact
       DeepSeek letter-class range table ported to Pascal). Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
-- [X] Parameter groups for the optimizer (PyTorch param_groups port):
-      per-group learning-rate multipliers and weight-decay exclusion for
-      norm/bias parameters (AdamW currently decays everything uniformly).
-      LANDED: opt-in TNeuralFitBase.ExcludeBiasAndNormFromWeightDecay routes the
-      L2Decay path through TNNet.ComputeL2Decay(ExcludeBias) which skips the
-      per-neuron bias (norm gains were already excluded via the
-      TNNetIdentityWithoutL2 no-op override; AdamW's ApplyDecoupledWeightDecay
-      already skipped both). NormAndBiasLearningRateMul (default 1.0) reapplies
-      a per-group LR multiplier to norm layers via
-      TNNet.ScaleNormLayerLearningRate after each base-LR broadcast. Both OFF by
-      default (bit-identical legacy path). Tests TestParamGroupDefaultsOff /
-      TestL2DecayDefaultDecaysBias / TestL2DecayExcludeBiasKeepsBias /
-      TestNormLayerLearningRateMultiplier in tests/TestNeuralFit.pas.
-- [ ] Encoder-decoder safetensors exporter follow-ups (GPT-2 / Llama / Qwen3 /
-      BERT / GPT-NeoX / BLOOM / Mamba / RWKV / T5 / Marian / BART / mBART /
-      Pegasus HF-names exporters all LANDED as exact bit-for-bit inverses of
-      their importers; SaveBart/Pegasus/MBartToSafeTensors share one
-      SaveBartFamilyToSafeTensors worker, round-trip tests in
-      TestNeuralPretrained.pas):
-  - [X] M2M100/NLLB safetensors exporter (SaveM2M100ToSafeTensors) — the last
-        open encoder-decoder exporter; rides the same SaveBartFamilyToSafeTensors
-        worker via the Pegasus parameter set (no layernorm_embedding, final
-        per-stack layer_norm, PosOffset<0 so sinusoidal positions are
-        regenerated not serialized), inverting BuildM2M100FromSafeTensors.
-        Round-trip bit-exact test TestM2M100SafeTensorsRoundTrip like the
-        BART/mBART/Pegasus trio.
 - [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
       (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
       llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
