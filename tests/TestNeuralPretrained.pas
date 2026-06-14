@@ -242,6 +242,7 @@ type
     procedure TestClipConfigFromJSONFile;
     procedure TestClipParity;
     procedure TestClipVisionFeatures;
+    procedure TestClipImagePreprocess;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -10568,6 +10569,112 @@ begin
     ImageInput.Free;
     VisionNet.Free;
     Reader.Free;
+  end;
+end;
+
+// Step 2 of the LLaVA import: ReadClipImageProcessorConfig +
+// ClipPreprocessImage must reproduce HF's CLIPImageProcessor normalized RGB
+// tensor. The oracle (tools/clip_image_preprocess_fixture.py) pins two
+// images: a parity image already at the working size (resize/crop are
+// identities -> rescale+normalize is byte-exact) and a 2x image whose
+// center-crop is an exact integer crop (no interpolation). Both compared
+// against HF pixel_values [3][H][W]; our (W,H,3) Dst[x,y,c] = ref[c][y][x].
+procedure TTestNeuralPretrained.TestClipImagePreprocess;
+var
+  Config: TClipImageProcessorConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Src, Dst: TNNetVolume;
+  Crop: integer;
+
+  function MaxDiffAgainst(const ImgKey, RefKey: string;
+    ResizeOff: boolean): double;
+  var
+    ImgArr, RefArr, RowArr, PixArr, RefChan, RefRow: TJSONArray;
+    H, W, X, Y, C: integer;
+    Cfg: TClipImageProcessorConfig;
+    D: double;
+  begin
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find(ImgKey));
+    RefArr := TJSONArray(TJSONObject(RefRoot).Find(RefKey));
+    AssertTrue(ImgKey + ' present', ImgArr <> nil);
+    AssertTrue(RefKey + ' present', RefArr <> nil);
+    H := ImgArr.Count;
+    W := TJSONArray(ImgArr.Items[0]).Count;
+    // Load HWC uint8 image into a (W, H, 3) channel-last volume.
+    Src.ReSize(W, H, 3);
+    for Y := 0 to H - 1 do
+    begin
+      RowArr := TJSONArray(ImgArr.Items[Y]);
+      for X := 0 to W - 1 do
+      begin
+        PixArr := TJSONArray(RowArr.Items[X]);
+        for C := 0 to 2 do
+          Src[X, Y, C] := PixArr.Items[C].AsFloat;
+      end;
+    end;
+    Cfg := Config;
+    if ResizeOff then Cfg.DoResize := false;
+    ClipPreprocessImage(Src, Dst, Cfg);
+    AssertEquals('crop width', Crop, Dst.SizeX);
+    AssertEquals('crop height', Crop, Dst.SizeY);
+    AssertEquals('crop depth', 3, Dst.Depth);
+    Result := 0;
+    // HF ref is [3][Crop][Crop] = [c][y][x].
+    for C := 0 to 2 do
+    begin
+      RefChan := TJSONArray(RefArr.Items[C]);
+      for Y := 0 to Crop - 1 do
+      begin
+        RefRow := TJSONArray(RefChan.Items[Y]);
+        for X := 0 to Crop - 1 do
+        begin
+          D := Abs(Dst[X, Y, C] - RefRow.Items[X].AsFloat);
+          if D > Result then Result := D;
+        end;
+      end;
+    end;
+  end;
+
+var
+  MaxDiff: double;
+begin
+  Config := ReadClipImageProcessorConfig(
+    FixturePath('tiny_clip_preprocessor_config.json'));
+  AssertEquals('shortest_edge', 8, Config.ShortestEdge);
+  AssertEquals('crop height', 8, Config.CropHeight);
+  AssertEquals('crop width', 8, Config.CropWidth);
+  AssertTrue('do_normalize', Config.DoNormalize);
+  AssertTrue('do_rescale', Config.DoRescale);
+  AssertTrue('mean[0] ~ 0.4814',
+    Abs(Config.Mean[0] - 0.48145466) < 1e-6);
+  AssertTrue('std[2] ~ 0.2757',
+    Abs(Config.Std[2] - 0.27577711) < 1e-6);
+
+  Crop := Config.CropWidth;
+  Src := TNNetVolume.Create;
+  Dst := TNNetVolume.Create;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_clip_preprocess.json'));
+    RefRoot := GetJSON(RefJson.Text);
+
+    // parity image: resize + center-crop are identities; byte-exact path.
+    MaxDiff := MaxDiffAgainst('parity_image', 'parity_ref',
+      {ResizeOff=}false);
+    AssertTrue('parity preprocess: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // 2x image, resize off: center-crop is an exact integer crop.
+    MaxDiff := MaxDiffAgainst('crop_image', 'crop_ref', {ResizeOff=}true);
+    AssertTrue('center-crop preprocess: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+    Dst.Free;
+    Src.Free;
   end;
 end;
 

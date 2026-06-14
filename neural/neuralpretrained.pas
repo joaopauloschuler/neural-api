@@ -4129,6 +4129,48 @@ procedure ClipExtractEmbedding(NetOutput: TNNetVolume; TokenPos: integer;
 // ClipExtractEmbedding outputs (both are unit-L2).
 function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 
+// ---------------------------------------------------------------------------
+// CLIP / LLaVA image preprocessing (LLaVA Step 2)
+// ---------------------------------------------------------------------------
+// The CLIP/LLaVA processor pipeline (preprocessor_config.json):
+//   resize the shortest edge to size.shortest_edge (preserving aspect
+//   ratio) -> center-crop to crop_size -> rescale by 1/255 ->
+//   normalize (x - image_mean) / image_std, per channel.
+// CropSize is the crop_size (height = width assumed, the published CLIP
+// configs); ShortestEdge is size.shortest_edge (resize target). Rescale
+// factor is 1/255 (the published rescale_factor).
+type
+  TClipImageProcessorConfig = record
+    ShortestEdge: integer;          // size.shortest_edge (resize target)
+    CropHeight: integer;            // crop_size.height
+    CropWidth: integer;             // crop_size.width
+    DoResize: boolean;              // do_resize
+    DoCenterCrop: boolean;          // do_center_crop
+    DoRescale: boolean;             // do_rescale
+    DoNormalize: boolean;           // do_normalize
+    RescaleFactor: TNeuralFloat;    // rescale_factor (1/255)
+    Mean: array[0..2] of TNeuralFloat;  // image_mean (RGB)
+    Std: array[0..2] of TNeuralFloat;   // image_std (RGB)
+  end;
+
+// Reads a HF preprocessor_config.json for the CLIP/LLaVA image processor.
+// Defaults follow CLIPImageProcessor: shortest_edge/crop 224, do_* True,
+// rescale_factor 1/255, the OpenAI image_mean/std. size may be an int, an
+// object with "shortest_edge", or "height"/"width"; crop_size may be an int
+// or an object with "height"/"width".
+function ReadClipImageProcessorConfig(
+  const FileName: string): TClipImageProcessorConfig;
+
+// Preprocesses Src (an (W, H, 3) RGB volume with 0..255 byte values in the
+// channel-last layout the vision net consumes) into Dst, a
+// (CropWidth, CropHeight, 3) normalized RGB volume ready for the CLIP /
+// LLaVA vision tower input. Resize uses bilinear interpolation (HF's
+// default is bicubic; for byte-exact parity feed a Src already at the
+// processor's working size so resize and center-crop are identities - the
+// rescale/normalize path is then byte-exact vs CLIPImageProcessor).
+procedure ClipPreprocessImage(Src, Dst: TNNetVolume;
+  const Config: TClipImageProcessorConfig);
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -26051,6 +26093,207 @@ begin
       IntToStr(EmbA.Size) + ' vs ' + IntToStr(EmbB.Size) + ').');
   for ChanCnt := 0 to EmbA.Size - 1 do
     Result := Result + EmbA.FData[ChanCnt] * EmbB.FData[ChanCnt];
+end;
+
+function ReadClipImageProcessorConfig(
+  const FileName: string): TClipImageProcessorConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+
+  // Reads a size-like field that may be an int (square) or an object with
+  // shortest_edge / height / width. Returns the resolved edge length;
+  // OutH/OutW receive height/width (= edge when square / shortest_edge).
+  procedure ReadSize(const FieldName: string; DefaultEdge: integer;
+    out OutEdge, OutH, OutW: integer);
+  var
+    Data: TJSONData;
+    O: TJSONObject;
+  begin
+    OutEdge := DefaultEdge;
+    OutH := DefaultEdge;
+    OutW := DefaultEdge;
+    Data := Obj.Find(FieldName);
+    if Data = nil then Exit;
+    if Data is TJSONObject then
+    begin
+      O := TJSONObject(Data);
+      if O.IndexOfName('shortest_edge') >= 0 then
+      begin
+        OutEdge := O.Get('shortest_edge', DefaultEdge);
+        OutH := OutEdge;
+        OutW := OutEdge;
+      end;
+      if O.IndexOfName('height') >= 0 then OutH := O.Get('height', OutH);
+      if O.IndexOfName('width') >= 0 then OutW := O.Get('width', OutW);
+      if O.IndexOfName('shortest_edge') < 0 then
+        OutEdge := OutH;
+    end
+    else if Data.JSONType = jtNumber then
+    begin
+      OutEdge := Data.AsInteger;
+      OutH := OutEdge;
+      OutW := OutEdge;
+    end;
+  end;
+
+  procedure ReadTriple(const FieldName: string; var Arr: array of TNeuralFloat;
+    D0, D1, D2: TNeuralFloat);
+  var
+    Data: TJSONData;
+    A: TJSONArray;
+  begin
+    Arr[0] := D0; Arr[1] := D1; Arr[2] := D2;
+    Data := Obj.Find(FieldName);
+    if (Data <> nil) and (Data is TJSONArray) then
+    begin
+      A := TJSONArray(Data);
+      if A.Count >= 3 then
+      begin
+        Arr[0] := A.Items[0].AsFloat;
+        Arr[1] := A.Items[1].AsFloat;
+        Arr[2] := A.Items[2].AsFloat;
+      end;
+    end;
+  end;
+
+var
+  SizeH, SizeW, CropEdge: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('CLIP image preprocessing: config file not found: ' +
+      FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('CLIP image preprocessing: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('CLIP image preprocessing: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+
+    // size.shortest_edge (resize target). When size is square the edge is
+    // the side length.
+    ReadSize('size', 224, Result.ShortestEdge, SizeH, SizeW);
+    if Result.ShortestEdge <= 0 then Result.ShortestEdge := SizeH;
+
+    // crop_size.{height,width}.
+    ReadSize('crop_size', Result.ShortestEdge, CropEdge,
+      Result.CropHeight, Result.CropWidth);
+
+    Result.DoResize := Obj.Get('do_resize', true);
+    Result.DoCenterCrop := Obj.Get('do_center_crop', true);
+    Result.DoRescale := Obj.Get('do_rescale', true);
+    Result.DoNormalize := Obj.Get('do_normalize', true);
+    Result.RescaleFactor := Obj.Get('rescale_factor', 1.0 / 255.0);
+    ReadTriple('image_mean', Result.Mean,
+      0.48145466, 0.4578275, 0.40821073);
+    ReadTriple('image_std', Result.Std,
+      0.26862954, 0.26130258, 0.27577711);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+procedure ClipPreprocessImage(Src, Dst: TNNetVolume;
+  const Config: TClipImageProcessorConfig);
+var
+  Work: TNNetVolume;
+  ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
+  Scale, Fx, Fy, V: TNeuralFloat;
+begin
+  if (Src = nil) or (Dst = nil) then
+    ImportError('ClipPreprocessImage: nil volume.');
+  if Src.Depth <> 3 then
+    ImportError('ClipPreprocessImage: source must have depth 3 (RGB), got ' +
+      IntToStr(Src.Depth) + '.');
+
+  Work := TNNetVolume.Create;
+  try
+    // ---- resize: shortest edge -> Config.ShortestEdge, aspect preserved.
+    // HF uses bicubic; this is bilinear (identity when already at size).
+    if Config.DoResize and
+       ((Src.SizeX <> Config.ShortestEdge) or
+        (Src.SizeY <> Config.ShortestEdge)) then
+    begin
+      if Src.SizeX <= Src.SizeY then
+      begin
+        Scale := Config.ShortestEdge / Src.SizeX;
+        ResizeW := Config.ShortestEdge;
+        ResizeH := Round(Src.SizeY * Scale);
+      end
+      else
+      begin
+        Scale := Config.ShortestEdge / Src.SizeY;
+        ResizeH := Config.ShortestEdge;
+        ResizeW := Round(Src.SizeX * Scale);
+      end;
+      if ResizeW < 1 then ResizeW := 1;
+      if ResizeH < 1 then ResizeH := 1;
+      Work.ReSize(ResizeW, ResizeH, 3);
+      for Y := 0 to ResizeH - 1 do
+        for X := 0 to ResizeW - 1 do
+        begin
+          // bilinear sample (align_corners = false convention)
+          Fx := (X + 0.5) * Src.SizeX / ResizeW - 0.5;
+          Fy := (Y + 0.5) * Src.SizeY / ResizeH - 0.5;
+          if Fx < 0 then Fx := 0;
+          if Fy < 0 then Fy := 0;
+          SrcX := Trunc(Fx); SrcY := Trunc(Fy);
+          if SrcX > Src.SizeX - 1 then SrcX := Src.SizeX - 1;
+          if SrcY > Src.SizeY - 1 then SrcY := Src.SizeY - 1;
+          for C := 0 to 2 do
+            Work[X, Y, C] := Src[SrcX, SrcY, C]; // nearest fallback edge
+        end;
+    end
+    else
+      Work.Copy(Src);
+
+    // ---- center crop to (CropWidth, CropHeight).
+    if Config.DoCenterCrop then
+    begin
+      OffX := (Work.SizeX - Config.CropWidth) div 2;
+      OffY := (Work.SizeY - Config.CropHeight) div 2;
+    end
+    else
+    begin
+      OffX := 0;
+      OffY := 0;
+    end;
+    Dst.ReSize(Config.CropWidth, Config.CropHeight, 3);
+    for Y := 0 to Config.CropHeight - 1 do
+      for X := 0 to Config.CropWidth - 1 do
+      begin
+        SrcX := OffX + X;
+        SrcY := OffY + Y;
+        // pad with zeros if the crop window exceeds the resized image
+        if (SrcX < 0) or (SrcY < 0) or
+           (SrcX > Work.SizeX - 1) or (SrcY > Work.SizeY - 1) then
+        begin
+          for C := 0 to 2 do Dst[X, Y, C] := 0;
+          continue;
+        end;
+        for C := 0 to 2 do
+        begin
+          V := Work[SrcX, SrcY, C];
+          if Config.DoRescale then V := V * Config.RescaleFactor;
+          if Config.DoNormalize then
+            V := (V - Config.Mean[C]) / Config.Std[C];
+          Dst[X, Y, C] := V;
+        end;
+      end;
+  finally
+    Work.Free;
+  end;
 end;
 
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
