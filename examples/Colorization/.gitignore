@@ -1,0 +1,10 @@
+# Example outputs and build artifacts — never commit these.
+colorized/
+*.nn
+*.csv
+Colorization
+*.o
+*.ppu
+*.res
+data_batch_*.bin
+test_batch.bin

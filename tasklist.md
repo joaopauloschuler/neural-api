@@ -462,7 +462,7 @@ rather than acted on.
       rectangular-mask generator and the masked-region-weighted loss; the network is
       stock conv encoder-decoder + skip connections. CPU-friendly on CIFAR-10 /
       Tiny ImageNet; writes before/after triplets. Edit examples/README.md.
-- [ ] Image colorization example (examples/Colorization) — a self-supervised
+- [X] Image colorization example (examples/Colorization) — a self-supervised
       generative-vision gap: predict the chroma (CIELAB a*b* channels) of an image
       from its luminance (L) channel, so any grayscale photo can be auto-colorized.
       A conv encoder-decoder (or the landed U-Net) trained with per-pixel regression
