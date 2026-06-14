@@ -344,14 +344,6 @@ rather than acted on.
       (TNNetTorchBinReader path); (b) real x4 upscale of a tiny PNG end-to-end
       example; (c) scale=2 / other scales (currently only scale=4 = two upsample
       stages wired).
-- [ ] VQ-VAE discrete image autoencoder + autoregressive prior example
-      (examples/VQVAE) — goes beyond the existing VQCodebookUsage/Collapse
-      DIAGNOSTIC examples: train a full encoder -> vector-quantizer -> decoder to
-      reconstruct MNIST/CIFAR into a grid of discrete codebook indices (commitment
-      loss + straight-through estimator), then fit a small autoregressive prior
-      (the landed TinyGPT/decoder stack) over the index grid to GENERATE new
-      images by sampling tokens and decoding. First discrete-latent generative
-      pipeline; precursor to VQGAN/MaskGIT.
 - [ ] Next-frame video prediction example (examples/VideoPrediction, Moving-MNIST)
       — fills the VIDEO gap (the repo has no spatiotemporal example). A
       ConvLSTM-style recurrent encoder-decoder that watches N frames and predicts
@@ -360,26 +352,6 @@ rather than acted on.
       the landed TNNetMinLSTM but with conv instead of dense gates and a spatial
       cell state); otherwise compose from existing conv + gating layers. Generates
       a short MNIST-digit-trajectory rollout on CPU.
-- [X] VGG-16/19 importer (BuildVGGFromSafeTensors, torchvision/timm) — DONE.
-      TVGGConfig + ReadVGGConfigFromJSONFile + VGGConfigToString + BuildVGG /
-      BuildVGGFromSafeTensors[Ex] in neuralpretrained.pas (plain Conv3x3-pad1-ReLU
-      stack split into 5 stages by 2x2 stride-2 MaxPool, AdaptiveAvgPool2d no-op /
-      global-pool, 3-FC classifier; conv bias loaded via LoadResNetConvBias, FC via
-      LoadLlamaLinearWeights). Taps EXPOSED via out TapLayerIdx[0..4] = layer
-      indices of relu1_2/2_2/3_3/4_3/relu5_<n> (the ReLU after each stage's last
-      conv); a downstream consumer reads NN.Layers[TapLayerIdx[k]].Output after a
-      full Compute, OR sets Config.FeatureTapStage in 1..5 to build a truncated
-      feature extractor (classifier dropped, no trailing pool on the tap stage).
-      Parity: tools/vgg_tiny_fixture.py pico float64 numpy oracle (torchvision not
-      installed); TestVGGConfigParity / TestVGGLogitParity (logits max|diff| < 1e-4)
-      / TestVGGFeatureTaps (all 5 tap maps < 1e-4) in TestNeuralPretrained.pas.
-      Follow-ups: (1) _bn (BatchNorm) variant key wiring (fold path exists in
-      ResNet's LoadResNetConvFoldBN, just needs the shifted features.{i} indices);
-      rejected loudly for now. (2) non-no-op AdaptiveAvgPool2d((7,7)) when the
-      post-stack grid != target (needs a real adaptive-pool layer); only the
-      no-op / unit-grid case is wired. (3) .pth pickle load (safetensors only in
-      v1; TNNetTorchBinReader .bin path is shared via CreatePretrainedTensorReader).
-      (4) real-checkpoint slicer + ImageNet-class top-1 sanity on one real image.
 - [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
       torchvision) — structurally distinct from every landed CNN (parallel
       multi-branch Inception modules with 1x1 / 3x3 / 5x5(as two 3x3) / pool
@@ -405,18 +377,10 @@ rather than acted on.
       generative quality, complementing the landed SuperResolution / SubPixelSuperRes
       / Real-ESRGAN work where pixel MSE is known to be a poor quality proxy.
       Compute the weighted L2 distance between unit-normalized VGG feature maps
-      (reusing the VGG importer above) across the relu taps; ship the official
+      (reusing the landed VGG importer) across the relu taps; ship the official
       linear-head weights (lin layers of richzhang/PerceptualSimilarity) as a tiny
       imported tensor. Parity vs the reference LPIPS on one image pair; also expose
       it as a training loss so SR examples can opt into perceptual fine-tuning.
-- [ ] Neural style transfer example (examples/StyleTransfer, Gatys et al.) — a
-      classic, self-contained, visually-compelling CV-generative example with no
-      training loop: optimize the PIXELS of a canvas image (gradient ascent on the
-      input, the infra the GradientAscent example already exercises) to jointly
-      match content activations and style Gram matrices of a reference pair, using
-      the VGG feature taps above. New code is the Gram-matrix layer/helper and the
-      content+style loss; produces a stylized PNG of a tiny CPU image. Reuses the
-      perceptual-feature backbone and closes the loop on "what is VGG good for here".
 - [ ] DETR object-detection importer (BuildDetrFromSafeTensors,
       facebook/detr-resnet-50) — the FIRST object-detection importer, a wholly new
       CV vertical (bounding boxes + class per box, not a single label / dense map).
