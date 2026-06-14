@@ -4846,6 +4846,81 @@ function BuildViTFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// TORCHVISION RESNET IMPORT (the FIRST trained CONV-NET weight import; every
+// other importer is a transformer/LLM or a ViT). Targets the torchvision
+// resnet18 / resnet34 (BasicBlock) and resnet50 (Bottleneck) state_dict and
+// produces ImageNet-1k logits. The torchvision key scheme is:
+//   conv1.weight, bn1.{weight,bias,running_mean,running_var}
+//   layer{1..4}.{0..}.conv{1..}.weight, layer{1..4}.{0..}.bn{1..}.*
+//   layer{1..4}.0.downsample.0.weight (1x1 conv), .downsample.1.* (bn)
+//   fc.{weight,bias}
+// Each Conv2d has bias=False and is followed by a BatchNorm2d; the importer
+// FOLDS each BN into the preceding conv at load time (the bias-into-conv fold
+//   w' = w*gamma/sqrt(var+eps);  b' = beta - gamma*mean/sqrt(var+eps)
+// loaded into the conv+bias layer; precedent: the Llama/BitNet RMSNorm folds).
+// Stem = conv1 7x7 s2 p3 + bn + relu + maxpool 3x3 s2 p1; then layer1..layer4
+// (stride 2 on the first block of layers 2..4, identity/1x1-downsample
+// shortcut); global avg pool (TNNetAvgChannel) -> fc -> num_labels logits.
+// NOTE: CAI's TNNetMaxPool with padding uses ceil() sizing + edge-clamped
+// windows + zero padding, which differs from torchvision's floor()+(-inf)
+// maxpool; the pico parity fixture replicates the CAI maxpool semantics, so
+// real torchvision-checkpoint maxpool parity is a documented follow-up.
+// Coded by Claude (AI).
+
+const
+  // ResNet variants. BasicBlock (resnet18/34): two 3x3 convs, expansion 1.
+  // Bottleneck (resnet50/101/152): 1x1 -> 3x3 -> 1x1, expansion 4.
+  cResNetBasicBlocks: array[0..3] of integer = (2, 2, 2, 2);   // resnet18
+  cResNet34Blocks: array[0..3] of integer = (3, 4, 6, 3);      // resnet34
+  cResNet50Blocks: array[0..3] of integer = (3, 4, 6, 3);      // resnet50
+
+type
+  TResNetBlockKind = (rbkBasic, rbkBottleneck);
+
+  TResNetConfig = record
+    Depth: integer;                  // 18 / 34 / 50
+    BlockKind: TResNetBlockKind;     // basic (18/34) or bottleneck (50)
+    BlocksPerStage: array[0..3] of integer; // layer1..layer4 block counts
+    StageWidths: array[0..3] of integer;    // base conv widths per stage
+    Expansion: integer;              // 1 (basic) or 4 (bottleneck)
+    StemWidth: integer;              // conv1 out channels (64 in torchvision)
+    ImageSize: integer;              // 224 for torchvision ImageNet
+    NumChannels: integer;            // 3
+    NumLabels: integer;              // fc out width (1000 ImageNet-1k)
+    BnEps: TNeuralFloat;             // BatchNorm2d eps (1e-5 in torchvision)
+    ModelType: string;               // 'resnet'
+  end;
+
+// Reads a torchvision-style ResNet config. The only REQUIRED field is "depth"
+// (18 / 34 / 50). Optional overrides: image_size (224), num_channels (3),
+// num_labels / id2label / label2id (1000), bn_eps (1e-5), and the pico-fixture
+// keys "widths" (4-int array) + "blocks_per_stage" (4-int array) which, when
+// present, override the canonical torchvision stage widths/counts so a tiny
+// random fixture can be described. Unknown depths are rejected loudly.
+function ReadResNetConfigFromJSONFile(
+  const FileName: string): TResNetConfig;
+
+function ResNetConfigToString(const Config: TResNetConfig): string;
+
+// Builds the torchvision ResNet described by Config and loads every weight
+// from Reader (caller owns Reader), folding each BatchNorm into its conv. The
+// net takes an (ImageSize, ImageSize, NumChannels) ImageNet-normalized RGB
+// volume and outputs (1, 1, NumLabels) class logits.
+function BuildResNet(Reader: TNNetSafeTensorsReader;
+  const Config: TResNetConfig; pInferenceOnly: boolean = false): TNNet;
+
+// Builds + loads the ResNet classifier from the checkpoint at FileName
+// (.safetensors / sharded index / pytorch_model.bin). Config is supplied by
+// the caller (Ex) or read from ConfigFileName ('' = "config.json" beside
+// FileName) and returned. Net owned by caller. Output: (1,1,num_labels).
+function BuildResNetFromSafeTensorsEx(const FileName: string;
+  const Config: TResNetConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildResNetFromSafeTensors(const FileName: string;
+  out Config: TResNetConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // DINOv2 SELF-SUPERVISED ViT IMPORT (model_type "dinov2") for general-purpose
 // VISUAL EMBEDDINGS (facebook/dinov2-{small,base,large}). The architecture is
 // the same pre-LN ViT encoder path as the plain "vit" importer above (reusing
@@ -30867,6 +30942,421 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadViTConfigFromJSONFile(ConfigPath);
   Result := BuildViTFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// TORCHVISION RESNET IMPORT (model_type "resnet")  [FIRST conv-net importer]
+// ===========================================================================
+
+function ReadResNetConfigFromJSONFile(
+  const FileName: string): TResNetConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  LabelObj, ArrData: TJSONData;
+  Arr: TJSONArray;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('ResNet import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('ResNet import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('ResNet import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'resnet');
+    if Obj.IndexOfName('depth') < 0 then
+      ImportError('ResNet import: config "' + FileName +
+        '" is missing the required field "depth" (18 / 34 / 50).');
+    Result.Depth := Obj.Get('depth', 0);
+    // Canonical torchvision layouts keyed by depth. Stage base widths are the
+    // same for every depth (64,128,256,512); the block KIND and per-stage
+    // block COUNT differ. Unknown depths are rejected loudly.
+    Result.StageWidths[0] := 64;
+    Result.StageWidths[1] := 128;
+    Result.StageWidths[2] := 256;
+    Result.StageWidths[3] := 512;
+    Result.StemWidth := 64;
+    case Result.Depth of
+      18: begin
+        Result.BlockKind := rbkBasic; Result.Expansion := 1;
+        for i := 0 to 3 do Result.BlocksPerStage[i] := cResNetBasicBlocks[i];
+      end;
+      34: begin
+        Result.BlockKind := rbkBasic; Result.Expansion := 1;
+        for i := 0 to 3 do Result.BlocksPerStage[i] := cResNet34Blocks[i];
+      end;
+      50: begin
+        Result.BlockKind := rbkBottleneck; Result.Expansion := 4;
+        for i := 0 to 3 do Result.BlocksPerStage[i] := cResNet50Blocks[i];
+      end;
+    else
+      ImportError('ResNet import: unsupported depth ' +
+        IntToStr(Result.Depth) + ' - only resnet18 / resnet34 / resnet50 ' +
+        'are supported (resnet101/152 and ConvNeXt are follow-ups).');
+    end;
+    Result.ImageSize := Obj.Get('image_size', 224);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.BnEps := Obj.Get('bn_eps', 0.00001);
+    // pico-fixture overrides: tiny stage widths / block counts.
+    ArrData := Obj.Find('widths');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 4 then
+        ImportError('ResNet import: "widths" must have 4 entries, got ' +
+          IntToStr(Arr.Count) + '.');
+      for i := 0 to 3 do Result.StageWidths[i] := Arr.Integers[i];
+      Result.StemWidth := Result.StageWidths[0];
+    end;
+    ArrData := Obj.Find('blocks_per_stage');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 4 then
+        ImportError('ResNet import: "blocks_per_stage" must have 4 entries, ' +
+          'got ' + IntToStr(Arr.Count) + '.');
+      for i := 0 to 3 do Result.BlocksPerStage[i] := Arr.Integers[i];
+    end;
+    // num_labels: explicit field, else len(id2label), else len(label2id),
+    // else ImageNet-1k 1000.
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('label2id');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ResNetConfigToString(const Config: TResNetConfig): string;
+var
+  Kind: string;
+begin
+  if Config.BlockKind = rbkBottleneck then Kind := 'bottleneck'
+  else Kind := 'basic';
+  if Config.ModelType = '' then Result := 'resnet'
+  else Result := Config.ModelType;
+  Result := Result + IntToStr(Config.Depth) + ' config: block=' + Kind +
+    ', stages=[' + IntToStr(Config.BlocksPerStage[0]) + ',' +
+    IntToStr(Config.BlocksPerStage[1]) + ',' +
+    IntToStr(Config.BlocksPerStage[2]) + ',' +
+    IntToStr(Config.BlocksPerStage[3]) + ']' +
+    ', widths=[' + IntToStr(Config.StageWidths[0]) + ',' +
+    IntToStr(Config.StageWidths[1]) + ',' +
+    IntToStr(Config.StageWidths[2]) + ',' +
+    IntToStr(Config.StageWidths[3]) + ']' +
+    ', expansion=' + IntToStr(Config.Expansion) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', num_labels=' + IntToStr(Config.NumLabels);
+end;
+
+// Loads a torchvision Conv2d (weight [O,I,kh,kw], bias=False) into a CAI conv
+// layer, FOLDING the following BatchNorm2d into it. The CAI conv stores each
+// neuron's weights depth-contiguous as FData[(ky*K + kx)*I + c] (the layout
+// LoadClipPatchConv uses) and the fold scale/shift go into the weight and
+// BiasWeight. When BnPrefix = '' the conv is loaded without a fold (no BN).
+procedure LoadResNetConvFoldBN(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const ConvWName, BnPrefix: string;
+  OutCh, InCh, K: integer; BnEps: TNeuralFloat);
+var
+  W, Gamma, Beta, Mean, Var_: TNNetVolume;
+  o, c, ky, kx: integer;
+  Scale, Shift, Denom: TNeuralFloat;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(ConvWName) then
+    ImportError('ResNet import: missing tensor "' + ConvWName + '".');
+  if (Reader.DimCount(ConvWName) <> 4) or
+     (Reader.DimSize(ConvWName, 0) <> OutCh) or
+     (Reader.DimSize(ConvWName, 1) <> InCh) or
+     (Reader.DimSize(ConvWName, 2) <> K) or
+     (Reader.DimSize(ConvWName, 3) <> K) then
+    ImportError('ResNet import: "' + ConvWName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '] (nn.Conv2d [out,in,kh,kw]), got ' +
+      Reader.ShapeAsString(ConvWName));
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('ResNet import: internal error - conv "' + ConvWName +
+      '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  if Layer.Neurons[0].Weights.Size <> K * K * InCh then
+    ImportError('ResNet import: internal error - conv "' + ConvWName +
+      '" target neuron has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(K * K * InCh) + '.');
+  W := TNNetVolume.Create;
+  Gamma := TNNetVolume.Create;
+  Beta := TNNetVolume.Create;
+  Mean := TNNetVolume.Create;
+  Var_ := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(ConvWName, W);
+    if BnPrefix <> '' then
+    begin
+      if not Reader.HasTensor(BnPrefix + '.weight') then
+        ImportError('ResNet import: missing BatchNorm tensor "' +
+          BnPrefix + '.weight".');
+      Reader.LoadTensorFlat(BnPrefix + '.weight', Gamma);
+      Reader.LoadTensorFlat(BnPrefix + '.bias', Beta);
+      Reader.LoadTensorFlat(BnPrefix + '.running_mean', Mean);
+      Reader.LoadTensorFlat(BnPrefix + '.running_var', Var_);
+      if (Gamma.Size <> OutCh) or (Beta.Size <> OutCh) or
+         (Mean.Size <> OutCh) or (Var_.Size <> OutCh) then
+        ImportError('ResNet import: BatchNorm "' + BnPrefix +
+          '" parameters must each have ' + IntToStr(OutCh) + ' elements.');
+    end;
+    for o := 0 to OutCh - 1 do
+    begin
+      if BnPrefix <> '' then
+      begin
+        // Fold BN: w' = w * gamma/sqrt(var+eps); b' = beta - gamma*mean/...
+        Denom := Sqrt(Var_.FData[o] + BnEps);
+        Scale := Gamma.FData[o] / Denom;
+        Shift := Beta.FData[o] - Gamma.FData[o] * Mean.FData[o] / Denom;
+      end
+      else
+      begin
+        Scale := 1.0;
+        Shift := 0.0;
+      end;
+      for ky := 0 to K - 1 do
+        for kx := 0 to K - 1 do
+          for c := 0 to InCh - 1 do
+            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+              W.FData[((o * InCh + c) * K + ky) * K + kx] * Scale;
+      Layer.Neurons[o].BiasWeight := Shift;
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
+  end;
+end;
+
+// Adds (architecture) one residual block to NN and returns the layer refs the
+// weight loader needs. AfterStem is the input to the block. For a BasicBlock:
+// conv1(3x3,stride)->relu->conv2(3x3,1), shortcut (identity or 1x1 downsample
+// conv at stride), Add, relu. For a Bottleneck: conv1(1x1,1)->relu->conv2
+// (3x3,stride)->relu->conv3(1x1,1)->[*expansion width], shortcut, Add, relu.
+// Convs carry a bias (suppressBias=0) so the folded BN shift loads into it.
+type
+  TResNetBlockLayers = record
+    Conv1, Conv2, Conv3, Down: TNNetLayer;  // Conv3/Down nil when unused
+  end;
+
+procedure AddResNetBlock(NN: TNNet; const Config: TResNetConfig;
+  BaseWidth, Stride: integer; HasDownsample: boolean;
+  out Refs: TResNetBlockLayers);
+var
+  Input, Branch: TNNetLayer;
+  OutWidth: integer;
+begin
+  Refs.Conv1 := nil; Refs.Conv2 := nil; Refs.Conv3 := nil; Refs.Down := nil;
+  OutWidth := BaseWidth * Config.Expansion;
+  // The block input is the current last layer; build the MAIN branch
+  // sequentially with AddLayer (it follows the input), then attach the
+  // shortcut branch with AddLayerAfter(..., Input) - the same residual idiom
+  // as THistoricalNets.AddResNetUnit (using AddLayerAfter for the main path
+  // would re-insert mid-chain and rewire the input).
+  Input := NN.GetLastLayer();
+  if Config.BlockKind = rbkBasic then
+  begin
+    // torchvision puts the stride on conv1 in a BasicBlock.
+    Refs.Conv1 := NN.AddLayer(
+      TNNetConvolutionLinear.Create(BaseWidth, 3, 1, Stride, 0) );
+    NN.AddLayer( TNNetReLU.Create() );
+    Refs.Conv2 := NN.AddLayer(
+      TNNetConvolutionLinear.Create(OutWidth, 3, 1, 1, 0) );
+  end
+  else
+  begin
+    // Bottleneck: torchvision puts the stride on the 3x3 (conv2).
+    Refs.Conv1 := NN.AddLayer(
+      TNNetConvolutionLinear.Create(BaseWidth, 1, 0, 1, 0) );
+    NN.AddLayer( TNNetReLU.Create() );
+    Refs.Conv2 := NN.AddLayer(
+      TNNetConvolutionLinear.Create(BaseWidth, 3, 1, Stride, 0) );
+    NN.AddLayer( TNNetReLU.Create() );
+    Refs.Conv3 := NN.AddLayer(
+      TNNetConvolutionLinear.Create(OutWidth, 1, 0, 1, 0) );
+  end;
+  Branch := NN.GetLastLayer();
+  if HasDownsample then
+  begin
+    Refs.Down := NN.AddLayerAfter(
+      [TNNetConvolutionLinear.Create(OutWidth, 1, 0, Stride, 0)], Input);
+    NN.AddLayer( TNNetSum.Create([Branch, Refs.Down]) );
+  end
+  else
+    NN.AddLayer( TNNetSum.Create([Branch, Input]) );
+  NN.AddLayer( TNNetReLU.Create() );
+end;
+
+function BuildResNet(Reader: TNNetSafeTensorsReader;
+  const Config: TResNetConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  StemConv, FC: TNNetLayer;
+  BlockRefs: array of TResNetBlockLayers;
+  RefCount, Stage, BlockIdx, Stride, InWidth, BaseWidth, OutWidth: integer;
+  HasDown: boolean;
+  Prefix: string;
+begin
+  if Config.NumChannels < 1 then
+    ImportError('ResNet import: num_channels must be >= 1.');
+  if Config.NumLabels < 1 then
+    ImportError('ResNet import: num_labels must be >= 1.');
+  // Count total blocks to size the ref array.
+  RefCount := 0;
+  for Stage := 0 to 3 do RefCount := RefCount + Config.BlocksPerStage[Stage];
+  SetLength(BlockRefs, RefCount);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    // Stem: conv 7x7 stride2 pad3 (+folded BN bias) -> relu -> maxpool.
+    StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.StemWidth, 7, {pad=}3, {stride=}2, {suppressBias=}0) );
+    NN.AddLayer( TNNetReLU.Create() );
+    NN.AddLayer( TNNetMaxPool.Create({pool=}3, {stride=}2, {pad=}1) );
+    RefCount := 0;
+    InWidth := Config.StemWidth;
+    for Stage := 0 to 3 do
+    begin
+      BaseWidth := Config.StageWidths[Stage];
+      OutWidth := BaseWidth * Config.Expansion;
+      for BlockIdx := 0 to Config.BlocksPerStage[Stage] - 1 do
+      begin
+        if BlockIdx = 0 then
+        begin
+          // First block of layer1 keeps stride 1; layers 2..4 stride 2. The
+          // 1x1 downsample shortcut is present whenever the block changes
+          // spatial size OR channel count (always on block 0 here: layer1's
+          // basic block keeps width but Bottleneck changes it 64->256).
+          if Stage = 0 then Stride := 1 else Stride := 2;
+          HasDown := (Stride <> 1) or (InWidth <> OutWidth);
+        end
+        else
+        begin
+          Stride := 1;
+          HasDown := false;
+        end;
+        AddResNetBlock(NN, Config, BaseWidth, Stride, HasDown,
+          BlockRefs[RefCount]);
+        Inc(RefCount);
+        InWidth := OutWidth;
+      end;
+    end;
+    // Head: global average pool over the spatial grid -> fc -> logits.
+    NN.AddLayer( TNNetAvgChannel.Create() );
+    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadResNetConvFoldBN(Reader, StemConv, 'conv1.weight', 'bn1',
+      Config.StemWidth, Config.NumChannels, 7, Config.BnEps);
+    RefCount := 0;
+    InWidth := Config.StemWidth;
+    for Stage := 0 to 3 do
+    begin
+      BaseWidth := Config.StageWidths[Stage];
+      OutWidth := BaseWidth * Config.Expansion;
+      for BlockIdx := 0 to Config.BlocksPerStage[Stage] - 1 do
+      begin
+        Prefix := 'layer' + IntToStr(Stage + 1) + '.' + IntToStr(BlockIdx);
+        if BlockIdx = 0 then
+        begin
+          if Stage = 0 then Stride := 1 else Stride := 2;
+        end
+        else Stride := 1;
+        if Config.BlockKind = rbkBasic then
+        begin
+          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv1,
+            Prefix + '.conv1.weight', Prefix + '.bn1',
+            BaseWidth, InWidth, 3, Config.BnEps);
+          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv2,
+            Prefix + '.conv2.weight', Prefix + '.bn2',
+            OutWidth, BaseWidth, 3, Config.BnEps);
+        end
+        else
+        begin
+          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv1,
+            Prefix + '.conv1.weight', Prefix + '.bn1',
+            BaseWidth, InWidth, 1, Config.BnEps);
+          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv2,
+            Prefix + '.conv2.weight', Prefix + '.bn2',
+            BaseWidth, BaseWidth, 3, Config.BnEps);
+          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv3,
+            Prefix + '.conv3.weight', Prefix + '.bn3',
+            OutWidth, BaseWidth, 1, Config.BnEps);
+        end;
+        if BlockRefs[RefCount].Down <> nil then
+          LoadResNetConvFoldBN(Reader, BlockRefs[RefCount].Down,
+            Prefix + '.downsample.0.weight', Prefix + '.downsample.1',
+            OutWidth, InWidth, 1, Config.BnEps);
+        Inc(RefCount);
+        InWidth := OutWidth;
+      end;
+    end;
+    // fc: torchvision Linear [num_labels, last_out] with bias.
+    LoadLlamaLinearWeights(Reader, FC, 'fc.weight',
+      Config.StageWidths[3] * Config.Expansion, Config.NumLabels,
+      0, -1, 0, 'fc.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildResNetFromSafeTensorsEx(const FileName: string;
+  const Config: TResNetConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildResNet(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildResNetFromSafeTensors(const FileName: string;
+  out Config: TResNetConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadResNetConfigFromJSONFile(ConfigPath);
+  Result := BuildResNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

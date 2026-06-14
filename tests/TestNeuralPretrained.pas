@@ -272,6 +272,8 @@ type
     procedure TestSigLIPVisionFeatures;
     procedure TestViTConfigFromJSONFile;
     procedure TestViTImageClassificationParity;
+    procedure TestResNetConfigFromJSONFile;
+    procedure TestResNet18ImageClassificationParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
     procedure TestWhisperLogMelFrontend;
@@ -12507,6 +12509,102 @@ begin
       NN.GetLastLayer().Output.Depth);
 
     RefJson.LoadFromFile(FixturePath('tiny_vit_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadResNetConfigFromJSONFile on the committed ResNet18 pico config
+// (the FIRST conv-net importer config). The pico fixture overrides the
+// canonical torchvision stage widths/counts via the "widths" /
+// "blocks_per_stage" keys so it stays KB-scale.
+procedure TTestNeuralPretrained.TestResNetConfigFromJSONFile;
+var
+  Config: TResNetConfig;
+begin
+  Config := ReadResNetConfigFromJSONFile(FixturePath('tiny_resnet18_config.json'));
+  AssertEquals('model_type', 'resnet', Config.ModelType);
+  AssertEquals('depth', 18, Config.Depth);
+  AssertTrue('BasicBlock', Config.BlockKind = rbkBasic);
+  AssertEquals('expansion', 1, Config.Expansion);
+  AssertEquals('image_size', 64, Config.ImageSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('stage0 width', 4, Config.StageWidths[0]);
+  AssertEquals('stage3 width', 12, Config.StageWidths[3]);
+  AssertEquals('stage0 blocks', 2, Config.BlocksPerStage[0]);
+  AssertEquals('stage3 blocks', 2, Config.BlocksPerStage[3]);
+end;
+
+// torchvision ResNet18 image-classification parity test (the FIRST conv-net /
+// non-transformer weight import). tests/fixtures/tiny_resnet18.* is a pico
+// random-init ResNet18 (BasicBlock, image 8, stage widths [4,6,8,12], 2 blocks
+// per stage, 5 labels) whose state_dict mirrors the torchvision key scheme
+// (conv1/bn1, layerN.M.convK/bnK, layerN.0.downsample.0/1, fc). Each BN is
+// FOLDED into its conv at load time. The generator tools/resnet18_tiny_fixture
+// .py computes the reference logits with a self-contained numpy float64 oracle
+// (torchvision is not installed) that replicates the CAI forward path - the
+// same BN fold + CAI maxpool semantics (ceil-sizing, edge-clamped, zero-pad).
+// Asserts the (1,1,num_labels) logits match the oracle < 1e-4.
+procedure TTestNeuralPretrained.TestResNet18ImageClassificationParity;
+var
+  NN: TNNet;
+  Config: TResNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildResNetFromSafeTensors(FixturePath('tiny_resnet18.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_resnet18_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    // TNNetFullConnectLinear head emits the NumLabels logits flat on the X
+    // axis (Size = NumLabels); FData is read flat below.
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_resnet18_logits.json'));
     RefRoot := GetJSON(RefJson.Text);
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     LogitsArr := TJSONArray(TJSONArray(
