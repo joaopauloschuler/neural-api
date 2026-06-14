@@ -438,7 +438,7 @@ rather than acted on.
       (b) the lightweight all-MLP decode head (project each of the 4 stages to a
       common dim, upsample, concat, fuse, 1x1 to num_classes). Pico parity vs HF
       float64 + an examples/SemanticSegmentation that colors a tiny CPU image.
-- [ ] Class-conditional image generation example (examples/ConditionalDiffusion) —
+- [X] Class-conditional image generation example (examples/ConditionalDiffusion) —
       the landed generative image examples (VisualGAN, DiffusionMNIST, FlowMatching)
       are all UNCONDITIONAL; there is no example of steering generation by a class
       label. Train a small label-conditioned denoiser on MNIST (inject the class via

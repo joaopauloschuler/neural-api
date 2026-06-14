@@ -24,6 +24,7 @@ examples/FourierMix/FourierMix
 examples/SpanCorruptionPretrain/SpanCorruptionPretrain
 examples/VQVAE/VQVAE
 examples/VQVAE/diag
+examples/ConditionalDiffusion/ConditionalDiffusion
 link*.res
 autosave.csv
 autosave.nn
@@ -34,6 +35,13 @@ autosave.nn
 # MNIST idx data (symlinks/downloads) + generated images in the VQVAE example
 examples/VQVAE/*-ubyte
 examples/VQVAE/*.png
+
+# MNIST idx data (symlinks) + generated images/logs in ConditionalDiffusion
+examples/ConditionalDiffusion/*-ubyte
+examples/ConditionalDiffusion/*.png
+examples/ConditionalDiffusion/*.log
+examples/ConditionalDiffusion/*.o
+examples/ConditionalDiffusion/*.ppu
 
 # Claude Code (created at repo root)
 .claude/
