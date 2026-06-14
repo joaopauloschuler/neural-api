@@ -360,15 +360,26 @@ rather than acted on.
       the landed TNNetMinLSTM but with conv instead of dense gates and a spatial
       cell state); otherwise compose from existing conv + gating layers. Generates
       a short MNIST-digit-trajectory rollout on CPU.
-- [ ] VGG-16/19 importer (BuildVGGFromSafeTensors, torchvision/timm) — the
-      canonical perceptual-feature backbone that is conspicuously absent (ResNet,
-      ViT, DINOv2 are landed but the plain VGG conv stack is not). Trivial on the
-      existing conv-import idiom (straight Conv3x3-ReLU + MaxPool stack, no residual
-      / norm bookkeeping), and it is the prerequisite feature extractor for
-      perceptual loss, LPIPS and neural style transfer below. Pico parity vs HF
-      float64 + an ImageNet-class top-1 sanity check on one real image. Expose the
-      intermediate ReLU feature maps (relu1_2/2_2/3_3/4_3) as named taps so the
-      perceptual-loss consumers can read them.
+- [X] VGG-16/19 importer (BuildVGGFromSafeTensors, torchvision/timm) — DONE.
+      TVGGConfig + ReadVGGConfigFromJSONFile + VGGConfigToString + BuildVGG /
+      BuildVGGFromSafeTensors[Ex] in neuralpretrained.pas (plain Conv3x3-pad1-ReLU
+      stack split into 5 stages by 2x2 stride-2 MaxPool, AdaptiveAvgPool2d no-op /
+      global-pool, 3-FC classifier; conv bias loaded via LoadResNetConvBias, FC via
+      LoadLlamaLinearWeights). Taps EXPOSED via out TapLayerIdx[0..4] = layer
+      indices of relu1_2/2_2/3_3/4_3/relu5_<n> (the ReLU after each stage's last
+      conv); a downstream consumer reads NN.Layers[TapLayerIdx[k]].Output after a
+      full Compute, OR sets Config.FeatureTapStage in 1..5 to build a truncated
+      feature extractor (classifier dropped, no trailing pool on the tap stage).
+      Parity: tools/vgg_tiny_fixture.py pico float64 numpy oracle (torchvision not
+      installed); TestVGGConfigParity / TestVGGLogitParity (logits max|diff| < 1e-4)
+      / TestVGGFeatureTaps (all 5 tap maps < 1e-4) in TestNeuralPretrained.pas.
+      Follow-ups: (1) _bn (BatchNorm) variant key wiring (fold path exists in
+      ResNet's LoadResNetConvFoldBN, just needs the shifted features.{i} indices);
+      rejected loudly for now. (2) non-no-op AdaptiveAvgPool2d((7,7)) when the
+      post-stack grid != target (needs a real adaptive-pool layer); only the
+      no-op / unit-grid case is wired. (3) .pth pickle load (safetensors only in
+      v1; TNNetTorchBinReader .bin path is shared via CreatePretrainedTensorReader).
+      (4) real-checkpoint slicer + ImageNet-class top-1 sanity on one real image.
 - [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
       torchvision) — structurally distinct from every landed CNN (parallel
       multi-branch Inception modules with 1x1 / 3x3 / 5x5(as two 3x3) / pool

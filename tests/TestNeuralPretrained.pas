@@ -274,6 +274,9 @@ type
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
     procedure TestResNet18ImageClassificationParity;
+    procedure TestVGGConfigParity;
+    procedure TestVGGLogitParity;
+    procedure TestVGGFeatureTaps;
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
     procedure TestVaeEncoderParity;
@@ -12640,6 +12643,181 @@ begin
     end;
     AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadVGGConfigFromJSONFile on the committed pico VGG-16 config.
+procedure TTestNeuralPretrained.TestVGGConfigParity;
+var
+  Config: TVGGConfig;
+begin
+  Config := ReadVGGConfigFromJSONFile(FixturePath('tiny_vgg16_config.json'));
+  AssertEquals('model_type', 'vgg', Config.ModelType);
+  AssertEquals('depth', 16, Config.Depth);
+  AssertEquals('image_size', 64, Config.ImageSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertFalse('batch_norm', Config.BatchNorm);
+  AssertEquals('adaptive_pool', 1, Config.AdaptivePool);
+  AssertEquals('stage0 convs', 2, Config.StageConvs[0]);
+  AssertEquals('stage2 convs', 3, Config.StageConvs[2]);
+  AssertEquals('stage0 width', 4, Config.StageWidths[0]);
+  AssertEquals('stage4 width', 8, Config.StageWidths[4]);
+  AssertEquals('fc_hidden0', 10, Config.FCHidden[0]);
+  AssertEquals('fc_hidden1', 10, Config.FCHidden[1]);
+end;
+
+// Loads pixels from the fixture oracle JSON into an Input volume (shared by the
+// VGG logit + tap tests). [num_channels][image][image] -> (image,image,chan).
+procedure VGGLoadPixels(const Obj: TJSONObject; const Config: TVGGConfig;
+  ImageInput: TNNetVolume);
+var
+  Pixels, RowArr, ChanArr: TJSONArray;
+  ChanCnt, YCnt, XCnt: integer;
+begin
+  Pixels := TJSONArray(Obj.Find('pixels'));
+  ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+  for ChanCnt := 0 to Config.NumChannels - 1 do
+  begin
+    RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+    for YCnt := 0 to Config.ImageSize - 1 do
+    begin
+      ChanArr := TJSONArray(RowArr.Items[YCnt]);
+      for XCnt := 0 to Config.ImageSize - 1 do
+        ImageInput.FData[(YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+          ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+    end;
+  end;
+end;
+
+// torchvision VGG-16 image-classification parity test. tests/fixtures/tiny_vgg16
+// .* is a pico random-init plain VGG (stage_convs [2,2,3,3,3], widths
+// [4,6,8,8,8], fc_hidden [10,10], image 32 -> 1x1 grid after 5 pools, 5
+// labels) whose state_dict mirrors the torchvision SEQUENTIAL key scheme
+// (features.{i}.{weight,bias} on positions 0,2,5,7,..., classifier.{0,3,6}).
+// tools/vgg_tiny_fixture.py computes the reference logits with a self-contained
+// numpy float64 oracle (torchvision not installed) that replicates the CAI
+// forward path (Conv3x3-pad1-ReLU stack + 2x2 stride-2 MaxPool + global pool +
+// FC ReLU classifier). Asserts the (1,1,num_labels) logits match < 1e-4.
+procedure TTestNeuralPretrained.TestVGGLogitParity;
+var
+  NN: TNNet;
+  Config: TVGGConfig;
+  TapIdx: array[0..4] of integer;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  i: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildVGGFromSafeTensors(FixturePath('tiny_vgg16.safetensors'),
+    Config, TapIdx, {pInferenceOnly=}false,
+    FixturePath('tiny_vgg16_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+    RefJson.LoadFromFile(FixturePath('tiny_vgg16_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+    VGGLoadPixels(TJSONObject(RefRoot), Config, ImageInput);
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for i := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[i] - LogitsArr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies the perceptual feature taps: BuildVGG returns the layer indices of
+// the relu1_2..relu5_3 activations; after a full Compute the activation at each
+// tap layer must match the oracle's per-stage last-conv ReLU map (< 1e-4). This
+// is what LPIPS / style transfer reads.
+procedure TTestNeuralPretrained.TestVGGFeatureTaps;
+var
+  NN: TNNet;
+  Config: TVGGConfig;
+  TapIdx: array[0..4] of integer;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  TapsObj: TJSONObject;
+  TapArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  TapOut: TNNetVolume;
+  Stage, j: integer;
+  Diff, MaxDiff: double;
+  TapName: string;
+  TapNames: array[0..4] of string;
+begin
+  RandSeed := 424242;
+  NN := BuildVGGFromSafeTensors(FixturePath('tiny_vgg16.safetensors'),
+    Config, TapIdx, {pInferenceOnly=}false,
+    FixturePath('tiny_vgg16_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    // Tap names match the oracle keys relu{stage}_{nconv}.
+    for Stage := 0 to 4 do
+      TapNames[Stage] := 'relu' + IntToStr(Stage + 1) + '_' +
+        IntToStr(Config.StageConvs[Stage]);
+    for Stage := 0 to 4 do
+      AssertTrue('tap ' + IntToStr(Stage) + ' index set', TapIdx[Stage] >= 0);
+    RefJson.LoadFromFile(FixturePath('tiny_vgg16_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    TapsObj := TJSONObject(TJSONObject(RefRoot).Find('taps'));
+    VGGLoadPixels(TJSONObject(RefRoot), Config, ImageInput);
+    NN.Compute(ImageInput);
+    for Stage := 0 to 4 do
+    begin
+      TapName := TapNames[Stage];
+      TapArr := TJSONArray(TapsObj.Find(TapName));
+      AssertTrue('tap present: ' + TapName, TapArr <> nil);
+      TapOut := NN.Layers[TapIdx[Stage]].Output;
+      // Oracle tap is (C,H,W) row-major; CAI Output is (H,W,C) depth-contiguous.
+      // Compare element counts then values reindexing C-major -> depth-contig.
+      AssertEquals('tap size ' + TapName, TapArr.Count, TapOut.Size);
+      MaxDiff := 0;
+      // oracle index = ((c*H + y)*W + x); CAI FData index = ((y*W + x)*C + c).
+      for j := 0 to TapArr.Count - 1 do
+      begin
+        // map oracle flat j=(c,y,x) to CAI depth-contiguous position.
+        Diff := 0; // computed below
+        // decode c,y,x from oracle layout using tap spatial dims
+        // (TapOut.SizeX/Y/Depth give H=SizeY, W=SizeX, C=Depth).
+        Diff := Abs(
+          TapOut.FData[
+            (((j div TapOut.SizeX) mod TapOut.SizeY) * TapOut.SizeX +
+             (j mod TapOut.SizeX)) * TapOut.Depth +
+            (j div (TapOut.SizeX * TapOut.SizeY))]
+          - TapArr.Items[j].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue('tap ' + TapName + ' max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+    end;
   finally
     RefRoot.Free;
     ImageInput.Free;

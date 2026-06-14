@@ -4921,6 +4921,89 @@ function BuildResNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// VGG-16 / VGG-19 IMPORT (torchvision / timm "vgg", the canonical perceptual-
+// feature backbone and the prerequisite for LPIPS + neural style transfer).
+// The architecture is a STRAIGHT stack with NO residuals or norm bookkeeping:
+//   features: per stage, (stage_convs) x [Conv 3x3 pad1 (+bias) -> ReLU],
+//             then a 2x2 stride-2 MaxPool. VGG-16 stages = [2,2,3,3,3],
+//             VGG-19 = [2,2,4,4,4]; canonical widths = [64,128,256,512,512].
+//   AdaptiveAvgPool2d((7,7)): a NO-OP for the canonical 224 input (the post-
+//             stack map is already 7x7). This importer requires the input to
+//             produce the configured adaptive grid (image_size / 2^5 ==
+//             AdaptivePool) so the pool is the exact no-op global mean per
+//             cell; non-no-op adaptive pooling is a documented follow-up. For
+//             AdaptivePool=1 (the pico fixture, 32->1) the pool is a plain
+//             TNNetAvgChannel global pool; for the 7x7 ImageNet case it is the
+//             identity (the 7x7 grid is fed straight into the flatten+FC).
+//   classifier: Linear(flatten -> 4096) ReLU Dropout Linear(4096 -> 4096)
+//             ReLU Dropout Linear(4096 -> num_labels). Dropout is a no-op at
+//             inference, so it is omitted; the FC widths are configurable.
+// torchvision state_dict keys are SEQUENTIAL inside the nn.Sequential
+// containers: features.{i}.{weight,bias} (i = position in the features
+// Sequential; for the PLAIN config the convs land on 0,2,5,7,10,... and the
+// _bn config inserts a BatchNorm2d after each conv, shifting indices) and
+// classifier.{0,3,6}.{weight,bias}. v1 imports the PLAIN config (no BN); the
+// _bn variant reuses the ResNet conv-BN fold path and is a documented follow-up
+// (see tasklist). The conv weight layout [O,I,kh,kw] and float32 load path are
+// shared with the ResNet importer.
+//
+// PERCEPTUAL TAPS: BuildVGG returns, via out TapLayerIdx, the layer indices of
+// the relu1_2 / relu2_2 / relu3_3 / relu4_3 / relu5_<n> activations (the ReLU
+// after the LAST conv of each stage). A downstream consumer (LPIPS, style
+// transfer) runs the net up to a tap by Compute()-ing the full net and reading
+// NN.Layers[TapLayerIdx[k]].Output, or builds a truncated feature-extractor by
+// passing FeatureTapStage in Config (see BuildVGGFeatureExtractor) which builds
+// the conv stack ONLY up to (and including) the requested stage's last ReLU and
+// drops the classifier. TapLayerIdx[0] = relu1_2, .. TapLayerIdx[4] = relu5_<n>.
+type
+  TVGGConfig = record
+    Depth: integer;                  // 16 / 19 (informational)
+    StageConvs: array[0..4] of integer;  // conv count per stage
+    StageWidths: array[0..4] of integer; // conv width per stage
+    FCHidden: array[0..1] of integer;    // classifier hidden widths (4096,4096)
+    BatchNorm: boolean;              // _bn variant (rejected by builder in v1)
+    AdaptivePool: integer;           // AdaptiveAvgPool2d target grid (7)
+    ImageSize: integer;              // 224 for torchvision ImageNet
+    NumChannels: integer;            // 3
+    NumLabels: integer;              // classifier out width (1000 ImageNet-1k)
+    FeatureTapStage: integer;        // 0 = full net; 1..5 = truncate at that
+                                     // stage's last ReLU (feature extractor)
+    ModelType: string;               // 'vgg'
+  end;
+
+// Reads a torchvision/timm VGG config. Optional "depth" (16 / 19) selects the
+// canonical stage_convs ([2,2,3,3,3] / [2,2,4,4,4]); the pico-fixture keys
+// "stage_convs" + "stage_widths" (5-int arrays) + "fc_hidden" (2-int) override
+// the canonical layout. Optional: image_size (224), num_channels (3),
+// num_labels / id2label / label2id (1000), batch_norm (false), adaptive_pool
+// (7), feature_tap_stage (0). Unknown depths without explicit stage_convs are
+// rejected loudly.
+function ReadVGGConfigFromJSONFile(const FileName: string): TVGGConfig;
+
+function VGGConfigToString(const Config: TVGGConfig): string;
+
+// Builds the torchvision VGG described by Config and loads every conv + FC
+// weight from Reader (caller owns Reader). The net takes an (ImageSize,
+// ImageSize, NumChannels) ImageNet-normalized RGB volume and outputs
+// (1,1,NumLabels) class logits. TapLayerIdx[0..4] returns the layer indices of
+// the per-stage last-conv ReLU taps (relu1_2..relu5_<n>) for perceptual-loss
+// consumers. When Config.FeatureTapStage in 1..5 the classifier is dropped and
+// the net ends at that stage's last ReLU (a feature extractor); the unused tap
+// slots are -1.
+function BuildVGG(Reader: TNNetSafeTensorsReader;
+  const Config: TVGGConfig; out TapLayerIdx: array of integer;
+  pInferenceOnly: boolean = false): TNNet;
+
+function BuildVGGFromSafeTensorsEx(const FileName: string;
+  const Config: TVGGConfig; out TapLayerIdx: array of integer;
+  pInferenceOnly: boolean = false): TNNet;
+
+function BuildVGGFromSafeTensors(const FileName: string;
+  out Config: TVGGConfig; out TapLayerIdx: array of integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // STABLE DIFFUSION VAE DECODER IMPORT (diffusers AutoencoderKL DECODER only,
 // model_type / _class_name "AutoencoderKL", e.g. stabilityai/sd-vae-ft-mse).
 // This is the modular generative decoder that maps a 4-channel latent to an
@@ -31534,6 +31617,320 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadResNetConfigFromJSONFile(ConfigPath);
   Result := BuildResNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// VGG-16 / VGG-19 IMPORT (torchvision / timm "vgg")
+// ===========================================================================
+
+const
+  // Canonical torchvision conv counts per stage, keyed by depth.
+  cVGG16StageConvs: array[0..4] of integer = (2, 2, 3, 3, 3);  // vgg16
+  cVGG19StageConvs: array[0..4] of integer = (2, 2, 4, 4, 4);  // vgg19
+
+function ReadVGGConfigFromJSONFile(const FileName: string): TVGGConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  LabelObj, ArrData: TJSONData;
+  Arr: TJSONArray;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('VGG import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('VGG import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('VGG import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'vgg');
+    Result.Depth := Obj.Get('depth', 16);
+    // Canonical conv counts + widths keyed by depth; overridable below.
+    case Result.Depth of
+      16: for i := 0 to 4 do Result.StageConvs[i] := cVGG16StageConvs[i];
+      19: for i := 0 to 4 do Result.StageConvs[i] := cVGG19StageConvs[i];
+    else
+      // Unknown depth is allowed only if stage_convs is supplied explicitly.
+      if Obj.Find('stage_convs') = nil then
+        ImportError('VGG import: unsupported depth ' + IntToStr(Result.Depth) +
+          ' - only vgg16 / vgg19 are supported (supply "stage_convs" to ' +
+          'override).');
+    end;
+    Result.StageWidths[0] := 64;  Result.StageWidths[1] := 128;
+    Result.StageWidths[2] := 256; Result.StageWidths[3] := 512;
+    Result.StageWidths[4] := 512;
+    Result.FCHidden[0] := 4096;   Result.FCHidden[1] := 4096;
+    // pico-fixture overrides.
+    ArrData := Obj.Find('stage_convs');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 5 then
+        ImportError('VGG import: "stage_convs" must have 5 entries, got ' +
+          IntToStr(Arr.Count) + '.');
+      for i := 0 to 4 do Result.StageConvs[i] := Arr.Integers[i];
+    end;
+    ArrData := Obj.Find('stage_widths');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 5 then
+        ImportError('VGG import: "stage_widths" must have 5 entries, got ' +
+          IntToStr(Arr.Count) + '.');
+      for i := 0 to 4 do Result.StageWidths[i] := Arr.Integers[i];
+    end;
+    ArrData := Obj.Find('fc_hidden');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 2 then
+        ImportError('VGG import: "fc_hidden" must have 2 entries, got ' +
+          IntToStr(Arr.Count) + '.');
+      for i := 0 to 1 do Result.FCHidden[i] := Arr.Integers[i];
+    end;
+    Result.BatchNorm := Obj.Get('batch_norm', false);
+    Result.AdaptivePool := Obj.Get('adaptive_pool', 7);
+    Result.ImageSize := Obj.Get('image_size', 224);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.FeatureTapStage := Obj.Get('feature_tap_stage', 0);
+    // num_labels: explicit, else len(id2label), else len(label2id), else 1000.
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('label2id');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function VGGConfigToString(const Config: TVGGConfig): string;
+var
+  i: integer;
+  Convs, Widths: string;
+begin
+  Convs := ''; Widths := '';
+  for i := 0 to 4 do
+  begin
+    if i > 0 then begin Convs := Convs + ','; Widths := Widths + ','; end;
+    Convs := Convs + IntToStr(Config.StageConvs[i]);
+    Widths := Widths + IntToStr(Config.StageWidths[i]);
+  end;
+  if Config.ModelType = '' then Result := 'vgg' else Result := Config.ModelType;
+  Result := Result + IntToStr(Config.Depth) + ' config: stage_convs=[' +
+    Convs + '], widths=[' + Widths + ']' +
+    ', fc_hidden=[' + IntToStr(Config.FCHidden[0]) + ',' +
+    IntToStr(Config.FCHidden[1]) + ']' +
+    ', batch_norm=' + BoolToStr(Config.BatchNorm, true) +
+    ', adaptive_pool=' + IntToStr(Config.AdaptivePool) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', num_labels=' + IntToStr(Config.NumLabels);
+end;
+
+// Loads a torchvision Conv2d bias (bias=True; one scalar per output channel)
+// into a CAI conv layer's per-neuron BiasWeight. Used by VGG, whose convs carry
+// an explicit bias (unlike ResNet's bias=False convs whose bias comes from the
+// folded BN). Must run AFTER the conv weights are loaded (it does not touch the
+// weight matrix). FlushWeightCache is called so the new bias takes effect.
+procedure LoadResNetConvBias(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const BiasName: string; OutCh: integer);
+var
+  B: TNNetVolume;
+  o: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(BiasName) then
+    ImportError('VGG import: missing conv bias tensor "' + BiasName + '".');
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('VGG import: internal error - conv bias "' + BiasName +
+      '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(BiasName, B);
+    if B.Size <> OutCh then
+      ImportError('VGG import: conv bias "' + BiasName + '" must have ' +
+        IntToStr(OutCh) + ' elements, got ' + IntToStr(B.Size) + '.');
+    for o := 0 to OutCh - 1 do
+      Layer.Neurons[o].BiasWeight := B.FData[o];
+    Layer.FlushWeightCache();
+  finally
+    B.Free;
+  end;
+end;
+
+function BuildVGG(Reader: TNNetSafeTensorsReader;
+  const Config: TVGGConfig; out TapLayerIdx: array of integer;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  ConvLayers: array of TNNetLayer;
+  FC0, FC1, FC2: TNNetLayer;
+  Stage, ConvIdx, ConvCount, RefCount, InWidth, FlatDim: integer;
+  FeatPos, i: integer;
+  Prefix: string;
+  LastStage: integer;
+begin
+  if Config.NumChannels < 1 then
+    ImportError('VGG import: num_channels must be >= 1.');
+  if Config.BatchNorm then
+    ImportError('VGG import: the _bn (BatchNorm) variant is not wired in v1 ' +
+      '- the conv-BN fold path exists (ResNet) but VGG _bn key wiring is a ' +
+      'documented follow-up. Import a plain (non-_bn) VGG checkpoint.');
+  for i := 0 to High(TapLayerIdx) do TapLayerIdx[i] := -1;
+  // Determine the last stage to build (full net vs feature extractor).
+  if (Config.FeatureTapStage >= 1) and (Config.FeatureTapStage <= 5) then
+    LastStage := Config.FeatureTapStage - 1
+  else
+    LastStage := 4;
+  // Count total convs to size the ref array.
+  ConvCount := 0;
+  for Stage := 0 to LastStage do ConvCount := ConvCount + Config.StageConvs[Stage];
+  SetLength(ConvLayers, ConvCount);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    RefCount := 0;
+    InWidth := Config.NumChannels;
+    for Stage := 0 to LastStage do
+    begin
+      for ConvIdx := 0 to Config.StageConvs[Stage] - 1 do
+      begin
+        // Conv 3x3 pad1 stride1 with bias (suppressBias=0), then ReLU.
+        ConvLayers[RefCount] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(Config.StageWidths[Stage], 3, 1, 1, 0) );
+        NN.AddLayer( TNNetReLU.Create() );
+        Inc(RefCount);
+        InWidth := Config.StageWidths[Stage];
+      end;
+      // The ReLU after the LAST conv of this stage is the perceptual tap.
+      TapLayerIdx[Stage] := NN.GetLastLayer().LayerIdx;
+      // MaxPool 2x2 stride2 (no padding): exact torchvision MaxPool2d(2,2) on
+      // even maps. The last stage before the classifier ALSO pools (torchvision
+      // pools after every stage); a feature-extractor truncation stops at the
+      // tap ReLU (no trailing pool) so the tap map is the full-resolution one.
+      if Stage < LastStage then
+        NN.AddLayer( TNNetMaxPool.Create({pool=}2, {stride=}2, {pad=}0) )
+      else if (Config.FeatureTapStage < 1) or (Config.FeatureTapStage > 5) then
+        NN.AddLayer( TNNetMaxPool.Create(2, 2, 0) );  // full net: final pool
+    end;
+
+    if (Config.FeatureTapStage >= 1) and (Config.FeatureTapStage <= 5) then
+    begin
+      // Feature-extractor variant: no classifier; the net ends at the tap ReLU.
+      if pInferenceOnly then NN.MakeInferenceOnly();
+    end
+    else
+    begin
+      // AdaptiveAvgPool2d((AdaptivePool,AdaptivePool)): for AdaptivePool=1 this
+      // is a plain global mean per channel (TNNetAvgChannel). For >1 it must be
+      // a no-op (post-stack grid already == AdaptivePool); see header. The
+      // pico fixture uses AdaptivePool=1; the 7x7 ImageNet case is the identity
+      // feeding the 7x7 grid straight into the flatten + FC. Only the no-op /
+      // unit-grid cases are supported in v1.
+      if Config.AdaptivePool = 1 then
+        NN.AddLayer( TNNetAvgChannel.Create() );
+      // else: identity (grid already AdaptivePool x AdaptivePool); FC flattens.
+      FlatDim := Config.StageWidths[4] * Config.AdaptivePool * Config.AdaptivePool;
+      FC0 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[0]) );
+      FC1 := NN.AddLayer( TNNetFullConnectReLU.Create(Config.FCHidden[1]) );
+      FC2 := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+    end;
+
+    // ---------------- Weights ----------------
+    // Walk the features Sequential positions in lockstep with the build. PLAIN
+    // VGG: each [Conv, ReLU] occupies 2 positions, each MaxPool 1 position.
+    FeatPos := 0;
+    RefCount := 0;
+    InWidth := Config.NumChannels;
+    for Stage := 0 to LastStage do
+    begin
+      for ConvIdx := 0 to Config.StageConvs[Stage] - 1 do
+      begin
+        Prefix := 'features.' + IntToStr(FeatPos);
+        LoadResNetConvFoldBN(Reader, ConvLayers[RefCount],
+          Prefix + '.weight', {BnPrefix=}'',
+          Config.StageWidths[Stage], InWidth, 3, 0.0);
+        // The conv carries its own bias (torchvision Conv2d bias=True): load it.
+        LoadResNetConvBias(Reader, ConvLayers[RefCount], Prefix + '.bias',
+          Config.StageWidths[Stage]);
+        InWidth := Config.StageWidths[Stage];
+        FeatPos := FeatPos + 2;   // Conv + ReLU
+        Inc(RefCount);
+      end;
+      FeatPos := FeatPos + 1;     // MaxPool position
+    end;
+
+    if (Config.FeatureTapStage < 1) or (Config.FeatureTapStage > 5) then
+    begin
+      // classifier.{0,3,6}: torchvision Linear [out,in] with bias.
+      LoadLlamaLinearWeights(Reader, FC0, 'classifier.0.weight',
+        FlatDim, Config.FCHidden[0], 0, -1, 0, 'classifier.0.bias');
+      LoadLlamaLinearWeights(Reader, FC1, 'classifier.3.weight',
+        Config.FCHidden[0], Config.FCHidden[1], 0, -1, 0, 'classifier.3.bias');
+      LoadLlamaLinearWeights(Reader, FC2, 'classifier.6.weight',
+        Config.FCHidden[1], Config.NumLabels, 0, -1, 0, 'classifier.6.bias');
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildVGGFromSafeTensorsEx(const FileName: string;
+  const Config: TVGGConfig; out TapLayerIdx: array of integer;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildVGG(Reader, Config, TapLayerIdx, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildVGGFromSafeTensors(const FileName: string;
+  out Config: TVGGConfig; out TapLayerIdx: array of integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadVGGConfigFromJSONFile(ConfigPath);
+  Result := BuildVGGFromSafeTensorsEx(FileName, Config, TapLayerIdx,
+    pInferenceOnly);
 end;
 
 // ===========================================================================
