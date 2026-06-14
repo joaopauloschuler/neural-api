@@ -359,24 +359,6 @@ rather than acted on.
       convs, BN after every conv). Reuses the landed conv + BN + Concat path; the
       new work is the branch-concatenation block builder. Needed in its own right
       and as the pooled-feature backbone for FID below. Pico parity vs HF float64.
-- [X] Generative-image quality metrics — FID (Fréchet Inception Distance) +
-      Inception Score. Landed as neural/neuralimagemetrics.pas (backbone-agnostic:
-      caller supplies feature vectors for FID and softmax prob vectors for IS).
-      TFIDFeatureAccumulator (streaming running sum + outer-product -> unbiased
-      mean + covariance); ComputeFID(meanR,covR,meanG,covG) +
-      ComputeFIDFromAccumulators/FromFeatures; matrix square-root via a symmetric
-      Jacobi eigendecomposition (sqrt clamped eigenvalues, V*diag*V^T) with the
-      stable Tr(sqrt(A*B)) = sum sqrt(eig(sqrtA*B*sqrtA)) cross-trace; all double
-      precision. ComputeInceptionScore(probs,NumSplits) = exp(E_x KL(p(y|x)||pbar))
-      with mean+std over splits. Inception-v3 backbone is NOT in-repo yet, so the
-      DOCUMENTED proxy is any landed classifier CNN (late pooled hidden layer for
-      FID features, final softmax for IS) — FID is backbone-relative; ordering is
-      preserved. Validated against a numpy float64 oracle (scipy absent; oracle's
-      matrix sqrt = numpy eigendecomposition) on synthetic Gaussian feature sets:
-      tests/TestNeuralImageMetrics.pas (7 tests, FID < 1e-4 vs oracle, FID-self ~0,
-      IS==K / IS==1 analytic), tools/make_image_metrics_fixture.py +
-      tests/fixtures/image_metrics_oracle.json. SKIPPED the optional
-      examples/GenerativeImageMetrics demo (unit + tests are the core deliverable).
 - [ ] LPIPS perceptual distance (TNNetLPIPS or a metric helper) — the standard
       perceptual image-similarity metric for super-resolution / restoration /
       generative quality, complementing the landed SuperResolution / SubPixelSuperRes
@@ -466,27 +448,6 @@ rather than acted on.
       Hungarian matcher (that is training-only) — just threshold the per-query class
       softmax. Pico parity vs HF float64 + an examples/ObjectDetection demo that
       draws boxes on one CPU image.
-- [X] Diffusion sampler / noise-scheduler unit (neuraldiffusion.pas) — the repo
-      has the diffusion/flow EXAMPLES (DiffusionMNIST, FlowMatching) but every one
-      hand-rolls its own noising loop inline; there is NO reusable, tested sampler.
-      Add a small unit with the standard reverse-process schedulers — DDPM
-      (ancestral), DDIM (deterministic, eta arg), and DPM-Solver++(2M) — over a
-      configurable beta schedule (linear / scaled-linear / cosine), plus
-      classifier-free guidance mixing (eps_uncond + w*(eps_cond-eps_uncond)) given
-      two model evals. Pure CPU, model-agnostic (caller supplies an eps/v predictor
-      closure). Validate the alpha-bar/beta math + a DDIM trajectory against a numpy
-      oracle; refactor DiffusionMNIST to call it. This is the missing piece (with
-      the already-tracked SD-UNet follow-up) for end-to-end imported text-to-image.
-- [X] TNNet.AddUNet builder (symmetric conv encoder–decoder with skip
-      concatenations) — the repo's only segmentation example (DiceSegmentation) is a
-      FLAT fully-convolutional net with no down/upsampling, and there is no reusable
-      U-Net. Add a builder: N encoder stages (2x Conv3x3-Norm-ReLU + 2x2 stride-2
-      downsample, doubling features), a bottleneck, N decoder stages (DeMaxPool/
-      transpose upsample + TNNetConcat of the matching encoder tap + 2x Conv), and a
-      1x1 head. Returns the tap layer indices so callers can wire skips. Ship an
-      examples/UNetSegmentation that trains on a small synthetic-shapes or
-      medical-style mask dataset and reports Dice/IoU; reuses the landed Dice loss.
-      Foundational for SD-UNet, SegFormer decode heads, and medical imaging.
 - [ ] TNNetConvolution3D layer (spatiotemporal / volumetric conv, depth axis =
       time or Z) — the repo has zero 3-D conv, which blocks proper video models and
       volumetric (CT/MRI) imaging. Add a (T,H,W,C) conv with TxKxK kernels (and a
@@ -513,14 +474,6 @@ rather than acted on.
       (b) the lightweight all-MLP decode head (project each of the 4 stages to a
       common dim, upsample, concat, fuse, 1x1 to num_classes). Pico parity vs HF
       float64 + an examples/SemanticSegmentation that colors a tiny CPU image.
-- [X] Class-conditional image generation example (examples/ConditionalDiffusion) —
-      the landed generative image examples (VisualGAN, DiffusionMNIST, FlowMatching)
-      are all UNCONDITIONAL; there is no example of steering generation by a class
-      label. Train a small label-conditioned denoiser on MNIST (inject the class via
-      a learned label embedding added to the timestep embedding, with label-dropout
-      for classifier-free guidance), then sample a chosen digit and show that the CFG
-      weight trades diversity for class fidelity. Reuses FiLMConditioning + the new
-      diffusion-sampler unit; demonstrates conditional generation + CFG end-to-end.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
