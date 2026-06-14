@@ -674,7 +674,7 @@ rather than acted on.
       plain greedy on the target while issuing fewer target forwards; an
       examples/TreeSpeculativeDecoding demo reporting the accepted-tokens/forward
       speedup vs the linear self-speculative baseline.
-- [ ] examples/RAG end-to-end retrieval-augmented generation demo — the obvious
+- [X] examples/RAG end-to-end retrieval-augmented generation demo — the obvious
       missing NLP application that ties together already-landed pieces with no new
       core code: chunk a small text corpus, embed the chunks with the landed
       sentence-embedding path (SemanticSearch/EmbeddingSearch + the embedding
