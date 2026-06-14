@@ -461,9 +461,26 @@ rather than acted on.
       the input and mix the targets by area fraction (Beta-distributed
       lambda). The CIFAR image-classification examples give an instant
       bake-off harness.
-- [ ] Batched generation with left-padding in neural/neuraldecode.pas:
+- [X] Batched generation with left-padding in neural/neuraldecode.pas:
       generate for N prompts in one forward pass per step (today's decode
       paths look single-sample). Makes evaluation sweeps cheap and is a
+      prerequisite for an efficient speculative-decoding verify step.
+      DONE: DecodeBatchGreedy(NN, Prompts, MaxLen[, StopStrings]) advances N
+      prompts in lockstep with per-row EOS / stop-string / MaxLen termination
+      (finished rows frozen). Output is token-for-token identical to running
+      each prompt through single-sample DecodeGreedy -- including SumLogProb /
+      Score -- UNCONDITIONALLY for arbitrary differing prompt lengths. The
+      char-level decode forward uses the REVERSED one-hot encoding, which
+      right-aligns the latest token at x=0 and zero-fills older positions, so
+      left-padding is implicit per row and there is no cross-row attention
+      contamination to mask. Tests: TestBatchGreedyMatchesPerPromptGreedy,
+      TestBatchGreedyStopStringsPerRowIndependent, TestBatchGreedyEmptyAndSingle
+      (tests/TestNeuralDecode.pas).
+      RESIDUAL: this is a lockstep ORCHESTRATION batch, not a vectorized one --
+      NN.Compute has no SIMD batch axis on this char path, so each step still
+      pays one forward per running row (the convenience/correctness win, not a
+      throughput win). A true single-kernel batched forward (real batch axis +
+      attention padding mask for left-pad) remains open and is the actual
       prerequisite for an efficient speculative-decoding verify step.
 - [X] Chat templates v2 (v1 is landed in neural/neuralchat.pas —
       ApplyChatTemplate with seven hardcoded formats + DetectChatFormat

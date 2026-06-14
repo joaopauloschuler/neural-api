@@ -1001,6 +1001,35 @@ function DecodeGreedy(NN: TNNet; const Prompt: string; MaxLen: integer;
   const StopStrings: array of string;
   Constraint: TNNetTokenConstraint): TNNetDecodeResult; overload;
 
+// BATCHED greedy decode for N prompts in lockstep. Generates a continuation for
+// every entry of Prompts, advancing the whole batch one step at a time: at each
+// step every still-running row gets ONE forward pass and its argmax token, then
+// rows that hit EOS / a stop string / MaxLen are frozen while the others keep
+// going. Result[i] is exactly what DecodeGreedy(NN, Prompts[i], MaxLen,
+// StopStrings) would return -- token-for-token identical, including SumLogProb
+// and Score.
+//
+// Left-padding / masking: the char-level decode forward uses the REVERSED
+// one-hot encoding (TNNetVolume.OneHotEncodingReversed), which right-aligns the
+// most-recent token at x=0 and leaves the unused (older) positions zero. Each
+// prompt is encoded independently into its own fixed-width input volume, so a
+// shorter prompt simply leaves more high-x positions zero -- this IS the
+// left-pad, and because every row's forward is computed on its own volume there
+// is no cross-row attention contamination to mask. Hence the bit-identical
+// guarantee holds UNCONDITIONALLY for prompts of arbitrary differing lengths
+// (no equal-length restriction).
+//
+// Note on performance: the underlying char-level engine (NN.Compute) has no
+// SIMD batch axis, so "one forward per step" is realized as a per-row inner
+// loop. The value here is a correct lockstep batched API with per-row stop
+// handling -- an evaluation-sweep convenience and a building block for a
+// speculative-decoding verify step -- not a vectorized speedup.
+function DecodeBatchGreedy(NN: TNNet; const Prompts: array of string;
+  MaxLen: integer): TNNetDecodeResultArray; overload;
+function DecodeBatchGreedy(NN: TNNet; const Prompts: array of string;
+  MaxLen: integer;
+  const StopStrings: array of string): TNNetDecodeResultArray; overload;
+
 // Beam search. Keeps BeamWidth partial sequences ranked by length-penalised
 // cumulative log-prob. Returns the single best (highest Score) result.
 //   MaxLen        : maximum number of generated tokens (excludes the prompt).
@@ -4106,6 +4135,100 @@ begin
   end;
   Result.Score := Result.SumLogProb /
     LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function DecodeBatchGreedy(NN: TNNet; const Prompts: array of string;
+  MaxLen: integer): TNNetDecodeResultArray;
+begin
+  Result := DecodeBatchGreedy(NN, Prompts, MaxLen, []);
+end;
+
+// Batched greedy decode: N prompts advanced in lockstep. Per row, every step is
+// byte-for-byte the same computation DecodeGreedy(NN, Prompt, MaxLen,
+// StopStrings) performs (same NextLogProbs forward, same argmax tie-break, same
+// SumLogProb accumulation, same EOS / stop-string termination and trimming), so
+// Result[i] is token-for-token identical to the single-sample call. Finished
+// rows are frozen; the loop runs until every row is done or MaxLen is reached.
+// Each row keeps its OWN input/output volumes -- the reversed one-hot encoding
+// right-aligns the latest token at x=0, so differing prompt lengths are handled
+// purely by per-row left-zero-padding with no cross-row interaction to mask.
+function DecodeBatchGreedy(NN: TNNet; const Prompts: array of string;
+  MaxLen: integer;
+  const StopStrings: array of string): TNNetDecodeResultArray;
+var
+  N, R, Step, VocabSize, Best, I, StopLen: integer;
+  InVols, OutVols: array of TNNetVolume;
+  Contexts: array of string;
+  Done: array of boolean;
+  LogProbs: array of TNeuralFloat;
+  AnyRunning: boolean;
+begin
+  N := Length(Prompts);
+  SetLength(Result, N);
+  if N = 0 then Exit;
+  VocabSize := NN.GetLastLayer().Output.Size;
+  SetLength(LogProbs, VocabSize);
+  SetLength(InVols, N);
+  SetLength(OutVols, N);
+  SetLength(Contexts, N);
+  SetLength(Done, N);
+  for R := 0 to N - 1 do
+  begin
+    InVols[R] := TNNetVolume.Create(NN.GetFirstLayer.Output);
+    OutVols[R] := TNNetVolume.Create(NN.GetLastLayer().Output);
+    Contexts[R] := Prompts[R];
+    Done[R] := False;
+    Result[R].Text := '';
+    Result[R].SumLogProb := 0;
+    Result[R].Score := 0;
+    Result[R].Finished := False;
+  end;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      AnyRunning := False;
+      for R := 0 to N - 1 do
+      begin
+        if Done[R] then Continue;
+        AnyRunning := True;
+        // One forward pass for this row (per-row left-padding is implicit in
+        // the reversed one-hot encoding inside NextLogProbs).
+        NextLogProbs(NN, Contexts[R], InVols[R], OutVols[R], LogProbs);
+        Best := 0;
+        for I := 1 to VocabSize - 1 do
+          if LogProbs[I] > LogProbs[Best] then Best := I;
+        Result[R].SumLogProb := Result[R].SumLogProb + LogProbs[Best];
+        if Best = csDecodeEOSToken then
+        begin
+          Result[R].Finished := True;
+          Done[R] := True;
+          Continue;
+        end;
+        Result[R].Text := Result[R].Text + Chr(Best);
+        Contexts[R] := Contexts[R] + Chr(Best);
+        if Length(StopStrings) > 0 then
+        begin
+          StopLen := MatchStopStringSuffix(Result[R].Text, StopStrings);
+          if StopLen > 0 then
+          begin
+            SetLength(Result[R].Text, Length(Result[R].Text) - StopLen);
+            Result[R].Finished := True;
+            Done[R] := True;
+          end;
+        end;
+      end;
+      if not AnyRunning then Break;
+    end;
+  finally
+    for R := 0 to N - 1 do
+    begin
+      InVols[R].Free;
+      OutVols[R].Free;
+    end;
+  end;
+  for R := 0 to N - 1 do
+    Result[R].Score := Result[R].SumLogProb /
+      LengthPenaltyDenominator(Length(Result[R].Text), 0);
 end;
 
 // The "last hidden state" layer for contrastive search: the input to the final

@@ -82,6 +82,9 @@ type
     procedure TestSafeLogProbMatchesLn;
     // End-to-end behaviour on a tiny net.
     procedure TestGreedyReturnsBoundedFiniteResult;
+    procedure TestBatchGreedyMatchesPerPromptGreedy;
+    procedure TestBatchGreedyStopStringsPerRowIndependent;
+    procedure TestBatchGreedyEmptyAndSingle;
     procedure TestBeamSearchAllSortedDescending;
     procedure TestBeamSearchScoreNoWorseThanGreedy;
     // Diverse beam search (Hamming-diversity groups).
@@ -323,6 +326,118 @@ begin
     AssertTrue('greedy never exceeds MaxLen', Length(R.Text) <= 6);
     AssertTrue('greedy score finite',
       not IsInfinite(R.Score) and not IsNan(R.Score));
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBatchGreedyMatchesPerPromptGreedy;
+var
+  NN: TNNet;
+  Prompts: array[0..2] of string;
+  Batch: TNNetDecodeResultArray;
+  Single: TNNetDecodeResult;
+  R: integer;
+begin
+  // HEADLINE GUARANTEE: batched greedy for N prompts is token-for-token
+  // identical to running each prompt independently through DecodeGreedy.
+  // The three prompts have DIFFERENT lengths so the (implicit) per-row
+  // left-padding of the reversed one-hot encoding is exercised.
+  RandSeed := 424242;
+  NN := BuildTinyNet(4, 8);
+  Prompts[0] := 'a';        // length 1
+  Prompts[1] := 'abc';      // length 3
+  Prompts[2] := 'abcdef';   // length 6 (> ContextLen, forces window truncation)
+  try
+    Batch := DecodeBatchGreedy(NN, Prompts, 10);
+    AssertEquals('batch returns one result per prompt', 3, Length(Batch));
+    for R := 0 to 2 do
+    begin
+      Single := DecodeGreedy(NN, Prompts[R], 10);
+      AssertEquals('row '+IntToStr(R)+' text bit-identical',
+        Single.Text, Batch[R].Text);
+      AssertEquals('row '+IntToStr(R)+' finished bit-identical',
+        Ord(Single.Finished), Ord(Batch[R].Finished));
+      AssertEquals('row '+IntToStr(R)+' SumLogProb bit-identical',
+        Single.SumLogProb, Batch[R].SumLogProb, 0.0);
+      AssertEquals('row '+IntToStr(R)+' Score bit-identical',
+        Single.Score, Batch[R].Score, 0.0);
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBatchGreedyStopStringsPerRowIndependent;
+var
+  NN: TNNet;
+  Prompts: array[0..2] of string;
+  Stops: array[0..0] of string;
+  Batch: TNNetDecodeResultArray;
+  Single: TNNetDecodeResult;
+  R, MinLen: integer;
+begin
+  // PER-ROW STOP HANDLING: with a stop string the rows terminate at DIFFERENT
+  // steps (the generated continuations differ by prompt window). Each row must
+  // be byte-identical to the single-sample DecodeGreedy with the SAME stop
+  // string -- proving an early-finishing row neither extends nor truncates the
+  // others. Equivalence to the independent single-sample path IS the proof of
+  // non-interference.
+  RandSeed := 424242;
+  NN := BuildTinyNet(4, 8);
+  Prompts[0] := 'a';
+  Prompts[1] := 'abc';
+  Prompts[2] := 'abcdef';
+  // Find a 1-char stop that actually fires somewhere so rows finish at
+  // different lengths: use the first emitted char of the longest run.
+  Single := DecodeGreedy(NN, Prompts[2], 12);
+  if Length(Single.Text) >= 2 then Stops[0] := Single.Text[2]
+  else Stops[0] := 'q';
+  try
+    Batch := DecodeBatchGreedy(NN, Prompts, 12, Stops);
+    MinLen := MaxInt;
+    for R := 0 to 2 do
+    begin
+      Single := DecodeGreedy(NN, Prompts[R], 12, Stops);
+      AssertEquals('stop row '+IntToStr(R)+' text bit-identical',
+        Single.Text, Batch[R].Text);
+      AssertEquals('stop row '+IntToStr(R)+' finished bit-identical',
+        Ord(Single.Finished), Ord(Batch[R].Finished));
+      AssertEquals('stop row '+IntToStr(R)+' SumLogProb bit-identical',
+        Single.SumLogProb, Batch[R].SumLogProb, 0.0);
+      if Length(Batch[R].Text) < MinLen then MinLen := Length(Batch[R].Text);
+    end;
+    // Sanity: at least one row actually stopped early (shorter than the cap),
+    // otherwise the per-row independence is not really exercised.
+    AssertTrue('at least one row stopped before the cap', MinLen < 12);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBatchGreedyEmptyAndSingle;
+var
+  NN: TNNet;
+  Empty: array of string;
+  One: array[0..0] of string;
+  Batch: TNNetDecodeResultArray;
+  Single: TNNetDecodeResult;
+begin
+  // Degenerate batch sizes: 0 prompts -> empty result; 1 prompt -> identical
+  // to the single-sample call.
+  RandSeed := 424242;
+  NN := BuildTinyNet(4, 8);
+  SetLength(Empty, 0);
+  One[0] := 'ab';
+  try
+    Batch := DecodeBatchGreedy(NN, Empty, 6);
+    AssertEquals('empty batch -> empty result', 0, Length(Batch));
+    Batch := DecodeBatchGreedy(NN, One, 6);
+    AssertEquals('single batch -> one result', 1, Length(Batch));
+    Single := DecodeGreedy(NN, One[0], 6);
+    AssertEquals('single batch text bit-identical', Single.Text, Batch[0].Text);
+    AssertEquals('single batch SumLogProb bit-identical',
+      Single.SumLogProb, Batch[0].SumLogProb, 0.0);
   finally
     NN.Free;
   end;
