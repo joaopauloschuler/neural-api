@@ -3142,6 +3142,117 @@ procedure BuildWhisperFromSafeTensors(const FileName: string;
   DecSeqLen: integer; pInferenceOnly: boolean = false;
   const ConfigFileName: string = '');
 
+// ============================ WAV2VEC2 / HUBERT CTC IMPORT =================
+// Wav2Vec2 / HuBERT (model_type "wav2vec2" / "hubert", architectures
+// ["Wav2Vec2ForCTC"] / ["HubertForCTC"], e.g.
+// facebook/wav2vec2-base-960h) - the SECOND speech import family and the
+// first SELF-SUPERVISED-encoder speech model. Architecturally distinct
+// from the landed Whisper (a mel-spectrogram encoder-decoder seq2seq):
+// Wav2Vec2/HuBERT consume a RAW float WAVEFORM and run a CONV FEATURE
+// EXTRACTOR -> transformer ENCODER -> linear CTC head (NO decoder). The
+// net is single-input ((NumSamples,1,1) raw audio in seconds*16000
+// samples) and outputs (EncLen,1,vocab) CTC logits, decoded with the
+// landed DecodeCTCGreedy / DecodeCTCBeamSearch.
+//
+// Pipeline (HF Wav2Vec2Model + Wav2Vec2ForCTC, do_stable_layer_norm
+// False - the wav2vec2-base / -960h topology):
+//   raw (NumSamples,1,1)
+//     -> FEATURE EXTRACTOR: num_feat_extract_layers strided 1-D convs
+//        (TNNetConvolutionLinear on the (T,1,C) grid, conv_bias False so
+//        suppressed bias). Layer 0 is conv -> GroupNorm -> GELU; the
+//        GroupNorm uses num_groups = conv_dim[0] = num_channels, i.e. ONE
+//        channel per group normalized over the TIME axis (the "group"
+//        feat_extract_norm; TNNetGroupNorm(conv_dim[0]) on the depth-as-
+//        channels grid is exactly that). Layers 1.. are conv -> GELU only.
+//        Each conv reduces the length: out = (in - kernel) div stride + 1.
+//     -> FEATURE PROJECTION: TNNetTokenLayerNorm over the last conv
+//        channels then a biased Linear conv_dim[-1] -> hidden_size.
+//     -> ENCODER: a conv-based relative POSITIONAL EMBEDDING (a GROUPED
+//        conv1d, kernel num_conv_pos_embeddings, padding kernel div 2,
+//        groups num_conv_pos_embedding_groups; weight_norm-parametrized in
+//        the checkpoint - the effective weight is reconstructed from
+//        original0 (g) and original1 (v) with dim=2: w[:,:,k] = g[k] *
+//        v[:,:,k] / ||v[:,:,k]||) added to the projected features; an even
+//        kernel makes the conv emit one extra frame, dropped by a SamePad
+//        crop; then GELU. After the add comes encoder.layer_norm, then the
+//        POST-LN transformer blocks (do_stable_layer_norm False):
+//          x := LN(x + Attn(x)); x := final_LN(x + FFN(x))
+//        with BIDIRECTIONAL self-attention and exact erf "gelu" FFN -
+//        identical block math to the BERT encoder, so the same builder
+//        primitives are reused.
+//     -> CTC HEAD: a biased Linear hidden_size -> vocab_size (lm_head).
+// Every GELU is the exact erf form. HuBERT shares this EXACT topology and
+// the same tensor names under the "hubert." prefix - the SAME builder with
+// Config.IsHubert = True (set from model_type). The "robust"/-large
+// variant (feat_extract_norm "layer", LayerNorm on EVERY conv layer +
+// pre-norm encoder, do_stable_layer_norm True) is a documented follow-up.
+// Tokenizer is a tiny char/phoneme vocab.json (no SentencePiece); decoding
+// is DecodeCTCGreedy over the per-frame argmax. Coded by Claude (AI).
+
+type
+  TWav2Vec2Config = record
+    HiddenSize: integer;        // hidden_size (d_model)
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    IntermediateSize: integer;  // intermediate_size (FFN width)
+    VocabSize: integer;         // vocab_size (CTC head width incl. blank)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (default 1e-5)
+    NumConvLayers: integer;     // num_feat_extract_layers (= Length(ConvDim))
+    ConvDim: array of integer;  // conv_dim (per-conv output channels)
+    ConvStride: array of integer; // conv_stride
+    ConvKernel: array of integer; // conv_kernel
+    ConvBias: boolean;          // conv_bias (false in wav2vec2-base)
+    NumPosConvEmbeddings: integer; // num_conv_pos_embeddings (kernel; even)
+    NumPosConvGroups: integer;  // num_conv_pos_embedding_groups
+    DoStableLayerNorm: boolean; // do_stable_layer_norm (false: GroupNorm
+                                // base path - the only supported variant)
+    FeatExtractGroupNorm: boolean; // feat_extract_norm == "group"
+    IsHubert: boolean;          // model_type == "hubert"
+    ModelType: string;          // 'wav2vec2' / 'hubert'
+    Prefix: string;             // 'wav2vec2.' / 'hubert.' (detected)
+  end;
+
+// Reads a HF Wav2Vec2/HuBERT config.json (model_type "wav2vec2" or
+// "hubert"). Required: hidden_size, num_hidden_layers,
+// num_attention_heads, intermediate_size, vocab_size, conv_dim,
+// conv_stride, conv_kernel. Defaults follow Wav2Vec2Config:
+// layer_norm_eps 1e-5, conv_bias false, num_conv_pos_embeddings 128,
+// num_conv_pos_embedding_groups 16, feat_extract_norm "group",
+// do_stable_layer_norm false, hidden_act "gelu". Rejects the unsupported
+// "layer"-norm / stable-layer-norm (-large/robust) variant loudly.
+function ReadWav2Vec2ConfigFromJSONFile(const FileName: string): TWav2Vec2Config;
+
+function Wav2Vec2ConfigToString(const Config: TWav2Vec2Config): string;
+
+// Computes the encoder sequence length the conv feature extractor produces
+// for a raw clip of NumSamples samples (each conv: (n - kernel) div stride
+// + 1). NumSamples must be large enough that every conv keeps a positive
+// length AND the result is >= num_conv_pos_embeddings (the pos-conv kernel).
+function Wav2Vec2EncoderLength(const Config: TWav2Vec2Config;
+  NumSamples: integer): integer;
+
+// Builds the Wav2Vec2/HuBERT CTC net described by Config: a single
+// TNNetInput (NumSamples,1,1) raw waveform in, (EncLen,1,vocab) CTC logits
+// out (EncLen = Wav2Vec2EncoderLength(Config, NumSamples)), and loads every
+// weight from the checkpoint at FileName (see the WAV2VEC2 / HUBERT CTC
+// IMPORT section). Config.Prefix and Config.IsHubert are detected from the
+// checkpoint / model_type. pInferenceOnly = True frees training volumes
+// during construction (Compute()-only afterwards). Decode the logits with
+// DecodeCTCGreedy (neuraldecode.pas) against the tokenizer's vocab.json.
+function BuildWav2Vec2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TWav2Vec2Config; NumSamples: integer;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildWav2Vec2FromSafeTensorsEx(const FileName: string;
+  out Config: TWav2Vec2Config; NumSamples: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildWav2Vec2FromSafeTensors(const FileName: string;
+  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+
 // ---------------------------------------------------------------------------
 // RWKV-4 IMPORT (model_type "rwkv": RWKV/rwkv-4-169m-pile and siblings,
 // architectures ["RwkvForCausalLM"]) - the FIRST NON-TRANSFORMER importer:
@@ -20917,6 +21028,611 @@ begin
     DecoderNet, DecSeqLen, pInferenceOnly);
 end;
 
+// ============================ WAV2VEC2 / HUBERT CTC IMPORT =================
+
+function ReadWav2Vec2ConfigFromJSONFile(
+  const FileName: string): TWav2Vec2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, FeatNorm, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Wav2Vec2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Wav2Vec2 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+  // Reads a required JSON int array of length ExpectLen into Dst.
+  procedure RequiredIntArray(const FieldName: string;
+    var Dst: array of integer; ExpectLen: integer);
+  var
+    Arr: TJSONArray;
+    k: integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Wav2Vec2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    if not (Obj.Find(FieldName) is TJSONArray) then
+      ImportError('Wav2Vec2 import: config field "' + FieldName +
+        '" must be an array.');
+    Arr := TJSONArray(Obj.Find(FieldName));
+    if Arr.Count <> ExpectLen then
+      ImportError('Wav2Vec2 import: config field "' + FieldName +
+        '" must have ' + IntToStr(ExpectLen) + ' entries (matching ' +
+        'conv_dim), got ' + IntToStr(Arr.Count) + '.');
+    for k := 0 to ExpectLen - 1 do
+    begin
+      Dst[k] := Arr.Items[k].AsInteger;
+      if Dst[k] <= 0 then
+        ImportError('Wav2Vec2 import: config "' + FieldName + '"[' +
+          IntToStr(k) + '] must be a positive integer.');
+    end;
+  end;
+
+var
+  Arr: TJSONArray;
+  k: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('Wav2Vec2 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Wav2Vec2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Wav2Vec2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'wav2vec2');
+    if (ModelType <> 'wav2vec2') and (ModelType <> 'hubert') then
+      ImportError('Wav2Vec2 import: config model_type is "' + ModelType +
+        '" - only "wav2vec2" / "hubert" are supported here.');
+    Result.ModelType := ModelType;
+    Result.IsHubert := (ModelType = 'hubert');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
+    // conv_dim is the spine: conv_stride / conv_kernel must match its length.
+    if Obj.IndexOfName('conv_dim') < 0 then
+      ImportError('Wav2Vec2 import: config "' + FileName +
+        '" is missing the required field "conv_dim".');
+    if not (Obj.Find('conv_dim') is TJSONArray) then
+      ImportError('Wav2Vec2 import: config field "conv_dim" must be an array.');
+    Arr := TJSONArray(Obj.Find('conv_dim'));
+    Result.NumConvLayers := Arr.Count;
+    if Result.NumConvLayers < 1 then
+      ImportError('Wav2Vec2 import: conv_dim must be a non-empty array.');
+    SetLength(Result.ConvDim, Result.NumConvLayers);
+    SetLength(Result.ConvStride, Result.NumConvLayers);
+    SetLength(Result.ConvKernel, Result.NumConvLayers);
+    for k := 0 to Result.NumConvLayers - 1 do
+    begin
+      Result.ConvDim[k] := Arr.Items[k].AsInteger;
+      if Result.ConvDim[k] <= 0 then
+        ImportError('Wav2Vec2 import: conv_dim[' + IntToStr(k) +
+          '] must be a positive integer.');
+    end;
+    RequiredIntArray('conv_stride', Result.ConvStride, Result.NumConvLayers);
+    RequiredIntArray('conv_kernel', Result.ConvKernel, Result.NumConvLayers);
+    Result.ConvBias := Obj.Get('conv_bias', False);
+    Result.NumPosConvEmbeddings := Obj.Get('num_conv_pos_embeddings', 128);
+    Result.NumPosConvGroups := Obj.Get('num_conv_pos_embedding_groups', 16);
+    if Odd(Result.NumPosConvEmbeddings) then
+      ImportError('Wav2Vec2 import: num_conv_pos_embeddings must be EVEN ' +
+        '(the SamePad layer drops the extra frame an even kernel emits).');
+    if (Result.NumPosConvGroups < 1) or
+       (Result.HiddenSize mod Result.NumPosConvGroups <> 0) then
+      ImportError('Wav2Vec2 import: num_conv_pos_embedding_groups must ' +
+        'divide hidden_size.');
+    Result.DoStableLayerNorm := Obj.Get('do_stable_layer_norm', False);
+    FeatNorm := Obj.Get('feat_extract_norm', 'group');
+    Result.FeatExtractGroupNorm := (FeatNorm = 'group');
+    // Only the wav2vec2-base / -960h GroupNorm path is supported. The
+    // -large / robust variant (LayerNorm on EVERY conv + pre-norm encoder,
+    // do_stable_layer_norm True) is a documented follow-up.
+    if not Result.FeatExtractGroupNorm then
+      ImportError('Wav2Vec2 import: feat_extract_norm "' + FeatNorm +
+        '" is not supported - only the "group" (wav2vec2-base) variant is ' +
+        'implemented; the "layer" (-large/robust) variant is a follow-up.');
+    if Result.DoStableLayerNorm then
+      ImportError('Wav2Vec2 import: do_stable_layer_norm=true (the ' +
+        '-large/robust pre-norm variant) is not supported yet - a ' +
+        'documented follow-up.');
+    ActFn := Obj.Get('hidden_act', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('Wav2Vec2 import: hidden_act "' + ActFn + '" is not ' +
+        'supported - the published CTC checkpoints use exact erf "gelu".');
+    Result.Prefix := ''; // detected by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function Wav2Vec2ConfigToString(const Config: TWav2Vec2Config): string;
+var
+  k: integer;
+  Dims, Strides, Kernels: string;
+begin
+  Dims := ''; Strides := ''; Kernels := '';
+  for k := 0 to Config.NumConvLayers - 1 do
+  begin
+    if k > 0 then begin Dims := Dims + ','; Strides := Strides + ',';
+      Kernels := Kernels + ','; end;
+    Dims := Dims + IntToStr(Config.ConvDim[k]);
+    Strides := Strides + IntToStr(Config.ConvStride[k]);
+    Kernels := Kernels + IntToStr(Config.ConvKernel[k]);
+  end;
+  Result := 'Wav2Vec2Config(model_type=' + Config.ModelType +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', inter=' + IntToStr(Config.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', conv_dim=[' + Dims + ']' +
+    ', conv_stride=[' + Strides + ']' +
+    ', conv_kernel=[' + Kernels + ']' +
+    ', conv_bias=' + BoolToStr(Config.ConvBias, True) +
+    ', pos_conv=' + IntToStr(Config.NumPosConvEmbeddings) +
+    '/' + IntToStr(Config.NumPosConvGroups) + ')';
+end;
+
+function Wav2Vec2EncoderLength(const Config: TWav2Vec2Config;
+  NumSamples: integer): integer;
+var
+  k: integer;
+begin
+  Result := NumSamples;
+  for k := 0 to Config.NumConvLayers - 1 do
+  begin
+    if Result < Config.ConvKernel[k] then
+      ImportError('Wav2Vec2 import: NumSamples=' + IntToStr(NumSamples) +
+        ' is too short - conv layer ' + IntToStr(k) + ' (kernel ' +
+        IntToStr(Config.ConvKernel[k]) + ') has no valid window.');
+    Result := (Result - Config.ConvKernel[k]) div Config.ConvStride[k] + 1;
+  end;
+  if Result < Config.NumPosConvEmbeddings then
+    ImportError('Wav2Vec2 import: encoder length ' + IntToStr(Result) +
+      ' for NumSamples=' + IntToStr(NumSamples) + ' is shorter than the ' +
+      'positional conv kernel ' + IntToStr(Config.NumPosConvEmbeddings) +
+      ' - feed a longer clip.');
+end;
+
+// Loads one feature-extractor conv (HF nn.Conv1d, weight [Out, In, Kernel],
+// NO bias when conv_bias=false) into a TNNetConvolutionLinear built with a
+// (Kernel,1) kernel on the (T,1,In) sequence grid. Tap k of HF's kernel
+// multiplies the SAME padded frame as tap x=k of the (Kernel,1) kernel, so
+// the layout map is Neurons[o].Weights[x*In + i] = W[o, i, x] (the exact
+// LoadWhisperConv1D convention generalized to arbitrary kernel widths).
+procedure LoadWav2Vec2FeatureConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; InDim, OutDim, Kernel: integer;
+  Consumed: TStringList);
+var
+  W: TNNetVolume;
+  o, i, kk: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Wav2Vec2 import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 3) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) or
+     (Reader.DimSize(WName, 2) <> Kernel) then
+    ImportError('Wav2Vec2 import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + ', ' + IntToStr(Kernel) +
+      '] (nn.Conv1d stores [out, in, kernel]), got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('Wav2Vec2 import: internal error - conv layer for "' +
+      WName + '" has ' + IntToStr(Layer.Neurons.Count) +
+      ' neurons, expected ' + IntToStr(OutDim) + '.');
+  if Layer.Neurons[0].Weights.Size <> Kernel * InDim then
+    ImportError('Wav2Vec2 import: internal error - conv neuron for "' +
+      WName + '" has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(Kernel * InDim) + '.');
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for o := 0 to OutDim - 1 do
+    begin
+      for kk := 0 to Kernel - 1 do
+        for i := 0 to InDim - 1 do
+          Layer.Neurons[o].Weights.FData[kk * InDim + i] :=
+            W.FData[(o * InDim + i) * Kernel + kk];
+      Layer.Neurons[o].BiasWeight := 0;
+    end;
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+  Consumed.Add(WName);
+end;
+
+// Loads the weight-norm-parametrized positional conv (HF grouped nn.Conv1d
+// weight_norm(dim=2)) into a TNNetGroupedConvolutionLinear. The checkpoint
+// stores g = ...original0 [1,1,Kernel] and v = ...original1
+// [Out, In/Groups, Kernel]; the effective weight reconstructs per kernel
+// tap k as w[:,:,k] = g[k] * v[:,:,k] / ||v[:,:,k]|| (Frobenius over the
+// out/in dims, the dim=2 convention). Output neuron o belongs to group
+// o div (Out/Groups) and reads the In/Groups input channels of that group:
+// Neurons[o].Weights[x*(In/Groups) + ic] = w_eff[o, ic, x].
+procedure LoadWav2Vec2PosConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const GName, VName, BName: string;
+  HiddenSize, Groups, Kernel: integer; Consumed: TStringList);
+var
+  G, V, B, WEff: TNNetVolume;
+  InPerGroup, o, ic, kk: integer;
+  Norm, Acc: TNeuralFloat;
+begin
+  InPerGroup := HiddenSize div Groups;
+  if not Reader.HasTensor(GName) then
+    ImportError('Wav2Vec2 import: missing tensor "' + GName + '".');
+  if not Reader.HasTensor(VName) then
+    ImportError('Wav2Vec2 import: missing tensor "' + VName + '".');
+  if not Reader.HasTensor(BName) then
+    ImportError('Wav2Vec2 import: missing tensor "' + BName + '".');
+  if (Reader.DimCount(GName) <> 3) or
+     (Reader.DimSize(GName, 0) <> 1) or (Reader.DimSize(GName, 1) <> 1) or
+     (Reader.DimSize(GName, 2) <> Kernel) then
+    ImportError('Wav2Vec2 import: "' + GName + '" must have shape ' +
+      '[1, 1, ' + IntToStr(Kernel) + '], got ' + Reader.ShapeAsString(GName));
+  if (Reader.DimCount(VName) <> 3) or
+     (Reader.DimSize(VName, 0) <> HiddenSize) or
+     (Reader.DimSize(VName, 1) <> InPerGroup) or
+     (Reader.DimSize(VName, 2) <> Kernel) then
+    ImportError('Wav2Vec2 import: "' + VName + '" must have shape [' +
+      IntToStr(HiddenSize) + ', ' + IntToStr(InPerGroup) + ', ' +
+      IntToStr(Kernel) + '], got ' + Reader.ShapeAsString(VName));
+  if Layer.Neurons.Count <> HiddenSize then
+    ImportError('Wav2Vec2 import: internal error - pos conv has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(HiddenSize) + '.');
+  if Layer.Neurons[0].Weights.Size <> Kernel * InPerGroup then
+    ImportError('Wav2Vec2 import: internal error - pos conv neuron has ' +
+      IntToStr(Layer.Neurons[0].Weights.Size) + ' weights, expected ' +
+      IntToStr(Kernel * InPerGroup) + '.');
+  G := TNNetVolume.Create;
+  V := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  WEff := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(GName, G);
+    Reader.LoadTensorFlat(VName, V);
+    Reader.LoadTensorFlat(BName, B);
+    WEff.ReSize(HiddenSize, InPerGroup, Kernel);
+    // Per kernel tap k: Frobenius norm of v[:,:,k] over (out, in/groups).
+    for kk := 0 to Kernel - 1 do
+    begin
+      Acc := 0;
+      for o := 0 to HiddenSize - 1 do
+        for ic := 0 to InPerGroup - 1 do
+          Acc := Acc + Sqr(V.FData[(o * InPerGroup + ic) * Kernel + kk]);
+      Norm := Sqrt(Acc);
+      if Norm = 0 then Norm := 1;
+      for o := 0 to HiddenSize - 1 do
+        for ic := 0 to InPerGroup - 1 do
+          WEff.FData[(o * InPerGroup + ic) * Kernel + kk] :=
+            G.FData[kk] * V.FData[(o * InPerGroup + ic) * Kernel + kk] / Norm;
+    end;
+    for o := 0 to HiddenSize - 1 do
+    begin
+      for kk := 0 to Kernel - 1 do
+        for ic := 0 to InPerGroup - 1 do
+          Layer.Neurons[o].Weights.FData[kk * InPerGroup + ic] :=
+            WEff.FData[(o * InPerGroup + ic) * Kernel + kk];
+      Layer.Neurons[o].BiasWeight := B.FData[o];
+    end;
+  finally
+    WEff.Free; B.Free; V.Free; G.Free;
+  end;
+  Layer.FlushWeightCache();
+  Consumed.Add(GName);
+  Consumed.Add(VName);
+  Consumed.Add(BName);
+end;
+
+function BuildWav2Vec2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TWav2Vec2Config; NumSamples: integer;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  QKV, AttnDense, AttnLN, Inter, OutDense, OutLN: array of TNNetLayer;
+  ConvLayer, ConvGN: array of TNNetLayer;
+  FeatProjLN, FeatProj, PosConv, EncLN: TNNetLayer;
+  LMHead, BranchInput, HiddenAct, PhiBranch, FeatInput, PreEncoder: TNNetLayer;
+  EncLen, InLen, BlockCnt, i, k, Pad: integer;
+  ConvPrefix, EncPrefix, BlockPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('Wav2Vec2 import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('Wav2Vec2 import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      if Config.IsHubert then Config.Prefix := 'hubert.'
+      else Config.Prefix := 'wav2vec2.';
+      if not Reader.HasTensor(Config.Prefix +
+        'feature_projection.projection.weight') then
+        ImportError('Wav2Vec2 import: "' + Config.Prefix +
+          'feature_projection.projection.weight" not found in ' +
+          Reader.FileName + ' - not a ' + Config.ModelType +
+          ' CTC checkpoint?');
+      EncLen := Wav2Vec2EncoderLength(Config, NumSamples);
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      // Raw waveform: (NumSamples, 1, 1).
+      FeatInput := NN.AddLayer( TNNetInput.Create(NumSamples, 1, 1) );
+      // ----- Feature extractor: strided 1-D convs over the (T,1,C) grid. -
+      SetLength(ConvLayer, Config.NumConvLayers);
+      SetLength(ConvGN, Config.NumConvLayers);
+      InLen := NumSamples;
+      for k := 0 to Config.NumConvLayers - 1 do
+      begin
+        // conv_bias false => suppress the bias (pSuppressBias=1).
+        ConvLayer[k] := NN.AddLayer( TNNetConvolutionLinear.Create(
+          Config.ConvDim[k], Config.ConvKernel[k], {Padding=}0,
+          Config.ConvStride[k], {SuppressBias=}1) );
+        InLen := (InLen - Config.ConvKernel[k]) div Config.ConvStride[k] + 1;
+        if (k = 0) and Config.FeatExtractGroupNorm then
+          // GroupNorm with num_groups = num_channels: each channel is its
+          // own group, normalized over the TIME (SizeX) axis - exactly HF's
+          // first-conv GroupNorm. Per-channel affine (gamma/beta).
+          ConvGN[k] := NN.AddLayer( TNNetGroupNorm.Create(Config.ConvDim[k]) );
+        AddWhisperExactGelu(NN); // exact erf GELU (feat_extract_activation)
+      end;
+      // ----- Feature projection: LayerNorm then Linear C[-1] -> hidden. ---
+      FeatProjLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      FeatProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      PreEncoder := NN.GetLastLayer();
+      // ----- Positional conv embedding (grouped conv1d, even kernel). -----
+      // SAME padding via explicit X-only PadXY (kernel div 2 each side); the
+      // even kernel emits T+1 frames, the SamePad crop drops the last one.
+      Pad := Config.NumPosConvEmbeddings div 2;
+      NN.AddLayer( TNNetPadXY.Create(Pad, 0) );
+      PosConv := NN.AddLayer( TNNetGroupedConvolutionLinear.Create(
+        Config.HiddenSize, Config.NumPosConvEmbeddings, {Padding=}0,
+        {Stride=}1, Config.NumPosConvGroups) );
+      // PadXY adds 2*Pad = kernel cols; grouped conv emits
+      // (EncLen + kernel) - kernel + 1 = EncLen + 1 frames. Drop the last.
+      NN.AddLayer( TNNetCrop.Create(0, 0, EncLen, 1) );
+      AddWhisperExactGelu(NN);
+      // hidden := encoder.layer_norm( projected_features + pos_embed ).
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), PreEncoder]) );
+      EncLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      // ----- POST-LN transformer encoder blocks (BERT block math). -------
+      SetLength(QKV, Config.NumLayers);
+      SetLength(AttnDense, Config.NumLayers);
+      SetLength(AttnLN, Config.NumLayers);
+      SetLength(Inter, Config.NumLayers);
+      SetLength(OutDense, Config.NumLayers);
+      SetLength(OutLN, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
+        BranchInput := NN.GetLastLayer();
+        QKV[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        AttnDense[BlockCnt] := NN.AddMultiHeadSelfAttention(
+          Config.NumHeads, {CausalMask=}false);
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        AttnLN[BlockCnt] := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        // x := final_LN(x + output_dense(gelu(intermediate_dense(x)))).
+        BranchInput := NN.GetLastLayer();
+        Inter[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        HiddenAct := NN.GetLastLayer();
+        NN.AddLayerAfter(
+          TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+        NN.AddLayer( TNNetErf.Create() );
+        NN.AddLayer( TNNetAddConstant.Create(1.0) );
+        PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+        NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+        NN.AddLayer( TNNetReGLU.Create() );
+        OutDense[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        OutLN[BlockCnt] := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      // ----- CTC head: linear hidden -> vocab (lm_head). -----------------
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      ConvPrefix := Config.Prefix + 'feature_extractor.conv_layers.';
+      for k := 0 to Config.NumConvLayers - 1 do
+      begin
+        if k = 0 then InLen := 1 else InLen := Config.ConvDim[k - 1];
+        LoadWav2Vec2FeatureConv(Reader, ConvLayer[k],
+          ConvPrefix + IntToStr(k) + '.conv.weight',
+          InLen, Config.ConvDim[k], Config.ConvKernel[k], Consumed);
+        if (k = 0) and Config.FeatExtractGroupNorm then
+        begin
+          // GroupNorm's per-channel affine stores gamma in Neurons[0] and
+          // beta in Neurons[1] as flat Depth vectors - the same layout as a
+          // LayerNorm, so the LayerNorm loader maps it correctly.
+          LoadLayerNormWeights(Reader, ConvGN[0],
+            ConvPrefix + '0.layer_norm.weight',
+            ConvPrefix + '0.layer_norm.bias', Config.ConvDim[0]);
+          MarkConsumed(ConvPrefix + '0.layer_norm.weight');
+          MarkConsumed(ConvPrefix + '0.layer_norm.bias');
+        end;
+      end;
+      // Feature projection.
+      LoadLayerNormWeights(Reader, FeatProjLN,
+        Config.Prefix + 'feature_projection.layer_norm.weight',
+        Config.Prefix + 'feature_projection.layer_norm.bias',
+        Config.ConvDim[Config.NumConvLayers - 1]);
+      MarkConsumed(Config.Prefix + 'feature_projection.layer_norm.weight');
+      MarkConsumed(Config.Prefix + 'feature_projection.layer_norm.bias');
+      LoadLlamaLinearWeights(Reader, FeatProj,
+        Config.Prefix + 'feature_projection.projection.weight',
+        Config.ConvDim[Config.NumConvLayers - 1], Config.HiddenSize, 0, -1, 0,
+        Config.Prefix + 'feature_projection.projection.bias');
+      MarkConsumed(Config.Prefix + 'feature_projection.projection.weight');
+      MarkConsumed(Config.Prefix + 'feature_projection.projection.bias');
+      // Positional conv (weight_norm parametrized).
+      EncPrefix := Config.Prefix + 'encoder.';
+      LoadWav2Vec2PosConv(Reader, PosConv,
+        EncPrefix + 'pos_conv_embed.conv.parametrizations.weight.original0',
+        EncPrefix + 'pos_conv_embed.conv.parametrizations.weight.original1',
+        EncPrefix + 'pos_conv_embed.conv.bias',
+        Config.HiddenSize, Config.NumPosConvGroups,
+        Config.NumPosConvEmbeddings, Consumed);
+      LoadLayerNormWeights(Reader, EncLN,
+        EncPrefix + 'layer_norm.weight', EncPrefix + 'layer_norm.bias',
+        Config.HiddenSize);
+      MarkConsumed(EncPrefix + 'layer_norm.weight');
+      MarkConsumed(EncPrefix + 'layer_norm.bias');
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := EncPrefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        // Separate biased q/k/v -> the fused Q|K|V slab (query 0..d-1, key
+        // d..2d-1, value 2d..3d-1; the builder's per-head slicing matches).
+        LoadLlamaLinearWeights(Reader, QKV[BlockCnt],
+          BlockPrefix + 'attention.q_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, 3 * Config.HiddenSize, 0,
+          BlockPrefix + 'attention.q_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.q_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.q_proj.bias');
+        LoadLlamaLinearWeights(Reader, QKV[BlockCnt],
+          BlockPrefix + 'attention.k_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, Config.HiddenSize,
+          3 * Config.HiddenSize, 0, BlockPrefix + 'attention.k_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.k_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.k_proj.bias');
+        LoadLlamaLinearWeights(Reader, QKV[BlockCnt],
+          BlockPrefix + 'attention.v_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, 2 * Config.HiddenSize,
+          3 * Config.HiddenSize, 0, BlockPrefix + 'attention.v_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.v_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.v_proj.bias');
+        LoadLlamaLinearWeights(Reader, AttnDense[BlockCnt],
+          BlockPrefix + 'attention.out_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'attention.out_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.out_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.out_proj.bias');
+        LoadLayerNormWeights(Reader, AttnLN[BlockCnt],
+          BlockPrefix + 'layer_norm.weight', BlockPrefix + 'layer_norm.bias',
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'layer_norm.weight');
+        MarkConsumed(BlockPrefix + 'layer_norm.bias');
+        LoadLlamaLinearWeights(Reader, Inter[BlockCnt],
+          BlockPrefix + 'feed_forward.intermediate_dense.weight',
+          Config.HiddenSize, Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'feed_forward.intermediate_dense.bias');
+        MarkConsumed(BlockPrefix + 'feed_forward.intermediate_dense.weight');
+        MarkConsumed(BlockPrefix + 'feed_forward.intermediate_dense.bias');
+        LoadLlamaLinearWeights(Reader, OutDense[BlockCnt],
+          BlockPrefix + 'feed_forward.output_dense.weight',
+          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'feed_forward.output_dense.bias');
+        MarkConsumed(BlockPrefix + 'feed_forward.output_dense.weight');
+        MarkConsumed(BlockPrefix + 'feed_forward.output_dense.bias');
+        LoadLayerNormWeights(Reader, OutLN[BlockCnt],
+          BlockPrefix + 'final_layer_norm.weight',
+          BlockPrefix + 'final_layer_norm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'final_layer_norm.weight');
+        MarkConsumed(BlockPrefix + 'final_layer_norm.bias');
+      end;
+      // CTC head.
+      LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+        Config.HiddenSize, Config.VocabSize, 0, -1, 0, 'lm_head.bias');
+      MarkConsumed('lm_head.weight');
+      MarkConsumed('lm_head.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // masked_spec_embed: a pretraining-only buffer (SpecAugment mask
+        // token), never read at CTC inference - a known ignorable.
+        if Pos('masked_spec_embed', TensorNameStr) > 0 then continue;
+        // feature_projection has no extra tensors; quantizer / adapter /
+        // project_hid / project_q are pretraining heads absent from *ForCTC.
+        ImportError('Wav2Vec2 import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildWav2Vec2FromSafeTensorsEx(const FileName: string;
+  out Config: TWav2Vec2Config; NumSamples: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadWav2Vec2ConfigFromJSONFile(ConfigPath);
+  Result := BuildWav2Vec2FromSafeTensorsWithConfig(FileName, Config,
+    NumSamples, pInferenceOnly);
+end;
+
+function BuildWav2Vec2FromSafeTensors(const FileName: string;
+  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+var
+  Config: TWav2Vec2Config;
+begin
+  Result := BuildWav2Vec2FromSafeTensorsEx(FileName, Config, NumSamples,
+    pInferenceOnly);
+end;
+
 function ReadRWKVConfigFromJSONFile(const FileName: string): TRWKVConfig;
 var
   JsonText: TStringList;
@@ -27213,7 +27929,7 @@ var
   ConfigPath, WeightsPath, ModelType, ArchName: string;
   JsonText: TStringList;
   Root, ArchData: TJSONData;
-  NumHeads, ArchCnt: integer;
+  NumHeads, ArchCnt, Wav2Vec2Samples: integer;
   BertSeqCls, GPT2SeqCls, GPT2ExactGelu: boolean;
   IgnoredGPT2Config: TGPT2Config;
   IgnoredId2Label: TStringList;
@@ -27237,6 +27953,7 @@ var
   IgnoredModernBertConfig: TModernBertConfig;
   IgnoredDebertaV2Config: TDebertaV2Config;
   IgnoredDeepSeekV2Config: TDeepSeekV2Config;
+  IgnoredWav2Vec2Config: TWav2Vec2Config;
 begin
   // ---- resolve the weights file and the config.json ----
   if DirectoryExists(Path) then
@@ -27602,6 +28319,17 @@ begin
       'neuralaudio.ComputeWhisperLogMel) instead of this single-net ' +
       'dispatch.');
   end
+  else if (ModelType = 'wav2vec2') or (ModelType = 'hubert') then
+  begin
+    // Wav2Vec2 / HuBERT CTC: a single-net raw-waveform ASR encoder. Here
+    // pSeqLen is reinterpreted as the RAW SAMPLE COUNT of the clip the net
+    // is built for (a default of 16000 = 1 second at 16 kHz when 0). The
+    // output is (EncLen,1,vocab) CTC logits - decode with DecodeCTCGreedy.
+    if pSeqLen > 0 then Wav2Vec2Samples := pSeqLen
+    else Wav2Vec2Samples := 16000;
+    Result := BuildWav2Vec2FromSafeTensorsEx(WeightsPath,
+      IgnoredWav2Vec2Config, Wav2Vec2Samples, pInferenceOnly, ConfigPath);
+  end
   else if ModelType = 'clip' then
   begin
     // CLIP is a dual encoder: the import builds TWO independent nets
@@ -27621,7 +28349,7 @@ begin
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, phi3, llama, ' +
       'mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, ' +
       'mamba, bloom, falcon, bert, distilbert, roberta, modernbert, ' +
-      'deepseek_v2, olmo2.');
+      'deepseek_v2, olmo2, wav2vec2, hubert.');
   end;
 end;
 

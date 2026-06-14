@@ -613,27 +613,36 @@ rather than acted on.
       — the projection head is always f32 while the BERT backbone already
       supports int8.
 
-- [ ] Wav2Vec2 / HuBERT CTC ASR importer (`BuildWav2Vec2FromSafeTensors[Ex]`,
-      model_type "wav2vec2"/"hubert") — reuse the landed DecodeCTCGreedy for the
-      CTC head. The SECOND speech import family and the
-      first SELF-SUPERVISED-encoder speech model, architecturally distinct from
-      the landed Whisper seq2seq (Whisper is a mel-spectrogram encoder-decoder;
-      Wav2Vec2/HuBERT is a raw-waveform CONV FEATURE EXTRACTOR -> transformer
-      ENCODER -> linear CTC head, no decoder). Genuinely new pieces: (a) the
-      multi-layer strided 1-D conv feature encoder (GroupNorm on the first conv
-      for wav2vec2-base, LayerNorm-everywhere for the -large/robust variant) over
-      a raw float audio volume, (b) the conv-based relative POSITIONAL EMBEDDING
-      (a grouped conv1d added to the encoder input, NOT sinusoidal/RoPE), (c)
-      feature projection + the standard pre/post-norm transformer encoder (reuse
-      the BERT encoder machinery — bidirectional, GELU FFN), (d) the CTC linear
-      head decoded with the landed `DecodeCTCGreedy`.
-      Tokenizer is a tiny char/phoneme vocab.json (no SentencePiece). Deliverables:
-      pico parity fixture via make_pico_*_fixture.py asserting encoder hidden
-      states AND CTC logits < 1e-4 vs HF float64 Wav2Vec2ForCTC, and an
-      examples/Wav2Vec2Transcribe demo that transcribes a short WAV on CPU (reuse
-      the WhisperTranscribe audio-loading path; edit examples/README.md not the
-      main README). Opens HuBERT (identical CTC head, same importer with a flag)
-      and later wav2vec2 pretraining.
+- [X] Wav2Vec2 / HuBERT CTC ASR importer (`BuildWav2Vec2FromSafeTensors[Ex/
+      WithConfig]`, model_type "wav2vec2"/"hubert") — LANDED. The SECOND speech
+      import family and first SELF-SUPERVISED-encoder ASR: a raw-waveform CONV
+      FEATURE EXTRACTOR -> transformer ENCODER -> linear CTC head, no decoder.
+      Built in neuralpretrained.pas reusing existing layers: (a) multi-layer
+      strided 1-D conv feature extractor (TNNetConvolutionLinear bias-free on the
+      (T,1,C) grid; first conv -> TNNetGroupNorm(channels) per-channel-over-time
+      GroupNorm -> GELU, rest conv -> GELU); (b) feature projection
+      (TNNetTokenLayerNorm + Linear); (c) conv-based relative POSITIONAL EMBEDDING
+      (grouped conv1d, weight-norm reconstructed from original0/original1 dim=2,
+      even-kernel SamePad via TNNetCrop) added then encoder.layer_norm; (d) the
+      BERT post-LN bidirectional encoder block math (exact erf GELU); (e) linear
+      CTC head decoded with DecodeCTCGreedy. HuBERT = same importer + IsHubert
+      flag. Wired into BuildFromPretrained (pSeqLen reinterpreted as raw sample
+      count). Deliverables DONE: tools/wav2vec2_tiny_fixture.py builds committed
+      pico fixtures (tiny_wav2vec2.*, tiny_hubert.*); TestWav2Vec2ConfigFromJSONFile
+      + TestWav2Vec2CTCParity + TestHubertCTCParity assert encoder hidden 2.3e-6 /
+      CTC logits 1.2e-7 (wav2vec2) and 2.6e-6 / 2.0e-7 (hubert) < 1e-4 vs HF
+      float64 Wav2Vec2ForCTC/HubertForCTC; examples/Wav2Vec2Transcribe transcribes
+      a WAV (LoadWav16ToVolume raw path) with a self-contained pico smoke test;
+      examples/README.md updated. Tokenizer is the tiny char vocab.json.
+- [ ] Wav2Vec2 -large / robust LayerNorm variant + pretraining (follow-up to the
+      landed Wav2Vec2/HuBERT CTC importer, which supports ONLY the wav2vec2-base
+      "group" feat_extract_norm + post-norm encoder; ReadWav2Vec2ConfigFromJSONFile
+      rejects feat_extract_norm="layer" and do_stable_layer_norm=true loudly). The
+      -large/robust path needs: LayerNorm on EVERY conv feature-extractor layer
+      (not just GroupNorm on conv 0), a PRE-norm transformer encoder
+      (do_stable_layer_norm), and the final encoder LayerNorm placement that
+      pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
+      contrastive masked-prediction heads currently dropped as ignorable tensors).
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,

@@ -18,7 +18,8 @@ interface
 uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
-  neuralgguf, neuralmxfp4, neuralpretrained, neuralhftokenizer, neuralaudio;
+  neuralgguf, neuralmxfp4, neuralpretrained, neuralhftokenizer, neuralaudio,
+  neuraldecode;
 
 type
   TTestNeuralPretrained = class(TTestCase)
@@ -54,6 +55,9 @@ type
     procedure AssertBertParityWithFixture(NN: TNNet;
       const HiddenFileName: string; SeqLen, Hidden: integer;
       PoolerRow0Only: boolean);
+    // Wav2Vec2/HuBERT CTC parity loop (encoder hidden states + CTC logits
+    // vs the HF float64 oracle, gate 1e-4) - see the body comment.
+    procedure AssertWav2Vec2CTCParity(IsHubert: boolean);
     // Sequence-classification parity loop: feeds every "sequences" row of
     // the fixture through NN ((SeqLen,1,2) token|token-type ids for
     // BertStyle, else (SeqLen,1,1) token ids), selects the pooled row via
@@ -246,6 +250,9 @@ type
     procedure TestM2M100Parity;
     procedure TestWhisperConfigFromJSONFile;
     procedure TestWhisperParity;
+    procedure TestWav2Vec2ConfigFromJSONFile;
+    procedure TestWav2Vec2CTCParity;
+    procedure TestHubertCTCParity;
     procedure TestClipConfigFromJSONFile;
     procedure TestClipParity;
     procedure TestClipVisionFeatures;
@@ -10719,6 +10726,156 @@ begin
     Dec.Free;
     Enc.Free;
   end;
+end;
+
+procedure TTestNeuralPretrained.TestWav2Vec2ConfigFromJSONFile;
+var
+  Config: TWav2Vec2Config;
+begin
+  Config := ReadWav2Vec2ConfigFromJSONFile(
+    FixturePath('tiny_wav2vec2_config.json'));
+  AssertEquals('model_type', 'wav2vec2', Config.ModelType);
+  AssertEquals('is hubert', false, Config.IsHubert);
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('layers', 2, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('inter', 32, Config.IntermediateSize);
+  AssertEquals('vocab', 12, Config.VocabSize);
+  AssertEquals('num conv layers', 3, Config.NumConvLayers);
+  AssertEquals('conv_dim[0]', 8, Config.ConvDim[0]);
+  AssertEquals('conv_stride[0]', 5, Config.ConvStride[0]);
+  AssertEquals('conv_kernel[0]', 10, Config.ConvKernel[0]);
+  AssertEquals('conv_bias', false, Config.ConvBias);
+  AssertEquals('pos conv kernel', 8, Config.NumPosConvEmbeddings);
+  AssertEquals('pos conv groups', 4, Config.NumPosConvGroups);
+  AssertEquals('feat extract group norm', true, Config.FeatExtractGroupNorm);
+  AssertEquals('do stable layer norm', false, Config.DoStableLayerNorm);
+  // The hubert config differs only in model_type / IsHubert.
+  Config := ReadWav2Vec2ConfigFromJSONFile(
+    FixturePath('tiny_hubert_config.json'));
+  AssertEquals('hubert model_type', 'hubert', Config.ModelType);
+  AssertEquals('hubert flag', true, Config.IsHubert);
+end;
+
+// Shared Wav2Vec2/HuBERT CTC parity loop: builds the importer net for the
+// fixture clip length, feeds every raw "clips" row of the reference JSON
+// ({"clips","hidden","logits","enc_len"}) and asserts BOTH the encoder
+// final hidden states AND the CTC logits match the HF float64 oracle to
+// < 1e-4 (the importer-parity gate). Also exercises DecodeCTCGreedy on the
+// imported logits to confirm the CTC head wires to the decoder.
+procedure TTestNeuralPretrained.AssertWav2Vec2CTCParity(IsHubert: boolean);
+var
+  NN: TNNet;
+  Config: TWav2Vec2Config;
+  RefRoot: TJSONData;
+  Clips, Hidden, LogitsArr, ClipArr, PosArr, RowArr: TJSONArray;
+  Input, Output: TNNetVolume;
+  RefJson: TStringList;
+  Prefix: string;
+  ClipCnt, PosCnt, ChCnt, NumSamples, EncLen, expLen: integer;
+  Diff, MaxHiddenDiff, MaxLogitDiff: double;
+  Decoded: TNeuralIntegerArray;
+begin
+  RandSeed := 424242;
+  if IsHubert then Prefix := 'tiny_hubert' else Prefix := 'tiny_wav2vec2';
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath(Prefix + '_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    Hidden := TJSONArray(TJSONObject(RefRoot).Find('hidden'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    expLen := TJSONObject(RefRoot).Get('enc_len', 0);
+    AssertTrue('clips present', Clips <> nil);
+    AssertTrue('hidden present', Hidden <> nil);
+    AssertTrue('logits present', LogitsArr <> nil);
+    AssertTrue('at least 3 clips', Clips.Count >= 3);
+    NumSamples := TJSONArray(Clips.Items[0]).Count;
+
+    NN := BuildWav2Vec2FromSafeTensorsEx(
+      FixturePath(Prefix + '.safetensors'), Config, NumSamples,
+      {pInferenceOnly=}false, FixturePath(Prefix + '_config.json'));
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('hubert flag from config', IsHubert, Config.IsHubert);
+    EncLen := Wav2Vec2EncoderLength(Config, NumSamples);
+    AssertEquals('encoder length matches the oracle', expLen, EncLen);
+    AssertEquals('raw input length', NumSamples, NN.Layers[0].Output.SizeX);
+    AssertEquals('CTC logits shape', EncLen * Config.VocabSize,
+      NN.GetLastLayer().Output.Size);
+
+    MaxHiddenDiff := 0;
+    MaxLogitDiff := 0;
+    Input.ReSize(NumSamples, 1, 1);
+    for ClipCnt := 0 to Clips.Count - 1 do
+    begin
+      ClipArr := TJSONArray(Clips.Items[ClipCnt]);
+      AssertEquals('clip length', NumSamples, ClipArr.Count);
+      for PosCnt := 0 to NumSamples - 1 do
+        Input.FData[PosCnt] := ClipArr.Items[PosCnt].AsFloat;
+      NN.Compute(Input);
+      NN.GetOutput(Output);
+      // CTC logits vs HF float64 lm_head logits.
+      PosArr := TJSONArray(LogitsArr.Items[ClipCnt]);
+      AssertEquals('logit frames', EncLen, PosArr.Count);
+      for PosCnt := 0 to EncLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChCnt := 0 to Config.VocabSize - 1 do
+        begin
+          Diff := Abs(Output.FData[PosCnt * Config.VocabSize + ChCnt] -
+            RowArr.Items[ChCnt].AsFloat);
+          if Diff > MaxLogitDiff then MaxLogitDiff := Diff;
+        end;
+      end;
+      // Encoder final hidden states vs HF float64 last_hidden_state. The
+      // encoder output is the last block's LN output, recoverable here as
+      // the layer feeding the lm_head (the layer before the last).
+      Output.Copy(NN.Layers[NN.Layers.Count - 2].Output);
+      PosArr := TJSONArray(Hidden.Items[ClipCnt]);
+      AssertEquals('hidden frames', EncLen, PosArr.Count);
+      for PosCnt := 0 to EncLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChCnt := 0 to Config.HiddenSize - 1 do
+        begin
+          Diff := Abs(Output.FData[PosCnt * Config.HiddenSize + ChCnt] -
+            RowArr.Items[ChCnt].AsFloat);
+          if Diff > MaxHiddenDiff then MaxHiddenDiff := Diff;
+        end;
+      end;
+      // CTC greedy decode must run on the imported logits (head wiring).
+      NN.GetOutput(Output);
+      Decoded := DecodeCTCGreedy(Output, {Blank=}Config.VocabSize - 1);
+      AssertTrue('decode produces a token sequence (possibly empty)',
+        Length(Decoded) >= 0);
+    end;
+    // 1e-4 importer-parity gate (the committed-fixture convention). NEVER
+    // loosen - fix the model instead.
+    AssertTrue('Wav2Vec2 encoder hidden parity: max |diff| = ' +
+      FloatToStr(MaxHiddenDiff) + ' must be < 1e-4', MaxHiddenDiff < 1e-4);
+    AssertTrue('Wav2Vec2 CTC logit parity: max |diff| = ' +
+      FloatToStr(MaxLogitDiff) + ' must be < 1e-4', MaxLogitDiff < 1e-4);
+  finally
+    NN.Free;
+    RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestWav2Vec2CTCParity;
+begin
+  AssertWav2Vec2CTCParity({IsHubert=}false);
+end;
+
+procedure TTestNeuralPretrained.TestHubertCTCParity;
+begin
+  AssertWav2Vec2CTCParity({IsHubert=}true);
 end;
 
 // Verifies the log-mel FRONTEND (neural/neuralaudio.pas) against HF
