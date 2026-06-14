@@ -5002,6 +5002,9 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      // Normalization epsilon (default 1e-5; e.g. diffusers GroupNorm uses 1e-6).
+      property GroupNormEpsilon: TNeuralFloat read FGroupNormEpsilon
+        write FGroupNormEpsilon;
   end;
 
   /// Instance normalization: per-sample, per-channel normalization. This is

@@ -274,6 +274,8 @@ type
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
     procedure TestResNet18ImageClassificationParity;
+    procedure TestVaeDecoderConfigFromJSONFile;
+    procedure TestVaeDecoderParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
     procedure TestWhisperLogMelFrontend;
@@ -12638,6 +12640,112 @@ begin
   finally
     RefRoot.Free;
     ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadVaeDecoderConfigFromJSONFile on the committed pico VAE config.
+procedure TTestNeuralPretrained.TestVaeDecoderConfigFromJSONFile;
+var
+  Config: TVaeDecoderConfig;
+begin
+  Config := ReadVaeDecoderConfigFromJSONFile(
+    FixturePath('tiny_vae_decoder_config.json'));
+  AssertEquals('model_type', 'AutoencoderKL', Config.ModelType);
+  AssertEquals('num block_out_channels', 2, Config.NumBlockOut);
+  AssertEquals('block_out_channels[0]', 8, Config.BlockOutChannels[0]);
+  AssertEquals('block_out_channels[1]', 16, Config.BlockOutChannels[1]);
+  AssertEquals('layers_per_block', 1, Config.LayersPerBlock);
+  AssertEquals('latent_channels', 4, Config.LatentChannels);
+  AssertEquals('out_channels', 3, Config.OutChannels);
+  AssertEquals('norm_num_groups', 4, Config.NormNumGroups);
+  AssertEquals('latent_grid', 8, Config.LatentGrid);
+  AssertTrue('scaling_factor ~ 0.18215',
+    Abs(Config.ScalingFactor - 0.18215) < 1e-6);
+end;
+
+// Stable Diffusion VAE DECODER parity test (diffusers AutoencoderKL decoder).
+// tests/fixtures/tiny_vae_decoder.* is a pico randomly-initialized decoder
+// (block_out_channels [8,16], layers_per_block 1, norm_num_groups 4, latent
+// grid 8x8, 4 latent channels -> 16x16 RGB after one nearest 2x upsample). The
+// generator tools/vae_decoder_tiny_fixture.py builds a self-contained numpy
+// float64 oracle (diffusers is not installed) and asserts the spatial
+// self-attention, the upsampler conv and conv_norm_out each MOVE the output.
+// This checks the latent 1/scaling_factor scaling, post_quant_conv, conv_in,
+// the MID resnet/attention/resnet, the up-block resnets + nearest upsample
+// convs, and conv_norm_out -> SiLU -> conv_out, end to end < 1e-4 vs oracle.
+procedure TTestNeuralPretrained.TestVaeDecoderParity;
+var
+  NN: TNNet;
+  Config: TVaeDecoderConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Latent, ChanArr, RowArr, ImgArr: TJSONArray;
+  LatentInput: TNNetVolume;
+  ImgSize: integer;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildVaeDecoderFromSafeTensors(
+    FixturePath('tiny_vae_decoder.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_vae_decoder_config.json'));
+  RefJson := TStringList.Create;
+  LatentInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('latent grid', Config.LatentGrid, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_vae_decoder_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Latent := TJSONArray(TJSONObject(RefRoot).Find('latent'));
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
+    ImgSize := TJSONObject(RefRoot).Get('image_size', 0);
+    AssertTrue('latent present', Latent <> nil);
+    AssertEquals('output image grid', ImgSize, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.OutChannels,
+      NN.GetLastLayer().Output.Depth);
+
+    // Load the (C,H,W) latent into the CAI (x,y,depth)-indexed volume.
+    LatentInput.ReSize(Config.LatentGrid, Config.LatentGrid,
+      Config.LatentChannels);
+    for ChanCnt := 0 to Config.LatentChannels - 1 do
+    begin
+      RowArr := TJSONArray(Latent.Items[ChanCnt]);
+      for YCnt := 0 to Config.LatentGrid - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.LatentGrid - 1 do
+          LatentInput.FData[
+            (YCnt * Config.LatentGrid + XCnt) * Config.LatentChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(LatentInput);
+    // Compare the (C,H,W) oracle vs the CAI (x,y,depth) output volume.
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.OutChannels - 1 do
+    begin
+      RowArr := TJSONArray(ImgArr.Items[ChanCnt]);
+      for YCnt := 0 to ImgSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to ImgSize - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := NN.GetLastLayer().Output.FData[
+            (YCnt * ImgSize + XCnt) * Config.OutChannels + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('decoded RGB: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    LatentInput.Free;
     RefJson.Free;
     NN.Free;
   end;
