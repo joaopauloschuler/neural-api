@@ -193,7 +193,7 @@ rather than acted on.
       is forward-only — add backward through the dt/B/C RMSNorms for fine-tuning;
       (c) no Jamba-specific tokenizer demo (raw ids work); (d) no real-checkpoint
       slicer fixture (parity uses a random pico model).
-- [ ] Nemotron-H hybrid Mamba-2 + attention importer
+- [X] Nemotron-H hybrid Mamba-2 + attention importer
       (`BuildNemotronHFromSafeTensors[Ex]`, model_type "nemotron_h"; e.g.
       nvidia/Nemotron-H-8B-Base / the 4B/47B siblings) — the open Mamba-2-hybrid
       follow-up the README's Mamba-2 entry names but the tasklist has no entry for.
@@ -216,6 +216,25 @@ rather than acted on.
       `NemotronHForCausalLM`; wire model_type "nemotron_h" into `BuildFromPretrained`.
       Opens Zamba2 (the sibling Mamba-2 hybrid, which additionally adds shared
       transformer blocks with per-invocation LoRA — a separate, larger follow-up).
+      LANDED 2026-06-14 (branch a3): `BuildNemotronHFromSafeTensors[Ex]` +
+      `ReadNemotronHConfigFromJSONFile` + `TNemotronHConfig`, override-pattern
+      parser (`hybrid_override_pattern` string OR `layers_block_type` list) with
+      per-layer M/*/- dispatch, single pre-norm residual per block; relu2 MLP =
+      up_proj -> TNNetReLU -> TNNetSquare -> down_proj (ReLU(x)^2, no gate, no new
+      class); NoPE bias-free GQA with explicit `head_dim`; reuses the standalone
+      Mamba-2 mixer construction + TNNetMamba2 leaf. Wired into BuildFromPretrained.
+      Pico parity test `TestNemotronHLogitParity` (tools/make_pico_nemotronh_fixture.py,
+      pattern "M*-M" covering all three block types) passes < 1e-4 vs REAL HF
+      float64 `NemotronHForCausalLM` (naive CPU path). Suite green (1982 tests).
+  - [ ] Nemotron-H-MoE ('E' block type) — the importer currently REJECTS the 'E'
+        (MoE) block type with a clear message. Add the DeepSeek/Mixtral-style
+        top-k MoE FFN block (n_routed_experts, num_experts_per_tok,
+        norm_topk_prob, routed_scaling_factor, n_shared_experts) on the
+        Nemotron-H schedule path; reuse the landed TopKGate/expert machinery.
+  - [ ] Zamba2 importer (model_type "zamba2") — the sibling Mamba-2 hybrid that
+        additionally shares a small set of transformer blocks across depth with a
+        per-invocation LoRA adapter; needs a shared-block + LoRA wiring helper
+        (larger than Nemotron-H, distinct from the per-layer-independent schedule).
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).

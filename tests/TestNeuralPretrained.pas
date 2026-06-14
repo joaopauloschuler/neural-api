@@ -190,6 +190,7 @@ type
     procedure TestMamba2LogitParity;
     procedure TestRecurrentGemmaLogitParity;
     procedure TestJambaLogitParity;
+    procedure TestNemotronHLogitParity;
     procedure TestBloomLogitParity;
     procedure TestModernBertHiddenStateParity;
     procedure TestDebertaV2ConfigFromJSONFile;
@@ -6655,6 +6656,85 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_jamba_logits.json'), 7, 17);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the NEMOTRON-H import target - the suite's SECOND HYBRID decoder
+// (HF model_type "nemotron_h", architectures ["NemotronHForCausalLM"], the
+// nvidia/Nemotron-H-8B-Base / 4B / 47B family) and architecturally DISTINCT
+// from Jamba. tests/fixtures/tiny_nemotronh.* is a pico RANDOM model whose
+// hybrid_override_pattern "M*-M" interleaves all three block types -
+// Mamba-2 SSD mixer, attention, and a non-gated relu2 MLP - each as a single
+// pre-norm residual x := x + mixer(norm(x)). The reference logits are
+// computed by REAL HF transformers NemotronHForCausalLM in float64 on the
+// naive CPU path (see tools/make_pico_nemotronh_fixture.py, which asserts
+// every block type / quirk is non-vacuous: per-head A_log 0.45, relu2 MLP
+// 3.83, attention 5.55 - all far above the 1e-4 gate). Quirks on the parity
+// path: the explicit override-pattern schedule; the relu2 MLP (ReLU->Square,
+// NO gate); NoPE bias-free GQA with an EXPLICIT head_dim != hidden/heads; the
+// multi-head Mamba-2 mixer ([gate|x|B|C|dt] packing + gated RMSNorm). The
+// MoE 'E' block type is a rejected follow-up (Nemotron-H-MoE / Zamba2).
+procedure TTestNeuralPretrained.TestNemotronHLogitParity;
+var
+  NN: TNNet;
+  Config: TNemotronHConfig;
+  LayerCnt, Mamba2Cnt, AttnCnt, SquareCnt, SwiGLUCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildNemotronHFromSafeTensorsEx(
+    FixturePath('tiny_nemotronh.safetensors'), Config, {SeqLen=}7,
+    {pInferenceOnly=}false, FixturePath('tiny_nemotronh_config.json'));
+  try
+    AssertEquals('model_type', 'nemotron_h', Config.ModelType);
+    AssertEquals('pattern', 'M*-M', Config.Pattern);
+    AssertEquals('layers', 4, Config.NumLayers);
+    AssertEquals('hidden', 8, Config.HiddenSize);
+    AssertEquals('heads', 4, Config.NumHeads);
+    AssertEquals('kv_heads (GQA)', 2, Config.NumKVHeads);
+    AssertEquals('head_dim (explicit, != hidden/heads)', 3, Config.HeadDim);
+    AssertEquals('mlp inter', 12, Config.IntermediateSize);
+    AssertEquals('d_inner (mamba_heads*mamba_head_dim)', 8, Config.DInner);
+    AssertEquals('mamba_heads', 2, Config.MambaNumHeads);
+    AssertEquals('mamba_head_dim', 4, Config.MambaHeadDim);
+    AssertEquals('n_groups', 1, Config.NGroups);
+    AssertEquals('d_state', 4, Config.StateSize);
+    AssertEquals('conv_kernel', 4, Config.ConvKernel);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertTrue('use_conv_bias', Config.UseConvBias);
+    AssertFalse('use_bias (in/out_proj)', Config.UseBias);
+    AssertFalse('untied head', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    // Schedule M*-M: 2 Mamba-2 mixers (-> 2 TNNetMamba2), 1 attention block
+    // (-> NumHeads=4 SDPA heads), 1 relu2 MLP (-> 1 TNNetSquare). No SwiGLU
+    // anywhere (the MLP is NON-gated).
+    Mamba2Cnt := 0; AttnCnt := 0; SquareCnt := 0; SwiGLUCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt] is TNNetMamba2 then Inc(Mamba2Cnt);
+      if NN.Layers[LayerCnt] is TNNetScaledDotProductAttention then
+        Inc(AttnCnt);
+      if NN.Layers[LayerCnt] is TNNetSquare then Inc(SquareCnt);
+      if NN.Layers[LayerCnt] is TNNetSwiGLU then Inc(SwiGLUCnt);
+    end;
+    AssertEquals('TNNetMamba2 count (2 M blocks)', 2, Mamba2Cnt);
+    AssertEquals('SDPA head count (4 heads x 1 attn block)', 4, AttnCnt);
+    AssertEquals('TNNetSquare count (1 relu2 MLP block)', 1, SquareCnt);
+    AssertEquals('SwiGLU count (non-gated relu2 MLP => 0)', 0, SwiGLUCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_nemotronh_logits.json'), 7, Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "nemotron_h" (architectures ["NemotronHForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_nemotronh.safetensors'),
+    {SeqLen=}7, {pInferenceOnly=}true,
+    FixturePath('tiny_nemotronh_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_nemotronh_logits.json'), 7, 13);
   finally
     NN.Free;
   end;

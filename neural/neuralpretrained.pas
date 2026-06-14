@@ -3687,6 +3687,90 @@ function BuildJambaFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
+// ====================== NEMOTRON-H IMPORT (interface) =====================
+// BuildNemotronHFromSafeTensors imports NVIDIA's Nemotron-H hybrid family
+// (HF model_type "nemotron_h", architectures ["NemotronHForCausalLM"]:
+// nvidia/Nemotron-H-8B-Base and the 4B/47B siblings) - the SECOND HYBRID
+// importer after Jamba, and ARCHITECTURALLY DISTINCT from it. Jamba is
+// Mamba-1 + attention with a periodic arithmetic schedule and a gated SwiGLU
+// (or top-k MoE) FFN on every block. Nemotron-H instead interleaves the
+// landed multi-head TNNetMamba2 selective-SSD mixer, full softmax-attention,
+// and a plain NON-gated MLP on an EXPLICIT per-layer string schedule
+// (config "hybrid_override_pattern" / "layers_block_type", e.g. "M-M-M*-M-..."
+// with 'M'=Mamba2, '*'=attention, '-'=MLP). Each block is a SINGLE pre-norm
+// residual x := x + mixer(norm(x)) - there is NO separate FFN sub-block as in
+// Jamba; the MLP IS a block type on the schedule.
+//
+// Genuinely new vs every landed importer:
+//   (a) the override-pattern string driving heterogeneous block placement
+//       (parsed once into a TNemotronHBlockType array; not arithmetic like
+//       Jamba's attn_layer_period/offset);
+//   (b) a squared-ReLU (relu2 / ACT2FN "relu2") NON-gated MLP -
+//       down(ReLU(up(x))^2) with NO gate projection. Reproduced as
+//       up_proj -> TNNetReLU -> TNNetSquare -> down_proj (ReLU then x*x =
+//       ReLU(x)^2), the single-projection counterpart of the gated
+//       TNNetReGLUSquared used by BitNet.
+// The Mamba2 mixer reuses the standalone Mamba2 in_proj packing exactly
+// ([gate | x|B|C | dt], d_mlp=0) and the attention is bias-free GQA with NoPE
+// and an explicit config head_dim (NOT hidden/num_heads), scaling head_dim^-0.5.
+// RMSNorm throughout. Tokenizer is a tokenizer.json BPE (already supported).
+//
+// v1 supports the M/*/- block types (the dense Nemotron-H base/4B/8B/47B).
+// The 'E'=MoE block type (Nemotron-H-MoE) is rejected with a clear message;
+// it is a separate follow-up alongside Zamba2 (Mamba-2 + shared LoRA blocks).
+// Coded by Claude (AI).
+type
+  TNemotronHBlockType = (nhMamba2, nhAttention, nhMLP);
+  TNemotronHBlockTypeArray = array of TNemotronHBlockType;
+
+  TNemotronHConfig = record
+    HiddenSize: integer;          // hidden_size (d_model)
+    NumLayers: integer;           // derived: length of the block schedule
+    BlockTypes: TNemotronHBlockTypeArray; // per-layer M/*/- schedule
+    Pattern: string;              // the raw override-pattern string
+    // attention
+    NumHeads: integer;            // num_attention_heads
+    NumKVHeads: integer;          // num_key_value_heads (GQA)
+    HeadDim: integer;             // head_dim (explicit, may != hidden/heads)
+    // MLP
+    IntermediateSize: integer;    // intermediate_size (relu2 MLP width)
+    // mamba2 mixer
+    StateSize: integer;           // ssm_state_size (d_state)
+    MambaNumHeads: integer;       // mamba_num_heads
+    MambaHeadDim: integer;        // mamba_head_dim
+    NGroups: integer;             // n_groups
+    ConvKernel: integer;          // conv_kernel
+    DInner: integer;              // derived: mamba_num_heads*mamba_head_dim
+    UseConvBias: boolean;         // use_conv_bias (default true)
+    UseBias: boolean;             // use_bias - mamba in/out_proj (default false)
+    // shared
+    VocabSize: integer;           // vocab_size
+    LayerNormEps: double;         // layer_norm_epsilon (default 1e-5)
+    TieWordEmbeddings: boolean;   // tie_word_embeddings (default false)
+    ModelType: string;            // 'nemotron_h'
+    Prefix: string;               // 'model.' (detected from the checkpoint)
+  end;
+
+// Reads an HF Nemotron-H config.json (model_type "nemotron_h"). The block
+// schedule comes from "hybrid_override_pattern" (string of M/*/-) or
+// "layers_block_type" (list of "mamba"/"attention"/"mlp"); one is required.
+function ReadNemotronHConfigFromJSONFile(const FileName: string): TNemotronHConfig;
+
+function NemotronHConfigToString(const Config: TNemotronHConfig): string;
+
+function BuildNemotronHFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TNemotronHConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildNemotronHFromSafeTensorsEx(const FileName: string;
+  out Config: TNemotronHConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildNemotronHFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
 // ============================ BLOOM IMPORT =================================
 // BuildBloomFromSafeTensors rebuilds BigScience's BLOOM decoder (model_type
 // "bloom": bigscience/bloom-560m .. bloom-176B and the instruction-tuned
@@ -24609,6 +24693,549 @@ begin
     pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
+// ====================== NEMOTRON-H IMPORT (impl) =========================
+
+function ReadNemotronHConfigFromJSONFile(
+  const FileName: string): TNemotronHConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, Pattern: string;
+  Field, ListData: TJSONData;
+  Arr: TJSONArray;
+  i: integer;
+  ch, sb: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Nemotron-H import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Nemotron-H import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Nemotron-H import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Nemotron-H import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Nemotron-H import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'nemotron_h');
+    if ModelType <> 'nemotron_h' then
+      ImportError('Nemotron-H import: config model_type is "' + ModelType +
+        '" - expected "nemotron_h".');
+    Result.ModelType := ModelType;
+
+    // ---- block schedule: hybrid_override_pattern (string) OR
+    //      layers_block_type (list of "mamba"/"attention"/"mlp"/"moe") ----
+    Pattern := '';
+    Field := Obj.Find('hybrid_override_pattern');
+    if (Field <> nil) and (Field.JSONType = jtString) then
+      Pattern := Field.AsString;
+    if Pattern = '' then
+    begin
+      ListData := Obj.Find('layers_block_type');
+      if (ListData <> nil) and (ListData.JSONType = jtArray) then
+      begin
+        Arr := TJSONArray(ListData);
+        for i := 0 to Arr.Count - 1 do
+        begin
+          sb := LowerCase(Arr.Strings[i]);
+          if sb = 'mamba' then Pattern := Pattern + 'M'
+          else if sb = 'attention' then Pattern := Pattern + '*'
+          else if sb = 'mlp' then Pattern := Pattern + '-'
+          else if sb = 'moe' then Pattern := Pattern + 'E'
+          else
+            ImportError('Nemotron-H import: layers_block_type entry "' + sb +
+              '" is not one of mamba/attention/mlp/moe.');
+        end;
+      end;
+    end;
+    if Pattern = '' then
+      ImportError('Nemotron-H import: config has neither a non-empty ' +
+        '"hybrid_override_pattern" string nor a "layers_block_type" list.');
+    Result.Pattern := Pattern;
+    Result.NumLayers := Length(Pattern);
+    SetLength(Result.BlockTypes, Result.NumLayers);
+    for i := 1 to Length(Pattern) do
+    begin
+      ch := Pattern[i];
+      if ch = 'M' then Result.BlockTypes[i - 1] := nhMamba2
+      else if ch = '*' then Result.BlockTypes[i - 1] := nhAttention
+      else if ch = '-' then Result.BlockTypes[i - 1] := nhMLP
+      else if ch = 'E' then
+        ImportError('Nemotron-H import: block type ''E'' (MoE) is not wired ' +
+          'in v1 (the dense Nemotron-H base/4B/8B/47B use only M/*/-); ' +
+          'Nemotron-H-MoE is a separate follow-up.')
+      else
+        ImportError('Nemotron-H import: unknown block-type char "' + ch +
+          '" in pattern "' + Pattern + '" (expected M, *, -).');
+    end;
+
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if Result.NumKVHeads < 1 then
+      ImportError('Nemotron-H import: num_key_value_heads must be >= 1.');
+    if Result.NumHeads mod Result.NumKVHeads <> 0 then
+      ImportError('Nemotron-H import: num_attention_heads (' +
+        IntToStr(Result.NumHeads) + ') must be divisible by ' +
+        'num_key_value_heads (' + IntToStr(Result.NumKVHeads) + ').');
+    Field := Obj.Find('head_dim');
+    if (Field = nil) or Field.IsNull then
+      Result.HeadDim := Result.HiddenSize div Result.NumHeads
+    else
+      Result.HeadDim := RequiredInt('head_dim');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+
+    Result.StateSize := Obj.Get('ssm_state_size', 128);
+    if Result.StateSize < 1 then
+      ImportError('Nemotron-H import: ssm_state_size must be >= 1.');
+    Result.MambaNumHeads := RequiredInt('mamba_num_heads');
+    Result.MambaHeadDim := RequiredInt('mamba_head_dim');
+    Result.DInner := Result.MambaNumHeads * Result.MambaHeadDim;
+    Result.NGroups := Obj.Get('n_groups', 8);
+    if Result.NGroups < 1 then
+      ImportError('Nemotron-H import: n_groups must be >= 1.');
+    if Result.MambaNumHeads mod Result.NGroups <> 0 then
+      ImportError('Nemotron-H import: mamba_num_heads (' +
+        IntToStr(Result.MambaNumHeads) + ') must be divisible by n_groups (' +
+        IntToStr(Result.NGroups) + ').');
+    Result.ConvKernel := Obj.Get('conv_kernel', 4);
+    if Result.ConvKernel < 1 then
+      ImportError('Nemotron-H import: conv_kernel must be >= 1.');
+    Result.UseConvBias := Obj.Get('use_conv_bias', True);
+    Result.UseBias := Obj.Get('use_bias', False);
+    if Obj.Get('mamba_proj_bias', False) then
+      Result.UseBias := True;
+    if Obj.Get('attention_bias', False) then
+      ImportError('Nemotron-H import: attention_bias=true is not wired (the ' +
+        'published Nemotron-H checkpoints keep q/k/v/o bias-free).');
+    if Obj.Get('mlp_bias', False) then
+      ImportError('Nemotron-H import: mlp_bias=true is not wired (the ' +
+        'published Nemotron-H checkpoints keep the relu2 MLP bias-free).');
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    Result.Prefix := '';
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function NemotronHConfigToString(const Config: TNemotronHConfig): string;
+begin
+  Result := 'nemotron_h config: pattern="' + Config.Pattern + '"' +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', head_dim=' + IntToStr(Config.HeadDim) +
+    ', mlp_inter=' + IntToStr(Config.IntermediateSize) +
+    ', d_inner=' + IntToStr(Config.DInner) +
+    ', d_state=' + IntToStr(Config.StateSize) +
+    ', mamba_heads=' + IntToStr(Config.MambaNumHeads) +
+    ', mamba_head_dim=' + IntToStr(Config.MambaHeadDim) +
+    ', n_groups=' + IntToStr(Config.NGroups) +
+    ', conv_kernel=' + IntToStr(Config.ConvKernel) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', conv_bias=' + BoolToStr(Config.UseConvBias, true) +
+    ', bias=' + BoolToStr(Config.UseBias, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TNemotronHBlockLayers = record
+    Norm: TNNetLayer;
+    // mamba2 mixer
+    InProj, Conv, Scan, OutProj: TNNetLayer;
+    // attention
+    QProj, KProj, VProj, OProj: TNNetLayer;
+    // relu2 MLP
+    UpProj, DownProj: TNNetLayer;
+  end;
+
+function BuildNemotronHFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TNemotronHConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TNemotronHBlockLayers;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSrc, XBCConv, DtSplit, GateSplit: TNNetLayer;
+  QSlice, HeadPack: TNNetLayer;
+  KSlices, VSlices, HeadOutputs: array of TNNetLayer;
+  BlockCnt, SeqLen, i, j, d, ConvDim, ProjSize, ConvBiasSuppress: integer;
+  QWidth, KVWidth, GroupSize, HeadCnt, KVHeadCnt, KVGroup: integer;
+  Tmp: TNNetVolume;
+  MixPrefix, LayerP, AttP, TensorNameStr, InBias, OutBias: string;
+  Consumed: TStringList;
+  SliceChannels: array of integer;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  procedure LoadChannelVector(Layer: TNNetLayer; NeuronIdx: integer;
+    const TName: string; Channels: integer);
+  var dd: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('Nemotron-H import: missing tensor "' + TName + '".');
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Tmp.Size <> Channels then
+      ImportError('Nemotron-H import: "' + TName + '" must carry ' +
+        IntToStr(Channels) + ' elements, got ' + Reader.ShapeAsString(TName));
+    EnsureWritableImportWeights(Layer);
+    for dd := 0 to Channels - 1 do
+      Layer.Neurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
+    Layer.FlushWeightCache();
+    MarkConsumed(TName);
+  end;
+
+  procedure LoadDepthwiseConv(Layer: TNNetLayer; const WName, BName: string);
+  var dd, kk: integer;
+  begin
+    if not Reader.HasTensor(WName) then
+      ImportError('Nemotron-H import: missing tensor "' + WName + '".');
+    if (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> ConvDim) or
+       (Reader.DimSize(WName, 1) <> 1) or
+       (Reader.DimSize(WName, 2) <> Config.ConvKernel) then
+      ImportError('Nemotron-H import: "' + WName + '" must have shape [' +
+        IntToStr(ConvDim) + ', 1, ' + IntToStr(Config.ConvKernel) +
+        '], got ' + Reader.ShapeAsString(WName));
+    Reader.LoadTensorFlat(WName, Tmp);
+    EnsureWritableImportWeights(Layer);
+    for dd := 0 to ConvDim - 1 do
+      for kk := 0 to Config.ConvKernel - 1 do
+        Layer.Neurons[dd].Weights.FData[kk] :=
+          Tmp.FData[dd * Config.ConvKernel + kk];
+    MarkConsumed(WName);
+    if Config.UseConvBias then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('Nemotron-H import: use_conv_bias=true but "' + BName +
+          '" is missing.');
+      Reader.LoadTensorFlat(BName, Tmp);
+      if Tmp.Size <> ConvDim then
+        ImportError('Nemotron-H import: "' + BName + '" must carry ' +
+          IntToStr(ConvDim) + ' elements.');
+      for dd := 0 to ConvDim - 1 do
+        Layer.Neurons[dd].BiasWeight := Tmp.FData[dd];
+      MarkConsumed(BName);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if Config.NumLayers < 1 then
+        ImportError('Nemotron-H import: empty block schedule.');
+      if Reader.HasTensor('model.embeddings.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embeddings.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Nemotron-H import: neither "model.embeddings.weight" ' +
+          'nor "embeddings.weight" found - not a Nemotron-H checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embeddings.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Nemotron-H import: embeddings.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embeddings.weight'));
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('lm_head.weight')) then
+        ImportError('Nemotron-H import: tie_word_embeddings=false but ' +
+          '"lm_head.weight" is missing.');
+      if pSeqLen <= 0 then SeqLen := 1024 else SeqLen := pSeqLen;
+      if Config.UseConvBias then ConvBiasSuppress := 0
+      else ConvBiasSuppress := 1;
+      ConvDim := Config.DInner + 2 * Config.NGroups * Config.StateSize;
+      ProjSize := Config.DInner + ConvDim + Config.MambaNumHeads;
+      QWidth := Config.NumHeads * Config.HeadDim;
+      KVWidth := Config.NumKVHeads * Config.HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+
+      // ---------------- Architecture (single pre-norm residual / block) ----
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(KSlices, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, Config.HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // x := x + mixer(norm(x)).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].Norm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        NormedSrc := NN.GetLastLayer();
+        case Config.BlockTypes[BlockCnt] of
+          nhMamba2:
+          begin
+            // Identical to the standalone Mamba2 mixer: in_proj packs
+            // [gate | x|B|C | dt] (d_mlp=0), depthwise causal conv + SiLU on
+            // x|B|C, TNNetMamba2 SSD scan, out_proj.
+            Blocks[BlockCnt].InProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(ProjSize, 1), NormedSrc);
+            NN.AddLayerAfter(
+              TNNetSplitChannels.Create(Config.DInner, ConvDim),
+              Blocks[BlockCnt].InProj );
+            Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
+              Config.ConvKernel, {pCausal=}true, ConvBiasSuppress) );
+            XBCConv := NN.AddLayer( TNNetSiLU.Create() );
+            DtSplit := NN.AddLayerAfter( TNNetSplitChannels.Create(
+              Config.DInner + ConvDim, Config.MambaNumHeads),
+              Blocks[BlockCnt].InProj );
+            GateSplit := NN.AddLayerAfter( TNNetSplitChannels.Create(
+              0, Config.DInner), Blocks[BlockCnt].InProj );
+            NN.AddLayer( TNNetDeepConcat.Create([XBCConv, DtSplit, GateSplit]) );
+            Blocks[BlockCnt].Scan := NN.AddLayer( TNNetMamba2.Create(
+              Config.MambaNumHeads, Config.MambaHeadDim, Config.StateSize,
+              Config.NGroups, Config.LayerNormEps) );
+            Blocks[BlockCnt].OutProj := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+          end;
+          nhAttention:
+          begin
+            // Bias-free GQA, NoPE. Pack [Q_h|K_g|V_g] per query head -> SDPA.
+            Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(QWidth, 1), NormedSrc);
+            Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+            Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+            for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+            begin
+              for d := 0 to Config.HeadDim - 1 do
+                SliceChannels[d] := KVHeadCnt * Config.HeadDim + d;
+              KSlices[KVHeadCnt] := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(SliceChannels),
+                Blocks[BlockCnt].KProj);
+              VSlices[KVHeadCnt] := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(SliceChannels),
+                Blocks[BlockCnt].VProj);
+            end;
+            for HeadCnt := 0 to Config.NumHeads - 1 do
+            begin
+              KVGroup := HeadCnt div GroupSize;
+              for d := 0 to Config.HeadDim - 1 do
+                SliceChannels[d] := HeadCnt * Config.HeadDim + d;
+              QSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(SliceChannels),
+                Blocks[BlockCnt].QProj);
+              HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+                [QSlice, KSlices[KVGroup], VSlices[KVGroup]]) );
+              HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+                TNNetScaledDotProductAttention.Create(
+                  Config.HeadDim, {CausalMask=}true), HeadPack);
+            end;
+            NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+            Blocks[BlockCnt].OProj := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+          end;
+          nhMLP:
+          begin
+            // Non-gated relu2 MLP: down(ReLU(up(x))^2). ReLU then Square =
+            // ReLU(x)^2 (ACT2FN "relu2"); NO gate projection.
+            Blocks[BlockCnt].UpProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1),
+              NormedSrc);
+            NN.AddLayer( TNNetReLU.Create() );
+            NN.AddLayer( TNNetSquare.Create() );
+            Blocks[BlockCnt].DownProj := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+          end;
+        end;
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(Config.Prefix + 'embeddings.weight');
+      if Config.TieWordEmbeddings then
+      begin
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then
+          MarkConsumed('lm_head.weight');
+      end
+      else
+      begin
+        LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+          Config.HiddenSize, Config.VocabSize);
+        MarkConsumed('lm_head.weight');
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].Norm,
+          LayerP + 'norm.weight', Config.HiddenSize);
+        MarkConsumed(LayerP + 'norm.weight');
+        case Config.BlockTypes[BlockCnt] of
+          nhMamba2:
+          begin
+            MixPrefix := LayerP + 'mixer.';
+            if Config.UseBias then InBias := MixPrefix + 'in_proj.bias'
+            else InBias := '';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].InProj,
+              MixPrefix + 'in_proj.weight', Config.HiddenSize, ProjSize,
+              0, -1, 0, InBias);
+            MarkConsumed(MixPrefix + 'in_proj.weight');
+            if InBias <> '' then MarkConsumed(InBias);
+            LoadDepthwiseConv(Blocks[BlockCnt].Conv,
+              MixPrefix + 'conv1d.weight', MixPrefix + 'conv1d.bias');
+            LoadChannelVector(Blocks[BlockCnt].Scan, 0, MixPrefix + 'A_log',
+              Config.MambaNumHeads);
+            LoadChannelVector(Blocks[BlockCnt].Scan, 1, MixPrefix + 'D',
+              Config.MambaNumHeads);
+            LoadChannelVector(Blocks[BlockCnt].Scan, 2, MixPrefix + 'dt_bias',
+              Config.MambaNumHeads);
+            LoadChannelVector(Blocks[BlockCnt].Scan, 3, MixPrefix +
+              'norm.weight', Config.DInner);
+            if Config.UseBias then OutBias := MixPrefix + 'out_proj.bias'
+            else OutBias := '';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutProj,
+              MixPrefix + 'out_proj.weight', Config.DInner,
+              Config.HiddenSize, 0, -1, 0, OutBias);
+            MarkConsumed(MixPrefix + 'out_proj.weight');
+            if OutBias <> '' then MarkConsumed(OutBias);
+          end;
+          nhAttention:
+          begin
+            AttP := LayerP + 'mixer.';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+              AttP + 'q_proj.weight', Config.HiddenSize, QWidth);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+              AttP + 'k_proj.weight', Config.HiddenSize, KVWidth);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+              AttP + 'v_proj.weight', Config.HiddenSize, KVWidth);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+              AttP + 'o_proj.weight', QWidth, Config.HiddenSize);
+            MarkConsumed(AttP + 'q_proj.weight');
+            MarkConsumed(AttP + 'k_proj.weight');
+            MarkConsumed(AttP + 'v_proj.weight');
+            MarkConsumed(AttP + 'o_proj.weight');
+          end;
+          nhMLP:
+          begin
+            MixPrefix := LayerP + 'mixer.';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].UpProj,
+              MixPrefix + 'up_proj.weight', Config.HiddenSize,
+              Config.IntermediateSize);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].DownProj,
+              MixPrefix + 'down_proj.weight', Config.IntermediateSize,
+              Config.HiddenSize);
+            MarkConsumed(MixPrefix + 'up_proj.weight');
+            MarkConsumed(MixPrefix + 'down_proj.weight');
+          end;
+        end;
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadLlamaRMSNormWeights(Reader, FinalNorm,
+        Config.Prefix + 'norm_f.weight', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'norm_f.weight');
+
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Nemotron-H import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildNemotronHFromSafeTensorsEx(const FileName: string;
+  out Config: TNemotronHConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadNemotronHConfigFromJSONFile(ConfigPath);
+  Result := BuildNemotronHFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildNemotronHFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TNemotronHConfig;
+begin
+  Result := BuildNemotronHFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
 // ============================ BLOOM IMPORT =================================
 
 function ReadBloomConfigFromJSONFile(const FileName: string): TBloomConfig;
@@ -27948,6 +28575,7 @@ var
   IgnoredMamba2Config: TMamba2Config;
   IgnoredRecGemmaConfig: TRecurrentGemmaConfig;
   IgnoredJambaConfig: TJambaConfig;
+  IgnoredNemotronHConfig: TNemotronHConfig;
   IgnoredBloomConfig: TBloomConfig;
   IgnoredFalconConfig: TFalconConfig;
   IgnoredModernBertConfig: TModernBertConfig;
@@ -28200,6 +28828,16 @@ begin
     // contract like the other decoder families. See the JAMBA IMPORT section.
     Result := BuildJambaFromSafeTensorsEx(WeightsPath, IgnoredJambaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'nemotron_h' then
+    // The second HYBRID route: Nemotron-H (architectures
+    // ["NemotronHForCausalLM"]) - the multi-head TNNetMamba2 SSD mixer, full
+    // softmax-attention, and a non-gated relu2 MLP interleaved on an explicit
+    // per-layer override-pattern schedule. NoPE, RMSNorm, GQA. Causal-LM
+    // contract like the other decoder families. See the NEMOTRON-H IMPORT
+    // section.
+    Result := BuildNemotronHFromSafeTensorsEx(WeightsPath,
+      IgnoredNemotronHConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
   else if ModelType = 'bloom' then
     // The ALiBi route: BLOOM (architectures ["BloomForCausalLM"]), no
     // positional embeddings - per-head fixed linear attention biases
