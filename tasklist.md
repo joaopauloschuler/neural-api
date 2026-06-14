@@ -277,6 +277,75 @@ rather than acted on.
       pooling over the variable grid and a padding/attention mask — needs a
       variable-SeqLen vision input, an interpolated/resampled position table,
       and key-padding-masked MAP pooling. Not yet wired.
+
+### Computer vision & generative models
+
+- [ ] Standard vision-model image preprocessing helper in neuraldatasets.pas —
+      the timm/torchvision/CLIP inference transform that EVERY vision importer
+      below needs and that is currently missing (LoadImageFromFileIntoVolume
+      only does a plain stretch-resize to SizeX,SizeY). Add a helper that does
+      aspect-ratio-preserving resize-shorter-side-to-N then center-crop-to-NxN,
+      followed by per-channel (x/255 - mean)/std normalization with configurable
+      mean/std (ImageNet defaults 0.485/0.456/0.406, 0.229/0.224/0.225; CLIP
+      0.48145.../0.26862...). Read the three scalars straight from a HF
+      preprocessor_config.json (image_mean/image_std/size/crop_size) so it
+      drops into the importers. This is exactly LLaVA Step "(b) image
+      preprocessing" pulled out as a reusable foundation; the CLIP importer's
+      ad-hoc PadXY+Crop folding is NOT this (it bakes a fixed square resize into
+      pos row 0). Deliverable: one tested helper + a parity check vs
+      torchvision/PIL on a committed tiny image.
+- [ ] First trained-CNN classifier importer from torchvision/timm — every
+      importer in the repo today is a transformer/LLM (or CLIP/SigLIP ViT); the
+      ResNet example BUILDS from scratch, it does not IMPORT weights. Add
+      BuildResNetFromSafeTensors (torchvision resnet18/50 state_dict: conv-bn
+      fold into the existing conv+bias, the 1-2-3-4 layer/bottleneck blocks map
+      onto TNNetConvolution + identity/projection shortcuts already used by the
+      ResNet example, global avg pool -> fc) producing ImageNet-1k logits.
+      Verify top-1 prediction + logits vs torchvision float64 on a tiny pico
+      fixture (make_pico_*_fixture.py recipe) and on one real image through the
+      new preprocessing helper. ConvNeXt (LayerScale + GRN + depthwise 7x7,
+      TNNetGRN already exists) is the modern-CNN stretch goal on the same path.
+- [ ] Standalone ViT image-classification importer
+      (google/vit-base-patch16-224 / timm vit) — BuildViTForImageClassification
+      reusing the BuildClipVisionTower ViT path (patch-embed conv + learned pos
+      table + pre-norm encoder) plus the missing pieces: a prepended CLS token,
+      the classifier head reading the CLS row after final LayerNorm, and the
+      vit-specific key names (embeddings.cls_token / patch_embeddings.projection
+      / layernorm / classifier). First image-in/class-out importer with a real
+      label head; reuses the new preprocessing helper. Pico parity vs HF
+      float64 + a real-image top-1 sanity check (e.g. a known ImageNet photo).
+- [ ] DINOv2 self-supervised ViT importer (facebook/dinov2-small) for visual
+      embeddings — distinct from CLIP/SigLIP (no text tower, no contrastive
+      head; LayerScale on every block, SwiGLU-or-MLP FFN per config, optional
+      register tokens, and the CLS+patch tokens are the OUTPUT). Produces
+      general-purpose dense/global visual features that downstream code can pool
+      for retrieval/kNN. Reuses the ViT encoder path + LayerScale (TNNetChannelMul
+      / the ReZero-style scale already in the repo) and the preprocessing helper.
+      Pico parity vs HF float64; demo: nearest-neighbour image retrieval over a
+      handful of committed thumbnails.
+- [ ] DDPM diffusion image-generation example (examples/DiffusionMNIST) — the
+      first GENERATIVE-by-diffusion example; TNNetSinusoidalTimeEmbedding already
+      exists in neuralnetwork.pas specifically for this (Ho et al. 2020) but no
+      example uses it. Train a small U-Net (downsample conv blocks + GroupNorm +
+      the time-embedding injected as a per-channel bias via FiLM/TNNetChannelMul,
+      TNNetUpsample/TNNetDeconvolution for the decoder, skip concats with the
+      existing concat layer) on MNIST with the standard linear beta schedule and
+      epsilon-prediction MSE objective, then ancestral-sample 28x28 digits on CPU
+      and save a grid PNG. All layers exist; the new content is the noising
+      schedule + sampling loop + the U-Net builder. Opens the door to a CIFAR /
+      latent-diffusion follow-up.
+- [ ] Stable Diffusion VAE decoder importer (diffusers AutoencoderKL decoder,
+      e.g. stabilityai/sd-vae-ft-mse) — a modular, independently-testable
+      generative piece short of a full diffusion UNet: import the decoder
+      (post_quant_conv -> mid block with a single self-attention over HxW ->
+      up blocks of ResNet groups + nearest TNNetUpsample -> conv_out) that maps
+      a 4-channel latent to an RGB image, scaling the latent by 1/0.18215.
+      Needs GroupNorm (have it), SiLU (have it), and spatial self-attention
+      reshaped to (H*W, 1, C) — exactly the per-token SDPA pattern already used
+      for sequences. Deliverable: BuildVaeDecoderFromSafeTensors + a demo that
+      decodes a committed tiny latent and parity-checks the RGB output vs
+      diffusers float64. Reusable later as the decoder stage of a latent
+      diffusion / SD import.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
