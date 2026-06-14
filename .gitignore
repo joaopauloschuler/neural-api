@@ -22,12 +22,18 @@ examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix
 examples/SpanCorruptionPretrain/SpanCorruptionPretrain
+examples/VQVAE/VQVAE
+examples/VQVAE/diag
 link*.res
 autosave.csv
 autosave.nn
 
 # Generated diagram images (e.g. reliability diagrams from example runs)
 *.pgm
+
+# MNIST idx data (symlinks/downloads) + generated images in the VQVAE example
+examples/VQVAE/*-ubyte
+examples/VQVAE/*.png
 
 # Claude Code (created at repo root)
 .claude/

@@ -692,6 +692,7 @@ type
     procedure TestCenterLossCenterGradient;
     procedure TestCenterLossLoadFromString;
     procedure TestVectorQuantizerForward;
+    procedure TestVectorQuantizerChosenCodeIndex;
     procedure TestVectorQuantizerLoadFromString;
     procedure TestVectorQuantizerCommitmentGradient;
     procedure TestVectorQuantizerCodebookGradient;
@@ -43645,6 +43646,61 @@ begin
             LVQ.Neurons[ExpectedCode].Weights.Raw[j],
             NN.GetLastLayer.Output[x, y, j], 1e-6);
       end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestVectorQuantizerChosenCodeIndex;
+const
+  cK     = 3;
+  cD     = 2;
+  cSizeX = 2;
+  cSizeY = 2;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LVQ: TNNetVectorQuantizer;
+  x, y, ExpectedCode: integer;
+begin
+  // ChosenCodeIndex(X,Y) must read back the discrete argmin token chosen at
+  // each spatial position on the last Compute() (the VQ-VAE token grid), and
+  // return 0 for out-of-range coordinates. Same hand-set codebook as the
+  // forward test so the expected codes are known.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSizeX, cSizeY, cD);
+  try
+    NN.AddLayer(TNNetInput.Create(cSizeX, cSizeY, cD, 1));
+    LVQ := TNNetVectorQuantizer.Create(cK, 0.25);
+    NN.AddLayer(LVQ);
+
+    LVQ.Neurons[0].Weights.Raw[0] :=  0.0; LVQ.Neurons[0].Weights.Raw[1] :=  0.0;
+    LVQ.Neurons[1].Weights.Raw[0] :=  5.0; LVQ.Neurons[1].Weights.Raw[1] :=  5.0;
+    LVQ.Neurons[2].Weights.Raw[0] := -5.0; LVQ.Neurons[2].Weights.Raw[1] := -5.0;
+
+    Input[0, 0, 0] :=  0.1; Input[0, 0, 1] := -0.2; // -> code 0
+    Input[1, 0, 0] :=  4.7; Input[1, 0, 1] :=  5.3; // -> code 1
+    Input[0, 1, 0] := -4.4; Input[0, 1, 1] := -5.1; // -> code 2
+    Input[1, 1, 0] :=  0.3; Input[1, 1, 1] :=  0.4; // -> code 0
+
+    NN.Compute(Input);
+
+    for x := 0 to cSizeX - 1 do
+      for y := 0 to cSizeY - 1 do
+      begin
+        if (x = 1) and (y = 0) then ExpectedCode := 1
+        else if (x = 0) and (y = 1) then ExpectedCode := 2
+        else ExpectedCode := 0;
+        AssertEquals('ChosenCodeIndex at (' + IntToStr(x) + ',' + IntToStr(y) + ')',
+          ExpectedCode, LVQ.ChosenCodeIndex(x, y));
+      end;
+
+    // Out-of-range coordinates return 0 (safe sentinel), not a crash.
+    AssertEquals('ChosenCodeIndex out-of-range X', 0, LVQ.ChosenCodeIndex(cSizeX, 0));
+    AssertEquals('ChosenCodeIndex out-of-range Y', 0, LVQ.ChosenCodeIndex(0, cSizeY));
+    AssertEquals('ChosenCodeIndex negative', 0, LVQ.ChosenCodeIndex(-1, -1));
   finally
     NN.Free;
     Input.Free;

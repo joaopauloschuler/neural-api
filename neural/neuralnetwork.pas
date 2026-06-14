@@ -2222,6 +2222,11 @@ type
     procedure ResetCodebookUsage(); // zero every per-code selection counter
     function ActiveCodeCount(): integer; // # distinct codes selected >= once
     function CodebookUsageCount(Index: integer): integer; // wins for one code
+    // Discrete code index chosen at spatial position (X,Y) on the LAST Compute()
+    // call (the argmin cached in FChosenIdx). This is what turns the continuous
+    // encoder output into the DISCRETE token grid a VQ-VAE autoregressive prior
+    // is fitted over. Returns 0 if (X,Y) is out of range or before any Compute().
+    function ChosenCodeIndex(X, Y: integer): integer;
   end;
 
   /// ArcFace additive angular-margin softmax output layer (Deng et al. 2019,
@@ -20609,6 +20614,18 @@ begin
     Result := FUsageCount[Index]
   else
     Result := 0;
+end;
+
+function TNNetVectorQuantizer.ChosenCodeIndex(X, Y: integer): integer;
+var
+  PosIdx: integer;
+begin
+  Result := 0;
+  if (X < 0) or (X > FOutput.SizeX - 1) or (Y < 0) or (Y > FOutput.SizeY - 1) then
+    Exit;
+  PosIdx := X * FOutput.SizeY + Y;
+  if (PosIdx >= 0) and (PosIdx < Length(FChosenIdx)) then
+    Result := FChosenIdx[PosIdx];
 end;
 
 { TNNetArcFace }
