@@ -108,30 +108,11 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] MiniCPM importer (`BuildMiniCPMFromSafeTensors[Ex]`, model_type
-      `minicpm`; openbmb/MiniCPM-1.2B/2B-sft/dpo) — a genuinely CPU-runnable
-      (1.2B/2B) Llama-backbone family (RMSNorm + RoPE + SwiGLU, tied
-      embeddings) whose distinguishing piece is OpenBMB's μP-style
-      depth/width rescaling, which is NOT the same mechanism as the already-
-      landed Granite multipliers and must be wired, not reused verbatim:
-        - `scale_emb` multiplies the token embeddings (one constant fold on
-          the embedding matrix — overlaps Granite's embedding multiplier);
-        - `scale_depth / sqrt(num_hidden_layers)` rescales EVERY residual
-          branch (each attention and each MLP sublayer output) — this is a
-          PER-SUBLAYER residual scale (2*num_layers folds), distinct from
-          Granite's single constant residual multiplier; fold it into the
-          out-projection (`o_proj` and `down_proj`) of each block so no new
-          layer is needed;
-        - logits divide by `hidden_size / dim_model_base` (a DIVIDING LM-head
-          scale, foldable through the existing QScale/W_q slot like Granite's
-          logits_scaling).
-      Reuse the core Llama builder + the standard SentencePiece `.model`
-      tokenizer; the only new code is the config record + the four fold
-      points. Verify with a HAND-BUILT pico fixture (tools/minicpm_tiny_
-      fixture.py, MiniCPM IS in transformers so reference can be a live
-      float64 forward) asserting next-token logits < 1e-4:
-      TestMiniCPM{Config,Logit}Parity. Note: MiniCPM4 / MiniCPM-MoE are
-      separate follow-ups (do not scope here).
+- [ ] MiniCPM importer follow-ups (`BuildMiniCPMFromSafeTensors[Ex]` LANDED,
+      model_type `minicpm`; OpenBMB μP-style scale_emb / per-sublayer
+      scale_depth / dim_model_base logits folds on the core Llama path +
+      SentencePiece `.model` tokenizer; pico parity TestMiniCPM{Config,Logit}Parity
+      < 1e-4 vs float64 HF):
   - [ ] MiniCPM real-checkpoint slicer follow-up (slice_llama.py reuse) to
         parity-check a sliced openbmb/MiniCPM-1.2B/2B against the random pico
         fixture (network/RAM-gated; the landed parity is the hand-built pico
@@ -224,20 +205,12 @@ rather than acted on.
       is forward-only — add backward through the dt/B/C RMSNorms for fine-tuning;
       (c) no Jamba-specific tokenizer demo (raw ids work); (d) no real-checkpoint
       slicer fixture (parity uses a random pico model).
-- [X] Nemotron-H-MoE ('E' block type) follow-up to the landed
-      BuildNemotronHFromSafeTensors — the 'E' (MoE) block is now wired as a
-      DeepSeek-V3-style sparse FFN with NON-GATED relu2 experts: sigmoid router
-      -> top-k selection on (sigmoid + e_score_correction_bias) -> raw-sigmoid
-      combine weights renormalized iff norm_topk_prob then scaled by
-      routed_scaling_factor, plus an always-on shared expert. Config keys
-      n_routed_experts/num_experts_per_tok/moe_intermediate_size/
-      norm_topk_prob/routed_scaling_factor/n_shared_experts wired; reuses the
-      landed TNNetBiasBalancedTopKGate/TNNetTopKGate + TNNetSigmoid +
-      TNNetMulByConstant (NO new layer). Grouped routing (n_group>1) and
-      moe_latent_size rejected with a clear message. Verified by
-      TestNemotronHMoELogitParity (schedule "M*E-", all four block types) vs a
-      float64 HF oracle < 1e-4 (tools/make_pico_nemotronh_moe_fixture.py;
-      each MoE knob asserted non-vacuous).
+- [ ] Nemotron-H-MoE importer follow-ups ('E' MoE block LANDED on the landed
+      BuildNemotronHFromSafeTensors: DeepSeek-V3-style sparse non-gated relu2
+      experts + always-on shared expert via the landed
+      TNNetBiasBalancedTopKGate/TNNetTopKGate + TNNetSigmoid + TNNetMulByConstant
+      (NO new layer); TestNemotronHMoELogitParity, schedule "M*E-", < 1e-4 vs a
+      float64 HF oracle):
   - [ ] Nemotron-H-MoE grouped-routing follow-up: the importer REJECTS
         n_group>1 and moe_latent_size with a clear message. Wire the
         group-limited / latent-MoE routing path if a real Nemotron-H-MoE
@@ -454,23 +427,12 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [X] Encoder-decoder safetensors exporter follow-ups (the GPT-2 / Llama /
-      Qwen3 / BERT / GPT-NeoX / BLOOM / Mamba / RWKV / T5 / Marian HF-names
-      exporters all LANDED as exact inverses of their importers, round-trips
-      bit-exact): Pegasus / mBART exporters (Pegasus = pre-norm + sinusoidal
-      final-norm twist; mBART = pre-norm + extra final LayerNorms + learned
-      +2-offset positions) and BART SaveBartToSafeTensors, which ride the SAME
-      Marian post-norm skeleton. DONE — SaveBartToSafeTensors /
-      SavePegasusToSafeTensors / SaveMBartToSafeTensors (neuralpretrained.pas)
-      share one worker SaveBartFamilyToSafeTensors parameterized by HasEmbLN /
-      HasFinalLN / PosOffset; its inner DumpStack reuses the Marian per-block
-      biased-linear/norm name layout (skipping the layernorm_embedding +
-      final layer_norm), re-emits the +2-offset learned position table
-      ([MaxPos+2, DModel], padding/upper rows zeroed) for BART/mBART, and
-      omits Pegasus's regenerated sinusoids. Round-trips bit-exact (max |diff|
-      ~0): TestBartSafeTensorsRoundTrip / TestPegasusSafeTensorsRoundTrip /
-      TestMBartSafeTensorsRoundTrip in TestNeuralPretrained.pas (import pico
-      fixture -> Save* -> re-import -> RunT5 logits identical &lt; 1e-5).
+- [ ] Encoder-decoder safetensors exporter follow-ups (GPT-2 / Llama / Qwen3 /
+      BERT / GPT-NeoX / BLOOM / Mamba / RWKV / T5 / Marian / BART / mBART /
+      Pegasus HF-names exporters all LANDED as exact bit-for-bit inverses of
+      their importers; SaveBart/Pegasus/MBartToSafeTensors share one
+      SaveBartFamilyToSafeTensors worker, round-trip tests in
+      TestNeuralPretrained.pas):
   - [ ] M2M100/NLLB safetensors exporter (SaveM2M100ToSafeTensors) — the last
         open encoder-decoder exporter; ride the same SaveBartFamilyToSafeTensors
         worker (M2M100 = pre-norm + sinusoidal positions + the M2M100 tensor
