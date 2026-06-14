@@ -151,6 +151,32 @@ rather than acted on.
       logit, < 1e-4 vs float64 OlmoeForCausalLM, BuildFromPretrained dispatch).
       Open follow-up: real allenai/OLMoE-1B-0924 slicer parity (the pico
       fixture is random-init only).
+- [ ] BitNet b1.58 importer (`BuildBitNetFromSafeTensors[Ex]`, model_type
+      "bitnet" / the released `microsoft/bitnet-b1.58-2B-4T`) — the ternary-
+      weight LLM family, the one importer that maps a real released checkpoint
+      onto the ALREADY-LANDED `TNNetBitLinear` layer (BitNet b1.58 absmean
+      ternarization + opt-in int8 activation quantization, see
+      neural/neuralnetwork.pas; demonstrated in examples/BitLinearBakeoff). The
+      architecture is the Llama backbone (RMSNorm, RoPE, SwiGLU) with the
+      attention/FFN nn.Linear projections replaced by BitLinear and an EXTRA
+      SubLN/RMSNorm before the o_proj and down_proj (the BitNet
+      "norm-before-quantized-linear" placement) — so most of this rides the
+      existing BuildLlamaFromSafeTensors path with two genuinely new pieces:
+      (a) routing q/k/v/o + gate/up/down through TNNetBitLinear instead of the
+      plain dense layers, folding the per-tensor weight scale, and (b) the
+      packed-ternary weight de-quant-at-load — HF ships either FP32/BF16
+      shadow weights (trivial: ternarize at load with the layer's absmean rule
+      and assert the round-trip matches) OR the native I2_S packed format (4
+      ternary values per byte + a separate weight_scale tensor), which needs a
+      2-bit unpack analogous to the landed GGUF Q8_0 / MXFP4 dequant-at-load
+      readers. Wire the SubLN placement via the existing pre-norm builder slots
+      (no new layer class). Deliverables: pico parity fixture via the
+      make_pico_*_fixture.py recipe (re-randomized ternary weights + scales
+      asserted to move the HF logits) + TestBitNet{Config,Logit}Parity < 1e-4
+      vs float64 HF transformers, plus a real-checkpoint slicer (slice_llama.py
+      reuse) to parity-check a sliced microsoft/bitnet-b1.58-2B-4T against the
+      pico fixture. Headline: a 2B model that resides in well under 1GB,
+      dovetailing with the int8/GGUF "run big models on commodity RAM" theme.
 - [ ] M2M100/NLLB translate demo + real-vocab check (follow-up to the landed
       BuildM2M100FromSafeTensors, commit cb21550): an examples/NLLBTranslate
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and
