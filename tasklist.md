@@ -213,6 +213,31 @@ rather than acted on.
       mixed image+text prompt vs HF float64, and an examples/LlavaDescribe
       demo that captions a small image on CPU. First image-in/text-out
       model in the repo; opens the door to Qwen-VL/PaliGemma later.
+  Suggested incremental breakdown (each step independently buildable + committable):
+  - [ ] Step 1 — select-hidden-layer / skip-pooling mode on BuildClipVisionTower
+        so it returns the penultimate-layer PATCH tokens WITHOUT the CLS row and
+        WITHOUT the projection head (LLaVA's vision feature). Test: assert the
+        returned tensor shape == (num_patches, hidden) and that it matches the
+        HF vision_tower hidden_states[-2][:,1:] on the existing CLIP pico fixture.
+  - [ ] Step 2 — image preprocessing helper: load preprocessor_config.json,
+        resize/center-crop to the processor size, normalize by image_mean/std
+        into a TNNetVolume. Test: byte-parity of the normalized RGB tensor vs the
+        HF CLIPImageProcessor on a tiny pinned image. (Also unblocks the
+        ClipZeroShot real-image follow-up.)
+  - [ ] Step 3 — projector import + prompt-assembly helper: load the 2-layer MLP
+        (gelu) projector, run the vision tower once, and concatenate
+        [text-embeds | projected image tokens | text-embeds] as a TNNetInput-fed
+        embedding sequence at the <image> placeholder (precedent:
+        T5EncoderStatesInput). Test: projected visual tokens match HF float64 < 1e-4.
+  - [ ] Step 4 — BuildLlavaFromSafeTensors[Ex] (two nets + projector, multi-shard
+        index.json) on a small checkpoint (llava-interleave-qwen-0.5b-hf or a
+        SmolVLM-class config); language side is the stock Llama/Qwen2 path. Pico
+        parity fixture asserting next-token logits for a mixed image+text prompt
+        vs HF float64 < 1e-4.
+  - [ ] Step 5 — multimodal chat template ("USER: <image>\\n...ASSISTANT:" /
+        ChatML-with-image) in neuralchat.pas + examples/LlavaDescribe demo that
+        captions a small image on CPU (ulimit-bounded). Edit examples/README.md
+        (NOT the main README) for the new example.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
