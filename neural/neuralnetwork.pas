@@ -13147,6 +13147,31 @@ type
         Sample: TNNetVolume;
         Iterations: integer = 50
       ): string;
+      // ProfileReport is a torch.profiler-lite: a single per-layer table that
+      // fuses LayerTimingReport's wall-clock timing with
+      // MemoryFootprintReport's parameter/activation accounting. It runs
+      // Iterations forward passes of Sample (and, when Target<>nil, the same
+      // number of full Backpropagate(Target) passes) through NN, reusing the
+      // framework's per-layer FForwardTime / FBackwardTime accumulators
+      // (zeroed first via NN.ClearTime, a TDateTime span in days converted to
+      // microseconds). Per layer it reports: index, class name, output shape,
+      // mean us/forward, mean us/backward (blank "-" when no Target is given),
+      // parameter element count + bytes (sum of every neuron's Weights.Size
+      // plus one bias/neuron for layers that own their weights, matching
+      // MemoryFootprintReport), and activation element count + bytes
+      // (Output.Size * SizeOf(TNeuralFloat), single-sample batch=1). A TOTAL
+      // row sums the timing, parameter and activation columns. Wall-clock
+      // numbers are inherently machine/run dependent; the param/activation
+      // byte counts are exact and deterministic. Pure diagnostic that leaves
+      // no training state behind (gradients computed during the optional
+      // backward pass are not applied). Returns a short message (never
+      // crashes) when NN is nil, has no layers, or Sample is nil.
+      class function ProfileReport(
+        NN: TNNet;
+        Sample: TNNetVolume;
+        Target: TNNetVolume = nil;
+        Iterations: integer = 20
+      ): string;
       // Diagonal (empirical) Fisher-information importance diagnostic. Given a
       // trained classifier NN and a labelled probe batch Samples (input volume
       // + one-hot target pairs), estimates the diagonal Fisher information of
@@ -70731,6 +70756,140 @@ begin
     Lines.Add(StringOfChar('-', 70));
     Lines.Add(Format('TOTAL: %.2f us/forward across %d layer(s)',
       [TotalUs / Iterations, NN.GetLastLayerIdx() + 1]));
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+class function TNNet.ProfileReport(
+  NN: TNNet;
+  Sample: TNNetVolume;
+  Target: TNNetVolume = nil;
+  Iterations: integer = 20
+): string;
+var
+  Lines: TStringList;
+  LayerCnt, NeuronIdx, IterCnt: integer;
+  Layer: TNNetLayer;
+  FwdUs, BwdUs, BwdStr: string;
+  MeanFwdUs, MeanBwdUs: double;
+  ParamElements, ActElements: Int64;
+  TotalParamElements, TotalActElements: Int64;
+  TotalFwdUs, TotalBwdUs: double;
+  DoBackward: boolean;
+  BytesPerElem: integer;
+  ShapeStr, PassStr: string;
+const
+  // FForwardTime / FBackwardTime are TDateTime spans measured in days; this
+  // converts to microseconds.
+  cUsPerDay = 24.0 * 60.0 * 60.0 * 1000.0 * 1000.0;
+begin
+  Result := '';
+  if NN = nil then
+  begin
+    Result := 'ProfileReport: NN is nil.' + sLineBreak;
+    Exit;
+  end;
+  if NN.GetLastLayerIdx() < 0 then
+  begin
+    Result := 'ProfileReport: NN has no layers.' + sLineBreak;
+    Exit;
+  end;
+  if Sample = nil then
+  begin
+    Result := 'ProfileReport: Sample is nil.' + sLineBreak;
+    Exit;
+  end;
+  if Iterations < 1 then Iterations := 1;
+  DoBackward := (Target <> nil);
+
+  BytesPerElem := SizeOf(TNeuralFloat);
+
+  // Zero the per-layer FForwardTime / FBackwardTime accumulators, then run
+  // Iterations full forward (and optional backward) passes so each layer
+  // sums its own Compute / Backpropagate cost.
+  NN.ClearTime();
+  for IterCnt := 1 to Iterations do
+  begin
+    NN.Compute(Sample);
+    if DoBackward then NN.Backpropagate(Target);
+  end;
+
+  TotalParamElements := 0;
+  TotalActElements := 0;
+  TotalFwdUs := 0;
+  TotalBwdUs := 0;
+
+  Lines := TStringList.Create;
+  try
+    Lines.Add('Profile Report (torch.profiler-lite)');
+    Lines.Add(StringOfChar('=', 36));
+    if DoBackward then
+      PassStr := ' + backward'
+    else
+      PassStr := ' (no backward: Target=nil)';
+    Lines.Add(Format(
+      'Passes: %d forward%s, single-sample (batch=1), %d bytes/elem',
+      [Iterations, PassStr, BytesPerElem]));
+    Lines.Add(Format('%-4s %-22s %-14s %10s %10s %10s %12s %10s %12s',
+      ['Idx', 'Layer', 'Output', 'us/fwd', 'us/bwd',
+       'Params', 'ParamBytes', 'ActElem', 'ActBytes']));
+    Lines.Add(StringOfChar('-', 116));
+    for LayerCnt := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LayerCnt];
+
+      // Activation tensor size in elements (single sample, batch=1).
+      if Layer.Output <> nil then
+        ActElements := Int64(Layer.Output.SizeX) * Layer.Output.SizeY *
+          Layer.Output.Depth
+      else
+        ActElements := 0;
+
+      // Parameter tensor size in elements: weights + biases. Per neuron one
+      // bias (FBiasWeight) is allocated even if unused; count it only for
+      // layers that own their weights so parameter-free / weight-linked
+      // layers stay at 0 (matches MemoryFootprintReport).
+      ParamElements := 0;
+      if Layer.Neurons.Count > 0 then
+      begin
+        for NeuronIdx := 0 to Layer.Neurons.Count - 1 do
+          ParamElements := ParamElements +
+            Layer.Neurons[NeuronIdx].Weights.Size;
+        if (ParamElements > 0) and (not Layer.LinkedNeurons) then
+          ParamElements := ParamElements + Layer.Neurons.Count;
+      end;
+
+      MeanFwdUs := (Layer.ForwardTime * cUsPerDay) / Iterations;
+      MeanBwdUs := (Layer.BackwardTime * cUsPerDay) / Iterations;
+
+      TotalParamElements := TotalParamElements + ParamElements;
+      TotalActElements := TotalActElements + ActElements;
+      TotalFwdUs := TotalFwdUs + Layer.ForwardTime * cUsPerDay;
+      TotalBwdUs := TotalBwdUs + Layer.BackwardTime * cUsPerDay;
+
+      ShapeStr := Format('%dx%dx%d',
+        [Layer.Output.SizeX, Layer.Output.SizeY, Layer.Output.Depth]);
+      FwdUs := Format('%10.2f', [MeanFwdUs]);
+      if DoBackward then
+        BwdStr := Format('%10.2f', [MeanBwdUs])
+      else
+        BwdStr := Format('%10s', ['-']);
+      Lines.Add(Format('%-4d %-22s %-14s %s %s %10d %12d %10d %12d',
+        [LayerCnt, Layer.ClassName, ShapeStr, FwdUs, BwdStr,
+         ParamElements, ParamElements * BytesPerElem,
+         ActElements, ActElements * BytesPerElem]));
+    end;
+    Lines.Add(StringOfChar('-', 116));
+    if DoBackward then
+      BwdStr := Format('%10.2f', [TotalBwdUs / Iterations])
+    else
+      BwdStr := Format('%10s', ['-']);
+    Lines.Add(Format('%-4s %-22s %-14s %10.2f %s %10d %12d %10d %12d',
+      ['TOT', '', '', TotalFwdUs / Iterations, BwdStr,
+       TotalParamElements, TotalParamElements * BytesPerElem,
+       TotalActElements, TotalActElements * BytesPerElem]));
     Result := Lines.Text;
   finally
     Lines.Free;

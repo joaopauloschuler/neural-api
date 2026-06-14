@@ -129,6 +129,7 @@ type
     procedure TestPredictionDepthReportSmoke;
     procedure TestToGraphvizDotSmoke;
     procedure TestLayerTimingReportSmoke;
+    procedure TestProfileReportStructureAndCounts;
     procedure TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
     procedure TestMixtureOfDepthsShapeDegenerateAndRoundTrip;
     procedure TestDropBlockSmokeAndRoundTrip;
@@ -6060,6 +6061,69 @@ begin
   NN.Free;
   // nil NN must not crash
   S := TNNet.LayerTimingReport(nil, nil, 3);
+  AssertTrue('nil NN handled', Length(S) > 0);
+end;
+
+procedure TTestNeuralLayersExtra.TestProfileReportStructureAndCounts;
+var
+  NN: TNNet;
+  Sample, Target: TNNetVolume;
+  S: string;
+  Lines: TStringList;
+  i, RowCnt, BytesPerElem: integer;
+  ExpectedFCParamBytes, ExpectedFCActBytes: integer;
+begin
+  BytesPerElem := SizeOf(TNeuralFloat);
+  NN := TNNet.Create;
+  NN.AddLayer(TNNetInput.Create(4));
+  // FullConnectReLU(5) over 4 inputs: 5*4 weights + 5 biases = 25 params.
+  NN.AddLayer(TNNetFullConnectReLU.Create(5));
+  Sample := TNNetVolume.Create(4, 1, 1);
+  Sample.FillForDebug();
+  Target := TNNetVolume.Create(5, 1, 1);
+  Target.FillForDebug();
+
+  // Forward + backward profile.
+  S := TNNet.ProfileReport(NN, Sample, Target, 3);
+  AssertTrue('Report is not empty', Length(S) > 0);
+  AssertTrue('Report has header', Pos('Profile Report', S) > 0);
+  AssertTrue('Report has TOTAL row', Pos('TOT', S) > 0);
+
+  // One data row per layer (2 layers): count rows that start with a digit
+  // followed by whitespace in the table body.
+  Lines := TStringList.Create;
+  try
+    Lines.Text := S;
+    RowCnt := 0;
+    for i := 0 to Lines.Count - 1 do
+      if (Length(Lines[i]) > 1) and (Lines[i][1] in ['0'..'9']) and
+         (Lines[i][2] = ' ') then
+        Inc(RowCnt);
+    AssertEquals('One data row per layer', 2, RowCnt);
+  finally
+    Lines.Free;
+  end;
+
+  // FullConnect(5)/4-in: 25 param elements, 5 activation elements.
+  ExpectedFCParamBytes := 25 * BytesPerElem;
+  ExpectedFCActBytes := 5 * BytesPerElem;
+  AssertTrue('FC param bytes present',
+    Pos(IntToStr(ExpectedFCParamBytes), S) > 0);
+  AssertTrue('FC activation bytes present',
+    Pos(IntToStr(ExpectedFCActBytes), S) > 0);
+  // TOTAL param count (25) and total param bytes are surfaced.
+  AssertTrue('Total param count present', Pos(' 25 ', ' ' + S) > 0);
+
+  // Forward-only profile (Target=nil) must still work and mark "no backward".
+  S := TNNet.ProfileReport(NN, Sample, nil, 3);
+  AssertTrue('Forward-only report not empty', Length(S) > 0);
+  AssertTrue('Forward-only marks no backward', Pos('no backward', S) > 0);
+
+  Sample.Free;
+  Target.Free;
+  NN.Free;
+  // nil NN must not crash.
+  S := TNNet.ProfileReport(nil, nil);
   AssertTrue('nil NN handled', Length(S) > 0);
 end;
 
