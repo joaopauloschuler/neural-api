@@ -49,7 +49,9 @@ unit neuralgguf;
 //                           layout (per head: new[2p] = old[p],
 //                           new[2p+1] = old[p + head_dim/2]). Registering
 //                           a tensor makes LoadTensorFlat serve the rows
-//                           de-interleaved, i.e. back in HF order.
+//                           de-interleaved, i.e. back in HF order. A 1-D
+//                           target (a per-row q/k bias, the Qwen2 case) is
+//                           permuted the same way (RowLen=1).
 //
 // This unit is coded by Claude (AI).
 {$mode objfpc}{$H+}
@@ -1015,9 +1017,13 @@ begin
     raise EGGUFError.CreateFmt(
       'gguf: de-interleave head_dim %d for "%s" must be an even number ' +
       '>= 2: %s', [HeadDim, pName, FFileName]);
-  if Length(FTensors[Idx].Shape) <> 2 then
+  // 2-D for a projection matrix [Rows, Cols]; 1-D for a per-row bias [Rows]
+  // (the Qwen2 q/k biases) - both permute per HEAD along the row axis, the
+  // 1-D case being the RowLen=1 specialization handled in LoadTensorFlat.
+  if (Length(FTensors[Idx].Shape) <> 2) and
+     (Length(FTensors[Idx].Shape) <> 1) then
     raise EGGUFError.CreateFmt(
-      'gguf: de-interleave target "%s" must be 2-D, got %s: %s',
+      'gguf: de-interleave target "%s" must be 1-D or 2-D, got %s: %s',
       [pName, ShapeAsString(pName), FFileName]);
   Rows := integer(FTensors[Idx].Shape[0]);
   if (Rows mod HeadDim) <> 0 then

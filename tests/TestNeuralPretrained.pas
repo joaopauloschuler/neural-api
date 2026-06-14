@@ -150,6 +150,8 @@ type
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestGGUFWriterRoundTrip;
+    procedure TestBuildFromGGUFQwen2RoundTrip;
+    procedure TestBuildFromGGUFRejectsUnknownArch;
     procedure TestGGUFWriterGpt2TokenizerRoundTrip;
     procedure TestTNNetGGUFWriterRoundTrip;
     procedure TestGGUFWriterQ8FromInt8;
@@ -4314,6 +4316,118 @@ begin
     NNG.Free; NNRef.Free;
     DeleteFile(GGUFPath);
   end;
+end;
+
+// Generic GGUF architecture dispatch (BuildFromGGUF) on a NON-Llama family:
+// the tiny_qwen2 fixture (q/k/v projection biases re-randomized to NONZERO
+// values, untied lm_head) is exported to a temp .gguf via SaveLlamaToGGUFEx
+// - which now emits general.architecture "qwen2" plus the blk.N.attn_*.bias
+// tensors (q/k biases permuted into the interleaved-rotary layout) - then
+// read back through BuildFromGGUF, which re-derives the QKVBias flag from the
+// architecture name and de-interleaves the q/k rows AND biases. An F32
+// round-trip must reproduce the safetensors-built logits to < 1e-4 (the
+// write->read permutations are exact inverses), proving the bias path and
+// the arch dispatch are wired end to end. // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestBuildFromGGUFQwen2RoundTrip;
+var
+  NNRef, NNG: TNNet;
+  Config, ConfigG: TLlamaConfig;
+  Reader: TNNetSafeTensorsReader;
+  GGUFPath: string;
+  Input, OutR, OutG: TNNetVolume;
+  i, s, SeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  GGUFPath := GetTempDir(false) + 'cai_buildfromgguf_qwen2_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Config := ReadLlamaConfigFromJSONFile(FixturePath('tiny_qwen2_config.json'));
+  Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_qwen2.safetensors'));
+  try
+    if Config.VocabSize <= 0 then
+      Config.VocabSize := integer(
+        Reader.DimSize('model.embed_tokens.weight', 0));
+    SaveLlamaToGGUF(Reader, Config, GGUFPath);
+  finally
+    Reader.Free;
+  end;
+
+  NNRef := BuildQwen2FromSafeTensorsEx(FixturePath('tiny_qwen2.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_qwen2_config.json'));
+  NNG := BuildFromGGUFEx(GGUFPath, ConfigG);
+  Input := TNNetVolume.Create;
+  OutR := TNNetVolume.Create;
+  OutG := TNNetVolume.Create;
+  try
+    AssertEquals('dispatch model_type', 'qwen2', ConfigG.ModelType);
+    AssertTrue('dispatch qkv_bias', ConfigG.QKVBias);
+    AssertEquals('round-trip hidden', Config.HiddenSize, ConfigG.HiddenSize);
+    AssertEquals('round-trip layers', Config.NumLayers, ConfigG.NumLayers);
+    AssertEquals('round-trip kv_heads', Config.NumKVHeads, ConfigG.NumKVHeads);
+    AssertEquals('round-trip vocab', Config.VocabSize, ConfigG.VocabSize);
+    AssertFalse('round-trip untied head', ConfigG.TieWordEmbeddings);
+    SeqLen := ConfigG.MaxPositions;
+    Vocab := ConfigG.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      NNRef.Compute(Input);
+      NNRef.GetOutput(OutR);
+      NNG.Compute(Input);
+      NNG.GetOutput(OutG);
+      AssertEquals('round-trip output size', OutR.Size, OutG.Size);
+      for i := 0 to OutR.Size - 1 do
+        if Abs(OutR.FData[i] - OutG.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutR.FData[i] - OutG.FData[i]);
+    end;
+    AssertTrue('Qwen2 GGUF dispatch round-trip max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutG.Free; OutR.Free; Input.Free;
+    NNG.Free; NNRef.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+// BuildFromGGUF must reject an unsupported architecture with a clear error
+// that lists the supported set (so the caller knows which dedicated builder
+// to reach for). We synthesize a minimal .gguf whose general.architecture is
+// "starcoder2" (deliberately out of scope) and assert the import raises.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestBuildFromGGUFRejectsUnknownArch;
+var
+  Writer: TNNetGGUFWriter;
+  GGUFPath: string;
+  Raised: boolean;
+  Dummy: TNNetVolume;
+begin
+  GGUFPath := GetTempDir(false) + 'cai_buildfromgguf_badarch_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Writer := TNNetGGUFWriter.Create(GGUFPath);
+  Dummy := TNNetVolume.Create(4, 1, 1);
+  try
+    Writer.AddMetaString('general.architecture', 'starcoder2');
+    Writer.AddMetaUInt32('starcoder2.block_count', 1);
+    // At least one tensor so the writer produces a valid container.
+    Writer.AddTensorFlat('token_embd.weight', [2, 2], Dummy, gwF32);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+    Dummy.Free;
+  end;
+  Raised := false;
+  try
+    BuildFromGGUF(GGUFPath).Free;
+  except
+    on E: Exception do
+      Raised := True;
+  end;
+  AssertTrue('BuildFromGGUF must reject starcoder2', Raised);
+  DeleteFile(GGUFPath);
 end;
 
 // Q8_0-direct-from-int8 writer path: when a layer already holds the int8

@@ -1029,6 +1029,42 @@ function BuildLlamaFromGGUF(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// ---- GENERIC GGUF IMPORT (architecture dispatch) -----------------------
+// Reads general.architecture from a .gguf file and dispatches to the right
+// builder so GGUF checkpoints beyond plain Llama import without the caller
+// having to know the family. The Llama-BACKBONE families (no new layer
+// type) are wired:
+//   llama  - delegates to BuildLlamaFromGGUFEx (the reference path).
+//   qwen2  - the Llama skeleton + q/k/v projection biases (o_proj and the
+//            MLP stay bias-free); reads the qwen2.* metadata prefix and the
+//            blk.N.attn_{q,k,v}.bias tensors (q/k biases de-interleaved like
+//            their rows). use_sliding_window is NOT wired (rejected).
+//   gemma2 - the Gemma-2 deltas matching BuildGemma2FromSafeTensors:
+//            gated-GELU MLP, zero-centered (1+w) RMSNorm, sqrt(d_model)
+//            embedding scale, sandwich norms (post_attention /
+//            post_feedforward layernorm INSIDE the residual branches),
+//            1:1 alternating local/global sliding window, query_pre_attn_
+//            scalar score scaling and attention/final logit soft-capping.
+//            Read from the gemma2.* metadata prefix; the GGUF tensor set
+//            adds blk.N.{post_attention_norm,post_ffw_norm}.weight. Gemma's
+//            q/k rows are NOT permuted by llama.cpp (no de-interleave).
+// OUT OF SCOPE for v1 (raise a clear error listing the supported set):
+//   - starcoder2: it uses LayerNorm (not RMSNorm) with biases on EVERY
+//     projection AND a non-gated GELU MLP - more than a trivial flag on the
+//     RMSNorm Llama path, so it is deliberately skipped here.
+//   - qwen3 / gemma3 / phi3 / MoE / Mamba / RWKV / BERT / enc-dec etc.:
+//     either need q/k-norm, fused slabs, per-layer theta, or a different
+//     backbone; import those through their dedicated safetensors builders.
+// pSeqLen / pInferenceOnly / pQuantizeInt8 behave as in BuildLlamaFromGGUFEx.
+// Coded by Claude (AI).
+function BuildFromGGUFEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildFromGGUF(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
 // ---- GGUF EXPORT (writer) ----------------------------------------------
 // The byte-for-byte inverse of BuildLlamaFromGGUFEx: writes a llama.cpp-
 // loadable .gguf for a Llama-family decoder whose HF-named weights live in
@@ -7943,17 +7979,260 @@ begin
     pInferenceOnly, pQuantizeInt8);
 end;
 
+function BuildFromGGUFEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetGGUFReader;
+  Arch, GGUFPrefix, HFPrefix: string;
+  BlockCnt, HeadDim: integer;
+  OK: boolean;
+
+  function MetaKey(const Suffix: string): string;
+  begin
+    Result := Arch + '.' + Suffix;
+  end;
+
+  function RequiredMetaInt(const Suffix: string): integer;
+  var
+    V: Int64;
+  begin
+    V := Reader.GetMetaInt(MetaKey(Suffix), -1);
+    if V <= 0 then
+      ImportError('GGUF import: metadata key "' + MetaKey(Suffix) +
+        '" is missing or not a positive integer in ' + FileName + '.');
+    Result := integer(V);
+  end;
+
+  procedure Rename(const GGUFName, HFName: string; Optional: boolean);
+  begin
+    if Reader.HasTensor(GGUFName) then
+      Reader.RenameTensor(GGUFName, HFName)
+    else if not Optional then
+      ImportError('GGUF import: missing tensor "' + GGUFName +
+        '" in ' + FileName + '.');
+  end;
+
+begin
+  // The reference "llama" path stays in its dedicated builder; everything
+  // else is read here so the qwen2/gemma2 deltas live in one place.
+  Reader := TNNetGGUFReader.Create(FileName);
+  try
+    Arch := Reader.GetMetaString('general.architecture', '');
+  finally
+    Reader.Free;
+  end;
+  if Arch = 'llama' then
+  begin
+    Result := BuildLlamaFromGGUFEx(FileName, Config, pSeqLen,
+      pInferenceOnly, pQuantizeInt8);
+    Exit;
+  end;
+  if (Arch <> 'qwen2') and (Arch <> 'gemma2') then
+    ImportError('GGUF import: general.architecture "' + Arch +
+      '" is not supported by BuildFromGGUF (supported: llama, qwen2, ' +
+      'gemma2). starcoder2 (LayerNorm + full biases + non-gated GELU) and ' +
+      'the q/k-norm / fused-slab / MoE / non-Llama-backbone families are ' +
+      'out of scope for v1 - import those through their dedicated ' +
+      'safetensors builders: ' + FileName);
+
+  Reader := TNNetGGUFReader.Create(FileName);
+  OK := false;
+  try
+    Config := Default(TLlamaConfig);
+    Config.ModelType := Arch;
+    Config.HiddenSize := RequiredMetaInt('embedding_length');
+    Config.IntermediateSize := RequiredMetaInt('feed_forward_length');
+    Config.NumLayers := RequiredMetaInt('block_count');
+    Config.NumHeads := RequiredMetaInt('attention.head_count');
+    Config.NumKVHeads := integer(Reader.GetMetaInt(
+      MetaKey('attention.head_count_kv'), Config.NumHeads));
+    Config.MaxPositions := RequiredMetaInt('context_length');
+    Config.RmsNormEps := Reader.GetMetaFloat(
+      MetaKey('attention.layer_norm_rms_epsilon'), 1e-6);
+    Config.RopeTheta := Reader.GetMetaFloat(MetaKey('rope.freq_base'), 10000.0);
+    Config.HeadDim := integer(Reader.GetMetaInt(
+      MetaKey('attention.key_length'), 0));
+    Config.PartialRotaryFactor := 1.0;
+    Config.RopeScaling := DefaultRoPEScaling();
+    Config.EmbedScale := 1.0;
+
+    // vocab_size: explicit key, else the embedding rows (GGUF dims reversed,
+    // so dim 0 is the vocab axis), else the token list.
+    Config.VocabSize := integer(Reader.GetMetaInt(MetaKey('vocab_size'), 0));
+    if Config.VocabSize <= 0 then
+    begin
+      if Reader.HasTensor('token_embd.weight') and
+         (Reader.DimCount('token_embd.weight') = 2) then
+        Config.VocabSize := integer(Reader.DimSize('token_embd.weight', 0))
+      else
+        Config.VocabSize := integer(Reader.GetMetaArrayCount(
+          'tokenizer.ggml.tokens'));
+    end;
+    if Config.VocabSize <= 0 then
+      ImportError('GGUF import: cannot determine the vocab size in ' +
+        FileName + '.');
+    Config.TieWordEmbeddings := not Reader.HasTensor('output.weight');
+
+    if Config.HeadDim > 0 then
+      HeadDim := Config.HeadDim
+    else
+    begin
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('GGUF import: ' + MetaKey('embedding_length') + '=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          MetaKey('attention.head_count') + '=' + IntToStr(Config.NumHeads) +
+          '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+    end;
+
+    if Arch = 'qwen2' then
+    begin
+      // Qwen2: the Llama skeleton + q/k/v projection biases.
+      Config.QKVBias := True;
+      if Reader.GetMetaBool(MetaKey('attention.sliding_window'), False) or
+         (Reader.GetMetaInt(MetaKey('attention.sliding_window'), 0) > 0) then
+        ImportError('GGUF import: Qwen2 sliding-window attention is not ' +
+          'wired into this importer yet: ' + FileName);
+    end
+    else // gemma2
+    begin
+      // NOTE: the gemma2 path reuses the HF-verified Gemma-2 config flags
+      // (BuildGemma2FromSafeTensors is tested against HF float64 logits), but
+      // the GGUF SIDE is NOT round-trip-verified offline: the landed GGUF
+      // writer does not emit Gemma deltas (gated-GELU / embed scale / soft-
+      // caps), so there is no write->read oracle the way qwen2 has. The
+      // metadata key names below and the "no q/k de-interleave" choice follow
+      // llama.cpp's gemma2 convert convention; treat real-gemma2-GGUF parity
+      // as PENDING a fixture before trusting it in production.
+      // Gemma-2 deltas (match BuildGemma2FromSafeTensors): gated-GELU MLP,
+      // zero-centered RMSNorm, sqrt(d_model) embed scale, sandwich norms,
+      // 1:1 alternating local/global sliding window, query pre-attn scalar
+      // score scaling and attention/final logit soft-capping.
+      Config.GegluFFN := True;
+      Config.RMSNormAddOne := True;
+      Config.EmbedScale := Sqrt(Config.HiddenSize);
+      Config.SandwichNorm := True;
+      Config.AltSlidingWindow := True;
+      Config.SlidingWindow := integer(Reader.GetMetaInt(
+        MetaKey('attention.sliding_window'), 4096));
+      // llama.cpp emits gemma2.attn_logit_softcapping /
+      // gemma2.final_logit_softcapping (HF defaults 50 / 30) and folds the
+      // query_pre_attn_scalar into the model's attention scale. The GGUF
+      // scale key is gemma2.attention.scale (1/sqrt(query_pre_attn_scalar));
+      // we keep the HF default (256) when absent.
+      Config.QueryPreAttnScalar := Reader.GetMetaFloat(
+        MetaKey('attention.query_pre_attn_scalar'), 256.0);
+      if Config.QueryPreAttnScalar <= 0 then
+        Config.QueryPreAttnScalar := 256.0;
+      Config.AttnLogitSoftCap := Reader.GetMetaFloat(
+        MetaKey('attn_logit_softcapping'), 50.0);
+      Config.FinalLogitSoftCap := Reader.GetMetaFloat(
+        MetaKey('final_logit_softcapping'), 30.0);
+      if Config.RmsNormEps = 1e-6 then
+        Config.RmsNormEps := Reader.GetMetaFloat(
+          MetaKey('attention.layer_norm_rms_epsilon'), 1e-6);
+    end;
+
+    // ---- ggml -> HF tensor names ----
+    Rename('token_embd.weight', 'model.embed_tokens.weight', false);
+    Rename('output_norm.weight', 'model.norm.weight', false);
+    Rename('output.weight', 'lm_head.weight', true);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      GGUFPrefix := 'blk.' + IntToStr(BlockCnt) + '.';
+      HFPrefix := 'model.layers.' + IntToStr(BlockCnt) + '.';
+      Rename(GGUFPrefix + 'attn_norm.weight',
+        HFPrefix + 'input_layernorm.weight', false);
+      Rename(GGUFPrefix + 'attn_q.weight',
+        HFPrefix + 'self_attn.q_proj.weight', false);
+      Rename(GGUFPrefix + 'attn_k.weight',
+        HFPrefix + 'self_attn.k_proj.weight', false);
+      Rename(GGUFPrefix + 'attn_v.weight',
+        HFPrefix + 'self_attn.v_proj.weight', false);
+      Rename(GGUFPrefix + 'attn_output.weight',
+        HFPrefix + 'self_attn.o_proj.weight', false);
+      Rename(GGUFPrefix + 'ffn_gate.weight',
+        HFPrefix + 'mlp.gate_proj.weight', false);
+      Rename(GGUFPrefix + 'ffn_up.weight',
+        HFPrefix + 'mlp.up_proj.weight', false);
+      Rename(GGUFPrefix + 'ffn_down.weight',
+        HFPrefix + 'mlp.down_proj.weight', false);
+      if Arch = 'qwen2' then
+      begin
+        Rename(GGUFPrefix + 'attn_q.bias',
+          HFPrefix + 'self_attn.q_proj.bias', false);
+        Rename(GGUFPrefix + 'attn_k.bias',
+          HFPrefix + 'self_attn.k_proj.bias', false);
+        Rename(GGUFPrefix + 'attn_v.bias',
+          HFPrefix + 'self_attn.v_proj.bias', false);
+        Rename(GGUFPrefix + 'ffn_norm.weight',
+          HFPrefix + 'post_attention_layernorm.weight', false);
+      end
+      else // gemma2 sandwich-norm names
+      begin
+        Rename(GGUFPrefix + 'post_attention_norm.weight',
+          HFPrefix + 'post_attention_layernorm.weight', false);
+        Rename(GGUFPrefix + 'ffn_norm.weight',
+          HFPrefix + 'pre_feedforward_layernorm.weight', false);
+        Rename(GGUFPrefix + 'post_ffw_norm.weight',
+          HFPrefix + 'post_feedforward_layernorm.weight', false);
+      end;
+    end;
+
+    // llama.cpp permutes q/k rows into the interleaved-rotary layout for the
+    // INTERLEAVED-rope families (llama/qwen2); Gemma uses NEOX rope and is
+    // stored in HF order, so it gets NO de-interleave.
+    if Arch = 'qwen2' then
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        HFPrefix := 'model.layers.' + IntToStr(BlockCnt) + '.';
+        Reader.RegisterRowDeinterleave(
+          HFPrefix + 'self_attn.q_proj.weight', HeadDim);
+        Reader.RegisterRowDeinterleave(
+          HFPrefix + 'self_attn.k_proj.weight', HeadDim);
+        // The q/k biases follow the same per-head interleave.
+        Reader.RegisterRowDeinterleave(
+          HFPrefix + 'self_attn.q_proj.bias', HeadDim);
+        Reader.RegisterRowDeinterleave(
+          HFPrefix + 'self_attn.k_proj.bias', HeadDim);
+      end;
+    OK := true;
+  finally
+    if not OK then Reader.Free;
+  end;
+  Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
+    pSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildFromGGUF(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildFromGGUFEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
 procedure SaveLlamaToGGUFEx(Reader: TNNetSafeTensorsReader;
   const Config: TLlamaConfig; const Tokens: array of string;
   const FileName: string; pDType: TGGUFWriteDType = gwF32;
   Tokenizer: TNeuralHFTokenizer = nil);
 var
   Writer: TNNetGGUFWriter;
-  Prefix: string;
+  Prefix, Arch: string;
   HeadDim, QWidth, KVWidth, b, i: integer;
   BlockPrefix, GGUFBlock: string;
   Scores: array of single;
   TokenTypes: array of Int64;
+
+  // Builds a "<arch>.<suffix>" metadata key (llama.cpp keys all the
+  // hyperparameters under the architecture prefix).
+  function MetaKey(const Suffix: string): string;
+  begin
+    Result := Arch + '.' + Suffix;
+  end;
 
   // Loads an HF-named tensor [Rows, Cols] from the reader.
   function LoadHF(const HFName: string): TNNetVolume;
@@ -8041,6 +8320,59 @@ var
     end;
   end;
 
+  // Writes a 1-D bias [Rows]; always F32 (matches the norm convention).
+  procedure WriteBias(const HFName, GGUFName: string; Rows: integer);
+  var
+    V: TNNetVolume;
+  begin
+    V := LoadHF(HFName);
+    try
+      if V.Size <> Rows then
+        ImportError('Llama GGUF export: bias "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' + IntToStr(Rows) + '.');
+      Writer.AddTensorFlat(GGUFName, [Rows], V, gwF32);
+    finally
+      V.Free;
+    end;
+  end;
+
+  // Writes a q/k bias [Rows], permuting the entries from HF rotate_half into
+  // llama.cpp's interleaved-rotary layout (the same per-head permutation
+  // WriteQKMatrix applies to the rows, here over a single column).
+  procedure WriteQKBias(const HFName, GGUFName: string; Rows: integer);
+  var
+    V, Perm: TNNetVolume;
+    HalfDim, hd, pp, srcRow, dstRow: integer;
+  begin
+    V := LoadHF(HFName);
+    Perm := TNNetVolume.Create;
+    try
+      if V.Size <> Rows then
+        ImportError('Llama GGUF export: q/k bias "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' + IntToStr(Rows) + '.');
+      if (Rows mod HeadDim) <> 0 then
+        ImportError('Llama GGUF export: q/k bias "' + HFName + '" length ' +
+          IntToStr(Rows) + ' not a multiple of head_dim ' +
+          IntToStr(HeadDim) + '.');
+      Perm.ReSize(Rows, 1, 1);
+      HalfDim := HeadDim div 2;
+      for srcRow := 0 to Rows - 1 do
+      begin
+        hd := srcRow div HeadDim;
+        pp := srcRow mod HeadDim;
+        if pp < HalfDim then
+          dstRow := hd * HeadDim + 2 * pp
+        else
+          dstRow := hd * HeadDim + 2 * (pp - HalfDim) + 1;
+        Perm.FData[dstRow] := V.FData[srcRow];
+      end;
+      Writer.AddTensorFlat(GGUFName, [Rows], Perm, gwF32);
+    finally
+      Perm.Free;
+      V.Free;
+    end;
+  end;
+
 begin
   // ---- reject the out-of-scope architecture deltas (v1 = plain Llama) ----
   if Config.IsMoE then
@@ -8088,28 +8420,34 @@ begin
 
   Writer := TNNetGGUFWriter.Create(FileName);
   try
-    // ---- metadata (the llama.* hyperparameter block) ----
-    Writer.AddMetaString('general.architecture', 'llama');
+    // ---- metadata (the <arch>.* hyperparameter block) ----
+    // A Qwen2-style decoder (q/k/v projection biases, otherwise the plain
+    // Llama skeleton) is emitted under general.architecture "qwen2" so the
+    // round-trip reader (BuildFromGGUF) re-derives the QKVBias flag from the
+    // architecture name rather than guessing from the presence of bias
+    // tensors. Everything else stays "llama".
+    if Config.QKVBias then Arch := 'qwen2' else Arch := 'llama';
+    Writer.AddMetaString('general.architecture', Arch);
     Writer.AddMetaString('general.name', 'cai-neural-api-export');
-    Writer.AddMetaUInt32('llama.block_count', Config.NumLayers);
-    Writer.AddMetaUInt32('llama.context_length', Config.MaxPositions);
-    Writer.AddMetaUInt32('llama.embedding_length', Config.HiddenSize);
-    Writer.AddMetaUInt32('llama.feed_forward_length',
+    Writer.AddMetaUInt32(MetaKey('block_count'), Config.NumLayers);
+    Writer.AddMetaUInt32(MetaKey('context_length'), Config.MaxPositions);
+    Writer.AddMetaUInt32(MetaKey('embedding_length'), Config.HiddenSize);
+    Writer.AddMetaUInt32(MetaKey('feed_forward_length'),
       Config.IntermediateSize);
-    Writer.AddMetaUInt32('llama.attention.head_count', Config.NumHeads);
-    Writer.AddMetaUInt32('llama.attention.head_count_kv', Config.NumKVHeads);
-    Writer.AddMetaFloat32('llama.attention.layer_norm_rms_epsilon',
+    Writer.AddMetaUInt32(MetaKey('attention.head_count'), Config.NumHeads);
+    Writer.AddMetaUInt32(MetaKey('attention.head_count_kv'), Config.NumKVHeads);
+    Writer.AddMetaFloat32(MetaKey('attention.layer_norm_rms_epsilon'),
       Config.RmsNormEps);
-    Writer.AddMetaFloat32('llama.rope.freq_base', Config.RopeTheta);
-    Writer.AddMetaUInt32('llama.rope.dimension_count', HeadDim);
-    Writer.AddMetaUInt32('llama.vocab_size', Config.VocabSize);
+    Writer.AddMetaFloat32(MetaKey('rope.freq_base'), Config.RopeTheta);
+    Writer.AddMetaUInt32(MetaKey('rope.dimension_count'), HeadDim);
+    Writer.AddMetaUInt32(MetaKey('vocab_size'), Config.VocabSize);
     if (Config.HeadDim > 0) and
        (Config.HeadDim <> Config.HiddenSize div Config.NumHeads) then
-      Writer.AddMetaUInt32('llama.attention.key_length', HeadDim);
+      Writer.AddMetaUInt32(MetaKey('attention.key_length'), HeadDim);
     if Config.RopeScaling.Mode = rsmPositionInterpolation then
     begin
-      Writer.AddMetaString('llama.rope.scaling.type', 'linear');
-      Writer.AddMetaFloat32('llama.rope.scaling.factor',
+      Writer.AddMetaString(MetaKey('rope.scaling.type'), 'linear');
+      Writer.AddMetaFloat32(MetaKey('rope.scaling.factor'),
         Config.RopeScaling.Factor);
     end
     else if Config.RopeScaling.Mode <> rsmNone then
@@ -8160,6 +8498,17 @@ begin
         GGUFBlock + 'attn_k.weight', KVWidth, Config.HiddenSize);
       WriteMatrix(BlockPrefix + 'self_attn.v_proj.weight',
         GGUFBlock + 'attn_v.weight', KVWidth, Config.HiddenSize);
+      // Qwen2 q/k/v projection biases (o_proj stays bias-free). q/k biases are
+      // permuted into the interleaved-rotary layout like their matrix rows.
+      if Config.QKVBias then
+      begin
+        WriteQKBias(BlockPrefix + 'self_attn.q_proj.bias',
+          GGUFBlock + 'attn_q.bias', QWidth);
+        WriteQKBias(BlockPrefix + 'self_attn.k_proj.bias',
+          GGUFBlock + 'attn_k.bias', KVWidth);
+        WriteBias(BlockPrefix + 'self_attn.v_proj.bias',
+          GGUFBlock + 'attn_v.bias', KVWidth);
+      end;
       WriteMatrix(BlockPrefix + 'self_attn.o_proj.weight',
         GGUFBlock + 'attn_output.weight', Config.HiddenSize, QWidth);
       WriteNorm(BlockPrefix + 'post_attention_layernorm.weight',
