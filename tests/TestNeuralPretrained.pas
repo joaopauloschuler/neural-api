@@ -275,6 +275,8 @@ type
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
     procedure TestResNet18ImageClassificationParity;
+    procedure TestInceptionV3ConfigFromJSONFile;
+    procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
     procedure TestMobileNetV3ImageClassificationParity;
     procedure TestSwinConfigFromJSONFile;
@@ -12771,6 +12773,125 @@ begin
     end;
     AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadInceptionV3ConfigFromJSONFile on the committed Inception pico
+// config (the FIRST multi-branch channel-concat CNN importer). The pico
+// overrides the canonical torchvision branch widths with tiny counts so the
+// fixture stays KB-scale.
+procedure TTestNeuralPretrained.TestInceptionV3ConfigFromJSONFile;
+var
+  Config: TInceptionV3Config;
+begin
+  Config := ReadInceptionV3ConfigFromJSONFile(
+    FixturePath('tiny_inceptionv3_config.json'));
+  AssertEquals('model_type', 'inception', Config.ModelType);
+  AssertEquals('image_size', 8, Config.ImageSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('stem_width', 4, Config.StemWidth);
+  AssertEquals('num_modules', 2, Config.NumModules);
+  AssertEquals('branch1x1', 3, Config.Branch1x1);
+  AssertEquals('branch5x5_reduce', 2, Config.Branch5x5Reduce);
+  AssertEquals('branch5x5', 3, Config.Branch5x5);
+  AssertEquals('branch3x3dbl_reduce', 2, Config.Branch3x3dblReduce);
+  AssertEquals('branch3x3dbl_mid', 3, Config.Branch3x3dblMid);
+  AssertEquals('branch3x3dbl', 4, Config.Branch3x3dbl);
+  AssertEquals('branch_pool', 3, Config.BranchPool);
+  // concat-out (the pooled-feature / FID-backbone width) = 3+3+4+3 = 13.
+  AssertTrue('config ToString non-empty',
+    Length(InceptionV3ConfigToString(Config)) > 0);
+end;
+
+// torchvision Inception-v3 image-classification parity test (the FIRST
+// multi-branch channel-concat CNN weight import). tests/fixtures/
+// tiny_inceptionv3.* is a pico random-init Inception (size-preserving
+// InceptionA-shaped modules: branch1x1 / branch5x5 / branch3x3dbl /
+// branch_pool, concatenated on the CHANNEL axis via TNNetDeepConcat) whose
+// state_dict mirrors the torchvision BasicConv2d key scheme (Mixed_5b/5c
+// .branchN.{conv,bn}, fc). Each BN is FOLDED into its conv at load (reusing the
+// ResNet conv-BN fold path). The generator tools/inceptionv3_tiny_fixture.py
+// computes the reference logits with a self-contained numpy float64 oracle
+// (torchvision not installed) replicating the CAI forward path exactly (same
+// BN fold + portable maxpool + channel concat). Also checks the pooled-feature
+// (FID backbone) tap. Asserts logits AND pooled feature match the oracle < 1e-4.
+procedure TTestNeuralPretrained.TestInceptionV3ImageClassificationParity;
+var
+  NN: TNNet;
+  Config: TInceptionV3Config;
+  PoolIdx: integer;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr, PooledArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, MaxPoolDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildInceptionV3FromSafeTensors(
+    FixturePath('tiny_inceptionv3.safetensors'), Config, PoolIdx,
+    {pInferenceOnly=}false, FixturePath('tiny_inceptionv3_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+    // The pooled-feature tap is the global-avg-pool layer; its width is the
+    // concatenated module output (the FID backbone feature dim, 13 here).
+    AssertEquals('pool feature dim', 13, NN.Layers[PoolIdx].Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_inceptionv3_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    PooledArr := TJSONArray(TJSONObject(RefRoot).Find('pooled'));
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+    AssertEquals('pooled width', 13, PooledArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    // Pooled-feature (FID backbone) parity.
+    MaxPoolDiff := 0;
+    for ChanCnt := 0 to 12 do
+    begin
+      Diff := Abs(NN.Layers[PoolIdx].Output.FData[ChanCnt] -
+        PooledArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxPoolDiff then MaxPoolDiff := Diff;
+    end;
+    AssertTrue('pooled feature: max |diff| = ' + FloatToStr(MaxPoolDiff) +
+      ' must be < 1e-4', MaxPoolDiff < 1e-4);
   finally
     RefRoot.Free;
     ImageInput.Free;

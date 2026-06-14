@@ -5055,6 +5055,90 @@ function BuildMobileNetV3FromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// INCEPTION-V3 IMPORT (torchvision "inception_v3"). Structurally distinct from
+// every other landed CNN: the body is a stack of parallel MULTI-BRANCH
+// Inception modules whose branch outputs are concatenated on the CHANNEL
+// (depth) axis (TNNetDeepConcat), not summed (ResNet) or sequential (VGG/
+// MobileNet). The new work here is the branch-concatenation block builder; the
+// conv-BN fold and Concat are reused from the landed ResNet path.
+//
+// An "InceptionA" module (the canonical multi-branch block) has FOUR parallel
+// branches, all spatial-size-preserving (stride 1, same padding), each a
+// BasicConv2d chain (conv bias=False -> BatchNorm2d -> ReLU; the BN is FOLDED
+// into the conv at load exactly as in ResNet):
+//   branch1x1:    1x1
+//   branch5x5:    1x1 reduce -> 5x5 (in CAI: pico uses a 3x3 stand-in)
+//   branch3x3dbl: 1x1 reduce -> 3x3 -> 3x3   (the "5x5-as-two-3x3" path)
+//   branch_pool:  size-preserving 3x3 pool -> 1x1
+// then DeepConcat([b1x1, b5x5, b3x3dbl, branch_pool]) on the channel axis.
+// torchvision keys are BasicConv2d sub-modules ".conv.weight" / ".bn.*" under
+// per-module prefixes (Mixed_5b/5c/5d ... ); BatchNorm2d eps is 1e-3.
+//
+// Head = global average pool (TNNetAvgChannel) -> fc (Linear -> num_labels).
+// The POOLED feature (the input to fc) is the FID pooled-feature backbone tap;
+// BuildInceptionV3 returns its layer index via out PoolFeatureIdx so a later
+// FID rewire can read the 2048-d (here MOD_OUT-d) pool vector. The aux
+// classifier is SKIPPED (inference-only).
+//
+// SCOPE / DOCUMENTED LIMITATIONS (v1 targets the multi-branch concat builder +
+// conv-BN fold + pooled-feature tap; the pico parity fixture is faithful to
+// exactly what CAI computes): CAI's TNNetConvolution is SQUARE-kernel only, so
+// torchvision InceptionC's asymmetric 1x7/7x1 factorized convs and the strided
+// grid-reduction modules (InceptionB/D, which shrink the grid and so cannot be
+// channel-concatenated with a same-size branch) are documented follow-ups. The
+// pico builds the size-preserving InceptionA-shaped module (the canonical
+// multi-branch concat block). The pool branch uses a PyTorch-sized 3x3 stride1
+// pad1 MAXpool (TNNetMaxPoolPortable, grid-preserving); torchvision's is an
+// AVGpool -- a documented difference (the oracle uses the same maxpool the
+// importer builds, so pico parity is exact end to end).
+// Coded by Claude (AI).
+type
+  TInceptionV3Config = record
+    ModelType: string;       // 'inception'
+    ImageSize: integer;      // 299 canonical torchvision (pico: small)
+    NumChannels: integer;    // 3
+    NumLabels: integer;      // 1000 ImageNet-1k
+    StemWidth: integer;      // Conv2d_1a_3x3 out channels
+    NumModules: integer;     // InceptionA modules stacked (Mixed_5b..)
+    BnEps: TNeuralFloat;     // BatchNorm2d eps (1e-3 in torchvision inception)
+    // Per-InceptionA-module branch channel counts (config-driven so the pico
+    // and a canonical config share one builder):
+    Branch1x1: integer;
+    Branch5x5Reduce, Branch5x5: integer;
+    Branch3x3dblReduce, Branch3x3dblMid, Branch3x3dbl: integer;
+    BranchPool: integer;
+  end;
+
+// Reads an Inception-v3 config.json (the pico-faithful branch table). Optional
+// overrides: image_size (299), num_channels (3), num_labels (1000), stem_width,
+// num_modules, bn_eps (1e-3), and the seven branch channel counts.
+function ReadInceptionV3ConfigFromJSONFile(
+  const FileName: string): TInceptionV3Config;
+
+function InceptionV3ConfigToString(const Config: TInceptionV3Config): string;
+
+// Builds the Inception-v3 described by Config and loads every weight from
+// Reader (caller owns Reader), folding each BatchNorm into its conv. The net
+// takes an (ImageSize, ImageSize, NumChannels) normalized RGB volume and
+// outputs (1, 1, NumLabels) class logits. PoolFeatureIdx returns the layer
+// index of the global-avg-pool (the FID pooled-feature backbone tap).
+function BuildInceptionV3(Reader: TNNetSafeTensorsReader;
+  const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Builds + loads the Inception-v3 classifier from a checkpoint file. Config
+// supplied by the caller (Ex) or read from ConfigFileName ('' = "config.json"
+// beside FileName) and returned. Net owned by caller. Output: (1,1,num_labels).
+function BuildInceptionV3FromSafeTensorsEx(const FileName: string;
+  const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
+  pInferenceOnly: boolean = false): TNNet;
+
+function BuildInceptionV3FromSafeTensors(const FileName: string;
+  out Config: TInceptionV3Config; out PoolFeatureIdx: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // SWIN TRANSFORMER IMPORT (microsoft/swin-* "swin"): hierarchical shifted-
 // window vision transformer. Structurally distinct from the plain ViT towers
 // (CLIP/SigLIP/DINOv2): patch-merging downsampling between stages, window
@@ -31903,6 +31987,256 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadResNetConfigFromJSONFile(ConfigPath);
   Result := BuildResNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// INCEPTION-V3 IMPORT (torchvision inception_v3)
+// ===========================================================================
+
+function ReadInceptionV3ConfigFromJSONFile(
+  const FileName: string): TInceptionV3Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  LabelObj: TJSONData;
+begin
+  if not FileExists(FileName) then
+    ImportError('Inception import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Inception import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Inception import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'inception');
+    Result.ImageSize := Obj.Get('image_size', 299);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.StemWidth := Obj.Get('stem_width', 32);
+    Result.NumModules := Obj.Get('num_modules', 3);
+    Result.BnEps := Obj.Get('bn_eps', 0.001);
+    // Per-InceptionA-module branch widths. Canonical torchvision Mixed_5b uses
+    // [64; 48,64; 64,96,96; 32] (pool_features 32); the pico fixture overrides
+    // these with tiny counts. Defaults below are the canonical Mixed_5b widths.
+    Result.Branch1x1 := Obj.Get('branch1x1', 64);
+    Result.Branch5x5Reduce := Obj.Get('branch5x5_reduce', 48);
+    Result.Branch5x5 := Obj.Get('branch5x5', 64);
+    Result.Branch3x3dblReduce := Obj.Get('branch3x3dbl_reduce', 64);
+    Result.Branch3x3dblMid := Obj.Get('branch3x3dbl_mid', 96);
+    Result.Branch3x3dbl := Obj.Get('branch3x3dbl', 96);
+    Result.BranchPool := Obj.Get('branch_pool', 32);
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function InceptionV3ConfigToString(const Config: TInceptionV3Config): string;
+begin
+  if Config.ModelType = '' then Result := 'inception'
+  else Result := Config.ModelType;
+  Result := Result + '_v3 config: stem=' + IntToStr(Config.StemWidth) +
+    ', modules(InceptionA)=' + IntToStr(Config.NumModules) +
+    ', branches[1x1=' + IntToStr(Config.Branch1x1) +
+    ', 5x5=' + IntToStr(Config.Branch5x5Reduce) + '->' +
+      IntToStr(Config.Branch5x5) +
+    ', 3x3dbl=' + IntToStr(Config.Branch3x3dblReduce) + '->' +
+      IntToStr(Config.Branch3x3dblMid) + '->' +
+      IntToStr(Config.Branch3x3dbl) +
+    ', pool=' + IntToStr(Config.BranchPool) + ']' +
+    ', concat_out=' + IntToStr(Config.Branch1x1 + Config.Branch5x5 +
+      Config.Branch3x3dbl + Config.BranchPool) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', num_labels=' + IntToStr(Config.NumLabels) +
+    ', bn_eps=' + FloatToStr(Config.BnEps);
+end;
+
+// Layer refs of one InceptionA module the weight loader needs (one conv per
+// BasicConv2d; Concat is weightless).
+type
+  TInceptionAModuleLayers = record
+    B1x1: TNNetLayer;                 // branch1x1: 1x1
+    B5x5R, B5x5: TNNetLayer;          // branch5x5: 1x1 reduce -> 3x3
+    B3R, B3M, B3: TNNetLayer;         // branch3x3dbl: 1x1 -> 3x3 -> 3x3
+    BPool: TNNetLayer;                // branch_pool: 1x1 after pool
+  end;
+
+// Adds (architecture only) one size-preserving InceptionA module on top of the
+// current last layer and returns the conv layer refs. THE BRANCH-CONCAT BLOCK
+// BUILDER: four parallel branches are built off the shared module input via
+// AddLayerAfter(..., Input), then DeepConcat-ed on the channel axis. Every conv
+// carries a bias (suppressBias=0) so the folded BN shift loads into it; each
+// BasicConv2d ends in ReLU.
+procedure AddInceptionAModule(NN: TNNet; const Config: TInceptionV3Config;
+  out Refs: TInceptionAModuleLayers);
+var
+  Input, T: TNNetLayer;
+  B1, B5, B3, BP: TNNetLayer;     // branch tails (DeepConcat inputs)
+begin
+  Input := NN.GetLastLayer();
+
+  // branch1x1: 1x1 conv -> ReLU.
+  Refs.B1x1 := NN.AddLayerAfter(
+    [TNNetConvolutionLinear.Create(Config.Branch1x1, 1, 0, 1, 0)], Input);
+  B1 := NN.AddLayer( TNNetReLU.Create() );
+
+  // branch5x5: 1x1 reduce -> 3x3 (pico stand-in for 5x5, same-pad).
+  Refs.B5x5R := NN.AddLayerAfter(
+    [TNNetConvolutionLinear.Create(Config.Branch5x5Reduce, 1, 0, 1, 0)], Input);
+  NN.AddLayer( TNNetReLU.Create() );
+  Refs.B5x5 := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Config.Branch5x5, 3, 1, 1, 0) );
+  B5 := NN.AddLayer( TNNetReLU.Create() );
+
+  // branch3x3dbl: 1x1 reduce -> 3x3 -> 3x3 (the 5x5-as-two-3x3 path).
+  Refs.B3R := NN.AddLayerAfter(
+    [TNNetConvolutionLinear.Create(Config.Branch3x3dblReduce, 1, 0, 1, 0)],
+    Input);
+  NN.AddLayer( TNNetReLU.Create() );
+  Refs.B3M := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Config.Branch3x3dblMid, 3, 1, 1, 0) );
+  NN.AddLayer( TNNetReLU.Create() );
+  Refs.B3 := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Config.Branch3x3dbl, 3, 1, 1, 0) );
+  B3 := NN.AddLayer( TNNetReLU.Create() );
+
+  // branch_pool: size-preserving 3x3 stride1 pad1 (portable/floor-sized) pool
+  // -> 1x1 conv -> ReLU.
+  T := NN.AddLayerAfter(
+    [TNNetMaxPoolPortable.Create({pool=}3, {stride=}1, {pad=}1)], Input);
+  Refs.BPool := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Config.BranchPool, 1, 0, 1, 0) );
+  BP := NN.AddLayer( TNNetReLU.Create() );
+
+  // Concatenate the four branches on the channel (depth) axis.
+  NN.AddLayer( TNNetDeepConcat.Create([B1, B5, B3, BP]) );
+end;
+
+function BuildInceptionV3(Reader: TNNetSafeTensorsReader;
+  const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  StemConv, FC: TNNetLayer;
+  ModRefs: array of TInceptionAModuleLayers;
+  m, InCh, ModOut: integer;
+  Prefix: string;
+begin
+  if Config.NumChannels < 1 then
+    ImportError('Inception import: num_channels must be >= 1.');
+  if Config.NumLabels < 1 then
+    ImportError('Inception import: num_labels must be >= 1.');
+  if Config.NumModules < 1 then
+    ImportError('Inception import: num_modules must be >= 1.');
+  ModOut := Config.Branch1x1 + Config.Branch5x5 + Config.Branch3x3dbl +
+    Config.BranchPool;
+  SetLength(ModRefs, Config.NumModules);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    // Stem: a single 3x3 same-pad conv+BN+ReLU (pico). torchvision's full stem
+    // (Conv2d_1a..4a + maxpools) is a documented follow-up; the multi-branch
+    // modules are what is exercised here.
+    StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.StemWidth, 3, {pad=}1, {stride=}1, {suppressBias=}0) );
+    NN.AddLayer( TNNetReLU.Create() );
+    for m := 0 to Config.NumModules - 1 do
+      AddInceptionAModule(NN, Config, ModRefs[m]);
+    // Head: global average pool (the FID pooled-feature tap) -> fc.
+    PoolFeatureIdx := NN.AddLayer( TNNetAvgChannel.Create() ).LayerIdx;
+    FC := NN.AddLayer( TNNetFullConnectLinear.Create(Config.NumLabels) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    // Stem BasicConv2d: Conv2d_1a_3x3.{conv,bn}.
+    LoadResNetConvFoldBN(Reader, StemConv, 'Conv2d_1a_3x3.conv.weight',
+      'Conv2d_1a_3x3.bn', Config.StemWidth, Config.NumChannels, 3, Config.BnEps);
+    InCh := Config.StemWidth;
+    for m := 0 to Config.NumModules - 1 do
+    begin
+      // Module prefixes follow torchvision: Mixed_5b, Mixed_5c, Mixed_5d, ...
+      Prefix := 'Mixed_5' + Chr(Ord('b') + m) + '.';
+      LoadResNetConvFoldBN(Reader, ModRefs[m].B1x1,
+        Prefix + 'branch1x1.conv.weight', Prefix + 'branch1x1.bn',
+        Config.Branch1x1, InCh, 1, Config.BnEps);
+      LoadResNetConvFoldBN(Reader, ModRefs[m].B5x5R,
+        Prefix + 'branch5x5_1.conv.weight', Prefix + 'branch5x5_1.bn',
+        Config.Branch5x5Reduce, InCh, 1, Config.BnEps);
+      LoadResNetConvFoldBN(Reader, ModRefs[m].B5x5,
+        Prefix + 'branch5x5_2.conv.weight', Prefix + 'branch5x5_2.bn',
+        Config.Branch5x5, Config.Branch5x5Reduce, 3, Config.BnEps);
+      LoadResNetConvFoldBN(Reader, ModRefs[m].B3R,
+        Prefix + 'branch3x3dbl_1.conv.weight', Prefix + 'branch3x3dbl_1.bn',
+        Config.Branch3x3dblReduce, InCh, 1, Config.BnEps);
+      LoadResNetConvFoldBN(Reader, ModRefs[m].B3M,
+        Prefix + 'branch3x3dbl_2.conv.weight', Prefix + 'branch3x3dbl_2.bn',
+        Config.Branch3x3dblMid, Config.Branch3x3dblReduce, 3, Config.BnEps);
+      LoadResNetConvFoldBN(Reader, ModRefs[m].B3,
+        Prefix + 'branch3x3dbl_3.conv.weight', Prefix + 'branch3x3dbl_3.bn',
+        Config.Branch3x3dbl, Config.Branch3x3dblMid, 3, Config.BnEps);
+      LoadResNetConvFoldBN(Reader, ModRefs[m].BPool,
+        Prefix + 'branch_pool.conv.weight', Prefix + 'branch_pool.bn',
+        Config.BranchPool, InCh, 1, Config.BnEps);
+      InCh := ModOut;
+    end;
+    // fc: torchvision Linear [num_labels, concat_out] with bias.
+    LoadLlamaLinearWeights(Reader, FC, 'fc.weight',
+      ModOut, Config.NumLabels, 0, -1, 0, 'fc.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildInceptionV3FromSafeTensorsEx(const FileName: string;
+  const Config: TInceptionV3Config; out PoolFeatureIdx: integer;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildInceptionV3(Reader, Config, PoolFeatureIdx, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildInceptionV3FromSafeTensors(const FileName: string;
+  out Config: TInceptionV3Config; out PoolFeatureIdx: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadInceptionV3ConfigFromJSONFile(ConfigPath);
+  Result := BuildInceptionV3FromSafeTensorsEx(FileName, Config, PoolFeatureIdx,
+    pInferenceOnly);
 end;
 
 // ===========================================================================

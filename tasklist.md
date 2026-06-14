@@ -336,13 +336,18 @@ rather than acted on.
       the landed TNNetMinLSTM but with conv instead of dense gates and a spatial
       cell state); otherwise compose from existing conv + gating layers. Generates
       a short MNIST-digit-trajectory rollout on CPU.
-- [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
-      torchvision) — structurally distinct from every landed CNN (parallel
-      multi-branch Inception modules with 1x1 / 3x3 / 5x5(as two 3x3) / pool
-      branches concatenated on the channel axis, asymmetric 1xN/Nx1 factorized
-      convs, BN after every conv). Reuses the landed conv + BN + Concat path; the
-      new work is the branch-concatenation block builder. Needed in its own right
-      and as the pooled-feature backbone for FID below. Pico parity vs HF float64.
+- [X] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
+      torchvision) — LANDED: branch-concatenation block builder (AddInceptionAModule)
+      runs 4 parallel branches (1x1 / 5x5 / 3x3dbl=5x5-as-two-3x3 / pool)
+      concatenated on the channel axis via TNNetDeepConcat; reuses the ResNet
+      conv-BN fold (LoadResNetConvFoldBN) + config reader/ToString. Pooled-feature
+      (FID backbone) tap exposed via out PoolFeatureIdx. Pico parity vs numpy
+      float64 oracle <1e-4 (logits + pooled feature). FOLLOW-UPS: CAI conv is
+      square-kernel only so InceptionC asymmetric 1x7/7x1 factorized convs and the
+      strided grid-reduction modules (InceptionB/D) are deferred; full stem
+      (Conv2d_1a..4a + maxpools) and torchvision avg-pool branch (pico uses a
+      grid-preserving portable maxpool) are deferred. Rewiring neuralimagemetrics
+      FID onto this backbone is a separate follow-up.
 - [ ] LPIPS follow-ups — the metric LANDED (ComputeLPIPSDistance /
       LPIPSStageDistance / LPIPSUnitNormalize in neuralpretrained.pas, reusing the
       VGG importer's 5 relu taps; unit-normalize -> squared-diff -> per-stage lin
