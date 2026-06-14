@@ -627,7 +627,9 @@ rather than acted on.
       the planted target). Reusable well beyond speech: OCR/handwriting CTC heads.
       This is the prerequisite for the Wav2Vec2/HuBERT importer below.
 - [ ] Wav2Vec2 / HuBERT CTC ASR importer (`BuildWav2Vec2FromSafeTensors[Ex]`,
-      model_type "wav2vec2"/"hubert") — the SECOND speech import family and the
+      model_type "wav2vec2"/"hubert") — NOW UNBLOCKED: the CTC loss/decode
+      prerequisite landed (TNNetCTCLoss + DecodeCTCGreedy/BeamSearch, commit
+      f2fb723); reuse DecodeCTCGreedy for the CTC head. — the SECOND speech import family and the
       first SELF-SUPERVISED-encoder speech model, architecturally distinct from
       the landed Whisper seq2seq (Whisper is a mel-spectrogram encoder-decoder;
       Wav2Vec2/HuBERT is a raw-waveform CONV FEATURE EXTRACTOR -> transformer
