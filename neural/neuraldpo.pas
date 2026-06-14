@@ -267,6 +267,98 @@ type
       property LastRefRejectedLogProb: TNeuralFloat read FLastRefRejected;
   end;
 
+  /// Trainer-level helper that LEARNS a scalar reward model from preference
+  /// pairs with the standard RLHF Bradley-Terry objective (Christiano et al.
+  /// 2017; Ouyang et al. 2022). Given a prompt and a (chosen, rejected)
+  /// response pair the reward net produces one scalar per sequence
+  /// r(x) = RewardNet(prompt + response) and is trained to rank chosen above
+  /// rejected:
+  ///
+  ///   delta = r(chosen) - r(rejected)
+  ///   loss  = -ln sigmoid(delta)
+  ///
+  /// GRADIENT (what Step() backpropagates):
+  ///   dLoss/d delta      = -(1 - sigmoid(delta))           (= -sigmoid(-delta))
+  ///   dLoss/d r(chosen)  = -(1 - sigmoid(delta))           (push the chosen reward UP)
+  ///   dLoss/d r(rejected)= +(1 - sigmoid(delta))           (push the rejected reward DOWN)
+  /// so a well-separated pair (delta large positive) has a vanishing gradient
+  /// and a mis-ranked pair (delta negative) has a gradient approaching +-1.
+  ///
+  /// EXPECTED MODEL SHAPE
+  /// The reward net is a base encoder/transformer + a SCALAR head: a final
+  /// layer whose Output.Size = 1 (e.g. TNNetFullConnectLinear(1)), NOT a
+  /// softmax LM head. The input is a TNNetInput(ContextLen, 1, VocabSize) and
+  /// the full (prompt + response) sequence is one-hot encoded with
+  /// OneHotEncodingReversed (most recent token at x=0), then a SINGLE forward
+  /// pass yields the scalar reward. Sequences longer than ContextLen are
+  /// truncated to the most recent ContextLen tokens (sliding window).
+  ///
+  /// The trained reward net plugs into GRPO (as a TNeuralGRPORewardEvent) or
+  /// Best-of-N reranking (as a TNNetSequenceScorer) to supply learned rewards.
+  ///
+  /// API
+  ///   Trainer := TNeuralRewardModelTrainer.Create(RewardNet);
+  ///   RewardNet.SetLearningRate(0.01, 0);
+  ///   Loss := Trainer.Step(Prompt, Chosen, Rejected);   // one SGD BT update
+  ///   r    := Trainer.Reward(Prompt, Response);          // forward-only score
+  /// After any Step/ComputeLoss the scalar diagnostics LastLoss / LastMargin
+  /// (= delta) / LastScale (= 1 - sigmoid(delta), the gradient magnitude) /
+  /// LastRewardChosen / LastRewardRejected are available. ComputeLoss() is
+  /// forward-only; AccumulateGradients() does forward+backward WITHOUT
+  /// ClearDeltas/UpdateWeights (the net must already be in batch-update mode).
+  // Coded by Claude (AI).
+  TNeuralRewardModelTrainer = class(TObject)
+    private
+      FRewardNet: TNNet;
+      FInput: TNNetVolume;
+      FPseudoTarget: TNNetVolume;
+      FLastLoss: TNeuralFloat;
+      FLastMargin: TNeuralFloat;
+      FLastScale: TNeuralFloat;
+      FLastRewardChosen, FLastRewardRejected: TNeuralFloat;
+      // Concatenates Prompt + Response (most recent ContextLen tokens) and
+      // one-hot encodes them into FInput.
+      procedure EncodeSequence(
+        const Prompt, Response: array of integer);
+      // Verifies the reward net ends in a single-scalar (Output.Size = 1) head.
+      procedure ValidateScalarHead();
+      // Backpropagates the scalar error signal dLoss/dr onto the reward net's
+      // single output neuron (one forward + backward). The net must be in
+      // batch-update mode; weights are NOT updated here.
+      procedure BackpropagateReward(
+        const Prompt, Response: array of integer; dLossdR: TNeuralFloat);
+    public
+      constructor Create(pRewardNet: TNNet);
+      destructor Destroy(); override;
+
+      // Scalar reward r(Prompt + Response) under the reward net (forward only).
+      function Reward(const Prompt, Response: array of integer): TNeuralFloat;
+      // Forward-only Bradley-Terry loss for one preference pair; refreshes all
+      // Last* diagnostics. Returns -ln sigmoid(r(chosen) - r(rejected)).
+      function ComputeLoss(
+        const Prompt, Chosen, Rejected: array of integer): TNeuralFloat;
+      // Forward + backward (accumulates deltas; requires the net to be in
+      // batch-update mode; does NOT ClearDeltas nor UpdateWeights). Returns
+      // the loss.
+      function AccumulateGradients(
+        const Prompt, Chosen, Rejected: array of integer): TNeuralFloat;
+      // One full Bradley-Terry SGD step on the pair (batch mode + ClearDeltas +
+      // backward on chosen and rejected + UpdateWeights). Returns the loss.
+      function Step(
+        const Prompt, Chosen, Rejected: array of integer): TNeuralFloat;
+
+      property RewardNet: TNNet read FRewardNet;
+      property LastLoss: TNeuralFloat read FLastLoss;
+      // The reward margin delta = r(chosen) - r(rejected) of the last loss
+      // evaluation; the pair is "correctly ranked" when this is positive.
+      property LastMargin: TNeuralFloat read FLastMargin;
+      // 1 - sigmoid(delta) = sigmoid(-delta): the magnitude of the per-reward
+      // gradient of the last loss evaluation.
+      property LastScale: TNeuralFloat read FLastScale;
+      property LastRewardChosen: TNeuralFloat read FLastRewardChosen;
+      property LastRewardRejected: TNeuralFloat read FLastRewardRejected;
+  end;
+
   // Reward callback for GRPO: maps a generated completion (token ids, WITHOUT
   // the prompt) to a scalar reward. Higher is better. May close over the
   // prompt if needed. Implemented as a method-of-object reference so it can
@@ -729,6 +821,121 @@ function TNeuralDPOTrainer.PolicyMargin(
 begin
   Result := SequenceLogProb(FPolicy, Prompt, Chosen)
           - SequenceLogProb(FPolicy, Prompt, Rejected);
+end;
+
+{ TNeuralRewardModelTrainer }
+
+constructor TNeuralRewardModelTrainer.Create(pRewardNet: TNNet);
+begin
+  inherited Create();
+  FRewardNet := pRewardNet;
+  FLastLoss := 0; FLastMargin := 0; FLastScale := 0.5;
+  FLastRewardChosen := 0; FLastRewardRejected := 0;
+  FInput := TNNetVolume.Create();
+  FPseudoTarget := TNNetVolume.Create();
+  ValidateScalarHead();
+end;
+
+destructor TNeuralRewardModelTrainer.Destroy();
+begin
+  FPseudoTarget.Free;
+  FInput.Free;
+  inherited Destroy();
+end;
+
+procedure TNeuralRewardModelTrainer.ValidateScalarHead();
+begin
+  if FRewardNet.GetLastLayer().Output.Size <> 1 then
+    raise Exception.Create(
+      'TNeuralRewardModelTrainer requires a scalar reward head ' +
+      '(last layer Output.Size = 1, e.g. TNNetFullConnectLinear(1)). Found ' +
+      'Output.Size = ' + IntToStr(FRewardNet.GetLastLayer().Output.Size) +
+      ' (' + FRewardNet.GetLastLayer().ClassName + ').');
+end;
+
+procedure TNeuralRewardModelTrainer.EncodeSequence(
+  const Prompt, Response: array of integer);
+var
+  Seq: TNeuralDPOTokenArray;
+  SeqLen, ContextLen, StartPos, I: integer;
+  FirstLayerOutput: TNNetVolume;
+begin
+  FirstLayerOutput := FRewardNet.GetFirstLayer().Output;
+  if FInput.Size <> FirstLayerOutput.Size then FInput.ReSize(FirstLayerOutput);
+  ContextLen := FirstLayerOutput.SizeX;
+  SeqLen := Length(Prompt) + Length(Response);
+  // Sliding window: keep only the most recent ContextLen tokens.
+  StartPos := Max(0, SeqLen - ContextLen);
+  SetLength(Seq, SeqLen - StartPos);
+  for I := StartPos to SeqLen - 1 do
+  begin
+    if I < Length(Prompt)
+    then Seq[I - StartPos] := Prompt[I]
+    else Seq[I - StartPos] := Response[I - Length(Prompt)];
+  end;
+  FInput.OneHotEncodingReversed(Seq);
+end;
+
+function TNeuralRewardModelTrainer.Reward(
+  const Prompt, Response: array of integer): TNeuralFloat;
+begin
+  EncodeSequence(Prompt, Response);
+  FRewardNet.Compute(FInput);
+  Result := FRewardNet.GetLastLayer().Output.FData[0];
+end;
+
+function TNeuralRewardModelTrainer.ComputeLoss(
+  const Prompt, Chosen, Rejected: array of integer): TNeuralFloat;
+begin
+  FLastRewardChosen   := Reward(Prompt, Chosen);
+  FLastRewardRejected := Reward(Prompt, Rejected);
+  FLastMargin := FLastRewardChosen - FLastRewardRejected;   // delta
+  FLastLoss := StableSoftplus(-FLastMargin);                // -ln sigmoid(delta)
+  FLastScale := StableSigmoid(-FLastMargin);                // 1 - sigmoid(delta)
+  Result := FLastLoss;
+end;
+
+procedure TNeuralRewardModelTrainer.BackpropagateReward(
+  const Prompt, Response: array of integer; dLossdR: TNeuralFloat);
+var
+  R: TNeuralFloat;
+begin
+  // TNNet.Backpropagate(pDesired) seeds the output error as (Output - pDesired)
+  // on the single scalar head. To inject the analytic gradient dLoss/dr we pass
+  // pDesired[0] = r - dLossdR so that FOutputError[0] = r - (r - dLossdR) =
+  // dLossdR (the exact reward gradient that the head then backpropagates).
+  EncodeSequence(Prompt, Response);
+  FRewardNet.Compute(FInput);
+  R := FRewardNet.GetLastLayer().Output.FData[0];
+  if FPseudoTarget.Size <> 1 then FPseudoTarget.ReSize(1, 1, 1);
+  FPseudoTarget.FData[0] := R - dLossdR;
+  FRewardNet.Backpropagate(FPseudoTarget);
+end;
+
+function TNeuralRewardModelTrainer.AccumulateGradients(
+  const Prompt, Chosen, Rejected: array of integer): TNeuralFloat;
+var
+  S: TNeuralFloat;
+begin
+  Result := ComputeLoss(Prompt, Chosen, Rejected);
+  // s = 1 - sigmoid(delta) = sigmoid(-delta). Bradley-Terry gradients:
+  //   dLoss/dr(chosen)   = -s   (push the chosen reward up)
+  //   dLoss/dr(rejected) = +s   (push the rejected reward down).
+  S := FLastScale;
+  BackpropagateReward(Prompt, Chosen,   -S);
+  BackpropagateReward(Prompt, Rejected, +S);
+end;
+
+function TNeuralRewardModelTrainer.Step(
+  const Prompt, Chosen, Rejected: array of integer): TNeuralFloat;
+begin
+  // Batch mode: the two backward passes accumulate deltas against the SAME
+  // weights; per-sample mode would update weights inside Backpropagate.
+  FRewardNet.SetBatchUpdate(true);
+  FRewardNet.ClearDeltas();
+  Result := AccumulateGradients(Prompt, Chosen, Rejected);
+  FRewardNet.UpdateWeights();
+  FRewardNet.SetBatchUpdate(false);
 end;
 
 { TNeuralGRPOTrainer }

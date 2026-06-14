@@ -527,8 +527,13 @@ rather than acted on.
       loss-formula deltas LANDED on TNeuralDPOTrainer as a TNeuralPreferenceLossMode
       (plmSimPO/plmORPO are reference-free via CreateReferenceFree; plmKTO uses a
       reference, paired-batch simplification documented in the unit header), tests
-      in tests/TestNeuralPreference.pas. REMAINING: a Bradley-Terry pairwise
-      reward-model trainer to feed GRPO real (learned) rewards; and a full
+      in tests/TestNeuralPreference.pas. Bradley-Terry pairwise reward-model
+      trainer DONE: TNeuralRewardModelTrainer in neural/neuraldpo.pas learns a
+      scalar reward head r(x)=RewardNet(prompt+response) from (chosen,rejected)
+      pairs with loss=-ln sigmoid(r_w-r_l) and the sigmoid-margin gradient
+      (dL/dr_w=-(1-sigmoid(delta)), dL/dr_l=+(...)) via the DPO batch-update +
+      direct-output-error plumbing; plugs into GRPO/Best-of-N as a learned
+      reward; tests in tests/TestNeuralRewardModel.pas. REMAINING: a full
       unpaired-batch KTO variant (current KTO uses the paired pair-mean KL point).
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (the rebuild-same-
