@@ -98,12 +98,6 @@ rather than acted on.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
-  - [X] F16/Q8_0 gemma2 export-drift test (mirror TestGGUFLlamaQ8AndF16ImportDrift):
-        TestGGUFGemma2Q8AndF16ImportDrift exports the gemma2 fixture to GGUF in
-        F16 (pico tiny_gemma2) and Q8_0 (new tiny_gemma2_q8, width 32 so rows
-        clear the Q8_0 32-block guard) then re-imports via BuildFromGGUF and
-        bounds the relative logit drift: Q8_0 0.0272 in (1e-3,1.5e-1), F16
-        0.0018 < 3e-3. tools/gemma2_q8_tiny_fixture.py generates the Q8 fixture.
   - [ ] cross-tool llama.cpp gemma2 GGUF parity (DEFERRED: needs the llama.cpp
         shared lib / CLI — network + native build — unavailable here; the Llama
         drift test does not shell out either).
@@ -619,40 +613,9 @@ rather than acted on.
       — the projection head is always f32 while the BERT backbone already
       supports int8.
 
-- [X] CTC (Connectionist Temporal Classification) loss head + decode — LANDED.
-      `TNNetCTCLoss` (TNNetIdentity loss head, after a `TNNetLogSoftMax`): forward
-      identity passthrough, backward runs the log-space forward-backward over the
-      blank-interleaved label lattice (stable log-sum-exp) and writes the
-      `-gamma` occupancy gradient (composed with LogSoftMax -> textbook
-      `softmax - gamma` logit gradient). Blank index in `FStruct[0]` (default -1 =
-      last vocab); variable-length targets encoded into the same-shape target
-      volume via class method `EncodeTarget`/`DecodeTarget`; the scalar loss and
-      grad are exposed by class method `ForwardBackwardLogLoss`. Registered in
-      BOTH dispatch tables (round-trip preserves blank index). `DecodeCTCGreedy`
-      (argmax-per-frame -> collapse repeats -> drop blank) and
-      `DecodeCTCBeamSearch` (prefix beam, Graves/Hannun, summing alignment mass)
-      added in neuraldecode.pas. Tests in TestNeuralNumerical.pas:
-      TestCTCLossGradient (central-difference of the CTC loss on an 8x4 logit grid
-      vs an independent float64 forward-backward oracle, tol 2e-3),
-      TestCTCDecodeGreedyRoundTrip (clean argmax path decodes to the planted
-      target), TestCTCLossForwardPassthrough, TestCTCLossLoadFromString,
-      TestCTCDecodeBeamSearch. Original note: the loss zoo
-      (NLLLoss/FocalLoss/Dice/...) had no alignment-free
-      sequence loss, and there was no CTC decode. Followed the
-      loss-layer pattern (Identity passthrough forward + backward rewrite over the
-      loss-layer pattern (Identity passthrough forward + backward rewrite over the
-      forward-backward alpha/beta lattice in log-space, with the standard blank
-      label and label-collapsing rule) plus a `DecodeCTCGreedy` (argmax-per-frame
-      then collapse-repeats/drop-blank) and an optional `DecodeCTCBeamSearch`
-      (prefix-beam) in neuraldecode.pas. Gate the backward with a numerical-
-      gradient test on a tiny (T,vocab) logit grid vs a float64 reference
-      forward-backward, and an alignment round-trip (a clean argmax path decodes to
-      the planted target). Reusable well beyond speech: OCR/handwriting CTC heads.
-      This is the prerequisite for the Wav2Vec2/HuBERT importer below.
 - [ ] Wav2Vec2 / HuBERT CTC ASR importer (`BuildWav2Vec2FromSafeTensors[Ex]`,
-      model_type "wav2vec2"/"hubert") — NOW UNBLOCKED: the CTC loss/decode
-      prerequisite landed (TNNetCTCLoss + DecodeCTCGreedy/BeamSearch, commit
-      f2fb723); reuse DecodeCTCGreedy for the CTC head. — the SECOND speech import family and the
+      model_type "wav2vec2"/"hubert") — reuse the landed DecodeCTCGreedy for the
+      CTC head. The SECOND speech import family and the
       first SELF-SUPERVISED-encoder speech model, architecturally distinct from
       the landed Whisper seq2seq (Whisper is a mel-spectrogram encoder-decoder;
       Wav2Vec2/HuBERT is a raw-waveform CONV FEATURE EXTRACTOR -> transformer
@@ -663,7 +626,7 @@ rather than acted on.
       (a grouped conv1d added to the encoder input, NOT sinusoidal/RoPE), (c)
       feature projection + the standard pre/post-norm transformer encoder (reuse
       the BERT encoder machinery — bidirectional, GELU FFN), (d) the CTC linear
-      head decoded with `DecodeCTCGreedy` (depends on the CTC task above).
+      head decoded with the landed `DecodeCTCGreedy`.
       Tokenizer is a tiny char/phoneme vocab.json (no SentencePiece). Deliverables:
       pico parity fixture via make_pico_*_fixture.py asserting encoder hidden
       states AND CTC logits < 1e-4 vs HF float64 Wav2Vec2ForCTC, and an
@@ -671,28 +634,6 @@ rather than acted on.
       the WhisperTranscribe audio-loading path; edit examples/README.md not the
       main README). Opens HuBERT (identical CTC head, same importer with a flag)
       and later wav2vec2 pretraining.
-- [X] Sampler zoo expansion (only greedy/top-k/top-p/min-p/weighted-top-k exist):
-      add the genuinely-distinct truncation algorithms that the existing samplers
-      do NOT cover — (a) `TNNetSamplerMirostat` (Mirostat v1 AND v2, the
-      perplexity/surprise feedback controller that adapts the truncation each step
-      to hold output entropy at a target `tau`, carrying a running `mu` state
-      across the generation — a STATEFUL sampler, unlike the stateless top-k/p),
-      and (b) locally-typical sampling (keep the tokens whose surprise is closest
-      to the distribution's conditional entropy, i.e. truncate by |−log p − H|
-      rather than by rank or cumulative mass). Both are small TNNetSamplerBase
-      subclasses; wire them through TGenerationConfig and the streamed decode path.
-      Test: on a pinned logit sequence each selects the documented token set, and
-      Mirostat's `mu` converges toward `tau` on a synthetic high-entropy stream.
-- [X] LLM output watermarking (Kirchenbauer et al. 2023 green-list scheme) — a
-      defensive/provenance feature with no current analogue: a
-      `TNNetWatermarkLogitsProcessor` in the logits-processor chain that, seeded by
-      a hash of the previous token, partitions the vocab into a pseudo-random
-      "green" list and adds a bias `delta` to green logits before sampling, plus a
-      standalone `DetectWatermark` statistical test (z-score of the green-token
-      fraction over a candidate text given the same key). Test: watermarked
-      generations score above the detection threshold while un-watermarked text
-      does not, and the green-list partition is reproducible from the key+prefix.
-      Fits the landed TNNetLogitsProcessorChain / prob-domain convention exactly.
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
@@ -706,18 +647,6 @@ rather than acted on.
       plain greedy on the target while issuing fewer target forwards; an
       examples/TreeSpeculativeDecoding demo reporting the accepted-tokens/forward
       speedup vs the linear self-speculative baseline.
-- [X] examples/RAG end-to-end retrieval-augmented generation demo — the obvious
-      missing NLP application that ties together already-landed pieces with no new
-      core code: chunk a small text corpus, embed the chunks with the landed
-      sentence-embedding path (SemanticSearch/EmbeddingSearch + the embedding
-      pooling/STS reports), retrieve the top-k chunks for a query by cosine
-      similarity, splice them into a prompt template ("Context:\n{chunks}\n\n
-      Question: {q}\nAnswer:"), and generate a grounded answer with an imported
-      decoder via the streaming decode + ApplyChatTemplate infra. Demonstrate the
-      headline RAG property (a question the bare model gets wrong is answered
-      correctly once the relevant chunk is retrieved). CPU/ulimit-bounded with a
-      tiny imported model; edit examples/README.md (NOT the main README). Pairs
-      naturally with the open MinHash dedup + streaming-corpus tasks.
 
 ## Layer follow-ups that fix real limitations
 
