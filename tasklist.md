@@ -265,10 +265,11 @@ rather than acted on.
       int8 weight-only storage instead of dequantize-then-requantize (the
       k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
       neural/neuralgguf.pas).
-- [ ] Quantized inference follow-up: upstream fix for TVolume.GetMaxAbs
-      (seeds the running max with the SIGNED first element, so a negative
-      max-magnitude element 0 is missed; csErrorOverflowBackpropProtection
-      and friends consume it — audit callers before fixing).
+- [X] Quantized inference follow-up: TVolume.GetMaxAbs signed-seed fix LANDED
+      (commit a0d4d40): now seeds with abs(FData[0]) so a negative
+      largest-magnitude element 0 is not missed. Caller audit confirmed all
+      consumers (ForceMaxAbs/NormalizeMax/int8 scale/csErrorOverflowBackpropProtection)
+      treat the result as a magnitude. Test TestVolumeMaxAbsNegativeFirst.
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
       (b) DONE — raw SentencePiece .model protobuf path landed
       (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
@@ -431,10 +432,12 @@ rather than acted on.
       (bit-exact)): add a layer->HF-name + transpose inverse map for the
       REMAINING architectures — only the ENCODER-DECODER importers (T5/Marian,
       each its own two-net map) now remain on this entry.
-- [ ] GGUF writer follow-up: write Q8_0 STRAIGHT from the int8 weight-only
-      storage ([[int8-quantized-inference]]) instead of quantizing-on-write
-      from F32 (avoids the dequantize-then-requantize round trip when the
-      source layers already hold int8 blocks).
+- [X] GGUF writer follow-up: write Q8_0 STRAIGHT from int8 weight-only storage
+      LANDED (commit 5f6fd0b): TNNetGGUFWriter.AddTensorFlatInt8 +
+      TNNetLayerConcatedWeights.GetInt8QuantData build Q8_0 from int8 codes +
+      per-row scales with NO F32 matrix materialization. Per-row scale cancels in
+      the quants (survives only in the f16 d), so output is bit-identical to the
+      F32->Q8_0 path. Test TestGGUFWriterQ8FromInt8.
 - [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
       (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
       llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
