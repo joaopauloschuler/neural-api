@@ -214,16 +214,24 @@ rather than acted on.
       demo that captions a small image on CPU. First image-in/text-out
       model in the repo; opens the door to Qwen-VL/PaliGemma later.
   Suggested incremental breakdown (each step independently buildable + committable):
-  - [ ] Step 1 — select-hidden-layer / skip-pooling mode on BuildClipVisionTower
+  - [X] Step 1 — select-hidden-layer / skip-pooling mode on BuildClipVisionTower
         so it returns the penultimate-layer PATCH tokens WITHOUT the CLS row and
-        WITHOUT the projection head (LLaVA's vision feature). Test: assert the
-        returned tensor shape == (num_patches, hidden) and that it matches the
-        HF vision_tower hidden_states[-2][:,1:] on the existing CLIP pico fixture.
-  - [ ] Step 2 — image preprocessing helper: load preprocessor_config.json,
+        WITHOUT the projection head (LLaVA's vision feature). LANDED: new
+        pVisionFeatures flag builds NumLayers-1 encoder blocks, crops row 0,
+        skips post_layernorm + projection; output (num_patches, 1, hidden).
+        clip_tiny_fixture.py now dumps vision_features (HF
+        hidden_states[-2][:,1:]); TestClipVisionFeatures asserts shape + value
+        parity (<1e-4) on the existing random pico CLIP checkpoint.
+  - [X] Step 2 — image preprocessing helper: load preprocessor_config.json,
         resize/center-crop to the processor size, normalize by image_mean/std
-        into a TNNetVolume. Test: byte-parity of the normalized RGB tensor vs the
-        HF CLIPImageProcessor on a tiny pinned image. (Also unblocks the
-        ClipZeroShot real-image follow-up.)
+        into a TNNetVolume. LANDED: TClipImageProcessorConfig +
+        ReadClipImageProcessorConfig (size/crop as int or object, mean/std,
+        do_* flags) + ClipPreprocessImage (resize shortest-edge -> center-crop
+        -> rescale 1/255 -> per-channel normalize). Resize is bilinear (HF
+        default bicubic; rescale/normalize is byte-exact at the working size).
+        TestClipImagePreprocess: byte parity (<1e-4) vs HF CLIPImageProcessor on
+        a same-size image (rescale/normalize) and a 2x image (exact integer
+        center-crop). Also unblocks the ClipZeroShot real-image follow-up.
   - [ ] Step 3 — projector import + prompt-assembly helper: load the 2-layer MLP
         (gelu) projector, run the vision tower once, and concatenate
         [text-embeds | projected image tokens | text-embeds] as a TNNetInput-fed
