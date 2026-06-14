@@ -121,29 +121,6 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] Llama 4 (text) importer — LANDED. `BuildLlama4FromSafeTensors[Ex]` +
-      `ReadLlama4ConfigFromJSONFile` + BuildFromPretrained dispatch in
-      neural/neuralpretrained.pas, model_type `llama4`/`llama4_text`. New layer
-      `TNNetLlama4AttnTemperature` (NoPE per-position query temperature). New
-      TLlamaConfig deltas: NoRopeLayers (iRoPE per-layer rope on/off),
-      Llama4QKL2Norm (L2 QK-norm after RoPE on RoPE layers, gain=1 TokenRMSNorm),
-      AttnTempTuning/AttnFloorScale/AttnScale, AttnChunkSize, MoESigmoidGate
-      (sigmoid router, no renorm), MoEScaleInput (gate scales expert INPUT, since
-      SwiGLU is nonlinear: experts(g*x) != g*experts(x)), MoEGateUpTransposed
-      (Llama-4 fused 3-D slab gate_up_proj [E,H,2I] / down_proj [E,I,H] +
-      feed_forward.router, sliced by new LoadLlama4MoEExperts), IntermediateSizeMLP
-      (wider dense width). Shared expert reuses the granite shared-expert layer
-      wiring with Llama-4's separate 2-D shared_expert.{gate,up,down}_proj load.
-      RoPE layers use InterleavedRotary (no rotate_half permute). Verified vs HF
-      transformers 5.11 float64 oracle: TestLlama4{Config,Logit,Moe}LogitParity
-      (max |logit diff| 1.84e-6, gate 1e-4) on the hand-built pico fixture
-      tools/llama4_tiny_fixture.py (interleaves RoPE/NoPE AND dense/MoE; pins
-      qk-norm/temperature/shared-expert non-vacuously). OPEN FOLLOW-UPS: the NoPE
-      chunked-attention BOUNDARY is not modeled (the fixture keeps seq_len <
-      attention_chunk_size where chunked == full causal — a real block-diagonal
-      chunk mask is a TNNetScaledDotProductAttention enhancement); multimodal
-      `llama4` checkpoints with a `language_model.model.` prefix / vision tower;
-      a real-checkpoint slicer for Scout/Maverick.
 - [ ] InternLM2 / InternLM2.5 importer follow-up (`BuildInternLM2FromSafeTensors[Ex]`,
       model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — LANDED.
       A plain Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONLY
@@ -532,22 +509,6 @@ rather than acted on.
       serialized string. Assert the twin's logits match the source on a pinned
       input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
       template).
-- [X] KV-cache quantization (int8 cache with per-row scales): LANDED. Opt-in
-      (OFF by default => the FP32 cache is bit-exact). TNNetScaledDotProduct
-      Attention.EnableInt8KV/DisableInt8KV switch the incremental-decode KV cache
-      to int8 storage: each appended K/V row is quantized with a per-row (per-
-      token-block) scale = maxabs/127, round-to-nearest, clamp [-127,127], and
-      dequantized into a scratch row on read in the attention math (codes +
-      one scale per position => ~1/4 the FP32 K/V memory). Surfaced from
-      TNNetStreamingDecoder.EnableInt8KVCache/DisableInt8KVCache (applies to
-      every collected attention layer). Eviction-shift handles int8; Capture/
-      RestoreCacheState reject int8 (snapshot is FP32 only). Test
-      TestKVCacheInt8DriftWithinTolerance streams a pinned prompt through a
-      width-1 twin twice (FP32 vs int8): measured max logit drift ~8.4e-5,
-      committed tolerance 5e-2, argmax stable at every position. (Used a small
-      deterministic BuildTinyCausalLM twin; no pico-Llama fixture needed for the
-      bound.) Follow-ups: per-group (sub-row) scales for very long d_k; int8
-      Capture/Restore snapshot support.
 - [ ] Preference-optimization follow-ups on the landed DPO/GRPO trainers
       (TNeuralGRPOTrainer in neural/neuraldpo.pas LANDED: group-relative
       advantages + PG + DeepSeek-k3 per-token KL reusing the DPO softmax-backward
@@ -608,60 +569,6 @@ rather than acted on.
       substantially. Note: the WhisperTranscribe example needs ~4 GB
       VIRTUAL memory (ulimit -v 4000000; the 3 GB test cap aborts during
       build).
-- [X] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
-      TNNet and RE-ENCODES the whole prefix every step — the streaming-
-      decode docs explicitly note only greedy/sampled streamed generation
-      is exact today. Add a fork/clone primitive to TNNetStreamingDecoder
-      (copy, or copy-on-write, of per-layer cache state per surviving
-      hypothesis) and a cache-backed DecodeBeamSearch variant on top.
-      Turns beam from O(L^2) per hypothesis into O(L); the fork primitive
-      is also what best-of-N and the speculative-decoding verify step
-      want. Assert ranked beam output is identical to the re-encoding
-      implementation.
-      LANDED: DecodeBeamSearchCachedAll / DecodeBeamSearchCached on top of
-      TNNetStreamingDecoder, reusing the already-landed Snapshot/
-      RestoreSnapshot fork (one snapshot per surviving hypothesis, cloned
-      per beam via Restore-then-Snapshot). Per step: Restore each beam's
-      cache, StepForward its last token, read HiddenState/Output logits,
-      expand, prune to BeamWidth, snapshot survivors. Regression tests
-      assert BIT-IDENTICAL ranked beams (text + sum-log-prob + score +
-      finished flag, best-first) vs the re-encoding DecodeBeamSearchAll:
-      TestBeamSearchCachedMatchesReEncodeBigram (exact, tol 0.0, against
-      DecodeBeamSearchAll on a rigged bigram pair) and
-      TestBeamSearchCachedMatchesReEncodeCausalReference (RoPE causal KV-
-      cache topology vs a zero-pad re-encode beam reference, tol 1e-5),
-      plus TestBeamSearchCachedRejectsWideSession.
-- [X] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
-      easy tokens from an intermediate layer through the LM head, fall
-      back to full depth when confidence is low — the model becomes its
-      OWN draft model, no second checkpoint. Distinct from the landed
-      examples/SelfSpeculativeDecoding, which drafts from MTP heads, not an
-      intermediate-layer exit. The repo is unusually well positioned: the
-      LogitLens/TunedLens frozen-body splice idiom already implements "read
-      logits at layer k", and examples/SpeculativeDecoding implements the
-      accept/verify rule.
-      LANDED (v1, a3): DecodeEarlyExitSelfSpeculative (neuraldecode.pas) +
-      TNNetEarlyExitStats. STATIC exit layer + confidence threshold: each
-      step does the full forward (verifier), then the frozen-body LogitLens
-      splice reads p_exit at the intermediate ExitLayer through the SAME LM
-      head (snapshot the exit activation, CopyNoChecks into the head-input
-      slot, recompute only the head sub-stack — the exact DecodeDoLa idiom);
-      drafts argmax(p_exit) when max p_exit >= Confidence (LayerSkip/CALM
-      static gate) and ACCEPTS iff it equals the full-depth argmax (exact-
-      greedy verify, like examples/SpeculativeDecoding). The emitted token is
-      ALWAYS the full-depth argmax -> output BIT-IDENTICAL to plain greedy;
-      the gate only moves the accept/reject counters. Reusable lib fn +
-      examples/EarlyExitSelfSpeculative (trains a tiny char LM, asserts
-      self-spec == greedy bit-for-bit with a Halt(1) gate, reports accept/
-      reject counts, acceptance rate, and tokens/sec for both paths).
-      Regression tests TestEarlyExitMatchesGreedyBitIdentical /
-      ...HighConfidenceMatchesGreedy / ...AcceptCountsAreConsistent in
-      tests/TestNeuralDecode.pas (full suite 1954 green).
-      OPEN FOLLOW-UP: per-token-adaptive exit (per-step exit-layer choice via
-      an early-exit classifier) + the CACHED tail-skip that turns accepted
-      drafts into actually-saved tail-layer compute (v1 still does the full
-      forward plus a head-only splice, so it does not yet beat full depth on
-      wall-clock; the acceptance rate is the speed signal).
 - [ ] Streaming corpus loader with shuffle buffer: the landed packing
       pipeline materializes the whole token stream in RAM (neuraldatasets
       builds one concatenated Stream array). Read large text/token files
