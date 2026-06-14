@@ -378,24 +378,6 @@ rather than acted on.
       thin example head, NOT a new leaf class). Isola et al. 2017; foundational
       conditional-generation recipe distinct from the unconditional VisualGAN and the
       diffusion examples. Edit examples/README.md.
-- [X] VQGAN / pretrained discrete image-tokenizer importer LANDED
-      (BuildVqModelFromSafeTensors + TNNetVqModel.EncodeImageToTokens /
-      DecodeTokensToImage; reuses the VAE encoder/decoder helpers, plain-Pascal
-      argmin-L2 codebook lookup + gather, no new TNNet* layer; pico fixture
-      tools/vqmodel_tiny_fixture.py + TestVqModel{Encode,Decode,RoundTrip}Parity
-      exact-id encode / <1e-4 decode; examples/VQModelImport demo)
-      (BuildVqModelFromSafeTensors, diffusers VQModel / taming-transformers VQGAN) —
-      the repo TRAINS a VQ-VAE (examples/VQVAE) but cannot IMPORT a pretrained
-      discrete image tokenizer, the encoder used by most autoregressive / masked
-      image generators (MaskGIT, Parti, LlamaGen) to turn an image into a grid of
-      codebook token IDs and back. Reuses the landed VAE encoder/decoder ResNet+attn
-      blocks (BuildVaeEncoder/Decoder are the continuous-KL siblings); the genuinely
-      new pieces are the nearest-neighbor codebook lookup (image -> token-id grid via
-      argmin L2 to the embedding table) and the inverse (token-ids -> embeddings ->
-      decoder -> image). Exposes EncodeImageToTokens / DecodeTokensToImage so an
-      imported autoregressive image LM (stock Llama/GPT path) could generate image
-      tokens end-to-end. Pico parity vs a numpy float64 oracle on the encode (token
-      ids) + decode (pixels); demo round-trips a tiny image through the codebook.
 - [ ] DETR object-detection importer (BuildDetrFromSafeTensors,
       facebook/detr-resnet-50) — the FIRST object-detection importer, a wholly new
       CV vertical (bounding boxes + class per box, not a single label / dense map).
@@ -469,15 +451,6 @@ rather than acted on.
       rectangular-mask generator and the masked-region-weighted loss; the network is
       stock conv encoder-decoder + skip connections. CPU-friendly on CIFAR-10 /
       Tiny ImageNet; writes before/after triplets. Edit examples/README.md.
-- [X] Image colorization example (examples/Colorization) — a self-supervised
-      generative-vision gap: predict the chroma (CIELAB a*b* channels) of an image
-      from its luminance (L) channel, so any grayscale photo can be auto-colorized.
-      A conv encoder-decoder (or the landed U-Net) trained with per-pixel regression
-      on the a*b* channels (or the classic quantized-bin classification head for
-      more vivid output). New code is the RGB<->Lab conversion helper in
-      neuralvolume / neuraldatasets and the L-in / ab-out data pipeline; the network
-      reuses existing conv layers. CPU-friendly on CIFAR-10 / Tiny ImageNet; writes
-      grayscale-input vs colorized-output pairs. Edit examples/README.md.
 - [ ] VideoMAE / TimeSformer spatiotemporal-transformer importer
       (BuildVideoMAEFromSafeTensors, e.g. MCG-NJU/videomae-base-finetuned-kinetics)
       — the FIRST video-classification importer (a clip of T frames -> an action
