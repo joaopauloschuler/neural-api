@@ -2319,6 +2319,13 @@ begin
     // It keys on the global step counter (see neuralscheduler.pas); Epoch is
     // passed for interface compatibility. iEpochCount already reflects any
     // cyclical wrap applied above.
+    //
+    // Plateau hook: CheckLearningRate runs at the START of each epoch, so
+    // FValidationError already holds the previous epoch's validation metric.
+    // Feed it to the scheduler so metric-driven schedulers
+    // (TReduceLROnPlateau) can decide whether to reduce the LR. Stateless
+    // schedulers ignore this (base ReportMetric is a no-op).
+    FScheduler.ReportMetric(FValidationError);
     fNewLearningRate := FScheduler.NextLR(iEpochCount, FCurrentStep);
   end
   else if Assigned(FCustomLearningRateScheduleFn) then

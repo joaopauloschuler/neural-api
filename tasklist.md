@@ -445,11 +445,21 @@ rather than acted on.
       (a hand-rolled Muon gradient-surgery demo already exists in
       examples/MuonOptimizer; the optimizer-class port is what's missing).
       Each is a small TNeuralOptimizer subclass in neuralfit.pas.
-- [ ] ReduceLROnPlateau + OneCycle / cyclical LR schedulers
+- [X] ReduceLROnPlateau + OneCycle / cyclical LR schedulers
       (neural/neuralscheduler.pas has Step/CosineAnnealing/WarmupCosine/Poly):
       plateau-driven decay needs a hook feeding the validation metric into
       NextLR — that wiring is the interesting part; OneCycle/CyclicLR are
       straightforward NextLR formulas.
+      Added TReduceLROnPlateau (mode min/max, factor/patience/threshold rel|abs/
+      cooldown/min_lr, torch state best/num_bad_epochs/cooldown_counter),
+      TOneCycleLR (cos anneal), TCyclicLR (triangular + triangular2). Wiring:
+      base TNeuralLRScheduler.ReportMetric(metric) no-op hook overridden by the
+      plateau scheduler; TNeuralFitBase.CheckLearningRate feeds FValidationError
+      (previous epoch's, since CheckLearningRate runs at epoch start) before
+      NextLR. Parity vs torch within 1e-5.
+      - Not ported: OneCycle anneal_strategy='linear' (only 'cos'); CyclicLR
+        mode='exp_range'; OneCycle three_phase=True. CyclicLR momentum cycling
+        is left to the optimizer (LR-only here).
 - [ ] Trainer callbacks API (transformers TrainerCallback port): a
       TNeuralFitCallback with OnEpochBegin/End, OnStepEnd, OnEvaluate hooks
       registered on TNeuralFitBase. Early stopping, custom logging, and the
