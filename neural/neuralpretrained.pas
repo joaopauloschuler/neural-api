@@ -4768,6 +4768,83 @@ function ReadClipImageProcessorConfig(
 procedure ClipPreprocessImage(Src, Dst: TNNetVolume;
   const Config: TClipImageProcessorConfig);
 
+// ===========================================================================
+// ViT IMAGE-CLASSIFICATION IMPORT (model_type "vit": google/vit-base-
+// patch16-224 and timm/HF ViTForImageClassification siblings) - a STANDALONE
+// image classifier. It REUSES the CLIP pre-LN ViT encoder block
+// (TClipTowerConfig / AddClipEncoderBlock) - structurally identical - but the
+// embeddings, head and tensor key names are ViT's own (BERT-style):
+//   (a) a learnable CLS token (HF embeddings.cls_token) PREPENDED to the
+//       patch sequence; like the CLIP path it is folded into row 0 of the
+//       learned position table (the prepended slot's pre-position content is
+//       identically zero, so the fold is exact);
+//   (b) a BIASED patch_embeddings.projection Conv2d (CLIP's is bias-free),
+//       learned absolute positions over num_patches+1 rows;
+//   (c) exact erf "gelu" activation (HF hidden_act default), built from the
+//       BERT side-branch Phi composition (AddClipHiddenAct chaGeluExact);
+//   (d) a final layernorm then a classifier nn.Linear reading the CLS row 0
+//       -> (1,1,num_labels) class logits;
+//   (e) ViT tensor key names: embeddings.cls_token,
+//       embeddings.patch_embeddings.projection.{weight,bias},
+//       embeddings.position_embeddings, encoder.layer.N.{attention.attention.
+//       {query,key,value}, attention.output.dense, intermediate.dense,
+//       output.dense, layernorm_before, layernorm_after}, layernorm.{weight,
+//       bias} (final), classifier.{weight,bias}.
+// Image preprocessing reuses ReadClipImageProcessorConfig / ClipPreprocess
+// Image (ViT's preprocessor_config.json carries its own image_mean/image_std
+// - 0.5/0.5/0.5 for google/vit-base - read straight from the config).
+// ---------------------------------------------------------------------------
+type
+  TViTImageClassificationConfig = record
+    HiddenSize: integer;        // hidden_size
+    IntermediateSize: integer;  // intermediate_size
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-12 in published ViTs)
+    HiddenAct: TClipHiddenAct;  // hidden_act (gelu = exact erf by default)
+    ImageSize: integer;         // image_size (224)
+    PatchSize: integer;         // patch_size (16)
+    NumChannels: integer;       // num_channels (3)
+    NumLabels: integer;         // classifier out width (id2label / num_labels)
+    ModelType: string;          // 'vit'
+  end;
+
+// Reads a HF ViT config.json (model_type "vit"). Required: hidden_size,
+// intermediate_size, num_hidden_layers, num_attention_heads, image_size,
+// patch_size. num_labels is taken from "num_labels", else len(id2label),
+// else len(label2id), else 1000 (ImageNet-1k default). Defaults follow
+// ViTConfig: hidden_act "gelu" (exact erf), layer_norm_eps 1e-12,
+// num_channels 3. hidden_act other than gelu / quick_gelu / gelu_new /
+// gelu_pytorch_tanh is rejected.
+function ReadViTConfigFromJSONFile(
+  const FileName: string): TViTImageClassificationConfig;
+
+function ViTConfigToString(
+  const Config: TViTImageClassificationConfig): string;
+
+// Builds the ViT image-classification net described by Config and loads every
+// weight from Reader (the caller owns Reader). The net takes an
+// (ImageSize, ImageSize, NumChannels) normalized RGB volume and outputs
+// (1, 1, NumLabels) class logits (the CLS-row classifier). pInferenceOnly
+// frees training volumes during construction.
+function BuildViTForImageClassification(Reader: TNNetSafeTensorsReader;
+  const Config: TViTImageClassificationConfig;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Builds + loads the ViT classifier from the checkpoint at FileName
+// (.safetensors / sharded index / pytorch_model.bin via CreatePretrained
+// TensorReader). Config is supplied by the caller (Ex) or read from
+// ConfigFileName ('' = "config.json" beside FileName) and returned. The net
+// is owned by the caller. Output: (1,1,num_labels) class logits.
+function BuildViTFromSafeTensorsEx(const FileName: string;
+  const Config: TViTImageClassificationConfig;
+  pInferenceOnly: boolean = false): TNNet;
+
+function BuildViTFromSafeTensors(const FileName: string;
+  out Config: TViTImageClassificationConfig;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -30374,6 +30451,336 @@ begin
   Config := ReadSigLIPConfigFromJSONFile(ConfigPath);
   BuildSigLIPFromSafeTensorsWithConfig(FileName, Config, TextNet, VisionNet,
     TextSeqLen, pInferenceOnly);
+end;
+
+// ===========================================================================
+// ViT IMAGE-CLASSIFICATION IMPORT (model_type "vit")
+// ===========================================================================
+
+function ReadViTConfigFromJSONFile(
+  const FileName: string): TViTImageClassificationConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+  LabelObj: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('ViT import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('ViT import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('ViT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('ViT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('ViT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'vit');
+    if ModelType <> 'vit' then
+      ImportError('ViT import: config model_type is "' + ModelType +
+        '" - only "vit" is supported here.');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.ImageSize := RequiredInt('image_size');
+    Result.PatchSize := RequiredInt('patch_size');
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 0.000000000001);
+    // hidden_act default is exact erf "gelu" in ViTConfig.
+    Result.HiddenAct := ClipHiddenActFromString(Obj.Get('hidden_act', 'gelu'));
+    // num_labels: explicit field, else len(id2label), else len(label2id),
+    // else the ImageNet-1k default of 1000.
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('label2id');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ViTConfigToString(
+  const Config: TViTImageClassificationConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'vit'
+  else Result := Config.ModelType;
+  Result := Result + ' config: d=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', ffn=' + IntToStr(Config.IntermediateSize) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', act=' + ClipHiddenActToString(Config.HiddenAct) +
+    ', num_labels=' + IntToStr(Config.NumLabels);
+end;
+
+// Loads one ViT encoder block. The block ARCHITECTURE is AddClipEncoderBlock
+// (pre-LN, structurally identical); only the tensor names differ from CLIP's
+// self_attn/mlp/layer_norm scheme. TWO HF key conventions are accepted:
+//   - LEGACY (transformers <5, the published google/vit-base-patch16-224 and
+//     timm checkpoints): encoder.layer.N.{attention.attention.{query,key,
+//     value}, attention.output.dense, intermediate.dense, output.dense};
+//   - REFACTORED (transformers >=5): layers.N.{attention.{q_proj,k_proj,
+//     v_proj,o_proj}, mlp.fc1, mlp.fc2}.
+// Both load separate biased nn.Linear q/k/v into the fused Q|K|V slab and the
+// biased out/fc1/fc2 + the two biased LayerNorms (layernorm_before = pre-attn,
+// layernorm_after = pre-MLP). The scheme is picked per-checkpoint by probing
+// the query weight key. BlockPrefix is the prefix THROUGH the per-layer index
+// ('vit.encoder.layer.N.' or 'vit.layers.N.').
+procedure LoadViTEncoderBlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TClipBlockLayers; const BlockPrefix: string;
+  const Tower: TClipTowerConfig);
+var
+  d: integer;
+  QName, KName, VName, ONm, F1Name, F2Name: string;
+begin
+  d := Tower.HiddenSize;
+  if Reader.HasTensor(BlockPrefix + 'attention.attention.query.weight') then
+  begin
+    // Legacy BERT-style names.
+    QName := BlockPrefix + 'attention.attention.query';
+    KName := BlockPrefix + 'attention.attention.key';
+    VName := BlockPrefix + 'attention.attention.value';
+    ONm := BlockPrefix + 'attention.output.dense';
+    F1Name := BlockPrefix + 'intermediate.dense';
+    F2Name := BlockPrefix + 'output.dense';
+  end
+  else
+  begin
+    // Refactored transformers >=5 names.
+    QName := BlockPrefix + 'attention.q_proj';
+    KName := BlockPrefix + 'attention.k_proj';
+    VName := BlockPrefix + 'attention.v_proj';
+    ONm := BlockPrefix + 'attention.o_proj';
+    F1Name := BlockPrefix + 'mlp.fc1';
+    F2Name := BlockPrefix + 'mlp.fc2';
+  end;
+  LoadLayerNormWeights(Reader, Block.LN1,
+    BlockPrefix + 'layernorm_before.weight',
+    BlockPrefix + 'layernorm_before.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    QName + '.weight', d, d, 0, 3 * d, 0, QName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    KName + '.weight', d, d, d, 3 * d, 0, KName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    VName + '.weight', d, d, 2 * d, 3 * d, 0, VName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.AttnDense,
+    ONm + '.weight', d, d, 0, -1, 0, ONm + '.bias');
+  LoadLayerNormWeights(Reader, Block.LN2,
+    BlockPrefix + 'layernorm_after.weight',
+    BlockPrefix + 'layernorm_after.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.Inter,
+    F1Name + '.weight', d, Tower.IntermediateSize, 0, -1, 0,
+    F1Name + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.OutDense,
+    F2Name + '.weight', Tower.IntermediateSize, d, 0, -1, 0,
+    F2Name + '.bias');
+end;
+
+function BuildViTForImageClassification(Reader: TNNetSafeTensorsReader;
+  const Config: TViTImageClassificationConfig;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Tower: TClipTowerConfig;
+  PatchConv, PosEmb, FinalLN, Classifier: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  Tmp: TNNetVolume;
+  Grid, NumPatches, BlockCnt, ci, d: integer;
+  PatchBiasName, LayerGroup: string;
+begin
+  d := Config.HiddenSize;
+  if (Config.NumHeads < 1) or ((d mod Config.NumHeads) <> 0) then
+    ImportError('ViT import: hidden_size=' + IntToStr(d) +
+      ' is not divisible by num_attention_heads=' +
+      IntToStr(Config.NumHeads) + '.');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0)
+  then
+    ImportError('ViT import: image_size=' + IntToStr(Config.ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
+  if Config.NumLabels < 1 then
+    ImportError('ViT import: num_labels must be >= 1, got ' +
+      IntToStr(Config.NumLabels) + '.');
+  // Map the flat ViT config onto the reusable encoder-block tower shape.
+  Tower.HiddenSize := Config.HiddenSize;
+  Tower.IntermediateSize := Config.IntermediateSize;
+  Tower.NumLayers := Config.NumLayers;
+  Tower.NumHeads := Config.NumHeads;
+  Tower.LayerNormEps := Config.LayerNormEps;
+  Tower.HiddenAct := Config.HiddenAct;
+  Grid := Config.ImageSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    // BIASED patch embedding: kernel = stride = patch_size, no padding ->
+    // a (Grid, Grid, hidden) patch grid, flattened row-major over (y,x)
+    // = HF flatten(2).transpose(1,2) patch order.
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
+      {pSuppressBias=}0) );
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    // Prepend one ZERO row as the CLS-token slot (PadXY pads both ends;
+    // Crop drops the right pad). cls_token is folded into row 0 of the
+    // position table below - exact, since this slot is identically zero.
+    NN.AddLayer( TNNetPadXY.Create(1, 0) );
+    NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(Blocks, Config.NumLayers);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
+        Blocks[BlockCnt], pInferenceOnly);
+    // Final layernorm over every token (exact for the CLS row 0 we read).
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    // Keep only the CLS row (row 0) -> (1,1,hidden), then the classifier.
+    NN.AddLayer( TNNetCrop.Create({StartX=}0, {StartY=}0, {LenX=}1, {LenY=}1) );
+    Classifier := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.NumLabels) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadClipPatchConv(Reader, PatchConv,
+      'vit.embeddings.patch_embeddings.projection.weight',
+      Config.NumChannels, Config.PatchSize, d);
+    // ViT's patch conv IS biased (LoadClipPatchConv zeroes the bias);
+    // load the per-output-channel bias into each neuron's BiasWeight.
+    PatchBiasName := 'vit.embeddings.patch_embeddings.projection.bias';
+    if not Reader.HasTensor(PatchBiasName) then
+      ImportError('ViT import: missing tensor "' + PatchBiasName + '".');
+    if (Reader.DimCount(PatchBiasName) <> 1) or
+       (Reader.DimSize(PatchBiasName, 0) <> d) then
+      ImportError('ViT import: "' + PatchBiasName + '" must have shape [' +
+        IntToStr(d) + '], got ' + Reader.ShapeAsString(PatchBiasName));
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(PatchBiasName, Tmp);
+      for ci := 0 to d - 1 do
+        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // position_embeddings [1, num_patches+1, hidden] -> the table; the
+    // leading batch axis of 1 is dropped by LoadClipEmbeddingTable's flat
+    // copy (it matches element count, not the [1,...] shape), so load it
+    // manually to keep the strict shape check meaningful.
+    if not Reader.HasTensor('vit.embeddings.position_embeddings') then
+      ImportError('ViT import: missing tensor ' +
+        '"vit.embeddings.position_embeddings".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('vit.embeddings.position_embeddings', Tmp);
+      if Tmp.Size <> (NumPatches + 1) * d then
+        ImportError('ViT import: "vit.embeddings.position_embeddings" must ' +
+          'have ' + IntToStr((NumPatches + 1) * d) + ' elements, got ' +
+          IntToStr(Tmp.Size) + '.');
+      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // cls_token [1,1,hidden] folded into position row 0 (see above).
+    if not Reader.HasTensor('vit.embeddings.cls_token') then
+      ImportError('ViT import: missing tensor "vit.embeddings.cls_token".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('vit.embeddings.cls_token', Tmp);
+      if Tmp.Size <> d then
+        ImportError('ViT import: "vit.embeddings.cls_token" must have ' +
+          IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
+      for ci := 0 to d - 1 do
+        PosEmb.Neurons[0].Weights.FData[ci] :=
+          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      PosEmb.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // Legacy (transformers <5) groups blocks under 'vit.encoder.layer.N.';
+    // the refactored transformers >=5 layout uses 'vit.layers.N.'.
+    if Reader.HasTensor('vit.encoder.layer.0.layernorm_before.weight') then
+      LayerGroup := 'vit.encoder.layer.'
+    else
+      LayerGroup := 'vit.layers.';
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      LoadViTEncoderBlockWeights(Reader, Blocks[BlockCnt],
+        LayerGroup + IntToStr(BlockCnt) + '.', Tower);
+    LoadLayerNormWeights(Reader, FinalLN,
+      'vit.layernorm.weight', 'vit.layernorm.bias', d);
+    LoadLlamaLinearWeights(Reader, Classifier, 'classifier.weight',
+      d, Config.NumLabels, 0, -1, 0, 'classifier.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildViTFromSafeTensorsEx(const FileName: string;
+  const Config: TViTImageClassificationConfig;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildViTForImageClassification(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildViTFromSafeTensors(const FileName: string;
+  out Config: TViTImageClassificationConfig;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadViTConfigFromJSONFile(ConfigPath);
+  Result := BuildViTFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 function ReadClipImageProcessorConfig(

@@ -270,6 +270,8 @@ type
     procedure TestSigLIPConfigFromJSONFile;
     procedure TestSigLIPParity;
     procedure TestSigLIPVisionFeatures;
+    procedure TestViTConfigFromJSONFile;
+    procedure TestViTImageClassificationParity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -12447,6 +12449,97 @@ begin
   finally
     VisionNet.Free;
     Reader.Free;
+  end;
+end;
+
+// Verifies ReadViTConfigFromJSONFile on the committed ViT pico config.
+procedure TTestNeuralPretrained.TestViTConfigFromJSONFile;
+var
+  Config: TViTImageClassificationConfig;
+begin
+  Config := ReadViTConfigFromJSONFile(FixturePath('tiny_vit_config.json'));
+  AssertEquals('model_type', 'vit', Config.ModelType);
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  AssertEquals('intermediate_size', 32, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 4, Config.NumHeads);
+  AssertEquals('image_size', 12, Config.ImageSize);
+  AssertEquals('patch_size', 4, Config.PatchSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertTrue('hidden_act gelu (exact erf)',
+    Config.HiddenAct = chaGeluExact);
+end;
+
+// ViT image-classification parity test: tests/fixtures/tiny_vit.* is a pico
+// randomly-initialized HF ViTForImageClassification (image 12, patch 4 -> 9
+// patches + 1 CLS = 10 tokens, 2 layers, 4 heads, d 16, 5 labels; BIASED
+// patch conv, learnable cls_token folded into pos row 0, exact-erf gelu,
+// final layernorm + classifier on the CLS row). The generator
+// tools/vit_tiny_fixture.py asserts every ViT quirk (cls_token, patch bias,
+// classifier bias, exact-erf gelu, CLS-row head) is visible in the float64
+// oracle. Compares the (1,1,num_labels) class logits < 1e-4 vs HF.
+procedure TTestNeuralPretrained.TestViTImageClassificationParity;
+var
+  NN: TNNet;
+  Config: TViTImageClassificationConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildViTFromSafeTensors(FixturePath('tiny_vit.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_vit_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output rows = 1 (CLS-pooled)', 1,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output depth = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_vit_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
   end;
 end;
 
