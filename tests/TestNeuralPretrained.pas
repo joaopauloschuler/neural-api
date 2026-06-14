@@ -119,6 +119,9 @@ type
     procedure TestRWKVSafeTensorsRoundTrip;
     procedure TestT5SafeTensorsRoundTrip;
     procedure TestMarianSafeTensorsRoundTrip;
+    procedure TestBartSafeTensorsRoundTrip;
+    procedure TestPegasusSafeTensorsRoundTrip;
+    procedure TestMBartSafeTensorsRoundTrip;
     procedure TestResizeTokenEmbeddings;
     procedure TestTorchBinMatchesSafeTensorsTwin;
     procedure TestTorchBinRejectsMaliciousPickle;
@@ -2139,6 +2142,178 @@ begin
     // F32 + invertible scale_embedding un-fold + straight biased dumps +
     // regenerated sinusoids -> exact.
     AssertTrue('Marian safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    L2.Free; L1.Free; DecInput.Free; EncInput.Free;
+    Dec2.Free; Enc2.Free; Dec.Free; Enc.Free;
+  end;
+end;
+
+// SaveBartToSafeTensors round-trip: import the pico BART ENCODER+DECODER pair,
+// export both nets, re-import, and assert identical logits through RunT5.
+// Exercises the post-norm block dump, the layernorm_embedding pair, the
+// +2-offset learned position table re-emission (rows 0/1 and the upper window
+// zero-padded), and the tied head + final_logits_bias re-derivation.
+procedure TTestNeuralPretrained.TestBartSafeTensorsRoundTrip;
+var
+  Enc, Dec, Enc2, Dec2: TNNet;
+  Config, Config2: TBartConfig;
+  EncInput, DecInput, L1, L2: TNNetVolume;
+  TmpPath: string;
+  i, s, EncSeqLen, DecSeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  EncSeqLen := 10;
+  DecSeqLen := 6;
+  TmpPath := GetTempDir(false) + 'cai_bart_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  BuildBartFromSafeTensors(FixturePath('tiny_bart.safetensors'),
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    FixturePath('tiny_bart_config.json'));
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  L1 := TNNetVolume.Create;
+  L2 := TNNetVolume.Create;
+  Enc2 := nil; Dec2 := nil;
+  try
+    SaveBartToSafeTensors(Enc, Dec, Config, TmpPath);
+    BuildBartFromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
+      DecSeqLen, {pInferenceOnly=}false, FixturePath('tiny_bart_config.json'));
+    Vocab := Config.VocabSize;
+    EncInput.ReSize(EncSeqLen, 1, 1);
+    DecInput.ReSize(DecSeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to EncSeqLen - 1 do
+        EncInput.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      for i := 0 to DecSeqLen - 1 do
+        DecInput.FData[i] := (s * 7 + i * 2 + 1) mod Vocab;
+      RunT5(Enc, Dec, EncInput, DecInput, L1);
+      RunT5(Enc2, Dec2, EncInput, DecInput, L2);
+      AssertEquals('bart round-trip logits size', L1.Size, L2.Size);
+      for i := 0 to L1.Size - 1 do
+        if Abs(L1.FData[i] - L2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(L1.FData[i] - L2.FData[i]);
+    end;
+    AssertTrue('BART safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    L2.Free; L1.Free; DecInput.Free; EncInput.Free;
+    Dec2.Free; Enc2.Free; Dec.Free; Enc.Free;
+  end;
+end;
+
+// SavePegasusToSafeTensors round-trip: import the pico Pegasus pair, export,
+// re-import, assert identical logits. Exercises the PRE-norm block dump, the
+// FINAL encoder/decoder layer_norm re-emission, the scale_embedding un-fold,
+// and the deliberate OMISSION of the static sinusoidal position tables (the
+// re-import regenerates them).
+procedure TTestNeuralPretrained.TestPegasusSafeTensorsRoundTrip;
+var
+  Enc, Dec, Enc2, Dec2: TNNet;
+  Config, Config2: TPegasusConfig;
+  EncInput, DecInput, L1, L2: TNNetVolume;
+  TmpPath: string;
+  i, s, EncSeqLen, DecSeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  EncSeqLen := 10;
+  DecSeqLen := 6;
+  TmpPath := GetTempDir(false) + 'cai_pegasus_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  BuildPegasusFromSafeTensors(FixturePath('tiny_pegasus.safetensors'),
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    FixturePath('tiny_pegasus_config.json'));
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  L1 := TNNetVolume.Create;
+  L2 := TNNetVolume.Create;
+  Enc2 := nil; Dec2 := nil;
+  try
+    SavePegasusToSafeTensors(Enc, Dec, Config, TmpPath);
+    BuildPegasusFromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
+      DecSeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_pegasus_config.json'));
+    Vocab := Config.VocabSize;
+    EncInput.ReSize(EncSeqLen, 1, 1);
+    DecInput.ReSize(DecSeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to EncSeqLen - 1 do
+        EncInput.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      for i := 0 to DecSeqLen - 1 do
+        DecInput.FData[i] := (s * 7 + i * 2 + 1) mod Vocab;
+      RunT5(Enc, Dec, EncInput, DecInput, L1);
+      RunT5(Enc2, Dec2, EncInput, DecInput, L2);
+      AssertEquals('pegasus round-trip logits size', L1.Size, L2.Size);
+      for i := 0 to L1.Size - 1 do
+        if Abs(L1.FData[i] - L2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(L1.FData[i] - L2.FData[i]);
+    end;
+    AssertTrue('Pegasus safetensors round-trip: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    if FileExists(TmpPath) then DeleteFile(TmpPath);
+    L2.Free; L1.Free; DecInput.Free; EncInput.Free;
+    Dec2.Free; Enc2.Free; Dec.Free; Enc.Free;
+  end;
+end;
+
+// SaveMBartToSafeTensors round-trip: import the pico mBART pair, export,
+// re-import, assert identical logits. Exercises the BART front-end
+// (layernorm_embedding + +2-offset learned positions) over PRE-norm stacks
+// closed by a FINAL encoder/decoder layer_norm.
+procedure TTestNeuralPretrained.TestMBartSafeTensorsRoundTrip;
+var
+  Enc, Dec, Enc2, Dec2: TNNet;
+  Config, Config2: TBartConfig;
+  EncInput, DecInput, L1, L2: TNNetVolume;
+  TmpPath: string;
+  i, s, EncSeqLen, DecSeqLen, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  EncSeqLen := 10;
+  DecSeqLen := 6;
+  TmpPath := GetTempDir(false) + 'cai_mbart_roundtrip_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  BuildMBartFromSafeTensors(FixturePath('tiny_mbart.safetensors'),
+    Enc, Dec, Config, EncSeqLen, DecSeqLen, {pInferenceOnly=}false,
+    FixturePath('tiny_mbart_config.json'));
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  L1 := TNNetVolume.Create;
+  L2 := TNNetVolume.Create;
+  Enc2 := nil; Dec2 := nil;
+  try
+    SaveMBartToSafeTensors(Enc, Dec, Config, TmpPath);
+    BuildMBartFromSafeTensors(TmpPath, Enc2, Dec2, Config2, EncSeqLen,
+      DecSeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_mbart_config.json'));
+    Vocab := Config.VocabSize;
+    EncInput.ReSize(EncSeqLen, 1, 1);
+    DecInput.ReSize(DecSeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to EncSeqLen - 1 do
+        EncInput.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      for i := 0 to DecSeqLen - 1 do
+        DecInput.FData[i] := (s * 7 + i * 2 + 1) mod Vocab;
+      RunT5(Enc, Dec, EncInput, DecInput, L1);
+      RunT5(Enc2, Dec2, EncInput, DecInput, L2);
+      AssertEquals('mbart round-trip logits size', L1.Size, L2.Size);
+      for i := 0 to L1.Size - 1 do
+        if Abs(L1.FData[i] - L2.FData[i]) > MaxDiff then
+          MaxDiff := Abs(L1.FData[i] - L2.FData[i]);
+    end;
+    AssertTrue('mBART safetensors round-trip: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
   finally
     if FileExists(TmpPath) then DeleteFile(TmpPath);

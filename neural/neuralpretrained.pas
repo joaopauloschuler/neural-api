@@ -2985,6 +2985,39 @@ procedure BuildMBartFromSafeTensors(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
+// Exports a BART ENCODER+DECODER pair (built by BuildBartFromSafeTensors) back
+// to a single HF-name safetensors file - the exact inverse of the importer.
+// Undoes the scale_embedding sqrt(d_model) fold on the shared matrix, re-emits
+// the +2-offset learned position table (rows 0/1 and rows beyond the built
+// sequence length are zero-padded; the importer only reads rows
+// 2..SeqLen+1), the two layernorm_embedding LayerNorms, the per-block biased
+// linears/post-norms, and re-derives final_logits_bias from the tied head.
+// Round-trip gated by TestBartSafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TBartConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
+// Exports a Pegasus ENCODER+DECODER pair (built by BuildPegasusFromSafeTensors)
+// back to a single HF-name safetensors file - the exact inverse of the
+// importer. PRE-norm stack: re-emits the FINAL encoder/decoder layer_norm,
+// undoes the scale_embedding fold, and re-derives final_logits_bias. The
+// STATIC half-split sinusoidal position tables are NOT emitted (HF regenerates
+// them; they are not learned parameters). Round-trip gated by
+// TestPegasusSafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SavePegasusToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TPegasusConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
+// Exports an mBART ENCODER+DECODER pair (built by BuildMBartFromSafeTensors)
+// back to a single HF-name safetensors file - the exact inverse of the
+// importer. BART embedding front-end (layernorm_embedding + +2-offset learned
+// positions) over PRE-norm stacks that close with a FINAL encoder/decoder
+// layer_norm; undoes the scale_embedding fold and re-derives final_logits_bias.
+// Round-trip gated by TestMBartSafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveMBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TBartConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
 // ---------------------------------------------------------------------------
 // M2M100 / NLLB IMPORT (model_type "m2m_100": the facebook/m2m100_* and
 // facebook/nllb-200-* multilingual translation checkpoints; architectures
@@ -19355,6 +19388,319 @@ begin
     Shared.Free;
     Writer.Free;
   end;
+end;
+
+// ===========================================================================
+// BART / mBART / PEGASUS EXPORT (inverse of the three importers above)
+// All three ride the Marian post-/pre-norm block skeleton. The shared worker
+// SaveBartFamilyToSafeTensors dumps the per-block biased linears + norms with
+// the SAME tensor names as Marian; the three public wrappers differ only in:
+//   - HasEmbLN  : a layernorm_embedding after token+position embeddings
+//                 (BART/mBART) - the first per-stack TokenLayerNorm;
+//   - HasFinalLN: a FINAL encoder/decoder layer_norm closing a pre-norm stack
+//                 (Pegasus/mBART) - the last per-stack TokenLayerNorm;
+//   - PosOffset : >=0 re-emits the learned +2-offset position table
+//                 (BART/mBART, PosOffset=2); <0 emits NO position table
+//                 (Pegasus's static sinusoids, regenerated on import).
+// Coded by Claude (AI).
+// ===========================================================================
+
+procedure SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const FileName, ExporterTag: string;
+  DModel, VocabSize, MaxPositionEmbeddings,
+  EncoderLayers, DecoderLayers, EncoderFFNDim, DecoderFFNDim: integer;
+  ScaleEmbedding, HasEmbLN, HasFinalLN: boolean; PosOffset: integer;
+  pDType: TSafeTensorsWriteDType);
+var
+  Writer: TNNetSafeTensorsWriter;
+  EncEmbed, DecEmbed, LMHead: TNNetLayer;
+  Shared, FinalBias: TNNetVolume;
+  EmbedScale, InvEmbedScale: TNeuralFloat;
+  i, j: integer;
+
+  // Writes a HF nn.Linear [OutDim, InDim] (+bias [OutDim]) from OutDim biased
+  // neurons of Layer - the BART-family convention (identical to Marian).
+  procedure DumpLinearB(Layer: TNNetLayer; OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[jj].Weights.Size <> InDim then
+          ImportError(ExporterTag + ' export: neuron ' + IntToStr(jj) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[jj].Weights.Size) + ' weights, expected ' +
+            IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Re-emits the [MaxPositionEmbeddings + PosOffset, DModel] learned position
+  // table from the SeqLen rows stored at offset PosOffset; the unused
+  // padding/upper rows are zero (the importer only reads rows
+  // PosOffset..SeqLen+PosOffset-1).
+  procedure DumpPositions(PosLayer: TNNetLayer; SeqLen: integer;
+    const TName: string);
+  var
+    Tbl: TNNetVolume;
+    PosCnt, ElementCnt, Rows: integer;
+  begin
+    Rows := MaxPositionEmbeddings + PosOffset;
+    Tbl := TNNetVolume.Create;
+    try
+      Tbl.ReSize(Rows * DModel, 1, 1);
+      Tbl.Fill(0);
+      for PosCnt := 0 to SeqLen - 1 do
+        for ElementCnt := 0 to DModel - 1 do
+          Tbl.FData[(PosCnt + PosOffset) * DModel + ElementCnt] :=
+            PosLayer.Neurons[0].Weights.FData[PosCnt * DModel + ElementCnt];
+      Writer.AddTensorFlat(TName, [Rows, DModel], Tbl, pDType);
+    finally
+      Tbl.Free;
+    end;
+  end;
+
+  // Walks one stack and emits its HF tensors. The per-block PointwiseConvLinear
+  // / TokenLayerNorm name layout is identical to Marian; HasEmbLN consumes the
+  // first per-stack TokenLayerNorm (layernorm_embedding) and HasFinalLN the
+  // last (the pre-norm closing layer_norm), neither of which is per-block.
+  procedure DumpStack(Net: TNNet; IsDecoder: boolean;
+    const StackPrefix, StackName: string; NumBlocks, FFNDim: integer;
+    out EmbLNOut, FinalLNOut, LMHeadOut: TNNetLayer);
+  var
+    PwConvs, Norms: array of TNNetLayer;
+    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock,
+      BlockNormBase, ExpectNorm: integer;
+    BP: string;
+  begin
+    SetLength(PwConvs, 0);
+    SetLength(Norms, 0);
+    for li := 0 to Net.CountLayers - 1 do
+    begin
+      if Net.Layers[li] is TNNetTokenLayerNorm then
+      begin
+        SetLength(Norms, Length(Norms) + 1);
+        Norms[High(Norms)] := Net.Layers[li];
+      end
+      else if Net.Layers[li] is TNNetPointwiseConvLinear then
+      begin
+        SetLength(PwConvs, Length(PwConvs) + 1);
+        PwConvs[High(PwConvs)] := Net.Layers[li];
+      end;
+    end;
+    if IsDecoder then
+    begin
+      PwPerBlock := 10; NormPerBlock := 3;
+    end
+    else
+    begin
+      PwPerBlock := 6; NormPerBlock := 2;
+    end;
+    if Length(PwConvs) <> PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0) then
+      ImportError(ExporterTag + ' export: ' + StackName + ' has ' +
+        IntToStr(Length(PwConvs)) + ' PointwiseConvLinear layers, expected ' +
+        IntToStr(PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0)) + '.');
+    ExpectNorm := NormPerBlock * NumBlocks +
+      IfThen(HasEmbLN, 1, 0) + IfThen(HasFinalLN, 1, 0);
+    if Length(Norms) <> ExpectNorm then
+      ImportError(ExporterTag + ' export: ' + StackName + ' has ' +
+        IntToStr(Length(Norms)) + ' TokenLayerNorm layers, expected ' +
+        IntToStr(ExpectNorm) + '.');
+    BlockNormBase := IfThen(HasEmbLN, 1, 0);
+    for BlockCnt := 0 to NumBlocks - 1 do
+    begin
+      BP := StackPrefix + IntToStr(BlockCnt) + '.';
+      PwBase := BlockCnt * PwPerBlock;
+      NormBase := BlockNormBase + BlockCnt * NormPerBlock;
+      DumpLinearB(PwConvs[PwBase + 0], DModel, DModel,
+        BP + 'self_attn.q_proj.weight', BP + 'self_attn.q_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 1], DModel, DModel,
+        BP + 'self_attn.k_proj.weight', BP + 'self_attn.k_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 2], DModel, DModel,
+        BP + 'self_attn.v_proj.weight', BP + 'self_attn.v_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 3], DModel, DModel,
+        BP + 'self_attn.out_proj.weight', BP + 'self_attn.out_proj.bias');
+      SaveLayerNormWeights(Writer, Norms[NormBase + 0],
+        BP + 'self_attn_layer_norm.weight', BP + 'self_attn_layer_norm.bias',
+        DModel, pDType);
+      if IsDecoder then
+      begin
+        DumpLinearB(PwConvs[PwBase + 4], DModel, DModel,
+          BP + 'encoder_attn.q_proj.weight', BP + 'encoder_attn.q_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 5], DModel, DModel,
+          BP + 'encoder_attn.k_proj.weight', BP + 'encoder_attn.k_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 6], DModel, DModel,
+          BP + 'encoder_attn.v_proj.weight', BP + 'encoder_attn.v_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 7], DModel, DModel,
+          BP + 'encoder_attn.out_proj.weight',
+          BP + 'encoder_attn.out_proj.bias');
+        SaveLayerNormWeights(Writer, Norms[NormBase + 1],
+          BP + 'encoder_attn_layer_norm.weight',
+          BP + 'encoder_attn_layer_norm.bias', DModel, pDType);
+      end;
+      DumpLinearB(PwConvs[PwBase + PwPerBlock - 2], FFNDim, DModel,
+        BP + 'fc1.weight', BP + 'fc1.bias');
+      DumpLinearB(PwConvs[PwBase + PwPerBlock - 1], DModel, FFNDim,
+        BP + 'fc2.weight', BP + 'fc2.bias');
+      SaveLayerNormWeights(Writer, Norms[NormBase + NormPerBlock - 1],
+        BP + 'final_layer_norm.weight', BP + 'final_layer_norm.bias',
+        DModel, pDType);
+    end;
+    if HasEmbLN then EmbLNOut := Norms[0] else EmbLNOut := nil;
+    if HasFinalLN then FinalLNOut := Norms[High(Norms)] else FinalLNOut := nil;
+    if IsDecoder then LMHeadOut := PwConvs[High(PwConvs)]
+    else LMHeadOut := nil;
+  end;
+
+  procedure FindLearnedPos(Net: TNNet; out PosLayer: TNNetLayer);
+  var
+    li: integer;
+  begin
+    PosLayer := nil;
+    for li := 0 to Net.CountLayers - 1 do
+      if Net.Layers[li] is TNNetLearnedPositionalEmbedding then
+      begin PosLayer := Net.Layers[li]; break; end;
+    if PosLayer = nil then
+      ImportError(ExporterTag + ' export: missing positional embedding layer.');
+  end;
+
+var
+  EncEmbLN, DecEmbLN, EncFinalLN, DecFinalLN, EncPos, DecPos,
+    EncLMHeadUnused: TNNetLayer;
+begin
+  // ---- find embeddings ----
+  EncEmbed := nil; DecEmbed := nil;
+  for i := 0 to EncoderNet.CountLayers - 1 do
+    if EncoderNet.Layers[i] is TNNetEmbedding then
+    begin EncEmbed := EncoderNet.Layers[i]; break; end;
+  for i := 0 to DecoderNet.CountLayers - 1 do
+    if DecoderNet.Layers[i] is TNNetEmbedding then
+    begin DecEmbed := DecoderNet.Layers[i]; break; end;
+  if (EncEmbed = nil) or (DecEmbed = nil) then
+    ImportError(ExporterTag + ' export: missing embedding layer - not a ' +
+      'Build' + ExporterTag + 'FromSafeTensors pair?');
+
+  if ScaleEmbedding then EmbedScale := Sqrt(DModel)
+  else EmbedScale := 1.0;
+  InvEmbedScale := 1.0 / EmbedScale;
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  Shared := TNNetVolume.Create;
+  FinalBias := TNNetVolume.Create;
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/' + LowerCase(ExporterTag));
+    // ---- shared embedding: un-fold the scale_embedding sqrt(d_model). ----
+    if EncEmbed.Neurons[0].Weights.Size <> VocabSize * DModel then
+      ImportError(ExporterTag + ' export: embedding size mismatch.');
+    Shared.ReSize(VocabSize * DModel, 1, 1);
+    for i := 0 to Shared.Size - 1 do
+      Shared.FData[i] := EncEmbed.Neurons[0].Weights.FData[i] * InvEmbedScale;
+    Writer.AddTensorFlat('model.shared.weight',
+      [VocabSize, DModel], Shared, pDType);
+
+    DumpStack(EncoderNet, {IsDecoder=}false, 'model.encoder.layers.',
+      'encoder', EncoderLayers, EncoderFFNDim,
+      EncEmbLN, EncFinalLN, EncLMHeadUnused);
+    DumpStack(DecoderNet, {IsDecoder=}true, 'model.decoder.layers.',
+      'decoder', DecoderLayers, DecoderFFNDim,
+      DecEmbLN, DecFinalLN, LMHead);
+
+    // ---- layernorm_embedding (BART/mBART) ----
+    if HasEmbLN then
+    begin
+      SaveLayerNormWeights(Writer, EncEmbLN,
+        'model.encoder.layernorm_embedding.weight',
+        'model.encoder.layernorm_embedding.bias', DModel, pDType);
+      SaveLayerNormWeights(Writer, DecEmbLN,
+        'model.decoder.layernorm_embedding.weight',
+        'model.decoder.layernorm_embedding.bias', DModel, pDType);
+    end;
+
+    // ---- final per-stack layer_norm (Pegasus/mBART pre-norm) ----
+    if HasFinalLN then
+    begin
+      SaveLayerNormWeights(Writer, EncFinalLN,
+        'model.encoder.layer_norm.weight',
+        'model.encoder.layer_norm.bias', DModel, pDType);
+      SaveLayerNormWeights(Writer, DecFinalLN,
+        'model.decoder.layer_norm.weight',
+        'model.decoder.layer_norm.bias', DModel, pDType);
+    end;
+
+    // ---- learned +offset position tables (BART/mBART). Pegasus's static
+    // sinusoids (PosOffset < 0) are regenerated on import - emit nothing. ----
+    if PosOffset >= 0 then
+    begin
+      FindLearnedPos(EncoderNet, EncPos);
+      FindLearnedPos(DecoderNet, DecPos);
+      DumpPositions(EncPos, EncPos.Output.SizeX,
+        'model.encoder.embed_positions.weight');
+      DumpPositions(DecPos, DecPos.Output.SizeX,
+        'model.decoder.embed_positions.weight');
+    end;
+
+    // ---- final_logits_bias: the tied head's per-neuron biases ([1,vocab]). --
+    FinalBias.ReSize(VocabSize, 1, 1);
+    for j := 0 to VocabSize - 1 do
+      FinalBias.FData[j] := LMHead.Neurons[j].BiasWeight;
+    Writer.AddTensorFlat('final_logits_bias',
+      [1, VocabSize], FinalBias, pDType);
+
+    Writer.SaveToFile;
+  finally
+    FinalBias.Free;
+    Shared.Free;
+    Writer.Free;
+  end;
+end;
+
+procedure SaveBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TBartConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+begin
+  SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet, FileName, 'Bart',
+    Config.DModel, Config.VocabSize, Config.MaxPositionEmbeddings,
+    Config.EncoderLayers, Config.DecoderLayers,
+    Config.EncoderFFNDim, Config.DecoderFFNDim, Config.ScaleEmbedding,
+    {HasEmbLN=}true, {HasFinalLN=}false, {PosOffset=}2, pDType);
+end;
+
+procedure SavePegasusToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TPegasusConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+begin
+  SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet, FileName, 'Pegasus',
+    Config.DModel, Config.VocabSize, Config.MaxPositionEmbeddings,
+    Config.EncoderLayers, Config.DecoderLayers,
+    Config.EncoderFFNDim, Config.DecoderFFNDim, Config.ScaleEmbedding,
+    {HasEmbLN=}false, {HasFinalLN=}true, {PosOffset=}-1, pDType);
+end;
+
+procedure SaveMBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TBartConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+begin
+  SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet, FileName, 'MBart',
+    Config.DModel, Config.VocabSize, Config.MaxPositionEmbeddings,
+    Config.EncoderLayers, Config.DecoderLayers,
+    Config.EncoderFFNDim, Config.DecoderFFNDim, Config.ScaleEmbedding,
+    {HasEmbLN=}true, {HasFinalLN=}true, {PosOffset=}2, pDType);
 end;
 
 // ===========================================================================

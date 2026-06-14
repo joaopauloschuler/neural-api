@@ -410,15 +410,24 @@ rather than acted on.
 - [ ] Parameter groups for the optimizer (PyTorch param_groups port):
       per-group learning-rate multipliers and weight-decay exclusion for
       norm/bias parameters (AdamW currently decays everything uniformly).
-- [ ] Encoder-decoder safetensors exporter follow-ups (the GPT-2 / Llama /
+- [X] Encoder-decoder safetensors exporter follow-ups (the GPT-2 / Llama /
       Qwen3 / BERT / GPT-NeoX / BLOOM / Mamba / RWKV / T5 / Marian HF-names
       exporters all LANDED as exact inverses of their importers, round-trips
       bit-exact): Pegasus / mBART exporters (Pegasus = pre-norm + sinusoidal
       final-norm twist; mBART = pre-norm + extra final LayerNorms + learned
       +2-offset positions) and BART SaveBartToSafeTensors, which ride the SAME
-      Marian post-norm skeleton (reuse LoadMarianStack/Attn + DumpStack with the
-      +2-offset learned position table re-emitted) but were not done in the
-      landed batch.
+      Marian post-norm skeleton. DONE — SaveBartToSafeTensors /
+      SavePegasusToSafeTensors / SaveMBartToSafeTensors (neuralpretrained.pas)
+      share one worker SaveBartFamilyToSafeTensors parameterized by HasEmbLN /
+      HasFinalLN / PosOffset; its inner DumpStack reuses the Marian per-block
+      biased-linear/norm name layout (skipping the layernorm_embedding +
+      final layer_norm), re-emits the +2-offset learned position table
+      ([MaxPos+2, DModel], padding/upper rows zeroed) for BART/mBART, and
+      omits Pegasus's regenerated sinusoids. Round-trips bit-exact (max |diff|
+      ~0): TestBartSafeTensorsRoundTrip / TestPegasusSafeTensorsRoundTrip /
+      TestMBartSafeTensorsRoundTrip in TestNeuralPretrained.pas (import pico
+      fixture -> Save* -> re-import -> RunT5 logits identical &lt; 1e-5).
+      M2M100/NLLB exporter remains a separate open follow-up.
 - [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
       (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
       llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
