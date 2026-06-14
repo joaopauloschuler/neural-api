@@ -237,24 +237,6 @@ rather than acted on.
       demo that captions a small image on CPU. First image-in/text-out
       model in the repo; opens the door to Qwen-VL/PaliGemma later.
   Suggested incremental breakdown (each step independently buildable + committable):
-  - [X] Step 1 — select-hidden-layer / skip-pooling mode on BuildClipVisionTower
-        so it returns the penultimate-layer PATCH tokens WITHOUT the CLS row and
-        WITHOUT the projection head (LLaVA's vision feature). LANDED: new
-        pVisionFeatures flag builds NumLayers-1 encoder blocks, crops row 0,
-        skips post_layernorm + projection; output (num_patches, 1, hidden).
-        clip_tiny_fixture.py now dumps vision_features (HF
-        hidden_states[-2][:,1:]); TestClipVisionFeatures asserts shape + value
-        parity (<1e-4) on the existing random pico CLIP checkpoint.
-  - [X] Step 2 — image preprocessing helper: load preprocessor_config.json,
-        resize/center-crop to the processor size, normalize by image_mean/std
-        into a TNNetVolume. LANDED: TClipImageProcessorConfig +
-        ReadClipImageProcessorConfig (size/crop as int or object, mean/std,
-        do_* flags) + ClipPreprocessImage (resize shortest-edge -> center-crop
-        -> rescale 1/255 -> per-channel normalize). Resize is bilinear (HF
-        default bicubic; rescale/normalize is byte-exact at the working size).
-        TestClipImagePreprocess: byte parity (<1e-4) vs HF CLIPImageProcessor on
-        a same-size image (rescale/normalize) and a 2x image (exact integer
-        center-crop). Also unblocks the ClipZeroShot real-image follow-up.
   - [ ] Step 3 — projector import + prompt-assembly helper: load the 2-layer MLP
         (gelu) projector, run the vision tower once, and concatenate
         [text-embeds | projected image tokens | text-embeds] as a TNNetInput-fed
@@ -528,31 +510,6 @@ rather than acted on.
       serialized string. Assert the twin's logits match the source on a pinned
       input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
       template).
-- [X] KV-cache eviction for unbounded streaming: attention sinks + rolling
-      window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder.
-      LANDED: TNNetScaledDotProductAttention.EnableEviction(SinkTokens,
-      RecentWindow)/DisableEviction on the KV-cache decode path + the matching
-      TNNetStreamingDecoder.EnableEviction/DisableEviction/SDPACacheLength
-      pass-throughs. After each appended token, once CacheLength would exceed
-      SinkTokens+RecentWindow the OLDEST window key is dropped (slots
-      [Sinks+1..] shifted left by one over slot Sinks); the first SinkTokens
-      slots are never touched, so live cache is pinned at Sinks+RecentWindow
-      forever (constant memory). OFF by default (SinkTokens=0 => unbounded,
-      bit-identical to before). RoPE-after-eviction strategy = "keep original
-      positions" (NOT re-rotation, NOT pre-RoPE caching): this layer caches K
-      AFTER positional encoding and StepForward rotates the query at its TRUE
-      absolute position, so retained keys keep their original rotation and every
-      surviving query/key pair attends at its EXACT relative distance — correct
-      for RoPE/ALiBi/absolute/learned uniformly with no SDPA<->RoPE coupling.
-      DELIBERATE LIMITATION: the StreamingLLM paper's optional position
-      RE-INDEXING inside the cache (closing the sink<->window gap) is a
-      perplexity refinement, not a correctness requirement, and is NOT done.
-      Rejects combining with the sliding-window mask. Tests
-      (TestStreamingEviction*): (1) within Sinks+RecentWindow the eviction
-      session is BIT-IDENTICAL (=, not approx) to the unbounded session and to
-      the full causal forward; (2) streaming 30 steps past the cap pins every
-      attention layer's CacheLength at Sinks+RecentWindow. Note TNNetSinkAttention
-      remains the TRAINING-side cousin (learnable sink logits), untouched.
 - [ ] KV-cache quantization (int8 cache with per-channel scales): the
       landed int8 quantized inference covers WEIGHT storage; for long-context
       decode the KV cache dominates memory instead. Quantize cached K/V
@@ -629,30 +586,6 @@ rather than acted on.
       is also what best-of-N and the speculative-decoding verify step
       want. Assert ranked beam output is identical to the re-encoding
       implementation.
-- [X] Prefix/session cache reuse in TNNetStreamingDecoder. LANDED: in-memory
-      snapshot-after-prefill + clone-per-request fork. TNNetStreamingDecoder
-      .Snapshot() deep-copies the session's FULL live state (every attention
-      layer's K/V cache + live length + eviction sinks/window, every SSM layer's
-      recurrent state h + step count) into an owned TNNetDecoderSessionSnapshot;
-      .RestoreSnapshot(Snap) copies it back so the next StepForward continues
-      exactly where the snapshot was taken. Built on new public
-      TNNetScaledDotProductAttention.CaptureCacheState/RestoreCacheState and
-      TNNetDiagonalSSM.CaptureState/RestoreState (so the snapshot stays decoupled
-      from the layer privates). Snapshot is an independent copy -> restorable into
-      MANY sessions (the per-request fork AND the per-hypothesis fork the KV-cache
-      beam task wants). Eviction-aware: it captures+restores the sinks/window so a
-      forked session keeps the source's eviction policy (capturing past the cap is
-      fine - the snapshot holds whatever the live cache holds). RoPE PositionOffset
-      is NOT stored (set per-StepForward from AbsPos). Tests (TestNeuralDecode):
-      forked continuation BIT-IDENTICAL (exact float equality, tol 0) to a fresh
-      prefill of the whole prefix for both a RoPE transformer and an SSM; one
-      snapshot forks two independent continuations and survives both untouched.
-      DELIBERATE LIMITATION: in-memory only; save/load of a snapshot to disk (a
-      persistent system-prompt cache) is a documented follow-up. Related consumer
-      still open: examples/ChatTerminal decodes one full fixed-width forward per
-      token because importers build at full context width — an importer option to
-      build a width-1 decode twin (or build-twice + CopyWeights) would let chat
-      ride TNNetStreamingDecoder.
 - [ ] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
       easy tokens from an intermediate layer through the LM head, fall
       back to full depth when confidence is low — the model becomes its
@@ -693,67 +626,6 @@ rather than acted on.
       caching loop lives in the example); (c) pQuantizeInt8 for the ColBERT path
       — the projection head is always f32 while the BERT backbone already
       supports int8.
-- [X] Cross-encoder RERANKER import + rerank scorer — LANDED a3. The
-      num_labels=1 BERT reranker reuses BuildBertForSequenceClassificationFrom-
-      SafeTensors; the genuinely new pieces all landed in neuralpretrained.pas
-      CROSS-ENCODER RERANKER section: (a) BertTokenizePair lays out
-      [CLS] q [SEP] d [SEP] + parallel segment ids (0 over query, 1 over doc,
-      HF longest_first truncation) - the importer's token_type channel-1 path
-      was ALREADY wired into token_type_embeddings, so no importer change was
-      needed, only verified/exercised; (b) CrossEncoderScore (one joint forward,
-      [CLS] logit, sigmoid) + RerankPassages (batch scorer, sorted, int8 via the
-      backbone pQuantizeInt8); (c) RerankReport (MRR/nDCG@k before-vs-after,
-      introspection-report style, sibling of RetrievalReport). Parity: pico
-      fixture tools/bert_reranker_tiny_fixture.py pins the PAIR/segment-1 [CLS]
-      logit to HF float64 AutoModelForSequenceClassification <1e-4
-      (TestRerankerPairLogitParity; the fixture boosts token_type embeddings so
-      the segment-1 path measurably moves the logit + asserts seg0!=seg-mixed so
-      the test is not vacuous), plus TestBertTokenizePairSegmentIds and
-      TestRerankReportLift. Demo examples/Rerank (bi-encoder shortlist ->
-      cross-encoder reorder, -demo runs offline on the pico fixture); documented
-      in examples/README.md. Possible follow-up: attention-padding-mask so a
-      short passage doesn't attend to [PAD] rows (the SemanticSearch/ColBERT
-      approximation), which would let RerankPassages batch mixed-length docs in
-      one net instead of one forward each.
-  Original task description:
-  Cross-encoder RERANKER import + rerank scorer — the missing rung of the
-      RAG retrieval stack. The repo already ships the two BI-encoder paths
-      (separate query/doc towers: examples/SemanticSearch + the embedding-eval
-      RetrievalReport) and the late-interaction path (ColBERT MaxSim), but NOT
-      the cross-encoder reranker that production RAG uses for the final
-      precision pass: a single BERT-family trunk that encodes the query and the
-      candidate document JOINTLY as one sequence
-      `[CLS] query [SEP] document [SEP]` and emits ONE relevance score from the
-      [CLS] row. This is genuinely distinct from everything landed (joint
-      cross-attention between query and doc tokens, not two independent
-      embeddings whose dot product is taken), and it is the standard
-      second-stage scorer behind every retrieve-then-rerank pipeline
-      (cross-encoder/ms-marco-MiniLM-L-6-v2, BAAI/bge-reranker-base,
-      mixedbread/mxbai-rerank). The trunk + [CLS]-pooled head already exist
-      (BuildBertForSequenceClassificationFromSafeTensors, num_labels=1 →
-      regression relevance logit), so the genuinely NEW pieces are: (a) a
-      sentence-PAIR encoding helper that lays out the two segments with the
-      [SEP] separators AND feeds the second segment's SEGMENT/token_type id = 1
-      into the BERT embedding path (today's single-text classification encodes
-      everything as segment 0 — verify the importer's token_type_embeddings
-      table is actually addressable per-position from a caller-supplied
-      segment-id input, and wire it if only segment 0 is reachable); (b) a
-      batch RERANK scorer — score a query against a LIST of candidate passages
-      (one joint forward each, optionally int8 via the BERT backbone's existing
-      pQuantizeInt8 path), apply sigmoid, return passages sorted by relevance;
-      (c) a RerankReport diagnostic (introspection-report pattern) that takes a
-      query + an initially-ranked candidate list with relevance labels and
-      reports MRR/nDCG@k BEFORE vs AFTER reranking, quantifying the precision
-      lift over the bi-encoder order. Deliverables: the pair-encoding helper +
-      RerankPassages scorer in neuralpretrained.pas, TNNet.RerankReport, a pico
-      parity fixture (make_pico_*_fixture.py reuse) asserting the [CLS]
-      relevance logit for a pinned (query, doc) PAIR matches HF
-      AutoModelForSequenceClassification float64 < 1e-4 (the pair/token_type
-      path is the thing under test, NOT the already-verified single-text BERT
-      logits), and an examples/Rerank demo that retrieves with the landed
-      bi-encoder then reorders the top-k with the cross-encoder on CPU (edit
-      examples/README.md, not the main README). High practical NLP value:
-      completes retrieve-then-rerank, the single biggest quality lever in RAG.
 
 ## Layer follow-ups that fix real limitations
 
