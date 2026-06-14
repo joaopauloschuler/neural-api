@@ -107,50 +107,15 @@ rather than acted on.
       with a dedicated LoadGraniteMoEExperts loader for its fused 3-D slabs;
       pico parity TestGranite{Config,Logit,MoeLogit}Parity < 1e-4 vs float64
       HF transformers):
-  - [X] granitemoe `shared_intermediate_size` > 0 (an always-on parallel
-        shared expert, GraniteMoeShared / granite-3.0-3b-a800m) wired: the
-        shared SwiGLU branch (shared_mlp.input_linear [2S,H] fused gate|up +
-        shared_mlp.output_linear [H,S] down, residual_multiplier folded into
-        down) is summed with the routed-MoE output before the FFN residual
-        close. tiny_granitemoeshared.* pico fixture + TestGraniteMoeShared-
-        LogitParity < 1e-4 vs float64 HF GraniteMoeSharedForCausalLM.
   - [ ] real-checkpoint slicer (make_pico_*_fixture.py reuse) to parity-check
         a sliced ibm-granite/granite-3.1-* against the random pico fixture.
-- [X] OLMoE importer (`BuildOlmoeFromSafeTensors[Ex]`, model_type `olmoe`) —
-      the SPARSE sibling of the landed dense OLMo-2 importer
-      (BuildOlmo2FromSafeTensors). OLMoE-1B-7B (allenai/OLMoE-1B-0924) is a
-      fully-open Apache-2.0 MoE LLM, ideal for real-weight parity (small active
-      footprint, public weights + configs). Architecturally it is the OLMo
-      backbone REUSING two landed pieces with NO new layer class: (a) the
-      attention/norm placement is the OLMo line — QK-norm over the FULL head
-      width (the QKNormFullWidth flag already wired for OLMo-2) and RMSNorm; and
-      (b) the FFN is a Mixtral-style top-k router over E experts (reuse the
-      AddTopKMixtureOfExperts / Mixtral MoE WIRING exactly as Qwen3-MoE did =
-      Qwen3 attention × Mixtral MoE). Open the importer on the existing Llama/
-      OLMo path with the three MoE knobs (num_experts, num_experts_per_tok,
-      norm_topk_prob) read from config; gate softmax-over-top-k-logits ==
-      top-k-renorm like the other MoE importers. CHECK FIRST whether OLMoE uses
-      OLMo-2's PostNormReordered (x + Norm(Attn(x))) or the original-OLMo
-      pre-norm placement and wire whichever the HF config/impl dictates — this
-      is the one genuinely model-specific decision. Deliverables: pico parity
-      fixture via the make_pico_*_fixture.py recipe (re-randomized non-trivial
-      router + expert weights asserted to move the HF logits) +
-      TestOlmoe{Config,Logit}Parity < 1e-4 vs float64 HF transformers
-      (OlmoeForCausalLM), plus a real-checkpoint slicer (slice_llama.py reuse)
-      to parity-check a sliced allenai/OLMoE-1B-0924 against the random pico
-      fixture. Pairs with the open Qwen3-MoE "uniform all-MoE only" stance: if
-      OLMoE is also uniformly-MoE this needs no per-layer dense/MoE switching.
-      LANDED: BuildOlmoeFromSafeTensors[Ex] + 'olmoe' config branch
-      (QKNormFullWidth=True, PostNormReordered=FALSE — OLMoE is the ORIGINAL-
-      OLMo PRE-NORM block, NOT OLMo-2's reordered post-norm; confirmed against
-      HF modeling_olmoe.OlmoeDecoderLayer.forward) reusing the Qwen3-MoE MoE
-      wiring (MoEQwen3Naming; expert width = plain intermediate_size). OLMoE is
-      UNIFORMLY all-MoE (no mlp_only_layers/decoder_sparse_step), so no per-
-      layer switching. tools/olmoe_tiny_fixture.py (asserts q/k-norm gains move
-      logits 3.92 and top-k renorm 1.74) + TestOlmoeLogitParity (config +
-      logit, < 1e-4 vs float64 OlmoeForCausalLM, BuildFromPretrained dispatch).
-      Open follow-up: real allenai/OLMoE-1B-0924 slicer parity (the pico
-      fixture is random-init only).
+- [ ] OLMoE real-checkpoint slicer follow-up (BuildOlmoeFromSafeTensors[Ex],
+      model_type `olmoe`, LANDED: OLMo backbone with QK-norm full-width +
+      original-OLMo pre-norm placement × Qwen3-MoE/Mixtral top-k MoE wiring,
+      uniformly all-MoE; pico parity TestOlmoeLogitParity < 1e-4 vs float64 HF
+      OlmoeForCausalLM): the pico fixture is random-init only — add a real
+      allenai/OLMoE-1B-0924 slicer (slice_llama.py reuse) to parity-check a
+      sliced real checkpoint against the random pico fixture.
 - [ ] BitNet b1.58 importer (`BuildBitNetFromSafeTensors[Ex]`, model_type
       "bitnet" / the released `microsoft/bitnet-b1.58-2B-4T`) — the ternary-
       weight LLM family, the one importer that maps a real released checkpoint
@@ -411,27 +376,15 @@ rather than acted on.
       storage ([[int8-quantized-inference]]) instead of quantizing-on-write
       from F32 (avoids the dequantize-then-requantize round trip when the
       source layers already hold int8 blocks).
-- [X] GGUF writer follow-up: wire tools/verify_gguf_writer.py to assert
-      next-token-logit parity against the Pascal model via llama-cpp-python
-      (when installed), and emit the BPE merges array for byte-level-BPE
-      tokenizers (v1 emits SP-style tokens/scores/token_type only).
-      DONE: TNeuralHFTokenizer.SaveTokenizerToGGUF emits model "gpt2" +
-      tokenizer.ggml.merges (rank-ordered) + tokens/scores/token_type + special
-      ids (the exact inverse of LoadFromGGUF), and "llama" Unigram-with-scores;
-      WordPiece rejected. Round-trip test TestSaveTokenizerToGGUFGpt2RoundTrip
-      (Pascal tokenizer -> writer -> reader, Encode/Decode id-identical) passes.
-      verify_gguf_writer.py now cross-checks next-token-logit parity (greedy
-      argmax + top-k ranking) via llama-cpp-python when importable and SKIPS
-      gracefully otherwise; the Pascal sidecar carries parity_prompt +
-      parity_next_token_logits. NOTE: the llama-cpp-python parity arm is wired
-      but UNVERIFIED end-to-end here (lib not installed in this env, and the
-      pico demo GGUF may be too small for llama.cpp to load) - it is written to
-      skip-not-fail; revisit once llama-cpp-python is available to confirm the
-      argmax/ranking actually agree on a real checkpoint.
-      Still open: SaveLlamaToGGUFEx itself still only takes a plain `Tokens`
-      array (SP "llama" model); a byte-level-BPE end-to-end model export would
-      route the gpt2 tokenizer block through SaveTokenizerToGGUF from the model
-      exporter, not just the tokenizer unit test.
+- [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
+      (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
+      llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
+      only takes a plain `Tokens` array (SP "llama" model) — route the gpt2
+      tokenizer block through SaveTokenizerToGGUF from the MODEL exporter (not
+      just the tokenizer unit test). Also: the llama-cpp-python parity arm is
+      wired but UNVERIFIED end-to-end (lib not installed here; pico demo GGUF may
+      be too small for llama.cpp) — confirm argmax/ranking agree on a real
+      checkpoint once the lib is available.
 - [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.
@@ -485,23 +438,6 @@ rather than acted on.
       alongside tokenizer_config.json~~ [DONE: LoadChatTemplateString sibling
       fallback]; continue_final_message / return_assistant_tokens_mask
       equivalents.
-- [X] Magnitude pruning (torch.nn.utils.prune port): DONE.
-      [X] diagnostics half (TNNet.MagnitudePruningReport +
-          examples/MagnitudePruning prune-and-restore sweep);
-      [X] PERSISTENT global or per-layer magnitude masks that STAY applied
-          through training/inference — TNNet.PruneWeightsByMagnitude(Sparsity,
-          PerLayer) installs a per-layer keep/prune mask (TNNetLayer.FPruneMask),
-          re-enforced via TNNetLayer.ZeroPrunedWeights() inside the base
-          AfterWeightUpdate hook (covers both the batch UpdateWeights path and
-          the inline online TNNetFullConnect.BackpropagateCPU path); pruned
-          weights AND their delta/inertia/Adam-moment entries are zeroed so they
-          never regrow. Helpers: ApplyPruneMasks/HasPruneMasks/ClearPruneMasks/
-          CountPrunedWeights/GetPruneSparsity (+ layer-level
-          BuildPruneMaskFromThreshold/ApplyPruneMask/HasPruneMask/ClearPruneMask/
-          CountPrunedWeights). Test: TestPersistentPruneMask;
-      [X] fine-tune-after-prune example showing accuracy recovery —
-          examples/MagnitudePruneFineTune (dense -> prune -> fine-tune with mask
-          enforced, before/after accuracy printed per sparsity).
 - [ ] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
       with forward/backward wall-time and parameter/activation memory per
       layer (introspection-report pattern). Directly serves the open
@@ -541,26 +477,12 @@ rather than acted on.
       blocks to int8 on append, dequantize on read inside
       TNNetStreamingDecoder; assert logit drift vs the FP32 cache stays
       within a documented tolerance on the pico-Llama parity fixture.
-- [X] GRPO trainer (DeepSeekMath/R1-style group-relative policy
-      optimization) in neural/neuraldpo.pas or a sibling unit: sample N
-      completions per prompt, advantage = (reward - group mean)/group std,
-      policy-gradient step with a KL penalty against the reference — no
-      value network, so it is the one RL-from-feedback method that fits this
-      framework. The DPO trainer already holds policy+reference and computes
-      per-sequence logprobs, and sampled streamed generation already exists
-      in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
-      (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
-      reward-model trainer to feed GRPO real rewards.
-      LANDED: TNeuralGRPOTrainer sibling class in neural/neuraldpo.pas
-      (configurable GroupSize/Beta/ClipEpsilon/MaxNewTokens/Temperature,
-      pluggable TNeuralGRPORewardEvent method-ref reward, TrainOnPrompt that
-      samples the group, computes group-relative advantages, and does the
-      PG + DeepSeek-k3 per-token KL backward reusing the DPO softmax-backward
-      plumbing). Tests in tests/TestNeuralGRPO.pas (advantage normalization,
-      zero-variance->zero-advantage, learning-signal P(target token) up).
-      STILL OPEN cheap follow-ups: ORPO / SimPO / KTO loss-formula deltas on
-      the landed DPO trainer, and a Bradley-Terry pairwise reward-model
-      trainer to feed GRPO real (learned) rewards.
+- [ ] Preference-optimization follow-ups on the landed DPO/GRPO trainers
+      (TNeuralGRPOTrainer in neural/neuraldpo.pas LANDED: group-relative
+      advantages + PG + DeepSeek-k3 per-token KL reusing the DPO softmax-backward
+      plumbing, tests in tests/TestNeuralGRPO.pas): ORPO / SimPO / KTO
+      loss-formula deltas on the landed DPO trainer, and a Bradley-Terry pairwise
+      reward-model trainer to feed GRPO real (learned) rewards.
 - [ ] Offset-mapping follow-up: EncodeWithOffsets (commit 1e90b8a) is a
       post-hoc surface-match heuristic (each token's DecodeToken surface
       located forward at the running cursor), so it leaves tokens unmapped
