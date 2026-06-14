@@ -475,6 +475,7 @@ type
     procedure TestWKVInputGradientCheck;
     procedure TestWKVWeightGradientCheck;
     procedure TestWKVSerializationRoundTrip;
+    procedure TestWKVIncrementalDecodeEquivalence;
     procedure TestLRUShapeInference;
     procedure TestLRUInputGradientCheck;
     procedure TestLRUWeightGradientCheck;
@@ -28346,6 +28347,116 @@ begin
   // sweep (not persisted); FStruct[0]=C. Input depth must be 2*C=4 -> C=2.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetWKV.Create(), 'WKV', 4, 1, 4, 1e-5);
+end;
+
+// Headline correctness for the O(1)-per-step incremental decode path: feeding a
+// sequence token-by-token through ComputeIncremental() must reproduce the full
+// parallel-scan Compute() output BIT-CLOSE. This is the exact-vs-fast
+// equivalence assert used across the chunked-forward family.
+procedure TTestNeuralNumerical.TestWKVIncrementalDecodeEquivalence;
+var
+  NNFull, NNInc: TNNet;
+  InFull, InInc: TNNetInput;
+  LFull, LInc: TNNetWKV;
+  SeqLen, C, t, d, n: integer;
+  v, maxErr, e: TNeuralFloat;
+  Snap: TNNetVolume;
+  Steps: integer;
+begin
+  RandSeed := 424242;
+  SeqLen := 12;
+  C := 4;                       // input depth = 2*C = 8 (k|v split)
+  NNFull := TNNet.Create();
+  NNInc := TNNet.Create();
+  Snap := TNNetVolume.Create();
+  try
+    InFull := TNNetInput.Create(SeqLen, 1, 2 * C, 1);
+    NNFull.AddLayer(InFull);
+    LFull := TNNetWKV.Create();
+    NNFull.AddLayer(LFull);
+
+    // Second net with a SINGLE-token input (the decode-step shape) sharing the
+    // same weights so the two paths are weight-identical.
+    InInc := TNNetInput.Create(1, 1, 2 * C, 1);
+    NNInc.AddLayer(InInc);
+    LInc := TNNetWKV.Create();
+    NNInc.AddLayer(LInc);
+    // Perturb weights away from defaults, then copy into the incremental net.
+    for n := 0 to 1 do
+      for d := 0 to C - 1 do
+        LFull.Neurons[n].Weights.FData[d] :=
+          LFull.Neurons[n].Weights.FData[d] + 0.7 * (Random - 0.5);
+    LInc.Neurons[0].Weights.Copy(LFull.Neurons[0].Weights);
+    LInc.Neurons[1].Weights.Copy(LFull.Neurons[1].Weights);
+
+    // Random k|v input sequence; the same rows feed both paths.
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to 2 * C - 1 do
+        InFull.Output[t, 0, d] := 1.5 * (Random - 0.5);
+
+    // Parallel/prefill path: full-sequence scan in one Compute().
+    NNFull.Compute(InFull.Output);
+
+    // Incremental path: one token at a time, state carried across calls.
+    LInc.BeginIncrementalDecode();
+    maxErr := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to 2 * C - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to C - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    WriteLn('WKV incremental-decode vs full-scan max abs error: ', maxErr:0:10);
+    AssertTrue('WKV incremental decode matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+
+    // CaptureState/RestoreState fork: snapshot mid-way, advance, restore, and
+    // re-advance must reproduce the same outputs.
+    LInc.ResetState();
+    for t := 0 to 5 do
+    begin
+      for d := 0 to 2 * C - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    LInc.CaptureState(Snap, Steps);
+    AssertEquals('CaptureState step count', 6, Steps);
+    // Advance to the end from the snapshot, recording outputs.
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to 2 * C - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    // Restore the snapshot and re-run the tail; outputs must match full scan.
+    LInc.RestoreState(Snap, Steps);
+    maxErr := 0;
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to 2 * C - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to C - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    AssertTrue('WKV restored-state tail matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+    LInc.EndIncrementalDecode();
+    // Suppress unused-var warnings on v / n.
+    v := 0; v := v;
+  finally
+    Snap.Free;
+    NNInc.Free;
+    NNFull.Free;
+  end;
 end;
 
 // --- TNNetLRU (Linear Recurrent Unit, Orvieto et al. 2023) -------------------

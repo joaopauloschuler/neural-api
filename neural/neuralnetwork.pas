@@ -6404,6 +6404,13 @@ type
       FA: TNNetVolume;          // cached true accumulator a_t, (SeqLen,1,C)
       FB: TNNetVolume;          // cached true accumulator b_t, (SeqLen,1,C)
       FGradW, FGradU: TNNetVolume; // C-long grad accumulators
+      // --- incremental-decode state (inference only, not serialized) ---
+      FDecodeEnabled: boolean;
+      FDecodeSteps: integer;    // tokens consumed since Begin/ResetState
+      FDecAA: TNNetVolume;      // persisted stabilised numerator A, C-long
+      FDecBB: TNNetVolume;      // persisted stabilised denominator B, C-long
+      FDecPP: TNNetVolume;      // persisted log-space running max Q, C-long
+      procedure ComputeIncremental();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -6411,6 +6418,27 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      // Enable the O(1)-per-step incremental-decode path. The running RWKV-v4
+      // numerator/denominator state (A,B,Q) is a fixed C-long triple, so there
+      // is no MaxContext budget (contrast the attention KV cache). The sequence
+      // starts fresh (A=B=0, Q=-inf). Mirrors TNNetDiagonalSSM /
+      // TNNetScaledDotProductAttention Begin/End/Reset so a decoder can drive
+      // every recurrent layer type uniformly.
+      procedure BeginIncrementalDecode();
+      // Disable the incremental path; return to the normal full-sequence forward.
+      procedure EndIncrementalDecode();
+      // Start a fresh sequence (A=B=0, Q=-inf).
+      procedure ResetState();
+      // Alias for ResetState() to match the SDPA cache vocabulary.
+      procedure ResetCache();
+      // Session snapshot / fork support (mirrors TNNetDiagonalSSM): CaptureState
+      // copies the persisted (A,B,Q) triple and step count out; RestoreState
+      // copies them back so a continuation resumes from the snapshot. Dst must
+      // be (1,1,3*C) (A|B|Q concatenated on Depth). A deep copy, so one snapshot
+      // forks many sessions.
+      procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
+      procedure RestoreState(Src: TNNetVolume; Steps: integer);
+      property DecodeEnabled: boolean read FDecodeEnabled;
   end;
 
   /// TNNetCrossWKV: a TWO-SOURCE key/value variant of the RWKV-4 WKV
@@ -37773,12 +37801,20 @@ begin
   FB := TNNetVolume.Create();
   FGradW := TNNetVolume.Create();
   FGradU := TNNetVolume.Create();
+  FDecAA := TNNetVolume.Create();
+  FDecBB := TNNetVolume.Create();
+  FDecPP := TNNetVolume.Create();
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
   // [0]=w_raw [1]=u
   AddMissingNeurons(2);
 end;
 
 destructor TNNetWKV.Destroy();
 begin
+  FDecPP.Free;
+  FDecBB.Free;
+  FDecAA.Free;
   FGradU.Free;
   FGradW.Free;
   FB.Free;
@@ -37816,6 +37852,9 @@ begin
   FB.ReSize(FOutput.SizeX, 1, FChannels);
   FGradW.ReSize(1, 1, FChannels);
   FGradU.ReSize(1, 1, FChannels);
+  FDecAA.ReSize(1, 1, FChannels);
+  FDecBB.ReSize(1, 1, FChannels);
+  FDecPP.ReSize(1, 1, FChannels);
   InitDefault();
 end;
 
@@ -37829,6 +37868,11 @@ var
   ww2, qmax2, e3, e4: TNeuralFloat;
   anew, bnew: TNeuralFloat;
 begin
+  if FDecodeEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   Ww := FNeurons[0].FWeights;
@@ -37885,6 +37929,139 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Inference-only stateful forward. The per-token recurrence is ALGEBRAICALLY
+// IDENTICAL to one step of Compute()'s full-sequence scan (same RWKV-v4
+// running-max stabiliser), but the running stabilised state (A,B,Q) resumes
+// from the PERSISTED FDecAA/FDecBB/FDecPP (carried across calls) instead of
+// starting at (0,0,-inf), the true-accumulator BPTT cache FA/FB is NOT written,
+// and the loop is O(1) in past context (it only sweeps the SeqLen supplied this
+// call - one token for a decode step, many for a prompt prefill). Driving the
+// whole sequence token-by-token through this path reproduces the full-scan
+// output bit-for-bit.
+procedure TNNetWKV.ComputeIncremental();
+var
+  StartTime: double;
+  Ww, Wu, Prev: TNNetVolume;
+  SeqLen, C, t, d: integer;
+  wv, uv, kt, vt, aprev, bprev: TNeuralFloat;
+  qprev, ww1, qmax, e1, e2, num, den: TNeuralFloat;
+  ww2, qmax2, e3, e4, anew, bnew: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  Ww := FNeurons[0].FWeights;
+  Wu := FNeurons[1].FWeights;
+  SeqLen := FOutput.SizeX;
+  C := FChannels;
+  // Per-channel positive decay w = softplus(w_raw) (same as Compute()).
+  for d := 0 to C - 1 do
+  begin
+    if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
+    else FW.FData[d] := Ln(1 + Exp(Ww.FData[d]));
+  end;
+  for d := 0 to C - 1 do
+  begin
+    wv := FW.FData[d];
+    uv := Wu.FData[d];
+    // Resume the stabilised state from the persisted triple (NOT zero).
+    aprev := FDecAA.FData[d];
+    bprev := FDecBB.FData[d];
+    qprev := FDecPP.FData[d];
+    for t := 0 to SeqLen - 1 do
+    begin
+      kt := Prev.FData[Prev.GetRawPos(t, 0, d)];          // key channel d
+      vt := Prev.FData[Prev.GetRawPos(t, 0, C + d)];      // value channel d
+      // OUTPUT step: bonus path weights the current token by e^{u+k}.
+      ww1 := uv + kt;
+      qmax := qprev;
+      if ww1 > qmax then qmax := ww1;
+      e1 := Exp(qprev - qmax);
+      e2 := Exp(ww1 - qmax);
+      num := e1 * aprev + e2 * vt;
+      den := e1 * bprev + e2;
+      FOutput.FData[FOutput.GetRawPos(t, 0, d)] := num / den;
+      // STATE step: decay path. a_t = e^{-w} a_{t-1} + e^{k} v.
+      ww2 := (-wv) + qprev;
+      qmax2 := ww2;
+      if kt > qmax2 then qmax2 := kt;
+      e3 := Exp(ww2 - qmax2);
+      e4 := Exp(kt - qmax2);
+      anew := e3 * aprev + e4 * vt;
+      bnew := e3 * bprev + e4;
+      aprev := anew;
+      bprev := bnew;
+      qprev := qmax2;
+    end;
+    // Persist the advanced stabilised state for the next call.
+    FDecAA.FData[d] := aprev;
+    FDecBB.FData[d] := bprev;
+    FDecPP.FData[d] := qprev;
+  end;
+  Inc(FDecodeSteps, SeqLen);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetWKV.BeginIncrementalDecode();
+begin
+  // The persisted state is one C-long (A,B,Q) triple; no MaxContext budget is
+  // needed (contrast the attention KV cache). The buffers are already sized by
+  // SetPrevLayer; ReSize is a safety net for layers wired manually.
+  FDecAA.ReSize(1, 1, FChannels);
+  FDecBB.ReSize(1, 1, FChannels);
+  FDecPP.ReSize(1, 1, FChannels);
+  ResetState();
+  FDecodeEnabled := true;
+end;
+
+procedure TNNetWKV.EndIncrementalDecode();
+begin
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetWKV.ResetState();
+var
+  d: integer;
+begin
+  FDecAA.Fill(0);            // A_{-1} = 0
+  FDecBB.Fill(0);            // B_{-1} = 0
+  for d := 0 to FChannels - 1 do
+    FDecPP.FData[d] := -1e30;  // Q_{-1} = -inf (log-space running max)
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetWKV.ResetCache();
+begin
+  ResetState();
+end;
+
+procedure TNNetWKV.CaptureState(Dst: TNNetVolume; out Steps: integer);
+var
+  d: integer;
+begin
+  Dst.ReSize(1, 1, 3 * FChannels);
+  for d := 0 to FChannels - 1 do
+  begin
+    Dst.FData[d]                := FDecAA.FData[d];
+    Dst.FData[FChannels + d]    := FDecBB.FData[d];
+    Dst.FData[2 * FChannels + d]:= FDecPP.FData[d];
+  end;
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetWKV.RestoreState(Src: TNNetVolume; Steps: integer);
+var
+  d: integer;
+begin
+  for d := 0 to FChannels - 1 do
+  begin
+    FDecAA.FData[d] := Src.FData[d];
+    FDecBB.FData[d] := Src.FData[FChannels + d];
+    FDecPP.FData[d] := Src.FData[2 * FChannels + d];
+  end;
+  FDecodeSteps := Steps;
 end;
 
 procedure TNNetWKV.Backpropagate();
