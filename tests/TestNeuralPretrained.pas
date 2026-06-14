@@ -276,6 +276,7 @@ type
     procedure TestResNet18ImageClassificationParity;
     procedure TestVaeDecoderConfigFromJSONFile;
     procedure TestVaeDecoderParity;
+    procedure TestRRDBNetParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
     procedure TestWhisperLogMelFrontend;
@@ -12746,6 +12747,86 @@ begin
   finally
     RefRoot.Free;
     LatentInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Parity test for the Real-ESRGAN / ESRGAN RRDBNet (scale x4) importer against
+// the committed tiny float64 numpy oracle (tools/rrdbnet_tiny_fixture.py).
+procedure TTestNeuralPretrained.TestRRDBNetParity;
+var
+  NN: TNNet;
+  Config: TRRDBNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  InputArr, ChanArr, RowArr, ImgArr: TJSONArray;
+  ImgInput: TNNetVolume;
+  ImgSize: integer;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildRRDBNetFromSafeTensors(
+    FixturePath('tiny_rrdbnet.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_rrdbnet_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.InputSize, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_rrdbnet_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
+    ImgSize := TJSONObject(RefRoot).Get('image_size', 0);
+    AssertTrue('input present', InputArr <> nil);
+    AssertEquals('output image grid', Config.InputSize * Config.Scale,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output grid vs oracle', ImgSize,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.NumOutCh,
+      NN.GetLastLayer().Output.Depth);
+
+    // Load the (C,H,W) input into the CAI (x,y,depth)-indexed volume.
+    ImgInput.ReSize(Config.InputSize, Config.InputSize, Config.NumInCh);
+    for ChanCnt := 0 to Config.NumInCh - 1 do
+    begin
+      RowArr := TJSONArray(InputArr.Items[ChanCnt]);
+      for YCnt := 0 to Config.InputSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.InputSize - 1 do
+          ImgInput.FData[
+            (YCnt * Config.InputSize + XCnt) * Config.NumInCh + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImgInput);
+    // Compare the (C,H,W) oracle vs the CAI (x,y,depth) output volume.
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumOutCh - 1 do
+    begin
+      RowArr := TJSONArray(ImgArr.Items[ChanCnt]);
+      for YCnt := 0 to ImgSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to ImgSize - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := NN.GetLastLayer().Output.FData[
+            (YCnt * ImgSize + XCnt) * Config.NumOutCh + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('super-res RGB: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
     RefJson.Free;
     NN.Free;
   end;

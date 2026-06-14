@@ -4295,8 +4295,13 @@ type
       FAlpha: TNeuralFloat;
       FThreshold: TNeuralFloat;
     public
-      constructor Create(); override;
+      constructor Create(); overload; override;
+      // Creates a LeakyReLU with a user-configurable negative slope `pAlpha`
+      // (e.g. 0.2 for ESRGAN/Real-ESRGAN). The slope is stored in FFloatSt[0]
+      // for serialization so the layer round-trips through Save/LoadFromString.
+      constructor Create(pAlpha: TNeuralFloat); overload;
       procedure Compute(); override;
+      property Alpha: TNeuralFloat read FAlpha;
   end;
 
   /// Very Leaky Rectified Linear Unit (ReLU) layer.
@@ -34088,6 +34093,7 @@ constructor TNNetVeryLeakyReLU.Create();
 begin
   inherited Create();
   FAlpha := 1/3;
+  FFloatSt[0] := FAlpha;
 end;
 
 { TNNetRReLU }
@@ -34175,6 +34181,15 @@ begin
   inherited Create();
   FAlpha := 0.01;
   FThreshold := 0.0;
+  FFloatSt[0] := FAlpha;
+end;
+
+constructor TNNetLeakyReLU.Create(pAlpha: TNeuralFloat);
+begin
+  inherited Create();
+  FAlpha := pAlpha;
+  FThreshold := 0.0;
+  FFloatSt[0] := FAlpha;
 end;
 
 procedure TNNetLeakyReLU.Compute();
@@ -87467,7 +87482,7 @@ begin
       'TNNetSignedSquareRoot' :     Result := TNNetSignedSquareRoot.Create();
       'TNNetSignedSquareRoot1' :    Result := TNNetSignedSquareRoot1.Create();
       'TNNetSignedSquareRootN' :    Result := TNNetSignedSquareRootN.Create(Ft[0]);
-      'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create();
+      'TNNetLeakyReLU' :            Result := TNNetLeakyReLU.Create(Ft[0]);
       'TNNetVeryLeakyReLU' :        Result := TNNetVeryLeakyReLU.Create();
       'TNNetSigmoid' :              Result := TNNetSigmoid.Create();
       'TNNetPonderHalting' :        Result := TNNetPonderHalting.Create(St[0], Ft[0]);
@@ -87859,7 +87874,7 @@ begin
       if S[0] = 'TNNetSignedSquareRoot' then Result := TNNetSignedSquareRoot.Create() else
       if S[0] = 'TNNetSignedSquareRoot1' then Result := TNNetSignedSquareRoot1.Create() else
       if S[0] = 'TNNetSignedSquareRootN' then Result := TNNetSignedSquareRootN.Create(Ft[0]) else
-      if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create() else
+      if S[0] = 'TNNetLeakyReLU' then Result := TNNetLeakyReLU.Create(Ft[0]) else
       if S[0] = 'TNNetVeryLeakyReLU' then Result := TNNetVeryLeakyReLU.Create() else
       if S[0] = 'TNNetSigmoid' then Result := TNNetSigmoid.Create() else
       if S[0] = 'TNNetPonderHalting' then Result := TNNetPonderHalting.Create(St[0], Ft[0]) else

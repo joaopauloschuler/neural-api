@@ -4996,6 +4996,58 @@ function BuildVaeDecoderFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// REAL-ESRGAN / ESRGAN SUPER-RESOLUTION IMPORT (RRDBNet, e.g.
+// xinntao/Real-ESRGAN x4). The FIRST imported generative-image model that runs
+// end-to-end on CPU with NO diffusion loop - it is a pure-convolutional
+// Residual-in-Residual Dense Block network. The architecture (canonical
+// xinntao RRDBNet):
+//   conv_first (3x3, in_ch -> nf)
+//   body: num_block RRDB; each RRDB = 3 ResidualDenseBlocks (rdb1,rdb2,rdb3)
+//     output = x + 0.2 * rdb3(rdb2(rdb1(x)));
+//     each RDB = 5 conv (3x3) with DENSE channel-concat skips
+//       (TNNetDeepConcat); LeakyReLU(0.2) after convs 1..4; conv5 -> nf;
+//       rdb_out = x + 0.2 * conv5_out.
+//   conv_body (3x3, nf -> nf); feat = feat + conv_body(body(feat))  [global res]
+//   upsample x4: two (nearest-2x + 3x3 conv + LeakyReLU(0.2)) stages using
+//     TNNetDeMaxPool(2) for the F.interpolate(mode='nearest') 2x upsample.
+//   conv_hr (3x3, nf -> nf) + LeakyReLU(0.2); conv_last (3x3, nf -> out_ch).
+// state_dict keys: conv_first.{weight,bias}, body.{i}.rdb{1,2,3}.conv{1..5}.*,
+// conv_body.*, conv_up1.*, conv_up2.*, conv_hr.*, conv_last.*.
+// Only scale=4 (two upsample stages) is wired in v1; the realesrgan .pth pickle
+// load is a follow-up (use safetensors here).
+type
+  TRRDBNetConfig = record
+    NumInCh: integer;     // input channels (3)
+    NumOutCh: integer;    // output channels (3)
+    NumFeat: integer;     // nf (typically 64)
+    NumBlock: integer;    // number of RRDB blocks in the body
+    NumGrowCh: integer;   // gc growth channels (typically 32)
+    Scale: integer;       // upscaling factor (4)
+    InputSize: integer;   // input image grid H=W for the Input layer
+    ModelType: string;    // 'rrdbnet'
+  end;
+
+// Reads an RRDBNet config. Required: num_feat, num_block. Optional: num_in_ch
+// (3), num_out_ch (3), num_grow_ch (32), scale (4), input_size, model_type.
+function ReadRRDBNetConfigFromJSONFile(
+  const FileName: string): TRRDBNetConfig;
+
+function RRDBNetConfigToString(const Config: TRRDBNetConfig): string;
+
+// Builds the RRDBNet described by Config and loads every weight from Reader
+// (caller owns Reader). The net takes a (InputSize, InputSize, NumInCh) image
+// and outputs a (InputSize*Scale)^2 image with NumOutCh channels (raw).
+function BuildRRDBNet(Reader: TNNetSafeTensorsReader;
+  const Config: TRRDBNetConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildRRDBNetFromSafeTensorsEx(const FileName: string;
+  const Config: TRRDBNetConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildRRDBNetFromSafeTensors(const FileName: string;
+  out Config: TRRDBNetConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // DINOv2 SELF-SUPERVISED ViT IMPORT (model_type "dinov2") for general-purpose
 // VISUAL EMBEDDINGS (facebook/dinov2-{small,base,large}). The architecture is
 // the same pre-LN ViT encoder path as the plain "vit" importer above (reusing
@@ -31840,6 +31892,269 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadVaeDecoderConfigFromJSONFile(ConfigPath);
   Result := BuildVaeDecoderFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// REAL-ESRGAN / ESRGAN SUPER-RESOLUTION IMPORT (RRDBNet)
+// ===========================================================================
+
+function ReadRRDBNetConfigFromJSONFile(
+  const FileName: string): TRRDBNetConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('RRDBNet import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('RRDBNet import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('RRDBNet import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('RRDBNet import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('RRDBNet import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'rrdbnet');
+    Result.NumFeat := RequiredInt('num_feat');
+    Result.NumBlock := RequiredInt('num_block');
+    Result.NumInCh := Obj.Get('num_in_ch', 3);
+    Result.NumOutCh := Obj.Get('num_out_ch', 3);
+    Result.NumGrowCh := Obj.Get('num_grow_ch', 32);
+    Result.Scale := Obj.Get('scale', 4);
+    Result.InputSize := Obj.Get('input_size', 0);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RRDBNetConfigToString(const Config: TRRDBNetConfig): string;
+begin
+  Result := Config.ModelType + ' config: num_feat=' + IntToStr(Config.NumFeat) +
+    ', num_block=' + IntToStr(Config.NumBlock) +
+    ', num_grow_ch=' + IntToStr(Config.NumGrowCh) +
+    ', in_ch=' + IntToStr(Config.NumInCh) +
+    ', out_ch=' + IntToStr(Config.NumOutCh) +
+    ', scale=' + IntToStr(Config.Scale) +
+    ', input_size=' + IntToStr(Config.InputSize);
+end;
+
+type
+  // The 5 dense convs of one ResidualDenseBlock.
+  TRDBLayers = record
+    Conv: array[0..4] of TNNetLayer;
+  end;
+  TRRDBLayers = record
+    Rdb: array[0..2] of TRDBLayers;  // rdb1, rdb2, rdb3
+  end;
+
+// Adds (architecture) one ResidualDenseBlock. The block input feeds 5 dense
+// 3x3 convs; conv k>0 takes the DEPTH concat of the input plus all previous
+// conv outputs (TNNetDeepConcat). LeakyReLU(0.2) follows convs 0..3; conv4
+// produces nf channels; the block output is input + 0.2 * conv4_out.
+procedure AddRRDBResidualDenseBlock(NN: TNNet; const Config: TRRDBNetConfig;
+  out Refs: TRDBLayers);
+var
+  Input: TNNetLayer;
+  Acts: array[0..3] of TNNetLayer;  // post-LeakyReLU outputs x1..x4
+  Scaled: TNNetLayer;
+  k: integer;
+begin
+  Input := NN.GetLastLayer();
+  for k := 0 to 4 do
+  begin
+    if k = 0 then
+      // conv1 sees just the block input (already the last layer).
+      Refs.Conv[k] := NN.AddLayer(
+        TNNetConvolutionLinear.Create(Config.NumGrowCh, 3, 1, 1, 0) )
+    else
+    begin
+      // Depth-concat the input with all previous activations, then conv.
+      case k of
+        1: NN.AddLayer( TNNetDeepConcat.Create([Input, Acts[0]]) );
+        2: NN.AddLayer( TNNetDeepConcat.Create([Input, Acts[0], Acts[1]]) );
+        3: NN.AddLayer(
+             TNNetDeepConcat.Create([Input, Acts[0], Acts[1], Acts[2]]) );
+        4: NN.AddLayer( TNNetDeepConcat.Create(
+             [Input, Acts[0], Acts[1], Acts[2], Acts[3]]) );
+      end;
+      if k < 4 then
+        Refs.Conv[k] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(Config.NumGrowCh, 3, 1, 1, 0) )
+      else
+        Refs.Conv[k] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(Config.NumFeat, 3, 1, 1, 0) );
+    end;
+    if k < 4 then
+      Acts[k] := NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
+  end;
+  // rdb_out = input + 0.2 * conv5_out.
+  Scaled := NN.AddLayer( TNNetMulByConstant.Create(0.2) );
+  NN.AddLayer( TNNetSum.Create([Scaled, Input]) );
+end;
+
+// Adds one RRDB = 3 chained ResidualDenseBlocks with output = x + 0.2*chain(x).
+procedure AddRRDB(NN: TNNet; const Config: TRRDBNetConfig;
+  out Refs: TRRDBLayers);
+var
+  Input, Scaled: TNNetLayer;
+  r: integer;
+begin
+  Input := NN.GetLastLayer();
+  for r := 0 to 2 do
+    AddRRDBResidualDenseBlock(NN, Config, Refs.Rdb[r]);
+  Scaled := NN.AddLayer( TNNetMulByConstant.Create(0.2) );
+  NN.AddLayer( TNNetSum.Create([Scaled, Input]) );
+end;
+
+procedure LoadRDB(Reader: TNNetSafeTensorsReader; const Refs: TRDBLayers;
+  const Prefix: string; const Config: TRRDBNetConfig);
+var
+  nf, gc, k, InCh, OutCh: integer;
+  Name: string;
+begin
+  nf := Config.NumFeat;
+  gc := Config.NumGrowCh;
+  for k := 0 to 4 do
+  begin
+    InCh := nf + k * gc;
+    if k < 4 then OutCh := gc else OutCh := nf;
+    Name := Prefix + 'conv' + IntToStr(k + 1);
+    LoadVaeConv(Reader, Refs.Conv[k], Name + '.weight', Name + '.bias',
+      OutCh, InCh, 3);
+  end;
+end;
+
+procedure LoadRRDB(Reader: TNNetSafeTensorsReader; const Refs: TRRDBLayers;
+  const Prefix: string; const Config: TRRDBNetConfig);
+var
+  r: integer;
+begin
+  for r := 0 to 2 do
+    LoadRDB(Reader, Refs.Rdb[r], Prefix + 'rdb' + IntToStr(r + 1) + '.', Config);
+end;
+
+function BuildRRDBNet(Reader: TNNetSafeTensorsReader;
+  const Config: TRRDBNetConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  ConvFirst, FeatRef, ConvBody, ConvUp1, ConvUp2, ConvHR, ConvLast: TNNetLayer;
+  Blocks: array of TRRDBLayers;
+  nf, i, UpStages, s: integer;
+begin
+  if Config.NumFeat < 1 then
+    ImportError('RRDBNet import: num_feat must be >= 1.');
+  if Config.NumBlock < 1 then
+    ImportError('RRDBNet import: num_block must be >= 1.');
+  if Config.InputSize < 1 then
+    ImportError('RRDBNet import: input_size must be >= 1.');
+  if Config.Scale <> 4 then
+    ImportError('RRDBNet import: only scale=4 is supported in v1, got ' +
+      IntToStr(Config.Scale) + '.');
+  nf := Config.NumFeat;
+  UpStages := 2;  // scale 4 = two 2x nearest-upsample stages.
+  SetLength(Blocks, Config.NumBlock);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.InputSize, Config.InputSize,
+      Config.NumInCh) );
+    ConvFirst := NN.AddLayer(
+      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+    FeatRef := ConvFirst;  // global residual / upsample feeder
+    for i := 0 to Config.NumBlock - 1 do
+      AddRRDB(NN, Config, Blocks[i]);
+    ConvBody := NN.AddLayer(
+      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+    // Global residual: feat = conv_first + conv_body(body(conv_first)).
+    NN.AddLayer( TNNetSum.Create([ConvBody, FeatRef]) );
+    // Upsample x4: two (nearest-2x + 3x3 conv + LeakyReLU(0.2)) stages.
+    ConvUp1 := nil; ConvUp2 := nil;
+    for s := 0 to UpStages - 1 do
+    begin
+      NN.AddLayer( TNNetDeMaxPool.Create(2) );  // nearest 2x upsample
+      if s = 0 then
+      begin
+        ConvUp1 := NN.AddLayer(
+          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+      end
+      else
+      begin
+        ConvUp2 := NN.AddLayer(
+          TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+      end;
+      NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
+    end;
+    ConvHR := NN.AddLayer(
+      TNNetConvolutionLinear.Create(nf, 3, 1, 1, 0) );
+    NN.AddLayer( TNNetLeakyReLU.Create(0.2) );
+    ConvLast := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.NumOutCh, 3, 1, 1, 0) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadVaeConv(Reader, ConvFirst, 'conv_first.weight', 'conv_first.bias',
+      nf, Config.NumInCh, 3);
+    for i := 0 to Config.NumBlock - 1 do
+      LoadRRDB(Reader, Blocks[i], 'body.' + IntToStr(i) + '.', Config);
+    LoadVaeConv(Reader, ConvBody, 'conv_body.weight', 'conv_body.bias',
+      nf, nf, 3);
+    LoadVaeConv(Reader, ConvUp1, 'conv_up1.weight', 'conv_up1.bias', nf, nf, 3);
+    LoadVaeConv(Reader, ConvUp2, 'conv_up2.weight', 'conv_up2.bias', nf, nf, 3);
+    LoadVaeConv(Reader, ConvHR, 'conv_hr.weight', 'conv_hr.bias', nf, nf, 3);
+    LoadVaeConv(Reader, ConvLast, 'conv_last.weight', 'conv_last.bias',
+      Config.NumOutCh, nf, 3);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildRRDBNetFromSafeTensorsEx(const FileName: string;
+  const Config: TRRDBNetConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildRRDBNet(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildRRDBNetFromSafeTensors(const FileName: string;
+  out Config: TRRDBNetConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRRDBNetConfigFromJSONFile(ConfigPath);
+  Result := BuildRRDBNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

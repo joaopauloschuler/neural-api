@@ -353,14 +353,22 @@ rather than acted on.
       loader path. Pico parity vs a numpy float64 oracle producing ImageNet-1k
       logits; depthwise conv groups must map onto the existing grouped/separable
       conv layers (verify the channel-grouping math first).
-- [ ] Real-ESRGAN / ESRGAN super-resolution model importer (RRDBNet,
+- [X] Real-ESRGAN / ESRGAN super-resolution model importer (RRDBNet,
       xinntao/Real-ESRGAN x4) — first IMPORTED generative-image model that runs
       end-to-end on CPU (no diffusion loop): Residual-in-Residual Dense Blocks
-      (RDB = 5 conv layers with dense skip + residual scaling 0.2) + pixel-shuffle
-      upsampling (TNNetUpsample is already pixel-shuffle). Pure-conv, fully
-      reuse-only; pico parity vs a numpy float64 oracle, then a real x4 upscale
-      of a tiny image. Complements the from-scratch SubPixelSuperRes/SuperResolution
-      training examples with a pretrained-weight inference path.
+      (RDB = 5 conv layers with dense channel-concat skip via TNNetDeepConcat +
+      residual scaling 0.2). LANDED: BuildRRDBNet[FromSafeTensors][Ex] +
+      TRRDBNetConfig in neuralpretrained.pas (reuse-only; LoadVaeConv conv loader,
+      TNNetSum residuals, TNNetMulByConstant(0.2) scaling). NOTE: canonical
+      xinntao RRDBNet x4 weights use NEAREST-interpolate + conv upsampling, NOT
+      pixel-shuffle, so it is wired with TNNetDeMaxPool(2) (spacing 0 = nearest),
+      same idiom as the SD VAE decoder; added a parametrized TNNetLeakyReLU.Create
+      (pAlpha) for the 0.2 negative slope (serialized via FFloatSt[0]). Pico
+      parity TestRRDBNetParity (max|diff| < 1e-4) vs a numpy float64 oracle
+      (tools/rrdbnet_tiny_fixture.py, committed ~58KB safetensors fixture).
+      FOLLOW-UPS: (a) realesrgan .pth pickle load (TNNetTorchBinReader path);
+      (b) real x4 upscale of a tiny PNG end-to-end example; (c) scale=2 / other
+      scales (currently only scale=4 = two upsample stages wired).
 - [ ] Class-conditional DiffusionMNIST follow-up: classifier-free guidance (CFG)
       + DDIM deterministic fast sampler. Extends the landed unconditional DDPM
       example — (a) condition the U-Net on a digit label embedding added to the
