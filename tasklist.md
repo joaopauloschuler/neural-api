@@ -165,9 +165,9 @@ rather than acted on.
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and
       round-trips a translation on CPU via DecodeSeq2SeqGreedy/BeamSearch, plus
       verifying the importer against a downloaded sentencepiece.bpe.model vocab
-      (the parity fixture today uses raw token ids only). Blocked partly on the
-      BPE-in-.model tokenizer follow-up for NLLB-BPE variants (see the
-      neuralhftokenizer Tokenizer follow-up (b) entry).
+      (the parity fixture today uses raw token ids only). The BPE-in-.model
+      tokenizer support for NLLB-BPE variants has landed (see the
+      neuralhftokenizer Tokenizer follow-up (b) entry), so this is unblocked.
 - [ ] GPT-OSS importer follow-ups (BuildGptOssFromSafeTensors[Ex] LANDED,
       model_type "gpt_oss", with TNNetGptOssSinkAttention per-head scalar sink +
       alternating sliding/full window + YaRN truncate flag + top-k MoE +
@@ -470,21 +470,6 @@ rather than acted on.
       (a hand-rolled Muon gradient-surgery demo already exists in
       examples/MuonOptimizer; the optimizer-class port is what's missing).
       Each is a small TNeuralOptimizer subclass in neuralfit.pas.
-- [X] ReduceLROnPlateau + OneCycle / cyclical LR schedulers
-      (neural/neuralscheduler.pas has Step/CosineAnnealing/WarmupCosine/Poly):
-      plateau-driven decay needs a hook feeding the validation metric into
-      NextLR — that wiring is the interesting part; OneCycle/CyclicLR are
-      straightforward NextLR formulas.
-      Added TReduceLROnPlateau (mode min/max, factor/patience/threshold rel|abs/
-      cooldown/min_lr, torch state best/num_bad_epochs/cooldown_counter),
-      TOneCycleLR (cos anneal), TCyclicLR (triangular + triangular2). Wiring:
-      base TNeuralLRScheduler.ReportMetric(metric) no-op hook overridden by the
-      plateau scheduler; TNeuralFitBase.CheckLearningRate feeds FValidationError
-      (previous epoch's, since CheckLearningRate runs at epoch start) before
-      NextLR. Parity vs torch within 1e-5.
-      - Not ported: OneCycle anneal_strategy='linear' (only 'cos'); CyclicLR
-        mode='exp_range'; OneCycle three_phase=True. CyclicLR momentum cycling
-        is left to the optimizer (LR-only here).
 - [ ] Trainer callbacks API (transformers TrainerCallback port): a
       TNeuralFitCallback with OnEpochBegin/End, OnStepEnd, OnEvaluate hooks
       registered on TNeuralFitBase. Early stopping, custom logging, and the
@@ -496,48 +481,11 @@ rather than acted on.
       the input and mix the targets by area fraction (Beta-distributed
       lambda). The CIFAR image-classification examples give an instant
       bake-off harness.
-- [X] Batched generation with left-padding in neural/neuraldecode.pas:
-      generate for N prompts in one forward pass per step (today's decode
-      paths look single-sample). Makes evaluation sweeps cheap and is a
+- [ ] True single-kernel batched forward (real batch axis + attention padding
+      mask for left-pad) — the lockstep DecodeBatchGreedy orchestration landed,
+      but NN.Compute has no SIMD batch axis on the char path, so each step still
+      pays one forward per running row. The vectorized batch is the actual
       prerequisite for an efficient speculative-decoding verify step.
-      DONE: DecodeBatchGreedy(NN, Prompts, MaxLen[, StopStrings]) advances N
-      prompts in lockstep with per-row EOS / stop-string / MaxLen termination
-      (finished rows frozen). Output is token-for-token identical to running
-      each prompt through single-sample DecodeGreedy -- including SumLogProb /
-      Score -- UNCONDITIONALLY for arbitrary differing prompt lengths. The
-      char-level decode forward uses the REVERSED one-hot encoding, which
-      right-aligns the latest token at x=0 and zero-fills older positions, so
-      left-padding is implicit per row and there is no cross-row attention
-      contamination to mask. Tests: TestBatchGreedyMatchesPerPromptGreedy,
-      TestBatchGreedyStopStringsPerRowIndependent, TestBatchGreedyEmptyAndSingle
-      (tests/TestNeuralDecode.pas).
-      RESIDUAL: this is a lockstep ORCHESTRATION batch, not a vectorized one --
-      NN.Compute has no SIMD batch axis on this char path, so each step still
-      pays one forward per running row (the convenience/correctness win, not a
-      throughput win). A true single-kernel batched forward (real batch axis +
-      attention padding mask for left-pad) remains open and is the actual
-      prerequisite for an efficient speculative-decoding verify step.
-- [X] Chat templates v2 (v1 is landed in neural/neuralchat.pas —
-      ApplyChatTemplate with seven hardcoded formats + DetectChatFormat
-      fingerprinting + EncodeChat): ~~a mini-Jinja subset interpreter for
-      unrecognized chat_template strings (must pass ground truth for all
-      bundled templates and raise cleanly on unsupported constructs)~~
-      [DONE: TJInterp / RenderChatTemplate + ApplyChatTemplateString
-      fallback path; reproduces all 9 bundled templates byte-exact incl.
-      whitespace control, raises EChatTemplateError on unsupported
-      constructs; tests in TestNeuralHFTokenizer.pas]; more
-      formats (~~DeepSeek~~ [DONE: cfDeepSeek], ~~Phi-4-mini's tool-aware
-      ChatML variant~~ [DONE: cfPhi4Mini], ~~Qwen's default-system injection~~
-      [DONE: cfQwen -- ChatML + default-system header when no leading system
-      message; DetectChatFormat fingerprints the "You are Qwen..." literal]);
-      ~~read the separate chat_template.jinja file newer transformers exports
-      alongside tokenizer_config.json~~ [DONE: LoadChatTemplateString sibling
-      fallback]; ~~continue_final_message~~ [DONE: TChatTemplateOptions
-      .ContinueFinalMessage + ApplyChatTemplate options overload; HF-exact
-      render-no-genprompt + truncate-at-final-content + rstrip] /
-      ~~return_assistant_tokens_mask~~ [DONE: EncodeChatWithMask returns a
-      parallel 0/1 assistant-content mask via segmented encoding] equivalents.
-      (Chat templates v2 fully landed; tests in TestNeuralHFTokenizer.pas.)
 - [ ] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
       with forward/backward wall-time and parameter/activation memory per
       layer (introspection-report pattern). Directly serves the open
@@ -715,15 +663,6 @@ rather than acted on.
       static exit layer + confidence threshold; follow-up: per-token
       adaptive exit. Report tokens/sec vs full-depth at matched output
       quality.
-- [X] Token healing follow-ups (v1 is landed: TNNetTokenHealingConstraint +
-      PrepareTokenHealing + TGenerationConfig.TokenHealing): DONE.
-      (a) DONE — TNeuralHFTokenizer.PrefixScanVocab + FragmentToSurface
-      (byte-alphabet/metaspace surface-space prefix scan) and a
-      PrepareTokenHealing(TNeuralHFTokenizer; ...) overload in neuraldecode.
-      (b) DONE — guidance-style multi-token rollback via an optional
-      RollbackTokens param (default 1 = bit-identical v1 single-token path)
-      on BOTH PrepareTokenHealing overloads; rebuilds the combined boundary
-      fragment from the last N tokens when the artifact spans merges.
 - [ ] Streaming corpus loader with shuffle buffer: the landed packing
       pipeline materializes the whole token stream in RAM (neuraldatasets
       builds one concatenated Stream array). Read large text/token files
