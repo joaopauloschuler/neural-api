@@ -816,6 +816,58 @@ rather than acted on.
       examples/TreeSpeculativeDecoding demo reporting the accepted-tokens/forward
       speedup vs the linear self-speculative baseline.
 
+- [ ] DiT / PixArt diffusion-transformer importer (BuildDiTFromSafeTensors, e.g.
+      facebook/DiT-XL-2-256 or PixArt-alpha) — the repo already has the full
+      sampling side (neuraldiffusion.pas TNNetDiffusionScheduler with DDPM / DDIM /
+      DPM-Solver++(2M)) and the VAE-encoder/decoder importers, but every diffusion
+      BACKBONE it can run is a from-scratch convolutional UNet (DiffusionMNIST /
+      ConditionalDiffusion). DiT is the transformer-based latent denoiser behind
+      SD3 / Sora and is the modern SOTA gap. New pieces: patchify the VAE latent
+      into a token sequence, the timestep + class/text embedding MLP, and the
+      adaLN-Zero conditioning block (per-token scale/shift/gate regressed from the
+      conditioning vector — TNNetFiLM already provides the per-channel affine
+      modulation primitive, the "-Zero" part is the gate initialized to 0). Wire the
+      ViT backbone (BuildViTFromSafeTensors infra) plus the final linear unpatchify
+      head. Verify on a pico-sliced fixture (make_pico_*_fixture.py pattern); a
+      latent-noise -> denoise -> VAE-decode smoke test reuses the existing scheduler.
+
+- [ ] ConvNeXt-v1/v2 image-classification backbone importer
+      (BuildConvNeXtFromSafeTensors, e.g. facebook/convnext-tiny-224 and the v2
+      convnextv2-tiny). The ResNet importer task explicitly scopes ConvNeXt OUT, yet
+      it is a distinct modern CNN whose two signature primitives ALREADY EXIST as
+      layers: TNNetGRN (the v2 Global Response Normalization) and the LayerScale
+      per-channel gain (a 1x1 PointwiseConvLinear / FiLM scale). New work is the
+      block wiring: depthwise 7x7 conv -> LayerNorm (channels-first) -> pointwise
+      expand-4x -> GELU -> pointwise project -> LayerScale -> stochastic-depth
+      residual, plus the patchify stem (4x4 stride-4 conv) and 2x2 downsample
+      transitions between the 4 stages. Distinct from the MBConv path used by the
+      MobileNetV3 importer (no squeeze-excite, no inverted bottleneck). Verify top-1
+      logits against torchvision on a single ImageNet sample.
+
+- [ ] ImageNet top-1 / top-5 parity eval harness for the imported vision backbones
+      (EvaluateImageNet + ImageNetReport in neuralimagemetrics.pas or a sibling, plus
+      examples/ImageNetEval). Today there is NO end-to-end accuracy check for the
+      landed classifier importers (ResNet / ViT / Swin / DINOv2 / MobileNetV3 / VGG /
+      Inception-v3): each importer's parity test only compares raw logits on one or
+      two tensors, which catches a transposed weight but NOT a wrong preprocessing
+      pipeline (resize/crop/normalize) or a label-permutation. The harness loads a
+      small folder of labelled ImageNet-val JPEGs, applies the importer's declared
+      ImageSize + csImageNetMean/csImageNetStd (already in neuraldatasets.pas) with
+      the correct resize-then-center-crop, runs the net, and reports top-1 / top-5
+      accuracy with a confusion sample. This is the missing import-VERIFICATION
+      backstop mirroring what MMLUEval/PerplexityEval do for the LLM side.
+
+- [ ] End-to-end latent text-to-image generation example (examples/LatentTextToImage)
+      that finally CHAINS the imported generative pieces into one pipeline on CPU:
+      CLIP text encoder (BuildClipFromSafeTensors) -> a latent denoiser (the from
+      DiT importer above, or the SD-UNet noted under the VAE task) -> VAE decoder
+      (BuildVaeDecoderFromSafeTensors) -> RGB, driven by the existing
+      TNNetDiffusionScheduler DDIM/DPM-Solver++ loop with classifier-free guidance
+      (MakeUnconditionalTwin / the CFG follow-up). The individual importers exist but
+      nothing demonstrates the full Stable-Diffusion-style txt2img path; an
+      ulimit-bounded demo that generates one small image from a hard-coded prompt is
+      the capstone proving the CV-generative stack composes. Edit examples/README.md.
+
 ## Layer follow-ups that fix real limitations
 
 - [ ] Asymmetric-kernel convolution (1xN / Nx1 factorized convs) — CAI
