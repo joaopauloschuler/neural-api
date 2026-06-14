@@ -126,6 +126,13 @@ type
     // QA span extraction (Task B): pinned logits -> pinned n-best spans.
     procedure TestExtractQASpansPinned;
     procedure TestExtractQASpansMaxLenAndOrder;
+    // MMLU harness: with the monotone linear scorer the largest answer-letter
+    // token id always wins, so per-question predictions (hence per-subject /
+    // macro / micro accuracy) are analytic. Verifies the answer-letter argmax,
+    // the per-subject buckets, and macro != micro on unbalanced subjects.
+    procedure TestMMLUAnswerLetterArgmaxAndAggregation;
+    // MMLUReport formatting contains the headline macro/micro lines.
+    procedure TestMMLUReportFormatting;
   end;
 
 implementation
@@ -1180,6 +1187,89 @@ begin
   // NBest cap limits the list length.
   Spans := ExtractQASpans(StartLogits, EndLogits, 20, 30, 3);
   AssertTrue('n-best capped at 3', Length(Spans) <= 3);
+end;
+
+procedure TTestNeuralNLPMetrics.TestMMLUAnswerLetterArgmaxAndAggregation;
+var
+  NN: TNNet;
+  Questions: array of TNNetMMLUQuestion;
+  LetterTokens: array[0..3] of integer;
+  Stats: TNNetMMLUStats;
+begin
+  // Per-position monotone linear scorer: with a non-negative previous token the
+  // single-token logit logit(J) = 0.02*J*PrevId + 0.03*J is strictly increasing
+  // in the token id J, so among the four answer-letter tokens the one with the
+  // LARGEST id always has the highest log-prob -> it is the harness prediction.
+  NN := BuildPerPositionLM(csCtx, csVocab);
+  try
+    SetLinearScorerWeights(NN);
+
+    // Letter tokens A/B/C/D mapped to ids 2,3,4,5 (D has the largest id, so the
+    // monotone scorer ALWAYS predicts D = index 3).
+    LetterTokens[0] := 2; LetterTokens[1] := 3;
+    LetterTokens[2] := 4; LetterTokens[3] := 5;
+
+    // 3 questions in subject 0 (gold D twice -> 2/3) and 1 in subject 1 (gold D
+    // -> 1/1). The prompt tokens just need a non-negative last token (PrevId).
+    SetLength(Questions, 4);
+    Questions[0].PromptTokens := TNeuralIntegerArray.Create(2, 6);
+    Questions[0].GoldLetter := 3; Questions[0].SubjectIndex := 0; // D, correct
+    Questions[1].PromptTokens := TNeuralIntegerArray.Create(2, 7);
+    Questions[1].GoldLetter := 0; Questions[1].SubjectIndex := 0; // A, wrong
+    Questions[2].PromptTokens := TNeuralIntegerArray.Create(3, 5);
+    Questions[2].GoldLetter := 3; Questions[2].SubjectIndex := 0; // D, correct
+    Questions[3].PromptTokens := TNeuralIntegerArray.Create(2, 4);
+    Questions[3].GoldLetter := 3; Questions[3].SubjectIndex := 1; // D, correct
+
+    Stats := EvaluateMMLU(NN, Questions, LetterTokens, 2);
+
+    AssertEquals('items scored', 4, Stats.ItemCount);
+    AssertEquals('subjects scored', 2, Stats.SubjectCount);
+    AssertEquals('total correct (3 of 4 are D)', 3, Stats.CorrectCount);
+    // Subject 0: 2/3 ; subject 1: 1/1.
+    AssertEquals('subject0 total', 3, Stats.PerSubject[0].Total);
+    AssertEquals('subject0 correct', 2, Stats.PerSubject[0].Correct);
+    AssertEquals('subject0 acc', 2.0 / 3.0, Stats.PerSubject[0].Accuracy, 1e-6);
+    AssertEquals('subject1 acc', 1.0, Stats.PerSubject[1].Accuracy, 1e-6);
+    // Macro = mean(2/3, 1) = 5/6 ; micro = 3/4 -> they DISAGREE (unbalanced).
+    AssertEquals('macro = mean over subjects', 5.0 / 6.0,
+      Stats.MacroAccuracy, 1e-6);
+    AssertEquals('micro = pooled', 0.75, Stats.MicroAccuracy, 1e-6);
+    AssertTrue('macro != micro on unbalanced subjects',
+      Abs(Stats.MacroAccuracy - Stats.MicroAccuracy) > 1e-3);
+
+    // Out-of-range subject index is skipped (not scored, not counted).
+    SetLength(Questions, 1);
+    Questions[0].PromptTokens := TNeuralIntegerArray.Create(2, 6);
+    Questions[0].GoldLetter := 3; Questions[0].SubjectIndex := 9; // >= NumSubjects
+    Stats := EvaluateMMLU(NN, Questions, LetterTokens, 2);
+    AssertEquals('out-of-range subject skipped', 0, Stats.ItemCount);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestMMLUReportFormatting;
+var
+  Stats: TNNetMMLUStats;
+  Report: string;
+begin
+  Stats.MacroAccuracy := 0.5;
+  Stats.MicroAccuracy := 0.4;
+  Stats.ItemCount := 5;
+  Stats.CorrectCount := 2;
+  Stats.SubjectCount := 2;
+  SetLength(Stats.PerSubject, 2);
+  Stats.PerSubject[0].Correct := 1; Stats.PerSubject[0].Total := 2;
+  Stats.PerSubject[0].Accuracy := 0.5;
+  Stats.PerSubject[1].Correct := 1; Stats.PerSubject[1].Total := 3;
+  Stats.PerSubject[1].Accuracy := 1.0 / 3.0;
+
+  Report := MMLUReport(Stats, ['algebra', 'history'], 5);
+  AssertTrue('header mentions 5-shot', Pos('5-shot', Report) > 0);
+  AssertTrue('lists named subject', Pos('algebra', Report) > 0);
+  AssertTrue('has macro-average line', Pos('macro-average', Report) > 0);
+  AssertTrue('has micro-average line', Pos('micro-average', Report) > 0);
 end;
 
 initialization

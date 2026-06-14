@@ -509,7 +509,7 @@ rather than acted on.
 - [ ] NumPy .npz follow-up (neural/neuralnumpy.pas reader/writer landed; WRITER
       is STORED-only): DEFLATE-compressed .npz WRITER (savez_compressed) +
       zip64 / >4GB archive support (reader currently rejects zip64).
-- [ ] MMLU few-shot accuracy benchmark harness + example (NLP eval gap;
+- [X] MMLU few-shot accuracy benchmark harness + example (NLP eval gap;
       complements the landed examples/HellaSwagEval + examples/PerplexityEval
       and the EvaluateMultipleChoice / ScoreSequence primitives, but is a
       DISTINCT benchmark, not a near-duplicate): MMLU is the canonical
@@ -535,6 +535,21 @@ rather than acted on.
           left-padded DecodeBatchGreedy / KV-cache path so large models stay
           tractable. Follow-ups (separate tasks): LAMBADA last-word accuracy,
           ARC/PIQA/WinoGrande on the same answer-letter scoring core.
+      LANDED: EvaluateMMLU + MMLUReport (single-token A/B/C/D answer-letter
+      scoring, per-subject + macro + micro, 0/5-shot) in neuralnlpmetrics.pas,
+      TestNeuralNLPMetrics MMLU tests, examples/MMLUEval (tiny embedded smoke
+      subset, char-level toy model). Open follow-ups:
+  - [ ] examples/MMLUEval --full <path> hook: dump cais/mmlu (hendrycks_test)
+        dev+test splits to a small text file via the venv-x datasets package and
+        feed the questions through the same FormatQuestion/BuildPrompt builder
+        + a real subword tokenizer (the smoke build hard-codes its questions).
+  - [ ] EvaluateMMLU large-model path: reuse the left-padded DecodeBatchGreedy /
+        KV-cache batch scoring instead of the per-question per-letter
+        ScoreCompletion loop (acceptable for the smoke subset, slow at the full
+        14k-question x 57-subject scale).
+  - [ ] LAMBADA last-word accuracy + ARC/PIQA/WinoGrande on the answer-letter
+        scoring core (separate benchmarks, same EvaluateMMLU /
+        EvaluateMultipleChoice machinery).
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
       the GPT-Neo route; the published pytorch_model.bin-only checkpoints

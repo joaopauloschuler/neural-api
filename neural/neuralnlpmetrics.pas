@@ -337,6 +337,87 @@ function ScoreCompletionsBatch(NN: TNNet;
 function EvaluateMultipleChoice(NN: TNNet;
   const Items: array of TNNetMultipleChoiceItem): TNNetMultipleChoiceStats;
 
+// ---------------------------------------------------------------------------
+// MMLU few-shot accuracy harness (single-token answer-letter scoring)
+// ---------------------------------------------------------------------------
+//
+// MMLU (Hendrycks et al. 2021) is a 4-choice (A/B/C/D) knowledge benchmark.
+// This harness follows the HF lm-evaluation-harness CONVENTION, which is
+// DISTINCT from the HellaSwag full-continuation scoring above
+// (EvaluateMultipleChoice): for each question the standard k-shot prompt
+//
+//   <k same-subject demos, each "Question..\nA. ..\nB. ..\nC. ..\nD. ..\nAnswer: X\n\n">
+//   Question ..\nA. ..\nB. ..\nC. ..\nD. ..\nAnswer:
+//
+// is built and the model is scored by the log-probability of the SINGLE
+// answer-letter token (" A" / " B" / " C" / " D") that would come next - NOT
+// by the perplexity of the whole answer string. The four letter tokens are
+// supplied by the caller (tokenizer-specific: each letter is encoded once and
+// the harness uses the LAST token of that encoding as the answer token), so
+// the harness itself is checkpoint-/tokenizer-agnostic.
+//
+// Each scored letter is one single-token completion through ScoreCompletion,
+// so the prompt prefix carries the causal-shift / reversed-prefix encoding
+// exactly like every other scorer in this unit; the argmax letter is the
+// prediction (first-max tie-break). Per-subject accuracy is reported plus the
+// MACRO average (mean over subjects, the headline MMLU number) and the MICRO
+// average (pooled over all questions). 0-shot (no demos) and k-shot both run
+// through the same path - the demo prompt is just prepended to PromptTokens by
+// the caller / the example's prompt builder.
+
+// One MMLU question, already tokenized by the caller. PromptTokens is the full
+// k-shot prompt up to and including "Answer:" (or "Answer: " with the trailing
+// space the caller's tokenizer prefers); the four answer-letter tokens are
+// passed once in EvaluateMMLU. GoldLetter is 0..3 (A/B/C/D). SubjectIndex
+// selects the per-subject bucket (0 .. number-of-subjects-1).
+type
+  TNNetMMLUQuestion = record
+    PromptTokens: TNeuralIntegerArray;
+    GoldLetter: integer;   // 0=A 1=B 2=C 3=D
+    SubjectIndex: integer; // bucket for per-subject accuracy
+  end;
+
+  // Per-subject tally and accuracy.
+  TNNetMMLUSubjectStat = record
+    Correct: integer;
+    Total: integer;
+    Accuracy: TNeuralFloat; // Correct / Total (0 when Total = 0)
+  end;
+  TNNetMMLUSubjectStatArray = array of TNNetMMLUSubjectStat;
+
+  // Aggregate MMLU result. MacroAccuracy is the mean of the per-subject
+  // accuracies over the subjects that actually have questions (the headline
+  // MMLU number); MicroAccuracy pools all questions (CorrectCount/ItemCount).
+  TNNetMMLUStats = record
+    MacroAccuracy: TNeuralFloat;
+    MicroAccuracy: TNeuralFloat;
+    ItemCount: integer;
+    CorrectCount: integer;
+    SubjectCount: integer;            // subjects with at least one question
+    PerSubject: TNNetMMLUSubjectStatArray; // length = NumSubjects (see below)
+  end;
+
+// MMLU answer-letter scoring harness. For every question the four answer-letter
+// tokens (LetterTokens[0..3], typically the ids of " A".." D") are each scored
+// as a single-token completion of PromptTokens via ScoreCompletion; the highest
+// log-probability letter is the prediction. NumSubjects sizes the per-subject
+// table (questions with SubjectIndex outside 0..NumSubjects-1 are skipped).
+// LastWindow forwards to ScoreCompletion (over-context prompts score over the
+// trailing window instead of raising). Reports per-subject accuracy plus the
+// macro (mean-over-subjects) and micro (pooled) averages.
+function EvaluateMMLU(NN: TNNet;
+  const Questions: array of TNNetMMLUQuestion;
+  const LetterTokens: array of integer;
+  NumSubjects: integer;
+  LastWindow: boolean = false): TNNetMMLUStats;
+
+// Formats a TNNetMMLUStats into a small multi-line report (the PerplexityReport
+// / *Report idiom). SubjectNames must have NumSubjects entries (or be empty, in
+// which case subjects are labelled "subject <i>"); ShotsK is printed in the
+// header (0 = zero-shot, 5 = the headline five-shot setting).
+function MMLUReport(const Stats: TNNetMMLUStats;
+  const SubjectNames: array of string; ShotsK: integer): string;
+
 // Corpus-level BLEU (one reference per candidate; Candidates[i] is scored
 // against References[i]; both arrays must have the same length).
 function CorpusBLEU(const Candidates, References: array of TNeuralIntegerArray;
@@ -980,6 +1061,118 @@ begin
   begin
     Result.Accuracy := Result.CorrectCount / Result.ItemCount;
     Result.AccuracyNorm := Result.CorrectNormCount / Result.ItemCount;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// MMLU few-shot accuracy harness
+// ---------------------------------------------------------------------------
+
+function EvaluateMMLU(NN: TNNet;
+  const Questions: array of TNNetMMLUQuestion;
+  const LetterTokens: array of integer;
+  NumSubjects: integer;
+  LastWindow: boolean): TNNetMMLUStats;
+var
+  QIdx, L, NumLetters, Best, Subj, NonEmpty: integer;
+  Letter: TNeuralIntegerArray;
+  Score: TNNetCompletionScore;
+  BestLP, MacroSum: TNeuralFloat;
+begin
+  Result.MacroAccuracy := 0;
+  Result.MicroAccuracy := 0;
+  Result.ItemCount := 0;
+  Result.CorrectCount := 0;
+  Result.SubjectCount := 0;
+  if NumSubjects < 0 then NumSubjects := 0;
+  SetLength(Result.PerSubject, NumSubjects);
+  for Subj := 0 to NumSubjects - 1 do
+  begin
+    Result.PerSubject[Subj].Correct := 0;
+    Result.PerSubject[Subj].Total := 0;
+    Result.PerSubject[Subj].Accuracy := 0;
+  end;
+  if NN = nil then Exit;
+  NumLetters := Length(LetterTokens);
+  if NumLetters = 0 then Exit;
+  SetLength(Letter, 1); // each candidate is the SINGLE answer-letter token
+
+  for QIdx := 0 to High(Questions) do
+  begin
+    Subj := Questions[QIdx].SubjectIndex;
+    if (Subj < 0) or (Subj >= NumSubjects) then continue;
+    if Length(Questions[QIdx].PromptTokens) = 0 then continue;
+    // Score every answer-letter token as a single-token completion; the
+    // highest single-token log-prob letter is the prediction (first-max).
+    Best := 0;
+    BestLP := 0;
+    for L := 0 to NumLetters - 1 do
+    begin
+      Letter[0] := LetterTokens[L];
+      Score := ScoreCompletionCore(NN, Questions[QIdx].PromptTokens,
+        Letter, LastWindow);
+      if (L = 0) or (Score.SumLogProb > BestLP) then
+      begin
+        BestLP := Score.SumLogProb;
+        Best := L;
+      end;
+    end;
+    Inc(Result.ItemCount);
+    Inc(Result.PerSubject[Subj].Total);
+    if Best = Questions[QIdx].GoldLetter then
+    begin
+      Inc(Result.CorrectCount);
+      Inc(Result.PerSubject[Subj].Correct);
+    end;
+  end;
+
+  // Per-subject accuracy + macro (mean over non-empty subjects) and micro.
+  MacroSum := 0;
+  NonEmpty := 0;
+  for Subj := 0 to NumSubjects - 1 do
+    if Result.PerSubject[Subj].Total > 0 then
+    begin
+      Result.PerSubject[Subj].Accuracy :=
+        Result.PerSubject[Subj].Correct / Result.PerSubject[Subj].Total;
+      MacroSum := MacroSum + Result.PerSubject[Subj].Accuracy;
+      Inc(NonEmpty);
+    end;
+  Result.SubjectCount := NonEmpty;
+  if NonEmpty > 0 then Result.MacroAccuracy := MacroSum / NonEmpty;
+  if Result.ItemCount > 0 then
+    Result.MicroAccuracy := Result.CorrectCount / Result.ItemCount;
+end;
+
+function MMLUReport(const Stats: TNNetMMLUStats;
+  const SubjectNames: array of string; ShotsK: integer): string;
+var
+  Subj: integer;
+  Name: string;
+  SL: TStringList;
+begin
+  SL := TStringList.Create();
+  try
+    SL.Add(Format('MMLU %d-shot accuracy (single-token answer-letter scoring)',
+      [ShotsK]));
+    SL.Add(Format('  questions scored : %d', [Stats.ItemCount]));
+    SL.Add(Format('  subjects scored  : %d', [Stats.SubjectCount]));
+    SL.Add('  per-subject:');
+    for Subj := 0 to High(Stats.PerSubject) do
+    begin
+      if Stats.PerSubject[Subj].Total = 0 then continue;
+      if Subj <= High(SubjectNames) then Name := SubjectNames[Subj]
+      else Name := Format('subject %d', [Subj]);
+      SL.Add(Format('    %-28s %.4f  (%d / %d)',
+        [Name, Stats.PerSubject[Subj].Accuracy,
+         Stats.PerSubject[Subj].Correct, Stats.PerSubject[Subj].Total]));
+    end;
+    SL.Add(Format('  macro-average    : %.4f  (mean over %d subjects)',
+      [Stats.MacroAccuracy, Stats.SubjectCount]));
+    SL.Add(Format('  micro-average    : %.4f  (%d / %d pooled)',
+      [Stats.MicroAccuracy, Stats.CorrectCount, Stats.ItemCount]));
+    Result := SL.Text;
+  finally
+    SL.Free;
   end;
 end;
 
