@@ -1009,13 +1009,27 @@ function BuildLlamaFromGGUF(const FileName: string;
 // rejected loudly - exporting those is out of scope for v1, same as the
 // ONNX-export task. Q8_0 is quantized on write (max|x|/127 + round, the
 // ggml quantize_row_q8_0 reference).
+// The optional Tokenizer argument, when non-nil, takes precedence over the
+// plain Tokens array and routes the FULL tokenizer block through
+// TNeuralHFTokenizer.SaveTokenizerToGGUF - a byte-level-BPE tokenizer emits a
+// "gpt2" block (vocab + merges + special ids), a Unigram one a scored "llama"
+// block - so a GPT-2/Llama-3-vocab model exports end-to-end (weights + gpt2
+// tokenizer) in a single call and reads back self-contained through
+// LoadFromGGUF. The plain Tokens array path (minimal SentencePiece "llama"
+// block) is unchanged when Tokenizer is nil.
 procedure SaveLlamaToGGUFEx(Reader: TNNetSafeTensorsReader;
   const Config: TLlamaConfig; const Tokens: array of string;
-  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+  const FileName: string; pDType: TGGUFWriteDType = gwF32;
+  Tokenizer: TNeuralHFTokenizer = nil);
 // As SaveLlamaToGGUFEx with the F32 (lossless) matrix encoding and no
 // tokenizer block (pass tokens to the Ex form for a self-contained file).
 procedure SaveLlamaToGGUF(Reader: TNNetSafeTensorsReader;
   const Config: TLlamaConfig; const FileName: string);
+// Convenience: export Llama weights + a full TNeuralHFTokenizer (gpt2 byte-
+// level-BPE or llama Unigram) block end-to-end through SaveTokenizerToGGUF.
+procedure SaveLlamaToGGUFExWithTokenizer(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; Tokenizer: TNeuralHFTokenizer;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
 
 // Exports a from-scratch CAI-trained (or imported) Llama held PURELY in wired
 // TNNet layers to GGUF - the inverse mapping of BuildLlamaFromTensorReader's
@@ -7462,7 +7476,8 @@ end;
 
 procedure SaveLlamaToGGUFEx(Reader: TNNetSafeTensorsReader;
   const Config: TLlamaConfig; const Tokens: array of string;
-  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+  const FileName: string; pDType: TGGUFWriteDType = gwF32;
+  Tokenizer: TNeuralHFTokenizer = nil);
 var
   Writer: TNNetGGUFWriter;
   Prefix: string;
@@ -7633,8 +7648,16 @@ begin
         IntToStr(Ord(Config.RopeScaling.Mode)) + ' is out of scope for v1 ' +
         '(only none / linear).');
 
-    // ---- a self-contained tokenizer block (when tokens are supplied) ----
-    if Length(Tokens) > 0 then
+    // ---- a self-contained tokenizer block ----
+    // A supplied TNeuralHFTokenizer takes precedence over the plain Tokens
+    // array: it routes the full byte-level-BPE ("gpt2": vocab+merges+specials)
+    // or Unigram ("llama": vocab+scores) block through SaveTokenizerToGGUF, so
+    // a model exported this way reads back self-contained through
+    // TNeuralHFTokenizer.LoadFromGGUF. The plain Tokens array still emits the
+    // minimal SentencePiece "llama" block (id-indexed pieces, zero scores).
+    if Tokenizer <> nil then
+      Tokenizer.SaveTokenizerToGGUF(Writer)
+    else if Length(Tokens) > 0 then
     begin
       if Length(Tokens) <> Config.VocabSize then
         ImportError('Llama GGUF export: ' + IntToStr(Length(Tokens)) +
@@ -7703,6 +7726,18 @@ var
 begin
   SetLength(NoTokens, 0);
   SaveLlamaToGGUFEx(Reader, Config, NoTokens, FileName, gwF32);
+end;
+
+procedure SaveLlamaToGGUFExWithTokenizer(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; Tokenizer: TNeuralHFTokenizer;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+var
+  NoTokens: array of string;
+begin
+  if Tokenizer = nil then
+    ImportError('SaveLlamaToGGUFExWithTokenizer: nil tokenizer.');
+  SetLength(NoTokens, 0);
+  SaveLlamaToGGUFEx(Reader, Config, NoTokens, FileName, pDType, Tokenizer);
 end;
 
 type

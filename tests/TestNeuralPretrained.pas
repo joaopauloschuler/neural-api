@@ -150,6 +150,7 @@ type
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestGGUFWriterRoundTrip;
+    procedure TestGGUFWriterGpt2TokenizerRoundTrip;
     procedure TestTNNetGGUFWriterRoundTrip;
     procedure TestMXFP4DequantHandBlock;
     procedure TestMXFP4DequantNaNScale;
@@ -4300,6 +4301,123 @@ begin
   finally
     OutG.Free; OutR.Free; Input.Free;
     NNG.Free; NNRef.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+// End-to-end byte-level-BPE model export: export the untied tiny_llama F32
+// fixture together with a real gpt2 byte-level-BPE tokenizer in ONE call via
+// SaveLlamaToGGUFExWithTokenizer (which routes the tokenizer block through
+// TNeuralHFTokenizer.SaveTokenizerToGGUF -> "gpt2" vocab+merges), then read
+// the single file back self-contained: (a) the model logits round-trip
+// (mirrors TestGGUFWriterRoundTrip's < 1e-5 gate) and (b) Encode/Decode through
+// TNeuralHFTokenizer.LoadFromGGUF are id-identical to the source gpt2 tokenizer
+// (mirrors TestSaveTokenizerToGGUFGpt2RoundTrip, but driven from the MODEL
+// exporter). The tokenizer vocab (400) is intentionally decoupled from the
+// model vocab - the gpt2 block carries its own tokens independent of llama.*.
+procedure TTestNeuralPretrained.TestGGUFWriterGpt2TokenizerRoundTrip;
+var
+  NNRef, NNG: TNNet;
+  Config, ConfigG: TLlamaConfig;
+  Reader: TNNetSafeTensorsReader;
+  SrcTok, GgufTok: TNeuralHFTokenizer;
+  GGUFPath: string;
+  GGUFReader: TNNetGGUFReader;
+  Input, OutR, OutG: TNNetVolume;
+  i, s, SeqLen, Vocab, T, K: integer;
+  MaxDiff: double;
+  Texts: array[0..3] of string;
+  IdsSrc, IdsG: TNeuralIntegerArray;
+begin
+  RandSeed := 424242;
+  Texts[0] := 'the cat sat on the mat';
+  Texts[1] := 'Hello, world!';
+  Texts[2] := 'a man and a dog 123';
+  Texts[3] := 'the dog ran';
+
+  GGUFPath := GetTempDir(false) + 'cai_gguf_writer_gpt2tok_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Config := ReadLlamaConfigFromJSONFile(FixturePath('tiny_llama_config.json'));
+
+  SrcTok := TNeuralHFTokenizer.Create();
+  Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_llama.safetensors'));
+  try
+    if Config.VocabSize <= 0 then
+      Config.VocabSize := integer(
+        Reader.DimSize('model.embed_tokens.weight', 0));
+    SrcTok.LoadFromFile(FixturePath('tiny_bpe_split_cl100k_tokenizer.json'));
+    // ONE call: weights + the full gpt2 byte-level-BPE tokenizer block.
+    SaveLlamaToGGUFExWithTokenizer(Reader, Config, SrcTok, GGUFPath, gwF32);
+  finally
+    Reader.Free;
+  end;
+
+  // ---- (a) model logits round-trip ----
+  NNRef := BuildLlamaFromSafeTensorsEx(
+    FixturePath('tiny_llama.safetensors'), Config, {SeqLen=}0,
+    {pInferenceOnly=}false, FixturePath('tiny_llama_config.json'));
+  NNG := BuildLlamaFromGGUFEx(GGUFPath, ConfigG);
+  Input := TNNetVolume.Create;
+  OutR := TNNetVolume.Create;
+  OutG := TNNetVolume.Create;
+  try
+    AssertEquals('gpt2tok round-trip vocab', Config.VocabSize,
+      ConfigG.VocabSize);
+    SeqLen := ConfigG.MaxPositions;
+    Vocab := ConfigG.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    MaxDiff := 0;
+    for s := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+      NNRef.Compute(Input);
+      NNRef.GetOutput(OutR);
+      NNG.Compute(Input);
+      NNG.GetOutput(OutG);
+      AssertEquals('gpt2tok round-trip output size', OutR.Size, OutG.Size);
+      for i := 0 to OutR.Size - 1 do
+        if Abs(OutR.FData[i] - OutG.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutR.FData[i] - OutG.FData[i]);
+    end;
+    AssertTrue('gpt2tok F32 GGUF model round-trip max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    OutG.Free; OutR.Free; Input.Free;
+    NNG.Free; NNRef.Free;
+  end;
+
+  // ---- (b) tokenizer round-trip through LoadFromGGUF on the SAME file ----
+  GgufTok := TNeuralHFTokenizer.Create();
+  try
+    GgufTok.LoadFromGGUF(GGUFPath);
+    AssertTrue('gpt2tok gguf byte-level flag', GgufTok.IsByteLevel);
+    AssertEquals('gpt2tok gguf vocab size', SrcTok.GetVocabSize(),
+      GgufTok.GetVocabSize());
+    AssertEquals('gpt2tok gguf eos id', SrcTok.EosId, GgufTok.EosId);
+    for T := 0 to High(Texts) do
+    begin
+      IdsSrc := SrcTok.Encode(Texts[T]);
+      IdsG := GgufTok.Encode(Texts[T]);
+      AssertEquals('gpt2tok gguf id count "' + Texts[T] + '"',
+        Length(IdsSrc), Length(IdsG));
+      for K := 0 to High(IdsSrc) do
+        AssertEquals('gpt2tok gguf id[' + IntToStr(K) + '] "' + Texts[T] + '"',
+          IdsSrc[K], IdsG[K]);
+      AssertEquals('gpt2tok gguf decode "' + Texts[T] + '"',
+        SrcTok.Decode(IdsSrc, true), GgufTok.Decode(IdsG, true));
+    end;
+    // Confirm the reader sees the gpt2 model id in the same file.
+    GGUFReader := TNNetGGUFReader.Create(GGUFPath);
+    try
+      AssertEquals('gpt2tok gguf tokenizer.ggml.model', 'gpt2',
+        GGUFReader.GetMetaString('tokenizer.ggml.model', ''));
+    finally
+      GGUFReader.Free;
+    end;
+  finally
+    GgufTok.Free;
+    SrcTok.Free;
     DeleteFile(GGUFPath);
   end;
 end;

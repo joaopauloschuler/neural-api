@@ -402,7 +402,15 @@ rather than acted on.
       llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
       only takes a plain `Tokens` array (SP "llama" model) — route the gpt2
       tokenizer block through SaveTokenizerToGGUF from the MODEL exporter (not
-      just the tokenizer unit test). Also: the llama-cpp-python parity arm is
+      just the tokenizer unit test). DONE — SaveLlamaToGGUFEx gained an optional
+      `Tokenizer: TNeuralHFTokenizer` arg (+ SaveLlamaToGGUFExWithTokenizer
+      convenience overload) that, when non-nil, routes the FULL block through
+      TNeuralHFTokenizer.SaveTokenizerToGGUF (gpt2 vocab+merges+ids / llama
+      Unigram scores), taking precedence over the plain Tokens SP path (which is
+      unchanged); covered by TestGGUFWriterGpt2TokenizerRoundTrip (one-call
+      weights+gpt2-tokenizer export, read back self-contained: model logits
+      < 1e-5 + Encode/Decode id-identical via LoadFromGGUF on the SAME file).
+      Also: the llama-cpp-python parity arm is
       wired but UNVERIFIED end-to-end (lib not installed here; pico demo GGUF may
       be too small for llama.cpp) — confirm argmax/ranking agree on a real
       checkpoint once the lib is available.
