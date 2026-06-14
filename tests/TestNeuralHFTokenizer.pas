@@ -134,6 +134,34 @@ begin
       ' (run python3 tools/hf_tokenizer_fixture.py from the repo root).');
 end;
 
+// Parse a fixture JSON file from its RAW bytes via TJSONParser(s, []).
+// This deliberately AVOIDS GetJSON: the GetJSON string overloads (and any
+// joUTF8 path) re-emit multi-byte UTF-8 string values as single Latin-1
+// bytes, corrupting non-ASCII case data (e.g. "cafe'", CJK) loaded from
+// hf_tokenizer_cases.json / chat_template_cases.json. Reading the raw bytes
+// and parsing with an empty options set keeps every UTF-8 byte verbatim.
+// See the project note "hf-tokenizer-and-fpjson-traps".
+function LoadFixtureJSON(const Path: string): TJSONData;
+var
+  SS: TStringStream;
+  JsonStr: string;
+  Parser: TJSONParser;
+begin
+  SS := TStringStream.Create('');
+  try
+    SS.LoadFromFile(Path);
+    JsonStr := SS.DataString;
+  finally
+    SS.Free;
+  end;
+  Parser := TJSONParser.Create(JsonStr, []);
+  try
+    Result := Parser.Parse;
+  finally
+    Parser.Free;
+  end;
+end;
+
 // Loads the tokenizer named by hf_tokenizer_cases.json[GroupName] and
 // asserts exact Encode-id and Decode-string parity for every pinned case.
 procedure TTestNeuralHFTokenizer.RunParityBattery(const GroupName: string);
@@ -145,15 +173,9 @@ var
   Ids: TIntegerList;
   CaseCnt, IdCnt: integer;
   Text, Context: string;
-  FS: TFileStream;
 begin
-  FS := TFileStream.Create(FixturePath('hf_tokenizer_cases.json'),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    Root := GetJSON(FS);
-  finally
-    FS.Free;
-  end;
+  // Raw-bytes load: the parity cases include non-ASCII text/decoded strings.
+  Root := LoadFixtureJSON(FixturePath('hf_tokenizer_cases.json'));
   Tok := TNeuralHFTokenizer.Create();
   Ids := TIntegerList.Create();
   try
@@ -329,15 +351,9 @@ var
   CaseCnt, IdCnt: integer;
   Text, Context: string;
   HasUnk: boolean;
-  FS: TFileStream;
 begin
-  FS := TFileStream.Create(FixturePath('hf_tokenizer_cases.json'),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    Root := GetJSON(FS);
-  finally
-    FS.Free;
-  end;
+  // Raw-bytes load: the spm_model parity cases include non-ASCII text.
+  Root := LoadFixtureJSON(FixturePath('hf_tokenizer_cases.json'));
   Tok := TNeuralHFTokenizer.Create();
   Ids := TIntegerList.Create();
   try
@@ -1225,18 +1241,13 @@ var
   CaseCnt, MsgCnt: integer;
   Context, Rendered: string;
   Raised: boolean;
-  FS: TFileStream;
 begin
   ChatFormat := ChatFormatFromName(FormatName);
   AssertTrue('format name recognized: ' + FormatName,
     ChatFormat <> cfUnknown);
-  FS := TFileStream.Create(FixturePath('chat_template_cases.json'),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    Root := GetJSON(FS);
-  finally
-    FS.Free;
-  end;
+  // Raw-bytes load: chat content and the expected rendered output carry
+  // non-ASCII bytes (DeepSeek U+FF5C / U+2581, etc.).
+  Root := LoadFixtureJSON(FixturePath('chat_template_cases.json'));
   try
     Group := TJSONObject(Root).Objects[FormatName];
     Cases := Group.Arrays['cases'];
@@ -1417,15 +1428,10 @@ var
   RootObj: TJSONObject;
   Cnt: integer;
   FormatName, Template: string;
-  FS: TFileStream;
 begin
-  FS := TFileStream.Create(FixturePath('chat_template_cases.json'),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    Root := GetJSON(FS);
-  finally
-    FS.Free;
-  end;
+  // Raw-bytes load: some authentic templates embed non-ASCII bytes
+  // (e.g. DeepSeek U+FF5C / U+2581) that drive format detection.
+  Root := LoadFixtureJSON(FixturePath('chat_template_cases.json'));
   try
     RootObj := TJSONObject(Root);
     AssertTrue('formats pinned', RootObj.Count >= 7);
@@ -1599,17 +1605,10 @@ var
   Template, Context, Rendered: string;
   CaseCnt, MsgCnt: integer;
   Raised: boolean;
-  FS: TFileStream;
 begin
-  FS := TFileStream.Create(FixturePath('chat_template_cases.json'),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    // parse WITHOUT joUTF8 so the DeepSeek non-ASCII bytes in 'expected'
-    // survive without a widestring manager (see fpjson trap notes).
-    Root := GetJSON(FS, False);
-  finally
-    FS.Free;
-  end;
+  // Raw-bytes load so the DeepSeek non-ASCII bytes in 'expected' survive
+  // verbatim (see fpjson trap notes / project memory).
+  Root := LoadFixtureJSON(FixturePath('chat_template_cases.json'));
   try
     Group := TJSONObject(Root).Objects[FormatName];
     Template := Group.Get('template', '');
