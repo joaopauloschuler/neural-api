@@ -708,6 +708,44 @@ rather than acted on.
       caching loop lives in the example); (c) pQuantizeInt8 for the ColBERT path
       — the projection head is always f32 while the BERT backbone already
       supports int8.
+- [ ] Cross-encoder RERANKER import + rerank scorer — the missing rung of the
+      RAG retrieval stack. The repo already ships the two BI-encoder paths
+      (separate query/doc towers: examples/SemanticSearch + the embedding-eval
+      RetrievalReport) and the late-interaction path (ColBERT MaxSim), but NOT
+      the cross-encoder reranker that production RAG uses for the final
+      precision pass: a single BERT-family trunk that encodes the query and the
+      candidate document JOINTLY as one sequence
+      `[CLS] query [SEP] document [SEP]` and emits ONE relevance score from the
+      [CLS] row. This is genuinely distinct from everything landed (joint
+      cross-attention between query and doc tokens, not two independent
+      embeddings whose dot product is taken), and it is the standard
+      second-stage scorer behind every retrieve-then-rerank pipeline
+      (cross-encoder/ms-marco-MiniLM-L-6-v2, BAAI/bge-reranker-base,
+      mixedbread/mxbai-rerank). The trunk + [CLS]-pooled head already exist
+      (BuildBertForSequenceClassificationFromSafeTensors, num_labels=1 →
+      regression relevance logit), so the genuinely NEW pieces are: (a) a
+      sentence-PAIR encoding helper that lays out the two segments with the
+      [SEP] separators AND feeds the second segment's SEGMENT/token_type id = 1
+      into the BERT embedding path (today's single-text classification encodes
+      everything as segment 0 — verify the importer's token_type_embeddings
+      table is actually addressable per-position from a caller-supplied
+      segment-id input, and wire it if only segment 0 is reachable); (b) a
+      batch RERANK scorer — score a query against a LIST of candidate passages
+      (one joint forward each, optionally int8 via the BERT backbone's existing
+      pQuantizeInt8 path), apply sigmoid, return passages sorted by relevance;
+      (c) a RerankReport diagnostic (introspection-report pattern) that takes a
+      query + an initially-ranked candidate list with relevance labels and
+      reports MRR/nDCG@k BEFORE vs AFTER reranking, quantifying the precision
+      lift over the bi-encoder order. Deliverables: the pair-encoding helper +
+      RerankPassages scorer in neuralpretrained.pas, TNNet.RerankReport, a pico
+      parity fixture (make_pico_*_fixture.py reuse) asserting the [CLS]
+      relevance logit for a pinned (query, doc) PAIR matches HF
+      AutoModelForSequenceClassification float64 < 1e-4 (the pair/token_type
+      path is the thing under test, NOT the already-verified single-text BERT
+      logits), and an examples/Rerank demo that retrieves with the landed
+      bi-encoder then reorders the top-k with the cross-encoder on CPU (edit
+      examples/README.md, not the main README). High practical NLP value:
+      completes retrieve-then-rerank, the single biggest quality lever in RAG.
 
 ## Layer follow-ups that fix real limitations
 
