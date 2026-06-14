@@ -129,6 +129,10 @@ type
     procedure TestDoLaEmptyBucketMatchesGreedy;
     procedure TestDoLaFlipsShallowBiasedCompletion;
     procedure TestDoLaLowHighBucketsSelectDifferentLayers;
+    // Early-exit / self-speculative decode (LayerSkip/CALM, single-model).
+    procedure TestEarlyExitMatchesGreedyBitIdentical;
+    procedure TestEarlyExitHighConfidenceMatchesGreedy;
+    procedure TestEarlyExitAcceptCountsAreConsistent;
     // Best-of-N / self-consistency reranking.
     procedure TestBestOfNReturnsHighestScoringCandidate;
     procedure TestBestOfNExternalScorerPicksItsTop;
@@ -1082,6 +1086,95 @@ begin
       AssertEquals('DoLa-high emits TShallow (deep lens suppresses TDeep)',
         Chr(TShallow), DHigh.Text[I]);
     end;
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestEarlyExitMatchesGreedyBitIdentical;
+var
+  NN: TNNet;
+  G, S: TNNetDecodeResult;
+  Stats: TNNetEarlyExitStats;
+  NoStops: array of string;
+begin
+  // CORRECTNESS GUARANTEE of exact-greedy self-speculative decode: every
+  // emitted token is the full-depth argmax, so the accepted sequence MUST equal
+  // plain greedy DecodeGreedy bit-for-bit, regardless of the early-exit draft.
+  // Confidence=0 means the draft is consulted EVERY step (maximum exercise of
+  // the splice path); the output still has to match greedy exactly.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  NN := BuildDoLaTwoCandidateNet(4, 8, 5, 6, 7);
+  try
+    G := DecodeGreedy(NN, 'ab', 8);
+    // ExitLayer = 1 (the shallow intermediate), auto head-start detection.
+    S := DecodeEarlyExitSelfSpeculative(NN, 'ab', 8, Stats, NoStops,
+      {ExitLayer=}1, {Confidence=}0.0);
+    AssertEquals('early-exit text == greedy text (bit-identical)',
+      G.Text, S.Text);
+    AssertEquals('early-exit finished == greedy', Ord(G.Finished),
+      Ord(S.Finished));
+    AssertEquals('early-exit sumlogprob == greedy', G.SumLogProb,
+      S.SumLogProb, 1e-6);
+    AssertEquals('one full-depth forward per emitted token',
+      Length(G.Text), Stats.Steps);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestEarlyExitHighConfidenceMatchesGreedy;
+var
+  NN: TNNet;
+  G, S: TNNetDecodeResult;
+  Stats: TNNetEarlyExitStats;
+  NoStops: array of string;
+begin
+  // Confidence > 1 disables the draft path entirely (pure greedy fallback). The
+  // output must STILL be bit-identical and NO drafts may be proposed.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  NN := BuildDoLaTwoCandidateNet(4, 8, 5, 6, 7);
+  try
+    G := DecodeGreedy(NN, 'ab', 8);
+    S := DecodeEarlyExitSelfSpeculative(NN, 'ab', 8, Stats, NoStops,
+      {ExitLayer=}1, {Confidence=}2.0);
+    AssertEquals('draft-disabled text == greedy text', G.Text, S.Text);
+    AssertEquals('draft-disabled sumlogprob == greedy', G.SumLogProb,
+      S.SumLogProb, 1e-6);
+    AssertEquals('no draft proposed when Confidence>1', 0, Stats.DraftProposals);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestEarlyExitAcceptCountsAreConsistent;
+var
+  NN: TNNet;
+  S: TNNetDecodeResult;
+  Stats: TNNetEarlyExitStats;
+  NoStops: array of string;
+begin
+  // Accounting invariant: Accepted + Rejected = DraftProposals <= Steps, and the
+  // acceptance rate matches Accepted/DraftProposals. (Output identity is covered
+  // by the dedicated test above; here we exercise the fallback bookkeeping.)
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  NN := BuildDoLaTwoCandidateNet(4, 8, 5, 6, 7);
+  try
+    S := DecodeEarlyExitSelfSpeculative(NN, 'ab', 8, Stats, NoStops,
+      {ExitLayer=}1, {Confidence=}0.0);
+    AssertTrue('at least one step ran', Stats.Steps >= 1);
+    AssertEquals('accepted + rejected == proposals',
+      Stats.DraftProposals, Stats.Accepted + Stats.Rejected);
+    AssertTrue('proposals never exceed steps',
+      Stats.DraftProposals <= Stats.Steps);
+    if Stats.DraftProposals > 0 then
+      AssertEquals('acceptance rate == accepted/proposals',
+        Stats.Accepted / Stats.DraftProposals, Stats.AcceptanceRate, 1e-6);
+    AssertTrue('emitted length does not exceed steps',
+      Length(S.Text) <= Stats.Steps);
   finally
     NN.Free;
   end;

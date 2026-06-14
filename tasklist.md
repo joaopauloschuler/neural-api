@@ -609,7 +609,7 @@ rather than acted on.
       TestBeamSearchCachedMatchesReEncodeCausalReference (RoPE causal KV-
       cache topology vs a zero-pad re-encode beam reference, tol 1e-5),
       plus TestBeamSearchCachedRejectsWideSession.
-- [ ] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
+- [X] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
       easy tokens from an intermediate layer through the LM head, fall
       back to full depth when confidence is low — the model becomes its
       OWN draft model, no second checkpoint. Distinct from the landed
@@ -617,10 +617,29 @@ rather than acted on.
       intermediate-layer exit. The repo is unusually well positioned: the
       LogitLens/TunedLens frozen-body splice idiom already implements "read
       logits at layer k", and examples/SpeculativeDecoding implements the
-      accept/verify rule. v1:
-      static exit layer + confidence threshold; follow-up: per-token
-      adaptive exit. Report tokens/sec vs full-depth at matched output
-      quality.
+      accept/verify rule.
+      LANDED (v1, a3): DecodeEarlyExitSelfSpeculative (neuraldecode.pas) +
+      TNNetEarlyExitStats. STATIC exit layer + confidence threshold: each
+      step does the full forward (verifier), then the frozen-body LogitLens
+      splice reads p_exit at the intermediate ExitLayer through the SAME LM
+      head (snapshot the exit activation, CopyNoChecks into the head-input
+      slot, recompute only the head sub-stack — the exact DecodeDoLa idiom);
+      drafts argmax(p_exit) when max p_exit >= Confidence (LayerSkip/CALM
+      static gate) and ACCEPTS iff it equals the full-depth argmax (exact-
+      greedy verify, like examples/SpeculativeDecoding). The emitted token is
+      ALWAYS the full-depth argmax -> output BIT-IDENTICAL to plain greedy;
+      the gate only moves the accept/reject counters. Reusable lib fn +
+      examples/EarlyExitSelfSpeculative (trains a tiny char LM, asserts
+      self-spec == greedy bit-for-bit with a Halt(1) gate, reports accept/
+      reject counts, acceptance rate, and tokens/sec for both paths).
+      Regression tests TestEarlyExitMatchesGreedyBitIdentical /
+      ...HighConfidenceMatchesGreedy / ...AcceptCountsAreConsistent in
+      tests/TestNeuralDecode.pas (full suite 1954 green).
+      OPEN FOLLOW-UP: per-token-adaptive exit (per-step exit-layer choice via
+      an early-exit classifier) + the CACHED tail-skip that turns accepted
+      drafts into actually-saved tail-layer compute (v1 still does the full
+      forward plus a head-only splice, so it does not yet beat full depth on
+      wall-clock; the acceptance rate is the speed signal).
 - [ ] Streaming corpus loader with shuffle buffer: the landed packing
       pipeline materializes the whole token stream in RAM (neuraldatasets
       builds one concatenated Stream array). Read large text/token files

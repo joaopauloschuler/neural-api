@@ -196,6 +196,22 @@ type
 
   TNNetDecodeResultArray = array of TNNetDecodeResult;
 
+  // SELF-SPECULATIVE / EARLY-EXIT decode statistics (LayerSkip/CALM style).
+  // The SAME network is its own draft model: a token drafted from an
+  // INTERMEDIATE layer's logits (read through the LM head, frozen-body splice)
+  // is verified against the full-depth argmax. Because every emitted token is
+  // the full-depth argmax, the output is BIT-IDENTICAL to plain greedy; only
+  // the COUNTERS below describe the speed story. Coded by Claude (AI).
+  TNNetEarlyExitStats = record
+    Steps: integer;          // generated tokens (= full-depth forwards)
+    DraftProposals: integer; // steps where the early-exit was confident enough
+                             // to PROPOSE a draft (max p_exit >= Confidence)
+    Accepted: integer;       // confident drafts that matched the full argmax
+                             // (these would be free in a cached implementation)
+    Rejected: integer;       // confident drafts that DISAGREED (fell back)
+    AcceptanceRate: TNeuralFloat; // Accepted / max(1, DraftProposals)
+  end;
+
   // -------------------------------------------------------------------------
   // NEEDLE-IN-A-HAYSTACK long-context evaluation (NeedleInHaystackReport).
   //
@@ -1345,6 +1361,50 @@ function DecodeDoLa(NN: TNNet; const Prompt: string;
   MaxLen: integer; Alpha: TNeuralFloat;
   const StopStrings: array of string;
   Bucket: TDoLaLayerBucket;
+  HeadStartIdx: integer = -1): TNNetDecodeResult; overload;
+
+// SELF-SPECULATIVE EARLY-EXIT (LayerSkip / CALM) GREEDY decode. The model is
+// its OWN draft model - NO second checkpoint, NO separate prediction head:
+//   1. A full forward gives the mature distribution p_final.
+//   2. The "logits at layer k" splice (the frozen-body LogitLens idiom, the
+//      same one DecodeDoLa uses) snapshots the INTERMEDIATE exit layer's
+//      activation, copies it into the LM-head input slot, and recomputes ONLY
+//      the head sub-stack -> p_exit, the EARLY draft distribution.
+//   3. If the early exit is confident (max p_exit >= Confidence) it DRAFTS
+//      argmax(p_exit); that draft is VERIFIED against the full-depth argmax
+//      (exact-greedy verify, exactly as examples/SpeculativeDecoding does for a
+//      separate draft net). The EMITTED token is ALWAYS the full-depth argmax,
+//      so on agreement the costly tail layers were "skippable" and on
+//      disagreement we fall back to full depth. Either way the output is
+//      identical to plain greedy - the early exit only changes the ACCEPT
+//      counters (a cached decoder turns accepts into saved tail-layer work).
+// CORRECTNESS: the accepted greedy sequence equals DecodeGreedy BIT-FOR-BIT;
+// Confidence only steers how often the draft is consulted, never the output.
+//   MaxLen     : maximum generated tokens (excludes the prompt).
+//   ExitLayer  : the intermediate exit layer index (its Output is spliced into
+//                the head input). Must be < the head-input layer. -1 auto-picks
+//                the midpoint between the input and the head input.
+//   Confidence : early-exit confidence threshold in [0,1]; the draft is
+//                proposed only when max p_exit >= Confidence (LayerSkip/CALM
+//                static gate). Confidence > 1 disables drafting (pure greedy,
+//                still bit-identical). Default 0 = always draft.
+//   HeadStartIdx: first layer of the LM-head sub-stack; -1 auto-detects it as
+//                 the last trainable layer (same heuristic as DecodeDoLa).
+// The out Stats record reports accept/reject counts and acceptance rate.
+// Char-level, same forward / encoding convention as DecodeGreedy; no KV-cache
+// (v1; the per-token-adaptive exit + cached tail-skip is the open follow-up).
+// Coded by Claude (AI).
+function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
+  MaxLen: integer; out Stats: TNNetEarlyExitStats;
+  const StopStrings: array of string;
+  ExitLayer: integer = -1; Confidence: TNeuralFloat = 0.0;
+  HeadStartIdx: integer = -1): TNNetDecodeResult; overload;
+
+// Convenience overload without the Stats out-param (counters discarded).
+// Coded by Claude (AI).
+function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
+  MaxLen: integer;
+  ExitLayer: integer = -1; Confidence: TNeuralFloat = 0.0;
   HeadStartIdx: integer = -1): TNNetDecodeResult; overload;
 
 // SAMPLED char-level decode: the stochastic sibling of DecodeGreedy. Each step
@@ -5363,6 +5423,150 @@ begin
     Result := HeadStartIdx;
   if Result < 1 then Result := 1;
   if Result > LastLayer then Result := LastLayer;
+end;
+
+function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
+  MaxLen: integer; out Stats: TNNetEarlyExitStats;
+  const StopStrings: array of string;
+  ExitLayer: integer; Confidence: TNeuralFloat;
+  HeadStartIdx: integer): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume, ExitSnap: TNNetVolume;
+  VocabSize, Step, I, HeadIdx, HeadInIdx, LastLayer, ResolvedExit: integer;
+  FullBest, ExitBest, StopLen: integer;
+  Total, MaxFinal, MaxExit, Pf: TNeuralFloat;
+  Context: string;
+  Confident: boolean;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  ExitSnap := TNNetVolume.Create();
+  VocabSize := OutputVolume.Size;
+  LastLayer := NN.GetLastLayerIdx();
+  HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
+  HeadInIdx := HeadIdx - 1;
+  // Resolve the intermediate exit layer. It must sit BELOW the head input so
+  // its activation can be spliced through the LM head. Auto = midpoint.
+  if ExitLayer < 0 then
+    ResolvedExit := HeadInIdx div 2
+  else
+    ResolvedExit := ExitLayer;
+  if ResolvedExit < 1 then ResolvedExit := 1;
+  if ResolvedExit > HeadInIdx then ResolvedExit := HeadInIdx;
+  // The splice only works when the exit layer's activation is shape-compatible
+  // with the head-input slot. If not, drafting is impossible -> pure greedy.
+  if NN.Layers[ResolvedExit].Output.Size <> NN.Layers[HeadInIdx].Output.Size then
+    Confidence := 2.0;  // disables the draft path; output stays bit-identical.
+
+  Stats.Steps := 0;
+  Stats.DraftProposals := 0;
+  Stats.Accepted := 0;
+  Stats.Rejected := 0;
+  Stats.AcceptanceRate := 0;
+
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      // (1) Full-depth forward -> p_final and its argmax (the verifier).
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      FullBest := 0;
+      MaxFinal := OutputVolume.Raw[0];
+      for I := 1 to VocabSize - 1 do
+        if OutputVolume.Raw[I] > MaxFinal then
+        begin
+          MaxFinal := OutputVolume.Raw[I];
+          FullBest := I;
+        end;
+      MaxFinal := MaxFinal / Total;
+      if MaxFinal < 0 then MaxFinal := 0;
+
+      // (2) Early-exit DRAFT via the frozen-body splice: copy the intermediate
+      //     layer's activation (already computed by the full forward above) into
+      //     the head-input slot and recompute ONLY the head sub-stack -> p_exit.
+      //     Only consulted when ExitLayer is strictly below the head input.
+      if (Confidence <= 1.0) and (ResolvedExit < HeadInIdx) then
+      begin
+        ExitSnap.Copy(NN.Layers[ResolvedExit].Output);
+        NN.Layers[HeadInIdx].Output.CopyNoChecks(ExitSnap);
+        for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
+        Total := NN.GetLastLayer().Output.GetSum();
+        if Total <= 0 then Total := 1.0;
+        ExitBest := 0;
+        MaxExit := NN.GetLastLayer().Output.Raw[0];
+        for I := 1 to VocabSize - 1 do
+          if NN.GetLastLayer().Output.Raw[I] > MaxExit then
+          begin
+            MaxExit := NN.GetLastLayer().Output.Raw[I];
+            ExitBest := I;
+          end;
+        MaxExit := MaxExit / Total;
+        if MaxExit < 0 then MaxExit := 0;
+
+        // (3) Static-gate accept/verify (LayerSkip/CALM): the draft is PROPOSED
+        //     only when the early exit is confident; it is ACCEPTED iff it
+        //     matches the full-depth argmax (exact-greedy verify).
+        Confident := MaxExit >= Confidence;
+        if Confident then
+        begin
+          Inc(Stats.DraftProposals);
+          if ExitBest = FullBest then Inc(Stats.Accepted)
+          else Inc(Stats.Rejected);
+        end;
+      end;
+
+      // The EMITTED token is ALWAYS the full-depth argmax -> bit-identical to
+      // DecodeGreedy. The draft above only moved the accept/reject counters.
+      Pf := MaxFinal;
+      Result.SumLogProb := Result.SumLogProb + SafeLogProb(Pf);
+      Inc(Stats.Steps);
+
+      if FullBest = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      Result.Text := Result.Text + Chr(FullBest);
+      Context := Context + Chr(FullBest);
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+    ExitSnap.Free;
+  end;
+  if Stats.DraftProposals > 0 then
+    Stats.AcceptanceRate := Stats.Accepted / Stats.DraftProposals;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
+  MaxLen: integer;
+  ExitLayer: integer; Confidence: TNeuralFloat;
+  HeadStartIdx: integer): TNNetDecodeResult;
+var
+  Stats: TNNetEarlyExitStats;
+  NoStops: array of string;
+begin
+  SetLength(NoStops, 0);
+  Result := DecodeEarlyExitSelfSpeculative(NN, Prompt, MaxLen, Stats, NoStops,
+    ExitLayer, Confidence, HeadStartIdx);
 end;
 
 // Builds the DoLa candidate-layer bucket: every layer 0..HeadInIdx-1 whose
