@@ -1493,6 +1493,25 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// ReGLU gated activation with a SQUARED ReLU gate - experimental layer.
+  // Splits the input along the channel (depth) axis into two equal halves
+  // A (first half) and B (second half) and outputs A * ReLU(B)^2 (the gate is
+  // the squared ReLU activation, ACT2FN "relu2"). Output depth = input depth
+  // / 2. Parameter-free; the input depth must be even. This is the BitNet
+  // b1.58 SwiGLU-slot activation: down(ffn_sub_norm(relu2(gate(x)) * up(x)))
+  // with the Llama fused-projection convention (first half = up, second half =
+  // gate), so the layer reproduces relu2(gate) * up = A_up * ReLU(B_gate)^2.
+  // d/dB (ReLU(B)^2) = 2*ReLU(B) (0 for B <= 0).
+  // Coded by Claude (AI).
+  TNNetReGLUSquared = class(TNNetLayer)
+  private
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Tanh-gated linear unit - This is an experimental layer.
   // Splits the input along the channel (depth) axis into two equal halves
   // A and B and outputs A * tanh(B). Output depth = input depth / 2.
@@ -18213,6 +18232,89 @@ begin
           FPrevLayer.FOutputError.Add(X, Y, D, err * reluDeriv * b);
           // dL/db = ReLU(a) * dL/dy
           FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth, err * reluA);
+        end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetReGLUSquared }
+
+constructor TNNetReGLUSquared.Create();
+begin
+  inherited Create();
+end;
+
+procedure TNNetReGLUSquared.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetReGLUSquared requires an even input depth. Input depth: ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  end;
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetReGLUSquared.Compute();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, reluB: TNeuralFloat;
+begin
+  StartTime := Now();
+  HalfDepth := FOutput.Depth;
+  MaxX := FOutput.SizeX - 1;
+  MaxY := FOutput.SizeY - 1;
+  MaxD := HalfDepth - 1;
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+      for D := 0 to MaxD do
+      begin
+        a := FPrevLayer.FOutput[X, Y, D];
+        b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+        if b > 0 then reluB := b else reluB := 0;
+        FOutput[X, Y, D] := a * reluB * reluB;
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetReGLUSquared.Backpropagate();
+var
+  StartTime: double;
+  MaxX, MaxY, MaxD: integer;
+  X, Y, D, HalfDepth: integer;
+  a, b, reluB, err: TNeuralFloat;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.Output.Size > 0) and
+     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) then
+  begin
+    StartTime := Now();
+    HalfDepth := FOutput.Depth;
+    MaxX := FOutput.SizeX - 1;
+    MaxY := FOutput.SizeY - 1;
+    MaxD := HalfDepth - 1;
+    for X := 0 to MaxX do
+      for Y := 0 to MaxY do
+        for D := 0 to MaxD do
+        begin
+          a := FPrevLayer.FOutput[X, Y, D];
+          b := FPrevLayer.FOutput[X, Y, D + HalfDepth];
+          if b > 0 then reluB := b else reluB := 0;
+          err := FOutputError[X, Y, D];
+          // y = a * ReLU(b)^2
+          // dL/da = ReLU(b)^2 * dL/dy
+          FPrevLayer.FOutputError.Add(X, Y, D, err * reluB * reluB);
+          // dL/db = a * 2*ReLU(b) * dL/dy
+          FPrevLayer.FOutputError.Add(X, Y, D + HalfDepth,
+            err * a * 2.0 * reluB);
         end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -85817,6 +85919,7 @@ begin
       'TNNetGptOssGatedSwiGLU' :    Result := TNNetGptOssGatedSwiGLU.Create(Ft[0], Ft[1]);
       'TNNetGLU' :                  Result := TNNetGLU.Create();
       'TNNetReGLU' :                Result := TNNetReGLU.Create();
+      'TNNetReGLUSquared' :         Result := TNNetReGLUSquared.Create();
       'TNNetTanhGLU' :              Result := TNNetTanhGLU.Create();
       'TNNetCosineSimilarity' :     Result := TNNetCosineSimilarity.Create();
       'TNNetSquaredReLU' :          Result := TNNetSquaredReLU.Create();
@@ -86206,6 +86309,7 @@ begin
       if S[0] = 'TNNetGptOssGatedSwiGLU' then Result := TNNetGptOssGatedSwiGLU.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetGLU' then Result := TNNetGLU.Create() else
       if S[0] = 'TNNetReGLU' then Result := TNNetReGLU.Create() else
+      if S[0] = 'TNNetReGLUSquared' then Result := TNNetReGLUSquared.Create() else
       if S[0] = 'TNNetTanhGLU' then Result := TNNetTanhGLU.Create() else
       if S[0] = 'TNNetCosineSimilarity' then Result := TNNetCosineSimilarity.Create() else
       if S[0] = 'TNNetSquaredReLU' then Result := TNNetSquaredReLU.Create() else

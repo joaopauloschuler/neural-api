@@ -832,6 +832,20 @@ type
                                // shared_mlp.input_linear [2*S, H] (fused
                                // gate|up) + shared_mlp.output_linear [H, S]
                                // (down). 0 = no shared expert
+    // ---- BitNet b1.58 deltas (all default off for the other families) ----
+    BitNetSubLN: boolean;      // BitNet "norm-before-quantized-linear" SubLN:
+                               // an EXTRA RMSNorm INSIDE the attention branch
+                               // on the concatenated head outputs BEFORE o_proj
+                               // (attn_sub_norm) and INSIDE the FFN branch on
+                               // the gated activation BEFORE down_proj
+                               // (ffn_sub_norm). Distinct from the Gemma-2 /
+                               // OLMo-2 post-norms (those normalize the WHOLE
+                               // sublayer output AFTER the last projection; the
+                               // BitNet SubLN sits BEFORE it). Wired via the
+                               // existing pre-norm builder slots (no new layer)
+    ReGLUSquaredFFN: boolean;  // BitNet relu2 FFN: the SwiGLU activation slot is
+                               // replaced by TNNetReGLUSquared (up*ReLU(gate)^2,
+                               // ACT2FN "relu2") instead of SiLU SwiGLU
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
@@ -1267,6 +1281,36 @@ function BuildPhi3FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildPhi3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// BitNet b1.58 (model_type "bitnet", microsoft/bitnet-b1.58-2B-4T - the
+// ternary-weight LLM family): the Llama backbone (RMSNorm + RoPE) with two
+// deltas, both wired onto the existing builder slots with NO new layer class
+// for the norms:
+// (a) BitNet SubLN ("norm-before-quantized-linear"): an EXTRA RMSNorm INSIDE
+//     each residual branch BEFORE the quantized projection - attn_sub_norm on
+//     the concatenated head outputs before o_proj and ffn_sub_norm on the gated
+//     activation before down_proj (HF BitNetAttention / BitNetMLP). Distinct
+//     from the Gemma-2 / OLMo-2 post-norms (those normalize AFTER the last
+//     projection); this one sits BEFORE it.
+// (b) relu2 gated FFN (hidden_act "relu2"): down(ffn_sub_norm(relu2(gate)*up))
+//     with SEPARATE gate_proj/up_proj, so the SwiGLU activation slot becomes
+//     the squared-ReLU TNNetReGLUSquared (up * ReLU(gate)^2).
+// The ternary weights ride the standard de-quant-at-load convention (the same
+// path as the GGUF / MXFP4 importers): the HF transformers checkpoint
+// (BitNetForCausalLM) ships FP shadow weights that are already the
+// ternary*scale effective weights and uses plain nn.Linear, so matching it
+// bit-for-bit means loading them straight (the absmean ternarize is a no-op
+// round-trip on already-ternary weights; the native I2_S 2-bit packed format
+// is converted to the same effective weights). Thin wrappers over the Llama
+// path that ASSERT model_type is 'bitnet'.
+function BuildBitNetFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildBitNetFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -5017,11 +5061,13 @@ begin
        (ModelType <> 'olmo2') and (ModelType <> 'olmoe') and
        (ModelType <> 'mixtral') and
        (ModelType <> 'glm4') and (ModelType <> 'glm') and
-       (ModelType <> 'granite') and (ModelType <> 'granitemoe') then
+       (ModelType <> 'granite') and (ModelType <> 'granitemoe') and
+       (ModelType <> 'bitnet') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", ' +
         '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "olmoe", ' +
-        '"mixtral", "glm4", "granite" and "granitemoe" are supported here ' +
+        '"mixtral", "glm4", "granite", "granitemoe" and "bitnet" are ' +
+        'supported here ' +
         '(see BuildFromPretrained for the full dispatch; multimodal ' +
         '"gemma3" configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
@@ -5086,6 +5132,8 @@ begin
     Result.GLM4SandwichNorm := False;
     Result.FusedGateUp := False;
     Result.InterleavedRotary := False;
+    Result.BitNetSubLN := False;
+    Result.ReGLUSquaredFFN := False;
     // Granite multipliers default to 1.0 (no-op) so a vanilla Llama-shaped
     // config still imports unchanged; the granite/granitemoe branch reads the
     // real values below.
@@ -5572,6 +5620,49 @@ begin
             IntToStr(Result.SharedIntermediateSize) + '.');
       end;
     end
+    else if ModelType = 'bitnet' then
+    begin
+      // BitNet b1.58 (model_type "bitnet", microsoft/bitnet-b1.58-2B-4T): the
+      // Llama backbone (RMSNorm + RoPE) with the BitNet deltas, all wired onto
+      // the existing builder slots (no new layer class for the norms):
+      //   (a) BitNetSubLN: an EXTRA RMSNorm INSIDE each branch BEFORE the
+      //       quantized linear - attn_sub_norm before o_proj and ffn_sub_norm
+      //       before down_proj (HF BitNetAttention / BitNetMLP). These are the
+      //       "norm-before-quantized-linear" SubLN, distinct from the post-norm
+      //       families (which normalize AFTER the projection).
+      //   (b) ReGLUSquaredFFN: hidden_act "relu2" - the gated FFN is
+      //       down(ffn_sub_norm(relu2(gate(x)) * up(x))) with SEPARATE (non-
+      //       fused) gate_proj/up_proj, so the SwiGLU activation slot becomes
+      //       TNNetReGLUSquared (up * ReLU(gate)^2) and the loader takes the
+      //       standard separate-projection path.
+      // The released checkpoint ships in two storage forms (handled at load):
+      // either FP shadow weights (which for the released model are already the
+      // ternary*scale effective weights - loaded straight, so the absmean
+      // round-trip is a no-op) or the native I2_S 2-bit packed format. The HF
+      // transformers checkpoint (BitNetForCausalLM) is the SHADOW form and uses
+      // plain nn.Linear, so matching it bit-for-bit means loading the stored
+      // weights straight (the same dequant-at-load convention as the GGUF /
+      // MXFP4 importers - the ternarization lives in the fixture, not here).
+      Result.BitNetSubLN := True;
+      Result.ReGLUSquaredFFN := True;
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5); // BitNet default
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      if Result.QKVBias then
+        ImportError('Llama import: BitNet attention_bias=true is not wired ' +
+          '(every released bitnet checkpoint is bias-free).');
+      HiddenAct := Obj.Get('hidden_act', 'relu2');
+      if HiddenAct <> 'relu2' then
+        ImportError('Llama import: BitNet hidden_act "' + HiddenAct +
+          '" is not supported - every released bitnet checkpoint uses ' +
+          '"relu2" (squared-ReLU gated FFN).');
+      // transformers 5.x BitNetConfig carries rope_theta inside the
+      // rope_parameters dict (rope_type "default", default theta 500000),
+      // not as a top-level rope_theta. Honor it when present.
+      FloatField := Obj.Find('rope_parameters');
+      if (FloatField <> nil) and (FloatField is TJSONObject) then
+        Result.RopeTheta :=
+          TJSONObject(FloatField).Get('rope_theta', Result.RopeTheta);
+    end
     else // llama
       Result.QKVBias := Obj.Get('attention_bias', False);
     Result.Prefix := ''; // detected from the checkpoint by the builder
@@ -5649,6 +5740,10 @@ begin
     Result := Result + ', fused_gate_up=true';
   if Config.InterleavedRotary then
     Result := Result + ', interleaved_rotary=true';
+  if Config.BitNetSubLN then
+    Result := Result + ', bitnet_sub_ln=true';
+  if Config.ReGLUSquaredFFN then
+    Result := Result + ', reglu_squared_ffn=true';
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -6053,6 +6148,10 @@ type
     // place - the sublayer output, before the residual add - it just drops
     // the entry norms: AttnNorm and MlpNorm stay nil).
     PostAttnNorm, PostMlpNorm: TNNetLayer;
+    // BitNet b1.58 SubLN (Config.BitNetSubLN): the attn_sub_norm RMSNorm on the
+    // concatenated head outputs BEFORE o_proj, and the ffn_sub_norm RMSNorm on
+    // the gated activation BEFORE down_proj; nil otherwise.
+    AttnSubNorm, FfnSubNorm: TNNetLayer;
     // Per-head q/k RMSNorm copies (Qwen3 QKNorm); empty otherwise.
     QNorms, KNorms: array of TNNetLayer;
     // FULL-WIDTH q/k RMSNorm (OLMo-2 QKNormFullWidth); nil otherwise.
@@ -6630,6 +6729,14 @@ begin
             HeadPack);
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        // Config.BitNetSubLN (BitNet b1.58): the attn_sub_norm RMSNorm sits on
+        // the concatenated head outputs BEFORE o_proj (HF BitNetAttention:
+        // attn_output = attn_sub_norm(attn_output); o_proj(attn_output)) - the
+        // "norm-before-quantized-linear" SubLN, distinct from the post-norms
+        // below (which normalize the WHOLE sublayer output AFTER o_proj).
+        if Config.BitNetSubLN then
+          Blocks[BlockCnt].AttnSubNorm :=
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
         // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
@@ -6664,10 +6771,22 @@ begin
         begin
           Blocks[BlockCnt].GateUp := NN.AddLayer(
             TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
-          if Config.GegluFFN then
+          if Config.ReGLUSquaredFFN then
+            // BitNet b1.58 relu2 FFN: down(ffn_sub_norm(relu2(gate)*up)). The
+            // fused projection packs up in neurons 0..I-1 and gate in I..2I-1
+            // (firsthalf=up, secondhalf=gate), so TNNetReGLUSquared computes
+            // up * ReLU(gate)^2 = relu2(gate) * up.
+            NN.AddLayer( TNNetReGLUSquared.Create() )
+          else if Config.GegluFFN then
             NN.AddLayer( TNNetGEGLU.Create() )
           else
             NN.AddLayer( TNNetSwiGLU.Create() );
+          // Config.BitNetSubLN (BitNet b1.58): the ffn_sub_norm RMSNorm sits on
+          // the gated activation BEFORE down_proj (HF BitNetMLP:
+          // down_proj(ffn_sub_norm(act_fn(gate(x)) * up(x)))).
+          if Config.BitNetSubLN then
+            Blocks[BlockCnt].FfnSubNorm :=
+              NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
           Blocks[BlockCnt].Down := NN.AddLayer(
             TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
         end;
@@ -6964,6 +7083,22 @@ begin
             BlockPrefix + 'post_attention_layernorm.weight',
             Config.HiddenSize, NormGainOffset);
           MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+        end;
+        // Config.BitNetSubLN (BitNet b1.58): the two extra SubLN gains.
+        // attn_sub_norm normalizes the [hidden_size] attention output before
+        // o_proj; ffn_sub_norm normalizes the [intermediate_size] gated
+        // activation before down_proj. Both are plain RMSNorm gains (no 1+w
+        // offset - BitNet stores them straight).
+        if Config.BitNetSubLN then
+        begin
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].AttnSubNorm,
+            BlockPrefix + 'self_attn.attn_sub_norm.weight',
+            Config.HiddenSize, 0);
+          MarkConsumed(BlockPrefix + 'self_attn.attn_sub_norm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].FfnSubNorm,
+            BlockPrefix + 'mlp.ffn_sub_norm.weight',
+            Config.IntermediateSize, 0);
+          MarkConsumed(BlockPrefix + 'mlp.ffn_sub_norm.weight');
         end;
         if LlamaLayerIsMoE(Config, BlockCnt) then
         begin
@@ -14906,6 +15041,25 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildPhi3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildBitNetFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'bitnet', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildBitNetFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildBitNetFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -25451,7 +25605,8 @@ begin
           (ModelType = 'olmo2') or (ModelType = 'olmoe') or
           (ModelType = 'mixtral') or
           (ModelType = 'glm4') or
-          (ModelType = 'granite') or (ModelType = 'granitemoe') then
+          (ModelType = 'granite') or (ModelType = 'granitemoe') or
+          (ModelType = 'bitnet') then
     // 'glm4' (architectures ["Glm4ForCausalLM"], THUDM/GLM-4-9B-0414 etc.)
     // raises the four-norm sandwich (post_self_attn_layernorm /
     // post_mlp_layernorm INSIDE the residual branches), partial+interleaved

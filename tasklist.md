@@ -116,32 +116,37 @@ rather than acted on.
       OlmoeForCausalLM): the pico fixture is random-init only — add a real
       allenai/OLMoE-1B-0924 slicer (slice_llama.py reuse) to parity-check a
       sliced real checkpoint against the random pico fixture.
-- [ ] BitNet b1.58 importer (`BuildBitNetFromSafeTensors[Ex]`, model_type
-      "bitnet" / the released `microsoft/bitnet-b1.58-2B-4T`) — the ternary-
-      weight LLM family, the one importer that maps a real released checkpoint
-      onto the ALREADY-LANDED `TNNetBitLinear` layer (BitNet b1.58 absmean
-      ternarization + opt-in int8 activation quantization, see
-      neural/neuralnetwork.pas; demonstrated in examples/BitLinearBakeoff). The
-      architecture is the Llama backbone (RMSNorm, RoPE, SwiGLU) with the
-      attention/FFN nn.Linear projections replaced by BitLinear and an EXTRA
-      SubLN/RMSNorm before the o_proj and down_proj (the BitNet
-      "norm-before-quantized-linear" placement) — so most of this rides the
-      existing BuildLlamaFromSafeTensors path with two genuinely new pieces:
-      (a) routing q/k/v/o + gate/up/down through TNNetBitLinear instead of the
-      plain dense layers, folding the per-tensor weight scale, and (b) the
-      packed-ternary weight de-quant-at-load — HF ships either FP32/BF16
-      shadow weights (trivial: ternarize at load with the layer's absmean rule
-      and assert the round-trip matches) OR the native I2_S packed format (4
-      ternary values per byte + a separate weight_scale tensor), which needs a
-      2-bit unpack analogous to the landed GGUF Q8_0 / MXFP4 dequant-at-load
-      readers. Wire the SubLN placement via the existing pre-norm builder slots
-      (no new layer class). Deliverables: pico parity fixture via the
-      make_pico_*_fixture.py recipe (re-randomized ternary weights + scales
-      asserted to move the HF logits) + TestBitNet{Config,Logit}Parity < 1e-4
-      vs float64 HF transformers, plus a real-checkpoint slicer (slice_llama.py
-      reuse) to parity-check a sliced microsoft/bitnet-b1.58-2B-4T against the
-      pico fixture. Headline: a 2B model that resides in well under 1GB,
-      dovetailing with the int8/GGUF "run big models on commodity RAM" theme.
+- [X] BitNet b1.58 importer (`BuildBitNetFromSafeTensors[Ex]` LANDED,
+      model_type "bitnet" / the released `microsoft/bitnet-b1.58-2B-4T`) — the
+      ternary-weight LLM family, mapped onto the Llama backbone (RMSNorm, RoPE)
+      with the BitNet deltas wired onto the existing builder slots:
+      (a) the SubLN "norm-before-quantized-linear" RMSNorm — attn_sub_norm on
+      the concatenated head outputs BEFORE o_proj and ffn_sub_norm on the gated
+      activation BEFORE down_proj (Config.BitNetSubLN, distinct from the
+      Gemma-2/OLMo-2 post-norms; no new layer class, reuses TNNetTokenRMSNorm);
+      (b) the relu2 gated FFN (hidden_act "relu2") via the new
+      TNNetReGLUSquared activation (up*ReLU(gate)^2) with SEPARATE
+      gate_proj/up_proj on the standard separate-projection loader path; and
+      (c) rope_theta read from the transformers-5.x rope_parameters dict
+      (default 500000). The ternary weights ride the standard de-quant-at-load
+      convention (the GGUF Q8_0 / MXFP4 precedent): the HF transformers
+      BitNetForCausalLM checkpoint is the FP "shadow" form storing the
+      already-ternary effective weights (scale*{-1,0,+1}) and runs them through
+      plain nn.Linear, so loading them straight is bit-for-bit (the absmean
+      ternarize is a no-op round-trip on already-ternary weights). Pico parity
+      fixture tools/bitnet_tiny_fixture.py re-randomizes + ternarizes the
+      projections and ASSERTS the ternarization moves the HF logits
+      (non-vacuous); TestBitNet{Config,Logit}Parity < 1e-4 vs float64 HF
+      BitNetForCausalLM, both passing. Headline: a 2B model that resides in
+      well under 1GB, dovetailing with the int8/GGUF "commodity RAM" theme.
+  - [ ] native I2_S packed-ternary de-quant-at-load (2-bit unpack: 4 ternary
+        values per byte + a separate weight_scale tensor). The shadow-weight
+        (FP effective-weights) path is covered; the GGUF/bitnet.cpp-style I2_S
+        packed format is NOT yet read (the HF transformers checkpoint ships
+        the shadow form, so the parity fixture exercises only that path).
+  - [ ] real-checkpoint slicer (slice_llama.py reuse) to parity-check a sliced
+        microsoft/bitnet-b1.58-2B-4T against the random pico fixture — SKIPPED
+        (network/RAM-gated: requires downloading the 2B checkpoint).
 - [ ] M2M100/NLLB translate demo + real-vocab check (follow-up to the landed
       BuildM2M100FromSafeTensors, commit cb21550): an examples/NLLBTranslate
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and

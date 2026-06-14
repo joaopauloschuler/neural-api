@@ -204,6 +204,8 @@ type
     procedure TestPhiLogitParity;
     procedure TestPhi3LogitParity;
     procedure TestPhi3LongRoPELogitParity;
+    procedure TestBitNetConfigParity;
+    procedure TestBitNetLogitParity;
     procedure TestGLM4ConfigFromJSONFile;
     procedure TestGLM4LogitParity;
     procedure TestGraniteConfigFromJSONFile;
@@ -7266,6 +7268,79 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free;
+  end;
+end;
+
+// BitNet b1.58 config parity (model_type "bitnet", the
+// microsoft/bitnet-b1.58-2B-4T architecture). tests/fixtures/tiny_bitnet.* is
+// a pico randomly-initialized HF BitNetForCausalLM whose q/k/v/o + gate/up/down
+// projections are ternarized (scale * {-1,0,+1}, the BitNet absmean rule, see
+// tools/bitnet_tiny_fixture.py). The config reader must raise the two bitnet
+// deltas - the SubLN ("norm-before-quantized-linear") and the relu2 gated FFN -
+// from model_type alone, and read rope_theta from the rope_parameters dict.
+procedure TTestNeuralPretrained.TestBitNetConfigParity;
+var
+  Config: TLlamaConfig;
+begin
+  Config := ReadLlamaConfigFromJSONFile(
+    FixturePath('tiny_bitnet_config.json'));
+  AssertEquals('model_type', 'bitnet', Config.ModelType);
+  AssertEquals('layers', 2, Config.NumLayers);
+  AssertEquals('heads', 4, Config.NumHeads);
+  AssertEquals('kv_heads', 2, Config.NumKVHeads);
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('intermediate', 32, Config.IntermediateSize);
+  AssertEquals('vocab', 13, Config.VocabSize);
+  AssertEquals('rms_norm_eps', 1.0e-5, Config.RmsNormEps, 1e-12);
+  // rope_theta lives in rope_parameters (transformers 5.x BitNetConfig).
+  AssertEquals('rope_theta from rope_parameters', 500000.0,
+    Config.RopeTheta, 1e-3);
+  AssertTrue('bitnet_sub_ln', Config.BitNetSubLN);
+  AssertTrue('reglu_squared_ffn', Config.ReGLUSquaredFFN);
+  AssertFalse('qkv_bias (bitnet is bias-free)', Config.QKVBias);
+  AssertFalse('not fused gate/up (separate proj)', Config.FusedQKVGateUp);
+  AssertFalse('not fused gate/up (separate proj)', Config.FusedGateUp);
+  AssertFalse('not tied (released bitnet is untied)',
+    Config.TieWordEmbeddings);
+end;
+
+// BitNet b1.58 logit parity. The pico fixture's projections are ternary
+// (scale * {-1,0,+1}); the HF transformers BitNetForCausalLM runs them through
+// plain nn.Linear, so loading the stored effective weights straight onto the
+// Llama path (the de-quant-at-load convention) must reproduce the float64 HF
+// logits bit-for-bit (the importer's load-time absmean ternarize is a no-op
+// round-trip on already-ternary weights). The fixture asserts the
+// ternarization moved the logits well above the 1e-4 gate, so this genuinely
+// exercises ternary weights, the SubLN placement and the relu2 FFN.
+procedure TTestNeuralPretrained.TestBitNetLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NN := BuildBitNetFromSafeTensorsEx(FixturePath('tiny_bitnet.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_bitnet_config.json'));
+  try
+    AssertEquals('model_type', 'bitnet', Config.ModelType);
+    AssertTrue('bitnet_sub_ln', Config.BitNetSubLN);
+    AssertTrue('reglu_squared_ffn', Config.ReGLUSquaredFFN);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_bitnet_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type "bitnet"
+  // (architectures ["BitNetForCausalLM"]) onto the same Llama path.
+  NN := BuildFromPretrained(FixturePath('tiny_bitnet.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_bitnet_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_bitnet_logits.json'), 16, 13);
   finally
     NN.Free;
   end;
