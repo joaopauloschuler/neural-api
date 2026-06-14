@@ -99,25 +99,14 @@ rather than acted on.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
-- [X] IBM Granite 3.x importer (`BuildGraniteFromSafeTensors[Ex]`, model_type
-      `granite`/`granitemoe`) — DONE. Four multipliers folded at load on the
-      Llama path (embedding_multiplier→embedding rows; residual_multiplier→
-      o_proj/down_proj/expert-down rows; attention_multiplier→W_q as
-      multiplier·sqrt(head_dim) so SDPA's structural 1/sqrt(head_dim) yields
-      the requested scale — wired through the existing QScale/W_q slot, not
-      hardcoded; logits_scaling→1/logits_scaling into the LM head, like the
-      Cohere fold but DIVIDING). granitemoe reuses the Mixtral MoE block
-      WIRING but with a dedicated loader (LoadGraniteMoEExperts) for its FUSED
-      3-D slabs (block_sparse_moe.input_linear [E,2I,H] / output_linear
-      [E,H,I] / router.layer.weight [E,H]) — Mixtral's per-expert 2-D w1/w2/w3
-      tensors do NOT apply; gating is identical (softmax over top-k logits ==
-      top-k renorm). Pico fixtures tools/granite_tiny_fixture.py (both
-      variants, all four multipliers re-randomized non-1.0 and asserted to
-      move the HF logits) + TestGranite{Config,Logit,MoeLogit}Parity, all <
-      1e-4 vs float64 HF transformers (Granite{,Moe}ForCausalLM). Defaults of
-      1.0 keep vanilla-Llama configs unchanged; a 0/unset multiplier from the
-      GGUF (Default-record) config path is normalized to its no-op in the
-      builder so non-Granite imports are untouched. Open follow-ups:
+- [ ] IBM Granite 3.x importer follow-ups (`BuildGraniteFromSafeTensors[Ex]`
+      LANDED, model_type `granite`/`granitemoe`; four multipliers folded at
+      load on the Llama path — embedding/residual/attention multipliers + a
+      DIVIDING logits_scaling into the LM head, wired through the existing
+      QScale/W_q slot not hardcoded; granitemoe reuses the Mixtral MoE WIRING
+      with a dedicated LoadGraniteMoEExperts loader for its fused 3-D slabs;
+      pico parity TestGranite{Config,Logit,MoeLogit}Parity < 1e-4 vs float64
+      HF transformers):
   - [ ] granitemoe `shared_intermediate_size` > 0 (an always-on parallel
         shared expert, GraniteMoeShared / granite-3.0-3b-a800m) is REJECTED,
         not wired — needs the shared SwiGLU branch summed with the routed
