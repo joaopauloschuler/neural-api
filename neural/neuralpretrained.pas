@@ -4961,6 +4961,60 @@ function BuildResNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// CONVNEXT v1 / v2 IMPORT (HF "convnext" / "convnextv2",
+// e.g. facebook/convnext-tiny-224 and facebook/convnextv2-tiny-1k-224).
+// A modern hierarchical CNN. Stem = 4x4 stride-4 patchify conv -> channel
+// LayerNorm. 4 stages of depths/dims (tiny = [3,3,9,3]/[96,192,384,768]),
+// each preceded (stages 1..3) by a downsample = channel LayerNorm -> 2x2
+// stride-2 conv. Block (ConvNeXtLayer): depthwise 7x7 (pad 3) -> channel
+// LayerNorm -> pointwise Linear expand to 4*dim -> exact-erf GELU ->
+// [v2: GRN] -> pointwise Linear project to dim -> [v1: per-channel LayerScale
+// gamma] -> residual add. v2 REPLACES the LayerScale gamma with a GRN inserted
+// between the GELU and the project pointwise. Head = global average pool ->
+// channel LayerNorm -> Linear(num_labels). Stochastic depth is identity at
+// inference. Distinct from MobileNetV3's MBConv (no squeeze-excite, no inverted
+// bottleneck, no BatchNorm) - every norm here is LayerNorm/GRN, not folded.
+// The two signature primitives reuse existing layers: TNNetGRN (v2 GRN) and
+// TNNetChannelMul (v1 LayerScale). Channel LayerNorm is TNNetTokenLayerNorm
+// (per-(x,y) over the Depth channel vector). pwconv1/pwconv2 are
+// TNNetPointwiseConvLinear (1x1 conv == per-pixel Linear over channels).
+// ---------------------------------------------------------------------------
+type
+  TConvNeXtConfig = record
+    Version: integer;                // 1 (LayerScale) or 2 (GRN)
+    Depths: array[0..3] of integer;  // blocks per stage (tiny [3,3,9,3])
+    Dims: array[0..3] of integer;    // channels per stage (tiny [96..768])
+    PatchSize: integer;              // stem conv kernel/stride (4)
+    ImageSize: integer;              // 224 for ImageNet
+    NumChannels: integer;            // 3
+    NumLabels: integer;              // classifier out width (1000 ImageNet-1k)
+    LayerNormEps: TNeuralFloat;      // 1e-6 (HF ConvNeXt LayerNorm/GRN eps)
+    LayerScaleInit: TNeuralFloat;    // v1 LayerScale init (1e-6); <=0 disables
+    ModelType: string;               // 'convnext' / 'convnextv2'
+  end;
+
+// Reads an HF ConvNeXt/ConvNeXtV2 config.json. model_type "convnextv2" selects
+// the v2 (GRN) path, else v1 (LayerScale). depths / hidden_sizes (4-int arrays)
+// override the tiny defaults; num_labels / id2label / label2id set the head.
+function ReadConvNeXtConfigFromJSONFile(
+  const FileName: string): TConvNeXtConfig;
+
+function ConvNeXtConfigToString(const Config: TConvNeXtConfig): string;
+
+// Builds the ConvNeXt described by Config and loads every weight from Reader
+// (caller owns Reader). Input (ImageSize, ImageSize, NumChannels) RGB volume;
+// output (1, 1, NumLabels) class logits.
+function BuildConvNeXt(Reader: TNNetSafeTensorsReader;
+  const Config: TConvNeXtConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildConvNeXtFromSafeTensorsEx(const FileName: string;
+  const Config: TConvNeXtConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildConvNeXtFromSafeTensors(const FileName: string;
+  out Config: TConvNeXtConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // MOBILENETV3 IMPORT (torchvision "mobilenet_v3_small" / "mobilenet_v3_large").
 // The efficient mobile-CNN family, structurally distinct from ResNet: the body
 // is a stack of inverted-residual MBConv blocks, each:
@@ -32108,6 +32162,429 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadResNetConfigFromJSONFile(ConfigPath);
   Result := BuildResNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// CONVNEXT v1 / v2 IMPORT (HF convnext / convnextv2)
+// ===========================================================================
+
+function ReadConvNeXtConfigFromJSONFile(
+  const FileName: string): TConvNeXtConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  LabelObj, ArrData: TJSONData;
+  Arr: TJSONArray;
+  i: integer;
+const
+  // ConvNeXt-tiny defaults (depths/dims), overridable by the config arrays.
+  cTinyDepths: array[0..3] of integer = (3, 3, 9, 3);
+  cTinyDims:   array[0..3] of integer = (96, 192, 384, 768);
+begin
+  if not FileExists(FileName) then
+    ImportError('ConvNeXt import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('ConvNeXt import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('ConvNeXt import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'convnext');
+    // v2 iff the model_type is convnextv2 (GRN path); v1 otherwise (LayerScale).
+    if LowerCase(Result.ModelType) = 'convnextv2' then Result.Version := 2
+    else Result.Version := 1;
+    for i := 0 to 3 do
+    begin
+      Result.Depths[i] := cTinyDepths[i];
+      Result.Dims[i] := cTinyDims[i];
+    end;
+    ArrData := Obj.Find('depths');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 4 then
+        ImportError('ConvNeXt import: "depths" must have 4 entries, got ' +
+          IntToStr(Arr.Count) + '.');
+      for i := 0 to 3 do Result.Depths[i] := Arr.Integers[i];
+    end;
+    ArrData := Obj.Find('hidden_sizes');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 4 then
+        ImportError('ConvNeXt import: "hidden_sizes" must have 4 entries, got ' +
+          IntToStr(Arr.Count) + '.');
+      for i := 0 to 3 do Result.Dims[i] := Arr.Integers[i];
+    end;
+    Result.PatchSize := Obj.Get('patch_size', 4);
+    Result.ImageSize := Obj.Get('image_size', 224);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 0.000001);
+    Result.LayerScaleInit := Obj.Get('layer_scale_init_value', 0.000001);
+    // num_labels: explicit, else len(id2label), else len(label2id), else 1000.
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('label2id');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ConvNeXtConfigToString(const Config: TConvNeXtConfig): string;
+begin
+  Result := Config.ModelType + ' (v' + IntToStr(Config.Version) + ') config: ' +
+    'depths=[' + IntToStr(Config.Depths[0]) + ',' + IntToStr(Config.Depths[1]) +
+    ',' + IntToStr(Config.Depths[2]) + ',' + IntToStr(Config.Depths[3]) + ']' +
+    ', dims=[' + IntToStr(Config.Dims[0]) + ',' + IntToStr(Config.Dims[1]) +
+    ',' + IntToStr(Config.Dims[2]) + ',' + IntToStr(Config.Dims[3]) + ']' +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', num_labels=' + IntToStr(Config.NumLabels);
+end;
+
+// Loads an HF nn.Conv2d (weight [O,I,kh,kw] + bias [O]) into a CAI conv layer
+// WITHOUT a BN fold (ConvNeXt convs are biased, no BatchNorm). Weight layout
+// matches LoadResNetConvFoldBN's depth-contiguous FData[(ky*K+kx)*I + c].
+procedure LoadConvNeXtConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; OutCh, InCh, K: integer);
+var
+  W, B: TNNetVolume;
+  o, c, ky, kx: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('ConvNeXt import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> OutCh) or
+     (Reader.DimSize(WName, 1) <> InCh) or
+     (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError('ConvNeXt import: "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', ' + IntToStr(K) + ', ' +
+      IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('ConvNeXt import: internal error - conv "' + WName +
+      '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> OutCh then
+      ImportError('ConvNeXt import: "' + BName + '" must have ' +
+        IntToStr(OutCh) + ' elements.');
+    for o := 0 to OutCh - 1 do
+    begin
+      for ky := 0 to K - 1 do
+        for kx := 0 to K - 1 do
+          for c := 0 to InCh - 1 do
+            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+              W.FData[((o * InCh + c) * K + ky) * K + kx];
+      Layer.Neurons[o].BiasWeight := B.FData[o];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+// Loads an HF depthwise nn.Conv2d (weight [C,1,kh,kw] + bias [C], groups=C)
+// into a TNNetDepthwiseConv (multiplier 1: ONE neuron whose Weights volume is
+// (K, K, C)). For kernel position (kx,ky) channel c the CAI index is
+// (ky*K + kx)*C + c (the volume GetRawPtr layout the depthwise compute reads);
+// HF stores it at [c, 0, ky, kx].
+procedure LoadConvNeXtDepthwise(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; Ch, K: integer);
+var
+  W, B: TNNetVolume;
+  c, ky, kx: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('ConvNeXt import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> Ch) or
+     (Reader.DimSize(WName, 1) <> 1) or
+     (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError('ConvNeXt import: depthwise "' + WName + '" must have shape [' +
+      IntToStr(Ch) + ', 1, ' + IntToStr(K) + ', ' + IntToStr(K) + '], got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> 1 then
+    ImportError('ConvNeXt import: internal error - depthwise "' + WName +
+      '" target must have exactly 1 neuron (multiplier 1), got ' +
+      IntToStr(Layer.Neurons.Count) + '.');
+  if Layer.Neurons[0].Weights.Size <> K * K * Ch then
+    ImportError('ConvNeXt import: internal error - depthwise "' + WName +
+      '" neuron has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(K * K * Ch) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    if B.Size <> Ch then
+      ImportError('ConvNeXt import: depthwise "' + BName + '" must have ' +
+        IntToStr(Ch) + ' elements.');
+    for c := 0 to Ch - 1 do
+      for ky := 0 to K - 1 do
+        for kx := 0 to K - 1 do
+          Layer.Neurons[0].Weights.FData[(ky * K + kx) * Ch + c] :=
+            W.FData[((c * 1 + 0) * K + ky) * K + kx];
+    // Depthwise bias is per-output-channel; TNNetDepthwiseConv has a single
+    // neuron and applies its scalar BiasWeight to every output channel, so the
+    // per-channel bias must ride a separate channel-bias layer instead. The
+    // caller wires a TNNetChannelBias after the depthwise conv and loads the
+    // bias there via LoadConvNeXtChannelVector; here BiasWeight stays 0.
+    Layer.Neurons[0].BiasWeight := 0;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+// Loads a 1-D HF tensor [Ch] into a per-channel layer's FNeurons[NeuronIdx]
+// weight vector (TNNetChannelBias bias, TNNetChannelMul LayerScale gamma,
+// or one of TNNetGRN's gamma/beta neurons). HF GRN tensors are [1,1,1,Ch];
+// they flatten to Ch so the dim check accepts either rank.
+procedure LoadConvNeXtChannelVector(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const Name: string; NeuronIdx, Ch: integer);
+var
+  Tmp: TNNetVolume;
+  i: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(Name) then
+    ImportError('ConvNeXt import: missing tensor "' + Name + '".');
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(Name, Tmp);
+    if Tmp.Size <> Ch then
+      ImportError('ConvNeXt import: "' + Name + '" must flatten to ' +
+        IntToStr(Ch) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
+    if Layer.Neurons[NeuronIdx].Weights.Size <> Ch then
+      ImportError('ConvNeXt import: internal error - neuron ' +
+        IntToStr(NeuronIdx) + ' for "' + Name + '" has ' +
+        IntToStr(Layer.Neurons[NeuronIdx].Weights.Size) +
+        ' weights, expected ' + IntToStr(Ch) + '.');
+    for i := 0 to Ch - 1 do
+      Layer.Neurons[NeuronIdx].Weights.FData[i] := Tmp.FData[i];
+    Layer.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+end;
+
+type
+  // Layer refs needed to load one ConvNeXt block's weights.
+  TConvNeXtBlockLayers = record
+    DwConv, DwBias, LN, PwConv1, PwConv2: TNNetLayer;
+    GRN: TNNetLayer;        // v2 only (nil on v1)
+    LayerScale: TNNetLayer; // v1 only (nil on v2)
+  end;
+
+// Architecture: builds one ConvNeXt block onto NN and returns its layer refs.
+// Dim is the block channel count. v2 inserts a TNNetGRN(4*Dim) between GELU and
+// pwconv2; v1 appends a TNNetChannelMul (LayerScale gamma) after pwconv2. The
+// residual adds the block branch to the block input.
+procedure AddConvNeXtBlock(NN: TNNet; const Config: TConvNeXtConfig;
+  Dim: integer; out Refs: TConvNeXtBlockLayers);
+var
+  Input, Branch: TNNetLayer;
+begin
+  Refs.DwConv := nil; Refs.DwBias := nil; Refs.LN := nil;
+  Refs.PwConv1 := nil; Refs.PwConv2 := nil; Refs.GRN := nil;
+  Refs.LayerScale := nil;
+  Input := NN.GetLastLayer();
+  // depthwise 7x7 pad 3 (multiplier 1, LINEAR - no activation) + per-channel
+  // bias. NOTE: CAI clamps the conv kernel to the input spatial size, so every
+  // stage must stay >= 7 wide for a faithful 7x7 depthwise (true at 224).
+  Refs.DwConv := NN.AddLayer(TNNetDepthwiseConvLinear.Create(1, 7, 3, 1));
+  Refs.DwBias := NN.AddLayer(TNNetChannelBias.Create());
+  // channel LayerNorm (per-(x,y) over Depth) eps 1e-6.
+  Refs.LN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+  // pointwise expand to 4*Dim -> exact-erf GELU.
+  Refs.PwConv1 := NN.AddLayer(TNNetPointwiseConvLinear.Create(4 * Dim));
+  NN.AddLayer(TNNetGELUErf.Create());
+  if Config.Version >= 2 then
+    Refs.GRN := NN.AddLayer(TNNetGRN.Create());
+  // pointwise project back to Dim.
+  Refs.PwConv2 := NN.AddLayer(TNNetPointwiseConvLinear.Create(Dim));
+  if Config.Version = 1 then
+    Refs.LayerScale := NN.AddLayer(TNNetChannelMul.Create());
+  Branch := NN.GetLastLayer();
+  NN.AddLayer(TNNetSum.Create([Branch, Input]));
+end;
+
+function BuildConvNeXt(Reader: TNNetSafeTensorsReader;
+  const Config: TConvNeXtConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  StemConv, StemLN, HeadLN, FC: TNNetLayer;
+  DownLN: array[0..3] of TNNetLayer;       // per-stage downsample LN (1..3)
+  DownConv: array[0..3] of TNNetLayer;     // per-stage downsample conv (1..3)
+  BlockRefs: array of TConvNeXtBlockLayers;
+  RefCount, Stage, BlockIdx, InDim, Dim: integer;
+  Prefix, StagePrefix, Pre: string;
+begin
+  if Config.NumChannels < 1 then
+    ImportError('ConvNeXt import: num_channels must be >= 1.');
+  if Config.NumLabels < 1 then
+    ImportError('ConvNeXt import: num_labels must be >= 1.');
+  RefCount := 0;
+  for Stage := 0 to 3 do RefCount := RefCount + Config.Depths[Stage];
+  SetLength(BlockRefs, RefCount);
+  // HF tensor prefix: "convnext." (v1) or "convnextv2." (v2).
+  if Config.Version >= 2 then Pre := 'convnextv2.' else Pre := 'convnext.';
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels));
+    // Stem: patchify conv (PxP stride P, biased) -> channel LayerNorm.
+    StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.Dims[0], Config.PatchSize, 0, Config.PatchSize, 0));
+    StemLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+    RefCount := 0;
+    InDim := Config.Dims[0];
+    for Stage := 0 to 3 do
+    begin
+      Dim := Config.Dims[Stage];
+      DownLN[Stage] := nil; DownConv[Stage] := nil;
+      // Stages 1..3: downsample = channel LayerNorm -> 2x2 stride-2 conv.
+      if Stage > 0 then
+      begin
+        DownLN[Stage] := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        DownConv[Stage] := NN.AddLayer(
+          TNNetConvolutionLinear.Create(Dim, 2, 0, 2, 0));
+      end;
+      for BlockIdx := 0 to Config.Depths[Stage] - 1 do
+      begin
+        AddConvNeXtBlock(NN, Config, Dim, BlockRefs[RefCount]);
+        Inc(RefCount);
+      end;
+      InDim := Dim;
+    end;
+    // Head: global average pool over spatial grid -> channel LayerNorm -> fc.
+    NN.AddLayer(TNNetAvgChannel.Create());
+    HeadLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadConvNeXtConv(Reader, StemConv,
+      Pre + 'embeddings.patch_embeddings.weight',
+      Pre + 'embeddings.patch_embeddings.bias',
+      Config.Dims[0], Config.NumChannels, Config.PatchSize);
+    LoadLayerNormWeights(Reader, StemLN,
+      Pre + 'embeddings.layernorm.weight',
+      Pre + 'embeddings.layernorm.bias', Config.Dims[0]);
+    RefCount := 0;
+    InDim := Config.Dims[0];
+    for Stage := 0 to 3 do
+    begin
+      Dim := Config.Dims[Stage];
+      StagePrefix := Pre + 'encoder.stages.' + IntToStr(Stage);
+      if Stage > 0 then
+      begin
+        LoadLayerNormWeights(Reader, DownLN[Stage],
+          StagePrefix + '.downsampling_layer.0.weight',
+          StagePrefix + '.downsampling_layer.0.bias', InDim);
+        LoadConvNeXtConv(Reader, DownConv[Stage],
+          StagePrefix + '.downsampling_layer.1.weight',
+          StagePrefix + '.downsampling_layer.1.bias', Dim, InDim, 2);
+      end;
+      for BlockIdx := 0 to Config.Depths[Stage] - 1 do
+      begin
+        Prefix := StagePrefix + '.layers.' + IntToStr(BlockIdx);
+        LoadConvNeXtDepthwise(Reader, BlockRefs[RefCount].DwConv,
+          Prefix + '.dwconv.weight', Prefix + '.dwconv.bias', Dim, 7);
+        LoadConvNeXtChannelVector(Reader, BlockRefs[RefCount].DwBias,
+          Prefix + '.dwconv.bias', 0, Dim);
+        LoadLayerNormWeights(Reader, BlockRefs[RefCount].LN,
+          Prefix + '.layernorm.weight', Prefix + '.layernorm.bias', Dim);
+        LoadLlamaLinearWeights(Reader, BlockRefs[RefCount].PwConv1,
+          Prefix + '.pwconv1.weight', Dim, 4 * Dim, 0, -1, 0,
+          Prefix + '.pwconv1.bias');
+        LoadLlamaLinearWeights(Reader, BlockRefs[RefCount].PwConv2,
+          Prefix + '.pwconv2.weight', 4 * Dim, Dim, 0, -1, 0,
+          Prefix + '.pwconv2.bias');
+        if Config.Version >= 2 then
+        begin
+          // GRN: gamma -> Neurons[0], beta -> Neurons[1] (over 4*Dim channels).
+          LoadConvNeXtChannelVector(Reader, BlockRefs[RefCount].GRN,
+            Prefix + '.grn.weight', 0, 4 * Dim);
+          LoadConvNeXtChannelVector(Reader, BlockRefs[RefCount].GRN,
+            Prefix + '.grn.bias', 1, 4 * Dim);
+        end
+        else
+          LoadConvNeXtChannelVector(Reader, BlockRefs[RefCount].LayerScale,
+            Prefix + '.layer_scale_parameter', 0, Dim);
+        Inc(RefCount);
+      end;
+      InDim := Dim;
+    end;
+    LoadLayerNormWeights(Reader, HeadLN,
+      Pre + 'layernorm.weight', Pre + 'layernorm.bias', Config.Dims[3]);
+    LoadLlamaLinearWeights(Reader, FC, 'classifier.weight',
+      Config.Dims[3], Config.NumLabels, 0, -1, 0, 'classifier.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildConvNeXtFromSafeTensorsEx(const FileName: string;
+  const Config: TConvNeXtConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildConvNeXt(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildConvNeXtFromSafeTensors(const FileName: string;
+  out Config: TConvNeXtConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadConvNeXtConfigFromJSONFile(ConfigPath);
+  Result := BuildConvNeXtFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

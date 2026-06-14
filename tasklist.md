@@ -806,18 +806,30 @@ rather than acted on.
       head. Verify on a pico-sliced fixture (make_pico_*_fixture.py pattern); a
       latent-noise -> denoise -> VAE-decode smoke test reuses the existing scheduler.
 
-- [ ] ConvNeXt-v1/v2 image-classification backbone importer
-      (BuildConvNeXtFromSafeTensors, e.g. facebook/convnext-tiny-224 and the v2
-      convnextv2-tiny). The ResNet importer task explicitly scopes ConvNeXt OUT, yet
-      it is a distinct modern CNN whose two signature primitives ALREADY EXIST as
-      layers: TNNetGRN (the v2 Global Response Normalization) and the LayerScale
-      per-channel gain (a 1x1 PointwiseConvLinear / FiLM scale). New work is the
-      block wiring: depthwise 7x7 conv -> LayerNorm (channels-first) -> pointwise
-      expand-4x -> GELU -> pointwise project -> LayerScale -> stochastic-depth
-      residual, plus the patchify stem (4x4 stride-4 conv) and 2x2 downsample
-      transitions between the 4 stages. Distinct from the MBConv path used by the
-      MobileNetV3 importer (no squeeze-excite, no inverted bottleneck). Verify top-1
-      logits against torchvision on a single ImageNet sample.
+- [X] ConvNeXt-v1/v2 image-classification backbone importer
+      (BuildConvNeXtFromSafeTensors[Ex] + TConvNeXtConfig + ReadConvNeXtConfigFrom
+      JSONFile/ConvNeXtConfigToString in neuralpretrained.pas). BOTH variants land:
+      v1 uses the per-channel LayerScale gamma (TNNetChannelMul) and v2 uses GRN
+      (the existing TNNetGRN, inserted between GELU and the project pointwise, with
+      NO layer_scale_parameter) — model_type "convnextv2" auto-selects the GRN path.
+      Block wiring: depthwise 7x7 pad-3 (TNNetDepthwiseConvLinear) + per-channel
+      bias (TNNetChannelBias) -> channel LayerNorm (TNNetTokenLayerNorm, per-(x,y)
+      over Depth) -> pointwise expand-4x (TNNetPointwiseConvLinear) -> EXACT-erf
+      GELU (new TNNetGELUErf — HF "gelu", needed for <1e-4; the tanh-approx
+      TNNetGELU is too coarse) -> [v2 GRN] -> pointwise project -> [v1 LayerScale]
+      -> residual. Plus patchify stem (PxP stride-P conv -> LayerNorm), 2x2 stride-2
+      downsample transitions (LayerNorm -> conv) before stages 1..3, and the head
+      (global avg pool -> LayerNorm -> Linear). HF "convnext."/"convnextv2." tensor
+      names. Verified <1e-4 against the REAL HF ConvNext(V2)ForImageClassification
+      forward via committed pico fixtures (tools/convnext_tiny_fixture.py +
+      tests/fixtures/tiny_convnext{,v2}.* + TestConvNeXt{Config,V1,V2}* — v1 max
+      |diff| and v2 both PASS). GEOMETRY NOTE: CAI clamps a conv kernel to the input
+      spatial size, so every stage must stay >=7 wide for the 7x7 depthwise (true at
+      the stock 224 input); the pico uses patch_size 1 + image 56 (stages 56/28/14/7)
+      to keep that property at KB scale. DEFERRED follow-up: a real-checkpoint slicer
+      (make_pico_*_fixture.py-style) to commit a sub-slice of facebook/convnext-tiny-
+      224 for an end-to-end ImageNet sample check (covered by the ImageNet eval
+      harness task below).
 
 - [ ] ImageNet top-1 / top-5 parity eval harness for the imported vision backbones
       (EvaluateImageNet + ImageNetReport in neuralimagemetrics.pas or a sibling, plus

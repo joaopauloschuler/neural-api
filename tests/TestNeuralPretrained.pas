@@ -25,6 +25,7 @@ type
   TTestNeuralPretrained = class(TTestCase)
   private
     function FixturePath(const FileName: string): string;
+    procedure RunConvNeXtParity(const Base: string);
     // Composes a minimal safetensors byte stream into a temp file and
     // returns its path. HeaderJson is written verbatim (preceded by its
     // 8-byte little-endian length); Payload is the raw data section.
@@ -275,6 +276,9 @@ type
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
     procedure TestResNet18ImageClassificationParity;
+    procedure TestConvNeXtConfigFromJSONFile;
+    procedure TestConvNeXtV1ImageClassificationParity;
+    procedure TestConvNeXtV2ImageClassificationParity;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
@@ -12782,6 +12786,124 @@ begin
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+// Verifies ReadConvNeXtConfigFromJSONFile on the committed v1 pico config.
+procedure TTestNeuralPretrained.TestConvNeXtConfigFromJSONFile;
+var
+  Config: TConvNeXtConfig;
+begin
+  Config := ReadConvNeXtConfigFromJSONFile(
+    FixturePath('tiny_convnext_config.json'));
+  AssertEquals('model_type', 'convnext', Config.ModelType);
+  AssertEquals('version', 1, Config.Version);
+  AssertEquals('image_size', 56, Config.ImageSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('patch', 1, Config.PatchSize);
+  AssertEquals('depth0', 1, Config.Depths[0]);
+  AssertEquals('depth2', 2, Config.Depths[2]);
+  AssertEquals('dim0', 4, Config.Dims[0]);
+  AssertEquals('dim3', 8, Config.Dims[3]);
+  AssertTrue('config ToString non-empty',
+    Length(ConvNeXtConfigToString(Config)) > 0);
+  // v2 config selects the GRN path.
+  Config := ReadConvNeXtConfigFromJSONFile(
+    FixturePath('tiny_convnextv2_config.json'));
+  AssertEquals('v2 model_type', 'convnextv2', Config.ModelType);
+  AssertEquals('v2 version', 2, Config.Version);
+end;
+
+// Shared ConvNeXt parity driver: builds the importer from the named pico
+// fixtures and asserts the (1,1,num_labels) logits match the HF oracle stored
+// in <base>_logits.json (pixels [C][H][W]) within 1e-4.
+procedure TTestNeuralPretrained.RunConvNeXtParity(const Base: string);
+var
+  NN: TNNet;
+  Config: TConvNeXtConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildConvNeXtFromSafeTensors(
+    FixturePath(Base + '.safetensors'), Config, {pInferenceOnly=}false,
+    FixturePath(Base + '_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize,
+      NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath(Base + '_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// HF ConvNeXt-V1 (LayerScale) image-classification parity. tiny_convnext.* is
+// a pico random-init ConvNeXt (image 32, patch 4, depths [1,1,2,1], dims
+// [8,16,24,32], 5 labels) whose state_dict mirrors HF's "convnext." key scheme
+// (embeddings.patch_embeddings, encoder.stages.i.layers.j.{dwconv,layernorm,
+// pwconv1,pwconv2,layer_scale_parameter}, encoder.stages.i.downsampling_layer,
+// convnext.layernorm, classifier). Reference logits come from the REAL HF
+// ConvNextForImageClassification forward. Asserts logits < 1e-4 - exercising
+// the exact-erf GELU, channel LayerNorm, depthwise 7x7 conv, and per-channel
+// LayerScale gamma.
+procedure TTestNeuralPretrained.TestConvNeXtV1ImageClassificationParity;
+begin
+  RunConvNeXtParity('tiny_convnext');
+end;
+
+// HF ConvNeXt-V2 (GRN) image-classification parity. tiny_convnextv2.* mirrors
+// HF's "convnextv2." key scheme with grn.{weight,bias} (and NO
+// layer_scale_parameter); the GRN sits between the GELU and pwconv2. Reference
+// logits come from the REAL HF ConvNextV2ForImageClassification forward.
+// Asserts logits < 1e-4 - exercising the TNNetGRN primitive on the importer
+// path.
+procedure TTestNeuralPretrained.TestConvNeXtV2ImageClassificationParity;
+begin
+  RunConvNeXtParity('tiny_convnextv2');
 end;
 
 // Verifies ReadInceptionV3ConfigFromJSONFile on the committed Inception pico

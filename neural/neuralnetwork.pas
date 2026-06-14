@@ -887,6 +887,19 @@ type
     procedure Backpropagate(); override;
   end;
 
+  /// GELU with the EXACT erf form (no tanh approximation):
+  //   GELU_erf(x) = x * Phi(x), Phi(x) = 0.5 * (1 + erf(x / sqrt(2)))
+  // This is the activation HF transformers calls "gelu" (e.g. ConvNeXt, BERT),
+  // as opposed to "gelu_new"/"gelu_pytorch_tanh" which is the tanh approximation
+  // implemented by TNNetGELU. erf is evaluated via pcr_erff. Derivative:
+  //   GELU_erf'(x) = Phi(x) + x * phi(x), phi(x) = exp(-x^2/2)/sqrt(2*pi)
+  // Coded by Claude (AI).
+  TNNetGELUErf = class(TNNetReLUBase)
+  public
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+  end;
+
   /// Mish activation function.
   // A smooth, non-monotonic self-regularizing activation function.
   // Mish(x) = x * tanh(softplus(x)) = x * tanh(ln(1 + exp(x)))
@@ -18196,6 +18209,62 @@ begin
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   // Apply chain rule: multiply error by derivative computed in Compute()
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    FOutputError.Mul(FOutputErrorDeriv);
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  inherited BackpropagateNoTest();
+end;
+
+{ TNNetGELUErf }
+
+procedure TNNetGELUErf.Compute();
+var
+  SizeM1: integer;
+  LocalPrevOutput: TNNetVolume;
+  OutputCnt: integer;
+  StartTime: double;
+  x, cdf, pdf: TNeuralFloat;
+const
+  // 1/sqrt(2) and 1/sqrt(2*pi)
+  INV_SQRT_2 = 0.70710678118654752;
+  INV_SQRT_2PI = 0.39894228040143268;
+begin
+  StartTime := Now();
+  LocalPrevOutput := FPrevLayer.Output;
+  SizeM1 := LocalPrevOutput.Size - 1;
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      cdf := 0.5 * (1 + pcr_erff(x * INV_SQRT_2));
+      FOutput.FData[OutputCnt] := x * cdf;
+      // GELU_erf'(x) = Phi(x) + x * phi(x)
+      pdf := INV_SQRT_2PI * pcr_expf(-0.5 * x * x);
+      FOutputErrorDeriv.FData[OutputCnt] := cdf + x * pdf;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := x * 0.5 * (1 + pcr_erff(x * INV_SQRT_2));
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetGELUErf.Backpropagate();
+var
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     FOutputError.Mul(FOutputErrorDeriv);
@@ -88125,6 +88194,7 @@ begin
       'TNNetHardSwish' :            Result := TNNetHardSwish.Create();
       'TNNetHardSigmoid' :          Result := TNNetHardSigmoid.Create();
       'TNNetGELU' :                 Result := TNNetGELU.Create();
+      'TNNetGELUErf' :              Result := TNNetGELUErf.Create();
       'TNNetMish' :                 Result := TNNetMish.Create();
       'TNNetPhish' :                Result := TNNetPhish.Create();
       'TNNetSerf' :                 Result := TNNetSerf.Create();
@@ -88523,6 +88593,7 @@ begin
       if S[0] = 'TNNetHardSwish' then Result := TNNetHardSwish.Create() else
       if S[0] = 'TNNetHardSigmoid' then Result := TNNetHardSigmoid.Create() else
       if S[0] = 'TNNetGELU' then Result := TNNetGELU.Create() else
+      if S[0] = 'TNNetGELUErf' then Result := TNNetGELUErf.Create() else
       if S[0] = 'TNNetMish' then Result := TNNetMish.Create() else
       if S[0] = 'TNNetPhish' then Result := TNNetPhish.Create() else
       if S[0] = 'TNNetSerf' then Result := TNNetSerf.Create() else
