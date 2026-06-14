@@ -531,14 +531,15 @@ rather than acted on.
       plumbing, tests in tests/TestNeuralGRPO.pas): ORPO / SimPO / KTO
       loss-formula deltas on the landed DPO trainer, and a Bradley-Terry pairwise
       reward-model trainer to feed GRPO real (learned) rewards.
-- [ ] Offset-mapping follow-up: EncodeWithOffsets (commit 1e90b8a) is a
-      post-hoc surface-match heuristic (each token's DecodeToken surface
-      located forward at the running cursor), so it leaves tokens unmapped
-      when the decoded surface can't be found at the cursor (added/special
-      tokens, byte-fallback fragments). Add a byte-exact trace through the
-      byte-level-BPE merge state for a guaranteed alignment, and a test over
-      a pinned string with a byte-fallback / multi-byte-UTF8 token that the
-      heuristic currently leaves unmapped.
+- [X] Offset-mapping follow-up: EncodeWithOffsets byte-exact — LANDED
+      (commit fdc4e5d). Rewrote the post-hoc decoded-surface PosEx search into a
+      per-token byte-consumption walk: DecodeToken surface bytes matched
+      byte-for-byte against the original text from a running cursor, giving every
+      token (byte-fallback fragments, metaspace/leading-space, split multi-byte
+      chars, WordPiece ##) a non-degenerate span. Convention: each byte token of a
+      split char maps to its own source-byte sub-range; concatenated spans
+      reproduce the input verbatim. Test TestOffsetMappingByteFallbackExact on the
+      tiny_spm_bytefallback.model fixture.
 - [X] JSON-Schema -> GBNF compiler for structured / function-calling output
       LANDED (commit b53f3a5): CompileJSONSchemaToGBNF + CreateJSONSchemaConstraint
       in neuraldecode.pas (TJSONSchemaCompiler walk), examples/StructuredOutput,
