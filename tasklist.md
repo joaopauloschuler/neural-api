@@ -539,7 +539,12 @@ rather than acted on.
       byte-level-BPE merge state for a guaranteed alignment, and a test over
       a pinned string with a byte-fallback / multi-byte-UTF8 token that the
       heuristic currently leaves unmapped.
-- [ ] JSON-Schema -> GBNF compiler for structured / function-calling output
+- [X] JSON-Schema -> GBNF compiler for structured / function-calling output
+      LANDED (commit b53f3a5): CompileJSONSchemaToGBNF + CreateJSONSchemaConstraint
+      in neuraldecode.pas (TJSONSchemaCompiler walk), examples/StructuredOutput,
+      tests TestSchemaGBNF*. Covers object/array/string(enum,pattern)/number/
+      integer/boolean/null/anyOf/oneOf/$ref+$defs recursion; allOf/format/numeric
+      bounds documented out-of-scope.
       (the one piece of the "JSON mode" stack still missing). The decode side
       is fully landed: TNNetGrammar compiles GBNF text to a flat pushdown and
       TNNetGrammarConstraint masks logits to grammar-legal tokens, plus the
