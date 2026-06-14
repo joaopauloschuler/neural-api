@@ -5618,12 +5618,38 @@ type
   // Coded by Claude (AI).
   TNNetTokenShift = class(TNNetChannelTransformBase)
     private
+      // --- incremental-decode state (inference only, not serialized) ---
+      FDecodeEnabled: boolean;
+      FDecodeSteps: integer;    // tokens consumed since Begin/ResetState
+      FDecPrev: TNNetVolume;    // persisted previous token x_{t-1}, Depth-long
+      procedure ComputeIncremental();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
+      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
+      // Enable the O(1)-per-step incremental-decode path. The carried state is a
+      // single Depth-long buffer holding the PREVIOUS token x_{t-1} (the only
+      // history a one-token causal shift needs), so there is no MaxContext budget
+      // (contrast the attention KV cache). The sequence starts fresh (x_{-1}=0).
+      // Mirrors TNNetWKV / TNNetSelectiveSSM Begin/End/Reset so a decoder can
+      // drive every recurrent layer type uniformly.
+      procedure BeginIncrementalDecode();
+      // Disable the incremental path; return to the normal full-sequence forward.
+      procedure EndIncrementalDecode();
+      // Start a fresh sequence (x_{-1}=0).
+      procedure ResetState();
+      // Alias for ResetState() to match the SDPA cache vocabulary.
+      procedure ResetCache();
+      // Session snapshot / fork support (mirrors TNNetWKV): CaptureState copies
+      // the persisted previous-token vector and step count out; RestoreState
+      // copies them back so a continuation resumes from the snapshot. Dst is
+      // (1,1,Depth). A deep copy, so one snapshot forks many sessions.
+      procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
+      procedure RestoreState(Src: TNNetVolume; Steps: integer);
+      property DecodeEnabled: boolean read FDecodeEnabled;
   end;
 
   /// TNNetCausalConv1D: a learnable 1D convolution along the SizeX (time) axis
@@ -13057,6 +13083,22 @@ type
       // untouched. Returns the embedding layer (nil on error).
       function ResizeTokenEmbeddings(NewVocabSize: integer): TNNetEmbedding; // Coded by Claude (AI).
       procedure ResetBackpropCallCurrCnt(); {$IFDEF Release} inline; {$ENDIF}
+      // Net-wide recurrent incremental-decode broadcast. Loops every layer and
+      // switches the zero-arg recurrent leaves (TNNetTokenShift, TNNetWKV,
+      // TNNetSelectiveSSM, TNNetDiagonalSSM) onto their O(1)-per-step state-carry
+      // forward, so a FULL recurrent block (e.g. AddRWKVBlock: TokenShift ->
+      // projections -> WKV, plus the channel-mix TokenShifts) decodes
+      // token-by-token with every stateful layer advancing in lockstep. The
+      // stateless per-token layers (pointwise projections, sums, concats,
+      // activations) need no state. ATTENTION KV-cache layers
+      // (TNNetScaledDotProductAttention) take a MaxContext budget and are driven
+      // by TNNetStreamingDecoder instead, so they are intentionally NOT touched
+      // here. Returns the number of recurrent layers switched on.
+      function BeginIncrementalDecode(): integer;
+      // Switch the recurrent leaves back onto the normal full-sequence forward.
+      procedure EndIncrementalDecode();
+      // Start a fresh sequence on every recurrent leaf (state := initial).
+      procedure ResetIncrementalDecode();
       procedure SetL2Decay(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure SetL2DecayToConvolutionalLayers(pL2Decay: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeL2Decay(); {$IFDEF Release} inline; {$ENDIF}
@@ -36814,7 +36856,16 @@ end;
 constructor TNNetTokenShift.Create();
 begin
   inherited Create();
+  FDecPrev := TNNetVolume.Create();
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
   InitDefault();
+end;
+
+destructor TNNetTokenShift.Destroy();
+begin
+  FDecPrev.Free;
+  inherited Destroy();
 end;
 
 procedure TNNetTokenShift.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -36825,6 +36876,7 @@ begin
       IntToStr(pPrevLayer.FOutput.SizeY));
   // The base class already calls SetNumWeightsForAllNeurons(1,1,Depth)
   // and InitDefault().
+  FDecPrev.ReSize(1, 1, pPrevLayer.FOutput.Depth);
 end;
 
 procedure TNNetTokenShift.Compute();
@@ -36835,6 +36887,11 @@ var
   mix, one_minus_mix, xt, xtm1: TNeuralFloat;
   W: TNNetVolume;
 begin
+  if FDecodeEnabled then
+  begin
+    ComputeIncremental();
+    exit;
+  end;
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -36863,6 +36920,88 @@ begin
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Inference-only stateful forward. The per-token output is ALGEBRAICALLY
+// IDENTICAL to one step of Compute()'s full-sequence shift
+//   y[t,c] = mix[c]*x[t,c] + (1-mix[c])*x[t-1,c]   (x[-1,c]=0),
+// but the "previous token" x[t-1] resumes from the PERSISTED FDecPrev (carried
+// across calls) instead of being re-read from a re-scanned sequence. At a fresh
+// start FDecPrev is zero, so the t=0 zero-padding is reproduced exactly. The
+// loop is O(1) in past context (it only sweeps the SeqLen supplied this call -
+// one token for a decode step, many for a prompt prefill). Driving the whole
+// sequence token-by-token through this path reproduces the full-scan output
+// bit-for-bit. No gradient cache is written (inference-only).
+procedure TNNetTokenShift.ComputeIncremental();
+var
+  StartTime: double;
+  SeqLen, Depth, t, d: integer;
+  Prev: TNNetVolume;
+  mix, one_minus_mix, xt, xtm1: TNeuralFloat;
+  W: TNNetVolume;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Depth := Prev.Depth;
+  W := FNeurons[0].FWeights;
+  for t := 0 to SeqLen - 1 do
+  begin
+    for d := 0 to Depth - 1 do
+    begin
+      mix := W.Raw[d];
+      one_minus_mix := 1.0 - mix;
+      xt := Prev[t, 0, d];
+      // x_{t-1}: the persisted previous token for the first row in this call,
+      // then the row just consumed for subsequent rows in a multi-token prefill.
+      xtm1 := FDecPrev.FData[d];
+      FOutput[t, 0, d] := mix * xt + one_minus_mix * xtm1;
+      // Persist the current token as the new "previous".
+      FDecPrev.FData[d] := xt;
+    end;
+  end;
+  Inc(FDecodeSteps, SeqLen);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetTokenShift.BeginIncrementalDecode();
+begin
+  // The carried state is one Depth-long previous-token buffer; no MaxContext
+  // budget is needed (contrast the attention KV cache). The buffer is already
+  // sized by SetPrevLayer; ReSize is a safety net for layers wired manually.
+  FDecPrev.ReSize(1, 1, FOutput.Depth);
+  ResetState();
+  FDecodeEnabled := true;
+end;
+
+procedure TNNetTokenShift.EndIncrementalDecode();
+begin
+  FDecodeEnabled := false;
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetTokenShift.ResetState();
+begin
+  FDecPrev.Fill(0);          // x_{-1} = 0 (the full-scan left zero-padding)
+  FDecodeSteps := 0;
+end;
+
+procedure TNNetTokenShift.ResetCache();
+begin
+  ResetState();
+end;
+
+procedure TNNetTokenShift.CaptureState(Dst: TNNetVolume; out Steps: integer);
+begin
+  Dst.ReSize(1, 1, FDecPrev.Size);
+  Dst.Copy(FDecPrev);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetTokenShift.RestoreState(Src: TNNetVolume; Steps: integer);
+begin
+  FDecPrev.Copy(Src);
+  FDecodeSteps := Steps;
 end;
 
 procedure TNNetTokenShift.Backpropagate();
@@ -90318,6 +90457,56 @@ begin
   for LayerCnt := 0 to GetLastLayerIdx() do
   begin
     FLayers[LayerCnt].ResetBackpropCallCurrCnt();
+  end;
+end;
+
+function TNNet.BeginIncrementalDecode(): integer;
+var
+  LayerCnt: integer;
+  L: TNNetLayer;
+begin
+  Result := 0;
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    L := FLayers[LayerCnt];
+    if L is TNNetTokenShift then
+    begin TNNetTokenShift(L).BeginIncrementalDecode(); Inc(Result); end
+    else if L is TNNetWKV then
+    begin TNNetWKV(L).BeginIncrementalDecode(); Inc(Result); end
+    else if L is TNNetSelectiveSSM then
+    begin TNNetSelectiveSSM(L).BeginIncrementalDecode(); Inc(Result); end
+    else if L is TNNetDiagonalSSM then
+    begin TNNetDiagonalSSM(L).BeginIncrementalDecode(); Inc(Result); end;
+  end;
+end;
+
+procedure TNNet.EndIncrementalDecode();
+var
+  LayerCnt: integer;
+  L: TNNetLayer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    L := FLayers[LayerCnt];
+    if L is TNNetTokenShift then TNNetTokenShift(L).EndIncrementalDecode()
+    else if L is TNNetWKV then TNNetWKV(L).EndIncrementalDecode()
+    else if L is TNNetSelectiveSSM then TNNetSelectiveSSM(L).EndIncrementalDecode()
+    else if L is TNNetDiagonalSSM then TNNetDiagonalSSM(L).EndIncrementalDecode();
+  end;
+end;
+
+procedure TNNet.ResetIncrementalDecode();
+var
+  LayerCnt: integer;
+  L: TNNetLayer;
+begin
+  for LayerCnt := 0 to GetLastLayerIdx() do
+  begin
+    L := FLayers[LayerCnt];
+    if L is TNNetTokenShift then TNNetTokenShift(L).ResetState()
+    else if L is TNNetWKV then TNNetWKV(L).ResetState()
+    else if L is TNNetSelectiveSSM then TNNetSelectiveSSM(L).ResetState()
+    else if L is TNNetDiagonalSSM then TNNetDiagonalSSM(L).ResetState();
   end;
 end;
 

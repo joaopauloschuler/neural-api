@@ -477,6 +477,8 @@ type
     procedure TestWKVWeightGradientCheck;
     procedure TestWKVSerializationRoundTrip;
     procedure TestWKVIncrementalDecodeEquivalence;
+    procedure TestTokenShiftIncrementalDecodeEquivalence;
+    procedure TestRWKVBlockIncrementalDecodeEquivalence;
     procedure TestLRUShapeInference;
     procedure TestLRUInputGradientCheck;
     procedure TestLRUWeightGradientCheck;
@@ -28455,6 +28457,178 @@ begin
     v := 0; v := v;
   finally
     Snap.Free;
+    NNInc.Free;
+    NNFull.Free;
+  end;
+end;
+
+// Headline correctness for the TNNetTokenShift O(1)-per-step incremental decode
+// path: feeding a sequence token-by-token through ComputeIncremental() must
+// reproduce the full-sequence Compute() shift BIT-CLOSE. Mirrors
+// TestWKVIncrementalDecodeEquivalence (token-shift is the second RWKV recurrent
+// leaf needed for true block-level decode).
+procedure TTestNeuralNumerical.TestTokenShiftIncrementalDecodeEquivalence;
+var
+  NNFull, NNInc: TNNet;
+  InFull, InInc: TNNetInput;
+  LFull, LInc: TNNetTokenShift;
+  SeqLen, Dim, t, d, n: integer;
+  maxErr, e: TNeuralFloat;
+  Snap: TNNetVolume;
+  Steps: integer;
+begin
+  RandSeed := 424242;
+  SeqLen := 12;
+  Dim := 5;
+  NNFull := TNNet.Create();
+  NNInc := TNNet.Create();
+  Snap := TNNetVolume.Create();
+  try
+    InFull := TNNetInput.Create(SeqLen, 1, Dim, 1);
+    NNFull.AddLayer(InFull);
+    LFull := TNNetTokenShift.Create();
+    NNFull.AddLayer(LFull);
+
+    // Second net with a SINGLE-token input (the decode-step shape) sharing the
+    // same weights so the two paths are weight-identical.
+    InInc := TNNetInput.Create(1, 1, Dim, 1);
+    NNInc.AddLayer(InInc);
+    LInc := TNNetTokenShift.Create();
+    NNInc.AddLayer(LInc);
+    // Perturb the per-channel mix away from the 0.5 default, then copy across.
+    for d := 0 to Dim - 1 do
+      LFull.Neurons[0].Weights.FData[d] :=
+        LFull.Neurons[0].Weights.FData[d] + 0.6 * (Random - 0.5);
+    LInc.Neurons[0].Weights.Copy(LFull.Neurons[0].Weights);
+
+    // Random input sequence; the same rows feed both paths.
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Dim - 1 do
+        InFull.Output[t, 0, d] := 1.5 * (Random - 0.5);
+
+    // Parallel/prefill path: full-sequence shift in one Compute().
+    NNFull.Compute(InFull.Output);
+
+    // Incremental path: one token at a time, x_{t-1} carried across calls.
+    LInc.BeginIncrementalDecode();
+    maxErr := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to Dim - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    WriteLn('TokenShift incremental-decode vs full-scan max abs error: ', maxErr:0:10);
+    AssertTrue('TokenShift incremental decode matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+
+    // CaptureState/RestoreState fork: snapshot mid-way, advance, restore, and
+    // re-advance must reproduce the same outputs.
+    LInc.ResetState();
+    for t := 0 to 5 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    LInc.CaptureState(Snap, Steps);
+    AssertEquals('CaptureState step count', 6, Steps);
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+    end;
+    LInc.RestoreState(Snap, Steps);
+    maxErr := 0;
+    for t := 6 to SeqLen - 1 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to Dim - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    AssertTrue('TokenShift restored-state tail matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+    LInc.EndIncrementalDecode();
+    n := 0; n := n;   // suppress unused-var warning
+  finally
+    Snap.Free;
+    NNInc.Free;
+    NNFull.Free;
+  end;
+end;
+
+// THE HEADLINE: a full RWKV time-mix BLOCK (AddRWKVTimeMix: TokenShift ->
+// receptance/key/value projections -> WKV -> gate -> out-proj) decoded
+// token-by-token with the net-wide driver TNNet.BeginIncrementalDecode must
+// reproduce the full-sequence forward BIT-CLOSE. This proves end-to-end RWKV
+// recurrent decode is exact with EVERY stateful layer (TokenShift + WKV)
+// advancing in lockstep.
+procedure TTestNeuralNumerical.TestRWKVBlockIncrementalDecodeEquivalence;
+var
+  NNFull, NNInc: TNNet;
+  InFull, InInc: TNNetInput;
+  SeqLen, Dim, t, d, switched: integer;
+  maxErr, e: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 10;
+  Dim := 6;
+  NNFull := TNNet.Create();
+  NNInc := TNNet.Create();
+  try
+    InFull := TNNetInput.Create(SeqLen, 1, Dim, 1);
+    NNFull.AddLayer(InFull);
+    NNFull.AddRWKVTimeMix();
+    NNFull.AddLayer(TNNetTokenLayerNorm.Create());
+
+    InInc := TNNetInput.Create(1, 1, Dim, 1);
+    NNInc.AddLayer(InInc);
+    NNInc.AddRWKVTimeMix();
+    NNInc.AddLayer(TNNetTokenLayerNorm.Create());
+
+    // Make the two nets weight-identical (perturb full, copy into inc).
+    NNFull.InitWeights();
+    NNInc.CopyWeights(NNFull);
+
+    // Random input sequence.
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Dim - 1 do
+        InFull.Output[t, 0, d] := 1.2 * (Random - 0.5);
+
+    NNFull.Compute(InFull.Output);
+
+    switched := NNInc.BeginIncrementalDecode();
+    // The block has TWO recurrent leaves: one TokenShift + one WKV.
+    AssertEquals('RWKV time-mix block recurrent layers switched on', 2, switched);
+    maxErr := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to Dim - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to Dim - 1 do
+      begin
+        e := Abs(NNInc.GetLastLayer().Output[0, 0, d] -
+                 NNFull.GetLastLayer().Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    WriteLn('RWKV block incremental-decode vs full-scan max abs error: ', maxErr:0:10);
+    AssertTrue('RWKV block incremental decode matches full scan (< 1e-5)',
+      maxErr < 1e-5);
+    NNInc.EndIncrementalDecode();
+  finally
     NNInc.Free;
     NNFull.Free;
   end;

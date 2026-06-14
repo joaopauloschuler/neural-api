@@ -557,8 +557,20 @@ rather than acted on.
       across positions 64->448. 1957 tests pass. OPEN follow-ups:
   - [ ] TNNetCrossWKV incremental path (two-source + asymmetric modes + receptance
         gate — non-trivial, deferred).
-  - [ ] Block-level token-by-token decode through AddRWKVTimeMix (needs TNNetTokenShift
-        to carry its one-token shift state) + wiring into TNNetStreamingDecoder.
+  - [X] Block-level token-by-token decode through AddRWKVTimeMix (needs TNNetTokenShift
+        to carry its one-token shift state). LANDED: TNNetTokenShift gains the same
+        O(1)-per-step incremental API as TNNetWKV (BeginIncrementalDecode/
+        ComputeIncremental/ResetState/ResetCache/EndIncrementalDecode +
+        CaptureState/RestoreState; carried state = one Depth-long prev-token buffer,
+        bit-exact vs full-scan). New net-wide driver TNNet.BeginIncrementalDecode/
+        ResetIncrementalDecode/EndIncrementalDecode broadcasts the decode mode to every
+        zero-arg recurrent leaf (TokenShift+WKV+SelectiveSSM+DiagonalSSM), so a full
+        AddRWKVBlock decodes token-by-token with all stateful layers in lockstep.
+        Tests TestTokenShiftIncrementalDecodeEquivalence + TestRWKVBlockIncrementalDecode
+        Equivalence (both max abs err 0.0), examples/RWKVGenerate. FOLLOW-UP: wire this
+        net-wide recurrent driver INTO TNNetStreamingDecoder so GenerateTokens* drives
+        TokenShift/WKV/SSM uniformly alongside the SDPA KV-cache (decoder currently
+        only collects SDPA + TNNetDiagonalSSM, not TokenShift/WKV/SelectiveSSM).
 - [X] Mamba decode-side demo: tokens/sec flat in context length where a
       transformer of equal size slows (constant-memory headline of the
       landed BuildMambaFromSafeTensors importer; needs an incremental
