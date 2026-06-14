@@ -272,6 +272,8 @@ type
     procedure TestSigLIPVisionFeatures;
     procedure TestViTConfigFromJSONFile;
     procedure TestViTImageClassificationParity;
+    procedure TestDINOv2ConfigFromJSONFile;
+    procedure TestDINOv2Parity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -12534,6 +12536,107 @@ begin
       if Diff > MaxDiff then MaxDiff := Diff;
     end;
     AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadDINOv2ConfigFromJSONFile on the committed DINOv2 pico config.
+procedure TTestNeuralPretrained.TestDINOv2ConfigFromJSONFile;
+var
+  Config: TDINOv2Config;
+begin
+  Config := ReadDINOv2ConfigFromJSONFile(FixturePath('tiny_dinov2_config.json'));
+  AssertEquals('model_type', 'dinov2', Config.ModelType);
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  AssertEquals('mlp_ratio', 4, Config.MlpRatio);
+  AssertEquals('intermediate_size = mlp_ratio*hidden', 64,
+    Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 4, Config.NumHeads);
+  AssertEquals('image_size', 12, Config.ImageSize);
+  AssertEquals('patch_size', 4, Config.PatchSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_register_tokens', 0, Config.NumRegisterTokens);
+  AssertTrue('use_swiglu_ffn false', not Config.UseSwiGLUFFN);
+  AssertTrue('hidden_act gelu (exact erf)',
+    Config.HiddenAct = chaGeluExact);
+end;
+
+// DINOv2 parity test: tests/fixtures/tiny_dinov2.* is a pico randomly-
+// initialized HF Dinov2Model (image 12, patch 4 -> 9 patches + 1 CLS = 10
+// tokens, 2 layers, 4 heads, d 16, mlp_ratio 4 -> ffn 64; BIASED patch conv,
+// learnable cls_token folded into pos row 0, LayerScale on every residual
+// branch, exact-erf gelu, layer_norm_eps 1e-6, final layernorm and NO
+// classifier head). The generator tools/dinov2_tiny_fixture.py asserts every
+// DINOv2 quirk (LayerScale, cls_token, patch bias, exact-erf gelu) is visible
+// in the float64 oracle. Compares the (num_tokens, 1, hidden) post-final-LN
+// hidden states (CLS row 0 + patch tokens) < 1e-4 vs HF.
+procedure TTestNeuralPretrained.TestDINOv2Parity;
+var
+  NN: TNNet;
+  Config: TDINOv2Config;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, HiddenArr, TokRow: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, TokCnt, ColCnt, NumTokens: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildDINOv2FromSafeTensorsWithConfig(
+    FixturePath('tiny_dinov2.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_dinov2_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output depth = hidden_size', Config.HiddenSize,
+      NN.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_dinov2_hidden.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    HiddenArr := TJSONArray(TJSONObject(RefRoot).Find('hidden'));
+    NumTokens := TJSONObject(RefRoot).Get('num_tokens', 0);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('oracle token rows', NumTokens, HiddenArr.Count);
+    AssertEquals('output rows = num tokens (CLS + patches, NO crop)',
+      NumTokens, NN.GetLastLayer().Output.SizeX);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for TokCnt := 0 to NumTokens - 1 do
+    begin
+      TokRow := TJSONArray(HiddenArr.Items[TokCnt]);
+      for ColCnt := 0 to Config.HiddenSize - 1 do
+      begin
+        Diff := Abs(NN.GetLastLayer().Output.FData[
+          TokCnt * Config.HiddenSize + ColCnt] -
+          TokRow.Items[ColCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('CLS+patch hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;

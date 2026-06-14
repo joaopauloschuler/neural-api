@@ -4845,6 +4845,92 @@ function BuildViTFromSafeTensors(const FileName: string;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet;
 
+// ---------------------------------------------------------------------------
+// DINOv2 SELF-SUPERVISED ViT IMPORT (model_type "dinov2") for general-purpose
+// VISUAL EMBEDDINGS (facebook/dinov2-{small,base,large}). The architecture is
+// the same pre-LN ViT encoder path as the plain "vit" importer above (reusing
+// AddClipEncoderBlock's pieces and ViT's BERT-style tensor keys) with these
+// DINOv2-specific traits:
+//   (a) LayerScale on EVERY block: a per-channel learnable scale
+//       (layer_scale1.lambda1 / layer_scale2.lambda1) multiplying the OUTPUT
+//       of each residual branch (attention branch and MLP branch) BEFORE the
+//       skip add. Implemented with TNNetChannelMul (per-channel multiply, the
+//       LayerScale primitive) inserted on each branch.
+//   (b) FFN width is mlp_ratio * hidden_size (DINOv2 has NO intermediate_size
+//       field; mlp_ratio defaults to 4). FFN is plain MLP + exact-erf gelu
+//       for small/base/large; use_swiglu_ffn (giant) is NOT wired and is
+//       rejected loudly.
+//   (c) optional register tokens (num_register_tokens): 0 for the base
+//       DINOv2 checkpoints (handled cleanly); >0 (dinov2-with-registers) is
+//       rejected loudly (the importer would need to load + place the
+//       embeddings.register_tokens slot, not wired in v1).
+//   (d) the OUTPUT is the CLS + patch token hidden states AFTER the final
+//       LayerNorm - there is NO classifier head and NO CLS-row crop. The net
+//       outputs (num_patches+1, 1, hidden): row 0 = CLS (global feature),
+//       rows 1.. = patch tokens (dense features).
+// HF tensor keys (transformers 5.11.0): embeddings.cls_token,
+// embeddings.mask_token (IGNORED), embeddings.patch_embeddings.projection.
+// {weight,bias}, embeddings.position_embeddings, encoder.layer.N.{norm1,
+// norm2, attention.attention.{query,key,value}, attention.output.dense,
+// layer_scale1.lambda1, layer_scale2.lambda1, mlp.fc1, mlp.fc2}, final
+// layernorm.{weight,bias}. layer_norm_eps defaults to 1e-6 (NOT ViT's
+// 1e-12). The square matching-resolution position add is exact (HF's
+// interpolate_pos_encoding is a no-op when num_patches == num_positions and
+// height == width); non-square / mismatched resolutions are not supported.
+// Image preprocessing reuses ReadClipImageProcessorConfig / ClipPreprocess
+// Image (DINOv2 uses ImageNet mean/std from preprocessor_config.json).
+// ---------------------------------------------------------------------------
+type
+  TDINOv2Config = record
+    HiddenSize: integer;        // hidden_size
+    IntermediateSize: integer;  // mlp_ratio * hidden_size (DERIVED)
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-6 default)
+    HiddenAct: TClipHiddenAct;  // hidden_act (gelu = exact erf by default)
+    ImageSize: integer;         // image_size
+    PatchSize: integer;         // patch_size
+    NumChannels: integer;       // num_channels (3)
+    MlpRatio: integer;          // mlp_ratio (4 default)
+    NumRegisterTokens: integer; // num_register_tokens (0 for the base models)
+    UseSwiGLUFFN: boolean;      // use_swiglu_ffn (giant; rejected if true)
+    ModelType: string;          // 'dinov2'
+  end;
+
+// Reads a HF DINOv2 config.json (model_type "dinov2"). Required: hidden_size,
+// num_hidden_layers, num_attention_heads, image_size, patch_size. Defaults
+// follow Dinov2Config: hidden_act "gelu" (exact erf), layer_norm_eps 1e-6,
+// num_channels 3, mlp_ratio 4, num_register_tokens 0, use_swiglu_ffn false.
+// IntermediateSize is DERIVED as mlp_ratio * hidden_size. use_swiglu_ffn true
+// and num_register_tokens > 0 are accepted by the reader but rejected by the
+// builder.
+function ReadDINOv2ConfigFromJSONFile(
+  const FileName: string): TDINOv2Config;
+
+function DINOv2ConfigToString(const Config: TDINOv2Config): string;
+
+// Builds the DINOv2 visual-embedding net described by Config and loads every
+// weight from Reader (the caller owns Reader). The net takes an
+// (ImageSize, ImageSize, NumChannels) normalized RGB volume and outputs the
+// (num_patches+1, 1, HiddenSize) post-final-LayerNorm hidden states: row 0 is
+// the CLS global feature, rows 1.. are the per-patch dense features. There is
+// NO classifier head. pInferenceOnly frees training volumes during build.
+function BuildDINOv2FromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDINOv2Config; pInferenceOnly: boolean = false): TNNet;
+
+// Builds + loads the DINOv2 net from the checkpoint at FileName
+// (.safetensors / sharded index / pytorch_model.bin via CreatePretrained
+// TensorReader). Config is supplied by the caller (Ex) or read from
+// ConfigFileName ('' = "config.json" beside FileName) and returned. The net
+// is owned by the caller. Output: (num_patches+1, 1, HiddenSize) hidden
+// states (CLS row 0 + patch tokens).
+function BuildDINOv2FromSafeTensorsEx(const FileName: string;
+  const Config: TDINOv2Config; pInferenceOnly: boolean = false): TNNet;
+
+function BuildDINOv2FromSafeTensorsWithConfig(const FileName: string;
+  out Config: TDINOv2Config; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -30781,6 +30867,366 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadViTConfigFromJSONFile(ConfigPath);
   Result := BuildViTFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// DINOv2 SELF-SUPERVISED ViT IMPORT (model_type "dinov2")
+// ===========================================================================
+
+function ReadDINOv2ConfigFromJSONFile(
+  const FileName: string): TDINOv2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('DINOv2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('DINOv2 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('DINOv2 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('DINOv2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('DINOv2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'dinov2');
+    if ModelType <> 'dinov2' then
+      ImportError('DINOv2 import: config model_type is "' + ModelType +
+        '" - only "dinov2" is supported here.');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.ImageSize := RequiredInt('image_size');
+    Result.PatchSize := RequiredInt('patch_size');
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 0.000001);
+    // hidden_act default is exact erf "gelu" in Dinov2Config.
+    Result.HiddenAct := ClipHiddenActFromString(Obj.Get('hidden_act', 'gelu'));
+    Result.MlpRatio := Obj.Get('mlp_ratio', 4);
+    if Result.MlpRatio <= 0 then
+      ImportError('DINOv2 import: mlp_ratio must be a positive integer, got ' +
+        IntToStr(Result.MlpRatio) + '.');
+    // DINOv2 has NO intermediate_size field; the FFN width is derived.
+    Result.IntermediateSize := Result.MlpRatio * Result.HiddenSize;
+    Result.NumRegisterTokens := Obj.Get('num_register_tokens', 0);
+    Result.UseSwiGLUFFN := Obj.Get('use_swiglu_ffn', false);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function DINOv2ConfigToString(const Config: TDINOv2Config): string;
+begin
+  if Config.ModelType = '' then Result := 'dinov2'
+  else Result := Config.ModelType;
+  Result := Result + ' config: d=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', ffn=' + IntToStr(Config.IntermediateSize) +
+    ' (mlp_ratio=' + IntToStr(Config.MlpRatio) + ')' +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', act=' + ClipHiddenActToString(Config.HiddenAct) +
+    ', register_tokens=' + IntToStr(Config.NumRegisterTokens);
+  if Config.UseSwiGLUFFN then Result := Result + ', swiglu_ffn=true';
+end;
+
+// Loads the per-channel LayerScale vector (lambda1, shape [hidden]) into a
+// TNNetChannelMul layer (FNeurons[0].Weights = the Depth-length scale,
+// applied as Output[x,y,d] = Input[x,y,d] * lambda1[d]).
+procedure LoadDINOv2LayerScale(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const TName: string; Hidden: integer);
+var
+  Tmp: TNNetVolume;
+  i: integer;
+begin
+  if not Reader.HasTensor(TName) then
+    ImportError('DINOv2 import: missing tensor "' + TName + '".');
+  if (Reader.DimCount(TName) <> 1) or (Reader.DimSize(TName, 0) <> Hidden) then
+    ImportError('DINOv2 import: "' + TName + '" must have shape [' +
+      IntToStr(Hidden) + '], got ' + Reader.ShapeAsString(TName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Layer.Neurons[0].Weights.Size <> Hidden then
+      ImportError('DINOv2 import: internal error - LayerScale layer has ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' weights, expected ' +
+        IntToStr(Hidden) + '.');
+    for i := 0 to Hidden - 1 do
+      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i];
+    Layer.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+end;
+
+// Holds the per-block layers of one DINOv2 encoder block. Same pieces as the
+// ViT/CLIP block (TClipBlockLayers) plus the two LayerScale layers.
+type
+  TDINOv2BlockLayers = record
+    LN1, QKV, AttnDense, LS1: TNNetLayer;
+    LN2, Inter, OutDense, LS2: TNNetLayer;
+  end;
+  TDINOv2BlockLayersArray = array of TDINOv2BlockLayers;
+
+// Appends one DINOv2 pre-LN encoder block with LayerScale on each residual
+// branch:
+//   x1 = x + LS1 * Attn(LN1(x))
+//   y  = x1 + LS2 * MLP(LN2(x1))
+// (TNNetChannelMul is the per-channel LayerScale multiply, inserted before
+// each TNNetSum skip add.)
+procedure AddDINOv2EncoderBlock(NN: TNNet; const Config: TDINOv2Config;
+  var Block: TDINOv2BlockLayers; pInferenceOnly: boolean);
+var
+  BranchInput: TNNetLayer;
+begin
+  BranchInput := NN.GetLastLayer();
+  Block.LN1 := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+  Block.QKV := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+  Block.AttnDense := NN.AddMultiHeadSelfAttention(Config.NumHeads,
+    {CausalMask=}false);
+  Block.LS1 := NN.AddLayer( TNNetChannelMul.Create() );
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  BranchInput := NN.GetLastLayer();
+  Block.LN2 := NN.AddLayer(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+  Block.Inter := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+  AddClipHiddenAct(NN, Config.HiddenAct);
+  Block.OutDense := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+  Block.LS2 := NN.AddLayer( TNNetChannelMul.Create() );
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  if pInferenceOnly then NN.MakeInferenceOnly();
+end;
+
+// Loads one DINOv2 encoder block. BERT-style attention names (same as ViT's
+// legacy scheme: attention.attention.{query,key,value}, attention.output.
+// dense) into the fused Q|K|V slab + biased out/fc1/fc2, the two biased
+// LayerNorms (norm1 = pre-attn, norm2 = pre-MLP) and the two LayerScales.
+// BlockPrefix is the prefix THROUGH the per-layer index
+// ('dinov2.encoder.layer.N.').
+procedure LoadDINOv2EncoderBlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TDINOv2BlockLayers; const BlockPrefix: string;
+  const Config: TDINOv2Config);
+var
+  d: integer;
+  QName, KName, VName, ONm: string;
+begin
+  d := Config.HiddenSize;
+  QName := BlockPrefix + 'attention.attention.query';
+  KName := BlockPrefix + 'attention.attention.key';
+  VName := BlockPrefix + 'attention.attention.value';
+  ONm := BlockPrefix + 'attention.output.dense';
+  LoadLayerNormWeights(Reader, Block.LN1,
+    BlockPrefix + 'norm1.weight', BlockPrefix + 'norm1.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    QName + '.weight', d, d, 0, 3 * d, 0, QName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    KName + '.weight', d, d, d, 3 * d, 0, KName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    VName + '.weight', d, d, 2 * d, 3 * d, 0, VName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.AttnDense,
+    ONm + '.weight', d, d, 0, -1, 0, ONm + '.bias');
+  LoadDINOv2LayerScale(Reader, Block.LS1,
+    BlockPrefix + 'layer_scale1.lambda1', d);
+  LoadLayerNormWeights(Reader, Block.LN2,
+    BlockPrefix + 'norm2.weight', BlockPrefix + 'norm2.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.Inter,
+    BlockPrefix + 'mlp.fc1.weight', d, Config.IntermediateSize, 0, -1, 0,
+    BlockPrefix + 'mlp.fc1.bias');
+  LoadLlamaLinearWeights(Reader, Block.OutDense,
+    BlockPrefix + 'mlp.fc2.weight', Config.IntermediateSize, d, 0, -1, 0,
+    BlockPrefix + 'mlp.fc2.bias');
+  LoadDINOv2LayerScale(Reader, Block.LS2,
+    BlockPrefix + 'layer_scale2.lambda1', d);
+end;
+
+function BuildDINOv2FromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDINOv2Config; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  PatchConv, PosEmb, FinalLN: TNNetLayer;
+  Blocks: TDINOv2BlockLayersArray;
+  Tmp: TNNetVolume;
+  Grid, NumPatches, BlockCnt, ci, d: integer;
+  PatchBiasName, Pfx: string;
+begin
+  d := Config.HiddenSize;
+  if (Config.NumHeads < 1) or ((d mod Config.NumHeads) <> 0) then
+    ImportError('DINOv2 import: hidden_size=' + IntToStr(d) +
+      ' is not divisible by num_attention_heads=' +
+      IntToStr(Config.NumHeads) + '.');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0)
+  then
+    ImportError('DINOv2 import: image_size=' + IntToStr(Config.ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
+  if Config.UseSwiGLUFFN then
+    ImportError('DINOv2 import: use_swiglu_ffn=true (the giant model) is NOT ' +
+      'supported - only the plain MLP+gelu FFN (small/base/large) is wired.');
+  if Config.NumRegisterTokens > 0 then
+    ImportError('DINOv2 import: num_register_tokens=' +
+      IntToStr(Config.NumRegisterTokens) + ' (dinov2-with-registers) is NOT ' +
+      'supported - only num_register_tokens=0 is wired.');
+  Grid := Config.ImageSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    // BIASED patch embedding: kernel = stride = patch_size, no padding ->
+    // a (Grid, Grid, hidden) patch grid, flattened row-major over (y,x)
+    // = HF flatten(2).transpose(1,2) patch order.
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
+      {pSuppressBias=}0) );
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    // Prepend one ZERO row as the CLS-token slot (PadXY pads both ends;
+    // Crop drops the right pad). cls_token is folded into row 0 of the
+    // position table below - exact, since this slot is identically zero.
+    NN.AddLayer( TNNetPadXY.Create(1, 0) );
+    NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(Blocks, Config.NumLayers);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      AddDINOv2EncoderBlock(NN, Config, Blocks[BlockCnt], pInferenceOnly);
+    // Final layernorm over every token; the output is the CLS + patch token
+    // hidden states (NO classifier head, NO CLS-row crop).
+    FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    // The bare Dinov2Model checkpoint (incl. published facebook/dinov2-*) has
+    // NO 'dinov2.' prefix; a wrapped model (e.g. Dinov2ForImageClassification)
+    // nests the backbone under 'dinov2.'. Probe the cls_token to pick.
+    if Reader.HasTensor('dinov2.embeddings.cls_token') then
+      Pfx := 'dinov2.'
+    else
+      Pfx := '';
+    LoadClipPatchConv(Reader, PatchConv,
+      Pfx + 'embeddings.patch_embeddings.projection.weight',
+      Config.NumChannels, Config.PatchSize, d);
+    // DINOv2's patch conv IS biased (LoadClipPatchConv zeroes the bias);
+    // load the per-output-channel bias into each neuron's BiasWeight.
+    PatchBiasName := Pfx + 'embeddings.patch_embeddings.projection.bias';
+    if not Reader.HasTensor(PatchBiasName) then
+      ImportError('DINOv2 import: missing tensor "' + PatchBiasName + '".');
+    if (Reader.DimCount(PatchBiasName) <> 1) or
+       (Reader.DimSize(PatchBiasName, 0) <> d) then
+      ImportError('DINOv2 import: "' + PatchBiasName + '" must have shape [' +
+        IntToStr(d) + '], got ' + Reader.ShapeAsString(PatchBiasName));
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(PatchBiasName, Tmp);
+      for ci := 0 to d - 1 do
+        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // position_embeddings [1, num_patches+1, hidden] -> the table. The square
+    // matching-resolution add is exact (HF's interpolate_pos_encoding returns
+    // position_embeddings unchanged when num_patches == num_positions and the
+    // image is square).
+    if not Reader.HasTensor(Pfx + 'embeddings.position_embeddings') then
+      ImportError('DINOv2 import: missing tensor "' + Pfx +
+        'embeddings.position_embeddings".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Pfx + 'embeddings.position_embeddings', Tmp);
+      if Tmp.Size <> (NumPatches + 1) * d then
+        ImportError('DINOv2 import: ' +
+          '"dinov2.embeddings.position_embeddings" must have ' +
+          IntToStr((NumPatches + 1) * d) + ' elements, got ' +
+          IntToStr(Tmp.Size) + '. (Only the native image_size=' +
+          IntToStr(Config.ImageSize) + ' resolution is supported.)');
+      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // cls_token [1,1,hidden] folded into position row 0 (see above).
+    if not Reader.HasTensor(Pfx + 'embeddings.cls_token') then
+      ImportError('DINOv2 import: missing tensor "' + Pfx +
+        'embeddings.cls_token".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Pfx + 'embeddings.cls_token', Tmp);
+      if Tmp.Size <> d then
+        ImportError('DINOv2 import: "dinov2.embeddings.cls_token" must have ' +
+          IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
+      for ci := 0 to d - 1 do
+        PosEmb.Neurons[0].Weights.FData[ci] :=
+          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      PosEmb.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      LoadDINOv2EncoderBlockWeights(Reader, Blocks[BlockCnt],
+        Pfx + 'encoder.layer.' + IntToStr(BlockCnt) + '.', Config);
+    LoadLayerNormWeights(Reader, FinalLN,
+      Pfx + 'layernorm.weight', Pfx + 'layernorm.bias', d);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildDINOv2FromSafeTensorsEx(const FileName: string;
+  const Config: TDINOv2Config; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDINOv2FromSafeTensors(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildDINOv2FromSafeTensorsWithConfig(const FileName: string;
+  out Config: TDINOv2Config; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDINOv2ConfigFromJSONFile(ConfigPath);
+  Result := BuildDINOv2FromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 function ReadClipImageProcessorConfig(
