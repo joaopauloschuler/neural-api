@@ -343,18 +343,23 @@ rather than acted on.
       and save a grid PNG. All layers exist; the new content is the noising
       schedule + sampling loop + the U-Net builder. Opens the door to a CIFAR /
       latent-diffusion follow-up.
-- [ ] Stable Diffusion VAE decoder importer (diffusers AutoencoderKL decoder,
+- [X] Stable Diffusion VAE decoder importer (diffusers AutoencoderKL decoder,
       e.g. stabilityai/sd-vae-ft-mse) — a modular, independently-testable
       generative piece short of a full diffusion UNet: import the decoder
       (post_quant_conv -> mid block with a single self-attention over HxW ->
       up blocks of ResNet groups + nearest TNNetUpsample -> conv_out) that maps
       a 4-channel latent to an RGB image, scaling the latent by 1/0.18215.
-      Needs GroupNorm (have it), SiLU (have it), and spatial self-attention
-      reshaped to (H*W, 1, C) — exactly the per-token SDPA pattern already used
-      for sequences. Deliverable: BuildVaeDecoderFromSafeTensors + a demo that
-      decodes a committed tiny latent and parity-checks the RGB output vs
-      diffusers float64. Reusable later as the decoder stage of a latent
-      diffusion / SD import.
+      LANDED (commit a7870a1): BuildVaeDecoderFromSafeTensors[Ex] + config
+      reader/ToString, reuse-only (nearest upsample = TNNetDeMaxPool(2) FSpacing=0,
+      NOT TNNetUpsample which is pixel-shuffle; mid attention flattens (H,W,C)->
+      (H*W,1,C) per-token SDPA; added GroupNormEpsilon property to TNNetGroupNorm
+      to pin diffusers eps 1e-6). TestVaeDecoderParity <1e-4 vs a numpy float64
+      oracle (diffusers not installed here). Follow-ups:
+  - [ ] BuildVaeEncoder (Down blocks + DiagonalGaussianDistribution sampling) +
+        wire encoder+decoder into a full AutoencoderKL round-trip.
+  - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
+        installable; SDXL VAE uses different group counts / multi-head attention.
+  - [ ] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
