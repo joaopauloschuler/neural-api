@@ -152,6 +152,7 @@ type
     procedure TestGGUFWriterRoundTrip;
     procedure TestBuildFromGGUFQwen2RoundTrip;
     procedure TestBuildFromGGUFGemma2RoundTrip;
+    procedure TestGGUFGemma2Q8AndF16ImportDrift;
     procedure TestBuildFromGGUFRejectsUnknownArch;
     procedure TestGGUFWriterGpt2TokenizerRoundTrip;
     procedure TestTNNetGGUFWriterRoundTrip;
@@ -4511,6 +4512,137 @@ begin
     NNG.Free; NNRef.Free;
     DeleteFile(GGUFPath);
   end;
+end;
+
+// GGUF export-DRIFT for gemma2 (mirror of TestGGUFLlamaQ8AndF16ImportDrift):
+// build the tiny gemma2 reference net from safetensors (lossless F32), then
+// SaveLlamaToGGUFEx the SAME checkpoint out in gwQ8_0 and gwF16 and re-import
+// each via the BuildFromGGUF arch dispatch. The only difference between the
+// reference and the GGUF net is the matrix encoding, so the relative logit
+// drift isolates the F16-rounding / Q8_0-quantization error (1-D norm gains
+// always stay F32). The Q8_0 round-trip writes from the DEQUANTIZED FP32 row,
+// so its drift bound mirrors the Llama Q8_0 gate; F16 is tight.
+//
+// CROSS-TOOL llama.cpp gemma2 GGUF parity is DEFERRED: it needs the llama.cpp
+// shared lib / CLI (network + native build), which is unavailable in this
+// environment. The in-repo write->read drift below is the available coverage;
+// the cross-tool arm stays open in tasklist.md (same convention the Llama
+// drift test follows - it does not shell out to llama.cpp either).
+procedure TTestNeuralPretrained.TestGGUFGemma2Q8AndF16ImportDrift;
+var
+  NNRef, NNG: TNNet;
+
+  // Max |logit diff| / max |reference logit| over 3 deterministic sequences
+  // of SeqLen tokens (ids cycle through the vocab) - identical metric to the
+  // Llama drift test.
+  function RelativeDrift(SeqLen, Vocab: integer): double;
+  var
+    Input, OutR, OutG: TNNetVolume;
+    i, s: integer;
+    MaxDiff, MaxAbsLogit: double;
+  begin
+    Input := TNNetVolume.Create(SeqLen, 1, 1);
+    OutR := TNNetVolume.Create;
+    OutG := TNNetVolume.Create;
+    try
+      MaxDiff := 0;
+      MaxAbsLogit := 0;
+      for s := 0 to 2 do
+      begin
+        for i := 0 to SeqLen - 1 do
+          Input.FData[i] := (s * 5 + i * 3 + 1) mod Vocab;
+        NNRef.Compute(Input);
+        NNRef.GetOutput(OutR);
+        NNG.Compute(Input);
+        NNG.GetOutput(OutG);
+        AssertEquals('output size', OutR.Size, OutG.Size);
+        for i := 0 to OutR.Size - 1 do
+        begin
+          if Abs(OutR.FData[i]) > MaxAbsLogit then
+            MaxAbsLogit := Abs(OutR.FData[i]);
+          if Abs(OutR.FData[i] - OutG.FData[i]) > MaxDiff then
+            MaxDiff := Abs(OutR.FData[i] - OutG.FData[i]);
+        end;
+      end;
+      AssertTrue('reference logits non-degenerate', MaxAbsLogit > 1e-3);
+      Result := MaxDiff / MaxAbsLogit;
+    finally
+      OutG.Free;
+      OutR.Free;
+      Input.Free;
+    end;
+  end;
+
+  // Build the lossless F32 reference net from SafeTensors, export the SAME
+  // checkpoint to GGUF at pDType, re-import via the BuildFromGGUF dispatch,
+  // and return the relative logit drift. Caller frees nothing.
+  function ExportImportDrift(const Stem: string;
+    pDType: TGGUFWriteDType): double;
+  var
+    Config, ConfigG: TLlamaConfig;
+    Reader: TNNetSafeTensorsReader;
+    NoTokens: array of string;
+    GGUFPath: string;
+  begin
+    SetLength(NoTokens, 0);
+    Config := ReadLlamaConfigFromJSONFile(FixturePath(Stem + '_config.json'));
+    NNRef := BuildGemma2FromSafeTensorsEx(FixturePath(Stem + '.safetensors'),
+      Config, {SeqLen=}0, {pInferenceOnly=}false,
+      FixturePath(Stem + '_config.json'));
+    GGUFPath := GetTempDir(false) + 'cai_gemma2_drift_' +
+      IntToStr(Random(1000000)) + '.gguf';
+    Reader := TNNetSafeTensorsReader.Create(FixturePath(Stem + '.safetensors'));
+    try
+      if Config.VocabSize <= 0 then
+        Config.VocabSize := integer(
+          Reader.DimSize('model.embed_tokens.weight', 0));
+      SaveLlamaToGGUFEx(Reader, Config, NoTokens, GGUFPath, pDType);
+    finally
+      Reader.Free;
+    end;
+    NNG := BuildFromGGUFEx(GGUFPath, ConfigG);
+    try
+      AssertEquals('dispatch model_type', 'gemma2', ConfigG.ModelType);
+      AssertEquals('hidden', Config.HiddenSize, ConfigG.HiddenSize);
+      AssertEquals('layers', Config.NumLayers, ConfigG.NumLayers);
+      AssertEquals('vocab', Config.VocabSize, ConfigG.VocabSize);
+      AssertTrue('tied head', ConfigG.TieWordEmbeddings);
+      Result := RelativeDrift(ConfigG.MaxPositions, ConfigG.VocabSize);
+    finally
+      NNG.Free;
+      NNRef.Free;
+      DeleteFile(GGUFPath);
+    end;
+  end;
+
+var
+  Drift: double;
+begin
+  RandSeed := 424242;
+  // ---- (a) Q8_0 ----
+  // The pico tiny_gemma2 fixture is width-8/head_dim-6/ff-12 so its rows are
+  // NOT multiples of the Q8_0 block size (32). The Q8_0 arm therefore uses
+  // tiny_gemma2_q8 (width 32, head_dim 32, ff 64, vocab 32 - every contiguous
+  // dim a multiple of 32), mirroring how the Llama drift test keeps a separate
+  // hidden-32 tiny_llama_q8 fixture for its Q8_0 arm. All gemma2 deltas stay
+  // ON, so the importer still walks the full gemma2 path.
+  Drift := ExportImportDrift('tiny_gemma2_q8', gwQ8_0);
+  // Q8_0 export re-emits each matrix row from its DEQUANTIZED FP32 values, so
+  // the drift is pure Q8_0 quantization error at pico width - the same regime
+  // the Llama Q8_0 drift test sits in (it measured 8.33e-2). Gated generously
+  // in (1e-3, 1.5e-1): quantization must be VISIBLE (fixture not vacuous) yet
+  // bounded.
+  AssertTrue('Q8_0 gemma2 GGUF logit drift = ' + FloatToStr(Drift) +
+    ' must be in (1e-3, 1.5e-1) relative',
+    (Drift > 1e-3) and (Drift < 1.5e-1));
+  // ---- (b) F16 ----
+  // F16 has no block-size constraint, so it runs on the canonical pico
+  // tiny_gemma2 fixture (the one the round-trip oracle verifies).
+  Drift := ExportImportDrift('tiny_gemma2', gwF16);
+  // F16 rounds each weight to ~5e-4 relative; gemma2's monotone logit
+  // soft-capping does not amplify it. Gated < 3e-3 like the Llama F16 arm.
+  AssertTrue('F16 gemma2 GGUF logit drift = ' + FloatToStr(Drift) +
+    ' must be < 3e-3 relative', Drift < 3e-3);
 end;
 
 // BuildFromGGUF must reject an unsupported architecture with a clear error

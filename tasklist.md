@@ -98,8 +98,15 @@ rather than acted on.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
-  - [ ] F16/Q8_0 gemma2 export-drift test (mirror TestGGUFLlamaQ8AndF16ImportDrift);
-        cross-tool llama.cpp gemma2 GGUF parity.
+  - [X] F16/Q8_0 gemma2 export-drift test (mirror TestGGUFLlamaQ8AndF16ImportDrift):
+        TestGGUFGemma2Q8AndF16ImportDrift exports the gemma2 fixture to GGUF in
+        F16 (pico tiny_gemma2) and Q8_0 (new tiny_gemma2_q8, width 32 so rows
+        clear the Q8_0 32-block guard) then re-imports via BuildFromGGUF and
+        bounds the relative logit drift: Q8_0 0.0272 in (1e-3,1.5e-1), F16
+        0.0018 < 3e-3. tools/gemma2_q8_tiny_fixture.py generates the Q8 fixture.
+  - [ ] cross-tool llama.cpp gemma2 GGUF parity (DEFERRED: needs the llama.cpp
+        shared lib / CLI — network + native build — unavailable here; the Llama
+        drift test does not shell out either).
   - [ ] starcoder2 GGUF (out of scope for v1): needs LayerNorm-not-RMSNorm + full
         per-projection biases + non-gated GELU on the GGUF import path.
   - [ ] Extend dispatch to more Llama-backbone GGUF archs (phi3, qwen3, gemma3,
