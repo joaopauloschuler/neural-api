@@ -651,7 +651,7 @@ rather than acted on.
       subclasses; wire them through TGenerationConfig and the streamed decode path.
       Test: on a pinned logit sequence each selects the documented token set, and
       Mirostat's `mu` converges toward `tau` on a synthetic high-entropy stream.
-- [ ] LLM output watermarking (Kirchenbauer et al. 2023 green-list scheme) — a
+- [X] LLM output watermarking (Kirchenbauer et al. 2023 green-list scheme) — a
       defensive/provenance feature with no current analogue: a
       `TNNetWatermarkLogitsProcessor` in the logits-processor chain that, seeded by
       a hash of the previous token, partitions the vocab into a pseudo-random

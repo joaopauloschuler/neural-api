@@ -821,6 +821,48 @@ type
         read FGuidanceScale write FGuidanceScale;
   end;
 
+  { TNNetWatermarkLogitsProcessor }
+  // LLM OUTPUT WATERMARKING - the green-list scheme of Kirchenbauer et al.
+  // 2023 ("A Watermark for Large Language Models"). At every step the
+  // PREVIOUS token (set in Reset to the last prompt token, then advanced in
+  // Commit) seeds a splitmix64 hash combined with a secret Key; that hash
+  // pseudo-randomly partitions the whole vocabulary into a "green" list of
+  // fraction Gamma (default 0.25) and the complementary "red" list. A bias
+  // Delta (default 2.0, a LOGIT-space additive shift) is then applied to the
+  // green tokens, gently steering sampling toward them without forbidding red
+  // tokens. Because the chain works in the POST-SOFTMAX probability domain,
+  // adding Delta to a green logit is realized as multiplying its probability
+  // by exp(Delta) and renormalizing - the exact probability-domain image of
+  // logit += Delta. The same deterministic partition (IsGreen) is reused by
+  // the standalone DetectWatermark statistical test, so a watermarked text is
+  // detectable from Key alone without the model.
+  // Coded by Claude (AI).
+  TNNetWatermarkLogitsProcessor = class(TNNetLogitsProcessor)
+    private
+      FKey: UInt64;
+      FGamma: TNeuralFloat;
+      FDelta: TNeuralFloat;
+      FPrevToken: integer;
+    public
+      // Key: secret watermark key (any 64-bit value). Gamma: green-list
+      // fraction in (0,1). Delta: green-logit bias (>= 0).
+      constructor Create(pKey: UInt64; pGamma: TNeuralFloat = 0.25;
+        pDelta: TNeuralFloat = 2.0);
+      // Seeds FPrevToken from the LAST prompt token (the first generated token
+      // is greened relative to it); an empty prompt seeds with -1.
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      // Deterministic, bit-reproducible green-list membership: TRUE iff TokenId
+      // is in the green list seeded by (Key, PrevToken, Gamma). Shared verbatim
+      // with DetectWatermark so detection matches generation exactly.
+      class function IsGreen(pKey: UInt64; PrevToken, TokenId: integer;
+        Gamma: TNeuralFloat): boolean; static;
+      property Key: UInt64 read FKey write FKey;
+      property Gamma: TNeuralFloat read FGamma write FGamma;
+      property Delta: TNeuralFloat read FDelta write FDelta;
+  end;
+
   { TGenerationConfig }
   // One-record bundle of generation knobs - the GenerationConfig counterpart
   // of the parameter piles on the GenerateTokensStreamed overloads, consumed
@@ -1088,6 +1130,19 @@ function LengthPenaltyDenominator(L: integer; Alpha: TNeuralFloat): TNeuralFloat
 // Numerically-safe natural log of a probability (clamps tiny / zero probs so a
 // dead-but-not-impossible token never produces -Inf and poisons the sum).
 function SafeLogProb(P: TNeuralFloat): TNeuralFloat;
+
+// WATERMARK DETECTION (Kirchenbauer et al. 2023). Given a candidate token
+// sequence and the same (Key, Gamma) the generator used, recomputes the green
+// list at every position from its PREDECESSOR token (positions 1..T-1, the
+// scored positions T = High(Tokens)) and returns the one-proportion z-score
+//   z = (greenObserved - Gamma*T) / sqrt(T*Gamma*(1-Gamma)).
+// Under the null hypothesis (text not produced under this watermark) the green
+// fraction is ~Gamma and z ~ N(0,1); a watermarked text drives the green
+// fraction well above Gamma and z above a threshold (e.g. 4.0 => p ~ 3e-5).
+// Sequences shorter than 2 tokens have no scored positions and return 0.
+// Coded by Claude (AI).
+function DetectWatermark(const Tokens: array of integer; Key: UInt64;
+  Gamma: TNeuralFloat = 0.25): TNeuralFloat;
 
 // Deterministic greedy argmax decode, in the same forward-pass / encoding
 // convention as DecodeBeamSearch. Returned as a single-element result so its
@@ -2184,6 +2239,29 @@ const
 begin
   if P < csTinyProb then P := csTinyProb;
   Result := Ln(P);
+end;
+
+function DetectWatermark(const Tokens: array of integer; Key: UInt64;
+  Gamma: TNeuralFloat = 0.25): TNeuralFloat;
+var
+  I, T, GreenCount: integer;
+  Expected, Variance: TNeuralFloat;
+begin
+  // Scored positions are 1..High(Tokens): each token is judged against its
+  // immediate predecessor, exactly the seed the processor used when it was
+  // emitted. T < 1 (a sequence of fewer than 2 tokens) has nothing to score.
+  T := Length(Tokens) - 1;
+  if T < 1 then exit(0.0);
+  GreenCount := 0;
+  for I := 1 to High(Tokens) do
+    if TNNetWatermarkLogitsProcessor.IsGreen(Key, Tokens[I - 1], Tokens[I],
+      Gamma) then
+      Inc(GreenCount);
+  // One-proportion z-score against the null green rate Gamma.
+  Expected := Gamma * T;
+  Variance := T * Gamma * (1.0 - Gamma);
+  if Variance <= 0 then exit(0.0);
+  Result := (GreenCount - Expected) / Sqrt(Variance);
 end;
 
 { TNNetTokenConstraint }
@@ -4116,6 +4194,88 @@ end;
 procedure TNNetConstraintProcessor.Commit(TokenId: integer);
 begin
   FConstraint.Commit(TokenId);
+end;
+
+{ TNNetWatermarkLogitsProcessor }
+
+// One round of the splitmix64 finalizer - a fast, well-mixing 64-bit hash.
+// Used as the deterministic green-list PRNG so the partition is bit-identical
+// in the processor and in DetectWatermark.
+function WatermarkSplitMix64(X: UInt64): UInt64;
+begin
+  X := X + UInt64($9E3779B97F4A7C15);
+  X := (X xor (X shr 30)) * UInt64($BF58476D1CE4E5B9);
+  X := (X xor (X shr 27)) * UInt64($94D049BB133111EB);
+  Result := X xor (X shr 31);
+end;
+
+constructor TNNetWatermarkLogitsProcessor.Create(pKey: UInt64;
+  pGamma: TNeuralFloat = 0.25; pDelta: TNeuralFloat = 2.0);
+begin
+  inherited Create();
+  FKey := pKey;
+  FGamma := pGamma;
+  FDelta := pDelta;
+  FPrevToken := -1;
+end;
+
+class function TNNetWatermarkLogitsProcessor.IsGreen(pKey: UInt64;
+  PrevToken, TokenId: integer; Gamma: TNeuralFloat): boolean;
+var
+  Seed, H: UInt64;
+  Frac: double;
+begin
+  // Seed the per-step PRNG from the previous token XOR the key (the h=1
+  // "left-hash" rule of Kirchenbauer et al.); mixing once decorrelates
+  // adjacent seeds. The token id is folded in and finalized so each token's
+  // membership is an independent uniform draw in [0,1); green iff below Gamma.
+  Seed := WatermarkSplitMix64(UInt64(UInt32(PrevToken)) xor pKey);
+  H := WatermarkSplitMix64(Seed + UInt64(UInt32(TokenId)));
+  // Top 53 bits -> uniform double in [0,1) (mirrors the std double-from-u64
+  // trick; avoids the low-bit non-uniformity of a plain modulo).
+  Frac := (H shr 11) * (1.0 / 9007199254740992.0); // 2^53
+  Result := Frac < Gamma;
+end;
+
+procedure TNNetWatermarkLogitsProcessor.Reset(
+  const PromptTokens: array of integer);
+begin
+  if Length(PromptTokens) > 0 then
+    FPrevToken := PromptTokens[High(PromptTokens)]
+  else
+    FPrevToken := -1;
+end;
+
+procedure TNNetWatermarkLogitsProcessor.ProcessRow(Row: TNNetVolume);
+var
+  I: integer;
+  ExpDelta, Sum: TNeuralFloat;
+begin
+  // Delta = 0 (or a degenerate non-positive bias) is a no-op.
+  if FDelta <= 0 then exit;
+  // Probability-domain image of "logit += Delta on green tokens": multiply
+  // every green probability by exp(Delta), then renormalize. (Adding Delta to
+  // a logit scales its softmax numerator by exp(Delta); the partition cancels
+  // in the ratio, so renormalizing the post-softmax row reproduces it exactly.)
+  ExpDelta := Exp(FDelta);
+  Sum := 0;
+  for I := 0 to Row.Size - 1 do
+  begin
+    if IsGreen(FKey, FPrevToken, I, FGamma) then
+      Row.Raw[I] := Row.Raw[I] * ExpDelta;
+    Sum := Sum + Row.Raw[I];
+  end;
+  // Defensive: an all-zero row (no probability mass) is left untouched,
+  // mirroring the temperature/constraint zero-mass fallback.
+  if Sum <= 0 then exit;
+  for I := 0 to Row.Size - 1 do
+    Row.Raw[I] := Row.Raw[I] / Sum;
+end;
+
+procedure TNNetWatermarkLogitsProcessor.Commit(TokenId: integer);
+begin
+  // The token just emitted becomes the predecessor that seeds the next step.
+  FPrevToken := TokenId;
 end;
 
 { TNNetLogitsProcessorChain }

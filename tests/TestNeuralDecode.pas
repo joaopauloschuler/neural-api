@@ -196,6 +196,10 @@ type
     procedure TestConfigCFGScaleOneMatchesNoCFGConfig;
     procedure TestConfigCFGScaleChangesOutput;
     procedure TestMakeUnconditionalTwinMatchesSourceLogits;
+    // LLM output watermarking (Kirchenbauer green-list scheme).
+    procedure TestWatermarkGreenListReproducibleFromKeyAndPrefix;
+    procedure TestWatermarkDetectsWatermarkedAndRejectsRandom;
+    procedure TestWatermarkProcessorBoostsGreenInProbabilityDomain;
     // Constrained (structured) decoding: TNNetTokenConstraint and friends.
     procedure TestAllowedTokensConstraintMasksAndRenormalizes;
     procedure TestConstraintMaskFallbackLeavesRowUntouched;
@@ -4097,6 +4101,182 @@ begin
     InV.Free;
     TwinSess.Free; SrcSess.Free;
     Clone.Free; Source.Free; Full.Free;
+  end;
+end;
+
+// The green-list partition must be a deterministic, bit-reproducible function
+// of (Key, PrevToken): the same key+prefix yields the identical green set, a
+// different prefix or a different key yields a different one, and the green
+// fraction over the vocab is close to Gamma.
+procedure TTestNeuralDecode.TestWatermarkGreenListReproducibleFromKeyAndPrefix;
+const
+  Vocab = 4000;
+  Key1: UInt64 = $C0FFEE123456789A;
+  Key2: UInt64 = $0123456789ABCDEF;
+  Gamma = 0.25;
+var
+  Tok: integer;
+  G_k1_p5a, G_k1_p5b, G_k1_p7, G_k2_p5: boolean;
+  GreenCount, DiffPrefix, DiffKey: integer;
+begin
+  GreenCount := 0;
+  DiffPrefix := 0;
+  DiffKey := 0;
+  for Tok := 0 to Vocab - 1 do
+  begin
+    // Reproducibility: two independent calls with identical args must agree.
+    G_k1_p5a := TNNetWatermarkLogitsProcessor.IsGreen(Key1, 5, Tok, Gamma);
+    G_k1_p5b := TNNetWatermarkLogitsProcessor.IsGreen(Key1, 5, Tok, Gamma);
+    AssertEquals('green membership reproducible at token ' + IntToStr(Tok),
+      G_k1_p5a, G_k1_p5b);
+    if G_k1_p5a then Inc(GreenCount);
+    // Different prefix token => generally a different partition.
+    G_k1_p7 := TNNetWatermarkLogitsProcessor.IsGreen(Key1, 7, Tok, Gamma);
+    if G_k1_p7 <> G_k1_p5a then Inc(DiffPrefix);
+    // Different key => generally a different partition.
+    G_k2_p5 := TNNetWatermarkLogitsProcessor.IsGreen(Key2, 5, Tok, Gamma);
+    if G_k2_p5 <> G_k1_p5a then Inc(DiffKey);
+  end;
+  // Green fraction tracks Gamma (within sampling noise over 4000 draws).
+  AssertTrue('green fraction near Gamma (got ' + IntToStr(GreenCount) + '/' +
+    IntToStr(Vocab) + ')',
+    (GreenCount > Round(0.20 * Vocab)) and (GreenCount < Round(0.30 * Vocab)));
+  // A changed prefix and a changed key each flip a substantial fraction of
+  // the partition (decorrelated), not a handful of tokens.
+  AssertTrue('different prefix changes the partition (' + IntToStr(DiffPrefix) +
+    ')', DiffPrefix > Round(0.10 * Vocab));
+  AssertTrue('different key changes the partition (' + IntToStr(DiffKey) + ')',
+    DiffKey > Round(0.10 * Vocab));
+end;
+
+// End-to-end statistical test: a token stream synthesized to follow the green
+// list (each token drawn green w.r.t. its predecessor) scores well above the
+// detection threshold, while a uniform-random stream scores around zero.
+// Detection also depends on the key: the WRONG key does not detect.
+procedure TTestNeuralDecode.TestWatermarkDetectsWatermarkedAndRejectsRandom;
+const
+  Vocab = 500;
+  Len = 400;
+  Key: UInt64 = $A5A5A5A5DEADBEEF;
+  WrongKey: UInt64 = $1111111122222222;
+  Gamma = 0.25;
+  Threshold = 4.0;
+var
+  Watermarked, Random: array of integer;
+  I, Tok, Prev: integer;
+  ZMarked, ZRandom, ZWrongKey: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SetLength(Watermarked, Len);
+  SetLength(Random, Len);
+  // First token is unconstrained (no predecessor inside the scored window).
+  Watermarked[0] := System.Random(Vocab);
+  for I := 1 to Len - 1 do
+  begin
+    Prev := Watermarked[I - 1];
+    // Pick the first green token at a random offset (a greedy watermark would
+    // do the same in expectation); guaranteed to find one since ~Gamma*Vocab
+    // tokens are green.
+    Tok := System.Random(Vocab);
+    while not TNNetWatermarkLogitsProcessor.IsGreen(Key, Prev, Tok, Gamma) do
+      Tok := (Tok + 1) mod Vocab;
+    Watermarked[I] := Tok;
+  end;
+  for I := 0 to Len - 1 do Random[I] := System.Random(Vocab);
+
+  ZMarked := DetectWatermark(Watermarked, Key, Gamma);
+  ZRandom := DetectWatermark(Random, Key, Gamma);
+  ZWrongKey := DetectWatermark(Watermarked, WrongKey, Gamma);
+
+  AssertTrue('watermarked text scores above threshold (z=' +
+    FloatToStrF(ZMarked, ffFixed, 8, 3) + ')', ZMarked > Threshold);
+  AssertTrue('uniform-random text scores below threshold (z=' +
+    FloatToStrF(ZRandom, ffFixed, 8, 3) + ')', ZRandom < Threshold);
+  AssertTrue('watermark not detectable with the wrong key (z=' +
+    FloatToStrF(ZWrongKey, ffFixed, 8, 3) + ')', ZWrongKey < Threshold);
+end;
+
+// The processor, in the post-softmax probability domain, must multiply every
+// green probability by exp(Delta) and renormalize (the exact image of
+// logit += Delta), and ProcessRow must use the PREVIOUS token (seeded in
+// Reset, advanced in Commit) to pick the green list.
+procedure TTestNeuralDecode.TestWatermarkProcessorBoostsGreenInProbabilityDomain;
+const
+  Vocab = 64;
+  Delta = 2.0;
+  Gamma = 0.25;
+  Key: UInt64 = $DEADC0DE;
+  Prompt: array[0..1] of integer = (3, 9);
+var
+  Row, Base: TNNetVolume;
+  Proc: TNNetWatermarkLogitsProcessor;
+  I: integer;
+  ExpDelta, Sum, Expected: TNeuralFloat;
+begin
+  Row := TNNetVolume.Create(Vocab, 1, 1);
+  Base := TNNetVolume.Create(Vocab, 1, 1);
+  Proc := TNNetWatermarkLogitsProcessor.Create(Key, Gamma, Delta);
+  try
+    AssertTrue('declares the probability domain', Proc.ExpectsProbabilities());
+    // A normalized starting distribution.
+    Sum := 0;
+    for I := 0 to Vocab - 1 do
+    begin
+      Base.Raw[I] := 0.5 + I; // arbitrary positive weights
+      Sum := Sum + Base.Raw[I];
+    end;
+    for I := 0 to Vocab - 1 do Base.Raw[I] := Base.Raw[I] / Sum;
+
+    Proc.Reset(Prompt);          // FPrevToken := 9 (last prompt token)
+    for I := 0 to Vocab - 1 do Row.Raw[I] := Base.Raw[I];
+    Proc.ProcessRow(Row);
+
+    // Verify against the hand-computed image: green *= exp(Delta), renormalize.
+    ExpDelta := Exp(Delta);
+    Sum := 0;
+    for I := 0 to Vocab - 1 do
+      if TNNetWatermarkLogitsProcessor.IsGreen(Key, 9, I, Gamma) then
+        Sum := Sum + Base.Raw[I] * ExpDelta
+      else
+        Sum := Sum + Base.Raw[I];
+    for I := 0 to Vocab - 1 do
+    begin
+      if TNNetWatermarkLogitsProcessor.IsGreen(Key, 9, I, Gamma) then
+        Expected := Base.Raw[I] * ExpDelta / Sum
+      else
+        Expected := Base.Raw[I] / Sum;
+      AssertEquals('green-boosted prob at token ' + IntToStr(I),
+        Expected, Row.Raw[I], 1e-6);
+    end;
+    // Row remains a valid distribution.
+    Sum := 0;
+    for I := 0 to Vocab - 1 do Sum := Sum + Row.Raw[I];
+    AssertEquals('row sums to 1', 1.0, Sum, 1e-6);
+
+    // Commit advances the predecessor: after emitting token 17 the green list
+    // is now seeded by 17, not 9.
+    Proc.Commit(17);
+    for I := 0 to Vocab - 1 do Row.Raw[I] := Base.Raw[I];
+    Proc.ProcessRow(Row);
+    for I := 0 to Vocab - 1 do
+    begin
+      if TNNetWatermarkLogitsProcessor.IsGreen(Key, 17, I, Gamma) then
+        Expected := Base.Raw[I] * ExpDelta
+      else
+        Expected := Base.Raw[I];
+      // (unnormalized comparison up to the shared constant is enough to prove
+      // the predecessor switched; check the boost direction)
+      if TNNetWatermarkLogitsProcessor.IsGreen(Key, 17, I, Gamma) then
+        AssertTrue('after Commit green token ' + IntToStr(I) + ' boosted',
+          Row.Raw[I] >= Base.Raw[I] - 1e-9)
+      else
+        AssertTrue('after Commit red token ' + IntToStr(I) + ' not boosted up',
+          Row.Raw[I] <= Base.Raw[I] + 1e-9);
+    end;
+  finally
+    Proc.Free;
+    Base.Free;
+    Row.Free;
   end;
 end;
 
