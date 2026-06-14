@@ -20,3 +20,10 @@ QuantileRegression/QuantileRegression
 RandomLabelMemorization/RandomLabelMemorization
 RetentionDualForm/RetentionDualForm
 SpeculativeDecoding/SpeculativeDecoding
+
+# DiffusionMNIST: generated sample grid, MNIST data, compiled binary
+DiffusionMNIST/DiffusionMNIST
+DiffusionMNIST/*.png
+DiffusionMNIST/*-ubyte
+DiffusionMNIST/*.idx*-ubyte
+DiffusionMNIST/*.nn
