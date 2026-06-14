@@ -18,7 +18,7 @@ interface
 
 uses
   Classes, SysUtils, fpcunit, testregistry, fpjson, jsonparser,
-  neuralvolume, neuralhftokenizer, neuralchat, neuralgguf;
+  neuralvolume, neuralhftokenizer, neuralchat, neuralgguf, neuraldecode;
 
 type
   TTestNeuralHFTokenizer = class(TTestCase)
@@ -77,6 +77,17 @@ type
     // byte-level-BPE tokenizer's vocab+merges via SaveTokenizerToGGUF, read it
     // back with LoadFromGGUF, and assert Encode/Decode stay id-identical.
     procedure TestSaveTokenizerToGGUFGpt2RoundTrip;
+    // Token-healing follow-up (a): the byte-level-BPE vocab prefix scan
+    // (PrefixScanVocab) returns EXACTLY the vocab ids whose stored surface
+    // extends a raw fragment, mapped into the byte-alphabet surface space -
+    // including a fragment (' he') that only matches AFTER the space->U+0120
+    // byte-alphabet mapping, plus the surface-mapping helper itself.
+    procedure TestByteLevelHealingPrefixScan;
+    // Token-healing follow-up (b): a multi-token rollback heals a boundary
+    // ('Ġse'+'as' -> 'Ġseas...') that single-token rollback ('as' alone, no
+    // strict extension) provably does NOT, and the default single-token path
+    // is unchanged.
+    procedure TestByteLevelHealingMultiTokenRollback;
   end;
 
   // Tests for the chat templates in neuralchat.pas. The flagship tests
@@ -1358,6 +1369,105 @@ begin
     Gguf.Free;
     Src.Free;
     DeleteFile(GGUFPath);
+  end;
+end;
+
+// Token-healing follow-up (a): byte-level-BPE vocab prefix scan. The tiny
+// GPT-2 byte-level fixture holds 'he'(257),'hells'(289) and 'Ġhe'(372).
+// PrefixScanVocab('he') must return EXACTLY {257,289}; ' he' (leading
+// space) only matches after the space->U+0120('Ġ') byte-alphabet mapping,
+// so it must return {372} and NOT match the bare 'he' tokens. The
+// surface-mapping helper FragmentToSurface is checked directly too.
+procedure TTestNeuralHFTokenizer.TestByteLevelHealingPrefixScan;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TNeuralIntegerArray;
+
+  function SetHas(const A: TNeuralIntegerArray; Id: integer): boolean;
+  var K: integer;
+  begin
+    Result := false;
+    for K := 0 to High(A) do if A[K] = Id then Exit(true);
+  end;
+
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    AssertTrue('fixture is byte-level', Tok.IsByteLevel);
+
+    // 'he' -> exactly {257,289}.
+    Ids := Tok.PrefixScanVocab('he');
+    AssertEquals('he prefix scan count', 2, Length(Ids));
+    AssertTrue('he scan has 257 (he)', SetHas(Ids, 257));
+    AssertTrue('he scan has 289 (hells)', SetHas(Ids, 289));
+    // Every returned id must really extend the fragment in surface space.
+    AssertTrue('he scan id 257 starts with surface',
+      Copy(Tok.IdToToken(Ids[0]), 1, 2) = Tok.FragmentToSurface('he'));
+
+    // ' he' (leading space) only matches via the byte alphabet: space byte
+    // 0x20 maps to U+0120 'Ġ' (a multi-byte UTF-8 surface), so the scan
+    // must return {372} ('Ġhe') and NOT the bare 'he'/'hells' tokens.
+    AssertEquals('space surface is metaspace-Ġ', #$C4#$A0 + 'he',
+      Tok.FragmentToSurface(' he'));
+    Ids := Tok.PrefixScanVocab(' he');
+    AssertEquals(' he prefix scan count', 1, Length(Ids));
+    AssertTrue(' he scan has 372 (Ġhe)', SetHas(Ids, 372));
+    AssertTrue(' he scan excludes bare he(257)', not SetHas(Ids, 257));
+
+    // Empty fragment -> empty result.
+    AssertEquals('empty fragment scan empty', 0,
+      Length(Tok.PrefixScanVocab('')));
+  finally
+    Tok.Free;
+  end;
+end;
+
+// Token-healing follow-up (b): guidance-style multi-token rollback over the
+// byte-level-BPE tokenizer. The prompt ends in the two ids 'Ġse'(270) and
+// 'as'(272). Single-token rollback drops only 'as' (surface 'as'); the only
+// vocab entry with that prefix is 'as' itself (no STRICT extension), so v1
+// healing is provably a no-op -> PrepareTokenHealing returns nil. A 2-token
+// rollback rebuilds the fragment ' seas' (surface 'Ġseas'), which IS
+// strictly extended by 'Ġseashells'(316) -> healing applies, allows exactly
+// {291('Ġseas'),316('Ġseashells')}, trims PromptLen by 2 and reports the
+// first dropped id (270).
+procedure TTestNeuralHFTokenizer.TestByteLevelHealingMultiTokenRollback;
+var
+  Tok: TNeuralHFTokenizer;
+  Toks: TNeuralIntegerArray;
+  C: TNNetTokenHealingConstraint;
+  PromptLen, Dropped: integer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  C := nil;
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    // Prompt: a leading id then 'Ġse','as' as the trailing boundary.
+    SetLength(Toks, 3);
+    Toks[0] := 327;  // 'The'
+    Toks[1] := 270;  // 'Ġse'
+    Toks[2] := 272;  // 'as'
+
+    // Default single-token rollback: 'as' has no strict extension -> skipped.
+    PromptLen := 3;
+    C := PrepareTokenHealing(Tok, Toks, PromptLen, Dropped);
+    AssertTrue('single-token rollback is a no-op here', C = nil);
+    AssertEquals('single-token leaves PromptLen', 3, PromptLen);
+
+    // Two-token rollback heals the spanned boundary.
+    PromptLen := 3;
+    C := PrepareTokenHealing(Tok, Toks, PromptLen, Dropped, 2);
+    AssertTrue('two-token rollback heals', C <> nil);
+    AssertEquals('PromptLen trimmed by two', 1, PromptLen);
+    AssertEquals('first dropped id is Ġse(270)', 270, Dropped);
+    AssertTrue('allows Ġseas(291)', C.TokenAllowed(291));
+    AssertTrue('allows Ġseashells(316)', C.TokenAllowed(316));
+    AssertTrue('disallows unrelated dog(311)', not C.TokenAllowed(311));
+    AssertTrue('disallows bare as(272)', not C.TokenAllowed(272));
+  finally
+    C.Free;
+    Tok.Free;
   end;
 end;
 

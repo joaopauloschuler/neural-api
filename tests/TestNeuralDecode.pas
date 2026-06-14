@@ -167,6 +167,7 @@ type
     // Token healing (guidance-style BPE boundary repair).
     procedure TestPrepareTokenHealingBuildsPrefixSetAndTrims;
     procedure TestTokenHealingChangesFirstTokenVsUnhealed;
+    procedure TestTokenHealingMultiTokenRollback;
     // JSON automaton unit tests (no model).
     procedure TestJSONStateMachineObjectTransitions;
     procedure TestJSONStateMachineStringAndEscapes;
@@ -3693,6 +3694,59 @@ begin
     C := PrepareTokenHealing(Dict, Toks, PromptLen, Dropped);
     AssertTrue('no strict extension - not healed', C = nil);
     AssertEquals('prompt len untouched without extensions', 2, PromptLen);
+  finally
+    C.Free;
+    Dict.Free;
+  end;
+end;
+
+// Token-healing follow-up (b) on the dict path: guidance-style MULTI-TOKEN
+// rollback. On a vocab holding 'ab','c','abc','abcd', a prompt ending in the
+// two tokens 'ab','c' is NOT healed by the default single-token rollback
+// ('c' alone has no strict extension - provable no-op), but a 2-token
+// rollback rebuilds the boundary fragment 'abc', which 'abcd' strictly
+// extends -> healing applies, allows exactly {'abc','abcd'}, trims PromptLen
+// by two and reports the first dropped id ('ab'). The default path stays
+// bit-identical to v1.
+procedure TTestNeuralDecode.TestTokenHealingMultiTokenRollback;
+const
+  Words: array[0..6] of string = ('<eos>', '<pad>', 'ab', 'abc', 'abcd',
+    'c', 'z');
+var
+  Dict: TStringListInt;
+  Toks: TNeuralIntegerArray;
+  C: TNNetTokenHealingConstraint;
+  PromptLen, Dropped, T: integer;
+begin
+  Dict := TStringListInt.Create();
+  C := nil;
+  try
+    Dict.Sorted := true;
+    for T := 0 to High(Words) do Dict.Add(Words[T]);
+    Dict.SaveCurrentPosition();
+
+    // Prompt 'z ab c' -> ids [z, ab, c].
+    Dict.Tokenize('z ab c', Toks);
+    PromptLen := Length(Toks);
+    AssertEquals('prompt tokenizes to 3 ids', 3, PromptLen);
+
+    // Default single-token rollback: 'c' has no strict extension -> skipped.
+    C := PrepareTokenHealing(Dict, Toks, PromptLen, Dropped);
+    AssertTrue('single-token rollback is a no-op', C = nil);
+    AssertEquals('single-token leaves PromptLen', 3, PromptLen);
+
+    // Two-token rollback heals 'ab'+'c' -> 'abc' (extended by 'abcd').
+    PromptLen := Length(Toks);
+    C := PrepareTokenHealing(Dict, Toks, PromptLen, Dropped, 2);
+    AssertTrue('two-token rollback heals', C <> nil);
+    AssertEquals('PromptLen trimmed by two', 1, PromptLen);
+    AssertEquals('first dropped id is ab', Dict.WordToIndex('ab'), Dropped);
+    AssertTrue('allows abc', C.TokenAllowed(Dict.WordToIndex('abc')));
+    AssertTrue('allows abcd', C.TokenAllowed(Dict.WordToIndex('abcd')));
+    AssertTrue('disallows c',
+      not C.TokenAllowed(Dict.WordToIndex('c')));
+    AssertTrue('disallows z',
+      not C.TokenAllowed(Dict.WordToIndex('z')));
   finally
     C.Free;
     Dict.Free;

@@ -629,12 +629,15 @@ rather than acted on.
       static exit layer + confidence threshold; follow-up: per-token
       adaptive exit. Report tokens/sec vs full-depth at matched output
       quality.
-- [ ] Token healing follow-ups (v1 is landed: TNNetTokenHealingConstraint +
-      PrepareTokenHealing + TGenerationConfig.TokenHealing):
-      (a) PrepareTokenHealing is TStringListInt-only — a TNeuralHFTokenizer
-      byte-level-BPE variant needs a vocab prefix-scan helper there;
-      (b) guidance-style multi-token rollback (back up over more than the
-      single last prompt token when the boundary artifact spans merges).
+- [X] Token healing follow-ups (v1 is landed: TNNetTokenHealingConstraint +
+      PrepareTokenHealing + TGenerationConfig.TokenHealing): DONE.
+      (a) DONE — TNeuralHFTokenizer.PrefixScanVocab + FragmentToSurface
+      (byte-alphabet/metaspace surface-space prefix scan) and a
+      PrepareTokenHealing(TNeuralHFTokenizer; ...) overload in neuraldecode.
+      (b) DONE — guidance-style multi-token rollback via an optional
+      RollbackTokens param (default 1 = bit-identical v1 single-token path)
+      on BOTH PrepareTokenHealing overloads; rebuilds the combined boundary
+      fragment from the last N tokens when the artifact spans merges.
 - [ ] Streaming corpus loader with shuffle buffer: the landed packing
       pipeline materializes the whole token stream in RAM (neuraldatasets
       builds one concatenated Stream array). Read large text/token files

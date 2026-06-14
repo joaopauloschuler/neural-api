@@ -323,6 +323,24 @@ type
       class function NormalizeUnicodeText(const Text: string;
         Compose: boolean; Compat: boolean = false): string;
 
+      // TOKEN-HEALING vocab prefix scan (byte-level-BPE sibling of
+      // neuraldecode's TStringListInt PrepareTokenHealing). Returns every
+      // vocabulary id whose STORED SURFACE has Fragment as a prefix, after
+      // mapping Fragment into the SAME surface space the vocab is stored in
+      // (byte-level: each raw byte -> its GPT-2 byte-alphabet codepoint;
+      // metaspace: spaces -> U+2581; WordPiece/plain: raw). So healing can
+      // re-roll the boundary token to any vocab entry that EXTENDS the
+      // trailing prompt fragment. Matching happens in surface space, so a
+      // multi-byte UTF-8 fragment whose bytes map to several alphabet
+      // codepoints still scans correctly. Added (special) tokens are not
+      // included. Empty Fragment -> empty result.
+      function PrefixScanVocab(const Fragment: string): TNeuralIntegerArray;
+      // Maps a raw text Fragment into the storage surface space used by
+      // PrefixScanVocab / FIdToToken (byte alphabet / metaspace / raw).
+      // Exposed for callers that want to build the healing constraint
+      // themselves; mirrors what DecodeToken inverts.
+      function FragmentToSurface(const Fragment: string): string;
+
       function GetVocabSize(): integer;
       function TokenToId(const Token: string): integer; // -1 if absent
       function IdToToken(Id: integer): string;
@@ -3728,6 +3746,52 @@ begin
   SetLength(Arr, Ids.Count);
   for Cnt := 0 to Ids.Count - 1 do Arr[Cnt] := Ids[Cnt];
   Result := Decode(Arr, SkipSpecialTokens);
+end;
+
+function TNeuralHFTokenizer.FragmentToSurface(const Fragment: string): string;
+var
+  Cnt: integer;
+begin
+  if FByteLevel then
+  begin
+    // Each raw byte -> its GPT-2 byte-alphabet codepoint (same mapping
+    // MapPieceToByteLevel applies during encoding; DecodeToken inverts it).
+    Result := '';
+    for Cnt := 1 to Length(Fragment) do
+      Result := Result + CodePointToUTF8(FByteToCP[Ord(Fragment[Cnt])]);
+  end
+  else if FMetaspacePreTok then
+    // Metaspace: spaces are stored as the replacement char (usually U+2581).
+    Result := StringReplace(Fragment, ' ', FMSReplacement, [rfReplaceAll])
+  else
+    // WordPiece / plain: vocab surfaces ARE the raw text.
+    Result := Fragment;
+end;
+
+function TNeuralHFTokenizer.PrefixScanVocab(
+  const Fragment: string): TNeuralIntegerArray;
+var
+  Surface, Cand: string;
+  SurfLen, Id, Count: integer;
+begin
+  SetLength(Result, 0);
+  if Fragment = '' then exit;
+  Surface := FragmentToSurface(Fragment);
+  SurfLen := Length(Surface);
+  if SurfLen = 0 then exit;
+  SetLength(Result, Length(FIdToToken));
+  Count := 0;
+  for Id := 0 to High(FIdToToken) do
+  begin
+    Cand := FIdToToken[Id];
+    if (Cand <> '') and (Length(Cand) >= SurfLen) and
+       (Copy(Cand, 1, SurfLen) = Surface) then
+    begin
+      Result[Count] := Id;
+      Inc(Count);
+    end;
+  end;
+  SetLength(Result, Count);
 end;
 
 function TNeuralHFTokenizer.GetVocabSize(): integer;

@@ -154,7 +154,7 @@ Coded by Claude (AI).
 interface
 
 uses
-  Classes, SysUtils, neuralvolume, neuralnetwork;
+  Classes, SysUtils, neuralvolume, neuralnetwork, neuralhftokenizer;
 
 type
   // Forward declaration: TNNetCFGProcessor (below) holds an unconditional
@@ -1465,10 +1465,39 @@ function GenerateStringStreamedWithProcessors(Session: TNNetStreamingDecoder;
 // (the healed run would provably equal the unhealed one). Pass the
 // constraint to any Constraint-accepting overload (the caller frees it).
 // Linear vocab scan (v1) - fine for the dict sizes the streamed paths use.
+//
+// MULTI-TOKEN ROLLBACK (guidance-style, follow-up b): RollbackTokens backs
+// up over the LAST N prompt tokens, not just one. The dropped tokens' texts
+// are concatenated (left-to-right) into one boundary FRAGMENT, and the
+// first generated token is constrained to vocabulary entries whose text has
+// that whole fragment as a prefix. This heals boundary artifacts that SPAN
+// merges (e.g. the trailing 2-3 tokens together form a surface a single
+// longer vocab token would have produced). RollbackTokens is CLAMPED to
+// PromptLen-1 (healing never empties the prompt). DroppedToken reports the
+// FIRST dropped id (the one the first generated token overwrites); PromptLen
+// is decremented by the effective rollback count. Default RollbackTokens=1
+// reproduces the v1 single-token behavior bit-for-bit.
 // Coded by Claude (AI).
 function PrepareTokenHealing(Dict: TStringListInt;
   const Tokens: TNeuralIntegerArray; var PromptLen: integer;
-  out DroppedToken: integer): TNNetTokenHealingConstraint;
+  out DroppedToken: integer;
+  RollbackTokens: integer = 1): TNNetTokenHealingConstraint; overload;
+
+// TOKEN-HEALING SET-UP for a HuggingFace byte-level-BPE / metaspace /
+// WordPiece tokenizer (follow-up a). Sibling of the TStringListInt overload:
+// backs up over the last RollbackTokens prompt ids, rebuilds their combined
+// boundary fragment via Tokenizer.DecodeToken, and constrains the first
+// generated token to Tokenizer.PrefixScanVocab(fragment) - every vocab id
+// whose STORED SURFACE extends the fragment, matched in the same surface
+// space the vocab is stored in (so multi-byte UTF-8 / byte-alphabet
+// boundaries scan correctly). Same nil-skip rules as the dict overload
+// (PromptLen too short, empty fragment, no STRICT extension). Default
+// RollbackTokens=1 = single-token healing. Caller frees the constraint.
+// Coded by Claude (AI).
+function PrepareTokenHealing(Tokenizer: TNeuralHFTokenizer;
+  const Tokens: TNeuralIntegerArray; var PromptLen: integer;
+  out DroppedToken: integer;
+  RollbackTokens: integer = 1): TNNetTokenHealingConstraint; overload;
 
 // A TGenerationConfig with every knob OFF: greedy (nil sampler),
 // Temperature 1.0, no penalties/processors/constraint, no stop
@@ -3630,20 +3659,30 @@ end;
 
 function PrepareTokenHealing(Dict: TStringListInt;
   const Tokens: TNeuralIntegerArray; var PromptLen: integer;
-  out DroppedToken: integer): TNNetTokenHealingConstraint;
+  out DroppedToken: integer;
+  RollbackTokens: integer = 1): TNNetTokenHealingConstraint;
 var
   LastText, CandText: string;
   Allowed: TNeuralIntegerArray;
-  TokenCnt, AllowedCount, VocabCount, LastLen: integer;
+  TokenCnt, AllowedCount, VocabCount, LastLen, Roll, RollIdx, Tok: integer;
   HasStrictExtension: boolean;
 begin
   Result := nil;
   DroppedToken := -1;
   if PromptLen < 2 then exit; // healing would empty the prompt
   VocabCount := Dict.GetVocabCount();
-  if (Tokens[PromptLen - 1] < 0) or
-     (Tokens[PromptLen - 1] >= VocabCount) then exit;
-  LastText := Dict.DeTokenize(Tokens[PromptLen - 1]);
+  // Effective rollback: at least 1, never enough to empty the prompt.
+  Roll := RollbackTokens;
+  if Roll < 1 then Roll := 1;
+  if Roll > PromptLen - 1 then Roll := PromptLen - 1;
+  // Rebuild the combined boundary fragment from the last Roll tokens.
+  LastText := '';
+  for RollIdx := PromptLen - Roll to PromptLen - 1 do
+  begin
+    Tok := Tokens[RollIdx];
+    if (Tok < 0) or (Tok >= VocabCount) then exit; // out-of-dict id: skip
+    LastText := LastText + Dict.DeTokenize(Tok);
+  end;
   LastLen := Length(LastText);
   if LastLen = 0 then exit; // byte-level/special oddity: no-op fallback
   SetLength(Allowed, VocabCount);
@@ -3661,12 +3700,56 @@ begin
     end;
   end;
   // Without a strict extension the only allowed continuation re-emits the
-  // dropped token - the healed run provably equals the unhealed one, so
+  // dropped fragment - the healed run provably equals the unhealed one, so
   // healing is skipped (PromptLen untouched).
   if not HasStrictExtension then exit;
   SetLength(Allowed, AllowedCount);
-  DroppedToken := Tokens[PromptLen - 1];
-  Dec(PromptLen);
+  DroppedToken := Tokens[PromptLen - Roll];
+  Dec(PromptLen, Roll);
+  Result := TNNetTokenHealingConstraint.Create(Allowed);
+end;
+
+function PrepareTokenHealing(Tokenizer: TNeuralHFTokenizer;
+  const Tokens: TNeuralIntegerArray; var PromptLen: integer;
+  out DroppedToken: integer;
+  RollbackTokens: integer = 1): TNNetTokenHealingConstraint;
+var
+  Fragment, CandSurface, FragSurface: string;
+  Allowed: TNeuralIntegerArray;
+  Roll, RollIdx, FragLen, Cnt: integer;
+  HasStrictExtension: boolean;
+begin
+  Result := nil;
+  DroppedToken := -1;
+  if PromptLen < 2 then exit; // healing would empty the prompt
+  Roll := RollbackTokens;
+  if Roll < 1 then Roll := 1;
+  if Roll > PromptLen - 1 then Roll := PromptLen - 1;
+  // Rebuild the combined boundary fragment (raw text) from the last Roll ids.
+  Fragment := '';
+  for RollIdx := PromptLen - Roll to PromptLen - 1 do
+    Fragment := Fragment + Tokenizer.DecodeToken(Tokens[RollIdx]);
+  if Fragment = '' then exit; // special/empty surface: no-op fallback
+  // Surface-space prefix scan over the byte-level/metaspace vocabulary.
+  Allowed := Tokenizer.PrefixScanVocab(Fragment);
+  if Length(Allowed) = 0 then exit;
+  // Require a STRICT extension - else the only allowed continuation re-emits
+  // the dropped fragment and the healed run equals the unhealed one.
+  FragSurface := Tokenizer.FragmentToSurface(Fragment);
+  FragLen := Length(FragSurface);
+  HasStrictExtension := false;
+  for Cnt := 0 to High(Allowed) do
+  begin
+    CandSurface := Tokenizer.IdToToken(Allowed[Cnt]);
+    if Length(CandSurface) > FragLen then
+    begin
+      HasStrictExtension := true;
+      break;
+    end;
+  end;
+  if not HasStrictExtension then exit;
+  DroppedToken := Tokens[PromptLen - Roll];
+  Dec(PromptLen, Roll);
   Result := TNNetTokenHealingConstraint.Create(Allowed);
 end;
 
