@@ -32,7 +32,42 @@ type
     procedure HandleError(const S: string);
   end;
 
+  // Deterministic, counter-addressed training-data source for the gradient
+  // accumulation equivalence test. It owns a fixed pool of (input,target)
+  // samples and, given the within-micro-batch index and the owning Fit's
+  // CurrentAccumulationStep, returns the GLOBAL sample of an effective batch.
+  // This makes "N micro-batches of M" draw the SAME M*N samples in the SAME
+  // order as "one true batch of M*N", which is what the equivalence proof needs.
+  TAccumDataSource = class
+  public
+    FFit: TNeuralFitBase;
+    FMicroBatch: integer;          // M, the per-micro-batch size
+    FPoolIn, FPoolOut: array of TNNetVolume;
+    constructor Create(pMicroBatch, pPoolSize, pInDepth, pOutDepth: integer);
+    destructor Destroy; override;
+    procedure GetPair(Idx, ThreadId: integer; vInput, vOutput: TNNetVolume);
+  end;
+
+  // OnAfterStep probe for the EMA tests. Fires inside the epoch loop right
+  // after each optimizer step (and thus after the per-step EMA update), BEFORE
+  // the end-of-Fit FAvgWeight overwrite of the live net. On every step it
+  // snapshots the LIVE last-layer weights and the EMA SHADOW last-layer weights,
+  // so after Fit the snapshots hold the final-step values that must satisfy the
+  // EMA invariants (which the post-Fit FNN, overwritten by FAvgWeight, does not).
+  TEMAStepProbe = class
+  public
+    FFit: TNeuralFitBase;
+    Live, Shadow: TNNetVolume;   // last-step snapshots (owned)
+    HadShadow: boolean;
+    constructor Create(pFit: TNeuralFitBase);
+    destructor Destroy; override;
+    procedure AfterStep(Sender: TObject);
+  end;
+
   TTestNeuralFit = class(TTestCase)
+  private
+    function RunAccumFit(MicroBatch, AccumSteps, Epochs: integer;
+      out FinalLoss: TNeuralFloat): TNNetVolume;
   published
     // Optimizer tests
     procedure TestSGDOptimizerCreation;
@@ -82,6 +117,24 @@ type
     procedure TestLabelSmoothingDefaultZero;
     procedure TestLabelSmoothingTargetMath;
     procedure TestLabelSmoothingZeroIsBitIdentical;
+
+    // Gradient accumulation tests
+    procedure TestAccumulationStepsDefaultsToOne;
+    procedure TestAccumulationStepsClampsBelowOne;
+    procedure TestAccumulationEqualsBigBatch;
+
+    // EMA shadow-weights tests
+    procedure TestEMADefaultsOff;
+    procedure TestEMADecayZeroEqualsLive;
+    procedure TestEMAConvexBlend;
+    procedure TestEMAApplyRestoreRoundTrip;
+    procedure TestEMADisabledIsBitIdentical;
+
+    // Parameter groups (PyTorch param_groups port)
+    procedure TestParamGroupDefaultsOff;
+    procedure TestL2DecayExcludeBiasKeepsBias;
+    procedure TestL2DecayDefaultDecaysBias;
+    procedure TestNormLayerLearningRateMultiplier;
   end;
 
 implementation
@@ -958,6 +1011,616 @@ begin
     Reference.Free;
     Target.Free;
     Fit.Free;
+  end;
+end;
+
+constructor TAccumDataSource.Create(pMicroBatch, pPoolSize, pInDepth,
+  pOutDepth: integer);
+var
+  S, D: integer;
+begin
+  inherited Create;
+  FMicroBatch := pMicroBatch;
+  SetLength(FPoolIn, pPoolSize);
+  SetLength(FPoolOut, pPoolSize);
+  // Deterministic content: independent of the global RNG so both runs see the
+  // exact same samples regardless of how many times RefreshDropoutMask draws.
+  for S := 0 to pPoolSize - 1 do
+  begin
+    FPoolIn[S] := TNNetVolume.Create(pInDepth, 1, 1);
+    FPoolOut[S] := TNNetVolume.Create(pOutDepth, 1, 1);
+    for D := 0 to pInDepth - 1 do
+      FPoolIn[S].FData[D] := Sin(0.7 * S + 1.3 * D) * 0.5 + 0.5;
+    for D := 0 to pOutDepth - 1 do
+      FPoolOut[S].FData[D] := Cos(0.9 * S + 0.5 * D) * 0.5 + 0.5;
+  end;
+end;
+
+destructor TAccumDataSource.Destroy;
+var
+  S: integer;
+begin
+  for S := 0 to High(FPoolIn) do
+  begin
+    FPoolIn[S].Free;
+    FPoolOut[S].Free;
+  end;
+  inherited Destroy;
+end;
+
+procedure TAccumDataSource.GetPair(Idx, ThreadId: integer;
+  vInput, vOutput: TNNetVolume);
+var
+  Global: integer;
+begin
+  // Idx is the 1-based within-micro-batch index; CurrentAccumulationStep is the
+  // 0-based micro-batch number inside the accumulation group. Together they
+  // address the global sample of an effective FMicroBatch*AccumulationSteps
+  // batch. With AccumulationSteps = 1 this is just (Idx - 1), so a true big
+  // batch and an accumulated batch enumerate the identical sample sequence.
+  Global := FFit.CurrentAccumulationStep * FMicroBatch + (Idx - 1);
+  vInput.Copy(FPoolIn[Global]);
+  vOutput.Copy(FPoolOut[Global]);
+end;
+
+// Trains a fresh, deterministically-initialized net with the given micro-batch
+// size and AccumulationSteps for Epochs epochs, returning the last-layer weight
+// vector (live, no best-model reload) and the final training loss. The
+// effective batch is always MicroBatch*AccumSteps and the pool/order is fixed,
+// so two configs with the same product MUST converge to the same weights.
+function TTestNeuralFit.RunAccumFit(MicroBatch, AccumSteps, Epochs: integer;
+  out FinalLoss: TNeuralFloat): TNNetVolume;
+var
+  Net: TNNet;
+  Fit: TNeuralFit;
+  Source: TAccumDataSource;
+  EffectiveBatch: integer;
+begin
+  EffectiveBatch := MicroBatch * AccumSteps;
+  // Identical initial weights for every call.
+  RandSeed := 424242;
+  Net := TNNet.Create();
+  Net.AddLayer([
+    TNNetInput.Create(3),
+    TNNetFullConnectLinear.Create(4),
+    TNNetFullConnectLinear.Create(2)
+  ]);
+  // Plain SGD with no inertia keeps the step a pure sum of per-sample deltas,
+  // so the summed-delta equivalence is exercised without momentum book-keeping.
+  Net.SetLearningRate(0.01, 0.0);
+
+  Source := TAccumDataSource.Create(MicroBatch, EffectiveBatch, 3, 2);
+  Fit := TNeuralFit.Create;
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;            // deterministic reduction order
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;       // hold LR fixed
+    Fit.StaircaseEpochs := 1;
+    Fit.Inertia := 0.0;               // pure SGD, no momentum
+    Fit.L2Decay := 0;                 // no weight decay term
+    Fit.ClipNorm := 0;                // disable per-layer norm clipping...
+    Fit.ClipDelta := 0;               // ...and delta clipping so deltas pass through raw
+    Fit.MinBackpropagationError := 0;
+    Fit.MinBackpropagationErrorProportion := 0; // backprop EVERY sample (no skip)
+    Fit.LoadBestAtEnd := False;       // keep live trained weights
+    Fit.AccumulationSteps := AccumSteps;
+    Source.FFit := Fit;
+    Fit.EnableDefaultLoss();
+    // One optimizer step per epoch: the per-epoch loop runs
+    // (TrainingCnt div BatchSize) = 1 RunTrainingBatch, and each RunTrainingBatch
+    // runs AccumSteps micro-batches => exactly EffectiveBatch samples per step.
+    Fit.FitLoading(Net, {TrainingCnt=}MicroBatch, 0, 0, {BatchSize=}MicroBatch,
+      Epochs, {$IFDEF FPC}@{$ENDIF}Source.GetPair, nil, nil);
+    FinalLoss := Fit.CurrentTrainingError;
+    Result := TNNetVolume.Create();
+    Result.Copy(Net.GetLastLayer.Neurons[0].Weights);
+  finally
+    Fit.Free;
+    Source.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAccumulationStepsDefaultsToOne;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    AssertEquals('AccumulationSteps must default to 1 (today''s behaviour)',
+      1, Fit.AccumulationSteps);
+    AssertEquals('CurrentAccumulationStep must start at 0',
+      0, Fit.CurrentAccumulationStep);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAccumulationStepsClampsBelowOne;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    Fit.AccumulationSteps := 0;
+    AssertEquals('AccumulationSteps <= 0 must clamp to 1', 1,
+      Fit.AccumulationSteps);
+    Fit.AccumulationSteps := -5;
+    AssertEquals('Negative AccumulationSteps must clamp to 1', 1,
+      Fit.AccumulationSteps);
+    Fit.AccumulationSteps := 4;
+    AssertEquals('Valid AccumulationSteps must round-trip', 4,
+      Fit.AccumulationSteps);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestAccumulationEqualsBigBatch;
+var
+  WAccum, WBig: TNNetVolume;
+  LossAccum, LossBig: TNeuralFloat;
+  I: integer;
+const
+  cMicroBatch = 3;
+  cAccumSteps = 4;   // effective batch = 12
+  cEpochs = 8;
+begin
+  WAccum := nil;
+  WBig := nil;
+  try
+    // Accumulated: 4 micro-batches of 3 => effective batch 12 per optimizer step.
+    WAccum := RunAccumFit(cMicroBatch, cAccumSteps, cEpochs, LossAccum);
+    // True big batch: one batch of 12, AccumulationSteps = 1.
+    WBig := RunAccumFit(cMicroBatch * cAccumSteps, 1, cEpochs, LossBig);
+
+    AssertEquals('Weight vector size must match', WBig.Size, WAccum.Size);
+    // The framework SUMS deltas across a batch (it never averages), so N
+    // micro-batches of M produce the identical summed delta as one batch of
+    // N*M. After many compounding steps the weights must coincide to tight
+    // single-precision tolerance (only float-add ordering differs).
+    for I := 0 to WBig.Size - 1 do
+      AssertEquals('Accumulated weights must match true big-batch weights',
+        WBig.FData[I], WAccum.FData[I], 1e-5);
+    // Loss bookkeeping must also match: accumulation reports the loss over the
+    // full effective batch, exactly like the true big batch.
+    AssertEquals('Final training error must match the big-batch run',
+      LossBig, LossAccum, 1e-5);
+  finally
+    WAccum.Free;
+    WBig.Free;
+  end;
+end;
+
+constructor TEMAStepProbe.Create(pFit: TNeuralFitBase);
+begin
+  inherited Create;
+  FFit := pFit;
+  Live := TNNetVolume.Create();
+  Shadow := TNNetVolume.Create();
+  HadShadow := False;
+end;
+
+destructor TEMAStepProbe.Destroy;
+begin
+  Live.Free;
+  Shadow.Free;
+  inherited Destroy;
+end;
+
+procedure TEMAStepProbe.AfterStep(Sender: TObject);
+var
+  N: TNNet;
+begin
+  // Snapshot the LIVE weights as they stand right after this step's update.
+  Live.Copy(FFit.NN.GetLastLayer.Neurons[0].Weights);
+  N := FFit.EMAShadowNet();
+  if Assigned(N) then
+  begin
+    Shadow.Copy(N.GetLastLayer.Neurons[0].Weights);
+    HadShadow := True;
+  end;
+end;
+
+// Runs a short, deterministic Fit on Net with EMA configured by pEnable/pDecay.
+// Captures the LAST-step LIVE and EMA SHADOW last-layer weights via an
+// OnAfterStep probe (BEFORE the end-of-Fit FAvgWeight overwrite). Returns the
+// live snapshot in WLive and, when EMA produced a shadow, the shadow in WShadow
+// (nil otherwise). Mirrors RunFit's determinism recipe.
+procedure RunFitEMA(Net: TNNet; pEnable: boolean; pDecay: TNeuralFloat;
+  out WLive, WShadow: TNNetVolume);
+var
+  Fit: TNeuralFit;
+  Pairs: TNNetVolumePairList;
+  Probe: TEMAStepProbe;
+begin
+  WShadow := nil;
+  Pairs := BuildFitPairs();
+  RandSeed := 100;
+  Fit := TNeuralFit.Create;
+  Probe := TEMAStepProbe.Create(Fit);
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.LoadBestAtEnd := False;
+    Fit.EnableEMA := pEnable;
+    Fit.EMADecay := pDecay;
+    Fit.OnAfterStep := {$IFDEF FPC}@{$ENDIF}Probe.AfterStep;
+    Fit.Fit(Net, Pairs, nil, nil, 4, 20);
+    WLive := TNNetVolume.Create();
+    WLive.Copy(Probe.Live);
+    if Probe.HadShadow then
+    begin
+      WShadow := TNNetVolume.Create();
+      WShadow.Copy(Probe.Shadow);
+    end;
+  finally
+    Probe.Free;
+    Fit.Free;
+    Pairs.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMADefaultsOff;
+var
+  Fit: TNeuralFit;
+begin
+  Fit := TNeuralFit.Create;
+  try
+    // EMA must be OPT-IN so the default training path is unchanged.
+    AssertFalse('EnableEMA must default to false', Fit.EnableEMA);
+    AssertTrue('EMAShadowNet must be nil before any update',
+      Fit.EMAShadowNet() = nil);
+    // ApplyEMAWeights is a no-op when EMA is disabled.
+    AssertFalse('ApplyEMAWeights must be a no-op when EMA is off',
+      Fit.ApplyEMAWeights());
+    Fit.EnableEMA := True;
+    AssertTrue('EnableEMA must be settable', Fit.EnableEMA);
+    Fit.EMADecay := 0.9999;
+    // EMADecay is a single, so compare at single precision.
+    AssertEquals('EMADecay must round-trip', 0.9999, Fit.EMADecay, 1e-6);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMADecayZeroEqualsLive;
+var
+  Net: TNNet;
+  WLive, WShadow: TNNetVolume;
+  I: integer;
+begin
+  WLive := nil;
+  WShadow := nil;
+  Net := BuildFitNet();
+  try
+    // With decay = 0 the EMA degenerates to a plain copy: after the LAST update
+    // shadow := 0*shadow + 1*live = live. So the shadow must equal the final
+    // live weights exactly.
+    RunFitEMA(Net, True, 0.0, WLive, WShadow);
+    AssertTrue('Shadow net must exist after training with EMA on',
+      Assigned(WShadow));
+    AssertEquals('Shadow size must match live size', WLive.Size, WShadow.Size);
+    for I := 0 to WLive.Size - 1 do
+      AssertEquals('decay=0 shadow must equal the live weights exactly',
+        WLive.FData[I], WShadow.FData[I], 0);
+  finally
+    WLive.Free;
+    WShadow.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMAConvexBlend;
+var
+  NetInit, Net: TNNet;
+  WInit, WLive, WShadow: TNNetVolume;
+  I: integer;
+  Lo, Hi, Sh: TNeuralFloat;
+  SawStrictlyBetween: boolean;
+begin
+  WInit := nil;
+  WLive := nil;
+  WShadow := nil;
+  // Snapshot the initialization weights (same seed as the trained net).
+  NetInit := BuildFitNet();
+  Net := BuildFitNet();
+  try
+    WInit := TNNetVolume.Create();
+    WInit.Copy(NetInit.GetLastLayer.Neurons[0].Weights);
+
+    // 0 < decay < 1 over several updates: the shadow is a convex blend of the
+    // initial seed and the live weights. It must lie BETWEEN them and equal
+    // neither (for at least one coordinate that actually moved).
+    RunFitEMA(Net, True, 0.9, WLive, WShadow);
+    AssertTrue('Shadow net must exist', Assigned(WShadow));
+
+    SawStrictlyBetween := False;
+    for I := 0 to WLive.Size - 1 do
+    begin
+      Lo := Min(WInit.FData[I], WLive.FData[I]);
+      Hi := Max(WInit.FData[I], WLive.FData[I]);
+      Sh := WShadow.FData[I];
+      // Shadow stays within the [init, live] interval (small epsilon for fp).
+      AssertTrue('EMA shadow must lie within [init, live]',
+        (Sh >= Lo - 1e-6) and (Sh <= Hi + 1e-6));
+      // Strict blend: for a coordinate that moved, the shadow differs from BOTH
+      // endpoints (it lags the live weights but has left the init).
+      if (Abs(WLive.FData[I] - WInit.FData[I]) > 1e-4) then
+        if (Abs(Sh - WLive.FData[I]) > 1e-7) and
+           (Abs(Sh - WInit.FData[I]) > 1e-7) then
+          SawStrictlyBetween := True;
+    end;
+    AssertTrue('EMA shadow must be a STRICT blend (not equal to init or live) '
+      + 'for at least one moved weight', SawStrictlyBetween);
+  finally
+    WInit.Free;
+    WLive.Free;
+    WShadow.Free;
+    NetInit.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMAApplyRestoreRoundTrip;
+var
+  Net: TNNet;
+  Pairs: TNNetVolumePairList;
+  Fit: TNeuralFit;
+  Before, Swapped, After: TNNetVolume;
+  ShadowRef: TNNetVolume;
+  I: integer;
+  Applied: boolean;
+begin
+  Before := nil;
+  Swapped := nil;
+  After := nil;
+  ShadowRef := nil;
+  Net := BuildFitNet();
+  Pairs := BuildFitPairs();
+  Fit := TNeuralFit.Create;
+  try
+    Fit.HideMessages;
+    Fit.Verbose := False;
+    Fit.MaxThreadNum := 1;
+    Fit.InitialLearningRate := 0.01;
+    Fit.LearningRateDecay := 0;
+    Fit.StaircaseEpochs := 1;
+    Fit.LoadBestAtEnd := False;
+    Fit.EnableEMA := True;
+    Fit.EMADecay := 0.9; // shadow != live so the swap is observable
+    RandSeed := 100;
+    Fit.Fit(Net, Pairs, nil, nil, 4, 20);
+
+    // Capture the live training weights before any swap.
+    Before := TNNetVolume.Create();
+    Before.Copy(Net.GetLastLayer.Neurons[0].Weights);
+    // Capture what the shadow holds (the expected post-swap content).
+    ShadowRef := TNNetVolume.Create();
+    ShadowRef.Copy(Fit.EMAShadowNet().GetLastLayer.Neurons[0].Weights);
+
+    // Swap EMA weights into the live net.
+    Applied := Fit.ApplyEMAWeights();
+    AssertTrue('ApplyEMAWeights must succeed when EMA is initialized', Applied);
+    Swapped := TNNetVolume.Create();
+    Swapped.Copy(Net.GetLastLayer.Neurons[0].Weights);
+    for I := 0 to Swapped.Size - 1 do
+      AssertEquals('After swap the live net must hold the EMA shadow weights',
+        ShadowRef.FData[I], Swapped.FData[I], 0);
+
+    // A nested ApplyEMAWeights must be ignored (returns false, no change).
+    AssertFalse('Nested ApplyEMAWeights must be ignored',
+      Fit.ApplyEMAWeights());
+
+    // Restore: the live training weights must be bit-identical to before.
+    Fit.RestoreLiveWeights();
+    After := TNNetVolume.Create();
+    After.Copy(Net.GetLastLayer.Neurons[0].Weights);
+    AssertEquals('Restore size must match', Before.Size, After.Size);
+    for I := 0 to Before.Size - 1 do
+      AssertEquals('Apply-then-restore must leave LIVE weights bit-identical',
+        Before.FData[I], After.FData[I], 0);
+  finally
+    Before.Free;
+    Swapped.Free;
+    After.Free;
+    ShadowRef.Free;
+    Fit.Free;
+    Pairs.Free;
+    Net.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestEMADisabledIsBitIdentical;
+var
+  NetA, NetB, NetOn: TNNet;
+  WA, WB, WOn, DummyA, DummyB, ShadowOn: TNNetVolume;
+  I: integer;
+  ErrBeforeOn, ErrAfterOn: TNeuralFloat;
+begin
+  WA := nil; WB := nil; WOn := nil;
+  DummyA := nil; DummyB := nil; ShadowOn := nil;
+  NetA := BuildFitNet();
+  NetB := BuildFitNet();    // same seed -> identical init
+  NetOn := BuildFitNet();
+  try
+    // (1) Zero behaviour change with EMA OFF (the default): two EMA-disabled
+    // runs of the same net/data must be BIT-FOR-BIT identical. The EMA code
+    // path is fully short-circuited when EnableEMA is false, so adding the
+    // feature does not perturb the default training path at all.
+    RunFitEMA(NetA, False, 0.999, WA, DummyA);
+    RunFitEMA(NetB, False, 0.999, WB, DummyB);
+    AssertTrue('No shadow must exist with EMA off', DummyA = nil);
+    AssertTrue('No shadow must exist with EMA off', DummyB = nil);
+    AssertEquals('Live weight size must match', WA.Size, WB.Size);
+    for I := 0 to WA.Size - 1 do
+      AssertEquals('EMA-off must be bit-identical run-to-run '
+        + '(default path unchanged by the feature)',
+        WA.FData[I], WB.FData[I], 0);
+
+    // (2) EMA is a side-channel that never feeds back into the live weights or
+    // deltas (the math is untouched; only the one lazy shadow clone draws from
+    // the global RNG, which can reorder the batch shuffle). So an EMA-ON run
+    // must still LEARN normally: the live error after training is well below
+    // the error before training.
+    ErrBeforeOn := FitNetMSE(NetOn);
+    RunFitEMA(NetOn, True, 0.999, WOn, ShadowOn);
+    ErrAfterOn := FitNetMSE(NetOn);
+    AssertTrue('A shadow must exist when EMA is on', Assigned(ShadowOn));
+    AssertTrue('EMA-on training must still reduce the error ('
+      + FloatToStr(ErrAfterOn) + ' vs ' + FloatToStr(ErrBeforeOn) + ')',
+      ErrAfterOn < ErrBeforeOn);
+  finally
+    WA.Free; WB.Free; WOn.Free;
+    DummyA.Free; DummyB.Free; ShadowOn.Free;
+    NetA.Free; NetB.Free; NetOn.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestParamGroupDefaultsOff;
+var
+  Fit: TNeuralFit;
+begin
+  // The parameter-group feature must be OFF by default so existing training
+  // paths are unchanged.
+  Fit := TNeuralFit.Create();
+  try
+    AssertFalse('ExcludeBiasAndNormFromWeightDecay must default OFF',
+      Fit.ExcludeBiasAndNormFromWeightDecay);
+    AssertEquals('NormAndBiasLearningRateMul must default to 1.0',
+      1.0, Fit.NormAndBiasLearningRateMul, 0);
+  finally
+    Fit.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestL2DecayDefaultDecaysBias;
+var
+  NN: TNNet;
+  OldW, OldB, Factor: TNeuralFloat;
+const
+  cL2 = 0.1;
+  cLR = 0.5;
+begin
+  // DEFAULT (off) path: ComputeL2Decay() / ComputeL2Decay(False) must be
+  // bit-identical to the legacy behaviour, which shrinks BOTH weights AND the
+  // bias by (1 - L2Decay*LearningRate).
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.SetL2Decay(cL2);
+    NN.SetLearningRate(cLR, 0.9);
+    Factor := 1 - (cL2 * cLR);
+
+    OldW := NN.Layers[1].Neurons[0].Weights.FData[0];
+    OldB := NN.Layers[1].Neurons[0].BiasWeight;
+
+    NN.ComputeL2Decay(False); // ExcludeBias = false == legacy path
+
+    AssertEquals('Default path must shrink weight by (1-L2*LR)',
+      OldW * Factor, NN.Layers[1].Neurons[0].Weights.FData[0], 1e-7);
+    AssertEquals('Default path must ALSO shrink the bias (legacy behaviour)',
+      OldB * Factor, NN.Layers[1].Neurons[0].BiasWeight, 1e-7);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestL2DecayExcludeBiasKeepsBias;
+var
+  NN: TNNet;
+  OldW, OldB, OldLN, Factor: TNeuralFloat;
+  I: integer;
+  OldWAll: TNNetVolume;
+const
+  cL2 = 0.1;
+  cLR = 0.5;
+begin
+  // PARAMETER-GROUP path: with ExcludeBias = true the matrix weights are still
+  // decayed exactly by (1 - L2*LR), but the bias term receives NO shrinkage,
+  // and the normalization layer's gain is untouched as well.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  OldWAll := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetLayerNorm.Create());
+    NN.SetL2Decay(cL2);
+    NN.SetLearningRate(cLR, 0.9);
+    Factor := 1 - (cL2 * cLR);
+
+    OldWAll.Copy(NN.Layers[1].Neurons[0].Weights);
+    OldW := OldWAll.FData[0];
+    OldB := NN.Layers[1].Neurons[0].BiasWeight;
+    OldLN := NN.Layers[2].Neurons[0].Weights.FData[0];
+
+    NN.ComputeL2Decay(True); // ExcludeBias
+
+    // (a) matrix weights: still decayed exactly.
+    for I := 0 to OldWAll.Size - 1 do
+      AssertEquals('Excluded path must still decay matrix weights',
+        OldWAll.FData[I] * Factor,
+        NN.Layers[1].Neurons[0].Weights.FData[I], 1e-7);
+    AssertEquals('Weight[0] sanity', OldW * Factor,
+      NN.Layers[1].Neurons[0].Weights.FData[0], 1e-7);
+    // (b) bias: NO shrinkage (the whole point of the param group).
+    AssertEquals('Bias must NOT be decayed when excluded', OldB,
+      NN.Layers[1].Neurons[0].BiasWeight, 0);
+    // (c) norm-layer gain: untouched.
+    AssertEquals('Norm-layer gain must NOT be decayed', OldLN,
+      NN.Layers[2].Neurons[0].Weights.FData[0], 0);
+  finally
+    OldWAll.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralFit.TestNormLayerLearningRateMultiplier;
+var
+  NN: TNNet;
+  Scaled: integer;
+const
+  cLR = 0.5;
+  cMul = 0.1;
+begin
+  // The per-group LR multiplier scales ONLY normalization layers that carry
+  // trainable neurons; ordinary weight layers keep the base learning rate.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetLayerNorm.Create());
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.SetLearningRate(cLR, 0.9);
+
+    Scaled := NN.ScaleNormLayerLearningRate(cMul);
+
+    AssertEquals('Exactly one norm layer must be scaled', 1, Scaled);
+    AssertEquals('FullConnect LR must stay at base', cLR,
+      NN.Layers[1].LearningRate, 0);
+    AssertEquals('Norm-layer LR must be multiplied', cLR * cMul,
+      NN.Layers[2].LearningRate, 1e-7);
+    AssertEquals('Second FullConnect LR must stay at base', cLR,
+      NN.Layers[3].LearningRate, 0);
+
+    // Mul = 1 is a no-op and reports zero scaled layers.
+    NN.SetLearningRate(cLR, 0.9);
+    AssertEquals('Mul=1 must be a no-op', 0,
+      NN.ScaleNormLayerLearningRate(1.0));
+    AssertEquals('Norm-layer LR unchanged by no-op', cLR,
+      NN.Layers[2].LearningRate, 0);
+  finally
+    NN.Free;
   end;
 end;
 

@@ -1,0 +1,11 @@
+{
+ "peft_type": "LORA",
+ "r": 2,
+ "lora_alpha": 8.0,
+ "lora_dropout": 0.0,
+ "bias": "none",
+ "target_modules": [
+  "proj"
+ ],
+ "task_type": "FEATURE_EXTRACTION"
+}

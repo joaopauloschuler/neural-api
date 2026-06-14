@@ -35,8 +35,12 @@ sequence in the generated region and trimmed from the reply), or after
 --max-new-tokens.
 
 The model is always built with pInferenceOnly=true (the REPL never trains;
-~1/3 the memory) and --int8 adds pQuantizeInt8 weight-only int8 storage
-(~1/4 the FP32 weight bytes).
+frees the per-neuron gradient/momentum buffers). Weight-only int8 storage
+(pQuantizeInt8) is the DEFAULT because the FP32 forward path keeps ~3 copies
+of every weight matrix (per-neuron + concatenated + interleaved caches), so
+a 0.5B model can need >10GB resident; int8 holds ~1/4 of ONE FP32 copy and
+dequantizes a layer at a time. Pass --fp32 to opt back into full precision
+(much more RAM) when you have the memory and want bit-exact FP32 outputs.
 
 REPL commands: /exit, /reset (clear history), /system <msg> (set the system
 prompt; raises on formats without a system role, e.g. gemma/mistral).
@@ -75,6 +79,12 @@ uses
   neuralvolume, neuralnetwork, neuralpretrained, neuralhftokenizer,
   neuralchat, neuraldecode;
 
+const
+  // Default --ctx when the user gives none. Kept modest because build memory
+  // is O(ctx^2) (a SeqLen x SeqLen score buffer per head per layer); the full
+  // checkpoint context (e.g. 32768) would OOM at load. See the load path.
+  DefaultCtxCap = 2048;
+
 type
   TChatOptions = record
     ModelDir: string;
@@ -83,6 +93,7 @@ type
     MaxNewTokens: integer;
     Temperature: TNeuralFloat;   // 1.0 = off
     TopK: integer;               // 0 = off
+    WeightedTopK: boolean;       // true = weighted (HF) top-k, false = uniform
     TopP: TNeuralFloat;          // 0 = off
     MinP: TNeuralFloat;          // 0 = off
     RepetitionPenalty: TNeuralFloat; // 1.0 = off
@@ -107,6 +118,7 @@ begin
   WriteLn('Options:');
   WriteLn('  --temperature X       sampling temperature (default 1.0)');
   WriteLn('  --top-k N             top-k sampling (uniform draw among top K)');
+  WriteLn('  --weighted-top-k N    top-k sampling (HF: weighted draw among top K)');
   WriteLn('  --top-p X             nucleus sampling (weighted draw)');
   WriteLn('  --min-p X             min-p sampling (weighted draw)');
   WriteLn('  --repetition-penalty X  CTRL repetition penalty (default 1.0)');
@@ -114,10 +126,12 @@ begin
   WriteLn('  --presence-penalty X    presence penalty (default 0)');
   WriteLn('  --max-new-tokens N    reply length cap (default 128)');
   WriteLn('  --seed N              RNG seed (default: randomize)');
-  WriteLn('  --ctx N               context window to build (default: model max)');
+  WriteLn('  --ctx N               context window (default min(model max,2048); mem ~O(ctx^2))');
   WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral');
   WriteLn('  --system "msg"        initial system prompt');
-  WriteLn('  --int8                int8 weight-only quantized inference');
+  WriteLn('  --int8                int8 weight-only quantized inference (DEFAULT)');
+  WriteLn('  --fp32                full-precision weights (much more RAM; ~3x the');
+  WriteLn('                        weight bytes are held - see --int8)');
   WriteLn('  --selftest            run the offline unit checks and exit');
   WriteLn('  --help                this text');
   WriteLn;
@@ -127,11 +141,12 @@ end;
 function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
-  Result.Int8 := false;
+  Result.Int8 := true; // int8 weight-only by default (a fraction of FP32 RAM)
   Result.CtxLen := 0;
   Result.MaxNewTokens := 128;
   Result.Temperature := 1.0;
   Result.TopK := 0;
+  Result.WeightedTopK := false;
   Result.TopP := 0;
   Result.MinP := 0;
   Result.RepetitionPenalty := 1.0;
@@ -205,6 +220,7 @@ begin
   begin
     Arg := Args[ArgPos];
     if Arg = '--int8' then Opt.Int8 := true
+    else if Arg = '--fp32' then Opt.Int8 := false
     else if Arg = '--selftest' then Opt.SelfTest := true
     else if (Arg = '--help') or (Arg = '-h') then Opt.ShowHelp := true
     else if Arg = '--temperature' then
@@ -216,6 +232,12 @@ begin
     begin
       if not NextInt(Arg, IVal) then exit(false);
       Opt.TopK := IVal;
+    end
+    else if Arg = '--weighted-top-k' then
+    begin
+      if not NextInt(Arg, IVal) then exit(false);
+      Opt.TopK := IVal;
+      Opt.WeightedTopK := true;
     end
     else if Arg = '--top-p' then
     begin
@@ -407,6 +429,40 @@ begin
   SL.Free;
 end;
 
+// Reads an integer field from config.json (e.g. max_position_embeddings),
+// returning Default on any trouble. Same fpjson stance as ReadModelType.
+function ReadConfigInt(const ConfigFile, Field: string;
+  Default: integer): integer;
+var
+  SL: TStringList;
+  Parser: TJSONParser;
+  Root: TJSONData;
+  Node: TJSONData;
+begin
+  Result := Default;
+  if not FileExists(ConfigFile) then exit;
+  SL := TStringList.Create();
+  try
+    SL.LoadFromFile(ConfigFile);
+    Parser := TJSONParser.Create(SL.Text, []);
+    try
+      Root := Parser.Parse();
+      try
+        Node := Root.FindPath(Field);
+        if Assigned(Node) and (Node.JSONType = jtNumber) then
+          Result := Node.AsInteger;
+      finally
+        Root.Free;
+      end;
+    finally
+      Parser.Free;
+    end;
+  except
+    Result := Default;
+  end;
+  SL.Free;
+end;
+
 // ---------------------------------------------------------------------------
 // Generation: one assistant reply, streamed to stdout as it decodes.
 // ---------------------------------------------------------------------------
@@ -559,6 +615,15 @@ begin
     Check(Opt.SystemPrompt = 'Be brief.', '--system');
     Check(Opt.Int8, '--int8');
 
+    // int8 is the default; --fp32 opts back into full precision.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and Opt.Int8, 'int8 is the default weight mode');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--fp32');
+    Check(ParseArgs(Args, Opt) and not Opt.Int8, '--fp32 disables int8');
+
     Args.Clear;
     Args.Add('--bogus-flag');
     Check(not ParseArgs(Args, Opt), 'unknown flag rejected');
@@ -695,7 +760,33 @@ begin
   if Opt.Seed >= 0 then RandSeed := Opt.Seed
   else Randomize;
 
+  // Default context window. The full-recompute decode allocates a persistent
+  // SeqLen x SeqLen attention-score buffer PER HEAD PER LAYER, so build memory
+  // grows as O(SeqLen^2) (e.g. ~336 such buffers for a 24-layer/14-head 0.5B
+  // model). Using the checkpoint's full max_position_embeddings (32768 for
+  // Qwen2.5) would request terabytes and OOM at load, so when the user gives
+  // no --ctx we cap the default at DefaultCtxCap (clamped to the model's own
+  // limit). Raise it with --ctx N (and prefer --int8) if you have the RAM.
+  if Opt.CtxLen <= 0 then
+  begin
+    Cnt := ReadConfigInt(IncludeTrailingPathDelimiter(Opt.ModelDir) +
+      'config.json', 'max_position_embeddings', DefaultCtxCap);
+    if (Cnt <= 0) or (Cnt > DefaultCtxCap) then Cnt := DefaultCtxCap;
+    Opt.CtxLen := Cnt;
+    WriteLn('[context not set - defaulting to ', Opt.CtxLen,
+      ' tokens; override with --ctx N (memory grows ~O(ctx^2))]');
+  end;
+
   // Model: generic architecture dispatch, inference-only, optional int8.
+  // Weight precision. int8 is the default because the FP32 forward path keeps
+  // ~3 copies of every weight matrix; FP32 is opt-in via --fp32.
+  if Opt.Int8 then
+    WriteLn('[int8 weights (default) - pass --fp32 for full-precision',
+      ' weights (much more RAM)]')
+  else
+    WriteLn('[--fp32: full-precision weights - this holds ~3x the weight',
+      ' bytes; drop --fp32 to use int8 if you run low on RAM]');
+
   WriteLn('Loading ', Opt.ModelDir, ' ...');
   NN := BuildFromPretrained(Opt.ModelDir, Opt.CtxLen,
     {pInferenceOnly=}true, '', {pQuantizeInt8=}Opt.Int8);
@@ -724,7 +815,11 @@ begin
   if Opt.Temperature <> 1.0 then
     Chain.Add(TNNetTemperatureProcessor.Create(Opt.Temperature), true);
   Sampler := nil;
-  if Opt.TopK > 0 then Sampler := TNNetSamplerTopK.Create(Opt.TopK)
+  if Opt.TopK > 0 then
+  begin
+    if Opt.WeightedTopK then Sampler := TNNetSamplerWeightedTopK.Create(Opt.TopK)
+    else Sampler := TNNetSamplerTopK.Create(Opt.TopK);
+  end
   else if Opt.TopP > 0 then Sampler := TNNetSamplerTopP.Create(Opt.TopP)
   else if Opt.MinP > 0 then Sampler := TNNetSamplerMinP.Create(Opt.MinP);
 

@@ -99,6 +99,7 @@ type
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
     procedure TestMagnitudePruningReportSmoke;
+    procedure TestPersistentPruneMask;
     procedure TestMCDropoutUncertaintyReportSmoke;
     procedure TestEquivarianceReportSmoke;
     procedure TestTTAReportSmoke;
@@ -128,6 +129,7 @@ type
     procedure TestPredictionDepthReportSmoke;
     procedure TestToGraphvizDotSmoke;
     procedure TestLayerTimingReportSmoke;
+    procedure TestProfileReportStructureAndCounts;
     procedure TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
     procedure TestMixtureOfDepthsShapeDegenerateAndRoundTrip;
     procedure TestDropBlockSmokeAndRoundTrip;
@@ -137,9 +139,165 @@ type
     procedure TestShakeDropEvalAndRoundTrip;
     procedure TestRoutingEntropyReportSmoke;
     procedure TestLocalLearningCoefficientReportSmoke;
+    procedure TestDetectAnomalyCleanForwardBackward;
+    procedure TestDetectAnomalyForwardCatchesNaN;
+    procedure TestDetectAnomalyBackwardCatchesNaN;
+    procedure TestDetectAnomalyOffDoesNotRaise;
   end;
 
 implementation
+
+procedure TTestNeuralLayersExtra.TestDetectAnomalyCleanForwardBackward;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+begin
+  // A clean tiny net with anomaly detection ON must NOT raise.
+  NN := TNNet.Create;
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(2, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.SetLearningRate(0.01, 0.0);
+    NN.DetectAnomaly := True;
+    Input.Fill(0.5);
+    Target.Fill(0.1);
+    // Should run cleanly through both passes with no exception.
+    NN.Compute(Input);
+    NN.Backpropagate(Target);
+    AssertTrue('clean forward/backward did not raise with DetectAnomaly on', True);
+  finally
+    Target.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDetectAnomalyForwardCatchesNaN;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Raised: boolean;
+  Msg: string;
+begin
+  // Inject Infinity into a hidden layer's bias so its OUTPUT becomes non-finite
+  // during the forward pass; the anomaly must be caught and name layer 1.
+  NN := TNNet.Create;
+  Input := TNNetVolume.Create(4, 1, 1);
+  Raised := False;
+  Msg := '';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3)); // layer index 1
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.DetectAnomaly := True;
+    NN.HideMessages();
+    Input.Fill(0.5);
+    NN.Layers[1].Neurons[0].BiasWeight := Infinity;
+    try
+      NN.Compute(Input);
+    except
+      on E: Exception do
+      begin
+        Raised := True;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('forward anomaly was raised', Raised);
+    AssertTrue('message names FORWARD phase', Pos('FORWARD', Msg) > 0);
+    AssertTrue('message names OUTPUT', Pos('OUTPUT', Msg) > 0);
+    AssertTrue('message names layer 1', Pos('layer 1 ', Msg) > 0);
+    AssertTrue('message names layer class',
+      Pos('TNNetFullConnectLinear', Msg) > 0);
+  finally
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDetectAnomalyBackwardCatchesNaN;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  Raised: boolean;
+  Msg: string;
+begin
+  // A non-finite TARGET makes the output layer's OutputError non-finite during
+  // the backward pass; the anomaly must be caught and name the BACKWARD phase.
+  NN := TNNet.Create;
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(2, 1, 1);
+  Raised := False;
+  Msg := '';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2)); // output, layer index 2
+    NN.SetLearningRate(0.01, 0.0);
+    NN.DetectAnomaly := True;
+    NN.HideMessages();
+    Input.Fill(0.5);
+    Target.Fill(Infinity);
+    NN.Compute(Input);
+    try
+      NN.Backpropagate(Target);
+    except
+      on E: Exception do
+      begin
+        Raised := True;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('backward anomaly was raised', Raised);
+    AssertTrue('message names BACKWARD phase', Pos('BACKWARD', Msg) > 0);
+    AssertTrue('message names OUTPUTERROR', Pos('OUTPUTERROR', Msg) > 0);
+    AssertTrue('message names layer 2', Pos('layer 2 ', Msg) > 0);
+  finally
+    Target.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDetectAnomalyOffDoesNotRaise;
+var
+  NN: TNNet;
+  Input, Target: TNNetVolume;
+  Raised: boolean;
+begin
+  // With DetectAnomaly OFF (default), the same non-finite injection must NOT
+  // raise - the overhead-off path is silent.
+  NN := TNNet.Create;
+  Input := TNNetVolume.Create(4, 1, 1);
+  Target := TNNetVolume.Create(2, 1, 1);
+  Raised := False;
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.SetLearningRate(0.01, 0.0);
+    AssertFalse('DetectAnomaly defaults to false', NN.DetectAnomaly);
+    NN.HideMessages();
+    Input.Fill(0.5);
+    // Same forward injection as the forward-anomaly test, but the flag is OFF.
+    NN.Layers[1].Neurons[0].BiasWeight := Infinity;
+    try
+      NN.Compute(Input);
+    except
+      on E: Exception do
+        Raised := True;
+    end;
+    AssertFalse('no anomaly raised when DetectAnomaly is off', Raised);
+    AssertTrue('output is actually non-finite (injection took effect)',
+      NN.Layers[1].Output.HasNonFinite());
+  finally
+    Target.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
 
 procedure TTestNeuralLayersExtra.TestDeconvolutionForward;
 var
@@ -2287,6 +2445,124 @@ begin
     Before.Free;
     Labels.Free;
     Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestPersistentPruneMask;
+var
+  NN: TNNet;
+  X, Y: TNNetVolume;
+  PrunedW: array of TNeuralFloat;
+  PrunedLayer, PrunedNeuron, PrunedIdx: array of integer;
+  KeptLayer, KeptNeuron, KeptIdx: integer;
+  KeptBefore: TNeuralFloat;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  L, NIdx, WIdx, I, Step, PrunedCount, NonZero: integer;
+  PrunedTarget: integer;
+begin
+  NN := TNNet.Create();
+  X := TNNetVolume.Create(6, 1, 1);
+  Y := TNNetVolume.Create(3, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(10));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.InitWeights();
+    NN.SetLearningRate(0.1, 0.0);
+
+    // Train a few steps so weights have a magnitude spread.
+    for Step := 0 to 39 do
+    begin
+      X.Fill(0); Y.Fill(0);
+      for I := 0 to X.Size - 1 do X.Raw[I] := Random - 0.5;
+      Y.Raw[Random(3)] := 1.0;
+      NN.Compute(X);
+      NN.Backpropagate(Y);
+    end;
+
+    // Prune to 50% sparsity (global magnitude) with a persistent mask.
+    PrunedCount := NN.PruneWeightsByMagnitude(0.5, False);
+    AssertTrue('something was pruned', PrunedCount > 0);
+    AssertTrue('mask present', NN.HasPruneMasks());
+    AssertEquals('CountPrunedWeights matches return value',
+      PrunedCount, NN.CountPrunedWeights());
+    AssertTrue('sparsity ~ 0.5',
+      (NN.GetPruneSparsity() >= 0.45) and (NN.GetPruneSparsity() <= 0.60));
+
+    // Record the exact set of pruned weights (must be zero now) and one kept,
+    // non-zero weight (must change during fine-tuning).
+    SetLength(PrunedW, 0);
+    SetLength(PrunedLayer, 0);
+    SetLength(PrunedNeuron, 0);
+    SetLength(PrunedIdx, 0);
+    KeptLayer := -1; KeptNeuron := -1; KeptIdx := -1; KeptBefore := 0;
+    for L := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[L];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      for NIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NIdx];
+        for WIdx := 0 to Neuron.Weights.Size - 1 do
+        begin
+          if Neuron.Weights.FData[WIdx] = 0 then
+          begin
+            SetLength(PrunedLayer, Length(PrunedLayer) + 1);
+            SetLength(PrunedNeuron, Length(PrunedNeuron) + 1);
+            SetLength(PrunedIdx, Length(PrunedIdx) + 1);
+            PrunedLayer[High(PrunedLayer)] := L;
+            PrunedNeuron[High(PrunedNeuron)] := NIdx;
+            PrunedIdx[High(PrunedIdx)] := WIdx;
+          end
+          else if KeptLayer < 0 then
+          begin
+            KeptLayer := L; KeptNeuron := NIdx; KeptIdx := WIdx;
+            KeptBefore := Neuron.Weights.FData[WIdx];
+          end;
+        end;
+      end;
+    end;
+    PrunedTarget := Length(PrunedLayer);
+    AssertTrue('pruned-weight set non-empty', PrunedTarget > 0);
+    AssertTrue('a kept non-zero weight exists', KeptLayer >= 0);
+
+    // Fine-tune several steps; the mask must survive.
+    for Step := 0 to 59 do
+    begin
+      X.Fill(0); Y.Fill(0);
+      for I := 0 to X.Size - 1 do X.Raw[I] := Random - 0.5;
+      Y.Raw[Random(3)] := 1.0;
+      NN.Compute(X);
+      NN.Backpropagate(Y);
+    end;
+
+    // All originally-pruned weights are STILL exactly zero.
+    NonZero := 0;
+    for I := 0 to PrunedTarget - 1 do
+    begin
+      Neuron := NN.Layers[PrunedLayer[I]].Neurons[PrunedNeuron[I]];
+      if Neuron.Weights.FData[PrunedIdx[I]] <> 0 then Inc(NonZero);
+    end;
+    AssertEquals('pruned weights stay exactly zero after fine-tuning', 0, NonZero);
+    AssertEquals('count of pruned weights unchanged',
+      PrunedTarget, NN.CountPrunedWeights());
+
+    // The kept weight DID change (training actually progressed).
+    Neuron := NN.Layers[KeptLayer].Neurons[KeptNeuron];
+    AssertTrue('kept (unpruned) weight changed during fine-tuning',
+      Abs(Neuron.Weights.FData[KeptIdx] - KeptBefore) > 1e-7);
+
+    // Clearing the mask removes enforcement.
+    NN.ClearPruneMasks();
+    AssertTrue('mask cleared', not NN.HasPruneMasks());
+    AssertEquals('no pruned weights after clear', 0, NN.CountPrunedWeights());
+  finally
+    Y.Free;
+    X.Free;
     NN.Free;
   end;
 end;
@@ -5785,6 +6061,69 @@ begin
   NN.Free;
   // nil NN must not crash
   S := TNNet.LayerTimingReport(nil, nil, 3);
+  AssertTrue('nil NN handled', Length(S) > 0);
+end;
+
+procedure TTestNeuralLayersExtra.TestProfileReportStructureAndCounts;
+var
+  NN: TNNet;
+  Sample, Target: TNNetVolume;
+  S: string;
+  Lines: TStringList;
+  i, RowCnt, BytesPerElem: integer;
+  ExpectedFCParamBytes, ExpectedFCActBytes: integer;
+begin
+  BytesPerElem := SizeOf(TNeuralFloat);
+  NN := TNNet.Create;
+  NN.AddLayer(TNNetInput.Create(4));
+  // FullConnectReLU(5) over 4 inputs: 5*4 weights + 5 biases = 25 params.
+  NN.AddLayer(TNNetFullConnectReLU.Create(5));
+  Sample := TNNetVolume.Create(4, 1, 1);
+  Sample.FillForDebug();
+  Target := TNNetVolume.Create(5, 1, 1);
+  Target.FillForDebug();
+
+  // Forward + backward profile.
+  S := TNNet.ProfileReport(NN, Sample, Target, 3);
+  AssertTrue('Report is not empty', Length(S) > 0);
+  AssertTrue('Report has header', Pos('Profile Report', S) > 0);
+  AssertTrue('Report has TOTAL row', Pos('TOT', S) > 0);
+
+  // One data row per layer (2 layers): count rows that start with a digit
+  // followed by whitespace in the table body.
+  Lines := TStringList.Create;
+  try
+    Lines.Text := S;
+    RowCnt := 0;
+    for i := 0 to Lines.Count - 1 do
+      if (Length(Lines[i]) > 1) and (Lines[i][1] in ['0'..'9']) and
+         (Lines[i][2] = ' ') then
+        Inc(RowCnt);
+    AssertEquals('One data row per layer', 2, RowCnt);
+  finally
+    Lines.Free;
+  end;
+
+  // FullConnect(5)/4-in: 25 param elements, 5 activation elements.
+  ExpectedFCParamBytes := 25 * BytesPerElem;
+  ExpectedFCActBytes := 5 * BytesPerElem;
+  AssertTrue('FC param bytes present',
+    Pos(IntToStr(ExpectedFCParamBytes), S) > 0);
+  AssertTrue('FC activation bytes present',
+    Pos(IntToStr(ExpectedFCActBytes), S) > 0);
+  // TOTAL param count (25) and total param bytes are surfaced.
+  AssertTrue('Total param count present', Pos(' 25 ', ' ' + S) > 0);
+
+  // Forward-only profile (Target=nil) must still work and mark "no backward".
+  S := TNNet.ProfileReport(NN, Sample, nil, 3);
+  AssertTrue('Forward-only report not empty', Length(S) > 0);
+  AssertTrue('Forward-only marks no backward', Pos('no backward', S) > 0);
+
+  Sample.Free;
+  Target.Free;
+  NN.Free;
+  // nil NN must not crash.
+  S := TNNet.ProfileReport(nil, nil);
   AssertTrue('nil NN handled', Length(S) > 0);
 end;
 

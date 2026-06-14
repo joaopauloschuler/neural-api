@@ -1,0 +1,34 @@
+{
+ "model_type": "hubert",
+ "architectures": [
+  "HubertForCTC"
+ ],
+ "hidden_size": 16,
+ "num_hidden_layers": 2,
+ "num_attention_heads": 2,
+ "intermediate_size": 32,
+ "conv_dim": [
+  8,
+  8,
+  8
+ ],
+ "conv_stride": [
+  5,
+  2,
+  2
+ ],
+ "conv_kernel": [
+  10,
+  3,
+  3
+ ],
+ "conv_bias": false,
+ "num_conv_pos_embeddings": 8,
+ "num_conv_pos_embedding_groups": 4,
+ "feat_extract_norm": "group",
+ "do_stable_layer_norm": false,
+ "hidden_act": "gelu",
+ "feat_extract_activation": "gelu",
+ "vocab_size": 12,
+ "layer_norm_eps": 1e-05
+}

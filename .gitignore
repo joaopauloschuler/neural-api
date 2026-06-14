@@ -16,9 +16,12 @@ tests/RunTests
 examples/ActivationBakeoff/ActivationBakeoff
 examples/GumbelAnnealingAutoencoder/GumbelAnnealingAutoencoder
 examples/BeamSearchDecode/BeamSearchDecode
+examples/ColBERTSearch/ColBERTSearch
+examples/EmbeddingSearch/EmbeddingSearch
 examples/LotteryTicketIMP/LotteryTicketIMP
 examples/VQCodebookUsage/VQCodebookUsage
 examples/FourierMix/FourierMix
+examples/SpanCorruptionPretrain/SpanCorruptionPretrain
 link*.res
 autosave.csv
 autosave.nn
@@ -34,3 +37,6 @@ examples/SimpleNLP/datasets/
 examples/SimpleNLP/temp.csv
 examples/SimpleNLP/*.nn
 examples/SimpleNLP/decode_bakeoff_phase*.log
+
+# Downloaded HF model checkpoints (large binaries, never commit)
+.olmo2_1b/

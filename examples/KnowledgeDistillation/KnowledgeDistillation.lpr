@@ -1,43 +1,32 @@
 program KnowledgeDistillation;
 (*
-KnowledgeDistillation: demonstrates the TNNetKLDivergence loss head doing
-knowledge distillation on a SYNTHETIC multi-class toy, contrasted against a
-hard-label cross-entropy baseline of identical student capacity. No external
-dataset, pure CPU, finishes in well under a second.
+KnowledgeDistillation: end-to-end demo of TNeuralKDTrainer
+(neural/neuralkd.pas), classic Hinton knowledge distillation.
 
-WHAT IT SHOWS
--------------
-Three classes of 2D Gaussian blobs (K=3) are classified by a small MLP.
-First a relatively LARGE "teacher" MLP is trained on hard one-hot labels.
-Then, for every training point, the teacher's TEMPERATURE-SOFTENED output
-distribution is recorded (softmax of teacher logits / T, with T=3). These
-softened distributions carry the teacher's "dark knowledge": the relative
-confidences across the wrong classes, not just the argmax.
+A LARGER char-level next-token TEACHER is Pascal-trained on a structured
+synthetic corpus until it is a non-trivial predictor. A SMALL student is then
+trained two ways, at MATCHED steps / examples-seen and identical RNG
+initialisation:
 
-A SMALLER "student" MLP is then trained TWO ways from the same body:
-  (a) DISTILLATION: student head = SoftMax -> TNNetKLDivergence, with the
-      teacher's soft distribution as the target. The KL head minimises
-      KL(p_teacher || q_student).
-  (b) BASELINE:     student head = SoftMax trained against the HARD one-hot
-      label via the framework's standard (output - target) cross-entropy
-      gradient.
+  (A) WITH KD  -- soft teacher targets blended with the hard label
+                  (alpha < 1, temperature T > 1), via TNeuralKDTrainer.
+  (B) HARD-ONLY -- the SAME trainer with alpha = 1 (the soft term vanishes,
+                  so this is an ordinary cross-entropy SGD step; see the
+                  TestAlphaOneMatchesPlainCE unit test). Same data order,
+                  same learning rate, same number of Step() calls.
 
-The program prints periodic loss checkpoints for both students and a final
-comparison of TEST accuracy: teacher vs distilled-student vs hard-label
-student. Numbers are reported honestly: whatever the run produces is printed,
-and the README repeats the actual captured output.
+Both students are then evaluated with TNNet.PerplexityReport on a held-out
+slice of the stream. The KD student should reach LOWER perplexity than the
+hard-label-only student at the same budget: the teacher's softened
+distribution carries "dark knowledge" (relative probabilities of the wrong
+classes) that a single hard label cannot.
 
-HOW THE KL HEAD IS WIRED (read from neural/neuralnetwork.pas)
-------------------------------------------------------------
-TNNetKLDivergence is a TNNetIdentity descendant. Its doc-comment states its
-input q must be a PROBABILITY distribution (e.g. the output of a SoftMax) and
-its target p is the reference distribution. Forward is an identity passthrough.
-The framework seeds the last layer's FOutputError with (output - target) =
-(q - p); Backpropagate recovers p = q - FOutputError and rewrites the residual
-with the analytic gradient dL/dq_i = -p_i / q_i. So to distil we:
-  - end the student with SoftMax (produces q), then KLDivergence;
-  - feed the teacher's softened distribution as the TARGET volume.
-The SoftMax then backprops the KL gradient through its Jacobian.
+The teacher here is a small Pascal-built model so the whole demo runs on pure
+CPU in well under a minute and inside a 3 GB memory cap. To distill from a
+REAL pretrained teacher (GPT-2 / TinyStories) instead, import it with the
+safetensors / torch.bin importers and pass it as the teacher (see README.md);
+the only requirement is that teacher and student share the vocabulary width
+and both end in TNNetFullConnectLinear(Vocab) -> SoftMax.
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -51,10 +40,6 @@ but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
-You should have received a copy of the GNU General Public License along
-with this program; if not, write to the Free Software Foundation, Inc.,
-51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
 Coded by Claude (AI).
 *)
 
@@ -63,364 +48,197 @@ Coded by Claude (AI).
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
   neuralnetwork,
-  neuralvolume;
+  neuralvolume,
+  neuralkd;
 
 const
-  cNumClasses     = 3;
-  cSamplesPerCls  = 120;   // training samples per class
-  cTestPerCls     = 60;    // held-out test samples per class
-  cTeacherEpochs  = 60;
-  cStudentEpochs  = 80;
+  cVocab          = 12;
+  cContextLen     = 8;
+  cTeacherHidden  = 96;    // teacher is comfortably larger than the student
+  cStudentHidden  = 12;    // small student
+  cStudentEmbed   = 8;
+  cTeacherEmbed   = 24;
+  cTeacherPasses  = 120;   // train the teacher well first
   cTeacherLR      = 0.05;
+  cStudentSteps   = 6000;  // MATCHED budget for both students (Step() calls)
   cStudentLR      = 0.05;
-  cTemperature    = 3.0;   // distillation temperature for softening teacher
-  cSeed           = 42;
-  cSigma          = 0.85;  // blob spread (deliberately overlapping classes)
+  cKDAlpha        = 0.3;   // 0.3*hard CE + 0.7*soft KL
+  cKDTemperature  = 3.0;
+  cTrainStreamN   = 1024;
+  cEvalStreamN    = 512;
 
-  // Three 2D Gaussian blob centers in a triangle, with deliberate overlap so
-  // the teacher's soft targets actually carry useful inter-class structure.
-  cCenters: array[0..cNumClasses - 1, 0..1] of TNeuralFloat =
-    (( 0.0,  1.4),
-     (-1.2, -0.8),
-     ( 1.2, -0.8));
-
-type
-  TSample = record
-    X, Y: TNeuralFloat;
-    Cls:  integer;
+  // A structured-but-not-trivial stream: a deterministic mixing recurrence
+  // over the vocabulary. Each token depends on the two preceding ones, so the
+  // next-token distribution is genuinely learnable (not uniform, not a single
+  // trivial period), giving the teacher real "dark knowledge" to transfer.
+  procedure MakeStream(out S: array of integer; Seed: integer);
+  var
+    I, A, B: integer;
+  begin
+    A := Seed mod cVocab;
+    B := (Seed * 7 + 3) mod cVocab;
+    for I := 0 to High(S) do
+    begin
+      S[I] := (A * 5 + B * 3 + 1) mod cVocab;
+      A := B;
+      B := S[I];
+    end;
   end;
-  TSampleArray = array of TSample;
-  // Soft targets: one probability row per training sample.
-  TSoftArray = array of array of TNeuralFloat;
 
-// Why: Box-Muller gives N(0,1) samples without an extra dependency.
-function RandomGauss(): TNeuralFloat;
-var
-  U1, U2: TNeuralFloat;
-begin
-  repeat
-    U1 := Random;
-  until U1 > 1e-9;
-  U2 := Random;
-  Result := Sqrt(-2 * Ln(U1)) * Cos(2 * Pi * U2);
-end;
-
-// Builds a synthetic dataset of PerCls 2D Gaussian points per class.
-procedure BuildDataset(out Data: TSampleArray; PerCls: integer);
-var
-  C, I, Idx: integer;
-begin
-  SetLength(Data, cNumClasses * PerCls);
-  Idx := 0;
-  for C := 0 to cNumClasses - 1 do
-    for I := 1 to PerCls do
-    begin
-      Data[Idx].X := cCenters[C][0] + RandomGauss() * cSigma;
-      Data[Idx].Y := cCenters[C][1] + RandomGauss() * cSigma;
-      Data[Idx].Cls := C;
-      Inc(Idx);
-    end;
-end;
-
-// Loads a single 2D point into the input volume.
-procedure FillInput(V: TNNetVolume; const S: TSample);
-begin
-  V[0, 0, 0] := S.X;
-  V[0, 0, 1] := S.Y;
-end;
-
-// Teacher: a comparatively wide MLP ending SoftMax (hard-label classifier).
-function BuildTeacher(): TNNet;
-begin
-  Result := TNNet.Create();
-  Result.AddLayer(TNNetInput.Create(1, 1, 2));
-  Result.AddLayer(TNNetFullConnectReLU.Create(32));
-  Result.AddLayer(TNNetFullConnectReLU.Create(32));
-  Result.AddLayer(TNNetFullConnectLinear.Create(cNumClasses));
-  Result.AddLayer(TNNetSoftMax.Create());
-  Result.InitWeights();
-end;
-
-// Student body: a deliberately SMALLER MLP, shared by both training modes.
-// pDistil = True appends SoftMax -> KLDivergence (soft-target distillation);
-// pDistil = False appends just SoftMax (hard-label cross-entropy baseline).
-function BuildStudent(pDistil: boolean): TNNet;
-begin
-  Result := TNNet.Create();
-  Result.AddLayer(TNNetInput.Create(1, 1, 2));
-  Result.AddLayer(TNNetFullConnectReLU.Create(6));
-  Result.AddLayer(TNNetFullConnectLinear.Create(cNumClasses));
-  Result.AddLayer(TNNetSoftMax.Create());
-  if pDistil then
-    // KL head consumes the SoftMax probabilities q; target is the teacher dist.
-    Result.AddLayer(TNNetKLDivergence.Create());
-  Result.InitWeights();
-end;
-
-// One epoch of hard-label training: target is a one-hot volume; the SoftMax
-// head's (output - target) seed yields the standard cross-entropy gradient.
-function TrainHardEpoch(Net: TNNet; const Data: TSampleArray): TNeuralFloat;
-var
-  Step, NumSamples, Order, Tmp, K: integer;
-  Input, Target: TNNetVolume;
-  Perm: array of integer;
-  P, TotalCE: TNeuralFloat;
-begin
-  NumSamples := Length(Data);
-  Input := TNNetVolume.Create(1, 1, 2);
-  Target := TNNetVolume.Create(1, 1, cNumClasses);
-  SetLength(Perm, NumSamples);
-  for Step := 0 to NumSamples - 1 do Perm[Step] := Step;
-  TotalCE := 0;
-  try
-    // Shuffle for stochastic order.
-    for Step := NumSamples - 1 downto 1 do
-    begin
-      Order := Random(Step + 1);
-      Tmp := Perm[Step]; Perm[Step] := Perm[Order]; Perm[Order] := Tmp;
-    end;
-    for Step := 0 to NumSamples - 1 do
-    begin
-      Order := Perm[Step];
-      FillInput(Input, Data[Order]);
-      Target.Fill(0);
-      Target[0, 0, Data[Order].Cls] := 1.0;
-      Net.Compute(Input);
-      Net.Backpropagate(Target);
-      // Report cross-entropy -log q[true class] for progress.
-      P := Net.GetLastLayer().Output.FData[Data[Order].Cls];
-      if P < 1e-7 then P := 1e-7;
-      TotalCE := TotalCE - Ln(P);
-    end;
-  finally
-    Target.Free;
-    Input.Free;
+  procedure BuildTeacher(out NN: TNNet);
+  begin
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(cContextLen, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(cVocab, cTeacherEmbed));
+    NN.AddLayer(TNNetFullConnectReLU.Create(cTeacherHidden));
+    NN.AddLayer(TNNetFullConnectReLU.Create(cTeacherHidden));
+    NN.AddLayer(TNNetFullConnectLinear.Create(cVocab));   // logits z_t
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(cTeacherLR, 0.9);
   end;
-  K := NumSamples;
-  Result := TotalCE / K;
-end;
 
-// One epoch of distillation: target is the teacher's softened distribution.
-// Reports mean KL(p_teacher || q_student) for progress.
-function TrainSoftEpoch(Net: TNNet; const Data: TSampleArray;
-  const Soft: TSoftArray): TNeuralFloat;
-var
-  Step, NumSamples, Order, Tmp, C: integer;
-  Input, Target: TNNetVolume;
-  Perm: array of integer;
-  Q, Pt, TotalKL: TNeuralFloat;
-begin
-  NumSamples := Length(Data);
-  Input := TNNetVolume.Create(1, 1, 2);
-  Target := TNNetVolume.Create(1, 1, cNumClasses);
-  SetLength(Perm, NumSamples);
-  for Step := 0 to NumSamples - 1 do Perm[Step] := Step;
-  TotalKL := 0;
-  try
-    for Step := NumSamples - 1 downto 1 do
-    begin
-      Order := Random(Step + 1);
-      Tmp := Perm[Step]; Perm[Step] := Perm[Order]; Perm[Order] := Tmp;
-    end;
-    for Step := 0 to NumSamples - 1 do
-    begin
-      Order := Perm[Step];
-      FillInput(Input, Data[Order]);
-      for C := 0 to cNumClasses - 1 do
-        Target[0, 0, C] := Soft[Order][C];
-      Net.Compute(Input);
-      Net.Backpropagate(Target);
-      // KL(p||q) = sum p*log(p/q) over classes (SoftMax output is the q head).
-      for C := 0 to cNumClasses - 1 do
-      begin
-        Pt := Soft[Order][C];
-        if Pt > 1e-7 then
+  procedure BuildStudent(out NN: TNNet);
+  begin
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(cContextLen, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(cVocab, cStudentEmbed));
+    NN.AddLayer(TNNetFullConnectReLU.Create(cStudentHidden));
+    NN.AddLayer(TNNetFullConnectLinear.Create(cVocab));   // logits z_s
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(cStudentLR, 0.9);
+  end;
+
+  // Ordinary supervised SGD to train the (frozen-afterwards) teacher.
+  procedure TrainTeacher(NN: TNNet; const Stream: array of integer);
+  var
+    Input, Target: TNNetVolume;
+    Pass, T, D: integer;
+  begin
+    Input := TNNetVolume.Create(cContextLen, 1, 1);
+    Target := TNNetVolume.Create(NN.GetLastLayer().Output);
+    try
+      for Pass := 1 to cTeacherPasses do
+        for T := cContextLen to High(Stream) do
         begin
-          Q := Net.GetLastLayer().Output.FData[C];
-          if Q < 1e-7 then Q := 1e-7;
-          TotalKL := TotalKL + Pt * Ln(Pt / Q);
+          for D := 0 to cContextLen - 1 do
+            Input.FData[D] := Stream[T - cContextLen + D];
+          Target.Fill(0);
+          Target.FData[Stream[T]] := 1.0;
+          NN.Compute(Input);
+          NN.Backpropagate(Target);
+        end;
+    finally
+      Target.Free;
+      Input.Free;
+    end;
+  end;
+
+  // Train a student through TNeuralKDTrainer for exactly cStudentSteps Step()
+  // calls over the stream (looping the stream if needed). The SAME procedure
+  // is used for the KD student (alpha<1) and the hard-label-only student
+  // (alpha=1), so the two runs differ ONLY in the soft-target term.
+  procedure DistillStudent(Trainer: TNeuralKDTrainer;
+    const Stream: array of integer; const Title: string);
+  var
+    Input: TNNetVolume;
+    Step, T, D: integer;
+    AccLoss, AccHard, AccKL: TNeuralFloat;
+  begin
+    Input := TNNetVolume.Create(cContextLen, 1, 1);
+    AccLoss := 0; AccHard := 0; AccKL := 0;
+    try
+      WriteLn(Title, ' (alpha=', FloatToStrF(Trainer.Alpha, ffFixed, 3, 2),
+        ', T=', FloatToStrF(Trainer.Temperature, ffFixed, 3, 1),
+        ', ', cStudentSteps, ' steps):');
+      for Step := 0 to cStudentSteps - 1 do
+      begin
+        // Slide a window across the (looped) stream.
+        T := cContextLen + (Step mod (Length(Stream) - cContextLen));
+        for D := 0 to cContextLen - 1 do
+          Input.FData[D] := Stream[T - cContextLen + D];
+        Trainer.Step(Input, Stream[T]);
+        AccLoss := AccLoss + Trainer.LastLoss;
+        AccHard := AccHard + Trainer.LastHardLoss;
+        AccKL := AccKL + Trainer.LastKL;
+        if (Step + 1) mod 1500 = 0 then
+        begin
+          WriteLn('  step ', Step + 1:5,
+            '  mean blended=', FloatToStrF(AccLoss / 1500, ffFixed, 8, 4),
+            '  hardCE=', FloatToStrF(AccHard / 1500, ffFixed, 8, 4),
+            '  KL=', FloatToStrF(AccKL / 1500, ffFixed, 8, 4));
+          AccLoss := 0; AccHard := 0; AccKL := 0;
         end;
       end;
+    finally
+      Input.Free;
     end;
-  finally
-    Target.Free;
-    Input.Free;
   end;
-  Result := TotalKL / NumSamples;
-end;
 
-// Computes the teacher's TEMPERATURE-SOFTENED distribution for each sample.
-// We read the teacher's already-softmaxed probabilities, recover logits as
-// ln(prob), divide by T, and re-softmax. (ln of a softmax recovers the logits
-// up to an additive constant, which softmax is invariant to, so this yields
-// exactly softmax(logits / T).)
-procedure ComputeSoftTargets(Teacher: TNNet; const Data: TSampleArray;
-  out Soft: TSoftArray);
-var
-  I, C, NumSamples: integer;
-  Input: TNNetVolume;
-  Logit, MaxL, SumE, E: TNeuralFloat;
-  L: array[0..cNumClasses - 1] of TNeuralFloat;
-begin
-  NumSamples := Length(Data);
-  SetLength(Soft, NumSamples, cNumClasses);
-  Input := TNNetVolume.Create(1, 1, 2);
-  try
-    for I := 0 to NumSamples - 1 do
-    begin
-      FillInput(Input, Data[I]);
-      Teacher.Compute(Input);
-      MaxL := -1e30;
-      for C := 0 to cNumClasses - 1 do
-      begin
-        Logit := Teacher.GetLastLayer().Output.FData[C];
-        if Logit < 1e-7 then Logit := 1e-7;
-        L[C] := Ln(Logit) / cTemperature;  // softened logit
-        if L[C] > MaxL then MaxL := L[C];
-      end;
-      SumE := 0;
-      for C := 0 to cNumClasses - 1 do
-      begin
-        E := Exp(L[C] - MaxL);
-        L[C] := E;
-        SumE := SumE + E;
-      end;
-      for C := 0 to cNumClasses - 1 do
-        Soft[I][C] := L[C] / SumE;
-    end;
-  finally
-    Input.Free;
-  end;
-end;
-
-// Classification accuracy of a SoftMax-headed net over a dataset.
-// For the distillation student the SoftMax is the second-to-last layer (the
-// KL head is an identity passthrough), so the argmax is identical either way.
-function Accuracy(Net: TNNet; const Data: TSampleArray): TNeuralFloat;
-var
-  I, C, NumSamples, Pred, Correct: integer;
-  Input: TNNetVolume;
-  Best, V: TNeuralFloat;
-begin
-  NumSamples := Length(Data);
-  Input := TNNetVolume.Create(1, 1, 2);
-  Correct := 0;
-  try
-    for I := 0 to NumSamples - 1 do
-    begin
-      FillInput(Input, Data[I]);
-      Net.Compute(Input);
-      Pred := 0;
-      Best := -1e30;
-      for C := 0 to cNumClasses - 1 do
-      begin
-        V := Net.GetLastLayer().Output.FData[C];
-        if V > Best then begin Best := V; Pred := C; end;
-      end;
-      if Pred = Data[I].Cls then Inc(Correct);
-    end;
-  finally
-    Input.Free;
-  end;
-  Result := Correct / NumSamples;
-end;
-
-procedure RunAlgo();
 var
   Teacher, StudentKD, StudentHard: TNNet;
-  Train, Test: TSampleArray;
-  Soft: TSoftArray;
-  Epoch: integer;
-  Loss, AccTeacher, AccKD, AccHard, AccTeacherTrain: TNeuralFloat;
+  TrainerKD, TrainerHard: TNeuralKDTrainer;
+  TrainStream: array[0..cTrainStreamN - 1] of integer;
+  EvalStream: array[0..cEvalStreamN - 1] of integer;
+  TeacherPPL, KDPPL, HardPPL: string;
 begin
-  RandSeed := cSeed;
-  WriteLn('KnowledgeDistillation: KL-divergence distillation vs hard-label baseline');
-  WriteLn('Classes: ', cNumClasses, '  train/class: ', cSamplesPerCls,
-    '  test/class: ', cTestPerCls, '  temperature: ', cTemperature:0:1);
-  WriteLn('(deliberately overlapping blobs, sigma=', cSigma:0:2,
-    ', so soft targets carry inter-class structure)');
+  WriteLn('Knowledge-distillation demo: char-level next-token model.');
+  WriteLn('Teacher hidden=', cTeacherHidden, '  student hidden=', cStudentHidden,
+    '  vocab=', cVocab, '  context=', cContextLen);
   WriteLn;
 
-  BuildDataset(Train, cSamplesPerCls);
-  BuildDataset(Test, cTestPerCls);
+  MakeStream(TrainStream, 1);
+  MakeStream(EvalStream, 99);   // held-out stream (different seed)
 
-  // ---- 1. Train the teacher on hard labels. -------------------------------
-  Teacher := BuildTeacher();
-  Teacher.SetLearningRate(cTeacherLR, 0.9);
-  WriteLn('[1] Training teacher (32-32 MLP) on hard labels for ',
-    cTeacherEpochs, ' epochs...');
-  for Epoch := 1 to cTeacherEpochs do
-  begin
-    Loss := TrainHardEpoch(Teacher, Train);
-    if (Epoch = 1) or (Epoch mod 15 = 0) then
-      WriteLn(Format('    epoch %3d   train_CE=%8.4f', [Epoch, Loss]));
-  end;
-  AccTeacherTrain := Accuracy(Teacher, Train);
-  AccTeacher := Accuracy(Teacher, Test);
-  WriteLn(Format('    teacher train_acc=%6.3f   test_acc=%6.3f',
-    [AccTeacherTrain, AccTeacher]));
+  // ---- 1. Train the teacher -------------------------------------------------
+  RandSeed := 2026;
+  BuildTeacher(Teacher);
+  WriteLn('Training teacher (', cTeacherPasses, ' passes over ',
+    cTrainStreamN, ' tokens) ...');
+  TrainTeacher(Teacher, TrainStream);
+  WriteLn('Teacher trained. Held-out perplexity:');
+  TeacherPPL := TNNet.PerplexityReport(Teacher, EvalStream, cContextLen, 0);
+  Write(TeacherPPL);
   WriteLn;
 
-  // ---- 2. Record the teacher's softened distributions as soft targets. ----
-  WriteLn('[2] Computing teacher temperature-softened soft targets (T=',
-    cTemperature:0:1, ')...');
-  ComputeSoftTargets(Teacher, Train, Soft);
-  WriteLn(Format('    example soft target for a train point: [%5.3f %5.3f %5.3f]',
-    [Soft[0][0], Soft[0][1], Soft[0][2]]));
+  // ---- 2. Two identical small students (same RNG init) ----------------------
+  RandSeed := 555;
+  BuildStudent(StudentKD);
+  RandSeed := 555;
+  BuildStudent(StudentHard);
+
+  // ---- 3a. KD student: soft teacher targets + hard label --------------------
+  TrainerKD := TNeuralKDTrainer.Create(Teacher, StudentKD,
+    cKDAlpha, cKDTemperature);
+  DistillStudent(TrainerKD, TrainStream, 'Student WITH KD');
   WriteLn;
 
-  // ---- 3a. Distillation student (SoftMax -> KLDivergence). ----------------
-  StudentKD := BuildStudent(True);
-  StudentKD.SetLearningRate(cStudentLR, 0.9);
-  WriteLn('[3a] Training DISTILLATION student (6-unit MLP, KL head) for ',
-    cStudentEpochs, ' epochs...');
-  for Epoch := 1 to cStudentEpochs do
-  begin
-    Loss := TrainSoftEpoch(StudentKD, Train, Soft);
-    if (Epoch = 1) or (Epoch mod 20 = 0) then
-      WriteLn(Format('    epoch %3d   mean_KL=%8.4f', [Epoch, Loss]));
-  end;
+  // ---- 3b. Hard-label-only student: alpha=1 (soft term off) -----------------
+  // Same trainer plumbing, alpha=1 -> pure cross-entropy SGD, MATCHED steps.
+  TrainerHard := TNeuralKDTrainer.Create(Teacher, StudentHard,
+    {alpha=}1.0, {T=}cKDTemperature);
+  DistillStudent(TrainerHard, TrainStream, 'Student HARD-LABEL ONLY');
   WriteLn;
 
-  // ---- 3b. Hard-label baseline student (same body, SoftMax + CE). ---------
-  StudentHard := BuildStudent(False);
-  StudentHard.SetLearningRate(cStudentLR, 0.9);
-  WriteLn('[3b] Training HARD-LABEL student (same 6-unit MLP, CE head) for ',
-    cStudentEpochs, ' epochs...');
-  for Epoch := 1 to cStudentEpochs do
-  begin
-    Loss := TrainHardEpoch(StudentHard, Train);
-    if (Epoch = 1) or (Epoch mod 20 = 0) then
-      WriteLn(Format('    epoch %3d   train_CE=%8.4f', [Epoch, Loss]));
-  end;
+  // ---- 4. Compare held-out perplexity ---------------------------------------
+  WriteLn(StringOfChar('=', 78));
+  WriteLn('Held-out perplexity comparison (lower is better):');
+  WriteLn(StringOfChar('=', 78));
+  KDPPL := TNNet.PerplexityReport(StudentKD, EvalStream, cContextLen, 0);
+  HardPPL := TNNet.PerplexityReport(StudentHard, EvalStream, cContextLen, 0);
+  WriteLn('--- Student WITH KD ---');
+  Write(KDPPL);
+  WriteLn('--- Student HARD-LABEL ONLY ---');
+  Write(HardPPL);
   WriteLn;
+  WriteLn('Expect: the KD student reaches LOWER perplexity than the ',
+    'hard-label-only student at the SAME number of steps. The soft teacher ',
+    'targets regularise the small student toward the teacher''s relative ',
+    'class probabilities, which generalises better to the held-out stream ',
+    'than memorising hard labels alone (uniform baseline = ', cVocab, ').');
 
-  // ---- 4. Compare test accuracy. ------------------------------------------
-  AccKD := Accuracy(StudentKD, Test);
-  AccHard := Accuracy(StudentHard, Test);
-  WriteLn('==================== TEST-SET ACCURACY ====================');
-  WriteLn(Format('  teacher (32-32)                : %6.3f', [AccTeacher]));
-  WriteLn(Format('  student, distilled (KL, 6)     : %6.3f', [AccKD]));
-  WriteLn(Format('  student, hard-label (CE, 6)    : %6.3f', [AccHard]));
-  WriteLn('===========================================================');
-  if AccKD > AccHard + 1e-6 then
-    WriteLn('  -> On this run distillation BEAT the hard-label baseline.')
-  else if AccKD < AccHard - 1e-6 then
-    WriteLn('  -> On this run distillation did NOT beat the hard-label baseline.')
-  else
-    WriteLn('  -> On this run distillation TIED the hard-label baseline.');
-  WriteLn('  (Toy problem; reported numbers are exactly what this run produced.)');
-
+  TrainerHard.Free;
+  TrainerKD.Free;
   StudentHard.Free;
   StudentKD.Free;
   Teacher.Free;
-end;
-
-var
-  // Stops Lazarus errors
-  Application: record Title: string; end;
-
-begin
-  Application.Title := 'KnowledgeDistillation Example';
-  RunAlgo();
 end.

@@ -17,6 +17,12 @@ unit neuralpretrained;
 //     [head_dim] shared across heads, plus an optionally DECOUPLED
 //     head_dim where num_heads*head_dim <> hidden_size) -
 //     BuildQwen3FromSafeTensors.
+//   - OLMo-2 (model_type "olmo2", the fully-open AllenAI family; the Llama
+//     tensor layout with REORDERED post-norm - RMSNorm on the sublayer
+//     OUTPUT before the residual add, x + Norm(Attn(x)), NO input_layernorm
+//     - and q/k RMSNorm over the FULL flattened projection width BEFORE the
+//     head split + RoPE, unlike Qwen3's per-head placement) -
+//     BuildOlmo2FromSafeTensors.
 //   - Gemma 1 (the Llama skeleton with three LOAD-TIME deltas: GeGLU MLP
 //     - gated tanh-GELU, TNNetGEGLU instead of TNNetSwiGLU; zero-centered
 //     RMSNorm - gains stored as 1+w; embedding output scaled by
@@ -140,6 +146,18 @@ unit neuralpretrained;
 //     factored as the reusable BuildClipVisionTower). L2-normalized
 //     cosine scoring via ClipExtractEmbedding/ClipSimilarity +
 //     exp(logit_scale). See the CLIP IMPORT section below.
+//   - IBM Granite 3.x (model_type "granite", dense FFN; "granitemoe",
+//     Mixtral-style MoE FFN; e.g. ibm-granite/granite-3.1-* and
+//     granite-3.0-*-a800m) - BuildGraniteFromSafeTensors. The Llama block
+//     (RMSNorm + RoPE + SwiGLU, GQA, bias-free attention) plus FOUR scalar
+//     multipliers Llama lacks, all CONSTANT-SCALE folds at load (no new layer
+//     types): embedding_multiplier (embedding rows), residual_multiplier
+//     (o_proj / down_proj rows), attention_multiplier (replaces SDPA's
+//     1/sqrt(head_dim) score scale, folded into W_q) and logits_scaling
+//     (DIVIDES the final logits, folded as 1/logits_scaling into the LM
+//     head). granitemoe adds the fused 3-D expert slab
+//     (block_sparse_moe.input_linear/output_linear/router). See the LLAMA
+//     IMPORT section below.
 //   - Fine-tuned classifier checkpoints: BertForSequenceClassification
 //     ([CLS]-pooled) and GPT2ForSequenceClassification (last-token-pooled)
 //     - BuildBertForSequenceClassificationFromSafeTensors /
@@ -504,9 +522,9 @@ unit neuralpretrained;
 interface
 
 uses
-  Classes, SysUtils, fpjson, jsonparser,
+  Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
-  neuralgguf, neuralhftokenizer;
+  neuralgguf, neuralhftokenizer, neuralmxfp4;
 
 type
   EPretrainedImportError = class(Exception);
@@ -583,6 +601,22 @@ function BuildGPT2FromSafeTensorsEx(const FileName: string;
   pSeqClsHead: boolean = false; pExactGelu: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// Exports a TNNet previously wired by BuildGPT2FromSafeTensors[Ex] back to a
+// .safetensors file carrying the HF GPT-2 tensor NAMES (wte.weight, wpe.weight,
+// h.N.ln_1.weight/bias, h.N.attn.c_attn.weight/bias, h.N.attn.c_proj.*,
+// h.N.mlp.c_fc.*, h.N.mlp.c_proj.*, ln_f.weight/bias). It is the exact inverse
+// of the importer: HF Conv1D weights are stored [in, out] (the TRANSPOSE of the
+// Pascal neuron-major layout), so each c_* matrix is written W[i*out + j] =
+// Neuron[j].Weights[i]. The LM head is tied (= wte) and emitted as the unprefixed
+// lm_head.weight buffer. Config supplies the dimensions (pass the one returned
+// by BuildGPT2FromSafeTensorsEx); the named layers are recovered from the wired
+// net by walking it in the same order the importer built it. pDType selects the
+// on-disk encoding (stwF32 lossless default). Round-trips bit-exact through
+// BuildGPT2FromSafeTensors (see TestGPT2SafeTensorsRoundTrip).
+// Coded by Claude (AI).
+procedure SaveGPT2ToSafeTensors(Net: TNNet; const Config: TGPT2Config;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
 type
   // Parsed HF config.json "rope_scaling" (long-context extension), mapped
   // onto TNNetRotaryEmbedding's scaling-mode constructor arguments:
@@ -593,6 +627,9 @@ type
   //                        YarnAlpha=beta_slow, YarnBeta=beta_fast)
   //   "llama3"          -> rsmLlama3 (factor, original_max_position_embeddings,
   //                        YarnAlpha=low_freq_factor, YarnBeta=high_freq_factor)
+  //   "longrope"/"su"   -> rsmLongRoPE (Phi-3): per-frequency LongFactors table
+  //                        (long_factor, length head_dim/2) divides each
+  //                        inverse frequency, LongAttnFactor scales the output.
   // null/absent rope_scaling (and rope_type "default") parse to Mode=rsmNone,
   // which keeps the import bit-identical to the unscaled path.
   TRoPEScalingConfig = record
@@ -601,6 +638,21 @@ type
     OriginalContextLen: integer; // pretraining context (YaRN/llama3 ramp)
     YarnAlpha: TNeuralFloat;     // beta_slow (yarn) / low_freq_factor (llama3)
     YarnBeta: TNeuralFloat;      // beta_fast (yarn) / high_freq_factor (llama3)
+    // LongRoPE (rsmLongRoPE) only: the verbatim per-frequency long_factor
+    // table (length head_dim/2) and the output attention scaling (long_mscale,
+    // or sqrt(1+ln(max/orig)/ln(orig)) when no explicit mscale is given).
+    LongFactors: TNeuralFloatDynArr;
+    LongAttnFactor: TNeuralFloat;
+    // YaRN only: "truncate" (rope_parameters/rope_scaling). HF/the paper floor/
+    // ceil the correction-range band edges (truncate=true, the default here);
+    // gpt-oss ships "truncate": false (no rounding). Coded by Claude (AI).
+    YarnTruncate: boolean;
+    // YaRN only: explicit attention scaling folded from DeepSeek-V2/-V3's
+    // "mscale"/"mscale_all_dim" rope_scaling fields, =
+    //   _yarn_get_mscale(factor,mscale)/_yarn_get_mscale(factor,mscale_all_dim).
+    // 0 means "no explicit override" -> the layer uses the YaRN default
+    // 0.1*ln(factor)+1. Coded by Claude (AI).
+    YarnAttnFactor: TNeuralFloat;
   end;
 
 // The Mode=rsmNone record (Factor=1, OriginalContextLen=0, alpha=1, beta=32).
@@ -672,11 +724,179 @@ type
                                // only the first int(head_dim*factor)
                                // channels of each q/k head, the tail passes
                                // through (Phi-4-mini: 0.75); 0 or 1 = full
+    // ---- OLMo-2 deltas (all default off for the other families) ----
+    PostNormReordered: boolean;// REORDERED post-norm: RMSNorm on the SUBLAYER
+                               // OUTPUT before the residual add -
+                               // x + Norm(Attn(x)) - with NO input_layernorm
+                               // and NO pre-FFN norm (HF keys
+                               // post_attention_layernorm /
+                               // post_feedforward_layernorm)
+    QKNormFullWidth: boolean;  // RMSNorm over the FULL flattened q/k
+                               // projection width (num_heads*head_dim /
+                               // num_kv_heads*head_dim) AFTER the projection
+                               // and BEFORE the head split + RoPE - distinct
+                               // from the Qwen3/Gemma-3 PER-HEAD placement
+                               // (QKNorm)
+    // ---- Mixtral deltas (all default off for the other families) ----
+    IsMoE: boolean;            // every FFN is a block_sparse_moe: a router
+                               // (mlp gate linear -> num_local_experts
+                               // logits) + N independent SwiGLU experts,
+                               // softmax over ALL experts then top-k
+                               // routing with the top-k subset RENORMALIZED
+                               // (Mixtral; the standard top-2 sparse MoE)
+    NumLocalExperts: integer;  // num_local_experts (Mixtral: 8); experts
+                               // are block_sparse_moe.experts.{i}.w1/w2/w3
+    MoEExpertsPerTok: integer; // num_experts_per_tok routed per token
+                               // (Mixtral: 2); the renormalized top-k
+    // ---- Qwen3-MoE deltas (Mixtral-MoE FFN, Qwen3 QK-norm attention) ----
+    MoEGraniteNaming: boolean; // granitemoe FUSED experts: a single 3-D
+                               // block_sparse_moe.input_linear [E, 2I, H]
+                               // (gate|up per expert), output_linear
+                               // [E, H, I] (down per expert) and router
+                               // block_sparse_moe.router.layer.weight [E, H]
+                               // instead of Mixtral's per-expert 2-D w1/w2/w3.
+                               // Same MoE MATH as Mixtral (softmax over the
+                               // top-k logits = top-k renorm), only the slab
+                               // layout differs (see the granitemoe loader)
+    MoEQwen3Naming: boolean;   // experts use the Qwen3-MoE tensor names
+                               // (mlp.gate.weight router +
+                               // mlp.experts.{i}.gate_proj/up_proj/down_proj
+                               // .weight) instead of Mixtral's block_sparse_moe
+                               // .gate + experts.{i}.w1/w3/w2; off = Mixtral
+    MoEIntermediateSize: integer; // per-expert SwiGLU width when it DIFFERS
+                               // from intermediate_size (Qwen3-MoE
+                               // moe_intermediate_size); 0 = use
+                               // IntermediateSize (Mixtral, whose experts are
+                               // full-width)
+    MoENormTopK: boolean;      // renormalize the top-k gate probs to sum 1
+                               // (Mixtral: always true; Qwen3-MoE:
+                               // norm_topk_prob, default false)
+    MoEDecoderSparseStep: integer; // Qwen3-MoE decoder_sparse_step: a decoder
+                               // layer is MoE iff (layer_idx+1) mod step = 0
+                               // (HF modeling_qwen3_moe). 1 = every layer MoE
+                               // (the uniform stack); >1 intersperses dense
+                               // SwiGLU FFN layers. 0/unset treated as 1.
+    MoEMlpOnlyLayers: array of integer; // Qwen3-MoE mlp_only_layers: layer
+                               // indices FORCED to a dense SwiGLU FFN (plain
+                               // intermediate_size) regardless of the step
+                               // rule; empty = none
+    // ---- GLM-4 deltas (all default off for the other families) ----
+    GLM4SandwichNorm: boolean; // GLM-4 four-norm sandwich block: the usual
+                               // input_layernorm (attn pre) and
+                               // post_attention_layernorm (FFN pre) PLUS
+                               // post_self_attn_layernorm INSIDE the attention
+                               // residual branch and post_mlp_layernorm INSIDE
+                               // the FFN residual branch. Structurally the
+                               // SandwichNorm wiring (4 norms) but with GLM-4's
+                               // distinct tensor key names (see the loader)
+    FusedGateUp: boolean;      // FUSED bias-free mlp.gate_up_proj (gate|up
+                               // rows) WITHOUT a fused qkv_proj - GLM-4 keeps
+                               // SEPARATE q/k/v projections (with bias) but
+                               // fuses the MLP gate+up like Phi-3
+    InterleavedRotary: boolean;// q/k rows feed RoPE in the native INTERLEAVED
+                               // (even/odd) pair layout, so they load STRAIGHT
+                               // (no rotate_half row permutation) - GLM-4 (and
+                               // Cohere) rotate consecutive channel pairs, the
+                               // exact layout TNNetRotaryEmbedding expects
+    // ---- IBM Granite-3.x deltas (all default 1.0 = vanilla Llama) ----
+    // Granite keeps the Llama block (RMSNorm + RoPE + SwiGLU, dense or
+    // Mixtral-style MoE FFN) but multiplies four scalar knobs Llama lacks;
+    // all four are constant-scale FOLDS into existing weights at load time
+    // (no new layer types - see BuildGraniteFromSafeTensors):
+    EmbeddingMultiplier: TNeuralFloat; // embedding_multiplier: scale token
+                               // embeddings AFTER lookup (folded into the
+                               // embedding rows, like Gemma's EmbedScale but
+                               // an arbitrary scalar); the tied LM head reads
+                               // the UNSCALED rows. 1.0 = off
+    ResidualMultiplier: TNeuralFloat;  // residual_multiplier: scale EACH
+                               // attention/FFN sublayer output BEFORE the
+                               // residual add (folded into o_proj and
+                               // down_proj / expert down rows). 1.0 = off
+    AttentionMultiplier: TNeuralFloat; // attention_multiplier: REPLACES the
+                               // default 1/sqrt(head_dim) SDPA scale (folded
+                               // into W_q as attention_multiplier*sqrt(head_dim)
+                               // so SDPA's structural 1/sqrt(head_dim) yields
+                               // the requested scale). 0/absent = default
+    LogitsScaling: TNeuralFloat;       // logits_scaling: DIVIDE the final
+                               // logits by this before softmax (folded into
+                               // the LM head rows as 1/logits_scaling, exactly
+                               // like Cohere's logit_scale fold but DIVIDING).
+                               // 1.0 = off
+    SharedIntermediateSize: integer; // granitemoe shared_intermediate_size:
+                               // an always-on shared-expert SwiGLU MLP (width
+                               // shared_intermediate_size) that runs in
+                               // PARALLEL with the routed experts; its output
+                               // is ADDED to the routed-MoE output before the
+                               // FFN residual close (HF GraniteMoeShared:
+                               // hidden = moe(h) + shared_mlp(h)). Tensors:
+                               // shared_mlp.input_linear [2*S, H] (fused
+                               // gate|up) + shared_mlp.output_linear [H, S]
+                               // (down). 0 = no shared expert
+    // ---- BitNet b1.58 deltas (all default off for the other families) ----
+    BitNetSubLN: boolean;      // BitNet "norm-before-quantized-linear" SubLN:
+                               // an EXTRA RMSNorm INSIDE the attention branch
+                               // on the concatenated head outputs BEFORE o_proj
+                               // (attn_sub_norm) and INSIDE the FFN branch on
+                               // the gated activation BEFORE down_proj
+                               // (ffn_sub_norm). Distinct from the Gemma-2 /
+                               // OLMo-2 post-norms (those normalize the WHOLE
+                               // sublayer output AFTER the last projection; the
+                               // BitNet SubLN sits BEFORE it). Wired via the
+                               // existing pre-norm builder slots (no new layer)
+    ReGLUSquaredFFN: boolean;  // BitNet relu2 FFN: the SwiGLU activation slot is
+                               // replaced by TNNetReGLUSquared (up*ReLU(gate)^2,
+                               // ACT2FN "relu2") instead of SiLU SwiGLU
+    // ---- Llama-4 (text) deltas (all default off for the other families) ----
+    // Llama-4 interleaves RoPE and NoPE (no positional) attention layers,
+    // adds NoPE-layer temperature tuning + L2 QK-norm on the RoPE layers, and
+    // a sigmoid-gated top-k MoE with an always-on shared expert. See
+    // BuildLlama4FromSafeTensors. The RoPE layers use the INTERLEAVED
+    // (even/odd pair) rotary layout, so q/k load STRAIGHT (set via
+    // InterleavedRotary, shared with Cohere/GLM-4 - no rotate_half permute).
+    NoRopeLayers: array of boolean; // per-layer rope on/off (Llama-4
+                               // no_rope_layers; element i TRUE = layer i uses
+                               // RoPE, FALSE = NoPE/no positional at all).
+                               // Empty = every layer uses RoPE (vanilla).
+    Llama4QKL2Norm: boolean;   // use_qk_norm: an UNWEIGHTED L2 RMS-norm over
+                               // each q/k head (head_dim) applied AFTER RoPE on
+                               // the RoPE layers ONLY (Llama4TextL2Norm; the
+                               // NoPE layers and the 128E model skip it). Wired
+                               // as a gain=1 TNNetTokenRMSNorm per head.
+    AttnTempTuning: boolean;   // attn_temperature_tuning: on the NoPE layers
+                               // scale every query vector by the per-position
+                               // log-of-position factor (TNNetLlama4AttnTemperature)
+    AttnFloorScale: TNeuralFloat; // floor_scale (default 8192) for the above
+    AttnScale: TNeuralFloat;   // attn_scale (default 0.1) for the above
+    AttnChunkSize: integer;    // attention_chunk_size: the NoPE (chunked)
+                               // layers attend within blocks of this many
+                               // tokens; 0 = full attention. (A sequence no
+                               // longer than the chunk attends fully.)
+    MoESigmoidGate: boolean;   // Llama-4 router: top-k over the router logits
+                               // then SIGMOID of the survivors (not Mixtral's
+                               // softmax-then-renorm). Wired as PointwiseSigmoid
+                               // -> raw TNNetTopKGate (sigmoid is monotonic so
+                               // top-k selection is unchanged).
+    MoEScaleInput: boolean;    // Llama-4: the routed gate weight scales the
+                               // expert INPUT (HF: routed_out =
+                               // experts(g * x)), not the output. Because the
+                               // expert is a nonlinear SwiGLU, expert(g*x) !=
+                               // g*expert(x) - so the gate must ride the input.
+                               // Mixtral/Qwen3/granite scale the OUTPUT (off).
+    MoEGateUpTransposed: boolean; // Llama-4 fused expert slab layout
+                               // gate_up_proj [E, H, 2I] (hidden-major, gate
+                               // FIRST then up) and down_proj [E, I, H], vs
+                               // granitemoe's [E, 2I, H] / [E, H, I]. router is
+                               // a plain mlp.router or feed_forward.router
+                               // [E, H] linear (see the Llama-4 loader).
+    IntermediateSizeMLP: integer; // intermediate_size_mlp: the DENSE-layer
+                               // SwiGLU width (Llama-4's dense FFN is wider than
+                               // an MoE expert, whose width is IntermediateSize);
+                               // 0 = use IntermediateSize.
     Prefix: string;            // tensor-name prefix ('model.' or '')
   end;
 
 // Reads a HF Llama-family config.json (model_type 'llama', 'mistral',
-// 'qwen2', 'qwen3', 'gemma', 'gemma2', 'gemma3_text' or 'phi3').
+// 'qwen2', 'qwen3', 'gemma', 'gemma2', 'gemma3_text', 'phi3' or 'olmo2').
 // Required: hidden_size, intermediate_size,
 // num_hidden_layers, num_attention_heads, vocab_size,
 // max_position_embeddings. Defaults: num_key_value_heads =
@@ -809,6 +1029,131 @@ function BuildLlamaFromGGUF(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// ---- GENERIC GGUF IMPORT (architecture dispatch) -----------------------
+// Reads general.architecture from a .gguf file and dispatches to the right
+// builder so GGUF checkpoints beyond plain Llama import without the caller
+// having to know the family. The Llama-BACKBONE families (no new layer
+// type) are wired:
+//   llama  - delegates to BuildLlamaFromGGUFEx (the reference path).
+//   qwen2  - the Llama skeleton + q/k/v projection biases (o_proj and the
+//            MLP stay bias-free); reads the qwen2.* metadata prefix and the
+//            blk.N.attn_{q,k,v}.bias tensors (q/k biases de-interleaved like
+//            their rows). use_sliding_window is NOT wired (rejected).
+//   gemma2 - the Gemma-2 deltas matching BuildGemma2FromSafeTensors:
+//            gated-GELU MLP, zero-centered (1+w) RMSNorm, sqrt(d_model)
+//            embedding scale, sandwich norms (post_attention /
+//            post_feedforward layernorm INSIDE the residual branches),
+//            1:1 alternating local/global sliding window, query_pre_attn_
+//            scalar score scaling and attention/final logit soft-capping.
+//            Read from the gemma2.* metadata prefix; the GGUF tensor set
+//            adds blk.N.{post_attention_norm,post_ffw_norm}.weight. Gemma's
+//            q/k rows are NOT permuted by llama.cpp (no de-interleave).
+// OUT OF SCOPE for v1 (raise a clear error listing the supported set):
+//   - starcoder2: it uses LayerNorm (not RMSNorm) with biases on EVERY
+//     projection AND a non-gated GELU MLP - more than a trivial flag on the
+//     RMSNorm Llama path, so it is deliberately skipped here.
+//   - qwen3 / gemma3 / phi3 / MoE / Mamba / RWKV / BERT / enc-dec etc.:
+//     either need q/k-norm, fused slabs, per-layer theta, or a different
+//     backbone; import those through their dedicated safetensors builders.
+// pSeqLen / pInferenceOnly / pQuantizeInt8 behave as in BuildLlamaFromGGUFEx.
+// Coded by Claude (AI).
+function BuildFromGGUFEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildFromGGUF(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// ---- GGUF EXPORT (writer) ----------------------------------------------
+// The byte-for-byte inverse of BuildLlamaFromGGUFEx: writes a llama.cpp-
+// loadable .gguf for a Llama-family decoder whose HF-named weights live in
+// Reader (a safetensors / torch.bin / GGUF tensor source) and whose
+// hyperparameters live in Config. Emits the ggml container (magic, version
+// 3, 32-byte alignment), the llama.* metadata block (general.architecture
+// "llama", block_count / embedding_length / feed_forward_length /
+// attention.head_count[_kv] / context_length / rope.freq_base /
+// attention.layer_norm_rms_epsilon / vocab_size) and, when Tokens is
+// non-empty, a self-contained tokenizer.ggml.* block (model "llama", the
+// token list, and matching scores/token_type arrays). Tensors carry the
+// ggml-canonical names (token_embd, blk.N.attn_q/k/v/output, blk.N.ffn_
+// gate/up/down, blk.N.attn_norm/ffn_norm, output_norm, output) with the
+// dims reversed; the q/k projection rows are permuted from HF rotate_half
+// into the interleaved-rotary layout llama.cpp expects (the inverse of the
+// reader's de-interleave), so a write -> BuildLlamaFromGGUF round-trip
+// reproduces logits. pDType selects the matrix encoding (gwF32 lossless,
+// gwF16, gwQ8_0); 1-D norm gains always stay F32.
+//
+// SCOPE: the Llama BACKBONE plus its qwen2 and gemma2 siblings - the three
+// families BuildFromGGUF can read back. The architecture is selected from the
+// config: plain Llama/Mistral (SwiGLU, separate q/k/v, single theta);
+// "qwen2" when Config.QKVBias (adds the q/k/v projection biases); "gemma2"
+// when Config.GegluFFN (then RMSNormAddOne + SandwichNorm + AltSlidingWindow
+// are required) - it serializes the gated-GELU FFN, sqrt(d) embed scale, the
+// four-norm sandwich tensors, NEOX-order (unpermuted) q/k rows, and the
+// gemma2.* numeric deltas (sliding_window, query_pre_attn_scalar, attn/final
+// soft-caps). The remaining exotic deltas (MoE, fused qkv/gate-up, QK-norm,
+// partial rotary, per-layer theta, GLM-4/OLMo-2 norms) are NOT serialized and
+// are rejected loudly - out of scope for v1. Each emitted family is offline
+// round-trip-verified (write -> BuildFromGGUF -> logits) to < 1e-4. Q8_0 is
+// quantized on write (max|x|/127 + round, the ggml quantize_row_q8_0 ref).
+// The optional Tokenizer argument, when non-nil, takes precedence over the
+// plain Tokens array and routes the FULL tokenizer block through
+// TNeuralHFTokenizer.SaveTokenizerToGGUF - a byte-level-BPE tokenizer emits a
+// "gpt2" block (vocab + merges + special ids), a Unigram one a scored "llama"
+// block - so a GPT-2/Llama-3-vocab model exports end-to-end (weights + gpt2
+// tokenizer) in a single call and reads back self-contained through
+// LoadFromGGUF. The plain Tokens array path (minimal SentencePiece "llama"
+// block) is unchanged when Tokenizer is nil.
+procedure SaveLlamaToGGUFEx(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; const Tokens: array of string;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32;
+  Tokenizer: TNeuralHFTokenizer = nil);
+// As SaveLlamaToGGUFEx with the F32 (lossless) matrix encoding and no
+// tokenizer block (pass tokens to the Ex form for a self-contained file).
+procedure SaveLlamaToGGUF(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; const FileName: string);
+// Convenience: export Llama weights + a full TNeuralHFTokenizer (gpt2 byte-
+// level-BPE or llama Unigram) block end-to-end through SaveTokenizerToGGUF.
+procedure SaveLlamaToGGUFExWithTokenizer(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; Tokenizer: TNeuralHFTokenizer;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+
+// Exports a from-scratch CAI-trained (or imported) Llama held PURELY in wired
+// TNNet layers to GGUF - the inverse mapping of BuildLlamaFromTensorReader's
+// weight load. Net must be the exact plain-Llama layer stack
+// BuildLlamaFromSafeTensors produces (token embedding, per-block TokenRMSNorm
+// + Q/K/V/O PointwiseConvLinear projections + RMSNorm + fused SwiGLU gate|up /
+// down, final norm, output head); the architecture is described by Config (the
+// same TLlamaConfig the importer/SaveLlamaToGGUF takes - this does NOT infer
+// hyperparameters from layer shapes). Internally it reads the weights back OUT
+// of the wired layers into an in-memory HF-named tensor source (de-fusing the
+// SwiGLU gate|up split and DE-permuting q/k from the interleaved-rotary neuron
+// layout back to HF rotate_half) and then rides the existing SaveLlamaToGGUFEx
+// emitter, so the q/k re-permute, reversed ggml dims and F32/F16/Q8_0 paths are
+// shared byte-for-byte with the reader-source export. The same out-of-scope
+// architecture deltas (MoE/fused-qkv/sandwich/QK-norm/partial-rotary/per-layer
+// theta/soft-cap/embed-scale) are rejected loudly. pDType selects the on-disk
+// matrix encoding (gwF32 lossless default; gwF16/gwQ8_0 lossy). Q8_0 here
+// re-quantizes from the FP32 layer weights (writing Q8_0 STRAIGHT from int8
+// quantized storage is a separate follow-up). Coded by Claude (AI).
+procedure SaveTNNetLlamaToGGUFEx(Net: TNNet;
+  const Config: TLlamaConfig; const Tokens: array of string;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+// As SaveTNNetLlamaToGGUFEx with the F32 (lossless) encoding and no tokenizer
+// block.
+procedure SaveTNNetLlamaToGGUF(Net: TNNet;
+  const Config: TLlamaConfig; const FileName: string);
+
+// HF-names safetensors exporter: the exact inverse of
+// BuildLlamaFromSafeTensors. Writes the wired Llama TNNet's weights to a
+// .safetensors file under HF tensor names (q/k rotate_half de-permute, SwiGLU
+// gate|up un-fuse, Gemma RMSNorm gain offset all undone), so a re-import via
+// BuildLlamaFromSafeTensors (with the matching config.json) is bit-identical.
+// Weights only - supply the original config.json at import time.
+procedure SaveLlamaToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
 // Mistral: the Llama skeleton + optional sliding-window attention (config
 // sliding_window; null/absent = full attention). Thin wrappers over the
 // Llama path that ASSERT the config's model_type is 'mistral'.
@@ -844,6 +1189,126 @@ function BuildQwen3FromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildQwen3FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// HF-names safetensors exporter - the exact inverse of
+// BuildQwen3FromSafeTensors. Re-derives the HF-named weight set from the
+// wired layers (the q/k rotate_half de-permutation and SwiGLU gate|up
+// un-fusion of the Llama exporter PLUS the per-head q/k RMSNorm gain
+// un-pack: each block's shared [head_dim] q_norm/k_norm gain is read back
+// from the first per-head TNNetTokenRMSNorm copy and rotate_half-de-permuted)
+// and writes it under the precise model.embed_tokens / model.layers.N.* /
+// model.norm / lm_head names BuildQwen3FromSafeTensors reads, so a re-import
+// is bit-identical. Tied-embedding models omit lm_head.weight. The matching
+// config.json must accompany the file for re-import. Coded by Claude (AI).
+procedure SaveQwen3ToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
+// Qwen3-MoE (model_type "qwen3_moe", e.g. Qwen/Qwen3-30B-A3B and smaller
+// Qwen3-MoE chat checkpoints): the CROSS of the dense-Qwen3 attention and a
+// sparse top-k Mixture-of-Experts FFN. The attention side is the Qwen3 path
+// VERBATIM (per-head q/k RMSNorm before RoPE, GQA, no q/k/v bias). Every FFN
+// is replaced by a Mixtral-style block: a router (mlp.gate.weight,
+// num_experts logits) -> per-token softmax over ALL experts -> hard top-k
+// (num_experts_per_tok) gate, the top-k subset renormalized iff
+// norm_topk_prob, feeding num_experts independent SwiGLU experts of width
+// moe_intermediate_size (mlp.experts.{i}.gate_proj/up_proj/down_proj.weight).
+// NO shared expert and NO per-expert/router bias - the distinction from
+// DeepSeek-V2 (MLA + shared experts). Only the uniform all-MoE stack
+// (decoder_sparse_step=1, empty mlp_only_layers) is wired. Thin wrappers over
+// the Llama path that ASSERT the config's model_type is 'qwen3_moe'.
+function BuildQwen3MoeFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildQwen3MoeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// Llama-4 text decoder (model_type "llama4" / "llama4_text",
+// meta-llama/Llama-4-Scout-17B-16E and the community redistills). Text-only -
+// the vision tower is OUT OF SCOPE. Rides the core Llama builder with five
+// genuinely new pieces no other importer combines:
+//  (a) iRoPE - interleaved attention: most layers use RoPE, but the NoPE
+//      layers (no_rope_layers[i]=0, every no_rope_layer_interval-th layer)
+//      carry NO positional encoding and switch to a CHUNKED-causal mask of
+//      width attention_chunk_size. The RoPE layers use the INTERLEAVED rotary
+//      layout (q/k load straight, no rotate_half permutation).
+//  (b) attn_temperature_tuning - on the NoPE layers each query is scaled by a
+//      per-position log factor (TNNetLlama4AttnTemperature, floor_scale /
+//      attn_scale).
+//  (c) use_qk_norm - an UNWEIGHTED L2 RMS-norm over each q/k head AFTER RoPE,
+//      on the RoPE layers ONLY (a gain=1 TNNetTokenRMSNorm).
+//  (d) sigmoid-gated top-k MoE (top-k logits -> sigmoid, no renorm) with an
+//      always-on SHARED EXPERT summed onto the routed output (the Llama-4
+//      transposed fused 3-D expert slabs gate_up_proj [E,H,2I] / down_proj
+//      [E,I,H]); the dense (non-MoE) layers use the wider intermediate_size_mlp.
+//      Dense for the first interleave_moe_layer_step-1 layers, MoE thereafter
+//      (moe_layers).
+//  (e) the TikToken byte-level BPE tokenizer (the GPT-2 path).
+// Tied embeddings. Thin wrappers that ASSERT model_type is llama4/llama4_text.
+function ReadLlama4ConfigFromJSONFile(const FileName: string): TLlamaConfig;
+
+function BuildLlama4FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildLlama4FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// OLMo-2 (model_type "olmo2", e.g. allenai/OLMo-2-0425-1B - the fully-open
+// weights+data+code family): the Llama tensor layout (SwiGLU, RoPE, no
+// biases) with TWO architectural deltas:
+// (a) REORDERED post-norm - RMSNorm applied to the SUBLAYER OUTPUT before
+//     the residual add, x + Norm(Attn(x)) / x + Norm(MLP(x)) (HF keys
+//     post_attention_layernorm / post_feedforward_layernorm; there is NO
+//     input_layernorm and no pre-FFN norm) - a third placement beside the
+//     pre-norm (Llama) and sandwich-norm (Gemma-2) conventions (see
+//     TNNet.AddOutputNormResidual for the builder form);
+// (b) q/k RMSNorm over the FULL flattened projection width
+//     (num_heads*head_dim / num_kv_heads*head_dim) AFTER the projection and
+//     BEFORE the head split + RoPE (HF keys q_norm / k_norm) - distinct
+//     from the Qwen3/Gemma-3 PER-HEAD placement whose RMS statistic spans
+//     head_dim channels only.
+// The final norm is the standard model.norm and the tokenizer is a stock
+// GPT-NeoX-style BPE tokenizer.json (TNeuralHFTokenizer). Thin wrappers
+// over the Llama path that ASSERT the config's model_type is 'olmo2'.
+function BuildOlmo2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildOlmo2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// OLMoE (model_type "olmoe", e.g. allenai/OLMoE-1B-0924 - the fully-open
+// Apache-2.0 SPARSE MoE sibling of dense OLMo-2). The cross-product of two
+// landed importer pieces with NO new layer class:
+// (a) attention/norm placement is the ORIGINAL OLMo PRE-NORM block (NOT
+//     OLMo-2's reordered post-norm): standard input_layernorm before the
+//     attention residual and post_attention_layernorm before the FFN
+//     residual. q/k RMSNorm is over the FULL flattened projection width
+//     (the OLMo-2 QKNormFullWidth flag) BEFORE the head split + RoPE.
+// (b) the FFN is a Mixtral-style top-k router over num_experts SwiGLU
+//     experts, wired EXACTLY like Qwen3-MoE (router softmax over ALL experts
+//     -> hard top-k num_experts_per_tok, subset renormalized iff
+//     norm_topk_prob). The released checkpoint ships the Qwen3-MoE tensor
+//     dialect (mlp.gate.weight + mlp.experts.{i}.gate_proj/up_proj/down_proj).
+// OLMoE is UNIFORMLY MoE: EVERY decoder layer is a sparse block (no
+// mlp_only_layers / decoder_sparse_step in HF), and the expert width is the
+// plain intermediate_size. Thin wrappers over the Llama path that ASSERT the
+// config's model_type is 'olmoe'.
+function BuildOlmoeFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildOlmoeFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -954,6 +1419,232 @@ function BuildPhi3FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// BitNet b1.58 (model_type "bitnet", microsoft/bitnet-b1.58-2B-4T - the
+// ternary-weight LLM family): the Llama backbone (RMSNorm + RoPE) with two
+// deltas, both wired onto the existing builder slots with NO new layer class
+// for the norms:
+// (a) BitNet SubLN ("norm-before-quantized-linear"): an EXTRA RMSNorm INSIDE
+//     each residual branch BEFORE the quantized projection - attn_sub_norm on
+//     the concatenated head outputs before o_proj and ffn_sub_norm on the gated
+//     activation before down_proj (HF BitNetAttention / BitNetMLP). Distinct
+//     from the Gemma-2 / OLMo-2 post-norms (those normalize AFTER the last
+//     projection); this one sits BEFORE it.
+// (b) relu2 gated FFN (hidden_act "relu2"): down(ffn_sub_norm(relu2(gate)*up))
+//     with SEPARATE gate_proj/up_proj, so the SwiGLU activation slot becomes
+//     the squared-ReLU TNNetReGLUSquared (up * ReLU(gate)^2).
+// The ternary weights ride the standard de-quant-at-load convention (the same
+// path as the GGUF / MXFP4 importers): the HF transformers checkpoint
+// (BitNetForCausalLM) ships FP shadow weights that are already the
+// ternary*scale effective weights and uses plain nn.Linear, so matching it
+// bit-for-bit means loading them straight (the absmean ternarize is a no-op
+// round-trip on already-ternary weights; the native I2_S 2-bit packed format
+// is converted to the same effective weights). Thin wrappers over the Llama
+// path that ASSERT model_type is 'bitnet'.
+function BuildBitNetFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildBitNetFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// InternLM2 / InternLM2.5 (model_type "internlm2", e.g.
+// internlm/internlm2_5-1_8b / internlm2_5-7b / internlm2_5-20b): a plain
+// Llama backbone (RMSNorm + RoPE + SwiGLU, GQA, untied output head) whose
+// ONLY genuinely new piece is the checkpoint TENSOR LAYOUT - the math rides
+// the existing Llama path unchanged. Two layout differences, both resolved
+// by an InternLM2->HF translating reader BEFORE the core builder runs:
+// (a) the FUSED attention.wqkv slab. It is reshaped
+//     [num_kv_heads, (q_per_kv + 2), head_dim, hidden] and concatenates,
+//     PER KV GROUP, that group's q_per_kv query slices, then its single K,
+//     then its single V slice - so the rows are NEITHER contiguous Q|K|V
+//     thirds NOR GPT-NeoX per-head interleaving. The reader gathers all Q
+//     rows of all groups (group-major), then all K, then all V into standard
+//     separate W_q/W_k/W_v in HF rotate_half order; the core builder then
+//     applies its usual rotate_half->interleaved q/k de-permute for RoPE.
+// (b) the InternLM2 tensor NAMES (model.tok_embeddings / attention.wqkv|wo /
+//     feed_forward.w1=gate|w2=down|w3=up / attention_norm / ffn_norm /
+//     output) are renamed to the standard HF Llama names the core builder
+//     reads (embed_tokens / self_attn.{q,k,v,o}_proj / mlp.{gate,up,down}_proj
+//     / input_layernorm / post_attention_layernorm / lm_head). The tokenizer
+//     is a SentencePiece .model (already supported). attention biases
+//     (config "bias"=true) are rejected (the released checkpoints are
+//     bias-free). Thin wrappers over the Llama path that ASSERT the config's
+//     model_type is 'internlm2'.
+function BuildInternLM2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildInternLM2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// GLM-4 (model_type "glm4", e.g. THUDM/GLM-4-9B-0414 / zai-org/GLM-4 text
+// checkpoints - NOT the older two-norm "glm"): the Llama skeleton (GQA,
+// SwiGLU, RoPE, model.norm + untied lm_head) with four architectural deltas
+// (no new layers - it composes the SandwichNorm + partial-rotary builders):
+// (a) FOUR-norm SANDWICH block - input_layernorm (attention pre-norm) and
+//     post_attention_layernorm (FFN pre-norm) PLUS post_self_attn_layernorm
+//     INSIDE the attention residual branch and post_mlp_layernorm INSIDE the
+//     FFN residual branch (the Gemma-2 sandwich WIRING with GLM-4's distinct
+//     tensor key names);
+// (b) PARTIAL rotary - partial_rotary_factor 0.5, RoPE rotates only the
+//     first int(head_dim*0.5) channels of each q/k head (the same
+//     RotaryDims slice wiring proven on Phi-3 / GPT-NeoX);
+// (c) INTERLEAVED rotary - GLM-4 rotates consecutive channel PAIRS
+//     (rotate_half over x[0::2]/x[1::2]), the native TNNetRotaryEmbedding
+//     layout, so the q/k rows load STRAIGHT (no rotate_half permutation);
+// (d) SEPARATE q/k/v projections WITH bias (attention_bias true) and a
+//     bias-free o_proj, with a FUSED bias-free mlp.gate_up_proj (gate|up
+//     rows, the Phi-3 packing). Thin wrappers over the Llama path that
+//     ASSERT the config's model_type is 'glm4'.
+function BuildGLM4FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildGLM4FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// Imports a HF Mixtral checkpoint (model_type "mixtral", e.g.
+// mistralai/Mixtral-8x7B-v0.1): a stock Mistral/Llama decoder (full
+// MHA/GQA, RoPE, optional sliding window) whose every FFN is replaced by
+// block_sparse_moe = a router gate linear (num_local_experts logits) + N
+// independent SwiGLU experts (experts.{i}.w1/w2/w3), softmax over ALL
+// experts then top-k (num_experts_per_tok, default 2) routing with the
+// top-k subset RENORMALIZED (HF normalize_topk_prob). No shared expert, no
+// MLA - distinct from BuildDeepSeekV2FromSafeTensors. Runs on the shared
+// Llama path (TLlamaConfig.IsMoE).
+function BuildMixtralFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildMixtralFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// Builds an IBM Granite 3.x decoder (HF GraniteForCausalLM, model_type
+// "granite", dense FFN; or GraniteMoeForCausalLM, model_type "granitemoe",
+// Mixtral-style sparse top-k MoE FFN). Granite is the Llama block (RMSNorm +
+// RoPE + SwiGLU, GQA, bias-free attention) plus FOUR scalar multipliers Llama
+// lacks, all CONSTANT-SCALE folds at load (no new layer types):
+//   embedding_multiplier  - scale token embeddings after lookup (folded into
+//                           the embedding rows; NOT into the tied LM head);
+//   residual_multiplier   - scale each attention/FFN sublayer output before
+//                           the residual add (folded into o_proj and the
+//                           FFN down_proj / expert output_linear rows);
+//   attention_multiplier  - replaces SDPA's 1/sqrt(head_dim) score scale
+//                           (folded into W_q as multiplier*sqrt(head_dim));
+//   logits_scaling        - DIVIDES the final logits before softmax (folded
+//                           into the LM head rows as 1/logits_scaling, like
+//                           Cohere's logit_scale fold but dividing).
+// All four default to 1.0 (absent) so a vanilla-Llama-shaped config imports
+// unchanged. granitemoe carries the same four multipliers and a fused 3-D
+// expert slab (block_sparse_moe.input_linear/output_linear/router); its
+// gating (softmax over the top-k logits) is identical to Mixtral's top-k
+// renorm. A non-zero shared_intermediate_size (GraniteMoeShared) adds an
+// always-on full-width SwiGLU shared expert (shared_mlp.input_linear/
+// output_linear) run in PARALLEL with the routed experts and
+// SUMMED with the routed output before the FFN residual close.
+function BuildGraniteFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildGraniteFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// MiniCPM (openbmb/MiniCPM-1.2B / 2B-sft/dpo, model_type "minicpm"): the Llama
+// backbone with OpenBMB's muP-style depth/width rescaling (scale_emb,
+// scale_depth/sqrt(num_layers), hidden_size/dim_model_base) folded into the
+// existing Granite-style multiplier slots at load (no new layer types).
+function BuildMiniCPMFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildMiniCPMFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+type
+  // GPT-OSS (OpenAI gpt-oss, model_type "gpt_oss"; openai/gpt-oss-20b and
+  // gpt-oss-120b). A sparse top-k MoE decoder that CROSSES several subsystems:
+  //  - attention with a LEARNED PER-HEAD SINK logit appended to the softmax
+  //    denominator (TNNetGptOssSinkAttention; the sink leaks softmax mass off
+  //    the real keys but contributes nothing to the value mix);
+  //  - ALTERNATING sliding-window / full attention per layer (layer_types,
+  //    the same per-layer banded-window wiring as Gemma-2/3);
+  //  - YaRN RoPE (rope_parameters.rope_type "yarn") on EVERY layer;
+  //  - FFN = top-k routed experts with gpt-oss's CLAMPED-SwiGLU activation
+  //    (TNNetGptOssGatedSwiGLU, alpha=1.702/limit=7.0), the gate|up projection
+  //    INTERLEAVED (gate=even, up=odd) and BOTH the expert projections AND the
+  //    router carrying biases;
+  //  - the MoE expert matrices ship as MXFP4 4-bit blocks in real checkpoints
+  //    ("...experts.gate_up_proj_blocks"/"_scales" + "...down_proj_blocks"/
+  //    "_scales", uint8) - dequantized at load via DequantizeMXFP4. A checkpoint
+  //    that ships the experts already in plain F32/F16/BF16
+  //    ("...experts.gate_up_proj" / "...down_proj", batched [E,in,out]) loads
+  //    straight (the pico parity fixture uses this form to stay tiny).
+  // Coded by Claude (AI).
+  TGptOssConfig = record
+    HiddenSize: integer;       // hidden_size
+    IntermediateSize: integer; // per-expert SwiGLU width (intermediate_size)
+    NumLayers: integer;        // num_hidden_layers
+    NumHeads: integer;         // num_attention_heads
+    NumKVHeads: integer;       // num_key_value_heads (GQA)
+    HeadDim: integer;          // head_dim
+    VocabSize: integer;        // vocab_size
+    MaxPositions: integer;     // max_position_embeddings
+    RmsNormEps: TNeuralFloat;  // rms_norm_eps
+    RopeTheta: TNeuralFloat;   // rope_parameters.rope_theta
+    SlidingWindow: integer;    // sliding_window (sliding layers)
+    NumLocalExperts: integer;  // num_local_experts
+    NumExpertsPerTok: integer; // num_experts_per_tok (top-k)
+    SwiGLUAlpha: TNeuralFloat; // clamped-SwiGLU alpha (1.702)
+    SwiGLULimit: TNeuralFloat; // clamped-SwiGLU clamp limit (7.0)
+    TieWordEmbeddings: boolean;// tie_word_embeddings
+    LayerIsSliding: array of boolean; // per-layer attention type (layer_types)
+    RopeScaling: TRoPEScalingConfig;  // parsed rope_parameters (YaRN)
+    Prefix: string;            // 'model.' or ''
+  end;
+
+// Reads a HF gpt_oss config.json (model_type "gpt_oss"). Required:
+// hidden_size, intermediate_size, num_hidden_layers, num_attention_heads,
+// vocab_size. Defaults: num_key_value_heads = num_attention_heads,
+// head_dim = 64, rms_norm_eps = 1e-5, num_local_experts = 128,
+// num_experts_per_tok = 4, sliding_window = 128, max_position_embeddings =
+// 131072, tie_word_embeddings = false. layer_types (a list of
+// "sliding_attention"/"full_attention") sets the per-layer window; when absent
+// it defaults to the gpt-oss alternating pattern (even = sliding, odd = full).
+// rope_parameters (rope_type "yarn" + rope_theta/factor/beta_fast/beta_slow/
+// original_max_position_embeddings) is parsed into RopeScaling.
+function ReadGptOssConfigFromJSONFile(const FileName: string): TGptOssConfig;
+
+function GptOssConfigToString(const Config: TGptOssConfig): string;
+
+// Builds the gpt-oss decoder from Config and loads every weight from the
+// checkpoint at FileName (single .safetensors, a .safetensors.index.json
+// shard set - the real 20B/120B checkpoints are sharded - or pytorch_model.bin
+// via CreatePretrainedTensorReader). ConfigFileName overrides the config.json
+// location (defaults to a sibling of FileName). pSeqLen caps the context (0 =
+// max_position_embeddings). pInferenceOnly / pQuantizeInt8 mirror the other
+// importers. gpt-oss-120b imports with the SAME path but is RAM-gated like the
+// other large checkpoints - use pInferenceOnly and a sharded checkpoint.
+function BuildGptOssFromSafeTensorsEx(const FileName: string;
+  out Config: TGptOssConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildGptOssFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
 type
   TGPTNeoConfig = record
     HiddenSize: integer;       // d_model (hidden_size)
@@ -1060,6 +1751,118 @@ function BuildGPTNeoXFromSafeTensors(const FileName: string;
   pQuantizeInt8: boolean = false): TNNet;
 
 type
+  // HF Starcoder2Config (model_type "starcoder2", bigcode/starcoder2-3b/7b/15b).
+  // The first CODE-specialised decoder: RoPE + GQA + (optional) sliding-window
+  // attention pinned to three GPT-2-flavoured pieces the RMSNorm/SwiGLU Llama
+  // path does NOT use - biased nn.LayerNorm norms (NOT RMSNorm), bias=True on
+  // EVERY linear (q/k/v AND o_proj - the path OLMo-2 deliberately rejects), and
+  // a plain two-matrix gelu_pytorch_tanh FFN (c_fc -> GELU -> c_proj, NO gate).
+  TStarCoder2Config = record
+    HiddenSize: integer;        // hidden_size (d_model)
+    IntermediateSize: integer;  // intermediate_size (c_fc width)
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads (query heads)
+    NumKVHeads: integer;        // num_key_value_heads (GQA/MQA)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings
+    LayerNormEps: TNeuralFloat; // norm_epsilon (nn.LayerNorm eps, default 1e-5)
+    RopeTheta: TNeuralFloat;    // rope_theta (RoPE base)
+    SlidingWindow: integer;     // sliding_window (0/null = full attention; when
+                                // set, applies to EVERY layer - no pattern)
+    UseBias: boolean;           // use_bias: q/k/v/o AND c_fc/c_proj carry biases
+                                // (default true); lm_head is ALWAYS bias-free
+    TieWordEmbeddings: boolean; // tie_word_embeddings (config default true; the
+                                // released 3b/7b/15b checkpoints are UNTIED)
+    Prefix: string;             // tensor-name prefix ('model.' or '')
+  end;
+
+// Reads a HF Starcoder2 config.json (model_type 'starcoder2'). Required:
+// hidden_size, intermediate_size, num_hidden_layers, num_attention_heads,
+// vocab_size, max_position_embeddings. Defaults: num_key_value_heads =
+// num_attention_heads, norm_epsilon = 1e-5, rope_theta = 10000 (also read from
+// rope_parameters.rope_theta when present), sliding_window = 0 (full
+// attention), use_bias = true, tie_word_embeddings = true. hidden_act must be
+// 'gelu_pytorch_tanh' (the only released form). head_dim = hidden/heads.
+function ReadStarCoder2ConfigFromJSONFile(const FileName: string): TStarCoder2Config;
+
+function StarCoder2ConfigToString(const Config: TStarCoder2Config): string;
+
+// Builds a TNNet with the Starcoder2 architecture described by the config and
+// loads every weight from the safetensors/.bin checkpoint at FileName (see the
+// STARCODER2 IMPORT section). The net takes a (SeqLen,1,1) volume of token ids
+// and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses the full
+// max_position_embeddings context. Config.Prefix is detected and written back.
+function BuildStarCoder2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TStarCoder2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildStarCoder2FromSafeTensorsEx(const FileName: string;
+  out Config: TStarCoder2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildStarCoder2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+type
+  // HF GPTBigCodeConfig (model_type "gpt_bigcode", architectures
+  // ["GPTBigCodeForCausalLM"]; bigcode/starcoder, bigcode/gpt_bigcode-santacoder
+  // and the StarCoder-v1 / StarCoderBase family). The same biased-pre-LN GPT-2
+  // skeleton as StarCoder2 (biased nn.LayerNorm norms, bias=True on every
+  // nn.Linear, a two-matrix gelu_pytorch_tanh FFN) but with the two GPT-2
+  // hallmarks StarCoder2 dropped: LEARNED absolute position embeddings (a wpe
+  // table added to wte; NO RoPE) and a FUSED c_attn slab. The defining twist is
+  // MULTI-QUERY attention (multi_query=true): a SINGLE shared K/V head
+  // broadcast to every query head (GQA with kv_heads = 1), so the c_attn slab
+  // is [q (n_head*head_dim) | k (head_dim) | v (head_dim)].
+  TGptBigCodeConfig = record
+    HiddenSize: integer;        // n_embd (d_model)
+    IntermediateSize: integer;  // n_inner (c_fc width; null = 4*n_embd)
+    NumLayers: integer;         // n_layer
+    NumHeads: integer;          // n_head (query heads)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // n_positions (wpe rows / context length)
+    LayerNormEps: TNeuralFloat; // layer_norm_epsilon (nn.LayerNorm eps, 1e-5)
+    MultiQuery: boolean;        // multi_query: true = 1 shared K/V head (the
+                                // only form wired here; false = full MHA)
+    TieWordEmbeddings: boolean; // tie_word_embeddings (config default true)
+    Prefix: string;             // tensor-name prefix ('transformer.' or '')
+  end;
+
+// Reads a HF GPTBigCode config.json (model_type 'gpt_bigcode'). Required:
+// n_embd (or hidden_size), n_layer, n_head, vocab_size, n_positions. Defaults:
+// n_inner = 4*n_embd, layer_norm_epsilon = 1e-5, multi_query = true,
+// tie_word_embeddings = true. activation_function must be 'gelu_pytorch_tanh'
+// or 'gelu_new'. head_dim = n_embd / n_head. multi_query=false is rejected
+// (no committed checkpoint uses it; the released family is all MQA).
+function ReadGptBigCodeConfigFromJSONFile(const FileName: string): TGptBigCodeConfig;
+
+function GptBigCodeConfigToString(const Config: TGptBigCodeConfig): string;
+
+// Builds a TNNet with the GPT-BigCode architecture described by the config and
+// loads every weight from the safetensors/.bin checkpoint at FileName (see the
+// GPT-BIGCODE IMPORT section). The net takes a (SeqLen,1,1) volume of token ids
+// and outputs (SeqLen,1,vocab) logits. pSeqLen = 0 uses the full
+// n_positions context. Config.Prefix is detected and written back.
+function BuildGptBigCodeFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGptBigCodeConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildGptBigCodeFromSafeTensorsEx(const FileName: string;
+  out Config: TGptBigCodeConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildGptBigCodeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+type
   TGPTJConfig = record
     HiddenSize: integer;        // d_model (n_embd)
     IntermediateSize: integer;  // MLP width (n_inner; null = 4*n_embd)
@@ -1106,6 +1909,64 @@ function BuildGPTJFromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildGPTJFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+type
+  TCohereConfig = record
+    HiddenSize: integer;        // d_model (hidden_size)
+    IntermediateSize: integer;  // SwiGLU MLP width (intermediate_size)
+    NumLayers: integer;         // decoder blocks (num_hidden_layers)
+    NumHeads: integer;          // query heads (num_attention_heads)
+    NumKVHeads: integer;        // K/V heads (num_key_value_heads; GQA/MQA)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings (context length)
+    HeadDim: integer;           // per-head width; 0 = hidden_size/num_heads
+    LayerNormEps: TNeuralFloat; // layer_norm_eps
+    RopeTheta: TNeuralFloat;    // rope_theta (RoPE base)
+    LogitScale: TNeuralFloat;   // logit_scale (final logits *= it; folded
+                                // into the tied LM-head rows at load)
+    TieWordEmbeddings: boolean; // tie_word_embeddings (Cohere: TRUE)
+    UseQKNorm: boolean;         // per-head q/k LayerNorm pre-RoPE (cohere
+                                // only; CohereLayerNorm = mean-subtracting)
+    ModelType: string;          // 'cohere' or 'cohere2'
+    SlidingWindow: integer;     // cohere2 sliding-window width (0 = cohere)
+    SlidingWindowPattern: integer; // cohere2: every Nth layer global, the
+                                // rest local AND RoPE only on local layers
+                                // (global = NoPE); 0 = cohere (full + RoPE)
+    Prefix: string;             // tensor-name prefix ('model.' or '')
+  end;
+
+// Reads a HF Cohere config.json (model_type 'cohere' or 'cohere2').
+// Required: hidden_size, intermediate_size, num_hidden_layers,
+// num_attention_heads, vocab_size, max_position_embeddings. Defaults:
+// num_key_value_heads = num_attention_heads, layer_norm_eps = 1e-5,
+// rope_theta = 10000, logit_scale = 0.0625, tie_word_embeddings = true,
+// use_qk_norm = false. cohere2 adds sliding_window (4096) and
+// sliding_window_pattern (4); attention_bias=true and any non-silu
+// hidden_act are rejected. See the COHERE IMPORT section.
+function ReadCohereConfigFromJSONFile(const FileName: string): TCohereConfig;
+
+function CohereConfigToString(const Config: TCohereConfig): string;
+
+// Builds the Cohere Command-R / Aya (model_type 'cohere') or Command-R7B
+// ('cohere2') decoder and loads every weight from FileName. The net takes a
+// (SeqLen,1,1) volume of token ids and outputs (SeqLen,1,vocab) logits
+// already scaled by logit_scale (folded into the tied LM head). See the
+// COHERE IMPORT section for the architecture mapping. pSeqLen/pInferenceOnly/
+// pQuantizeInt8 behave as on the Llama path.
+function BuildCohereFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TCohereConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildCohereFromSafeTensorsEx(const FileName: string;
+  out Config: TCohereConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildCohereFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
@@ -1242,10 +2103,22 @@ function BertConfigToString(const Config: TBertConfig): string;
 // [CLS] / <s> position) carries HF's class logits (see the SEQUENCE
 // CLASSIFICATION IMPORT section). num_labels is inferred from the final
 // classifier weight shape.
+// pPaddingMask (default false) is an OPT-IN key-padding-mask mode. With it
+// OFF the input is (SeqLen,1,2) (token ids, token-type ids) and the behavior
+// is bit-identical to before. With it ON the input becomes (SeqLen,1,3): the
+// EXTRA channel 2 carries a per-position segment id (0 = a real token, any
+// other value = a position to be excluded as a KEY from every real query's
+// softmax). That channel is threaded as the per-sample segment-mask source
+// into every bidirectional-attention block (the existing
+// TNNetScaledDotProductAttention segment mask), so a document shorter than
+// SeqLen is encoded EXACTLY (real tokens never attend to the [PAD] rows). The
+// caller fills channel 2 with 0 for the real prefix and 1 for the padding
+// tail (see ColBERTEmbedTokens).
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
-  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false;
+  pPaddingMask: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
@@ -1257,6 +2130,28 @@ function BuildBertFromSafeTensorsEx(const FileName: string;
 function BuildBertFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pIncludePooler: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Re-emits a wired BERT-family encoder (built by BuildBertFromSafeTensors) as
+// a HF-named .safetensors checkpoint - the exact inverse of the importer's
+// name map and transforms. Config must be the one the importer returned (it
+// carries Family / Prefix / PositionOffset / HiddenActTanh). Round-trips
+// bit-for-bit for bert/distilbert; for roberta the first PositionOffset
+// position-table rows are NEVER read by the net (padding positions) and so
+// cannot be recovered - they are re-emitted as zeros, which the importer
+// skips anyway. pIncludePooler re-emits the pooler.dense head when the net
+// carries it. Coded by Claude (AI).
+procedure SaveBertToSafeTensors(Net: TNNet; const Config: TBertConfig;
+  const FileName: string; pIncludePooler: boolean = false;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
+// Inverse of BuildGPTNeoXFromSafeTensors: walks the wired GPT-NeoX decoder
+// in importer build order, recovers each HF-named tensor with the EXACT
+// inverse of every load transform (re-interleaving the per-head Q|K|V slab
+// back into the single fused query_key_value tensor, undoing the partial
+// rotate_half permutation) and saves the .safetensors under the gpt_neox.*
+// name map. Config.Prefix selects the tensor-name prefix ('gpt_neox.' or '').
+procedure SaveGPTNeoXToSafeTensors(Net: TNNet; const Config: TGPTNeoXConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
 
 // ======================= SENTENCE EMBEDDINGS ===============================
 // sentence-transformers style sentence vectors on top of the BERT encoder
@@ -1293,6 +2188,236 @@ procedure BertPoolSentenceEmbedding(HiddenStates: TNNetVolume;
 // padded calls return an approximation.
 procedure BertEncodeSentence(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
   const Text: string; Embedding: TNNetVolume);
+
+// ------------------- generalized pooling + instructions -------------------
+// Sentence-embedding pooling modes generalizing BertPoolSentenceEmbedding's
+// mean-only head:
+//   epCLS       - the FIRST token (row 0), BERT/[CLS]-pooler convention.
+//   epMean      - mean over the REAL tokens (== BertPoolSentenceEmbedding).
+//   epLastToken - the LAST real token (row RealTokens-1), the e5-mistral /
+//                 decoder-as-encoder convention.
+type
+  TNNetEmbedPooling = (epCLS, epMean, epLastToken);
+
+// Pools the (SeqLen,1,hidden) HiddenStates into Embedding (1,1,hidden) using
+// the requested Pooling mode over the first RealTokens rows, optionally
+// L2-normalizing (Normalize=True makes cosine = dot product). The epMean path
+// delegates to BertPoolSentenceEmbedding when Normalize=True (its built-in
+// behaviour); the CLS / last-token paths copy a single row. RealTokens must be
+// in 1..SeqLen.
+procedure PoolSentenceEmbedding(HiddenStates: TNNetVolume;
+  RealTokens: integer; Pooling: TNNetEmbedPooling; Embedding: TNNetVolume;
+  Normalize: boolean = True);
+
+// Instruction-prefix families for asymmetric embedding models. Each prepends a
+// short instruction to the raw text before tokenization (the CALLER tokenizes
+// the returned string). efNone returns the text unchanged.
+//   efE5       - intfloat/e5-* : "query: " / "passage: "
+//   efBGE      - BAAI/bge-*    : query gets the retrieval instruction,
+//                                passages stay raw.
+//   efGteQwen2 - Alibaba-NLP/gte-Qwen2-*-instruct: "Instruct: <task>\nQuery: "
+//                                on queries; passages stay raw.
+type
+  TNNetEmbedInstruction = (efNone, efE5, efBGE, efGteQwen2);
+
+// Returns the bare instruction prefix string for (Family, IsQuery). Passages
+// of efBGE/efGteQwen2 return '' (no prefix). The efGteQwen2 query template
+// embeds Task (defaulting to a generic retrieval task when empty).
+function EmbedInstructionPrefix(Family: TNNetEmbedInstruction;
+  IsQuery: boolean; const Task: string = ''): string;
+
+// Prepends the instruction prefix to Text (see EmbedInstructionPrefix).
+function ApplyEmbedInstruction(Family: TNNetEmbedInstruction;
+  IsQuery: boolean; const Text: string; const Task: string = ''): string;
+
+// ------------------------- embedding eval reports -------------------------
+// Cosine similarity between two equal-length vectors (returns 0 if either is
+// the zero vector). Public so callers can score pairs without a report.
+function CosineSimilarity(A, B: TNNetVolume): TNeuralFloat;
+
+// STSReport: semantic-textual-similarity correlation report. Given Pred cosine
+// (or any) similarity scores and Gold reference scores (parallel arrays of the
+// same length), returns a formatted multi-line report with the Pearson (linear)
+// and Spearman (rank) correlation of Pred vs Gold. Raises on length mismatch or
+// fewer than 2 pairs. Spearman is Pearson on the (average-tie) ranks.
+function STSReport(const Pred, Gold: array of TNeuralFloat): string;
+
+// Pearson / Spearman correlation primitives behind STSReport, exposed for
+// programmatic use (NaN when a series has zero variance).
+function PearsonCorrelation(const X, Y: array of TNeuralFloat): TNeuralFloat;
+function SpearmanCorrelation(const X, Y: array of TNeuralFloat): TNeuralFloat;
+
+// RetrievalReport: ranking-quality report for a planted query/passage set.
+// QueryEmb[i] and PassageEmb[j] are (1,1,d) embeddings; Relevant[i] lists the
+// gold-relevant passage indices for query i (graded relevance not modelled:
+// every listed passage counts as gain 1). For each query, passages are ranked
+// by descending cosine similarity to the query, then Recall@k (for each k in
+// KList) and nDCG@10 are averaged over queries. Returns a formatted report.
+// Raises if QueryEmb/Relevant lengths differ or a passage index is out of range.
+function RetrievalReport(QueryEmb, PassageEmb: array of TNNetVolume;
+  const Relevant: array of TNeuralIntegerArray;
+  const KList: array of integer): string;
+
+// ====================== COLBERT LATE INTERACTION ==========================
+// ColBERT (colbert-ir/colbertv2.0) late-interaction retrieval: the third RAG
+// paradigm next to the landed bi-encoder (single pooled vector + cosine) and
+// cross-encoder (joint [CLS] q[SEP]passage scorer) paths. The backbone is the
+// stock BERT encoder (BuildBertFromSafeTensors) with a single EXTRA head: a
+// [hidden -> dim] dense with NO bias (the ColBERT "linear" tensor, dim 128 in
+// the released checkpoints). Each token's contextual hidden state is projected
+// and L2-normalized - there is NO pooling: query and document are kept as
+// PER-TOKEN matrices. A (query, doc) pair is scored by MaxSim late interaction
+//   score = sum_{q in query} max_{d in doc} <E_q, E_d>
+// (every query token matched to its single best document token, then summed) -
+// cross-encoder-grade accuracy at bi-encoder cost (docs are pre-encoded once).
+
+// Builds the ColBERT encoder: the BERT backbone (exactly BuildBertFromSafeTensorsEx)
+// with the [hidden -> ProjDim] no-bias "linear" projection head appended PER
+// TOKEN (TNNetPointwiseConvLinear). Output is the (SeqLen,1,ProjDim) RAW
+// projected hidden states (NOT yet L2-normalized - EmbedTokens normalizes).
+// "linear.weight" must be present in the checkpoint ([ProjDim, hidden]).
+// ProjDim is read from that tensor (0 in/out below = autodetected). Config
+// is returned. ConfigFileName '' = "config.json" next to FileName.
+// pPaddingMask (default false, behavior bit-identical to before) turns on the
+// key-padding-mask mode of the BERT backbone: the net input becomes
+// (SeqLen,1,3) and channel 2 carries a per-position segment id (0 = real
+// token, 1 = a [PAD] position). Real tokens then never attend to the [PAD]
+// rows, so a document shorter than SeqLen is encoded EXACTLY (the per-token
+// embeddings of the real tokens equal running the encoder on the unpadded
+// sequence). ColBERTEmbedTokens fills channel 2 automatically when the net
+// was built with this flag.
+// pQuantizeInt8 (default false) applies the same weight-only int8 quantization
+// the BERT backbone supports to the WHOLE net INCLUDING the [hidden -> ProjDim]
+// projection head (a TNNetPointwiseConvLinear, covered by the int8 sweep), so
+// the projection head is no longer forced to stay f32.
+function BuildColBERTFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pPaddingMask: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+function BuildColBERTFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pPaddingMask: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// ColBERT marker-token convention: a query is [CLS][Q] tokens... [SEP] then
+// PADDED with [MASK] to the net's SeqLen (query augmentation - the [MASK] rows
+// are REAL inputs, projected and matched); a document is [CLS][D] tokens...
+// [SEP] then [PAD]-filled (pad rows are skipped). [Q]/[D] are the unused BERT
+// vocab slots [unused0]/[unused1] (ids 1/2 in bert-base-uncased), overridable.
+type
+  TColBERTMarkers = record
+    QueryMarkerId: integer;   // [Q]   (default [unused0] = 1)
+    DocMarkerId: integer;     // [D]   (default [unused1] = 2)
+    MaskId: integer;          // [MASK] (query augmentation pad)
+    ClsId, SepId, PadId: integer;
+  end;
+
+// Default markers for a bert-base-uncased-family tokenizer (looks up [MASK]/
+// [CLS]/[SEP]/[PAD]; [Q]/[D] default to ids 1/2 = [unused0]/[unused1]).
+function ColBERTDefaultMarkers(Tokenizer: TNeuralHFTokenizer):
+  TColBERTMarkers;
+
+// Builds the ColBERT input token row (length = net SeqLen) for Text. IsQuery
+// selects the [Q]/[D] marker and the [MASK]/[PAD] augmentation. Returns the
+// REAL token count via RealTokens (positions that contribute to MaxSim: ALL
+// SeqLen for a query because [MASK] rows count; the non-[PAD] prefix for a
+// document). Truncates content to fit SeqLen.
+function ColBERTBuildInput(Tokenizer: TNeuralHFTokenizer; const Text: string;
+  IsQuery: boolean; const Markers: TColBERTMarkers; SeqLen: integer;
+  out RealTokens: integer): TNeuralIntegerArray;
+
+// EmbedTokens: runs Text through the ColBERT net and returns the per-token
+// L2-normalized projected matrix as a (RealTokens,1,ProjDim) volume into Mat
+// (NO pooling - this is the whole point of late interaction). RealTokens is
+// the MaxSim-contributing row count (see ColBERTBuildInput): all rows for a
+// query, the non-[PAD] prefix for a document. Each row is unit L2 norm.
+procedure ColBERTEmbedTokens(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Text: string; IsQuery: boolean; const Markers: TColBERTMarkers;
+  Mat: TNNetVolume);
+
+// L2-normalizes each row of a (Rows,1,Dim) projected matrix in place (used by
+// ColBERTEmbedTokens; public so callers can normalize hand-built matrices).
+procedure ColBERTNormalizeRows(Mat: TNNetVolume);
+
+// MaxSim late-interaction score between a query matrix and a doc matrix, both
+// (Rows,1,Dim) with L2-normalized rows (so <E_q,E_d> is a cosine):
+//   score = sum over query rows of ( max over doc rows of dot(q_row, d_row) ).
+// Dims must match; raises otherwise.
+function ColBERTMaxSimScore(QueryMat, DocMat: TNNetVolume): TNeuralFloat;
+
+// ColBERTRetrievalReport: the RetrievalReport ranking quality report driven by
+// MaxSim instead of cosine. QueryMats[i] / DocMats[j] are per-token
+// (Rows,1,Dim) matrices (from ColBERTEmbedTokens); Relevant[i] lists the gold
+// doc indices for query i. Recall@k (each k in KList) and nDCG@10, averaged
+// over queries. Returns a formatted report.
+function ColBERTRetrievalReport(QueryMats, DocMats: array of TNNetVolume;
+  const Relevant: array of TNeuralIntegerArray;
+  const KList: array of integer): string;
+
+type
+  // A single ranked hit from TColBERTIndex.Search: the corpus document index,
+  // its MaxSim score and its (cached) text.
+  TColBERTHit = record
+    DocIndex: integer;
+    Score: TNeuralFloat;
+    Text: string;
+  end;
+  TColBERTHitArray = array of TColBERTHit;
+
+  // End-to-end ColBERT corpus index: wraps a built ColBERT encoder + tokenizer
+  // and caches one per-token L2-normalized doc matrix (ColBERTEmbedTokens) per
+  // added document, so a query is scored against the whole corpus by MaxSim
+  // without re-encoding the documents. This lifts the encode-corpus / cache /
+  // score loop out of examples/ColBERTSearch into the library.
+  //
+  // The index does NOT own the Net or Tokenizer (the caller builds/frees them;
+  // typically Net = BuildColBERTFromSafeTensors). It DOES own the cached doc
+  // matrices it allocates and frees them on Clear/Free. Markers default to
+  // ColBERTDefaultMarkers(Tokenizer) but can be overridden via Create.
+  // Coded by Claude (AI).
+  TColBERTIndex = class(TObject)
+  private
+    FNet: TNNet;
+    FTokenizer: TNeuralHFTokenizer;
+    FMarkers: TColBERTMarkers;
+    FDocMats: array of TNNetVolume;
+    FDocTexts: array of string;
+    FCount: integer;
+    function GetDocText(Index: integer): string;
+    function GetDocMatrix(Index: integer): TNNetVolume;
+  public
+    constructor Create(ANet: TNNet; ATokenizer: TNeuralHFTokenizer);
+    constructor CreateWithMarkers(ANet: TNNet;
+      ATokenizer: TNeuralHFTokenizer; const AMarkers: TColBERTMarkers);
+    destructor Destroy; override;
+    // Encodes Text as a document, caches its per-token matrix and returns the
+    // new document's index.
+    function AddDocument(const Text: string): integer;
+    // Adds every entry of Corpus in order (calls AddDocument for each).
+    procedure AddCorpus(const Corpus: array of string);
+    // Frees all cached doc matrices and empties the index.
+    procedure Clear;
+    // Encodes Query and returns its MaxSim score against the cached document
+    // DocIndex (no re-encoding of the document).
+    function ScoreQuery(const Query: string; DocIndex: integer): TNeuralFloat;
+    // Encodes Query into a caller-owned (Rows,1,Dim) matrix (so callers can
+    // score it themselves / reuse it). QueryMat is resized as needed.
+    procedure EncodeQuery(const Query: string; QueryMat: TNNetVolume);
+    // Encodes Query and scores it against EVERY cached document, returning the
+    // raw MaxSim scores in corpus order into Scores (resized to Count).
+    procedure ScoreAll(const Query: string; out Scores: TNeuralFloatDynArr);
+    // Encodes Query, scores the whole corpus and returns the TopK best hits
+    // sorted by descending MaxSim (DocIndex + Score + Text). TopK <= 0 or
+    // TopK > Count returns all documents ranked.
+    function Search(const Query: string; TopK: integer): TColBERTHitArray;
+    property Count: integer read FCount;
+    property DocText[Index: integer]: string read GetDocText;
+    property DocMatrix[Index: integer]: TNNetVolume read GetDocMatrix;
+    property Net: TNNet read FNet;
+    property Tokenizer: TNeuralHFTokenizer read FTokenizer;
+    property Markers: TColBERTMarkers read FMarkers;
+  end;
 
 // =================== SEQUENCE CLASSIFICATION IMPORT =======================
 // Fine-tuned classifier checkpoints (see the unit-header section of the
@@ -1336,6 +2461,65 @@ function BuildBertForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
+// =================== CROSS-ENCODER RERANKER ==============================
+// The cross-encoder reranker (cross-encoder/ms-marco-MiniLM-L-6-v2,
+// BAAI/bge-reranker-base, mixedbread/mxbai-rerank) is the SECOND-stage
+// precision scorer of a retrieve-then-rerank RAG pipeline: a single
+// BERT-family trunk encodes the query and ONE candidate passage JOINTLY as
+//   [CLS] query [SEP] passage [SEP]
+// (with token_type/segment id 0 on the query span and 1 on the passage
+// span) and emits ONE relevance logit from the [CLS] row. This is the SAME
+// architecture as BuildBertForSequenceClassificationFromSafeTensors with
+// num_labels=1 - the genuinely new pieces below are the sentence-PAIR
+// encoding (the segment-id=1 path, exercised here for the first time: the
+// importer already wires channel 1 of its (SeqLen,1,2) input into the
+// token_type_embeddings table) and the batch rerank scorer / report.
+
+// Tokenizes a sentence PAIR into a BERT joint sequence
+//   [CLS] TextA [SEP] TextB [SEP]
+// returning the token ids in TokenIds and the parallel SEGMENT ids in
+// SegmentIds (0 over "[CLS] TextA [SEP]", 1 over "TextB [SEP]" - HF's
+// token_type_ids convention). MaxTokens>0 caps the TOTAL length, truncating
+// the longer segment first (the HF "longest_first" default) while always
+// keeping [CLS] and both [SEP]s. Raises when the tokenizer lacks [CLS]/[SEP].
+procedure BertTokenizePair(Tokenizer: TNeuralHFTokenizer;
+  const TextA, TextB: string; out TokenIds, SegmentIds: TNeuralIntegerArray;
+  MaxTokens: integer = 0);
+
+// CrossEncoderScore: joint relevance of (Query, Passage) under a num_labels=1
+// reranker net (BuildBertForSequenceClassificationFromSafeTensors). Encodes
+// the pair (BertTokenizePair) into the net's (SeqLen,1,2) input - channel 0
+// token ids, channel 1 segment ids - runs ONE forward and returns the [CLS]
+// (row 0) logit. ApplySigmoid=True maps it to a (0,1) probability (the
+// standard reranker output); False returns the raw logit (use for exact
+// parity checks / when ordering only).
+function CrossEncoderScore(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query, Passage: string;
+  ApplySigmoid: boolean = True): TNeuralFloat;
+
+// RerankPassages: scores Query against EACH candidate in Passages with one
+// joint cross-encoder forward (CrossEncoderScore, sigmoid applied), then
+// returns the passages reordered most-relevant first. Order[r] is the index
+// (into Passages) of the rank-r passage; Scores[r] is its sigmoid relevance.
+// Both out arrays have Length(Passages) entries. Stable: equal scores keep
+// the original (retrieval) order. Use the net's pQuantizeInt8 build for an
+// int8 backbone - the scorer is agnostic to the backbone's precision.
+procedure RerankPassages(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query: string; const Passages: array of string;
+  out Order: TNeuralIntegerArray; out Scores: TNeuralFloatDynArr);
+
+// RerankReport: quantifies the precision lift a cross-encoder gives over the
+// first-stage (bi-encoder) order. Passages is the candidate list IN ITS
+// INITIAL (retrieval) RANK; Relevant lists the indices (into Passages) of the
+// gold-relevant candidates. Reports MRR and nDCG@k (each k in KList) for the
+// BEFORE order (Passages as given) vs the AFTER order (RerankPassages). One
+// query per call (the per-query lift is the interesting signal); average over
+// queries by combining calls. Returns a formatted multi-line report.
+function RerankReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query: string; const Passages: array of string;
+  const Relevant: TNeuralIntegerArray;
+  const KList: array of integer): string;
+
 // Builds the FULL GPT2ForSequenceClassification stack: GPT-2 trunk + the
 // bias-free score head instead of the LM head. Output is per-position
 // class logits (SeqLen,1,num_labels); HF's logits are the LAST non-pad row
@@ -1352,6 +2536,60 @@ function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
 function BuildGPT2ForSequenceClassificationFromSafeTensors(
   const FileName: string; pSeqLen: integer = 0; pNumHeads: integer = 0;
   pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// =================== EXTRACTIVE QUESTION ANSWERING (SQuAD) ================
+// Fine-tuned *ForQuestionAnswering checkpoints (bert / distilbert / roberta
+// family): the stock encoder trunk plus a SINGLE [hidden -> 2] dense head
+// ("qa_outputs", no intervening pooler) that emits, PER TOKEN, a start logit
+// (column 0) and an end logit (column 1). HF stores qa_outputs as one
+// nn.Linear [2, hidden]: row 0 -> start logits, row 1 -> end logits. The
+// answer span is argmax_{s<=e} start[s]+end[e] over the CONTEXT tokens.
+
+// Builds the FULL *ForQuestionAnswering stack: the BERT-family encoder
+// (BuildBertFromSafeTensorsWithConfig, no pooler) with AddQuestionAnsweringHead
+// appended - two per-token [hidden -> 1] projections (TNNetPointwiseConvLinear)
+// DeepConcat'd to (SeqLen,1,2): channel 0 = start logits, channel 1 = end
+// logits. The HF "qa_outputs.weight" [2, hidden] row 0 is loaded onto the start
+// projection, row 1 onto the end projection (likewise "qa_outputs.bias" [2]).
+// Config is returned; ConfigFileName '' = "config.json" next to FileName.
+function BuildBertForQuestionAnsweringFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildBertForQuestionAnsweringFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
+// AnswerSpan: runs "[CLS] question [SEP] context [SEP]" through a QA net and
+// returns the predicted answer substring of Context. The question, special and
+// pad positions are masked out; only CONTEXT tokens are eligible span ends.
+// The best span maximizes start[s]+end[e] subject to s<=e<=s+MaxAnswerLen-1
+// (MaxAnswerLen<=0 -> 30, the SQuAD default). StartChar/EndChar return the
+// 0-based [start,end) char span into Context (-1/-1 when empty). Score returns
+// start[s]+end[e]. An empty/over-long input that leaves no context token
+// yields '' (StartChar=-1). NoAnswerScore returns start[CLS]+end[CLS] (the
+// SQuAD2 null-answer baseline) so callers can threshold abstention.
+function AnswerSpan(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Question, Context: string; out StartChar, EndChar: integer;
+  out Score, NoAnswerScore: TNeuralFloat;
+  MaxAnswerLen: integer = 0): string;
+
+// QAReport: SQuAD Exact-Match + macro token-F1 over a planted set. Questions[i]
+// / Contexts[i] / GoldAnswers[i] are parallel arrays; the net answers each and
+// the prediction is compared to the gold under the official SQuAD normalization
+// (lowercase, strip articles a/an/the, drop punctuation, collapse whitespace).
+// EM is the fraction of exact normalized matches; F1 is the macro mean of the
+// per-example token-overlap F1. Returns a formatted report. Mirrors STSReport /
+// RetrievalReport. Raises on length mismatch or an empty set.
+function QAReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Questions, Contexts, GoldAnswers: array of string): string;
+
+// SQuAD answer normalization (lowercase, remove a/an/the, strip punctuation,
+// collapse whitespace) and the token-overlap F1 behind QAReport, exposed for
+// programmatic scoring.
+function NormalizeSquadAnswer(const S: string): string;
+function SquadTokenF1(const Pred, Gold: string): TNeuralFloat;
 
 // ---------------------------------------------------------------------------
 // T5 / FLAN-T5 IMPORT (model_type "t5") - the FIRST ENCODER-DECODER import.
@@ -1571,6 +2809,403 @@ procedure BuildMarianFromSafeTensors(const FileName: string;
   EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
 
+// Exports a T5 ENCODER+DECODER pair (built by BuildT5FromSafeTensors) back to
+// a single HF-name safetensors file - the exact inverse of the importer.
+// Walks the typed layers of BOTH nets in build order, undoing every load
+// transform: the q-projection's folded sqrt(d_kv) compensation, the gated-FFN
+// wi_0|wi_1 fusion, the per-head shared relative-position-bias columns, and
+// (v1.0 tied) the d_model^-0.5 head scaling. EncoderNet/DecoderNet are the two
+// nets returned by the importer; Config the same record. Round-trip gated by
+// TestT5SafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveT5ToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TT5Config; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
+// Exports a Marian ENCODER+DECODER pair (built by BuildMarianFromSafeTensors)
+// back to a single HF-name safetensors file - the exact inverse of the
+// importer. The STATIC half-split sinusoidal position tables are NOT emitted
+// (HF regenerates them; they are not learned parameters). Undoes the
+// scale_embedding sqrt(d_model) fold on the shared matrix and re-derives
+// final_logits_bias from the tied head's per-neuron biases. Round-trip gated
+// by TestMarianSafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveMarianToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TMarianConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
+// ---------------------------------------------------------------------------
+// BART IMPORT (model_type "bart": the facebook/bart-large-cnn and
+// sshleifer/distilbart-cnn-* abstractive-summarization checkpoints;
+// architectures ["BartForConditionalGeneration"]) - the dominant pretrained
+// encoder-decoder for SUMMARIZATION and the SECOND learned-position text
+// encoder-decoder after Marian (same two-net + RunT5 convention). Lewis et
+// al. 2019, arXiv:1910.13461. BART = a bidirectional BERT-style encoder + a
+// GPT-2-style causal decoder with cross-attention. Differences from the
+// Marian importer (which shares the same POST-norm block skeleton):
+//   - LEARNED ABSOLUTE position embeddings (embed_positions, an
+//     (max_position_embeddings + 2, d_model) table) with BART's +2 padding
+//     offset: token position p reads table row p + 2 (rows 0/1 are the
+//     padding-idx slots and are never used). The importer copies rows
+//     2..EncSeqLen+1 / 2..DecSeqLen+1 into a TNNetLearnedPositionalEmbedding;
+//   - a layernorm_embedding LayerNorm applied AFTER token+position
+//     embeddings in BOTH stacks (Marian has none);
+//   - EXACT-erf GELU FFN (HF activation_function "gelu"), composed from the
+//     same Phi side-branch + ReGLU as the BERT importer;
+//   - scale_embedding defaults FALSE (no sqrt(d_model) on the embeddings);
+//   - decoder_start_token_id defaults to eos_token_id (BART's shift), not
+//     pad as in Marian.
+// Everything else matches Marian: shared source/target embedding TIED to the
+// lm_head plus a final_logits_bias row, all q/k/v/out/fc Linears biased,
+// standard 1/sqrt(head_dim) attention, post-residual biased LayerNorms (eps
+// 1e-5), no final stack norm. tie_word_embeddings=false is REJECTED (the
+// untied head needs a second matrix this v1 does not wire). The GPT-2
+// byte-level BPE tokenizer is already covered by TNeuralHFTokenizer, so
+// end-to-end summarization works (see examples/Summarize). BuildFromPretrained
+// does NOT dispatch "bart" (it returns ONE net); it raises an error pointing
+// here instead.
+
+type
+  TBartConfig = record
+    DModel: integer;            // d_model (hidden width)
+    EncoderLayers: integer;     // encoder_layers
+    DecoderLayers: integer;     // decoder_layers
+    EncoderHeads: integer;      // encoder_attention_heads
+    DecoderHeads: integer;      // decoder_attention_heads
+    EncoderFFNDim: integer;     // encoder_ffn_dim
+    DecoderFFNDim: integer;     // decoder_ffn_dim
+    VocabSize: integer;         // vocab_size
+    MaxPositionEmbeddings: integer; // max_position_embeddings
+    PadTokenId: integer;        // pad_token_id (default 1)
+    BosTokenId: integer;        // bos_token_id (default 0)
+    EosTokenId: integer;        // eos_token_id (default 2)
+    DecoderStartTokenId: integer; // decoder_start_token_id (= eos in BART)
+    ScaleEmbedding: boolean;    // scale_embedding (sqrt(d_model); default off)
+    ModelType: string;          // 'bart'
+  end;
+
+// Reads a HF BART config.json (model_type "bart"). Required: d_model,
+// encoder_layers, decoder_layers, encoder_attention_heads,
+// decoder_attention_heads, encoder_ffn_dim, decoder_ffn_dim, vocab_size.
+// Defaults follow BartConfig: max_position_embeddings = 1024, pad_token_id
+// = 1, bos_token_id = 0, eos_token_id = 2, decoder_start_token_id =
+// eos_token_id, scale_embedding = false. activation_function must be "gelu"
+// (the exact erf form; "gelu_new"/"relu"/"swish" are rejected to avoid a
+// silent activation mismatch - every published BART pins "gelu").
+// tie_word_embeddings = false is REJECTED.
+function ReadBartConfigFromJSONFile(const FileName: string): TBartConfig;
+
+function BartConfigToString(const Config: TBartConfig): string;
+
+// Builds the BART ENCODER and DECODER nets described by Config and loads
+// every weight from the safetensors checkpoint at FileName (see the BART
+// IMPORT section above). EncSeqLen/DecSeqLen fix the two sequence lengths at
+// build time and must not exceed max_position_embeddings. Both nets are
+// owned by the caller. Run the pair with RunT5 (the two-net convention is
+// shared with the T5/Marian importers); the DECODER's second TNNetInput
+// holds the encoder hidden states (T5EncoderStatesInput).
+procedure BuildBartFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, but takes the already-read Config by value (the ...Ex naming the
+// single-net importers use); kept for symmetry with the dispatch helpers.
+procedure BuildBartFromSafeTensorsEx(const FileName: string;
+  Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildBartFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+
+// ---------------------------------------------------------------------------
+// PEGASUS IMPORT (model_type "pegasus": the google/pegasus-* abstractive
+// summarization checkpoints; architectures ["PegasusForConditionalGeneration"])
+// - the close PRE-NORM cousin of BART (Zhang et al. 2019, arXiv:1912.08777).
+// It rides the same two-net + RunT5 convention as T5/Marian/BART. Differences
+// from the BART importer (which shares the same per-block Q/K/V/FFN skeleton):
+//   - PRE-NORM blocks (normalize_before=true): every sub-layer NORMS the
+//     residual stream FIRST, runs the sub-layer, then adds the RAW residual
+//     (residual = x; x = LN(x); x = sublayer(x); x = residual + x). BART/Marian
+//     are post-norm (add THEN norm). The norm tensor names are unchanged
+//     (self_attn_layer_norm / encoder_attn_layer_norm / final_layer_norm);
+//   - STATIC SINUSOIDAL position embeddings in HF's HALF-SPLIT layout (the
+//     SAME table builder as Marian, FillMarianSinusoidalPositions), added with
+//     NO padding offset (position p reads row p; not BART's +2). The table is
+//     regenerated by the importer (real checkpoints save it but it is a pure
+//     function of d_model);
+//   - NO layernorm_embedding (BART has one after the embeddings);
+//   - a FINAL encoder AND decoder LayerNorm (model.encoder.layer_norm /
+//     model.decoder.layer_norm) closing each pre-norm stack (post-norm BART has
+//     none);
+//   - scale_embedding defaults TRUE (every published Pegasus pins it; the
+//     sqrt(d_model) folds into the embedding rows exactly as in Marian);
+//   - decoder_start_token_id defaults to pad_token_id (= 0), eos_token_id = 1.
+// Everything else matches BART: shared source/target embedding TIED to the
+// lm_head plus a final_logits_bias row, all q/k/v/out/fc Linears biased,
+// 1/sqrt(head_dim) attention, exact-erf GELU FFN, biased nn.LayerNorms (eps
+// 1e-5). The SentencePiece/Unigram tokenizer is a separate open task, so this
+// importer covers the MODEL only. BuildFromPretrained does NOT dispatch
+// "pegasus" (it returns ONE net); it raises an error pointing here instead.
+
+type
+  TPegasusConfig = record
+    DModel: integer;            // d_model (hidden width; must be EVEN)
+    EncoderLayers: integer;     // encoder_layers
+    DecoderLayers: integer;     // decoder_layers
+    EncoderHeads: integer;      // encoder_attention_heads
+    DecoderHeads: integer;      // decoder_attention_heads
+    EncoderFFNDim: integer;     // encoder_ffn_dim
+    DecoderFFNDim: integer;     // decoder_ffn_dim
+    VocabSize: integer;         // vocab_size
+    MaxPositionEmbeddings: integer; // max_position_embeddings
+    PadTokenId: integer;        // pad_token_id (default 0)
+    EosTokenId: integer;        // eos_token_id (default 1)
+    DecoderStartTokenId: integer; // decoder_start_token_id (= pad in Pegasus)
+    ScaleEmbedding: boolean;    // scale_embedding (sqrt(d_model); default ON)
+    ModelType: string;          // 'pegasus'
+  end;
+
+// Reads a HF Pegasus config.json (model_type "pegasus"). Required: d_model,
+// encoder_layers, decoder_layers, encoder_attention_heads,
+// decoder_attention_heads, encoder_ffn_dim, decoder_ffn_dim, vocab_size.
+// Defaults follow PegasusConfig: max_position_embeddings = 1024, pad_token_id
+// = 0, eos_token_id = 1, decoder_start_token_id = pad_token_id, scale_embedding
+// = true. activation_function must be "gelu" (the exact erf form; every
+// published Pegasus pins it). tie_word_embeddings = false is REJECTED.
+function ReadPegasusConfigFromJSONFile(const FileName: string): TPegasusConfig;
+
+function PegasusConfigToString(const Config: TPegasusConfig): string;
+
+// Builds the Pegasus ENCODER and DECODER nets described by Config and loads
+// every weight from the safetensors checkpoint at FileName (see the PEGASUS
+// IMPORT section above). EncSeqLen/DecSeqLen fix the two sequence lengths at
+// build time and must not exceed max_position_embeddings (the static
+// sinusoidal tables are generated for exactly these lengths). Both nets are
+// owned by the caller. Run the pair with RunT5 (the two-net convention is
+// shared with the T5/Marian/BART importers); the DECODER's second TNNetInput
+// holds the encoder hidden states (T5EncoderStatesInput).
+procedure BuildPegasusFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TPegasusConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, but takes the already-read Config by value (the ...Ex naming the
+// single-net importers use); kept for symmetry with the dispatch helpers.
+procedure BuildPegasusFromSafeTensorsEx(const FileName: string;
+  Config: TPegasusConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildPegasusFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TPegasusConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+
+// ---------------------------------------------------------------------------
+// mBART IMPORT (model_type "mbart": the facebook/mbart-large-* multilingual
+// translation/denoising checkpoints; architectures
+// ["MBartForConditionalGeneration"]) - the PRE-NORM cousin of BART. mBART is
+// EXACTLY BART's embedding front-end stacked on PEGASUS-style pre-norm blocks:
+//   - LEARNED absolute position embeddings with BART's +2 padding offset
+//     (model.{encoder,decoder}.embed_positions.weight, shape
+//     [max_position_embeddings + 2, d_model]; token position p reads row p+2)
+//     - NOT Pegasus's static sinusoids;
+//   - a layernorm_embedding LayerNorm AFTER token+position embeddings in BOTH
+//     stacks (BART has it; Pegasus does NOT);
+//   - PRE-NORM transformer blocks (normalize_before=true): each sub-layer
+//     NORMS the residual stream first, runs the sub-layer, then adds the RAW
+//     residual back - the SAME wiring as Pegasus, so BuildPegasusStackBlocks
+//     is reused verbatim (the per-block norm tensor names are identical);
+//   - a FINAL encoder AND decoder layer_norm closing each pre-norm stack
+//     (model.{encoder,decoder}.layer_norm) - like Pegasus;
+//   - exact-erf GELU FFN, ALL q/k/v/out/fc Linears biased, 1/sqrt(head_dim)
+//     attention, biased nn.LayerNorm (eps 1e-5);
+//   - shared source/target embedding TIED to the lm_head plus a
+//     final_logits_bias row (the BartForConditionalGeneration head);
+//   - scale_embedding follows the config (mBART default OFF; the sqrt(d_model)
+//     folds into the embedding rows exactly as in BART/Pegasus).
+// mBART ships a raw sentencepiece.bpe.model (no tokenizer.json) - the
+// Unigram .model path in neuralhftokenizer.LoadSentencePieceModel covers the
+// tokenizer side (see TNeuralHFTokenizer.LoadFromFile). mBART config reuses
+// TBartConfig (same fields) but the importer accepts model_type "mbart".
+// For a v1 PARITY fixture this importer is checked on teacher-forced logits
+// for a pinned (encoder ids, decoder ids) pair - the full multilingual
+// forced-language-token generation protocol is a generation-time concern, not
+// a model-build one. BuildFromPretrained does NOT dispatch "mbart" (it
+// returns ONE net); it raises an error pointing here instead.
+// NLLB (model_type "m2m_100", the M2M100 architecture) is a close BART-style
+// relative and a documented follow-up.
+
+// Reads a HF mBART config.json (model_type "mbart"). Same fields as BART;
+// max_position_embeddings = 1024, pad_token_id = 1, bos_token_id = 0,
+// eos_token_id = 2, decoder_start_token_id = eos_token_id, scale_embedding =
+// false by default. activation_function must be "gelu" (the exact erf form);
+// tie_word_embeddings = false is REJECTED. Returns a TBartConfig with
+// ModelType = 'mbart'.
+function ReadMBartConfigFromJSONFile(const FileName: string): TBartConfig;
+
+// Builds the mBART ENCODER and DECODER nets and loads every weight from the
+// safetensors checkpoint at FileName (see the mBART IMPORT section above).
+// EncSeqLen/DecSeqLen fix the two sequence lengths at build time and must not
+// exceed max_position_embeddings. Both nets are owned by the caller. Run the
+// pair with RunT5 (the two-net convention shared with the T5/Marian/BART/
+// Pegasus importers); the DECODER's second TNNetInput holds the encoder
+// hidden states (T5EncoderStatesInput).
+procedure BuildMBartFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, but takes the already-read Config by value (the ...Ex naming).
+procedure BuildMBartFromSafeTensorsEx(const FileName: string;
+  Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildMBartFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+
+// Exports a BART ENCODER+DECODER pair (built by BuildBartFromSafeTensors) back
+// to a single HF-name safetensors file - the exact inverse of the importer.
+// Undoes the scale_embedding sqrt(d_model) fold on the shared matrix, re-emits
+// the +2-offset learned position table (rows 0/1 and rows beyond the built
+// sequence length are zero-padded; the importer only reads rows
+// 2..SeqLen+1), the two layernorm_embedding LayerNorms, the per-block biased
+// linears/post-norms, and re-derives final_logits_bias from the tied head.
+// Round-trip gated by TestBartSafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TBartConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
+// Exports a Pegasus ENCODER+DECODER pair (built by BuildPegasusFromSafeTensors)
+// back to a single HF-name safetensors file - the exact inverse of the
+// importer. PRE-norm stack: re-emits the FINAL encoder/decoder layer_norm,
+// undoes the scale_embedding fold, and re-derives final_logits_bias. The
+// STATIC half-split sinusoidal position tables are NOT emitted (HF regenerates
+// them; they are not learned parameters). Round-trip gated by
+// TestPegasusSafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SavePegasusToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TPegasusConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
+// Exports an mBART ENCODER+DECODER pair (built by BuildMBartFromSafeTensors)
+// back to a single HF-name safetensors file - the exact inverse of the
+// importer. BART embedding front-end (layernorm_embedding + +2-offset learned
+// positions) over PRE-norm stacks that close with a FINAL encoder/decoder
+// layer_norm; undoes the scale_embedding fold and re-derives final_logits_bias.
+// Round-trip gated by TestMBartSafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveMBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TBartConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
+// ---------------------------------------------------------------------------
+// M2M100 / NLLB IMPORT (model_type "m2m_100": the facebook/m2m100_* and
+// facebook/nllb-200-* multilingual translation checkpoints; architectures
+// ["M2M100ForConditionalGeneration"]) - the SINUSOIDAL-position cousin of
+// mBART, and the REMAINING piece of the BART-family follow-up. M2M100 is
+// EXACTLY Pegasus's pre-norm encoder-decoder body with three deltas:
+//   - SINUSOIDAL positions (M2M100SinusoidalPositionalEmbedding) like
+//     Marian/Pegasus, BUT with the half-split base log(10000)/(half-1) AND a
+//     +2 offset: token position p reads sinusoidal row p+2 (HF position_ids
+//     start at padding_idx+1 = 2). FillM2M100SinusoidalPositions regenerates
+//     the static table - HF drops embed_positions via _keys_to_ignore_on_save;
+//   - NO layernorm_embedding (mBART has one; M2M100, like Pegasus, does NOT);
+//   - a ReLU FFN (activation_function="relu" on every published M2M100 and
+//     NLLB checkpoint) instead of Pegasus/mBART's exact-erf GELU. The shared
+//     BuildPegasusStackBlocks grows the relu FFN via its UseReluFFN flag.
+// Everything else matches mBART/Pegasus: PRE-NORM blocks (the per-block norm
+// tensor names are identical, so LoadMarianStack is reused verbatim), a FINAL
+// encoder AND decoder layer_norm closing each pre-norm stack, scale_embedding
+// (default ON; sqrt(d_model) folds into the embedding rows), shared
+// source/target embedding TIED to the lm_head plus a final_logits_bias row,
+// all q/k/v/out/fc Linears biased, 1/sqrt(head_dim) attention, biased
+// nn.LayerNorm (eps 1e-5), pad_token_id = 1 / bos = 0 / eos = 2 /
+// decoder_start = eos. NLLB-200 and base M2M100 share this exact body (HF has
+// no normalize_before branch for m2m_100 - both are pre-norm). The raw
+// sentencepiece.bpe.model tokenizer is a separate open task; this importer
+// covers the MODEL only (teacher-forced parity on a pinned (enc ids, dec ids)
+// pair). BuildFromPretrained does NOT dispatch "m2m_100" (it returns ONE net);
+// it raises an error pointing here instead.
+
+type
+  TM2M100Config = record
+    DModel: integer;            // d_model (hidden width; must be EVEN)
+    EncoderLayers: integer;     // encoder_layers
+    DecoderLayers: integer;     // decoder_layers
+    EncoderHeads: integer;      // encoder_attention_heads
+    DecoderHeads: integer;      // decoder_attention_heads
+    EncoderFFNDim: integer;     // encoder_ffn_dim
+    DecoderFFNDim: integer;     // decoder_ffn_dim
+    VocabSize: integer;         // vocab_size
+    MaxPositionEmbeddings: integer; // max_position_embeddings
+    PadTokenId: integer;        // pad_token_id (default 1)
+    BosTokenId: integer;        // bos_token_id (default 0)
+    EosTokenId: integer;        // eos_token_id (default 2)
+    DecoderStartTokenId: integer; // decoder_start_token_id (= eos)
+    ScaleEmbedding: boolean;    // scale_embedding (sqrt(d_model); default ON)
+    ModelType: string;          // 'm2m_100'
+  end;
+
+// Reads a HF M2M100/NLLB config.json (model_type "m2m_100"). Required:
+// d_model, encoder_layers, decoder_layers, encoder_attention_heads,
+// decoder_attention_heads, encoder_ffn_dim (or ffn_dim), decoder_ffn_dim (or
+// ffn_dim), vocab_size. Defaults follow M2M100Config: max_position_embeddings
+// = 1024, pad_token_id = 1, bos_token_id = 0, eos_token_id = 2,
+// decoder_start_token_id = eos_token_id, scale_embedding = true.
+// activation_function must be "relu" (every published M2M100/NLLB pins it).
+// tie_word_embeddings = false is REJECTED.
+function ReadM2M100ConfigFromJSONFile(const FileName: string): TM2M100Config;
+
+function M2M100ConfigToString(const Config: TM2M100Config): string;
+
+// Builds the M2M100/NLLB ENCODER and DECODER nets and loads every weight from
+// the safetensors checkpoint at FileName (see the M2M100 IMPORT section
+// above). EncSeqLen/DecSeqLen fix the two sequence lengths at build time and
+// must not exceed max_position_embeddings (the static sinusoidal tables are
+// generated for exactly these lengths). Both nets are owned by the caller.
+// Run the pair with RunT5 (the two-net convention shared with the
+// T5/Marian/BART/Pegasus/mBART importers); the DECODER's second TNNetInput
+// holds the encoder hidden states (T5EncoderStatesInput).
+procedure BuildM2M100FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, but takes the already-read Config by value (the ...Ex naming).
+procedure BuildM2M100FromSafeTensorsEx(const FileName: string;
+  Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildM2M100FromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TM2M100Config;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+
+// Exports an M2M100/NLLB ENCODER+DECODER pair (built by
+// BuildM2M100FromSafeTensors) back to a single HF-name safetensors file - the
+// exact inverse of the importer. Pegasus-shaped front-end (NO
+// layernorm_embedding, STATIC sinusoidal positions that are regenerated on
+// import so NO position table is emitted) over PRE-norm relu stacks that close
+// with a FINAL encoder/decoder layer_norm; undoes the scale_embedding fold and
+// re-derives final_logits_bias. Round-trip gated by
+// TestM2M100SafeTensorsRoundTrip. Coded by Claude (AI).
+procedure SaveM2M100ToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TM2M100Config; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
 // ---------------------------------------------------------------------------
 // WHISPER IMPORT (model_type "whisper": the openai/whisper-* speech-to-text
 // checkpoints; architectures ["WhisperForConditionalGeneration"]) - the
@@ -1678,6 +3313,117 @@ procedure BuildWhisperFromSafeTensors(const FileName: string;
   DecSeqLen: integer; pInferenceOnly: boolean = false;
   const ConfigFileName: string = '');
 
+// ============================ WAV2VEC2 / HUBERT CTC IMPORT =================
+// Wav2Vec2 / HuBERT (model_type "wav2vec2" / "hubert", architectures
+// ["Wav2Vec2ForCTC"] / ["HubertForCTC"], e.g.
+// facebook/wav2vec2-base-960h) - the SECOND speech import family and the
+// first SELF-SUPERVISED-encoder speech model. Architecturally distinct
+// from the landed Whisper (a mel-spectrogram encoder-decoder seq2seq):
+// Wav2Vec2/HuBERT consume a RAW float WAVEFORM and run a CONV FEATURE
+// EXTRACTOR -> transformer ENCODER -> linear CTC head (NO decoder). The
+// net is single-input ((NumSamples,1,1) raw audio in seconds*16000
+// samples) and outputs (EncLen,1,vocab) CTC logits, decoded with the
+// landed DecodeCTCGreedy / DecodeCTCBeamSearch.
+//
+// Pipeline (HF Wav2Vec2Model + Wav2Vec2ForCTC, do_stable_layer_norm
+// False - the wav2vec2-base / -960h topology):
+//   raw (NumSamples,1,1)
+//     -> FEATURE EXTRACTOR: num_feat_extract_layers strided 1-D convs
+//        (TNNetConvolutionLinear on the (T,1,C) grid, conv_bias False so
+//        suppressed bias). Layer 0 is conv -> GroupNorm -> GELU; the
+//        GroupNorm uses num_groups = conv_dim[0] = num_channels, i.e. ONE
+//        channel per group normalized over the TIME axis (the "group"
+//        feat_extract_norm; TNNetGroupNorm(conv_dim[0]) on the depth-as-
+//        channels grid is exactly that). Layers 1.. are conv -> GELU only.
+//        Each conv reduces the length: out = (in - kernel) div stride + 1.
+//     -> FEATURE PROJECTION: TNNetTokenLayerNorm over the last conv
+//        channels then a biased Linear conv_dim[-1] -> hidden_size.
+//     -> ENCODER: a conv-based relative POSITIONAL EMBEDDING (a GROUPED
+//        conv1d, kernel num_conv_pos_embeddings, padding kernel div 2,
+//        groups num_conv_pos_embedding_groups; weight_norm-parametrized in
+//        the checkpoint - the effective weight is reconstructed from
+//        original0 (g) and original1 (v) with dim=2: w[:,:,k] = g[k] *
+//        v[:,:,k] / ||v[:,:,k]||) added to the projected features; an even
+//        kernel makes the conv emit one extra frame, dropped by a SamePad
+//        crop; then GELU. After the add comes encoder.layer_norm, then the
+//        POST-LN transformer blocks (do_stable_layer_norm False):
+//          x := LN(x + Attn(x)); x := final_LN(x + FFN(x))
+//        with BIDIRECTIONAL self-attention and exact erf "gelu" FFN -
+//        identical block math to the BERT encoder, so the same builder
+//        primitives are reused.
+//     -> CTC HEAD: a biased Linear hidden_size -> vocab_size (lm_head).
+// Every GELU is the exact erf form. HuBERT shares this EXACT topology and
+// the same tensor names under the "hubert." prefix - the SAME builder with
+// Config.IsHubert = True (set from model_type). The "robust"/-large
+// variant (feat_extract_norm "layer", LayerNorm on EVERY conv layer +
+// pre-norm encoder, do_stable_layer_norm True) is a documented follow-up.
+// Tokenizer is a tiny char/phoneme vocab.json (no SentencePiece); decoding
+// is DecodeCTCGreedy over the per-frame argmax. Coded by Claude (AI).
+
+type
+  TWav2Vec2Config = record
+    HiddenSize: integer;        // hidden_size (d_model)
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    IntermediateSize: integer;  // intermediate_size (FFN width)
+    VocabSize: integer;         // vocab_size (CTC head width incl. blank)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (default 1e-5)
+    NumConvLayers: integer;     // num_feat_extract_layers (= Length(ConvDim))
+    ConvDim: array of integer;  // conv_dim (per-conv output channels)
+    ConvStride: array of integer; // conv_stride
+    ConvKernel: array of integer; // conv_kernel
+    ConvBias: boolean;          // conv_bias (false in wav2vec2-base)
+    NumPosConvEmbeddings: integer; // num_conv_pos_embeddings (kernel; even)
+    NumPosConvGroups: integer;  // num_conv_pos_embedding_groups
+    DoStableLayerNorm: boolean; // do_stable_layer_norm (false: GroupNorm
+                                // base path - the only supported variant)
+    FeatExtractGroupNorm: boolean; // feat_extract_norm == "group"
+    IsHubert: boolean;          // model_type == "hubert"
+    ModelType: string;          // 'wav2vec2' / 'hubert'
+    Prefix: string;             // 'wav2vec2.' / 'hubert.' (detected)
+  end;
+
+// Reads a HF Wav2Vec2/HuBERT config.json (model_type "wav2vec2" or
+// "hubert"). Required: hidden_size, num_hidden_layers,
+// num_attention_heads, intermediate_size, vocab_size, conv_dim,
+// conv_stride, conv_kernel. Defaults follow Wav2Vec2Config:
+// layer_norm_eps 1e-5, conv_bias false, num_conv_pos_embeddings 128,
+// num_conv_pos_embedding_groups 16, feat_extract_norm "group",
+// do_stable_layer_norm false, hidden_act "gelu". Rejects the unsupported
+// "layer"-norm / stable-layer-norm (-large/robust) variant loudly.
+function ReadWav2Vec2ConfigFromJSONFile(const FileName: string): TWav2Vec2Config;
+
+function Wav2Vec2ConfigToString(const Config: TWav2Vec2Config): string;
+
+// Computes the encoder sequence length the conv feature extractor produces
+// for a raw clip of NumSamples samples (each conv: (n - kernel) div stride
+// + 1). NumSamples must be large enough that every conv keeps a positive
+// length AND the result is >= num_conv_pos_embeddings (the pos-conv kernel).
+function Wav2Vec2EncoderLength(const Config: TWav2Vec2Config;
+  NumSamples: integer): integer;
+
+// Builds the Wav2Vec2/HuBERT CTC net described by Config: a single
+// TNNetInput (NumSamples,1,1) raw waveform in, (EncLen,1,vocab) CTC logits
+// out (EncLen = Wav2Vec2EncoderLength(Config, NumSamples)), and loads every
+// weight from the checkpoint at FileName (see the WAV2VEC2 / HUBERT CTC
+// IMPORT section). Config.Prefix and Config.IsHubert are detected from the
+// checkpoint / model_type. pInferenceOnly = True frees training volumes
+// during construction (Compute()-only afterwards). Decode the logits with
+// DecodeCTCGreedy (neuraldecode.pas) against the tokenizer's vocab.json.
+function BuildWav2Vec2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TWav2Vec2Config; NumSamples: integer;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildWav2Vec2FromSafeTensorsEx(const FileName: string;
+  out Config: TWav2Vec2Config; NumSamples: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildWav2Vec2FromSafeTensors(const FileName: string;
+  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+
 // ---------------------------------------------------------------------------
 // RWKV-4 IMPORT (model_type "rwkv": RWKV/rwkv-4-169m-pile and siblings,
 // architectures ["RwkvForCausalLM"]) - the FIRST NON-TRANSFORMER importer:
@@ -1765,6 +3511,16 @@ function BuildRWKVFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
+// Writes Net (a BuildRWKVFromSafeTensors causal-LM) back out under the HF
+// rwkv.* tensor names, the exact inverse of BuildRWKVFromSafeTensorsWithConfig.
+// time_decay is reconstructed by applying the FORWARD softplus to the stored
+// w_raw (LoadWKVDecay's inverse): time_decay = ln(softplus(w_raw)). All other
+// tensors round-trip raw (LayerNorms, token-shift lerp vectors, bias-free
+// projections, time_first bonus, embeddings, ln0/ln_out, tied/untied head).
+procedure SaveRWKVToSafeTensors(Net: TNNet; const Config: TRWKVConfig;
+  const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+
 // ============================ MAMBA IMPORT =================================
 // Mamba (model_type "mamba": state-spaces/mamba-130m-hf and siblings,
 // architectures ["MambaForCausalLM"]) - the SECOND NON-TRANSFORMER importer
@@ -1848,6 +3604,358 @@ function BuildMambaFromSafeTensorsEx(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 function BuildMambaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+// Writes Net (a BuildMambaFromSafeTensors causal-LM) back out under the HF
+// "backbone.*" (or bare, per Config.Prefix) tensor names - the exact inverse
+// of BuildMambaFromSafeTensorsWithConfig. A_log and D and dt_proj.bias and
+// the B|C x_proj rows round-trip RAW; the conv1d / in_proj / out_proj are
+// straight nn.Linear dumps. The one non-trivial inversion is the low-rank
+// dt path: the importer FOLDED dt_proj.weight @ x_proj.weight[0:dt_rank]
+// (a [d_inner, dt_rank] @ [dt_rank, d_inner] product) into the single
+// [d_inner, d_inner] rank-<=dt_rank matrix W_d stored in the scan layer, so
+// the original factors are not retained. The exporter recovers an EXACT
+// rank-<=dt_rank factorization of W_d (Gaussian elimination with partial
+// pivoting), emitting dt_proj.weight = L and x_proj.weight[0:dt_rank] = U
+// with L @ U = W_d - re-importing folds them back to the same W_d (bit-exact
+// in F32 up to single-precision rounding of the factor product). Tied LM
+// heads emit no lm_head.weight tensor (Config.TieWordEmbeddings).
+procedure SaveMambaToSafeTensors(Net: TNNet; const Config: TMambaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
+// ====================== MAMBA-2 / SSD IMPORT ============================
+// BuildMamba2FromSafeTensors imports the Mamba-2 / State-Space Duality
+// family (HF model_type "mamba2", architectures ["Mamba2ForCausalLM"]:
+// state-spaces/mamba2-*, tiiuae/Falcon-Mamba-7B, mistralai/Mamba-Codestral-
+// 7B-v0.1) - the architecturally DISTINCT successor to the Mamba-1 importer.
+// Mamba-2 is a MULTI-HEAD SSM: the state transition A is a single SCALAR
+// per head (A = -exp(A_log), A_log NumHeads-long), B/C are SHARED across the
+// heads of a group (n_groups, GQA-like), and an extra grouped gated RMSNorm
+// precedes out_proj - so the scan is the new TNNetMamba2 leaf, not a flag on
+// TNNetSelectiveSSM. The conv1d/in_proj/out_proj plumbing reuses the Mamba-1
+// pattern. Causal-LM contract like the decoder families ((SeqLen,1,1) ids
+// in, (SeqLen,1,vocab) logits out).
+type
+  TMamba2Config = record
+    HiddenSize: integer;          // hidden_size (d_model)
+    NumLayers: integer;           // num_hidden_layers
+    StateSize: integer;           // state_size (d_state, default 128)
+    NumHeads: integer;            // num_heads
+    HeadDim: integer;             // head_dim
+    NGroups: integer;             // n_groups (default 1)
+    VocabSize: integer;           // vocab_size
+    Expand: integer;              // expand (default 2)
+    DInner: integer;              // intermediate_size = expand*hidden
+    ConvKernel: integer;          // conv_kernel (default 4)
+    UseConvBias: boolean;         // use_conv_bias (default true)
+    UseBias: boolean;             // use_bias - in/out_proj (default false)
+    LayerNormEps: double;         // layer_norm_epsilon (default 1e-5)
+    TieWordEmbeddings: boolean;   // tie_word_embeddings (default true)
+    ModelType: string;            // 'mamba2'
+    Prefix: string;               // 'backbone.' or '' (detected from the file)
+  end;
+
+// Reads a HF Mamba2 config.json (model_type "mamba2"). Required: hidden_size,
+// num_hidden_layers, vocab_size, num_heads, head_dim. Defaults: state_size =
+// 128, n_groups = 1, expand = 2, intermediate_size = expand*hidden, conv_kernel
+// = 4, use_conv_bias true, use_bias false, layer_norm_epsilon = 1e-5,
+// tie_word_embeddings true.
+function ReadMamba2ConfigFromJSONFile(const FileName: string): TMamba2Config;
+
+function Mamba2ConfigToString(const Config: TMamba2Config): string;
+
+// Builds the Mamba-2 causal-LM net described by Config and loads every weight
+// from the checkpoint at FileName (see the MAMBA-2 IMPORT section above).
+// pSeqLen <= 0 uses 1024 (Mamba has no positional limit).
+function BuildMamba2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMamba2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildMamba2FromSafeTensorsEx(const FileName: string;
+  out Config: TMamba2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildMamba2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+// ====================== RECURRENT GEMMA IMPORT ===========================
+// BuildRecurrentGemmaFromSafeTensors imports Google's Griffin/Hawk hybrid
+// (HF model_type "recurrent_gemma", google/recurrentgemma-2b[-it]) - the
+// major modern-recurrent-LM family member alongside the landed RWKV / Mamba
+// importers, and the FIRST import to use the new TNNetRGLRU real-gated linear
+// recurrent unit.
+//
+// Architecture: a fixed temporal-block PATTERN (block_types, default
+// ('recurrent','recurrent','attention') replicated to num_hidden_layers).
+// Each decoder layer is two pre-norm residual sub-blocks:
+//   x := x + temporal_block(RMSNorm(x))   (recurrent OR local attention)
+//   x := x + mlp_block(RMSNorm(x))        (GEGLU(tanh) FFN, intermediate//2)
+// where RMSNorm is the Gemma (1+w) zero-centered norm and the word
+// embeddings are scaled by sqrt(hidden_size) once at the input.
+//
+// Recurrent block (Hawk/Griffin): y = gelu_tanh(linear_y(x)); the x-branch is
+// linear_x(x) -> depthwise CAUSAL conv1d (conv1d_width) -> RG-LRU; output is
+// linear_out(rg_lru_out * y). The per-head block-diagonal RG-LRU gate
+// matrices (input_gate / recurrent_gate, [heads, bw, bw] + biases) are
+// realised as full lru_width->lru_width Pointwise projections (block-diagonal
+// = a full matrix with zero off-block entries), so TNNetRGLRU consumes the
+// packed [x | i_logits | a_logits] slab and owns only Lambda (recurrent_param).
+//
+// Attention block: LOCAL sliding-window (attention_window_size) GQA with
+// PARTIAL rotary (partial_rotary_factor, default 0.5 -> rotary_dims =
+// head_dim*0.5), attention scaled by head_dim**-0.5, an o_proj BIAS (q/k/v
+// biased iff attention_bias). The LM head is tied; the final logits are
+// soft-capped to logits_soft_cap*tanh(logits/cap) (default 30).
+type
+  TRecurrentGemmaConfig = record
+    HiddenSize: integer;          // hidden_size
+    LruWidth: integer;            // lru_width (default hidden_size)
+    NumLayers: integer;           // num_hidden_layers
+    VocabSize: integer;           // vocab_size
+    NumHeads: integer;            // num_attention_heads
+    NumKVHeads: integer;          // num_key_value_heads (default num_heads)
+    HeadDim: integer;             // head_dim (default hidden/num_heads)
+    Intermediate: integer;        // intermediate_size (GEGLU uses half)
+    ConvKernel: integer;          // conv1d_width (default 4)
+    Window: integer;              // attention_window_size (default 2048)
+    LogitSoftCap: double;         // logits_soft_cap (default 30, 0 = off)
+    RmsNormEps: double;           // rms_norm_eps (default 1e-6)
+    PartialRotaryFactor: double;  // partial_rotary_factor (default 0.5)
+    RopeTheta: double;            // rope_theta (default 10000)
+    AttentionBias: boolean;       // attention_bias (q/k/v bias; default false)
+    BlockTypes: array of string;  // per-layer 'recurrent' / 'attention'
+    ModelType: string;            // 'recurrent_gemma'
+    Prefix: string;               // 'model.' or '' (detected from the file)
+  end;
+
+// Reads a HF recurrent_gemma config.json. Required: hidden_size,
+// num_hidden_layers, vocab_size, num_attention_heads. block_types defaults to
+// ('recurrent','recurrent','attention'); lru_width defaults to hidden_size;
+// head_dim to hidden/num_heads; num_key_value_heads to num_attention_heads.
+function ReadRecurrentGemmaConfigFromJSONFile(
+  const FileName: string): TRecurrentGemmaConfig;
+
+function RecurrentGemmaConfigToString(
+  const Config: TRecurrentGemmaConfig): string;
+
+// Builds the RecurrentGemma causal-LM net described by Config ((SeqLen,1,1)
+// token ids in, (SeqLen,1,vocab) logits out) and loads every weight from the
+// checkpoint at FileName. pSeqLen <= 0 uses 2048.
+function BuildRecurrentGemmaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildRecurrentGemmaFromSafeTensorsEx(const FileName: string;
+  out Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildRecurrentGemmaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+// ============================ JAMBA IMPORT ================================
+// BuildJambaFromSafeTensors imports AI21's Jamba (HF model_type "jamba",
+// ai21labs/Jamba-tiny-dev / Jamba-Mini / Jamba-1.5) - the FIRST HYBRID
+// Mamba+attention+MoE decoder in this suite, and the first import that
+// composes three landed primitives in ONE stack: selective-SSM mixers
+// (TNNetSelectiveSSM), full softmax attention, and Mixtral-style top-k MoE.
+//
+// PER-LAYER BLOCK-TYPE SCHEDULE (the genuinely new piece; mirrors HF
+// configuration_jamba EXACTLY): layer i is an ATTENTION layer iff
+// i mod attn_layer_period = attn_layer_offset (else a MAMBA layer); its FFN
+// is an N-expert MoE iff i mod expert_layer_period = expert_layer_offset
+// (else a dense SwiGLU MLP). The 4 block kinds (mamba|attn) x (moe|dense)
+// can co-occur in any combination.
+//
+// Each block is pre-norm with two residuals (HF JambaAttention/MambaDecoder
+// Layer): x := x + Mixer(input_layernorm(x)); x := x + FFN(pre_ff_layernorm
+// (x)). RMSNorm throughout (eps rms_norm_eps). NO positional encoding at all
+// - the Mamba layers carry order; attention is NoPE (no RoPE in HF
+// JambaAttention.forward). Attention is bias-free GQA (num_key_value_heads),
+// scale head_dim^-0.5.
+//
+// The MAMBA mixer is HF JambaMambaMixer, which differs from plain Mamba by an
+// INNER per-vector RMSNorm on the dt / B / C selection vectors between x_proj
+// and the scan (dt_layernorm / b_layernorm / c_layernorm). That nonlinearity
+// cannot be folded into the constant projections the plain-Mamba importer
+// uses, so the SSM leaf is built in TNNetSelectiveSSM's forward-only Jamba
+// inner-norm mode (CreateJambaInner), which keeps the dt path unfolded and
+// applies the three inner RMSNorms itself. The surrounding wiring (in_proj
+// x|z split, depthwise causal conv1d + SiLU, SiLU(z) gate, out_proj) matches
+// the plain Mamba block.
+//
+// The MoE FFN is the Mixtral combine (router softmax over ALL experts, hard
+// top-k, SwiGLU experts) but with the top-k weights NOT renormalized (HF
+// JambaSparseMoeBlock takes the raw softmax probs of the selected experts).
+//
+// Causal-LM contract like the other decoder families: (SeqLen,1,1) token ids
+// in, (SeqLen,1,vocab) logits out. Multi-shard .index.json checkpoints are
+// supported (real Jamba is large/sharded). Jamba-Mini (52B, 12 active) and
+// the 1.5 line import on this exact path but are RAM-gated like the other
+// large checkpoints - use a sliced fixture for tests; never load a real one
+// in CI. Coded by Claude (AI).
+type
+  TJambaConfig = record
+    HiddenSize: integer;        // hidden_size (d_model)
+    IntermediateSize: integer;  // SwiGLU / per-expert width
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    NumKVHeads: integer;        // num_key_value_heads (GQA)
+    VocabSize: integer;         // vocab_size
+    RmsNormEps: TNeuralFloat;   // rms_norm_eps
+    TieWordEmbeddings: boolean; // tie_word_embeddings (default false)
+    NumExperts: integer;        // num_experts (the MoE expert count)
+    NumExpertsPerTok: integer;  // num_experts_per_tok (top-k)
+    ExpertLayerPeriod: integer; // expert_layer_period
+    ExpertLayerOffset: integer; // expert_layer_offset
+    AttnLayerPeriod: integer;   // attn_layer_period
+    AttnLayerOffset: integer;   // attn_layer_offset
+    MambaDState: integer;       // mamba_d_state
+    MambaDConv: integer;        // mamba_d_conv (conv kernel)
+    MambaExpand: integer;       // mamba_expand (d_inner = expand*hidden)
+    MambaDtRank: integer;       // mamba_dt_rank ("auto" = ceil(hidden/16))
+    MambaConvBias: boolean;     // mamba_conv_bias
+    MambaProjBias: boolean;     // mamba_proj_bias (in/out_proj bias)
+    DInner: integer;            // derived: MambaExpand*HiddenSize
+    ModelType: string;          // 'jamba'
+    Prefix: string;             // 'model.' (detected from the checkpoint)
+  end;
+
+// Reads an HF Jamba config.json (model_type "jamba"). Defaults follow
+// JambaConfig: num_key_value_heads = num_attention_heads, rms_norm_eps =
+// 1e-6, tie_word_embeddings false, num_experts 16, num_experts_per_tok 2,
+// expert_layer_period 2 / offset 1, attn_layer_period 8 / offset 4,
+// mamba_d_state 16, mamba_d_conv 4, mamba_expand 2, mamba_dt_rank "auto",
+// mamba_conv_bias true, mamba_proj_bias false.
+function ReadJambaConfigFromJSONFile(const FileName: string): TJambaConfig;
+
+function JambaConfigToString(const Config: TJambaConfig): string;
+
+// Per-layer block-type predicates (HF configuration_jamba, verbatim).
+function JambaLayerIsAttention(const Config: TJambaConfig;
+  LayerIdx: integer): boolean;
+function JambaLayerIsMoE(const Config: TJambaConfig;
+  LayerIdx: integer): boolean;
+
+function BuildJambaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TJambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildJambaFromSafeTensorsEx(const FileName: string;
+  out Config: TJambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildJambaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+// ====================== NEMOTRON-H IMPORT (interface) =====================
+// BuildNemotronHFromSafeTensors imports NVIDIA's Nemotron-H hybrid family
+// (HF model_type "nemotron_h", architectures ["NemotronHForCausalLM"]:
+// nvidia/Nemotron-H-8B-Base and the 4B/47B siblings) - the SECOND HYBRID
+// importer after Jamba, and ARCHITECTURALLY DISTINCT from it. Jamba is
+// Mamba-1 + attention with a periodic arithmetic schedule and a gated SwiGLU
+// (or top-k MoE) FFN on every block. Nemotron-H instead interleaves the
+// landed multi-head TNNetMamba2 selective-SSD mixer, full softmax-attention,
+// and a plain NON-gated MLP on an EXPLICIT per-layer string schedule
+// (config "hybrid_override_pattern" / "layers_block_type", e.g. "M-M-M*-M-..."
+// with 'M'=Mamba2, '*'=attention, '-'=MLP). Each block is a SINGLE pre-norm
+// residual x := x + mixer(norm(x)) - there is NO separate FFN sub-block as in
+// Jamba; the MLP IS a block type on the schedule.
+//
+// Genuinely new vs every landed importer:
+//   (a) the override-pattern string driving heterogeneous block placement
+//       (parsed once into a TNemotronHBlockType array; not arithmetic like
+//       Jamba's attn_layer_period/offset);
+//   (b) a squared-ReLU (relu2 / ACT2FN "relu2") NON-gated MLP -
+//       down(ReLU(up(x))^2) with NO gate projection. Reproduced as
+//       up_proj -> TNNetReLU -> TNNetSquare -> down_proj (ReLU then x*x =
+//       ReLU(x)^2), the single-projection counterpart of the gated
+//       TNNetReGLUSquared used by BitNet.
+// The Mamba2 mixer reuses the standalone Mamba2 in_proj packing exactly
+// ([gate | x|B|C | dt], d_mlp=0) and the attention is bias-free GQA with NoPE
+// and an explicit config head_dim (NOT hidden/num_heads), scaling head_dim^-0.5.
+// RMSNorm throughout. Tokenizer is a tokenizer.json BPE (already supported).
+//
+// Supports the M/*/- block types (the dense Nemotron-H base/4B/8B/47B) AND
+// the 'E'=MoE block type (Nemotron-H-MoE). The MoE block is a DeepSeek-V3-style
+// SPARSE FFN that reuses the NON-GATED relu2 expert (down(ReLU(up(x))^2), no
+// gate proj - the sparse counterpart of the dense '-' MLP): a SIGMOID router
+// (NOT softmax) -> top-k selection on (sigmoid + e_score_correction_bias) ->
+// raw-sigmoid combine weights (renormalized iff norm_topk_prob) scaled by
+// routed_scaling_factor, PLUS an always-on shared expert (its own non-gated
+// relu2 MLP at moe_shared_expert_intermediate_size) summed in. Wired with the
+// landed TNNetTopKGate / TNNetBiasBalancedTopKGate (selection-bias = the
+// e_score_correction_bias, combine renormalized) + TNNetSigmoid + a
+// routed_scaling_factor TNNetMulByConstant - NO new layer. Grouped routing
+// (n_group>1) and moe_latent_size are rejected with a clear message.
+// Coded by Claude (AI).
+type
+  TNemotronHBlockType = (nhMamba2, nhAttention, nhMLP, nhMoE);
+  TNemotronHBlockTypeArray = array of TNemotronHBlockType;
+
+  TNemotronHConfig = record
+    HiddenSize: integer;          // hidden_size (d_model)
+    NumLayers: integer;           // derived: length of the block schedule
+    BlockTypes: TNemotronHBlockTypeArray; // per-layer M/*/- schedule
+    Pattern: string;              // the raw override-pattern string
+    // attention
+    NumHeads: integer;            // num_attention_heads
+    NumKVHeads: integer;          // num_key_value_heads (GQA)
+    HeadDim: integer;             // head_dim (explicit, may != hidden/heads)
+    // MLP
+    IntermediateSize: integer;    // intermediate_size (relu2 MLP width)
+    // MoE ('E' block) - DeepSeek-V3-style sigmoid-router sparse relu2 FFN
+    NumRoutedExperts: integer;    // n_routed_experts (0 = no MoE block present)
+    NumExpertsPerTok: integer;    // num_experts_per_tok (top-k)
+    MoEIntermediateSize: integer; // moe_intermediate_size (routed-expert width)
+    NumSharedExperts: integer;    // n_shared_experts (0 or 1)
+    SharedExpertInterSize: integer; // moe_shared_expert_intermediate_size
+    NormTopKProb: boolean;        // norm_topk_prob (renormalize the top-k probs)
+    RoutedScalingFactor: double;  // routed_scaling_factor
+    // mamba2 mixer
+    StateSize: integer;           // ssm_state_size (d_state)
+    MambaNumHeads: integer;       // mamba_num_heads
+    MambaHeadDim: integer;        // mamba_head_dim
+    NGroups: integer;             // n_groups
+    ConvKernel: integer;          // conv_kernel
+    DInner: integer;              // derived: mamba_num_heads*mamba_head_dim
+    UseConvBias: boolean;         // use_conv_bias (default true)
+    UseBias: boolean;             // use_bias - mamba in/out_proj (default false)
+    // shared
+    VocabSize: integer;           // vocab_size
+    LayerNormEps: double;         // layer_norm_epsilon (default 1e-5)
+    TieWordEmbeddings: boolean;   // tie_word_embeddings (default false)
+    ModelType: string;            // 'nemotron_h'
+    Prefix: string;               // 'model.' (detected from the checkpoint)
+  end;
+
+// Reads an HF Nemotron-H config.json (model_type "nemotron_h"). The block
+// schedule comes from "hybrid_override_pattern" (string of M/*/-) or
+// "layers_block_type" (list of "mamba"/"attention"/"mlp"); one is required.
+function ReadNemotronHConfigFromJSONFile(const FileName: string): TNemotronHConfig;
+
+function NemotronHConfigToString(const Config: TNemotronHConfig): string;
+
+function BuildNemotronHFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TNemotronHConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildNemotronHFromSafeTensorsEx(const FileName: string;
+  out Config: TNemotronHConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildNemotronHFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
@@ -1942,6 +4050,97 @@ function BuildBloomFromSafeTensorsEx(const FileName: string;
 function BuildBloomFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+// Inverse of BuildBloomFromSafeTensors: walks the wired BLOOM decoder in
+// importer build order and saves each HF-named tensor with the EXACT inverse
+// of every load transform - re-fusing the per-head Q|K|V slab back into the
+// single query_key_value tensor (BLOOM has NO rotary, so NO rotate_half
+// permutation), and dumping the word_embeddings_layernorm, the per-block
+// input/post_attention LayerNorms, dense/mlp Linears (with bias) and the
+// final ln_f. The LM head is ALWAYS tied (no separate lm_head tensor is
+// written). Config.Prefix selects the name prefix ('transformer.' or '').
+procedure SaveBloomToSafeTensors(Net: TNNet; const Config: TBloomConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+
+// ============================= FALCON IMPORT ===============================
+// BuildFalconFromSafeTensors rebuilds the Falcon decoder family (model_type
+// "falcon"; legacy "RefinedWebModel" = falcon-7b, "RefinedWeb" = falcon-40b)
+// - the closest cousin of the GPT-NeoX path (fused query_key_value, RoPE,
+// parallel attention+MLP residual) with two Falcon-specific twists:
+//   - FUSED MULTI-QUERY / GQA query_key_value: a single [qkv_out, hidden]
+//     slab. For multi_query=true & new_decoder_architecture=false
+//     (falcon-7b, falcon-rw): num_heads query heads + ONE shared K head +
+//     ONE shared V head (view(num_heads+2, head_dim)); the single cached
+//     K/V fans out across every query head. For new_decoder_architecture=
+//     true (falcon-40b): num_kv_heads GQA groups, each
+//     (num_heads/num_kv_heads query heads + 1 K + 1 V) INTERLEAVED per group
+//     (view(-1, num_heads//num_kv_heads + 2, head_dim)). multi_query=false &
+//     new_decoder_architecture=false is plain per-head [q|k|v] (the GPT-NeoX
+//     layout). RoPE is FULL-head Llama rotate_half (the loader composes the
+//     rotate_half->interleaved permutation into Q and K rows).
+//   - PARALLEL attention+MLP residual x := x + Attn(ln(x)) + MLP(ln(x)) with
+//     a SINGLE shared LayerNorm (parallel_attn / num_ln_in_parallel_attn=1,
+//     falcon-7b: input_layernorm) OR TWO separate norms (new arch /
+//     num_ln_in_parallel_attn=2, falcon-40b: ln_attn for attention,
+//     ln_mlp for the MLP). parallel_attn=false is the rare SEQUENTIAL pre-LN
+//     fallback (input_layernorm + post_attention_layernorm).
+// Plain BIASED LayerNorm (NOT RMSNorm), GELU MLP, NO biases on any Linear
+// (bias=false). Causal-LM contract like the other decoder families
+// ((SeqLen,1,1) ids in, (SeqLen,1,vocab) logits out).
+type
+  TFalconConfig = record
+    HiddenSize: integer;        // hidden_size (d_model)
+    IntermediateSize: integer;  // ffn_hidden_size (null/absent = 4*hidden)
+    NumLayers: integer;         // num_hidden_layers (legacy n_layer)
+    NumHeads: integer;          // num_attention_heads (legacy n_head)
+    NumKVHeads: integer;        // EFFECTIVE K/V heads: num_kv_heads (new
+                                // arch), 1 (multi_query), or NumHeads (MHA)
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings
+    LayerNormEps: TNeuralFloat; // layer_norm_epsilon
+    RopeTheta: TNeuralFloat;    // rope_theta (RoPE base, default 10000)
+    NewDecoderArchitecture: boolean; // new_decoder_architecture (falcon-40b)
+    ParallelAttn: boolean;      // parallel_attn (single LN, falcon-7b)
+    TwoLayerNorms: boolean;     // ln_attn/ln_mlp split (new arch /
+                                // num_ln_in_parallel_attn=2)
+    TieWordEmbeddings: boolean; // tie_word_embeddings
+    RopeScaling: TRoPEScalingConfig; // parsed "rope_scaling"/"rope_parameters"
+    Prefix: string;             // tensor-name prefix ('transformer.' or '')
+  end;
+
+// Reads a HF Falcon config.json (model_type "falcon"; the legacy
+// "RefinedWebModel"/"RefinedWeb" spellings are accepted). Required: n_head /
+// num_attention_heads, n_layer / num_hidden_layers, vocab_size, hidden_size.
+// Defaults follow FalconConfig: ffn_hidden_size null = 4*hidden_size,
+// num_kv_heads = num_attention_heads, new_decoder_architecture = false,
+// multi_query = true, parallel_attn = true, layer_norm_epsilon = 1e-5,
+// rope_theta = 10000, max_position_embeddings = 2048, tie_word_embeddings =
+// true. alibi=true is rejected (use the BLOOM-style path, not wired for
+// Falcon). bias=true is rejected (no released Falcon uses biased Linears).
+// Prefix is left '' - the builder detects it.
+function ReadFalconConfigFromJSONFile(const FileName: string): TFalconConfig;
+
+function FalconConfigToString(const Config: TFalconConfig): string;
+
+// Builds the Falcon causal-LM net described by Config and loads every weight
+// from the checkpoint at FileName (see the FALCON IMPORT section above).
+// pSeqLen <= 0 uses max_position_embeddings. pInferenceOnly = True frees
+// training volumes during construction. Config.Prefix is detected from the
+// checkpoint and written back.
+function BuildFalconFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TFalconConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+function BuildFalconFromSafeTensorsEx(const FileName: string;
+  out Config: TFalconConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildFalconFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
 
 // ========================= MODERNBERT IMPORT ===============================
 // BuildModernBertFromSafeTensors rebuilds answer.ai's ModernBERT encoder
@@ -2051,6 +4250,97 @@ function BuildModernBertFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
+// DEBERTA-V2 / DEBERTA-V3 IMPORT (model_type "deberta-v2"; the deberta-v3
+// family - microsoft/deberta-v3-base/-small, the ms-marco cross-encoder
+// rerankers - all use the DebertaV2 architecture class). The THIRD encoder
+// family here and the first with DISENTANGLED ATTENTION
+// (TNNetDisentangledAttention): the pre-softmax score is content-to-content
+// PLUS content-to-position PLUS position-to-content, the position terms
+// projecting a SEPARATE relative-position embedding table (distinct from the
+// avT5RelPosBias SCALAR bias). Architecture (verified vs HF transformers
+// modeling_deberta_v2):
+//
+//   Input(SeqLen,1,1 token ids) -> TNNetEmbedding (embeddings.word_embeddings)
+//     -> TNNetTokenLayerNorm (embeddings.LayerNorm)        [StableDropout off]
+//     -> num_hidden_layers x POST-LN blocks
+//          x := LN(x + dense(DISENTANGLED-MHA(q|k|v(x))))
+//          x := LN(x + output.dense(gelu(intermediate.dense(x))))
+//     -> Output: (SeqLen,1,hidden) final hidden states (HF DebertaV2Model
+//        last_hidden_state) - NO LM head.
+//
+// DeBERTa-v3 specifics handled here:
+//   - position_biased_input=false: NO absolute position table and NO
+//     token-type add in the embedding path (type_vocab_size=0) - just word
+//     embedding -> LayerNorm. (The BERT importer's pos/type branches are
+//     ABSENT.)
+//   - conv-after-embeddings is ABSENT in v3 (conv_kernel_size unset/0).
+//   - relative_attention=true, pos_att_type=[p2c,c2p], share_att_key=true:
+//     ONE shared rel_embeddings table (2*pos_ebd_size rows), LayerNorm'd
+//     (norm_rel_ebd "layer_norm") then projected by the SAME per-layer
+//     query/key weights as content (share_att_key). The importer precomputes
+//     each layer's per-head position-KEY (K^r = key_proj(rel_ln)) and
+//     position-QUERY (Q^r = query_proj(rel_ln)) tables and loads them into
+//     the per-head TNNetDisentangledAttention neurons.
+//   - exact erf GELU (hidden_act "gelu"), composed like the BERT importer.
+//   - sequence-classification head (pSeqClsHead): ContextPooler
+//     dense+gelu on row 0 then classifier(pooled) - reuses the same per-token
+//     PointwiseConvLinear scoring path as BuildBertForSequenceClassification.
+//
+// Tokenizer is a Unigram tokenizer.json (rides TNeuralHFTokenizer); the raw
+// spm.model protobuf path is OUT OF SCOPE here.
+
+type
+  TDebertaV2Config = record
+    HiddenSize: integer;       // hidden_size
+    IntermediateSize: integer; // intermediate_size
+    NumLayers: integer;        // num_hidden_layers
+    NumHeads: integer;         // num_attention_heads
+    VocabSize: integer;        // vocab_size
+    MaxPositions: integer;     // max_position_embeddings
+    LayerNormEps: double;      // layer_norm_eps (DeBERTa default 1e-7)
+    PosBuckets: integer;       // position_buckets (-1/0 = no log bucketing)
+    MaxRelPos: integer;        // max_relative_positions (resolved)
+    PosEbdSize: integer;       // att_span = position_buckets if >0 else MaxRel
+    NormRelEbd: boolean;       // norm_rel_ebd contains "layer_norm"
+    HiddenActTanh: boolean;    // false = exact erf "gelu" (the v3 default)
+    PoolerActTanh: boolean;    // pooler_hidden_act: false = gelu (default)
+    ModelType: string;         // 'deberta-v2'
+    Prefix: string;            // 'deberta.' or '' (detected by the builder)
+  end;
+
+// Reads a HF DeBERTa-v2/v3 config.json (model_type "deberta-v2"). Requires
+// hidden_size, intermediate_size, num_hidden_layers, num_attention_heads,
+// vocab_size, max_position_embeddings. Defaults follow DebertaV2Config:
+// layer_norm_eps = 1e-7, position_buckets = -1, max_relative_positions = -1
+// (resolved to max_position_embeddings), norm_rel_ebd = "none". Only the
+// p2c+c2p (scale_factor 3), share_att_key=true, relative_attention=true
+// configuration is supported (the deberta-v3 family); anything else is
+// rejected.
+function ReadDebertaV2ConfigFromJSONFile(
+  const FileName: string): TDebertaV2Config;
+
+function DebertaV2ConfigToString(const Config: TDebertaV2Config): string;
+
+// Builds the DeBERTa-v2/v3 ENCODER described by Config ((SeqLen,1,1) token ids
+// in, (SeqLen,1,hidden) final hidden states out) and loads every weight from
+// the checkpoint at FileName. pSeqLen = 0 uses the full
+// max_position_embeddings context. pInferenceOnly frees training volumes.
+// pSeqClsHead = True appends the ContextPooler + classifier head (row 0 then
+// carries HF's sequence-classification logits).
+function BuildDebertaV2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TDebertaV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pSeqClsHead: boolean = false): TNNet;
+
+function BuildDebertaV2FromSafeTensorsEx(const FileName: string;
+  out Config: TDebertaV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; const ConfigFileName: string = '';
+  pSeqClsHead: boolean = false): TNNet;
+
+function BuildDebertaV2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // DEEPSEEK-V2 IMPORT (model_type "deepseek_v2"; DeepSeek-V2-Lite is the
 // reference checkpoint) - the first importer to carry the two DeepSeek-V2
 // signature blocks: Multi-head Latent Attention (MLA: a low-rank compressed
@@ -2095,9 +4385,9 @@ function BuildModernBertFromSafeTensors(const FileName: string;
 // LIMITATIONS (all checked, with clear errors): q_lora_rank must be null
 // (the -Lite case; the full 236B V2 uses a low-rank W_q, not wired),
 // qk_nope_head_dim must equal v_head_dim (true for -Lite AND full V2; the
-// zero-pad trick reuses the dr-wide rope-K block), rope_scaling must be
-// null (DeepSeek's YaRN carries mscale/mscale_all_dim attention-scale
-// overrides that the rope-scaling support deliberately rejects),
+// zero-pad trick reuses the dr-wide rope-K block). rope_scaling: YaRN (incl.
+// DeepSeek's mscale/mscale_all_dim attention-scale overrides, folded into the
+// rotary FOutScale) and null are wired; other types are rejected.
 // topk_method must be "greedy" (group_limited_greedy routing is a full-V2
 // feature), scoring_func "softmax", moe_layer_freq 1, attention_bias and
 // mlp_bias false.
@@ -2129,6 +4419,10 @@ type
     TieWordEmbeddings: boolean;
     ModelType: string;          // 'deepseek_v2'
     Prefix: string;             // detected: 'model.' or ''
+    // Parsed "rope_scaling" (Mode=rsmNone when null/absent). DeepSeek-V2-Lite
+    // carries a YaRN config with explicit mscale/mscale_all_dim attention-scale
+    // overrides, folded into RopeScaling.YarnAttnFactor. Coded by Claude (AI).
+    RopeScaling: TRoPEScalingConfig;
   end;
 
 // Reads a HF DeepSeek-V2 config.json (model_type "deepseek_v2"). Required:
@@ -2138,9 +4432,10 @@ type
 // num_experts_per_tok. Optional: n_shared_experts (null/absent = 0),
 // first_k_dense_replace (default 0), norm_topk_prob (default false),
 // routed_scaling_factor (default 1.0), rms_norm_eps (1e-6), rope_theta
-// (10000), tie_word_embeddings (false). Fails with a clear message on the
+// (10000), tie_word_embeddings (false), rope_scaling (null or YaRN incl.
+// mscale/mscale_all_dim overrides). Fails with a clear message on the
 // unsupported variants listed in the section header (q_lora_rank,
-// rope_scaling, group_limited_greedy, ...).
+// non-YaRN rope_scaling, group_limited_greedy, ...).
 function ReadDeepSeekV2ConfigFromJSONFile(
   const FileName: string): TDeepSeekV2Config;
 // One-line human-readable summary (mirrors LlamaConfigToString).
@@ -2303,11 +4598,17 @@ procedure BuildClipFromSafeTensors(const FileName: string;
 // post LayerNorm ('visual_projection.weight' for CLIP; '' skips the
 // projection and the net outputs (num_patches+1,1,hidden) post-LN hidden
 // states - the plain ViT contract). The CLASS-token row is row 0.
+// When pVisionFeatures is true the tower returns LLaVA's vision feature:
+// the penultimate hidden state (HF output_hidden_states[-2]) - the encoder
+// stack with the LAST block omitted - WITHOUT the CLS row and WITHOUT
+// post_layernorm/projection. The result shape is (NumPatches, 1, hidden);
+// ProjectionTensorName/ProjectionDim are ignored in this mode.
 function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
   const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
   ProjectionDim: integer; const Prefix: string;
   const ProjectionTensorName: string = '';
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false;
+  pVisionFeatures: boolean = false): TNNet;
 
 // The text-pooling position of modeling_clip: EosTokenId = 2 (the legacy
 // id of every published OpenAI CLIP) returns the position of the FIRST
@@ -2332,6 +4633,141 @@ procedure ClipExtractEmbedding(NetOutput: TNNetVolume; TokenPos: integer;
 // ClipExtractEmbedding outputs (both are unit-L2).
 function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 
+// ===========================================================================
+// SigLIP IMPORT (model_type "siglip" / "siglip2": google/siglip-base-
+// patch16-224 and siblings) - a sigmoid-loss image-text dual encoder. It
+// REUSES the CLIP pre-LN encoder block (TClipTowerConfig / AddClipEncoder
+// block / LoadClipEncoderBlockWeights) but the heads/pooling/embeddings are
+// architecturally DISTINCT from CLIP and are NOT force-fit onto the CLIP path:
+//   (a) loss head: a learnable logit_scale AND logit_bias (CLIP has scale
+//       only); SigLIPLogits applies logits = exp(scale)*cosine + bias;
+//   (b) TEXT tower: BIDIRECTIONAL (no causal mask, unlike CLIP), pools the
+//       LAST token's hidden state (NOT CLIP's eos-argmax) through a BIASED
+//       head nn.Linear (text_model.head); VISION tower pools via a Multihead
+//       Attention Pooling head (MAP: one learnable probe query cross-attends
+//       over the patch tokens, then out = attn + mlp(LayerNorm(attn)), row 0)
+//       - NOT a CLS token;
+//   (c) MLP activation is gelu_pytorch_tanh (the tanh-approx GELU), not
+//       CLIP's quick_gelu;
+//   (d) patch embedding is BIASED, has NO class token, and the learned
+//       position table covers exactly num_patches rows (no +1); a prenorm
+//       encoder with a final post_layernorm.
+// v1 scopes to the FIXED-resolution siglip / siglip2 base configs; NaFlex /
+// variable-resolution siglip2 is an explicit follow-up (tasklist.md).
+// ---------------------------------------------------------------------------
+type
+  TSigLIPConfig = record
+    Text: TClipTowerConfig;     // text_config (encoder block shape; HiddenAct
+                                // forced to gelu_pytorch_tanh)
+    Vision: TClipTowerConfig;   // vision_config
+    TextVocabSize: integer;     // text_config.vocab_size
+    TextMaxPositions: integer;  // text_config.max_position_embeddings (64)
+    ImageSize: integer;         // vision_config.image_size (224)
+    PatchSize: integer;         // vision_config.patch_size (16/14)
+    NumChannels: integer;       // vision_config.num_channels (3)
+    ProjectionDim: integer;     // text head out width = projection_size
+                                // (= text hidden_size in published SigLIPs);
+                                // the IMAGE embed width is vision hidden_size
+    LogitScale: TNeuralFloat;   // RAW logit_scale tensor (pre-exp)
+    LogitBias: TNeuralFloat;    // RAW logit_bias tensor (added after scaling)
+    ModelType: string;          // 'siglip' / 'siglip2'
+  end;
+
+// Reads a HF SigLIP config.json (model_type "siglip"/"siglip2"). Required
+// per tower (text_config / vision_config): hidden_size, intermediate_size,
+// num_hidden_layers, num_attention_heads, plus text vocab_size +
+// max_position_embeddings and vision image_size + patch_size. Defaults:
+// hidden_act "gelu_pytorch_tanh", layer_norm_eps 1e-6, num_channels 3,
+// projection_size = text hidden_size. The hidden_act is forced to the
+// tanh-GELU (every published SigLIP); any other value is rejected.
+function ReadSigLIPConfigFromJSONFile(const FileName: string): TSigLIPConfig;
+
+function SigLIPConfigToString(const Config: TSigLIPConfig): string;
+
+// Builds the SigLIP TEXT and VISION nets described by Config and loads every
+// weight from the checkpoint at FileName. TextSeqLen <= 0 uses the full
+// max_position_embeddings context. Both nets are owned by the caller.
+// pInferenceOnly frees training volumes during construction. The TEXT net
+// outputs (SeqLen,1,ProjectionDim): the per-token final_layer_norm + biased
+// head; the IMAGE embed is the VISION net's row-0 output (the MAP pooled
+// token), shape (1,1,vision hidden). Config.LogitScale / LogitBias are
+// updated from the checkpoint tensors.
+procedure BuildSigLIPFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TSigLIPConfig; out TextNet, VisionNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+procedure BuildSigLIPFromSafeTensors(const FileName: string;
+  out TextNet, VisionNet: TNNet; out Config: TSigLIPConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Builds + loads the SigLIP ViT VISION tower alone (the reusable half, the
+// SigLIP-flavoured ViT: biased patch conv, no class token, prenorm encoder,
+// post_layernorm). Prefix is the tensor-name prefix ('vision_model.').
+// pVisionFeatures = True is the LLaVA/VLM mode: the tower SKIPS the MAP
+// pooling head and returns the (NumPatches,1,hidden) patch-token hidden
+// states straight after the encoder (SelectHiddenLayer picks how many
+// encoder blocks to run: <=0 = the full stack then post_layernorm; a
+// positive N runs the first N blocks and omits post_layernorm, matching HF
+// output_hidden_states[N]). Default (pVisionFeatures = False) returns the
+// MAP-pooled (1,1,hidden) image embedding token at row 0.
+function BuildSigLIPVisionTower(Reader: TNNetSafeTensorsReader;
+  const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels: integer;
+  const Prefix: string; pInferenceOnly: boolean = false;
+  pVisionFeatures: boolean = false;
+  SelectHiddenLayer: integer = 0): TNNet;
+
+// SigLIP scoring: image/text embeds are L2-normalized (ClipExtractEmbedding),
+// then logit = exp(LogitScale) * cosine(ImageEmb, TextEmb) + LogitBias. This
+// is HF's logits_per_image[i][t] entry; the sigmoid probability is
+// 1/(1+exp(-logit)).
+function SigLIPLogit(ImageEmb, TextEmb: TNNetVolume;
+  LogitScale, LogitBias: TNeuralFloat): TNeuralFloat;
+
+// ---------------------------------------------------------------------------
+// CLIP / LLaVA image preprocessing (LLaVA Step 2)
+// ---------------------------------------------------------------------------
+// The CLIP/LLaVA processor pipeline (preprocessor_config.json):
+//   resize the shortest edge to size.shortest_edge (preserving aspect
+//   ratio) -> center-crop to crop_size -> rescale by 1/255 ->
+//   normalize (x - image_mean) / image_std, per channel.
+// CropSize is the crop_size (height = width assumed, the published CLIP
+// configs); ShortestEdge is size.shortest_edge (resize target). Rescale
+// factor is 1/255 (the published rescale_factor).
+type
+  TClipImageProcessorConfig = record
+    ShortestEdge: integer;          // size.shortest_edge (resize target)
+    CropHeight: integer;            // crop_size.height
+    CropWidth: integer;             // crop_size.width
+    DoResize: boolean;              // do_resize
+    DoCenterCrop: boolean;          // do_center_crop
+    DoRescale: boolean;             // do_rescale
+    DoNormalize: boolean;           // do_normalize
+    RescaleFactor: TNeuralFloat;    // rescale_factor (1/255)
+    Mean: array[0..2] of TNeuralFloat;  // image_mean (RGB)
+    Std: array[0..2] of TNeuralFloat;   // image_std (RGB)
+  end;
+
+// Reads a HF preprocessor_config.json for the CLIP/LLaVA image processor.
+// Defaults follow CLIPImageProcessor: shortest_edge/crop 224, do_* True,
+// rescale_factor 1/255, the OpenAI image_mean/std. size may be an int, an
+// object with "shortest_edge", or "height"/"width"; crop_size may be an int
+// or an object with "height"/"width".
+function ReadClipImageProcessorConfig(
+  const FileName: string): TClipImageProcessorConfig;
+
+// Preprocesses Src (an (W, H, 3) RGB volume with 0..255 byte values in the
+// channel-last layout the vision net consumes) into Dst, a
+// (CropWidth, CropHeight, 3) normalized RGB volume ready for the CLIP /
+// LLaVA vision tower input. Resize uses bilinear interpolation (HF's
+// default is bicubic; for byte-exact parity feed a Src already at the
+// processor's working size so resize and center-crop are identities - the
+// rescale/normalize path is then byte-exact vs CLIPImageProcessor).
+procedure ClipPreprocessImage(Src, Dst: TNNetVolume;
+  const Config: TClipImageProcessorConfig);
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -2341,7 +4777,8 @@ function ClipSimilarity(EmbA, EmbB: TNNetVolume): TNeuralFloat;
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
 // gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, gemma,
-// gemma2, gemma3_text, rwkv, mamba, bloom, bert, distilbert, roberta,
+// gemma2, gemma3_text, rwkv, mamba, bloom, falcon (legacy RefinedWebModel /
+// RefinedWeb spellings accepted), bert, distilbert, roberta,
 // modernbert, deepseek_v2.
 // Anything else
 // raises EPretrainedImportError listing the supported types. The explicit
@@ -2389,6 +4826,54 @@ function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
 function LoadPretrainedEmbedding(const FileName: string;
   Embedding: TNNetEmbedding; Tokenizer: TStringListInt;
   FreezeEmbedding: boolean = false): integer;
+
+// ----------------------------- HF PEFT LoRA -------------------------------
+// Loads a Hugging Face PEFT LoRA adapter (an adapter_model.safetensors plus
+// an optional adapter_config.json) onto the A=down / B=up pointwise
+// projections built by TNNet.AddLoRAAdapter. PEFT stores, per wrapped module
+// <m>, two nn.Linear weight matrices:
+//   <prefix><m>.lora_A.weight : [r,     d_in ]   (down, A)
+//   <prefix><m>.lora_B.weight : [d_out, r    ]   (up,   B)
+// where <prefix> is usually "base_model.model." (and the matrices often sit
+// under a ".default." adapter-name segment). The effective bypass applied at
+// inference is (lora_alpha / r) * B*A; PEFT's own scaling lives in the config,
+// NOT in the stored weights, which exactly matches AddLoRAAdapter's
+// MulByConstant(Alpha/Rank). Both [out, in] matrices follow nn.Linear layout,
+// so they map row-for-row onto the pointwise neurons (neuron j, weight i).
+type
+  // alpha (lora_alpha) and r read from an adapter_config.json. RankFound is
+  // false when no config was read (caller keeps the rank it built with).
+  TPEFTAdapterConfig = record
+    Alpha: TNeuralFloat;
+    Rank: integer;
+    RankFound: boolean;
+  end;
+
+// Loads a bias-free nn.Linear [OutDim, InDim] matrix straight onto a pointwise
+// layer's neurons (neuron j gets row j, weight i = W[j*InDim+i]), each weight
+// multiplied by Scale. The pointwise/per-token layout the AddLoRAAdapter A/B
+// projections use, so it is reused to drop the base proj and the lora_A/lora_B
+// matrices onto their layers. Raises EPretrainedImportError on a shape or
+// neuron-count mismatch.
+procedure LoadPlainLinearWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
+  Scale: TNeuralFloat = 1.0);
+
+// Reads lora_alpha and r from a PEFT adapter_config.json. Missing fields
+// default to Alpha=Rank (scale 1.0) so a config-less adapter still loads.
+function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
+
+// Loads ONE wrapped module's LoRA pair from an already-open reader onto the
+// AddLoRAAdapter A (down) and B (up) layers. ModuleName is the PEFT module
+// path (e.g. "model.layers.0.self_attn.q_proj"); the loader tries the common
+// "base_model.model." prefix and ".default."/"" adapter-name segments until
+// it finds "<...>.lora_A.weight" and "<...>.lora_B.weight". Scale is the
+// effective alpha/r multiplier folded into B at load time (so the built
+// MulByConstant(1.0) net still applies the right PEFT scaling). Returns the
+// resolved tensor base name (the "<...>" before ".lora_A.weight").
+function LoadPEFTLoRAModule(Reader: TNNetSafeTensorsReader;
+  ADown, BUp: TNNetLayer; const ModuleName: string;
+  Scale: TNeuralFloat = 1.0): string;
 
 implementation
 
@@ -2848,6 +5333,170 @@ begin
     pQuantizeInt8);
 end;
 
+// Writes a HF Conv1D weight [InDim, OutDim] (+ bias [OutDim]) pair to Writer
+// from a TNNetPointwiseConvLinear with OutDim neurons of InDim weights each -
+// the exact inverse of LoadConv1DWeights: HF stores W[in][out] row-major while
+// the Pascal side is neuron-major, so W[i*out + j] = Neuron[j].Weights[i].
+// Coded by Claude (AI).
+procedure SaveConv1DWeights(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
+  const WName, BName: string; InDim, OutDim: integer;
+  pDType: TSafeTensorsWriteDType);
+var
+  W, B: TNNetVolume;
+  i, j: integer;
+begin
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('GPT-2 export: layer for "' + WName + '" has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    W.ReSize(InDim, OutDim, 1);   // flat [InDim, OutDim] row-major
+    B.ReSize(OutDim, 1, 1);
+    for j := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[j].Weights.Size <> InDim then
+        ImportError('GPT-2 export: neuron ' + IntToStr(j) + ' for "' + WName +
+          '" has ' + IntToStr(Layer.Neurons[j].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for i := 0 to InDim - 1 do
+        W.FData[i * OutDim + j] := Layer.Neurons[j].Weights.FData[i];
+      B.FData[j] := Layer.Neurons[j].BiasWeight;
+    end;
+    Writer.AddTensorFlat(WName, [InDim, OutDim], W, pDType);
+    Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+  finally
+    B.Free;
+    W.Free;
+  end;
+end;
+
+// Writes a HF LayerNorm weight/bias pair to Writer from a TNNetTokenLayerNorm
+// (gamma in Neurons[0], beta in Neurons[1]) - inverse of LoadLayerNormWeights.
+// Coded by Claude (AI).
+procedure SaveLayerNormWeights(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
+  const WName, BName: string; d_model: integer;
+  pDType: TSafeTensorsWriteDType);
+begin
+  if (Layer.Neurons[0].Weights.Size <> d_model) or
+     (Layer.Neurons[1].Weights.Size <> d_model) then
+    ImportError('GPT-2 export: LayerNorm "' + WName + '" gamma/beta size ' +
+      'mismatch (expected ' + IntToStr(d_model) + ').');
+  Writer.AddTensorFlat(WName, [d_model], Layer.Neurons[0].Weights, pDType);
+  Writer.AddTensorFlat(BName, [d_model], Layer.Neurons[1].Weights, pDType);
+end;
+
+procedure SaveGPT2ToSafeTensors(Net: TNNet; const Config: TGPT2Config;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  LayerNorms, PwConvs: array of TNNetLayer;
+  EmbeddingLayer, PosLayer: TNNetLayer;
+  L, WteVol: TNNetVolume;
+  i, BlockCnt, PwBase, NumLN, NumPw, ExpectLN, ExpectPw: integer;
+  BlockPrefix: string;
+begin
+  // Recover the named layers by walking the net in the importer's build order:
+  // the only TNNetTokenLayerNorm layers are LN1/LN2 per block then ln_f, and
+  // the only TNNetPointwiseConvLinear layers are c_attn, attn.c_proj, mlp.c_fc,
+  // mlp.c_proj per block then the LM head (the MHA builder adds no other
+  // PointwiseConvLinear for the GPT-2 non-RoPE path).
+  EmbeddingLayer := nil;
+  PosLayer := nil;
+  SetLength(LayerNorms, 0);
+  SetLength(PwConvs, 0);
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if (EmbeddingLayer = nil) and (Net.Layers[i] is TNNetEmbedding) then
+      EmbeddingLayer := Net.Layers[i]
+    else if (PosLayer = nil) and
+            (Net.Layers[i] is TNNetLearnedPositionalEmbedding) then
+      PosLayer := Net.Layers[i]
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LayerNorms, Length(LayerNorms) + 1);
+      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if EmbeddingLayer = nil then
+    ImportError('GPT-2 export: no TNNetEmbedding (wte) layer found.');
+  if PosLayer = nil then
+    ImportError('GPT-2 export: no TNNetLearnedPositionalEmbedding (wpe) layer.');
+  NumLN := Length(LayerNorms);
+  NumPw := Length(PwConvs);
+  ExpectLN := 2 * Config.NLayers + 1;          // LN1+LN2 per block + ln_f
+  ExpectPw := 4 * Config.NLayers + 1;          // c_attn,c_proj,c_fc,c_proj + LM head
+  if NumLN <> ExpectLN then
+    ImportError('GPT-2 export: found ' + IntToStr(NumLN) + ' LayerNorm layers, ' +
+      'expected ' + IntToStr(ExpectLN) + ' for n_layer=' +
+      IntToStr(Config.NLayers) + '. Was this net built by BuildGPT2FromSafeTensors?');
+  if NumPw <> ExpectPw then
+    ImportError('GPT-2 export: found ' + IntToStr(NumPw) + ' PointwiseConvLinear ' +
+      'layers, expected ' + IntToStr(ExpectPw) + ' for n_layer=' +
+      IntToStr(Config.NLayers) + '. Was this net built by BuildGPT2FromSafeTensors?');
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/gpt2');
+    // wte: the embedding table is one neuron of [vocab*d] flat row-major.
+    WteVol := EmbeddingLayer.Neurons[0].Weights;
+    if WteVol.Size <> Config.VocabSize * Config.NEmbd then
+      ImportError('GPT-2 export: wte size ' + IntToStr(WteVol.Size) +
+        ' <> vocab*d = ' + IntToStr(Config.VocabSize * Config.NEmbd) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'wte.weight',
+      [Config.VocabSize, Config.NEmbd], WteVol, pDType);
+    // wpe: the learned positional table, [n_ctx, d] flat row-major.
+    L := PosLayer.Neurons[0].Weights;
+    if L.Size <> Config.NCtx * Config.NEmbd then
+      ImportError('GPT-2 export: wpe size ' + IntToStr(L.Size) +
+        ' <> n_ctx*d = ' + IntToStr(Config.NCtx * Config.NEmbd) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'wpe.weight',
+      [Config.NCtx, Config.NEmbd], L, pDType);
+    // Tied LM head: re-emit wte under the unprefixed lm_head.weight name the
+    // importer treats as an ignorable duplicate (HF tie_word_embeddings).
+    Writer.AddTensorFlat('lm_head.weight',
+      [Config.VocabSize, Config.NEmbd], WteVol, pDType);
+
+    for BlockCnt := 0 to Config.NLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+      PwBase := BlockCnt * 4;
+      SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2],
+        BlockPrefix + 'ln_1.weight', BlockPrefix + 'ln_1.bias',
+        Config.NEmbd, pDType);
+      SaveConv1DWeights(Writer, PwConvs[PwBase + 0],
+        BlockPrefix + 'attn.c_attn.weight', BlockPrefix + 'attn.c_attn.bias',
+        Config.NEmbd, 3 * Config.NEmbd, pDType);
+      SaveConv1DWeights(Writer, PwConvs[PwBase + 1],
+        BlockPrefix + 'attn.c_proj.weight', BlockPrefix + 'attn.c_proj.bias',
+        Config.NEmbd, Config.NEmbd, pDType);
+      SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 1],
+        BlockPrefix + 'ln_2.weight', BlockPrefix + 'ln_2.bias',
+        Config.NEmbd, pDType);
+      SaveConv1DWeights(Writer, PwConvs[PwBase + 2],
+        BlockPrefix + 'mlp.c_fc.weight', BlockPrefix + 'mlp.c_fc.bias',
+        Config.NEmbd, 4 * Config.NEmbd, pDType);
+      SaveConv1DWeights(Writer, PwConvs[PwBase + 3],
+        BlockPrefix + 'mlp.c_proj.weight', BlockPrefix + 'mlp.c_proj.bias',
+        4 * Config.NEmbd, Config.NEmbd, pDType);
+    end;
+    // Final ln_f is the last TokenLayerNorm.
+    SaveLayerNormWeights(Writer, LayerNorms[NumLN - 1],
+      Config.Prefix + 'ln_f.weight', Config.Prefix + 'ln_f.bias',
+      Config.NEmbd, pDType);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
 // ===================== ROPE SCALING (config.json) ==========================
 
 function DefaultRoPEScaling(): TRoPEScalingConfig;
@@ -2857,6 +5506,10 @@ begin
   Result.OriginalContextLen := 0;
   Result.YarnAlpha := 1.0;
   Result.YarnBeta := 32.0;
+  SetLength(Result.LongFactors, 0);
+  Result.LongAttnFactor := 1.0;
+  Result.YarnTruncate := True;
+  Result.YarnAttnFactor := 0.0;
 end;
 
 function RoPEScalingToString(const S: TRoPEScalingConfig): string;
@@ -2872,6 +5525,10 @@ begin
       ' orig=' + IntToStr(S.OriginalContextLen) +
       ' low=' + FloatToStr(S.YarnAlpha) +
       ' high=' + FloatToStr(S.YarnBeta);
+    rsmLongRoPE: Result := 'longrope orig=' +
+      IntToStr(S.OriginalContextLen) +
+      ' long_factors=' + IntToStr(Length(S.LongFactors)) +
+      ' attn=' + FloatToStr(S.LongAttnFactor);
     else Result := 'none';
   end;
 end;
@@ -2886,12 +5543,14 @@ end;
 //  - yarn: original_max_position_embeddings is read from rope_scaling, then
 //    the top level (Phi-3 style), then falls back to max_position_embeddings
 //    (the HF fallback chain). DeepSeek-style "mscale"/"mscale_all_dim"
-//    overrides and a custom "attention_factor" (anything other than the
-//    YaRN default 0.1*ln(factor)+1, which the layer hardcodes) are rejected.
-//    The layer implements HF's DEFAULT truncate=true band edges; a config
-//    with an explicit "truncate": false would deviate slightly on the two
-//    boundary pairs (the key is ignored).
-//  - "longrope" (Phi-3) and unknown types are rejected.
+//    overrides and an explicit "attention_factor" are now HONORED (folded
+//    into YarnAttnFactor = _yarn_get_mscale(s,mscale)/_yarn_get_mscale(s,
+//    mscale_all_dim), exactly HF deepseek_v2 _compute_yarn_parameters, and
+//    threaded into TNNetRotaryEmbedding's FOutScale). When they resolve to the
+//    plain YaRN default 0.1*ln(factor)+1, YarnAttnFactor stays 0 so the
+//    no-mscale path is bit-for-bit unchanged. "truncate" is parsed
+//    (YarnTruncate, default true) and threaded into the band edges.
+//  - "longrope" (Phi-3) is wired (rsmLongRoPE); unknown types are rejected.
 // Coded by Claude (AI).
 function ReadRoPEScalingFromJSONObject(Obj: TJSONObject;
   MaxPositions: integer; const ImporterName: string): TRoPEScalingConfig;
@@ -2899,7 +5558,14 @@ var
   Field, Sub: TJSONData;
   Scaling: TJSONObject;
   TypeName: string;
-  DefaultAttn: TNeuralFloat;
+  DefaultAttn, MScaleVal, MScaleAllDim: TNeuralFloat;
+
+  // HF transformers' _yarn_get_mscale: 1.0 for scale<=1, else 0.1*m*ln(scale)+1.
+  function YarnGetMScale(Scale, M: TNeuralFloat): TNeuralFloat;
+  begin
+    if Scale <= 1 then Result := 1.0
+    else Result := 0.1 * M * Ln(Scale) + 1.0;
+  end;
 
   function ReadOriginalContextLen(): integer;
   var
@@ -2918,16 +5584,33 @@ var
         IntToStr(Result) + '.');
   end;
 
-  procedure RejectKey(const KeyName: string);
+  // Reads a LongRoPE per-frequency factor array (long_factor / short_factor):
+  // a non-empty JSON array of positive numbers.
+  function ReadFactorArray(const KeyName: string): TNeuralFloatDynArr;
   var
     F: TJSONData;
+    Arr: TJSONArray;
+    I: integer;
+    V: TNeuralFloat;
   begin
     F := Scaling.Find(KeyName);
-    if (F <> nil) and not F.IsNull then
-      ImportError(ImporterName + ': rope_scaling "' + KeyName + '" (' +
-        F.AsJSON + ') is not wired into TNNetRotaryEmbedding (it changes ' +
-        'the attention factor away from the YaRN default the layer ' +
-        'hardcodes).');
+    if (F = nil) or F.IsNull or not (F is TJSONArray) then
+      ImportError(ImporterName + ': rope_scaling longrope requires a "' +
+        KeyName + '" array.');
+    Arr := TJSONArray(F);
+    if Arr.Count < 1 then
+      ImportError(ImporterName + ': rope_scaling longrope "' + KeyName +
+        '" array is empty.');
+    SetLength(Result, Arr.Count);
+    for I := 0 to Arr.Count - 1 do
+    begin
+      V := Arr.Items[I].AsFloat;
+      if V <= 0 then
+        ImportError(ImporterName + ': rope_scaling longrope "' + KeyName +
+          '" entries must be positive, got ' + FloatToStr(V) +
+          ' at index ' + IntToStr(I) + '.');
+      Result[I] := V;
+    end;
   end;
 
 begin
@@ -2943,6 +5626,35 @@ begin
     ImportError(ImporterName + ': rope_scaling carries neither "rope_type" ' +
       'nor "type": ' + Scaling.AsJSON + '.');
   if TypeName = 'default' then Exit; // explicit no-op scaling
+  // HF's Phi3Config remaps rope_scaling type "su"/"yarn" to "longrope" when a
+  // per-frequency long_factor table is present; detect that FIRST (before the
+  // scalar "factor" guard, which longrope does not require) so a Phi-3 "yarn"
+  // (carrying long_factor, NOT beta_slow/beta_fast) is treated as LongRoPE
+  // rather than mis-parsed as standard YaRN.
+  if (TypeName = 'longrope') or (TypeName = 'su') or
+     ((TypeName = 'yarn') and (Scaling.Find('long_factor') <> nil) and
+      not Scaling.Find('long_factor').IsNull) then
+  begin
+    // Phi-3 LongRoPE: per-frequency long_factor table (used for the long
+    // context) divides each inverse frequency, plus an attention scaling.
+    Result.Mode := rsmLongRoPE;
+    Result.Factor := 1.0;
+    Result.OriginalContextLen := ReadOriginalContextLen();
+    Result.LongFactors := ReadFactorArray('long_factor');
+    // attention_factor (long_mscale): explicit value wins; otherwise HF's
+    // sqrt(1 + ln(max_pos/orig)/ln(orig)) when max_pos > orig, else 1.0.
+    Sub := Scaling.Find('long_mscale');
+    if (Sub = nil) or Sub.IsNull then Sub := Scaling.Find('attention_factor');
+    if (Sub <> nil) and not Sub.IsNull then
+      Result.LongAttnFactor := Sub.AsFloat
+    else if MaxPositions > Result.OriginalContextLen then
+      Result.LongAttnFactor :=
+        Sqrt(1.0 + Ln(MaxPositions / Result.OriginalContextLen) /
+          Ln(Result.OriginalContextLen))
+    else
+      Result.LongAttnFactor := 1.0;
+    Exit;
+  end;
   Sub := Scaling.Find('factor');
   if (Sub = nil) or Sub.IsNull then
     ImportError(ImporterName + ': rope_scaling type "' + TypeName +
@@ -2961,25 +5673,54 @@ begin
     Result.OriginalContextLen := ReadOriginalContextLen();
     Result.YarnAlpha := Scaling.Get('beta_slow', 1.0);
     Result.YarnBeta := Scaling.Get('beta_fast', 32.0);
+    // "truncate" (gpt-oss rope_parameters): false skips the floor/ceil rounding
+    // of the YaRN correction-range band edges. Defaults true (HF/paper).
+    Result.YarnTruncate := Scaling.Get('truncate', True);
     if Result.YarnBeta <= Result.YarnAlpha then
       ImportError(ImporterName + ': rope_scaling yarn requires beta_fast > ' +
         'beta_slow, got beta_fast=' + FloatToStr(Result.YarnBeta) +
         ' beta_slow=' + FloatToStr(Result.YarnAlpha) + '.');
-    RejectKey('mscale');
-    RejectKey('mscale_all_dim');
+    // DeepSeek-style attention scaling. HF's _compute_yarn_parameters infers
+    // the post-rotation cos/sin scale ("attention_factor") as follows:
+    //   if attention_factor given:        use it verbatim
+    //   elif mscale and mscale_all_dim:   _yarn_get_mscale(factor,mscale) /
+    //                                      _yarn_get_mscale(factor,mscale_all_dim)
+    //   else:                             _yarn_get_mscale(factor)
+    // where _yarn_get_mscale(s,m)=1 if s<=1 else 0.1*m*ln(s)+1. The third
+    // branch is the layer's hardcoded 0.1*ln(factor)+1 default, so we only set
+    // YarnAttnFactor (FFloatSt[4]) when an EXPLICIT attention_factor or a
+    // mscale/mscale_all_dim PAIR is present; otherwise it stays 0 and the layer
+    // keeps the default bit-for-bit. Note HF treats a 0/absent mscale (or
+    // mscale_all_dim) as falsy -> default branch.
+    Result.YarnAttnFactor := 0.0;
+    if Result.Factor > 1 then
+      DefaultAttn := 0.1 * Ln(Result.Factor) + 1.0
+    else
+      DefaultAttn := 1.0;
     Sub := Scaling.Find('attention_factor');
     if (Sub <> nil) and not Sub.IsNull then
     begin
-      if Result.Factor > 1 then
-        DefaultAttn := 0.1 * Ln(Result.Factor) + 1.0
-      else
-        DefaultAttn := 1.0;
-      if Abs(Sub.AsFloat - DefaultAttn) > 1e-3 then
-        ImportError(ImporterName + ': rope_scaling attention_factor=' +
-          FloatToStr(Sub.AsFloat) + ' is not wired - TNNetRotaryEmbedding ' +
-          'hardcodes the YaRN default 0.1*ln(factor)+1 = ' +
-          FloatToStr(DefaultAttn) + '.');
+      // Explicit attention_factor wins over both default and mscale pair.
+      Result.YarnAttnFactor := Sub.AsFloat;
+      if Result.YarnAttnFactor <= 0 then
+        ImportError(ImporterName + ': rope_scaling attention_factor must be ' +
+          'positive, got ' + FloatToStr(Result.YarnAttnFactor) + '.');
+    end
+    else
+    begin
+      MScaleVal := Scaling.Get('mscale', 0.0);
+      MScaleAllDim := Scaling.Get('mscale_all_dim', 0.0);
+      if (MScaleVal <> 0.0) and (MScaleAllDim <> 0.0) then
+        Result.YarnAttnFactor :=
+          YarnGetMScale(Result.Factor, MScaleVal) /
+          YarnGetMScale(Result.Factor, MScaleAllDim);
     end;
+    // If the resolved factor equals the layer default to within tolerance,
+    // leave YarnAttnFactor=0 so serialization/round-trip is bit-for-bit
+    // identical to the no-mscale path (the layer recomputes the same value).
+    if (Result.YarnAttnFactor > 0) and
+       (Abs(Result.YarnAttnFactor - DefaultAttn) <= 1e-9) then
+      Result.YarnAttnFactor := 0.0;
   end
   else if TypeName = 'llama3' then
   begin
@@ -2996,7 +5737,8 @@ begin
   else
     ImportError(ImporterName + ': rope_scaling type "' + TypeName +
       '" is not supported - only "linear" (Position Interpolation), ' +
-      '"dynamic"/"ntk" (NTK-aware), "yarn" and "llama3" are wired onto ' +
+      '"dynamic"/"ntk" (NTK-aware), "yarn", "llama3" and ' +
+      '"longrope"/"su" (Phi-3 LongRoPE) are wired onto ' +
       'TNNetRotaryEmbedding.');
 end;
 
@@ -3006,8 +5748,16 @@ end;
 function CreateRoPEFromScaling(Base: TNeuralFloat;
   const S: TRoPEScalingConfig): TNNetRotaryEmbedding;
 begin
-  Result := TNNetRotaryEmbedding.Create(Base, S.Mode, S.Factor,
-    S.OriginalContextLen, S.YarnAlpha, S.YarnBeta);
+  if S.Mode = rsmLongRoPE then
+    Result := TNNetRotaryEmbedding.CreateLongRoPE(Base, S.LongFactors,
+      S.LongAttnFactor)
+  else
+    // The 7th arg (pLongAttnFactor -> FFloatSt[4]) carries the explicit YaRN
+    // attention scaling for DeepSeek-style mscale/mscale_all_dim overrides; 0
+    // for every other YaRN config keeps the layer's 0.1*ln(s)+1 default.
+    Result := TNNetRotaryEmbedding.Create(Base, S.Mode, S.Factor,
+      S.OriginalContextLen, S.YarnAlpha, S.YarnBeta, S.YarnAttnFactor,
+      S.YarnTruncate);
 end;
 
 // ============================ LLAMA IMPORT =================================
@@ -3019,6 +5769,9 @@ var
   Obj: TJSONObject;
   ModelType, HiddenAct: string;
   HeadDimField, SlidingWindowField, FloatField: TJSONData;
+  MoEMlpOnlyArr, ClipQKVField: TJSONData;
+  i: integer;
+  DimModelBase: integer;
 
   function RequiredInt(const FieldName: string): integer;
   begin
@@ -3053,13 +5806,22 @@ begin
     ModelType := Obj.Get('model_type', 'llama');
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
+       (ModelType <> 'qwen3_moe') and
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
-       (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') then
+       (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') and
+       (ModelType <> 'olmo2') and (ModelType <> 'olmoe') and
+       (ModelType <> 'mixtral') and
+       (ModelType <> 'glm4') and (ModelType <> 'glm') and
+       (ModelType <> 'granite') and (ModelType <> 'granitemoe') and
+       (ModelType <> 'bitnet') and (ModelType <> 'internlm2') and
+       (ModelType <> 'minicpm') then
       ImportError('Llama import: config model_type is "' + ModelType +
-        '" - only "llama", "mistral", "qwen2", "qwen3", "gemma", ' +
-        '"gemma2", "gemma3_text" and "phi3" are supported here (see ' +
-        'BuildFromPretrained for the full dispatch; multimodal "gemma3" ' +
-        'configs are out of scope - use a TEXT-ONLY gemma3_text ' +
+        '" - only "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", ' +
+        '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "olmoe", ' +
+        '"mixtral", "glm4", "granite", "granitemoe", "bitnet", ' +
+        '"internlm2" and "minicpm" are supported here ' +
+        '(see BuildFromPretrained for the full dispatch; multimodal ' +
+        '"gemma3" configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
     Result.ModelType := ModelType;
     Result.HiddenSize := RequiredInt('hidden_size');
@@ -3108,7 +5870,81 @@ begin
     Result.RopeLocalTheta := 0;
     Result.FusedQKVGateUp := False;
     Result.PartialRotaryFactor := 1.0;
-    if ModelType = 'mistral' then
+    Result.PostNormReordered := False;
+    Result.QKNormFullWidth := False;
+    Result.IsMoE := False;
+    Result.NumLocalExperts := 0;
+    Result.MoEExpertsPerTok := 0;
+    Result.MoEGraniteNaming := False;
+    Result.MoEQwen3Naming := False;
+    Result.MoEIntermediateSize := 0;
+    Result.MoENormTopK := False;
+    Result.MoEDecoderSparseStep := 1;
+    SetLength(Result.MoEMlpOnlyLayers, 0);
+    // Llama-4 MoE/attention deltas: off for every family this reader handles
+    // (Llama-4 has its OWN reader, ReadLlama4ConfigFromJSONFile).
+    Result.MoESigmoidGate := False;
+    Result.MoEScaleInput := False;
+    Result.MoEGateUpTransposed := False;
+    Result.IntermediateSizeMLP := 0;
+    SetLength(Result.NoRopeLayers, 0);
+    Result.Llama4QKL2Norm := False;
+    Result.AttnTempTuning := False;
+    Result.AttnFloorScale := 0;
+    Result.AttnScale := 0;
+    Result.AttnChunkSize := 0;
+    Result.GLM4SandwichNorm := False;
+    Result.FusedGateUp := False;
+    Result.InterleavedRotary := False;
+    Result.BitNetSubLN := False;
+    Result.ReGLUSquaredFFN := False;
+    // Granite multipliers default to 1.0 (no-op) so a vanilla Llama-shaped
+    // config still imports unchanged; the granite/granitemoe branch reads the
+    // real values below.
+    Result.EmbeddingMultiplier := 1.0;
+    Result.ResidualMultiplier := 1.0;
+    Result.AttentionMultiplier := 0; // 0 = use SDPA's default 1/sqrt(head_dim)
+    Result.LogitsScaling := 1.0;
+    Result.SharedIntermediateSize := 0; // granitemoe: no shared expert
+    if ModelType = 'mixtral' then
+    begin
+      // Mixtral: a stock Mistral decoder (full MHA/GQA, RoPE, sliding
+      // window) whose every FFN is replaced by block_sparse_moe = a gate
+      // linear (num_local_experts logits) + N independent SwiGLU experts,
+      // softmax over ALL experts then top-k (num_experts_per_tok, default
+      // 2) routing, output = sum of selected experts weighted by the
+      // RENORMALIZED top-k softmax probs (HF normalizes the top-k subset).
+      // No shared expert, no MLA - the distinction from DeepSeek-V2.
+      Result.IsMoE := True;
+      Result.MoENormTopK := True; // HF Mixtral always renormalizes top-k
+      Result.NumLocalExperts := Obj.Get('num_local_experts', 8);
+      Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 2);
+      if Result.NumLocalExperts < 1 then
+        ImportError('Llama import: Mixtral num_local_experts must be >= 1, ' +
+          'got ' + IntToStr(Result.NumLocalExperts) + '.');
+      if (Result.MoEExpertsPerTok < 1) or
+         (Result.MoEExpertsPerTok > Result.NumLocalExperts) then
+        ImportError('Llama import: Mixtral num_experts_per_tok=' +
+          IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, ' +
+          'num_local_experts=' + IntToStr(Result.NumLocalExperts) + '].');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: Mixtral hidden_act "' + HiddenAct +
+          '" is not supported - every released mixtral checkpoint uses ' +
+          '"silu" (SwiGLU experts).');
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      // Mixtral configs ship sliding_window (8x7B: null in newer revisions,
+      // 4096 in the original); null/absent = full attention.
+      SlidingWindowField := Obj.Find('sliding_window');
+      if (SlidingWindowField <> nil) and not SlidingWindowField.IsNull then
+      begin
+        Result.SlidingWindow := SlidingWindowField.AsInteger;
+        if Result.SlidingWindow < 1 then
+          ImportError('Llama import: config sliding_window must be a ' +
+            'positive integer or null, got ' + SlidingWindowField.AsJSON + '.');
+      end;
+    end
+    else if ModelType = 'mistral' then
     begin
       // Many Mistral configs ship sliding_window=null (full attention).
       SlidingWindowField := Obj.Find('sliding_window');
@@ -3136,6 +5972,76 @@ begin
       if Obj.Get('use_sliding_window', False) then
         ImportError('Llama import: Qwen3 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
+    end
+    else if ModelType = 'qwen3_moe' then
+    begin
+      // Qwen3-MoE (Qwen/Qwen3-30B-A3B and smaller chat checkpoints): the
+      // dense-Qwen3 attention VERBATIM (per-head q/k RMSNorm before RoPE,
+      // GQA, no q/k/v bias) with every FFN replaced by a sparse top-k
+      // Mixture-of-Experts - a router mlp.gate.weight (num_experts logits)
+      // feeding num_experts independent SwiGLU experts of width
+      // moe_intermediate_size. softmax over ALL experts then top-k
+      // (num_experts_per_tok), the top-k subset renormalized iff
+      // norm_topk_prob. NO shared expert and NO per-expert/router bias - the
+      // distinction from DeepSeek-V2 (MLA + shared experts).
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      Result.QKNorm := True;
+      Result.IsMoE := True;
+      Result.MoEQwen3Naming := True;
+      Result.NumLocalExperts := Obj.Get('num_experts', 128);
+      Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 8);
+      Result.MoEIntermediateSize := RequiredInt('moe_intermediate_size');
+      Result.MoENormTopK := Obj.Get('norm_topk_prob', False);
+      if Result.NumLocalExperts < 1 then
+        ImportError('Llama import: Qwen3-MoE num_experts must be >= 1, got ' +
+          IntToStr(Result.NumLocalExperts) + '.');
+      if (Result.MoEExpertsPerTok < 1) or
+         (Result.MoEExpertsPerTok > Result.NumLocalExperts) then
+        ImportError('Llama import: Qwen3-MoE num_experts_per_tok=' +
+          IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, num_experts=' +
+          IntToStr(Result.NumLocalExperts) + '].');
+      // Qwen3-MoE MIXED stack: a decoder layer is MoE iff (layer_idx+1) mod
+      // decoder_sparse_step = 0 AND layer_idx not in mlp_only_layers (HF
+      // modeling_qwen3_moe.Qwen3MoeDecoderLayer.__init__); otherwise it is a
+      // plain dense SwiGLU FFN of full intermediate_size. The reference
+      // all-MoE checkpoints (Qwen3-30B-A3B) use decoder_sparse_step=1 with
+      // mlp_only_layers=[], so EVERY layer is MoE (the uniform path). See
+      // LlamaLayerIsMoE for the per-layer gate; both the block builder and
+      // the weight loader consult it.
+      Result.MoEDecoderSparseStep := Obj.Get('decoder_sparse_step', 1);
+      if Result.MoEDecoderSparseStep < 1 then
+        ImportError('Llama import: Qwen3-MoE decoder_sparse_step=' +
+          IntToStr(Result.MoEDecoderSparseStep) + ' must be >= 1.');
+      MoEMlpOnlyArr := Obj.Find('mlp_only_layers');
+      if (MoEMlpOnlyArr <> nil) and (MoEMlpOnlyArr is TJSONArray) then
+      begin
+        SetLength(Result.MoEMlpOnlyLayers,
+          TJSONArray(MoEMlpOnlyArr).Count);
+        for i := 0 to TJSONArray(MoEMlpOnlyArr).Count - 1 do
+          Result.MoEMlpOnlyLayers[i] := TJSONArray(MoEMlpOnlyArr).Integers[i];
+      end;
+      // Qwen3-MoE sliding window: HF Qwen3MoeConfig sets
+      // self.sliding_window = sliding_window if use_sliding_window else None,
+      // and the model bands EVERY layer's causal mask with that window when it
+      // is not None (create_sliding_window_causal_mask, no max_window_layers
+      // gating in this revision - unlike the older Qwen2 first-N-layers
+      // scheme). So use_sliding_window=true with a positive sliding_window is
+      // exactly the Mistral convention: SlidingWindow > 0 => every layer local
+      // (LlamaLayerWindow above bands each SDPA via pWindow/FStruct[2]).
+      if Obj.Get('use_sliding_window', False) then
+      begin
+        SlidingWindowField := Obj.Find('sliding_window');
+        if (SlidingWindowField <> nil) and not SlidingWindowField.IsNull then
+        begin
+          Result.SlidingWindow := SlidingWindowField.AsInteger;
+          if Result.SlidingWindow < 1 then
+            ImportError('Llama import: config sliding_window must be a ' +
+              'positive integer or null, got ' +
+              SlidingWindowField.AsJSON + '.');
+        end;
+        // use_sliding_window=true with sliding_window=null leaves
+        // SlidingWindow=0 (full attention), matching HF's None fallback.
+      end;
     end
     else if (ModelType = 'gemma') or (ModelType = 'gemma2') or
             (ModelType = 'gemma3_text') then
@@ -3286,17 +6192,320 @@ begin
             'positive integer or null, got ' + SlidingWindowField.AsJSON + '.');
       end;
       // The 128k Phi-3 variants ship rope_scaling type "longrope" (older
-      // configs spell it "su" or even "yarn" - HF's Phi3Config remaps both
-      // to longrope): per-frequency long/short factor tables that are NOT
-      // standard YaRN. The generic parse above already rejects
-      // "longrope"/"su" as unknown types; a phi3 "yarn" would be ACCEPTED
-      // as standard YaRN and silently mis-load, so it is rejected here.
-      if Result.RopeScaling.Mode = rsmYaRN then
-        ImportError('Llama import: a phi3 rope_scaling of type "yarn" is ' +
-          'LongRoPE in disguise (HF Phi3Config remaps "su"/"yarn" to ' +
-          '"longrope": per-frequency long/short factor tables, not ' +
-          'standard YaRN) - the 128k Phi-3 variants are not wired into ' +
-          'TNNetRotaryEmbedding; use a 4k/8k checkpoint.');
+      // configs spell it "su" or even "yarn" - HF's Phi3Config remaps all
+      // three to longrope): per-frequency long/short factor tables. The
+      // generic parse above (ReadRoPEScalingFromJSONObject) now maps these to
+      // rsmLongRoPE (using the long_factor table and the long attention
+      // scaling for the static long-context import).
+    end
+    else if ModelType = 'olmo2' then
+    begin
+      // OLMo-2 deltas (see BuildOlmo2FromSafeTensors): reordered post-norm
+      // (x + Norm(Attn(x)), NO input_layernorm) and full-width q/k RMSNorm
+      // before the head split + RoPE. rms_norm_eps defaults to 1e-5 (the
+      // HF Olmo2Config default). attention_bias=true would put biases on
+      // ALL FOUR projections including o_proj (unlike Qwen2's q/k/v-only
+      // QKVBias) - no released OLMo-2 checkpoint uses it, so it is
+      // rejected rather than half-wired.
+      Result.PostNormReordered := True;
+      Result.QKNormFullWidth := True;
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5);
+      if Obj.Get('attention_bias', False) then
+        ImportError('Llama import: OLMo-2 attention_bias=true (biases on ' +
+          'q/k/v AND o_proj) is not wired into this importer - every ' +
+          'released OLMo-2 checkpoint is bias-free.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: OLMo-2 hidden_act "' + HiddenAct +
+          '" is not supported - every released olmo2 checkpoint uses ' +
+          '"silu" (SwiGLU).');
+    end
+    else if ModelType = 'olmoe' then
+    begin
+      // OLMoE (model_type "olmoe", allenai/OLMoE-1B-0924 - the fully-open
+      // Apache-2.0 SPARSE MoE sibling of dense OLMo-2). The cross-product of
+      // two landed pieces with NO new layer class:
+      //   (a) ATTENTION/NORM = the ORIGINAL OLMo line, NOT OLMo-2's reordered
+      //       post-norm. HF modeling_olmoe.OlmoeDecoderLayer.forward is the
+      //       canonical PRE-NORM block (residual=x; x=input_layernorm(x);
+      //       x=residual+attn(x); residual=x; x=post_attention_layernorm(x);
+      //       x=residual+moe(x)) - so PostNormReordered is FALSE. q/k RMSNorm
+      //       is over the FULL flattened projection width (OlmoeAttention:
+      //       q_norm over hidden_size, k_norm over num_kv_heads*head_dim),
+      //       i.e. the OLMo-2 QKNormFullWidth flag, applied BEFORE the head
+      //       split + RoPE.
+      //   (b) FFN = a Mixtral-style top-k router over num_experts SwiGLU
+      //       experts, wired EXACTLY like Qwen3-MoE (router softmax over ALL
+      //       experts -> hard top-k (num_experts_per_tok), subset renormalized
+      //       iff norm_topk_prob). The released checkpoint ships the Qwen3-MoE
+      //       tensor dialect (mlp.gate.weight, mlp.experts.{i}.gate_proj/
+      //       up_proj/down_proj), so MoEQwen3Naming is reused verbatim.
+      // OLMoE is UNIFORMLY MoE: every decoder layer is a sparse block (HF has
+      // no mlp_only_layers / decoder_sparse_step), so MoEDecoderSparseStep=1
+      // with empty MoEMlpOnlyLayers gives the all-MoE path. Expert width is
+      // the plain intermediate_size (OlmoeExperts wrap OlmoeMLP, NOT a
+      // separate moe_intermediate_size).
+      Result.QKNormFullWidth := True;
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5);
+      Result.IsMoE := True;
+      Result.MoEQwen3Naming := True;
+      Result.NumLocalExperts := Obj.Get('num_experts', 64);
+      Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 8);
+      Result.MoEIntermediateSize := Result.IntermediateSize;
+      Result.MoENormTopK := Obj.Get('norm_topk_prob', False);
+      Result.MoEDecoderSparseStep := 1;
+      if Result.NumLocalExperts < 1 then
+        ImportError('Llama import: OLMoE num_experts must be >= 1, got ' +
+          IntToStr(Result.NumLocalExperts) + '.');
+      if (Result.MoEExpertsPerTok < 1) or
+         (Result.MoEExpertsPerTok > Result.NumLocalExperts) then
+        ImportError('Llama import: OLMoE num_experts_per_tok=' +
+          IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, num_experts=' +
+          IntToStr(Result.NumLocalExperts) + '].');
+      if Obj.Get('attention_bias', False) then
+        ImportError('Llama import: OLMoE attention_bias=true is not wired ' +
+          'into this importer - the released OLMoE-1B-0924 checkpoint is ' +
+          'bias-free.');
+      // clip_qkv (Olmoe1 clamps q/k/v to +-clip_qkv) is null in the released
+      // checkpoint; a non-null value is not wired into the SDPA path.
+      ClipQKVField := Obj.Find('clip_qkv');
+      if (ClipQKVField <> nil) and not ClipQKVField.IsNull then
+        ImportError('Llama import: OLMoE clip_qkv (q/k/v clamping) is not ' +
+          'wired into this importer - every released OLMoE checkpoint uses ' +
+          'clip_qkv=null.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: OLMoE hidden_act "' + HiddenAct +
+          '" is not supported - every released olmoe checkpoint uses ' +
+          '"silu" (SwiGLU).');
+    end
+    else if ModelType = 'glm4' then
+    begin
+      // GLM-4 (model_type "glm4", e.g. THUDM/GLM-4-9B-0414 /
+      // zai-org/GLM-4 text checkpoints): the Llama skeleton (GQA, SwiGLU,
+      // RoPE) with FOUR architectural deltas (see BuildGLM4FromSafeTensors):
+      // (a) FOUR-norm SANDWICH block - the usual input_layernorm (attn pre)
+      //     and post_attention_layernorm (FFN pre) PLUS
+      //     post_self_attn_layernorm INSIDE the attention residual branch
+      //     and post_mlp_layernorm INSIDE the FFN residual branch (the
+      //     Gemma-2 sandwich WIRING with GLM-4's distinct key names);
+      // (b) PARTIAL rotary (partial_rotary_factor 0.5: RoPE rotates the
+      //     first int(head_dim*0.5) channels of each q/k head, the tail
+      //     passes through);
+      // (c) INTERLEAVED rotary - GLM-4 rotates consecutive channel PAIRS
+      //     (rotate_half over x[0::2]/x[1::2]), the native
+      //     TNNetRotaryEmbedding layout, so q/k rows load STRAIGHT (no
+      //     rotate_half row permutation);
+      // (d) SEPARATE q/k/v projections WITH bias (attention_bias true) and a
+      //     bias-free o_proj, but a FUSED bias-free mlp.gate_up_proj.
+      Result.GLM4SandwichNorm := True;
+      Result.SandwichNorm := True; // share the sandwich block WIRING
+      Result.FusedGateUp := True;  // fused mlp.gate_up_proj (qkv stays split)
+      Result.InterleavedRotary := True;
+      Result.QKVBias := Obj.Get('attention_bias', True); // GLM-4 default true
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.5625e-07); // GLM-4 default
+      Result.PartialRotaryFactor :=
+        Obj.Get('partial_rotary_factor', 0.5);
+      if (Result.PartialRotaryFactor <= 0) or
+         (Result.PartialRotaryFactor > 1) then
+        ImportError('Llama import: config partial_rotary_factor must be ' +
+          'in (0, 1], got ' + FloatToStr(Result.PartialRotaryFactor) + '.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: GLM-4 hidden_act "' + HiddenAct +
+          '" is not supported - every released glm4 checkpoint uses ' +
+          '"silu" (SwiGLU).');
+    end
+    else if ModelType = 'glm' then
+      // model_type "glm" (the older two-norm GLM-4 9B - pre-norm, NOT the
+      // four-norm sandwich; HF GlmForCausalLM) is a DIFFERENT block and is
+      // not wired here. BuildGLM4FromSafeTensors targets "glm4".
+      ImportError('Llama import: model_type "glm" (the two-norm GLM, ' +
+        'HF GlmForCausalLM) is not supported - this importer targets ' +
+        'model_type "glm4" (the four-norm sandwich block).')
+    else if (ModelType = 'granite') or (ModelType = 'granitemoe') then
+    begin
+      // IBM Granite 3.x (HF GraniteForCausalLM / GraniteMoeForCausalLM): the
+      // Llama block (RMSNorm + RoPE + SwiGLU, GQA, no q/k/v bias) plus FOUR
+      // scalar multipliers Llama lacks (all folds at load - see
+      // BuildGraniteFromSafeTensors): embedding_multiplier (scale embeddings
+      // after lookup), residual_multiplier (scale each sublayer output before
+      // the residual add), attention_multiplier (replaces 1/sqrt(head_dim) in
+      // the SDPA score scale) and logits_scaling (DIVIDE the final logits).
+      // rope_theta defaults 10000000 (Granite's HF default), rms_norm_eps
+      // 1e-6, tie_word_embeddings true (the released checkpoints tie).
+      Result.RopeTheta := Obj.Get('rope_theta', 10000000.0);
+      Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      Result.EmbeddingMultiplier := Obj.Get('embedding_multiplier', 1.0);
+      Result.ResidualMultiplier := Obj.Get('residual_multiplier', 1.0);
+      Result.AttentionMultiplier := Obj.Get('attention_multiplier', 0.0);
+      Result.LogitsScaling := Obj.Get('logits_scaling', 1.0);
+      if Result.LogitsScaling = 0 then
+        ImportError('Llama import: Granite logits_scaling must be non-zero ' +
+          '(the final logits are DIVIDED by it).');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: Granite hidden_act "' + HiddenAct +
+          '" is not supported - every released granite checkpoint uses ' +
+          '"silu" (SwiGLU).');
+      if ModelType = 'granitemoe' then
+      begin
+        // granitemoe FFN = Mixtral-style sparse top-k MoE (softmax over the
+        // top-k logits == Mixtral's top-k renorm, so MoENormTopK) but with
+        // granitemoe's FUSED 3-D expert slabs (see MoEGraniteNaming). NO
+        // q/k/v bias, no per-expert bias.
+        Result.IsMoE := True;
+        Result.MoEGraniteNaming := True;
+        Result.MoENormTopK := True;
+        Result.NumLocalExperts := Obj.Get('num_local_experts', 8);
+        Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 2);
+        if Result.NumLocalExperts < 1 then
+          ImportError('Llama import: granitemoe num_local_experts must be ' +
+            '>= 1, got ' + IntToStr(Result.NumLocalExperts) + '.');
+        if (Result.MoEExpertsPerTok < 1) or
+           (Result.MoEExpertsPerTok > Result.NumLocalExperts) then
+          ImportError('Llama import: granitemoe num_experts_per_tok=' +
+            IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, ' +
+            'num_local_experts=' + IntToStr(Result.NumLocalExperts) + '].');
+        // shared_intermediate_size > 0 adds an always-on shared expert
+        // (GraniteMoeShared, e.g. granite-3.0-3b-a800m): an ordinary SwiGLU
+        // MLP of width shared_intermediate_size that runs in PARALLEL with
+        // the routed experts; its output is ADDED to the routed-MoE output
+        // before the FFN residual close (HF: hidden = moe(h) +
+        // shared_mlp(h)). The reference dense-MoE checkpoints (e.g.
+        // granite-3.0-1b/3b-a800m without "Shared") ship
+        // shared_intermediate_size=0 (no shared expert).
+        Result.SharedIntermediateSize :=
+          Obj.Get('shared_intermediate_size', 0);
+        if Result.SharedIntermediateSize < 0 then
+          ImportError('Llama import: granitemoe shared_intermediate_size ' +
+            'must be >= 0, got ' +
+            IntToStr(Result.SharedIntermediateSize) + '.');
+      end;
+    end
+    else if ModelType = 'bitnet' then
+    begin
+      // BitNet b1.58 (model_type "bitnet", microsoft/bitnet-b1.58-2B-4T): the
+      // Llama backbone (RMSNorm + RoPE) with the BitNet deltas, all wired onto
+      // the existing builder slots (no new layer class for the norms):
+      //   (a) BitNetSubLN: an EXTRA RMSNorm INSIDE each branch BEFORE the
+      //       quantized linear - attn_sub_norm before o_proj and ffn_sub_norm
+      //       before down_proj (HF BitNetAttention / BitNetMLP). These are the
+      //       "norm-before-quantized-linear" SubLN, distinct from the post-norm
+      //       families (which normalize AFTER the projection).
+      //   (b) ReGLUSquaredFFN: hidden_act "relu2" - the gated FFN is
+      //       down(ffn_sub_norm(relu2(gate(x)) * up(x))) with SEPARATE (non-
+      //       fused) gate_proj/up_proj, so the SwiGLU activation slot becomes
+      //       TNNetReGLUSquared (up * ReLU(gate)^2) and the loader takes the
+      //       standard separate-projection path.
+      // The released checkpoint ships in two storage forms (handled at load):
+      // either FP shadow weights (which for the released model are already the
+      // ternary*scale effective weights - loaded straight, so the absmean
+      // round-trip is a no-op) or the native I2_S 2-bit packed format. The HF
+      // transformers checkpoint (BitNetForCausalLM) is the SHADOW form and uses
+      // plain nn.Linear, so matching it bit-for-bit means loading the stored
+      // weights straight (the same dequant-at-load convention as the GGUF /
+      // MXFP4 importers - the ternarization lives in the fixture, not here).
+      Result.BitNetSubLN := True;
+      Result.ReGLUSquaredFFN := True;
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5); // BitNet default
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      if Result.QKVBias then
+        ImportError('Llama import: BitNet attention_bias=true is not wired ' +
+          '(every released bitnet checkpoint is bias-free).');
+      HiddenAct := Obj.Get('hidden_act', 'relu2');
+      if HiddenAct <> 'relu2' then
+        ImportError('Llama import: BitNet hidden_act "' + HiddenAct +
+          '" is not supported - every released bitnet checkpoint uses ' +
+          '"relu2" (squared-ReLU gated FFN).');
+      // transformers 5.x BitNetConfig carries rope_theta inside the
+      // rope_parameters dict (rope_type "default", default theta 500000),
+      // not as a top-level rope_theta. Honor it when present.
+      FloatField := Obj.Find('rope_parameters');
+      if (FloatField <> nil) and (FloatField is TJSONObject) then
+        Result.RopeTheta :=
+          TJSONObject(FloatField).Get('rope_theta', Result.RopeTheta);
+    end
+    else if ModelType = 'minicpm' then
+    begin
+      // MiniCPM (model_type "minicpm", e.g. openbmb/MiniCPM-1.2B / 2B-sft/dpo):
+      // a plain Llama backbone (RMSNorm + RoPE + SwiGLU, GQA, tied embeddings,
+      // no q/k/v bias) plus OpenBMB's muP-style depth/width rescaling. All
+      // three knobs are constant FOLDS into existing weights at load - the
+      // SAME fold machinery Granite uses (no new layer types):
+      //   - scale_emb multiplies the token embeddings after lookup -> reuse
+      //     EmbeddingMultiplier (folded into the embedding rows; the tied LM
+      //     head reads the UNSCALED rows, matching HF MiniCPMForCausalLM).
+      //   - scale_depth / sqrt(num_hidden_layers) rescales EVERY residual
+      //     branch (each attention AND each MLP sublayer output) -> reuse
+      //     ResidualMultiplier (folded per-block into o_proj and down_proj).
+      //     This is a PER-SUBLAYER residual scale; the constant is the same
+      //     for every block, so Granite's per-block fold reproduces it exactly.
+      //   - logits divide by hidden_size / dim_model_base -> reuse
+      //     LogitsScaling (DIVIDES the final logits, folded as
+      //     1/LogitsScaling into the tied LM head rows, like Granite).
+      // attention_multiplier is NOT part of MiniCPM (the SDPA score scale
+      // stays the default 1/sqrt(head_dim)).
+      Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+      Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5);
+      Result.QKVBias := Obj.Get('attention_bias', False);
+      if Result.QKVBias then
+        ImportError('Llama import: MiniCPM attention_bias=true is not wired ' +
+          'into this importer - every released minicpm checkpoint is ' +
+          'bias-free.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: MiniCPM hidden_act "' + HiddenAct +
+          '" is not supported - every released minicpm checkpoint uses ' +
+          '"silu" (SwiGLU).');
+      Result.AttentionMultiplier := 0; // default 1/sqrt(head_dim) score scale
+      // scale_emb -> embedding multiplier (default 1.0 = off).
+      Result.EmbeddingMultiplier := Obj.Get('scale_emb', 1.0);
+      // scale_depth / sqrt(num_hidden_layers) -> per-sublayer residual scale.
+      if Result.NumLayers < 1 then
+        ImportError('Llama import: MiniCPM num_hidden_layers must be >= 1.');
+      Result.ResidualMultiplier :=
+        Obj.Get('scale_depth', 1.0) / Sqrt(Result.NumLayers);
+      // logits divide by hidden_size / dim_model_base (DIVIDING LM-head scale).
+      DimModelBase := Obj.Get('dim_model_base', Result.HiddenSize);
+      if DimModelBase <= 0 then
+        ImportError('Llama import: MiniCPM dim_model_base must be > 0, got ' +
+          IntToStr(DimModelBase) + '.');
+      Result.LogitsScaling := Result.HiddenSize / DimModelBase;
+      if Result.LogitsScaling = 0 then
+        ImportError('Llama import: MiniCPM logits scale (hidden_size / ' +
+          'dim_model_base) must be non-zero.');
+    end
+    else if ModelType = 'internlm2' then
+    begin
+      // InternLM2 / InternLM2.5 (model_type "internlm2", e.g.
+      // internlm/internlm2_5-1_8b/7b/20b): a plain Llama backbone (RMSNorm +
+      // RoPE + SwiGLU, GQA) with NO architectural delta on the math - the
+      // ONLY difference is the checkpoint TENSOR LAYOUT, handled entirely by
+      // the InternLM2 translating reader (see BuildInternLM2FromSafeTensors):
+      //   - the fused attention.wqkv slab (group-interleaved q/k/v packing,
+      //     NOT contiguous thirds and NOT NeoX per-head interleaving) is
+      //     unpacked into standard separate W_q/W_k/W_v rows in HF rotate_half
+      //     order BEFORE the core builder sees them;
+      //   - the InternLM2 names (tok_embeddings / attention.wqkv|wo /
+      //     feed_forward.w1|w2|w3 / attention_norm / ffn_norm / output) are
+      //     renamed to the standard HF Llama names the core builder reads.
+      // So the config carries NO extra flags - the standard separate-
+      // projection Llama path loads the repacked tensors. "bias" gates the
+      // q/k/v projection biases (InternLM2 default false); a true value is
+      // rejected (the released checkpoints are bias-free).
+      Result.QKVBias := Obj.Get('bias', False);
+      if Result.QKVBias then
+        ImportError('Llama import: InternLM2 bias=true (q/k/v projection ' +
+          'biases) is not wired into this importer - every released ' +
+          'internlm2 / internlm2.5 checkpoint is bias-free.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: InternLM2 hidden_act "' + HiddenAct +
+          '" is not supported - every released internlm2 checkpoint uses ' +
+          '"silu" (SwiGLU).');
     end
     else // llama
       Result.QKVBias := Obj.Get('attention_bias', False);
@@ -3358,10 +6567,27 @@ begin
       FloatToStr(Config.RopeLocalTheta);
   if Config.FusedQKVGateUp then
     Result := Result + ', fused_qkv_gate_up=true';
+  if Config.PostNormReordered then
+    Result := Result + ', post_norm_reordered=true';
+  if Config.QKNormFullWidth then
+    Result := Result + ', qk_norm_full_width=true';
   if (Config.PartialRotaryFactor > 0) and
      (Config.PartialRotaryFactor < 1) then
     Result := Result + ', partial_rotary=' +
       FloatToStr(Config.PartialRotaryFactor);
+  if Config.IsMoE then
+    Result := Result + ', moe=' + IntToStr(Config.NumLocalExperts) +
+      'x top-' + IntToStr(Config.MoEExpertsPerTok);
+  if Config.GLM4SandwichNorm then
+    Result := Result + ', glm4_sandwich_norm=true';
+  if Config.FusedGateUp then
+    Result := Result + ', fused_gate_up=true';
+  if Config.InterleavedRotary then
+    Result := Result + ', interleaved_rotary=true';
+  if Config.BitNetSubLN then
+    Result := Result + ', bitnet_sub_ln=true';
+  if Config.ReGLUSquaredFFN then
+    Result := Result + ', reglu_squared_ffn=true';
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -3519,6 +6745,151 @@ begin
   Layer.FlushWeightCache();
 end;
 
+// Loads a bias-free nn.Linear [OutDim, InDim] matrix straight onto a pointwise
+// layer's neurons (neuron j gets row j, weight i = W[j*InDim+i]), each weight
+// multiplied by Scale. Used by the PEFT LoRA loader to drop lora_A/lora_B onto
+// the AddLoRAAdapter A/B projections (which carry exactly this layout).
+procedure LoadPlainLinearWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
+  Scale: TNeuralFloat = 1.0);
+var
+  W: TNNetVolume;
+  i, j: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('PEFT import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) then
+    ImportError('PEFT import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + '] (nn.Linear stores ' +
+      '[out, in]), got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('PEFT import: layer for "' + WName + '" has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for j := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[j].Weights.Size <> InDim then
+        ImportError('PEFT import: neuron ' + IntToStr(j) + ' for "' + WName +
+          '" has ' + IntToStr(Layer.Neurons[j].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for i := 0 to InDim - 1 do
+        Layer.Neurons[j].Weights.FData[i] := Scale * W.FData[j * InDim + i];
+      Layer.Neurons[j].BiasWeight := 0; // LoRA projections are bias-free
+    end;
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+function ReadPEFTAdapterConfig(const FileName: string): TPEFTAdapterConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  Field: TJSONData;
+begin
+  Result.Alpha := 1.0;
+  Result.Rank := 1;
+  Result.RankFound := False;
+  if not FileExists(FileName) then
+    ImportError('PEFT import: adapter_config.json not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('PEFT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('PEFT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Field := Obj.Find('r');
+    if (Field <> nil) and not Field.IsNull then
+    begin
+      Result.Rank := Field.AsInteger;
+      Result.RankFound := True;
+      if Result.Rank < 1 then
+        ImportError('PEFT import: config "r" must be a positive integer, got '
+          + Field.AsJSON + '.');
+    end;
+    // lora_alpha defaults to r (PEFT scale 1.0) when absent.
+    Result.Alpha := Obj.Get('lora_alpha', TNeuralFloat(Result.Rank));
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function LoadPEFTLoRAModule(Reader: TNNetSafeTensorsReader;
+  ADown, BUp: TNNetLayer; const ModuleName: string;
+  Scale: TNeuralFloat): string;
+var
+  Rank, d_in, d_out, p, s: integer;
+  Prefixes, Segments: array of string;
+  Base, AName, BName: string;
+  Found: boolean;
+begin
+  if (ADown = nil) or (BUp = nil) then
+    ImportError('PEFT import: LoadPEFTLoRAModule requires non-nil A and B ' +
+      'layers (module "' + ModuleName + '").');
+  Rank := ADown.Neurons.Count;
+  d_out := BUp.Neurons.Count;
+  if Rank < 1 then
+    ImportError('PEFT import: A layer for "' + ModuleName +
+      '" has no neurons.');
+  d_in := ADown.Neurons[0].Weights.Size;
+  // PEFT names are "<prefix><module>.lora_A<seg>weight" where <prefix> is
+  // usually "base_model.model." and <seg> is ".default." (the adapter name)
+  // or "." (no adapter-name segment). Try the common combinations.
+  SetLength(Prefixes, 2);
+  Prefixes[0] := 'base_model.model.';
+  Prefixes[1] := '';
+  SetLength(Segments, 2);
+  Segments[0] := '.default.';
+  Segments[1] := '.';
+  Found := False;
+  Base := '';
+  AName := '';
+  BName := '';
+  for p := 0 to High(Prefixes) do
+  begin
+    for s := 0 to High(Segments) do
+    begin
+      Base := Prefixes[p] + ModuleName;
+      AName := Base + '.lora_A' + Segments[s] + 'weight';
+      BName := Base + '.lora_B' + Segments[s] + 'weight';
+      if Reader.HasTensor(AName) and Reader.HasTensor(BName) then
+      begin
+        Found := True;
+        break;
+      end;
+    end;
+    if Found then break;
+  end;
+  if not Found then
+    ImportError('PEFT import: could not find lora_A/lora_B tensors for module '
+      + '"' + ModuleName + '" (tried prefixes "base_model.model." and "", ' +
+      'adapter segments ".default." and ".").');
+  // A: [Rank, d_in] -> A layer (Rank neurons, d_in weights). The PEFT scaling
+  // alpha/r is folded into B, so A loads unscaled.
+  LoadPlainLinearWeights(Reader, ADown, AName, d_in, Rank, 1.0);
+  // B: [d_out, Rank] -> B layer (d_out neurons, Rank weights), scaled.
+  LoadPlainLinearWeights(Reader, BUp, BName, Rank, d_out, Scale);
+  Result := Base;
+end;
+
 // Loads a Qwen3-style SHARED per-head RMSNorm gain vector [HeadDim] into
 // every per-head TNNetTokenRMSNorm copy in NormLayers (q_norm/k_norm are
 // stored ONCE in the checkpoint but applied to each head's q/k slice).
@@ -3569,15 +6940,407 @@ begin
   end;
 end;
 
+// Loads a HF FULL-WIDTH q/k RMSNorm gain [num_heads*head_dim] (OLMo-2
+// QKNormFullWidth: ONE norm over the whole flattened projection output,
+// applied BEFORE the head split + RoPE) into a single TNNetTokenRMSNorm.
+// The q/k projection ROWS were loaded with the per-head rotate_half ->
+// interleaved-pair permutation, so each head's HeadDim-wide gain slice is
+// permuted the same way (the RMS statistic itself is permutation-invariant,
+// only the per-channel gains must follow their channels).
+procedure LoadLlamaFullWidthQKNormWeights(Reader: TNNetSafeTensorsReader;
+  NormLayer: TNNetLayer; const WName: string; Width, HeadDim: integer;
+  GainOffset: TNeuralFloat = 0);
+var
+  Tmp: TNNetVolume;
+  HeadCnt, j, TargetIdx, HalfDim: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Llama import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 1) or
+     (Reader.DimSize(WName, 0) <> Width) then
+    ImportError('Llama import: "' + WName + '" must have shape [' +
+      IntToStr(Width) + '], got ' + Reader.ShapeAsString(WName));
+  HalfDim := HeadDim div 2;
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for HeadCnt := 0 to (Width div HeadDim) - 1 do
+    begin
+      for j := 0 to HeadDim - 1 do
+      begin
+        if j < HalfDim then
+          TargetIdx := 2 * j
+        else
+          TargetIdx := 2 * (j - HalfDim) + 1;
+        NormLayer.Neurons[0].Weights.FData[HeadCnt * HeadDim + TargetIdx] :=
+          GainOffset + Tmp.FData[HeadCnt * HeadDim + j]; // gain
+      end;
+    end;
+    NormLayer.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+end;
+
 type
   TLlamaBlockLayers = record
     AttnNorm, QProj, KProj, VProj, OProj, MlpNorm, GateUp, Down: TNNetLayer;
     // Sandwich norms (Gemma-2 SandwichNorm): post-attention and
     // post-feedforward RMSNorms INSIDE the residual branches; nil otherwise.
+    // OLMo-2's PostNormReordered REUSES the two fields (its
+    // post_attention_layernorm / post_feedforward_layernorm sit in the same
+    // place - the sublayer output, before the residual add - it just drops
+    // the entry norms: AttnNorm and MlpNorm stay nil).
     PostAttnNorm, PostMlpNorm: TNNetLayer;
+    // BitNet b1.58 SubLN (Config.BitNetSubLN): the attn_sub_norm RMSNorm on the
+    // concatenated head outputs BEFORE o_proj, and the ffn_sub_norm RMSNorm on
+    // the gated activation BEFORE down_proj; nil otherwise.
+    AttnSubNorm, FfnSubNorm: TNNetLayer;
     // Per-head q/k RMSNorm copies (Qwen3 QKNorm); empty otherwise.
     QNorms, KNorms: array of TNNetLayer;
+    // FULL-WIDTH q/k RMSNorm (OLMo-2 QKNormFullWidth); nil otherwise.
+    QNormFull, KNormFull: TNNetLayer;
+    // Mixtral block_sparse_moe (Config.IsMoE): the router gate conv plus
+    // per-expert fused gate|up and down projections; empty otherwise.
+    GateConv: TNNetLayer;
+    ExpertGateUp, ExpertDown: array of TNNetLayer;
+    // granitemoe shared expert (Config.SharedIntermediateSize > 0): an
+    // always-on SwiGLU MLP whose output is summed with the routed output;
+    // nil otherwise.
+    SharedGateUp, SharedDown: TNNetLayer;
   end;
+
+// Wires Mixtral's block_sparse_moe FFN from primitives onto MoESource (the
+// pre-FFN-normalized residual stream): a token-wise router (gate linear ->
+// num_local_experts logits -> PER-TOKEN softmax -> hard top-k gate with the
+// surviving probs RENORMALIZED, HF's normalize_topk_prob), N independent
+// SwiGLU experts, and y = Sum_e gTopK[e] * Expert_e(x). This is the
+// AddTopKMixtureOfExperts combine specialized to SwiGLU experts so the
+// importer can drop the checkpoint's per-expert w1/w2/w3 onto named layers.
+// The gate's PER-TOKEN softmax matches HF (the whole-volume TNNetSoftMax
+// would couple tokens); pRenormalize=true is Mixtral's top-k renorm, the
+// one routing knob that distinguishes it from DeepSeek-V2 (norm=false).
+// Leaves the combined sum as the last layer (the caller closes the residual).
+//
+// Per-layer dense/MoE gate for the Qwen3-MoE mixed stack. Mirrors HF
+// modeling_qwen3_moe.Qwen3MoeDecoderLayer.__init__ EXACTLY: layer LayerIdx is
+// an MoE FFN iff it is NOT in mlp_only_layers AND num_experts > 0 AND
+// (LayerIdx+1) mod decoder_sparse_step = 0; otherwise it is a plain dense
+// SwiGLU FFN (full intermediate_size). For the uniform all-MoE stack
+// (decoder_sparse_step=1, empty mlp_only_layers) this is true for every layer,
+// so the original behaviour is unchanged. Config.IsMoE gates whether ANY layer
+// is MoE (non-MoE families short-circuit to dense). Coded by Claude (AI).
+function LlamaLayerIsMoE(const Config: TLlamaConfig; LayerIdx: integer): boolean;
+var
+  Step, k: integer;
+begin
+  if not Config.IsMoE then Exit(False);
+  if Config.NumLocalExperts < 1 then Exit(False);
+  for k := 0 to High(Config.MoEMlpOnlyLayers) do
+    if Config.MoEMlpOnlyLayers[k] = LayerIdx then Exit(False);
+  Step := Config.MoEDecoderSparseStep;
+  if Step < 1 then Step := 1;
+  Result := ((LayerIdx + 1) mod Step) = 0;
+end;
+
+procedure BuildMixtralMoEBranch(NN: TNNet; var Block: TLlamaBlockLayers;
+  MoESource: TNNetLayer; const Config: TLlamaConfig);
+var
+  GateTopK, ExpertOut, GateE, GateEBroadcast, RoutedOut: TNNetLayer;
+  MoEBranches: array of TNNetLayer;
+  ExpertCnt, ExpertWidth: integer;
+begin
+  // Per-expert SwiGLU width: Mixtral's experts are full intermediate_size;
+  // Qwen3-MoE's are the narrower moe_intermediate_size (MoEIntermediateSize,
+  // 0 = fall back to IntermediateSize).
+  if Config.MoEIntermediateSize > 0 then ExpertWidth := Config.MoEIntermediateSize
+  else ExpertWidth := Config.IntermediateSize;
+  SetLength(Block.ExpertGateUp, Config.NumLocalExperts);
+  SetLength(Block.ExpertDown, Config.NumLocalExperts);
+  SetLength(MoEBranches, Config.NumLocalExperts);
+  // Router: token-wise linear -> PER-TOKEN softmax (over ALL experts) ->
+  // hard top-k gate with the top-k subset renormalized iff Config.MoENormTopK
+  // (Mixtral always renormalizes; Qwen3-MoE follows norm_topk_prob).
+  Block.GateConv := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts), MoESource);
+  // Config.MoESigmoidGate (Llama-4): HF keeps the top-k LOGITS, scatters them
+  // into a -inf tensor and applies SIGMOID (the non-survivors -> sigmoid(-inf)
+  // = 0). Sigmoid is monotonic so top-k SELECTION on sigmoid(logit) equals
+  // top-k on the raw logit; raw (no-renorm) TopKGate then keeps sigmoid(logit)
+  // for survivors and zeros the rest - exactly HF's router_scores. Mixtral /
+  // Qwen3-MoE / granitemoe instead softmax over ALL experts before the gate.
+  if Config.MoESigmoidGate then
+  begin
+    NN.AddLayer( TNNetSigmoid.Create() );
+    GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+      Config.MoEExpertsPerTok, {pRenormalize=}false) );
+  end
+  else
+  begin
+    NN.AddLayer( TNNetPointwiseSoftMax.Create() );
+    GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+      Config.MoEExpertsPerTok, {pRenormalize=}Config.MoENormTopK) );
+  end;
+  for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
+  begin
+    // Slice this expert's top-k gate weight g[e] and broadcast it across
+    // d_model (zero for non-selected experts).
+    GateE := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(ExpertCnt, 1), GateTopK);
+    GateEBroadcast := NN.AddLayer(
+      TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
+    // Per-expert SwiGLU MLP. TNNetSwiGLU computes FIRSTHALF * silu(SECONDHALF):
+    // the fused projection holds w3 (up) in neurons 0..I-1 and w1 (gate) in
+    // I..2I-1; w2 is the down projection (loaded below).
+    // Config.MoEScaleInput (Llama-4): the gate scales the expert INPUT
+    // (experts(g*x)); else (Mixtral/Qwen3/granite) it scales the OUTPUT
+    // (g*expert(x)). expert(0)=0 (bias-free) so non-selected always vanish.
+    if Config.MoEScaleInput then
+      ExpertOut := NN.AddLayer(
+        TNNetCellMulByCell.Create(MoESource, GateEBroadcast) )
+    else
+      ExpertOut := MoESource;
+    Block.ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(2 * ExpertWidth), ExpertOut);
+    NN.AddLayer( TNNetSwiGLU.Create() );
+    Block.ExpertDown[ExpertCnt] := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    ExpertOut := NN.GetLastLayer();
+    if Config.MoEScaleInput then
+      MoEBranches[ExpertCnt] := ExpertOut
+    else
+      MoEBranches[ExpertCnt] := NN.AddLayer(
+        TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+  end;
+  // y = Sum_e Expert_e(gTopK[e] * x)  (MoEScaleInput) or Sum_e gTopK[e] *
+  // Expert_e(x). (NumExpertsPerTok>=2 implies NumLocalExperts>=2; a
+  // single-expert sum is still valid for safety.)
+  RoutedOut := NN.AddLayer( TNNetSum.Create(MoEBranches) );
+  SetLength(MoEBranches, 0);
+  // granitemoe shared expert (GraniteMoeShared, Config.SharedIntermediateSize
+  // > 0): an always-on full-width SwiGLU MLP reading the SAME pre-FFN-normed
+  // residual stream as the router, run in PARALLEL with the routed experts.
+  // HF GraniteMoeSharedDecoderLayer: hidden = block_sparse_moe(h) +
+  // shared_mlp(h). shared_mlp.input_linear is the FUSED [2*S, H] gate|up slab
+  // (HF chunks it into (gate, up) and computes silu(gate)*up); TNNetSwiGLU
+  // computes FIRSTHALF*silu(SECONDHALF), so the UP half loads into neurons
+  // 0..S-1 and the GATE half into S..2S-1 (the same convention as every
+  // other fused gate|up here). residual_multiplier folds into the shared
+  // down (output_linear) rows, matching the routed experts.
+  if Config.SharedIntermediateSize > 0 then
+  begin
+    Block.SharedGateUp := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(2 * Config.SharedIntermediateSize),
+      MoESource);
+    NN.AddLayer( TNNetSwiGLU.Create() );
+    Block.SharedDown := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    NN.AddLayer( TNNetSum.Create([RoutedOut, NN.GetLastLayer()]) );
+  end;
+end;
+
+// Loads granitemoe's FUSED 3-D expert slab for one block (no Mixtral-style
+// per-expert 2-D tensors). HF GraniteMoeParallelExperts stack every expert
+// into one tensor:
+//   block_sparse_moe.input_linear.weight  [E, 2I, H]  (per expert: gate rows
+//       0..I-1 then up rows I..2I-1; HF chunks input_linear into (gate, up)
+//       and computes silu(gate)*up);
+//   block_sparse_moe.output_linear.weight [E, H, I]   (per expert down);
+//   block_sparse_moe.router.layer.weight  [E, H]      (the router gate).
+// TNNetSwiGLU computes FIRSTHALF*silu(SECONDHALF), so the UP half loads into
+// expert neurons 0..I-1 and the GATE half into I..2I-1 (the same convention
+// as the dense fused gate_up). ResidualScale folds Granite's
+// residual_multiplier into the down (output_linear) rows. Coded by Claude (AI).
+procedure LoadGraniteMoEExperts(Reader: TNNetSafeTensorsReader;
+  var Block: TLlamaBlockLayers; const BlockPrefix: string;
+  NumExperts, HiddenSize, ExpertWidth: integer; ResidualScale: TNeuralFloat;
+  Consumed: TStringList);
+var
+  InName, OutName, RouterName: string;
+  W: TNNetVolume;
+  e, j, i, SrcRow, TwoI: integer;
+begin
+  TwoI := 2 * ExpertWidth;
+  InName := BlockPrefix + 'block_sparse_moe.input_linear.weight';
+  OutName := BlockPrefix + 'block_sparse_moe.output_linear.weight';
+  RouterName := BlockPrefix + 'block_sparse_moe.router.layer.weight';
+  // ---- router gate [E, H] (a plain bias-free nn.Linear over experts) ----
+  if (Reader.DimCount(RouterName) <> 2) or
+     (Reader.DimSize(RouterName, 0) <> NumExperts) or
+     (Reader.DimSize(RouterName, 1) <> HiddenSize) then
+    ImportError('Llama import: "' + RouterName + '" must have shape [' +
+      IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + '], got ' +
+      Reader.ShapeAsString(RouterName));
+  W := TNNetVolume.Create;
+  try
+    EnsureWritableImportWeights(Block.GateConv);
+    Reader.LoadTensorFlat(RouterName, W);
+    for e := 0 to NumExperts - 1 do
+    begin
+      for i := 0 to HiddenSize - 1 do
+        Block.GateConv.Neurons[e].Weights.FData[i] :=
+          W.FData[e * HiddenSize + i];
+      Block.GateConv.Neurons[e].BiasWeight := 0;
+    end;
+    Block.GateConv.FlushWeightCache();
+    Consumed.Add(RouterName);
+    // ---- input_linear [E, 2I, H]: per expert gate|up -> up|gate neurons ----
+    if (Reader.DimCount(InName) <> 3) or
+       (Reader.DimSize(InName, 0) <> NumExperts) or
+       (Reader.DimSize(InName, 1) <> TwoI) or
+       (Reader.DimSize(InName, 2) <> HiddenSize) then
+      ImportError('Llama import: "' + InName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(TwoI) + ', ' +
+        IntToStr(HiddenSize) + '], got ' + Reader.ShapeAsString(InName));
+    Reader.LoadTensorFlat(InName, W); // flat [E*2I, H]
+    for e := 0 to NumExperts - 1 do
+    begin
+      EnsureWritableImportWeights(Block.ExpertGateUp[e]);
+      for j := 0 to ExpertWidth - 1 do
+      begin
+        // UP half (input_linear rows I..2I-1) -> neurons 0..I-1.
+        SrcRow := e * TwoI + ExpertWidth + j;
+        for i := 0 to HiddenSize - 1 do
+          Block.ExpertGateUp[e].Neurons[j].Weights.FData[i] :=
+            W.FData[SrcRow * HiddenSize + i];
+        Block.ExpertGateUp[e].Neurons[j].BiasWeight := 0;
+        // GATE half (input_linear rows 0..I-1) -> neurons I..2I-1.
+        SrcRow := e * TwoI + j;
+        for i := 0 to HiddenSize - 1 do
+          Block.ExpertGateUp[e].Neurons[ExpertWidth + j].Weights.FData[i] :=
+            W.FData[SrcRow * HiddenSize + i];
+        Block.ExpertGateUp[e].Neurons[ExpertWidth + j].BiasWeight := 0;
+      end;
+      Block.ExpertGateUp[e].FlushWeightCache();
+    end;
+    Consumed.Add(InName);
+    // ---- output_linear [E, H, I]: per expert down (residual_multiplier) ----
+    if (Reader.DimCount(OutName) <> 3) or
+       (Reader.DimSize(OutName, 0) <> NumExperts) or
+       (Reader.DimSize(OutName, 1) <> HiddenSize) or
+       (Reader.DimSize(OutName, 2) <> ExpertWidth) then
+      ImportError('Llama import: "' + OutName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + ', ' +
+        IntToStr(ExpertWidth) + '], got ' + Reader.ShapeAsString(OutName));
+    Reader.LoadTensorFlat(OutName, W); // flat [E*H, I]
+    for e := 0 to NumExperts - 1 do
+    begin
+      EnsureWritableImportWeights(Block.ExpertDown[e]);
+      for j := 0 to HiddenSize - 1 do
+      begin
+        SrcRow := e * HiddenSize + j;
+        for i := 0 to ExpertWidth - 1 do
+          Block.ExpertDown[e].Neurons[j].Weights.FData[i] :=
+            ResidualScale * W.FData[SrcRow * ExpertWidth + i];
+        Block.ExpertDown[e].Neurons[j].BiasWeight := 0;
+      end;
+      Block.ExpertDown[e].FlushWeightCache();
+    end;
+    Consumed.Add(OutName);
+  finally
+    W.Free;
+  end;
+end;
+
+// Loads Llama-4's FUSED 3-D expert slab for one block. HF Llama4TextExperts
+// stores the experts TRANSPOSED relative to granitemoe (the weights are
+// bmm-ed as hidden @ W, so each per-expert matrix is [in, out] not [out, in]):
+//   feed_forward.experts.gate_up_proj  [E, H, 2I]  (per expert [H, 2I]; HF
+//       chunks the LAST axis into gate (cols 0..I-1) then up (cols I..2I-1)
+//       and computes up * silu(gate));
+//   feed_forward.experts.down_proj     [E, I, H]   (per expert [I, H]);
+//   feed_forward.router.weight         [E, H]      (a plain nn.Linear [out=E,
+//       in=H], the only NON-transposed slab).
+// TNNetSwiGLU computes FIRSTHALF*silu(SECONDHALF), so the UP columns load into
+// expert neurons 0..I-1 and the GATE columns into I..2I-1 (matching every
+// other fused gate|up here). Llama-4 has no residual_multiplier, so the down
+// rows load straight. Coded by Claude (AI).
+procedure LoadLlama4MoEExperts(Reader: TNNetSafeTensorsReader;
+  var Block: TLlamaBlockLayers; const BlockPrefix: string;
+  NumExperts, HiddenSize, ExpertWidth: integer; Consumed: TStringList);
+var
+  InName, OutName, RouterName: string;
+  W: TNNetVolume;
+  e, j, i, TwoI: integer;
+begin
+  TwoI := 2 * ExpertWidth;
+  InName := BlockPrefix + 'feed_forward.experts.gate_up_proj';
+  OutName := BlockPrefix + 'feed_forward.experts.down_proj';
+  RouterName := BlockPrefix + 'feed_forward.router.weight';
+  // ---- router gate [E, H] (a plain bias-free nn.Linear over experts) ----
+  if (Reader.DimCount(RouterName) <> 2) or
+     (Reader.DimSize(RouterName, 0) <> NumExperts) or
+     (Reader.DimSize(RouterName, 1) <> HiddenSize) then
+    ImportError('Llama import: "' + RouterName + '" must have shape [' +
+      IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + '], got ' +
+      Reader.ShapeAsString(RouterName));
+  W := TNNetVolume.Create;
+  try
+    EnsureWritableImportWeights(Block.GateConv);
+    Reader.LoadTensorFlat(RouterName, W);
+    for e := 0 to NumExperts - 1 do
+    begin
+      for i := 0 to HiddenSize - 1 do
+        Block.GateConv.Neurons[e].Weights.FData[i] :=
+          W.FData[e * HiddenSize + i];
+      Block.GateConv.Neurons[e].BiasWeight := 0;
+    end;
+    Block.GateConv.FlushWeightCache();
+    Consumed.Add(RouterName);
+    // ---- gate_up_proj [E, H, 2I]: per expert gate|up COLUMNS -> up|gate
+    //      neurons (the slab is [in=H, out=2I] so we read down COLUMNS) ----
+    if (Reader.DimCount(InName) <> 3) or
+       (Reader.DimSize(InName, 0) <> NumExperts) or
+       (Reader.DimSize(InName, 1) <> HiddenSize) or
+       (Reader.DimSize(InName, 2) <> TwoI) then
+      ImportError('Llama import: "' + InName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + ', ' +
+        IntToStr(TwoI) + '], got ' + Reader.ShapeAsString(InName));
+    Reader.LoadTensorFlat(InName, W); // flat [E*H, 2I]
+    for e := 0 to NumExperts - 1 do
+    begin
+      EnsureWritableImportWeights(Block.ExpertGateUp[e]);
+      for j := 0 to ExpertWidth - 1 do
+        for i := 0 to HiddenSize - 1 do
+        begin
+          // UP column (gate_up_proj col I+j) -> neuron j.
+          Block.ExpertGateUp[e].Neurons[j].Weights.FData[i] :=
+            W.FData[(e * HiddenSize + i) * TwoI + ExpertWidth + j];
+          Block.ExpertGateUp[e].Neurons[j].BiasWeight := 0;
+          // GATE column (gate_up_proj col j) -> neuron I+j.
+          Block.ExpertGateUp[e].Neurons[ExpertWidth + j].Weights.FData[i] :=
+            W.FData[(e * HiddenSize + i) * TwoI + j];
+          Block.ExpertGateUp[e].Neurons[ExpertWidth + j].BiasWeight := 0;
+        end;
+      Block.ExpertGateUp[e].FlushWeightCache();
+    end;
+    Consumed.Add(InName);
+    // ---- down_proj [E, I, H]: per expert [in=I, out=H] -> read COLUMNS ----
+    if (Reader.DimCount(OutName) <> 3) or
+       (Reader.DimSize(OutName, 0) <> NumExperts) or
+       (Reader.DimSize(OutName, 1) <> ExpertWidth) or
+       (Reader.DimSize(OutName, 2) <> HiddenSize) then
+      ImportError('Llama import: "' + OutName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(ExpertWidth) + ', ' +
+        IntToStr(HiddenSize) + '], got ' + Reader.ShapeAsString(OutName));
+    Reader.LoadTensorFlat(OutName, W); // flat [E*I, H]
+    for e := 0 to NumExperts - 1 do
+    begin
+      EnsureWritableImportWeights(Block.ExpertDown[e]);
+      for j := 0 to HiddenSize - 1 do
+      begin
+        for i := 0 to ExpertWidth - 1 do
+          Block.ExpertDown[e].Neurons[j].Weights.FData[i] :=
+            W.FData[(e * ExpertWidth + i) * HiddenSize + j];
+        Block.ExpertDown[e].Neurons[j].BiasWeight := 0;
+      end;
+      Block.ExpertDown[e].FlushWeightCache();
+    end;
+    Consumed.Add(OutName);
+  finally
+    W.Free;
+  end;
+end;
 
 // The Llama builder core: builds the net and loads every weight from the
 // ALREADY-OPEN pReader (whose tensor table must use the HF tensor names).
@@ -3595,13 +7358,16 @@ var
   Blocks: array of TLlamaBlockLayers;
   EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
   BranchInput, NormedSource: TNNetLayer;
+  QSource, KSource: TNNetLayer;
   QSlice, KSlice, VSlice, HeadPack, RotSlice, PassSlice: TNNetLayer;
   KRotated, VSlices, HeadOutputs: array of TNNetLayer;
   SliceChannels, RotChannels, PassChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, RotaryDims, LayerWindow, i, j, d: integer;
-  LayerIsLocal: boolean;
+  RotaryHeadDimArg: integer;
+  LayerIsLocal, LayerUseRoPE: boolean;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
+  LogitScaleFold: TNeuralFloat;
   LayerRoPEScaling: TRoPEScalingConfig;
   Tmp: TNNetVolume;
   BlockPrefix, TensorNameStr, LMHeadName, FusedName: string;
@@ -3662,13 +7428,42 @@ begin
         ImportError('Llama import: rotary_dim = int(head_dim * ' +
           'partial_rotary_factor) = ' + IntToStr(RotaryDims) +
           ' must be an even number >= 2 (RoPE rotates channel pairs).');
+      // LongRoPE per-frequency table must have exactly RotaryDims/2 entries
+      // (one per rotated channel pair) - HF's long_factor is rotary_ndims/2
+      // long. Validate here for a clear message before the layer build.
+      if (Config.RopeScaling.Mode = rsmLongRoPE) and
+         (Length(Config.RopeScaling.LongFactors) <> (RotaryDims div 2)) then
+        ImportError('Llama import: rope_scaling longrope long_factor has ' +
+          IntToStr(Length(Config.RopeScaling.LongFactors)) + ' entries but ' +
+          'rotary_dim/2 = ' + IntToStr(RotaryDims div 2) +
+          ' are required (one factor per rotated channel pair).');
       if Config.QKNorm and (RotaryDims < HeadDim) then
         ImportError('Llama import: internal error - partial rotary ' +
           'combined with per-head q/k RMSNorm is not wired (no family ' +
           'uses both).');
+      if Config.QKNormFullWidth and (RotaryDims < HeadDim) then
+        ImportError('Llama import: internal error - partial rotary ' +
+          'combined with full-width q/k RMSNorm is not wired (no family ' +
+          'uses both).');
+      if Config.QKNormFullWidth and Config.QKNorm then
+        ImportError('Llama import: internal error - per-head (QKNorm) and ' +
+          'full-width (QKNormFullWidth) q/k RMSNorm are mutually ' +
+          'exclusive.');
+      if Config.PostNormReordered and Config.SandwichNorm then
+        ImportError('Llama import: internal error - PostNormReordered ' +
+          '(OLMo-2, no entry norms) and SandwichNorm (Gemma-2, entry + ' +
+          'exit norms) are mutually exclusive.');
       QWidth := Config.NumHeads * HeadDim;
       KVWidth := Config.NumKVHeads * HeadDim;
       GroupSize := Config.NumHeads div Config.NumKVHeads;
+      // The Granite multipliers default to 1.0 (no-op) in the JSON config
+      // reader, but config builders that start from Default(TLlamaConfig)
+      // (e.g. the GGUF path) leave them 0. Normalize a 0/unset multiplier to
+      // its no-op so EVERY non-Granite path is unaffected by the folds below.
+      if Config.EmbeddingMultiplier = 0 then Config.EmbeddingMultiplier := 1.0;
+      if Config.ResidualMultiplier = 0 then Config.ResidualMultiplier := 1.0;
+      if Config.LogitsScaling = 0 then Config.LogitsScaling := 1.0;
+      // AttentionMultiplier 0 stays 0 = "use SDPA's default 1/sqrt(head_dim)".
       if Reader.HasTensor('model.embed_tokens.weight') then
         Config.Prefix := 'model.'
       else if Reader.HasTensor('embed_tokens.weight') then
@@ -3760,16 +7555,60 @@ begin
           LayerTheta := Config.RopeTheta;
           LayerRoPEScaling := Config.RopeScaling;
         end;
+        // Llama-4 iRoPE: Config.NoRopeLayers (when non-empty) is the per-layer
+        // rope on/off pattern (element BlockCnt TRUE = RoPE, FALSE = NoPE/no
+        // positional). The NoPE layers also switch to a CHUNKED-causal mask of
+        // width Config.AttnChunkSize (HF Llama4 layer_types: "chunked_attention"
+        // iff no_rope, else "full_attention"); a sequence no longer than the
+        // chunk attends fully. Every other family leaves NoRopeLayers empty and
+        // uses RoPE on every layer.
+        if Length(Config.NoRopeLayers) > 0 then
+        begin
+          LayerUseRoPE := Config.NoRopeLayers[BlockCnt];
+          if not LayerUseRoPE then
+            LayerWindow := Config.AttnChunkSize;
+        end
+        else
+          LayerUseRoPE := True;
         BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].AttnNorm :=
-          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
-        NormedSource := NN.GetLastLayer();
+        // Config.PostNormReordered (OLMo-2): NO input_layernorm - the
+        // attention sub-block reads the raw residual stream and the RMSNorm
+        // moves to the SUBLAYER OUTPUT (PostAttnNorm below):
+        // x := x + Norm(Attn(x)).
+        if Config.PostNormReordered then
+          NormedSource := BranchInput
+        else
+        begin
+          Blocks[BlockCnt].AttnNorm :=
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+          NormedSource := NN.GetLastLayer();
+        end;
         Blocks[BlockCnt].QProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
         Blocks[BlockCnt].KProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        // Config.QKNormFullWidth (OLMo-2): ONE RMSNorm over the FULL
+        // flattened q/k projection width (num_heads*head_dim /
+        // num_kv_heads*head_dim) AFTER the projection and BEFORE the head
+        // split + RoPE (HF modeling_olmo2: q_norm(q_proj(x)) over the whole
+        // width, then view(heads, head_dim) and apply_rotary_pos_emb) -
+        // distinct from the Qwen3/Gemma-3 PER-HEAD QKNorm whose RMS
+        // statistic spans head_dim channels only.
+        QSource := Blocks[BlockCnt].QProj;
+        KSource := Blocks[BlockCnt].KProj;
+        if Config.QKNormFullWidth then
+        begin
+          Blocks[BlockCnt].QNormFull := NN.AddLayerAfter(
+            TNNetTokenRMSNorm.Create(Config.RmsNormEps),
+            Blocks[BlockCnt].QProj);
+          QSource := Blocks[BlockCnt].QNormFull;
+          Blocks[BlockCnt].KNormFull := NN.AddLayerAfter(
+            TNNetTokenRMSNorm.Create(Config.RmsNormEps),
+            Blocks[BlockCnt].KProj);
+          KSource := Blocks[BlockCnt].KNormFull;
+        end;
         // Config.QKNorm (Qwen3, Gemma-3): per-head RMSNorm on each q/k
         // slice AFTER the projection and BEFORE RoPE (the HF
         // modeling_qwen3 AND modeling_gemma3 ordering, both verified:
@@ -3801,26 +7640,38 @@ begin
             for d := 0 to HeadDim - RotaryDims - 1 do
               PassChannels[d] := KVHeadCnt * HeadDim + RotaryDims + d;
             RotSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(RotChannels), Blocks[BlockCnt].KProj);
+              TNNetSplitChannels.Create(RotChannels), KSource);
             RotSlice := NN.AddLayerAfter(
               CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), RotSlice);
             PassSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(PassChannels), Blocks[BlockCnt].KProj);
+              TNNetSplitChannels.Create(PassChannels), KSource);
             KRotated[KVHeadCnt] := NN.AddLayer(
               TNNetDeepConcat.Create([RotSlice, PassSlice]) );
           end
           else
           begin
             KSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
+              TNNetSplitChannels.Create(SliceChannels), KSource);
             if Config.QKNorm then
             begin
               Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
                 TNNetTokenRMSNorm.Create(Config.RmsNormEps), KSlice);
               KSlice := Blocks[BlockCnt].KNorms[KVHeadCnt];
             end;
-            KRotated[KVHeadCnt] := NN.AddLayerAfter(
-              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), KSlice);
+            // Llama-4 iRoPE: RoPE only on the RoPE layers (NoPE layers carry no
+            // positional encoding); RotaryEmbedding's native (2k,2k+1) layout
+            // matches Llama-4's view_as_complex pairing (Config.InterleavedRotary
+            // loads q/k straight - no rotate_half permutation).
+            if LayerUseRoPE then
+              KSlice := NN.AddLayerAfter(
+                CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), KSlice);
+            // Config.Llama4QKL2Norm (use_qk_norm): UNWEIGHTED L2 RMS-norm over
+            // the head AFTER RoPE, on the RoPE layers only (Llama4TextL2Norm).
+            // A gain=1 TNNetTokenRMSNorm = x*rsqrt(mean(x^2)+eps).
+            if Config.Llama4QKL2Norm and LayerUseRoPE then
+              KSlice := NN.AddLayerAfter(
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps), KSlice);
+            KRotated[KVHeadCnt] := KSlice;
           end;
           VSlices[KVHeadCnt] := NN.AddLayerAfter(
             TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
@@ -3838,26 +7689,39 @@ begin
             for d := 0 to HeadDim - RotaryDims - 1 do
               PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
             RotSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(RotChannels), Blocks[BlockCnt].QProj);
+              TNNetSplitChannels.Create(RotChannels), QSource);
             RotSlice := NN.AddLayerAfter(
               CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), RotSlice);
             PassSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(PassChannels), Blocks[BlockCnt].QProj);
+              TNNetSplitChannels.Create(PassChannels), QSource);
             QSlice := NN.AddLayer(
               TNNetDeepConcat.Create([RotSlice, PassSlice]) );
           end
           else
           begin
             QSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+              TNNetSplitChannels.Create(SliceChannels), QSource);
             if Config.QKNorm then
             begin
               Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
                 TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
               QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
             end;
-            QSlice := NN.AddLayerAfter(
-              CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), QSlice);
+            // Llama-4 iRoPE: RoPE only on the RoPE layers (see the K path).
+            if LayerUseRoPE then
+              QSlice := NN.AddLayerAfter(
+                CreateRoPEFromScaling(LayerTheta, LayerRoPEScaling), QSlice);
+            if Config.Llama4QKL2Norm and LayerUseRoPE then
+              QSlice := NN.AddLayerAfter(
+                TNNetTokenRMSNorm.Create(Config.RmsNormEps), QSlice);
+            // Config.AttnTempTuning (attn_temperature_tuning): on the NoPE
+            // layers scale the query by the per-position log factor BEFORE SDPA
+            // (HF Llama4TextAttention: applied iff attn_temperature_tuning and
+            // NOT use_rope).
+            if Config.AttnTempTuning and (not LayerUseRoPE) then
+              QSlice := NN.AddLayerAfter(
+                TNNetLlama4AttnTemperature.Create(
+                  Config.AttnFloorScale, Config.AttnScale), QSlice);
           end;
           // Pack [Q_h | K_group | V_group] (width 3*head_dim) for SDPA.
           HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
@@ -3876,12 +7740,22 @@ begin
             HeadPack);
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        // Config.BitNetSubLN (BitNet b1.58): the attn_sub_norm RMSNorm sits on
+        // the concatenated head outputs BEFORE o_proj (HF BitNetAttention:
+        // attn_output = attn_sub_norm(attn_output); o_proj(attn_output)) - the
+        // "norm-before-quantized-linear" SubLN, distinct from the post-norms
+        // below (which normalize the WHOLE sublayer output AFTER o_proj).
+        if Config.BitNetSubLN then
+          Blocks[BlockCnt].AttnSubNorm :=
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         Blocks[BlockCnt].OProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
-        // Config.SandwichNorm (Gemma-2): post-attention RMSNorm INSIDE the
-        // residual branch (HF post_attention_layernorm normalizes the
-        // attention output BEFORE the residual add).
-        if Config.SandwichNorm then
+        // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
+        // post-attention RMSNorm INSIDE the residual branch (HF
+        // post_attention_layernorm normalizes the attention output BEFORE
+        // the residual add). OLMo-2 drops the entry norm above, making this
+        // the block's ONLY attention norm: x + Norm(Attn(x)).
+        if Config.SandwichNorm or Config.PostNormReordered then
           Blocks[BlockCnt].PostAttnNorm :=
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
@@ -3893,19 +7767,49 @@ begin
         // neurons I..2I-1 (see LoadLlamaLinearWeights calls below) for
         // either activation.
         BranchInput := NN.GetLastLayer();
-        Blocks[BlockCnt].MlpNorm :=
-          NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
-        Blocks[BlockCnt].GateUp := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
-        if Config.GegluFFN then
-          NN.AddLayer( TNNetGEGLU.Create() )
+        // Config.PostNormReordered (OLMo-2): no pre-FFN norm either - the
+        // MLP reads the raw residual stream and PostMlpNorm (below) closes
+        // the branch: x := x + Norm(MLP(x)).
+        if not Config.PostNormReordered then
+          Blocks[BlockCnt].MlpNorm :=
+            NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        // Per-layer dense/MoE choice (Qwen3-MoE mixed stack; uniform stacks
+        // and non-MoE families fall through unchanged - see LlamaLayerIsMoE).
+        if LlamaLayerIsMoE(Config, BlockCnt) then
+          BuildMixtralMoEBranch(NN, Blocks[BlockCnt], NN.GetLastLayer(),
+            Config)
         else
-          NN.AddLayer( TNNetSwiGLU.Create() );
-        Blocks[BlockCnt].Down := NN.AddLayer(
-          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
-        // Config.SandwichNorm (Gemma-2): post-feedforward RMSNorm INSIDE
-        // the residual branch (HF post_feedforward_layernorm).
-        if Config.SandwichNorm then
+        begin
+          // Llama-4 dense layers use intermediate_size_mlp (wider than an MoE
+          // expter's intermediate_size); 0 = use IntermediateSize (every other
+          // family, whose dense FFN is the standard width).
+          if Config.IntermediateSizeMLP > 0 then j := Config.IntermediateSizeMLP
+          else j := Config.IntermediateSize;
+          Blocks[BlockCnt].GateUp := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(2 * j) );
+          if Config.ReGLUSquaredFFN then
+            // BitNet b1.58 relu2 FFN: down(ffn_sub_norm(relu2(gate)*up)). The
+            // fused projection packs up in neurons 0..I-1 and gate in I..2I-1
+            // (firsthalf=up, secondhalf=gate), so TNNetReGLUSquared computes
+            // up * ReLU(gate)^2 = relu2(gate) * up.
+            NN.AddLayer( TNNetReGLUSquared.Create() )
+          else if Config.GegluFFN then
+            NN.AddLayer( TNNetGEGLU.Create() )
+          else
+            NN.AddLayer( TNNetSwiGLU.Create() );
+          // Config.BitNetSubLN (BitNet b1.58): the ffn_sub_norm RMSNorm sits on
+          // the gated activation BEFORE down_proj (HF BitNetMLP:
+          // down_proj(ffn_sub_norm(act_fn(gate(x)) * up(x)))).
+          if Config.BitNetSubLN then
+            Blocks[BlockCnt].FfnSubNorm :=
+              NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+          Blocks[BlockCnt].Down := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        end;
+        // Config.SandwichNorm (Gemma-2) / Config.PostNormReordered (OLMo-2):
+        // post-feedforward RMSNorm INSIDE the residual branch (HF
+        // post_feedforward_layernorm).
+        if Config.SandwichNorm or Config.PostNormReordered then
           Blocks[BlockCnt].PostMlpNorm :=
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
@@ -3940,11 +7844,19 @@ begin
       // (Gemma-3 combines it with QueryPreAttnScalar) the fold moves into
       // the per-head q_norm GAINS instead (still ahead of RoPE, which
       // commutes with a scalar).
-      if Config.QueryPreAttnScalar > 0 then
+      // Config.AttentionMultiplier (Granite): HF replaces SDPA's structural
+      // 1/sqrt(head_dim) score scale with attention_multiplier. SDPA here
+      // still divides by sqrt(head_dim), so folding QScale =
+      // attention_multiplier*sqrt(head_dim) into W_q makes the EFFECTIVE
+      // scale attention_multiplier (the same W_q-fold trick as Gemma-2's
+      // query_pre_attn_scalar; the two never co-occur). 0 = the default.
+      if Config.AttentionMultiplier > 0 then
+        QScale := Config.AttentionMultiplier * Sqrt(HeadDim)
+      else if Config.QueryPreAttnScalar > 0 then
         QScale := Sqrt(HeadDim / Config.QueryPreAttnScalar)
       else
         QScale := 1.0;
-      if Config.QKNorm then
+      if Config.QKNorm or Config.QKNormFullWidth then
         QProjScale := 1.0
       else
         QProjScale := QScale;
@@ -3965,17 +7877,32 @@ begin
         // matching HF GemmaForCausalLM (the head ties to the raw matrix).
         if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
           EmbeddingLayer.Neurons[0].Weights.Mul(Config.EmbedScale);
+        // Config.EmbeddingMultiplier (Granite): scale token embeddings AFTER
+        // lookup - folded into the embedding rows like EmbedScale (and, like
+        // EmbedScale, NOT into the tied LM head, which reads the raw Tmp rows
+        // matching HF GraniteForCausalLM tying to the unscaled matrix).
+        if (Config.EmbeddingMultiplier <> 0) and
+           (Config.EmbeddingMultiplier <> 1.0) then
+          EmbeddingLayer.Neurons[0].Weights.Mul(Config.EmbeddingMultiplier);
         EmbeddingLayer.FlushWeightCache();
         MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+        // Config.LogitsScaling (Granite): HF DIVIDES the final logits by
+        // logits_scaling before softmax. Fold 1/logits_scaling into the LM
+        // head rows (exactly the Cohere logit_scale fold, but dividing).
+        if Config.LogitsScaling <> 0 then
+          LogitScaleFold := 1.0 / Config.LogitsScaling
+        else
+          LogitScaleFold := 1.0;
         if Config.TieWordEmbeddings then
         begin
-          // Tied LM head: logits = h . embed^T (rows copied, bias-free).
+          // Tied LM head: logits = (h . embed^T) / logits_scaling (rows
+          // copied with the 1/logits_scaling fold, bias-free).
           EnsureWritableImportWeights(LMHead);
           for j := 0 to Config.VocabSize - 1 do
           begin
             for i := 0 to Config.HiddenSize - 1 do
               LMHead.Neurons[j].Weights.FData[i] :=
-                Tmp.FData[j * Config.HiddenSize + i];
+                LogitScaleFold * Tmp.FData[j * Config.HiddenSize + i];
             LMHead.Neurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
@@ -3985,7 +7912,7 @@ begin
         else
         begin
           LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
-            Config.HiddenSize, Config.VocabSize);
+            Config.HiddenSize, Config.VocabSize, 0, -1, 0, '', LogitScaleFold);
           MarkConsumed(LMHeadName);
         end;
       finally
@@ -3996,10 +7923,15 @@ begin
       for BlockCnt := 0 to Config.NumLayers - 1 do
       begin
         BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
-        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].AttnNorm,
-          BlockPrefix + 'input_layernorm.weight', Config.HiddenSize,
-          NormGainOffset);
-        MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        // Config.PostNormReordered (OLMo-2): there is NO input_layernorm -
+        // the block's two norms load into the post-norms below.
+        if not Config.PostNormReordered then
+        begin
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].AttnNorm,
+            BlockPrefix + 'input_layernorm.weight', Config.HiddenSize,
+            NormGainOffset);
+          MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        end;
         // q_proj/k_proj rows are PERMUTED per head for the rotate_half
         // convention (RotaryHeadDim); v_proj/o_proj load straight.
         // Config.QKVBias (Qwen2) loads q/k/v biases too - permuted along
@@ -4038,9 +7970,19 @@ begin
         end
         else
         begin
+          // Config.InterleavedRotary (GLM-4, Cohere): RoPE rotates
+          // consecutive channel PAIRS - the native TNNetRotaryEmbedding
+          // layout - so the q/k rows load STRAIGHT (RotaryHeadDim=0, no
+          // rotate_half row permutation). Llama/Phi/NeoX (half-split
+          // rotate_half) pass HeadDim to permute into the interleaved order.
+          if Config.InterleavedRotary then
+            RotaryHeadDimArg := 0
+          else
+            RotaryHeadDimArg := HeadDim;
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
             BlockPrefix + 'self_attn.q_proj.weight',
-            Config.HiddenSize, QWidth, 0, -1, HeadDim, QBiasName, QProjScale);
+            Config.HiddenSize, QWidth, 0, -1, RotaryHeadDimArg, QBiasName,
+            QProjScale);
           MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
           if QBiasName <> '' then MarkConsumed(QBiasName);
           // Qwen3/Gemma-3 per-head q/k RMSNorm: one shared [head_dim] gain
@@ -4060,9 +8002,27 @@ begin
               NormGainOffset);
             MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
           end;
+          // OLMo-2 full-width q/k RMSNorm: ONE [num_heads*head_dim] /
+          // [num_kv_heads*head_dim] gain per block, loaded with the same
+          // per-head rotate_half permutation as the q/k projection ROWS
+          // (the RMS statistic is permutation-invariant; the per-channel
+          // gains must follow their permuted channels).
+          if Config.QKNormFullWidth then
+          begin
+            LoadLlamaFullWidthQKNormWeights(Reader,
+              Blocks[BlockCnt].QNormFull,
+              BlockPrefix + 'self_attn.q_norm.weight', QWidth, HeadDim,
+              NormGainOffset);
+            MarkConsumed(BlockPrefix + 'self_attn.q_norm.weight');
+            LoadLlamaFullWidthQKNormWeights(Reader,
+              Blocks[BlockCnt].KNormFull,
+              BlockPrefix + 'self_attn.k_norm.weight', KVWidth, HeadDim,
+              NormGainOffset);
+            MarkConsumed(BlockPrefix + 'self_attn.k_norm.weight');
+          end;
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
             BlockPrefix + 'self_attn.k_proj.weight',
-            Config.HiddenSize, KVWidth, 0, -1, HeadDim, KBiasName);
+            Config.HiddenSize, KVWidth, 0, -1, RotaryHeadDimArg, KBiasName);
           MarkConsumed(BlockPrefix + 'self_attn.k_proj.weight');
           if KBiasName <> '' then MarkConsumed(KBiasName);
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
@@ -4071,11 +8031,34 @@ begin
           MarkConsumed(BlockPrefix + 'self_attn.v_proj.weight');
           if VBiasName <> '' then MarkConsumed(VBiasName);
         end;
+        // Config.ResidualMultiplier (Granite): scale the attention sublayer
+        // output before the residual add - folded into the o_proj rows (and
+        // the FFN down_proj / expert down rows below). 1.0 = off.
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
           BlockPrefix + 'self_attn.o_proj.weight',
-          QWidth, Config.HiddenSize);
+          QWidth, Config.HiddenSize, 0, -1, 0, '', Config.ResidualMultiplier);
         MarkConsumed(BlockPrefix + 'self_attn.o_proj.weight');
-        if Config.SandwichNorm then
+        if Config.GLM4SandwichNorm then
+        begin
+          // GLM-4 four-norm sandwich (same WIRING as Gemma-2's sandwich,
+          // different key names): input_layernorm (attn pre, loaded above) +
+          // post_self_attn_layernorm INSIDE the attention branch +
+          // post_attention_layernorm as the FFN PRE-norm +
+          // post_mlp_layernorm closing the FFN branch.
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostAttnNorm,
+            BlockPrefix + 'post_self_attn_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_self_attn_layernorm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].MlpNorm,
+            BlockPrefix + 'post_attention_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostMlpNorm,
+            BlockPrefix + 'post_mlp_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_mlp_layernorm.weight');
+        end
+        else if Config.SandwichNorm then
         begin
           // Gemma-2 sandwich norms: post_attention_layernorm is the TRUE
           // post-attention norm (inside the residual branch) and the FFN's
@@ -4094,6 +8077,21 @@ begin
             Config.HiddenSize, NormGainOffset);
           MarkConsumed(BlockPrefix + 'post_feedforward_layernorm.weight');
         end
+        else if Config.PostNormReordered then
+        begin
+          // OLMo-2 reordered post-norms: post_attention_layernorm closes
+          // the attention branch and post_feedforward_layernorm the FFN
+          // branch (both INSIDE the residual, before the add); there are
+          // no entry norms.
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostAttnNorm,
+            BlockPrefix + 'post_attention_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].PostMlpNorm,
+            BlockPrefix + 'post_feedforward_layernorm.weight',
+            Config.HiddenSize, NormGainOffset);
+          MarkConsumed(BlockPrefix + 'post_feedforward_layernorm.weight');
+        end
         else
         begin
           // Llama naming: post_attention_layernorm is the FFN's pre-norm.
@@ -4102,43 +8100,216 @@ begin
             Config.HiddenSize, NormGainOffset);
           MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
         end;
+        // Config.BitNetSubLN (BitNet b1.58): the two extra SubLN gains.
+        // attn_sub_norm normalizes the [hidden_size] attention output before
+        // o_proj; ffn_sub_norm normalizes the [intermediate_size] gated
+        // activation before down_proj. Both are plain RMSNorm gains (no 1+w
+        // offset - BitNet stores them straight).
+        if Config.BitNetSubLN then
+        begin
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].AttnSubNorm,
+            BlockPrefix + 'self_attn.attn_sub_norm.weight',
+            Config.HiddenSize, 0);
+          MarkConsumed(BlockPrefix + 'self_attn.attn_sub_norm.weight');
+          LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].FfnSubNorm,
+            BlockPrefix + 'mlp.ffn_sub_norm.weight',
+            Config.IntermediateSize, 0);
+          MarkConsumed(BlockPrefix + 'mlp.ffn_sub_norm.weight');
+        end;
+        if LlamaLayerIsMoE(Config, BlockCnt) then
+        begin
+          // Sparse top-k MoE FFN: a router gate + per-expert SwiGLU. Two
+          // checkpoint dialects share the SAME math (the block builder above);
+          // only the tensor names, expert width and gate/up half ordering
+          // differ:
+          //   Mixtral   - block_sparse_moe.gate + experts.{i}.w1/w3/w2,
+          //               full intermediate_size experts (w1=gate, w3=up,
+          //               w2=down).
+          //   Qwen3-MoE - mlp.gate + experts.{i}.gate_proj/up_proj/down_proj,
+          //               narrower moe_intermediate_size experts.
+          // TNNetSwiGLU computes FIRSTHALF*silu(SECONDHALF), so the UP half
+          // loads into neurons 0..I-1 and the GATE half into neurons I..2I-1.
+          if Config.MoEIntermediateSize > 0 then i := Config.MoEIntermediateSize
+          else i := Config.IntermediateSize;
+          if Config.MoEGateUpTransposed then
+          begin
+            // Llama-4: TRANSPOSED fused 3-D expert slabs (gate_up_proj
+            // [E,H,2I] / down_proj [E,I,H]) + a plain feed_forward.router. The
+            // shared expert is a SEPARATE 2-D SwiGLU MLP (shared_expert.gate_proj
+            // / up_proj / down_proj), distinct from granitemoe's fused
+            // shared_mlp slab.
+            LoadLlama4MoEExperts(Reader, Blocks[BlockCnt], BlockPrefix,
+              Config.NumLocalExperts, Config.HiddenSize, i, Consumed);
+            if Config.SharedIntermediateSize > 0 then
+            begin
+              TensorNameStr := BlockPrefix + 'feed_forward.shared_expert.';
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+                TensorNameStr + 'up_proj.weight',
+                Config.HiddenSize, Config.SharedIntermediateSize,
+                0, 2 * Config.SharedIntermediateSize);
+              MarkConsumed(TensorNameStr + 'up_proj.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+                TensorNameStr + 'gate_proj.weight',
+                Config.HiddenSize, Config.SharedIntermediateSize,
+                Config.SharedIntermediateSize, 2 * Config.SharedIntermediateSize);
+              MarkConsumed(TensorNameStr + 'gate_proj.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedDown,
+                TensorNameStr + 'down_proj.weight',
+                Config.SharedIntermediateSize, Config.HiddenSize);
+              MarkConsumed(TensorNameStr + 'down_proj.weight');
+            end;
+            if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+            continue;
+          end;
+          if Config.MoEGraniteNaming then
+          begin
+            // granitemoe: ONE fused 3-D slab per block (input_linear /
+            // output_linear / router). residual_multiplier folds into the
+            // down (output_linear) rows.
+            LoadGraniteMoEExperts(Reader, Blocks[BlockCnt], BlockPrefix,
+              Config.NumLocalExperts, Config.HiddenSize, i,
+              Config.ResidualMultiplier, Consumed);
+            // granitemoe shared expert (GraniteMoeShared): a 2-D FUSED SwiGLU
+            // MLP, shared_mlp.input_linear [2S, H] (gate rows 0..S-1 then up
+            // rows S..2S-1; HF chunks (gate, up) and computes silu(gate)*up)
+            // and shared_mlp.output_linear [H, S] (down). The shared_mlp keys
+            // sit DIRECTLY under the layer prefix (NOT under
+            // block_sparse_moe). TNNetSwiGLU is FIRSTHALF*silu(SECONDHALF),
+            // so UP (rows S..2S-1) -> neurons 0..S-1 and GATE (rows 0..S-1) ->
+            // neurons S..2S-1. The down rows carry residual_multiplier like
+            // the routed expert down.
+            if Config.SharedIntermediateSize > 0 then
+            begin
+              TensorNameStr := BlockPrefix + 'shared_mlp.';
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+                TensorNameStr + 'input_linear.weight',
+                Config.HiddenSize, Config.SharedIntermediateSize,
+                {NeuronBase=}0, {ExpectedNeurons=}2 * Config.SharedIntermediateSize,
+                {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+                {SrcRowBase=}Config.SharedIntermediateSize,
+                {SrcRows=}2 * Config.SharedIntermediateSize); // UP rows
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
+                TensorNameStr + 'input_linear.weight',
+                Config.HiddenSize, Config.SharedIntermediateSize,
+                {NeuronBase=}Config.SharedIntermediateSize,
+                {ExpectedNeurons=}2 * Config.SharedIntermediateSize,
+                {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+                {SrcRowBase=}0,
+                {SrcRows=}2 * Config.SharedIntermediateSize); // GATE rows
+              MarkConsumed(TensorNameStr + 'input_linear.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedDown,
+                TensorNameStr + 'output_linear.weight',
+                Config.SharedIntermediateSize, Config.HiddenSize,
+                {NeuronBase=}0, {ExpectedNeurons=}Config.HiddenSize,
+                {RotaryHeadDim=}0, {BiasName=}'',
+                {Scale=}Config.ResidualMultiplier);
+              MarkConsumed(TensorNameStr + 'output_linear.weight');
+            end;
+            if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+            continue;
+          end;
+          if Config.MoEQwen3Naming then
+          begin
+            // Router gate: bias-free [num_experts, hidden] nn.Linear.
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateConv,
+              BlockPrefix + 'mlp.gate.weight',
+              Config.HiddenSize, Config.NumLocalExperts);
+            MarkConsumed(BlockPrefix + 'mlp.gate.weight');
+            for d := 0 to Config.NumLocalExperts - 1 do
+            begin
+              TensorNameStr := BlockPrefix + 'mlp.experts.' + IntToStr(d) + '.';
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+                TensorNameStr + 'up_proj.weight',
+                Config.HiddenSize, i, 0, 2 * i);
+              MarkConsumed(TensorNameStr + 'up_proj.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+                TensorNameStr + 'gate_proj.weight',
+                Config.HiddenSize, i, i, 2 * i);
+              MarkConsumed(TensorNameStr + 'gate_proj.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertDown[d],
+                TensorNameStr + 'down_proj.weight',
+                i, Config.HiddenSize);
+              MarkConsumed(TensorNameStr + 'down_proj.weight');
+            end;
+          end
+          else
+          begin
+            // Router gate: bias-free [num_local_experts, hidden] nn.Linear.
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateConv,
+              BlockPrefix + 'block_sparse_moe.gate.weight',
+              Config.HiddenSize, Config.NumLocalExperts);
+            MarkConsumed(BlockPrefix + 'block_sparse_moe.gate.weight');
+            // HF Mixtral: w1=gate_proj, w3=up_proj, w2=down_proj;
+            // y = w2(silu(w1 x) * w3 x).
+            for d := 0 to Config.NumLocalExperts - 1 do
+            begin
+              TensorNameStr := BlockPrefix + 'block_sparse_moe.experts.' +
+                IntToStr(d) + '.';
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+                TensorNameStr + 'w3.weight',
+                Config.HiddenSize, i, 0, 2 * i);
+              MarkConsumed(TensorNameStr + 'w3.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+                TensorNameStr + 'w1.weight',
+                Config.HiddenSize, i, i, 2 * i);
+              MarkConsumed(TensorNameStr + 'w1.weight');
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertDown[d],
+                TensorNameStr + 'w2.weight',
+                i, Config.HiddenSize);
+              MarkConsumed(TensorNameStr + 'w2.weight');
+            end;
+          end;
+          if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+          continue;
+        end;
+        // Dense FFN width: Llama-4 dense layers carry intermediate_size_mlp
+        // (wider than an MoE expert); every other family uses intermediate_size.
+        // Llama-4 also names the dense FFN tensors under "feed_forward." (not
+        // "mlp."); MoEGateUpTransposed marks the Llama-4 layout.
+        if Config.IntermediateSizeMLP > 0 then i := Config.IntermediateSizeMLP
+        else i := Config.IntermediateSize;
+        if Config.MoEGateUpTransposed then TensorNameStr := BlockPrefix + 'feed_forward.'
+        else TensorNameStr := BlockPrefix + 'mlp.';
         // Fused gate/up: up_proj -> neurons 0..I-1 (SwiGLU's linear half),
         // gate_proj -> neurons I..2I-1 (SwiGLU's Swish-gated half).
-        if Config.FusedQKVGateUp then
+        // Phi-3 (FusedQKVGateUp) AND GLM-4 (FusedGateUp - qkv stays split)
+        // both ship mlp.gate_up_proj with the SAME gate|up row order.
+        if Config.FusedQKVGateUp or Config.FusedGateUp then
         begin
           // Phi-3 fused mlp.gate_up_proj packs gate (rows 0..I-1) THEN up
           // (rows I..2I-1) - HF chunks the output in that order - so the
           // UP half lands in neurons 0..I-1 and the GATE half in
           // neurons I..2I-1 (TNNetSwiGLU computes FIRSTHALF *
           // silu(SECONDHALF)).
-          FusedName := BlockPrefix + 'mlp.gate_up_proj.weight';
+          FusedName := TensorNameStr + 'gate_up_proj.weight';
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp, FusedName,
-            Config.HiddenSize, Config.IntermediateSize,
-            0, 2 * Config.IntermediateSize, 0, '', 1.0, 0,
-            Config.IntermediateSize, 2 * Config.IntermediateSize);
+            Config.HiddenSize, i,
+            0, 2 * i, 0, '', 1.0, 0,
+            i, 2 * i);
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp, FusedName,
-            Config.HiddenSize, Config.IntermediateSize,
-            Config.IntermediateSize, 2 * Config.IntermediateSize,
-            0, '', 1.0, 0, 0, 2 * Config.IntermediateSize);
+            Config.HiddenSize, i,
+            i, 2 * i,
+            0, '', 1.0, 0, 0, 2 * i);
           MarkConsumed(FusedName);
         end
         else
         begin
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
-            BlockPrefix + 'mlp.up_proj.weight',
-            Config.HiddenSize, Config.IntermediateSize,
-            0, 2 * Config.IntermediateSize);
-          MarkConsumed(BlockPrefix + 'mlp.up_proj.weight');
+            TensorNameStr + 'up_proj.weight',
+            Config.HiddenSize, i,
+            0, 2 * i);
+          MarkConsumed(TensorNameStr + 'up_proj.weight');
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
-            BlockPrefix + 'mlp.gate_proj.weight',
-            Config.HiddenSize, Config.IntermediateSize,
-            Config.IntermediateSize, 2 * Config.IntermediateSize);
-          MarkConsumed(BlockPrefix + 'mlp.gate_proj.weight');
+            TensorNameStr + 'gate_proj.weight',
+            Config.HiddenSize, i,
+            i, 2 * i);
+          MarkConsumed(TensorNameStr + 'gate_proj.weight');
         end;
         LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
-          BlockPrefix + 'mlp.down_proj.weight',
-          Config.IntermediateSize, Config.HiddenSize);
-        MarkConsumed(BlockPrefix + 'mlp.down_proj.weight');
+          TensorNameStr + 'down_proj.weight',
+          i, Config.HiddenSize, 0, -1, 0, '',
+          Config.ResidualMultiplier);
+        MarkConsumed(TensorNameStr + 'down_proj.weight');
         // Re-quantize the block just refilled with checkpoint weights.
         if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       end;
@@ -4341,6 +8512,2039 @@ var
 begin
   Result := BuildLlamaFromGGUFEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildFromGGUFEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetGGUFReader;
+  Arch, GGUFPrefix, HFPrefix: string;
+  BlockCnt, HeadDim: integer;
+  OK: boolean;
+
+  function MetaKey(const Suffix: string): string;
+  begin
+    Result := Arch + '.' + Suffix;
+  end;
+
+  function RequiredMetaInt(const Suffix: string): integer;
+  var
+    V: Int64;
+  begin
+    V := Reader.GetMetaInt(MetaKey(Suffix), -1);
+    if V <= 0 then
+      ImportError('GGUF import: metadata key "' + MetaKey(Suffix) +
+        '" is missing or not a positive integer in ' + FileName + '.');
+    Result := integer(V);
+  end;
+
+  procedure Rename(const GGUFName, HFName: string; Optional: boolean);
+  begin
+    if Reader.HasTensor(GGUFName) then
+      Reader.RenameTensor(GGUFName, HFName)
+    else if not Optional then
+      ImportError('GGUF import: missing tensor "' + GGUFName +
+        '" in ' + FileName + '.');
+  end;
+
+begin
+  // The reference "llama" path stays in its dedicated builder; everything
+  // else is read here so the qwen2/gemma2 deltas live in one place.
+  Reader := TNNetGGUFReader.Create(FileName);
+  try
+    Arch := Reader.GetMetaString('general.architecture', '');
+  finally
+    Reader.Free;
+  end;
+  if Arch = 'llama' then
+  begin
+    Result := BuildLlamaFromGGUFEx(FileName, Config, pSeqLen,
+      pInferenceOnly, pQuantizeInt8);
+    Exit;
+  end;
+  if (Arch <> 'qwen2') and (Arch <> 'gemma2') then
+    ImportError('GGUF import: general.architecture "' + Arch +
+      '" is not supported by BuildFromGGUF (supported: llama, qwen2, ' +
+      'gemma2). starcoder2 (LayerNorm + full biases + non-gated GELU) and ' +
+      'the q/k-norm / fused-slab / MoE / non-Llama-backbone families are ' +
+      'out of scope for v1 - import those through their dedicated ' +
+      'safetensors builders: ' + FileName);
+
+  Reader := TNNetGGUFReader.Create(FileName);
+  OK := false;
+  try
+    Config := Default(TLlamaConfig);
+    Config.ModelType := Arch;
+    Config.HiddenSize := RequiredMetaInt('embedding_length');
+    Config.IntermediateSize := RequiredMetaInt('feed_forward_length');
+    Config.NumLayers := RequiredMetaInt('block_count');
+    Config.NumHeads := RequiredMetaInt('attention.head_count');
+    Config.NumKVHeads := integer(Reader.GetMetaInt(
+      MetaKey('attention.head_count_kv'), Config.NumHeads));
+    Config.MaxPositions := RequiredMetaInt('context_length');
+    Config.RmsNormEps := Reader.GetMetaFloat(
+      MetaKey('attention.layer_norm_rms_epsilon'), 1e-6);
+    Config.RopeTheta := Reader.GetMetaFloat(MetaKey('rope.freq_base'), 10000.0);
+    Config.HeadDim := integer(Reader.GetMetaInt(
+      MetaKey('attention.key_length'), 0));
+    Config.PartialRotaryFactor := 1.0;
+    Config.RopeScaling := DefaultRoPEScaling();
+    Config.EmbedScale := 1.0;
+
+    // vocab_size: explicit key, else the embedding rows (GGUF dims reversed,
+    // so dim 0 is the vocab axis), else the token list.
+    Config.VocabSize := integer(Reader.GetMetaInt(MetaKey('vocab_size'), 0));
+    if Config.VocabSize <= 0 then
+    begin
+      if Reader.HasTensor('token_embd.weight') and
+         (Reader.DimCount('token_embd.weight') = 2) then
+        Config.VocabSize := integer(Reader.DimSize('token_embd.weight', 0))
+      else
+        Config.VocabSize := integer(Reader.GetMetaArrayCount(
+          'tokenizer.ggml.tokens'));
+    end;
+    if Config.VocabSize <= 0 then
+      ImportError('GGUF import: cannot determine the vocab size in ' +
+        FileName + '.');
+    Config.TieWordEmbeddings := not Reader.HasTensor('output.weight');
+
+    if Config.HeadDim > 0 then
+      HeadDim := Config.HeadDim
+    else
+    begin
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('GGUF import: ' + MetaKey('embedding_length') + '=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          MetaKey('attention.head_count') + '=' + IntToStr(Config.NumHeads) +
+          '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+    end;
+
+    if Arch = 'qwen2' then
+    begin
+      // Qwen2: the Llama skeleton + q/k/v projection biases.
+      Config.QKVBias := True;
+      if Reader.GetMetaBool(MetaKey('attention.sliding_window'), False) or
+         (Reader.GetMetaInt(MetaKey('attention.sliding_window'), 0) > 0) then
+        ImportError('GGUF import: Qwen2 sliding-window attention is not ' +
+          'wired into this importer yet: ' + FileName);
+    end
+    else // gemma2
+    begin
+      // The gemma2 path reuses the HF-verified Gemma-2 config flags
+      // (BuildGemma2FromSafeTensors is tested against HF float64 logits) AND
+      // is now round-trip-verified offline: SaveLlamaToGGUFEx emits the Gemma
+      // deltas (gated-GELU / sqrt(d) embed scale / sandwich-norm tensors /
+      // unpermuted NEOX q/k rows / sliding_window / query_pre_attn_scalar /
+      // attn+final soft-caps), and TestBuildFromGGUFGemma2RoundTrip exports
+      // the pico Gemma-2 fixture through the writer, reads it back here, and
+      // asserts next-token logits match the safetensors-built net to < 1e-4.
+      // The metadata key names below and the "no q/k de-interleave" choice
+      // follow llama.cpp's gemma2 convert convention.
+      // Gemma-2 deltas (match BuildGemma2FromSafeTensors): gated-GELU MLP,
+      // zero-centered RMSNorm, sqrt(d_model) embed scale, sandwich norms,
+      // 1:1 alternating local/global sliding window, query pre-attn scalar
+      // score scaling and attention/final logit soft-capping.
+      Config.GegluFFN := True;
+      Config.RMSNormAddOne := True;
+      Config.EmbedScale := Sqrt(Config.HiddenSize);
+      Config.SandwichNorm := True;
+      Config.AltSlidingWindow := True;
+      Config.SlidingWindow := integer(Reader.GetMetaInt(
+        MetaKey('attention.sliding_window'), 4096));
+      // llama.cpp emits gemma2.attn_logit_softcapping /
+      // gemma2.final_logit_softcapping (HF defaults 50 / 30) and folds the
+      // query_pre_attn_scalar into the model's attention scale. The GGUF
+      // scale key is gemma2.attention.scale (1/sqrt(query_pre_attn_scalar));
+      // we keep the HF default (256) when absent.
+      Config.QueryPreAttnScalar := Reader.GetMetaFloat(
+        MetaKey('attention.query_pre_attn_scalar'), 256.0);
+      if Config.QueryPreAttnScalar <= 0 then
+        Config.QueryPreAttnScalar := 256.0;
+      Config.AttnLogitSoftCap := Reader.GetMetaFloat(
+        MetaKey('attn_logit_softcapping'), 50.0);
+      Config.FinalLogitSoftCap := Reader.GetMetaFloat(
+        MetaKey('final_logit_softcapping'), 30.0);
+      if Config.RmsNormEps = 1e-6 then
+        Config.RmsNormEps := Reader.GetMetaFloat(
+          MetaKey('attention.layer_norm_rms_epsilon'), 1e-6);
+    end;
+
+    // ---- ggml -> HF tensor names ----
+    Rename('token_embd.weight', 'model.embed_tokens.weight', false);
+    Rename('output_norm.weight', 'model.norm.weight', false);
+    Rename('output.weight', 'lm_head.weight', true);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      GGUFPrefix := 'blk.' + IntToStr(BlockCnt) + '.';
+      HFPrefix := 'model.layers.' + IntToStr(BlockCnt) + '.';
+      Rename(GGUFPrefix + 'attn_norm.weight',
+        HFPrefix + 'input_layernorm.weight', false);
+      Rename(GGUFPrefix + 'attn_q.weight',
+        HFPrefix + 'self_attn.q_proj.weight', false);
+      Rename(GGUFPrefix + 'attn_k.weight',
+        HFPrefix + 'self_attn.k_proj.weight', false);
+      Rename(GGUFPrefix + 'attn_v.weight',
+        HFPrefix + 'self_attn.v_proj.weight', false);
+      Rename(GGUFPrefix + 'attn_output.weight',
+        HFPrefix + 'self_attn.o_proj.weight', false);
+      Rename(GGUFPrefix + 'ffn_gate.weight',
+        HFPrefix + 'mlp.gate_proj.weight', false);
+      Rename(GGUFPrefix + 'ffn_up.weight',
+        HFPrefix + 'mlp.up_proj.weight', false);
+      Rename(GGUFPrefix + 'ffn_down.weight',
+        HFPrefix + 'mlp.down_proj.weight', false);
+      if Arch = 'qwen2' then
+      begin
+        Rename(GGUFPrefix + 'attn_q.bias',
+          HFPrefix + 'self_attn.q_proj.bias', false);
+        Rename(GGUFPrefix + 'attn_k.bias',
+          HFPrefix + 'self_attn.k_proj.bias', false);
+        Rename(GGUFPrefix + 'attn_v.bias',
+          HFPrefix + 'self_attn.v_proj.bias', false);
+        Rename(GGUFPrefix + 'ffn_norm.weight',
+          HFPrefix + 'post_attention_layernorm.weight', false);
+      end
+      else // gemma2 sandwich-norm names
+      begin
+        Rename(GGUFPrefix + 'post_attention_norm.weight',
+          HFPrefix + 'post_attention_layernorm.weight', false);
+        Rename(GGUFPrefix + 'ffn_norm.weight',
+          HFPrefix + 'pre_feedforward_layernorm.weight', false);
+        Rename(GGUFPrefix + 'post_ffw_norm.weight',
+          HFPrefix + 'post_feedforward_layernorm.weight', false);
+      end;
+    end;
+
+    // llama.cpp permutes q/k rows into the interleaved-rotary layout for the
+    // INTERLEAVED-rope families (llama/qwen2); Gemma uses NEOX rope and is
+    // stored in HF order, so it gets NO de-interleave.
+    if Arch = 'qwen2' then
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        HFPrefix := 'model.layers.' + IntToStr(BlockCnt) + '.';
+        Reader.RegisterRowDeinterleave(
+          HFPrefix + 'self_attn.q_proj.weight', HeadDim);
+        Reader.RegisterRowDeinterleave(
+          HFPrefix + 'self_attn.k_proj.weight', HeadDim);
+        // The q/k biases follow the same per-head interleave.
+        Reader.RegisterRowDeinterleave(
+          HFPrefix + 'self_attn.q_proj.bias', HeadDim);
+        Reader.RegisterRowDeinterleave(
+          HFPrefix + 'self_attn.k_proj.bias', HeadDim);
+      end;
+    OK := true;
+  finally
+    if not OK then Reader.Free;
+  end;
+  Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
+    pSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildFromGGUF(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildFromGGUFEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+procedure SaveLlamaToGGUFEx(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; const Tokens: array of string;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32;
+  Tokenizer: TNeuralHFTokenizer = nil);
+var
+  Writer: TNNetGGUFWriter;
+  Prefix, Arch: string;
+  HeadDim, QWidth, KVWidth, b, i: integer;
+  BlockPrefix, GGUFBlock: string;
+  Scores: array of single;
+  TokenTypes: array of Int64;
+  Gemma2: boolean;
+
+  // Builds a "<arch>.<suffix>" metadata key (llama.cpp keys all the
+  // hyperparameters under the architecture prefix).
+  function MetaKey(const Suffix: string): string;
+  begin
+    Result := Arch + '.' + Suffix;
+  end;
+
+  // Loads an HF-named tensor [Rows, Cols] from the reader.
+  function LoadHF(const HFName: string): TNNetVolume;
+  begin
+    if not Reader.HasTensor(HFName) then
+      ImportError('Llama GGUF export: missing tensor "' + HFName + '" in ' +
+        Reader.FileName + '.');
+    Result := TNNetVolume.Create;
+    Reader.LoadTensorFlat(HFName, Result);
+  end;
+
+  // Writes a 2-D matrix tensor [Rows, Cols] under its ggml name.
+  procedure WriteMatrix(const HFName, GGUFName: string;
+    Rows, Cols: integer);
+  var
+    V: TNNetVolume;
+  begin
+    V := LoadHF(HFName);
+    try
+      if V.Size <> Rows * Cols then
+        ImportError('Llama GGUF export: tensor "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' +
+          IntToStr(Rows * Cols) + '.');
+      Writer.AddTensorFlat(GGUFName, [Rows, Cols], V, pDType);
+    finally
+      V.Free;
+    end;
+  end;
+
+  // Writes a 1-D norm gain [Cols]; always F32 (the llama.cpp convention).
+  procedure WriteNorm(const HFName, GGUFName: string; Cols: integer);
+  var
+    V: TNNetVolume;
+  begin
+    V := LoadHF(HFName);
+    try
+      if V.Size <> Cols then
+        ImportError('Llama GGUF export: norm "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' + IntToStr(Cols) + '.');
+      Writer.AddTensorFlat(GGUFName, [Cols], V, gwF32);
+    finally
+      V.Free;
+    end;
+  end;
+
+  // Writes a q/k projection [Rows, Cols], permuting the rows from HF
+  // rotate_half into llama.cpp's interleaved-rotary layout (the inverse of
+  // the reader's de-interleave): stored[head, 2p] = hf[head, p],
+  // stored[head, 2p+1] = hf[head, p + head_dim/2].
+  procedure WriteQKMatrix(const HFName, GGUFName: string;
+    Rows, Cols: integer);
+  var
+    V, Perm: TNNetVolume;
+    HalfDim, hd, pp, srcRow, dstRow, c: integer;
+  begin
+    V := LoadHF(HFName);
+    Perm := TNNetVolume.Create;
+    try
+      if V.Size <> Rows * Cols then
+        ImportError('Llama GGUF export: q/k tensor "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' +
+          IntToStr(Rows * Cols) + '.');
+      if (Rows mod HeadDim) <> 0 then
+        ImportError('Llama GGUF export: q/k tensor "' + HFName + '" rows ' +
+          IntToStr(Rows) + ' not a multiple of head_dim ' +
+          IntToStr(HeadDim) + '.');
+      Perm.ReSize(Rows * Cols, 1, 1);
+      HalfDim := HeadDim div 2;
+      // For each HF source row, compute its stored (interleaved) row.
+      for srcRow := 0 to Rows - 1 do
+      begin
+        hd := srcRow div HeadDim;
+        pp := srcRow mod HeadDim;
+        if pp < HalfDim then
+          dstRow := hd * HeadDim + 2 * pp
+        else
+          dstRow := hd * HeadDim + 2 * (pp - HalfDim) + 1;
+        for c := 0 to Cols - 1 do
+          Perm.FData[dstRow * Cols + c] := V.FData[srcRow * Cols + c];
+      end;
+      Writer.AddTensorFlat(GGUFName, [Rows, Cols], Perm, pDType);
+    finally
+      Perm.Free;
+      V.Free;
+    end;
+  end;
+
+  // Writes a 1-D bias [Rows]; always F32 (matches the norm convention).
+  procedure WriteBias(const HFName, GGUFName: string; Rows: integer);
+  var
+    V: TNNetVolume;
+  begin
+    V := LoadHF(HFName);
+    try
+      if V.Size <> Rows then
+        ImportError('Llama GGUF export: bias "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' + IntToStr(Rows) + '.');
+      Writer.AddTensorFlat(GGUFName, [Rows], V, gwF32);
+    finally
+      V.Free;
+    end;
+  end;
+
+  // Writes a q/k bias [Rows], permuting the entries from HF rotate_half into
+  // llama.cpp's interleaved-rotary layout (the same per-head permutation
+  // WriteQKMatrix applies to the rows, here over a single column).
+  procedure WriteQKBias(const HFName, GGUFName: string; Rows: integer);
+  var
+    V, Perm: TNNetVolume;
+    HalfDim, hd, pp, srcRow, dstRow: integer;
+  begin
+    V := LoadHF(HFName);
+    Perm := TNNetVolume.Create;
+    try
+      if V.Size <> Rows then
+        ImportError('Llama GGUF export: q/k bias "' + HFName + '" has ' +
+          IntToStr(V.Size) + ' elements, expected ' + IntToStr(Rows) + '.');
+      if (Rows mod HeadDim) <> 0 then
+        ImportError('Llama GGUF export: q/k bias "' + HFName + '" length ' +
+          IntToStr(Rows) + ' not a multiple of head_dim ' +
+          IntToStr(HeadDim) + '.');
+      Perm.ReSize(Rows, 1, 1);
+      HalfDim := HeadDim div 2;
+      for srcRow := 0 to Rows - 1 do
+      begin
+        hd := srcRow div HeadDim;
+        pp := srcRow mod HeadDim;
+        if pp < HalfDim then
+          dstRow := hd * HeadDim + 2 * pp
+        else
+          dstRow := hd * HeadDim + 2 * (pp - HalfDim) + 1;
+        Perm.FData[dstRow] := V.FData[srcRow];
+      end;
+      Writer.AddTensorFlat(GGUFName, [Rows], Perm, gwF32);
+    finally
+      Perm.Free;
+      V.Free;
+    end;
+  end;
+
+begin
+  // A Gemma-2 export rides the SAME writer with a handful of deltas (gated-
+  // GELU FFN, sqrt(d) embed scale, sandwich norms, query pre-attn scalar,
+  // attn/final soft-caps, NEOX rope so the q/k rows are NOT permuted). It is
+  // recognized by Config.GegluFFN (the FFN gate is the defining structural
+  // delta); the remaining Gemma flags are then REQUIRED so a half-configured
+  // net cannot silently emit a malformed "gemma2" file. The reader
+  // (BuildFromGGUF) re-derives EmbedScale / RMSNormAddOne / SandwichNorm /
+  // AltSlidingWindow from general.architecture "gemma2", so those need no
+  // explicit metadata; only the numeric soft-caps / scalar / window are keyed.
+  Gemma2 := Config.GegluFFN;
+  if Gemma2 then
+  begin
+    if not (Config.RMSNormAddOne and Config.SandwichNorm and
+            Config.AltSlidingWindow) then
+      ImportError('Llama GGUF export: a gemma2 export (GegluFFN set) also ' +
+        'requires RMSNormAddOne + SandwichNorm + AltSlidingWindow; this ' +
+        'config is only partially Gemma-2.');
+    if Config.InterleavedRotary then
+      ImportError('Llama GGUF export: gemma2 uses NEOX rope; ' +
+        'InterleavedRotary must be off.');
+    if Config.QKNorm or Config.QKNormFullWidth then
+      ImportError('Llama GGUF export: gemma2 with q/k RMSNorm (gemma3) is ' +
+        'out of scope for v1.');
+    if Config.RopeLocalTheta > 0 then
+      ImportError('Llama GGUF export: per-layer RoPE theta (Gemma-3) is out ' +
+        'of scope for v1.');
+  end;
+
+  // ---- reject the out-of-scope architecture deltas (v1 = plain Llama) ----
+  if Config.IsMoE then
+    ImportError('Llama GGUF export: MoE models are out of scope for v1.');
+  if Config.FusedQKVGateUp or Config.FusedGateUp then
+    ImportError('Llama GGUF export: fused qkv/gate-up projections are out ' +
+      'of scope for v1.');
+  if (not Gemma2) and (Config.SandwichNorm or Config.GLM4SandwichNorm or
+     Config.PostNormReordered) then
+    ImportError('Llama GGUF export: sandwich/reordered norms are out of ' +
+      'scope for v1.');
+  if (not Gemma2) and (Config.QKNorm or Config.QKNormFullWidth) then
+    ImportError('Llama GGUF export: q/k RMSNorm models are out of scope ' +
+      'for v1.');
+  if (Config.PartialRotaryFactor > 0) and (Config.PartialRotaryFactor < 1) then
+    ImportError('Llama GGUF export: partial rotary is out of scope for v1.');
+  if (not Gemma2) and Config.InterleavedRotary then
+    ImportError('Llama GGUF export: interleaved-rotary families (GLM-4/' +
+      'Cohere) are out of scope for v1.');
+  if (not Gemma2) and Config.GegluFFN then
+    ImportError('Llama GGUF export: gated-GELU FFN (Gemma) is out of scope ' +
+      'for v1.');
+  if (not Gemma2) and (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1) then
+    ImportError('Llama GGUF export: embedding scaling (Gemma) is out of ' +
+      'scope for v1.');
+  if (not Gemma2) and ((Config.QueryPreAttnScalar <> 0) or
+     (Config.AttnLogitSoftCap <> 0) or (Config.FinalLogitSoftCap <> 0)) then
+    ImportError('Llama GGUF export: Gemma-2 score scaling / soft-capping ' +
+      'is out of scope for v1.');
+  if (not Gemma2) and (Config.RopeLocalTheta > 0) then
+    ImportError('Llama GGUF export: per-layer RoPE theta (Gemma-3) is out ' +
+      'of scope for v1.');
+
+  if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+  else HeadDim := Config.HiddenSize div Config.NumHeads;
+  QWidth := Config.NumHeads * HeadDim;
+  KVWidth := Config.NumKVHeads * HeadDim;
+
+  // Detect the tensor-name prefix ('model.' for HF, '' for some exports).
+  if Reader.HasTensor('model.embed_tokens.weight') then Prefix := 'model.'
+  else if Reader.HasTensor('embed_tokens.weight') then Prefix := ''
+  else
+    ImportError('Llama GGUF export: neither "model.embed_tokens.weight" ' +
+      'nor "embed_tokens.weight" found in ' + Reader.FileName + '.');
+
+  Writer := TNNetGGUFWriter.Create(FileName);
+  try
+    // ---- metadata (the <arch>.* hyperparameter block) ----
+    // A Qwen2-style decoder (q/k/v projection biases, otherwise the plain
+    // Llama skeleton) is emitted under general.architecture "qwen2" so the
+    // round-trip reader (BuildFromGGUF) re-derives the QKVBias flag from the
+    // architecture name rather than guessing from the presence of bias
+    // tensors. Everything else stays "llama".
+    if Gemma2 then Arch := 'gemma2'
+    else if Config.QKVBias then Arch := 'qwen2'
+    else Arch := 'llama';
+    Writer.AddMetaString('general.architecture', Arch);
+    Writer.AddMetaString('general.name', 'cai-neural-api-export');
+    Writer.AddMetaUInt32(MetaKey('block_count'), Config.NumLayers);
+    Writer.AddMetaUInt32(MetaKey('context_length'), Config.MaxPositions);
+    Writer.AddMetaUInt32(MetaKey('embedding_length'), Config.HiddenSize);
+    Writer.AddMetaUInt32(MetaKey('feed_forward_length'),
+      Config.IntermediateSize);
+    Writer.AddMetaUInt32(MetaKey('attention.head_count'), Config.NumHeads);
+    Writer.AddMetaUInt32(MetaKey('attention.head_count_kv'), Config.NumKVHeads);
+    Writer.AddMetaFloat32(MetaKey('attention.layer_norm_rms_epsilon'),
+      Config.RmsNormEps);
+    Writer.AddMetaFloat32(MetaKey('rope.freq_base'), Config.RopeTheta);
+    Writer.AddMetaUInt32(MetaKey('rope.dimension_count'), HeadDim);
+    Writer.AddMetaUInt32(MetaKey('vocab_size'), Config.VocabSize);
+    if (Config.HeadDim > 0) and
+       (Config.HeadDim <> Config.HiddenSize div Config.NumHeads) then
+      Writer.AddMetaUInt32(MetaKey('attention.key_length'), HeadDim);
+    if Config.RopeScaling.Mode = rsmPositionInterpolation then
+    begin
+      Writer.AddMetaString(MetaKey('rope.scaling.type'), 'linear');
+      Writer.AddMetaFloat32(MetaKey('rope.scaling.factor'),
+        Config.RopeScaling.Factor);
+    end
+    else if Config.RopeScaling.Mode <> rsmNone then
+      ImportError('Llama GGUF export: rope_scaling mode ' +
+        IntToStr(Ord(Config.RopeScaling.Mode)) + ' is out of scope for v1 ' +
+        '(only none / linear).');
+
+    // ---- gemma2 numeric deltas (the reader keys these under gemma2.*) ----
+    // EmbedScale / RMSNormAddOne / SandwichNorm / AltSlidingWindow are
+    // re-derived from general.architecture "gemma2" on read and need no key;
+    // only the per-model numbers are emitted. The 1:1 local/global pattern is
+    // implied by the architecture (the reader sets AltSlidingWindow), so the
+    // sliding_window key carries just the local window span.
+    if Gemma2 then
+    begin
+      Writer.AddMetaUInt32(MetaKey('attention.sliding_window'),
+        Config.SlidingWindow);
+      Writer.AddMetaFloat32(MetaKey('attention.query_pre_attn_scalar'),
+        Config.QueryPreAttnScalar);
+      Writer.AddMetaFloat32(MetaKey('attn_logit_softcapping'),
+        Config.AttnLogitSoftCap);
+      Writer.AddMetaFloat32(MetaKey('final_logit_softcapping'),
+        Config.FinalLogitSoftCap);
+    end;
+
+    // ---- a self-contained tokenizer block ----
+    // A supplied TNeuralHFTokenizer takes precedence over the plain Tokens
+    // array: it routes the full byte-level-BPE ("gpt2": vocab+merges+specials)
+    // or Unigram ("llama": vocab+scores) block through SaveTokenizerToGGUF, so
+    // a model exported this way reads back self-contained through
+    // TNeuralHFTokenizer.LoadFromGGUF. The plain Tokens array still emits the
+    // minimal SentencePiece "llama" block (id-indexed pieces, zero scores).
+    if Tokenizer <> nil then
+      Tokenizer.SaveTokenizerToGGUF(Writer)
+    else if Length(Tokens) > 0 then
+    begin
+      if Length(Tokens) <> Config.VocabSize then
+        ImportError('Llama GGUF export: ' + IntToStr(Length(Tokens)) +
+          ' tokens supplied but vocab_size is ' +
+          IntToStr(Config.VocabSize) + '.');
+      Writer.AddMetaString('tokenizer.ggml.model', 'llama');
+      Writer.AddMetaStringArray('tokenizer.ggml.tokens', Tokens);
+      SetLength(Scores, Length(Tokens));
+      SetLength(TokenTypes, Length(Tokens));
+      for i := 0 to High(Tokens) do
+      begin
+        Scores[i] := 0;
+        TokenTypes[i] := 1; // LLAMA_TOKEN_TYPE_NORMAL
+      end;
+      Writer.AddMetaFloat32Array('tokenizer.ggml.scores', Scores);
+      Writer.AddMetaInt32Array('tokenizer.ggml.token_type', TokenTypes);
+    end;
+
+    // ---- tensors (ggml-canonical names, dims reversed by the writer) ----
+    WriteMatrix(Prefix + 'embed_tokens.weight', 'token_embd.weight',
+      Config.VocabSize, Config.HiddenSize);
+    for b := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Prefix + 'layers.' + IntToStr(b) + '.';
+      GGUFBlock := 'blk.' + IntToStr(b) + '.';
+      WriteNorm(BlockPrefix + 'input_layernorm.weight',
+        GGUFBlock + 'attn_norm.weight', Config.HiddenSize);
+      // Gemma uses NEOX rope and is stored in HF row order, so its q/k rows are
+      // NOT permuted (no interleave); the interleaved-rope families (llama/
+      // qwen2) get the per-head row permutation that the reader undoes.
+      if Gemma2 then
+      begin
+        WriteMatrix(BlockPrefix + 'self_attn.q_proj.weight',
+          GGUFBlock + 'attn_q.weight', QWidth, Config.HiddenSize);
+        WriteMatrix(BlockPrefix + 'self_attn.k_proj.weight',
+          GGUFBlock + 'attn_k.weight', KVWidth, Config.HiddenSize);
+      end
+      else
+      begin
+        WriteQKMatrix(BlockPrefix + 'self_attn.q_proj.weight',
+          GGUFBlock + 'attn_q.weight', QWidth, Config.HiddenSize);
+        WriteQKMatrix(BlockPrefix + 'self_attn.k_proj.weight',
+          GGUFBlock + 'attn_k.weight', KVWidth, Config.HiddenSize);
+      end;
+      WriteMatrix(BlockPrefix + 'self_attn.v_proj.weight',
+        GGUFBlock + 'attn_v.weight', KVWidth, Config.HiddenSize);
+      // Qwen2 q/k/v projection biases (o_proj stays bias-free). q/k biases are
+      // permuted into the interleaved-rotary layout like their matrix rows.
+      if Config.QKVBias then
+      begin
+        WriteQKBias(BlockPrefix + 'self_attn.q_proj.bias',
+          GGUFBlock + 'attn_q.bias', QWidth);
+        WriteQKBias(BlockPrefix + 'self_attn.k_proj.bias',
+          GGUFBlock + 'attn_k.bias', KVWidth);
+        WriteBias(BlockPrefix + 'self_attn.v_proj.bias',
+          GGUFBlock + 'attn_v.bias', KVWidth);
+      end;
+      WriteMatrix(BlockPrefix + 'self_attn.o_proj.weight',
+        GGUFBlock + 'attn_output.weight', Config.HiddenSize, QWidth);
+      if Gemma2 then
+      begin
+        // Gemma-2 sandwich: post_attention_layernorm closes the attention
+        // branch (attn_norm above is its pre-norm); pre_feedforward_layernorm
+        // is the FFN pre-norm (the ggml "ffn_norm" slot) and
+        // post_feedforward_layernorm closes the FFN branch. These match the
+        // reader's blk.N.{post_attention_norm,ffn_norm,post_ffw_norm} renames.
+        WriteNorm(BlockPrefix + 'post_attention_layernorm.weight',
+          GGUFBlock + 'post_attention_norm.weight', Config.HiddenSize);
+        WriteNorm(BlockPrefix + 'pre_feedforward_layernorm.weight',
+          GGUFBlock + 'ffn_norm.weight', Config.HiddenSize);
+        WriteNorm(BlockPrefix + 'post_feedforward_layernorm.weight',
+          GGUFBlock + 'post_ffw_norm.weight', Config.HiddenSize);
+      end
+      else
+        WriteNorm(BlockPrefix + 'post_attention_layernorm.weight',
+          GGUFBlock + 'ffn_norm.weight', Config.HiddenSize);
+      WriteMatrix(BlockPrefix + 'mlp.gate_proj.weight',
+        GGUFBlock + 'ffn_gate.weight', Config.IntermediateSize,
+        Config.HiddenSize);
+      WriteMatrix(BlockPrefix + 'mlp.up_proj.weight',
+        GGUFBlock + 'ffn_up.weight', Config.IntermediateSize,
+        Config.HiddenSize);
+      WriteMatrix(BlockPrefix + 'mlp.down_proj.weight',
+        GGUFBlock + 'ffn_down.weight', Config.HiddenSize,
+        Config.IntermediateSize);
+    end;
+    WriteNorm(Prefix + 'norm.weight', 'output_norm.weight',
+      Config.HiddenSize);
+    // llama.cpp omits output.weight when the LM head is tied to the
+    // embeddings; mirror that so the round-trip infers TieWordEmbeddings.
+    if not Config.TieWordEmbeddings then
+      WriteMatrix('lm_head.weight', 'output.weight',
+        Config.VocabSize, Config.HiddenSize);
+
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
+procedure SaveLlamaToGGUF(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; const FileName: string);
+var
+  NoTokens: array of string;
+begin
+  SetLength(NoTokens, 0);
+  SaveLlamaToGGUFEx(Reader, Config, NoTokens, FileName, gwF32);
+end;
+
+procedure SaveLlamaToGGUFExWithTokenizer(Reader: TNNetSafeTensorsReader;
+  const Config: TLlamaConfig; Tokenizer: TNeuralHFTokenizer;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+var
+  NoTokens: array of string;
+begin
+  if Tokenizer = nil then
+    ImportError('SaveLlamaToGGUFExWithTokenizer: nil tokenizer.');
+  SetLength(NoTokens, 0);
+  SaveLlamaToGGUFEx(Reader, Config, NoTokens, FileName, pDType, Tokenizer);
+end;
+
+type
+  // In-memory HF-named tensor source: holds row-major F32 tensors handed to
+  // it (a private copy each) and serves them through the parent reader's
+  // metadata accessors (HasTensor/DimCount/...) + an overridden LoadTensorFlat.
+  // Built bare (CreateBare) so the parent never tries to parse a file; the
+  // FTensors table is populated with synthetic F32 entries whose byte offsets
+  // index FData rather than a stream. Lets the TNNet->GGUF exporter reuse the
+  // existing reader-source SaveLlamaToGGUFEx emitter verbatim. Coded by Claude
+  // (AI).
+  TNNetMemTensorReader = class(TNNetSafeTensorsReader)
+  private
+    FData: array of TNNetVolume;  // one volume per FTensors entry (owned)
+  public
+    constructor Create;
+    destructor Destroy; override;
+    // Adds a named row-major tensor (a private copy of Src is kept).
+    procedure AddTensor(const pName: string; const pShape: array of Int64;
+      Src: TNNetVolume);
+    procedure LoadTensorFlat(const pName: string;
+      Dest: TNNetVolume); override;
+  end;
+
+constructor TNNetMemTensorReader.Create;
+begin
+  inherited CreateBare;
+  FFileName := '<in-memory TNNet weights>';
+end;
+
+destructor TNNetMemTensorReader.Destroy;
+var
+  i: integer;
+begin
+  for i := 0 to High(FData) do
+    FData[i].Free;
+  inherited Destroy;
+end;
+
+procedure TNNetMemTensorReader.AddTensor(const pName: string;
+  const pShape: array of Int64; Src: TNNetVolume);
+var
+  Idx, i: integer;
+  Elems: Int64;
+  V: TNNetVolume;
+begin
+  if HasTensor(pName) then
+    ImportError('TNNet GGUF export: duplicate tensor "' + pName + '".');
+  Elems := 1;
+  for i := 0 to High(pShape) do Elems := Elems * pShape[i];
+  if Elems <> Src.Size then
+    ImportError('TNNet GGUF export: tensor "' + pName + '" shape product ' +
+      IntToStr(Elems) + ' <> source element count ' + IntToStr(Src.Size) + '.');
+  Idx := Length(FData);
+  SetLength(FData, Idx + 1);
+  V := TNNetVolume.Create;
+  V.Copy(Src);
+  FData[Idx] := V;
+  SetLength(FTensors, Idx + 1);
+  FTensors[Idx].Name := pName;
+  FTensors[Idx].DType := 'F32';
+  SetLength(FTensors[Idx].Shape, Length(pShape));
+  for i := 0 to High(pShape) do FTensors[Idx].Shape[i] := pShape[i];
+  // Byte offsets are unused by the override below, but keep them consistent.
+  FTensors[Idx].DataBegin := 0;
+  FTensors[Idx].DataEnd := Elems * 4;
+  FTensors[Idx].Shard := 0;
+end;
+
+procedure TNNetMemTensorReader.LoadTensorFlat(const pName: string;
+  Dest: TNNetVolume);
+var
+  Idx: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    ImportError('TNNet GGUF export: tensor "' + pName + '" not found.');
+  Dest.Copy(FData[Idx]);
+end;
+
+// Walks a wired plain-Llama TNNet and emits every load-bearing weight into a
+// fresh TNNetMemTensorReader under its EXACT HuggingFace tensor name, undoing
+// each transform BuildLlamaFromSafeTensors applied on import: the interleaved
+// rotate_half q/k de-permutation, the SwiGLU gate|up un-fusion, and the Gemma
+// RMSNorm +1 gain offset. The returned reader is the in-memory equivalent of
+// the original HF safetensors checkpoint (row-major [out,in] linear matrices,
+// [d] norm gains, [vocab,hidden] embedding) and is shared by the GGUF and
+// safetensors TNNet exporters. Caller owns the result. Coded by Claude (AI).
+function BuildLlamaMemTensorReader(Net: TNNet;
+  const Config: TLlamaConfig): TNNetMemTensorReader;
+var
+  Reader: TNNetMemTensorReader;
+  HeadDim, QWidth, KVWidth, b, j, c: integer;
+  HalfDim, h, k, IntSize: integer;
+  NormGainOffset: TNeuralFloat;
+  Linears, Norms: array of TNNetLayer;
+  Embed: TNNetLayer;
+  Lay: TNNetLayer;
+  i: integer;
+  V: TNNetVolume;
+  BlockPrefix: string;
+
+  // Reads a bias-free [OutDim, InDim] PointwiseConvLinear back into a flat
+  // row-major [OutDim*InDim] volume (neuron j weight i = W[j*InDim+i]).
+  procedure DumpLinear(Layer: TNNetLayer; OutDim, InDim: integer;
+    const HFName: string);
+  var
+    jj, ii: integer;
+  begin
+    if Layer.Neurons.Count <> OutDim then
+      ImportError('TNNet GGUF export: layer for "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+        IntToStr(OutDim) + '.');
+    V.ReSize(OutDim * InDim, 1, 1);
+    for jj := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[jj].Weights.Size <> InDim then
+        ImportError('TNNet GGUF export: neuron ' + IntToStr(jj) + ' of "' +
+          HFName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for ii := 0 to InDim - 1 do
+        V.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+    end;
+    Reader.AddTensor(HFName, [OutDim, InDim], V);
+  end;
+
+  // Reads a TokenRMSNorm gain [d] back (un-folding the Gemma +offset).
+  procedure DumpNorm(Layer: TNNetLayer; d: integer; const HFName: string);
+  var
+    ii: integer;
+  begin
+    if Layer.Neurons[0].Weights.Size < d then
+      ImportError('TNNet GGUF export: norm "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' gains, expected >= ' +
+        IntToStr(d) + '.');
+    V.ReSize(d, 1, 1);
+    for ii := 0 to d - 1 do
+      V.FData[ii] := Layer.Neurons[0].Weights.FData[ii] - NormGainOffset;
+    Reader.AddTensor(HFName, [d], V);
+  end;
+
+begin
+  // ---- reject the out-of-scope architecture deltas (mirror SaveLlamaToGGUFEx
+  //      so the wired stack is guaranteed to be the plain-Llama layout this
+  //      walker understands; the emitter rejects them again, but a clear
+  //      message here precedes the layer walk) ----
+  if Config.IsMoE then
+    ImportError('TNNet GGUF export: MoE models are out of scope for v1.');
+  if Config.FusedQKVGateUp or Config.FusedGateUp then
+    ImportError('TNNet GGUF export: fused qkv/gate-up projections are out ' +
+      'of scope for v1.');
+  if Config.SandwichNorm or Config.GLM4SandwichNorm or
+     Config.PostNormReordered then
+    ImportError('TNNet GGUF export: sandwich/reordered norms are out of ' +
+      'scope for v1.');
+  if Config.QKNorm or Config.QKNormFullWidth then
+    ImportError('TNNet GGUF export: q/k RMSNorm models are out of scope ' +
+      'for v1.');
+  if Config.QKVBias then
+    ImportError('TNNet GGUF export: q/k/v projection biases are out of ' +
+      'scope for v1.');
+  if (Config.PartialRotaryFactor > 0) and (Config.PartialRotaryFactor < 1) then
+    ImportError('TNNet GGUF export: partial rotary is out of scope for v1.');
+  if Config.InterleavedRotary then
+    ImportError('TNNet GGUF export: interleaved-rotary families are out of ' +
+      'scope for v1.');
+  if Config.GegluFFN then
+    ImportError('TNNet GGUF export: gated-GELU FFN (Gemma) is out of scope ' +
+      'for v1.');
+  if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1) then
+    ImportError('TNNet GGUF export: embedding scaling (Gemma) is out of ' +
+      'scope for v1.');
+  if (Config.QueryPreAttnScalar <> 0) or (Config.AttnLogitSoftCap <> 0) or
+     (Config.FinalLogitSoftCap <> 0) then
+    ImportError('TNNet GGUF export: Gemma-2 score scaling / soft-capping ' +
+      'is out of scope for v1.');
+  if Config.RopeLocalTheta > 0 then
+    ImportError('TNNet GGUF export: per-layer RoPE theta (Gemma-3) is out ' +
+      'of scope for v1.');
+
+  if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+  else HeadDim := Config.HiddenSize div Config.NumHeads;
+  QWidth := Config.NumHeads * HeadDim;
+  KVWidth := Config.NumKVHeads * HeadDim;
+  HalfDim := HeadDim div 2;
+  IntSize := Config.IntermediateSize;
+  if Config.RMSNormAddOne then NormGainOffset := 1.0 else NormGainOffset := 0;
+
+  // ---- collect the load-bearing layers in net order. For the plain-Llama
+  //      stack the only TNNetPointwiseConvLinear layers are, per block,
+  //      QProj/KProj/VProj/OProj then GateUp/Down (6), followed by the LM
+  //      head; the only TNNetTokenRMSNorm layers are AttnNorm/MlpNorm per
+  //      block (2) then the final norm. Per-head slices are TNNetSplitChannels
+  //      so they do not pollute either list. ----
+  Embed := nil;
+  SetLength(Linears, 0);
+  SetLength(Norms, 0);
+  for i := 0 to Net.Layers.Count - 1 do
+  begin
+    Lay := Net.Layers[i];
+    if Lay is TNNetEmbedding then
+    begin
+      if Embed <> nil then
+        ImportError('TNNet GGUF export: more than one TNNetEmbedding layer ' +
+          '- not the plain-Llama stack this exporter understands.');
+      Embed := Lay;
+    end
+    else if Lay is TNNetPointwiseConvLinear then
+    begin
+      SetLength(Linears, Length(Linears) + 1);
+      Linears[High(Linears)] := Lay;
+    end
+    else if Lay is TNNetTokenRMSNorm then
+    begin
+      SetLength(Norms, Length(Norms) + 1);
+      Norms[High(Norms)] := Lay;
+    end;
+  end;
+  if Embed = nil then
+    ImportError('TNNet GGUF export: no TNNetEmbedding layer found - not a ' +
+      'Llama TNNet stack?');
+  if Length(Linears) <> Config.NumLayers * 6 + 1 then
+    ImportError('TNNet GGUF export: found ' + IntToStr(Length(Linears)) +
+      ' linear projections, expected ' + IntToStr(Config.NumLayers * 6 + 1) +
+      ' (6 per block + LM head) - not the plain-Llama stack, or wrong ' +
+      'num_hidden_layers in Config.');
+  if Length(Norms) <> Config.NumLayers * 2 + 1 then
+    ImportError('TNNet GGUF export: found ' + IntToStr(Length(Norms)) +
+      ' RMSNorms, expected ' + IntToStr(Config.NumLayers * 2 + 1) +
+      ' (2 per block + final norm).');
+
+  Result := TNNetMemTensorReader.Create;
+  Reader := Result;
+  V := TNNetVolume.Create;
+  try
+    // ---- token embedding table [vocab, hidden] (row-major, straight) ----
+    if Embed.Neurons[0].Weights.Size <> Config.VocabSize * Config.HiddenSize then
+      ImportError('TNNet GGUF export: embedding table has ' +
+        IntToStr(Embed.Neurons[0].Weights.Size) + ' elements, expected ' +
+        IntToStr(Config.VocabSize * Config.HiddenSize) + '.');
+    V.Copy(Embed.Neurons[0].Weights);
+    Reader.AddTensor('model.embed_tokens.weight',
+      [Config.VocabSize, Config.HiddenSize], V);
+
+    for b := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := 'model.layers.' + IntToStr(b) + '.';
+      // attn_norm = AttnNorm (norm 2*b), ffn_norm = MlpNorm (norm 2*b+1).
+      DumpNorm(Norms[2 * b], Config.HiddenSize,
+        BlockPrefix + 'input_layernorm.weight');
+      DumpNorm(Norms[2 * b + 1], Config.HiddenSize,
+        BlockPrefix + 'post_attention_layernorm.weight');
+
+      // Q/K/V/O = Linears[6*b .. 6*b+3]; GateUp/Down = Linears[6*b+4..+5].
+      // The q/k neurons are in the interleaved-rotary layout the loader
+      // produced; DE-permute back to HF rotate_half so SaveLlamaToGGUFEx's
+      // WriteQKMatrix re-permutes to the exact ggml order (round-trips the
+      // reader-source path). HF row (head h, within-head k): the interleaved
+      // neuron row is 2k if k<half else 2(k-half)+1.
+      // --- q_proj ---
+      Lay := Linears[6 * b];
+      if Lay.Neurons.Count <> QWidth then
+        ImportError('TNNet GGUF export: q_proj block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(QWidth) + '.');
+      V.ReSize(QWidth * Config.HiddenSize, 1, 1);
+      for h := 0 to Config.NumHeads - 1 do
+        for k := 0 to HeadDim - 1 do
+        begin
+          if k < HalfDim then j := h * HeadDim + 2 * k
+          else j := h * HeadDim + 2 * (k - HalfDim) + 1;
+          for c := 0 to Config.HiddenSize - 1 do
+            V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
+              Lay.Neurons[j].Weights.FData[c];
+        end;
+      Reader.AddTensor(BlockPrefix + 'self_attn.q_proj.weight',
+        [QWidth, Config.HiddenSize], V);
+      // --- k_proj ---
+      Lay := Linears[6 * b + 1];
+      if Lay.Neurons.Count <> KVWidth then
+        ImportError('TNNet GGUF export: k_proj block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(KVWidth) + '.');
+      V.ReSize(KVWidth * Config.HiddenSize, 1, 1);
+      for h := 0 to Config.NumKVHeads - 1 do
+        for k := 0 to HeadDim - 1 do
+        begin
+          if k < HalfDim then j := h * HeadDim + 2 * k
+          else j := h * HeadDim + 2 * (k - HalfDim) + 1;
+          for c := 0 to Config.HiddenSize - 1 do
+            V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
+              Lay.Neurons[j].Weights.FData[c];
+        end;
+      Reader.AddTensor(BlockPrefix + 'self_attn.k_proj.weight',
+        [KVWidth, Config.HiddenSize], V);
+      // --- v_proj / o_proj (straight) ---
+      DumpLinear(Linears[6 * b + 2], KVWidth, Config.HiddenSize,
+        BlockPrefix + 'self_attn.v_proj.weight');
+      DumpLinear(Linears[6 * b + 3], Config.HiddenSize, QWidth,
+        BlockPrefix + 'self_attn.o_proj.weight');
+
+      // --- SwiGLU fused gate|up -> un-fuse into ffn_up / ffn_gate ---
+      // The loader packs up_proj into neurons 0..I-1 and gate_proj into
+      // neurons I..2I-1 (TNNetSwiGLU = up * silu(gate)). Split them back.
+      Lay := Linears[6 * b + 4];
+      if Lay.Neurons.Count <> 2 * IntSize then
+        ImportError('TNNet GGUF export: fused gate|up block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(2 * IntSize) + '.');
+      // up_proj = neurons 0..I-1
+      V.ReSize(IntSize * Config.HiddenSize, 1, 1);
+      for j := 0 to IntSize - 1 do
+        for c := 0 to Config.HiddenSize - 1 do
+          V.FData[j * Config.HiddenSize + c] := Lay.Neurons[j].Weights.FData[c];
+      Reader.AddTensor(BlockPrefix + 'mlp.up_proj.weight',
+        [IntSize, Config.HiddenSize], V);
+      // gate_proj = neurons I..2I-1
+      V.ReSize(IntSize * Config.HiddenSize, 1, 1);
+      for j := 0 to IntSize - 1 do
+        for c := 0 to Config.HiddenSize - 1 do
+          V.FData[j * Config.HiddenSize + c] :=
+            Lay.Neurons[IntSize + j].Weights.FData[c];
+      Reader.AddTensor(BlockPrefix + 'mlp.gate_proj.weight',
+        [IntSize, Config.HiddenSize], V);
+      // --- down_proj (straight) ---
+      DumpLinear(Linears[6 * b + 5], Config.HiddenSize, IntSize,
+        BlockPrefix + 'mlp.down_proj.weight');
+    end;
+
+    // ---- final norm + LM head ----
+    DumpNorm(Norms[High(Norms)], Config.HiddenSize, 'model.norm.weight');
+    if not Config.TieWordEmbeddings then
+      DumpLinear(Linears[High(Linears)], Config.VocabSize, Config.HiddenSize,
+        'lm_head.weight');
+    // (tied head: omit lm_head.weight - SaveLlamaToGGUFEx mirrors llama.cpp by
+    //  also omitting output.weight, so the round-trip re-infers the tie.)
+  except
+    V.Free;
+    Result.Free;
+    raise;
+  end;
+  V.Free;
+end;
+
+procedure SaveTNNetLlamaToGGUFEx(Net: TNNet;
+  const Config: TLlamaConfig; const Tokens: array of string;
+  const FileName: string; pDType: TGGUFWriteDType = gwF32);
+var
+  Reader: TNNetMemTensorReader;
+begin
+  // Re-derive the HF-named weights from the wired layers, then ride the
+  // existing reader-source emitter (shared q/k re-permute, reversed dims,
+  // F32/F16/Q8_0, metadata + tokenizer block).
+  Reader := BuildLlamaMemTensorReader(Net, Config);
+  try
+    SaveLlamaToGGUFEx(Reader, Config, Tokens, FileName, pDType);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure SaveTNNetLlamaToGGUF(Net: TNNet;
+  const Config: TLlamaConfig; const FileName: string);
+var
+  NoTokens: array of string;
+begin
+  SetLength(NoTokens, 0);
+  SaveTNNetLlamaToGGUFEx(Net, Config, NoTokens, FileName, gwF32);
+end;
+
+// HF-names safetensors exporter - the exact inverse of
+// BuildLlamaFromSafeTensors. Re-derives the HF-named weight set from the wired
+// layers (the SAME in-memory reader the GGUF exporter uses, so the q/k
+// rotate_half de-permutation, SwiGLU gate|up un-fusion and Gemma RMSNorm gain
+// offset are undone identically) and writes it to a .safetensors file under
+// the precise model.embed_tokens / model.layers.N.* / model.norm / lm_head
+// names BuildLlamaFromSafeTensors reads. Linear matrices are emitted [out,in]
+// row-major (plain nn.Linear, NOT the GPT-2 Conv1D [in,out] transpose) and
+// norm gains as [d], so a re-import is bit-identical. Tied-embedding models
+// omit lm_head.weight (the importer re-infers the tie from
+// config.tie_word_embeddings). The matching config.json must accompany the
+// file at import (this writes weights only, like the GPT-2 exporter).
+// Coded by Claude (AI).
+procedure SaveLlamaToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Reader: TNNetMemTensorReader;
+  Writer: TNNetSafeTensorsWriter;
+  V: TNNetVolume;
+  i, d, Dims: integer;
+  Shape: array of Int64;
+  TName: string;
+begin
+  Reader := BuildLlamaMemTensorReader(Net, Config);
+  V := TNNetVolume.Create;
+  try
+    Writer := TNNetSafeTensorsWriter.Create(FileName);
+    try
+      Writer.SetMetadata('format', 'pt');
+      Writer.SetMetadata('exporter', 'cai-neural-api/llama');
+      // Drain every HF-named tensor the walk produced, preserving its shape.
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TName := Reader.TensorName(i);
+        Dims := Reader.DimCount(TName);
+        SetLength(Shape, Dims);
+        for d := 0 to Dims - 1 do
+          Shape[d] := Reader.DimSize(TName, d);
+        Reader.LoadTensorFlat(TName, V);
+        Writer.AddTensorFlat(TName, Shape, V, pDType);
+      end;
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+  finally
+    V.Free;
+    Reader.Free;
+  end;
+end;
+
+// Re-derives the HF-named Qwen3 weight set (row-major [out,in] linears,
+// [d] norm gains, per-head [head_dim] q_norm/k_norm gains, [vocab,hidden]
+// embedding) from a wired Qwen3 TNNet, undoing every transform
+// BuildQwen3FromSafeTensors applied: the interleaved rotate_half q/k
+// de-permutation, the SwiGLU gate|up un-fusion, and the per-head q/k RMSNorm
+// gain un-permutation. This is the Qwen3 sibling of BuildLlamaMemTensorReader
+// (which rejects QKNorm); the Llama walker cannot be reused because the
+// per-head TNNetTokenRMSNorm copies are interleaved with the block norms in
+// net order (AttnNorm, K-norms, Q-norms, MlpNorm per block). The returned
+// reader is the in-memory equivalent of the original HF safetensors
+// checkpoint. Caller owns the result. Coded by Claude (AI).
+function BuildQwen3MemTensorReader(Net: TNNet;
+  const Config: TLlamaConfig): TNNetMemTensorReader;
+var
+  Reader: TNNetMemTensorReader;
+  HeadDim, QWidth, KVWidth, HalfDim, IntSize: integer;
+  b, j, c, h, k, i: integer;
+  Linears, Norms: array of TNNetLayer;
+  Embed, Lay: TNNetLayer;
+  V: TNNetVolume;
+  BlockPrefix: string;
+  NormsPerBlock: integer;
+
+  // Reads a bias-free [OutDim, InDim] PointwiseConvLinear back into a flat
+  // row-major [OutDim*InDim] volume (neuron j weight i = W[j*InDim+i]).
+  procedure DumpLinear(Layer: TNNetLayer; OutDim, InDim: integer;
+    const HFName: string);
+  var
+    jj, ii: integer;
+  begin
+    if Layer.Neurons.Count <> OutDim then
+      ImportError('TNNet Qwen3 export: layer for "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+        IntToStr(OutDim) + '.');
+    V.ReSize(OutDim * InDim, 1, 1);
+    for jj := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[jj].Weights.Size <> InDim then
+        ImportError('TNNet Qwen3 export: neuron ' + IntToStr(jj) + ' of "' +
+          HFName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for ii := 0 to InDim - 1 do
+        V.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+    end;
+    Reader.AddTensor(HFName, [OutDim, InDim], V);
+  end;
+
+  // Reads a TokenRMSNorm gain [d] back straight (Qwen3 has no gain offset).
+  procedure DumpNorm(Layer: TNNetLayer; d: integer; const HFName: string);
+  var
+    ii: integer;
+  begin
+    if Layer.Neurons[0].Weights.Size < d then
+      ImportError('TNNet Qwen3 export: norm "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' gains, expected >= ' +
+        IntToStr(d) + '.');
+    V.ReSize(d, 1, 1);
+    for ii := 0 to d - 1 do
+      V.FData[ii] := Layer.Neurons[0].Weights.FData[ii];
+    Reader.AddTensor(HFName, [d], V);
+  end;
+
+  // Reads a per-head q/k RMSNorm [head_dim] gain back, de-permuting the
+  // rotate_half order LoadLlamaHeadRMSNormWeights applied (stored channel
+  // 2k <- HF k for k<half, 2(k-half)+1 <- HF k for k>=half). The shared
+  // gain is identical in every head copy, so the first copy is sufficient.
+  procedure DumpHeadNorm(Layer: TNNetLayer; const HFName: string);
+  var
+    kk, src: integer;
+  begin
+    if Layer.Neurons[0].Weights.Size < HeadDim then
+      ImportError('TNNet Qwen3 export: head norm "' + HFName + '" has ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' gains, expected >= ' +
+        IntToStr(HeadDim) + '.');
+    V.ReSize(HeadDim, 1, 1);
+    for kk := 0 to HeadDim - 1 do
+    begin
+      if kk < HalfDim then src := 2 * kk
+      else src := 2 * (kk - HalfDim) + 1;
+      V.FData[kk] := Layer.Neurons[0].Weights.FData[src];
+    end;
+    Reader.AddTensor(HFName, [HeadDim], V);
+  end;
+
+begin
+  // ---- reject the out-of-scope architecture deltas. Qwen3 is the plain
+  //      Llama stack PLUS per-head q/k RMSNorm (QKNorm); everything else
+  //      (MoE, fused projections, sandwich norms, partial/interleaved rotary,
+  //      GeGLU, embed scaling, Gemma score scaling, per-layer rope theta,
+  //      full-width q/k norm, q/k/v bias) is out of scope for this exporter. ----
+  if not Config.QKNorm then
+    ImportError('TNNet Qwen3 export: Config.QKNorm must be true (this is the '
+      + 'Qwen3 per-head q/k RMSNorm exporter; use SaveLlamaToSafeTensors for '
+      + 'plain-Llama stacks).');
+  if Config.IsMoE then
+    ImportError('TNNet Qwen3 export: MoE models (qwen3_moe) are out of scope.');
+  if Config.FusedQKVGateUp or Config.FusedGateUp then
+    ImportError('TNNet Qwen3 export: fused qkv/gate-up projections are out ' +
+      'of scope.');
+  if Config.SandwichNorm or Config.GLM4SandwichNorm or
+     Config.PostNormReordered then
+    ImportError('TNNet Qwen3 export: sandwich/reordered norms are out of scope.');
+  if Config.QKNormFullWidth then
+    ImportError('TNNet Qwen3 export: full-width q/k RMSNorm (OLMo-2) is out ' +
+      'of scope.');
+  if Config.QKVBias then
+    ImportError('TNNet Qwen3 export: q/k/v projection biases are out of scope.');
+  if (Config.PartialRotaryFactor > 0) and (Config.PartialRotaryFactor < 1) then
+    ImportError('TNNet Qwen3 export: partial rotary is out of scope.');
+  if Config.InterleavedRotary then
+    ImportError('TNNet Qwen3 export: interleaved-rotary families are out of ' +
+      'scope.');
+  if Config.GegluFFN then
+    ImportError('TNNet Qwen3 export: gated-GELU FFN is out of scope.');
+  if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1) then
+    ImportError('TNNet Qwen3 export: embedding scaling is out of scope.');
+  if (Config.QueryPreAttnScalar <> 0) or (Config.AttnLogitSoftCap <> 0) or
+     (Config.FinalLogitSoftCap <> 0) then
+    ImportError('TNNet Qwen3 export: score scaling / soft-capping is out of ' +
+      'scope.');
+  if Config.RopeLocalTheta > 0 then
+    ImportError('TNNet Qwen3 export: per-layer RoPE theta is out of scope.');
+
+  if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+  else HeadDim := Config.HiddenSize div Config.NumHeads;
+  QWidth := Config.NumHeads * HeadDim;
+  KVWidth := Config.NumKVHeads * HeadDim;
+  HalfDim := HeadDim div 2;
+  IntSize := Config.IntermediateSize;
+  // Per block: AttnNorm (1) + K-norms (NumKVHeads) + Q-norms (NumHeads) +
+  // MlpNorm (1), in that net order; plus one final norm.
+  NormsPerBlock := 2 + Config.NumHeads + Config.NumKVHeads;
+
+  // ---- collect linears and norms in net order. Linears per block are
+  //      Q/K/V/O/GateUp/Down (6) like plain Llama, then the LM head; the
+  //      norms are the interleaved block + per-head set above. Per-head q/k
+  //      slices are TNNetSplitChannels so only the genuine norms land here. ----
+  Embed := nil;
+  SetLength(Linears, 0);
+  SetLength(Norms, 0);
+  for i := 0 to Net.Layers.Count - 1 do
+  begin
+    Lay := Net.Layers[i];
+    if Lay is TNNetEmbedding then
+    begin
+      if Embed <> nil then
+        ImportError('TNNet Qwen3 export: more than one TNNetEmbedding layer.');
+      Embed := Lay;
+    end
+    else if Lay is TNNetPointwiseConvLinear then
+    begin
+      SetLength(Linears, Length(Linears) + 1);
+      Linears[High(Linears)] := Lay;
+    end
+    else if Lay is TNNetTokenRMSNorm then
+    begin
+      SetLength(Norms, Length(Norms) + 1);
+      Norms[High(Norms)] := Lay;
+    end;
+  end;
+  if Embed = nil then
+    ImportError('TNNet Qwen3 export: no TNNetEmbedding layer found - not a ' +
+      'Qwen3 TNNet stack?');
+  if Length(Linears) <> Config.NumLayers * 6 + 1 then
+    ImportError('TNNet Qwen3 export: found ' + IntToStr(Length(Linears)) +
+      ' linear projections, expected ' + IntToStr(Config.NumLayers * 6 + 1) +
+      ' (6 per block + LM head).');
+  if Length(Norms) <> Config.NumLayers * NormsPerBlock + 1 then
+    ImportError('TNNet Qwen3 export: found ' + IntToStr(Length(Norms)) +
+      ' RMSNorms, expected ' + IntToStr(Config.NumLayers * NormsPerBlock + 1) +
+      ' (1 attn + ' + IntToStr(Config.NumKVHeads) + ' k_norm + ' +
+      IntToStr(Config.NumHeads) + ' q_norm per block + final norm).');
+
+  Result := TNNetMemTensorReader.Create;
+  Reader := Result;
+  V := TNNetVolume.Create;
+  try
+    // ---- token embedding table [vocab, hidden] (row-major, straight) ----
+    if Embed.Neurons[0].Weights.Size <> Config.VocabSize * Config.HiddenSize then
+      ImportError('TNNet Qwen3 export: embedding table has ' +
+        IntToStr(Embed.Neurons[0].Weights.Size) + ' elements, expected ' +
+        IntToStr(Config.VocabSize * Config.HiddenSize) + '.');
+    V.Copy(Embed.Neurons[0].Weights);
+    Reader.AddTensor('model.embed_tokens.weight',
+      [Config.VocabSize, Config.HiddenSize], V);
+
+    for b := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := 'model.layers.' + IntToStr(b) + '.';
+      // Norm group for this block: base = b * NormsPerBlock.
+      //   [base]                           = AttnNorm (input_layernorm)
+      //   [base+1 .. +NumKVHeads]          = K-norms  (k_norm, shared gain)
+      //   [base+1+NumKVHeads .. +NumHeads] = Q-norms  (q_norm, shared gain)
+      //   [base+1+NumKVHeads+NumHeads]     = MlpNorm  (post_attention_ln)
+      DumpNorm(Norms[b * NormsPerBlock], Config.HiddenSize,
+        BlockPrefix + 'input_layernorm.weight');
+      DumpNorm(Norms[b * NormsPerBlock + 1 + Config.NumKVHeads +
+        Config.NumHeads], Config.HiddenSize,
+        BlockPrefix + 'post_attention_layernorm.weight');
+      // q/k RMSNorm shared [head_dim] gain (first head copy is canonical).
+      DumpHeadNorm(Norms[b * NormsPerBlock + 1],
+        BlockPrefix + 'self_attn.k_norm.weight');
+      DumpHeadNorm(Norms[b * NormsPerBlock + 1 + Config.NumKVHeads],
+        BlockPrefix + 'self_attn.q_norm.weight');
+
+      // Q/K/V/O = Linears[6*b .. 6*b+3]; GateUp/Down = Linears[6*b+4..+5].
+      // The q/k neurons are in the interleaved-rotary layout the loader
+      // produced; DE-permute back to HF rotate_half (HF row k -> interleaved
+      // neuron row 2k if k<half else 2(k-half)+1).
+      // --- q_proj ---
+      Lay := Linears[6 * b];
+      if Lay.Neurons.Count <> QWidth then
+        ImportError('TNNet Qwen3 export: q_proj block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(QWidth) + '.');
+      V.ReSize(QWidth * Config.HiddenSize, 1, 1);
+      for h := 0 to Config.NumHeads - 1 do
+        for k := 0 to HeadDim - 1 do
+        begin
+          if k < HalfDim then j := h * HeadDim + 2 * k
+          else j := h * HeadDim + 2 * (k - HalfDim) + 1;
+          for c := 0 to Config.HiddenSize - 1 do
+            V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
+              Lay.Neurons[j].Weights.FData[c];
+        end;
+      Reader.AddTensor(BlockPrefix + 'self_attn.q_proj.weight',
+        [QWidth, Config.HiddenSize], V);
+      // --- k_proj ---
+      Lay := Linears[6 * b + 1];
+      if Lay.Neurons.Count <> KVWidth then
+        ImportError('TNNet Qwen3 export: k_proj block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(KVWidth) + '.');
+      V.ReSize(KVWidth * Config.HiddenSize, 1, 1);
+      for h := 0 to Config.NumKVHeads - 1 do
+        for k := 0 to HeadDim - 1 do
+        begin
+          if k < HalfDim then j := h * HeadDim + 2 * k
+          else j := h * HeadDim + 2 * (k - HalfDim) + 1;
+          for c := 0 to Config.HiddenSize - 1 do
+            V.FData[(h * HeadDim + k) * Config.HiddenSize + c] :=
+              Lay.Neurons[j].Weights.FData[c];
+        end;
+      Reader.AddTensor(BlockPrefix + 'self_attn.k_proj.weight',
+        [KVWidth, Config.HiddenSize], V);
+      // --- v_proj / o_proj (straight) ---
+      DumpLinear(Linears[6 * b + 2], KVWidth, Config.HiddenSize,
+        BlockPrefix + 'self_attn.v_proj.weight');
+      DumpLinear(Linears[6 * b + 3], Config.HiddenSize, QWidth,
+        BlockPrefix + 'self_attn.o_proj.weight');
+
+      // --- SwiGLU fused gate|up -> un-fuse into mlp.up / mlp.gate ---
+      // The loader packs up_proj into neurons 0..I-1 and gate_proj into
+      // neurons I..2I-1 (TNNetSwiGLU = up * silu(gate)). Split them back.
+      Lay := Linears[6 * b + 4];
+      if Lay.Neurons.Count <> 2 * IntSize then
+        ImportError('TNNet Qwen3 export: fused gate|up block ' + IntToStr(b) +
+          ' has ' + IntToStr(Lay.Neurons.Count) + ' neurons, expected ' +
+          IntToStr(2 * IntSize) + '.');
+      // up_proj = neurons 0..I-1
+      V.ReSize(IntSize * Config.HiddenSize, 1, 1);
+      for j := 0 to IntSize - 1 do
+        for c := 0 to Config.HiddenSize - 1 do
+          V.FData[j * Config.HiddenSize + c] := Lay.Neurons[j].Weights.FData[c];
+      Reader.AddTensor(BlockPrefix + 'mlp.up_proj.weight',
+        [IntSize, Config.HiddenSize], V);
+      // gate_proj = neurons I..2I-1
+      V.ReSize(IntSize * Config.HiddenSize, 1, 1);
+      for j := 0 to IntSize - 1 do
+        for c := 0 to Config.HiddenSize - 1 do
+          V.FData[j * Config.HiddenSize + c] :=
+            Lay.Neurons[IntSize + j].Weights.FData[c];
+      Reader.AddTensor(BlockPrefix + 'mlp.gate_proj.weight',
+        [IntSize, Config.HiddenSize], V);
+      // --- down_proj (straight) ---
+      DumpLinear(Linears[6 * b + 5], Config.HiddenSize, IntSize,
+        BlockPrefix + 'mlp.down_proj.weight');
+    end;
+
+    // ---- final norm + LM head ----
+    DumpNorm(Norms[High(Norms)], Config.HiddenSize, 'model.norm.weight');
+    if not Config.TieWordEmbeddings then
+      DumpLinear(Linears[High(Linears)], Config.VocabSize, Config.HiddenSize,
+        'lm_head.weight');
+  except
+    V.Free;
+    Result.Free;
+    raise;
+  end;
+  V.Free;
+end;
+
+procedure SaveQwen3ToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Reader: TNNetMemTensorReader;
+  Writer: TNNetSafeTensorsWriter;
+  V: TNNetVolume;
+  i, d, Dims: integer;
+  Shape: array of Int64;
+  TName: string;
+begin
+  Reader := BuildQwen3MemTensorReader(Net, Config);
+  V := TNNetVolume.Create;
+  try
+    Writer := TNNetSafeTensorsWriter.Create(FileName);
+    try
+      Writer.SetMetadata('format', 'pt');
+      Writer.SetMetadata('exporter', 'cai-neural-api/qwen3');
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TName := Reader.TensorName(i);
+        Dims := Reader.DimCount(TName);
+        SetLength(Shape, Dims);
+        for d := 0 to Dims - 1 do
+          Shape[d] := Reader.DimSize(TName, d);
+        Reader.LoadTensorFlat(TName, V);
+        Writer.AddTensorFlat(TName, Shape, V, pDType);
+      end;
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+  finally
+    V.Free;
+    Reader.Free;
+  end;
+end;
+
+// Inverse of BuildBertFromSafeTensors: walks the wired encoder in the
+// importer's build order, recovers each HF-named tensor and writes it with
+// the EXACT inverse of every load transform, then saves the .safetensors.
+//   - embeddings.word/token_type: [vocab/type, hidden] straight from the
+//     single-neuron embedding tables (TNNetEmbedding).
+//   - embeddings.position: the structural table carries only the USABLE rows
+//     (checkpoint rows PositionOffset..MaxPositions-1); the first
+//     PositionOffset rows are padding positions the net never reads, so they
+//     are re-emitted as zeros (the importer skips them via SrcRowOffset).
+//   - LayerNorm: gamma=Neurons[0], beta=Neurons[1] (SaveLayerNormWeights).
+//   - q/k/v: un-fuse the [3*hidden] Q|K|V slab back into the three separate
+//     nn.Linear [hidden,hidden] (+bias) tensors - query=neurons 0..d-1,
+//     key=d..2d-1, value=2d..3d-1 - each stored [out,in] STRAIGHT (neuron j =
+//     row j, BiasWeight = bias[j]); NO Conv1D transpose (BERT is nn.Linear).
+//   - attention.output.dense / intermediate.dense / output.dense: straight
+//     [out,in] nn.Linear (+bias). The exact-erf-vs-tanh GELU is structural
+//     (no weights), so nothing to invert there.
+//   - pooler.dense: same straight [hidden,hidden] nn.Linear when present.
+// Coded by Claude (AI).
+procedure SaveBertToSafeTensors(Net: TNNet; const Config: TBertConfig;
+  const FileName: string; pIncludePooler: boolean = false;
+  pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  Embeds, LayerNorms, PwConvs: array of TNNetLayer;
+  WordEmb, TypeEmb, PosEmb, EmbLN: TNNetLayer;
+  V: TNNetVolume;
+  i, BlockCnt, PwBase, NumPw, ExpectPw, ExpectLN, ExpectEmb: integer;
+  d, IntSize, UsablePositions: integer;
+  BlockPrefix, QName, KName, VName, AttnDenseName, AttnLNName: string;
+  InterName, OutDenseName, OutLNName: string;
+
+  // Writes a HF nn.Linear [OutDim, InDim] weight (+bias [OutDim]) STRAIGHT
+  // from OutDim consecutive neurons of Layer starting at NeuronBase: neuron
+  // (NeuronBase+j) is checkpoint row j (weight i = W[j*InDim+i]), BiasWeight
+  // is bias[j]. The exact inverse of LoadLlamaLinearWeights with no rotary.
+  procedure DumpLinear(Layer: TNNetLayer; NeuronBase, OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+          ImportError('BERT export: neuron ' + IntToStr(NeuronBase + jj) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] :=
+            Layer.Neurons[NeuronBase + jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[NeuronBase + jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  IntSize := Config.IntermediateSize;
+  UsablePositions := Config.MaxPositions - Config.PositionOffset;
+  // ---- collect the load-bearing layers in net (= importer build) order ----
+  // Embeddings: WordEmb then (if TypeVocabSize>0) TypeEmb - both TNNetEmbedding
+  // - and the TNNetLearnedPositionalEmbedding position table. LayerNorms: EmbLN
+  // then AttnLN/OutLN per block. PointwiseConvLinear: QKV,AttnDense,Inter,
+  // OutDense per block, then the optional pooler.dense (the SDPA per-head
+  // attention adds SplitChannels, not PointwiseConvLinear).
+  SetLength(Embeds, 0);
+  SetLength(LayerNorms, 0);
+  SetLength(PwConvs, 0);
+  PosEmb := nil;
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetLearnedPositionalEmbedding then
+    begin
+      if PosEmb <> nil then
+        ImportError('BERT export: more than one positional-embedding layer.');
+      PosEmb := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetEmbedding then
+    begin
+      SetLength(Embeds, Length(Embeds) + 1);
+      Embeds[High(Embeds)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LayerNorms, Length(LayerNorms) + 1);
+      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if PosEmb = nil then
+    ImportError('BERT export: no TNNetLearnedPositionalEmbedding layer - ' +
+      'not a BuildBertFromSafeTensors encoder?');
+  if Config.TypeVocabSize > 0 then ExpectEmb := 2 else ExpectEmb := 1;
+  if Length(Embeds) <> ExpectEmb then
+    ImportError('BERT export: found ' + IntToStr(Length(Embeds)) +
+      ' TNNetEmbedding layers, expected ' + IntToStr(ExpectEmb) +
+      '.');
+  // Build order interleaves the word/type embeddings; the FIRST is word, the
+  // SECOND (when present) is token_type (see the importer).
+  WordEmb := Embeds[0];
+  if Config.TypeVocabSize > 0 then TypeEmb := Embeds[1] else TypeEmb := nil;
+  ExpectLN := 2 * Config.NumLayers + 1;        // EmbLN + AttnLN/OutLN per block
+  ExpectPw := 4 * Config.NumLayers;            // QKV,AttnDense,Inter,OutDense
+  if pIncludePooler then Inc(ExpectPw);        // + pooler.dense
+  if Length(LayerNorms) <> ExpectLN then
+    ImportError('BERT export: found ' + IntToStr(Length(LayerNorms)) +
+      ' LayerNorm layers, expected ' + IntToStr(ExpectLN) + ' for ' +
+      IntToStr(Config.NumLayers) + ' blocks.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('BERT export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) +
+      ' (4 per block + optional pooler). A classifier head (pSeqClsHead) is ' +
+      'out of scope for this exporter.');
+  EmbLN := LayerNorms[0];
+
+  V := TNNetVolume.Create;
+  try
+    Writer := TNNetSafeTensorsWriter.Create(FileName);
+    try
+      Writer.SetMetadata('format', 'pt');
+      Writer.SetMetadata('exporter', 'cai-neural-api/bert');
+      // ---- embeddings ----
+      if WordEmb.Neurons[0].Weights.Size <> Config.VocabSize * d then
+        ImportError('BERT export: word embedding size ' +
+          IntToStr(WordEmb.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+          IntToStr(Config.VocabSize * d) + '.');
+      Writer.AddTensorFlat(Config.Prefix + 'embeddings.word_embeddings.weight',
+        [Config.VocabSize, d], WordEmb.Neurons[0].Weights, pDType);
+      // Position table: the layer holds only UsablePositions rows = checkpoint
+      // rows PositionOffset..MaxPositions-1. Re-emit a full [MaxPositions,
+      // hidden] tensor with the first PositionOffset rows zeroed (never read).
+      if PosEmb.Neurons[0].Weights.Size <> UsablePositions * d then
+        ImportError('BERT export: position table size ' +
+          IntToStr(PosEmb.Neurons[0].Weights.Size) + ' <> usable*hidden = ' +
+          IntToStr(UsablePositions * d) + '.');
+      V.ReSize(Config.MaxPositions * d, 1, 1);
+      V.Fill(0);
+      for i := 0 to UsablePositions * d - 1 do
+        V.FData[Config.PositionOffset * d + i] :=
+          PosEmb.Neurons[0].Weights.FData[i];
+      Writer.AddTensorFlat(
+        Config.Prefix + 'embeddings.position_embeddings.weight',
+        [Config.MaxPositions, d], V, pDType);
+      if TypeEmb <> nil then
+      begin
+        if TypeEmb.Neurons[0].Weights.Size <> Config.TypeVocabSize * d then
+          ImportError('BERT export: token_type embedding size mismatch.');
+        Writer.AddTensorFlat(
+          Config.Prefix + 'embeddings.token_type_embeddings.weight',
+          [Config.TypeVocabSize, d], TypeEmb.Neurons[0].Weights, pDType);
+      end;
+      SaveLayerNormWeights(Writer, EmbLN,
+        Config.Prefix + 'embeddings.LayerNorm.weight',
+        Config.Prefix + 'embeddings.LayerNorm.bias', d, pDType);
+
+      // ---- encoder blocks ----
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        if Config.Family = bfDistilBert then
+        begin
+          BlockPrefix := Config.Prefix + 'transformer.layer.' +
+            IntToStr(BlockCnt) + '.';
+          QName := BlockPrefix + 'attention.q_lin';
+          KName := BlockPrefix + 'attention.k_lin';
+          VName := BlockPrefix + 'attention.v_lin';
+          AttnDenseName := BlockPrefix + 'attention.out_lin';
+          AttnLNName := BlockPrefix + 'sa_layer_norm';
+          InterName := BlockPrefix + 'ffn.lin1';
+          OutDenseName := BlockPrefix + 'ffn.lin2';
+          OutLNName := BlockPrefix + 'output_layer_norm';
+        end
+        else
+        begin
+          BlockPrefix := Config.Prefix + 'encoder.layer.' +
+            IntToStr(BlockCnt) + '.';
+          QName := BlockPrefix + 'attention.self.query';
+          KName := BlockPrefix + 'attention.self.key';
+          VName := BlockPrefix + 'attention.self.value';
+          AttnDenseName := BlockPrefix + 'attention.output.dense';
+          AttnLNName := BlockPrefix + 'attention.output.LayerNorm';
+          InterName := BlockPrefix + 'intermediate.dense';
+          OutDenseName := BlockPrefix + 'output.dense';
+          OutLNName := BlockPrefix + 'output.LayerNorm';
+        end;
+        PwBase := BlockCnt * 4;
+        // Un-fuse the Q|K|V slab: query=neurons 0..d-1, key=d..2d-1,
+        // value=2d..3d-1 (the importer's LoadLlamaLinearWeights NeuronBase).
+        DumpLinear(PwConvs[PwBase + 0], 0,     d, d, QName + '.weight',
+          QName + '.bias');
+        DumpLinear(PwConvs[PwBase + 0], d,     d, d, KName + '.weight',
+          KName + '.bias');
+        DumpLinear(PwConvs[PwBase + 0], 2 * d, d, d, VName + '.weight',
+          VName + '.bias');
+        DumpLinear(PwConvs[PwBase + 1], 0, d, d, AttnDenseName + '.weight',
+          AttnDenseName + '.bias');
+        SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 1],
+          AttnLNName + '.weight', AttnLNName + '.bias', d, pDType);
+        DumpLinear(PwConvs[PwBase + 2], 0, IntSize, d, InterName + '.weight',
+          InterName + '.bias');
+        DumpLinear(PwConvs[PwBase + 3], 0, d, IntSize, OutDenseName + '.weight',
+          OutDenseName + '.bias');
+        SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 2],
+          OutLNName + '.weight', OutLNName + '.bias', d, pDType);
+      end;
+
+      // ---- optional pooler head ----
+      if pIncludePooler then
+        DumpLinear(PwConvs[4 * Config.NumLayers], 0, d, d,
+          Config.Prefix + 'pooler.dense.weight',
+          Config.Prefix + 'pooler.dense.bias');
+
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+  finally
+    V.Free;
+  end;
+end;
+
+// Inverse of BuildGPTNeoXFromSafeTensors. The importer collects, per block,
+// the typed layers in this insertion order: TNNetTokenLayerNorm -> [LN1, LN2],
+// TNNetPointwiseConvLinear -> [QKV, AttnDense, dense_h_to_4h, dense_4h_to_h]
+// (the per-head SDPA adds SplitChannels/RoPE/SDPA, none of which we collect),
+// then a final TNNetTokenLayerNorm (final_layer_norm) and the LM-head
+// PointwiseConvLinear. The TNNetEmbedding is embed_in.
+//   - embed_in.weight: [vocab, hidden] straight from the embedding table.
+//   - embed_out.weight: [vocab, hidden] straight from the LM-head neurons
+//     (bias-free). When tie_word_embeddings the head is a copy of embed_in,
+//     so dumping it straight reproduces the same tensor; HF untied (Pythia)
+//     exports always carry embed_out, so we always emit it.
+//   - input_layernorm / post_attention_layernorm / final_layer_norm: gamma=
+//     Neurons[0], beta=Neurons[1] (SaveLayerNormWeights).
+//   - attention.query_key_value: RE-FUSE the per-head Q|K|V slab into the
+//     single [3*hidden, hidden] (+bias) tensor, INVERTING the partial
+//     rotate_half interleave of LoadGPTNeoXQKVWeights (HF row r maps to neuron
+//     TargetIdx; here we read neuron TargetIdx back into HF row r).
+//   - attention.dense / mlp.dense_h_to_4h / mlp.dense_4h_to_h: straight
+//     [out,in] nn.Linear (+bias).
+// Coded by Claude (AI).
+procedure SaveGPTNeoXToSafeTensors(Net: TNNet; const Config: TGPTNeoXConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  Embeds, LayerNorms, PwConvs: array of TNNetLayer;
+  EmbIn, FinalLN, LMHead: TNNetLayer;
+  i, BlockCnt, PwBase, ExpectPw, ExpectLN: integer;
+  d, IntSize, HeadDim, RotaryDims: integer;
+  BlockPrefix, AttnPrefix: string;
+
+  // Straight HF nn.Linear [OutDim, InDim] (+optional bias [OutDim]) from
+  // OutDim consecutive neurons of Layer at NeuronBase: neuron (NeuronBase+j)
+  // is checkpoint row j. The exact inverse of LoadLlamaLinearWeights (no
+  // rotary). When BName='' the layer is bias-free (the LM head).
+  procedure DumpLinear(Layer: TNNetLayer; NeuronBase, OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+          ImportError('GPT-NeoX export: neuron ' + IntToStr(NeuronBase + jj) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] :=
+            Layer.Neurons[NeuronBase + jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[NeuronBase + jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      if BName <> '' then
+        Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Re-fuse the per-head Q|K|V slab into the single interleaved
+  // query_key_value [3*hidden, hidden] (+bias). HF source row r maps to net
+  // neuron TargetIdx exactly as LoadGPTNeoXQKVWeights does; we run the same
+  // map and copy neuron TargetIdx back into HF row r.
+  procedure DumpQKV(Layer: TNNetLayer; const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    r, ii, HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
+  begin
+    if Layer.Neurons.Count <> 3 * d then
+      ImportError('GPT-NeoX export: layer for "' + WName + '" has ' +
+        IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+        IntToStr(3 * d) + '.');
+    RotHalf := RotaryDims div 2;
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(3 * d * d, 1, 1);
+      B.ReSize(3 * d, 1, 1);
+      for r := 0 to 3 * d - 1 do
+      begin
+        HeadIdx := r div (3 * HeadDim);
+        Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
+        RowInHead := r mod HeadDim;
+        TargetRow := RowInHead;
+        if (Third < 2) and (RowInHead < RotaryDims) then
+        begin
+          if RowInHead < RotHalf then
+            TargetRow := 2 * RowInHead
+          else
+            TargetRow := 2 * (RowInHead - RotHalf) + 1;
+        end;
+        TargetIdx := Third * d + HeadIdx * HeadDim + TargetRow;
+        if Layer.Neurons[TargetIdx].Weights.Size <> d then
+          ImportError('GPT-NeoX export: neuron ' + IntToStr(TargetIdx) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+            ' weights, expected ' + IntToStr(d) + '.');
+        for ii := 0 to d - 1 do
+          W.FData[r * d + ii] := Layer.Neurons[TargetIdx].Weights.FData[ii];
+        B.FData[r] := Layer.Neurons[TargetIdx].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [3 * d, d], W, pDType);
+      Writer.AddTensorFlat(BName, [3 * d], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  IntSize := Config.IntermediateSize;
+  if Config.NumHeads < 1 then
+    ImportError('GPT-NeoX export: num_attention_heads must be >= 1.');
+  if (d mod Config.NumHeads) <> 0 then
+    ImportError('GPT-NeoX export: hidden_size not divisible by num heads.');
+  HeadDim := d div Config.NumHeads;
+  RotaryDims := Trunc(HeadDim * Config.RotaryPct);
+  // ---- collect load-bearing layers in net (= importer build) order ----
+  SetLength(Embeds, 0);
+  SetLength(LayerNorms, 0);
+  SetLength(PwConvs, 0);
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetEmbedding then
+    begin
+      SetLength(Embeds, Length(Embeds) + 1);
+      Embeds[High(Embeds)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LayerNorms, Length(LayerNorms) + 1);
+      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if Length(Embeds) <> 1 then
+    ImportError('GPT-NeoX export: found ' + IntToStr(Length(Embeds)) +
+      ' TNNetEmbedding layers, expected 1 - not a ' +
+      'BuildGPTNeoXFromSafeTensors decoder?');
+  ExpectLN := 2 * Config.NumLayers + 1;   // LN1/LN2 per block + final_layer_norm
+  ExpectPw := 4 * Config.NumLayers + 1;   // QKV,AttnDense,HTo4H,FourHToH + LMHead
+  if Length(LayerNorms) <> ExpectLN then
+    ImportError('GPT-NeoX export: found ' + IntToStr(Length(LayerNorms)) +
+      ' LayerNorm layers, expected ' + IntToStr(ExpectLN) + ' for ' +
+      IntToStr(Config.NumLayers) + ' blocks.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('GPT-NeoX export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) + '.');
+  EmbIn := Embeds[0];
+  FinalLN := LayerNorms[2 * Config.NumLayers];     // last collected LayerNorm
+  LMHead := PwConvs[4 * Config.NumLayers];          // last collected PwConv
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/gpt_neox');
+    // ---- embeddings ----
+    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+      ImportError('GPT-NeoX export: embed_in size ' +
+        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(Config.VocabSize * d) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'embed_in.weight',
+      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+    // ---- decoder blocks ----
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+      AttnPrefix := BlockPrefix + 'attention.';
+      PwBase := BlockCnt * 4;
+      SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 0],
+        BlockPrefix + 'input_layernorm.weight',
+        BlockPrefix + 'input_layernorm.bias', d, pDType);
+      SaveLayerNormWeights(Writer, LayerNorms[BlockCnt * 2 + 1],
+        BlockPrefix + 'post_attention_layernorm.weight',
+        BlockPrefix + 'post_attention_layernorm.bias', d, pDType);
+      DumpQKV(PwConvs[PwBase + 0],
+        AttnPrefix + 'query_key_value.weight',
+        AttnPrefix + 'query_key_value.bias');
+      DumpLinear(PwConvs[PwBase + 1], 0, d, d,
+        AttnPrefix + 'dense.weight', AttnPrefix + 'dense.bias');
+      DumpLinear(PwConvs[PwBase + 2], 0, IntSize, d,
+        BlockPrefix + 'mlp.dense_h_to_4h.weight',
+        BlockPrefix + 'mlp.dense_h_to_4h.bias');
+      DumpLinear(PwConvs[PwBase + 3], 0, d, IntSize,
+        BlockPrefix + 'mlp.dense_4h_to_h.weight',
+        BlockPrefix + 'mlp.dense_4h_to_h.bias');
+    end;
+    SaveLayerNormWeights(Writer, FinalLN,
+      Config.Prefix + 'final_layer_norm.weight',
+      Config.Prefix + 'final_layer_norm.bias', d, pDType);
+    // ---- LM head (embed_out, OUTSIDE the gpt_neox. prefix, bias-free) ----
+    DumpLinear(LMHead, 0, Config.VocabSize, d, 'embed_out.weight', '');
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
+procedure SaveBloomToSafeTensors(Net: TNNet; const Config: TBloomConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  Embeds, LayerNorms, PwConvs: array of TNNetLayer;
+  EmbIn, EmbLN, FinalLN: TNNetLayer;
+  i, BlockCnt, PwBase, ExpectPw, ExpectLN: integer;
+  d, IntSize, HeadDim: integer;
+  BlockPrefix, AttnPrefix: string;
+
+  // Straight HF nn.Linear [OutDim, InDim] (+bias [OutDim]) from OutDim
+  // consecutive neurons at NeuronBase. The exact inverse of
+  // LoadLlamaLinearWeights (no rotary on any BLOOM linear).
+  procedure DumpLinear(Layer: TNNetLayer; NeuronBase, OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+          ImportError('BLOOM export: neuron ' + IntToStr(NeuronBase + jj) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] :=
+            Layer.Neurons[NeuronBase + jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[NeuronBase + jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Re-fuse the per-head Q|K|V slab back into the single query_key_value
+  // [3*hidden, hidden] (+bias). HF source row r maps to net neuron TargetIdx
+  // exactly as LoadBloomQKVWeights does (no rotate_half - BLOOM is ALiBi);
+  // we run the same map and copy neuron TargetIdx back into HF row r.
+  procedure DumpQKV(Layer: TNNetLayer; const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    r, ii, HeadIdx, Third, RowInHead, TargetIdx: integer;
+  begin
+    if Layer.Neurons.Count <> 3 * d then
+      ImportError('BLOOM export: layer for "' + WName + '" has ' +
+        IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+        IntToStr(3 * d) + '.');
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(3 * d * d, 1, 1);
+      B.ReSize(3 * d, 1, 1);
+      for r := 0 to 3 * d - 1 do
+      begin
+        HeadIdx := r div (3 * HeadDim);
+        Third := (r mod (3 * HeadDim)) div HeadDim; // 0=q, 1=k, 2=v
+        RowInHead := r mod HeadDim;
+        TargetIdx := Third * d + HeadIdx * HeadDim + RowInHead;
+        if Layer.Neurons[TargetIdx].Weights.Size <> d then
+          ImportError('BLOOM export: neuron ' + IntToStr(TargetIdx) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+            ' weights, expected ' + IntToStr(d) + '.');
+        for ii := 0 to d - 1 do
+          W.FData[r * d + ii] := Layer.Neurons[TargetIdx].Weights.FData[ii];
+        B.FData[r] := Layer.Neurons[TargetIdx].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [3 * d, d], W, pDType);
+      Writer.AddTensorFlat(BName, [3 * d], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  IntSize := Config.IntermediateSize;
+  if Config.NumHeads < 1 then
+    ImportError('BLOOM export: n_head must be >= 1.');
+  if (d mod Config.NumHeads) <> 0 then
+    ImportError('BLOOM export: hidden_size not divisible by n_head.');
+  HeadDim := d div Config.NumHeads;
+  // ---- collect load-bearing layers in net (= importer build) order ----
+  SetLength(Embeds, 0);
+  SetLength(LayerNorms, 0);
+  SetLength(PwConvs, 0);
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetEmbedding then
+    begin
+      SetLength(Embeds, Length(Embeds) + 1);
+      Embeds[High(Embeds)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LayerNorms, Length(LayerNorms) + 1);
+      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if Length(Embeds) <> 1 then
+    ImportError('BLOOM export: found ' + IntToStr(Length(Embeds)) +
+      ' TNNetEmbedding layers, expected 1 - not a ' +
+      'BuildBloomFromSafeTensors decoder?');
+  // word_embeddings LN + 2 per block + ln_f.
+  ExpectLN := 2 * Config.NumLayers + 2;
+  // QKV,AttnDense,HTo4H,FourHToH per block + tied LM head.
+  ExpectPw := 4 * Config.NumLayers + 1;
+  if Length(LayerNorms) <> ExpectLN then
+    ImportError('BLOOM export: found ' + IntToStr(Length(LayerNorms)) +
+      ' LayerNorm layers, expected ' + IntToStr(ExpectLN) + ' for ' +
+      IntToStr(Config.NumLayers) + ' blocks.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('BLOOM export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) + '.');
+  EmbIn := Embeds[0];
+  EmbLN := LayerNorms[0];                          // word_embeddings_layernorm
+  FinalLN := LayerNorms[2 * Config.NumLayers + 1]; // last collected LayerNorm
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/bloom');
+    // ---- embeddings (LM head is tied; no separate lm_head tensor) ----
+    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+      ImportError('BLOOM export: word_embeddings size ' +
+        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(Config.VocabSize * d) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'word_embeddings.weight',
+      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+    SaveLayerNormWeights(Writer, EmbLN,
+      Config.Prefix + 'word_embeddings_layernorm.weight',
+      Config.Prefix + 'word_embeddings_layernorm.bias', d, pDType);
+    // ---- decoder blocks ----
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+      AttnPrefix := BlockPrefix + 'self_attention.';
+      PwBase := BlockCnt * 4;
+      SaveLayerNormWeights(Writer, LayerNorms[1 + BlockCnt * 2 + 0],
+        BlockPrefix + 'input_layernorm.weight',
+        BlockPrefix + 'input_layernorm.bias', d, pDType);
+      SaveLayerNormWeights(Writer, LayerNorms[1 + BlockCnt * 2 + 1],
+        BlockPrefix + 'post_attention_layernorm.weight',
+        BlockPrefix + 'post_attention_layernorm.bias', d, pDType);
+      DumpQKV(PwConvs[PwBase + 0],
+        AttnPrefix + 'query_key_value.weight',
+        AttnPrefix + 'query_key_value.bias');
+      DumpLinear(PwConvs[PwBase + 1], 0, d, d,
+        AttnPrefix + 'dense.weight', AttnPrefix + 'dense.bias');
+      DumpLinear(PwConvs[PwBase + 2], 0, IntSize, d,
+        BlockPrefix + 'mlp.dense_h_to_4h.weight',
+        BlockPrefix + 'mlp.dense_h_to_4h.bias');
+      DumpLinear(PwConvs[PwBase + 3], 0, d, IntSize,
+        BlockPrefix + 'mlp.dense_4h_to_h.weight',
+        BlockPrefix + 'mlp.dense_4h_to_h.bias');
+    end;
+    SaveLayerNormWeights(Writer, FinalLN,
+      Config.Prefix + 'ln_f.weight',
+      Config.Prefix + 'ln_f.bias', d, pDType);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
 end;
 
 function BuildLlamaFromSafeTensorsEx(const FileName: string;
@@ -5353,6 +11557,842 @@ begin
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
+// ========================= STARCODER2 IMPORT ==============================
+// Starcoder2 (model_type "starcoder2", bigcode/starcoder2-3b/7b/15b) is the
+// first CODE-specialised decoder in this unit. It pairs the modern Llama-style
+// attention front-end - RoPE on q/k, GQA (num_key_value_heads), an OPTIONAL
+// sliding window applied to EVERY layer when sliding_window is set - with three
+// GPT-2-flavoured pieces the RMSNorm/SwiGLU Llama path never exercises:
+//   (a) biased nn.LayerNorm norms (TNNetTokenLayerNorm WITH a learned bias),
+//       NOT RMSNorm - input_layernorm, post_attention_layernorm and the final
+//       model.norm, eps = norm_epsilon (default 1e-5);
+//   (b) bias=True (config use_bias) on ALL FOUR attention projections including
+//       o_proj (the exact path OLMo-2's attention_bias deliberately REJECTS)
+//       AND on both MLP matrices; lm_head is always bias-free;
+//   (c) a plain two-matrix gelu_pytorch_tanh FFN (c_fc -> GELU -> c_proj, NO
+//       SwiGLU gate), so it reuses TNNetGELU (the tanh approximation = HF's
+//       gelu_pytorch_tanh) on a dedicated LayerNorm pre-norm block.
+// The block is the standard sequential pre-norm pair (residual_dropout and
+// embedding_dropout are 0 at inference):
+//   x := x + o_proj( GQA-RoPE-SDPA( input_layernorm(x) ) )
+//   x := x + c_proj( gelu_tanh( c_fc( post_attention_layernorm(x) ) ) )
+// q/k rows carry the same per-head rotate_half permutation as the Llama path
+// (TNNetRotaryEmbedding rotates interleaved pairs; HF rotates half-split pairs);
+// v/o load straight. Embeddings are usually UNTIED (a separate lm_head.weight);
+// the config-default tied case copies the embedding rows into the head.
+// Tokenizer is the stock BPE tokenizer.json path (already supported).
+
+function ReadStarCoder2ConfigFromJSONFile(const FileName: string): TStarCoder2Config;
+var
+  JsonText: TStringList;
+  Root, RopeParams: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Starcoder2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Starcoder2 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Starcoder2 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Starcoder2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Starcoder2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'starcoder2');
+    if ModelType <> 'starcoder2' then
+      ImportError('Starcoder2 import: config model_type is "' + ModelType +
+        '" - expected "starcoder2" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if Result.NumKVHeads <= 0 then Result.NumKVHeads := Result.NumHeads;
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.LayerNormEps := Obj.Get('norm_epsilon', 1.0e-5);
+    // rope_theta is top-level in the released checkpoint configs; newer
+    // transformers nests it under rope_parameters.rope_theta.
+    Result.RopeTheta := Obj.Get('rope_theta', 0.0);
+    if Result.RopeTheta <= 0 then
+    begin
+      RopeParams := Obj.Find('rope_parameters');
+      if (RopeParams <> nil) and (RopeParams is TJSONObject) then
+        Result.RopeTheta := TJSONObject(RopeParams).Get('rope_theta', 0.0);
+    end;
+    if Result.RopeTheta <= 0 then Result.RopeTheta := 10000.0;
+    // sliding_window may be null (full attention) or a positive int (applied to
+    // EVERY layer, no Mistral-style per-layer pattern).
+    Result.SlidingWindow := 0;
+    if (Obj.IndexOfName('sliding_window') >= 0) and
+       (Obj.Find('sliding_window').JSONType = jtNumber) then
+      Result.SlidingWindow := Obj.Get('sliding_window', 0);
+    if Result.SlidingWindow < 0 then Result.SlidingWindow := 0;
+    Result.UseBias := Obj.Get('use_bias', True);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    HiddenAct := Obj.Get('hidden_act', 'gelu_pytorch_tanh');
+    if (HiddenAct <> 'gelu_pytorch_tanh') and (HiddenAct <> 'gelu_new') then
+      ImportError('Starcoder2 import: config hidden_act "' + HiddenAct +
+        '" is not supported - only "gelu_pytorch_tanh" (the released form) ' +
+        'is wired here.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function StarCoder2ConfigToString(const Config: TStarCoder2Config): string;
+begin
+  Result := 'starcoder2 config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', window=' + IntToStr(Config.SlidingWindow) +
+    ', bias=' + BoolToStr(Config.UseBias, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TStarCoder2BlockLayers = record
+    AttnNorm, QProj, KProj, VProj, OProj: TNNetLayer;
+    MlpNorm, CFc, CProj: TNNetLayer;
+  end;
+
+function BuildStarCoder2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TStarCoder2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TStarCoder2BlockLayers;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSource, KSlice, QSlice, HeadPack: TNNetLayer;
+  KRotated, VSlices, HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
+  HeadDim, QWidth, KVWidth, i, j, d: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, MlpPrefix, TensorNameStr, LMHeadName: string;
+  QBiasName, KBiasName, VBiasName, OBiasName, FcBiasName, ProjBiasName: string;
+  RopeScaling: TRoPEScalingConfig;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // Loads a [d_model] LayerNorm weight/bias pair under the Starcoder2 message
+  // namespace (delegates to the shared loader, which already handles bias).
+  procedure LoadNorm(Layer: TNNetLayer; const Base: string);
+  begin
+    LoadLayerNormWeights(Reader, Layer, Base + '.weight', Base + '.bias',
+      Config.HiddenSize);
+    MarkConsumed(Base + '.weight');
+    MarkConsumed(Base + '.bias');
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  RopeScaling := DefaultRoPEScaling();
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('Starcoder2 import: num_attention_heads must be >= 1.');
+      if Config.NumKVHeads < 1 then
+        ImportError('Starcoder2 import: num_key_value_heads must be >= 1.');
+      if (Config.NumHeads mod Config.NumKVHeads) <> 0 then
+        ImportError('Starcoder2 import: num_attention_heads=' +
+          IntToStr(Config.NumHeads) + ' is not divisible by ' +
+          'num_key_value_heads=' + IntToStr(Config.NumKVHeads) + '.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('Starcoder2 import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if Odd(HeadDim) then
+        ImportError('Starcoder2 import: head_dim=' + IntToStr(HeadDim) +
+          ' must be even (RoPE rotates channel pairs).');
+      if Config.SlidingWindow < 0 then
+        ImportError('Starcoder2 import: sliding_window must be >= 0 ' +
+          '(0 = full attention).');
+      QWidth := Config.NumHeads * HeadDim;
+      KVWidth := Config.NumKVHeads * HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Starcoder2 import: neither "model.embed_tokens.weight" ' +
+          'nor "embed_tokens.weight" found in ' + Reader.FileName +
+          ' - not a Starcoder2 checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embed_tokens.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Starcoder2 import: embed_tokens.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+      LMHeadName := 'lm_head.weight';
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor(LMHeadName)) then
+        ImportError('Starcoder2 import: config says tie_word_embeddings=' +
+          'false but "' + LMHeadName + '" is missing from ' +
+          Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('Starcoder2 import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(KRotated, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // Attention sub-block: x := x + o_proj(rotary-GQA(LayerNorm(x))),
+        // wired from primitives exactly like the Llama path (per-head RoPE on
+        // each Q/K slice; depth = head_dim so the frequency schedule matches
+        // HF), but with a BIASED LayerNorm pre-norm and biased projections.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].AttnNorm := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        NormedSource := NN.GetLastLayer();
+        Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+        Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        // K is rotated ONCE per KV head; V is never rotated.
+        for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+        begin
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := KVHeadCnt * HeadDim + d;
+          KSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
+          KRotated[KVHeadCnt] := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), KSlice);
+          VSlices[KVHeadCnt] := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
+        end;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          KVGroup := HeadCnt div GroupSize;
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := HeadCnt * HeadDim + d;
+          QSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+          QSlice := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), QSlice);
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+            [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
+          // Config.SlidingWindow > 0 (when set) applies the banded causal
+          // window to EVERY layer (HF Starcoder2 has no per-layer pattern).
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true,
+              {pWindow=}Config.SlidingWindow),
+            HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // MLP sub-block: x := x + c_proj(gelu_tanh(c_fc(LayerNorm(x)))) -
+        // a plain two-matrix FFN, NO SwiGLU gate.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].MlpNorm := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].CFc := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        NN.AddLayer( TNNetGELU.Create() ); // gelu_pytorch_tanh
+        Blocks[BlockCnt].CProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Starcoder2 import: embed_tokens.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          EnsureWritableImportWeights(LMHead);
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+        end
+        else
+        begin
+          // UNTIED head: lm_head.weight is its own [vocab, hidden] bias-free
+          // nn.Linear (HF builds lm_head with bias=False regardless of use_bias).
+          LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+            Config.HiddenSize, Config.VocabSize);
+          MarkConsumed(LMHeadName);
+        end;
+      finally
+        Tmp.Free;
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'self_attn.';
+        MlpPrefix := BlockPrefix + 'mlp.';
+        LoadNorm(Blocks[BlockCnt].AttnNorm, BlockPrefix + 'input_layernorm');
+        LoadNorm(Blocks[BlockCnt].MlpNorm,
+          BlockPrefix + 'post_attention_layernorm');
+        // Config.UseBias (default true): every attention projection - q/k/v
+        // AND o_proj - carries a bias (the path OLMo-2 rejects). q/k rows are
+        // rotate_half-permuted per head; v/o load straight.
+        if Config.UseBias then
+        begin
+          QBiasName := AttnPrefix + 'q_proj.bias';
+          KBiasName := AttnPrefix + 'k_proj.bias';
+          VBiasName := AttnPrefix + 'v_proj.bias';
+          OBiasName := AttnPrefix + 'o_proj.bias';
+          FcBiasName := MlpPrefix + 'c_fc.bias';
+          ProjBiasName := MlpPrefix + 'c_proj.bias';
+        end
+        else
+        begin
+          QBiasName := ''; KBiasName := ''; VBiasName := '';
+          OBiasName := ''; FcBiasName := ''; ProjBiasName := '';
+        end;
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+          AttnPrefix + 'q_proj.weight', Config.HiddenSize, QWidth,
+          0, -1, HeadDim, QBiasName);
+        MarkConsumed(AttnPrefix + 'q_proj.weight');
+        if QBiasName <> '' then MarkConsumed(QBiasName);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+          AttnPrefix + 'k_proj.weight', Config.HiddenSize, KVWidth,
+          0, -1, HeadDim, KBiasName);
+        MarkConsumed(AttnPrefix + 'k_proj.weight');
+        if KBiasName <> '' then MarkConsumed(KBiasName);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+          AttnPrefix + 'v_proj.weight', Config.HiddenSize, KVWidth,
+          0, -1, 0, VBiasName);
+        MarkConsumed(AttnPrefix + 'v_proj.weight');
+        if VBiasName <> '' then MarkConsumed(VBiasName);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+          AttnPrefix + 'o_proj.weight', QWidth, Config.HiddenSize,
+          0, -1, 0, OBiasName);
+        MarkConsumed(AttnPrefix + 'o_proj.weight');
+        if OBiasName <> '' then MarkConsumed(OBiasName);
+        // Two-matrix FFN: c_fc (hidden -> intermediate), c_proj back.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CFc,
+          MlpPrefix + 'c_fc.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, -1, 0, FcBiasName);
+        MarkConsumed(MlpPrefix + 'c_fc.weight');
+        if FcBiasName <> '' then MarkConsumed(FcBiasName);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CProj,
+          MlpPrefix + 'c_proj.weight', Config.IntermediateSize,
+          Config.HiddenSize, 0, -1, 0, ProjBiasName);
+        MarkConsumed(MlpPrefix + 'c_proj.weight');
+        if ProjBiasName <> '' then MarkConsumed(ProjBiasName);
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadNorm(FinalNorm, Config.Prefix + 'norm');
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if Pos('rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
+        ImportError('Starcoder2 import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildStarCoder2FromSafeTensorsEx(const FileName: string;
+  out Config: TStarCoder2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadStarCoder2ConfigFromJSONFile(ConfigPath);
+  Result := BuildStarCoder2FromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildStarCoder2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TStarCoder2Config;
+begin
+  Result := BuildStarCoder2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ========================== GPT-BIGCODE IMPORT =============================
+//
+// GPT-BigCode / StarCoder-v1 (model_type "gpt_bigcode") is the biased-pre-LN
+// GPT-2 skeleton with two GPT-2 hallmarks StarCoder2 later dropped - LEARNED
+// absolute position embeddings (a wpe table added to wte; NO RoPE) and a FUSED
+// c_attn slab - plus the defining twist: MULTI-QUERY attention (a single shared
+// K/V head broadcast to every query head). Per HF the c_attn slab is laid out
+// [q (n_head*head_dim) | k (head_dim) | v (head_dim)] and split on dim -1; the
+// importer slices it into three nn.Linear sub-blocks (Phi-3 style) and wires
+// MQA over the grouped-SDPA path (every query head shares the lone K/V slice).
+// Norms are biased nn.LayerNorm, every nn.Linear (q/k/v fused, c_proj, c_fc,
+// c_proj) carries a bias, the FFN is the plain two-matrix gelu_pytorch_tanh,
+// and lm_head is tied to wte by default.
+
+function ReadGptBigCodeConfigFromJSONFile(const FileName: string): TGptBigCodeConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+
+  // n_embd / hidden_size etc. are required positive ints (HF accepts either
+  // spelling for the dims; n_embd is the canonical GPT-BigCode form).
+  function RequiredInt(const Primary, Alt: string): integer;
+  var
+    Name: string;
+  begin
+    Name := Primary;
+    if (Obj.IndexOfName(Primary) < 0) and (Alt <> '') and
+       (Obj.IndexOfName(Alt) >= 0) then
+      Name := Alt;
+    if Obj.IndexOfName(Name) < 0 then
+      ImportError('GPT-BigCode import: config "' + FileName +
+        '" is missing the required field "' + Primary + '".');
+    Result := Obj.Get(Name, 0);
+    if Result <= 0 then
+      ImportError('GPT-BigCode import: config field "' + Name +
+        '" must be a positive integer, got ' + Obj.Find(Name).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('GPT-BigCode import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('GPT-BigCode import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('GPT-BigCode import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'gpt_bigcode');
+    if ModelType <> 'gpt_bigcode' then
+      ImportError('GPT-BigCode import: config model_type is "' + ModelType +
+        '" - expected "gpt_bigcode" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.HiddenSize := RequiredInt('n_embd', 'hidden_size');
+    Result.NumLayers := RequiredInt('n_layer', 'num_hidden_layers');
+    Result.NumHeads := RequiredInt('n_head', 'num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size', '');
+    Result.MaxPositions := RequiredInt('n_positions', 'max_position_embeddings');
+    // n_inner null = 4*n_embd (the GPT-2 / GPT-BigCode default).
+    Result.IntermediateSize := 4 * Result.HiddenSize;
+    if (Obj.IndexOfName('n_inner') >= 0) and
+       (Obj.Find('n_inner').JSONType = jtNumber) then
+      Result.IntermediateSize := Obj.Get('n_inner', Result.IntermediateSize);
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    Result.MultiQuery := Obj.Get('multi_query', True);
+    if not Result.MultiQuery then
+      ImportError('GPT-BigCode import: multi_query=false (full multi-head) is ' +
+        'not wired here - the released gpt_bigcode family is all multi-query.');
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    HiddenAct := Obj.Get('activation_function', 'gelu_pytorch_tanh');
+    if (HiddenAct <> 'gelu_pytorch_tanh') and (HiddenAct <> 'gelu_new') then
+      ImportError('GPT-BigCode import: config activation_function "' +
+        HiddenAct + '" is not supported - only the gelu-tanh forms ' +
+        '("gelu_pytorch_tanh" / "gelu_new") are wired here.');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function GptBigCodeConfigToString(const Config: TGptBigCodeConfig): string;
+begin
+  Result := 'gpt_bigcode config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', multi_query=' + BoolToStr(Config.MultiQuery, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TGptBigCodeBlockLayers = record
+    LN1, QProj, KProj, VProj, OProj: TNNetLayer;
+    LN2, CFc, CProj: TNNetLayer;
+  end;
+
+function BuildGptBigCodeFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TGptBigCodeConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TGptBigCodeBlockLayers;
+  EmbeddingLayer, PosLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSource, KSlice, VSlice, QSlice, HeadPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, HeadDim, QWidth, SlabRows, i, j, d: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, MlpPrefix, TensorNameStr, LMHeadName: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  procedure LoadNorm(Layer: TNNetLayer; const Base: string);
+  begin
+    LoadLayerNormWeights(Reader, Layer, Base + '.weight', Base + '.bias',
+      Config.HiddenSize);
+    MarkConsumed(Base + '.weight');
+    MarkConsumed(Base + '.bias');
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('GPT-BigCode import: n_head must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('GPT-BigCode import: n_embd=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by n_head=' +
+          IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      QWidth := Config.NumHeads * HeadDim;        // == HiddenSize
+      // c_attn slab rows: q (QWidth) | k (head_dim) | v (head_dim).
+      SlabRows := QWidth + 2 * HeadDim;
+      if Reader.HasTensor('transformer.wte.weight') then
+        Config.Prefix := 'transformer.'
+      else if Reader.HasTensor('wte.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('GPT-BigCode import: neither "transformer.wte.weight" nor ' +
+          '"wte.weight" found in ' + Reader.FileName +
+          ' - not a GPT-BigCode checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'wte.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'wte.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'wte.weight', 1) <> Config.HiddenSize) then
+        ImportError('GPT-BigCode import: wte.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' + Reader.ShapeAsString(Config.Prefix + 'wte.weight'));
+      LMHeadName := 'lm_head.weight';
+      if (not Config.TieWordEmbeddings) and (not Reader.HasTensor(LMHeadName)) then
+        ImportError('GPT-BigCode import: config says tie_word_embeddings=false ' +
+          'but "' + LMHeadName + '" is missing from ' + Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('GPT-BigCode import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds n_positions=' + IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      // Learned absolute positions (wpe), GPT-2 style: x := wte[token] + wpe[pos].
+      PosLayer := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // Attention sub-block: x := x + c_proj(MQA-SDPA(LayerNorm(x))).
+        // No RoPE; the lone K/V head is shared across every query head.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN1 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        NormedSource := NN.GetLastLayer();
+        // Three nn.Linear sub-blocks sliced from the fused c_attn slab below.
+        Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+        Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(HeadDim), NormedSource);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(HeadDim), NormedSource);
+        // The single shared K and V slices (the WHOLE projection is one head).
+        KSlice := Blocks[BlockCnt].KProj;
+        VSlice := Blocks[BlockCnt].VProj;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := HeadCnt * HeadDim + d;
+          QSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true),
+            HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // MLP sub-block: x := x + c_proj(gelu_tanh(c_fc(LayerNorm(x)))).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].LN2 := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].CFc := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        NN.AddLayer( TNNetGELU.Create() ); // gelu_pytorch_tanh
+        Blocks[BlockCnt].CProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Config.Prefix + 'wte.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('GPT-BigCode import: wte.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'wte.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          EnsureWritableImportWeights(LMHead);
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+            Config.HiddenSize, Config.VocabSize);
+          MarkConsumed(LMHeadName);
+        end;
+        // wpe -> learned positional table (n_positions rows of d floats).
+        Reader.LoadTensorFlat(Config.Prefix + 'wpe.weight', Tmp);
+        if PosLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('GPT-BigCode import: wpe.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the positional table size ' +
+            IntToStr(PosLayer.Neurons[0].Weights.Size) + '.');
+        PosLayer.Neurons[0].Weights.Copy(Tmp);
+        PosLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'wpe.weight');
+      finally
+        Tmp.Free;
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'attn.';
+        MlpPrefix := BlockPrefix + 'mlp.';
+        LoadNorm(Blocks[BlockCnt].LN1, BlockPrefix + 'ln_1');
+        LoadNorm(Blocks[BlockCnt].LN2, BlockPrefix + 'ln_2');
+        // FUSED c_attn slab [q (QWidth) | k (head_dim) | v (head_dim)],
+        // sliced into three nn.Linear sub-blocks (Phi-3-style SrcRowBase). All
+        // load straight (no rotate_half permutation - GPT-BigCode has no RoPE).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+          AttnPrefix + 'c_attn.weight', Config.HiddenSize, QWidth,
+          0, -1, 0, AttnPrefix + 'c_attn.bias', 1.0, 0, {SrcRowBase=}0, SlabRows);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+          AttnPrefix + 'c_attn.weight', Config.HiddenSize, HeadDim,
+          0, -1, 0, AttnPrefix + 'c_attn.bias', 1.0, 0,
+          {SrcRowBase=}QWidth, SlabRows);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+          AttnPrefix + 'c_attn.weight', Config.HiddenSize, HeadDim,
+          0, -1, 0, AttnPrefix + 'c_attn.bias', 1.0, 0,
+          {SrcRowBase=}QWidth + HeadDim, SlabRows);
+        MarkConsumed(AttnPrefix + 'c_attn.weight');
+        MarkConsumed(AttnPrefix + 'c_attn.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+          AttnPrefix + 'c_proj.weight', Config.HiddenSize, Config.HiddenSize,
+          0, -1, 0, AttnPrefix + 'c_proj.bias');
+        MarkConsumed(AttnPrefix + 'c_proj.weight');
+        MarkConsumed(AttnPrefix + 'c_proj.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CFc,
+          MlpPrefix + 'c_fc.weight', Config.HiddenSize, Config.IntermediateSize,
+          0, -1, 0, MlpPrefix + 'c_fc.bias');
+        MarkConsumed(MlpPrefix + 'c_fc.weight');
+        MarkConsumed(MlpPrefix + 'c_fc.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].CProj,
+          MlpPrefix + 'c_proj.weight', Config.IntermediateSize, Config.HiddenSize,
+          0, -1, 0, MlpPrefix + 'c_proj.bias');
+        MarkConsumed(MlpPrefix + 'c_proj.weight');
+        MarkConsumed(MlpPrefix + 'c_proj.bias');
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadNorm(FinalNorm, Config.Prefix + 'ln_f');
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('GPT-BigCode import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) + ') in ' +
+          FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildGptBigCodeFromSafeTensorsEx(const FileName: string;
+  out Config: TGptBigCodeConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadGptBigCodeConfigFromJSONFile(ConfigPath);
+  Result := BuildGptBigCodeFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildGptBigCodeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TGptBigCodeConfig;
+begin
+  Result := BuildGptBigCodeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
 // ============================ GPT-J IMPORT =================================
 
 function ReadGPTJConfigFromJSONFile(const FileName: string): TGPTJConfig;
@@ -5795,6 +12835,611 @@ var
   IgnoredConfig: TGPTJConfig;
 begin
   Result := BuildGPTJFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ============================ COHERE IMPORT ================================
+//
+// BuildCohereFromSafeTensors rebuilds Cohere's Command-R / Aya decoder
+// (model_type "cohere") and the Command-R7B variant (model_type "cohere2").
+// This is the leading open MULTILINGUAL instruct family (C4AI Command-R,
+// Aya-Expanse-8B, Command-R7B). It is NOT a Llama clone - the genuinely new
+// pieces, all verified against HF modeling_cohere / modeling_cohere2:
+//
+//  (a) PARALLEL residual: ONE input LayerNorm feeds BOTH the attention and
+//      the MLP branch, and a single fused 3-input sum closes the block:
+//         x := x + Attn(LN(x)) + MLP(LN(x))
+//      exactly the GPT-J/GPT-NeoX parallel-residual path reused here.
+//  (b) Cohere's norm is a TRUE LayerNorm (mean-subtracting), bias-free and
+//      weight-only (CohereLayerNorm: (x-mean)/sqrt(var+eps)*weight, no beta).
+//      -> TNNetTokenLayerNorm with the beta neuron left at zero (only the
+//      gamma vector is loaded). This is distinct from the Llama families'
+//      TNNetTokenRMSNorm (no mean subtraction).
+//  (c) a scalar logit_scale multiplies the final logits before softmax
+//      (HF: logits = (h . embed^T) * logit_scale). The embeddings are tied,
+//      so logit_scale is folded into every LM-head weight row at load (the
+//      same idiom as Gemma's query_pre_attn_scalar / embed-scale folding) -
+//      the head alone reproduces the scaled logits.
+//  (d) tied input/output embeddings, NO attention/MLP biases (attention_bias
+//      defaults false; the MLP and o_proj are plain bias-free nn.Linear).
+//  (e) RoPE is FULL-head and uses the GPT-J INTERLEAVED pair layout
+//      (rotate_half = stack(-x[1::2], x[0::2]); repeat_interleave(freqs,2)),
+//      which is TNNetRotaryEmbedding's NATIVE (even/odd) layout - so the
+//      q/k projection rows load STRAIGHT (RotaryHeadDim=0, NO rotate_half
+//      row permutation, opposite of the Llama/NeoX half-split path).
+//  (f) GQA (num_key_value_heads <= num_attention_heads): each KV head is
+//      projected and rotated once, then shared across its query-head group.
+//  (g) cohere ONLY (Config.UseQKNorm): per-head q_norm/k_norm are
+//      CohereLayerNorm over head_dim with PER-HEAD DISTINCT gains (weight
+//      shape [num_heads, head_dim] / [num_kv_heads, head_dim]), applied
+//      AFTER the projection and BEFORE RoPE (HF: "main diff from Llama").
+//      Mean-subtracting -> a per-head TNNetTokenLayerNorm (NOT TokenRMSNorm).
+//  (h) cohere2 ONLY: an alternating sliding-window / global attention
+//      pattern (Config.SlidingWindowPattern, every Nth layer global, the
+//      rest local) AND - crucially - RoPE is applied ONLY on the SLIDING
+//      layers; the GLOBAL layers use NoPE (no positional embedding at all,
+//      HF: `if self.sliding_window is not None: apply_rotary_pos_emb`).
+//      cohere2 has NO qk_norm.
+//
+// The MLP is the standard SwiGLU (down(silu(gate(x)) * up(x))). TNNetSwiGLU
+// computes FIRSTHALF * Swish(SECONDHALF), so the fused gate/up projection
+// holds up_proj in neurons 0..I-1 and gate_proj in I..2I-1.
+//
+// The net takes a (SeqLen,1,1) volume of token ids and outputs
+// (SeqLen,1,vocab) logit_scale-scaled logits, matching the other decoder
+// importers' causal-LM contract. .bin checkpoints dispatch through the same
+// TNNetTorchBinReader path (CreatePretrainedTensorReader) and multi-shard
+// .index.json is handled by the reader, like every importer in this unit.
+// Coded by Claude (AI).
+
+function ReadCohereConfigFromJSONFile(const FileName: string): TCohereConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct: string;
+  Field: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Cohere import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Cohere import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Cohere import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Cohere import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Cohere import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'cohere');
+    if (ModelType <> 'cohere') and (ModelType <> 'cohere2') then
+      ImportError('Cohere import: config model_type is "' + ModelType +
+        '" - expected "cohere" or "cohere2".');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    // num_key_value_heads defaults to num_attention_heads (no GQA).
+    Field := Obj.Find('num_key_value_heads');
+    if (Field = nil) or Field.IsNull then
+      Result.NumKVHeads := Result.NumHeads
+    else
+      Result.NumKVHeads := RequiredInt('num_key_value_heads');
+    // head_dim is implicit in every published Cohere config.
+    Field := Obj.Find('head_dim');
+    if (Field = nil) or Field.IsNull then
+      Result.HeadDim := 0
+    else
+      Result.HeadDim := RequiredInt('head_dim');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-5);
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    // logit_scale: CohereConfig default 0.0625 (Command-R) - always present
+    // in the published configs, but keep the documented default.
+    Result.LogitScale := Obj.Get('logit_scale', 0.0625);
+    // tie_word_embeddings defaults TRUE for Cohere (the published configs
+    // tie; there is no separate lm_head tensor).
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    // attention_bias / MLP bias are false in every Cohere config; a true
+    // value would mean tensors this importer does not wire.
+    if Obj.Get('attention_bias', False) then
+      ImportError('Cohere import: attention_bias=true is not supported ' +
+        '(every published Cohere config is bias-free).');
+    HiddenAct := Obj.Get('hidden_act', 'silu');
+    if HiddenAct <> 'silu' then
+      ImportError('Cohere import: hidden_act "' + HiddenAct +
+        '" is not supported - Cohere uses "silu" (SwiGLU).');
+    // use_qk_norm: cohere only (CohereConfig default false; Aya-Expanse and
+    // some Command-R checkpoints enable it). cohere2 has no qk_norm.
+    Result.UseQKNorm := Obj.Get('use_qk_norm', False);
+    if ModelType = 'cohere2' then
+    begin
+      if Result.UseQKNorm then
+        ImportError('Cohere import: cohere2 does not define use_qk_norm.');
+      // sliding_window + sliding_window_pattern: every Nth layer is global,
+      // the rest carry the sliding window (Command-R7B: window 4096,
+      // pattern 4 - 3 local : 1 global). order_of_interleaved_layers in
+      // older configs maps to the same period.
+      Result.SlidingWindow := Obj.Get('sliding_window', 4096);
+      Result.SlidingWindowPattern := Obj.Get('sliding_window_pattern', 4);
+      if Result.SlidingWindowPattern < 1 then
+        ImportError('Cohere import: sliding_window_pattern must be >= 1.');
+    end
+    else
+    begin
+      Result.SlidingWindow := 0;
+      Result.SlidingWindowPattern := 0;
+    end;
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function CohereConfigToString(const Config: TCohereConfig): string;
+begin
+  Result := Config.ModelType + ' config: layers=' +
+    IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', logit_scale=' + FloatToStr(Config.LogitScale) +
+    ', qk_norm=' + BoolToStr(Config.UseQKNorm, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.SlidingWindowPattern > 0 then
+    Result := Result + ', window=' + IntToStr(Config.SlidingWindow) +
+      ', pattern=' + IntToStr(Config.SlidingWindowPattern);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+// Loads a bias-free, weight-only LayerNorm gain [d] (CohereLayerNorm) into a
+// TNNetTokenLayerNorm: only the gamma neuron (Neurons[0]) is written; the
+// beta neuron (Neurons[1]) is forced to zero (Cohere has no learned shift).
+// Coded by Claude (AI).
+procedure LoadCohereLayerNormWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; d_model: integer);
+var
+  Tmp: TNNetVolume;
+  i: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Cohere import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 1) or (Reader.DimSize(WName, 0) <> d_model) then
+    ImportError('Cohere import: "' + WName + '" must have shape [' +
+      IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for i := 0 to d_model - 1 do
+    begin
+      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+      Layer.Neurons[1].Weights.FData[i] := 0;            // beta (bias-free)
+    end;
+  finally
+    Tmp.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads the per-head CohereLayerNorm q_norm/k_norm gains (weight shape
+// [num_heads, head_dim], PER-HEAD DISTINCT) into the list of per-head
+// TNNetTokenLayerNorm layers (one gamma row each, beta zero). Row h of the
+// flat [num_heads*head_dim] tensor is head h's gain. Loaded STRAIGHT - the
+// q/k projection rows are NOT rotate_half-permuted on the Cohere path.
+// Coded by Claude (AI).
+procedure LoadCohereHeadLayerNormWeights(Reader: TNNetSafeTensorsReader;
+  NormLayers: array of TNNetLayer; const WName: string;
+  NumHeadsExpected, HeadDim: integer);
+var
+  Tmp: TNNetVolume;
+  h, i: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Cohere import: missing tensor "' + WName + '".');
+  if Reader.ElementCount(WName) <> NumHeadsExpected * HeadDim then
+    ImportError('Cohere import: "' + WName + '" must have ' +
+      IntToStr(NumHeadsExpected * HeadDim) + ' elements ([' +
+      IntToStr(NumHeadsExpected) + ', ' + IntToStr(HeadDim) + ']), got ' +
+      Reader.ShapeAsString(WName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for h := 0 to NumHeadsExpected - 1 do
+    begin
+      for i := 0 to HeadDim - 1 do
+      begin
+        NormLayers[h].Neurons[0].Weights.FData[i] :=
+          Tmp.FData[h * HeadDim + i];           // gamma row h
+        NormLayers[h].Neurons[1].Weights.FData[i] := 0; // beta
+      end;
+      NormLayers[h].FlushWeightCache();
+    end;
+  finally
+    Tmp.Free;
+  end;
+end;
+
+type
+  TCohereBlockLayers = record
+    LN1, QProj, KProj, VProj, OProj, GateUp, Down: TNNetLayer;
+    QNorms, KNorms: array of TNNetLayer; // per-head q/k LayerNorm (cohere)
+  end;
+
+function BuildCohereFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TCohereConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TCohereBlockLayers;
+  EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
+  BranchInput, SharedLN, AttnOut, MlpOut: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  KRotated, VSlices: array of TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
+  HeadDim, QWidth, KVWidth, i, j, d: integer;
+  LayerIsLocal: boolean;
+  LayerWindow: integer;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, LMHeadName, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // Builds one q or k head: optional per-head LayerNorm (cohere qk_norm),
+  // then RoPE iff this layer is rotary (full head, interleaved native
+  // layout). Returns the rotated/normed head slice layer.
+  function BuildQKHead(ProjLayer: TNNetLayer; HeadIdx: integer;
+    IsQuery, ApplyRoPE: boolean): TNNetLayer;
+  var
+    s: TNNetLayer;
+    cc: integer;
+  begin
+    for cc := 0 to HeadDim - 1 do
+      SliceChannels[cc] := HeadIdx * HeadDim + cc;
+    s := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceChannels), ProjLayer);
+    if Config.UseQKNorm then
+    begin
+      s := NN.AddLayerAfter(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps), s);
+      if IsQuery then Blocks[BlockCnt].QNorms[HeadIdx] := s
+      else Blocks[BlockCnt].KNorms[HeadIdx] := s;
+    end;
+    if ApplyRoPE then
+      s := NN.AddLayerAfter(
+        TNNetRotaryEmbedding.Create(Config.RopeTheta), s);
+    Result := s;
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('Cohere import: num_attention_heads must be >= 1.');
+      if Config.NumKVHeads < 1 then
+        ImportError('Cohere import: num_key_value_heads must be >= 1.');
+      if (Config.NumHeads mod Config.NumKVHeads) <> 0 then
+        ImportError('Cohere import: num_attention_heads=' +
+          IntToStr(Config.NumHeads) + ' is not a multiple of ' +
+          'num_key_value_heads=' + IntToStr(Config.NumKVHeads) + '.');
+      if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+      else
+      begin
+        if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+          ImportError('Cohere import: hidden_size=' +
+            IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+            'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+        HeadDim := Config.HiddenSize div Config.NumHeads;
+      end;
+      if Odd(HeadDim) then
+        ImportError('Cohere import: head_dim=' + IntToStr(HeadDim) +
+          ' must be even (RoPE rotates channel pairs).');
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+      QWidth := Config.NumHeads * HeadDim;
+      KVWidth := Config.NumKVHeads * HeadDim;
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Cohere import: neither "model.embed_tokens.weight" ' +
+          'nor "embed_tokens.weight" found in ' + Reader.FileName +
+          ' - not a Cohere checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embed_tokens.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Cohere import: embed_tokens.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+      LMHeadName := 'lm_head.weight';
+      if (not Config.TieWordEmbeddings) and (not Reader.HasTensor(LMHeadName)) then
+        ImportError('Cohere import: tie_word_embeddings=false but ' +
+          '"lm_head.weight" is missing from ' + Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('Cohere import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(KRotated, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // cohere2 alternating attention: every Nth layer (1-indexed) is
+        // GLOBAL, the rest carry the sliding window. AND RoPE is applied
+        // only on the SLIDING layers - global layers are NoPE (HF
+        // Cohere2Attention: rotary only when self.sliding_window is not
+        // None). cohere (pattern 0) is full attention + RoPE everywhere.
+        if Config.SlidingWindowPattern > 1 then
+          LayerIsLocal := ((BlockCnt + 1) mod Config.SlidingWindowPattern) <> 0
+        else
+          LayerIsLocal := false;
+        if (Config.SlidingWindowPattern > 0) then
+        begin
+          // cohere2: window on local layers, NoPE on global layers.
+          if LayerIsLocal then LayerWindow := Config.SlidingWindow
+          else LayerWindow := 0;
+        end
+        else
+          LayerWindow := 0; // cohere: full attention everywhere
+        // SHARED-LN PARALLEL residual: one input_layernorm feeds BOTH
+        // branches; one fused 3-input sum closes the block.
+        BranchInput := NN.GetLastLayer();
+        SharedLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Blocks[BlockCnt].LN1 := SharedLN;
+        // bias-free q/k/v projections (GQA: kv width may be narrower).
+        Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(QWidth), SharedLN);
+        Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), SharedLN);
+        Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), SharedLN);
+        if Config.UseQKNorm then
+        begin
+          SetLength(Blocks[BlockCnt].QNorms, Config.NumHeads);
+          SetLength(Blocks[BlockCnt].KNorms, Config.NumKVHeads);
+        end;
+        // RoPE iff this layer is rotary: cohere = always, cohere2 = only
+        // the sliding layers (global layers are NoPE).
+        // Build each KV head once (rotated/normed), shared across its group.
+        for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+        begin
+          KRotated[KVHeadCnt] := BuildQKHead(Blocks[BlockCnt].KProj,
+            KVHeadCnt, {IsQuery=}false,
+            {ApplyRoPE=}(Config.SlidingWindowPattern = 0) or LayerIsLocal);
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := KVHeadCnt * HeadDim + d;
+          VSlices[KVHeadCnt] := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
+        end;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          KVGroup := HeadCnt div GroupSize;
+          QSlice := BuildQKHead(Blocks[BlockCnt].QProj, HeadCnt,
+            {IsQuery=}true,
+            {ApplyRoPE=}(Config.SlidingWindowPattern = 0) or LayerIsLocal);
+          // Pack [Q_h | K_group | V_group] for SDPA (standard
+          // 1/sqrt(head_dim) scaling). LayerWindow>0 bands the causal mask.
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+            [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true,
+              {pWindow=}LayerWindow), HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        AttnOut := NN.GetLastLayer();
+        // MLP branch reads the SAME shared LN (parallel residual).
+        Blocks[BlockCnt].GateUp := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize),
+          SharedLN);
+        NN.AddLayer( TNNetSwiGLU.Create() );
+        Blocks[BlockCnt].Down := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        MlpOut := NN.GetLastLayer();
+        NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Cohere import: embed_tokens.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+        // LM head: logits = (h . embed^T) * logit_scale. With tied
+        // embeddings the scale is folded into every head weight row (the
+        // head alone reproduces the scaled logits, bias-free). An untied
+        // lm_head loads via LoadLlamaLinearWeights with the same Scale fold.
+        if Config.TieWordEmbeddings then
+        begin
+          EnsureWritableImportWeights(LMHead);
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Config.LogitScale * Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+            Config.HiddenSize, Config.VocabSize, 0, -1, 0, '',
+            Config.LogitScale);
+          MarkConsumed(LMHeadName);
+        end;
+      finally
+        Tmp.Free;
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'self_attn.';
+        LoadCohereLayerNormWeights(Reader, Blocks[BlockCnt].LN1,
+          BlockPrefix + 'input_layernorm.weight', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+        // bias-free q/k/v, rows loaded STRAIGHT (RotaryHeadDim=0: Cohere's
+        // interleaved RoPE pairing is already the layer's native layout).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+          AttnPrefix + 'q_proj.weight', Config.HiddenSize, QWidth);
+        MarkConsumed(AttnPrefix + 'q_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+          AttnPrefix + 'k_proj.weight', Config.HiddenSize, KVWidth);
+        MarkConsumed(AttnPrefix + 'k_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+          AttnPrefix + 'v_proj.weight', Config.HiddenSize, KVWidth);
+        MarkConsumed(AttnPrefix + 'v_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+          AttnPrefix + 'o_proj.weight', QWidth, Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'o_proj.weight');
+        if Config.UseQKNorm then
+        begin
+          LoadCohereHeadLayerNormWeights(Reader, Blocks[BlockCnt].QNorms,
+            AttnPrefix + 'q_norm.weight', Config.NumHeads, HeadDim);
+          MarkConsumed(AttnPrefix + 'q_norm.weight');
+          LoadCohereHeadLayerNormWeights(Reader, Blocks[BlockCnt].KNorms,
+            AttnPrefix + 'k_norm.weight', Config.NumKVHeads, HeadDim);
+          MarkConsumed(AttnPrefix + 'k_norm.weight');
+        end;
+        // SwiGLU: TNNetSwiGLU = FIRSTHALF * Swish(SECONDHALF); Cohere's MLP
+        // is down(silu(gate) * up), so up_proj -> neurons 0..I-1 and
+        // gate_proj -> I..2I-1.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+          BlockPrefix + 'mlp.up_proj.weight', Config.HiddenSize,
+          Config.IntermediateSize, 0, 2 * Config.IntermediateSize);
+        MarkConsumed(BlockPrefix + 'mlp.up_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+          BlockPrefix + 'mlp.gate_proj.weight', Config.HiddenSize,
+          Config.IntermediateSize, Config.IntermediateSize,
+          2 * Config.IntermediateSize);
+        MarkConsumed(BlockPrefix + 'mlp.gate_proj.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
+          BlockPrefix + 'mlp.down_proj.weight', Config.IntermediateSize,
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'mlp.down_proj.weight');
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadCohereLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'norm.weight', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'norm.weight');
+
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // rotary_emb.inv_freq: the persisted RoPE buffer (structural).
+        if Pos('.rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
+        ImportError('Cohere import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildCohereFromSafeTensorsEx(const FileName: string;
+  out Config: TCohereConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadCohereConfigFromJSONFile(ConfigPath);
+  Result := BuildCohereFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildCohereFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TCohereConfig;
+begin
+  Result := BuildCohereFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -6472,12 +14117,13 @@ type
 function BuildBertFromSafeTensorsWithConfig(const FileName: string;
   var Config: TBertConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false; pIncludePooler: boolean = false;
-  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+  pSeqClsHead: boolean = false; pQuantizeInt8: boolean = false;
+  pPaddingMask: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TBertBlockLayers;
-  InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN: TNNetLayer;
+  InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN, SegMaskSrc: TNNetLayer;
   PoolerDense, ClassifierDense, ClsHeadDense: TNNetLayer;
   ClsHeadName, ClsOutName: string;
   IncludePooler: boolean;
@@ -6602,10 +14248,24 @@ begin
       // Channel 0 = token ids, channel 1 = token-type (segment) ids
       // (IGNORED when the family has no token-type embeddings - the
       // distilbert case; the shape stays (SeqLen,1,2) for API uniformity).
-      InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
+      // pPaddingMask adds channel 2 = the per-position KEY-PADDING segment id
+      // (0 = real token, !=0 = a position excluded as a key from every real
+      // query's attention softmax); it is extracted below as the segment-mask
+      // source threaded into every attention block.
+      if pPaddingMask then
+        InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 3) )
+      else
+        InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
+      SegMaskSrc := nil;
+      if pPaddingMask then
+        // (SeqLen,1,1) per-sample segment-id source; varies across the batch.
+        SegMaskSrc := NN.AddLayerAfter(
+          TNNetSplitChannels.Create([2]), InputLayer);
       // Word branch: tokens -> embedding -> + learned absolute positions.
       // EncodeZero=1: token id 0 is [PAD], a REAL row in the BERT vocab.
-      NN.AddLayer( TNNetSplitChannels.Create([0]) );
+      // Anchored explicitly to InputLayer (GetLastLayer may be the segment
+      // mask source when pPaddingMask is on).
+      NN.AddLayerAfter( TNNetSplitChannels.Create([0]), InputLayer );
       WordEmb := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
       // The structural table only carries the USABLE rows: row p is
@@ -6637,9 +14297,15 @@ begin
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].QKV := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
-        // CausalMask=false: every position attends to all SeqLen keys.
+        // CausalMask=false: every position attends to all SeqLen keys
+        // (INTERSECTED with the key-padding segment mask when pPaddingMask is
+        // on - SegMaskSrc excludes the [PAD] key positions from every real
+        // query, so a short document is encoded exactly).
         Blocks[BlockCnt].AttnDense := NN.AddMultiHeadSelfAttention(
-          Config.NumHeads, {CausalMask=}false);
+          Config.NumHeads, {CausalMask=}false, {UseRoPE=}false, avSDPA,
+          {NumSinks=}1, {Window=}0, {RelPosNumBuckets=}32,
+          {RelPosMaxDistance=}128, {QKRMSNorm=}false,
+          {SegmentSource=}SegMaskSrc);
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         Blocks[BlockCnt].AttnLN := NN.AddLayer(
           TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
@@ -6883,6 +14549,16 @@ begin
         if (Config.Family in [bfBert, bfRoberta]) and
            (not IncludePooler) and
            (Pos('pooler.dense.', TensorNameStr) > 0) then continue;
+        // ColBERT projection head ([dim, hidden] no-bias "linear"): not part
+        // of a plain BERT export; BuildColBERTFromSafeTensorsEx loads it as a
+        // separate per-token head on top of this encoder.
+        if (TensorNameStr = 'linear.weight') or
+           (TensorNameStr = 'linear.bias') then continue;
+        // *ForQuestionAnswering span head ([2, hidden] qa_outputs): not part of
+        // a plain BERT export; BuildBertForQuestionAnsweringFromSafeTensorsEx
+        // loads it as a separate per-token head on top of this encoder.
+        if (TensorNameStr = 'qa_outputs.weight') or
+           (TensorNameStr = 'qa_outputs.bias') then continue;
         ImportError('BERT import: unexpected tensor "' + TensorNameStr +
           '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
           ') in ' + FileName + ' - refusing a partial import.');
@@ -7018,6 +14694,796 @@ begin
   end;
 end;
 
+procedure PoolSentenceEmbedding(HiddenStates: TNNetVolume;
+  RealTokens: integer; Pooling: TNNetEmbedPooling; Embedding: TNNetVolume;
+  Normalize: boolean = True);
+var
+  SeqLen, Depth, ChanCnt, SrcRow: integer;
+  Norm: TNeuralFloat;
+begin
+  SeqLen := HiddenStates.SizeX;
+  Depth := HiddenStates.Depth;
+  if (HiddenStates.SizeY <> 1) or (SeqLen < 1) or (Depth < 1) then
+    ImportError('PoolSentenceEmbedding: expected a (SeqLen,1,hidden) ' +
+      'volume, got ' + IntToStr(SeqLen) + 'x' +
+      IntToStr(HiddenStates.SizeY) + 'x' + IntToStr(Depth) + '.');
+  if (RealTokens < 1) or (RealTokens > SeqLen) then
+    ImportError('PoolSentenceEmbedding: RealTokens ' +
+      IntToStr(RealTokens) + ' out of range 1..' + IntToStr(SeqLen) + '.');
+  // mean path with normalization is exactly BertPoolSentenceEmbedding
+  if (Pooling = epMean) and Normalize then
+  begin
+    BertPoolSentenceEmbedding(HiddenStates, RealTokens, Embedding);
+    Exit;
+  end;
+  Embedding.ReSize(1, 1, Depth);
+  case Pooling of
+    epCLS:        SrcRow := 0;
+    epLastToken:  SrcRow := RealTokens - 1;
+  else
+    SrcRow := -1; // epMean (un-normalized) handled below
+  end;
+  if SrcRow >= 0 then
+    for ChanCnt := 0 to Depth - 1 do
+      Embedding.FData[ChanCnt] := HiddenStates.FData[SrcRow * Depth + ChanCnt]
+  else
+    for ChanCnt := 0 to Depth - 1 do
+    begin
+      Norm := 0; // reuse Norm as a row accumulator
+      for SrcRow := 0 to RealTokens - 1 do
+        Norm := Norm + HiddenStates.FData[SrcRow * Depth + ChanCnt];
+      Embedding.FData[ChanCnt] := Norm / RealTokens;
+    end;
+  if Normalize then
+  begin
+    Norm := 0;
+    for ChanCnt := 0 to Depth - 1 do
+      Norm := Norm + Embedding.FData[ChanCnt] * Embedding.FData[ChanCnt];
+    Norm := Sqrt(Norm);
+    if Norm > 0 then
+      for ChanCnt := 0 to Depth - 1 do
+        Embedding.FData[ChanCnt] := Embedding.FData[ChanCnt] / Norm;
+  end;
+end;
+
+function EmbedInstructionPrefix(Family: TNNetEmbedInstruction;
+  IsQuery: boolean; const Task: string = ''): string;
+var
+  TaskStr: string;
+begin
+  Result := '';
+  case Family of
+    efNone: Result := '';
+    efE5:
+      if IsQuery then Result := 'query: ' else Result := 'passage: ';
+    efBGE:
+      if IsQuery then
+        Result := 'Represent this sentence for searching relevant ' +
+          'passages: ';
+      // bge passages are embedded raw
+    efGteQwen2:
+      if IsQuery then
+      begin
+        TaskStr := Task;
+        if TaskStr = '' then
+          TaskStr := 'Given a web search query, retrieve relevant ' +
+            'passages that answer the query';
+        Result := 'Instruct: ' + TaskStr + #10 + 'Query: ';
+      end;
+      // gte-Qwen2 passages are embedded raw
+  end;
+end;
+
+function ApplyEmbedInstruction(Family: TNNetEmbedInstruction;
+  IsQuery: boolean; const Text: string; const Task: string = ''): string;
+begin
+  Result := EmbedInstructionPrefix(Family, IsQuery, Task) + Text;
+end;
+
+function CosineSimilarity(A, B: TNNetVolume): TNeuralFloat;
+var
+  Dot, NormA, NormB: TNeuralFloat;
+  Cnt: integer;
+begin
+  if A.Size <> B.Size then
+    ImportError('CosineSimilarity: vector size mismatch ' +
+      IntToStr(A.Size) + ' vs ' + IntToStr(B.Size) + '.');
+  Dot := 0; NormA := 0; NormB := 0;
+  for Cnt := 0 to A.Size - 1 do
+  begin
+    Dot   := Dot   + A.FData[Cnt] * B.FData[Cnt];
+    NormA := NormA + A.FData[Cnt] * A.FData[Cnt];
+    NormB := NormB + B.FData[Cnt] * B.FData[Cnt];
+  end;
+  if (NormA <= 0) or (NormB <= 0) then
+    Result := 0
+  else
+    Result := Dot / (Sqrt(NormA) * Sqrt(NormB));
+end;
+
+function PearsonCorrelation(const X, Y: array of TNeuralFloat): TNeuralFloat;
+var
+  N, Cnt: integer;
+  MeanX, MeanY, Cov, VarX, VarY, Dx, Dy: TNeuralFloat;
+begin
+  N := Length(X);
+  if N <> Length(Y) then
+    ImportError('PearsonCorrelation: length mismatch ' + IntToStr(N) +
+      ' vs ' + IntToStr(Length(Y)) + '.');
+  if N < 2 then
+    ImportError('PearsonCorrelation: need at least 2 points.');
+  MeanX := 0; MeanY := 0;
+  for Cnt := 0 to N - 1 do
+  begin
+    MeanX := MeanX + X[Cnt];
+    MeanY := MeanY + Y[Cnt];
+  end;
+  MeanX := MeanX / N; MeanY := MeanY / N;
+  Cov := 0; VarX := 0; VarY := 0;
+  for Cnt := 0 to N - 1 do
+  begin
+    Dx := X[Cnt] - MeanX;
+    Dy := Y[Cnt] - MeanY;
+    Cov  := Cov  + Dx * Dy;
+    VarX := VarX + Dx * Dx;
+    VarY := VarY + Dy * Dy;
+  end;
+  if (VarX <= 0) or (VarY <= 0) then
+    Result := NaN
+  else
+    Result := Cov / (Sqrt(VarX) * Sqrt(VarY));
+end;
+
+// Average-tie ranks: equal values share the mean of the ranks they span
+// (e.g. two values tied for ranks 3,4 both get 3.5). This is the standard
+// rank assignment that makes Spearman = Pearson-on-ranks consistent with
+// scipy.stats.spearmanr.
+function AverageTieRanks(const V: array of TNeuralFloat): TNeuralFloatDynArr;
+var
+  N, Cnt, i, j: integer;
+  Order: array of integer;
+  Tmp: integer;
+  RankSum: TNeuralFloat;
+begin
+  N := Length(V);
+  SetLength(Result, N);
+  SetLength(Order, N);
+  for Cnt := 0 to N - 1 do Order[Cnt] := Cnt;
+  // simple insertion sort of indices by ascending V (N is small in eval sets)
+  for i := 1 to N - 1 do
+  begin
+    Tmp := Order[i];
+    j := i - 1;
+    while (j >= 0) and (V[Order[j]] > V[Tmp]) do
+    begin
+      Order[j + 1] := Order[j];
+      Dec(j);
+    end;
+    Order[j + 1] := Tmp;
+  end;
+  // assign average ranks (1-based) to runs of equal values
+  i := 0;
+  while i < N do
+  begin
+    j := i;
+    while (j + 1 < N) and (V[Order[j + 1]] = V[Order[i]]) do Inc(j);
+    RankSum := 0;
+    for Cnt := i to j do RankSum := RankSum + (Cnt + 1);
+    RankSum := RankSum / (j - i + 1);
+    for Cnt := i to j do Result[Order[Cnt]] := RankSum;
+    i := j + 1;
+  end;
+end;
+
+function SpearmanCorrelation(const X, Y: array of TNeuralFloat): TNeuralFloat;
+var
+  RankX, RankY: TNeuralFloatDynArr;
+begin
+  if Length(X) <> Length(Y) then
+    ImportError('SpearmanCorrelation: length mismatch ' +
+      IntToStr(Length(X)) + ' vs ' + IntToStr(Length(Y)) + '.');
+  RankX := AverageTieRanks(X);
+  RankY := AverageTieRanks(Y);
+  Result := PearsonCorrelation(RankX, RankY);
+end;
+
+function STSReport(const Pred, Gold: array of TNeuralFloat): string;
+var
+  N: integer;
+  Pear, Spear: TNeuralFloat;
+begin
+  N := Length(Pred);
+  if N <> Length(Gold) then
+    ImportError('STSReport: Pred/Gold length mismatch ' + IntToStr(N) +
+      ' vs ' + IntToStr(Length(Gold)) + '.');
+  if N < 2 then
+    ImportError('STSReport: need at least 2 pairs.');
+  Pear  := PearsonCorrelation(Pred, Gold);
+  Spear := SpearmanCorrelation(Pred, Gold);
+  Result :=
+    '=== STS Report ===' + sLineBreak +
+    'pairs:    ' + IntToStr(N) + sLineBreak +
+    'Pearson:  ' + FloatToStrF(Pear,  ffFixed, 8, 4) + sLineBreak +
+    'Spearman: ' + FloatToStrF(Spear, ffFixed, 8, 4) + sLineBreak;
+end;
+
+function RetrievalReport(QueryEmb, PassageEmb: array of TNNetVolume;
+  const Relevant: array of TNeuralIntegerArray;
+  const KList: array of integer): string;
+var
+  NQ, NP, Qi, Pj, Ki, RankPos, RelIdx, MaxK: integer;
+  Scores: TNeuralFloatDynArr;
+  Order: array of integer;
+  Tmp: integer;
+  IsRel: array of boolean;
+  RecallSum: TNeuralFloatDynArr;
+  NDCGSum, DCG, IDCG, Gain: TNeuralFloat;
+  HitCount, NumRel, i, j: integer;
+begin
+  NQ := Length(QueryEmb);
+  NP := Length(PassageEmb);
+  if NQ <> Length(Relevant) then
+    ImportError('RetrievalReport: QueryEmb/Relevant length mismatch ' +
+      IntToStr(NQ) + ' vs ' + IntToStr(Length(Relevant)) + '.');
+  if (NQ < 1) or (NP < 1) then
+    ImportError('RetrievalReport: need >=1 query and >=1 passage.');
+  if Length(KList) < 1 then
+    ImportError('RetrievalReport: KList must list at least one k.');
+  SetLength(RecallSum, Length(KList));
+  for Ki := 0 to High(KList) do RecallSum[Ki] := 0;
+  NDCGSum := 0;
+  MaxK := 10; // nDCG@10
+  SetLength(Scores, NP);
+  SetLength(Order, NP);
+  SetLength(IsRel, NP);
+  for Qi := 0 to NQ - 1 do
+  begin
+    for Pj := 0 to NP - 1 do
+    begin
+      Scores[Pj] := CosineSimilarity(QueryEmb[Qi], PassageEmb[Pj]);
+      Order[Pj] := Pj;
+      IsRel[Pj] := False;
+    end;
+    NumRel := Length(Relevant[Qi]);
+    for RelIdx := 0 to NumRel - 1 do
+    begin
+      Pj := Relevant[Qi][RelIdx];
+      if (Pj < 0) or (Pj >= NP) then
+        ImportError('RetrievalReport: relevant passage index ' +
+          IntToStr(Pj) + ' for query ' + IntToStr(Qi) + ' out of range.');
+      IsRel[Pj] := True;
+    end;
+    // descending sort of passage indices by score (stable insertion sort,
+    // ties keep lower index first -> deterministic ranking)
+    for i := 1 to NP - 1 do
+    begin
+      Tmp := Order[i];
+      j := i - 1;
+      while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
+      begin
+        Order[j + 1] := Order[j];
+        Dec(j);
+      end;
+      Order[j + 1] := Tmp;
+    end;
+    // Recall@k for each requested k
+    for Ki := 0 to High(KList) do
+    begin
+      HitCount := 0;
+      for RankPos := 0 to KList[Ki] - 1 do
+        if (RankPos < NP) and IsRel[Order[RankPos]] then Inc(HitCount);
+      if NumRel > 0 then
+        RecallSum[Ki] := RecallSum[Ki] + HitCount / NumRel;
+    end;
+    // nDCG@10 (binary relevance: gain 1 per relevant hit)
+    DCG := 0;
+    for RankPos := 0 to MaxK - 1 do
+      if (RankPos < NP) and IsRel[Order[RankPos]] then
+      begin
+        Gain := 1;
+        DCG := DCG + Gain / (Ln(RankPos + 2) / Ln(2)); // log2(rank+1), rank 1-based
+      end;
+    IDCG := 0;
+    for RankPos := 0 to MaxK - 1 do
+      if RankPos < NumRel then
+        IDCG := IDCG + 1 / (Ln(RankPos + 2) / Ln(2));
+    if IDCG > 0 then
+      NDCGSum := NDCGSum + DCG / IDCG;
+  end;
+  Result :=
+    '=== Retrieval Report ===' + sLineBreak +
+    'queries:  ' + IntToStr(NQ) + sLineBreak +
+    'passages: ' + IntToStr(NP) + sLineBreak;
+  for Ki := 0 to High(KList) do
+    Result := Result + 'Recall@' + IntToStr(KList[Ki]) + ': ' +
+      FloatToStrF(RecallSum[Ki] / NQ, ffFixed, 8, 4) + sLineBreak;
+  Result := Result + 'nDCG@10:  ' +
+    FloatToStrF(NDCGSum / NQ, ffFixed, 8, 4) + sLineBreak;
+end;
+
+// ====================== COLBERT LATE INTERACTION ==========================
+
+function BuildColBERTFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; out ProjDim: integer; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pPaddingMask: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  ProjLayer: TNNetLayer;
+  ConfigPath: string;
+begin
+  // Build the stock BERT encoder (no pooler/seq-cls head). DEFER the
+  // inference-only/quantization pass: the projection head appended below must
+  // be loaded with writable weights first (the QA-head pattern).
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBertConfigFromJSONFile(ConfigPath);
+  Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    {pInferenceOnly=}false, {pIncludePooler=}false, {pSeqClsHead=}false,
+    {pQuantizeInt8=}false, {pPaddingMask=}pPaddingMask);
+  ProjDim := 0;
+  try
+    // Read ProjDim from "linear.weight" ([ProjDim, hidden], no bias).
+    Reader := CreatePretrainedTensorReader(FileName);
+    try
+      if not Reader.HasTensor('linear.weight') then
+        ImportError('ColBERT import: missing tensor "linear.weight" (the ' +
+          '[dim, hidden] projection head) - not a ColBERT checkpoint?');
+      if (Reader.DimCount('linear.weight') <> 2) or
+         (Reader.DimSize('linear.weight', 1) <> Config.HiddenSize) then
+        ImportError('ColBERT import: "linear.weight" must have shape ' +
+          '[dim, ' + IntToStr(Config.HiddenSize) + '] (nn.Linear stores ' +
+          '[out, in]), got ' + Reader.ShapeAsString('linear.weight'));
+      if Reader.HasTensor('linear.bias') then
+        ImportError('ColBERT import: "linear.bias" present - the ColBERT ' +
+          'projection head is bias-free; refusing the import.');
+      ProjDim := Reader.DimSize('linear.weight', 0);
+      // Per-token projection head: TNNetPointwiseConvLinear with bias
+      // suppressed (second arg 1).
+      ProjLayer := Result.AddLayer(
+        TNNetPointwiseConvLinear.Create(ProjDim, {pSuppressBias=}1) );
+      LoadLlamaLinearWeights(Reader, ProjLayer, 'linear.weight',
+        Config.HiddenSize, ProjDim, 0, -1, 0, {BiasName=}'');
+    finally
+      Reader.Free;
+    end;
+  except
+    on E: ESafeTensorsError do
+    begin
+      Result.Free;
+      raise EPretrainedImportError.Create(E.Message);
+    end;
+    on E: Exception do
+    begin
+      Result.Free;
+      raise;
+    end;
+  end;
+  if pInferenceOnly then Result.MakeInferenceOnly();
+  // Quantize AFTER the projection head is loaded so the int8 sweep covers it
+  // too (the projection head is a TNNetPointwiseConvLinear).
+  if pQuantizeInt8 then Result.QuantizeWeightsInt8();
+end;
+
+function BuildColBERTFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pPaddingMask: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TBertConfig;
+  IgnoredDim: integer;
+begin
+  Result := BuildColBERTFromSafeTensorsEx(FileName, IgnoredConfig, IgnoredDim,
+    pSeqLen, pInferenceOnly, '', pPaddingMask, pQuantizeInt8);
+end;
+
+function ColBERTDefaultMarkers(Tokenizer: TNeuralHFTokenizer):
+  TColBERTMarkers;
+begin
+  Result.ClsId  := Tokenizer.TokenToId('[CLS]');
+  Result.SepId  := Tokenizer.TokenToId('[SEP]');
+  Result.PadId  := Tokenizer.TokenToId('[PAD]');
+  Result.MaskId := Tokenizer.TokenToId('[MASK]');
+  if (Result.ClsId < 0) or (Result.SepId < 0) or (Result.MaskId < 0) then
+    ImportError('ColBERTDefaultMarkers: tokenizer has no [CLS]/[SEP]/[MASK] ' +
+      'special tokens (not a BERT-family tokenizer.json?).');
+  if Result.PadId < 0 then Result.PadId := 0; // BERT [PAD] is id 0
+  // [Q]/[D] = bert-base-uncased [unused0]/[unused1] (ids 1/2). Prefer the
+  // named tokens when present, else fall back to the canonical ids.
+  Result.QueryMarkerId := Tokenizer.TokenToId('[unused0]');
+  if Result.QueryMarkerId < 0 then Result.QueryMarkerId := 1;
+  Result.DocMarkerId := Tokenizer.TokenToId('[unused1]');
+  if Result.DocMarkerId < 0 then Result.DocMarkerId := 2;
+end;
+
+function ColBERTBuildInput(Tokenizer: TNeuralHFTokenizer; const Text: string;
+  IsQuery: boolean; const Markers: TColBERTMarkers; SeqLen: integer;
+  out RealTokens: integer): TNeuralIntegerArray;
+var
+  ContentIds: TNeuralIntegerArray;
+  Marker, FillId, ContentLen, Cnt, Used: integer;
+begin
+  if SeqLen < 4 then
+    ImportError('ColBERTBuildInput: SeqLen must be >= 4 ([CLS][Q/D] x ... ' +
+      '[SEP]).');
+  if IsQuery then
+  begin
+    Marker := Markers.QueryMarkerId;
+    FillId := Markers.MaskId; // query augmentation: pad with [MASK]
+  end
+  else
+  begin
+    Marker := Markers.DocMarkerId;
+    FillId := Markers.PadId;
+  end;
+  ContentIds := Tokenizer.Encode(Text);
+  ContentLen := Length(ContentIds);
+  // [CLS] [marker] content... [SEP] must fit in SeqLen -> content <= SeqLen-3.
+  if ContentLen > SeqLen - 3 then ContentLen := SeqLen - 3;
+  SetLength(Result, SeqLen);
+  Result[0] := Markers.ClsId;
+  Result[1] := Marker;
+  for Cnt := 0 to ContentLen - 1 do Result[Cnt + 2] := ContentIds[Cnt];
+  Result[ContentLen + 2] := Markers.SepId;
+  Used := ContentLen + 3; // [CLS][marker] content [SEP]
+  for Cnt := Used to SeqLen - 1 do Result[Cnt] := FillId;
+  // Query: the [MASK] augmentation rows ARE real inputs and contribute to
+  // MaxSim, so all SeqLen rows count. Document: only the non-[PAD] prefix.
+  if IsQuery then RealTokens := SeqLen
+  else RealTokens := Used;
+end;
+
+procedure ColBERTNormalizeRows(Mat: TNNetVolume);
+var
+  Rows, Dim, R, C: integer;
+  Norm: TNeuralFloat;
+begin
+  Rows := Mat.SizeX;
+  Dim := Mat.Depth;
+  if (Mat.SizeY <> 1) or (Rows < 1) or (Dim < 1) then
+    ImportError('ColBERTNormalizeRows: expected a (Rows,1,Dim) volume, got ' +
+      IntToStr(Rows) + 'x' + IntToStr(Mat.SizeY) + 'x' + IntToStr(Dim) + '.');
+  for R := 0 to Rows - 1 do
+  begin
+    Norm := 0;
+    for C := 0 to Dim - 1 do
+      Norm := Norm + Mat.FData[R * Dim + C] * Mat.FData[R * Dim + C];
+    Norm := Sqrt(Norm);
+    if Norm > 0 then
+      for C := 0 to Dim - 1 do
+        Mat.FData[R * Dim + C] := Mat.FData[R * Dim + C] / Norm;
+  end;
+end;
+
+procedure ColBERTEmbedTokens(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Text: string; IsQuery: boolean; const Markers: TColBERTMarkers;
+  Mat: TNNetVolume);
+var
+  TokenIds: TNeuralIntegerArray;
+  Input, Proj: TNNetVolume;
+  SeqLen, Dim, RealTokens, PosCnt, ChanCnt, InDepth: integer;
+begin
+  SeqLen := Net.Layers[0].Output.SizeX;
+  InDepth := Net.Layers[0].Output.Depth;
+  if (InDepth <> 2) and (InDepth <> 3) then
+    ImportError('ColBERTEmbedTokens: net input is not (SeqLen,1,2) or ' +
+      '(SeqLen,1,3) - not a BuildColBERTFromSafeTensors encoder?');
+  TokenIds := ColBERTBuildInput(Tokenizer, Text, IsQuery, Markers, SeqLen,
+    RealTokens);
+  Input := TNNetVolume.Create();
+  Proj := TNNetVolume.Create();
+  try
+    Input.ReSize(SeqLen, 1, InDepth);
+    Input.Fill(0); // single segment: token-type channel all zeros
+    for PosCnt := 0 to SeqLen - 1 do
+      Input.FData[PosCnt * InDepth] := TokenIds[PosCnt];
+    // Key-padding-mask channel (only present when the net was built with
+    // pPaddingMask): real prefix (positions < RealTokens) = segment 0, the
+    // [PAD] tail = segment 1 so real tokens never attend the pad rows. A
+    // query has RealTokens = SeqLen, so its mask is all-zero (no change).
+    if InDepth = 3 then
+      for PosCnt := 0 to SeqLen - 1 do
+        if PosCnt >= RealTokens then
+          Input.FData[PosCnt * InDepth + 2] := 1;
+    Net.Compute(Input);
+    Net.GetOutput(Proj);
+    Dim := Proj.Depth;
+    if (Proj.SizeX <> SeqLen) or (Proj.SizeY <> 1) then
+      ImportError('ColBERTEmbedTokens: unexpected output shape ' +
+        IntToStr(Proj.SizeX) + 'x' + IntToStr(Proj.SizeY) + 'x' +
+        IntToStr(Dim) + '.');
+    // Keep only the MaxSim-contributing rows (skip [PAD] for documents).
+    Mat.ReSize(RealTokens, 1, Dim);
+    for PosCnt := 0 to RealTokens - 1 do
+      for ChanCnt := 0 to Dim - 1 do
+        Mat.FData[PosCnt * Dim + ChanCnt] :=
+          Proj.FData[PosCnt * Dim + ChanCnt];
+    ColBERTNormalizeRows(Mat);
+  finally
+    Proj.Free;
+    Input.Free;
+  end;
+end;
+
+function ColBERTMaxSimScore(QueryMat, DocMat: TNNetVolume): TNeuralFloat;
+var
+  QRows, DRows, Dim, Qi, Di, C: integer;
+  Dot, Best: TNeuralFloat;
+begin
+  Dim := QueryMat.Depth;
+  QRows := QueryMat.SizeX;
+  DRows := DocMat.SizeX;
+  if (QueryMat.SizeY <> 1) or (DocMat.SizeY <> 1) or
+     (QRows < 1) or (DRows < 1) or (Dim < 1) then
+    ImportError('ColBERTMaxSimScore: expected (Rows,1,Dim) matrices, got ' +
+      IntToStr(QRows) + 'x' + IntToStr(QueryMat.SizeY) + 'x' + IntToStr(Dim) +
+      ' and ' + IntToStr(DRows) + 'x' + IntToStr(DocMat.SizeY) + 'x' +
+      IntToStr(DocMat.Depth) + '.');
+  if DocMat.Depth <> Dim then
+    ImportError('ColBERTMaxSimScore: dim mismatch query ' + IntToStr(Dim) +
+      ' vs doc ' + IntToStr(DocMat.Depth) + '.');
+  Result := 0;
+  for Qi := 0 to QRows - 1 do
+  begin
+    Best := -1e30;
+    for Di := 0 to DRows - 1 do
+    begin
+      Dot := 0;
+      for C := 0 to Dim - 1 do
+        Dot := Dot + QueryMat.FData[Qi * Dim + C] * DocMat.FData[Di * Dim + C];
+      if Dot > Best then Best := Dot;
+    end;
+    Result := Result + Best;
+  end;
+end;
+
+function ColBERTRetrievalReport(QueryMats, DocMats: array of TNNetVolume;
+  const Relevant: array of TNeuralIntegerArray;
+  const KList: array of integer): string;
+var
+  NQ, NP, Qi, Pj, Ki, RankPos, RelIdx, MaxK: integer;
+  Scores: TNeuralFloatDynArr;
+  Order: array of integer;
+  Tmp: integer;
+  IsRel: array of boolean;
+  RecallSum: TNeuralFloatDynArr;
+  NDCGSum, DCG, IDCG: TNeuralFloat;
+  HitCount, NumRel, i, j: integer;
+begin
+  NQ := Length(QueryMats);
+  NP := Length(DocMats);
+  if NQ <> Length(Relevant) then
+    ImportError('ColBERTRetrievalReport: QueryMats/Relevant length mismatch ' +
+      IntToStr(NQ) + ' vs ' + IntToStr(Length(Relevant)) + '.');
+  if (NQ < 1) or (NP < 1) then
+    ImportError('ColBERTRetrievalReport: need >=1 query and >=1 doc.');
+  if Length(KList) < 1 then
+    ImportError('ColBERTRetrievalReport: KList must list at least one k.');
+  SetLength(RecallSum, Length(KList));
+  for Ki := 0 to High(KList) do RecallSum[Ki] := 0;
+  NDCGSum := 0;
+  MaxK := 10; // nDCG@10
+  SetLength(Scores, NP);
+  SetLength(Order, NP);
+  SetLength(IsRel, NP);
+  for Qi := 0 to NQ - 1 do
+  begin
+    for Pj := 0 to NP - 1 do
+    begin
+      Scores[Pj] := ColBERTMaxSimScore(QueryMats[Qi], DocMats[Pj]);
+      Order[Pj] := Pj;
+      IsRel[Pj] := False;
+    end;
+    NumRel := Length(Relevant[Qi]);
+    for RelIdx := 0 to NumRel - 1 do
+    begin
+      Pj := Relevant[Qi][RelIdx];
+      if (Pj < 0) or (Pj >= NP) then
+        ImportError('ColBERTRetrievalReport: relevant doc index ' +
+          IntToStr(Pj) + ' for query ' + IntToStr(Qi) + ' out of range.');
+      IsRel[Pj] := True;
+    end;
+    // descending stable insertion sort by MaxSim (ties keep lower index)
+    for i := 1 to NP - 1 do
+    begin
+      Tmp := Order[i];
+      j := i - 1;
+      while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
+      begin
+        Order[j + 1] := Order[j];
+        Dec(j);
+      end;
+      Order[j + 1] := Tmp;
+    end;
+    for Ki := 0 to High(KList) do
+    begin
+      HitCount := 0;
+      for RankPos := 0 to KList[Ki] - 1 do
+        if (RankPos < NP) and IsRel[Order[RankPos]] then Inc(HitCount);
+      if NumRel > 0 then
+        RecallSum[Ki] := RecallSum[Ki] + HitCount / NumRel;
+    end;
+    DCG := 0;
+    for RankPos := 0 to MaxK - 1 do
+      if (RankPos < NP) and IsRel[Order[RankPos]] then
+        DCG := DCG + 1 / (Ln(RankPos + 2) / Ln(2));
+    IDCG := 0;
+    for RankPos := 0 to MaxK - 1 do
+      if RankPos < NumRel then
+        IDCG := IDCG + 1 / (Ln(RankPos + 2) / Ln(2));
+    if IDCG > 0 then
+      NDCGSum := NDCGSum + DCG / IDCG;
+  end;
+  Result :=
+    '=== ColBERT Retrieval Report (MaxSim) ===' + sLineBreak +
+    'queries:  ' + IntToStr(NQ) + sLineBreak +
+    'docs:     ' + IntToStr(NP) + sLineBreak;
+  for Ki := 0 to High(KList) do
+    Result := Result + 'Recall@' + IntToStr(KList[Ki]) + ': ' +
+      FloatToStrF(RecallSum[Ki] / NQ, ffFixed, 8, 4) + sLineBreak;
+  Result := Result + 'nDCG@10:  ' +
+    FloatToStrF(NDCGSum / NQ, ffFixed, 8, 4) + sLineBreak;
+end;
+
+{ TColBERTIndex }
+
+constructor TColBERTIndex.Create(ANet: TNNet;
+  ATokenizer: TNeuralHFTokenizer);
+begin
+  CreateWithMarkers(ANet, ATokenizer, ColBERTDefaultMarkers(ATokenizer));
+end;
+
+constructor TColBERTIndex.CreateWithMarkers(ANet: TNNet;
+  ATokenizer: TNeuralHFTokenizer; const AMarkers: TColBERTMarkers);
+begin
+  inherited Create();
+  if ANet = nil then
+    ImportError('TColBERTIndex: Net must not be nil.');
+  if ATokenizer = nil then
+    ImportError('TColBERTIndex: Tokenizer must not be nil.');
+  FNet := ANet;
+  FTokenizer := ATokenizer;
+  FMarkers := AMarkers;
+  FCount := 0;
+  SetLength(FDocMats, 0);
+  SetLength(FDocTexts, 0);
+end;
+
+destructor TColBERTIndex.Destroy;
+begin
+  Clear();
+  inherited Destroy;
+end;
+
+procedure TColBERTIndex.Clear;
+var
+  i: integer;
+begin
+  for i := 0 to FCount - 1 do
+    if FDocMats[i] <> nil then FDocMats[i].Free;
+  SetLength(FDocMats, 0);
+  SetLength(FDocTexts, 0);
+  FCount := 0;
+end;
+
+function TColBERTIndex.GetDocText(Index: integer): string;
+begin
+  if (Index < 0) or (Index >= FCount) then
+    ImportError('TColBERTIndex.DocText: index ' + IntToStr(Index) +
+      ' out of range [0,' + IntToStr(FCount - 1) + '].');
+  Result := FDocTexts[Index];
+end;
+
+function TColBERTIndex.GetDocMatrix(Index: integer): TNNetVolume;
+begin
+  if (Index < 0) or (Index >= FCount) then
+    ImportError('TColBERTIndex.DocMatrix: index ' + IntToStr(Index) +
+      ' out of range [0,' + IntToStr(FCount - 1) + '].');
+  Result := FDocMats[Index];
+end;
+
+function TColBERTIndex.AddDocument(const Text: string): integer;
+var
+  Mat: TNNetVolume;
+begin
+  Mat := TNNetVolume.Create();
+  try
+    ColBERTEmbedTokens(FNet, FTokenizer, Text, {IsQuery=}false, FMarkers, Mat);
+  except
+    Mat.Free;
+    raise;
+  end;
+  Result := FCount;
+  SetLength(FDocMats, FCount + 1);
+  SetLength(FDocTexts, FCount + 1);
+  FDocMats[FCount] := Mat;
+  FDocTexts[FCount] := Text;
+  Inc(FCount);
+end;
+
+procedure TColBERTIndex.AddCorpus(const Corpus: array of string);
+var
+  i: integer;
+begin
+  for i := 0 to High(Corpus) do
+    AddDocument(Corpus[i]);
+end;
+
+procedure TColBERTIndex.EncodeQuery(const Query: string;
+  QueryMat: TNNetVolume);
+begin
+  if QueryMat = nil then
+    ImportError('TColBERTIndex.EncodeQuery: QueryMat must not be nil.');
+  ColBERTEmbedTokens(FNet, FTokenizer, Query, {IsQuery=}true, FMarkers,
+    QueryMat);
+end;
+
+function TColBERTIndex.ScoreQuery(const Query: string;
+  DocIndex: integer): TNeuralFloat;
+var
+  QueryMat: TNNetVolume;
+begin
+  if (DocIndex < 0) or (DocIndex >= FCount) then
+    ImportError('TColBERTIndex.ScoreQuery: DocIndex ' + IntToStr(DocIndex) +
+      ' out of range [0,' + IntToStr(FCount - 1) + '].');
+  QueryMat := TNNetVolume.Create();
+  try
+    EncodeQuery(Query, QueryMat);
+    Result := ColBERTMaxSimScore(QueryMat, FDocMats[DocIndex]);
+  finally
+    QueryMat.Free;
+  end;
+end;
+
+procedure TColBERTIndex.ScoreAll(const Query: string;
+  out Scores: TNeuralFloatDynArr);
+var
+  QueryMat: TNNetVolume;
+  i: integer;
+begin
+  SetLength(Scores, FCount);
+  if FCount = 0 then Exit;
+  QueryMat := TNNetVolume.Create();
+  try
+    EncodeQuery(Query, QueryMat);
+    for i := 0 to FCount - 1 do
+      Scores[i] := ColBERTMaxSimScore(QueryMat, FDocMats[i]);
+  finally
+    QueryMat.Free;
+  end;
+end;
+
+function TColBERTIndex.Search(const Query: string;
+  TopK: integer): TColBERTHitArray;
+var
+  Scores: TNeuralFloatDynArr;
+  Order: array of integer;
+  i, j, Tmp: integer;
+begin
+  ScoreAll(Query, Scores);
+  SetLength(Order, FCount);
+  for i := 0 to FCount - 1 do Order[i] := i;
+  // descending insertion sort by score (stable for the small corpora ColBERT
+  // demos use; matches the example's hand-rolled ranking exactly).
+  for i := 1 to FCount - 1 do
+  begin
+    Tmp := Order[i]; j := i - 1;
+    while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
+    begin
+      Order[j + 1] := Order[j]; Dec(j);
+    end;
+    Order[j + 1] := Tmp;
+  end;
+  if (TopK <= 0) or (TopK > FCount) then TopK := FCount;
+  SetLength(Result, TopK);
+  for i := 0 to TopK - 1 do
+  begin
+    Result[i].DocIndex := Order[i];
+    Result[i].Score := Scores[Order[i]];
+    Result[i].Text := FDocTexts[Order[i]];
+  end;
+end;
+
 // =================== SEQUENCE CLASSIFICATION IMPORT =======================
 
 function ReadId2LabelFromJSONFile(const FileName: string): TStringList;
@@ -7142,6 +15608,206 @@ begin
     IgnoredConfig, nil, pSeqLen, pInferenceOnly, '', pQuantizeInt8);
 end;
 
+// ----------------------- CROSS-ENCODER RERANKER --------------------------
+
+procedure BertTokenizePair(Tokenizer: TNeuralHFTokenizer;
+  const TextA, TextB: string; out TokenIds, SegmentIds: TNeuralIntegerArray;
+  MaxTokens: integer = 0);
+var
+  IdsA, IdsB: TNeuralIntegerArray;
+  ClsId, SepId, LenA, LenB, Cnt, Pos, Budget: integer;
+begin
+  ClsId := Tokenizer.TokenToId('[CLS]');
+  SepId := Tokenizer.TokenToId('[SEP]');
+  if (ClsId < 0) or (SepId < 0) then
+    ImportError('BertTokenizePair: tokenizer has no [CLS]/[SEP] special ' +
+      'tokens (not a BERT-family tokenizer.json?).');
+  if (MaxTokens > 0) and (MaxTokens < 3) then
+    ImportError('BertTokenizePair: MaxTokens must be 0 or >= 3 ([CLS] and ' +
+      'two [SEP]s alone need three positions).');
+  IdsA := Tokenizer.Encode(TextA);
+  IdsB := Tokenizer.Encode(TextB);
+  LenA := Length(IdsA);
+  LenB := Length(IdsB);
+  // HF "longest_first" truncation: 3 positions reserved for [CLS]/[SEP]/[SEP],
+  // then drop the LONGER segment's tail one token at a time until it fits.
+  if MaxTokens > 0 then
+  begin
+    Budget := MaxTokens - 3;
+    while LenA + LenB > Budget do
+      if LenA >= LenB then Dec(LenA) else Dec(LenB);
+    if LenA < 0 then LenA := 0;
+    if LenB < 0 then LenB := 0;
+  end;
+  // [CLS] A [SEP] B [SEP] - segment 0 over "[CLS] A [SEP]", 1 over "B [SEP]".
+  SetLength(TokenIds, LenA + LenB + 3);
+  SetLength(SegmentIds, LenA + LenB + 3);
+  Pos := 0;
+  TokenIds[Pos] := ClsId; SegmentIds[Pos] := 0; Inc(Pos);
+  for Cnt := 0 to LenA - 1 do
+  begin
+    TokenIds[Pos] := IdsA[Cnt]; SegmentIds[Pos] := 0; Inc(Pos);
+  end;
+  TokenIds[Pos] := SepId; SegmentIds[Pos] := 0; Inc(Pos);
+  for Cnt := 0 to LenB - 1 do
+  begin
+    TokenIds[Pos] := IdsB[Cnt]; SegmentIds[Pos] := 1; Inc(Pos);
+  end;
+  TokenIds[Pos] := SepId; SegmentIds[Pos] := 1; Inc(Pos);
+end;
+
+function CrossEncoderScore(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query, Passage: string;
+  ApplySigmoid: boolean = True): TNeuralFloat;
+var
+  TokenIds, SegmentIds: TNeuralIntegerArray;
+  Input, Output: TNNetVolume;
+  SeqLen, PadId, Pos: integer;
+begin
+  SeqLen := Net.Layers[0].Output.SizeX;
+  if Net.Layers[0].Output.Depth <> 2 then
+    ImportError('CrossEncoderScore: net input is not (SeqLen,1,2) - not a ' +
+      'BuildBertForSequenceClassification reranker?');
+  BertTokenizePair(Tokenizer, Query, Passage, TokenIds, SegmentIds, SeqLen);
+  PadId := Tokenizer.TokenToId('[PAD]');
+  if PadId < 0 then PadId := 0; // BERT-family [PAD] is id 0 anyway
+  Input := TNNetVolume.Create();
+  Output := TNNetVolume.Create();
+  try
+    Input.ReSize(SeqLen, 1, 2);
+    Input.Fill(0); // pad rows: token=PadId below, segment 0
+    for Pos := 0 to SeqLen - 1 do
+      if Pos < Length(TokenIds) then
+      begin
+        Input.FData[Pos * 2]     := TokenIds[Pos];
+        Input.FData[Pos * 2 + 1] := SegmentIds[Pos];
+      end
+      else
+        Input.FData[Pos * 2] := PadId;
+    Net.Compute(Input);
+    Net.GetOutput(Output);
+    // num_labels=1: the [CLS] (row 0) relevance logit.
+    Result := Output.FData[0];
+    if ApplySigmoid then Result := Sigmoid(Result);
+  finally
+    Output.Free;
+    Input.Free;
+  end;
+end;
+
+procedure RerankPassages(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query: string; const Passages: array of string;
+  out Order: TNeuralIntegerArray; out Scores: TNeuralFloatDynArr);
+var
+  NP, Pj, i, j, Tmp: integer;
+  RawScores: TNeuralFloatDynArr;
+begin
+  NP := Length(Passages);
+  if NP < 1 then
+    ImportError('RerankPassages: need at least one candidate passage.');
+  SetLength(RawScores, NP);
+  SetLength(Order, NP);
+  for Pj := 0 to NP - 1 do
+  begin
+    RawScores[Pj] := CrossEncoderScore(Net, Tokenizer, Query, Passages[Pj],
+      {ApplySigmoid=}True);
+    Order[Pj] := Pj;
+  end;
+  // descending stable insertion sort by score (ties keep original order).
+  for i := 1 to NP - 1 do
+  begin
+    Tmp := Order[i];
+    j := i - 1;
+    while (j >= 0) and (RawScores[Order[j]] < RawScores[Tmp]) do
+    begin
+      Order[j + 1] := Order[j];
+      Dec(j);
+    end;
+    Order[j + 1] := Tmp;
+  end;
+  SetLength(Scores, NP);
+  for i := 0 to NP - 1 do Scores[i] := RawScores[Order[i]];
+end;
+
+function RerankReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Query: string; const Passages: array of string;
+  const Relevant: TNeuralIntegerArray;
+  const KList: array of integer): string;
+var
+  NP, NumRel, RelIdx, Pj, Ki, RankPos: integer;
+  IsRel: array of boolean;
+  Order: TNeuralIntegerArray;
+  Scores: TNeuralFloatDynArr;
+
+  function ReciprocalRank(const Ord: array of integer): TNeuralFloat;
+  var r: integer;
+  begin
+    Result := 0;
+    for r := 0 to High(Ord) do
+      if IsRel[Ord[r]] then begin Result := 1 / (r + 1); Exit; end;
+  end;
+
+  function NDCGAtK(const Ord: array of integer; K: integer): TNeuralFloat;
+  var r: integer; DCG, IDCG: TNeuralFloat;
+  begin
+    DCG := 0;
+    for r := 0 to K - 1 do
+      if (r < Length(Ord)) and IsRel[Ord[r]] then
+        DCG := DCG + 1 / (Ln(r + 2) / Ln(2)); // log2(rank+1), rank 1-based
+    IDCG := 0;
+    for r := 0 to K - 1 do
+      if r < NumRel then IDCG := IDCG + 1 / (Ln(r + 2) / Ln(2));
+    if IDCG > 0 then Result := DCG / IDCG else Result := 0;
+  end;
+
+var
+  BeforeOrder: TNeuralIntegerArray;
+  r: integer;
+begin
+  NP := Length(Passages);
+  if NP < 1 then ImportError('RerankReport: need >=1 passage.');
+  if Length(KList) < 1 then
+    ImportError('RerankReport: KList must list at least one k.');
+  SetLength(IsRel, NP);
+  for Pj := 0 to NP - 1 do IsRel[Pj] := False;
+  NumRel := Length(Relevant);
+  for RelIdx := 0 to NumRel - 1 do
+  begin
+    Pj := Relevant[RelIdx];
+    if (Pj < 0) or (Pj >= NP) then
+      ImportError('RerankReport: relevant index ' + IntToStr(Pj) +
+        ' out of range 0..' + IntToStr(NP - 1) + '.');
+    IsRel[Pj] := True;
+  end;
+  // BEFORE = the initial (retrieval) order: identity.
+  SetLength(BeforeOrder, NP);
+  for r := 0 to NP - 1 do BeforeOrder[r] := r;
+  // AFTER = cross-encoder rerank.
+  RerankPassages(Net, Tokenizer, Query, Passages, Order, Scores);
+  Result :=
+    '=== Rerank Report ===' + sLineBreak +
+    'candidates: ' + IntToStr(NP) + sLineBreak +
+    'relevant:   ' + IntToStr(NumRel) + sLineBreak +
+    'MRR    before -> after: ' +
+      FloatToStrF(ReciprocalRank(BeforeOrder), ffFixed, 8, 4) + ' -> ' +
+      FloatToStrF(ReciprocalRank(Order), ffFixed, 8, 4) + sLineBreak;
+  for Ki := 0 to High(KList) do
+    Result := Result + 'nDCG@' + IntToStr(KList[Ki]) +
+      ' before -> after: ' +
+      FloatToStrF(NDCGAtK(BeforeOrder, KList[Ki]), ffFixed, 8, 4) + ' -> ' +
+      FloatToStrF(NDCGAtK(Order, KList[Ki]), ffFixed, 8, 4) + sLineBreak;
+  // top-ranked-after listing for eyeballing.
+  Result := Result + 'top-after: ';
+  for RankPos := 0 to NP - 1 do
+  begin
+    if RankPos >= 3 then Break;
+    Result := Result + '#' + IntToStr(Order[RankPos]) + '(' +
+      FloatToStrF(Scores[RankPos], ffFixed, 8, 3) + ')';
+    if (RankPos < 2) and (RankPos < NP - 1) then Result := Result + ' ';
+  end;
+  Result := Result + sLineBreak;
+end;
+
 function BuildGPT2ForSequenceClassificationFromSafeTensorsEx(
   const FileName: string; out Config: TGPT2Config; Id2Label: TStringList;
   pSeqLen: integer = 0; pNumHeads: integer = 0;
@@ -7179,6 +15845,853 @@ begin
   Result := BuildGPT2ForSequenceClassificationFromSafeTensorsEx(FileName,
     IgnoredConfig, nil, pSeqLen, pNumHeads, pInferenceOnly, '',
     pQuantizeInt8);
+end;
+
+// =================== EXTRACTIVE QUESTION ANSWERING (SQuAD) ================
+
+function BuildBertForQuestionAnsweringFromSafeTensorsEx(const FileName: string;
+  out Config: TBertConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  ConfigPath: string;
+  Head, StartLayer, EndLayer: TNNetLayer;
+  StartIdx: integer;
+begin
+  // Build the stock BERT-family encoder (no pooler, no seq-cls head). DEFER
+  // the inference-only / int8 pass: the qa_outputs head appended below must
+  // be loaded with writable weights first (the ColBERT pattern).
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBertConfigFromJSONFile(ConfigPath);
+  Result := BuildBertFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    {pInferenceOnly=}false, {pIncludePooler=}false, {pSeqClsHead=}false,
+    {pQuantizeInt8=}false);
+  try
+    // AddQuestionAnsweringHead returns the (SeqLen,1,2) DeepConcat; the two
+    // [hidden -> 1] per-token projections are the two layers right before it:
+    // StartLogit (channel 0) then EndLogit (channel 1).
+    Head := Result.AddQuestionAnsweringHead();
+    StartIdx := Result.Layers.Count - 3;
+    StartLayer := Result.Layers[StartIdx];
+    EndLayer := Result.Layers[StartIdx + 1];
+    if (Head = nil) or
+       (not (StartLayer is TNNetPointwiseConvLinear)) or
+       (not (EndLayer is TNNetPointwiseConvLinear)) or
+       (StartLayer.Neurons.Count <> 1) or (EndLayer.Neurons.Count <> 1) then
+      ImportError('QA import: internal error wiring AddQuestionAnsweringHead.');
+    Reader := CreatePretrainedTensorReader(FileName);
+    try
+      if not Reader.HasTensor('qa_outputs.weight') then
+        ImportError('QA import: missing tensor "qa_outputs.weight" (the ' +
+          '[2, hidden] span head) - not a *ForQuestionAnswering checkpoint?');
+      if (Reader.DimCount('qa_outputs.weight') <> 2) or
+         (Reader.DimSize('qa_outputs.weight', 0) <> 2) or
+         (Reader.DimSize('qa_outputs.weight', 1) <> Config.HiddenSize) then
+        ImportError('QA import: "qa_outputs.weight" must have shape ' +
+          '[2, ' + IntToStr(Config.HiddenSize) + '] (nn.Linear stores ' +
+          '[out, in]), got ' + Reader.ShapeAsString('qa_outputs.weight'));
+      // Row 0 -> start projection, row 1 -> end projection. SrcRows=2 selects
+      // the right weight/bias row via SrcRowBase (start=0, end=1).
+      LoadLlamaLinearWeights(Reader, StartLayer, 'qa_outputs.weight',
+        Config.HiddenSize, 1, 0, 1, 0, 'qa_outputs.bias', 1.0, 0, 0, 2);
+      LoadLlamaLinearWeights(Reader, EndLayer, 'qa_outputs.weight',
+        Config.HiddenSize, 1, 0, 1, 0, 'qa_outputs.bias', 1.0, 0, 1, 2);
+    finally
+      Reader.Free;
+    end;
+  except
+    on E: ESafeTensorsError do
+    begin
+      Result.Free;
+      raise EPretrainedImportError.Create(E.Message);
+    end;
+    on E: Exception do
+    begin
+      Result.Free;
+      raise;
+    end;
+  end;
+  if pInferenceOnly then Result.MakeInferenceOnly();
+  if pQuantizeInt8 then Result.QuantizeWeightsInt8();
+end;
+
+function BuildBertForQuestionAnsweringFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TBertConfig;
+begin
+  Result := BuildBertForQuestionAnsweringFromSafeTensorsEx(FileName,
+    IgnoredConfig, pSeqLen, pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function AnswerSpan(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Question, Context: string; out StartChar, EndChar: integer;
+  out Score, NoAnswerScore: TNeuralFloat;
+  MaxAnswerLen: integer = 0): string;
+var
+  QOff, COff: TNeuralTokenOffsetArray;
+  SeqLen, ClsId, SepId, PadId: integer;
+  Input, Output: TNNetVolume;
+  Pos, QCnt, CCnt, ContextBase, ContextCnt, Used: integer;
+  IsContext: array of boolean;       // per seq position: an eligible answer token
+  CtxOffStart, CtxOffLen: array of integer; // per seq position: char span into Context
+  StartLogit, EndLogit: TNeuralFloat;
+  s, e, BestS, BestE: integer;
+  Best: TNeuralFloat;
+begin
+  StartChar := -1;
+  EndChar := -1;
+  Score := 0;
+  NoAnswerScore := 0;
+  if MaxAnswerLen <= 0 then MaxAnswerLen := 30;
+  SeqLen := Net.Layers[0].Output.SizeX;
+  if Net.Layers[0].Output.Depth <> 2 then
+    ImportError('AnswerSpan: net input is not (SeqLen,1,2) - not a ' +
+      'BuildBertForQuestionAnswering encoder?');
+  ClsId := Tokenizer.TokenToId('[CLS]');
+  SepId := Tokenizer.TokenToId('[SEP]');
+  if (ClsId < 0) or (SepId < 0) then
+  begin
+    // RoBERTa-family <s>/</s> fallback.
+    ClsId := Tokenizer.TokenToId('<s>');
+    SepId := Tokenizer.TokenToId('</s>');
+  end;
+  if (ClsId < 0) or (SepId < 0) then
+    ImportError('AnswerSpan: tokenizer has no [CLS]/[SEP] (or <s>/</s>) ' +
+      'special tokens.');
+  PadId := Tokenizer.TokenToId('[PAD]');
+  if PadId < 0 then PadId := Tokenizer.TokenToId('<pad>');
+  if PadId < 0 then PadId := 0;
+
+  QOff := Tokenizer.EncodeWithOffsets(Question);
+  COff := Tokenizer.EncodeWithOffsets(Context);
+
+  Input := TNNetVolume.Create();
+  Output := TNNetVolume.Create();
+  SetLength(IsContext, SeqLen);
+  SetLength(CtxOffStart, SeqLen);
+  SetLength(CtxOffLen, SeqLen);
+  try
+    Input.ReSize(SeqLen, 1, 2);
+    Input.Fill(0); // segment ids: 0 everywhere here (works for distilbert/roberta
+                   // which ignore them; BERT QA is robust to all-zero segments).
+    for Pos := 0 to SeqLen - 1 do IsContext[Pos] := False;
+    // [CLS] question [SEP] context [SEP], truncating context to fit.
+    Pos := 0;
+    Input.FData[Pos * 2] := ClsId; Inc(Pos);
+    for QCnt := 0 to High(QOff) do
+    begin
+      if Pos >= SeqLen - 2 then Break; // leave room for [SEP] context [SEP]
+      Input.FData[Pos * 2] := QOff[QCnt].Id; Inc(Pos);
+    end;
+    if Pos >= SeqLen - 1 then Pos := SeqLen - 2;
+    Input.FData[Pos * 2] := SepId; Inc(Pos);
+    ContextBase := Pos;
+    ContextCnt := 0;
+    for CCnt := 0 to High(COff) do
+    begin
+      if Pos >= SeqLen - 1 then Break; // leave room for the trailing [SEP]
+      Input.FData[Pos * 2] := COff[CCnt].Id;
+      // Only real-surface context tokens are eligible answer positions.
+      if COff[CCnt].Length > 0 then
+      begin
+        IsContext[Pos] := True;
+        // EncodeWithOffsets Start is 1-based; convert to 0-based [start,end).
+        CtxOffStart[Pos] := COff[CCnt].Start - 1;
+        CtxOffLen[Pos] := COff[CCnt].Length;
+      end;
+      Inc(Pos); Inc(ContextCnt);
+    end;
+    Input.FData[Pos * 2] := SepId; Inc(Pos);
+    Used := Pos;
+    for Pos := Used to SeqLen - 1 do Input.FData[Pos * 2] := PadId;
+
+    Net.Compute(Input);
+    Net.GetOutput(Output); // (SeqLen,1,2): depth 0 = start, depth 1 = end
+
+    // SQuAD2 null-answer baseline: start[CLS] + end[CLS] (position 0).
+    NoAnswerScore := Output.FData[0 * 2 + 0] + Output.FData[0 * 2 + 1];
+
+    if ContextCnt = 0 then Exit; // nothing to answer over
+
+    Best := -1e30; BestS := -1; BestE := -1;
+    for s := ContextBase to ContextBase + ContextCnt - 1 do
+    begin
+      if not IsContext[s] then Continue;
+      StartLogit := Output.FData[s * 2 + 0];
+      for e := s to s + MaxAnswerLen - 1 do
+      begin
+        if e > ContextBase + ContextCnt - 1 then Break;
+        if not IsContext[e] then Continue;
+        EndLogit := Output.FData[e * 2 + 1];
+        if StartLogit + EndLogit > Best then
+        begin
+          Best := StartLogit + EndLogit;
+          BestS := s; BestE := e;
+        end;
+      end;
+    end;
+    if BestS < 0 then Exit;
+    Score := Best;
+    StartChar := CtxOffStart[BestS];
+    EndChar := CtxOffStart[BestE] + CtxOffLen[BestE];
+    if (StartChar < 0) or (EndChar < StartChar) or
+       (EndChar > Length(Context)) then Exit;
+    Result := Copy(Context, StartChar + 1, EndChar - StartChar);
+  finally
+    Output.Free;
+    Input.Free;
+  end;
+end;
+
+function NormalizeSquadAnswer(const S: string): string;
+var
+  Lower, Tmp, Word: string;
+  i: integer;
+  Words: TStringList;
+  Ch: char;
+begin
+  // Lowercase, strip punctuation to spaces, collapse whitespace, drop the
+  // English articles a/an/the (the official SQuAD normalize_answer).
+  Lower := LowerCase(S);
+  Tmp := '';
+  for i := 1 to Length(Lower) do
+  begin
+    Ch := Lower[i];
+    if ((Ch >= 'a') and (Ch <= 'z')) or ((Ch >= '0') and (Ch <= '9')) then
+      Tmp := Tmp + Ch
+    else
+      Tmp := Tmp + ' '; // punctuation and whitespace both become separators
+  end;
+  Words := TStringList.Create();
+  try
+    Words.Delimiter := ' ';
+    Words.StrictDelimiter := False; // collapse runs of spaces
+    Words.DelimitedText := Tmp;
+    Result := '';
+    for i := 0 to Words.Count - 1 do
+    begin
+      Word := Words[i];
+      if (Word = '') or (Word = 'a') or (Word = 'an') or (Word = 'the') then
+        Continue;
+      if Result <> '' then Result := Result + ' ';
+      Result := Result + Word;
+    end;
+  finally
+    Words.Free;
+  end;
+end;
+
+function SquadTokenF1(const Pred, Gold: string): TNeuralFloat;
+var
+  PredToks, GoldToks: TStringList;
+  i, j, Same: integer;
+  Used: array of boolean;
+  Prec, Rec: TNeuralFloat;
+begin
+  PredToks := TStringList.Create();
+  GoldToks := TStringList.Create();
+  try
+    PredToks.Delimiter := ' '; PredToks.StrictDelimiter := False;
+    GoldToks.Delimiter := ' '; GoldToks.StrictDelimiter := False;
+    PredToks.DelimitedText := NormalizeSquadAnswer(Pred);
+    GoldToks.DelimitedText := NormalizeSquadAnswer(Gold);
+    // SQuAD convention: if either side is empty, F1 is 1 iff both empty.
+    if (PredToks.Count = 0) or (GoldToks.Count = 0) then
+    begin
+      if PredToks.Count = GoldToks.Count then Result := 1.0
+      else Result := 0.0;
+      Exit;
+    end;
+    // Multiset intersection (bag-of-words overlap).
+    SetLength(Used, GoldToks.Count);
+    for j := 0 to GoldToks.Count - 1 do Used[j] := False;
+    Same := 0;
+    for i := 0 to PredToks.Count - 1 do
+      for j := 0 to GoldToks.Count - 1 do
+        if (not Used[j]) and (PredToks[i] = GoldToks[j]) then
+        begin
+          Used[j] := True; Inc(Same); Break;
+        end;
+    if Same = 0 then begin Result := 0.0; Exit; end;
+    Prec := Same / PredToks.Count;
+    Rec := Same / GoldToks.Count;
+    Result := 2 * Prec * Rec / (Prec + Rec);
+  finally
+    GoldToks.Free;
+    PredToks.Free;
+  end;
+end;
+
+function QAReport(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
+  const Questions, Contexts, GoldAnswers: array of string): string;
+var
+  N, i, EMCount: integer;
+  Pred: string;
+  StartChar, EndChar: integer;
+  Score, NoAns, F1Sum, F1: TNeuralFloat;
+begin
+  N := Length(Questions);
+  if (N <> Length(Contexts)) or (N <> Length(GoldAnswers)) then
+    ImportError('QAReport: Questions/Contexts/GoldAnswers length mismatch.');
+  if N < 1 then
+    ImportError('QAReport: need at least 1 example.');
+  EMCount := 0;
+  F1Sum := 0;
+  for i := 0 to N - 1 do
+  begin
+    Pred := AnswerSpan(Net, Tokenizer, Questions[i], Contexts[i],
+      StartChar, EndChar, Score, NoAns);
+    if NormalizeSquadAnswer(Pred) = NormalizeSquadAnswer(GoldAnswers[i]) then
+      Inc(EMCount);
+    F1 := SquadTokenF1(Pred, GoldAnswers[i]);
+    F1Sum := F1Sum + F1;
+  end;
+  Result :=
+    '=== QA Report (SQuAD) ===' + sLineBreak +
+    'examples: ' + IntToStr(N) + sLineBreak +
+    'EM:       ' + FloatToStrF(100.0 * EMCount / N, ffFixed, 8, 2) +
+      sLineBreak +
+    'F1:       ' + FloatToStrF(100.0 * F1Sum / N, ffFixed, 8, 2) + sLineBreak;
+end;
+
+// ============= DEBERTA-V2 / DEBERTA-V3 IMPORT =============================
+
+function ReadDebertaV2ConfigFromJSONFile(
+  const FileName: string): TDebertaV2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, HiddenAct, PoolerAct, NormRel: string;
+  PosAtt: TJSONArray;
+  HasC2P, HasP2C: boolean;
+  i: integer;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('DeBERTa import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('DeBERTa import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('DeBERTa import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('DeBERTa import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('DeBERTa import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'deberta-v2');
+    if (ModelType <> 'deberta-v2') and (ModelType <> 'deberta') then
+      ImportError('DeBERTa import: config model_type is "' + ModelType +
+        '" - expected "deberta-v2" (see BuildFromPretrained for the full ' +
+        'dispatch).');
+    Result.ModelType := 'deberta-v2';
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1.0e-7);
+    if not Obj.Get('relative_attention', false) then
+      ImportError('DeBERTa import: only relative_attention=true (the ' +
+        'deberta-v3 disentangled-attention config) is supported.');
+    Result.PosBuckets := Obj.Get('position_buckets', -1);
+    Result.MaxRelPos := Obj.Get('max_relative_positions', -1);
+    if Result.MaxRelPos < 1 then Result.MaxRelPos := Result.MaxPositions;
+    if Result.PosBuckets > 0 then
+      Result.PosEbdSize := Result.PosBuckets
+    else
+      Result.PosEbdSize := Result.MaxRelPos;
+    if not Obj.Get('share_att_key', false) then
+      ImportError('DeBERTa import: only share_att_key=true is supported ' +
+        '(the deberta-v3 family; separate pos_key/pos_query projections are ' +
+        'not wired).');
+    // pos_att_type must be exactly {p2c, c2p} (scale_factor 3).
+    HasC2P := false; HasP2C := false;
+    if Obj.Find('pos_att_type') is TJSONArray then
+    begin
+      PosAtt := TJSONArray(Obj.Find('pos_att_type'));
+      for i := 0 to PosAtt.Count - 1 do
+      begin
+        if PosAtt.Strings[i] = 'c2p' then HasC2P := true;
+        if PosAtt.Strings[i] = 'p2c' then HasP2C := true;
+      end;
+    end;
+    if not (HasC2P and HasP2C) then
+      ImportError('DeBERTa import: only pos_att_type containing BOTH "c2p" ' +
+        'and "p2c" (scale_factor 3, the deberta-v3 default) is supported.');
+    NormRel := Obj.Get('norm_rel_ebd', 'none');
+    Result.NormRelEbd := Pos('layer_norm', NormRel) > 0;
+    HiddenAct := Obj.Get('hidden_act', 'gelu');
+    if HiddenAct = 'gelu' then
+      Result.HiddenActTanh := false
+    else if (HiddenAct = 'gelu_new') or (HiddenAct = 'gelu_pytorch_tanh') then
+      Result.HiddenActTanh := true
+    else
+      ImportError('DeBERTa import: config hidden_act "' + HiddenAct +
+        '" is not supported (only "gelu", "gelu_new", "gelu_pytorch_tanh").');
+    PoolerAct := Obj.Get('pooler_hidden_act', 'gelu');
+    Result.PoolerActTanh := (PoolerAct = 'tanh');
+    Result.Prefix := '';
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function DebertaV2ConfigToString(const Config: TDebertaV2Config): string;
+begin
+  Result := 'deberta-v2 config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', pos_buckets=' + IntToStr(Config.PosBuckets) +
+    ', max_rel=' + IntToStr(Config.MaxRelPos) +
+    ', att_span=' + IntToStr(Config.PosEbdSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps);
+  if Config.NormRelEbd then Result := Result + ', norm_rel_ebd=layer_norm';
+  if Config.HiddenActTanh then Result := Result + ', act=gelu_tanh'
+  else Result := Result + ', act=gelu_exact';
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TDebertaBlock = record
+    QKV, AttnDense, AttnLN, Inter, OutDense, OutLN: TNNetLayer;
+    Heads: array of TNNetLayer; // per-head TNNetDisentangledAttention
+  end;
+
+// Computes RelLN[a, :] = LayerNorm(RelEmb[a, :]) over the hidden axis for the
+// first twoSpan rows (matching HF DebertaV2Encoder.get_rel_embedding, which
+// LayerNorm-normalizes the rel_embeddings when norm_rel_ebd contains
+// "layer_norm"). When NormRel=false RelLN is a straight copy of the rows.
+procedure DebertaBuildRelLN(RelEmb, RelGamma, RelBeta: TNNetVolume;
+  NormRel: boolean; twoSpan, Hidden: integer; Eps: double; RelLN: TNNetVolume);
+var
+  a, c: integer;
+  Mean, Variance, InvStd, V: TNeuralFloat;
+begin
+  for a := 0 to twoSpan - 1 do
+  begin
+    if NormRel then
+    begin
+      Mean := 0;
+      for c := 0 to Hidden - 1 do
+        Mean := Mean + RelEmb.FData[a * Hidden + c];
+      Mean := Mean / Hidden;
+      Variance := 0;
+      for c := 0 to Hidden - 1 do
+      begin
+        V := RelEmb.FData[a * Hidden + c] - Mean;
+        Variance := Variance + V * V;
+      end;
+      Variance := Variance / Hidden;
+      InvStd := 1.0 / Sqrt(Variance + Eps);
+      for c := 0 to Hidden - 1 do
+        RelLN.FData[a * Hidden + c] :=
+          (RelEmb.FData[a * Hidden + c] - Mean) * InvStd *
+          RelGamma.FData[c] + RelBeta.FData[c];
+    end
+    else
+      for c := 0 to Hidden - 1 do
+        RelLN.FData[a * Hidden + c] := RelEmb.FData[a * Hidden + c];
+  end;
+end;
+
+// Projects the (LayerNorm'd) rel-embedding rows through one head's slice of
+// the content key/query projections (share_att_key) and writes the resulting
+// position-KEY table into the head layer's neuron 0 (K^r) and the
+// position-QUERY table into neuron 1 (Q^r). W* are [out=hidden, in=hidden]
+// row-major nn.Linear weights, B* the [hidden] biases; the head reads output
+// columns [h*d_k .. h*d_k+d_k-1]. The neuron table is twoSpan rows of d_k,
+// flattened row-major (FData[a*d_k + dLocal]).
+procedure DebertaLoadHeadPosTables(HeadLayer: TNNetLayer;
+  RelLN, Wq, Bq, Wk, Bk: TNNetVolume; HeadIdx, d_k, Hidden, twoSpan: integer);
+var
+  PosK, PosQ: TNNetVolume;
+  a, dLocal, c, OutRow: integer;
+  AccK, AccQ: TNeuralFloat;
+  RelRow: TNeuralFloatArrPtr;
+begin
+  EnsureWritableImportWeights(HeadLayer);
+  PosK := HeadLayer.Neurons[0].Weights; // K^r
+  PosQ := HeadLayer.Neurons[1].Weights; // Q^r
+  for a := 0 to twoSpan - 1 do
+  begin
+    RelRow := RelLN.GetRawPtr(a, 0, 0);
+    for dLocal := 0 to d_k - 1 do
+    begin
+      OutRow := HeadIdx * d_k + dLocal;
+      AccK := Bk.FData[OutRow];
+      AccQ := Bq.FData[OutRow];
+      for c := 0 to Hidden - 1 do
+      begin
+        AccK := AccK + RelRow^[c] * Wk.FData[OutRow * Hidden + c];
+        AccQ := AccQ + RelRow^[c] * Wq.FData[OutRow * Hidden + c];
+      end;
+      PosK.FData[a * d_k + dLocal] := AccK;
+      PosQ.FData[a * d_k + dLocal] := AccQ;
+    end;
+  end;
+  HeadLayer.FlushWeightCache();
+end;
+
+function BuildDebertaV2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TDebertaV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pSeqClsHead: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TDebertaBlock;
+  InputLayer, WordEmb, EmbLN, BranchInput, HiddenAct, PhiBranch: TNNetLayer;
+  PoolerDense, ClassifierDense, ConcatLayer: TNNetLayer;
+  SliceLayers: array of TNNetLayer;
+  BlockCnt, SeqLen, d_k, h, NumLabels, i, twoSpan: integer;
+  BlockPrefix, TensorNameStr, QName, KName, VName: string;
+  Consumed: TStringList;
+  RelEmb, RelGamma, RelBeta, RelLN: TNNetVolume;
+  WqV, WkV, BqV, BkV: TNNetVolume;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  procedure LoadWordEmbedding(Layer: TNNetLayer; const TName: string);
+  var Tmp: TNNetVolume;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('DeBERTa import: missing tensor "' + TName + '".');
+    if (Reader.DimCount(TName) <> 2) or
+       (Reader.DimSize(TName, 0) <> Config.VocabSize) or
+       (Reader.DimSize(TName, 1) <> Config.HiddenSize) then
+      ImportError('DeBERTa import: "' + TName + '" must be [' +
+        IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+        '], got ' + Reader.ShapeAsString(TName));
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(TName, Tmp);
+      Layer.Neurons[0].Weights.Copy(Tmp);
+      Layer.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    MarkConsumed(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  RelEmb := nil; RelGamma := nil; RelBeta := nil; RelLN := nil;
+  WqV := nil; WkV := nil; BqV := nil; BkV := nil;
+  try
+    try
+      if Config.NumHeads < 1 then
+        ImportError('DeBERTa import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('DeBERTa import: hidden_size not divisible by heads.');
+      d_k := Config.HiddenSize div Config.NumHeads;
+      twoSpan := 2 * Config.PosEbdSize;
+      // Prefix: the plain *Model serializes with no prefix; *For* exports
+      // carry "deberta.".
+      if Reader.HasTensor('embeddings.word_embeddings.weight') then
+        Config.Prefix := ''
+      else if Reader.HasTensor('deberta.embeddings.word_embeddings.weight') then
+        Config.Prefix := 'deberta.'
+      else
+        ImportError('DeBERTa import: word_embeddings.weight not found - not ' +
+          'a deberta-v2 checkpoint?');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      // Channel 0 = token ids (token-type IGNORED: type_vocab_size=0 in v3;
+      // the shape stays (SeqLen,1,2) for API uniformity with the BERT family).
+      InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
+      NN.AddLayer( TNNetSplitChannels.Create([0]) );
+      WordEmb := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      // position_biased_input=false: NO absolute position add, NO token-type
+      // add. Just the embedding LayerNorm.
+      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        SetLength(Blocks[BlockCnt].Heads, Config.NumHeads);
+        // POST-LN disentangled-attention sub-block.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].QKV := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        // Manual multi-head disentangled attention (one head per
+        // TNNetDisentangledAttention so the importer can load each head's
+        // position tables).
+        SetLength(SliceLayers, Config.NumHeads);
+        NN.AddSplitQKVHeads(Config.HiddenSize, Config.NumHeads, SliceLayers,
+          Blocks[BlockCnt].QKV);
+        for h := 0 to Config.NumHeads - 1 do
+          Blocks[BlockCnt].Heads[h] := NN.AddLayerAfter(
+            TNNetDisentangledAttention.Create(d_k, {causal=}false,
+              Config.PosEbdSize, Config.PosBuckets, Config.MaxRelPos),
+            SliceLayers[h]);
+        ConcatLayer := NN.AddLayer(
+          TNNetDeepConcat.Create(Blocks[BlockCnt].Heads) );
+        Blocks[BlockCnt].AttnDense := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), ConcatLayer );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].AttnLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        // POST-LN FFN sub-block.
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].Inter := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        if Config.HiddenActTanh then
+          NN.AddLayer( TNNetGELU.Create() )
+        else
+        begin
+          HiddenAct := NN.GetLastLayer();
+          NN.AddLayerAfter(
+            TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+          NN.AddLayer( TNNetErf.Create() );
+          NN.AddLayer( TNNetAddConstant.Create(1.0) );
+          PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+          NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+          NN.AddLayer( TNNetReGLU.Create() );
+        end;
+        Blocks[BlockCnt].OutDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].OutLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      // Optional sequence-classification head (ContextPooler + classifier).
+      PoolerDense := nil;
+      ClassifierDense := nil;
+      NumLabels := 0;
+      if pSeqClsHead then
+      begin
+        // ContextPooler: dense(hidden->hidden) + pooler_hidden_act, per-token
+        // (row 0 = HF pooled_output); then classifier(pooled).
+        PoolerDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        if Config.PoolerActTanh then
+          NN.AddLayer( TNNetHyperbolicTangent.Create() )
+        else
+        begin
+          HiddenAct := NN.GetLastLayer();
+          NN.AddLayerAfter(
+            TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+          NN.AddLayer( TNNetErf.Create() );
+          NN.AddLayer( TNNetAddConstant.Create(1.0) );
+          PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+          NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+          NN.AddLayer( TNNetReGLU.Create() );
+        end;
+        if not Reader.HasTensor('classifier.weight') then
+          ImportError('DeBERTa import: missing "classifier.weight" - not a ' +
+            '*ForSequenceClassification checkpoint?');
+        NumLabels := Reader.DimSize('classifier.weight', 0);
+        ClassifierDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(NumLabels) );
+      end;
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      LoadWordEmbedding(WordEmb,
+        Config.Prefix + 'embeddings.word_embeddings.weight');
+      LoadLayerNormWeights(Reader, EmbLN,
+        Config.Prefix + 'embeddings.LayerNorm.weight',
+        Config.Prefix + 'embeddings.LayerNorm.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'embeddings.LayerNorm.weight');
+      MarkConsumed(Config.Prefix + 'embeddings.LayerNorm.bias');
+
+      // Shared relative-position embedding table + its LayerNorm, applied
+      // once. RelLN[a, :] = LayerNorm(rel_embeddings[a, :]) over hidden.
+      RelEmb := TNNetVolume.Create;
+      Reader.LoadTensorFlat(Config.Prefix + 'encoder.rel_embeddings.weight',
+        RelEmb);
+      MarkConsumed(Config.Prefix + 'encoder.rel_embeddings.weight');
+      if Reader.DimSize(Config.Prefix + 'encoder.rel_embeddings.weight', 0) <
+         twoSpan then
+        ImportError('DeBERTa import: rel_embeddings has fewer than 2*att_span='
+          + IntToStr(twoSpan) + ' rows.');
+      RelLN := TNNetVolume.Create;
+      RelLN.ReSize(twoSpan, 1, Config.HiddenSize);
+      if Config.NormRelEbd then
+      begin
+        RelGamma := TNNetVolume.Create;
+        RelBeta := TNNetVolume.Create;
+        Reader.LoadTensorFlat(Config.Prefix + 'encoder.LayerNorm.weight',
+          RelGamma);
+        Reader.LoadTensorFlat(Config.Prefix + 'encoder.LayerNorm.bias',
+          RelBeta);
+        MarkConsumed(Config.Prefix + 'encoder.LayerNorm.weight');
+        MarkConsumed(Config.Prefix + 'encoder.LayerNorm.bias');
+      end;
+      // Build the (LayerNorm'd) rel-embedding rows used by every layer.
+      DebertaBuildRelLN(RelEmb, RelGamma, RelBeta, Config.NormRelEbd,
+        twoSpan, Config.HiddenSize, Config.LayerNormEps, RelLN);
+
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'encoder.layer.' + IntToStr(BlockCnt) +
+          '.';
+        QName := BlockPrefix + 'attention.self.query_proj';
+        KName := BlockPrefix + 'attention.self.key_proj';
+        VName := BlockPrefix + 'attention.self.value_proj';
+        // Content Q|K|V slab (separate biased Linears -> fused QKV).
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV, QName + '.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, 3 * Config.HiddenSize, 0,
+          QName + '.bias');
+        MarkConsumed(QName + '.weight'); MarkConsumed(QName + '.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV, KName + '.weight',
+          Config.HiddenSize, Config.HiddenSize, Config.HiddenSize,
+          3 * Config.HiddenSize, 0, KName + '.bias');
+        MarkConsumed(KName + '.weight'); MarkConsumed(KName + '.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV, VName + '.weight',
+          Config.HiddenSize, Config.HiddenSize, 2 * Config.HiddenSize,
+          3 * Config.HiddenSize, 0, VName + '.bias');
+        MarkConsumed(VName + '.weight'); MarkConsumed(VName + '.bias');
+        // Per-head position tables: project RelLN through THIS layer's
+        // query_proj (-> Q^r, neuron 1) and key_proj (-> K^r, neuron 0),
+        // share_att_key=true. Read the projection weights into volumes.
+        WqV := TNNetVolume.Create; WkV := TNNetVolume.Create;
+        BqV := TNNetVolume.Create; BkV := TNNetVolume.Create;
+        Reader.LoadTensorFlat(QName + '.weight', WqV);
+        Reader.LoadTensorFlat(KName + '.weight', WkV);
+        Reader.LoadTensorFlat(QName + '.bias', BqV);
+        Reader.LoadTensorFlat(KName + '.bias', BkV);
+        for h := 0 to Config.NumHeads - 1 do
+          DebertaLoadHeadPosTables(Blocks[BlockCnt].Heads[h], RelLN,
+            WqV, BqV, WkV, BkV, h, d_k, Config.HiddenSize, twoSpan);
+        FreeAndNil(WqV); FreeAndNil(WkV); FreeAndNil(BqV); FreeAndNil(BkV);
+        // attention.output dense + LayerNorm.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
+          BlockPrefix + 'attention.output.dense.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'attention.output.dense.bias');
+        MarkConsumed(BlockPrefix + 'attention.output.dense.weight');
+        MarkConsumed(BlockPrefix + 'attention.output.dense.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].AttnLN,
+          BlockPrefix + 'attention.output.LayerNorm.weight',
+          BlockPrefix + 'attention.output.LayerNorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'attention.output.LayerNorm.weight');
+        MarkConsumed(BlockPrefix + 'attention.output.LayerNorm.bias');
+        // FFN.
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Inter,
+          BlockPrefix + 'intermediate.dense.weight',
+          Config.HiddenSize, Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'intermediate.dense.bias');
+        MarkConsumed(BlockPrefix + 'intermediate.dense.weight');
+        MarkConsumed(BlockPrefix + 'intermediate.dense.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutDense,
+          BlockPrefix + 'output.dense.weight',
+          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'output.dense.bias');
+        MarkConsumed(BlockPrefix + 'output.dense.weight');
+        MarkConsumed(BlockPrefix + 'output.dense.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].OutLN,
+          BlockPrefix + 'output.LayerNorm.weight',
+          BlockPrefix + 'output.LayerNorm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'output.LayerNorm.weight');
+        MarkConsumed(BlockPrefix + 'output.LayerNorm.bias');
+      end;
+      if pSeqClsHead then
+      begin
+        LoadLlamaLinearWeights(Reader, PoolerDense,
+          'pooler.dense.weight', Config.HiddenSize, Config.HiddenSize, 0, -1,
+          0, 'pooler.dense.bias');
+        MarkConsumed('pooler.dense.weight');
+        MarkConsumed('pooler.dense.bias');
+        LoadLlamaLinearWeights(Reader, ClassifierDense,
+          'classifier.weight', Config.HiddenSize, NumLabels, 0, -1, 0,
+          'classifier.bias');
+        MarkConsumed('classifier.weight');
+        MarkConsumed('classifier.bias');
+      end;
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        if Pos('position_ids', TensorNameStr) > 0 then continue;
+        if Pos('embeddings.position_embeddings', TensorNameStr) > 0 then
+          continue; // present but unused when position_biased_input=false
+        if (not pSeqClsHead) and (Pos('pooler.', TensorNameStr) > 0) then
+          continue;
+        if (not pSeqClsHead) and (Pos('classifier.', TensorNameStr) > 0) then
+          continue;
+        ImportError('DeBERTa import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+    RelEmb.Free; RelGamma.Free; RelBeta.Free; RelLN.Free;
+    WqV.Free; WkV.Free; BqV.Free; BkV.Free;
+  end;
+end;
+
+function BuildDebertaV2FromSafeTensorsEx(const FileName: string;
+  out Config: TDebertaV2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; const ConfigFileName: string = '';
+  pSeqClsHead: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDebertaV2ConfigFromJSONFile(ConfigPath);
+  Result := BuildDebertaV2FromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pSeqClsHead);
+end;
+
+function BuildDebertaV2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  IgnoredConfig: TDebertaV2Config;
+begin
+  Result := BuildDebertaV2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName, {pSeqClsHead=}false);
 end;
 
 // ============= MISTRAL / QWEN2 / QWEN3 / GEMMA / DISPATCH ==================
@@ -7259,6 +16772,238 @@ begin
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
+function BuildQwen3MoeFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3_moe', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildQwen3MoeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildQwen3MoeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function ReadLlama4ConfigFromJSONFile(const FileName: string): TLlamaConfig;
+var
+  JsonText: TStringList;
+  Root, TextRoot: TJSONData;
+  Obj, Outer: TJSONObject;
+  ModelType, HiddenAct: string;
+  Field: TJSONData;
+  i, Step, Interval: integer;
+  IsMoELayer: boolean;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Llama4 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Llama4 import: config field "' + FieldName +
+        '" must be a positive integer, got ' + Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  Result := Default(TLlamaConfig);
+  if not FileExists(FileName) then
+    ImportError('Llama4 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Llama4 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Llama4 import: config "' + FileName +
+        '" is not a JSON object.');
+    Outer := TJSONObject(Root);
+    ModelType := Outer.Get('model_type', '');
+    // Multimodal "llama4" configs nest the decoder under "text_config"; the
+    // text-only "llama4_text" config is flat. The vision tower is out of scope.
+    Obj := Outer;
+    TextRoot := Outer.Find('text_config');
+    if (TextRoot <> nil) and (TextRoot is TJSONObject) then
+      Obj := TJSONObject(TextRoot);
+    if (ModelType <> 'llama4') and (ModelType <> 'llama4_text') then
+    begin
+      ModelType := Obj.Get('model_type', ModelType);
+      if (ModelType <> 'llama4') and (ModelType <> 'llama4_text') then
+        ImportError('Llama4 import: config model_type is "' + ModelType +
+          '", expected "llama4" or "llama4_text" (text-only; the vision ' +
+          'tower is out of scope - point at a llama4_text checkpoint).');
+    end;
+    Result.ModelType := 'llama4_text';
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositions := RequiredInt('max_position_embeddings');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5);
+    Result.RopeTheta := Obj.Get('rope_theta', 500000.0);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', false);
+    Result.HeadDim := Obj.Get('head_dim', 128);
+    if Result.HeadDim < 1 then
+      ImportError('Llama4 import: head_dim must be positive.');
+    HiddenAct := Obj.Get('hidden_act', 'silu');
+    if HiddenAct <> 'silu' then
+      ImportError('Llama4 import: hidden_act "' + HiddenAct +
+        '" is not supported (only "silu" / SwiGLU).');
+    if Obj.Get('attention_bias', false) then
+      ImportError('Llama4 import: attention_bias=true is not supported ' +
+        '(would bias o_proj too).');
+    // ---- iRoPE: Config.InterleavedRotary (view_as_complex pairing) ----
+    Result.InterleavedRotary := True;
+    // no_rope_layers: explicit list, else built from no_rope_layer_interval
+    // (default 4): element i = ((i+1) mod interval != 0) (1 = RoPE, 0 = NoPE).
+    SetLength(Result.NoRopeLayers, Result.NumLayers);
+    Field := Obj.Find('no_rope_layers');
+    if (Field <> nil) and (Field is TJSONArray) and (TJSONArray(Field).Count > 0) then
+    begin
+      if TJSONArray(Field).Count <> Result.NumLayers then
+        ImportError('Llama4 import: no_rope_layers length <> num_hidden_layers.');
+      for i := 0 to Result.NumLayers - 1 do
+        Result.NoRopeLayers[i] := TJSONArray(Field).Integers[i] <> 0;
+    end
+    else
+    begin
+      Interval := Obj.Get('no_rope_layer_interval', 4);
+      if Interval < 1 then Interval := 1;
+      for i := 0 to Result.NumLayers - 1 do
+        Result.NoRopeLayers[i] := ((i + 1) mod Interval) <> 0;
+    end;
+    // QK L2-norm (use_qk_norm, default true) on the RoPE layers.
+    Result.Llama4QKL2Norm := Obj.Get('use_qk_norm', true);
+    // attn_temperature_tuning (default true) on the NoPE layers.
+    Result.AttnTempTuning := Obj.Get('attn_temperature_tuning', true);
+    Result.AttnFloorScale := Obj.Get('floor_scale', 8192.0);
+    Result.AttnScale := Obj.Get('attn_scale', 0.1);
+    Result.AttnChunkSize := Obj.Get('attention_chunk_size', 8192);
+    // ---- MoE: sigmoid-gated top-k + always-on shared expert ----
+    Result.IsMoE := True;
+    Result.MoESigmoidGate := True;
+    Result.MoEScaleInput := True;
+    Result.MoEGateUpTransposed := True;
+    Result.NumLocalExperts := Obj.Get('num_local_experts', 16);
+    Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 1);
+    if Result.MoEExpertsPerTok > Result.NumLocalExperts then
+      ImportError('Llama4 import: num_experts_per_tok > num_local_experts.');
+    // Per-expert SwiGLU width = intermediate_size; dense layers use
+    // intermediate_size_mlp (wider).
+    Result.MoEIntermediateSize := Result.IntermediateSize;
+    Result.IntermediateSizeMLP := Obj.Get('intermediate_size_mlp',
+      Result.IntermediateSize);
+    // Shared expert width = intermediate_size (Llama4TextMLP default).
+    Result.SharedIntermediateSize := Result.IntermediateSize;
+    // moe_layers: explicit list, else interleave_moe_layer_step (default 1):
+    // range(step-1, num_layers, step). Translate into MoEDecoderSparseStep +
+    // MoEMlpOnlyLayers so LlamaLayerIsMoE selects them.
+    Step := Obj.Get('interleave_moe_layer_step', 1);
+    if Step < 1 then Step := 1;
+    Field := Obj.Find('moe_layers');
+    SetLength(Result.MoEMlpOnlyLayers, 0);
+    if (Field <> nil) and (Field is TJSONArray) then
+    begin
+      // Build the explicit dense (mlp-only) list = complement of moe_layers.
+      Result.MoEDecoderSparseStep := 1; // step handled via the explicit list
+      for i := 0 to Result.NumLayers - 1 do
+      begin
+        IsMoELayer := False;
+        for Step := 0 to TJSONArray(Field).Count - 1 do
+          if TJSONArray(Field).Integers[Step] = i then IsMoELayer := True;
+        if not IsMoELayer then
+        begin
+          SetLength(Result.MoEMlpOnlyLayers, Length(Result.MoEMlpOnlyLayers) + 1);
+          Result.MoEMlpOnlyLayers[High(Result.MoEMlpOnlyLayers)] := i;
+        end;
+      end;
+    end
+    else
+      // range(step-1, n, step) = layers with (i+1) mod step = 0.
+      Result.MoEDecoderSparseStep := Step;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BuildLlama4FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadLlama4ConfigFromJSONFile(ConfigPath);
+  Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildLlama4FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildLlama4FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildOlmo2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'olmo2', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildOlmo2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildOlmo2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildOlmoeFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'olmoe', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildOlmoeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildOlmoeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
 function BuildGemmaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
@@ -7332,6 +17077,903 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildPhi3FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildBitNetFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'bitnet', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildBitNetFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildBitNetFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+type
+  // Translates an InternLM2 / InternLM2.5 checkpoint into the standard HF
+  // Llama tensor names + layout the core Llama builder
+  // (BuildLlamaFromTensorReaderWithConfig) expects, so InternLM2 rides that
+  // path with NO new layer class. It wraps an inner real reader (the actual
+  // .safetensors / .bin checkpoint) and presents a SYNTHETIC tensor table
+  // under HF names; LoadTensorFlat either delegates a renamed pass-through
+  // tensor to the inner reader or, for the three q/k/v projections, unpacks
+  // the fused attention.wqkv slab on the fly.
+  //
+  // wqkv layout (modeling_internlm2.InternLM2Attention): the slab is
+  // [num_kv_heads*(q_per_kv+2)*head_dim, hidden], viewed as
+  // [num_kv_heads, q_per_kv+2, head_dim, hidden]; per KV group the first
+  // q_per_kv (head_dim)-row slices are that group's query heads, the next is
+  // its single K head, the last its single V head. Standard separate W_q is
+  // the group-major concatenation of all query slices (rows
+  // [num_heads*head_dim, hidden]), W_k / W_v the concatenation of the single
+  // K / V slice per group ([num_kv_heads*head_dim, hidden]). These are HF
+  // rotate_half-order rows - the core builder applies its own
+  // rotate_half->interleaved q/k permutation for RoPE, exactly as for a
+  // native Llama q_proj/k_proj.
+  // Coded by Claude (AI).
+  TNNetInternLM2Reader = class(TNNetSafeTensorsReader)
+  private
+    FInner: TNNetSafeTensorsReader;     // the real checkpoint (owned)
+    FNumKVHeads, FQPerKV, FHeadDim, FHidden: integer;
+    // For each synthetic tensor: the inner source name it delegates to, and
+    // a "kind" (0 = straight pass-through; 1/2/3 = Q/K/V slice of wqkv).
+    FSrcNames: array of string;
+    FKinds: array of integer;
+    procedure AddSynthetic(const HFName, SrcName: string; Kind: integer;
+      const Shape: array of Int64);
+  public
+    constructor Create(Inner: TNNetSafeTensorsReader; NumLayers, NumHeads,
+      NumKVHeads, HeadDim, Hidden, VocabSize: integer; TieWordEmbeddings:
+      boolean);
+    destructor Destroy; override;
+    procedure LoadTensorFlat(const pName: string;
+      Dest: TNNetVolume); override;
+  end;
+
+procedure TNNetInternLM2Reader.AddSynthetic(const HFName, SrcName: string;
+  Kind: integer; const Shape: array of Int64);
+var
+  Idx, i: integer;
+begin
+  if not FInner.HasTensor(SrcName) then
+    ImportError('InternLM2 import: missing tensor "' + SrcName + '" in ' +
+      FInner.FileName + '.');
+  Idx := Length(FTensors);
+  SetLength(FTensors, Idx + 1);
+  SetLength(FSrcNames, Idx + 1);
+  SetLength(FKinds, Idx + 1);
+  FTensors[Idx].Name := HFName;
+  FTensors[Idx].DType := 'F32';
+  FTensors[Idx].Shard := 0;
+  FTensors[Idx].DataBegin := 0;
+  FTensors[Idx].DataEnd := 0;
+  SetLength(FTensors[Idx].Shape, Length(Shape));
+  for i := 0 to High(Shape) do FTensors[Idx].Shape[i] := Shape[i];
+  FSrcNames[Idx] := SrcName;
+  FKinds[Idx] := Kind;
+end;
+
+constructor TNNetInternLM2Reader.Create(Inner: TNNetSafeTensorsReader;
+  NumLayers, NumHeads, NumKVHeads, HeadDim, Hidden, VocabSize: integer;
+  TieWordEmbeddings: boolean);
+var
+  b, WqkvRows: integer;
+  P, Src: string;
+begin
+  inherited CreateBare;
+  FInner := Inner;
+  FFileName := Inner.FileName;
+  FNumKVHeads := NumKVHeads;
+  FQPerKV := NumHeads div NumKVHeads;
+  FHeadDim := HeadDim;
+  FHidden := Hidden;
+  WqkvRows := NumKVHeads * (FQPerKV + 2) * HeadDim;
+  // Token embedding + final norm + output head.
+  AddSynthetic('model.embed_tokens.weight', 'model.tok_embeddings.weight',
+    0, [VocabSize, Hidden]);
+  AddSynthetic('model.norm.weight', 'model.norm.weight', 0, [Hidden]);
+  if not TieWordEmbeddings then
+    AddSynthetic('lm_head.weight', 'output.weight', 0, [VocabSize, Hidden]);
+  for b := 0 to NumLayers - 1 do
+  begin
+    P := 'model.layers.' + IntToStr(b) + '.';
+    Src := P + 'attention.wqkv.weight';
+    if not FInner.HasTensor(Src) then
+      ImportError('InternLM2 import: missing tensor "' + Src + '" in ' +
+        FInner.FileName + '.');
+    if (FInner.DimCount(Src) <> 2) or (FInner.DimSize(Src, 0) <> WqkvRows) or
+       (FInner.DimSize(Src, 1) <> Hidden) then
+      ImportError('InternLM2 import: "' + Src + '" must have shape [' +
+        IntToStr(WqkvRows) + ', ' + IntToStr(Hidden) + '] (num_kv_heads*' +
+        '(q_per_kv+2)*head_dim x hidden), got ' + FInner.ShapeAsString(Src));
+    AddSynthetic(P + 'self_attn.q_proj.weight', Src, 1,
+      [NumHeads * HeadDim, Hidden]);
+    AddSynthetic(P + 'self_attn.k_proj.weight', Src, 2,
+      [NumKVHeads * HeadDim, Hidden]);
+    AddSynthetic(P + 'self_attn.v_proj.weight', Src, 3,
+      [NumKVHeads * HeadDim, Hidden]);
+    AddSynthetic(P + 'self_attn.o_proj.weight', P + 'attention.wo.weight',
+      0, [Hidden, NumHeads * HeadDim]);
+    AddSynthetic(P + 'input_layernorm.weight', P + 'attention_norm.weight',
+      0, [Hidden]);
+    AddSynthetic(P + 'post_attention_layernorm.weight',
+      P + 'ffn_norm.weight', 0, [Hidden]);
+    // feed_forward: w1 = gate, w3 = up, w2 = down.
+    AddSynthetic(P + 'mlp.gate_proj.weight', P + 'feed_forward.w1.weight',
+      0, [FInner.DimSize(P + 'feed_forward.w1.weight', 0), Hidden]);
+    AddSynthetic(P + 'mlp.up_proj.weight', P + 'feed_forward.w3.weight',
+      0, [FInner.DimSize(P + 'feed_forward.w3.weight', 0), Hidden]);
+    AddSynthetic(P + 'mlp.down_proj.weight', P + 'feed_forward.w2.weight',
+      0, [Hidden, FInner.DimSize(P + 'feed_forward.w2.weight', 1)]);
+  end;
+end;
+
+destructor TNNetInternLM2Reader.Destroy;
+begin
+  FInner.Free;
+  inherited Destroy;
+end;
+
+procedure TNNetInternLM2Reader.LoadTensorFlat(const pName: string;
+  Dest: TNNetVolume);
+var
+  Idx, Kind: integer;
+  Wqkv: TNNetVolume;
+  GroupStride, KOffset, VOffset: integer;
+  g, q, r, c, DstRow: integer;
+  SrcBase: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    ImportError('InternLM2 import: tensor "' + pName + '" not found in ' +
+      FFileName + '.');
+  Kind := FKinds[Idx];
+  if Kind = 0 then
+  begin
+    // Straight pass-through under the renamed source.
+    FInner.LoadTensorFlat(FSrcNames[Idx], Dest);
+    exit;
+  end;
+  // Q/K/V slice of the fused wqkv slab. wqkv is laid out, per KV group, as
+  // q_per_kv query (head_dim)-row blocks, then one K block, then one V
+  // block (rows contiguous, each row Hidden wide).
+  Wqkv := TNNetVolume.Create;
+  try
+    FInner.LoadTensorFlat(FSrcNames[Idx], Wqkv);
+    GroupStride := (FQPerKV + 2) * FHeadDim;   // rows per KV group
+    KOffset := FQPerKV * FHeadDim;             // K block start within a group
+    VOffset := (FQPerKV + 1) * FHeadDim;       // V block start within a group
+    if Kind = 1 then
+      Dest.ReSize(FNumKVHeads * FQPerKV * FHeadDim * FHidden, 1, 1)
+    else
+      Dest.ReSize(FNumKVHeads * FHeadDim * FHidden, 1, 1);
+    DstRow := 0;
+    for g := 0 to FNumKVHeads - 1 do
+    begin
+      SrcBase := g * GroupStride;
+      if Kind = 1 then
+      begin
+        // all q_per_kv query head-rows of this group (group-major)
+        for q := 0 to FQPerKV * FHeadDim - 1 do
+        begin
+          for c := 0 to FHidden - 1 do
+            Dest.FData[DstRow * FHidden + c] :=
+              Wqkv.FData[(SrcBase + q) * FHidden + c];
+          Inc(DstRow);
+        end;
+      end
+      else
+      begin
+        if Kind = 2 then r := SrcBase + KOffset
+        else r := SrcBase + VOffset;
+        for q := 0 to FHeadDim - 1 do
+        begin
+          for c := 0 to FHidden - 1 do
+            Dest.FData[DstRow * FHidden + c] :=
+              Wqkv.FData[(r + q) * FHidden + c];
+          Inc(DstRow);
+        end;
+      end;
+    end;
+  finally
+    Wqkv.Free;
+  end;
+end;
+
+function BuildInternLM2FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+  Inner: TNNetSafeTensorsReader;
+  Reader: TNNetInternLM2Reader;
+  HeadDim: integer;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadLlamaConfigFromJSONFile(ConfigPath);
+  if Config.ModelType <> 'internlm2' then
+  begin
+    ImportError('internlm2 import: config model_type is "' +
+      Config.ModelType + '", expected "internlm2" - use the matching ' +
+      'builder or BuildFromPretrained.');
+    Result := nil;
+    exit;
+  end;
+  if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+  else
+  begin
+    if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+      ImportError('InternLM2 import: hidden_size=' +
+        IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+        'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+    HeadDim := Config.HiddenSize div Config.NumHeads;
+  end;
+  Inner := CreatePretrainedTensorReader(FileName);
+  Reader := nil;
+  try
+    Reader := TNNetInternLM2Reader.Create(Inner, Config.NumLayers,
+      Config.NumHeads, Config.NumKVHeads, HeadDim, Config.HiddenSize,
+      Config.VocabSize, Config.TieWordEmbeddings);
+    Inner := nil; // ownership transferred to Reader
+  except
+    Inner.Free;
+    Reader.Free;
+    raise;
+  end;
+  // The core builder takes ownership of Reader (it frees it in its finally).
+  Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
+    pSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildInternLM2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildInternLM2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildGLM4FromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'glm4', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildGLM4FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildGLM4FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildMixtralFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'mixtral', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildMixtralFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildMixtralFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildGraniteFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  // The config reader accepts both 'granite' (dense FFN) and 'granitemoe'
+  // (Mixtral-style MoE FFN); accept whichever the checkpoint declares.
+  Result := BuildLlamaFromSafeTensorsEx(FileName, Config, pSeqLen,
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+  if (Config.ModelType <> 'granite') and (Config.ModelType <> 'granitemoe') then
+  begin
+    Result.Free;
+    Result := nil;
+    ImportError('granite import: config model_type is "' + Config.ModelType +
+      '", expected "granite" or "granitemoe" - use the matching builder or ' +
+      'BuildFromPretrained.');
+  end;
+end;
+
+function BuildGraniteFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildGraniteFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ============================ MiniCPM IMPORT ===============================
+
+// MiniCPM (openbmb/MiniCPM-1.2B / 2B-sft/dpo, HF MiniCPMForCausalLM): the
+// Llama block (RMSNorm + RoPE + SwiGLU, GQA, tied embeddings, bias-free) plus
+// OpenBMB's muP-style depth/width rescaling, all folded into existing weights
+// at load (no new layer types - the Granite fold machinery is reused):
+//   scale_emb                        -> embedding multiplier (embedding rows)
+//   scale_depth / sqrt(num_layers)   -> per-sublayer residual scale (o_proj
+//                                       and down_proj rows of every block)
+//   hidden_size / dim_model_base     -> DIVIDES the final logits (folded as
+//                                       1/scale into the tied LM head rows)
+// The standard SentencePiece .model tokenizer applies. See
+// ReadLlamaConfigFromJSONFile's "minicpm" branch for the three folds.
+function BuildMiniCPMFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFromSafeTensorsEx(FileName, Config, pSeqLen,
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+  if Config.ModelType <> 'minicpm' then
+  begin
+    Result.Free;
+    Result := nil;
+    ImportError('minicpm import: config model_type is "' + Config.ModelType +
+      '", expected "minicpm" - use the matching builder or ' +
+      'BuildFromPretrained.');
+  end;
+end;
+
+function BuildMiniCPMFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildMiniCPMFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+// ============================ GPT-OSS IMPORT ===============================
+
+function ReadGptOssConfigFromJSONFile(const FileName: string): TGptOssConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, RopeObj: TJSONObject;
+  ModelType: string;
+  Field: TJSONData;
+  LayerTypesArr: TJSONArray;
+  i: integer;
+  TypeStr: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('gpt-oss import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('gpt-oss import: config field "' + FieldName +
+        '" must be a positive integer, got ' + Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  Result := Default(TGptOssConfig);
+  if not FileExists(FileName) then
+    ImportError('gpt-oss import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('gpt-oss import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('gpt-oss import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if ModelType <> 'gpt_oss' then
+      ImportError('gpt-oss import: config model_type is "' + ModelType +
+        '", expected "gpt_oss".');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if Result.NumKVHeads <= 0 then Result.NumKVHeads := Result.NumHeads;
+    Result.HeadDim := Obj.Get('head_dim', 0);
+    if Result.HeadDim <= 0 then
+      Result.HeadDim := Result.HiddenSize div Result.NumHeads;
+    Result.MaxPositions := Obj.Get('max_position_embeddings', 131072);
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', TNeuralFloat(1e-5));
+    Result.SlidingWindow := Obj.Get('sliding_window', 128);
+    Result.NumLocalExperts := Obj.Get('num_local_experts', 128);
+    Result.NumExpertsPerTok := Obj.Get('num_experts_per_tok', 4);
+    Result.SwiGLUAlpha := 1.702;
+    Result.SwiGLULimit := 7.0;
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    Result.RopeScaling := DefaultRoPEScaling();
+    Result.RopeTheta := 150000.0;
+    // rope_parameters (gpt-oss spelling) OR rope_theta (plain). gpt-oss packs
+    // rope_theta + the YaRN parameters inside rope_parameters; map it onto a
+    // synthetic rope_scaling object the shared YaRN reader understands.
+    Field := Obj.Find('rope_parameters');
+    if (Field <> nil) and (Field is TJSONObject) then
+    begin
+      RopeObj := TJSONObject(Field);
+      Result.RopeTheta := RopeObj.Get('rope_theta', Result.RopeTheta);
+      TypeStr := RopeObj.Get('rope_type', RopeObj.Get('type', 'default'));
+      if (TypeStr <> 'default') and (TypeStr <> '') then
+        Result.RopeScaling := ReadRoPEScalingFromJSONObject(
+          TJSONObject.Create(['rope_scaling', RopeObj.Clone]),
+          Result.MaxPositions, 'gpt-oss import');
+    end
+    else
+      Result.RopeTheta := Obj.Get('rope_theta', Result.RopeTheta);
+    // Per-layer attention type. layer_types overrides; otherwise gpt-oss
+    // alternates sliding (even) / full (odd).
+    SetLength(Result.LayerIsSliding, Result.NumLayers);
+    Field := Obj.Find('layer_types');
+    if (Field <> nil) and (Field is TJSONArray) then
+    begin
+      LayerTypesArr := TJSONArray(Field);
+      if LayerTypesArr.Count <> Result.NumLayers then
+        ImportError('gpt-oss import: layer_types has ' +
+          IntToStr(LayerTypesArr.Count) + ' entries but num_hidden_layers=' +
+          IntToStr(Result.NumLayers) + '.');
+      for i := 0 to Result.NumLayers - 1 do
+      begin
+        TypeStr := LayerTypesArr.Items[i].AsString;
+        if TypeStr = 'sliding_attention' then
+          Result.LayerIsSliding[i] := True
+        else if TypeStr = 'full_attention' then
+          Result.LayerIsSliding[i] := False
+        else
+          ImportError('gpt-oss import: layer_types[' + IntToStr(i) +
+            '] = "' + TypeStr + '" is not "sliding_attention" or ' +
+            '"full_attention".');
+      end;
+    end
+    else
+      for i := 0 to Result.NumLayers - 1 do
+        Result.LayerIsSliding[i] := not Odd(i);
+    Result.Prefix := '';
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function GptOssConfigToString(const Config: TGptOssConfig): string;
+var
+  i, SlideCnt: integer;
+begin
+  SlideCnt := 0;
+  for i := 0 to High(Config.LayerIsSliding) do
+    if Config.LayerIsSliding[i] then Inc(SlideCnt);
+  Result :=
+    'gpt_oss: hidden=' + IntToStr(Config.HiddenSize) +
+    ' inter=' + IntToStr(Config.IntermediateSize) +
+    ' layers=' + IntToStr(Config.NumLayers) +
+    ' heads=' + IntToStr(Config.NumHeads) +
+    ' kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ' head_dim=' + IntToStr(Config.HeadDim) +
+    ' vocab=' + IntToStr(Config.VocabSize) +
+    ' experts=' + IntToStr(Config.NumLocalExperts) +
+    ' top_k=' + IntToStr(Config.NumExpertsPerTok) +
+    ' sliding_window=' + IntToStr(Config.SlidingWindow) +
+    ' sliding_layers=' + IntToStr(SlideCnt) + '/' +
+      IntToStr(Config.NumLayers) +
+    ' rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ' rope_mode=' + IntToStr(Ord(Config.RopeScaling.Mode)) +
+    ' tie_embed=' + BoolToStr(Config.TieWordEmbeddings, True);
+end;
+
+// Loads expert bank e of a gpt-oss MoE FFN. The HF expert matrices are stored
+// BATCHED and in [in, out] order (current_state @ gate_up_proj[e], unlike a
+// bias-free nn.Linear): gate_up_proj is [E, hidden, 2*inter] and down_proj is
+// [E, inter, hidden]. Per expert e, neuron j (output channel) of the pointwise
+// layer gets weight i = W[e, i, j] (the [in, out] -> per-neuron [in] transpose)
+// and bias[j] from *_bias[e, j]. The gate|up output stays INTERLEAVED
+// (gate=even, up=odd) for TNNetGptOssGatedSwiGLU. W/B supply the already FLAT
+// (E*In*Out) weights and (E*Out) biases.
+procedure LoadGptOssExpertMatrix(WLayer: TNNetLayer; const W, B: TNNetVolume;
+  ExpertIdx, InDim, OutDim: integer);
+var
+  i, j, ExpertBase, BiasBase: integer;
+begin
+  EnsureWritableImportWeights(WLayer);
+  if WLayer.Neurons.Count <> OutDim then
+    ImportError('gpt-oss import: internal error - expert layer has ' +
+      IntToStr(WLayer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  ExpertBase := ExpertIdx * InDim * OutDim;
+  BiasBase := ExpertIdx * OutDim;
+  for j := 0 to OutDim - 1 do
+  begin
+    for i := 0 to InDim - 1 do
+      WLayer.Neurons[j].Weights.FData[i] := W.FData[ExpertBase + i * OutDim + j];
+    if B <> nil then
+      WLayer.Neurons[j].BiasWeight := B.FData[BiasBase + j]
+    else
+      WLayer.Neurons[j].BiasWeight := 0;
+  end;
+  WLayer.FlushWeightCache();
+end;
+
+// Reads a gpt-oss expert weight slab into Dest as a FLAT [E*In*Out] array in
+// the F32 [E, In, Out] layout LoadGptOssExpertMatrix expects. Handles BOTH
+// storage forms: a plain dense tensor (BaseName, dtype F32/F16/BF16) loaded
+// straight, OR the MXFP4 pair (BaseName+"_blocks" uint8 + BaseName+"_scales"
+// uint8) dequantized via DequantizeMXFP4. The MXFP4 packed layout is
+// [E, Out, In/32, 16] -> dequant to [E, Out, In] -> transpose to [E, In, Out]
+// (transformers _convert_moe_packed_tensors ends with .transpose(1,2)).
+procedure LoadGptOssExpertSlab(Reader: TNNetSafeTensorsReader;
+  const BaseName: string; NumExperts, InDim, OutDim: integer; Dest: TNNetVolume);
+var
+  Blocks, Scales: TBytes;
+  Deq: array of single;
+  e, ii, oo, NumBlocks: integer;
+  BlocksName, ScalesName: string;
+begin
+  if Reader.HasTensor(BaseName) then
+  begin
+    if (Reader.DimCount(BaseName) <> 3) or
+       (Reader.DimSize(BaseName, 0) <> NumExperts) or
+       (Reader.DimSize(BaseName, 1) <> InDim) or
+       (Reader.DimSize(BaseName, 2) <> OutDim) then
+      ImportError('gpt-oss import: "' + BaseName + '" must have shape [' +
+        IntToStr(NumExperts) + ', ' + IntToStr(InDim) + ', ' +
+        IntToStr(OutDim) + '], got ' + Reader.ShapeAsString(BaseName));
+    Reader.LoadTensorFlat(BaseName, Dest);
+    Exit;
+  end;
+  BlocksName := BaseName + '_blocks';
+  ScalesName := BaseName + '_scales';
+  if not (Reader.HasTensor(BlocksName) and Reader.HasTensor(ScalesName)) then
+    ImportError('gpt-oss import: missing expert tensor "' + BaseName +
+      '" (neither the dense form nor the MXFP4 "' + BlocksName + '"/"' +
+      ScalesName + '" pair is present).');
+  if (InDim mod MXFP4_BLOCK_ELEMS) <> 0 then
+    ImportError('gpt-oss import: MXFP4 expert "' + BaseName + '" in-dim ' +
+      IntToStr(InDim) + ' is not a multiple of ' +
+      IntToStr(MXFP4_BLOCK_ELEMS) + '.');
+  NumBlocks := NumExperts * OutDim * (InDim div MXFP4_BLOCK_ELEMS);
+  Reader.LoadTensorRawBytes(BlocksName, Blocks);
+  Reader.LoadTensorRawBytes(ScalesName, Scales);
+  if Length(Blocks) <> NumBlocks * MXFP4_BLOCK_BYTES then
+    ImportError('gpt-oss import: MXFP4 "' + BlocksName + '" has ' +
+      IntToStr(Length(Blocks)) + ' bytes, expected ' +
+      IntToStr(NumBlocks * MXFP4_BLOCK_BYTES) + '.');
+  if Length(Scales) <> NumBlocks then
+    ImportError('gpt-oss import: MXFP4 "' + ScalesName + '" has ' +
+      IntToStr(Length(Scales)) + ' bytes, expected ' +
+      IntToStr(NumBlocks) + '.');
+  SetLength(Deq, NumExperts * OutDim * InDim);
+  DequantizeMXFP4(@Blocks[0], @Scales[0], NumBlocks, @Deq[0]);
+  // Deq is [E, Out, In] (row-major). Transpose the last two axes into Dest's
+  // [E, In, Out] layout.
+  Dest.ReSize(NumExperts * InDim * OutDim, 1, 1);
+  for e := 0 to NumExperts - 1 do
+    for oo := 0 to OutDim - 1 do
+      for ii := 0 to InDim - 1 do
+        Dest.FData[(e * InDim + ii) * OutDim + oo] :=
+          Deq[(e * OutDim + oo) * InDim + ii];
+  SetLength(Deq, 0);
+end;
+
+// Builds and loads one gpt-oss MoE FFN branch from MoESource. Router (bias) ->
+// per-token softmax -> top-k gate (renormalized, == gpt-oss's topk-then-softmax)
+// -> per-expert [interleaved gate|up (bias) -> clamped SwiGLU -> down (bias)],
+// gate-weighted sum. Mirrors BuildMixtralMoEBranch but for gpt-oss's biased,
+// interleaved, clamped-SwiGLU experts.
+procedure BuildGptOssMoEBranch(NN: TNNet; MoESource: TNNetLayer;
+  const Config: TGptOssConfig; Reader: TNNetSafeTensorsReader;
+  const BlockPrefix: string);
+var
+  GateConv, GateTopK, ExpertOut, GateE, GateEBroadcast: TNNetLayer;
+  GateUpLayers, DownLayers, MoEBranches: array of TNNetLayer;
+  ExpertCnt: integer;
+  GateUpW, GateUpB, DownW, DownB: TNNetVolume;
+  GU2: integer;
+begin
+  GU2 := 2 * Config.IntermediateSize;
+  SetLength(GateUpLayers, Config.NumLocalExperts);
+  SetLength(DownLayers, Config.NumLocalExperts);
+  SetLength(MoEBranches, Config.NumLocalExperts);
+  GateConv := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.NumLocalExperts), MoESource);
+  NN.AddLayer( TNNetPointwiseSoftMax.Create() );
+  GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+    Config.NumExpertsPerTok, {pRenormalize=}True) );
+  for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
+  begin
+    GateUpLayers[ExpertCnt] := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(GU2), MoESource);
+    NN.AddLayer( TNNetGptOssGatedSwiGLU.Create(
+      Config.SwiGLUAlpha, Config.SwiGLULimit) );
+    DownLayers[ExpertCnt] := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+    ExpertOut := NN.GetLastLayer();
+    GateE := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(ExpertCnt, 1), GateTopK);
+    GateEBroadcast := NN.AddLayer(
+      TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
+    MoEBranches[ExpertCnt] := NN.AddLayer(
+      TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
+  end;
+  NN.AddLayer( TNNetSum.Create(MoEBranches) );
+  // ---- weights ----
+  GateUpW := TNNetVolume.Create;
+  GateUpB := TNNetVolume.Create;
+  DownW := TNNetVolume.Create;
+  DownB := TNNetVolume.Create;
+  try
+    LoadLlamaLinearWeights(Reader, GateConv,
+      BlockPrefix + 'mlp.router.weight', Config.HiddenSize,
+      Config.NumLocalExperts, 0, -1, 0,
+      BlockPrefix + 'mlp.router.bias');
+    LoadGptOssExpertSlab(Reader, BlockPrefix + 'mlp.experts.gate_up_proj',
+      Config.NumLocalExperts, Config.HiddenSize, GU2, GateUpW);
+    Reader.LoadTensorFlat(BlockPrefix + 'mlp.experts.gate_up_proj_bias', GateUpB);
+    LoadGptOssExpertSlab(Reader, BlockPrefix + 'mlp.experts.down_proj',
+      Config.NumLocalExperts, Config.IntermediateSize, Config.HiddenSize, DownW);
+    Reader.LoadTensorFlat(BlockPrefix + 'mlp.experts.down_proj_bias', DownB);
+    for ExpertCnt := 0 to Config.NumLocalExperts - 1 do
+    begin
+      LoadGptOssExpertMatrix(GateUpLayers[ExpertCnt], GateUpW, GateUpB,
+        ExpertCnt, Config.HiddenSize, GU2);
+      LoadGptOssExpertMatrix(DownLayers[ExpertCnt], DownW, DownB,
+        ExpertCnt, Config.IntermediateSize, Config.HiddenSize);
+    end;
+  finally
+    DownB.Free; DownW.Free; GateUpB.Free; GateUpW.Free;
+  end;
+end;
+
+function BuildGptOssFromTensorReaderWithConfig(
+  pReader: TNNetSafeTensorsReader; const FileName: string;
+  var Config: TGptOssConfig; pSeqLen: integer;
+  pInferenceOnly: boolean; pQuantizeInt8: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  EmbeddingLayer, LMHead, BranchInput, NormedSource: TNNetLayer;
+  AttnNorm, MlpNorm, QProj, KProj, VProj, OProj: TNNetLayer;
+  QSlice, KSlice, HeadPack: TNNetLayer;
+  KRotated, VSlices, HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
+  HeadDim, QWidth, KVWidth, LayerWindow, i, j, d: integer;
+  LMHeadName, BlockPrefix: string;
+  Tmp: TNNetVolume;
+begin
+  Reader := pReader;
+  NN := nil;
+  try
+    HeadDim := Config.HeadDim;
+    if Odd(HeadDim) then
+      ImportError('gpt-oss import: head_dim=' + IntToStr(HeadDim) +
+        ' must be even (RoPE rotates channel pairs).');
+    QWidth := Config.NumHeads * HeadDim;
+    KVWidth := Config.NumKVHeads * HeadDim;
+    if (Config.NumHeads mod Config.NumKVHeads) <> 0 then
+      ImportError('gpt-oss import: num_attention_heads=' +
+        IntToStr(Config.NumHeads) + ' is not a multiple of ' +
+        'num_key_value_heads=' + IntToStr(Config.NumKVHeads) + '.');
+    GroupSize := Config.NumHeads div Config.NumKVHeads;
+    if Reader.HasTensor('model.embed_tokens.weight') then
+      Config.Prefix := 'model.'
+    else if Reader.HasTensor('embed_tokens.weight') then
+      Config.Prefix := ''
+    else
+      ImportError('gpt-oss import: neither "model.embed_tokens.weight" nor ' +
+        '"embed_tokens.weight" found in ' + Reader.FileName + '.');
+    LMHeadName := 'lm_head.weight';
+    if (not Config.TieWordEmbeddings) and (not Reader.HasTensor(LMHeadName)) then
+      ImportError('gpt-oss import: tie_word_embeddings=false but "' +
+        LMHeadName + '" is missing from ' + Reader.FileName + '.');
+    if pSeqLen <= 0 then SeqLen := Config.MaxPositions else SeqLen := pSeqLen;
+    if SeqLen > Config.MaxPositions then
+      ImportError('gpt-oss import: requested SeqLen=' + IntToStr(SeqLen) +
+        ' exceeds max_position_embeddings=' +
+        IntToStr(Config.MaxPositions) + '.');
+
+    NN := TNNet.Create();
+    NN.AddLayer( TNNetInput.Create(SeqLen) );
+    EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+      Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(KRotated, Config.NumKVHeads);
+    SetLength(VSlices, Config.NumKVHeads);
+    SetLength(HeadOutputs, Config.NumHeads);
+    SetLength(SliceChannels, HeadDim);
+
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        ImportError('gpt-oss import: embed_tokens.weight element count ' +
+          IntToStr(Tmp.Size) + ' <> embedding table size ' +
+          IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+      if Config.LayerIsSliding[BlockCnt] then
+        LayerWindow := Config.SlidingWindow
+      else
+        LayerWindow := 0;
+      // attention sub-block: x := x + o_proj(sink-attn(rope-GQA(RMSNorm(x))))
+      BranchInput := NN.GetLastLayer();
+      AttnNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      NormedSource := AttnNorm;
+      QProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+      KProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+      VProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+      for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+      begin
+        for d := 0 to HeadDim - 1 do
+          SliceChannels[d] := KVHeadCnt * HeadDim + d;
+        KSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels), KProj);
+        KRotated[KVHeadCnt] := NN.AddLayerAfter(
+          CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), KSlice);
+        VSlices[KVHeadCnt] := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels), VProj);
+      end;
+      for HeadCnt := 0 to Config.NumHeads - 1 do
+      begin
+        KVGroup := HeadCnt div GroupSize;
+        for d := 0 to HeadDim - 1 do
+          SliceChannels[d] := HeadCnt * HeadDim + d;
+        QSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels), QProj);
+        QSlice := NN.AddLayerAfter(
+          CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling), QSlice);
+        HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+          [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
+        HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+          TNNetGptOssSinkAttention.Create(HeadDim, {pCausalMask=}True,
+            {pWindow=}LayerWindow), HeadPack);
+      end;
+      NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+      OProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      NN.AddLayer( TNNetSum.Create([OProj, BranchInput]) );
+      // MLP sub-block: x := x + MoE(RMSNorm(x))
+      BranchInput := NN.GetLastLayer();
+      MlpNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      BuildGptOssMoEBranch(NN, MlpNorm, Config, Reader, BlockPrefix);
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      LoadLlamaRMSNormWeights(Reader, AttnNorm,
+        BlockPrefix + 'input_layernorm.weight', Config.HiddenSize);
+      LoadLlamaRMSNormWeights(Reader, MlpNorm,
+        BlockPrefix + 'post_attention_layernorm.weight', Config.HiddenSize);
+      LoadLlamaLinearWeights(Reader, QProj,
+        BlockPrefix + 'self_attn.q_proj.weight', Config.HiddenSize, QWidth,
+        0, -1, HeadDim, BlockPrefix + 'self_attn.q_proj.bias');
+      LoadLlamaLinearWeights(Reader, KProj,
+        BlockPrefix + 'self_attn.k_proj.weight', Config.HiddenSize, KVWidth,
+        0, -1, HeadDim, BlockPrefix + 'self_attn.k_proj.bias');
+      LoadLlamaLinearWeights(Reader, VProj,
+        BlockPrefix + 'self_attn.v_proj.weight', Config.HiddenSize, KVWidth,
+        0, -1, 0, BlockPrefix + 'self_attn.v_proj.bias');
+      LoadLlamaLinearWeights(Reader, OProj,
+        BlockPrefix + 'self_attn.o_proj.weight', QWidth, Config.HiddenSize,
+        0, -1, 0, BlockPrefix + 'self_attn.o_proj.bias');
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(BlockPrefix + 'self_attn.sinks', Tmp);
+        if Tmp.Size <> Config.NumHeads then
+          ImportError('gpt-oss import: "' + BlockPrefix +
+            'self_attn.sinks" has ' + IntToStr(Tmp.Size) +
+            ' entries, expected num_attention_heads=' +
+            IntToStr(Config.NumHeads) + '.');
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+          TNNetGptOssSinkAttention(HeadOutputs[HeadCnt]).SetSinkLogit(
+            Tmp.FData[HeadCnt]);
+      finally
+        Tmp.Free;
+      end;
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+    end;
+
+    NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+    LoadLlamaRMSNormWeights(Reader, NN.GetLastLayer(),
+      Config.Prefix + 'norm.weight', Config.HiddenSize);
+    LMHead := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    Tmp := TNNetVolume.Create;
+    try
+      if Config.TieWordEmbeddings then
+      begin
+        Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+      end
+      else
+        LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+          Config.HiddenSize, Config.VocabSize);
+    finally
+      Tmp.Free;
+    end;
+    if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+    Result := NN;
+    NN := nil;
+  finally
+    NN.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildGptOssFromSafeTensorsEx(const FileName: string;
+  out Config: TGptOssConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadGptOssConfigFromJSONFile(ConfigPath);
+  Result := BuildGptOssFromTensorReaderWithConfig(
+    CreatePretrainedTensorReader(FileName), FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildGptOssFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TGptOssConfig;
+begin
+  Result := BuildGptOssFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -8380,6 +19022,39 @@ begin
   Layer.FlushWeightCache();
 end;
 
+// Fills a TNNetLearnedPositionalEmbedding table with the M2M100/NLLB
+// sinusoidal positions (M2M100SinusoidalPositionalEmbedding). The half-split
+// layout matches Marian/Pegasus (sin in the first d/2 columns, cos in the
+// second), BUT the frequency base is log(10000)/(half-1) - NOT the
+// /d_model spacing of FillMarianSinusoidalPositions - and the token at
+// (0-based) position p reads table row p + 2 (HF position_ids start at
+// padding_idx + 1 = 2; the padding-idx row is never reached for non-pad
+// sequences). The whole table is a pure function of d_model, so the importer
+// regenerates it (HF drops embed_positions via _keys_to_ignore_on_save).
+procedure FillM2M100SinusoidalPositions(Layer: TNNetLayer;
+  SeqLen, DModel: integer);
+const
+  M2M100PositionOffset = 2;
+var
+  PosCnt, ChCnt, Half, Row: integer;
+  EmbConst, Angle: double;
+begin
+  Half := DModel div 2;
+  EmbConst := Ln(10000.0) / (Half - 1);
+  for PosCnt := 0 to SeqLen - 1 do
+  begin
+    Row := PosCnt + M2M100PositionOffset;
+    for ChCnt := 0 to Half - 1 do
+    begin
+      Angle := Row * Exp(-ChCnt * EmbConst);
+      Layer.Neurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
+      Layer.Neurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
+        Cos(Angle);
+    end;
+  end;
+  Layer.FlushWeightCache();
+end;
+
 // Loads one Marian attention sub-block's q/k/v/out projections (HF
 // nn.Linear [d_model, d_model], ALL biased) plus its post-residual
 // LayerNorm (NormPrefix, weight+bias).
@@ -8655,6 +19330,2482 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMarianConfigFromJSONFile(ConfigPath);
   BuildMarianFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+// ===========================================================================
+// T5 EXPORT (inverse of BuildT5FromSafeTensors)
+// ===========================================================================
+// Walks one T5 stack (encoder or decoder) collected as typed arrays and emits
+// every HF tensor for it. The collection mirrors the importer build order:
+//   PointwiseConvLinear per block: enc = Q,K,V,O(self),Wi,Wo (6);
+//     dec = Q,K,V,O(self),Q,K,V,O(cross),Wi,Wo (10); + the decoder LM head.
+//   TokenRMSNorm per block: enc = SelfAttnNorm,FFNNorm (2);
+//     dec = SelfAttnNorm,CrossAttnNorm,FFNNorm (3); + one final stack norm.
+//   T5RelPosBiasAttention leaves: NumHeads per block (only block 0's are
+//     emitted - the SHARED relative_attention_bias table, [NumBuckets,Heads]).
+// Coded by Claude (AI).
+
+type
+  TT5ExportLayerArray = array of TNNetLayer;
+
+// Writes a bias-free HF nn.Linear [OutDim, InDim] STRAIGHT from OutDim
+// consecutive neurons of Layer starting at NeuronBase, optionally dividing
+// every weight by InvScale (the T5 q-projection un-folds its sqrt(d_kv)
+// compensation this way). Inverse of LoadLlamaLinearWeights (bias-free).
+procedure DumpT5Linear(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
+  NeuronBase, OutDim, InDim: integer; const WName: string;
+  InvScale: TNeuralFloat; pDType: TSafeTensorsWriteDType);
+var
+  W: TNNetVolume;
+  jj, ii: integer;
+begin
+  W := TNNetVolume.Create;
+  try
+    W.ReSize(OutDim * InDim, 1, 1);
+    for jj := 0 to OutDim - 1 do
+    begin
+      if Layer.Neurons[NeuronBase + jj].Weights.Size <> InDim then
+        ImportError('T5 export: neuron ' + IntToStr(NeuronBase + jj) +
+          ' for "' + WName + '" has ' +
+          IntToStr(Layer.Neurons[NeuronBase + jj].Weights.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      for ii := 0 to InDim - 1 do
+        W.FData[jj * InDim + ii] :=
+          Layer.Neurons[NeuronBase + jj].Weights.FData[ii] * InvScale;
+    end;
+    Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+  finally
+    W.Free;
+  end;
+end;
+
+// Writes a T5 RMSNorm gain ([d_model], no beta) from Neurons[0].
+procedure DumpT5RMSNorm(Writer: TNNetSafeTensorsWriter; Layer: TNNetLayer;
+  const WName: string; d_model: integer; pDType: TSafeTensorsWriteDType);
+begin
+  if Layer.Neurons[0].Weights.Size <> d_model then
+    ImportError('T5 export: RMSNorm "' + WName + '" gain size ' +
+      IntToStr(Layer.Neurons[0].Weights.Size) + ' <> d_model ' +
+      IntToStr(d_model) + '.');
+  Writer.AddTensorFlat(WName, [d_model], Layer.Neurons[0].Weights, pDType);
+end;
+
+procedure SaveT5ToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TT5Config; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  InnerDim: integer;
+  QInvScale: TNeuralFloat;
+  RelBias: TNNetVolume;
+  HeadCnt, BucketCnt: integer;
+
+  // Collects, for one stack, the typed layers in build order, then emits all
+  // its HF tensors under StackPrefix ('encoder.' / 'decoder.').
+  procedure DumpStack(Net: TNNet; IsDecoder: boolean;
+    const StackPrefix: string; NumBlocks: integer;
+    out LMHead: TNNetLayer; out RelHeads0: TT5ExportLayerArray);
+  var
+    PwConvs, Norms, RelHeads: array of TNNetLayer;
+    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock: integer;
+    BP, FFNPrefix, SAP, CAP: string;
+    FFNIdx: integer;
+  begin
+    SetLength(PwConvs, 0);
+    SetLength(Norms, 0);
+    SetLength(RelHeads, 0);
+    for li := 0 to Net.CountLayers - 1 do
+    begin
+      if Net.Layers[li] is TNNetT5RelPosBiasAttention then
+      begin
+        SetLength(RelHeads, Length(RelHeads) + 1);
+        RelHeads[High(RelHeads)] := Net.Layers[li];
+      end
+      else if Net.Layers[li] is TNNetTokenRMSNorm then
+      begin
+        SetLength(Norms, Length(Norms) + 1);
+        Norms[High(Norms)] := Net.Layers[li];
+      end
+      else if Net.Layers[li] is TNNetPointwiseConvLinear then
+      begin
+        SetLength(PwConvs, Length(PwConvs) + 1);
+        PwConvs[High(PwConvs)] := Net.Layers[li];
+      end;
+    end;
+    if IsDecoder then
+    begin
+      PwPerBlock := 10; NormPerBlock := 3; FFNIdx := 2;
+    end
+    else
+    begin
+      PwPerBlock := 6; NormPerBlock := 2; FFNIdx := 1;
+    end;
+    if Length(PwConvs) <> PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0) then
+      ImportError('T5 export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(PwConvs)) + ' PointwiseConvLinear layers, expected ' +
+        IntToStr(PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0)) + '.');
+    if Length(Norms) <> NormPerBlock * NumBlocks + 1 then
+      ImportError('T5 export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(Norms)) + ' TokenRMSNorm layers, expected ' +
+        IntToStr(NormPerBlock * NumBlocks + 1) + '.');
+    if Length(RelHeads) <> Config.NumHeads * NumBlocks then
+      ImportError('T5 export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(RelHeads)) + ' relpos heads, expected ' +
+        IntToStr(Config.NumHeads * NumBlocks) + '.');
+    for BlockCnt := 0 to NumBlocks - 1 do
+    begin
+      BP := StackPrefix + 'block.' + IntToStr(BlockCnt) + '.';
+      PwBase := BlockCnt * PwPerBlock;
+      NormBase := BlockCnt * NormPerBlock;
+      SAP := BP + 'layer.0.SelfAttention.';
+      DumpT5RMSNorm(Writer, Norms[NormBase + 0],
+        BP + 'layer.0.layer_norm.weight', Config.DModel, pDType);
+      // q un-folds its sqrt(d_kv) scale; k/v/o are straight.
+      DumpT5Linear(Writer, PwConvs[PwBase + 0], 0, InnerDim, Config.DModel,
+        SAP + 'q.weight', QInvScale, pDType);
+      DumpT5Linear(Writer, PwConvs[PwBase + 1], 0, InnerDim, Config.DModel,
+        SAP + 'k.weight', 1.0, pDType);
+      DumpT5Linear(Writer, PwConvs[PwBase + 2], 0, InnerDim, Config.DModel,
+        SAP + 'v.weight', 1.0, pDType);
+      DumpT5Linear(Writer, PwConvs[PwBase + 3], 0, Config.DModel, InnerDim,
+        SAP + 'o.weight', 1.0, pDType);
+      if IsDecoder then
+      begin
+        CAP := BP + 'layer.1.EncDecAttention.';
+        DumpT5RMSNorm(Writer, Norms[NormBase + 1],
+          BP + 'layer.1.layer_norm.weight', Config.DModel, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + 4], 0, InnerDim, Config.DModel,
+          CAP + 'q.weight', QInvScale, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + 5], 0, InnerDim, Config.DModel,
+          CAP + 'k.weight', 1.0, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + 6], 0, InnerDim, Config.DModel,
+          CAP + 'v.weight', 1.0, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + 7], 0, Config.DModel, InnerDim,
+          CAP + 'o.weight', 1.0, pDType);
+      end;
+      FFNPrefix := BP + 'layer.' + IntToStr(FFNIdx) + '.';
+      DumpT5RMSNorm(Writer, Norms[NormBase + NormPerBlock - 1],
+        FFNPrefix + 'layer_norm.weight', Config.DModel, pDType);
+      if Config.GatedFFN then
+      begin
+        // TNNetGEGLU fused: neurons 0..d_ff-1 = wi_1 (linear half),
+        // d_ff..2*d_ff-1 = wi_0 (gated half) - inverse of the importer.
+        DumpT5Linear(Writer, PwConvs[PwBase + PwPerBlock - 2], Config.DFF,
+          Config.DFF, Config.DModel,
+          FFNPrefix + 'DenseReluDense.wi_0.weight', 1.0, pDType);
+        DumpT5Linear(Writer, PwConvs[PwBase + PwPerBlock - 2], 0,
+          Config.DFF, Config.DModel,
+          FFNPrefix + 'DenseReluDense.wi_1.weight', 1.0, pDType);
+      end
+      else
+        DumpT5Linear(Writer, PwConvs[PwBase + PwPerBlock - 2], 0,
+          Config.DFF, Config.DModel,
+          FFNPrefix + 'DenseReluDense.wi.weight', 1.0, pDType);
+      DumpT5Linear(Writer, PwConvs[PwBase + PwPerBlock - 1], 0,
+        Config.DModel, Config.DFF,
+        FFNPrefix + 'DenseReluDense.wo.weight', 1.0, pDType);
+    end;
+    DumpT5RMSNorm(Writer, Norms[High(Norms)],
+      StackPrefix + 'final_layer_norm.weight', Config.DModel, pDType);
+    // The block-0 per-head rel-pos columns (the SHARED table for the stack).
+    SetLength(RelHeads0, Config.NumHeads);
+    for li := 0 to Config.NumHeads - 1 do
+      RelHeads0[li] := RelHeads[li];
+    if IsDecoder then LMHead := PwConvs[High(PwConvs)] else LMHead := nil;
+  end;
+
+var
+  EncEmbed, DecEmbed: TNNetLayer;
+  EncLMHead, DecLMHead: TNNetLayer;
+  EncRelHeads0, DecRelHeads0: TT5ExportLayerArray;
+  i: integer;
+begin
+  InnerDim := Config.NumHeads * Config.DKV;
+  // The importer multiplies every q weight by sqrt(d_kv); un-fold by dividing.
+  QInvScale := 1.0 / Sqrt(Config.DKV);
+
+  // ---- find the embeddings ----
+  EncEmbed := nil; DecEmbed := nil;
+  for i := 0 to EncoderNet.CountLayers - 1 do
+    if EncoderNet.Layers[i] is TNNetEmbedding then
+    begin EncEmbed := EncoderNet.Layers[i]; break; end;
+  for i := 0 to DecoderNet.CountLayers - 1 do
+    if DecoderNet.Layers[i] is TNNetEmbedding then
+    begin DecEmbed := DecoderNet.Layers[i]; break; end;
+  if (EncEmbed = nil) or (DecEmbed = nil) then
+    ImportError('T5 export: missing embedding layer - not a ' +
+      'BuildT5FromSafeTensors pair?');
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  RelBias := TNNetVolume.Create;
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/t5');
+    // ---- shared embedding (unscaled in T5) ----
+    if EncEmbed.Neurons[0].Weights.Size <> Config.VocabSize * Config.DModel then
+      ImportError('T5 export: embedding size mismatch.');
+    Writer.AddTensorFlat('shared.weight',
+      [Config.VocabSize, Config.DModel], EncEmbed.Neurons[0].Weights, pDType);
+
+    DumpStack(EncoderNet, {IsDecoder=}false, 'encoder.', Config.NumLayers,
+      EncLMHead, EncRelHeads0);
+    DumpStack(DecoderNet, {IsDecoder=}true, 'decoder.',
+      Config.NumDecoderLayers, DecLMHead, DecRelHeads0);
+
+    // ---- shared relative-position bias tables (block 0 of each stack) ----
+    // HF [NumBuckets, NumHeads]: T[bucket, h] = head h's bucket bias.
+    RelBias.ReSize(Config.RelPosNumBuckets * Config.NumHeads, 1, 1);
+    for HeadCnt := 0 to Config.NumHeads - 1 do
+    begin
+      if EncRelHeads0[HeadCnt].Neurons[0].Weights.Size <>
+         Config.RelPosNumBuckets then
+        ImportError('T5 export: encoder relpos head ' + IntToStr(HeadCnt) +
+          ' bucket count mismatch.');
+      for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
+        RelBias.FData[BucketCnt * Config.NumHeads + HeadCnt] :=
+          EncRelHeads0[HeadCnt].Neurons[0].Weights.FData[BucketCnt];
+    end;
+    Writer.AddTensorFlat('encoder.block.0.layer.0.SelfAttention.' +
+      'relative_attention_bias.weight',
+      [Config.RelPosNumBuckets, Config.NumHeads], RelBias, pDType);
+    for HeadCnt := 0 to Config.NumHeads - 1 do
+      for BucketCnt := 0 to Config.RelPosNumBuckets - 1 do
+        RelBias.FData[BucketCnt * Config.NumHeads + HeadCnt] :=
+          DecRelHeads0[HeadCnt].Neurons[0].Weights.FData[BucketCnt];
+    Writer.AddTensorFlat('decoder.block.0.layer.0.SelfAttention.' +
+      'relative_attention_bias.weight',
+      [Config.RelPosNumBuckets, Config.NumHeads], RelBias, pDType);
+
+    // ---- LM head ----
+    // Tied v1.0: the head holds shared rows scaled by d_model^-0.5; the
+    // importer REGENERATES it from shared.weight, so emit nothing (the
+    // un-scaled shared.weight already round-trips). Untied (Flan/v1.1): a
+    // straight bias-free [vocab, d_model] head.
+    if not Config.TieWordEmbeddings then
+      DumpT5Linear(Writer, DecLMHead, 0, Config.VocabSize, Config.DModel,
+        'lm_head.weight', 1.0, pDType);
+
+    Writer.SaveToFile;
+  finally
+    RelBias.Free;
+    Writer.Free;
+  end;
+end;
+
+// ===========================================================================
+// MARIAN EXPORT (inverse of BuildMarianFromSafeTensors)
+// ===========================================================================
+
+procedure SaveMarianToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TMarianConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  EncEmbed, DecEmbed, LMHead: TNNetLayer;
+  Shared, FinalBias: TNNetVolume;
+  EmbedScale, InvEmbedScale: TNeuralFloat;
+  i, j: integer;
+
+  // Writes a HF nn.Linear [OutDim, InDim] (+bias [OutDim]) from OutDim
+  // neurons of Layer (biased - the Marian convention).
+  procedure DumpLinearB(Layer: TNNetLayer; OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[jj].Weights.Size <> InDim then
+          ImportError('Marian export: neuron ' + IntToStr(jj) + ' for "' +
+            WName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Walks one Marian stack and emits its HF tensors. PointwiseConvLinear per
+  // block: enc = Q,K,V,O(self),Fc1,Fc2 (6); dec = Q,K,V,O(self),Q,K,V,O
+  // (cross),Fc1,Fc2 (10) + the decoder LM head. TokenLayerNorm per block:
+  // enc = SelfNorm,FFNNorm (2); dec = SelfNorm,CrossNorm,FFNNorm (3).
+  procedure DumpStack(Net: TNNet; IsDecoder: boolean;
+    const StackPrefix: string; NumBlocks, NumHeads, FFNDim: integer;
+    out LMHeadOut: TNNetLayer);
+  var
+    PwConvs, Norms: array of TNNetLayer;
+    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock: integer;
+    BP: string;
+  begin
+    SetLength(PwConvs, 0);
+    SetLength(Norms, 0);
+    for li := 0 to Net.CountLayers - 1 do
+    begin
+      if Net.Layers[li] is TNNetTokenLayerNorm then
+      begin
+        SetLength(Norms, Length(Norms) + 1);
+        Norms[High(Norms)] := Net.Layers[li];
+      end
+      else if Net.Layers[li] is TNNetPointwiseConvLinear then
+      begin
+        SetLength(PwConvs, Length(PwConvs) + 1);
+        PwConvs[High(PwConvs)] := Net.Layers[li];
+      end;
+    end;
+    if IsDecoder then
+    begin
+      PwPerBlock := 10; NormPerBlock := 3;
+    end
+    else
+    begin
+      PwPerBlock := 6; NormPerBlock := 2;
+    end;
+    if Length(PwConvs) <> PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0) then
+      ImportError('Marian export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(PwConvs)) + ' PointwiseConvLinear layers, expected ' +
+        IntToStr(PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0)) + '.');
+    if Length(Norms) <> NormPerBlock * NumBlocks then
+      ImportError('Marian export: ' + StackPrefix + ' has ' +
+        IntToStr(Length(Norms)) + ' TokenLayerNorm layers, expected ' +
+        IntToStr(NormPerBlock * NumBlocks) + '.');
+    for BlockCnt := 0 to NumBlocks - 1 do
+    begin
+      BP := StackPrefix + IntToStr(BlockCnt) + '.';
+      PwBase := BlockCnt * PwPerBlock;
+      NormBase := BlockCnt * NormPerBlock;
+      DumpLinearB(PwConvs[PwBase + 0], Config.DModel, Config.DModel,
+        BP + 'self_attn.q_proj.weight', BP + 'self_attn.q_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 1], Config.DModel, Config.DModel,
+        BP + 'self_attn.k_proj.weight', BP + 'self_attn.k_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 2], Config.DModel, Config.DModel,
+        BP + 'self_attn.v_proj.weight', BP + 'self_attn.v_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 3], Config.DModel, Config.DModel,
+        BP + 'self_attn.out_proj.weight', BP + 'self_attn.out_proj.bias');
+      SaveLayerNormWeights(Writer, Norms[NormBase + 0],
+        BP + 'self_attn_layer_norm.weight', BP + 'self_attn_layer_norm.bias',
+        Config.DModel, pDType);
+      if IsDecoder then
+      begin
+        DumpLinearB(PwConvs[PwBase + 4], Config.DModel, Config.DModel,
+          BP + 'encoder_attn.q_proj.weight', BP + 'encoder_attn.q_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 5], Config.DModel, Config.DModel,
+          BP + 'encoder_attn.k_proj.weight', BP + 'encoder_attn.k_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 6], Config.DModel, Config.DModel,
+          BP + 'encoder_attn.v_proj.weight', BP + 'encoder_attn.v_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 7], Config.DModel, Config.DModel,
+          BP + 'encoder_attn.out_proj.weight',
+          BP + 'encoder_attn.out_proj.bias');
+        SaveLayerNormWeights(Writer, Norms[NormBase + 1],
+          BP + 'encoder_attn_layer_norm.weight',
+          BP + 'encoder_attn_layer_norm.bias', Config.DModel, pDType);
+      end;
+      DumpLinearB(PwConvs[PwBase + PwPerBlock - 2], FFNDim, Config.DModel,
+        BP + 'fc1.weight', BP + 'fc1.bias');
+      DumpLinearB(PwConvs[PwBase + PwPerBlock - 1], Config.DModel, FFNDim,
+        BP + 'fc2.weight', BP + 'fc2.bias');
+      SaveLayerNormWeights(Writer, Norms[NormBase + NormPerBlock - 1],
+        BP + 'final_layer_norm.weight', BP + 'final_layer_norm.bias',
+        Config.DModel, pDType);
+    end;
+    if IsDecoder then LMHeadOut := PwConvs[High(PwConvs)]
+    else LMHeadOut := nil;
+  end;
+
+begin
+  // ---- find embeddings ----
+  EncEmbed := nil; DecEmbed := nil;
+  for i := 0 to EncoderNet.CountLayers - 1 do
+    if EncoderNet.Layers[i] is TNNetEmbedding then
+    begin EncEmbed := EncoderNet.Layers[i]; break; end;
+  for i := 0 to DecoderNet.CountLayers - 1 do
+    if DecoderNet.Layers[i] is TNNetEmbedding then
+    begin DecEmbed := DecoderNet.Layers[i]; break; end;
+  if (EncEmbed = nil) or (DecEmbed = nil) then
+    ImportError('Marian export: missing embedding layer - not a ' +
+      'BuildMarianFromSafeTensors pair?');
+
+  if Config.ScaleEmbedding then EmbedScale := Sqrt(Config.DModel)
+  else EmbedScale := 1.0;
+  InvEmbedScale := 1.0 / EmbedScale;
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  Shared := TNNetVolume.Create;
+  FinalBias := TNNetVolume.Create;
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/marian');
+    // ---- shared embedding: un-fold the scale_embedding sqrt(d_model). ----
+    if EncEmbed.Neurons[0].Weights.Size <> Config.VocabSize * Config.DModel then
+      ImportError('Marian export: embedding size mismatch.');
+    Shared.ReSize(Config.VocabSize * Config.DModel, 1, 1);
+    for i := 0 to Shared.Size - 1 do
+      Shared.FData[i] := EncEmbed.Neurons[0].Weights.FData[i] * InvEmbedScale;
+    Writer.AddTensorFlat('model.shared.weight',
+      [Config.VocabSize, Config.DModel], Shared, pDType);
+
+    DumpStack(EncoderNet, {IsDecoder=}false, 'model.encoder.layers.',
+      Config.EncoderLayers, Config.EncoderHeads, Config.EncoderFFNDim, LMHead);
+    DumpStack(DecoderNet, {IsDecoder=}true, 'model.decoder.layers.',
+      Config.DecoderLayers, Config.DecoderHeads, Config.DecoderFFNDim, LMHead);
+
+    // ---- final_logits_bias: the tied head's per-neuron biases ([1,vocab]).
+    FinalBias.ReSize(Config.VocabSize, 1, 1);
+    for j := 0 to Config.VocabSize - 1 do
+      FinalBias.FData[j] := LMHead.Neurons[j].BiasWeight;
+    Writer.AddTensorFlat('final_logits_bias',
+      [1, Config.VocabSize], FinalBias, pDType);
+    // The static half-split sinusoidal position tables are NOT learned
+    // parameters (HF _keys_to_ignore_on_save); the importer regenerates them,
+    // so we deliberately emit nothing for embed_positions.
+
+    Writer.SaveToFile;
+  finally
+    FinalBias.Free;
+    Shared.Free;
+    Writer.Free;
+  end;
+end;
+
+// ===========================================================================
+// BART / mBART / PEGASUS EXPORT (inverse of the three importers above)
+// All three ride the Marian post-/pre-norm block skeleton. The shared worker
+// SaveBartFamilyToSafeTensors dumps the per-block biased linears + norms with
+// the SAME tensor names as Marian; the three public wrappers differ only in:
+//   - HasEmbLN  : a layernorm_embedding after token+position embeddings
+//                 (BART/mBART) - the first per-stack TokenLayerNorm;
+//   - HasFinalLN: a FINAL encoder/decoder layer_norm closing a pre-norm stack
+//                 (Pegasus/mBART) - the last per-stack TokenLayerNorm;
+//   - PosOffset : >=0 re-emits the learned +2-offset position table
+//                 (BART/mBART, PosOffset=2); <0 emits NO position table
+//                 (Pegasus's static sinusoids, regenerated on import).
+// Coded by Claude (AI).
+// ===========================================================================
+
+procedure SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const FileName, ExporterTag: string;
+  DModel, VocabSize, MaxPositionEmbeddings,
+  EncoderLayers, DecoderLayers, EncoderFFNDim, DecoderFFNDim: integer;
+  ScaleEmbedding, HasEmbLN, HasFinalLN: boolean; PosOffset: integer;
+  pDType: TSafeTensorsWriteDType);
+var
+  Writer: TNNetSafeTensorsWriter;
+  EncEmbed, DecEmbed, LMHead: TNNetLayer;
+  Shared, FinalBias: TNNetVolume;
+  EmbedScale, InvEmbedScale: TNeuralFloat;
+  i, j: integer;
+
+  // Writes a HF nn.Linear [OutDim, InDim] (+bias [OutDim]) from OutDim biased
+  // neurons of Layer - the BART-family convention (identical to Marian).
+  procedure DumpLinearB(Layer: TNNetLayer; OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[jj].Weights.Size <> InDim then
+          ImportError(ExporterTag + ' export: neuron ' + IntToStr(jj) +
+            ' for "' + WName + '" has ' +
+            IntToStr(Layer.Neurons[jj].Weights.Size) + ' weights, expected ' +
+            IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Re-emits the [MaxPositionEmbeddings + PosOffset, DModel] learned position
+  // table from the SeqLen rows stored at offset PosOffset; the unused
+  // padding/upper rows are zero (the importer only reads rows
+  // PosOffset..SeqLen+PosOffset-1).
+  procedure DumpPositions(PosLayer: TNNetLayer; SeqLen: integer;
+    const TName: string);
+  var
+    Tbl: TNNetVolume;
+    PosCnt, ElementCnt, Rows: integer;
+  begin
+    Rows := MaxPositionEmbeddings + PosOffset;
+    Tbl := TNNetVolume.Create;
+    try
+      Tbl.ReSize(Rows * DModel, 1, 1);
+      Tbl.Fill(0);
+      for PosCnt := 0 to SeqLen - 1 do
+        for ElementCnt := 0 to DModel - 1 do
+          Tbl.FData[(PosCnt + PosOffset) * DModel + ElementCnt] :=
+            PosLayer.Neurons[0].Weights.FData[PosCnt * DModel + ElementCnt];
+      Writer.AddTensorFlat(TName, [Rows, DModel], Tbl, pDType);
+    finally
+      Tbl.Free;
+    end;
+  end;
+
+  // Walks one stack and emits its HF tensors. The per-block PointwiseConvLinear
+  // / TokenLayerNorm name layout is identical to Marian; HasEmbLN consumes the
+  // first per-stack TokenLayerNorm (layernorm_embedding) and HasFinalLN the
+  // last (the pre-norm closing layer_norm), neither of which is per-block.
+  procedure DumpStack(Net: TNNet; IsDecoder: boolean;
+    const StackPrefix, StackName: string; NumBlocks, FFNDim: integer;
+    out EmbLNOut, FinalLNOut, LMHeadOut: TNNetLayer);
+  var
+    PwConvs, Norms: array of TNNetLayer;
+    li, BlockCnt, PwBase, NormBase, PwPerBlock, NormPerBlock,
+      BlockNormBase, ExpectNorm: integer;
+    BP: string;
+  begin
+    SetLength(PwConvs, 0);
+    SetLength(Norms, 0);
+    for li := 0 to Net.CountLayers - 1 do
+    begin
+      if Net.Layers[li] is TNNetTokenLayerNorm then
+      begin
+        SetLength(Norms, Length(Norms) + 1);
+        Norms[High(Norms)] := Net.Layers[li];
+      end
+      else if Net.Layers[li] is TNNetPointwiseConvLinear then
+      begin
+        SetLength(PwConvs, Length(PwConvs) + 1);
+        PwConvs[High(PwConvs)] := Net.Layers[li];
+      end;
+    end;
+    if IsDecoder then
+    begin
+      PwPerBlock := 10; NormPerBlock := 3;
+    end
+    else
+    begin
+      PwPerBlock := 6; NormPerBlock := 2;
+    end;
+    if Length(PwConvs) <> PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0) then
+      ImportError(ExporterTag + ' export: ' + StackName + ' has ' +
+        IntToStr(Length(PwConvs)) + ' PointwiseConvLinear layers, expected ' +
+        IntToStr(PwPerBlock * NumBlocks + IfThen(IsDecoder, 1, 0)) + '.');
+    ExpectNorm := NormPerBlock * NumBlocks +
+      IfThen(HasEmbLN, 1, 0) + IfThen(HasFinalLN, 1, 0);
+    if Length(Norms) <> ExpectNorm then
+      ImportError(ExporterTag + ' export: ' + StackName + ' has ' +
+        IntToStr(Length(Norms)) + ' TokenLayerNorm layers, expected ' +
+        IntToStr(ExpectNorm) + '.');
+    BlockNormBase := IfThen(HasEmbLN, 1, 0);
+    for BlockCnt := 0 to NumBlocks - 1 do
+    begin
+      BP := StackPrefix + IntToStr(BlockCnt) + '.';
+      PwBase := BlockCnt * PwPerBlock;
+      NormBase := BlockNormBase + BlockCnt * NormPerBlock;
+      DumpLinearB(PwConvs[PwBase + 0], DModel, DModel,
+        BP + 'self_attn.q_proj.weight', BP + 'self_attn.q_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 1], DModel, DModel,
+        BP + 'self_attn.k_proj.weight', BP + 'self_attn.k_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 2], DModel, DModel,
+        BP + 'self_attn.v_proj.weight', BP + 'self_attn.v_proj.bias');
+      DumpLinearB(PwConvs[PwBase + 3], DModel, DModel,
+        BP + 'self_attn.out_proj.weight', BP + 'self_attn.out_proj.bias');
+      SaveLayerNormWeights(Writer, Norms[NormBase + 0],
+        BP + 'self_attn_layer_norm.weight', BP + 'self_attn_layer_norm.bias',
+        DModel, pDType);
+      if IsDecoder then
+      begin
+        DumpLinearB(PwConvs[PwBase + 4], DModel, DModel,
+          BP + 'encoder_attn.q_proj.weight', BP + 'encoder_attn.q_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 5], DModel, DModel,
+          BP + 'encoder_attn.k_proj.weight', BP + 'encoder_attn.k_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 6], DModel, DModel,
+          BP + 'encoder_attn.v_proj.weight', BP + 'encoder_attn.v_proj.bias');
+        DumpLinearB(PwConvs[PwBase + 7], DModel, DModel,
+          BP + 'encoder_attn.out_proj.weight',
+          BP + 'encoder_attn.out_proj.bias');
+        SaveLayerNormWeights(Writer, Norms[NormBase + 1],
+          BP + 'encoder_attn_layer_norm.weight',
+          BP + 'encoder_attn_layer_norm.bias', DModel, pDType);
+      end;
+      DumpLinearB(PwConvs[PwBase + PwPerBlock - 2], FFNDim, DModel,
+        BP + 'fc1.weight', BP + 'fc1.bias');
+      DumpLinearB(PwConvs[PwBase + PwPerBlock - 1], DModel, FFNDim,
+        BP + 'fc2.weight', BP + 'fc2.bias');
+      SaveLayerNormWeights(Writer, Norms[NormBase + NormPerBlock - 1],
+        BP + 'final_layer_norm.weight', BP + 'final_layer_norm.bias',
+        DModel, pDType);
+    end;
+    if HasEmbLN then EmbLNOut := Norms[0] else EmbLNOut := nil;
+    if HasFinalLN then FinalLNOut := Norms[High(Norms)] else FinalLNOut := nil;
+    if IsDecoder then LMHeadOut := PwConvs[High(PwConvs)]
+    else LMHeadOut := nil;
+  end;
+
+  procedure FindLearnedPos(Net: TNNet; out PosLayer: TNNetLayer);
+  var
+    li: integer;
+  begin
+    PosLayer := nil;
+    for li := 0 to Net.CountLayers - 1 do
+      if Net.Layers[li] is TNNetLearnedPositionalEmbedding then
+      begin PosLayer := Net.Layers[li]; break; end;
+    if PosLayer = nil then
+      ImportError(ExporterTag + ' export: missing positional embedding layer.');
+  end;
+
+var
+  EncEmbLN, DecEmbLN, EncFinalLN, DecFinalLN, EncPos, DecPos,
+    EncLMHeadUnused: TNNetLayer;
+begin
+  // ---- find embeddings ----
+  EncEmbed := nil; DecEmbed := nil;
+  for i := 0 to EncoderNet.CountLayers - 1 do
+    if EncoderNet.Layers[i] is TNNetEmbedding then
+    begin EncEmbed := EncoderNet.Layers[i]; break; end;
+  for i := 0 to DecoderNet.CountLayers - 1 do
+    if DecoderNet.Layers[i] is TNNetEmbedding then
+    begin DecEmbed := DecoderNet.Layers[i]; break; end;
+  if (EncEmbed = nil) or (DecEmbed = nil) then
+    ImportError(ExporterTag + ' export: missing embedding layer - not a ' +
+      'Build' + ExporterTag + 'FromSafeTensors pair?');
+
+  if ScaleEmbedding then EmbedScale := Sqrt(DModel)
+  else EmbedScale := 1.0;
+  InvEmbedScale := 1.0 / EmbedScale;
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  Shared := TNNetVolume.Create;
+  FinalBias := TNNetVolume.Create;
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/' + LowerCase(ExporterTag));
+    // ---- shared embedding: un-fold the scale_embedding sqrt(d_model). ----
+    if EncEmbed.Neurons[0].Weights.Size <> VocabSize * DModel then
+      ImportError(ExporterTag + ' export: embedding size mismatch.');
+    Shared.ReSize(VocabSize * DModel, 1, 1);
+    for i := 0 to Shared.Size - 1 do
+      Shared.FData[i] := EncEmbed.Neurons[0].Weights.FData[i] * InvEmbedScale;
+    Writer.AddTensorFlat('model.shared.weight',
+      [VocabSize, DModel], Shared, pDType);
+
+    DumpStack(EncoderNet, {IsDecoder=}false, 'model.encoder.layers.',
+      'encoder', EncoderLayers, EncoderFFNDim,
+      EncEmbLN, EncFinalLN, EncLMHeadUnused);
+    DumpStack(DecoderNet, {IsDecoder=}true, 'model.decoder.layers.',
+      'decoder', DecoderLayers, DecoderFFNDim,
+      DecEmbLN, DecFinalLN, LMHead);
+
+    // ---- layernorm_embedding (BART/mBART) ----
+    if HasEmbLN then
+    begin
+      SaveLayerNormWeights(Writer, EncEmbLN,
+        'model.encoder.layernorm_embedding.weight',
+        'model.encoder.layernorm_embedding.bias', DModel, pDType);
+      SaveLayerNormWeights(Writer, DecEmbLN,
+        'model.decoder.layernorm_embedding.weight',
+        'model.decoder.layernorm_embedding.bias', DModel, pDType);
+    end;
+
+    // ---- final per-stack layer_norm (Pegasus/mBART pre-norm) ----
+    if HasFinalLN then
+    begin
+      SaveLayerNormWeights(Writer, EncFinalLN,
+        'model.encoder.layer_norm.weight',
+        'model.encoder.layer_norm.bias', DModel, pDType);
+      SaveLayerNormWeights(Writer, DecFinalLN,
+        'model.decoder.layer_norm.weight',
+        'model.decoder.layer_norm.bias', DModel, pDType);
+    end;
+
+    // ---- learned +offset position tables (BART/mBART). Pegasus's static
+    // sinusoids (PosOffset < 0) are regenerated on import - emit nothing. ----
+    if PosOffset >= 0 then
+    begin
+      FindLearnedPos(EncoderNet, EncPos);
+      FindLearnedPos(DecoderNet, DecPos);
+      DumpPositions(EncPos, EncPos.Output.SizeX,
+        'model.encoder.embed_positions.weight');
+      DumpPositions(DecPos, DecPos.Output.SizeX,
+        'model.decoder.embed_positions.weight');
+    end;
+
+    // ---- final_logits_bias: the tied head's per-neuron biases ([1,vocab]). --
+    FinalBias.ReSize(VocabSize, 1, 1);
+    for j := 0 to VocabSize - 1 do
+      FinalBias.FData[j] := LMHead.Neurons[j].BiasWeight;
+    Writer.AddTensorFlat('final_logits_bias',
+      [1, VocabSize], FinalBias, pDType);
+
+    Writer.SaveToFile;
+  finally
+    FinalBias.Free;
+    Shared.Free;
+    Writer.Free;
+  end;
+end;
+
+procedure SaveBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TBartConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+begin
+  SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet, FileName, 'Bart',
+    Config.DModel, Config.VocabSize, Config.MaxPositionEmbeddings,
+    Config.EncoderLayers, Config.DecoderLayers,
+    Config.EncoderFFNDim, Config.DecoderFFNDim, Config.ScaleEmbedding,
+    {HasEmbLN=}true, {HasFinalLN=}false, {PosOffset=}2, pDType);
+end;
+
+procedure SavePegasusToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TPegasusConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+begin
+  SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet, FileName, 'Pegasus',
+    Config.DModel, Config.VocabSize, Config.MaxPositionEmbeddings,
+    Config.EncoderLayers, Config.DecoderLayers,
+    Config.EncoderFFNDim, Config.DecoderFFNDim, Config.ScaleEmbedding,
+    {HasEmbLN=}false, {HasFinalLN=}true, {PosOffset=}-1, pDType);
+end;
+
+procedure SaveMBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TBartConfig; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+begin
+  SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet, FileName, 'MBart',
+    Config.DModel, Config.VocabSize, Config.MaxPositionEmbeddings,
+    Config.EncoderLayers, Config.DecoderLayers,
+    Config.EncoderFFNDim, Config.DecoderFFNDim, Config.ScaleEmbedding,
+    {HasEmbLN=}true, {HasFinalLN=}true, {PosOffset=}2, pDType);
+end;
+
+procedure SaveM2M100ToSafeTensors(EncoderNet, DecoderNet: TNNet;
+  const Config: TM2M100Config; const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+begin
+  // M2M100/NLLB rides the Pegasus parameterisation exactly: NO
+  // layernorm_embedding, a FINAL per-stack pre-norm layer_norm, and STATIC
+  // half-split sinusoidal positions (PosOffset < 0 => emit NO position table;
+  // the importer regenerates them). The relu vs erf-GELU FFN difference is
+  // structural only - it does not change which weights are serialized.
+  SaveBartFamilyToSafeTensors(EncoderNet, DecoderNet, FileName, 'M2M100',
+    Config.DModel, Config.VocabSize, Config.MaxPositionEmbeddings,
+    Config.EncoderLayers, Config.DecoderLayers,
+    Config.EncoderFFNDim, Config.DecoderFFNDim, Config.ScaleEmbedding,
+    {HasEmbLN=}false, {HasFinalLN=}true, {PosOffset=}-1, pDType);
+end;
+
+// ===========================================================================
+// BART IMPORT
+// ===========================================================================
+
+const
+  // nn.LayerNorm's default eps - BART never overrides it.
+  BartLayerNormEps = 1e-5;
+  // BartLearnedPositionalEmbedding's padding offset: token position p reads
+  // table row p + 2 (rows 0/1 are the padding-idx slots).
+  BartPositionOffset = 2;
+
+function ReadBartConfigFromJSONFile(const FileName: string): TBartConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('BART import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('BART import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('BART import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('BART import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('BART import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'bart');
+    if ModelType <> 'bart' then
+      ImportError('BART import: config model_type is "' + ModelType +
+        '" - only "bart" is supported here (see BuildFromPretrained for ' +
+        'the full dispatch).');
+    Result.ModelType := ModelType;
+    Result.DModel := RequiredInt('d_model');
+    Result.EncoderLayers := RequiredInt('encoder_layers');
+    Result.DecoderLayers := RequiredInt('decoder_layers');
+    Result.EncoderHeads := RequiredInt('encoder_attention_heads');
+    Result.DecoderHeads := RequiredInt('decoder_attention_heads');
+    Result.EncoderFFNDim := RequiredInt('encoder_ffn_dim');
+    Result.DecoderFFNDim := RequiredInt('decoder_ffn_dim');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositionEmbeddings :=
+      Obj.Get('max_position_embeddings', 1024);
+    // HF BartConfig defaults.
+    Result.PadTokenId := Obj.Get('pad_token_id', 1);
+    Result.BosTokenId := Obj.Get('bos_token_id', 0);
+    Result.EosTokenId := Obj.Get('eos_token_id', 2);
+    Result.DecoderStartTokenId :=
+      Obj.Get('decoder_start_token_id', Result.EosTokenId);
+    Result.ScaleEmbedding := Obj.Get('scale_embedding', False);
+    // Only the published BART recipe ("gelu", the exact erf form) is
+    // supported. gelu_new / relu / swish are rejected to avoid a silent
+    // activation mismatch.
+    ActFn := Obj.Get('activation_function', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('BART import: activation_function "' + ActFn +
+        '" is not supported - expected "gelu" (the exact erf form every ' +
+        'published BART pins).');
+    if not Obj.Get('tie_word_embeddings', True) then
+      ImportError('BART import: tie_word_embeddings=false is not ' +
+        'supported - BART ties the lm_head to the shared embedding.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BartConfigToString(const Config: TBartConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'bart'
+  else Result := Config.ModelType;
+  Result := Result + ' config: enc_layers=' +
+    IntToStr(Config.EncoderLayers) +
+    ', dec_layers=' + IntToStr(Config.DecoderLayers) +
+    ', enc_heads=' + IntToStr(Config.EncoderHeads) +
+    ', dec_heads=' + IntToStr(Config.DecoderHeads) +
+    ', d_model=' + IntToStr(Config.DModel) +
+    ', enc_ffn=' + IntToStr(Config.EncoderFFNDim) +
+    ', dec_ffn=' + IntToStr(Config.DecoderFFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings) +
+    ', pad=' + IntToStr(Config.PadTokenId) +
+    ', eos=' + IntToStr(Config.EosTokenId) +
+    ', dec_start=' + IntToStr(Config.DecoderStartTokenId) +
+    ', scale_embedding=' + BoolToStr(Config.ScaleEmbedding, true) +
+    ', ffn=gelu';
+end;
+
+// Grows one BART stack (encoder or decoder) onto NN after the embedding +
+// positional + layernorm_embedding layers. POST-norm wiring identical to
+// Marian (residual add THEN biased LayerNorm; no final stack norm), but the
+// FFN uses the EXACT-erf GELU (the BERT composition) instead of swish/relu.
+// IsDecoder adds the causal self-attention mask plus the cross-attention
+// sub-block reading Keys|Values from EncStates. The layer handles reuse the
+// Marian block record (TMarianBlockArray); .CrossAttn is filled only for
+// decoder blocks.
+procedure BuildBartStackBlocks(NN: TNNet; const Config: TBartConfig;
+  NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
+  EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
+  pInferenceOnly: boolean; pQuantizeInt8: boolean = false);
+var
+  HeadDim, BlockCnt, HeadCnt, d: integer;
+  BranchInput, HiddenAct, PhiBranch: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
+  Heads: array of TNNetLayer;
+  SliceChannels: array of integer;
+begin
+  HeadDim := Config.DModel div NumHeads;
+  SetLength(Blocks, NumBlocks);
+  SetLength(SliceChannels, HeadDim);
+  SetLength(Heads, NumHeads);
+  for BlockCnt := 0 to NumBlocks - 1 do
+  begin
+    // ---- self-attention sub-block (residual add, THEN LayerNorm) ----
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+    Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+    Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+    for HeadCnt := 0 to NumHeads - 1 do
+    begin
+      for d := 0 to HeadDim - 1 do
+        SliceChannels[d] := HeadCnt * HeadDim + d;
+      QSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.QProj);
+      KSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.KProj);
+      VSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.VProj);
+      HeadPack := NN.AddLayer(
+        TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+      Heads[HeadCnt] := NN.AddLayerAfter(
+        TNNetScaledDotProductAttention.Create(HeadDim,
+          {CausalMask=}IsDecoder), HeadPack);
+    end;
+    NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+    Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+
+    // ---- cross-attention sub-block (decoder only) ----
+    if IsDecoder then
+    begin
+      BranchInput := NN.GetLastLayer();
+      Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), BranchInput);
+      Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+      Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+      for HeadCnt := 0 to NumHeads - 1 do
+      begin
+        for d := 0 to HeadDim - 1 do
+          SliceChannels[d] := HeadCnt * HeadDim + d;
+        QSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.QProj);
+        KSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.KProj);
+        VSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.VProj);
+        KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+        Heads[HeadCnt] := NN.AddLayerAfter(
+          TNNetCrossAttention.Create(HeadDim, {CausalMask=}false,
+            KVPack), QSlice);
+      end;
+      NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+      Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.DModel) );
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+      Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+    end;
+
+    // ---- FFN sub-block: fc2(gelu(fc1(x))), then final_layer_norm ----
+    BranchInput := NN.GetLastLayer();
+    Blocks[BlockCnt].Fc1 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(FFNDim) );
+    // EXACT erf GELU x*Phi(x) composed from existing layers (the BERT
+    // recipe): Phi = 0.5*(1 + erf(x/sqrt(2))) on a side branch, then
+    // ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x since Phi is in (0, 1). TNNetReGLU
+    // applies the ReLU to the FIRST depth half, so Phi must come first.
+    HiddenAct := NN.GetLastLayer();
+    NN.AddLayerAfter(
+      TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+    NN.AddLayer( TNNetErf.Create() );
+    NN.AddLayer( TNNetAddConstant.Create(1.0) );
+    PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+    NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+    NN.AddLayer( TNNetReGLU.Create() );
+    Blocks[BlockCnt].Fc2 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+    Blocks[BlockCnt].FFNNorm := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+  end;
+  SetLength(SliceChannels, 0);
+  SetLength(Heads, 0);
+end;
+
+procedure BuildBartFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TMarianBlockArray;
+  EncEmbed, DecEmbed, EncPos, DecPos, EncEmbLN, DecEmbLN: TNNetLayer;
+  DecTokenInput, EncStates, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+  // LoadMarianStack/LoadMarianAttn only read .DModel from the config; this
+  // shim carries it so the shared per-block loader works unchanged.
+  MarianShim: TMarianConfig;
+
+  // Loads embed_positions rows BartPositionOffset..SeqLen+offset-1 into the
+  // SeqLen-row TNNetLearnedPositionalEmbedding table (token position p reads
+  // checkpoint row p + 2).
+  procedure LoadBartPositions(PosLayer: TNNetLayer; const TName: string;
+    SeqLen: integer);
+  var
+    PosCnt, ElementCnt: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('BART import: missing tensor "' + TName + '".');
+    if (Reader.DimCount(TName) <> 2) or
+       (Reader.DimSize(TName, 0) <>
+          Config.MaxPositionEmbeddings + BartPositionOffset) or
+       (Reader.DimSize(TName, 1) <> Config.DModel) then
+      ImportError('BART import: "' + TName + '" must have shape [' +
+        IntToStr(Config.MaxPositionEmbeddings + BartPositionOffset) + ', ' +
+        IntToStr(Config.DModel) + '], got ' + Reader.ShapeAsString(TName));
+    Reader.LoadTensorFlat(TName, Tmp);
+    for PosCnt := 0 to SeqLen - 1 do
+      for ElementCnt := 0 to Config.DModel - 1 do
+        PosLayer.Neurons[0].Weights.FData[PosCnt * Config.DModel +
+          ElementCnt] := Tmp.FData[(PosCnt + BartPositionOffset) *
+            Config.DModel + ElementCnt];
+    PosLayer.FlushWeightCache();
+    Consumed.Add(TName);
+  end;
+
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  // ---------------- Config validation ----------------
+  if EncSeqLen < 1 then
+    ImportError('BART import: EncSeqLen must be >= 1, got ' +
+      IntToStr(EncSeqLen) + '.');
+  if DecSeqLen < 1 then
+    ImportError('BART import: DecSeqLen must be >= 1, got ' +
+      IntToStr(DecSeqLen) + '.');
+  if (EncSeqLen > Config.MaxPositionEmbeddings) or
+     (DecSeqLen > Config.MaxPositionEmbeddings) then
+    ImportError('BART import: EncSeqLen/DecSeqLen must not exceed ' +
+      'max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+  if (Config.EncoderHeads < 1) or
+     ((Config.DModel mod Config.EncoderHeads) <> 0) then
+    ImportError('BART import: encoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.EncoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  if (Config.DecoderHeads < 1) or
+     ((Config.DModel mod Config.DecoderHeads) <> 0) then
+    ImportError('BART import: decoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.DecoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if not Reader.HasTensor('model.shared.weight') then
+        ImportError('BART import: "model.shared.weight" not found in ' +
+          Reader.FileName + ' - not a BART checkpoint?');
+      if (Reader.DimCount('model.shared.weight') <> 2) or
+         (Reader.DimSize('model.shared.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize('model.shared.weight', 1) <> Config.DModel) then
+        ImportError('BART import: model.shared.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.DModel) +
+          '], got ' + Reader.ShapeAsString('model.shared.weight'));
+      if not Reader.HasTensor('final_logits_bias') then
+        ImportError('BART import: "final_logits_bias" not found in ' +
+          Reader.FileName +
+          ' - not a BartForConditionalGeneration checkpoint?');
+      if (Reader.DimCount('final_logits_bias') <> 2) or
+         (Reader.DimSize('final_logits_bias', 0) <> 1) or
+         (Reader.DimSize('final_logits_bias', 1) <> Config.VocabSize) then
+        ImportError('BART import: final_logits_bias must have shape ' +
+          '[1, ' + IntToStr(Config.VocabSize) + '], got ' +
+          Reader.ShapeAsString('final_logits_bias'));
+
+      // ---------------- Encoder architecture ----------------
+      Enc := TNNet.Create();
+      Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
+      EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+      EncPos := Enc.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+      EncEmbLN := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      BuildBartStackBlocks(Enc, Config, Config.EncoderLayers,
+        Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
+        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
+
+      // ---------------- Decoder architecture ----------------
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+      DecEmbLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      BuildBartStackBlocks(Dec, Config, Config.DecoderLayers,
+        Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('BART import: model.shared.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+        if Config.ScaleEmbedding then
+          EmbedScale := Sqrt(Config.DModel)
+        else
+          EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+        begin
+          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        end;
+        EncEmbed.FlushWeightCache();
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('model.shared.weight');
+        // Tied head: logits = h . shared^T + final_logits_bias.
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+          for i := 0 to Config.DModel - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.DModel + i];
+        Reader.LoadTensorFlat('final_logits_bias', Tmp);
+        for j := 0 to Config.VocabSize - 1 do
+          LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+        LMHead.FlushWeightCache();
+        Consumed.Add('final_logits_bias');
+        // Legacy exports may still carry the tied aliases (HF drops
+        // embed_tokens and lm_head via _tied_weights_keys).
+        if Reader.HasTensor('lm_head.weight') then
+          Consumed.Add('lm_head.weight');
+        if Reader.HasTensor('model.encoder.embed_tokens.weight') then
+          Consumed.Add('model.encoder.embed_tokens.weight');
+        if Reader.HasTensor('model.decoder.embed_tokens.weight') then
+          Consumed.Add('model.decoder.embed_tokens.weight');
+        // Learned positions (the +2-offset window).
+        LoadBartPositions(EncPos,
+          'model.encoder.embed_positions.weight', EncSeqLen);
+        LoadBartPositions(DecPos,
+          'model.decoder.embed_positions.weight', DecSeqLen);
+      finally
+        Tmp.Free;
+      end;
+      // layernorm_embedding (after token+position embeddings).
+      LoadLayerNormWeights(Reader, EncEmbLN,
+        'model.encoder.layernorm_embedding.weight',
+        'model.encoder.layernorm_embedding.bias', Config.DModel);
+      Consumed.Add('model.encoder.layernorm_embedding.weight');
+      Consumed.Add('model.encoder.layernorm_embedding.bias');
+      LoadLayerNormWeights(Reader, DecEmbLN,
+        'model.decoder.layernorm_embedding.weight',
+        'model.decoder.layernorm_embedding.bias', Config.DModel);
+      Consumed.Add('model.decoder.layernorm_embedding.weight');
+      Consumed.Add('model.decoder.layernorm_embedding.bias');
+      // Per-block weights (same names/shapes as Marian; the loader only
+      // needs d_model from the shim config).
+      MarianShim.DModel := Config.DModel;
+      LoadMarianStack(Reader, EncBlocks, 'model.encoder.layers.',
+        MarianShim, Config.EncoderFFNDim, {IsDecoder=}false,
+        Consumed);
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      LoadMarianStack(Reader, DecBlocks, 'model.decoder.layers.',
+        MarianShim, Config.DecoderFFNDim, {IsDecoder=}true,
+        Consumed);
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('BART import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil;
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free;
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildBartFromSafeTensorsEx(const FileName: string;
+  Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+begin
+  BuildBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+procedure BuildBartFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBartConfigFromJSONFile(ConfigPath);
+  BuildBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+// ===========================================================================
+// PEGASUS IMPORT
+// ===========================================================================
+
+const
+  // nn.LayerNorm's default eps - Pegasus never overrides it.
+  PegasusLayerNormEps = 1e-5;
+
+function ReadPegasusConfigFromJSONFile(const FileName: string):
+  TPegasusConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Pegasus import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Pegasus import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Pegasus import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Pegasus import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Pegasus import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'pegasus');
+    if ModelType <> 'pegasus' then
+      ImportError('Pegasus import: config model_type is "' + ModelType +
+        '" - only "pegasus" is supported here (see BuildFromPretrained for ' +
+        'the full dispatch).');
+    Result.ModelType := ModelType;
+    Result.DModel := RequiredInt('d_model');
+    Result.EncoderLayers := RequiredInt('encoder_layers');
+    Result.DecoderLayers := RequiredInt('decoder_layers');
+    Result.EncoderHeads := RequiredInt('encoder_attention_heads');
+    Result.DecoderHeads := RequiredInt('decoder_attention_heads');
+    Result.EncoderFFNDim := RequiredInt('encoder_ffn_dim');
+    Result.DecoderFFNDim := RequiredInt('decoder_ffn_dim');
+    Result.VocabSize := RequiredInt('vocab_size');
+    if Odd(Result.DModel) then
+      ImportError('Pegasus import: d_model must be EVEN (the half-split ' +
+        'sinusoidal table), got ' + IntToStr(Result.DModel) + '.');
+    Result.MaxPositionEmbeddings :=
+      Obj.Get('max_position_embeddings', 1024);
+    // HF PegasusConfig defaults.
+    Result.PadTokenId := Obj.Get('pad_token_id', 0);
+    Result.EosTokenId := Obj.Get('eos_token_id', 1);
+    Result.DecoderStartTokenId :=
+      Obj.Get('decoder_start_token_id', Result.PadTokenId);
+    // Pegasus pins scale_embedding=true (sqrt(d_model) on the embeddings).
+    Result.ScaleEmbedding := Obj.Get('scale_embedding', True);
+    // Only the published Pegasus recipe ("gelu", the exact erf form) is
+    // supported; gelu_new / relu / swish are rejected to avoid a silent
+    // activation mismatch.
+    ActFn := Obj.Get('activation_function', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('Pegasus import: activation_function "' + ActFn +
+        '" is not supported - expected "gelu" (the exact erf form every ' +
+        'published Pegasus pins).');
+    if not Obj.Get('tie_word_embeddings', True) then
+      ImportError('Pegasus import: tie_word_embeddings=false is not ' +
+        'supported - Pegasus ties the lm_head to the shared embedding.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function PegasusConfigToString(const Config: TPegasusConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'pegasus'
+  else Result := Config.ModelType;
+  Result := Result + ' config: enc_layers=' +
+    IntToStr(Config.EncoderLayers) +
+    ', dec_layers=' + IntToStr(Config.DecoderLayers) +
+    ', enc_heads=' + IntToStr(Config.EncoderHeads) +
+    ', dec_heads=' + IntToStr(Config.DecoderHeads) +
+    ', d_model=' + IntToStr(Config.DModel) +
+    ', enc_ffn=' + IntToStr(Config.EncoderFFNDim) +
+    ', dec_ffn=' + IntToStr(Config.DecoderFFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings) +
+    ', pad=' + IntToStr(Config.PadTokenId) +
+    ', eos=' + IntToStr(Config.EosTokenId) +
+    ', dec_start=' + IntToStr(Config.DecoderStartTokenId) +
+    ', scale_embedding=' + BoolToStr(Config.ScaleEmbedding, true) +
+    ', ffn=gelu (pre-norm)';
+end;
+
+// Grows one Pegasus stack (encoder or decoder) onto NN after the embedding +
+// positional layers. PRE-NORM wiring (the opposite of BART/Marian): each
+// sub-layer NORMS the residual stream first, runs the sub-layer, then adds
+// the RAW residual back (residual = x; x = LN(x); x = sublayer(x);
+// x = residual + x). The per-block norm tensor names are identical to BART
+// (self_attn_layer_norm / encoder_attn_layer_norm / final_layer_norm), so
+// LoadMarianStack reloads them unchanged; the .Norm handle now points at the
+// PRE-sublayer norm. The FFN uses the same exact-erf GELU as BART. IsDecoder
+// adds the causal self-attention mask plus the cross-attention sub-block
+// reading Keys|Values from EncStates. A FINAL stack LayerNorm is added by the
+// caller (pre-norm stacks need it). The block record is the shared
+// TMarianBlockArray; .CrossAttn is filled only for decoder blocks.
+procedure BuildPegasusStackBlocks(NN: TNNet; const Config: TPegasusConfig;
+  NumBlocks, NumHeads, FFNDim: integer; IsDecoder: boolean;
+  EncStates: TNNetLayer; var Blocks: TMarianBlockArray;
+  pInferenceOnly: boolean; pQuantizeInt8: boolean = false;
+  UseReluFFN: boolean = false);
+var
+  HeadDim, BlockCnt, HeadCnt, d: integer;
+  ResidualInput, NormedInput, HiddenAct, PhiBranch: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
+  Heads: array of TNNetLayer;
+  SliceChannels: array of integer;
+begin
+  HeadDim := Config.DModel div NumHeads;
+  SetLength(Blocks, NumBlocks);
+  SetLength(SliceChannels, HeadDim);
+  SetLength(Heads, NumHeads);
+  for BlockCnt := 0 to NumBlocks - 1 do
+  begin
+    // ---- self-attention sub-block (PRE-norm: LN, sublayer, add raw) ----
+    ResidualInput := NN.GetLastLayer();
+    Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+    NormedInput := NN.GetLastLayer();
+    Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), NormedInput);
+    Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), NormedInput);
+    Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel), NormedInput);
+    for HeadCnt := 0 to NumHeads - 1 do
+    begin
+      for d := 0 to HeadDim - 1 do
+        SliceChannels[d] := HeadCnt * HeadDim + d;
+      QSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.QProj);
+      KSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.KProj);
+      VSlice := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(SliceChannels),
+        Blocks[BlockCnt].SelfAttn.VProj);
+      HeadPack := NN.AddLayer(
+        TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+      Heads[HeadCnt] := NN.AddLayerAfter(
+        TNNetScaledDotProductAttention.Create(HeadDim,
+          {CausalMask=}IsDecoder), HeadPack);
+    end;
+    NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+    Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
+
+    // ---- cross-attention sub-block (decoder only, PRE-norm) ----
+    if IsDecoder then
+    begin
+      ResidualInput := NN.GetLastLayer();
+      Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+      NormedInput := NN.GetLastLayer();
+      Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), NormedInput);
+      // Keys|Values come from the (already final-normed) encoder states.
+      Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+      Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DModel), EncStates);
+      for HeadCnt := 0 to NumHeads - 1 do
+      begin
+        for d := 0 to HeadDim - 1 do
+          SliceChannels[d] := HeadCnt * HeadDim + d;
+        QSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.QProj);
+        KSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.KProj);
+        VSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(SliceChannels),
+          Blocks[BlockCnt].CrossAttn.VProj);
+        KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+        Heads[HeadCnt] := NN.AddLayerAfter(
+          TNNetCrossAttention.Create(HeadDim, {CausalMask=}false,
+            KVPack), QSlice);
+      end;
+      NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+      Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.DModel) );
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
+    end;
+
+    // ---- FFN sub-block (PRE-norm): fc2(act(fc1(LN(x)))) + x ----
+    ResidualInput := NN.GetLastLayer();
+    Blocks[BlockCnt].FFNNorm := NN.AddLayer(
+      TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+    Blocks[BlockCnt].Fc1 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(FFNDim) );
+    if UseReluFFN then
+    begin
+      // Plain ReLU FFN (M2M100/NLLB use activation_function="relu").
+      NN.AddLayer( TNNetReLU.Create() );
+    end
+    else
+    begin
+      // EXACT erf GELU x*Phi(x), the same BERT/BART composition: Phi on a side
+      // branch, then ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x (Phi in (0,1)). ReGLU
+      // applies the ReLU to the FIRST depth half, so Phi must come first.
+      HiddenAct := NN.GetLastLayer();
+      NN.AddLayerAfter(
+        TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+      NN.AddLayer( TNNetErf.Create() );
+      NN.AddLayer( TNNetAddConstant.Create(1.0) );
+      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+      NN.AddLayer( TNNetReGLU.Create() );
+    end;
+    Blocks[BlockCnt].Fc2 := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DModel) );
+    NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualInput]) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+  end;
+  SetLength(SliceChannels, 0);
+  SetLength(Heads, 0);
+end;
+
+procedure BuildPegasusFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TPegasusConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TMarianBlockArray;
+  EncEmbed, DecEmbed, EncPos, DecPos, EncFinalLN, DecFinalLN: TNNetLayer;
+  DecTokenInput, EncStates, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+  // LoadMarianStack/LoadMarianAttn only read .DModel from the config; this
+  // shim carries it so the shared per-block loader works unchanged.
+  MarianShim: TMarianConfig;
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  // ---------------- Config validation ----------------
+  if EncSeqLen < 1 then
+    ImportError('Pegasus import: EncSeqLen must be >= 1, got ' +
+      IntToStr(EncSeqLen) + '.');
+  if DecSeqLen < 1 then
+    ImportError('Pegasus import: DecSeqLen must be >= 1, got ' +
+      IntToStr(DecSeqLen) + '.');
+  if (EncSeqLen > Config.MaxPositionEmbeddings) or
+     (DecSeqLen > Config.MaxPositionEmbeddings) then
+    ImportError('Pegasus import: EncSeqLen/DecSeqLen must not exceed ' +
+      'max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+  if Odd(Config.DModel) then
+    ImportError('Pegasus import: d_model must be EVEN (the half-split ' +
+      'sinusoidal table), got ' + IntToStr(Config.DModel) + '.');
+  if (Config.EncoderHeads < 1) or
+     ((Config.DModel mod Config.EncoderHeads) <> 0) then
+    ImportError('Pegasus import: encoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.EncoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  if (Config.DecoderHeads < 1) or
+     ((Config.DModel mod Config.DecoderHeads) <> 0) then
+    ImportError('Pegasus import: decoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.DecoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if not Reader.HasTensor('model.shared.weight') then
+        ImportError('Pegasus import: "model.shared.weight" not found in ' +
+          Reader.FileName + ' - not a Pegasus checkpoint?');
+      if (Reader.DimCount('model.shared.weight') <> 2) or
+         (Reader.DimSize('model.shared.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize('model.shared.weight', 1) <> Config.DModel) then
+        ImportError('Pegasus import: model.shared.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.DModel) +
+          '], got ' + Reader.ShapeAsString('model.shared.weight'));
+      if not Reader.HasTensor('final_logits_bias') then
+        ImportError('Pegasus import: "final_logits_bias" not found in ' +
+          Reader.FileName +
+          ' - not a PegasusForConditionalGeneration checkpoint?');
+      if (Reader.DimCount('final_logits_bias') <> 2) or
+         (Reader.DimSize('final_logits_bias', 0) <> 1) or
+         (Reader.DimSize('final_logits_bias', 1) <> Config.VocabSize) then
+        ImportError('Pegasus import: final_logits_bias must have shape ' +
+          '[1, ' + IntToStr(Config.VocabSize) + '], got ' +
+          Reader.ShapeAsString('final_logits_bias'));
+
+      // ---------------- Encoder architecture ----------------
+      Enc := TNNet.Create();
+      Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
+      EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+      // Static sinusoidal positions, NO padding offset (position p -> row p).
+      EncPos := Enc.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Enc, Config, Config.EncoderLayers,
+        Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
+        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
+      // Pre-norm stack: a FINAL encoder LayerNorm closes the stack.
+      EncFinalLN := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+
+      // ---------------- Decoder architecture ----------------
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Dec, Config, Config.DecoderLayers,
+        Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
+      // Pre-norm stack: a FINAL decoder LayerNorm closes the stack BEFORE
+      // the lm_head.
+      DecFinalLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Pegasus import: model.shared.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+        // scale_embedding folds sqrt(d_model) into the embedding rows; the
+        // TIED head below copies the UNSCALED rows.
+        if Config.ScaleEmbedding then
+          EmbedScale := Sqrt(Config.DModel)
+        else
+          EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+        begin
+          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        end;
+        EncEmbed.FlushWeightCache();
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('model.shared.weight');
+        // Tied head: logits = h . shared^T + final_logits_bias.
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+          for i := 0 to Config.DModel - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.DModel + i];
+        Reader.LoadTensorFlat('final_logits_bias', Tmp);
+        for j := 0 to Config.VocabSize - 1 do
+          LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+        LMHead.FlushWeightCache();
+        Consumed.Add('final_logits_bias');
+        // Legacy exports may still carry the tied/static aliases (HF drops
+        // embed_tokens/lm_head via _tied_weights_keys and the SINUSOIDAL
+        // embed_positions via _keys_to_ignore_on_save).
+        if Reader.HasTensor('lm_head.weight') then
+          Consumed.Add('lm_head.weight');
+        if Reader.HasTensor('model.encoder.embed_tokens.weight') then
+          Consumed.Add('model.encoder.embed_tokens.weight');
+        if Reader.HasTensor('model.decoder.embed_tokens.weight') then
+          Consumed.Add('model.decoder.embed_tokens.weight');
+        if Reader.HasTensor('model.encoder.embed_positions.weight') then
+          Consumed.Add('model.encoder.embed_positions.weight');
+        if Reader.HasTensor('model.decoder.embed_positions.weight') then
+          Consumed.Add('model.decoder.embed_positions.weight');
+      finally
+        Tmp.Free;
+      end;
+      // Static sinusoidal positions (same half-split table as Marian).
+      FillMarianSinusoidalPositions(EncPos, EncSeqLen, Config.DModel);
+      FillMarianSinusoidalPositions(DecPos, DecSeqLen, Config.DModel);
+      // Per-block weights (same names/shapes as BART/Marian; the loader only
+      // needs d_model from the shim config). The per-block norms now sit
+      // BEFORE each sub-layer (pre-norm), but the tensor names are identical.
+      MarianShim.DModel := Config.DModel;
+      LoadMarianStack(Reader, EncBlocks, 'model.encoder.layers.',
+        MarianShim, Config.EncoderFFNDim, {IsDecoder=}false, Consumed);
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      LoadMarianStack(Reader, DecBlocks, 'model.decoder.layers.',
+        MarianShim, Config.DecoderFFNDim, {IsDecoder=}true, Consumed);
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // Final per-stack LayerNorms (pre-norm models close each stack).
+      LoadLayerNormWeights(Reader, EncFinalLN,
+        'model.encoder.layer_norm.weight',
+        'model.encoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.encoder.layer_norm.weight');
+      Consumed.Add('model.encoder.layer_norm.bias');
+      LoadLayerNormWeights(Reader, DecFinalLN,
+        'model.decoder.layer_norm.weight',
+        'model.decoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.decoder.layer_norm.weight');
+      Consumed.Add('model.decoder.layer_norm.bias');
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Pegasus import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil;
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free;
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildPegasusFromSafeTensorsEx(const FileName: string;
+  Config: TPegasusConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+begin
+  BuildPegasusFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+procedure BuildPegasusFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TPegasusConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadPegasusConfigFromJSONFile(ConfigPath);
+  BuildPegasusFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+// ===========================================================================
+// mBART IMPORT (BART embedding front-end + Pegasus pre-norm stacks)
+// ===========================================================================
+
+function ReadMBartConfigFromJSONFile(const FileName: string): TBartConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('mBART import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('mBART import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('mBART import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('mBART import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('mBART import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'mbart');
+    if ModelType <> 'mbart' then
+      ImportError('mBART import: config model_type is "' + ModelType +
+        '" - only "mbart" is supported here (NLLB/M2M100 "m2m_100" is a ' +
+        'documented follow-up; see BuildFromPretrained for the dispatch).');
+    Result.ModelType := ModelType;
+    Result.DModel := RequiredInt('d_model');
+    Result.EncoderLayers := RequiredInt('encoder_layers');
+    Result.DecoderLayers := RequiredInt('decoder_layers');
+    Result.EncoderHeads := RequiredInt('encoder_attention_heads');
+    Result.DecoderHeads := RequiredInt('decoder_attention_heads');
+    Result.EncoderFFNDim := RequiredInt('encoder_ffn_dim');
+    Result.DecoderFFNDim := RequiredInt('decoder_ffn_dim');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositionEmbeddings :=
+      Obj.Get('max_position_embeddings', 1024);
+    // HF MBartConfig defaults (pad 1 / bos 0 / eos 2; decoder start = eos).
+    Result.PadTokenId := Obj.Get('pad_token_id', 1);
+    Result.BosTokenId := Obj.Get('bos_token_id', 0);
+    Result.EosTokenId := Obj.Get('eos_token_id', 2);
+    Result.DecoderStartTokenId :=
+      Obj.Get('decoder_start_token_id', Result.EosTokenId);
+    Result.ScaleEmbedding := Obj.Get('scale_embedding', False);
+    // Only the published mBART recipe ("gelu", the exact erf form) is
+    // supported; gelu_new / relu / swish are rejected to avoid a silent
+    // activation mismatch.
+    ActFn := Obj.Get('activation_function', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('mBART import: activation_function "' + ActFn +
+        '" is not supported - expected "gelu" (the exact erf form every ' +
+        'published mBART pins).');
+    if not Obj.Get('tie_word_embeddings', True) then
+      ImportError('mBART import: tie_word_embeddings=false is not ' +
+        'supported - mBART ties the lm_head to the shared embedding.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+procedure BuildMBartFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TMarianBlockArray;
+  EncEmbed, DecEmbed, EncPos, DecPos, EncEmbLN, DecEmbLN: TNNetLayer;
+  EncFinalLN, DecFinalLN: TNNetLayer;
+  DecTokenInput, EncStates, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+  // The per-block loader (LoadMarianStack) only reads .DModel; the pre-norm
+  // stack builder (BuildPegasusStackBlocks) takes a TPegasusConfig and also
+  // only reads .DModel. Both shims carry d_model so the shared helpers work
+  // unchanged - mBART is BART's embedding front-end on Pegasus pre-norm blocks.
+  MarianShim: TMarianConfig;
+  PegShim: TPegasusConfig;
+
+  // Loads embed_positions rows BartPositionOffset..SeqLen+offset-1 into the
+  // SeqLen-row TNNetLearnedPositionalEmbedding table (token position p reads
+  // checkpoint row p + 2; rows 0/1 are the padding-idx slots).
+  procedure LoadMBartPositions(PosLayer: TNNetLayer; const TName: string;
+    SeqLen: integer);
+  var
+    PosCnt, ElementCnt: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('mBART import: missing tensor "' + TName + '".');
+    if (Reader.DimCount(TName) <> 2) or
+       (Reader.DimSize(TName, 0) <>
+          Config.MaxPositionEmbeddings + BartPositionOffset) or
+       (Reader.DimSize(TName, 1) <> Config.DModel) then
+      ImportError('mBART import: "' + TName + '" must have shape [' +
+        IntToStr(Config.MaxPositionEmbeddings + BartPositionOffset) + ', ' +
+        IntToStr(Config.DModel) + '], got ' + Reader.ShapeAsString(TName));
+    Reader.LoadTensorFlat(TName, Tmp);
+    for PosCnt := 0 to SeqLen - 1 do
+      for ElementCnt := 0 to Config.DModel - 1 do
+        PosLayer.Neurons[0].Weights.FData[PosCnt * Config.DModel +
+          ElementCnt] := Tmp.FData[(PosCnt + BartPositionOffset) *
+            Config.DModel + ElementCnt];
+    PosLayer.FlushWeightCache();
+    Consumed.Add(TName);
+  end;
+
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  // ---------------- Config validation ----------------
+  if EncSeqLen < 1 then
+    ImportError('mBART import: EncSeqLen must be >= 1, got ' +
+      IntToStr(EncSeqLen) + '.');
+  if DecSeqLen < 1 then
+    ImportError('mBART import: DecSeqLen must be >= 1, got ' +
+      IntToStr(DecSeqLen) + '.');
+  if (EncSeqLen > Config.MaxPositionEmbeddings) or
+     (DecSeqLen > Config.MaxPositionEmbeddings) then
+    ImportError('mBART import: EncSeqLen/DecSeqLen must not exceed ' +
+      'max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+  if (Config.EncoderHeads < 1) or
+     ((Config.DModel mod Config.EncoderHeads) <> 0) then
+    ImportError('mBART import: encoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.EncoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  if (Config.DecoderHeads < 1) or
+     ((Config.DModel mod Config.DecoderHeads) <> 0) then
+    ImportError('mBART import: decoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.DecoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  PegShim.DModel := Config.DModel;
+  try
+    try
+      if not Reader.HasTensor('model.shared.weight') then
+        ImportError('mBART import: "model.shared.weight" not found in ' +
+          Reader.FileName + ' - not an mBART checkpoint?');
+      if (Reader.DimCount('model.shared.weight') <> 2) or
+         (Reader.DimSize('model.shared.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize('model.shared.weight', 1) <> Config.DModel) then
+        ImportError('mBART import: model.shared.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.DModel) +
+          '], got ' + Reader.ShapeAsString('model.shared.weight'));
+      if not Reader.HasTensor('final_logits_bias') then
+        ImportError('mBART import: "final_logits_bias" not found in ' +
+          Reader.FileName +
+          ' - not an MBartForConditionalGeneration checkpoint?');
+      if (Reader.DimCount('final_logits_bias') <> 2) or
+         (Reader.DimSize('final_logits_bias', 0) <> 1) or
+         (Reader.DimSize('final_logits_bias', 1) <> Config.VocabSize) then
+        ImportError('mBART import: final_logits_bias must have shape ' +
+          '[1, ' + IntToStr(Config.VocabSize) + '], got ' +
+          Reader.ShapeAsString('final_logits_bias'));
+
+      // ---------------- Encoder architecture ----------------
+      // BART front-end: token embedding -> learned positions (+2) ->
+      // layernorm_embedding. PRE-norm blocks then a FINAL encoder layer_norm.
+      Enc := TNNet.Create();
+      Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
+      EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+      EncPos := Enc.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+      EncEmbLN := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Enc, PegShim, Config.EncoderLayers,
+        Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
+        nil, EncBlocks, pInferenceOnly, pQuantizeInt8);
+      EncFinalLN := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+
+      // ---------------- Decoder architecture ----------------
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+      DecEmbLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
+        Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8);
+      DecFinalLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(BartLayerNormEps) );
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('mBART import: model.shared.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+        if Config.ScaleEmbedding then
+          EmbedScale := Sqrt(Config.DModel)
+        else
+          EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+        begin
+          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        end;
+        EncEmbed.FlushWeightCache();
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('model.shared.weight');
+        // Tied head: logits = h . shared^T + final_logits_bias (UNSCALED rows).
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+          for i := 0 to Config.DModel - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.DModel + i];
+        Reader.LoadTensorFlat('final_logits_bias', Tmp);
+        for j := 0 to Config.VocabSize - 1 do
+          LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+        LMHead.FlushWeightCache();
+        Consumed.Add('final_logits_bias');
+        // Legacy exports may still carry the tied aliases (HF drops
+        // embed_tokens and lm_head via _tied_weights_keys).
+        if Reader.HasTensor('lm_head.weight') then
+          Consumed.Add('lm_head.weight');
+        if Reader.HasTensor('model.encoder.embed_tokens.weight') then
+          Consumed.Add('model.encoder.embed_tokens.weight');
+        if Reader.HasTensor('model.decoder.embed_tokens.weight') then
+          Consumed.Add('model.decoder.embed_tokens.weight');
+        // Learned positions (the +2-offset window).
+        LoadMBartPositions(EncPos,
+          'model.encoder.embed_positions.weight', EncSeqLen);
+        LoadMBartPositions(DecPos,
+          'model.decoder.embed_positions.weight', DecSeqLen);
+      finally
+        Tmp.Free;
+      end;
+      // layernorm_embedding (after token+position embeddings).
+      LoadLayerNormWeights(Reader, EncEmbLN,
+        'model.encoder.layernorm_embedding.weight',
+        'model.encoder.layernorm_embedding.bias', Config.DModel);
+      Consumed.Add('model.encoder.layernorm_embedding.weight');
+      Consumed.Add('model.encoder.layernorm_embedding.bias');
+      LoadLayerNormWeights(Reader, DecEmbLN,
+        'model.decoder.layernorm_embedding.weight',
+        'model.decoder.layernorm_embedding.bias', Config.DModel);
+      Consumed.Add('model.decoder.layernorm_embedding.weight');
+      Consumed.Add('model.decoder.layernorm_embedding.bias');
+      // Per-block weights (same names/shapes as BART/Marian; the per-block
+      // norms now sit BEFORE each sub-layer (pre-norm) but the names match).
+      MarianShim.DModel := Config.DModel;
+      LoadMarianStack(Reader, EncBlocks, 'model.encoder.layers.',
+        MarianShim, Config.EncoderFFNDim, {IsDecoder=}false, Consumed);
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      LoadMarianStack(Reader, DecBlocks, 'model.decoder.layers.',
+        MarianShim, Config.DecoderFFNDim, {IsDecoder=}true, Consumed);
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // Final per-stack LayerNorms (pre-norm models close each stack).
+      LoadLayerNormWeights(Reader, EncFinalLN,
+        'model.encoder.layer_norm.weight',
+        'model.encoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.encoder.layer_norm.weight');
+      Consumed.Add('model.encoder.layer_norm.bias');
+      LoadLayerNormWeights(Reader, DecFinalLN,
+        'model.decoder.layer_norm.weight',
+        'model.decoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.decoder.layer_norm.weight');
+      Consumed.Add('model.decoder.layer_norm.bias');
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('mBART import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil;
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free;
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildMBartFromSafeTensorsEx(const FileName: string;
+  Config: TBartConfig; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+begin
+  BuildMBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+procedure BuildMBartFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TBartConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMBartConfigFromJSONFile(ConfigPath);
+  BuildMBartFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+// ===========================================================================
+// M2M100 / NLLB IMPORT (sinusoidal-position +relu cousin of mBART/Pegasus)
+// ===========================================================================
+
+function ReadM2M100ConfigFromJSONFile(const FileName: string): TM2M100Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('M2M100 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('M2M100 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+  // encoder_ffn_dim / decoder_ffn_dim, falling back to the shared "ffn_dim"
+  // some fairseq-converted m2m_100 configs use.
+  function FFNDim(const PrimaryField: string): integer;
+  begin
+    if Obj.IndexOfName(PrimaryField) >= 0 then
+      Result := Obj.Get(PrimaryField, 0)
+    else if Obj.IndexOfName('ffn_dim') >= 0 then
+      Result := Obj.Get('ffn_dim', 0)
+    else
+      ImportError('M2M100 import: config "' + FileName +
+        '" is missing "' + PrimaryField + '" (and the "ffn_dim" fallback).');
+    if Result <= 0 then
+      ImportError('M2M100 import: FFN dim "' + PrimaryField +
+        '" must be positive, got ' + IntToStr(Result) + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('M2M100 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('M2M100 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('M2M100 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'm2m_100');
+    if ModelType <> 'm2m_100' then
+      ImportError('M2M100 import: config model_type is "' + ModelType +
+        '" - only "m2m_100" is supported here (NLLB uses m2m_100; see ' +
+        'BuildFromPretrained for the full dispatch).');
+    Result.ModelType := ModelType;
+    Result.DModel := RequiredInt('d_model');
+    Result.EncoderLayers := RequiredInt('encoder_layers');
+    Result.DecoderLayers := RequiredInt('decoder_layers');
+    Result.EncoderHeads := RequiredInt('encoder_attention_heads');
+    Result.DecoderHeads := RequiredInt('decoder_attention_heads');
+    Result.EncoderFFNDim := FFNDim('encoder_ffn_dim');
+    Result.DecoderFFNDim := FFNDim('decoder_ffn_dim');
+    Result.VocabSize := RequiredInt('vocab_size');
+    if Odd(Result.DModel) then
+      ImportError('M2M100 import: d_model must be EVEN (the half-split ' +
+        'sinusoidal table), got ' + IntToStr(Result.DModel) + '.');
+    Result.MaxPositionEmbeddings :=
+      Obj.Get('max_position_embeddings', 1024);
+    // HF M2M100Config defaults (pad 1 / bos 0 / eos 2; decoder start = eos).
+    Result.PadTokenId := Obj.Get('pad_token_id', 1);
+    Result.BosTokenId := Obj.Get('bos_token_id', 0);
+    Result.EosTokenId := Obj.Get('eos_token_id', 2);
+    Result.DecoderStartTokenId :=
+      Obj.Get('decoder_start_token_id', Result.EosTokenId);
+    // M2M100/NLLB pin scale_embedding=true (sqrt(d_model) on the embeddings).
+    Result.ScaleEmbedding := Obj.Get('scale_embedding', True);
+    // Only the published M2M100/NLLB recipe ("relu") is supported; gelu /
+    // gelu_new / swish are rejected to avoid a silent activation mismatch.
+    ActFn := Obj.Get('activation_function', 'relu');
+    if ActFn <> 'relu' then
+      ImportError('M2M100 import: activation_function "' + ActFn +
+        '" is not supported - expected "relu" (every published M2M100/NLLB ' +
+        'pins it).');
+    if not Obj.Get('tie_word_embeddings', True) then
+      ImportError('M2M100 import: tie_word_embeddings=false is not ' +
+        'supported - M2M100 ties the lm_head to the shared embedding.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function M2M100ConfigToString(const Config: TM2M100Config): string;
+begin
+  if Config.ModelType = '' then Result := 'm2m_100'
+  else Result := Config.ModelType;
+  Result := Result + ' config: enc_layers=' +
+    IntToStr(Config.EncoderLayers) +
+    ', dec_layers=' + IntToStr(Config.DecoderLayers) +
+    ', enc_heads=' + IntToStr(Config.EncoderHeads) +
+    ', dec_heads=' + IntToStr(Config.DecoderHeads) +
+    ', d_model=' + IntToStr(Config.DModel) +
+    ', enc_ffn=' + IntToStr(Config.EncoderFFNDim) +
+    ', dec_ffn=' + IntToStr(Config.DecoderFFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositionEmbeddings) +
+    ', pad=' + IntToStr(Config.PadTokenId) +
+    ', eos=' + IntToStr(Config.EosTokenId) +
+    ', dec_start=' + IntToStr(Config.DecoderStartTokenId) +
+    ', scale_embedding=' + BoolToStr(Config.ScaleEmbedding, true) +
+    ', ffn=relu (pre-norm, sinusoidal +2)';
+end;
+
+procedure BuildM2M100FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  EncBlocks, DecBlocks: TMarianBlockArray;
+  EncEmbed, DecEmbed, EncPos, DecPos, EncFinalLN, DecFinalLN: TNNetLayer;
+  DecTokenInput, EncStates, LMHead: TNNetLayer;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr: string;
+  // LoadMarianStack reads only .DModel; BuildPegasusStackBlocks takes a
+  // TPegasusConfig and also reads only .DModel. Both shims carry d_model so
+  // the shared helpers work unchanged - M2M100 is mBART's pre-norm body with
+  // sinusoidal positions and a relu FFN.
+  MarianShim: TMarianConfig;
+  PegShim: TPegasusConfig;
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  // ---------------- Config validation ----------------
+  if EncSeqLen < 1 then
+    ImportError('M2M100 import: EncSeqLen must be >= 1, got ' +
+      IntToStr(EncSeqLen) + '.');
+  if DecSeqLen < 1 then
+    ImportError('M2M100 import: DecSeqLen must be >= 1, got ' +
+      IntToStr(DecSeqLen) + '.');
+  if (EncSeqLen > Config.MaxPositionEmbeddings) or
+     (DecSeqLen > Config.MaxPositionEmbeddings) then
+    ImportError('M2M100 import: EncSeqLen/DecSeqLen must not exceed ' +
+      'max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+  if Odd(Config.DModel) then
+    ImportError('M2M100 import: d_model must be EVEN (the half-split ' +
+      'sinusoidal table), got ' + IntToStr(Config.DModel) + '.');
+  if (Config.EncoderHeads < 1) or
+     ((Config.DModel mod Config.EncoderHeads) <> 0) then
+    ImportError('M2M100 import: encoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.EncoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  if (Config.DecoderHeads < 1) or
+     ((Config.DModel mod Config.DecoderHeads) <> 0) then
+    ImportError('M2M100 import: decoder_attention_heads must divide ' +
+      'd_model, got ' + IntToStr(Config.DecoderHeads) + ' heads for ' +
+      'd_model ' + IntToStr(Config.DModel) + '.');
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  PegShim.DModel := Config.DModel;
+  try
+    try
+      if not Reader.HasTensor('model.shared.weight') then
+        ImportError('M2M100 import: "model.shared.weight" not found in ' +
+          Reader.FileName + ' - not an M2M100 checkpoint?');
+      if (Reader.DimCount('model.shared.weight') <> 2) or
+         (Reader.DimSize('model.shared.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize('model.shared.weight', 1) <> Config.DModel) then
+        ImportError('M2M100 import: model.shared.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.DModel) +
+          '], got ' + Reader.ShapeAsString('model.shared.weight'));
+      // final_logits_bias is OPTIONAL: transformers >= 5 dropped it from
+      // M2M100 entirely (bias-free lm_head), while older published NLLB/
+      // M2M100 checkpoints carry an all-ZERO [1, vocab] buffer. When present
+      // it must have the right shape; when absent the head bias is left zero.
+      if Reader.HasTensor('final_logits_bias') then
+        if (Reader.DimCount('final_logits_bias') <> 2) or
+           (Reader.DimSize('final_logits_bias', 0) <> 1) or
+           (Reader.DimSize('final_logits_bias', 1) <> Config.VocabSize) then
+          ImportError('M2M100 import: final_logits_bias must have shape ' +
+            '[1, ' + IntToStr(Config.VocabSize) + '], got ' +
+            Reader.ShapeAsString('final_logits_bias'));
+
+      // ---------------- Encoder architecture ----------------
+      // Pegasus front-end: token embedding -> static sinusoidal positions
+      // (+2 offset), NO layernorm_embedding. PRE-norm relu blocks then a
+      // FINAL encoder layer_norm.
+      Enc := TNNet.Create();
+      Enc.AddLayer( TNNetInput.Create(EncSeqLen) );
+      EncEmbed := Enc.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1) );
+      EncPos := Enc.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(EncSeqLen) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Enc, PegShim, Config.EncoderLayers,
+        Config.EncoderHeads, Config.EncoderFFNDim, {IsDecoder=}false,
+        nil, EncBlocks, pInferenceOnly, pQuantizeInt8, {UseReluFFN=}true);
+      EncFinalLN := Enc.AddLayer(
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+
+      // ---------------- Decoder architecture ----------------
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen) );
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(EncSeqLen, 1, Config.DModel, 1), 0);
+      DecEmbed := Dec.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, Config.DModel, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(DecSeqLen) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
+        Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8,
+        {UseReluFFN=}true);
+      DecFinalLN := Dec.AddLayer(
+        TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+      LMHead := Dec.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('model.shared.weight', Tmp);
+        if EncEmbed.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('M2M100 import: model.shared.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
+            'size ' + IntToStr(EncEmbed.Neurons[0].Weights.Size) + '.');
+        if Config.ScaleEmbedding then
+          EmbedScale := Sqrt(Config.DModel)
+        else
+          EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+        begin
+          EncEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        end;
+        EncEmbed.FlushWeightCache();
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('model.shared.weight');
+        // Tied head: logits = h . shared^T + final_logits_bias (UNSCALED).
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+          for i := 0 to Config.DModel - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.DModel + i];
+        // final_logits_bias is optional (see the validation note above): a
+        // zero head bias is the default for the bias-free transformers-5 head
+        // and for the all-zero buffer of older checkpoints.
+        if Reader.HasTensor('final_logits_bias') then
+        begin
+          Reader.LoadTensorFlat('final_logits_bias', Tmp);
+          for j := 0 to Config.VocabSize - 1 do
+            LMHead.Neurons[j].BiasWeight := Tmp.FData[j];
+          Consumed.Add('final_logits_bias');
+        end
+        else
+          for j := 0 to Config.VocabSize - 1 do
+            LMHead.Neurons[j].BiasWeight := 0.0;
+        LMHead.FlushWeightCache();
+        // Legacy aliases (HF drops embed_tokens/lm_head via
+        // _tied_weights_keys and the SINUSOIDAL embed_positions via
+        // _keys_to_ignore_on_save).
+        if Reader.HasTensor('lm_head.weight') then
+          Consumed.Add('lm_head.weight');
+        if Reader.HasTensor('model.encoder.embed_tokens.weight') then
+          Consumed.Add('model.encoder.embed_tokens.weight');
+        if Reader.HasTensor('model.decoder.embed_tokens.weight') then
+          Consumed.Add('model.decoder.embed_tokens.weight');
+        if Reader.HasTensor('model.encoder.embed_positions.weights') then
+          Consumed.Add('model.encoder.embed_positions.weights');
+        if Reader.HasTensor('model.decoder.embed_positions.weights') then
+          Consumed.Add('model.decoder.embed_positions.weights');
+      finally
+        Tmp.Free;
+      end;
+      // Static sinusoidal positions (half-split, +2 offset).
+      FillM2M100SinusoidalPositions(EncPos, EncSeqLen, Config.DModel);
+      FillM2M100SinusoidalPositions(DecPos, DecSeqLen, Config.DModel);
+      // Per-block weights (same names/shapes as BART/Marian; the pre-norm
+      // norms sit BEFORE each sub-layer but the tensor names are identical).
+      MarianShim.DModel := Config.DModel;
+      LoadMarianStack(Reader, EncBlocks, 'model.encoder.layers.',
+        MarianShim, Config.EncoderFFNDim, {IsDecoder=}false, Consumed);
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      LoadMarianStack(Reader, DecBlocks, 'model.decoder.layers.',
+        MarianShim, Config.DecoderFFNDim, {IsDecoder=}true, Consumed);
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // Final per-stack LayerNorms (pre-norm models close each stack).
+      LoadLayerNormWeights(Reader, EncFinalLN,
+        'model.encoder.layer_norm.weight',
+        'model.encoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.encoder.layer_norm.weight');
+      Consumed.Add('model.encoder.layer_norm.bias');
+      LoadLayerNormWeights(Reader, DecFinalLN,
+        'model.decoder.layer_norm.weight',
+        'model.decoder.layer_norm.bias', Config.DModel);
+      Consumed.Add('model.decoder.layer_norm.weight');
+      Consumed.Add('model.decoder.layer_norm.bias');
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('M2M100 import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil;
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free;
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildM2M100FromSafeTensorsEx(const FileName: string;
+  Config: TM2M100Config; out EncoderNet, DecoderNet: TNNet;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+begin
+  BuildM2M100FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+procedure BuildM2M100FromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TM2M100Config;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadM2M100ConfigFromJSONFile(ConfigPath);
+  BuildM2M100FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
     DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
 end;
 
@@ -9302,6 +22453,611 @@ begin
   Config := ReadWhisperConfigFromJSONFile(ConfigPath);
   BuildWhisperFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
     DecoderNet, DecSeqLen, pInferenceOnly);
+end;
+
+// ============================ WAV2VEC2 / HUBERT CTC IMPORT =================
+
+function ReadWav2Vec2ConfigFromJSONFile(
+  const FileName: string): TWav2Vec2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, FeatNorm, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Wav2Vec2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Wav2Vec2 import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+  // Reads a required JSON int array of length ExpectLen into Dst.
+  procedure RequiredIntArray(const FieldName: string;
+    var Dst: array of integer; ExpectLen: integer);
+  var
+    Arr: TJSONArray;
+    k: integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Wav2Vec2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    if not (Obj.Find(FieldName) is TJSONArray) then
+      ImportError('Wav2Vec2 import: config field "' + FieldName +
+        '" must be an array.');
+    Arr := TJSONArray(Obj.Find(FieldName));
+    if Arr.Count <> ExpectLen then
+      ImportError('Wav2Vec2 import: config field "' + FieldName +
+        '" must have ' + IntToStr(ExpectLen) + ' entries (matching ' +
+        'conv_dim), got ' + IntToStr(Arr.Count) + '.');
+    for k := 0 to ExpectLen - 1 do
+    begin
+      Dst[k] := Arr.Items[k].AsInteger;
+      if Dst[k] <= 0 then
+        ImportError('Wav2Vec2 import: config "' + FieldName + '"[' +
+          IntToStr(k) + '] must be a positive integer.');
+    end;
+  end;
+
+var
+  Arr: TJSONArray;
+  k: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('Wav2Vec2 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Wav2Vec2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Wav2Vec2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'wav2vec2');
+    if (ModelType <> 'wav2vec2') and (ModelType <> 'hubert') then
+      ImportError('Wav2Vec2 import: config model_type is "' + ModelType +
+        '" - only "wav2vec2" / "hubert" are supported here.');
+    Result.ModelType := ModelType;
+    Result.IsHubert := (ModelType = 'hubert');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
+    // conv_dim is the spine: conv_stride / conv_kernel must match its length.
+    if Obj.IndexOfName('conv_dim') < 0 then
+      ImportError('Wav2Vec2 import: config "' + FileName +
+        '" is missing the required field "conv_dim".');
+    if not (Obj.Find('conv_dim') is TJSONArray) then
+      ImportError('Wav2Vec2 import: config field "conv_dim" must be an array.');
+    Arr := TJSONArray(Obj.Find('conv_dim'));
+    Result.NumConvLayers := Arr.Count;
+    if Result.NumConvLayers < 1 then
+      ImportError('Wav2Vec2 import: conv_dim must be a non-empty array.');
+    SetLength(Result.ConvDim, Result.NumConvLayers);
+    SetLength(Result.ConvStride, Result.NumConvLayers);
+    SetLength(Result.ConvKernel, Result.NumConvLayers);
+    for k := 0 to Result.NumConvLayers - 1 do
+    begin
+      Result.ConvDim[k] := Arr.Items[k].AsInteger;
+      if Result.ConvDim[k] <= 0 then
+        ImportError('Wav2Vec2 import: conv_dim[' + IntToStr(k) +
+          '] must be a positive integer.');
+    end;
+    RequiredIntArray('conv_stride', Result.ConvStride, Result.NumConvLayers);
+    RequiredIntArray('conv_kernel', Result.ConvKernel, Result.NumConvLayers);
+    Result.ConvBias := Obj.Get('conv_bias', False);
+    Result.NumPosConvEmbeddings := Obj.Get('num_conv_pos_embeddings', 128);
+    Result.NumPosConvGroups := Obj.Get('num_conv_pos_embedding_groups', 16);
+    if Odd(Result.NumPosConvEmbeddings) then
+      ImportError('Wav2Vec2 import: num_conv_pos_embeddings must be EVEN ' +
+        '(the SamePad layer drops the extra frame an even kernel emits).');
+    if (Result.NumPosConvGroups < 1) or
+       (Result.HiddenSize mod Result.NumPosConvGroups <> 0) then
+      ImportError('Wav2Vec2 import: num_conv_pos_embedding_groups must ' +
+        'divide hidden_size.');
+    Result.DoStableLayerNorm := Obj.Get('do_stable_layer_norm', False);
+    FeatNorm := Obj.Get('feat_extract_norm', 'group');
+    Result.FeatExtractGroupNorm := (FeatNorm = 'group');
+    // Only the wav2vec2-base / -960h GroupNorm path is supported. The
+    // -large / robust variant (LayerNorm on EVERY conv + pre-norm encoder,
+    // do_stable_layer_norm True) is a documented follow-up.
+    if not Result.FeatExtractGroupNorm then
+      ImportError('Wav2Vec2 import: feat_extract_norm "' + FeatNorm +
+        '" is not supported - only the "group" (wav2vec2-base) variant is ' +
+        'implemented; the "layer" (-large/robust) variant is a follow-up.');
+    if Result.DoStableLayerNorm then
+      ImportError('Wav2Vec2 import: do_stable_layer_norm=true (the ' +
+        '-large/robust pre-norm variant) is not supported yet - a ' +
+        'documented follow-up.');
+    ActFn := Obj.Get('hidden_act', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('Wav2Vec2 import: hidden_act "' + ActFn + '" is not ' +
+        'supported - the published CTC checkpoints use exact erf "gelu".');
+    Result.Prefix := ''; // detected by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function Wav2Vec2ConfigToString(const Config: TWav2Vec2Config): string;
+var
+  k: integer;
+  Dims, Strides, Kernels: string;
+begin
+  Dims := ''; Strides := ''; Kernels := '';
+  for k := 0 to Config.NumConvLayers - 1 do
+  begin
+    if k > 0 then begin Dims := Dims + ','; Strides := Strides + ',';
+      Kernels := Kernels + ','; end;
+    Dims := Dims + IntToStr(Config.ConvDim[k]);
+    Strides := Strides + IntToStr(Config.ConvStride[k]);
+    Kernels := Kernels + IntToStr(Config.ConvKernel[k]);
+  end;
+  Result := 'Wav2Vec2Config(model_type=' + Config.ModelType +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', inter=' + IntToStr(Config.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', conv_dim=[' + Dims + ']' +
+    ', conv_stride=[' + Strides + ']' +
+    ', conv_kernel=[' + Kernels + ']' +
+    ', conv_bias=' + BoolToStr(Config.ConvBias, True) +
+    ', pos_conv=' + IntToStr(Config.NumPosConvEmbeddings) +
+    '/' + IntToStr(Config.NumPosConvGroups) + ')';
+end;
+
+function Wav2Vec2EncoderLength(const Config: TWav2Vec2Config;
+  NumSamples: integer): integer;
+var
+  k: integer;
+begin
+  Result := NumSamples;
+  for k := 0 to Config.NumConvLayers - 1 do
+  begin
+    if Result < Config.ConvKernel[k] then
+      ImportError('Wav2Vec2 import: NumSamples=' + IntToStr(NumSamples) +
+        ' is too short - conv layer ' + IntToStr(k) + ' (kernel ' +
+        IntToStr(Config.ConvKernel[k]) + ') has no valid window.');
+    Result := (Result - Config.ConvKernel[k]) div Config.ConvStride[k] + 1;
+  end;
+  if Result < Config.NumPosConvEmbeddings then
+    ImportError('Wav2Vec2 import: encoder length ' + IntToStr(Result) +
+      ' for NumSamples=' + IntToStr(NumSamples) + ' is shorter than the ' +
+      'positional conv kernel ' + IntToStr(Config.NumPosConvEmbeddings) +
+      ' - feed a longer clip.');
+end;
+
+// Loads one feature-extractor conv (HF nn.Conv1d, weight [Out, In, Kernel],
+// NO bias when conv_bias=false) into a TNNetConvolutionLinear built with a
+// (Kernel,1) kernel on the (T,1,In) sequence grid. Tap k of HF's kernel
+// multiplies the SAME padded frame as tap x=k of the (Kernel,1) kernel, so
+// the layout map is Neurons[o].Weights[x*In + i] = W[o, i, x] (the exact
+// LoadWhisperConv1D convention generalized to arbitrary kernel widths).
+procedure LoadWav2Vec2FeatureConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; InDim, OutDim, Kernel: integer;
+  Consumed: TStringList);
+var
+  W: TNNetVolume;
+  o, i, kk: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Wav2Vec2 import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 3) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) or
+     (Reader.DimSize(WName, 2) <> Kernel) then
+    ImportError('Wav2Vec2 import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + ', ' + IntToStr(Kernel) +
+      '] (nn.Conv1d stores [out, in, kernel]), got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('Wav2Vec2 import: internal error - conv layer for "' +
+      WName + '" has ' + IntToStr(Layer.Neurons.Count) +
+      ' neurons, expected ' + IntToStr(OutDim) + '.');
+  if Layer.Neurons[0].Weights.Size <> Kernel * InDim then
+    ImportError('Wav2Vec2 import: internal error - conv neuron for "' +
+      WName + '" has ' + IntToStr(Layer.Neurons[0].Weights.Size) +
+      ' weights, expected ' + IntToStr(Kernel * InDim) + '.');
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for o := 0 to OutDim - 1 do
+    begin
+      for kk := 0 to Kernel - 1 do
+        for i := 0 to InDim - 1 do
+          Layer.Neurons[o].Weights.FData[kk * InDim + i] :=
+            W.FData[(o * InDim + i) * Kernel + kk];
+      Layer.Neurons[o].BiasWeight := 0;
+    end;
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+  Consumed.Add(WName);
+end;
+
+// Loads the weight-norm-parametrized positional conv (HF grouped nn.Conv1d
+// weight_norm(dim=2)) into a TNNetGroupedConvolutionLinear. The checkpoint
+// stores g = ...original0 [1,1,Kernel] and v = ...original1
+// [Out, In/Groups, Kernel]; the effective weight reconstructs per kernel
+// tap k as w[:,:,k] = g[k] * v[:,:,k] / ||v[:,:,k]|| (Frobenius over the
+// out/in dims, the dim=2 convention). Output neuron o belongs to group
+// o div (Out/Groups) and reads the In/Groups input channels of that group:
+// Neurons[o].Weights[x*(In/Groups) + ic] = w_eff[o, ic, x].
+procedure LoadWav2Vec2PosConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const GName, VName, BName: string;
+  HiddenSize, Groups, Kernel: integer; Consumed: TStringList);
+var
+  G, V, B, WEff: TNNetVolume;
+  InPerGroup, o, ic, kk: integer;
+  Norm, Acc: TNeuralFloat;
+begin
+  InPerGroup := HiddenSize div Groups;
+  if not Reader.HasTensor(GName) then
+    ImportError('Wav2Vec2 import: missing tensor "' + GName + '".');
+  if not Reader.HasTensor(VName) then
+    ImportError('Wav2Vec2 import: missing tensor "' + VName + '".');
+  if not Reader.HasTensor(BName) then
+    ImportError('Wav2Vec2 import: missing tensor "' + BName + '".');
+  if (Reader.DimCount(GName) <> 3) or
+     (Reader.DimSize(GName, 0) <> 1) or (Reader.DimSize(GName, 1) <> 1) or
+     (Reader.DimSize(GName, 2) <> Kernel) then
+    ImportError('Wav2Vec2 import: "' + GName + '" must have shape ' +
+      '[1, 1, ' + IntToStr(Kernel) + '], got ' + Reader.ShapeAsString(GName));
+  if (Reader.DimCount(VName) <> 3) or
+     (Reader.DimSize(VName, 0) <> HiddenSize) or
+     (Reader.DimSize(VName, 1) <> InPerGroup) or
+     (Reader.DimSize(VName, 2) <> Kernel) then
+    ImportError('Wav2Vec2 import: "' + VName + '" must have shape [' +
+      IntToStr(HiddenSize) + ', ' + IntToStr(InPerGroup) + ', ' +
+      IntToStr(Kernel) + '], got ' + Reader.ShapeAsString(VName));
+  if Layer.Neurons.Count <> HiddenSize then
+    ImportError('Wav2Vec2 import: internal error - pos conv has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(HiddenSize) + '.');
+  if Layer.Neurons[0].Weights.Size <> Kernel * InPerGroup then
+    ImportError('Wav2Vec2 import: internal error - pos conv neuron has ' +
+      IntToStr(Layer.Neurons[0].Weights.Size) + ' weights, expected ' +
+      IntToStr(Kernel * InPerGroup) + '.');
+  G := TNNetVolume.Create;
+  V := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  WEff := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(GName, G);
+    Reader.LoadTensorFlat(VName, V);
+    Reader.LoadTensorFlat(BName, B);
+    WEff.ReSize(HiddenSize, InPerGroup, Kernel);
+    // Per kernel tap k: Frobenius norm of v[:,:,k] over (out, in/groups).
+    for kk := 0 to Kernel - 1 do
+    begin
+      Acc := 0;
+      for o := 0 to HiddenSize - 1 do
+        for ic := 0 to InPerGroup - 1 do
+          Acc := Acc + Sqr(V.FData[(o * InPerGroup + ic) * Kernel + kk]);
+      Norm := Sqrt(Acc);
+      if Norm = 0 then Norm := 1;
+      for o := 0 to HiddenSize - 1 do
+        for ic := 0 to InPerGroup - 1 do
+          WEff.FData[(o * InPerGroup + ic) * Kernel + kk] :=
+            G.FData[kk] * V.FData[(o * InPerGroup + ic) * Kernel + kk] / Norm;
+    end;
+    for o := 0 to HiddenSize - 1 do
+    begin
+      for kk := 0 to Kernel - 1 do
+        for ic := 0 to InPerGroup - 1 do
+          Layer.Neurons[o].Weights.FData[kk * InPerGroup + ic] :=
+            WEff.FData[(o * InPerGroup + ic) * Kernel + kk];
+      Layer.Neurons[o].BiasWeight := B.FData[o];
+    end;
+  finally
+    WEff.Free; B.Free; V.Free; G.Free;
+  end;
+  Layer.FlushWeightCache();
+  Consumed.Add(GName);
+  Consumed.Add(VName);
+  Consumed.Add(BName);
+end;
+
+function BuildWav2Vec2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TWav2Vec2Config; NumSamples: integer;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  QKV, AttnDense, AttnLN, Inter, OutDense, OutLN: array of TNNetLayer;
+  ConvLayer, ConvGN: array of TNNetLayer;
+  FeatProjLN, FeatProj, PosConv, EncLN: TNNetLayer;
+  LMHead, BranchInput, HiddenAct, PhiBranch, FeatInput, PreEncoder: TNNetLayer;
+  EncLen, InLen, BlockCnt, i, k, Pad: integer;
+  ConvPrefix, EncPrefix, BlockPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('Wav2Vec2 import: num_attention_heads must be >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('Wav2Vec2 import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      if Config.IsHubert then Config.Prefix := 'hubert.'
+      else Config.Prefix := 'wav2vec2.';
+      if not Reader.HasTensor(Config.Prefix +
+        'feature_projection.projection.weight') then
+        ImportError('Wav2Vec2 import: "' + Config.Prefix +
+          'feature_projection.projection.weight" not found in ' +
+          Reader.FileName + ' - not a ' + Config.ModelType +
+          ' CTC checkpoint?');
+      EncLen := Wav2Vec2EncoderLength(Config, NumSamples);
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      // Raw waveform: (NumSamples, 1, 1).
+      FeatInput := NN.AddLayer( TNNetInput.Create(NumSamples, 1, 1) );
+      // ----- Feature extractor: strided 1-D convs over the (T,1,C) grid. -
+      SetLength(ConvLayer, Config.NumConvLayers);
+      SetLength(ConvGN, Config.NumConvLayers);
+      InLen := NumSamples;
+      for k := 0 to Config.NumConvLayers - 1 do
+      begin
+        // conv_bias false => suppress the bias (pSuppressBias=1).
+        ConvLayer[k] := NN.AddLayer( TNNetConvolutionLinear.Create(
+          Config.ConvDim[k], Config.ConvKernel[k], {Padding=}0,
+          Config.ConvStride[k], {SuppressBias=}1) );
+        InLen := (InLen - Config.ConvKernel[k]) div Config.ConvStride[k] + 1;
+        if (k = 0) and Config.FeatExtractGroupNorm then
+          // GroupNorm with num_groups = num_channels: each channel is its
+          // own group, normalized over the TIME (SizeX) axis - exactly HF's
+          // first-conv GroupNorm. Per-channel affine (gamma/beta).
+          ConvGN[k] := NN.AddLayer( TNNetGroupNorm.Create(Config.ConvDim[k]) );
+        AddWhisperExactGelu(NN); // exact erf GELU (feat_extract_activation)
+      end;
+      // ----- Feature projection: LayerNorm then Linear C[-1] -> hidden. ---
+      FeatProjLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      FeatProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+      PreEncoder := NN.GetLastLayer();
+      // ----- Positional conv embedding (grouped conv1d, even kernel). -----
+      // SAME padding via explicit X-only PadXY (kernel div 2 each side); the
+      // even kernel emits T+1 frames, the SamePad crop drops the last one.
+      Pad := Config.NumPosConvEmbeddings div 2;
+      NN.AddLayer( TNNetPadXY.Create(Pad, 0) );
+      PosConv := NN.AddLayer( TNNetGroupedConvolutionLinear.Create(
+        Config.HiddenSize, Config.NumPosConvEmbeddings, {Padding=}0,
+        {Stride=}1, Config.NumPosConvGroups) );
+      // PadXY adds 2*Pad = kernel cols; grouped conv emits
+      // (EncLen + kernel) - kernel + 1 = EncLen + 1 frames. Drop the last.
+      NN.AddLayer( TNNetCrop.Create(0, 0, EncLen, 1) );
+      AddWhisperExactGelu(NN);
+      // hidden := encoder.layer_norm( projected_features + pos_embed ).
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), PreEncoder]) );
+      EncLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      // ----- POST-LN transformer encoder blocks (BERT block math). -------
+      SetLength(QKV, Config.NumLayers);
+      SetLength(AttnDense, Config.NumLayers);
+      SetLength(AttnLN, Config.NumLayers);
+      SetLength(Inter, Config.NumLayers);
+      SetLength(OutDense, Config.NumLayers);
+      SetLength(OutLN, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // x := LN(x + dense(BIDIRECTIONAL-MHA(q|k|v(x)))).
+        BranchInput := NN.GetLastLayer();
+        QKV[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        AttnDense[BlockCnt] := NN.AddMultiHeadSelfAttention(
+          Config.NumHeads, {CausalMask=}false);
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        AttnLN[BlockCnt] := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        // x := final_LN(x + output_dense(gelu(intermediate_dense(x)))).
+        BranchInput := NN.GetLastLayer();
+        Inter[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        HiddenAct := NN.GetLastLayer();
+        NN.AddLayerAfter(
+          TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+        NN.AddLayer( TNNetErf.Create() );
+        NN.AddLayer( TNNetAddConstant.Create(1.0) );
+        PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+        NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+        NN.AddLayer( TNNetReGLU.Create() );
+        OutDense[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        OutLN[BlockCnt] := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      // ----- CTC head: linear hidden -> vocab (lm_head). -----------------
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      ConvPrefix := Config.Prefix + 'feature_extractor.conv_layers.';
+      for k := 0 to Config.NumConvLayers - 1 do
+      begin
+        if k = 0 then InLen := 1 else InLen := Config.ConvDim[k - 1];
+        LoadWav2Vec2FeatureConv(Reader, ConvLayer[k],
+          ConvPrefix + IntToStr(k) + '.conv.weight',
+          InLen, Config.ConvDim[k], Config.ConvKernel[k], Consumed);
+        if (k = 0) and Config.FeatExtractGroupNorm then
+        begin
+          // GroupNorm's per-channel affine stores gamma in Neurons[0] and
+          // beta in Neurons[1] as flat Depth vectors - the same layout as a
+          // LayerNorm, so the LayerNorm loader maps it correctly.
+          LoadLayerNormWeights(Reader, ConvGN[0],
+            ConvPrefix + '0.layer_norm.weight',
+            ConvPrefix + '0.layer_norm.bias', Config.ConvDim[0]);
+          MarkConsumed(ConvPrefix + '0.layer_norm.weight');
+          MarkConsumed(ConvPrefix + '0.layer_norm.bias');
+        end;
+      end;
+      // Feature projection.
+      LoadLayerNormWeights(Reader, FeatProjLN,
+        Config.Prefix + 'feature_projection.layer_norm.weight',
+        Config.Prefix + 'feature_projection.layer_norm.bias',
+        Config.ConvDim[Config.NumConvLayers - 1]);
+      MarkConsumed(Config.Prefix + 'feature_projection.layer_norm.weight');
+      MarkConsumed(Config.Prefix + 'feature_projection.layer_norm.bias');
+      LoadLlamaLinearWeights(Reader, FeatProj,
+        Config.Prefix + 'feature_projection.projection.weight',
+        Config.ConvDim[Config.NumConvLayers - 1], Config.HiddenSize, 0, -1, 0,
+        Config.Prefix + 'feature_projection.projection.bias');
+      MarkConsumed(Config.Prefix + 'feature_projection.projection.weight');
+      MarkConsumed(Config.Prefix + 'feature_projection.projection.bias');
+      // Positional conv (weight_norm parametrized).
+      EncPrefix := Config.Prefix + 'encoder.';
+      LoadWav2Vec2PosConv(Reader, PosConv,
+        EncPrefix + 'pos_conv_embed.conv.parametrizations.weight.original0',
+        EncPrefix + 'pos_conv_embed.conv.parametrizations.weight.original1',
+        EncPrefix + 'pos_conv_embed.conv.bias',
+        Config.HiddenSize, Config.NumPosConvGroups,
+        Config.NumPosConvEmbeddings, Consumed);
+      LoadLayerNormWeights(Reader, EncLN,
+        EncPrefix + 'layer_norm.weight', EncPrefix + 'layer_norm.bias',
+        Config.HiddenSize);
+      MarkConsumed(EncPrefix + 'layer_norm.weight');
+      MarkConsumed(EncPrefix + 'layer_norm.bias');
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := EncPrefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        // Separate biased q/k/v -> the fused Q|K|V slab (query 0..d-1, key
+        // d..2d-1, value 2d..3d-1; the builder's per-head slicing matches).
+        LoadLlamaLinearWeights(Reader, QKV[BlockCnt],
+          BlockPrefix + 'attention.q_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, 3 * Config.HiddenSize, 0,
+          BlockPrefix + 'attention.q_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.q_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.q_proj.bias');
+        LoadLlamaLinearWeights(Reader, QKV[BlockCnt],
+          BlockPrefix + 'attention.k_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, Config.HiddenSize,
+          3 * Config.HiddenSize, 0, BlockPrefix + 'attention.k_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.k_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.k_proj.bias');
+        LoadLlamaLinearWeights(Reader, QKV[BlockCnt],
+          BlockPrefix + 'attention.v_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, 2 * Config.HiddenSize,
+          3 * Config.HiddenSize, 0, BlockPrefix + 'attention.v_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.v_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.v_proj.bias');
+        LoadLlamaLinearWeights(Reader, AttnDense[BlockCnt],
+          BlockPrefix + 'attention.out_proj.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'attention.out_proj.bias');
+        MarkConsumed(BlockPrefix + 'attention.out_proj.weight');
+        MarkConsumed(BlockPrefix + 'attention.out_proj.bias');
+        LoadLayerNormWeights(Reader, AttnLN[BlockCnt],
+          BlockPrefix + 'layer_norm.weight', BlockPrefix + 'layer_norm.bias',
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'layer_norm.weight');
+        MarkConsumed(BlockPrefix + 'layer_norm.bias');
+        LoadLlamaLinearWeights(Reader, Inter[BlockCnt],
+          BlockPrefix + 'feed_forward.intermediate_dense.weight',
+          Config.HiddenSize, Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'feed_forward.intermediate_dense.bias');
+        MarkConsumed(BlockPrefix + 'feed_forward.intermediate_dense.weight');
+        MarkConsumed(BlockPrefix + 'feed_forward.intermediate_dense.bias');
+        LoadLlamaLinearWeights(Reader, OutDense[BlockCnt],
+          BlockPrefix + 'feed_forward.output_dense.weight',
+          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'feed_forward.output_dense.bias');
+        MarkConsumed(BlockPrefix + 'feed_forward.output_dense.weight');
+        MarkConsumed(BlockPrefix + 'feed_forward.output_dense.bias');
+        LoadLayerNormWeights(Reader, OutLN[BlockCnt],
+          BlockPrefix + 'final_layer_norm.weight',
+          BlockPrefix + 'final_layer_norm.bias', Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'final_layer_norm.weight');
+        MarkConsumed(BlockPrefix + 'final_layer_norm.bias');
+      end;
+      // CTC head.
+      LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+        Config.HiddenSize, Config.VocabSize, 0, -1, 0, 'lm_head.bias');
+      MarkConsumed('lm_head.weight');
+      MarkConsumed('lm_head.bias');
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // masked_spec_embed: a pretraining-only buffer (SpecAugment mask
+        // token), never read at CTC inference - a known ignorable.
+        if Pos('masked_spec_embed', TensorNameStr) > 0 then continue;
+        // feature_projection has no extra tensors; quantizer / adapter /
+        // project_hid / project_q are pretraining heads absent from *ForCTC.
+        ImportError('Wav2Vec2 import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildWav2Vec2FromSafeTensorsEx(const FileName: string;
+  out Config: TWav2Vec2Config; NumSamples: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadWav2Vec2ConfigFromJSONFile(ConfigPath);
+  Result := BuildWav2Vec2FromSafeTensorsWithConfig(FileName, Config,
+    NumSamples, pInferenceOnly);
+end;
+
+function BuildWav2Vec2FromSafeTensors(const FileName: string;
+  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+var
+  Config: TWav2Vec2Config;
+begin
+  Result := BuildWav2Vec2FromSafeTensorsEx(FileName, Config, NumSamples,
+    pInferenceOnly);
 end;
 
 function ReadRWKVConfigFromJSONFile(const FileName: string): TRWKVConfig;
@@ -10199,6 +23955,2854 @@ begin
     pInferenceOnly, ConfigFileName, pQuantizeInt8);
 end;
 
+procedure SaveMambaToSafeTensors(Net: TNNet; const Config: TMambaConfig;
+  const FileName: string; pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  Embeds, Norms, PwConvs, Convs, Scans: array of TNNetLayer;
+  EmbIn, FinalNorm, LMHead: TNNetLayer;
+  i, BlockCnt: integer;
+  d, DI, NS, RK, ExpectNorm, ExpectPw: integer;
+  MixPrefix, NormName: string;
+
+  // Straight HF nn.Linear [OutDim, InDim] (+optional bias [OutDim]) from
+  // OutDim consecutive neurons of Layer: neuron j is checkpoint row j. The
+  // exact inverse of LoadLlamaLinearWeights (no rotary on any Mamba linear).
+  // BName='' for the bias-free in/out_proj when use_bias=false.
+  procedure DumpLinear(Layer: TNNetLayer; OutDim, InDim: integer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      B.ReSize(OutDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[jj].Weights.Size <> InDim then
+          ImportError('Mamba export: neuron ' + IntToStr(jj) + ' for "' +
+            WName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+        B.FData[jj] := Layer.Neurons[jj].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+      if BName <> '' then Writer.AddTensorFlat(BName, [OutDim], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // depthwise causal conv1d [d_inner, 1, k] (one k-tap filter per channel,
+  // tap order direct) + optional [d_inner] bias - inverse of LoadDepthwiseConv.
+  procedure DumpDepthwiseConv(Layer: TNNetLayer;
+    const WName, BName: string);
+  var
+    W, B: TNNetVolume;
+    dd, kk: integer;
+  begin
+    W := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      W.ReSize(DI * Config.ConvKernel, 1, 1);
+      B.ReSize(DI, 1, 1);
+      for dd := 0 to DI - 1 do
+      begin
+        for kk := 0 to Config.ConvKernel - 1 do
+          W.FData[dd * Config.ConvKernel + kk] :=
+            Layer.Neurons[dd].Weights.FData[kk];
+        B.FData[dd] := Layer.Neurons[dd].BiasWeight;
+      end;
+      Writer.AddTensorFlat(WName, [DI, 1, Config.ConvKernel], W, pDType);
+      if Config.UseConvBias then
+        Writer.AddTensorFlat(BName, [DI], B, pDType);
+    finally
+      B.Free;
+      W.Free;
+    end;
+  end;
+
+  // Per-token RMSNorm gain [d_model] -> single tensor (Neurons[0].Weights),
+  // the inverse of LoadLlamaRMSNormWeights.
+  procedure DumpRMSNorm(Layer: TNNetLayer; const WName: string);
+  begin
+    if Layer.Neurons[0].Weights.Size <> d then
+      ImportError('Mamba export: RMSNorm "' + WName + '" gain size ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' <> ' + IntToStr(d) + '.');
+    Writer.AddTensorFlat(WName, [d], Layer.Neurons[0].Weights, pDType);
+  end;
+
+  // The selective-scan bundle (inverse of LoadScanWeights). W_B/W_C/b_d/A_log/D
+  // round-trip raw. The folded W_d (Neurons[0], [d_inner, d_inner], rank
+  // <= dt_rank) is factored EXACTLY into dt_proj.weight [d_inner, dt_rank]
+  // (= L) and the first dt_rank rows of x_proj.weight (= U) via Gaussian
+  // elimination with partial pivoting, so L @ U = W_d.
+  procedure DumpScanWeights(Layer: TNNetLayer; const MixP: string);
+  var
+    Wd: array of array of double;   // d_inner x d_inner working copy
+    L: array of array of double;    // d_inner x dt_rank
+    U: array of array of double;    // dt_rank x d_inner
+    PivRow: array of integer;
+    XW, DtW, Vec: TNNetVolume;
+    a, b, c, s, r, k, pr: integer;
+    piv, mult, maxv: double;
+  begin
+    XW := TNNetVolume.Create;     // x_proj.weight  [RK+2*NS, DI]
+    DtW := TNNetVolume.Create;    // dt_proj.weight [DI, RK]
+    Vec := TNNetVolume.Create;
+    try
+      // ---- exact rank-<=RK factorization of W_d (Neurons[0]) ----
+      SetLength(Wd, DI);
+      for a := 0 to DI - 1 do
+      begin
+        SetLength(Wd[a], DI);
+        for b := 0 to DI - 1 do
+          Wd[a][b] := Layer.Neurons[0].Weights.FData[a * DI + b];
+      end;
+      SetLength(L, DI);
+      for a := 0 to DI - 1 do
+      begin
+        SetLength(L[a], RK);
+        for r := 0 to RK - 1 do L[a][r] := 0;
+      end;
+      SetLength(U, RK);
+      for r := 0 to RK - 1 do
+      begin
+        SetLength(U[r], DI);
+        for b := 0 to DI - 1 do U[r][b] := 0;
+      end;
+      SetLength(PivRow, RK);
+      // Column-by-column LU-style extraction: at step r pick the row with the
+      // largest residual entry in some pivot column, record it as U[r], and
+      // eliminate it from the remaining rows (multipliers -> L[*][r]).
+      for r := 0 to RK - 1 do
+      begin
+        // pivot = row with the max-abs entry over the whole residual matrix.
+        pr := -1; maxv := 0;
+        for a := 0 to DI - 1 do
+          for b := 0 to DI - 1 do
+            if Abs(Wd[a][b]) > maxv then
+            begin
+              maxv := Abs(Wd[a][b]); pr := a;
+            end;
+        if pr < 0 then pr := r;          // residual already ~0: any row
+        PivRow[r] := pr;
+        for b := 0 to DI - 1 do U[r][b] := Wd[pr][b];
+        // choose the pivot column = the largest-magnitude entry of U[r].
+        k := 0; piv := 0;
+        for b := 0 to DI - 1 do
+          if Abs(U[r][b]) > Abs(piv) then begin piv := U[r][b]; k := b; end;
+        if piv = 0 then
+        begin
+          // U[r] is all zero: this rank slot contributes nothing.
+          for a := 0 to DI - 1 do L[a][r] := 0;
+          continue;
+        end;
+        // eliminate the pivot column from every row.
+        for a := 0 to DI - 1 do
+        begin
+          mult := Wd[a][k] / piv;
+          L[a][r] := mult;
+          for b := 0 to DI - 1 do
+            Wd[a][b] := Wd[a][b] - mult * U[r][b];
+        end;
+      end;
+      // ---- assemble x_proj.weight [RK+2*NS, DI] ----
+      XW.ReSize((RK + 2 * NS) * DI, 1, 1);
+      for r := 0 to RK - 1 do
+        for b := 0 to DI - 1 do
+          XW.FData[r * DI + b] := U[r][b];
+      for s := 0 to NS - 1 do
+        for b := 0 to DI - 1 do
+        begin
+          XW.FData[(RK + s) * DI + b] :=
+            Layer.Neurons[1].Weights.FData[s * DI + b];       // W_B
+          XW.FData[(RK + NS + s) * DI + b] :=
+            Layer.Neurons[2].Weights.FData[s * DI + b];       // W_C
+        end;
+      Writer.AddTensorFlat(MixP + 'x_proj.weight', [RK + 2 * NS, DI],
+        XW, pDType);
+      // ---- dt_proj.weight [DI, RK] = L ----
+      DtW.ReSize(DI * RK, 1, 1);
+      for a := 0 to DI - 1 do
+        for r := 0 to RK - 1 do
+          DtW.FData[a * RK + r] := L[a][r];
+      Writer.AddTensorFlat(MixP + 'dt_proj.weight', [DI, RK], DtW, pDType);
+      // ---- dt_proj.bias = b_d (Neurons[3]) ----
+      Vec.ReSize(DI, 1, 1);
+      for a := 0 to DI - 1 do Vec.FData[a] := Layer.Neurons[3].Weights.FData[a];
+      Writer.AddTensorFlat(MixP + 'dt_proj.bias', [DI], Vec, pDType);
+      // ---- A_log = A_raw RAW (Neurons[4], [DI, NS]) ----
+      Vec.ReSize(DI * NS, 1, 1);
+      for a := 0 to DI * NS - 1 do
+        Vec.FData[a] := Layer.Neurons[4].Weights.FData[a];
+      Writer.AddTensorFlat(MixP + 'A_log', [DI, NS], Vec, pDType);
+      // ---- D = e (Neurons[5], [DI]) ----
+      Vec.ReSize(DI, 1, 1);
+      for a := 0 to DI - 1 do Vec.FData[a] := Layer.Neurons[5].Weights.FData[a];
+      Writer.AddTensorFlat(MixP + 'D', [DI], Vec, pDType);
+    finally
+      Vec.Free;
+      DtW.Free;
+      XW.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  DI := Config.DInner;
+  NS := Config.StateSize;
+  RK := Config.TimeStepRank;
+  if Config.NumLayers < 1 then
+    ImportError('Mamba export: num_hidden_layers must be >= 1.');
+  // ---- collect load-bearing layers in net (= importer build) order ----
+  SetLength(Embeds, 0); SetLength(Norms, 0); SetLength(PwConvs, 0);
+  SetLength(Convs, 0); SetLength(Scans, 0);
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetEmbedding then
+    begin
+      SetLength(Embeds, Length(Embeds) + 1);
+      Embeds[High(Embeds)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenRMSNorm then
+    begin
+      SetLength(Norms, Length(Norms) + 1);
+      Norms[High(Norms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetSelectiveSSM then
+    begin
+      SetLength(Scans, Length(Scans) + 1);
+      Scans[High(Scans)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetDepthwiseConv1D then
+    begin
+      SetLength(Convs, Length(Convs) + 1);
+      Convs[High(Convs)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if Length(Embeds) <> 1 then
+    ImportError('Mamba export: found ' + IntToStr(Length(Embeds)) +
+      ' TNNetEmbedding layers, expected 1 - not a ' +
+      'BuildMambaFromSafeTensors net?');
+  ExpectNorm := Config.NumLayers + 1;     // per-block norm + norm_f
+  ExpectPw := 2 * Config.NumLayers + 1;   // in_proj + out_proj per block + LM head
+  if Length(Norms) <> ExpectNorm then
+    ImportError('Mamba export: found ' + IntToStr(Length(Norms)) +
+      ' TokenRMSNorm layers, expected ' + IntToStr(ExpectNorm) + '.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('Mamba export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) + '.');
+  if Length(Scans) <> Config.NumLayers then
+    ImportError('Mamba export: found ' + IntToStr(Length(Scans)) +
+      ' SelectiveSSM layers, expected ' + IntToStr(Config.NumLayers) + '.');
+  if Length(Convs) <> Config.NumLayers then
+    ImportError('Mamba export: found ' + IntToStr(Length(Convs)) +
+      ' DepthwiseConv1D layers, expected ' + IntToStr(Config.NumLayers) + '.');
+  EmbIn := Embeds[0];
+  FinalNorm := Norms[Config.NumLayers];           // last collected norm
+  LMHead := PwConvs[2 * Config.NumLayers];         // last collected PwConv
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/mamba');
+    // ---- embeddings ----
+    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+      ImportError('Mamba export: embeddings size ' +
+        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(Config.VocabSize * d) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'embeddings.weight',
+      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+    // ---- mixer blocks ----
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      MixPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.mixer.';
+      NormName := Config.Prefix + 'layers.' + IntToStr(BlockCnt) +
+        '.norm.weight';
+      DumpRMSNorm(Norms[BlockCnt], NormName);
+      if Config.UseBias then
+        DumpLinear(PwConvs[BlockCnt * 2 + 0], 2 * DI, d,
+          MixPrefix + 'in_proj.weight', MixPrefix + 'in_proj.bias')
+      else
+        DumpLinear(PwConvs[BlockCnt * 2 + 0], 2 * DI, d,
+          MixPrefix + 'in_proj.weight', '');
+      DumpDepthwiseConv(Convs[BlockCnt], MixPrefix + 'conv1d.weight',
+        MixPrefix + 'conv1d.bias');
+      DumpScanWeights(Scans[BlockCnt], MixPrefix);
+      if Config.UseBias then
+        DumpLinear(PwConvs[BlockCnt * 2 + 1], d, DI,
+          MixPrefix + 'out_proj.weight', MixPrefix + 'out_proj.bias')
+      else
+        DumpLinear(PwConvs[BlockCnt * 2 + 1], d, DI,
+          MixPrefix + 'out_proj.weight', '');
+    end;
+    // ---- final norm ----
+    DumpRMSNorm(FinalNorm, Config.Prefix + 'norm_f.weight');
+    // ---- LM head (untied only; tied heads carry no lm_head tensor) ----
+    if not Config.TieWordEmbeddings then
+      DumpLinear(LMHead, Config.VocabSize, d, 'lm_head.weight', '');
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
+procedure SaveRWKVToSafeTensors(Net: TNNet; const Config: TRWKVConfig;
+  const FileName: string;
+  pDType: TSafeTensorsWriteDType = stwF32);
+var
+  Writer: TNNetSafeTensorsWriter;
+  LNorms, Shifts, PwConvs, WKVs: array of TNNetLayer;
+  EmbIn, PreLN, FinalLN, LMHead: TNNetLayer;
+  i, BlockCnt, d, AH, IM: integer;
+  ExpectLN, ExpectShift, ExpectPw: integer;
+  BlockPrefix, AttPrefix, FFPrefix: string;
+
+  // Straight bias-free HF nn.Linear [OutDim, InDim] from OutDim consecutive
+  // neurons (neuron j = checkpoint row j). Inverse of LoadLlamaLinearWeights
+  // (no rotary/scale on any RWKV linear).
+  procedure DumpLinear(Layer: TNNetLayer; OutDim, InDim: integer;
+    const WName: string);
+  var
+    W: TNNetVolume;
+    jj, ii: integer;
+  begin
+    W := TNNetVolume.Create;
+    try
+      W.ReSize(OutDim * InDim, 1, 1);
+      for jj := 0 to OutDim - 1 do
+      begin
+        if Layer.Neurons[jj].Weights.Size <> InDim then
+          ImportError('RWKV export: neuron ' + IntToStr(jj) + ' for "' +
+            WName + '" has ' + IntToStr(Layer.Neurons[jj].Weights.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        for ii := 0 to InDim - 1 do
+          W.FData[jj * InDim + ii] := Layer.Neurons[jj].Weights.FData[ii];
+      end;
+      Writer.AddTensorFlat(WName, [OutDim, InDim], W, pDType);
+    finally
+      W.Free;
+    end;
+  end;
+
+  // LayerNorm gamma (Neurons[0]) + beta (Neurons[1]), each [Chan].
+  // Inverse of LoadLayerNormWeights.
+  procedure DumpLayerNorm(Layer: TNNetLayer;
+    const WName, BName: string; Chan: integer);
+  var
+    G, B: TNNetVolume;
+    ii: integer;
+  begin
+    if (Layer.Neurons[0].Weights.Size <> Chan) or
+       (Layer.Neurons[1].Weights.Size <> Chan) then
+      ImportError('RWKV export: LayerNorm "' + WName + '" gain/bias size ' +
+        IntToStr(Layer.Neurons[0].Weights.Size) + ' <> ' + IntToStr(Chan) +
+        '.');
+    G := TNNetVolume.Create;
+    B := TNNetVolume.Create;
+    try
+      G.ReSize(Chan, 1, 1);
+      B.ReSize(Chan, 1, 1);
+      for ii := 0 to Chan - 1 do
+      begin
+        G.FData[ii] := Layer.Neurons[0].Weights.FData[ii];
+        B.FData[ii] := Layer.Neurons[1].Weights.FData[ii];
+      end;
+      Writer.AddTensorFlat(WName, [Chan], G, pDType);
+      Writer.AddTensorFlat(BName, [Chan], B, pDType);
+    finally
+      B.Free;
+      G.Free;
+    end;
+  end;
+
+  // Per-channel vector [1,1,Chan] (token-shift lerp or time_first bonus)
+  // from neuron NeuronIdx of Layer. Inverse of LoadChannelVector.
+  procedure DumpChannelVector(Layer: TNNetLayer; NeuronIdx: integer;
+    const TName: string; Chan: integer);
+  var
+    V: TNNetVolume;
+    ii: integer;
+  begin
+    if Layer.Neurons[NeuronIdx].Weights.Size < Chan then
+      ImportError('RWKV export: vector "' + TName + '" neuron ' +
+        IntToStr(NeuronIdx) + ' has ' +
+        IntToStr(Layer.Neurons[NeuronIdx].Weights.Size) +
+        ' elements, expected >= ' + IntToStr(Chan) + '.');
+    V := TNNetVolume.Create;
+    try
+      V.ReSize(Chan, 1, 1);
+      for ii := 0 to Chan - 1 do
+        V.FData[ii] := Layer.Neurons[NeuronIdx].Weights.FData[ii];
+      Writer.AddTensorFlat(TName, [1, 1, Chan], V, pDType);
+    finally
+      V.Free;
+    end;
+  end;
+
+  // TNNetWKV w_raw (Neurons[0]) -> HF time_decay [Chan]: the FORWARD softplus,
+  // exactly inverting LoadWKVDecay. The checkpoint's effective decay is
+  // x = softplus(w_raw) = ln(1+exp(w_raw)) and time_decay = ln(x). Branch
+  // bounds mirror the importer's: w_raw > 30 took the x=w_raw shortcut, and
+  // x < 1e-7 (w_raw < ln(1e-7) ~= -16.118) took the x=exp(w_raw) limit.
+  procedure DumpWKVDecay(Layer: TNNetLayer; const TName: string; Chan: integer);
+  var
+    V: TNNetVolume;
+    ii: integer;
+    wraw, x: double;
+  begin
+    V := TNNetVolume.Create;
+    try
+      V.ReSize(Chan, 1, 1);
+      for ii := 0 to Chan - 1 do
+      begin
+        wraw := Layer.Neurons[0].Weights.FData[ii];
+        if wraw > 30 then x := wraw                 // softplus(w)=w for big w
+        else if wraw < Ln(1e-7) then x := Exp(wraw) // softplus(w)=exp(w) tiny
+        else x := Ln(1.0 + Exp(wraw));
+        V.FData[ii] := Ln(x);                       // time_decay = ln(x)
+      end;
+      Writer.AddTensorFlat(TName, [Chan], V, pDType);
+    finally
+      V.Free;
+    end;
+  end;
+
+begin
+  d := Config.HiddenSize;
+  AH := Config.AttentionHiddenSize;
+  IM := Config.IntermediateSize;
+  if Config.NumLayers < 1 then
+    ImportError('RWKV export: num_hidden_layers must be >= 1.');
+  // ---- collect load-bearing layers in net (= importer build) order ----
+  SetLength(LNorms, 0); SetLength(Shifts, 0);
+  SetLength(PwConvs, 0); SetLength(WKVs, 0);
+  EmbIn := nil;
+  for i := 0 to Net.CountLayers - 1 do
+  begin
+    if Net.Layers[i] is TNNetEmbedding then
+      EmbIn := Net.Layers[i]
+    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    begin
+      SetLength(LNorms, Length(LNorms) + 1);
+      LNorms[High(LNorms)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetTokenShift then
+    begin
+      SetLength(Shifts, Length(Shifts) + 1);
+      Shifts[High(Shifts)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetWKV then
+    begin
+      SetLength(WKVs, Length(WKVs) + 1);
+      WKVs[High(WKVs)] := Net.Layers[i];
+    end
+    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    begin
+      SetLength(PwConvs, Length(PwConvs) + 1);
+      PwConvs[High(PwConvs)] := Net.Layers[i];
+    end;
+  end;
+  if EmbIn = nil then
+    ImportError('RWKV export: no TNNetEmbedding layer - not a ' +
+      'BuildRWKVFromSafeTensors net?');
+  ExpectLN := 2 * Config.NumLayers + 2;     // ln0 + ln1/ln2 per block + ln_out
+  ExpectShift := 5 * Config.NumLayers;      // 3 attn + 2 ffn shifts per block
+  ExpectPw := 7 * Config.NumLayers + 1;     // 7 projections per block + head
+  if Length(LNorms) <> ExpectLN then
+    ImportError('RWKV export: found ' + IntToStr(Length(LNorms)) +
+      ' TokenLayerNorm layers, expected ' + IntToStr(ExpectLN) + '.');
+  if Length(Shifts) <> ExpectShift then
+    ImportError('RWKV export: found ' + IntToStr(Length(Shifts)) +
+      ' TokenShift layers, expected ' + IntToStr(ExpectShift) + '.');
+  if Length(PwConvs) <> ExpectPw then
+    ImportError('RWKV export: found ' + IntToStr(Length(PwConvs)) +
+      ' PointwiseConvLinear layers, expected ' + IntToStr(ExpectPw) + '.');
+  if Length(WKVs) <> Config.NumLayers then
+    ImportError('RWKV export: found ' + IntToStr(Length(WKVs)) +
+      ' WKV layers, expected ' + IntToStr(Config.NumLayers) + '.');
+  PreLN := LNorms[0];
+  FinalLN := LNorms[2 * Config.NumLayers + 1];   // last collected norm
+  LMHead := PwConvs[7 * Config.NumLayers];       // last collected PwConv
+
+  Writer := TNNetSafeTensorsWriter.Create(FileName);
+  try
+    Writer.SetMetadata('format', 'pt');
+    Writer.SetMetadata('exporter', 'cai-neural-api/rwkv');
+    // ---- embeddings ----
+    if EmbIn.Neurons[0].Weights.Size <> Config.VocabSize * d then
+      ImportError('RWKV export: embeddings size ' +
+        IntToStr(EmbIn.Neurons[0].Weights.Size) + ' <> vocab*hidden = ' +
+        IntToStr(Config.VocabSize * d) + '.');
+    Writer.AddTensorFlat(Config.Prefix + 'embeddings.weight',
+      [Config.VocabSize, d], EmbIn.Neurons[0].Weights, pDType);
+    // ---- block-0 embedding LayerNorm (ln0 / HF pre_ln) ----
+    DumpLayerNorm(PreLN, Config.Prefix + 'blocks.0.pre_ln.weight',
+      Config.Prefix + 'blocks.0.pre_ln.bias', d);
+    // ---- blocks ----
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      BlockPrefix := Config.Prefix + 'blocks.' + IntToStr(BlockCnt) + '.';
+      AttPrefix := BlockPrefix + 'attention.';
+      FFPrefix := BlockPrefix + 'feed_forward.';
+      // ln1 = LNorms[1 + 2*b], ln2 = LNorms[2 + 2*b]
+      DumpLayerNorm(LNorms[1 + 2 * BlockCnt], BlockPrefix + 'ln1.weight',
+        BlockPrefix + 'ln1.bias', d);
+      DumpLayerNorm(LNorms[2 + 2 * BlockCnt], BlockPrefix + 'ln2.weight',
+        BlockPrefix + 'ln2.bias', d);
+      // Token-shift lerp vectors. Shift order per block:
+      //   [0]=AttShiftK [1]=AttShiftV [2]=AttShiftR [3]=FFShiftK [4]=FFShiftR
+      DumpChannelVector(Shifts[5 * BlockCnt + 0], 0,
+        AttPrefix + 'time_mix_key', d);
+      DumpChannelVector(Shifts[5 * BlockCnt + 1], 0,
+        AttPrefix + 'time_mix_value', d);
+      DumpChannelVector(Shifts[5 * BlockCnt + 2], 0,
+        AttPrefix + 'time_mix_receptance', d);
+      DumpChannelVector(Shifts[5 * BlockCnt + 3], 0,
+        FFPrefix + 'time_mix_key', d);
+      DumpChannelVector(Shifts[5 * BlockCnt + 4], 0,
+        FFPrefix + 'time_mix_receptance', d);
+      // WKV decay (forward softplus) + time_first bonus.
+      DumpWKVDecay(WKVs[BlockCnt], AttPrefix + 'time_decay', AH);
+      DumpChannelVector(WKVs[BlockCnt], 1, AttPrefix + 'time_first', AH);
+      // Bias-free projections. PwConv order per block:
+      //   [0]=AttKey [1]=AttValue [2]=AttRecept [3]=AttOut
+      //   [4]=FFKey  [5]=FFValue  [6]=FFRecept
+      DumpLinear(PwConvs[7 * BlockCnt + 0], AH, d, AttPrefix + 'key.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 1], AH, d, AttPrefix + 'value.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 2], AH, d,
+        AttPrefix + 'receptance.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 3], d, AH, AttPrefix + 'output.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 4], IM, d, FFPrefix + 'key.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 5], d, IM, FFPrefix + 'value.weight');
+      DumpLinear(PwConvs[7 * BlockCnt + 6], d, d,
+        FFPrefix + 'receptance.weight');
+    end;
+    // ---- final LayerNorm ----
+    DumpLayerNorm(FinalLN, Config.Prefix + 'ln_out.weight',
+      Config.Prefix + 'ln_out.bias', d);
+    // ---- LM head (untied only; tied heads carry no head.weight tensor) ----
+    if not Config.TieWordEmbeddings then
+      DumpLinear(LMHead, Config.VocabSize, d, 'head.weight');
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+  end;
+end;
+
+// ====================== MAMBA-2 / SSD IMPORT (impl) ======================
+
+function ReadMamba2ConfigFromJSONFile(const FileName: string): TMamba2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+  Field: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Mamba2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Mamba2 import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Mamba2 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Mamba2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Mamba2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'mamba2');
+    if ModelType <> 'mamba2' then
+      ImportError('Mamba2 import: config model_type is "' + ModelType +
+        '" - expected "mamba2".');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumHeads := RequiredInt('num_heads');
+    Result.HeadDim := RequiredInt('head_dim');
+    Result.StateSize := Obj.Get('state_size', 128);
+    if Result.StateSize < 1 then
+      ImportError('Mamba2 import: config state_size must be >= 1.');
+    Result.NGroups := Obj.Get('n_groups', 1);
+    if Result.NGroups < 1 then
+      ImportError('Mamba2 import: config n_groups must be >= 1.');
+    if Result.NumHeads mod Result.NGroups <> 0 then
+      ImportError('Mamba2 import: num_heads (' + IntToStr(Result.NumHeads) +
+        ') must be divisible by n_groups (' + IntToStr(Result.NGroups) + ').');
+    Result.Expand := Obj.Get('expand', 2);
+    if Result.Expand < 1 then
+      ImportError('Mamba2 import: config expand must be >= 1.');
+    Field := Obj.Find('intermediate_size');
+    if (Field = nil) or Field.IsNull then
+      Result.DInner := Result.Expand * Result.HiddenSize
+    else
+      Result.DInner := RequiredInt('intermediate_size');
+    if Result.DInner <> Result.NumHeads * Result.HeadDim then
+      ImportError('Mamba2 import: intermediate_size (' +
+        IntToStr(Result.DInner) + ') must equal num_heads*head_dim (' +
+        IntToStr(Result.NumHeads * Result.HeadDim) + ').');
+    Result.ConvKernel := Obj.Get('conv_kernel', 4);
+    if Result.ConvKernel < 1 then
+      ImportError('Mamba2 import: config conv_kernel must be >= 1.');
+    Result.UseConvBias := Obj.Get('use_conv_bias', True);
+    Result.UseBias := Obj.Get('use_bias', False);
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    Result.Prefix := '';
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function Mamba2ConfigToString(const Config: TMamba2Config): string;
+begin
+  Result := 'mamba2 config: layers=' + IntToStr(Config.NumLayers) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', d_inner=' + IntToStr(Config.DInner) +
+    ', d_state=' + IntToStr(Config.StateSize) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', head_dim=' + IntToStr(Config.HeadDim) +
+    ', n_groups=' + IntToStr(Config.NGroups) +
+    ', conv_kernel=' + IntToStr(Config.ConvKernel) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', conv_bias=' + BoolToStr(Config.UseConvBias, true) +
+    ', bias=' + BoolToStr(Config.UseBias, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TMamba2BlockLayers = record
+    Norm, InProj, Conv, Scan, OutProj: TNNetLayer;
+  end;
+
+function BuildMamba2FromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMamba2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TMamba2BlockLayers;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, XBCConv, DtSplit, GateSplit: TNNetLayer;
+  BlockCnt, SeqLen, i, j, ConvDim, ProjSize, ConvBiasSuppress: integer;
+  Tmp: TNNetVolume;
+  MixPrefix, TensorNameStr, InBias, OutBias: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // Per-channel vector tensor -> neuron NeuronIdx of Layer.
+  procedure LoadChannelVector(Layer: TNNetLayer; NeuronIdx: integer;
+    const TName: string; Channels: integer);
+  var
+    d: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('Mamba2 import: missing tensor "' + TName + '".');
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Tmp.Size <> Channels then
+      ImportError('Mamba2 import: "' + TName + '" must carry ' +
+        IntToStr(Channels) + ' elements, got ' + Reader.ShapeAsString(TName));
+    EnsureWritableImportWeights(Layer);
+    for d := 0 to Channels - 1 do
+      Layer.Neurons[NeuronIdx].Weights.FData[d] := Tmp.FData[d];
+    Layer.FlushWeightCache();
+    MarkConsumed(TName);
+  end;
+
+  // conv1d.weight [conv_dim,1,k] + optional bias [conv_dim] into the
+  // TNNetDepthwiseConv1D (same tap mapping as Mamba-1).
+  procedure LoadDepthwiseConv(Layer: TNNetLayer; const WName, BName: string);
+  var
+    d, kk: integer;
+  begin
+    if not Reader.HasTensor(WName) then
+      ImportError('Mamba2 import: missing tensor "' + WName + '".');
+    if (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> ConvDim) or
+       (Reader.DimSize(WName, 1) <> 1) or
+       (Reader.DimSize(WName, 2) <> Config.ConvKernel) then
+      ImportError('Mamba2 import: "' + WName + '" must have shape [' +
+        IntToStr(ConvDim) + ', 1, ' + IntToStr(Config.ConvKernel) +
+        '], got ' + Reader.ShapeAsString(WName));
+    Reader.LoadTensorFlat(WName, Tmp);
+    EnsureWritableImportWeights(Layer);
+    for d := 0 to ConvDim - 1 do
+      for kk := 0 to Config.ConvKernel - 1 do
+        Layer.Neurons[d].Weights.FData[kk] :=
+          Tmp.FData[d * Config.ConvKernel + kk];
+    MarkConsumed(WName);
+    if Config.UseConvBias then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('Mamba2 import: use_conv_bias=true but "' + BName +
+          '" is missing.');
+      Reader.LoadTensorFlat(BName, Tmp);
+      if Tmp.Size <> ConvDim then
+        ImportError('Mamba2 import: "' + BName + '" must carry ' +
+          IntToStr(ConvDim) + ' elements.');
+      for d := 0 to ConvDim - 1 do
+        Layer.Neurons[d].BiasWeight := Tmp.FData[d];
+      MarkConsumed(BName);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if Config.NumLayers < 1 then
+        ImportError('Mamba2 import: num_hidden_layers must be >= 1.');
+      if Reader.HasTensor('backbone.embeddings.weight') then
+        Config.Prefix := 'backbone.'
+      else if Reader.HasTensor('embeddings.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Mamba2 import: neither "backbone.embeddings.weight" ' +
+          'nor "embeddings.weight" found - not a Mamba2 checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embeddings.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Mamba2 import: embeddings.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embeddings.weight'));
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('lm_head.weight')) then
+        ImportError('Mamba2 import: tie_word_embeddings=false but ' +
+          '"lm_head.weight" is missing.');
+      if pSeqLen <= 0 then SeqLen := 1024 else SeqLen := pSeqLen;
+      if Config.UseConvBias then ConvBiasSuppress := 0
+      else ConvBiasSuppress := 1;
+      // conv operates over (x | B | C); the in_proj packs (gate | x|B|C | dt).
+      ConvDim := Config.DInner + 2 * Config.NGroups * Config.StateSize;
+      ProjSize := Config.DInner + ConvDim + Config.NumHeads;
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // x := x + out_proj( gated_norm( Mamba2(conv(x|B|C)|dt|gate) ) ).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].Norm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        // (1) in_proj -> [gate | x|B|C | dt].
+        Blocks[BlockCnt].InProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(ProjSize, 1) );
+        // (2) x|B|C path: depthwise causal conv1d + SiLU.
+        NN.AddLayerAfter(
+          TNNetSplitChannels.Create(Config.DInner, ConvDim),
+          Blocks[BlockCnt].InProj );
+        Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
+          Config.ConvKernel, {pCausal=}true, ConvBiasSuppress) );
+        XBCConv := NN.AddLayer( TNNetSiLU.Create() );
+        // (3) dt slice and gate slice (raw, no conv).
+        DtSplit := NN.AddLayerAfter( TNNetSplitChannels.Create(
+          Config.DInner + ConvDim, Config.NumHeads), Blocks[BlockCnt].InProj );
+        GateSplit := NN.AddLayerAfter( TNNetSplitChannels.Create(
+          0, Config.DInner), Blocks[BlockCnt].InProj );
+        // (4) reassemble the leaf input [x|B|C | dt | gate] and scan.
+        NN.AddLayer( TNNetDeepConcat.Create([XBCConv, DtSplit, GateSplit]) );
+        Blocks[BlockCnt].Scan := NN.AddLayer( TNNetMamba2.Create(
+          Config.NumHeads, Config.HeadDim, Config.StateSize,
+          Config.NGroups, Config.LayerNormEps) );
+        // (5) out_proj back to hidden + residual sum.
+        Blocks[BlockCnt].OutProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(Config.Prefix + 'embeddings.weight');
+      if Config.TieWordEmbeddings then
+      begin
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then
+          MarkConsumed('lm_head.weight');
+      end
+      else
+      begin
+        LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+          Config.HiddenSize, Config.VocabSize);
+        MarkConsumed('lm_head.weight');
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        MixPrefix := Config.Prefix + 'layers.' + IntToStr(BlockCnt) +
+          '.mixer.';
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].Norm,
+          Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.norm.weight',
+          Config.HiddenSize);
+        MarkConsumed(Config.Prefix + 'layers.' + IntToStr(BlockCnt) +
+          '.norm.weight');
+        if Config.UseBias then InBias := MixPrefix + 'in_proj.bias'
+        else InBias := '';
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].InProj,
+          MixPrefix + 'in_proj.weight', Config.HiddenSize, ProjSize,
+          0, -1, 0, InBias);
+        MarkConsumed(MixPrefix + 'in_proj.weight');
+        if InBias <> '' then MarkConsumed(InBias);
+        LoadDepthwiseConv(Blocks[BlockCnt].Conv,
+          MixPrefix + 'conv1d.weight', MixPrefix + 'conv1d.bias');
+        // Mamba2 leaf weights: [0]=A_log [1]=D [2]=dt_bias [3]=norm.weight.
+        LoadChannelVector(Blocks[BlockCnt].Scan, 0, MixPrefix + 'A_log',
+          Config.NumHeads);
+        LoadChannelVector(Blocks[BlockCnt].Scan, 1, MixPrefix + 'D',
+          Config.NumHeads);
+        LoadChannelVector(Blocks[BlockCnt].Scan, 2, MixPrefix + 'dt_bias',
+          Config.NumHeads);
+        LoadChannelVector(Blocks[BlockCnt].Scan, 3, MixPrefix + 'norm.weight',
+          Config.DInner);
+        if Config.UseBias then OutBias := MixPrefix + 'out_proj.bias'
+        else OutBias := '';
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutProj,
+          MixPrefix + 'out_proj.weight', Config.DInner,
+          Config.HiddenSize, 0, -1, 0, OutBias);
+        MarkConsumed(MixPrefix + 'out_proj.weight');
+        if OutBias <> '' then MarkConsumed(OutBias);
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadLlamaRMSNormWeights(Reader, FinalNorm,
+        Config.Prefix + 'norm_f.weight', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'norm_f.weight');
+
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Mamba2 import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildMamba2FromSafeTensorsEx(const FileName: string;
+  out Config: TMamba2Config; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMamba2ConfigFromJSONFile(ConfigPath);
+  Result := BuildMamba2FromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildMamba2FromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TMamba2Config;
+begin
+  Result := BuildMamba2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+// ====================== RECURRENT GEMMA IMPORT (impl) =====================
+
+function ReadRecurrentGemmaConfigFromJSONFile(
+  const FileName: string): TRecurrentGemmaConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  Arr: TJSONArray;
+  Field: TJSONData;
+  i: integer;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('RecurrentGemma import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('RecurrentGemma import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('RecurrentGemma import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('RecurrentGemma import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('RecurrentGemma import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'recurrent_gemma');
+    if Result.ModelType <> 'recurrent_gemma' then
+      ImportError('RecurrentGemma import: config model_type is "' +
+        Result.ModelType + '" - expected "recurrent_gemma" (see ' +
+        'BuildFromPretrained for the full dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if Result.NumKVHeads < 1 then Result.NumKVHeads := Result.NumHeads;
+    if (Result.NumHeads mod Result.NumKVHeads) <> 0 then
+      ImportError('RecurrentGemma import: num_attention_heads must be a ' +
+        'multiple of num_key_value_heads.');
+    Result.HeadDim := Obj.Get('head_dim', Result.HiddenSize div Result.NumHeads);
+    Result.LruWidth := Obj.Get('lru_width', Result.HiddenSize);
+    if Result.LruWidth <> Result.HiddenSize then
+      ImportError('RecurrentGemma import: lru_width != hidden_size (' +
+        IntToStr(Result.LruWidth) + ' vs ' + IntToStr(Result.HiddenSize) +
+        ') is not wired (the recurrent block would need an extra ' +
+        'projection); every released recurrentgemma keeps them equal.');
+    if (Result.LruWidth mod Result.NumHeads) <> 0 then
+      ImportError('RecurrentGemma import: lru_width must be a multiple of ' +
+        'num_attention_heads (per-head RG-LRU gate blocks).');
+    Field := Obj.Find('intermediate_size');
+    if (Field = nil) or Field.IsNull then
+      Result.Intermediate := 3 * Result.HiddenSize
+    else
+      Result.Intermediate := RequiredInt('intermediate_size');
+    if Odd(Result.Intermediate) then
+      ImportError('RecurrentGemma import: intermediate_size must be even ' +
+        '(the GEGLU MLP uses intermediate_size // 2).');
+    Result.ConvKernel := Obj.Get('conv1d_width', 4);
+    Result.Window := Obj.Get('attention_window_size', 2048);
+    Result.LogitSoftCap := Obj.Get('logits_soft_cap', 30.0);
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
+    Result.PartialRotaryFactor := Obj.Get('partial_rotary_factor', 0.5);
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    Result.AttentionBias := Obj.Get('attention_bias', False);
+    // block_types defaults to ('recurrent','recurrent','attention') tiled.
+    SetLength(Result.BlockTypes, Result.NumLayers);
+    Field := Obj.Find('block_types');
+    if (Field <> nil) and (Field is TJSONArray) then
+    begin
+      Arr := TJSONArray(Field);
+      for i := 0 to Result.NumLayers - 1 do
+        Result.BlockTypes[i] := Arr.Strings[i mod Arr.Count];
+    end
+    else
+      for i := 0 to Result.NumLayers - 1 do
+        case i mod 3 of
+          0, 1: Result.BlockTypes[i] := 'recurrent';
+        else    Result.BlockTypes[i] := 'attention';
+        end;
+    for i := 0 to Result.NumLayers - 1 do
+      if (Result.BlockTypes[i] <> 'recurrent') and
+         (Result.BlockTypes[i] <> 'attention') then
+        ImportError('RecurrentGemma import: block_types[' + IntToStr(i) +
+          '] = "' + Result.BlockTypes[i] + '" - expected "recurrent" or ' +
+          '"attention".');
+    Result.Prefix := ''; // detected by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RecurrentGemmaConfigToString(
+  const Config: TRecurrentGemmaConfig): string;
+var
+  i: integer;
+  Pat: string;
+begin
+  Pat := '';
+  for i := 0 to Config.NumLayers - 1 do
+  begin
+    if Config.BlockTypes[i] = 'recurrent' then Pat := Pat + 'R'
+    else Pat := Pat + 'A';
+  end;
+  Result := 'recurrent_gemma config: layers=' + IntToStr(Config.NumLayers) +
+    ' [' + Pat + ']' +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', lru_width=' + IntToStr(Config.LruWidth) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', head_dim=' + IntToStr(Config.HeadDim) +
+    ', intermediate=' + IntToStr(Config.Intermediate) +
+    ', conv1d=' + IntToStr(Config.ConvKernel) +
+    ', window=' + IntToStr(Config.Window) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', rms_eps=' + FloatToStr(Config.RmsNormEps) +
+    ', partial_rotary=' + FloatToStr(Config.PartialRotaryFactor) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', logit_softcap=' + FloatToStr(Config.LogitSoftCap);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TRecGemmaBlock = record
+    IsAttn: boolean;
+    TemporalNorm, ChannelNorm: TNNetLayer;
+    // recurrent block:
+    LinearX, LinearY, Conv, IGate, AGate, RGLRU, LinearOut: TNNetLayer;
+    // attention block:
+    QProj, KProj, VProj, OProj: TNNetLayer;
+    // mlp:
+    Gate, Up, Down: TNNetLayer;
+  end;
+
+function BuildRecurrentGemmaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TRecGemmaBlock;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSrc, Residual, XBranch, YBranch, ConvAct, PackedSlab: TNNetLayer;
+  Gated, MlpNormed, GateAct, UpAct, MlpProd, GegluProd: TNNetLayer;
+  QSrc, KSrc, VSrc, AttnConcat, KRot, VSlice, QSlice, KSlice, RotS, PassS: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  KRotated, VSlices: array of TNNetLayer;
+  SliceCh, RotCh, PassCh: array of integer;
+  BlockCnt, SeqLen, i, j, d, HeadCnt, KVHeadCnt, GroupSize: integer;
+  RotaryDims, HalfFFN, BlockWidth, AttnD: integer;
+  Tmp: TNNetVolume;
+  MixP, LayerP, TensorNameStr, QkvBias: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // conv1d.weight [lru_width, 1, k] (+ bias) into a TNNetDepthwiseConv1D
+  // (tap order maps directly; HF pads k-1 on the left and truncates).
+  procedure LoadConv(Layer: TNNetLayer; const WName, BName: string);
+  var
+    dd, kk: integer;
+  begin
+    if (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> Config.LruWidth) or
+       (Reader.DimSize(WName, 1) <> 1) or
+       (Reader.DimSize(WName, 2) <> Config.ConvKernel) then
+      ImportError('RecurrentGemma import: "' + WName + '" must have shape [' +
+        IntToStr(Config.LruWidth) + ', 1, ' + IntToStr(Config.ConvKernel) +
+        '], got ' + Reader.ShapeAsString(WName));
+    Reader.LoadTensorFlat(WName, Tmp);
+    for dd := 0 to Config.LruWidth - 1 do
+      for kk := 0 to Config.ConvKernel - 1 do
+        Layer.Neurons[dd].Weights.FData[kk] :=
+          Tmp.FData[dd * Config.ConvKernel + kk];
+    MarkConsumed(WName);
+    Reader.LoadTensorFlat(BName, Tmp);
+    for dd := 0 to Config.LruWidth - 1 do
+      Layer.Neurons[dd].BiasWeight := Tmp.FData[dd];
+    MarkConsumed(BName);
+    Layer.FlushWeightCache();
+  end;
+
+  // The per-head block-diagonal RG-LRU gate matrix [heads, bw, bw] + bias
+  // [heads, bw] into a full lru_width->lru_width Pointwise layer (off-block
+  // entries left 0). HF baddbmm computes, per head h, logits = act @ W_h +
+  // b_h with act [.., bw], W_h [bw, bw] -> out[o] = sum_i act[i]*W_h[i,o] +
+  // b_h[o]. So output channel (h*bw + o) gathers input channels (h*bw + i)
+  // with weight W_h[i, o] = W[h, i, o] (row-major [h, i, o]).
+  procedure LoadGate(Layer: TNNetLayer; const WName, BName: string);
+  var
+    h, ci, co, outCh, inCh: integer;
+    Wt, Bt: TNNetVolume;
+  begin
+    if (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> Config.NumHeads) or
+       (Reader.DimSize(WName, 1) <> BlockWidth) or
+       (Reader.DimSize(WName, 2) <> BlockWidth) then
+      ImportError('RecurrentGemma import: "' + WName + '" must have shape [' +
+        IntToStr(Config.NumHeads) + ', ' + IntToStr(BlockWidth) + ', ' +
+        IntToStr(BlockWidth) + '], got ' + Reader.ShapeAsString(WName));
+    EnsureWritableImportWeights(Layer);
+    Wt := TNNetVolume.Create;
+    Bt := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(WName, Wt);
+      Reader.LoadTensorFlat(BName, Bt);
+      for h := 0 to Config.NumHeads - 1 do
+        for co := 0 to BlockWidth - 1 do
+        begin
+          outCh := h * BlockWidth + co;
+          Layer.Neurons[outCh].Weights.Fill(0);
+          for ci := 0 to BlockWidth - 1 do
+          begin
+            inCh := h * BlockWidth + ci;
+            // W[h, ci, co]
+            Layer.Neurons[outCh].Weights.FData[inCh] :=
+              Wt.FData[(h * BlockWidth + ci) * BlockWidth + co];
+          end;
+          Layer.Neurons[outCh].BiasWeight :=
+            Bt.FData[h * BlockWidth + co];
+        end;
+    finally
+      Bt.Free;
+      Wt.Free;
+    end;
+    MarkConsumed(WName);
+    MarkConsumed(BName);
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if Config.NumLayers < 1 then
+        ImportError('RecurrentGemma import: num_hidden_layers must be >= 1.');
+      // Prefix detection.
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('RecurrentGemma import: neither "model.embed_tokens.' +
+          'weight" nor "embed_tokens.weight" found in ' + Reader.FileName +
+          ' - not a recurrent_gemma checkpoint?');
+      if (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('RecurrentGemma import: embed_tokens.weight must have ' +
+          'shape [' + IntToStr(Config.VocabSize) + ', ' +
+          IntToStr(Config.HiddenSize) + '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+      if pSeqLen <= 0 then SeqLen := 2048 else SeqLen := pSeqLen;
+      RotaryDims := Round(Config.HeadDim * Config.PartialRotaryFactor);
+      if Odd(RotaryDims) then Dec(RotaryDims);
+      HalfFFN := Config.Intermediate div 2;
+      BlockWidth := Config.LruWidth div Config.NumHeads;
+      AttnD := Config.NumHeads * Config.HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(KRotated, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(SliceCh, Config.HeadDim);
+      SetLength(RotCh, RotaryDims);
+      SetLength(PassCh, Config.HeadDim - RotaryDims);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        Blocks[BlockCnt].IsAttn :=
+          Config.BlockTypes[BlockCnt] = 'attention';
+        // ---- temporal sub-block: x := x + temporal(RMSNorm(x)) ----
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].TemporalNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        NormedSrc := NN.GetLastLayer();
+        if not Blocks[BlockCnt].IsAttn then
+        begin
+          // RECURRENT block. y = gelu_tanh(linear_y(x));
+          // x_branch = rg_lru(conv(linear_x(x)));  out = linear_out(x_branch*y).
+          Blocks[BlockCnt].LinearY := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.LruWidth), NormedSrc);
+          YBranch := NN.AddLayer( TNNetGELU.Create() );
+          Blocks[BlockCnt].LinearX := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.LruWidth), NormedSrc);
+          Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
+            Config.ConvKernel, {pCausal=}true, {pSuppressBias=}0) );
+          ConvAct := NN.GetLastLayer();
+          // The two gate logit projections (block-diagonal, full Pointwise).
+          Blocks[BlockCnt].IGate := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.LruWidth), ConvAct);
+          Blocks[BlockCnt].AGate := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.LruWidth), ConvAct);
+          // Pack [x | i_logits | a_logits] for the RG-LRU leaf.
+          PackedSlab := NN.AddLayer( TNNetDeepConcat.Create(
+            [ConvAct, Blocks[BlockCnt].IGate, Blocks[BlockCnt].AGate]) );
+          Blocks[BlockCnt].RGLRU := NN.AddLayerAfter(
+            TNNetRGLRU.Create(), PackedSlab);
+          Gated := NN.AddLayer( TNNetCellMulByCell.Create(
+            Blocks[BlockCnt].RGLRU, YBranch) );
+          Blocks[BlockCnt].LinearOut := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize), Gated);
+        end
+        else
+        begin
+          // LOCAL sliding-window GQA attention with partial rotary.
+          Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(AttnD), NormedSrc);
+          Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim),
+            NormedSrc);
+          Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.NumKVHeads * Config.HeadDim),
+            NormedSrc);
+          QSrc := Blocks[BlockCnt].QProj;
+          KSrc := Blocks[BlockCnt].KProj;
+          VSrc := Blocks[BlockCnt].VProj;
+          // K rotated once per KV head; V sliced once per KV head.
+          for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+          begin
+            for d := 0 to RotaryDims - 1 do
+              RotCh[d] := KVHeadCnt * Config.HeadDim + d;
+            for d := 0 to Config.HeadDim - RotaryDims - 1 do
+              PassCh[d] := KVHeadCnt * Config.HeadDim + RotaryDims + d;
+            RotS := NN.AddLayerAfter( TNNetSplitChannels.Create(RotCh), KSrc);
+            RotS := NN.AddLayerAfter(
+              TNNetRotaryEmbedding.Create(Config.RopeTheta), RotS);
+            PassS := NN.AddLayerAfter( TNNetSplitChannels.Create(PassCh), KSrc);
+            KRotated[KVHeadCnt] := NN.AddLayer(
+              TNNetDeepConcat.Create([RotS, PassS]) );
+            for d := 0 to Config.HeadDim - 1 do
+              SliceCh[d] := KVHeadCnt * Config.HeadDim + d;
+            VSlices[KVHeadCnt] := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceCh), VSrc);
+          end;
+          // One SDPA head per query head (GQA: head h shares KV group h div G).
+          for HeadCnt := 0 to Config.NumHeads - 1 do
+          begin
+            for d := 0 to RotaryDims - 1 do
+              RotCh[d] := HeadCnt * Config.HeadDim + d;
+            for d := 0 to Config.HeadDim - RotaryDims - 1 do
+              PassCh[d] := HeadCnt * Config.HeadDim + RotaryDims + d;
+            RotS := NN.AddLayerAfter( TNNetSplitChannels.Create(RotCh), QSrc);
+            RotS := NN.AddLayerAfter(
+              TNNetRotaryEmbedding.Create(Config.RopeTheta), RotS);
+            PassS := NN.AddLayerAfter( TNNetSplitChannels.Create(PassCh), QSrc);
+            QSlice := NN.AddLayer( TNNetDeepConcat.Create([RotS, PassS]) );
+            KVHeadCnt := HeadCnt div GroupSize;
+            // Pack [Q|K|V] for this head: SDPA reads the 3*head_dim slab.
+            AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(
+              [QSlice, KRotated[KVHeadCnt], VSlices[KVHeadCnt]]) );
+            HeadOutputs[HeadCnt] := NN.AddLayer(
+              TNNetScaledDotProductAttention.Create(Config.HeadDim,
+                {CausalMask=}true, {Window=}Config.Window) );
+          end;
+          NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+          Blocks[BlockCnt].OProj := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        end;
+        // Residual sum (temporal).
+        Residual := NN.AddLayer(
+          TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // ---- channel sub-block: x := residual + GEGLU(RMSNorm(residual)) ----
+        Blocks[BlockCnt].ChannelNorm := NN.AddLayerAfter(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps), Residual);
+        MlpNormed := NN.GetLastLayer();
+        Blocks[BlockCnt].Gate := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(HalfFFN), MlpNormed);
+        GateAct := NN.AddLayer( TNNetGELU.Create() );
+        Blocks[BlockCnt].Up := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(HalfFFN), MlpNormed);
+        UpAct := NN.GetLastLayer();
+        GegluProd := NN.AddLayer( TNNetCellMulByCell.Create(GateAct, UpAct) );
+        Blocks[BlockCnt].Down := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize), GegluProd);
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), Residual]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if Config.LogitSoftCap > 0 then
+        NN.AddLayer( TNNetSoftCapping.Create(Config.LogitSoftCap) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+      // Tied head reads UNSCALED rows; embedding then gets *sqrt(hidden).
+      EnsureWritableImportWeights(LMHead);
+      for j := 0 to Config.VocabSize - 1 do
+      begin
+        for i := 0 to Config.HiddenSize - 1 do
+          LMHead.Neurons[j].Weights.FData[i] :=
+            Tmp.FData[j * Config.HiddenSize + i];
+        LMHead.Neurons[j].BiasWeight := 0;
+      end;
+      LMHead.FlushWeightCache();
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.Neurons[0].Weights.Mul(Sqrt(Config.HiddenSize));
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+      if Reader.HasTensor('lm_head.weight') then MarkConsumed('lm_head.weight');
+
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        MixP := LayerP + 'temporal_block.';
+        // Gemma RMSNorm gain = 1 + w.
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].TemporalNorm,
+          LayerP + 'temporal_pre_norm.weight', Config.HiddenSize, 1.0);
+        MarkConsumed(LayerP + 'temporal_pre_norm.weight');
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].ChannelNorm,
+          LayerP + 'channel_pre_norm.weight', Config.HiddenSize, 1.0);
+        MarkConsumed(LayerP + 'channel_pre_norm.weight');
+        if not Blocks[BlockCnt].IsAttn then
+        begin
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].LinearY,
+            MixP + 'linear_y.weight', Config.HiddenSize, Config.LruWidth,
+            0, -1, 0, MixP + 'linear_y.bias');
+          MarkConsumed(MixP + 'linear_y.weight');
+          MarkConsumed(MixP + 'linear_y.bias');
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].LinearX,
+            MixP + 'linear_x.weight', Config.HiddenSize, Config.LruWidth,
+            0, -1, 0, MixP + 'linear_x.bias');
+          MarkConsumed(MixP + 'linear_x.weight');
+          MarkConsumed(MixP + 'linear_x.bias');
+          LoadConv(Blocks[BlockCnt].Conv, MixP + 'conv_1d.weight',
+            MixP + 'conv_1d.bias');
+          LoadGate(Blocks[BlockCnt].IGate,
+            MixP + 'rg_lru.input_gate_weight', MixP + 'rg_lru.input_gate_bias');
+          LoadGate(Blocks[BlockCnt].AGate,
+            MixP + 'rg_lru.recurrent_gate_weight',
+            MixP + 'rg_lru.recurrent_gate_bias');
+          // recurrent_param -> Lambda (raw copy; the layer applies softplus).
+          Reader.LoadTensorFlat(MixP + 'rg_lru.recurrent_param', Tmp);
+          for d := 0 to Config.LruWidth - 1 do
+            Blocks[BlockCnt].RGLRU.Neurons[0].Weights.FData[d] := Tmp.FData[d];
+          Blocks[BlockCnt].RGLRU.FlushWeightCache();
+          MarkConsumed(MixP + 'rg_lru.recurrent_param');
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].LinearOut,
+            MixP + 'linear_out.weight', Config.LruWidth, Config.HiddenSize,
+            0, -1, 0, MixP + 'linear_out.bias');
+          MarkConsumed(MixP + 'linear_out.weight');
+          MarkConsumed(MixP + 'linear_out.bias');
+        end
+        else
+        begin
+          if Config.AttentionBias then QkvBias := MixP + 'q_proj.bias'
+          else QkvBias := '';
+          // q/k get the rotate_half->interleaved permutation over the rotary
+          // slice (RotaryHeadDim=head_dim, RotaryDims=partial slice).
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+            MixP + 'q_proj.weight', Config.HiddenSize, AttnD, 0, -1,
+            Config.HeadDim, QkvBias, 1.0, RotaryDims);
+          MarkConsumed(MixP + 'q_proj.weight');
+          if QkvBias <> '' then MarkConsumed(QkvBias);
+          if Config.AttentionBias then QkvBias := MixP + 'k_proj.bias'
+          else QkvBias := '';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+            MixP + 'k_proj.weight', Config.HiddenSize,
+            Config.NumKVHeads * Config.HeadDim, 0, -1,
+            Config.HeadDim, QkvBias, 1.0, RotaryDims);
+          MarkConsumed(MixP + 'k_proj.weight');
+          if QkvBias <> '' then MarkConsumed(QkvBias);
+          if Config.AttentionBias then QkvBias := MixP + 'v_proj.bias'
+          else QkvBias := '';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+            MixP + 'v_proj.weight', Config.HiddenSize,
+            Config.NumKVHeads * Config.HeadDim, 0, -1, 0, QkvBias);
+          MarkConsumed(MixP + 'v_proj.weight');
+          if QkvBias <> '' then MarkConsumed(QkvBias);
+          // o_proj ALWAYS has a bias in recurrentgemma.
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+            MixP + 'o_proj.weight', AttnD, Config.HiddenSize, 0, -1, 0,
+            MixP + 'o_proj.bias');
+          MarkConsumed(MixP + 'o_proj.weight');
+          MarkConsumed(MixP + 'o_proj.bias');
+        end;
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Gate,
+          LayerP + 'mlp_block.gate_proj.weight', Config.HiddenSize, HalfFFN,
+          0, -1, 0, LayerP + 'mlp_block.gate_proj.bias');
+        MarkConsumed(LayerP + 'mlp_block.gate_proj.weight');
+        MarkConsumed(LayerP + 'mlp_block.gate_proj.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Up,
+          LayerP + 'mlp_block.up_proj.weight', Config.HiddenSize, HalfFFN,
+          0, -1, 0, LayerP + 'mlp_block.up_proj.bias');
+        MarkConsumed(LayerP + 'mlp_block.up_proj.weight');
+        MarkConsumed(LayerP + 'mlp_block.up_proj.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
+          LayerP + 'mlp_block.down_proj.weight', HalfFFN, Config.HiddenSize,
+          0, -1, 0, LayerP + 'mlp_block.down_proj.bias');
+        MarkConsumed(LayerP + 'mlp_block.down_proj.weight');
+        MarkConsumed(LayerP + 'mlp_block.down_proj.bias');
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadLlamaRMSNormWeights(Reader, FinalNorm,
+        Config.Prefix + 'final_norm.weight', Config.HiddenSize, 1.0);
+      MarkConsumed(Config.Prefix + 'final_norm.weight');
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('RecurrentGemma import: unexpected tensor "' +
+          TensorNameStr + '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildRecurrentGemmaFromSafeTensorsEx(const FileName: string;
+  out Config: TRecurrentGemmaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRecurrentGemmaConfigFromJSONFile(ConfigPath);
+  Result := BuildRecurrentGemmaFromSafeTensorsWithConfig(FileName, Config,
+    pSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildRecurrentGemmaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TRecurrentGemmaConfig;
+begin
+  Result := BuildRecurrentGemmaFromSafeTensorsEx(FileName, IgnoredConfig,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+// ============================ JAMBA IMPORT (impl) =========================
+
+function ReadJambaConfigFromJSONFile(const FileName: string): TJambaConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+  Field: TJSONData;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Jamba import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Jamba import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Jamba import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Jamba import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Jamba import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'jamba');
+    if ModelType <> 'jamba' then
+      ImportError('Jamba import: config model_type is "' + ModelType +
+        '" - expected "jamba".');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if (Result.NumKVHeads < 1) or
+       ((Result.NumHeads mod Result.NumKVHeads) <> 0) then
+      ImportError('Jamba import: num_key_value_heads (' +
+        IntToStr(Result.NumKVHeads) + ') must divide num_attention_heads (' +
+        IntToStr(Result.NumHeads) + ').');
+    Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-6);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    Result.NumExperts := Obj.Get('num_experts', 16);
+    Result.NumExpertsPerTok := Obj.Get('num_experts_per_tok', 2);
+    Result.ExpertLayerPeriod := Obj.Get('expert_layer_period', 2);
+    Result.ExpertLayerOffset := Obj.Get('expert_layer_offset', 1);
+    Result.AttnLayerPeriod := Obj.Get('attn_layer_period', 8);
+    Result.AttnLayerOffset := Obj.Get('attn_layer_offset', 4);
+    if (Result.AttnLayerOffset >= Result.AttnLayerPeriod) or
+       (Result.ExpertLayerOffset >= Result.ExpertLayerPeriod) then
+      ImportError('Jamba import: layer offset must be smaller than its ' +
+        'period (HF validate_architecture).');
+    Result.MambaDState := Obj.Get('mamba_d_state', 16);
+    Result.MambaDConv := Obj.Get('mamba_d_conv', 4);
+    Result.MambaExpand := Obj.Get('mamba_expand', 2);
+    Field := Obj.Find('mamba_dt_rank');
+    if (Field = nil) or Field.IsNull or
+       ((Field is TJSONString) and (Field.AsString = 'auto')) then
+      Result.MambaDtRank := (Result.HiddenSize + 15) div 16
+    else
+      Result.MambaDtRank := RequiredInt('mamba_dt_rank');
+    Result.MambaConvBias := Obj.Get('mamba_conv_bias', True);
+    Result.MambaProjBias := Obj.Get('mamba_proj_bias', False);
+    if Result.MambaProjBias then
+      ImportError('Jamba import: mamba_proj_bias=true is not wired (the ' +
+        'published Jamba checkpoints keep in/out_proj bias-free).');
+    Result.DInner := Result.MambaExpand * Result.HiddenSize;
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function JambaConfigToString(const Config: TJambaConfig): string;
+begin
+  Result := 'jamba config: layers=' + IntToStr(Config.NumLayers) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', inter=' + IntToStr(Config.IntermediateSize) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', experts=' + IntToStr(Config.NumExperts) +
+    ', top_k=' + IntToStr(Config.NumExpertsPerTok) +
+    ', attn(period=' + IntToStr(Config.AttnLayerPeriod) +
+    ',offset=' + IntToStr(Config.AttnLayerOffset) + ')' +
+    ', expert(period=' + IntToStr(Config.ExpertLayerPeriod) +
+    ',offset=' + IntToStr(Config.ExpertLayerOffset) + ')' +
+    ', d_inner=' + IntToStr(Config.DInner) +
+    ', d_state=' + IntToStr(Config.MambaDState) +
+    ', dt_rank=' + IntToStr(Config.MambaDtRank) +
+    ', conv_kernel=' + IntToStr(Config.MambaDConv);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+function JambaLayerIsAttention(const Config: TJambaConfig;
+  LayerIdx: integer): boolean;
+begin
+  Result := (LayerIdx mod Config.AttnLayerPeriod) = Config.AttnLayerOffset;
+end;
+
+function JambaLayerIsMoE(const Config: TJambaConfig;
+  LayerIdx: integer): boolean;
+begin
+  Result := (Config.NumExperts > 1) and
+    ((LayerIdx mod Config.ExpertLayerPeriod) = Config.ExpertLayerOffset);
+end;
+
+type
+  TJambaBlockLayers = record
+    InNorm, FfNorm: TNNetLayer;
+    // attention
+    QProj, KProj, VProj, OProj: TNNetLayer;
+    // mamba mixer
+    InProj, Conv, Scan, OutProj: TNNetLayer;
+    // dense FFN
+    GateUp, Down: TNNetLayer;
+    // MoE FFN
+    GateConv: TNNetLayer;
+    ExpertGateUp, ExpertDown: array of TNNetLayer;
+  end;
+
+function BuildJambaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TJambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TJambaBlockLayers;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSrc, ScanL, ZGate, Gated: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack, ExpertOut, GateTopK, GateE, GateEB: TNNetLayer;
+  KSlices, VSlices: array of TNNetLayer;
+  HeadOutputs, MoEBranches: array of TNNetLayer;
+  BlockCnt, SeqLen, i, j, HeadDim, QWidth, KVWidth, GroupSize: integer;
+  HeadCnt, KVHeadCnt, KVGroup, d, e: integer;
+  Tmp, XW, DtW: TNNetVolume;
+  MixP, FfP, AttP, LayerP, TensorNameStr: string;
+  Consumed: TStringList;
+  ConvBiasSuppress, NS, DI, RK: integer;
+  SliceChannels: array of integer;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // conv1d.weight [d_inner,1,k] (+ bias) into TNNetDepthwiseConv1D, exactly
+  // like the plain Mamba importer.
+  procedure LoadDepthwiseConv(Layer: TNNetLayer; const WName, BName: string);
+  var dd, kk: integer;
+  begin
+    if (not Reader.HasTensor(WName)) or (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> Config.DInner) or
+       (Reader.DimSize(WName, 1) <> 1) or
+       (Reader.DimSize(WName, 2) <> Config.MambaDConv) then
+      ImportError('Jamba import: "' + WName + '" must have shape [' +
+        IntToStr(Config.DInner) + ', 1, ' + IntToStr(Config.MambaDConv) +
+        '], got ' + Reader.ShapeAsString(WName));
+    Reader.LoadTensorFlat(WName, Tmp);
+    for dd := 0 to Config.DInner - 1 do
+      for kk := 0 to Config.MambaDConv - 1 do
+        Layer.Neurons[dd].Weights.FData[kk] :=
+          Tmp.FData[dd * Config.MambaDConv + kk];
+    MarkConsumed(WName);
+    if Config.MambaConvBias then
+    begin
+      Reader.LoadTensorFlat(BName, Tmp);
+      for dd := 0 to Config.DInner - 1 do
+        Layer.Neurons[dd].BiasWeight := Tmp.FData[dd];
+      MarkConsumed(BName);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+  procedure LoadVec(Layer: TNNetLayer; NeuronIdx: integer;
+    const TName: string; Cnt: integer);
+  var dd: integer;
+  begin
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Tmp.Size <> Cnt then
+      ImportError('Jamba import: "' + TName + '" must carry ' +
+        IntToStr(Cnt) + ' elements, got ' + Reader.ShapeAsString(TName));
+    for dd := 0 to Cnt - 1 do
+      Layer.Neurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
+    Layer.FlushWeightCache();
+    MarkConsumed(TName);
+  end;
+
+  // Jamba inner-norm SSM weights. Unlike plain Mamba, dt stays UNFOLDED:
+  // [0]=dt_proj.weight (DI,RK), [6]=x_proj_dt (RK,DI). W_B/W_C are the
+  // remaining x_proj rows; the three inner gains go to [7..9].
+  procedure LoadJambaScan(Layer: TNNetLayer; const MixPfx: string);
+  var d, j, r, s: integer;
+  begin
+    if (not Reader.HasTensor(MixPfx + 'x_proj.weight')) or
+       (Reader.DimSize(MixPfx + 'x_proj.weight', 0) <> RK + 2 * NS) or
+       (Reader.DimSize(MixPfx + 'x_proj.weight', 1) <> DI) then
+      ImportError('Jamba import: "' + MixPfx + 'x_proj.weight" must be [' +
+        IntToStr(RK + 2 * NS) + ', ' + IntToStr(DI) + '].');
+    if (not Reader.HasTensor(MixPfx + 'dt_proj.weight')) or
+       (Reader.DimSize(MixPfx + 'dt_proj.weight', 0) <> DI) or
+       (Reader.DimSize(MixPfx + 'dt_proj.weight', 1) <> RK) then
+      ImportError('Jamba import: "' + MixPfx + 'dt_proj.weight" must be [' +
+        IntToStr(DI) + ', ' + IntToStr(RK) + '].');
+    Reader.LoadTensorFlat(MixPfx + 'x_proj.weight', XW);
+    Reader.LoadTensorFlat(MixPfx + 'dt_proj.weight', DtW);
+    // [0] dt_proj.weight (DI rows of RK), [6] x_proj_dt (RK rows of DI).
+    for d := 0 to DI - 1 do
+      for r := 0 to RK - 1 do
+        Layer.Neurons[0].Weights.FData[d * RK + r] := DtW.FData[d * RK + r];
+    for r := 0 to RK - 1 do
+      for j := 0 to DI - 1 do
+        Layer.Neurons[6].Weights.FData[r * DI + j] := XW.FData[r * DI + j];
+    // W_B / W_C: the d_state + d_state rows after the dt rows.
+    for s := 0 to NS - 1 do
+      for j := 0 to DI - 1 do
+      begin
+        Layer.Neurons[1].Weights.FData[s * DI + j] := XW.FData[(RK + s) * DI + j];
+        Layer.Neurons[2].Weights.FData[s * DI + j] := XW.FData[(RK + NS + s) * DI + j];
+      end;
+    MarkConsumed(MixPfx + 'x_proj.weight');
+    MarkConsumed(MixPfx + 'dt_proj.weight');
+    LoadVec(Layer, 3, MixPfx + 'dt_proj.bias', DI);       // b_d
+    LoadVec(Layer, 4, MixPfx + 'A_log', DI * NS);         // A_raw (raw copy)
+    LoadVec(Layer, 5, MixPfx + 'D', DI);                  // D skip
+    LoadVec(Layer, 7, MixPfx + 'dt_layernorm.weight', RK);// dt inner gain
+    LoadVec(Layer, 8, MixPfx + 'b_layernorm.weight', NS); // B inner gain
+    LoadVec(Layer, 9, MixPfx + 'c_layernorm.weight', NS); // C inner gain
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  XW := TNNetVolume.Create;
+  DtW := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if Config.NumLayers < 1 then
+        ImportError('Jamba import: num_hidden_layers must be >= 1.');
+      if Reader.HasTensor('model.embed_tokens.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embed_tokens.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Jamba import: neither "model.embed_tokens.weight" nor ' +
+          '"embed_tokens.weight" found in ' + Reader.FileName +
+          ' - not a Jamba checkpoint?');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      QWidth := Config.NumHeads * HeadDim;
+      KVWidth := Config.NumKVHeads * HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+      NS := Config.MambaDState;
+      DI := Config.DInner;
+      RK := Config.MambaDtRank;
+      if Config.MambaConvBias then ConvBiasSuppress := 0
+      else ConvBiasSuppress := 1;
+      if pSeqLen <= 0 then SeqLen := 1024 else SeqLen := pSeqLen;
+
+      // ---------------- Architecture (NO positional encoding) ----------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(KSlices, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // ---- mixer sub-block: x := x + Mixer(input_layernorm(x)) ----
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].InNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        NormedSrc := NN.GetLastLayer();
+        if JambaLayerIsAttention(Config, BlockCnt) then
+        begin
+          // Bias-free GQA, NoPE. Pack [Q_h|K_g|V_g] per query head -> SDPA.
+          Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(QWidth, 1), NormedSrc);
+          Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+          Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+          for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+          begin
+            for d := 0 to HeadDim - 1 do
+              SliceChannels[d] := KVHeadCnt * HeadDim + d;
+            KSlices[KVHeadCnt] := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
+            VSlices[KVHeadCnt] := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
+          end;
+          for HeadCnt := 0 to Config.NumHeads - 1 do
+          begin
+            KVGroup := HeadCnt div GroupSize;
+            for d := 0 to HeadDim - 1 do
+              SliceChannels[d] := HeadCnt * HeadDim + d;
+            QSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
+            HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+              [QSlice, KSlices[KVGroup], VSlices[KVGroup]]) );
+            HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+              TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true),
+              HeadPack);
+          end;
+          NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+          Blocks[BlockCnt].OProj := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+        end
+        else
+        begin
+          // Mamba mixer (HF JambaMambaMixer): in_proj x|z split, depthwise
+          // causal conv1d + SiLU, the inner-norm selective scan, SiLU(z)
+          // gate, out_proj.
+          Blocks[BlockCnt].InProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(2 * DI, 1), NormedSrc);
+          NN.AddLayerAfter( TNNetSplitChannels.Create(0, DI),
+            Blocks[BlockCnt].InProj );
+          Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
+            Config.MambaDConv, {pCausal=}true, ConvBiasSuppress) );
+          NN.AddLayer( TNNetSiLU.Create() );
+          Blocks[BlockCnt].Scan := NN.AddLayer(
+            TNNetSelectiveSSM.CreateJambaInner(NS, RK, Config.RmsNormEps) );
+          ScanL := Blocks[BlockCnt].Scan;
+          NN.AddLayerAfter( TNNetSplitChannels.Create(DI, DI),
+            Blocks[BlockCnt].InProj );
+          ZGate := NN.AddLayer( TNNetSiLU.Create() );
+          Gated := NN.AddLayer( TNNetCellMulByCell.Create(ScanL, ZGate) );
+          Blocks[BlockCnt].OutProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1), Gated );
+        end;
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+
+        // ---- FFN sub-block: x := x + FFN(pre_ff_layernorm(x)) ----
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].FfNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+        NormedSrc := NN.GetLastLayer();
+        if JambaLayerIsMoE(Config, BlockCnt) then
+        begin
+          // Mixtral combine but NOT renormalized (HF JambaSparseMoeBlock
+          // takes the RAW top-k softmax probs).
+          SetLength(Blocks[BlockCnt].ExpertGateUp, Config.NumExperts);
+          SetLength(Blocks[BlockCnt].ExpertDown, Config.NumExperts);
+          SetLength(MoEBranches, Config.NumExperts);
+          Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.NumExperts), NormedSrc);
+          NN.AddLayer( TNNetPointwiseSoftMax.Create() );
+          GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+            Config.NumExpertsPerTok, {pRenormalize=}false) );
+          for e := 0 to Config.NumExperts - 1 do
+          begin
+            Blocks[BlockCnt].ExpertGateUp[e] := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize),
+              NormedSrc);
+            NN.AddLayer( TNNetSwiGLU.Create() );
+            Blocks[BlockCnt].ExpertDown[e] := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+            ExpertOut := NN.GetLastLayer();
+            GateE := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(e, 1), GateTopK);
+            GateEB := NN.AddLayer(
+              TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
+            MoEBranches[e] := NN.AddLayer(
+              TNNetCellMulByCell.Create(ExpertOut, GateEB) );
+          end;
+          NN.AddLayer( TNNetSum.Create(MoEBranches) );
+          SetLength(MoEBranches, 0);
+        end
+        else
+        begin
+          Blocks[BlockCnt].GateUp := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(2 * Config.IntermediateSize) );
+          NN.AddLayer( TNNetSwiGLU.Create() );
+          Blocks[BlockCnt].Down := NN.AddLayer(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        end;
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalNorm := NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps) );
+      LMHead := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
+      if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+        ImportError('Jamba import: embed_tokens.weight size mismatch.');
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(Config.Prefix + 'embed_tokens.weight');
+      if Config.TieWordEmbeddings then
+      begin
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then MarkConsumed('lm_head.weight');
+      end
+      else
+      begin
+        LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+          Config.HiddenSize, Config.VocabSize);
+        MarkConsumed('lm_head.weight');
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].InNorm,
+          LayerP + 'input_layernorm.weight', Config.HiddenSize);
+        MarkConsumed(LayerP + 'input_layernorm.weight');
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].FfNorm,
+          LayerP + 'pre_ff_layernorm.weight', Config.HiddenSize);
+        MarkConsumed(LayerP + 'pre_ff_layernorm.weight');
+        if JambaLayerIsAttention(Config, BlockCnt) then
+        begin
+          AttP := LayerP + 'self_attn.';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+            AttP + 'q_proj.weight', Config.HiddenSize, QWidth);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+            AttP + 'k_proj.weight', Config.HiddenSize, KVWidth);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+            AttP + 'v_proj.weight', Config.HiddenSize, KVWidth);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+            AttP + 'o_proj.weight', QWidth, Config.HiddenSize);
+          MarkConsumed(AttP + 'q_proj.weight');
+          MarkConsumed(AttP + 'k_proj.weight');
+          MarkConsumed(AttP + 'v_proj.weight');
+          MarkConsumed(AttP + 'o_proj.weight');
+        end
+        else
+        begin
+          MixP := LayerP + 'mamba.';
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].InProj,
+            MixP + 'in_proj.weight', Config.HiddenSize, 2 * DI);
+          MarkConsumed(MixP + 'in_proj.weight');
+          LoadDepthwiseConv(Blocks[BlockCnt].Conv,
+            MixP + 'conv1d.weight', MixP + 'conv1d.bias');
+          LoadJambaScan(Blocks[BlockCnt].Scan, MixP);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutProj,
+            MixP + 'out_proj.weight', DI, Config.HiddenSize);
+          MarkConsumed(MixP + 'out_proj.weight');
+        end;
+        FfP := LayerP + 'feed_forward.';
+        if JambaLayerIsMoE(Config, BlockCnt) then
+        begin
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateConv,
+            FfP + 'router.weight', Config.HiddenSize, Config.NumExperts);
+          MarkConsumed(FfP + 'router.weight');
+          for e := 0 to Config.NumExperts - 1 do
+          begin
+            // SwiGLU fused: up_proj (w3) in 0..I-1, gate_proj (w1) in I..2I-1.
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[e],
+              FfP + 'experts.' + IntToStr(e) + '.up_proj.weight',
+              Config.HiddenSize, Config.IntermediateSize, 0,
+              2 * Config.IntermediateSize);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[e],
+              FfP + 'experts.' + IntToStr(e) + '.gate_proj.weight',
+              Config.HiddenSize, Config.IntermediateSize,
+              Config.IntermediateSize, 2 * Config.IntermediateSize);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertDown[e],
+              FfP + 'experts.' + IntToStr(e) + '.down_proj.weight',
+              Config.IntermediateSize, Config.HiddenSize);
+            MarkConsumed(FfP + 'experts.' + IntToStr(e) + '.up_proj.weight');
+            MarkConsumed(FfP + 'experts.' + IntToStr(e) + '.gate_proj.weight');
+            MarkConsumed(FfP + 'experts.' + IntToStr(e) + '.down_proj.weight');
+          end;
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+            FfP + 'up_proj.weight', Config.HiddenSize,
+            Config.IntermediateSize, 0, 2 * Config.IntermediateSize);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
+            FfP + 'gate_proj.weight', Config.HiddenSize,
+            Config.IntermediateSize, Config.IntermediateSize,
+            2 * Config.IntermediateSize);
+          LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Down,
+            FfP + 'down_proj.weight', Config.IntermediateSize,
+            Config.HiddenSize);
+          MarkConsumed(FfP + 'up_proj.weight');
+          MarkConsumed(FfP + 'gate_proj.weight');
+          MarkConsumed(FfP + 'down_proj.weight');
+        end;
+      end;
+      LoadLlamaRMSNormWeights(Reader, FinalNorm,
+        Config.Prefix + 'final_layernorm.weight', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'final_layernorm.weight');
+
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Jamba import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    DtW.Free;
+    XW.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildJambaFromSafeTensorsEx(const FileName: string;
+  out Config: TJambaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadJambaConfigFromJSONFile(ConfigPath);
+  Result := BuildJambaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildJambaFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TJambaConfig;
+begin
+  Result := BuildJambaFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+// ====================== NEMOTRON-H IMPORT (impl) =========================
+
+// True iff the parsed Nemotron-H schedule contains at least one block of the
+// given type. Used to make MoE-specific config keys required ONLY when an 'E'
+// block is actually on the schedule.
+function NemotronHHasBlock(const Config: TNemotronHConfig;
+  Bt: TNemotronHBlockType): boolean;
+var i: integer;
+begin
+  Result := False;
+  for i := 0 to Length(Config.BlockTypes) - 1 do
+    if Config.BlockTypes[i] = Bt then exit(True);
+end;
+
+function ReadNemotronHConfigFromJSONFile(
+  const FileName: string): TNemotronHConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, Pattern: string;
+  Field, ListData: TJSONData;
+  Arr: TJSONArray;
+  i: integer;
+  ch, sb: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Nemotron-H import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Nemotron-H import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Nemotron-H import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Nemotron-H import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Nemotron-H import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'nemotron_h');
+    if ModelType <> 'nemotron_h' then
+      ImportError('Nemotron-H import: config model_type is "' + ModelType +
+        '" - expected "nemotron_h".');
+    Result.ModelType := ModelType;
+
+    // ---- block schedule: hybrid_override_pattern (string) OR
+    //      layers_block_type (list of "mamba"/"attention"/"mlp"/"moe") ----
+    Pattern := '';
+    Field := Obj.Find('hybrid_override_pattern');
+    if (Field <> nil) and (Field.JSONType = jtString) then
+      Pattern := Field.AsString;
+    if Pattern = '' then
+    begin
+      ListData := Obj.Find('layers_block_type');
+      if (ListData <> nil) and (ListData.JSONType = jtArray) then
+      begin
+        Arr := TJSONArray(ListData);
+        for i := 0 to Arr.Count - 1 do
+        begin
+          sb := LowerCase(Arr.Strings[i]);
+          if sb = 'mamba' then Pattern := Pattern + 'M'
+          else if sb = 'attention' then Pattern := Pattern + '*'
+          else if sb = 'mlp' then Pattern := Pattern + '-'
+          else if sb = 'moe' then Pattern := Pattern + 'E'
+          else
+            ImportError('Nemotron-H import: layers_block_type entry "' + sb +
+              '" is not one of mamba/attention/mlp/moe.');
+        end;
+      end;
+    end;
+    if Pattern = '' then
+      ImportError('Nemotron-H import: config has neither a non-empty ' +
+        '"hybrid_override_pattern" string nor a "layers_block_type" list.');
+    Result.Pattern := Pattern;
+    Result.NumLayers := Length(Pattern);
+    SetLength(Result.BlockTypes, Result.NumLayers);
+    for i := 1 to Length(Pattern) do
+    begin
+      ch := Pattern[i];
+      if ch = 'M' then Result.BlockTypes[i - 1] := nhMamba2
+      else if ch = '*' then Result.BlockTypes[i - 1] := nhAttention
+      else if ch = '-' then Result.BlockTypes[i - 1] := nhMLP
+      else if ch = 'E' then Result.BlockTypes[i - 1] := nhMoE
+      else
+        ImportError('Nemotron-H import: unknown block-type char "' + ch +
+          '" in pattern "' + Pattern + '" (expected M, *, -, E).');
+    end;
+
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.NumKVHeads := Obj.Get('num_key_value_heads', Result.NumHeads);
+    if Result.NumKVHeads < 1 then
+      ImportError('Nemotron-H import: num_key_value_heads must be >= 1.');
+    if Result.NumHeads mod Result.NumKVHeads <> 0 then
+      ImportError('Nemotron-H import: num_attention_heads (' +
+        IntToStr(Result.NumHeads) + ') must be divisible by ' +
+        'num_key_value_heads (' + IntToStr(Result.NumKVHeads) + ').');
+    Field := Obj.Find('head_dim');
+    if (Field = nil) or Field.IsNull then
+      Result.HeadDim := Result.HiddenSize div Result.NumHeads
+    else
+      Result.HeadDim := RequiredInt('head_dim');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+
+    // ---- MoE ('E' block) config (only required if the schedule has an 'E') ----
+    Result.NumRoutedExperts := Obj.Get('n_routed_experts', 0);
+    Result.NumExpertsPerTok := Obj.Get('num_experts_per_tok', 0);
+    Result.MoEIntermediateSize := Obj.Get('moe_intermediate_size', 0);
+    Result.NumSharedExperts := Obj.Get('n_shared_experts', 0);
+    Result.SharedExpertInterSize := Obj.Get('moe_shared_expert_intermediate_size',
+      Result.MoEIntermediateSize);
+    Result.NormTopKProb := Obj.Get('norm_topk_prob', True);
+    Field := Obj.Find('routed_scaling_factor');
+    if (Field <> nil) and (Field.JSONType in [jtNumber]) then
+      Result.RoutedScalingFactor := Field.AsFloat
+    else
+      Result.RoutedScalingFactor := 1.0;
+    if NemotronHHasBlock(Result, nhMoE) then
+    begin
+      if Result.NumRoutedExperts < 1 then
+        ImportError('Nemotron-H import: an ''E'' (MoE) block is on the schedule ' +
+          'but n_routed_experts (' + IntToStr(Result.NumRoutedExperts) +
+          ') is < 1.');
+      if (Result.NumExpertsPerTok < 1) or
+         (Result.NumExpertsPerTok > Result.NumRoutedExperts) then
+        ImportError('Nemotron-H import: num_experts_per_tok (' +
+          IntToStr(Result.NumExpertsPerTok) + ') must be in 1..n_routed_experts (' +
+          IntToStr(Result.NumRoutedExperts) + ').');
+      if Result.MoEIntermediateSize < 1 then
+        ImportError('Nemotron-H import: moe_intermediate_size must be >= 1 ' +
+          'for an ''E'' block.');
+      if Obj.Get('n_group', 1) > 1 then
+        ImportError('Nemotron-H import: grouped routing (n_group>1) is not ' +
+          'wired; only the ungrouped DeepSeek-V3-style top-k path is supported.');
+      Field := Obj.Find('moe_latent_size');
+      if (Field <> nil) and (not Field.IsNull) and (Field.AsInteger > 0) then
+        ImportError('Nemotron-H import: moe_latent_size (latent expert ' +
+          'projection) is not wired.');
+      if Result.NumSharedExperts > 1 then
+        ImportError('Nemotron-H import: n_shared_experts>1 is not wired (the ' +
+          'published Nemotron-H-MoE checkpoints carry a single shared expert).');
+      if Obj.Get('moe_bias', False) or Obj.Get('mlp_bias', False) then
+        ImportError('Nemotron-H import: biased MoE/MLP projections are not ' +
+          'wired (the published checkpoints keep the relu2 experts bias-free).');
+    end;
+
+    Result.StateSize := Obj.Get('ssm_state_size', 128);
+    if Result.StateSize < 1 then
+      ImportError('Nemotron-H import: ssm_state_size must be >= 1.');
+    Result.MambaNumHeads := RequiredInt('mamba_num_heads');
+    Result.MambaHeadDim := RequiredInt('mamba_head_dim');
+    Result.DInner := Result.MambaNumHeads * Result.MambaHeadDim;
+    Result.NGroups := Obj.Get('n_groups', 8);
+    if Result.NGroups < 1 then
+      ImportError('Nemotron-H import: n_groups must be >= 1.');
+    if Result.MambaNumHeads mod Result.NGroups <> 0 then
+      ImportError('Nemotron-H import: mamba_num_heads (' +
+        IntToStr(Result.MambaNumHeads) + ') must be divisible by n_groups (' +
+        IntToStr(Result.NGroups) + ').');
+    Result.ConvKernel := Obj.Get('conv_kernel', 4);
+    if Result.ConvKernel < 1 then
+      ImportError('Nemotron-H import: conv_kernel must be >= 1.');
+    Result.UseConvBias := Obj.Get('use_conv_bias', True);
+    Result.UseBias := Obj.Get('use_bias', False);
+    if Obj.Get('mamba_proj_bias', False) then
+      Result.UseBias := True;
+    if Obj.Get('attention_bias', False) then
+      ImportError('Nemotron-H import: attention_bias=true is not wired (the ' +
+        'published Nemotron-H checkpoints keep q/k/v/o bias-free).');
+    if Obj.Get('mlp_bias', False) then
+      ImportError('Nemotron-H import: mlp_bias=true is not wired (the ' +
+        'published Nemotron-H checkpoints keep the relu2 MLP bias-free).');
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', False);
+    Result.Prefix := '';
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function NemotronHConfigToString(const Config: TNemotronHConfig): string;
+begin
+  Result := 'nemotron_h config: pattern="' + Config.Pattern + '"' +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', head_dim=' + IntToStr(Config.HeadDim) +
+    ', mlp_inter=' + IntToStr(Config.IntermediateSize) +
+    ', d_inner=' + IntToStr(Config.DInner) +
+    ', d_state=' + IntToStr(Config.StateSize) +
+    ', mamba_heads=' + IntToStr(Config.MambaNumHeads) +
+    ', mamba_head_dim=' + IntToStr(Config.MambaHeadDim) +
+    ', n_groups=' + IntToStr(Config.NGroups) +
+    ', conv_kernel=' + IntToStr(Config.ConvKernel) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', conv_bias=' + BoolToStr(Config.UseConvBias, true) +
+    ', bias=' + BoolToStr(Config.UseBias, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if NemotronHHasBlock(Config, nhMoE) then
+    Result := Result +
+      ', routed_experts=' + IntToStr(Config.NumRoutedExperts) +
+      ', experts_per_tok=' + IntToStr(Config.NumExpertsPerTok) +
+      ', moe_inter=' + IntToStr(Config.MoEIntermediateSize) +
+      ', shared_experts=' + IntToStr(Config.NumSharedExperts) +
+      ', shared_inter=' + IntToStr(Config.SharedExpertInterSize) +
+      ', norm_topk=' + BoolToStr(Config.NormTopKProb, true) +
+      ', routed_scale=' + FloatToStr(Config.RoutedScalingFactor);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+type
+  TNemotronHBlockLayers = record
+    Norm: TNNetLayer;
+    // mamba2 mixer
+    InProj, Conv, Scan, OutProj: TNNetLayer;
+    // attention
+    QProj, KProj, VProj, OProj: TNNetLayer;
+    // relu2 MLP
+    UpProj, DownProj: TNNetLayer;
+    // MoE ('E' block): router + per-expert up/down + shared-expert up/down
+    GateConv: TNNetLayer;
+    SharedUp, SharedDown: TNNetLayer;
+    ExpertUp, ExpertDown: array of TNNetLayer;
+  end;
+
+function BuildNemotronHFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TNemotronHConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TNemotronHBlockLayers;
+  EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
+  BranchInput, NormedSrc, XBCConv, DtSplit, GateSplit: TNNetLayer;
+  QSlice, HeadPack: TNNetLayer;
+  GateTopK, GateScaled, SharedOut, ExpertOut, GateE, GateEB: TNNetLayer;
+  KSlices, VSlices, HeadOutputs, MoEBranches: array of TNNetLayer;
+  BlockCnt, SeqLen, i, j, d, ConvDim, ProjSize, ConvBiasSuppress: integer;
+  QWidth, KVWidth, GroupSize, HeadCnt, KVHeadCnt, KVGroup, e: integer;
+  Tmp, BiasVec: TNNetVolume;
+  MixPrefix, LayerP, AttP, TensorNameStr, InBias, OutBias, MoeP: string;
+  Consumed: TStringList;
+  SliceChannels: array of integer;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  procedure LoadChannelVector(Layer: TNNetLayer; NeuronIdx: integer;
+    const TName: string; Channels: integer);
+  var dd: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('Nemotron-H import: missing tensor "' + TName + '".');
+    Reader.LoadTensorFlat(TName, Tmp);
+    if Tmp.Size <> Channels then
+      ImportError('Nemotron-H import: "' + TName + '" must carry ' +
+        IntToStr(Channels) + ' elements, got ' + Reader.ShapeAsString(TName));
+    EnsureWritableImportWeights(Layer);
+    for dd := 0 to Channels - 1 do
+      Layer.Neurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
+    Layer.FlushWeightCache();
+    MarkConsumed(TName);
+  end;
+
+  procedure LoadDepthwiseConv(Layer: TNNetLayer; const WName, BName: string);
+  var dd, kk: integer;
+  begin
+    if not Reader.HasTensor(WName) then
+      ImportError('Nemotron-H import: missing tensor "' + WName + '".');
+    if (Reader.DimCount(WName) <> 3) or
+       (Reader.DimSize(WName, 0) <> ConvDim) or
+       (Reader.DimSize(WName, 1) <> 1) or
+       (Reader.DimSize(WName, 2) <> Config.ConvKernel) then
+      ImportError('Nemotron-H import: "' + WName + '" must have shape [' +
+        IntToStr(ConvDim) + ', 1, ' + IntToStr(Config.ConvKernel) +
+        '], got ' + Reader.ShapeAsString(WName));
+    Reader.LoadTensorFlat(WName, Tmp);
+    EnsureWritableImportWeights(Layer);
+    for dd := 0 to ConvDim - 1 do
+      for kk := 0 to Config.ConvKernel - 1 do
+        Layer.Neurons[dd].Weights.FData[kk] :=
+          Tmp.FData[dd * Config.ConvKernel + kk];
+    MarkConsumed(WName);
+    if Config.UseConvBias then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('Nemotron-H import: use_conv_bias=true but "' + BName +
+          '" is missing.');
+      Reader.LoadTensorFlat(BName, Tmp);
+      if Tmp.Size <> ConvDim then
+        ImportError('Nemotron-H import: "' + BName + '" must carry ' +
+          IntToStr(ConvDim) + ' elements.');
+      for dd := 0 to ConvDim - 1 do
+        Layer.Neurons[dd].BiasWeight := Tmp.FData[dd];
+      MarkConsumed(BName);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+  // Loads expert ExpertIdx's [OutDim, InDim] slice from a 3D MoE expert slab
+  // [NumExperts, OutDim, InDim] (PyTorch nn.Parameter, weight rows = outputs)
+  // into a TNNetPointwiseConvLinear (neuron o = output channel, bias-free).
+  procedure LoadMoEExpertSlice(Layer: TNNetLayer; const TName: string;
+    ExpertIdx, NumExperts, OutDim, InDim: integer);
+  var oo, ii, ExpertBase: integer;
+  begin
+    if not Reader.HasTensor(TName) then
+      ImportError('Nemotron-H import: missing tensor "' + TName + '".');
+    if (Reader.DimCount(TName) <> 3) or
+       (Reader.DimSize(TName, 0) <> NumExperts) or
+       (Reader.DimSize(TName, 1) <> OutDim) or
+       (Reader.DimSize(TName, 2) <> InDim) then
+      ImportError('Nemotron-H import: MoE expert slab "' + TName +
+        '" must have shape [' + IntToStr(NumExperts) + ', ' + IntToStr(OutDim) +
+        ', ' + IntToStr(InDim) + '], got ' + Reader.ShapeAsString(TName));
+    Reader.LoadTensorFlat(TName, Tmp);
+    EnsureWritableImportWeights(Layer);
+    ExpertBase := ExpertIdx * OutDim * InDim;
+    for oo := 0 to OutDim - 1 do
+    begin
+      for ii := 0 to InDim - 1 do
+        Layer.Neurons[oo].Weights.FData[ii] :=
+          Tmp.FData[ExpertBase + oo * InDim + ii];
+      Layer.Neurons[oo].BiasWeight := 0;
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Tmp := TNNetVolume.Create;
+  BiasVec := TNNetVolume.Create;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      if Config.NumLayers < 1 then
+        ImportError('Nemotron-H import: empty block schedule.');
+      if Reader.HasTensor('model.embeddings.weight') then
+        Config.Prefix := 'model.'
+      else if Reader.HasTensor('embeddings.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Nemotron-H import: neither "model.embeddings.weight" ' +
+          'nor "embeddings.weight" found - not a Nemotron-H checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'embeddings.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'embeddings.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Nemotron-H import: embeddings.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'embeddings.weight'));
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('lm_head.weight')) then
+        ImportError('Nemotron-H import: tie_word_embeddings=false but ' +
+          '"lm_head.weight" is missing.');
+      if pSeqLen <= 0 then SeqLen := 1024 else SeqLen := pSeqLen;
+      if Config.UseConvBias then ConvBiasSuppress := 0
+      else ConvBiasSuppress := 1;
+      ConvDim := Config.DInner + 2 * Config.NGroups * Config.StateSize;
+      ProjSize := Config.DInner + ConvDim + Config.MambaNumHeads;
+      QWidth := Config.NumHeads * Config.HeadDim;
+      KVWidth := Config.NumKVHeads * Config.HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+
+      // ---------------- Architecture (single pre-norm residual / block) ----
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(KSlices, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, Config.HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        // x := x + mixer(norm(x)).
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].Norm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+        NormedSrc := NN.GetLastLayer();
+        case Config.BlockTypes[BlockCnt] of
+          nhMamba2:
+          begin
+            // Identical to the standalone Mamba2 mixer: in_proj packs
+            // [gate | x|B|C | dt] (d_mlp=0), depthwise causal conv + SiLU on
+            // x|B|C, TNNetMamba2 SSD scan, out_proj.
+            Blocks[BlockCnt].InProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(ProjSize, 1), NormedSrc);
+            NN.AddLayerAfter(
+              TNNetSplitChannels.Create(Config.DInner, ConvDim),
+              Blocks[BlockCnt].InProj );
+            Blocks[BlockCnt].Conv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
+              Config.ConvKernel, {pCausal=}true, ConvBiasSuppress) );
+            XBCConv := NN.AddLayer( TNNetSiLU.Create() );
+            DtSplit := NN.AddLayerAfter( TNNetSplitChannels.Create(
+              Config.DInner + ConvDim, Config.MambaNumHeads),
+              Blocks[BlockCnt].InProj );
+            GateSplit := NN.AddLayerAfter( TNNetSplitChannels.Create(
+              0, Config.DInner), Blocks[BlockCnt].InProj );
+            NN.AddLayer( TNNetDeepConcat.Create([XBCConv, DtSplit, GateSplit]) );
+            Blocks[BlockCnt].Scan := NN.AddLayer( TNNetMamba2.Create(
+              Config.MambaNumHeads, Config.MambaHeadDim, Config.StateSize,
+              Config.NGroups, Config.LayerNormEps) );
+            Blocks[BlockCnt].OutProj := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+          end;
+          nhAttention:
+          begin
+            // Bias-free GQA, NoPE. Pack [Q_h|K_g|V_g] per query head -> SDPA.
+            Blocks[BlockCnt].QProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(QWidth, 1), NormedSrc);
+            Blocks[BlockCnt].KProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+            Blocks[BlockCnt].VProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(KVWidth, 1), NormedSrc);
+            for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+            begin
+              for d := 0 to Config.HeadDim - 1 do
+                SliceChannels[d] := KVHeadCnt * Config.HeadDim + d;
+              KSlices[KVHeadCnt] := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(SliceChannels),
+                Blocks[BlockCnt].KProj);
+              VSlices[KVHeadCnt] := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(SliceChannels),
+                Blocks[BlockCnt].VProj);
+            end;
+            for HeadCnt := 0 to Config.NumHeads - 1 do
+            begin
+              KVGroup := HeadCnt div GroupSize;
+              for d := 0 to Config.HeadDim - 1 do
+                SliceChannels[d] := HeadCnt * Config.HeadDim + d;
+              QSlice := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(SliceChannels),
+                Blocks[BlockCnt].QProj);
+              HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+                [QSlice, KSlices[KVGroup], VSlices[KVGroup]]) );
+              HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+                TNNetScaledDotProductAttention.Create(
+                  Config.HeadDim, {CausalMask=}true), HeadPack);
+            end;
+            NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+            Blocks[BlockCnt].OProj := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+          end;
+          nhMLP:
+          begin
+            // Non-gated relu2 MLP: down(ReLU(up(x))^2). ReLU then Square =
+            // ReLU(x)^2 (ACT2FN "relu2"); NO gate projection.
+            Blocks[BlockCnt].UpProj := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(Config.IntermediateSize, 1),
+              NormedSrc);
+            NN.AddLayer( TNNetReLU.Create() );
+            NN.AddLayer( TNNetSquare.Create() );
+            Blocks[BlockCnt].DownProj := NN.AddLayer(
+              TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+          end;
+          nhMoE:
+          begin
+            // DeepSeek-V3-style sparse FFN with NON-GATED relu2 experts.
+            //   router  : Linear(E) -> sigmoid -> top-k on (sig + e_score
+            //             correction bias) -> raw-sigmoid combine weights
+            //             (renormalized iff norm_topk_prob) * routed_scaling.
+            //   experts : down(ReLU(up(x))^2), bias-free, NO gate proj.
+            //   shared  : one always-on non-gated relu2 MLP, summed in.
+            SetLength(Blocks[BlockCnt].ExpertUp, Config.NumRoutedExperts);
+            SetLength(Blocks[BlockCnt].ExpertDown, Config.NumRoutedExperts);
+            SetLength(MoEBranches, Config.NumRoutedExperts +
+              Ord(Config.NumSharedExperts > 0));
+            // Always-on shared expert (its own relu2 MLP) - the residual
+            // (PRE-router) source is NormedSrc, same as the routed experts.
+            if Config.NumSharedExperts > 0 then
+            begin
+              Blocks[BlockCnt].SharedUp := NN.AddLayerAfter(
+                TNNetPointwiseConvLinear.Create(Config.SharedExpertInterSize, 1),
+                NormedSrc);
+              NN.AddLayer( TNNetReLU.Create() );
+              NN.AddLayer( TNNetSquare.Create() );
+              Blocks[BlockCnt].SharedDown := NN.AddLayer(
+                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+              SharedOut := NN.GetLastLayer();
+            end
+            else SharedOut := nil;
+            // Router: sigmoid logits -> top-k gate. The selection bias (the
+            // e_score_correction_bias) lives on a TNNetBiasBalancedTopKGate;
+            // when norm_topk_prob the gate already renormalizes the survivors.
+            Blocks[BlockCnt].GateConv := NN.AddLayerAfter(
+              TNNetPointwiseConvLinear.Create(Config.NumRoutedExperts, 1),
+              NormedSrc);
+            NN.AddLayer( TNNetSigmoid.Create() );
+            if Config.NormTopKProb then
+              GateTopK := NN.AddLayer( TNNetBiasBalancedTopKGate.Create(
+                Config.NumExpertsPerTok, {BalanceBiasSpeed=}0) )
+            else
+              GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+                Config.NumExpertsPerTok, {pRenormalize=}false) );
+            if Config.RoutedScalingFactor <> 1.0 then
+              GateScaled := NN.AddLayer(
+                TNNetMulByConstant.Create(Config.RoutedScalingFactor) )
+            else
+              GateScaled := GateTopK;
+            for e := 0 to Config.NumRoutedExperts - 1 do
+            begin
+              Blocks[BlockCnt].ExpertUp[e] := NN.AddLayerAfter(
+                TNNetPointwiseConvLinear.Create(Config.MoEIntermediateSize, 1),
+                NormedSrc);
+              NN.AddLayer( TNNetReLU.Create() );
+              NN.AddLayer( TNNetSquare.Create() );
+              Blocks[BlockCnt].ExpertDown[e] := NN.AddLayer(
+                TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1) );
+              ExpertOut := NN.GetLastLayer();
+              GateE := NN.AddLayerAfter(
+                TNNetSplitChannels.Create(e, 1), GateScaled);
+              GateEB := NN.AddLayer(
+                TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
+              MoEBranches[e] := NN.AddLayer(
+                TNNetCellMulByCell.Create(ExpertOut, GateEB) );
+            end;
+            if SharedOut <> nil then
+              MoEBranches[Config.NumRoutedExperts] := SharedOut;
+            NN.AddLayer( TNNetSum.Create(MoEBranches) );
+            SetLength(MoEBranches, 0);
+          end;
+        end;
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      FinalNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
+      EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+      EmbeddingLayer.FlushWeightCache();
+      MarkConsumed(Config.Prefix + 'embeddings.weight');
+      if Config.TieWordEmbeddings then
+      begin
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Config.HiddenSize - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Config.HiddenSize + i];
+          LMHead.Neurons[j].BiasWeight := 0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then
+          MarkConsumed('lm_head.weight');
+      end
+      else
+      begin
+        LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+          Config.HiddenSize, Config.VocabSize);
+        MarkConsumed('lm_head.weight');
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
+        LoadLlamaRMSNormWeights(Reader, Blocks[BlockCnt].Norm,
+          LayerP + 'norm.weight', Config.HiddenSize);
+        MarkConsumed(LayerP + 'norm.weight');
+        case Config.BlockTypes[BlockCnt] of
+          nhMamba2:
+          begin
+            MixPrefix := LayerP + 'mixer.';
+            if Config.UseBias then InBias := MixPrefix + 'in_proj.bias'
+            else InBias := '';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].InProj,
+              MixPrefix + 'in_proj.weight', Config.HiddenSize, ProjSize,
+              0, -1, 0, InBias);
+            MarkConsumed(MixPrefix + 'in_proj.weight');
+            if InBias <> '' then MarkConsumed(InBias);
+            LoadDepthwiseConv(Blocks[BlockCnt].Conv,
+              MixPrefix + 'conv1d.weight', MixPrefix + 'conv1d.bias');
+            LoadChannelVector(Blocks[BlockCnt].Scan, 0, MixPrefix + 'A_log',
+              Config.MambaNumHeads);
+            LoadChannelVector(Blocks[BlockCnt].Scan, 1, MixPrefix + 'D',
+              Config.MambaNumHeads);
+            LoadChannelVector(Blocks[BlockCnt].Scan, 2, MixPrefix + 'dt_bias',
+              Config.MambaNumHeads);
+            LoadChannelVector(Blocks[BlockCnt].Scan, 3, MixPrefix +
+              'norm.weight', Config.DInner);
+            if Config.UseBias then OutBias := MixPrefix + 'out_proj.bias'
+            else OutBias := '';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutProj,
+              MixPrefix + 'out_proj.weight', Config.DInner,
+              Config.HiddenSize, 0, -1, 0, OutBias);
+            MarkConsumed(MixPrefix + 'out_proj.weight');
+            if OutBias <> '' then MarkConsumed(OutBias);
+          end;
+          nhAttention:
+          begin
+            AttP := LayerP + 'mixer.';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+              AttP + 'q_proj.weight', Config.HiddenSize, QWidth);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].KProj,
+              AttP + 'k_proj.weight', Config.HiddenSize, KVWidth);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].VProj,
+              AttP + 'v_proj.weight', Config.HiddenSize, KVWidth);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OProj,
+              AttP + 'o_proj.weight', QWidth, Config.HiddenSize);
+            MarkConsumed(AttP + 'q_proj.weight');
+            MarkConsumed(AttP + 'k_proj.weight');
+            MarkConsumed(AttP + 'v_proj.weight');
+            MarkConsumed(AttP + 'o_proj.weight');
+          end;
+          nhMLP:
+          begin
+            MixPrefix := LayerP + 'mixer.';
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].UpProj,
+              MixPrefix + 'up_proj.weight', Config.HiddenSize,
+              Config.IntermediateSize);
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].DownProj,
+              MixPrefix + 'down_proj.weight', Config.IntermediateSize,
+              Config.HiddenSize);
+            MarkConsumed(MixPrefix + 'up_proj.weight');
+            MarkConsumed(MixPrefix + 'down_proj.weight');
+          end;
+          nhMoE:
+          begin
+            MoeP := LayerP + 'mixer.';
+            // Router (bias-free Linear): logits = gate.weight @ x.
+            LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateConv,
+              MoeP + 'gate.weight', Config.HiddenSize, Config.NumRoutedExperts);
+            MarkConsumed(MoeP + 'gate.weight');
+            // Per-expert selection bias (e_score_correction_bias). When
+            // norm_topk_prob the gate is a TNNetBiasBalancedTopKGate whose
+            // neuron[0] holds the per-expert additive selection bias; when not
+            // there is no bias slot, so a non-zero bias would be silently
+            // dropped - reject it rather than import incorrectly.
+            if Reader.HasTensor(MoeP + 'gate.e_score_correction_bias') then
+            begin
+              Reader.LoadTensorFlat(MoeP + 'gate.e_score_correction_bias',
+                BiasVec);
+              if BiasVec.Size <> Config.NumRoutedExperts then
+                ImportError('Nemotron-H import: "' + MoeP +
+                  'gate.e_score_correction_bias" must carry ' +
+                  IntToStr(Config.NumRoutedExperts) + ' elements.');
+              if Config.NormTopKProb then
+              begin
+                EnsureWritableImportWeights(GateTopK);
+                for e := 0 to Config.NumRoutedExperts - 1 do
+                  GateTopK.Neurons[0].Weights.FData[e] := BiasVec.FData[e];
+                GateTopK.FlushWeightCache();
+              end
+              else
+              begin
+                for e := 0 to Config.NumRoutedExperts - 1 do
+                  if BiasVec.FData[e] <> 0 then
+                    ImportError('Nemotron-H import: a non-zero ' +
+                      'e_score_correction_bias with norm_topk_prob=false is ' +
+                      'not wired (no biased non-renormalizing gate variant).');
+              end;
+              MarkConsumed(MoeP + 'gate.e_score_correction_bias');
+            end;
+            // Routed experts: 3D slabs [E, *, *].
+            for e := 0 to Config.NumRoutedExperts - 1 do
+            begin
+              LoadMoEExpertSlice(Blocks[BlockCnt].ExpertUp[e],
+                MoeP + 'experts.up_proj', e, Config.NumRoutedExperts,
+                Config.MoEIntermediateSize, Config.HiddenSize);
+              LoadMoEExpertSlice(Blocks[BlockCnt].ExpertDown[e],
+                MoeP + 'experts.down_proj', e, Config.NumRoutedExperts,
+                Config.HiddenSize, Config.MoEIntermediateSize);
+            end;
+            MarkConsumed(MoeP + 'experts.up_proj');
+            MarkConsumed(MoeP + 'experts.down_proj');
+            // Shared expert (a plain non-gated relu2 MLP).
+            if Config.NumSharedExperts > 0 then
+            begin
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedUp,
+                MoeP + 'shared_experts.up_proj.weight', Config.HiddenSize,
+                Config.SharedExpertInterSize);
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedDown,
+                MoeP + 'shared_experts.down_proj.weight',
+                Config.SharedExpertInterSize, Config.HiddenSize);
+              MarkConsumed(MoeP + 'shared_experts.up_proj.weight');
+              MarkConsumed(MoeP + 'shared_experts.down_proj.weight');
+            end;
+          end;
+        end;
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadLlamaRMSNormWeights(Reader, FinalNorm,
+        Config.Prefix + 'norm_f.weight', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'norm_f.weight');
+
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Nemotron-H import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    BiasVec.Free;
+    Tmp.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildNemotronHFromSafeTensorsEx(const FileName: string;
+  out Config: TNemotronHConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadNemotronHConfigFromJSONFile(ConfigPath);
+  Result := BuildNemotronHFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildNemotronHFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TNemotronHConfig;
+begin
+  Result := BuildNemotronHFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
 // ============================ BLOOM IMPORT =================================
 
 function ReadBloomConfigFromJSONFile(const FileName: string): TBloomConfig;
@@ -10637,6 +27241,624 @@ var
 begin
   Result := BuildBloomFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+// ============================= FALCON IMPORT ===============================
+
+function ReadFalconConfigFromJSONFile(const FileName: string): TFalconConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, RopeObj: TJSONObject;
+  Field: TJSONData;
+  ModelType: string;
+  MultiQuery: boolean;
+  NumLnInParallel: integer;
+
+  function RequiredInt(const Key, AltKey: string): integer;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(Key);
+    if (Data = nil) or Data.IsNull then
+      Data := Obj.Find(AltKey);
+    if (Data = nil) or Data.IsNull then
+      ImportError('Falcon import: config "' + FileName +
+        '" is missing required key "' + Key + '" (or "' + AltKey + '").');
+    Result := Data.AsInteger;
+  end;
+
+begin
+  Result := Default(TFalconConfig);
+  if not FileExists(FileName) then
+    ImportError('Falcon import: config file "' + FileName + '" not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Falcon import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Falcon import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    // model_type "falcon"; the original tiiuae exports used the legacy
+    // "RefinedWebModel" (falcon-7b) and "RefinedWeb" (falcon-40b) spellings.
+    ModelType := Obj.Get('model_type', 'falcon');
+    if (ModelType <> 'falcon') and (ModelType <> 'RefinedWebModel') and
+       (ModelType <> 'RefinedWeb') then
+      ImportError('Falcon import: config model_type is "' + ModelType +
+        '" - expected "falcon", "RefinedWebModel" or "RefinedWeb" (see ' +
+        'BuildFromPretrained for the full dispatch).');
+    Result.HiddenSize := RequiredInt('hidden_size', 'hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers', 'n_layer');
+    Result.NumHeads := RequiredInt('num_attention_heads', 'n_head');
+    Result.VocabSize := RequiredInt('vocab_size', 'vocab_size');
+    Result.MaxPositions := Obj.Get('max_position_embeddings', 2048);
+    Result.LayerNormEps := Obj.Get('layer_norm_epsilon', 1.0e-5);
+    Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings', True);
+    // ffn_hidden_size null/absent = 4*hidden_size (the FalconConfig default).
+    Field := Obj.Find('ffn_hidden_size');
+    if (Field <> nil) and not Field.IsNull then
+      Result.IntermediateSize := Field.AsInteger
+    else
+      Result.IntermediateSize := 4 * Result.HiddenSize;
+    // alibi=true and bias=true are not wired for Falcon (no released Falcon
+    // uses either - alibi was an early experiment, all releases use RoPE).
+    if Obj.Get('alibi', False) then
+      ImportError('Falcon import: config has alibi=true - this importer ' +
+        'only wires the RoPE form (every released Falcon uses RoPE).');
+    if Obj.Get('bias', False) then
+      ImportError('Falcon import: config has bias=true - this importer ' +
+        'only wires the bias-free form (no released Falcon uses biased ' +
+        'Linears).');
+    Result.NewDecoderArchitecture := Obj.Get('new_decoder_architecture', False);
+    Result.ParallelAttn := Obj.Get('parallel_attn', True);
+    MultiQuery := Obj.Get('multi_query', True);
+    // EFFECTIVE K/V head count and the QKV slab layout depend on the branch:
+    //   - new arch: num_kv_heads GQA groups (default = num_attention_heads);
+    //   - multi_query (old arch): ONE shared K/V head;
+    //   - neither: plain per-head [q|k|v] MHA (num_kv_heads = num_heads).
+    if Result.NewDecoderArchitecture then
+    begin
+      Field := Obj.Find('num_kv_heads');
+      if (Field <> nil) and not Field.IsNull then
+        Result.NumKVHeads := Field.AsInteger
+      else
+        Result.NumKVHeads := Result.NumHeads;
+    end
+    else if MultiQuery then
+      Result.NumKVHeads := 1
+    else
+      Result.NumKVHeads := Result.NumHeads;
+    // LayerNorm topology: new arch (or num_ln_in_parallel_attn=2) splits the
+    // single input_layernorm into ln_attn + ln_mlp. parallel_attn=false is
+    // the rare sequential pre-LN fallback (input_layernorm +
+    // post_attention_layernorm), single norm at the block entry.
+    NumLnInParallel := Obj.Get('num_ln_in_parallel_attn', 0); // 0 = absent
+    if Result.NewDecoderArchitecture and (NumLnInParallel = 0) then
+      NumLnInParallel := 2; // FalconDecoderLayer default for the new arch
+    Result.TwoLayerNorms :=
+      Result.ParallelAttn and (NumLnInParallel = 2);
+    // rope_theta: the classic key, or the newer rope_parameters.rope_theta
+    // nesting; default 10000.
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    Field := Obj.Find('rope_parameters');
+    if (Field <> nil) and (Field is TJSONObject) then
+    begin
+      RopeObj := TJSONObject(Field);
+      Result.RopeTheta := RopeObj.Get('rope_theta', Result.RopeTheta);
+      Result.RopeScaling := ReadRoPEScalingFromJSONObject(RopeObj,
+        Result.MaxPositions, 'Falcon import');
+    end
+    else
+      Result.RopeScaling := ReadRoPEScalingFromJSONObject(Obj,
+        Result.MaxPositions, 'Falcon import');
+    Result.Prefix := ''; // detected from the checkpoint by the builder
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function FalconConfigToString(const Config: TFalconConfig): string;
+begin
+  Result := 'falcon config: layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', kv_heads=' + IntToStr(Config.NumKVHeads) +
+    ', hidden=' + IntToStr(Config.HiddenSize) +
+    ', intermediate=' + IntToStr(Config.IntermediateSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', ln_eps=' + FloatToStr(Config.LayerNormEps) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', new_arch=' + BoolToStr(Config.NewDecoderArchitecture, true) +
+    ', parallel=' + BoolToStr(Config.ParallelAttn, true) +
+    ', two_ln=' + BoolToStr(Config.TwoLayerNorms, true) +
+    ', tied=' + BoolToStr(Config.TieWordEmbeddings, true);
+  if Config.RopeScaling.Mode <> rsmNone then
+    Result := Result + ', rope_scaling=' +
+      RoPEScalingToString(Config.RopeScaling);
+  if Config.Prefix <> '' then
+    Result := Result + ', prefix="' + Config.Prefix + '"';
+end;
+
+// Loads the fused Falcon query_key_value nn.Linear ([qkv_out, hidden]
+// weight, bias-free) into a TNNetPointwiseConvLinear Q|K|V slab laid out
+// q -> neurons 0..QWidth-1, k -> QWidth..QWidth+KVWidth-1,
+// v -> QWidth+KVWidth..QWidth+2*KVWidth-1 (the same de-interleaved layout
+// the GQA head wiring below expects, identical to the Llama q/k/v split).
+// The source slab is INTERLEAVED PER GQA GROUP: group g packs GroupSize
+// query heads, then ONE K head, then ONE V head, each head_dim rows wide
+// (HF view(-1, GroupSize + 2, head_dim)); multi_query is the special case
+// num_kv_heads=1 (one group). The plain-MHA layout (NOT new arch, NOT
+// multi_query) is per-head [q|k|v] thirds (view(num_heads, 3, head_dim)) and
+// is handled by PerHeadThirds=true. On top of the de-interleave, the q and k
+// rows are PERMUTED from HF's rotate_half (first-half / second-half) into
+// TNNetRotaryEmbedding's interleaved (even/odd) pair layout (the Llama
+// permutation); v rows load straight.
+procedure LoadFalconQKVWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string;
+  Hidden, Heads, KVHeads, HeadDim: integer; PerHeadThirds: boolean);
+var
+  W: TNNetVolume;
+  GroupSize, QkvOut, QWidth, KVWidth, r, i: integer;
+  HeadIdx, Third, RowInHead, RotHalf, TargetRow, TargetIdx: integer;
+  Group, SubInGroup, GroupStride: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  GroupSize := Heads div KVHeads;
+  QWidth := Heads * HeadDim;
+  KVWidth := KVHeads * HeadDim;
+  QkvOut := QWidth + 2 * KVWidth;
+  if not Reader.HasTensor(WName) then
+    ImportError('Falcon import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> QkvOut) or
+     (Reader.DimSize(WName, 1) <> Hidden) then
+    ImportError('Falcon import: "' + WName + '" must have shape [' +
+      IntToStr(QkvOut) + ', ' + IntToStr(Hidden) + '] (nn.Linear stores ' +
+      '[out, in]), got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> QkvOut then
+    ImportError('Falcon import: internal error - layer for "' + WName +
+      '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(QkvOut) + '.');
+  RotHalf := HeadDim div 2;
+  GroupStride := (GroupSize + 2) * HeadDim;
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for r := 0 to QkvOut - 1 do
+    begin
+      // Decode source row r -> (Third in {0=q,1=k,2=v}, HeadIdx, RowInHead).
+      if PerHeadThirds then
+      begin
+        // view(num_heads, 3, head_dim): head h, third t, dim d at
+        // ((h*3 + t)*head_dim + d).
+        HeadIdx := r div (3 * HeadDim);
+        Third := (r mod (3 * HeadDim)) div HeadDim;
+        RowInHead := r mod HeadDim;
+      end
+      else
+      begin
+        // view(num_kv_heads, GroupSize + 2, head_dim): group g, sub s, dim d
+        // at ((g*(GroupSize+2) + s)*head_dim + d). s in 0..GroupSize-1 are
+        // query heads (global head g*GroupSize + s), s=GroupSize is the K
+        // head, s=GroupSize+1 the V head (both shared across the group).
+        Group := r div GroupStride;
+        SubInGroup := (r mod GroupStride) div HeadDim;
+        RowInHead := r mod HeadDim;
+        if SubInGroup < GroupSize then
+        begin
+          Third := 0;
+          HeadIdx := Group * GroupSize + SubInGroup;
+        end
+        else if SubInGroup = GroupSize then
+        begin
+          Third := 1;
+          HeadIdx := Group;
+        end
+        else
+        begin
+          Third := 2;
+          HeadIdx := Group;
+        end;
+      end;
+      // rotate_half -> interleaved permutation on q and k rows (full head).
+      TargetRow := RowInHead;
+      if Third < 2 then
+      begin
+        if RowInHead < RotHalf then
+          TargetRow := 2 * RowInHead
+        else
+          TargetRow := 2 * (RowInHead - RotHalf) + 1;
+      end;
+      // Destination index in the q|k|v slab.
+      case Third of
+        0: TargetIdx := HeadIdx * HeadDim + TargetRow;
+        1: TargetIdx := QWidth + HeadIdx * HeadDim + TargetRow;
+      else
+        TargetIdx := QWidth + KVWidth + HeadIdx * HeadDim + TargetRow;
+      end;
+      if Layer.Neurons[TargetIdx].Weights.Size <> Hidden then
+        ImportError('Falcon import: internal error - neuron ' +
+          IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
+          IntToStr(Layer.Neurons[TargetIdx].Weights.Size) +
+          ' weights, expected ' + IntToStr(Hidden) + '.');
+      for i := 0 to Hidden - 1 do
+        Layer.Neurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      Layer.Neurons[TargetIdx].BiasWeight := 0;
+    end;
+  finally
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+type
+  TFalconBlockLayers = record
+    LNAttn, LNMlp, LNPostAttn, QKV, AttnDense, HTo4H, FourHToH: TNNetLayer;
+  end;
+
+function BuildFalconFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TFalconConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Blocks: array of TFalconBlockLayers;
+  EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
+  BranchInput, AttnSource, MlpSource, AttnOut, MlpOut, QKVLayer: TNNetLayer;
+  QSource, KSource, QSlice, KSlice, HeadPack: TNNetLayer;
+  KRotated, VSlices, HeadOutputs: array of TNNetLayer;
+  SliceChannels: array of integer;
+  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
+  HeadDim, QWidth, KVWidth, i, j, d: integer;
+  PerHeadThirds: boolean;
+  Tmp: TNNetVolume;
+  BlockPrefix, AttnPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // x*Phi(x), the exact erf GELU (Falcon's activation is "gelu" = exact),
+  // composed from existing layers exactly like the GPT-NeoX/BERT path.
+  procedure AddExactGELU;
+  var
+    GELUSource, PhiBranch: TNNetLayer;
+  begin
+    GELUSource := NN.GetLastLayer();
+    NN.AddLayerAfter(
+      TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
+    NN.AddLayer( TNNetErf.Create() );
+    NN.AddLayer( TNNetAddConstant.Create(1.0) );
+    PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+    NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
+    NN.AddLayer( TNNetReGLU.Create() );
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation & prefix detection -------------
+      if Config.NumHeads < 1 then
+        ImportError('Falcon import: num_attention_heads must be >= 1.');
+      if Config.NumKVHeads < 1 then
+        ImportError('Falcon import: effective num_kv_heads must be >= 1.');
+      if (Config.NumHeads mod Config.NumKVHeads) <> 0 then
+        ImportError('Falcon import: num_attention_heads=' +
+          IntToStr(Config.NumHeads) + ' is not divisible by the effective ' +
+          'num_kv_heads=' + IntToStr(Config.NumKVHeads) + '.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('Falcon import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.NumHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      if Odd(HeadDim) then
+        ImportError('Falcon import: head_dim=' + IntToStr(HeadDim) +
+          ' must be even (RoPE rotates channel pairs).');
+      QWidth := Config.NumHeads * HeadDim;
+      KVWidth := Config.NumKVHeads * HeadDim;
+      GroupSize := Config.NumHeads div Config.NumKVHeads;
+      // The plain-MHA QKV layout (per-head [q|k|v] thirds) is used ONLY when
+      // neither the new arch nor multi_query applies: that is exactly when
+      // the effective num_kv_heads equals num_heads AND the new arch is off.
+      PerHeadThirds := (not Config.NewDecoderArchitecture) and
+        (Config.NumKVHeads = Config.NumHeads);
+      if Reader.HasTensor('transformer.word_embeddings.weight') then
+        Config.Prefix := 'transformer.'
+      else if Reader.HasTensor('word_embeddings.weight') then
+        Config.Prefix := ''
+      else
+        ImportError('Falcon import: neither ' +
+          '"transformer.word_embeddings.weight" nor ' +
+          '"word_embeddings.weight" found in ' + Reader.FileName +
+          ' - not a Falcon checkpoint?');
+      if (Reader.DimCount(Config.Prefix + 'word_embeddings.weight') <> 2) or
+         (Reader.DimSize(Config.Prefix + 'word_embeddings.weight', 0) <>
+          Config.VocabSize) or
+         (Reader.DimSize(Config.Prefix + 'word_embeddings.weight', 1) <>
+          Config.HiddenSize) then
+        ImportError('Falcon import: word_embeddings.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+          '], got ' +
+          Reader.ShapeAsString(Config.Prefix + 'word_embeddings.weight'));
+      if (not Config.TieWordEmbeddings) and
+         (not Reader.HasTensor('lm_head.weight')) then
+        ImportError('Falcon import: config says tie_word_embeddings=false ' +
+          'but "lm_head.weight" is missing from ' + Reader.FileName + '.');
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('Falcon import: requested SeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen) );
+      EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      SetLength(Blocks, Config.NumLayers);
+      SetLength(KRotated, Config.NumKVHeads);
+      SetLength(VSlices, Config.NumKVHeads);
+      SetLength(HeadOutputs, Config.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BranchInput := NN.GetLastLayer();
+        // LayerNorm topology:
+        //  - TwoLayerNorms (new arch / num_ln_in_parallel_attn=2): ln_attn
+        //    feeds attention, ln_mlp feeds the MLP, BOTH read the block input;
+        //  - otherwise a single LayerNorm (input_layernorm) feeds both the
+        //    attention branch and (parallel_attn) the MLP branch.
+        if Config.TwoLayerNorms then
+        begin
+          Blocks[BlockCnt].LNAttn := NN.AddLayerAfter(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput);
+          AttnSource := Blocks[BlockCnt].LNAttn;
+          Blocks[BlockCnt].LNMlp := NN.AddLayerAfter(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput);
+          MlpSource := Blocks[BlockCnt].LNMlp;
+        end
+        else
+        begin
+          Blocks[BlockCnt].LNAttn := NN.AddLayerAfter(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps), BranchInput);
+          AttnSource := Blocks[BlockCnt].LNAttn;
+          MlpSource := Blocks[BlockCnt].LNAttn; // shared (set below if seq.)
+        end;
+        // ---- attention branch: dense(GQA-RoPE(ln(x))) ----
+        QKVLayer := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(QWidth + 2 * KVWidth), AttnSource);
+        Blocks[BlockCnt].QKV := QKVLayer;
+        QSource := QKVLayer;
+        KSource := QKVLayer;
+        // K is rotated ONCE per KV head; V (slab tail) is never rotated.
+        for KVHeadCnt := 0 to Config.NumKVHeads - 1 do
+        begin
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := QWidth + KVHeadCnt * HeadDim + d;
+          KSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), KSource);
+          KRotated[KVHeadCnt] := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
+            KSlice);
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := QWidth + KVWidth + KVHeadCnt * HeadDim + d;
+          VSlices[KVHeadCnt] := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), QKVLayer);
+        end;
+        for HeadCnt := 0 to Config.NumHeads - 1 do
+        begin
+          KVGroup := HeadCnt div GroupSize;
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := HeadCnt * HeadDim + d;
+          QSlice := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), QSource);
+          QSlice := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
+            QSlice);
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+            [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim,
+              {CausalMask=}true), HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        Blocks[BlockCnt].AttnDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        AttnOut := NN.GetLastLayer();
+        if not Config.ParallelAttn then
+        begin
+          // SEQUENTIAL pre-LN (parallel_attn=false): close the attention
+          // residual first, then the MLP reads post_attention_layernorm of
+          // the updated stream. x := x + Attn(ln1(x));
+          // x := x + MLP(ln2(x)).
+          AttnOut := NN.AddLayer( TNNetSum.Create([AttnOut, BranchInput]) );
+          Blocks[BlockCnt].LNPostAttn := NN.AddLayer(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+          MlpSource := Blocks[BlockCnt].LNPostAttn;
+        end;
+        // ---- MLP branch: dense_4h_to_h(gelu(dense_h_to_4h(ln(x)))) ----
+        Blocks[BlockCnt].HTo4H := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize), MlpSource);
+        AddExactGELU;
+        Blocks[BlockCnt].FourHToH := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        MlpOut := NN.GetLastLayer();
+        if Config.ParallelAttn then
+          // PARALLEL: x := x + Attn(ln(x)) + MLP(ln(x)). One fused 3-input
+          // sum (HF computes mlp_output += attention_output then
+          // residual + mlp_output).
+          NN.AddLayer( TNNetSum.Create([BranchInput, AttnOut, MlpOut]) )
+        else
+          NN.AddLayer( TNNetSum.Create([MlpOut, AttnOut]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      LMHead := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Weights ----------------
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Config.Prefix + 'word_embeddings.weight', Tmp);
+        if EmbeddingLayer.Neurons[0].Weights.Size <> Tmp.Size then
+          ImportError('Falcon import: word_embeddings.weight element count ' +
+            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+            IntToStr(EmbeddingLayer.Neurons[0].Weights.Size) + '.');
+        EmbeddingLayer.Neurons[0].Weights.Copy(Tmp);
+        EmbeddingLayer.FlushWeightCache();
+        MarkConsumed(Config.Prefix + 'word_embeddings.weight');
+        if Config.TieWordEmbeddings then
+        begin
+          EnsureWritableImportWeights(LMHead);
+          for j := 0 to Config.VocabSize - 1 do
+          begin
+            for i := 0 to Config.HiddenSize - 1 do
+              LMHead.Neurons[j].Weights.FData[i] :=
+                Tmp.FData[j * Config.HiddenSize + i];
+            LMHead.Neurons[j].BiasWeight := 0;
+          end;
+          LMHead.FlushWeightCache();
+          if Reader.HasTensor('lm_head.weight') then
+            MarkConsumed('lm_head.weight');
+        end
+        else
+        begin
+          LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
+            Config.HiddenSize, Config.VocabSize);
+          MarkConsumed('lm_head.weight');
+        end;
+      finally
+        Tmp.Free;
+      end;
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
+        AttnPrefix := BlockPrefix + 'self_attention.';
+        if Config.TwoLayerNorms then
+        begin
+          LoadLayerNormWeights(Reader, Blocks[BlockCnt].LNAttn,
+            BlockPrefix + 'ln_attn.weight', BlockPrefix + 'ln_attn.bias',
+            Config.HiddenSize);
+          MarkConsumed(BlockPrefix + 'ln_attn.weight');
+          MarkConsumed(BlockPrefix + 'ln_attn.bias');
+          LoadLayerNormWeights(Reader, Blocks[BlockCnt].LNMlp,
+            BlockPrefix + 'ln_mlp.weight', BlockPrefix + 'ln_mlp.bias',
+            Config.HiddenSize);
+          MarkConsumed(BlockPrefix + 'ln_mlp.weight');
+          MarkConsumed(BlockPrefix + 'ln_mlp.bias');
+        end
+        else
+        begin
+          LoadLayerNormWeights(Reader, Blocks[BlockCnt].LNAttn,
+            BlockPrefix + 'input_layernorm.weight',
+            BlockPrefix + 'input_layernorm.bias', Config.HiddenSize);
+          MarkConsumed(BlockPrefix + 'input_layernorm.weight');
+          MarkConsumed(BlockPrefix + 'input_layernorm.bias');
+          if not Config.ParallelAttn then
+          begin
+            LoadLayerNormWeights(Reader, Blocks[BlockCnt].LNPostAttn,
+              BlockPrefix + 'post_attention_layernorm.weight',
+              BlockPrefix + 'post_attention_layernorm.bias',
+              Config.HiddenSize);
+            MarkConsumed(BlockPrefix + 'post_attention_layernorm.weight');
+            MarkConsumed(BlockPrefix + 'post_attention_layernorm.bias');
+          end;
+        end;
+        LoadFalconQKVWeights(Reader, Blocks[BlockCnt].QKV,
+          AttnPrefix + 'query_key_value.weight',
+          Config.HiddenSize, Config.NumHeads, Config.NumKVHeads, HeadDim,
+          PerHeadThirds);
+        MarkConsumed(AttnPrefix + 'query_key_value.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnDense,
+          AttnPrefix + 'dense.weight', Config.HiddenSize, Config.HiddenSize);
+        MarkConsumed(AttnPrefix + 'dense.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].HTo4H,
+          BlockPrefix + 'mlp.dense_h_to_4h.weight', Config.HiddenSize,
+          Config.IntermediateSize);
+        MarkConsumed(BlockPrefix + 'mlp.dense_h_to_4h.weight');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].FourHToH,
+          BlockPrefix + 'mlp.dense_4h_to_h.weight', Config.IntermediateSize,
+          Config.HiddenSize);
+        MarkConsumed(BlockPrefix + 'mlp.dense_4h_to_h.weight');
+        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      end;
+      LoadLayerNormWeights(Reader, FinalLN,
+        Config.Prefix + 'ln_f.weight', Config.Prefix + 'ln_f.bias',
+        Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'ln_f.weight');
+      MarkConsumed(Config.Prefix + 'ln_f.bias');
+
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // rotary_emb.inv_freq: RoPE buffers (structural, rebuilt from base).
+        if Pos('rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
+        ImportError('Falcon import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) + ') in ' +
+          FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildFalconFromSafeTensorsEx(const FileName: string;
+  out Config: TFalconConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadFalconConfigFromJSONFile(ConfigPath);
+  // The builder detects Config.Prefix from the checkpoint (var parameter).
+  Result := BuildFalconFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
+    pInferenceOnly, pQuantizeInt8);
+end;
+
+function BuildFalconFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TFalconConfig;
+begin
+  Result := BuildFalconFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
 end;
 
 function ReadModernBertConfigFromJSONFile(
@@ -11426,11 +28648,16 @@ begin
         'null, the DeepSeek-V2-Lite case) is wired. The low-rank ' +
         'q_a_proj/q_a_layernorm/q_b_proj query path of the full 236B V2 ' +
         'is not implemented.');
-    if HasNonNull('rope_scaling') then
-      ImportError('DeepSeek-V2 import: rope_scaling is not supported - ' +
-        'DeepSeek''s YaRN configs carry mscale/mscale_all_dim ' +
-        'attention-scale overrides that the rope-scaling support ' +
-        'deliberately rejects. Use a checkpoint with rope_scaling: null.');
+    // rope_scaling: DeepSeek-V2-Lite ships a YaRN config carrying explicit
+    // mscale/mscale_all_dim attention-scale overrides. The shared reader folds
+    // them into RopeScaling.YarnAttnFactor (=_yarn_get_mscale(s,mscale)/
+    // _yarn_get_mscale(s,mscale_all_dim)); null/absent stays Mode=rsmNone.
+    Result.RopeScaling := ReadRoPEScalingFromJSONObject(Obj,
+      Result.MaxPositions, 'DeepSeek-V2 import');
+    if not (Result.RopeScaling.Mode in [rsmNone, rsmYaRN]) then
+      ImportError('DeepSeek-V2 import: rope_scaling type ' +
+        RoPEScalingToString(Result.RopeScaling) +
+        ' is not supported - DeepSeek-V2 uses YaRN (or null).');
     StrVal := Obj.Get('topk_method', 'greedy');
     if StrVal <> 'greedy' then
       ImportError('DeepSeek-V2 import: topk_method "' + StrVal +
@@ -11487,6 +28714,9 @@ begin
       FloatToStr(Config.RoutedScalingFactor);
   if Config.TieWordEmbeddings then
     Result := Result + ', tied_embeddings=true';
+  if Config.RopeScaling.Mode <> rsmNone then
+    Result := Result + ', rope_scaling=' +
+      RoPEScalingToString(Config.RopeScaling);
   if Config.Prefix <> '' then
     Result := Result + ', prefix="' + Config.Prefix + '"';
 end;
@@ -11673,7 +28903,7 @@ begin
         Blocks[BlockCnt].KRope := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(dr), NormedSource);
         KRopeRot := NN.AddLayerAfter(
-          CreateRoPEFromScaling(Config.RopeTheta, DefaultRoPEScaling()),
+          CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
           Blocks[BlockCnt].KRope);
         // SDPA packs equal-width Q|K|V; V (width dv = dn) has no rope
         // slice, so it is padded with an exact dr-wide zero block built as
@@ -11698,7 +28928,7 @@ begin
             TNNetSplitChannels.Create(HeadCnt * dr, dr),
             Blocks[BlockCnt].QRope);
           QRopeSlice := NN.AddLayerAfter(
-            CreateRoPEFromScaling(Config.RopeTheta, DefaultRoPEScaling()),
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling),
             QRopeSlice);
           // Pack [Q_h|ropeQ_h | K_h|ropeK | V_h|0] (width 3*(dn+dr)).
           HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
@@ -12251,13 +29481,14 @@ function BuildClipVisionTower(Reader: TNNetSafeTensorsReader;
   const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels,
   ProjectionDim: integer; const Prefix: string;
   const ProjectionTensorName: string = '';
-  pInferenceOnly: boolean = false): TNNet;
+  pInferenceOnly: boolean = false;
+  pVisionFeatures: boolean = false): TNNet;
 var
   NN: TNNet;
   PatchConv, PosEmb, PreLN, PostLN, Proj: TNNetLayer;
   Blocks: TClipBlockLayersArray;
   Tbl: TNNetVolume;
-  Grid, NumPatches, BlockCnt, ChanCnt: integer;
+  Grid, NumPatches, BlockCnt, BuiltLayers, ChanCnt: integer;
   PreLNName: string;
 begin
   if (Tower.NumHeads < 1) or
@@ -12293,18 +29524,39 @@ begin
     PreLN := NN.AddLayer(
       TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
     if pInferenceOnly then NN.MakeInferenceOnly();
-    SetLength(Blocks, Tower.NumLayers);
-    for BlockCnt := 0 to Tower.NumLayers - 1 do
+    // LLaVA's vision feature is the penultimate hidden state
+    // (output_hidden_states[-2]) WITHOUT the CLS row and WITHOUT
+    // post_layernorm/projection: that is the output of the stack with the
+    // LAST encoder block omitted. In feature mode build NumLayers-1 blocks,
+    // skip post_layernorm + projection, and crop the class-token row so the
+    // net returns exactly (NumPatches, 1, hidden) patch tokens.
+    if pVisionFeatures then
+      BuiltLayers := Tower.NumLayers - 1
+    else
+      BuiltLayers := Tower.NumLayers;
+    if BuiltLayers < 0 then BuiltLayers := 0;
+    SetLength(Blocks, BuiltLayers);
+    for BlockCnt := 0 to BuiltLayers - 1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
         Blocks[BlockCnt], pInferenceOnly);
-    // HF applies post_layernorm (and the projection) only to the pooled
-    // class token; applying them PER TOKEN is exact for row 0.
-    PostLN := NN.AddLayer(
-      TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    PostLN := nil;
     Proj := nil;
-    if ProjectionTensorName <> '' then
-      Proj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(ProjectionDim) );
+    if pVisionFeatures then
+    begin
+      // Drop the class-token slot (row 0); keep the NumPatches patch rows.
+      NN.AddLayer( TNNetCrop.Create({StartX=}1, {StartY=}0,
+        {LenX=}NumPatches, {LenY=}1) );
+    end
+    else
+    begin
+      // HF applies post_layernorm (and the projection) only to the pooled
+      // class token; applying them PER TOKEN is exact for row 0.
+      PostLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+      if ProjectionTensorName <> '' then
+        Proj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(ProjectionDim) );
+    end;
     if pInferenceOnly then NN.MakeInferenceOnly();
 
     // ---------------- Weights ----------------
@@ -12340,12 +29592,13 @@ begin
       PreLNName := Prefix + 'pre_layernorm';
     LoadLayerNormWeights(Reader, PreLN, PreLNName + '.weight',
       PreLNName + '.bias', Tower.HiddenSize);
-    for BlockCnt := 0 to Tower.NumLayers - 1 do
+    for BlockCnt := 0 to BuiltLayers - 1 do
       LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
         Prefix + 'encoder.layers.' + IntToStr(BlockCnt) + '.', Tower);
-    LoadLayerNormWeights(Reader, PostLN,
-      Prefix + 'post_layernorm.weight',
-      Prefix + 'post_layernorm.bias', Tower.HiddenSize);
+    if PostLN <> nil then
+      LoadLayerNormWeights(Reader, PostLN,
+        Prefix + 'post_layernorm.weight',
+        Prefix + 'post_layernorm.bias', Tower.HiddenSize);
     if Proj <> nil then
       LoadLlamaLinearWeights(Reader, Proj, ProjectionTensorName,
         Tower.HiddenSize, ProjectionDim); // bias-free: CAI biases zeroed
@@ -12662,6 +29915,668 @@ begin
     Result := Result + EmbA.FData[ChanCnt] * EmbB.FData[ChanCnt];
 end;
 
+// ===========================================================================
+// SigLIP IMPORT (see the interface header). Reuses TClipTowerConfig and the
+// CLIP encoder-block builder/loader; only the embeddings, heads, pooling and
+// scoring differ.
+// ===========================================================================
+
+function SigLIPHiddenActFromString(const ActStr: string): TClipHiddenAct;
+begin
+  // Every published SigLIP uses gelu_pytorch_tanh (the tanh-approx GELU).
+  // gelu_new is an accepted spelling of the same; the exact erf gelu and
+  // quick_gelu are visibly different (see the fixture self-checks) and are
+  // rejected so a mislabelled config fails loudly rather than silently.
+  if (ActStr = 'gelu_pytorch_tanh') or (ActStr = 'gelu_new') then
+    Result := chaGeluTanh
+  else
+  begin
+    Result := chaGeluTanh;
+    ImportError('SigLIP import: hidden_act "' + ActStr + '" is not ' +
+      'supported - SigLIP uses "gelu_pytorch_tanh".');
+  end;
+end;
+
+function ReadSigLIPConfigFromJSONFile(const FileName: string): TSigLIPConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, TowerObj: TJSONObject;
+  ModelType: string;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(FieldName);
+    if (Data = nil) or not (Data is TJSONObject) then
+      ImportError('SigLIP import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(Data);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('SigLIP import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('SigLIP import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        O.Find(FieldName).AsJSON + '.');
+  end;
+
+  procedure ReadTower(O: TJSONObject; var Tower: TClipTowerConfig);
+  begin
+    Tower.HiddenSize := RequiredInt(O, 'hidden_size');
+    Tower.IntermediateSize := RequiredInt(O, 'intermediate_size');
+    Tower.NumLayers := RequiredInt(O, 'num_hidden_layers');
+    Tower.NumHeads := RequiredInt(O, 'num_attention_heads');
+    Tower.LayerNormEps := O.Get('layer_norm_eps', 0.000001);
+    Tower.HiddenAct := SigLIPHiddenActFromString(
+      O.Get('hidden_act', 'gelu_pytorch_tanh'));
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('SigLIP import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('SigLIP import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('SigLIP import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'siglip');
+    if (ModelType <> 'siglip') and (ModelType <> 'siglip2') then
+      ImportError('SigLIP import: config model_type is "' + ModelType +
+        '" - only "siglip" / "siglip2" are supported here.');
+    Result.ModelType := ModelType;
+    TowerObj := RequiredSubObject('text_config');
+    ReadTower(TowerObj, Result.Text);
+    Result.TextVocabSize := RequiredInt(TowerObj, 'vocab_size');
+    Result.TextMaxPositions :=
+      RequiredInt(TowerObj, 'max_position_embeddings');
+    // SigLIP's text head out width is projection_size (defaults to the text
+    // hidden_size in every published SigLIP).
+    Result.ProjectionDim :=
+      TowerObj.Get('projection_size', Result.Text.HiddenSize);
+    TowerObj := RequiredSubObject('vision_config');
+    ReadTower(TowerObj, Result.Vision);
+    Result.ImageSize := RequiredInt(TowerObj, 'image_size');
+    Result.PatchSize := RequiredInt(TowerObj, 'patch_size');
+    Result.NumChannels := TowerObj.Get('num_channels', 3);
+    Result.LogitScale := 0;   // overwritten from the checkpoint tensor
+    Result.LogitBias := 0;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function SigLIPConfigToString(const Config: TSigLIPConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'siglip'
+  else Result := Config.ModelType;
+  Result := Result + ' config: text(d=' + IntToStr(Config.Text.HiddenSize) +
+    ', layers=' + IntToStr(Config.Text.NumLayers) +
+    ', heads=' + IntToStr(Config.Text.NumHeads) +
+    ', ffn=' + IntToStr(Config.Text.IntermediateSize) +
+    ', vocab=' + IntToStr(Config.TextVocabSize) +
+    ', max_pos=' + IntToStr(Config.TextMaxPositions) +
+    '), vision(d=' + IntToStr(Config.Vision.HiddenSize) +
+    ', layers=' + IntToStr(Config.Vision.NumLayers) +
+    ', heads=' + IntToStr(Config.Vision.NumHeads) +
+    ', ffn=' + IntToStr(Config.Vision.IntermediateSize) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    '), proj_dim=' + IntToStr(Config.ProjectionDim) +
+    ', logit_scale=' + FloatToStrF(Config.LogitScale, ffGeneral, 6, 0) +
+    ', logit_bias=' + FloatToStrF(Config.LogitBias, ffGeneral, 6, 0);
+end;
+
+function SigLIPLogit(ImageEmb, TextEmb: TNNetVolume;
+  LogitScale, LogitBias: TNeuralFloat): TNeuralFloat;
+begin
+  Result := Exp(LogitScale) * ClipSimilarity(ImageEmb, TextEmb) + LogitBias;
+end;
+
+function BuildSigLIPVisionTower(Reader: TNNetSafeTensorsReader;
+  const Tower: TClipTowerConfig; ImageSize, PatchSize, NumChannels: integer;
+  const Prefix: string; pInferenceOnly: boolean = false;
+  pVisionFeatures: boolean = false;
+  SelectHiddenLayer: integer = 0): TNNet;
+var
+  NN: TNNet;
+  PatchConv, PosEmb, PostLN: TNNetLayer;
+  Probe, ProbeQ, PatchKV: TNNetLayer;
+  MapQProj, MapKProj, MapVProj, MapOut: TNNetLayer;
+  MapLN, MapInter, MapFc2, AttnSum, MlpSum: TNNetLayer;
+  QSlice, KSlice, VSlice, KVPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+   Channels: array of integer;
+  Blocks: TClipBlockLayersArray;
+  Tmp: TNNetVolume;
+  d, dk, HeadCnt, ci, Grid, NumPatches, BuiltLayers, BlockCnt: integer;
+  PatchBiasName: string;
+begin
+  d := Tower.HiddenSize;
+  if (Tower.NumHeads < 1) or ((d mod Tower.NumHeads) <> 0) then
+    ImportError('SigLIP import: vision hidden_size=' + IntToStr(d) +
+      ' is not divisible by num_attention_heads=' +
+      IntToStr(Tower.NumHeads) + '.');
+  if (PatchSize < 1) or ((ImageSize mod PatchSize) <> 0) then
+    ImportError('SigLIP import: image_size=' + IntToStr(ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(PatchSize) + '.');
+  Grid := ImageSize div PatchSize;
+  NumPatches := Grid * Grid;
+  dk := d div Tower.NumHeads;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(ImageSize, ImageSize, NumChannels) );
+    // BIASED patch embedding (unlike CLIP): kernel = stride = patch_size.
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      d, PatchSize, {pInputPadding=}0, {pStride=}PatchSize,
+      {pSuppressBias=}0) );
+    // Row-major (y,x) patch grid = HF flatten(2).transpose order. NO class
+    // token (unlike CLIP): the position table covers exactly NumPatches rows.
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(NumPatches) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    // SigLIP's vision encoder is a PRENORM stack like CLIP but WITHOUT a
+    // pre_layrnorm before block 0. In LLaVA/VLM feature mode a positive
+    // SelectHiddenLayer runs only the first N blocks (HF
+    // output_hidden_states[N]); default runs the full stack.
+    if pVisionFeatures and (SelectHiddenLayer > 0) then
+      BuiltLayers := SelectHiddenLayer
+    else
+      BuiltLayers := Tower.NumLayers;
+    if BuiltLayers > Tower.NumLayers then BuiltLayers := Tower.NumLayers;
+    SetLength(Blocks, BuiltLayers);
+    for BlockCnt := 0 to BuiltLayers - 1 do
+      AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
+        Blocks[BlockCnt], pInferenceOnly);
+    PostLN := nil;
+    if pVisionFeatures then
+    begin
+      // VLM feature mode: return the (NumPatches,1,hidden) patch hidden
+      // states. The full-stack case (SelectHiddenLayer<=0) applies the final
+      // post_layernorm (HF last_hidden_state); a selected earlier layer is
+      // returned RAW (HF hidden_states[N] is pre-post_layernorm).
+      if SelectHiddenLayer <= 0 then
+        PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+    end
+    else
+    begin
+      // Inference embedding path: post_layernorm over every patch token,
+      // then the Multihead Attention Pooling (MAP) head.
+      PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+      PatchKV := NN.GetLastLayer();    // (NumPatches,1,d) K/V source
+      // The learnable probe (one virtual query token) prepended to the patch
+      // sequence by TNNetSoftPrompt; we then crop it back out as the query.
+      Probe := NN.AddLayer( TNNetSoftPrompt.Create(1, d) );
+      ProbeQ := NN.AddLayer(
+        TNNetCrop.Create({StartX=}0, {StartY=}0, {LenX=}1, {LenY=}1) );
+      // MAP cross-attention: probe (1 token) attends over the NumPatches
+      // patch tokens. Built manually (mirroring AddMultiHeadCrossAttention)
+      // so the per-head Q/K/V projections can be loaded from nn.Multihead
+      // Attention's packed in_proj_weight [3d, d].
+      MapQProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(d), ProbeQ);
+      MapKProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(d), PatchKV);
+      MapVProj := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(d), PatchKV);
+      SetLength(HeadOutputs, Tower.NumHeads);
+      SetLength(Channels, dk);
+      for HeadCnt := 0 to Tower.NumHeads - 1 do
+      begin
+        for ci := 0 to dk - 1 do Channels[ci] := HeadCnt * dk + ci;
+        QSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(Channels), MapQProj);
+        KSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(Channels), MapKProj);
+        VSlice := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(Channels), MapVProj);
+        KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+        HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+          TNNetCrossAttention.Create(dk, {CausalMask=}false, KVPack), QSlice);
+      end;
+      NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+      MapOut := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+      SetLength(HeadOutputs, 0);
+      SetLength(Channels, 0);
+      // residual = attn; out = residual + mlp(layernorm(attn)); take row 0.
+      AttnSum := MapOut;
+      MapLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Tower.LayerNormEps) );
+      MapInter := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Tower.IntermediateSize) );
+      AddClipHiddenAct(NN, Tower.HiddenAct);
+      MapFc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+      MlpSum := NN.AddLayer( TNNetSum.Create([MapFc2, AttnSum]) );
+      // The pooled output is row 0 (the single probe row); already (1,1,d).
+      if MlpSum = nil then ;  // (silence unused warning paths)
+    end;
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    PatchBiasName := Prefix + 'embeddings.patch_embedding.bias';
+    LoadClipPatchConv(Reader, PatchConv,
+      Prefix + 'embeddings.patch_embedding.weight',
+      NumChannels, PatchSize, d);
+    // SigLIP's patch conv IS biased (LoadClipPatchConv zeroes the bias for
+    // CLIP); load the per-output-channel bias into each neuron's BiasWeight.
+    if not Reader.HasTensor(PatchBiasName) then
+      ImportError('SigLIP import: missing tensor "' + PatchBiasName + '".')
+    else
+    begin
+      if (Reader.DimCount(PatchBiasName) <> 1) or
+         (Reader.DimSize(PatchBiasName, 0) <> d) then
+        ImportError('SigLIP import: "' + PatchBiasName + '" must have shape ['
+          + IntToStr(d) + '], got ' + Reader.ShapeAsString(PatchBiasName));
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(PatchBiasName, Tmp);
+        for ci := 0 to d - 1 do
+          PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+        PatchConv.FlushWeightCache();
+      finally
+        Tmp.Free;
+      end;
+    end;
+    LoadClipEmbeddingTable(Reader, PosEmb,
+      Prefix + 'embeddings.position_embedding.weight', NumPatches, d);
+    for BlockCnt := 0 to BuiltLayers - 1 do
+      LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
+        Prefix + 'encoder.layers.' + IntToStr(BlockCnt) + '.', Tower);
+    if PostLN <> nil then
+      LoadLayerNormWeights(Reader, PostLN,
+        Prefix + 'post_layernorm.weight',
+        Prefix + 'post_layernorm.bias', d);
+    if not pVisionFeatures then
+    begin
+      // probe [1,1,d] -> the SoftPrompt bank row 0 (d values, flattened).
+      if not Reader.HasTensor(Prefix + 'head.probe') then
+        ImportError('SigLIP import: missing tensor "' + Prefix +
+          'head.probe".');
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(Prefix + 'head.probe', Tmp);
+        if Tmp.Size <> d then
+          ImportError('SigLIP import: "' + Prefix + 'head.probe" must have ' +
+            IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
+        for ci := 0 to d - 1 do
+          Probe.Neurons[0].Weights.FData[ci] := Tmp.FData[ci];
+        Probe.FlushWeightCache();
+      finally
+        Tmp.Free;
+      end;
+      // nn.MultiheadAttention in_proj_weight [3d, d] = [Wq; Wk; Wv] row
+      // blocks; in_proj_bias [3d] likewise. Slice each block into Q/K/V.
+      LoadLlamaLinearWeights(Reader, MapQProj,
+        Prefix + 'head.attention.in_proj_weight', d, d, 0, d, 0,
+        Prefix + 'head.attention.in_proj_bias', 1.0, 0, 0, 3 * d);
+      LoadLlamaLinearWeights(Reader, MapKProj,
+        Prefix + 'head.attention.in_proj_weight', d, d, 0, d, 0,
+        Prefix + 'head.attention.in_proj_bias', 1.0, 0, d, 3 * d);
+      LoadLlamaLinearWeights(Reader, MapVProj,
+        Prefix + 'head.attention.in_proj_weight', d, d, 0, d, 0,
+        Prefix + 'head.attention.in_proj_bias', 1.0, 0, 2 * d, 3 * d);
+      LoadLlamaLinearWeights(Reader, MapOut,
+        Prefix + 'head.attention.out_proj.weight', d, d, 0, -1, 0,
+        Prefix + 'head.attention.out_proj.bias');
+      LoadLayerNormWeights(Reader, MapLN,
+        Prefix + 'head.layernorm.weight',
+        Prefix + 'head.layernorm.bias', d);
+      LoadLlamaLinearWeights(Reader, MapInter,
+        Prefix + 'head.mlp.fc1.weight', d, Tower.IntermediateSize, 0, -1, 0,
+        Prefix + 'head.mlp.fc1.bias');
+      LoadLlamaLinearWeights(Reader, MapFc2,
+        Prefix + 'head.mlp.fc2.weight', Tower.IntermediateSize, d, 0, -1, 0,
+        Prefix + 'head.mlp.fc2.bias');
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+procedure BuildSigLIPFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TSigLIPConfig; out TextNet, VisionNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  TokEmb, PosEmb, FinalLN, Head: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  Tmp: TNNetVolume;
+  SeqLen, BlockCnt: integer;
+begin
+  TextNet := nil;
+  VisionNet := nil;
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  try
+    try
+      if (Config.Text.NumHeads < 1) or
+         ((Config.Text.HiddenSize mod Config.Text.NumHeads) <> 0) then
+        ImportError('SigLIP import: text hidden_size=' +
+          IntToStr(Config.Text.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.Text.NumHeads) + '.');
+      if TextSeqLen <= 0 then SeqLen := Config.TextMaxPositions
+      else SeqLen := TextSeqLen;
+      if SeqLen > Config.TextMaxPositions then
+        ImportError('SigLIP import: requested TextSeqLen=' +
+          IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
+          IntToStr(Config.TextMaxPositions) + '.');
+
+      // ---------------- TEXT tower architecture ----------------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
+      TokEmb := NN.AddLayer( TNNetEmbedding.Create(
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1) );
+      PosEmb := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.Text.NumLayers);
+      // BIDIRECTIONAL (no causal mask), unlike CLIP's text tower.
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+        AddClipEncoderBlock(NN, Config.Text, {CausalMask=}false,
+          Blocks[BlockCnt], pInferenceOnly);
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      // BIASED head nn.Linear applied PER TOKEN; HF's text_embeds is the row
+      // at the LAST position (SigLIPExtractEmbedding: TokenPos = SeqLen-1).
+      Head := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- TEXT tower weights ----------------
+      LoadClipEmbeddingTable(Reader, TokEmb,
+        'text_model.embeddings.token_embedding.weight',
+        Config.TextVocabSize, Config.Text.HiddenSize);
+      LoadClipEmbeddingTable(Reader, PosEmb,
+        'text_model.embeddings.position_embedding.weight',
+        Config.TextMaxPositions, Config.Text.HiddenSize);
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+        LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
+          'text_model.encoder.layers.' + IntToStr(BlockCnt) + '.',
+          Config.Text);
+      LoadLayerNormWeights(Reader, FinalLN,
+        'text_model.final_layer_norm.weight',
+        'text_model.final_layer_norm.bias', Config.Text.HiddenSize);
+      LoadLlamaLinearWeights(Reader, Head, 'text_model.head.weight',
+        Config.Text.HiddenSize, Config.ProjectionDim, 0, -1, 0,
+        'text_model.head.bias');  // BIASED (unlike CLIP's text_projection)
+      TextNet := NN;
+      NN := nil;
+
+      // ---------------- VISION tower ----------------
+      VisionNet := BuildSigLIPVisionTower(Reader, Config.Vision,
+        Config.ImageSize, Config.PatchSize, Config.NumChannels,
+        'vision_model.', pInferenceOnly);
+
+      // ---------------- logit_scale / logit_bias ----------------
+      if Reader.HasTensor('logit_scale') then
+      begin
+        Tmp := TNNetVolume.Create;
+        try
+          Reader.LoadTensorFlat('logit_scale', Tmp);
+          if Tmp.Size >= 1 then Config.LogitScale := Tmp.FData[0];
+        finally
+          Tmp.Free;
+        end;
+      end;
+      if Reader.HasTensor('logit_bias') then
+      begin
+        Tmp := TNNetVolume.Create;
+        try
+          Reader.LoadTensorFlat('logit_bias', Tmp);
+          if Tmp.Size >= 1 then Config.LogitBias := Tmp.FData[0];
+        finally
+          Tmp.Free;
+        end;
+      end;
+    except
+      NN.Free;
+      TextNet.Free;
+      TextNet := nil;
+      VisionNet.Free;
+      VisionNet := nil;
+      raise;
+    end;
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure BuildSigLIPFromSafeTensors(const FileName: string;
+  out TextNet, VisionNet: TNNet; out Config: TSigLIPConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSigLIPConfigFromJSONFile(ConfigPath);
+  BuildSigLIPFromSafeTensorsWithConfig(FileName, Config, TextNet, VisionNet,
+    TextSeqLen, pInferenceOnly);
+end;
+
+function ReadClipImageProcessorConfig(
+  const FileName: string): TClipImageProcessorConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+
+  // Reads a size-like field that may be an int (square) or an object with
+  // shortest_edge / height / width. Returns the resolved edge length;
+  // OutH/OutW receive height/width (= edge when square / shortest_edge).
+  procedure ReadSize(const FieldName: string; DefaultEdge: integer;
+    out OutEdge, OutH, OutW: integer);
+  var
+    Data: TJSONData;
+    O: TJSONObject;
+  begin
+    OutEdge := DefaultEdge;
+    OutH := DefaultEdge;
+    OutW := DefaultEdge;
+    Data := Obj.Find(FieldName);
+    if Data = nil then Exit;
+    if Data is TJSONObject then
+    begin
+      O := TJSONObject(Data);
+      if O.IndexOfName('shortest_edge') >= 0 then
+      begin
+        OutEdge := O.Get('shortest_edge', DefaultEdge);
+        OutH := OutEdge;
+        OutW := OutEdge;
+      end;
+      if O.IndexOfName('height') >= 0 then OutH := O.Get('height', OutH);
+      if O.IndexOfName('width') >= 0 then OutW := O.Get('width', OutW);
+      if O.IndexOfName('shortest_edge') < 0 then
+        OutEdge := OutH;
+    end
+    else if Data.JSONType = jtNumber then
+    begin
+      OutEdge := Data.AsInteger;
+      OutH := OutEdge;
+      OutW := OutEdge;
+    end;
+  end;
+
+  procedure ReadTriple(const FieldName: string; var Arr: array of TNeuralFloat;
+    D0, D1, D2: TNeuralFloat);
+  var
+    Data: TJSONData;
+    A: TJSONArray;
+  begin
+    Arr[0] := D0; Arr[1] := D1; Arr[2] := D2;
+    Data := Obj.Find(FieldName);
+    if (Data <> nil) and (Data is TJSONArray) then
+    begin
+      A := TJSONArray(Data);
+      if A.Count >= 3 then
+      begin
+        Arr[0] := A.Items[0].AsFloat;
+        Arr[1] := A.Items[1].AsFloat;
+        Arr[2] := A.Items[2].AsFloat;
+      end;
+    end;
+  end;
+
+var
+  SizeH, SizeW, CropEdge: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('CLIP image preprocessing: config file not found: ' +
+      FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('CLIP image preprocessing: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('CLIP image preprocessing: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+
+    // size.shortest_edge (resize target). When size is square the edge is
+    // the side length.
+    ReadSize('size', 224, Result.ShortestEdge, SizeH, SizeW);
+    if Result.ShortestEdge <= 0 then Result.ShortestEdge := SizeH;
+
+    // crop_size.{height,width}.
+    ReadSize('crop_size', Result.ShortestEdge, CropEdge,
+      Result.CropHeight, Result.CropWidth);
+
+    Result.DoResize := Obj.Get('do_resize', true);
+    Result.DoCenterCrop := Obj.Get('do_center_crop', true);
+    Result.DoRescale := Obj.Get('do_rescale', true);
+    Result.DoNormalize := Obj.Get('do_normalize', true);
+    Result.RescaleFactor := Obj.Get('rescale_factor', 1.0 / 255.0);
+    ReadTriple('image_mean', Result.Mean,
+      0.48145466, 0.4578275, 0.40821073);
+    ReadTriple('image_std', Result.Std,
+      0.26862954, 0.26130258, 0.27577711);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+procedure ClipPreprocessImage(Src, Dst: TNNetVolume;
+  const Config: TClipImageProcessorConfig);
+var
+  Work: TNNetVolume;
+  ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
+  Scale, Fx, Fy, V: TNeuralFloat;
+begin
+  if (Src = nil) or (Dst = nil) then
+    ImportError('ClipPreprocessImage: nil volume.');
+  if Src.Depth <> 3 then
+    ImportError('ClipPreprocessImage: source must have depth 3 (RGB), got ' +
+      IntToStr(Src.Depth) + '.');
+
+  Work := TNNetVolume.Create;
+  try
+    // ---- resize: shortest edge -> Config.ShortestEdge, aspect preserved.
+    // HF uses bicubic; this is bilinear (identity when already at size).
+    if Config.DoResize and
+       ((Src.SizeX <> Config.ShortestEdge) or
+        (Src.SizeY <> Config.ShortestEdge)) then
+    begin
+      if Src.SizeX <= Src.SizeY then
+      begin
+        Scale := Config.ShortestEdge / Src.SizeX;
+        ResizeW := Config.ShortestEdge;
+        ResizeH := Round(Src.SizeY * Scale);
+      end
+      else
+      begin
+        Scale := Config.ShortestEdge / Src.SizeY;
+        ResizeH := Config.ShortestEdge;
+        ResizeW := Round(Src.SizeX * Scale);
+      end;
+      if ResizeW < 1 then ResizeW := 1;
+      if ResizeH < 1 then ResizeH := 1;
+      Work.ReSize(ResizeW, ResizeH, 3);
+      for Y := 0 to ResizeH - 1 do
+        for X := 0 to ResizeW - 1 do
+        begin
+          // bilinear sample (align_corners = false convention)
+          Fx := (X + 0.5) * Src.SizeX / ResizeW - 0.5;
+          Fy := (Y + 0.5) * Src.SizeY / ResizeH - 0.5;
+          if Fx < 0 then Fx := 0;
+          if Fy < 0 then Fy := 0;
+          SrcX := Trunc(Fx); SrcY := Trunc(Fy);
+          if SrcX > Src.SizeX - 1 then SrcX := Src.SizeX - 1;
+          if SrcY > Src.SizeY - 1 then SrcY := Src.SizeY - 1;
+          for C := 0 to 2 do
+            Work[X, Y, C] := Src[SrcX, SrcY, C]; // nearest fallback edge
+        end;
+    end
+    else
+      Work.Copy(Src);
+
+    // ---- center crop to (CropWidth, CropHeight).
+    if Config.DoCenterCrop then
+    begin
+      OffX := (Work.SizeX - Config.CropWidth) div 2;
+      OffY := (Work.SizeY - Config.CropHeight) div 2;
+    end
+    else
+    begin
+      OffX := 0;
+      OffY := 0;
+    end;
+    Dst.ReSize(Config.CropWidth, Config.CropHeight, 3);
+    for Y := 0 to Config.CropHeight - 1 do
+      for X := 0 to Config.CropWidth - 1 do
+      begin
+        SrcX := OffX + X;
+        SrcY := OffY + Y;
+        // pad with zeros if the crop window exceeds the resized image
+        if (SrcX < 0) or (SrcY < 0) or
+           (SrcX > Work.SizeX - 1) or (SrcY > Work.SizeY - 1) then
+        begin
+          for C := 0 to 2 do Dst[X, Y, C] := 0;
+          continue;
+        end;
+        for C := 0 to 2 do
+        begin
+          V := Work[SrcX, SrcY, C];
+          if Config.DoRescale then V := V * Config.RescaleFactor;
+          if Config.DoNormalize then
+            V := (V - Config.Mean[C]) / Config.Std[C];
+          Dst[X, Y, C] := V;
+        end;
+      end;
+  finally
+    Work.Free;
+  end;
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
@@ -12669,7 +30584,7 @@ var
   ConfigPath, WeightsPath, ModelType, ArchName: string;
   JsonText: TStringList;
   Root, ArchData: TJSONData;
-  NumHeads, ArchCnt: integer;
+  NumHeads, ArchCnt, Wav2Vec2Samples: integer;
   BertSeqCls, GPT2SeqCls, GPT2ExactGelu: boolean;
   IgnoredGPT2Config: TGPT2Config;
   IgnoredId2Label: TStringList;
@@ -12677,13 +30592,24 @@ var
   IgnoredGPTNeoConfig: TGPTNeoConfig;
   IgnoredGPTNeoXConfig: TGPTNeoXConfig;
   IgnoredGPTJConfig: TGPTJConfig;
+  IgnoredStarCoder2Config: TStarCoder2Config;
+  IgnoredGptBigCodeConfig: TGptBigCodeConfig;
+  IgnoredGptOssConfig: TGptOssConfig;
+  IgnoredCohereConfig: TCohereConfig;
   IgnoredPhiConfig: TPhiConfig;
   IgnoredBertConfig: TBertConfig;
   IgnoredRWKVConfig: TRWKVConfig;
   IgnoredMambaConfig: TMambaConfig;
+  IgnoredMamba2Config: TMamba2Config;
+  IgnoredRecGemmaConfig: TRecurrentGemmaConfig;
+  IgnoredJambaConfig: TJambaConfig;
+  IgnoredNemotronHConfig: TNemotronHConfig;
   IgnoredBloomConfig: TBloomConfig;
+  IgnoredFalconConfig: TFalconConfig;
   IgnoredModernBertConfig: TModernBertConfig;
+  IgnoredDebertaV2Config: TDebertaV2Config;
   IgnoredDeepSeekV2Config: TDeepSeekV2Config;
+  IgnoredWav2Vec2Config: TWav2Vec2Config;
 begin
   // ---- resolve the weights file and the config.json ----
   if DirectoryExists(Path) then
@@ -12788,13 +30714,81 @@ begin
   else if ModelType = 'gptj' then
     Result := BuildGPTJFromSafeTensorsEx(WeightsPath, IgnoredGPTJConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'starcoder2' then
+    // Starcoder2 (architectures ["Starcoder2ForCausalLM"],
+    // bigcode/starcoder2-3b/7b/15b): the first CODE-specialised decoder -
+    // RoPE + GQA + (optional) sliding window with biased nn.LayerNorm norms
+    // (NOT RMSNorm), bias=True on all q/k/v AND o_proj linears, and a plain
+    // two-matrix gelu_pytorch_tanh FFN (c_fc -> GELU -> c_proj, no gate).
+    // Causal-LM contract like the other decoder families. See the STARCODER2
+    // IMPORT section.
+    Result := BuildStarCoder2FromSafeTensorsEx(WeightsPath,
+      IgnoredStarCoder2Config, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
+  else if ModelType = 'gpt_bigcode' then
+    // GPT-BigCode / StarCoder-v1 (architectures ["GPTBigCodeForCausalLM"];
+    // bigcode/starcoder, gpt_bigcode-santacoder, StarCoderBase): the biased
+    // pre-LN GPT-2 skeleton (biased nn.LayerNorm norms, bias on every linear,
+    // two-matrix gelu-tanh FFN) with LEARNED absolute positions (wpe; NO RoPE),
+    // a FUSED c_attn slab and MULTI-QUERY attention (one shared K/V head
+    // broadcast across query heads). See the GPT-BIGCODE IMPORT section.
+    Result := BuildGptBigCodeFromSafeTensorsEx(WeightsPath,
+      IgnoredGptBigCodeConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
+  else if ModelType = 'gpt_oss' then
+    // GPT-OSS (OpenAI gpt-oss, architectures ["GptOssForCausalLM"], the
+    // openai/gpt-oss-20b/120b family): sparse top-k MoE decoder with learned
+    // per-head attention sinks, alternating sliding/full attention, YaRN RoPE
+    // and gpt-oss's clamped-SwiGLU experts (MXFP4 dequant-at-load for the real
+    // checkpoints). See BuildGptOssFromSafeTensors.
+    Result := BuildGptOssFromSafeTensorsEx(WeightsPath, IgnoredGptOssConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if (ModelType = 'cohere') or (ModelType = 'cohere2') then
+    // Cohere Command-R / Aya (architectures ["CohereForCausalLM"]) and the
+    // Command-R7B variant (["Cohere2ForCausalLM"]): parallel residual,
+    // mean-subtracting weight-only LayerNorm, interleaved RoPE, tied
+    // embeddings with logit_scale folded into the head. cohere2 adds the
+    // alternating sliding/global pattern with NoPE on global layers. See
+    // the COHERE IMPORT section.
+    Result := BuildCohereFromSafeTensorsEx(WeightsPath, IgnoredCohereConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'phi' then
     Result := BuildPhiFromSafeTensorsEx(WeightsPath, IgnoredPhiConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'internlm2' then
+    // InternLM2 / InternLM2.5 (architectures ["InternLM2ForCausalLM"],
+    // internlm/internlm2_5-*): a plain Llama backbone whose ONLY new piece is
+    // the checkpoint layout - the fused group-interleaved attention.wqkv slab
+    // and the InternLM2 tensor names - both translated to standard HF Llama
+    // names + separate W_q/W_k/W_v by the InternLM2 reader, then ridden over
+    // the Llama path. See BuildInternLM2FromSafeTensors.
+    Result := BuildInternLM2FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if (ModelType = 'llama4') or (ModelType = 'llama4_text') then
+    // Llama-4 text decoder (architectures ["Llama4ForCausalLM"],
+    // meta-llama/Llama-4-Scout-17B-16E + redistills; text-only - the vision
+    // tower is out of scope). iRoPE (interleaved RoPE / NoPE chunked layers),
+    // NoPE attention temperature tuning, L2 QK-norm on the RoPE layers, and a
+    // sigmoid-gated top-k MoE with an always-on shared expert. See
+    // BuildLlama4FromSafeTensors.
+    Result := BuildLlama4FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'llama') or (ModelType = 'mistral') or
           (ModelType = 'qwen2') or (ModelType = 'qwen3') or
+          (ModelType = 'qwen3_moe') or
           (ModelType = 'gemma') or (ModelType = 'gemma2') or
-          (ModelType = 'gemma3_text') or (ModelType = 'phi3') then
+          (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
+          (ModelType = 'olmo2') or (ModelType = 'olmoe') or
+          (ModelType = 'mixtral') or
+          (ModelType = 'glm4') or
+          (ModelType = 'granite') or (ModelType = 'granitemoe') or
+          (ModelType = 'minicpm') or
+          (ModelType = 'bitnet') then
+    // 'glm4' (architectures ["Glm4ForCausalLM"], THUDM/GLM-4-9B-0414 etc.)
+    // raises the four-norm sandwich (post_self_attn_layernorm /
+    // post_mlp_layernorm INSIDE the residual branches), partial+interleaved
+    // rotary and fused-gate_up flags from model_type alone (the older
+    // two-norm "glm" is rejected by the config reader).
     // 'gemma' (architectures ["GemmaForCausalLM"]) rides the same path: the
     // config reader raises the Gemma flags (GeGLU FFN, zero-centered
     // RMSNorm, sqrt(d) embedding scale) from model_type alone. 'gemma2'
@@ -12806,7 +30800,15 @@ begin
     // with per-layer-type RoPE theta. 'phi3' (["Phi3ForCausalLM"],
     // Phi-3-mini / Phi-4-mini) raises the fused qkv_proj/gate_up_proj and
     // partial-rotary flags the same way (the 128k longrope variants are
-    // rejected by the config reader).
+    // rejected by the config reader). 'olmo2' (["Olmo2ForCausalLM"]) raises
+    // the reordered post-norm (x + Norm(Attn(x)), no input_layernorm) and
+    // full-width q/k RMSNorm flags. 'mixtral' (["MixtralForCausalLM"])
+    // raises the block_sparse_moe flags (per-FFN router gate +
+    // num_local_experts SwiGLU experts, renormalized top-k routing).
+    // 'granite' (["GraniteForCausalLM"]) / 'granitemoe'
+    // (["GraniteMoeForCausalLM"]) raise the four Granite scalar multipliers
+    // (embedding / residual / attention / logits), all load-time folds; the
+    // MoE variant adds the fused 3-D expert slab.
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
@@ -12833,12 +30835,54 @@ begin
     // logits out). See the MAMBA IMPORT section.
     Result := BuildMambaFromSafeTensorsEx(WeightsPath, IgnoredMambaConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'mamba2' then
+    // Mamba-2 / SSD (architectures ["Mamba2ForCausalLM"]), the multi-head
+    // state-space-duality successor to Mamba-1 (per-head scalar A, grouped
+    // B/C, gated RMSNorm before out_proj). Causal-LM contract like the other
+    // decoder families. See the MAMBA-2 IMPORT section.
+    Result := BuildMamba2FromSafeTensorsEx(WeightsPath, IgnoredMamba2Config,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'recurrent_gemma' then
+    // RecurrentGemma (architectures ["RecurrentGemmaForCausalLM"]) - the
+    // Griffin/Hawk recurrent+local-attention hybrid built on the new
+    // TNNetRGLRU. Causal-LM contract like the other decoder families. See the
+    // RECURRENT GEMMA IMPORT section.
+    Result := BuildRecurrentGemmaFromSafeTensorsEx(WeightsPath,
+      IgnoredRecGemmaConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
+  else if ModelType = 'jamba' then
+    // The first HYBRID route: Jamba (architectures ["JambaForCausalLM"]) -
+    // interleaved Mamba / softmax-attention layers with per-layer dense or
+    // top-k MoE FFNs on the config schedule. NoPE, RMSNorm, GQA. Causal-LM
+    // contract like the other decoder families. See the JAMBA IMPORT section.
+    Result := BuildJambaFromSafeTensorsEx(WeightsPath, IgnoredJambaConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if ModelType = 'nemotron_h' then
+    // The second HYBRID route: Nemotron-H (architectures
+    // ["NemotronHForCausalLM"]) - the multi-head TNNetMamba2 SSD mixer, full
+    // softmax-attention, and a non-gated relu2 MLP interleaved on an explicit
+    // per-layer override-pattern schedule. NoPE, RMSNorm, GQA. Causal-LM
+    // contract like the other decoder families. See the NEMOTRON-H IMPORT
+    // section.
+    Result := BuildNemotronHFromSafeTensorsEx(WeightsPath,
+      IgnoredNemotronHConfig, pSeqLen, pInferenceOnly, ConfigPath,
+      pQuantizeInt8)
   else if ModelType = 'bloom' then
     // The ALiBi route: BLOOM (architectures ["BloomForCausalLM"]), no
     // positional embeddings - per-head fixed linear attention biases
     // (TNNetALiBiAttention). Causal-LM contract like the other decoder
     // families. See the BLOOM IMPORT section.
     Result := BuildBloomFromSafeTensorsEx(WeightsPath, IgnoredBloomConfig,
+      pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
+  else if (ModelType = 'falcon') or (ModelType = 'RefinedWebModel') or
+          (ModelType = 'RefinedWeb') then
+    // Falcon (architectures ["FalconForCausalLM"]; the original tiiuae
+    // exports used model_type "RefinedWebModel" = falcon-7b and "RefinedWeb"
+    // = falcon-40b): fused multi-query/GQA query_key_value, RoPE, parallel
+    // attention+MLP residual with one (parallel_attn) or two (new arch,
+    // ln_attn/ln_mlp) LayerNorms. Causal-LM contract like the other decoder
+    // families. See the FALCON IMPORT section.
+    Result := BuildFalconFromSafeTensorsEx(WeightsPath, IgnoredFalconConfig,
       pSeqLen, pInferenceOnly, ConfigPath, pQuantizeInt8)
   else if ModelType = 'modernbert' then
     // The second ENCODER route: ModernBERT (architectures
@@ -12849,6 +30893,17 @@ begin
     Result := BuildModernBertFromSafeTensorsEx(WeightsPath,
       IgnoredModernBertConfig, pSeqLen, pInferenceOnly, ConfigPath,
       pQuantizeInt8)
+  else if ModelType = 'deberta-v2' then
+    // The third ENCODER route: DeBERTa-v2/v3 (architectures
+    // ["DebertaV2Model"]; the deberta-v3 family - microsoft/deberta-v3-base,
+    // the ms-marco rerankers) - input (SeqLen,1,2) token|token-type ids
+    // (channel 1 ignored, type_vocab_size=0), output (SeqLen,1,hidden) final
+    // hidden states. The FIRST disentangled-attention encoder
+    // (TNNetDisentangledAttention). Sequence-classification head excluded;
+    // call BuildDebertaV2FromSafeTensorsEx with pSeqClsHead=true for it. See
+    // the DEBERTA-V2 IMPORT section.
+    Result := BuildDebertaV2FromSafeTensorsEx(WeightsPath,
+      IgnoredDebertaV2Config, pSeqLen, pInferenceOnly, ConfigPath)
   else if ModelType = 'deepseek_v2' then
     // DeepSeek-V2 (architectures ["DeepseekV2ForCausalLM"];
     // DeepSeek-V2-Lite is the reference checkpoint): Multi-head Latent
@@ -12880,6 +30935,46 @@ begin
       'both nets; run them with RunT5) instead of this single-net ' +
       'dispatch.');
   end
+  else if ModelType = 'bart' then
+  begin
+    // BART is an encoder-decoder: the import builds TWO nets, which this
+    // single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "bart" builds an ' +
+      'ENCODER-DECODER pair - call BuildBartFromSafeTensors (returns ' +
+      'both nets; run them with RunT5) instead of this single-net ' +
+      'dispatch.');
+  end
+  else if ModelType = 'pegasus' then
+  begin
+    // Pegasus is an encoder-decoder: the import builds TWO nets, which this
+    // single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "pegasus" builds an ' +
+      'ENCODER-DECODER pair - call BuildPegasusFromSafeTensors (returns ' +
+      'both nets; run them with RunT5) instead of this single-net ' +
+      'dispatch.');
+  end
+  else if ModelType = 'mbart' then
+  begin
+    // mBART is an encoder-decoder: the import builds TWO nets, which this
+    // single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "mbart" builds an ' +
+      'ENCODER-DECODER pair - call BuildMBartFromSafeTensors (returns ' +
+      'both nets; run them with RunT5) instead of this single-net ' +
+      'dispatch.');
+  end
+  else if ModelType = 'm2m_100' then
+  begin
+    // M2M100/NLLB is an encoder-decoder: the import builds TWO nets, which
+    // this single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "m2m_100" builds an ' +
+      'ENCODER-DECODER pair - call BuildM2M100FromSafeTensors (returns ' +
+      'both nets; run them with RunT5) instead of this single-net ' +
+      'dispatch.');
+  end
   else if ModelType = 'whisper' then
   begin
     // Whisper is an encoder-decoder: the import builds TWO nets, which
@@ -12890,6 +30985,17 @@ begin
       'both nets; run them with RunT5, mel input from ' +
       'neuralaudio.ComputeWhisperLogMel) instead of this single-net ' +
       'dispatch.');
+  end
+  else if (ModelType = 'wav2vec2') or (ModelType = 'hubert') then
+  begin
+    // Wav2Vec2 / HuBERT CTC: a single-net raw-waveform ASR encoder. Here
+    // pSeqLen is reinterpreted as the RAW SAMPLE COUNT of the clip the net
+    // is built for (a default of 16000 = 1 second at 16 kHz when 0). The
+    // output is (EncLen,1,vocab) CTC logits - decode with DecodeCTCGreedy.
+    if pSeqLen > 0 then Wav2Vec2Samples := pSeqLen
+    else Wav2Vec2Samples := 16000;
+    Result := BuildWav2Vec2FromSafeTensorsEx(WeightsPath,
+      IgnoredWav2Vec2Config, Wav2Vec2Samples, pInferenceOnly, ConfigPath);
   end
   else if ModelType = 'clip' then
   begin
@@ -12902,14 +31008,26 @@ begin
       'ClipTextEosPosition, ClipExtractEmbedding and ClipSimilarity) ' +
       'instead of this single-net dispatch.');
   end
+  else if (ModelType = 'siglip') or (ModelType = 'siglip2') then
+  begin
+    // SigLIP is a sigmoid-loss dual encoder: the import builds TWO nets
+    // (text + vision), which this single-net dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "' + ModelType +
+      '" builds a TWO-net dual encoder (text + vision) - call ' +
+      'BuildSigLIPFromSafeTensors (returns both nets; pool with ' +
+      'ClipExtractEmbedding - text row SeqLen-1, image row 0 - and score ' +
+      'with SigLIPLogit) instead of this single-net dispatch.');
+  end
   else
   begin
     Result := nil;
     ImportError('BuildFromPretrained: model_type "' + ModelType +
       '" (config ' + ConfigPath + ') is not supported. Supported ' +
       'model_types: gpt2, gpt_neo, gpt_neox, gptj, phi, phi3, llama, ' +
-      'mistral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, mamba, ' +
-      'bloom, bert, distilbert, roberta, modernbert, deepseek_v2.');
+      'mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, ' +
+      'mamba, bloom, falcon, bert, distilbert, roberta, modernbert, ' +
+      'deepseek_v2, olmo2, wav2vec2, hubert.');
   end;
 end;
 

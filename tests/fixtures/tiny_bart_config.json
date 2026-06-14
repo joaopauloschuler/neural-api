@@ -1,0 +1,25 @@
+{
+ "architectures": [
+  "BartForConditionalGeneration"
+ ],
+ "model_type": "bart",
+ "d_model": 8,
+ "encoder_layers": 2,
+ "decoder_layers": 2,
+ "encoder_attention_heads": 2,
+ "decoder_attention_heads": 2,
+ "encoder_ffn_dim": 16,
+ "decoder_ffn_dim": 16,
+ "vocab_size": 13,
+ "max_position_embeddings": 16,
+ "activation_function": "gelu",
+ "scale_embedding": false,
+ "tie_word_embeddings": true,
+ "dropout": 0.0,
+ "attention_dropout": 0.0,
+ "activation_dropout": 0.0,
+ "bos_token_id": 0,
+ "pad_token_id": 1,
+ "eos_token_id": 2,
+ "decoder_start_token_id": 2
+}

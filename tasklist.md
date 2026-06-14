@@ -85,16 +85,149 @@ rather than acted on.
 - [ ] FFT-path FPU denormal/invalid-op traps in TNNetSpectralConv2D needed an
       example-side SetExceptionMask workaround — consider masking/guarding the
       denormals inside the layer's FFT so callers don't have to.
+- [ ] ulimit -v 3000000 ChatTerminal /path/to/Qwen2.5-0.5B-Instruct crashes using all RAM at loading the model
+      Tested with !git clone https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct q2
+- [ ] SentencePiece `.model` `precompiled_charsmap` parsing — the opaque
+      per-model normalization trie (NOT standard NFKC) is still not
+      parsed/applied. A tokenizer.json that declares a standard NFKC/NFKD
+      normalizer already works in full (`UnicodeNormalize` + `AddNormalizer`,
+      landed); only the embedded charsmap is unhandled.
 
 ## Infrastructure / dev experience
 
 - [ ] Gradient checkpointing for training deeper nets in less memory
+- [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
+      arch dispatch with llama/qwen2/gemma2 LANDED & verified):
+  - [ ] cross-tool llama.cpp gemma2 GGUF parity (DEFERRED: needs the llama.cpp
+        shared lib / CLI — network + native build — unavailable here; the Llama
+        drift test does not shell out either).
+  - [ ] starcoder2 GGUF (out of scope for v1): needs LayerNorm-not-RMSNorm + full
+        per-projection biases + non-gated GELU on the GGUF import path.
+  - [ ] Extend dispatch to more Llama-backbone GGUF archs (phi3, qwen3, gemma3,
+        gpt2/neox, MoE families) once each has an offline parity oracle.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
+- [ ] MiniCPM importer follow-ups (`BuildMiniCPMFromSafeTensors[Ex]` LANDED,
+      model_type `minicpm`; OpenBMB μP-style scale_emb / per-sublayer
+      scale_depth / dim_model_base logits folds on the core Llama path +
+      SentencePiece `.model` tokenizer; pico parity TestMiniCPM{Config,Logit}Parity
+      < 1e-4 vs float64 HF):
+  - [ ] MiniCPM real-checkpoint slicer follow-up (slice_llama.py reuse) to
+        parity-check a sliced openbmb/MiniCPM-1.2B/2B against the random pico
+        fixture (network/RAM-gated; the landed parity is the hand-built pico
+        oracle only).
+  - [ ] MiniCPM4 / MiniCPM-MoE importers (separate model families; MiniCPM4
+        adds its own long-context/sparse-attention pieces, MiniCPM-MoE adds the
+        Mixtral-style MoE FFN — neither is the dense-1.2B/2B path landed here).
+- [ ] InternLM2 / InternLM2.5 importer follow-up (`BuildInternLM2FromSafeTensors[Ex]`,
+      model_type "internlm2"; internlm/internlm2_5-1_8b/7b/20b) — LANDED.
+      A plain Llama-backbone family (RMSNorm + RoPE + SwiGLU, GQA) whose ONLY
+      genuinely new piece is the checkpoint LAYOUT, resolved by an
+      InternLM2->HF translating reader (`TNNetInternLM2Reader`, a
+      `TNNetSafeTensorsReader` subclass) that rides the existing core Llama
+      builder with NO new layer/config flags. It (a) unpacks the fused
+      `attention.wqkv` (reshaped `[num_kv_heads, q_per_kv+2, head_dim, hidden]`,
+      per-group q slices then single K then single V) into standard separate
+      W_q/W_k/W_v with the group-interleaved row reorder (all Q heads
+      group-major, then all K, then all V — HF rotate_half order, so the core
+      builder's own rotate_half→interleaved q/k de-permute for RoPE applies
+      unchanged), and (b) renames the InternLM2 tensors (tok_embeddings /
+      wo / feed_forward.w1=gate|w2=down|w3=up / attention_norm / ffn_norm /
+      output) to the HF Llama names the core builder reads. Tokenizer is a
+      SentencePiece `.model` (already supported); `bias=true` rejected.
+      Verified by a HAND-BUILT pico fixture (tools/internlm2_tiny_fixture.py —
+      InternLM2 is NOT in transformers, needs trust_remote_code offline, so the
+      reference is a self-contained numpy float64 forward) asserting next-token
+      logits < 1e-4: tests `TestInternLM2ConfigParity` / `TestInternLM2LogitParity`.
+  - [ ] real-checkpoint slicer not exercised: the translating reader's wqkv
+        unpack rematerializes each q/k/v slice in RAM per tensor (fine at pico
+        and 1.8B/7B widths); a streaming/int8 path for the 20B checkpoint and a
+        live trust_remote_code parity run against a downloaded internlm2_5-* are
+        left open.
+- [ ] IBM Granite 3.x importer follow-ups (`BuildGraniteFromSafeTensors[Ex]`
+      LANDED, model_type `granite`/`granitemoe`; four multipliers folded at
+      load on the Llama path — embedding/residual/attention multipliers + a
+      DIVIDING logits_scaling into the LM head, wired through the existing
+      QScale/W_q slot not hardcoded; granitemoe reuses the Mixtral MoE WIRING
+      with a dedicated LoadGraniteMoEExperts loader for its fused 3-D slabs;
+      pico parity TestGranite{Config,Logit,MoeLogit}Parity < 1e-4 vs float64
+      HF transformers):
+  - [ ] real-checkpoint slicer (make_pico_*_fixture.py reuse) to parity-check
+        a sliced ibm-granite/granite-3.1-* against the random pico fixture.
+- [ ] OLMoE real-checkpoint slicer follow-up (BuildOlmoeFromSafeTensors[Ex],
+      model_type `olmoe`, LANDED: OLMo backbone with QK-norm full-width +
+      original-OLMo pre-norm placement × Qwen3-MoE/Mixtral top-k MoE wiring,
+      uniformly all-MoE; pico parity TestOlmoeLogitParity < 1e-4 vs float64 HF
+      OlmoeForCausalLM): the pico fixture is random-init only — add a real
+      allenai/OLMoE-1B-0924 slicer (slice_llama.py reuse) to parity-check a
+      sliced real checkpoint against the random pico fixture.
+- [ ] BitNet b1.58 importer follow-ups (`BuildBitNetFromSafeTensors[Ex]` LANDED,
+      model_type "bitnet" / the released `microsoft/bitnet-b1.58-2B-4T`; the
+      ternary-weight LLM mapped onto the Llama backbone with the SubLN
+      norm-before-quantized-linear RMSNorms (attn_sub_norm before o_proj,
+      ffn_sub_norm before down_proj via Config.BitNetSubLN, reusing
+      TNNetTokenRMSNorm), the relu2 gated FFN via the new TNNetReGLUSquared
+      activation (up*ReLU(gate)^2) on the separate-projection loader, and
+      rope_theta from the transformers-5.x rope_parameters dict; the FP "shadow"
+      checkpoint loads bit-for-bit since the absmean ternarize is a no-op on
+      already-ternary weights; pico parity TestBitNet{Config,Logit}Parity < 1e-4
+      vs float64 HF BitNetForCausalLM):
+  - [ ] native I2_S packed-ternary de-quant-at-load (2-bit unpack: 4 ternary
+        values per byte + a separate weight_scale tensor). The shadow-weight
+        (FP effective-weights) path is covered; the GGUF/bitnet.cpp-style I2_S
+        packed format is NOT yet read (the HF transformers checkpoint ships
+        the shadow form, so the parity fixture exercises only that path).
+  - [ ] real-checkpoint slicer (slice_llama.py reuse) to parity-check a sliced
+        microsoft/bitnet-b1.58-2B-4T against the random pico fixture — SKIPPED
+        (network/RAM-gated: requires downloading the 2B checkpoint).
+- [ ] M2M100/NLLB translate demo + real-vocab check (follow-up to the landed
+      BuildM2M100FromSafeTensors, commit cb21550): an examples/NLLBTranslate
+      seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and
+      round-trips a translation on CPU via DecodeSeq2SeqGreedy/BeamSearch, plus
+      verifying the importer against a downloaded sentencepiece.bpe.model vocab
+      (the parity fixture today uses raw token ids only). The BPE-in-.model
+      tokenizer support for NLLB-BPE variants has landed (see the
+      neuralhftokenizer Tokenizer follow-up (b) entry), so this is unblocked.
+- [ ] GPT-OSS importer follow-ups (BuildGptOssFromSafeTensors[Ex] LANDED,
+      model_type "gpt_oss", with TNNetGptOssSinkAttention per-head scalar sink +
+      alternating sliding/full window + YaRN truncate flag + top-k MoE +
+      TNNetGptOssGatedSwiGLU clamped experts + MXFP4 dequant-at-load; pico parity
+      TestGptOssLogitParity / TestGptOssMXFP4LogitParity <1e-4): (a) MXFP4 -> int8
+      weight-only STORAGE path — pQuantizeInt8 currently re-quantizes the
+      dequantized FP32 rather than a direct 4->8 transcode; (b) no real-weight
+      20B/120B smoke run yet (RAM-gated; pico parity only).
+- [ ] Jamba importer follow-ups (BuildJambaFromSafeTensors[Ex] LANDED, model_type
+      "jamba", first hybrid Mamba+attention+MoE import; TNNetSelectiveSSM
+      CreateJambaInner inner-norm mode; pico parity TestJambaLogitParity <1e-4):
+      (a) mamba_proj_bias=true (in/out_proj biases) is REJECTED — wire the bias
+      path if a checkpoint needs it; (b) training through the Jamba inner-norm SSM
+      is forward-only — add backward through the dt/B/C RMSNorms for fine-tuning;
+      (c) no Jamba-specific tokenizer demo (raw ids work); (d) no real-checkpoint
+      slicer fixture (parity uses a random pico model).
+- [ ] Nemotron-H-MoE importer follow-ups ('E' MoE block LANDED on the landed
+      BuildNemotronHFromSafeTensors: DeepSeek-V3-style sparse non-gated relu2
+      experts + always-on shared expert via the landed
+      TNNetBiasBalancedTopKGate/TNNetTopKGate + TNNetSigmoid + TNNetMulByConstant
+      (NO new layer); TestNemotronHMoELogitParity, schedule "M*E-", < 1e-4 vs a
+      float64 HF oracle):
+  - [ ] Nemotron-H-MoE grouped-routing follow-up: the importer REJECTS
+        n_group>1 and moe_latent_size with a clear message. Wire the
+        group-limited / latent-MoE routing path if a real Nemotron-H-MoE
+        checkpoint needs it (DeepSeek-V2-style grouped topk gate is landed —
+        reuse it).
+- [ ] Zamba2 importer (model_type "zamba2") — the sibling Mamba-2 hybrid that
+      additionally shares a small set of transformer blocks across depth with a
+      per-invocation LoRA adapter; needs a shared-block + LoRA wiring helper
+      (larger than Nemotron-H, distinct from the per-layer-independent schedule).
 - [ ] LLaVA-style GENERATIVE vision-language import — image-conditioned text
       generation, the capability step past the landed CLIP dual encoder
       (which only scores image/text similarity and cannot generate).
+      UNBLOCKED FURTHER: the SigLIP vision tower now LANDED
+      (BuildSigLIPVisionTower with a pVisionFeatures skip-pooling/
+      select-hidden-layer mode — exactly the LLaVA-needs select-hidden mode);
+      most modern open VLMs (PaliGemma/SmolVLM/Idefics) use SigLIP, not CLIP,
+      as the tower, so prefer BuildSigLIPVisionTower for Step 4's checkpoint.
       Target a small open checkpoint on the classic LLaVA recipe (e.g.
       llava-hf/llava-interleave-qwen-0.5b-hf or a SmolVLM-class model —
       whichever config maps cleanest onto existing paths): ViT vision
@@ -121,6 +254,37 @@ rather than acted on.
       mixed image+text prompt vs HF float64, and an examples/LlavaDescribe
       demo that captions a small image on CPU. First image-in/text-out
       model in the repo; opens the door to Qwen-VL/PaliGemma later.
+  Suggested incremental breakdown (each step independently buildable + committable):
+  - [ ] Step 3 — projector import + prompt-assembly helper: load the 2-layer MLP
+        (gelu) projector, run the vision tower once, and concatenate
+        [text-embeds | projected image tokens | text-embeds] as a TNNetInput-fed
+        embedding sequence at the <image> placeholder (precedent:
+        T5EncoderStatesInput). Test: projected visual tokens match HF float64 < 1e-4.
+  - [ ] Step 4 — BuildLlavaFromSafeTensors[Ex] (two nets + projector, multi-shard
+        index.json) on a small checkpoint (llava-interleave-qwen-0.5b-hf or a
+        SmolVLM-class config); language side is the stock Llama/Qwen2 path. Pico
+        parity fixture asserting next-token logits for a mixed image+text prompt
+        vs HF float64 < 1e-4.
+  - [ ] Step 5 — multimodal chat template ("USER: <image>\\n...ASSISTANT:" /
+        ChatML-with-image) in neuralchat.pas + examples/LlavaDescribe demo that
+        captions a small image on CPU (ulimit-bounded). Edit examples/README.md
+        (NOT the main README) for the new example.
+- [ ] SigLIP follow-up: NaFlex / variable-resolution siglip2 (the landed
+      BuildSigLIPFromSafeTensors scopes to the FIXED-resolution siglip/siglip2
+      base configs: square image_size, learned position table over a fixed
+      num_patches grid). NaFlex siglip2 supports per-image patch counts
+      (aspect-ratio-preserving resize to a variable token grid) with attention
+      pooling over the variable grid and a padding/attention mask — needs a
+      variable-SeqLen vision input, an interpolated/resampled position table,
+      and key-padding-masked MAP pooling. Not yet wired.
+- [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
+      for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
+      parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
+      pico fixtures): add a real-weight slicer for Aya-Expanse-8B /
+      Command-R7B (like slice_llama.py) so parity is checked against real
+      Cohere weights on top of the synthetic fixture. Also: order_of_interleaved_layers
+      (legacy cohere2 spelling) maps to sliding_window_pattern but was not seen
+      in a published config — wire it if one surfaces.
 - [ ] ONNX (or simpler JSON) export path — minimal viable: dump a
       forward-only graph for the currently-supported subset of layers,
       enough to run inference in onnxruntime. Doc which layers are
@@ -130,16 +294,6 @@ rather than acted on.
       int8 matmul kernels (AVX2 maddubs / dot-product paths) so quantized
       layers stop paying the per-forward dequantize cost; today the int8
       win is RAM only — compute still runs the FP32 kernels.
-- [X] Quantized inference follow-up: thread pQuantizeInt8 through the
-      remaining importer entry points that do NOT ride
-      BuildLlamaFromSafeTensorsWithConfig (GPT-Neo/NeoX/J, Phi, BERT family,
-      BLOOM, RWKV, Mamba, T5/Marian, DeepSeek-V2 MoE) — mechanical: same
-      construction-sweep + loader-refill pattern; loaders already
-      auto-dequantize (EnsureWritableImportWeights). (Landed: all of the
-      above + ModernBERT, the seq-cls wrappers, the Mistral/Qwen/Gemma/
-      Phi-3 wrapper chain and BuildFromPretrained; 12 pico drift tests
-      gated at 5e-2 relative. Whisper and CLIP remain FP32-only — wire
-      them if int8 audio/vision import is ever needed.)
 - [ ] Quantized inference follow-up: GPTQ/AWQ-style calibrated quantization
       (error-compensating rounding / activation-aware scale search) and
       4-bit (int4 pairs packed per byte, group-wise scales); also quantized
@@ -147,75 +301,137 @@ rather than acted on.
       d_model stays FP32 in v1, e.g. ~262MB for TinyLlama) and FP16/BF16
       weight storage as a zero-drift middle rung. GGUF dovetails (reader
       landed in neural/neuralgguf.pas): load Q8_0 blocks straight into the
-      int8 weight-only storage instead of dequantize-then-requantize, and
-      decode the common ggml 4-bit types (Q4_0/Q4_K/Q6_K) so real-world
-      quantized checkpoints import.
-- [ ] Quantized inference follow-up: upstream fix for TVolume.GetMaxAbs
-      (seeds the running max with the SIGNED first element, so a negative
-      max-magnitude element 0 is missed; csErrorOverflowBackpropProtection
-      and friends consume it — audit callers before fixing).
-- [ ] Tokenizer follow-ups for neuralhftokenizer.pas: (a) Unigram model
-      support (model.type "Unigram", Viterbi segmentation) -- needed only
-      for tokenizers not yet converted to BPE format; (b) the raw
-      SentencePiece .model protobuf path (parse the protobuf wire format
-      or vendor a minimal decoder) for checkpoints that ship without a
-      tokenizer.json; (c) exact full-Unicode \p{L}/\p{N} tables (current
+      int8 weight-only storage instead of dequantize-then-requantize (the
+      k-quant Q4_K/Q6_K/Q5_K/Q2_K dequant-at-load READ path has landed in
+      neural/neuralgguf.pas).
+- [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
+      (b) DONE — raw SentencePiece .model protobuf path landed
+      (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
+      vendored proto lib; auto-dispatched from LoadFromFile by the '.model'
+      extension or a non-'{' first byte). Populates the SAME Unigram
+      structures as the tokenizer.json path; pico fixture + spm-oracle parity
+      test (tools/make_pico_spm_fixture.py, tests/fixtures/tiny_spm.model,
+      TestSentencePieceModelParity). UNIGRAM model_type only; a BPE/WORD/CHAR
+      ModelProto raises EHFTokenizerError ("use tokenizer.json").
+      BPE-in-.model is now DONE — model_type=BPE (NLLB/mBART-BPE/DeBERTa-v3
+      sentencepiece.bpe.model exports): LoadSentencePieceModel reconstructs the
+      merges from the scored pieces (ReconstructBPEMerges, byte-for-byte the
+      HF transformers generate_merges algorithm — per piece, every codepoint
+      split whose both halves are in the vocab becomes a candidate ordered by
+      (id_l,id_r), then a stable sort by (piece_id,len_l,len_r) gives the merge
+      rank), sets FUnigram=false and routes encode/decode through the SAME
+      metaspace + byte-level-BPE (BPEWord/EmitTokenOrFallback) machinery the
+      tokenizer.json/GGUF-gpt2 BPE paths use; byte_fallback (type-6 pieces)
+      covers non-ASCII via <0xNN>. Pico fixture tiny_spm_bpe.model
+      (tools/make_pico_spm_fixture.py BPE variant) + TestSentencePieceBPEModelParity.
+      Parity is FULL (exact), NOT an approximation: verified id-identical to the
+      sentencepiece encoder over ASCII *and* non-ASCII (café/CJK/emoji/control-
+      byte) inputs, and that encoder is itself id-identical to a tokenizers BPE
+      model built from these same reconstructed merges. WORD/CHAR model_types
+      still raise EHFTokenizerError. This now partially UNBLOCKS the mBART/NLLB
+      BART-family follow-up (a, above) and the DeBERTa-v3 import. No residual
+      non-ASCII parity gap. BYTE
+      (type=6) byte-fallback is now DONE: LoadSentencePieceModel sets
+      FByteFallback when any type-6 piece is present, so (1) encode routes
+      unknown chars through the <0xNN> BYTE pieces — the Unigram Viterbi
+      unk node now decomposes the char into its UTF-8 bytes via byte
+      pieces (EmitByteFallback) instead of one fused <unk>; and (2) decode
+      emits the RAW byte for each <0xNN> piece (DecodeToken), so a run of
+      byte pieces reassembles into the original multi-byte UTF-8 string
+      (the metaspace U+2581 handling is unaffected). Round-trip parity test
+      TestSentencePieceByteFallbackRoundTrip + tiny_spm_bytefallback.model
+      fixture (tools/make_pico_spm_fixture.py byte_fallback variant; cases
+      read via TJSONParser(s,[]) to keep their UTF-8 bytes intact). This
+      partially UNBLOCKS the mBART/NLLB BART-family follow-up (b) and the
+      DeBERTa-v3 import (both ship raw sentencepiece .model and are
+      Unigram). (c) exact full-Unicode \p{L}/\p{N} tables (current
       classifier covers Latin/Greek/Cyrillic/Armenian/Hebrew/Arabic/
       Devanagari/Kana/CJK/Hangul; exotic scripts fall into the
-      punctuation class of the GPT-2 regex); (d) build a tokenizer from
-      GGUF tokenizer.ggml.* metadata (tokens/merges/scores arrays are
-      already readable via TNNetGGUFReader) so a single .gguf file is
-      fully self-contained for generation without tokenizer.json.
+      punctuation class of the GPT-2 regex); (d) DONE — build a tokenizer from
+      GGUF tokenizer.ggml.* metadata (TNeuralHFTokenizer.LoadFromGGUF: opens
+      via TNNetGGUFReader, reads tokenizer.ggml.model + tokens/scores/
+      token_type [+ merges] and the bos/eos/unknown_token_id scalars, and
+      populates the SAME internal structures the tokenizer.json/.model loaders
+      use), so a single .gguf is self-contained for generation. SUPPORTED
+      tokenizer.ggml.model values: "llama" (SentencePiece-with-scores →
+      Unigram/Viterbi path: metaspace U+2581, <0xNN> byte fallback, CONTROL/
+      UNKNOWN/USER_DEFINED pieces exposed as added tokens) and "gpt2" (byte-
+      level BPE → GPT-2 byte table + cl100k Split pre-tokenizer + merges).
+      DEFERRED: "bert" (WordPiece) and "no_vocab" raise EHFTokenizerError;
+      gpt2 path assumes the cl100k Split pre-tok (GGUF carries no pre-tok
+      config). Oracle = write-then-read round-trip: a tokenizer.json fixture's
+      vocab/scores(+merges) is emitted to a temp .gguf via TNNetGGUFWriter and
+      read back, then Encode/Decode are asserted id-identical to the
+      tokenizer.json source (TestLoadFromGGUF{Llama,Gpt2}RoundTrip,
+      TestLoadFromGGUFRejectsUnsupportedModel in TestNeuralHFTokenizer.pas).
 - [ ] neuralhftokenizer.pas pre_tokenizer leftovers from the Split/Metaspace
-      batch: (a) a STANDALONE ByteLevel pre_tokenizer with use_regex=false
+      batch: ~~(a) a STANDALONE ByteLevel pre_tokenizer with use_regex=false
       silently applies the GPT-2 regex anyway (the flag is only honored
       implicitly inside the Sequence[Split, ByteLevel] path, which bypasses
-      ByteLevelPieces; parse use_regex and skip the regex split when false);
+      ByteLevelPieces; parse use_regex and skip the regex split when false)~~
+      DONE: FByteLevelUseRegex parsed; standalone ByteLevel(use_regex=false)
+      now feeds the whole segment as ONE chunk to the byte alphabet (no GPT-2
+      regex). Test TestByteLevelNoRegexParityWithHF + bytelevel_noregex
+      fixture group.
       (b) only the Qwen2 and Llama-3/cl100k Split pattern literals are
       recognized — the o200k (GPT-4o-family) and DeepSeek pattern strings
-      raise EHFTokenizerError; add them to the verbatim-match table with a
-      hand-written splitter variant — the DeepSeek family is now importable
-      (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap; add
-      o200k when a GPT-4o-family checkpoint matters. Test: per-pattern
+      raise EHFTokenizerError. ~~the DeepSeek family is now importable
+      (BuildDeepSeekV2FromSafeTensors), so its pattern is the live gap~~ DONE
+      for DeepSeek-V2/V2-Lite: the multi-Split+Digits Sequence is detected as
+      a WHOLE (MatchesDeepSeekSequence) and dispatched to SplitDeepSeekPieces
+      (a distinct splitter: \s?-prefixed letter/punct runs, separate CJK run,
+      individual digits, \s+$ trailing). Test TestSplitDeepSeekParityWithHF +
+      split_deepseek fixture. REMAINING sub-tasks: (i) DONE — o200k_base
+      (GPT-4o family: gpt-4o/gpt-4o-mini/o1/o3) Split pattern recognized
+      verbatim (csO200kSplitPattern) and dispatched to a dedicated
+      case-aware SplitO200kPieces splitter (two letter alternations
+      [\p{Lu}...]*[\p{Ll}...]+ and [\p{Lu}...]+[\p{Ll}...]*, \p{N}{1,3}
+      digits, the [\r\n/]* punct trailing run that adds '/'). The Lu/Ll
+      split uses the ASCII case tables; non-ASCII letters fall into the
+      Ll/Lo class, so byte parity is guaranteed over ASCII letters (incl
+      case transitions like HelloWorld->Hello+World, iPhone->i+Phone),
+      digits, punct (incl '/'), and whitespace — the SAME approximation
+      stance as the cl100k/DeepSeek splitters. Test
+      TestSplitO200kParityWithHF + split_o200k fixture group
+      (tools/hf_pretok_fixture.py build_o200k_split). RESIDUAL GAP: non-ASCII
+      Latin AND CJK parity for SplitO200kPieces (would need the exact o200k
+      Lu/Ll/Lo class tables ported to Pascal); (ii) DeepSeek-V3
+      pre-tokenizer (different shape: \p{N}{1,3} + packed punct+letter Split,
+      NO Digits stage) — not matched by MatchesDeepSeekSequence, falls through
+      and raises; add a V3 variant when V3 is imported; (iii) non-ASCII Latin
+      parity for SplitDeepSeekPieces — the HF onig engine isolates some
+      precomposed Latin-1 letters that the \p{L} table groups, so exact byte
+      parity is only guaranteed over ASCII/digit/punct/whitespace/CJK (the
+      same approximation stance as the cl100k splitter; would need the exact
+      DeepSeek letter-class range table ported to Pascal). Test: per-pattern
       parity fixtures like tools/hf_pretok_fixture.py.
-- [ ] LoRA follow-ups (the adapter itself is landed: TNNet.AddLoRAAdapter
-      low-rank B·A bypass + examples/LoRAFineTune, commit 34511c0):
-      (a) MergeLoRA — fold the trained B·A (scaled by alpha/r) into the
-      frozen base layer's W for zero-overhead inference, asserting merged
-      forward equals adapter forward; (b) load HF PEFT adapter safetensors
-      files onto an imported base model (name-map lora_A/lora_B tensors
-      onto the AddLoRAAdapter layers).
-- [ ] Gradient accumulation in neuralfit.pas: accumulate deltas over N
-      micro-batches before the optimizer step (large effective batch
-      without the memory), scaling the loss/deltas by 1/N so results match
-      a true big batch.
-- [ ] EMA (exponential moving average) shadow weights in neuralfit.pas:
-      maintain decay-averaged copies of all weights during training and
-      allow swapping them in for eval/save; classic free eval-quality win.
-- [ ] Parameter groups for the optimizer (PyTorch param_groups port):
-      per-group learning-rate multipliers and weight-decay exclusion for
-      norm/bias parameters (AdamW currently decays everything uniformly).
-- [ ] safetensors writer F16/BF16 output: TNNetSafeTensorsWriter only
-      emits F32; add encode-on-write halves (EncodeF16/EncodeBF16 mirroring
-      the existing decoders) for smaller exported checkpoints.
-- [ ] HF-names safetensors exporter: export an imported pico-GPT-2 back to
-      HF tensor names (wte.weight, h.N.attn.c_attn.weight, ...), reload via
-      BuildGPT2FromSafeTensors and compare logits; generalize per-importer
-      name maps later. The generic writer landed; only the naming/transpose
-      mapping (Pascal neuron-major vs HF [in,out] Conv1D) is missing.
-- [ ] Knowledge distillation trainer (transformers DistillationTrainer /
-      classic Hinton KD): temperature-softened KL between a frozen teacher's
-      logits and the student's, blended with the hard-label loss
-      (L = alpha*CE(hard) + (1-alpha)*T^2*KL(soft)). The DPO trainer already
-      holds two TNNets simultaneously, so the two-model plumbing exists.
-      Killer combo with the Llama/GPT-2 importers: distill an imported
-      pretrained teacher into a small Pascal-trained student.
+- [ ] GGUF writer follow-up: byte-level-BPE end-to-end model export
+      (SaveTokenizerToGGUF gpt2/llama tokenizer block + verify_gguf_writer.py
+      llama-cpp-python logit-parity hook LANDED): SaveLlamaToGGUFEx itself still
+      only takes a plain `Tokens` array (SP "llama" model) — route the gpt2
+      tokenizer block through SaveTokenizerToGGUF from the MODEL exporter (not
+      just the tokenizer unit test). DONE — SaveLlamaToGGUFEx gained an optional
+      `Tokenizer: TNeuralHFTokenizer` arg (+ SaveLlamaToGGUFExWithTokenizer
+      convenience overload) that, when non-nil, routes the FULL block through
+      TNeuralHFTokenizer.SaveTokenizerToGGUF (gpt2 vocab+merges+ids / llama
+      Unigram scores), taking precedence over the plain Tokens SP path (which is
+      unchanged); covered by TestGGUFWriterGpt2TokenizerRoundTrip (one-call
+      weights+gpt2-tokenizer export, read back self-contained: model logits
+      < 1e-5 + Encode/Decode id-identical via LoadFromGGUF on the SAME file).
+      Also: the llama-cpp-python parity arm is
+      wired but UNVERIFIED end-to-end (lib not installed here; pico demo GGUF may
+      be too small for llama.cpp) — confirm argmax/ranking agree on a real
+      checkpoint once the lib is available.
 - [ ] Stochastic Weight Averaging (torch.optim.swa_utils port): equal-weight
       running average of checkpoints over the schedule tail + a constant or
       cyclic SWA learning rate phase; swap averaged weights in for eval/save.
-      Distinct from the EMA task above (running decay average) but should
-      share the shadow-weights machinery — consider landing both on one
-      shadow-copy mechanism.
+      Distinct from the landed EMA shadow-weights wiring (running decay
+      average) but should share the shadow-weights machinery. NOTE: the EMA
+      task landed its trainer wiring
+      (TNeuralFitBase.EnableEMA + ApplyEMAWeights/RestoreLiveWeights store-and-
+      restore swap) on TNNetEMAWrapper; TNNetSWAWrapper already exists too, so
+      SWA is mostly a matter of wiring that wrapper into TNeuralFitBase reusing
+      the same Apply/Restore swap plumbing.
 - [ ] Optimizer zoo expansion (only SGD/Adam/AdamW exist today):
       Adafactor (factored second-moment estimate, drastically less optimizer
       state — pairs with the "run big imported models on commodity RAM"
@@ -224,194 +440,56 @@ rather than acted on.
       (a hand-rolled Muon gradient-surgery demo already exists in
       examples/MuonOptimizer; the optimizer-class port is what's missing).
       Each is a small TNeuralOptimizer subclass in neuralfit.pas.
-- [ ] ReduceLROnPlateau + OneCycle / cyclical LR schedulers
-      (neural/neuralscheduler.pas has Step/CosineAnnealing/WarmupCosine/Poly):
-      plateau-driven decay needs a hook feeding the validation metric into
-      NextLR — that wiring is the interesting part; OneCycle/CyclicLR are
-      straightforward NextLR formulas.
 - [ ] Trainer callbacks API (transformers TrainerCallback port): a
       TNeuralFitCallback with OnEpochBegin/End, OnStepEnd, OnEvaluate hooks
       registered on TNeuralFitBase. Early stopping, custom logging, and the
       EMA/SWA tasks become small callbacks instead of ever more
       TNeuralFitBase fields.
-- [ ] NEFTune noisy embedding fine-tuning: uniform noise scaled by
-      alpha/sqrt(L*d) added to embedding-layer outputs during TRAINING only
-      (off at eval); famously a ~5-line instruction-tuning quality win.
-      Trivially testable: assert eval forward is noise-free and train
-      forward differs.
 - [ ] CutMix training augmentation (torchvision transforms-v2 staple;
       Mixup itself is landed: CreateMixedVolumePairList in neuralvolume +
       examples/Mixup): patch a random rectangle from a second sample into
       the input and mix the targets by area fraction (Beta-distributed
       lambda). The CIFAR image-classification examples give an instant
       bake-off harness.
-- [ ] Contrastive search decoding (transformers penalty_alpha): degeneration
-      penalty re-ranking each candidate token by max cosine similarity
-      between its hidden state and all previous tokens' hidden states;
-      needs hidden-state capture during decode — a different beast from the
-      landed sampling/logits-processor chain and strong for greedy-quality
-      open-ended text.
-- [ ] Diverse beam search (Hamming-diversity groups) + constrained beam
-      search (force_words_ids: force given phrases to APPEAR anywhere in the
-      output — stronger than the existing TNNetTokenConstraint prefix/mask
-      machinery) in neural/neuraldecode.pas as DecodeBeamSearch variants.
-- [ ] Batched generation with left-padding in neural/neuraldecode.pas:
-      generate for N prompts in one forward pass per step (today's decode
-      paths look single-sample). Makes evaluation sweeps cheap and is a
+- [ ] True single-kernel batched forward (real batch axis + attention padding
+      mask for left-pad) — the lockstep DecodeBatchGreedy orchestration landed,
+      but NN.Compute has no SIMD batch axis on the char path, so each step still
+      pays one forward per running row. The vectorized batch is the actual
       prerequisite for an efficient speculative-decoding verify step.
-- [ ] Chat templates v2 (v1 is landed in neural/neuralchat.pas —
-      ApplyChatTemplate with seven hardcoded formats + DetectChatFormat
-      fingerprinting + EncodeChat): a mini-Jinja subset interpreter for unrecognized
-      chat_template strings (must pass ground truth for all bundled
-      templates and raise cleanly on unsupported constructs); more
-      formats (DeepSeek, Phi-4-mini's tool-aware ChatML variant, Qwen's
-      default-system injection); read the separate chat_template.jinja
-      file newer transformers exports alongside tokenizer_config.json;
-      continue_final_message / return_assistant_tokens_mask equivalents.
-- [X] resize_token_embeddings equivalent: grow/shrink the token embedding +
-      (landed: TNNet.ResizeTokenEmbeddings, mean-init rows, copy-tied head
-      kept equal, int8/inference-only safe)
-      LM-head vocab of an imported model (mean-init new rows, keep tied
-      heads consistent, update FStruct vocab sizes). Needed the moment
-      anyone adds special tokens to fine-tune on top of the Llama/GPT-2
-      importers.
-- [X] GGUF reader (sibling of neural/neuralsafetensors.pas): the other
-      de-facto checkpoint format, and it ships PRE-quantized weights —
-      dovetails with the landed int8 quantized inference (read Q8_0 blocks
-      directly instead of quantizing FP32 yourself). (landed:
-      neural/neuralgguf.pas TNNetGGUFReader F32/F16/Q8_0 +
-      BuildLlamaFromGGUF; Q8_0 still dequantizes to FP32 at load — the
-      direct-into-int8-storage path remains open)
-- [ ] Magnitude pruning (torch.nn.utils.prune port): PERSISTENT global or
-      per-layer magnitude masks applied during training/inference — the
-      diagnostics half is landed (TNNet.MagnitudePruningReport +
-      examples/MagnitudePruning prune-and-restore sweep); still open are
-      masks that stay applied (instead of restoring weights after the
-      sweep) and a fine-tune-after-prune example showing accuracy recovery.
-- [ ] Anomaly detection mode (autograd.set_detect_anomaly port): a debug
-      flag that checks every layer's Output/OutputError for NaN/Inf during
-      forward AND backward and names the FIRST offending layer + phase.
-      The random-architecture NaN fuzz task elsewhere in this list finds
-      such failures; this is the runtime tool that makes them diagnosable.
-      Probably the highest value-to-effort diagnostic on this list.
-- [ ] Per-layer profiler report (torch.profiler lite): TNNet.ProfileReport
-      with forward/backward wall-time and parameter/activation memory per
-      layer (introspection-report pattern). Directly serves the open
-      chunked-forward throughput tasks by showing where time actually goes.
 - [ ] FlashAttention-style tiled online-softmax SDPA forward: opt-in fast
       mode — not for GPU speed but for O(L*d) vs O(L^2) attention-score
       MEMORY on long sequences; gate behind an exact-vs-naive equivalence
       assert, same pattern as the chunked-forward recurrence family.
-- [ ] rope_scaling follow-ups to the landed wiring (7e74fee): (a) longrope
-      (Phi-3 family — per-dim short/long factor arrays + two attention
-      factors) is parsed and rejected; map it onto a new scaling mode to
-      unlock the 128k-context variants of the now-importable Phi-3/
-      Phi-4-mini family (BuildPhi3FromSafeTensors rejects them today); (b) DeepSeek-style YaRN `mscale` /
-      `mscale_all_dim` overrides are rejected — needed for full
-      DeepSeek-V2 checkpoints (the -Lite config carries them); (c) yarn
-      `"truncate": false` configs are silently treated as truncate=true —
-      honor the flag or reject loudly.
-- [ ] KV-cache eviction for unbounded streaming: attention sinks + rolling
-      window (StreamingLLM; transformers SinkCache) in TNNetStreamingDecoder
-      — today the per-SDPA-layer cache grows without bound. Keep the first
-      NumSinks tokens plus a fixed window, evicting the middle, so streamed
-      generation runs forever in constant memory. Note TNNetSinkAttention is
-      the TRAINING-side cousin (learnable sink logits); this is the
-      decode-side cache policy and needs care with RoPE positions after
-      eviction (re-rotate or cache pre-RoPE K). Assert: while output length
-      <= window the streamed tokens are bit-identical to the unbounded
-      cache, and memory stays flat past it.
-- [ ] KV-cache quantization (int8 cache with per-channel scales): the
-      landed int8 quantized inference covers WEIGHT storage; for long-context
-      decode the KV cache dominates memory instead. Quantize cached K/V
-      blocks to int8 on append, dequantize on read inside
-      TNNetStreamingDecoder; assert logit drift vs the FP32 cache stays
-      within a documented tolerance on the pico-Llama parity fixture.
-- [ ] GRPO trainer (DeepSeekMath/R1-style group-relative policy
-      optimization) in neural/neuraldpo.pas or a sibling unit: sample N
-      completions per prompt, advantage = (reward - group mean)/group std,
-      policy-gradient step with a KL penalty against the reference — no
-      value network, so it is the one RL-from-feedback method that fits this
-      framework. The DPO trainer already holds policy+reference and computes
-      per-sequence logprobs, and sampled streamed generation already exists
-      in neuraldecode. Cheap follow-ups on the same plumbing: ORPO / SimPO / KTO
-      (loss-formula deltas on the landed DPO), and a Bradley-Terry pairwise
-      reward-model trainer to feed GRPO real rewards.
-- [ ] Seq2seq translation/summarization EXAMPLE on the landed beam:
-      DecodeSeq2SeqBeamSearch + the BLEU/ROUGE metrics in
-      neuralnlpmetrics.pas are both waiting on the Unigram/SentencePiece
-      tokenizer for real Marian/T5 checkpoints - wire an examples/ entry
-      (and an examples/README.md mention) once that lands.
-- [ ] Masked-LM data collator (transformers DataCollatorForLanguageModeling
-      port): BERT-style dynamic masking — pick 15% of tokens, replace 80%
-      with [MASK] / 10% random / 10% unchanged, loss only on masked
-      positions — plus whole-word masking and, as a stretch, T5 span
-      corruption (sentinel tokens). Everything in the current NLP stack is
-      causal-LM; one collator unit unlocks encoder pretraining with the
-      existing AddTransformerEncoderBlock, no new layers. Test: masked
-      fraction and 80/10/10 split within tolerance at fixed seed; loss
-      ignores unmasked positions exactly.
-- [ ] Prompt tuning / P-tuning soft prompts (PEFT beyond the LoRA task
-      above): K learnable virtual-token embeddings prepended to the
-      embedding-layer output, base model frozen — K*d_model trainable
-      params, the cheapest fine-tune of an imported checkpoint. Mostly
-      composes existing pieces (a learnable bank + sequence-axis concat);
-      decode side must skip the K virtual positions when detokenizing.
-      Test: base weights bit-unchanged after a training step, soft-prompt
-      gradient nonzero, eval forward deterministic.
-- [ ] Token-classification head + entity-level metrics (transformers
-      ForTokenClassification + seqeval port): per-token PointwiseConvLinear
-      head over the sequence axis plus span-aware precision/recall/F1
-      (BIO/IOB2 decoding, entity-level not token-level) in
-      neuralnlpmetrics.pas. Needs tokenizer offset-mapping / word-id
-      alignment (subword → word labels, return_offsets_mapping equivalent in
-      neuraltokenizer.pas) — that alignment utility is reusable beyond NER.
-      Test: pinned BIO sequences with known entity P/R/F1, including the
-      classic boundary-error cases.
-- [ ] QA span-extraction head (transformers ForQuestionAnswering port):
-      two per-token logit heads (start/end) over the sequence axis +
-      SQuAD-style postprocessing (top-k start×end pairs, end>=start, max
-      answer length, n-best list). Pure composition over existing per-token
-      projections; pairs with the offset-mapping utility from the
-      token-classification task to map spans back to text. Test: pinned
-      logits → pinned extracted span.
-- [ ] chrF metric in neural/neuralnlpmetrics.pas: character n-gram F-score
-      (Popović 2015) — tokenizer-independent so it sidesteps the BLEU
-      tokenization sensitivity, ~100 lines beside the landed BLEU/ROUGE.
-      Optional chrF++ (adds word unigrams+bigrams). Test against pinned
-      values from sacrebleu on a couple of sentence pairs.
-- [ ] Strided sliding-window perplexity in neural/neuralnlpmetrics.pas
-      (the HF-docs-standard evaluation): for corpora longer than the model
-      context, slide a window with stride < window and score only the
-      non-overlapping tail tokens, so every token gets (bounded) left
-      context instead of the chop-into-disjoint-windows underestimate the
-      landed Perplexity() implies. Test: stride = window reproduces the
-      disjoint baseline exactly; smaller stride gives <= NLL on a model
-      with real long-range structure.
-- [ ] Length-grouped batching + dynamic padding collator (transformers
-      LengthGroupedSampler + DataCollatorWithPadding port) in neuralfit:
-      sort/bucket variable-length text by length, batch neighbors, pad each
-      batch only to its own max (not the global max) — a large real-world
-      throughput win. Complements (distinct from) the per-sample-attention-
-      mask and left-padded-generation tasks: this is the TRAINING data-side
-      half. Test: identical loss trajectory vs naive padding at fixed seed
-      modulo batch order, plus a padded-token-count reduction assert.
-- [ ] Classifier-free guidance for text generation (transformers
-      UnbatchedClassifierFreeGuidanceLogitsProcessor port): run the model
-      with and without the prompt (or with a negative prompt), combine
-      l_uncond + g*(l_cond - l_uncond) before sampling. Two forward passes
-      per step, no training; slots into the landed logits-processor chain
-      as just another processor. Test: g=1 is bit-identical to normal
-      decoding; g=0 ignores the prompt.
-- [ ] Best-of-N / self-consistency reranking utility in
-      neural/neuraldecode.pas: sample N completions, rerank by
-      length-normalized sequence logprob (LengthPenaltyDenominator already
-      exists) or by an external scorer callback — the standard
-      test-time-compute baseline, and the natural consumer of the
-      Bradley-Terry reward model from the GRPO task. Self-consistency
-      variant: majority-vote over extracted answers. Sampled generation is
-      already landed, so this is mostly harness work; worth its own entry as
-      the canonical harness.
+- [ ] longrope short-factor / dynamic switching follow-up (static long-context
+      import landed): the import statically picks the long_factor table + long
+      attention scaling. HF switches to short_factor when seq_len <=
+      original_max_position_embeddings. Add a decode-time mode that selects the
+      short table for short sequences (or document that the static long import
+      is intentional for the 128k use case).
+- [ ] CFG follow-up: a full-width-net -> width-1 unconditional-twin auto-clone
+      so MakeUnconditionalTwin (commit 48e2fd2) works from a single imported
+      model with no hand-built width-1 net. A SaveToString->LoadFromString
+      round-trip preserves the ORIGINAL input width, so this needs either a
+      rebuild-architecture-at-width-1 + CopyWeights walk (per-importer, or a
+      generic layer-shape-independent rebuilder) or a width-rewrite on the
+      serialized string. Assert the twin's logits match the source on a pinned
+      input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
+      template).
+- [ ] Preference-optimization follow-ups on the landed DPO/GRPO trainers
+      (TNeuralGRPOTrainer in neural/neuraldpo.pas LANDED: group-relative
+      advantages + PG + DeepSeek-k3 per-token KL reusing the DPO softmax-backward
+      plumbing, tests in tests/TestNeuralGRPO.pas). ORPO / SimPO / KTO
+      loss-formula deltas LANDED on TNeuralDPOTrainer as a TNeuralPreferenceLossMode
+      (plmSimPO/plmORPO are reference-free via CreateReferenceFree; plmKTO uses a
+      reference, paired-batch simplification documented in the unit header), tests
+      in tests/TestNeuralPreference.pas. Bradley-Terry pairwise reward-model
+      trainer DONE: TNeuralRewardModelTrainer in neural/neuraldpo.pas learns a
+      scalar reward head r(x)=RewardNet(prompt+response) from (chosen,rejected)
+      pairs with loss=-ln sigmoid(r_w-r_l) and the sigmoid-margin gradient
+      (dL/dr_w=-(1-sigmoid(delta)), dL/dr_l=+(...)) via the DPO batch-update +
+      direct-output-error plumbing; plugs into GRPO/Best-of-N as a learned
+      reward; tests in tests/TestNeuralRewardModel.pas. REMAINING: a full
+      unpaired-batch KTO variant (current KTO uses the paired pair-mean KL point).
 - [ ] Sequence-length warmup curriculum in neuralfit.pas: train at short
       context first and grow SeqLen on a schedule (the rebuild-same-
       architecture-at-a-new-width idiom this list already notes near the
@@ -428,14 +506,50 @@ rather than acted on.
       destination layer — or straight into the landed int8 storage —
       keeping only one tensor-sized scratch buffer. Assert peak RSS during import
       stays within tensor-size + model-size on the parity fixture.
-- [ ] NumPy .npy/.npz reader + writer: the universal interchange escape
-      hatch — ANY framework can np.savez(**state_dict), and the format is
-      trivial (magic + header dict + raw bytes; npz is a zip of npy).
-      Reader gives a generic named-tensor import path for frameworks with
-      no safetensors export; WRITER doubles as fixture tooling for parity
-      tests (dump Pascal tensors, compare in Python), complementing the
-      landed safetensors writer. Support F32/F64/F16 + int dtypes, C-order only, reject
-      Fortran-order/pickled-object arrays explicitly.
+- [ ] NumPy .npz follow-up (neural/neuralnumpy.pas reader/writer landed; WRITER
+      is STORED-only): DEFLATE-compressed .npz WRITER (savez_compressed) +
+      zip64 / >4GB archive support (reader currently rejects zip64).
+- [X] MMLU few-shot accuracy benchmark harness + example (NLP eval gap;
+      complements the landed examples/HellaSwagEval + examples/PerplexityEval
+      and the EvaluateMultipleChoice / ScoreSequence primitives, but is a
+      DISTINCT benchmark, not a near-duplicate): MMLU is the canonical
+      knowledge benchmark and the missing piece for validating the large
+      imported instruct-model fleet (Llama/Qwen3/Gemma3/Phi3/Mistral/...)
+      against published numbers rather than only against tiny pico-fixture
+      logit parity. Scope:
+        - a TMMLUEvaluator-style harness in neuralnlpmetrics.pas (or a small
+          new unit) that, for each 4-choice question, builds the standard
+          k-shot prompt ("Question ... A. .. B. .. C. .. D. ..\nAnswer:")
+          from same-subject dev examples and scores by the single-token
+          A/B/C/D answer-letter logprob (the HF lm-eval convention), NOT by
+          full-continuation perplexity (that is what HellaSwagEval already
+          does — keep the two scoring modes clearly separate).
+        - per-subject accuracy + macro-average over the 57 subjects, plus a
+          micro-average, printed as a small report (reuse the existing
+          PerplexityReport / *Report formatting idiom).
+        - examples/MMLUEval reading the cais/mmlu (or hendrycks_test) splits
+          via the venv-x datasets/transformers already available; default to
+          a tiny embedded smoke subset so the example compiles/runs in CI
+          without a network fetch, with a flag to point at the full dataset.
+        - 0-shot and 5-shot modes (5-shot is the headline setting); reuse the
+          left-padded DecodeBatchGreedy / KV-cache path so large models stay
+          tractable. Follow-ups (separate tasks): LAMBADA last-word accuracy,
+          ARC/PIQA/WinoGrande on the same answer-letter scoring core.
+      LANDED: EvaluateMMLU + MMLUReport (single-token A/B/C/D answer-letter
+      scoring, per-subject + macro + micro, 0/5-shot) in neuralnlpmetrics.pas,
+      TestNeuralNLPMetrics MMLU tests, examples/MMLUEval (tiny embedded smoke
+      subset, char-level toy model). Open follow-ups:
+  - [ ] examples/MMLUEval --full <path> hook: dump cais/mmlu (hendrycks_test)
+        dev+test splits to a small text file via the venv-x datasets package and
+        feed the questions through the same FormatQuestion/BuildPrompt builder
+        + a real subword tokenizer (the smoke build hard-codes its questions).
+  - [ ] EvaluateMMLU large-model path: reuse the left-padded DecodeBatchGreedy /
+        KV-cache batch scoring instead of the per-question per-letter
+        ScoreCompletion loop (acceptable for the smoke subset, slow at the full
+        14k-question x 57-subject scale).
+  - [ ] LAMBADA last-word accuracy + ARC/PIQA/WinoGrande on the answer-letter
+        scoring core (separate benchmarks, same EvaluateMMLU /
+        EvaluateMultipleChoice machinery).
 - [ ] TinyStories reference-vs-from-scratch perplexity bake-off (follow-up
       to the landed, parity-verified roneneldan/TinyStories-1M import on
       the GPT-Neo route; the published pytorch_model.bin-only checkpoints
@@ -448,15 +562,20 @@ rather than acted on.
       at 1M-33M params the comparison runs against FULL checkpoints
       instead of sliced fixtures, the only importer family where that is
       true.
-- [ ] RWKV-4 decode-side demo: flat-memory recurrent decoding vs a
-      transformer of equal size (constant-memory headline of the landed
-      BuildRWKVFromSafeTensors importer; needs an incremental TNNetWKV
-      state-carry path).
-- [ ] Mamba decode-side demo: tokens/sec flat in context length where a
-      transformer of equal size slows (constant-memory headline of the
-      landed BuildMambaFromSafeTensors importer; needs an incremental
-      TNNetSelectiveSSM state-carry path, the sibling of the RWKV-4
-      decode demo task above).
+- [ ] RWKV/recurrent decode follow-ups (O(1) incremental decode for TNNetWKV +
+      TNNetTokenShift + net-wide TNNet.BeginIncrementalDecode driver over
+      TokenShift/WKV/SelectiveSSM/DiagonalSSM LANDED, commits 62165c1/cc1bfcb):
+  - [ ] TNNetCrossWKV incremental path (two-source + asymmetric modes + receptance
+        gate — non-trivial, deferred).
+  - [ ] Wire the net-wide recurrent driver INTO TNNetStreamingDecoder so GenerateTokens*
+        drives TokenShift/WKV/SSM uniformly alongside the SDPA KV-cache (decoder
+        currently only collects SDPA + TNNetDiagonalSSM, not TokenShift/WKV/SelectiveSSM).
+- [ ] Mamba decode follow-up (O(1) incremental TNNetSelectiveSSM state-carry decode
+      LANDED, commit 27ba256):
+  - [ ] Full Mamba-BLOCK token-by-token decode: causal DepthwiseConv1D must carry
+        its (kernel-1)-token ring buffer + in/out projections driven one token at a
+        time, then wire into TNNetStreamingDecoder (mirrors the RWKV TokenShift
+        block-integration follow-up).
 - [ ] Forced-prefix seq2seq decode + KV cache for Whisper-style decoders:
       DecodeSeq2SeqGreedy/Sampled assume a text encoder input and a
       single BOS start token, so examples/WhisperTranscribe hand-rolls
@@ -471,108 +590,6 @@ rather than acted on.
       substantially. Note: the WhisperTranscribe example needs ~4 GB
       VIRTUAL memory (ulimit -v 4000000; the 3 GB test cap aborts during
       build).
-- [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
-      TNNet and RE-ENCODES the whole prefix every step — the streaming-
-      decode docs explicitly note only greedy/sampled streamed generation
-      is exact today. Add a fork/clone primitive to TNNetStreamingDecoder
-      (copy, or copy-on-write, of per-layer cache state per surviving
-      hypothesis) and a cache-backed DecodeBeamSearch variant on top.
-      Turns beam from O(L^2) per hypothesis into O(L); the fork primitive
-      is also what best-of-N and the speculative-decoding verify step
-      want. Assert ranked beam output is identical to the re-encoding
-      implementation.
-- [ ] Prefix/session cache reuse in TNNetStreamingDecoder: no way today to
-      save/restore or fork a session, so a shared system prompt is
-      re-prefilled for every generation. Add snapshot-after-prefill +
-      clone-per-request (and optional save/load to disk for a persistent
-      system-prompt cache). The single biggest practical speedup for the
-      landed chat-templates use case; shares the fork primitive with the
-      KV-cache beam task above. Assert a forked session's continuation is
-      bit-identical to a fresh prefill. Related consumer: the landed
-      examples/ChatTerminal decodes with one full fixed-width forward per
-      token because importers build at full context width — an importer
-      option to build a width-1 decode twin (or build-twice +
-      CopyWeights) would let chat ride TNNetStreamingDecoder.
-- [ ] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
-      easy tokens from an intermediate layer through the LM head, fall
-      back to full depth when confidence is low — the model becomes its
-      OWN draft model, no second checkpoint. Distinct from the landed
-      examples/SelfSpeculativeDecoding, which drafts from MTP heads, not an
-      intermediate-layer exit. The repo is unusually well positioned: the
-      LogitLens/TunedLens frozen-body splice idiom already implements "read
-      logits at layer k", and examples/SpeculativeDecoding implements the
-      accept/verify rule. v1:
-      static exit layer + confidence threshold; follow-up: per-token
-      adaptive exit. Report tokens/sec vs full-depth at matched output
-      quality.
-- [ ] DoLa decoding (Decoding by Contrasting Layers, Chuang et al. 2023;
-      transformers `generate(dola_layers=...)`): improve FACTUALITY (not
-      speed — distinct from the early-exit task above and from contrastive
-      search, which contrasts against context tokens) by reading logits at
-      a premature layer via the same LogitLens "logits at layer k" splice,
-      then scoring next tokens by log p_final - log p_premature over an
-      adaptive head-candidate set (tokens above an alpha fraction of the
-      final layer's max prob); pick the premature layer per step as the
-      one with max Jensen-Shannon divergence from the final distribution
-      over a small candidate bucket. Pure decode-time composition of
-      landed primitives — no new weights, no training. v1 in
-      neural/neuraldecode.pas with fixed candidate-layer bucket; test:
-      on a toy LM with a planted shallow-layer bias, DoLa flips the
-      biased completion while greedy full-depth decode does not, and
-      alpha=0/empty-bucket degrades exactly to standard greedy.
-- [ ] Grammar/regex-constrained decoding (GBNF-style): generalize the
-      landed hand-written JSON state machine — TNNetTokenConstraint's
-      Reset/MaskAllowed/Commit interface (plus the copy-on-fork support
-      the JSON machine already has) is exactly the right plug. v1: a
-      llama.cpp-GBNF-subset grammar compiled to a pushdown machine over
-      CHARACTERS, with the existing char-by-char token-feasibility walk;
-      alternatively (or additionally) regex -> DFA. Test: a small
-      arithmetic-expression grammar accepts only valid strings across
-      greedy/sampled decoding, and forked beams keep independent states.
-- [X] Token healing (guidance-style): back up over the LAST prompt token
-      (landed: TNNetTokenHealingConstraint + PrepareTokenHealing +
-      TGenerationConfig.TokenHealing; still open: PrepareTokenHealing is
-      TStringListInt-only — a TNeuralHFTokenizer byte-level-BPE variant
-      needs a vocab prefix-scan helper there — and guidance-style
-      multi-token rollback)
-      and constrain the first generated token to extensions of its text,
-      fixing the classic BPE boundary artifact ("http:" never continuing
-      to "//" because the prompt split mid-merge). ~30 lines on top of the
-      constraint machinery + tokenizer vocab prefix lookup;
-      disproportionate quality win for completion-style prompts. Test: a
-      pinned vocab where the healed and unhealed first-token distributions
-      provably differ.
-- [ ] Weighted top-k sampler with HF semantics: TNNetSamplerTopK draws
-      UNIFORMLY among the top K instead of by renormalized probability
-      (long-standing gotcha; examples/GPT2Import and examples/ChatTerminal
-      hand-roll around it, and seq2seq sampled decode inherits it). Add a
-      probability-weighted top-k sampler in neuralvolume (or fix
-      TNNetSamplerTopK behind a flag, default unchanged for
-      reproducibility), switch the hand-rolled call sites to it, and pin a
-      distribution test (chi-square or fixed-seed draw sequence) proving
-      weighted-vs-uniform differ on a skewed 3-token head.
-- [ ] HellaSwag-style eval example on an imported checkpoint: a small
-      example program that loads a real imported model (e.g. SmolLM2 /
-      pythia via the safetensors importers), tokenizes a handful of
-      multiple-choice items with TNeuralHFTokenizer and reports acc /
-      acc_norm through EvaluateMultipleChoice (neuralnlpmetrics.pas) —
-      the end-to-end "imported model scores X" demo the landed scoring
-      API was built for. Follow-ups: batch candidates sharing
-      a context prefix; optional last-window scoring for over-context
-      sequences (v1 raises).
-- [ ] Generation-quality / degeneration metrics in neuralnlpmetrics.pas:
-      distinct-n (Li et al. 2016), self-BLEU (reuses the landed
-      CorpusBLEU), and repetition rate — the standard degeneration suite.
-      The contrastive-search and sampling tasks elsewhere in this list
-      have no way to demonstrate their benefit without these. Pinned
-      hand-computable fixtures (e.g. "a a a a" distinct-1 = 1/4).
-- [ ] Needle-in-a-haystack long-context eval harness: place a fact at
-      varying depths in a synthetic long context, measure retrieval
-      accuracy vs (depth, context length) as a small grid report. The
-      landed RoPE-scaling wiring and the open KV-cache-eviction task both
-      NEED this to demonstrate they work — neither has an eval. Works
-      with the char-level/TinyStories-scale models the repo can actually
-      run, not just imported LLMs.
 - [ ] Streaming corpus loader with shuffle buffer: the landed packing
       pipeline materializes the whole token stream in RAM (neuraldatasets
       builds one concatenated Stream array). Read large text/token files
@@ -581,14 +598,6 @@ rather than acted on.
       way to pretrain on corpora bigger than RAM. Assert: same model
       quality on a small corpus vs the in-memory path at matched
       examples-seen, and bounded RSS on a corpus larger than the buffer.
-- [ ] BPE-dropout subword regularization (Provilkov et al. 2020): during
-      TRAINING tokenization randomly skip each applicable merge with
-      p~0.1 so the model sees alternative segmentations of the same text;
-      well-known robustness/quality win, ~20 lines in the existing
-      neuraltokenizer BPE merge loop, train-time only (eval tokenization
-      unchanged). Test: p=0 is bit-identical to the deterministic
-      tokenizer; p>0 at fixed seed yields a pinned alternative
-      segmentation.
 - [ ] MinHash near-duplicate corpus dedup tool: the C4/Pile hygiene step —
       shingle each document, MinHash signatures, LSH banding to find
       near-duplicate clusters, keep one representative. Small standalone
@@ -596,6 +605,29 @@ rather than acted on.
       task above; report duplicate-cluster stats. Test: planted
       near-duplicates (one-word edits) are found, distinct documents are
       not merged.
+
+- [ ] Wav2Vec2 -large / robust LayerNorm variant + pretraining (follow-up to the
+      landed Wav2Vec2/HuBERT CTC importer, which supports ONLY the wav2vec2-base
+      "group" feat_extract_norm + post-norm encoder; ReadWav2Vec2ConfigFromJSONFile
+      rejects feat_extract_norm="layer" and do_stable_layer_norm=true loudly). The
+      -large/robust path needs: LayerNorm on EVERY conv feature-extractor layer
+      (not just GroupNorm on conv 0), a PRE-norm transformer encoder
+      (do_stable_layer_norm), and the final encoder LayerNorm placement that
+      pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
+      contrastive masked-prediction heads currently dropped as ignorable tensors).
+- [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
+      genuinely distinct from the landed SEQUENTIAL self-speculative paths
+      (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
+      which verify ONE linear draft sequence per step). Tree drafting proposes a
+      TREE of candidate continuations (multiple top-k branches per draft head) and
+      verifies them all in ONE forward pass using a block-diagonal TREE-ATTENTION
+      mask so every root-to-node path is scored simultaneously, committing the
+      longest accepted path. New pieces: the draft-tree builder (Medusa multi-head
+      or EAGLE feature-autoregressive draft), the tree-attention mask construction,
+      and the path-acceptance/commit walk. Assert greedy output is bit-identical to
+      plain greedy on the target while issuing fewer target forwards; an
+      examples/TreeSpeculativeDecoding demo reporting the accepted-tokens/forward
+      speedup vs the linear self-speculative baseline.
 
 ## Layer follow-ups that fix real limitations
 
@@ -677,15 +709,15 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       KVHeads-sized cache (cache aliasing keyed by the shared K/V projection
       layers) so the GQA memory win materializes at inference; assert streamed
       output stays bit-identical to the unaliased path.
-- [ ] Per-sample / dynamic attention masks in TNNetScaledDotProductAttention
-      (follow-up to TNNetSequencePacker, commit 52c5ca0): SDPA only supports
-      the static causal flag + static sliding window, so packed training
-      windows cannot mask attention across document boundaries (GPT-2/3-style
-      cross-doc attention is what ships today). Add an optional per-sample
-      block-diagonal/document-id mask input (or a segment-ids side channel) and
-      wire `TNNetSequencePacker` to emit it; verify with a test that attention
-      weights across a separator are exactly zero and gradients match an
-      unpacked per-document baseline.
+- [ ] Segment-mask MHA-builder wiring follow-up (the SDPA-layer + packer half
+      landed above): thread an optional segment-id source through the
+      multi-head attention BUILDERS (AddMultiHeadSelfAttention and friends) so
+      packed-window training masks cross-document attention end-to-end, not just
+      at the bare TNNetScaledDotProductAttention layer. Each per-head SDPA in the
+      builder takes the same shared `pSegmentSource`; assert a packed two-doc MHA
+      stack matches the concatenation of independent per-document MHA runs (the
+      builder-level analogue of TestSegmentMaskMatchesUnpackedBaseline). KV-cache
+      incremental decode stays intentionally unmasked (single-stream = one doc).
 
 ## Tests / numerical-gradient audit
 
@@ -822,7 +854,3 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       with loss-difference direction >90% of the time across a small grid.
 - [ ] Coverage matrix at the top of TestNeuralNumerical.pas: per-class
       `[grad] [serialize]` block, written by a small script.
-
-# Examples
-- [X] A chat terminal application with option to select the model to import
-      and inference parameters.

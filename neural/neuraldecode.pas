@@ -91,6 +91,21 @@ Ready-made constraints:
     after the top-level value is accepted. Intended for char-level or BPE
     (no-separator) vocabularies: token strings are validated as-is, with no
     separator inserted between tokens.
+  - TNNetGrammarConstraint: GENERAL grammar-constrained generation, the
+    generalization of the JSON machine to an arbitrary GBNF-subset grammar
+    (llama.cpp style). TNNetGrammar compiles GBNF text to a flat pushdown
+    representation; TNNetGrammarMachine runs it as an NFA-of-stacks (the active
+    set is a SET of parse stacks, so alternation / optional / repetition are
+    handled exactly), reusing the same char-by-char token-feasibility walk: a
+    token is allowed iff feeding its characters through a FORK of the machine
+    accepts all of them, and EOS (< 2) iff the machine is in an accepting
+    (complete) state. The grammar constrains ONLY the generated text (the
+    prompt is plain conditioning). Supported subset: rule defs name ::= body
+    (entry rule MUST be 'root'); sequence + alternation '|'; char literals
+    "abc" (\n \r \t \" \\ escapes); classes [a-z], negation [^...], '.' any;
+    repetition * + ? and grouping ( ... ); rule references (recursion ->
+    the pushdown stack); '#' comments and free whitespace. NOT in v1: bounded
+    repetition {m,n}, regex->DFA, and numeric \xNN/\uNNNN class escapes.
 
 LOGITS-PROCESSOR CHAIN + GENERATION CONFIG. The penalties / temperature /
 constraints above also compose through TNNetLogitsProcessor, a chainable
@@ -122,6 +137,14 @@ per-step distribution transform (the transformers GenerationMixin
     order is: penalty -> temperature -> extra processors -> constraint ->
     sampler (the constraint runs LAST so its structural guarantees - e.g.
     JSON validity - cannot be broken by a later transform).
+  - TNNetCFGProcessor is CLASSIFIER-FREE GUIDANCE (the transformers
+    UnbatchedClassifierFreeGuidanceLogitsProcessor): it owns a SECOND width-1
+    streaming session for an unconditional / negative prompt, runs it forward
+    alongside the conditional loop each step, and combines the two
+    distributions in LOGIT space (logits := uncond + scale*(cond-uncond))
+    before the sampler. GuidanceScale=1 is bit-for-bit conditional-only
+    decoding; GuidanceScale=0 ignores the conditional prompt entirely. As a
+    plain TNNetLogitsProcessor it plugs into any processor-accepting overload.
 
 Coded by Claude (AI).
 *)
@@ -131,9 +154,37 @@ Coded by Claude (AI).
 interface
 
 uses
-  Classes, SysUtils, neuralvolume, neuralnetwork;
+  Classes, SysUtils, neuralvolume, neuralnetwork, neuralhftokenizer;
 
 type
+  // Forward declaration: TNNetCFGProcessor (below) holds an unconditional
+  // streaming session, but the session class is declared further down.
+  TNNetStreamingDecoder = class;
+
+  // External per-candidate scorer for Best-of-N reranking (the Bradley-Terry /
+  // reward-model plug). Returns a scalar reward for a generated continuation;
+  // Best-of-N returns the candidate with the MAXIMUM scorer value. Plain (not
+  // "of object") so a bare function can be passed. Coded by Claude (AI).
+  TNNetSequenceScorer = function(const Prompt, Generated: string): TNeuralFloat;
+
+  // DoLa candidate-layer bucket selection (Chuang et al. 2023, the paper's
+  // DoLa-low / DoLa-high dynamic premature-layer pools). The lens-compatible
+  // earlier layers (those whose Output.Size matches the head-input slot) are
+  // ordered by depth and split at the midpoint:
+  //   dlbFull - all lens-compatible layers (the v1 fixed bucket; default).
+  //   dlbLow  - the SHALLOW half (early layers, index < count div 2).
+  //   dlbHigh - the DEEP half (later layers, index >= count div 2).
+  // With a single candidate layer dlbLow keeps it and dlbHigh is empty (an
+  // empty bucket degrades DoLa to greedy, same invariant as Alpha<=0).
+  // Coded by Claude (AI).
+  TDoLaLayerBucket = (dlbFull, dlbLow, dlbHigh);
+
+  // Answer-extraction callback for the self-consistency variant: maps a full
+  // generated continuation to its canonical ANSWER string (e.g. the final
+  // number after "####"). Candidates whose extracted answer is the empty string
+  // are ignored in the vote. Coded by Claude (AI).
+  TNNetAnswerExtractor = function(const Generated: string): string;
+
   // A scored decode candidate: the generated text (excluding the prompt) and
   // its cumulative log-probability.
   TNNetDecodeResult = record
@@ -144,6 +195,69 @@ type
   end;
 
   TNNetDecodeResultArray = array of TNNetDecodeResult;
+
+  // SELF-SPECULATIVE / EARLY-EXIT decode statistics (LayerSkip/CALM style).
+  // The SAME network is its own draft model: a token drafted from an
+  // INTERMEDIATE layer's logits (read through the LM head, frozen-body splice)
+  // is verified against the full-depth argmax. Because every emitted token is
+  // the full-depth argmax, the output is BIT-IDENTICAL to plain greedy; only
+  // the COUNTERS below describe the speed story. Coded by Claude (AI).
+  TNNetEarlyExitStats = record
+    Steps: integer;          // generated tokens (= full-depth forwards)
+    DraftProposals: integer; // steps where the early-exit was confident enough
+                             // to PROPOSE a draft (max p_exit >= Confidence)
+    Accepted: integer;       // confident drafts that matched the full argmax
+                             // (these would be free in a cached implementation)
+    Rejected: integer;       // confident drafts that DISAGREED (fell back)
+    AcceptanceRate: TNeuralFloat; // Accepted / max(1, DraftProposals)
+  end;
+
+  // -------------------------------------------------------------------------
+  // NEEDLE-IN-A-HAYSTACK long-context evaluation (NeedleInHaystackReport).
+  //
+  // Places a FACT ("needle") at varying depths inside a synthetic long
+  // context ("haystack" filler), appends a retrieval question, runs
+  // generation, and checks whether the answer was recovered. The result is a
+  // (depth x context-length) accuracy grid - the standard probe for whether a
+  // position-extrapolation scheme (RoPE scaling) or a KV-cache-eviction policy
+  // actually preserves access to information far from the query position.
+  //
+  // Pluggable callbacks keep it model-agnostic so it can be exercised both by
+  // a real char-level TNNet (via the convenience overload that wraps
+  // DecodeGreedy) and by a deterministic stand-in in tests:
+  //   TNeedleFillerCallback   builds CharCount characters of distractor text
+  //                           (must NOT contain the needle answer);
+  //   TNeedleGenerateCallback runs the model on a fully-assembled prompt and
+  //                           returns its generated continuation.
+  // Coded by Claude (AI).
+  TNeedleFillerCallback =
+    function(CharCount: integer; Data: Pointer): string;
+  TNeedleGenerateCallback =
+    function(const Prompt: string; Data: Pointer): string;
+
+  // Outcome of a single (length,depth) probe plus the assembled prompt and the
+  // raw model output, so callers can inspect individual cells.
+  // Coded by Claude (AI).
+  TNeedleCell = record
+    ContextLen: integer;       // requested filler length in characters
+    DepthFraction: TNeuralFloat; // needle insertion depth in [0,1]
+    Prompt: string;            // the fully-assembled probe prompt
+    Output: string;            // the model's generated continuation
+    Hit: boolean;              // True if Output contained the needle answer
+  end;
+
+  // Full grid result: Cells[depthRow][lenCol], the requested axes, and the
+  // overall hit rate (HitCount/TotalCount). Report is the rendered grid.
+  // Coded by Claude (AI).
+  TNeedleInHaystackResult = record
+    Cells: array of array of TNeedleCell; // [depth][length]
+    DepthFractions: TNeuralFloatDynArr;
+    ContextLengths: TNeuralIntegerArray;
+    HitCount: integer;
+    TotalCount: integer;
+    Accuracy: TNeuralFloat;    // HitCount / TotalCount (0 if empty)
+    Report: string;            // rendered ASCII grid + summary
+  end;
 
   // A scored TOKEN-ID decode candidate - the seq2seq (encoder-decoder) beam
   // counterpart of the char-level TNNetDecodeResult above. Tokens holds the
@@ -360,6 +474,175 @@ type
       property Machine: TNNetJSONStateMachine read FMachine;
   end;
 
+  // Flat compiled-grammar element kind (the llama.cpp GBNF encoding: a grammar
+  // rule body is a flat array of these, alternates separated by getAlt and
+  // terminated by getEnd). Coded by Claude (AI).
+  TNNetGrammarElemType = (
+    getEnd,        // end of a rule body (an alternate completes here)
+    getAlt,        // separates the alternates of a rule body
+    getRuleRef,    // a reference to another rule (Value = rule index)
+    getChar,       // a single literal character (Value = ord(char))
+    getCharSet,    // a character class: Value = index into FCharSets
+    getCharSetNot, // a negated character class (Value = index into FCharSets)
+    getCharAny);   // '.' : any character (rejects only nothing; impl excludes #0)
+
+  // One compiled grammar element. Coded by Claude (AI).
+  TNNetGrammarElem = record
+    ElemType: TNNetGrammarElemType;
+    Value: integer;
+  end;
+  TNNetGrammarElemArray = array of TNNetGrammarElem;
+
+  // A character-class entry: an inclusive [Lo..Hi] range (a single char is
+  // Lo=Hi). A class is a contiguous run of these in FRanges. Coded by Claude (AI).
+  TNNetGrammarRange = record
+    Lo, Hi: char;
+  end;
+
+  { TNNetGrammar }
+  // A GBNF-subset grammar COMPILED to a flat pushdown representation. Supported
+  // subset (llama.cpp-style, v1):
+  //   - rule definitions:  name ::= body  (one per logical line; the entry
+  //     rule MUST be named 'root')
+  //   - sequence (concatenation) and alternation '|'
+  //   - char literals "abc" (each char a literal; \n \r \t \" \\ \] escapes)
+  //   - character classes [a-z0-9_], negation [^...], '.' any-char
+  //   - repetition postfix '*', '+', '?' and grouping '( ... )'
+  //   - rule references (recursion -> the pushdown stack)
+  //   - '#' line comments and free whitespace between tokens
+  // NOT in v1 (see the unit header / tasklist): bounded repetition {m,n},
+  // regex->DFA, and numeric \xNN / \uNNNN escapes in classes.
+  // Repetition/grouping/optional are desugared into anonymous helper rules at
+  // compile time, so the run-time machine only ever sees char/charset/ruleref/
+  // alt/end elements (exactly the llama.cpp scheme). Coded by Claude (AI).
+  TNNetGrammar = class(TObject)
+    private
+      FSource: string;
+      FRuleNames: TStringList;        // index -> rule name
+      FRules: array of TNNetGrammarElemArray; // index -> compiled body
+      FRanges: array of TNNetGrammarRange;    // pooled char-class ranges
+      FCharSets: array of record First, Count: integer; end; // run in FRanges
+      FRootRule: integer;
+      // --- parser state (over FSource) ---
+      FPos: integer;
+      function PeekCh(): char;
+      procedure NextCh();
+      procedure SkipWS();
+      function AtEnd(): boolean;
+      function AddRule(const Name: string): integer;
+      function FindOrAddRule(const Name: string): integer;
+      function NewAnonRule(): integer;
+      function AddCharSet(const ARanges: array of TNNetGrammarRange): integer;
+      // Parses one rule body (alternation of sequences) into Elems, then
+      // applies a possible repetition wrapper. Returns via Elems.
+      procedure ParseAlternates(var Elems: TNNetGrammarElemArray);
+      procedure ParseSequence(var Elems: TNNetGrammarElemArray);
+      // Parses ONE element (literal/class/group/ref) plus its */+/? postfix;
+      // appends the resulting element(s) to Elems.
+      procedure ParseElement(var Elems: TNNetGrammarElemArray);
+      // Parses a '[' ... ']' class; sets Negated for '[^'. Returns charset idx.
+      function ParseCharClass(out Negated: boolean): integer;
+      procedure ExpectCh(C: char);
+      // Desugar helpers: append a single getRuleRef to a freshly built
+      // anonymous rule implementing the postfix over AtomRule.
+      procedure BuildOptRule(AtomRule: integer;
+        var Elems: TNNetGrammarElemArray);
+      procedure BuildStarRule(AtomRule: integer;
+        var Elems: TNNetGrammarElemArray);
+      procedure BuildPlusRule(AtomRule: integer;
+        var Elems: TNNetGrammarElemArray);
+      procedure Compile();
+    public
+      // Builds and compiles the grammar from GBNF text. Raises EAssertionFailed
+      // on a malformed grammar or a missing 'root' rule.
+      constructor Create(const GBNFText: string);
+      destructor Destroy(); override;
+      property RootRule: integer read FRootRule;
+  end;
+
+  { TNNetGrammarMachine }
+  // Run-time NFA-of-stacks over a compiled TNNetGrammar (does NOT own it). The
+  // active set is a list of STACKS; each stack is a list of element positions
+  // (a position = rule index * KStride + element index, packed) with the TOP at
+  // the end. FeedChar(C) keeps only the stacks whose top element matches C,
+  // advances each past the matched element (descending into rule refs along the
+  // way so the new tops are again terminals), and dedups. IsComplete() is true
+  // when some active stack is empty (a full parse of 'root' stands). CharAllowed
+  // is a non-destructive probe; CopyFrom supports copy-on-fork for beams.
+  // Coded by Claude (AI).
+  TNNetGrammarMachine = class(TObject)
+    private
+      FGrammar: TNNetGrammar;
+      // Active set: FStacks[i] is a stack of packed positions, length in
+      // FStackLen[i]; FStackCount stacks are live.
+      FStacks: array of array of integer;
+      FStackLen: array of integer;
+      FStackCount: integer;
+      // Scratch for FeedChar/CharAllowed (avoids per-call allocation).
+      FScratch: array of array of integer;
+      FScratchLen: array of integer;
+      FScratchCount: integer;
+      function PackPos(Rule, Idx: integer): integer;
+      procedure UnpackPos(Pos: integer; out Rule, Idx: integer);
+      // Pushes a stack (copy of Src[0..Len-1] then descends rule refs so the
+      // new top is a terminal or the stack is empty) into the scratch set,
+      // expanding alternates. Dedups against what's already in scratch.
+      procedure AddStackExpanded(const Src: array of integer; Len: integer);
+      // Forks Base into every alternate of RuleIdx (used by Reset and ruleref
+      // expansion).
+      procedure PushRuleAlternates(const Base: array of integer;
+        BaseLen, RuleIdx: integer);
+      procedure AddStackRaw(const Src: array of integer; Len: integer);
+      function ScratchHas(const Src: array of integer; Len: integer): boolean;
+      // Replaces the active set with the freshly built scratch set.
+      procedure CommitScratchToActive();
+      // Char matches the terminal element at Pos?
+      function ElemMatches(Pos: integer; C: char): boolean;
+    public
+      constructor Create(AGrammar: TNNetGrammar);
+      procedure Reset();
+      procedure CopyFrom(Source: TNNetGrammarMachine);
+      // Advances by one character; False = no active stack accepts C (the
+      // active set is REPLACED by the survivors, which is empty on False - call
+      // CharAllowed/use a copy if you must probe non-destructively).
+      function FeedChar(C: char): boolean;
+      function FeedString(const S: string): boolean;
+      function CharAllowed(C: char): boolean;
+      // True when a complete parse of the root rule stands (some empty stack).
+      function IsComplete(): boolean;
+      function ActiveCount(): integer;
+  end;
+
+  { TNNetGrammarConstraint }
+  // Grammar-driven constrained-decoding hook: allows exactly the tokens whose
+  // decoded surface text is a legal continuation of the grammar from the
+  // current parse state. Multi-character tokens are validated transitively by
+  // feeding their characters through a forked machine (the same char-by-char
+  // token-feasibility walk the JSON constraint uses). The grammar constrains
+  // ONLY the generated text - the prompt is plain conditioning and is NOT fed
+  // through the machine. Special/EOS ids (< 2) are allowed exactly when the
+  // grammar is in a complete (accepting) state; empty-string tokens are never
+  // allowed. Create(GBNFText, Dict) snapshots Dict.DeTokenize(id) per id;
+  // CreateCharLevel(GBNFText, VocabSize) is the char-level convention (token id
+  // = character code, ids < 2 special). Owns its TNNetGrammar.
+  // Coded by Claude (AI).
+  TNNetGrammarConstraint = class(TNNetTokenConstraint)
+    private
+      FTokenStr: array of string;
+      FGrammar: TNNetGrammar;
+      FMachine: TNNetGrammarMachine;
+      FProbe: TNNetGrammarMachine;
+    public
+      constructor Create(const GBNFText: string; Dict: TStringListInt); overload;
+      constructor CreateCharLevel(const GBNFText: string; VocabSize: integer);
+      destructor Destroy(); override;
+      procedure Reset(const PromptTokens: array of integer); override;
+      function TokenAllowed(TokenId: integer): boolean; override;
+      procedure Commit(TokenId: integer); override;
+      // The live machine (after the committed tokens) for inspection.
+      property Machine: TNNetGrammarMachine read FMachine;
+  end;
+
   { TNNetLogitsProcessor }
   // Chainable next-token distribution transform - the GenerationMixin-style
   // "logits processor" abstraction. The generation loop calls
@@ -477,6 +760,109 @@ type
       property Items[Index: integer]: TNNetLogitsProcessor read GetItem; default;
   end;
 
+  { TNNetCFGProcessor }
+  // CLASSIFIER-FREE GUIDANCE (CFG) for autoregressive text generation - the
+  // port of transformers' UnbatchedClassifierFreeGuidanceLogitsProcessor. Each
+  // decode step the model is run TWICE: the CONDITIONAL branch (the real
+  // prompt, owned by the calling generation loop) and an UNCONDITIONAL branch
+  // (an empty or NEGATIVE prompt, owned by THIS processor's own width-1
+  // streaming session). The two distributions are combined in LOGIT space
+  // before the sampler reads them:
+  //   logits := uncond + GuidanceScale * (cond - uncond)
+  // GuidanceScale = 1 reproduces the conditional-only distribution exactly
+  // (the term collapses to cond); GuidanceScale = 0 collapses to uncond,
+  // ignoring the conditional prompt entirely; GuidanceScale > 1 SHARPENS the
+  // contrast (the usual CFG regime).
+  //
+  // DOMAIN. The chain feeds POST-SOFTMAX PROBABILITIES (the model ends in a
+  // SoftMax). CFG is a logit-space rule, so this processor maps each branch's
+  // probabilities to LOG-PROBABILITIES (SafeLogProb), combines, and softmaxes
+  // back to a probability row. Using log-probs instead of true pre-softmax
+  // logits differs only by a per-branch additive constant; that constant is
+  // uniform across tokens and cancels in the final softmax, so the combine is
+  // exact (and GuidanceScale = 1 is bit-for-bit the untouched cond row).
+  //
+  // OWNERSHIP / WIRING (mirrors the HF design that wires an unconditional
+  // model+inputs into the processor): Create takes the UNCONDITIONAL width-1
+  // streaming session (typically the SAME twin net as the conditional loop, or
+  // a separate twin sharing weights) and the negative/unconditional prompt
+  // token ids. The session is NOT owned unless OwnsSession is True. The
+  // processor drives its own session: Reset prefills the negative prompt,
+  // ProcessRow steps the unconditional branch forward one token and combines,
+  // Commit feeds the just-emitted token into the unconditional branch (so both
+  // branches share the generated suffix, differing only in their prompt).
+  // The negative prompt may be empty (pure unconditional / "no prompt"): a
+  // single BOS-like seed token is then required so the branch has an input -
+  // pass at least one token (e.g. the conditional prompt's first token, or a
+  // dedicated BOS id) as the unconditional context.
+  // Coded by Claude (AI).
+  TNNetCFGProcessor = class(TNNetLogitsProcessor)
+    private
+      FSession: TNNetStreamingDecoder;
+      FOwnsSession: boolean;
+      FNegPrompt: TNeuralIntegerArray;
+      FInV: TNNetVolume;
+      FPendingToken: integer; // next token to feed the uncond branch
+      FAbsPos: integer;       // absolute position of FPendingToken
+      FGuidanceScale: TNeuralFloat;
+    public
+      // UncondSession: a WIDTH-1 streaming session for the unconditional
+      // branch. NegativePrompt: the unconditional/negative prompt token ids
+      // (must be non-empty - it seeds the branch's first input). GuidanceScale
+      // = 1 is a no-op; = 0 ignores the conditional prompt.
+      constructor Create(UncondSession: TNNetStreamingDecoder;
+        const NegativePrompt: array of integer; GuidanceScale: TNeuralFloat;
+        OwnsSession: boolean = false);
+      destructor Destroy(); override;
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      property GuidanceScale: TNeuralFloat
+        read FGuidanceScale write FGuidanceScale;
+  end;
+
+  { TNNetWatermarkLogitsProcessor }
+  // LLM OUTPUT WATERMARKING - the green-list scheme of Kirchenbauer et al.
+  // 2023 ("A Watermark for Large Language Models"). At every step the
+  // PREVIOUS token (set in Reset to the last prompt token, then advanced in
+  // Commit) seeds a splitmix64 hash combined with a secret Key; that hash
+  // pseudo-randomly partitions the whole vocabulary into a "green" list of
+  // fraction Gamma (default 0.25) and the complementary "red" list. A bias
+  // Delta (default 2.0, a LOGIT-space additive shift) is then applied to the
+  // green tokens, gently steering sampling toward them without forbidding red
+  // tokens. Because the chain works in the POST-SOFTMAX probability domain,
+  // adding Delta to a green logit is realized as multiplying its probability
+  // by exp(Delta) and renormalizing - the exact probability-domain image of
+  // logit += Delta. The same deterministic partition (IsGreen) is reused by
+  // the standalone DetectWatermark statistical test, so a watermarked text is
+  // detectable from Key alone without the model.
+  // Coded by Claude (AI).
+  TNNetWatermarkLogitsProcessor = class(TNNetLogitsProcessor)
+    private
+      FKey: UInt64;
+      FGamma: TNeuralFloat;
+      FDelta: TNeuralFloat;
+      FPrevToken: integer;
+    public
+      // Key: secret watermark key (any 64-bit value). Gamma: green-list
+      // fraction in (0,1). Delta: green-logit bias (>= 0).
+      constructor Create(pKey: UInt64; pGamma: TNeuralFloat = 0.25;
+        pDelta: TNeuralFloat = 2.0);
+      // Seeds FPrevToken from the LAST prompt token (the first generated token
+      // is greened relative to it); an empty prompt seeds with -1.
+      procedure Reset(const PromptTokens: array of integer); override;
+      procedure ProcessRow(Row: TNNetVolume); override;
+      procedure Commit(TokenId: integer); override;
+      // Deterministic, bit-reproducible green-list membership: TRUE iff TokenId
+      // is in the green list seeded by (Key, PrevToken, Gamma). Shared verbatim
+      // with DetectWatermark so detection matches generation exactly.
+      class function IsGreen(pKey: UInt64; PrevToken, TokenId: integer;
+        Gamma: TNeuralFloat): boolean; static;
+      property Key: UInt64 read FKey write FKey;
+      property Gamma: TNeuralFloat read FGamma write FGamma;
+      property Delta: TNeuralFloat read FDelta write FDelta;
+  end;
+
   { TGenerationConfig }
   // One-record bundle of generation knobs - the GenerationConfig counterpart
   // of the parameter piles on the GenerateTokensStreamed overloads, consumed
@@ -506,6 +892,20 @@ type
     Constraint: TNNetTokenConstraint;      // nil = off (not owned)
     // Sampler reading the processed probability row; nil = greedy argmax.
     Sampler: TNNetSamplerBase;             // not owned
+    // CLASSIFIER-FREE GUIDANCE (CFG). GuidanceScale = 1.0 is OFF (the no-op
+    // default): the conditional distribution is used untouched and CFGUncond
+    // is ignored, so the path is bit-for-bit the non-CFG path. When
+    // GuidanceScale <> 1.0 the config wires a TNNetCFGProcessor at the FRONT
+    // of the per-step pipeline (it combines the two model distributions BEFORE
+    // penalty/temperature/processors/constraint see the row). CFGUncond is the
+    // WIDTH-1 unconditional streaming twin (typically derived with
+    // MakeUnconditionalTwin from the same imported net; not owned by the
+    // record). NegativePrompt is the unconditional/negative prompt token ids;
+    // it must be non-empty when GuidanceScale <> 1.0 (it seeds the
+    // unconditional branch - pass a single BOS-like id for "no prompt").
+    GuidanceScale: TNeuralFloat;           // 1.0 = off
+    CFGUncond: TNNetStreamingDecoder;      // unconditional twin (not owned)
+    NegativePrompt: TNeuralIntegerArray;   // negative/unconditional prompt ids
     // Guidance-style TOKEN HEALING (string paths only - the token-level
     // routines have no dict; call PrepareTokenHealing yourself there): drop
     // the last prompt token and constrain the FIRST generated token to
@@ -513,6 +913,50 @@ type
     // no-op when healing is not applicable (1-token prompt, empty/unknown
     // last-token text, or no strict extension exists in the vocabulary).
     TokenHealing: boolean;
+  end;
+
+  // TNNetDecoderSessionSnapshot: an opaque, owned, deep copy of a
+  // TNNetStreamingDecoder's live per-layer KV-cache / SSM state, captured at one
+  // point in a sequence (typically right after prefilling a shared system
+  // prompt). It is the prefix-cache-reuse / cache-fork primitive: prefill a
+  // prompt P once, Snapshot it, then for each request RestoreSnapshot it into a
+  // session and generate the continuation - the system prompt is NOT re-prefilled
+  // per request. The same snapshot can be restored any number of times (it is an
+  // independent copy, untouched by the session it forked from), so it doubles as
+  // the per-hypothesis fork the KV-cache beam / best-of-N tasks want.
+  //
+  // CONTENTS. One captured (K-cache, V-cache, live length, eviction sinks,
+  // eviction window) tuple per collected attention layer, and one (recurrent
+  // state h, step count) pair per collected SSM layer - i.e. the FULL live state
+  // a StepForward reads, including any eviction policy armed on the source
+  // session. RoPE PositionOffset is NOT stored (it is set per-StepForward from
+  // the caller's AbsPos, not session state).
+  //
+  // CORRECTNESS. Restoring a snapshot and continuing is BIT-IDENTICAL to a fresh
+  // prefill of the whole prefix followed by the same continuation (the cache
+  // buffers are byte-copied and the live length is restored, so the next token
+  // appends at exactly the same slot it would in the unforked session). The
+  // shape contract is the source and destination sessions wrap the SAME
+  // architecture at the SAME MaxCacheLen (the natural case: one twin built once,
+  // or two twins CopyWeights'd from the same trained net). Disk persistence of a
+  // snapshot (a system-prompt cache on disk) is a documented follow-up; this is
+  // the in-memory fork. Coded by Claude (AI).
+  TNNetDecoderSessionSnapshot = class(TObject)
+  private
+    FK: array of TNNetVolume;        // per-attention-layer cached keys (deep copy)
+    FV: array of TNNetVolume;        // per-attention-layer cached values
+    FLen: array of integer;          // per-attention-layer live cache length
+    FSinks: array of integer;        // per-attention-layer eviction sink count
+    FWindow: array of integer;       // per-attention-layer eviction window
+    FH: array of TNNetVolume;        // per-SSM-layer recurrent state h (deep copy)
+    FSteps: array of integer;        // per-SSM-layer step count
+    function GetSDPACount(): integer;
+    function GetSSMCount(): integer;
+  public
+    destructor Destroy(); override;
+    // Number of attention / SSM layers captured (diagnostics / tests).
+    property SDPACount: integer read GetSDPACount;
+    property SSMCount: integer read GetSSMCount;
   end;
 
   // TNNetStreamingDecoder: a reusable incremental-decode "streaming session"
@@ -582,6 +1026,7 @@ type
     FSDPAs: array of TNNetScaledDotProductAttention;
     FSSMs: array of TNNetDiagonalSSM;
     FRopes: array of TNNetRotaryEmbedding;
+    FHiddenLayer: TNNetLayer;        // lazily resolved last-hidden-state layer
     function GetSDPACount(): integer;
     function GetSSMCount(): integer;
     function GetRopeCount(): integer;
@@ -600,9 +1045,71 @@ type
     // attention layer, discarding the K/V of rejected/pad tokens. No-op when
     // the net has no attention layers.
     procedure TruncateTo(CommittedLen: integer);
+    // StreamingLLM unbounded streaming: turn on the attention-sink + rolling-
+    // window KV-cache eviction policy on EVERY collected attention layer, so a
+    // stream can run forever in constant memory. SinkTokens (the first tokens,
+    // always retained - a few initial tokens absorb a disproportionate share of
+    // attention mass) plus RecentWindow (the most-recent tokens) are kept and
+    // the middle is evicted; total live tokens per layer is pinned at
+    // SinkTokens + RecentWindow once the stream passes that length. OFF by
+    // default (SinkTokens = 0), leaving the unbounded cache (the current
+    // behavior). SinkTokens + RecentWindow must be <= the session's MaxCacheLen.
+    //   RoPE is handled by the "keep original positions" rule (retained keys
+    // keep their post-RoPE rotation, the query keeps its true absolute rotation
+    // via StepForward's PositionOffset := AbsPos), so each surviving query/key
+    // pair attends at its exact relative distance - correct for RoPE/ALiBi/
+    // absolute/learned encodings alike. See TNNetScaledDotProductAttention.
+    // EnableEviction for the full note. No-op when the net has no attention
+    // layers (a pure-SSM model already decodes in constant memory).
+    //   While the streamed length stays <= SinkTokens + RecentWindow eviction
+    // never fires, so output is BIT-IDENTICAL to the unbounded session; only
+    // past that length does it diverge (by design - the middle is gone).
+    procedure EnableEviction(SinkTokens, RecentWindow: integer);
+    procedure DisableEviction();
+    // int8 KV-cache quantization for LONG-CONTEXT decode (opt-in, OFF by
+    // default). EnableInt8KVCache switches every collected attention layer's KV
+    // cache to int8 storage (per-row scale = maxabs/127, round-to-nearest,
+    // clamp [-127,127], dequantized on read) so a long context costs ~1/4 the
+    // FP32 K/V memory - the win when the KV cache, not the weights, dominates.
+    // Quantization is LOSSY: the decoded logits are NOT bit-exact vs the FP32
+    // cache, but per-row scaling keeps the drift small (a few e-2 on the logits
+    // with argmax stable on a pinned prompt; see TestKVCacheInt8). Call on a
+    // FRESH session BEFORE any StepForward (the attention layers require an
+    // empty cache to switch storage mode). DisableInt8KVCache reverts to FP32
+    // (also on an empty cache). No-op when the net has no attention layers.
+    procedure EnableInt8KVCache();
+    procedure DisableInt8KVCache();
+    // Live cache length of the Index-th collected attention layer (diagnostics /
+    // tests: with eviction on this is pinned at SinkTokens + RecentWindow once
+    // the stream passes that length).
+    function SDPACacheLength(Index: integer): integer;
+    // PREFIX-CACHE REUSE / cache fork. Snapshot() deep-copies this session's
+    // entire live state (every attention layer's KV cache + length + eviction
+    // policy, every SSM layer's recurrent state + step count) into a new owned
+    // TNNetDecoderSessionSnapshot the caller must Free. Typical use: prefill a
+    // shared system prompt once, Snapshot it, then for each request
+    // RestoreSnapshot it and generate just the continuation - the prompt is not
+    // re-prefilled per request. RestoreSnapshot(Snap) copies the snapshot back
+    // into this session (overwriting the live state), so the next StepForward
+    // continues EXACTLY where the snapshot was taken; restoring is BIT-IDENTICAL
+    // to a fresh prefill of the whole snapshotted prefix. The snapshot is an
+    // independent copy, so it can be restored into many sessions (the per-request
+    // fork, and the per-hypothesis fork the KV-cache beam task wants). The
+    // snapshot must come from a session wrapping the SAME architecture at the
+    // SAME MaxCacheLen (e.g. the same twin, or twins CopyWeights'd from one net).
+    function Snapshot(): TNNetDecoderSessionSnapshot;
+    procedure RestoreSnapshot(Snap: TNNetDecoderSessionSnapshot);
     // Convenience: the net's last layer output (e.g. the softmax row(s) of
     // the window just computed).
     function Output(): TNNetVolume;
+    // LAST-HIDDEN-STATE accessor: the output of the layer feeding the LM head
+    // (the representation a contrastive-search / embedding consumer reads),
+    // resolved once with the same heuristic as the cache-less
+    // ContrastiveHiddenLayer. After a width-1 StepForward this is exactly the
+    // just-stepped token's hidden state - no re-encode, no slicing - so it is
+    // the reusable primitive token-level contrastive search (and the KV-cache
+    // beam / best-of-N tasks) read instead of running an extra full forward.
+    function HiddenState(): TNNetVolume;
     property Net: TNNet read FNet;
     property SDPACount: integer read GetSDPACount;
     property SSMCount: integer read GetSSMCount;
@@ -623,6 +1130,19 @@ function LengthPenaltyDenominator(L: integer; Alpha: TNeuralFloat): TNeuralFloat
 // Numerically-safe natural log of a probability (clamps tiny / zero probs so a
 // dead-but-not-impossible token never produces -Inf and poisons the sum).
 function SafeLogProb(P: TNeuralFloat): TNeuralFloat;
+
+// WATERMARK DETECTION (Kirchenbauer et al. 2023). Given a candidate token
+// sequence and the same (Key, Gamma) the generator used, recomputes the green
+// list at every position from its PREDECESSOR token (positions 1..T-1, the
+// scored positions T = High(Tokens)) and returns the one-proportion z-score
+//   z = (greenObserved - Gamma*T) / sqrt(T*Gamma*(1-Gamma)).
+// Under the null hypothesis (text not produced under this watermark) the green
+// fraction is ~Gamma and z ~ N(0,1); a watermarked text drives the green
+// fraction well above Gamma and z above a threshold (e.g. 4.0 => p ~ 3e-5).
+// Sequences shorter than 2 tokens have no scored positions and return 0.
+// Coded by Claude (AI).
+function DetectWatermark(const Tokens: array of integer; Key: UInt64;
+  Gamma: TNeuralFloat = 0.25): TNeuralFloat;
 
 // Deterministic greedy argmax decode, in the same forward-pass / encoding
 // convention as DecodeBeamSearch. Returned as a single-element result so its
@@ -650,6 +1170,35 @@ function DecodeGreedy(NN: TNNet; const Prompt: string; MaxLen: integer;
   const StopStrings: array of string;
   Constraint: TNNetTokenConstraint): TNNetDecodeResult; overload;
 
+// BATCHED greedy decode for N prompts in lockstep. Generates a continuation for
+// every entry of Prompts, advancing the whole batch one step at a time: at each
+// step every still-running row gets ONE forward pass and its argmax token, then
+// rows that hit EOS / a stop string / MaxLen are frozen while the others keep
+// going. Result[i] is exactly what DecodeGreedy(NN, Prompts[i], MaxLen,
+// StopStrings) would return -- token-for-token identical, including SumLogProb
+// and Score.
+//
+// Left-padding / masking: the char-level decode forward uses the REVERSED
+// one-hot encoding (TNNetVolume.OneHotEncodingReversed), which right-aligns the
+// most-recent token at x=0 and leaves the unused (older) positions zero. Each
+// prompt is encoded independently into its own fixed-width input volume, so a
+// shorter prompt simply leaves more high-x positions zero -- this IS the
+// left-pad, and because every row's forward is computed on its own volume there
+// is no cross-row attention contamination to mask. Hence the bit-identical
+// guarantee holds UNCONDITIONALLY for prompts of arbitrary differing lengths
+// (no equal-length restriction).
+//
+// Note on performance: the underlying char-level engine (NN.Compute) has no
+// SIMD batch axis, so "one forward per step" is realized as a per-row inner
+// loop. The value here is a correct lockstep batched API with per-row stop
+// handling -- an evaluation-sweep convenience and a building block for a
+// speculative-decoding verify step -- not a vectorized speedup.
+function DecodeBatchGreedy(NN: TNNet; const Prompts: array of string;
+  MaxLen: integer): TNNetDecodeResultArray; overload;
+function DecodeBatchGreedy(NN: TNNet; const Prompts: array of string;
+  MaxLen: integer;
+  const StopStrings: array of string): TNNetDecodeResultArray; overload;
+
 // Beam search. Keeps BeamWidth partial sequences ranked by length-penalised
 // cumulative log-prob. Returns the single best (highest Score) result.
 //   MaxLen        : maximum number of generated tokens (excludes the prompt).
@@ -664,6 +1213,351 @@ function DecodeBeamSearch(NN: TNNet; const Prompt: string;
 function DecodeBeamSearchAll(NN: TNNet; const Prompt: string;
   MaxLen: integer; BeamWidth: integer;
   LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+
+// KV-CACHE (CACHE-FORKING) BEAM SEARCH. Same algorithm and ranking as
+// DecodeBeamSearchAll, but driven by a TNNetStreamingDecoder session so the
+// shared prefix is NOT re-encoded each step. Each surviving hypothesis keeps
+// one cache snapshot (TNNetDecoderSessionSnapshot, forked per beam); a step
+// RestoreSnapshots the beam's cache, StepForwards its last token to read the
+// next-token distribution, expands, prunes to BeamWidth, then snapshots each
+// survivor's cache for the next step. This turns the per-hypothesis cost from
+// O(L^2) (re-encode the whole prefix every step) into O(L).
+//   Session : a WIDTH-1 twin streaming decoder (input SizeX=1) over the same
+//             weights as the cache-less net. Its cache budget (MaxCacheLen at
+//             Create) must be >= Length(Prompt) + MaxLen.
+// EXACTNESS: produces BIT-FOR-BIT the same ranked beam (finished + surviving,
+// best-first) as DecodeBeamSearchAll(NN, Prompt, MaxLen, BeamWidth, ..) on the
+// equivalent net (per the TNNetStreamingDecoder exactness contract). Coded by
+// Claude (AI).
+function DecodeBeamSearchCachedAll(Session: TNNetStreamingDecoder;
+  const Prompt: string; MaxLen: integer; BeamWidth: integer;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+
+// Single-best cache-forking beam search: the highest-Score result of
+// DecodeBeamSearchCachedAll (same relation as DecodeBeamSearch to
+// DecodeBeamSearchAll). Coded by Claude (AI).
+function DecodeBeamSearchCached(Session: TNNetStreamingDecoder;
+  const Prompt: string; MaxLen: integer; BeamWidth: integer;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+
+// DIVERSE beam search (Vijayakumar et al. 2018, "Diverse Beam Search"). The
+// BeamWidth beams are partitioned into NumGroups equal groups of size
+// BeamWidth div NumGroups; the groups are expanded one after another within a
+// step, and when scoring group g (g>0) each candidate token's length-penalised
+// score has a HAMMING DIVERSITY PENALTY subtracted:
+//     score'(t) = score(t) - Diversity * (count of token t already chosen by
+//                                         the earlier groups 0..g-1 this step)
+// so later groups are pushed away from tokens the earlier groups already took,
+// giving a diverse set of completions instead of B near-duplicates.
+// DEGRADE-TO-BEAM invariant: NumGroups=1 (a single group) with Diversity=0 is
+// BIT-FOR-BIT the ordinary DecodeBeamSearchAll(NN,Prompt,MaxLen,BeamWidth,..);
+// Diversity=0 with any NumGroups removes the penalty (groups then differ only
+// through the per-group width split). Returns the whole final ranked beam
+// (finished + surviving), sorted best-first, exactly like DecodeBeamSearchAll.
+//   NumGroups : G, the number of diversity groups (clamped to [1, BeamWidth]).
+//   Diversity : lambda >= 0, the per-collision Hamming penalty (0 = none).
+// Coded by Claude (AI).
+function DecodeDiverseBeamSearchAll(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer; NumGroups: integer;
+  Diversity: TNeuralFloat;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+
+// Single-best diverse beam search: the highest-Score result of
+// DecodeDiverseBeamSearchAll (same relation as DecodeBeamSearch to
+// DecodeBeamSearchAll). Coded by Claude (AI).
+function DecodeDiverseBeamSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer; NumGroups: integer;
+  Diversity: TNeuralFloat;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+
+// CONSTRAINED beam search with FORCE-WORDS (force_words_ids; Anderson et al.
+// 2017 constrained beam search / HF PhrasalConstraint banking). Guarantees
+// that EVERY one of the required phrases in ForceTokens APPEARS somewhere in
+// the generated output (a phrase is a token sequence; here token id =
+// character code, so each phrase is a string). Unlike TNNetTokenConstraint
+// (which constrains a PREFIX / per-step allowed set) this forces phrases to
+// occur ANYWHERE in the completion, even when an unconstrained beam would
+// never emit them.
+// V1 GUARANTEE ("force completion before EOS"): each hypothesis tracks its
+// progress through every required phrase (how many leading characters of each
+// phrase it has emitted as a contiguous run). A beam may only emit EOS / be
+// counted finished once ALL phrases have been fully emitted; while phrases
+// remain unmet, EOS is blocked and the beam is additionally expanded with the
+// next needed phrase character so a satisfying continuation is always present
+// in the candidate pool. The standard length-penalised beam ranking then picks
+// the best satisfying completion. With ForceTokens empty the routine is
+// BIT-FOR-BIT DecodeBeamSearchAll.
+//   ForceTokens : the required phrases (strings); empty = ordinary beam search.
+// Returns the whole final ranked beam, sorted best-first.
+// Coded by Claude (AI).
+function DecodeConstrainedBeamSearchAll(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer;
+  const ForceTokens: array of string;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+
+// Single-best constrained beam search (highest-Score result of
+// DecodeConstrainedBeamSearchAll). Coded by Claude (AI).
+function DecodeConstrainedBeamSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer;
+  const ForceTokens: array of string;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+
+// CONTRASTIVE SEARCH decoding (Su et al. 2022, "A Contrastive Framework for
+// Neural Text Generation"; the transformers `penalty_alpha` decoder). Each
+// step re-ranks the TopK most probable next-token candidates by
+//   score(v) = (1 - PenaltyAlpha) * p(v)
+//            - PenaltyAlpha * max_{j<t} cos_sim( h_v , h_j )
+// where p(v) is the model probability of candidate v, h_v is the LAST hidden
+// state (the input to the final projection / softmax layer) the model produces
+// when v is appended, and {h_j} are the hidden states of all previously
+// processed tokens (the "degeneration penalty" context). The candidate with
+// the highest score is emitted; this favours fluent continuations while
+// penalising tokens whose representation collapses onto the existing context
+// (the cause of greedy degeneration / repetition).
+//   MaxLen       : maximum number of generated tokens (excludes the prompt).
+//   TopK         : candidate-set size (Su et al. use 4..8); TopK<=1 is greedy.
+//   PenaltyAlpha : the degeneration penalty in [0,1]. PenaltyAlpha=0 degrades
+//                  EXACTLY to greedy argmax over the SAME TopK candidates
+//                  (i.e. plain greedy argmax, since the top-prob candidate is
+//                  always in the TopK set). PenaltyAlpha=1 ranks purely by the
+//                  similarity penalty.
+// Char-level, same forward-pass / encoding convention as DecodeGreedy (token
+// id = character code). The hidden state is read from the layer feeding the
+// final projection via an extra forward of each candidate continuation; no
+// KV-cache is used (v1, mirrors the char-level DecodeGreedy re-encode loop).
+// Coded by Claude (AI).
+function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; TopK: integer; PenaltyAlpha: TNeuralFloat;
+  const StopStrings: array of string): TNNetDecodeResult;
+
+// TOKEN-LEVEL / KV-CACHE CONTRASTIVE SEARCH (follow-up to the char-level v1
+// above), driven by a TNNetStreamingDecoder session instead of re-encoding the
+// whole context each step. Identical scoring to v1:
+//   score(v) = (1 - PenaltyAlpha) * p(v)
+//            - PenaltyAlpha * max_{j<t} cos_sim( h_v , h_j )
+// but the per-step cost is paid with the session's KV cache, not a full
+// re-encode:
+//   * The next-token distribution p(.) is the output row of the LAST COMMITTED
+//     streamed step (one width-1 forward over the cached past), so there is NO
+//     re-encode of the growing context.
+//   * Each top-k candidate's hidden state h_v is read via the fork/rollback
+//     primitive: StepForward([v]) appends v's K/V to the cache, HiddenState()
+//     reads the resulting last-hidden-state, then TruncateTo(committedLen)
+//     rolls the cache back. Candidates are thus evaluated AGAINST the cached
+//     state - no full re-encode per candidate. (One width-1 forward per
+//     candidate is INHERENT to contrastive search: h_v depends on v as the
+//     model input; HF batches the same k forwards. v1 additionally paid a full
+//     O(context) re-encode for each, which this variant removes.)
+//   * The chosen token is committed with a single StepForward, advancing the
+//     cache by one - no separate "commit" re-encode.
+// DEGRADE-TO-GREEDY invariant (matches v1): PenaltyAlpha<=0 skips every
+// candidate forward and emits the top-probability token, BIT-FOR-BIT the
+// streamed greedy argmax (GenerateTokensStreamed with a nil sampler) on the
+// same session.
+//
+// CONTRACT. Session is a WIDTH-1 twin of the trained causal next-token net
+// (built and weight-copied by the caller, exactly as for GenerateTokensStreamed
+// - see the TNNetStreamingDecoder header). PromptTokens[0..PromptLen-1] is the
+// prompt; the function Reset()s the session, prefills the prompt, then decodes
+// up to MaxNewTokens tokens (or until an EOS token < 2 / a StopSequences match,
+// trimmed like the streamed greedy loop). MaxTotalLen must not exceed the
+// session's cache budget. The generated token ids are written into Tokens
+// (resized if needed); the return value is the final committed length.
+// Coded by Claude (AI).
+function DecodeContrastiveSearchStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens, MaxTotalLen,
+  TopK: integer; PenaltyAlpha: TNeuralFloat;
+  const StopSequences: TNNetTokenSequences): integer;
+
+// DoLa DECODING (Decoding by Contrasting Layers, Chuang et al. 2023; the
+// transformers `generate(dola_layers=...)` path). Improves FACTUALITY (NOT
+// speed - distinct from early-exit, and distinct from contrastive SEARCH which
+// contrasts against context tokens: DoLa contrasts LAYERS). At each step the
+// FINAL distribution p_final is contrasted against a PREMATURE-layer
+// distribution p_premature, both read through the SAME LM head:
+//   1. A full forward gives p_final (the mature distribution).
+//   2. The "logits at layer k" splice (the frozen-body idiom from
+//      TNNet.LogitLensReport) takes each candidate premature layer's activation,
+//      copies it into the head-input slot, and recomputes ONLY the head
+//      sub-stack -> p_premature for that layer.
+//   3. The premature layer is chosen PER STEP as the one whose distribution has
+//      the MAXIMUM Jensen-Shannon divergence from p_final, over the fixed
+//      candidate-layer bucket (v1: every earlier layer whose Output.Size matches
+//      the head-input size; HeadInIdx itself is excluded - contrasting against
+//      itself is a no-op).
+//   4. The next token is argmax over the ADAPTIVE head-candidate set
+//      V_head = { t : p_final[t] >= Alpha * max_j p_final[j] } of the contrast
+//      score  log p_final[t] - log p_premature[t]  (tokens outside V_head are
+//      masked out, exactly as in the paper's APC step).
+// DEGRADE-TO-GREEDY invariant: Alpha <= 0 (or an EMPTY candidate-layer bucket,
+// e.g. a net with no lens-compatible earlier layer) disables the contrast and
+// reproduces plain greedy argmax BIT-FOR-BIT (the same net's DecodeGreedy).
+//   MaxLen        : maximum number of generated tokens (excludes the prompt).
+//   Alpha         : head-set fraction in [0,1]; the paper uses ~0.1. Alpha<=0
+//                   degrades exactly to greedy. Alpha=1 keeps only the
+//                   final-argmax token (also greedy, but via the contrast path).
+//   HeadStartIdx  : first layer of the LM head sub-stack; -1 auto-detects it as
+//                   the last trainable layer (same heuristic as LogitLensReport).
+// Char-level, same forward-pass / encoding convention as DecodeGreedy /
+// DecodeContrastiveSearch (token id = character code); no KV-cache (v1).
+// Coded by Claude (AI).
+function DecodeDoLa(NN: TNNet; const Prompt: string;
+  MaxLen: integer; Alpha: TNeuralFloat;
+  const StopStrings: array of string;
+  HeadStartIdx: integer = -1): TNNetDecodeResult; overload;
+
+// DoLa with explicit DoLa-low / DoLa-high candidate-layer bucket selection
+// (the paper's dynamic premature-layer pools). Bucket=dlbFull is identical to
+// the call above. dlbLow restricts the per-step max-JS premature-layer search
+// to the SHALLOW half of the lens-compatible layers, dlbHigh to the DEEP half;
+// an empty resulting bucket degrades to greedy exactly as Alpha<=0 does.
+// Coded by Claude (AI).
+function DecodeDoLa(NN: TNNet; const Prompt: string;
+  MaxLen: integer; Alpha: TNeuralFloat;
+  const StopStrings: array of string;
+  Bucket: TDoLaLayerBucket;
+  HeadStartIdx: integer = -1): TNNetDecodeResult; overload;
+
+// SELF-SPECULATIVE EARLY-EXIT (LayerSkip / CALM) GREEDY decode. The model is
+// its OWN draft model - NO second checkpoint, NO separate prediction head:
+//   1. A full forward gives the mature distribution p_final.
+//   2. The "logits at layer k" splice (the frozen-body LogitLens idiom, the
+//      same one DecodeDoLa uses) snapshots the INTERMEDIATE exit layer's
+//      activation, copies it into the LM-head input slot, and recomputes ONLY
+//      the head sub-stack -> p_exit, the EARLY draft distribution.
+//   3. If the early exit is confident (max p_exit >= Confidence) it DRAFTS
+//      argmax(p_exit); that draft is VERIFIED against the full-depth argmax
+//      (exact-greedy verify, exactly as examples/SpeculativeDecoding does for a
+//      separate draft net). The EMITTED token is ALWAYS the full-depth argmax,
+//      so on agreement the costly tail layers were "skippable" and on
+//      disagreement we fall back to full depth. Either way the output is
+//      identical to plain greedy - the early exit only changes the ACCEPT
+//      counters (a cached decoder turns accepts into saved tail-layer work).
+// CORRECTNESS: the accepted greedy sequence equals DecodeGreedy BIT-FOR-BIT;
+// Confidence only steers how often the draft is consulted, never the output.
+//   MaxLen     : maximum generated tokens (excludes the prompt).
+//   ExitLayer  : the intermediate exit layer index (its Output is spliced into
+//                the head input). Must be < the head-input layer. -1 auto-picks
+//                the midpoint between the input and the head input.
+//   Confidence : early-exit confidence threshold in [0,1]; the draft is
+//                proposed only when max p_exit >= Confidence (LayerSkip/CALM
+//                static gate). Confidence > 1 disables drafting (pure greedy,
+//                still bit-identical). Default 0 = always draft.
+//   HeadStartIdx: first layer of the LM-head sub-stack; -1 auto-detects it as
+//                 the last trainable layer (same heuristic as DecodeDoLa).
+// The out Stats record reports accept/reject counts and acceptance rate.
+// Char-level, same forward / encoding convention as DecodeGreedy; no KV-cache
+// (v1; the per-token-adaptive exit + cached tail-skip is the open follow-up).
+// Coded by Claude (AI).
+function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
+  MaxLen: integer; out Stats: TNNetEarlyExitStats;
+  const StopStrings: array of string;
+  ExitLayer: integer = -1; Confidence: TNeuralFloat = 0.0;
+  HeadStartIdx: integer = -1): TNNetDecodeResult; overload;
+
+// Convenience overload without the Stats out-param (counters discarded).
+// Coded by Claude (AI).
+function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
+  MaxLen: integer;
+  ExitLayer: integer = -1; Confidence: TNeuralFloat = 0.0;
+  HeadStartIdx: integer = -1): TNNetDecodeResult; overload;
+
+// SAMPLED char-level decode: the stochastic sibling of DecodeGreedy. Each step
+// draws the next token from the softmax row via Sampler.GetToken (Sampler = nil
+// -> greedy argmax, bit-identical to DecodeGreedy). Stop strings are trimmed as
+// in DecodeGreedy. Result.SumLogProb sums the chosen tokens' log-probs so the
+// completion is directly rerankable (the Best-of-N building block). The caller
+// seeds the RNG (RandSeed) for reproducibility. Coded by Claude (AI).
+function DecodeSampled(NN: TNNet; const Prompt: string; MaxLen: integer;
+  Sampler: TNNetSamplerBase;
+  const StopStrings: array of string): TNNetDecodeResult;
+
+// BEST-OF-N reranking (the canonical test-time-compute baseline). Draws N
+// sampled completions (DecodeSampled with the given Sampler; the caller seeds
+// RandSeed) and returns the single best.
+//   * Default ranking is by LENGTH-NORMALIZED sequence log-prob:
+//       Score = SumLogProb / LengthPenaltyDenominator(Length(Text), LengthPenalty)
+//     (LengthPenalty=0 -> raw sum-log-prob; >0 lifts longer completions, Wu et
+//     al.). Each returned candidate carries this Score.
+//   * When Scorer <> nil the EXTERNAL scorer decides instead: the candidate
+//     with the maximum Scorer(Prompt, Text) is returned (the Bradley-Terry
+//     reward-model consumer). Score is overwritten with the scorer's value.
+// N < 1 is clamped to 1; ties keep the FIRST (lowest-index) candidate.
+// Coded by Claude (AI).
+function DecodeBestOfN(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; LengthPenalty: TNeuralFloat;
+  const StopStrings: array of string;
+  Scorer: TNNetSequenceScorer = nil): TNNetDecodeResult;
+
+// Like DecodeBestOfN but returns ALL N candidates (in draw order, unsorted), so
+// callers can inspect/rerank them externally. Each carries its length-normalized
+// Score (or, when Scorer<>nil, the scorer value). Coded by Claude (AI).
+function SampleNCompletions(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; LengthPenalty: TNeuralFloat;
+  const StopStrings: array of string;
+  Scorer: TNNetSequenceScorer = nil): TNNetDecodeResultArray;
+
+// SELF-CONSISTENCY (Wang et al. 2022): draw N sampled completions, extract each
+// one's ANSWER via Extract, and return the MODAL (majority-vote) answer string.
+// Ties are broken toward the answer that FIRST reached the winning count (the
+// earliest-drawn modal answer). Candidates whose extracted answer is empty are
+// ignored; if none yields an answer the empty string is returned. The caller
+// seeds RandSeed. Coded by Claude (AI).
+function DecodeSelfConsistency(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; Extract: TNNetAnswerExtractor;
+  const StopStrings: array of string): string;
+
+// PROMPT-LOOKUP / N-GRAM SPECULATIVE DECODING (Saxena 2023, "prompt lookup
+// decoding"; the transformers `prompt_lookup_num_tokens` path). A TRAINING-FREE,
+// NO-second-model speculative decode: the draft of the next few tokens is
+// produced by a pure STRING LOOKUP instead of a draft network.
+//   * Each step, the last MatchLen characters of the running context (prompt +
+//     text generated so far) are matched against EARLIER occurrences of that
+//     same MatchLen-gram in the context. The MOST RECENT earlier occurrence is
+//     preferred; the NumDraft characters that FOLLOWED that occurrence become
+//     the speculative draft.
+//   * The draft is then VERIFIED against the model with the same width-K greedy
+//     verify rule used by speculative decoding: walking the draft left-to-right,
+//     a drafted character is ACCEPTED iff it equals the model's greedy argmax at
+//     that position; the first mismatch (or draft exhaustion) ends the window.
+//     The model's own argmax at the first rejected position is then emitted, so
+//     EVERY emitted character is exactly the greedy argmax - acceptance is a
+//     SPEEDUP, never a quality change.
+//   * DEGRADE-TO-GREEDY GUARANTEE: when no MatchLen-gram match is found (or the
+//     whole draft is rejected) exactly one token is emitted, identical to plain
+//     DecodeGreedy. The full output is therefore BIT-FOR-BIT DecodeGreedy on the
+//     same net for any MatchLen / NumDraft (only the number of forward passes
+//     differs). This is the standout win for repetition-heavy NLP (RAG,
+//     summarization, "quote the passage").
+//   MaxLen   : maximum number of generated tokens (excludes the prompt).
+//   MatchLen : length of the suffix n-gram matched into the context (>=1).
+//   NumDraft : how many following characters to copy as the draft (>=1).
+// Char-level, same forward-pass / encoding convention as DecodeGreedy (token id
+// = character code); no KV-cache (v1, re-encode loop), so the verify window is
+// checked one prefix at a time - the lookup itself is free. Coded by Claude (AI).
+function DecodePromptLookup(NN: TNNet; const Prompt: string;
+  MaxLen: integer; MatchLen: integer; NumDraft: integer;
+  const StopStrings: array of string): TNNetDecodeResult;
+
+// ---------------------------------------------------------------------------
+// CTC DECODE: turn a (T,1,vocab) per-frame score volume (logits, log-probs or
+// probabilities - argmax/beam ranking is invariant to a monotone transform of
+// the score, and the beam search below works in either log- or probability-
+// space) into a label sequence, applying the CTC collapse rule (merge adjacent
+// repeats, then drop blanks). The blank index defaults to vocab-1 (Blank < 0),
+// matching TNNetCTCLoss.
+//
+// DecodeCTCGreedy: argmax per frame, then collapse repeats and drop blank -
+// the O(T*vocab) best-path approximation (exact when one alignment dominates).
+//
+// DecodeCTCBeamSearch: prefix beam search (Graves & Jaitly 2014 / Hannun 2017)
+// that sums the probability mass of all alignments collapsing to the same
+// prefix; BeamWidth prefixes are kept per frame. The input is treated as
+// LOG-probabilities when LogInput is true, else probabilities. More accurate
+// than greedy when several alignments compete; returns the single best prefix.
+function DecodeCTCGreedy(Scores: TNNetVolume; Blank: integer = -1): TNeuralIntegerArray;
+function DecodeCTCBeamSearch(Scores: TNNetVolume; BeamWidth: integer;
+  Blank: integer = -1; LogInput: boolean = true): TNeuralIntegerArray;
 
 // ---------------------------------------------------------------------------
 // STREAMED GENERATION: the KV-cache / SSM-state counterpart of neuraldatasets'
@@ -859,10 +1753,39 @@ function GenerateStringStreamedWithProcessors(Session: TNNetStreamingDecoder;
 // (the healed run would provably equal the unhealed one). Pass the
 // constraint to any Constraint-accepting overload (the caller frees it).
 // Linear vocab scan (v1) - fine for the dict sizes the streamed paths use.
+//
+// MULTI-TOKEN ROLLBACK (guidance-style, follow-up b): RollbackTokens backs
+// up over the LAST N prompt tokens, not just one. The dropped tokens' texts
+// are concatenated (left-to-right) into one boundary FRAGMENT, and the
+// first generated token is constrained to vocabulary entries whose text has
+// that whole fragment as a prefix. This heals boundary artifacts that SPAN
+// merges (e.g. the trailing 2-3 tokens together form a surface a single
+// longer vocab token would have produced). RollbackTokens is CLAMPED to
+// PromptLen-1 (healing never empties the prompt). DroppedToken reports the
+// FIRST dropped id (the one the first generated token overwrites); PromptLen
+// is decremented by the effective rollback count. Default RollbackTokens=1
+// reproduces the v1 single-token behavior bit-for-bit.
 // Coded by Claude (AI).
 function PrepareTokenHealing(Dict: TStringListInt;
   const Tokens: TNeuralIntegerArray; var PromptLen: integer;
-  out DroppedToken: integer): TNNetTokenHealingConstraint;
+  out DroppedToken: integer;
+  RollbackTokens: integer = 1): TNNetTokenHealingConstraint; overload;
+
+// TOKEN-HEALING SET-UP for a HuggingFace byte-level-BPE / metaspace /
+// WordPiece tokenizer (follow-up a). Sibling of the TStringListInt overload:
+// backs up over the last RollbackTokens prompt ids, rebuilds their combined
+// boundary fragment via Tokenizer.DecodeToken, and constrains the first
+// generated token to Tokenizer.PrefixScanVocab(fragment) - every vocab id
+// whose STORED SURFACE extends the fragment, matched in the same surface
+// space the vocab is stored in (so multi-byte UTF-8 / byte-alphabet
+// boundaries scan correctly). Same nil-skip rules as the dict overload
+// (PromptLen too short, empty fragment, no STRICT extension). Default
+// RollbackTokens=1 = single-token healing. Caller frees the constraint.
+// Coded by Claude (AI).
+function PrepareTokenHealing(Tokenizer: TNeuralHFTokenizer;
+  const Tokens: TNeuralIntegerArray; var PromptLen: integer;
+  out DroppedToken: integer;
+  RollbackTokens: integer = 1): TNNetTokenHealingConstraint; overload;
 
 // A TGenerationConfig with every knob OFF: greedy (nil sampler),
 // Temperature 1.0, no penalties/processors/constraint, no stop
@@ -886,6 +1809,32 @@ function GenerateTokensWithConfig(Session: TNNetStreamingDecoder;
 function GenerateStringWithConfig(Session: TNNetStreamingDecoder;
   Dict: TStringListInt; InputString: string;
   const Config: TGenerationConfig): string;
+
+// CFG CONVENIENCE: derive the UNCONDITIONAL streaming twin automatically from
+// a single (already WIDTH-1) trained net, so CFG callers do not hand-build a
+// second branch. SourceWidth1Net must be the same width-1 net the conditional
+// streaming loop drives (e.g. an imported inference model, or the twin built
+// for the conditional TNNetStreamingDecoder). The function CLONES it through
+// SaveToString -> LoadFromString (architecture AND weights survive the
+// round-trip, and the width-1 input shape is preserved exactly), giving the
+// CFG branch its OWN net with INDEPENDENT KV-cache / SSM state but the SAME
+// trained weights - the conditional and unconditional branches must not share
+// one cache. The clone is returned in TwinNet and wrapped in a fresh
+// TNNetStreamingDecoder (cache budget MaxTotalLen) returned as the result.
+//
+// OWNERSHIP: the CALLER owns and frees BOTH the returned session AND TwinNet
+// (free the session first). A TNNetCFGProcessor created with this session and
+// OwnsSession=false leaves them for the caller; with OwnsSession=true the
+// processor frees the session but NOT TwinNet (the session never owns its
+// net), so the caller still frees TwinNet.
+//
+// A direct full-width->width-1 clone is intentionally NOT attempted: a TNNet
+// cannot be reshaped to a different input width by a string round-trip (the
+// saved structure carries the original width). Build the width-1 net once
+// (the established Build*(1)+CopyWeights idiom) and pass it here.
+// Coded by Claude (AI).
+function MakeUnconditionalTwin(SourceWidth1Net: TNNet;
+  MaxTotalLen: integer; out TwinNet: TNNet): TNNetStreamingDecoder;
 
 // ---------------------------------------------------------------------------
 // SEQ2SEQ (ENCODER-DECODER) GENERATION: the T5/BART-style counterpart of the
@@ -997,10 +1946,284 @@ function DecodeSeq2SeqBeamSearchAll(EncoderNet, DecoderNet: TNNet;
   StartTokenId, EOSTokenId, MaxNewTokens: integer;
   BeamWidth: integer; LengthPenalty: TNeuralFloat): TNNetTokenDecodeResultArray;
 
+// ---------------------------------------------------------------------------
+// NEEDLE-IN-A-HAYSTACK long-context eval harness.
+//
+// For each (ContextLengths[c], DepthFractions[d]) cell the harness:
+//   1. builds Filler(ContextLengths[c]) characters of distractor text;
+//   2. splices NeedleFact in at byte position round(DepthFraction*len) snapped
+//      to a space boundary (depth 0 = very start, 1 = very end);
+//   3. appends Question, yielding the probe Prompt;
+//   4. calls Generate(Prompt) and records Hit := the output contains
+//      NeedleAnswer (case-insensitive substring match);
+// then renders a depth x length pass/fail grid plus an overall accuracy line.
+//
+// The callbacks carry an opaque Data pointer (e.g. a TNNet, a sampler, or a
+// test stand-in's state) so no globals are needed. NeedleFact should embed the
+// answer; NeedleAnswer is the token actually looked for in the output;
+// Question is the retrieval prompt that triggers recall. Empty axis arrays
+// yield an empty grid with Accuracy 0. Returns the full grid; .Report holds
+// the rendered string (also the function-style overload's Result).
+// Coded by Claude (AI).
+function NeedleInHaystackReport(
+  const ContextLengths: array of integer;
+  const DepthFractions: array of TNeuralFloat;
+  const NeedleFact, NeedleAnswer, Question: string;
+  Filler: TNeedleFillerCallback;
+  Generate: TNeedleGenerateCallback;
+  Data: Pointer): TNeedleInHaystackResult; overload;
+
+// Convenience overload that drives a real char-level TNNet through DecodeGreedy
+// (MaxLen generated chars) and a built-in repeating-lorem filler. The needle
+// answer match is the same case-insensitive substring test. This is the path
+// used to evaluate RoPE-scaling / KV-cache-eviction on a TinyStories-scale
+// char model the repo can run on CPU.
+// Coded by Claude (AI).
+function NeedleInHaystackReport(NN: TNNet;
+  const ContextLengths: array of integer;
+  const DepthFractions: array of TNeuralFloat;
+  const NeedleFact, NeedleAnswer, Question: string;
+  MaxLen: integer): TNeedleInHaystackResult; overload;
+
+// ---------------------------------------------------------------------------
+// JSON-SCHEMA -> GBNF compiler for structured / function-calling output.
+//
+// Parses a JSON Schema (the OpenAI-function-call / structured-output subset)
+// and EMITS a GBNF grammar string the existing TNNetGrammar consumes, so a
+// model can be constrained to emit ONLY schema-valid JSON (see
+// CreateJSONSchemaConstraint). Parsing uses the repo's TJSONParser(s,[])
+// convention (NOT GetJSON) so UTF-8 bytes survive intact.
+//
+// SUPPORTED SUBSET (v1):
+//   - object: "properties" emit ordered prop rules; "required" controls which
+//     props are optional (a non-required prop and its trailing comma are wrapped
+//     in '?'); additionalProperties:false (the default here) emits no open tail,
+//     additionalProperties:true (or a schema) allows arbitrary extra members.
+//   - array: "items" schema, "minItems"/"maxItems" -> explicit repetition (a
+//     bounded count desugared to required + optional element slots).
+//   - string: plain quoted string; "enum" -> alternation of quoted literals;
+//     "pattern" -> a single character-class rule (the chars inside the FIRST
+//     [...] of the regex; full regex is out of scope).
+//   - number / integer / boolean / null primitives.
+//   - anyOf / oneOf -> alternation of the branch grammars (treated alike; v1
+//     does not enforce oneOf's exactly-one semantics).
+//   - $ref "#/$defs/Name" (and legacy "#/definitions/Name") + $defs/definitions
+//     -> named rules, enabling recursion.
+//
+// OUT OF SCOPE for v1 (documented, not enforced): allOf, format validators
+// (date-time/email/uuid/...), and numeric minimum/maximum/multipleOf bound
+// enforcement (numbers are matched structurally, not range-checked). An empty
+// or unrecognised schema falls back to the permissive JSON value rule.
+// Coded by Claude (AI).
+function CompileJSONSchemaToGBNF(const SchemaJSON: string): string;
+
+// Convenience: compile SchemaJSON to GBNF and wrap it in a
+// TNNetGrammarConstraint over Dict (token id -> Dict.DeTokenize(id), ids < 2
+// special), matching the constraint's existing Create(GBNFText, Dict) ctor.
+// Coded by Claude (AI).
+function CreateJSONSchemaConstraint(const SchemaJSON: string;
+  Dict: TStringListInt): TNNetGrammarConstraint;
+
 implementation
 
 uses
-  Math;
+  Math, fpjson;
+
+// Forward declarations for helpers used before their definition.
+function ContrastiveHiddenLayer(NN: TNNet): TNNetLayer; forward;
+function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat; forward;
+
+function DecodeCTCGreedy(Scores: TNNetVolume; Blank: integer): TNeuralIntegerArray;
+var
+  NumT, Vocab, ti, k, ArgMax, Prev, Count: integer;
+  Best, V: TNeuralFloat;
+  Path: TNeuralIntegerArray;
+begin
+  NumT := Scores.SizeX;
+  Vocab := Scores.Depth;
+  if Blank < 0 then Blank := Vocab - 1;
+  SetLength(Path, NumT);
+  // Argmax per frame.
+  for ti := 0 to NumT - 1 do
+  begin
+    ArgMax := 0;
+    Best := Scores[ti, 0, 0];
+    for k := 1 to Vocab - 1 do
+    begin
+      V := Scores[ti, 0, k];
+      if V > Best then
+      begin
+        Best := V;
+        ArgMax := k;
+      end;
+    end;
+    Path[ti] := ArgMax;
+  end;
+  // Collapse adjacent repeats, then drop blanks.
+  SetLength(Result, NumT);
+  Count := 0;
+  Prev := -1;
+  for ti := 0 to NumT - 1 do
+  begin
+    if (Path[ti] <> Prev) and (Path[ti] <> Blank) then
+    begin
+      Result[Count] := Path[ti];
+      Inc(Count);
+    end;
+    Prev := Path[ti];
+  end;
+  SetLength(Result, Count);
+end;
+
+function DecodeCTCBeamSearch(Scores: TNNetVolume; BeamWidth: integer;
+  Blank: integer; LogInput: boolean): TNeuralIntegerArray;
+type
+  TCTCBeam = record
+    Prefix: TNeuralIntegerArray;
+    PB: double;   // probability prefix ends in blank
+    PNB: double;  // probability prefix ends in a non-blank
+  end;
+var
+  NumT, Vocab, ti, k, i, j, bi, LastSym: integer;
+  Beams, Next: array of TCTCBeam;
+  Prob: array of double; // current frame probabilities
+  BestIdx: integer;
+  BestScore, Total, Sum: double;
+  function KeyOf(const P: TNeuralIntegerArray): string;
+  var n: integer; s: string;
+  begin
+    s := '';
+    for n := 0 to High(P) do s := s + IntToStr(P[n]) + ',';
+    Result := s;
+  end;
+  function FindNext(const P: TNeuralIntegerArray): integer;
+  var n: integer; ky: string;
+  begin
+    ky := KeyOf(P);
+    for n := 0 to High(Next) do
+      if KeyOf(Next[n].Prefix) = ky then Exit(n);
+    Result := -1;
+  end;
+  procedure AddNext(const P: TNeuralIntegerArray; AddPB, AddPNB: double);
+  var n: integer;
+  begin
+    n := FindNext(P);
+    if n < 0 then
+    begin
+      SetLength(Next, Length(Next) + 1);
+      Next[High(Next)].Prefix := Copy(P, 0, Length(P));
+      Next[High(Next)].PB := AddPB;
+      Next[High(Next)].PNB := AddPNB;
+    end
+    else
+    begin
+      Next[n].PB := Next[n].PB + AddPB;
+      Next[n].PNB := Next[n].PNB + AddPNB;
+    end;
+  end;
+  function ExtendOne(const P: TNeuralIntegerArray; sym: integer): TNeuralIntegerArray;
+  var n: integer;
+  begin
+    SetLength(Result, Length(P) + 1);
+    for n := 0 to High(P) do Result[n] := P[n];
+    Result[High(Result)] := sym;
+  end;
+begin
+  NumT := Scores.SizeX;
+  Vocab := Scores.Depth;
+  if Blank < 0 then Blank := Vocab - 1;
+  if BeamWidth < 1 then BeamWidth := 1;
+  SetLength(Prob, Vocab);
+
+  // Initial beam: empty prefix, all mass on "ends in blank".
+  SetLength(Beams, 1);
+  SetLength(Beams[0].Prefix, 0);
+  Beams[0].PB := 1.0;
+  Beams[0].PNB := 0.0;
+
+  for ti := 0 to NumT - 1 do
+  begin
+    // Materialise this frame's probabilities (exp the log-probs if needed).
+    for k := 0 to Vocab - 1 do
+      if LogInput then Prob[k] := Exp(Scores[ti, 0, k])
+      else Prob[k] := Scores[ti, 0, k];
+
+    SetLength(Next, 0);
+    for bi := 0 to High(Beams) do
+    begin
+      if Length(Beams[bi].Prefix) > 0 then
+        LastSym := Beams[bi].Prefix[High(Beams[bi].Prefix)]
+      else
+        LastSym := -1;
+
+      // 1) Add blank: prefix unchanged, accrues to PB.
+      AddNext(Beams[bi].Prefix,
+        (Beams[bi].PB + Beams[bi].PNB) * Prob[Blank], 0.0);
+
+      // 2) Repeat the last symbol: prefix unchanged, accrues to PNB (only the
+      //    non-blank-ending mass can repeat without inserting a separator).
+      if LastSym >= 0 then
+        AddNext(Beams[bi].Prefix, 0.0, Beams[bi].PNB * Prob[LastSym]);
+
+      // 3) Extend by each non-blank symbol k.
+      for k := 0 to Vocab - 1 do
+      begin
+        if k = Blank then Continue;
+        if k = LastSym then
+          // Same as last: only blank-ending mass may extend (else it merges).
+          AddNext(ExtendOne(Beams[bi].Prefix, k), 0.0, Beams[bi].PB * Prob[k])
+        else
+          AddNext(ExtendOne(Beams[bi].Prefix, k), 0.0,
+            (Beams[bi].PB + Beams[bi].PNB) * Prob[k]);
+      end;
+    end;
+
+    // Prune to BeamWidth by total probability: copy Next -> Beams, sort
+    // descending by (PB+PNB) with a selection sort (BeamWidth is small), then
+    // truncate.
+    SetLength(Beams, Length(Next));
+    for i := 0 to High(Next) do Beams[i] := Next[i];
+    // Sort descending by total prob (selection sort over the whole list).
+    for i := 0 to High(Beams) - 1 do
+    begin
+      BestIdx := i;
+      BestScore := Beams[i].PB + Beams[i].PNB;
+      for j := i + 1 to High(Beams) do
+      begin
+        Total := Beams[j].PB + Beams[j].PNB;
+        if Total > BestScore then
+        begin
+          BestScore := Total;
+          BestIdx := j;
+        end;
+      end;
+      if BestIdx <> i then
+      begin
+        Next[0] := Beams[i];        // reuse Next[0] as temp
+        Beams[i] := Beams[BestIdx];
+        Beams[BestIdx] := Next[0];
+      end;
+    end;
+    if Length(Beams) > BeamWidth then SetLength(Beams, BeamWidth);
+  end;
+
+  // Best prefix = highest total probability.
+  BestIdx := 0;
+  BestScore := -1;
+  for i := 0 to High(Beams) do
+  begin
+    Sum := Beams[i].PB + Beams[i].PNB;
+    if Sum > BestScore then
+    begin
+      BestScore := Sum;
+      BestIdx := i;
+    end;
+  end;
+  if Length(Beams) > 0 then
+    Result := Copy(Beams[BestIdx].Prefix, 0, Length(Beams[BestIdx].Prefix))
+  else
+    SetLength(Result, 0);
+end;
 
 function LengthPenaltyDenominator(L: integer; Alpha: TNeuralFloat): TNeuralFloat;
 begin
@@ -1016,6 +2239,29 @@ const
 begin
   if P < csTinyProb then P := csTinyProb;
   Result := Ln(P);
+end;
+
+function DetectWatermark(const Tokens: array of integer; Key: UInt64;
+  Gamma: TNeuralFloat = 0.25): TNeuralFloat;
+var
+  I, T, GreenCount: integer;
+  Expected, Variance: TNeuralFloat;
+begin
+  // Scored positions are 1..High(Tokens): each token is judged against its
+  // immediate predecessor, exactly the seed the processor used when it was
+  // emitted. T < 1 (a sequence of fewer than 2 tokens) has nothing to score.
+  T := Length(Tokens) - 1;
+  if T < 1 then exit(0.0);
+  GreenCount := 0;
+  for I := 1 to High(Tokens) do
+    if TNNetWatermarkLogitsProcessor.IsGreen(Key, Tokens[I - 1], Tokens[I],
+      Gamma) then
+      Inc(GreenCount);
+  // One-proportion z-score against the null green rate Gamma.
+  Expected := Gamma * T;
+  Variance := T * Gamma * (1.0 - Gamma);
+  if Variance <= 0 then exit(0.0);
+  Result := (GreenCount - Expected) / Sqrt(Variance);
 end;
 
 { TNNetTokenConstraint }
@@ -1544,6 +2790,1286 @@ begin
   FMachine.FeedString(FTokenStr[TokenId]);
 end;
 
+{ TNNetGrammar }
+
+const
+  // Packed position = Rule * KGrammarStride + ElementIndex. A rule body of more
+  // than KGrammarStride elements would collide; far beyond any practical GBNF.
+  KGrammarStride = 1000000;
+
+constructor TNNetGrammar.Create(const GBNFText: string);
+begin
+  inherited Create();
+  FSource := GBNFText;
+  FRuleNames := TStringList.Create();
+  FRuleNames.CaseSensitive := true;
+  FRootRule := -1;
+  Compile();
+end;
+
+destructor TNNetGrammar.Destroy();
+begin
+  FRuleNames.Free;
+  inherited Destroy();
+end;
+
+function TNNetGrammar.PeekCh(): char;
+begin
+  if FPos <= Length(FSource) then Result := FSource[FPos] else Result := #0;
+end;
+
+procedure TNNetGrammar.NextCh();
+begin
+  Inc(FPos);
+end;
+
+function TNNetGrammar.AtEnd(): boolean;
+begin
+  Result := FPos > Length(FSource);
+end;
+
+procedure TNNetGrammar.SkipWS();
+// Whitespace AND '#' line comments between grammar tokens.
+begin
+  while not AtEnd() do
+  begin
+    if (PeekCh() = ' ') or (PeekCh() = #9) or (PeekCh() = #13) or
+       (PeekCh() = #10) then NextCh()
+    else if PeekCh() = '#' then
+      while (not AtEnd()) and (PeekCh() <> #10) do NextCh()
+    else break;
+  end;
+end;
+
+procedure TNNetGrammar.ExpectCh(C: char);
+begin
+  if PeekCh() <> C then
+    raise EAssertionFailed.Create('TNNetGrammar: expected ''' + C +
+      ''' at offset ' + IntToStr(FPos) + ' in grammar');
+  NextCh();
+end;
+
+function TNNetGrammar.AddRule(const Name: string): integer;
+begin
+  Result := FRuleNames.Add(Name);
+  SetLength(FRules, Length(FRules) + 1);
+end;
+
+function TNNetGrammar.FindOrAddRule(const Name: string): integer;
+begin
+  Result := FRuleNames.IndexOf(Name);
+  if Result < 0 then Result := AddRule(Name);
+end;
+
+function TNNetGrammar.NewAnonRule(): integer;
+begin
+  Result := AddRule('__anon' + IntToStr(Length(FRules)));
+end;
+
+function TNNetGrammar.AddCharSet(
+  const ARanges: array of TNNetGrammarRange): integer;
+var
+  I, Base: integer;
+begin
+  Base := Length(FRanges);
+  SetLength(FRanges, Base + Length(ARanges));
+  for I := 0 to High(ARanges) do FRanges[Base + I] := ARanges[I];
+  Result := Length(FCharSets);
+  SetLength(FCharSets, Result + 1);
+  FCharSets[Result].First := Base;
+  FCharSets[Result].Count := Length(ARanges);
+end;
+
+// Appends one element to a growing element array.
+procedure GrammarAppendElem(var Elems: TNNetGrammarElemArray;
+  AType: TNNetGrammarElemType; AValue: integer);
+begin
+  SetLength(Elems, Length(Elems) + 1);
+  Elems[High(Elems)].ElemType := AType;
+  Elems[High(Elems)].Value := AValue;
+end;
+
+function TNNetGrammar.ParseCharClass(out Negated: boolean): integer;
+// Current char is '['. Parses up to and including ']'. Handles '[^...]'.
+var
+  Ranges: array of TNNetGrammarRange;
+  Lo, Hi: char;
+
+  function ReadClassChar(): char;
+  begin
+    if PeekCh() = '\' then
+    begin
+      NextCh();
+      case PeekCh() of
+        'n': Result := #10;
+        'r': Result := #13;
+        't': Result := #9;
+        else Result := PeekCh(); // \\ \] \^ \- \" and any other: literal
+      end;
+      NextCh();
+    end
+    else
+    begin
+      Result := PeekCh();
+      NextCh();
+    end;
+  end;
+
+begin
+  ExpectCh('[');
+  Negated := false;
+  if PeekCh() = '^' then
+  begin
+    Negated := true;
+    NextCh();
+  end;
+  SetLength(Ranges, 0);
+  while (not AtEnd()) and (PeekCh() <> ']') do
+  begin
+    Lo := ReadClassChar();
+    Hi := Lo;
+    if (PeekCh() = '-') and (FPos + 1 <= Length(FSource)) and
+       (FSource[FPos + 1] <> ']') then
+    begin
+      NextCh(); // consume '-'
+      Hi := ReadClassChar();
+    end;
+    SetLength(Ranges, Length(Ranges) + 1);
+    Ranges[High(Ranges)].Lo := Lo;
+    Ranges[High(Ranges)].Hi := Hi;
+  end;
+  ExpectCh(']');
+  Result := AddCharSet(Ranges);
+end;
+
+// opt ::= atom | <empty>
+procedure TNNetGrammar.BuildOptRule(AtomRule: integer;
+  var Elems: TNNetGrammarElemArray);
+var
+  Body: TNNetGrammarElemArray;
+  R: integer;
+begin
+  R := NewAnonRule();
+  SetLength(Body, 0);
+  GrammarAppendElem(Body, getRuleRef, AtomRule);
+  GrammarAppendElem(Body, getAlt, 0);
+  GrammarAppendElem(Body, getEnd, 0); // empty alternate
+  FRules[R] := Body;
+  GrammarAppendElem(Elems, getRuleRef, R);
+end;
+
+// star ::= atom star | <empty>
+procedure TNNetGrammar.BuildStarRule(AtomRule: integer;
+  var Elems: TNNetGrammarElemArray);
+var
+  Body: TNNetGrammarElemArray;
+  R: integer;
+begin
+  R := NewAnonRule();
+  SetLength(Body, 0);
+  GrammarAppendElem(Body, getRuleRef, AtomRule);
+  GrammarAppendElem(Body, getRuleRef, R); // self-reference -> repetition
+  GrammarAppendElem(Body, getAlt, 0);
+  GrammarAppendElem(Body, getEnd, 0);
+  FRules[R] := Body;
+  GrammarAppendElem(Elems, getRuleRef, R);
+end;
+
+// plus ::= atom plus | atom
+procedure TNNetGrammar.BuildPlusRule(AtomRule: integer;
+  var Elems: TNNetGrammarElemArray);
+var
+  Body: TNNetGrammarElemArray;
+  R: integer;
+begin
+  R := NewAnonRule();
+  SetLength(Body, 0);
+  GrammarAppendElem(Body, getRuleRef, AtomRule);
+  GrammarAppendElem(Body, getRuleRef, R);
+  GrammarAppendElem(Body, getAlt, 0);
+  GrammarAppendElem(Body, getRuleRef, AtomRule);
+  GrammarAppendElem(Body, getEnd, 0);
+  FRules[R] := Body;
+  GrammarAppendElem(Elems, getRuleRef, R);
+end;
+
+procedure TNNetGrammar.ParseElement(var Elems: TNNetGrammarElemArray);
+var
+  Inner: TNNetGrammarElemArray;
+  AnonRule, SetIdx, RefRule: integer;
+  Negated: boolean;
+  StartLen, I: integer;
+  Name: string;
+  Postfix: char;
+begin
+  SkipWS();
+  StartLen := Length(Elems);
+  case PeekCh() of
+    '"':
+      begin
+        NextCh();
+        while (not AtEnd()) and (PeekCh() <> '"') do
+        begin
+          if PeekCh() = '\' then
+          begin
+            NextCh();
+            case PeekCh() of
+              'n': GrammarAppendElem(Elems, getChar, Ord(#10));
+              'r': GrammarAppendElem(Elems, getChar, Ord(#13));
+              't': GrammarAppendElem(Elems, getChar, Ord(#9));
+              else GrammarAppendElem(Elems, getChar, Ord(PeekCh()));
+            end;
+            NextCh();
+          end
+          else
+          begin
+            GrammarAppendElem(Elems, getChar, Ord(PeekCh()));
+            NextCh();
+          end;
+        end;
+        ExpectCh('"');
+      end;
+    '[':
+      begin
+        SetIdx := ParseCharClass(Negated);
+        if Negated
+        then GrammarAppendElem(Elems, getCharSetNot, SetIdx)
+        else GrammarAppendElem(Elems, getCharSet, SetIdx);
+      end;
+    '.':
+      begin
+        NextCh();
+        GrammarAppendElem(Elems, getCharAny, 0);
+      end;
+    '(':
+      begin
+        NextCh();
+        SetLength(Inner, 0);
+        ParseAlternates(Inner);
+        SkipWS();
+        ExpectCh(')');
+        AnonRule := NewAnonRule();
+        GrammarAppendElem(Inner, getEnd, 0);
+        FRules[AnonRule] := Inner;
+        GrammarAppendElem(Elems, getRuleRef, AnonRule);
+      end;
+    'a'..'z', 'A'..'Z', '_':
+      begin
+        Name := '';
+        while (not AtEnd()) and
+          (PeekCh() in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) do
+        begin
+          Name := Name + PeekCh();
+          NextCh();
+        end;
+        RefRule := FindOrAddRule(Name);
+        GrammarAppendElem(Elems, getRuleRef, RefRule);
+      end;
+    else
+      raise EAssertionFailed.Create('TNNetGrammar: unexpected ''' + PeekCh() +
+        ''' at offset ' + IntToStr(FPos));
+  end;
+
+  // Postfix repetition wraps the just-parsed atom (elements StartLen..end).
+  SkipWS();
+  Postfix := PeekCh();
+  if (Postfix = '*') or (Postfix = '+') or (Postfix = '?') then
+  begin
+    NextCh();
+    AnonRule := NewAnonRule();
+    SetLength(Inner, 0);
+    for I := StartLen to High(Elems) do
+      GrammarAppendElem(Inner, Elems[I].ElemType, Elems[I].Value);
+    SetLength(Elems, StartLen); // drop the atom; replaced by the wrapper ref
+    GrammarAppendElem(Inner, getEnd, 0);
+    FRules[AnonRule] := Inner;
+    case Postfix of
+      '?': BuildOptRule(AnonRule, Elems);
+      '*': BuildStarRule(AnonRule, Elems);
+      '+': BuildPlusRule(AnonRule, Elems);
+    end;
+  end;
+end;
+
+procedure TNNetGrammar.ParseSequence(var Elems: TNNetGrammarElemArray);
+begin
+  SkipWS();
+  while (not AtEnd()) and (PeekCh() <> '|') and (PeekCh() <> ')') do
+  begin
+    ParseElement(Elems);
+    SkipWS();
+  end;
+end;
+
+procedure TNNetGrammar.ParseAlternates(var Elems: TNNetGrammarElemArray);
+begin
+  ParseSequence(Elems);
+  SkipWS();
+  while PeekCh() = '|' do
+  begin
+    NextCh();
+    GrammarAppendElem(Elems, getAlt, 0);
+    ParseSequence(Elems);
+    SkipWS();
+  end;
+end;
+
+procedure TNNetGrammar.Compile();
+// Splits the source into 'name ::= body' definitions (continuation lines fold
+// into the previous def), pre-registers names so forward refs resolve, parses
+// each body, then resolves 'root'.
+var
+  Lines, Defs: TStringList;
+  I, J, ArrowPos, R: integer;
+  RawLine, Name, Body, FullBody: string;
+  LocalBody: TNNetGrammarElemArray;
+
+  function IsDefLine(const S: string): boolean;
+  var
+    K: integer;
+    T: string;
+  begin
+    T := TrimLeft(S);
+    Result := false;
+    if T = '' then exit;
+    if not (T[1] in ['a'..'z', 'A'..'Z', '_']) then exit;
+    K := 1;
+    while (K <= Length(T)) and
+      (T[K] in ['a'..'z', 'A'..'Z', '0'..'9', '_', '-']) do Inc(K);
+    while (K <= Length(T)) and (T[K] = ' ') do Inc(K);
+    Result := (K + 2 <= Length(T)) and (Copy(T, K, 3) = '::=');
+  end;
+
+begin
+  Defs := TStringList.Create();
+  Lines := TStringList.Create();
+  try
+    Lines.Text := FSource;
+    FullBody := '';
+    for I := 0 to Lines.Count - 1 do
+    begin
+      RawLine := Lines[I];
+      J := Pos('#', RawLine);
+      if J > 0 then RawLine := Copy(RawLine, 1, J - 1);
+      if IsDefLine(RawLine) then
+      begin
+        if FullBody <> '' then Defs.Add(FullBody);
+        FullBody := RawLine;
+      end
+      else if Trim(RawLine) <> '' then
+        FullBody := FullBody + ' ' + RawLine;
+    end;
+    if FullBody <> '' then Defs.Add(FullBody);
+
+    for I := 0 to Defs.Count - 1 do
+    begin
+      RawLine := TrimLeft(Defs[I]);
+      ArrowPos := Pos('::=', RawLine);
+      Name := Trim(Copy(RawLine, 1, ArrowPos - 1));
+      FindOrAddRule(Name);
+    end;
+
+    for I := 0 to Defs.Count - 1 do
+    begin
+      RawLine := TrimLeft(Defs[I]);
+      ArrowPos := Pos('::=', RawLine);
+      Name := Trim(Copy(RawLine, 1, ArrowPos - 1));
+      Body := Copy(RawLine, ArrowPos + 3, Length(RawLine));
+      R := FindOrAddRule(Name);
+      FSource := Body;   // parse this body in isolation
+      FPos := 1;
+      // Parse into a LOCAL array: parsing may create anonymous helper rules,
+      // which SetLength(FRules) and would invalidate a var-alias into FRules.
+      SetLength(LocalBody, 0);
+      ParseAlternates(LocalBody);
+      GrammarAppendElem(LocalBody, getEnd, 0);
+      FRules[R] := LocalBody;
+    end;
+  finally
+    Lines.Free;
+    Defs.Free;
+  end;
+
+  FRootRule := FRuleNames.IndexOf('root');
+  if FRootRule < 0 then
+    raise EAssertionFailed.Create('TNNetGrammar: no ''root'' rule defined');
+end;
+
+{ TNNetGrammarMachine }
+
+constructor TNNetGrammarMachine.Create(AGrammar: TNNetGrammar);
+begin
+  inherited Create();
+  FGrammar := AGrammar;
+  Reset();
+end;
+
+function TNNetGrammarMachine.PackPos(Rule, Idx: integer): integer;
+begin
+  Result := Rule * KGrammarStride + Idx;
+end;
+
+procedure TNNetGrammarMachine.UnpackPos(Pos: integer; out Rule, Idx: integer);
+begin
+  Rule := Pos div KGrammarStride;
+  Idx := Pos mod KGrammarStride;
+end;
+
+function TNNetGrammarMachine.ScratchHas(const Src: array of integer;
+  Len: integer): boolean;
+var
+  I, J: integer;
+  Same: boolean;
+begin
+  Result := false;
+  for I := 0 to FScratchCount - 1 do
+  begin
+    if FScratchLen[I] <> Len then continue;
+    Same := true;
+    for J := 0 to Len - 1 do
+      if FScratch[I][J] <> Src[J] then begin Same := false; break; end;
+    if Same then exit(true);
+  end;
+end;
+
+procedure TNNetGrammarMachine.AddStackRaw(const Src: array of integer;
+  Len: integer);
+var
+  J: integer;
+begin
+  if ScratchHas(Src, Len) then exit;
+  if FScratchCount >= Length(FScratch) then
+  begin
+    SetLength(FScratch, FScratchCount * 2 + 8);
+    SetLength(FScratchLen, FScratchCount * 2 + 8);
+  end;
+  if Length(FScratch[FScratchCount]) < Len then
+    SetLength(FScratch[FScratchCount], Len + 8);
+  for J := 0 to Len - 1 do FScratch[FScratchCount][J] := Src[J];
+  FScratchLen[FScratchCount] := Len;
+  Inc(FScratchCount);
+end;
+
+procedure TNNetGrammarMachine.AddStackExpanded(const Src: array of integer;
+  Len: integer);
+// Descends the stack top: rule-refs are expanded (forking on each alternate),
+// getEnd/getAlt pop, terminals (or empty stacks) come to rest in the scratch
+// set. Recursion depth is bounded by the grammar nesting + recursion depth of
+// the partial parse.
+var
+  Work: array of integer;
+  WLen: integer;
+  TopPos, Rule, Idx, RefRule, ContPos, K: integer;
+  Body: TNNetGrammarElemArray;
+begin
+  SetLength(Work, Len + 8);
+  for K := 0 to Len - 1 do Work[K] := Src[K];
+  WLen := Len;
+
+  if WLen = 0 then
+  begin
+    AddStackRaw(Work, 0);
+    exit;
+  end;
+
+  TopPos := Work[WLen - 1];
+  UnpackPos(TopPos, Rule, Idx);
+  Body := FGrammar.FRules[Rule];
+
+  case Body[Idx].ElemType of
+    getEnd, getAlt:
+      begin
+        // End of an alternate/rule: pop and continue with the parent.
+        Dec(WLen);
+        AddStackExpanded(Work, WLen);
+      end;
+    getRuleRef:
+      begin
+        RefRule := Body[Idx].Value;
+        ContPos := PackPos(Rule, Idx + 1);
+        Work[WLen - 1] := ContPos; // continuation replaces the ref on top
+        // Fork into each alternate of the referenced rule.
+        PushRuleAlternates(Work, WLen, RefRule);
+      end;
+    else
+      // Terminal top: a valid resting state.
+      AddStackRaw(Work, WLen);
+  end;
+end;
+
+procedure TNNetGrammarMachine.PushRuleAlternates(const Base: array of integer;
+  BaseLen, RuleIdx: integer);
+// For each top-level alternate of RuleIdx, push its first-element position atop
+// Base[0..BaseLen-1] and expand. An empty alternate's first position is its
+// getEnd, which AddStackExpanded pops to continue with Base.
+var
+  Work: array of integer;
+  AltIdx, K: integer;
+  RefBody: TNNetGrammarElemArray;
+begin
+  RefBody := FGrammar.FRules[RuleIdx];
+  SetLength(Work, BaseLen + 1);
+  for K := 0 to BaseLen - 1 do Work[K] := Base[K];
+  AltIdx := 0;
+  while true do
+  begin
+    Work[BaseLen] := PackPos(RuleIdx, AltIdx);
+    AddStackExpanded(Work, BaseLen + 1);
+    K := AltIdx;
+    while (RefBody[K].ElemType <> getAlt) and
+          (RefBody[K].ElemType <> getEnd) do Inc(K);
+    if RefBody[K].ElemType = getEnd then break;
+    AltIdx := K + 1;
+  end;
+end;
+
+procedure TNNetGrammarMachine.CommitScratchToActive();
+var
+  I, J: integer;
+begin
+  if Length(FStacks) < FScratchCount then
+  begin
+    SetLength(FStacks, FScratchCount);
+    SetLength(FStackLen, FScratchCount);
+  end;
+  for I := 0 to FScratchCount - 1 do
+  begin
+    if Length(FStacks[I]) < FScratchLen[I] then
+      SetLength(FStacks[I], FScratchLen[I] + 8);
+    for J := 0 to FScratchLen[I] - 1 do FStacks[I][J] := FScratch[I][J];
+    FStackLen[I] := FScratchLen[I];
+  end;
+  FStackCount := FScratchCount;
+end;
+
+procedure TNNetGrammarMachine.Reset();
+var
+  Empty: array of integer;
+begin
+  FStackCount := 0;
+  FScratchCount := 0;
+  SetLength(Empty, 0);
+  // Seed the active set with every alternate of the root rule.
+  PushRuleAlternates(Empty, 0, FGrammar.RootRule);
+  CommitScratchToActive();
+end;
+
+procedure TNNetGrammarMachine.CopyFrom(Source: TNNetGrammarMachine);
+var
+  I, J: integer;
+begin
+  FGrammar := Source.FGrammar;
+  if Length(FStacks) < Source.FStackCount then
+  begin
+    SetLength(FStacks, Source.FStackCount);
+    SetLength(FStackLen, Source.FStackCount);
+  end;
+  for I := 0 to Source.FStackCount - 1 do
+  begin
+    if Length(FStacks[I]) < Source.FStackLen[I] then
+      SetLength(FStacks[I], Source.FStackLen[I] + 8);
+    for J := 0 to Source.FStackLen[I] - 1 do
+      FStacks[I][J] := Source.FStacks[I][J];
+    FStackLen[I] := Source.FStackLen[I];
+  end;
+  FStackCount := Source.FStackCount;
+end;
+
+function TNNetGrammarMachine.ElemMatches(Pos: integer; C: char): boolean;
+var
+  Rule, Idx, SetIdx, R: integer;
+  Body: TNNetGrammarElemArray;
+  InSet: boolean;
+begin
+  UnpackPos(Pos, Rule, Idx);
+  Body := FGrammar.FRules[Rule];
+  case Body[Idx].ElemType of
+    getChar: Result := C = Chr(Body[Idx].Value);
+    getCharAny: Result := C <> #0;
+    getCharSet, getCharSetNot:
+      begin
+        SetIdx := Body[Idx].Value;
+        InSet := false;
+        for R := FGrammar.FCharSets[SetIdx].First to
+          FGrammar.FCharSets[SetIdx].First +
+          FGrammar.FCharSets[SetIdx].Count - 1 do
+          if (C >= FGrammar.FRanges[R].Lo) and
+             (C <= FGrammar.FRanges[R].Hi) then
+          begin InSet := true; break; end;
+        if Body[Idx].ElemType = getCharSet
+        then Result := InSet
+        else Result := (not InSet) and (C <> #0);
+      end;
+    else Result := false;
+  end;
+end;
+
+function TNNetGrammarMachine.FeedChar(C: char): boolean;
+var
+  I, TopPos, Rule, Idx: integer;
+  Adv: array of integer;
+begin
+  FScratchCount := 0;
+  for I := 0 to FStackCount - 1 do
+  begin
+    if FStackLen[I] = 0 then continue; // a completed stack accepts nothing
+    TopPos := FStacks[I][FStackLen[I] - 1];
+    if ElemMatches(TopPos, C) then
+    begin
+      UnpackPos(TopPos, Rule, Idx);
+      SetLength(Adv, FStackLen[I]);
+      Move(FStacks[I][0], Adv[0], FStackLen[I] * SizeOf(integer));
+      Adv[FStackLen[I] - 1] := PackPos(Rule, Idx + 1);
+      AddStackExpanded(Adv, FStackLen[I]);
+    end;
+  end;
+  Result := FScratchCount > 0;
+  CommitScratchToActive();
+end;
+
+function TNNetGrammarMachine.FeedString(const S: string): boolean;
+var
+  I: integer;
+begin
+  Result := true;
+  for I := 1 to Length(S) do
+    if not FeedChar(S[I]) then exit(false);
+end;
+
+function TNNetGrammarMachine.CharAllowed(C: char): boolean;
+var
+  I, TopPos: integer;
+begin
+  Result := false;
+  for I := 0 to FStackCount - 1 do
+  begin
+    if FStackLen[I] = 0 then continue;
+    TopPos := FStacks[I][FStackLen[I] - 1];
+    if ElemMatches(TopPos, C) then exit(true);
+  end;
+end;
+
+function TNNetGrammarMachine.IsComplete(): boolean;
+var
+  I: integer;
+begin
+  Result := false;
+  for I := 0 to FStackCount - 1 do
+    if FStackLen[I] = 0 then exit(true);
+end;
+
+function TNNetGrammarMachine.ActiveCount(): integer;
+begin
+  Result := FStackCount;
+end;
+
+{ TNNetGrammarConstraint }
+
+constructor TNNetGrammarConstraint.Create(const GBNFText: string;
+  Dict: TStringListInt);
+var
+  I: integer;
+begin
+  inherited Create();
+  FGrammar := TNNetGrammar.Create(GBNFText);
+  FMachine := TNNetGrammarMachine.Create(FGrammar);
+  FProbe := TNNetGrammarMachine.Create(FGrammar);
+  SetLength(FTokenStr, Dict.GetVocabCount());
+  for I := 0 to High(FTokenStr) do
+    if I < 2
+    then FTokenStr[I] := ''
+    else FTokenStr[I] := Dict.DeTokenize(I);
+end;
+
+constructor TNNetGrammarConstraint.CreateCharLevel(const GBNFText: string;
+  VocabSize: integer);
+var
+  I: integer;
+begin
+  inherited Create();
+  FGrammar := TNNetGrammar.Create(GBNFText);
+  FMachine := TNNetGrammarMachine.Create(FGrammar);
+  FProbe := TNNetGrammarMachine.Create(FGrammar);
+  SetLength(FTokenStr, VocabSize);
+  for I := 0 to High(FTokenStr) do
+    if I < 2
+    then FTokenStr[I] := ''
+    else FTokenStr[I] := Chr(I);
+end;
+
+destructor TNNetGrammarConstraint.Destroy();
+begin
+  FProbe.Free;
+  FMachine.Free;
+  FGrammar.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetGrammarConstraint.Reset(const PromptTokens: array of integer);
+begin
+  // The grammar constrains ONLY the generated text; the prompt is plain
+  // conditioning and is NOT fed through the machine.
+  FMachine.Reset();
+end;
+
+function TNNetGrammarConstraint.TokenAllowed(TokenId: integer): boolean;
+var
+  S: string;
+  I: integer;
+begin
+  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
+  // Special/EOS ids: legal exactly when the grammar is in a complete state.
+  if TokenId < 2 then exit(FMachine.IsComplete());
+  S := FTokenStr[TokenId];
+  if S = '' then exit(false);
+  // Transitive multi-character validation on a forked machine.
+  FProbe.CopyFrom(FMachine);
+  for I := 1 to Length(S) do
+    if not FProbe.FeedChar(S[I]) then exit(false);
+  Result := true;
+end;
+
+procedure TNNetGrammarConstraint.Commit(TokenId: integer);
+begin
+  if (TokenId < 2) or (TokenId > High(FTokenStr)) then exit;
+  FMachine.FeedString(FTokenStr[TokenId]);
+end;
+
+{ JSON-Schema -> GBNF compiler }
+
+// Stateful single-pass compiler: walks a parsed JSON Schema tree and appends
+// GBNF rule definitions to a builder, returning the rule NAME each node should
+// be referenced by. The fixed primitive rules (string/number/.../value, and
+// the optional-whitespace 'ws') are emitted once, lazily. $defs are pre-bound
+// to rule names so a $ref forward-references them (recursion -> the pushdown
+// stack). Everything is desugared into the GBNF subset TNNetGrammar accepts
+// (sequence/alternation/literals/classes/'?'/'*'/'+'/refs); no construct the
+// grammar can't parse is ever emitted. Coded by Claude (AI).
+type
+  TJSONSchemaCompiler = class(TObject)
+    private
+      FRules: TStringList;          // emitted "name ::= body" lines (ordered)
+      FAnonCount: integer;          // anon rule counter for inline subschemas
+      FDefRuleName: TStringList;    // def name -> emitted rule name (memo)
+      FHaveWS, FHaveStr, FHaveNum, FHaveInt, FHaveBool, FHaveNull,
+        FHaveValue: boolean;       // primitive-rule emitted flags
+      function NewAnonName(const Hint: string): string;
+      procedure Emit(const Name, Body: string);
+      // Lazily emit and return the name of each shared primitive rule.
+      function WSRule(): string;
+      function StringRule(): string;
+      function NumberRule(): string;
+      function IntegerRule(): string;
+      function BoolRule(): string;
+      function NullRule(): string;
+      function ValueRule(): string;
+      // Quotes S as a GBNF "..." literal (escaping " and \).
+      function GBNFLiteral(const S: string): string;
+      function CompileObject(Obj: TJSONObject; const Hint: string): string;
+      function CompileArray(Obj: TJSONObject; const Hint: string): string;
+      function CompileStringNode(Obj: TJSONObject; const Hint: string): string;
+      function CompileEnum(Arr: TJSONArray; const Hint: string): string;
+      function CompileAnyOf(Arr: TJSONArray; const Hint: string): string;
+      function CompileRef(const Ref: string): string;
+    public
+      FDefs: TJSONObject;           // $defs/definitions block (not owned)
+      constructor Create();
+      destructor Destroy(); override;
+      // Compiles one schema node to a rule and returns its NAME (a referenceable
+      // GBNF symbol). Hint seeds a readable anon-rule name.
+      function Compile(Node: TJSONData; const Hint: string): string;
+      // The accumulated "root ::= ..." grammar text (root first).
+      function Grammar(const RootRuleName: string): string;
+  end;
+
+constructor TJSONSchemaCompiler.Create();
+begin
+  inherited Create();
+  FRules := TStringList.Create();
+  FDefRuleName := TStringList.Create();
+  FAnonCount := 0;
+end;
+
+destructor TJSONSchemaCompiler.Destroy();
+begin
+  FDefRuleName.Free;
+  FRules.Free;
+  inherited Destroy();
+end;
+
+function TJSONSchemaCompiler.NewAnonName(const Hint: string): string;
+var
+  Clean: string;
+  I: integer;
+begin
+  // Keep only [A-Za-z0-9_] from the hint so the name is a legal GBNF symbol.
+  Clean := '';
+  for I := 1 to Length(Hint) do
+    if Hint[I] in ['A'..'Z', 'a'..'z', '0'..'9', '_']
+    then Clean := Clean + Hint[I];
+  if Clean = '' then Clean := 'r';
+  Inc(FAnonCount);
+  Result := Clean + '_' + IntToStr(FAnonCount);
+end;
+
+procedure TJSONSchemaCompiler.Emit(const Name, Body: string);
+begin
+  FRules.Add(Name + ' ::= ' + Body);
+end;
+
+function TJSONSchemaCompiler.WSRule(): string;
+begin
+  Result := 'ws';
+  if not FHaveWS then
+  begin
+    // Optional insignificant JSON whitespace.
+    Emit('ws', '[ ' + #9 + #10 + #13 + ']*');
+    FHaveWS := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.StringRule(): string;
+begin
+  Result := 'jstring';
+  if not FHaveStr then
+  begin
+    // A JSON string: quote, any non-control-non-"-non-\ char or an escape,
+    // quote. Mirrors the free-form JSON constraint's string acceptance.
+    Emit('jstring',
+      '"\"" ( [^"\\] | "\\" ["\\/bfnrt] )* "\""');
+    FHaveStr := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.NumberRule(): string;
+begin
+  Result := 'jnumber';
+  if not FHaveNum then
+  begin
+    // Optional sign, integer part, optional fraction, optional exponent.
+    Emit('jnumber',
+      '"-"? ("0" | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)?');
+    FHaveNum := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.IntegerRule(): string;
+begin
+  Result := 'jinteger';
+  if not FHaveInt then
+  begin
+    Emit('jinteger', '"-"? ("0" | [1-9] [0-9]*)');
+    FHaveInt := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.BoolRule(): string;
+begin
+  Result := 'jbool';
+  if not FHaveBool then
+  begin
+    Emit('jbool', '"true" | "false"');
+    FHaveBool := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.NullRule(): string;
+begin
+  Result := 'jnull';
+  if not FHaveNull then
+  begin
+    Emit('jnull', '"null"');
+    FHaveNull := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.ValueRule(): string;
+begin
+  // Permissive any-JSON-value fallback (schema-less / unknown node). Recursive
+  // through arrays/objects via the pushdown stack.
+  Result := 'jvalue';
+  if not FHaveValue then
+  begin
+    FHaveValue := true; // set first: the body references jvalue (recursion)
+    Emit('jvalue',
+      StringRule() + ' | ' + NumberRule() + ' | ' + BoolRule() + ' | ' +
+      NullRule() + ' | jvarray | jvobject');
+    Emit('jvarray',
+      '"[" ' + WSRule() + ' ( jvalue ' + WSRule() +
+      ' ("," ' + WSRule() + ' jvalue ' + WSRule() + ')* )? "]"');
+    Emit('jvmember', StringRule() + ' ' + WSRule() + ' ":" ' + WSRule() +
+      ' jvalue');
+    Emit('jvobject',
+      '"{" ' + WSRule() + ' ( jvmember ' + WSRule() +
+      ' ("," ' + WSRule() + ' jvmember ' + WSRule() + ')* )? "}"');
+  end;
+end;
+
+function TJSONSchemaCompiler.GBNFLiteral(const S: string): string;
+var
+  I: integer;
+begin
+  Result := '"';
+  for I := 1 to Length(S) do
+  begin
+    if (S[I] = '"') or (S[I] = '\') then Result := Result + '\';
+    Result := Result + S[I];
+  end;
+  Result := Result + '"';
+end;
+
+function TJSONSchemaCompiler.CompileRef(const Ref: string): string;
+var
+  DefName: string;
+  P, Idx: integer;
+  Node: TJSONData;
+begin
+  // Resolve "#/$defs/Name" or legacy "#/definitions/Name" to a named rule.
+  P := LastDelimiter('/', Ref);
+  DefName := Copy(Ref, P + 1, Length(Ref));
+  // Already bound? (memoised so a recursive $ref does not re-expand.)
+  Idx := FDefRuleName.IndexOfName(DefName);
+  if Idx >= 0 then exit(FDefRuleName.ValueFromIndex[Idx]);
+  if (FDefs = nil) or (FDefs.IndexOfName(DefName) < 0) then
+    // Unknown $ref -> permissive value (keeps the grammar well-formed).
+    exit(ValueRule());
+  // Bind the name BEFORE compiling so a self-recursive def references itself.
+  Result := 'def_' + NewAnonName(DefName);
+  FDefRuleName.Values[DefName] := Result;
+  Node := FDefs.Find(DefName);
+  Emit(Result, Compile(Node, DefName));
+end;
+
+function TJSONSchemaCompiler.CompileEnum(Arr: TJSONArray;
+  const Hint: string): string;
+var
+  I: integer;
+  Body, Lit: string;
+  Item: TJSONData;
+begin
+  // Each enum value -> its exact JSON literal; the rule is their alternation.
+  Body := '';
+  for I := 0 to Arr.Count - 1 do
+  begin
+    Item := Arr.Items[I];
+    case Item.JSONType of
+      jtString: Lit := GBNFLiteral('"' + Item.AsString + '"'); // quoted string
+      jtBoolean: if Item.AsBoolean then Lit := '"true"' else Lit := '"false"';
+      jtNull: Lit := '"null"';
+    else
+      Lit := GBNFLiteral(Item.AsJSON); // number: its textual form
+    end;
+    if Body = '' then Body := Lit else Body := Body + ' | ' + Lit;
+  end;
+  if Body = '' then Body := StringRule();
+  Result := NewAnonName(Hint + '_enum');
+  Emit(Result, Body);
+end;
+
+function TJSONSchemaCompiler.CompileAnyOf(Arr: TJSONArray;
+  const Hint: string): string;
+var
+  I: integer;
+  Body, Sub: string;
+begin
+  // anyOf / oneOf -> alternation of branch rules. (v1 does NOT enforce oneOf's
+  // exactly-one-match semantics; both map to '|'.)
+  Body := '';
+  for I := 0 to Arr.Count - 1 do
+  begin
+    Sub := Compile(Arr.Items[I], Hint + '_alt' + IntToStr(I));
+    if Body = '' then Body := Sub else Body := Body + ' | ' + Sub;
+  end;
+  if Body = '' then Body := ValueRule();
+  Result := NewAnonName(Hint + '_anyof');
+  Emit(Result, Body);
+end;
+
+function TJSONSchemaCompiler.CompileStringNode(Obj: TJSONObject;
+  const Hint: string): string;
+var
+  Pat, Cls: string;
+  P, Q: integer;
+begin
+  // "pattern" -> a char-class rule built from the FIRST [...] of the regex
+  // (full regex is out of scope); otherwise a generic JSON string.
+  if Obj.IndexOfName('pattern') >= 0 then
+  begin
+    Pat := Obj.Get('pattern', '');
+    P := Pos('[', Pat);
+    if P > 0 then
+    begin
+      Q := P;
+      while (Q <= Length(Pat)) and (Pat[Q] <> ']') do Inc(Q);
+      if Q <= Length(Pat) then
+      begin
+        Cls := Copy(Pat, P, Q - P + 1); // e.g. "[A-Za-z0-9_]"
+        // Wrap in quotes: pattern strings are still emitted as JSON strings,
+        // so a quote frames one-or-more pattern chars.
+        Result := NewAnonName(Hint + '_pat');
+        Emit(Result, '"\"" ' + Cls + '+ "\""');
+        exit;
+      end;
+    end;
+  end;
+  Result := StringRule();
+end;
+
+function TJSONSchemaCompiler.CompileArray(Obj: TJSONObject;
+  const Hint: string): string;
+var
+  ItemRule, Body, WS: string;
+  MinItems, MaxItems, I: integer;
+  ItemsNode: TJSONData;
+begin
+  WS := WSRule();
+  ItemsNode := Obj.Find('items');
+  if (ItemsNode <> nil) and (ItemsNode.JSONType = jtObject)
+  then ItemRule := Compile(ItemsNode, Hint + '_item')
+  else ItemRule := ValueRule();
+  MinItems := Obj.Get('minItems', 0);
+  MaxItems := Obj.Get('maxItems', -1); // -1 = unbounded
+  Result := NewAnonName(Hint + '_arr');
+  // Build the element list with explicit min/max counts. A comma precedes
+  // every element past the first.
+  if (MinItems <= 0) and (MaxItems < 0) then
+  begin
+    // Unbounded, zero or more.
+    Body := '"[" ' + WS + ' ( ' + ItemRule + ' ' + WS +
+      ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')* )? "]"';
+  end
+  else
+  begin
+    Body := '"[" ' + WS;
+    if MinItems > 0 then
+    begin
+      // First MinItems elements are mandatory.
+      Body := Body + ' ' + ItemRule + ' ' + WS;
+      for I := 2 to MinItems do
+        Body := Body + ' "," ' + WS + ' ' + ItemRule + ' ' + WS;
+      if MaxItems < 0 then
+        // Then any number more.
+        Body := Body + ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')*'
+      else
+        // Up to (MaxItems - MinItems) more, each optional.
+        for I := MinItems + 1 to MaxItems do
+          Body := Body + ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')?';
+    end
+    else
+    begin
+      // MinItems = 0 but bounded above: 0..MaxItems optional slots.
+      Body := Body + ' ( ' + ItemRule + ' ' + WS;
+      for I := 2 to MaxItems do
+        Body := Body + ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')?';
+      Body := Body + ' )?';
+    end;
+    Body := Body + ' "]"';
+  end;
+  Emit(Result, Body);
+end;
+
+function TJSONSchemaCompiler.CompileObject(Obj: TJSONObject;
+  const Hint: string): string;
+var
+  Props: TJSONObject;
+  Required: TJSONArray;
+  WS, Body, MemberRule, KeyLit, PropName: string;
+  I: integer;
+  IsReq, ExtraAllowed: boolean;
+  ReqFlags: array of boolean;
+  PropNames: TStringList;
+  ExtraNode: TJSONData;
+
+  function PropIsRequired(const AName: string): boolean;
+  var K: integer;
+  begin
+    Result := false;
+    if Required = nil then exit;
+    for K := 0 to Required.Count - 1 do
+      if (Required.Items[K].JSONType = jtString) and
+         (Required.Items[K].AsString = AName) then exit(true);
+  end;
+
+begin
+  WS := WSRule();
+  if Obj.Find('properties') is TJSONObject
+  then Props := TJSONObject(Obj.Find('properties'))
+  else Props := nil;
+  if Obj.Find('required') is TJSONArray
+  then Required := TJSONArray(Obj.Find('required'))
+  else Required := nil;
+  // additionalProperties: default false here (strict structured output). A
+  // value of true (or a schema object) re-opens the object to extra members.
+  ExtraAllowed := false;
+  ExtraNode := Obj.Find('additionalProperties');
+  if ExtraNode <> nil then
+    if (ExtraNode.JSONType = jtBoolean) then ExtraAllowed := ExtraNode.AsBoolean
+    else if (ExtraNode.JSONType = jtObject) then ExtraAllowed := true;
+
+  Result := NewAnonName(Hint + '_obj');
+
+  if (Props = nil) or (Props.Count = 0) then
+  begin
+    // No declared properties: either a closed empty object or a permissive one.
+    if ExtraAllowed
+    then Emit(Result, ValueRule()) // any object (jvobject is inside jvalue)
+    else Emit(Result, '"{" ' + WS + ' "}"');
+    exit;
+  end;
+
+  // Collect property names + compile a value rule per property.
+  PropNames := TStringList.Create();
+  try
+    for I := 0 to Props.Count - 1 do PropNames.Add(Props.Names[I]);
+    SetLength(ReqFlags, PropNames.Count);
+    for I := 0 to PropNames.Count - 1 do
+      ReqFlags[I] := PropIsRequired(PropNames[I]);
+
+    // Linear object body in declared property order. A comma precedes every
+    // member except the first one EMITTED; since optional members may be
+    // absent, each non-first member wraps its own leading comma inside the
+    // same optional group, and the FIRST member is comma-free. A required
+    // first member is mandatory; an optional first member is wrapped in '?'.
+    Body := '"{" ' + WS + ' ';
+    for I := 0 to PropNames.Count - 1 do
+    begin
+      PropName := PropNames[I];
+      KeyLit := GBNFLiteral('"' + PropName + '"');
+      MemberRule := Compile(Props.Items[I], Hint + '_' + PropName);
+      IsReq := ReqFlags[I];
+      if I = 0 then
+      begin
+        if IsReq then
+          Body := Body + KeyLit + ' ' + WS + ' ":" ' + WS + ' ' +
+            MemberRule + ' ' + WS
+        else
+          Body := Body + '( ' + KeyLit + ' ' + WS + ' ":" ' + WS + ' ' +
+            MemberRule + ' ' + WS + ' )?';
+      end
+      else
+      begin
+        if IsReq then
+          Body := Body + ' "," ' + WS + ' ' + KeyLit + ' ' + WS + ' ":" ' +
+            WS + ' ' + MemberRule + ' ' + WS
+        else
+          Body := Body + ' ( "," ' + WS + ' ' + KeyLit + ' ' + WS + ' ":" ' +
+            WS + ' ' + MemberRule + ' ' + WS + ' )?';
+      end;
+    end;
+
+    if ExtraAllowed then
+      // Allow trailing arbitrary members after the declared ones.
+      Body := Body + ' ( "," ' + WS + ' ' + StringRule() + ' ' + WS +
+        ' ":" ' + WS + ' ' + ValueRule() + ' ' + WS + ' )*';
+    Body := Body + ' "}"';
+    Emit(Result, Body);
+  finally
+    PropNames.Free;
+  end;
+end;
+
+function TJSONSchemaCompiler.Compile(Node: TJSONData;
+  const Hint: string): string;
+var
+  Obj: TJSONObject;
+  TypeStr: string;
+  TypeNode: TJSONData;
+begin
+  if (Node = nil) or (Node.JSONType <> jtObject) then exit(ValueRule());
+  Obj := TJSONObject(Node);
+
+  // $ref takes precedence (a ref node usually has nothing else of interest).
+  if Obj.IndexOfName('$ref') >= 0 then
+    exit(CompileRef(Obj.Get('$ref', '')));
+
+  // anyOf / oneOf -> alternation.
+  if Obj.Find('anyOf') is TJSONArray then
+    exit(CompileAnyOf(TJSONArray(Obj.Find('anyOf')), Hint));
+  if Obj.Find('oneOf') is TJSONArray then
+    exit(CompileAnyOf(TJSONArray(Obj.Find('oneOf')), Hint));
+
+  // enum (independent of "type").
+  if Obj.Find('enum') is TJSONArray then
+    exit(CompileEnum(TJSONArray(Obj.Find('enum')), Hint));
+
+  // "type": a single string here (a type ARRAY would be anyOf-like; v1 takes
+  // the first entry).
+  TypeStr := '';
+  TypeNode := Obj.Find('type');
+  if TypeNode <> nil then
+    if TypeNode.JSONType = jtString then TypeStr := TypeNode.AsString
+    else if (TypeNode.JSONType = jtArray) and (TJSONArray(TypeNode).Count > 0)
+      and (TJSONArray(TypeNode).Items[0].JSONType = jtString)
+    then TypeStr := TJSONArray(TypeNode).Items[0].AsString;
+
+  // A node carrying "properties" but no explicit type is an object.
+  if (TypeStr = '') and (Obj.IndexOfName('properties') >= 0) then
+    TypeStr := 'object';
+  if (TypeStr = '') and (Obj.IndexOfName('items') >= 0) then
+    TypeStr := 'array';
+
+  if TypeStr = 'object' then exit(CompileObject(Obj, Hint));
+  if TypeStr = 'array' then exit(CompileArray(Obj, Hint));
+  if TypeStr = 'string' then exit(CompileStringNode(Obj, Hint));
+  if TypeStr = 'number' then exit(NumberRule());
+  if TypeStr = 'integer' then exit(IntegerRule());
+  if TypeStr = 'boolean' then exit(BoolRule());
+  if TypeStr = 'null' then exit(NullRule());
+  // Unknown / schema-less node -> permissive value.
+  Result := ValueRule();
+end;
+
+function TJSONSchemaCompiler.Grammar(const RootRuleName: string): string;
+var
+  I: integer;
+begin
+  // root first (TNNetGrammar requires a 'root' rule; it may appear anywhere,
+  // but emitting it first reads best), then every emitted rule.
+  Result := 'root ::= ' + WSRule() + ' ' + RootRuleName + ' ' + WSRule() +
+    LineEnding;
+  for I := 0 to FRules.Count - 1 do
+    Result := Result + FRules[I] + LineEnding;
+end;
+
+function CompileJSONSchemaToGBNF(const SchemaJSON: string): string;
+var
+  Root: TJSONData;
+  Obj: TJSONObject;
+  Compiler: TJSONSchemaCompiler;
+  RootRule: string;
+  DefsNode: TJSONData;
+begin
+  Root := HFParseJSONRaw(SchemaJSON);
+  Compiler := TJSONSchemaCompiler.Create();
+  try
+    if (Root = nil) or (Root.JSONType <> jtObject) then
+    begin
+      // Degenerate schema: fall back to free-form JSON value.
+      RootRule := Compiler.ValueRule();
+    end
+    else
+    begin
+      Obj := TJSONObject(Root);
+      // Bind $defs / definitions for $ref resolution (the block is not owned).
+      DefsNode := Obj.Find('$defs');
+      if not (DefsNode is TJSONObject) then DefsNode := Obj.Find('definitions');
+      if DefsNode is TJSONObject then Compiler.FDefs := TJSONObject(DefsNode);
+      RootRule := Compiler.Compile(Root, 'schema');
+    end;
+    Result := Compiler.Grammar(RootRule);
+  finally
+    Compiler.Free;
+    Root.Free;
+  end;
+end;
+
+function CreateJSONSchemaConstraint(const SchemaJSON: string;
+  Dict: TStringListInt): TNNetGrammarConstraint;
+begin
+  Result := TNNetGrammarConstraint.Create(
+    CompileJSONSchemaToGBNF(SchemaJSON), Dict);
+end;
+
 { TNNetLogitsProcessor }
 
 function TNNetLogitsProcessor.ExpectsProbabilities(): boolean;
@@ -1670,6 +4196,88 @@ begin
   FConstraint.Commit(TokenId);
 end;
 
+{ TNNetWatermarkLogitsProcessor }
+
+// One round of the splitmix64 finalizer - a fast, well-mixing 64-bit hash.
+// Used as the deterministic green-list PRNG so the partition is bit-identical
+// in the processor and in DetectWatermark.
+function WatermarkSplitMix64(X: UInt64): UInt64;
+begin
+  X := X + UInt64($9E3779B97F4A7C15);
+  X := (X xor (X shr 30)) * UInt64($BF58476D1CE4E5B9);
+  X := (X xor (X shr 27)) * UInt64($94D049BB133111EB);
+  Result := X xor (X shr 31);
+end;
+
+constructor TNNetWatermarkLogitsProcessor.Create(pKey: UInt64;
+  pGamma: TNeuralFloat = 0.25; pDelta: TNeuralFloat = 2.0);
+begin
+  inherited Create();
+  FKey := pKey;
+  FGamma := pGamma;
+  FDelta := pDelta;
+  FPrevToken := -1;
+end;
+
+class function TNNetWatermarkLogitsProcessor.IsGreen(pKey: UInt64;
+  PrevToken, TokenId: integer; Gamma: TNeuralFloat): boolean;
+var
+  Seed, H: UInt64;
+  Frac: double;
+begin
+  // Seed the per-step PRNG from the previous token XOR the key (the h=1
+  // "left-hash" rule of Kirchenbauer et al.); mixing once decorrelates
+  // adjacent seeds. The token id is folded in and finalized so each token's
+  // membership is an independent uniform draw in [0,1); green iff below Gamma.
+  Seed := WatermarkSplitMix64(UInt64(UInt32(PrevToken)) xor pKey);
+  H := WatermarkSplitMix64(Seed + UInt64(UInt32(TokenId)));
+  // Top 53 bits -> uniform double in [0,1) (mirrors the std double-from-u64
+  // trick; avoids the low-bit non-uniformity of a plain modulo).
+  Frac := (H shr 11) * (1.0 / 9007199254740992.0); // 2^53
+  Result := Frac < Gamma;
+end;
+
+procedure TNNetWatermarkLogitsProcessor.Reset(
+  const PromptTokens: array of integer);
+begin
+  if Length(PromptTokens) > 0 then
+    FPrevToken := PromptTokens[High(PromptTokens)]
+  else
+    FPrevToken := -1;
+end;
+
+procedure TNNetWatermarkLogitsProcessor.ProcessRow(Row: TNNetVolume);
+var
+  I: integer;
+  ExpDelta, Sum: TNeuralFloat;
+begin
+  // Delta = 0 (or a degenerate non-positive bias) is a no-op.
+  if FDelta <= 0 then exit;
+  // Probability-domain image of "logit += Delta on green tokens": multiply
+  // every green probability by exp(Delta), then renormalize. (Adding Delta to
+  // a logit scales its softmax numerator by exp(Delta); the partition cancels
+  // in the ratio, so renormalizing the post-softmax row reproduces it exactly.)
+  ExpDelta := Exp(FDelta);
+  Sum := 0;
+  for I := 0 to Row.Size - 1 do
+  begin
+    if IsGreen(FKey, FPrevToken, I, FGamma) then
+      Row.Raw[I] := Row.Raw[I] * ExpDelta;
+    Sum := Sum + Row.Raw[I];
+  end;
+  // Defensive: an all-zero row (no probability mass) is left untouched,
+  // mirroring the temperature/constraint zero-mass fallback.
+  if Sum <= 0 then exit;
+  for I := 0 to Row.Size - 1 do
+    Row.Raw[I] := Row.Raw[I] / Sum;
+end;
+
+procedure TNNetWatermarkLogitsProcessor.Commit(TokenId: integer);
+begin
+  // The token just emitted becomes the predecessor that seeds the next step.
+  FPrevToken := TokenId;
+end;
+
 { TNNetLogitsProcessorChain }
 
 destructor TNNetLogitsProcessorChain.Destroy();
@@ -1736,6 +4344,136 @@ var
   I: integer;
 begin
   for I := 0 to High(FItems) do FItems[I].Commit(TokenId);
+end;
+
+{ TNNetCFGProcessor }
+
+constructor TNNetCFGProcessor.Create(UncondSession: TNNetStreamingDecoder;
+  const NegativePrompt: array of integer; GuidanceScale: TNeuralFloat;
+  OwnsSession: boolean = false);
+var
+  I: integer;
+begin
+  inherited Create();
+  if not Assigned(UncondSession) then
+    raise EArgumentException.Create(
+      'TNNetCFGProcessor: the unconditional session must be assigned.');
+  if Length(NegativePrompt) < 1 then
+    raise EArgumentException.Create(
+      'TNNetCFGProcessor: the negative/unconditional prompt must be ' +
+      'non-empty (it seeds the unconditional branch''s first input).');
+  if UncondSession.Net.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'TNNetCFGProcessor: the unconditional session net must be a WIDTH-1 ' +
+      'twin (input SizeX=1).');
+  FSession := UncondSession;
+  FOwnsSession := OwnsSession;
+  FGuidanceScale := GuidanceScale;
+  SetLength(FNegPrompt, Length(NegativePrompt));
+  for I := 0 to High(NegativePrompt) do FNegPrompt[I] := NegativePrompt[I];
+  FInV := TNNetVolume.Create(FSession.Net.GetFirstLayer().Output);
+  FInV.Fill(0);
+end;
+
+destructor TNNetCFGProcessor.Destroy();
+begin
+  FInV.Free;
+  if FOwnsSession then FSession.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetCFGProcessor.Reset(const PromptTokens: array of integer);
+var
+  Pos: integer;
+begin
+  // Fresh sequence: prefill the unconditional branch with the negative prompt
+  // (tokens 0..len-2), leaving its LAST token as the first decode step's
+  // input - exactly the prefill-then-step idiom the conditional loop uses on
+  // its own prompt. The conditional PromptTokens are intentionally ignored:
+  // the whole point of CFG is that the two branches differ in their prompt.
+  FSession.Reset();
+  for Pos := 0 to Length(FNegPrompt) - 2 do
+  begin
+    FInV.FData[0] := FNegPrompt[Pos];
+    FSession.StepForward(FInV, Pos);
+  end;
+  FPendingToken := FNegPrompt[High(FNegPrompt)];
+  FAbsPos := Length(FNegPrompt) - 1;
+end;
+
+procedure TNNetCFGProcessor.ProcessRow(Row: TNNetVolume);
+var
+  UncondRow: TNNetVolume;
+  I: integer;
+  LCond, LUncond, Combined, MaxL, Sum: TNeuralFloat;
+begin
+  // GuidanceScale = 1 collapses to the conditional row exactly (uncond + 1 *
+  // (cond - uncond) = cond); skip the second forward to keep it bit-for-bit
+  // identical to plain decoding AND to avoid the cost.
+  if FGuidanceScale = 1.0 then exit;
+  // Step the unconditional branch forward one token at its absolute position
+  // (the negative prompt's running length + tokens generated so far).
+  FInV.FData[0] := FPendingToken;
+  FSession.StepForward(FInV, FAbsPos);
+  UncondRow := FSession.Output();
+  // Combine in LOG space: logits := uncond + scale * (cond - uncond), with
+  // log-probs standing in for the pre-softmax logits (the per-branch softmax
+  // constant cancels in the final softmax below). Track the max for a stable
+  // softmax back to probabilities.
+  MaxL := -1e30;
+  for I := 0 to Row.Size - 1 do
+  begin
+    LCond := SafeLogProb(Row.Raw[I]);
+    LUncond := SafeLogProb(UncondRow.Raw[I]);
+    Combined := LUncond + FGuidanceScale * (LCond - LUncond);
+    Row.Raw[I] := Combined;
+    if Combined > MaxL then MaxL := Combined;
+  end;
+  // Softmax the combined logits back into a probability row (the chain's
+  // documented domain).
+  Sum := 0;
+  for I := 0 to Row.Size - 1 do
+  begin
+    Row.Raw[I] := Exp(Row.Raw[I] - MaxL);
+    Sum := Sum + Row.Raw[I];
+  end;
+  if Sum > 0 then
+    for I := 0 to Row.Size - 1 do Row.Raw[I] := Row.Raw[I] / Sum;
+end;
+
+procedure TNNetCFGProcessor.Commit(TokenId: integer);
+begin
+  // The emitted token becomes the next input of BOTH branches; the
+  // unconditional branch advances one absolute position. (When GuidanceScale
+  // = 1 ProcessRow never stepped the branch, but keeping the bookkeeping in
+  // sync is harmless and lets the scale be changed mid-run.)
+  FPendingToken := TokenId;
+  Inc(FAbsPos);
+end;
+
+{ TNNetDecoderSessionSnapshot }
+
+destructor TNNetDecoderSessionSnapshot.Destroy();
+var
+  i: integer;
+begin
+  for i := 0 to High(FK) do FK[i].Free;
+  for i := 0 to High(FV) do FV[i].Free;
+  for i := 0 to High(FH) do FH[i].Free;
+  SetLength(FK, 0);
+  SetLength(FV, 0);
+  SetLength(FH, 0);
+  inherited Destroy();
+end;
+
+function TNNetDecoderSessionSnapshot.GetSDPACount(): integer;
+begin
+  Result := Length(FK);
+end;
+
+function TNNetDecoderSessionSnapshot.GetSSMCount(): integer;
+begin
+  Result := Length(FH);
 end;
 
 { TNNetStreamingDecoder }
@@ -1820,9 +4558,100 @@ begin
   for i := 0 to High(FSDPAs) do FSDPAs[i].TruncateCache(CommittedLen);
 end;
 
+procedure TNNetStreamingDecoder.EnableEviction(SinkTokens, RecentWindow: integer);
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].EnableEviction(SinkTokens, RecentWindow);
+end;
+
+procedure TNNetStreamingDecoder.DisableEviction();
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].DisableEviction();
+end;
+
+procedure TNNetStreamingDecoder.EnableInt8KVCache();
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].EnableInt8KV();
+end;
+
+procedure TNNetStreamingDecoder.DisableInt8KVCache();
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].DisableInt8KV();
+end;
+
+function TNNetStreamingDecoder.SDPACacheLength(Index: integer): integer;
+begin
+  Result := FSDPAs[Index].CacheLength;
+end;
+
+function TNNetStreamingDecoder.Snapshot(): TNNetDecoderSessionSnapshot;
+var
+  i: integer;
+begin
+  Result := TNNetDecoderSessionSnapshot.Create();
+  SetLength(Result.FK, Length(FSDPAs));
+  SetLength(Result.FV, Length(FSDPAs));
+  SetLength(Result.FLen, Length(FSDPAs));
+  SetLength(Result.FSinks, Length(FSDPAs));
+  SetLength(Result.FWindow, Length(FSDPAs));
+  for i := 0 to High(FSDPAs) do
+  begin
+    Result.FK[i] := TNNetVolume.Create();
+    Result.FV[i] := TNNetVolume.Create();
+    FSDPAs[i].CaptureCacheState(Result.FK[i], Result.FV[i],
+      Result.FLen[i], Result.FSinks[i], Result.FWindow[i]);
+  end;
+  SetLength(Result.FH, Length(FSSMs));
+  SetLength(Result.FSteps, Length(FSSMs));
+  for i := 0 to High(FSSMs) do
+  begin
+    Result.FH[i] := TNNetVolume.Create();
+    FSSMs[i].CaptureState(Result.FH[i], Result.FSteps[i]);
+  end;
+end;
+
+procedure TNNetStreamingDecoder.RestoreSnapshot(Snap: TNNetDecoderSessionSnapshot);
+var
+  i: integer;
+begin
+  if Length(Snap.FK) <> Length(FSDPAs) then
+  begin
+    raise Exception.Create('TNNetStreamingDecoder.RestoreSnapshot: snapshot has ' +
+      IntToStr(Length(Snap.FK)) + ' attention layers but this session has ' +
+      IntToStr(Length(FSDPAs)) + ' (mismatched architecture).');
+  end;
+  if Length(Snap.FH) <> Length(FSSMs) then
+  begin
+    raise Exception.Create('TNNetStreamingDecoder.RestoreSnapshot: snapshot has ' +
+      IntToStr(Length(Snap.FH)) + ' SSM layers but this session has ' +
+      IntToStr(Length(FSSMs)) + ' (mismatched architecture).');
+  end;
+  for i := 0 to High(FSDPAs) do
+    FSDPAs[i].RestoreCacheState(Snap.FK[i], Snap.FV[i],
+      Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
+  for i := 0 to High(FSSMs) do
+    FSSMs[i].RestoreState(Snap.FH[i], Snap.FSteps[i]);
+end;
+
 function TNNetStreamingDecoder.Output(): TNNetVolume;
 begin
   Result := FNet.GetLastLayer().Output;
+end;
+
+function TNNetStreamingDecoder.HiddenState(): TNNetVolume;
+begin
+  // Resolve the LM-head input layer once (same heuristic as the cache-less
+  // path) and return its output - the hidden state of the token in the window
+  // just stepped.
+  if FHiddenLayer = nil then FHiddenLayer := ContrastiveHiddenLayer(FNet);
+  Result := FHiddenLayer.Output;
 end;
 
 function TNNetStreamingDecoder.GetSDPACount(): integer;
@@ -1993,7 +4822,9 @@ begin
     InV.Fill(0);
     Session.Reset();
     // A fresh sequence for the whole pipeline: penalties clear their history
-    // and register the prompt, stateful grammars rewind (see the adapters).
+    // and register the prompt, stateful grammars rewind (see the adapters), and
+    // STATEFUL samplers (e.g. TNNetSamplerMirostat) re-arm their running state.
+    if Assigned(Sampler) then Sampler.Reset();
     if Assigned(Processors) then
       Processors.Reset(Copy(Tokens, 0, PromptLen));
     // Prefill tokens 0..PromptLen-2 one at a time; the LAST prompt token is
@@ -2096,20 +4927,30 @@ end;
 
 function PrepareTokenHealing(Dict: TStringListInt;
   const Tokens: TNeuralIntegerArray; var PromptLen: integer;
-  out DroppedToken: integer): TNNetTokenHealingConstraint;
+  out DroppedToken: integer;
+  RollbackTokens: integer = 1): TNNetTokenHealingConstraint;
 var
   LastText, CandText: string;
   Allowed: TNeuralIntegerArray;
-  TokenCnt, AllowedCount, VocabCount, LastLen: integer;
+  TokenCnt, AllowedCount, VocabCount, LastLen, Roll, RollIdx, Tok: integer;
   HasStrictExtension: boolean;
 begin
   Result := nil;
   DroppedToken := -1;
   if PromptLen < 2 then exit; // healing would empty the prompt
   VocabCount := Dict.GetVocabCount();
-  if (Tokens[PromptLen - 1] < 0) or
-     (Tokens[PromptLen - 1] >= VocabCount) then exit;
-  LastText := Dict.DeTokenize(Tokens[PromptLen - 1]);
+  // Effective rollback: at least 1, never enough to empty the prompt.
+  Roll := RollbackTokens;
+  if Roll < 1 then Roll := 1;
+  if Roll > PromptLen - 1 then Roll := PromptLen - 1;
+  // Rebuild the combined boundary fragment from the last Roll tokens.
+  LastText := '';
+  for RollIdx := PromptLen - Roll to PromptLen - 1 do
+  begin
+    Tok := Tokens[RollIdx];
+    if (Tok < 0) or (Tok >= VocabCount) then exit; // out-of-dict id: skip
+    LastText := LastText + Dict.DeTokenize(Tok);
+  end;
   LastLen := Length(LastText);
   if LastLen = 0 then exit; // byte-level/special oddity: no-op fallback
   SetLength(Allowed, VocabCount);
@@ -2127,12 +4968,56 @@ begin
     end;
   end;
   // Without a strict extension the only allowed continuation re-emits the
-  // dropped token - the healed run provably equals the unhealed one, so
+  // dropped fragment - the healed run provably equals the unhealed one, so
   // healing is skipped (PromptLen untouched).
   if not HasStrictExtension then exit;
   SetLength(Allowed, AllowedCount);
-  DroppedToken := Tokens[PromptLen - 1];
-  Dec(PromptLen);
+  DroppedToken := Tokens[PromptLen - Roll];
+  Dec(PromptLen, Roll);
+  Result := TNNetTokenHealingConstraint.Create(Allowed);
+end;
+
+function PrepareTokenHealing(Tokenizer: TNeuralHFTokenizer;
+  const Tokens: TNeuralIntegerArray; var PromptLen: integer;
+  out DroppedToken: integer;
+  RollbackTokens: integer = 1): TNNetTokenHealingConstraint;
+var
+  Fragment, CandSurface, FragSurface: string;
+  Allowed: TNeuralIntegerArray;
+  Roll, RollIdx, FragLen, Cnt: integer;
+  HasStrictExtension: boolean;
+begin
+  Result := nil;
+  DroppedToken := -1;
+  if PromptLen < 2 then exit; // healing would empty the prompt
+  Roll := RollbackTokens;
+  if Roll < 1 then Roll := 1;
+  if Roll > PromptLen - 1 then Roll := PromptLen - 1;
+  // Rebuild the combined boundary fragment (raw text) from the last Roll ids.
+  Fragment := '';
+  for RollIdx := PromptLen - Roll to PromptLen - 1 do
+    Fragment := Fragment + Tokenizer.DecodeToken(Tokens[RollIdx]);
+  if Fragment = '' then exit; // special/empty surface: no-op fallback
+  // Surface-space prefix scan over the byte-level/metaspace vocabulary.
+  Allowed := Tokenizer.PrefixScanVocab(Fragment);
+  if Length(Allowed) = 0 then exit;
+  // Require a STRICT extension - else the only allowed continuation re-emits
+  // the dropped fragment and the healed run equals the unhealed one.
+  FragSurface := Tokenizer.FragmentToSurface(Fragment);
+  FragLen := Length(FragSurface);
+  HasStrictExtension := false;
+  for Cnt := 0 to High(Allowed) do
+  begin
+    CandSurface := Tokenizer.IdToToken(Allowed[Cnt]);
+    if Length(CandSurface) > FragLen then
+    begin
+      HasStrictExtension := true;
+      break;
+    end;
+  end;
+  if not HasStrictExtension then exit;
+  DroppedToken := Tokens[PromptLen - Roll];
+  Dec(PromptLen, Roll);
   Result := TNNetTokenHealingConstraint.Create(Allowed);
 end;
 
@@ -2255,6 +5140,25 @@ end;
 
 { Config-driven generation }
 
+function MakeUnconditionalTwin(SourceWidth1Net: TNNet;
+  MaxTotalLen: integer; out TwinNet: TNNet): TNNetStreamingDecoder;
+begin
+  if not Assigned(SourceWidth1Net) then
+    raise EArgumentException.Create(
+      'MakeUnconditionalTwin: SourceWidth1Net must be assigned.');
+  if SourceWidth1Net.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'MakeUnconditionalTwin: SourceWidth1Net must be a WIDTH-1 net ' +
+      '(input SizeX=1); build the width-1 twin first (Build*(1) + ' +
+      'CopyWeights). Got SizeX=' +
+      IntToStr(SourceWidth1Net.GetFirstLayer().Output.SizeX) + '.');
+  // Clone architecture AND weights; the round-trip preserves the width-1
+  // input shape, so the clone is a valid streaming twin with its own state.
+  TwinNet := TNNet.Create();
+  TwinNet.LoadFromString(SourceWidth1Net.SaveToString());
+  Result := TNNetStreamingDecoder.Create(TwinNet, MaxTotalLen);
+end;
+
 function DefaultGenerationConfig(MaxNewTokens: integer;
   MaxTotalLen: integer = 0): TGenerationConfig;
 begin
@@ -2268,7 +5172,38 @@ begin
   Result.Processors := nil;
   Result.Constraint := nil;
   Result.Sampler := nil;
+  Result.GuidanceScale := 1.0; // CFG off
+  Result.CFGUncond := nil;
+  SetLength(Result.NegativePrompt, 0);
   Result.TokenHealing := false;
+end;
+
+// Assemble the per-step pipeline implied by a TGenerationConfig. CFG (when
+// GuidanceScale <> 1.0) runs FIRST - it combines the conditional and
+// unconditional model distributions before any penalty/temperature/processor/
+// constraint transform sees the row - then the standard
+// Penalty -> Temperature -> Processors -> Constraint pipeline. Returns nil
+// when every knob is off (the plain path). The returned chain owns only the
+// adapters it created (the CFG processor included); Config's own objects are
+// not owned.
+function BuildConfigPipeline(
+  const Config: TGenerationConfig): TNNetLogitsProcessorChain;
+var
+  StdChain: TNNetLogitsProcessorChain;
+begin
+  StdChain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
+    Config.Processors, Config.Constraint);
+  if Config.GuidanceScale = 1.0 then exit(StdChain); // CFG off: as before
+  if not Assigned(Config.CFGUncond) then
+    raise EArgumentException.Create(
+      'BuildConfigPipeline: GuidanceScale <> 1 requires Config.CFGUncond ' +
+      '(the unconditional width-1 twin) to be assigned.');
+  Result := TNNetLogitsProcessorChain.Create();
+  // CFG owns its run but NOT the session/twin (OwnsSession=false): the config
+  // does not own CFGUncond, so neither does the chain it spawns.
+  Result.Add(TNNetCFGProcessor.Create(Config.CFGUncond, Config.NegativePrompt,
+    Config.GuidanceScale, {OwnsSession=}false), {OwnsProcessor=}true);
+  if Assigned(StdChain) then Result.Add(StdChain, {OwnsProcessor=}true);
 end;
 
 function GenerateTokensWithConfig(Session: TNNetStreamingDecoder;
@@ -2280,8 +5215,7 @@ var
 begin
   MaxTotal := Config.MaxTotalLen;
   if MaxTotal <= 0 then MaxTotal := PromptLen + Config.MaxNewTokens;
-  Chain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
-    Config.Processors, Config.Constraint);
+  Chain := BuildConfigPipeline(Config);
   try
     Result := GenerateTokensStreamedWithProcessors(Session, Tokens,
       PromptLen, Config.MaxNewTokens, MaxTotal, Config.Sampler, Chain,
@@ -2309,8 +5243,7 @@ begin
     MaxTotal := PromptLen + Config.MaxNewTokens;
     SetLength(Tokens, 0);
   end;
-  Chain := BuildProcessorPipeline(Config.Penalty, Config.Temperature,
-    Config.Processors, Config.Constraint);
+  Chain := BuildConfigPipeline(Config);
   try
     Result := GenerateStringStreamedWithProcessors(Session, Dict,
       InputString, Config.MaxNewTokens, MaxTotal, Config.Sampler, Chain,
@@ -2434,6 +5367,1071 @@ begin
           Break;
         end;
       end;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+  end;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function DecodeBatchGreedy(NN: TNNet; const Prompts: array of string;
+  MaxLen: integer): TNNetDecodeResultArray;
+begin
+  Result := DecodeBatchGreedy(NN, Prompts, MaxLen, []);
+end;
+
+// Batched greedy decode: N prompts advanced in lockstep. Per row, every step is
+// byte-for-byte the same computation DecodeGreedy(NN, Prompt, MaxLen,
+// StopStrings) performs (same NextLogProbs forward, same argmax tie-break, same
+// SumLogProb accumulation, same EOS / stop-string termination and trimming), so
+// Result[i] is token-for-token identical to the single-sample call. Finished
+// rows are frozen; the loop runs until every row is done or MaxLen is reached.
+// Each row keeps its OWN input/output volumes -- the reversed one-hot encoding
+// right-aligns the latest token at x=0, so differing prompt lengths are handled
+// purely by per-row left-zero-padding with no cross-row interaction to mask.
+function DecodeBatchGreedy(NN: TNNet; const Prompts: array of string;
+  MaxLen: integer;
+  const StopStrings: array of string): TNNetDecodeResultArray;
+var
+  N, R, Step, VocabSize, Best, I, StopLen: integer;
+  InVols, OutVols: array of TNNetVolume;
+  Contexts: array of string;
+  Done: array of boolean;
+  LogProbs: array of TNeuralFloat;
+  AnyRunning: boolean;
+begin
+  N := Length(Prompts);
+  SetLength(Result, N);
+  if N = 0 then Exit;
+  VocabSize := NN.GetLastLayer().Output.Size;
+  SetLength(LogProbs, VocabSize);
+  SetLength(InVols, N);
+  SetLength(OutVols, N);
+  SetLength(Contexts, N);
+  SetLength(Done, N);
+  for R := 0 to N - 1 do
+  begin
+    InVols[R] := TNNetVolume.Create(NN.GetFirstLayer.Output);
+    OutVols[R] := TNNetVolume.Create(NN.GetLastLayer().Output);
+    Contexts[R] := Prompts[R];
+    Done[R] := False;
+    Result[R].Text := '';
+    Result[R].SumLogProb := 0;
+    Result[R].Score := 0;
+    Result[R].Finished := False;
+  end;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      AnyRunning := False;
+      for R := 0 to N - 1 do
+      begin
+        if Done[R] then Continue;
+        AnyRunning := True;
+        // One forward pass for this row (per-row left-padding is implicit in
+        // the reversed one-hot encoding inside NextLogProbs).
+        NextLogProbs(NN, Contexts[R], InVols[R], OutVols[R], LogProbs);
+        Best := 0;
+        for I := 1 to VocabSize - 1 do
+          if LogProbs[I] > LogProbs[Best] then Best := I;
+        Result[R].SumLogProb := Result[R].SumLogProb + LogProbs[Best];
+        if Best = csDecodeEOSToken then
+        begin
+          Result[R].Finished := True;
+          Done[R] := True;
+          Continue;
+        end;
+        Result[R].Text := Result[R].Text + Chr(Best);
+        Contexts[R] := Contexts[R] + Chr(Best);
+        if Length(StopStrings) > 0 then
+        begin
+          StopLen := MatchStopStringSuffix(Result[R].Text, StopStrings);
+          if StopLen > 0 then
+          begin
+            SetLength(Result[R].Text, Length(Result[R].Text) - StopLen);
+            Result[R].Finished := True;
+            Done[R] := True;
+          end;
+        end;
+      end;
+      if not AnyRunning then Break;
+    end;
+  finally
+    for R := 0 to N - 1 do
+    begin
+      InVols[R].Free;
+      OutVols[R].Free;
+    end;
+  end;
+  for R := 0 to N - 1 do
+    Result[R].Score := Result[R].SumLogProb /
+      LengthPenaltyDenominator(Length(Result[R].Text), 0);
+end;
+
+// The "last hidden state" layer for contrastive search: the input to the final
+// projection / LM head. The last layer is the logit / probability layer; when
+// it is a SoftMax variant the logit-producing layer is the one before it. The
+// hidden state is the OUTPUT of the layer FEEDING that logit layer (the
+// representation the LM head reads). Falls back to GetLastLayer's PrevLayer
+// when the chain is too short to look further back.
+// Coded by Claude (AI).
+function ContrastiveHiddenLayer(NN: TNNet): TNNetLayer;
+var
+  Head: TNNetLayer;
+begin
+  Head := NN.GetLastLayer();
+  // Skip a trailing softmax: the LM head (logits) is its predecessor.
+  if (Head is TNNetPointwiseSoftMax) and Assigned(Head.PrevLayer) then
+    Head := Head.PrevLayer;
+  // Hidden state = the LM head's input representation.
+  if Assigned(Head.PrevLayer) then
+    Result := Head.PrevLayer
+  else
+    Result := Head;
+end;
+
+// Cosine similarity of two equal-length flat vectors (the per-token hidden
+// states). Zero magnitude on either side yields 0 (no penalty), keeping the
+// score finite for a dead representation.
+function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat;
+var
+  Denom: TNeuralFloat;
+begin
+  Denom := A.GetMagnitude() * B.GetMagnitude();
+  if Denom <= 0 then
+    Result := 0
+  else
+    Result := A.DotProduct(B) / Denom;
+end;
+
+function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; TopK: integer; PenaltyAlpha: TNeuralFloat;
+  const StopStrings: array of string): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  HiddenLayer: TNNetLayer;
+  Probs: array of TNeuralFloat;
+  Cand: array of integer;          // current top-k candidate token ids
+  Past: array of TNNetVolume;      // hidden states of already-processed tokens
+  CandHidden: TNNetVolume;         // snapshot of a candidate's hidden state
+  VocabSize, Step, I, J, NumCand, Best, StopLen, PastLen: integer;
+  Total, MaxSim, Sim, ScoreV, BestScore: TNeuralFloat;
+  Context, CandStr: string;
+  TmpI: integer;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  HiddenLayer := ContrastiveHiddenLayer(NN);
+  VocabSize := OutputVolume.Size;
+  SetLength(Probs, VocabSize);
+  if TopK < 1 then TopK := 1;
+  if TopK > VocabSize then TopK := VocabSize;
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  Past := nil;
+  PastLen := 0;
+  CandHidden := nil;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      // Forward the current context: probabilities for the next token AND the
+      // context's own last hidden state (seeds the past set on the first step).
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      for I := 0 to VocabSize - 1 do Probs[I] := OutputVolume.Raw[I] / Total;
+      // On the first step record the prompt's hidden state as the only past
+      // context (so step 1 already has something to penalise against).
+      if PastLen = 0 then
+      begin
+        SetLength(Past, 1);
+        Past[0] := TNNetVolume.Create();
+        Past[0].Copy(HiddenLayer.Output);
+        PastLen := 1;
+      end;
+      // Top-k candidates by probability (partial selection sort; k is tiny).
+      SetLength(Cand, VocabSize);
+      for I := 0 to VocabSize - 1 do Cand[I] := I;
+      NumCand := TopK;
+      for I := 0 to NumCand - 1 do
+      begin
+        Best := I;
+        for J := I + 1 to VocabSize - 1 do
+          if Probs[Cand[J]] > Probs[Cand[Best]] then Best := J;
+        TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
+      end;
+      SetLength(Cand, NumCand);
+      // Re-rank candidates by the contrastive objective. PenaltyAlpha=0 keeps
+      // (1-alpha)*p(v) only, so the highest-probability candidate (Cand[0])
+      // wins by construction -> exactly greedy argmax over the top-k (= plain
+      // greedy argmax, since the global argmax is always in the top-k set).
+      Best := Cand[0];
+      BestScore := -1e30;
+      for I := 0 to NumCand - 1 do
+      begin
+        MaxSim := 0;
+        if PenaltyAlpha > 0 then
+        begin
+          // Hidden state the model produces when candidate Cand[I] is appended.
+          CandStr := Context + Chr(Cand[I]);
+          InputVolume.OneHotEncodingReversed(CandStr);
+          NN.Compute(InputVolume, OutputVolume);
+          if CandHidden = nil then CandHidden := TNNetVolume.Create();
+          CandHidden.Copy(HiddenLayer.Output);
+          MaxSim := -1e30;
+          for J := 0 to PastLen - 1 do
+          begin
+            Sim := ContrastiveCosine(CandHidden, Past[J]);
+            if Sim > MaxSim then MaxSim := Sim;
+          end;
+        end;
+        ScoreV := (1 - PenaltyAlpha) * Probs[Cand[I]] - PenaltyAlpha * MaxSim;
+        if ScoreV > BestScore then
+        begin
+          BestScore := ScoreV;
+          Best := Cand[I];
+        end;
+      end;
+      Result.SumLogProb := Result.SumLogProb + SafeLogProb(Probs[Best]);
+      if Best = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      // Commit: append the token, and add ITS hidden state to the past set so
+      // future candidates are penalised against it too. Recompute the chosen
+      // continuation's hidden state (cheap, k is small; avoids stashing all k).
+      Result.Text := Result.Text + Chr(Best);
+      Context := Context + Chr(Best);
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      SetLength(Past, PastLen + 1);
+      Past[PastLen] := TNNetVolume.Create();
+      Past[PastLen].Copy(HiddenLayer.Output);
+      Inc(PastLen);
+      // Stop strings: terminate and trim, exactly like DecodeGreedy.
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+    if Assigned(CandHidden) then CandHidden.Free;
+    for I := 0 to PastLen - 1 do Past[I].Free;
+  end;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function DecodeContrastiveSearchStreamed(Session: TNNetStreamingDecoder;
+  var Tokens: TNeuralIntegerArray; PromptLen, MaxNewTokens, MaxTotalLen,
+  TopK: integer; PenaltyAlpha: TNeuralFloat;
+  const StopSequences: TNNetTokenSequences): integer;
+var
+  InV, Row: TNNetVolume;
+  Probs: array of TNeuralFloat;
+  Cand: array of integer;
+  Past: array of TNNetVolume;
+  CandHidden: TNNetVolume;
+  VocabSize, Pos, CapLen, I, J, NumCand, Best, PastLen, StopLen: integer;
+  Total, MaxSim, Sim, ScoreV, BestScore: TNeuralFloat;
+  TmpI: integer;
+begin
+  if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'DecodeContrastiveSearchStreamed: the session net must be a WIDTH-1 ' +
+      'twin (input SizeX=1); got SizeX=' +
+      IntToStr(Session.Net.GetFirstLayer().Output.SizeX) + '.');
+  if PromptLen < 1 then
+    raise EArgumentException.Create(
+      'DecodeContrastiveSearchStreamed: PromptLen must be >= 1.');
+  Row := Session.Output();
+  VocabSize := Row.Size;
+  SetLength(Probs, VocabSize);
+  if TopK < 1 then TopK := 1;
+  if TopK > VocabSize then TopK := VocabSize;
+  CapLen := Min(PromptLen + MaxNewTokens, MaxTotalLen);
+  if Length(Tokens) < CapLen then SetLength(Tokens, CapLen);
+  InV := TNNetVolume.Create(Session.Net.GetFirstLayer().Output);
+  Past := nil;
+  PastLen := 0;
+  CandHidden := nil;
+  try
+    InV.Fill(0);
+    Session.Reset();
+    // Prefill tokens 0..PromptLen-2 one at a time; the LAST prompt token is the
+    // first decode step's input. Record the prompt's running hidden states as
+    // the past-context set so step 1 already has something to penalise against
+    // (mirrors v1 seeding the prompt's hidden state).
+    for Pos := 0 to PromptLen - 2 do
+    begin
+      InV.FData[0] := Tokens[Pos];
+      Session.StepForward(InV, Pos);
+      if PenaltyAlpha > 0 then
+      begin
+        SetLength(Past, PastLen + 1);
+        Past[PastLen] := TNNetVolume.Create();
+        Past[PastLen].Copy(Session.HiddenState());
+        Inc(PastLen);
+      end;
+    end;
+    Pos := PromptLen;
+    while Pos < CapLen do
+    begin
+      // The committed forward of the previous token: its output row is the
+      // next-token distribution, its hidden state is the last context token's.
+      InV.FData[0] := Tokens[Pos - 1];
+      Session.StepForward(InV, Pos - 1);
+      if PenaltyAlpha > 0 then
+      begin
+        SetLength(Past, PastLen + 1);
+        Past[PastLen] := TNNetVolume.Create();
+        Past[PastLen].Copy(Session.HiddenState());
+        Inc(PastLen);
+      end;
+      Row := Session.Output();
+      Total := Row.GetSum();
+      if Total <= 0 then Total := 1.0;
+      for I := 0 to VocabSize - 1 do Probs[I] := Row.Raw[I] / Total;
+      // Top-k candidates by probability (partial selection sort; k is tiny).
+      SetLength(Cand, VocabSize);
+      for I := 0 to VocabSize - 1 do Cand[I] := I;
+      NumCand := TopK;
+      for I := 0 to NumCand - 1 do
+      begin
+        Best := I;
+        for J := I + 1 to VocabSize - 1 do
+          if Probs[Cand[J]] > Probs[Cand[Best]] then Best := J;
+        TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
+      end;
+      SetLength(Cand, NumCand);
+      // Re-rank by the contrastive objective. PenaltyAlpha=0 keeps
+      // (1-alpha)*p(v) only, so Cand[0] (the global argmax) wins by
+      // construction -> bit-for-bit the streamed greedy argmax.
+      Best := Cand[0];
+      BestScore := -1e30;
+      for I := 0 to NumCand - 1 do
+      begin
+        MaxSim := 0;
+        if PenaltyAlpha > 0 then
+        begin
+          // Fork/rollback: append the candidate's K/V (StepForward), read the
+          // resulting last-hidden-state, then truncate the cache back to the
+          // committed length. No re-encode, no extra commit forward.
+          InV.FData[0] := Cand[I];
+          Session.StepForward(InV, Pos);
+          if CandHidden = nil then CandHidden := TNNetVolume.Create();
+          CandHidden.Copy(Session.HiddenState());
+          Session.TruncateTo(Pos);
+          MaxSim := -1e30;
+          for J := 0 to PastLen - 1 do
+          begin
+            Sim := ContrastiveCosine(CandHidden, Past[J]);
+            if Sim > MaxSim then MaxSim := Sim;
+          end;
+        end;
+        ScoreV := (1 - PenaltyAlpha) * Probs[Cand[I]] - PenaltyAlpha * MaxSim;
+        if ScoreV > BestScore then
+        begin
+          BestScore := ScoreV;
+          Best := Cand[I];
+        end;
+      end;
+      Tokens[Pos] := Best;
+      Inc(Pos);
+      // Stop sequences: trim the matched generated tail (like the streamed
+      // greedy loop).
+      if Length(StopSequences) > 0 then
+      begin
+        StopLen := MatchStopSuffix(Tokens, Pos, PromptLen, StopSequences);
+        if StopLen > 0 then
+        begin
+          Pos := Pos - StopLen;
+          Break;
+        end;
+      end;
+      if TokenIsEOS(Best, nil) then Break;
+    end;
+    Result := Pos;
+  finally
+    InV.Free;
+    if Assigned(CandHidden) then CandHidden.Free;
+    for I := 0 to PastLen - 1 do Past[I].Free;
+  end;
+end;
+
+// Resolves the LM-head start index for the DoLa / logit-lens splice: when
+// HeadStartIdx < 0 it is the LAST trainable layer (Neurons.Count > 0), the same
+// heuristic TNNet.LogitLensReport uses; clamped to [1, LastLayer] so there is
+// always an input slot below the head. Coded by Claude (AI).
+function ResolveHeadStartIdx(NN: TNNet; HeadStartIdx: integer): integer;
+var
+  LayerIdx, LastLayer, LastTrainable: integer;
+begin
+  LastLayer := NN.GetLastLayerIdx();
+  if HeadStartIdx < 0 then
+  begin
+    LastTrainable := -1;
+    for LayerIdx := 0 to LastLayer do
+      if NN.Layers[LayerIdx].Neurons.Count > 0 then
+        LastTrainable := LayerIdx;
+    if LastTrainable <= 0 then
+      Result := LastLayer
+    else
+      Result := LastTrainable;
+  end
+  else
+    Result := HeadStartIdx;
+  if Result < 1 then Result := 1;
+  if Result > LastLayer then Result := LastLayer;
+end;
+
+function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
+  MaxLen: integer; out Stats: TNNetEarlyExitStats;
+  const StopStrings: array of string;
+  ExitLayer: integer; Confidence: TNeuralFloat;
+  HeadStartIdx: integer): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume, ExitSnap: TNNetVolume;
+  VocabSize, Step, I, HeadIdx, HeadInIdx, LastLayer, ResolvedExit: integer;
+  FullBest, ExitBest, StopLen: integer;
+  Total, MaxFinal, MaxExit, Pf: TNeuralFloat;
+  Context: string;
+  Confident: boolean;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  ExitSnap := TNNetVolume.Create();
+  VocabSize := OutputVolume.Size;
+  LastLayer := NN.GetLastLayerIdx();
+  HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
+  HeadInIdx := HeadIdx - 1;
+  // Resolve the intermediate exit layer. It must sit BELOW the head input so
+  // its activation can be spliced through the LM head. Auto = midpoint.
+  if ExitLayer < 0 then
+    ResolvedExit := HeadInIdx div 2
+  else
+    ResolvedExit := ExitLayer;
+  if ResolvedExit < 1 then ResolvedExit := 1;
+  if ResolvedExit > HeadInIdx then ResolvedExit := HeadInIdx;
+  // The splice only works when the exit layer's activation is shape-compatible
+  // with the head-input slot. If not, drafting is impossible -> pure greedy.
+  if NN.Layers[ResolvedExit].Output.Size <> NN.Layers[HeadInIdx].Output.Size then
+    Confidence := 2.0;  // disables the draft path; output stays bit-identical.
+
+  Stats.Steps := 0;
+  Stats.DraftProposals := 0;
+  Stats.Accepted := 0;
+  Stats.Rejected := 0;
+  Stats.AcceptanceRate := 0;
+
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      // (1) Full-depth forward -> p_final and its argmax (the verifier).
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      FullBest := 0;
+      MaxFinal := OutputVolume.Raw[0];
+      for I := 1 to VocabSize - 1 do
+        if OutputVolume.Raw[I] > MaxFinal then
+        begin
+          MaxFinal := OutputVolume.Raw[I];
+          FullBest := I;
+        end;
+      MaxFinal := MaxFinal / Total;
+      if MaxFinal < 0 then MaxFinal := 0;
+
+      // (2) Early-exit DRAFT via the frozen-body splice: copy the intermediate
+      //     layer's activation (already computed by the full forward above) into
+      //     the head-input slot and recompute ONLY the head sub-stack -> p_exit.
+      //     Only consulted when ExitLayer is strictly below the head input.
+      if (Confidence <= 1.0) and (ResolvedExit < HeadInIdx) then
+      begin
+        ExitSnap.Copy(NN.Layers[ResolvedExit].Output);
+        NN.Layers[HeadInIdx].Output.CopyNoChecks(ExitSnap);
+        for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
+        Total := NN.GetLastLayer().Output.GetSum();
+        if Total <= 0 then Total := 1.0;
+        ExitBest := 0;
+        MaxExit := NN.GetLastLayer().Output.Raw[0];
+        for I := 1 to VocabSize - 1 do
+          if NN.GetLastLayer().Output.Raw[I] > MaxExit then
+          begin
+            MaxExit := NN.GetLastLayer().Output.Raw[I];
+            ExitBest := I;
+          end;
+        MaxExit := MaxExit / Total;
+        if MaxExit < 0 then MaxExit := 0;
+
+        // (3) Static-gate accept/verify (LayerSkip/CALM): the draft is PROPOSED
+        //     only when the early exit is confident; it is ACCEPTED iff it
+        //     matches the full-depth argmax (exact-greedy verify).
+        Confident := MaxExit >= Confidence;
+        if Confident then
+        begin
+          Inc(Stats.DraftProposals);
+          if ExitBest = FullBest then Inc(Stats.Accepted)
+          else Inc(Stats.Rejected);
+        end;
+      end;
+
+      // The EMITTED token is ALWAYS the full-depth argmax -> bit-identical to
+      // DecodeGreedy. The draft above only moved the accept/reject counters.
+      Pf := MaxFinal;
+      Result.SumLogProb := Result.SumLogProb + SafeLogProb(Pf);
+      Inc(Stats.Steps);
+
+      if FullBest = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      Result.Text := Result.Text + Chr(FullBest);
+      Context := Context + Chr(FullBest);
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+    ExitSnap.Free;
+  end;
+  if Stats.DraftProposals > 0 then
+    Stats.AcceptanceRate := Stats.Accepted / Stats.DraftProposals;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
+  MaxLen: integer;
+  ExitLayer: integer; Confidence: TNeuralFloat;
+  HeadStartIdx: integer): TNNetDecodeResult;
+var
+  Stats: TNNetEarlyExitStats;
+  NoStops: array of string;
+begin
+  SetLength(NoStops, 0);
+  Result := DecodeEarlyExitSelfSpeculative(NN, Prompt, MaxLen, Stats, NoStops,
+    ExitLayer, Confidence, HeadStartIdx);
+end;
+
+// Builds the DoLa candidate-layer bucket: every layer 0..HeadInIdx-1 whose
+// Output.Size equals the head-input size (so its activation can be spliced into
+// the head-input slot and pushed through the SAME LM head). HeadInIdx itself is
+// EXCLUDED - contrasting a layer against its own forward is a no-op.
+// Mode selects the paper's dynamic premature-layer pool over those (already
+// depth-ordered) candidates: dlbFull keeps all, dlbLow the shallow half
+// (index < count div 2), dlbHigh the deep half (index >= count div 2).
+// Coded by Claude (AI).
+procedure BuildDoLaCandidateBucket(NN: TNNet; HeadInIdx: integer;
+  Mode: TDoLaLayerBucket; var Bucket: TNeuralIntegerArray);
+var
+  LayerIdx, HeadInSize, N, Total, Half, Lo, Hi, W: integer;
+begin
+  HeadInSize := NN.Layers[HeadInIdx].Output.Size;
+  N := 0;
+  SetLength(Bucket, HeadInIdx);
+  for LayerIdx := 0 to HeadInIdx - 1 do
+    if NN.Layers[LayerIdx].Output.Size = HeadInSize then
+    begin
+      Bucket[N] := LayerIdx;
+      Inc(N);
+    end;
+  SetLength(Bucket, N);
+  if Mode = dlbFull then Exit;
+  // Split the depth-ordered candidates at the midpoint and keep one half.
+  Total := N;
+  Half := Total div 2;
+  case Mode of
+    dlbLow:  begin Lo := 0;    Hi := Half - 1; end;
+    dlbHigh: begin Lo := Half; Hi := Total - 1; end;
+  else
+    begin Lo := 0; Hi := Total - 1; end;
+  end;
+  W := 0;
+  for LayerIdx := Lo to Hi do
+  begin
+    Bucket[W] := Bucket[LayerIdx];
+    Inc(W);
+  end;
+  SetLength(Bucket, W);
+end;
+
+function DecodeDoLa(NN: TNNet; const Prompt: string;
+  MaxLen: integer; Alpha: TNeuralFloat;
+  const StopStrings: array of string;
+  HeadStartIdx: integer): TNNetDecodeResult;
+begin
+  Result := DecodeDoLa(NN, Prompt, MaxLen, Alpha, StopStrings, dlbFull,
+    HeadStartIdx);
+end;
+
+function DecodeDoLa(NN: TNNet; const Prompt: string;
+  MaxLen: integer; Alpha: TNeuralFloat;
+  const StopStrings: array of string;
+  Bucket: TDoLaLayerBucket;
+  HeadStartIdx: integer): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  CandSnap: TNNetVolume;
+  PFinal, PLens, MFinalLens: array of TNeuralFloat;  // distributions + 0.5(p+q)
+  Cands: TNeuralIntegerArray;
+  VocabSize, Step, I, C, L, HeadIdx, HeadInIdx, LastLayer: integer;
+  NumCand, BestLayer, Best, StopLen: integer;
+  Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, Pm, ScoreV, BestScore: TNeuralFloat;
+  Context: string;
+  HaveContrast: boolean;
+const
+  cEps = 1e-12;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  CandSnap := TNNetVolume.Create();
+  VocabSize := OutputVolume.Size;
+  SetLength(PFinal, VocabSize);
+  SetLength(PLens, VocabSize);
+  SetLength(MFinalLens, VocabSize);
+  LastLayer := NN.GetLastLayerIdx();
+  HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
+  HeadInIdx := HeadIdx - 1;
+  BuildDoLaCandidateBucket(NN, HeadInIdx, Bucket, Cands);
+  NumCand := Length(Cands);
+  // The contrast path is active only when Alpha > 0 AND the bucket is non-empty.
+  // Otherwise this MUST reproduce plain greedy argmax bit-for-bit, so we take
+  // EXACTLY the DecodeGreedy step (argmax over the raw softmax row).
+  HaveContrast := (Alpha > 0) and (NumCand > 0);
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      // (1) Full forward -> the mature distribution p_final (re-normalised
+      //     defensively, same convention as NextLogProbs / contrastive search).
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      MaxFinal := 0;
+      for I := 0 to VocabSize - 1 do
+      begin
+        Pf := OutputVolume.Raw[I] / Total;
+        if Pf < 0 then Pf := 0;
+        PFinal[I] := Pf;
+        if Pf > MaxFinal then MaxFinal := Pf;
+      end;
+
+      if not HaveContrast then
+      begin
+        // Greedy argmax over p_final == DecodeGreedy's step (the raw softmax row
+        // is monotone in p_final, so this is bit-identical).
+        Best := 0;
+        for I := 1 to VocabSize - 1 do
+          if PFinal[I] > PFinal[Best] then Best := I;
+        Result.SumLogProb := Result.SumLogProb + SafeLogProb(PFinal[Best]);
+      end
+      else
+      begin
+        // (2)+(3) Pick the premature layer with MAX Jensen-Shannon divergence
+        //         from p_final. The candidate activation already lives in the
+        //         net after the full forward above (no extra forward needed);
+        //         snapshot it, splice into the head-input slot, recompute the
+        //         head sub-stack, read p_premature.
+        BestLayer := Cands[0];
+        BestJS := -1.0;
+        for C := 0 to NumCand - 1 do
+        begin
+          L := Cands[C];
+          CandSnap.Copy(NN.Layers[L].Output);
+          NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
+          for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
+          Total := NN.GetLastLayer().Output.GetSum();
+          if Total <= 0 then Total := 1.0;
+          // JS(p_final || p_lens) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q).
+          JS := 0;
+          for I := 0 to VocabSize - 1 do
+          begin
+            Pl := NN.GetLastLayer().Output.Raw[I] / Total;
+            if Pl < 0 then Pl := 0;
+            PLens[I] := Pl;
+            MFinalLens[I] := 0.5 * (PFinal[I] + Pl);
+          end;
+          for I := 0 to VocabSize - 1 do
+          begin
+            Pm := MFinalLens[I];
+            if Pm < cEps then Continue;
+            Pf := PFinal[I];
+            if Pf >= cEps then JS := JS + 0.5 * Pf * Ln(Pf / Pm);
+            Pl := PLens[I];
+            if Pl >= cEps then JS := JS + 0.5 * Pl * Ln(Pl / Pm);
+          end;
+          if JS > BestJS then
+          begin
+            BestJS := JS;
+            BestLayer := L;
+          end;
+        end;
+        // Recompute the chosen premature layer's distribution into PLens.
+        CandSnap.Copy(NN.Layers[BestLayer].Output);
+        NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
+        for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
+        Total := NN.GetLastLayer().Output.GetSum();
+        if Total <= 0 then Total := 1.0;
+        for I := 0 to VocabSize - 1 do
+        begin
+          Pl := NN.GetLastLayer().Output.Raw[I] / Total;
+          if Pl < 0 then Pl := 0;
+          PLens[I] := Pl;
+        end;
+        // (4) Adaptive plausibility constraint: keep only tokens at/above
+        //     Alpha * max(p_final); argmax the contrast score over that set.
+        Threshold := Alpha * MaxFinal;
+        Best := -1;
+        BestScore := -1e30;
+        for I := 0 to VocabSize - 1 do
+          if PFinal[I] >= Threshold then
+          begin
+            ScoreV := SafeLogProb(PFinal[I]) - SafeLogProb(PLens[I]);
+            if (Best < 0) or (ScoreV > BestScore) then
+            begin
+              BestScore := ScoreV;
+              Best := I;
+            end;
+          end;
+        if Best < 0 then  // degenerate empty head set: fall back to final argmax
+        begin
+          Best := 0;
+          for I := 1 to VocabSize - 1 do
+            if PFinal[I] > PFinal[Best] then Best := I;
+        end;
+        Result.SumLogProb := Result.SumLogProb + SafeLogProb(PFinal[Best]);
+      end;
+
+      if Best = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      Result.Text := Result.Text + Chr(Best);
+      Context := Context + Chr(Best);
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+    CandSnap.Free;
+  end;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function DecodeSampled(NN: TNNet; const Prompt: string; MaxLen: integer;
+  Sampler: TNNetSamplerBase;
+  const StopStrings: array of string): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  VocabSize, Step, I, Best, StopLen: integer;
+  Total, Pf: TNeuralFloat;
+  Context: string;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  VocabSize := OutputVolume.Size;
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  try
+    for Step := 1 to MaxLen do
+    begin
+      InputVolume.OneHotEncodingReversed(Context);
+      NN.Compute(InputVolume, OutputVolume);
+      if Assigned(Sampler) then
+        Best := Sampler.GetToken(OutputVolume)
+      else
+      begin
+        Best := 0;
+        for I := 1 to VocabSize - 1 do
+          if OutputVolume.Raw[I] > OutputVolume.Raw[Best] then Best := I;
+      end;
+      if (Best < 0) or (Best >= VocabSize) then Best := 0;
+      // Log-prob of the chosen token (re-normalised row, same convention as
+      // NextLogProbs) so completions are directly rerankable.
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      Pf := OutputVolume.Raw[Best] / Total;
+      Result.SumLogProb := Result.SumLogProb + SafeLogProb(Pf);
+      if Best = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      Result.Text := Result.Text + Chr(Best);
+      Context := Context + Chr(Best);
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+  end;
+  Result.Score := Result.SumLogProb /
+    LengthPenaltyDenominator(Length(Result.Text), 0);
+end;
+
+function SampleNCompletions(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; LengthPenalty: TNeuralFloat;
+  const StopStrings: array of string;
+  Scorer: TNNetSequenceScorer): TNNetDecodeResultArray;
+var
+  I: integer;
+begin
+  if N < 1 then N := 1;
+  SetLength(Result, N);
+  for I := 0 to N - 1 do
+  begin
+    Result[I] := DecodeSampled(NN, Prompt, MaxLen, Sampler, StopStrings);
+    if Assigned(Scorer) then
+      Result[I].Score := Scorer(Prompt, Result[I].Text)
+    else
+      Result[I].Score := Result[I].SumLogProb /
+        LengthPenaltyDenominator(Length(Result[I].Text), LengthPenalty);
+  end;
+end;
+
+function DecodeBestOfN(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; LengthPenalty: TNeuralFloat;
+  const StopStrings: array of string;
+  Scorer: TNNetSequenceScorer): TNNetDecodeResult;
+var
+  Cands: TNNetDecodeResultArray;
+  I, Best: integer;
+begin
+  Cands := SampleNCompletions(NN, Prompt, MaxLen, N, Sampler, LengthPenalty,
+    StopStrings, Scorer);
+  Best := 0;
+  for I := 1 to High(Cands) do
+    if Cands[I].Score > Cands[Best].Score then Best := I; // ties keep first
+  Result := Cands[Best];
+end;
+
+function DecodeSelfConsistency(NN: TNNet; const Prompt: string; MaxLen, N: integer;
+  Sampler: TNNetSamplerBase; Extract: TNNetAnswerExtractor;
+  const StopStrings: array of string): string;
+var
+  Cands: TNNetDecodeResultArray;
+  Answers: array of string;
+  Counts: array of integer;
+  I, J, NumDistinct, Best: integer;
+  Ans: string;
+  Found: boolean;
+begin
+  if N < 1 then N := 1;
+  Cands := SampleNCompletions(NN, Prompt, MaxLen, N, Sampler, 0.0,
+    StopStrings, nil);
+  // Tally extracted answers in FIRST-SEEN order so ties resolve toward the
+  // earliest-drawn modal answer.
+  SetLength(Answers, 0);
+  SetLength(Counts, 0);
+  NumDistinct := 0;
+  for I := 0 to High(Cands) do
+  begin
+    if Assigned(Extract) then Ans := Extract(Cands[I].Text)
+    else Ans := Cands[I].Text;
+    if Ans = '' then Continue;          // unparseable: ignore in the vote
+    Found := False;
+    for J := 0 to NumDistinct - 1 do
+      if Answers[J] = Ans then
+      begin
+        Inc(Counts[J]);
+        Found := True;
+        Break;
+      end;
+    if not Found then
+    begin
+      SetLength(Answers, NumDistinct + 1);
+      SetLength(Counts, NumDistinct + 1);
+      Answers[NumDistinct] := Ans;
+      Counts[NumDistinct] := 1;
+      Inc(NumDistinct);
+    end;
+  end;
+  if NumDistinct = 0 then
+  begin
+    Result := '';
+    Exit;
+  end;
+  Best := 0;
+  for J := 1 to NumDistinct - 1 do
+    if Counts[J] > Counts[Best] then Best := J; // strict > keeps first-seen tie
+  Result := Answers[Best];
+end;
+
+// Prompt-lookup draft: find the NumDraft characters that follow the MOST RECENT
+// EARLIER occurrence of the last MatchLen characters of Context. Returns '' when
+// there is no such earlier occurrence (degrade-to-greedy). The suffix itself
+// (the final MatchLen characters) is excluded as a match site so the draft is
+// always copied from STRICTLY earlier in the string.
+function PromptLookupDraft(const Context: string;
+  MatchLen, NumDraft: integer): string;
+var
+  CtxLen, P, FollowLen: integer;
+  Suffix: string;
+begin
+  Result := '';
+  CtxLen := Length(Context);
+  if (MatchLen < 1) or (NumDraft < 1) or (CtxLen < MatchLen + 1) then Exit;
+  Suffix := Copy(Context, CtxLen - MatchLen + 1, MatchLen);
+  // Scan candidate start positions from the most recent earlier one backwards;
+  // a match at start position P occupies Context[P .. P+MatchLen-1]. The most
+  // recent earlier occurrence has the largest P with P+MatchLen-1 < CtxLen, i.e.
+  // P <= CtxLen - MatchLen, EXCLUDING P = CtxLen - MatchLen + 1 (the suffix).
+  for P := CtxLen - MatchLen downto 1 do
+    if Copy(Context, P, MatchLen) = Suffix then
+    begin
+      FollowLen := CtxLen - (P + MatchLen) + 1; // chars available after match
+      if FollowLen > NumDraft then FollowLen := NumDraft;
+      if FollowLen >= 1 then
+        Result := Copy(Context, P + MatchLen, FollowLen);
+      Exit; // most-recent occurrence wins
+    end;
+end;
+
+function DecodePromptLookup(NN: TNNet; const Prompt: string;
+  MaxLen: integer; MatchLen: integer; NumDraft: integer;
+  const StopStrings: array of string): TNNetDecodeResult;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  LogProbs: array of TNeuralFloat;
+  VocabSize, Step, I, Best, StopLen, D: integer;
+  Context, Draft: string;
+begin
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  VocabSize := OutputVolume.Size;
+  SetLength(LogProbs, VocabSize);
+  Result.Text := '';
+  Result.SumLogProb := 0;
+  Result.Finished := False;
+  Context := Prompt;
+  if MatchLen < 1 then MatchLen := 1;
+  if NumDraft < 1 then NumDraft := 1;
+  try
+    Step := 0;
+    while Step < MaxLen do
+    begin
+      // One forward pass over the current context -> next-token greedy argmax.
+      NextLogProbs(NN, Context, InputVolume, OutputVolume, LogProbs);
+      Best := 0;
+      for I := 1 to VocabSize - 1 do
+        if LogProbs[I] > LogProbs[Best] then Best := I;
+      Result.SumLogProb := Result.SumLogProb + LogProbs[Best];
+      Inc(Step);
+      if Best = csDecodeEOSToken then
+      begin
+        Result.Finished := True;
+        Break;
+      end;
+      Result.Text := Result.Text + Chr(Best);
+      Context := Context + Chr(Best);
+      // Stop-string check on the freshly emitted greedy token (identical policy
+      // to DecodeGreedy: trim and finish).
+      if Length(StopStrings) > 0 then
+      begin
+        StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+        if StopLen > 0 then
+        begin
+          SetLength(Result.Text, Length(Result.Text) - StopLen);
+          Result.Finished := True;
+          Break;
+        end;
+      end;
+
+      // SPECULATIVE VERIFY of a prompt-lookup draft. The draft characters that
+      // follow the most-recent earlier occurrence of the current suffix are
+      // verified one prefix at a time; each is accepted only if it equals the
+      // model's greedy argmax at that position (bit-identical to greedy).
+      Draft := PromptLookupDraft(Context, MatchLen, NumDraft);
+      D := 1;
+      while (D <= Length(Draft)) and (Step < MaxLen) and
+        (not Result.Finished) do
+      begin
+        NextLogProbs(NN, Context, InputVolume, OutputVolume, LogProbs);
+        Best := 0;
+        for I := 1 to VocabSize - 1 do
+          if LogProbs[I] > LogProbs[Best] then Best := I;
+        // Reject as soon as the model disagrees with the draft (or EOS).
+        if (Best = csDecodeEOSToken) or (Best <> Ord(Draft[D])) then
+        begin
+          // The model's argmax here is the next emitted token; fall back to the
+          // outer greedy loop, which will recompute exactly this same argmax on
+          // its next iteration over the unchanged Context.
+          Break;
+        end;
+        // Accept: identical to the greedy argmax, so emit it.
+        Result.SumLogProb := Result.SumLogProb + LogProbs[Best];
+        Inc(Step);
+        Result.Text := Result.Text + Chr(Best);
+        Context := Context + Chr(Best);
+        if Length(StopStrings) > 0 then
+        begin
+          StopLen := MatchStopStringSuffix(Result.Text, StopStrings);
+          if StopLen > 0 then
+          begin
+            SetLength(Result.Text, Length(Result.Text) - StopLen);
+            Result.Finished := True;
+            Break;
+          end;
+        end;
+        Inc(D);
+      end;
+      if Result.Finished then Break;
     end;
   finally
     InputVolume.Free;
@@ -2584,6 +6582,689 @@ var
   All: TNNetDecodeResultArray;
 begin
   All := DecodeBeamSearchAll(NN, Prompt, MaxLen, BeamWidth, LengthPenalty);
+  if Length(All) > 0 then
+    Result := All[0]
+  else
+  begin
+    Result.Text := '';
+    Result.SumLogProb := 0;
+    Result.Score := 0;
+    Result.Finished := False;
+  end;
+end;
+
+type
+  // Cache-forking beam. Snap holds the KV-cache state JUST BEFORE LastToken is
+  // stepped (i.e. through absolute position LastPos-1); a step Restores Snap,
+  // StepForwards LastToken at LastPos and reads the next-token distribution.
+  TCachedBeam = record
+    Text: string;
+    SumLogProb: TNeuralFloat;
+    Score: TNeuralFloat;
+    Finished: boolean;
+    Snap: TNNetDecoderSessionSnapshot; // owned (nil for finished beams)
+    LastToken: integer;                // char code stepped to read this beam's dist
+    LastPos: integer;                  // absolute position of LastToken
+  end;
+  TCachedBeamArray = array of TCachedBeam;
+  TCachedCandidate = record
+    Text: string;
+    SumLogProb: TNeuralFloat;
+    Score: TNeuralFloat;
+    ParentIdx: integer; // index into the BaseAfter array (cache through LastPos)
+    LastToken: integer; // the new char this candidate appends (its future input)
+    LastPos: integer;   // absolute position of LastToken
+  end;
+  TCachedCandidateArray = array of TCachedCandidate;
+
+// Insertion sort cached candidates in DESCENDING Score (B is tiny).
+procedure SortCachedCandidates(var C: TCachedCandidateArray);
+var
+  I, J: integer;
+  Tmp: TCachedCandidate;
+begin
+  for I := 1 to High(C) do
+  begin
+    Tmp := C[I];
+    J := I - 1;
+    while (J >= 0) and (C[J].Score < Tmp.Score) do
+    begin
+      C[J + 1] := C[J];
+      Dec(J);
+    end;
+    C[J + 1] := Tmp;
+  end;
+end;
+
+function DecodeBeamSearchCachedAll(Session: TNNetStreamingDecoder;
+  const Prompt: string; MaxLen: integer; BeamWidth: integer;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+var
+  InV, Row: TNNetVolume;
+  LogProbs: array of TNeuralFloat;
+  VocabSize, PromptLen, Step, I, T, B, Pos: integer;
+  Live: TCachedBeamArray;      // still-growing beams (each owns a Snap)
+  Finished: TBeamArray;        // finished beams (Score-ranked, cache-free)
+  Cand: TCachedCandidateArray; // expansion candidates for this step
+  BaseAfter: array of TNNetDecoderSessionSnapshot; // per-live-beam cache through LastPos
+  NewC: TCachedCandidate;
+  FinB: TBeam;
+  NewLive: TCachedBeamArray;
+  CutScore, Total: TNeuralFloat;
+  AllDominated: boolean;
+  FinSurvivors: TBeamArray;
+
+  procedure FreeLiveSnaps;
+  var k: integer;
+  begin
+    for k := 0 to High(Live) do
+      if Live[k].Snap <> nil then
+      begin
+        Live[k].Snap.Free;
+        Live[k].Snap := nil;
+      end;
+  end;
+
+  procedure FreeBaseAfter;
+  var k: integer;
+  begin
+    for k := 0 to High(BaseAfter) do
+      if BaseAfter[k] <> nil then
+      begin
+        BaseAfter[k].Free;
+        BaseAfter[k] := nil;
+      end;
+    SetLength(BaseAfter, 0);
+  end;
+
+begin
+  if BeamWidth < 1 then BeamWidth := 1;
+  if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'DecodeBeamSearchCachedAll: the session net must be a WIDTH-1 twin ' +
+      '(input SizeX=1); got SizeX=' +
+      IntToStr(Session.Net.GetFirstLayer().Output.SizeX) + '.');
+  PromptLen := Length(Prompt);
+  if PromptLen < 1 then
+    raise EArgumentException.Create(
+      'DecodeBeamSearchCachedAll: Prompt must be non-empty (>= 1 char).');
+
+  Row := Session.Output();
+  VocabSize := Row.Size;
+  SetLength(LogProbs, VocabSize);
+  InV := TNNetVolume.Create(Session.Net.GetFirstLayer().Output);
+  BaseAfter := nil;
+  try
+    InV.Fill(0);
+    Session.Reset();
+    // Prefill the prompt EXCEPT its last char (positions 0..PromptLen-2). The
+    // last prompt char is the first decode step's input; its Output row is the
+    // first-token distribution - exactly NextLogProbs(NN, Prompt, ..).
+    for Pos := 0 to PromptLen - 2 do
+    begin
+      InV.FData[0] := Ord(Prompt[Pos + 1]); // Pascal strings are 1-based
+      Session.StepForward(InV, Pos);
+    end;
+    // The single initial live beam: its cache is "through PromptLen-2" (the
+    // current session state), its first step is the last prompt char.
+    SetLength(Live, 1);
+    Live[0].Text := '';
+    Live[0].SumLogProb := 0;
+    Live[0].Score := 0;
+    Live[0].Finished := False;
+    Live[0].Snap := Session.Snapshot();
+    Live[0].LastToken := Ord(Prompt[PromptLen]);
+    Live[0].LastPos := PromptLen - 1;
+    SetLength(Finished, 0);
+
+    for Step := 1 to MaxLen do
+    begin
+      if Length(Live) = 0 then Break;
+
+      // (d) Early stop: identical admissible-bound prune to DecodeBeamSearchAll.
+      if Length(Finished) >= BeamWidth then
+      begin
+        SortBeamsByScore(Finished);
+        CutScore := Finished[BeamWidth - 1].Score;
+        AllDominated := True;
+        for I := 0 to High(Live) do
+          if Live[I].Score > CutScore then AllDominated := False;
+        if AllDominated then
+        begin
+          FreeLiveSnaps;
+          Break;
+        end;
+      end;
+
+      // Expand every live beam by every vocabulary token, using its forked
+      // cache instead of re-encoding the prefix.
+      SetLength(Cand, 0);
+      SetLength(BaseAfter, Length(Live));
+      for B := 0 to High(Live) do BaseAfter[B] := nil;
+      for B := 0 to High(Live) do
+      begin
+        // Restore this beam's cache, step its last token, read the next-token
+        // distribution. The cache now holds through LastPos.
+        Session.RestoreSnapshot(Live[B].Snap);
+        InV.FData[0] := Live[B].LastToken;
+        Session.StepForward(InV, Live[B].LastPos);
+        Row := Session.Output();
+        Total := Row.GetSum();
+        if Total <= 0 then Total := 1.0;
+        for I := 0 to VocabSize - 1 do
+          LogProbs[I] := SafeLogProb(Row.Raw[I] / Total);
+        // Snapshot the cache-through-LastPos once: it is the shared base for
+        // every child of this beam (whose next input sits at LastPos+1).
+        BaseAfter[B] := Session.Snapshot();
+        for T := 0 to VocabSize - 1 do
+        begin
+          if T = csDecodeEOSToken then
+          begin
+            FinB.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+            FinB.Text := Live[B].Text;
+            FinB.Finished := True;
+            FinB.Score := FinB.SumLogProb /
+              LengthPenaltyDenominator(Length(FinB.Text), LengthPenalty);
+            SetLength(Finished, Length(Finished) + 1);
+            Finished[High(Finished)] := FinB;
+          end
+          else
+          begin
+            NewC.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+            NewC.Text := Live[B].Text + Chr(T);
+            NewC.Score := NewC.SumLogProb /
+              LengthPenaltyDenominator(Length(NewC.Text), LengthPenalty);
+            NewC.ParentIdx := B;
+            NewC.LastToken := T;             // future input char
+            NewC.LastPos := Live[B].LastPos + 1;
+            SetLength(Cand, Length(Cand) + 1);
+            Cand[High(Cand)] := NewC;
+          end;
+        end;
+      end;
+
+      // Re-prune survivors to the top BeamWidth by length-penalised score
+      // (same ordering as DecodeBeamSearchAll).
+      SortCachedCandidates(Cand);
+      if Length(Cand) > BeamWidth then SetLength(Cand, BeamWidth);
+
+      // Build the next live set. Each survivor gets an INDEPENDENT clone of its
+      // parent's BaseAfter cache (Restore then Snapshot makes a fresh deep
+      // copy), so per-beam forks never alias.
+      SetLength(NewLive, Length(Cand));
+      for I := 0 to High(Cand) do
+      begin
+        NewLive[I].Text := Cand[I].Text;
+        NewLive[I].SumLogProb := Cand[I].SumLogProb;
+        NewLive[I].Score := Cand[I].Score;
+        NewLive[I].Finished := False;
+        NewLive[I].LastToken := Cand[I].LastToken;
+        NewLive[I].LastPos := Cand[I].LastPos;
+        Session.RestoreSnapshot(BaseAfter[Cand[I].ParentIdx]);
+        NewLive[I].Snap := Session.Snapshot();
+      end;
+      FreeLiveSnaps;   // release the parents' caches
+      FreeBaseAfter;   // release the per-parent base caches
+      Live := NewLive;
+      NewLive := nil;
+    end;
+
+    // Merge any remaining live beams into the finished pool (MaxLen reached),
+    // dropping their (now unneeded) caches.
+    SetLength(FinSurvivors, Length(Live));
+    for B := 0 to High(Live) do
+    begin
+      FinSurvivors[B].Text := Live[B].Text;
+      FinSurvivors[B].SumLogProb := Live[B].SumLogProb;
+      FinSurvivors[B].Score := Live[B].Score;
+      FinSurvivors[B].Finished := Live[B].Finished;
+    end;
+    FreeLiveSnaps;
+    for B := 0 to High(FinSurvivors) do
+    begin
+      SetLength(Finished, Length(Finished) + 1);
+      Finished[High(Finished)] := FinSurvivors[B];
+    end;
+
+    SortBeamsByScore(Finished);
+    SetLength(Result, Length(Finished));
+    for I := 0 to High(Finished) do
+    begin
+      Result[I].Text := Finished[I].Text;
+      Result[I].SumLogProb := Finished[I].SumLogProb;
+      Result[I].Score := Finished[I].Score;
+      Result[I].Finished := Finished[I].Finished;
+    end;
+  finally
+    FreeLiveSnaps;
+    FreeBaseAfter;
+    InV.Free;
+  end;
+end;
+
+function DecodeBeamSearchCached(Session: TNNetStreamingDecoder;
+  const Prompt: string; MaxLen: integer; BeamWidth: integer;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+var
+  All: TNNetDecodeResultArray;
+begin
+  All := DecodeBeamSearchCachedAll(Session, Prompt, MaxLen, BeamWidth,
+    LengthPenalty);
+  if Length(All) > 0 then
+    Result := All[0]
+  else
+  begin
+    Result.Text := '';
+    Result.SumLogProb := 0;
+    Result.Score := 0;
+    Result.Finished := False;
+  end;
+end;
+
+function DecodeDiverseBeamSearchAll(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer; NumGroups: integer;
+  Diversity: TNeuralFloat;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  LogProbs: array of TNeuralFloat;
+  TokenTaken: array of integer;   // per-token collision count, this step
+  VocabSize, Step, I, T, B, GroupSize, G, GroupLo, GroupHi: integer;
+  Live: TBeamArray;      // still-growing beams, contiguous by group
+  NewLive: TBeamArray;   // frontier being assembled this step
+  Finished: TBeamArray;  // beams that emitted EOS
+  Cand: TBeamArray;      // expansion candidates for the CURRENT group
+  NewBeam: TBeam;
+  Pen: TNeuralFloat;
+begin
+  if BeamWidth < 1 then BeamWidth := 1;
+  if NumGroups < 1 then NumGroups := 1;
+  if NumGroups > BeamWidth then NumGroups := BeamWidth;
+  // Single group with no diversity penalty is ordinary beam search; delegate so
+  // the degenerate case is BIT-FOR-BIT DecodeBeamSearchAll (incl. early-stop).
+  if (NumGroups = 1) and (Diversity = 0) then
+  begin
+    Result := DecodeBeamSearchAll(NN, Prompt, MaxLen, BeamWidth, LengthPenalty);
+    Exit;
+  end;
+  GroupSize := BeamWidth div NumGroups;
+  if GroupSize < 1 then GroupSize := 1;
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  VocabSize := OutputVolume.Size;
+  SetLength(LogProbs, VocabSize);
+  SetLength(TokenTaken, VocabSize);
+  try
+    SetLength(Live, 1);
+    Live[0].Text := '';
+    Live[0].SumLogProb := 0;
+    Live[0].Score := 0;
+    Live[0].Finished := False;
+    SetLength(Finished, 0);
+
+    for Step := 1 to MaxLen do
+    begin
+      if Length(Live) = 0 then Break;
+      for T := 0 to VocabSize - 1 do TokenTaken[T] := 0;
+      SetLength(NewLive, 0);
+
+      // Expand group-by-group; each group contributes up to GroupSize survivors
+      // and its chosen first tokens raise TokenTaken so LATER groups are pushed
+      // away from them (Hamming diversity penalty).
+      for G := 0 to NumGroups - 1 do
+      begin
+        GroupLo := G * GroupSize;
+        GroupHi := GroupLo + GroupSize - 1;
+        if GroupLo > High(Live) then
+        begin
+          // No dedicated parents yet (early steps where the live frontier is
+          // smaller than the full beam, e.g. the single seed at step 1): the
+          // group still explores from the WHOLE current frontier so the
+          // diversity penalty can steer it off the earlier groups' tokens.
+          GroupLo := 0;
+          GroupHi := High(Live);
+        end
+        else if GroupHi > High(Live) then
+          GroupHi := High(Live);
+
+        SetLength(Cand, 0);
+        for B := GroupLo to GroupHi do
+        begin
+          NextLogProbs(NN, Prompt + Live[B].Text,
+            InputVolume, OutputVolume, LogProbs);
+          for T := 0 to VocabSize - 1 do
+          begin
+            NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+            if T = csDecodeEOSToken then
+            begin
+              NewBeam.Text := Live[B].Text;
+              NewBeam.Finished := True;
+              NewBeam.Score := NewBeam.SumLogProb /
+                LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+              SetLength(Finished, Length(Finished) + 1);
+              Finished[High(Finished)] := NewBeam;
+            end
+            else
+            begin
+              NewBeam.Text := Live[B].Text + Chr(T);
+              NewBeam.Finished := False;
+              // Length-penalised base score, minus the diversity penalty for
+              // collisions with earlier groups at THIS step (g=0: no penalty).
+              Pen := Diversity * TokenTaken[T];
+              NewBeam.Score := NewBeam.SumLogProb /
+                LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty)
+                - Pen;
+              SetLength(Cand, Length(Cand) + 1);
+              Cand[High(Cand)] := NewBeam;
+            end;
+          end;
+        end;
+
+        SortBeamsByScore(Cand);
+        if Length(Cand) > GroupSize then SetLength(Cand, GroupSize);
+        // Register this group's chosen first tokens for the diversity penalty
+        // and append the survivors to the next frontier.
+        for I := 0 to High(Cand) do
+        begin
+          Inc(TokenTaken[Ord(Cand[I].Text[Length(Cand[I].Text)])]);
+          SetLength(NewLive, Length(NewLive) + 1);
+          NewLive[High(NewLive)] := Cand[I];
+        end;
+      end;
+
+      // Pruning is per-group (each group keeps GroupSize); the new frontier is
+      // the concatenation. No global re-prune so groups stay independent.
+      Live := Copy(NewLive, 0, Length(NewLive));
+    end;
+
+    for B := 0 to High(Live) do
+    begin
+      SetLength(Finished, Length(Finished) + 1);
+      Finished[High(Finished)] := Live[B];
+    end;
+
+    SortBeamsByScore(Finished);
+    SetLength(Result, Length(Finished));
+    for I := 0 to High(Finished) do
+    begin
+      Result[I].Text := Finished[I].Text;
+      Result[I].SumLogProb := Finished[I].SumLogProb;
+      Result[I].Score := Finished[I].Score;
+      Result[I].Finished := Finished[I].Finished;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+  end;
+end;
+
+function DecodeDiverseBeamSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer; NumGroups: integer;
+  Diversity: TNeuralFloat;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+var
+  All: TNNetDecodeResultArray;
+begin
+  All := DecodeDiverseBeamSearchAll(NN, Prompt, MaxLen, BeamWidth,
+    NumGroups, Diversity, LengthPenalty);
+  if Length(All) > 0 then
+    Result := All[0]
+  else
+  begin
+    Result.Text := '';
+    Result.SumLogProb := 0;
+    Result.Score := 0;
+    Result.Finished := False;
+  end;
+end;
+
+// True when every required phrase in ForceTokens occurs as a substring of Text.
+function AllForcedPhrasesPresent(const Text: string;
+  const ForceTokens: array of string): boolean;
+var
+  K: integer;
+begin
+  Result := True;
+  for K := 0 to High(ForceTokens) do
+    if (Length(ForceTokens[K]) > 0) and (Pos(ForceTokens[K], Text) = 0) then
+    begin
+      Result := False;
+      Exit;
+    end;
+end;
+
+// Of the still-unmet phrases, returns the set of characters that can MAKE
+// PROGRESS when appended to Text (the next char of any phrase given Text's
+// current longest matching prefix-of-a-phrase suffix). Used to inject
+// guaranteed-satisfying continuations into the candidate pool. Returns the
+// distinct next-chars as a string (each char at most once).
+function NeededNextChars(const Text: string;
+  const ForceTokens: array of string): string;
+var
+  K, P, MatchLen: integer;
+  Phrase, Tail: string;
+  C: char;
+begin
+  Result := '';
+  for K := 0 to High(ForceTokens) do
+  begin
+    Phrase := ForceTokens[K];
+    if (Length(Phrase) = 0) or (Pos(Phrase, Text) > 0) then Continue; // met
+    // Longest prefix of Phrase that is a suffix of Text (how far an in-progress
+    // emission of this phrase has got); 0 means "start the phrase fresh".
+    MatchLen := 0;
+    for P := Length(Phrase) - 1 downto 1 do
+      if (Length(Text) >= P) and
+         (Copy(Text, Length(Text) - P + 1, P) = Copy(Phrase, 1, P)) then
+      begin
+        MatchLen := P;
+        Break;
+      end;
+    C := Phrase[MatchLen + 1];
+    Tail := Result;
+    if Pos(C, Tail) = 0 then Result := Result + C;
+  end;
+end;
+
+// A monotone PROGRESS metric toward satisfying all forced phrases: for each
+// phrase, its full length once it is present as a substring, otherwise the
+// length of the longest phrase-prefix that is a suffix of Text (an in-progress
+// emission). Summed over phrases. Increases as phrases get emitted and reaches
+// Sum(Length(phrase)) exactly when all are satisfied.
+function ForcedProgress(const Text: string;
+  const ForceTokens: array of string): integer;
+var
+  K, P: integer;
+  Phrase: string;
+begin
+  Result := 0;
+  for K := 0 to High(ForceTokens) do
+  begin
+    Phrase := ForceTokens[K];
+    if Length(Phrase) = 0 then Continue;
+    if Pos(Phrase, Text) > 0 then
+      Inc(Result, Length(Phrase))
+    else
+      for P := Length(Phrase) - 1 downto 1 do
+        if (Length(Text) >= P) and
+           (Copy(Text, Length(Text) - P + 1, P) = Copy(Phrase, 1, P)) then
+        begin
+          Inc(Result, P);
+          Break;
+        end;
+  end;
+end;
+
+function DecodeConstrainedBeamSearchAll(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer;
+  const ForceTokens: array of string;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+var
+  InputVolume, OutputVolume: TNNetVolume;
+  LogProbs: array of TNeuralFloat;
+  VocabSize, Step, I, T, B, RealForced, BestProg, KeptProg: integer;
+  Live: TBeamArray;
+  Finished: TBeamArray;
+  Cand: TBeamArray;
+  NewBeam: TBeam;
+  Needed: string;
+begin
+  if BeamWidth < 1 then BeamWidth := 1;
+  // Count real (non-empty) phrases; none -> ordinary beam search, bit-identical.
+  RealForced := 0;
+  for I := 0 to High(ForceTokens) do
+    if Length(ForceTokens[I]) > 0 then Inc(RealForced);
+  if RealForced = 0 then
+  begin
+    Result := DecodeBeamSearchAll(NN, Prompt, MaxLen, BeamWidth, LengthPenalty);
+    Exit;
+  end;
+
+  InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
+  OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
+  VocabSize := OutputVolume.Size;
+  SetLength(LogProbs, VocabSize);
+  try
+    SetLength(Live, 1);
+    Live[0].Text := '';
+    Live[0].SumLogProb := 0;
+    Live[0].Score := 0;
+    Live[0].Finished := False;
+    SetLength(Finished, 0);
+
+    for Step := 1 to MaxLen do
+    begin
+      if Length(Live) = 0 then Break;
+
+      SetLength(Cand, 0);
+      for B := 0 to High(Live) do
+      begin
+        NextLogProbs(NN, Prompt + Live[B].Text,
+          InputVolume, OutputVolume, LogProbs);
+        // Characters that advance an unmet phrase: each is FORCE-INJECTED as a
+        // candidate (even if the model assigns it ~0 probability) so a path that
+        // makes progress toward every phrase always exists in the pool.
+        Needed := NeededNextChars(Live[B].Text, ForceTokens);
+        for I := 1 to Length(Needed) do
+        begin
+          T := Ord(Needed[I]);
+          NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+          NewBeam.Text := Live[B].Text + Chr(T);
+          NewBeam.Finished := False;
+          NewBeam.Score := NewBeam.SumLogProb /
+            LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+          SetLength(Cand, Length(Cand) + 1);
+          Cand[High(Cand)] := NewBeam;
+        end;
+        for T := 0 to VocabSize - 1 do
+        begin
+          NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+          if T = csDecodeEOSToken then
+          begin
+            // EOS only allowed once ALL phrases are present; otherwise the
+            // hypothesis must keep generating to satisfy the constraint.
+            if not AllForcedPhrasesPresent(Live[B].Text, ForceTokens) then
+              Continue;
+            NewBeam.Text := Live[B].Text;
+            NewBeam.Finished := True;
+            NewBeam.Score := NewBeam.SumLogProb /
+              LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+            SetLength(Finished, Length(Finished) + 1);
+            Finished[High(Finished)] := NewBeam;
+          end
+          else
+          begin
+            // Skip a token already added through the force-injection pass above
+            // (it is a needed next-char) to avoid a duplicate candidate.
+            if Pos(Chr(T), Needed) > 0 then Continue;
+            NewBeam.Text := Live[B].Text + Chr(T);
+            NewBeam.Finished := False;
+            NewBeam.Score := NewBeam.SumLogProb /
+              LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+            SetLength(Cand, Length(Cand) + 1);
+            Cand[High(Cand)] := NewBeam;
+          end;
+        end;
+      end;
+
+      // Bank-aware prune. Keep the global top-BeamWidth by score, BUT GUARANTEE
+      // MONOTONE PROGRESS toward the forced phrases: compute the maximum
+      // ForcedProgress reachable this step (over ALL candidates, including the
+      // force-injected needed-char ones) and ensure at least one survivor
+      // attains it. If the plain top-B prune drops every max-progress
+      // candidate, force-keep the best-scoring one in the last slot. Because a
+      // strictly-more-advanced hypothesis thus survives every step (and EOS is
+      // blocked until all phrases are present), the progress is non-decreasing
+      // and reaches Sum(Length(phrase)) - i.e. full satisfaction - within
+      // MaxLen (given MaxLen >= total phrase length).
+      SortBeamsByScore(Cand);
+      if Length(Cand) > BeamWidth then
+      begin
+        BestProg := 0;
+        for I := 0 to High(Cand) do
+          if ForcedProgress(Cand[I].Text, ForceTokens) > BestProg then
+            BestProg := ForcedProgress(Cand[I].Text, ForceTokens);
+        SetLength(Live, BeamWidth);
+        for I := 0 to BeamWidth - 1 do Live[I] := Cand[I];
+        KeptProg := 0;
+        for I := 0 to High(Live) do
+          if ForcedProgress(Live[I].Text, ForceTokens) > KeptProg then
+            KeptProg := ForcedProgress(Live[I].Text, ForceTokens);
+        if KeptProg < BestProg then
+          // Best-scoring candidate that attains the max progress (Cand is
+          // score-sorted) takes the final slot.
+          for I := BeamWidth to High(Cand) do
+            if ForcedProgress(Cand[I].Text, ForceTokens) = BestProg then
+            begin
+              Live[BeamWidth - 1] := Cand[I];
+              Break;
+            end;
+      end
+      else
+        Live := Copy(Cand, 0, Length(Cand));
+    end;
+
+    // Merge surviving live beams that SATISFY the constraint into the pool; an
+    // unsatisfied live beam is dropped (it never met the forced phrases within
+    // MaxLen). If nothing satisfied, fall back to keeping the surviving beams so
+    // the caller still gets a (best-effort) result rather than empty.
+    for B := 0 to High(Live) do
+      if AllForcedPhrasesPresent(Live[B].Text, ForceTokens) then
+      begin
+        SetLength(Finished, Length(Finished) + 1);
+        Finished[High(Finished)] := Live[B];
+      end;
+    if Length(Finished) = 0 then
+      for B := 0 to High(Live) do
+      begin
+        SetLength(Finished, Length(Finished) + 1);
+        Finished[High(Finished)] := Live[B];
+      end;
+
+    SortBeamsByScore(Finished);
+    SetLength(Result, Length(Finished));
+    for I := 0 to High(Finished) do
+    begin
+      Result[I].Text := Finished[I].Text;
+      Result[I].SumLogProb := Finished[I].SumLogProb;
+      Result[I].Score := Finished[I].Score;
+      Result[I].Finished := Finished[I].Finished;
+    end;
+  finally
+    InputVolume.Free;
+    OutputVolume.Free;
+  end;
+end;
+
+function DecodeConstrainedBeamSearch(NN: TNNet; const Prompt: string;
+  MaxLen: integer; BeamWidth: integer;
+  const ForceTokens: array of string;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+var
+  All: TNNetDecodeResultArray;
+begin
+  All := DecodeConstrainedBeamSearchAll(NN, Prompt, MaxLen, BeamWidth,
+    ForceTokens, LengthPenalty);
   if Length(All) > 0 then
     Result := All[0]
   else
@@ -2904,6 +7585,144 @@ begin
   if Length(All) > 0
   then Result := Copy(All[0].Tokens, 0, Length(All[0].Tokens))
   else SetLength(Result, 0);
+end;
+
+// ---------------------------------------------------------------------------
+// Needle-in-a-haystack harness implementation.
+
+// Insert NeedleFact into Filler at depth DepthFraction (0..1), snapped to the
+// nearest space so a word is never sliced mid-token. Depth 0 prepends, depth 1
+// appends.
+function NeedleSpliceAt(const Filler, NeedleFact: string;
+  DepthFraction: TNeuralFloat): string;
+var
+  Len, Pos: integer;
+begin
+  Len := Length(Filler);
+  if DepthFraction < 0 then DepthFraction := 0;
+  if DepthFraction > 1 then DepthFraction := 1;
+  Pos := Round(DepthFraction * Len);
+  if Pos < 0 then Pos := 0;
+  if Pos > Len then Pos := Len;
+  // Snap forward to the next space so we splice on a word boundary.
+  while (Pos > 0) and (Pos < Len) and (Filler[Pos] <> ' ') do Inc(Pos);
+  Result := Copy(Filler, 1, Pos);
+  if (Result <> '') and (Result[Length(Result)] <> ' ') then Result := Result + ' ';
+  Result := Result + NeedleFact + ' ';
+  Result := Result + Copy(Filler, Pos + 1, Len - Pos);
+end;
+
+function NeedleInHaystackReport(
+  const ContextLengths: array of integer;
+  const DepthFractions: array of TNeuralFloat;
+  const NeedleFact, NeedleAnswer, Question: string;
+  Filler: TNeedleFillerCallback;
+  Generate: TNeedleGenerateCallback;
+  Data: Pointer): TNeedleInHaystackResult;
+var
+  d, c: integer;
+  FillerText, Haystack, Prompt, Output, AnswerLow: string;
+  Cell: TNeedleCell;
+  S: TStringList;
+  Line: string;
+begin
+  SetLength(Result.DepthFractions, Length(DepthFractions));
+  for d := 0 to High(DepthFractions) do Result.DepthFractions[d] := DepthFractions[d];
+  SetLength(Result.ContextLengths, Length(ContextLengths));
+  for c := 0 to High(ContextLengths) do Result.ContextLengths[c] := ContextLengths[c];
+
+  SetLength(Result.Cells, Length(DepthFractions), Length(ContextLengths));
+  Result.HitCount := 0;
+  Result.TotalCount := 0;
+  AnswerLow := LowerCase(NeedleAnswer);
+
+  for d := 0 to High(DepthFractions) do
+    for c := 0 to High(ContextLengths) do
+    begin
+      FillerText := Filler(ContextLengths[c], Data);
+      Haystack := NeedleSpliceAt(FillerText, NeedleFact, DepthFractions[d]);
+      Prompt := Haystack + ' ' + Question;
+      Output := Generate(Prompt, Data);
+
+      Cell.ContextLen := ContextLengths[c];
+      Cell.DepthFraction := DepthFractions[d];
+      Cell.Prompt := Prompt;
+      Cell.Output := Output;
+      Cell.Hit := (AnswerLow <> '') and (Pos(AnswerLow, LowerCase(Output)) > 0);
+      Result.Cells[d][c] := Cell;
+
+      Inc(Result.TotalCount);
+      if Cell.Hit then Inc(Result.HitCount);
+    end;
+
+  if Result.TotalCount > 0
+  then Result.Accuracy := Result.HitCount / Result.TotalCount
+  else Result.Accuracy := 0;
+
+  // Render the grid: rows = depth %, cols = context length.
+  S := TStringList.Create;
+  try
+    S.Add('Needle-in-a-Haystack retrieval grid (. = miss, X = hit)');
+    Line := 'depth\len ';
+    for c := 0 to High(ContextLengths) do
+      Line := Line + Format('%7d', [ContextLengths[c]]);
+    S.Add(Line);
+    for d := 0 to High(DepthFractions) do
+    begin
+      Line := Format('%7.0f%% ', [DepthFractions[d] * 100]);
+      for c := 0 to High(ContextLengths) do
+        if Result.Cells[d][c].Hit
+        then Line := Line + '      X'
+        else Line := Line + '      .';
+      S.Add(Line);
+    end;
+    S.Add(Format('Overall: %d/%d retrieved (%.1f%% accuracy)',
+      [Result.HitCount, Result.TotalCount, Result.Accuracy * 100]));
+    Result.Report := S.Text;
+  finally
+    S.Free;
+  end;
+end;
+
+type
+  // Carries the TNNet and MaxLen through the convenience overload's callbacks.
+  TNeedleGreedyContext = record
+    NN: TNNet;
+    MaxLen: integer;
+  end;
+  PNeedleGreedyContext = ^TNeedleGreedyContext;
+
+function NeedleLoremFiller(CharCount: integer; Data: Pointer): string;
+const
+  cLorem = 'the quick brown fox jumps over the lazy dog while a calm river ' +
+           'flows past green hills and a small village sleeps under stars ';
+begin
+  Result := '';
+  while Length(Result) < CharCount do Result := Result + cLorem;
+  Result := Copy(Result, 1, CharCount);
+end;
+
+function NeedleGreedyGenerate(const Prompt: string; Data: Pointer): string;
+var
+  Ctx: PNeedleGreedyContext;
+begin
+  Ctx := PNeedleGreedyContext(Data);
+  Result := DecodeGreedy(Ctx^.NN, Prompt, Ctx^.MaxLen).Text;
+end;
+
+function NeedleInHaystackReport(NN: TNNet;
+  const ContextLengths: array of integer;
+  const DepthFractions: array of TNeuralFloat;
+  const NeedleFact, NeedleAnswer, Question: string;
+  MaxLen: integer): TNeedleInHaystackResult;
+var
+  Ctx: TNeedleGreedyContext;
+begin
+  Ctx.NN := NN;
+  Ctx.MaxLen := MaxLen;
+  Result := NeedleInHaystackReport(ContextLengths, DepthFractions,
+    NeedleFact, NeedleAnswer, Question,
+    @NeedleLoremFiller, @NeedleGreedyGenerate, @Ctx);
 end;
 
 end.

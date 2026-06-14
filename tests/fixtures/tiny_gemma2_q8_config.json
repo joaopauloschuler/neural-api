@@ -1,0 +1,23 @@
+{
+ "architectures": [
+  "Gemma2ForCausalLM"
+ ],
+ "model_type": "gemma2",
+ "hidden_size": 32,
+ "intermediate_size": 64,
+ "num_hidden_layers": 2,
+ "num_attention_heads": 2,
+ "num_key_value_heads": 1,
+ "head_dim": 32,
+ "vocab_size": 32,
+ "max_position_embeddings": 16,
+ "rms_norm_eps": 1e-06,
+ "rope_theta": 10000.0,
+ "attention_bias": false,
+ "tie_word_embeddings": true,
+ "sliding_window": 4,
+ "query_pre_attn_scalar": 48,
+ "attn_logit_softcapping": 5.0,
+ "final_logit_softcapping": 0.5,
+ "hidden_activation": "gelu_pytorch_tanh"
+}

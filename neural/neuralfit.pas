@@ -172,6 +172,22 @@ type
       FOptimizer: TNeuralOptimizer;
       FOptimizerOwned: boolean;
       FScheduler: TNeuralLRScheduler;
+      FAccumulationSteps: integer;
+      FCurrentAccumulationStep: integer;
+      // EMA (exponential moving average) shadow weights. Opt-in via EnableEMA.
+      FEnableEMA: boolean;
+      FEMADecay: TNeuralFloat;
+      FEMA: TNNetEMAWrapper;            // lazily created on the first update
+      FEMASwapped: boolean;             // true while EMA weights are swapped in
+      FEMASaved: TNNet;                 // live weights stashed during a swap
+      // Parameter-group (PyTorch param_groups) support. Off by default.
+      FExcludeBiasAndNormFromWeightDecay: boolean;
+      FNormAndBiasLearningRateMul: TNeuralFloat;
+      procedure UpdateEMA();            // called once per real weight update
+      // Reapplies the per-group norm-layer LR multiplier after the base LR has
+      // been broadcast to every layer. No-op when the multiplier is 1.
+      procedure ApplyParamGroupLearningRate();
+      procedure SetAccumulationSteps(Value: integer);
       procedure CheckLearningRate(iEpochCount: integer);
       procedure Optimize();
       procedure SetOptimizer(pOptimizer: TNeuralOptimizer);
@@ -245,6 +261,73 @@ type
       // logic. When nil, the legacy LR code path is byte-for-byte unchanged.
       // The caller retains ownership of the scheduler instance.
       property Scheduler: TNeuralLRScheduler read FScheduler write FScheduler;
+      // Gradient accumulation. When AccumulationSteps = N > 1, every optimizer
+      // step is preceded by N forward+backward micro-batches whose per-neuron
+      // deltas are summed into the main network WITHOUT calling UpdateWeights,
+      // giving an effective batch of N*BatchSize at the memory cost of a single
+      // BatchSize micro-batch. Because the framework ACCUMULATES (sums, never
+      // averages) deltas across a batch, N micro-batches of size M produce
+      // exactly the same summed delta as one true batch of size N*M, so no
+      // 1/N rescaling is applied. Reported loss/accuracy are likewise summed
+      // over all N micro-batches before the per-example averaging in the fit
+      // loop, matching a true N*M batch. One optimizer step (and one LR-schedule
+      // step count) happens per N micro-batches, not per micro-batch.
+      // Default 1 = today's behaviour, bit-for-bit. Provider code can read
+      // CurrentAccumulationStep (0..N-1) to fetch distinct data per micro-batch.
+      property AccumulationSteps: integer read FAccumulationSteps write SetAccumulationSteps;
+      // 0-based index of the micro-batch currently being run inside a gradient
+      // accumulation group (always 0 when AccumulationSteps = 1). A deterministic
+      // GetTrainingPair/Proc can combine this with its own index to draw the
+      // matching slice of a large effective batch.
+      property CurrentAccumulationStep: integer read FCurrentAccumulationStep;
+      // EMA (exponential moving average) shadow weights. When EnableEMA is true,
+      // after every REAL weight update (i.e. once per optimizer step, on the
+      // same cadence as the live update, regardless of AccumulationSteps) a
+      // shadow copy of every trainable weight tensor is folded with
+      //   shadow := EMADecay*shadow + (1 - EMADecay)*live.
+      // The shadow is lazily seeded from the live weights on the first update,
+      // so the EMA starts from the real initialization, not from zeros.
+      // v1 uses a FIXED decay (no warmup/bias-correction ramp) for simplicity;
+      // the common min(decay,(1+step)/(10+step)) ramp can be layered on later.
+      // Disabled by default => zero behaviour change. The averaging machinery
+      // is TNNetEMAWrapper (neuralnetwork.pas), shared with the planned SWA
+      // feature (TNNetSWAWrapper).
+      property EnableEMA: boolean read FEnableEMA write FEnableEMA;
+      // EMA decay factor (typical 0.999 / 0.9999). 0 makes the shadow equal the
+      // live weights after one update; values in (0,1) keep a decaying memory.
+      property EMADecay: TNeuralFloat read FEMADecay write FEMADecay;
+      // Parameter groups (PyTorch param_groups port). When enabled, weight
+      // decay (both the L2Decay path and AdamW's decoupled decay) is EXCLUDED
+      // from (a) normalization-layer gains/bias (TNNetLayerNorm / TNNetRMSNorm /
+      // TNNetGroupNorm etc., which already opt out of decay) and (b) the
+      // per-neuron BIAS term of ordinary weight layers - the standard recipe
+      // that decays only matrix weights. AdamW's ApplyDecoupledWeightDecay
+      // already skips bias and norm layers, so for the AdamW optimizer the flag
+      // only documents intent; the behavioural change is on the L2Decay path,
+      // which otherwise shrinks the bias too. OFF by default => the decay path
+      // is bit-for-bit unchanged.
+      property ExcludeBiasAndNormFromWeightDecay: boolean
+        read FExcludeBiasAndNormFromWeightDecay
+        write FExcludeBiasAndNormFromWeightDecay;
+      // Per-group learning-rate multiplier applied to normalization layers
+      // (the param_group LR scaling). 1.0 (default) is a no-op. Reapplied each
+      // optimizer step after the base learning rate is broadcast to all layers.
+      // Independent of ExcludeBiasAndNormFromWeightDecay.
+      property NormAndBiasLearningRateMul: TNeuralFloat
+        read FNormAndBiasLearningRateMul
+        write FNormAndBiasLearningRateMul;
+      // The shadow network holding the EMA weights (nil until the first update;
+      // owned by the wrapper). Read-only convenience accessor.
+      function EMAShadowNet(): TNNet;
+      // Swaps the EMA (shadow) weights INTO the live net for eval/save, stashing
+      // the live training weights so they can be restored. No-op (returns false)
+      // if EMA is disabled or has not been initialized yet. Pairs with
+      // RestoreLiveWeights; nested ApplyEMAWeights calls are ignored.
+      function ApplyEMAWeights(): boolean;
+      // Restores the live training weights stashed by ApplyEMAWeights, leaving
+      // them bit-identical to before the swap so training can continue. No-op if
+      // no swap is currently active.
+      procedure RestoreLiveWeights();
       property StaircaseEpochs: integer read FStaircaseEpochs write FStaircaseEpochs;
       property TargetAccuracy: single read FTargetAccuracy write FTargetAccuracy;
       property TestBestAtEnd: boolean read FTestBestAtEnd write FTestBestAtEnd;
@@ -745,7 +828,78 @@ begin
   FOptimizer.SetNN(FNN, Self);
   FOptimizer.Optimize();
   //Write(FNN.ForceMaxAbsoluteWeight(2):3:2,' ');
-  if FL2Decay > 0.0 then FNN.ComputeL2Decay();
+  // Parameter-group weight decay: when enabled, exclude the per-neuron bias
+  // from the L2 decay (norm-layer gains are already excluded by their no-op
+  // ComputeL2Decay override). When off, the call is bit-identical to the
+  // legacy uniform-decay path.
+  if FL2Decay > 0.0 then FNN.ComputeL2Decay(FExcludeBiasAndNormFromWeightDecay);
+  // EMA shadow update runs on the SAME cadence as the live weight update
+  // (once per real optimizer step), right after the live weights changed.
+  if FEnableEMA then UpdateEMA();
+end;
+
+procedure TNeuralFitBase.ApplyParamGroupLearningRate();
+begin
+  // The real weight update runs on FNN (thread clones only accumulate deltas
+  // that are summed back into FNN before Optimize), so scaling FNN's norm-layer
+  // LearningRate is what governs the effective per-group step size.
+  if FNormAndBiasLearningRateMul = 1.0 then Exit;
+  if Assigned(FNN) then FNN.ScaleNormLayerLearningRate(FNormAndBiasLearningRateMul);
+end;
+
+procedure TNeuralFitBase.UpdateEMA();
+begin
+  if not FEnableEMA then Exit;
+  if not Assigned(FEMA) then
+  begin
+    // Lazy init: seed the shadow from the real (current) live weights, so the
+    // EMA starts from the init/checkpoint, not from zeros.
+    // NOTE: TNNetEMAWrapper clones the net, and cloning constructs layers whose
+    // weight initializers draw from the GLOBAL Mersenne-Twister RNG (the random
+    // values are then overwritten by CopyWeights). FPC's MT keeps a 624-word
+    // internal state that is not publicly saveable/restorable, so this single
+    // lazy clone perturbs the global RNG stream by a bounded amount. EMA is
+    // otherwise a pure side-channel: it never touches the live weights or
+    // deltas, so the optimization MATH is identical with EMA on or off; only
+    // the stochastic batch-shuffle order can differ, within float tolerance.
+    FEMA := TNNetEMAWrapper.Create(FNN, FEMADecay);
+    // First update degenerates to a copy of the live weights, so the shadow
+    // already reflects this step. Keep decay in sync in case it was changed.
+    FEMA.Decay := FEMADecay;
+    FEMA.Update();
+    Exit;
+  end;
+  // Honour live decay changes between steps.
+  FEMA.Decay := FEMADecay;
+  FEMA.Update();
+end;
+
+function TNeuralFitBase.EMAShadowNet(): TNNet;
+begin
+  if Assigned(FEMA)
+    then Result := FEMA.ShadowNet()
+    else Result := nil;
+end;
+
+function TNeuralFitBase.ApplyEMAWeights(): boolean;
+begin
+  Result := false;
+  if (not FEnableEMA) or (not Assigned(FEMA)) or (not Assigned(FNN)) then Exit;
+  if FEMASwapped then Exit; // already swapped; ignore nested calls
+  // Stash the live training weights, then copy the EMA shadow into the net.
+  if not Assigned(FEMASaved)
+    then FEMASaved := FNN.Clone()
+    else FEMASaved.CopyWeights(FNN);
+  FEMA.SetEmaShadow(FNN);
+  FEMASwapped := true;
+  Result := true;
+end;
+
+procedure TNeuralFitBase.RestoreLiveWeights();
+begin
+  if not FEMASwapped then Exit;
+  if Assigned(FEMASaved) and Assigned(FNN) then FNN.CopyWeights(FEMASaved);
+  FEMASwapped := false;
 end;
 
 constructor TNeuralFitWithImageBase.Create();
@@ -1759,6 +1913,7 @@ begin
 
   FNN.SetL2Decay(FL2Decay);
   FNN.SetLearningRate(FCurrentLearningRate, FInertia);
+  ApplyParamGroupLearningRate();
 end;
 
 procedure TNeuralDataLoadingFit.AllocateMemory(pNN: TNNet; pBatchSize: integer;
@@ -1791,20 +1946,34 @@ end;
 procedure TNeuralDataLoadingFit.RunTrainingBatch();
 var
   MaxDelta: TNeuralFloat;
+  AccStep: integer;
 begin
+  // Reset the global hit/loss/error accumulators ONCE per optimizer step. When
+  // FAccumulationSteps = N > 1 they keep accumulating across all N micro-batches
+  // so the reported loss/accuracy match a true N*BatchSize batch.
   FGlobalHit       := 0;
   FGlobalMiss      := 0;
   FGlobalTotalLoss := 0;
   FGlobalErrorSum  := 0;
-  FFinishedThread.Fill(0);
-  FNN.ClearTime();
-  FNN.RefreshDropoutMask();
-  {$IFDEF HASTHREADS}
-  //ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
-  FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
-  {$ELSE}
-  RunNNThread(0, 1);
-  {$ENDIF}
+  // FNN's per-neuron deltas are zero on entry (the previous Optimize() cleared
+  // them via UpdateWeights). Each micro-batch's threads SUM their deltas into
+  // FNN without clearing it, so deltas accumulate across the whole group; the
+  // single Optimize() below applies the summed delta exactly once.
+  for AccStep := 0 to FAccumulationSteps - 1 do
+  begin
+    FCurrentAccumulationStep := AccStep;
+    if FShouldQuit then break;
+    FFinishedThread.Fill(0);
+    FNN.ClearTime();
+    FNN.RefreshDropoutMask();
+    {$IFDEF HASTHREADS}
+    //ProcThreadPool.DoParallel(@RunNNThread, 0, FThreadNN.Count-1, Nil, FThreadNN.Count);
+    FProcs.StartProc({$IFDEF FPC}@RunNNThread{$ELSE}RunNNThread{$ENDIF});
+    {$ELSE}
+    RunNNThread(0, 1);
+    {$ENDIF}
+  end;
+  FCurrentAccumulationStep := 0;
   Optimize();
 end;
 
@@ -2100,11 +2269,30 @@ begin
   FOptimizer := nil;
   FOptimizerOwned := false;
   FSaveBest := SaveBestAccuracy;
+  FAccumulationSteps := 1;
+  FCurrentAccumulationStep := 0;
+  FEnableEMA := false;
+  FEMADecay := 0.999;
+  FEMA := nil;
+  FEMASwapped := false;
+  FEMASaved := nil;
+  FExcludeBiasAndNormFromWeightDecay := false;
+  FNormAndBiasLearningRateMul := 1.0;
+end;
+
+procedure TNeuralFitBase.SetAccumulationSteps(Value: integer);
+begin
+  if Value < 1 then Value := 1;
+  FAccumulationSteps := Value;
 end;
 
 destructor TNeuralFitBase.Destroy();
 begin
   if FOptimizerOwned and Assigned(FOptimizer) then FOptimizer.Free;
+  // If training ended mid-swap, put the live weights back before tearing down.
+  if FEMASwapped then RestoreLiveWeights();
+  if Assigned(FEMA) then FreeAndNil(FEMA);
+  if Assigned(FEMASaved) then FreeAndNil(FEMASaved);
   {$IFDEF HASTHREADS}
   NeuralDoneCriticalSection(FCritSec);
   {$ENDIF}
@@ -2173,6 +2361,13 @@ begin
     // It keys on the global step counter (see neuralscheduler.pas); Epoch is
     // passed for interface compatibility. iEpochCount already reflects any
     // cyclical wrap applied above.
+    //
+    // Plateau hook: CheckLearningRate runs at the START of each epoch, so
+    // FValidationError already holds the previous epoch's validation metric.
+    // Feed it to the scheduler so metric-driven schedulers
+    // (TReduceLROnPlateau) can decide whether to reduce the LR. Stateless
+    // schedulers ignore this (base ReportMetric is a no-op).
+    FScheduler.ReportMetric(FValidationError);
     fNewLearningRate := FScheduler.NextLR(iEpochCount, FCurrentStep);
   end
   else if Assigned(FCustomLearningRateScheduleFn) then
@@ -2197,6 +2392,7 @@ begin
     FCurrentLearningRate := fNewLearningRate;
     FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
     FNN.SetLearningRate(FCurrentLearningRate, FInertia);
+    ApplyParamGroupLearningRate();
     if Assigned(FOptimizer) then
     begin
       if (not Assigned(FOptimizer.FNN)) then
@@ -2417,6 +2613,7 @@ begin
 
   FNN.SetL2Decay(FL2Decay);
   FNN.SetLearningRate(FCurrentLearningRate, FInertia);
+  ApplyParamGroupLearningRate();
 
   if FVerbose then
   begin

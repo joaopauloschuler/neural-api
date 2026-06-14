@@ -157,6 +157,46 @@ TEMPLATES = {
         "bos": "<s>",
         "eos": "</s>",
     },
+    "deepseek": {
+        # deepseek-ai/DeepSeek-V2-Chat / DeepSeek-V3 turn format. The bos
+        # token / end-of-sentence token use the fullwidth pipe U+FF5C and the
+        # one-eighth block U+2581 ('<｜begin▁of▁sentence｜>'
+        # and '<｜end▁of▁sentence｜>'). System content is
+        # emitted verbatim (no role tag); the generation prompt is the bare
+        # 'Assistant:' continuation. No content strip.
+        "template": (
+            "{% if not add_generation_prompt is defined %}"
+            "{% set add_generation_prompt = false %}{% endif %}"
+            "{{ bos_token }}{% for message in messages %}"
+            "{% if message['role'] == 'user' %}"
+            "{{ 'User: ' + message['content'] + '\n\n' }}"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{ 'Assistant: ' + message['content'] + eos_token }}"
+            "{% elif message['role'] == 'system' %}"
+            "{{ message['content'] + '\n\n' }}{% endif %}{% endfor %}"
+            "{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
+        ),
+        "bos": "<｜begin▁of▁sentence｜>",
+        "eos": "<｜end▁of▁sentence｜>",
+    },
+    "phi4mini": {
+        # microsoft/Phi-4-mini-instruct ChatML-style tool-aware template;
+        # like Phi-3 but the <|...|> tags carry NO trailing newline and there
+        # is no eos fallback when add_generation_prompt is false.
+        "template": (
+            "{% for message in messages %}"
+            "{% if message['role'] == 'system' %}"
+            "{{'<|system|>' + message['content'] + '<|end|>'}}"
+            "{% elif message['role'] == 'user' %}"
+            "{{'<|user|>' + message['content'] + '<|end|>'}}"
+            "{% elif message['role'] == 'assistant' %}"
+            "{{'<|assistant|>' + message['content'] + '<|end|>'}}"
+            "{% endif %}{% endfor %}"
+            "{% if add_generation_prompt %}{{'<|assistant|>'}}{% endif %}"
+        ),
+        "bos": "<s>",
+        "eos": "<|endoftext|>",
+    },
 }
 
 # (messages, add_generation_prompt) conversations; every (format x case)

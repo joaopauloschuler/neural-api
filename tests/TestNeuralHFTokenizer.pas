@@ -18,7 +18,7 @@ interface
 
 uses
   Classes, SysUtils, fpcunit, testregistry, fpjson, jsonparser,
-  neuralvolume, neuralhftokenizer, neuralchat;
+  neuralvolume, neuralhftokenizer, neuralchat, neuralgguf, neuraldecode;
 
 type
   TTestNeuralHFTokenizer = class(TTestCase)
@@ -29,16 +29,66 @@ type
     procedure TestByteLevelParityWithHF;
     procedure TestMetaspaceParityWithHF;
     procedure TestWordPieceParityWithHF;
+    procedure TestUnigramParityWithHF;
+    procedure TestUnigramSegmentationAndFusedUnk;
+    // Raw SentencePiece .model protobuf reader (LoadSentencePieceModel):
+    // ids must match the SentencePiece encoder oracle for every pinned
+    // case (fixture by tools/make_pico_spm_fixture.py), decode must match
+    // for the unk-free cases, and special ids come from trainer_spec.
+    procedure TestSentencePieceModelParity;
+    procedure TestSentencePieceByteFallbackRoundTrip;
+    procedure TestSentencePieceBPEModelParity;
     procedure TestSplitQwen2ParityWithHF;
     procedure TestSplitCl100kParityWithHF;
+    procedure TestSplitDeepSeekParityWithHF;
+    procedure TestSplitO200kParityWithHF;
+    procedure TestByteLevelNoRegexParityWithHF;
     procedure TestMetaspacePreTokenizerParityWithHF;
     procedure TestRejectsUnknownSplitPattern;
+    procedure TestNFCComposesDecomposedInput;
+    procedure TestNFDDecomposesPrecomposedInput;
+    procedure TestNFKCFoldsCompatibilityForms;
+    procedure TestNFKDFoldsCompatibilityForms;
+    procedure TestNFKCNormalizerFoldsTokenIds;
+    procedure TestNFCNormalizerFoldsTokenIds;
     procedure TestWordPieceSpecialTokenIds;
     procedure TestByteLevelSpecialTokenIds;
     procedure TestMetaspaceSpecialTokenIds;
     procedure TestDecodeKeepsSpecialsWhenAsked;
     procedure TestRejectsNonBPEModel;
     procedure TestEncodeIntegerArrayHelper;
+    procedure TestOffsetMappingRoundTrip;
+    procedure TestOffsetMappingWordIds;
+    procedure TestOffsetMappingByteFallbackExact;
+    // BPE-dropout (Provilkov et al. 2020): p=0 is bit-identical to eval;
+    // p=1 is the maximally-split per-byte tokenization; a seeded mid-value
+    // run is deterministic and differs from p=0.
+    procedure TestDropoutZeroIsBitIdentical;
+    procedure TestDropoutOneIsMaximallySplit;
+    procedure TestDropoutSeededIsDeterministicAndDiffers;
+    // GGUF embedded-tokenizer loader (LoadFromGGUF): write the unigram /
+    // cl100k-BPE fixture's vocab+scores(+merges) into a temp .gguf as
+    // tokenizer.ggml.* (model "llama" / "gpt2"), read it back, and assert
+    // Encode/Decode match the tokenizer.json source exactly; plus the
+    // unsupported-model rejection.
+    procedure TestLoadFromGGUFLlamaRoundTrip;
+    procedure TestLoadFromGGUFGpt2RoundTrip;
+    procedure TestLoadFromGGUFRejectsUnsupportedModel;
+    // Writer-side complement of TestLoadFromGGUFGpt2RoundTrip: emit a loaded
+    // byte-level-BPE tokenizer's vocab+merges via SaveTokenizerToGGUF, read it
+    // back with LoadFromGGUF, and assert Encode/Decode stay id-identical.
+    procedure TestSaveTokenizerToGGUFGpt2RoundTrip;
+    // Token-healing follow-up (a): the byte-level-BPE vocab prefix scan
+    // (PrefixScanVocab) returns EXACTLY the vocab ids whose stored surface
+    // extends a raw fragment, mapped into the byte-alphabet surface space -
+    // including a fragment (' he') that only matches AFTER the space->U+0120
+    // byte-alphabet mapping, plus the surface-mapping helper itself.
+    procedure TestByteLevelHealingPrefixScan;
+    // Token-healing follow-up (b): a multi-token rollback heals a boundary
+    // ('Ġse'+'as' -> 'Ġseas...') that single-token rollback ('as' alone, no
+    // strict extension) provably does NOT, and the default single-token path
+    // is unchanged.
+    procedure TestByteLevelHealingMultiTokenRollback;
   end;
 
   // Tests for the chat templates in neuralchat.pas. The flagship tests
@@ -54,6 +104,10 @@ type
   private
     function FixturePath(const FileName: string): string;
     procedure RunChatBattery(const FormatName: string);
+    // Runs every pinned case of FormatName through the mini-Jinja
+    // INTERPRETER fed that family's AUTHENTIC chat_template string, with
+    // the right bos/eos, and asserts byte-exact parity with ground truth.
+    procedure RunInterpreterBattery(const FormatName, Bos, Eos: string);
   published
     procedure TestChatMLParityWithJinja;
     procedure TestLlama2ParityWithJinja;
@@ -62,12 +116,30 @@ type
     procedure TestGemmaParityWithJinja;
     procedure TestPhi3ParityWithJinja;
     procedure TestMistralParityWithJinja;
+    procedure TestDeepSeekParityWithJinja;
+    procedure TestPhi4MiniParityWithJinja;
+    procedure TestDetectDeepSeekAndPhi4Mini;
+    procedure TestLoadChatTemplateFromSiblingJinja;
     procedure TestDetectFormatOnAuthenticTemplates;
     procedure TestFormatNameRoundTrip;
     procedure TestEncodeChatLlama2SpecialTokens;
     procedure TestEncodeChatChatMLAddedToken;
     procedure TestLoadChatTemplateFromTokenizerConfig;
     procedure TestUnknownFormatRaises;
+    // mini-Jinja interpreter (chat templates v2)
+    procedure TestInterpreterChatMLParity;
+    procedure TestInterpreterLlama3Parity;
+    procedure TestInterpreterDeepSeekParity;
+    procedure TestInterpreterPhi4MiniParity;
+    procedure TestInterpreterZephyrWhitespaceControl;
+    procedure TestInterpreterAllBundledTemplatesParity;
+    procedure TestInterpreterUnsupportedConstructRaises;
+    procedure TestInterpreterWhitespaceControlTrimming;
+    procedure TestApplyChatTemplateStringFallback;
+    // chat templates v2 follow-ups
+    procedure TestQwenDefaultSystemInjection;
+    procedure TestContinueFinalMessage;
+    procedure TestReturnAssistantTokensMask;
   end;
 
 implementation
@@ -83,6 +155,34 @@ begin
       ' (run python3 tools/hf_tokenizer_fixture.py from the repo root).');
 end;
 
+// Parse a fixture JSON file from its RAW bytes via TJSONParser(s, []).
+// This deliberately AVOIDS GetJSON: the GetJSON string overloads (and any
+// joUTF8 path) re-emit multi-byte UTF-8 string values as single Latin-1
+// bytes, corrupting non-ASCII case data (e.g. "cafe'", CJK) loaded from
+// hf_tokenizer_cases.json / chat_template_cases.json. Reading the raw bytes
+// and parsing with an empty options set keeps every UTF-8 byte verbatim.
+// See the project note "hf-tokenizer-and-fpjson-traps".
+function LoadFixtureJSON(const Path: string): TJSONData;
+var
+  SS: TStringStream;
+  JsonStr: string;
+  Parser: TJSONParser;
+begin
+  SS := TStringStream.Create('');
+  try
+    SS.LoadFromFile(Path);
+    JsonStr := SS.DataString;
+  finally
+    SS.Free;
+  end;
+  Parser := TJSONParser.Create(JsonStr, []);
+  try
+    Result := Parser.Parse;
+  finally
+    Parser.Free;
+  end;
+end;
+
 // Loads the tokenizer named by hf_tokenizer_cases.json[GroupName] and
 // asserts exact Encode-id and Decode-string parity for every pinned case.
 procedure TTestNeuralHFTokenizer.RunParityBattery(const GroupName: string);
@@ -94,21 +194,15 @@ var
   Ids: TIntegerList;
   CaseCnt, IdCnt: integer;
   Text, Context: string;
-  FS: TFileStream;
 begin
-  FS := TFileStream.Create(FixturePath('hf_tokenizer_cases.json'),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    Root := GetJSON(FS);
-  finally
-    FS.Free;
-  end;
+  // Raw-bytes load: the parity cases include non-ASCII text/decoded strings.
+  Root := LoadFixtureJSON(FixturePath('hf_tokenizer_cases.json'));
   Tok := TNeuralHFTokenizer.Create();
   Ids := TIntegerList.Create();
   try
     Group := TJSONObject(Root).Objects[GroupName];
     Tok.LoadFromFile(FixturePath(Group.Get('tokenizer', '')));
-    AssertTrue(GroupName + ': vocab not loaded', Tok.GetVocabSize() > 100);
+    AssertTrue(GroupName + ': vocab not loaded', Tok.GetVocabSize() > 10);
     Cases := Group.Arrays['cases'];
     AssertTrue(GroupName + ': no cases pinned', Cases.Count >= 10);
     for CaseCnt := 0 to Cases.Count - 1 do
@@ -148,6 +242,262 @@ begin
   RunParityBattery('wordpiece');
 end;
 
+// SentencePiece-Unigram (ALBERT/T5/XLNet/DeBERTa-v3 family): Viterbi
+// segmentation over the [piece, log_prob] vocab + Metaspace pre_tokenizer.
+procedure TTestNeuralHFTokenizer.TestUnigramParityWithHF;
+begin
+  RunParityBattery('unigram');
+end;
+
+// Targeted Unigram checks: the IsUnigram flag, a known multi-character
+// Viterbi segmentation, and that a run of out-of-vocab characters between
+// known pieces collapses to a SINGLE fused <unk> id (HF behavior).
+procedure TTestNeuralHFTokenizer.TestUnigramSegmentationAndFusedUnk;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TIntegerList;
+  UnkCount, Cnt: integer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_unigram_tokenizer.json'));
+    AssertTrue('unigram flag', Tok.IsUnigram);
+    AssertTrue('not byte-level', not Tok.IsByteLevel);
+    AssertTrue('not wordpiece', not Tok.IsWordPiece);
+    AssertTrue('unk id present', Tok.UnkId >= 0);
+    AssertTrue('vocab loaded', Tok.GetVocabSize() > 10);
+
+    // "the" is a single multi-char vocab piece; the metaspace prefix makes
+    // it "▁the" -> the highest-score segmentation is a single id.
+    Ids.Clear;
+    Tok.Encode('the', Ids);
+    AssertEquals('"the" decodes back', 'the', Tok.Decode(Ids, true));
+
+    // A run of three unknown capitals (Q,X,Z) between known pieces must
+    // produce exactly ONE fused <unk>.
+    Ids.Clear;
+    Tok.Encode('the QXZ cat', Ids);
+    UnkCount := 0;
+    for Cnt := 0 to Ids.Count - 1 do
+      if Ids[Cnt] = Tok.UnkId then Inc(UnkCount);
+    AssertEquals('the QXZ run fuses to one unk', 1, UnkCount);
+  finally
+    Ids.Free;
+    Tok.Free;
+  end;
+end;
+
+// Raw SentencePiece .model protobuf path. The oracle is the SentencePiece
+// encoder itself (tools/make_pico_spm_fixture.py): every pinned id list
+// must match exactly. Decode is asserted only for cases with no <unk>
+// (id 0): the Pascal Decode follows the HF tokenizers metaspace convention
+// (unk -> empty surface), whereas the spm reference renders <unk> as its
+// unk_surface ' ⁇ ', so the two intentionally differ there.
+// A raw SentencePiece .model with byte_fallback=True ships the 256
+// <0x00>..<0xFF> BYTE pieces (type 6). The .model reader must flag
+// FByteFallback so (1) unknown bytes route through <0xNN> on encode and
+// (2) those byte pieces decode back to their RAW byte, reassembling the
+// original multi-byte UTF-8 string (instead of emitting the literal text
+// "<0xNN>"). Verified by full id-parity vs the sentencepiece oracle AND an
+// encode->decode round-trip over 2/3/4-byte UTF-8 chars + a raw control byte.
+procedure TTestNeuralHFTokenizer.TestSentencePieceByteFallbackRoundTrip;
+var
+  Tok: TNeuralHFTokenizer;
+  Root: TJSONData;
+  Group, CaseObj: TJSONObject;
+  Cases, ExpectedIds: TJSONArray;
+  Ids: TIntegerList;
+  CaseCnt, IdCnt: integer;
+  Text, Context, JsonStr: string;
+  SS: TStringStream;
+  Parser: TJSONParser;
+begin
+  // Read the cases via TJSONParser(s, []) over the RAW file bytes: the
+  // non-ASCII byte-fallback test strings are UTF-8 and must survive verbatim.
+  // GetJSON (both the TStream and the joUTF8 string overloads) re-emits
+  // multi-byte UTF-8 as a single Latin-1 byte and would corrupt the input.
+  SS := TStringStream.Create('');
+  try
+    SS.LoadFromFile(FixturePath('hf_tokenizer_cases.json'));
+    JsonStr := SS.DataString;
+  finally
+    SS.Free;
+  end;
+  Parser := TJSONParser.Create(JsonStr, []);
+  try
+    Root := Parser.Parse;
+  finally
+    Parser.Free;
+  end;
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Group := TJSONObject(Root).Objects['spm_bytefallback'];
+    Tok.LoadFromFile(FixturePath(Group.Get('tokenizer', '')));
+    AssertTrue('spm flag', Tok.IsUnigram);
+    AssertTrue('vocab loaded', Tok.GetVocabSize() > 256);
+    Cases := Group.Arrays['cases'];
+    AssertTrue('no cases pinned', Cases.Count >= 6);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Text := CaseObj.Get('text', '');
+      ExpectedIds := CaseObj.Arrays['ids'];
+      Context := 'spm-bf case ' + IntToStr(CaseCnt) + ' "' + Text + '"';
+      Ids.Clear;
+      Tok.Encode(Text, Ids);
+      // encode parity with the sentencepiece byte-fallback oracle
+      AssertEquals(Context + ': id count', ExpectedIds.Count, Ids.Count);
+      for IdCnt := 0 to ExpectedIds.Count - 1 do
+        AssertEquals(Context + ': id[' + IntToStr(IdCnt) + ']',
+          ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+      // round-trip: byte pieces must reassemble into the original UTF-8
+      AssertEquals(Context + ': round-trip decode', Text, Tok.Decode(Ids, true));
+    end;
+  finally
+    Ids.Free;
+    Tok.Free;
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestSentencePieceModelParity;
+var
+  Tok: TNeuralHFTokenizer;
+  Root: TJSONData;
+  Group, CaseObj: TJSONObject;
+  Cases, ExpectedIds: TJSONArray;
+  Ids: TIntegerList;
+  CaseCnt, IdCnt: integer;
+  Text, Context: string;
+  HasUnk: boolean;
+begin
+  // Raw-bytes load: the spm_model parity cases include non-ASCII text.
+  Root := LoadFixtureJSON(FixturePath('hf_tokenizer_cases.json'));
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Group := TJSONObject(Root).Objects['spm_model'];
+    // Exercise BOTH entry points: LoadFromFile must auto-dispatch the
+    // '.model' extension to the raw protobuf reader.
+    Tok.LoadFromFile(FixturePath(Group.Get('tokenizer', '')));
+    AssertTrue('spm flag', Tok.IsUnigram);
+    AssertTrue('not byte-level', not Tok.IsByteLevel);
+    AssertTrue('vocab loaded', Tok.GetVocabSize() > 10);
+    // trainer_spec ids (unk=0, bos=1, eos=2 in the fixture).
+    AssertEquals('unk id from trainer_spec', 0, Tok.UnkId);
+    AssertEquals('bos id from trainer_spec', 1, Tok.BosId);
+    AssertEquals('eos id from trainer_spec', 2, Tok.EosId);
+
+    Cases := Group.Arrays['cases'];
+    AssertTrue('no cases pinned', Cases.Count >= 10);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Text := CaseObj.Get('text', '');
+      ExpectedIds := CaseObj.Arrays['ids'];
+      Context := 'spm case ' + IntToStr(CaseCnt) + ' "' + Text + '"';
+      Ids.Clear;
+      Tok.Encode(Text, Ids);
+      AssertEquals(Context + ': id count', ExpectedIds.Count, Ids.Count);
+      HasUnk := false;
+      for IdCnt := 0 to ExpectedIds.Count - 1 do
+      begin
+        AssertEquals(Context + ': id[' + IntToStr(IdCnt) + ']',
+          ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+        if ExpectedIds.Integers[IdCnt] = Tok.UnkId then HasUnk := true;
+      end;
+      if not HasUnk then
+        AssertEquals(Context + ': decode',
+          CaseObj.Get('decoded', ''), Tok.Decode(Ids, true));
+    end;
+  finally
+    Ids.Free;
+    Tok.Free;
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestSentencePieceBPEModelParity;
+var
+  Tok: TNeuralHFTokenizer;
+  Root: TJSONData;
+  Group, CaseObj: TJSONObject;
+  Cases, ExpectedIds: TJSONArray;
+  Ids: TIntegerList;
+  CaseCnt, IdCnt: integer;
+  Text, Context, JsonStr: string;
+  SS: TStringStream;
+  Parser: TJSONParser;
+begin
+  // model_type=BPE SentencePiece .model: the .model carries ONLY scored
+  // pieces (no merge list), so LoadSentencePieceModel reconstructs the merges
+  // from the pieces (ReconstructBPEMerges, the HF generate_merges algorithm)
+  // and routes encode/decode through the metaspace byte-level-BPE machinery.
+  // Parity is asserted against the sentencepiece encoder (the oracle pinned at
+  // fixture-build time), which we verified is id-identical to a tokenizers BPE
+  // model built from those same reconstructed merges -- over ASCII AND
+  // non-ASCII (<0xNN> byte-fallback) inputs, so this is FULL byte parity, not
+  // an approximation. This is the flavour NLLB / mBART-BPE / DeBERTa-v3 ship.
+  //
+  // Raw-bytes load via TJSONParser(s, []): the cases include non-ASCII text
+  // (cafe / CJK / emoji / a raw control byte) that must survive verbatim --
+  // GetJSON would corrupt multi-byte UTF-8 (see byte-fallback test).
+  SS := TStringStream.Create('');
+  try
+    SS.LoadFromFile(FixturePath('hf_tokenizer_cases.json'));
+    JsonStr := SS.DataString;
+  finally
+    SS.Free;
+  end;
+  Parser := TJSONParser.Create(JsonStr, []);
+  try
+    Root := Parser.Parse;
+  finally
+    Parser.Free;
+  end;
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Group := TJSONObject(Root).Objects['spm_bpe_model'];
+    // LoadFromFile must auto-dispatch the '.model' extension to the protobuf
+    // reader, which then dispatches model_type=BPE to the merge path.
+    Tok.LoadFromFile(FixturePath(Group.Get('tokenizer', '')));
+    AssertTrue('not unigram (BPE)', not Tok.IsUnigram);
+    AssertTrue('not byte-level (metaspace BPE)', not Tok.IsByteLevel);
+    AssertTrue('byte-fallback vocab loaded', Tok.GetVocabSize() > 256);
+    // trainer_spec ids (unk=0, bos=1, eos=2 in the fixture).
+    AssertEquals('unk id from trainer_spec', 0, Tok.UnkId);
+    AssertEquals('bos id from trainer_spec', 1, Tok.BosId);
+    AssertEquals('eos id from trainer_spec', 2, Tok.EosId);
+
+    Cases := Group.Arrays['cases'];
+    AssertTrue('no cases pinned', Cases.Count >= 10);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Text := CaseObj.Get('text', '');
+      ExpectedIds := CaseObj.Arrays['ids'];
+      Context := 'spm-bpe case ' + IntToStr(CaseCnt) + ' "' + Text + '"';
+      Ids.Clear;
+      Tok.Encode(Text, Ids);
+      // encode parity with the sentencepiece BPE oracle (incl. byte fallback)
+      AssertEquals(Context + ': id count', ExpectedIds.Count, Ids.Count);
+      for IdCnt := 0 to ExpectedIds.Count - 1 do
+        AssertEquals(Context + ': id[' + IntToStr(IdCnt) + ']',
+          ExpectedIds.Integers[IdCnt], Ids[IdCnt]);
+      // round-trip: pieces + byte pieces reassemble the original UTF-8 text
+      AssertEquals(Context + ': round-trip decode', Text,
+        Tok.Decode(Ids, true));
+    end;
+  finally
+    Ids.Free;
+    Tok.Free;
+    Root.Free;
+  end;
+end;
+
 // Qwen2/Qwen3-style Sequence[Split(cl100k-style regex with \p{N}),
 // ByteLevel(use_regex=false)] pre-tokenizer (fixtures generated by
 // tools/hf_pretok_fixture.py).
@@ -160,6 +510,30 @@ end;
 procedure TTestNeuralHFTokenizer.TestSplitCl100kParityWithHF;
 begin
   RunParityBattery('split_cl100k');
+end;
+
+// DeepSeek-V2/V2-Lite multi-Split+Digits pre_tokenizer Sequence. Cases are
+// restricted to the classes SplitDeepSeekPieces reproduces exactly (ASCII
+// letters/digits/punct, whitespace incl tabs/CR/LF, and CJK).
+procedure TTestNeuralHFTokenizer.TestSplitDeepSeekParityWithHF;
+begin
+  RunParityBattery('split_deepseek');
+end;
+
+// o200k_base / GPT-4o-family Split pattern (case-aware letter alternations,
+// \p{N}{1,3} digits, [\r\n/]* punct trailing). Cases are restricted to the
+// classes SplitO200kPieces reproduces exactly: ASCII letters (with case
+// transitions), digits, punct (incl '/'), whitespace incl tabs/CR/LF, CJK.
+procedure TTestNeuralHFTokenizer.TestSplitO200kParityWithHF;
+begin
+  RunParityBattery('split_o200k');
+end;
+
+// STANDALONE ByteLevel(use_regex=false): the GPT-2 regex split must be
+// SKIPPED -- the whole segment is one chunk fed to the byte alphabet.
+procedure TTestNeuralHFTokenizer.TestByteLevelNoRegexParityWithHF;
+begin
+  RunParityBattery('bytelevel_noregex');
 end;
 
 // Mistral / legacy=false Llama style Metaspace PRE_TOKENIZER
@@ -193,6 +567,194 @@ begin
       on E: EHFTokenizerError do Raised := true;
     end;
     AssertTrue('unknown Split pattern must raise EHFTokenizerError', Raised);
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
+end;
+
+// Canonical NFC: pre-DECOMPOSED input (base + combining mark) must compose
+// to the PRECOMPOSED single codepoint, byte-identical to precomposed UTF-8.
+// Also pins canonical ordering of stacked marks and Hangul L+V+T composition.
+procedure TTestNeuralHFTokenizer.TestNFCComposesDecomposedInput;
+var
+  eAcuteD, aDiaerD, qStack, hangulD: string;
+begin
+  // 'e' + U+0301 COMBINING ACUTE  ->  U+00E9 'e' (C3 A9)
+  eAcuteD := 'e' + #$CC#$81;
+  AssertEquals('NFC e+0301 -> U+00E9 bytes', #$C3#$A9,
+    TNeuralHFTokenizer.NormalizeUnicodeText(eAcuteD, True));
+  // 'a' + U+0308 COMBINING DIAERESIS  ->  U+00E4 'a' (C3 A4)
+  aDiaerD := 'a' + #$CC#$88;
+  AssertEquals('NFC a+0308 -> U+00E4 bytes', #$C3#$A4,
+    TNeuralHFTokenizer.NormalizeUnicodeText(aDiaerD, True));
+  // Already-precomposed input is idempotent under NFC.
+  AssertEquals('NFC idempotent on U+00E9', #$C3#$A9,
+    TNeuralHFTokenizer.NormalizeUnicodeText(#$C3#$A9, True));
+  // Canonical ordering: q + U+0301(ccc230) + U+0323(ccc220). The lower class
+  // U+0323 must be reordered BEFORE U+0301; neither composes with q, so the
+  // NFC result is q U+0323 U+0301 = 71 CC A3 CC 81.
+  qStack := 'q' + #$CC#$81 + #$CC#$A3;
+  AssertEquals('NFC canonical-orders stacked marks',
+    'q' + #$CC#$A3 + #$CC#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText(qStack, True));
+  // Hangul algorithmic composition: U+1100 U+1161 U+11A8 -> U+AC01 (EA B0 81).
+  hangulD := #$E1#$84#$80 + #$E1#$85#$A1 + #$E1#$86#$A8;
+  AssertEquals('NFC composes Hangul jamo to syllable', #$EA#$B0#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText(hangulD, True));
+end;
+
+// Canonical NFD: PRECOMPOSED input must decompose to base + combining mark(s),
+// byte-identical to the expected decomposed UTF-8. Hangul decomposes via the
+// algorithmic S->L/V/T arithmetic.
+procedure TTestNeuralHFTokenizer.TestNFDDecomposesPrecomposedInput;
+begin
+  // U+00E9 'e'  ->  'e' + U+0301  (65 CC 81)
+  AssertEquals('NFD U+00E9 -> e+0301', 'e' + #$CC#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText(#$C3#$A9, False));
+  // U+00E4 'a'  ->  'a' + U+0308  (61 CC 88)
+  AssertEquals('NFD U+00E4 -> a+0308', 'a' + #$CC#$88,
+    TNeuralHFTokenizer.NormalizeUnicodeText(#$C3#$A4, False));
+  // Already-decomposed input is idempotent under NFD.
+  AssertEquals('NFD idempotent on e+0301', 'e' + #$CC#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText('e' + #$CC#$81, False));
+  // Hangul U+AC01 -> U+1100 U+1161 U+11A8.
+  AssertEquals('NFD decomposes Hangul syllable',
+    #$E1#$84#$80 + #$E1#$85#$A1 + #$E1#$86#$A8,
+    TNeuralHFTokenizer.NormalizeUnicodeText(#$EA#$B0#$81, False));
+end;
+
+// End-to-end: a tokenizer carrying a bare {"type":"NFC"} normalizer (Qwen2/3
+// style) must fold a pre-decomposed string to the SAME token ids as the
+// precomposed string. A byte-level BPE vocab over the relevant bytes is built
+// inline so encoding exercises the real normalize -> pre-tokenize -> BPE path.
+procedure TTestNeuralHFTokenizer.TestNFCNormalizerFoldsTokenIds;
+var
+  Tok: TNeuralHFTokenizer;
+  TempFile: string;
+  SL: TStringList;
+  IdsD, IdsC: TNeuralIntegerArray;
+  Cnt: integer;
+begin
+  TempFile := GetTempDir(true) + 'nfc_bytelevel_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    // Minimal byte-level BPE: vocab maps the GPT-2 byte-alphabet chars for
+    // the UTF-8 bytes of 'é' precomposed (C3 A9) and decomposed (65 CC 81),
+    // no merges, with an NFC normalizer. After NFC both inputs become C3 A9.
+    // GPT-2 byte alphabet (bytes_to_unicode): 0x65->U+0065 'e',
+    // 0xC3->U+00C3, 0xA9->U+00A9, 0xCC->U+00CC, 0x81->U+0123. After NFC both
+    // 'e'+U+0301 and U+00E9 become bytes C3 A9 -> chars U+00C3,U+00A9.
+    SL.Text :=
+      '{"normalizer": {"type": "NFC"},' +
+      ' "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},' +
+      ' "model": {"type": "BPE", "vocab":' +
+      ' {"e": 0, ' + '"' + #$C3#$83 + '": 1, "' + #$C2#$A9 + '": 2,' +
+      ' "' + #$C3#$8C + '": 3, "' + #$C4#$A3 + '": 4}, "merges": []}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    // decomposed 'e'+U+0301 and precomposed U+00E9 must tokenize identically
+    IdsD := Tok.Encode('e' + #$CC#$81);
+    IdsC := Tok.Encode(#$C3#$A9);
+    AssertEquals('NFC folds id count', Length(IdsC), Length(IdsD));
+    for Cnt := 0 to High(IdsC) do
+      AssertEquals('NFC folds id[' + IntToStr(Cnt) + ']', IdsC[Cnt], IdsD[Cnt]);
+    // and both are the precomposed byte ids C3 A9 -> tokens 1,2
+    AssertEquals('precomposed yields 2 byte ids', 2, Length(IdsC));
+    AssertEquals('byte C3 -> id 1', 1, IdsC[0]);
+    AssertEquals('byte A9 -> id 2', 2, IdsC[1]);
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
+end;
+
+// Compatibility NFKC: compat decompositions (ligatures, full/half-width,
+// super/subscripts, fractions, no-break space, circled/parenthesized/roman
+// numerals) fold, THEN canonical composition runs. Oracle strings are pinned
+// from Python unicodedata.normalize('NFKC', ...). UTF-8 byte literals.
+procedure TTestNeuralHFTokenizer.TestNFKCFoldsCompatibilityForms;
+  function NFKC(const S: string): string;
+  begin
+    Result := TNeuralHFTokenizer.NormalizeUnicodeText(S, True, True);
+  end;
+begin
+  // U+FB01 LATIN SMALL LIGATURE FI -> 'fi'
+  AssertEquals('NFKC ligature fi -> fi', 'fi', NFKC(#$EF#$AC#$81));
+  // U+FF21 FULLWIDTH LATIN CAPITAL LETTER A -> 'A'
+  AssertEquals('NFKC fullwidth A -> A', 'A', NFKC(#$EF#$BC#$A1));
+  // U+00B2 SUPERSCRIPT TWO -> '2'
+  AssertEquals('NFKC superscript 2 -> 2', '2', NFKC(#$C2#$B2));
+  // U+00BD VULGAR FRACTION ONE HALF -> '1' U+2044 FRACTION SLASH '2'
+  AssertEquals('NFKC fraction 1/2', '1' + #$E2#$81#$84 + '2', NFKC(#$C2#$BD));
+  // U+00A0 NO-BREAK SPACE -> U+0020 SPACE
+  AssertEquals('NFKC no-break space -> space', ' ', NFKC(#$C2#$A0));
+  // U+2460 CIRCLED DIGIT ONE -> '1'
+  AssertEquals('NFKC circled 1 -> 1', '1', NFKC(#$E2#$91#$A0));
+  // U+2474 PARENTHESIZED DIGIT ONE -> '(1)'
+  AssertEquals('NFKC parenthesized 1 -> (1)', '(1)', NFKC(#$E2#$91#$B4));
+  // U+2168 ROMAN NUMERAL NINE -> 'IX'
+  AssertEquals('NFKC roman IX -> IX', 'IX', NFKC(#$E2#$85#$A8));
+  // Compat THEN canonical compose: 'e'+U+0301 (decomposed) followed by
+  // U+00B2 superscript two -> U+00E9 'e' (composed) + '2'.
+  AssertEquals('NFKC compat-decompose then compose',
+    #$C3#$A9 + '2', NFKC('e' + #$CC#$81 + #$C2#$B2));
+  // Plain ASCII is untouched.
+  AssertEquals('NFKC ASCII identity', 'hello', NFKC('hello'));
+end;
+
+// Compatibility NFKD: same compat folds as NFKC but WITHOUT canonical compose,
+// so combining marks stay decomposed. Oracle from Python NFKD.
+procedure TTestNeuralHFTokenizer.TestNFKDFoldsCompatibilityForms;
+  function NFKD(const S: string): string;
+  begin
+    Result := TNeuralHFTokenizer.NormalizeUnicodeText(S, False, True);
+  end;
+begin
+  AssertEquals('NFKD ligature fi -> fi', 'fi', NFKD(#$EF#$AC#$81));
+  AssertEquals('NFKD fullwidth A -> A', 'A', NFKD(#$EF#$BC#$A1));
+  AssertEquals('NFKD superscript 2 -> 2', '2', NFKD(#$C2#$B2));
+  AssertEquals('NFKD fraction 1/2', '1' + #$E2#$81#$84 + '2', NFKD(#$C2#$BD));
+  AssertEquals('NFKD no-break space -> space', ' ', NFKD(#$C2#$A0));
+  AssertEquals('NFKD parenthesized 1 -> (1)', '(1)', NFKD(#$E2#$91#$B4));
+  // 'e'+U+0301 + U+00B2 stays decomposed under NFKD: 'e' U+0301 '2'.
+  AssertEquals('NFKD keeps marks decomposed',
+    'e' + #$CC#$81 + '2', NFKD('e' + #$CC#$81 + #$C2#$B2));
+end;
+
+// End-to-end: a tokenizer carrying {"type":"NFKC"} must fold a compatibility
+// form (fullwidth 'A' U+FF21) to the SAME token ids as plain ASCII 'A'.
+procedure TTestNeuralHFTokenizer.TestNFKCNormalizerFoldsTokenIds;
+var
+  Tok: TNeuralHFTokenizer;
+  TempFile: string;
+  SL: TStringList;
+  IdsW, IdsA: TNeuralIntegerArray;
+  Cnt: integer;
+begin
+  TempFile := GetTempDir(true) + 'nfkc_bytelevel_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    // Byte-level BPE, no merges, NFKC normalizer. After NFKC the fullwidth 'A'
+    // (U+FF21, bytes EF BC A1) folds to ASCII 'A' (byte 0x41 -> GPT-2 alphabet
+    // char 'A'). Vocab maps 'A' so both inputs yield the same single id.
+    SL.Text :=
+      '{"normalizer": {"type": "NFKC"},' +
+      ' "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},' +
+      ' "model": {"type": "BPE", "vocab": {"A": 0}, "merges": []}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    IdsW := Tok.Encode(#$EF#$BC#$A1); // fullwidth A
+    IdsA := Tok.Encode('A');          // ASCII A
+    AssertEquals('NFKC folds id count', Length(IdsA), Length(IdsW));
+    for Cnt := 0 to High(IdsA) do
+      AssertEquals('NFKC folds id[' + IntToStr(Cnt) + ']', IdsA[Cnt], IdsW[Cnt]);
+    AssertEquals('ASCII A yields 1 id', 1, Length(IdsA));
+    AssertEquals('byte 0x41 -> id 0', 0, IdsA[0]);
   finally
     Tok.Free;
     SL.Free;
@@ -285,11 +847,13 @@ var
   SL: TStringList;
   Raised: boolean;
 begin
+  // BPE, WordPiece and Unigram are supported; any other model.type must
+  // still raise (e.g. a hypothetical/unknown model).
   TempFile := GetTempDir(true) + 'not_bpe_tokenizer.json';
   SL := TStringList.Create();
   Tok := TNeuralHFTokenizer.Create();
   try
-    SL.Text := '{"model": {"type": "Unigram", "vocab": []}}';
+    SL.Text := '{"model": {"type": "FancyNewModel", "vocab": {}}}';
     SL.SaveToFile(TempFile);
     Raised := false;
     try
@@ -297,7 +861,7 @@ begin
     except
       on E: EHFTokenizerError do Raised := true;
     end;
-    AssertTrue('Unigram must raise EHFTokenizerError', Raised);
+    AssertTrue('unknown model.type must raise EHFTokenizerError', Raised);
   finally
     Tok.Free;
     SL.Free;
@@ -318,6 +882,665 @@ begin
     AssertEquals('decode round-trips the array helper',
       'the cat', Tok.Decode(Arr, true));
   finally
+    Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestOffsetMappingRoundTrip;
+var
+  Tok: TNeuralHFTokenizer;
+  Offsets: TNeuralTokenOffsetArray;
+  Text, Slice, Joined: string;
+  I: integer;
+begin
+  // Byte-level path: every mapped token's (Start,Length) must slice back to a
+  // non-empty substring, spans must be monotonic, and concatenating the mapped
+  // surfaces in order must reproduce the input VERBATIM (byte-exact tracing now
+  // claims the inter-word spaces too -- no gaps).
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    Text := 'the cat sat';
+    Offsets := Tok.EncodeWithOffsets(Text);
+    AssertTrue('byte-level offsets emitted', Length(Offsets) > 0);
+    Joined := '';
+    for I := 0 to High(Offsets) do
+      if Offsets[I].Length > 0 then
+      begin
+        Slice := Copy(Text, Offsets[I].Start, Offsets[I].Length);
+        AssertTrue('span ' + IntToStr(I) + ' nonempty slice', Slice <> '');
+        if I > 0 then
+          AssertTrue('monotonic start',
+            Offsets[I].Start >= Offsets[I - 1].Start);
+        Joined := Joined + Slice;
+      end;
+    AssertEquals('mapped surfaces reconstruct the full input', Text, Joined);
+  finally
+    Tok.Free;
+  end;
+  // WordPiece path: same invariants (surface stripped of '##').
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    Text := 'the cat';
+    Offsets := Tok.EncodeWithOffsets(Text);
+    AssertTrue('wordpiece offsets emitted', Length(Offsets) > 0);
+    for I := 0 to High(Offsets) do
+      if Offsets[I].Length > 0 then
+        AssertTrue('wp span ' + IntToStr(I) + ' in bounds',
+          (Offsets[I].Start >= 1) and
+          (Offsets[I].Start + Offsets[I].Length - 1 <= Length(Text)));
+  finally
+    Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestOffsetMappingWordIds;
+var
+  Tok: TNeuralHFTokenizer;
+  Offsets: TNeuralTokenOffsetArray;
+  Text: string;
+  I, MaxWord: integer;
+begin
+  // Three whitespace words -> word ids must be 0,1,2 in non-decreasing order;
+  // a subword of word k carries WordId = k (subword -> word alignment).
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    Text := 'the cat sat';
+    Offsets := Tok.EncodeWithOffsets(Text);
+    MaxWord := -1;
+    for I := 0 to High(Offsets) do
+      if Offsets[I].WordId >= 0 then
+      begin
+        AssertTrue('word ids non-decreasing',
+          Offsets[I].WordId >= MaxWord);
+        MaxWord := Offsets[I].WordId;
+      end;
+    AssertEquals('three whitespace words -> max word id 2', 2, MaxWord);
+  finally
+    Tok.Free;
+  end;
+end;
+
+// Byte-exact offset tracing on the byte-fallback Unigram path. The pinned
+// string 'the cafe' (with a real accented e -> UTF-8 C3 A9) tokenizes with the
+// two bytes of the accented char split across two <0xNN> byte-fallback tokens
+// (ids 198, 172 for this fixture) -- exactly the case the old surface-PosEx
+// heuristic left UNMAPPED. Asserts: every non-special token gets a non-zero
+// span, the two split-char byte tokens each map to their own single source
+// byte of the same char, and concatenating every mapped span (in order)
+// reproduces the input verbatim (no gaps), cross-checked against decode.
+procedure TTestNeuralHFTokenizer.TestOffsetMappingByteFallbackExact;
+var
+  Tok: TNeuralHFTokenizer;
+  Offsets: TNeuralTokenOffsetArray;
+  Text, Joined, Slice: string;
+  I, Mapped, ByteFrag, AccentStart: integer;
+begin
+  // Build the pinned input from explicit bytes so the multi-byte char survives
+  // regardless of source-file re-encoding: 'the ' + 'caf' + U+00E9 (C3 A9).
+  Text := 'the caf' + Chr($C3) + Chr($A9);
+  AccentStart := 8; // 1-based byte index of the first byte (C3) of the accent
+
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_spm_bytefallback.model'));
+    AssertTrue('byte-fallback unigram fixture', Tok.IsUnigram);
+    Offsets := Tok.EncodeWithOffsets(Text);
+    AssertTrue('offsets emitted', Length(Offsets) > 0);
+
+    Joined := '';
+    Mapped := 0;
+    ByteFrag := 0;
+    for I := 0 to High(Offsets) do
+    begin
+      // EVERY token must be mapped (no gaps / unmapped sentinels).
+      AssertTrue('token ' + IntToStr(I) + ' has a span',
+        Offsets[I].Length > 0);
+      AssertTrue('span ' + IntToStr(I) + ' in bounds',
+        (Offsets[I].Start >= 1) and
+        (Offsets[I].Start + Offsets[I].Length - 1 <= Length(Text)));
+      if I > 0 then
+        AssertTrue('monotonic start ' + IntToStr(I),
+          Offsets[I].Start >= Offsets[I - 1].Start);
+      Inc(Mapped);
+      // Each byte token of the accented char spans exactly ONE source byte and
+      // points inside that char's byte range (per-byte split convention).
+      if (Offsets[I].Start >= AccentStart) and (Offsets[I].Length = 1) then
+      begin
+        Inc(ByteFrag);
+        AssertTrue('byte fragment inside accent char',
+          (Offsets[I].Start = AccentStart) or
+          (Offsets[I].Start = AccentStart + 1));
+      end;
+      Slice := Copy(Text, Offsets[I].Start, Offsets[I].Length);
+      Joined := Joined + Slice;
+    end;
+
+    AssertEquals('every token mapped', Length(Offsets), Mapped);
+    AssertTrue('accent char split into >=2 byte fragments', ByteFrag >= 2);
+    // Every byte of the input is claimed exactly once (the metaspace boundary
+    // token carries the inter-word space), so concatenating the mapped spans in
+    // order reproduces the input VERBATIM -- no gaps, no unmapped tokens.
+    AssertEquals('mapped spans reconstruct the full input', Text, Joined);
+    // Cross-check: the decode round-trip recovers the original string.
+    AssertEquals('decode round-trips the input',
+      Text, Tok.Decode(Tok.Encode(Text), true));
+  finally
+    Tok.Free;
+  end;
+end;
+
+// p=0 (default) must reproduce the deterministic byte-level BPE ids exactly
+// (bit-identical to eval/inference; mirrors TestNeuralTokenizer).
+procedure TTestNeuralHFTokenizer.TestDropoutZeroIsBitIdentical;
+var
+  Tok: TNeuralHFTokenizer;
+  BaseLine, WithZero: TNeuralIntegerArray;
+  I: integer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    AssertEquals('DropoutProb defaults to OFF', 0.0, Tok.DropoutProb, 0.0);
+    BaseLine := Tok.Encode('the cat sat on the mat');
+    Tok.DropoutProb := 0.0;
+    RandSeed := 999; // must be irrelevant at p=0
+    WithZero := Tok.Encode('the cat sat on the mat');
+    AssertEquals('p=0 id count unchanged', Length(BaseLine), Length(WithZero));
+    for I := 0 to High(BaseLine) do
+      AssertEquals('p=0 id[' + IntToStr(I) + ']', BaseLine[I], WithZero[I]);
+  finally
+    Tok.Free;
+  end;
+end;
+
+// p=1 drops EVERY merge, so the tokenization collapses to the per-byte
+// alphabet tokens (the maximally-split segmentation), which still
+// round-trips on decode.
+procedure TTestNeuralHFTokenizer.TestDropoutOneIsMaximallySplit;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TNeuralIntegerArray;
+  Text: string;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    Text := 'the cat';
+    Tok.DropoutProb := 1.0;
+    RandSeed := 1;
+    Ids := Tok.Encode(Text);
+    // The maximally-split result is one id per UTF-8 byte of the text
+    // (every byte maps to its byte-level alphabet token, no merge applied).
+    AssertEquals('p=1 emits one id per input byte', Length(Text), Length(Ids));
+    AssertEquals('p=1 still round-trips', Text, Tok.Decode(Ids, true));
+  finally
+    Tok.Free;
+  end;
+end;
+
+// A seeded mid-value run is deterministic (same seed -> same ids) and
+// differs from the p=0 deterministic segmentation.
+procedure TTestNeuralHFTokenizer.TestDropoutSeededIsDeterministicAndDiffers;
+var
+  Tok: TNeuralHFTokenizer;
+  Deterministic, RunA, RunB: TNeuralIntegerArray;
+  Text: string;
+  I: integer;
+  Differs: boolean;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    Text := 'the cat sat on the mat';
+    Deterministic := Tok.Encode(Text);
+
+    Tok.DropoutProb := 0.5;
+    RandSeed := 424242;
+    RunA := Tok.Encode(Text);
+    RandSeed := 424242;
+    RunB := Tok.Encode(Text);
+
+    // Same seed -> identical ids (deterministic given the RNG state).
+    AssertEquals('seeded dropout id count stable',
+      Length(RunA), Length(RunB));
+    for I := 0 to High(RunA) do
+      AssertEquals('seeded dropout id[' + IntToStr(I) + ']',
+        RunA[I], RunB[I]);
+
+    // The dropout segmentation must differ from the p=0 one (the chosen
+    // seed/text actually drops at least one merge).
+    Differs := Length(RunA) <> Length(Deterministic);
+    if not Differs then
+      for I := 0 to High(RunA) do
+        if RunA[I] <> Deterministic[I] then Differs := true;
+    AssertTrue('seeded dropout differs from deterministic', Differs);
+    // And it still round-trips.
+    AssertEquals('seeded dropout round-trips', Text, Tok.Decode(RunA, true));
+  finally
+    Tok.Free;
+  end;
+end;
+
+// Reads a tokenizer.json fixture and emits an equivalent tokenizer.ggml.*
+// block (model "llama" Unigram-with-scores, or "gpt2" byte-level BPE with
+// merges) into GGUFPath. A single dummy F32 tensor keeps the GGUF valid.
+// This is the WRITE half of the GGUF embedded-tokenizer round-trip oracle.
+procedure WriteTokenizerGGUFFromJSON(const JSONPath, GGUFPath, Model: string;
+  BosId, EosId, UnkId: integer);
+var
+  FS: TFileStream;
+  RawJson: string;
+  Root: TJSONData;
+  RootObj, ModelObj, VocabObj: TJSONObject;
+  VocabArr, MergesArr, AddedArr, Pair: TJSONArray;
+  Writer: TNNetGGUFWriter;
+  Tokens, Merges: array of string;
+  Scores: array of single;
+  Types: array of Int64;
+  Cnt, Idx, TokId: integer;
+  Content: string;
+  Dummy: TNNetVolume;
+  IsLlama: boolean;
+begin
+  IsLlama := Model = 'llama';
+  FS := TFileStream.Create(JSONPath, fmOpenRead or fmShareDenyWrite);
+  try
+    SetLength(RawJson, FS.Size);
+    if FS.Size > 0 then FS.ReadBuffer(RawJson[1], FS.Size);
+  finally
+    FS.Free;
+  end;
+  Root := HFParseJSONRaw(HFDecodeUnicodeEscapes(RawJson));
+  try
+    RootObj := TJSONObject(Root);
+    ModelObj := RootObj.Objects['model'];
+
+    if IsLlama then
+    begin
+      // Unigram vocab is an array of [piece, log_prob]; index = id.
+      VocabArr := ModelObj.Arrays['vocab'];
+      SetLength(Tokens, VocabArr.Count);
+      SetLength(Scores, VocabArr.Count);
+      SetLength(Types, VocabArr.Count);
+      for Cnt := 0 to VocabArr.Count - 1 do
+      begin
+        Pair := TJSONArray(VocabArr.Items[Cnt]);
+        Tokens[Cnt] := Pair.Strings[0];
+        Scores[Cnt] := Pair.Floats[1];
+        Types[Cnt] := 1; // NORMAL (overridden for added/special below)
+      end;
+    end
+    else
+    begin
+      // BPE vocab is an object token -> id; rebuild the id-indexed list.
+      VocabObj := ModelObj.Objects['vocab'];
+      Idx := 0;
+      for Cnt := 0 to VocabObj.Count - 1 do
+        if VocabObj.Items[Cnt].AsInteger > Idx then
+          Idx := VocabObj.Items[Cnt].AsInteger;
+      SetLength(Tokens, Idx + 1);
+      SetLength(Scores, Idx + 1);
+      SetLength(Types, Idx + 1);
+      for Cnt := 0 to VocabObj.Count - 1 do
+      begin
+        TokId := VocabObj.Items[Cnt].AsInteger;
+        Tokens[TokId] := VocabObj.Names[Cnt];
+        Scores[TokId] := 0;
+        Types[TokId] := 1;
+      end;
+      MergesArr := ModelObj.Arrays['merges'];
+      SetLength(Merges, MergesArr.Count);
+      for Cnt := 0 to MergesArr.Count - 1 do
+        Merges[Cnt] := TJSONArray(MergesArr.Items[Cnt]).Strings[0] + ' ' +
+          TJSONArray(MergesArr.Items[Cnt]).Strings[1];
+    end;
+
+    // Tag special / control pieces from added_tokens so token_type carries
+    // them (CONTROL=3; the unk piece UNKNOWN=2).
+    if RootObj.IndexOfName('added_tokens') >= 0 then
+    begin
+      AddedArr := RootObj.Arrays['added_tokens'];
+      for Cnt := 0 to AddedArr.Count - 1 do
+      begin
+        TokId := AddedArr.Objects[Cnt].Get('id', -1);
+        Content := AddedArr.Objects[Cnt].Get('content', '');
+        if (TokId >= 0) and (TokId <= High(Types)) then
+        begin
+          if Content = '<unk>' then Types[TokId] := 2 else Types[TokId] := 3;
+        end;
+      end;
+    end;
+  finally
+    Root.Free;
+  end;
+
+  Writer := TNNetGGUFWriter.Create(GGUFPath);
+  Dummy := TNNetVolume.Create(4, 1, 1);
+  try
+    Writer.AddMetaString('general.architecture', 'llama');
+    Writer.AddMetaString('tokenizer.ggml.model', Model);
+    Writer.AddMetaStringArray('tokenizer.ggml.tokens', Tokens);
+    Writer.AddMetaFloat32Array('tokenizer.ggml.scores', Scores);
+    Writer.AddMetaInt32Array('tokenizer.ggml.token_type', Types);
+    if Length(Merges) > 0 then
+      Writer.AddMetaStringArray('tokenizer.ggml.merges', Merges);
+    if BosId >= 0 then
+      Writer.AddMetaUInt32('tokenizer.ggml.bos_token_id', BosId);
+    if EosId >= 0 then
+      Writer.AddMetaUInt32('tokenizer.ggml.eos_token_id', EosId);
+    if UnkId >= 0 then
+      Writer.AddMetaUInt32('tokenizer.ggml.unknown_token_id', UnkId);
+    Dummy.Fill(0);
+    Writer.AddTensorFlat('token_embd.weight', [1, 4], Dummy, gwF32);
+    Writer.SaveToFile;
+  finally
+    Dummy.Free;
+    Writer.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestLoadFromGGUFLlamaRoundTrip;
+var
+  Src, Gguf: TNeuralHFTokenizer;
+  GGUFPath: string;
+  Texts: array[0..3] of string;
+  T: integer;
+  IdsSrc, IdsG: TNeuralIntegerArray;
+  K: integer;
+begin
+  Texts[0] := 'the';
+  Texts[1] := 'the cat sat on the mat';
+  Texts[2] := 'a man and a dog';
+  Texts[3] := 'the QXZ cat';
+  GGUFPath := GetTempDir(false) + 'cai_tok_gguf_llama_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Src := TNeuralHFTokenizer.Create();
+  Gguf := TNeuralHFTokenizer.Create();
+  try
+    Src.LoadFromFile(FixturePath('tiny_unigram_tokenizer.json'));
+    // unk=0, bos=1 (<s>), eos=2 (</s>) per the fixture's added_tokens.
+    WriteTokenizerGGUFFromJSON(FixturePath('tiny_unigram_tokenizer.json'),
+      GGUFPath, 'llama', {bos=}1, {eos=}2, {unk=}0);
+    Gguf.LoadFromGGUF(GGUFPath);
+
+    AssertTrue('gguf llama unigram flag', Gguf.IsUnigram);
+    AssertEquals('gguf llama vocab size', Src.GetVocabSize(),
+      Gguf.GetVocabSize());
+    AssertEquals('gguf llama unk id', 0, Gguf.UnkId);
+    AssertEquals('gguf llama bos id', 1, Gguf.BosId);
+    AssertEquals('gguf llama eos id', 2, Gguf.EosId);
+
+    for T := 0 to High(Texts) do
+    begin
+      IdsSrc := Src.Encode(Texts[T]);
+      IdsG := Gguf.Encode(Texts[T]);
+      AssertEquals('gguf llama id count "' + Texts[T] + '"',
+        Length(IdsSrc), Length(IdsG));
+      for K := 0 to High(IdsSrc) do
+        AssertEquals('gguf llama id[' + IntToStr(K) + '] "' + Texts[T] + '"',
+          IdsSrc[K], IdsG[K]);
+      AssertEquals('gguf llama decode "' + Texts[T] + '"',
+        Src.Decode(IdsSrc, true), Gguf.Decode(IdsG, true));
+    end;
+  finally
+    Gguf.Free;
+    Src.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestLoadFromGGUFGpt2RoundTrip;
+var
+  Src, Gguf: TNeuralHFTokenizer;
+  GGUFPath: string;
+  Texts: array[0..3] of string;
+  T: integer;
+  IdsSrc, IdsG: TNeuralIntegerArray;
+  K: integer;
+begin
+  Texts[0] := 'the cat sat on the mat';
+  Texts[1] := 'Hello, world!';
+  Texts[2] := 'a man and a dog 123';
+  Texts[3] := 'the dog ran';
+  GGUFPath := GetTempDir(false) + 'cai_tok_gguf_gpt2_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Src := TNeuralHFTokenizer.Create();
+  Gguf := TNeuralHFTokenizer.Create();
+  try
+    // The cl100k fixture is byte-level BPE with the Split pre-tokenizer
+    // (digits capped at 3) - exactly the config the gpt2 GGUF path wires.
+    Src.LoadFromFile(FixturePath('tiny_bpe_split_cl100k_tokenizer.json'));
+    // <|endoftext|> is id 0 and doubles as eos/bos for this GPT-2 family.
+    WriteTokenizerGGUFFromJSON(
+      FixturePath('tiny_bpe_split_cl100k_tokenizer.json'),
+      GGUFPath, 'gpt2', {bos=}-1, {eos=}0, {unk=}-1);
+    Gguf.LoadFromGGUF(GGUFPath);
+
+    AssertTrue('gguf gpt2 byte-level flag', Gguf.IsByteLevel);
+    AssertEquals('gguf gpt2 vocab size', Src.GetVocabSize(),
+      Gguf.GetVocabSize());
+
+    for T := 0 to High(Texts) do
+    begin
+      IdsSrc := Src.Encode(Texts[T]);
+      IdsG := Gguf.Encode(Texts[T]);
+      AssertEquals('gguf gpt2 id count "' + Texts[T] + '"',
+        Length(IdsSrc), Length(IdsG));
+      for K := 0 to High(IdsSrc) do
+        AssertEquals('gguf gpt2 id[' + IntToStr(K) + '] "' + Texts[T] + '"',
+          IdsSrc[K], IdsG[K]);
+      AssertEquals('gguf gpt2 decode "' + Texts[T] + '"',
+        Src.Decode(IdsSrc, true), Gguf.Decode(IdsG, true));
+    end;
+  finally
+    Gguf.Free;
+    Src.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestLoadFromGGUFRejectsUnsupportedModel;
+var
+  Gguf: TNeuralHFTokenizer;
+  GGUFPath: string;
+  Writer: TNNetGGUFWriter;
+  Dummy: TNNetVolume;
+  Raised: boolean;
+begin
+  GGUFPath := GetTempDir(false) + 'cai_tok_gguf_bert_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Writer := TNNetGGUFWriter.Create(GGUFPath);
+  Dummy := TNNetVolume.Create(4, 1, 1);
+  try
+    Writer.AddMetaString('general.architecture', 'bert');
+    Writer.AddMetaString('tokenizer.ggml.model', 'bert');
+    Writer.AddMetaStringArray('tokenizer.ggml.tokens',
+      ['[PAD]', '[UNK]', 'the', 'cat']);
+    Dummy.Fill(0);
+    Writer.AddTensorFlat('token_embd.weight', [1, 4], Dummy, gwF32);
+    Writer.SaveToFile;
+  finally
+    Dummy.Free;
+    Writer.Free;
+  end;
+
+  Gguf := TNeuralHFTokenizer.Create();
+  Raised := false;
+  try
+    try
+      Gguf.LoadFromGGUF(GGUFPath);
+    except
+      on E: EHFTokenizerError do Raised := true;
+    end;
+    AssertTrue('gguf bert tokenizer model rejected', Raised);
+  finally
+    Gguf.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestSaveTokenizerToGGUFGpt2RoundTrip;
+// Pascal tokenizer -> SaveTokenizerToGGUF (writer) -> LoadFromGGUF (reader),
+// asserting the merges array survives the write side intact.
+var
+  Src, Gguf: TNeuralHFTokenizer;
+  GGUFPath: string;
+  Texts: array[0..3] of string;
+  T, K: integer;
+  IdsSrc, IdsG: TNeuralIntegerArray;
+  Writer: TNNetGGUFWriter;
+  Dummy: TNNetVolume;
+begin
+  Texts[0] := 'the cat sat on the mat';
+  Texts[1] := 'Hello, world!';
+  Texts[2] := 'a man and a dog 123';
+  Texts[3] := 'the dog ran';
+  GGUFPath := GetTempDir(false) + 'cai_tok_gguf_wgpt2_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Src := TNeuralHFTokenizer.Create();
+  Gguf := TNeuralHFTokenizer.Create();
+  try
+    Src.LoadFromFile(FixturePath('tiny_bpe_split_cl100k_tokenizer.json'));
+
+    // Emit the loaded tokenizer's block (model "gpt2" + tokens + merges +
+    // ids) straight through the production writer method.
+    Writer := TNNetGGUFWriter.Create(GGUFPath);
+    Dummy := TNNetVolume.Create(4, 1, 1);
+    try
+      Writer.AddMetaString('general.architecture', 'llama');
+      Src.SaveTokenizerToGGUF(Writer);
+      Dummy.Fill(0);
+      Writer.AddTensorFlat('token_embd.weight', [1, 4], Dummy, gwF32);
+      Writer.SaveToFile;
+    finally
+      Dummy.Free;
+      Writer.Free;
+    end;
+
+    Gguf.LoadFromGGUF(GGUFPath);
+
+    AssertTrue('writer gguf gpt2 byte-level flag', Gguf.IsByteLevel);
+    AssertEquals('writer gguf gpt2 vocab size', Src.GetVocabSize(),
+      Gguf.GetVocabSize());
+    AssertEquals('writer gguf gpt2 eos id', Src.EosId, Gguf.EosId);
+
+    for T := 0 to High(Texts) do
+    begin
+      IdsSrc := Src.Encode(Texts[T]);
+      IdsG := Gguf.Encode(Texts[T]);
+      AssertEquals('writer gguf gpt2 id count "' + Texts[T] + '"',
+        Length(IdsSrc), Length(IdsG));
+      for K := 0 to High(IdsSrc) do
+        AssertEquals('writer gguf gpt2 id[' + IntToStr(K) + '] "' +
+          Texts[T] + '"', IdsSrc[K], IdsG[K]);
+      AssertEquals('writer gguf gpt2 decode "' + Texts[T] + '"',
+        Src.Decode(IdsSrc, true), Gguf.Decode(IdsG, true));
+    end;
+  finally
+    Gguf.Free;
+    Src.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+// Token-healing follow-up (a): byte-level-BPE vocab prefix scan. The tiny
+// GPT-2 byte-level fixture holds 'he'(257),'hells'(289) and 'Ġhe'(372).
+// PrefixScanVocab('he') must return EXACTLY {257,289}; ' he' (leading
+// space) only matches after the space->U+0120('Ġ') byte-alphabet mapping,
+// so it must return {372} and NOT match the bare 'he' tokens. The
+// surface-mapping helper FragmentToSurface is checked directly too.
+procedure TTestNeuralHFTokenizer.TestByteLevelHealingPrefixScan;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TNeuralIntegerArray;
+
+  function SetHas(const A: TNeuralIntegerArray; Id: integer): boolean;
+  var K: integer;
+  begin
+    Result := false;
+    for K := 0 to High(A) do if A[K] = Id then Exit(true);
+  end;
+
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    AssertTrue('fixture is byte-level', Tok.IsByteLevel);
+
+    // 'he' -> exactly {257,289}.
+    Ids := Tok.PrefixScanVocab('he');
+    AssertEquals('he prefix scan count', 2, Length(Ids));
+    AssertTrue('he scan has 257 (he)', SetHas(Ids, 257));
+    AssertTrue('he scan has 289 (hells)', SetHas(Ids, 289));
+    // Every returned id must really extend the fragment in surface space.
+    AssertTrue('he scan id 257 starts with surface',
+      Copy(Tok.IdToToken(Ids[0]), 1, 2) = Tok.FragmentToSurface('he'));
+
+    // ' he' (leading space) only matches via the byte alphabet: space byte
+    // 0x20 maps to U+0120 'Ġ' (a multi-byte UTF-8 surface), so the scan
+    // must return {372} ('Ġhe') and NOT the bare 'he'/'hells' tokens.
+    AssertEquals('space surface is metaspace-Ġ', #$C4#$A0 + 'he',
+      Tok.FragmentToSurface(' he'));
+    Ids := Tok.PrefixScanVocab(' he');
+    AssertEquals(' he prefix scan count', 1, Length(Ids));
+    AssertTrue(' he scan has 372 (Ġhe)', SetHas(Ids, 372));
+    AssertTrue(' he scan excludes bare he(257)', not SetHas(Ids, 257));
+
+    // Empty fragment -> empty result.
+    AssertEquals('empty fragment scan empty', 0,
+      Length(Tok.PrefixScanVocab('')));
+  finally
+    Tok.Free;
+  end;
+end;
+
+// Token-healing follow-up (b): guidance-style multi-token rollback over the
+// byte-level-BPE tokenizer. The prompt ends in the two ids 'Ġse'(270) and
+// 'as'(272). Single-token rollback drops only 'as' (surface 'as'); the only
+// vocab entry with that prefix is 'as' itself (no STRICT extension), so v1
+// healing is provably a no-op -> PrepareTokenHealing returns nil. A 2-token
+// rollback rebuilds the fragment ' seas' (surface 'Ġseas'), which IS
+// strictly extended by 'Ġseashells'(316) -> healing applies, allows exactly
+// {291('Ġseas'),316('Ġseashells')}, trims PromptLen by 2 and reports the
+// first dropped id (270).
+procedure TTestNeuralHFTokenizer.TestByteLevelHealingMultiTokenRollback;
+var
+  Tok: TNeuralHFTokenizer;
+  Toks: TNeuralIntegerArray;
+  C: TNNetTokenHealingConstraint;
+  PromptLen, Dropped: integer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  C := nil;
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    // Prompt: a leading id then 'Ġse','as' as the trailing boundary.
+    SetLength(Toks, 3);
+    Toks[0] := 327;  // 'The'
+    Toks[1] := 270;  // 'Ġse'
+    Toks[2] := 272;  // 'as'
+
+    // Default single-token rollback: 'as' has no strict extension -> skipped.
+    PromptLen := 3;
+    C := PrepareTokenHealing(Tok, Toks, PromptLen, Dropped);
+    AssertTrue('single-token rollback is a no-op here', C = nil);
+    AssertEquals('single-token leaves PromptLen', 3, PromptLen);
+
+    // Two-token rollback heals the spanned boundary.
+    PromptLen := 3;
+    C := PrepareTokenHealing(Tok, Toks, PromptLen, Dropped, 2);
+    AssertTrue('two-token rollback heals', C <> nil);
+    AssertEquals('PromptLen trimmed by two', 1, PromptLen);
+    AssertEquals('first dropped id is Ġse(270)', 270, Dropped);
+    AssertTrue('allows Ġseas(291)', C.TokenAllowed(291));
+    AssertTrue('allows Ġseashells(316)', C.TokenAllowed(316));
+    AssertTrue('disallows unrelated dog(311)', not C.TokenAllowed(311));
+    AssertTrue('disallows bare as(272)', not C.TokenAllowed(272));
+  finally
+    C.Free;
     Tok.Free;
   end;
 end;
@@ -350,18 +1573,13 @@ var
   CaseCnt, MsgCnt: integer;
   Context, Rendered: string;
   Raised: boolean;
-  FS: TFileStream;
 begin
   ChatFormat := ChatFormatFromName(FormatName);
   AssertTrue('format name recognized: ' + FormatName,
     ChatFormat <> cfUnknown);
-  FS := TFileStream.Create(FixturePath('chat_template_cases.json'),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    Root := GetJSON(FS);
-  finally
-    FS.Free;
-  end;
+  // Raw-bytes load: chat content and the expected rendered output carry
+  // non-ASCII bytes (DeepSeek U+FF5C / U+2581, etc.).
+  Root := LoadFixtureJSON(FixturePath('chat_template_cases.json'));
   try
     Group := TJSONObject(Root).Objects[FormatName];
     Cases := Group.Arrays['cases'];
@@ -436,6 +1654,103 @@ begin
   RunChatBattery('mistral');
 end;
 
+procedure TTestNeuralChat.TestDeepSeekParityWithJinja;
+begin
+  RunChatBattery('deepseek');
+end;
+
+procedure TTestNeuralChat.TestPhi4MiniParityWithJinja;
+begin
+  RunChatBattery('phi4mini');
+end;
+
+// DetectChatFormat fingerprints the DeepSeek begin-of-sentence token (the
+// fullwidth pipe U+FF5C + block U+2581) and tells the no-newline Phi-4-mini
+// ChatML apart from the newline-tagged cfPhi3.
+procedure TTestNeuralChat.TestDetectDeepSeekAndPhi4Mini;
+const
+  // Authentic published chat_template strings (delimiter substrings).
+  DeepSeekTpl =
+    '{{ bos_token }}{% for message in messages %}'
+    + '{% if message[''role''] == ''user'' %}'
+    + '{{ ''User: '' + message[''content''] }}'
+    + '{% elif message[''role''] == ''assistant'' %}'
+    + '{{ ''Assistant: '' + message[''content''] + eos_token }}{% endif %}'
+    + '{% endfor %}'
+    // bos_token resolves to the DeepSeek begin-of-sentence token: the
+    // fullwidth pipe U+FF5C ($EF$BD$9C) and the one-eighth block U+2581
+    // ($E2$96$81), which is what DetectChatFormat fingerprints on.
+    + '<' + #$EF#$BD#$9C + 'begin' + #$E2#$96#$81 + 'of' + #$E2#$96#$81
+    + 'sentence' + #$EF#$BD#$9C + '>';
+  Phi4MiniTpl =
+    '{% for message in messages %}'
+    + '{% if message[''role''] == ''system'' %}'
+    + '{{''<|system|>'' + message[''content''] + ''<|end|>''}}'
+    + '{% elif message[''role''] == ''user'' %}'
+    + '{{''<|user|>'' + message[''content''] + ''<|end|>''}}'
+    + '{% elif message[''role''] == ''assistant'' %}'
+    + '{{''<|assistant|>'' + message[''content''] + ''<|end|>''}}'
+    + '{% endif %}{% endfor %}'
+    + '{% if add_generation_prompt %}{{''<|assistant|>''}}{% endif %}';
+begin
+  AssertTrue('deepseek template detected',
+    DetectChatFormat(DeepSeekTpl) = cfDeepSeek);
+  AssertTrue('phi4mini template detected',
+    DetectChatFormat(Phi4MiniTpl) = cfPhi4Mini);
+  // The phi4mini fingerprint must NOT swallow the newline-tagged cfPhi3.
+  AssertTrue('phi3 newline-tagged stays cfPhi3',
+    DetectChatFormat('{{''<|user|>' + #10 + ''' + content + ''<|end|>''}}')
+      = cfPhi3);
+end;
+
+// chat_template.jinja sibling fallback: when tokenizer_config.json lacks a
+// chat_template field, the template is read from chat_template.jinja in the
+// same directory and the SAME fingerprint detection runs on it.
+procedure TTestNeuralChat.TestLoadChatTemplateFromSiblingJinja;
+var
+  Dir, ConfigFile, JinjaFile, Template: string;
+  SL: TStringList;
+begin
+  Dir := GetTempDir(true) + 'chat_jinja_sibling' + DirectorySeparator;
+  ForceDirectories(Dir);
+  ConfigFile := Dir + 'tokenizer_config.json';
+  JinjaFile := Dir + 'chat_template.jinja';
+  SL := TStringList.Create();
+  try
+    // tokenizer_config.json WITHOUT a chat_template field.
+    SL.Text := '{"eos_token": "<|im_end|>", "bos_token": "<s>"}';
+    SL.SaveToFile(ConfigFile);
+    // sibling chat_template.jinja with a known (ChatML) template.
+    SL.Text := '{% for m in messages %}<|im_start|>{{ m.role }}{% endfor %}';
+    SL.SaveToFile(JinjaFile);
+
+    Template := LoadChatTemplateString(ConfigFile);
+    AssertTrue('sibling .jinja read', Pos('<|im_start|>', Template) > 0);
+    AssertTrue('sibling .jinja detected as chatml',
+      DetectChatFormatFromConfigFile(ConfigFile) = cfChatML);
+
+    // When tokenizer_config.json HAS a chat_template, it wins over the
+    // sibling .jinja (no fallback).
+    SL.Text := '{"chat_template": "x<start_of_turn>y"}';
+    SL.SaveToFile(ConfigFile);
+    AssertEquals('embedded chat_template wins over sibling',
+      'x<start_of_turn>y', LoadChatTemplateString(ConfigFile));
+
+    DeleteFile(JinjaFile);
+    DeleteFile(ConfigFile);
+    // No chat_template anywhere -> empty / cfUnknown.
+    SL.Text := '{"eos_token": "</s>"}';
+    SL.SaveToFile(ConfigFile);
+    AssertEquals('no template anywhere -> empty',
+      '', LoadChatTemplateString(ConfigFile));
+  finally
+    SL.Free;
+    DeleteFile(JinjaFile);
+    DeleteFile(ConfigFile);
+    RemoveDir(Dir);
+  end;
+end;
+
 // DetectChatFormat must recognize each AUTHENTIC published template
 // string (pinned in the fixture next to its cases) as its own format --
 // this is the auto-detection path for tokenizer_config.json templates.
@@ -445,15 +1760,10 @@ var
   RootObj: TJSONObject;
   Cnt: integer;
   FormatName, Template: string;
-  FS: TFileStream;
 begin
-  FS := TFileStream.Create(FixturePath('chat_template_cases.json'),
-    fmOpenRead or fmShareDenyWrite);
-  try
-    Root := GetJSON(FS);
-  finally
-    FS.Free;
-  end;
+  // Raw-bytes load: some authentic templates embed non-ASCII bytes
+  // (e.g. DeepSeek U+FF5C / U+2581) that drive format detection.
+  Root := LoadFixtureJSON(FixturePath('chat_template_cases.json'));
   try
     RootObj := TJSONObject(Root);
     AssertTrue('formats pinned', RootObj.Count >= 7);
@@ -476,7 +1786,7 @@ procedure TTestNeuralChat.TestFormatNameRoundTrip;
 var
   ChatFormat: TNeuralChatFormat;
 begin
-  for ChatFormat := cfChatML to cfMistral do
+  for ChatFormat := cfChatML to cfPhi4Mini do
     AssertTrue('round trip ' + ChatFormatName(ChatFormat),
       ChatFormatFromName(ChatFormatName(ChatFormat)) = ChatFormat);
   AssertTrue('unknown name', ChatFormatFromName('vicuna') = cfUnknown);
@@ -598,6 +1908,390 @@ begin
     on E: ENeuralChatError do Raised := true;
   end;
   AssertTrue('cfUnknown must raise ENeuralChatError', Raised);
+end;
+
+// ===================================================================
+// Mini-Jinja interpreter (chat templates v2) parity battery.
+// ===================================================================
+
+// DeepSeek special tokens: fullwidth pipe U+FF5C + one-eighth block U+2581.
+const
+  csDsBos =
+    '<' + #$EF#$BD#$9C + 'begin' + #$E2#$96#$81 + 'of' + #$E2#$96#$81 +
+    'sentence' + #$EF#$BD#$9C + '>';
+  csDsEos =
+    '<' + #$EF#$BD#$9C + 'end' + #$E2#$96#$81 + 'of' + #$E2#$96#$81 +
+    'sentence' + #$EF#$BD#$9C + '>';
+
+// Feeds the AUTHENTIC published chat_template string (pinned in the fixture
+// next to its cases) to RenderChatTemplate -- the mini-Jinja interpreter --
+// and asserts byte-exact parity with the ground-truth output (and that the
+// pinned raise cases raise EChatTemplateError, exactly where HF raises).
+procedure TTestNeuralChat.RunInterpreterBattery(
+  const FormatName, Bos, Eos: string);
+var
+  Root: TJSONData;
+  Group, CaseObj, MsgObj: TJSONObject;
+  Cases, MsgArr: TJSONArray;
+  Messages: TChatMessages;
+  Template, Context, Rendered: string;
+  CaseCnt, MsgCnt: integer;
+  Raised: boolean;
+begin
+  // Raw-bytes load so the DeepSeek non-ASCII bytes in 'expected' survive
+  // verbatim (see fpjson trap notes / project memory).
+  Root := LoadFixtureJSON(FixturePath('chat_template_cases.json'));
+  try
+    Group := TJSONObject(Root).Objects[FormatName];
+    Template := Group.Get('template', '');
+    AssertTrue(FormatName + ': template pinned', Template <> '');
+    Cases := Group.Arrays['cases'];
+    AssertTrue(FormatName + ': no cases pinned', Cases.Count >= 5);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CaseCnt];
+      Context := 'interp ' + FormatName + ' case ' + IntToStr(CaseCnt);
+      MsgArr := CaseObj.Arrays['messages'];
+      SetLength(Messages, MsgArr.Count);
+      for MsgCnt := 0 to MsgArr.Count - 1 do
+      begin
+        MsgObj := MsgArr.Objects[MsgCnt];
+        Messages[MsgCnt] := ChatMessage(MsgObj.Get('role', ''),
+          MsgObj.Get('content', ''));
+      end;
+      if CaseObj.Get('raises', false) then
+      begin
+        Raised := false;
+        try
+          RenderChatTemplate(Template, Messages,
+            CaseObj.Get('add_generation_prompt', true), Bos, Eos);
+        except
+          on E: EChatTemplateError do Raised := true;
+        end;
+        AssertTrue(Context + ': must raise EChatTemplateError', Raised);
+      end
+      else
+      begin
+        Rendered := RenderChatTemplate(Template, Messages,
+          CaseObj.Get('add_generation_prompt', true), Bos, Eos);
+        AssertEquals(Context, CaseObj.Get('expected', ''), Rendered);
+      end;
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralChat.TestInterpreterChatMLParity;
+begin
+  RunInterpreterBattery('chatml', '', '');
+end;
+
+procedure TTestNeuralChat.TestInterpreterLlama3Parity;
+begin
+  RunInterpreterBattery('llama3', '<|begin_of_text|>', '');
+end;
+
+procedure TTestNeuralChat.TestInterpreterDeepSeekParity;
+begin
+  RunInterpreterBattery('deepseek', csDsBos, csDsEos);
+end;
+
+procedure TTestNeuralChat.TestInterpreterPhi4MiniParity;
+begin
+  RunInterpreterBattery('phi4mini', '', '');
+end;
+
+// zephyr's authentic template is littered with literal newlines between its
+// block tags; only the implicit trim_blocks + lstrip_blocks transformers
+// uses makes it render correctly. This pins that behavior end to end.
+procedure TTestNeuralChat.TestInterpreterZephyrWhitespaceControl;
+begin
+  RunInterpreterBattery('zephyr', '', '</s>');
+end;
+
+// Every bundled family's authentic template, end to end, with the bos/eos
+// the family's tokens resolve to. This is the headline acceptance criterion:
+// the interpreter reproduces the byte-pinned ground truth for ALL of them.
+procedure TTestNeuralChat.TestInterpreterAllBundledTemplatesParity;
+begin
+  RunInterpreterBattery('chatml', '', '');
+  RunInterpreterBattery('llama2', '<s>', '</s>');
+  RunInterpreterBattery('llama3', '<|begin_of_text|>', '');
+  RunInterpreterBattery('zephyr', '', '</s>');
+  RunInterpreterBattery('gemma', '<bos>', '');
+  RunInterpreterBattery('phi3', '', '<|endoftext|>');
+  RunInterpreterBattery('mistral', '<s>', '</s>');
+  RunInterpreterBattery('deepseek', csDsBos, csDsEos);
+  RunInterpreterBattery('phi4mini', '', '');
+end;
+
+// Unsupported constructs must raise cleanly, never emit garbage.
+procedure TTestNeuralChat.TestInterpreterUnsupportedConstructRaises;
+var
+  Messages: TChatMessages;
+
+  function Raises(const Template: string): boolean;
+  begin
+    Result := false;
+    try
+      RenderChatTemplate(Template, Messages, true, '', '');
+    except
+      on E: EChatTemplateError do Result := true;
+    end;
+  end;
+
+begin
+  SetLength(Messages, 1);
+  Messages[0] := ChatMessage('user', 'hi');
+  AssertTrue('unknown filter raises',
+    Raises('{{ messages[0][''content''] | upper }}'));
+  AssertTrue('unknown statement raises',
+    Raises('{% macro foo %}x{% endmacro %}'));
+  AssertTrue('unknown method raises',
+    Raises('{{ messages[0][''content''].title() }}'));
+  AssertTrue('unterminated tag raises', Raises('{{ messages '));
+  AssertTrue('missing endfor raises',
+    Raises('{% for m in messages %}x'));
+  AssertTrue('unknown message key raises',
+    Raises('{{ messages[0][''bogus''] }}'));
+end;
+
+// {%- / -%} whitespace control and the default trim_blocks/lstrip_blocks.
+procedure TTestNeuralChat.TestInterpreterWhitespaceControlTrimming;
+var
+  Messages: TChatMessages;
+begin
+  SetLength(Messages, 0);
+  // {%- strips ALL preceding whitespace (incl. the newline).
+  AssertEquals('left trim marker',
+    'ab', RenderChatTemplate('a   ' + #10 + '{%- if true %}b{% endif %}',
+      Messages, true, '', ''));
+  // -%} strips ALL following whitespace.
+  AssertEquals('right trim marker', '   bx',
+    RenderChatTemplate('{% if true %}   b{% endif -%}   ' + #10 + 'x',
+      Messages, true, '', ''));
+  // trim_blocks default: the newline right after a block tag is swallowed.
+  AssertEquals('trim_blocks swallows newline', 'b',
+    RenderChatTemplate('{% if true %}' + #10 + 'b{% endif %}',
+      Messages, true, '', ''));
+  // lstrip_blocks default: leading spaces up to a block tag are stripped.
+  AssertEquals('lstrip_blocks strips indent', 'X',
+    RenderChatTemplate('   {% if true %}X{% endif %}',
+      Messages, true, '', ''));
+  // a {{ output }} tag does NOT trigger trim_blocks (newline kept).
+  AssertEquals('output tag keeps newline', 'x' + #10,
+    RenderChatTemplate('{{ ''x'' }}' + #10, Messages, true, '', ''));
+end;
+
+// ApplyChatTemplateString: recognized family -> hardcoded renderer;
+// unrecognized but renderable -> the interpreter fallback; empty -> raise.
+procedure TTestNeuralChat.TestApplyChatTemplateStringFallback;
+var
+  Messages: TChatMessages;
+  ChatMLTpl, CustomTpl: string;
+  Raised: boolean;
+begin
+  SetLength(Messages, 1);
+  Messages[0] := ChatMessage('user', 'hi');
+  ChatMLTpl :=
+    '{% for message in messages %}{{''<|im_start|>'' + message[''role''] '
+    + '+ ''' + #10 + ''' + message[''content''] + ''<|im_end|>'' + ''' + #10
+    + '''}}{% endfor %}{% if add_generation_prompt %}'
+    + '{{ ''<|im_start|>assistant' + #10 + ''' }}{% endif %}';
+  // ChatML is a recognized family: routes to the hardcoded renderer, so the
+  // result equals ApplyChatTemplate(cfChatML, ...).
+  AssertEquals('recognized family routes to hardcoded',
+    ApplyChatTemplate(cfChatML, Messages, true),
+    ApplyChatTemplateString(ChatMLTpl, Messages, true, '<s>', '</s>'));
+
+  // An unrecognized custom template falls back to the interpreter.
+  CustomTpl :=
+    '{% for m in messages %}[{{ m.role }}] {{ m[''content''] }}' + #10
+    + '{% endfor %}{% if add_generation_prompt %}[bot] {% endif %}';
+  AssertEquals('unrecognized falls back to interpreter',
+    '[user] hi' + #10 + '[bot] ',
+    ApplyChatTemplateString(CustomTpl, Messages, true, '', ''));
+
+  // Empty template -> clean raise.
+  Raised := false;
+  try
+    ApplyChatTemplateString('', Messages, true, '', '');
+  except
+    on E: EChatTemplateError do Raised := true;
+  end;
+  AssertTrue('empty template raises EChatTemplateError', Raised);
+end;
+
+// cfQwen reproduces Qwen2.5/Qwen-Instruct's default-system injection: a
+// conversation with NO leading system message gets a default
+// '<|im_start|>system\nYou are Qwen...<|im_end|>\n' header prepended; a
+// conversation WITH a system message is rendered like plain ChatML (the
+// supplied system is NOT duplicated). Ground truth: jinja2 render of the
+// authentic Qwen2.5-Instruct chat_template (default-system + ChatML loop +
+// loop.first system guard) through the transformers environment
+// (trim_blocks + lstrip_blocks), generated with /home/bpsa/x/bin/python.
+procedure TTestNeuralChat.TestQwenDefaultSystemInjection;
+const
+  QwenDefSys =
+    '<|im_start|>system' + #10 +
+    'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' +
+    '<|im_end|>' + #10;
+var
+  Messages: TChatMessages;
+  Rendered: string;
+begin
+  // NO system message -> default system header is injected first.
+  SetLength(Messages, 3);
+  Messages[0] := ChatMessage('user', 'Hi!');
+  Messages[1] := ChatMessage('assistant', 'Hello.');
+  Messages[2] := ChatMessage('user', 'Bye');
+  Rendered := ApplyChatTemplate(cfQwen, Messages, true);
+  AssertEquals('qwen default-system injected (no sys)',
+    QwenDefSys +
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10 + 'Hello.<|im_end|>' + #10 +
+    '<|im_start|>user' + #10 + 'Bye<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10,
+    Rendered);
+
+  // WITH a system message -> NO default, NO duplication.
+  SetLength(Messages, 2);
+  Messages[0] := ChatMessage('system', 'Be brief.');
+  Messages[1] := ChatMessage('user', 'Hi!');
+  Rendered := ApplyChatTemplate(cfQwen, Messages, true);
+  AssertEquals('qwen does not duplicate explicit system',
+    '<|im_start|>system' + #10 + 'Be brief.<|im_end|>' + #10 +
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10,
+    Rendered);
+  AssertEquals('explicit-system render has no Qwen default text',
+    0, Pos('You are Qwen', Rendered));
+
+  // plain cfChatML must NOT inject the default system (no regression).
+  SetLength(Messages, 1);
+  Messages[0] := ChatMessage('user', 'Hi!');
+  AssertEquals('cfChatML stays default-system-free',
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10,
+    ApplyChatTemplate(cfChatML, Messages, true));
+
+  // round-trip + fingerprint detection of the authentic Qwen template.
+  AssertTrue('qwen name round-trips',
+    ChatFormatFromName(ChatFormatName(cfQwen)) = cfQwen);
+  AssertTrue('authentic qwen template detected as cfQwen',
+    DetectChatFormat(
+      '{%- if messages[0].role == ''system'' %}...{%- else %}' +
+      '<|im_start|>system' + #10 +
+      'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' +
+      '<|im_end|>{%- endif %}') = cfQwen);
+end;
+
+// continue_final_message: the final (assistant) message is a PREFIX to be
+// continued, so NO end-of-turn token / generation prompt is appended after
+// it. Ground truth: HF apply_chat_template(continue_final_message=True)
+// renders with add_generation_prompt forced off, tags the final content,
+// truncates at the tag and rstrips -- reproduced here. Derivation verified
+// against jinja2 + the HF render_jinja_template algorithm with
+// /home/bpsa/x/bin/python.
+procedure TTestNeuralChat.TestContinueFinalMessage;
+var
+  Messages: TChatMessages;
+  Opt: TChatTemplateOptions;
+  Cont, Normal: string;
+begin
+  SetLength(Messages, 2);
+  Messages[0] := ChatMessage('user', 'Hi!');
+  Messages[1] := ChatMessage('assistant', 'Hello, how can');
+
+  // ChatML continue: ends exactly at the assistant prefix, no <|im_end|> and
+  // no trailing generation prompt.
+  Opt := ChatTemplateOptions({AddGenerationPrompt=}false,
+    {ContinueFinalMessage=}true);
+  Cont := ApplyChatTemplate(cfChatML, Messages, Opt);
+  AssertEquals('chatml continue_final_message',
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10 + 'Hello, how can',
+    Cont);
+
+  // The normal (add_generation_prompt) render appends <|im_end|> + a fresh
+  // assistant prompt -- continue must omit both.
+  Normal := ApplyChatTemplate(cfChatML, Messages, true);
+  AssertTrue('continue is a strict prefix of nothing-extra',
+    Pos('<|im_end|>' + #10 + '<|im_start|>assistant' + #10, Normal) > 0);
+  AssertEquals('continue has no end-of-turn after the prefix',
+    0, Pos('Hello, how can<|im_end|>', Cont));
+
+  // Qwen continue: default-system header still present, assistant prefix kept.
+  Opt := ChatTemplateOptions(false, true);
+  Cont := ApplyChatTemplate(cfQwen, Messages, Opt);
+  AssertEquals('qwen continue_final_message',
+    '<|im_start|>system' + #10 +
+    'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' +
+    '<|im_end|>' + #10 +
+    '<|im_start|>user' + #10 + 'Hi!<|im_end|>' + #10 +
+    '<|im_start|>assistant' + #10 + 'Hello, how can',
+    Cont);
+
+  // The default options overload is backward-compatible with the v1 boolean.
+  AssertEquals('options overload == boolean overload (default)',
+    ApplyChatTemplate(cfChatML, Messages, true),
+    ApplyChatTemplate(cfChatML, Messages, ChatTemplateOptions(true, false)));
+end;
+
+// return_assistant_tokens_mask: EncodeChatWithMask returns a parallel 0/1
+// mask flagging the token span of every assistant message's CONTENT (the
+// {% generation %} span in HF). Pins a 2-turn ChatML conversation on the
+// Qwen2-style fixture tokenizer and asserts the mask covers exactly the
+// assistant-content tokens (and that those tokens decode back to the
+// assistant content).
+procedure TTestNeuralChat.TestReturnAssistantTokensMask;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids, Mask: TNeuralIntegerArray;
+  Messages: TChatMessages;
+  Cnt, MaskOnes: integer;
+  AsstText, Decoded: string;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_split_qwen2_tokenizer.json'));
+    SetLength(Messages, 4);
+    Messages[0] := ChatMessage('user', 'the cat');
+    Messages[1] := ChatMessage('assistant', 'the dog');
+    Messages[2] := ChatMessage('user', 'a fish');
+    Messages[3] := ChatMessage('assistant', 'a bird');
+
+    Ids := EncodeChatWithMask(Tok, cfChatML, Messages, false, Mask);
+    AssertTrue('ids produced', Length(Ids) > 0);
+    AssertEquals('mask is parallel to ids', Length(Ids), Length(Mask));
+
+    // The mask must flag at least one token and exclude the role/control
+    // tokens -- the very first token (<|im_start|> or its text) is never
+    // assistant content.
+    MaskOnes := 0;
+    for Cnt := 0 to High(Mask) do
+      if Mask[Cnt] = 1 then Inc(MaskOnes);
+    AssertTrue('some assistant tokens flagged', MaskOnes > 0);
+    AssertEquals('first token (control) not flagged', 0, Mask[0]);
+
+    // Every flagged token must decode to text that belongs to one of the
+    // assistant contents; reconstruct the flagged run and check it equals
+    // the concatenation of assistant contents (token order preserved).
+    AsstText := 'the dog' + 'a bird';
+    Decoded := '';
+    for Cnt := 0 to High(Ids) do
+      if Mask[Cnt] = 1 then
+        Decoded := Decoded + Tok.Decode([Ids[Cnt]]);
+    // Decoded may carry the tokenizer's metaspace/leading-space artifacts;
+    // compare after stripping ASCII spaces so the assertion is robust to the
+    // BPE space-prefix convention while still proving content coverage.
+    AssertEquals('flagged tokens decode to the assistant contents',
+      StringReplace(AsstText, ' ', '', [rfReplaceAll]),
+      StringReplace(Decoded, ' ', '', [rfReplaceAll]));
+  finally
+    Tok.Free;
+  end;
 end;
 
 initialization

@@ -1,0 +1,19 @@
+{
+ "architectures": [
+  "GPTBigCodeForCausalLM"
+ ],
+ "model_type": "gpt_bigcode",
+ "n_embd": 8,
+ "n_inner": 16,
+ "n_layer": 2,
+ "n_head": 2,
+ "n_positions": 16,
+ "vocab_size": 13,
+ "layer_norm_epsilon": 1e-05,
+ "multi_query": true,
+ "scale_attn_weights": true,
+ "tie_word_embeddings": true,
+ "activation_function": "gelu_pytorch_tanh",
+ "bos_token_id": 0,
+ "eos_token_id": 0
+}

@@ -100,14 +100,26 @@ type
     // quantized blocks, neuralgguf.pas) can decode their own dtypes.
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); virtual;
+    // Loads the named tensor's RAW on-disk bytes verbatim into Dest (no dtype
+    // decoding). Used by the MXFP4 dequant-at-load path (gpt-oss), whose
+    // packed-nibble "*_blocks" and E8M0 "*_scales" tensors ship as U8 and must
+    // be read byte-for-byte. Dest is set to Length(Dest) = the tensor's byte
+    // length. Coded by Claude (AI).
+    procedure LoadTensorRawBytes(const pName: string; out Dest: TBytes);
     property FileName: string read FFileName;
   end;
 
-  // One tensor queued in a TNNetSafeTensorsWriter (name + shape + a private
-  // copy of the raw little-endian F32 bytes).
+  // The on-disk dtype a writer encodes a tensor as. F32 is the lossless
+  // default; F16/BF16 halve the file at the cost of precision (encoded on
+  // write via EncodeF16/EncodeBF16, read back through DecodeF16/DecodeBF16).
+  TSafeTensorsWriteDType = (stwF32, stwF16, stwBF16);
+
+  // One tensor queued in a TNNetSafeTensorsWriter (name + shape + the chosen
+  // on-disk dtype + a private copy of its raw little-endian encoded bytes).
   TSafeTensorPending = record
     Name: string;
     Shape: array of Int64;
+    DType: TSafeTensorsWriteDType;
     Data: TBytes;
   end;
 
@@ -120,10 +132,12 @@ type
   // with spaces to an 8-byte boundary so the data section is aligned,
   // matching the reference Python serializer. Files written here read
   // back bit-exact through TNNetSafeTensorsReader and load with the
-  // Python "safetensors" library. Only F32 is written (the library is
-  // FP32 end to end); F16/BF16 conversion on write is a possible
-  // follow-up. Raises ESafeTensorsError on invalid input (duplicate or
-  // empty names, shape/element-count mismatches, writing twice).
+  // Python "safetensors" library. F32 is the default; AddTensorFlat also
+  // accepts stwF16/stwBF16 to encode-on-write a half-width tensor (via
+  // EncodeF16/EncodeBF16) for smaller exported checkpoints - the header
+  // dtype string and data_offsets reflect the chosen 2-byte encoding.
+  // Raises ESafeTensorsError on invalid input (duplicate or empty names,
+  // shape/element-count mismatches, writing twice).
   TNNetSafeTensorsWriter = class
   private
     FFileName: string;
@@ -139,13 +153,15 @@ type
     // Adds/overwrites one "__metadata__" key/value pair (string->string,
     // as the spec requires). Call before SaveToFile.
     procedure SetMetadata(const pKey, pValue: string);
-    // Queues a named F32 tensor: pShape are the row-major dims declared in
-    // the header (an empty array declares a 0-dim scalar) and Src supplies
-    // the elements - Src.FData[0..Size-1] is copied verbatim in its flat
-    // order, so prod(pShape) must equal Src.Size. The data is copied, so
-    // Src may be freed or reused immediately.
+    // Queues a named tensor: pShape are the row-major dims declared in the
+    // header (an empty array declares a 0-dim scalar) and Src supplies the
+    // elements - Src.FData[0..Size-1] is copied verbatim in its flat order,
+    // so prod(pShape) must equal Src.Size. pDType selects the on-disk
+    // encoding (stwF32 default = lossless; stwF16/stwBF16 encode-on-write to
+    // half the bytes). The data is copied, so Src may be freed or reused
+    // immediately.
     procedure AddTensorFlat(const pName: string; const pShape: array of Int64;
-      Src: TNNetVolume);
+      Src: TNNetVolume; pDType: TSafeTensorsWriteDType = stwF32);
     function Count: integer;
     // Writes the collected tensors to FileName. May be called once.
     procedure SaveToFile;
@@ -156,6 +172,13 @@ type
 function DecodeF16(Bits: Word): Single;
 // bfloat16 -> single (bf16 is the top 16 bits of a single's bit pattern).
 function DecodeBF16(Bits: Word): Single;
+// single -> IEEE 754 half (binary16), round-to-nearest-even, saturating to
+// +/-Inf on overflow; the inverse of DecodeF16 (neuralnumpy reuses this).
+function EncodeF16(Value: Single): Word;
+// single -> bfloat16, round-to-nearest-even on the dropped low 16 bits
+// (DecodeBF16 reconstructs by zero-extension, so RNE here yields the nearest
+// representable bf16). NaN is mapped to a canonical quiet NaN; Inf is kept.
+function EncodeBF16(Value: Single): Word;
 
 // Exports every parameterized layer of NN as named F32 tensors so
 // Pascal-trained models round-trip into PyTorch/transformers (and back via
@@ -174,6 +197,12 @@ function DecodeBF16(Bits: Word): Single;
 // program of TNNetByteProcessing) are not covered - use the .nn serializer
 // for those. "__metadata__" records format=cai-neural-api/v1.
 procedure SaveNNetToSafeTensors(NN: TNNet; const pFileName: string);
+// As SaveNNetToSafeTensors but encodes every weight/bias tensor as the given
+// on-disk dtype (stwF16/stwBF16 produce ~half-size checkpoints at reduced
+// precision; stwF32 is identical to SaveNNetToSafeTensors). The reloaded net
+// is within the dtype's precision of the original, not bit-exact.
+procedure SaveNNetToSafeTensorsEx(NN: TNNet; const pFileName: string;
+  pDType: TSafeTensorsWriteDType);
 // Loads tensors written by SaveNNetToSafeTensors back into an
 // IDENTICALLY-STRUCTURED net, matching by name. Raises ESafeTensorsError
 // if an expected tensor is missing or its element count disagrees with the
@@ -226,6 +255,86 @@ var
 begin
   OutBits := Cardinal(Bits) shl 16;
   Result := PSingle(@OutBits)^;
+end;
+
+function EncodeF16(Value: Single): Word;
+var
+  Bits: Cardinal;
+  Sign, Exp, Mant: Cardinal;
+  E: integer;
+  Half: Cardinal;
+begin
+  Bits := PCardinal(@Value)^;
+  Sign := (Bits shr 16) and $8000;
+  Exp := (Bits shr 23) and $FF;
+  Mant := Bits and $7FFFFF;
+  if Exp = $FF then
+  begin
+    // Inf or NaN
+    if Mant <> 0 then
+      Result := Word(Sign or $7E00) // canonical quiet NaN
+    else
+      Result := Word(Sign or $7C00); // Inf
+    exit;
+  end;
+  E := integer(Exp) - 127 + 15; // rebias 127 -> 15
+  if E >= $1F then
+  begin
+    // overflow -> Inf
+    Result := Word(Sign or $7C00);
+    exit;
+  end
+  else if E <= 0 then
+  begin
+    // subnormal or zero
+    if E < -10 then
+    begin
+      Result := Word(Sign); // too small -> signed zero
+      exit;
+    end;
+    // add implicit leading 1, then shift into subnormal position with rounding
+    Mant := Mant or $800000;
+    Half := Mant shr (14 - E);
+    // round to nearest even using the bit just shifted out
+    if (Mant shr (13 - E)) and 1 = 1 then
+      Inc(Half);
+    Result := Word(Sign or Half);
+    exit;
+  end
+  else
+  begin
+    // normal: 10-bit mantissa = top 10 bits of the 23-bit mantissa
+    Half := (Cardinal(E) shl 10) or (Mant shr 13);
+    // round to nearest even on the dropped 13 bits
+    if (Mant and $1000) <> 0 then // guard bit set
+    begin
+      if ((Mant and $FFF) <> 0) or ((Half and 1) = 1) then
+        Inc(Half); // may carry into exponent, which is the correct behavior
+    end;
+    Result := Word(Sign or Half);
+    exit;
+  end;
+end;
+
+function EncodeBF16(Value: Single): Word;
+var
+  Bits, Exp, Mant, Rounded: Cardinal;
+begin
+  Bits := PCardinal(@Value)^;
+  Exp := (Bits shr 23) and $FF;
+  Mant := Bits and $7FFFFF;
+  if (Exp = $FF) and (Mant <> 0) then
+  begin
+    // NaN: preserve sign, force a non-zero mantissa (canonical quiet NaN) so
+    // the zero-extending DecodeBF16 cannot turn it into an Inf.
+    Result := Word((Bits shr 16) or $0040);
+    exit;
+  end;
+  // Round-to-nearest-even on the low 16 bits that DecodeBF16 discards.
+  // Add half an ULP (0x8000) plus the round-bias (bit 16 of the kept part)
+  // before truncating, the standard RNE-by-bias trick.
+  Rounded := Bits + $7FFF + ((Bits shr 16) and 1);
+  Result := Word(Rounded shr 16);
 end;
 
 function DTypeByteSize(const DType: string): integer;
@@ -649,6 +758,20 @@ begin
   end;
 end;
 
+procedure TNNetSafeTensorsReader.LoadTensorRawBytes(const pName: string;
+  out Dest: TBytes);
+var
+  Info: TSafeTensorInfo;
+  Len: Int64;
+begin
+  Info := GetInfo(pName);
+  Len := Info.DataEnd - Info.DataBegin;
+  SetLength(Dest, Len);
+  if Len = 0 then exit;
+  FStreams[Info.Shard].Position := FDataStarts[Info.Shard] + Info.DataBegin;
+  FStreams[Info.Shard].ReadBuffer(Dest[0], Len);
+end;
+
 { TNNetSafeTensorsWriter }
 
 // Escapes S for embedding in a JSON string literal: backslash, double
@@ -720,11 +843,13 @@ begin
 end;
 
 procedure TNNetSafeTensorsWriter.AddTensorFlat(const pName: string;
-  const pShape: array of Int64; Src: TNNetVolume);
+  const pShape: array of Int64; Src: TNNetVolume;
+  pDType: TSafeTensorsWriteDType = stwF32);
 var
   NumElements: Int64;
-  i, Idx: integer;
+  i, Idx, ElemBytes: integer;
   SinglePtr: PSingle;
+  WordPtr: PWord;
 begin
   if pName = '' then
     raise ESafeTensorsError.CreateFmt(
@@ -757,19 +882,44 @@ begin
   Idx := Length(FTensors);
   SetLength(FTensors, Idx + 1);
   FTensors[Idx].Name := pName;
+  FTensors[Idx].DType := pDType;
   SetLength(FTensors[Idx].Shape, Length(pShape));
   for i := 0 to High(pShape) do
     FTensors[Idx].Shape[i] := pShape[i];
-  SetLength(FTensors[Idx].Data, NumElements * 4);
+  if pDType = stwF32 then ElemBytes := 4 else ElemBytes := 2;
+  SetLength(FTensors[Idx].Data, NumElements * ElemBytes);
   if NumElements > 0 then
   begin
-    // Element-wise copy through PSingle so the bytes are F32 even if
-    // TNeuralFloat is ever widened.
-    SinglePtr := PSingle(@FTensors[Idx].Data[0]);
-    for i := 0 to NumElements - 1 do
-    begin
-      SinglePtr^ := Src.FData[i];
-      Inc(SinglePtr);
+    case pDType of
+      stwF32:
+        begin
+          // Element-wise copy through PSingle so the bytes are F32 even if
+          // TNeuralFloat is ever widened.
+          SinglePtr := PSingle(@FTensors[Idx].Data[0]);
+          for i := 0 to NumElements - 1 do
+          begin
+            SinglePtr^ := Src.FData[i];
+            Inc(SinglePtr);
+          end;
+        end;
+      stwF16:
+        begin
+          WordPtr := PWord(@FTensors[Idx].Data[0]);
+          for i := 0 to NumElements - 1 do
+          begin
+            WordPtr^ := EncodeF16(Src.FData[i]);
+            Inc(WordPtr);
+          end;
+        end;
+      stwBF16:
+        begin
+          WordPtr := PWord(@FTensors[Idx].Data[0]);
+          for i := 0 to NumElements - 1 do
+          begin
+            WordPtr^ := EncodeBF16(Src.FData[i]);
+            Inc(WordPtr);
+          end;
+        end;
     end;
   end;
 end;
@@ -805,8 +955,14 @@ begin
   for i := 0 to High(FTensors) do
   begin
     if i > 0 then Result := Result + ',';
-    Entry := '"' + JsonEscapeString(FTensors[i].Name) +
-      '":{"dtype":"F32","shape":[';
+    case FTensors[i].DType of
+      stwF16: Entry := '"' + JsonEscapeString(FTensors[i].Name) +
+        '":{"dtype":"F16","shape":[';
+      stwBF16: Entry := '"' + JsonEscapeString(FTensors[i].Name) +
+        '":{"dtype":"BF16","shape":[';
+      else Entry := '"' + JsonEscapeString(FTensors[i].Name) +
+        '":{"dtype":"F32","shape":[';
+    end;
     for j := 0 to High(FTensors[i].Shape) do
     begin
       if j > 0 then Entry := Entry + ',';
@@ -876,6 +1032,12 @@ begin
 end;
 
 procedure SaveNNetToSafeTensors(NN: TNNet; const pFileName: string);
+begin
+  SaveNNetToSafeTensorsEx(NN, pFileName, stwF32);
+end;
+
+procedure SaveNNetToSafeTensorsEx(NN: TNNet; const pFileName: string;
+  pDType: TSafeTensorsWriteDType);
 var
   Writer: TNNetSafeTensorsWriter;
   Tmp: TNNetVolume;
@@ -905,7 +1067,7 @@ begin
             Inc(Cursor);
           end;
         Writer.AddTensorFlat(Base + '.weights',
-          [L.Neurons.Count, W.SizeY, W.SizeX, W.Depth], Tmp);
+          [L.Neurons.Count, W.SizeY, W.SizeX, W.Depth], Tmp, pDType);
       end
       else
       begin
@@ -914,13 +1076,13 @@ begin
           W := L.Neurons[j].Weights;
           Writer.AddTensorFlat(
             Base + '.neuron_' + IntToStr(j) + '.weights',
-            [W.SizeY, W.SizeX, W.Depth], W);
+            [W.SizeY, W.SizeX, W.Depth], W, pDType);
         end;
       end;
       Tmp.ReSize(L.Neurons.Count, 1, 1);
       for j := 0 to L.Neurons.Count - 1 do
         Tmp.FData[j] := L.Neurons[j].BiasWeight;
-      Writer.AddTensorFlat(Base + '.biases', [L.Neurons.Count], Tmp);
+      Writer.AddTensorFlat(Base + '.biases', [L.Neurons.Count], Tmp, pDType);
     end;
     Writer.SaveToFile;
   finally
