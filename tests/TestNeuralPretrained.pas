@@ -170,6 +170,7 @@ type
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
     procedure TestOlmo2LogitParity;
+    procedure TestOlmoeLogitParity;
     procedure TestMixtralLogitParity;
     procedure TestRWKVLogitParity;
     procedure TestMambaLogitParity;
@@ -4999,6 +5000,106 @@ begin
   try
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_olmo2_logits.json'), 16, 13);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Verifies the OLMoE import target (HF model_type "olmoe", architectures
+// ["OlmoeForCausalLM"], the allenai/OLMoE-1B-0924 fully-open Apache-2.0 SPARSE
+// MoE LLM): the CROSS-product of the ORIGINAL-OLMo PRE-NORM attention and a
+// Mixtral-style top-k MoE FFN, with NO new layer class. tests/fixtures/
+// tiny_olmoe.* is a pico randomly-initialized OlmoeForCausalLM (2 layers,
+// hidden 8, head_dim 4, 4 experts / top-2, 1 kv head < 2 query heads, untied
+// head). The importer must wire:
+//   (a) the ORIGINAL-OLMo PRE-NORM block (input_layernorm before the attn
+//       residual + post_attention_layernorm before the FFN residual -
+//       PostNormReordered stays OFF, distinct from OLMo-2), with q/k RMSNorm
+//       over the FULL flattened projection width (QKNormFullWidth) BEFORE the
+//       head split + RoPE;
+//   (b) a UNIFORM all-MoE FFN stack (every layer is a sparse top-k router over
+//       intermediate_size-wide SwiGLU experts; the Qwen3-MoE tensor dialect
+//       mlp.gate + mlp.experts.{i}.gate_proj/up_proj/down_proj that the
+//       released checkpoint ships), the top-k subset renormalized
+//       (norm_topk_prob=True).
+// tools/olmoe_tiny_fixture.py ASSERTS BOTH the full-width q/k norm gains AND
+// the top-k renorm move the float64 logits (max |diff| ~3.9 and ~1.7, far
+// above the 1e-4 parity gate). Reference logits come from HF transformers
+// (OlmoeForCausalLM) in float64. The BuildFromPretrained model_type "olmoe"
+// dispatch is checked too. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestOlmoeLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, GateCnt, SoftMaxCnt, SwiGLUCnt, NormCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildOlmoeFromSafeTensorsEx(FixturePath('tiny_olmoe.safetensors'),
+    Config, {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_olmoe_config.json'));
+  try
+    AssertEquals('model_type', 'olmoe', Config.ModelType);
+    AssertEquals('layers', 2, Config.NumLayers);
+    AssertEquals('heads', 2, Config.NumHeads);
+    AssertEquals('kv_heads', 1, Config.NumKVHeads);
+    AssertEquals('vocab', 13, Config.VocabSize);
+    AssertFalse('qkv_bias', Config.QKVBias);
+    // OLMoE: full-width q/k RMSNorm (OLMo-2 placement) but ORIGINAL-OLMo
+    // PRE-NORM (NOT the OLMo-2 reordered post-norm).
+    AssertFalse('per-head qk_norm must stay OFF', Config.QKNorm);
+    AssertTrue('qk_norm_full_width', Config.QKNormFullWidth);
+    AssertFalse('post_norm_reordered must stay OFF (pre-norm OLMoE)',
+      Config.PostNormReordered);
+    AssertFalse('sandwich_norm must stay OFF', Config.SandwichNorm);
+    AssertTrue('is_moe', Config.IsMoE);
+    AssertTrue('qwen3 expert naming', Config.MoEQwen3Naming);
+    AssertTrue('renorm top-k', Config.MoENormTopK);
+    AssertEquals('num_experts', 4, Config.NumLocalExperts);
+    AssertEquals('num_experts_per_tok', 2, Config.MoEExpertsPerTok);
+    // OLMoE experts are the plain intermediate_size (no moe_intermediate_size).
+    AssertEquals('expert width = intermediate_size', 5,
+      Config.MoEIntermediateSize);
+    AssertEquals('intermediate_size', 5, Config.IntermediateSize);
+    AssertFalse('untied', Config.TieWordEmbeddings);
+    AssertEquals('prefix', 'model.', Config.Prefix);
+    // Structure: UNIFORM all-MoE - one router (TopKGate + its PER-TOKEN
+    // softmax) per block, one SwiGLU per expert per block (no dense MLP). The
+    // pre-norm block carries 4 TokenRMSNorm (input_layernorm, full-width
+    // q_norm, full-width k_norm, post_attention_layernorm) + final norm.
+    GateCnt := 0;
+    SoftMaxCnt := 0;
+    SwiGLUCnt := 0;
+    NormCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetPointwiseSoftMax then
+        Inc(SoftMaxCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetTokenRMSNorm then Inc(NormCnt);
+    end;
+    AssertEquals('one top-k router gate per block (uniform all-MoE)',
+      Config.NumLayers, GateCnt);
+    AssertEquals('one per-token router softmax per block',
+      Config.NumLayers, SoftMaxCnt);
+    AssertEquals('one SwiGLU per expert per block (no dense FFN)',
+      Config.NumLocalExperts * Config.NumLayers, SwiGLUCnt);
+    AssertEquals('TokenRMSNorm count (4 per pre-norm block + final)',
+      4 * Config.NumLayers + 1, NormCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_olmoe_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
+  finally
+    NN.Free;
+  end;
+  // Config-driven route: BuildFromPretrained must dispatch model_type
+  // "olmoe" (architectures ["OlmoeForCausalLM"]) onto the same path.
+  NN := BuildFromPretrained(FixturePath('tiny_olmoe.safetensors'),
+    {SeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_olmoe_config.json'));
+  try
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_olmoe_logits.json'), 16, 13);
   finally
     NN.Free;
   end;

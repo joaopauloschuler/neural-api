@@ -1127,6 +1127,32 @@ function BuildOlmo2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pInferenceOnly: boolean = false;
   pQuantizeInt8: boolean = false): TNNet;
 
+// OLMoE (model_type "olmoe", e.g. allenai/OLMoE-1B-0924 - the fully-open
+// Apache-2.0 SPARSE MoE sibling of dense OLMo-2). The cross-product of two
+// landed importer pieces with NO new layer class:
+// (a) attention/norm placement is the ORIGINAL OLMo PRE-NORM block (NOT
+//     OLMo-2's reordered post-norm): standard input_layernorm before the
+//     attention residual and post_attention_layernorm before the FFN
+//     residual. q/k RMSNorm is over the FULL flattened projection width
+//     (the OLMo-2 QKNormFullWidth flag) BEFORE the head split + RoPE.
+// (b) the FFN is a Mixtral-style top-k router over num_experts SwiGLU
+//     experts, wired EXACTLY like Qwen3-MoE (router softmax over ALL experts
+//     -> hard top-k num_experts_per_tok, subset renormalized iff
+//     norm_topk_prob). The released checkpoint ships the Qwen3-MoE tensor
+//     dialect (mlp.gate.weight + mlp.experts.{i}.gate_proj/up_proj/down_proj).
+// OLMoE is UNIFORMLY MoE: EVERY decoder layer is a sparse block (no
+// mlp_only_layers / decoder_sparse_step in HF), and the expert width is the
+// plain intermediate_size. Thin wrappers over the Llama path that ASSERT the
+// config's model_type is 'olmoe'.
+function BuildOlmoeFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildOlmoeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+
 // Gemma 1: the Llama skeleton with three load-time deltas (no new layers):
 // (a) the embedding OUTPUT is scaled by sqrt(hidden_size) - folded into the
 //     embedding rows at load (the tied LM head keeps the UNSCALED rows, as
@@ -4937,7 +4963,7 @@ var
   Obj: TJSONObject;
   ModelType, HiddenAct: string;
   HeadDimField, SlidingWindowField, FloatField: TJSONData;
-  MoEMlpOnlyArr: TJSONData;
+  MoEMlpOnlyArr, ClipQKVField: TJSONData;
   i: integer;
 
   function RequiredInt(const FieldName: string): integer;
@@ -4976,13 +5002,14 @@ begin
        (ModelType <> 'qwen3_moe') and
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
        (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') and
-       (ModelType <> 'olmo2') and (ModelType <> 'mixtral') and
+       (ModelType <> 'olmo2') and (ModelType <> 'olmoe') and
+       (ModelType <> 'mixtral') and
        (ModelType <> 'glm4') and (ModelType <> 'glm') and
        (ModelType <> 'granite') and (ModelType <> 'granitemoe') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", ' +
-        '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "mixtral", ' +
-        '"glm4", "granite" and "granitemoe" are supported here ' +
+        '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "olmoe", ' +
+        '"mixtral", "glm4", "granite" and "granitemoe" are supported here ' +
         '(see BuildFromPretrained for the full dispatch; multimodal ' +
         '"gemma3" configs are out of scope - use a TEXT-ONLY gemma3_text ' +
         'checkpoint).');
@@ -5366,6 +5393,65 @@ begin
       if HiddenAct <> 'silu' then
         ImportError('Llama import: OLMo-2 hidden_act "' + HiddenAct +
           '" is not supported - every released olmo2 checkpoint uses ' +
+          '"silu" (SwiGLU).');
+    end
+    else if ModelType = 'olmoe' then
+    begin
+      // OLMoE (model_type "olmoe", allenai/OLMoE-1B-0924 - the fully-open
+      // Apache-2.0 SPARSE MoE sibling of dense OLMo-2). The cross-product of
+      // two landed pieces with NO new layer class:
+      //   (a) ATTENTION/NORM = the ORIGINAL OLMo line, NOT OLMo-2's reordered
+      //       post-norm. HF modeling_olmoe.OlmoeDecoderLayer.forward is the
+      //       canonical PRE-NORM block (residual=x; x=input_layernorm(x);
+      //       x=residual+attn(x); residual=x; x=post_attention_layernorm(x);
+      //       x=residual+moe(x)) - so PostNormReordered is FALSE. q/k RMSNorm
+      //       is over the FULL flattened projection width (OlmoeAttention:
+      //       q_norm over hidden_size, k_norm over num_kv_heads*head_dim),
+      //       i.e. the OLMo-2 QKNormFullWidth flag, applied BEFORE the head
+      //       split + RoPE.
+      //   (b) FFN = a Mixtral-style top-k router over num_experts SwiGLU
+      //       experts, wired EXACTLY like Qwen3-MoE (router softmax over ALL
+      //       experts -> hard top-k (num_experts_per_tok), subset renormalized
+      //       iff norm_topk_prob). The released checkpoint ships the Qwen3-MoE
+      //       tensor dialect (mlp.gate.weight, mlp.experts.{i}.gate_proj/
+      //       up_proj/down_proj), so MoEQwen3Naming is reused verbatim.
+      // OLMoE is UNIFORMLY MoE: every decoder layer is a sparse block (HF has
+      // no mlp_only_layers / decoder_sparse_step), so MoEDecoderSparseStep=1
+      // with empty MoEMlpOnlyLayers gives the all-MoE path. Expert width is
+      // the plain intermediate_size (OlmoeExperts wrap OlmoeMLP, NOT a
+      // separate moe_intermediate_size).
+      Result.QKNormFullWidth := True;
+      Result.RmsNormEps := Obj.Get('rms_norm_eps', 1.0e-5);
+      Result.IsMoE := True;
+      Result.MoEQwen3Naming := True;
+      Result.NumLocalExperts := Obj.Get('num_experts', 64);
+      Result.MoEExpertsPerTok := Obj.Get('num_experts_per_tok', 8);
+      Result.MoEIntermediateSize := Result.IntermediateSize;
+      Result.MoENormTopK := Obj.Get('norm_topk_prob', False);
+      Result.MoEDecoderSparseStep := 1;
+      if Result.NumLocalExperts < 1 then
+        ImportError('Llama import: OLMoE num_experts must be >= 1, got ' +
+          IntToStr(Result.NumLocalExperts) + '.');
+      if (Result.MoEExpertsPerTok < 1) or
+         (Result.MoEExpertsPerTok > Result.NumLocalExperts) then
+        ImportError('Llama import: OLMoE num_experts_per_tok=' +
+          IntToStr(Result.MoEExpertsPerTok) + ' must be in [1, num_experts=' +
+          IntToStr(Result.NumLocalExperts) + '].');
+      if Obj.Get('attention_bias', False) then
+        ImportError('Llama import: OLMoE attention_bias=true is not wired ' +
+          'into this importer - the released OLMoE-1B-0924 checkpoint is ' +
+          'bias-free.');
+      // clip_qkv (Olmoe1 clamps q/k/v to +-clip_qkv) is null in the released
+      // checkpoint; a non-null value is not wired into the SDPA path.
+      ClipQKVField := Obj.Find('clip_qkv');
+      if (ClipQKVField <> nil) and not ClipQKVField.IsNull then
+        ImportError('Llama import: OLMoE clip_qkv (q/k/v clamping) is not ' +
+          'wired into this importer - every released OLMoE checkpoint uses ' +
+          'clip_qkv=null.');
+      HiddenAct := Obj.Get('hidden_act', 'silu');
+      if HiddenAct <> 'silu' then
+        ImportError('Llama import: OLMoE hidden_act "' + HiddenAct +
+          '" is not supported - every released olmoe checkpoint uses ' +
           '"silu" (SwiGLU).');
     end
     else if ModelType = 'glm4' then
@@ -14647,6 +14733,25 @@ var
   IgnoredConfig: TLlamaConfig;
 begin
   Result := BuildOlmo2FromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
+    pInferenceOnly, '', pQuantizeInt8);
+end;
+
+function BuildOlmoeFromSafeTensorsEx(const FileName: string;
+  out Config: TLlamaConfig; pSeqLen: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildLlamaFamilyFromSafeTensors(FileName, 'olmoe', Config,
+    pSeqLen, pInferenceOnly, ConfigFileName, pQuantizeInt8);
+end;
+
+function BuildOlmoeFromSafeTensors(const FileName: string;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false): TNNet;
+var
+  IgnoredConfig: TLlamaConfig;
+begin
+  Result := BuildOlmoeFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, '', pQuantizeInt8);
 end;
 
@@ -25265,7 +25370,8 @@ begin
           (ModelType = 'qwen3_moe') or
           (ModelType = 'gemma') or (ModelType = 'gemma2') or
           (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
-          (ModelType = 'olmo2') or (ModelType = 'mixtral') or
+          (ModelType = 'olmo2') or (ModelType = 'olmoe') or
+          (ModelType = 'mixtral') or
           (ModelType = 'glm4') or
           (ModelType = 'granite') or (ModelType = 'granitemoe') then
     // 'glm4' (architectures ["Glm4ForCausalLM"], THUDM/GLM-4-9B-0414 etc.)

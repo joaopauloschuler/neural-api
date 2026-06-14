@@ -113,7 +113,7 @@ rather than acted on.
         output. The pico fixture ships shared_intermediate_size=0.
   - [ ] real-checkpoint slicer (make_pico_*_fixture.py reuse) to parity-check
         a sliced ibm-granite/granite-3.1-* against the random pico fixture.
-- [ ] OLMoE importer (`BuildOlmoeFromSafeTensors[Ex]`, model_type `olmoe`) —
+- [X] OLMoE importer (`BuildOlmoeFromSafeTensors[Ex]`, model_type `olmoe`) —
       the SPARSE sibling of the landed dense OLMo-2 importer
       (BuildOlmo2FromSafeTensors). OLMoE-1B-7B (allenai/OLMoE-1B-0924) is a
       fully-open Apache-2.0 MoE LLM, ideal for real-weight parity (small active
@@ -137,6 +137,17 @@ rather than acted on.
       to parity-check a sliced allenai/OLMoE-1B-0924 against the random pico
       fixture. Pairs with the open Qwen3-MoE "uniform all-MoE only" stance: if
       OLMoE is also uniformly-MoE this needs no per-layer dense/MoE switching.
+      LANDED: BuildOlmoeFromSafeTensors[Ex] + 'olmoe' config branch
+      (QKNormFullWidth=True, PostNormReordered=FALSE — OLMoE is the ORIGINAL-
+      OLMo PRE-NORM block, NOT OLMo-2's reordered post-norm; confirmed against
+      HF modeling_olmoe.OlmoeDecoderLayer.forward) reusing the Qwen3-MoE MoE
+      wiring (MoEQwen3Naming; expert width = plain intermediate_size). OLMoE is
+      UNIFORMLY all-MoE (no mlp_only_layers/decoder_sparse_step), so no per-
+      layer switching. tools/olmoe_tiny_fixture.py (asserts q/k-norm gains move
+      logits 3.92 and top-k renorm 1.74) + TestOlmoeLogitParity (config +
+      logit, < 1e-4 vs float64 OlmoeForCausalLM, BuildFromPretrained dispatch).
+      Open follow-up: real allenai/OLMoE-1B-0924 slicer parity (the pico
+      fixture is random-init only).
 - [ ] M2M100/NLLB translate demo + real-vocab check (follow-up to the landed
       BuildM2M100FromSafeTensors, commit cb21550): an examples/NLLBTranslate
       seq2seq demo that loads a real (small) NLLB/M2M100 checkpoint and
