@@ -96,6 +96,28 @@ rather than acted on.
 ## Infrastructure / dev experience
 
 - [ ] Gradient checkpointing for training deeper nets in less memory
+- [ ] GGUF model import beyond Llama — `BuildFromGGUF` architecture dispatch.
+      Today `BuildLlamaFromGGUF` is the ONLY GGUF model builder, yet GGUF is the
+      dominant distribution format for community-quantized checkpoints (Qwen2/2.5,
+      Gemma-2/3, Phi-3, StarCoder2, GPT-2/NeoX, etc. all ship as .gguf). Nearly
+      everything is in place: TNNetGGUFReader already dequantizes F32/F16/Q8_0 +
+      the k-quants at load, TNeuralHFTokenizer.LoadFromGGUF builds the tokenizer
+      from the embedded tokenizer.ggml.* metadata, and every target architecture
+      already has a safetensors builder. The missing piece is a `BuildFromGGUF`
+      entry point that reads `general.architecture` (+ the per-arch
+      `<arch>.attention.head_count` / `block_count` / `feed_forward_length` /
+      rope/norm-eps GGUF metadata keys) and dispatches to the existing builder
+      paths, plus a GGUF->HF tensor-name + shape map per family (the inverse of
+      the SaveLlamaToGGUF reversed-dims / rotate_half->interleaved q/k permute that
+      the GGUF WRITER already encodes — reuse that permutation knowledge). Start
+      with the Llama-backbone families that need NO new layer (qwen2, gemma2,
+      starcoder2 — same blocks as their safetensors importers, only the tensor
+      names + GGUF metadata key prefixes differ); document which architectures
+      stay out of scope for v1. Parity: load a pico fixture exported by the landed
+      TNNetGGUFWriter for a non-Llama arch and assert next-token logits match the
+      safetensors-built net < 1e-4 (write-then-read oracle, the same stance the
+      GGUF tokenizer round-trip tests already use). High leverage: one dispatch
+      unlocks dozens of ready-to-run quantized checkpoints with no Python step.
 - [ ] ONNX import
 - [ ] Gemma 4 import
 - [ ] Qwen 3.5 import
