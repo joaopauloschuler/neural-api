@@ -542,10 +542,20 @@ rather than acted on.
       at 1M-33M params the comparison runs against FULL checkpoints
       instead of sliced fixtures, the only importer family where that is
       true.
-- [ ] RWKV-4 decode-side demo: flat-memory recurrent decoding vs a
+- [X] RWKV-4 decode-side demo: flat-memory recurrent decoding vs a
       transformer of equal size (constant-memory headline of the landed
       BuildRWKVFromSafeTensors importer; needs an incremental TNNetWKV
-      state-carry path).
+      state-carry path). LANDED (commit 62165c1): TNNetWKV gains an O(1)-per-step
+      incremental decode API (BeginIncrementalDecode/ComputeIncremental/ResetState/
+      ResetCache/EndIncrementalDecode + CaptureState/RestoreState for session
+      forking), mirroring TNNetDiagonalSSM. Token-by-token decode is BIT-EXACT vs
+      full-scan (err 0.0, TestWKVIncrementalDecodeEquivalence). examples/RWKVDecode
+      demos exact equivalence + flat per-step timing/memory (3*C-float carried state)
+      across positions 64->448. 1957 tests pass. OPEN follow-ups:
+  - [ ] TNNetCrossWKV incremental path (two-source + asymmetric modes + receptance
+        gate — non-trivial, deferred).
+  - [ ] Block-level token-by-token decode through AddRWKVTimeMix (needs TNNetTokenShift
+        to carry its one-token shift state) + wiring into TNNetStreamingDecoder.
 - [ ] Mamba decode-side demo: tokens/sec flat in context length where a
       transformer of equal size slows (constant-memory headline of the
       landed BuildMambaFromSafeTensors importer; needs an incremental
