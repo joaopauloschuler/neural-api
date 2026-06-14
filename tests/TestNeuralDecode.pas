@@ -189,6 +189,11 @@ type
     // Model-integration: constrained generation emits parseable JSON.
     procedure TestGenerateTokensStreamedJSONConstraintEmitsParseableJSON;
     procedure TestDecodeGreedyJSONConstraintEmitsParseableJSON;
+    // JSON-Schema -> GBNF compiler (CompileJSONSchemaToGBNF) + the
+    // CreateJSONSchemaConstraint convenience wrapper.
+    procedure TestSchemaGBNFObjectRequiredAcceptsAndRejects;
+    procedure TestSchemaGBNFEnumArrayRefRecursion;
+    procedure TestSchemaGBNFConstraintGreedyToolCallIsByteLegal;
     // Seq2seq (encoder-decoder) generation on the committed T5/Marian pico
     // fixture pairs (BuildT5FromSafeTensors / BuildMarianFromSafeTensors).
     procedure TestDecodeSeq2SeqGreedyT5DeterministicEOSAndOracle;
@@ -5271,6 +5276,219 @@ begin
   AssertTrue('depth 0 needle is earlier than depth 1 needle',
     Pos('magic number is 42', LowerCase(R.Cells[0][0].Prompt)) <
     Pos('magic number is 42', LowerCase(R.Cells[High(Depths)][0].Prompt)));
+end;
+
+// --- JSON-Schema -> GBNF compiler ------------------------------------------
+
+// A two-field tool-call arguments schema: both properties required, a strict
+// (additionalProperties:false) object. The compiled grammar must ACCEPT the
+// well-formed argument objects and REJECT malformed / extra-field ones via the
+// TNNetGrammar pushdown (same accept = FeedString and IsComplete idiom the
+// arithmetic-grammar test uses).
+procedure TTestNeuralDecode.TestSchemaGBNFObjectRequiredAcceptsAndRejects;
+const
+  Schema =
+    '{"type":"object",' +
+    '"properties":{' +
+    '"location":{"type":"string"},' +
+    '"days":{"type":"integer"}},' +
+    '"required":["location","days"],' +
+    '"additionalProperties":false}';
+var
+  GBNF: string;
+  G: TNNetGrammar;
+  M: TNNetGrammarMachine;
+
+  function OK(const S: string): boolean;
+  begin
+    M.Reset();
+    Result := M.FeedString(S) and M.IsComplete();
+  end;
+
+begin
+  GBNF := CompileJSONSchemaToGBNF(Schema);
+  G := TNNetGrammar.Create(GBNF);
+  M := TNNetGrammarMachine.Create(G);
+  try
+    // Both required props present in declared order -> accepted.
+    AssertTrue('both fields valid',
+      OK('{"location":"Paris","days":3}'));
+    AssertTrue('whitespace between tokens tolerated',
+      OK('{ "location" : "Paris" , "days" : 12 }'));
+    AssertTrue('negative integer day',
+      OK('{"location":"Rio","days":-1}'));
+    // Missing a required field -> rejected.
+    AssertTrue('missing required "days" rejected',
+      not OK('{"location":"Paris"}'));
+    AssertTrue('empty object rejected (fields required)',
+      not OK('{}'));
+    // Wrong order (root is declared-order) -> rejected.
+    AssertTrue('swapped field order rejected',
+      not OK('{"days":3,"location":"Paris"}'));
+    // additionalProperties:false -> an extra field is rejected.
+    AssertTrue('extra field rejected (additionalProperties:false)',
+      not OK('{"location":"Paris","days":3,"unit":"c"}'));
+    // Type violation: days must be an integer, not a string.
+    AssertTrue('string where integer expected rejected',
+      not OK('{"location":"Paris","days":"three"}'));
+    AssertTrue('fractional where integer expected rejected',
+      not OK('{"location":"Paris","days":3.5}'));
+  finally
+    M.Free;
+    G.Free;
+  end;
+end;
+
+// Exercises enum -> literal alternation, array + minItems/maxItems, and
+// $ref/$defs recursion (a tree node referencing itself through $defs).
+procedure TTestNeuralDecode.TestSchemaGBNFEnumArrayRefRecursion;
+const
+  EnumSchema =
+    '{"type":"object",' +
+    '"properties":{"unit":{"enum":["celsius","fahrenheit"]}},' +
+    '"required":["unit"],"additionalProperties":false}';
+  ArraySchema =
+    '{"type":"array","items":{"type":"integer"},' +
+    '"minItems":2,"maxItems":3}';
+  RefSchema =
+    '{"$ref":"#/$defs/node",' +
+    '"$defs":{"node":{"type":"object",' +
+    '"properties":{"children":{"type":"array",' +
+    '"items":{"$ref":"#/$defs/node"}}},' +
+    '"required":["children"],"additionalProperties":false}}}';
+var
+  G: TNNetGrammar;
+  M: TNNetGrammarMachine;
+
+  function OK(const S: string): boolean;
+  begin
+    M.Reset();
+    Result := M.FeedString(S) and M.IsComplete();
+  end;
+
+begin
+  // enum -> alternation of the two exact string literals.
+  G := TNNetGrammar.Create(CompileJSONSchemaToGBNF(EnumSchema));
+  M := TNNetGrammarMachine.Create(G);
+  try
+    AssertTrue('enum value "celsius"', OK('{"unit":"celsius"}'));
+    AssertTrue('enum value "fahrenheit"', OK('{"unit":"fahrenheit"}'));
+    AssertTrue('non-enum value rejected', not OK('{"unit":"kelvin"}'));
+  finally
+    M.Free; G.Free;
+  end;
+  // array minItems=2 maxItems=3.
+  G := TNNetGrammar.Create(CompileJSONSchemaToGBNF(ArraySchema));
+  M := TNNetGrammarMachine.Create(G);
+  try
+    AssertTrue('two items', OK('[1,2]'));
+    AssertTrue('three items', OK('[1,2,3]'));
+    AssertTrue('one item rejected (minItems 2)', not OK('[1]'));
+    AssertTrue('four items rejected (maxItems 3)', not OK('[1,2,3,4]'));
+    AssertTrue('empty array rejected', not OK('[]'));
+  finally
+    M.Free; G.Free;
+  end;
+  // $ref/$defs recursion: a self-referential tree.
+  G := TNNetGrammar.Create(CompileJSONSchemaToGBNF(RefSchema));
+  M := TNNetGrammarMachine.Create(G);
+  try
+    AssertTrue('leaf node (empty children)', OK('{"children":[]}'));
+    AssertTrue('one level of nesting',
+      OK('{"children":[{"children":[]}]}'));
+    AssertTrue('two levels of nesting',
+      OK('{"children":[{"children":[{"children":[]}]}]}'));
+    AssertTrue('missing required children rejected', not OK('{}'));
+  finally
+    M.Free; G.Free;
+  end;
+end;
+
+// A tiny greedy decode under CreateJSONSchemaConstraint must produce
+// byte-legal output for a two-field tool-call schema: every emitted character
+// keeps the grammar machine in a legal state and the run ends in a complete
+// (accepting) parse. Char-level Dict (id = char code, ids < 2 special) mirrors
+// the existing JSON-constraint greedy-decode test.
+procedure TTestNeuralDecode.TestSchemaGBNFConstraintGreedyToolCallIsByteLegal;
+const
+  CharVocab = 128;
+  Schema =
+    '{"type":"object",' +
+    '"properties":{' +
+    '"name":{"type":"string"},' +
+    '"value":{"type":"integer"}},' +
+    '"required":["name","value"],"additionalProperties":false}';
+var
+  NN: TNNet;
+  Logit: TNNetLayer;
+  Dict: TStringListInt;
+  Constraint: TNNetGrammarConstraint;
+  Constrained: TNNetDecodeResult;
+  Probe, Fresh: TNNetGrammarMachine;
+  FreshG: TNNetGrammar;
+  N, I: integer;
+begin
+  RandSeed := 424242;
+  // Context wide enough to hold the whole emitted tool call (no reversed-
+  // one-hot truncation warnings).
+  NN := BuildTinyNet(64, CharVocab);
+  // Char-level Dict: id i (>= 2) detokenizes to Chr(i); ids 0/1 are special.
+  Dict := TStringListInt.Create();
+  Constraint := nil;
+  try
+    Dict.Sorted := false;
+    Dict.Add('<eos>');  // id 0
+    Dict.Add('<pad>');  // id 1
+    for I := 2 to CharVocab - 1 do Dict.Add(Chr(I));
+    Dict.SaveCurrentPosition();
+    AssertEquals('char-level vocab', CharVocab, Dict.GetVocabCount());
+
+    Constraint := CreateJSONSchemaConstraint(Schema, Dict);
+
+    // Rig the LOGIT layer so the unconstrained argmax would wander, but the
+    // constraint forces every step to a grammar-legal char. Bias toward EOS
+    // and the structural chars; the constraint masks illegal mass each step.
+    Logit := NN.Layers[NN.Layers.Count - 2];
+    for N := 0 to Logit.Neurons.Count - 1 do
+    begin
+      Logit.Neurons[N].Weights.Fill(0);
+      Logit.Neurons[N].BiasWeight := 0;
+    end;
+    Logit.Neurons[1].BiasWeight := 14;          // EOS most wanted (gated)
+    Logit.Neurons[Ord('"')].BiasWeight := 11;   // quote beats other string chars
+    Logit.Neurons[Ord('}')].BiasWeight := 10;
+    Logit.Neurons[Ord('{')].BiasWeight := 9;
+    Logit.Neurons[Ord(':')].BiasWeight := 8;
+    Logit.Neurons[Ord(',')].BiasWeight := 7;
+    Logit.Neurons[Ord('a')].BiasWeight := 6;
+    Logit.Neurons[Ord('1')].BiasWeight := 5;
+
+    Constrained := DecodeGreedy(NN, 'q', 64, [], Constraint);
+
+    // (a) Every byte of the produced text must keep an independent fresh
+    //     machine legal, and the full string must parse (IsComplete).
+    Probe := Constraint.Machine; // live machine after the committed run
+    AssertTrue('decode ended in a complete (accepting) parse',
+      Probe.IsComplete());
+    AssertTrue('non-empty structured output', Length(Constrained.Text) > 0);
+
+    // (b) Independent re-validation: feed the text through a FRESH machine
+    //     compiled straight from the schema; it must be byte-legal end to end.
+    FreshG := TNNetGrammar.Create(CompileJSONSchemaToGBNF(Schema));
+    Fresh := TNNetGrammarMachine.Create(FreshG);
+    try
+      AssertTrue('emitted text is byte-legal under a fresh machine',
+        Fresh.FeedString(Constrained.Text));
+      AssertTrue('emitted text is a complete parse', Fresh.IsComplete());
+    finally
+      Fresh.Free;
+      FreshG.Free;
+    end;
+  finally
+    Constraint.Free;
+    NN.Free;
+    Dict.Free;
+  end;
 end;
 
 initialization

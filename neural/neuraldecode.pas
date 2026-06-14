@@ -1726,10 +1726,49 @@ function NeedleInHaystackReport(NN: TNNet;
   const NeedleFact, NeedleAnswer, Question: string;
   MaxLen: integer): TNeedleInHaystackResult; overload;
 
+// ---------------------------------------------------------------------------
+// JSON-SCHEMA -> GBNF compiler for structured / function-calling output.
+//
+// Parses a JSON Schema (the OpenAI-function-call / structured-output subset)
+// and EMITS a GBNF grammar string the existing TNNetGrammar consumes, so a
+// model can be constrained to emit ONLY schema-valid JSON (see
+// CreateJSONSchemaConstraint). Parsing uses the repo's TJSONParser(s,[])
+// convention (NOT GetJSON) so UTF-8 bytes survive intact.
+//
+// SUPPORTED SUBSET (v1):
+//   - object: "properties" emit ordered prop rules; "required" controls which
+//     props are optional (a non-required prop and its trailing comma are wrapped
+//     in '?'); additionalProperties:false (the default here) emits no open tail,
+//     additionalProperties:true (or a schema) allows arbitrary extra members.
+//   - array: "items" schema, "minItems"/"maxItems" -> explicit repetition (a
+//     bounded count desugared to required + optional element slots).
+//   - string: plain quoted string; "enum" -> alternation of quoted literals;
+//     "pattern" -> a single character-class rule (the chars inside the FIRST
+//     [...] of the regex; full regex is out of scope).
+//   - number / integer / boolean / null primitives.
+//   - anyOf / oneOf -> alternation of the branch grammars (treated alike; v1
+//     does not enforce oneOf's exactly-one semantics).
+//   - $ref "#/$defs/Name" (and legacy "#/definitions/Name") + $defs/definitions
+//     -> named rules, enabling recursion.
+//
+// OUT OF SCOPE for v1 (documented, not enforced): allOf, format validators
+// (date-time/email/uuid/...), and numeric minimum/maximum/multipleOf bound
+// enforcement (numbers are matched structurally, not range-checked). An empty
+// or unrecognised schema falls back to the permissive JSON value rule.
+// Coded by Claude (AI).
+function CompileJSONSchemaToGBNF(const SchemaJSON: string): string;
+
+// Convenience: compile SchemaJSON to GBNF and wrap it in a
+// TNNetGrammarConstraint over Dict (token id -> Dict.DeTokenize(id), ids < 2
+// special), matching the constraint's existing Create(GBNFText, Dict) ctor.
+// Coded by Claude (AI).
+function CreateJSONSchemaConstraint(const SchemaJSON: string;
+  Dict: TStringListInt): TNNetGrammarConstraint;
+
 implementation
 
 uses
-  Math;
+  Math, fpjson;
 
 // Forward declarations for helpers used before their definition.
 function ContrastiveHiddenLayer(NN: TNNet): TNNetLayer; forward;
@@ -3020,6 +3059,541 @@ procedure TNNetGrammarConstraint.Commit(TokenId: integer);
 begin
   if (TokenId < 2) or (TokenId > High(FTokenStr)) then exit;
   FMachine.FeedString(FTokenStr[TokenId]);
+end;
+
+{ JSON-Schema -> GBNF compiler }
+
+// Stateful single-pass compiler: walks a parsed JSON Schema tree and appends
+// GBNF rule definitions to a builder, returning the rule NAME each node should
+// be referenced by. The fixed primitive rules (string/number/.../value, and
+// the optional-whitespace 'ws') are emitted once, lazily. $defs are pre-bound
+// to rule names so a $ref forward-references them (recursion -> the pushdown
+// stack). Everything is desugared into the GBNF subset TNNetGrammar accepts
+// (sequence/alternation/literals/classes/'?'/'*'/'+'/refs); no construct the
+// grammar can't parse is ever emitted. Coded by Claude (AI).
+type
+  TJSONSchemaCompiler = class(TObject)
+    private
+      FRules: TStringList;          // emitted "name ::= body" lines (ordered)
+      FAnonCount: integer;          // anon rule counter for inline subschemas
+      FDefRuleName: TStringList;    // def name -> emitted rule name (memo)
+      FHaveWS, FHaveStr, FHaveNum, FHaveInt, FHaveBool, FHaveNull,
+        FHaveValue: boolean;       // primitive-rule emitted flags
+      function NewAnonName(const Hint: string): string;
+      procedure Emit(const Name, Body: string);
+      // Lazily emit and return the name of each shared primitive rule.
+      function WSRule(): string;
+      function StringRule(): string;
+      function NumberRule(): string;
+      function IntegerRule(): string;
+      function BoolRule(): string;
+      function NullRule(): string;
+      function ValueRule(): string;
+      // Quotes S as a GBNF "..." literal (escaping " and \).
+      function GBNFLiteral(const S: string): string;
+      function CompileObject(Obj: TJSONObject; const Hint: string): string;
+      function CompileArray(Obj: TJSONObject; const Hint: string): string;
+      function CompileStringNode(Obj: TJSONObject; const Hint: string): string;
+      function CompileEnum(Arr: TJSONArray; const Hint: string): string;
+      function CompileAnyOf(Arr: TJSONArray; const Hint: string): string;
+      function CompileRef(const Ref: string): string;
+    public
+      FDefs: TJSONObject;           // $defs/definitions block (not owned)
+      constructor Create();
+      destructor Destroy(); override;
+      // Compiles one schema node to a rule and returns its NAME (a referenceable
+      // GBNF symbol). Hint seeds a readable anon-rule name.
+      function Compile(Node: TJSONData; const Hint: string): string;
+      // The accumulated "root ::= ..." grammar text (root first).
+      function Grammar(const RootRuleName: string): string;
+  end;
+
+constructor TJSONSchemaCompiler.Create();
+begin
+  inherited Create();
+  FRules := TStringList.Create();
+  FDefRuleName := TStringList.Create();
+  FAnonCount := 0;
+end;
+
+destructor TJSONSchemaCompiler.Destroy();
+begin
+  FDefRuleName.Free;
+  FRules.Free;
+  inherited Destroy();
+end;
+
+function TJSONSchemaCompiler.NewAnonName(const Hint: string): string;
+var
+  Clean: string;
+  I: integer;
+begin
+  // Keep only [A-Za-z0-9_] from the hint so the name is a legal GBNF symbol.
+  Clean := '';
+  for I := 1 to Length(Hint) do
+    if Hint[I] in ['A'..'Z', 'a'..'z', '0'..'9', '_']
+    then Clean := Clean + Hint[I];
+  if Clean = '' then Clean := 'r';
+  Inc(FAnonCount);
+  Result := Clean + '_' + IntToStr(FAnonCount);
+end;
+
+procedure TJSONSchemaCompiler.Emit(const Name, Body: string);
+begin
+  FRules.Add(Name + ' ::= ' + Body);
+end;
+
+function TJSONSchemaCompiler.WSRule(): string;
+begin
+  Result := 'ws';
+  if not FHaveWS then
+  begin
+    // Optional insignificant JSON whitespace.
+    Emit('ws', '[ ' + #9 + #10 + #13 + ']*');
+    FHaveWS := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.StringRule(): string;
+begin
+  Result := 'jstring';
+  if not FHaveStr then
+  begin
+    // A JSON string: quote, any non-control-non-"-non-\ char or an escape,
+    // quote. Mirrors the free-form JSON constraint's string acceptance.
+    Emit('jstring',
+      '"\"" ( [^"\\] | "\\" ["\\/bfnrt] )* "\""');
+    FHaveStr := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.NumberRule(): string;
+begin
+  Result := 'jnumber';
+  if not FHaveNum then
+  begin
+    // Optional sign, integer part, optional fraction, optional exponent.
+    Emit('jnumber',
+      '"-"? ("0" | [1-9] [0-9]*) ("." [0-9]+)? ([eE] [-+]? [0-9]+)?');
+    FHaveNum := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.IntegerRule(): string;
+begin
+  Result := 'jinteger';
+  if not FHaveInt then
+  begin
+    Emit('jinteger', '"-"? ("0" | [1-9] [0-9]*)');
+    FHaveInt := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.BoolRule(): string;
+begin
+  Result := 'jbool';
+  if not FHaveBool then
+  begin
+    Emit('jbool', '"true" | "false"');
+    FHaveBool := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.NullRule(): string;
+begin
+  Result := 'jnull';
+  if not FHaveNull then
+  begin
+    Emit('jnull', '"null"');
+    FHaveNull := true;
+  end;
+end;
+
+function TJSONSchemaCompiler.ValueRule(): string;
+begin
+  // Permissive any-JSON-value fallback (schema-less / unknown node). Recursive
+  // through arrays/objects via the pushdown stack.
+  Result := 'jvalue';
+  if not FHaveValue then
+  begin
+    FHaveValue := true; // set first: the body references jvalue (recursion)
+    Emit('jvalue',
+      StringRule() + ' | ' + NumberRule() + ' | ' + BoolRule() + ' | ' +
+      NullRule() + ' | jvarray | jvobject');
+    Emit('jvarray',
+      '"[" ' + WSRule() + ' ( jvalue ' + WSRule() +
+      ' ("," ' + WSRule() + ' jvalue ' + WSRule() + ')* )? "]"');
+    Emit('jvmember', StringRule() + ' ' + WSRule() + ' ":" ' + WSRule() +
+      ' jvalue');
+    Emit('jvobject',
+      '"{" ' + WSRule() + ' ( jvmember ' + WSRule() +
+      ' ("," ' + WSRule() + ' jvmember ' + WSRule() + ')* )? "}"');
+  end;
+end;
+
+function TJSONSchemaCompiler.GBNFLiteral(const S: string): string;
+var
+  I: integer;
+begin
+  Result := '"';
+  for I := 1 to Length(S) do
+  begin
+    if (S[I] = '"') or (S[I] = '\') then Result := Result + '\';
+    Result := Result + S[I];
+  end;
+  Result := Result + '"';
+end;
+
+function TJSONSchemaCompiler.CompileRef(const Ref: string): string;
+var
+  DefName: string;
+  P, Idx: integer;
+  Node: TJSONData;
+begin
+  // Resolve "#/$defs/Name" or legacy "#/definitions/Name" to a named rule.
+  P := LastDelimiter('/', Ref);
+  DefName := Copy(Ref, P + 1, Length(Ref));
+  // Already bound? (memoised so a recursive $ref does not re-expand.)
+  Idx := FDefRuleName.IndexOfName(DefName);
+  if Idx >= 0 then exit(FDefRuleName.ValueFromIndex[Idx]);
+  if (FDefs = nil) or (FDefs.IndexOfName(DefName) < 0) then
+    // Unknown $ref -> permissive value (keeps the grammar well-formed).
+    exit(ValueRule());
+  // Bind the name BEFORE compiling so a self-recursive def references itself.
+  Result := 'def_' + NewAnonName(DefName);
+  FDefRuleName.Values[DefName] := Result;
+  Node := FDefs.Find(DefName);
+  Emit(Result, Compile(Node, DefName));
+end;
+
+function TJSONSchemaCompiler.CompileEnum(Arr: TJSONArray;
+  const Hint: string): string;
+var
+  I: integer;
+  Body, Lit: string;
+  Item: TJSONData;
+begin
+  // Each enum value -> its exact JSON literal; the rule is their alternation.
+  Body := '';
+  for I := 0 to Arr.Count - 1 do
+  begin
+    Item := Arr.Items[I];
+    case Item.JSONType of
+      jtString: Lit := GBNFLiteral('"' + Item.AsString + '"'); // quoted string
+      jtBoolean: if Item.AsBoolean then Lit := '"true"' else Lit := '"false"';
+      jtNull: Lit := '"null"';
+    else
+      Lit := GBNFLiteral(Item.AsJSON); // number: its textual form
+    end;
+    if Body = '' then Body := Lit else Body := Body + ' | ' + Lit;
+  end;
+  if Body = '' then Body := StringRule();
+  Result := NewAnonName(Hint + '_enum');
+  Emit(Result, Body);
+end;
+
+function TJSONSchemaCompiler.CompileAnyOf(Arr: TJSONArray;
+  const Hint: string): string;
+var
+  I: integer;
+  Body, Sub: string;
+begin
+  // anyOf / oneOf -> alternation of branch rules. (v1 does NOT enforce oneOf's
+  // exactly-one-match semantics; both map to '|'.)
+  Body := '';
+  for I := 0 to Arr.Count - 1 do
+  begin
+    Sub := Compile(Arr.Items[I], Hint + '_alt' + IntToStr(I));
+    if Body = '' then Body := Sub else Body := Body + ' | ' + Sub;
+  end;
+  if Body = '' then Body := ValueRule();
+  Result := NewAnonName(Hint + '_anyof');
+  Emit(Result, Body);
+end;
+
+function TJSONSchemaCompiler.CompileStringNode(Obj: TJSONObject;
+  const Hint: string): string;
+var
+  Pat, Cls: string;
+  P, Q: integer;
+begin
+  // "pattern" -> a char-class rule built from the FIRST [...] of the regex
+  // (full regex is out of scope); otherwise a generic JSON string.
+  if Obj.IndexOfName('pattern') >= 0 then
+  begin
+    Pat := Obj.Get('pattern', '');
+    P := Pos('[', Pat);
+    if P > 0 then
+    begin
+      Q := P;
+      while (Q <= Length(Pat)) and (Pat[Q] <> ']') do Inc(Q);
+      if Q <= Length(Pat) then
+      begin
+        Cls := Copy(Pat, P, Q - P + 1); // e.g. "[A-Za-z0-9_]"
+        // Wrap in quotes: pattern strings are still emitted as JSON strings,
+        // so a quote frames one-or-more pattern chars.
+        Result := NewAnonName(Hint + '_pat');
+        Emit(Result, '"\"" ' + Cls + '+ "\""');
+        exit;
+      end;
+    end;
+  end;
+  Result := StringRule();
+end;
+
+function TJSONSchemaCompiler.CompileArray(Obj: TJSONObject;
+  const Hint: string): string;
+var
+  ItemRule, Body, WS: string;
+  MinItems, MaxItems, I: integer;
+  ItemsNode: TJSONData;
+begin
+  WS := WSRule();
+  ItemsNode := Obj.Find('items');
+  if (ItemsNode <> nil) and (ItemsNode.JSONType = jtObject)
+  then ItemRule := Compile(ItemsNode, Hint + '_item')
+  else ItemRule := ValueRule();
+  MinItems := Obj.Get('minItems', 0);
+  MaxItems := Obj.Get('maxItems', -1); // -1 = unbounded
+  Result := NewAnonName(Hint + '_arr');
+  // Build the element list with explicit min/max counts. A comma precedes
+  // every element past the first.
+  if (MinItems <= 0) and (MaxItems < 0) then
+  begin
+    // Unbounded, zero or more.
+    Body := '"[" ' + WS + ' ( ' + ItemRule + ' ' + WS +
+      ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')* )? "]"';
+  end
+  else
+  begin
+    Body := '"[" ' + WS;
+    if MinItems > 0 then
+    begin
+      // First MinItems elements are mandatory.
+      Body := Body + ' ' + ItemRule + ' ' + WS;
+      for I := 2 to MinItems do
+        Body := Body + ' "," ' + WS + ' ' + ItemRule + ' ' + WS;
+      if MaxItems < 0 then
+        // Then any number more.
+        Body := Body + ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')*'
+      else
+        // Up to (MaxItems - MinItems) more, each optional.
+        for I := MinItems + 1 to MaxItems do
+          Body := Body + ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')?';
+    end
+    else
+    begin
+      // MinItems = 0 but bounded above: 0..MaxItems optional slots.
+      Body := Body + ' ( ' + ItemRule + ' ' + WS;
+      for I := 2 to MaxItems do
+        Body := Body + ' ("," ' + WS + ' ' + ItemRule + ' ' + WS + ')?';
+      Body := Body + ' )?';
+    end;
+    Body := Body + ' "]"';
+  end;
+  Emit(Result, Body);
+end;
+
+function TJSONSchemaCompiler.CompileObject(Obj: TJSONObject;
+  const Hint: string): string;
+var
+  Props: TJSONObject;
+  Required: TJSONArray;
+  WS, Body, MemberRule, KeyLit, PropName: string;
+  I: integer;
+  IsReq, ExtraAllowed: boolean;
+  ReqFlags: array of boolean;
+  PropNames: TStringList;
+  ExtraNode: TJSONData;
+
+  function PropIsRequired(const AName: string): boolean;
+  var K: integer;
+  begin
+    Result := false;
+    if Required = nil then exit;
+    for K := 0 to Required.Count - 1 do
+      if (Required.Items[K].JSONType = jtString) and
+         (Required.Items[K].AsString = AName) then exit(true);
+  end;
+
+begin
+  WS := WSRule();
+  if Obj.Find('properties') is TJSONObject
+  then Props := TJSONObject(Obj.Find('properties'))
+  else Props := nil;
+  if Obj.Find('required') is TJSONArray
+  then Required := TJSONArray(Obj.Find('required'))
+  else Required := nil;
+  // additionalProperties: default false here (strict structured output). A
+  // value of true (or a schema object) re-opens the object to extra members.
+  ExtraAllowed := false;
+  ExtraNode := Obj.Find('additionalProperties');
+  if ExtraNode <> nil then
+    if (ExtraNode.JSONType = jtBoolean) then ExtraAllowed := ExtraNode.AsBoolean
+    else if (ExtraNode.JSONType = jtObject) then ExtraAllowed := true;
+
+  Result := NewAnonName(Hint + '_obj');
+
+  if (Props = nil) or (Props.Count = 0) then
+  begin
+    // No declared properties: either a closed empty object or a permissive one.
+    if ExtraAllowed
+    then Emit(Result, ValueRule()) // any object (jvobject is inside jvalue)
+    else Emit(Result, '"{" ' + WS + ' "}"');
+    exit;
+  end;
+
+  // Collect property names + compile a value rule per property.
+  PropNames := TStringList.Create();
+  try
+    for I := 0 to Props.Count - 1 do PropNames.Add(Props.Names[I]);
+    SetLength(ReqFlags, PropNames.Count);
+    for I := 0 to PropNames.Count - 1 do
+      ReqFlags[I] := PropIsRequired(PropNames[I]);
+
+    // Linear object body in declared property order. A comma precedes every
+    // member except the first one EMITTED; since optional members may be
+    // absent, each non-first member wraps its own leading comma inside the
+    // same optional group, and the FIRST member is comma-free. A required
+    // first member is mandatory; an optional first member is wrapped in '?'.
+    Body := '"{" ' + WS + ' ';
+    for I := 0 to PropNames.Count - 1 do
+    begin
+      PropName := PropNames[I];
+      KeyLit := GBNFLiteral('"' + PropName + '"');
+      MemberRule := Compile(Props.Items[I], Hint + '_' + PropName);
+      IsReq := ReqFlags[I];
+      if I = 0 then
+      begin
+        if IsReq then
+          Body := Body + KeyLit + ' ' + WS + ' ":" ' + WS + ' ' +
+            MemberRule + ' ' + WS
+        else
+          Body := Body + '( ' + KeyLit + ' ' + WS + ' ":" ' + WS + ' ' +
+            MemberRule + ' ' + WS + ' )?';
+      end
+      else
+      begin
+        if IsReq then
+          Body := Body + ' "," ' + WS + ' ' + KeyLit + ' ' + WS + ' ":" ' +
+            WS + ' ' + MemberRule + ' ' + WS
+        else
+          Body := Body + ' ( "," ' + WS + ' ' + KeyLit + ' ' + WS + ' ":" ' +
+            WS + ' ' + MemberRule + ' ' + WS + ' )?';
+      end;
+    end;
+
+    if ExtraAllowed then
+      // Allow trailing arbitrary members after the declared ones.
+      Body := Body + ' ( "," ' + WS + ' ' + StringRule() + ' ' + WS +
+        ' ":" ' + WS + ' ' + ValueRule() + ' ' + WS + ' )*';
+    Body := Body + ' "}"';
+    Emit(Result, Body);
+  finally
+    PropNames.Free;
+  end;
+end;
+
+function TJSONSchemaCompiler.Compile(Node: TJSONData;
+  const Hint: string): string;
+var
+  Obj: TJSONObject;
+  TypeStr: string;
+  TypeNode: TJSONData;
+begin
+  if (Node = nil) or (Node.JSONType <> jtObject) then exit(ValueRule());
+  Obj := TJSONObject(Node);
+
+  // $ref takes precedence (a ref node usually has nothing else of interest).
+  if Obj.IndexOfName('$ref') >= 0 then
+    exit(CompileRef(Obj.Get('$ref', '')));
+
+  // anyOf / oneOf -> alternation.
+  if Obj.Find('anyOf') is TJSONArray then
+    exit(CompileAnyOf(TJSONArray(Obj.Find('anyOf')), Hint));
+  if Obj.Find('oneOf') is TJSONArray then
+    exit(CompileAnyOf(TJSONArray(Obj.Find('oneOf')), Hint));
+
+  // enum (independent of "type").
+  if Obj.Find('enum') is TJSONArray then
+    exit(CompileEnum(TJSONArray(Obj.Find('enum')), Hint));
+
+  // "type": a single string here (a type ARRAY would be anyOf-like; v1 takes
+  // the first entry).
+  TypeStr := '';
+  TypeNode := Obj.Find('type');
+  if TypeNode <> nil then
+    if TypeNode.JSONType = jtString then TypeStr := TypeNode.AsString
+    else if (TypeNode.JSONType = jtArray) and (TJSONArray(TypeNode).Count > 0)
+      and (TJSONArray(TypeNode).Items[0].JSONType = jtString)
+    then TypeStr := TJSONArray(TypeNode).Items[0].AsString;
+
+  // A node carrying "properties" but no explicit type is an object.
+  if (TypeStr = '') and (Obj.IndexOfName('properties') >= 0) then
+    TypeStr := 'object';
+  if (TypeStr = '') and (Obj.IndexOfName('items') >= 0) then
+    TypeStr := 'array';
+
+  if TypeStr = 'object' then exit(CompileObject(Obj, Hint));
+  if TypeStr = 'array' then exit(CompileArray(Obj, Hint));
+  if TypeStr = 'string' then exit(CompileStringNode(Obj, Hint));
+  if TypeStr = 'number' then exit(NumberRule());
+  if TypeStr = 'integer' then exit(IntegerRule());
+  if TypeStr = 'boolean' then exit(BoolRule());
+  if TypeStr = 'null' then exit(NullRule());
+  // Unknown / schema-less node -> permissive value.
+  Result := ValueRule();
+end;
+
+function TJSONSchemaCompiler.Grammar(const RootRuleName: string): string;
+var
+  I: integer;
+begin
+  // root first (TNNetGrammar requires a 'root' rule; it may appear anywhere,
+  // but emitting it first reads best), then every emitted rule.
+  Result := 'root ::= ' + WSRule() + ' ' + RootRuleName + ' ' + WSRule() +
+    LineEnding;
+  for I := 0 to FRules.Count - 1 do
+    Result := Result + FRules[I] + LineEnding;
+end;
+
+function CompileJSONSchemaToGBNF(const SchemaJSON: string): string;
+var
+  Root: TJSONData;
+  Obj: TJSONObject;
+  Compiler: TJSONSchemaCompiler;
+  RootRule: string;
+  DefsNode: TJSONData;
+begin
+  Root := HFParseJSONRaw(SchemaJSON);
+  Compiler := TJSONSchemaCompiler.Create();
+  try
+    if (Root = nil) or (Root.JSONType <> jtObject) then
+    begin
+      // Degenerate schema: fall back to free-form JSON value.
+      RootRule := Compiler.ValueRule();
+    end
+    else
+    begin
+      Obj := TJSONObject(Root);
+      // Bind $defs / definitions for $ref resolution (the block is not owned).
+      DefsNode := Obj.Find('$defs');
+      if not (DefsNode is TJSONObject) then DefsNode := Obj.Find('definitions');
+      if DefsNode is TJSONObject then Compiler.FDefs := TJSONObject(DefsNode);
+      RootRule := Compiler.Compile(Root, 'schema');
+    end;
+    Result := Compiler.Grammar(RootRule);
+  finally
+    Compiler.Free;
+    Root.Free;
+  end;
+end;
+
+function CreateJSONSchemaConstraint(const SchemaJSON: string;
+  Dict: TStringListInt): TNNetGrammarConstraint;
+begin
+  Result := TNNetGrammarConstraint.Create(
+    CompileJSONSchemaToGBNF(SchemaJSON), Dict);
 end;
 
 { TNNetLogitsProcessor }
