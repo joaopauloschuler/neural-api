@@ -576,7 +576,7 @@ rather than acted on.
       substantially. Note: the WhisperTranscribe example needs ~4 GB
       VIRTUAL memory (ulimit -v 4000000; the 3 GB test cap aborts during
       build).
-- [ ] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
+- [X] KV-cache beam search (cache forking): DecodeBeamSearch takes a plain
       TNNet and RE-ENCODES the whole prefix every step — the streaming-
       decode docs explicitly note only greedy/sampled streamed generation
       is exact today. Add a fork/clone primitive to TNNetStreamingDecoder
@@ -586,6 +586,19 @@ rather than acted on.
       is also what best-of-N and the speculative-decoding verify step
       want. Assert ranked beam output is identical to the re-encoding
       implementation.
+      LANDED: DecodeBeamSearchCachedAll / DecodeBeamSearchCached on top of
+      TNNetStreamingDecoder, reusing the already-landed Snapshot/
+      RestoreSnapshot fork (one snapshot per surviving hypothesis, cloned
+      per beam via Restore-then-Snapshot). Per step: Restore each beam's
+      cache, StepForward its last token, read HiddenState/Output logits,
+      expand, prune to BeamWidth, snapshot survivors. Regression tests
+      assert BIT-IDENTICAL ranked beams (text + sum-log-prob + score +
+      finished flag, best-first) vs the re-encoding DecodeBeamSearchAll:
+      TestBeamSearchCachedMatchesReEncodeBigram (exact, tol 0.0, against
+      DecodeBeamSearchAll on a rigged bigram pair) and
+      TestBeamSearchCachedMatchesReEncodeCausalReference (RoPE causal KV-
+      cache topology vs a zero-pad re-encode beam reference, tol 1e-5),
+      plus TestBeamSearchCachedRejectsWideSession.
 - [ ] Early-exit / self-speculative decoding (LayerSkip / CALM): decode
       easy tokens from an intermediate layer through the LM head, fall
       back to full depth when confidence is low — the model becomes its

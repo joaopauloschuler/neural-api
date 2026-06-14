@@ -73,6 +73,24 @@ type
     // Sets Emb's row of PrevToken to ln of the given next-token probs.
     procedure SetMarkovRow(Emb: TNNetEmbedding; PrevToken: integer;
       const Probs: array of TNeuralFloat);
+    // BIGRAM pair for the cache-forking beam test. Both nets are
+    // Input(ContextLen,1,Vocab)->FullConnectLinear(Vocab)->SoftMax with the
+    // SAME hand-set lookup table wired into the position-0 weight block (all
+    // other positions zeroed). The one-hot-REVERSED cache-less forward and the
+    // width-1 streamed forward therefore both compute softmax(Table[lastTok]),
+    // so DecodeBeamSearchAll(Full) and DecodeBeamSearchCachedAll(Twin session)
+    // must agree bit-for-bit. A deterministic seeded table gives a non-trivial
+    // (multi-branch, EOS-bearing) beam tree.
+    procedure BuildBigramBeamPair(out Full, Twin: TNNet; Vocab,
+      FullContextLen: integer);
+    // Full-re-encode beam-search reference for a CAUSAL streamable net (zero-pad
+    // the prefix, read the last-real-position softmax row). Same algorithm and
+    // ranking as DecodeBeamSearchAll, but driven by the SAME causal net the
+    // cache-forking variant streams, so the two are bit-comparable on a genuine
+    // KV-cache topology (RoPE attention).
+    function CausalReEncodeBeamAll(Full: TNNet; const PromptToks: array of integer;
+      MaxLen, BeamWidth: integer; LengthPenalty: TNeuralFloat
+      ): TNNetDecodeResultArray;
   published
     // Pure helper functions (no network needed).
     procedure TestLengthPenaltyAlphaZeroIsOne;
@@ -87,6 +105,11 @@ type
     procedure TestBatchGreedyEmptyAndSingle;
     procedure TestBeamSearchAllSortedDescending;
     procedure TestBeamSearchScoreNoWorseThanGreedy;
+    // KV-cache (cache-forking) beam search must be bit-identical to the
+    // re-encoding DecodeBeamSearchAll, full ranked beam, best-first.
+    procedure TestBeamSearchCachedMatchesReEncodeBigram;
+    procedure TestBeamSearchCachedMatchesReEncodeCausalReference;
+    procedure TestBeamSearchCachedRejectsWideSession;
     // Diverse beam search (Hamming-diversity groups).
     procedure TestDiverseBeamLambdaZeroMatchesBeam;
     procedure TestDiverseBeamGroupsDifferInFirstToken;
@@ -5835,6 +5858,307 @@ begin
     Constraint.Free;
     NN.Free;
     Dict.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.BuildBigramBeamPair(out Full, Twin: TNNet;
+  Vocab, FullContextLen: integer);
+var
+  HF: TNNetLayer;
+  Emb: TNNetEmbedding;
+  T, O: integer;
+  Table: array of array of TNeuralFloat;
+begin
+  // Deterministic bigram logit table Table[prevTok][outTok].
+  RandSeed := 991733;
+  SetLength(Table, Vocab);
+  for T := 0 to Vocab - 1 do
+  begin
+    SetLength(Table[T], Vocab);
+    for O := 0 to Vocab - 1 do
+      // A spread of values (some negative) so the beam tree actually branches
+      // and EOS (token 1) sometimes wins, exercising the finished pool.
+      Table[T][O] := (Random - 0.5) * 6.0;
+  end;
+
+  // CACHE-LESS net (DecodeBeamSearchAll): ONE-HOT input fed REVERSED, so the
+  // current (last) token lands at position 0. A FullConnect head collapses the
+  // whole sequence to one Vocab-sized distribution; we wire Table into ONLY the
+  // position-0 weight block (every other position zeroed), making the output
+  // exactly softmax(Table[currentToken]).
+  Full := TNNet.Create();
+  Full.AddLayer(TNNetInput.Create(FullContextLen, 1, Vocab));
+  HF := Full.AddLayer(TNNetFullConnectLinear.Create(Vocab));
+  Full.AddLayer(TNNetSoftMax.Create());
+  Full.InitWeights();
+  for O := 0 to Vocab - 1 do
+  begin
+    HF.Neurons[O].Weights.Fill(0);
+    HF.Neurons[O].BiasWeight := 0;
+    for T := 0 to Vocab - 1 do
+      HF.Neurons[O].Weights[0, 0, T] := Table[T][O];
+  end;
+  HF.MulWeights(1.0);
+
+  // STREAMING twin (DecodeBeamSearchCachedAll): TOKEN-ID input (FData[0]=token,
+  // the streamed-decoder convention). An Embedding whose row t IS the logit
+  // vector Table[t], then SoftMax, computes the SAME softmax(Table[token]) - so
+  // both nets realise the identical bigram next-token distribution.
+  Twin := TNNet.Create();
+  Twin.AddLayer(TNNetInput.Create(1, 1, 1));
+  // EncodeZero=1: token 0 is a REAL embedding row (not a zero pad), so the
+  // bigram covers the full 0..Vocab-1 alphabet like the one-hot net does.
+  Emb := TNNetEmbedding(Twin.AddLayer(TNNetEmbedding.Create(Vocab, Vocab, 1, 1.0)));
+  Twin.AddLayer(TNNetSoftMax.Create());
+  Twin.InitWeights();
+  for T := 0 to Vocab - 1 do
+    for O := 0 to Vocab - 1 do
+      Emb.Neurons[0].Weights[T, 0, O] := Table[T][O];
+  Emb.MulWeights(1.0);
+end;
+
+function TTestNeuralDecode.CausalReEncodeBeamAll(Full: TNNet;
+  const PromptToks: array of integer; MaxLen, BeamWidth: integer;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+type
+  TLBeam = record
+    Text: string; SumLogProb, Score: TNeuralFloat; Finished: boolean;
+  end;
+const
+  csEOS = 1;
+var
+  InV: TNNetVolume; Row: TNNetVolume;
+  ContextLen, VocabSize, Step, I, T, B, PromptLen: integer;
+  Total, CutScore: TNeuralFloat;
+  Live, Finished, Cand: array of TLBeam;
+  NB: TLBeam;
+  AllDominated: boolean;
+
+  procedure SortDesc(var A: array of TLBeam);
+  var ii, jj: integer; tt: TLBeam;
+  begin
+    for ii := 1 to High(A) do
+    begin
+      tt := A[ii]; jj := ii - 1;
+      while (jj >= 0) and (A[jj].Score < tt.Score) do
+      begin A[jj + 1] := A[jj]; Dec(jj); end;
+      A[jj + 1] := tt;
+    end;
+  end;
+
+  // Full re-encode: zero-pad PromptToks ++ generated chars, read the softmax
+  // row at the last real position (the next-token distribution).
+  procedure NextLP(const Gen: string; var LP: array of TNeuralFloat);
+  var k, last: integer;
+  begin
+    InV.Fill(0);
+    PromptLen := Length(PromptToks);
+    for k := 0 to PromptLen - 1 do InV.FData[k] := PromptToks[k];
+    for k := 1 to Length(Gen) do InV.FData[PromptLen + k - 1] := Ord(Gen[k]);
+    last := PromptLen + Length(Gen) - 1;
+    Full.Compute(InV);
+    Row := Full.GetLastLayer().Output;
+    Total := 0;
+    for k := 0 to VocabSize - 1 do Total := Total + Row[last, 0, k];
+    if Total <= 0 then Total := 1.0;
+    for k := 0 to VocabSize - 1 do LP[k] := SafeLogProb(Row[last, 0, k] / Total);
+  end;
+
+var
+  LP: array of TNeuralFloat;
+begin
+  ContextLen := Full.GetFirstLayer().Output.SizeX;
+  // Token-id input (Depth=1); the vocabulary is the LM head's output depth.
+  VocabSize := Full.GetLastLayer().Output.Depth;
+  SetLength(LP, VocabSize);
+  if BeamWidth < 1 then BeamWidth := 1;
+  // Token-id input volume (Depth=1), zero-padded; matches the streamed twin.
+  InV := TNNetVolume.Create(ContextLen, 1, 1);
+  try
+    SetLength(Live, 1);
+    Live[0].Text := ''; Live[0].SumLogProb := 0; Live[0].Score := 0;
+    Live[0].Finished := False;
+    SetLength(Finished, 0);
+    for Step := 1 to MaxLen do
+    begin
+      if Length(Live) = 0 then Break;
+      if Length(Finished) >= BeamWidth then
+      begin
+        SortDesc(Finished);
+        CutScore := Finished[BeamWidth - 1].Score;
+        AllDominated := True;
+        for I := 0 to High(Live) do
+          if Live[I].Score > CutScore then AllDominated := False;
+        if AllDominated then Break;
+      end;
+      SetLength(Cand, 0);
+      for B := 0 to High(Live) do
+      begin
+        NextLP(Live[B].Text, LP);
+        for T := 0 to VocabSize - 1 do
+        begin
+          NB.SumLogProb := Live[B].SumLogProb + LP[T];
+          if T = csEOS then
+          begin
+            NB.Text := Live[B].Text; NB.Finished := True;
+            NB.Score := NB.SumLogProb /
+              LengthPenaltyDenominator(Length(NB.Text), LengthPenalty);
+            SetLength(Finished, Length(Finished) + 1);
+            Finished[High(Finished)] := NB;
+          end
+          else
+          begin
+            NB.Text := Live[B].Text + Chr(T); NB.Finished := False;
+            NB.Score := NB.SumLogProb /
+              LengthPenaltyDenominator(Length(NB.Text), LengthPenalty);
+            SetLength(Cand, Length(Cand) + 1);
+            Cand[High(Cand)] := NB;
+          end;
+        end;
+      end;
+      SortDesc(Cand);
+      if Length(Cand) > BeamWidth then SetLength(Cand, BeamWidth);
+      SetLength(Live, Length(Cand));
+      for I := 0 to High(Cand) do Live[I] := Cand[I];
+    end;
+    for B := 0 to High(Live) do
+    begin
+      SetLength(Finished, Length(Finished) + 1);
+      Finished[High(Finished)] := Live[B];
+    end;
+    SortDesc(Finished);
+    SetLength(Result, Length(Finished));
+    for I := 0 to High(Finished) do
+    begin
+      Result[I].Text := Finished[I].Text;
+      Result[I].SumLogProb := Finished[I].SumLogProb;
+      Result[I].Score := Finished[I].Score;
+      Result[I].Finished := Finished[I].Finished;
+    end;
+  finally
+    InV.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBeamSearchCachedMatchesReEncodeBigram;
+const
+  Vocab = 8;
+  ContextLen = 12;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  RefAll, CacAll: TNNetDecodeResultArray;
+  Prompt: string;
+  I: integer;
+begin
+  // Prompt chars must be >= 2 (0/1 are EOS/terminal) and < Vocab.
+  Prompt := Chr(3) + Chr(5);
+  BuildBigramBeamPair(Full, Twin, Vocab, ContextLen);
+  Session := nil;
+  try
+    Session := TNNetStreamingDecoder.Create(Twin, ContextLen);
+    RefAll := DecodeBeamSearchAll(Full, Prompt, 6, 4, 0.0);
+    CacAll := DecodeBeamSearchCachedAll(Session, Prompt, 6, 4, 0.0);
+    AssertEquals('same beam count', Length(RefAll), Length(CacAll));
+    for I := 0 to High(RefAll) do
+    begin
+      AssertEquals('text rank ' + IntToStr(I), RefAll[I].Text, CacAll[I].Text);
+      AssertEquals('sumlogprob rank ' + IntToStr(I),
+        RefAll[I].SumLogProb, CacAll[I].SumLogProb, 0.0);
+      AssertEquals('score rank ' + IntToStr(I),
+        RefAll[I].Score, CacAll[I].Score, 0.0);
+      AssertTrue('finished flag rank ' + IntToStr(I),
+        RefAll[I].Finished = CacAll[I].Finished);
+    end;
+    // Also exercise the length-penalised, single-best wrapper.
+    RefAll := DecodeBeamSearchAll(Full, Prompt, 6, 4, 0.7);
+    CacAll := DecodeBeamSearchCachedAll(Session, Prompt, 6, 4, 0.7);
+    AssertEquals('alpha=0.7 same beam count', Length(RefAll), Length(CacAll));
+    for I := 0 to High(RefAll) do
+    begin
+      AssertEquals('alpha=0.7 text rank ' + IntToStr(I),
+        RefAll[I].Text, CacAll[I].Text);
+      AssertEquals('alpha=0.7 score rank ' + IntToStr(I),
+        RefAll[I].Score, CacAll[I].Score, 0.0);
+    end;
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBeamSearchCachedMatchesReEncodeCausalReference;
+const
+  SeqLen = 12;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  RefAll, CacAll: TNNetDecodeResultArray;
+  PromptToks: array of integer;
+  Prompt: string;
+  I: integer;
+begin
+  // Genuine KV-cache topology: RoPE causal attention + DyT norms. The full net
+  // is driven by a zero-pad re-encode beam reference; the twin streams with
+  // per-beam cache forking. SoftMax appended to both so the rows are proper
+  // probabilities (CopyWeights still maps 1:1 - identical topology).
+  RandSeed := 424242;
+  Full := BuildTinyCausalLM(SeqLen);
+  Full.AddLayer(TNNetPointwiseSoftMax.Create());
+  Twin := BuildTinyCausalLM(1);
+  Twin.AddLayer(TNNetPointwiseSoftMax.Create());
+  Session := nil;
+  try
+    Twin.CopyWeights(Full);
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SetLength(PromptToks, 2);
+    PromptToks[0] := 3; PromptToks[1] := 7;
+    Prompt := Chr(PromptToks[0]) + Chr(PromptToks[1]);
+
+    RefAll := CausalReEncodeBeamAll(Full, PromptToks, 5, 3, 0.0);
+    CacAll := DecodeBeamSearchCachedAll(Session, Prompt, 5, 3, 0.0);
+
+    AssertEquals('same beam count', Length(RefAll), Length(CacAll));
+    for I := 0 to High(RefAll) do
+    begin
+      AssertEquals('text rank ' + IntToStr(I), RefAll[I].Text, CacAll[I].Text);
+      AssertEquals('sumlogprob rank ' + IntToStr(I),
+        RefAll[I].SumLogProb, CacAll[I].SumLogProb, 1e-5);
+      AssertEquals('score rank ' + IntToStr(I),
+        RefAll[I].Score, CacAll[I].Score, 1e-5);
+      AssertTrue('finished flag rank ' + IntToStr(I),
+        RefAll[I].Finished = CacAll[I].Finished);
+    end;
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBeamSearchCachedRejectsWideSession;
+var
+  Wide: TNNet;
+  Session: TNNetStreamingDecoder;
+  Raised: boolean;
+begin
+  // A non-width-1 session must be rejected (the cache-forking driver needs a
+  // width-1 twin, like the other streamed decoders).
+  Wide := BuildTinyCausalLM(4);
+  Session := nil;
+  Raised := False;
+  try
+    Session := TNNetStreamingDecoder.Create(Wide, 8);
+    try
+      DecodeBeamSearchCachedAll(Session, Chr(3) + Chr(5), 4, 2, 0.0);
+    except
+      on EArgumentException do Raised := True;
+    end;
+    AssertTrue('wide session rejected', Raised);
+  finally
+    Session.Free;
+    Wide.Free;
   end;
 end;
 

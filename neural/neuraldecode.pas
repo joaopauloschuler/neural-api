@@ -1130,6 +1130,32 @@ function DecodeBeamSearchAll(NN: TNNet; const Prompt: string;
   MaxLen: integer; BeamWidth: integer;
   LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
 
+// KV-CACHE (CACHE-FORKING) BEAM SEARCH. Same algorithm and ranking as
+// DecodeBeamSearchAll, but driven by a TNNetStreamingDecoder session so the
+// shared prefix is NOT re-encoded each step. Each surviving hypothesis keeps
+// one cache snapshot (TNNetDecoderSessionSnapshot, forked per beam); a step
+// RestoreSnapshots the beam's cache, StepForwards its last token to read the
+// next-token distribution, expands, prunes to BeamWidth, then snapshots each
+// survivor's cache for the next step. This turns the per-hypothesis cost from
+// O(L^2) (re-encode the whole prefix every step) into O(L).
+//   Session : a WIDTH-1 twin streaming decoder (input SizeX=1) over the same
+//             weights as the cache-less net. Its cache budget (MaxCacheLen at
+//             Create) must be >= Length(Prompt) + MaxLen.
+// EXACTNESS: produces BIT-FOR-BIT the same ranked beam (finished + surviving,
+// best-first) as DecodeBeamSearchAll(NN, Prompt, MaxLen, BeamWidth, ..) on the
+// equivalent net (per the TNNetStreamingDecoder exactness contract). Coded by
+// Claude (AI).
+function DecodeBeamSearchCachedAll(Session: TNNetStreamingDecoder;
+  const Prompt: string; MaxLen: integer; BeamWidth: integer;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+
+// Single-best cache-forking beam search: the highest-Score result of
+// DecodeBeamSearchCachedAll (same relation as DecodeBeamSearch to
+// DecodeBeamSearchAll). Coded by Claude (AI).
+function DecodeBeamSearchCached(Session: TNNetStreamingDecoder;
+  const Prompt: string; MaxLen: integer; BeamWidth: integer;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+
 // DIVERSE beam search (Vijayakumar et al. 2018, "Diverse Beam Search"). The
 // BeamWidth beams are partitioned into NumGroups equal groups of size
 // BeamWidth div NumGroups; the groups are expanded one after another within a
@@ -5951,6 +5977,274 @@ var
   All: TNNetDecodeResultArray;
 begin
   All := DecodeBeamSearchAll(NN, Prompt, MaxLen, BeamWidth, LengthPenalty);
+  if Length(All) > 0 then
+    Result := All[0]
+  else
+  begin
+    Result.Text := '';
+    Result.SumLogProb := 0;
+    Result.Score := 0;
+    Result.Finished := False;
+  end;
+end;
+
+type
+  // Cache-forking beam. Snap holds the KV-cache state JUST BEFORE LastToken is
+  // stepped (i.e. through absolute position LastPos-1); a step Restores Snap,
+  // StepForwards LastToken at LastPos and reads the next-token distribution.
+  TCachedBeam = record
+    Text: string;
+    SumLogProb: TNeuralFloat;
+    Score: TNeuralFloat;
+    Finished: boolean;
+    Snap: TNNetDecoderSessionSnapshot; // owned (nil for finished beams)
+    LastToken: integer;                // char code stepped to read this beam's dist
+    LastPos: integer;                  // absolute position of LastToken
+  end;
+  TCachedBeamArray = array of TCachedBeam;
+  TCachedCandidate = record
+    Text: string;
+    SumLogProb: TNeuralFloat;
+    Score: TNeuralFloat;
+    ParentIdx: integer; // index into the BaseAfter array (cache through LastPos)
+    LastToken: integer; // the new char this candidate appends (its future input)
+    LastPos: integer;   // absolute position of LastToken
+  end;
+  TCachedCandidateArray = array of TCachedCandidate;
+
+// Insertion sort cached candidates in DESCENDING Score (B is tiny).
+procedure SortCachedCandidates(var C: TCachedCandidateArray);
+var
+  I, J: integer;
+  Tmp: TCachedCandidate;
+begin
+  for I := 1 to High(C) do
+  begin
+    Tmp := C[I];
+    J := I - 1;
+    while (J >= 0) and (C[J].Score < Tmp.Score) do
+    begin
+      C[J + 1] := C[J];
+      Dec(J);
+    end;
+    C[J + 1] := Tmp;
+  end;
+end;
+
+function DecodeBeamSearchCachedAll(Session: TNNetStreamingDecoder;
+  const Prompt: string; MaxLen: integer; BeamWidth: integer;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResultArray;
+var
+  InV, Row: TNNetVolume;
+  LogProbs: array of TNeuralFloat;
+  VocabSize, PromptLen, Step, I, T, B, Pos: integer;
+  Live: TCachedBeamArray;      // still-growing beams (each owns a Snap)
+  Finished: TBeamArray;        // finished beams (Score-ranked, cache-free)
+  Cand: TCachedCandidateArray; // expansion candidates for this step
+  BaseAfter: array of TNNetDecoderSessionSnapshot; // per-live-beam cache through LastPos
+  NewC: TCachedCandidate;
+  FinB: TBeam;
+  NewLive: TCachedBeamArray;
+  CutScore, Total: TNeuralFloat;
+  AllDominated: boolean;
+  FinSurvivors: TBeamArray;
+
+  procedure FreeLiveSnaps;
+  var k: integer;
+  begin
+    for k := 0 to High(Live) do
+      if Live[k].Snap <> nil then
+      begin
+        Live[k].Snap.Free;
+        Live[k].Snap := nil;
+      end;
+  end;
+
+  procedure FreeBaseAfter;
+  var k: integer;
+  begin
+    for k := 0 to High(BaseAfter) do
+      if BaseAfter[k] <> nil then
+      begin
+        BaseAfter[k].Free;
+        BaseAfter[k] := nil;
+      end;
+    SetLength(BaseAfter, 0);
+  end;
+
+begin
+  if BeamWidth < 1 then BeamWidth := 1;
+  if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'DecodeBeamSearchCachedAll: the session net must be a WIDTH-1 twin ' +
+      '(input SizeX=1); got SizeX=' +
+      IntToStr(Session.Net.GetFirstLayer().Output.SizeX) + '.');
+  PromptLen := Length(Prompt);
+  if PromptLen < 1 then
+    raise EArgumentException.Create(
+      'DecodeBeamSearchCachedAll: Prompt must be non-empty (>= 1 char).');
+
+  Row := Session.Output();
+  VocabSize := Row.Size;
+  SetLength(LogProbs, VocabSize);
+  InV := TNNetVolume.Create(Session.Net.GetFirstLayer().Output);
+  BaseAfter := nil;
+  try
+    InV.Fill(0);
+    Session.Reset();
+    // Prefill the prompt EXCEPT its last char (positions 0..PromptLen-2). The
+    // last prompt char is the first decode step's input; its Output row is the
+    // first-token distribution - exactly NextLogProbs(NN, Prompt, ..).
+    for Pos := 0 to PromptLen - 2 do
+    begin
+      InV.FData[0] := Ord(Prompt[Pos + 1]); // Pascal strings are 1-based
+      Session.StepForward(InV, Pos);
+    end;
+    // The single initial live beam: its cache is "through PromptLen-2" (the
+    // current session state), its first step is the last prompt char.
+    SetLength(Live, 1);
+    Live[0].Text := '';
+    Live[0].SumLogProb := 0;
+    Live[0].Score := 0;
+    Live[0].Finished := False;
+    Live[0].Snap := Session.Snapshot();
+    Live[0].LastToken := Ord(Prompt[PromptLen]);
+    Live[0].LastPos := PromptLen - 1;
+    SetLength(Finished, 0);
+
+    for Step := 1 to MaxLen do
+    begin
+      if Length(Live) = 0 then Break;
+
+      // (d) Early stop: identical admissible-bound prune to DecodeBeamSearchAll.
+      if Length(Finished) >= BeamWidth then
+      begin
+        SortBeamsByScore(Finished);
+        CutScore := Finished[BeamWidth - 1].Score;
+        AllDominated := True;
+        for I := 0 to High(Live) do
+          if Live[I].Score > CutScore then AllDominated := False;
+        if AllDominated then
+        begin
+          FreeLiveSnaps;
+          Break;
+        end;
+      end;
+
+      // Expand every live beam by every vocabulary token, using its forked
+      // cache instead of re-encoding the prefix.
+      SetLength(Cand, 0);
+      SetLength(BaseAfter, Length(Live));
+      for B := 0 to High(Live) do BaseAfter[B] := nil;
+      for B := 0 to High(Live) do
+      begin
+        // Restore this beam's cache, step its last token, read the next-token
+        // distribution. The cache now holds through LastPos.
+        Session.RestoreSnapshot(Live[B].Snap);
+        InV.FData[0] := Live[B].LastToken;
+        Session.StepForward(InV, Live[B].LastPos);
+        Row := Session.Output();
+        Total := Row.GetSum();
+        if Total <= 0 then Total := 1.0;
+        for I := 0 to VocabSize - 1 do
+          LogProbs[I] := SafeLogProb(Row.Raw[I] / Total);
+        // Snapshot the cache-through-LastPos once: it is the shared base for
+        // every child of this beam (whose next input sits at LastPos+1).
+        BaseAfter[B] := Session.Snapshot();
+        for T := 0 to VocabSize - 1 do
+        begin
+          if T = csDecodeEOSToken then
+          begin
+            FinB.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+            FinB.Text := Live[B].Text;
+            FinB.Finished := True;
+            FinB.Score := FinB.SumLogProb /
+              LengthPenaltyDenominator(Length(FinB.Text), LengthPenalty);
+            SetLength(Finished, Length(Finished) + 1);
+            Finished[High(Finished)] := FinB;
+          end
+          else
+          begin
+            NewC.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+            NewC.Text := Live[B].Text + Chr(T);
+            NewC.Score := NewC.SumLogProb /
+              LengthPenaltyDenominator(Length(NewC.Text), LengthPenalty);
+            NewC.ParentIdx := B;
+            NewC.LastToken := T;             // future input char
+            NewC.LastPos := Live[B].LastPos + 1;
+            SetLength(Cand, Length(Cand) + 1);
+            Cand[High(Cand)] := NewC;
+          end;
+        end;
+      end;
+
+      // Re-prune survivors to the top BeamWidth by length-penalised score
+      // (same ordering as DecodeBeamSearchAll).
+      SortCachedCandidates(Cand);
+      if Length(Cand) > BeamWidth then SetLength(Cand, BeamWidth);
+
+      // Build the next live set. Each survivor gets an INDEPENDENT clone of its
+      // parent's BaseAfter cache (Restore then Snapshot makes a fresh deep
+      // copy), so per-beam forks never alias.
+      SetLength(NewLive, Length(Cand));
+      for I := 0 to High(Cand) do
+      begin
+        NewLive[I].Text := Cand[I].Text;
+        NewLive[I].SumLogProb := Cand[I].SumLogProb;
+        NewLive[I].Score := Cand[I].Score;
+        NewLive[I].Finished := False;
+        NewLive[I].LastToken := Cand[I].LastToken;
+        NewLive[I].LastPos := Cand[I].LastPos;
+        Session.RestoreSnapshot(BaseAfter[Cand[I].ParentIdx]);
+        NewLive[I].Snap := Session.Snapshot();
+      end;
+      FreeLiveSnaps;   // release the parents' caches
+      FreeBaseAfter;   // release the per-parent base caches
+      Live := NewLive;
+      NewLive := nil;
+    end;
+
+    // Merge any remaining live beams into the finished pool (MaxLen reached),
+    // dropping their (now unneeded) caches.
+    SetLength(FinSurvivors, Length(Live));
+    for B := 0 to High(Live) do
+    begin
+      FinSurvivors[B].Text := Live[B].Text;
+      FinSurvivors[B].SumLogProb := Live[B].SumLogProb;
+      FinSurvivors[B].Score := Live[B].Score;
+      FinSurvivors[B].Finished := Live[B].Finished;
+    end;
+    FreeLiveSnaps;
+    for B := 0 to High(FinSurvivors) do
+    begin
+      SetLength(Finished, Length(Finished) + 1);
+      Finished[High(Finished)] := FinSurvivors[B];
+    end;
+
+    SortBeamsByScore(Finished);
+    SetLength(Result, Length(Finished));
+    for I := 0 to High(Finished) do
+    begin
+      Result[I].Text := Finished[I].Text;
+      Result[I].SumLogProb := Finished[I].SumLogProb;
+      Result[I].Score := Finished[I].Score;
+      Result[I].Finished := Finished[I].Finished;
+    end;
+  finally
+    FreeLiveSnaps;
+    FreeBaseAfter;
+    InV.Free;
+  end;
+end;
+
+function DecodeBeamSearchCached(Session: TNNetStreamingDecoder;
+  const Prompt: string; MaxLen: integer; BeamWidth: integer;
+  LengthPenalty: TNeuralFloat): TNNetDecodeResult;
+var
+  All: TNNetDecodeResultArray;
+begin
+  All := DecodeBeamSearchCachedAll(Session, Prompt, MaxLen, BeamWidth,
+    LengthPenalty);
   if Length(All) > 0 then
     Result := All[0]
   else
