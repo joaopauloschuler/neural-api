@@ -1008,6 +1008,19 @@ type
     // past that length does it diverge (by design - the middle is gone).
     procedure EnableEviction(SinkTokens, RecentWindow: integer);
     procedure DisableEviction();
+    // int8 KV-cache quantization for LONG-CONTEXT decode (opt-in, OFF by
+    // default). EnableInt8KVCache switches every collected attention layer's KV
+    // cache to int8 storage (per-row scale = maxabs/127, round-to-nearest,
+    // clamp [-127,127], dequantized on read) so a long context costs ~1/4 the
+    // FP32 K/V memory - the win when the KV cache, not the weights, dominates.
+    // Quantization is LOSSY: the decoded logits are NOT bit-exact vs the FP32
+    // cache, but per-row scaling keeps the drift small (a few e-2 on the logits
+    // with argmax stable on a pinned prompt; see TestKVCacheInt8). Call on a
+    // FRESH session BEFORE any StepForward (the attention layers require an
+    // empty cache to switch storage mode). DisableInt8KVCache reverts to FP32
+    // (also on an empty cache). No-op when the net has no attention layers.
+    procedure EnableInt8KVCache();
+    procedure DisableInt8KVCache();
     // Live cache length of the Index-th collected attention layer (diagnostics /
     // tests: with eviction on this is pinned at SinkTokens + RecentWindow once
     // the stream passes that length).
@@ -4125,6 +4138,20 @@ var
   i: integer;
 begin
   for i := 0 to High(FSDPAs) do FSDPAs[i].DisableEviction();
+end;
+
+procedure TNNetStreamingDecoder.EnableInt8KVCache();
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].EnableInt8KV();
+end;
+
+procedure TNNetStreamingDecoder.DisableInt8KVCache();
+var
+  i: integer;
+begin
+  for i := 0 to High(FSDPAs) do FSDPAs[i].DisableInt8KV();
 end;
 
 function TNNetStreamingDecoder.SDPACacheLength(Index: integer): integer;

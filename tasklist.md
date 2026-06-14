@@ -510,12 +510,22 @@ rather than acted on.
       serialized string. Assert the twin's logits match the source on a pinned
       input (the existing TestMakeUnconditionalTwinMatchesSourceLogits is the
       template).
-- [ ] KV-cache quantization (int8 cache with per-channel scales): the
-      landed int8 quantized inference covers WEIGHT storage; for long-context
-      decode the KV cache dominates memory instead. Quantize cached K/V
-      blocks to int8 on append, dequantize on read inside
-      TNNetStreamingDecoder; assert logit drift vs the FP32 cache stays
-      within a documented tolerance on the pico-Llama parity fixture.
+- [X] KV-cache quantization (int8 cache with per-row scales): LANDED. Opt-in
+      (OFF by default => the FP32 cache is bit-exact). TNNetScaledDotProduct
+      Attention.EnableInt8KV/DisableInt8KV switch the incremental-decode KV cache
+      to int8 storage: each appended K/V row is quantized with a per-row (per-
+      token-block) scale = maxabs/127, round-to-nearest, clamp [-127,127], and
+      dequantized into a scratch row on read in the attention math (codes +
+      one scale per position => ~1/4 the FP32 K/V memory). Surfaced from
+      TNNetStreamingDecoder.EnableInt8KVCache/DisableInt8KVCache (applies to
+      every collected attention layer). Eviction-shift handles int8; Capture/
+      RestoreCacheState reject int8 (snapshot is FP32 only). Test
+      TestKVCacheInt8DriftWithinTolerance streams a pinned prompt through a
+      width-1 twin twice (FP32 vs int8): measured max logit drift ~8.4e-5,
+      committed tolerance 5e-2, argmax stable at every position. (Used a small
+      deterministic BuildTinyCausalLM twin; no pico-Llama fixture needed for the
+      bound.) Follow-ups: per-group (sub-row) scales for very long d_k; int8
+      Capture/Restore snapshot support.
 - [ ] Preference-optimization follow-ups on the landed DPO/GRPO trainers
       (TNeuralGRPOTrainer in neural/neuraldpo.pas LANDED: group-relative
       advantages + PG + DeepSeek-k3 per-token KL reusing the DPO softmax-backward

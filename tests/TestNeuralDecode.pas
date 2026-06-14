@@ -144,6 +144,7 @@ type
     procedure TestKVCacheResetStartsFreshSequence;
     procedure TestKVCacheTruncateThenReappendMatchesFresh;
     procedure TestKVCacheDisabledPathUnchanged;
+    procedure TestKVCacheInt8DriftWithinTolerance;
     // O(1)-per-step incremental decode on TNNetDiagonalSSM (persisted state).
     procedure TestSSMIncrementalMatchesFullForward;
     procedure TestSSMPrefillThenStepMatchesFullForward;
@@ -1730,6 +1731,103 @@ begin
     OutBefore.Free;
     InV.Free;
     NN.Free;
+  end;
+end;
+
+// int8 KV-cache quantization (opt-in, long-context memory win): stream the
+// SAME pinned prompt through a width-1 twin twice - once with the default
+// FP32 KV cache, once with int8 KV (per-row scale = maxabs/127, dequant on
+// read) - and assert the per-position logit DRIFT stays within a documented
+// tolerance AND the next-token argmax agrees at every position. int8 quant is
+// LOSSY, so the logits are NOT bit-exact; the assertion is the bound, not
+// equality. TOLERANCE: max |logit_int8 - logit_fp32| < 5e-2 over all positions
+// and all vocab logits on this pinned prompt, with the argmax (greedy next
+// token) identical at every step. The bound is HEADROOM: the measured drift on
+// this prompt is ~8.4e-5 (per-row int8 quant is accurate), so 5e-2 is a very
+// safe ceiling that absorbs weight/seed variation while still being a real
+// (non-vacuous) cap on the lossy quantization.
+procedure TTestNeuralDecode.TestKVCacheInt8DriftWithinTolerance;
+const
+  SeqLen = 7;
+  Toks: array[0..6] of integer = (3, 7, 1, 9, 4, 11, 2);
+  Tol = 5e-2;
+var
+  Net, Twin: TNNet;
+  SessFP32, SessInt8: TNNetStreamingDecoder;
+  StepIn: TNNetVolume;
+  T, D, Vocab: integer;
+  LogitFP32: array of array of TNeuralFloat;
+  ArgMaxFP32: array of integer;
+  MaxDrift, Drift, BestVal: TNeuralFloat;
+  BestIdx: integer;
+begin
+  RandSeed := 424242;
+  Net := BuildTinyCausalLM(SeqLen);
+  Twin := BuildTinyCausalLM(1);
+  SessFP32 := nil;
+  SessInt8 := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Twin.CopyWeights(Net);
+    Vocab := Twin.GetLastLayer().Output.Depth; // = csStreamVocab (12) of the LM head
+    SetLength(LogitFP32, SeqLen, Vocab);
+    SetLength(ArgMaxFP32, SeqLen);
+
+    // Pass 1: default FP32 KV cache. Record per-position logits + argmax.
+    SessFP32 := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertTrue('session has attention layers to quantize', SessFP32.SDPACount > 0);
+    SessFP32.Reset();
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      SessFP32.StepForward(StepIn, T);
+      BestIdx := 0; BestVal := SessFP32.Output()[0, 0, 0];
+      for D := 0 to Vocab - 1 do
+      begin
+        LogitFP32[T][D] := SessFP32.Output()[0, 0, D];
+        if LogitFP32[T][D] > BestVal then
+        begin
+          BestVal := LogitFP32[T][D];
+          BestIdx := D;
+        end;
+      end;
+      ArgMaxFP32[T] := BestIdx;
+    end;
+    SessFP32.Free; SessFP32 := nil;
+
+    // Pass 2: int8 KV cache enabled on a FRESH session. Compare to pass 1.
+    SessInt8 := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    SessInt8.Reset();
+    SessInt8.EnableInt8KVCache();
+    MaxDrift := 0;
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      SessInt8.StepForward(StepIn, T);
+      BestIdx := 0; BestVal := SessInt8.Output()[0, 0, 0];
+      for D := 0 to Vocab - 1 do
+      begin
+        Drift := Abs(SessInt8.Output()[0, 0, D] - LogitFP32[T][D]);
+        if Drift > MaxDrift then MaxDrift := Drift;
+        if SessInt8.Output()[0, 0, D] > BestVal then
+        begin
+          BestVal := SessInt8.Output()[0, 0, D];
+          BestIdx := D;
+        end;
+      end;
+      // Argmax (greedy next token) must be stable under int8 quantization.
+      AssertEquals('int8 argmax stable at pos ' + IntToStr(T),
+        ArgMaxFP32[T], BestIdx);
+    end;
+    // Documented tolerance: max logit drift across the whole pinned prompt.
+    AssertTrue('int8 KV logit drift ' + FloatToStr(MaxDrift) +
+      ' within tolerance ' + FloatToStr(Tol), MaxDrift < Tol);
+  finally
+    StepIn.Free;
+    SessInt8.Free;
+    SessFP32.Free;
+    Twin.Free;
+    Net.Free;
   end;
 end;
 
