@@ -70,6 +70,14 @@ uses
 function LoadWav16ToVolume(const FileName: string;
   Samples: TNNetVolume): integer;
 
+// Writes Samples (a mono waveform, floats in [-1, 1], laid out along FData as
+// LoadWav16ToVolume reads them) to a canonical mono 16-bit PCM RIFF/WAVE file.
+// Samples are clamped to [-1, 1] and scaled to int16 (x * 32768, rounded and
+// clamped to the int16 range). This is the inverse of LoadWav16ToVolume
+// (which divides by 32768) to within 1 LSB.
+procedure SaveVolumeToWav16(Samples: TNNetVolume; const FileName: string;
+  SampleRate: integer = 16000);
+
 // HF WhisperFeatureExtractor log-mel spectrogram (see the unit header).
 // Samples: mono waveform at 16 kHz, any length (padded/truncated to
 // NumFrames*160 samples). Mel is resized to (NumFrames, 1, NumMelBins).
@@ -185,6 +193,82 @@ begin
     end;
     raise Exception.Create('LoadWav16ToVolume: no "data" chunk in ' +
       FileName);
+  finally
+    FS.Free;
+  end;
+end;
+
+procedure SaveVolumeToWav16(Samples: TNNetVolume; const FileName: string;
+  SampleRate: integer = 16000);
+var
+  FS: TFileStream;
+  NumFrames, i: integer;
+  DataBytes, ByteRate, FileTail: longword;
+  ChunkSize16: longword;
+  NumChannels, BlockAlign, BitsPerSample, AudioFormat: word;
+  SR: longword;
+  Raw: array of smallint;
+  V: TNeuralFloat;
+  Scaled: double;
+
+  procedure WriteBytes(const Buf; Count: integer);
+  begin
+    FS.WriteBuffer(Buf, Count);
+  end;
+
+  procedure WriteTag(const Tag: string);
+  var
+    A: array[0..3] of AnsiChar;
+    k: integer;
+  begin
+    for k := 0 to 3 do A[k] := AnsiChar(Tag[k + 1]);
+    WriteBytes(A, 4);
+  end;
+
+begin
+  NumFrames := Samples.Size;
+  NumChannels := 1;
+  BitsPerSample := 16;
+  AudioFormat := 1;            // PCM
+  SR := longword(SampleRate);
+  BlockAlign := NumChannels * (BitsPerSample div 8);
+  ByteRate := SR * BlockAlign;
+  DataBytes := longword(NumFrames) * BlockAlign;
+  ChunkSize16 := 16;
+  // RIFF chunk size = 4 ("WAVE") + (8 + 16) fmt + (8 + DataBytes) data.
+  FileTail := 4 + (8 + 16) + (8 + DataBytes);
+
+  SetLength(Raw, NumFrames);
+  for i := 0 to NumFrames - 1 do
+  begin
+    V := Samples.FData[i];
+    if V > 1.0 then V := 1.0
+    else if V < -1.0 then V := -1.0;
+    // Scale by 32768 to be the exact inverse of LoadWav16ToVolume (which
+    // divides by 32768), clamped to the int16 range so +1.0 does not overflow.
+    Scaled := Round(V * 32768.0);
+    if Scaled > 32767 then Scaled := 32767
+    else if Scaled < -32768 then Scaled := -32768;
+    Raw[i] := smallint(Round(Scaled));
+  end;
+
+  FS := TFileStream.Create(FileName, fmCreate);
+  try
+    WriteTag('RIFF');
+    WriteBytes(FileTail, 4);
+    WriteTag('WAVE');
+    WriteTag('fmt ');
+    WriteBytes(ChunkSize16, 4);
+    WriteBytes(AudioFormat, 2);
+    WriteBytes(NumChannels, 2);
+    WriteBytes(SR, 4);
+    WriteBytes(ByteRate, 4);
+    WriteBytes(BlockAlign, 2);
+    WriteBytes(BitsPerSample, 2);
+    WriteTag('data');
+    WriteBytes(DataBytes, 4);
+    if NumFrames > 0 then
+      WriteBytes(Raw[0], NumFrames * 2);
   finally
     FS.Free;
   end;

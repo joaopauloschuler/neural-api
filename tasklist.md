@@ -707,7 +707,7 @@ rather than acted on.
       (do_stable_layer_norm), and the final encoder LayerNorm placement that
       pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
       contrastive masked-prediction heads currently dropped as ignorable tensors).
-- [ ] WAV writer in neuralaudio.pas (`SaveVolumeToWav16` / `WriteWav16File`) — the
+- [X] WAV writer in neuralaudio.pas (`SaveVolumeToWav16` / `WriteWav16File`) — the
       symmetric counterpart to the landed `LoadWav16ToVolume`. The library can read
       16 kHz mono PCM and compute the log-mel frontend, but has NO path to write a
       waveform back to disk, which blocks listening to ANY synthesis output (neural
