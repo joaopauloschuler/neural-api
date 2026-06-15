@@ -1,6 +1,6 @@
 # DiffusionMNIST
 
-The repository's first **generative-by-diffusion** example: a Denoising
+A **generative-by-diffusion** example: a Denoising
 Diffusion Probabilistic Model (DDPM, [Ho et al. 2020](https://arxiv.org/abs/2006.11239))
 that learns to synthesise 28x28 MNIST digits from pure Gaussian noise. It trains
 a small time-conditioned U-Net to predict the noise added to an image, then runs

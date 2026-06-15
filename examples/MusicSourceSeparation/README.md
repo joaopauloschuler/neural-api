@@ -1,6 +1,6 @@
 # Demucs music source separation (4 stems)
 
-The first **audio source-separation** demo in the library and a new audio
+An **audio source-separation** demo with an audio
 **output** modality: one **mixed** stereo track in, **four** stems out
 (drums / bass / other / vocals). Every prior audio demo is either analysis
 (Whisper / Wav2Vec2 → text), codec (EnCodec waveform → codes → waveform) or

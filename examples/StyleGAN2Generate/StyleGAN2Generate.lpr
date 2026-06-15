@@ -2,7 +2,7 @@ program StyleGAN2Generate;
 (*
 StyleGAN2Generate: synthesizes ONE image on the CPU from a fixed latent with the
 repo's StyleGAN2 generator importer (BuildStyleGAN2Generator,
-neuralpretrained.pas) -- the FIRST style-based generative import in the tree
+neuralpretrained.pas) -- a style-based generative import
 (Karras et al. 2020, "Analyzing and Improving the Image Quality of StyleGAN",
 arXiv:1912.04958).
 

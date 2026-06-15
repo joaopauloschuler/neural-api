@@ -1,6 +1,6 @@
 # TextToSpeech — VITS / MMS-TTS end-to-end text-to-speech
 
-The first **text-to-speech** demo in the repo. VITS (Kim et al. 2021, the
+A **text-to-speech** demo. VITS (Kim et al. 2021, the
 architecture behind `facebook/mms-tts-*` and `kakao-enterprise/vits-ljs`)
 synthesizes a raw waveform end-to-end from a sequence of token ids:
 

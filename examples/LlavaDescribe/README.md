@@ -1,4 +1,4 @@
-# LLaVA image captioning (the first decoder-only image-in / text-out import)
+# LLaVA image captioning
 
 LLaVA (Liu et al. 2023, [arXiv:2304.08485](https://arxiv.org/abs/2304.08485))
 is the classic **generative vision-language** recipe: a ViT vision tower turns

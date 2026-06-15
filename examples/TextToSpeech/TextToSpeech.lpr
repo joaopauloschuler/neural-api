@@ -19,7 +19,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 Coded by Claude (AI).
 *)
 
-// TextToSpeech -- the FIRST text-to-speech demo: VITS / MMS-TTS
+// TextToSpeech -- a text-to-speech demo: VITS / MMS-TTS
 // (facebook/mms-tts-*, kakao-enterprise/vits-ljs) synthesizes a waveform
 // end-to-end from a sequence of token ids:
 //

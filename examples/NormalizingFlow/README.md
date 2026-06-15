@@ -1,8 +1,8 @@
 # Normalizing Flow (exact-likelihood density estimation)
 
 Fits a 2-D **two-moons** density with a small RealNVP/Glow-style
-**normalizing flow** built from stacked `TNNetAffineCoupling` layers — the
-library's first exact-likelihood generative primitive — and shows that
+**normalizing flow** built from stacked `TNNetAffineCoupling` layers — an
+exact-likelihood generative primitive — and shows that
 interleaving the couplings with Glow's **learnable invertible 1x1 convolution**
 (`TNNetInvertible1x1Conv`) reaches a **higher** mean log-likelihood than the
 fixed-permute baseline on the same target.

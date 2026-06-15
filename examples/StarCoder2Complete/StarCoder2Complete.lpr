@@ -25,7 +25,7 @@ Coded by Claude (AI).
 // checkpoint and its stock BPE tokenizer.json, encodes a code PROMPT and
 // greedily extends it one token at a time, printing the decoded completion.
 //
-// Starcoder2 is the first CODE-specialised decoder in the unit: RoPE + GQA +
+// Starcoder2 is a CODE-specialised decoder: RoPE + GQA +
 // (optional) sliding-window attention paired with biased nn.LayerNorm norms
 // (NOT RMSNorm), bias=True on every linear (q/k/v AND o_proj), and a plain
 // two-matrix gelu_pytorch_tanh FFN (c_fc -> GELU -> c_proj). All of that is

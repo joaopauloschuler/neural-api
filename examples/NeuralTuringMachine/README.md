@@ -1,7 +1,7 @@
 # Neural Turing Machine — the COPY task
 
-A headline demo of `TNNetNTMMemory`, the first **writable** differentiable
-external-memory layer in this fork (Neural Turing Machine, Graves et al. 2014,
+A headline demo of `TNNetNTMMemory`, a **writable** differentiable
+external-memory layer (Neural Turing Machine, Graves et al. 2014,
 ["Neural Turing Machines", arXiv:1410.5401](https://arxiv.org/abs/1410.5401)).
 
 ## What an NTM layer does

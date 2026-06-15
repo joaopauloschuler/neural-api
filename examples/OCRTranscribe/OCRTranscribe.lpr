@@ -1,8 +1,8 @@
 program OCRTranscribe;
 (*
   TrOCR optical-character-recognition on the committed pico fixture (or any
-  TrOCR VisionEncoderDecoder checkpoint passed as argument 1): the FIRST OCR /
-  image-to-text vertical in this repo - a cropped text-line image -> a
+  TrOCR VisionEncoderDecoder checkpoint passed as argument 1): an OCR /
+  image-to-text vertical - a cropped text-line image -> a
   transcribed string. A DeiT/ViT image encoder feeds a BART-style causal text
   DECODER through cross-attention (BuildTrOCRFromSafeTensors,
   neural/neuralpretrained.pas), which autoregressively transcribes the line

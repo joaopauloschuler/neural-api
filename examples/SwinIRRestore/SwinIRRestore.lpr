@@ -2,7 +2,7 @@ program SwinIRRestore;
 (*
 SwinIRRestore: super-resolves (upscales) a small image on the CPU end-to-end
 with the repo's SwinIR image-restoration importer (BuildSwinIRFromSafeTensors,
-neuralpretrained.pas) -- the FIRST TRANSFORMER restoration import in the tree.
+neuralpretrained.pas) -- a TRANSFORMER restoration import.
 SwinIR (Liang et al. 2021, "SwinIR: Image Restoration Using Swin Transformer",
 arXiv:2108.10257) stacks Residual Swin Transformer Blocks (RSTB = a few Swin
 window/shifted-window attention layers + a 3x3 conv + a residual over the block)

@@ -1,7 +1,7 @@
 program PaliGemmaCaption;
 // PaliGemma generative vision-language captioning on the committed pico
-// fixture (or any PaliGemma checkpoint passed as argument 1): the FIRST
-// PREFIX-LM vision-language demo in the repo. It loads the THREE nets returned
+// fixture (or any PaliGemma checkpoint passed as argument 1): a
+// PREFIX-LM vision-language demo. It loads the THREE nets returned
 // by BuildPaliGemmaFromSafeTensors (neural/neuralpretrained.pas) - the SigLIP
 // vision tower (last_hidden_state, WITH post_layernorm), the single-linear
 // multimodal projector, and the Gemma language decoder - assembles a

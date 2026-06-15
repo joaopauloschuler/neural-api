@@ -1,6 +1,6 @@
 program CycleGAN;
 (*
-CycleGAN: the repo's first UNPAIRED image-to-image translation example
+CycleGAN: an UNPAIRED image-to-image translation example
 (Zhu et al. 2017, "Unpaired Image-to-Image Translation using Cycle-Consistent
 Adversarial Networks"). It learns to translate between two image DOMAINS that
 have NO aligned pairs, using two generators plus a CYCLE-CONSISTENCY loss to

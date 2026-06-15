@@ -19,7 +19,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 Coded by Claude (AI).
 *)
 
-// MusicGenSmoke -- the FIRST text-to-AUDIO generation demo: the MusicGen LM
+// MusicGenSmoke -- a text-to-AUDIO generation demo: the MusicGen LM
 // decoder predicts a stack of EnCodec codes autoregressively using the
 // DELAY-PATTERN codebook interleaving, the inverse of the analysis-only audio
 // demos. The genuinely new piece over the seq2seq enc-dec convention is the

@@ -1,6 +1,6 @@
 # MusicGenSmoke — text-to-music delay-pattern generation
 
-The first **text-to-audio generative** demo in the repo. The MusicGen LM
+A **text-to-audio generative** demo. The MusicGen LM
 decoder predicts a stack of EnCodec codes autoregressively using the
 **delay-pattern** codebook interleaving, decoded back to audio through the
 landed EnCodec decoder.

@@ -2,7 +2,7 @@ program NeuralTuringMachine;
 (*
 NeuralTuringMachine: the classic COPY task of the Neural Turing Machine
 (TNNetNTMMemory, Graves et al. 2014, "Neural Turing Machines", arXiv:1410.5401),
-the first WRITABLE differentiable external-memory layer in this fork.
+a WRITABLE differentiable external-memory layer.
 
 Idea: unlike the READ-ONLY associative memories (TNNetModernHopfield,
 TNNetProductKeyMemory) that retrieve against a learned bank, an NTM carries a

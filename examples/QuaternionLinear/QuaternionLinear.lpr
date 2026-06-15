@@ -1,8 +1,8 @@
 program QuaternionLinear;
 (*
 QuaternionLinear: a PARAMETER-MATCHED bake-off that shows when the structured
-weight sharing of TNNetQuaternionLinear (the first hypercomplex layer in this
-fork) actually pays off.
+weight sharing of TNNetQuaternionLinear (a hypercomplex layer)
+actually pays off.
 
 TNNetQuaternionLinear reinterprets the input/output Depth (multiples of 4) as
 packed quaternions and learns an (OutQ x InQ) grid of quaternion weights

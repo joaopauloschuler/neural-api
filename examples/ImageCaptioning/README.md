@@ -1,6 +1,6 @@
 # BLIP image captioning
 
-The repo's first **generative** vision-language importer of the
+A **generative** vision-language importer of the
 **encoder-decoder** kind. A ViT image encoder feeds a BERT-style **causal text
 decoder** through **cross-attention**, which autoregressively generates a
 caption with greedy decoding.

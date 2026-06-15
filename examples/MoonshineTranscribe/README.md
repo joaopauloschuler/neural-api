@@ -1,8 +1,8 @@
 # MoonshineTranscribe
 
 The [Moonshine](https://huggingface.co/UsefulSensors/moonshine-tiny)
-streaming-ASR **encoder** -- the SECOND speech-to-text architecture in the
-library, deliberately distinct from Whisper.
+streaming-ASR **encoder** -- a speech-to-text architecture
+deliberately distinct from Whisper.
 
 Whisper pads every clip to a **fixed 30 s log-mel spectrogram** (so a 1 s
 utterance costs the same to encode as a 30 s one). Moonshine has **no mel

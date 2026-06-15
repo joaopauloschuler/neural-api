@@ -1,6 +1,6 @@
 # CycleGAN — unpaired image-to-image translation (cycle-consistency)
 
-The repo's first **UNPAIRED** image-to-image translation example
+An **UNPAIRED** image-to-image translation example
 ([Zhu et al. 2017](https://arxiv.org/abs/1703.10593)). It is the unpaired
 sibling of [Pix2Pix](../Pix2Pix) (which is *paired* supervised: every input has a
 known aligned target). Here the two image **domains** are sampled from *separate

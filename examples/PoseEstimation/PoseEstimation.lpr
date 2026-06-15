@@ -6,8 +6,8 @@
 /// deconvolution head turns the patch-grid features into one 2-D HEATMAP per
 /// keypoint (ReLU -> bilinear upsample -> 3x3 conv to num_joints channels). The
 /// (x,y) location of each joint is read out by a spatial ARGMAX over its
-/// heatmap. It is the repo's first keypoint / pose import - the output modality
-/// is a stack of per-joint heatmaps, not a class label, box or dense class map.
+/// heatmap. The output modality is a stack of per-joint heatmaps, not a class
+/// label, box or dense class map.
 ///
 /// This example loads the committed PICO ViTPose parity fixture
 /// (tests/fixtures/tiny_vitpose.safetensors, a tiny ViT-backbone model) with

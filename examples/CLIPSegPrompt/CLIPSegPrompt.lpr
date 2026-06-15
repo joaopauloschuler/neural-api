@@ -2,7 +2,7 @@ program CLIPSegPrompt;
 (*
 CLIPSegPrompt: text-prompted ZERO-SHOT segmentation on the CPU end-to-end with
 the repo's CLIPSeg importer (BuildCLIPSegFromSafeTensors, neuralpretrained.pas)
--- the FIRST "free-text prompt -> dense single-channel mask" import in the tree.
+-- a "free-text prompt -> dense single-channel mask" import.
 CLIPSeg (Lueddecke & Ecker 2022, "Image Segmentation Using Text and Image
 Prompts", arXiv:2112.10003; CIDAS/clipseg-rd64-refined) runs an image through a
 FROZEN CLIP ViT, taps a few intermediate encoder layers (config.extract_layers),

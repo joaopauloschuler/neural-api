@@ -4,12 +4,9 @@ ForwardForward: reproduces Geoffrey Hinton's 2022 "The Forward-Forward
 Algorithm: Some Preliminary Investigations" on a pure-CPU toy, using only
 existing in-tree layers (NO new layer class is added).
 
-What makes this example UNIQUE in the tree:
-  This is the FIRST and ONLY example that does NOT learn by end-to-end
-  backpropagation. Every other example -- including the SAM / Lookahead
-  gradient-surgery demos -- still forms ONE global loss and backpropagates it
-  through the whole stack. Forward-Forward (FF) NEVER forms a global loss and
-  NEVER chains a backward pass between layers. It replaces the
+What makes this example distinctive:
+  It does NOT learn by end-to-end backpropagation. Forward-Forward (FF)
+  NEVER forms a global loss and NEVER chains a backward pass between layers. It replaces the
   forward+backward pair with TWO forward passes (one on POSITIVE/real data,
   one on NEGATIVE/fake data) and trains EACH layer GREEDILY by its OWN LOCAL
   objective. No gradient ever flows from one layer into the layer below.

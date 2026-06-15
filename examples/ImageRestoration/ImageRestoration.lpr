@@ -2,8 +2,8 @@ program ImageRestoration;
 (*
 ImageRestoration: denoises a small image on the CPU end-to-end with the repo's
 NAFNet image-restoration importer (BuildNAFNetFromSafeTensors,
-neuralpretrained.pas) -- the FIRST non-diffusion image-to-image RESTORATION
-import in the tree that is NOT super-resolution (the RRDBNet/ESRGAN path is x4
+neuralpretrained.pas) -- a non-diffusion image-to-image RESTORATION
+import that is NOT super-resolution (the RRDBNet/ESRGAN path is x4
 upscaling only). NAFNet (Chen et al. 2022, "Simple Baselines for Image
 Restoration", arXiv:2204.04676) is a symmetric U-Net of NAFBlocks; it restores
 at the SAME resolution.

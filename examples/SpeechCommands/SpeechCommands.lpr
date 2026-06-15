@@ -1,8 +1,8 @@
 program SpeechCommands;
 (*
 SpeechCommands -- keyword-spotting trainer, the audio analogue of
-SimpleImageClassifier and the FIRST from-scratch (no pretrained-model
-import) audio TRAINING example in the library. It proves that the
+SimpleImageClassifier and a from-scratch (no pretrained-model
+import) audio TRAINING example. It proves that the
 log-mel frontend in neural/neuralaudio.pas (the same ComputeWhisperLogMel
 that drives the Whisper / Wav2Vec2 importers) is usable for ordinary
 supervised training, not only for replaying imported checkpoints.

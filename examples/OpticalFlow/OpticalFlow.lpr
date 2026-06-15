@@ -1,7 +1,7 @@
 program OpticalFlow;
 (*
-OpticalFlow: dense optical-flow estimation with the RAFT importer - the FIRST
-two-image-in / dense-(dx,dy)-out vertical in the tree (Teed & Deng 2020, "RAFT:
+OpticalFlow: dense optical-flow estimation with the RAFT importer - a
+two-image-in / dense-(dx,dy)-out vertical (Teed & Deng 2020, "RAFT:
 Recurrent All-Pairs Field Transforms for Optical Flow", arXiv:2003.12039).
 
 WHAT IT SHOWS

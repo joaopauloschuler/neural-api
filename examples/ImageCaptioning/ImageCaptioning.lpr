@@ -1,7 +1,7 @@
 program ImageCaptioning;
 // BLIP image captioning on the committed pico fixture (or any
-// BlipForConditionalGeneration checkpoint passed as argument 1): the FIRST
-// generative ENCODER-DECODER vision-language importer in this repo. A ViT
+// BlipForConditionalGeneration checkpoint passed as argument 1): a
+// generative ENCODER-DECODER vision-language importer. A ViT
 // image encoder feeds a BERT-style causal text DECODER through cross-attention
 // (BuildBlipForCaptioningFromSafeTensors, neural/neuralpretrained.pas), which
 // autoregressively generates a caption with DecodeBlipCaptionGreedy.

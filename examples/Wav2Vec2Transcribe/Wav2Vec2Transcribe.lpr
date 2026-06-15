@@ -21,8 +21,8 @@ Coded by Claude (AI).
 
 // Wav2Vec2Transcribe -- SPEECH-TO-TEXT with a pretrained Wav2Vec2 / HuBERT
 // CTC checkpoint (facebook/wav2vec2-base-960h, facebook/hubert-large-
-// ls960-ft and siblings): the SECOND audio demo in the library and the
-// first SELF-SUPERVISED-encoder ASR. Unlike WhisperTranscribe (a mel-
+// ls960-ft and siblings): an audio demo and a
+// SELF-SUPERVISED-encoder ASR. Unlike WhisperTranscribe (a mel-
 // spectrogram encoder-decoder that autoregresses tokens), this pipeline is
 // a RAW-WAVEFORM conv feature extractor -> transformer encoder -> linear
 // CTC head, decoded in ONE forward pass with greedy CTC collapse:

@@ -1,6 +1,6 @@
 # EnCodec round-trip (neural audio codec)
 
-The first **audio-generative** demo in the library: a neural audio **codec**
+An **audio-generative** demo: a neural audio **codec**
 that compresses a waveform into a stack of discrete codes and reconstructs it
 (waveform → codes → waveform). Every prior audio demo (Whisper, Wav2Vec2 /
 HuBERT) is analysis-only (audio → text); EnCodec is the inverse — a streaming

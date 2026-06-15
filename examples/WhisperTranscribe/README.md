@@ -1,7 +1,7 @@
 # WhisperTranscribe
 
 Speech-to-text with a pretrained [OpenAI Whisper](https://huggingface.co/openai/whisper-tiny)
-checkpoint -- the first **audio** example in the library. The pipeline is
+checkpoint. The pipeline is
 pure CAI Pascal end to end:
 
 1. **WAV reader + log-mel frontend** (`neural/neuralaudio.pas`): 16 kHz mono

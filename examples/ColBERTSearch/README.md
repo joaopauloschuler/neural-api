@@ -3,7 +3,7 @@
 Pre-encodes a small passage corpus with an imported
 [colbert-ir/colbertv2.0](https://huggingface.co/colbert-ir/colbertv2.0)-class
 checkpoint and ranks it against a query by the **MaxSim** late-interaction
-score. ColBERT is the third RAG retrieval paradigm in this repo, next to the
+score. ColBERT is a RAG retrieval paradigm alongside the
 **bi-encoder** ([examples/SemanticSearch](../SemanticSearch): one pooled vector
 + cosine) and the **cross-encoder**
 ([examples/DebertaReranker](../DebertaReranker): a joint query+passage scorer).

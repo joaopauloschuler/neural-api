@@ -2,8 +2,8 @@ program VideoFrameInterpolation;
 (*
 VideoFrameInterpolation: synthesises ONE intermediate frame (t=0.5) between two
 input frames on the CPU end-to-end with the repo's RIFE frame-interpolation
-importer (BuildRIFEFromSafeTensors, neuralpretrained.pas) -- the FIRST
-VIDEO-generative import in the tree. The landed RAFT path estimates optical FLOW
+importer (BuildRIFEFromSafeTensors, neuralpretrained.pas) -- a
+VIDEO-generative import. The landed RAFT path estimates optical FLOW
 but does NOT synthesise frames; examples/FrameInterpolation is a from-scratch toy
 (TNNetFlowWarp), not an importer. RIFE (Huang et al. 2022, "Real-Time
 Intermediate Flow Estimation for Video Frame Interpolation", arXiv:2011.06294;

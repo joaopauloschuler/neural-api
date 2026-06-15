@@ -1,6 +1,6 @@
 program VideoPrediction;
 (*
-VideoPrediction: the repo's first SPATIOTEMPORAL (video) example - next-frame
+VideoPrediction: a SPATIOTEMPORAL (video) example - next-frame
 prediction in the Moving-MNIST style (Srivastava et al. 2015), but with a
 self-contained, download-free synthetic dataset: a small bright BLOB that
 translates across a grid at constant velocity, bouncing off the walls. The

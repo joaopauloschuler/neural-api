@@ -19,7 +19,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 Coded by Claude (AI).
 *)
 
-// MusicSourceSeparation -- the FIRST audio SOURCE-SEPARATION demo: one MIXED
+// MusicSourceSeparation -- an audio SOURCE-SEPARATION demo: one MIXED
 // stereo track in, FOUR stems out (drums / bass / other / vocals). This is the
 // time-domain Demucs (Defossez et al. 2019, arXiv:1911.13254) imported by
 // BuildDemucsFromSafeTensors -- a symmetric 1-D conv U-Net:
