@@ -727,6 +727,32 @@ rather than acted on.
       (do_stable_layer_norm), and the final encoder LayerNorm placement that
       pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
       contrastive masked-prediction heads currently dropped as ignorable tensors).
+- [ ] EnCodec neural audio codec importer (BuildEnCodecFromSafeTensors, e.g.
+      facebook/encodec_24khz) — the FIRST audio-GENERATIVE importer and the foundational
+      decoder for neural audio synthesis. Every landed audio model (Wav2Vec2/HuBERT) is
+      analysis-only (audio -> CTC text); EnCodec is the inverse — a streaming
+      convolutional encoder/decoder that turns a waveform into a stack of discrete codes
+      and back. The genuinely NEW primitive is **Residual Vector Quantization (RVQ)**: a
+      cascade of N codebooks where each successive codebook quantizes the RESIDUAL left by
+      the previous one (the repo today has only the single-codebook TNNetVectorQuantizer
+      used by VQVAE/MaskGIT — RVQ is the multi-stage generalization, a small holder class
+      EncodeAudioToCodes / DecodeCodesToAudio doing argmin/gather per stage, NO heavy new
+      TNNet layer). The conv encoder/decoder reuse the SeparableConv / causal-Conv1D
+      blocks already in tree; v1 is inference-only reconstruction (waveform -> codes ->
+      waveform). Pico parity vs a transformers float64 oracle on the round-tripped
+      waveform (< 1e-4) + reuse make_pico_*_fixture.py; an examples/EnCodecRoundTrip that
+      compresses and reconstructs a tiny WAV on CPU. Unblocks the MusicGen / Bark
+      text-to-audio follow-up below (those generate EnCodec codes with a transformer LM,
+      then decode through this codec) — the audio analogue of the VQModel->image-LM path.
+  - [ ] MusicGen text-to-music follow-up (BuildMusicGenFromSafeTensors, e.g.
+        facebook/musicgen-small) once EnCodec lands: a T5 text encoder
+        (BuildT5FromSafeTensors) conditioning a single-stage transformer decoder that
+        autoregressively predicts the EnCodec code stack with the **delay-pattern**
+        codebook interleaving (each of the K codebooks is offset by one step so a single
+        LM head predicts them causally), decoded back to audio through the landed EnCodec
+        decoder. Reuses the seq2seq enc-dec convention + KV-cache decode; new code is only
+        the delay-pattern (de)interleaving. examples/MusicGenSmoke generates a one-second
+        clip on CPU (ulimit-bounded).
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
@@ -898,6 +924,40 @@ rather than acted on.
       HF float64 on the decoder logits for a fixed image+task token + an examples/
       Florence2 that captions and box-detects one tiny CPU image. First "spatial-output-
       as-text" importer; complements the box/mask importers (DETR/SAM/Mask2Former).
+- [ ] Qwen2-VL / Qwen2.5-VL vision-language importer (BuildQwen2VLFromSafeTensors, e.g.
+      Qwen/Qwen2-VL-2B-Instruct or Qwen/Qwen2.5-VL-3B-Instruct) — referenced today only
+      as "the open Qwen2-VL M-RoPE path" in the PaliGemma task but never tracked as a
+      deliverable. The genuinely NEW piece, distinct from every landed/tracked VLM
+      (LLaVA causal-everywhere, PaliGemma prefix-LM bidirectional), is **M-RoPE
+      (Multimodal Rotary Position Embedding)**: the RoPE position index is split into
+      three sections (temporal, height, width) so image/video tokens carry a 3-D grid
+      position while text tokens fall back to the scalar 1-D index — a new rotary-index
+      assignment threaded through the decoder's RoPE, NOT a new attention math. The
+      vision side is a native-dynamic-resolution ViT (window attention over a variable
+      patch grid + a small patch-merger MLP that 2x2-pools spatial tokens), reusing the
+      landed BuildClipVisionTower/SigLIP ViT path and the LLaVA prompt-assembly splice
+      (so it shares that open helper). Scope v1 to a SINGLE still image + text, greedy
+      decode on CPU. Genuinely new code: the M-RoPE 3-D position builder (reuse the
+      existing rotary tables, only the per-token index changes) + the spatial patch
+      merger + the variable-grid window-attention mask. Pico parity vs HF float64 on
+      next-token logits for a mixed image+text prompt (reuse make_pico_*_fixture.py) +
+      an examples/Qwen2VLDescribe that captions a tiny image (ulimit-bounded). The
+      M-RoPE index builder also unblocks Qwen2.5-VL video (the temporal section) later.
+- [ ] CLIPScore text-image-alignment metric (ComputeCLIPScore / CLIPScoreReport in
+      neuralimagemetrics.pas) — the one generative-image metric the repo is missing: FID
+      / Inception Score / KID (all landed) measure sample QUALITY and DIVERSITY but NONE
+      measure whether a generated image actually MATCHES its text prompt (prompt
+      faithfulness), which is the headline eval for every text-to-image model the tree
+      now imports (PixArt, DiT, the tracked SD-UNet/MMDiT stack). Reuses the landed CLIP
+      dual encoder (BuildClipFromSafeTensors): embed the image with the vision tower and
+      the prompt with the text tower, L2-normalize both, and report the cosine-similarity
+      CLIPScore = w * max(cos(img, txt), 0) with the standard w=2.5 rescale (Hessel et al.
+      2021), plus a RefCLIPScore variant (harmonic mean with reference-caption similarity)
+      for captioning eval. Pure CPU post-process on CLIP embeddings; pin parity vs a
+      transformers/open_clip float64 oracle on a fixed (image, caption) pair and assert
+      CLIPScore rises for a matching caption vs a mismatched one. The text-to-image
+      verification backstop that the tracked ImageNet top-1 / detection-mAP harnesses are
+      for classifiers and detectors; the natural scorer for the LatentTextToImage capstone.
 
 ## Layer follow-ups that fix real limitations
 
