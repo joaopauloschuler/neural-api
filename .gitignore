@@ -86,3 +86,7 @@ examples/Inpainting/*.ppm
 examples/Inpainting/*.png
 examples/Inpainting/*.o
 examples/Inpainting/*.ppu
+
+# Python bytecode caches (fixture generators in tools/)
+__pycache__/
+*.pyc
