@@ -388,16 +388,8 @@ rather than acted on.
       sigmoid-cxcywh box/class heads, inference-only, no Hungarian matcher):
   - [ ] examples/ObjectDetection demo that draws boxes on one CPU image (the importer +
         parity test exist; no example yet).
-- [ ] TNNetConvolution3D layer (spatiotemporal / volumetric conv, depth axis =
-      time or Z) — the repo has zero 3-D conv, which blocks proper video models and
-      volumetric (CT/MRI) imaging. Add a (T,H,W,C) conv with TxKxK kernels (and a
-      pConvolution1D-style temporal-only special case), AVX-vectorized along the
-      contiguous channel axis like the 2-D conv, full input+weight numerical-gradient
-      coverage in TestNeuralNumerical.pas, and a tiny examples/VideoActionTiny (or
-      Moving-MNIST tubelet) classifier. Unblocks I3D/C3D/VideoMAE-style importers and
-      gives the tracked Next-frame VideoPrediction task a true spatiotemporal option.
 - [ ] YOLO single-shot object-detection importer (ultralytics YOLOv8n safetensors)
-      — a detection family STRUCTURALLY DISTINCT from the tracked DETR importer
+      — a detection family STRUCTURALLY DISTINCT from the landed DETR importer
       (anchor-free fully-convolutional one-stage detector, no transformer): the
       CSP/C2f backbone + PANet feature-pyramid neck + the decoupled detect head
       (per-cell box distribution via DFL + class logits over 3 strides). New code is
@@ -414,7 +406,7 @@ rather than acted on.
       multi-scale pyramid) -> an iterative ConvGRU update operator that refines the
       flow over N steps (a convolutional recurrent cell over an (H,W,C) state —
       reuse / add a minimal conv-gated recurrent cell, the same building block the
-      tracked Next-frame VideoPrediction ConvLSTM needs). Scope v1 to raft_small +
+      landed Next-frame VideoPrediction ConvLSTM needs). Scope v1 to raft_small +
       a fixed small iteration count, inference-only (no upsampling-mask training
       path needed). Pico parity vs a torchvision float64 oracle on the predicted
       flow + an examples/OpticalFlow that warps one tiny frame toward the next and
@@ -432,13 +424,13 @@ rather than acted on.
 - [ ] VideoMAE / TimeSformer spatiotemporal-transformer importer
       (BuildVideoMAEFromSafeTensors, e.g. MCG-NJU/videomae-base-finetuned-kinetics)
       — the FIRST video-classification importer (a clip of T frames -> an action
-      label), the natural pay-off of the tracked TNNetConvolution3D layer. Tubelet
+      label), the natural pay-off of the landed TNNetConvolution3D layer. Tubelet
       embedding (a 3-D conv that splits the clip into TxPxP space-time patches —
-      exactly the tracked Conv3D primitive) -> the stock transformer encoder stack
+      exactly the landed Conv3D primitive) -> the stock transformer encoder stack
       (reuses the ViT/BERT encoder path) with joint or divided space-time attention
       (TimeSformer) -> mean-pool + classifier. The only genuinely new code is the
       tubelet patchifier wiring + the (divided) space-time attention factorization;
-      everything else is landed. Depends on the tracked Conv3D task. Pico parity vs
+      everything else is landed. Pico parity vs
       HF float64 on the logits + an examples/VideoAction that classifies a short
       Moving-MNIST-tubelet or a tiny clip on CPU. First image-sequence-in importer.
 - [ ] PixArt-alpha text-to-image importer (BuildPixArtFromSafeTensors, e.g.
