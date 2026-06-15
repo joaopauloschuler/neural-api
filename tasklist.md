@@ -884,20 +884,39 @@ rather than acted on.
   - [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
         cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
         machinery) so long transcripts don't re-run the whole prefix each step.
-- [ ] SAM two-way MASK DECODER (successor to the landed SAM image-encoder above).
-      The ViT-B encoder + neck (BuildSAMVisionTower) and its embedding parity are DONE;
-      this adds the lightweight promptable mask decoder so one point click -> one binary
-      mask end-to-end. Scope v1 to a SINGLE point prompt + SINGLE mask output: (a) the
-      prompt encoder (point coords -> positional encoding + learned point/not-a-point
-      embeddings; the dense no-mask embedding); (b) the two-way transformer decoder
-      block (token->image and image->token cross-attention, reuse the landed
-      TNNetCrossAttention two-source wiring) over the learned IoU + mask-output tokens;
-      (c) the output upscaling (2x transposed-conv) + the per-mask hypernetwork-MLP dot
-      with the upscaled embedding -> mask logits. Extend make_pico_sam_fixture.py to
-      build a tiny HF SamModel WITH the mask decoder, feed a fixed point, and dump the
-      low-res mask logits; add TestSAMMaskDecoderParity < 1e-4. Then make
-      examples/SegmentAnything produce a REAL click->mask PPM (replacing the encoder
-      cosine proxy). Watch the CAI fast-X-axis grid mapping the encoder work documented.
+- [X] SAM two-way MASK DECODER (successor to the landed SAM image-encoder above). v1
+      SINGLE point prompt + SINGLE mask: RunSAMMaskDecoder + ReadSAMMaskDecoderConfig +
+      TSAMMaskDecoderConfig in neuralpretrained.pas compose the prompt encoder (point
+      positional encoding + learned point/not-a-point embeddings + dense no-mask embed),
+      the two-way transformer (token<->image cross-attention over the IoU + mask tokens),
+      and the output upscale (2x ConvTranspose x2) + per-mask hypernetwork-MLP dot ->
+      low-res mask logits. make_pico_sam_fixture.py now builds a tiny HF SamModel WITH a
+      pico-sized prompt/mask decoder, feeds a fixed positive point, and dumps the HF
+      float64 mask logits to tiny_sam_mask.json; TestSAMMaskDecoderParity passes < 1e-4
+      (verified numpy reproduction 6e-7 vs HF). examples/SegmentAnything now runs a REAL
+      click->mask PPM (encoder once -> RunSAMMaskDecoder). GOTCHAS hit: layer-0 self-attn
+      (skip_first_layer_pe) REPLACES queries with NO residual; cross-attn down-samples
+      internal dim by attention_downsample_rate (self-attn does not); image->token
+      cross-attn swaps roles (q=image+pe, k=tokens+pe, v=tokens, added back into keys);
+      num_pos_feats lives on the VISION config (= hidden div 2); the forward is run as
+      plain-array math (NOT a TNNet graph) because the two-way block's per-step q/k pe
+      additions across asymmetric cross-attentions made a static multi-source graph
+      fragile. Follow-ups below.
+- [ ] SAM mask decoder v2: MULTI-point / box prompts + MULTI-mask output + IoU head.
+      v1 hardcodes a single positive point (+ pad) and emits only mask-token 0
+      (multimask_output=False). Extend the prompt encoder to N points / a box (two
+      corner tokens with point_embed[2]/[3]), return all 3 multimask masks, and expose
+      the iou_prediction_head scores for mask ranking. Reuse the validated RunSAMMaskDecoder
+      math (the token layout + hypernetwork loop already generalize).
+- [ ] SAM mask decoder as a real TNNet layer graph (TNNetCrossAttention two-source
+      wiring) instead of the plain-array RunSAMMaskDecoder forward, so the decoder is
+      trainable / fine-tunable end-to-end (v1 is inference-only). Needs a builder that
+      threads the per-step query/key positional-embedding additions through the
+      asymmetric token<->image cross-attentions.
+- [ ] SAM full end-to-end importer + processor parity: a single BuildSAMModel that wires
+      encoder + decoder + the HF SamProcessor coordinate transform (longest-side resize
+      to image_size, point rescaling) so a real sam-vit-base checkpoint segments a real
+      image from pixel-space clicks (v1 assumes input_image_size == raw pixel coords).
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,

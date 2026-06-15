@@ -389,6 +389,7 @@ type
     procedure TestBeitConfigFromJSONFile;
     procedure TestBeitParity;
     procedure TestSAMEncoderParity;
+    procedure TestSAMMaskDecoderParity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -18002,6 +18003,98 @@ begin
     ImageInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// SAM mask-decoder parity: a fixed single POSITIVE point click on the pico
+// SAM fixture must reproduce the HF float64 low-res mask logits to < 1e-4.
+// The oracle (tiny_sam_mask.json) is HF's own SamModel forward (float64), fed
+// the encoder's image embedding; this test feeds the SAME oracle image
+// embedding (tiny_sam_embed.json) straight into RunSAMMaskDecoder so the mask
+// decoder is exercised independently of the encoder parity.
+procedure TTestNeuralPretrained.TestSAMMaskDecoderParity;
+var
+  VisCfg: TSAMConfig;
+  MDCfg: TSAMMaskDecoderConfig;
+  Reader: TNNetSafeTensorsReader;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  EmbArr, EmbRow, EmbCell, MaskArr, MaskRow, PointArr: TJSONArray;
+  ImgEmb, MaskLogits: TNNetVolume;
+  Grid, OutCh, MaskH, MaskW, RowCnt, ColCnt, DCnt: integer;
+  PtX, PtY, Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  VisCfg := ReadSAMConfigFromJSONFile(FixturePath('tiny_sam_config.json'));
+  MDCfg := ReadSAMMaskDecoderConfig(FixturePath('tiny_sam_config.json'), VisCfg);
+  Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_sam.safetensors'));
+  RefJson := TStringList.Create;
+  ImgEmb := TNNetVolume.Create;
+  MaskLogits := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertEquals('decoder hidden == out channels', VisCfg.OutputChannels,
+      MDCfg.HiddenSize);
+    AssertEquals('decoder grid', VisCfg.ImageSize div VisCfg.PatchSize,
+      MDCfg.Grid);
+
+    // Load the oracle image embedding (grid, grid, out) into the encoder-output
+    // layout (SizeX=row, SizeY=col, Depth=chan).
+    RefJson.LoadFromFile(FixturePath('tiny_sam_embed.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    EmbArr := TJSONArray(TJSONObject(RefRoot).Find('embed'));
+    Grid := TJSONObject(RefRoot).Get('grid', 0);
+    OutCh := TJSONObject(RefRoot).Get('out_channels', 0);
+    ImgEmb.ReSize(Grid, Grid, OutCh);
+    for RowCnt := 0 to Grid - 1 do
+    begin
+      EmbRow := TJSONArray(EmbArr.Items[RowCnt]);
+      for ColCnt := 0 to Grid - 1 do
+      begin
+        EmbCell := TJSONArray(EmbRow.Items[ColCnt]);
+        for DCnt := 0 to OutCh - 1 do
+          ImgEmb.FData[(RowCnt * Grid + ColCnt) * OutCh + DCnt] :=
+            EmbCell.Items[DCnt].AsFloat;
+      end;
+    end;
+    RefRoot.Free; RefRoot := nil;
+
+    // Load the mask oracle: point + low-res mask logits.
+    RefJson.LoadFromFile(FixturePath('tiny_sam_mask.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    PointArr := TJSONArray(TJSONObject(RefRoot).Find('point'));
+    PtX := PointArr.Items[0].AsFloat;
+    PtY := PointArr.Items[1].AsFloat;
+    MaskArr := TJSONArray(TJSONObject(RefRoot).Find('mask_logits'));
+    MaskH := TJSONObject(RefRoot).Get('mask_h', 0);
+    MaskW := TJSONObject(RefRoot).Get('mask_w', 0);
+
+    RunSAMMaskDecoder(Reader, MDCfg, ImgEmb, PtX, PtY, {IsPositive=}true,
+      MaskLogits);
+
+    AssertEquals('mask logits rows', MaskH, MaskLogits.SizeX);
+    AssertEquals('mask logits cols', MaskW, MaskLogits.SizeY);
+    AssertEquals('mask logits depth', 1, MaskLogits.Depth);
+
+    MaxDiff := 0;
+    for RowCnt := 0 to MaskH - 1 do
+    begin
+      MaskRow := TJSONArray(MaskArr.Items[RowCnt]);
+      for ColCnt := 0 to MaskW - 1 do
+      begin
+        Diff := Abs(MaskLogits.FData[(RowCnt * MaskW + ColCnt) * 1 + 0] -
+          MaskRow.Items[ColCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('SAM mask logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    MaskLogits.Free;
+    ImgEmb.Free;
+    RefJson.Free;
+    Reader.Free;
   end;
 end;
 
