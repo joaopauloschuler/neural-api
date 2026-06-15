@@ -272,6 +272,10 @@ type
     procedure TestModulatedDeformableConvInputGradientCheck;
     procedure TestModulatedDeformableConvWeightGradientCheck;
     procedure TestModulatedDeformableConvSerializationRoundTrip;
+    procedure TestRoIAlignForward;
+    procedure TestRoIAlignInputGradientCheck;
+    procedure TestRoIAlignShapeInference;
+    procedure TestRoIAlignSerializationRoundTrip;
     // TNNetGroupConvP4 p4 (C4 90-degree) group-equivariant lifting convolution
     procedure TestGroupConvP4InputGradientCheck;
     procedure TestGroupConvP4WeightGradientCheck;
@@ -56819,6 +56823,208 @@ begin
         (NN2.Layers[1] as TNNetDeformableConv).Neurons[2].Weights.Size);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('ModulatedDeformableConv Compute matches after round-trip pos ' +
+          IntToStr(i), NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// --- TNNetRoIAlign ----------------------------------------------------------
+
+// Forward correctness pinned against a reference roi_align (torchvision
+// aligned=True semantics, reproduced by a standalone Python script): a 3x3
+// single-channel feature map with values 1..9 row-major, box (0.5,0.5)-(2.5,2.5),
+// PooledW=PooledH=2, spatial_scale=1.0. With the aligned half-pixel offset the
+// four output bins sample exactly at integer pixels (1,1),(2,1),(1,2),(2,2)
+// (0-based -> feature values 5? no: the centers land on grid points), giving
+// the inner-corner averages [3, 4, 6, 7]. Verified identical for sampling_ratio
+// = 2 and the adaptive (sampling_ratio = -1) path.
+procedure TTestNeuralNumerical.TestRoIAlignForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+  expected: array[0..3] of TNeuralFloat;
+begin
+  expected[0] := 3.0; expected[1] := 4.0; expected[2] := 6.0; expected[3] := 7.0;
+  // sampling_ratio = 2
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 1);
+  try
+    for i := 0 to 8 do
+      Input.Raw[i] := i + 1; // 1..9 row-major
+    NN.AddLayer(TNNetInput.Create(3, 3, 1));
+    NN.AddLayer(TNNetRoIAlign.Create(2, 2, 0.5, 0.5, 2.5, 2.5, 1.0, 2));
+    NN.Compute(Input);
+    AssertEquals('RoIAlign output SizeX', 2, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('RoIAlign output SizeY', 2, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('RoIAlign output Depth', 1, NN.GetLastLayer.Output.Depth);
+    for i := 0 to 3 do
+      AssertEquals('RoIAlign forward (sr=2) bin ' + IntToStr(i),
+        expected[i], NN.GetLastLayer.Output.Raw[i], 1e-4);
+    WriteLn('  RoIAlign forward (sr=2) matches reference oracle within 1e-4.');
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+  // adaptive sampling_ratio = -1
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 1);
+  try
+    for i := 0 to 8 do
+      Input.Raw[i] := i + 1;
+    NN.AddLayer(TNNetInput.Create(3, 3, 1));
+    NN.AddLayer(TNNetRoIAlign.Create(2, 2, 0.5, 0.5, 2.5, 2.5, 1.0, -1));
+    NN.Compute(Input);
+    for i := 0 to 3 do
+      AssertEquals('RoIAlign forward (adaptive) bin ' + IntToStr(i),
+        expected[i], NN.GetLastLayer.Output.Raw[i], 1e-4);
+    WriteLn('  RoIAlign forward (adaptive sr=-1) matches reference oracle within 1e-4.');
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoIAlignInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+  i, InSize: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    kk: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for kk := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[kk] - Desired.Raw[kk];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Full input numerical-gradient check. A non-integer box ((0.7,0.4)-(4.3,4.6))
+  // keeps every sample strictly between integer pixels (no bilinear kink), so the
+  // central difference converges cleanly. sampling_ratio = 2 with a 2-channel 5x5
+  // input exercises the per-corner gradient scatter over multiple sample points.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 2);
+  InputPlus := TNNetVolume.Create(5, 5, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 2, 1)); // 1 = collect input error
+    NN.AddLayer(TNNetRoIAlign.Create(3, 3, 0.7, 0.4, 4.3, 4.6, 1.0, 2));
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    InSize := Input.Size;
+
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.07 * i - 0.4;
+    Desired := TNNetVolume.Create(NN.GetLastLayer.Output.SizeX,
+      NN.GetLastLayer.Output.SizeY, NN.GetLastLayer.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * i - 0.3;
+
+    epsilon := 0.001;
+    maxErr := 0;
+    for i := 0 to InSize - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('RoIAlign input gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' +
+        FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  RoIAlign input gradient check max-abs-error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoIAlignShapeInference;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // Output is the fixed PooledW x PooledH grid with channels preserved from the
+  // input, regardless of input spatial size or the box.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 6, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 6, 4));
+    NN.AddLayer(TNNetRoIAlign.Create(7, 5, 1.0, 1.0, 6.0, 4.0, 1.0, 0));
+    NN.Compute(Input);
+    AssertEquals('RoIAlign PooledW -> SizeX', 7, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('RoIAlign PooledH -> SizeY', 5, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('RoIAlign channels preserved', 4, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoIAlignSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  // PooledW/H, sampling_ratio, the full box and spatial_scale must round-trip
+  // through BOTH dispatch points (FStruct[0..2] + FFloatSt[0..4]) so the reloaded
+  // layer produces a byte-identical serialization and matching Compute.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(6, 6, 3));
+    NN.AddLayer(TNNetRoIAlign.Create(4, 3, 0.6, 1.1, 5.2, 4.7, 0.5, 3));
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.2;
+
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.Compute(Input);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('RoIAlign SaveToString round-trip byte-identical', Saved, Saved2);
+      AssertTrue('RoIAlign token present in serialized string',
+        Pos('TNNetRoIAlign', Saved) > 0);
+      AssertEquals('RoIAlign output SizeX preserved',
+        NN.Layers[1].Output.SizeX, NN2.Layers[1].Output.SizeX);
+      AssertEquals('RoIAlign output Depth preserved',
+        NN.Layers[1].Output.Depth, NN2.Layers[1].Output.Depth);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('RoIAlign Compute matches after round-trip pos ' +
           IntToStr(i), NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

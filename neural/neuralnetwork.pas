@@ -11260,6 +11260,63 @@ type
     property FeaturesCount: integer read FFeaturesCount;
   end;
 
+  /// RoI ALIGN pooling (He et al. 2017, "Mask R-CNN", arXiv:1703.06870) -- the
+  /// bilinear-sampled fixed-size crop that turns an arbitrary region (a proposal
+  /// "box") of a feature map into a fixed PooledH x PooledW x Depth output, the
+  /// pooling primitive a two-stage detector (Faster / Mask R-CNN) feeds to its
+  /// box and mask heads. Unlike RoIPool it does NO coordinate quantization: each
+  /// output bin is the AVERAGE of sampling_ratio^2 points sampled at the bin
+  /// sub-centers by BILINEAR interpolation of the feature map (the exact sampler
+  /// and per-corner gradient scatter of TNNetDeformableConv, summed over sample
+  /// points and divided by the per-bin sample count). Channel count is preserved.
+  ///
+  /// CONVENTIONS (match torchvision.ops.roi_align, the standard):
+  ///   - The box (x1,y1,x2,y2) is given in the FEATURE MAP's coordinate space
+  ///     and pre-multiplied by SpatialScale (default 1.0) to map it onto the
+  ///     input grid; roi_start = coord*scale.
+  ///   - aligned=True (pixel-center) convention: subtract a 0.5 offset from the
+  ///     scaled box corners so sample positions land on pixel centers (this is
+  ///     torchvision's recommended default; it removes the half-pixel shift of
+  ///     the original Detectron implementation).
+  ///   - bin_size = roi_size / pooled_size; sample point (ix,iy) of bin (px,py)
+  ///     sits at roi_start + bin*pos + bin*(i+0.5)/ratio.
+  ///   - SamplingRatio <= 0 selects ADAPTIVE ratio = ceil(roi_size/pooled_size)
+  ///     per axis (torchvision's sampling_ratio=-1 behaviour).
+  ///   - Out-of-bounds bilinear corners contribute 0 (zero padding), like the
+  ///     DeformableConv sampler.
+  ///
+  /// DESIGN (v1): a SINGLE FIXED box per layer instance, supplied at Create time
+  /// and operating on the previous layer's output. This is exactly what the
+  /// Mask R-CNN inference path needs -- the importer feeds externally supplied
+  /// proposal boxes, creating one RoIAlign per proposal (or rewriting the box
+  /// between forwards via SetBox). A second-input box source is a future variant.
+  ///
+  /// No trainable params (parameter-free, like a pooling layer). Serialized in
+  /// FStruct[0]=PooledW, FStruct[1]=PooledH, FStruct[2]=SamplingRatio and
+  /// FFloatSt[0..3]=box (x1,y1,x2,y2), FFloatSt[4]=SpatialScale, so the box is
+  /// part of the round-trip.
+  // Coded by Claude (AI).
+  TNNetRoIAlign = class(TNNetLayer)
+  private
+    FPooledW, FPooledH: integer;
+    FSamplingRatio: integer;       // <=0 = adaptive ceil(roi_size/pooled_size)
+    FX1, FY1, FX2, FY2: TNeuralFloat;  // box in feature-map coords (pre-scale)
+    FSpatialScale: TNeuralFloat;
+    function SampleBilinear(PrevOut: TNNetVolume; px, py: TNeuralFloat;
+      ci: integer): TNeuralFloat;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pPooledW, pPooledH: integer;
+      pX1, pY1, pX2, pY2: TNeuralFloat;
+      pSpatialScale: TNeuralFloat = 1.0;
+      pSamplingRatio: integer = 0); overload;
+    procedure SetBox(pX1, pY1, pX2, pY2: TNeuralFloat);
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property PooledW: integer read FPooledW;
+    property PooledH: integer read FPooledH;
+  end;
+
   /// MONARCH structured DENSE layer (Dao et al. 2022, "Monarch: Expressive
   /// Structured Matrices for Efficient and Accurate Training", arXiv:2204.00595).
   /// A square n -> n linear map whose n x n weight is a MONARCH matrix -- a
@@ -61652,6 +61709,225 @@ begin
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
+{ TNNetRoIAlign }
+
+constructor TNNetRoIAlign.Create(pPooledW, pPooledH: integer;
+  pX1, pY1, pX2, pY2: TNeuralFloat;
+  pSpatialScale: TNeuralFloat = 1.0;
+  pSamplingRatio: integer = 0);
+begin
+  inherited Create();
+  if pPooledW < 1 then pPooledW := 1;
+  if pPooledH < 1 then pPooledH := 1;
+  FPooledW := pPooledW;
+  FPooledH := pPooledH;
+  FSamplingRatio := pSamplingRatio;
+  FX1 := pX1;  FY1 := pY1;  FX2 := pX2;  FY2 := pY2;
+  FSpatialScale := pSpatialScale;
+  // Serialize so SaveStructureToString / CreateLayer round-trips (box included).
+  FStruct[0] := FPooledW;
+  FStruct[1] := FPooledH;
+  FStruct[2] := FSamplingRatio;
+  FFloatSt[0] := FX1;
+  FFloatSt[1] := FY1;
+  FFloatSt[2] := FX2;
+  FFloatSt[3] := FY2;
+  FFloatSt[4] := FSpatialScale;
+end;
+
+procedure TNNetRoIAlign.SetBox(pX1, pY1, pX2, pY2: TNeuralFloat);
+begin
+  FX1 := pX1;  FY1 := pY1;  FX2 := pX2;  FY2 := pY2;
+  FFloatSt[0] := FX1;
+  FFloatSt[1] := FY1;
+  FFloatSt[2] := FX2;
+  FFloatSt[3] := FY2;
+end;
+
+procedure TNNetRoIAlign.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  // Fixed PooledW x PooledH grid, channels preserved from the input.
+  FOutput.ReSize(FPooledW, FPooledH, pPrevLayer.Output.Depth);
+  FOutputError.ReSize(FOutput);
+end;
+
+// Bilinear sample of input channel ci at floating position (px,py); out-of-
+// bounds corners contribute 0 (zero-padding). Identical math to the
+// TNNetDeformableConv sampler.
+function TNNetRoIAlign.SampleBilinear(PrevOut: TNNetVolume;
+  px, py: TNeuralFloat; ci: integer): TNeuralFloat;
+var
+  x0, y0, x1, y1, sx, sy: integer;
+  fx, fy, w00, w01, w10, w11, v: TNeuralFloat;
+begin
+  sx := PrevOut.SizeX;
+  sy := PrevOut.SizeY;
+  x0 := Floor(px);
+  y0 := Floor(py);
+  x1 := x0 + 1;
+  y1 := y0 + 1;
+  fx := px - x0;
+  fy := py - y0;
+  w00 := (1 - fx) * (1 - fy);
+  w01 := fx * (1 - fy);
+  w10 := (1 - fx) * fy;
+  w11 := fx * fy;
+  v := 0;
+  if (x0 >= 0) and (x0 < sx) and (y0 >= 0) and (y0 < sy) then
+    v := v + w00 * PrevOut.Get(x0, y0, ci);
+  if (x1 >= 0) and (x1 < sx) and (y0 >= 0) and (y0 < sy) then
+    v := v + w01 * PrevOut.Get(x1, y0, ci);
+  if (x0 >= 0) and (x0 < sx) and (y1 >= 0) and (y1 < sy) then
+    v := v + w10 * PrevOut.Get(x0, y1, ci);
+  if (x1 >= 0) and (x1 < sx) and (y1 >= 0) and (y1 < sy) then
+    v := v + w11 * PrevOut.Get(x1, y1, ci);
+  Result := v;
+end;
+
+// RoI Align forward (torchvision aligned=True). For each output bin average
+// sampling_ratio^2 bilinearly-sampled points at the bin sub-centers.
+procedure TNNetRoIAlign.Compute();
+var
+  PrevOut: TNNetVolume;
+  Depth, ci, px, py, ix, iy, ratioX, ratioY: integer;
+  roiStartX, roiStartY, roiW, roiH, binW, binH: TNeuralFloat;
+  sx, sy, acc, countInv: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  PrevOut := FPrevLayer.FOutput;
+  Depth := PrevOut.Depth;
+
+  // aligned=True: scale box, then subtract half-pixel offset (pixel centers).
+  roiStartX := FX1 * FSpatialScale - 0.5;
+  roiStartY := FY1 * FSpatialScale - 0.5;
+  roiW := (FX2 - FX1) * FSpatialScale;
+  roiH := (FY2 - FY1) * FSpatialScale;
+  // NOTE: torchvision does NOT clamp roi size to >=1 when aligned=True.
+  binW := roiW / FPooledW;
+  binH := roiH / FPooledH;
+
+  if FSamplingRatio > 0 then
+  begin
+    ratioX := FSamplingRatio;
+    ratioY := FSamplingRatio;
+  end
+  else
+  begin
+    ratioX := Ceil(roiW / FPooledW);
+    ratioY := Ceil(roiH / FPooledH);
+    if ratioX < 1 then ratioX := 1;
+    if ratioY < 1 then ratioY := 1;
+  end;
+  countInv := 1.0 / (ratioX * ratioY);
+
+  for py := 0 to FPooledH - 1 do
+  for px := 0 to FPooledW - 1 do
+    for ci := 0 to Depth - 1 do
+    begin
+      acc := 0;
+      for iy := 0 to ratioY - 1 do
+      begin
+        sy := roiStartY + py * binH + (iy + 0.5) * binH / ratioY;
+        for ix := 0 to ratioX - 1 do
+        begin
+          sx := roiStartX + px * binW + (ix + 0.5) * binW / ratioX;
+          acc := acc + SampleBilinear(PrevOut, sx, sy, ci);
+        end;
+      end;
+      FOutput.FData[FOutput.GetRawPos(px, py, ci)] := acc * countInv;
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// Backward: distribute each output-bin gradient (scaled by 1/sample_count)
+// through the 4 bilinear corners of every sample point.
+procedure TNNetRoIAlign.Backpropagate();
+var
+  PrevOut, PrevErr: TNNetVolume;
+  Depth, ci, px, py, ix, iy, ratioX, ratioY: integer;
+  x0, y0, x1, y1, sxSize, sySize: integer;
+  roiStartX, roiStartY, roiW, roiH, binW, binH: TNeuralFloat;
+  sx, sy, fx, fy, w00, w01, w10, w11, dy_out, g, countInv: TNeuralFloat;
+  HasPrevError: boolean;
+  StartTime: double;
+
+  procedure ScatterCorner(xx, yy: integer; coef: TNeuralFloat);
+  begin
+    if HasPrevError and (xx >= 0) and (xx < sxSize) and
+       (yy >= 0) and (yy < sySize) then
+      PrevErr.Add(xx, yy, ci, coef);
+  end;
+
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutput.Size > 0) then
+  begin
+    StartTime := Now();
+    PrevOut := FPrevLayer.FOutput;
+    PrevErr := FPrevLayer.OutputError;
+    HasPrevError := (PrevErr.Size = PrevOut.Size);
+    Depth := PrevOut.Depth;
+    sxSize := PrevOut.SizeX;
+    sySize := PrevOut.SizeY;
+
+    roiStartX := FX1 * FSpatialScale - 0.5;
+    roiStartY := FY1 * FSpatialScale - 0.5;
+    roiW := (FX2 - FX1) * FSpatialScale;
+    roiH := (FY2 - FY1) * FSpatialScale;
+    binW := roiW / FPooledW;
+    binH := roiH / FPooledH;
+
+    if FSamplingRatio > 0 then
+    begin
+      ratioX := FSamplingRatio;
+      ratioY := FSamplingRatio;
+    end
+    else
+    begin
+      ratioX := Ceil(roiW / FPooledW);
+      ratioY := Ceil(roiH / FPooledH);
+      if ratioX < 1 then ratioX := 1;
+      if ratioY < 1 then ratioY := 1;
+    end;
+    countInv := 1.0 / (ratioX * ratioY);
+
+    if HasPrevError then
+    for py := 0 to FPooledH - 1 do
+    for px := 0 to FPooledW - 1 do
+      for ci := 0 to Depth - 1 do
+      begin
+        dy_out := FOutputError.Get(px, py, ci);
+        if dy_out = 0 then continue;
+        g := dy_out * countInv;
+        for iy := 0 to ratioY - 1 do
+        begin
+          sy := roiStartY + py * binH + (iy + 0.5) * binH / ratioY;
+          for ix := 0 to ratioX - 1 do
+          begin
+            sx := roiStartX + px * binW + (ix + 0.5) * binW / ratioX;
+            x0 := Floor(sx); y0 := Floor(sy);
+            x1 := x0 + 1;    y1 := y0 + 1;
+            fx := sx - x0;   fy := sy - y0;
+            w00 := (1 - fx) * (1 - fy);
+            w01 := fx * (1 - fy);
+            w10 := (1 - fx) * fy;
+            w11 := fx * fy;
+            ScatterCorner(x0, y0, g * w00);
+            ScatterCorner(x1, y0, g * w01);
+            ScatterCorner(x0, y1, g * w10);
+            ScatterCorner(x1, y1, g * w11);
+          end;
+        end;
+      end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+  end;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
 { TNNetMonarchLinear }
 
 // Monarch structured dense layer: y = P^T*(L*(P*(R*x))) (+bias). R and L are
@@ -91253,6 +91529,7 @@ begin
       'TNNetDeformableConv' :       Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]);
       'TNNetGroupConvP4' :          Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]);
       'TNNetGroupPoolP4' :          Result := TNNetGroupPoolP4.Create(St[0]);
+      'TNNetRoIAlign' :             Result := TNNetRoIAlign.Create(St[0], St[1], Ft[0], Ft[1], Ft[2], Ft[3], Ft[4], St[2]);
       'TNNetMonarchLinear' :        Result := TNNetMonarchLinear.Create(St[3]);
       'TNNetKroneckerLinear' :      Result := TNNetKroneckerLinear.Create(St[3], St[1]);
       'TNNetTensorTrain' :          Result := TNNetTensorTrain.Create(St[3], St[1], St[2]);
@@ -91667,6 +91944,7 @@ begin
       if S[0] = 'TNNetDeformableConv' then Result := TNNetDeformableConv.Create(St[0], St[1], St[2], St[3], St[4], St[5]) else
       if S[0] = 'TNNetGroupConvP4' then Result := TNNetGroupConvP4.Create(St[0], St[1], St[2], St[3], St[4]) else
       if S[0] = 'TNNetGroupPoolP4' then Result := TNNetGroupPoolP4.Create(St[0]) else
+      if S[0] = 'TNNetRoIAlign' then Result := TNNetRoIAlign.Create(St[0], St[1], Ft[0], Ft[1], Ft[2], Ft[3], Ft[4], St[2]) else
       if S[0] = 'TNNetMonarchLinear' then Result := TNNetMonarchLinear.Create(St[3]) else
       if S[0] = 'TNNetKroneckerLinear' then Result := TNNetKroneckerLinear.Create(St[3], St[1]) else
       if S[0] = 'TNNetTensorTrain' then Result := TNNetTensorTrain.Create(St[3], St[1], St[2]) else

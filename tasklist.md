@@ -941,7 +941,20 @@ rather than acted on.
         sensible image, and consider a Karras-spaced / Euler-ancestral variant.
       Edit examples/README.md. Mind the 5-min/ulimit budget — default to a smoke run.
 
+- [X] RoIAlign pooling primitive LANDED (TNNetRoIAlign, neuralnetwork.pas) — the
+      genuinely-new leaf layer the Mask R-CNN item below depends on. Bilinear-sampled
+      fixed-size crop of a proposal box (torchvision roi_align aligned=True semantics:
+      spatial_scale, sampling_ratio<=0 adaptive, per-bin average of sampling_ratio^2
+      bilinear samples), sibling to the DeformableConv sampler/gradient. v1 = single
+      FIXED box per instance via Create(PooledW,PooledH,X1,Y1,X2,Y2,SpatialScale,
+      SamplingRatio) (+SetBox), exactly the externally-supplied-proposal inference path
+      the importer needs. Registered in both CreateLayer dispatch paths (round-trips).
+      Tests in TestNeuralNumerical.pas: forward vs torchvision-equivalent oracle (<1e-4),
+      full input numerical-gradient (max err 8.5e-4 < 1e-2), shape inference, SaveToString
+      round-trip. README layer list updated.
 - [ ] Mask R-CNN instance-segmentation importer + a RoIAlign primitive
+      (RoIAlign DEPENDENCY NOW SATISFIED — see the landed TNNetRoIAlign entry above;
+      remaining work is the importer/FPN/heads below)
       (BuildMaskRCNNFromSafeTensors, e.g. torchvision maskrcnn_resnet50_fpn) — the
       FIRST instance-segmentation vertical (per-OBJECT binary masks, distinct from
       DETR's boxes-only, SegFormer's single dense class map, and SAM's prompt-driven
