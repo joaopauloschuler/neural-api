@@ -379,15 +379,30 @@ rather than acted on.
       offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
       examples can opt into perceptual fine-tuning (the VGG build already enables
       input/error collection, so the gradient path exists).
-- [ ] YOLO single-shot object-detection importer (ultralytics YOLOv8n safetensors)
-      — a detection family STRUCTURALLY DISTINCT from the landed DETR importer
-      (anchor-free fully-convolutional one-stage detector, no transformer): the
-      CSP/C2f backbone + PANet feature-pyramid neck + the decoupled detect head
-      (per-cell box distribution via DFL + class logits over 3 strides). New code is
-      the C2f/SPPF blocks, the FPN top-down+bottom-up fusion (reuses Concat +
-      upsample), and DFL box decoding; NMS is a small CPU post-process. Pico parity
-      vs an ultralytics float64 oracle on the head outputs + an examples/YoloDetect
-      that draws boxes on one CPU image. Reuses the conv-BN-fold loader path.
+- [X] YOLO single-shot object-detection importer (ultralytics YOLOv8 safetensors)
+      — LANDED: BuildYolo / BuildYoloFromSafeTensors[Ex] + TYoloConfig /
+      ReadYoloConfigFromJSONFile / YoloConfigToString in neuralpretrained.pas.
+      Anchor-free fully-conv one-stage detector (no transformer): CSP/C2f backbone
+      (YoloAddC2f: 1x1 -> channel SplitChannels into two halves -> n chained
+      Bottlenecks kept -> DeepConcat -> 1x1) + SPPF (YoloAddSPPF: 1x1 -> 3 chained
+      k5 s1 TNNetMaxPoolPortable kept -> concat -> 1x1) + PANet top-down
+      (TNNetDeMaxPool nearest-2x + DeepConcat + C2f) / bottom-up (stride-2 conv +
+      concat + C2f) neck + decoupled DFL detect head (box branch 4*reg_max dist
+      logits + cls branch num_classes, 3 strides), flattened to a
+      (sum Hi*Wi, 1, 4*reg_max+nc) per-cell raw head. Every ultralytics Conv =
+      conv2d(no bias)->BN->SiLU loaded via LoadResNetConvFoldBN; head final Conv2d
+      via LoadMobileNetSEConv. DFL decode + greedy IoU NMS = DecodeYoloDetections
+      (TYoloDetection). Pico parity vs a numpy float64 oracle on the raw head
+      (TestYoloObjectDetectionParity, max|diff| < 1e-4) + decode unit test
+      (TestYoloDetectionDecode) + config test; fixture tools/yolo_tiny_fixture.py
+      (INPUT 96 so /32=3 avoids CAI's Min(K, prev.SizeX) kernel clamp; maxpool
+      zero-PADs like CAI, not -inf). examples/YoloDetect draws boxes -> PPM.
+      OPEN FOLLOW-UPS: (a) wire model_type 'yolov8' into BuildFromPretrained
+      dispatch; (b) real ultralytics yolov8n weight-name parity (the .pt -> .pth
+      key scheme is identical "model.{i}.*" but verify against a real export + the
+      DFL conv bin buffer ultralytics bakes in); (c) yolov8 segmentation /
+      pose / OBB heads; (d) letterbox preprocessing helper for arbitrary-size
+      images (the importer assumes a square ImageSize input).
 - [ ] RAFT optical-flow importer (BuildRaftFromSafeTensors, e.g. princeton-vl/raft or
       the torchvision raft_small weights) — the FIRST optical-flow vertical and the
       first model with a TWO-image input producing a dense 2-channel (dx, dy) motion

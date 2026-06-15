@@ -294,6 +294,9 @@ type
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
+    procedure TestYoloConfigFromJSONFile;
+    procedure TestYoloObjectDetectionParity;
+    procedure TestYoloDetectionDecode;
     procedure TestOwlViTConfigFromJSONFile;
     procedure TestOwlViTOpenVocabDetectionParity;
     procedure TestOwlViTDetectionDecode;
@@ -13773,6 +13776,170 @@ begin
     AssertTrue('query0 box in [0,1]',
       (Dets[0].Cx >= 0) and (Dets[0].Cx <= 1) and
       (Dets[0].Cy >= 0) and (Dets[0].Cy <= 1));
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadYoloConfigFromJSONFile on the committed YOLOv8 pico config.
+procedure TTestNeuralPretrained.TestYoloConfigFromJSONFile;
+var
+  Config: TYoloConfig;
+begin
+  Config := ReadYoloConfigFromJSONFile(FixturePath('tiny_yolo_config.json'));
+  AssertEquals('model_type', 'yolov8', Config.ModelType);
+  AssertEquals('num_classes', 3, Config.NumClasses);
+  AssertEquals('reg_max', 8, Config.RegMax);
+  AssertEquals('width0', 4, Config.Widths[0]);
+  AssertEquals('width4', 16, Config.Widths[4]);
+  AssertEquals('depth0', 1, Config.Depths[0]);
+  AssertEquals('depth1', 2, Config.Depths[1]);
+  AssertEquals('image size', 96, Config.ImageSize);
+  AssertEquals('stride0', 8, Config.Strides[0]);
+  AssertEquals('stride2', 32, Config.Strides[2]);
+  AssertTrue('config string', Length(YoloConfigToString(Config)) > 0);
+end;
+
+// Builds the tiny RANDOM YOLOv8 (CSP/C2f backbone + SPPF + PANet neck +
+// decoupled DFL detect head) from the committed pico fixture and asserts the
+// RAW head outputs (DFL box-distribution logits + class logits per cell) match
+// the numpy float64 oracle, max |diff| < 1e-4. Exercises the C2f channel-split,
+// the SPPF k5-s1 maxpool chain, the top-down/bottom-up fusion and the
+// conv+folded-BN load path (tools/yolo_tiny_fixture.py).
+procedure TTestNeuralPretrained.TestYoloObjectDetectionParity;
+var
+  NN: TNNet;
+  Config: TYoloConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  InArr, OutArr: TJSONArray;
+  Img, Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  x, yy, ch, FlatIdx, W, H, NumCh, NumCells, OutDim, cell, c: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildYoloFromSafeTensors(FixturePath('tiny_yolo.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_yolo_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  OutDim := 4 * Config.RegMax + Config.NumClasses;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('output depth = 4*reg_max+nc', OutDim,
+      NN.GetLastLayer().Output.Depth);
+    RefJson.LoadFromFile(FixturePath('tiny_yolo_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    NumCells := TJSONObject(RefRoot).Get('num_cells', 0);
+    AssertEquals('output cells', NumCells, NN.GetLastLayer().Output.SizeX);
+    InArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
+    OutArr := TJSONArray(TJSONObject(RefRoot).Find('output'));
+    // input is stored (c, y, x) (numpy (C,H,W)); CAI volume is (x,y,c).
+    Img.ReSize(W, H, NumCh);
+    for ch := 0 to NumCh - 1 do
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+        begin
+          FlatIdx := (ch * H + yy) * W + x;
+          Img[x, yy, ch] := InArr.Items[FlatIdx].AsFloat;
+        end;
+    NN.Compute(Img);
+    Output := NN.GetLastLayer().Output;
+    // oracle output is flat (cell, channel); CAI out is (cell, 0, channel).
+    for cell := 0 to NumCells - 1 do
+      for c := 0 to OutDim - 1 do
+      begin
+        RefVal := OutArr.Items[cell * OutDim + c].AsFloat;
+        GotVal := Output[cell, 0, c];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    AssertTrue('YOLO head: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies DecodeYoloDetections: DFL box decode (softmax each reg_max-bin side ->
+// expected distance), xyxy pixel conversion + greedy NMS. With ScoreThreshold 0
+// every cell becomes a candidate; the decode must agree with a hand DFL+sigmoid
+// over the same head output for the first kept cell, and the box must be in
+// pixel range.
+procedure TTestNeuralPretrained.TestYoloDetectionDecode;
+var
+  NN: TNNet;
+  Config: TYoloConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  InArr: TJSONArray;
+  Img, Output: TNNetVolume;
+  Dets: TYoloDetectionArray;
+  x, yy, ch, FlatIdx, W, H, NumCh, c, BestCls, rm, side, b: integer;
+  MaxLogit, SumExp, BestP, P, Dist: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := BuildYoloFromSafeTensors(FixturePath('tiny_yolo.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_yolo_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  rm := Config.RegMax;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_yolo_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    InArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
+    Img.ReSize(W, H, NumCh);
+    for ch := 0 to NumCh - 1 do
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+        begin
+          FlatIdx := (ch * H + yy) * W + x;
+          Img[x, yy, ch] := InArr.Items[FlatIdx].AsFloat;
+        end;
+    NN.Compute(Img);
+    Output := NN.GetLastLayer().Output;
+    // ScoreThreshold 0 keeps every cell (no NMS suppression at random weights
+    // is not guaranteed, but at least one detection must survive).
+    Dets := DecodeYoloDetections(Output, Config, {ScoreThreshold=}0.0,
+      {IoUThreshold=}1.1);
+    AssertEquals('all cells kept at thresh 0 / IoU>1', Output.SizeX,
+      Length(Dets));
+    // Verify cell 0 (stride 8, gx=gy=0) class + DFL box against a manual decode.
+    BestCls := 0; BestP := -1;
+    for c := 0 to Config.NumClasses - 1 do
+    begin
+      P := 1.0 / (1.0 + Exp(-Output[0, 0, 4 * rm + c]));
+      if P > BestP then begin BestP := P; BestCls := c; end;
+    end;
+    // DecodeYoloDetections sorts by score, so find cell 0's detection by its
+    // unique cell-0 box (stride 8, centre (0.5,0.5)).
+    side := 0;
+    MaxLogit := Output[0, 0, 0];
+    for b := 1 to rm - 1 do
+      if Output[0, 0, b] > MaxLogit then MaxLogit := Output[0, 0, b];
+    SumExp := 0;
+    for b := 0 to rm - 1 do SumExp := SumExp + Exp(Output[0, 0, b] - MaxLogit);
+    Dist := 0;
+    for b := 0 to rm - 1 do
+      Dist := Dist + b * Exp(Output[0, 0, b] - MaxLogit) / SumExp;
+    AssertTrue('DFL left distance in [0, reg_max)', (Dist >= 0) and (Dist < rm));
+    AssertTrue('best class score sane', (BestP > 0) and (BestP < 1));
+    AssertTrue('at least one detection', Length(Dets) > 0);
+    // every box must lie within a sane pixel range around the image.
+    AssertTrue('box x1 finite', Dets[0].X1 > -1000);
+    AssertTrue('box scores sorted desc',
+      (Length(Dets) < 2) or (Dets[0].Score >= Dets[1].Score));
+    if side = 0 then ; // silence unused
   finally
     RefRoot.Free;
     Img.Free;

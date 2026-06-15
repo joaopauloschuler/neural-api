@@ -6825,6 +6825,88 @@ type
 function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
   Threshold: TNeuralFloat = 0.5): TDetrDetectionArray;
 
+// ---------------------------------------------------------------------------
+// YOLOv8 SINGLE-SHOT OBJECT-DETECTION IMPORT (ultralytics "yolov8", e.g.
+// ultralytics/yolov8n) -- the repo's FIRST anchor-free fully-convolutional
+// one-stage detector, STRUCTURALLY DISTINCT from the landed DETR importer (no
+// transformer, no learned object queries; instead a CSP backbone + a PANet
+// feature pyramid + a decoupled per-cell DFL detect head over 3 strides).
+// New wiring vs every prior CV importer: the C2f cross-stage block (1x1 split
+// -> n chained Bottlenecks keeping all intermediates -> concat -> 1x1), the
+// SPPF block (1x1 -> 3 chained k5 s1 maxpools kept -> concat -> 1x1), the PAN
+// top-down (upsample+concat+C2f) + bottom-up (stride-2 conv+concat+C2f) fusion,
+// and the decoupled detect head (a box branch emitting 4*reg_max DFL-distribution
+// logits + a class branch emitting num_classes logits per cell). Every
+// ultralytics "Conv" = conv2d(no bias) -> BatchNorm2d -> SiLU, loaded with the
+// shared conv+folded-BN path (LoadResNetConvFoldBN); the two final head Conv2d
+// layers carry a real bias and no BN. INFERENCE only.
+//
+// The net takes an (ImageSize, ImageSize, NumChannels) [0,1] RGB volume and
+// outputs the RAW head, flattened stride-major / row-major into a
+// (sum_i Hi*Wi, 1, 4*reg_max + num_classes) volume (the same per-cell layout as
+// DETR's per-query tensor): channels 0..4*reg_max-1 = the 4 box-side DFL
+// distribution logits, channels 4*reg_max..end = the class logits. DFL decode
+// (softmax each 16-bin side -> expected value -> ltrb distances -> xyxy box in
+// grid units -> *stride to pixels) + NMS are a CPU post-process in
+// DecodeYoloDetections (training-only loss/anchor-assignment is omitted).
+// Coded by Claude (AI).
+type
+  TYoloConfig = record
+    Widths: array[0..4] of integer;  // stage widths w0..w4
+    Depths: array[0..1] of integer;  // C2f repeats (d0 shallow, d1 deep)
+    NumClasses: integer;             // detection classes
+    RegMax: integer;                 // DFL bins per box side (ultralytics 16)
+    BoxHidden: integer;              // box-branch hidden width (cv2)
+    ClsHidden: integer;              // class-branch hidden width (cv3)
+    NumChannels: integer;            // 3
+    ImageSize: integer;              // square input (multiple of 32)
+    BnEps: TNeuralFloat;             // BatchNorm2d eps (ultralytics 1e-3)
+    Strides: array[0..2] of integer; // 8 / 16 / 32
+    ModelType: string;               // 'yolov8'
+  end;
+
+// Reads a YOLOv8 config (the pico-fixture / repacked schema). Required:
+// num_classes. Optional overrides: widths (5-int), depths (2-int), reg_max (16),
+// box_hidden / cls_hidden, num_channels (3), image_size (640), bn_eps (1e-3),
+// strides ([8,16,32]), model_type ('yolov8'). Defaults reproduce yolov8n.
+function ReadYoloConfigFromJSONFile(const FileName: string): TYoloConfig;
+
+function YoloConfigToString(const Config: TYoloConfig): string;
+
+// Builds the YOLOv8 detector described by Config and loads every weight from
+// Reader (caller owns Reader), folding each BatchNorm into its conv. Output:
+// (sum_i Hi*Wi, 1, 4*reg_max + num_classes) raw head (see the section comment).
+function BuildYolo(Reader: TNNetSafeTensorsReader;
+  const Config: TYoloConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildYoloFromSafeTensorsEx(const FileName: string;
+  const Config: TYoloConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildYoloFromSafeTensors(const FileName: string;
+  out Config: TYoloConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+type
+  // One decoded YOLO detection: foreground class, confidence (sigmoid of the
+  // best class logit) and the xyxy box in PIXELS of the ImageSize input.
+  TYoloDetection = record
+    ClassId: integer;
+    Score: TNeuralFloat;
+    X1, Y1, X2, Y2: TNeuralFloat;
+  end;
+  TYoloDetectionArray = array of TYoloDetection;
+
+// Decodes a YOLO head volume (the (NumCells,1,4*reg_max+num_classes) tensor)
+// into detections: per cell, sigmoid the class logits and take the best class;
+// keep cells whose best score >= ScoreThreshold; DFL-decode the 4 box sides
+// (softmax each reg_max-bin side, expected value = predicted ltrb distance from
+// the cell centre, in grid units), convert to an xyxy pixel box, then run
+// greedy IoU NMS at IoUThreshold. Config supplies strides / grid sizes /
+// reg_max. Returns the kept detections sorted by descending score.
+function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
+  ScoreThreshold: TNeuralFloat = 0.25;
+  IoUThreshold: TNeuralFloat = 0.45): TYoloDetectionArray;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -41561,6 +41643,443 @@ begin
     end;
   end;
   SetLength(Result, Cnt);
+end;
+
+// ===========================================================================
+// YOLOv8 importer
+// ===========================================================================
+function ReadYoloConfigFromJSONFile(const FileName: string): TYoloConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ArrData: TJSONData;
+  Arr: TJSONArray;
+  i: integer;
+begin
+  // Canonical yolov8n defaults; the pico fixture overrides widths/depths etc.
+  Result.Widths[0] := 16; Result.Widths[1] := 32; Result.Widths[2] := 64;
+  Result.Widths[3] := 128; Result.Widths[4] := 256;
+  Result.Depths[0] := 1; Result.Depths[1] := 2;
+  Result.RegMax := 16;
+  Result.BoxHidden := 64; Result.ClsHidden := 80;
+  Result.NumChannels := 3;
+  Result.ImageSize := 640;
+  Result.BnEps := 1e-3;
+  Result.Strides[0] := 8; Result.Strides[1] := 16; Result.Strides[2] := 32;
+  Result.ModelType := 'yolov8';
+  if not FileExists(FileName) then
+    ImportError('YOLO import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('YOLO import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('YOLO import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'yolov8');
+    if (Result.ModelType <> 'yolov8') and (Result.ModelType <> 'yolo') then
+      ImportError('YOLO import: config model_type is "' + Result.ModelType +
+        '" - only "yolov8" is supported.');
+    if Obj.IndexOfName('num_classes') < 0 then
+      ImportError('YOLO import: config "' + FileName +
+        '" is missing the required field "num_classes".');
+    Result.NumClasses := Obj.Get('num_classes', 0);
+    if Result.NumClasses <= 0 then
+      ImportError('YOLO import: num_classes must be a positive integer.');
+    ArrData := Obj.Find('widths');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 5 then
+        ImportError('YOLO import: "widths" must have exactly 5 entries.');
+      for i := 0 to 4 do Result.Widths[i] := Arr.Integers[i];
+    end;
+    ArrData := Obj.Find('depths');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 2 then
+        ImportError('YOLO import: "depths" must have exactly 2 entries.');
+      for i := 0 to 1 do Result.Depths[i] := Arr.Integers[i];
+    end;
+    ArrData := Obj.Find('strides');
+    if (ArrData <> nil) and (ArrData is TJSONArray) then
+    begin
+      Arr := TJSONArray(ArrData);
+      if Arr.Count <> 3 then
+        ImportError('YOLO import: "strides" must have exactly 3 entries.');
+      for i := 0 to 2 do Result.Strides[i] := Arr.Integers[i];
+    end;
+    Result.RegMax := Obj.Get('reg_max', Result.RegMax);
+    Result.BoxHidden := Obj.Get('box_hidden', Result.BoxHidden);
+    Result.ClsHidden := Obj.Get('cls_hidden', Result.ClsHidden);
+    Result.NumChannels := Obj.Get('num_channels', Result.NumChannels);
+    Result.ImageSize := Obj.Get('image_size', Result.ImageSize);
+    if Obj.IndexOfName('bn_eps') >= 0 then
+      Result.BnEps := Obj.Get('bn_eps', Double(Result.BnEps));
+    if (Result.RegMax <= 0) or (Result.BoxHidden <= 0) or
+       (Result.ClsHidden <= 0) then
+      ImportError('YOLO import: reg_max / box_hidden / cls_hidden must be > 0.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function YoloConfigToString(const Config: TYoloConfig): string;
+begin
+  Result := 'YOLOv8(model_type=' + Config.ModelType +
+    ', widths=[' + IntToStr(Config.Widths[0]) + ',' +
+    IntToStr(Config.Widths[1]) + ',' + IntToStr(Config.Widths[2]) + ',' +
+    IntToStr(Config.Widths[3]) + ',' + IntToStr(Config.Widths[4]) +
+    '], depths=[' + IntToStr(Config.Depths[0]) + ',' +
+    IntToStr(Config.Depths[1]) + '], num_classes=' +
+    IntToStr(Config.NumClasses) + ', reg_max=' + IntToStr(Config.RegMax) +
+    ', image_size=' + IntToStr(Config.ImageSize) + ')';
+end;
+
+// Adds an ultralytics "Conv" module (conv2d no bias -> BN -> SiLU) and returns
+// the conv layer ref so the BN-fold loader can target it. The fold writes the
+// BN shift into the conv bias, so the conv is created WITH a bias slot.
+function YoloAddConv(NN: TNNet; OutCh, K, Stride: integer): TNNetLayer;
+var
+  Pad: integer;
+begin
+  Pad := K div 2;
+  Result := NN.AddLayer(TNNetConvolutionLinear.Create(OutCh, K, Pad, Stride, 0));
+  NN.AddLayer(TNNetSiLU.Create());
+end;
+
+type
+  TYoloConvRef = record Conv: TNNetLayer; InCh, K: integer; Name: string; end;
+  TYoloConvRefArray = array of TYoloConvRef;
+
+procedure YoloPushConv(var Refs: TYoloConvRefArray; Conv: TNNetLayer;
+  InCh, K: integer; const Name: string);
+var n: integer;
+begin
+  n := Length(Refs);
+  SetLength(Refs, n + 1);
+  Refs[n].Conv := Conv; Refs[n].InCh := InCh; Refs[n].K := K; Refs[n].Name := Name;
+end;
+
+// Adds a C2f cross-stage block on NN's last layer and records its convs in Refs.
+// Returns the block output layer. cin/cout = in/out channels, n = bottleneck
+// repeats, shortcut = add residual inside each bottleneck (backbone uses true,
+// neck false). Prefix = ultralytics module prefix e.g. 'model.2'.
+function YoloAddC2f(NN: TNNet; var Refs: TYoloConvRefArray;
+  cin, cout, n: integer; shortcut: boolean; const Prefix: string): TNNetLayer;
+var
+  cmid, j: integer;
+  cv1, Half0, Half1, Cur, Bn1, Bn2, Cat: TNNetLayer;
+  Outs: array of TNNetLayer;
+begin
+  cmid := cout div 2;
+  // cv1: 1x1 -> 2*cmid
+  cv1 := YoloAddConv(NN, 2 * cmid, 1, 1);
+  YoloPushConv(Refs, cv1, cin, 1, Prefix + '.cv1');
+  cv1 := NN.GetLastLayer();    // the SiLU output of cv1 (the 2*cmid tensor)
+  // BOTH halves split the SAME cv1 output (not a chain).
+  Half0 := NN.AddLayerAfter(TNNetSplitChannels.Create(0, cmid), cv1);
+  Half1 := NN.AddLayerAfter(TNNetSplitChannels.Create(cmid, cmid), cv1);
+  SetLength(Outs, 2 + n);
+  Outs[0] := Half0;
+  Outs[1] := Half1;
+  Cur := Half1;
+  for j := 0 to n - 1 do
+  begin
+    Bn1 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(cmid, 3, 1, 1, 0), Cur);
+    YoloPushConv(Refs, Bn1, cmid, 3, Prefix + '.m.' + IntToStr(j) + '.cv1');
+    NN.AddLayer(TNNetSiLU.Create());
+    Bn2 := NN.AddLayer(TNNetConvolutionLinear.Create(cmid, 3, 1, 1, 0));
+    YoloPushConv(Refs, Bn2, cmid, 3, Prefix + '.m.' + IntToStr(j) + '.cv2');
+    NN.AddLayer(TNNetSiLU.Create());
+    if shortcut then
+      NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), Cur]));
+    Cur := NN.GetLastLayer();
+    Outs[2 + j] := Cur;
+  end;
+  Cat := NN.AddLayer(TNNetDeepConcat.Create(Outs));
+  // cv2: 1x1 -> cout
+  Result := NN.AddLayerAfter(
+    TNNetConvolutionLinear.Create(cout, 1, 0, 1, 0), Cat);
+  YoloPushConv(Refs, Result, (2 + n) * cmid, 1, Prefix + '.cv2');
+  NN.AddLayer(TNNetSiLU.Create());
+  Result := NN.GetLastLayer();
+end;
+
+// Adds an SPPF block (1x1 -> 3 chained k5 s1 maxpools kept -> concat -> 1x1).
+function YoloAddSPPF(NN: TNNet; var Refs: TYoloConvRefArray;
+  cin, cout: integer; const Prefix: string): TNNetLayer;
+var
+  cmid: integer;
+  cv1, P1, P2, P3, Cat: TNNetLayer;
+begin
+  cmid := cin div 2;
+  cv1 := YoloAddConv(NN, cmid, 1, 1);
+  YoloPushConv(Refs, cv1, cin, 1, Prefix + '.cv1');
+  cv1 := NN.GetLastLayer();   // SiLU output
+  P1 := NN.AddLayerAfter(TNNetMaxPoolPortable.Create(5, 1, 2), cv1);
+  P2 := NN.AddLayerAfter(TNNetMaxPoolPortable.Create(5, 1, 2), P1);
+  P3 := NN.AddLayerAfter(TNNetMaxPoolPortable.Create(5, 1, 2), P2);
+  Cat := NN.AddLayer(TNNetDeepConcat.Create([cv1, P1, P2, P3]));
+  Result := NN.AddLayerAfter(
+    TNNetConvolutionLinear.Create(cout, 1, 0, 1, 0), Cat);
+  YoloPushConv(Refs, Result, 4 * cmid, 1, Prefix + '.cv2');
+  NN.AddLayer(TNNetSiLU.Create());
+  Result := NN.GetLastLayer();
+end;
+
+function BuildYolo(Reader: TNNetSafeTensorsReader;
+  const Config: TYoloConfig; pInferenceOnly: boolean): TNNet;
+var
+  NN: TNNet;
+  Refs: TYoloConvRefArray;
+  i, OutDim, TotalCells, ci: integer;
+  w0, w1, w2, w3, w4, d0, d1, nc, rm, cb, cc: integer;
+  HeadCh: array[0..2] of integer;
+  HeadIn: array[0..2] of TNNetLayer;
+  StrideTok: array[0..2] of TNNetLayer;
+  P3, P4, P5, N4, H3, H4, H5, T, U, Cat, BoxC, ClsC: TNNetLayer;
+  BoxConv, ClsConv: array[0..2] of array[0..2] of TNNetLayer;
+  Pref: string;
+begin
+  w0 := Config.Widths[0]; w1 := Config.Widths[1]; w2 := Config.Widths[2];
+  w3 := Config.Widths[3]; w4 := Config.Widths[4];
+  d0 := Config.Depths[0]; d1 := Config.Depths[1];
+  nc := Config.NumClasses; rm := Config.RegMax;
+  cb := Config.BoxHidden; cc := Config.ClsHidden;
+  OutDim := 4 * rm + nc;
+  SetLength(Refs, 0);
+  NN := TNNet.Create();
+  try
+    // -------------------- Architecture --------------------
+    NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels));
+    // backbone
+    T := YoloAddConv(NN, w0, 3, 2); YoloPushConv(Refs, T, Config.NumChannels, 3, 'model.0');
+    T := YoloAddConv(NN, w1, 3, 2); YoloPushConv(Refs, T, w0, 3, 'model.1');
+    YoloAddC2f(NN, Refs, w1, w1, d0, True, 'model.2');
+    T := YoloAddConv(NN, w2, 3, 2); YoloPushConv(Refs, T, w1, 3, 'model.3');
+    P3 := YoloAddC2f(NN, Refs, w2, w2, d1, True, 'model.4');     // /8
+    T := YoloAddConv(NN, w3, 3, 2); YoloPushConv(Refs, T, w2, 3, 'model.5');
+    P4 := YoloAddC2f(NN, Refs, w3, w3, d1, True, 'model.6');     // /16
+    T := YoloAddConv(NN, w4, 3, 2); YoloPushConv(Refs, T, w3, 3, 'model.7');
+    YoloAddC2f(NN, Refs, w4, w4, d0, True, 'model.8');
+    P5 := YoloAddSPPF(NN, Refs, w4, w4, 'model.9');              // /32
+    // neck: top-down
+    U := NN.AddLayerAfter(TNNetDeMaxPool.Create(2), P5);       // 2x nearest
+    Cat := NN.AddLayer(TNNetDeepConcat.Create([U, P4]));
+    N4 := YoloAddC2f(NN, Refs, w4 + w3, w3, d0, False, 'model.12');
+    U := NN.AddLayerAfter(TNNetDeMaxPool.Create(2), N4);
+    Cat := NN.AddLayer(TNNetDeepConcat.Create([U, P3]));
+    H3 := YoloAddC2f(NN, Refs, w3 + w2, w2, d0, False, 'model.15');  // head /8
+    // neck: bottom-up
+    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w2, 3, 1, 2, 0), H3);
+    YoloPushConv(Refs, T, w2, 3, 'model.16'); NN.AddLayer(TNNetSiLU.Create());
+    T := NN.GetLastLayer();
+    Cat := NN.AddLayer(TNNetDeepConcat.Create([T, N4]));
+    H4 := YoloAddC2f(NN, Refs, w2 + w3, w3, d0, False, 'model.18');  // head /16
+    T := NN.AddLayerAfter(TNNetConvolutionLinear.Create(w3, 3, 1, 2, 0), H4);
+    YoloPushConv(Refs, T, w3, 3, 'model.19'); NN.AddLayer(TNNetSiLU.Create());
+    T := NN.GetLastLayer();
+    Cat := NN.AddLayer(TNNetDeepConcat.Create([T, P5]));
+    H5 := YoloAddC2f(NN, Refs, w3 + w4, w4, d0, False, 'model.21');  // head /32
+    // -------------------- Detect head --------------------
+    HeadIn[0] := H3; HeadIn[1] := H4; HeadIn[2] := H5;
+    HeadCh[0] := w2; HeadCh[1] := w3; HeadCh[2] := w4;
+    for i := 0 to 2 do
+    begin
+      ci := HeadCh[i];
+      Pref := 'model.22';
+      // box branch cv2[i]: Conv3 -> Conv3 -> Conv2d(4*rm,+bias)
+      BoxConv[i][0] := NN.AddLayerAfter(
+        TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0), HeadIn[i]);
+      YoloPushConv(Refs, BoxConv[i][0], ci, 3, Pref + '.cv2.' + IntToStr(i) + '.0');
+      NN.AddLayer(TNNetSiLU.Create());
+      BoxConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cb, 3, 1, 1, 0));
+      YoloPushConv(Refs, BoxConv[i][1], cb, 3, Pref + '.cv2.' + IntToStr(i) + '.1');
+      NN.AddLayer(TNNetSiLU.Create());
+      BoxConv[i][2] := NN.AddLayer(
+        TNNetConvolutionLinear.Create(4 * rm, 1, 0, 1, 0));
+      BoxC := NN.GetLastLayer();
+      // class branch cv3[i]: Conv3 -> Conv3 -> Conv2d(nc,+bias)
+      ClsConv[i][0] := NN.AddLayerAfter(
+        TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0), HeadIn[i]);
+      YoloPushConv(Refs, ClsConv[i][0], ci, 3, Pref + '.cv3.' + IntToStr(i) + '.0');
+      NN.AddLayer(TNNetSiLU.Create());
+      ClsConv[i][1] := NN.AddLayer(TNNetConvolutionLinear.Create(cc, 3, 1, 1, 0));
+      YoloPushConv(Refs, ClsConv[i][1], cc, 3, Pref + '.cv3.' + IntToStr(i) + '.1');
+      NN.AddLayer(TNNetSiLU.Create());
+      ClsConv[i][2] := NN.AddLayer(TNNetConvolutionLinear.Create(nc, 1, 0, 1, 0));
+      ClsC := NN.GetLastLayer();
+      // per-cell channel layout = [box(4*rm), cls(nc)]
+      Cat := NN.AddLayer(TNNetDeepConcat.Create([BoxC, ClsC]));
+      // flatten (H,W,OutDim) -> (H*W,1,OutDim), row-major (depth-fastest layout)
+      StrideTok[i] := NN.AddLayer(
+        TNNetReshape.Create(Cat.Output.SizeX * Cat.Output.SizeY, 1, OutDim));
+    end;
+    // concat the three strides along the cell axis, then fix the shape.
+    TotalCells := 0;
+    for i := 0 to 2 do
+      TotalCells := TotalCells + StrideTok[i].Output.SizeX;
+    NN.AddLayer(TNNetConcat.Create([StrideTok[0], StrideTok[1], StrideTok[2]]));
+    NN.AddLayer(TNNetReshape.Create(TotalCells, 1, OutDim));
+
+    // -------------------- Weight loading --------------------
+    for i := 0 to High(Refs) do
+      LoadResNetConvFoldBN(Reader, Refs[i].Conv, Refs[i].Name + '.conv.weight',
+        Refs[i].Name + '.bn', Refs[i].Conv.Neurons.Count, Refs[i].InCh,
+        Refs[i].K, Config.BnEps);
+    // head final Conv2d layers carry a real bias and NO BN.
+    for i := 0 to 2 do
+    begin
+      ci := HeadCh[i];
+      LoadMobileNetSEConv(Reader, BoxConv[i][2],
+        'model.22.cv2.' + IntToStr(i) + '.2.weight',
+        'model.22.cv2.' + IntToStr(i) + '.2.bias', 4 * rm, cb);
+      LoadMobileNetSEConv(Reader, ClsConv[i][2],
+        'model.22.cv3.' + IntToStr(i) + '.2.weight',
+        'model.22.cv3.' + IntToStr(i) + '.2.bias', nc, cc);
+    end;
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildYoloFromSafeTensorsEx(const FileName: string;
+  const Config: TYoloConfig; pInferenceOnly: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildYolo(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildYoloFromSafeTensors(const FileName: string;
+  out Config: TYoloConfig; pInferenceOnly: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadYoloConfigFromJSONFile(ConfigPath);
+  Result := BuildYoloFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
+  ScoreThreshold: TNeuralFloat; IoUThreshold: TNeuralFloat): TYoloDetectionArray;
+var
+  s, gx, gy, gw, side, b, k, cls, BestCls, Cnt, Cell, i2, jj: integer;
+  rm, nc, OutDim, Stride: integer;
+  MaxLogit, SumExp, P, BestScore, Dist, Cx, Cy, L, Tp, R, Bp: TNeuralFloat;
+  Dists: array[0..3] of TNeuralFloat;
+  Cand: TYoloDetectionArray;
+  Keep: array of boolean;
+  Tmp: TYoloDetection;
+  Area1, Area2, IX1, IY1, IX2, IY2, IW, IH, Inter, UnionA, IoU: TNeuralFloat;
+begin
+  rm := Config.RegMax; nc := Config.NumClasses; OutDim := 4 * rm + nc;
+  SetLength(Cand, 0);
+  Cell := 0;
+  for s := 0 to 2 do
+  begin
+    Stride := Config.Strides[s];
+    gw := Config.ImageSize div Stride;
+    for gy := 0 to gw - 1 do
+      for gx := 0 to gw - 1 do
+      begin
+        // class logits -> sigmoid; best class.
+        BestCls := 0; BestScore := -1;
+        for cls := 0 to nc - 1 do
+        begin
+          P := 1.0 / (1.0 + Exp(-Output[Cell, 0, 4 * rm + cls]));
+          if P > BestScore then begin BestScore := P; BestCls := cls; end;
+        end;
+        if BestScore >= ScoreThreshold then
+        begin
+          // DFL: each of 4 sides = softmax over rm bins -> expected value.
+          for side := 0 to 3 do
+          begin
+            MaxLogit := Output[Cell, 0, side * rm];
+            for b := 1 to rm - 1 do
+              if Output[Cell, 0, side * rm + b] > MaxLogit then
+                MaxLogit := Output[Cell, 0, side * rm + b];
+            SumExp := 0;
+            for b := 0 to rm - 1 do
+              SumExp := SumExp + Exp(Output[Cell, 0, side * rm + b] - MaxLogit);
+            Dist := 0;
+            for b := 0 to rm - 1 do
+              Dist := Dist + b * Exp(Output[Cell, 0, side * rm + b] - MaxLogit) / SumExp;
+            Dists[side] := Dist;
+          end;
+          // ltrb distances from the cell centre (in grid units), -> xyxy.
+          Cx := gx + 0.5; Cy := gy + 0.5;
+          L := Dists[0]; Tp := Dists[1]; R := Dists[2]; Bp := Dists[3];
+          Cnt := Length(Cand);
+          SetLength(Cand, Cnt + 1);
+          Cand[Cnt].ClassId := BestCls;
+          Cand[Cnt].Score := BestScore;
+          Cand[Cnt].X1 := (Cx - L) * Stride;
+          Cand[Cnt].Y1 := (Cy - Tp) * Stride;
+          Cand[Cnt].X2 := (Cx + R) * Stride;
+          Cand[Cnt].Y2 := (Cy + Bp) * Stride;
+        end;
+        Inc(Cell);
+      end;
+  end;
+  // sort by descending score (selection sort - candidate counts are small).
+  for i2 := 0 to High(Cand) do
+    for jj := i2 + 1 to High(Cand) do
+      if Cand[jj].Score > Cand[i2].Score then
+      begin Tmp := Cand[i2]; Cand[i2] := Cand[jj]; Cand[jj] := Tmp; end;
+  // greedy NMS (class-agnostic by IoU; suppress only same-class overlaps).
+  SetLength(Keep, Length(Cand));
+  for i2 := 0 to High(Cand) do Keep[i2] := True;
+  for i2 := 0 to High(Cand) do
+  begin
+    if not Keep[i2] then Continue;
+    Area1 := Max(0, Cand[i2].X2 - Cand[i2].X1) * Max(0, Cand[i2].Y2 - Cand[i2].Y1);
+    for jj := i2 + 1 to High(Cand) do
+    begin
+      if (not Keep[jj]) or (Cand[jj].ClassId <> Cand[i2].ClassId) then Continue;
+      IX1 := Max(Cand[i2].X1, Cand[jj].X1);
+      IY1 := Max(Cand[i2].Y1, Cand[jj].Y1);
+      IX2 := Min(Cand[i2].X2, Cand[jj].X2);
+      IY2 := Min(Cand[i2].Y2, Cand[jj].Y2);
+      IW := Max(0, IX2 - IX1); IH := Max(0, IY2 - IY1);
+      Inter := IW * IH;
+      Area2 := Max(0, Cand[jj].X2 - Cand[jj].X1) * Max(0, Cand[jj].Y2 - Cand[jj].Y1);
+      UnionA := Area1 + Area2 - Inter;
+      if UnionA > 0 then IoU := Inter / UnionA else IoU := 0;
+      if IoU > IoUThreshold then Keep[jj] := False;
+    end;
+  end;
+  SetLength(Result, 0);
+  for i2 := 0 to High(Cand) do
+    if Keep[i2] then
+    begin
+      k := Length(Result);
+      SetLength(Result, k + 1);
+      Result[k] := Cand[i2];
+    end;
 end;
 
 function BuildDPTFromSafeTensorsEx(const FileName: string;
