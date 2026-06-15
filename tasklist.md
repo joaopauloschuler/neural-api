@@ -432,18 +432,6 @@ rather than acted on.
       make_pico_videomae_fixture.py + examples/VideoAction. Open follow-ups:
       use_mean_pooling=False CLS-token head; DIVIDED space-time attention
       (TimeSformer); the masked-pretraining VideoMAEModel/decoder path.)
-  OLD: VideoMAE / TimeSformer spatiotemporal-transformer importer
-      (BuildVideoMAEFromSafeTensors, e.g. MCG-NJU/videomae-base-finetuned-kinetics)
-      — the FIRST video-classification importer (a clip of T frames -> an action
-      label), the natural pay-off of the landed TNNetConvolution3D layer. Tubelet
-      embedding (a 3-D conv that splits the clip into TxPxP space-time patches —
-      exactly the landed Conv3D primitive) -> the stock transformer encoder stack
-      (reuses the ViT/BERT encoder path) with joint or divided space-time attention
-      (TimeSformer) -> mean-pool + classifier. The only genuinely new code is the
-      tubelet patchifier wiring + the (divided) space-time attention factorization;
-      everything else is landed. Pico parity vs
-      HF float64 on the logits + an examples/VideoAction that classifies a short
-      Moving-MNIST-tubelet or a tiny clip on CPU. First image-sequence-in importer.
 - [X] PixArt-alpha text-to-image importer (BuildPixArtFromSafeTensors, e.g.
       PixArt-alpha/PixArt-XL-2-512x512) — the TEXT-conditioned DiT variant that the
       landed class-conditional DiT importer (BuildDiTFromSafeTensors) explicitly
@@ -847,15 +835,22 @@ rather than acted on.
       backstop mirroring what MMLUEval/PerplexityEval do for the LLM side.
 
 - [ ] End-to-end latent text-to-image generation example (examples/LatentTextToImage)
-      that finally CHAINS the imported generative pieces into one pipeline on CPU:
-      CLIP text encoder (BuildClipFromSafeTensors) -> a latent denoiser (the from
-      DiT importer above, or the SD-UNet noted under the VAE task) -> VAE decoder
-      (BuildVaeDecoderFromSafeTensors) -> RGB, driven by the existing
-      TNNetDiffusionScheduler DDIM/DPM-Solver++ loop with classifier-free guidance
-      (MakeUnconditionalTwin / the CFG follow-up). The individual importers exist but
-      nothing demonstrates the full Stable-Diffusion-style txt2img path; an
-      ulimit-bounded demo that generates one small image from a hard-coded prompt is
-      the capstone proving the CV-generative stack composes. Edit examples/README.md.
+      that finally CHAINS the imported generative pieces into one pipeline on CPU.
+      NOW UNBLOCKED via the landed PixArt path (no SD-UNet needed): T5 text encoder
+      (BuildT5FromSafeTensors) -> PixArt latent denoiser (BuildPixArtFromSafeTensors,
+      LANDED, parity < 1e-4) -> VAE decoder (BuildVaeDecoderFromSafeTensors, LANDED)
+      -> RGB, driven by the existing TNNetDiffusionScheduler DDIM/DPM-Solver++ loop
+      with classifier-free guidance (PixArt uses a null/empty-caption uncond branch).
+      Suggested smaller, doable breakdown:
+  - [ ] Step 1 — wire PixArtConditioning/PixArtDenoise into a multi-step DDIM/
+        DPM-Solver++ sampling loop over caller-supplied T5 states (fixture-only,
+        no real checkpoint): assert no NaN/Inf, produce a latent. Pure offline.
+  - [ ] Step 2 — decode the sampled latent through BuildVaeDecoderFromSafeTensors
+        (latent /0.18215 scaling) to an RGB image; write a PPM/PNG. Fixture VAE.
+  - [ ] Step 3 — add the real T5 tower (BuildT5FromSafeTensors) + CFG (cond vs
+        empty-caption uncond) and a hard-coded prompt; ulimit-bounded demo that
+        generates one small image. The CV-generative-stack-composes capstone.
+      Edit examples/README.md. Mind the 5-min/ulimit budget — default to a smoke run.
 
 - [ ] Mask R-CNN instance-segmentation importer + a RoIAlign primitive
       (BuildMaskRCNNFromSafeTensors, e.g. torchvision maskrcnn_resnet50_fpn) — the
