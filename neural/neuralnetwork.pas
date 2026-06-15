@@ -3240,6 +3240,65 @@ type
     property WeightsSource: TNNetLayer read FWeightsLayer;
   end;
 
+  /// StyleGAN2 weight-modulated / demodulated 2-D convolution (Karras et al.
+  // 2020, "Analyzing and Improving the Image Quality of StyleGAN",
+  // arXiv:1912.04958). This is the genuinely-new style-synthesis PRIMITIVE: a
+  // WEIGHT-SPACE operation, not an activation. Unlike TNNetHyperConv (whose
+  // whole kernel is generated upstream) this layer OWNS a trainable base
+  // convolution kernel and merely SCALES then RENORMALIZES it per forward pass
+  // using a per-input-channel style vector read from a SECOND input source.
+  // TWO sources (wired like TNNetHyperConv / TNNetHyperLinear):
+  //   PrevLayer (main features): a (SizeX, SizeY, InChannels) image tensor.
+  //   StyleSource (style vector s): a flat (1,1,InChannels) per-input-channel
+  //     scale. (StyleGAN2's affine layer "A" maps the w latent -> s; build that
+  //     affine with a stock TNNetPointwiseConvLinear / TNNetFullConnectLinear.)
+  // The owned base kernel w[o,ky,kx,i] lives in FNeurons (one neuron per output
+  // channel o, holding K*K*InChannels weights laid out
+  //   w[o,ky,kx,i] at FNeurons[o].Weights flat offset (ky*K + kx)*InChannels + i)
+  // plus, when not suppressed, a trailing bias neuron FNeurons[OutChannels]
+  // (OutChannels weights b[o]).
+  // Forward (SAME padding, stride 1):
+  //   modulate:   w'[o,ky,kx,i] = s[i] * w[o,ky,kx,i]
+  //   demodulate (Demodulate=true): d[o] = 1/sqrt(sum_{ky,kx,i} w'^2 + eps)
+  //               w''[o,ky,kx,i] = w'[o,ky,kx,i] * d[o]
+  //               (Demodulate=false -> w'' = w', e.g. the toRGB conv)
+  //   y[ox,oy,o] = sum_{ky,kx,i} w''[o,ky,kx,i]*x[ox+kx-pad, oy+ky-pad, i] (+b[o])
+  // Backward routes gradient to THREE places: the owned kernel (FNeurons.Delta,
+  // through the demod normalization), the main feature input (dL/dx), and the
+  // style vector (dL/ds, into the second source, so the mapping/affine trains
+  // end-to-end). The demod backward uses the chain rule through
+  // d[o]=(g[o]+eps)^(-1/2), g[o]=sum w'^2: d d[o]/d w'[o,t] = -d[o]^3 * w'[o,t].
+  // FStruct[0]=OutChannels, FStruct[1]=FeatureSize, FStruct[2]=SuppressBias,
+  // FStruct[3]=Demodulate persist; the StyleSource index is injected into the
+  // source slot (like TNNetConcat) so it round-trips through SaveToString.
+  // SCOPE NOTE (v1): inference-oriented synthesis primitive -- no fused
+  // up/downsampling (use a separate TNNetUpsample), no grouped/minibatch-std.
+  // Coded by Claude (AI).
+  TNNetModulatedConv2D = class(TNNetLayer)
+  private
+    FOutChannels: integer;
+    FFeatureSize: integer;
+    FInChannels: integer;
+    FDemodulate: boolean;
+    FStyleLayer: TNNetLayer;     // explicit per-input-channel style source
+    FModWeights: TNNetVolume;    // cached modulated+demodulated kernel (forward)
+    FDemodScale: TNNetVolume;    // cached per-output-channel demod factor d[o]
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pNumFeatures, pFeatureSize, pSuppressBias,
+      pDemodulate: integer; StyleSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure InitDefault(); override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property OutChannels: integer read FOutChannels;
+    property FeatureSize: integer read FFeatureSize;
+    property InChannels: integer read FInChannels;
+    property Demodulate: boolean read FDemodulate;
+    property StyleSource: TNNetLayer read FStyleLayer;
+  end;
+
   /// Modern (continuous) Hopfield associative-memory layer (Ramsauer et al.
   // 2020, "Hopfield Networks is All You Need", arXiv:2008.02217). Unlike the
   // single-pass attention layers in this tree (TNNetScaledDotProductAttention
@@ -26704,6 +26763,301 @@ begin
   if Assigned(FWeightsLayer) and
      (FWeightsLayer.OutputError.Size = FWeightsLayer.Output.Size) then
     FWeightsLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetModulatedConv2D }
+
+constructor TNNetModulatedConv2D.Create(pNumFeatures, pFeatureSize,
+  pSuppressBias, pDemodulate: integer; StyleSource: TNNetLayer);
+begin
+  inherited Create();
+  FOutChannels := pNumFeatures;
+  FFeatureSize := pFeatureSize;
+  FSuppressBias := pSuppressBias;
+  FDemodulate := (pDemodulate <> 0);
+  if FOutChannels < 1 then
+    FErrorProc('TNNetModulatedConv2D requires NumFeatures >= 1. Got ' +
+      IntToStr(FOutChannels));
+  if FFeatureSize < 1 then
+    FErrorProc('TNNetModulatedConv2D requires FeatureSize >= 1. Got ' +
+      IntToStr(FFeatureSize));
+  if (FFeatureSize mod 2) <> 1 then
+    FErrorProc('TNNetModulatedConv2D requires an ODD FeatureSize (SAME ' +
+      'padding). Got ' + IntToStr(FFeatureSize));
+  if StyleSource = nil then
+    FErrorProc('TNNetModulatedConv2D requires a non-nil StyleSource.');
+  FStruct[0] := FOutChannels;
+  FStruct[1] := FFeatureSize;
+  FStruct[2] := FSuppressBias;
+  if FDemodulate then FStruct[3] := 1 else FStruct[3] := 0;
+  FStyleLayer := StyleSource;
+  if FStyleLayer is TNNetInput then TNNetInput(FStyleLayer).EnableErrorCollection;
+  // Two-source layer: register the extra departing branch on the style source
+  // (the main-features branch is incremented the usual way by AddLayer).
+  FStyleLayer.IncDepartingBranchesCnt();
+  FModWeights := TNNetVolume.Create();
+  FDemodScale := TNNetVolume.Create();
+  FActivationFn := @Identity;
+  FActivationFnDerivative := @IdentityDerivative;
+end;
+
+destructor TNNetModulatedConv2D.Destroy();
+begin
+  FModWeights.Free;
+  FDemodScale.Free;
+  inherited Destroy();
+end;
+
+function TNNetModulatedConv2D.SaveStructureToString(): string;
+begin
+  // Inject the style source layer index into the (otherwise empty) third
+  // ':'-delimited slot, exactly as TNNetHyperConv / TNNetConcatBase do, so
+  // CreateLayer / LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FStyleLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetModulatedConv2D.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  o, tapsPerOut: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FInChannels := pPrevLayer.FOutput.Depth;
+  if FStyleLayer.FOutput.Size <> FInChannels then
+    FErrorProc('TNNetModulatedConv2D requires a StyleSource of size InChannels'+
+      ' = ' + IntToStr(FInChannels) + '. Got size=' +
+      IntToStr(FStyleLayer.FOutput.Size));
+  tapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
+  // One neuron per output channel (K*K*InChannels weights), laid out
+  // w[o,ky,kx,i] at offset (ky*K + kx)*InChannels + i, plus a trailing bias
+  // neuron (OutChannels weights b[o]) unless suppressed.
+  while FNeurons.Count > 0 do FNeurons.Delete(FNeurons.Count - 1);
+  for o := 0 to FOutChannels - 1 do
+  begin
+    FNeurons.Add(TNNetNeuron.Create());
+    FNeurons[o].Weights.ReSize(tapsPerOut, 1, 1);
+    FNeurons[o].BackInertia.ReSize(tapsPerOut, 1, 1);
+    FNeurons[o].Delta.ReSize(tapsPerOut, 1, 1);
+  end;
+  // Bias neuron (always present so the layer round-trips; zeroed and ignored
+  // when SuppressBias).
+  FNeurons.Add(TNNetNeuron.Create());
+  FNeurons[FOutChannels].Weights.ReSize(FOutChannels, 1, 1);
+  FNeurons[FOutChannels].BackInertia.ReSize(FOutChannels, 1, 1);
+  FNeurons[FOutChannels].Delta.ReSize(FOutChannels, 1, 1);
+  FNeurons[FOutChannels].Weights.Fill(0);
+  BuildArrNeurons();
+  InitDefault();
+  // SAME padding, stride 1 -> output keeps the spatial size.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    FOutChannels);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  FModWeights.ReSize(tapsPerOut, 1, FOutChannels);
+  FDemodScale.ReSize(FOutChannels, 1, 1);
+end;
+
+procedure TNNetModulatedConv2D.InitDefault();
+var
+  o, t, tapsPerOut: integer;
+  scale: TNeuralFloat;
+begin
+  if FOutChannels <= 0 then exit;
+  if FNeurons.Count < FOutChannels + 1 then exit;
+  tapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
+  scale := Sqrt(2.0 / (tapsPerOut + 1));
+  for o := 0 to FOutChannels - 1 do
+    for t := 0 to tapsPerOut - 1 do
+      FArrNeurons[o].FWeights.FData[t] := scale * (Random - 0.5) * 2;
+  FNeurons[FOutChannels].Weights.Fill(0);
+end;
+
+procedure TNNetModulatedConv2D.Compute();
+var
+  StartTime: double;
+  X, Style: TNNetVolume;
+  o, ox, oy, ky, kx, i, Base, pad, prevX, prevY: integer;
+  tapsPerOut: integer;
+  Acc, g, wm: TNeuralFloat;
+const
+  cDemodEps = 1e-8;
+begin
+  StartTime := Now();
+  X := FPrevLayer.FOutput;
+  Style := FStyleLayer.FOutput;
+  pad := FFeatureSize div 2;
+  tapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
+  // ---- modulate (+ optional demodulate) the owned base kernel ----
+  for o := 0 to FOutChannels - 1 do
+  begin
+    g := 0;
+    for ky := 0 to FFeatureSize - 1 do
+      for kx := 0 to FFeatureSize - 1 do
+      begin
+        Base := (ky * FFeatureSize + kx) * FInChannels;
+        for i := 0 to FInChannels - 1 do
+        begin
+          wm := Style.FData[i] * FArrNeurons[o].FWeights.FData[Base + i];
+          FModWeights.FData[o * tapsPerOut + Base + i] := wm;
+          g := g + wm * wm;
+        end;
+      end;
+    if FDemodulate then FDemodScale.FData[o] := 1.0 / Sqrt(g + cDemodEps)
+    else FDemodScale.FData[o] := 1.0;
+    if FDemodulate then
+      for i := 0 to tapsPerOut - 1 do
+        FModWeights.FData[o * tapsPerOut + i] :=
+          FModWeights.FData[o * tapsPerOut + i] * FDemodScale.FData[o];
+  end;
+  // ---- SAME-padding stride-1 convolution with the modulated kernel ----
+  FOutput.Fill(0);
+  for o := 0 to FOutChannels - 1 do
+    for oy := 0 to FOutput.SizeY - 1 do
+      for ox := 0 to FOutput.SizeX - 1 do
+      begin
+        Acc := 0;
+        for ky := 0 to FFeatureSize - 1 do
+        begin
+          prevY := oy + ky - pad;
+          if (prevY < 0) or (prevY >= X.SizeY) then continue;
+          for kx := 0 to FFeatureSize - 1 do
+          begin
+            prevX := ox + kx - pad;
+            if (prevX < 0) or (prevX >= X.SizeX) then continue;
+            Base := o * tapsPerOut + (ky * FFeatureSize + kx) * FInChannels;
+            for i := 0 to FInChannels - 1 do
+              Acc := Acc + FModWeights.FData[Base + i] * X.Get(prevX, prevY, i);
+          end;
+        end;
+        if FSuppressBias = 0 then Acc := Acc + FNeurons[FOutChannels].FWeights.FData[o];
+        FOutput.Add(ox, oy, o, Acc);
+      end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetModulatedConv2D.Backpropagate();
+var
+  StartTime: double;
+  X, Style, XErr, StyleErr: TNNetVolume;
+  o, ox, oy, ky, kx, i, Base, pad, prevX, prevY, tapsPerOut: integer;
+  Dy, Xv, lr, dwm, dot, wbase, sv: TNeuralFloat;
+  PropMain, PropStyle, PropW: boolean;
+  GModW, GBias: TNNetVolume;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  X := FPrevLayer.FOutput;
+  Style := FStyleLayer.FOutput;
+  XErr := FPrevLayer.FOutputError;
+  StyleErr := FStyleLayer.FOutputError;
+  pad := FFeatureSize div 2;
+  tapsPerOut := FFeatureSize * FFeatureSize * FInChannels;
+  lr := -FLearningRate;
+  PropMain := (X.Size > 0) and (X.Size = XErr.Size);
+  PropStyle := (StyleErr.Size = Style.Size);
+  PropW := (FLearningRate <> 0.0);
+  StartTime := Now();
+  // GModW[o,t] = dL/d(modulated-and-demodulated weight w''[o,t]) accumulated
+  // from the convolution; then chained back through demod -> modulate to reach
+  // dL/d(base weight) and dL/d(style[i]).
+  GModW := TNNetVolume.Create(tapsPerOut, 1, FOutChannels);
+  GBias := TNNetVolume.Create(FOutChannels, 1, 1);
+  try
+    GModW.Fill(0); GBias.Fill(0);
+    // ---- conv backward: dL/dx and dL/dw'' ----
+    for o := 0 to FOutChannels - 1 do
+      for oy := 0 to FOutput.SizeY - 1 do
+        for ox := 0 to FOutput.SizeX - 1 do
+        begin
+          Dy := FOutputError.Get(ox, oy, o);
+          if FSuppressBias = 0 then GBias.FData[o] := GBias.FData[o] + Dy;
+          if Dy = 0 then continue;
+          for ky := 0 to FFeatureSize - 1 do
+          begin
+            prevY := oy + ky - pad;
+            if (prevY < 0) or (prevY >= X.SizeY) then continue;
+            for kx := 0 to FFeatureSize - 1 do
+            begin
+              prevX := ox + kx - pad;
+              if (prevX < 0) or (prevX >= X.SizeX) then continue;
+              Base := (ky * FFeatureSize + kx) * FInChannels;
+              for i := 0 to FInChannels - 1 do
+              begin
+                // dL/dx += w''[o,t] * dy
+                if PropMain then
+                  XErr.Add(prevX, prevY, i,
+                    FModWeights.FData[o * tapsPerOut + Base + i] * Dy);
+                // dL/dw''[o,t] += x * dy
+                Xv := X.Get(prevX, prevY, i);
+                GModW.FData[o * tapsPerOut + Base + i] :=
+                  GModW.FData[o * tapsPerOut + Base + i] + Xv * Dy;
+              end;
+            end;
+          end;
+        end;
+    // ---- chain through demod + modulate, per output channel ----
+    // Let s=style, w=base, w'=s_i*w (modulate), d=(sum w'^2 + eps)^-1/2,
+    // w''=d*w' (when demod). Then for any modulated tap w'[o,t]:
+    //   dL/dw'[o,t] = d*GModW[o,t] + (dd/dw'[o,t]) * sum_u (GModW[o,u]*w'[o,u])
+    //   dd/dw'[o,t] = -d^3 * w'[o,t]
+    //   => dL/dw'[o,t] = d*GModW[o,t] - d^3 * w'[o,t] * dot,  dot=sum GModW*w'
+    // (demod=false: d=1, dot term drops, dL/dw'=GModW.)
+    // Then dL/dw[o,t] = s_i * dL/dw'[o,t]; dL/ds_i += w[o,t] * dL/dw'[o,t].
+    if PropW or PropStyle then
+      for o := 0 to FOutChannels - 1 do
+      begin
+        dot := 0;
+        if FDemodulate then
+          for i := 0 to tapsPerOut - 1 do
+            dot := dot + GModW.FData[o * tapsPerOut + i] *
+              (FModWeights.FData[o * tapsPerOut + i] / FDemodScale.FData[o]);
+        // note: FModWeights holds w''=d*w'; recover w'=w''/d via /FDemodScale.
+        for ky := 0 to FFeatureSize - 1 do
+          for kx := 0 to FFeatureSize - 1 do
+          begin
+            Base := (ky * FFeatureSize + kx) * FInChannels;
+            for i := 0 to FInChannels - 1 do
+            begin
+              sv := Style.FData[i];
+              wbase := FArrNeurons[o].FWeights.FData[Base + i];
+              // dL/dw'[o,t]
+              if FDemodulate then
+                dwm := FDemodScale.FData[o] * GModW.FData[o * tapsPerOut + Base + i]
+                  - FDemodScale.FData[o] * FDemodScale.FData[o] * FDemodScale.FData[o]
+                    * (sv * wbase) * dot
+              else
+                dwm := GModW.FData[o * tapsPerOut + Base + i];
+              // dL/d(base weight) = s_i * dwm  -> Delta (LR-scaled, negated)
+              if PropW then
+                FArrNeurons[o].FDelta.FData[Base + i] :=
+                  FArrNeurons[o].FDelta.FData[Base + i] + lr * (sv * dwm);
+              // dL/d(style[i]) += w_base * dwm
+              if PropStyle then
+                StyleErr.FData[i] := StyleErr.FData[i] + wbase * dwm;
+            end;
+          end;
+        // bias delta
+        if PropW and (FSuppressBias = 0) then
+          FArrNeurons[FOutChannels].FDelta.FData[o] :=
+            FArrNeurons[FOutChannels].FDelta.FData[o] + lr * GBias.FData[o];
+      end;
+  finally
+    GModW.Free;
+    GBias.Free;
+  end;
+  if (PropW) and (not FBatchUpdate) then
+  begin
+    for o := 0 to FOutChannels do
+      FArrNeurons[o].UpdateWeightsWithoutInertia();
+    AfterWeightUpdate();
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  // Propagate into BOTH sources (style branch then main features).
+  if Assigned(FStyleLayer) and
+     (FStyleLayer.OutputError.Size = FStyleLayer.Output.Size) then
+    FStyleLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -88770,7 +89124,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetScaledDotProductAttention') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -88914,6 +89268,7 @@ begin
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
       'TNNetHyperConv' :            Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]);
+      'TNNetModulatedConv2D' :      Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]);
       'TNNetCosineSimilarityAttention' : Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1);
       'TNNetQKNormAttention' :      Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]);
       'TNNetT5RelPosBiasAttention' : Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]);
@@ -89316,6 +89671,7 @@ begin
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetHyperConv' then Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]) else
+      if S[0] = 'TNNetModulatedConv2D' then Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]) else
       if S[0] = 'TNNetCosineSimilarityAttention' then Result := TNNetCosineSimilarityAttention.Create(St[0], St[1] = 1, Ft[0], St[2] = 1) else
       if S[0] = 'TNNetQKNormAttention' then Result := TNNetQKNormAttention.Create(St[0], St[1] = 1, Ft[0]) else
       if S[0] = 'TNNetT5RelPosBiasAttention' then Result := TNNetT5RelPosBiasAttention.Create(St[0], St[1] = 1, St[3], St[4], St[2]) else

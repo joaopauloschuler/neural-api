@@ -320,6 +320,8 @@ type
     procedure TestDiTParity;
     procedure TestDiTSchedulerSmoke;
     procedure TestRRDBNetParity;
+    procedure TestStyleGAN2ConfigFromJSONFile;
+    procedure TestStyleGAN2GeneratorParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
     procedure TestWhisperLogMelFrontend;
@@ -15406,6 +15408,96 @@ begin
   finally
     RefRoot.Free;
     ImgInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadStyleGAN2ConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestStyleGAN2ConfigFromJSONFile;
+var
+  Config: TStyleGAN2Config;
+begin
+  Config := ReadStyleGAN2ConfigFromJSONFile(
+    FixturePath('tiny_stylegan2_config.json'));
+  AssertEquals('model_type', 'stylegan2', Config.ModelType);
+  AssertEquals('latent_dim', 8, Config.LatentDim);
+  AssertEquals('mapping_layers', 3, Config.MappingLayers);
+  AssertEquals('start_size', 4, Config.StartSize);
+  AssertEquals('num_blocks', 3, Config.NumBlocks);
+  AssertEquals('channels', 6, Config.Channels);
+  AssertEquals('num_out_ch', 3, Config.NumOutCh);
+end;
+
+// Parity test for the StyleGAN2 generator importer (BuildStyleGAN2Generator)
+// against the committed tiny float64 numpy oracle
+// (tools/make_pico_stylegan2_fixture.py: latent 8, mapping 3, start 4, 3 blocks
+// 4->8->16, channels 6, out_ch 3). The official weights are not obtainable
+// offline; the fixture is a config-faithful random generator + a hand-written
+// float64 oracle of the EXACT modulated-conv + demod + noise + toRGB-skip math.
+// Exercises: the new TNNetModulatedConv2D primitive (modulate/demodulate on the
+// conv blocks, modulate-only on the 1x1 toRGB), the per-input-channel style
+// affine "A", nearest-x2 upsampling (TNNetDeMaxPool), learned per-pixel noise
+// injection (TNNetReZero strength) and the upsampled toRGB skip tower. The
+// learned constant + fixed noise maps live in the safetensors and are pre-filled
+// by the importer, so the only fed input is the latent z. Asserts < 1e-4 on the
+// FULL (num_out_ch, FinalSize, FinalSize) generated image.
+procedure TTestNeuralPretrained.TestStyleGAN2GeneratorParity;
+var
+  NN: TNNet;
+  Config: TStyleGAN2Config;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, OneCase, ZArr, OutArr: TJSONArray;
+  CaseObj: TJSONObject;
+  ZInput, Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, x, yy, c, FlatIdx, FinalSize: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildStyleGAN2GeneratorFromSafeTensors(
+    FixturePath('tiny_stylegan2.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_stylegan2_config.json'));
+  RefJson := TStringList.Create;
+  ZInput := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  try
+    AssertTrue('net built', NN <> nil);
+    FinalSize := Config.StartSize shl (Config.NumBlocks - 1);
+    AssertEquals('output grid', FinalSize, NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.NumOutCh,
+      NN.GetLastLayer().Output.Depth);
+    RefJson.LoadFromFile(FixturePath('tiny_stylegan2_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      ZArr := TJSONArray(CaseObj.Find('z'));
+      OutArr := TJSONArray(CaseObj.Find('output')); // flat (out_ch, H, W)
+      ZInput.ReSize(Config.LatentDim, 1, 1);
+      for c := 0 to Config.LatentDim - 1 do
+        ZInput.FData[c] := ZArr.Items[c].AsFloat;
+      NN.Compute(ZInput);
+      Output := NN.GetLastLayer().Output;
+      for c := 0 to Config.NumOutCh - 1 do
+        for yy := 0 to FinalSize - 1 do
+          for x := 0 to FinalSize - 1 do
+          begin
+            FlatIdx := c * FinalSize * FinalSize + yy * FinalSize + x;
+            RefVal := OutArr.Items[FlatIdx].AsFloat;
+            GotVal := Output.FData[(yy * FinalSize + x) * Config.NumOutCh + c];
+            Diff := Abs(GotVal - RefVal);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+    end;
+    AssertTrue('StyleGAN2 image: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ZInput.Free;
     RefJson.Free;
     NN.Free;
   end;

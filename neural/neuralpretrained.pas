@@ -6259,6 +6259,56 @@ function BuildRRDBNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// StyleGAN2 GENERATOR IMPORT (model_type "stylegan2") -- the repo's FIRST
+// STYLE-BASED generative synthesis importer (Karras et al. 2020,
+// arXiv:1912.04958). INFERENCE-ONLY synthesis: an 8-layer mapping MLP turns a
+// latent z into a w latent; the synthesis network grows an image from a learned
+// constant through a tower of resolution blocks, each made of
+//   upsample (except the first block) -> [modulated/demodulated conv (the new
+//   TNNetModulatedConv2D primitive) + per-pixel noise injection (scaled by a
+//   learned strength) + LeakyReLU(0.2)]  (1 conv on the first block, 2 after) ->
+//   a toRGB modulated conv (NO demod) summed into an upsampled RGB skip tower.
+// Each modulated conv reads a per-input-channel style vector produced by a small
+// affine layer "A" (FullConnect) from w. NO discriminator / path-length reg /
+// training (v1). The official weights are not redistributable; pico fixtures are
+// CONFIG-FAITHFUL random generators checked against a hand-written float64 oracle
+// (tools/make_pico_stylegan2_fixture.py).
+// Coded by Claude (AI).
+type
+  TStyleGAN2Config = record
+    LatentDim: integer;       // z_dim / w_dim (mapping in & out width)
+    MappingLayers: integer;   // mapping MLP depth (StyleGAN2 default 8)
+    StartSize: integer;       // base constant spatial size (4)
+    NumBlocks: integer;       // resolution blocks (each after the first = x2)
+    Channels: integer;        // feature channels per block (constant in v1)
+    NumOutCh: integer;        // RGB output channels (3)
+    ModelType: string;        // 'stylegan2'
+  end;
+
+// Reads a StyleGAN2 generator config. Required: latent_dim, num_blocks,
+// channels. Optional: mapping_layers (8), start_size (4), num_out_ch (3),
+// model_type ('stylegan2').
+function ReadStyleGAN2ConfigFromJSONFile(
+  const FileName: string): TStyleGAN2Config;
+
+function StyleGAN2ConfigToString(const Config: TStyleGAN2Config): string;
+
+// Builds the StyleGAN2 generator described by Config and loads every weight from
+// Reader (caller owns Reader). INPUT 0 = latent z (LatentDim,1,1). INPUTS 1..N =
+// per-block per-pixel noise maps (one (Size,Size,1) image per modulated conv,
+// in synthesis order). OUTPUT = a (FinalSize, FinalSize, NumOutCh) raw RGB
+// image, FinalSize = StartSize * 2^(NumBlocks-1).
+function BuildStyleGAN2Generator(Reader: TNNetSafeTensorsReader;
+  const Config: TStyleGAN2Config; pInferenceOnly: boolean = false): TNNet;
+
+function BuildStyleGAN2GeneratorFromSafeTensorsEx(const FileName: string;
+  const Config: TStyleGAN2Config; pInferenceOnly: boolean = false): TNNet;
+
+function BuildStyleGAN2GeneratorFromSafeTensors(const FileName: string;
+  out Config: TStyleGAN2Config; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // DINOv2 SELF-SUPERVISED ViT IMPORT (model_type "dinov2") for general-purpose
 // VISUAL EMBEDDINGS (facebook/dinov2-{small,base,large}). The architecture is
 // the same pre-LN ViT encoder path as the plain "vit" importer above (reusing
@@ -38806,6 +38856,351 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRRDBNetConfigFromJSONFile(ConfigPath);
   Result := BuildRRDBNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// StyleGAN2 GENERATOR IMPORT (model_type "stylegan2")
+// ===========================================================================
+
+function ReadStyleGAN2ConfigFromJSONFile(
+  const FileName: string): TStyleGAN2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('StyleGAN2 import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('StyleGAN2 import: config field "' + FieldName +
+        '" must be a positive integer, got ' + Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('StyleGAN2 import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('StyleGAN2 import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('StyleGAN2 import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'stylegan2');
+    Result.LatentDim := RequiredInt('latent_dim');
+    Result.NumBlocks := RequiredInt('num_blocks');
+    Result.Channels := RequiredInt('channels');
+    Result.MappingLayers := Obj.Get('mapping_layers', 8);
+    Result.StartSize := Obj.Get('start_size', 4);
+    Result.NumOutCh := Obj.Get('num_out_ch', 3);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function StyleGAN2ConfigToString(const Config: TStyleGAN2Config): string;
+begin
+  Result := Config.ModelType + ' config: latent_dim=' +
+    IntToStr(Config.LatentDim) +
+    ', mapping_layers=' + IntToStr(Config.MappingLayers) +
+    ', start_size=' + IntToStr(Config.StartSize) +
+    ', num_blocks=' + IntToStr(Config.NumBlocks) +
+    ', channels=' + IntToStr(Config.Channels) +
+    ', num_out_ch=' + IntToStr(Config.NumOutCh) +
+    ', final_size=' + IntToStr(Config.StartSize shl (Config.NumBlocks - 1));
+end;
+
+// Loads an nn.Linear [out,in](+bias[out]) into a TNNetFullConnectLinear.
+procedure LoadStyleGAN2Linear(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; OutDim, InDim: integer);
+var
+  W, B: TNNetVolume;
+  j, i: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('StyleGAN2 import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) then
+    ImportError('StyleGAN2 import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + '], got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('StyleGAN2 import: layer for "' + WName + '" has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if BName <> '' then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('StyleGAN2 import: missing bias tensor "' + BName + '".');
+      Reader.LoadTensorFlat(BName, B);
+      if B.Size <> OutDim then
+        ImportError('StyleGAN2 import: bias "' + BName + '" must have ' +
+          IntToStr(OutDim) + ' elements, got ' + IntToStr(B.Size) + '.');
+    end;
+    for j := 0 to OutDim - 1 do
+    begin
+      for i := 0 to InDim - 1 do
+        Layer.Neurons[j].Weights.FData[i] := W.FData[j * InDim + i];
+      if BName <> '' then Layer.Neurons[j].BiasWeight := B.FData[j]
+      else Layer.Neurons[j].BiasWeight := 0;
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+// Loads a Conv2d [out,in,K,K] kernel + optional [out] bias into a
+// TNNetModulatedConv2D (kernel -> per-output neuron, bias -> FNeurons[OutCh]).
+procedure LoadStyleGAN2ModConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetModulatedConv2D; const WName, BName: string;
+  OutCh, InCh, K: integer);
+var
+  W, B: TNNetVolume;
+  o, c, ky, kx: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('StyleGAN2 import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> OutCh) or
+     (Reader.DimSize(WName, 1) <> InCh) or
+     (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError('StyleGAN2 import: "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ',' + IntToStr(InCh) + ',' + IntToStr(K) + ',' +
+      IntToStr(K) + '], got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutCh + 1 then
+    ImportError('StyleGAN2 import: modconv "' + WName + '" target has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh + 1) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for o := 0 to OutCh - 1 do
+      for ky := 0 to K - 1 do
+        for kx := 0 to K - 1 do
+          for c := 0 to InCh - 1 do
+            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+              W.FData[((o * InCh + c) * K + ky) * K + kx];
+    Layer.Neurons[OutCh].Weights.Fill(0);
+    if BName <> '' then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('StyleGAN2 import: missing bias tensor "' + BName + '".');
+      Reader.LoadTensorFlat(BName, B);
+      if B.Size <> OutCh then
+        ImportError('StyleGAN2 import: bias "' + BName + '" must have ' +
+          IntToStr(OutCh) + ' elements, got ' + IntToStr(B.Size) + '.');
+      for o := 0 to OutCh - 1 do Layer.Neurons[OutCh].Weights.FData[o] := B.FData[o];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+function BuildStyleGAN2Generator(Reader: TNNetSafeTensorsReader;
+  const Config: TStyleGAN2Config; pInferenceOnly: boolean = false): TNNet;
+type
+  TConvRefs = record
+    Affine: TNNetLayer;
+    ModConv: TNNetModulatedConv2D;
+    Noise: TNNetLayer;
+    NoiseScale: TNNetLayer;
+  end;
+var
+  NN: TNNet;
+  ConstInput, WLatent, Feat, RGB, PrevRGB: TNNetLayer;
+  MapFC: array of TNNetLayer;
+  ToRGBAffine: array of TNNetLayer;
+  ToRGBConv: array of TNNetModulatedConv2D;
+  Convs: array of array of TConvRefs;  // [block][convIdx]
+  ConstW, NoiseW: TNNetVolume;
+  b, c, l, nConv, size, ch, lat, gridSize, noiseIdx: integer;
+  pfx: string;
+
+  function AddConvPass(const Prefix: string): TConvRefs;
+  begin
+    Result.Affine := NN.AddLayerAfter(
+      TNNetFullConnectLinear.Create(ch), WLatent);
+    Result.ModConv := TNNetModulatedConv2D.Create(ch, 3, 0, 1, Result.Affine);
+    NN.AddLayerAfter(Result.ModConv, Feat);
+    Feat := Result.ModConv;
+    // Per-pixel noise injection: noise input (size,size,1) -> learned scalar
+    // strength (TNNetReZero) -> Sum into the conv output (broadcast over depth
+    // is handled because the noise depth is 1 and TNNetSum broadcasts? -- no:
+    // build a noise map of full depth so Sum is element-wise on (size,size,ch)).
+    Result.Noise := NN.AddLayerAfter(
+      TNNetInput.Create(size, size, ch, 1), 0);
+    Result.NoiseScale := NN.AddLayerAfter(TNNetReZero.Create(), Result.Noise);
+    Feat := NN.AddLayerAfter(TNNetSum.Create([Feat, Result.NoiseScale]), Feat);
+    Feat := NN.AddLayerAfter(TNNetLeakyReLU.Create(0.2), Feat);
+  end;
+
+begin
+  if Config.LatentDim < 1 then
+    ImportError('StyleGAN2 import: latent_dim must be >= 1.');
+  if Config.NumBlocks < 1 then
+    ImportError('StyleGAN2 import: num_blocks must be >= 1.');
+  if Config.Channels < 1 then
+    ImportError('StyleGAN2 import: channels must be >= 1.');
+  if Config.MappingLayers < 1 then
+    ImportError('StyleGAN2 import: mapping_layers must be >= 1.');
+  lat := Config.LatentDim;
+  ch := Config.Channels;
+  NN := TNNet.Create();
+  SetLength(MapFC, Config.MappingLayers);
+  SetLength(ToRGBAffine, Config.NumBlocks);
+  SetLength(ToRGBConv, Config.NumBlocks);
+  SetLength(Convs, Config.NumBlocks);
+  ConstW := TNNetVolume.Create();
+  NoiseW := TNNetVolume.Create();
+  try
+    // -------- Inputs: [0]=z latent, [1]=learned constant --------
+    NN.AddLayer( TNNetInput.Create(lat, 1, 1, 1) );          // layer 0 = z
+    ConstInput := NN.AddLayerAfter(
+      TNNetInput.Create(Config.StartSize, Config.StartSize, ch, 1), 0); // const
+    // -------- Mapping network: z -> w --------
+    WLatent := NN.Layers[0];
+    for l := 0 to Config.MappingLayers - 1 do
+    begin
+      MapFC[l] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(lat), WLatent);
+      WLatent := NN.AddLayer(TNNetLeakyReLU.Create(0.2));
+    end;
+    // -------- Synthesis network --------
+    Feat := ConstInput;
+    PrevRGB := nil;
+    for b := 0 to Config.NumBlocks - 1 do
+    begin
+      size := Config.StartSize shl b;
+      if b > 0 then
+        Feat := NN.AddLayerAfter( TNNetDeMaxPool.Create(2), Feat ); // nearest x2
+      if b = 0 then nConv := 1 else nConv := 2;
+      SetLength(Convs[b], nConv);
+      for c := 0 to nConv - 1 do
+        Convs[b][c] := AddConvPass('block.' + IntToStr(b) + '.conv.' +
+          IntToStr(c) + '.');
+      // toRGB: modulated 1x1 conv (no demod) -> RGB, summed with upsampled skip.
+      ToRGBAffine[b] := NN.AddLayerAfter(TNNetFullConnectLinear.Create(ch), WLatent);
+      ToRGBConv[b] := TNNetModulatedConv2D.Create(Config.NumOutCh, 1, 0, 0,
+        ToRGBAffine[b]);
+      NN.AddLayerAfter(ToRGBConv[b], Feat);
+      RGB := ToRGBConv[b];
+      if PrevRGB <> nil then
+      begin
+        PrevRGB := NN.AddLayerAfter(TNNetDeMaxPool.Create(2), PrevRGB);
+        RGB := NN.AddLayerAfter(TNNetSum.Create([ToRGBConv[b], PrevRGB]),
+          ToRGBConv[b]);
+      end;
+      PrevRGB := RGB;
+    end;
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // -------- Weights --------
+    for l := 0 to Config.MappingLayers - 1 do
+      LoadStyleGAN2Linear(Reader, MapFC[l],
+        'mapping.' + IntToStr(l) + '.weight', 'mapping.' + IntToStr(l) + '.bias',
+        lat, lat);
+    // Learned constant (stored CHW [ch,start,start]) -> ConstInput.Output.
+    if not Reader.HasTensor('const') then
+      ImportError('StyleGAN2 import: missing tensor "const".');
+    Reader.LoadTensorFlat('const', ConstW);
+    if ConstW.Size <> ch * Config.StartSize * Config.StartSize then
+      ImportError('StyleGAN2 import: "const" size mismatch.');
+    gridSize := Config.StartSize * Config.StartSize;
+    for c := 0 to ch - 1 do
+      for l := 0 to gridSize - 1 do
+        ConstInput.Output.FData[l * ch + c] := ConstW.FData[c * gridSize + l];
+
+    noiseIdx := 0;
+    for b := 0 to Config.NumBlocks - 1 do
+    begin
+      size := Config.StartSize shl b;
+      for c := 0 to Length(Convs[b]) - 1 do
+      begin
+        pfx := 'block.' + IntToStr(b) + '.conv.' + IntToStr(c) + '.';
+        LoadStyleGAN2Linear(Reader, Convs[b][c].Affine, pfx + 'affine.weight',
+          pfx + 'affine.bias', ch, lat);
+        LoadStyleGAN2ModConv(Reader, Convs[b][c].ModConv, pfx + 'weight',
+          pfx + 'bias', ch, ch, 3);
+        // noise_strength scalar -> ReZero alpha (FNeurons[0].Weights[0]).
+        if not Reader.HasTensor(pfx + 'noise_strength') then
+          ImportError('StyleGAN2 import: missing "' + pfx + 'noise_strength".');
+        Reader.LoadTensorFlat(pfx + 'noise_strength', NoiseW);
+        EnsureWritableImportWeights(Convs[b][c].NoiseScale);
+        Convs[b][c].NoiseScale.Neurons[0].Weights.FData[0] := NoiseW.FData[0];
+        Convs[b][c].NoiseScale.FlushWeightCache();
+        // Fixed per-pixel noise map (stored CHW [ch,size,size]) -> noise input.
+        if not Reader.HasTensor(pfx + 'noise') then
+          ImportError('StyleGAN2 import: missing "' + pfx + 'noise".');
+        Reader.LoadTensorFlat(pfx + 'noise', NoiseW);
+        if NoiseW.Size <> ch * size * size then
+          ImportError('StyleGAN2 import: "' + pfx + 'noise" size mismatch.');
+        for l := 0 to ch - 1 do
+          for noiseIdx := 0 to size * size - 1 do
+            Convs[b][c].Noise.Output.FData[noiseIdx * ch + l] :=
+              NoiseW.FData[l * size * size + noiseIdx];
+      end;
+      pfx := 'block.' + IntToStr(b) + '.torgb.';
+      LoadStyleGAN2Linear(Reader, ToRGBAffine[b], pfx + 'affine.weight',
+        pfx + 'affine.bias', ch, lat);
+      LoadStyleGAN2ModConv(Reader, ToRGBConv[b], pfx + 'weight', pfx + 'bias',
+        Config.NumOutCh, ch, 1);
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+  ConstW.Free;
+  NoiseW.Free;
+end;
+
+function BuildStyleGAN2GeneratorFromSafeTensorsEx(const FileName: string;
+  const Config: TStyleGAN2Config; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildStyleGAN2Generator(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildStyleGAN2GeneratorFromSafeTensors(const FileName: string;
+  out Config: TStyleGAN2Config; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadStyleGAN2ConfigFromJSONFile(ConfigPath);
+  Result := BuildStyleGAN2GeneratorFromSafeTensorsEx(FileName, Config,
+    pInferenceOnly);
 end;
 
 // ===========================================================================

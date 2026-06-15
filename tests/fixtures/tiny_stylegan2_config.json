@@ -1,0 +1,9 @@
+{
+  "model_type": "stylegan2",
+  "latent_dim": 8,
+  "mapping_layers": 3,
+  "start_size": 4,
+  "num_blocks": 3,
+  "channels": 6,
+  "num_out_ch": 3
+}

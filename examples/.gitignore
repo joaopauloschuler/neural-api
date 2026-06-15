@@ -83,3 +83,12 @@ ConsistencyDistill/run*.log
 ConsistencyDistill/run*.time
 ConsistencyDistill/time.log
 ConsistencyDistill/*.nn
+
+# StyleGAN2Generate: compiled style-based generator synthesis demo binary,
+# build artifacts, and generated sample image
+StyleGAN2Generate/StyleGAN2Generate
+StyleGAN2Generate/*.o
+StyleGAN2Generate/*.ppu
+StyleGAN2Generate/*.ppr
+StyleGAN2Generate/*.ppm
+StyleGAN2Generate/*.png

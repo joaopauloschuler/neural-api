@@ -952,6 +952,11 @@ type
     procedure TestHyperConvGeneratedKernelGradientCheck;
     procedure TestHyperConvLoadFromString;
     procedure TestAddHyperConvBuilder;
+    procedure TestModulatedConv2DMainInputGradientCheck;
+    procedure TestModulatedConv2DWeightGradientCheck;
+    procedure TestModulatedConv2DStyleGradientCheck;
+    procedure TestModulatedConv2DNoDemodWeightGradientCheck;
+    procedure TestModulatedConv2DLoadFromString;
     procedure TestScatterToAffineForwardAndShearZero;
     procedure TestScatterToAffineInputGradientCheck;
     procedure TestScatterToAffineLoadFromString;
@@ -18507,6 +18512,396 @@ begin
     end;
   finally
     NN.Free; XData.Free; WData.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// TNNetModulatedConv2D (StyleGAN2 modulated/demodulated conv) gradient checks.
+// Layer OWNS its base conv kernel (FNeurons) and reads a per-input-channel
+// style vector from a SECOND input. We finite-difference d(loss) w.r.t. (a) the
+// main image input, (b) the OWNED kernel weights through the demod
+// normalization, (c) the style vector (second source). Inputs/weights are
+// bounded small so the central-difference signal stays above the FP32
+// cancellation floor -- DO NOT loosen the tolerance.
+// ---------------------------------------------------------------------------
+
+procedure TTestNeuralNumerical.TestModulatedConv2DMainInputGradientCheck;
+var
+  NN: TNNet;
+  XInput, SInput: TNNetLayer;
+  XData, XPlus, SData, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AX: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(AX);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 3;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  XPlus := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  Desired := TNNetVolume.Create(SizeXY, SizeXY, OutC); // SAME padding keeps size
+  epsilon := 0.001; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput), XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
+    for i := 0 to SData.Size - 1 do SData.Raw[i] := Cos(i * 0.41) * 0.5 + 0.7;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+
+    for i := 0 to XData.Size - 1 do
+    begin
+      XPlus.Copy(XData);
+      XPlus.Raw[i] := XData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(XPlus);
+      XPlus.Raw[i] := XData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(XPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      XInput.Output.Copy(XData);
+      SInput.Output.Copy(SData);
+      NN.Compute(XInput.Output);
+      XInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := XInput.OutputError.Raw[i];
+
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ModulatedConv2D main-input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestModulatedConv2DMainInputGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; XPlus.Free; SData.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedConv2DWeightGradientCheck;
+// The headline gradient: d(loss)/d(OWNED base kernel) THROUGH the demodulation
+// normalization (demod=true). Read from Conv.Neurons[o].Delta (LR=1 => grad =
+// -Delta). Also covers the bias neuron (FNeurons[OutChannels]).
+var
+  NN: TNNet;
+  XInput, SInput: TNNetLayer;
+  Conv: TNNetModulatedConv2D;
+  XData, SData, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, o, w, tapsPerOut: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+  procedure DoBackward();
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    NN.ClearDeltas();
+    NN.Backpropagate(Desired);
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 3;
+  tapsPerOut := KSz * KSz * InC;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  Desired := TNNetVolume.Create(SizeXY, SizeXY, OutC);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    Conv := TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput);
+    NN.AddLayerAfter(Conv, XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for o := 0 to XData.Size - 1 do XData.Raw[o] := Sin(o * 0.53) * 0.6 + 0.1;
+    for o := 0 to SData.Size - 1 do SData.Raw[o] := Cos(o * 0.41) * 0.5 + 0.7;
+    // Bound the kernel small so demod is well conditioned and FD is clean.
+    for o := 0 to OutC - 1 do
+      for w := 0 to tapsPerOut - 1 do
+        Conv.Neurons[o].Weights.Raw[w] := 0.4 * Sin(o * 1.7 + w * 0.6 + 0.2);
+    for o := 0 to OutC - 1 do Conv.Neurons[OutC].Weights.Raw[o] := 0.1 * (o + 1);
+    for o := 0 to Desired.Size - 1 do Desired.Raw[o] := Cos(o * 0.31) * 0.5;
+
+    // Owned kernel weights.
+    for o := 0 to OutC - 1 do
+      for w := 0 to tapsPerOut - 1 do
+      begin
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] + epsilon;
+        lossPlus := ComputeLoss();
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] - 2 * epsilon;
+        lossMinus := ComputeLoss();
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        DoBackward();
+        analyticalGrad := -Conv.Neurons[o].Delta.Raw[w];
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+        AssertTrue('ModulatedConv2D weight grad o=' + IntToStr(o) + ' w=' +
+          IntToStr(w) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    // Bias.
+    for o := 0 to OutC - 1 do
+    begin
+      Conv.Neurons[OutC].Weights.Raw[o] := Conv.Neurons[OutC].Weights.Raw[o] + epsilon;
+      lossPlus := ComputeLoss();
+      Conv.Neurons[OutC].Weights.Raw[o] := Conv.Neurons[OutC].Weights.Raw[o] - 2 * epsilon;
+      lossMinus := ComputeLoss();
+      Conv.Neurons[OutC].Weights.Raw[o] := Conv.Neurons[OutC].Weights.Raw[o] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+      DoBackward();
+      analyticalGrad := -Conv.Neurons[OutC].Delta.Raw[o];
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ModulatedConv2D bias grad o=' + IntToStr(o) + ' num=' +
+        FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestModulatedConv2DWeightGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; SData.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedConv2DStyleGradientCheck;
+// d(loss)/d(style vector) (the SECOND source). The style scale enters the
+// modulated weights w'=s_i*w then the demod normalization, so this exercises
+// the full chain back into the style branch (= what trains the mapping/affine).
+var
+  NN: TNNet;
+  XInput, SInput: TNNetLayer;
+  XData, SData, SPlus, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, i: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AStyleV: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(AStyleV);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 3; OutC := 2; KSz := 3;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  SPlus := TNNetVolume.Create(InC, 1, 1);
+  Desired := TNNetVolume.Create(SizeXY, SizeXY, OutC);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput), XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
+    for i := 0 to SData.Size - 1 do SData.Raw[i] := Cos(i * 0.41) * 0.5 + 0.7;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31) * 0.5;
+
+    for i := 0 to SData.Size - 1 do
+    begin
+      SPlus.Copy(SData);
+      SPlus.Raw[i] := SData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(SPlus);
+      SPlus.Raw[i] := SData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(SPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      XInput.Output.Copy(XData);
+      SInput.Output.Copy(SData);
+      NN.Compute(XInput.Output);
+      SInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := SInput.OutputError.Raw[i];
+
+      maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+      AssertTrue('ModulatedConv2D style gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestModulatedConv2DStyleGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; SData.Free; SPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedConv2DNoDemodWeightGradientCheck;
+// The toRGB conv uses modulation WITHOUT demodulation (demod=0). Verify the
+// owned-kernel gradient on that simpler path (no normalization chain).
+var
+  NN: TNNet;
+  XInput, SInput: TNNetLayer;
+  Conv: TNNetModulatedConv2D;
+  XData, SData, Desired: TNNetVolume;
+  SizeXY, InC, OutC, KSz, o, w, tapsPerOut: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+  procedure DoBackward();
+  begin
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+    NN.ClearDeltas();
+    NN.Backpropagate(Desired);
+  end;
+
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 3; KSz := 1; // 1x1 toRGB-style
+  tapsPerOut := KSz * KSz * InC;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  Desired := TNNetVolume.Create(SizeXY, SizeXY, OutC);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    Conv := TNNetModulatedConv2D.Create(OutC, KSz, 0, 0, SInput); // demod=0
+    NN.AddLayerAfter(Conv, XInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for o := 0 to XData.Size - 1 do XData.Raw[o] := Sin(o * 0.53) * 0.6 + 0.1;
+    for o := 0 to SData.Size - 1 do SData.Raw[o] := Cos(o * 0.41) * 0.5 + 0.7;
+    for o := 0 to OutC - 1 do
+      for w := 0 to tapsPerOut - 1 do
+        Conv.Neurons[o].Weights.Raw[w] := 0.4 * Sin(o * 1.7 + w * 0.6 + 0.2);
+    for o := 0 to Desired.Size - 1 do Desired.Raw[o] := Cos(o * 0.31) * 0.5;
+
+    for o := 0 to OutC - 1 do
+      for w := 0 to tapsPerOut - 1 do
+      begin
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] + epsilon;
+        lossPlus := ComputeLoss();
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] - 2 * epsilon;
+        lossMinus := ComputeLoss();
+        Conv.Neurons[o].Weights.Raw[w] := Conv.Neurons[o].Weights.Raw[w] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+        DoBackward();
+        analyticalGrad := -Conv.Neurons[o].Delta.Raw[w];
+        maxErr := Max(maxErr, Abs(numericalGrad - analyticalGrad));
+        AssertTrue('ModulatedConv2D(noDemod) weight grad o=' + IntToStr(o) +
+          ' w=' + IntToStr(w) + ' num=' + FloatToStr(numericalGrad) + ' ana=' +
+          FloatToStr(analyticalGrad), Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('  TestModulatedConv2DNoDemodWeightGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; XData.Free; SData.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestModulatedConv2DLoadFromString;
+// Serialization round-trip: the style source layer index (injected like
+// TNNetConcat) and OutChannels/FeatureSize/SuppressBias/Demodulate struct
+// fields plus the OWNED kernel weights must survive SaveToString round-trip.
+var
+  NN, NN2: TNNet;
+  XInput, SInput: TNNetLayer;
+  XData, SData: TNNetVolume;
+  SizeXY, InC, OutC, KSz, i: integer;
+  Saved, Saved2: string;
+  Found: boolean;
+begin
+  RandSeed := 424242;
+  SizeXY := 4; InC := 2; OutC := 2; KSz := 3;
+  NN := TNNet.Create();
+  XData := TNNetVolume.Create(SizeXY, SizeXY, InC);
+  SData := TNNetVolume.Create(InC, 1, 1);
+  try
+    XInput := NN.AddLayer(TNNetInput.Create(SizeXY, SizeXY, InC, 1));
+    SInput := NN.AddLayerAfter(TNNetInput.Create(InC, 1, 1, 1), 0);
+    NN.AddLayerAfter(TNNetModulatedConv2D.Create(OutC, KSz, 0, 1, SInput), XInput);
+
+    for i := 0 to XData.Size - 1 do XData.Raw[i] := Sin(i * 0.53) * 0.6 + 0.1;
+    for i := 0 to SData.Size - 1 do SData.Raw[i] := Cos(i * 0.41) * 0.5 + 0.7;
+    XInput.Output.Copy(XData);
+    SInput.Output.Copy(SData);
+    NN.Compute(XInput.Output);
+
+    Found := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetModulatedConv2D then Found := true;
+    AssertTrue('ModulatedConv2D layer present', Found);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('ModulatedConv2D SaveToString round-trip equality', Saved, Saved2);
+      AssertTrue('ModulatedConv2D round-trip last layer is TNNetModulatedConv2D',
+        NN2.GetLastLayer is TNNetModulatedConv2D);
+      NN2.Layers[0].Output.Copy(XData);
+      NN2.Layers[1].Output.Copy(SData);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('ModulatedConv2D round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; XData.Free; SData.Free;
   end;
 end;
 
