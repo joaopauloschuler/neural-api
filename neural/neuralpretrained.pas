@@ -4674,6 +4674,104 @@ function RefClipScoreFromEmbeddings(ImageEmb, TextEmb, RefTextEmb: TNNetVolume;
   Weight: TNeuralFloat = 2.5): TNeuralFloat;
 
 // ===========================================================================
+// OWL-ViT IMPORT (model_type "owlvit": google/owlvit-base-patch32 and
+// siblings) - the repo's first OPEN-VOCABULARY (zero-shot, text-conditioned)
+// object detector. DETR is open but CLOSED-vocabulary (a fixed label set);
+// OWL-ViT instead matches every IMAGE PATCH against arbitrary free-text query
+// embeddings by cosine similarity. It REUSES the CLIP towers verbatim (the
+// tensor names are CLIP's under an "owlvit." prefix):
+//   - the CLIP ViT image tower (BuildClipVisionTower with ProjectionTensorName
+//     = '' so it returns the (num_patches+1, 1, hidden) POST-layernorm hidden
+//     states, CLS row first);
+//   - the CLIP text tower (causal, ARGMAX-of-ids pooling, text_projection)
+//     producing one query embedding per free-text prompt.
+// OWL-ViT-specific head, built into VisionNet on top of the post-LN states:
+//   (a) CLS MERGE: image_embeds[p] = post_ln[1+p] * post_ln[0] (the class
+//       token broadcast over the patch rows), then a final LayerNorm
+//       (the model's top-level `layer_norm`);
+//   (b) class head: dense0 (hidden -> text_dim, biased) gives per-patch
+//       image_class_embeds; a per-patch logit_shift (Linear ->1) and
+//       logit_scale (Linear ->1) ride alongside;
+//   (c) box head: a 3-layer GELU MLP (hidden->hidden->hidden->4, biased) gives
+//       the raw box; a fixed grid box_bias is ADDED then sigmoid -> cxcywh.
+// VisionNet outputs, per patch, the depth-concatenation
+//   [ image_class_embeds (text_dim) | logit_shift (1) | logit_scale_raw (1)
+//     | box_raw (4) ]   (box_bias is baked into the box dense2 bias so box_raw
+//   already carries it; sigmoid is applied in DecodeOwlViTDetections).
+// The cosine match + ELU-gated (logit + shift)*scale and the box sigmoid are
+// finished in DecodeOwlViTDetections given the L2-normalized text-query
+// embeddings (one per prompt, pooled from TextNet by OwlViTQueryEmbedding).
+// Output modality: a set of (patch, query, score, box) tuples per image.
+// ---------------------------------------------------------------------------
+type
+  TOwlViTConfig = record
+    Text: TClipTowerConfig;     // text_config (encoder block shape)
+    Vision: TClipTowerConfig;   // vision_config
+    TextVocabSize: integer;     // text_config.vocab_size
+    TextMaxPositions: integer;  // text_config.max_position_embeddings
+    EosTokenId: integer;        // text_config.eos_token_id (argmax pooling)
+    ImageSize: integer;         // vision_config.image_size
+    PatchSize: integer;         // vision_config.patch_size
+    NumChannels: integer;       // vision_config.num_channels (3)
+    ProjectionDim: integer;     // projection_dim (== text hidden_size, the
+                                // shared cosine space)
+    GridH, GridW: integer;      // num patches per side (image_size/patch_size)
+    ModelType: string;          // 'owlvit'
+  end;
+
+  // One open-vocabulary detection: a (patch, query) match above threshold.
+  TOwlViTDetectionRec = record
+    PatchIndex: integer;        // 0..num_patches-1 (row-major over the grid)
+    QueryIndex: integer;        // 0..num_queries-1
+    Score: TNeuralFloat;        // sigmoid(match logit) in (0,1)
+    Cx, Cy, W, H: TNeuralFloat; // cxcywh box, sigmoid-normalized to (0,1)
+  end;
+  TOwlViTDetectionArray = array of TOwlViTDetectionRec;
+
+// Reads a HF OWL-ViT config.json (model_type "owlvit"). Mirrors the CLIP
+// reader over the text_config / vision_config sub-objects, plus projection_dim
+// and the derived patch grid. hidden_act defaults to quick_gelu.
+function ReadOwlViTConfigFromJSONFile(const FileName: string): TOwlViTConfig;
+
+function OwlViTConfigToString(const Config: TOwlViTConfig): string;
+
+// Builds the OWL-ViT TEXT net (CLIP text tower) and the VISION+head detection
+// net described by Config and loads every weight from the checkpoint at
+// FileName. TextSeqLen <= 0 uses the full text max_position_embeddings context.
+// Both nets are owned by the caller. pInferenceOnly frees training volumes.
+procedure BuildOwlViTFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TOwlViTConfig; out TextNet, VisionNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+procedure BuildOwlViTFromSafeTensors(const FileName: string;
+  out TextNet, VisionNet: TNNet; out Config: TOwlViTConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Pools and L2-normalizes one OWL-ViT text-query embedding from a forward of
+// TextNet: argmax-of-ids EOS pooling (the OWL-ViT / legacy-CLIP convention)
+// over TextNet.GetLastLayer().Output, then unit-normalized. TokenIds is the
+// (SeqLen,1,1) text-net input (it must already have been Compute()d through
+// TextNet). Result is written to QueryEmb (1,1,projection_dim).
+procedure OwlViTQueryEmbedding(TextNet: TNNet; TokenIds: TNNetVolume;
+  QueryEmb: TNNetVolume);
+
+// Finishes the OWL-ViT detection given VisionNet's per-patch output volume
+// (text_dim image_class_embeds | logit_shift | logit_scale_raw | 4 box) and a
+// (num_queries, 1, projection_dim) stack of UNIT-L2 text-query embeddings
+// (row q = OwlViTQueryEmbedding of prompt q). For each patch p and query q the
+// match logit is (cos(normalize(class_embeds[p]), query[q]) + shift[p]) *
+// (elu(scale_raw[p]) + 1); Score = sigmoid(logit). Boxes are sigmoid(box_raw)
+// (the per-patch grid box_bias is ADDED to box_raw before the sigmoid).
+// Detections with Score >= Threshold are returned. TextDim is the
+// image_class_embeds width; GridH x GridW is the patch grid (row-major).
+function DecodeOwlViTDetections(VisionOutput, QueryEmbeds: TNNetVolume;
+  TextDim, GridH, GridW: integer;
+  Threshold: TNeuralFloat): TOwlViTDetectionArray;
+
+// ===========================================================================
 // SigLIP IMPORT (model_type "siglip" / "siglip2": google/siglip-base-
 // patch16-224 and siblings) - a sigmoid-loss image-text dual encoder. It
 // REUSES the CLIP pre-LN encoder block (TClipTowerConfig / AddClipEncoder
@@ -31366,6 +31464,405 @@ begin
     Result := 2 * ImageTerm * RefTerm / (ImageTerm + RefTerm)
   else
     Result := 0;
+end;
+
+// ===========================================================================
+// OWL-ViT IMPORT (see the interface header). Reuses TClipTowerConfig and the
+// CLIP towers; the open-vocabulary detection head (CLS merge, class/box MLPs)
+// is built on top of the post-LN vision hidden states.
+// ===========================================================================
+
+function ReadOwlViTConfigFromJSONFile(const FileName: string): TOwlViTConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, TowerObj: TJSONObject;
+  ModelType: string;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(FieldName);
+    if (Data = nil) or not (Data is TJSONObject) then
+      ImportError('OWL-ViT import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(Data);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('OWL-ViT import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('OWL-ViT import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        O.Find(FieldName).AsJSON + '.');
+  end;
+
+  procedure ReadTower(O: TJSONObject; var Tower: TClipTowerConfig);
+  begin
+    Tower.HiddenSize := RequiredInt(O, 'hidden_size');
+    Tower.IntermediateSize := RequiredInt(O, 'intermediate_size');
+    Tower.NumLayers := RequiredInt(O, 'num_hidden_layers');
+    Tower.NumHeads := RequiredInt(O, 'num_attention_heads');
+    Tower.LayerNormEps := O.Get('layer_norm_eps', 0.00001);
+    Tower.HiddenAct := ClipHiddenActFromString(
+      O.Get('hidden_act', 'quick_gelu'));
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('OWL-ViT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('OWL-ViT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('OWL-ViT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'owlvit');
+    if (ModelType <> 'owlvit') and (ModelType <> 'owlv2') then
+      ImportError('OWL-ViT import: config model_type is "' + ModelType +
+        '" - only "owlvit"/"owlv2" are supported here.');
+    Result.ModelType := ModelType;
+    TowerObj := RequiredSubObject('text_config');
+    ReadTower(TowerObj, Result.Text);
+    Result.TextVocabSize := RequiredInt(TowerObj, 'vocab_size');
+    Result.TextMaxPositions :=
+      RequiredInt(TowerObj, 'max_position_embeddings');
+    // OWL-ViT pools via input_ids.argmax(-1); eos_token_id is informational.
+    Result.EosTokenId := TowerObj.Get('eos_token_id', 49407);
+    TowerObj := RequiredSubObject('vision_config');
+    ReadTower(TowerObj, Result.Vision);
+    Result.ImageSize := RequiredInt(TowerObj, 'image_size');
+    Result.PatchSize := RequiredInt(TowerObj, 'patch_size');
+    Result.NumChannels := TowerObj.Get('num_channels', 3);
+    Result.ProjectionDim := Obj.Get('projection_dim', 512);
+    if (Result.PatchSize < 1) or
+       ((Result.ImageSize mod Result.PatchSize) <> 0) then
+      ImportError('OWL-ViT import: image_size=' + IntToStr(Result.ImageSize) +
+        ' is not a multiple of patch_size=' + IntToStr(Result.PatchSize) + '.');
+    Result.GridH := Result.ImageSize div Result.PatchSize;
+    Result.GridW := Result.GridH;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function OwlViTConfigToString(const Config: TOwlViTConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'owlvit'
+  else Result := Config.ModelType;
+  Result := Result + ' config: text(d=' + IntToStr(Config.Text.HiddenSize) +
+    ', layers=' + IntToStr(Config.Text.NumLayers) +
+    ', heads=' + IntToStr(Config.Text.NumHeads) +
+    ', vocab=' + IntToStr(Config.TextVocabSize) +
+    ', max_pos=' + IntToStr(Config.TextMaxPositions) +
+    '), vision(d=' + IntToStr(Config.Vision.HiddenSize) +
+    ', layers=' + IntToStr(Config.Vision.NumLayers) +
+    ', heads=' + IntToStr(Config.Vision.NumHeads) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    '), proj_dim=' + IntToStr(Config.ProjectionDim) +
+    ', grid=' + IntToStr(Config.GridH) + 'x' + IntToStr(Config.GridW);
+end;
+
+// Computes the OWL-ViT grid box_bias for patch p (row-major over a GridH x
+// GridW grid) into Bias[0..3] (cx, cy, w, h biases, pre-sigmoid). Mirrors
+// modeling_owlvit.compute_box_bias exactly (float64-stable in extended).
+procedure OwlViTBoxBias(PatchIndex, GridH, GridW: integer;
+  out BiasCx, BiasCy, BiasW, BiasH: TNeuralFloat);
+var
+  Row, Col: integer;
+  Xc, Yc, Wc, Hc: Extended;
+
+  function Logit(V: Extended): Extended;
+  begin
+    // log(v + 1e-4) - log1p(-v + 1e-4), v clipped to [0,1] by the caller.
+    Result := Ln(V + 1e-4) - Ln(1.0 - V + 1e-4);
+  end;
+
+begin
+  Row := PatchIndex div GridW;   // y index (0..GridH-1)
+  Col := PatchIndex mod GridW;   // x index (0..GridW-1)
+  // normalize_grid_corner_coordinates: x_coords = arange(1,W+1)/W,
+  // y_coords = arange(1,H+1)/H, meshgrid(indexing='xy') flattened row-major.
+  Xc := (Col + 1) / GridW;
+  Yc := (Row + 1) / GridH;
+  if Xc > 1.0 then Xc := 1.0;
+  if Yc > 1.0 then Yc := 1.0;
+  Wc := 1.0 / GridW;             // box_size bias: 1/num_patches per axis
+  Hc := 1.0 / GridH;
+  BiasCx := Logit(Xc);
+  BiasCy := Logit(Yc);
+  BiasW := Logit(Wc);
+  BiasH := Logit(Hc);
+end;
+
+procedure BuildOwlViTFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TOwlViTConfig; out TextNet, VisionNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  TokEmb, PosEmb, FinalLN, TextProj: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  VisionTower, ClsRow, PatchRows, Merged, MergeLN: TNNetLayer;
+  Dense0, LogitShift, LogitScale: TNNetLayer;
+  Box0, Box1, Box2: TNNetLayer;
+  SeqLen, BlockCnt, NumPatches, TextDim, VisHidden: integer;
+begin
+  TextNet := nil;
+  VisionNet := nil;
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  try
+    try
+      if (Config.Text.NumHeads < 1) or
+         ((Config.Text.HiddenSize mod Config.Text.NumHeads) <> 0) then
+        ImportError('OWL-ViT import: text hidden_size=' +
+          IntToStr(Config.Text.HiddenSize) + ' is not divisible by ' +
+          'num_attention_heads=' + IntToStr(Config.Text.NumHeads) + '.');
+      if TextSeqLen <= 0 then SeqLen := Config.TextMaxPositions
+      else SeqLen := TextSeqLen;
+      if SeqLen > Config.TextMaxPositions then
+        ImportError('OWL-ViT import: requested TextSeqLen=' +
+          IntToStr(SeqLen) + ' exceeds max_position_embeddings=' +
+          IntToStr(Config.TextMaxPositions) + '.');
+      TextDim := Config.ProjectionDim;
+      VisHidden := Config.Vision.HiddenSize;
+      NumPatches := Config.GridH * Config.GridW;
+
+      // ---------------- TEXT tower (CLIP text, owlvit. prefix) ----------
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
+      TokEmb := NN.AddLayer( TNNetEmbedding.Create(
+        Config.TextVocabSize, Config.Text.HiddenSize, {EncodeZero=}1) );
+      PosEmb := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      SetLength(Blocks, Config.Text.NumLayers);
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+        AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
+          Blocks[BlockCnt], pInferenceOnly);
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      // text_projection applied PER TOKEN (bias-free); the query embedding is
+      // the argmax-pooled row, L2-normalized in OwlViTQueryEmbedding.
+      TextProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      LoadClipEmbeddingTable(Reader, TokEmb,
+        'owlvit.text_model.embeddings.token_embedding.weight',
+        Config.TextVocabSize, Config.Text.HiddenSize);
+      LoadClipEmbeddingTable(Reader, PosEmb,
+        'owlvit.text_model.embeddings.position_embedding.weight',
+        Config.TextMaxPositions, Config.Text.HiddenSize);
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+        LoadClipEncoderBlockWeights(Reader, Blocks[BlockCnt],
+          'owlvit.text_model.encoder.layers.' + IntToStr(BlockCnt) + '.',
+          Config.Text);
+      LoadLayerNormWeights(Reader, FinalLN,
+        'owlvit.text_model.final_layer_norm.weight',
+        'owlvit.text_model.final_layer_norm.bias', Config.Text.HiddenSize);
+      LoadLlamaLinearWeights(Reader, TextProj, 'owlvit.text_projection.weight',
+        Config.Text.HiddenSize, Config.ProjectionDim); // bias-free
+      TextNet := NN;
+      NN := nil;
+
+      // ---------------- VISION tower + detection head ----------------
+      // BuildClipVisionTower with ProjectionTensorName='' returns the
+      // (NumPatches+1, 1, hidden) post_layernorm hidden states (CLS row 0).
+      NN := BuildClipVisionTower(Reader, Config.Vision,
+        Config.ImageSize, Config.PatchSize, Config.NumChannels,
+        Config.ProjectionDim, 'owlvit.vision_model.', '', pInferenceOnly);
+      VisionTower := NN.GetLastLayer();
+
+      // CLS MERGE: image_embeds[p] = post_ln[1+p] * post_ln[0]. The CLS row
+      // is (1,1,hidden); TNNetChannelMulByLayer broadcasts its per-channel
+      // vector over every patch row of PatchRows (NumPatches,1,hidden).
+      ClsRow := NN.AddLayerAfter(
+        TNNetCrop.Create({StartX=}0, {StartY=}0, {LenX=}1, {LenY=}1),
+        VisionTower);
+      PatchRows := NN.AddLayerAfter(
+        TNNetCrop.Create({StartX=}1, {StartY=}0, {LenX=}NumPatches, {LenY=}1),
+        VisionTower);
+      Merged := NN.AddLayer(
+        TNNetChannelMulByLayer.Create(PatchRows, ClsRow) );
+      MergeLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps) );
+
+      // class head: dense0 (hidden -> text_dim), plus logit_shift/scale (->1).
+      Dense0 := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(TextDim, 0), MergeLN);
+      LogitShift := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(1, 0), MergeLN);
+      LogitScale := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(1, 0), MergeLN);
+      // box head: dense0 -> gelu -> dense1 -> gelu -> dense2(4).
+      Box0 := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(VisHidden, 0), MergeLN);
+      NN.AddLayer( TNNetGELUErf.Create() );
+      Box1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(VisHidden, 0) );
+      NN.AddLayer( TNNetGELUErf.Create() );
+      Box2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0) );
+      // concat [ image_class_embeds | logit_shift | logit_scale_raw | box_raw ]
+      NN.AddLayer( TNNetDeepConcat.Create([Dense0, LogitShift, LogitScale,
+        Box2]) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- head weights ----------------
+      LoadLayerNormWeights(Reader, MergeLN,
+        'layer_norm.weight', 'layer_norm.bias', VisHidden);
+      LoadLlamaLinearWeights(Reader, Dense0, 'class_head.dense0.weight',
+        VisHidden, TextDim, 0, -1, 0, 'class_head.dense0.bias');
+      LoadLlamaLinearWeights(Reader, LogitShift, 'class_head.logit_shift.weight',
+        VisHidden, 1, 0, -1, 0, 'class_head.logit_shift.bias');
+      LoadLlamaLinearWeights(Reader, LogitScale, 'class_head.logit_scale.weight',
+        VisHidden, 1, 0, -1, 0, 'class_head.logit_scale.bias');
+      LoadLlamaLinearWeights(Reader, Box0, 'box_head.dense0.weight',
+        VisHidden, VisHidden, 0, -1, 0, 'box_head.dense0.bias');
+      LoadLlamaLinearWeights(Reader, Box1, 'box_head.dense1.weight',
+        VisHidden, VisHidden, 0, -1, 0, 'box_head.dense1.bias');
+      LoadLlamaLinearWeights(Reader, Box2, 'box_head.dense2.weight',
+        VisHidden, 4, 0, -1, 0, 'box_head.dense2.bias');
+      // box_raw = dense2(image_feats) is kept exactly: the per-patch grid
+      // box_bias depends on the patch index (the 4 dense2 neurons are shared
+      // across patches, so it cannot be folded per-patch into a bias here) and
+      // is added in DecodeOwlViTDetections where the patch index is known.
+      VisionNet := NN;
+      NN := nil;
+    except
+      NN.Free;
+      TextNet.Free;
+      TextNet := nil;
+      VisionNet.Free;
+      VisionNet := nil;
+      raise;
+    end;
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure BuildOwlViTFromSafeTensors(const FileName: string;
+  out TextNet, VisionNet: TNNet; out Config: TOwlViTConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadOwlViTConfigFromJSONFile(ConfigPath);
+  BuildOwlViTFromSafeTensorsWithConfig(FileName, Config, TextNet, VisionNet,
+    TextSeqLen, pInferenceOnly);
+end;
+
+procedure OwlViTQueryEmbedding(TextNet: TNNet; TokenIds: TNNetVolume;
+  QueryEmb: TNNetVolume);
+var
+  Output: TNNetVolume;
+  Depth, ChanCnt, Pos, BestPos, BestId, TokId: integer;
+  Norm: TNeuralFloat;
+begin
+  Output := TextNet.GetLastLayer().Output;
+  Depth := Output.Depth;
+  // OWL-ViT pools at input_ids.argmax(-1): the FIRST position with the max id.
+  BestPos := 0;
+  BestId := Round(TokenIds.FData[0]);
+  for Pos := 1 to TokenIds.SizeX - 1 do
+  begin
+    TokId := Round(TokenIds.FData[Pos]);
+    if TokId > BestId then begin BestId := TokId; BestPos := Pos; end;
+  end;
+  QueryEmb.ReSize(1, 1, Depth);
+  for ChanCnt := 0 to Depth - 1 do
+    QueryEmb.FData[ChanCnt] := Output[BestPos, 0, ChanCnt];
+  // L2 normalize (HF uses norm + 1e-6 in the class head; applied here so the
+  // decode's cosine is a plain dot product).
+  Norm := 0;
+  for ChanCnt := 0 to Depth - 1 do
+    Norm := Norm + QueryEmb.FData[ChanCnt] * QueryEmb.FData[ChanCnt];
+  Norm := Sqrt(Norm) + 1e-6;
+  for ChanCnt := 0 to Depth - 1 do
+    QueryEmb.FData[ChanCnt] := QueryEmb.FData[ChanCnt] / Norm;
+end;
+
+function DecodeOwlViTDetections(VisionOutput, QueryEmbeds: TNNetVolume;
+  TextDim, GridH, GridW: integer;
+  Threshold: TNeuralFloat): TOwlViTDetectionArray;
+var
+  NumPatches, NumQueries, p, q, c, Cnt: integer;
+  ShiftBase, ScaleBase, BoxBase: integer;
+  Norm, Shift, ScaleRaw, ScaleVal, Cos, Logit, Score: TNeuralFloat;
+  BiasCx, BiasCy, BiasW, BiasH: TNeuralFloat;
+  ImgEmb: array of TNeuralFloat;
+begin
+  NumPatches := VisionOutput.SizeX;
+  NumQueries := QueryEmbeds.SizeX;
+  ShiftBase := TextDim;
+  ScaleBase := TextDim + 1;
+  BoxBase := TextDim + 2;
+  SetLength(ImgEmb, TextDim);
+  SetLength(Result, NumPatches * NumQueries);
+  Cnt := 0;
+  for p := 0 to NumPatches - 1 do
+  begin
+    // L2-normalize the per-patch image_class_embeds (norm + 1e-6, as HF).
+    Norm := 0;
+    for c := 0 to TextDim - 1 do
+    begin
+      ImgEmb[c] := VisionOutput[p, 0, c];
+      Norm := Norm + ImgEmb[c] * ImgEmb[c];
+    end;
+    Norm := Sqrt(Norm) + 1e-6;
+    for c := 0 to TextDim - 1 do
+      ImgEmb[c] := ImgEmb[c] / Norm;
+    Shift := VisionOutput[p, 0, ShiftBase];
+    ScaleRaw := VisionOutput[p, 0, ScaleBase];
+    // elu(x) + 1
+    if ScaleRaw > 0 then ScaleVal := ScaleRaw + 1
+    else ScaleVal := Exp(ScaleRaw); // (exp(x)-1)+1
+    for q := 0 to NumQueries - 1 do
+    begin
+      Cos := 0;
+      for c := 0 to TextDim - 1 do
+        Cos := Cos + ImgEmb[c] * QueryEmbeds[q, 0, c];
+      Logit := (Cos + Shift) * ScaleVal;
+      Score := 1.0 / (1.0 + Exp(-Logit));
+      if Score >= Threshold then
+      begin
+        OwlViTBoxBias(p, GridH, GridW, BiasCx, BiasCy, BiasW, BiasH);
+        Result[Cnt].PatchIndex := p;
+        Result[Cnt].QueryIndex := q;
+        Result[Cnt].Score := Score;
+        Result[Cnt].Cx :=
+          1.0 / (1.0 + Exp(-(VisionOutput[p, 0, BoxBase + 0] + BiasCx)));
+        Result[Cnt].Cy :=
+          1.0 / (1.0 + Exp(-(VisionOutput[p, 0, BoxBase + 1] + BiasCy)));
+        Result[Cnt].W :=
+          1.0 / (1.0 + Exp(-(VisionOutput[p, 0, BoxBase + 2] + BiasW)));
+        Result[Cnt].H :=
+          1.0 / (1.0 + Exp(-(VisionOutput[p, 0, BoxBase + 3] + BiasH)));
+        Inc(Cnt);
+      end;
+    end;
+  end;
+  SetLength(Result, Cnt);
 end;
 
 // ===========================================================================

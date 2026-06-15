@@ -1085,7 +1085,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       downstream linear-probe / fine-tune on a small classification set. Reuses
       the patch-embed + EncoderBlock path; new code is the random-mask gather/
       scatter and the asymmetric encoder/decoder split.
-- [ ] OWL-ViT open-vocabulary object-detection importer
+- [X] OWL-ViT open-vocabulary object-detection importer
       (BuildOwlViTFromSafeTensors, e.g. google/owlvit-base-patch32) — the
       ZERO-SHOT-DETECTION gap (DETR is open but closed-vocabulary). OWL-ViT
       reuses a CLIP ViT image encoder (already landed as BuildClipVisionTower)
@@ -1096,6 +1096,21 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       the per-patch logits; demo: examples/OpenVocabDetection scores a couple of
       free-text queries against one tiny image. Distinct from DETR (CLIP-based,
       text-conditioned, no learned object queries).
+      DONE: BuildOwlViTFromSafeTensors[WithConfig] (CLIP text tower +
+      BuildClipVisionTower-based vision+detection net), the CLS-merge
+      (TNNetChannelMulByLayer broadcast + layer_norm), class head (dense0 +
+      logit_shift/scale) and box head (3-layer GELUErf MLP), plus
+      OwlViTQueryEmbedding (argmax pooling + L2) and DecodeOwlViTDetections
+      (cosine match, ELU-gated logit, grid box_bias + sigmoid). Pico parity
+      max|diff| < 1e-4 vs transformers float64 over per-patch/per-query logits
+      AND boxes (TestOwlViTOpenVocabDetectionParity/DetectionDecode/Config,
+      tools/make_pico_owlvit_fixture.py). Demo examples/OpenVocabDetection.
+      FOLLOW-UPS: (a) owlv2 (config accepted, NOT parity-verified — owlv2 adds a
+      pred objectness head + bicubic pos-embed interpolation; verify before
+      claiming); (b) image-conditioned (one-shot) query path
+      (embed_image_query); (c) interpolate_pos_encoding for non-default image
+      sizes; (d) a real BPE tokenizer + image preprocessing so free-text strings
+      (not raw token ids) drive the demo.
 - [ ] BLIP image-captioning importer (BuildBlipForCaptioningFromSafeTensors,
       e.g. Salesforce/blip-image-captioning-base) — first GENERATIVE
       vision-language importer of the ENCODER-DECODER kind (LLaVA, still open,

@@ -289,6 +289,9 @@ type
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
+    procedure TestOwlViTConfigFromJSONFile;
+    procedure TestOwlViTOpenVocabDetectionParity;
+    procedure TestOwlViTDetectionDecode;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
@@ -13485,6 +13488,247 @@ begin
     Img.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// Verifies ReadOwlViTConfigFromJSONFile on the committed OWL-ViT pico config
+// (the FIRST open-vocabulary / zero-shot object-detection importer).
+procedure TTestNeuralPretrained.TestOwlViTConfigFromJSONFile;
+var
+  Config: TOwlViTConfig;
+begin
+  Config := ReadOwlViTConfigFromJSONFile(
+    FixturePath('tiny_owlvit_config.json'));
+  AssertEquals('model_type', 'owlvit', Config.ModelType);
+  AssertEquals('text hidden', 24, Config.Text.HiddenSize);
+  AssertEquals('text layers', 2, Config.Text.NumLayers);
+  AssertEquals('text heads', 3, Config.Text.NumHeads);
+  AssertEquals('vocab', 50, Config.TextVocabSize);
+  AssertEquals('max pos', 8, Config.TextMaxPositions);
+  AssertEquals('vision hidden', 24, Config.Vision.HiddenSize);
+  AssertEquals('image', 16, Config.ImageSize);
+  AssertEquals('patch', 8, Config.PatchSize);
+  AssertEquals('proj_dim', 24, Config.ProjectionDim);
+  AssertEquals('grid h', 2, Config.GridH);
+  AssertEquals('grid w', 2, Config.GridW);
+  AssertTrue('config ToString non-empty',
+    Length(OwlViTConfigToString(Config)) > 0);
+end;
+
+// OWL-ViT open-vocabulary object-detection parity. tests/fixtures/tiny_owlvit.*
+// is a pico random-init OwlViTForObjectDetection (CLIP text + CLIP ViT image
+// towers + the per-patch class-embedding cosine head and the box-regression
+// MLP). The reference forward is the REAL transformers OwlViTForObjectDetection
+// run in float64; the test asserts the Pascal per-patch / per-query class
+// logits AND the per-patch cxcywh boxes match within 1e-4.
+procedure TTestNeuralPretrained.TestOwlViTOpenVocabDetectionParity;
+var
+  TextNet, VisionNet: TNNet;
+  Config: TOwlViTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, InArr, IdArr, LogArr, BoxArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img, Tokens, VisOut, QueryEmbeds, OneQuery: TNNetVolume;
+  RefVal, GotVal, Diff, MaxLogDiff, MaxBoxDiff: double;
+  CaseCnt, q, c, x, yy, ch, FlatIdx, NQ, NP, W, H, NumCh, SeqLen: integer;
+  Dets: TOwlViTDetectionArray;
+  d: integer;
+begin
+  RandSeed := 424242;
+  BuildOwlViTFromSafeTensors(FixturePath('tiny_owlvit.safetensors'),
+    TextNet, VisionNet, Config, {TextSeqLen=}0, {pInferenceOnly=}false,
+    FixturePath('tiny_owlvit_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  Tokens := TNNetVolume.Create;
+  VisOut := TNNetVolume.Create;
+  QueryEmbeds := TNNetVolume.Create;
+  OneQuery := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxLogDiff := 0;
+  MaxBoxDiff := 0;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  SeqLen := Config.TextMaxPositions;
+  NP := Config.GridH * Config.GridW;
+  try
+    AssertTrue('text net built', TextNet <> nil);
+    AssertTrue('vision net built', VisionNet <> nil);
+    // vision output: NumPatches rows, depth = text_dim + 1 + 1 + 4.
+    AssertEquals('vision out patches', NP, VisionNet.GetLastLayer().Output.SizeX);
+    AssertEquals('vision out depth', Config.ProjectionDim + 1 + 1 + 4,
+      VisionNet.GetLastLayer().Output.Depth);
+    RefJson.LoadFromFile(FixturePath('tiny_owlvit_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      InArr := TJSONArray(CaseObj.Find('input'));
+      IdArr := TJSONArray(CaseObj.Find('input_ids'));
+      LogArr := TJSONArray(CaseObj.Find('logits'));
+      BoxArr := TJSONArray(CaseObj.Find('boxes'));
+      NQ := CaseObj.Get('num_queries', 0);
+      // image: flat (y, x, c).
+      Img.ReSize(W, H, NumCh);
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          for ch := 0 to NumCh - 1 do
+          begin
+            FlatIdx := (yy * W + x) * NumCh + ch;
+            Img.FData[(yy * W + x) * NumCh + ch] := InArr.Items[FlatIdx].AsFloat;
+          end;
+      VisionNet.Compute(Img);
+      VisOut.Copy(VisionNet.GetLastLayer().Output);
+      // queries: input_ids is flat (query, seqlen); pool each through TextNet.
+      QueryEmbeds.ReSize(NQ, 1, Config.ProjectionDim);
+      for q := 0 to NQ - 1 do
+      begin
+        Tokens.ReSize(SeqLen, 1, 1);
+        for c := 0 to SeqLen - 1 do
+          Tokens.FData[c] := IdArr.Items[q * SeqLen + c].AsFloat;
+        TextNet.Compute(Tokens);
+        OwlViTQueryEmbedding(TextNet, Tokens, OneQuery);
+        for d := 0 to Config.ProjectionDim - 1 do
+          QueryEmbeds[q, 0, d] := OneQuery.FData[d];
+      end;
+      Dets := DecodeOwlViTDetections(VisOut, QueryEmbeds,
+        Config.ProjectionDim, Config.GridH, Config.GridW, {Threshold=}0.0);
+      AssertEquals('detection count = patches*queries', NP * NQ, Length(Dets));
+      // logits flat (patch, query); boxes flat (patch, 4). Dets is in
+      // patch-major, query-minor order (matching the decode's loop).
+      for c := 0 to Length(Dets) - 1 do
+      begin
+        // reconstruct the pre-sigmoid match logit and compare to HF.
+        RefVal := LogArr.Items[Dets[c].PatchIndex * NQ + Dets[c].QueryIndex].AsFloat;
+        // HF logits are pre-sigmoid; invert Dets.Score = sigmoid(logit).
+        GotVal := Ln(Dets[c].Score / (1.0 - Dets[c].Score));
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxLogDiff then MaxLogDiff := Diff;
+      end;
+      for q := 0 to NP - 1 do
+      begin
+        // box for patch q is the same across queries; read query 0's record.
+        FlatIdx := q * NQ;
+        RefVal := BoxArr.Items[q * 4 + 0].AsFloat;
+        Diff := Abs(Dets[FlatIdx].Cx - RefVal);
+        if Diff > MaxBoxDiff then MaxBoxDiff := Diff;
+        RefVal := BoxArr.Items[q * 4 + 1].AsFloat;
+        Diff := Abs(Dets[FlatIdx].Cy - RefVal);
+        if Diff > MaxBoxDiff then MaxBoxDiff := Diff;
+        RefVal := BoxArr.Items[q * 4 + 2].AsFloat;
+        Diff := Abs(Dets[FlatIdx].W - RefVal);
+        if Diff > MaxBoxDiff then MaxBoxDiff := Diff;
+        RefVal := BoxArr.Items[q * 4 + 3].AsFloat;
+        Diff := Abs(Dets[FlatIdx].H - RefVal);
+        if Diff > MaxBoxDiff then MaxBoxDiff := Diff;
+      end;
+    end;
+    AssertTrue('OWL-ViT match logits: max |diff| = ' + FloatToStr(MaxLogDiff) +
+      ' must be < 1e-4', MaxLogDiff < 1e-4);
+    AssertTrue('OWL-ViT boxes: max |diff| = ' + FloatToStr(MaxBoxDiff) +
+      ' must be < 1e-4', MaxBoxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    Tokens.Free;
+    VisOut.Free;
+    QueryEmbeds.Free;
+    OneQuery.Free;
+    RefJson.Free;
+    TextNet.Free;
+    VisionNet.Free;
+  end;
+end;
+
+// Verifies DecodeOwlViTDetections thresholding + ordering on case 0: with
+// Threshold 0 every (patch, query) pair is returned in patch-major order, each
+// Score in (0,1) and each box coordinate in (0,1).
+procedure TTestNeuralPretrained.TestOwlViTDetectionDecode;
+var
+  TextNet, VisionNet: TNNet;
+  Config: TOwlViTConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, InArr, IdArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img, Tokens, VisOut, QueryEmbeds, OneQuery: TNNetVolume;
+  q, c, x, yy, ch, FlatIdx, NQ, NP, W, H, NumCh, SeqLen, d: integer;
+  Dets: TOwlViTDetectionArray;
+  OkScore, OkBox, OkOrder: boolean;
+begin
+  RandSeed := 424242;
+  BuildOwlViTFromSafeTensors(FixturePath('tiny_owlvit.safetensors'),
+    TextNet, VisionNet, Config, 0, false,
+    FixturePath('tiny_owlvit_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  Tokens := TNNetVolume.Create;
+  VisOut := TNNetVolume.Create;
+  QueryEmbeds := TNNetVolume.Create;
+  OneQuery := TNNetVolume.Create;
+  RefRoot := nil;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  SeqLen := Config.TextMaxPositions;
+  NP := Config.GridH * Config.GridW;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_owlvit_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    CaseObj := TJSONObject(CasesArr.Items[0]);
+    InArr := TJSONArray(CaseObj.Find('input'));
+    IdArr := TJSONArray(CaseObj.Find('input_ids'));
+    NQ := CaseObj.Get('num_queries', 0);
+    Img.ReSize(W, H, NumCh);
+    for yy := 0 to H - 1 do
+      for x := 0 to W - 1 do
+        for ch := 0 to NumCh - 1 do
+        begin
+          FlatIdx := (yy * W + x) * NumCh + ch;
+          Img.FData[(yy * W + x) * NumCh + ch] := InArr.Items[FlatIdx].AsFloat;
+        end;
+    VisionNet.Compute(Img);
+    VisOut.Copy(VisionNet.GetLastLayer().Output);
+    QueryEmbeds.ReSize(NQ, 1, Config.ProjectionDim);
+    for q := 0 to NQ - 1 do
+    begin
+      Tokens.ReSize(SeqLen, 1, 1);
+      for c := 0 to SeqLen - 1 do
+        Tokens.FData[c] := IdArr.Items[q * SeqLen + c].AsFloat;
+      TextNet.Compute(Tokens);
+      OwlViTQueryEmbedding(TextNet, Tokens, OneQuery);
+      for d := 0 to Config.ProjectionDim - 1 do
+        QueryEmbeds[q, 0, d] := OneQuery.FData[d];
+    end;
+    Dets := DecodeOwlViTDetections(VisOut, QueryEmbeds,
+      Config.ProjectionDim, Config.GridH, Config.GridW, 0.0);
+    AssertEquals('decode count = patches*queries', NP * NQ, Length(Dets));
+    OkScore := true; OkBox := true; OkOrder := true;
+    for c := 0 to Length(Dets) - 1 do
+    begin
+      if (Dets[c].Score <= 0) or (Dets[c].Score >= 1) then OkScore := false;
+      if (Dets[c].Cx < 0) or (Dets[c].Cx > 1) or
+         (Dets[c].Cy < 0) or (Dets[c].Cy > 1) or
+         (Dets[c].W < 0) or (Dets[c].W > 1) or
+         (Dets[c].H < 0) or (Dets[c].H > 1) then OkBox := false;
+      // patch-major, query-minor order.
+      if (Dets[c].PatchIndex <> c div NQ) or
+         (Dets[c].QueryIndex <> c mod NQ) then OkOrder := false;
+    end;
+    AssertTrue('all scores in (0,1)', OkScore);
+    AssertTrue('all boxes in [0,1]', OkBox);
+    AssertTrue('patch-major query-minor order', OkOrder);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    Tokens.Free;
+    VisOut.Free;
+    QueryEmbeds.Free;
+    OneQuery.Free;
+    RefJson.Free;
+    TextNet.Free;
+    VisionNet.Free;
   end;
 end;
 
