@@ -428,7 +428,7 @@ rather than acted on.
       (b) the lightweight all-MLP decode head (project each of the 4 stages to a
       common dim, upsample, concat, fuse, 1x1 to num_classes). Pico parity vs HF
       float64 + an examples/SemanticSegmentation that colors a tiny CPU image.
-- [ ] ViTPose human-pose keypoint-estimation importer (BuildViTPoseFromSafeTensors,
+- [X] ViTPose human-pose keypoint-estimation importer (BuildViTPoseFromSafeTensors,
       e.g. usyd-community/vitpose-base-simple) — the FIRST keypoint/pose vertical, a
       new output modality (per-joint 2-D heatmaps, not a class label, a box, or a
       dense class map). Top-down single-person recipe: the landed ViT backbone
@@ -441,6 +441,27 @@ rather than acted on.
       that draws a 17-keypoint COCO skeleton on one CPU image. Reuses the ViT path and
       the vision preprocessing helper; distinct from classification / detection /
       segmentation outputs already tracked.
+      DONE (this commit): BuildViTPoseFromSafeTensors[Ex] + TViTPoseConfig +
+      ReadViTPoseConfigFromJSONFile + ViTPoseConfigToString + DecodeViTPoseKeypoints in
+      neuralpretrained.pas (model_type vitpose / vitpose_backbone). The "simple"
+      decoder head is the actual usyd-community/vitpose-base-simple head (ReLU ->
+      bilinear-upsample-by-scale_factor [reused TNNetBilinearUpsample, align_corners=
+      False] -> 3x3 conv to num_labels heatmaps), NOT a 2-stage deconv — the simple
+      checkpoint has a single upsample, so no new deconv layer was needed. ViT backbone
+      reused via AddClipEncoderBlock (separate biased q/k/v); two ViTPose quirks
+      reproduced: hardcoded patch-conv padding=2, and NO cls token (each patch gets
+      position_embeddings[1:] + broadcast [:1]). Argmax decode is a plain CPU helper.
+      Tests: TestViTPoseConfigFromJSONFile, TestViTPosePoseEstimationParity (max |diff|
+      < 1e-4 vs HF float64 over the whole heatmap stack), TestViTPoseKeypointDecode
+      (argmax (x,y) peaks match the oracle). Fixture tools/make_pico_vitpose_fixture.py
+      (48KB tiny_vitpose.safetensors + config/io json). examples/PoseEstimation demo.
+      Remaining sub-tasks (scoped out): (a) the ViTPose "classic" multi-stage
+      DECONV head (vitpose-base, not -simple: 2x ConvTranspose2d + BN + ReLU) — only
+      the simple single-upsample head is wired; (b) MoE backbone (num_experts > 1,
+      dataset_index routing) is rejected; (c) the COCO 17-keypoint skeleton EDGE
+      rendering / detector-box preprocessing + sub-pixel (DARK) heatmap refinement are
+      not implemented (the demo draws per-joint argmax peaks, no skeleton edges);
+      (d) BuildFromPretrained auto-dispatch wiring for model_type vitpose.
 - [ ] RAFT optical-flow importer (BuildRaftFromSafeTensors, e.g. princeton-vl/raft or
       the torchvision raft_small weights) — the FIRST optical-flow vertical and the
       first model with a TWO-image input producing a dense 2-channel (dx, dy) motion

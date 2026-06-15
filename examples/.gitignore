@@ -33,3 +33,6 @@ SemanticSegmentation/SemanticSegmentation
 
 # DepthEstimation: compiled DPT / Depth-Anything demo binary
 DepthEstimation/DepthEstimation
+
+# PoseEstimation: compiled ViTPose demo binary
+PoseEstimation/PoseEstimation

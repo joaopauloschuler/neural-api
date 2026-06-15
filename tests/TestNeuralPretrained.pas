@@ -283,6 +283,9 @@ type
     procedure TestSegformerSemanticSegmentationParity;
     procedure TestDPTConfigFromJSONFile;
     procedure TestDPTDepthEstimationParity;
+    procedure TestViTPoseConfigFromJSONFile;
+    procedure TestViTPosePoseEstimationParity;
+    procedure TestViTPoseKeypointDecode;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
@@ -13112,6 +13115,171 @@ begin
     end;
     AssertTrue('DPT depth: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadViTPoseConfigFromJSONFile on the committed pico ViTPose config
+// (nested vitpose_backbone config + top-level num_labels / scale_factor).
+procedure TTestNeuralPretrained.TestViTPoseConfigFromJSONFile;
+var
+  Config: TViTPoseConfig;
+begin
+  Config := ReadViTPoseConfigFromJSONFile(
+    FixturePath('tiny_vitpose_config.json'));
+  AssertEquals('model_type', 'vitpose', Config.ModelType);
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('inter', 32, Config.IntermediateSize);
+  AssertEquals('layers', 2, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('image_h', 24, Config.ImageH);
+  AssertEquals('image_w', 16, Config.ImageW);
+  AssertEquals('patch_h', 8, Config.PatchH);
+  AssertEquals('patch_w', 8, Config.PatchW);
+  AssertEquals('channels', 3, Config.NumChannels);
+  AssertEquals('keypoints', 4, Config.NumKeypoints);
+  AssertEquals('scale', 4, Config.ScaleFactor);
+end;
+
+// HF ViTPose human-pose parity (the repo's FIRST keypoint / pose vertical: the
+// output modality is per-joint 2-D heatmaps). tiny_vitpose.* is a pico
+// VitPoseForPoseEstimation (a plain ViT backbone + the "simple" deconvolution
+// head) with re-randomized O(1) weights; the reference per-joint heatmap tensor
+// comes from the REAL transformers float64 forward. Asserts max |diff| < 1e-4
+// over the whole (NumKeypoints, Hh, Hw) heatmap stack - exercising the ViT
+// encoder (separate biased q/k/v, pre-LN blocks, gelu MLP, shared final
+// LayerNorm), the no-CLS folded-cls position table, the padded patch conv, the
+// patch->grid reshape and the ReLU -> bilinear-upsample -> 3x3-conv head.
+procedure TTestNeuralPretrained.TestViTPosePoseEstimationParity;
+var
+  NN: TNNet;
+  Config: TViTPoseConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, OutArr, InArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img, Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, x, yy, c, FlatIdx, GW, GH, K, W, H, NumCh: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildViTPoseFromSafeTensors(FixturePath('tiny_vitpose.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_vitpose_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  W := Config.ImageW; H := Config.ImageH;
+  NumCh := Config.NumChannels;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_vitpose_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      InArr := TJSONArray(CaseObj.Find('input'));
+      OutArr := TJSONArray(CaseObj.Find('output'));
+      GW := CaseObj.Get('out_grid_w', 0);
+      GH := CaseObj.Get('out_grid_h', 0);
+      K := CaseObj.Get('num_keypoints', 0);
+      Img.ReSize(W, H, NumCh);
+      // input is flat (y, x, c).
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          for c := 0 to NumCh - 1 do
+          begin
+            FlatIdx := (yy * W + x) * NumCh + c;
+            Img.FData[(yy * W + x) * NumCh + c] := InArr.Items[FlatIdx].AsFloat;
+          end;
+      NN.Compute(Img);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('heatmap grid w', GW, Output.SizeX);
+      AssertEquals('heatmap grid h', GH, Output.SizeY);
+      AssertEquals('heatmap channels', K, Output.Depth);
+      // reference is flat (c, y, x); CAI output is (x, y, c).
+      for c := 0 to K - 1 do
+        for yy := 0 to GH - 1 do
+          for x := 0 to GW - 1 do
+          begin
+            FlatIdx := (c * GH + yy) * GW + x;
+            RefVal := OutArr.Items[FlatIdx].AsFloat;
+            GotVal := Output[x, yy, c];
+            Diff := Abs(GotVal - RefVal);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+    end;
+    AssertTrue('ViTPose heatmaps: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies the spatial-argmax keypoint decode (DecodeViTPoseKeypoints) recovers
+// the correct (x, y) peak per joint, matching the float64 oracle's per-channel
+// argmax stored in the fixture ("peaks").
+procedure TTestNeuralPretrained.TestViTPoseKeypointDecode;
+var
+  NN: TNNet;
+  Config: TViTPoseConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, InArr, PeaksArr, PeakArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img: TNNetVolume;
+  Keypoints: TViTPoseKeypointArray;
+  CaseCnt, x, yy, c, FlatIdx, K, W, H, NumCh, RefX, RefY: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildViTPoseFromSafeTensors(FixturePath('tiny_vitpose.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_vitpose_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  W := Config.ImageW; H := Config.ImageH;
+  NumCh := Config.NumChannels;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_vitpose_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      InArr := TJSONArray(CaseObj.Find('input'));
+      PeaksArr := TJSONArray(CaseObj.Find('peaks'));
+      K := CaseObj.Get('num_keypoints', 0);
+      Img.ReSize(W, H, NumCh);
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          for c := 0 to NumCh - 1 do
+          begin
+            FlatIdx := (yy * W + x) * NumCh + c;
+            Img.FData[(yy * W + x) * NumCh + c] := InArr.Items[FlatIdx].AsFloat;
+          end;
+      NN.Compute(Img);
+      Keypoints := DecodeViTPoseKeypoints(NN.GetLastLayer().Output);
+      AssertEquals('keypoint count', K, Length(Keypoints));
+      for c := 0 to K - 1 do
+      begin
+        PeakArr := TJSONArray(PeaksArr.Items[c]);
+        RefX := PeakArr.Items[0].AsInteger;
+        RefY := PeakArr.Items[1].AsInteger;
+        AssertEquals('joint ' + IntToStr(c) + ' peak x',
+          RefX, Keypoints[c].X);
+        AssertEquals('joint ' + IntToStr(c) + ' peak y',
+          RefY, Keypoints[c].Y);
+      end;
+    end;
   finally
     RefRoot.Free;
     Img.Free;

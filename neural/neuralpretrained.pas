@@ -6010,6 +6010,88 @@ function BuildDPTFromSafeTensors(const FileName: string;
   out Config: TDPTConfig; pInferenceOnly: boolean = false;
   const ConfigFileName: string = ''): TNNet; overload;
 
+type
+  // ViTPose human-pose KEYPOINT-estimation config (model_type "vitpose"; the
+  // nested backbone_config is model_type "vitpose_backbone"). The repo's FIRST
+  // keypoint / pose vertical: the output modality is per-joint 2-D HEATMAPS (a
+  // stack of HxW maps, one per keypoint), decoded to (x,y) coordinates by a
+  // spatial argmax on CPU (DecodeViTPoseKeypoints below). Top-down single-person
+  // recipe: a plain ViT backbone over the cropped person image -> a "simple"
+  // deconvolution head (ReLU -> bilinear upsample by ScaleFactor -> 3x3 conv to
+  // NumKeypoints channels). The backbone is the reused ViT encoder path. The
+  // backbone uses a RECTANGULAR image (image_size = [H, W]) and a hardcoded
+  // patch-conv PADDING of 2 (a ViTPose quirk - for patch_size >= 5 the floored
+  // output grid still equals image // patch).
+  TViTPoseConfig = record
+    HiddenSize: integer;        // backbone hidden_size
+    IntermediateSize: integer;  // backbone intermediate_size
+    NumLayers: integer;         // backbone num_hidden_layers
+    NumHeads: integer;          // backbone num_attention_heads
+    ImageH: integer;            // backbone image_size[0]
+    ImageW: integer;            // backbone image_size[1]
+    PatchH: integer;            // backbone patch_size[0]
+    PatchW: integer;            // backbone patch_size[1]
+    NumChannels: integer;       // backbone num_channels (3)
+    LayerNormEps: double;       // backbone layer_norm_eps (1e-12)
+    HiddenAct: TClipHiddenAct;  // backbone hidden_act (gelu)
+    NumKeypoints: integer;      // num_labels (number of joints / heatmaps)
+    ScaleFactor: integer;       // head upsample factor (4)
+    ModelType: string;          // 'vitpose'
+  end;
+
+// Reads a HF ViTPose config.json (model_type "vitpose"). The backbone is read
+// from the nested "backbone_config" object (model_type "vitpose_backbone"):
+// hidden_size, num_hidden_layers, num_attention_heads, intermediate_size,
+// image_size ([H, W] or a square int), patch_size ([ph, pw] or int), num_channels
+// (3), layer_norm_eps (1e-12). num_experts > 1 (MoE backbone) is rejected.
+// Top-level: num_labels (= number of keypoints) and scale_factor (head upsample,
+// default 4). num_experts other than 1 is unsupported.
+function ReadViTPoseConfigFromJSONFile(const FileName: string): TViTPoseConfig;
+
+function ViTPoseConfigToString(const Config: TViTPoseConfig): string;
+
+// Builds the ViTPose keypoint-estimation net described by Config and loads every
+// weight from Reader (the caller owns Reader). The net takes an
+// (ImageW, ImageH, NumChannels) normalized RGB person crop and outputs a
+// (ImageW//PatchW * ScaleFactor, ImageH//PatchH * ScaleFactor, NumKeypoints)
+// volume: one heatmap per joint (CAI (W, H, C) order), exactly HF's `heatmaps`
+// permuted to channels-last. The ViT encoder is reused (separate biased q/k/v,
+// pre-LN blocks, gelu MLP, shared final LayerNorm); NO class token is kept - each
+// patch token gets position_embeddings[1:] PLUS the broadcast cls position row
+// [:1] (a ViTPose quirk). The genuinely new wiring is the patch reshape to a grid
+// + the simple deconvolution head (ReLU -> bilinear upsample -> 3x3 conv). Decode
+// the (x,y) keypoints from the output with DecodeViTPoseKeypoints.
+function BuildViTPoseFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TViTPoseConfig; pInferenceOnly: boolean = false): TNNet; overload;
+
+// Builds + loads the ViTPose net from the checkpoint at FileName. Config is
+// supplied by the caller (Ex) or read from ConfigFileName ('' = "config.json"
+// beside FileName) and returned. The net is owned by the caller.
+function BuildViTPoseFromSafeTensorsEx(const FileName: string;
+  const Config: TViTPoseConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildViTPoseFromSafeTensors(const FileName: string;
+  out Config: TViTPoseConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+type
+  // One decoded keypoint: the (X, Y) integer peak location on the heatmap grid
+  // and its Score (the heatmap value at that peak, a rough confidence).
+  TViTPoseKeypoint = record
+    X, Y: integer;
+    Score: TNeuralFloat;
+  end;
+  TViTPoseKeypointArray = array of TViTPoseKeypoint;
+
+// Spatial ARGMAX decode of a ViTPose heatmap volume into per-joint (x,y) peaks.
+// Heatmaps is the net output (a (W, H, NumKeypoints) volume, CAI (x,y,c)); for
+// each channel c it finds the (x,y) with the maximum value and returns it with
+// that value as the score. This is the standard top-down pose read-out (no
+// sub-pixel refinement); coordinates are on the heatmap grid (multiply by the
+// crop size / heatmap size to map back to image pixels). Not a leaf layer - a
+// plain CPU helper, exactly the recipe the task asks for.
+function DecodeViTPoseKeypoints(Heatmaps: TNNetVolume): TViTPoseKeypointArray;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -37307,6 +37389,391 @@ function BuildDPTFromSafeTensors(Reader: TNNetSafeTensorsReader;
   const Config: TDPTConfig; pInferenceOnly: boolean): TNNet;
 begin
   Result := BuildDPT(Reader, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// ViTPose HUMAN-POSE KEYPOINT-ESTIMATION IMPORT (model_type "vitpose")
+// ===========================================================================
+
+function ReadViTPoseConfigFromJSONFile(
+  const FileName: string): TViTPoseConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, Bk: TJSONObject;
+  ModelType, BkType: string;
+  NumExperts: integer;
+
+  function RequiredIntObj(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('ViTPose import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('ViTPose import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+  // Reads an [H, W] / [ph, pw] size pair that HF may store as a 2-element array
+  // or a single int (square). Returns the two components.
+  procedure ReadSizePair(O: TJSONObject; const FieldName: string;
+    out V0, V1: integer);
+  var
+    Data: TJSONData;
+    A: TJSONArray;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('ViTPose import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Data := O.Find(FieldName);
+    if Data is TJSONArray then
+    begin
+      A := TJSONArray(Data);
+      if A.Count < 2 then
+        ImportError('ViTPose import: "' + FieldName +
+          '" array must have 2 entries [H, W].');
+      V0 := A.Items[0].AsInteger;
+      V1 := A.Items[1].AsInteger;
+    end
+    else
+    begin
+      V0 := Data.AsInteger;
+      V1 := V0;
+    end;
+    if (V0 <= 0) or (V1 <= 0) then
+      ImportError('ViTPose import: "' + FieldName + '" must be positive.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('ViTPose import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('ViTPose import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('ViTPose import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'vitpose');
+    if (ModelType <> 'vitpose') and (ModelType <> 'vitpose_backbone') then
+      ImportError('ViTPose import: config model_type is "' + ModelType +
+        '" - only "vitpose" is supported here.');
+    Result.ModelType := 'vitpose';
+    // Backbone is the nested backbone_config (or this object itself when the
+    // config IS a bare vitpose_backbone).
+    if Obj.Find('backbone_config') is TJSONObject then
+      Bk := TJSONObject(Obj.Find('backbone_config'))
+    else
+      Bk := Obj;
+    BkType := Bk.Get('model_type', 'vitpose_backbone');
+    if (BkType <> 'vitpose_backbone') and (BkType <> 'vit') then
+      ImportError('ViTPose import: backbone model_type "' + BkType +
+        '" unsupported (expected "vitpose_backbone").');
+    NumExperts := Bk.Get('num_experts', 1);
+    if NumExperts <> 1 then
+      ImportError('ViTPose import: num_experts=' + IntToStr(NumExperts) +
+        ' (MoE backbone) is not supported.');
+    Result.HiddenSize := RequiredIntObj(Bk, 'hidden_size');
+    // ViTPose has no intermediate_size; the MLP width is hidden_size * mlp_ratio
+    // (default 4). Accept an explicit intermediate_size if a checkpoint ships one.
+    if Bk.IndexOfName('intermediate_size') >= 0 then
+      Result.IntermediateSize := Bk.Get('intermediate_size', 0)
+    else
+      Result.IntermediateSize := Result.HiddenSize * Bk.Get('mlp_ratio', 4);
+    if Result.IntermediateSize <= 0 then
+      ImportError('ViTPose import: intermediate_size / mlp_ratio must be > 0.');
+    Result.NumLayers := RequiredIntObj(Bk, 'num_hidden_layers');
+    Result.NumHeads := RequiredIntObj(Bk, 'num_attention_heads');
+    ReadSizePair(Bk, 'image_size', Result.ImageH, Result.ImageW);
+    ReadSizePair(Bk, 'patch_size', Result.PatchH, Result.PatchW);
+    Result.NumChannels := Bk.Get('num_channels', 3);
+    Result.LayerNormEps := Bk.Get('layer_norm_eps', 0.000000000001);
+    Result.HiddenAct := ClipHiddenActFromString(Bk.Get('hidden_act', 'gelu'));
+    // num_labels (= number of keypoints): explicit, else len(id2label/label2id),
+    // else COCO's 17.
+    Result.NumKeypoints := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumKeypoints := Obj.Get('num_labels', 0);
+    if Result.NumKeypoints <= 0 then
+      if Obj.Find('id2label') is TJSONObject then
+        Result.NumKeypoints := TJSONObject(Obj.Find('id2label')).Count;
+    if Result.NumKeypoints <= 0 then Result.NumKeypoints := 17;
+    Result.ScaleFactor := Obj.Get('scale_factor', 4);
+    if Result.ScaleFactor < 1 then
+      ImportError('ViTPose import: scale_factor must be >= 1.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ViTPoseConfigToString(const Config: TViTPoseConfig): string;
+begin
+  Result := 'vitpose config: d=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', ffn=' + IntToStr(Config.IntermediateSize) +
+    ', image=' + IntToStr(Config.ImageH) + 'x' + IntToStr(Config.ImageW) +
+    ', patch=' + IntToStr(Config.PatchH) + 'x' + IntToStr(Config.PatchW) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', act=' + ClipHiddenActToString(Config.HiddenAct) +
+    ', keypoints=' + IntToStr(Config.NumKeypoints) +
+    ', scale=' + IntToStr(Config.ScaleFactor);
+end;
+
+// Loads one ViTPose backbone encoder block. The block ARCHITECTURE is
+// AddClipEncoderBlock (pre-LN, separate biased q/k/v, gelu MLP), but ViTPose
+// MIXES BERT-style attention key names with timm-style MLP names:
+//   attention.attention.{query,key,value}, attention.output.dense,
+//   mlp.fc1, mlp.fc2, layernorm_before (pre-attn), layernorm_after (pre-MLP).
+// (The reusable LoadViTEncoderBlockWeights cannot be used: it pairs the BERT
+// attention names with intermediate.dense/output.dense MLP names.)
+procedure LoadViTPoseEncoderBlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TClipBlockLayers; const BlockPrefix: string;
+  const Tower: TClipTowerConfig);
+var
+  d: integer;
+begin
+  d := Tower.HiddenSize;
+  LoadLayerNormWeights(Reader, Block.LN1,
+    BlockPrefix + 'layernorm_before.weight',
+    BlockPrefix + 'layernorm_before.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    BlockPrefix + 'attention.attention.query.weight', d, d, 0, 3 * d, 0,
+    BlockPrefix + 'attention.attention.query.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    BlockPrefix + 'attention.attention.key.weight', d, d, d, 3 * d, 0,
+    BlockPrefix + 'attention.attention.key.bias');
+  LoadLlamaLinearWeights(Reader, Block.QKV,
+    BlockPrefix + 'attention.attention.value.weight', d, d, 2 * d, 3 * d, 0,
+    BlockPrefix + 'attention.attention.value.bias');
+  LoadLlamaLinearWeights(Reader, Block.AttnDense,
+    BlockPrefix + 'attention.output.dense.weight', d, d, 0, -1, 0,
+    BlockPrefix + 'attention.output.dense.bias');
+  LoadLayerNormWeights(Reader, Block.LN2,
+    BlockPrefix + 'layernorm_after.weight',
+    BlockPrefix + 'layernorm_after.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.Inter,
+    BlockPrefix + 'mlp.fc1.weight', d, Tower.IntermediateSize, 0, -1, 0,
+    BlockPrefix + 'mlp.fc1.bias');
+  LoadLlamaLinearWeights(Reader, Block.OutDense,
+    BlockPrefix + 'mlp.fc2.weight', Tower.IntermediateSize, d, 0, -1, 0,
+    BlockPrefix + 'mlp.fc2.bias');
+end;
+
+function BuildViTPose(Reader: TNNetSafeTensorsReader;
+  const Config: TViTPoseConfig; pInferenceOnly: boolean): TNNet;
+const
+  cPatchPad = 2;   // ViTPose hardcodes nn.Conv2d(..., padding=2) on the patch conv
+var
+  NN: TNNet;
+  Tower: TClipTowerConfig;
+  PatchConv, PosEmb, FinalLN, HeadConv: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  Tmp: TNNetVolume;
+  GridW, GridH, NumPatches, BlockCnt, ci, d, p: integer;
+  ClsName, Pfx, BkPfx, LayerGroup: string;
+begin
+  d := Config.HiddenSize;
+  if (Config.NumHeads < 1) or ((d mod Config.NumHeads) <> 0) then
+    ImportError('ViTPose import: hidden_size=' + IntToStr(d) +
+      ' not divisible by num_attention_heads=' +
+      IntToStr(Config.NumHeads) + '.');
+  if (Config.PatchH < 1) or (Config.PatchW < 1) or
+     ((Config.ImageH mod Config.PatchH) <> 0) or
+     ((Config.ImageW mod Config.PatchW) <> 0) then
+    ImportError('ViTPose import: image_size not a multiple of patch_size.');
+  if Config.PatchH <> Config.PatchW then
+    ImportError('ViTPose import: non-square patches not supported.');
+  if Config.NumKeypoints < 1 then
+    ImportError('ViTPose import: num_labels (keypoints) must be >= 1.');
+  p := Config.PatchH;
+  // HF patch conv: nn.Conv2d(k=stride=patch, padding=2). The output grid is
+  //   floor((side + 2*pad - patch)/patch) + 1.
+  GridH := (Config.ImageH + 2 * cPatchPad - p) div p + 1;
+  GridW := (Config.ImageW + 2 * cPatchPad - p) div p + 1;
+  // The position table was sized for image//patch; for patch >= 5 the floor
+  // above coincides with image//patch. Reject the (rare) mismatch case rather
+  // than silently misaligning the pos table.
+  if (GridH <> Config.ImageH div p) or (GridW <> Config.ImageW div p) then
+    ImportError('ViTPose import: patch_size ' + IntToStr(p) +
+      ' produces a padded grid (' + IntToStr(GridW) + 'x' + IntToStr(GridH) +
+      ') that does not match image//patch - position table would misalign ' +
+      '(use patch_size >= 5).');
+  NumPatches := GridW * GridH;
+  // Map onto the reusable encoder-block tower shape.
+  Tower.HiddenSize := Config.HiddenSize;
+  Tower.IntermediateSize := Config.IntermediateSize;
+  Tower.NumLayers := Config.NumLayers;
+  Tower.NumHeads := Config.NumHeads;
+  Tower.LayerNormEps := Config.LayerNormEps;
+  Tower.HiddenAct := Config.HiddenAct;
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture: ViT backbone --------------------------
+    NN.AddLayer(TNNetInput.Create(Config.ImageW, Config.ImageH,
+      Config.NumChannels));
+    // BIASED patch conv: kernel = stride = patch, PADDING = 2 -> (GridW, GridH,
+    // hidden) grid, flattened row-major (y*GridW + x) = HF flatten(2).transpose.
+    PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      d, p, {pInputPadding=}cPatchPad, {pStride=}p, {pSuppressBias=}0));
+    NN.AddLayer(TNNetReshape.Create(NumPatches, 1, d));
+    // NO class token: the patch tokens ARE the sequence. The learned position
+    // table carries the cls row folded into every patch position (loaded below).
+    PosEmb := NN.AddLayer(TNNetLearnedPositionalEmbedding.Create(NumPatches));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(Blocks, Config.NumLayers);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
+        Blocks[BlockCnt], pInferenceOnly);
+    FinalLN := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+    // Reshape the N patch tokens back to a (GridW, GridH, hidden) grid (HF
+    // permute(0,2,1).reshape(batch, hidden, GridH, GridW); CAI is (x,y,c)).
+    NN.AddLayer(TNNetReshape.Create(GridW, GridH, d));
+    // ---------------- simple deconvolution head ---------------------------
+    // ReLU -> bilinear upsample (scale_factor, align_corners=False) -> 3x3 pad-1
+    // conv to NumKeypoints heatmaps.
+    NN.AddLayer(TNNetReLU.Create());
+    NN.AddLayer(TNNetBilinearUpsample.Create(Config.ScaleFactor));
+    NN.AddLayer(TNNetPadXY.Create(1, 1));
+    HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.NumKeypoints, 3, {pInputPadding=}0, {pStride=}1,
+      {pSuppressBias=}0));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ---------------------------------------------
+    // Prefix probing: the standalone backbone or the ForPoseEstimation wrap.
+    if Reader.HasTensor('backbone.embeddings.position_embeddings') then
+      Pfx := 'backbone.'
+    else
+      Pfx := '';
+    BkPfx := Pfx;
+    LoadClipPatchConv(Reader, PatchConv,
+      BkPfx + 'embeddings.patch_embeddings.projection.weight',
+      Config.NumChannels, p, d);
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(
+        BkPfx + 'embeddings.patch_embeddings.projection.bias', Tmp);
+      if Tmp.Size <> d then
+        ImportError('ViTPose import: patch conv bias size mismatch.');
+      for ci := 0 to d - 1 do PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+    finally Tmp.Free; end;
+    // position_embeddings [1, NumPatches+1, hidden]. HF adds pos[:,1:] (per
+    // patch) + pos[:,:1] (the cls row, broadcast to every patch). We fold the
+    // cls row into every patch position so the single table reproduces the sum.
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(BkPfx + 'embeddings.position_embeddings', Tmp);
+      if Tmp.Size <> (NumPatches + 1) * d then
+        ImportError('ViTPose import: position_embeddings size mismatch ' +
+          '(native resolution only).');
+      // Drop the leading cls row, then add it (broadcast) to every patch row.
+      for ci := 0 to NumPatches * d - 1 do
+        PosEmb.Neurons[0].Weights.FData[ci] :=
+          Tmp.FData[d + ci] + Tmp.FData[ci mod d];
+      PosEmb.FlushWeightCache();
+    finally Tmp.Free; end;
+    // Some checkpoints also ship a separate cls_token tensor that HF folds into
+    // pos row 0 at load; the published vitpose ships it inside the pos table, so
+    // add it only when present (defensive, keeps parity for both layouts).
+    ClsName := BkPfx + 'embeddings.cls_token';
+    if Reader.HasTensor(ClsName) then
+    begin
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(ClsName, Tmp);
+        if Tmp.Size = d then
+          for ci := 0 to NumPatches * d - 1 do
+            PosEmb.Neurons[0].Weights.FData[ci] :=
+              PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci mod d];
+        PosEmb.FlushWeightCache();
+      finally Tmp.Free; end;
+    end;
+    LayerGroup := BkPfx + 'encoder.layer.';
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      LoadViTPoseEncoderBlockWeights(Reader, Blocks[BlockCnt],
+        LayerGroup + IntToStr(BlockCnt) + '.', Tower);
+    LoadLayerNormWeights(Reader, FinalLN,
+      BkPfx + 'layernorm.weight', BkPfx + 'layernorm.bias', d);
+    // head.conv 3x3 (hidden -> NumKeypoints, biased).
+    LoadConvNeXtConv(Reader, HeadConv, 'head.conv.weight', 'head.conv.bias',
+      Config.NumKeypoints, d, 3);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildViTPoseFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TViTPoseConfig; pInferenceOnly: boolean): TNNet;
+begin
+  Result := BuildViTPose(Reader, Config, pInferenceOnly);
+end;
+
+function BuildViTPoseFromSafeTensorsEx(const FileName: string;
+  const Config: TViTPoseConfig; pInferenceOnly: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildViTPose(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildViTPoseFromSafeTensors(const FileName: string;
+  out Config: TViTPoseConfig; pInferenceOnly: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadViTPoseConfigFromJSONFile(ConfigPath);
+  Result := BuildViTPoseFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+function DecodeViTPoseKeypoints(
+  Heatmaps: TNNetVolume): TViTPoseKeypointArray;
+var
+  c, x, y, K: integer;
+  Val, Best: TNeuralFloat;
+begin
+  K := Heatmaps.Depth;
+  SetLength(Result, K);
+  for c := 0 to K - 1 do
+  begin
+    Best := Heatmaps[0, 0, c];
+    Result[c].X := 0;
+    Result[c].Y := 0;
+    Result[c].Score := Best;
+    for y := 0 to Heatmaps.SizeY - 1 do
+      for x := 0 to Heatmaps.SizeX - 1 do
+      begin
+        Val := Heatmaps[x, y, c];
+        if Val > Best then
+        begin
+          Best := Val;
+          Result[c].X := x;
+          Result[c].Y := y;
+          Result[c].Score := Val;
+        end;
+      end;
+  end;
 end;
 
 function BuildDPTFromSafeTensorsEx(const FileName: string;
