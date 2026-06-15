@@ -7663,6 +7663,115 @@ procedure PixArtDenoise(Net: TNNet; const Config: TPixArtConfig;
   Latent: TNNetVolume; t: TNeuralFloat; TextStates: TNNetVolume;
   EpsOut: TNNetVolume);
 
+// ===========================================================================
+// MMDiT IMPORT (Stable Diffusion 3 / FLUX.1 dual-stream joint-attention DiT,
+// Esser et al. 2024, "Scaling Rectified Flow Transformers for High-Resolution
+// Image Synthesis", arXiv:2403.03206 - the diffusers SD3Transformer2DModel and
+// its JointTransformerBlock in diffusers.models.attention).
+//
+// The genuinely NEW architectural piece vs the landed class-conditional DiT
+// (BuildDiTFromSafeTensors) and the single-stream cross-attention PixArt is the
+// DUAL-STREAM JOINT-ATTENTION block. Image tokens (the patchified VAE latent)
+// and text tokens (the prompt condition) each carry SEPARATE per-stream adaLN
+// modulations, QKV projections and MLPs, but their Q/K/V are CONCATENATED along
+// the SEQUENCE axis for ONE joint self-attention pass (text and image attend to
+// each other SYMMETRICALLY), then the output is SPLIT back per stream and each
+// stream applies its own output projection + gated residual + MLP. This is NOT
+// the image->text CROSS-attention of PixArt (one-directional, no text update).
+//
+// One joint block (diffusers JointTransformerBlock, context_pre_only=False, the
+// standard joint block; qk_norm=None as in stabilityai/stable-diffusion-3-
+// medium - SD3.5's RMSNorm QK-norm is rejected loudly in v1):
+//   c = conditioning vector (pooled timestep+text embedding), width d.
+//   mod_i = chunk(Linear(SiLU(c)),6)  via norm1.linear         (image stream)
+//         = [sh_msa, sc_msa, g_msa, sh_mlp, sc_mlp, g_mlp]
+//   mod_t = chunk(Linear(SiLU(c)),6)  via norm1_context.linear (text stream)
+//         = [c_sh_msa, c_sc_msa, c_g_msa, c_sh_mlp, c_sc_mlp, c_g_mlp]
+//   hi = modulate(LN(img), sh_msa, sc_msa);  ht = modulate(LN(txt), c_sh, c_sc)
+//   img-stream q/k/v: attn.to_q / attn.to_k / attn.to_v   (d->d biased)
+//   txt-stream q/k/v: attn.add_q_proj / add_k_proj / add_v_proj (d->d biased)
+//   q=[qi;qt], k=[ki;kt], v=[vi;vt]  (CONCAT on seq; diffusers order img then txt)
+//   o = softmax(q kT / sqrt(head_dim)) v ; oi,ot = split(o,[img_len,txt_len])
+//   img = img + g_msa  * attn.to_out.0(oi)
+//   txt = txt + c_g_msa* attn.to_add_out(ot)
+//   img = img + g_mlp  * ff      ( modulate(LN(img), sh_mlp, sc_mlp) )
+//   txt = txt + c_g_mlp* ff_context( modulate(LN(txt), c_sh_mlp, c_sc_mlp) )
+//   modulate(h,shift,scale)=h*(1+scale)+shift; LNs are elementwise_affine=False;
+//   ff = net.2( gelu_tanh( net.0.proj(.) ) ) (diffusers ff "gelu-approximate").
+//
+// HOW JOINT ATTENTION IS EXPRESSED (pure COMPOSITION - no new leaf class):
+//   each head's Q is the X-axis TNNetConcat of [img-Q-slice ; txt-Q-slice], same
+//   for K and V; the head runs one TNNetCrossAttention over the concatenated
+//   K|V; the (img_len+txt_len, head_dim) output is split back to the two streams
+//   with TNNetCrop on the X (sequence) axis. adaLN modulation reuses the DiT
+//   helpers (TNNetFiLM over [LN(x), gamma|beta], TNNetChannelMulByLayer gate).
+//
+// v1 SCOPE: ONE standard joint block, INFERENCE on one denoise step, parity on
+// the block's two output streams. The full SD3 stack (patch embed, the combined
+// CLIP+T5 prompt tower, the pooled-projection conditioning, the context-free
+// FINAL block where the text stream is dropped, the VAE decode and the
+// rectified-flow Euler sampler) are landed elsewhere or tracked as follow-ups.
+// ---------------------------------------------------------------------------
+type
+  TMMDiTConfig = record
+    HiddenSize: integer;        // joint width d (num_heads * head_dim)
+    NumHeads: integer;          // num_attention_heads
+    HeadDim: integer;           // attention_head_dim
+    MlpHidden: integer;         // per-stream FFN hidden (4*d in SD3)
+    ImgLen: integer;            // image tokens fed to the block
+    TxtLen: integer;            // text  tokens fed to the block
+    LayerNormEps: TNeuralFloat; // 1e-6
+    ModelType: string;          // 'SD3Transformer2DModel'
+  end;
+
+// Leaf layers of one MMDiT joint block that need weights loaded.
+type
+  TMMDiTBlockLayers = record
+    ImgAdaLN, TxtAdaLN: TNNetLayer;              // norm1.linear, norm1_context.linear
+    ImgQ, ImgK, ImgV, ImgOut: TNNetLayer;        // attn.to_q/to_k/to_v/to_out.0
+    TxtQ, TxtK, TxtV, TxtOut: TNNetLayer;        // attn.add_{q,k,v}_proj/to_add_out
+    ImgFf0, ImgFf2: TNNetLayer;                  // ff.net.0.proj / ff.net.2
+    TxtFf0, TxtFf2: TNNetLayer;                  // ff_context.net.0.proj / .net.2
+  end;
+
+// Builds one MMDiT joint-attention block as a pure composition over the
+// supplied image-stream (ImgInput, (ImgLen,1,d)), text-stream (TxtInput,
+// (TxtLen,1,d)) and conditioning (CondInput, (1,1,d)) layers. Records the leaf
+// layers in Block; returns the two block-output layers (image, text). Reusable
+// directly to build a full SD3 stack once the patch embed + prompt tower wiring
+// lands; v1 wires it standalone for the parity test.
+procedure AddMMDiTJointBlock(NN: TNNet; ImgInput, TxtInput, CondInput: TNNetLayer;
+  const Config: TMMDiTConfig; var Block: TMMDiTBlockLayers;
+  out ImgOutLayer, TxtOutLayer: TNNetLayer; pInferenceOnly: boolean = false);
+
+// Loads one MMDiT joint block's diffusers weights from Reader under Prefix
+// (e.g. 'transformer_blocks.0.'). Expects qk_norm=None (no attn.norm_q/norm_k);
+// if those tensors are present the SD3.5 RMSNorm QK-norm variant is rejected.
+procedure LoadMMDiTJointBlock(Reader: TNNetSafeTensorsReader;
+  const Block: TMMDiTBlockLayers; const Prefix: string;
+  const Config: TMMDiTConfig);
+
+// Builds a standalone net holding exactly ONE MMDiT joint block: input0 the
+// image stream (ImgLen,1,d), input1 the text stream (TxtLen,1,d), input2 the
+// conditioning (1,1,d). The net's last two layers are the image and text
+// outputs (image first). Used by the v1 parity test; the same AddMMDiTJointBlock
+// builder is the reusable piece for the full importer.
+function BuildMMDiTBlock(Reader: TNNetSafeTensorsReader;
+  const Config: TMMDiTConfig; const Prefix: string;
+  out ImgOutLayer, TxtOutLayer: TNNetLayer;
+  pInferenceOnly: boolean = false): TNNet;
+
+function BuildMMDiTBlockFromSafeTensors(const FileName: string;
+  const Config: TMMDiTConfig; const Prefix: string;
+  out ImgOutLayer, TxtOutLayer: TNNetLayer;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Reads a tiny MMDiT block config.json (hidden_size, num_attention_heads,
+// attention_head_dim, img_len, txt_len, mlp_hidden, layer_norm_eps).
+function ReadMMDiTConfigFromJSONFile(const FileName: string): TMMDiTConfig;
+
+function MMDiTConfigToString(const Config: TMMDiTConfig): string;
+
 // ---------------------------------------------------------------------------
 // VQGAN / DISCRETE IMAGE-TOKENIZER IMPORT (diffusers VQModel, the encoder used
 // by autoregressive / masked image generators - MaskGIT, Parti, LlamaGen - to
@@ -55019,6 +55128,285 @@ begin
     for y := 0 to Config.SampleSize - 1 do
       for c := 0 to Config.InChannels - 1 do
         EpsOut[x, y, c] := Output[x, y, c];
+end;
+
+// ============================== MMDiT IMPORT ===============================
+// Coded by Claude (AI).
+
+function ReadMMDiTConfigFromJSONFile(const FileName: string): TMMDiTConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.LayerNormEps := 1e-6;
+  Result.ModelType := 'SD3Transformer2DModel';
+  if not FileExists(FileName) then
+    ImportError('MMDiT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('MMDiT import: ' + FileName + ' is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.NumHeads := Obj.Get('num_attention_heads', 0);
+    Result.HeadDim := Obj.Get('attention_head_dim', 0);
+    Result.HiddenSize := Obj.Get('hidden_size', Result.NumHeads * Result.HeadDim);
+    if Result.HiddenSize <= 0 then
+      Result.HiddenSize := Result.NumHeads * Result.HeadDim;
+    Result.MlpHidden := Obj.Get('mlp_hidden', 4 * Result.HiddenSize);
+    Result.ImgLen := Obj.Get('img_len', 0);
+    Result.TxtLen := Obj.Get('txt_len', 0);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', double(Result.LayerNormEps));
+    if Obj.Find('_class_name') <> nil then
+      Result.ModelType := Obj.Get('_class_name', Result.ModelType);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  if (Result.HiddenSize <= 0) or (Result.NumHeads <= 0) or
+     (Result.HeadDim <= 0) or (Result.ImgLen <= 0) or (Result.TxtLen <= 0) then
+    ImportError('MMDiT import: ' + FileName + ' is missing one of the required ' +
+      'keys num_attention_heads/attention_head_dim/img_len/txt_len.');
+  if Result.HiddenSize <> Result.NumHeads * Result.HeadDim then
+    ImportError('MMDiT import: hidden_size=' + IntToStr(Result.HiddenSize) +
+      ' must equal num_attention_heads*attention_head_dim=' +
+      IntToStr(Result.NumHeads * Result.HeadDim) + '.');
+end;
+
+function MMDiTConfigToString(const Config: TMMDiTConfig): string;
+begin
+  Result := Config.ModelType + ' joint-block config: d=' +
+    IntToStr(Config.HiddenSize) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', head_dim=' + IntToStr(Config.HeadDim) +
+    ', mlp_hidden=' + IntToStr(Config.MlpHidden) +
+    ', img_len=' + IntToStr(Config.ImgLen) +
+    ', txt_len=' + IntToStr(Config.TxtLen);
+end;
+
+procedure AddMMDiTJointBlock(NN: TNNet; ImgInput, TxtInput, CondInput: TNNetLayer;
+  const Config: TMMDiTConfig; var Block: TMMDiTBlockLayers;
+  out ImgOutLayer, TxtOutLayer: TNNetLayer; pInferenceOnly: boolean);
+var
+  d, Heads, dk, ImgLen, TxtLen, JointLen, HeadCnt, ci: integer;
+  ImgSilu, TxtSilu: TNNetLayer;
+  ImgLN1, TxtLN1, ImgFiLM1, TxtFiLM1: TNNetLayer;
+  QSliceI, KSliceI, VSliceI, QSliceT, KSliceT, VSliceT: TNNetLayer;
+  QJoint, KVJointK, KVJointV, KVPack, HeadAttn: TNNetLayer;
+  JointOut, ImgAttn, TxtAttn: TNNetLayer;
+  ImgGate1, TxtGate1, ImgGated1, TxtGated1, ImgRes1, TxtRes1: TNNetLayer;
+  ImgLN2, TxtLN2, ImgFiLM2, TxtFiLM2: TNNetLayer;
+  ImgFf, TxtFf, ImgGate2, TxtGate2, ImgGated2, TxtGated2: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  Channels: array of integer;
+begin
+  d := Config.HiddenSize;
+  Heads := Config.NumHeads;
+  dk := Config.HeadDim;
+  ImgLen := Config.ImgLen;
+  TxtLen := Config.TxtLen;
+  JointLen := ImgLen + TxtLen;
+
+  // ---- per-stream adaLN modulation from the SAME conditioning vector ----
+  // chunk layout (both streams): [shift_msa, scale_msa, gate_msa, shift_mlp,
+  // scale_mlp, gate_mlp] each width d.
+  ImgSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondInput);
+  Block.ImgAdaLN := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(6 * d), ImgSilu);
+  TxtSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondInput);
+  Block.TxtAdaLN := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(6 * d), TxtSilu);
+
+  // ---- normed + modulated streams (msa branch) ----
+  ImgLN1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), ImgInput);
+  ImgFiLM1 := NN.AddLayer( TNNetFiLM.Create(
+    [ImgLN1, DiTModCond(NN, Block.ImgAdaLN, {scale}1 * d, {shift}0 * d, d)]) );
+  TxtLN1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), TxtInput);
+  TxtFiLM1 := NN.AddLayer( TNNetFiLM.Create(
+    [TxtLN1, DiTModCond(NN, Block.TxtAdaLN, {scale}1 * d, {shift}0 * d, d)]) );
+
+  // ---- per-stream q/k/v projections ----
+  Block.ImgQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), ImgFiLM1);
+  Block.ImgK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), ImgFiLM1);
+  Block.ImgV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), ImgFiLM1);
+  Block.TxtQ := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), TxtFiLM1);
+  Block.TxtK := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), TxtFiLM1);
+  Block.TxtV := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), TxtFiLM1);
+
+  // ---- JOINT attention: per head, concat [img;txt] on the SEQUENCE axis ----
+  SetLength(HeadOutputs, Heads);
+  SetLength(Channels, dk);
+  for HeadCnt := 0 to Heads - 1 do
+  begin
+    for ci := 0 to dk - 1 do Channels[ci] := HeadCnt * dk + ci;
+    QSliceI := NN.AddLayerAfter(TNNetSplitChannels.Create(Channels), Block.ImgQ);
+    KSliceI := NN.AddLayerAfter(TNNetSplitChannels.Create(Channels), Block.ImgK);
+    VSliceI := NN.AddLayerAfter(TNNetSplitChannels.Create(Channels), Block.ImgV);
+    QSliceT := NN.AddLayerAfter(TNNetSplitChannels.Create(Channels), Block.TxtQ);
+    KSliceT := NN.AddLayerAfter(TNNetSplitChannels.Create(Channels), Block.TxtK);
+    VSliceT := NN.AddLayerAfter(TNNetSplitChannels.Create(Channels), Block.TxtV);
+    // Sequence-axis concat -> (JointLen,1,dk): diffusers order is image then
+    // text. Each per-head slice is (len,1,dk); the (len,1,dk) volume is stored
+    // token-major (token0 all dk channels, token1 ...), so a FLAT concat of
+    // [img;txt] is exactly the joint token sequence - we re-shape it to
+    // (JointLen,1,dk) by passing explicit dims to TNNetConcat.
+    QJoint   := NN.AddLayer( TNNetConcat.Create(JointLen, 1, dk, [QSliceI, QSliceT]) );
+    KVJointK := NN.AddLayer( TNNetConcat.Create(JointLen, 1, dk, [KSliceI, KSliceT]) );
+    KVJointV := NN.AddLayer( TNNetConcat.Create(JointLen, 1, dk, [VSliceI, VSliceT]) );
+    // pack K|V on depth for the cross-attention layer (Q-source = KV-source seq).
+    KVPack := NN.AddLayer( TNNetDeepConcat.Create([KVJointK, KVJointV]) );
+    HeadAttn := NN.AddLayerAfter(
+      TNNetCrossAttention.Create(dk, {CausalMask=}false, KVPack), QJoint);
+    HeadOutputs[HeadCnt] := HeadAttn;
+  end;
+  // concat heads back on depth -> (JointLen,1,d).
+  JointOut := NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+  SetLength(HeadOutputs, 0);
+  SetLength(Channels, 0);
+
+  // ---- split the joint output back per stream on the SEQUENCE (X) axis ----
+  ImgAttn := NN.AddLayerAfter(TNNetCrop.Create(0, 0, ImgLen, 1), JointOut);
+  TxtAttn := NN.AddLayerAfter(TNNetCrop.Create(ImgLen, 0, TxtLen, 1), JointOut);
+  Block.ImgOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), ImgAttn);
+  Block.TxtOut := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(d), TxtAttn);
+
+  // ---- gated residual (gate_msa is the THIRD adaLN chunk, slice 2*d..3*d) ----
+  ImgGate1 := NN.AddLayerAfter(TNNetSplitChannels.Create(2 * d, d), Block.ImgAdaLN);
+  ImgGated1 := NN.AddLayer( TNNetChannelMulByLayer.Create(Block.ImgOut, ImgGate1) );
+  ImgRes1 := NN.AddLayer( TNNetSum.Create([ImgGated1, ImgInput]) );
+  TxtGate1 := NN.AddLayerAfter(TNNetSplitChannels.Create(2 * d, d), Block.TxtAdaLN);
+  TxtGated1 := NN.AddLayer( TNNetChannelMulByLayer.Create(Block.TxtOut, TxtGate1) );
+  TxtRes1 := NN.AddLayer( TNNetSum.Create([TxtGated1, TxtInput]) );
+
+  // ---- per-stream MLP (mlp branch: scale_mlp slice 4*d, shift_mlp slice 3*d) ----
+  ImgLN2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), ImgRes1);
+  ImgFiLM2 := NN.AddLayer( TNNetFiLM.Create(
+    [ImgLN2, DiTModCond(NN, Block.ImgAdaLN, {scale}4 * d, {shift}3 * d, d)]) );
+  Block.ImgFf0 := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.MlpHidden), ImgFiLM2);
+  NN.AddLayer( TNNetGELU.Create() ); // gelu approximate='tanh'
+  Block.ImgFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+  ImgFf := Block.ImgFf2;
+  ImgGate2 := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Block.ImgAdaLN);
+  ImgGated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(ImgFf, ImgGate2) );
+  ImgOutLayer := NN.AddLayer( TNNetSum.Create([ImgGated2, ImgRes1]) );
+
+  TxtLN2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), TxtRes1);
+  TxtFiLM2 := NN.AddLayer( TNNetFiLM.Create(
+    [TxtLN2, DiTModCond(NN, Block.TxtAdaLN, {scale}4 * d, {shift}3 * d, d)]) );
+  Block.TxtFf0 := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.MlpHidden), TxtFiLM2);
+  NN.AddLayer( TNNetGELU.Create() );
+  Block.TxtFf2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+  TxtFf := Block.TxtFf2;
+  TxtGate2 := NN.AddLayerAfter(TNNetSplitChannels.Create(5 * d, d), Block.TxtAdaLN);
+  TxtGated2 := NN.AddLayer( TNNetChannelMulByLayer.Create(TxtFf, TxtGate2) );
+  TxtOutLayer := NN.AddLayer( TNNetSum.Create([TxtGated2, TxtRes1]) );
+
+  if pInferenceOnly then NN.MakeInferenceOnly();
+end;
+
+procedure LoadMMDiTJointBlock(Reader: TNNetSafeTensorsReader;
+  const Block: TMMDiTBlockLayers; const Prefix: string;
+  const Config: TMMDiTConfig);
+var
+  d, Mlp: integer;
+begin
+  d := Config.HiddenSize;
+  Mlp := Config.MlpHidden;
+  // Reject the SD3.5 RMSNorm QK-norm variant loudly (v1 is qk_norm=None).
+  if Reader.HasTensor(Prefix + 'attn.norm_q.weight') or
+     Reader.HasTensor(Prefix + 'attn.norm_k.weight') or
+     Reader.HasTensor(Prefix + 'attn.norm_added_q.weight') or
+     Reader.HasTensor(Prefix + 'attn.norm_added_k.weight') then
+    ImportError('MMDiT import: this block carries attn QK-norm weights ' +
+      '(SD3.5 / qk_norm="rms_norm"); only the qk_norm=None variant ' +
+      '(stable-diffusion-3-medium) is supported in v1.');
+  // adaLN: diffusers norm1.linear / norm1_context.linear (d -> 6*d).
+  LoadLlamaLinearWeights(Reader, Block.ImgAdaLN, Prefix + 'norm1.linear.weight',
+    d, 6 * d, 0, -1, 0, Prefix + 'norm1.linear.bias');
+  LoadLlamaLinearWeights(Reader, Block.TxtAdaLN,
+    Prefix + 'norm1_context.linear.weight',
+    d, 6 * d, 0, -1, 0, Prefix + 'norm1_context.linear.bias');
+  // image-stream q/k/v + out-proj.
+  LoadLlamaLinearWeights(Reader, Block.ImgQ, Prefix + 'attn.to_q.weight',
+    d, d, 0, -1, 0, Prefix + 'attn.to_q.bias');
+  LoadLlamaLinearWeights(Reader, Block.ImgK, Prefix + 'attn.to_k.weight',
+    d, d, 0, -1, 0, Prefix + 'attn.to_k.bias');
+  LoadLlamaLinearWeights(Reader, Block.ImgV, Prefix + 'attn.to_v.weight',
+    d, d, 0, -1, 0, Prefix + 'attn.to_v.bias');
+  LoadLlamaLinearWeights(Reader, Block.ImgOut, Prefix + 'attn.to_out.0.weight',
+    d, d, 0, -1, 0, Prefix + 'attn.to_out.0.bias');
+  // text-stream q/k/v + out-proj.
+  LoadLlamaLinearWeights(Reader, Block.TxtQ, Prefix + 'attn.add_q_proj.weight',
+    d, d, 0, -1, 0, Prefix + 'attn.add_q_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.TxtK, Prefix + 'attn.add_k_proj.weight',
+    d, d, 0, -1, 0, Prefix + 'attn.add_k_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.TxtV, Prefix + 'attn.add_v_proj.weight',
+    d, d, 0, -1, 0, Prefix + 'attn.add_v_proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.TxtOut, Prefix + 'attn.to_add_out.weight',
+    d, d, 0, -1, 0, Prefix + 'attn.to_add_out.bias');
+  // per-stream MLP (gelu-approximate, NOT GEGLU): net.0.proj (d->mlp), net.2.
+  LoadLlamaLinearWeights(Reader, Block.ImgFf0, Prefix + 'ff.net.0.proj.weight',
+    d, Mlp, 0, -1, 0, Prefix + 'ff.net.0.proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.ImgFf2, Prefix + 'ff.net.2.weight',
+    Mlp, d, 0, -1, 0, Prefix + 'ff.net.2.bias');
+  LoadLlamaLinearWeights(Reader, Block.TxtFf0,
+    Prefix + 'ff_context.net.0.proj.weight',
+    d, Mlp, 0, -1, 0, Prefix + 'ff_context.net.0.proj.bias');
+  LoadLlamaLinearWeights(Reader, Block.TxtFf2, Prefix + 'ff_context.net.2.weight',
+    Mlp, d, 0, -1, 0, Prefix + 'ff_context.net.2.bias');
+end;
+
+function BuildMMDiTBlock(Reader: TNNetSafeTensorsReader;
+  const Config: TMMDiTConfig; const Prefix: string;
+  out ImgOutLayer, TxtOutLayer: TNNetLayer;
+  pInferenceOnly: boolean): TNNet;
+var
+  NN: TNNet;
+  ImgInput, TxtInput, CondInput: TNNetLayer;
+  Block: TMMDiTBlockLayers;
+begin
+  if (Config.NumHeads < 1) or (Config.HeadDim < 1) or
+     (Config.HiddenSize <> Config.NumHeads * Config.HeadDim) then
+    ImportError('MMDiT import: hidden_size must equal num_heads*head_dim.');
+  NN := TNNet.Create();
+  try
+    ImgInput := NN.AddLayer( TNNetInput.Create(Config.ImgLen, 1, Config.HiddenSize) );
+    TxtInput := NN.AddLayer( TNNetInput.Create(Config.TxtLen, 1, Config.HiddenSize) );
+    CondInput := NN.AddLayer( TNNetInput.Create(1, 1, Config.HiddenSize) );
+    AddMMDiTJointBlock(NN, ImgInput, TxtInput, CondInput, Config, Block,
+      ImgOutLayer, TxtOutLayer, pInferenceOnly);
+    LoadMMDiTJointBlock(Reader, Block, Prefix, Config);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildMMDiTBlockFromSafeTensors(const FileName: string;
+  const Config: TMMDiTConfig; const Prefix: string;
+  out ImgOutLayer, TxtOutLayer: TNNetLayer;
+  pInferenceOnly: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildMMDiTBlock(Reader, Config, Prefix, ImgOutLayer, TxtOutLayer,
+      pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
 end;
 
 // ============================ VideoMAE IMPORT ==============================

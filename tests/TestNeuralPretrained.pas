@@ -375,6 +375,8 @@ type
     procedure TestDiTSchedulerSmoke;
     procedure TestPixArtConfigFromJSONFile;
     procedure TestPixArtParity;
+    procedure TestMMDiTConfigFromJSONFile;
+    procedure TestMMDiTJointBlockParity;
     procedure TestLatentTextToImageSmoke;
     procedure TestRRDBNetParity;
     procedure TestNAFNetConfigFromJSONFile;
@@ -17313,6 +17315,141 @@ begin
     RefRoot.Free;
     TextStates.Free;
     LatentInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMMDiTConfigFromJSONFile;
+var
+  Config: TMMDiTConfig;
+begin
+  Config := ReadMMDiTConfigFromJSONFile(FixturePath('tiny_mmdit_config.json'));
+  AssertEquals('mmdit hidden', 16, Config.HiddenSize);
+  AssertEquals('mmdit heads', 2, Config.NumHeads);
+  AssertEquals('mmdit head_dim', 8, Config.HeadDim);
+  AssertEquals('mmdit img_len', 5, Config.ImgLen);
+  AssertEquals('mmdit txt_len', 3, Config.TxtLen);
+  AssertEquals('mmdit mlp_hidden', 64, Config.MlpHidden);
+  AssertTrue('mmdit model type',
+    Pos('SD3', Config.ModelType) > 0);
+end;
+
+// Pico parity for ONE MMDiT (SD3 / FLUX) joint-attention block - the genuinely
+// new dual-stream piece: image tokens and text tokens carry SEPARATE adaLN
+// modulations / QKV projections / MLPs but their Q/K/V are CONCATENATED on the
+// sequence axis for ONE joint self-attention pass, then split back per stream.
+// Checks BOTH the image-stream and text-stream block outputs against a float64
+// numpy oracle (tools/make_pico_mmdit_fixture.py, the diffusers
+// JointTransformerBlock math, qk_norm=None) to < 1e-4. The net has three inputs:
+// input0 image stream (img_len,1,d), input1 text stream (txt_len,1,d), input2
+// the (1,1,d) conditioning vector; the block builder is the reusable piece a
+// full SD3 importer wires patch-embed + prompt-tower + final-layer around.
+procedure TTestNeuralPretrained.TestMMDiTJointBlockParity;
+var
+  NN: TNNet;
+  Config: TMMDiTConfig;
+  ImgOutLayer, TxtOutLayer: TNNetLayer;
+  ImgInput, TxtInput, CondInput: TNNetVolume;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr: TJSONArray;
+  CaseObj: TJSONObject;
+  ImgArr, TxtArr, CArr, OutImgArr, OutTxtArr: TJSONArray;
+  d, CaseCnt, tk, ch, FlatIdx, LayerCnt, InputCnt: integer;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  TxtInputLayer, CondInputLayer: TNNetLayer;
+begin
+  RandSeed := 424242;
+  Config := ReadMMDiTConfigFromJSONFile(FixturePath('tiny_mmdit_config.json'));
+  d := Config.HiddenSize;
+  NN := BuildMMDiTBlockFromSafeTensors(FixturePath('tiny_mmdit.safetensors'),
+    Config, {Prefix=}'', ImgOutLayer, TxtOutLayer,
+    {pInferenceOnly=}false);
+  // The pico fixture writes raw diffusers JointTransformerBlock tensor names
+  // (norm1.*, attn.to_q, ...); a real SD3 checkpoint prefixes them with
+  // 'transformer_blocks.<i>.' which the importer accepts via the Prefix arg.
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  TxtInput := TNNetVolume.Create;
+  CondInput := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  try
+    AssertTrue('mmdit block built', NN <> nil);
+    // Locate the 2nd (text) and 3rd (cond) TNNetInput layers.
+    TxtInputLayer := nil;
+    CondInputLayer := nil;
+    InputCnt := 0;
+    for LayerCnt := 0 to NN.CountLayers() - 1 do
+      if NN.Layers[LayerCnt] is TNNetInput then
+      begin
+        if InputCnt = 1 then TxtInputLayer := NN.Layers[LayerCnt];
+        if InputCnt = 2 then CondInputLayer := NN.Layers[LayerCnt];
+        Inc(InputCnt);
+      end;
+    AssertTrue('text input found', TxtInputLayer <> nil);
+    AssertTrue('cond input found', CondInputLayer <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_mmdit_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      ImgArr := TJSONArray(CaseObj.Find('img'));      // flat (img_len, d)
+      TxtArr := TJSONArray(CaseObj.Find('txt'));      // flat (txt_len, d)
+      CArr := TJSONArray(CaseObj.Find('c'));          // flat (d,)
+      OutImgArr := TJSONArray(CaseObj.Find('out_img'));
+      OutTxtArr := TJSONArray(CaseObj.Find('out_txt'));
+      // Fill the three inputs. The token-major flat layout (tok, ch) maps to the
+      // CAI (x,y,depth) volume as FData[tok*d + ch] for a (len,1,d) volume.
+      ImgInput.ReSize(Config.ImgLen, 1, d);
+      for tk := 0 to Config.ImgLen - 1 do
+        for ch := 0 to d - 1 do
+          ImgInput.FData[tk * d + ch] := ImgArr.Items[tk * d + ch].AsFloat;
+      TxtInput.ReSize(Config.TxtLen, 1, d);
+      for tk := 0 to Config.TxtLen - 1 do
+        for ch := 0 to d - 1 do
+          TxtInput.FData[tk * d + ch] := TxtArr.Items[tk * d + ch].AsFloat;
+      CondInput.ReSize(1, 1, d);
+      for ch := 0 to d - 1 do CondInput.FData[ch] := CArr.Items[ch].AsFloat;
+      // input0 = image (set by Compute), input1 = text, input2 = cond.
+      TxtInputLayer.Output.CopyNoChecks(TxtInput);
+      CondInputLayer.Output.CopyNoChecks(CondInput);
+      NN.Compute(ImgInput);
+      // image-stream output.
+      AssertEquals('img out tokens', Config.ImgLen, ImgOutLayer.Output.SizeX);
+      AssertEquals('img out channels', d, ImgOutLayer.Output.Depth);
+      for tk := 0 to Config.ImgLen - 1 do
+        for ch := 0 to d - 1 do
+        begin
+          FlatIdx := tk * d + ch;
+          RefVal := OutImgArr.Items[FlatIdx].AsFloat;
+          GotVal := ImgOutLayer.Output.FData[tk * d + ch];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      // text-stream output.
+      AssertEquals('txt out tokens', Config.TxtLen, TxtOutLayer.Output.SizeX);
+      AssertEquals('txt out channels', d, TxtOutLayer.Output.Depth);
+      for tk := 0 to Config.TxtLen - 1 do
+        for ch := 0 to d - 1 do
+        begin
+          FlatIdx := tk * d + ch;
+          RefVal := OutTxtArr.Items[FlatIdx].AsFloat;
+          GotVal := TxtOutLayer.Output.FData[tk * d + ch];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+    end;
+    AssertTrue('MMDiT joint block: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    TxtInput.Free;
+    CondInput.Free;
     RefJson.Free;
     NN.Free;
   end;

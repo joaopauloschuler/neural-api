@@ -1005,22 +1005,28 @@ rather than acted on.
         per-pixel broadcast noise for real stochastic synthesis).
   - [ ] real stylegan2 checkpoint (NVIDIA .pkl / a rosinality safetensors) parity once
         obtainable; the training path (discriminator + path-length reg) and StyleGAN3.
-- [ ] MMDiT (Stable Diffusion 3 / FLUX.1) text-to-image transformer importer
-      (BuildMMDiTFromSafeTensors, e.g. stabilityai/stable-diffusion-3-medium or a
-      small Flux-schnell config) — the DUAL-STREAM joint-attention DiT, architecturally
-      DISTINCT from the landed class-conditional DiT (BuildDiTFromSafeTensors) and the
-      tracked single-stream cross-attention PixArt-alpha. The genuinely new piece is the
-      MMDiT block: image tokens and text tokens carry SEPARATE per-stream
-      projections/MLPs/adaLN modulations but are CONCATENATED for ONE JOINT
-      self-attention pass (text and image attend to each other symmetrically), then
-      split back — not the image->text CROSS-attention of PixArt. Everything else is
-      landed: patch embed, the T5 + CLIP prompt towers (BuildT5/BuildClip), the VAE
-      decoder (BuildVaeDecoderFromSafeTensors), and a RECTIFIED-FLOW Euler sampler
-      (the examples/FlowMatching velocity-field loop). Scope v1 to inference on one
-      denoise step. The cheapest path to a REAL modern text-to-image checkpoint and a
-      second route (besides the tracked PixArt) to the LatentTextToImage capstone with
-      NO SD UNet. Pico parity vs a diffusers float64 oracle on one block's joint-attention
-      output + reuse make_pico_*_fixture.py.
+- [X] MMDiT (Stable Diffusion 3 / FLUX.1) text-to-image transformer importer — v1:
+      the DUAL-STREAM joint-attention BLOCK (the genuinely new piece) lands as a pure
+      composition builder AddMMDiTJointBlock + LoadMMDiTJointBlock + BuildMMDiTBlock
+      [FromSafeTensors] + ReadMMDiTConfigFromJSONFile in neuralpretrained.pas. Image
+      tokens and text tokens carry SEPARATE per-stream adaLN modulations (norm1 /
+      norm1_context), QKV projections (attn.to_q/k/v + attn.add_q/k/v_proj), out-proj
+      (attn.to_out.0 / attn.to_add_out) and MLPs (ff / ff_context); their per-head Q/K/V
+      are CONCATENATED on the SEQUENCE axis (TNNetConcat with explicit (JointLen,1,dk)
+      dims) for ONE joint self-attention pass (TNNetCrossAttention over the packed K|V,
+      img attends to txt and vice-versa SYMMETRICALLY), then SPLIT back per stream with
+      TNNetCrop on the X axis — NOT PixArt's one-directional image->text cross-attention.
+      adaLN reuses the DiT helpers (DiTModCond/TNNetFiLM gamma|beta, TNNetChannelMulByLayer
+      gate). qk_norm=None (stable-diffusion-3-medium); SD3.5 RMSNorm QK-norm rejected
+      loudly. Pico parity on BOTH stream outputs of one block vs a float64 numpy diffusers
+      JointTransformerBlock oracle (< 1e-4) — tools/make_pico_mmdit_fixture.py +
+      tests/fixtures/tiny_mmdit.* + TestMMDiTJointBlockParity/TestMMDiTConfigFromJSONFile.
+      Follow-ups [ ]: full BuildMMDiTFromSafeTensors stack (patch embed + combined CLIP+T5
+      prompt tower + pooled-projection conditioning + N joint blocks + final adaLN/unpatchify);
+      the CONTEXT-FREE final block (context_pre_only=True, text stream dropped); the
+      end-to-end rectified-flow Euler sampler driving it (reuse examples/FlowMatching) into
+      the LatentTextToImage capstone with NO SD UNet; real stabilityai/stable-diffusion-3-
+      medium (or Flux-schnell) checkpoint parity; SD3.5 RMSNorm QK-norm support.
 - [ ] AnimateDiff text-to-VIDEO motion-module importer (BuildAnimateDiffFromSafeTensors,
       e.g. guoyww/animatediff-motion-adapter-v1-5-2) — the FIRST video-GENERATIVE
       importer (a sequence of frames from a text prompt), a brand-new generative
