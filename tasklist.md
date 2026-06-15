@@ -760,7 +760,12 @@ rather than acted on.
       conv upsampling, so it needs an `ISTFT(mag, phase)` overlap-add primitive in
       `neuralaudio.pas` (the inverse of the existing `WhisperLogMelFromWavFile` /
       forward-STFT machinery — a genuinely missing DSP building block, also reusable by
-      future vocoders); (3) a **prosody/duration stack** driving a length-regulator
+      future vocoders) — **the ISTFT primitive LANDED**: `ISTFTOverlapAdd(Mag, Phase,
+      Wave, NFFT, HopLength)` + `ISTFTOverlapAddReIm(Re, Im, ...)` in `neuralaudio.pas`
+      (COLA / window_sumsquare normalization, periodic-Hann synthesis mirroring the
+      forward CosTab/SinTab convention), with a forward-STFT->ISTFT round-trip test
+      `TestISTFTRoundTrip` (75% overlap, interior max-abs err 2.98e-8, float32-storage
+      limited); the rest of the iSTFTNet decoder wiring stays open; (3) a **prosody/duration stack** driving a length-regulator
       expansion analogous to the VITS deterministic duration path but conditioned on the
       style vector. Reuse where possible: the length-regulator / monotonic-expansion math
       and `SaveVolumeToWav16` from the VITS path, and the conv/LSTM primitives already in

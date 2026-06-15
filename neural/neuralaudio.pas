@@ -90,6 +90,44 @@ procedure ComputeWhisperLogMel(Samples: TNNetVolume; Mel: TNNetVolume;
 procedure WhisperLogMelFromWavFile(const FileName: string; Mel: TNNetVolume;
   NumMelBins: integer = 80; NumFrames: integer = 3000);
 
+// Inverse STFT overlap-add (OLA) synthesis - the exact inverse of the forward
+// real STFT used by ComputeWhisperLogMel (periodic Hann analysis window, same
+// one-sided rDFT bin convention). Reconstructs a mono waveform from a complex
+// spectrogram given as a magnitude + phase pair (ISTFTOverlapAdd) or as a
+// real + imaginary pair (ISTFTOverlapAddReIm).
+//
+// Mag/Phase (or Re/Im) are (NumFrames, 1, NumFreqBins) volumes, time along
+// SizeX and frequency bins along Depth - the same (SeqLen, 1, Channels) layout
+// ComputeWhisperLogMel emits. NumFreqBins MUST equal NFFT div 2 + 1 (one-sided
+// real-FFT layout). The bin convention mirrors the forward DFT tables exactly:
+//   Re[k] = Mag[k]*cos(Phase[k]),  Im[k] = Mag[k]*sin(Phase[k])
+// where the stored Im is +sum(x*sin(2*pi*k*t/NFFT)) (i.e. the negated standard
+// imaginary part, identical to the forward CosTab/SinTab convention here), so
+// a forward STFT computed with the file's tables fed straight back in is a true
+// round-trip.
+//
+// Each frame is inverse-rDFT'd, multiplied by the synthesis Hann window, and
+// overlap-added; the accumulated signal is then divided by the overlap-added
+// squared-window envelope (the COLA / window_sumsquare normalization that
+// torch/librosa apply), with a small epsilon guard against divide-by-zero at
+// edge samples covered by no window. With a perfect-reconstruction Hann window
+// and 75% overlap (HopLength = NFFT div 4) the interior reconstructs the
+// original waveform to ~1e-12.
+//
+// Wave is resized to (NFFT + (NumFrames-1)*HopLength, 1, 1) - the full
+// uncentred OLA length (NO librosa center-trim; trim NFFT div 2 from each end
+// yourself if you fed a centre-padded forward STFT). The first and last
+// ~NFFT-HopLength samples are partial-overlap (COLA not satisfied) and should
+// be treated as edge transients.
+procedure ISTFTOverlapAdd(Mag, Phase, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+
+// As ISTFTOverlapAdd but the spectrogram is supplied as real + imaginary parts
+// (same bin/sign convention as the forward CosTab/SinTab tables here) instead
+// of magnitude + phase. ISTFTOverlapAdd is a thin wrapper over this.
+procedure ISTFTOverlapAddReIm(Re, Im, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+
 implementation
 
 const
@@ -463,6 +501,128 @@ begin
     ComputeWhisperLogMel(Samples, Mel, NumMelBins, NumFrames);
   finally
     Samples.Free;
+  end;
+end;
+
+procedure ISTFTOverlapAddReIm(Re, Im, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+var
+  NumFrames, NumBins, OutLen: integer;
+  FrameCnt, BinCnt, TapCnt, OutIdx, FrameStart: integer;
+  Window: array of double;        // periodic hann (matches forward analysis)
+  CosTab, SinTab: array of double; // (NumBins x NFFT) inverse-DFT twiddles
+  AccSig: array of double;        // overlap-added windowed frames
+  AccEnv: array of double;        // overlap-added squared-window envelope
+  ReVal, ImVal, Sample, Scale, WinTap: double;
+const
+  csEnvEps = 1e-12;               // divide-by-zero guard for the COLA envelope
+begin
+  if NFFT < 2 then
+    raise Exception.Create('ISTFTOverlapAdd: NFFT must be >= 2.');
+  if HopLength < 1 then
+    raise Exception.Create('ISTFTOverlapAdd: HopLength must be >= 1.');
+  NumBins := NFFT div 2 + 1;
+  if (Re.Depth <> NumBins) or (Im.Depth <> NumBins) then
+    raise Exception.Create('ISTFTOverlapAdd: Re/Im Depth must be NFFT div 2 + 1.');
+  NumFrames := Re.SizeX;
+  if Im.SizeX <> NumFrames then
+    raise Exception.Create('ISTFTOverlapAdd: Re and Im must have the same frame count.');
+  if NumFrames < 1 then
+    raise Exception.Create('ISTFTOverlapAdd: at least one frame is required.');
+
+  // ---- periodic hann synthesis window (matches the forward analysis) ----
+  SetLength(Window, NFFT);
+  for TapCnt := 0 to NFFT - 1 do
+    Window[TapCnt] := 0.5 - 0.5 * Cos(2.0 * Pi * TapCnt / NFFT);
+
+  // ---- inverse-rDFT twiddle tables (same cos/sin convention as forward) ----
+  // x[t] = (1/NFFT) * ( Re[0]
+  //        + 2*sum_{k=1..NumBins-1}( Re[k]*cos + Im[k]*sin )  [k=NFFT/2 halved]
+  //        ). The Im sign matches the forward SinTab (stored Im = +sum x*sin),
+  // so feeding a forward STFT computed with this file's tables back in inverts.
+  SetLength(CosTab, NumBins * NFFT);
+  SetLength(SinTab, NumBins * NFFT);
+  for BinCnt := 0 to NumBins - 1 do
+    for TapCnt := 0 to NFFT - 1 do
+    begin
+      CosTab[BinCnt * NFFT + TapCnt] :=
+        Cos(2.0 * Pi * BinCnt * TapCnt / NFFT);
+      SinTab[BinCnt * NFFT + TapCnt] :=
+        Sin(2.0 * Pi * BinCnt * TapCnt / NFFT);
+    end;
+
+  OutLen := NFFT + (NumFrames - 1) * HopLength;
+  SetLength(AccSig, OutLen);
+  SetLength(AccEnv, OutLen);
+  for OutIdx := 0 to OutLen - 1 do
+  begin
+    AccSig[OutIdx] := 0.0;
+    AccEnv[OutIdx] := 0.0;
+  end;
+
+  for FrameCnt := 0 to NumFrames - 1 do
+  begin
+    FrameStart := FrameCnt * HopLength;
+    for TapCnt := 0 to NFFT - 1 do
+    begin
+      // inverse real DFT of this frame at sample TapCnt
+      Sample := 0.0;
+      for BinCnt := 0 to NumBins - 1 do
+      begin
+        ReVal := Re.FData[FrameCnt * NumBins + BinCnt];
+        ImVal := Im.FData[FrameCnt * NumBins + BinCnt];
+        // bins 0 and NFFT/2 are self-conjugate -> weight 1, the rest weight 2
+        // (they stand in for their negative-frequency conjugate partner).
+        if (BinCnt = 0) or ((BinCnt = NumBins - 1) and (NFFT mod 2 = 0)) then
+          Scale := 1.0
+        else
+          Scale := 2.0;
+        Sample := Sample + Scale *
+          (ReVal * CosTab[BinCnt * NFFT + TapCnt] +
+           ImVal * SinTab[BinCnt * NFFT + TapCnt]);
+      end;
+      Sample := Sample / NFFT;
+      WinTap := Window[TapCnt];
+      OutIdx := FrameStart + TapCnt;
+      AccSig[OutIdx] := AccSig[OutIdx] + Sample * WinTap;
+      AccEnv[OutIdx] := AccEnv[OutIdx] + WinTap * WinTap;
+    end;
+  end;
+
+  // ---- COLA / window_sumsquare normalization (guarded) ----
+  Wave.ReSize(OutLen, 1, 1);
+  for OutIdx := 0 to OutLen - 1 do
+    if AccEnv[OutIdx] > csEnvEps then
+      Wave.FData[OutIdx] := AccSig[OutIdx] / AccEnv[OutIdx]
+    else
+      Wave.FData[OutIdx] := 0.0;
+end;
+
+procedure ISTFTOverlapAdd(Mag, Phase, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+var
+  Re, Im: TNNetVolume;
+  Idx: integer;
+  M, P: double;
+begin
+  if (Mag.SizeX <> Phase.SizeX) or (Mag.Depth <> Phase.Depth) then
+    raise Exception.Create('ISTFTOverlapAdd: Mag and Phase must have the same shape.');
+  Re := TNNetVolume.Create(Mag.SizeX, 1, Mag.Depth);
+  Im := TNNetVolume.Create(Mag.SizeX, 1, Mag.Depth);
+  try
+    // Re[k] = Mag*cos(Phase), Im[k] = Mag*sin(Phase) - the forward table
+    // convention (stored Im = +sum x*sin), so the round-trip is exact.
+    for Idx := 0 to Mag.Size - 1 do
+    begin
+      M := Mag.FData[Idx];
+      P := Phase.FData[Idx];
+      Re.FData[Idx] := M * Cos(P);
+      Im.FData[Idx] := M * Sin(P);
+    end;
+    ISTFTOverlapAddReIm(Re, Im, Wave, NFFT, HopLength);
+  finally
+    Re.Free;
+    Im.Free;
   end;
 end;
 

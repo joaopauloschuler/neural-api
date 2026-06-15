@@ -34,6 +34,9 @@ type
     procedure TestWavHeader;
     // An empty (zero-length) waveform writes a valid header and reads back 0.
     procedure TestWavEmpty;
+    // Forward STFT -> ISTFTOverlapAdd round-trips the interior near-exactly
+    // under a perfect-reconstruction Hann window with 75% overlap.
+    procedure TestISTFTRoundTrip;
   end;
 
 implementation
@@ -144,6 +147,95 @@ begin
   finally
     Src.Free;
     Dst.Free;
+  end;
+end;
+
+// Forward real STFT mirroring neuralaudio's CosTab/SinTab convention exactly:
+// Re[k] = sum_t (x[FrameStart+t]*Window[t]) * cos(2*pi*k*t/NFFT)
+// Im[k] = sum_t (x[FrameStart+t]*Window[t]) * sin(2*pi*k*t/NFFT)
+// (no centering: FrameStart = frame*Hop), periodic Hann analysis window.
+// Produces Mag/Phase volumes (NumFrames, 1, NFFT div 2 + 1) consumable by
+// ISTFTOverlapAdd. This is the inverse contract under test.
+procedure ForwardSTFT(Sig: TNNetVolume; Mag, Phase: TNNetVolume;
+  NFFT, Hop: integer);
+var
+  NumBins, NumFrames, f, k, t, start, src: integer;
+  Window: array of double;
+  ReAcc, ImAcc, v: double;
+begin
+  NumBins := NFFT div 2 + 1;
+  NumFrames := (Sig.Size - NFFT) div Hop + 1;
+  SetLength(Window, NFFT);
+  for t := 0 to NFFT - 1 do
+    Window[t] := 0.5 - 0.5 * Cos(2.0 * Pi * t / NFFT);
+  Mag.ReSize(NumFrames, 1, NumBins);
+  Phase.ReSize(NumFrames, 1, NumBins);
+  for f := 0 to NumFrames - 1 do
+  begin
+    start := f * Hop;
+    for k := 0 to NumBins - 1 do
+    begin
+      ReAcc := 0.0;
+      ImAcc := 0.0;
+      for t := 0 to NFFT - 1 do
+      begin
+        src := start + t;
+        v := Sig.FData[src] * Window[t];
+        ReAcc := ReAcc + v * Cos(2.0 * Pi * k * t / NFFT);
+        ImAcc := ImAcc + v * Sin(2.0 * Pi * k * t / NFFT);
+      end;
+      Mag.FData[f * NumBins + k] := Sqrt(ReAcc * ReAcc + ImAcc * ImAcc);
+      Phase.FData[f * NumBins + k] := ArcTan2(ImAcc, ReAcc);
+    end;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestISTFTRoundTrip;
+const
+  csNFFT = 16;
+  csHop = csNFFT div 4;   // 75% overlap -> Hann satisfies COLA
+  csN = 256;
+var
+  Sig, Mag, Phase, Rec: TNNetVolume;
+  i, lo, hi: integer;
+  t, MaxDiff, d: double;
+begin
+  Sig := TNNetVolume.Create(csN, 1, 1);
+  Mag := TNNetVolume.Create(1, 1, 1);
+  Phase := TNNetVolume.Create(1, 1, 1);
+  Rec := TNNetVolume.Create(1, 1, 1);
+  try
+    // deterministic sum of two sinusoids, well inside [-1, 1]
+    for i := 0 to csN - 1 do
+    begin
+      t := i / csN;
+      Sig.FData[i] := 0.5 * Sin(2.0 * Pi * 5.0 * t) +
+                      0.3 * Cos(2.0 * Pi * 11.0 * t);
+    end;
+    ForwardSTFT(Sig, Mag, Phase, csNFFT, csHop);
+    ISTFTOverlapAdd(Mag, Phase, Rec, csNFFT, csHop);
+
+    // Interior only: skip the first/last (NFFT - Hop) samples where the
+    // overlap-add envelope is partial (COLA not satisfied at the edges).
+    // Tolerance 1e-9: the DSP is all double precision; only TNNetVolume's
+    // float32 storage of Mag/Phase/Rec limits the round-trip (~1e-6), so we
+    // keep a comfortable 1e-4 bound the float32 path easily clears.
+    lo := csNFFT - csHop;
+    hi := Rec.Size - (csNFFT - csHop) - 1;
+    AssertTrue('reconstruction length covers the interior', hi > lo);
+    MaxDiff := 0;
+    for i := lo to hi do
+    begin
+      d := Abs(Sig.FData[i] - Rec.FData[i]);
+      if d > MaxDiff then MaxDiff := d;
+    end;
+    AssertTrue('interior ISTFT round-trip max abs diff < 1e-4 (' +
+      FloatToStr(MaxDiff) + ')', MaxDiff < 1e-4);
+  finally
+    Sig.Free;
+    Mag.Free;
+    Phase.Free;
+    Rec.Free;
   end;
 end;
 
