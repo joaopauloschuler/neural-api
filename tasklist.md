@@ -312,6 +312,39 @@ rather than acted on.
       prompt + single mask output to keep the decoder small. Pico parity vs HF
       float64 on the encoder embedding first (decoder is the stretch); demo:
       examples/SegmentAnything segments an object from one click on a tiny image.
+- [ ] Depth Anything V2 / DPT monocular-depth importer
+      (BuildDepthAnythingFromSafeTensors, e.g. depth-anything/Depth-Anything-V2-Small-hf
+      or Intel/dpt-hybrid-midas) — the FIRST DENSE-REGRESSION vision importer and a
+      brand-new output modality: one RGB image -> a per-pixel depth map (the landed
+      examples/DepthEstimation is a from-scratch TRAINING toy, not a real-checkpoint
+      importer). Reuses the landed DINOv2 ViT backbone wholesale (Depth Anything's
+      encoder IS DINOv2) and adds the DPT head: (a) the "reassemble" step that takes
+      patch tokens from 4 chosen encoder layers and projects+resizes them into a
+      4-level feature pyramid (1x1 conv + transpose/identity/strided resampling), and
+      (b) the RefineNet-style top-down fusion (residual conv units + nearest upsample)
+      ending in a small conv depth head -> single-channel HxW map. The only genuinely
+      new code is the multi-layer-token reassemble + the fusion-block wiring; resize
+      reuses TNNetDeMaxPool / TNNetUpsample. Pico parity vs HF float64 on the depth
+      logits < 1e-4 + an examples/MonoDepth that writes a grayscale depth map of one
+      tiny CPU image. Distinct from SegFormer (class map), DETR/SAM (objects/masks)
+      and the open Mask R-CNN — this is continuous per-pixel regression.
+- [ ] Mask2Former universal-segmentation importer
+      (BuildMask2FormerFromSafeTensors, e.g. facebook/mask2former-swin-tiny-*-semantic)
+      — a third, architecturally DISTINCT segmentation vertical: mask-classification
+      set-prediction (a fixed set of learned queries each predicting one binary mask +
+      a class), unifying semantic/instance/panoptic in one head. Different from the
+      landed SegFormer (per-PIXEL argmax) and the tracked Mask R-CNN (RoIAlign on
+      region proposals) — there are NO proposals and NO per-pixel classifier. Reuses
+      the landed DETR set-prediction machinery (learned object queries + a transformer
+      decoder, already imported for detection) and a Swin/ResNet backbone (Swin is a
+      landed classifier importer); the new pieces are the lightweight pixel decoder
+      (a small FPN-style multi-scale conv pixel embedding, reusing the Mask R-CNN FPN
+      blocks) and the masked-attention decoder layer (cross-attention restricted to the
+      current mask foreground) plus the dot-product query-embedding x pixel-embedding
+      -> per-query mask logits. Scope v1 to semantic inference (argmax over query
+      class x mask). Pico parity vs HF float64 on the mask logits for a fixed image +
+      an examples/UniversalSegmentation that writes one segmentation overlay on a tiny
+      CPU image.
 - [ ] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
       + TRRDBNetConfig LANDED in neuralpretrained.pas; RRDBNet x4 with
       NEAREST-interpolate conv upsampling via TNNetDeMaxPool(2), parametrized
@@ -1140,7 +1173,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       DecodeSeq2SeqSampled / DecodeSeq2SeqBeamSearch helpers for the image-
       encoder path); (c) BLIP-2 (Q-Former + frozen LLM) is a distinct, larger
       architecture, still open.
-- [ ] VQ-GAN training example (examples/VQGAN) — upgrades the landed VQVAE
+- [X] VQ-GAN training example (examples/VQGAN) — upgrades the landed VQVAE
       (reconstruction-only L2) into the GENERATIVE-CV regime by adding a
       PatchGAN discriminator (reuse the Pix2Pix discriminator) + an adversarial
       loss and a perceptual term (reuse the landed LPIPS / ComputeLPIPSDistance),
