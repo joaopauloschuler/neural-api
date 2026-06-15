@@ -402,7 +402,10 @@ rather than acted on.
       upsample), and DFL box decoding; NMS is a small CPU post-process. Pico parity
       vs an ultralytics float64 oracle on the head outputs + an examples/YoloDetect
       that draws boxes on one CPU image. Reuses the conv-BN-fold loader path.
-- [ ] SegFormer semantic-segmentation importer (nvidia/segformer-b0-finetuned-ade)
+- [X] SegFormer semantic-segmentation importer (nvidia/segformer-b0-finetuned-ade)
+      — DONE (commit 6048520): BuildSegformerFromSafeTensors + new TNNetBilinearUpsample
+      layer, all-MLP decode head, examples/SemanticSegmentation, pico parity
+      TestSegformerSemanticSegmentationParity < 1e-4 vs HF float64. (Original task below.)
       — the FIRST dense semantic-segmentation importer (per-pixel class map), the
       vertical explicitly flagged as "unblocked" by the hierarchical backbone work.
       Two pieces: (a) the MiT (Mix Transformer) hierarchical encoder — overlap-patch
