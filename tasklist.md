@@ -703,8 +703,12 @@ rather than acted on.
       ships). Discriminators skipped (training-only). Parity-gated < 1e-4 against an
       HF SpeechT5HifiGan float64 oracle (tools/make_pico_hifigan_fixture.py ->
       tests/fixtures/tiny_hifigan*, TestHiFiGANSynthesisParity). Open follow-ups:
-  - [ ] resblock type "2" (the alternative MRF wiring) — currently rejected loudly
-        in ReadHiFiGANConfigFromJSONFile.
+  - [X] resblock type "2" (the alternative MRF wiring) — LANDED. THiFiGANConfig.ResblockType
+        (1|2); ReadHiFiGANConfigFromJSONFile accepts resblock="2"; builder loads single
+        `resblocks.{i}.convs.{j}` per tap (no convs2) and Synthesize does x:=x+Conv(LReLU(x))
+        per tap. Self-contained float64 numpy oracle (tools/make_pico_hifigan_rb2_fixture.py,
+        cross-validated to 5e-16 vs the HF type-1 oracle) -> tests/fixtures/tiny_hifigan_rb2*,
+        TestHiFiGANSynthesisParityResBlock2 (< 1e-4).
   - [ ] real-checkpoint smoke: resynthesize a clip with a downloaded `hifigan` /
         SpeechT5HifiGan generator (weight_norm fold path) and write it via
         SaveVolumeToWav16 (offline + RAM-gated here, so deferred).

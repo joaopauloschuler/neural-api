@@ -3964,6 +3964,8 @@ type
     NormalizeBefore: boolean;      // normalize_before (SpeechT5 mean/scale)
     SamplingRate: integer;         // sampling_rate (for the WAV writer)
     ModelType: string;             // 'hifigan'
+    ResblockType: integer;         // resblock type: 1 (convs1+convs2 pair) or
+                                   // 2 (single dilated conv per tap, jik876 v2/v3)
   end;
 
   // One plain Conv1d (or ConvTranspose1d when Transpose) stage with the
@@ -3976,9 +3978,12 @@ type
     B: array of TNeuralFloat;   // [OutCh]
   end;
 
-  // One HiFi-GAN ResBlock: per dilation tap, a (Conv1 dilated, Conv2 d=1) pair.
+  // One HiFi-GAN ResBlock. Type 1 (jik876 v1): per dilation tap a (Conv1
+  // dilated, Conv2 d=1) PAIR (Convs1/Convs2 used). Type 2 (jik876 v2/v3): per
+  // dilation tap a SINGLE dilated conv (Convs used, Convs1/Convs2 empty).
   THiFiGANResBlock = record
-    Convs1, Convs2: array of THiFiGANConv;
+    Convs1, Convs2: array of THiFiGANConv; // type 1 pair
+    Convs: array of THiFiGANConv;          // type 2 single dilated conv
   end;
 
   { TNNetHiFiGAN }
@@ -4010,8 +4015,8 @@ type
 // configs have no explicit model_type, so an absent/empty model_type with the
 // HiFi-GAN keys present is accepted). Required: model_in_dim,
 // upsample_initial_channel, upsample_rates, upsample_kernel_sizes,
-// resblock_kernel_sizes, resblock_dilation_sizes. Rejects resblock_type "2"
-// loudly (a documented follow-up). Coded by Claude (AI).
+// resblock_kernel_sizes, resblock_dilation_sizes. Supports resblock type "1"
+// (convs1+convs2 pair) and "2" (single dilated conv per tap). Coded by Claude (AI).
 function ReadHiFiGANConfigFromJSONFile(const FileName: string): THiFiGANConfig;
 
 function HiFiGANConfigToString(const Config: THiFiGANConfig): string;
@@ -30796,12 +30801,17 @@ begin
         '" - only "hifigan" / "speecht5_hifigan" (or a generator with no ' +
         'model_type) is supported here.');
     Result.ModelType := 'hifigan';
-    // resblock type "2" (the alternative MRF wiring) is a documented follow-up.
+    // resblock type "1" (convs1+convs2 pair per tap) or "2" (single dilated
+    // conv per tap, jik876 config_v2/v3). Anything else is rejected loudly.
     ResType := Obj.Get('resblock', '1');
-    if (ResType <> '1') and (ResType <> '') then
+    if ResType = '' then ResType := '1';
+    if ResType = '1' then
+      Result.ResblockType := 1
+    else if ResType = '2' then
+      Result.ResblockType := 2
+    else
       ImportError('HiFi-GAN import: resblock type "' + ResType +
-        '" is not supported - only the common type "1" is implemented ' +
-        '(type "2" is a documented follow-up).');
+        '" is not supported - only types "1" and "2" are implemented.');
 
     Result.ModelInDim := RequiredInt('model_in_dim');
     Result.UpsampleInitialChannel := RequiredInt('upsample_initial_channel');
@@ -30897,6 +30907,7 @@ begin
     end;
   end;
   Result := 'HiFiGANConfig(model_type=' + Config.ModelType +
+    ', resblock=' + IntToStr(Config.ResblockType) +
     ', in_dim=' + IntToStr(Config.ModelInDim) +
     ', init_ch=' + IntToStr(Config.UpsampleInitialChannel) +
     ', up_rates=[' + Rates + ']' +
@@ -31135,13 +31146,36 @@ begin
     for j := 0 to NumKernels - 1 do
     begin
       rb := s * NumKernels + j;
-      // ResBlock rb: for each dilation tap, x := x + Conv2(LReLU(Conv1(LReLU(x)))).
+      // ResBlock rb. Type 1: x := x + Conv2(LReLU(Conv1(LReLU(x)))) per tap.
+      // Type 2: x := x + Conv(LReLU(x)) per tap (single dilated conv, no Conv2).
       SetLength(ResOne, Length(Sig));
       for c := 0 to Length(Sig) - 1 do
       begin
         SetLength(ResOne[c], Length(Sig[c]));
         for t := 0 to Length(Sig[c]) - 1 do ResOne[c][t] := Sig[c][t];
       end;
+      if FConfig.ResblockType = 2 then
+      begin
+        for d := 0 to Length(FResBlocks[rb].Convs) - 1 do
+        begin
+          dil := FResBlocks[rb].Convs[d].Dilation;
+          // Tmp1 = LeakyReLU(ResOne)
+          SetLength(Tmp1, Length(ResOne));
+          for c := 0 to Length(ResOne) - 1 do
+          begin
+            SetLength(Tmp1[c], Length(ResOne[c]));
+            for t := 0 to Length(ResOne[c]) - 1 do
+              Tmp1[c][t] := HiFiGANLeakyReLU(ResOne[c][t], Slope);
+          end;
+          RunHiFiGANConv(FResBlocks[rb].Convs[d], Tmp1, Tmp2);
+          // ResOne := ResOne + Tmp2
+          for c := 0 to Length(ResOne) - 1 do
+            for t := 0 to Length(ResOne[c]) - 1 do
+              ResOne[c][t] := ResOne[c][t] + Tmp2[c][t];
+          if dil = 0 then ; // (silence "unused" hint when no dilations)
+        end;
+      end
+      else
       for d := 0 to Length(FResBlocks[rb].Convs1) - 1 do
       begin
         dil := FResBlocks[rb].Convs1[d].Dilation;
@@ -31261,26 +31295,44 @@ begin
       begin
         rb := s * NumKernels + j;
         kk := Config.ResblockKernelSizes[j];
-        SetLength(Model.FResBlocks[rb].Convs1,
-          Length(Config.ResblockDilationSizes[j]));
-        SetLength(Model.FResBlocks[rb].Convs2,
-          Length(Config.ResblockDilationSizes[j]));
         Base := 'resblocks.' + IntToStr(rb);
-        for d := 0 to Length(Config.ResblockDilationSizes[j]) - 1 do
+        if Config.ResblockType = 2 then
         begin
-          // convs1[d]: dilation resblock_dilation_sizes[j][d], "same" pad
-          // = (k*dil - dil) div 2.
-          LoadHiFiGANConv(Reader, Base + '.convs1.' + IntToStr(d),
-            Model.FResBlocks[rb].Convs1[d], False, 1,
-            Config.ResblockDilationSizes[j][d],
-            (kk * Config.ResblockDilationSizes[j][d] -
-             Config.ResblockDilationSizes[j][d]) div 2, Consumed);
-          // convs2[d]: dilation 1, "same" pad = (k-1) div 2.
-          LoadHiFiGANConv(Reader, Base + '.convs2.' + IntToStr(d),
-            Model.FResBlocks[rb].Convs2[d], False, 1, 1, (kk - 1) div 2,
-            Consumed);
-          if ch = 0 then ;
+          // Type 2: a SINGLE dilated conv per tap (resblocks.{rb}.convs.{d}),
+          // no convs2. Forward per tap: x := x + conv(LeakyReLU(x)).
+          SetLength(Model.FResBlocks[rb].Convs,
+            Length(Config.ResblockDilationSizes[j]));
+          for d := 0 to Length(Config.ResblockDilationSizes[j]) - 1 do
+            // convs[d]: dilation resblock_dilation_sizes[j][d], "same" pad
+            // = (k*dil - dil) div 2.
+            LoadHiFiGANConv(Reader, Base + '.convs.' + IntToStr(d),
+              Model.FResBlocks[rb].Convs[d], False, 1,
+              Config.ResblockDilationSizes[j][d],
+              (kk * Config.ResblockDilationSizes[j][d] -
+               Config.ResblockDilationSizes[j][d]) div 2, Consumed);
+        end
+        else
+        begin
+          SetLength(Model.FResBlocks[rb].Convs1,
+            Length(Config.ResblockDilationSizes[j]));
+          SetLength(Model.FResBlocks[rb].Convs2,
+            Length(Config.ResblockDilationSizes[j]));
+          for d := 0 to Length(Config.ResblockDilationSizes[j]) - 1 do
+          begin
+            // convs1[d]: dilation resblock_dilation_sizes[j][d], "same" pad
+            // = (k*dil - dil) div 2.
+            LoadHiFiGANConv(Reader, Base + '.convs1.' + IntToStr(d),
+              Model.FResBlocks[rb].Convs1[d], False, 1,
+              Config.ResblockDilationSizes[j][d],
+              (kk * Config.ResblockDilationSizes[j][d] -
+               Config.ResblockDilationSizes[j][d]) div 2, Consumed);
+            // convs2[d]: dilation 1, "same" pad = (k-1) div 2.
+            LoadHiFiGANConv(Reader, Base + '.convs2.' + IntToStr(d),
+              Model.FResBlocks[rb].Convs2[d], False, 1, 1, (kk - 1) div 2,
+              Consumed);
+          end;
         end;
+        if ch = 0 then ;
       end;
     end;
 
@@ -32646,6 +32698,7 @@ begin
     Result.Decoder.LeakyReluSlope := Obj.Get('leaky_relu_slope', 0.1);
     Result.Decoder.NormalizeBefore := False;
     Result.Decoder.SamplingRate := Result.SamplingRate;
+    Result.Decoder.ResblockType := 1; // VITS decoder is always ResBlock1.
   finally
     Root.Free;
     JsonText.Free;

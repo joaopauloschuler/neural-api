@@ -1,0 +1,31 @@
+{
+ "model_in_dim": 4,
+ "upsample_initial_channel": 8,
+ "upsample_rates": [
+  2,
+  2
+ ],
+ "upsample_kernel_sizes": [
+  4,
+  4
+ ],
+ "resblock": "2",
+ "resblock_kernel_sizes": [
+  3,
+  5
+ ],
+ "resblock_dilation_sizes": [
+  [
+   1,
+   3
+  ],
+  [
+   1,
+   3
+  ]
+ ],
+ "leaky_relu_slope": 0.1,
+ "normalize_before": false,
+ "sampling_rate": 8000,
+ "model_type": "hifigan"
+}

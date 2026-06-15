@@ -285,6 +285,7 @@ type
     // vocoder (mel -> waveform) and asserts the waveform matches the HF
     // SpeechT5HifiGan float64 oracle < 1e-4.
     procedure TestHiFiGANSynthesisParity;
+    procedure TestHiFiGANSynthesisParityResBlock2;
     // VITS / MMS-TTS: per-stage parity (text-encoder prior stats, durations,
     // flow reverse, end-to-end waveform) vs the HF VitsModel float64 oracle,
     // with the prior noise z fed explicitly for a deterministic result < 1e-4.
@@ -12568,6 +12569,73 @@ begin
     // 1e-4 importer-parity gate (the committed-fixture convention). NEVER
     // loosen - fix the model instead.
     AssertTrue('HiFi-GAN synthesis waveform parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestHiFiGANSynthesisParityResBlock2;
+var
+  Model: TNNetHiFiGAN;
+  Config: THiFiGANConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Clips, Clip, MelArr, MelRow, WavArr: TJSONArray;
+  Mel: array of TNeuralFloatDynArr;
+  Wave: TNeuralFloatDynArr;
+  Frames, Bands, ci, b, t, i: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_hifigan_rb2_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Clips := TJSONArray(TJSONObject(RefRoot).Find('clips'));
+    AssertTrue('clips present', Clips <> nil);
+    AssertTrue('at least 3 clips', Clips.Count >= 3);
+
+    Model := BuildHiFiGANFromSafeTensors(
+      FixturePath('tiny_hifigan_rb2.safetensors'), Config,
+      FixturePath('tiny_hifigan_rb2_config.json'));
+    AssertTrue('vocoder built', Model <> nil);
+    AssertEquals('resblock type 2', 2, Config.ResblockType);
+    AssertEquals('model_in_dim from config',
+      TJSONObject(RefRoot).Get('model_in_dim', 0), Config.ModelInDim);
+
+    MaxDiff := 0;
+    for ci := 0 to Clips.Count - 1 do
+    begin
+      Clip := TJSONArray(Clips.Items[ci]);
+      MelArr := TJSONArray(TJSONObject(Clip).Find('mel'));
+      WavArr := TJSONArray(TJSONObject(Clip).Find('waveform'));
+      // mel is [frames][bands]; the holder expects channel-major [bands][frames].
+      Frames := MelArr.Count;
+      Bands := TJSONArray(MelArr.Items[0]).Count;
+      SetLength(Mel, Bands);
+      for b := 0 to Bands - 1 do SetLength(Mel[b], Frames);
+      for t := 0 to Frames - 1 do
+      begin
+        MelRow := TJSONArray(MelArr.Items[t]);
+        for b := 0 to Bands - 1 do Mel[b][t] := MelRow.Items[b].AsFloat;
+      end;
+
+      Model.Synthesize(Mel, Wave);
+      AssertEquals('waveform length', WavArr.Count, Length(Wave));
+      for i := 0 to WavArr.Count - 1 do
+      begin
+        Diff := Abs(Wave[i] - WavArr.Items[i].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    // 1e-4 importer-parity gate (the committed-fixture convention). NEVER
+    // loosen - fix the model instead.
+    AssertTrue('HiFi-GAN ResBlock2 synthesis waveform parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     Model.Free;
