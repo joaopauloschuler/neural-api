@@ -3207,6 +3207,109 @@ procedure SaveM2M100ToSafeTensors(EncoderNet, DecoderNet: TNNet;
   pDType: TSafeTensorsWriteDType = stwF32);
 
 // ---------------------------------------------------------------------------
+// SEAMLESS-M4T-v2 SPEECH-TO-TEXT (S2TT) IMPORT (model_type "seamless_m4t_v2",
+// architectures ["SeamlessM4Tv2ForSpeechToText"], e.g.
+// facebook/seamless-m4t-v2-large). The repo's FIRST multilingual speech
+// TRANSLATION importer (the landed Whisper/Wav2Vec2/Moonshine all TRANSCRIBE
+// in ONE language; SeamlessM4T TRANSLATES across languages). v1 SCOPE: the
+// speech-to-TEXT path only. The pipeline is a wav2vec2-style CONFORMER speech
+// encoder
+//   feature_projection (LayerNorm(feat_in) -> Linear(feat_in -> hidden))
+//   -> N conformer layers, each (pre-norm, macaron):
+//        h += 0.5 * FFN1(LN(h))                         (swish FFN)
+//        h += SelfAttn(LN(h))                           (vanilla SDPA, see note)
+//        h += ConvModule(h)                             (pointwise->GLU->causal
+//             depthwise conv->LN->swish->pointwise)
+//        h  = LN( h + 0.5 * FFN2(LN(h)) )               (final per-layer LN)
+//   -> encoder.layer_norm
+//   -> h += 0.5 * intermediate_ffn(h)                   (relu FFN, NO LN before)
+//   -> conformer ADAPTER layer (a STRIDED length adapter that downsamples the
+//        speech frames): residual = GLU(stride-conv(LN(h))); a parallel
+//        GLU(stride-conv(LN(h))) feeds a (no-position) SDPA; h = attn + residual;
+//        h += FFN(LN(h))  (relu)
+//   -> inner_layer_norm
+// feeding an NLLB-style TEXT DECODER (M2M100 body: scaled tied word embedding,
+// half-split sinusoidal positions with pad_token_id=0 -> +1 offset, pre-norm
+// causal self-attn + cross-attn to the adapted encoder states + relu FFN,
+// final layer_norm, tied lm_head). Run the pair with RunT5 / decode with
+// DecodeSeq2SeqGreedy (the shared two-net convention).
+//
+// v1 SCOPE NOTE: position_embeddings_type="relative_key" (the v2 conformer's
+// distance-embedding attention bias) is NOT yet wired - it needs a new
+// attention layer. The importer REJECTS "relative_key" and accepts the
+// disabled setting (""/"absolute"/"none"). The T2ST unit vocoder and the
+// UnitY2 two-pass decoding are deferred follow-ups (see tasklist.md).
+// Coded by Claude (AI).
+type
+  TSeamlessM4Tv2Config = record
+    HiddenSize: integer;            // hidden_size (d_model; must be EVEN)
+    FeatureProjInputDim: integer;   // feature_projection_input_dim
+    SpeechEncoderLayers: integer;   // speech_encoder_layers
+    SpeechEncoderHeads: integer;    // speech_encoder_attention_heads
+    SpeechEncoderFFNDim: integer;   // speech_encoder_intermediate_size
+    ConvDepthwiseKernel: integer;   // conv_depthwise_kernel_size (odd)
+    AdaptorKernel: integer;         // adaptor_kernel_size
+    AdaptorStride: integer;         // adaptor_stride
+    NumAdapterLayers: integer;      // num_adapter_layers
+    DecoderLayers: integer;         // decoder_layers
+    DecoderHeads: integer;          // decoder_attention_heads
+    DecoderFFNDim: integer;         // decoder_ffn_dim
+    VocabSize: integer;             // vocab_size
+    MaxPositionEmbeddings: integer; // max_position_embeddings
+    PadTokenId: integer;            // pad_token_id (default 0)
+    BosTokenId: integer;            // bos_token_id (default 2)
+    EosTokenId: integer;            // eos_token_id (default 3)
+    DecoderStartTokenId: integer;   // decoder_start_token_id (default 3)
+    ScaleEmbedding: boolean;        // scale_embedding (sqrt(hidden); default ON)
+    PositionEmbeddingsType: string; // must NOT be "relative_key" (v1 scope)
+    SpeechEncoderAct: string;       // speech_encoder_hidden_act ("swish")
+    LayerNormEps: TNeuralFloat;     // layer_norm_eps (default 1e-5)
+    ModelType: string;              // 'seamless_m4t_v2'
+  end;
+
+// Reads a HF seamless_m4t_v2 config.json. Defaults follow the published
+// facebook/seamless-m4t-v2-large config. Rejects position_embeddings_type =
+// "relative_key" (the v1 scope cannot represent its attention bias yet).
+function ReadSeamlessM4Tv2ConfigFromJSONFile(
+  const FileName: string): TSeamlessM4Tv2Config;
+
+function SeamlessM4Tv2ConfigToString(
+  const Config: TSeamlessM4Tv2Config): string;
+
+// Computes the adapter-downsampled sequence length (the decoder cross-attends
+// to exactly this many encoder positions) for SpeechFrames input frames after
+// NumAdapterLayers strided adapter convs (kernel K, stride S, padding S div 2,
+// 1-D conv length floor((n + 2*pad - K)/S) + 1, applied per adapter layer).
+function SeamlessM4Tv2AdaptedLength(const Config: TSeamlessM4Tv2Config;
+  SpeechFrames: integer): integer;
+
+// Builds the SeamlessM4T-v2 S2TT speech ENCODER and text DECODER nets and
+// loads every weight from the safetensors checkpoint at FileName. SpeechFrames
+// fixes the number of input feature frames (the encoder input is a
+// (SpeechFrames, 1, feature_projection_input_dim) feature volume); DecSeqLen
+// fixes the decoder sequence length. The decoder's second TNNetInput holds the
+// ADAPTED encoder hidden states (T5EncoderStatesInput); their count is
+// SeamlessM4Tv2AdaptedLength(Config, SpeechFrames). Both nets are owned by the
+// caller. Run with RunT5 / DecodeSeq2SeqGreedy.
+procedure BuildSeamlessM4TFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TSeamlessM4Tv2Config; out EncoderNet, DecoderNet: TNNet;
+  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, but takes the already-read Config by value (the ...Ex naming).
+procedure BuildSeamlessM4TFromSafeTensorsEx(const FileName: string;
+  Config: TSeamlessM4Tv2Config; out EncoderNet, DecoderNet: TNNet;
+  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildSeamlessM4TFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TSeamlessM4Tv2Config;
+  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+
+// ---------------------------------------------------------------------------
 // WHISPER IMPORT (model_type "whisper": the openai/whisper-* speech-to-text
 // checkpoints; architectures ["WhisperForConditionalGeneration"]) - the
 // FIRST SPEECH importer and the THIRD encoder-decoder import after T5 and
@@ -26155,6 +26258,772 @@ begin
   Config := ReadM2M100ConfigFromJSONFile(ConfigPath);
   BuildM2M100FromSafeTensorsWithConfig(FileName, Config, EncoderNet,
     DecoderNet, EncSeqLen, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+// ===========================================================================
+//  SEAMLESS-M4T-v2 SPEECH-TO-TEXT (S2TT) IMPORT
+// ===========================================================================
+
+function ReadSeamlessM4Tv2ConfigFromJSONFile(
+  const FileName: string): TSeamlessM4Tv2Config;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType, PosType, Act: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.Find(FieldName) = nil then
+      ImportError('SeamlessM4T import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('SeamlessM4T import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('SeamlessM4T import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('SeamlessM4T import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('SeamlessM4T import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'seamless_m4t_v2');
+    if ModelType <> 'seamless_m4t_v2' then
+      ImportError('SeamlessM4T import: config model_type is "' + ModelType +
+        '" - only "seamless_m4t_v2" (the v2 S2TT path) is supported here.');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    if Odd(Result.HiddenSize) then
+      ImportError('SeamlessM4T import: hidden_size must be EVEN (half-split ' +
+        'sinusoidal table + GLU), got ' + IntToStr(Result.HiddenSize) + '.');
+    Result.FeatureProjInputDim := RequiredInt('feature_projection_input_dim');
+    Result.SpeechEncoderLayers := RequiredInt('speech_encoder_layers');
+    Result.SpeechEncoderHeads := RequiredInt('speech_encoder_attention_heads');
+    Result.SpeechEncoderFFNDim :=
+      RequiredInt('speech_encoder_intermediate_size');
+    Result.ConvDepthwiseKernel := RequiredInt('conv_depthwise_kernel_size');
+    if not Odd(Result.ConvDepthwiseKernel) then
+      ImportError('SeamlessM4T import: conv_depthwise_kernel_size must be ' +
+        'ODD, got ' + IntToStr(Result.ConvDepthwiseKernel) + '.');
+    Result.AdaptorKernel := Obj.Get('adaptor_kernel_size', 8);
+    Result.AdaptorStride := Obj.Get('adaptor_stride', 8);
+    Result.NumAdapterLayers := Obj.Get('num_adapter_layers', 1);
+    Result.DecoderLayers := RequiredInt('decoder_layers');
+    Result.DecoderHeads := RequiredInt('decoder_attention_heads');
+    Result.DecoderFFNDim := RequiredInt('decoder_ffn_dim');
+    Result.VocabSize := RequiredInt('vocab_size');
+    Result.MaxPositionEmbeddings :=
+      Obj.Get('max_position_embeddings', 4096);
+    Result.PadTokenId := Obj.Get('pad_token_id', 0);
+    Result.BosTokenId := Obj.Get('bos_token_id', 2);
+    Result.EosTokenId := Obj.Get('eos_token_id', 3);
+    Result.DecoderStartTokenId :=
+      Obj.Get('decoder_start_token_id', Result.EosTokenId);
+    Result.ScaleEmbedding := Obj.Get('scale_embedding', True);
+    PosType := Obj.Get('position_embeddings_type', 'relative_key');
+    if PosType = 'relative_key' then
+      ImportError('SeamlessM4T import: position_embeddings_type ' +
+        '"relative_key" (the v2 conformer distance-embedding attention bias) ' +
+        'is not supported in the v1 S2TT scope - it needs a new attention ' +
+        'layer (documented follow-up). Disable it ("" / "absolute" / "none") ' +
+        'or wait for the follow-up.');
+    Result.PositionEmbeddingsType := PosType;
+    Act := Obj.Get('speech_encoder_hidden_act', 'swish');
+    if (Act <> 'swish') and (Act <> 'silu') then
+      ImportError('SeamlessM4T import: speech_encoder_hidden_act "' + Act +
+        '" is not supported - the published checkpoints use "swish".');
+    Result.SpeechEncoderAct := Act;
+    Act := Obj.Get('activation_function', 'relu');
+    if Act <> 'relu' then
+      ImportError('SeamlessM4T import: activation_function "' + Act +
+        '" (the text decoder FFN) is not supported - expected "relu".');
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-5);
+    if not Obj.Get('tie_word_embeddings', True) then
+      ImportError('SeamlessM4T import: tie_word_embeddings=false is not ' +
+        'supported - SeamlessM4T ties the lm_head to the shared embedding.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function SeamlessM4Tv2ConfigToString(
+  const Config: TSeamlessM4Tv2Config): string;
+begin
+  Result := 'SeamlessM4Tv2Config(hidden=' + IntToStr(Config.HiddenSize) +
+    ', feat_in=' + IntToStr(Config.FeatureProjInputDim) +
+    ', speech_layers=' + IntToStr(Config.SpeechEncoderLayers) +
+    ', speech_heads=' + IntToStr(Config.SpeechEncoderHeads) +
+    ', speech_ffn=' + IntToStr(Config.SpeechEncoderFFNDim) +
+    ', depthwise_k=' + IntToStr(Config.ConvDepthwiseKernel) +
+    ', adaptor_k=' + IntToStr(Config.AdaptorKernel) +
+    ', adaptor_s=' + IntToStr(Config.AdaptorStride) +
+    ', adapter_layers=' + IntToStr(Config.NumAdapterLayers) +
+    ', dec_layers=' + IntToStr(Config.DecoderLayers) +
+    ', dec_heads=' + IntToStr(Config.DecoderHeads) +
+    ', dec_ffn=' + IntToStr(Config.DecoderFFNDim) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', scale_embedding=' + BoolToStr(Config.ScaleEmbedding, true) + ')';
+end;
+
+function SeamlessM4Tv2AdaptedLength(const Config: TSeamlessM4Tv2Config;
+  SpeechFrames: integer): integer;
+var
+  i, Pad: integer;
+begin
+  Result := SpeechFrames;
+  Pad := Config.AdaptorStride div 2;
+  for i := 0 to Config.NumAdapterLayers - 1 do
+  begin
+    Result := (Result + 2 * Pad - Config.AdaptorKernel)
+      div Config.AdaptorStride + 1;
+    if Result < 1 then
+      ImportError('SeamlessM4T import: SpeechFrames=' +
+        IntToStr(SpeechFrames) + ' is too short - adapter layer ' +
+        IntToStr(i) + ' downsamples it below 1 frame.');
+  end;
+end;
+
+// Fills a TNNetLearnedPositionalEmbedding with the SeamlessM4T (M2M100-style)
+// half-split sinusoidal positions. SeamlessM4T uses pad_token_id=0, so HF
+// position_ids start at pad_token_id+1 = 1: the (0-based) token p reads table
+// row p+1 (offset +1, vs M2M100's +2 because M2M100 pads at id 1). The
+// padding-idx row is row 0 and is never reached for non-pad sequences.
+procedure FillSeamlessSinusoidalPositions(Layer: TNNetLayer;
+  SeqLen, HiddenSize: integer);
+const
+  SeamlessPositionOffset = 1;
+var
+  PosCnt, ChCnt, Half, Row: integer;
+  EmbConst, Angle: double;
+begin
+  Half := HiddenSize div 2;
+  EmbConst := Ln(10000.0) / (Half - 1);
+  for PosCnt := 0 to SeqLen - 1 do
+  begin
+    Row := PosCnt + SeamlessPositionOffset;
+    for ChCnt := 0 to Half - 1 do
+    begin
+      Angle := Row * Exp(-ChCnt * EmbConst);
+      Layer.Neurons[0].Weights.FData[PosCnt * HiddenSize + ChCnt] := Sin(Angle);
+      Layer.Neurons[0].Weights.FData[PosCnt * HiddenSize + Half + ChCnt] :=
+        Cos(Angle);
+    end;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads one HF nn.Conv1d kernel-K conv (weight [Out, In, K], optional bias)
+// into a TNNetConvolutionLinear built with a (K,1) kernel on the (T,1,In)
+// grid: Neurons[o].Weights[x*In + i] = W[o, i, x] (the LoadWav2Vec2FeatureConv
+// convention). Used for the conformer pointwise convs (K=1, no bias) and the
+// strided adapter pooling convs (K=AdaptorKernel, with bias). BiasName='' =>
+// no bias (left zero).
+procedure LoadSeamlessConv1D(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BiasName: string;
+  InDim, OutDim, Kernel: integer; Consumed: TStringList);
+var
+  W, B: TNNetVolume;
+  o, i, kk: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('SeamlessM4T import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 3) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) or
+     (Reader.DimSize(WName, 2) <> Kernel) then
+    ImportError('SeamlessM4T import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + ', ' + IntToStr(Kernel) +
+      '] (nn.Conv1d [out, in, kernel]), got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('SeamlessM4T import: internal error - conv layer for "' +
+      WName + '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutDim) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    EnsureWritableImportWeights(Layer);
+    for o := 0 to OutDim - 1 do
+    begin
+      for kk := 0 to Kernel - 1 do
+        for i := 0 to InDim - 1 do
+          Layer.Neurons[o].Weights.FData[kk * InDim + i] :=
+            W.FData[(o * InDim + i) * Kernel + kk];
+      Layer.Neurons[o].BiasWeight := 0.0;
+    end;
+    Consumed.Add(WName);
+    if BiasName <> '' then
+    begin
+      if not Reader.HasTensor(BiasName) then
+        ImportError('SeamlessM4T import: missing bias tensor "' +
+          BiasName + '".');
+      Reader.LoadTensorFlat(BiasName, B);
+      for o := 0 to OutDim - 1 do
+        Layer.Neurons[o].BiasWeight := B.FData[o];
+      Consumed.Add(BiasName);
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free;
+    B.Free;
+  end;
+end;
+
+// Loads the conformer causal depthwise conv (HF nn.Conv1d weight
+// [hidden, 1, K], groups=hidden, bias=false) into a TNNetDepthwiseConv1D.
+// Channel c's neuron carries a (K,1,1) kernel: with HF's left-pad-(K-1) causal
+// conv, output t reads W_hf[c,0,k]*x[t-(K-1)+k]; the layer's causal forward is
+// y[t,c] = sum_k W[c][k]*x[t-(K-1-k),c] = sum_k W[c][k]*x[t-(K-1)+k], so
+// W[c][k] = W_hf[c,0,k] DIRECTLY (no kernel reversal).
+procedure LoadSeamlessDepthwiseConv1D(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; Hidden, Kernel: integer;
+  Consumed: TStringList);
+var
+  W: TNNetVolume;
+  c, kk: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('SeamlessM4T import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 3) or
+     (Reader.DimSize(WName, 0) <> Hidden) or
+     (Reader.DimSize(WName, 1) <> 1) or
+     (Reader.DimSize(WName, 2) <> Kernel) then
+    ImportError('SeamlessM4T import: "' + WName + '" must have shape [' +
+      IntToStr(Hidden) + ', 1, ' + IntToStr(Kernel) +
+      '] (depthwise nn.Conv1d), got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> Hidden then
+    ImportError('SeamlessM4T import: internal error - depthwise conv for "' +
+      WName + '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(Hidden) + '.');
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    EnsureWritableImportWeights(Layer);
+    for c := 0 to Hidden - 1 do
+    begin
+      for kk := 0 to Kernel - 1 do
+        Layer.Neurons[c].Weights.FData[kk] := W.FData[c * Kernel + kk];
+      Layer.Neurons[c].BiasWeight := 0.0;
+    end;
+    Consumed.Add(WName);
+    Layer.FlushWeightCache();
+  finally
+    W.Free;
+  end;
+end;
+
+procedure BuildSeamlessM4TFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TSeamlessM4Tv2Config; out EncoderNet, DecoderNet: TNNet;
+  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Enc, Dec: TNNet;
+  Consumed: TStringList;
+  Tmp: TNNetVolume;
+  i, j, AdaptedLen, Hidden, Heads: integer;
+  EmbedScale: TNeuralFloat;
+  TensorNameStr, SP, BP: string;
+  // decoder handles
+  DecTokenInput, EncStates, DecEmbed, DecPos, DecFinalLN, LMHead: TNNetLayer;
+  DecBlocks: TMarianBlockArray;
+  MarianShim: TMarianConfig;
+  PegShim: TPegasusConfig;
+  // encoder reusable handles
+  FeatProjLN, FeatProj, EncLN, InterFc1, InterFc2, InnerLN: TNNetLayer;
+  AdResLN, AdResConv, AdResGLU, AdAttnLN, AdAttnConv, AdAttnGLU: TNNetLayer;
+  AdQ, AdK, AdV, AdO, AdFfnLN, AdFc1, AdFc2: TNNetLayer;
+  ConvLN, ConvPw1, ConvDw, ConvDwLN, ConvPw2: TNNetLayer;
+  ResidualInput: TNNetLayer;
+  QProj, KProj, VProj, OProj: TNNetLayer;
+  Ffn1LN, Ffn1Fc1, Ffn1Fc2, AttnLN, Ffn2LN, Ffn2Fc1, Ffn2Fc2, LayLN: TNNetLayer;
+  LayerCnt, AdLayerCnt: integer;
+
+  // Builds one vanilla (no-position) multi-head SDPA over the layer Src whose
+  // output is already the per-token query/key/value source (SizeX = seq).
+  // Returns the OProj layer. Q/K/V are full biased Linears (HF nn.Linear) so
+  // they are PointwiseConvLinear over (seq,1,hidden). NumHeadsLoc heads.
+  procedure BuildConformerSDPA(Src: TNNetLayer; NumHeadsLoc: integer;
+    out Q, K, V, O: TNNetLayer);
+  var
+    hc, dd: integer;
+    HDim: integer;
+    qs, ks, vs, hp: TNNetLayer;
+    HArr: array of TNNetLayer;
+    Slice: array of integer;
+  begin
+    HDim := Hidden div NumHeadsLoc;
+    SetLength(HArr, NumHeadsLoc);
+    SetLength(Slice, HDim);
+    Q := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden), Src);
+    K := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden), Src);
+    V := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hidden), Src);
+    for hc := 0 to NumHeadsLoc - 1 do
+    begin
+      for dd := 0 to HDim - 1 do Slice[dd] := hc * HDim + dd;
+      qs := Enc.AddLayerAfter(TNNetSplitChannels.Create(Slice), Q);
+      ks := Enc.AddLayerAfter(TNNetSplitChannels.Create(Slice), K);
+      vs := Enc.AddLayerAfter(TNNetSplitChannels.Create(Slice), V);
+      hp := Enc.AddLayer(TNNetDeepConcat.Create([qs, ks, vs]));
+      HArr[hc] := Enc.AddLayerAfter(
+        TNNetScaledDotProductAttention.Create(HDim, {CausalMask=}false), hp);
+    end;
+    Enc.AddLayer(TNNetDeepConcat.Create(HArr));
+    O := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+  end;
+
+  // FFN: fc2(act(fc1(x))) where act is swish; returns the fc2 layer. NoLN -
+  // caller has already normed (or not). Built on the current last layer.
+  procedure BuildConformerFFN(InLayer: TNNetLayer; FFNDim: integer;
+    UseRelu: boolean; out Fc1, Fc2: TNNetLayer);
+  begin
+    Fc1 := Enc.AddLayerAfter(TNNetPointwiseConvLinear.Create(FFNDim), InLayer);
+    if UseRelu then Enc.AddLayer(TNNetReLU.Create())
+    else Enc.AddLayer(TNNetSwish.Create());
+    Fc2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+  end;
+
+begin
+  EncoderNet := nil;
+  DecoderNet := nil;
+  Hidden := Config.HiddenSize;
+  Heads := Config.SpeechEncoderHeads;
+  // ---------------- Config validation ----------------
+  if SpeechFrames < 1 then
+    ImportError('SeamlessM4T import: SpeechFrames must be >= 1.');
+  if DecSeqLen < 1 then
+    ImportError('SeamlessM4T import: DecSeqLen must be >= 1.');
+  if DecSeqLen > Config.MaxPositionEmbeddings then
+    ImportError('SeamlessM4T import: DecSeqLen must not exceed ' +
+      'max_position_embeddings = ' +
+      IntToStr(Config.MaxPositionEmbeddings) + '.');
+  if (Heads < 1) or ((Hidden mod Heads) <> 0) then
+    ImportError('SeamlessM4T import: speech_encoder_attention_heads must ' +
+      'divide hidden_size.');
+  if (Config.DecoderHeads < 1) or ((Hidden mod Config.DecoderHeads) <> 0) then
+    ImportError('SeamlessM4T import: decoder_attention_heads must divide ' +
+      'hidden_size.');
+  if Config.PositionEmbeddingsType = 'relative_key' then
+    ImportError('SeamlessM4T import: position_embeddings_type "relative_key" ' +
+      'is not supported in the v1 S2TT scope.');
+  AdaptedLen := SeamlessM4Tv2AdaptedLength(Config, SpeechFrames);
+
+  Reader := CreatePretrainedTensorReader(FileName);
+  Enc := nil;
+  Dec := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  PegShim.DModel := Hidden;
+  MarianShim.DModel := Hidden;
+  try
+    try
+      if not Reader.HasTensor('shared.weight') then
+        ImportError('SeamlessM4T import: "shared.weight" not found in ' +
+          Reader.FileName + ' - not a SeamlessM4Tv2 S2TT checkpoint?');
+      if (Reader.DimCount('shared.weight') <> 2) or
+         (Reader.DimSize('shared.weight', 0) <> Config.VocabSize) or
+         (Reader.DimSize('shared.weight', 1) <> Hidden) then
+        ImportError('SeamlessM4T import: shared.weight must have shape [' +
+          IntToStr(Config.VocabSize) + ', ' + IntToStr(Hidden) + '], got ' +
+          Reader.ShapeAsString('shared.weight'));
+
+      // =============== SPEECH ENCODER (conformer) ===============
+      Enc := TNNet.Create();
+      Enc.AddLayer(TNNetInput.Create(SpeechFrames, 1, Config.FeatureProjInputDim));
+      // feature_projection: LayerNorm(feat_in) -> Linear(feat_in -> hidden)
+      FeatProjLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+      FeatProj := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+      LoadLayerNormWeights(Reader, FeatProjLN,
+        'speech_encoder.feature_projection.layer_norm.weight',
+        'speech_encoder.feature_projection.layer_norm.bias',
+        Config.FeatureProjInputDim);
+      Consumed.Add('speech_encoder.feature_projection.layer_norm.weight');
+      Consumed.Add('speech_encoder.feature_projection.layer_norm.bias');
+      LoadLlamaLinearWeights(Reader, FeatProj,
+        'speech_encoder.feature_projection.projection.weight',
+        Config.FeatureProjInputDim, Hidden, 0, -1, 0,
+        'speech_encoder.feature_projection.projection.bias');
+      Consumed.Add('speech_encoder.feature_projection.projection.weight');
+      Consumed.Add('speech_encoder.feature_projection.projection.bias');
+
+      for LayerCnt := 0 to Config.SpeechEncoderLayers - 1 do
+      begin
+        // ---- macaron FFN1: h += 0.5 * FFN1(LN(h)) ----
+        ResidualInput := Enc.GetLastLayer();
+        Ffn1LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        BuildConformerFFN(Ffn1LN, Config.SpeechEncoderFFNDim, false,
+          Ffn1Fc1, Ffn1Fc2);
+        Enc.AddLayer(TNNetMulByConstant.Create(0.5));
+        Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
+
+        // ---- self-attention: h += SDPA(LN(h)) ----
+        ResidualInput := Enc.GetLastLayer();
+        AttnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        BuildConformerSDPA(AttnLN, Heads, QProj, KProj, VProj, OProj);
+        Enc.AddLayer(TNNetSum.Create([OProj, ResidualInput]));
+
+        // ---- conv module: h += ConvModule(h) ----
+        ResidualInput := Enc.GetLastLayer();
+        ConvLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        // pointwise_conv1: hidden -> 2*hidden (no bias), GLU back to hidden
+        ConvPw1 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(2 * Hidden));
+        Enc.AddLayer(TNNetGLU.Create());
+        // causal depthwise conv (left-pad K-1), depthwise LN, swish
+        ConvDw := Enc.AddLayer(TNNetDepthwiseConv1D.Create(
+          Config.ConvDepthwiseKernel, {Causal=}true, {SuppressBias=}1));
+        ConvDwLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        Enc.AddLayer(TNNetSwish.Create());
+        // pointwise_conv2: hidden -> hidden (no bias)
+        ConvPw2 := Enc.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+        Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
+
+        // ---- macaron FFN2: h = LN(h + 0.5 * FFN2(LN(h))) ----
+        ResidualInput := Enc.GetLastLayer();
+        Ffn2LN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        BuildConformerFFN(Ffn2LN, Config.SpeechEncoderFFNDim, false,
+          Ffn2Fc1, Ffn2Fc2);
+        Enc.AddLayer(TNNetMulByConstant.Create(0.5));
+        Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
+        LayLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+
+        // ---- load this layer's weights ----
+        SP := 'speech_encoder.encoder.layers.' + IntToStr(LayerCnt) + '.';
+        LoadLayerNormWeights(Reader, Ffn1LN, SP + 'ffn1_layer_norm.weight',
+          SP + 'ffn1_layer_norm.bias', Hidden);
+        Consumed.Add(SP + 'ffn1_layer_norm.weight');
+        Consumed.Add(SP + 'ffn1_layer_norm.bias');
+        LoadLlamaLinearWeights(Reader, Ffn1Fc1,
+          SP + 'ffn1.intermediate_dense.weight', Hidden,
+          Config.SpeechEncoderFFNDim, 0, -1, 0,
+          SP + 'ffn1.intermediate_dense.bias');
+        Consumed.Add(SP + 'ffn1.intermediate_dense.weight');
+        Consumed.Add(SP + 'ffn1.intermediate_dense.bias');
+        LoadLlamaLinearWeights(Reader, Ffn1Fc2,
+          SP + 'ffn1.output_dense.weight', Config.SpeechEncoderFFNDim,
+          Hidden, 0, -1, 0, SP + 'ffn1.output_dense.bias');
+        Consumed.Add(SP + 'ffn1.output_dense.weight');
+        Consumed.Add(SP + 'ffn1.output_dense.bias');
+
+        LoadLayerNormWeights(Reader, AttnLN, SP + 'self_attn_layer_norm.weight',
+          SP + 'self_attn_layer_norm.bias', Hidden);
+        Consumed.Add(SP + 'self_attn_layer_norm.weight');
+        Consumed.Add(SP + 'self_attn_layer_norm.bias');
+        LoadLlamaLinearWeights(Reader, QProj, SP + 'self_attn.linear_q.weight',
+          Hidden, Hidden, 0, -1, 0, SP + 'self_attn.linear_q.bias');
+        Consumed.Add(SP + 'self_attn.linear_q.weight');
+        Consumed.Add(SP + 'self_attn.linear_q.bias');
+        LoadLlamaLinearWeights(Reader, KProj, SP + 'self_attn.linear_k.weight',
+          Hidden, Hidden, 0, -1, 0, SP + 'self_attn.linear_k.bias');
+        Consumed.Add(SP + 'self_attn.linear_k.weight');
+        Consumed.Add(SP + 'self_attn.linear_k.bias');
+        LoadLlamaLinearWeights(Reader, VProj, SP + 'self_attn.linear_v.weight',
+          Hidden, Hidden, 0, -1, 0, SP + 'self_attn.linear_v.bias');
+        Consumed.Add(SP + 'self_attn.linear_v.weight');
+        Consumed.Add(SP + 'self_attn.linear_v.bias');
+        LoadLlamaLinearWeights(Reader, OProj, SP + 'self_attn.linear_out.weight',
+          Hidden, Hidden, 0, -1, 0, SP + 'self_attn.linear_out.bias');
+        Consumed.Add(SP + 'self_attn.linear_out.weight');
+        Consumed.Add(SP + 'self_attn.linear_out.bias');
+
+        LoadLayerNormWeights(Reader, ConvLN,
+          SP + 'conv_module.layer_norm.weight',
+          SP + 'conv_module.layer_norm.bias', Hidden);
+        Consumed.Add(SP + 'conv_module.layer_norm.weight');
+        Consumed.Add(SP + 'conv_module.layer_norm.bias');
+        LoadSeamlessConv1D(Reader, ConvPw1,
+          SP + 'conv_module.pointwise_conv1.weight', '',
+          Hidden, 2 * Hidden, 1, Consumed);
+        LoadSeamlessDepthwiseConv1D(Reader, ConvDw,
+          SP + 'conv_module.depthwise_conv.weight', Hidden,
+          Config.ConvDepthwiseKernel, Consumed);
+        LoadLayerNormWeights(Reader, ConvDwLN,
+          SP + 'conv_module.depthwise_layer_norm.weight',
+          SP + 'conv_module.depthwise_layer_norm.bias', Hidden);
+        Consumed.Add(SP + 'conv_module.depthwise_layer_norm.weight');
+        Consumed.Add(SP + 'conv_module.depthwise_layer_norm.bias');
+        LoadSeamlessConv1D(Reader, ConvPw2,
+          SP + 'conv_module.pointwise_conv2.weight', '',
+          Hidden, Hidden, 1, Consumed);
+
+        LoadLayerNormWeights(Reader, Ffn2LN, SP + 'ffn2_layer_norm.weight',
+          SP + 'ffn2_layer_norm.bias', Hidden);
+        Consumed.Add(SP + 'ffn2_layer_norm.weight');
+        Consumed.Add(SP + 'ffn2_layer_norm.bias');
+        LoadLlamaLinearWeights(Reader, Ffn2Fc1,
+          SP + 'ffn2.intermediate_dense.weight', Hidden,
+          Config.SpeechEncoderFFNDim, 0, -1, 0,
+          SP + 'ffn2.intermediate_dense.bias');
+        Consumed.Add(SP + 'ffn2.intermediate_dense.weight');
+        Consumed.Add(SP + 'ffn2.intermediate_dense.bias');
+        LoadLlamaLinearWeights(Reader, Ffn2Fc2,
+          SP + 'ffn2.output_dense.weight', Config.SpeechEncoderFFNDim,
+          Hidden, 0, -1, 0, SP + 'ffn2.output_dense.bias');
+        Consumed.Add(SP + 'ffn2.output_dense.weight');
+        Consumed.Add(SP + 'ffn2.output_dense.bias');
+        LoadLayerNormWeights(Reader, LayLN, SP + 'final_layer_norm.weight',
+          SP + 'final_layer_norm.bias', Hidden);
+        Consumed.Add(SP + 'final_layer_norm.weight');
+        Consumed.Add(SP + 'final_layer_norm.bias');
+      end;
+
+      // encoder.layer_norm
+      EncLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+      LoadLayerNormWeights(Reader, EncLN,
+        'speech_encoder.encoder.layer_norm.weight',
+        'speech_encoder.encoder.layer_norm.bias', Hidden);
+      Consumed.Add('speech_encoder.encoder.layer_norm.weight');
+      Consumed.Add('speech_encoder.encoder.layer_norm.bias');
+
+      // intermediate_ffn: h += 0.5 * relu_ffn(h)  (NO layernorm before)
+      ResidualInput := Enc.GetLastLayer();
+      BuildConformerFFN(ResidualInput, Config.SpeechEncoderFFNDim, true,
+        InterFc1, InterFc2);
+      Enc.AddLayer(TNNetMulByConstant.Create(0.5));
+      Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
+      LoadLlamaLinearWeights(Reader, InterFc1,
+        'speech_encoder.intermediate_ffn.intermediate_dense.weight', Hidden,
+        Config.SpeechEncoderFFNDim, 0, -1, 0,
+        'speech_encoder.intermediate_ffn.intermediate_dense.bias');
+      Consumed.Add('speech_encoder.intermediate_ffn.intermediate_dense.weight');
+      Consumed.Add('speech_encoder.intermediate_ffn.intermediate_dense.bias');
+      LoadLlamaLinearWeights(Reader, InterFc2,
+        'speech_encoder.intermediate_ffn.output_dense.weight',
+        Config.SpeechEncoderFFNDim, Hidden, 0, -1, 0,
+        'speech_encoder.intermediate_ffn.output_dense.bias');
+      Consumed.Add('speech_encoder.intermediate_ffn.output_dense.weight');
+      Consumed.Add('speech_encoder.intermediate_ffn.output_dense.bias');
+
+      // ---- adapter layers (strided length adapter) ----
+      for AdLayerCnt := 0 to Config.NumAdapterLayers - 1 do
+      begin
+        BP := 'speech_encoder.adapter.layers.' + IntToStr(AdLayerCnt) + '.';
+        // residual = GLU(stride-conv(LN(h)))  (kernel K stride S pad S/2)
+        ResidualInput := Enc.GetLastLayer();
+        AdResLN := Enc.AddLayerAfter(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps), ResidualInput);
+        // strided pooling conv: pad left/right by stride/2 then stride-S conv
+        if (Config.AdaptorStride div 2) > 0 then
+          Enc.AddLayer(TNNetPadXY.Create(Config.AdaptorStride div 2, 0));
+        AdResConv := Enc.AddLayer(TNNetConvolutionLinear.Create(
+          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0));
+        AdResGLU := Enc.AddLayer(TNNetGLU.Create());
+
+        // attn branch = GLU(stride-conv(LN(h))) -> SDPA(no pos) ; h = attn+res
+        AdAttnLN := Enc.AddLayerAfter(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps), ResidualInput);
+        if (Config.AdaptorStride div 2) > 0 then
+          Enc.AddLayer(TNNetPadXY.Create(Config.AdaptorStride div 2, 0));
+        AdAttnConv := Enc.AddLayer(TNNetConvolutionLinear.Create(
+          2 * Hidden, Config.AdaptorKernel, 0, Config.AdaptorStride, 0));
+        AdAttnGLU := Enc.AddLayer(TNNetGLU.Create());
+        BuildConformerSDPA(AdAttnGLU, Heads, AdQ, AdK, AdV, AdO);
+        Enc.AddLayer(TNNetSum.Create([AdO, AdResGLU]));
+
+        // h += FFN(LN(h))  (relu)
+        ResidualInput := Enc.GetLastLayer();
+        AdFfnLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+        BuildConformerFFN(AdFfnLN, Config.SpeechEncoderFFNDim, true,
+          AdFc1, AdFc2);
+        Enc.AddLayer(TNNetSum.Create([Enc.GetLastLayer(), ResidualInput]));
+
+        // load adapter weights
+        LoadLayerNormWeights(Reader, AdResLN,
+          BP + 'residual_layer_norm.weight',
+          BP + 'residual_layer_norm.bias', Hidden);
+        Consumed.Add(BP + 'residual_layer_norm.weight');
+        Consumed.Add(BP + 'residual_layer_norm.bias');
+        LoadSeamlessConv1D(Reader, AdResConv, BP + 'residual_conv.weight',
+          BP + 'residual_conv.bias', Hidden, 2 * Hidden,
+          Config.AdaptorKernel, Consumed);
+        LoadLayerNormWeights(Reader, AdAttnLN,
+          BP + 'self_attn_layer_norm.weight',
+          BP + 'self_attn_layer_norm.bias', Hidden);
+        Consumed.Add(BP + 'self_attn_layer_norm.weight');
+        Consumed.Add(BP + 'self_attn_layer_norm.bias');
+        LoadSeamlessConv1D(Reader, AdAttnConv, BP + 'self_attn_conv.weight',
+          BP + 'self_attn_conv.bias', Hidden, 2 * Hidden,
+          Config.AdaptorKernel, Consumed);
+        LoadLlamaLinearWeights(Reader, AdQ, BP + 'self_attn.linear_q.weight',
+          Hidden, Hidden, 0, -1, 0, BP + 'self_attn.linear_q.bias');
+        Consumed.Add(BP + 'self_attn.linear_q.weight');
+        Consumed.Add(BP + 'self_attn.linear_q.bias');
+        LoadLlamaLinearWeights(Reader, AdK, BP + 'self_attn.linear_k.weight',
+          Hidden, Hidden, 0, -1, 0, BP + 'self_attn.linear_k.bias');
+        Consumed.Add(BP + 'self_attn.linear_k.weight');
+        Consumed.Add(BP + 'self_attn.linear_k.bias');
+        LoadLlamaLinearWeights(Reader, AdV, BP + 'self_attn.linear_v.weight',
+          Hidden, Hidden, 0, -1, 0, BP + 'self_attn.linear_v.bias');
+        Consumed.Add(BP + 'self_attn.linear_v.weight');
+        Consumed.Add(BP + 'self_attn.linear_v.bias');
+        LoadLlamaLinearWeights(Reader, AdO, BP + 'self_attn.linear_out.weight',
+          Hidden, Hidden, 0, -1, 0, BP + 'self_attn.linear_out.bias');
+        Consumed.Add(BP + 'self_attn.linear_out.weight');
+        Consumed.Add(BP + 'self_attn.linear_out.bias');
+        LoadLayerNormWeights(Reader, AdFfnLN, BP + 'ffn_layer_norm.weight',
+          BP + 'ffn_layer_norm.bias', Hidden);
+        Consumed.Add(BP + 'ffn_layer_norm.weight');
+        Consumed.Add(BP + 'ffn_layer_norm.bias');
+        LoadLlamaLinearWeights(Reader, AdFc1,
+          BP + 'ffn.intermediate_dense.weight', Hidden,
+          Config.SpeechEncoderFFNDim, 0, -1, 0,
+          BP + 'ffn.intermediate_dense.bias');
+        Consumed.Add(BP + 'ffn.intermediate_dense.weight');
+        Consumed.Add(BP + 'ffn.intermediate_dense.bias');
+        LoadLlamaLinearWeights(Reader, AdFc2,
+          BP + 'ffn.output_dense.weight', Config.SpeechEncoderFFNDim,
+          Hidden, 0, -1, 0, BP + 'ffn.output_dense.bias');
+        Consumed.Add(BP + 'ffn.output_dense.weight');
+        Consumed.Add(BP + 'ffn.output_dense.bias');
+      end;
+
+      // inner_layer_norm
+      InnerLN := Enc.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+      LoadLayerNormWeights(Reader, InnerLN,
+        'speech_encoder.inner_layer_norm.weight',
+        'speech_encoder.inner_layer_norm.bias', Hidden);
+      Consumed.Add('speech_encoder.inner_layer_norm.weight');
+      Consumed.Add('speech_encoder.inner_layer_norm.bias');
+      if pInferenceOnly then Enc.MakeInferenceOnly();
+      if pQuantizeInt8 then Enc.QuantizeWeightsInt8();
+
+      // =============== TEXT DECODER (NLLB/M2M100 body) ===============
+      Dec := TNNet.Create();
+      DecTokenInput := Dec.AddLayer(TNNetInput.Create(DecSeqLen));
+      EncStates := Dec.AddLayerAfter(
+        TNNetInput.Create(AdaptedLen, 1, Hidden, 1), 0);
+      DecEmbed := Dec.AddLayerAfter(TNNetEmbedding.Create(
+        Config.VocabSize, Hidden, {EncodeZero=}1), DecTokenInput);
+      DecPos := Dec.AddLayer(TNNetLearnedPositionalEmbedding.Create(DecSeqLen));
+      BuildPegasusStackBlocks(Dec, PegShim, Config.DecoderLayers,
+        Config.DecoderHeads, Config.DecoderFFNDim, {IsDecoder=}true,
+        EncStates, DecBlocks, pInferenceOnly, pQuantizeInt8,
+        {UseReluFFN=}true);
+      DecFinalLN := Dec.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+      LMHead := Dec.AddLayer(TNNetPointwiseConvLinear.Create(Config.VocabSize));
+
+      // ---- decoder weights ----
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat('shared.weight', Tmp);
+        if Config.ScaleEmbedding then EmbedScale := Sqrt(Hidden)
+        else EmbedScale := 1.0;
+        for i := 0 to Tmp.Size - 1 do
+          DecEmbed.Neurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        DecEmbed.FlushWeightCache();
+        Consumed.Add('shared.weight');
+        // tied bias-free lm_head (UNSCALED rows)
+        EnsureWritableImportWeights(LMHead);
+        for j := 0 to Config.VocabSize - 1 do
+        begin
+          for i := 0 to Hidden - 1 do
+            LMHead.Neurons[j].Weights.FData[i] :=
+              Tmp.FData[j * Hidden + i];
+          LMHead.Neurons[j].BiasWeight := 0.0;
+        end;
+        LMHead.FlushWeightCache();
+        if Reader.HasTensor('lm_head.weight') then
+          Consumed.Add('lm_head.weight');
+        if Reader.HasTensor('text_decoder.embed_tokens.weight') then
+          Consumed.Add('text_decoder.embed_tokens.weight');
+        if Reader.HasTensor('text_decoder.embed_positions.weights') then
+          Consumed.Add('text_decoder.embed_positions.weights');
+      finally
+        Tmp.Free;
+      end;
+      FillSeamlessSinusoidalPositions(DecPos, DecSeqLen, Hidden);
+      // per-block weights: SeamlessM4T decoder names differ from M2M100
+      // (cross_attention.* not encoder_attn.*, ffn.fc1/fc2 not fc1/fc2,
+      // ffn_layer_norm not final_layer_norm), so load by hand here.
+      for j := 0 to Config.DecoderLayers - 1 do
+      begin
+        BP := 'text_decoder.layers.' + IntToStr(j) + '.';
+        LoadMarianAttn(Reader, DecBlocks[j].SelfAttn, BP + 'self_attn.',
+          BP + 'self_attn_layer_norm', MarianShim, Consumed);
+        LoadMarianAttn(Reader, DecBlocks[j].CrossAttn, BP + 'cross_attention.',
+          BP + 'cross_attention_layer_norm', MarianShim, Consumed);
+        LoadLlamaLinearWeights(Reader, DecBlocks[j].Fc1, BP + 'ffn.fc1.weight',
+          Hidden, Config.DecoderFFNDim, 0, -1, 0, BP + 'ffn.fc1.bias');
+        Consumed.Add(BP + 'ffn.fc1.weight');
+        Consumed.Add(BP + 'ffn.fc1.bias');
+        LoadLlamaLinearWeights(Reader, DecBlocks[j].Fc2, BP + 'ffn.fc2.weight',
+          Config.DecoderFFNDim, Hidden, 0, -1, 0, BP + 'ffn.fc2.bias');
+        Consumed.Add(BP + 'ffn.fc2.weight');
+        Consumed.Add(BP + 'ffn.fc2.bias');
+        LoadLayerNormWeights(Reader, DecBlocks[j].FFNNorm,
+          BP + 'ffn_layer_norm.weight', BP + 'ffn_layer_norm.bias', Hidden);
+        Consumed.Add(BP + 'ffn_layer_norm.weight');
+        Consumed.Add(BP + 'ffn_layer_norm.bias');
+      end;
+      LoadLayerNormWeights(Reader, DecFinalLN, 'text_decoder.layer_norm.weight',
+        'text_decoder.layer_norm.bias', Hidden);
+      Consumed.Add('text_decoder.layer_norm.weight');
+      Consumed.Add('text_decoder.layer_norm.bias');
+      if pInferenceOnly then Dec.MakeInferenceOnly();
+      if pQuantizeInt8 then Dec.QuantizeWeightsInt8();
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('SeamlessM4T import: unexpected tensor "' + TensorNameStr +
+          '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      EncoderNet := Enc;
+      DecoderNet := Dec;
+      Enc := nil;
+      Dec := nil;
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    Enc.Free;
+    Dec.Free;
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+procedure BuildSeamlessM4TFromSafeTensorsEx(const FileName: string;
+  Config: TSeamlessM4Tv2Config; out EncoderNet, DecoderNet: TNNet;
+  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  pQuantizeInt8: boolean = false);
+begin
+  BuildSeamlessM4TFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, SpeechFrames, DecSeqLen, pInferenceOnly, pQuantizeInt8);
+end;
+
+procedure BuildSeamlessM4TFromSafeTensors(const FileName: string;
+  out EncoderNet, DecoderNet: TNNet; out Config: TSeamlessM4Tv2Config;
+  SpeechFrames, DecSeqLen: integer; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false);
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSeamlessM4Tv2ConfigFromJSONFile(ConfigPath);
+  BuildSeamlessM4TFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
+    DecoderNet, SpeechFrames, DecSeqLen, pInferenceOnly, pQuantizeInt8);
 end;
 
 function ReadWhisperConfigFromJSONFile(const FileName: string): TWhisperConfig;
@@ -53174,6 +54043,17 @@ begin
       'both nets; run them with RunT5, mel input from ' +
       'neuralaudio.ComputeWhisperLogMel) instead of this single-net ' +
       'dispatch.');
+  end
+  else if ModelType = 'seamless_m4t_v2' then
+  begin
+    // SeamlessM4T-v2 S2TT is an encoder-decoder: the import builds TWO nets
+    // (conformer speech encoder + NLLB text decoder), which this single-net
+    // dispatch cannot return.
+    Result := nil;
+    ImportError('BuildFromPretrained: model_type "seamless_m4t_v2" builds ' +
+      'an ENCODER-DECODER pair - call BuildSeamlessM4TFromSafeTensors ' +
+      '(returns both nets; run them with RunT5 / DecodeSeq2SeqGreedy) ' +
+      'instead of this single-net dispatch.');
   end
   else if (ModelType = 'wav2vec2') or (ModelType = 'hubert') then
   begin

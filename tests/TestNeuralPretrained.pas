@@ -259,6 +259,8 @@ type
     procedure TestMBartParity;
     procedure TestM2M100ConfigFromJSONFile;
     procedure TestM2M100Parity;
+    procedure TestSeamlessM4Tv2ConfigFromJSONFile;
+    procedure TestSeamlessM4Tv2S2TTParity;
     procedure TestWhisperConfigFromJSONFile;
     procedure TestWhisperParity;
     procedure TestWhisperWordTimestamps;
@@ -11568,6 +11570,157 @@ begin
       FixturePath('tiny_m2m100_logits.json'), 10, 6, Config.DModel,
       Config.VocabSize);
   finally
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Verifies ReadSeamlessM4Tv2ConfigFromJSONFile on the committed pico config
+// plus the "relative_key" rejection (the v1 S2TT scope cannot represent the
+// v2 conformer distance-embedding attention bias yet).
+procedure TTestNeuralPretrained.TestSeamlessM4Tv2ConfigFromJSONFile;
+var
+  Config: TSeamlessM4Tv2Config;
+begin
+  Config := ReadSeamlessM4Tv2ConfigFromJSONFile(
+    FixturePath('tiny_seamless_m4t_v2_config.json'));
+  AssertEquals('model_type', 'seamless_m4t_v2', Config.ModelType);
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  AssertEquals('feature_projection_input_dim', 12, Config.FeatureProjInputDim);
+  AssertEquals('speech_encoder_layers', 2, Config.SpeechEncoderLayers);
+  AssertEquals('speech_encoder_attention_heads', 2,
+    Config.SpeechEncoderHeads);
+  AssertEquals('speech_encoder_intermediate_size', 32,
+    Config.SpeechEncoderFFNDim);
+  AssertEquals('conv_depthwise_kernel_size', 5, Config.ConvDepthwiseKernel);
+  AssertEquals('adaptor_kernel_size', 4, Config.AdaptorKernel);
+  AssertEquals('adaptor_stride', 2, Config.AdaptorStride);
+  AssertEquals('num_adapter_layers', 1, Config.NumAdapterLayers);
+  AssertEquals('decoder_layers', 2, Config.DecoderLayers);
+  AssertEquals('decoder_attention_heads', 2, Config.DecoderHeads);
+  AssertEquals('decoder_ffn_dim', 32, Config.DecoderFFNDim);
+  AssertEquals('vocab_size', 24, Config.VocabSize);
+  AssertEquals('pad_token_id', 0, Config.PadTokenId);
+  AssertTrue('scale_embedding', Config.ScaleEmbedding);
+  AssertEquals('adapted length for 6 frames',
+    SeamlessM4Tv2AdaptedLength(Config, 6), 3);
+end;
+
+// SeamlessM4T-v2 S2TT parity: the conformer SPEECH encoder
+// (feature_projection -> conformer layers -> encoder.layer_norm ->
+// intermediate_ffn -> strided length ADAPTER -> inner_layer_norm) feeding the
+// NLLB-style text DECODER (cross-attending to the adapted encoder states),
+// vs a float64 HF SeamlessM4Tv2ForSpeechToText oracle on the committed pico
+// fixture. The fixture pins position_embeddings_type="" (relative_key
+// disabled, the v1 scope). Encoder-only hidden-state parity and full
+// encoder-decoder logit parity, both < 1e-4 (NEVER loosen past 1e-3).
+procedure TTestNeuralPretrained.TestSeamlessM4Tv2S2TTParity;
+var
+  Enc, Dec: TNNet;
+  Config: TSeamlessM4Tv2Config;
+  RefRoot: TJSONData;
+  FeatArr, RowArr, SeqArr, PosArr, HiddenArr, LogitsArr: TJSONArray;
+  EncInput, DecInput, Logits: TNNetVolume;
+  RefJson: TStringList;
+  FrameCnt, ChCnt, PosCnt, AdaptedLen: integer;
+  Diff, MaxHiddenDiff, MaxLogitDiff: double;
+const
+  SpeechFrames = 6;
+  DecLen = 5;
+begin
+  RandSeed := 424242;
+  BuildSeamlessM4TFromSafeTensors(
+    FixturePath('tiny_seamless_m4t_v2.safetensors'), Enc, Dec, Config,
+    SpeechFrames, DecLen, {pInferenceOnly=}false,
+    FixturePath('tiny_seamless_m4t_v2_config.json'));
+  RefJson := TStringList.Create;
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    AdaptedLen := SeamlessM4Tv2AdaptedLength(Config, SpeechFrames);
+    AssertEquals('encoder feature input frames', SpeechFrames,
+      Enc.Layers[0].Output.SizeX);
+    AssertEquals('encoder feature input depth', Config.FeatureProjInputDim,
+      Enc.Layers[0].Output.Depth);
+    AssertEquals('encoder output frames downsampled by the adapter',
+      AdaptedLen * Config.HiddenSize, Enc.GetLastLayer().Output.Size);
+    AssertTrue('decoder second input is TNNetInput',
+      T5EncoderStatesInput(Dec) is TNNetInput);
+    AssertEquals('encoder-states (adapted) input size',
+      AdaptedLen * Config.HiddenSize, T5EncoderStatesInput(Dec).Output.Size);
+    AssertEquals('decoder token input length', DecLen,
+      Dec.Layers[0].Output.SizeX);
+
+    RefJson.LoadFromFile(FixturePath('tiny_seamless_m4t_v2_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    FeatArr := TJSONArray(TJSONObject(RefRoot).Find('input_features'));
+    SeqArr := TJSONArray(TJSONObject(RefRoot).Find('dec_sequences'));
+    HiddenArr := TJSONArray(TJSONObject(RefRoot).Find('enc_hidden'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    AssertTrue('input_features present', FeatArr <> nil);
+    AssertTrue('dec_sequences present', SeqArr <> nil);
+    AssertTrue('enc_hidden present', HiddenArr <> nil);
+    AssertTrue('logits present', LogitsArr <> nil);
+    AssertEquals('feature frames', SpeechFrames, FeatArr.Count);
+    AssertEquals('adapted_len rows', AdaptedLen, HiddenArr.Count);
+
+    // Build the (frames, 1, feat_in) encoder input from the (frames, feat_in)
+    // fixture layout.
+    EncInput.ReSize(SpeechFrames, 1, Config.FeatureProjInputDim);
+    for FrameCnt := 0 to SpeechFrames - 1 do
+    begin
+      RowArr := TJSONArray(FeatArr.Items[FrameCnt]);
+      AssertEquals('feat_in', Config.FeatureProjInputDim, RowArr.Count);
+      for ChCnt := 0 to Config.FeatureProjInputDim - 1 do
+        EncInput.FData[FrameCnt * Config.FeatureProjInputDim + ChCnt] :=
+          RowArr.Items[ChCnt].AsFloat;
+    end;
+    DecInput.ReSize(DecLen, 1, 1);
+    for PosCnt := 0 to DecLen - 1 do
+      DecInput.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+
+    // Encoder-only parity: adapted hidden states vs the HF float64 oracle.
+    Enc.Compute(EncInput);
+    MaxHiddenDiff := 0;
+    for PosCnt := 0 to AdaptedLen - 1 do
+    begin
+      RowArr := TJSONArray(HiddenArr.Items[PosCnt]);
+      for ChCnt := 0 to Config.HiddenSize - 1 do
+      begin
+        Diff := Abs(Enc.GetLastLayer().Output.FData[
+          PosCnt * Config.HiddenSize + ChCnt] - RowArr.Items[ChCnt].AsFloat);
+        if Diff > MaxHiddenDiff then MaxHiddenDiff := Diff;
+      end;
+    end;
+
+    // Full S2TT parity through RunT5.
+    RunT5(Enc, Dec, EncInput, DecInput, Logits);
+    AssertEquals('logits size', DecLen * Config.VocabSize, Logits.Size);
+    MaxLogitDiff := 0;
+    for PosCnt := 0 to DecLen - 1 do
+    begin
+      RowArr := TJSONArray(LogitsArr.Items[PosCnt]);
+      for ChCnt := 0 to Config.VocabSize - 1 do
+      begin
+        Diff := Abs(Logits.FData[PosCnt * Config.VocabSize + ChCnt] -
+          RowArr.Items[ChCnt].AsFloat);
+        if Diff > MaxLogitDiff then MaxLogitDiff := Diff;
+      end;
+    end;
+    AssertTrue('SeamlessM4T S2TT encoder hidden-state parity: max |diff| = ' +
+      FloatToStr(MaxHiddenDiff) + ' must be < 1e-4', MaxHiddenDiff < 1e-4);
+    AssertTrue('SeamlessM4T S2TT logit parity: max |diff| = ' +
+      FloatToStr(MaxLogitDiff) + ' must be < 1e-4', MaxLogitDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    DecInput.Free;
+    EncInput.Free;
+    RefJson.Free;
     Dec.Free;
     Enc.Free;
   end;

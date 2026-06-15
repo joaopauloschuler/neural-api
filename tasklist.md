@@ -808,17 +808,39 @@ rather than acted on.
       text prompt; plus KV-cache incremental decode and top-k/temperature
       sampling for the generation loop (follow-up to the landed
       examples/MusicGenText).
-- [ ] SeamlessM4T (v2) speech-to-text TRANSLATION importer
+- [X] SeamlessM4T (v2) speech-to-text TRANSLATION importer
       (`BuildSeamlessM4TFromSafeTensors[Ex]`, `facebook/seamless-m4t-v2-large` /
       `hf-audio/…`) — multilingual speech translation, a capability the repo has
       no analogue for (the landed Whisper/Wav2Vec2/Moonshine all TRANSCRIBE in one
-      language; SeamlessM4T TRANSLATES across languages). Scope v1 to the
-      speech-to-TEXT (S2TT) path only: the wav2vec2-style conformer SPEECH encoder
-      (reuse the landed Wav2Vec2 conformer blocks) + a length adapter +
-      the NLLB-style text DECODER (reuse the landed mBART/NLLB enc-dec seq2seq
-      decode path and SentencePiece tokenizer). Defer the text-to-speech (T2ST)
-      unit-vocoder path and the v2's UnitY2 two-pass decoding to a follow-up.
-      Verify against HF on a pico-sliced fixture. Voice priority.
+      language; SeamlessM4T TRANSLATES across languages).
+      LANDED (S2TT v1): BuildSeamlessM4TFromSafeTensors[WithConfig|Ex] +
+      ReadSeamlessM4Tv2ConfigFromJSONFile + SeamlessM4Tv2AdaptedLength +
+      SeamlessM4Tv2ConfigToString in neuralpretrained.pas. The conformer SPEECH
+      encoder (feature_projection -> N macaron conformer layers [0.5*FFN1,
+      SDPA, causal-depthwise CONV module via TNNetDepthwiseConv1D + TNNetGLU,
+      0.5*FFN2, per-layer LN] -> encoder.layer_norm -> intermediate_ffn ->
+      strided length ADAPTER [residual/attn GLU pooling convs + no-pos SDPA +
+      relu FFN] -> inner_layer_norm) feeds the NLLB-style text DECODER
+      (M2M100 body: tied scaled embed, half-split sinusoidal with pad=0 -> +1
+      offset, pre-norm causal self-attn + cross-attn to the adapted encoder
+      states + relu FFN, final LN, tied lm_head) reusing BuildPegasusStackBlocks
+      + LoadMarianAttn; run with RunT5 / DecodeSeq2SeqGreedy (the shared two-net
+      convention) + the SentencePiece tokenizer. Pico parity vs an HF float64
+      SeamlessM4Tv2ForSpeechToText oracle (encoder hidden states + logits both
+      < 1e-4): TestSeamlessM4Tv2S2TTParity / TestSeamlessM4Tv2ConfigFromJSONFile,
+      fixtures tests/fixtures/tiny_seamless_m4t_v2.{safetensors,config.json,
+      logits.json} + generator tools/seamless_m4t_v2_tiny_fixture.py.
+      BuildFromPretrained rejects model_type "seamless_m4t_v2" -> redirect.
+- [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
+      (1) position_embeddings_type="relative_key" — the v2 conformer self-attn
+      distance-embedding attention bias (einsum("bhld,lrd->bhlr") added to the
+      scores, clamped to [-left_max, right_max]); needs a new relative-position
+      attention layer (the importer currently REJECTS "relative_key" and the
+      pico fixture pins it disabled). (2) the text-to-speech (T2ST) unit
+      vocoder path (TextToUnit decoder + HiFi-GAN-style unit vocoder).
+      (3) the UnitY2 two-pass decoding. (4) a real downloaded
+      facebook/seamless-m4t-v2-large checkpoint + real SentencePiece tokenizer
+      + a runnable examples/SeamlessTranslate S2TT end-to-end demo.
 - [ ] examples/SpeechCommands keyword-spotting trainer — the audio analogue of
       SimpleImageClassifier and the first FROM-SCRATCH (no-import) audio training
       example. Feed the existing log-mel frontend (neuralaudio.pas) into a small
