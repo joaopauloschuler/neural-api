@@ -5234,6 +5234,54 @@ procedure LlavaRunLogits(VisionNet, ProjectorNet, TextNet: TNNet;
   ImageTokenIndex, NumPatches: integer; Logits: TNNetVolume);
 
 // ===========================================================================
+// RAFT OPTICAL-FLOW IMPORT (model_type "raft_small", the torchvision
+// raft_small architecture, Teed & Deng 2020 "RAFT", arXiv:2003.12039) - the
+// FIRST optical-flow vertical and the first TWO-image-in / dense-2-channel-out
+// model in the tree. The net takes TWO stacked frames and produces a coarse
+// (dx, dy) motion field at the encoder stride. Structurally it is a shared
+// SmallEncoder feature net (fnet) over both frames, a context SmallEncoder
+// (cnet) over frame 1, an all-pairs TNNetCorrelationVolume, and an iterative
+// TNNetConvGRUCell update operator (NumIters fixed small steps) refining the
+// flow via a motion encoder + flow head, with the per-step lookup done by
+// TNNetCorrelationLookup. v1 is inference-only at encoder stride (no convex
+// upsampling-mask head). The importer builds ONE TNNet whose three inputs are
+// frame1, frame2 (both ImageH x ImageW x 3) and a zero flow seed; the public
+// RaftPredictFlow helper drives the iterative forward and returns the flow.
+// Coded by Claude (AI).
+type
+  TRaftConfig = record
+    ModelType: string;
+    ImageH, ImageW: integer;    // full-resolution input frame size
+    Stride: integer;            // encoder downsample (flow grid = image/stride)
+    FeatureDim: integer;        // fnet output channels
+    HiddenDim: integer;         // ConvGRU hidden state channels (net)
+    ContextDim: integer;        // context inp channels
+    CorrRadius: integer;        // local correlation lookup radius
+    NumIters: integer;          // fixed iteration count
+    NormEps: TNeuralFloat;      // InstanceNorm epsilon
+  end;
+
+function ReadRaftConfigFromJSONFile(const FileName: string): TRaftConfig;
+function RaftConfigToString(const Config: TRaftConfig): string;
+
+// Builds the RAFT net from the checkpoint at FileName. The returned net has
+// three TNNetInput sources (frame1, frame2, flow-seed) and a final
+// TNNetConvGRUCell-driven update; use RaftPredictFlow to run it. The net is
+// owned by the caller. Coded by Claude (AI).
+function BuildRaftFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  const Config: TRaftConfig; pInferenceOnly: boolean = false): TNNet;
+function BuildRaftFromSafeTensors(const FileName: string;
+  out Config: TRaftConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// Runs the RAFT iterative forward on two frames (each ImageH x ImageW x 3,
+// channels-last) and returns the predicted coarse flow in FlowOut, resized to
+// (FlowW, FlowH, 2) with channel 0 = dx, channel 1 = dy (flow-grid pixels).
+// Coded by Claude (AI).
+procedure RaftPredictFlow(NN: TNNet; const Config: TRaftConfig;
+  Frame1, Frame2, FlowOut: TNNetVolume);
+
+// ===========================================================================
 // ViT IMAGE-CLASSIFICATION IMPORT (model_type "vit": google/vit-base-
 // patch16-224 and timm/HF ViTForImageClassification siblings) - a STANDALONE
 // image classifier. It REUSES the CLIP pre-LN ViT encoder block
@@ -42688,6 +42736,430 @@ begin
   finally
     Embeds.Free;
     VisualTokens.Free;
+  end;
+end;
+
+// ===========================================================================
+// RAFT optical-flow importer (model_type "raft_small"). See the interface
+// section for the architecture summary. Coded by Claude (AI).
+// ===========================================================================
+
+function ReadRaftConfigFromJSONFile(const FileName: string): TRaftConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  if not FileExists(FileName) then
+    ImportError('RAFT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('RAFT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('RAFT import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType  := Obj.Get('model_type', 'raft_small');
+    Result.ImageH     := Obj.Get('image_height', 16);
+    Result.ImageW     := Obj.Get('image_width', 16);
+    Result.Stride     := Obj.Get('stride', 4);
+    Result.FeatureDim := Obj.Get('feature_dim', 16);
+    Result.HiddenDim  := Obj.Get('hidden_dim', 12);
+    Result.ContextDim := Obj.Get('context_dim', 8);
+    Result.CorrRadius := Obj.Get('corr_radius', 2);
+    Result.NumIters   := Obj.Get('num_iters', 4);
+    Result.NormEps    := Obj.Get('norm_eps', 0.00001);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RaftConfigToString(const Config: TRaftConfig): string;
+begin
+  Result := Config.ModelType + ' config: ' +
+    'image=' + IntToStr(Config.ImageW) + 'x' + IntToStr(Config.ImageH) +
+    ', stride=' + IntToStr(Config.Stride) +
+    ', feature_dim=' + IntToStr(Config.FeatureDim) +
+    ', hidden_dim=' + IntToStr(Config.HiddenDim) +
+    ', context_dim=' + IntToStr(Config.ContextDim) +
+    ', corr_radius=' + IntToStr(Config.CorrRadius) +
+    ', num_iters=' + IntToStr(Config.NumIters);
+end;
+
+// ---- shared weight loaders (torch Conv2d [out,in,kh,kw]; InstanceNorm) ----
+
+procedure RaftLoadConv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const WName, BName: string; OutC, InC, K: integer; HasBias: boolean);
+var
+  W, B: TNNetVolume;
+  o, c, ky, kx: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('RAFT import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or (Reader.DimSize(WName, 0) <> OutC) or
+     (Reader.DimSize(WName, 1) <> InC) or (Reader.DimSize(WName, 2) <> K) or
+     (Reader.DimSize(WName, 3) <> K) then
+    ImportError('RAFT import: "' + WName + '" must be [' + IntToStr(OutC) +
+      ',' + IntToStr(InC) + ',' + IntToStr(K) + ',' + IntToStr(K) +
+      '], got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutC then
+    ImportError('RAFT import: conv neuron count ' +
+      IntToStr(Layer.Neurons.Count) + ' <> ' + IntToStr(OutC));
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    for o := 0 to OutC - 1 do
+    begin
+      for ky := 0 to K - 1 do
+        for kx := 0 to K - 1 do
+          for c := 0 to InC - 1 do
+            Layer.Neurons[o].Weights.FData[(ky * K + kx) * InC + c] :=
+              W.FData[((o * InC + c) * K + ky) * K + kx];
+      Layer.Neurons[o].BiasWeight := 0;
+    end;
+    if HasBias then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('RAFT import: missing tensor "' + BName + '".');
+      Reader.LoadTensorFlat(BName, B);
+      for o := 0 to OutC - 1 do Layer.Neurons[o].BiasWeight := B.FData[o];
+    end;
+  finally
+    W.Free; B.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+procedure RaftLoadInstanceNorm(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; Depth: integer);
+var
+  G, B: TNNetVolume;
+  c: integer;
+begin
+  if (not Reader.HasTensor(WName)) or (not Reader.HasTensor(BName)) then
+    ImportError('RAFT import: missing InstanceNorm tensors "' + WName +
+      '"/"' + BName + '".');
+  G := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, G);
+    Reader.LoadTensorFlat(BName, B);
+    for c := 0 to Depth - 1 do
+    begin
+      Layer.Neurons[0].Weights.FData[c] := G.FData[c]; // gamma
+      Layer.Neurons[1].Weights.FData[c] := B.FData[c]; // beta
+    end;
+  finally
+    G.Free; B.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+// Builds a SmallEncoder branch (conv1 7x7 s2 + IN + relu -> resblock s2 ->
+// resblock s1 -> conv2 1x1) starting from the given input layer; returns the
+// final conv layer. Collects the layers needing weights into Built.
+type
+  TRaftEncoderLayers = record
+    Conv1, Norm1: TNNetLayer;
+    L1c1, L1n1, L1c2, L1n2, L1proj, L1projn: TNNetLayer;
+    L2c1, L2n1, L2c2, L2n2: TNNetLayer;
+    Conv2: TNNetLayer;
+  end;
+
+const
+  cRaftEncC1 = 8;
+  cRaftEncC2 = 12;
+
+function RaftBuildEncoder(NN: TNNet; InputLayer: TNNetLayer; OutDim: integer;
+  Eps: TNeuralFloat; out E: TRaftEncoderLayers): TNNetLayer;
+var
+  cur, y, s: TNNetLayer;
+begin
+  // conv1 7x7 stride-2 pad-3 -> InstanceNorm -> ReLU
+  E.Conv1 := NN.AddLayerAfter(TNNetConvolutionLinear.Create(cRaftEncC1, 7, 3, 2), InputLayer);
+  E.Norm1 := NN.AddLayer(TNNetInstanceNorm.Create(True));
+  TNNetInstanceNorm(E.Norm1).GroupNormEpsilon := Eps;
+  cur := NN.AddLayer(TNNetReLU.Create());
+  // residual block 1 (downsample stride-2, 1x1 projection shortcut)
+  E.L1c1 := NN.AddLayer(TNNetConvolutionLinear.Create(cRaftEncC2, 3, 1, 2));
+  E.L1n1 := NN.AddLayer(TNNetInstanceNorm.Create(True));
+  TNNetInstanceNorm(E.L1n1).GroupNormEpsilon := Eps;
+  NN.AddLayer(TNNetReLU.Create());
+  E.L1c2 := NN.AddLayer(TNNetConvolutionLinear.Create(cRaftEncC2, 3, 1, 1));
+  E.L1n2 := NN.AddLayer(TNNetInstanceNorm.Create(True));
+  TNNetInstanceNorm(E.L1n2).GroupNormEpsilon := Eps;
+  y := E.L1n2;
+  E.L1proj := NN.AddLayerAfter(TNNetConvolutionLinear.Create(cRaftEncC2, 1, 0, 2), cur);
+  E.L1projn := NN.AddLayer(TNNetInstanceNorm.Create(True));
+  TNNetInstanceNorm(E.L1projn).GroupNormEpsilon := Eps;
+  s := E.L1projn;
+  cur := NN.AddLayer(TNNetSum.Create([y, s]));
+  cur := NN.AddLayer(TNNetReLU.Create());
+  // residual block 2 (stride-1, identity shortcut)
+  E.L2c1 := NN.AddLayer(TNNetConvolutionLinear.Create(cRaftEncC2, 3, 1, 1));
+  E.L2n1 := NN.AddLayer(TNNetInstanceNorm.Create(True));
+  TNNetInstanceNorm(E.L2n1).GroupNormEpsilon := Eps;
+  NN.AddLayer(TNNetReLU.Create());
+  E.L2c2 := NN.AddLayer(TNNetConvolutionLinear.Create(cRaftEncC2, 3, 1, 1));
+  E.L2n2 := NN.AddLayer(TNNetInstanceNorm.Create(True));
+  TNNetInstanceNorm(E.L2n2).GroupNormEpsilon := Eps;
+  y := E.L2n2;
+  cur := NN.AddLayer(TNNetSum.Create([y, cur]));
+  cur := NN.AddLayer(TNNetReLU.Create());
+  // conv2 1x1 -> OutDim
+  E.Conv2 := NN.AddLayer(TNNetConvolutionLinear.Create(OutDim, 1, 0, 1));
+  Result := E.Conv2;
+end;
+
+procedure RaftLoadEncoder(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; const E: TRaftEncoderLayers; OutDim: integer;
+  Eps: TNeuralFloat);
+begin
+  RaftLoadConv(Reader, E.Conv1, Prefix + 'conv1.weight', Prefix + 'conv1.bias',
+    cRaftEncC1, 3, 7, True);
+  RaftLoadInstanceNorm(Reader, E.Norm1, Prefix + 'norm1.weight',
+    Prefix + 'norm1.bias', cRaftEncC1);
+  RaftLoadConv(Reader, E.L1c1, Prefix + 'layer1_conv1.weight',
+    Prefix + 'layer1_conv1.bias', cRaftEncC2, cRaftEncC1, 3, True);
+  RaftLoadInstanceNorm(Reader, E.L1n1, Prefix + 'layer1_norm1.weight',
+    Prefix + 'layer1_norm1.bias', cRaftEncC2);
+  RaftLoadConv(Reader, E.L1c2, Prefix + 'layer1_conv2.weight',
+    Prefix + 'layer1_conv2.bias', cRaftEncC2, cRaftEncC2, 3, True);
+  RaftLoadInstanceNorm(Reader, E.L1n2, Prefix + 'layer1_norm2.weight',
+    Prefix + 'layer1_norm2.bias', cRaftEncC2);
+  RaftLoadConv(Reader, E.L1proj, Prefix + 'layer1_proj.weight',
+    Prefix + 'layer1_proj.bias', cRaftEncC2, cRaftEncC1, 1, True);
+  RaftLoadInstanceNorm(Reader, E.L1projn, Prefix + 'layer1_projnorm.weight',
+    Prefix + 'layer1_projnorm.bias', cRaftEncC2);
+  RaftLoadConv(Reader, E.L2c1, Prefix + 'layer2_conv1.weight',
+    Prefix + 'layer2_conv1.bias', cRaftEncC2, cRaftEncC2, 3, True);
+  RaftLoadInstanceNorm(Reader, E.L2n1, Prefix + 'layer2_norm1.weight',
+    Prefix + 'layer2_norm1.bias', cRaftEncC2);
+  RaftLoadConv(Reader, E.L2c2, Prefix + 'layer2_conv2.weight',
+    Prefix + 'layer2_conv2.bias', cRaftEncC2, cRaftEncC2, 3, True);
+  RaftLoadInstanceNorm(Reader, E.L2n2, Prefix + 'layer2_norm2.weight',
+    Prefix + 'layer2_norm2.bias', cRaftEncC2);
+  RaftLoadConv(Reader, E.Conv2, Prefix + 'conv2.weight', Prefix + 'conv2.bias',
+    OutDim, cRaftEncC2, 1, True);
+end;
+
+// Loads one torch ConvGRU (convz/convr/convq, each Conv2d(ZC, HiddenC, 3)) into
+// a TNNetConvGRUCell. Neurons: [0]=Wz [1]=Wr [2]=Wq (kernels (HiddenC,K*K,ZC)),
+// [3..5] = biases (1,1,HiddenC). torch stores [out,in,kh,kw].
+procedure RaftLoadConvGRU(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const Prefix: string; HiddenC, ZC: integer);
+const
+  K = 3;
+var
+  W, B: TNNetVolume;
+  gate, o, c, ky, kx: integer;
+  WName, BName: string;
+begin
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    for gate := 0 to 2 do
+    begin
+      case gate of
+        0: begin WName := Prefix + 'convz.weight'; BName := Prefix + 'convz.bias'; end;
+        1: begin WName := Prefix + 'convr.weight'; BName := Prefix + 'convr.bias'; end;
+      else  begin WName := Prefix + 'convq.weight'; BName := Prefix + 'convq.bias'; end;
+      end;
+      if (not Reader.HasTensor(WName)) or (not Reader.HasTensor(BName)) then
+        ImportError('RAFT import: missing ConvGRU tensor "' + WName + '".');
+      if (Reader.DimSize(WName, 0) <> HiddenC) or
+         (Reader.DimSize(WName, 1) <> ZC) or
+         (Reader.DimSize(WName, 2) <> K) or (Reader.DimSize(WName, 3) <> K) then
+        ImportError('RAFT import: "' + WName + '" must be [' +
+          IntToStr(HiddenC) + ',' + IntToStr(ZC) + ',3,3], got ' +
+          Reader.ShapeAsString(WName));
+      Reader.LoadTensorFlat(WName, W);
+      Reader.LoadTensorFlat(BName, B);
+      for o := 0 to HiddenC - 1 do
+      begin
+        for ky := 0 to K - 1 do
+          for kx := 0 to K - 1 do
+            for c := 0 to ZC - 1 do
+              Layer.Neurons[gate].Weights.FData[
+                (o * (K * K) + (ky * K + kx)) * ZC + c] :=
+                W.FData[((o * ZC + c) * K + ky) * K + kx];
+        Layer.Neurons[gate + 3].Weights.FData[o] := B.FData[o];
+      end;
+    end;
+  finally
+    W.Free; B.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+function BuildRaftFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  const Config: TRaftConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Inp1, Inp2, FlowSeed: TNNetLayer;
+  Fnet1, Fnet2, Cnet, CorrVol: TNNetLayer;
+  NetState, Inp: TNNetLayer;
+  Flow, Lookup, Cor, Flo, CorFlo, Motion, GruIn, Gru, FH1, DFlow: TNNetLayer;
+  E1, E2, EC: TRaftEncoderLayers;
+  corrDim, mout, it: integer;
+  MencC1, MencF1, MencF2, MencConv, FHc1, FHc2, GruCells: array of TNNetLayer;
+begin
+  corrDim := (2 * Config.CorrRadius + 1) * (2 * Config.CorrRadius + 1);
+  mout := Config.HiddenDim;
+  SetLength(MencC1, Config.NumIters);
+  SetLength(MencF1, Config.NumIters);
+  SetLength(MencF2, Config.NumIters);
+  SetLength(MencConv, Config.NumIters);
+  SetLength(FHc1, Config.NumIters);
+  SetLength(FHc2, Config.NumIters);
+  SetLength(GruCells, Config.NumIters);
+  NN := TNNet.Create();
+  try
+    // Three inputs at fixed indices 0,1,2 (TNNet.Compute([f1,f2,seed]) maps
+    // pInput[k] -> FLayers[k]): frame1, frame2, zero flow seed (FlowW x FlowH x 2).
+    Inp1 := NN.AddLayer(TNNetInput.Create(Config.ImageW, Config.ImageH, 3));
+    Inp2 := NN.AddLayer(TNNetInput.Create(Config.ImageW, Config.ImageH, 3));
+    FlowSeed := NN.AddLayer(TNNetInput.Create(
+      Config.ImageW div Config.Stride, Config.ImageH div Config.Stride, 2));
+    Fnet1 := RaftBuildEncoder(NN, Inp1, Config.FeatureDim, Config.NormEps, E1);
+    Fnet2 := RaftBuildEncoder(NN, Inp2, Config.FeatureDim, Config.NormEps, E2);
+    // context encoder over frame 1
+    Cnet := RaftBuildEncoder(NN, Inp1, Config.HiddenDim + Config.ContextDim,
+      Config.NormEps, EC);
+    // all-pairs correlation volume of the two feature maps
+    CorrVol := NN.AddLayerAfter(TNNetCorrelationVolume.Create(Fnet2), Fnet1);
+    // split context -> net = tanh(first HiddenDim), inp = relu(rest)
+    NetState := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(0, Config.HiddenDim), Cnet);
+    NetState := NN.AddLayer(TNNetHyperbolicTangent.Create());
+    Inp := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(Config.HiddenDim, Config.ContextDim), Cnet);
+    Inp := NN.AddLayer(TNNetReLU.Create());
+    Flow := FlowSeed;
+    // ---- iterative update ----
+    for it := 0 to Config.NumIters - 1 do
+    begin
+      Lookup := NN.AddLayerAfter(
+        TNNetCorrelationLookup.Create(Config.CorrRadius, Flow), CorrVol);
+      // motion encoder: corr branch (1x1 -> relu)
+      MencC1[it] := NN.AddLayerAfter(
+        TNNetConvolutionReLU.Create(16, 1, 0, 1), Lookup);
+      Cor := MencC1[it];
+      // flow branch (7x7 -> relu -> 3x3 -> relu)
+      MencF1[it] := NN.AddLayerAfter(
+        TNNetConvolutionReLU.Create(8, 7, 3, 1), Flow);
+      MencF2[it] := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+      Flo := MencF2[it];
+      CorFlo := NN.AddLayer(TNNetDeepConcat.Create([Cor, Flo]));
+      MencConv[it] := NN.AddLayerAfter(
+        TNNetConvolutionReLU.Create(mout - 2, 3, 1, 1), CorFlo);
+      Motion := NN.AddLayer(TNNetDeepConcat.Create([MencConv[it], Flow]));
+      // GRU input x = [motion ; inp]; state z = [net ; x]
+      GruIn := NN.AddLayer(TNNetDeepConcat.Create([Motion, Inp]));
+      NetState := NN.AddLayer(TNNetDeepConcat.Create([NetState, GruIn]));
+      Gru := NN.AddLayer(TNNetConvGRUCell.Create(Config.HiddenDim,
+        mout + Config.ContextDim, 3));
+      GruCells[it] := Gru;
+      NetState := Gru;
+      // flow head: conv 3x3 relu -> conv 3x3 (2)
+      FHc1[it] := NN.AddLayerAfter(
+        TNNetConvolutionReLU.Create(32, 3, 1, 1), Gru);
+      FHc2[it] := NN.AddLayer(TNNetConvolutionLinear.Create(2, 3, 1, 1));
+      DFlow := FHc2[it];
+      Flow := NN.AddLayer(TNNetSum.Create([Flow, DFlow]));
+    end;
+    FH1 := Flow; // final flow output (the net's last layer)
+    if FH1 = nil then
+      ImportError('RAFT import: internal error - no flow output produced.');
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // -------------------- weights --------------------
+    // fnet weights are SHARED across both frame branches (same tensors).
+    RaftLoadEncoder(Reader, 'fnet.', E1, Config.FeatureDim, Config.NormEps);
+    RaftLoadEncoder(Reader, 'fnet.', E2, Config.FeatureDim, Config.NormEps);
+    RaftLoadEncoder(Reader, 'cnet.', EC,
+      Config.HiddenDim + Config.ContextDim, Config.NormEps);
+    // The update operator weights (menc / gru / flow_head) are SHARED across
+    // every iteration: load the SAME tensors into each unrolled instance.
+    for it := 0 to Config.NumIters - 1 do
+    begin
+      RaftLoadConv(Reader, MencC1[it], 'menc.convc1.weight',
+        'menc.convc1.bias', 16, corrDim, 1, True);
+      RaftLoadConv(Reader, MencF1[it], 'menc.convf1.weight',
+        'menc.convf1.bias', 8, 2, 7, True);
+      RaftLoadConv(Reader, MencF2[it], 'menc.convf2.weight',
+        'menc.convf2.bias', 8, 8, 3, True);
+      RaftLoadConv(Reader, MencConv[it], 'menc.conv.weight',
+        'menc.conv.bias', mout - 2, 16 + 8, 3, True);
+      RaftLoadConvGRU(Reader, GruCells[it], 'gru.', Config.HiddenDim,
+        Config.HiddenDim + mout + Config.ContextDim);
+      RaftLoadConv(Reader, FHc1[it], 'flow_head.conv1.weight',
+        'flow_head.conv1.bias', 32, Config.HiddenDim, 3, True);
+      RaftLoadConv(Reader, FHc2[it], 'flow_head.conv2.weight',
+        'flow_head.conv2.bias', 2, 32, 3, True);
+    end;
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildRaftFromSafeTensors(const FileName: string;
+  out Config: TRaftConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  CfgFile: string;
+begin
+  if ConfigFileName <> '' then CfgFile := ConfigFileName
+  else CfgFile := ExtractFilePath(FileName) +
+    StringReplace(ExtractFileName(FileName), '.safetensors', '_config.json',
+      [rfReplaceAll]);
+  if not FileExists(CfgFile) then
+    CfgFile := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRaftConfigFromJSONFile(CfgFile);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildRaftFromSafeTensorsEx(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure RaftPredictFlow(NN: TNNet; const Config: TRaftConfig;
+  Frame1, Frame2, FlowOut: TNNetVolume);
+var
+  FlowW, FlowH, x, y: integer;
+  Seed, Outp: TNNetVolume;
+begin
+  FlowW := Config.ImageW div Config.Stride;
+  FlowH := Config.ImageH div Config.Stride;
+  // Inputs at fixed indices 0,1,2 (see BuildRaftFromSafeTensorsEx).
+  Seed := TNNetVolume.Create(FlowW, FlowH, 2);
+  try
+    Seed.Fill(0);
+    NN.Compute([Frame1, Frame2, Seed]);
+    Outp := NN.GetLastLayer().Output;
+    FlowOut.ReSize(FlowW, FlowH, 2);
+    for y := 0 to FlowH - 1 do
+      for x := 0 to FlowW - 1 do
+      begin
+        FlowOut.Store(x, y, 0, Outp.Get(x, y, 0));
+        FlowOut.Store(x, y, 1, Outp.Get(x, y, 1));
+      end;
+  finally
+    Seed.Free;
   end;
 end;
 

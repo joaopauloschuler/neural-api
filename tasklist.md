@@ -403,20 +403,30 @@ rather than acted on.
       DFL conv bin buffer ultralytics bakes in); (c) yolov8 segmentation /
       pose / OBB heads; (d) letterbox preprocessing helper for arbitrary-size
       images (the importer assumes a square ImageSize input).
-- [ ] RAFT optical-flow importer (BuildRaftFromSafeTensors, e.g. princeton-vl/raft or
-      the torchvision raft_small weights) — the FIRST optical-flow vertical and the
-      first model with a TWO-image input producing a dense 2-channel (dx, dy) motion
-      field. Structurally distinct from every landed model: a shared feature encoder
-      over both frames -> an all-pairs 4-D CORRELATION volume (the genuinely new
-      primitive: dot-products between every pair of feature locations across a
-      multi-scale pyramid) -> an iterative ConvGRU update operator that refines the
-      flow over N steps (a convolutional recurrent cell over an (H,W,C) state —
-      reuse / add a minimal conv-gated recurrent cell, the same building block the
-      landed Next-frame VideoPrediction ConvLSTM needs). Scope v1 to raft_small +
-      a fixed small iteration count, inference-only (no upsampling-mask training
-      path needed). Pico parity vs a torchvision float64 oracle on the predicted
-      flow + an examples/OpticalFlow that warps one tiny frame toward the next and
-      writes a color-coded flow map. Unblocks video-stabilization / frame-interp work.
+- [X] RAFT optical-flow importer (BuildRaftFromSafeTensors / ...Ex + TRaftConfig +
+      ReadRaftConfigFromJSONFile + RaftConfigToString + RaftPredictFlow, in
+      neuralpretrained.pas) — the FIRST optical-flow vertical and first TWO-image-in
+      / dense-(dx,dy)-out model. New layers (neuralnetwork.pas, all FORWARD-ONLY per
+      v1 inference scope): TNNetCorrelationVolume (all-pairs corr(i,j)=<f1(i),f2(j)>/
+      sqrt(C), depth=H*W, channel=jy*W+jx), TNNetCorrelationLookup (local (2r+1)^2
+      window around i+flow, bilinear grid_sample align_corners/zeros), TNNetConvGRUCell
+      (single-step conv GRU over (W,H,C); GOTCHA: Data[x,y,d] is x-FIRST, do NOT copy
+      ConvLSTM's Data[row,col] packing — caused a transposed-output border bug). Net
+      built as one TNNet, three TNNetInput sources (frame1,frame2,zero-flow seed) at
+      fixed indices 0,1,2 (TNNet.Compute([f1,f2,seed])), update loop UNROLLED NumIters
+      with SHARED menc/gru/flow_head weights loaded into each instance; fnet weights
+      shared across both frame branches. Pico parity vs a torch float64 oracle
+      (tools/raft_small_tiny_fixture.py reimplements raft_small math directly since
+      torchvision is NOT in the venv): max|diff| 5.5e-6 < 1e-4
+      (TestRaftOpticalFlowParity). examples/OpticalFlow warps frame1->frame2 via the
+      landed TNNetFlowWarp and writes a Middlebury color-coded flow map.
+      NOTE: float32 runtime vs float64 oracle forced the fixture into the
+      NON-SATURATING GRU regime (small weights) to stay under 1e-4 over the iterations.
+      OPEN FOLLOW-UPS: (a) real torchvision raft_small key parity + wire model_type
+      'raft_small' into BuildFromPretrained dispatch; (b) multi-level correlation
+      pyramid (v1 is single-level) + /8 stride; (c) convex-upsampling mask head to
+      full resolution; (d) backward path for the new layers (v1 forward-only);
+      (e) the big SepConvGRU + residual-flow-head of full raft_large.
 - [ ] ControlNet spatial-conditioning importer (BuildControlNetFromSafeTensors, e.g.
       lllyasviel/sd-controlnet-canny) — adds spatial control (edge / depth / pose
       map -> image) to latent diffusion: a trainable COPY of the SD UNet encoder +

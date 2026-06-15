@@ -3157,6 +3157,109 @@ type
     property FlowSource: TNNetLayer read FFlowLayer;
   end;
 
+  /// TNNetCorrelationVolume: the all-pairs 4-D CORRELATION volume that is the
+  // signature primitive of RAFT (Teed & Deng 2020, "RAFT: Recurrent All-Pairs
+  // Field Transforms for Optical Flow", arXiv:2003.12039). Given TWO feature
+  // maps f1 (PrevLayer) and f2 (the second source), both (W, H, C) and of the
+  // SAME shape, it produces the dot-product between EVERY pair of feature
+  // locations:
+  //   corr(i, j) = < f1(i), f2(j) > / sqrt(C)
+  // for source pixel i = (ix, iy) and target pixel j = (jx, jy). The output is
+  // (W, H, H*W): output pixel i carries the H*W correlations against every
+  // target j, packed in the depth axis row-major as channel = jy*W + jx (so
+  // the depth axis re-interpreted as a (W, H) map is exactly the target grid,
+  // which TNNetCorrelationLookup samples). This is the genuinely new operation
+  // among the landed layers: a quadratic-in-pixels similarity tensor rather
+  // than a local convolution. v1 is FORWARD-ONLY (RAFT inference): the
+  // correlation volume is precomputed once and consumed by the iterative
+  // update operator; Backpropagate is a no-op (documented inference-only path).
+  // No trainable parameters. TWO sources (wired like TNNetFlowWarp /
+  // TNNetCrossAttention): PrevLayer = f1, second source = f2.
+  // Coded by Claude (AI).
+  TNNetCorrelationVolume = class(TNNetLayer)
+  private
+    FF2Layer: TNNetLayer; // second feature map f2
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(F2Source: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property F2Source: TNNetLayer read FF2Layer;
+  end;
+
+  /// TNNetCorrelationLookup: the local lookup of a RAFT all-pairs correlation
+  // volume around each pixel's CURRENT flow estimate (Teed & Deng 2020). Given
+  // a correlation volume V (PrevLayer, shape (W, H, H*W) as produced by
+  // TNNetCorrelationVolume, depth channel = jy*W + jx) and a dense two-channel
+  // (dx, dy) flow field (the second source, (W, H, 2)), it emits for every
+  // source pixel i = (ix, iy) the (2r+1)^2 window of correlations
+  //   out(i, k) = V( i, ix + dx + dxoff, iy + dy + dyoff )
+  // bilinearly interpolated over the target grid, where (dxoff, dyoff) sweep
+  // [-r..r] x [-r..r] row-major (k = (dyoff+r)*(2r+1) + (dxoff+r)). Targets are
+  // sampled with PyTorch grid_sample(align_corners=True, padding_mode='zeros')
+  // semantics: the target grid is mapped to [-1,1] via 2*g/(dim-1)-1, bilinear,
+  // out-of-range neighbours contribute zero. Output (W, H, (2r+1)^2) feeds the
+  // motion encoder of the update operator. v1 is FORWARD-ONLY (inference).
+  // No trainable parameters. TWO sources: PrevLayer = volume, second = flow.
+  // Coded by Claude (AI).
+  TNNetCorrelationLookup = class(TNNetLayer)
+  private
+    FFlowLayer: TNNetLayer; // dense (dx, dy) flow source
+    FRadius, FW, FH: integer;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(pRadius: integer; FlowSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property Radius: integer read FRadius;
+    property FlowSource: TNNetLayer read FFlowLayer;
+  end;
+
+  /// TNNetConvGRUCell: a SINGLE-STEP convolutional GRU cell over an (W, H, C)
+  // hidden state - the recurrent update primitive of the RAFT flow update
+  // operator (Teed & Deng 2020) and the spatial GRU sibling of the dense
+  // TNNetMinGRU / TNNetSLSTMCell and of TNNetConvLSTMCell. Unlike
+  // TNNetConvLSTMCell (which scans a packed length-T sequence in one layer),
+  // this is ONE timestep: it takes the channel-concatenation z = [h ; x] of the
+  // previous hidden map h (the first HiddenC channels of PrevLayer) and the
+  // step input x (the remaining channels) and applies SAME-padding KxK convs:
+  //   z_g = sigmoid(Wz * [h ; x] + bz)        (update gate)
+  //   r_g = sigmoid(Wr * [h ; x] + br)        (reset gate)
+  //   q   = tanh   (Wq * [r_g*h ; x] + bq)    (candidate)
+  //   h'  = (1 - z_g) * h + z_g * q            (new hidden map)
+  // so the layer's input depth is HiddenC + InC and its output depth is HiddenC.
+  // The importer drives the iterative refinement by re-feeding the new hidden
+  // map (concatenated with the next step input) to the NEXT cell instance. Each
+  // gate kernel lives in one neuron as (HiddenC, K*K, inChannels) with a
+  // (1,1,HiddenC) bias; convz/convr see HiddenC+InC input channels, convq sees
+  // HiddenC+InC as well (the reset is applied to h before the concat is rebuilt
+  // internally). FStruct[0]=HiddenC, FStruct[1]=InC, FStruct[2]=K. v1 is
+  // FORWARD-ONLY (RAFT inference); Backpropagate is a no-op (documented).
+  // Coded by Claude (AI).
+  TNNetConvGRUCell = class(TNNetLayer)
+  private
+    FHiddenC, FInC, FFeature, FPad, FW, FH: integer;
+    FZg, FRg, FQ, FRH: TNNetVolume; // gate scratch maps
+    FZcat: TNNetVolume;            // [r*h ; x] scratch for the candidate conv
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    procedure GateConv(NeuronBase: integer; Src: TNNetVolume; Dst: TNNetVolume);
+  public
+    constructor Create(pHiddenChannels, pInputChannels: integer;
+      pFeatureSize: integer = 3); reintroduce; overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    procedure InitDefault(); override;
+    property HiddenChannels: integer read FHiddenC;
+    property InputChannels: integer read FInC;
+    property FeatureSize: integer read FFeature;
+  end;
+
   /// Scale + translate ONLY affine assembler for a "hard" visual-attention
   // glimpse. Takes a Size=4 input vector (s_x, s_y, t_x, t_y) from a
   // localization head and SCATTERS it into the Size=6, 2x3 affine matrix
@@ -25999,6 +26102,368 @@ begin
      (FFlowLayer.OutputError.Size = FFlowLayer.Output.Size) then
     FFlowLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCorrelationVolume }
+
+constructor TNNetCorrelationVolume.Create(F2Source: TNNetLayer);
+begin
+  inherited Create();
+  if F2Source = nil then
+    FErrorProc('TNNetCorrelationVolume requires a non-nil F2Source.');
+  FF2Layer := F2Source;
+  if FF2Layer is TNNetInput then TNNetInput(FF2Layer).EnableErrorCollection;
+  FF2Layer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetCorrelationVolume.Destroy();
+begin
+  inherited Destroy();
+end;
+
+function TNNetCorrelationVolume.SaveStructureToString(): string;
+begin
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FF2Layer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetCorrelationVolume.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (FF2Layer.FOutput.SizeX <> pPrevLayer.FOutput.SizeX) or
+     (FF2Layer.FOutput.SizeY <> pPrevLayer.FOutput.SizeY) or
+     (FF2Layer.FOutput.Depth <> pPrevLayer.FOutput.Depth) then
+    FErrorProc('TNNetCorrelationVolume requires f1 and f2 to share shape. f1='
+      + IntToStr(pPrevLayer.FOutput.SizeX) + 'x'
+      + IntToStr(pPrevLayer.FOutput.SizeY) + 'x'
+      + IntToStr(pPrevLayer.FOutput.Depth) + ', f2='
+      + IntToStr(FF2Layer.FOutput.SizeX) + 'x'
+      + IntToStr(FF2Layer.FOutput.SizeY) + 'x'
+      + IntToStr(FF2Layer.FOutput.Depth));
+  // Output depth = H*W (one correlation per target pixel), channel = jy*W + jx.
+  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
+    pPrevLayer.FOutput.SizeX * pPrevLayer.FOutput.SizeY);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetCorrelationVolume.Compute();
+var
+  StartTime: double;
+  W, H, C, ix, iy, jx, jy, dd, ch: integer;
+  f1, f2: TNNetVolume;
+  acc, invSqrtC: TNeuralFloat;
+begin
+  StartTime := Now();
+  f1 := FPrevLayer.FOutput;
+  f2 := FF2Layer.FOutput;
+  W := f1.SizeX; H := f1.SizeY; C := f1.Depth;
+  if C > 0 then invSqrtC := 1.0 / Sqrt(C) else invSqrtC := 1.0;
+  for iy := 0 to H - 1 do
+  for ix := 0 to W - 1 do
+    for jy := 0 to H - 1 do
+    for jx := 0 to W - 1 do
+    begin
+      acc := 0;
+      for dd := 0 to C - 1 do
+        acc := acc + f1.Get(ix, iy, dd) * f2.Get(jx, jy, dd);
+      ch := jy * W + jx;
+      FOutput.Store(ix, iy, ch, acc * invSqrtC);
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCorrelationVolume.Backpropagate();
+begin
+  // v1 is inference-only (RAFT forward). The all-pairs volume is consumed by
+  // the iterative update operator; no training path is wired.
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetCorrelationLookup }
+
+constructor TNNetCorrelationLookup.Create(pRadius: integer;
+  FlowSource: TNNetLayer);
+begin
+  inherited Create();
+  if pRadius < 0 then
+    FErrorProc('TNNetCorrelationLookup requires Radius >= 0.');
+  if FlowSource = nil then
+    FErrorProc('TNNetCorrelationLookup requires a non-nil FlowSource.');
+  FRadius := pRadius;
+  FStruct[0] := pRadius;
+  FFlowLayer := FlowSource;
+  if FFlowLayer is TNNetInput then TNNetInput(FFlowLayer).EnableErrorCollection;
+  FFlowLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetCorrelationLookup.Destroy();
+begin
+  inherited Destroy();
+end;
+
+function TNNetCorrelationLookup.SaveStructureToString(): string;
+begin
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FFlowLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetCorrelationLookup.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FW := pPrevLayer.FOutput.SizeX;
+  FH := pPrevLayer.FOutput.SizeY;
+  if pPrevLayer.FOutput.Depth <> FW * FH then
+    FErrorProc('TNNetCorrelationLookup expects a (W,H,H*W) volume. Got depth='
+      + IntToStr(pPrevLayer.FOutput.Depth) + ' for ' + IntToStr(FW) + 'x'
+      + IntToStr(FH));
+  if (FFlowLayer.FOutput.Depth <> 2) or
+     (FFlowLayer.FOutput.SizeX <> FW) or (FFlowLayer.FOutput.SizeY <> FH) then
+    FErrorProc('TNNetCorrelationLookup requires a (W,H,2) flow field matching '
+      + 'the volume spatial size.');
+  FOutput.ReSize(FW, FH, (2 * FRadius + 1) * (2 * FRadius + 1));
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetCorrelationLookup.Compute();
+var
+  StartTime: double;
+  Vol, Flow: TNNetVolume;
+  ix, iy, dxoff, dyoff, k: integer;
+  x0, y0, x1, y1: integer;
+  gx, gy, nx, ny, sgx, sgy, fx, fy: TNeuralFloat;
+  w00, w01, w10, w11, acc: TNeuralFloat;
+
+  function VolAt(srcx, srcy, tgtx, tgty: integer): TNeuralFloat;
+  begin
+    // zero padding outside the target grid (grid_sample padding_mode='zeros')
+    if (tgtx < 0) or (tgtx >= FW) or (tgty < 0) or (tgty >= FH) then
+      Result := 0
+    else
+      Result := Vol.Get(srcx, srcy, tgty * FW + tgtx);
+  end;
+
+begin
+  StartTime := Now();
+  Vol := FPrevLayer.FOutput;
+  Flow := FFlowLayer.FOutput;
+  for iy := 0 to FH - 1 do
+  for ix := 0 to FW - 1 do
+  begin
+    for dyoff := -FRadius to FRadius do
+    for dxoff := -FRadius to FRadius do
+    begin
+      k := (dyoff + FRadius) * (2 * FRadius + 1) + (dxoff + FRadius);
+      // target = i + flow(i) + delta, then grid_sample(align_corners=True):
+      // the [-1,1] normalisation maps integer grid coords back to themselves,
+      // so we sample bilinearly directly in target-pixel coordinates.
+      gx := ix + Flow.Get(ix, iy, 0) + dxoff;
+      gy := iy + Flow.Get(ix, iy, 1) + dyoff;
+      // align_corners=True identity round-trip (kept explicit to mirror the
+      // torch oracle: nx = 2*gx/(W-1)-1 then back to gx).
+      if FW > 1 then nx := 2.0 * gx / (FW - 1) - 1.0 else nx := 0;
+      if FH > 1 then ny := 2.0 * gy / (FH - 1) - 1.0 else ny := 0;
+      if FW > 1 then sgx := (nx + 1.0) * (FW - 1) / 2.0 else sgx := 0;
+      if FH > 1 then sgy := (ny + 1.0) * (FH - 1) / 2.0 else sgy := 0;
+      x0 := Floor(sgx); y0 := Floor(sgy);
+      x1 := x0 + 1;     y1 := y0 + 1;
+      fx := sgx - x0;   fy := sgy - y0;
+      w00 := (1 - fx) * (1 - fy); w10 := fx * (1 - fy);
+      w01 := (1 - fx) * fy;       w11 := fx * fy;
+      acc := w00 * VolAt(ix, iy, x0, y0)
+           + w10 * VolAt(ix, iy, x1, y0)
+           + w01 * VolAt(ix, iy, x0, y1)
+           + w11 * VolAt(ix, iy, x1, y1);
+      FOutput.Store(ix, iy, k, acc);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetCorrelationLookup.Backpropagate();
+begin
+  // v1 inference-only (see TNNetCorrelationVolume).
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetConvGRUCell }
+
+constructor TNNetConvGRUCell.Create(pHiddenChannels, pInputChannels: integer;
+  pFeatureSize: integer);
+begin
+  inherited Create();
+  if pHiddenChannels < 1 then
+    FErrorProc('TNNetConvGRUCell requires HiddenChannels >= 1.');
+  if pInputChannels < 1 then
+    FErrorProc('TNNetConvGRUCell requires InputChannels >= 1.');
+  if (pFeatureSize < 1) or ((pFeatureSize and 1) = 0) then
+    FErrorProc('TNNetConvGRUCell requires an odd FeatureSize >= 1.');
+  FHiddenC := pHiddenChannels;
+  FInC := pInputChannels;
+  FFeature := pFeatureSize;
+  FPad := pFeatureSize div 2;
+  FStruct[0] := FHiddenC;
+  FStruct[1] := FInC;
+  FStruct[2] := FFeature;
+  FZg := TNNetVolume.Create;
+  FRg := TNNetVolume.Create;
+  FQ := TNNetVolume.Create;
+  FRH := TNNetVolume.Create;
+  FZcat := TNNetVolume.Create;
+end;
+
+destructor TNNetConvGRUCell.Destroy();
+begin
+  FZg.Free; FRg.Free; FQ.Free; FRH.Free; FZcat.Free;
+  inherited Destroy();
+end;
+
+function TNNetConvGRUCell.SaveStructureToString(): string;
+begin
+  Result := inherited SaveStructureToString;
+end;
+
+procedure TNNetConvGRUCell.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  ZC: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if pPrevLayer.FOutput.Depth <> FHiddenC + FInC then
+    FErrorProc('TNNetConvGRUCell expects input depth HiddenC+InC=' +
+      IntToStr(FHiddenC + FInC) + '. Got ' +
+      IntToStr(pPrevLayer.FOutput.Depth));
+  FW := pPrevLayer.FOutput.SizeX;
+  FH := pPrevLayer.FOutput.SizeY;
+  ZC := FHiddenC + FInC;
+  // Neurons: [0]=Wz [1]=Wr [2]=Wq (kernels (HiddenC,K*K,ZC)),
+  //          [3]=bz [4]=br [5]=bq (biases (1,1,HiddenC)).
+  if FNeurons.Count < 6 then AddMissingNeurons(6);
+  FNeurons[0].FWeights.ReSize(FHiddenC, FFeature * FFeature, ZC);
+  FNeurons[1].FWeights.ReSize(FHiddenC, FFeature * FFeature, ZC);
+  FNeurons[2].FWeights.ReSize(FHiddenC, FFeature * FFeature, ZC);
+  FNeurons[3].FWeights.ReSize(1, 1, FHiddenC);
+  FNeurons[4].FWeights.ReSize(1, 1, FHiddenC);
+  FNeurons[5].FWeights.ReSize(1, 1, FHiddenC);
+  FZg.ReSize(FW, FH, FHiddenC);
+  FRg.ReSize(FW, FH, FHiddenC);
+  FQ.ReSize(FW, FH, FHiddenC);
+  FRH.ReSize(FW, FH, ZC);   // [r*h ; x]
+  FZcat.ReSize(FW, FH, ZC);
+  FOutput.ReSize(FW, FH, FHiddenC);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+  InitDefault();
+end;
+
+procedure TNNetConvGRUCell.GateConv(NeuronBase: integer; Src: TNNetVolume;
+  Dst: TNNetVolume);
+var
+  W, KW, Bias: TNNetVolume;
+  x, y, oc, ky, kx, sy, sx, tap, zi, ZC, ocBase: integer;
+  acc: TNeuralFloat;
+  WR, SPtr: TNeuralFloatArrPtr;
+begin
+  KW := FNeurons[NeuronBase].FWeights;
+  Bias := FNeurons[NeuronBase + 3].FWeights;
+  ZC := Src.Depth;
+  WR := KW.GetRawPtr(); // flat: neuron oc owns the contiguous (K*K*ZC) block at oc*K*K*ZC
+  for y := 0 to FH - 1 do
+  for x := 0 to FW - 1 do
+    for oc := 0 to FHiddenC - 1 do
+    begin
+      ocBase := oc * (FFeature * FFeature * ZC);
+      acc := Bias.FData[oc];
+      for ky := 0 to FFeature - 1 do
+      begin
+        sy := y + ky - FPad;
+        if (sy < 0) or (sy >= FH) then continue;
+        for kx := 0 to FFeature - 1 do
+        begin
+          sx := x + kx - FPad;
+          if (sx < 0) or (sx >= FW) then continue;
+          tap := ocBase + (ky * FFeature + kx) * ZC;
+          SPtr := Src.GetRawPtr(sx, sy, 0); // GetRawPtr(x=col, y=row, d)
+          for zi := 0 to ZC - 1 do
+            acc := acc + WR^[tap + zi] * SPtr^[zi];
+        end;
+      end;
+      Dst.Store(x, y, oc, acc); // Store(x, y, d) - x is the FIRST index
+    end;
+end;
+
+procedure TNNetConvGRUCell.Compute();
+var
+  StartTime: double;
+  Prev: TNNetVolume;
+  x, y, oc: integer;
+  zv, qv, hv: TNeuralFloat;
+begin
+  StartTime := Now();
+  Prev := FPrevLayer.FOutput;
+  // z = sigmoid(Wz*[h;x]+bz); r = sigmoid(Wr*[h;x]+br) over the raw input.
+  GateConv(0, Prev, FZg);
+  GateConv(1, Prev, FRg);
+  for y := 0 to FH - 1 do
+  for x := 0 to FW - 1 do
+    for oc := 0 to FHiddenC - 1 do
+    begin
+      FZg.Store(x, y, oc, Sigmoid(FZg.Get(x, y, oc)));
+      FRg.Store(x, y, oc, Sigmoid(FRg.Get(x, y, oc)));
+    end;
+  // Build [r*h ; x] then q = tanh(Wq*[r*h;x]+bq).
+  for y := 0 to FH - 1 do
+  for x := 0 to FW - 1 do
+  begin
+    for oc := 0 to FHiddenC - 1 do
+      FRH.Store(x, y, oc, FRg.Get(x, y, oc) * Prev.Get(x, y, oc));
+    for oc := 0 to FInC - 1 do
+      FRH.Store(x, y, FHiddenC + oc, Prev.Get(x, y, FHiddenC + oc));
+  end;
+  GateConv(2, FRH, FQ);
+  for y := 0 to FH - 1 do
+  for x := 0 to FW - 1 do
+    for oc := 0 to FHiddenC - 1 do
+    begin
+      zv := FZg.Get(x, y, oc);
+      qv := TanH(FQ.Get(x, y, oc));
+      hv := Prev.Get(x, y, oc);
+      FOutput.Store(x, y, oc, (1 - zv) * hv + zv * qv);
+    end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetConvGRUCell.Backpropagate();
+begin
+  // v1 inference-only (RAFT forward). No BPTT path is wired.
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+procedure TNNetConvGRUCell.InitDefault();
+var
+  d, j, ZC: integer;
+begin
+  if FNeurons.Count < 6 then exit;
+  ZC := FHiddenC + FInC;
+  for d := 0 to FHiddenC - 1 do
+    for j := 0 to FFeature * FFeature * ZC - 1 do
+    begin
+      FNeurons[0].FWeights.FData[d * FFeature * FFeature * ZC + j] :=
+        FNeurons[0].FWeights.RandomGaussianValue() * 0.05;
+      FNeurons[1].FWeights.FData[d * FFeature * FFeature * ZC + j] :=
+        FNeurons[1].FWeights.RandomGaussianValue() * 0.05;
+      FNeurons[2].FWeights.FData[d * FFeature * FFeature * ZC + j] :=
+        FNeurons[2].FWeights.RandomGaussianValue() * 0.05;
+    end;
+  FNeurons[3].FWeights.Fill(0);
+  FNeurons[4].FWeights.Fill(0);
+  FNeurons[5].FWeights.Fill(0);
 end;
 
 { TNNetScatterToAffine }
@@ -89572,7 +90037,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetCorrelationVolume') or (S[0] = 'TNNetCorrelationLookup') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -89715,6 +90180,9 @@ begin
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetFlowWarp' :             Result := TNNetFlowWarp.Create(aL[0]);
+      'TNNetCorrelationVolume' :    Result := TNNetCorrelationVolume.Create(aL[0]);
+      'TNNetCorrelationLookup' :    Result := TNNetCorrelationLookup.Create(St[0], aL[0]);
+      'TNNetConvGRUCell' :          Result := TNNetConvGRUCell.Create(St[0], St[1], St[2]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
       'TNNetHyperConv' :            Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]);
       'TNNetModulatedConv2D' :      Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]);
@@ -90120,6 +90588,9 @@ begin
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetFlowWarp' then Result := TNNetFlowWarp.Create(aL[0]) else
+      if S[0] = 'TNNetCorrelationVolume' then Result := TNNetCorrelationVolume.Create(aL[0]) else
+      if S[0] = 'TNNetCorrelationLookup' then Result := TNNetCorrelationLookup.Create(St[0], aL[0]) else
+      if S[0] = 'TNNetConvGRUCell' then Result := TNNetConvGRUCell.Create(St[0], St[1], St[2]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetHyperConv' then Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]) else
       if S[0] = 'TNNetModulatedConv2D' then Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]) else

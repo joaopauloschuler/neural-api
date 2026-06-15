@@ -114,3 +114,12 @@ StyleGAN2Generate/*.ppu
 StyleGAN2Generate/*.ppr
 StyleGAN2Generate/*.ppm
 StyleGAN2Generate/*.png
+
+# OpticalFlow: RAFT optical-flow demo binary, build artifacts, and the
+# generated flow-field / warp PPM visualisations.
+OpticalFlow/OpticalFlow
+OpticalFlow/*.o
+OpticalFlow/*.ppu
+OpticalFlow/*.ppr
+OpticalFlow/*.ppm
+OpticalFlow/lib

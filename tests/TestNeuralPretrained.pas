@@ -365,6 +365,8 @@ type
     procedure TestBuildFromPretrainedRejectsUnsupportedModelType;
     procedure TestLoadPretrainedEmbedding;
     procedure TestPEFTLoRAAdapterLoadAndMerge;
+    procedure TestRaftConfigFromJSONFile;
+    procedure TestRaftOpticalFlowParity;
   end;
 
 implementation
@@ -16592,6 +16594,114 @@ begin
   for i := 0 to 31 do
     AssertTrue('MXFP4 NaN-scale element ' + IntToStr(i) + ' is NaN',
       IsNan(Dest[i]));
+end;
+
+// Verifies ReadRaftConfigFromJSONFile on the committed pico RAFT config.
+procedure TTestNeuralPretrained.TestRaftConfigFromJSONFile;
+var
+  Cfg: TRaftConfig;
+begin
+  Cfg := ReadRaftConfigFromJSONFile(FixturePath('tiny_raft_config.json'));
+  AssertEquals('model_type', 'raft_small', Cfg.ModelType);
+  AssertEquals('image_w', 32, Cfg.ImageW);
+  AssertEquals('image_h', 32, Cfg.ImageH);
+  AssertEquals('stride', 4, Cfg.Stride);
+  AssertEquals('feature_dim', 16, Cfg.FeatureDim);
+  AssertEquals('hidden_dim', 12, Cfg.HiddenDim);
+  AssertEquals('context_dim', 8, Cfg.ContextDim);
+  AssertEquals('corr_radius', 2, Cfg.CorrRadius);
+  AssertEquals('num_iters', 4, Cfg.NumIters);
+end;
+
+// RAFT optical-flow parity. tiny_raft.* is a pico random-init raft_small-style
+// model (32x32 frames -> /4 = 8x8 flow grid, feature_dim 16, hidden_dim 12,
+// context_dim 8, corr_radius 2, 4 iterations) whose state_dict mirrors the
+// torchvision raft_small key scheme (fnet./cnet. SmallEncoders, an all-pairs
+// correlation volume, the menc./gru./flow_head update operator). The
+// reference flow is a torch float64 oracle (tools/raft_small_tiny_fixture.py,
+// which reimplements the published RAFT-small math since torchvision is not in
+// the venv). Asserts the predicted coarse flow field max |diff| < 1e-4 -
+// exercising the NEW TNNetCorrelationVolume / TNNetCorrelationLookup /
+// TNNetConvGRUCell primitives, the InstanceNorm residual encoder, the
+// two-feature-map correlation and the iterative ConvGRU refinement.
+procedure TTestNeuralPretrained.TestRaftOpticalFlowParity;
+var
+  NN: TNNet;
+  Config: TRaftConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Img1, Img2, FlowArr, RowArr, ChanArr: TJSONArray;
+  F1, F2, FlowOut: TNNetVolume;
+  ChanCnt, YCnt, XCnt, FlowW, FlowH: integer;
+  Diff, MaxDiff, Ref: double;
+begin
+  RandSeed := 424242;
+  NN := BuildRaftFromSafeTensors(FixturePath('tiny_raft.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_raft_config.json'));
+  RefJson := TStringList.Create;
+  F1 := TNNetVolume.Create(Config.ImageW, Config.ImageH, 3);
+  F2 := TNNetVolume.Create(Config.ImageW, Config.ImageH, 3);
+  FlowOut := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    FlowW := Config.ImageW div Config.Stride;
+    FlowH := Config.ImageH div Config.Stride;
+    AssertEquals('flow output depth (dx,dy)', 2,
+      NN.GetLastLayer().Output.Depth);
+    AssertEquals('flow grid width', FlowW, NN.GetLastLayer().Output.SizeX);
+
+    RefJson.LoadFromFile(FixturePath('tiny_raft_flow.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Img1 := TJSONArray(TJSONObject(RefRoot).Find('img1'));
+    Img2 := TJSONArray(TJSONObject(RefRoot).Find('img2'));
+    FlowArr := TJSONArray(TJSONObject(RefRoot).Find('flow'));
+    AssertTrue('frames present', (Img1 <> nil) and (Img2 <> nil));
+
+    for ChanCnt := 0 to 2 do
+    begin
+      RowArr := TJSONArray(Img1.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageH - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageW - 1 do
+          F1.FData[(YCnt * Config.ImageW + XCnt) * 3 + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+      RowArr := TJSONArray(Img2.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageH - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageW - 1 do
+          F2.FData[(YCnt * Config.ImageW + XCnt) * 3 + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+
+    RaftPredictFlow(NN, Config, F1, F2, FlowOut);
+    MaxDiff := 0;
+    for ChanCnt := 0 to 1 do
+    begin
+      RowArr := TJSONArray(FlowArr.Items[ChanCnt]);  // (2, H, W)
+      for YCnt := 0 to FlowH - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to FlowW - 1 do
+        begin
+          Ref := ChanArr.Items[XCnt].AsFloat;
+          Diff := Abs(FlowOut.Get(XCnt, YCnt, ChanCnt) - Ref);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('RAFT flow: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    FlowOut.Free; F2.Free; F1.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
 end;
 
 initialization
