@@ -799,32 +799,15 @@ rather than acted on.
       sequence; defer the g2p/phonemizer front-end (document feeding pre-phonemized
       ids) and multi-voice blending to a follow-up. The new pieces are the
       style-conditioned duration predictor and the iSTFT decoder tail.
-- [X] End-to-end TEXT-CONDITIONED MusicGen generation example
-      (examples/MusicGenText, successor to the landed MusicGenSmoke). The smoke
-      explicitly stubs the text encoder ("T5 text ENCODER … external; not in
-      smoke"); this wires the real `BuildT5FromSafeTensors` text encoder ->
-      enc_to_dec_proj -> cross-attention conditioning so a free-text prompt
-      actually steers the generated music, then decodes the delay-pattern code
-      stack through the landed EnCodec decoder to a WAV via SaveVolumeToWav16.
-      LANDED: examples/MusicGenText/{MusicGenText.lpr,.lpi,README.md}; the
-      extended tools/musicgen_tiny_fixture.py now ALSO emits a matched T5
-      encoder fixture (tiny_musicgen_t5enc.*) and a matched EnCodec decoder
-      fixture (tiny_musicgen_encodec.*, codebook_size = MusicGen vocab, >=K
-      quantizers); regression test TestMusicGenTextWiring (deterministic codes
-      + waveform, and a different prompt steers the codes). NOTE: the pico
-      fixture amplifies the conditioning path (enc_to_dec_proj + decoder
-      cross-attention projections) so the prompt visibly steers a 16-way greedy
-      argmax over untrained random weights (the "re-randomize pico weights to a
-      useful scale" trick); the decoder logit-parity oracle is recomputed from
-      the SAME scaled state dict so TestMusicGenDecoderParity stays < 1e-4.
-  - [ ] Classifier-free guidance for MusicGen generation: the
-        unconditional/null-prompt branch + a guidance-scale blend of
-        conditional vs. unconditional logits, wired into
-        TMusicGenModel.Generate.
-  - [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) and a real
-        large downloaded musicgen-small checkpoint + a real tokenizer for the
-        text prompt; plus KV-cache incremental decode and top-k/temperature
-        sampling for the generation loop.
+- [ ] Classifier-free guidance for MusicGen generation (follow-up to the landed
+      text-conditioned examples/MusicGenText): the unconditional/null-prompt
+      branch + a guidance-scale blend of conditional vs. unconditional logits,
+      wired into TMusicGenModel.Generate.
+- [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) and a real
+      large downloaded musicgen-small checkpoint + a real tokenizer for the
+      text prompt; plus KV-cache incremental decode and top-k/temperature
+      sampling for the generation loop (follow-up to the landed
+      examples/MusicGenText).
 - [ ] SeamlessM4T (v2) speech-to-text TRANSLATION importer
       (`BuildSeamlessM4TFromSafeTensors[Ex]`, `facebook/seamless-m4t-v2-large` /
       `hf-audio/…`) — multilingual speech translation, a capability the repo has
@@ -863,27 +846,14 @@ rather than acted on.
         default TargetAccuracy and early-stops.
   - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
         directly instead of requiring an ffmpeg pre-pass.
-- [X] Moonshine DECODER + end-to-end transcription (successor to the landed
-      encoder above). DONE: (a) BuildMoonshineEncoderDecoderFromSafeTensors[WithConfig]
-      builds the RoPE+SwiGLU decoder (causal partial-RoPE self-attn + cross-attn over
-      the encoder states via the T5EncoderStatesInput two-net convention + SwiGLU MLP
-      with [up|gate]-packed fc1, three gain-only LayerNorms/block, final LN + tied
-      bias-free LM head) — all composed from existing layers, no new layer class;
-      (b) seq2seq decode wired via the T5EncoderStatesInput convention (the audio
-      encoder takes a raw waveform not token ids, so the example uses an equivalent
-      manual greedy loop; DecodeSeq2SeqGreedy/BeamSearch apply to token-id seq2seq);
-      (c) make_pico_moonshine_fixture.py now also dumps decoder next-token logits
-      (tiny_moonshine_decoder.json) and TestMoonshineDecoderLogitParity passes < 1e-4
-      vs the HF MoonshineForConditionalGeneration float64 oracle; (d) examples/
-      MoonshineTranscribe imports encoder+decoder and emits real text when a
-      tokenizer.json is present (TNeuralHFTokenizer), keeping the no-network smoke.
-      Remaining follow-ups:
-  - [ ] GQA decoder/encoder_num_key_value_heads != heads pico fixture (the pico
-        currently sets kv_heads == heads; the GQA slice path is wired but unexercised
-        by an oracle — add a fixture with kv_heads < heads and assert parity).
-  - [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
-        cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
-        machinery) so long transcripts don't re-run the whole prefix each step.
+- [ ] Moonshine GQA decoder/encoder pico fixture (follow-up to the landed
+      Moonshine encoder-decoder importer + examples/MoonshineTranscribe):
+      decoder/encoder_num_key_value_heads != heads (the pico currently sets
+      kv_heads == heads; the GQA slice path is wired but unexercised by an
+      oracle — add a fixture with kv_heads < heads and assert parity).
+- [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
+      cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
+      machinery) so long transcripts don't re-run the whole prefix each step.
 - [ ] Whisper WORD-LEVEL timestamps via cross-attention DTW alignment (port of
       openai-whisper / transformers `return_timestamps="word"`) — the landed Whisper
       importer transcribes text but emits NO timing; this is the standard, high-value
@@ -905,24 +875,6 @@ rather than acted on.
       the DTW path length/monotonicity (and optionally token->frame indices) against an
       openai-whisper / HF float64 oracle on a pico fixture. Voice priority; extends an
       already-landed importer rather than adding a near-duplicate of one.
-- [X] SAM two-way MASK DECODER (successor to the landed SAM image-encoder above). v1
-      SINGLE point prompt + SINGLE mask: RunSAMMaskDecoder + ReadSAMMaskDecoderConfig +
-      TSAMMaskDecoderConfig in neuralpretrained.pas compose the prompt encoder (point
-      positional encoding + learned point/not-a-point embeddings + dense no-mask embed),
-      the two-way transformer (token<->image cross-attention over the IoU + mask tokens),
-      and the output upscale (2x ConvTranspose x2) + per-mask hypernetwork-MLP dot ->
-      low-res mask logits. make_pico_sam_fixture.py now builds a tiny HF SamModel WITH a
-      pico-sized prompt/mask decoder, feeds a fixed positive point, and dumps the HF
-      float64 mask logits to tiny_sam_mask.json; TestSAMMaskDecoderParity passes < 1e-4
-      (verified numpy reproduction 6e-7 vs HF). examples/SegmentAnything now runs a REAL
-      click->mask PPM (encoder once -> RunSAMMaskDecoder). GOTCHAS hit: layer-0 self-attn
-      (skip_first_layer_pe) REPLACES queries with NO residual; cross-attn down-samples
-      internal dim by attention_downsample_rate (self-attn does not); image->token
-      cross-attn swaps roles (q=image+pe, k=tokens+pe, v=tokens, added back into keys);
-      num_pos_feats lives on the VISION config (= hidden div 2); the forward is run as
-      plain-array math (NOT a TNNet graph) because the two-way block's per-step q/k pe
-      additions across asymmetric cross-attentions made a static multi-source graph
-      fragile. Follow-ups below.
 - [ ] SAM mask decoder v2: MULTI-point / box prompts + MULTI-mask output + IoU head.
       v1 hardcodes a single positive point (+ pad) and emits only mask-token 0
       (multimask_output=False). Extend the prompt encoder to N points / a box (two
