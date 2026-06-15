@@ -5385,6 +5385,80 @@ function BuildMobileNetV3FromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// EFFICIENTNET IMPORT (torchvision "efficientnet_b0".."efficientnet_b7" /
+// timm-equivalent). EfficientNet reuses the SAME inverted-residual MBConv
+// primitives as MobileNetV3 (expand 1x1 -> depthwise kxk -> optional squeeze-
+// excite -> project 1x1, residual when stride 1 and in == out). The genuine
+// deltas vs MobileNetV3 (small, well-scoped) are:
+//   * EVERY activation (stem / expand / depthwise / head) is SiLU/swish
+//     (x*sigmoid(x), TNNetSwish with beta=1), NOT MobileNetV3's alternating
+//     ReLU / hard-swish.
+//   * squeeze-excite uses SiLU on the reduced branch + a PLAIN sigmoid gate
+//     (TNNetSigmoid), NOT MobileNetV3's ReLU + hard-sigmoid.
+//   * the head is conv 1x1 +BN +SiLU -> global avg pool -> a SINGLE Linear
+//     (classifier.1), NOT MobileNetV3's two-Linear classifier.
+//   * stochastic-depth survival prob is a forward NO-OP at inference (ignored).
+// The per-block expand/kernel/stride/SE table is read from JSON, so b0..b7
+// (compound scaling) are config-driven from one builder. Every conv has
+// bias=False with a following BatchNorm2d (eps 1e-3) FOLDED into the conv at
+// load (reusing the ResNet / MobileNetV3 conv-BN fold path). The torchvision
+// state_dict key scheme is mirrored:
+//   features.0.0 (stem conv) / features.0.1 (stem BN);
+//   features.{i+1}.block.{j}... for each MBConv (j shifts with the optional
+//     expand sub-block and SE -- see the loader);
+//   features.{last}.0/.1 (head conv+BN);
+//   classifier.1 (single Linear).
+type
+  TEfficientNetBlock = record
+    Kernel: integer;       // depthwise kernel (3 or 5)
+    ExpChannels: integer;  // expanded (hidden) channels
+    OutChannels: integer;  // projected output channels
+    Stride: integer;       // depthwise stride (1 or 2)
+    UseSE: boolean;        // squeeze-excite present
+    SEChannels: integer;   // SE reduced dim (fc1 out); ignored when not UseSE
+  end;
+
+  TEfficientNetConfig = record
+    Variant: string;       // 'b0'..'b7' (informational)
+    StemWidth: integer;    // features.0 out channels
+    Blocks: array of TEfficientNetBlock;
+    HeadConvWidth: integer;// features.{last} conv out channels
+    ImageSize: integer;    // 224 canonical for b0
+    NumChannels: integer;  // 3
+    NumLabels: integer;    // 1000 ImageNet-1k
+    BnEps: TNeuralFloat;   // BatchNorm2d eps (1e-3 in torchvision efficientnet)
+    ModelType: string;     // 'efficientnet'
+  end;
+
+// Reads a torchvision-style EfficientNet config. The block table is supplied
+// via a REQUIRED "blocks" array of objects {kernel,exp,out,stride,se,
+// se_channels} (no SE activation/gate fields -- EfficientNet's are fixed
+// SiLU+sigmoid). Optional: variant, stem_width, head_conv_width, image_size
+// (224), num_channels (3), num_labels (1000), bn_eps (1e-3).
+function ReadEfficientNetConfigFromJSONFile(
+  const FileName: string): TEfficientNetConfig;
+
+function EfficientNetConfigToString(const Config: TEfficientNetConfig): string;
+
+// Builds the EfficientNet described by Config and loads every weight from
+// Reader (caller owns Reader), folding each BatchNorm into its conv. The net
+// takes an (ImageSize, ImageSize, NumChannels) ImageNet-normalized RGB volume
+// and outputs (1, 1, NumLabels) class logits.
+function BuildEfficientNet(Reader: TNNetSafeTensorsReader;
+  const Config: TEfficientNetConfig; pInferenceOnly: boolean = false): TNNet;
+
+// Builds + loads the EfficientNet classifier from the checkpoint at FileName
+// (.safetensors / sharded index / pytorch_model.bin). Config is supplied by the
+// caller (Ex) or read from ConfigFileName ('' = "config.json" beside FileName)
+// and returned. Net owned by caller. Output: (1,1,num_labels).
+function BuildEfficientNetFromSafeTensorsEx(const FileName: string;
+  const Config: TEfficientNetConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildEfficientNetFromSafeTensors(const FileName: string;
+  out Config: TEfficientNetConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // INCEPTION-V3 IMPORT (torchvision "inception_v3"). Structurally distinct from
 // every other landed CNN: the body is a stack of parallel MULTI-BRANCH
 // Inception modules whose branch outputs are concatenated on the CHANNEL
@@ -35446,6 +35520,293 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadMobileNetV3ConfigFromJSONFile(ConfigPath);
   Result := BuildMobileNetV3FromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// EFFICIENTNET IMPORT
+// ===========================================================================
+
+function ReadEfficientNetConfigFromJSONFile(
+  const FileName: string): TEfficientNetConfig;
+var
+  JsonText: TStringList;
+  Root, BlockData, LabelObj: TJSONData;
+  Obj, BObj: TJSONObject;
+  BlocksArr: TJSONArray;
+  i: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('EfficientNet import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('EfficientNet import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('EfficientNet import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'efficientnet');
+    Result.Variant := Obj.Get('variant', 'b0');
+    Result.ImageSize := Obj.Get('image_size', 224);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    // torchvision EfficientNet uses BatchNorm2d eps = 0.001 (NOT 1e-5).
+    Result.BnEps := Obj.Get('bn_eps', 0.001);
+    BlockData := Obj.Find('blocks');
+    if (BlockData = nil) or not (BlockData is TJSONArray) then
+      ImportError('EfficientNet import: config "' + FileName +
+        '" is missing the required "blocks" array (per-MBConv table).');
+    BlocksArr := TJSONArray(BlockData);
+    if BlocksArr.Count < 1 then
+      ImportError('EfficientNet import: "blocks" must have >= 1 entry.');
+    SetLength(Result.Blocks, BlocksArr.Count);
+    for i := 0 to BlocksArr.Count - 1 do
+    begin
+      if not (BlocksArr.Items[i] is TJSONObject) then
+        ImportError('EfficientNet import: blocks[' + IntToStr(i) +
+          '] is not a JSON object.');
+      BObj := TJSONObject(BlocksArr.Items[i]);
+      Result.Blocks[i].Kernel := BObj.Get('kernel', 3);
+      Result.Blocks[i].ExpChannels := BObj.Get('exp', 0);
+      Result.Blocks[i].OutChannels := BObj.Get('out', 0);
+      Result.Blocks[i].Stride := BObj.Get('stride', 1);
+      Result.Blocks[i].UseSE := BObj.Get('se', false);
+      Result.Blocks[i].SEChannels := BObj.Get('se_channels', 0);
+      if (Result.Blocks[i].ExpChannels < 1) or
+         (Result.Blocks[i].OutChannels < 1) then
+        ImportError('EfficientNet import: blocks[' + IntToStr(i) +
+          '] needs positive "exp" and "out".');
+      if Result.Blocks[i].UseSE and (Result.Blocks[i].SEChannels < 1) then
+        ImportError('EfficientNet import: blocks[' + IntToStr(i) +
+          '] has se=true but no positive "se_channels".');
+    end;
+    Result.StemWidth := Obj.Get('stem_width', Result.Blocks[0].ExpChannels);
+    // torchvision b0 head conv = 4 * last out channels (1280 = 4*320).
+    Result.HeadConvWidth := Obj.Get('head_conv_width',
+      Result.Blocks[High(Result.Blocks)].OutChannels * 4);
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 1000;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function EfficientNetConfigToString(const Config: TEfficientNetConfig): string;
+begin
+  Result := 'efficientnet_' + Config.Variant + ' config: ' +
+    IntToStr(Length(Config.Blocks)) + ' MBConv blocks' +
+    ', stem=' + IntToStr(Config.StemWidth) +
+    ', head_conv=' + IntToStr(Config.HeadConvWidth) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', channels=' + IntToStr(Config.NumChannels) +
+    ', num_labels=' + IntToStr(Config.NumLabels) +
+    ', bn_eps=' + FloatToStr(Config.BnEps);
+end;
+
+type
+  TEfficientNetBlockLayers = record
+    Expand, Dw, DwBias, SEReduce, SEExpand, Project: TNNetLayer;
+    HasExpand, HasSE, HasResidual: boolean;
+  end;
+
+// Adds one EfficientNet inverted-residual MBConv block (architecture only).
+// Identical structure to MobileNetV3's MBConv except every activation is SiLU
+// (TNNetSwish, beta=1) and the SE gate is a plain sigmoid (TNNetSigmoid).
+// Returns the layer refs the weight loader needs.
+procedure AddEfficientNetMBConv(NN: TNNet; const Blk: TEfficientNetBlock;
+  InChannels: integer; out Refs: TEfficientNetBlockLayers);
+var
+  Input, Branch, Pooled, Gate: TNNetLayer;
+  Pad: integer;
+begin
+  FillChar(Refs, SizeOf(Refs), 0);
+  Refs.HasExpand := Blk.ExpChannels <> InChannels;
+  Refs.HasSE := Blk.UseSE;
+  Refs.HasResidual := (Blk.Stride = 1) and (InChannels = Blk.OutChannels);
+  Pad := Blk.Kernel div 2;
+  Input := NN.GetLastLayer();
+  // 1) expand 1x1 (skipped when exp == in) -> BN(folded into conv bias) -> SiLU
+  if Refs.HasExpand then
+  begin
+    Refs.Expand := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Blk.ExpChannels, 1, 0, 1, 0));
+    NN.AddLayer(TNNetSwish.Create());
+  end;
+  // 2) depthwise kxk (stride) -> BN(scale folded in weights, shift via bias)
+  //    -> SiLU
+  Refs.Dw := NN.AddLayer(
+    TNNetDepthwiseConvLinear.Create({multiplier=}1, Blk.Kernel, Pad, Blk.Stride));
+  Refs.DwBias := NN.AddLayer(TNNetChannelBias.Create());
+  NN.AddLayer(TNNetSwish.Create());
+  // 3) squeeze-excite: pool -> 1x1 reduce -> SiLU -> 1x1 expand -> SIGMOID
+  //    -> per-channel multiply with the (post-activation) depthwise output.
+  if Refs.HasSE then
+  begin
+    Branch := NN.GetLastLayer();
+    Pooled := NN.AddLayerAfter(TNNetAvgChannel.Create(), Branch);
+    Refs.SEReduce := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Blk.SEChannels, 1, 0, 1, 0));
+    NN.AddLayer(TNNetSwish.Create());
+    Refs.SEExpand := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Blk.ExpChannels, 1, 0, 1, 0));
+    Gate := NN.AddLayer(TNNetSigmoid.Create());
+    NN.AddLayer(TNNetChannelMulByLayer.Create(Branch, Gate));
+  end;
+  // 4) project 1x1 -> BN (NO activation after project)
+  Refs.Project := NN.AddLayer(
+    TNNetConvolutionLinear.Create(Blk.OutChannels, 1, 0, 1, 0));
+  Branch := NN.GetLastLayer();
+  // 5) residual add when stride 1 and in == out
+  if Refs.HasResidual then
+    NN.AddLayer(TNNetSum.Create([Branch, Input]));
+end;
+
+function BuildEfficientNet(Reader: TNNetSafeTensorsReader;
+  const Config: TEfficientNetConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  StemConv, HeadConv, FC: TNNetLayer;
+  BlockRefs: array of TEfficientNetBlockLayers;
+  i, InChannels, LastFeatIdx: integer;
+  Prefix, P: string;
+  Shift: TNNetVolume;
+begin
+  if Config.NumChannels < 1 then
+    ImportError('EfficientNet import: num_channels must be >= 1.');
+  if Config.NumLabels < 1 then
+    ImportError('EfficientNet import: num_labels must be >= 1.');
+  SetLength(BlockRefs, Length(Config.Blocks));
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels));
+    // Stem: conv 3x3 stride2 pad1 (+folded BN bias) -> SiLU.
+    StemConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.StemWidth, 3, {pad=}1, {stride=}2, {suppressBias=}0));
+    NN.AddLayer(TNNetSwish.Create());
+    InChannels := Config.StemWidth;
+    for i := 0 to High(Config.Blocks) do
+    begin
+      AddEfficientNetMBConv(NN, Config.Blocks[i], InChannels, BlockRefs[i]);
+      InChannels := Config.Blocks[i].OutChannels;
+    end;
+    // Head: conv 1x1 +BN +SiLU -> global avg pool -> Linear(num_labels).
+    HeadConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+      Config.HeadConvWidth, 1, 0, 1, 0));
+    NN.AddLayer(TNNetSwish.Create());
+    NN.AddLayer(TNNetAvgChannel.Create());
+    FC := NN.AddLayer(TNNetFullConnectLinear.Create(Config.NumLabels));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    // features.0.0 = stem conv, features.0.1 = stem BN.
+    LoadResNetConvFoldBN(Reader, StemConv, 'features.0.0.weight',
+      'features.0.1', Config.StemWidth, Config.NumChannels, 3, Config.BnEps);
+    InChannels := Config.StemWidth;
+    for i := 0 to High(Config.Blocks) do
+    begin
+      // MBConv body keys: features.{i+1}.block.{j}...; j advances over the
+      // optional expand sub-block (ConvNormActivation = .0 conv .1 bn), the
+      // depthwise sub-block, the optional SE module, and the project sub-block.
+      Prefix := 'features.' + IntToStr(i + 1) + '.block.';
+      if BlockRefs[i].HasExpand then
+      begin
+        LoadResNetConvFoldBN(Reader, BlockRefs[i].Expand,
+          Prefix + '0.0.weight', Prefix + '0.1',
+          Config.Blocks[i].ExpChannels, InChannels, 1, Config.BnEps);
+        P := Prefix + '1';   // depthwise sub-block index
+      end
+      else
+        P := Prefix + '0';
+      LoadMobileNetDepthwiseFoldBN(Reader, BlockRefs[i].Dw,
+        P + '.0.weight', P + '.1',
+        Config.Blocks[i].ExpChannels, Config.Blocks[i].Kernel,
+        Config.BnEps, Shift);
+      LoadChannelBiasFromShift(BlockRefs[i].DwBias, Shift);
+      if BlockRefs[i].HasSE then
+      begin
+        // SE module sub-block index = depthwise idx + 1; project = + 2.
+        // torchvision SqueezeExcitation: fc1 (reduce) / fc2 (expand), 1x1 convs
+        // with bias.
+        if BlockRefs[i].HasExpand then P := Prefix + '2'
+        else P := Prefix + '1';
+        LoadMobileNetSEConv(Reader, BlockRefs[i].SEReduce,
+          P + '.fc1.weight', P + '.fc1.bias',
+          Config.Blocks[i].SEChannels, Config.Blocks[i].ExpChannels);
+        LoadMobileNetSEConv(Reader, BlockRefs[i].SEExpand,
+          P + '.fc2.weight', P + '.fc2.bias',
+          Config.Blocks[i].ExpChannels, Config.Blocks[i].SEChannels);
+        if BlockRefs[i].HasExpand then P := Prefix + '3'
+        else P := Prefix + '2';
+      end
+      else
+      begin
+        if BlockRefs[i].HasExpand then P := Prefix + '2'
+        else P := Prefix + '1';
+      end;
+      // project sub-block (P set above): conv .0 + BN .1, NO activation.
+      LoadResNetConvFoldBN(Reader, BlockRefs[i].Project,
+        P + '.0.weight', P + '.1',
+        Config.Blocks[i].OutChannels, Config.Blocks[i].ExpChannels, 1,
+        Config.BnEps);
+      InChannels := Config.Blocks[i].OutChannels;
+    end;
+    // head conv+BN: features.{last}.0 / .1
+    LastFeatIdx := Length(Config.Blocks) + 1;
+    LoadResNetConvFoldBN(Reader, HeadConv,
+      'features.' + IntToStr(LastFeatIdx) + '.0.weight',
+      'features.' + IntToStr(LastFeatIdx) + '.1',
+      Config.HeadConvWidth, InChannels, 1, Config.BnEps);
+    // classifier.1 (single Linear, with bias). No head activation after pool.
+    LoadLlamaLinearWeights(Reader, FC, 'classifier.1.weight',
+      Config.HeadConvWidth, Config.NumLabels, 0, -1, 0,
+      'classifier.1.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildEfficientNetFromSafeTensorsEx(const FileName: string;
+  const Config: TEfficientNetConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildEfficientNet(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildEfficientNetFromSafeTensors(const FileName: string;
+  out Config: TEfficientNetConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadEfficientNetConfigFromJSONFile(ConfigPath);
+  Result := BuildEfficientNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

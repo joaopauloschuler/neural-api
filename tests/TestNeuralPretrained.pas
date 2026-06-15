@@ -299,6 +299,8 @@ type
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
     procedure TestMobileNetV3ImageClassificationParity;
+    procedure TestEfficientNetConfigFromJSONFile;
+    procedure TestEfficientNetImageClassificationParity;
     procedure TestSwinConfigFromJSONFile;
     procedure TestSwinImageClassificationParity;
     procedure TestVGGConfigParity;
@@ -14083,6 +14085,112 @@ begin
       NN.GetLastLayer().Output.Size);
 
     RefJson.LoadFromFile(FixturePath('tiny_mobilenetv3_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    LogitsArr := TJSONArray(TJSONArray(
+      TJSONObject(RefRoot).Find('logits')).Items[0]);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('logits width', Config.NumLabels, LogitsArr.Count);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.NumLabels - 1 do
+    begin
+      Diff := Abs(NN.GetLastLayer().Output.FData[ChanCnt] -
+        LogitsArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('class logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadEfficientNetConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestEfficientNetConfigFromJSONFile;
+var
+  Config: TEfficientNetConfig;
+begin
+  Config := ReadEfficientNetConfigFromJSONFile(
+    FixturePath('tiny_efficientnet_config.json'));
+  AssertEquals('model_type', 'efficientnet', Config.ModelType);
+  AssertEquals('variant', 'b0', Config.Variant);
+  AssertEquals('image_size', 32, Config.ImageSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('stem_width', 8, Config.StemWidth);
+  AssertEquals('head_conv_width', 24, Config.HeadConvWidth);
+  // BatchNorm2d eps must be torchvision's 1e-3, not the 1e-5 default.
+  AssertTrue('bn_eps = 1e-3', Abs(Config.BnEps - 0.001) < 1e-9);
+  AssertEquals('block count', 4, Length(Config.Blocks));
+  // blk0: expand_ratio 1 -> no expand (exp==stem), SE, stride1.
+  AssertEquals('blk0 exp', 8, Config.Blocks[0].ExpChannels);
+  AssertEquals('blk0 out', 12, Config.Blocks[0].OutChannels);
+  AssertTrue('blk0 SE', Config.Blocks[0].UseSE);
+  // blk1: expand, no SE, stride2.
+  AssertEquals('blk1 stride', 2, Config.Blocks[1].Stride);
+  AssertFalse('blk1 no SE', Config.Blocks[1].UseSE);
+  // blk2: expand, SE, stride1, in==out residual, kernel 5.
+  AssertEquals('blk2 kernel', 5, Config.Blocks[2].Kernel);
+  AssertTrue('blk2 SE', Config.Blocks[2].UseSE);
+  AssertEquals('blk2 se_channels', 4, Config.Blocks[2].SEChannels);
+  AssertEquals('blk2 out', 16, Config.Blocks[2].OutChannels);
+end;
+
+// torchvision EfficientNet image-classification parity test. The committed
+// fixture tests/fixtures/tiny_efficientnet.* is a pico random-init EfficientNet
+// (config-faithful shrunk b0) exercising every importer branch (no-expand /
+// expand / SE / no-SE / stride 2 / stride-1 residual / kernel 3 & 5) whose
+// state_dict mirrors the torchvision key scheme. EfficientNet differs from
+// MobileNetV3 only in activations: every activation is SiLU/swish and the SE
+// gate is a plain sigmoid (not ReLU + hard-sigmoid), with a single classifier
+// Linear. Each BatchNorm (eps 1e-3) is FOLDED into its conv at load; the
+// depthwise BN shift rides a TNNetChannelBias. The generator
+// tools/make_pico_efficientnet_fixture.py computes the reference logits with a
+// self-contained numpy float64 oracle (timm/torchvision are not installed).
+// Asserts the (1,1,num_labels) logits match the oracle < 1e-4.
+procedure TTestNeuralPretrained.TestEfficientNetImageClassificationParity;
+var
+  NN: TNNet;
+  Config: TEfficientNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, LogitsArr: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildEfficientNetFromSafeTensors(
+    FixturePath('tiny_efficientnet.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_efficientnet_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output size = num_labels', Config.NumLabels,
+      NN.GetLastLayer().Output.Size);
+
+    RefJson.LoadFromFile(FixturePath('tiny_efficientnet_logits.json'));
     RefRoot := GetJSON(RefJson.Text);
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     LogitsArr := TJSONArray(TJSONArray(
