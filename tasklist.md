@@ -386,7 +386,7 @@ rather than acted on.
       tests/TestNeuralPretrained.pas, tiny_detr.safetensors fixture; ResNet-50 backbone +
       transformer enc-dec + learned object queries + 2-D sinusoidal pos embedding +
       sigmoid-cxcywh box/class heads, inference-only, no Hungarian matcher):
-  - [ ] examples/ObjectDetection demo that draws boxes on one CPU image (the importer +
+  - [X] examples/ObjectDetection demo that draws boxes on one CPU image (the importer +
         parity test exist; no example yet).
 - [ ] YOLO single-shot object-detection importer (ultralytics YOLOv8n safetensors)
       — a detection family STRUCTURALLY DISTINCT from the landed DETR importer

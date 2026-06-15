@@ -37,6 +37,12 @@ DepthEstimation/DepthEstimation
 # PoseEstimation: compiled ViTPose demo binary
 PoseEstimation/PoseEstimation
 
+# ObjectDetection: compiled DETR demo binary, build artifacts, annotated image
+ObjectDetection/ObjectDetection
+ObjectDetection/*.o
+ObjectDetection/*.ppu
+ObjectDetection/object_detection.ppm
+
 # Pix2Pix: compiled conditional-GAN demo binary, build artifacts, sample image
 Pix2Pix/Pix2Pix
 Pix2Pix/*.o
