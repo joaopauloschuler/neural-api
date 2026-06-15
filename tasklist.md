@@ -472,7 +472,7 @@ rather than acted on.
       diffusers float64 oracle on the down/mid residual tensors for a fixed control
       image; an examples/ControlNetCanny that conditions generation on a hand-drawn
       edge map once the base UNet lands. First conditioning-by-feature-injection model.
-- [ ] MaskGIT non-autoregressive image-generation example (examples/MaskGIT) — the
+- [X] MaskGIT non-autoregressive image-generation example (examples/MaskGIT) — the
       VQModelImport README already names MaskGIT as the intended downstream generator
       for the landed VQ tokenizer, but no generator exists. Train a small
       bidirectional transformer (reuse the landed encoder-block builder) over the

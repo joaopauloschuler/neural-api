@@ -90,6 +90,22 @@ ConsistencyDistill/run*.time
 ConsistencyDistill/time.log
 ConsistencyDistill/*.nn
 
+# MaskGIT: compiled non-autoregressive masked-token image-generation demo
+# binary, build artifacts, generated sample grids, MNIST data symlinks, logs
+MaskGIT/MaskGIT
+MaskGIT/*.o
+MaskGIT/*.ppu
+MaskGIT/*.ppr
+MaskGIT/*.png
+MaskGIT/*.ppm
+MaskGIT/*.pgm
+MaskGIT/*-ubyte
+MaskGIT/*.idx*-ubyte
+MaskGIT/run*.log
+MaskGIT/run.log
+MaskGIT/time.txt
+MaskGIT/*.nn
+
 # StyleGAN2Generate: compiled style-based generator synthesis demo binary,
 # build artifacts, and generated sample image
 StyleGAN2Generate/StyleGAN2Generate
