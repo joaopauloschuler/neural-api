@@ -943,6 +943,10 @@ type
     procedure TestAffineGridSampleSourceGradientCheck;
     procedure TestAffineGridSampleThetaGradientCheck;
     procedure TestAffineGridSampleLoadFromString;
+    // TNNetFlowWarp dense per-pixel (dx,dy) backward-warp sampler
+    procedure TestFlowWarpFeatureGradientCheck;
+    procedure TestFlowWarpFlowGradientCheck;
+    procedure TestFlowWarpLoadFromString;
     procedure TestAdaINForwardStatistics;
     procedure TestAdaINContentGradientCheck;
     procedure TestAdaINStyleGradientCheck;
@@ -17836,6 +17840,233 @@ begin
     end;
   finally
     NN.Free; Img.Free; Theta.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFlowWarpFeatureGradientCheck;
+// Finite-difference check of d(loss)/d(features) through the dense bilinear
+// backward-warp. A non-integer per-pixel flow keeps every sample OFF the
+// integer grid, so all 4 neighbours are active and we are far from the bilinear
+// kink (sampling at an integer position is non-differentiable; we avoid it).
+var
+  NN: TNNet;
+  ImgInput, FlowInput: TNNetLayer;
+  ImgData, ImgPlus, Flow, Desired: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AImg: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(AImg);
+    FlowInput.Output.Copy(Flow);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  ImgData := TNNetVolume.Create(W, H, D);
+  ImgPlus := TNNetVolume.Create(W, H, D);
+  Flow := TNNetVolume.Create(W, H, 2);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.001; maxErr := 0;
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    FlowInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetFlowWarp.Create(FlowInput), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to ImgData.Size - 1 do ImgData.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    // Per-pixel flow with non-integer fractional parts. dx,dy in [-0.7,0.7] keeps
+    // sample = pixel + flow strictly between integer grid points (interior, no
+    // border saturation given the 1-pixel margins), so all 4 bilinear weights are
+    // nonzero and the central difference does not straddle a kink.
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      Flow.Store(x, y, 0, 0.35 * Sin(0.7 * x + 1.1 * y) + 0.15);
+      Flow.Store(x, y, 1, 0.30 * Cos(0.5 * x - 0.9 * y) - 0.12);
+    end;
+
+    for i := 0 to ImgData.Size - 1 do
+    begin
+      ImgPlus.Copy(ImgData);
+      ImgPlus.Raw[i] := ImgData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(ImgPlus);
+      ImgPlus.Raw[i] := ImgData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(ImgPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(ImgData);
+      FlowInput.Output.Copy(Flow);
+      NN.Compute(ImgInput.Output);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := ImgInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('FlowWarp feature gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestFlowWarpFeatureGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; ImgData.Free; ImgPlus.Free; Flow.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFlowWarpFlowGradientCheck;
+// The headline gradient: finite-difference check of d(loss)/d(flow), the dense
+// per-pixel (dx,dy) field (bilinear weights are differentiable in dx,dy). The
+// flow comes from a second input branch, so its OutputError holds the
+// accumulated d(loss)/d(flow). Flow magnitudes are chosen to keep every sample
+// strictly interior and OFF the integer grid (the bilinear kink), so the central
+// difference never straddles a non-differentiable point or a border clamp.
+var
+  NN: TNNet;
+  ImgInput, FlowInput: TNNetLayer;
+  Img, FlowData, FlowPlus, Desired: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad, maxErr: TNeuralFloat;
+
+  function ComputeLoss(AFlow: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    ImgInput.Output.Copy(Img);
+    FlowInput.Output.Copy(AFlow);
+    NN.Compute(ImgInput.Output);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  FlowData := TNNetVolume.Create(W, H, 2);
+  FlowPlus := TNNetVolume.Create(W, H, 2);
+  Desired := TNNetVolume.Create(W, H, D);
+  epsilon := 0.0005; maxErr := 0;
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    FlowInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetFlowWarp.Create(FlowInput), ImgInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31);
+    // Small interior non-integer flow: keeps sample = pixel + flow off the
+    // integer grid AND inside the borders for every pixel (so neither the
+    // bilinear kink nor the border clamp is hit), giving a clean derivative.
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      FlowData.Store(x, y, 0, 0.30 * Sin(0.6 * x + 0.8 * y) + 0.12);
+      FlowData.Store(x, y, 1, 0.25 * Cos(0.4 * x - 0.7 * y) - 0.10);
+    end;
+
+    for i := 0 to FlowData.Size - 1 do
+    begin
+      FlowPlus.Copy(FlowData);
+      FlowPlus.Raw[i] := FlowData.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(FlowPlus);
+      FlowPlus.Raw[i] := FlowData.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(FlowPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      ImgInput.Output.Copy(Img);
+      FlowInput.Output.Copy(FlowData);
+      NN.Compute(ImgInput.Output);
+      FlowInput.OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := FlowInput.OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('FlowWarp flow gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('  TestFlowWarpFlowGradientCheck max gradient error: ',
+      FloatToStr(maxErr));
+  finally
+    NN.Free; Img.Free; FlowData.Free; FlowPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFlowWarpLoadFromString;
+// Serialization round-trip: the flow source layer index (injected like
+// TNNetConcat) must survive SaveToString -> LoadFromString, and the reloaded
+// net must reproduce the forward pass bit-for-bit.
+var
+  NN, NN2: TNNet;
+  ImgInput, FlowInput: TNNetLayer;
+  Img, Flow: TNNetVolume;
+  W, H, D, i, x, y: integer;
+  Saved, Saved2: string;
+  Found: boolean;
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 2;
+  NN := TNNet.Create();
+  Img := TNNetVolume.Create(W, H, D);
+  Flow := TNNetVolume.Create(W, H, 2);
+  try
+    ImgInput  := NN.AddLayer(TNNetInput.Create(W, H, D, 1));
+    FlowInput := NN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    NN.AddLayerAfter(TNNetFlowWarp.Create(FlowInput), ImgInput);
+
+    for i := 0 to Img.Size - 1 do Img.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+    for y := 0 to H - 1 do
+    for x := 0 to W - 1 do
+    begin
+      Flow.Store(x, y, 0, 0.30 * Sin(0.6 * x + 0.8 * y) + 0.12);
+      Flow.Store(x, y, 1, 0.25 * Cos(0.4 * x - 0.7 * y) - 0.10);
+    end;
+    ImgInput.Output.Copy(Img);
+    FlowInput.Output.Copy(Flow);
+    NN.Compute(ImgInput.Output);
+
+    Found := false;
+    for i := 0 to NN.GetLastLayerIdx do
+      if NN.Layers[i] is TNNetFlowWarp then Found := true;
+    AssertTrue('FlowWarp layer present', Found);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('FlowWarp SaveToString round-trip equality', Saved, Saved2);
+      NN2.Layers[0].Output.Copy(Img);
+      NN2.Layers[1].Output.Copy(Flow);
+      NN2.Compute(NN2.Layers[0].Output);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('FlowWarp round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Img.Free; Flow.Free;
   end;
 end;
 

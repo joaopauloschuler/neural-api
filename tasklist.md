@@ -835,20 +835,6 @@ rather than acted on.
         per-pixel broadcast noise for real stochastic synthesis).
   - [ ] real stylegan2 checkpoint (NVIDIA .pkl / a rosinality safetensors) parity once
         obtainable; the training path (discriminator + path-length reg) and StyleGAN3.
-- [ ] TNNetFlowWarp dense flow-field backward-warp primitive — the repo has
-      TNNetAffineGridSample (a single global 2x3 affine theta -> sampling grid) but
-      NO per-pixel DENSE flow warp: given a feature map and a two-channel (dx, dy)
-      flow field of the same spatial size, produce the bilinearly-sampled
-      backward-warped output `out(x,y) = in(x+dx, y+dy)`. This is the genuinely new
-      sampling layer that the open RAFT optical-flow task names ("warps one tiny
-      frame toward the next") and that the FrameInterpolation example below needs;
-      it is the dense-field sibling of the landed DeformableConv bilinear sampler
-      and the parametric TNNetAffineGridSample. Two sources (main features +
-      flow-field source, wired like TNNetCrossAttention/TNNetAffineGridSample),
-      full input numerical-gradient coverage in TestNeuralNumerical.pas for BOTH the
-      sampled-features gradient and the flow-field gradient (the bilinear weights are
-      differentiable in dx/dy), edge handling = border-clamp. Unblocks frame
-      interpolation, optical-flow warping, and any future video-stabilization work.
 - [ ] examples/FrameInterpolation — video FRAME INTERPOLATION (predict the MIDDLE
       frame between two given frames), structurally distinct from the landed
       examples/VideoPrediction (next-frame EXTRAPOLATION via TNNetConvLSTMCell) and

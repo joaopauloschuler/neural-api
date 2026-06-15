@@ -3112,6 +3112,51 @@ type
     property ThetaSource: TNNetLayer read FThetaLayer;
   end;
 
+  /// Dense per-pixel backward-warp sampler. Given a feature map (the main
+  // PrevLayer) and a two-channel (dx, dy) DENSE flow field of the SAME spatial
+  // size (a SECOND input source), produces the bilinearly-sampled backward-warp
+  //   out(x, y, c) = in(x + dx(x,y), y + dy(x,y), c)
+  // with BORDER-CLAMP edge handling (out-of-range sample coords are clamped to
+  // the valid [0..W-1] x [0..H-1] range, i.e. edge pixels are replicated). This
+  // is the dense-field sibling of the PARAMETRIC TNNetAffineGridSample (one
+  // global 2x3 theta) and of TNNetDeformableConv's per-tap bilinear sampler:
+  // here every output pixel carries its OWN learned (dx, dy) displacement, which
+  // is exactly what optical-flow warping (RAFT / RIFE / FILM frame
+  // interpolation, video stabilization) needs.
+  //   Flow-field source layout: depth-2 map, SAME SizeX/SizeY as the features.
+  //     channel 0 = dx (horizontal displacement, in pixels)
+  //     channel 1 = dy (vertical   displacement, in pixels)
+  // No trainable parameters (pure differentiable resampling).
+  // Forward: bilinear gather at the clamped sample position.
+  // Backward writes BOTH gradients (the whole point):
+  //   (a) dL/d(features): the bilinear weights scatter the output gradient back
+  //       onto the four (clamped) source neighbours, exactly like
+  //       TNNetAffineGridSample / TNNetDeformableConv.
+  //   (b) dL/d(flow): the bilinear weights are differentiable in (dx, dy) via
+  //       d(sampled)/d(sx), d(sampled)/d(sy) (and d(sx)/d(dx)=d(sy)/d(dy)=1, so
+  //       the chain rule sends the per-pixel image-space derivative straight to
+  //       the flow channels) — summed over depth into the (dx, dy) channels.
+  //   Border-clamp note: where a sample saturates against a border the clamped
+  //   coordinate stops moving, so its contribution to the flow gradient is 0 on
+  //   that axis (the clamp is locally constant). Interior samples carry the full
+  //   differentiable bilinear gradient.
+  // TWO sources (wired exactly like TNNetCrossAttention / TNNetAffineGridSample):
+  //   PrevLayer  (features): SizeX x SizeY x Depth, any depth.
+  //   FlowSource (dx, dy)  : SizeX x SizeY x 2, same SizeX/SizeY as features.
+  // Coded by Claude (AI).
+  TNNetFlowWarp = class(TNNetLayer)
+  private
+    FFlowLayer: TNNetLayer; // dense two-channel (dx, dy) flow-field source
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    constructor Create(FlowSource: TNNetLayer); overload;
+    destructor Destroy(); override;
+    function SaveStructureToString(): string; override;
+    procedure Compute(); override;
+    procedure Backpropagate(); override;
+    property FlowSource: TNNetLayer read FFlowLayer;
+  end;
+
   /// Scale + translate ONLY affine assembler for a "hard" visual-attention
   // glimpse. Takes a Size=4 input vector (s_x, s_y, t_x, t_y) from a
   // localization head and SCATTERS it into the Size=6, 2x3 affine matrix
@@ -25784,6 +25829,175 @@ begin
   if Assigned(FThetaLayer) and
      (FThetaLayer.OutputError.Size = FThetaLayer.Output.Size) then
     FThetaLayer.Backpropagate();
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetFlowWarp }
+
+constructor TNNetFlowWarp.Create(FlowSource: TNNetLayer);
+begin
+  inherited Create();
+  if FlowSource = nil then
+    FErrorProc('TNNetFlowWarp requires a non-nil FlowSource.');
+  FFlowLayer := FlowSource;
+  if FFlowLayer is TNNetInput then TNNetInput(FFlowLayer).EnableErrorCollection;
+  // Two-source layer: register the extra departing branch on the flow source
+  // (the image branch is incremented the usual way by AddLayer/AddLayerAfter).
+  FFlowLayer.IncDepartingBranchesCnt();
+end;
+
+destructor TNNetFlowWarp.Destroy();
+begin
+  inherited Destroy();
+end;
+
+function TNNetFlowWarp.SaveStructureToString(): string;
+begin
+  // Inject the flow source layer index into the (otherwise empty) third
+  // ':'-delimited slot, exactly as TNNetAffineGridSample / TNNetConcatBase do,
+  // so CreateLayer / LoadFromString can reconnect the second source.
+  Result := StringReplace(inherited SaveStructureToString,
+    '::', ':' + IntToStr(FFlowLayer.FLayerIdx) + ':', [rfReplaceAll]);
+end;
+
+procedure TNNetFlowWarp.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (FFlowLayer.FOutput.Depth <> 2) then
+    FErrorProc('TNNetFlowWarp requires a flow source of Depth=2 (dx, dy). Got '
+      + 'Depth=' + IntToStr(FFlowLayer.FOutput.Depth));
+  if (FFlowLayer.FOutput.SizeX <> pPrevLayer.FOutput.SizeX) or
+     (FFlowLayer.FOutput.SizeY <> pPrevLayer.FOutput.SizeY) then
+    FErrorProc('TNNetFlowWarp requires the flow field to match the feature map '
+      + 'spatial size. Features=' + IntToStr(pPrevLayer.FOutput.SizeX) + 'x'
+      + IntToStr(pPrevLayer.FOutput.SizeY) + ', Flow='
+      + IntToStr(FFlowLayer.FOutput.SizeX) + 'x'
+      + IntToStr(FFlowLayer.FOutput.SizeY));
+  FOutput.ReSize(pPrevLayer.FOutput);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetFlowWarp.Compute();
+var
+  StartTime: double;
+  W, H, D, ox, oy, dd: integer;
+  x0, y0, x1, y1: integer;
+  Flow, Src: TNNetVolume;
+  sx, sy, fx, fy, w00, w01, w10, w11, acc: TNeuralFloat;
+begin
+  StartTime := Now();
+  Src := FPrevLayer.FOutput;
+  Flow := FFlowLayer.FOutput;
+  W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  for oy := 0 to H - 1 do
+  for ox := 0 to W - 1 do
+  begin
+    // Backward warp: out(x,y) = in(x+dx, y+dy).
+    sx := ox + Flow.Get(ox, oy, 0);
+    sy := oy + Flow.Get(ox, oy, 1);
+    x0 := Floor(sx); y0 := Floor(sy);
+    x1 := x0 + 1;    y1 := y0 + 1;
+    fx := sx - x0;   fy := sy - y0;
+    w00 := (1 - fx) * (1 - fy);
+    w10 := fx * (1 - fy);
+    w01 := (1 - fx) * fy;
+    w11 := fx * fy;
+    // Border-clamp: replicate edge pixels (clamp each neighbour index to range).
+    if x0 < 0 then x0 := 0 else if x0 > W - 1 then x0 := W - 1;
+    if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
+    if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
+    if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
+    for dd := 0 to D - 1 do
+    begin
+      acc := w00 * Src.Get(x0, y0, dd)
+           + w10 * Src.Get(x1, y0, dd)
+           + w01 * Src.Get(x0, y1, dd)
+           + w11 * Src.Get(x1, y1, dd);
+      FOutput.Store(ox, oy, dd, acc);
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetFlowWarp.Backpropagate();
+var
+  StartTime: double;
+  W, H, D, ox, oy, dd: integer;
+  x0, y0, x1, y1: integer;
+  Flow, FlowErr, Src, SrcErr: TNNetVolume;
+  sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
+  gOut, dSdx, dSdy, dLdx, dLdy: TNeuralFloat;
+  v00, v01, v10, v11: TNeuralFloat;
+  HasSrcErr, HasFlowErr: boolean;
+begin
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  StartTime := Now();
+  Src := FPrevLayer.FOutput;
+  SrcErr := FPrevLayer.FOutputError;
+  Flow := FFlowLayer.FOutput;
+  FlowErr := FFlowLayer.FOutputError;
+  W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
+  HasSrcErr := (SrcErr.Size = Src.Size);
+  HasFlowErr := (FlowErr.Size = Flow.Size);
+  for oy := 0 to H - 1 do
+  for ox := 0 to W - 1 do
+  begin
+    sx := ox + Flow.Get(ox, oy, 0);
+    sy := oy + Flow.Get(ox, oy, 1);
+    x0 := Floor(sx); y0 := Floor(sy);
+    x1 := x0 + 1;    y1 := y0 + 1;
+    fx := sx - x0;   fy := sy - y0;
+    w00 := (1 - fx) * (1 - fy);
+    w10 := fx * (1 - fy);
+    w01 := (1 - fx) * fy;
+    w11 := fx * fy;
+    // Border-clamp the four neighbour indices, exactly as in Compute(). On the
+    // axes where a neighbour saturates the clamp is locally constant, so the
+    // flow gradient on that axis correctly drops out (d(clamped)/d(flow)=0).
+    if x0 < 0 then x0 := 0 else if x0 > W - 1 then x0 := W - 1;
+    if x1 < 0 then x1 := 0 else if x1 > W - 1 then x1 := W - 1;
+    if y0 < 0 then y0 := 0 else if y0 > H - 1 then y0 := H - 1;
+    if y1 < 0 then y1 := 0 else if y1 > H - 1 then y1 := H - 1;
+    dLdx := 0; dLdy := 0;
+    for dd := 0 to D - 1 do
+    begin
+      gOut := FOutputError.Get(ox, oy, dd);
+      if gOut = 0 then continue;
+      // (a) dL/d(features): scatter the output gradient to the 4 (clamped)
+      //     source neighbours by the bilinear weights.
+      if HasSrcErr then
+      begin
+        SrcErr.Add(x0, y0, dd, w00 * gOut);
+        SrcErr.Add(x1, y0, dd, w10 * gOut);
+        SrcErr.Add(x0, y1, dd, w01 * gOut);
+        SrcErr.Add(x1, y1, dd, w11 * gOut);
+      end;
+      // (b) dL/d(flow): bilinear sampler partials. Reuses the clamped neighbour
+      //     values so the math matches the forward gather exactly.
+      v00 := Src.Get(x0, y0, dd);
+      v10 := Src.Get(x1, y0, dd);
+      v01 := Src.Get(x0, y1, dd);
+      v11 := Src.Get(x1, y1, dd);
+      dSdx := (1 - fy) * (v10 - v00) + fy * (v11 - v01);
+      dSdy := (1 - fx) * (v01 - v00) + fx * (v11 - v10);
+      // sx = ox + dx, sy = oy + dy  =>  d(sx)/d(dx) = d(sy)/d(dy) = 1.
+      dLdx := dLdx + gOut * dSdx;
+      dLdy := dLdy + gOut * dSdy;
+    end;
+    if HasFlowErr then
+    begin
+      FlowErr.Add(ox, oy, 0, dLdx);
+      FlowErr.Add(ox, oy, 1, dLdy);
+    end;
+  end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  // Propagate into BOTH sources (flow branch then the image chain).
+  if Assigned(FFlowLayer) and
+     (FFlowLayer.OutputError.Size = FFlowLayer.Output.Size) then
+    FFlowLayer.Backpropagate();
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
 
@@ -89358,7 +89572,7 @@ begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
 
-        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') ) then
+        if ( (S[0] = 'TNNetConcat') or (S[0] = 'TNNetDeepConcat') or (S[0] = 'TNNetSum') or (S[0] = 'TNNetFiLM') or (S[0] = 'TNNetShakeShakeMerge') or (S[0] = 'TNNetShakeDropMerge') or (S[0] = 'TNNetCrossAttention') or (S[0] = 'TNNetCrossWKV') or (S[0] = 'TNNetAffineGridSample') or (S[0] = 'TNNetFlowWarp') or (S[0] = 'TNNetHyperLinear') or (S[0] = 'TNNetHyperConv') or (S[0] = 'TNNetModulatedConv2D') or (S[0] = 'TNNetScaledDotProductAttention') ) then
         begin
           IdxsToLayers(aIdx, aL);
         end;
@@ -89500,6 +89714,7 @@ begin
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
+      'TNNetFlowWarp' :             Result := TNNetFlowWarp.Create(aL[0]);
       'TNNetHyperLinear' :          Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]);
       'TNNetHyperConv' :            Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]);
       'TNNetModulatedConv2D' :      Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]);
@@ -89904,6 +90119,7 @@ begin
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
+      if S[0] = 'TNNetFlowWarp' then Result := TNNetFlowWarp.Create(aL[0]) else
       if S[0] = 'TNNetHyperLinear' then Result := TNNetHyperLinear.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetHyperConv' then Result := TNNetHyperConv.Create(St[0], St[1], St[2] = 1, aL[0]) else
       if S[0] = 'TNNetModulatedConv2D' then Result := TNNetModulatedConv2D.Create(St[0], St[1], St[2], St[3], aL[0]) else
