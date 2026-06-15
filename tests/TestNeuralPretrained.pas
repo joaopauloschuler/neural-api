@@ -353,6 +353,8 @@ type
     procedure TestStyleGAN2GeneratorParity;
     procedure TestDINOv2ConfigFromJSONFile;
     procedure TestDINOv2Parity;
+    procedure TestBeitConfigFromJSONFile;
+    procedure TestBeitParity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -16982,6 +16984,109 @@ begin
       end;
     end;
     AssertTrue('CLS+patch hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestBeitConfigFromJSONFile;
+var
+  Config: TBeitConfig;
+begin
+  Config := ReadBeitConfigFromJSONFile(FixturePath('tiny_beit_config.json'));
+  AssertEquals('model_type', 'beit', Config.ModelType);
+  AssertEquals('hidden_size', 16, Config.HiddenSize);
+  AssertEquals('intermediate_size', 64, Config.IntermediateSize);
+  AssertEquals('num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('num_attention_heads', 4, Config.NumHeads);
+  AssertEquals('image_size', 12, Config.ImageSize);
+  AssertEquals('patch_size', 4, Config.PatchSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertTrue('use_relative_position_bias true', Config.UseRelPosBias);
+  AssertTrue('use_shared_relative_position_bias false',
+    not Config.UseSharedRelPosBias);
+  AssertTrue('use_absolute_position_embeddings false', not Config.UseAbsPos);
+  AssertTrue('use_mean_pooling false (final LN applied)',
+    not Config.UseMeanPooling);
+  AssertTrue('hidden_act gelu (exact erf)', Config.HiddenAct = chaGeluExact);
+  AssertTrue('layer_scale_init > 0', Config.LayerScaleInit > 0);
+end;
+
+// BEiT parity test: tests/fixtures/tiny_beit.* is a pico randomly-initialized
+// HF BeitModel (image 12, patch 4 -> 9 patches + 1 cls = 10 tokens, 2 layers,
+// 4 heads, d 16, ffn 64) re-keyed to the CLASSIC published key scheme, with
+// every BEiT trait the importer must reproduce: full global attention with a
+// per-LAYER learned relative_position_bias (cls-aware index) added to every
+// block's scores, LayerScale (lambda_1/2) on both branches, NO absolute
+// positions, learnable cls token, query/value biased + KEY bias-free,
+// layer_norm_eps 1e-12, exact-erf gelu, use_mean_pooling=false -> final encoder
+// LayerNorm. tools/beit_tiny_fixture.py asserts every quirk is visible in the
+// float64 oracle. Compares the (num_tokens,1,hidden) post-final-LN hidden
+// states (cls row 0 + patch tokens) < 1e-4 vs HF.
+procedure TTestNeuralPretrained.TestBeitParity;
+var
+  NN: TNNet;
+  Config: TBeitConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, HiddenArr, TokRow: TJSONArray;
+  ImageInput: TNNetVolume;
+  ChanCnt, YCnt, XCnt, TokCnt, ColCnt, NumTokens: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  NN := BuildBeitFromSafeTensorsWithConfig(
+    FixturePath('tiny_beit.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_beit_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.ImageSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('output depth = hidden_size', Config.HiddenSize,
+      NN.GetLastLayer().Output.Depth);
+
+    RefJson.LoadFromFile(FixturePath('tiny_beit_hidden.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    HiddenArr := TJSONArray(TJSONObject(RefRoot).Find('hidden'));
+    NumTokens := TJSONObject(RefRoot).Get('num_tokens', 0);
+    AssertTrue('pixels present', Pixels <> nil);
+    AssertEquals('oracle token rows', NumTokens, HiddenArr.Count);
+    AssertEquals('output rows = num tokens (cls + patches)',
+      NumTokens, NN.GetLastLayer().Output.SizeX);
+
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels +
+            ChanCnt] := ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImageInput);
+    MaxDiff := 0;
+    for TokCnt := 0 to NumTokens - 1 do
+    begin
+      TokRow := TJSONArray(HiddenArr.Items[TokCnt]);
+      for ColCnt := 0 to Config.HiddenSize - 1 do
+      begin
+        Diff := Abs(NN.GetLastLayer().Output.FData[
+          TokCnt * Config.HiddenSize + ColCnt] - TokRow.Items[ColCnt].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('cls+patch hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;

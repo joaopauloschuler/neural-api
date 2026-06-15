@@ -941,24 +941,29 @@ rather than acted on.
       ray-marching + alpha-compositing primitive that any future 3-D / view-synthesis
       work (instant-NGP hash grids, 3D Gaussian splatting) would build on.
 
-- [ ] BEiT / data2vec-vision ViT importer (BuildBeitFromSafeTensors[Ex], e.g.
-      microsoft/beit-base-patch16-224, facebook/data2vec-vision-base). A genuinely
-      DISTINCT ViT backbone family from the landed plain ViT (absolute sin/learned
-      pos) and the landed Swin (windowed + cyclic-shift relative-position-bias):
-      BEiT uses FULL global attention with a SHARED per-head
-      `relative_position_bias_table` + relative-position index (no windowing, no
-      shift) added to every block's scores, PLUS LayerScale (`gamma_1`/`gamma_2`,
-      a.k.a. `lambda_1`) gating both residual branches, and pools via the cls token
-      (or mean) — there is NO absolute position embedding. The
-      relative-position-bias plumbing already exists for Swin and the LayerScale
-      loader already exists for ConvNeXt/DiT, so the new work is mainly the
-      non-windowed full-attention index table + the BEiT key remapping
-      (`beit.encoder.layer.N.attention.attention.{q,k,v}`,
-      `lambda_1`/`lambda_2`, `relative_position_bias.relative_position_bias_table`).
-      Unlocks a whole class of self-supervised image feature extractors (BEiT,
-      BEiTv2, data2vec-vision) that today cannot be loaded. Reuse the
-      preprocessor_config (image_mean/std, crop) path already in neuralpretrained;
-      pico-fixture parity per the established slicer pattern.
+- [X] BEiT / data2vec-vision ViT importer (BuildBeitFromSafeTensors[Ex], e.g.
+      microsoft/beit-base-patch16-224, facebook/data2vec-vision-base). DONE:
+      BuildBeitFromSafeTensors[Ex]/WithConfig + TBeitConfig + ReadBeitConfig
+      FromJSONFile/BeitConfigToString in neural/neuralpretrained.pas. Full global
+      attention with a per-LAYER learned relative_position_bias (cls-aware index,
+      the last 3 table rows for cls<->token interactions) added to every block's
+      scores; LayerScale (lambda_1/2, gamma_1/2 fallback) on both branches; NO
+      absolute positions; learnable cls token; query/value biased + KEY bias-free.
+      REUSED TNNetWindowAttention (the Swin relative-position layer) with the FULL
+      seq x seq bias matrix per head (no new leaf layer) + DINOv2's LayerScale
+      (TNNetChannelMul) + patch-embed scaffolding. The cls-aware relative-position
+      index BeitBuildRelPosIndex matches HF generate_relative_position_index
+      exactly. Parity < 1e-4 vs HF float64 oracle: tools/beit_tiny_fixture.py +
+      tests/fixtures/tiny_beit.* + TestBeitParity/TestBeitConfigFromJSONFile.
+      Deferred follow-ups:
+      - [ ] use_shared_relative_position_bias=true (one model-level table shared by
+            all layers) is rejected; only the per-layer table is wired.
+      - [ ] use_absolute_position_embeddings=true and use_relative_position_bias=
+            false variants rejected (the published checkpoints don't use them).
+      - [ ] No top-level BuildFromPretrained dispatch entry / classifier head /
+            ForImageClassification wrapper yet (builder returns token hidden states;
+            use_mean_pooling pooler LayerNorm + patch mean left to the caller).
+      - [ ] BEiTv2 (vector-quantized) not validated.
 
 - [ ] BLIP-2 Q-Former vision-language importer (BuildBlip2QFormerFromSafeTensors[Ex]
       + BuildBlip2FromSafeTensors, e.g. Salesforce/blip2-opt-2.7b). The landed VLM

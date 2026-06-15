@@ -7244,6 +7244,67 @@ function BuildDINOv2FromSafeTensorsWithConfig(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 type
+  // BEiT / data2vec-vision config (microsoft/beit-*, facebook/data2vec-vision-*).
+  // A DISTINCT ViT backbone family from the plain ViT/DINOv2 and Swin:
+  //   - FULL global attention (no windowing/shift) with a per-LAYER learned
+  //     relative_position_bias_table gathered by a fixed relative-position
+  //     index (incl. 3 cls-interaction rows) and ADDED to EVERY block's
+  //     attention scores;
+  //   - LayerScale (lambda_1 / lambda_2, a.k.a. gamma_1 / gamma_2) gating BOTH
+  //     residual branches;
+  //   - NO absolute position embedding; a learnable cls token prepended;
+  //   - pools via the cls token (use_mean_pooling=false) OR by mean-pooling the
+  //     patch tokens with a pooler LayerNorm (use_mean_pooling=true). The
+  //     builder returns the full token hidden states (pooling left to caller).
+  TBeitConfig = record
+    HiddenSize: integer;        // hidden_size
+    IntermediateSize: integer;  // intermediate_size
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-12 default)
+    HiddenAct: TClipHiddenAct;  // hidden_act (gelu = exact erf by default)
+    ImageSize: integer;         // image_size
+    PatchSize: integer;         // patch_size
+    NumChannels: integer;       // num_channels (3)
+    LayerScaleInit: TNeuralFloat; // layer_scale_init_value (>0 -> lambdas exist)
+    UseRelPosBias: boolean;     // use_relative_position_bias (per-layer table)
+    UseSharedRelPosBias: boolean; // use_shared_relative_position_bias (rejected)
+    UseAbsPos: boolean;         // use_absolute_position_embeddings (rejected)
+    UseMeanPooling: boolean;    // use_mean_pooling (pooler vs final LayerNorm)
+    ModelType: string;          // 'beit' / 'data2vec-vision'
+  end;
+
+// Reads a HF BEiT / data2vec-vision config.json. Required: hidden_size,
+// num_hidden_layers, num_attention_heads, image_size, patch_size. Defaults
+// follow BeitConfig: intermediate_size 4*hidden, hidden_act "gelu" (exact erf),
+// layer_norm_eps 1e-12, num_channels 3, layer_scale_init_value 0.1,
+// use_relative_position_bias true, use_shared_relative_position_bias false,
+// use_absolute_position_embeddings false, use_mean_pooling true.
+function ReadBeitConfigFromJSONFile(const FileName: string): TBeitConfig;
+
+function BeitConfigToString(const Config: TBeitConfig): string;
+
+// Builds the BEiT visual-embedding net described by Config and loads every
+// weight from Reader (the caller owns Reader). The net takes an
+// (ImageSize, ImageSize, NumChannels) normalized RGB volume and outputs the
+// (num_patches+1, 1, HiddenSize) token hidden states (row 0 = cls). When
+// use_mean_pooling is false a final encoder LayerNorm is applied; when true the
+// raw encoder output is returned (the pooler LayerNorm + patch mean is the
+// caller's job). pInferenceOnly frees training volumes during build.
+function BuildBeitFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TBeitConfig; pInferenceOnly: boolean = false): TNNet;
+
+// Builds + loads the BEiT net from the checkpoint at FileName. Config is
+// supplied by the caller (Ex) or read from ConfigFileName ('' = "config.json"
+// beside FileName) and returned. The net is owned by the caller.
+function BuildBeitFromSafeTensorsEx(const FileName: string;
+  const Config: TBeitConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildBeitFromSafeTensorsWithConfig(const FileName: string;
+  out Config: TBeitConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+type
   // DPT / Depth-Anything monocular depth-estimation config. The DINOv2 (or ViT)
   // backbone is described by Backbone; the rest is the DPT reassemble/fusion neck
   // + depth head. The repo's FIRST dense per-pixel REGRESSION vision importer.
@@ -43341,6 +43402,415 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadDINOv2ConfigFromJSONFile(ConfigPath);
   Result := BuildDINOv2FromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// BEiT / data2vec-vision IMPORT (microsoft/beit-*, facebook/data2vec-vision-*).
+// A distinct ViT backbone family: full global attention + per-layer learned
+// relative_position_bias (cls-aware index), LayerScale on both branches, NO
+// absolute position embedding. Reuses TNNetWindowAttention (the Swin
+// relative-position layer) with the FULL seq x seq bias matrix and DINOv2's
+// LayerScale (TNNetChannelMul) + patch-embed scaffolding.
+// ===========================================================================
+
+function ReadBeitConfigFromJSONFile(const FileName: string): TBeitConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('BEiT import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('BEiT import: config field "' + FieldName +
+        '" must be a positive integer, got ' + Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('BEiT import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('BEiT import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('BEiT import: config "' + FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'beit');
+    if (ModelType <> 'beit') and (ModelType <> 'data2vec-vision') then
+      ImportError('BEiT import: config model_type is "' + ModelType +
+        '" - only "beit" / "data2vec-vision" are supported here.');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumLayers := RequiredInt('num_hidden_layers');
+    Result.NumHeads := RequiredInt('num_attention_heads');
+    Result.ImageSize := RequiredInt('image_size');
+    Result.PatchSize := RequiredInt('patch_size');
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 1e-12);
+    Result.HiddenAct := ClipHiddenActFromString(Obj.Get('hidden_act', 'gelu'));
+    Result.IntermediateSize :=
+      Obj.Get('intermediate_size', 4 * Result.HiddenSize);
+    if Result.IntermediateSize <= 0 then
+      ImportError('BEiT import: intermediate_size must be positive.');
+    Result.LayerScaleInit := Obj.Get('layer_scale_init_value', 0.1);
+    Result.UseRelPosBias := Obj.Get('use_relative_position_bias', true);
+    Result.UseSharedRelPosBias :=
+      Obj.Get('use_shared_relative_position_bias', false);
+    Result.UseAbsPos := Obj.Get('use_absolute_position_embeddings', false);
+    Result.UseMeanPooling := Obj.Get('use_mean_pooling', true);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BeitConfigToString(const Config: TBeitConfig): string;
+begin
+  if Config.ModelType = '' then Result := 'beit' else Result := Config.ModelType;
+  Result := Result + ' config: d=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', ffn=' + IntToStr(Config.IntermediateSize) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize);
+  if Config.LayerScaleInit > 0 then Result := Result + ', layerscale';
+  if Config.UseRelPosBias then Result := Result + ', rel_pos_bias';
+  if Config.UseMeanPooling then Result := Result + ', mean_pool'
+  else Result := Result + ', cls_pool';
+end;
+
+// Builds the cls-aware BEiT relative_position_index [seq*seq] (seq =
+// num_patches+1, row 0 = cls). Mirrors BeitRelativePositionBias.generate_
+// relative_position_index: the (Grid*Grid) patch block uses the 2-D relative
+// coordinate code; the cls row/column use the last 3 table rows.
+procedure BeitBuildRelPosIndex(Grid: integer; out Idx: TNeuralIntegerArray);
+var
+  Area, Seq, NumDist, h2m1, i, j, yi, xi, yj, xj, ry, rx, code: integer;
+begin
+  Area := Grid * Grid;
+  Seq := Area + 1;
+  h2m1 := 2 * Grid - 1;
+  NumDist := h2m1 * h2m1 + 3;
+  SetLength(Idx, Seq * Seq);
+  // patch block (rows/cols 1..Area)
+  for i := 0 to Area - 1 do
+  begin
+    yi := i div Grid; xi := i mod Grid;
+    for j := 0 to Area - 1 do
+    begin
+      yj := j div Grid; xj := j mod Grid;
+      // relative_coords = coords[i] - coords[j], shifted to start at 0 (HF):
+      // dim0 (row) shift Grid-1 then *(2*Grid-1); dim1 (col) shift Grid-1.
+      ry := (yi - yj) + (Grid - 1);
+      rx := (xi - xj) + (Grid - 1);
+      code := ry * h2m1 + rx;
+      Idx[(i + 1) * Seq + (j + 1)] := code;
+    end;
+  end;
+  // cls interactions (the last 3 table rows): cls->token, token->cls, cls->cls.
+  for j := 0 to Seq - 1 do
+    Idx[0 * Seq + j] := NumDist - 3;      // row 0 (cls query) to every key
+  for i := 0 to Seq - 1 do
+    Idx[i * Seq + 0] := NumDist - 2;      // every query to cls key (col 0)
+  Idx[0] := NumDist - 1;                  // cls -> cls
+end;
+
+// Gathers the full seq x seq bias matrix for one head from the
+// relative_position_bias_table [num_relative_distance, NumHeads] via the
+// cls-aware index, then installs it on the head's TNNetWindowAttention.
+procedure BeitSetHeadBias(HeadAttn: TNNetLayer; BiasTable: TNNetVolume;
+  const Idx: TNeuralIntegerArray; HeadIdx, NumHeads, Seq: integer);
+var
+  Mat: TNNetVolume;
+  k: integer;
+begin
+  Mat := TNNetVolume.Create(Seq * Seq, 1, 1);
+  try
+    for k := 0 to Seq * Seq - 1 do
+      Mat.FData[k] := BiasTable.FData[Idx[k] * NumHeads + HeadIdx];
+    TNNetWindowAttention(HeadAttn).SetBiasMatrix(Mat);
+  finally
+    Mat.Free;
+  end;
+end;
+
+type
+  TBeitBlockLayers = record
+    LN1, QProj, KProj, VProj, OProj, LS1: TNNetLayer;
+    LN2, Inter, OutDense, LS2: TNNetLayer;
+    HeadAttn: array of TNNetLayer;   // one TNNetWindowAttention per head
+  end;
+  TBeitBlockLayersArray = array of TBeitBlockLayers;
+
+// Appends one BEiT pre-LN encoder block:
+//   x1 = x + LS1 * Attn(LN1(x))        (Attn = full MHSA + rel-pos bias)
+//   y  = x1 + LS2 * MLP(LN2(x1))
+// MHSA is built as Heads separate TNNetWindowAttention layers (per-head split
+// of the Q|K|V projections), each carrying the per-head seq x seq bias matrix.
+procedure AddBeitEncoderBlock(NN: TNNet; const Config: TBeitConfig;
+  Seq: integer; var Block: TBeitBlockLayers; pInferenceOnly: boolean);
+var
+  BranchInput, QSlice, KSlice, VSlice, QKV: TNNetLayer;
+  HeadDim, h, ci: integer;
+  Channels: TNeuralIntegerArray;
+  HeadOuts: array of TNNetLayer;
+begin
+  HeadDim := Config.HiddenSize div Config.NumHeads;
+  BranchInput := NN.GetLastLayer();
+  Block.LN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+  // per-token Q/K/V projections (Linear over depth, biased: q/v have a bias,
+  // k is bias-free in BEiT -> its bias neurons stay zero).
+  Block.QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+  Block.KProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize), Block.LN1);
+  Block.VProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize), Block.LN1);
+  SetLength(HeadOuts, Config.NumHeads);
+  SetLength(Block.HeadAttn, Config.NumHeads);
+  SetLength(Channels, HeadDim);
+  for h := 0 to Config.NumHeads - 1 do
+  begin
+    for ci := 0 to HeadDim - 1 do Channels[ci] := h * HeadDim + ci;
+    QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), Block.QProj);
+    KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), Block.KProj);
+    VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), Block.VProj);
+    QKV := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+    Block.HeadAttn[h] := NN.AddLayer( TNNetWindowAttention.Create(HeadDim, Seq) );
+    HeadOuts[h] := Block.HeadAttn[h];
+  end;
+  NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
+  Block.OProj := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+  Block.LS1 := NN.AddLayer( TNNetChannelMul.Create() );
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  BranchInput := NN.GetLastLayer();
+  Block.LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+  Block.Inter := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+  AddClipHiddenAct(NN, Config.HiddenAct);
+  Block.OutDense := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+  Block.LS2 := NN.AddLayer( TNNetChannelMul.Create() );
+  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+  if pInferenceOnly then NN.MakeInferenceOnly();
+end;
+
+procedure LoadBeitEncoderBlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TBeitBlockLayers; const BlockPrefix: string;
+  const Config: TBeitConfig; const Idx: TNeuralIntegerArray; Seq: integer);
+var
+  d, h: integer;
+  AttnPfx, QName, KName, VName, ONm, LamName, BiasTableName: string;
+  BiasTable: TNNetVolume;
+begin
+  d := Config.HiddenSize;
+  AttnPfx := BlockPrefix + 'attention.';
+  QName := AttnPfx + 'attention.query';
+  KName := AttnPfx + 'attention.key';
+  VName := AttnPfx + 'attention.value';
+  ONm := AttnPfx + 'output.dense';
+  LoadLayerNormWeights(Reader, Block.LN1,
+    BlockPrefix + 'layernorm_before.weight',
+    BlockPrefix + 'layernorm_before.bias', d);
+  // query / value biased; key bias-free (no .bias tensor -> zero).
+  LoadLlamaLinearWeights(Reader, Block.QProj, QName + '.weight',
+    d, d, 0, -1, 0, QName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.KProj, KName + '.weight', d, d);
+  LoadLlamaLinearWeights(Reader, Block.VProj, VName + '.weight',
+    d, d, 0, -1, 0, VName + '.bias');
+  LoadLlamaLinearWeights(Reader, Block.OProj, ONm + '.weight',
+    d, d, 0, -1, 0, ONm + '.bias');
+  LoadLayerNormWeights(Reader, Block.LN2,
+    BlockPrefix + 'layernorm_after.weight',
+    BlockPrefix + 'layernorm_after.bias', d);
+  LoadLlamaLinearWeights(Reader, Block.Inter,
+    BlockPrefix + 'intermediate.dense.weight', d, Config.IntermediateSize,
+    0, -1, 0, BlockPrefix + 'intermediate.dense.bias');
+  LoadLlamaLinearWeights(Reader, Block.OutDense,
+    BlockPrefix + 'output.dense.weight', Config.IntermediateSize, d,
+    0, -1, 0, BlockPrefix + 'output.dense.bias');
+  // LayerScale lambda_1 / lambda_2 (a.k.a. gamma_1 / gamma_2).
+  LamName := BlockPrefix + 'lambda_1';
+  if not Reader.HasTensor(LamName) then LamName := BlockPrefix + 'gamma_1';
+  LoadDINOv2LayerScale(Reader, Block.LS1, LamName, d);
+  LamName := BlockPrefix + 'lambda_2';
+  if not Reader.HasTensor(LamName) then LamName := BlockPrefix + 'gamma_2';
+  LoadDINOv2LayerScale(Reader, Block.LS2, LamName, d);
+  // per-layer relative_position_bias_table -> per-head full bias matrix.
+  BiasTableName := AttnPfx +
+    'attention.relative_position_bias.relative_position_bias_table';
+  if not Reader.HasTensor(BiasTableName) then
+    ImportError('BEiT import: missing per-layer relative position bias table "' +
+      BiasTableName + '" (only use_relative_position_bias=true is supported).');
+  BiasTable := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(BiasTableName, BiasTable);
+    for h := 0 to Config.NumHeads - 1 do
+      BeitSetHeadBias(Block.HeadAttn[h], BiasTable, Idx, h,
+        Config.NumHeads, Seq);
+  finally
+    BiasTable.Free;
+  end;
+end;
+
+function BuildBeitFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TBeitConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  PatchConv, ClsRow, FinalLN: TNNetLayer;
+  Blocks: TBeitBlockLayersArray;
+  Tmp: TNNetVolume;
+  Idx: TNeuralIntegerArray;
+  Grid, NumPatches, Seq, BlockCnt, ci, d: integer;
+  Pfx, PatchBiasName: string;
+begin
+  d := Config.HiddenSize;
+  if (Config.NumHeads < 1) or ((d mod Config.NumHeads) <> 0) then
+    ImportError('BEiT import: hidden_size=' + IntToStr(d) +
+      ' is not divisible by num_attention_heads=' +
+      IntToStr(Config.NumHeads) + '.');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0) then
+    ImportError('BEiT import: image_size=' + IntToStr(Config.ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
+  if not Config.UseRelPosBias then
+    ImportError('BEiT import: use_relative_position_bias=false is NOT ' +
+      'supported (the relative-position bias is the defining BEiT trait).');
+  if Config.UseSharedRelPosBias then
+    ImportError('BEiT import: use_shared_relative_position_bias=true is NOT ' +
+      'supported - only the per-layer relative_position_bias is wired.');
+  if Config.UseAbsPos then
+    ImportError('BEiT import: use_absolute_position_embeddings=true is NOT ' +
+      'supported - BEiT/data2vec-vision uses no absolute positions.');
+  Grid := Config.ImageSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  Seq := NumPatches + 1;
+  BeitBuildRelPosIndex(Grid, Idx);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    // BIASED patch embedding (kernel = stride = patch_size), flattened to a
+    // (NumPatches, 1, hidden) row-major (y,x) token sequence.
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      d, Config.PatchSize, 0, Config.PatchSize, 0) );
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    // Prepend one row for the cls token (PadXY pads both ends; Crop drops the
+    // right pad). The cls slot is then filled by a learned-positional layer
+    // whose row 0 = cls_token and rows 1.. = 0 (NO absolute positions).
+    NN.AddLayer( TNNetPadXY.Create(1, 0) );
+    NN.AddLayer( TNNetCrop.Create(0, 0, Seq, 1) );
+    ClsRow := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(Seq) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(Blocks, Config.NumLayers);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      AddBeitEncoderBlock(NN, Config, Seq, Blocks[BlockCnt], pInferenceOnly);
+    // use_mean_pooling=false -> final encoder LayerNorm over every token;
+    // use_mean_pooling=true -> the encoder output is returned raw (the pooler
+    // LayerNorm + patch mean is the caller's job).
+    if not Config.UseMeanPooling then
+    begin
+      FinalLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+    end
+    else
+      FinalLN := nil;
+
+    // ---------------- Weights ----------------
+    // Bare BeitModel checkpoints carry a 'beit.' prefix; data2vec-vision uses
+    // 'data2vec_vision.'. Probe the cls token to pick the prefix.
+    if Reader.HasTensor('beit.embeddings.cls_token') then
+      Pfx := 'beit.'
+    else if Reader.HasTensor('data2vec_vision.embeddings.cls_token') then
+      Pfx := 'data2vec_vision.'
+    else
+      Pfx := '';
+    LoadClipPatchConv(Reader, PatchConv,
+      Pfx + 'embeddings.patch_embeddings.projection.weight',
+      Config.NumChannels, Config.PatchSize, d);
+    PatchBiasName := Pfx + 'embeddings.patch_embeddings.projection.bias';
+    if not Reader.HasTensor(PatchBiasName) then
+      ImportError('BEiT import: missing tensor "' + PatchBiasName + '".');
+    if (Reader.DimCount(PatchBiasName) <> 1) or
+       (Reader.DimSize(PatchBiasName, 0) <> d) then
+      ImportError('BEiT import: "' + PatchBiasName + '" must have shape [' +
+        IntToStr(d) + '], got ' + Reader.ShapeAsString(PatchBiasName));
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(PatchBiasName, Tmp);
+      for ci := 0 to d - 1 do
+        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // cls_token [1,1,hidden] -> row 0 of the positional table; rows 1.. stay 0
+    // (the table starts zeroed by InitDefault), i.e. no absolute positions.
+    if not Reader.HasTensor(Pfx + 'embeddings.cls_token') then
+      ImportError('BEiT import: missing tensor "' + Pfx +
+        'embeddings.cls_token".');
+    ClsRow.Neurons[0].Weights.Fill(0);
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Pfx + 'embeddings.cls_token', Tmp);
+      if Tmp.Size <> d then
+        ImportError('BEiT import: "' + Pfx + 'embeddings.cls_token" must have ' +
+          IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
+      for ci := 0 to d - 1 do
+        ClsRow.Neurons[0].Weights.FData[ci] := Tmp.FData[ci];
+      ClsRow.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      LoadBeitEncoderBlockWeights(Reader, Blocks[BlockCnt],
+        Pfx + 'encoder.layer.' + IntToStr(BlockCnt) + '.', Config, Idx, Seq);
+    if FinalLN <> nil then
+      LoadLayerNormWeights(Reader, FinalLN,
+        Pfx + 'layernorm.weight', Pfx + 'layernorm.bias', d);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildBeitFromSafeTensorsEx(const FileName: string;
+  const Config: TBeitConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildBeitFromSafeTensors(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildBeitFromSafeTensorsWithConfig(const FileName: string;
+  out Config: TBeitConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBeitConfigFromJSONFile(ConfigPath);
+  Result := BuildBeitFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================
