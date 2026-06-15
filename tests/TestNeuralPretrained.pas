@@ -26,6 +26,7 @@ type
   private
     function FixturePath(const FileName: string): string;
     procedure RunConvNeXtParity(const Base: string);
+    procedure RunResNetParity(const Base: string);
     // Composes a minimal safetensors byte stream into a temp file and
     // returns its path. HeaderJson is written verbatim (preceded by its
     // 8-byte little-endian length); Payload is the raw data section.
@@ -339,6 +340,8 @@ type
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
     procedure TestResNet18ImageClassificationParity;
+    procedure TestResNet34ImageClassificationParity;
+    procedure TestResNet50ImageClassificationParity;
     procedure TestConvNeXtConfigFromJSONFile;
     procedure TestConvNeXtV1ImageClassificationParity;
     procedure TestConvNeXtV2ImageClassificationParity;
@@ -14784,7 +14787,15 @@ end;
 // (torchvision is not installed) that replicates the CAI forward path - the
 // same BN fold + CAI maxpool semantics (ceil-sizing, edge-clamped, zero-pad).
 // Asserts the (1,1,num_labels) logits match the oracle < 1e-4.
-procedure TTestNeuralPretrained.TestResNet18ImageClassificationParity;
+// Shared parity driver: builds BuildResNetFromSafeTensors from <Base>.* and
+// asserts the (1,1,num_labels) logits match the numpy float64 oracle stored in
+// <Base>_logits.json (pixels [C][H][W]) within 1e-4. The oracle replicates the
+// CAI forward path (BN fold + ceil-sized edge-clamped maxpool); the residual
+// 1e-4 budget is the float64-vs-float32 forward-arithmetic gap (the comment in
+// the generator mentions a tighter exact-weight goal of 1e-6, but the live CAI
+// float32 path is checked at 1e-4 here, the SAME tolerance the resnet18 test
+// used). Covers resnet18/34 (BasicBlock) and resnet50 (Bottleneck, expansion 4).
+procedure TTestNeuralPretrained.RunResNetParity(const Base: string);
 var
   NN: TNNet;
   Config: TResNetConfig;
@@ -14796,8 +14807,8 @@ var
   Diff, MaxDiff: double;
 begin
   RandSeed := 424242;
-  NN := BuildResNetFromSafeTensors(FixturePath('tiny_resnet18.safetensors'),
-    Config, {pInferenceOnly=}false, FixturePath('tiny_resnet18_config.json'));
+  NN := BuildResNetFromSafeTensors(FixturePath(Base + '.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath(Base + '_config.json'));
   RefJson := TStringList.Create;
   ImageInput := TNNetVolume.Create;
   RefRoot := nil;
@@ -14809,7 +14820,7 @@ begin
     AssertEquals('output size = num_labels', Config.NumLabels,
       NN.GetLastLayer().Output.Size);
 
-    RefJson.LoadFromFile(FixturePath('tiny_resnet18_logits.json'));
+    RefJson.LoadFromFile(FixturePath(Base + '_logits.json'));
     RefRoot := GetJSON(RefJson.Text);
     Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
     LogitsArr := TJSONArray(TJSONArray(
@@ -14846,6 +14857,33 @@ begin
     RefJson.Free;
     NN.Free;
   end;
+end;
+
+// torchvision ResNet18 image-classification parity (BasicBlock, [2,2,2,2]).
+procedure TTestNeuralPretrained.TestResNet18ImageClassificationParity;
+begin
+  RunResNetParity('tiny_resnet18');
+end;
+
+// torchvision ResNet34 parity: BasicBlock with the DEEPER [3,2,2,2] layout
+// (layer1 has 3 blocks -> 2 intra-stage IDENTITY shortcuts, deeper than
+// resnet18's 2-per-stage). Guards the resnet34 BasicBlock stacking path,
+// which was coded but previously untested. Fixture tiny_resnet34.* (depth=34
+// selects BasicBlock+expansion 1), tiny stage widths [4,6,8,12].
+procedure TTestNeuralPretrained.TestResNet34ImageClassificationParity;
+begin
+  RunResNetParity('tiny_resnet34');
+end;
+
+// torchvision ResNet50 parity: BOTTLENECK blocks (1x1 -> 3x3 -> 1x1,
+// expansion 4) -- the previously CODED-BUT-UNTESTED Bottleneck importer path.
+// Fixture tiny_resnet50.* (depth=50 selects Bottleneck+expansion 4) uses tiny
+// base widths [4,6,8,12] (out widths *4) and [2,1,1,1] blocks so layer1 also
+// exercises the Bottleneck IDENTITY shortcut plus every layerN.0 1x1
+// downsample/projection shortcut (channels change 4->16 even at stride 1).
+procedure TTestNeuralPretrained.TestResNet50ImageClassificationParity;
+begin
+  RunResNetParity('tiny_resnet50');
 end;
 
 // Verifies ReadConvNeXtConfigFromJSONFile on the committed v1 pico config.

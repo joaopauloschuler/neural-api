@@ -234,9 +234,15 @@ rather than acted on.
       reader/ToString, resnet18 parity 1.0e-6 vs a numpy float64 oracle —
       torchvision not installed; ConvNeXt LayerScale+GRN+depthwise-7x7 is the
       modern-CNN stretch goal on the same path):
-  - [ ] resnet50 Bottleneck (expansion 4) is CODED but not parity-tested — add a
+  - [X] resnet50 Bottleneck (expansion 4) is CODED but not parity-tested — add a
         pico Bottleneck fixture + TestResNet50...Parity. resnet34 likewise coded,
         untested. resnet101/152 + ConvNeXt remain out of scope.
+        LANDED: tools/resnet50_tiny_fixture.py emits pico tiny_resnet50.* (depth=50
+        Bottleneck, [2,1,1,1], expansion 4) and tiny_resnet34.* (depth=34 BasicBlock,
+        deeper [3,2,2,2]) with shared numpy-float64 oracles reusing resnet18's
+        helpers. TestResNet50/34ImageClassificationParity (shared RunResNetParity
+        driver) assert vs oracle < 1e-4 — both pass; no Bottleneck bug found.
+        resnet101/152 + ConvNeXt still OPEN.
   - [ ] real torchvision .pth (pickle) load path: today the importer reads
         safetensors only; the pico fixture is a numpy float64 oracle (no
         torchvision). Also: CAI maxpool (ceil sizing + edge-clamped windows + zero
