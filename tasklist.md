@@ -1045,6 +1045,29 @@ rather than acted on.
       examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU once the
       base UNet lands. Note: the cheaper no-UNet route to video is bolting the same
       temporal block onto the landed PixArt DiT — worth scoping if SD UNet stays blocked.
+- [ ] CogVideoX native text-to-VIDEO DiT importer (BuildCogVideoXFromSafeTensors[Ex] +
+      TCogVideoXConfig / ReadCogVideoXConfigFromJSONFile in neuralpretrained.pas, e.g.
+      THUDM/CogVideoX-2b) — a SELF-CONTAINED native video generator, architecturally
+      distinct from the tracked AnimateDiff task (which only bolts a temporal module onto a
+      frozen SD UNet and DEPENDS ON the still-open SD UNet importer). CogVideoX has no UNet
+      dependency: it is a flat MMDiT-style transformer over a flattened (frame x height x
+      width) latent token sequence with T5 text conditioning (BuildT5FromSafeTensors already
+      importable) + expert adaLN-Zero modulation (reuse the landed DiT DiTModCond / TNNetFiLM
+      gate recipe, exactly as MMDiT/PixArt/VAR). The ONE genuinely-new primitive is the 3D
+      CAUSAL-CONV VAE used to encode/decode the spatio-temporal latent: a depth-axis causal
+      temporal convolution (left-pad the time axis, no peeking at future frames) over a
+      (NumFrames, H*W, C) channel-major reshape — a new TNNetCausalConv3D leaf (or a thin
+      temporal-causal wrapper over the landed Conv1D/DepthwiseConv1D so each spatial cell
+      convolves along time), the video analogue of the VideoMAE space<->time transpose
+      already used in the AnimateDiff plan. Second new piece: 3D RoPE over the
+      (t,h,w)-factored positions, expressible by concatenating three axis-wise RoPE leaves.
+      Scope v1 as: the DiT denoiser forward + the 3D-causal VAE DECODE tail, reusing the
+      landed TNNetDiffusionScheduler (DDIM / DPM-Solver++(2M)) loop — NO training. Pico
+      parity test TestCogVideoXParity asserting < 1e-4 on one denoiser step AND one VAE-decode
+      against a self-contained torch/numpy float64 oracle (diffusers not required), with a
+      committed pico fixture tiny_cogvideox.* + tools/make_pico_cogvideox_fixture.py (tiny
+      hidden/depth/heads, 2-frame latent). Follow-up: an examples/TextToVideo writing a short
+      animated GIF/PPM sequence on CPU; shares the writer with the AnimateDiff example.
 - [X] VAR (Visual AutoRegressive, next-SCALE prediction) image generation importer —
       class-conditional v1 LANDED. `BuildVARFromSafeTensors[Ex]` +
       `ReadVARConfigFromJSONFile` / `TVARConfig` in neuralpretrained.pas builds the
