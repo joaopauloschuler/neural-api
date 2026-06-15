@@ -5092,6 +5092,136 @@ function RefClipScoreFromEmbeddings(ImageEmb, TextEmb, RefTextEmb: TNNetVolume;
   Weight: TNeuralFloat = 2.5): TNeuralFloat;
 
 // ===========================================================================
+// CLAP IMPORT (model_type "clap": laion/clap-htsat-unfused and siblings) -
+// the AUDIO-domain analogue of the CLIP dual encoder (zero-shot audio
+// classification + audio<->text retrieval). It shares CLIP's contrastive
+// head shape (two towers -> projection -> L2-normalize -> cosine *
+// exp(logit_scale)) but is genuinely NOT a near-duplicate:
+//   - AUDIO tower = HTS-AT, a Swin hierarchical windowed-attention
+//     transformer over a log-mel spectrogram. It REUSES the landed Swin
+//     window/shifted-window machinery verbatim (TNNetWindowAttention,
+//     TNNetGatherTokens, SwinBuildWindowLayout, SwinSetWindowBias, the
+//     patch-merge reorder), only with the clap_audio_model key spelling
+//     (attention.self.{query,key,value} + attention.output.dense +
+//     intermediate.dense + output.dense, and
+//     attention.self.relative_position_bias_table). On top: a Conv2d
+//     patch-embed + LayerNorm, the Swin STAGES, a final LayerNorm, a
+//     token mean-pool, then the 2-layer ClapProjectionLayer
+//     (linear1 -> ReLU -> linear2).
+//   - TEXT tower = RoBERTa (clap_text_model): token + LEARNED absolute
+//     positions OFFSET past pad_token_id + a token-type row, post-LN
+//     BIDIRECTIONAL blocks (built inline with AddMultiHeadSelfAttention,
+//     exactly the BuildBertFromSafeTensors shape), a BERT-style pooler
+//     (dense + tanh on token 0), then the SAME 2-layer ClapProjectionLayer.
+// Both nets output a SINGLE (1,1,projection_dim) pooled token; the shared
+// CLIP head ClipExtractEmbedding (L2-normalize at row 0) + ClipSimilarity
+// (cosine) finish the contrastive score. logits_per_audio =
+// exp(logit_scale_a) * cosine(audio, text) - see ClapSimilarityMatrix.
+//
+// AUDIO FRONTEND CONTRACT: the HF encoder prefixes a BatchNorm2d over the
+// mel axis and a "reshape mel to image" step (a freq<->time transpose at
+// freq_ratio = spec_size / num_mel_bins). v1 supports freq_ratio = 1 only
+// (the unfused laion checkpoint's canonical 1024-frame / 64-mel layout uses
+// freq_ratio = 4 and is REJECTED - see the tasklist follow-up). At
+// freq_ratio = 1 the reshape is a plain transpose and the final group-CNN
+// reshape is identity, so the AUDIO net's Input is the ALREADY batch-normed
+// + transposed mel image of shape (mel_bins, time, 1) - a fixed affine the
+// caller applies up front (ClapBatchNormMelImage), exactly as CLIP supplies
+// already-normalized pixels. enable_fusion = true is also REJECTED.
+//
+// Tensor names: audio_model.audio_encoder.{batch_norm.*, patch_embed.proj.
+// {weight,bias}, patch_embed.norm.{weight,bias}, layers.N.blocks.M.*,
+// layers.N.downsample.{norm,reduction}.*, norm.{weight,bias}};
+// text_model.{embeddings.*, encoder.layer.N.*, pooler.dense.{weight,bias}};
+// {audio,text}_projection.{linear1,linear2}.{weight,bias}; logit_scale_a,
+// logit_scale_t. BuildFromPretrained does NOT dispatch "clap" (it returns
+// TWO nets). See examples/ZeroShotAudioTag for the zero-shot recipe.
+// ---------------------------------------------------------------------------
+type
+  TClapAudioConfig = record
+    NumMelBins: integer;        // num_mel_bins
+    SpecSize: integer;          // spec_size (freq_ratio = SpecSize/NumMelBins)
+    PatchSize: integer;         // patch_size (= patch_stride, square)
+    EmbedDim: integer;          // patch_embeds_hidden_size (stage-0 dim)
+    Depths: array of integer;   // depths (blocks per stage)
+    NumHeads: array of integer; // num_attention_heads (heads per stage)
+    WindowSize: integer;        // window_size
+    HiddenAct: string;          // hidden_act ('gelu')
+    LayerNormEps: TNeuralFloat; // layer_norm_eps
+    EnableFusion: boolean;      // enable_fusion (rejected when true)
+  end;
+
+  TClapTextConfig = record
+    HiddenSize: integer;        // hidden_size
+    IntermediateSize: integer;  // intermediate_size
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    VocabSize: integer;         // vocab_size
+    MaxPositions: integer;      // max_position_embeddings
+    TypeVocabSize: integer;     // type_vocab_size
+    PadTokenId: integer;        // pad_token_id (position offset = pad+1)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-12 for roberta)
+  end;
+
+  TClapConfig = record
+    Audio: TClapAudioConfig;
+    Text: TClapTextConfig;
+    ProjectionDim: integer;     // projection_dim (shared space)
+    ProjectionActRelu: boolean; // projection_hidden_act == 'relu'
+    LogitScaleA: TNeuralFloat;  // logit_scale_a (RAW, pre-exp)
+    LogitScaleT: TNeuralFloat;  // logit_scale_t (RAW, pre-exp)
+    ModelType: string;          // 'clap'
+  end;
+
+// Reads a HF CLAP config.json (model_type "clap"). Pulls audio_config /
+// text_config sub-objects + projection_dim. Defaults follow ClapConfig:
+// projection_hidden_act = 'relu', text layer_norm_eps = 1e-12, audio
+// layer_norm_eps = 1e-5, pad_token_id = 1. freq_ratio != 1 and
+// enable_fusion = true are accepted by the reader but REJECTED at build.
+function ReadClapConfigFromJSONFile(const FileName: string): TClapConfig;
+
+function ClapConfigToString(const Config: TClapConfig): string;
+
+// Builds the CLAP AUDIO and TEXT nets described by Config and loads every
+// weight from the checkpoint at FileName. The AUDIO net takes a
+// (num_mel_bins, time, 1) batch-normed + transposed mel image (see the
+// AUDIO FRONTEND CONTRACT above; ClapBatchNormMelImage prepares it) and
+// outputs a (1,1,projection_dim) pooled embedding; the TEXT net takes a
+// (TextSeqLen,1,2) [token id | token-type id] volume and outputs the same.
+// Pool + L2-normalize BOTH with ClipExtractEmbedding(out, 0, emb).
+// TextSeqLen <= 0 uses the usable text context. Both nets are caller-owned.
+// pInferenceOnly frees training volumes during construction.
+// Config.LogitScale{A,T} are updated from the checkpoint scalars.
+procedure BuildClapFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TClapConfig; out AudioNet, TextNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+procedure BuildClapFromSafeTensors(const FileName: string;
+  out AudioNet, TextNet: TNNet; out Config: TClapConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Applies the HF ClapAudioEncoder front affine to a raw (time, mel_bins)
+// log-mel spectrogram and lays the result out as the (mel_bins, time, 1)
+// image the AUDIO net expects: per-mel-bin BatchNorm (using the loaded
+// running stats + gamma/beta) then the freq<->time transpose of the
+// freq_ratio = 1 reshape_mel2img. RawMel is (time,1,mel_bins) (X=time,
+// depth=mel); the result Image is (mel_bins,time,1) (X=mel,Y=time). The
+// BatchNorm params come straight from the checkpoint via the Reader.
+procedure ClapBatchNormMelImage(Reader: TNNetSafeTensorsReader;
+  RawMel: TNNetVolume; Image: TNNetVolume; const Config: TClapAudioConfig);
+
+// Fills Matrix (rows = audio embeddings, cols = text embeddings) with
+// exp(LogitScaleA) * cosine(audio[i], text[j]) - HF logits_per_audio - from
+// pre-extracted unit-L2 ClipExtractEmbedding outputs. AudioEmbs / TextEmbs
+// are arrays of (1,1,projection_dim) volumes. Matrix is sized rows x cols
+// as a (cols, rows, 1) volume (X = text index, Y = audio index).
+procedure ClapSimilarityMatrix(const AudioEmbs, TextEmbs: array of TNNetVolume;
+  LogitScaleA: TNeuralFloat; Matrix: TNNetVolume);
+
+// ===========================================================================
 // OWL-ViT IMPORT (model_type "owlvit": google/owlvit-base-patch32 and
 // siblings) - the repo's first OPEN-VOCABULARY (zero-shot, text-conditioned)
 // object detector. DETR is open but CLOSED-vocabulary (a fixed label set);
@@ -40182,6 +40312,582 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSwinConfigFromJSONFile(ConfigPath);
   Result := BuildSwinFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// CLAP IMPORT (model_type "clap") - implementation
+// ===========================================================================
+
+function ReadClapConfigFromJSONFile(const FileName: string): TClapConfig;
+var
+  JsonText: TStringList;
+  Root, ArrData: TJSONData;
+  Obj, AudioObj, TextObj: TJSONObject;
+  Arr: TJSONArray;
+  i: integer;
+  ModelType: string;
+
+  function ReqSub(O: TJSONObject; const FieldName: string): TJSONObject;
+  var Data: TJSONData;
+  begin
+    Data := O.Find(FieldName);
+    if (Data = nil) or not (Data is TJSONObject) then
+      ImportError('CLAP import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(Data);
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('CLAP import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('CLAP import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('CLAP import: config "' + FileName + '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'clap');
+    if ModelType <> 'clap' then
+      ImportError('CLAP import: config model_type is "' + ModelType +
+        '" - only "clap" is supported here.');
+    Result.ModelType := ModelType;
+    Result.ProjectionDim := Obj.Get('projection_dim', 512);
+
+    AudioObj := ReqSub(Obj, 'audio_config');
+    Result.Audio.NumMelBins := AudioObj.Get('num_mel_bins', 64);
+    Result.Audio.SpecSize := AudioObj.Get('spec_size', 256);
+    Result.Audio.PatchSize := AudioObj.Get('patch_size', 4);
+    Result.Audio.EmbedDim := AudioObj.Get('patch_embeds_hidden_size', 96);
+    Result.Audio.WindowSize := AudioObj.Get('window_size', 8);
+    Result.Audio.HiddenAct := AudioObj.Get('hidden_act', 'gelu');
+    Result.Audio.LayerNormEps := AudioObj.Get('layer_norm_eps', TJSONFloat(1e-5));
+    Result.Audio.EnableFusion := AudioObj.Get('enable_fusion', false);
+    ArrData := AudioObj.Find('depths');
+    if (ArrData = nil) or not (ArrData is TJSONArray) then
+      ImportError('CLAP import: audio_config missing the "depths" array.');
+    Arr := TJSONArray(ArrData);
+    if Arr.Count < 1 then ImportError('CLAP import: "depths" must be non-empty.');
+    SetLength(Result.Audio.Depths, Arr.Count);
+    for i := 0 to Arr.Count - 1 do Result.Audio.Depths[i] := Arr.Integers[i];
+    ArrData := AudioObj.Find('num_attention_heads');
+    if (ArrData = nil) or not (ArrData is TJSONArray) then
+      ImportError('CLAP import: audio_config missing "num_attention_heads".');
+    Arr := TJSONArray(ArrData);
+    if Arr.Count <> Length(Result.Audio.Depths) then
+      ImportError('CLAP import: audio num_attention_heads length must match depths.');
+    SetLength(Result.Audio.NumHeads, Arr.Count);
+    for i := 0 to Arr.Count - 1 do Result.Audio.NumHeads[i] := Arr.Integers[i];
+
+    TextObj := ReqSub(Obj, 'text_config');
+    Result.Text.HiddenSize := TextObj.Get('hidden_size', 768);
+    Result.Text.IntermediateSize := TextObj.Get('intermediate_size', 3072);
+    Result.Text.NumLayers := TextObj.Get('num_hidden_layers', 12);
+    Result.Text.NumHeads := TextObj.Get('num_attention_heads', 12);
+    Result.Text.VocabSize := TextObj.Get('vocab_size', 50265);
+    Result.Text.MaxPositions := TextObj.Get('max_position_embeddings', 514);
+    Result.Text.TypeVocabSize := TextObj.Get('type_vocab_size', 1);
+    Result.Text.PadTokenId := TextObj.Get('pad_token_id', 1);
+    Result.Text.LayerNormEps := TextObj.Get('layer_norm_eps', TJSONFloat(1e-12));
+
+    // projection_hidden_act lives in both sub-configs; HF defaults to relu.
+    Result.ProjectionActRelu :=
+      LowerCase(AudioObj.Get('projection_hidden_act', 'relu')) = 'relu';
+    // logit scales come from the checkpoint scalars; the config carries an
+    // init only.
+    Result.LogitScaleA := Obj.Get('logit_scale_init_value', TJSONFloat(2.6592));
+    Result.LogitScaleT := Result.LogitScaleA;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function ClapConfigToString(const Config: TClapConfig): string;
+var i: integer; DStr, HStr: string;
+begin
+  DStr := ''; HStr := '';
+  for i := 0 to High(Config.Audio.Depths) do
+  begin
+    if i > 0 then begin DStr := DStr + ','; HStr := HStr + ','; end;
+    DStr := DStr + IntToStr(Config.Audio.Depths[i]);
+    HStr := HStr + IntToStr(Config.Audio.NumHeads[i]);
+  end;
+  Result := 'clap config: audio(embed=' + IntToStr(Config.Audio.EmbedDim) +
+    ', depths=[' + DStr + '], heads=[' + HStr + '], window=' +
+    IntToStr(Config.Audio.WindowSize) + ', mel=' +
+    IntToStr(Config.Audio.NumMelBins) + ', spec=' +
+    IntToStr(Config.Audio.SpecSize) + ', patch=' +
+    IntToStr(Config.Audio.PatchSize) + '), text(d=' +
+    IntToStr(Config.Text.HiddenSize) + ', layers=' +
+    IntToStr(Config.Text.NumLayers) + ', heads=' +
+    IntToStr(Config.Text.NumHeads) + ', vocab=' +
+    IntToStr(Config.Text.VocabSize) + ', max_pos=' +
+    IntToStr(Config.Text.MaxPositions) + '), proj=' +
+    IntToStr(Config.ProjectionDim) + ', logit_scale_a=' +
+    FloatToStrF(Config.LogitScaleA, ffGeneral, 6, 0);
+end;
+
+// Builds the HTS-AT (Swin) audio tower. Mirrors BuildSwinFromSafeTensors'
+// stage stack (the reused window/shifted-window machinery) but with the
+// clap_audio_model key spelling and a 2-layer projection head; the input is
+// the already batch-normed + transposed (mel_bins, time, 1) image
+// (freq_ratio = 1 contract).
+function BuildClapAudioTower(Reader: TNNetSafeTensorsReader;
+  const Config: TClapConfig; pInferenceOnly: boolean): TNNet;
+var
+  NN: TNNet;
+  PatchConv, EmbNorm, FinalNorm, StageIn, GridMap, Pooled: TNNetLayer;
+  Proj1, Proj2: TNNetLayer;
+  NumStages, StageIdx, BlockIdx, Grid, Dim, Heads, HeadDim, ws, NumWindows: integer;
+  ShiftSize, EffWindow, EffShift, ws2, h, wIdx, ci, MlpHidden: integer;
+  Shifted: boolean;
+  Prefix, BPrefix, EncPrefix: string;
+  TokenPerm, InvPerm, RelPosIndex, RegionId, Channels, MergePerm: TNeuralIntegerArray;
+  ShortcutA, NormBefore, Reordered, WinSlice, QProj, KProj, VProj: TNNetLayer;
+  QSlice, KSlice, VSlice, QKV, HeadAttn, AttnConcat, OProj: TNNetLayer;
+  AllWindowConcat, ReorderBack, AttnResidual: TNNetLayer;
+  NormAfter, Fc1, Fc2: TNNetLayer;
+  MergeNorm, MergeReduce: TNNetLayer;
+  WindowOuts, HeadOuts, WinAttnLayers: array of TNNetLayer;
+  BiasTable: TNNetVolume;
+  ny, nx, gy, gx, half, FreqRatio, PatchGrid: integer;
+begin
+  NumStages := Length(Config.Audio.Depths);
+  FreqRatio := Config.Audio.SpecSize div Config.Audio.NumMelBins;
+  if Config.Audio.EnableFusion then
+    ImportError('CLAP import: enable_fusion=true (the "fused" windowing) is ' +
+      'not supported in v1 - use a clap-htsat-UNfused checkpoint.');
+  if FreqRatio <> 1 then
+    ImportError('CLAP import: spec_size/num_mel_bins (freq_ratio) = ' +
+      IntToStr(FreqRatio) + ' is not supported in v1 (only freq_ratio = 1, ' +
+      'i.e. spec_size = num_mel_bins). The mel2img reshape + group-CNN ' +
+      'glue for freq_ratio > 1 is a tasklist follow-up.');
+  if (Config.Audio.SpecSize mod Config.Audio.PatchSize) <> 0 then
+    ImportError('CLAP import: spec_size not a multiple of patch_size.');
+  PatchGrid := Config.Audio.SpecSize div Config.Audio.PatchSize;
+  ws := Config.Audio.WindowSize;
+  EncPrefix := 'audio_model.audio_encoder.';
+  NN := TNNet.Create();
+  SetLength(WinAttnLayers, 0);
+  try
+    // ---- patch embed: the (mel,time,1) image -> (gridF*gridT, 1, EmbedDim) ----
+    NN.AddLayer( TNNetInput.Create(Config.Audio.SpecSize, Config.Audio.SpecSize, 1) );
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.Audio.EmbedDim, Config.Audio.PatchSize, 0,
+      Config.Audio.PatchSize, 0) );
+    NN.AddLayer( TNNetReshape.Create(PatchGrid * PatchGrid, 1, Config.Audio.EmbedDim) );
+    EmbNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps) );
+    StageIn := EmbNorm;
+    Grid := PatchGrid;
+    Dim := Config.Audio.EmbedDim;
+
+    // ---- Swin stages (reused window machinery, clap key spelling) ----
+    for StageIdx := 0 to NumStages - 1 do
+    begin
+      Heads := Config.Audio.NumHeads[StageIdx];
+      HeadDim := Dim div Heads;
+      if Grid <= ws then begin EffWindow := Grid; ShiftSize := 0; end
+      else begin EffWindow := ws; ShiftSize := ws div 2; end;
+      ws2 := EffWindow * EffWindow;
+      Prefix := EncPrefix + 'layers.' + IntToStr(StageIdx) + '.';
+      for BlockIdx := 0 to Config.Audio.Depths[StageIdx] - 1 do
+      begin
+        Shifted := Odd(BlockIdx) and (ShiftSize > 0);
+        if Shifted then EffShift := ShiftSize else EffShift := 0;
+        BPrefix := Prefix + 'blocks.' + IntToStr(BlockIdx) + '.';
+        SwinBuildWindowLayout(Grid, EffWindow, EffShift, Shifted,
+          TokenPerm, InvPerm, RelPosIndex, RegionId, NumWindows);
+
+        ShortcutA := StageIn;
+        NormBefore := NN.AddLayerAfter(
+          TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps), StageIn);
+        Reordered := NN.AddLayer( TNNetGatherTokens.Create(TokenPerm) );
+        SetLength(WindowOuts, NumWindows);
+        for wIdx := 0 to NumWindows - 1 do
+        begin
+          WinSlice := NN.AddLayerAfter(
+            TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
+          QProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+          KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
+          VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(Dim), WinSlice);
+          SetLength(HeadOuts, Heads);
+          SetLength(Channels, HeadDim);
+          for h := 0 to Heads - 1 do
+          begin
+            for ci := 0 to HeadDim - 1 do Channels[ci] := h * HeadDim + ci;
+            QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), QProj);
+            KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), KProj);
+            VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), VProj);
+            QKV := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+            HeadAttn := NN.AddLayer( TNNetWindowAttention.Create(HeadDim, ws2) );
+            SetLength(WinAttnLayers, Length(WinAttnLayers) + 1);
+            WinAttnLayers[High(WinAttnLayers)] := HeadAttn;
+            HeadOuts[h] := HeadAttn;
+          end;
+          AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
+          OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+          WindowOuts[wIdx] := OProj;
+          // clap key spelling: attention.self.{query,key,value} +
+          // attention.output.dense
+          LoadLlamaLinearWeights(Reader, QProj, BPrefix + 'attention.self.query.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.self.query.bias');
+          LoadLlamaLinearWeights(Reader, KProj, BPrefix + 'attention.self.key.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.self.key.bias');
+          LoadLlamaLinearWeights(Reader, VProj, BPrefix + 'attention.self.value.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.self.value.bias');
+          LoadLlamaLinearWeights(Reader, OProj, BPrefix + 'attention.output.dense.weight',
+            Dim, Dim, 0, -1, 0, BPrefix + 'attention.output.dense.bias');
+        end;
+        AllWindowConcat := NN.AddLayer(
+          TNNetConcat.Create(NumWindows * ws2, 1, Dim, WindowOuts) );
+        ReorderBack := NN.AddLayer( TNNetGatherTokens.Create(InvPerm) );
+        AttnResidual := NN.AddLayer( TNNetSum.Create([ReorderBack, ShortcutA]) );
+
+        NormAfter := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps) );
+        MlpHidden := Reader.DimSize(BPrefix + 'intermediate.dense.weight', 0);
+        Fc1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(MlpHidden) );
+        NN.AddLayer( TNNetGELUErf.Create() );  // audio hidden_act 'gelu' = exact erf
+        Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Dim) );
+        NN.AddLayer( TNNetSum.Create([Fc2, AttnResidual]) );
+        StageIn := NN.GetLastLayer();
+
+        // relative_position_bias_table (clap key under attention.self)
+        BiasTable := TNNetVolume.Create;
+        try
+          Reader.LoadTensorFlat(BPrefix +
+            'attention.self.relative_position_bias_table', BiasTable);
+          for wIdx := 0 to NumWindows - 1 do
+            for h := 0 to Heads - 1 do
+            begin
+              ci := Length(WinAttnLayers) - NumWindows * Heads + wIdx * Heads + h;
+              SwinSetWindowBias(WinAttnLayers[ci], BiasTable,
+                RelPosIndex, RegionId, h, Heads, EffWindow, wIdx);
+            end;
+        finally
+          BiasTable.Free;
+        end;
+        LoadLayerNormWeights(Reader, NormBefore,
+          BPrefix + 'layernorm_before.weight', BPrefix + 'layernorm_before.bias', Dim);
+        LoadLayerNormWeights(Reader, NormAfter,
+          BPrefix + 'layernorm_after.weight', BPrefix + 'layernorm_after.bias', Dim);
+        LoadLlamaLinearWeights(Reader, Fc1, BPrefix + 'intermediate.dense.weight',
+          Dim, MlpHidden, 0, -1, 0, BPrefix + 'intermediate.dense.bias');
+        LoadLlamaLinearWeights(Reader, Fc2, BPrefix + 'output.dense.weight',
+          MlpHidden, Dim, 0, -1, 0, BPrefix + 'output.dense.bias');
+      end;
+
+      // ---- patch merging (between stages) ----
+      if StageIdx < NumStages - 1 then
+      begin
+        half := Grid div 2;
+        SetLength(MergePerm, Grid * Grid);
+        ci := 0;
+        for ny := 0 to half - 1 do
+          for nx := 0 to half - 1 do
+          begin
+            gy := 2 * ny;     gx := 2 * nx;     MergePerm[ci] := gy * Grid + gx; Inc(ci);
+            gy := 2 * ny + 1; gx := 2 * nx;     MergePerm[ci] := gy * Grid + gx; Inc(ci);
+            gy := 2 * ny;     gx := 2 * nx + 1; MergePerm[ci] := gy * Grid + gx; Inc(ci);
+            gy := 2 * ny + 1; gx := 2 * nx + 1; MergePerm[ci] := gy * Grid + gx; Inc(ci);
+          end;
+        NN.AddLayer( TNNetGatherTokens.Create(MergePerm) );
+        NN.AddLayer( TNNetReshape.Create(half * half, 1, 4 * Dim) );
+        MergeNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps) );
+        MergeReduce := NN.AddLayer( TNNetPointwiseConvLinear.Create(2 * Dim) );
+        LoadLayerNormWeights(Reader, MergeNorm,
+          Prefix + 'downsample.norm.weight', Prefix + 'downsample.norm.bias', 4 * Dim);
+        LoadLlamaLinearWeights(Reader, MergeReduce,
+          Prefix + 'downsample.reduction.weight', 4 * Dim, 2 * Dim);
+        StageIn := MergeReduce;
+        Grid := half;
+        Dim := 2 * Dim;
+      end;
+    end;
+
+    // ---- head: final LN -> token mean-pool -> 2-layer projection ----
+    FinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Audio.LayerNormEps) );
+    GridMap := NN.AddLayer( TNNetReshape.Create(Grid, Grid, Dim) );
+    Pooled := NN.AddLayer( TNNetAvgChannel.Create() );
+    // AvgChannel returns (1,1,Dim); ClapProjectionLayer is linear1 -> ReLU
+    // -> linear2 (both biased). PointwiseConvLinear over the single token.
+    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+    if Config.ProjectionActRelu then NN.AddLayer( TNNetReLU.Create() )
+    else NN.AddLayer( TNNetGELU.Create() );
+    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+
+    LoadLayerNormWeights(Reader, FinalNorm,
+      EncPrefix + 'norm.weight', EncPrefix + 'norm.bias', Dim);
+    LoadClipPatchConv(Reader, PatchConv,
+      EncPrefix + 'patch_embed.proj.weight', 1,
+      Config.Audio.PatchSize, Config.Audio.EmbedDim);
+    LoadSwinPatchConvBias(Reader, PatchConv,
+      EncPrefix + 'patch_embed.proj.bias', Config.Audio.EmbedDim);
+    LoadLayerNormWeights(Reader, EmbNorm,
+      EncPrefix + 'patch_embed.norm.weight', EncPrefix + 'patch_embed.norm.bias',
+      Config.Audio.EmbedDim);
+    LoadLlamaLinearWeights(Reader, Proj1, 'audio_projection.linear1.weight',
+      Dim, Config.ProjectionDim, 0, -1, 0, 'audio_projection.linear1.bias');
+    LoadLlamaLinearWeights(Reader, Proj2, 'audio_projection.linear2.weight',
+      Config.ProjectionDim, Config.ProjectionDim, 0, -1, 0,
+      'audio_projection.linear2.bias');
+
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    if (GridMap = nil) or (Pooled = nil) then ; // silence unused
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+// Builds the RoBERTa text tower (inline, exactly the BuildBertFromSafeTensors
+// post-LN bidirectional shape) + the BERT-style pooler + 2-layer projection.
+function BuildClapTextTower(Reader: TNNetSafeTensorsReader;
+  const Config: TClapConfig; TextSeqLen: integer; pInferenceOnly: boolean): TNNet;
+var
+  NN: TNNet;
+  InputLayer, WordEmb, PosEmb, TypeEmb, EmbLN, SliceLayer: TNNetLayer;
+  BranchInput, QKV, AttnDense, AttnLN, Inter, OutDense, OutLN: TNNetLayer;
+  Pooler, ClsSlice, Proj1, Proj2: TNNetLayer;
+  PositionOffset, UsablePositions, SeqLen, BlockCnt: integer;
+  H, BPrefix: string;
+  HSz: integer;
+
+  procedure LoadEmbTable(Layer: TNNetLayer; const TName: string;
+    Rows, Cols, SrcRowOffset: integer);
+  var Tmp: TNNetVolume; ElementCnt, UsedSize: integer;
+  begin
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(TName, Tmp);
+      UsedSize := (Rows - SrcRowOffset) * Cols;
+      if SrcRowOffset = 0 then Layer.Neurons[0].Weights.Copy(Tmp)
+      else
+        for ElementCnt := 0 to UsedSize - 1 do
+          Layer.Neurons[0].Weights.FData[ElementCnt] :=
+            Tmp.FData[SrcRowOffset * Cols + ElementCnt];
+      Layer.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+  end;
+
+begin
+  HSz := Config.Text.HiddenSize;
+  // RoBERTa burns the first pad_token_id+1 position rows on padding positions.
+  PositionOffset := Config.Text.PadTokenId + 1;
+  UsablePositions := Config.Text.MaxPositions - PositionOffset;
+  if TextSeqLen <= 0 then SeqLen := UsablePositions else SeqLen := TextSeqLen;
+  if SeqLen > UsablePositions then
+    ImportError('CLAP import: requested TextSeqLen=' + IntToStr(SeqLen) +
+      ' exceeds the usable context ' + IntToStr(UsablePositions) + '.');
+  NN := TNNet.Create();
+  try
+    InputLayer := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 2) );
+    NN.AddLayerAfter( TNNetSplitChannels.Create([0]), InputLayer );
+    WordEmb := NN.AddLayer( TNNetEmbedding.Create(Config.Text.VocabSize, HSz, 1) );
+    PosEmb := NN.AddLayer( TNNetLearnedPositionalEmbedding.Create(UsablePositions) );
+    TypeEmb := nil;
+    if Config.Text.TypeVocabSize > 0 then
+    begin
+      SliceLayer := NN.AddLayerAfter( TNNetSplitChannels.Create([1]), InputLayer);
+      TypeEmb := NN.AddLayerAfter(
+        TNNetEmbedding.Create(Config.Text.TypeVocabSize, HSz, 1), SliceLayer);
+      NN.AddLayer( TNNetSum.Create([PosEmb, TypeEmb]) );
+    end;
+    EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+    begin
+      BranchInput := NN.GetLastLayer();
+      QKV := NN.AddLayer( TNNetPointwiseConvLinear.Create(3 * HSz) );
+      AttnDense := NN.AddMultiHeadSelfAttention(Config.Text.NumHeads,
+        {CausalMask=}false, {UseRoPE=}false, avSDPA, {NumSinks=}1, {Window=}0,
+        {RelPosNumBuckets=}32, {RelPosMaxDistance=}128, {QKRMSNorm=}false,
+        {SegmentSource=}nil);
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+      AttnLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      BranchInput := NN.GetLastLayer();
+      Inter := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize) );
+      NN.AddLayer( TNNetGELUErf.Create() );  // text hidden_act 'gelu' = exact erf
+      OutDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz) );
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+      OutLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      BPrefix := 'text_model.encoder.layer.' + IntToStr(BlockCnt) + '.';
+      // pack q|k|v into the single 3*HSz QKV projection (depth-concatenated).
+      LoadLlamaLinearWeights(Reader, QKV, BPrefix + 'attention.self.query.weight',
+        HSz, HSz, 0, 3 * HSz, 0, BPrefix + 'attention.self.query.bias');
+      LoadLlamaLinearWeights(Reader, QKV, BPrefix + 'attention.self.key.weight',
+        HSz, HSz, HSz, 3 * HSz, 0, BPrefix + 'attention.self.key.bias');
+      LoadLlamaLinearWeights(Reader, QKV, BPrefix + 'attention.self.value.weight',
+        HSz, HSz, 2 * HSz, 3 * HSz, 0, BPrefix + 'attention.self.value.bias');
+      LoadLlamaLinearWeights(Reader, AttnDense,
+        BPrefix + 'attention.output.dense.weight', HSz, HSz, 0, -1, 0,
+        BPrefix + 'attention.output.dense.bias');
+      LoadLayerNormWeights(Reader, AttnLN,
+        BPrefix + 'attention.output.LayerNorm.weight',
+        BPrefix + 'attention.output.LayerNorm.bias', HSz);
+      LoadLlamaLinearWeights(Reader, Inter, BPrefix + 'intermediate.dense.weight',
+        HSz, Config.Text.IntermediateSize, 0, -1, 0,
+        BPrefix + 'intermediate.dense.bias');
+      LoadLlamaLinearWeights(Reader, OutDense, BPrefix + 'output.dense.weight',
+        Config.Text.IntermediateSize, HSz, 0, -1, 0, BPrefix + 'output.dense.bias');
+      LoadLayerNormWeights(Reader, OutLN, BPrefix + 'output.LayerNorm.weight',
+        BPrefix + 'output.LayerNorm.bias', HSz);
+    end;
+    // pooler (dense + tanh on token 0) then the 2-layer projection. Crop
+    // token 0 first so everything downstream is a single (1,1,*) token.
+    ClsSlice := NN.AddLayer( TNNetCrop.Create(0, 0, 1, 1) );
+    Pooler := NN.AddLayer( TNNetPointwiseConvLinear.Create(HSz) );
+    NN.AddLayer( TNNetHyperbolicTangent.Create() );
+    Proj1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+    if Config.ProjectionActRelu then NN.AddLayer( TNNetReLU.Create() )
+    else NN.AddLayer( TNNetGELU.Create() );
+    Proj2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    if ClsSlice = nil then ; // silence unused
+
+    // ---- weights ----
+    LoadEmbTable(WordEmb, 'text_model.embeddings.word_embeddings.weight',
+      Config.Text.VocabSize, HSz, 0);
+    LoadEmbTable(PosEmb, 'text_model.embeddings.position_embeddings.weight',
+      Config.Text.MaxPositions, HSz, PositionOffset);
+    if Config.Text.TypeVocabSize > 0 then
+      LoadEmbTable(TypeEmb, 'text_model.embeddings.token_type_embeddings.weight',
+        Config.Text.TypeVocabSize, HSz, 0);
+    LoadLayerNormWeights(Reader, EmbLN, 'text_model.embeddings.LayerNorm.weight',
+      'text_model.embeddings.LayerNorm.bias', HSz);
+    LoadLlamaLinearWeights(Reader, Pooler, 'text_model.pooler.dense.weight',
+      HSz, HSz, 0, -1, 0, 'text_model.pooler.dense.bias');
+    LoadLlamaLinearWeights(Reader, Proj1, 'text_projection.linear1.weight',
+      HSz, Config.ProjectionDim, 0, -1, 0, 'text_projection.linear1.bias');
+    LoadLlamaLinearWeights(Reader, Proj2, 'text_projection.linear2.weight',
+      Config.ProjectionDim, Config.ProjectionDim, 0, -1, 0,
+      'text_projection.linear2.bias');
+    if H = '' then ; // silence unused
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+procedure BuildClapFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TClapConfig; out AudioNet, TextNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  Tmp: TNNetVolume;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  AudioNet := nil;
+  TextNet := nil;
+  Tmp := TNNetVolume.Create;
+  try
+    if Reader.HasTensor('logit_scale_a') then
+    begin
+      Reader.LoadTensorFlat('logit_scale_a', Tmp);
+      if Tmp.Size >= 1 then Config.LogitScaleA := Tmp.FData[0];
+    end;
+    if Reader.HasTensor('logit_scale_t') then
+    begin
+      Reader.LoadTensorFlat('logit_scale_t', Tmp);
+      if Tmp.Size >= 1 then Config.LogitScaleT := Tmp.FData[0];
+    end;
+    AudioNet := BuildClapAudioTower(Reader, Config, pInferenceOnly);
+    TextNet := BuildClapTextTower(Reader, Config, TextSeqLen, pInferenceOnly);
+  except
+    AudioNet.Free;
+    TextNet.Free;
+    Tmp.Free;
+    Reader.Free;
+    raise;
+  end;
+  Tmp.Free;
+  Reader.Free;
+end;
+
+procedure BuildClapFromSafeTensors(const FileName: string;
+  out AudioNet, TextNet: TNNet; out Config: TClapConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadClapConfigFromJSONFile(ConfigPath);
+  BuildClapFromSafeTensorsWithConfig(FileName, Config, AudioNet, TextNet,
+    TextSeqLen, pInferenceOnly);
+end;
+
+procedure ClapBatchNormMelImage(Reader: TNNetSafeTensorsReader;
+  RawMel: TNNetVolume; Image: TNNetVolume; const Config: TClapAudioConfig);
+var
+  Gamma, Beta, Mean, Var_: TNNetVolume;
+  t, f, Time, Mel: integer;
+  Eps, Normed: TNeuralFloat;
+  EncPrefix: string;
+begin
+  Mel := Config.NumMelBins;
+  Time := RawMel.SizeX;
+  if RawMel.Depth <> Mel then
+    ImportError('ClapBatchNormMelImage: RawMel depth (' +
+      IntToStr(RawMel.Depth) + ') must equal num_mel_bins (' +
+      IntToStr(Mel) + ').');
+  EncPrefix := 'audio_model.audio_encoder.batch_norm.';
+  Eps := 1e-5;  // nn.BatchNorm2d default
+  Gamma := TNNetVolume.Create; Beta := TNNetVolume.Create;
+  Mean := TNNetVolume.Create; Var_ := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(EncPrefix + 'weight', Gamma);
+    Reader.LoadTensorFlat(EncPrefix + 'bias', Beta);
+    Reader.LoadTensorFlat(EncPrefix + 'running_mean', Mean);
+    Reader.LoadTensorFlat(EncPrefix + 'running_var', Var_);
+    // Image is (time, mel, 1): X = time frame, Y = mel/freq bin, depth 1.
+    // HF flattens the conv output row-major over (H=freq, W=time) - freq
+    // OUTER - so the (time,1,depth) token sequence after the patch reshape
+    // matches HF only when freq is the Y (outer) axis. The freq<->time
+    // transpose of the freq_ratio = 1 reshape_mel2img is therefore already
+    // expressed by putting freq on Y and time on X.
+    Image.ReSize(Time, Mel, 1);
+    for t := 0 to Time - 1 do
+      for f := 0 to Mel - 1 do
+      begin
+        Normed := (RawMel.FData[t * Mel + f] - Mean.FData[f]) /
+          Sqrt(Var_.FData[f] + Eps);
+        Normed := Normed * Gamma.FData[f] + Beta.FData[f];
+        Image[t, f, 0] := Normed;
+      end;
+  finally
+    Gamma.Free; Beta.Free; Mean.Free; Var_.Free;
+  end;
+end;
+
+procedure ClapSimilarityMatrix(const AudioEmbs, TextEmbs: array of TNNetVolume;
+  LogitScaleA: TNeuralFloat; Matrix: TNNetVolume);
+var
+  i, j, Rows, Cols: integer;
+  Scale: TNeuralFloat;
+begin
+  Rows := Length(AudioEmbs);
+  Cols := Length(TextEmbs);
+  Scale := Exp(LogitScaleA);
+  Matrix.ReSize(Cols, Rows, 1);
+  for i := 0 to Rows - 1 do
+    for j := 0 to Cols - 1 do
+      Matrix[j, i, 0] := Scale * ClipSimilarity(AudioEmbs[i], TextEmbs[j]);
 end;
 
 // ===========================================================================

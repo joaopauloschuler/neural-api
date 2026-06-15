@@ -747,17 +747,35 @@ rather than acted on.
       readout). New pieces: the monotonic length-regulator expansion and the text
       encoder's relative-position attention. Parity-check the flow + decoder on a pico
       fixture, then synthesize a sentence to a WAV and report it in the README.
-- [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]`,
-      e.g. `laion/clap-htsat-unfused`) + an examples/ZeroShotAudioTag demo — the
-      audio-domain analogue of the landed CLIP dual-encoder (zero-shot audio
-      classification and audio<->text retrieval), but genuinely NOT a near-duplicate:
-      the image tower is replaced by an HTS-AT spectrogram transformer (Swin-style
-      hierarchical attention over the log-mel frontend already in neuralaudio.pas) and
-      the text tower is a RoBERTa/GPT-2 encoder, projected into a shared embedding
-      with an L2-normalize + logit-scale head exactly like CLIP. Reuses the existing
-      Swin attention blocks and the L2Normalize / logit-scale folding from the CLIP
-      path. Demo: embed a handful of UrbanSound/ESC-50-style clips and a set of text
-      prompts, print the cosine-similarity matrix and top-1 zero-shot label.
+- [X] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
+      `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
+      + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP
+      dual-encoder (two nets, shared L2-normalized space, `exp(logit_scale_a)*cosine`),
+      but genuinely distinct: the audio tower is an HTS-AT Swin transformer over a
+      log-mel spectrogram (PURE REUSE of the landed Swin window machinery —
+      `TNNetWindowAttention`/`TNNetGatherTokens`/`SwinBuildWindowLayout`/
+      `SwinSetWindowBias`/patch-merge — under the `clap_audio_model` key spelling, plus
+      a Conv2d patch-embed + token mean-pool + 2-layer `ClapProjectionLayer`), and the
+      text tower is RoBERTa (built inline like `BuildBertFromSafeTensors` + BERT pooler
+      + 2-layer projection). The HF `BatchNorm2d`(mel) + `reshape_mel2img` freq<->time
+      transpose are folded into `ClapBatchNormMelImage` (caller supplies the
+      `(time,mel,1)` image). NO new leaf layers. Reuses `ClipExtractEmbedding`/
+      `ClipSimilarity` + new `ClapSimilarityMatrix`. Pico parity `< 1e-4` on BOTH
+      embeddings vs the float64 HF `ClapModel` oracle (`TestClapParity`, generator
+      `tools/clap_tiny_fixture.py`, committed `tests/fixtures/tiny_clap.*`).
+      Follow-ups:
+  - [ ] freq_ratio > 1 (the real laion 1024-frame/64-mel `freq_ratio = 4` layout):
+        the `reshape_mel2img` mel-crop reorganization + the final group-2D-CNN reshape
+        before the avgpool are currently identity-only and loudly REJECTED. Add the
+        general mel2img + group-CNN glue (a reshape/permute composition or a minimal
+        helper) and a freq_ratio=4 pico fixture.
+  - [ ] "fused" CLAP (`enable_fusion = true`, clap-htsat-FUSED): the local/global
+        mel-fusion patch-embed (`mel_conv2d` + the attention-feature-fusion block) is
+        rejected. Distinct windowing — own importer branch + fixture.
+  - [ ] Real laion checkpoint parity + the log-mel frontend wiring: `ClapFeatureExtractor`
+        produces the 1024x64 mel (depends on freq_ratio=4); wire `neuralaudio.pas`
+        log-mel -> `ClapBatchNormMelImage` end-to-end and verify against a downloaded
+        `clap-htsat-unfused`. (The RoBERTa BPE tokenizer is already importable.)
 - [ ] AudioLDM 2 / Stable Audio latent text-to-audio (music & sound) capstone —
       text-prompt -> audio via LATENT diffusion, the audio analogue of the landed
       LatentTextToImage (PixArt/DiT + VAE) pipeline and the natural home for the

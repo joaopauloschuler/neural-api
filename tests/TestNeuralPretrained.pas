@@ -280,6 +280,7 @@ type
     procedure TestMusicGenDelayPattern;
     procedure TestClipConfigFromJSONFile;
     procedure TestClipParity;
+    procedure TestClapParity;
     procedure TestClipScore;
     procedure TestClipVisionFeatures;
     procedure TestClipImagePreprocess;
@@ -12412,6 +12413,149 @@ begin
     RefJson.Free;
     VisionNet.Free;
     TextNet.Free;
+  end;
+end;
+
+// CLAP (laion/clap-htsat-unfused architecture) dual-encoder parity on the
+// tiny_clap pico fixture (freq_ratio = 1). Builds the HTS-AT Swin audio
+// tower + the RoBERTa text tower, feeds the pinned batch-normed mel image
+// and token sequences, and asserts max|diff| < 1e-4 on BOTH L2-normalized
+// shared-space embeddings vs the HF float64 oracle. Also exercises
+// ClapBatchNormMelImage (raw mel -> the net's input image) and the
+// exp(logit_scale_a)*cosine = logits_per_audio scoring path.
+procedure TTestNeuralPretrained.TestClapParity;
+var
+  AudioNet, TextNet: TNNet;
+  Config: TClapConfig;
+  Reader: TNNetSafeTensorsReader;
+  RefRoot: TJSONData;
+  MelArr, AudImgArr, TextSeqs, AudioEmbeds, TextEmbeds, LogitsPerAudio: TJSONArray;
+  RowArr, SeqArr: TJSONArray;
+  RawMel, AudioImage, AudioEmb, TextEmb, TextInput: TNNetVolume;
+  RefJson: TStringList;
+  Mel, Time, SeqLen, f, t, SeqCnt, PosCnt, ChanCnt: integer;
+  Diff, MaxAudioDiff, MaxTextDiff, MaxLogitDiff, Logit: double;
+  RefScaleA: double;
+begin
+  RandSeed := 424242;
+  BuildClapFromSafeTensors(FixturePath('tiny_clap.safetensors'),
+    AudioNet, TextNet, Config, {TextSeqLen=}8, {pInferenceOnly=}false,
+    FixturePath('tiny_clap_config.json'));
+  Reader := CreatePretrainedTensorReader(FixturePath('tiny_clap.safetensors'));
+  RefJson := TStringList.Create;
+  RawMel := TNNetVolume.Create;
+  AudioImage := TNNetVolume.Create;
+  AudioEmb := TNNetVolume.Create;
+  TextEmb := TNNetVolume.Create;
+  TextInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('audio net built', AudioNet <> nil);
+    AssertTrue('text net built', TextNet <> nil);
+    Mel := Config.Audio.NumMelBins;
+    Time := Config.Audio.SpecSize;       // freq_ratio = 1 -> spec_size frames
+    SeqLen := 8;
+    AssertEquals('audio input X = time frames', Time, AudioNet.Layers[0].Output.SizeX);
+    AssertEquals('audio output depth = projection_dim', Config.ProjectionDim,
+      AudioNet.GetLastLayer().Output.Depth);
+    AssertEquals('audio output is a single pooled token', 1,
+      AudioNet.GetLastLayer().Output.SizeX);
+    AssertEquals('text output depth = projection_dim', Config.ProjectionDim,
+      TextNet.GetLastLayer().Output.Depth);
+    AssertEquals('text output is a single pooled token', 1,
+      TextNet.GetLastLayer().Output.SizeX);
+
+    RefJson.LoadFromFile(FixturePath('tiny_clap_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    MelArr := TJSONArray(TJSONObject(RefRoot).Find('mel'));
+    AudImgArr := TJSONArray(TJSONObject(RefRoot).Find('audio_image'));
+    TextSeqs := TJSONArray(TJSONObject(RefRoot).Find('text_sequences'));
+    AudioEmbeds := TJSONArray(TJSONObject(RefRoot).Find('audio_embeds'));
+    TextEmbeds := TJSONArray(TJSONObject(RefRoot).Find('text_embeds'));
+    LogitsPerAudio := TJSONArray(TJSONObject(RefRoot).Find('logits_per_audio'));
+    RefScaleA := TJSONObject(RefRoot).Get('logit_scale_a', 0.0);
+    AssertTrue('logit_scale_a loaded from checkpoint',
+      Abs(Config.LogitScaleA - RefScaleA) < 1e-6);
+
+    // ClapBatchNormMelImage(raw mel) must reproduce the fixture's
+    // audio_image. RawMel is (time,1,mel): FData[(t)*Mel + f] = mel[t][f].
+    RawMel.ReSize(Time, 1, Mel);
+    for t := 0 to Time - 1 do
+    begin
+      RowArr := TJSONArray(MelArr.Items[t]);
+      for f := 0 to Mel - 1 do
+        RawMel.FData[t * Mel + f] := RowArr.Items[f].AsFloat;
+    end;
+    ClapBatchNormMelImage(Reader, RawMel, AudioImage, Config.Audio);
+    // audio_image[f][t] vs the net image (time=X, mel=Y): FData[f*Time + t].
+    MaxAudioDiff := 0;
+    for f := 0 to Mel - 1 do
+    begin
+      RowArr := TJSONArray(AudImgArr.Items[f]);
+      for t := 0 to Time - 1 do
+      begin
+        Diff := Abs(AudioImage.FData[f * Time + t] - RowArr.Items[t].AsFloat);
+        if Diff > MaxAudioDiff then MaxAudioDiff := Diff;
+      end;
+    end;
+    AssertTrue('ClapBatchNormMelImage: max |diff| = ' +
+      FloatToStr(MaxAudioDiff) + ' must be < 1e-5', MaxAudioDiff < 1e-5);
+
+    // ---- AUDIO tower parity ----
+    AudioNet.Compute(AudioImage);
+    ClipExtractEmbedding(AudioNet.GetLastLayer().Output, 0, AudioEmb);
+    MaxAudioDiff := 0;
+    RowArr := TJSONArray(AudioEmbeds.Items[0]);
+    AssertEquals('audio embed width', Config.ProjectionDim, RowArr.Count);
+    for ChanCnt := 0 to Config.ProjectionDim - 1 do
+    begin
+      Diff := Abs(AudioEmb.FData[ChanCnt] - RowArr.Items[ChanCnt].AsFloat);
+      if Diff > MaxAudioDiff then MaxAudioDiff := Diff;
+    end;
+    AssertTrue('audio embeds: max |diff| = ' + FloatToStr(MaxAudioDiff) +
+      ' must be < 1e-4', MaxAudioDiff < 1e-4);
+
+    // ---- TEXT tower parity + scoring path ----
+    MaxTextDiff := 0;
+    MaxLogitDiff := 0;
+    TextInput.ReSize(SeqLen, 1, 2);    // [token id | token-type id], type 0
+    for SeqCnt := 0 to TextSeqs.Count - 1 do
+    begin
+      SeqArr := TJSONArray(TextSeqs.Items[SeqCnt]);
+      AssertEquals('text sequence length', SeqLen, SeqArr.Count);
+      for PosCnt := 0 to SeqLen - 1 do
+      begin
+        TextInput.FData[PosCnt * 2] := SeqArr.Items[PosCnt].AsInteger;
+        TextInput.FData[PosCnt * 2 + 1] := 0;
+      end;
+      TextNet.Compute(TextInput);
+      ClipExtractEmbedding(TextNet.GetLastLayer().Output, 0, TextEmb);
+      RowArr := TJSONArray(TextEmbeds.Items[SeqCnt]);
+      for ChanCnt := 0 to Config.ProjectionDim - 1 do
+      begin
+        Diff := Abs(TextEmb.FData[ChanCnt] - RowArr.Items[ChanCnt].AsFloat);
+        if Diff > MaxTextDiff then MaxTextDiff := Diff;
+      end;
+      Logit := Exp(Config.LogitScaleA) * ClipSimilarity(AudioEmb, TextEmb);
+      Diff := Abs(Logit -
+        TJSONArray(LogitsPerAudio.Items[0]).Items[SeqCnt].AsFloat);
+      if Diff > MaxLogitDiff then MaxLogitDiff := Diff;
+    end;
+    AssertTrue('text embeds: max |diff| = ' + FloatToStr(MaxTextDiff) +
+      ' must be < 1e-4', MaxTextDiff < 1e-4);
+    AssertTrue('logits_per_audio: max |diff| = ' + FloatToStr(MaxLogitDiff) +
+      ' must be < 1e-4', MaxLogitDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    TextInput.Free;
+    TextEmb.Free;
+    AudioEmb.Free;
+    AudioImage.Free;
+    RawMel.Free;
+    RefJson.Free;
+    Reader.Free;
+    TextNet.Free;
+    AudioNet.Free;
   end;
 end;
 
