@@ -754,6 +754,36 @@ rather than acted on.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
+- [ ] Kokoro / StyleTTS2 text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]` +
+      `BuildKokoroFromSafeTensorsWithConfig`, `TKokoroConfig`/`ReadKokoroConfigFromJSONFile`,
+      a channel-major `TNNetKokoro` holder like the landed `TNNetVits`/`TNNetHiFiGAN`)
+      + an examples/KokoroTTS smoke that writes a WAV via `SaveVolumeToWav16`. Kokoro
+      (`hexgrad/Kokoro-82M`, Apache-2.0, ~82M params) is the current best-in-class
+      *lightweight* open TTS model and a natural CPU-native fit, but is genuinely
+      DISTINCT from the landed VITS path so it is not a near-duplicate of an existing
+      importer: it is a **StyleTTS2** architecture, not VITS. Three new pieces to wire:
+      (1) a **style-vector-conditioned** generator — the 256-d voice/style embedding
+      (the per-voice `voices/*.pt` reference tensors, indexed by token length) is
+      AdaIN/affine-injected into the duration predictor, the F0/energy predictors and
+      the decoder, so the conditioning math is the new part vs VITS's WaveNet `cond`
+      convs; (2) an **iSTFTNet-style decoder** — the generator predicts magnitude +
+      phase and runs an INVERSE STFT to waveform rather than HiFi-GAN's pure transposed-
+      conv upsampling, so it needs an `ISTFT(mag, phase)` overlap-add primitive in
+      `neuralaudio.pas` (the inverse of the existing `WhisperLogMelFromWavFile` /
+      forward-STFT machinery — a genuinely missing DSP building block, also reusable by
+      future vocoders); (3) a **prosody/duration stack** driving a length-regulator
+      expansion analogous to the VITS deterministic duration path but conditioned on the
+      style vector. Reuse where possible: the length-regulator / monotonic-expansion math
+      and `SaveVolumeToWav16` from the VITS path, and the conv/LSTM primitives already in
+      the library. SCOPE v1: single forward graph text(phonemes)->waveform with the
+      reference style vector as an EXPLICIT input (deterministic, no sampling) so a
+      parity test `TestKokoroSynthesisParity` can gate `< 1e-4` vs the HF/`kokoro`
+      float64 oracle on a pico fixture (`tools/make_pico_kokoro_fixture.py` ->
+      `tests/fixtures/tiny_kokoro*`, re-randomized O(1)-scale weights per the ModernBERT
+      fixture lesson). The grapheme->phoneme (misaki/espeak) front-end is OUT OF SCOPE —
+      feed pre-phonemized input and reject `language`/g2p config loudly, exactly as the
+      VITS uroman/phonemizer front-ends are deferred. Unlocks the missing inverse-STFT
+      vocoding rung shared with any spectral-domain generator.
 - [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
       `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
       + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP
