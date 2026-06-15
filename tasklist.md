@@ -381,13 +381,6 @@ rather than acted on.
       offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
       examples can opt into perceptual fine-tuning (the VGG build already enables
       input/error collection, so the gradient path exists).
-- [ ] DETR object-detection importer follow-up (BuildDetrFromSafeTensors/...Ex,
-      facebook/detr-resnet-50, LANDED — TestDetrObjectDetectionParity in
-      tests/TestNeuralPretrained.pas, tiny_detr.safetensors fixture; ResNet-50 backbone +
-      transformer enc-dec + learned object queries + 2-D sinusoidal pos embedding +
-      sigmoid-cxcywh box/class heads, inference-only, no Hungarian matcher):
-  - [X] examples/ObjectDetection demo that draws boxes on one CPU image (the importer +
-        parity test exist; no example yet).
 - [ ] YOLO single-shot object-detection importer (ultralytics YOLOv8n safetensors)
       — a detection family STRUCTURALLY DISTINCT from the landed DETR importer
       (anchor-free fully-convolutional one-stage detector, no transformer): the
@@ -421,33 +414,6 @@ rather than acted on.
       rectangular-mask generator and the masked-region-weighted loss; the network is
       stock conv encoder-decoder + skip connections. CPU-friendly on CIFAR-10 /
       Tiny ImageNet; writes before/after triplets. Edit examples/README.md.
-- [X] VideoMAE / TimeSformer spatiotemporal-transformer importer
-      (LANDED: BuildVideoMAEFromSafeTensors[Ex/WithConfig] +
-      ReadVideoMAEConfigFromJSONFile + RunVideoMAELogits in neuralpretrained.pas;
-      tubelet 3-D conv (TNNetConvolution3D, non-overlapping temporal stride via
-      SplitChannels+DeepConcat) + fixed sin-cos 3-D position table + stock CLIP
-      pre-LN encoder (joint space-time attention) + mean-pool/fc_norm/classifier
-      head; use_mean_pooling=True finetuned head only. Pico float64 parity
-      TestVideoMAEClassificationParity (max|diff| < 1e-4) + tools/
-      make_pico_videomae_fixture.py + examples/VideoAction. Open follow-ups:
-      use_mean_pooling=False CLS-token head; DIVIDED space-time attention
-      (TimeSformer); the masked-pretraining VideoMAEModel/decoder path.)
-- [X] PixArt-alpha text-to-image importer (BuildPixArtFromSafeTensors, e.g.
-      PixArt-alpha/PixArt-XL-2-512x512) — the TEXT-conditioned DiT variant that the
-      landed class-conditional DiT importer (BuildDiTFromSafeTensors) explicitly
-      defers (see the neuralpretrained.pas DiT header note). The ONLY structurally
-      new pieces vs the landed DiT are: (a) the conditioning source — drop the
-      y_embedder class table and instead feed T5 encoder states (reuse the landed
-      BuildT5FromSafeTensors encoder as the prompt tower) into each block; (b) a
-      CROSS-attention sublayer per DiTBlock between the (already landed)
-      self-attention and the FFN, attending image tokens -> T5 tokens (reuse
-      TNNetCrossAttention); (c) PixArt's SHARED adaLN-single (one global
-      timestep-modulation table broadcast to all blocks, instead of per-block
-      adaLN-Zero). Everything else — patch embed, sin-cos pos embed, the
-      DDPM/DDIM/DPM-Solver++ sampler, the VAE decoder — is already landed, so this
-      is the cheapest path to a REAL text-to-image checkpoint and directly unblocks
-      the tracked LatentTextToImage example WITHOUT needing the SD UNet. Pico parity
-      vs a diffusers float64 oracle on one denoise step + reuse make_pico_*_fixture.
 - [ ] ControlNet spatial-conditioning importer (BuildControlNetFromSafeTensors, e.g.
       lllyasviel/sd-controlnet-canny) — adds spatial control (edge / depth / pose
       map -> image) to latent diffusion: a trainable COPY of the SD UNet encoder +
@@ -460,18 +426,6 @@ rather than acted on.
       diffusers float64 oracle on the down/mid residual tensors for a fixed control
       image; an examples/ControlNetCanny that conditions generation on a hand-drawn
       edge map once the base UNet lands. First conditioning-by-feature-injection model.
-- [X] MaskGIT non-autoregressive image-generation example (examples/MaskGIT) — the
-      VQModelImport README already names MaskGIT as the intended downstream generator
-      for the landed VQ tokenizer, but no generator exists. Train a small
-      bidirectional transformer (reuse the landed encoder-block builder) over the
-      VQGAN/VqModel codebook indices to predict masked tokens, then GENERATE by
-      iterative parallel decoding: start all-[MASK], predict every token, keep the
-      most-confident fraction per step on a cosine mask schedule, remask the rest,
-      repeat ~8-12 steps. Structurally distinct from every landed generator — the
-      repo has autoregressive (TinyGPT), GAN (VisualGAN/StyleGAN2) and diffusion
-      paths but NO masked-token parallel image decoding. New code is the random
-      span-mask + confidence-based unmasking scheduler; the net and the VQ encode/
-      decode are landed. CPU-friendly on CIFAR-10 latents; writes a generated grid.
 - [ ] RandAugment / TrivialAugment automatic augmentation policy in
       neuraldatasets.pas — the repo has Mixup (landed) and CutMix (tracked) but NO
       single-image geometric/photometric augmentation policy; CV training augmentation
