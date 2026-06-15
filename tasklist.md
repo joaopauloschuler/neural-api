@@ -345,17 +345,31 @@ rather than acted on.
           not obtainable offline); the importer accepts a real checkpoint path.
       [ ] Lightweight-SR (no conv_after_body / single shared upsample) and the
           nearest+conv "real-world" SR upsampler variants not yet wired.
-- [ ] RIFE real-time video frame-interpolation importer (BuildRIFEFromSafeTensors[Ex],
+- [X] RIFE real-time video frame-interpolation importer (BuildRIFEFromSafeTensors[Ex],
       the IFNet of hzwer/Practical-RIFE) — fills the VIDEO-generative importer gap:
       synthesises an intermediate frame between two input frames (the landed RAFT
       estimates optical FLOW but does NOT synthesise frames, and
-      examples/FrameInterpolation is a from-scratch toy, not an importer). New code is
-      the coarse-to-fine IFNet (a few stride-2 conv "IFBlocks" each predicting a flow
-      residual + a soft fusion mask at increasing resolution) plus a differentiable
-      backward-warp op (TNNetBackwardWarp: bilinear-sample frame0/frame1 by the
-      predicted flow — reuse the bilinear sampler already in TNNetDeformableConv).
-      Pico parity vs a numpy float64 oracle on a tiny IFNet + examples/VideoFrameInterpolation
-      that interpolates one middle frame between two small PNGs on CPU.
+      examples/FrameInterpolation is a from-scratch toy, not an importer). Landed:
+      TNNetBackwardWarp (RIFE-convention pixel-unit bilinear border-clamp backward
+      warp, two-source layer, full fwd+bwd, numerical-gradient-checked in
+      TestNeuralNumerical + README layer list); TRIFEConfig + BuildRIFE[FromSafeTensors[Ex]]
+      + ReadRIFEConfigFromJSONFile/RIFEConfigToString in neuralpretrained.pas (IFBlock =
+      conv0->PReLU->conv1->PReLU->lastconv(5=4flow+1mask), accumulated flow residuals,
+      sigmoid soft fusion mask blend); pico parity TestRIFEParity < 1e-4 vs the
+      tools/rife_tiny_fixture.py float64 numpy oracle (tests/fixtures/tiny_rife.*);
+      examples/VideoFrameInterpolation interpolates one middle frame between two
+      synthetic frames on CPU (ulimit-bounded smoke). Scope v1 = one frame t=0.5,
+      inference-only, small full-resolution IFNet.
+      [ ] Real Practical-RIFE checkpoint parity (offline-download deferred): the real
+          IFNet is MULTI-SCALE (stride-2 IFBlocks downsample then bilinearly upsample
+          the predicted flow) and RE-FEEDS the warped frames + previous flow/mask into
+          each successive block; v1 refines from the SAME [frame0|frame1] input at full
+          resolution. Wire the scale schedule + warped-frame re-feeding and verify
+          against an exported hzwer/Practical-RIFE checkpoint.
+      [ ] Arbitrary-t interpolation (t != 0.5) and the recursive 2x->4x multi-frame
+          schedule (RIFE's timestep encoding + recursion).
+      [ ] Privileged-distillation teacher (the training-time IFNet that sees the GT
+          middle frame); inference-only path is landed.
 - [ ] GFPGAN blind face-restoration importer (BuildGFPGANFromSafeTensors[Ex],
       TencentARC/GFPGAN) — leverages the LANDED StyleGAN2 generator
       (BuildStyleGAN2GeneratorFromSafeTensors) as a fixed facial prior: a U-Net

@@ -342,6 +342,8 @@ type
     procedure TestRRDBNetParity;
     procedure TestNAFNetConfigFromJSONFile;
     procedure TestNAFNetParity;
+    procedure TestRIFEConfigFromJSONFile;
+    procedure TestRIFEParity;
     procedure TestSwinIRConfigFromJSONFile;
     procedure TestSwinIRParity;
     procedure TestCLIPSegConfigFromJSONFile;
@@ -16319,6 +16321,113 @@ begin
       end;
     end;
     AssertTrue('restored RGB: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadRIFEConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestRIFEConfigFromJSONFile;
+var
+  Config: TRIFEConfig;
+begin
+  Config := ReadRIFEConfigFromJSONFile(
+    FixturePath('tiny_rife_config.json'));
+  AssertEquals('model_type', 'rife', Config.ModelType);
+  AssertEquals('in_channel', 3, Config.InChannel);
+  AssertEquals('hidden_channels', 8, Config.HiddenChannels);
+  AssertEquals('num_blocks', 2, Config.NumBlocks);
+  AssertEquals('input_size', 8, Config.InputSize);
+end;
+
+// Parity test for the RIFE video frame-interpolation importer
+// (BuildRIFEFromSafeTensors) against the committed tiny float64 numpy oracle
+// (tools/rife_tiny_fixture.py: 2 IFBlocks, hidden 8, 3-channel 8x8 frames). No
+// official tiny checkpoint exists offline; the fixture is a config-faithful
+// random IFNet + a hand-written float64 oracle of the EXACT IFBlock +
+// backward-warp math. Exercises the new TNNetBackwardWarp (RIFE-convention
+// pixel-unit, bilinear, border-clamp warp), per-channel PReLU, the accumulated
+// flow residuals, sigmoid fusion mask, channel-broadcast blend, and the two-
+// source warp wiring. The input is the (2*in_channel, S, S) depth-concat
+// [frame0 | frame1]; the output is the (in_channel, S, S) interpolated MIDDLE
+// frame. Asserts max |diff| < 1e-4 on the full interpolated frame.
+procedure TTestNeuralPretrained.TestRIFEParity;
+var
+  NN: TNNet;
+  Config: TRIFEConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  InputArr, ChanArr, RowArr, ImgArr: TJSONArray;
+  ImgInput: TNNetVolume;
+  InPlanes, ImgSize: integer;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildRIFEFromSafeTensors(
+    FixturePath('tiny_rife.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_rife_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    InPlanes := 2 * Config.InChannel;
+    AssertEquals('input grid', Config.InputSize, NN.Layers[0].Output.SizeX);
+    AssertEquals('input depth (frame0|frame1)', InPlanes,
+      NN.Layers[0].Output.Depth);
+    RefJson.LoadFromFile(FixturePath('tiny_rife_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
+    ImgSize := TJSONObject(RefRoot).Get('image_size', 0);
+    AssertTrue('input present', InputArr <> nil);
+    // Output is the interpolated middle frame: in_channel x S x S.
+    AssertEquals('output frame grid', Config.InputSize,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output grid vs oracle', ImgSize,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.InChannel,
+      NN.GetLastLayer().Output.Depth);
+
+    // Load the (2*in_channel, H, W) input into the CAI (x,y,depth) volume.
+    ImgInput.ReSize(Config.InputSize, Config.InputSize, InPlanes);
+    for ChanCnt := 0 to InPlanes - 1 do
+    begin
+      RowArr := TJSONArray(InputArr.Items[ChanCnt]);
+      for YCnt := 0 to Config.InputSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.InputSize - 1 do
+          ImgInput.FData[
+            (YCnt * Config.InputSize + XCnt) * InPlanes + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImgInput);
+    // Compare the (in_channel,H,W) oracle vs the CAI (x,y,depth) output volume.
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.InChannel - 1 do
+    begin
+      RowArr := TJSONArray(ImgArr.Items[ChanCnt]);
+      for YCnt := 0 to ImgSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to ImgSize - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := NN.GetLastLayer().Output.FData[
+            (YCnt * ImgSize + XCnt) * Config.InChannel + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('interpolated frame: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;

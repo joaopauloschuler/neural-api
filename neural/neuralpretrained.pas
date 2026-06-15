@@ -6890,6 +6890,67 @@ function BuildNAFNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// RIFE VIDEO FRAME-INTERPOLATION IMPORT (model_type "rife") -- the repo's FIRST
+// VIDEO-generative importer: it SYNTHESISES an intermediate frame between two
+// input frames (the landed RAFT path estimates optical FLOW but does not
+// synthesise frames; examples/FrameInterpolation is a from-scratch toy, not an
+// importer). RIFE (Huang et al. 2022, "Real-Time Intermediate Flow Estimation
+// for Video Frame Interpolation", arXiv:2011.06294; hzwer/Practical-RIFE)
+// estimates a bidirectional intermediate flow with a coarse-to-fine stack of
+// IFBlocks, then BACKWARD-WARPS both frames and blends them with a learned soft
+// fusion mask. The genuinely new primitive is the differentiable backward-warp
+// TNNetBackwardWarp (RIFE convention: pixel-unit flow, bilinear, border-clamp,
+// the integer-pixel equivalent of grid_sample(padding_mode='border',
+// align_corners=True)). Everything else (3x3 conv, per-channel PReLU, sigmoid,
+// channel-broadcast multiply, residual sum) reuses landed layers.
+//
+// IFBlock(in_planes, c):
+//   conv0(3x3, in_planes->c, pad1) -> PReLU(c)
+//   conv1(3x3, c->c, pad1)         -> PReLU(c)
+//   lastconv(3x3, c->5, pad1)       # 4 flow channels + 1 fusion-mask channel
+// IFNet (v1, t=0.5): the input is the channel-concat [frame0(3) | frame1(3)]
+//   (6 channels, SAME HxW). Each IFBlock predicts a flow RESIDUAL (accumulated)
+//   and a mask logit (the LAST block's wins, like RIFE). The accumulated 4-ch
+//   flow splits into flow_t0=(dx,dy) for frame0 and flow_t1=(dx,dy) for frame1.
+//   warped0 = backward_warp(frame0, flow_t0); warped1 = backward_warp(frame1,
+//   flow_t1); m = sigmoid(mask); merged = warped0*m + warped1*(1-m). The output
+//   is the (in_channel, input_size, input_size) interpolated MIDDLE frame.
+// SCOPE (v1): one intermediate frame at t=0.5, inference-only, a small IFNet of
+// num_blocks IFBlocks at FULL resolution. Deferred (tasklist follow-ups): real
+// Practical-RIFE checkpoint parity (multi-scale stride-2 IFBlocks with warped-
+// frame re-feeding, privileged-distillation teacher), arbitrary-t and the
+// recursive 2x->4x multi-frame schedule.
+// ---------------------------------------------------------------------------
+type
+  TRIFEConfig = record
+    InChannel: integer;             // channels per frame (3 = RGB)
+    HiddenChannels: integer;        // IFBlock hidden width c
+    NumBlocks: integer;             // IFBlocks in the coarse-to-fine stack
+    InputSize: integer;             // input grid H=W for the Input layer
+    ModelType: string;              // 'rife'
+  end;
+
+// Reads a RIFE config. Required: hidden_channels. Optional: in_channel (3),
+// num_blocks (2), input_size, model_type.
+function ReadRIFEConfigFromJSONFile(const FileName: string): TRIFEConfig;
+
+function RIFEConfigToString(const Config: TRIFEConfig): string;
+
+// Builds the RIFE IFNet described by Config and loads every weight from Reader
+// (caller owns Reader). The net takes a (InputSize, InputSize, 2*InChannel)
+// image whose depth axis is [frame0 | frame1] and outputs the
+// (InputSize, InputSize, InChannel) interpolated middle frame (raw).
+function BuildRIFE(Reader: TNNetSafeTensorsReader;
+  const Config: TRIFEConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildRIFEFromSafeTensorsEx(const FileName: string;
+  const Config: TRIFEConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildRIFEFromSafeTensors(const FileName: string;
+  out Config: TRIFEConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // SwinIR IMAGE-RESTORATION IMPORT (model_type "swinir") -- the repo's FIRST
 // TRANSFORMER restoration importer (Liang et al. 2021, arXiv:2108.10257):
 // classical super-resolution. REUSES the landed Swin window/shifted-window
@@ -41138,6 +41199,196 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRRDBNetConfigFromJSONFile(ConfigPath);
   Result := BuildRRDBNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// RIFE VIDEO FRAME-INTERPOLATION IMPORT (model_type "rife")
+// ===========================================================================
+
+function ReadRIFEConfigFromJSONFile(const FileName: string): TRIFEConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+begin
+  if not FileExists(FileName) then
+    ImportError('RIFE import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('RIFE import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('RIFE import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'rife');
+    Result.InChannel := Obj.Get('in_channel', 3);
+    Result.HiddenChannels := Obj.Get('hidden_channels', 0);
+    if Result.HiddenChannels <= 0 then
+      ImportError('RIFE import: config "' + FileName +
+        '" is missing the required positive field "hidden_channels".');
+    Result.NumBlocks := Obj.Get('num_blocks', 2);
+    Result.InputSize := Obj.Get('input_size', 0);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function RIFEConfigToString(const Config: TRIFEConfig): string;
+begin
+  Result := Config.ModelType + ' config: in_channel=' +
+    IntToStr(Config.InChannel) + ', hidden_channels=' +
+    IntToStr(Config.HiddenChannels) + ', num_blocks=' +
+    IntToStr(Config.NumBlocks) + ', input_size=' + IntToStr(Config.InputSize);
+end;
+
+type
+  // Layer refs needed to load one IFBlock's weights (hidden width c).
+  TRIFEBlockLayers = record
+    Conv0, PReLU0, Conv1, PReLU1, LastConv: TNNetLayer;
+  end;
+
+// Architecture: append one IFBlock(in_planes -> 5) to NN reading from inp;
+// returns the lastconv (5-channel flow+mask) layer.
+function AddRIFEBlock(NN: TNNet; InPlanes, C: integer; inp: TNNetLayer;
+  out Refs: TRIFEBlockLayers): TNNetLayer;
+begin
+  Refs.Conv0 := NN.AddLayerAfter(
+    TNNetConvolutionLinear.Create(C, 3, 1, 1, 0), inp);
+  Refs.PReLU0 := NN.AddLayer(TNNetPReLUChannel.Create());
+  Refs.Conv1 := NN.AddLayer(TNNetConvolutionLinear.Create(C, 3, 1, 1, 0));
+  Refs.PReLU1 := NN.AddLayer(TNNetPReLUChannel.Create());
+  // lastconv: 5 channels = 4 flow + 1 mask.
+  Refs.LastConv := NN.AddLayer(TNNetConvolutionLinear.Create(5, 3, 1, 1, 0));
+  Result := Refs.LastConv;
+end;
+
+procedure LoadRIFEBlock(Reader: TNNetSafeTensorsReader;
+  const Refs: TRIFEBlockLayers; const Prefix: string; InPlanes, C: integer);
+begin
+  LoadVaeConv(Reader, Refs.Conv0, Prefix + 'conv0.weight',
+    Prefix + 'conv0.bias', C, InPlanes, 3);
+  LoadConvNeXtChannelVector(Reader, Refs.PReLU0, Prefix + 'prelu0.weight', 0, C);
+  LoadVaeConv(Reader, Refs.Conv1, Prefix + 'conv1.weight',
+    Prefix + 'conv1.bias', C, C, 3);
+  LoadConvNeXtChannelVector(Reader, Refs.PReLU1, Prefix + 'prelu1.weight', 0, C);
+  LoadVaeConv(Reader, Refs.LastConv, Prefix + 'lastconv.weight',
+    Prefix + 'lastconv.bias', 5, C, 3);
+end;
+
+function BuildRIFE(Reader: TNNetSafeTensorsReader;
+  const Config: TRIFEConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Refs: array of TRIFEBlockLayers;
+  InPlanes, b: integer;
+  InputLayer, Frame0, Frame1: TNNetLayer;
+  BlockLast, FlowAcc, MaskLogit: TNNetLayer;
+  Flow0, Flow1, Warped0, Warped1: TNNetLayer;
+  MaskSig, MaskRep, OneMinus, OneMinusRep, Term0, Term1: TNNetLayer;
+begin
+  if Config.HiddenChannels < 1 then
+    ImportError('RIFE import: hidden_channels must be >= 1.');
+  if Config.NumBlocks < 1 then
+    ImportError('RIFE import: num_blocks must be >= 1.');
+  if Config.InChannel < 1 then
+    ImportError('RIFE import: in_channel must be >= 1.');
+  if Config.InputSize < 1 then
+    ImportError('RIFE import: input_size must be >= 1.');
+  InPlanes := 2 * Config.InChannel;
+  SetLength(Refs, Config.NumBlocks);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    // Input depth = 2*InChannel: [frame0 | frame1] concatenated on depth axis.
+    InputLayer := NN.AddLayer(TNNetInput.Create(
+      Config.InputSize, Config.InputSize, InPlanes));
+    Frame0 := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(0, Config.InChannel), InputLayer);
+    Frame1 := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(Config.InChannel, Config.InChannel), InputLayer);
+
+    // Coarse-to-fine IFBlocks: each reads the [frame0|frame1] input and emits a
+    // 5-channel (4 flow + 1 mask) map. Flow residuals accumulate; the last
+    // block's mask logit is the fusion mask.
+    FlowAcc := nil;
+    MaskLogit := nil;
+    for b := 0 to Config.NumBlocks - 1 do
+    begin
+      BlockLast := AddRIFEBlock(NN, InPlanes, Config.HiddenChannels,
+        InputLayer, Refs[b]);
+      // Split the 5-channel head into flow (4) and mask (1).
+      if FlowAcc = nil then
+        FlowAcc := NN.AddLayerAfter(TNNetSplitChannels.Create(0, 4), BlockLast)
+      else
+        FlowAcc := NN.AddLayer(TNNetSum.Create([FlowAcc,
+          NN.AddLayerAfter(TNNetSplitChannels.Create(0, 4), BlockLast)]));
+      MaskLogit := NN.AddLayerAfter(TNNetSplitChannels.Create(4, 1), BlockLast);
+    end;
+
+    // Split accumulated flow into the two per-frame (dx, dy) fields.
+    Flow0 := NN.AddLayerAfter(TNNetSplitChannels.Create(0, 2), FlowAcc);
+    Flow1 := NN.AddLayerAfter(TNNetSplitChannels.Create(2, 2), FlowAcc);
+
+    // Backward-warp each frame by its predicted flow.
+    Warped0 := NN.AddLayerAfter(TNNetBackwardWarp.Create(Flow0), Frame0);
+    Warped1 := NN.AddLayerAfter(TNNetBackwardWarp.Create(Flow1), Frame1);
+
+    // Soft fusion: m = sigmoid(mask); merged = warped0*m + warped1*(1-m).
+    MaskSig := NN.AddLayerAfter(TNNetSigmoid.Create(), MaskLogit);
+    MaskRep := NN.AddLayer(
+      TNNetDeepConcat.Replicate(Config.InChannel, MaskSig));
+    OneMinus := NN.AddLayerAfter(TNNetAddConstant.Create(1.0),
+      NN.AddLayerAfter(TNNetMulByConstant.Create(-1.0), MaskSig));
+    OneMinusRep := NN.AddLayer(
+      TNNetDeepConcat.Replicate(Config.InChannel, OneMinus));
+    Term0 := NN.AddLayer(TNNetCellMulByCell.Create(Warped0, MaskRep));
+    Term1 := NN.AddLayer(TNNetCellMulByCell.Create(Warped1, OneMinusRep));
+    NN.AddLayer(TNNetSum.Create([Term0, Term1]));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    for b := 0 to Config.NumBlocks - 1 do
+      LoadRIFEBlock(Reader, Refs[b], 'block' + IntToStr(b) + '.',
+        InPlanes, Config.HiddenChannels);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildRIFEFromSafeTensorsEx(const FileName: string;
+  const Config: TRIFEConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildRIFE(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildRIFEFromSafeTensors(const FileName: string;
+  out Config: TRIFEConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadRIFEConfigFromJSONFile(ConfigPath);
+  Result := BuildRIFEFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

@@ -1,0 +1,7 @@
+{
+ "model_type": "rife",
+ "in_channel": 3,
+ "hidden_channels": 8,
+ "num_blocks": 2,
+ "input_size": 8
+}
