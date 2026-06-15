@@ -4703,6 +4703,105 @@ function RefClipScoreFromEmbeddings(ImageEmb, TextEmb, RefTextEmb: TNNetVolume;
 // embeddings (one per prompt, pooled from TextNet by OwlViTQueryEmbedding).
 // Output modality: a set of (patch, query, score, box) tuples per image.
 // ---------------------------------------------------------------------------
+
+// ===========================================================================
+// BLIP IMAGE-CAPTIONING IMPORT
+// ---------------------------------------------------------------------------
+// BLIP (Li et al. 2022, "Bootstrapping Language-Image Pre-training",
+// e.g. Salesforce/blip-image-captioning-base) is the repo's FIRST GENERATIVE
+// vision-language importer of the ENCODER-DECODER kind: a ViT image encoder
+// (the CLIP/ViT primitive set, built here exactly like the ViT importer - a
+// BIASED patch conv, a class token, learned positions, pre-LN encoder blocks
+// and a post_layernorm) feeds its full (num_patches+1, 1, hidden) patch
+// hidden-state sequence to a BERT-style CAUSAL text DECODER through
+// CROSS-ATTENTION (TNNetCrossAttention), which autoregressively generates a
+// caption.
+//
+// Two nets are returned (like T5/Marian/Pegasus): VisionNet (image -> patch
+// hidden states) and TextNet (a BERT post-LN decoder whose SECOND TNNetInput
+// holds the image hidden states - the T5EncoderStatesInput convention). Each
+// decoder block is:
+//   x := LN_a( x + out_dense( CAUSAL-SDPA( q|k|v(x) ) ) )       (self-attn)
+//   x := LN_c( x + out_dense( CROSS-ATTN( q(x), k|v(image) ) ) ) (cross-attn)
+//   x := LN_o( x + out_dense( GELU( inter(x) ) ) )               (FFN)
+// then the BERT LM head: transform = LN(GELU(dense(x))), then the vocab
+// decoder. GELU is the EXACT erf form (BERT default), composed from existing
+// layers (the side-branch Phi(x) of the BERT/CLIP path).
+//
+// The decoder's token+position embeddings are word_embeddings +
+// position_embeddings, then a LayerNorm (BlipTextEmbeddings). The vision
+// hidden states are the vision_model.last_hidden_state (post_layernorm
+// applied to all num_patches+1 tokens - so the vision net emits them WITHOUT
+// pooling).
+//
+// Run a SINGLE forward step (the parity contract) with RunBlipCaptionLogits:
+// it computes the vision features once, copies them into the decoder's
+// encoder-states input, and runs the decoder over a (DecSeqLen,1,1) token
+// prefix -> (DecSeqLen,1,vocab) next-token logits. Autoregressive captioning
+// reuses the generic DecodeSeq2Seq* helpers via DecodeBlipCaptionGreedy, which
+// precomputes the image features and drives the same greedy argmax loop.
+// ---------------------------------------------------------------------------
+type
+  TBlipConfig = record
+    Text: TClipTowerConfig;     // text_config encoder-block shape (HiddenAct is
+                                // the exact-erf GELU; eps = 1e-12)
+    Vision: TClipTowerConfig;   // vision_config (HiddenAct GELU; eps = 1e-5)
+    VocabSize: integer;         // text_config.vocab_size
+    MaxPositions: integer;      // text_config.max_position_embeddings
+    BosTokenId: integer;        // text_config.bos_token_id (caption start)
+    EosTokenId: integer;        // text_config.sep_token_id / eos_token_id
+    PadTokenId: integer;        // text_config.pad_token_id
+    ImageSize: integer;         // vision_config.image_size
+    PatchSize: integer;         // vision_config.patch_size
+    NumChannels: integer;       // vision_config.num_channels
+    ModelType: string;          // 'blip'
+  end;
+
+// Reads a HF BLIP config.json (model_type "blip"). Required per sub-object
+// (text_config / vision_config): hidden_size, intermediate_size,
+// num_hidden_layers, num_attention_heads, plus text vocab_size +
+// max_position_embeddings and vision image_size + patch_size. Defaults follow
+// BlipTextConfig / BlipVisionConfig: hidden_act "gelu" (exact erf) both sides,
+// text layer_norm_eps 1e-12, vision layer_norm_eps 1e-5, num_channels 3,
+// bos_token_id 30522, sep/eos 102, pad 0. A hidden_act other than the GELU
+// family is rejected.
+function ReadBlipConfigFromJSONFile(const FileName: string): TBlipConfig;
+
+function BlipConfigToString(const Config: TBlipConfig): string;
+
+// Builds the BLIP VISION and TEXT-DECODER nets described by Config and loads
+// every weight from the checkpoint at FileName (.safetensors / sharded index /
+// pytorch_model.bin via CreatePretrainedTensorReader). DecSeqLen <= 0 uses the
+// full text max_position_embeddings context. Both nets are owned by the
+// caller. pInferenceOnly = True frees training volumes during construction.
+procedure BuildBlipForCaptioningFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBlipConfig; out VisionNet, TextNet: TNNet;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" in the
+// directory of FileName) and returning it in Config.
+procedure BuildBlipForCaptioningFromSafeTensors(const FileName: string;
+  out VisionNet, TextNet: TNNet; out Config: TBlipConfig;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Runs ONE forward step of the BLIP caption decoder: computes the image patch
+// hidden states from PixelValues ((ImageSize,ImageSize,NumChannels), the
+// VisionNet input), copies them into the decoder's encoder-states input, then
+// runs the decoder over DecoderTokens ((DecSeqLen,1,1)) -> Logits, the
+// (DecSeqLen,1,vocab) next-token logits at every prefix position.
+procedure RunBlipCaptionLogits(VisionNet, TextNet: TNNet;
+  PixelValues, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
+
+// Autoregressive greedy caption: computes the image features once, then runs
+// the standard argmax decode loop from Config.BosTokenId, stopping at the EOS
+// token or after MaxNewTokens (or when DecSeqLen is exhausted). Returns the
+// GENERATED ids (BOS excluded; the emitted EOS is included). PixelValues is the
+// VisionNet input volume.
+function DecodeBlipCaptionGreedy(VisionNet, TextNet: TNNet;
+  PixelValues: TNNetVolume; const Config: TBlipConfig;
+  MaxNewTokens: integer): TNeuralIntegerArray;
+
 type
   TOwlViTConfig = record
     Text: TClipTowerConfig;     // text_config (encoder block shape)
@@ -31609,6 +31708,620 @@ begin
   BiasCy := Logit(Yc);
   BiasW := Logit(Wc);
   BiasH := Logit(Hc);
+end;
+
+// ===========================================================================
+// BLIP IMAGE-CAPTIONING IMPORT (implementation)
+// ===========================================================================
+
+function ReadBlipConfigFromJSONFile(const FileName: string): TBlipConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, TextObj, VisObj: TJSONObject;
+  ModelType: string;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(FieldName);
+    if (Data = nil) or not (Data is TJSONObject) then
+      ImportError('BLIP import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(Data);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('BLIP import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('BLIP import: config field "' + FieldName +
+        '" must be a positive integer, got ' + O.Find(FieldName).AsJSON + '.');
+  end;
+
+  // BLIP uses exact-erf "gelu" both sides (the BlipText/BlipVision default).
+  // Reject anything but the GELU family to avoid a silent activation mismatch.
+  function ReadGeluAct(O: TJSONObject): TClipHiddenAct;
+  var
+    ActStr: string;
+  begin
+    ActStr := O.Get('hidden_act', 'gelu');
+    if ActStr = 'gelu' then Result := chaGeluExact
+    else if (ActStr = 'gelu_new') or (ActStr = 'gelu_pytorch_tanh') then
+      Result := chaGeluTanh
+    else
+      ImportError('BLIP import: hidden_act "' + ActStr + '" is not ' +
+        'supported - BLIP uses "gelu" (exact erf); "gelu_new"/' +
+        '"gelu_pytorch_tanh" also accepted.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('BLIP import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('BLIP import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('BLIP import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'blip');
+    if (ModelType <> 'blip') and (ModelType <> 'blip-2') and
+       (ModelType <> 'blip_2') then
+      ImportError('BLIP import: config model_type is "' + ModelType +
+        '" - only "blip" (BlipForConditionalGeneration) is supported here.');
+    Result.ModelType := 'blip';
+
+    TextObj := RequiredSubObject('text_config');
+    Result.Text.HiddenSize := RequiredInt(TextObj, 'hidden_size');
+    Result.Text.IntermediateSize := RequiredInt(TextObj, 'intermediate_size');
+    Result.Text.NumLayers := RequiredInt(TextObj, 'num_hidden_layers');
+    Result.Text.NumHeads := RequiredInt(TextObj, 'num_attention_heads');
+    Result.Text.LayerNormEps := TextObj.Get('layer_norm_eps', 1e-12);
+    Result.Text.HiddenAct := ReadGeluAct(TextObj);
+    Result.VocabSize := RequiredInt(TextObj, 'vocab_size');
+    Result.MaxPositions := RequiredInt(TextObj, 'max_position_embeddings');
+    Result.BosTokenId := TextObj.Get('bos_token_id', 30522);
+    // BLIP captioning ends on sep_token_id ([SEP] = 102 by default); some
+    // configs spell it eos_token_id.
+    Result.EosTokenId := TextObj.Get('sep_token_id',
+      TextObj.Get('eos_token_id', 102));
+    Result.PadTokenId := TextObj.Get('pad_token_id', 0);
+
+    VisObj := RequiredSubObject('vision_config');
+    Result.Vision.HiddenSize := RequiredInt(VisObj, 'hidden_size');
+    Result.Vision.IntermediateSize := RequiredInt(VisObj, 'intermediate_size');
+    Result.Vision.NumLayers := RequiredInt(VisObj, 'num_hidden_layers');
+    Result.Vision.NumHeads := RequiredInt(VisObj, 'num_attention_heads');
+    Result.Vision.LayerNormEps := VisObj.Get('layer_norm_eps', 1e-5);
+    Result.Vision.HiddenAct := ReadGeluAct(VisObj);
+    Result.ImageSize := RequiredInt(VisObj, 'image_size');
+    Result.PatchSize := RequiredInt(VisObj, 'patch_size');
+    Result.NumChannels := VisObj.Get('num_channels', 3);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BlipConfigToString(const Config: TBlipConfig): string;
+begin
+  Result := 'blip config: vis(hidden=' + IntToStr(Config.Vision.HiddenSize) +
+    ', layers=' + IntToStr(Config.Vision.NumLayers) +
+    ', heads=' + IntToStr(Config.Vision.NumHeads) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ') txt(hidden=' + IntToStr(Config.Text.HiddenSize) +
+    ', layers=' + IntToStr(Config.Text.NumLayers) +
+    ', heads=' + IntToStr(Config.Text.NumHeads) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', max_pos=' + IntToStr(Config.MaxPositions) +
+    ', bos=' + IntToStr(Config.BosTokenId) +
+    ', eos=' + IntToStr(Config.EosTokenId) + ')';
+end;
+
+type
+  TBlipDecAttn = record
+    QProj, KProj, VProj, OProj, Norm: TNNetLayer;
+  end;
+  TBlipDecBlock = record
+    SelfAttn: TBlipDecAttn;
+    CrossAttn: TBlipDecAttn;
+    Inter, OutDense, OutNorm: TNNetLayer;
+  end;
+  TBlipDecBlockArray = array of TBlipDecBlock;
+
+// Loads one BLIP VISION encoder block (a TClipBlockLayers). BLIP's ViT
+// attention differs from CLIP only in the tensor NAMES: a single FUSED
+// self_attn.qkv ([3*hidden, hidden], rows ordered [Q | K | V] over all heads -
+// the same slab layout the per-head slicing reads) plus self_attn.projection
+// (CLIP's out_proj). The two LayerNorms and the fc1/fc2 MLP match CLIP.
+procedure LoadBlipVisionBlock(Reader: TNNetSafeTensorsReader;
+  const Block: TClipBlockLayers; const Prefix: string;
+  const Tower: TClipTowerConfig);
+var
+  dd: integer;
+begin
+  dd := Tower.HiddenSize;
+  LoadLayerNormWeights(Reader, Block.LN1, Prefix + 'layer_norm1.weight',
+    Prefix + 'layer_norm1.bias', dd);
+  // Fused qkv [3*hidden, hidden] straight into the 3*hidden-neuron slab.
+  LoadLlamaLinearWeights(Reader, Block.QKV, Prefix + 'self_attn.qkv.weight',
+    dd, 3 * dd, 0, 3 * dd, 0, Prefix + 'self_attn.qkv.bias');
+  LoadLlamaLinearWeights(Reader, Block.AttnDense,
+    Prefix + 'self_attn.projection.weight', dd, dd, 0, -1, 0,
+    Prefix + 'self_attn.projection.bias');
+  LoadLayerNormWeights(Reader, Block.LN2, Prefix + 'layer_norm2.weight',
+    Prefix + 'layer_norm2.bias', dd);
+  LoadLlamaLinearWeights(Reader, Block.Inter, Prefix + 'mlp.fc1.weight',
+    dd, Tower.IntermediateSize, 0, -1, 0, Prefix + 'mlp.fc1.bias');
+  LoadLlamaLinearWeights(Reader, Block.OutDense, Prefix + 'mlp.fc2.weight',
+    Tower.IntermediateSize, dd, 0, -1, 0, Prefix + 'mlp.fc2.bias');
+end;
+
+// Builds the BLIP ViT image encoder (HF BlipVisionModel). It is the ViT
+// importer's tower: a BIASED patch conv, a class token folded into position
+// row 0, pre-LN encoder blocks (AddClipEncoderBlock) and a final
+// post_layernorm. The net outputs ALL (num_patches+1, 1, hidden) post-LN
+// hidden states (vision_model.last_hidden_state - cross-attention reads every
+// row, so there is NO CLS crop and NO projection).
+function BuildBlipVisionTower(Reader: TNNetSafeTensorsReader;
+  const Config: TBlipConfig; pInferenceOnly: boolean): TNNet;
+var
+  NN: TNNet;
+  PatchConv, PosEmb, PostLN: TNNetLayer;
+  Blocks: TClipBlockLayersArray;
+  Tmp: TNNetVolume;
+  Grid, NumPatches, BlockCnt, ci, d: integer;
+begin
+  d := Config.Vision.HiddenSize;
+  if (Config.Vision.NumHeads < 1) or ((d mod Config.Vision.NumHeads) <> 0) then
+    ImportError('BLIP import: vision hidden_size=' + IntToStr(d) +
+      ' is not divisible by num_attention_heads=' +
+      IntToStr(Config.Vision.NumHeads) + '.');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0)
+  then
+    ImportError('BLIP import: image_size=' + IntToStr(Config.ImageSize) +
+      ' is not a multiple of patch_size=' + IntToStr(Config.PatchSize) + '.');
+  Grid := Config.ImageSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    // BIASED patch embedding: kernel = stride = patch_size, no padding.
+    PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      d, Config.PatchSize, {pInputPadding=}0, {pStride=}Config.PatchSize,
+      {pSuppressBias=}0) );
+    NN.AddLayer( TNNetReshape.Create(NumPatches, 1, d) );
+    // Prepend a ZERO class-token slot (PadXY pads both ends; Crop drops the
+    // right pad). class_embedding folds into position row 0 - exact, since the
+    // pre-position content of that slot is identically zero.
+    NN.AddLayer( TNNetPadXY.Create(1, 0) );
+    NN.AddLayer( TNNetCrop.Create(0, 0, NumPatches + 1, 1) );
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(NumPatches + 1) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    SetLength(Blocks, Config.Vision.NumLayers);
+    for BlockCnt := 0 to Config.Vision.NumLayers - 1 do
+      AddClipEncoderBlock(NN, Config.Vision, {CausalMask=}false,
+        Blocks[BlockCnt], pInferenceOnly);
+    // post_layernorm over every token (HF applies it to last_hidden_state).
+    PostLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // -------- weights --------
+    LoadClipPatchConv(Reader, PatchConv,
+      'vision_model.embeddings.patch_embedding.weight',
+      Config.NumChannels, Config.PatchSize, d);
+    // patch conv IS biased (LoadClipPatchConv zeroes the bias above).
+    if not Reader.HasTensor('vision_model.embeddings.patch_embedding.bias') then
+      ImportError('BLIP import: missing tensor ' +
+        '"vision_model.embeddings.patch_embedding.bias".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('vision_model.embeddings.patch_embedding.bias', Tmp);
+      if Tmp.Size <> d then
+        ImportError('BLIP import: patch_embedding.bias must have ' +
+          IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
+      for ci := 0 to d - 1 do
+        PatchConv.Neurons[ci].BiasWeight := Tmp.FData[ci];
+      PatchConv.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // position_embedding [1, num_patches+1, hidden] -> the table (the leading
+    // batch axis of 1 is dropped by the flat copy).
+    if not Reader.HasTensor('vision_model.embeddings.position_embedding') then
+      ImportError('BLIP import: missing tensor ' +
+        '"vision_model.embeddings.position_embedding".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('vision_model.embeddings.position_embedding', Tmp);
+      if Tmp.Size <> (NumPatches + 1) * d then
+        ImportError('BLIP import: position_embedding must have ' +
+          IntToStr((NumPatches + 1) * d) + ' elements, got ' +
+          IntToStr(Tmp.Size) + '.');
+      PosEmb.Neurons[0].Weights.Copy(Tmp);
+      PosEmb.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    // class_embedding [1,1,hidden] folded into position row 0.
+    if not Reader.HasTensor('vision_model.embeddings.class_embedding') then
+      ImportError('BLIP import: missing tensor ' +
+        '"vision_model.embeddings.class_embedding".');
+    Tmp := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('vision_model.embeddings.class_embedding', Tmp);
+      if Tmp.Size <> d then
+        ImportError('BLIP import: class_embedding must have ' +
+          IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
+      for ci := 0 to d - 1 do
+        PosEmb.Neurons[0].Weights.FData[ci] :=
+          PosEmb.Neurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      PosEmb.FlushWeightCache();
+    finally
+      Tmp.Free;
+    end;
+    for BlockCnt := 0 to Config.Vision.NumLayers - 1 do
+      LoadBlipVisionBlock(Reader, Blocks[BlockCnt],
+        'vision_model.encoder.layers.' + IntToStr(BlockCnt) + '.',
+        Config.Vision);
+    LoadLayerNormWeights(Reader, PostLN,
+      'vision_model.post_layernorm.weight',
+      'vision_model.post_layernorm.bias', d);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+// Loads one BLIP-text (BERT) attention sub-block: separate biased nn.Linear
+// query/key/value (each [d_model, d_model]) into the per-head q/k/v
+// projections, the biased output.dense and the post-residual output.LayerNorm.
+// SelfPrefix is e.g. "...attention." (self.query / output.dense /
+// output.LayerNorm); the crossattention sub-block has the same layout.
+procedure LoadBlipBertAttn(Reader: TNNetSafeTensorsReader;
+  const Attn: TBlipDecAttn; const Prefix: string; d: integer);
+begin
+  LoadLlamaLinearWeights(Reader, Attn.QProj, Prefix + 'self.query.weight',
+    d, d, 0, -1, 0, Prefix + 'self.query.bias');
+  LoadLlamaLinearWeights(Reader, Attn.KProj, Prefix + 'self.key.weight',
+    d, d, 0, -1, 0, Prefix + 'self.key.bias');
+  LoadLlamaLinearWeights(Reader, Attn.VProj, Prefix + 'self.value.weight',
+    d, d, 0, -1, 0, Prefix + 'self.value.bias');
+  LoadLlamaLinearWeights(Reader, Attn.OProj, Prefix + 'output.dense.weight',
+    d, d, 0, -1, 0, Prefix + 'output.dense.bias');
+  LoadLayerNormWeights(Reader, Attn.Norm, Prefix + 'output.LayerNorm.weight',
+    Prefix + 'output.LayerNorm.bias', d);
+end;
+
+procedure BuildBlipForCaptioningFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBlipConfig; out VisionNet, TextNet: TNNet;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  TokInput, EncStates, WordEmb, PosEmb, EmbLN: TNNetLayer;
+  HeadDense, HeadLN, HeadDecoder: TNNetLayer;
+  Blocks: TBlipDecBlockArray;
+  Tmp: TNNetVolume;
+  d, HeadDim, SeqLen, BlockCnt, HeadCnt, dd, NumVisTokens, Grid: integer;
+  BP: string;
+  BranchInput, QSlice, KSlice, VSlice, HeadPack, KVPack: TNNetLayer;
+  Heads: array of TNNetLayer;
+  SliceChannels: array of integer;
+begin
+  VisionNet := nil;
+  TextNet := nil;
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  try
+    try
+      d := Config.Text.HiddenSize;
+      if (Config.Text.NumHeads < 1) or ((d mod Config.Text.NumHeads) <> 0) then
+        ImportError('BLIP import: text hidden_size=' + IntToStr(d) +
+          ' is not divisible by num_attention_heads=' +
+          IntToStr(Config.Text.NumHeads) + '.');
+      HeadDim := d div Config.Text.NumHeads;
+      if DecSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := DecSeqLen;
+      if SeqLen > Config.MaxPositions then
+        ImportError('BLIP import: requested DecSeqLen=' + IntToStr(SeqLen) +
+          ' exceeds max_position_embeddings=' +
+          IntToStr(Config.MaxPositions) + '.');
+      Grid := Config.ImageSize div Config.PatchSize;
+      NumVisTokens := Grid * Grid + 1;
+
+      // ---------------- VISION tower ----------------
+      VisionNet := BuildBlipVisionTower(Reader, Config, pInferenceOnly);
+
+      // ---------------- TEXT decoder architecture ----------------
+      NN := TNNet.Create();
+      TokInput := NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
+      // SECOND input: the image hidden states (the T5EncoderStatesInput
+      // convention) - filled by RunBlipCaptionLogits before Compute.
+      EncStates := NN.AddLayer(
+        TNNetInput.Create(NumVisTokens, 1, Config.Vision.HiddenSize) );
+      // Token branch: word_embeddings + position_embeddings, then LayerNorm.
+      NN.AddLayerAfter( TNNetEmbedding.Create(
+        Config.VocabSize, d, {EncodeZero=}1), TokInput );
+      WordEmb := NN.GetLastLayer();
+      PosEmb := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.MaxPositions) );
+      EmbLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      SetLength(Blocks, Config.Text.NumLayers);
+      SetLength(Heads, Config.Text.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+      begin
+        // ---- causal self-attention (residual add, THEN LayerNorm) ----
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].SelfAttn.QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(d), BranchInput);
+        Blocks[BlockCnt].SelfAttn.KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(d), BranchInput);
+        Blocks[BlockCnt].SelfAttn.VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(d), BranchInput);
+        for HeadCnt := 0 to Config.Text.NumHeads - 1 do
+        begin
+          for dd := 0 to HeadDim - 1 do
+            SliceChannels[dd] := HeadCnt * HeadDim + dd;
+          QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceChannels),
+            Blocks[BlockCnt].SelfAttn.QProj);
+          KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceChannels),
+            Blocks[BlockCnt].SelfAttn.KProj);
+          VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceChannels),
+            Blocks[BlockCnt].SelfAttn.VProj);
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+          Heads[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true),
+            HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+        Blocks[BlockCnt].SelfAttn.OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(d) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].SelfAttn.Norm := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+
+        // ---- cross-attention to the image features (no causal mask) ----
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].CrossAttn.QProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(d), BranchInput);
+        Blocks[BlockCnt].CrossAttn.KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(d), EncStates);
+        Blocks[BlockCnt].CrossAttn.VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(d), EncStates);
+        for HeadCnt := 0 to Config.Text.NumHeads - 1 do
+        begin
+          for dd := 0 to HeadDim - 1 do
+            SliceChannels[dd] := HeadCnt * HeadDim + dd;
+          QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceChannels),
+            Blocks[BlockCnt].CrossAttn.QProj);
+          KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceChannels),
+            Blocks[BlockCnt].CrossAttn.KProj);
+          VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceChannels),
+            Blocks[BlockCnt].CrossAttn.VProj);
+          KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+          Heads[HeadCnt] := NN.AddLayerAfter(
+            TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVPack),
+            QSlice);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+        Blocks[BlockCnt].CrossAttn.OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(d) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].CrossAttn.Norm := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+
+        // ---- FFN: output.dense(GELU(intermediate.dense(x))), then LN ----
+        BranchInput := NN.GetLastLayer();
+        Blocks[BlockCnt].Inter := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.Text.IntermediateSize) );
+        AddClipHiddenAct(NN, Config.Text.HiddenAct);
+        Blocks[BlockCnt].OutDense := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(d) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        Blocks[BlockCnt].OutNorm := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+
+      // ---- LM prediction head: transform = LN(GELU(dense(x))), then decoder.
+      HeadDense := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+      AddClipHiddenAct(NN, Config.Text.HiddenAct);
+      HeadLN := NN.AddLayer( TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      HeadDecoder := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.VocabSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- TEXT decoder weights ----------------
+      if not Reader.HasTensor(
+        'text_decoder.bert.embeddings.word_embeddings.weight') then
+        ImportError('BLIP import: missing tensor ' +
+          '"text_decoder.bert.embeddings.word_embeddings.weight" - not a ' +
+          'BlipForConditionalGeneration checkpoint?');
+      Tmp := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(
+          'text_decoder.bert.embeddings.word_embeddings.weight', Tmp);
+        if Tmp.Size <> Config.VocabSize * d then
+          ImportError('BLIP import: word_embeddings size mismatch.');
+        WordEmb.Neurons[0].Weights.Copy(Tmp);
+        WordEmb.FlushWeightCache();
+        Reader.LoadTensorFlat(
+          'text_decoder.bert.embeddings.position_embeddings.weight', Tmp);
+        if Tmp.Size <> Config.MaxPositions * d then
+          ImportError('BLIP import: position_embeddings size mismatch.');
+        PosEmb.Neurons[0].Weights.Copy(Tmp);
+        PosEmb.FlushWeightCache();
+      finally
+        Tmp.Free;
+      end;
+      LoadLayerNormWeights(Reader, EmbLN,
+        'text_decoder.bert.embeddings.LayerNorm.weight',
+        'text_decoder.bert.embeddings.LayerNorm.bias', d);
+
+      for BlockCnt := 0 to Config.Text.NumLayers - 1 do
+      begin
+        BP := 'text_decoder.bert.encoder.layer.' + IntToStr(BlockCnt) + '.';
+        LoadBlipBertAttn(Reader, Blocks[BlockCnt].SelfAttn,
+          BP + 'attention.', d);
+        LoadBlipBertAttn(Reader, Blocks[BlockCnt].CrossAttn,
+          BP + 'crossattention.', d);
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Inter,
+          BP + 'intermediate.dense.weight', d, Config.Text.IntermediateSize,
+          0, -1, 0, BP + 'intermediate.dense.bias');
+        LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].OutDense,
+          BP + 'output.dense.weight', Config.Text.IntermediateSize, d,
+          0, -1, 0, BP + 'output.dense.bias');
+        LoadLayerNormWeights(Reader, Blocks[BlockCnt].OutNorm,
+          BP + 'output.LayerNorm.weight', BP + 'output.LayerNorm.bias', d);
+      end;
+
+      LoadLlamaLinearWeights(Reader, HeadDense,
+        'text_decoder.cls.predictions.transform.dense.weight', d, d,
+        0, -1, 0, 'text_decoder.cls.predictions.transform.dense.bias');
+      LoadLayerNormWeights(Reader, HeadLN,
+        'text_decoder.cls.predictions.transform.LayerNorm.weight',
+        'text_decoder.cls.predictions.transform.LayerNorm.bias', d);
+      // The vocab decoder is tied to the word embeddings in HF but the
+      // checkpoint serializes it explicitly (cls.predictions.decoder.{weight,
+      // bias}); load it directly so a hypothetical untied head also works.
+      LoadLlamaLinearWeights(Reader, HeadDecoder,
+        'text_decoder.cls.predictions.decoder.weight', d, Config.VocabSize,
+        0, -1, 0, 'text_decoder.cls.predictions.decoder.bias');
+
+      TextNet := NN;
+      NN := nil;
+    except
+      NN.Free;
+      VisionNet.Free;
+      VisionNet := nil;
+      TextNet.Free;
+      TextNet := nil;
+      raise;
+    end;
+  finally
+    SetLength(Heads, 0);
+    SetLength(SliceChannels, 0);
+    Reader.Free;
+  end;
+end;
+
+procedure BuildBlipForCaptioningFromSafeTensors(const FileName: string;
+  out VisionNet, TextNet: TNNet; out Config: TBlipConfig;
+  DecSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  CfgFile: string;
+begin
+  if ConfigFileName <> '' then CfgFile := ConfigFileName
+  else CfgFile := IncludeTrailingPathDelimiter(ExtractFilePath(FileName)) +
+    'config.json';
+  Config := ReadBlipConfigFromJSONFile(CfgFile);
+  BuildBlipForCaptioningFromSafeTensorsWithConfig(FileName, Config,
+    VisionNet, TextNet, DecSeqLen, pInferenceOnly);
+end;
+
+// Returns the decoder's SECOND TNNetInput (the image hidden-states input).
+function BlipEncoderStatesInput(TextNet: TNNet): TNNetLayer;
+var
+  LayerCnt, InputCnt: integer;
+begin
+  Result := nil;
+  InputCnt := 0;
+  for LayerCnt := 0 to TextNet.Layers.Count - 1 do
+    if TextNet.Layers[LayerCnt] is TNNetInput then
+    begin
+      Inc(InputCnt);
+      if InputCnt = 2 then
+      begin
+        Result := TextNet.Layers[LayerCnt];
+        exit;
+      end;
+    end;
+  ImportError('BLIP: the text net has no second TNNetInput - not a ' +
+    'BuildBlipForCaptioningFromSafeTensors decoder?');
+end;
+
+procedure RunBlipCaptionLogits(VisionNet, TextNet: TNNet;
+  PixelValues, DecoderTokens: TNNetVolume; Logits: TNNetVolume);
+var
+  EncStates: TNNetLayer;
+begin
+  EncStates := BlipEncoderStatesInput(TextNet);
+  VisionNet.Compute(PixelValues);
+  if VisionNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+    ImportError('RunBlipCaptionLogits: vision output size ' +
+      IntToStr(VisionNet.GetLastLayer().Output.Size) +
+      ' does not match the decoder''s image-states input size ' +
+      IntToStr(EncStates.Output.Size) + '.');
+  EncStates.Output.Copy(VisionNet.GetLastLayer().Output);
+  TextNet.Compute(DecoderTokens);
+  TextNet.GetOutput(Logits);
+end;
+
+function DecodeBlipCaptionGreedy(VisionNet, TextNet: TNNet;
+  PixelValues: TNNetVolume; const Config: TBlipConfig;
+  MaxNewTokens: integer): TNeuralIntegerArray;
+var
+  EncStates: TNNetLayer;
+  DecToks, Logits: TNNetVolume;
+  Targets: TNeuralIntegerArray;
+  DecSeqLen, CurLen, Pos, Next: integer;
+begin
+  SetLength(Result, 0);
+  if MaxNewTokens < 1 then exit;
+  EncStates := BlipEncoderStatesInput(TextNet);
+  // Encode the image ONCE; the hidden states are constant across decode steps.
+  VisionNet.Compute(PixelValues);
+  if VisionNet.GetLastLayer().Output.Size <> EncStates.Output.Size then
+    ImportError('DecodeBlipCaptionGreedy: vision/decoder image-states size ' +
+      'mismatch.');
+  EncStates.Output.Copy(VisionNet.GetLastLayer().Output);
+  DecSeqLen := TextNet.GetFirstLayer().Output.Size;
+  Logits := TextNet.GetLastLayer().Output;
+  DecToks := TNNetVolume.Create(DecSeqLen, 1, 1);
+  try
+    SetLength(Targets, DecSeqLen);
+    Targets[0] := Config.BosTokenId;
+    CurLen := 1;
+    while True do
+    begin
+      for Pos := 0 to DecSeqLen - 1 do
+        if Pos < CurLen then DecToks.FData[Pos] := Targets[Pos]
+        else DecToks.FData[Pos] := Config.BosTokenId;
+      TextNet.Compute(DecToks);
+      Next := Logits.GetClassOnPixel(CurLen - 1, 0);
+      SetLength(Result, Length(Result) + 1);
+      Result[High(Result)] := Next;
+      if Next = Config.EosTokenId then break;
+      if Length(Result) >= MaxNewTokens then break;
+      if CurLen >= DecSeqLen then break;
+      Targets[CurLen] := Next;
+      Inc(CurLen);
+    end;
+  finally
+    DecToks.Free;
+  end;
 end;
 
 procedure BuildOwlViTFromSafeTensorsWithConfig(const FileName: string;

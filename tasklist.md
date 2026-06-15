@@ -1111,16 +1111,25 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       (embed_image_query); (c) interpolate_pos_encoding for non-default image
       sizes; (d) a real BPE tokenizer + image preprocessing so free-text strings
       (not raw token ids) drive the demo.
-- [ ] BLIP image-captioning importer (BuildBlipForCaptioningFromSafeTensors,
+- [X] BLIP image-captioning importer (BuildBlipForCaptioningFromSafeTensors,
       e.g. Salesforce/blip-image-captioning-base) — first GENERATIVE
       vision-language importer of the ENCODER-DECODER kind (LLaVA, still open,
       is decoder-only-with-projector; this is architecturally different). A ViT
-      image encoder (reuse BuildClipVisionTower path) feeds a BERT-style text
-      decoder via CROSS-ATTENTION (the TNNetCrossAttention / cross-WKV wiring
-      already exists) to autoregressively generate a caption. Reuse the seq2seq
-      greedy/sampled decode helpers. Pico parity vs HF float64 on the first
-      decoded logits; demo: examples/ImageCaptioning writes a caption for one
-      tiny image.
+      image encoder (the ViT-importer tower: biased patch conv, class token
+      folded into pos row 0, pre-LN blocks, post_layernorm; emits all
+      last_hidden_state rows) feeds a BERT-style POST-norm causal text decoder
+      via CROSS-ATTENTION (TNNetCrossAttention + the T5EncoderStatesInput
+      second-input convention) to autoregressively generate a caption.
+      RunBlipCaptionLogits (single forward step) + DecodeBlipCaptionGreedy.
+      Pico parity vs HF float64: per-position next-token logits < 1e-4 and the
+      greedy caption ids match HF generate() exactly (TestBlipCaptioningParity /
+      TestBlipCaptionGreedy, generator tools/make_pico_blip_fixture.py). Demo:
+      examples/ImageCaptioning captions one tiny image offline. FOLLOW-UPS:
+      (a) decode-to-text needs the BLIP WordPiece tokenizer wired (the demo
+      prints token ids); (b) DecodeBlipCaptionSampled / beam (mirror the
+      DecodeSeq2SeqSampled / DecodeSeq2SeqBeamSearch helpers for the image-
+      encoder path); (c) BLIP-2 (Q-Former + frozen LLM) is a distinct, larger
+      architecture, still open.
 - [ ] VQ-GAN training example (examples/VQGAN) — upgrades the landed VQVAE
       (reconstruction-only L2) into the GENERATIVE-CV regime by adding a
       PatchGAN discriminator (reuse the Pix2Pix discriminator) + an adversarial

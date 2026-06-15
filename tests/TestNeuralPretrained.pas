@@ -292,6 +292,9 @@ type
     procedure TestOwlViTConfigFromJSONFile;
     procedure TestOwlViTOpenVocabDetectionParity;
     procedure TestOwlViTDetectionDecode;
+    procedure TestBlipConfigFromJSONFile;
+    procedure TestBlipCaptioningParity;
+    procedure TestBlipCaptionGreedy;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
@@ -13488,6 +13491,165 @@ begin
     Img.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// Verifies ReadBlipConfigFromJSONFile on the committed BLIP pico config (the
+// FIRST generative encoder-decoder vision-language importer).
+procedure TTestNeuralPretrained.TestBlipConfigFromJSONFile;
+var
+  Config: TBlipConfig;
+begin
+  Config := ReadBlipConfigFromJSONFile(FixturePath('tiny_blip_config.json'));
+  AssertEquals('model_type', 'blip', Config.ModelType);
+  AssertEquals('vision hidden', 24, Config.Vision.HiddenSize);
+  AssertEquals('vision layers', 2, Config.Vision.NumLayers);
+  AssertEquals('text hidden', 24, Config.Text.HiddenSize);
+  AssertEquals('text layers', 2, Config.Text.NumLayers);
+  AssertEquals('vocab', 40, Config.VocabSize);
+  AssertEquals('max pos', 32, Config.MaxPositions);
+  AssertEquals('image size', 16, Config.ImageSize);
+  AssertEquals('patch size', 8, Config.PatchSize);
+  AssertEquals('bos', 1, Config.BosTokenId);
+  AssertEquals('eos', 2, Config.EosTokenId);
+end;
+
+// Float64 parity of the BLIP image-captioning decoder against real HF
+// transformers: a tiny image + a short input token prefix; the per-position
+// next-token logits over the vocab must match within 1e-4.
+procedure TTestNeuralPretrained.TestBlipCaptioningParity;
+var
+  VisionNet, TextNet: TNNet;
+  Config: TBlipConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, InArr, LogArr, PreArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img, DecToks, Logits: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  W, H, NumCh, x, yy, ch, FlatIdx, SeqLen, Vocab, Pos, v, PreLen: integer;
+begin
+  RandSeed := 424242;
+  BuildBlipForCaptioningFromSafeTensors(FixturePath('tiny_blip.safetensors'),
+    VisionNet, TextNet, Config, {DecSeqLen=}8, {pInferenceOnly=}false,
+    FixturePath('tiny_blip_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  DecToks := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  try
+    AssertTrue('vision net built', VisionNet <> nil);
+    AssertTrue('text net built', TextNet <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_blip_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    CaseObj := TJSONObject(CasesArr.Items[0]);
+    InArr := TJSONArray(CaseObj.Find('input'));
+    LogArr := TJSONArray(CaseObj.Find('logits'));
+    PreArr := TJSONArray(CaseObj.Find('prefix'));
+    SeqLen := CaseObj.Get('seq_len', 0);
+    Vocab := CaseObj.Get('vocab', 0);
+    PreLen := PreArr.Count;
+    // image input is flat (y, x, c).
+    Img.ReSize(W, H, NumCh);
+    for yy := 0 to H - 1 do
+      for x := 0 to W - 1 do
+        for ch := 0 to NumCh - 1 do
+        begin
+          FlatIdx := (yy * W + x) * NumCh + ch;
+          Img.FData[FlatIdx] := InArr.Items[FlatIdx].AsFloat;
+        end;
+    // decoder token prefix padded with BOS past the prefix (causal mask makes
+    // those positions invisible to the rows we read).
+    DecToks.ReSize(8, 1, 1);
+    for Pos := 0 to 7 do
+      if Pos < PreLen then DecToks.FData[Pos] := PreArr.Items[Pos].AsInteger
+      else DecToks.FData[Pos] := Config.BosTokenId;
+    RunBlipCaptionLogits(VisionNet, TextNet, Img, DecToks, Logits);
+    AssertEquals('logits vocab', Vocab, Logits.Depth);
+    // logits flat (pos, vocab) for the PreLen real prefix positions.
+    for Pos := 0 to SeqLen - 1 do
+      for v := 0 to Vocab - 1 do
+      begin
+        RefVal := LogArr.Items[Pos * Vocab + v].AsFloat;
+        GotVal := Logits[Pos, 0, v];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    AssertTrue('BLIP caption logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    DecToks.Free;
+    Img.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    TextNet.Free;
+  end;
+end;
+
+// Verifies the autoregressive greedy caption matches HF's generate() ids on the
+// pico fixture (BOS-prefixed in HF; our helper returns the generated ids only).
+procedure TTestNeuralPretrained.TestBlipCaptionGreedy;
+var
+  VisionNet, TextNet: TNNet;
+  Config: TBlipConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, InArr, CapArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img: TNNetVolume;
+  Gen: TNeuralIntegerArray;
+  W, H, NumCh, x, yy, ch, FlatIdx, i, RefIdx: integer;
+begin
+  RandSeed := 424242;
+  BuildBlipForCaptioningFromSafeTensors(FixturePath('tiny_blip.safetensors'),
+    VisionNet, TextNet, Config, {DecSeqLen=}12, {pInferenceOnly=}false,
+    FixturePath('tiny_blip_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_blip_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    CaseObj := TJSONObject(CasesArr.Items[0]);
+    InArr := TJSONArray(CaseObj.Find('input'));
+    CapArr := TJSONArray(CaseObj.Find('caption_ids'));
+    Img.ReSize(W, H, NumCh);
+    for yy := 0 to H - 1 do
+      for x := 0 to W - 1 do
+        for ch := 0 to NumCh - 1 do
+        begin
+          FlatIdx := (yy * W + x) * NumCh + ch;
+          Img.FData[FlatIdx] := InArr.Items[FlatIdx].AsFloat;
+        end;
+    Gen := DecodeBlipCaptionGreedy(VisionNet, TextNet, Img, Config,
+      {MaxNewTokens=}11);
+    // HF caption_ids = [BOS] + generated ids (incl. the EOS). Compare our
+    // generated ids (BOS excluded) against caption_ids[1..].
+    AssertTrue('HF caption has BOS prefix', CapArr.Count >= 1);
+    AssertEquals('first HF id is BOS', Config.BosTokenId,
+      CapArr.Items[0].AsInteger);
+    AssertEquals('generated length matches HF (minus BOS)',
+      CapArr.Count - 1, Length(Gen));
+    for i := 0 to Length(Gen) - 1 do
+    begin
+      RefIdx := CapArr.Items[i + 1].AsInteger;
+      AssertEquals('caption id ' + IntToStr(i), RefIdx, Gen[i]);
+    end;
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    TextNet.Free;
   end;
 end;
 
