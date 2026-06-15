@@ -740,17 +740,6 @@ rather than acted on.
   - [ ] MULTI-SPEAKER models (`num_speakers>1` / `speaker_embedding_size!=0`, the
         global-conditioning `cond` convs into the WaveNet/duration/decoder) —
         rejected loudly.
-  - [X] the `VitsTokenizer` (char vocab) so a STRING can be synthesized -
-        LANDED. `TNNetVitsTokenizer` (neuralpretrained.pas) loads the char->id
-        `vocab.json` + `add_blank`/`normalize` flags and `Encode(text)`
-        reproduces HF `VitsTokenizer(text)` exactly (per-char lowercasing,
-        out-of-vocab drop, blank/pad id 0 interleaved when add_blank=true);
-        TextToSpeech accepts a STRING arg. Parity vs the real
-        transformers.VitsTokenizer in `TestVitsTokenizerParity` (tiny committed
-        char-vocab fixture, incl. a multibyte vocab key). uroman/phonemizer
-        front-ends are OUT OF SCOPE (is_uroman/phonemize=true rejected loudly) -
-        feed already-romanized lowercase text; those front-ends are the only
-        remaining follow-up.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
@@ -824,30 +813,6 @@ rather than acted on.
       latent, decoded to a short (~5 s) clip written via the WAV writer; defer
       classifier-free-guidance tuning and long-form generation to a follow-up.
       DEPENDS ON the WAV writer + HiFi-GAN vocoder tasks above.
-- [ ] Kokoro-82M text-to-speech importer (`BuildKokoroFromSafeTensors[Ex]`,
-      `hexgrad/Kokoro-82M`) — the most popular *lightweight* open TTS model and a
-      genuinely DIFFERENT architecture from the landed VITS importer (no
-      normalizing flow, no stochastic duration). Kokoro is a StyleTTS2 derivative:
-      an embedding/text encoder + a duration/prosody predictor conditioned on a
-      fixed per-voice STYLE VECTOR, length-regulated, then an iSTFTNet decoder
-      (HiFi-GAN-style upsampling whose final block predicts magnitude+phase fed
-      through an inverse STFT instead of a transposed conv). Voice priority; reuses
-      the landed log-mel/STFT frontend, `SaveVolumeToWav16`, and the HiFi-GAN
-      generator blocks. Scope v1 to ONE built-in voice (one style vector baked in
-      from a committed pico fixture) producing a short clip from a phoneme-id
-      sequence; defer the g2p/phonemizer front-end (document feeding pre-phonemized
-      ids) and multi-voice blending to a follow-up. The new pieces are the
-      style-conditioned duration predictor and the iSTFT decoder tail.
-- [X] Classifier-free guidance for MusicGen generation (follow-up to the landed
-      text-conditioned examples/MusicGenText): the unconditional/null-prompt
-      branch + a guidance-scale blend of conditional vs. unconditional logits,
-      wired into TMusicGenModel.Generate. DONE: TMusicGenModel.GenerateCFG
-      (EncStates, UncondStates, NumFrames, GuidanceScale, out Codes) runs the
-      decoder twice/step and blends guided = uncond + scale*(cond - uncond)
-      before argmax; Generate delegates to it (scale 1.0, nil uncond = plain
-      greedy, bit-identical). null branch = zeroed text condition (HF). Test
-      TestMusicGenCFG (scale-1.0/nil/zero-uncond == plain; scale-3.0 shifts a
-      code) + examples/MusicGenText --guidance N flag + examples/README.md.
 - [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) and a real
       large downloaded musicgen-small checkpoint + a real tokenizer for the
       text prompt; plus KV-cache incremental decode and top-k/temperature
@@ -971,20 +936,9 @@ rather than acted on.
         sensible image, and consider a Karras-spaced / Euler-ancestral variant.
       Edit examples/README.md. Mind the 5-min/ulimit budget — default to a smoke run.
 
-- [X] RoIAlign pooling primitive LANDED (TNNetRoIAlign, neuralnetwork.pas) — the
-      genuinely-new leaf layer the Mask R-CNN item below depends on. Bilinear-sampled
-      fixed-size crop of a proposal box (torchvision roi_align aligned=True semantics:
-      spatial_scale, sampling_ratio<=0 adaptive, per-bin average of sampling_ratio^2
-      bilinear samples), sibling to the DeformableConv sampler/gradient. v1 = single
-      FIXED box per instance via Create(PooledW,PooledH,X1,Y1,X2,Y2,SpatialScale,
-      SamplingRatio) (+SetBox), exactly the externally-supplied-proposal inference path
-      the importer needs. Registered in both CreateLayer dispatch paths (round-trips).
-      Tests in TestNeuralNumerical.pas: forward vs torchvision-equivalent oracle (<1e-4),
-      full input numerical-gradient (max err 8.5e-4 < 1e-2), shape inference, SaveToString
-      round-trip. README layer list updated.
 - [ ] Mask R-CNN instance-segmentation importer + a RoIAlign primitive
-      (RoIAlign DEPENDENCY NOW SATISFIED — see the landed TNNetRoIAlign entry above;
-      remaining work is the importer/FPN/heads below)
+      (RoIAlign DEPENDENCY NOW SATISFIED — TNNetRoIAlign has landed in
+      neuralnetwork.pas; remaining work is the importer/FPN/heads below)
       (BuildMaskRCNNFromSafeTensors, e.g. torchvision maskrcnn_resnet50_fpn) — the
       FIRST instance-segmentation vertical (per-OBJECT binary masks, distinct from
       DETR's boxes-only, SegFormer's single dense class map, and SAM's prompt-driven
@@ -1089,15 +1043,6 @@ rather than acted on.
         first-principles float64 oracle on a random pico config; verify against a sliced
         real checkpoint once weights are available (the make_pico_*_fixture slicer
         pattern).
-- [X] Diffusion INPAINTING example (examples/ImageToImage --inpaint, or a sibling) — the
-      one-flag follow-up unblocked by the landed SDEdit examples/ImageToImage driver: reuse
-      the exact same encode->partial-noise->denoise->decode pipeline but, BEFORE each
-      reverse step, overwrite the UNMASKED latent region with the (re-noised to that
-      timestep) clean encoded latent, so only the masked region is regenerated while the
-      rest stays pixel-faithful (the RePaint / SD-inpaint resample trick). No new model:
-      it adds a mask volume + a per-step composite to the existing ImageToImage loop. The
-      diffusion-based sibling of the tracked GAN context-encoder examples/Inpainting.
-      CPU/ulimit-bounded smoke run on the same tiny fixtures, writing before/masked/after.
 - [ ] Structured-vision accuracy eval harness for the imported DETECTION and DENSE-
       prediction backbones (EvaluateDetectionMAP / EvaluateSegmentationMIoU + reports in
       neuralimagemetrics.pas, plus examples/VisionEval) — the verification backstop that
@@ -1231,24 +1176,14 @@ rather than acted on.
       first sharp, boundary-accurate, metric-depth model in the tree. Pico-fixture
       smoke + a real-checkpoint parity follow-up.
 
-- [X] Latent Consistency Model (LCM) few-step sampler in neuraldiffusion.pas
-      (TNNetLCMScheduler / LCMSample). The landed diffusion samplers (DDIM,
-      DPM-Solver++(2M), Euler/Euler-ancestral, Karras spacing) are all ITERATIVE
-      noise-prediction integrators needing ~20-50 steps and CFG-in-the-loop; an LCM
-      sampler is a genuinely different inference rule — it evaluates a learned
-      CONSISTENCY function f(x_t, t) that maps any noised latent directly toward the
-      solution, so generation is 1-4 steps with guidance baked in (no
-      cond/uncond double pass per step). New code is the consistency
-      parameterization (c_skip/c_out boundary scalings) + the multistep LCM loop
-      (predict x0, re-noise to the next, fewer timesteps from the
-      already-landed TNNetDiffusionScheduler timestep table). The TNNetLCMScheduler
-      class + LCMStep/LCMSample multistep loop + boundary scalings LANDED (commit
-      8557e99, tests in TestNeuralDiffusion.pas pin the math + the fixed-point loop).
-  - [ ] FOLLOW-UP (sampler is landed; this is the remaining wiring): expose the LCM
-        scheduler as an opt-in sampler in the examples/LatentTextToImage pipeline so
-        the landed pico PixArt/DiT + VAE renders in ~4 steps (no cond/uncond double
-        pass); add it to the example's regression smoke. A short note on the matching
-        LCM-distillation objective (consistency loss to a teacher) is enough for v1.
+- [ ] LCM sampler wiring into examples/LatentTextToImage (TNNetLCMScheduler /
+      LCMStep/LCMSample multistep loop + boundary scalings LANDED in
+      neuraldiffusion.pas, commit 8557e99, tests in TestNeuralDiffusion.pas):
+      expose the LCM scheduler as an opt-in sampler in the examples/LatentTextToImage
+      pipeline so the landed pico PixArt/DiT + VAE renders in ~4 steps (no cond/uncond
+      double pass); add it to the example's regression smoke. A short note on the
+      matching LCM-distillation objective (consistency loss to a teacher) is enough
+      for v1.
 
 - [ ] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
