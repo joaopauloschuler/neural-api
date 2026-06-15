@@ -295,81 +295,46 @@ rather than acted on.
       (TNNetTorchBinReader path); (b) real x4 upscale of a tiny PNG end-to-end
       example; (c) scale=2 / other scales (currently only scale=4 = two upsample
       stages wired).
-- [X] NAFNet image-restoration importer (BuildNAFNetFromSafeTensors[Ex] +
-      TNAFNetConfig) — the first non-diffusion image-to-image RESTORATION importer
-      that is NOT super-resolution (the landed RRDBNet/ESRGAN path is x4 upscaling
-      only). Landed:
-      [X] TNNetSimpleGate leaf layer in neuralnetwork.pas (split channel axis in
-          half + multiply; parameter-free GLU) with forward + backward, registered
-          in both layer-load tables, numerical-gradient + forward + serialization
-          tests in tests/TestNeuralNumerical.pas, added to README.md layer list.
-      [X] Simplified Channel Attention (SCA) via landed AvgChannel -> 1x1 conv ->
-          TNNetChannelMulByLayer (no activation).
-      [X] U-Net of NAFBlocks with per-pixel LayerNorm2d (TNNetTokenLayerNorm),
-          depthwise 3x3, stride-2 down conv, PixelShuffle up via TNNetDepthToSpace,
-          per-channel beta/gamma residual scales, global input skip.
-      [X] Pico parity vs a numpy float64 oracle (tools/nafnet_tiny_fixture.py,
-          tests/fixtures/tiny_nafnet.*, TestNAFNetParity asserts max|diff| < 1e-4).
-      [X] examples/ImageRestoration denoises a small image end-to-end on CPU
-          (writes before/after PPM); entry added to examples/README.md.
-      Deferred follow-ups:
-      [ ] Real official NAFNet denoise/deblur checkpoint parity (offline env — the
-          weights are large / not redistributable; importer uses the canonical
-          NAFNet state_dict key scheme so a real checkpoint should drop in).
-      [ ] PNG input/output (the example uses deterministic synthetic images + PPM;
-          no PNG decoder in-tree).
-      [ ] NAFBlock dropout + the wider official width/block configs are wired by
-          config but only the small pico shape is parity-pinned.
-- [X] SwinIR transformer image-restoration importer (BuildSwinIRFromSafeTensors[Ex])
-      — classical/lightweight super-resolution built on the LANDED Swin
-      window/shifted-window attention (reused TNNetWindowAttention + rel-pos bias +
-      cyclic-shift mask + TNNetGatherTokens partition/reverse). New code = the
-      shallow-feature conv stem, the Residual Swin Transformer Blocks (RSTB = depth
-      Swin layers + a 3x3 conv + residual over the block) and the pixel-shuffle
-      (TNNetDepthToSpace) upsample tail. Architecturally distinct from the CNN-only
-      RRDBNet SR and the SimpleGate-CNN NAFNet (transformer restoration). NO new
-      leaf layers.
-      [X] TSwinIRConfig + BuildSwinIRFromSafeTensors[Ex] (+ out-Config overload) in
-          neuralpretrained.pas; AddSwinIRLayer/LoadSwinIRLayer reuse the landed Swin
-          attention blocks (packed attn.qkv sliced into q/k/v at load).
-      [X] Pico parity vs a self-contained float64 numpy oracle
-          (tools/swinir_tiny_fixture.py -> tests/fixtures/tiny_swinir.*): 1 RSTB of
-          2 Swin layers (W-MSA + SW-MSA), window 2, embed 6, 2 heads, upscale 2;
-          TestSwinIRParity + TestSwinIRConfigFromJSONFile assert max|diff| < 1e-4.
-      [X] examples/SwinIRRestore end-to-end 2x SR smoke (pico fixture, ulimit-bounded)
-          + examples/README.md entry.
-      [ ] Pinned the classical-SR (pixel-shuffle upscale) variant; the
-          same-resolution denoise tail (upscale=1, single conv reconstruction) is
-          wired by config but only the SR shape is parity-pinned.
-      [ ] Real-checkpoint parity deferred (official SwinIR .safetensors are large /
-          not obtainable offline); the importer accepts a real checkpoint path.
-      [ ] Lightweight-SR (no conv_after_body / single shared upsample) and the
-          nearest+conv "real-world" SR upsampler variants not yet wired.
-- [X] RIFE real-time video frame-interpolation importer (BuildRIFEFromSafeTensors[Ex],
-      the IFNet of hzwer/Practical-RIFE) — fills the VIDEO-generative importer gap:
-      synthesises an intermediate frame between two input frames (the landed RAFT
-      estimates optical FLOW but does NOT synthesise frames, and
-      examples/FrameInterpolation is a from-scratch toy, not an importer). Landed:
-      TNNetBackwardWarp (RIFE-convention pixel-unit bilinear border-clamp backward
-      warp, two-source layer, full fwd+bwd, numerical-gradient-checked in
-      TestNeuralNumerical + README layer list); TRIFEConfig + BuildRIFE[FromSafeTensors[Ex]]
-      + ReadRIFEConfigFromJSONFile/RIFEConfigToString in neuralpretrained.pas (IFBlock =
-      conv0->PReLU->conv1->PReLU->lastconv(5=4flow+1mask), accumulated flow residuals,
-      sigmoid soft fusion mask blend); pico parity TestRIFEParity < 1e-4 vs the
-      tools/rife_tiny_fixture.py float64 numpy oracle (tests/fixtures/tiny_rife.*);
-      examples/VideoFrameInterpolation interpolates one middle frame between two
-      synthetic frames on CPU (ulimit-bounded smoke). Scope v1 = one frame t=0.5,
-      inference-only, small full-resolution IFNet.
-      [ ] Real Practical-RIFE checkpoint parity (offline-download deferred): the real
+- [ ] NAFNet image-restoration importer follow-ups (BuildNAFNetFromSafeTensors[Ex]
+      + TNAFNetConfig LANDED — TNNetSimpleGate gate layer + Simplified Channel
+      Attention + U-Net of NAFBlocks with LayerNorm2d / depthwise 3x3 / PixelShuffle;
+      pico parity TestNAFNetParity < 1e-4 vs a numpy float64 oracle;
+      examples/ImageRestoration end-to-end CPU denoise):
+  - [ ] Real official NAFNet denoise/deblur checkpoint parity (offline env — the
+        weights are large / not redistributable; importer uses the canonical
+        NAFNet state_dict key scheme so a real checkpoint should drop in).
+  - [ ] PNG input/output (the example uses deterministic synthetic images + PPM;
+        no PNG decoder in-tree).
+  - [ ] NAFBlock dropout + the wider official width/block configs are wired by
+        config but only the small pico shape is parity-pinned.
+- [ ] SwinIR transformer image-restoration importer follow-ups
+      (BuildSwinIRFromSafeTensors[Ex] + TSwinIRConfig LANDED — RSTB of Swin
+      window/shifted-window attention + 3x3 conv residual + pixel-shuffle upsample
+      tail, reusing the landed Swin attention blocks, NO new leaf layers; pico parity
+      TestSwinIRParity / TestSwinIRConfigFromJSONFile < 1e-4 vs a float64 numpy
+      oracle; examples/SwinIRRestore 2x SR smoke):
+  - [ ] Pinned the classical-SR (pixel-shuffle upscale) variant; the
+        same-resolution denoise tail (upscale=1, single conv reconstruction) is
+        wired by config but only the SR shape is parity-pinned.
+  - [ ] Real-checkpoint parity deferred (official SwinIR .safetensors are large /
+        not obtainable offline); the importer accepts a real checkpoint path.
+  - [ ] Lightweight-SR (no conv_after_body / single shared upsample) and the
+        nearest+conv "real-world" SR upsampler variants not yet wired.
+- [ ] RIFE video frame-interpolation importer follow-ups (BuildRIFEFromSafeTensors[Ex]
+      + TRIFEConfig + TNNetBackwardWarp LANDED — IFNet intermediate-frame synthesis
+      with accumulated flow residuals + sigmoid fusion-mask blend; pico parity
+      TestRIFEParity < 1e-4 vs a float64 numpy oracle;
+      examples/VideoFrameInterpolation one middle frame t=0.5, inference-only, on CPU):
+  - [ ] Real Practical-RIFE checkpoint parity (offline-download deferred): the real
           IFNet is MULTI-SCALE (stride-2 IFBlocks downsample then bilinearly upsample
           the predicted flow) and RE-FEEDS the warped frames + previous flow/mask into
           each successive block; v1 refines from the SAME [frame0|frame1] input at full
           resolution. Wire the scale schedule + warped-frame re-feeding and verify
           against an exported hzwer/Practical-RIFE checkpoint.
-      [ ] Arbitrary-t interpolation (t != 0.5) and the recursive 2x->4x multi-frame
-          schedule (RIFE's timestep encoding + recursion).
-      [ ] Privileged-distillation teacher (the training-time IFNet that sees the GT
-          middle frame); inference-only path is landed.
+  - [ ] Arbitrary-t interpolation (t != 0.5) and the recursive 2x->4x multi-frame
+        schedule (RIFE's timestep encoding + recursion).
+  - [ ] Privileged-distillation teacher (the training-time IFNet that sees the GT
+        middle frame); inference-only path is landed.
 - [ ] GFPGAN blind face-restoration importer (BuildGFPGANFromSafeTensors[Ex],
       TencentARC/GFPGAN) — leverages the LANDED StyleGAN2 generator
       (BuildStyleGAN2GeneratorFromSafeTensors) as a fixed facial prior: a U-Net
@@ -776,20 +741,10 @@ rather than acted on.
       LANDED, parity < 1e-4) -> VAE decoder (BuildVaeDecoderFromSafeTensors, LANDED)
       -> RGB, driven by the existing TNNetDiffusionScheduler DDIM/DPM-Solver++ loop
       with classifier-free guidance (PixArt uses a null/empty-caption uncond branch).
-      Suggested smaller, doable breakdown:
-  - [X] Step 1 — wire PixArtConditioning/PixArtDenoise into a multi-step DDIM/
-        DPM-Solver++ sampling loop over caller-supplied T5 states (fixture-only,
-        no real checkpoint): assert no NaN/Inf, produce a latent. Pure offline.
-        DONE: examples/LatentTextToImage (.lpr+.lpi) runs a CFG (cond = prompt T5
-        states; uncond = null/empty-caption ZERO states via ApplyCFG) DDIM /
-        DPM-Solver++(2M) loop over the pico PixArt; regression TestLatentText
-        ToImageSmoke asserts the latent (6,6,4) is finite.
-  - [X] Step 2 — decode the sampled latent through BuildVaeDecoderFromSafeTensors
-        (latent /0.18215 scaling) to an RGB image; write a PPM/PNG. Fixture VAE.
-        DONE: matched pico VAE decoder (tools/vae_decoder_ltt_fixture.py,
-        tests/fixtures/tiny_vae_decoder_ltt.*, latent_size 6 / latent_channels 4)
-        decodes the (6,6,4) latent to a (12,12,3) RGB image -> P6 PPM; the smoke
-        test asserts the decoded image is finite.
+      Steps 1 & 2 LANDED: examples/LatentTextToImage runs a CFG DDIM / DPM-Solver++(2M)
+      loop over the pico PixArt (regression TestLatentTextToImageSmoke) and decodes the
+      (6,6,4) latent through a matched pico VAE decoder to a (12,12,3) RGB P6 PPM.
+      Remaining steps:
   - [ ] Step 3 — add the real T5 tower (BuildT5FromSafeTensors) + CFG (cond vs
         empty-caption uncond) and a hard-coded prompt; ulimit-bounded demo that
         generates one small image. The CV-generative-stack-composes capstone.
@@ -945,50 +900,26 @@ rather than acted on.
       next-token logits for a mixed image+text prompt (reuse make_pico_*_fixture.py) +
       an examples/Qwen2VLDescribe that captions a tiny image (ulimit-bounded). The
       M-RoPE index builder also unblocks Qwen2.5-VL video (the temporal section) later.
-- [X] CLIPSeg text-prompted zero-shot segmentation importer (BuildCLIPSegFromSafeTensors,
-      e.g. CIDAS/clipseg-rd64-refined) — a genuinely DISTINCT dense-prediction output
-      modality: given an image and a free-text prompt (or a prompt image), it emits a
-      single-channel binary mask for "whatever the prompt names", with NO fixed label
-      set. Different from every landed/tracked segmentation vertical — SegFormer
-      (per-pixel argmax over a FIXED class list), SAM (geometric point/box prompts, no
-      semantics), Mask2Former (closed-vocab query set), and OWL-ViT (open-vocab BOXES,
-      not masks). The genuinely new piece is the lightweight FiLM-conditioned transformer
-      DECODER: the frozen CLIP ViT image tower (reuse BuildClipVisionTower) exposes a few
-      intermediate hidden states which are projected and FiLM-modulated by the CLIP TEXT
-      embedding of the prompt (BuildClipFromSafeTensors text tower), then upsampled
-      through a small transposed-conv stack to a HxW logit map. Reuses the landed CLIP
-      dual encoder + the TNNetDeMaxPool/conv upsampling blocks the VAE decoder already
-      uses; the new code is the conditional decoder wiring (text-embedding -> per-token
-      affine modulation of the visual tokens). Scope v1 to a SINGLE text prompt -> one
-      mask, inference-only. Pico parity vs an HF float64 oracle on the decoder logit map
-      for a fixed (image, prompt) pair (reuse make_pico_*_fixture.py) + an
-      examples/CLIPSegPrompt that writes a binary-mask PPM for a hand-typed prompt over a
-      tiny CPU image. First "text-prompt -> dense mask" importer; the segmentation
-      counterpart to the landed open-vocab DETECTION (OWL-ViT).
-      LANDED: TCLIPSegConfig + BuildCLIPSegFromSafeTensors[WithConfig] +
-      ReadCLIPSegConfigFromJSONFile/CLIPSegConfigToString + RunCLIPSeg (three nets:
-      vision/text/decoder) in neuralpretrained.pas; intermediate vision taps via the
-      returned Config.TapLayerIdx (read after VisionNet.Compute); FiLM via TNNetFiLM,
-      post-norm decoder block, ConvTranspose2d realized as PointwiseConvLinear(P²) +
-      TNNetDepthToSpace(P). Pico parity TestCLIPSegParity < 1e-4 vs the REAL HF
-      CLIPSegForImageSegmentation float64 oracle (tools/clipseg_tiny_fixture.py,
-      tests/fixtures/tiny_clipseg.*) — checks BOTH the conditional embedding and the
-      full mask logits; examples/CLIPSegPrompt writes a binary-mask PPM. Scope v1:
-      single text prompt -> one mask, inference-only, use_complex_transposed_convolution
-      = false.
-- [ ] CLIPSeg real-checkpoint parity (CIDAS/clipseg-rd64-refined) — verify
-      BuildCLIPSegFromSafeTensors against the REAL HF checkpoint logits (the offline env
-      could not download it; the pico parity already pins the math vs the real HF
-      classes). Needs the ~600 MB checkpoint + CLIP tokenizer ids; also exercises the
-      default extract_layers [3,6,9] and reduce_dim 64 (the pico uses [0,1]/6).
-- [ ] CLIPSeg complex transposed-conv upsample (use_complex_transposed_convolution=true)
-      — the rd64-refined head uses the 3-stage Conv2d(3x3)+ReLU+2× ConvTranspose2d
-      decoder instead of the single ConvTranspose2d v1 ships; add the 3x3 conv + the
-      two-stage DepthToSpace upsample and a pico parity for that branch.
-- [ ] CLIPSeg image-prompt (visual) conditioning — CLIPSeg can also condition on a
-      PROMPT IMAGE (conditional_pixel_values -> clip.get_image_features pooled embedding)
-      instead of text; v1 does text only. Add a RunCLIPSegImagePrompt path reusing the
-      vision tower's pooled class-token embedding as the conditional vector.
+- [ ] CLIPSeg text-prompted zero-shot segmentation importer follow-ups
+      (BuildCLIPSegFromSafeTensors[WithConfig] + TCLIPSegConfig + RunCLIPSeg LANDED —
+      frozen CLIP dual encoder + a FiLM-conditioned transposed-conv decoder emitting a
+      single-channel mask for a free-text prompt; pico parity TestCLIPSegParity < 1e-4
+      vs the REAL HF CLIPSegForImageSegmentation float64 oracle; examples/CLIPSegPrompt
+      writes a binary-mask PPM; v1 = single text prompt -> one mask, inference-only,
+      use_complex_transposed_convolution = false):
+  - [ ] Real-checkpoint parity (CIDAS/clipseg-rd64-refined) — verify against the REAL
+        HF checkpoint logits (the offline env could not download it; the pico parity
+        already pins the math vs the real HF classes). Needs the ~600 MB checkpoint +
+        CLIP tokenizer ids; also exercises the default extract_layers [3,6,9] and
+        reduce_dim 64 (the pico uses [0,1]/6).
+  - [ ] Complex transposed-conv upsample (use_complex_transposed_convolution=true) —
+        the rd64-refined head uses the 3-stage Conv2d(3x3)+ReLU+2× ConvTranspose2d
+        decoder instead of the single ConvTranspose2d v1 ships; add the 3x3 conv + the
+        two-stage DepthToSpace upsample and a pico parity for that branch.
+  - [ ] Image-prompt (visual) conditioning — CLIPSeg can also condition on a PROMPT
+        IMAGE (conditional_pixel_values -> clip.get_image_features pooled embedding)
+        instead of text; v1 does text only. Add a RunCLIPSegImagePrompt path reusing
+        the vision tower's pooled class-token embedding as the conditional vector.
 - [ ] TinyNeRF novel-view-synthesis example (examples/TinyNeRF) — a brand-new
       output modality for the tree: a learned implicit 3-D scene that renders an image
       from an arbitrary camera pose, the first differentiable VOLUME RENDERER in the
