@@ -707,6 +707,67 @@ rather than acted on.
       (do_stable_layer_norm), and the final encoder LayerNorm placement that
       pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
       contrastive masked-prediction heads currently dropped as ignorable tensors).
+- [ ] WAV writer in neuralaudio.pas (`SaveVolumeToWav16` / `WriteWav16File`) — the
+      symmetric counterpart to the landed `LoadWav16ToVolume`. The library can read
+      16 kHz mono PCM and compute the log-mel frontend, but has NO path to write a
+      waveform back to disk, which blocks listening to ANY synthesis output (neural
+      vocoder, TTS, EnCodec resynthesis, latent text-to-audio). v1: a 1-D float
+      TNNetVolume in [-1,1] -> canonical 16-bit PCM WAV (RIFF header + sample
+      clamping/dither), round-trip tested against `LoadWav16ToVolume` to <=1 LSB.
+      Prerequisite enabler for the speech/music tasks below.
+- [ ] HiFi-GAN neural vocoder importer (`BuildHiFiGANFromSafeTensors[Ex]`,
+      e.g. the `hifigan` generator shipped with most TTS stacks) — mel-spectrogram
+      -> waveform, the reusable synthesis backend shared by Tacotron2 / FastSpeech2 /
+      SpeechT5 / Bark / VITS-style models. The generator is purely convolutional:
+      transposed-Conv1d upsampling stages interleaved with Multi-Receptive-Field
+      (MRF) residual blocks (parallel dilated Conv1d sums). New pieces: a 1-D
+      transposed-conv upsampler and the MRF residual builder; the discriminators are
+      training-only and can be skipped for an inference importer. Verify a log-mel ->
+      audio pass against a diffusers/HF HiFi-GAN float oracle to ~1e-4 on a pico
+      fixture, then resynthesize a real clip and write it with the WAV writer above.
+      Reuses the weight-norm Conv1d already needed by the Wav2Vec2 feature extractor.
+- [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`,
+      e.g. `facebook/mms-tts-eng` or `kakao-enterprise/vits-ljs`) + an
+      examples/TextToSpeech demo — the FIRST text-to-speech model in the library and
+      a strong fit because the conditional-prior flow can REUSE the landed
+      `TNNetAffineCoupling` + `TNNetInvertible1x1Conv` (Glow) layers directly. At
+      inference VITS is: phoneme/char text encoder (relative-position transformer) ->
+      duration predictor -> length regulator that expands the latent sequence ->
+      normalizing-flow prior -> HiFi-GAN decoder (shared with the importer above) ->
+      waveform. Only the inference path is needed (drop the posterior encoder and the
+      stochastic-duration-predictor training branch; use the deterministic duration
+      readout). New pieces: the monotonic length-regulator expansion and the text
+      encoder's relative-position attention. Parity-check the flow + decoder on a pico
+      fixture, then synthesize a sentence to a WAV and report it in the README.
+- [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]`,
+      e.g. `laion/clap-htsat-unfused`) + an examples/ZeroShotAudioTag demo — the
+      audio-domain analogue of the landed CLIP dual-encoder (zero-shot audio
+      classification and audio<->text retrieval), but genuinely NOT a near-duplicate:
+      the image tower is replaced by an HTS-AT spectrogram transformer (Swin-style
+      hierarchical attention over the log-mel frontend already in neuralaudio.pas) and
+      the text tower is a RoBERTa/GPT-2 encoder, projected into a shared embedding
+      with an L2-normalize + logit-scale head exactly like CLIP. Reuses the existing
+      Swin attention blocks and the L2Normalize / logit-scale folding from the CLIP
+      path. Demo: embed a handful of UrbanSound/ESC-50-style clips and a set of text
+      prompts, print the cosine-similarity matrix and top-1 zero-shot label.
+- [ ] AudioLDM 2 / Stable Audio latent text-to-audio (music & sound) capstone —
+      text-prompt -> audio via LATENT diffusion, the audio analogue of the landed
+      LatentTextToImage (PixArt/DiT + VAE) pipeline and the natural home for the
+      music priority. Reuses the landed `TNNetDiffusionScheduler` samplers
+      (DDIM / DPM-Solver++(2M) / Euler) and a VAE/EnCodec latent codec; the new piece
+      is the importer for the audio U-Net/DiT denoiser conditioned on a text encoder
+      (CLAP or T5/FLAN-T5, both already importable) plus the mel-VAE decode ->
+      HiFi-GAN vocode -> WAV tail. Scope v1 as: denoiser + scheduler loop producing a
+      latent, decoded to a short (~5 s) clip written via the WAV writer; defer
+      classifier-free-guidance tuning and long-form generation to a follow-up.
+      DEPENDS ON the WAV writer + HiFi-GAN vocoder tasks above.
+- [ ] examples/SpeechCommands keyword-spotting trainer — the audio analogue of
+      SimpleImageClassifier and the first FROM-SCRATCH (no-import) audio training
+      example. Feed the existing log-mel frontend (neuralaudio.pas) into a small
+      conv stack to classify the Google Speech Commands v2 spoken-word set
+      ("yes"/"no"/"up"/"down"/...). Pure CPU, ships a tiny downloader + a
+      reproducible accuracy number; demonstrates that the audio frontend is usable
+      for ordinary supervised training, not only for pretrained-model import.
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
