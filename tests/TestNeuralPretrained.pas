@@ -339,6 +339,7 @@ type
     procedure TestDiTSchedulerSmoke;
     procedure TestPixArtConfigFromJSONFile;
     procedure TestPixArtParity;
+    procedure TestLatentTextToImageSmoke;
     procedure TestRRDBNetParity;
     procedure TestNAFNetConfigFromJSONFile;
     procedure TestNAFNetParity;
@@ -16138,6 +16139,119 @@ begin
     LatentInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// End-to-end latent text-to-image SMOKE test (examples/LatentTextToImage Steps
+// 1 & 2): the imported PixArt transformer drives the existing
+// TNNetDiffusionScheduler over a few DDIM steps from latent noise with
+// classifier-free guidance over CALLER-SUPPLIED T5 states (the cond branch uses
+// pinned text states; the uncond branch uses a null/empty caption = zero
+// states), producing a finite (sample_size,sample_size,in_channels) latent;
+// that latent is then decoded through the imported VAE decoder (/0.18215 scaling
+// is inside the decoder) to a finite RGB image. NO real checkpoint / NO network:
+// both are committed pico fixtures (tools/make_pico_pixart_fixture.py and
+// tools/vae_decoder_ltt_fixture.py), sized so the (6,6,4) PixArt latent flows
+// straight into the VAE decoder (latent_size 6, latent_channels 4) -> 12x12x3.
+// Step 3 (real T5 tower + real checkpoint) is a tracked follow-up.
+procedure TTestNeuralPretrained.TestLatentTextToImageSmoke;
+const
+  cGuidance = 4.0;
+  cNumSteps = 3;
+var
+  PixArtNet, VaeNet: TNNet;
+  PixCfg: TPixArtConfig;
+  VaeCfg: TVaeDecoderConfig;
+  Scheduler: TNNetDiffusionScheduler;
+  Latent, TextStates, NullStates, EpsCond, EpsUncond, EpsGuided, Image: TNNetVolume;
+  StepCnt, T, TPrev, x, yy, c, HW: integer;
+  AllFinite: boolean;
+begin
+  RandSeed := 424242;
+  PixArtNet := BuildPixArtFromSafeTensors(FixturePath('tiny_pixart.safetensors'),
+    {TextSeqLen=}5, PixCfg, {pInferenceOnly=}false,
+    FixturePath('tiny_pixart_config.json'));
+  VaeNet := BuildVaeDecoderFromSafeTensors(
+    FixturePath('tiny_vae_decoder_ltt.safetensors'), VaeCfg,
+    {pInferenceOnly=}false, FixturePath('tiny_vae_decoder_ltt_config.json'));
+  Scheduler := TNNetDiffusionScheduler.Create(100, dsLinear, dpEps);
+  Latent := TNNetVolume.Create;
+  TextStates := TNNetVolume.Create;
+  NullStates := TNNetVolume.Create;
+  EpsCond := TNNetVolume.Create;
+  EpsUncond := TNNetVolume.Create;
+  EpsGuided := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    AssertTrue('PixArt net built', PixArtNet <> nil);
+    AssertTrue('VAE net built', VaeNet <> nil);
+    // PixArt latent channels must match the VAE decoder latent channels so the
+    // sampled latent flows straight into the decoder.
+    AssertEquals('latent-channel match', PixCfg.InChannels, VaeCfg.LatentChannels);
+    AssertEquals('VAE latent grid match', PixCfg.SampleSize, VaeCfg.LatentGrid);
+
+    HW := PixCfg.SampleSize;
+    // Caller-supplied T5 states (cond) -- deterministic, NOT a real tokenizer.
+    TextStates.ReSize(PixCfg.TextSeqLen, 1, PixCfg.CaptionChannels);
+    for x := 0 to TextStates.Size - 1 do
+      TextStates.FData[x] := Sin(x * 0.31) * 0.5;
+    // Null/empty-caption uncond branch = zero states (PixArt CFG convention).
+    NullStates.ReSize(PixCfg.TextSeqLen, 1, PixCfg.CaptionChannels);
+    NullStates.Fill(0);
+
+    // Start from latent noise and run a CFG DDIM trajectory.
+    Latent.ReSize(HW, HW, PixCfg.InChannels);
+    Latent.RandomizeGaussian(1.0);
+    EpsCond.ReSize(HW, HW, PixCfg.InChannels);
+    EpsUncond.ReSize(HW, HW, PixCfg.InChannels);
+    EpsGuided.ReSize(HW, HW, PixCfg.InChannels);
+    Scheduler.ResetMultistep;
+    for StepCnt := 0 to cNumSteps - 1 do
+    begin
+      T := Scheduler.NumTimesteps -
+        (StepCnt * Scheduler.NumTimesteps) div cNumSteps;
+      if StepCnt = cNumSteps - 1 then TPrev := 0
+      else TPrev := Scheduler.NumTimesteps -
+        ((StepCnt + 1) * Scheduler.NumTimesteps) div cNumSteps;
+      PixArtDenoise(PixArtNet, PixCfg, Latent, T, TextStates, EpsCond);
+      PixArtDenoise(PixArtNet, PixCfg, Latent, T, NullStates, EpsUncond);
+      TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond, EpsGuided, cGuidance);
+      AssertEquals('eps grid', HW, EpsGuided.SizeX);
+      AssertEquals('eps channels', PixCfg.InChannels, EpsGuided.Depth);
+      Scheduler.Step(Latent, EpsGuided, T, TPrev, smDDIM, 0.0);
+    end;
+
+    // The sampled latent must be all-finite.
+    AllFinite := true;
+    for c := 0 to PixCfg.InChannels - 1 do
+      for yy := 0 to HW - 1 do
+        for x := 0 to HW - 1 do
+          if not (Latent[x, yy, c] = Latent[x, yy, c]) then AllFinite := false;
+    AssertTrue('denoised latent is finite', AllFinite);
+
+    // Step 2: decode the latent to an RGB image (the /0.18215 scaling lives
+    // inside the decoder's first MulByConstant layer).
+    VaeNet.Compute(Latent);
+    Image.Copy(VaeNet.GetLastLayer().Output);
+    AssertEquals('decoded image channels', VaeCfg.OutChannels, Image.Depth);
+    AssertEquals('decoded image grid', HW * 2, Image.SizeX); // one 2x upsample
+    AllFinite := true;
+    for c := 0 to Image.Depth - 1 do
+      for yy := 0 to Image.SizeY - 1 do
+        for x := 0 to Image.SizeX - 1 do
+          if not (Image[x, yy, c] = Image[x, yy, c]) then AllFinite := false;
+    AssertTrue('decoded image is finite', AllFinite);
+  finally
+    Image.Free;
+    EpsGuided.Free;
+    EpsUncond.Free;
+    EpsCond.Free;
+    NullStates.Free;
+    TextStates.Free;
+    Latent.Free;
+    Scheduler.Free;
+    VaeNet.Free;
+    PixArtNet.Free;
   end;
 end;
 

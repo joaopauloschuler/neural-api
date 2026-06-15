@@ -1,0 +1,14 @@
+{
+ "_class_name": "AutoencoderKL",
+ "block_out_channels": [
+  8,
+  16
+ ],
+ "layers_per_block": 1,
+ "latent_channels": 4,
+ "out_channels": 3,
+ "norm_num_groups": 4,
+ "latent_size": 6,
+ "scaling_factor": 0.18215,
+ "norm_eps": 1e-06
+}

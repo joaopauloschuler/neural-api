@@ -777,14 +777,27 @@ rather than acted on.
       -> RGB, driven by the existing TNNetDiffusionScheduler DDIM/DPM-Solver++ loop
       with classifier-free guidance (PixArt uses a null/empty-caption uncond branch).
       Suggested smaller, doable breakdown:
-  - [ ] Step 1 — wire PixArtConditioning/PixArtDenoise into a multi-step DDIM/
+  - [X] Step 1 — wire PixArtConditioning/PixArtDenoise into a multi-step DDIM/
         DPM-Solver++ sampling loop over caller-supplied T5 states (fixture-only,
         no real checkpoint): assert no NaN/Inf, produce a latent. Pure offline.
-  - [ ] Step 2 — decode the sampled latent through BuildVaeDecoderFromSafeTensors
+        DONE: examples/LatentTextToImage (.lpr+.lpi) runs a CFG (cond = prompt T5
+        states; uncond = null/empty-caption ZERO states via ApplyCFG) DDIM /
+        DPM-Solver++(2M) loop over the pico PixArt; regression TestLatentText
+        ToImageSmoke asserts the latent (6,6,4) is finite.
+  - [X] Step 2 — decode the sampled latent through BuildVaeDecoderFromSafeTensors
         (latent /0.18215 scaling) to an RGB image; write a PPM/PNG. Fixture VAE.
+        DONE: matched pico VAE decoder (tools/vae_decoder_ltt_fixture.py,
+        tests/fixtures/tiny_vae_decoder_ltt.*, latent_size 6 / latent_channels 4)
+        decodes the (6,6,4) latent to a (12,12,3) RGB image -> P6 PPM; the smoke
+        test asserts the decoded image is finite.
   - [ ] Step 3 — add the real T5 tower (BuildT5FromSafeTensors) + CFG (cond vs
         empty-caption uncond) and a hard-coded prompt; ulimit-bounded demo that
         generates one small image. The CV-generative-stack-composes capstone.
+        (Steps 1+2 supply only DETERMINISTIC SYNTHETIC T5 states + pico fixtures;
+        Step 3 swaps in a real T5 encoder + real PixArt/VAE checkpoint.)
+  - [ ] Follow-up — the pico PixArt + matched pico VAE are RANDOM (smoke only);
+        once a real checkpoint is wired (Step 3) re-verify the chain produces a
+        sensible image, and consider a Karras-spaced / Euler-ancestral variant.
       Edit examples/README.md. Mind the 5-min/ulimit budget — default to a smoke run.
 
 - [ ] Mask R-CNN instance-segmentation importer + a RoIAlign primitive
