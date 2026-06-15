@@ -353,17 +353,6 @@ rather than acted on.
       (TNNetTorchBinReader path); (b) real x4 upscale of a tiny PNG end-to-end
       example; (c) scale=2 / other scales (currently only scale=4 = two upsample
       stages wired).
-- [X] Next-frame video prediction example (examples/VideoPrediction) + TNNetConvLSTMCell
-      (commit 301f4fa): NEW leaf layer TNNetConvLSTMCell — conv gates (i/f/o/g) over a
-      spatial (H,W,HiddenC) hidden+cell state, T frames packed on the X axis, exact BPTT
-      carrying both dL/dc_t and dL/dh_t right-to-left through the h_{t-1} gate coupling;
-      registered in both CreateLayer dispatch tables; numerical-gradient input 9.8e-4 /
-      weight 1.5e-3; added to main README. Example: download-free moving-blob clips,
-      ConvLSTM encoder -> Crop last-step -> conv+Tanh head, SMOKE ~28s, held-out MSE
-      1.20 -> 0.095 (~92% drop), ASCII (inputs|pred|gt) panel + PPM, --full flag.
-      (The tracked TNNetConvolution3D + VideoMAE tasks remain a separate spatiotemporal
-      option/follow-up; ConvGRU for the tracked RAFT optical-flow task can reuse this
-      conv-recurrent pattern.)
 - [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
       torchvision) — PARTIAL (commit 503540b): the branch-concatenation block
       builder LANDED (AddInceptionAModule runs 4 parallel branches
@@ -392,12 +381,11 @@ rather than acted on.
       offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
       examples can opt into perceptual fine-tuning (the VGG build already enables
       input/error collection, so the gradient path exists).
-- [X] DETR object-detection importer (BuildDetrFromSafeTensors/...Ex,
-      facebook/detr-resnet-50) — LANDED (TestDetrObjectDetectionParity in
-      tests/TestNeuralPretrained.pas, tiny_detr.safetensors fixture). First
-      object-detection importer: ResNet-50 backbone + transformer enc-dec + learned
-      object queries + 2-D sinusoidal pos embedding + sigmoid-cxcywh box/class heads,
-      inference-only (no Hungarian matcher). FOLLOW-UP:
+- [ ] DETR object-detection importer follow-up (BuildDetrFromSafeTensors/...Ex,
+      facebook/detr-resnet-50, LANDED — TestDetrObjectDetectionParity in
+      tests/TestNeuralPretrained.pas, tiny_detr.safetensors fixture; ResNet-50 backbone +
+      transformer enc-dec + learned object queries + 2-D sinusoidal pos embedding +
+      sigmoid-cxcywh box/class heads, inference-only, no Hungarian matcher):
   - [ ] examples/ObjectDetection demo that draws boxes on one CPU image (the importer +
         parity test exist; no example yet).
 - [ ] TNNetConvolution3D layer (spatiotemporal / volumetric conv, depth axis =
@@ -884,37 +872,23 @@ rather than acted on.
       overlays one object mask on a tiny CPU image. RoIAlign also unblocks any future
       two-stage detector (Faster R-CNN box head).
 
-- [X] TrOCR optical-character-recognition importer (BuildTrOCRFromSafeTensors, commit
-      2000f69: TTrOCRConfig + reader/ToString + ...Ex/...WithConfig, RunTrOCRLogits,
-      DecodeTrOCRGreedy; DeiT encoder reuses AddClipEncoderBlock (biased patch conv, cls
-      + distillation tokens folded into pos rows 0/1, emits all num_patches+2 tokens, no
-      pool); decoder reuses BuildBartStackBlocks + LoadMarianStack on the T5EncoderStates
-      two-net convention (learned +2-offset positions, scale_embedding, tied head, no
-      final_logits_bias). No new layer class. TestTrOCRParity decoder logits < 1e-4 vs a
-      real-transformers float64 oracle + examples/OCRTranscribe. FOLLOW-UPS:
+- [ ] TrOCR optical-character-recognition importer follow-up (BuildTrOCRFromSafeTensors
+      LANDED, commit 2000f69; DeiT encoder + Bart decoder on the T5EncoderStates two-net
+      convention, TestTrOCRParity decoder logits < 1e-4 + examples/OCRTranscribe):
   - [ ] tensor-name mapping targets the transformers 5.11 layout
         (encoder.layers.N.attention.q_proj, decoder.model.decoder.*); add the published
         checkpoints' older DeiT naming if it differs (the fixture is the parity contract).
-- [X] EfficientNet (timm / torchvision efficientnet_b0..b7) real-checkpoint importer
-      (BuildEfficientNetFromSafeTensors, commit d35970c: TEfficientNetConfig + reader/
-      ToString + AddEfficientNetMBConv reusing MobileNetV3 MBConv + conv-BN fold;
-      SiLU everywhere, plain-sigmoid SE, single classifier Linear, stochastic-depth =
-      inference no-op; per-block table JSON-driven so b0..b7 share one builder; no new
-      layer class; TestEfficientNetImageClassificationParity max|diff| < 1e-4 vs a numpy
-      float64 oracle, hand-built since timm/torchvision absent). FOLLOW-UPS:
+- [ ] EfficientNet (timm / torchvision efficientnet_b0..b7) importer follow-up
+      (BuildEfficientNetFromSafeTensors LANDED, commit d35970c; AddEfficientNetMBConv
+      reusing MobileNetV3 MBConv + conv-BN fold, b0..b7 share one JSON-driven builder,
+      TestEfficientNetImageClassificationParity max|diff| < 1e-4 vs a numpy float64 oracle):
   - [ ] real torchvision/timm efficientnet_b0 checkpoint parity + top-1 via the tracked
         ImageNet eval harness (the landed parity is the hand-built pico oracle only).
 
-- [X] StyleGAN2 generator importer (BuildStyleGAN2Generator, commit 8d72b95: NEW leaf
-      layer TNNetModulatedConv2D (weight-space per-input-channel style scale + RMS
-      demodulation, toggleable; second-source style input like TNNetHyperConv; backward
-      to kernel-through-demod + feature + style, numerical-gradient input 3.07e-4 /
-      weight-demod 2.92e-3 / style 8.18e-4 / weight-no-demod 3.54e-4, all under tol).
-      Mapping MLP z->w, synthesis from learned const through nearest-x2 upsample +
-      modulated conv + ReZero-strength noise + LeakyReLU blocks + summed toRGB skip
-      tower; inference-only. TestStyleGAN2GeneratorParity < 1e-4 vs a numpy float64
-      oracle (config-faithful pico, official weights unobtainable offline) +
-      examples/StyleGAN2Generate. FOLLOW-UPS:
+- [ ] StyleGAN2 generator importer follow-ups (BuildStyleGAN2Generator + NEW leaf layer
+      TNNetModulatedConv2D LANDED, commit 8d72b95; mapping MLP z->w + synthesis tower of
+      modulated conv + ReZero noise + LeakyReLU + summed toRGB skips, inference-only,
+      TestStyleGAN2GeneratorParity < 1e-4 vs a numpy float64 oracle + examples/StyleGAN2Generate):
   - [ ] per-pixel 1-channel BROADCAST random noise (v1 stores full-depth fixed noise maps
         in the safetensors for deterministic oracle-exact synthesis — wire the standard
         per-pixel broadcast noise for real stochastic synthesis).
@@ -1146,14 +1120,3 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       with loss-difference direction >90% of the time across a small grid.
 - [ ] Coverage matrix at the top of TestNeuralNumerical.pas: per-class
       `[grad] [serialize]` block, written by a small script.
-
-## Lucky-day additions 2026-06-14 (CV / generative / imports)
-
-- [X] Few-step Consistency-Model distillation example (examples/ConsistencyDistill,
-      commit 4348fe0): distills a multi-step DDPM teacher into a consistency model
-      f(x_t,t)=c_skip(t)*x + c_out(t)*F(x,t) (Karras boundary param, f(x,t->0)=x),
-      consistency-distillation loss along a deterministic teacher DDIM step, EMA target
-      net via the landed TNNetEMAWrapper, multistep few-step sampler. Reuses the
-      DiffusionMNIST U-Net + TNNetDiffusionScheduler wholesale; no new layer. SMOKE 1:47,
-      287MB RSS; nearest-train MSE teacher-16-step 2.04 vs consistency 1-step 0.88 /
-      2-step 0.69 / 4-step 0.71. Synthetic fallback if MNIST idx files absent.
