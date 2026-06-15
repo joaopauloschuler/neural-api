@@ -6946,6 +6946,107 @@ function BuildSwinIRFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet; overload;
 
 // ---------------------------------------------------------------------------
+// CLIPSeg TEXT-PROMPTED ZERO-SHOT SEGMENTATION IMPORT (model_type "clipseg")
+// -- the repo's FIRST "free-text prompt -> dense single-channel mask"
+// importer (Lueddecke & Ecker 2022, "Image Segmentation Using Text and Image
+// Prompts", arXiv:2112.10003; CIDAS/clipseg-rd64-refined). There is NO fixed
+// label set: given an image and an arbitrary text prompt it emits one HxW
+// logit map for "whatever the prompt names".
+//
+// REUSE is heavy: the FROZEN CLIP ViT image tower is BuildClipVisionTower and
+// the FROZEN CLIP text tower is the BuildClipFromSafeTensors text half (both
+// pre-LN CLIP encoder blocks). The genuinely NEW piece is a lightweight
+// FiLM-conditioned transformer DECODER:
+//   1. the vision tower exposes the hidden states AFTER each tapped encoder
+//      block (config.extract_layers, default [3,6,9]); these (Tok,1,vHidden)
+//      activations are read off the vision net after RunCLIPSeg (the tap
+//      layer indices are returned in the config -- the T5EncoderStatesInput
+//      "fill an Input before Compute" idiom, generalized to several inputs);
+//   2. the CLIP TEXT embedding of the prompt (text_projection of the eot
+//      token, NOT L2-normalized) is the conditional embedding;
+//   3. the DECODER processes the taps in REVERSE order: out := reduces[i](
+//      activation[i]) [+ out]; at the conditional_layer FiLM-modulates with
+//      film_mul(cond)*out + film_add(cond) (TNNetFiLM, gamma|beta broadcast
+//      over the token axis), then a POST-norm CLIP-style transformer block
+//      (relu MLP) refines it;
+//   4. drop the CLS token, reshape (grid,grid,reduce_dim) and a single
+//      non-overlapping ConvTranspose2d(reduce_dim, 1, patch, stride=patch)
+//      upsamples to the (patch*grid)=image_size logit map. That transposed
+//      conv is realized as PointwiseConvLinear(patch*patch) + TNNetDepthToSpace
+//      (channel patch_w*patch + patch_h carries spatial offset (x=patch_w,
+//      y=patch_h)). v1 covers use_complex_transposed_convolution=false.
+// SCOPE v1: a SINGLE text prompt -> one mask, inference path. Image-prompt
+// conditioning and the 3-stage complex transposed conv are deferred.
+// ---------------------------------------------------------------------------
+type
+  TCLIPSegConfig = record
+    Text: TClipTowerConfig;       // text_config encoder-block shape
+    Vision: TClipTowerConfig;     // vision_config (the frozen ViT tower)
+    TextVocabSize: integer;       // text_config.vocab_size
+    TextMaxPositions: integer;    // text_config.max_position_embeddings
+    EosTokenId: integer;          // text_config.eos_token_id (2 = argmax pool)
+    ImageSize: integer;           // vision_config.image_size
+    PatchSize: integer;           // vision_config.patch_size
+    NumChannels: integer;         // vision_config.num_channels (3)
+    ProjectionDim: integer;       // projection_dim (conditional-embed width)
+    ReduceDim: integer;           // reduce_dim (decoder working width)
+    ExtractLayers: TNeuralIntegerArray; // tapped vision-encoder block indices
+    ConditionalLayer: integer;    // decoder stage that applies FiLM (0)
+    DecoderHeads: integer;        // decoder_num_attention_heads
+    DecoderIntermediate: integer; // decoder_intermediate_size
+    UseComplexTransposedConv: boolean; // use_complex_transposed_convolution
+    // Filled by BuildCLIPSegFromSafeTensors: the VisionNet layer index whose
+    // Output holds the hidden state of tapped block ExtractLayers[i] (read
+    // after VisionNet.Compute; feed DecoderNet input i in REVERSE order).
+    TapLayerIdx: TNeuralIntegerArray;
+    ModelType: string;            // 'clipseg'
+  end;
+
+// Reads a HF CLIPSeg config.json (model_type "clipseg"). Required sub-objects
+// text_config / vision_config (hidden_size, intermediate_size,
+// num_hidden_layers, num_attention_heads; + vocab_size +
+// max_position_embeddings on text, image_size + patch_size on vision).
+// Top-level: projection_dim (512), reduce_dim (64), extract_layers
+// ([3,6,9]), conditional_layer (0), decoder_num_attention_heads (4),
+// decoder_intermediate_size (2048), use_complex_transposed_convolution
+// (false). hidden_act on the towers defaults to quick_gelu; the DECODER
+// always uses relu (per modeling_clipseg).
+function ReadCLIPSegConfigFromJSONFile(const FileName: string): TCLIPSegConfig;
+
+function CLIPSegConfigToString(const Config: TCLIPSegConfig): string;
+
+// Builds the three CLIPSeg nets and loads every weight from the checkpoint at
+// FileName. VisionNet: (image_size,image_size,num_channels) pixels ->
+// (num_patches+1,1,vision_hidden) hidden states; tap the per-block hidden
+// states at Config.TapLayerIdx[i].  TextNet: (TextSeqLen,1,1) token ids ->
+// (TextSeqLen,1,projection_dim) per-token text embeddings (pool the eot row
+// with ClipTextEosPosition).  DecoderNet: NumTaps+1 inputs -- input i (i in
+// 0..NumTaps-1) is the tap activation for ExtractLayers in REVERSE order, the
+// last input is the (1,1,projection_dim) conditional embedding -- and outputs
+// the (image_size,image_size,1) logit mask. All three nets are owned by the
+// caller. Use RunCLIPSeg to drive the pipeline end to end.
+procedure BuildCLIPSegFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TCLIPSegConfig; out VisionNet, TextNet, DecoderNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+procedure BuildCLIPSegFromSafeTensors(const FileName: string;
+  out VisionNet, TextNet, DecoderNet: TNNet; out Config: TCLIPSegConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Runs the full CLIPSeg pipeline: VisionNet.Compute(ImageInput), reads the
+// tapped hidden states at Config.TapLayerIdx, TextNet.Compute(TokenIds) and
+// pools the eot row as the conditional embedding, then DecoderNet.Compute over
+// (reversed taps + conditional embedding) and copies the (image_size,
+// image_size,1) logit mask into Logits (resized as needed). ImageInput is the
+// CLIP-preprocessed pixel volume; TokenIds the (TextSeqLen,1,1) text input.
+procedure RunCLIPSeg(VisionNet, TextNet, DecoderNet: TNNet;
+  const Config: TCLIPSegConfig; ImageInput, TokenIds: TNNetVolume;
+  Logits: TNNetVolume);
+
+// ---------------------------------------------------------------------------
 // StyleGAN2 GENERATOR IMPORT (model_type "stylegan2") -- the repo's FIRST
 // STYLE-BASED generative synthesis importer (Karras et al. 2020,
 // arXiv:1912.04958). INFERENCE-ONLY synthesis: an 8-layer mapping MLP turns a
@@ -41748,6 +41849,542 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadSwinIRConfigFromJSONFile(ConfigPath);
   Result := BuildSwinIRFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// CLIPSeg TEXT-PROMPTED ZERO-SHOT SEGMENTATION IMPORT (model_type "clipseg")
+// ===========================================================================
+
+function ReadCLIPSegConfigFromJSONFile(
+  const FileName: string): TCLIPSegConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, TowerObj: TJSONObject;
+  ExtractArr: TJSONArray;
+  i: integer;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    Data: TJSONData;
+  begin
+    Data := Obj.Find(FieldName);
+    if (Data = nil) or not (Data is TJSONObject) then
+      ImportError('CLIPSeg import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(Data);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('CLIPSeg import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('CLIPSeg import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+  procedure ReadTower(O: TJSONObject; var Tower: TClipTowerConfig);
+  begin
+    Tower.HiddenSize := RequiredInt(O, 'hidden_size');
+    Tower.IntermediateSize := RequiredInt(O, 'intermediate_size');
+    Tower.NumLayers := RequiredInt(O, 'num_hidden_layers');
+    Tower.NumHeads := RequiredInt(O, 'num_attention_heads');
+    Tower.LayerNormEps := O.Get('layer_norm_eps', 0.00001);
+    Tower.HiddenAct := ClipHiddenActFromString(
+      O.Get('hidden_act', 'quick_gelu'));
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('CLIPSeg import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('CLIPSeg import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('CLIPSeg import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'clipseg');
+    if Result.ModelType <> 'clipseg' then
+      ImportError('CLIPSeg import: config model_type is "' +
+        Result.ModelType + '" - only "clipseg" is supported here.');
+
+    TowerObj := RequiredSubObject('text_config');
+    ReadTower(TowerObj, Result.Text);
+    Result.TextVocabSize := RequiredInt(TowerObj, 'vocab_size');
+    Result.TextMaxPositions :=
+      RequiredInt(TowerObj, 'max_position_embeddings');
+    Result.EosTokenId := TowerObj.Get('eos_token_id', 2);
+
+    TowerObj := RequiredSubObject('vision_config');
+    ReadTower(TowerObj, Result.Vision);
+    Result.ImageSize := RequiredInt(TowerObj, 'image_size');
+    Result.PatchSize := RequiredInt(TowerObj, 'patch_size');
+    Result.NumChannels := TowerObj.Get('num_channels', 3);
+
+    Result.ProjectionDim := Obj.Get('projection_dim', 512);
+    Result.ReduceDim := Obj.Get('reduce_dim', 64);
+    Result.ConditionalLayer := Obj.Get('conditional_layer', 0);
+    Result.DecoderHeads := Obj.Get('decoder_num_attention_heads', 4);
+    Result.DecoderIntermediate := Obj.Get('decoder_intermediate_size', 2048);
+    Result.UseComplexTransposedConv :=
+      Obj.Get('use_complex_transposed_convolution', false);
+    // extract_layers (default [3,6,9]).
+    if (Obj.IndexOfName('extract_layers') >= 0) and
+       (Obj.Find('extract_layers') is TJSONArray) then
+    begin
+      ExtractArr := TJSONArray(Obj.Find('extract_layers'));
+      SetLength(Result.ExtractLayers, ExtractArr.Count);
+      for i := 0 to ExtractArr.Count - 1 do
+        Result.ExtractLayers[i] := ExtractArr.Items[i].AsInteger;
+    end
+    else
+    begin
+      SetLength(Result.ExtractLayers, 3);
+      Result.ExtractLayers[0] := 3;
+      Result.ExtractLayers[1] := 6;
+      Result.ExtractLayers[2] := 9;
+    end;
+    SetLength(Result.TapLayerIdx, 0);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function CLIPSegConfigToString(const Config: TCLIPSegConfig): string;
+var
+  i: integer;
+  ExtStr: string;
+begin
+  ExtStr := '';
+  for i := 0 to Length(Config.ExtractLayers) - 1 do
+  begin
+    if i > 0 then ExtStr := ExtStr + ',';
+    ExtStr := ExtStr + IntToStr(Config.ExtractLayers[i]);
+  end;
+  Result := Config.ModelType + ' config: vision(d=' +
+    IntToStr(Config.Vision.HiddenSize) + ', layers=' +
+    IntToStr(Config.Vision.NumLayers) + ', heads=' +
+    IntToStr(Config.Vision.NumHeads) + ', image=' +
+    IntToStr(Config.ImageSize) + ', patch=' + IntToStr(Config.PatchSize) +
+    '), text(d=' + IntToStr(Config.Text.HiddenSize) + ', layers=' +
+    IntToStr(Config.Text.NumLayers) + ', vocab=' +
+    IntToStr(Config.TextVocabSize) + '), proj_dim=' +
+    IntToStr(Config.ProjectionDim) + ', reduce_dim=' +
+    IntToStr(Config.ReduceDim) + ', extract_layers=[' + ExtStr +
+    '], conditional_layer=' + IntToStr(Config.ConditionalLayer) +
+    ', decoder(heads=' + IntToStr(Config.DecoderHeads) + ', ffn=' +
+    IntToStr(Config.DecoderIntermediate) + '), complex_tconv=' +
+    BoolToStr(Config.UseComplexTransposedConv, true);
+end;
+
+type
+  // Layer refs needed to load one CLIPSeg POST-norm decoder block.
+  TCLIPSegDecoderRefs = record
+    QKV, AttnDense, LN1, Fc1, Fc2, LN2: TNNetLayer;
+  end;
+
+// Appends ONE CLIPSeg decoder block to NN over the (Tok,1,reduce_dim) token
+// sequence feeding `inp`. POST-norm (LayerNorm AFTER each residual, unlike the
+// pre-norm CLIP encoder block), relu MLP. Standard 1/sqrt(head_dim) SDPA, NO
+// causal mask. Returns the block output and the weight-load refs.
+function AddCLIPSegDecoderBlock(NN: TNNet; inp: TNNetLayer;
+  ReduceDim, Heads, Intermediate: integer; LayerNormEps: TNeuralFloat;
+  out Refs: TCLIPSegDecoderRefs): TNNetLayer;
+var
+  Residual, Attn, AfterLN1, Mlp: TNNetLayer;
+begin
+  Residual := inp;
+  Refs.QKV := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(3 * ReduceDim), inp);
+  Refs.AttnDense := NN.AddMultiHeadSelfAttention(Heads, {CausalMask=}false);
+  Attn := NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), Residual]) );
+  AfterLN1 := NN.AddLayer( TNNetTokenLayerNorm.Create(LayerNormEps) );
+  Refs.LN1 := AfterLN1;
+  Residual := AfterLN1;
+  Refs.Fc1 := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Intermediate) );
+  NN.AddLayer( TNNetReLU.Create() );
+  Refs.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(ReduceDim) );
+  Mlp := NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), Residual]) );
+  Refs.LN2 := NN.AddLayer( TNNetTokenLayerNorm.Create(LayerNormEps) );
+  if Attn = nil then ;  // silence unused
+  if Mlp = nil then ;
+  Result := NN.GetLastLayer();
+end;
+
+procedure LoadCLIPSegDecoderBlock(Reader: TNNetSafeTensorsReader;
+  const Refs: TCLIPSegDecoderRefs; const Prefix: string;
+  ReduceDim, Intermediate: integer);
+var
+  d: integer;
+begin
+  d := ReduceDim;
+  LoadLlamaLinearWeights(Reader, Refs.QKV,
+    Prefix + 'self_attn.q_proj.weight', d, d, 0, 3 * d, 0,
+    Prefix + 'self_attn.q_proj.bias');
+  LoadLlamaLinearWeights(Reader, Refs.QKV,
+    Prefix + 'self_attn.k_proj.weight', d, d, d, 3 * d, 0,
+    Prefix + 'self_attn.k_proj.bias');
+  LoadLlamaLinearWeights(Reader, Refs.QKV,
+    Prefix + 'self_attn.v_proj.weight', d, d, 2 * d, 3 * d, 0,
+    Prefix + 'self_attn.v_proj.bias');
+  LoadLlamaLinearWeights(Reader, Refs.AttnDense,
+    Prefix + 'self_attn.out_proj.weight', d, d, 0, -1, 0,
+    Prefix + 'self_attn.out_proj.bias');
+  LoadLayerNormWeights(Reader, Refs.LN1,
+    Prefix + 'layer_norm1.weight', Prefix + 'layer_norm1.bias', d);
+  LoadLlamaLinearWeights(Reader, Refs.Fc1, Prefix + 'mlp.fc1.weight',
+    d, Intermediate, 0, -1, 0, Prefix + 'mlp.fc1.bias');
+  LoadLlamaLinearWeights(Reader, Refs.Fc2, Prefix + 'mlp.fc2.weight',
+    Intermediate, d, 0, -1, 0, Prefix + 'mlp.fc2.bias');
+  LoadLayerNormWeights(Reader, Refs.LN2,
+    Prefix + 'layer_norm2.weight', Prefix + 'layer_norm2.bias', d);
+end;
+
+// Loads the non-overlapping ConvTranspose2d(reduce_dim, 1, P, stride=P) into a
+// PointwiseConvLinear(P*P) whose neuron (pw*P + ph) carries the spatial offset
+// (x=pw, y=ph) for the downstream TNNetDepthToSpace(P) (out[ix*P+sx, iy*P+sy] =
+// in[ix,iy,(sx*P+sy)]). HF weight is [reduce_dim, 1, ph, pw]; CAI neuron k =
+// pw*P + ph has Weights[c] = W[c, 0, ph, pw], BiasWeight = bias[0].
+procedure LoadCLIPSegTransposedConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string; ReduceDim, P: integer);
+var
+  W, B: TNNetVolume;
+  c, ph, pw, k: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('CLIPSeg import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> ReduceDim) or
+     (Reader.DimSize(WName, 1) <> 1) or
+     (Reader.DimSize(WName, 2) <> P) or
+     (Reader.DimSize(WName, 3) <> P) then
+    ImportError('CLIPSeg import: "' + WName + '" must have shape [' +
+      IntToStr(ReduceDim) + ', 1, ' + IntToStr(P) + ', ' + IntToStr(P) +
+      '] (ConvTranspose2d [in,out,kh,kw]), got ' + Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> P * P then
+    ImportError('CLIPSeg import: internal error - transposed conv has ' +
+      IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(P * P) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    for pw := 0 to P - 1 do
+      for ph := 0 to P - 1 do
+      begin
+        k := pw * P + ph;
+        for c := 0 to ReduceDim - 1 do
+          Layer.Neurons[k].Weights.FData[c] :=
+            W.FData[((c * 1 + 0) * P + ph) * P + pw];
+        Layer.Neurons[k].BiasWeight := B.FData[0];
+      end;
+  finally
+    W.Free;
+    B.Free;
+  end;
+  Layer.FlushWeightCache();
+end;
+
+procedure BuildCLIPSegFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TCLIPSegConfig; out VisionNet, TextNet, DecoderNet: TNNet;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  // text tower
+  TokEmb, PosEmb, FinalLN, TProj: TNNetLayer;
+  TBlocks: TClipBlockLayersArray;
+  // vision tower
+  PatchConv, VPosEmb, VPreLN: TNNetLayer;
+  VBlocks: TClipBlockLayersArray;
+  Tbl: TNNetVolume;
+  // decoder
+  TapInputs, ReduceLayers: array of TNNetLayer;
+  CondInput, FilmMul, FilmAdd, FilmCond, Acc, Reduced, FilmOut: TNNetLayer;
+  TransConv: TNNetLayer;
+  DecRefs: array of TCLIPSegDecoderRefs;
+  SeqLen, Grid, NumPatches, NumTaps, i, TapBlock, ChanCnt, NumTokens: integer;
+  PreLNName: string;
+begin
+  VisionNet := nil;
+  TextNet := nil;
+  DecoderNet := nil;
+  if (Config.Vision.NumHeads < 1) or
+     ((Config.Vision.HiddenSize mod Config.Vision.NumHeads) <> 0) then
+    ImportError('CLIPSeg import: vision hidden_size not divisible by heads.');
+  if (Config.PatchSize < 1) or ((Config.ImageSize mod Config.PatchSize) <> 0) then
+    ImportError('CLIPSeg import: image_size not a multiple of patch_size.');
+  if Config.UseComplexTransposedConv then
+    ImportError('CLIPSeg import: use_complex_transposed_convolution=true is ' +
+      'not supported yet (v1 covers the single ConvTranspose2d upsample).');
+  Grid := Config.ImageSize div Config.PatchSize;
+  NumPatches := Grid * Grid;
+  NumTokens := NumPatches + 1;
+  NumTaps := Length(Config.ExtractLayers);
+  if NumTaps < 1 then
+    ImportError('CLIPSeg import: extract_layers must list at least one block.');
+  for i := 0 to NumTaps - 1 do
+    if (Config.ExtractLayers[i] < 0) or
+       (Config.ExtractLayers[i] >= Config.Vision.NumLayers) then
+      ImportError('CLIPSeg import: extract_layers entry ' +
+        IntToStr(Config.ExtractLayers[i]) + ' out of range [0,' +
+        IntToStr(Config.Vision.NumLayers - 1) + '].');
+
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  try
+    try
+      // ---------------- VISION tower (frozen CLIP ViT) ----------------
+      // Built inline so we can tap the hidden state AFTER each extract block.
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+        Config.NumChannels) );
+      PatchConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+        Config.Vision.HiddenSize, Config.PatchSize, 0, Config.PatchSize, 1) );
+      NN.AddLayer( TNNetReshape.Create(NumPatches, 1,
+        Config.Vision.HiddenSize) );
+      NN.AddLayer( TNNetPadXY.Create(1, 0) );
+      NN.AddLayer( TNNetCrop.Create(0, 0, NumTokens, 1) );
+      VPosEmb := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(NumTokens) );
+      VPreLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.Vision.LayerNormEps) );
+      SetLength(VBlocks, Config.Vision.NumLayers);
+      SetLength(Config.TapLayerIdx, NumTaps);
+      for i := 0 to Config.Vision.NumLayers - 1 do
+      begin
+        AddClipEncoderBlock(NN, Config.Vision, {CausalMask=}false,
+          VBlocks[i], pInferenceOnly);
+        // Record the tap layer index (the block's output Sum layer) for any
+        // extract layer == i. HF taps hidden_states[i+1] = output of block i.
+        TapBlock := -1;
+        for ChanCnt := 0 to NumTaps - 1 do
+          if Config.ExtractLayers[ChanCnt] = i then TapBlock := ChanCnt;
+        if TapBlock >= 0 then
+          Config.TapLayerIdx[TapBlock] := NN.GetLastLayerIdx();
+      end;
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      LoadClipPatchConv(Reader, PatchConv,
+        'clip.vision_model.embeddings.patch_embedding.weight',
+        Config.NumChannels, Config.PatchSize, Config.Vision.HiddenSize);
+      LoadClipEmbeddingTable(Reader, VPosEmb,
+        'clip.vision_model.embeddings.position_embedding.weight',
+        NumTokens, Config.Vision.HiddenSize);
+      // class_embedding folded into position row 0.
+      Tbl := TNNetVolume.Create;
+      try
+        Reader.LoadTensorFlat(
+          'clip.vision_model.embeddings.class_embedding', Tbl);
+        for ChanCnt := 0 to Config.Vision.HiddenSize - 1 do
+          VPosEmb.Neurons[0].Weights.FData[ChanCnt] :=
+            VPosEmb.Neurons[0].Weights.FData[ChanCnt] + Tbl.FData[ChanCnt];
+        VPosEmb.FlushWeightCache();
+      finally
+        Tbl.Free;
+      end;
+      PreLNName := 'clip.vision_model.pre_layrnorm';
+      if not Reader.HasTensor(PreLNName + '.weight') then
+        PreLNName := 'clip.vision_model.pre_layernorm';
+      LoadLayerNormWeights(Reader, VPreLN, PreLNName + '.weight',
+        PreLNName + '.bias', Config.Vision.HiddenSize);
+      for i := 0 to Config.Vision.NumLayers - 1 do
+        LoadClipEncoderBlockWeights(Reader, VBlocks[i],
+          'clip.vision_model.encoder.layers.' + IntToStr(i) + '.',
+          Config.Vision);
+      VisionNet := NN;
+      NN := nil;
+
+      // ---------------- TEXT tower (frozen CLIP text) ----------------
+      if (Config.Text.NumHeads < 1) or
+         ((Config.Text.HiddenSize mod Config.Text.NumHeads) <> 0) then
+        ImportError('CLIPSeg import: text hidden_size not divisible by heads.');
+      if TextSeqLen <= 0 then SeqLen := Config.TextMaxPositions
+      else SeqLen := TextSeqLen;
+      if SeqLen > Config.TextMaxPositions then
+        ImportError('CLIPSeg import: TextSeqLen exceeds max_position_embeddings.');
+      NN := TNNet.Create();
+      NN.AddLayer( TNNetInput.Create(SeqLen, 1, 1) );
+      TokEmb := NN.AddLayer( TNNetEmbedding.Create(
+        Config.TextVocabSize, Config.Text.HiddenSize, 1) );
+      PosEmb := NN.AddLayer(
+        TNNetLearnedPositionalEmbedding.Create(Config.TextMaxPositions) );
+      SetLength(TBlocks, Config.Text.NumLayers);
+      for i := 0 to Config.Text.NumLayers - 1 do
+        AddClipEncoderBlock(NN, Config.Text, {CausalMask=}true,
+          TBlocks[i], pInferenceOnly);
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.Text.LayerNormEps) );
+      TProj := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.ProjectionDim) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      LoadClipEmbeddingTable(Reader, TokEmb,
+        'clip.text_model.embeddings.token_embedding.weight',
+        Config.TextVocabSize, Config.Text.HiddenSize);
+      LoadClipEmbeddingTable(Reader, PosEmb,
+        'clip.text_model.embeddings.position_embedding.weight',
+        Config.TextMaxPositions, Config.Text.HiddenSize);
+      for i := 0 to Config.Text.NumLayers - 1 do
+        LoadClipEncoderBlockWeights(Reader, TBlocks[i],
+          'clip.text_model.encoder.layers.' + IntToStr(i) + '.', Config.Text);
+      LoadLayerNormWeights(Reader, FinalLN,
+        'clip.text_model.final_layer_norm.weight',
+        'clip.text_model.final_layer_norm.bias', Config.Text.HiddenSize);
+      LoadLlamaLinearWeights(Reader, TProj, 'clip.text_projection.weight',
+        Config.Text.HiddenSize, Config.ProjectionDim);
+      TextNet := NN;
+      NN := nil;
+
+      // ---------------- DECODER (FiLM-conditioned transformer) ----------
+      // Inputs 0..NumTaps-1: tap activations in REVERSE extract order
+      // (HF activations[::-1]), each (NumTokens,1,vision_hidden).
+      // Input NumTaps: conditional embedding (1,1,projection_dim).
+      NN := TNNet.Create();
+      SetLength(TapInputs, NumTaps);
+      for i := 0 to NumTaps - 1 do
+        TapInputs[i] := NN.AddLayer( TNNetInput.Create(
+          NumTokens, 1, Config.Vision.HiddenSize) );
+      CondInput := NN.AddLayer( TNNetInput.Create(1, 1, Config.ProjectionDim) );
+      SetLength(DecRefs, NumTaps);
+      SetLength(ReduceLayers, NumTaps);
+
+      // film_mul / film_add: projection_dim -> reduce_dim, applied to cond.
+      FilmMul := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.ReduceDim), CondInput);
+      FilmAdd := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.ReduceDim), CondInput);
+      // FiLM cond = gamma|beta concatenated on depth -> (1,1,2*reduce_dim).
+      FilmCond := NN.AddLayer( TNNetDeepConcat.Create([FilmMul, FilmAdd]) );
+
+      Acc := nil;
+      for i := 0 to NumTaps - 1 do
+      begin
+        // reduces[i] over tap input i (reversed order matches HF).
+        Reduced := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(Config.ReduceDim), TapInputs[i]);
+        ReduceLayers[i] := Reduced;
+        if Acc = nil then
+          Acc := Reduced
+        else
+          Acc := NN.AddLayer( TNNetSum.Create([Reduced, Acc]) );
+        if i = Config.ConditionalLayer then
+        begin
+          FilmOut := NN.AddLayer( TNNetFiLM.Create([Acc, FilmCond]) );
+          Acc := FilmOut;
+        end;
+        Acc := AddCLIPSegDecoderBlock(NN, Acc, Config.ReduceDim,
+          Config.DecoderHeads, Config.DecoderIntermediate,
+          Config.Vision.LayerNormEps, DecRefs[i]);
+      end;
+      // Drop the CLS token (row 0), keep NumPatches patch tokens, reshape to
+      // the (Grid,Grid,reduce_dim) spatial map.
+      NN.AddLayer( TNNetCrop.Create(1, 0, NumPatches, 1) );
+      NN.AddLayer( TNNetReshape.Create(Grid, Grid, Config.ReduceDim) );
+      // Non-overlapping ConvTranspose2d(reduce_dim,1,P,stride=P).
+      TransConv := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.PatchSize * Config.PatchSize) );
+      NN.AddLayer( TNNetDepthToSpace.Create(Config.PatchSize) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // Decoder weights. reduces[i] maps to tap input i (the REVERSED order
+      // HF iterates activations[::-1] in), so decoder.reduces.i.* loads into
+      // ReduceLayers[i] directly.
+      for i := 0 to NumTaps - 1 do
+        LoadLlamaLinearWeights(Reader, ReduceLayers[i],
+          'decoder.reduces.' + IntToStr(i) + '.weight',
+          Config.Vision.HiddenSize, Config.ReduceDim, 0, -1, 0,
+          'decoder.reduces.' + IntToStr(i) + '.bias');
+      LoadLlamaLinearWeights(Reader, FilmMul, 'decoder.film_mul.weight',
+        Config.ProjectionDim, Config.ReduceDim, 0, -1, 0, 'decoder.film_mul.bias');
+      LoadLlamaLinearWeights(Reader, FilmAdd, 'decoder.film_add.weight',
+        Config.ProjectionDim, Config.ReduceDim, 0, -1, 0, 'decoder.film_add.bias');
+      for i := 0 to NumTaps - 1 do
+        LoadCLIPSegDecoderBlock(Reader, DecRefs[i],
+          'decoder.layers.' + IntToStr(i) + '.',
+          Config.ReduceDim, Config.DecoderIntermediate);
+      LoadCLIPSegTransposedConv(Reader, TransConv,
+        'decoder.transposed_convolution.weight',
+        'decoder.transposed_convolution.bias',
+        Config.ReduceDim, Config.PatchSize);
+      DecoderNet := NN;
+      NN := nil;
+    except
+      NN.Free;
+      VisionNet.Free; VisionNet := nil;
+      TextNet.Free;   TextNet := nil;
+      DecoderNet.Free; DecoderNet := nil;
+      raise;
+    end;
+  finally
+    Reader.Free;
+  end;
+end;
+
+procedure BuildCLIPSegFromSafeTensors(const FileName: string;
+  out VisionNet, TextNet, DecoderNet: TNNet; out Config: TCLIPSegConfig;
+  TextSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadCLIPSegConfigFromJSONFile(ConfigPath);
+  BuildCLIPSegFromSafeTensorsWithConfig(FileName, Config,
+    VisionNet, TextNet, DecoderNet, TextSeqLen, pInferenceOnly);
+end;
+
+procedure RunCLIPSeg(VisionNet, TextNet, DecoderNet: TNNet;
+  const Config: TCLIPSegConfig; ImageInput, TokenIds: TNNetVolume;
+  Logits: TNNetVolume);
+var
+  DecInputs: array of TNNetVolume;
+  Cond: TNNetVolume;
+  NumTaps, i, EotPos, ChanCnt, OutSize: integer;
+  TextOut: TNNetVolume;
+begin
+  NumTaps := Length(Config.ExtractLayers);
+  // 1. Vision tower forward; tap hidden states.
+  VisionNet.Compute(ImageInput);
+  // 2. Text tower forward; pool eot row as the conditional embedding.
+  TextNet.Compute(TokenIds);
+  TextOut := TextNet.GetLastLayer().Output;
+  EotPos := ClipTextEosPosition(TokenIds, Config.EosTokenId);
+  Cond := TNNetVolume.Create;
+  Cond.ReSize(1, 1, Config.ProjectionDim);
+  for ChanCnt := 0 to Config.ProjectionDim - 1 do
+    Cond.FData[ChanCnt] := TextOut[EotPos, 0, ChanCnt];
+  // 3. Decoder: reversed taps + conditional embedding.
+  SetLength(DecInputs, NumTaps + 1);
+  for i := 0 to NumTaps - 1 do
+    // DecoderNet input i = tap in REVERSE order (HF activations[::-1]).
+    DecInputs[i] := VisionNet.Layers[
+      Config.TapLayerIdx[NumTaps - 1 - i]].Output;
+  DecInputs[NumTaps] := Cond;
+  try
+    DecoderNet.Compute(DecInputs);
+    OutSize := DecoderNet.GetLastLayer().Output.SizeX;
+    Logits.ReSize(OutSize, OutSize, 1);
+    Logits.Copy(DecoderNet.GetLastLayer().Output);
+  finally
+    Cond.Free;
+  end;
 end;
 
 // ===========================================================================

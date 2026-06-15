@@ -918,7 +918,7 @@ rather than acted on.
       next-token logits for a mixed image+text prompt (reuse make_pico_*_fixture.py) +
       an examples/Qwen2VLDescribe that captions a tiny image (ulimit-bounded). The
       M-RoPE index builder also unblocks Qwen2.5-VL video (the temporal section) later.
-- [ ] CLIPSeg text-prompted zero-shot segmentation importer (BuildCLIPSegFromSafeTensors,
+- [X] CLIPSeg text-prompted zero-shot segmentation importer (BuildCLIPSegFromSafeTensors,
       e.g. CIDAS/clipseg-rd64-refined) — a genuinely DISTINCT dense-prediction output
       modality: given an image and a free-text prompt (or a prompt image), it emits a
       single-channel binary mask for "whatever the prompt names", with NO fixed label
@@ -938,6 +938,30 @@ rather than acted on.
       examples/CLIPSegPrompt that writes a binary-mask PPM for a hand-typed prompt over a
       tiny CPU image. First "text-prompt -> dense mask" importer; the segmentation
       counterpart to the landed open-vocab DETECTION (OWL-ViT).
+      LANDED: TCLIPSegConfig + BuildCLIPSegFromSafeTensors[WithConfig] +
+      ReadCLIPSegConfigFromJSONFile/CLIPSegConfigToString + RunCLIPSeg (three nets:
+      vision/text/decoder) in neuralpretrained.pas; intermediate vision taps via the
+      returned Config.TapLayerIdx (read after VisionNet.Compute); FiLM via TNNetFiLM,
+      post-norm decoder block, ConvTranspose2d realized as PointwiseConvLinear(P²) +
+      TNNetDepthToSpace(P). Pico parity TestCLIPSegParity < 1e-4 vs the REAL HF
+      CLIPSegForImageSegmentation float64 oracle (tools/clipseg_tiny_fixture.py,
+      tests/fixtures/tiny_clipseg.*) — checks BOTH the conditional embedding and the
+      full mask logits; examples/CLIPSegPrompt writes a binary-mask PPM. Scope v1:
+      single text prompt -> one mask, inference-only, use_complex_transposed_convolution
+      = false.
+- [ ] CLIPSeg real-checkpoint parity (CIDAS/clipseg-rd64-refined) — verify
+      BuildCLIPSegFromSafeTensors against the REAL HF checkpoint logits (the offline env
+      could not download it; the pico parity already pins the math vs the real HF
+      classes). Needs the ~600 MB checkpoint + CLIP tokenizer ids; also exercises the
+      default extract_layers [3,6,9] and reduce_dim 64 (the pico uses [0,1]/6).
+- [ ] CLIPSeg complex transposed-conv upsample (use_complex_transposed_convolution=true)
+      — the rd64-refined head uses the 3-stage Conv2d(3x3)+ReLU+2× ConvTranspose2d
+      decoder instead of the single ConvTranspose2d v1 ships; add the 3x3 conv + the
+      two-stage DepthToSpace upsample and a pico parity for that branch.
+- [ ] CLIPSeg image-prompt (visual) conditioning — CLIPSeg can also condition on a
+      PROMPT IMAGE (conditional_pixel_values -> clip.get_image_features pooled embedding)
+      instead of text; v1 does text only. Add a RunCLIPSegImagePrompt path reusing the
+      vision tower's pooled class-token embedding as the conditional vector.
 - [ ] TinyNeRF novel-view-synthesis example (examples/TinyNeRF) — a brand-new
       output modality for the tree: a learned implicit 3-D scene that renders an image
       from an arbitrary camera pose, the first differentiable VOLUME RENDERER in the

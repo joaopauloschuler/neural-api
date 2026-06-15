@@ -344,6 +344,8 @@ type
     procedure TestNAFNetParity;
     procedure TestSwinIRConfigFromJSONFile;
     procedure TestSwinIRParity;
+    procedure TestCLIPSegConfigFromJSONFile;
+    procedure TestCLIPSegParity;
     procedure TestStyleGAN2ConfigFromJSONFile;
     procedure TestStyleGAN2GeneratorParity;
     procedure TestDINOv2ConfigFromJSONFile;
@@ -16431,6 +16433,147 @@ begin
     ImgInput.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// Verifies ReadCLIPSegConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestCLIPSegConfigFromJSONFile;
+var
+  Config: TCLIPSegConfig;
+begin
+  Config := ReadCLIPSegConfigFromJSONFile(
+    FixturePath('tiny_clipseg_config.json'));
+  AssertEquals('model_type', 'clipseg', Config.ModelType);
+  AssertEquals('vision hidden', 8, Config.Vision.HiddenSize);
+  AssertEquals('vision layers', 3, Config.Vision.NumLayers);
+  AssertEquals('text hidden', 8, Config.Text.HiddenSize);
+  AssertEquals('image_size', 8, Config.ImageSize);
+  AssertEquals('patch_size', 4, Config.PatchSize);
+  AssertEquals('projection_dim', 6, Config.ProjectionDim);
+  AssertEquals('reduce_dim', 6, Config.ReduceDim);
+  AssertEquals('extract count', 2, Length(Config.ExtractLayers));
+  AssertEquals('extract[0]', 0, Config.ExtractLayers[0]);
+  AssertEquals('extract[1]', 1, Config.ExtractLayers[1]);
+  AssertEquals('conditional_layer', 0, Config.ConditionalLayer);
+  AssertEquals('decoder heads', 2, Config.DecoderHeads);
+  AssertEquals('decoder inter', 12, Config.DecoderIntermediate);
+  AssertTrue('simple tconv', not Config.UseComplexTransposedConv);
+end;
+
+// CLIPSeg text-prompted zero-shot segmentation parity test.
+// tests/fixtures/tiny_clipseg.* is a pico random-init CLIPSeg built and run by
+// the REAL HF transformers.CLIPSegForImageSegmentation float64 oracle
+// (tools/clipseg_tiny_fixture.py): a 3-block ViT image tower (image 8, patch 4
+// -> 2x2 grid), a 2-block CLIP text tower, two tapped vision layers ([0,1]),
+// reduce_dim 6, a 2-layer FiLM-conditioned post-norm decoder, and a single
+// ConvTranspose2d upsample to an 8x8 logit map. Asserts the imported pipeline
+// (BuildCLIPSegFromSafeTensors + RunCLIPSeg) reproduces the (image_size,
+// image_size,1) mask logits < 1e-4 -- exercising the intermediate-tap reads,
+// the CLIP-text conditional embedding, TNNetFiLM modulation, the post-norm
+// decoder block and the DepthToSpace transposed-conv upsample.
+procedure TTestNeuralPretrained.TestCLIPSegParity;
+var
+  VisionNet, TextNet, DecoderNet: TNNet;
+  Config: TCLIPSegConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  PixelArr, ChanArr, RowArr, LogitArr, IdArr, CondArr: TJSONArray;
+  ImgInput, TokenIds, Logits: TNNetVolume;
+  LogitSize, SeqLen: integer;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  // The prompt is 5 tokens; build the text tower at that exact length.
+  BuildCLIPSegFromSafeTensors(
+    FixturePath('tiny_clipseg.safetensors'),
+    VisionNet, TextNet, DecoderNet, Config,
+    {TextSeqLen=}5, {pInferenceOnly=}false,
+    FixturePath('tiny_clipseg_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  TokenIds := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('vision net built', VisionNet <> nil);
+    AssertTrue('text net built', TextNet <> nil);
+    AssertTrue('decoder net built', DecoderNet <> nil);
+    AssertEquals('tap count', 2, Length(Config.TapLayerIdx));
+
+    RefJson.LoadFromFile(FixturePath('tiny_clipseg_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    PixelArr := TJSONArray(TJSONObject(RefRoot).Find('pixel'));
+    IdArr := TJSONArray(TJSONObject(RefRoot).Find('input_ids'));
+    LogitArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    CondArr := TJSONArray(TJSONObject(RefRoot).Find('cond'));
+    LogitSize := TJSONObject(RefRoot).Get('logit_size', 0);
+    AssertEquals('oracle logit size', Config.ImageSize, LogitSize);
+
+    // Load the (C,H,W) pixel oracle into the CAI (x,y,depth) volume.
+    ImgInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for ChanCnt := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(PixelArr.Items[ChanCnt]);
+      for YCnt := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.ImageSize - 1 do
+          ImgInput.FData[
+            (YCnt * Config.ImageSize + XCnt) * Config.NumChannels + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    // Prompt token ids.
+    SeqLen := IdArr.Count;
+    TokenIds.ReSize(SeqLen, 1, 1);
+    for XCnt := 0 to SeqLen - 1 do
+      TokenIds.FData[XCnt] := IdArr.Items[XCnt].AsInteger;
+
+    // Verify the conditional embedding (text projection of the eot row) first.
+    TextNet.Compute(TokenIds);
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.ProjectionDim - 1 do
+    begin
+      RefVal := CondArr.Items[ChanCnt].AsFloat;
+      GotVal := TextNet.GetLastLayer().Output[
+        ClipTextEosPosition(TokenIds, Config.EosTokenId), 0, ChanCnt];
+      Diff := Abs(GotVal - RefVal);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('conditional embed: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // Full pipeline.
+    RunCLIPSeg(VisionNet, TextNet, DecoderNet, Config,
+      ImgInput, TokenIds, Logits);
+    AssertEquals('mask grid X', Config.ImageSize, Logits.SizeX);
+    AssertEquals('mask grid Y', Config.ImageSize, Logits.SizeY);
+    AssertEquals('mask depth', 1, Logits.Depth);
+
+    MaxDiff := 0;
+    for YCnt := 0 to LogitSize - 1 do
+    begin
+      RowArr := TJSONArray(LogitArr.Items[YCnt]);
+      for XCnt := 0 to LogitSize - 1 do
+      begin
+        RefVal := RowArr.Items[XCnt].AsFloat;
+        GotVal := Logits[XCnt, YCnt, 0];
+        Diff := Abs(GotVal - RefVal);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('mask logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    TokenIds.Free;
+    Logits.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    TextNet.Free;
+    DecoderNet.Free;
   end;
 end;
 
