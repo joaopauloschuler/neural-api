@@ -253,39 +253,6 @@ rather than acted on.
   - [ ] real-checkpoint (stabilityai/sd-vae-ft-mse) parity once diffusers is
         installable; SDXL VAE uses different group counts / multi-head attention.
   - [ ] the SD UNet itself (the remaining piece for end-to-end latent text-to-image).
-- [X] Segment Anything (SAM) image-ENCODER importer LANDED (facebook/sam-vit-base)
-      — the repo's first PROMPTABLE-segmentation importer. BuildSAMFromSafeTensors
-      [Ex] + the reusable BuildSAMVisionTower + TSAMConfig + ReadSAMConfigFromJSON
-      File/SAMConfigToString (neuralpretrained.pas). The ViT-det image encoder:
-      biased patch conv -> learned 2-D absolute pos_embed (TNNetCellBias, no CLS,
-      no flatten) -> num_hidden_layers pre-LN blocks via the NEW self-contained
-      leaf TNNetSAMVisionAttention (windowed attention with the SAM zero-padding
-      window partition + global attention for global_attn_indexes blocks + the
-      MViTv2 DECOMPOSED query-dependent rel-pos bias Q.rel_pos_h + Q.rel_pos_w,
-      distinct from Swin's query-INdependent table) -> neck (conv1 1x1 no-bias ->
-      LayerNorm2d-over-channels -> conv2 3x3 pad1 no-bias -> LayerNorm2d). MLP uses
-      the exact-erf GELU (TNNetGELUErf). Pico parity < 1e-4 vs HF SamModel float64
-      image embedding (TestSAMEncoderParity; tools/make_pico_sam_fixture.py ->
-      tests/fixtures/tiny_sam.*). Example examples/SegmentAnything: encoder forward
-      on a synthetic image + a one-click cosine-similarity mask PPM (encoder-only
-      proxy). Gotchas baked in: CAI volume X axis is the FAST axis so the SAM grid
-      maps gridW->X, gridH->Y (GetRawPtr(col,row)); rel_pos tensors arrive FLAT
-      from LoadTensorFlat so the row count is Size div HeadDim (not SizeX);
-      hidden_act='gelu' is exact-erf (NOT tanh). Follow-ups DEFERRED:
-      (a) the lightweight TWO-WAY MASK DECODER (point/box prompt embeddings ->
-          cross-attention blocks -> upscaled mask) — the stretch goal, reuse
-          TNNetCrossAttention two-source wiring; the example's click->mask is a
-          cosine proxy until it lands;
-      (b) ViT-L / ViT-H variants (config-driven; only block count/width differ);
-      (c) a real-checkpoint slicer (make_pico_sam_fixture style) for
-          facebook/sam-vit-base parity from the real download;
-      (d) multi-mask output + box/multi-point prompts (v1 is single-point intent).
-  (DPT / Depth-Anything monocular-depth importer LANDED: BuildDPTFromSafeTensors
-   + ReadDPTConfigFromJSONFile/DPTConfigToString, DINOv2 backbone reuse + DPT
-   reassemble/RefineNet-fusion neck, pico parity < 1e-4 via tiny_dpt.* fixtures
-   and TestDPT{Config,DepthEstimation}Parity. Follow-ups deferred: real-checkpoint
-   slicer for depth-anything/Depth-Anything-V2-Small-hf, the dpt-hybrid (resnet
-   backbone) variant, and an examples/MonoDepth grayscale demo.)
 - [ ] Mask2Former universal-segmentation importer
       (BuildMask2FormerFromSafeTensors, e.g. facebook/mask2former-swin-tiny-*-semantic)
       — a third, architecturally DISTINCT segmentation vertical: mask-classification
@@ -882,59 +849,6 @@ rather than acted on.
         default TargetAccuracy and early-stops.
   - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
         directly instead of requiring an ffmpeg pre-pass.
-- [X] HTDemucs / Demucs music SOURCE-SEPARATION importer
-      (BuildDemucsFromSafeTensors[Ex] + TDemucsConfig +
-      ReadDemucsConfigFromJSONFile / DemucsConfigToString, facebook/demucs /
-      htdemucs) — LANDED the TIME-DOMAIN (waveform) Demucs (v2/v3) U-Net, the
-      FIRST audio source-separation model and a genuinely new audio OUTPUT
-      modality: one mixed stereo track in, four stems out (drums / bass / other
-      / vocals). Distinct from every landed audio model — EnCodec (codec),
-      Wav2Vec2/Whisper (recognition), HiFi-GAN/VITS (synthesis), CLAP
-      (embedding) — none separate sources. Built as a self-contained
-      channel-major TNNetDemucs holder (the HiFi-GAN/VITS/EnCodec convention),
-      REUSING THiFiGANConv / RunHiFiGANConv for every Conv1d / ConvTranspose1d
-      (no new leaf layer): an ENCODER of `depth` blocks (strided Conv1d -> ReLU
-      -> 1x1 Conv1d -> GLU, each saving a U-Net skip) -> a bi-LSTM bottleneck
-      (`lstm_layers` stacked bidirectional cells run INLINE in the holder, there
-      being no bidirectional-LSTM leaf layer, then Linear(2C -> C)) -> a DECODER
-      of `depth` blocks (skip-add with Demucs center_trim -> Conv1d -> GLU ->
-      ConvTranspose1d -> ReLU except the last) reshaped to (sources,
-      audio_channels, time) and center-trimmed to the input length. Conv /
-      nn.LSTM weights load as plain folded tensors (encoder.i.{0,2}, lstm.*_l*
-      + *_reverse, lstm_linear, decoder.i.{0,2}). Pico parity vs a SELF-CONTAINED
-      numpy float64 oracle (transformers ships no Demucs, so the oracle is
-      hand-built from the published architecture math — the *_tiny_fixture
-      precedent) on two short fixed stereo waveforms
-      (tools/make_pico_demucs_fixture.py -> tests/fixtures/tiny_demucs*,
-      TestDemucsSeparationParity max|diff| < 1e-4, PASSING) + an
-      examples/MusicSourceSeparation that splits a short clip and writes the four
-      stems via SaveVolumeToWav16 (no-arg pico smoke + real-checkpoint path).
-      OPEN FOLLOW-UPS: the hybrid TIME+SPECTRAL HTDemucs spectral branch (STFT +
-      a parallel 2-D spectral U-Net summed with the time branch); the v3
-      CROSS-DOMAIN TRANSFORMER bottleneck (in place of the bi-LSTM); input/output
-      NORMALIZATION (centering + std rescale, `normalize=true`) and weight
-      rescaling; and a real downloaded checkpoint end-to-end separation within
-      the ~5 min / ulimit budget.
-- [X] Moonshine streaming-ASR importer (BuildMoonshineFromSafeTensors[Ex] +
-      TMoonshineConfig + ReadMoonshineConfigFromJSONFile / MoonshineConfigToString +
-      MoonshineEncoderLength, UsefulSensors/moonshine-tiny|base) — LANDED the ENCODER
-      (the v1 parity surface). A SECOND speech-to-text architecture, distinct from the
-      landed Whisper importer: NO fixed 30 s mel frontend — the raw-waveform conv stem
-      (conv1 k127 s64 bias-free + tanh; GroupNorm(1) over the (T,C) block; conv2 k7 s3
-      + erf-GELU; conv3 k3 s2 + erf-GELU) convolves features directly off the 16 kHz
-      waveform so compute scales with actual audio length; PRE-norm BIDIRECTIONAL
-      encoder with PARTIAL RoPE (partial_rotary_factor, the Phi-3 slice wiring reused
-      verbatim), bias-free q/k/v/o, bias-free (gain-only) TNNetTokenLayerNorm norms,
-      erf-GELU fc1/fc2 MLP. Pico parity vs the HF MoonshineModel float64 oracle on
-      encoder hidden states (tools/make_pico_moonshine_fixture.py ->
-      tests/fixtures/tiny_moonshine*, TestMoonshineEncoderParity, max|diff| < 1e-4,
-      PASSING) + a DETERMINISTIC examples/MoonshineTranscribe smoke (no-arg fixture run
-      contrasting the length-scaled frame count/latency vs Whisper's fixed cost; real
-      checkpoint path supported). OPEN FOLLOW-UPS: the RoPE + SwiGLU DECODER (cross-
-      attending the encoder states via T5EncoderStatesInput; reuse
-      DecodeSeq2SeqGreedy/BeamSearch) + the GQA encoder_num_key_value_heads != heads
-      path (wired but only exercised at full multi-head in the pico) + the
-      MoonshineTokenizer for end-to-end WAV -> text transcription.
 - [ ] Moonshine DECODER + end-to-end transcription (successor to the landed
       encoder above). The encoder importer (BuildMoonshineFromSafeTensors) and its
       hidden-state parity are DONE; this adds the RoPE + SwiGLU decoder so a waveform
@@ -1067,35 +981,6 @@ rather than acted on.
       second route (besides the tracked PixArt) to the LatentTextToImage capstone with
       NO SD UNet. Pico parity vs a diffusers float64 oracle on one block's joint-attention
       output + reuse make_pico_*_fixture.py.
-- [X] PaliGemma vision-language importer (BuildPaliGemmaFromSafeTensors[Ex] +
-      TPaliGemmaConfig + ReadPaliGemmaConfigFromJSONFile/PaliGemmaConfigToString,
-      neuralpretrained.pas) — LANDED the first PREFIX-LM vision-language importer. The
-      genuinely NEW code is the block-bidirectional prefix mask: added a transient
-      TNNetScaledDotProductAttention.PrefixLen property (NOT serialized) + the net-wide
-      TNNet.SetAttentionPrefixLen driver (neuralnetwork.pas). In the SDPA score loop a
-      key j is attendable for query i iff causal-allowed (j<=i) OR both i,j are in the
-      prefix block [0..PrefixLen-1] — so the image tokens + prompt (token_type_id 0)
-      attend bidirectionally and only the generated suffix (token_type_id 1) is causal.
-      PrefixLen=0 default is bit-identical to the old pure-causal path (all SDPA
-      numerical regressions pass). EVERYTHING else is reused: SigLIP tower
-      (BuildSigLIPVisionTower in feature mode, SelectHiddenLayer=0 so post_layernorm IS
-      applied — PaliGemma uses last_hidden_state, the OPPOSITE of LLaVA's -1 feature),
-      the LLaVA splice (LlavaAssembleEmbeddings), and the stock Gemma decoder
-      (BuildLlamaFromTensorReaderWithConfig, gemma model_type). NEW pieces:
-      BuildPaliGemmaProjector (a SINGLE biased linear, no gelu / no 2nd layer unlike
-      LLaVA) and PaliGemmaRunLogits (the prefix-LM forward, sets/restores PrefixLen).
-      Pico parity TestPaliGemmaLogitParity: next-token logits < 1e-4 vs HF float64
-      (PaliGemmaForConditionalGeneration with token_type_ids) AND a negative control that
-      re-runs with PrefixLen=0 (causal-everywhere = LLaVA mask) and asserts the logits
-      DIFFER (>1e-3) — proving the bidirectional mask is load-bearing (fixture self-check
-      shows max|diff|=6.7). tools/make_pico_paligemma_fixture.py + committed
-      tests/fixtures/tiny_paligemma.{safetensors,_config.json,_logits.json}.
-      examples/PaliGemmaCaption (.lpr/.lpi + examples/README.md) smoke-captions the pico
-      image. OPEN FOLLOW-UPS: (a) multi-image prompts (one prefix block per image);
-      (b) a real-checkpoint slicer (tools/make_pico_*_fixture slice precedent) + the
-      Gemma SentencePiece tokenizer's <image>-token expansion to NumPatches ids (the demo
-      hardcodes the id layout); (c) 448/896 resolutions (more patches, larger pos table);
-      (d) the M-RoPE Qwen2-VL path (a THIRD distinct VLM attention regime, still open).
 - [ ] AnimateDiff text-to-VIDEO motion-module importer (BuildAnimateDiffFromSafeTensors,
       e.g. guoyww/animatediff-motion-adapter-v1-5-2) — the FIRST video-GENERATIVE
       importer (a sequence of frames from a text prompt), a brand-new generative
