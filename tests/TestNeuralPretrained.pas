@@ -261,6 +261,7 @@ type
     procedure TestM2M100Parity;
     procedure TestWhisperConfigFromJSONFile;
     procedure TestWhisperParity;
+    procedure TestWhisperWordTimestamps;
     procedure TestWav2Vec2ConfigFromJSONFile;
     procedure TestWav2Vec2CTCParity;
     procedure TestHubertCTCParity;
@@ -11752,6 +11753,193 @@ begin
     Logits.Free;
     DecInput.Free;
     EncInput.Free;
+    RefJson.Free;
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+// Parity-gates the Whisper WORD-LEVEL timestamp path (cross-attention DTW
+// alignment, the openai-whisper find_alignment port) against a float64
+// oracle on the committed pico fixture (tools/whisper_tiny_fixture.py emits
+// tiny_whisper_alignment.json: the averaged + per-token-softmaxed alignment-
+// head cross-attention, the monotonic DTW warp path, and per-token frame
+// spans). Asserts: (1) the collected (token x frame) score matrix matches
+// the oracle, (2) the DTW path length + token/frame indices match exactly
+// and are monotonic, (3) per-token frame spans match. v1 covers one window
+// of greedy-shaped decode; the fixture (2 layers, 2 heads) is not a released
+// Whisper size, so the test passes the SAME explicit head list the oracle
+// used (0,1)/(1,0)/(1,1).
+procedure TTestNeuralPretrained.TestWhisperWordTimestamps;
+var
+  Enc, Dec: TNNet;
+  Config: TWhisperConfig;
+  RefRoot, LogRoot: TJSONData;
+  AlignArr, AlignHeads, DecSeqs, MelInputs: TJSONArray;
+  SeqObj: TJSONObject;
+  ScoreArr, RowArr, PathTokArr, PathFrameArr, TokStartArr, TokEndArr: TJSONArray;
+  MelArr: TJSONArray;
+  RefJson, LogJson: TStringList;
+  EncInput, DecInput, Logits, Score: TNNetVolume;
+  Heads: TWhisperAlignmentHeads;
+  PathTok, PathFrame: array of integer;
+  SeqCnt, i, j, MelCnt, FrameCnt, PosCnt, PathLen, NTok, NSrc: integer;
+  Diff, MaxScoreDiff: double;
+const
+  DecLen = 6;
+begin
+  RandSeed := 424242;
+  BuildWhisperFromSafeTensors(FixturePath('tiny_whisper.safetensors'),
+    Enc, Dec, Config, {DecSeqLen=}DecLen, {pInferenceOnly=}false,
+    FixturePath('tiny_whisper_config.json'));
+  RefJson := TStringList.Create;
+  LogJson := TStringList.Create;
+  EncInput := TNNetVolume.Create;
+  DecInput := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  LogRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_whisper_alignment.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LogJson.LoadFromFile(FixturePath('tiny_whisper_logits.json'));
+    LogRoot := GetJSON(LogJson.Text);
+    AlignHeads := TJSONArray(TJSONObject(RefRoot).Find('align_heads'));
+    AlignArr := TJSONArray(TJSONObject(RefRoot).Find('alignment'));
+    DecSeqs := TJSONArray(TJSONObject(RefRoot).Find('dec_sequences'));
+    MelInputs := TJSONArray(TJSONObject(LogRoot).Find('mel_inputs'));
+    AssertTrue('align_heads present', AlignHeads <> nil);
+    AssertTrue('alignment present', AlignArr <> nil);
+
+    // Build the alignment-head list exactly as the oracle did.
+    SetLength(Heads, AlignHeads.Count);
+    for i := 0 to AlignHeads.Count - 1 do
+    begin
+      RowArr := TJSONArray(AlignHeads.Items[i]);
+      Heads[i].LayerIdx := RowArr.Items[0].AsInteger;
+      Heads[i].HeadIdx := RowArr.Items[1].AsInteger;
+    end;
+
+    EncInput.ReSize(2 * Config.MaxSourcePositions, 1, Config.NumMelBins);
+    DecInput.ReSize(DecLen, 1, 1);
+    MaxScoreDiff := 0;
+
+    for SeqCnt := 0 to AlignArr.Count - 1 do
+    begin
+      // Feed the SAME mel + decoder ids the oracle used for this sequence.
+      MelArr := TJSONArray(MelInputs.Items[SeqCnt]);
+      for MelCnt := 0 to Config.NumMelBins - 1 do
+      begin
+        RowArr := TJSONArray(MelArr.Items[MelCnt]);
+        for FrameCnt := 0 to RowArr.Count - 1 do
+          EncInput.FData[FrameCnt * Config.NumMelBins + MelCnt] :=
+            RowArr.Items[FrameCnt].AsFloat;
+      end;
+      RowArr := TJSONArray(DecSeqs.Items[SeqCnt]);
+      for PosCnt := 0 to DecLen - 1 do
+        DecInput.FData[PosCnt] := RowArr.Items[PosCnt].AsInteger;
+
+      // RunT5 computes the encoder then the decoder, populating every
+      // cross-attention leaf's AttentionWeights for this prefix.
+      RunT5(Enc, Dec, EncInput, DecInput, Logits);
+
+      SeqObj := TJSONObject(AlignArr.Items[SeqCnt]);
+      NTok := SeqObj.Get('n_tok', 0);
+      NSrc := SeqObj.Get('n_src', 0);
+      AssertEquals('n_tok', DecLen, NTok);
+      AssertEquals('n_src', Config.MaxSourcePositions, NSrc);
+
+      // (1) collected (token x frame) score matrix vs oracle
+      Score := WhisperCollectCrossAttention(Dec, Config, Heads, NTok);
+      try
+        AssertEquals('score frames', NSrc, Score.SizeX);
+        AssertEquals('score tokens', NTok, Score.SizeY);
+        ScoreArr := TJSONArray(SeqObj.Find('score'));
+        for i := 0 to NTok - 1 do
+        begin
+          RowArr := TJSONArray(ScoreArr.Items[i]);
+          for j := 0 to NSrc - 1 do
+          begin
+            Diff := Abs(Score[j, i, 0] - RowArr.Items[j].AsFloat);
+            if Diff > MaxScoreDiff then MaxScoreDiff := Diff;
+          end;
+        end;
+
+        // (2) DTW warp path: length, indices, monotonicity
+        SetLength(PathTok, NTok + NSrc);
+        SetLength(PathFrame, NTok + NSrc);
+        PathLen := WhisperDTW(Score, PathTok, PathFrame);
+        AssertEquals('DTW path length',
+          SeqObj.Get('path_len', 0), PathLen);
+        PathTokArr := TJSONArray(SeqObj.Find('path_tok'));
+        PathFrameArr := TJSONArray(SeqObj.Find('path_frame'));
+        for i := 0 to PathLen - 1 do
+        begin
+          AssertEquals('path_tok[' + IntToStr(i) + ']',
+            PathTokArr.Items[i].AsInteger, PathTok[i]);
+          AssertEquals('path_frame[' + IntToStr(i) + ']',
+            PathFrameArr.Items[i].AsInteger, PathFrame[i]);
+          if i > 0 then
+          begin
+            AssertTrue('path token monotonic',
+              PathTok[i] >= PathTok[i - 1]);
+            AssertTrue('path frame monotonic',
+              PathFrame[i] >= PathFrame[i - 1]);
+          end;
+        end;
+        AssertEquals('path starts at token 0', 0, PathTok[0]);
+        AssertEquals('path starts at frame 0', 0, PathFrame[0]);
+        AssertEquals('path ends at last token', NTok - 1,
+          PathTok[PathLen - 1]);
+        AssertEquals('path ends at last frame', NSrc - 1,
+          PathFrame[PathLen - 1]);
+
+        // (3) per-token frame spans (token -> first/last assigned frame)
+        TokStartArr := TJSONArray(SeqObj.Find('tok_start_frame'));
+        TokEndArr := TJSONArray(SeqObj.Find('tok_end_frame'));
+        for i := 0 to NTok - 1 do
+        begin
+          // recompute span from the path
+          PosCnt := -1; FrameCnt := -1;
+          for j := 0 to PathLen - 1 do
+            if PathTok[j] = i then
+            begin
+              if PosCnt < 0 then PosCnt := PathFrame[j];
+              FrameCnt := PathFrame[j];
+            end;
+          AssertEquals('tok_start_frame[' + IntToStr(i) + ']',
+            TokStartArr.Items[i].AsInteger, PosCnt);
+          AssertEquals('tok_end_frame[' + IntToStr(i) + ']',
+            TokEndArr.Items[i].AsInteger, FrameCnt);
+        end;
+      finally
+        Score.Free;
+      end;
+    end;
+
+    AssertTrue('Whisper alignment score parity: max |diff| = ' +
+      FloatToStr(MaxScoreDiff) + ' must be < 1e-4', MaxScoreDiff < 1e-4);
+
+    // The size-keyed default-head table: the released whisper-tiny shape
+    // (4 layers, 6 heads) returns the baked-in openai-whisper subset; the
+    // pico shape returns empty (callers fall back to all heads).
+    Heads := WhisperDefaultAlignmentHeads(4, 6);
+    AssertTrue('whisper-tiny default alignment heads non-empty',
+      Length(Heads) > 0);
+    Heads := WhisperDefaultAlignmentHeads(
+      Config.DecoderLayers, Config.DecoderHeads);
+    AssertEquals('pico shape has no baked-in head list', 0, Length(Heads));
+    Heads := WhisperAllAlignmentHeads(
+      Config.DecoderLayers, Config.DecoderHeads);
+    AssertEquals('all-heads count',
+      Config.DecoderLayers * Config.DecoderHeads, Length(Heads));
+  finally
+    LogRoot.Free;
+    RefRoot.Free;
+    Logits.Free;
+    DecInput.Free;
+    EncInput.Free;
+    LogJson.Free;
     RefJson.Free;
     Dec.Free;
     Enc.Free;

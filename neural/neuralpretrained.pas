@@ -3313,6 +3313,103 @@ procedure BuildWhisperFromSafeTensors(const FileName: string;
   DecSeqLen: integer; pInferenceOnly: boolean = false;
   const ConfigFileName: string = '');
 
+// -------------------- WHISPER WORD-LEVEL TIMESTAMPS -----------------------
+// Port of openai-whisper / transformers `return_timestamps="word"` (the
+// find_alignment / dynamic-time-warp path). After a greedy decode of one
+// 30 s window, the decoder->encoder CROSS-ATTENTION of a small, per-
+// checkpoint set of "alignment heads" carries a near-monotonic
+// token->audio-frame correspondence; averaging + normalizing those heads
+// into a (text-token x audio-frame) score matrix and running DTW recovers
+// the monotonic path, which converts to per-word (start_s, end_s) times.
+//
+// The cross-attention probabilities are ALREADY computed in the decoder
+// forward pass: every per-head leaf is a TNNetCrossAttention whose
+// AttentionWeights volume is [X=audio-frame j, Y=text-token i, 1] (post-
+// softmax). WhisperCollectCrossAttention enumerates those leaves (they
+// appear in decode order, DecoderHeads of them per layer, in head order)
+// and gathers the requested (layer, head) subset; no new capture hook is
+// needed beyond reading that public property after Dec.Compute.
+//
+// One encoder frame = 2 mel hops = 2 * hop_length / sample_rate seconds =
+// 2 * 160 / 16000 = 0.02 s (the 20 ms cited in the openai-whisper code).
+
+type
+  // One (decoder layer, head) coordinate into the cross-attention stack.
+  TWhisperAlignmentHead = record
+    LayerIdx: integer;  // 0-based decoder block
+    HeadIdx: integer;   // 0-based head within that block
+  end;
+  TWhisperAlignmentHeads = array of TWhisperAlignmentHead;
+
+  // One decoded word and its audio span, in seconds.
+  TWhisperWordTimestamp = record
+    Word: string;
+    StartS: TNeuralFloat;
+    EndS: TNeuralFloat;
+  end;
+  TWhisperWordTimestamps = array of TWhisperWordTimestamp;
+
+// Seconds per encoder frame for the standard 16 kHz / hop-160 mel front-end
+// (2 mel hops are pooled into 1 encoder frame by the stride-2 conv).
+const
+  WhisperSecondsPerFrame = 0.02;
+
+// The openai-whisper baked-in alignment heads for the released checkpoints,
+// returned for a stack matching (NumDecoderLayers, NumDecoderHeads). When
+// the size is not one of the known releases the result is EMPTY and callers
+// fall back to "all heads" (WhisperAllAlignmentHeads). The lists are the
+// _ALIGNMENT_HEADS entries from openai-whisper (whisper/__init__.py),
+// decoded from its base85 boolean masks.
+function WhisperDefaultAlignmentHeads(NumDecoderLayers,
+  NumDecoderHeads: integer): TWhisperAlignmentHeads;
+
+// Every (layer, head) in the decoder - the safe fallback when no curated
+// alignment-head list is available (HF does this for un-annotated models).
+function WhisperAllAlignmentHeads(NumDecoderLayers,
+  NumDecoderHeads: integer): TWhisperAlignmentHeads;
+
+// Averages the cross-attention of the requested alignment heads into a
+// (text-token x audio-frame) score matrix and returns it as a volume of
+// shape [SizeX=EncFrames, SizeY=TextLen, Depth=1]. TextLen rows are read
+// from the decoder's cross-attention (the full decoded prefix length); the
+// caller decides which rows correspond to real text vs prologue. The scores
+// are per-token (per row) softmax-normalized across frames AFTER averaging
+// (the openai-whisper recipe normalizes the matrix; the per-head weights
+// are already softmaxed, so this re-normalizes the average). DecoderNet must
+// have just been Computed on the decode prefix. The result is owned by the
+// caller.
+function WhisperCollectCrossAttention(DecoderNet: TNNet;
+  const Config: TWhisperConfig;
+  const AlignmentHeads: TWhisperAlignmentHeads;
+  TextLen: integer): TNNetVolume;
+
+// Monotonic dynamic time warping over a (TextLen x EncFrames) COST matrix
+// (Cost = -Score, the openai-whisper convention). Fills PathTok / PathFrame
+// with the warp path from (0,0) to (TextLen-1, EncFrames-1): each step moves
+// down (next token), right (next frame) or diagonally, so token and frame
+// indices are both NON-DECREASING along the path (monotonic alignment). The
+// two output arrays share one length (the path length). Returns that length.
+function WhisperDTW(Score: TNNetVolume;
+  out PathTok, PathFrame: array of integer): integer;
+
+// Full v1 word-timestamp extraction for ONE 30 s greedy-decoded window.
+//   Tokens       - the decoded token ids INCLUDING the prologue specials.
+//   TextStart    - index in Tokens of the first REAL text token (the
+//                  positions before it are the <|sot|><|lang|><|task|>...
+//                  prologue and are skipped for alignment).
+//   Tokenizer    - decodes ids back to text; sub-words are merged into words
+//                  on the GPT-2 byte-level-BPE rule (a token whose decoded
+//                  surface begins with a leading space starts a new word).
+//   AlignmentHeads - the (layer, head) subset to average; pass
+//                  WhisperDefaultAlignmentHeads (or WhisperAllAlignmentHeads).
+// DecoderNet must have just been Computed on the full Tokens prefix. Returns
+// (word, start_s, end_s) tuples. v1 scope: single window, greedy decode, no
+// median-filter smoothing or multi-window stitching (a documented follow-up).
+function WhisperWordTimestamps(DecoderNet: TNNet;
+  const Config: TWhisperConfig; Tokenizer: TNeuralHFTokenizer;
+  const Tokens: array of integer; TextStart: integer;
+  const AlignmentHeads: TWhisperAlignmentHeads): TWhisperWordTimestamps;
+
 // ============================ WAV2VEC2 / HUBERT CTC IMPORT =================
 // Wav2Vec2 / HuBERT (model_type "wav2vec2" / "hubert", architectures
 // ["Wav2Vec2ForCTC"] / ["HubertForCTC"], e.g.
@@ -26704,6 +26801,319 @@ begin
   Config := ReadWhisperConfigFromJSONFile(ConfigPath);
   BuildWhisperFromSafeTensorsWithConfig(FileName, Config, EncoderNet,
     DecoderNet, DecSeqLen, pInferenceOnly);
+end;
+
+// -------------------- WHISPER WORD-LEVEL TIMESTAMPS -----------------------
+
+function WhisperAllAlignmentHeads(NumDecoderLayers,
+  NumDecoderHeads: integer): TWhisperAlignmentHeads;
+var
+  L, H, Cnt: integer;
+begin
+  SetLength(Result, NumDecoderLayers * NumDecoderHeads);
+  Cnt := 0;
+  for L := 0 to NumDecoderLayers - 1 do
+    for H := 0 to NumDecoderHeads - 1 do
+    begin
+      Result[Cnt].LayerIdx := L;
+      Result[Cnt].HeadIdx := H;
+      Inc(Cnt);
+    end;
+end;
+
+function WhisperDefaultAlignmentHeads(NumDecoderLayers,
+  NumDecoderHeads: integer): TWhisperAlignmentHeads;
+  // Appends one (layer, head) pair if it is inside the stack.
+  procedure Add(var Heads: TWhisperAlignmentHeads; L, H: integer);
+  begin
+    if (L >= 0) and (L < NumDecoderLayers) and
+       (H >= 0) and (H < NumDecoderHeads) then
+    begin
+      SetLength(Heads, Length(Heads) + 1);
+      Heads[High(Heads)].LayerIdx := L;
+      Heads[High(Heads)].HeadIdx := H;
+    end;
+  end;
+begin
+  SetLength(Result, 0);
+  // openai-whisper _ALIGNMENT_HEADS (decoded base85 masks), keyed by the
+  // (decoder_layers, decoder_heads) shape of the released checkpoints.
+  if (NumDecoderLayers = 4) and (NumDecoderHeads = 6) then
+  begin
+    // whisper-tiny / tiny.en
+    Add(Result, 2, 2); Add(Result, 3, 0); Add(Result, 3, 2);
+    Add(Result, 3, 3); Add(Result, 3, 4); Add(Result, 3, 5);
+  end
+  else if (NumDecoderLayers = 6) and (NumDecoderHeads = 8) then
+  begin
+    // whisper-base / base.en
+    Add(Result, 3, 1); Add(Result, 4, 2); Add(Result, 4, 3);
+    Add(Result, 4, 7); Add(Result, 5, 1); Add(Result, 5, 2);
+    Add(Result, 5, 4); Add(Result, 5, 6);
+  end
+  else if (NumDecoderLayers = 12) and (NumDecoderHeads = 12) then
+  begin
+    // whisper-small / small.en
+    Add(Result, 5, 3); Add(Result, 5, 9); Add(Result, 8, 0);
+    Add(Result, 8, 4); Add(Result, 8, 7); Add(Result, 8, 8);
+    Add(Result, 9, 0); Add(Result, 9, 7); Add(Result, 9, 9);
+    Add(Result, 10, 5);
+  end;
+  // Other sizes (medium / large variants) and the pico fixture fall back to
+  // "all heads" at the call site (Length(Result) = 0).
+end;
+
+function WhisperCollectCrossAttention(DecoderNet: TNNet;
+  const Config: TWhisperConfig;
+  const AlignmentHeads: TWhisperAlignmentHeads;
+  TextLen: integer): TNNetVolume;
+var
+  CrossLeaves: array of TNNetCrossAttention;
+  LeafCnt, LayerCnt, HeadCnt, EncFrames, AvgN: integer;
+  i, j, h, GlobalIdx: integer;
+  Leaf: TNNetCrossAttention;
+  RowMax, SumExp, V: TNeuralFloat;
+begin
+  // 1. Enumerate the decoder's per-head cross-attention leaves in build
+  //    order: DecoderHeads of them per decode block, in head order.
+  SetLength(CrossLeaves, Config.DecoderLayers * Config.DecoderHeads);
+  LeafCnt := 0;
+  for i := 0 to DecoderNet.CountLayers - 1 do
+    if DecoderNet.Layers[i] is TNNetCrossAttention then
+    begin
+      if LeafCnt < Length(CrossLeaves) then
+        CrossLeaves[LeafCnt] := TNNetCrossAttention(DecoderNet.Layers[i]);
+      Inc(LeafCnt);
+    end;
+  if LeafCnt <> Config.DecoderLayers * Config.DecoderHeads then
+    ImportError('Whisper alignment: found ' + IntToStr(LeafCnt) +
+      ' cross-attention heads, expected ' +
+      IntToStr(Config.DecoderLayers * Config.DecoderHeads) +
+      ' (is this a Whisper decoder net?)');
+
+  // 2. Frame count from any leaf's attention map (X axis = audio frame).
+  EncFrames := CrossLeaves[0].AttentionWeights.SizeX;
+
+  Result := TNNetVolume.Create;
+  Result.ReSize(EncFrames, TextLen, 1);
+  Result.Fill(0);
+
+  // 3. Sum the requested heads' attention rows for the first TextLen tokens.
+  AvgN := 0;
+  for h := 0 to High(AlignmentHeads) do
+  begin
+    LayerCnt := AlignmentHeads[h].LayerIdx;
+    HeadCnt := AlignmentHeads[h].HeadIdx;
+    if (LayerCnt < 0) or (LayerCnt >= Config.DecoderLayers) or
+       (HeadCnt < 0) or (HeadCnt >= Config.DecoderHeads) then
+      continue;
+    GlobalIdx := LayerCnt * Config.DecoderHeads + HeadCnt;
+    Leaf := CrossLeaves[GlobalIdx];
+    for i := 0 to TextLen - 1 do
+      for j := 0 to EncFrames - 1 do
+        Result.Add(j, i, 0, Leaf.AttentionWeights[j, i, 0]);
+    Inc(AvgN);
+  end;
+  if AvgN = 0 then
+  begin
+    Result.Free;
+    ImportError('Whisper alignment: no valid alignment heads supplied.');
+  end;
+  Result.Mul(1.0 / AvgN);
+
+  // 4. Per-row (per-token) softmax over frames - normalizes the averaged
+  //    map back into a distribution along the audio axis.
+  for i := 0 to TextLen - 1 do
+  begin
+    RowMax := Result[0, i, 0];
+    for j := 1 to EncFrames - 1 do
+      if Result[j, i, 0] > RowMax then RowMax := Result[j, i, 0];
+    SumExp := 0;
+    for j := 0 to EncFrames - 1 do
+    begin
+      V := Exp(Result[j, i, 0] - RowMax);
+      Result[j, i, 0] := V;
+      SumExp := SumExp + V;
+    end;
+    if SumExp > 0 then
+      for j := 0 to EncFrames - 1 do
+        Result[j, i, 0] := Result[j, i, 0] / SumExp;
+  end;
+end;
+
+function WhisperDTW(Score: TNNetVolume;
+  out PathTok, PathFrame: array of integer): integer;
+var
+  N, M, i, j, ti, fj, PathLen: integer;
+  Cost: array of array of Double;   // accumulated cost
+  Trace: array of array of byte;    // 0=diag, 1=down(token), 2=right(frame)
+  c0, c1, c2, Best: Double;
+  BestMove: byte;
+  TmpTok, TmpFrame: array of integer;
+begin
+  N := Score.SizeY;  // text tokens
+  M := Score.SizeX;  // audio frames
+  SetLength(Cost, N + 1);
+  SetLength(Trace, N + 1);
+  for i := 0 to N do
+  begin
+    SetLength(Cost[i], M + 1);
+    SetLength(Trace[i], M + 1);
+    for j := 0 to M do Cost[i][j] := 1e30;
+  end;
+  Cost[0][0] := 0;
+  // Local cost = -Score (openai-whisper minimizes negative attention).
+  for i := 1 to N do
+    for j := 1 to M do
+    begin
+      c0 := Cost[i - 1][j - 1];  // diagonal
+      c1 := Cost[i - 1][j];      // down (advance token, hold frame)
+      c2 := Cost[i][j - 1];      // right (advance frame, hold token)
+      Best := c0; BestMove := 0;
+      if c1 < Best then begin Best := c1; BestMove := 1; end;
+      if c2 < Best then begin Best := c2; BestMove := 2; end;
+      Cost[i][j] := Best - Score[j - 1, i - 1, 0];
+      Trace[i][j] := BestMove;
+    end;
+  // Backtrace from (N,M) to (1,1), then collect into ascending order.
+  SetLength(TmpTok, N + M);
+  SetLength(TmpFrame, N + M);
+  PathLen := 0;
+  i := N; j := M;
+  while (i > 0) and (j > 0) do
+  begin
+    TmpTok[PathLen] := i - 1;
+    TmpFrame[PathLen] := j - 1;
+    Inc(PathLen);
+    case Trace[i][j] of
+      0: begin Dec(i); Dec(j); end;
+      1: Dec(i);
+      2: Dec(j);
+    end;
+  end;
+  // Reverse into the caller's arrays (truncate to their capacity).
+  Result := PathLen;
+  if Result > Length(PathTok) then Result := Length(PathTok);
+  if Result > Length(PathFrame) then Result := Length(PathFrame);
+  for i := 0 to Result - 1 do
+  begin
+    ti := TmpTok[PathLen - 1 - i];
+    fj := TmpFrame[PathLen - 1 - i];
+    PathTok[i] := ti;
+    PathFrame[i] := fj;
+  end;
+end;
+
+function WhisperWordTimestamps(DecoderNet: TNNet;
+  const Config: TWhisperConfig; Tokenizer: TNeuralHFTokenizer;
+  const Tokens: array of integer; TextStart: integer;
+  const AlignmentHeads: TWhisperAlignmentHeads): TWhisperWordTimestamps;
+var
+  Heads: TWhisperAlignmentHeads;
+  Score: TNNetVolume;
+  PathTok, PathFrame: array of integer;
+  PathLen, NText, t, k, WordCnt: integer;
+  TokStartFrame, TokEndFrame: array of integer;
+  Surface: string;
+  CurStart, CurEnd: integer;
+  HaveWord: boolean;
+  CurWord: string;
+begin
+  SetLength(Result, 0);
+  NText := Length(Tokens) - TextStart;
+  if NText <= 0 then Exit;
+
+  Heads := AlignmentHeads;
+  if Length(Heads) = 0 then
+    Heads := WhisperAllAlignmentHeads(Config.DecoderLayers,
+      Config.DecoderHeads);
+
+  // Cross-attention over the FULL prefix; we read only the text rows.
+  Score := WhisperCollectCrossAttention(DecoderNet, Config, Heads,
+    Length(Tokens));
+  try
+    // Slice out the text-token rows into a compact (NText x EncFrames) map.
+    if TextStart > 0 then
+    begin
+      // Re-pack rows [TextStart..] to the top.
+      for t := 0 to NText - 1 do
+        for k := 0 to Score.SizeX - 1 do
+          Score[k, t, 0] := Score[k, t + TextStart, 0];
+    end;
+    // DTW on just the text rows.
+    SetLength(PathTok, NText + Score.SizeX);
+    SetLength(PathFrame, NText + Score.SizeX);
+    // Temporarily view only NText rows by resizing the Y extent.
+    Score.ReSize(Score.SizeX, NText, 1);
+    PathLen := WhisperDTW(Score, PathTok, PathFrame);
+
+    // Per-token frame span: first and last frame the path assigns to it.
+    SetLength(TokStartFrame, NText);
+    SetLength(TokEndFrame, NText);
+    for t := 0 to NText - 1 do
+    begin
+      TokStartFrame[t] := -1;
+      TokEndFrame[t] := -1;
+    end;
+    for k := 0 to PathLen - 1 do
+    begin
+      t := PathTok[k];
+      if (t >= 0) and (t < NText) then
+      begin
+        if TokStartFrame[t] < 0 then TokStartFrame[t] := PathFrame[k];
+        TokEndFrame[t] := PathFrame[k];
+      end;
+    end;
+  finally
+    Score.Free;
+  end;
+
+  // Merge sub-word tokens into words: a token whose decoded surface starts
+  // with a leading space (GPT-2 byte-level BPE word boundary) opens a new
+  // word; specials (EOS / timestamp tokens >= eos) end the current word.
+  HaveWord := false;
+  CurWord := '';
+  CurStart := 0;
+  CurEnd := 0;
+  WordCnt := 0;
+  for t := 0 to NText - 1 do
+  begin
+    if Tokens[TextStart + t] >= Config.EosTokenId then
+      break;  // EOS or a timestamp/special token ends the text
+    Surface := Tokenizer.DecodeToken(Tokens[TextStart + t]);
+    if (TokStartFrame[t] < 0) then continue;
+    if HaveWord and (Length(Surface) > 0) and (Surface[1] = ' ') then
+    begin
+      // Flush the accumulated word.
+      SetLength(Result, WordCnt + 1);
+      Result[WordCnt].Word := CurWord;
+      Result[WordCnt].StartS := CurStart * WhisperSecondsPerFrame;
+      Result[WordCnt].EndS := (CurEnd + 1) * WhisperSecondsPerFrame;
+      Inc(WordCnt);
+      CurWord := Surface;
+      CurStart := TokStartFrame[t];
+      CurEnd := TokEndFrame[t];
+    end
+    else
+    begin
+      if not HaveWord then
+      begin
+        CurWord := Surface;
+        CurStart := TokStartFrame[t];
+      end
+      else
+        CurWord := CurWord + Surface;
+      CurEnd := TokEndFrame[t];
+      HaveWord := true;
+    end;
+  end;
+  if HaveWord then
+  begin
+    SetLength(Result, WordCnt + 1);
+    Result[WordCnt].Word := CurWord;
+    Result[WordCnt].StartS := CurStart * WhisperSecondsPerFrame;
+    Result[WordCnt].EndS := (CurEnd + 1) * WhisperSecondsPerFrame;
+  end;
 end;
 
 // ============================ WAV2VEC2 / HUBERT CTC IMPORT =================

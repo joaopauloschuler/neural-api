@@ -854,27 +854,32 @@ rather than acted on.
 - [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
       cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
       machinery) so long transcripts don't re-run the whole prefix each step.
-- [ ] Whisper WORD-LEVEL timestamps via cross-attention DTW alignment (port of
-      openai-whisper / transformers `return_timestamps="word"`) — the landed Whisper
-      importer transcribes text but emits NO timing; this is the standard, high-value
-      voice feature for subtitles/karaoke/forced alignment. After greedy/beam decode,
-      collect the decoder->encoder CROSS-ATTENTION weight matrices from the model's
-      designated "alignment heads" (a small per-checkpoint subset; HF stores them in
-      `generation_config.alignment_heads`, openai-whisper bakes them into the released
-      checkpoints — read or hardcode-per-size), average + normalize them into a
-      (text-token x audio-frame) score matrix, then run dynamic time warping (the same
-      O(N*M) DP as in openai-whisper's `find_alignment`) to extract the monotonic
-      token->frame path; convert frame indices to seconds (each encoder frame = 20 ms
-      for the 16 kHz/hop-160 mel front-end) and merge sub-word tokens back into words
-      to produce (word, start_s, end_s) tuples. New piece is a small DTW helper +
-      cross-attention-weight capture hook on the SDPA layers (the attention probs are
-      already computed in the forward — expose/accumulate them for the chosen heads);
-      the rest reuses the landed Whisper graph + tokenizer. Scope v1 to greedy decode
-      of one 30 s window with the head list supplied as a config arg; defer multi-window
-      stitching and the median-filter smoothing refinement to a follow-up. Parity-gate
-      the DTW path length/monotonicity (and optionally token->frame indices) against an
-      openai-whisper / HF float64 oracle on a pico fixture. Voice priority; extends an
-      already-landed importer rather than adding a near-duplicate of one.
+- [X] Whisper WORD-LEVEL timestamps via cross-attention DTW alignment (port of
+      openai-whisper / transformers `return_timestamps="word"`). Landed in
+      neuralpretrained.pas: WhisperCollectCrossAttention reads the decoder's
+      per-head TNNetCrossAttention.AttentionWeights (already softmaxed in the
+      forward — no new capture hook needed), averages the requested alignment
+      heads + per-token re-softmaxes into a (text-token x audio-frame) score
+      matrix; WhisperDTW runs the monotonic O(N*M) DP backtrace; and
+      WhisperWordTimestamps merges sub-word tokens into (word, start_s, end_s)
+      tuples at WhisperSecondsPerFrame = 0.02 s/frame. The head list is a config
+      arg: WhisperDefaultAlignmentHeads returns the openai-whisper baked-in
+      subset for the released tiny/base/small shapes, WhisperAllAlignmentHeads is
+      the fallback. Parity-gated against a HF/numpy float64 oracle on the pico
+      fixture (TestWhisperWordTimestamps + tools/whisper_tiny_fixture.py emitting
+      tests/fixtures/tiny_whisper_alignment.json): score matrix, DTW path
+      length + token/frame indices + monotonicity, and per-token frame spans.
+      FOLLOW-UPS (deferred, see below).
+- [ ] Whisper word-timestamp follow-ups (v1 landed above, scoped to one 30 s
+      greedy window): (a) median-filter smoothing of the score matrix before DTW
+      (openai-whisper's `median_filter`, default kernel 7) to suppress single-
+      frame spikes; (b) multi-window stitching for clips > 30 s (carry the
+      running time offset and merge the per-window word lists); (c) baked-in
+      alignment heads for the medium/large shapes + reading
+      generation_config.alignment_heads when present (v1 hardcodes tiny/base/small
+      and falls back to all-heads otherwise); (d) wire it into
+      examples/WhisperTranscribe behind a `--word-timestamps` flag and document
+      in examples/README; (e) optional per-word confidence (mean path attention).
 - [ ] SAM mask decoder v2: MULTI-point / box prompts + MULTI-mask output + IoU head.
       v1 hardcodes a single positive point (+ pad) and emits only mask-token 0
       (multimask_output=False). Extend the prompt encoder to N points / a box (two
