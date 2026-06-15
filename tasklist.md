@@ -948,6 +948,68 @@ rather than acted on.
       LLaVA's causal-everywhere mask and from the open Qwen2-VL M-RoPE path. Pico parity
       vs HF float64 on next-token logits for a mixed image+text prompt + an
       examples/PaliGemmaCaption that captions a tiny image on CPU (ulimit-bounded).
+- [ ] AnimateDiff text-to-VIDEO motion-module importer (BuildAnimateDiffFromSafeTensors,
+      e.g. guoyww/animatediff-motion-adapter-v1-5-2) — the FIRST video-GENERATIVE
+      importer (a sequence of frames from a text prompt), a brand-new generative
+      modality vs every landed image generator (DiT/PixArt diffusion, VisualGAN/
+      StyleGAN2, MaskGIT). AnimateDiff inserts a TEMPORAL motion module after each
+      spatial block of a frozen SD UNet: the per-frame token grids are transposed so
+      attention runs along the TIME axis (each spatial location attends across frames)
+      with a sinusoidal temporal position embedding, learning motion while the spatial
+      weights stay fixed. The genuinely new code is that temporal-axis attention block
+      (reuse the landed SDPA over a (NumFrames,1,C) reshape per spatial cell, exactly
+      the VideoMAE space<->time transpose trick) + the zero-initialised residual
+      injection into the frozen UNet (same wiring as the tracked ControlNet zero-conv).
+      DEPENDS ON the open SD UNet importer (the VAE-decoder follow-up's deferred piece);
+      track as its natural successor alongside ControlNet. Pico parity vs a diffusers
+      float64 oracle on one motion-module output for a fixed multi-frame latent; an
+      examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU once the
+      base UNet lands. Note: the cheaper no-UNet route to video is bolting the same
+      temporal block onto the landed PixArt DiT — worth scoping if SD UNet stays blocked.
+- [ ] SDEdit image-to-image / real-image EDITING example (examples/ImageToImage) that
+      reuses ALREADY-LANDED pieces with NO new importer and NO SD UNet: the VAE ENCODER
+      (BuildVaeEncoderFromSafeTensors, landed) maps a real input image -> latent, the
+      DDIM/DPM-Solver++ scheduler (TNNetDiffusionScheduler) adds noise to an intermediate
+      timestep (strength in 0..1), the landed PixArt denoiser (BuildPixArtFromSafeTensors)
+      re-denoises conditioned on a NEW prompt, and the VAE DECODER returns the edited RGB.
+      Structurally distinct from the tracked LatentTextToImage capstone (text->image from
+      PURE noise): here the start latent is a real encoded image partially noised, so it
+      preserves layout while changing content — the SDEdit / img2img workflow. The only
+      new code is the encode->partial-noise->denoise->decode driver + the strength knob;
+      every model and sampler step is landed. CPU/ulimit-bounded smoke run writing a
+      before/after pair. Also unblocks diffusion INPAINTING (re-noise only the masked
+      latent region each step) as a one-flag follow-up — the diffusion-based sibling of
+      the tracked GAN context-encoder examples/Inpainting. Edit examples/README.md.
+- [ ] Structured-vision accuracy eval harness for the imported DETECTION and DENSE-
+      prediction backbones (EvaluateDetectionMAP / EvaluateSegmentationMIoU + reports in
+      neuralimagemetrics.pas, plus examples/VisionEval) — the verification backstop that
+      the tracked ImageNet top-1 harness is for CLASSIFIERS, but for the importers whose
+      output is NOT a class vector: boxes (DETR / YOLO / OWL-ViT) and dense maps
+      (SegFormer / DPT-Depth). Each detection importer's parity test only compares raw
+      head logits on one image, which catches a transposed weight but NOT a wrong box
+      decode (cxcywh<->xyxy, sigmoid placement), NMS, or label permutation. Add: (a) a
+      COCO-style mean-Average-Precision scorer (per-class precision/recall over IoU
+      thresholds 0.50:0.95, the standard 101-point interpolation) over a small folder of
+      labelled boxes; (b) a semantic-segmentation mean-IoU / pixel-accuracy scorer over a
+      small folder of label-map PNGs. Pure CPU post-process on the landed importers'
+      outputs; reports a per-class table + a few visual overlays. Distinct from the
+      logit-parity tests (those pin the math; this pins the end-to-end pipeline incl.
+      preprocessing/decode). The missing import-VERIFICATION mirror of MMLUEval for vision.
+- [ ] Florence-2 unified vision importer (BuildFlorence2FromSafeTensors, e.g.
+      microsoft/Florence-2-base) — a structurally DISTINCT VLM that does detection,
+      segmentation, captioning AND OCR through ONE task-prompted seq2seq head, unlike the
+      tracked single-task PaliGemma (prefix-LM caption) and LLaVA (causal chat). The
+      input is an image + a short TASK TOKEN (e.g. <CAPTION>, <OD>, <OCR>) and the BART-
+      style decoder emits a text/coordinate token stream that is parsed per task (boxes
+      and polygons are encoded as quantized location tokens <loc_0..loc_999> in the
+      vocabulary — the genuinely new idea: spatial outputs as text). Reuses the landed
+      seq2seq enc-dec convention (T5EncoderStates two-net path, BART decoder as in TrOCR)
+      and a ViT-style image tower; the new code is the DaViT-or-ViT vision encoder feeding
+      visual tokens into the encoder prefix + the location-token (de)quantization for box/
+      polygon parsing. Scope v1 to <CAPTION> + <OD> (detection) inference. Pico parity vs
+      HF float64 on the decoder logits for a fixed image+task token + an examples/
+      Florence2 that captions and box-detects one tiny CPU image. First "spatial-output-
+      as-text" importer; complements the box/mask importers (DETR/SAM/Mask2Former).
 
 ## Layer follow-ups that fix real limitations
 
