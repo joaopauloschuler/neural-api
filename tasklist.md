@@ -1142,3 +1142,68 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       with loss-difference direction >90% of the time across a small grid.
 - [ ] Coverage matrix at the top of TestNeuralNumerical.pas: per-class
       `[grad] [serialize]` block, written by a small script.
+
+## Lucky-day additions 2026-06-14 (CV / generative / imports)
+
+- [ ] CycleGAN unpaired image-to-image translation example
+      (examples/CycleGAN) — the GENERATIVE-CV gap left by the landed Pix2Pix
+      (which is PAIRED supervised). CycleGAN learns two generators G:A->B and
+      F:B->A plus two PatchGAN discriminators with a CYCLE-CONSISTENCY loss
+      (|F(G(a))-a| + |G(F(b))-b|) and optional identity loss, so it needs NO
+      aligned pairs. Reuse the Pix2Pix PatchGAN discriminator + ResNet/U-Net
+      generator building blocks already in the repo; the new code is the
+      two-direction training loop and the cycle/identity loss bookkeeping.
+      Demo: a tiny horse<->zebra-style recoloring or MNIST<->edge toy on CPU.
+      Distinct from Pix2Pix (unpaired, dual generators, cycle loss) — not a
+      near-duplicate.
+- [ ] Masked Autoencoder (MAE, He et al. 2022) self-supervised pretraining
+      example (examples/MaskedAutoencoder) — the SELF-SUPERVISED-VISION gap
+      (existing autoencoders VisualAutoencoder/SparseAutoencoder/AnomalyAuto
+      encoder/GumbelAnnealingAutoencoder are all full-image, not masked). Patch
+      the image, randomly DROP ~75% of patches, encode only the visible patches
+      with a ViT encoder (already importable/buildable here), then a lightweight
+      decoder with mask tokens reconstructs the missing pixels (loss only on
+      masked patches). Shows that the learned encoder is a good init for a
+      downstream linear-probe / fine-tune on a small classification set. Reuses
+      the patch-embed + EncoderBlock path; new code is the random-mask gather/
+      scatter and the asymmetric encoder/decoder split.
+- [ ] OWL-ViT open-vocabulary object-detection importer
+      (BuildOwlViTFromSafeTensors, e.g. google/owlvit-base-patch32) — the
+      ZERO-SHOT-DETECTION gap (DETR is open but closed-vocabulary). OWL-ViT
+      reuses a CLIP ViT image encoder (already landed as BuildClipVisionTower)
+      + CLIP text encoder; it drops the CLIP pooling and instead attaches a
+      per-patch class-embedding head (matched against text-query embeddings by
+      cosine similarity) plus a small box-regression MLP head. Output modality:
+      a set of (box, query-match-score) per image. Pico parity vs HF float64 on
+      the per-patch logits; demo: examples/OpenVocabDetection scores a couple of
+      free-text queries against one tiny image. Distinct from DETR (CLIP-based,
+      text-conditioned, no learned object queries).
+- [ ] BLIP image-captioning importer (BuildBlipForCaptioningFromSafeTensors,
+      e.g. Salesforce/blip-image-captioning-base) — first GENERATIVE
+      vision-language importer of the ENCODER-DECODER kind (LLaVA, still open,
+      is decoder-only-with-projector; this is architecturally different). A ViT
+      image encoder (reuse BuildClipVisionTower path) feeds a BERT-style text
+      decoder via CROSS-ATTENTION (the TNNetCrossAttention / cross-WKV wiring
+      already exists) to autoregressively generate a caption. Reuse the seq2seq
+      greedy/sampled decode helpers. Pico parity vs HF float64 on the first
+      decoded logits; demo: examples/ImageCaptioning writes a caption for one
+      tiny image.
+- [ ] VQ-GAN training example (examples/VQGAN) — upgrades the landed VQVAE
+      (reconstruction-only L2) into the GENERATIVE-CV regime by adding a
+      PatchGAN discriminator (reuse the Pix2Pix discriminator) + an adversarial
+      loss and a perceptual term (reuse the landed LPIPS / ComputeLPIPSDistance),
+      which is what makes VQ codebooks usable for sharp generation. Reuse the
+      existing TNNetVQ codebook layer and the VQVAE encoder/decoder; the new code
+      is the GAN + perceptual loss schedule and the codebook commitment balance.
+      Distinct from VQVAE (adversarial + perceptual, not pure L2) and from
+      VisualGAN (discrete-latent two-stage, not a plain DCGAN).
+- [ ] Few-step Consistency-Model distillation example
+      (examples/ConsistencyDistill) — a FAST-SAMPLING generative follow-up to
+      the landed diffusion examples (DiffusionMNIST/ConditionalDiffusion/
+      FlowMatching are all many-step). Distill a trained MNIST diffusion teacher
+      into a consistency model whose self-consistency property (f(x_t,t) maps any
+      point on a trajectory to its origin) allows 1-4 step sampling. Reuse the
+      existing diffusion U-Net / noise schedule; new code is the consistency
+      training target (EMA target network + the boundary-condition
+      parameterization) and the few-step sampler. Shows sample quality at
+      1/2/4 steps vs the multi-step teacher.
