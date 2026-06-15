@@ -838,6 +838,36 @@ rather than acted on.
         default TargetAccuracy and early-stops.
   - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
         directly instead of requiring an ffmpeg pre-pass.
+- [ ] HTDemucs / Demucs music SOURCE-SEPARATION importer
+      (BuildDemucsFromSafeTensors[Ex] + TDemucsConfig, e.g.
+      facebook/demucs / htdemucs) — the FIRST audio source-separation model and a
+      genuinely new audio OUTPUT modality: one mixed track in, four stems out
+      (drums / bass / other / vocals), squarely in the music priority. Distinct from
+      every landed audio model — EnCodec (codec), Wav2Vec2/Whisper (recognition),
+      HiFi-GAN/VITS (synthesis), CLAP (embedding) — none separate sources. v1 scope:
+      the time-domain (waveform) Demucs (v2/v3) U-Net — a symmetric stack of strided
+      1-D conv encoders with GLU + a bi-LSTM (or the v3 cross-domain transformer)
+      bottleneck + transposed-conv decoders with skip connections, reusing the
+      existing 1-D conv / GLU / LSTM leaf layers (no new leaf layer expected; the
+      hybrid time+spectral HTDemucs spectral branch is the stretch). Pico parity
+      vs an HF/torch float64 oracle on a short fixed waveform (tools/make_pico_demucs_fixture.py
+      -> tests/fixtures/tiny_demucs*, TestDemucsSeparationParity < 1e-4), then an
+      examples/MusicSourceSeparation that splits a short clip and writes the four
+      stems via the landed WAV writer. DEPENDS ON the WAV writer (landed).
+- [ ] Moonshine streaming-ASR importer (BuildMoonshineFromSafeTensors[Ex] +
+      TMoonshineConfig, UsefulSensors/moonshine-tiny|base) — a SECOND speech-to-text
+      architecture that is deliberately distinct from the landed Whisper importer,
+      not a near-duplicate: Moonshine has NO fixed 30 s mel frontend (it convolves
+      RoPE-positioned features directly off the raw 16 kHz waveform with a small
+      strided-conv stem) so compute scales with actual audio length, and its
+      encoder-decoder transformer uses RoPE + SwiGLU rather than Whisper's learned
+      sinusoidal absolute positions + GELU MLP. Reuses the landed seq2seq decode
+      machinery (DecodeSeq2SeqGreedy/BeamSearch) and the RoPE/SwiGLU leaf layers;
+      the only new code is the raw-waveform conv stem + the config/key wiring. Pico
+      parity vs an HF float64 oracle on encoder hidden states for a fixed waveform
+      (tools/make_pico_moonshine_fixture.py -> tests/fixtures/tiny_moonshine*,
+      TestMoonshineEncoderParity < 1e-4) + an examples/MoonshineTranscribe smoke that
+      transcribes a short clip, contrasting decode latency vs WhisperTranscribe.
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
