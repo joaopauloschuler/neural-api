@@ -71,3 +71,8 @@ examples/ImageToImage/*.ppm
 examples/ImageToImage/*.png
 examples/ImageToImage/*.o
 examples/ImageToImage/*.ppu
+examples/FrameInterpolation/FrameInterpolation
+examples/FrameInterpolation/*.ppm
+examples/FrameInterpolation/*.png
+examples/FrameInterpolation/*.o
+examples/FrameInterpolation/*.ppu

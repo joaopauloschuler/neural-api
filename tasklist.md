@@ -835,19 +835,6 @@ rather than acted on.
         per-pixel broadcast noise for real stochastic synthesis).
   - [ ] real stylegan2 checkpoint (NVIDIA .pkl / a rosinality safetensors) parity once
         obtainable; the training path (discriminator + path-length reg) and StyleGAN3.
-- [ ] examples/FrameInterpolation — video FRAME INTERPOLATION (predict the MIDDLE
-      frame between two given frames), structurally distinct from the landed
-      examples/VideoPrediction (next-frame EXTRAPOLATION via TNNetConvLSTMCell) and
-      from every image-generation example: the input is two endpoint frames and the
-      target is the unseen in-between frame (the RIFE/FILM task). Scope v1 to the
-      same self-contained synthetic Moving-MNIST-style blob data already used by
-      VideoPrediction (no download): feed frames t and t+2, supervise on t+1 with an
-      L1 + landed-SSIM reconstruction loss. Two CPU-friendly model variants worth
-      comparing: (a) a direct conv encoder-decoder that synthesizes the middle frame,
-      and (b) a flow-based path that predicts a mid->endpoints flow field and warps
-      both frames via the new TNNetFlowWarp primitive, then blends — the textbook
-      illustration of why warping beats direct synthesis for motion. Writes
-      before/predicted/after triplets; edit examples/README.md (NOT the main README).
 - [ ] MMDiT (Stable Diffusion 3 / FLUX.1) text-to-image transformer importer
       (BuildMMDiTFromSafeTensors, e.g. stabilityai/stable-diffusion-3-medium or a
       small Flux-schnell config) — the DUAL-STREAM joint-attention DiT, architecturally
