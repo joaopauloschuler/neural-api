@@ -611,6 +611,9 @@ type
     procedure TestCausalConv1DDilatedForward;
     procedure TestCausalConv1DDilatedWeightGradientCheck;
     procedure TestCausalConv1DDilatedSerializationRoundTrip;
+    procedure TestConvolution3DInputGradientCheck;
+    procedure TestConvolution3DWeightGradientCheck;
+    procedure TestConvolution3DSerializationRoundTrip;
     procedure TestDepthwiseConv1DInputGradientCheck;
     procedure TestDepthwiseConv1DWeightGradientCheck;
     procedure TestDepthwiseConv1DSerializationRoundTrip;
@@ -39848,6 +39851,201 @@ begin
       NN2.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
         AssertEquals('CausalConv1D dilated round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i],
+          NN2.GetLastLayer.Output.Raw[i], 1e-5);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvolution3DInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  LConv: TNNetConvolution3D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+  W, H, InT, C, NumFeat, KT, KXY: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  // (W,H,InT,C)=(4,4,3,2); kernel KT=2 temporal, KXY=3 spatial, pad=1 stride=1.
+  W := 4; H := 4; InT := 3; C := 2; NumFeat := 2; KT := 2; KXY := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, InT * C);
+  InputPlus := TNNetVolume.Create(W, H, InT * C);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, InT * C, 1));
+    LConv := TNNetConvolution3D.Create(NumFeat, KT, KXY, 1, 1, C);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.6) * 1.1 + 0.2;
+    Desired := TNNetVolume.Create(LConv.Output.SizeX, LConv.Output.SizeY,
+      LConv.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.4) * 0.7;
+    for i := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.3;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Convolution3D input gradient at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvolution3DWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  LConv: TNNetConvolution3D;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i, n: integer;
+  W, H, InT, C, NumFeat, KT, KXY: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k2: integer;
+    diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k2 := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k2] - Desired.Raw[k2];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 4; H := 4; InT := 3; C := 2; NumFeat := 2; KT := 2; KXY := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(W, H, InT * C);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(W, H, InT * C, 1));
+    LConv := TNNetConvolution3D.Create(NumFeat, KT, KXY, 1, 1, C);
+    NN.AddLayer(LConv);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.45) * 1.0 + 0.3;
+    Desired := TNNetVolume.Create(LConv.Output.SizeX, LConv.Output.SizeY,
+      LConv.Output.Depth);
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.35) * 0.6;
+    for i := 0 to LConv.Neurons.Count - 1 do
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.25;
+
+    for n := 0 to LConv.Neurons.Count - 1 do
+      for i := 0 to LConv.Neurons[n].Weights.Size - 1 do
+      begin
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss(Input);
+        LConv.Neurons[n].Weights.Raw[i] := LConv.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        LConv.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -LConv.Neurons[n].Delta.Raw[i];
+
+        AssertTrue('Convolution3D weight gradient n=' + IntToStr(n) +
+          ' w=' + IntToStr(i) + ' num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvolution3DSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  LConv: TNNetConvolution3D;
+  Saved, Saved2: string;
+  i: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 3 * 2); // W=5,H=5,InT=3,C=2
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 3 * 2, 1));
+    LConv := TNNetConvolution3D.Create(3, 2, 3, 1, 1, 2);
+    NN.AddLayer(LConv);
+    for i := 0 to LConv.Neurons.Count - 1 do
+    begin
+      LConv.Neurons[i].Weights.Raw[0] := LConv.Neurons[i].Weights.Raw[0] + 0.37;
+      LConv.Neurons[i].Weights.Raw[1] := LConv.Neurons[i].Weights.Raw[1] - 0.21;
+    end;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.7 + 0.1;
+    NN.Compute(Input);
+    Saved := NN.SaveToString();
+
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      AssertTrue('Convolution3D round-trip class identity',
+        NN2.GetLastLayer is TNNetConvolution3D);
+      Saved2 := NN2.SaveToString();
+      AssertEquals('Convolution3D save->load->save string equality', Saved, Saved2);
+      AssertEquals('Convolution3D round-trip structure',
+        NN.GetLastLayer.SaveStructureToString(),
+        NN2.GetLastLayer.SaveStructureToString());
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('Convolution3D round-trip output at ' + IntToStr(i),
           NN.GetLastLayer.Output.Raw[i],
           NN2.GetLastLayer.Output.Raw[i], 1e-5);
     finally

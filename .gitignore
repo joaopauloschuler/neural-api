@@ -26,6 +26,7 @@ examples/SpanCorruptionPretrain/SpanCorruptionPretrain
 examples/VQVAE/VQVAE
 examples/VQVAE/diag
 examples/ConditionalDiffusion/ConditionalDiffusion
+examples/VideoActionTiny/VideoActionTiny
 link*.res
 autosave.csv
 autosave.nn
