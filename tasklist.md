@@ -700,47 +700,6 @@ rather than acted on.
       (do_stable_layer_norm), and the final encoder LayerNorm placement that
       pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
       contrastive masked-prediction heads currently dropped as ignorable tensors).
-- [X] EnCodec neural audio codec importer (BuildEnCodecFromSafeTensors, e.g.
-      facebook/encodec_24khz) — the FIRST audio-GENERATIVE importer and the foundational
-      decoder for neural audio synthesis. Every landed audio model (Wav2Vec2/HuBERT) is
-      analysis-only (audio -> CTC text); EnCodec is the inverse — a streaming
-      convolutional encoder/decoder that turns a waveform into a stack of discrete codes
-      and back. The genuinely NEW primitive is **Residual Vector Quantization (RVQ)**: a
-      cascade of N codebooks where each successive codebook quantizes the RESIDUAL left by
-      the previous one (the repo today has only the single-codebook TNNetVectorQuantizer
-      used by VQVAE/MaskGIT — RVQ is the multi-stage generalization, a small holder class
-      EncodeAudioToCodes / DecodeCodesToAudio doing argmin/gather per stage, NO heavy new
-      TNNet layer). The conv encoder/decoder reuse the SeparableConv / causal-Conv1D
-      blocks already in tree; v1 is inference-only reconstruction (waveform -> codes ->
-      waveform). Pico parity vs a transformers float64 oracle on the round-tripped
-      waveform (< 1e-4) + reuse make_pico_*_fixture.py; an examples/EnCodecRoundTrip that
-      compresses and reconstructs a tiny WAV on CPU. Unblocks the MusicGen / Bark
-      text-to-audio follow-up below (those generate EnCodec codes with a transformer LM,
-      then decode through this codec) — the audio analogue of the VQModel->image-LM path.
-  - [X] MusicGen text-to-music follow-up (BuildMusicGenFromSafeTensors, e.g.
-        facebook/musicgen-small) once EnCodec lands: a T5 text encoder
-        (BuildT5FromSafeTensors) conditioning a single-stage transformer decoder that
-        autoregressively predicts the EnCodec code stack with the **delay-pattern**
-        codebook interleaving (each of the K codebooks is offset by one step so a single
-        LM head predicts them causally), decoded back to audio through the landed EnCodec
-        decoder. DONE: TMusicGenModel holder + BuildMusicGenFromSafeTensors[Ex]; the
-        decoder is the PRE-norm cross-attention Pegasus block skeleton (NOT post-norm
-        BART) with K summed code-embedding tables, HF cat([cos,sin]) half-split sinusoidal
-        positions, bias-free q/k/v/out + fc, a final decoder LayerNorm, and K untied LM
-        heads, plus a biased enc_to_dec_proj. The genuinely new code is the delay-pattern
-        (de)interleave helpers (MusicGenDelayInterleave/Deinterleave) matching HF
-        build_delay_pattern_mask + a greedy Generate loop. Parity: TestMusicGenDecoderParity
-        (next-token logits K x T x vocab vs HF float64 oracle, max |diff| = 0.0 < 1e-4) +
-        TestMusicGenDelayPattern (interleave matches HF exactly + round-trip). Fixture:
-        tools/musicgen_tiny_fixture.py -> tests/fixtures/tiny_musicgen.{safetensors,
-        _config.json,_ref.json} (~16 KB). examples/MusicGenSmoke runs the importer +
-        delay-pattern greedy generation on the pico fixture (CPU, ulimit-bounded).
-        REMAINING FOLLOW-UPS (deferred): (a) stereo audio_channels=2 (the interleaved
-        2*K-codebook delay layout, currently rejected); (b) wire the FULL pipeline
-        end-to-end with a real T5 encoder + EnCodec decoder (RunT5-style helper) to emit
-        an actual waveform from a text prompt (v1's Generate stops at the code stack);
-        (c) KV-cache incremental decode in Generate (v1 recomputes the whole prefix each
-        step); (d) sampling (top-k/temperature) instead of greedy.
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
