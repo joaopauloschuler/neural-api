@@ -6092,6 +6092,86 @@ type
 // plain CPU helper, exactly the recipe the task asks for.
 function DecodeViTPoseKeypoints(Heatmaps: TNNetVolume): TViTPoseKeypointArray;
 
+// ===========================================================================
+// DETR object-detection import (HF model_type "detr",
+// facebook/detr-resnet-50) - the repo's FIRST object-detection importer.
+// ===========================================================================
+type
+  TDetrConfig = record
+    // backbone (HF ResNet, nested "backbone_config")
+    BackboneEmbedSize: integer;            // embedding_size (stem width)
+    BackboneHiddenSizes: array of integer; // hidden_sizes (per-stage widths)
+    BackboneDepths: array of integer;      // depths (blocks per stage)
+    NumChannels: integer;                  // num_channels (3)
+    ImageSize: integer;                    // image_size (square input)
+    // transformer
+    DModel: integer;                       // d_model
+    EncoderLayers: integer;                // encoder_layers
+    DecoderLayers: integer;                // decoder_layers
+    EncoderHeads: integer;                 // encoder_attention_heads
+    DecoderHeads: integer;                 // decoder_attention_heads
+    EncoderFFNDim: integer;                // encoder_ffn_dim
+    DecoderFFNDim: integer;                // decoder_ffn_dim
+    NumQueries: integer;                   // num_queries
+    NumLabels: integer;                    // num_labels (foreground classes)
+    ModelType: string;                     // 'detr'
+  end;
+
+// Reads a HF DETR config.json (model_type "detr"). The ResNet backbone is read
+// from the nested "backbone_config" object (embedding_size, hidden_sizes,
+// depths; layer_type must be "bottleneck"). Required transformer fields:
+// d_model, encoder_layers, decoder_layers, encoder/decoder_attention_heads,
+// encoder/decoder_ffn_dim, num_queries. num_labels = foreground classes (the
+// class head emits num_labels + 1 logits, the last slot = "no object").
+function ReadDetrConfigFromJSONFile(const FileName: string): TDetrConfig;
+
+function DetrConfigToString(const Config: TDetrConfig): string;
+
+// Builds the DETR object-detection net described by Config and loads every
+// weight from Reader (the caller owns Reader). The net takes an
+// (ImageSize, ImageSize, NumChannels) normalized RGB image and outputs, for the
+// FIXED set of NumQueries object queries, a (NumQueries, 1, NumLabels + 1 + 4)
+// volume: channels 0..NumLabels = the per-query class logits (the last is the
+// "no object" slot), channels NumLabels+1 .. NumLabels+4 = the sigmoid-
+// normalized cxcywh bounding box. INFERENCE only (no Hungarian matcher, which is
+// training-only): softmax each query's class logits, drop the no-object slot,
+// threshold, and read off the box with DecodeDetrDetections. Reuses the ResNet
+// backbone (conv + folded FrozenBatchNorm) and the transformer enc-dec
+// primitives; the genuinely new wiring is the learned object queries, the 2-D
+// sinusoidal spatial position embedding (added to queries+keys but NOT values of
+// every attention, matching DetrSinePositionEmbedding) and the class/box heads.
+function BuildDetrFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDetrConfig; pInferenceOnly: boolean = false): TNNet; overload;
+
+// Builds + loads the DETR net from the checkpoint at FileName. Config is
+// supplied by the caller (Ex) or read from ConfigFileName ('' = "config.json"
+// beside FileName) and returned. The net is owned by the caller.
+function BuildDetrFromSafeTensorsEx(const FileName: string;
+  const Config: TDetrConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildDetrFromSafeTensors(const FileName: string;
+  out Config: TDetrConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet; overload;
+
+type
+  // One decoded detection: the foreground class (0..NumLabels-1), its softmax
+  // probability (confidence) and the cxcywh box (normalized to [0,1]).
+  TDetrDetection = record
+    ClassId: integer;
+    Score: TNeuralFloat;
+    Cx, Cy, W, H: TNeuralFloat;
+  end;
+  TDetrDetectionArray = array of TDetrDetection;
+
+// Decodes a DETR output volume (the (NumQueries, 1, NumLabels+1+4) tensor) into
+// detections. For each query it softmaxes the NumLabels+1 class logits, takes
+// the most likely FOREGROUND class (the "no object" slot NumLabels is ignored),
+// and keeps the query when that probability >= Threshold. The box is read from
+// the trailing 4 channels (cxcywh). A plain CPU helper - the standard DETR
+// inference read-out (no Hungarian matcher, which is training-only).
+function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
+  Threshold: TNeuralFloat = 0.5): TDetrDetectionArray;
+
 // AutoModel-style dispatch: reads config.json's model_type and routes to
 // the right Build*FromSafeTensors builder. Path may be
 //   - a checkpoint DIRECTORY (uses Path/config.json and
@@ -37774,6 +37854,765 @@ begin
         end;
       end;
   end;
+end;
+
+// ===========================================================================
+// DETR object-detection import (HF model_type "detr") - IMPLEMENTATION
+// ===========================================================================
+
+function ReadDetrConfigFromJSONFile(const FileName: string): TDetrConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, BObj: TJSONObject;
+  BData, ArrData: TJSONData;
+  Arr: TJSONArray;
+  i: integer;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('DETR import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('DETR import: config field "' + FieldName +
+        '" must be a positive integer.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('DETR import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('DETR import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('DETR import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'detr');
+    if Result.ModelType <> 'detr' then
+      ImportError('DETR import: config model_type is "' + Result.ModelType +
+        '" - only "detr" is supported (deformable-DETR / DETA are follow-ups).');
+    // ---- transformer ----
+    Result.DModel := RequiredInt(Obj, 'd_model');
+    Result.EncoderLayers := RequiredInt(Obj, 'encoder_layers');
+    Result.DecoderLayers := RequiredInt(Obj, 'decoder_layers');
+    Result.EncoderHeads := RequiredInt(Obj, 'encoder_attention_heads');
+    Result.DecoderHeads := RequiredInt(Obj, 'decoder_attention_heads');
+    Result.EncoderFFNDim := RequiredInt(Obj, 'encoder_ffn_dim');
+    Result.DecoderFFNDim := RequiredInt(Obj, 'decoder_ffn_dim');
+    Result.NumQueries := RequiredInt(Obj, 'num_queries');
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.ImageSize := Obj.Get('image_size', 224);
+    // num_labels: explicit, else len(id2label), else 91 (COCO).
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      BData := Obj.Find('id2label');
+      if (BData <> nil) and (BData is TJSONObject) then
+        Result.NumLabels := TJSONObject(BData).Count;
+    end;
+    if Result.NumLabels <= 0 then Result.NumLabels := 91;
+    // ---- backbone (nested backbone_config, HF ResNet) ----
+    BData := Obj.Find('backbone_config');
+    if (BData = nil) or (not (BData is TJSONObject)) then
+      ImportError('DETR import: config "' + FileName +
+        '" is missing the nested "backbone_config" object (use_timm_backbone ' +
+        'must be false - the HF ResNet backbone path).');
+    BObj := TJSONObject(BData);
+    if LowerCase(BObj.Get('layer_type', 'bottleneck')) <> 'bottleneck' then
+      ImportError('DETR import: only a "bottleneck" ResNet backbone is ' +
+        'supported (resnet-50 uses bottleneck blocks).');
+    Result.BackboneEmbedSize := BObj.Get('embedding_size', 64);
+    ArrData := BObj.Find('hidden_sizes');
+    if (ArrData = nil) or (not (ArrData is TJSONArray)) then
+      ImportError('DETR import: backbone_config is missing "hidden_sizes".');
+    Arr := TJSONArray(ArrData);
+    SetLength(Result.BackboneHiddenSizes, Arr.Count);
+    for i := 0 to Arr.Count - 1 do
+      Result.BackboneHiddenSizes[i] := Arr.Integers[i];
+    ArrData := BObj.Find('depths');
+    if (ArrData = nil) or (not (ArrData is TJSONArray)) then
+      ImportError('DETR import: backbone_config is missing "depths".');
+    Arr := TJSONArray(ArrData);
+    SetLength(Result.BackboneDepths, Arr.Count);
+    for i := 0 to Arr.Count - 1 do
+      Result.BackboneDepths[i] := Arr.Integers[i];
+    if Length(Result.BackboneDepths) <> Length(Result.BackboneHiddenSizes) then
+      ImportError('DETR import: backbone hidden_sizes / depths length ' +
+        'mismatch.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function DetrConfigToString(const Config: TDetrConfig): string;
+var
+  i: integer;
+  Sizes, Depths: string;
+begin
+  Sizes := '';
+  Depths := '';
+  for i := 0 to High(Config.BackboneHiddenSizes) do
+  begin
+    if i > 0 then begin Sizes := Sizes + ','; Depths := Depths + ','; end;
+    Sizes := Sizes + IntToStr(Config.BackboneHiddenSizes[i]);
+    Depths := Depths + IntToStr(Config.BackboneDepths[i]);
+  end;
+  Result := 'detr config: d_model=' + IntToStr(Config.DModel) +
+    ', enc=' + IntToStr(Config.EncoderLayers) + 'x' +
+    IntToStr(Config.EncoderHeads) + 'h/ffn' + IntToStr(Config.EncoderFFNDim) +
+    ', dec=' + IntToStr(Config.DecoderLayers) + 'x' +
+    IntToStr(Config.DecoderHeads) + 'h/ffn' + IntToStr(Config.DecoderFFNDim) +
+    ', queries=' + IntToStr(Config.NumQueries) +
+    ', labels=' + IntToStr(Config.NumLabels) +
+    ', backbone embed=' + IntToStr(Config.BackboneEmbedSize) +
+    ' stages=[' + Sizes + '] depths=[' + Depths + ']' +
+    ', image=' + IntToStr(Config.ImageSize);
+end;
+
+// Fills a TNNetLearnedPositionalEmbedding's table (FNeurons[0], shaped
+// (GridH*GridW, 1, DModel)) with DETR's 2-D sinusoidal SPATIAL position
+// embedding, EXACTLY matching DetrSinePositionEmbedding with the model's
+// configured normalize=True / scale=2*pi (the facebook/detr defaults):
+//   y_embed = (y + 1)/(GridH + eps) * 2*pi   (cumsum of an all-ones mask,
+//   x_embed = (x + 1)/(GridW + eps) * 2*pi    normalized then *scale; eps=1e-6)
+// temperature 10000, num_position_features = DModel div 2 per axis,
+// dim_t[i] = 10000^(2*(i div 2)/nfeat). For token (y,x) (row-major index
+// t = y*GridW + x): the first nfeat channels carry pos_y (even index = sin,
+// odd index = cos), the last nfeat carry pos_x.
+procedure FillDetrSpatialPosEmbed(Layer: TNNetLayer;
+  GridH, GridW, DModel: integer);
+const
+  cNormEps = 0.000001;
+  cTwoPi = 6.283185307179586;
+var
+  nfeat, t, x, y, i, half: integer;
+  YEmbed, XEmbed, DimT, Ang: double;
+  W: TNNetVolume;
+begin
+  nfeat := DModel div 2;
+  if Layer.Neurons.Count < 1 then
+    ImportError('DETR import: spatial pos-embed layer has no table neuron.');
+  W := Layer.Neurons[0].Weights;
+  if W.Size <> GridH * GridW * DModel then
+    ImportError('DETR import: spatial pos-embed table size ' +
+      IntToStr(W.Size) + ' <> ' + IntToStr(GridH * GridW * DModel) + '.');
+  for y := 0 to GridH - 1 do
+    for x := 0 to GridW - 1 do
+    begin
+      t := y * GridW + x;
+      YEmbed := ((y + 1) / (GridH + cNormEps)) * cTwoPi;
+      XEmbed := ((x + 1) / (GridW + cNormEps)) * cTwoPi;
+      for i := 0 to nfeat - 1 do
+      begin
+        half := (i div 2);  // dim_t shared by the (sin,cos) pair
+        DimT := Power(10000.0, (2.0 * half) / nfeat);
+        // pos_y -> channels 0..nfeat-1 ; even index sin, odd index cos.
+        Ang := YEmbed / DimT;
+        if (i and 1) = 0 then W.FData[t * DModel + i] := Sin(Ang)
+        else W.FData[t * DModel + i] := Cos(Ang);
+        // pos_x -> channels nfeat..2*nfeat-1.
+        Ang := XEmbed / DimT;
+        if (i and 1) = 0 then W.FData[t * DModel + nfeat + i] := Sin(Ang)
+        else W.FData[t * DModel + nfeat + i] := Cos(Ang);
+      end;
+    end;
+  Layer.FlushWeightCache();
+end;
+
+// Loads a learned positional-embedding table (e.g. the DETR object queries
+// "query_position_embeddings.weight" [Rows, DModel]) into a
+// TNNetLearnedPositionalEmbedding's neuron weights (row t, channel c ->
+// FWeights[t*DModel + c]).
+procedure LoadDetrLearnedPosEmbed(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; Rows, DModel: integer);
+var
+  Tmp: TNNetVolume;
+  t, c: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('DETR import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 2) or
+     (Reader.DimSize(WName, 0) <> Rows) or
+     (Reader.DimSize(WName, 1) <> DModel) then
+    ImportError('DETR import: "' + WName + '" must have shape [' +
+      IntToStr(Rows) + ', ' + IntToStr(DModel) + '], got ' +
+      Reader.ShapeAsString(WName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for t := 0 to Rows - 1 do
+      for c := 0 to DModel - 1 do
+        Layer.Neurons[0].Weights.FData[t * DModel + c] :=
+          Tmp.FData[t * DModel + c];
+    Layer.FlushWeightCache();
+  finally
+    Tmp.Free;
+  end;
+end;
+
+type
+  // The projection layers of one DETR attention sub-block needing weights.
+  TDetrAttnRefs = record
+    QProj, KProj, VProj, OProj: TNNetLayer;
+  end;
+
+// Architecture: builds one DETR multi-head attention sub-block.
+//   QKSource feeds q_proj and k_proj (= hidden + pos), VSource feeds v_proj
+//   (= hidden, no pos). For self-attention QKSource is the pos-added stream and
+//   VSource is the plain stream over the SAME tokens. For cross-attention the
+//   query side (QKSource for Q) and the key/value side differ: pass the query's
+//   pos-added stream as QSource, the key's pos-added stream as KSource and the
+//   key's plain stream as VSource (DETR adds query-pos to Q, spatial-pos to K,
+//   nothing to V). Returns the (post o_proj) layer; the caller adds the
+//   residual. Per head: TNNetCrossAttention over packed K|V with Q sliced (this
+//   handles rectangular query/key lengths used by cross-attention; for self-
+//   attention the two lengths are equal which is the symmetric case).
+function AddDetrAttention(NN: TNNet; const Config: TDetrConfig;
+  QSource, KSource, VSource: TNNetLayer; Heads, DModel: integer;
+  out Refs: TDetrAttnRefs): TNNetLayer;
+var
+  HeadDim, h, d: integer;
+  QSlice, KSlice, VSlice, KVPack: TNNetLayer;
+  HeadLayers: array of TNNetLayer;
+  SliceCh: array of integer;
+begin
+  HeadDim := DModel div Heads;
+  SetLength(SliceCh, HeadDim);
+  SetLength(HeadLayers, Heads);
+  // Biased q/k/v/o projections (HF nn.Linear with bias). Each per-head
+  // attention leaf divides its scores by sqrt(HeadDim) internally (DETR's
+  // scaling = HeadDim^-0.5), matching the CAI attention default.
+  Refs.QProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(DModel, 0), QSource);
+  Refs.KProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(DModel, 0), KSource);
+  Refs.VProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(DModel, 0), VSource);
+  for h := 0 to Heads - 1 do
+  begin
+    for d := 0 to HeadDim - 1 do SliceCh[d] := h * HeadDim + d;
+    QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceCh), Refs.QProj);
+    KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceCh), Refs.KProj);
+    VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(SliceCh), Refs.VProj);
+    KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+    HeadLayers[h] := NN.AddLayerAfter(
+      TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVPack), QSlice);
+  end;
+  NN.AddLayer( TNNetDeepConcat.Create(HeadLayers) );
+  Refs.OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(DModel, 0) );
+  Result := Refs.OProj;
+end;
+
+procedure LoadDetrAttnWeights(Reader: TNNetSafeTensorsReader;
+  const Refs: TDetrAttnRefs; const Prefix: string; DModel: integer);
+begin
+  LoadLlamaLinearWeights(Reader, Refs.QProj, Prefix + 'q_proj.weight',
+    DModel, DModel, 0, -1, 0, Prefix + 'q_proj.bias');
+  LoadLlamaLinearWeights(Reader, Refs.KProj, Prefix + 'k_proj.weight',
+    DModel, DModel, 0, -1, 0, Prefix + 'k_proj.bias');
+  LoadLlamaLinearWeights(Reader, Refs.VProj, Prefix + 'v_proj.weight',
+    DModel, DModel, 0, -1, 0, Prefix + 'v_proj.bias');
+  LoadLlamaLinearWeights(Reader, Refs.OProj, Prefix + 'o_proj.weight',
+    DModel, DModel, 0, -1, 0, Prefix + 'o_proj.bias');
+end;
+
+// Loads one HF ResNet conv (+ folded FrozenBatchNorm2d, eps 1e-5) into a CAI
+// conv layer, mirroring LoadResNetConvFoldBN but with DETR/HF ResNet key names
+// (".convolution.weight" + ".normalization.{weight,bias,running_mean,
+// running_var}"). The HF layout is identical to torchvision's [O,I,kh,kw].
+procedure LoadDetrResNetConvFoldBN(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const Prefix: string; OutCh, InCh, K: integer);
+const
+  cFrozenBnEps = 0.00001;
+begin
+  LoadResNetConvFoldBN(Reader, Layer, Prefix + '.convolution.weight',
+    Prefix + '.normalization', OutCh, InCh, K, cFrozenBnEps);
+end;
+
+// Loads a 1x1 Conv2d (weight [O,I,1,1], with bias) into a pointwise conv layer.
+// HF DETR's input_projection is a 1x1 conv (not an nn.Linear), so its weight
+// carries the two trailing singleton kernel dims; squeeze them and load like a
+// linear (each neuron's I weights are the channel weights, plus the bias).
+procedure LoadDetr1x1Conv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const WName, BName: string; OutCh, InCh: integer);
+var
+  W, B: TNNetVolume;
+  o, c: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('DETR import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 4) or
+     (Reader.DimSize(WName, 0) <> OutCh) or
+     (Reader.DimSize(WName, 1) <> InCh) or
+     (Reader.DimSize(WName, 2) <> 1) or (Reader.DimSize(WName, 3) <> 1) then
+    ImportError('DETR import: "' + WName + '" must have shape [' +
+      IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', 1, 1], got ' +
+      Reader.ShapeAsString(WName));
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    Reader.LoadTensorFlat(BName, B);
+    for o := 0 to OutCh - 1 do
+    begin
+      for c := 0 to InCh - 1 do
+        Layer.Neurons[o].Weights.FData[c] := W.FData[o * InCh + c];
+      Layer.Neurons[o].BiasWeight := B.FData[o];
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+// LayerNorm loader keyed by a base name (".weight" + ".bias").
+procedure LoadLayerNormDetr(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
+  const Base: string; DModel: integer);
+begin
+  LoadLayerNormWeights(Reader, Layer, Base + '.weight', Base + '.bias', DModel);
+end;
+
+function BuildDetr(Reader: TNNetSafeTensorsReader;
+  const Config: TDetrConfig; pInferenceOnly: boolean): TNNet;
+var
+  NN: TNNet;
+  StemConv, InputProj, EncStates, QueryInput: TNNetLayer;
+  SpatialPos, BranchIn, Normed, Plain, AttnOut, QPos: TNNetLayer;
+  Refs: TDetrAttnRefs;
+  EncSelfNorm, EncFFNNorm, EncFC1, EncFC2: array of TNNetLayer;
+  DecSelfNorm, DecCrossNorm, DecFFNNorm, DecFC1, DecFC2: array of TNNetLayer;
+  DecSelf, DecCross: array of TDetrAttnRefs;
+  EncSelf: array of TDetrAttnRefs;
+  DecSpatialPos: array of TNNetLayer;
+  DecQueryPosSelf, DecQueryPosCross: array of TNNetLayer;
+  ClassHead, BBox0, BBox1, BBox2, DecFinalNorm: TNNetLayer;
+  NumStages, Stage, BlockIdx, Stride, InWidth, BaseWidth, OutWidth: integer;
+  GridDim, NumTokens, L, Mid: integer;
+  StagePrefix, BP, LP, ShortcutKey: string;
+  BlockRefs: array of TResNetBlockLayers;
+  RefCount: integer;
+  ConfigRN: TResNetConfig;
+
+  // Builds one HF ResNet bottleneck block (layer.0=1x1, layer.1=3x3 stride,
+  // layer.2=1x1; optional shortcut 1x1). Mirrors AddResNetBlock but the HF
+  // ResNet always carries a shortcut on the first block of each stage.
+  procedure AddDetrBottleneck(BaseW, Stride: integer; HasShort: boolean;
+    out R: TResNetBlockLayers);
+  var
+    Inp, Branch: TNNetLayer;
+    OutW: integer;
+  begin
+    R.Conv1 := nil; R.Conv2 := nil; R.Conv3 := nil; R.Down := nil;
+    OutW := BaseW * 4;
+    Inp := NN.GetLastLayer();
+    R.Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(BaseW, 1, 0, 1, 0) );
+    NN.AddLayer( TNNetReLU.Create() );
+    R.Conv2 := NN.AddLayer(
+      TNNetConvolutionLinear.Create(BaseW, 3, 1, Stride, 0) );
+    NN.AddLayer( TNNetReLU.Create() );
+    R.Conv3 := NN.AddLayer( TNNetConvolutionLinear.Create(OutW, 1, 0, 1, 0) );
+    Branch := NN.GetLastLayer();
+    if HasShort then
+    begin
+      R.Down := NN.AddLayerAfter(
+        [TNNetConvolutionLinear.Create(OutW, 1, 0, Stride, 0)], Inp);
+      NN.AddLayer( TNNetSum.Create([Branch, R.Down]) );
+    end
+    else
+      NN.AddLayer( TNNetSum.Create([Branch, Inp]) );
+    NN.AddLayer( TNNetReLU.Create() );
+  end;
+
+begin
+  if Config.NumChannels < 1 then
+    ImportError('DETR import: num_channels must be >= 1.');
+  if (Config.DModel mod Config.EncoderHeads) <> 0 then
+    ImportError('DETR import: d_model must be divisible by encoder heads.');
+  if (Config.DModel mod Config.DecoderHeads) <> 0 then
+    ImportError('DETR import: d_model must be divisible by decoder heads.');
+  NumStages := Length(Config.BackboneHiddenSizes);
+  // Backbone: stem conv 7x7 s2 (/2) + maxpool 3 s2 (/2) then stage0 s1, the
+  // rest s2 -> total downsample = 4 * 2^(NumStages-1). The feature grid must be
+  // square (square input).
+  GridDim := Config.ImageSize div (4 * (1 shl (NumStages - 1)));
+  if GridDim < 1 then
+    ImportError('DETR import: image_size too small for the backbone depth.');
+  NumTokens := GridDim * GridDim;
+
+  RefCount := 0;
+  for Stage := 0 to NumStages - 1 do
+    Inc(RefCount, Config.BackboneDepths[Stage]);
+  SetLength(BlockRefs, RefCount);
+
+  SetLength(EncSelf, Config.EncoderLayers);
+  SetLength(EncSelfNorm, Config.EncoderLayers);
+  SetLength(EncFFNNorm, Config.EncoderLayers);
+  SetLength(EncFC1, Config.EncoderLayers);
+  SetLength(EncFC2, Config.EncoderLayers);
+  SetLength(DecSelf, Config.DecoderLayers);
+  SetLength(DecCross, Config.DecoderLayers);
+  SetLength(DecSelfNorm, Config.DecoderLayers);
+  SetLength(DecCrossNorm, Config.DecoderLayers);
+  SetLength(DecFFNNorm, Config.DecoderLayers);
+  SetLength(DecFC1, Config.DecoderLayers);
+  SetLength(DecFC2, Config.DecoderLayers);
+  SetLength(DecSpatialPos, Config.DecoderLayers);
+  SetLength(DecQueryPosSelf, Config.DecoderLayers);
+  SetLength(DecQueryPosCross, Config.DecoderLayers);
+
+  NN := TNNet.Create();
+  try
+    // ===================== ARCHITECTURE =====================
+    NN.AddLayer( TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels) );
+    StemConv := NN.AddLayer( TNNetConvolutionLinear.Create(
+      Config.BackboneEmbedSize, 7, 3, 2, 0) );
+    NN.AddLayer( TNNetReLU.Create() );
+    // PyTorch-formula maxpool (floor (in-k+2p)/s + 1); the default TNNetMaxPool
+    // uses a ceil formula that produces a LARGER grid (off-by-one vs PyTorch).
+    NN.AddLayer( TNNetMaxPoolPortable.Create(3, 2, 1) );
+    RefCount := 0;
+    InWidth := Config.BackboneEmbedSize;
+    for Stage := 0 to NumStages - 1 do
+    begin
+      BaseWidth := Config.BackboneHiddenSizes[Stage] div 4;
+      OutWidth := Config.BackboneHiddenSizes[Stage];
+      for BlockIdx := 0 to Config.BackboneDepths[Stage] - 1 do
+      begin
+        if BlockIdx = 0 then
+        begin
+          if Stage = 0 then Stride := 1 else Stride := 2;
+          // HF ResNet shortcut iff width changes OR spatial size changes.
+          AddDetrBottleneck(BaseWidth, Stride,
+            {HasShort=}(Stride <> 1) or (InWidth <> OutWidth),
+            BlockRefs[RefCount]);
+        end
+        else
+          AddDetrBottleneck(BaseWidth, 1, false, BlockRefs[RefCount]);
+        Inc(RefCount);
+        InWidth := OutWidth;
+      end;
+    end;
+    // input_projection: 1x1 conv (biased) backbone-channels -> d_model, then
+    // flatten the (GridDim,GridDim,d_model) grid to (NumTokens,1,d_model)
+    // sequence tokens (row-major y*W+x, matching HF flatten(2)).
+    InputProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0) );
+    NN.AddLayer( TNNetReshape.Create(NumTokens, 1, Config.DModel) );
+
+    // ---- encoder ----
+    for L := 0 to Config.EncoderLayers - 1 do
+    begin
+      BranchIn := NN.GetLastLayer();
+      Plain := BranchIn;
+      // spatial pos added to q/k inputs (NOT v). One pos table per layer (all
+      // filled with the same 2-D sine constant below).
+      SpatialPos := NN.AddLayerAfter(
+        TNNetLearnedPositionalEmbedding.Create(NumTokens), Plain);
+      AttnOut := AddDetrAttention(NN, Config, {QSource=}SpatialPos,
+        {KSource=}SpatialPos, {VSource=}Plain, Config.EncoderHeads,
+        Config.DModel, Refs);
+      EncSelf[L] := Refs;
+      // residual after attn, then post-LN (DETR is POST-norm).
+      NN.AddLayer( TNNetSum.Create([AttnOut, BranchIn]) );
+      EncSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+      // FFN: fc1 -> relu -> fc2, residual, post-LN.
+      BranchIn := NN.GetLastLayer();
+      EncFC1[L] := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.EncoderFFNDim, 0) );
+      NN.AddLayer( TNNetReLU.Create() );
+      EncFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0) );
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchIn]) );
+      EncFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+      // The spatial pos table is per-layer; remember the LAST one is the
+      // encoder memory's pos (reused by the decoder cross-attn keys).
+    end;
+    EncStates := NN.GetLastLayer();  // encoder memory (NumTokens,1,d_model)
+
+    // ---- decoder ----
+    // Object queries start as ZEROS; their learned position embedding is added
+    // to q/k of self-attn and to q of cross-attn. We realize the zero start by
+    // a constant-zero stream: take the encoder states, multiply by 0, slice to
+    // NumQueries tokens? Simpler: a dedicated zero input is unavailable here, so
+    // build the query stream as a LearnedPositionalEmbedding over a zeroed base.
+    // Implementation: AddLayerAfter a TNNetReshape that crops EncStates is not
+    // valid (lengths differ). Instead start from a zero constant produced by
+    // mul-zero of the first NumQueries encoder tokens is also length-bound.
+    // We therefore add a TNNetInput-free zero source: a learned-pos layer needs
+    // a base; use a TNNetMulByConstant(0) over a NumQueries-length base built
+    // from the query-pos table itself is circular. So: introduce the query
+    // stream via a dedicated all-zero TNNetInput-like layer.
+    QueryInput := NN.AddLayerAfter(
+      TNNetInput.Create(Config.NumQueries, 1, Config.DModel, 1), 0);
+    // Zero it so the queries start at zero (filled at Compute time below).
+    QueryInput.Output.Fill(0);
+    for L := 0 to Config.DecoderLayers - 1 do
+    begin
+      BranchIn := NN.GetLastLayer();
+      if L = 0 then Plain := QueryInput else Plain := BranchIn;
+      // self-attn: query-pos added to q AND k; v plain.
+      QPos := NN.AddLayerAfter(
+        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries), Plain);
+      DecQueryPosSelf[L] := QPos;
+      AttnOut := AddDetrAttention(NN, Config, {QSource=}QPos, {KSource=}QPos,
+        {VSource=}Plain, Config.DecoderHeads, Config.DModel, Refs);
+      DecSelf[L] := Refs;
+      NN.AddLayer( TNNetSum.Create([AttnOut, Plain]) );
+      DecSelfNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+      // cross-attn: query-pos added to q (over the decoder stream); spatial-pos
+      // added to k (over encoder states); v = plain encoder states.
+      BranchIn := NN.GetLastLayer();
+      QPos := NN.AddLayerAfter(
+        TNNetLearnedPositionalEmbedding.Create(Config.NumQueries), BranchIn);
+      DecQueryPosCross[L] := QPos;
+      SpatialPos := NN.AddLayerAfter(
+        TNNetLearnedPositionalEmbedding.Create(NumTokens), EncStates);
+      DecSpatialPos[L] := SpatialPos;
+      AttnOut := AddDetrAttention(NN, Config, {QSource=}QPos,
+        {KSource=}SpatialPos, {VSource=}EncStates, Config.DecoderHeads,
+        Config.DModel, Refs);
+      DecCross[L] := Refs;
+      NN.AddLayer( TNNetSum.Create([AttnOut, BranchIn]) );
+      DecCrossNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+      // FFN
+      BranchIn := NN.GetLastLayer();
+      DecFC1[L] := NN.AddLayer(
+        TNNetPointwiseConvLinear.Create(Config.DecoderFFNDim, 0) );
+      NN.AddLayer( TNNetReLU.Create() );
+      DecFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0) );
+      NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchIn]) );
+      DecFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+    end;
+    // final decoder LayerNorm (model.decoder.layernorm)
+    DecFinalNorm := NN.AddLayer( TNNetTokenLayerNorm.Create() );
+    Normed := NN.GetLastLayer();
+
+    // ---- heads ----
+    // class head: Linear d_model -> num_labels+1 (over each query token).
+    ClassHead := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.NumLabels + 1, 0), Normed);
+    // box head: 3-layer MLP (relu, relu, sigmoid) d_model->d_model->d_model->4.
+    BBox0 := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.DModel, 0), Normed);
+    NN.AddLayer( TNNetReLU.Create() );
+    BBox1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0) );
+    NN.AddLayer( TNNetReLU.Create() );
+    BBox2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(4, 0) );
+    NN.AddLayer( TNNetSigmoid.Create() );
+    // concat [class logits (num_labels+1) | box (4)] on the depth axis.
+    NN.AddLayer( TNNetDeepConcat.Create([ClassHead, NN.GetLastLayer()]) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ===================== WEIGHTS =====================
+    // backbone stem
+    LoadDetrResNetConvFoldBN(Reader, StemConv,
+      'model.backbone.model.embedder.embedder',
+      Config.BackboneEmbedSize, Config.NumChannels, 7);
+    RefCount := 0;
+    InWidth := Config.BackboneEmbedSize;
+    for Stage := 0 to NumStages - 1 do
+    begin
+      BaseWidth := Config.BackboneHiddenSizes[Stage] div 4;
+      OutWidth := Config.BackboneHiddenSizes[Stage];
+      StagePrefix := 'model.backbone.model.encoder.stages.' +
+        IntToStr(Stage) + '.layers.';
+      for BlockIdx := 0 to Config.BackboneDepths[Stage] - 1 do
+      begin
+        BP := StagePrefix + IntToStr(BlockIdx) + '.';
+        if BlockIdx = 0 then
+        begin
+          if Stage = 0 then Stride := 1 else Stride := 2;
+        end
+        else Stride := 1;
+        LoadDetrResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv1,
+          BP + 'layer.0', BaseWidth, InWidth, 1);
+        LoadDetrResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv2,
+          BP + 'layer.1', BaseWidth, BaseWidth, 3);
+        LoadDetrResNetConvFoldBN(Reader, BlockRefs[RefCount].Conv3,
+          BP + 'layer.2', OutWidth, BaseWidth, 1);
+        if BlockRefs[RefCount].Down <> nil then
+          LoadDetrResNetConvFoldBN(Reader, BlockRefs[RefCount].Down,
+            BP + 'shortcut', OutWidth, InWidth, 1);
+        Inc(RefCount);
+        InWidth := OutWidth;
+      end;
+    end;
+    // input_projection (1x1 conv, biased) backbone-out -> d_model.
+    LoadDetr1x1Conv(Reader, InputProj, 'model.input_projection.weight',
+      'model.input_projection.bias',
+      Config.DModel, Config.BackboneHiddenSizes[NumStages - 1]);
+
+    // encoder layers
+    for L := 0 to Config.EncoderLayers - 1 do
+    begin
+      LP := 'model.encoder.layers.' + IntToStr(L) + '.';
+      LoadDetrAttnWeights(Reader, EncSelf[L], LP + 'self_attn.', Config.DModel);
+      LoadLayerNormDetr(Reader, EncSelfNorm[L],
+        LP + 'self_attn_layer_norm', Config.DModel);
+      LoadLlamaLinearWeights(Reader, EncFC1[L], LP + 'mlp.fc1.weight',
+        Config.DModel, Config.EncoderFFNDim, 0, -1, 0, LP + 'mlp.fc1.bias');
+      LoadLlamaLinearWeights(Reader, EncFC2[L], LP + 'mlp.fc2.weight',
+        Config.EncoderFFNDim, Config.DModel, 0, -1, 0, LP + 'mlp.fc2.bias');
+      LoadLayerNormDetr(Reader, EncFFNNorm[L],
+        LP + 'final_layer_norm', Config.DModel);
+    end;
+
+    // object-query position table (loaded into every decoder pos layer).
+    for L := 0 to Config.DecoderLayers - 1 do
+    begin
+      LoadDetrLearnedPosEmbed(Reader, DecQueryPosSelf[L],
+        'model.query_position_embeddings.weight', Config.NumQueries,
+        Config.DModel);
+      LoadDetrLearnedPosEmbed(Reader, DecQueryPosCross[L],
+        'model.query_position_embeddings.weight', Config.NumQueries,
+        Config.DModel);
+    end;
+
+    // decoder layers
+    for L := 0 to Config.DecoderLayers - 1 do
+    begin
+      LP := 'model.decoder.layers.' + IntToStr(L) + '.';
+      LoadDetrAttnWeights(Reader, DecSelf[L], LP + 'self_attn.', Config.DModel);
+      LoadLayerNormDetr(Reader, DecSelfNorm[L],
+        LP + 'self_attn_layer_norm', Config.DModel);
+      LoadDetrAttnWeights(Reader, DecCross[L], LP + 'encoder_attn.',
+        Config.DModel);
+      LoadLayerNormDetr(Reader, DecCrossNorm[L],
+        LP + 'encoder_attn_layer_norm', Config.DModel);
+      LoadLlamaLinearWeights(Reader, DecFC1[L], LP + 'mlp.fc1.weight',
+        Config.DModel, Config.DecoderFFNDim, 0, -1, 0, LP + 'mlp.fc1.bias');
+      LoadLlamaLinearWeights(Reader, DecFC2[L], LP + 'mlp.fc2.weight',
+        Config.DecoderFFNDim, Config.DModel, 0, -1, 0, LP + 'mlp.fc2.bias');
+      LoadLayerNormDetr(Reader, DecFFNNorm[L],
+        LP + 'final_layer_norm', Config.DModel);
+    end;
+    LoadLayerNormDetr(Reader, DecFinalNorm, 'model.decoder.layernorm',
+      Config.DModel);
+
+    // spatial pos tables (encoder layers + decoder cross-attn): the SAME 2-D
+    // sine constant, computed in Pascal.
+    for L := 0 to Config.EncoderLayers - 1 do
+    begin
+      // each encoder layer's spatial-pos layer is the one feeding its q/k.
+      // We stored EncSelf refs only; re-derive the pos layer via its q_proj's
+      // previous layer is fragile, so fill them by walking the net below.
+    end;
+    // Fill every TNNetLearnedPositionalEmbedding that holds the SPATIAL table
+    // (those sized NumTokens). The query-pos layers (sized NumQueries) were
+    // already loaded above; do not overwrite them.
+    for L := 0 to NN.Layers.Count - 1 do
+      if (NN.Layers[L] is TNNetLearnedPositionalEmbedding) and
+         (NN.Layers[L].Output.SizeX = NumTokens) then
+        FillDetrSpatialPosEmbed(NN.Layers[L], GridDim, GridDim, Config.DModel);
+
+    // class head + box MLP
+    LoadLlamaLinearWeights(Reader, ClassHead,
+      'class_labels_classifier.weight', Config.DModel, Config.NumLabels + 1,
+      0, -1, 0, 'class_labels_classifier.bias');
+    LoadLlamaLinearWeights(Reader, BBox0, 'bbox_predictor.layers.0.weight',
+      Config.DModel, Config.DModel, 0, -1, 0, 'bbox_predictor.layers.0.bias');
+    LoadLlamaLinearWeights(Reader, BBox1, 'bbox_predictor.layers.1.weight',
+      Config.DModel, Config.DModel, 0, -1, 0, 'bbox_predictor.layers.1.bias');
+    LoadLlamaLinearWeights(Reader, BBox2, 'bbox_predictor.layers.2.weight',
+      Config.DModel, 4, 0, -1, 0, 'bbox_predictor.layers.2.bias');
+
+    // re-zero the query input (load steps may have touched buffers) so the
+    // first Compute starts the queries at zero.
+    QueryInput.Output.Fill(0);
+    Result := NN;
+    // silence unused locals
+    if (Mid = 0) and (ShortcutKey = '') and (ConfigRN.Depth = 0) then ;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildDetrFromSafeTensors(Reader: TNNetSafeTensorsReader;
+  const Config: TDetrConfig; pInferenceOnly: boolean): TNNet;
+begin
+  Result := BuildDetr(Reader, Config, pInferenceOnly);
+end;
+
+function BuildDetrFromSafeTensorsEx(const FileName: string;
+  const Config: TDetrConfig; pInferenceOnly: boolean): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDetr(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildDetrFromSafeTensors(const FileName: string;
+  out Config: TDetrConfig; pInferenceOnly: boolean;
+  const ConfigFileName: string): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDetrConfigFromJSONFile(ConfigPath);
+  Result := BuildDetrFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
+  Threshold: TNeuralFloat): TDetrDetectionArray;
+var
+  q, c, BestCls, Cnt: integer;
+  Logit, MaxLogit, SumExp, Prob, BestProb: TNeuralFloat;
+  BoxBase: integer;
+begin
+  SetLength(Result, Output.SizeX);
+  Cnt := 0;
+  BoxBase := NumLabels + 1;  // first box channel
+  for q := 0 to Output.SizeX - 1 do
+  begin
+    // softmax over the NumLabels+1 class logits.
+    MaxLogit := Output[q, 0, 0];
+    for c := 1 to NumLabels do
+      if Output[q, 0, c] > MaxLogit then MaxLogit := Output[q, 0, c];
+    SumExp := 0;
+    for c := 0 to NumLabels do
+      SumExp := SumExp + Exp(Output[q, 0, c] - MaxLogit);
+    // best FOREGROUND class (exclude the no-object slot = NumLabels).
+    BestCls := 0;
+    BestProb := -1;
+    for c := 0 to NumLabels - 1 do
+    begin
+      Logit := Output[q, 0, c];
+      Prob := Exp(Logit - MaxLogit) / SumExp;
+      if Prob > BestProb then begin BestProb := Prob; BestCls := c; end;
+    end;
+    if BestProb >= Threshold then
+    begin
+      Result[Cnt].ClassId := BestCls;
+      Result[Cnt].Score := BestProb;
+      Result[Cnt].Cx := Output[q, 0, BoxBase + 0];
+      Result[Cnt].Cy := Output[q, 0, BoxBase + 1];
+      Result[Cnt].W := Output[q, 0, BoxBase + 2];
+      Result[Cnt].H := Output[q, 0, BoxBase + 3];
+      Inc(Cnt);
+    end;
+  end;
+  SetLength(Result, Cnt);
 end;
 
 function BuildDPTFromSafeTensorsEx(const FileName: string;

@@ -286,6 +286,9 @@ type
     procedure TestViTPoseConfigFromJSONFile;
     procedure TestViTPosePoseEstimationParity;
     procedure TestViTPoseKeypointDecode;
+    procedure TestDetrConfigFromJSONFile;
+    procedure TestDetrObjectDetectionParity;
+    procedure TestDetrDetectionDecode;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
@@ -13280,6 +13283,203 @@ begin
           RefY, Keypoints[c].Y);
       end;
     end;
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadDetrConfigFromJSONFile on the committed DETR pico config (the
+// repo's FIRST object-detection importer). Reads the transformer dims and the
+// nested ResNet backbone_config.
+procedure TTestNeuralPretrained.TestDetrConfigFromJSONFile;
+var
+  Config: TDetrConfig;
+begin
+  Config := ReadDetrConfigFromJSONFile(FixturePath('tiny_detr_config.json'));
+  AssertEquals('model_type', 'detr', Config.ModelType);
+  AssertEquals('d_model', 16, Config.DModel);
+  AssertEquals('encoder_layers', 1, Config.EncoderLayers);
+  AssertEquals('decoder_layers', 1, Config.DecoderLayers);
+  AssertEquals('encoder_heads', 2, Config.EncoderHeads);
+  AssertEquals('decoder_heads', 2, Config.DecoderHeads);
+  AssertEquals('encoder_ffn', 32, Config.EncoderFFNDim);
+  AssertEquals('decoder_ffn', 32, Config.DecoderFFNDim);
+  AssertEquals('num_queries', 5, Config.NumQueries);
+  AssertEquals('num_labels', 4, Config.NumLabels);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('image_size', 32, Config.ImageSize);
+  AssertEquals('backbone embed', 8, Config.BackboneEmbedSize);
+  AssertEquals('backbone stages', 2, Length(Config.BackboneHiddenSizes));
+  AssertEquals('backbone stage0 width', 8, Config.BackboneHiddenSizes[0]);
+  AssertEquals('backbone stage1 width', 16, Config.BackboneHiddenSizes[1]);
+  AssertEquals('backbone depth0', 1, Config.BackboneDepths[0]);
+  AssertTrue('config ToString non-empty',
+    Length(DetrConfigToString(Config)) > 0);
+end;
+
+// HF DETR object-detection parity (the repo's FIRST object-detection importer:
+// the output modality is a FIXED SET of object queries, each with a class
+// distribution num_labels+1 and a cxcywh box). tiny_detr.* is a pico
+// DetrForObjectDetection (a tiny HF ResNet backbone + the DETR transformer
+// encoder-decoder + class/box heads) with re-randomized weights chosen so the
+// per-query outputs are visibly DISTINCT (not a collapse); the reference per-
+// query class logits AND box coords come from the REAL transformers float64
+// forward. Asserts max |diff| < 1e-4 over BOTH the (NumQueries, NumLabels+1)
+// class-logits tensor and the (NumQueries, 4) box tensor - exercising the
+// folded-FrozenBatchNorm ResNet backbone, the input-projection + flatten, the
+// 2-D sinusoidal spatial position embedding (normalize=True, added to q/k but
+// NOT v of every attention), the learned object queries, the post-LN encoder-
+// decoder with cross-attention, and the class/box (sigmoid cxcywh) heads.
+procedure TTestNeuralPretrained.TestDetrObjectDetectionParity;
+var
+  NN: TNNet;
+  Config: TDetrConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, InArr, LogArr, BoxArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img, Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxLogDiff, MaxBoxDiff: double;
+  CaseCnt, q, c, x, yy, ch, FlatIdx, NQ, NL, W, H, NumCh: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildDetrFromSafeTensors(FixturePath('tiny_detr.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_detr_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxLogDiff := 0;
+  MaxBoxDiff := 0;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('output queries', Config.NumQueries,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output depth = labels+1+4', Config.NumLabels + 1 + 4,
+      NN.GetLastLayer().Output.Depth);
+    RefJson.LoadFromFile(FixturePath('tiny_detr_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      InArr := TJSONArray(CaseObj.Find('input'));
+      LogArr := TJSONArray(CaseObj.Find('logits'));
+      BoxArr := TJSONArray(CaseObj.Find('boxes'));
+      NQ := CaseObj.Get('num_queries', 0);
+      NL := CaseObj.Get('num_logits', 0);
+      Img.ReSize(W, H, NumCh);
+      // input is flat (y, x, c).
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          for ch := 0 to NumCh - 1 do
+          begin
+            FlatIdx := (yy * W + x) * NumCh + ch;
+            Img.FData[(yy * W + x) * NumCh + ch] := InArr.Items[FlatIdx].AsFloat;
+          end;
+      NN.Compute(Img);
+      Output := NN.GetLastLayer().Output;
+      // logits: flat (query, logit); box: flat (query, 4); CAI out (query,0,c).
+      for q := 0 to NQ - 1 do
+      begin
+        for c := 0 to NL - 1 do
+        begin
+          RefVal := LogArr.Items[q * NL + c].AsFloat;
+          GotVal := Output[q, 0, c];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxLogDiff then MaxLogDiff := Diff;
+        end;
+        for c := 0 to 3 do
+        begin
+          RefVal := BoxArr.Items[q * 4 + c].AsFloat;
+          GotVal := Output[q, 0, NL + c];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxBoxDiff then MaxBoxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('DETR class logits: max |diff| = ' + FloatToStr(MaxLogDiff) +
+      ' must be < 1e-4', MaxLogDiff < 1e-4);
+    AssertTrue('DETR boxes: max |diff| = ' + FloatToStr(MaxBoxDiff) +
+      ' must be < 1e-4', MaxBoxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies DecodeDetrDetections (the standard DETR inference read-out: softmax
+// each query's class logits, drop the no-object slot, threshold) on case 0 of
+// the fixture. With Threshold 0 every query is kept; the decoded class/score/box
+// must match a manual softmax+argmax over the same network output.
+procedure TTestNeuralPretrained.TestDetrDetectionDecode;
+var
+  NN: TNNet;
+  Config: TDetrConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, InArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img, Output: TNNetVolume;
+  Dets: TDetrDetectionArray;
+  x, yy, ch, FlatIdx, W, H, NumCh, q, c, BestCls: integer;
+  MaxLogit, SumExp, BestProb, Prob: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := BuildDetrFromSafeTensors(FixturePath('tiny_detr.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_detr_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_detr_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    CaseObj := TJSONObject(CasesArr.Items[0]);
+    InArr := TJSONArray(CaseObj.Find('input'));
+    Img.ReSize(W, H, NumCh);
+    for yy := 0 to H - 1 do
+      for x := 0 to W - 1 do
+        for ch := 0 to NumCh - 1 do
+        begin
+          FlatIdx := (yy * W + x) * NumCh + ch;
+          Img.FData[(yy * W + x) * NumCh + ch] := InArr.Items[FlatIdx].AsFloat;
+        end;
+    NN.Compute(Img);
+    Output := NN.GetLastLayer().Output;
+    // Threshold 0 keeps all queries.
+    Dets := DecodeDetrDetections(Output, Config.NumLabels, 0.0);
+    AssertEquals('decoded count = num_queries', Config.NumQueries,
+      Length(Dets));
+    // Manually verify query 0's class/score/box.
+    q := 0;
+    MaxLogit := Output[q, 0, 0];
+    for c := 1 to Config.NumLabels do
+      if Output[q, 0, c] > MaxLogit then MaxLogit := Output[q, 0, c];
+    SumExp := 0;
+    for c := 0 to Config.NumLabels do
+      SumExp := SumExp + Exp(Output[q, 0, c] - MaxLogit);
+    BestCls := 0; BestProb := -1;
+    for c := 0 to Config.NumLabels - 1 do
+    begin
+      Prob := Exp(Output[q, 0, c] - MaxLogit) / SumExp;
+      if Prob > BestProb then begin BestProb := Prob; BestCls := c; end;
+    end;
+    AssertEquals('query0 class', BestCls, Dets[0].ClassId);
+    AssertTrue('query0 score matches softmax',
+      Abs(BestProb - Dets[0].Score) < 1e-5);
+    AssertTrue('query0 cx matches box channel',
+      Abs(Output[0, 0, Config.NumLabels + 1] - Dets[0].Cx) < 1e-6);
+    AssertTrue('query0 box in [0,1]',
+      (Dets[0].Cx >= 0) and (Dets[0].Cx <= 1) and
+      (Dets[0].Cy >= 0) and (Dets[0].Cy <= 1));
   finally
     RefRoot.Free;
     Img.Free;
