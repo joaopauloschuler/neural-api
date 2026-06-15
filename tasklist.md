@@ -1211,10 +1211,14 @@ rather than acted on.
       cond/uncond double pass per step). New code is the consistency
       parameterization (c_skip/c_out boundary scalings) + the multistep LCM loop
       (predict x0, re-noise to the next, fewer timesteps from the
-      already-landed TNNetDiffusionScheduler timestep table). Wire it as an opt-in
-      sampler into the LatentTextToImage pipeline so the landed PixArt/DiT + VAE can
-      render in a handful of steps. A short note on the matching LCM-distillation
-      objective (consistency loss to a teacher) is enough for v1 — sampler first.
+      already-landed TNNetDiffusionScheduler timestep table). The TNNetLCMScheduler
+      class + LCMStep/LCMSample multistep loop + boundary scalings LANDED (commit
+      8557e99, tests in TestNeuralDiffusion.pas pin the math + the fixed-point loop).
+  - [ ] FOLLOW-UP (sampler is landed; this is the remaining wiring): expose the LCM
+        scheduler as an opt-in sampler in the examples/LatentTextToImage pipeline so
+        the landed pico PixArt/DiT + VAE renders in ~4 steps (no cond/uncond double
+        pass); add it to the example's regression smoke. A short note on the matching
+        LCM-distillation objective (consistency loss to a teacher) is enough for v1.
 
 - [ ] RT-DETR real-time detection-transformer importer
       (BuildRtDetrFromSafeTensors[Ex], e.g. PekingU/rtdetr_r50vd). A DISTINCT
