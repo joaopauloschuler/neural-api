@@ -269,6 +269,11 @@ type
     // HF float64 oracle (a SECOND speech-to-text architecture, distinct from
     // Whisper: no mel frontend, RoPE positions).
     procedure TestMoonshineEncoderParity;
+    // Moonshine DECODER parity: encodes a pinned waveform, then runs the
+    // causal RoPE + cross-attn + SwiGLU decoder on a fixed prefix and checks
+    // the next-token logit row against the HF float64
+    // MoonshineForConditionalGeneration oracle (< 1e-4).
+    procedure TestMoonshineDecoderLogitParity;
     // EnCodec: round-trips three pinned waveforms through the imported codec
     // (waveform -> RVQ codes -> waveform) and asserts the codes match the HF
     // oracle EXACTLY and the reconstructed waveform matches < 1e-4.
@@ -11971,6 +11976,95 @@ begin
     RefRoot.Free;
     Output.Free;
     Input.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMoonshineDecoderLogitParity;
+var
+  Enc, Dec: TNNet;
+  Config: TMoonshineConfig;
+  RefRoot: TJSONData;
+  WaveArr, PrefixArr, LogitsArr: TJSONArray;
+  EncIn, EncOut, DecIn, Logits: TNNetVolume;
+  EncStates: TNNetLayer;
+  RefJson: TStringList;
+  i, NumSamples, PrefixLen, DecSeqLen, Row: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  EncIn := TNNetVolume.Create;
+  EncOut := TNNetVolume.Create;
+  DecIn := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  Enc := nil;
+  Dec := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_moonshine_decoder.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    WaveArr := TJSONArray(TJSONObject(RefRoot).Find('waveform'));
+    PrefixArr := TJSONArray(TJSONObject(RefRoot).Find('dec_prefix'));
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('dec_logits'));
+    AssertTrue('waveform present', WaveArr <> nil);
+    AssertTrue('dec_prefix present', PrefixArr <> nil);
+    AssertTrue('dec_logits present', LogitsArr <> nil);
+    NumSamples := WaveArr.Count;
+    PrefixLen := PrefixArr.Count;
+    // Build the decoder with capacity >= the prefix length.
+    DecSeqLen := PrefixLen + 2;
+
+    BuildMoonshineEncoderDecoderFromSafeTensors(
+      FixturePath('tiny_moonshine.safetensors'), Enc, Dec, Config,
+      NumSamples, DecSeqLen, {pInferenceOnly=}false,
+      FixturePath('tiny_moonshine_config.json'));
+    AssertTrue('encoder built', Enc <> nil);
+    AssertTrue('decoder built', Dec <> nil);
+    AssertEquals('vocab matches the logit oracle', LogitsArr.Count,
+      Config.VocabSize);
+
+    // 1) Encode the waveform.
+    EncIn.ReSize(NumSamples, 1, 1);
+    for i := 0 to NumSamples - 1 do EncIn.FData[i] := WaveArr.Items[i].AsFloat;
+    Enc.Compute(EncIn);
+    Enc.GetOutput(EncOut);
+
+    // 2) Copy the encoder states into the decoder's second TNNetInput.
+    EncStates := T5EncoderStatesInput(Dec);
+    AssertEquals('encoder states size matches decoder input',
+      EncStates.Output.Size, EncOut.Size);
+    EncStates.Output.Copy(EncOut);
+
+    // 3) Decoder tokens: the prefix, positions past it padded with the start
+    //    token (causal self-attention hides them from row PrefixLen-1).
+    DecIn.ReSize(DecSeqLen, 1, 1);
+    for i := 0 to DecSeqLen - 1 do
+      if i < PrefixLen then DecIn.FData[i] := PrefixArr.Items[i].AsFloat
+      else DecIn.FData[i] := PrefixArr.Items[0].AsFloat;
+    Dec.Compute(DecIn);
+    Dec.GetOutput(Logits);
+
+    // 4) Compare the next-token logit row (after the full prefix).
+    Row := PrefixLen - 1;
+    MaxDiff := 0;
+    for i := 0 to Config.VocabSize - 1 do
+    begin
+      Diff := Abs(Logits.FData[Row * Config.VocabSize + i] -
+        LogitsArr.Items[i].AsFloat);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('Moonshine decoder logit parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Dec.Free;
+    Enc.Free;
+    RefRoot.Free;
+    Logits.Free;
+    DecIn.Free;
+    EncOut.Free;
+    EncIn.Free;
     RefJson.Free;
   end;
 end;

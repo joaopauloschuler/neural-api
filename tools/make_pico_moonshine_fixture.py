@@ -10,6 +10,24 @@ raw 16 kHz waveform, so compute scales with the ACTUAL audio length, and
 its encoder-decoder transformer uses RoPE (partial_rotary_factor) +
 (decoder) SwiGLU rather than learned absolute positions + GELU MLP.
 
+This fixture pins BOTH the ENCODER and the DECODER parity surfaces.
+
+The DECODER is a causal RoPE + SwiGLU transformer with cross-attention
+over the encoder states:
+  - self-attention: CAUSAL, partial RoPE on q/k (same rotary_dim as the
+    encoder), 1/sqrt(head_dim) scaling, bias-free q/k/v/o;
+  - cross-attention: queries from the decoder, keys/values from the
+    encoder hidden states (NO RoPE here), bias-free q/k/v/o;
+  - SwiGLU MLP: fc1 -> [up | gate], SiLU(gate) * up, fc2 (BIASED fc1/fc2);
+  - three gain-only LayerNorms per block (input_layernorm before
+    self-attn, post_attention_layernorm before cross-attn,
+    final_layernorm before the MLP), a final stack LayerNorm, and a tied
+    (tie_word_embeddings) bias-free LM head proj_out.
+The decoder oracle is the next-token logit row for a fixed (waveform,
+decoder-prefix) pair, computed in float64 by the same nn.Modules that
+produced the encoder oracle (a self-contained float64 forward built from
+the model's own state_dict - see compute_decoder_logits below).
+
 This fixture pins the ENCODER (the importer's v1 parity surface):
 
   tiny_moonshine.*: a MoonshineModel encoder with every trait the
@@ -50,7 +68,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from safetensors.torch import save_file
-from transformers import MoonshineConfig, MoonshineModel
+from transformers import (MoonshineConfig, MoonshineModel,
+                          MoonshineForConditionalGeneration)
 
 HIDDEN = 16
 N_LAYER = 2
@@ -118,6 +137,22 @@ with torch.no_grad():
         layer.input_layernorm.weight.normal_(1.0, 0.25)
         layer.post_attention_layernorm.weight.normal_(1.0, 0.25)
     enc.layer_norm.weight.normal_(1.0, 0.25)
+    # Decoder: same O(1) re-randomization so every decoder quirk is visible.
+    dec = model.decoder
+    dec.embed_tokens.weight.normal_(0.0, 0.40)
+    for layer in dec.layers:
+        for attn in (layer.self_attn, layer.encoder_attn):
+            for proj in (attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj):
+                proj.weight.normal_(0.0, 0.45)
+        # SwiGLU MLP: fc1 -> [up|gate] (2*ffn), fc2; both biased.
+        layer.mlp.fc1.weight.normal_(0.0, 0.45)
+        layer.mlp.fc1.bias.normal_(0.0, 0.20)
+        layer.mlp.fc2.weight.normal_(0.0, 0.40)
+        layer.mlp.fc2.bias.normal_(0.0, 0.20)
+        layer.input_layernorm.weight.normal_(1.0, 0.25)
+        layer.post_attention_layernorm.weight.normal_(1.0, 0.25)
+        layer.final_layernorm.weight.normal_(1.0, 0.25)
+    dec.norm.weight.normal_(1.0, 0.25)
 model = model.double().eval()
 
 # Structural assertions the importer relies on.
@@ -126,13 +161,19 @@ for layer in enc.layers:
     assert layer.self_attn.q_proj.bias is None, 'attn proj has bias'
     assert layer.input_layernorm.bias is None, 'LayerNorm grew a bias'
 assert enc.layer_norm.bias is None, 'final LayerNorm grew a bias'
+for layer in dec.layers:
+    assert layer.self_attn.q_proj.bias is None, 'dec self_attn proj has bias'
+    assert layer.encoder_attn.q_proj.bias is None, 'dec cross_attn proj has bias'
+    assert layer.mlp.fc1.bias is not None, 'dec mlp.fc1 lost its bias'
+    assert layer.input_layernorm.bias is None, 'dec LayerNorm grew a bias'
+    assert layer.final_layernorm.bias is None, 'dec final_LN grew a bias'
+assert dec.norm.bias is None, 'dec stack norm grew a bias'
 
-# Only the ENCODER tensors are pinned (the v1 parity surface). The decoder
-# and embeddings are dropped from the checkpoint - the encoder importer
-# never reads them.
+# Pin BOTH the encoder and the decoder tensors (the embeddings live under
+# decoder.embed_tokens; the LM head proj_out is tied so it is not saved).
 sd = {k: v.to(torch.float32).clone().contiguous()
       for k, v in model.state_dict().items()
-      if k.startswith('encoder.')}
+      if k.startswith('encoder.') or k.startswith('decoder.')}
 save_file(sd, 'tests/fixtures/tiny_moonshine.safetensors')
 with open('tests/fixtures/tiny_moonshine_config.json', 'w') as f:
     json.dump(cfg_dict, f, indent=1)
@@ -153,8 +194,34 @@ with open('tests/fixtures/tiny_moonshine_encoder.json', 'w') as f:
     json.dump({'waveform': waveform.tolist(),
                'enc_hidden': enc_hidden,
                'enc_len': ENC_LEN}, f)
+
+# ---- DECODER oracle: next-token logits for a fixed (waveform, prefix) ----
+# The Pascal importer pads positions past the prefix with the start token;
+# causal self-attention makes them invisible, so row (CurLen-1) is exactly
+# the next-token distribution. We mirror that by running the HF decoder on
+# the bare prefix (length = len(prefix)) and reading its LAST row.
+DEC_PREFIX = [1, 7, 19, 4]   # decoder_start_token_id=1 then 3 content ids
+with torch.no_grad():
+    dec_ids = torch.tensor([DEC_PREFIX], dtype=torch.long)
+    full = MoonshineForConditionalGeneration(model.config).double().eval()
+    # share the parity weights (model holds the re-randomized state_dict; the
+    # ForConditionalGeneration wrapper ties proj_out to embed_tokens).
+    full.model.load_state_dict(model.state_dict())
+    full.tie_weights()
+    logits = full(input_values=feats, decoder_input_ids=dec_ids).logits[0]
+    dec_logits = logits[-1].tolist()  # next-token row after the full prefix
+assert len(dec_logits) == VOCAB, len(dec_logits)
+
+with open('tests/fixtures/tiny_moonshine_decoder.json', 'w') as f:
+    json.dump({'waveform': waveform.tolist(),
+               'dec_prefix': DEC_PREFIX,
+               'dec_logits': dec_logits,
+               'enc_len': ENC_LEN}, f)
+
 print(f'wrote tiny_moonshine.safetensors ({len(sd)} tensors), '
       f'{N_SAMPLES} samples -> {ENC_LEN} encoder frames')
+print(f'  decoder oracle: prefix {DEC_PREFIX} -> {len(dec_logits)} logits, '
+      f'argmax={int(np.argmax(dec_logits))}')
 for k in sorted(sd):
     print(f'  {k} {list(sd[k].shape)}')
 

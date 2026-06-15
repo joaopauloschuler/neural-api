@@ -863,20 +863,27 @@ rather than acted on.
         default TargetAccuracy and early-stops.
   - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
         directly instead of requiring an ffmpeg pre-pass.
-- [ ] Moonshine DECODER + end-to-end transcription (successor to the landed
-      encoder above). The encoder importer (BuildMoonshineFromSafeTensors) and its
-      hidden-state parity are DONE; this adds the RoPE + SwiGLU decoder so a waveform
-      goes all the way to text. Scope: (a) build the decoder stack (self-attn causal
-      RoPE + cross-attn over the encoder states via the landed T5EncoderStatesInput
-      two-net convention + SwiGLU MLP) onto the existing config; (b) wire greedy/beam
-      via the landed DecodeSeq2SeqGreedy/BeamSearch; (c) extend make_pico_moonshine_fixture.py
-      to ALSO dump decoder next-token logits for a fixed (waveform, prefix-token) pair
-      and add TestMoonshineDecoderLogitParity < 1e-4 vs the HF MoonshineForConditionalGeneration
-      float64 oracle; (d) the MoonshineTokenizer (it ships a tokenizer.json — likely
-      already loadable via TNeuralHFTokenizer) so examples/MoonshineTranscribe emits
-      real text instead of the encoder smoke. Reuse Whisper's seq2seq decode loop as
-      the template. Also close the GQA encoder_num_key_value_heads != heads path with
-      a pico fixture that actually sets kv_heads < heads.
+- [X] Moonshine DECODER + end-to-end transcription (successor to the landed
+      encoder above). DONE: (a) BuildMoonshineEncoderDecoderFromSafeTensors[WithConfig]
+      builds the RoPE+SwiGLU decoder (causal partial-RoPE self-attn + cross-attn over
+      the encoder states via the T5EncoderStatesInput two-net convention + SwiGLU MLP
+      with [up|gate]-packed fc1, three gain-only LayerNorms/block, final LN + tied
+      bias-free LM head) — all composed from existing layers, no new layer class;
+      (b) seq2seq decode wired via the T5EncoderStatesInput convention (the audio
+      encoder takes a raw waveform not token ids, so the example uses an equivalent
+      manual greedy loop; DecodeSeq2SeqGreedy/BeamSearch apply to token-id seq2seq);
+      (c) make_pico_moonshine_fixture.py now also dumps decoder next-token logits
+      (tiny_moonshine_decoder.json) and TestMoonshineDecoderLogitParity passes < 1e-4
+      vs the HF MoonshineForConditionalGeneration float64 oracle; (d) examples/
+      MoonshineTranscribe imports encoder+decoder and emits real text when a
+      tokenizer.json is present (TNeuralHFTokenizer), keeping the no-network smoke.
+      Remaining follow-ups:
+  - [ ] GQA decoder/encoder_num_key_value_heads != heads pico fixture (the pico
+        currently sets kv_heads == heads; the GQA slice path is wired but unexercised
+        by an oracle — add a fixture with kv_heads < heads and assert parity).
+  - [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
+        cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
+        machinery) so long transcripts don't re-run the whole prefix each step.
 - [ ] SAM two-way MASK DECODER (successor to the landed SAM image-encoder above).
       The ViT-B encoder + neck (BuildSAMVisionTower) and its embedding parity are DONE;
       this adds the lightweight promptable mask decoder so one point click -> one binary

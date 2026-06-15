@@ -33,10 +33,11 @@ Coded by Claude (AI).
 //     -> partial-RoPE BIDIRECTIONAL pre-norm transformer encoder
 //     -> encoder hidden states (frames,1,hidden)
 //
-// The decoder (RoPE + SwiGLU, cross-attending these states) reuses the
-// landed seq2seq decode machinery (DecodeSeq2SeqGreedy / BeamSearch via the
-// T5EncoderStatesInput two-net convention) and is a documented follow-up;
-// this smoke exercises the encoder import + the length-scaled-compute claim.
+// The decoder (RoPE + SwiGLU, cross-attending these states) is the autoregressive
+// transformer that turns the encoder hidden states into text. It is built by
+// BuildMoonshineEncoderDecoderFromSafeTensors and driven by the landed seq2seq
+// decode machinery (DecodeSeq2SeqGreedy via the T5EncoderStatesInput two-net
+// convention).
 //
 // Usage:
 //   MoonshineTranscribe [<checkpoint-dir>]
@@ -49,14 +50,18 @@ Coded by Claude (AI).
 //
 //   With a checkpoint-dir holding model.safetensors (or pytorch_model.bin)
 //   + config.json (e.g. a download of huggingface.co/UsefulSensors/
-//   moonshine-tiny) it imports that real encoder instead.
+//   moonshine-tiny) it imports that real encoder AND decoder, then - if a
+//   tokenizer.json is present - greedily decodes a real transcription of a
+//   synthetic clip (swap in a TNNetVolume of your own 16 kHz samples for a
+//   real utterance).
 
 {$mode objfpc}{$H+}
 
 uses
   {$IFDEF UNIX}cthreads, cmem,{$ENDIF}
   Classes, SysUtils, Math,
-  neuralvolume, neuralnetwork, neuralpretrained;
+  neuralvolume, neuralnetwork, neuralpretrained, neuraldecode,
+  neuralhftokenizer;
 
 // Builds the encoder for NumSamples samples, times one forward over a
 // deterministic synthetic waveform, and reports frames + latency.
@@ -95,10 +100,77 @@ begin
   end;
 end;
 
+// Imports the full encoder+decoder and, when tokenizer.json is present,
+// greedily transcribes a synthetic clip to real text. SourceTokens for a
+// seq2seq audio model is the ENCODER input grid (one slot per sample); we
+// feed it a synthetic waveform here - replace Wave with your own samples.
+procedure TranscribeReal(const WeightsPath, ConfigPath, TokPath: string;
+  NumSamples: integer);
 var
-  CheckpointDir, WeightsPath, ConfigPath, FixDir: string;
+  Enc, Dec: TNNet;
+  Config: TMoonshineConfig;
+  Tok: TNeuralHFTokenizer;
+  Wave, DecIn, Logits: TNNetVolume;
+  EncStates: TNNetLayer;
+  Gen: array of integer;
+  i, DecSeqLen, CurLen, StartId, EOSId, Next: integer;
+begin
+  // A small decode budget keeps the smoke fast; raise for longer clips.
+  DecSeqLen := 64;
+  StartId := 1;  // decoder_start_token_id (Moonshine default)
+  EOSId := 2;    // eos_token_id (Moonshine default)
+  BuildMoonshineEncoderDecoderFromSafeTensors(WeightsPath, Enc, Dec, Config,
+    NumSamples, DecSeqLen, {pInferenceOnly=}true, ConfigPath);
+  Tok := TNeuralHFTokenizer.Create();
+  Wave := TNNetVolume.Create;
+  DecIn := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  SetLength(Gen, 0);
+  try
+    Tok.LoadFromFile(TokPath);
+    Wave.ReSize(NumSamples, 1, 1);
+    for i := 0 to NumSamples - 1 do
+      Wave.FData[i] := 0.5 * Sin(2.0 * Pi * 220.0 * i / 16000.0);
+    // The audio encoder's input is the RAW WAVEFORM (not token ids), so we
+    // drive a manual greedy loop instead of DecodeSeq2SeqGreedy (which assumes
+    // a token-id encoder): encode once, cache the states in the decoder's 2nd
+    // input, then autoregress reading row CurLen-1 each step.
+    Enc.Compute(Wave);
+    EncStates := T5EncoderStatesInput(Dec);
+    EncStates.Output.Copy(Enc.GetLastLayer().Output);
+    DecIn.ReSize(DecSeqLen, 1, 1);
+    CurLen := 1;
+    DecIn.FData[0] := StartId;
+    while CurLen < DecSeqLen do
+    begin
+      for i := CurLen to DecSeqLen - 1 do DecIn.FData[i] := StartId;
+      Dec.Compute(DecIn);
+      Dec.GetOutput(Logits);
+      Next := Logits.GetClassOnPixel(CurLen - 1, 0);
+      if Next = EOSId then break;
+      SetLength(Gen, Length(Gen) + 1);
+      Gen[High(Gen)] := Next;
+      DecIn.FData[CurLen] := Next;
+      Inc(CurLen);
+    end;
+    Write('  transcription: "');
+    Write(Tok.Decode(Gen, {SkipSpecialTokens=}true));
+    WriteLn('"');
+  finally
+    Logits.Free;
+    DecIn.Free;
+    Wave.Free;
+    Tok.Free;
+    Dec.Free;
+    Enc.Free;
+  end;
+end;
+
+var
+  CheckpointDir, WeightsPath, ConfigPath, FixDir, TokPath: string;
   Config: TMoonshineConfig;
 begin
+  TokPath := '';
   if ParamCount >= 1 then
   begin
     CheckpointDir := IncludeTrailingPathDelimiter(ParamStr(1));
@@ -111,6 +183,8 @@ begin
       WriteLn('No model.safetensors / pytorch_model.bin in ', CheckpointDir);
       Halt(1);
     end;
+    if FileExists(CheckpointDir + 'tokenizer.json') then
+      TokPath := CheckpointDir + 'tokenizer.json';
   end
   else
   begin
@@ -141,6 +215,19 @@ begin
   EncodeAndReport(WeightsPath, ConfigPath, 1719);
   EncodeAndReport(WeightsPath, ConfigPath, 5000);
   WriteLn;
-  WriteLn('Done. (Greedy/beam transcription via the RoPE+SwiGLU decoder is a '
-    + 'follow-up - this smoke exercises the encoder import.)');
+  if TokPath <> '' then
+  begin
+    WriteLn('Full encoder+decoder greedy transcription (RoPE + cross-attn + ' +
+      'SwiGLU decoder, tokenizer.json):');
+    TranscribeReal(WeightsPath, ConfigPath, TokPath, 16000);
+    WriteLn;
+    WriteLn('Done. (Swap the synthetic clip for your own 16 kHz samples to ' +
+      'transcribe real audio.)');
+  end
+  else
+  begin
+    WriteLn('Done. (No tokenizer.json found - the decoder builds and runs ' +
+      'but real text needs a checkpoint with a tokenizer; the pico fixture ' +
+      'has none. See TestMoonshineDecoderLogitParity for decoder parity.)');
+  end;
 end.
