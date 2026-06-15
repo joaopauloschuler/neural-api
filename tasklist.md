@@ -808,29 +808,6 @@ rather than acted on.
       text prompt; plus KV-cache incremental decode and top-k/temperature
       sampling for the generation loop (follow-up to the landed
       examples/MusicGenText).
-- [X] SeamlessM4T (v2) speech-to-text TRANSLATION importer
-      (`BuildSeamlessM4TFromSafeTensors[Ex]`, `facebook/seamless-m4t-v2-large` /
-      `hf-audio/…`) — multilingual speech translation, a capability the repo has
-      no analogue for (the landed Whisper/Wav2Vec2/Moonshine all TRANSCRIBE in one
-      language; SeamlessM4T TRANSLATES across languages).
-      LANDED (S2TT v1): BuildSeamlessM4TFromSafeTensors[WithConfig|Ex] +
-      ReadSeamlessM4Tv2ConfigFromJSONFile + SeamlessM4Tv2AdaptedLength +
-      SeamlessM4Tv2ConfigToString in neuralpretrained.pas. The conformer SPEECH
-      encoder (feature_projection -> N macaron conformer layers [0.5*FFN1,
-      SDPA, causal-depthwise CONV module via TNNetDepthwiseConv1D + TNNetGLU,
-      0.5*FFN2, per-layer LN] -> encoder.layer_norm -> intermediate_ffn ->
-      strided length ADAPTER [residual/attn GLU pooling convs + no-pos SDPA +
-      relu FFN] -> inner_layer_norm) feeds the NLLB-style text DECODER
-      (M2M100 body: tied scaled embed, half-split sinusoidal with pad=0 -> +1
-      offset, pre-norm causal self-attn + cross-attn to the adapted encoder
-      states + relu FFN, final LN, tied lm_head) reusing BuildPegasusStackBlocks
-      + LoadMarianAttn; run with RunT5 / DecodeSeq2SeqGreedy (the shared two-net
-      convention) + the SentencePiece tokenizer. Pico parity vs an HF float64
-      SeamlessM4Tv2ForSpeechToText oracle (encoder hidden states + logits both
-      < 1e-4): TestSeamlessM4Tv2S2TTParity / TestSeamlessM4Tv2ConfigFromJSONFile,
-      fixtures tests/fixtures/tiny_seamless_m4t_v2.{safetensors,config.json,
-      logits.json} + generator tools/seamless_m4t_v2_tiny_fixture.py.
-      BuildFromPretrained rejects model_type "seamless_m4t_v2" -> redirect.
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
       (1) position_embeddings_type="relative_key" — the v2 conformer self-attn
       distance-embedding attention bias (einsum("bhld,lrd->bhlr") added to the
@@ -876,23 +853,7 @@ rather than acted on.
 - [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
       cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
       machinery) so long transcripts don't re-run the whole prefix each step.
-- [X] Whisper WORD-LEVEL timestamps via cross-attention DTW alignment (port of
-      openai-whisper / transformers `return_timestamps="word"`). Landed in
-      neuralpretrained.pas: WhisperCollectCrossAttention reads the decoder's
-      per-head TNNetCrossAttention.AttentionWeights (already softmaxed in the
-      forward — no new capture hook needed), averages the requested alignment
-      heads + per-token re-softmaxes into a (text-token x audio-frame) score
-      matrix; WhisperDTW runs the monotonic O(N*M) DP backtrace; and
-      WhisperWordTimestamps merges sub-word tokens into (word, start_s, end_s)
-      tuples at WhisperSecondsPerFrame = 0.02 s/frame. The head list is a config
-      arg: WhisperDefaultAlignmentHeads returns the openai-whisper baked-in
-      subset for the released tiny/base/small shapes, WhisperAllAlignmentHeads is
-      the fallback. Parity-gated against a HF/numpy float64 oracle on the pico
-      fixture (TestWhisperWordTimestamps + tools/whisper_tiny_fixture.py emitting
-      tests/fixtures/tiny_whisper_alignment.json): score matrix, DTW path
-      length + token/frame indices + monotonicity, and per-token frame spans.
-      FOLLOW-UPS (deferred, see below).
-- [ ] Whisper word-timestamp follow-ups (v1 landed above, scoped to one 30 s
+- [ ] Whisper word-timestamp follow-ups (v1 landed, scoped to one 30 s
       greedy window): (a) median-filter smoothing of the score matrix before DTW
       (openai-whisper's `median_filter`, default kernel 7) to suppress single-
       frame spikes; (b) multi-window stitching for clips > 30 s (carry the
@@ -1005,28 +966,15 @@ rather than acted on.
         per-pixel broadcast noise for real stochastic synthesis).
   - [ ] real stylegan2 checkpoint (NVIDIA .pkl / a rosinality safetensors) parity once
         obtainable; the training path (discriminator + path-length reg) and StyleGAN3.
-- [X] MMDiT (Stable Diffusion 3 / FLUX.1) text-to-image transformer importer — v1:
-      the DUAL-STREAM joint-attention BLOCK (the genuinely new piece) lands as a pure
-      composition builder AddMMDiTJointBlock + LoadMMDiTJointBlock + BuildMMDiTBlock
-      [FromSafeTensors] + ReadMMDiTConfigFromJSONFile in neuralpretrained.pas. Image
-      tokens and text tokens carry SEPARATE per-stream adaLN modulations (norm1 /
-      norm1_context), QKV projections (attn.to_q/k/v + attn.add_q/k/v_proj), out-proj
-      (attn.to_out.0 / attn.to_add_out) and MLPs (ff / ff_context); their per-head Q/K/V
-      are CONCATENATED on the SEQUENCE axis (TNNetConcat with explicit (JointLen,1,dk)
-      dims) for ONE joint self-attention pass (TNNetCrossAttention over the packed K|V,
-      img attends to txt and vice-versa SYMMETRICALLY), then SPLIT back per stream with
-      TNNetCrop on the X axis — NOT PixArt's one-directional image->text cross-attention.
-      adaLN reuses the DiT helpers (DiTModCond/TNNetFiLM gamma|beta, TNNetChannelMulByLayer
-      gate). qk_norm=None (stable-diffusion-3-medium); SD3.5 RMSNorm QK-norm rejected
-      loudly. Pico parity on BOTH stream outputs of one block vs a float64 numpy diffusers
-      JointTransformerBlock oracle (< 1e-4) — tools/make_pico_mmdit_fixture.py +
-      tests/fixtures/tiny_mmdit.* + TestMMDiTJointBlockParity/TestMMDiTConfigFromJSONFile.
-      Follow-ups [ ]: full BuildMMDiTFromSafeTensors stack (patch embed + combined CLIP+T5
-      prompt tower + pooled-projection conditioning + N joint blocks + final adaLN/unpatchify);
-      the CONTEXT-FREE final block (context_pre_only=True, text stream dropped); the
-      end-to-end rectified-flow Euler sampler driving it (reuse examples/FlowMatching) into
-      the LatentTextToImage capstone with NO SD UNet; real stabilityai/stable-diffusion-3-
-      medium (or Flux-schnell) checkpoint parity; SD3.5 RMSNorm QK-norm support.
+- [ ] MMDiT (Stable Diffusion 3 / FLUX.1) full text-to-image importer + sampler
+      (dual-stream joint-attention BLOCK v1 LANDED — AddMMDiTJointBlock +
+      BuildMMDiTBlockFromSafeTensors + ReadMMDiTConfigFromJSONFile): full
+      BuildMMDiTFromSafeTensors stack (patch embed + combined CLIP+T5 prompt tower +
+      pooled-projection conditioning + N joint blocks + final adaLN/unpatchify); the
+      CONTEXT-FREE final block (context_pre_only=True, text stream dropped); the
+      end-to-end rectified-flow Euler sampler (reuse examples/FlowMatching) into the
+      LatentTextToImage capstone with NO SD UNet; real stable-diffusion-3-medium
+      (or Flux-schnell) checkpoint parity; SD3.5 RMSNorm QK-norm support.
 - [ ] AnimateDiff text-to-VIDEO motion-module importer (BuildAnimateDiffFromSafeTensors,
       e.g. guoyww/animatediff-motion-adapter-v1-5-2) — the FIRST video-GENERATIVE
       importer (a sequence of frames from a text prompt), a brand-new generative
@@ -1068,24 +1016,9 @@ rather than acted on.
       committed pico fixture tiny_cogvideox.* + tools/make_pico_cogvideox_fixture.py (tiny
       hidden/depth/heads, 2-frame latent). Follow-up: an examples/TextToVideo writing a short
       animated GIF/PPM sequence on CPU; shares the writer with the AnimateDiff example.
-- [X] VAR (Visual AutoRegressive, next-SCALE prediction) image generation importer —
-      class-conditional v1 LANDED. `BuildVARFromSafeTensors[Ex]` +
-      `ReadVARConfigFromJSONFile` / `TVARConfig` in neuralpretrained.pas builds the
-      GPT-style transformer over the flattened multi-scale token sequence, reusing the
-      landed DiT adaLN-Zero block recipe (DiTModCond / TNNetFiLM modulation + per-channel
-      gate). The three genuinely-new pieces are all expressed by composition + ONE tiny
-      SDPA flag: (a) next-scale embedding x = word_embed[idx] + lvl_embed[scale] +
-      pos_embed (one learnable level vector per pyramid level), (b) AdaLN single-class-
-      token conditioning (class_emb, the DiT timestep-cond pattern), (c) the
-      scale-block-causal mask via the NEW
-      `TNNetScaledDotProductAttention.BlockCausalSegments` flag — it reinterprets the
-      existing per-token segment side channel as a MONOTONE scale id with ordered
-      seg[j] <= seg[i] (vs the default equality/document mask), threaded into every
-      per-head SDPA leaf as the per-token scale id (VARFillScaleIds). Pico parity test
-      TestVARParity asserts < 1e-4 on EVERY scale's logits vs a self-contained torch/
-      numpy float64 oracle (FoundationVision/var not installed); committed pico fixture
-      tiny_var.* + generator tools/make_pico_var_fixture.py (hidden 16, depth 2, heads 2,
-      vocab 12, 5 classes, pyramid [1,2,3] -> 14 flattened tokens). Open follow-ups:
+- [ ] VAR (Visual AutoRegressive, next-scale prediction) image-generation follow-ups
+      (class-conditional v1 LANDED — BuildVARFromSafeTensors[Ex] + ReadVARConfigFromJSONFile
+      + the TNNetScaledDotProductAttention.BlockCausalSegments scale-mask flag):
   - [ ] VAR full multi-scale autoregressive SAMPLING loop (next-scale interpolation/
         up-sampling between predicted levels + residual-VQ decode to pixels via the
         landed BuildVqModelFromSafeTensors family) + an examples/VARGenerate demo. v1
@@ -1137,30 +1070,8 @@ rather than acted on.
       HF float64 on the decoder logits for a fixed image+task token + an examples/
       Florence2 that captions and box-detects one tiny CPU image. First "spatial-output-
       as-text" importer; complements the box/mask importers (DETR/SAM/Mask2Former).
-- [X] Qwen2-VL / Qwen2.5-VL vision-language importer — M-RoPE v1 LANDED
-      (BuildQwen2VLFromSafeTensors[Ex] + TQwen2VLConfig + ReadQwen2VLConfigFromJSONFile
-      + Qwen2VLRunLogits). The genuinely NEW piece, distinct from every landed VLM
-      (LLaVA causal-everywhere, PaliGemma prefix-LM bidirectional), is **M-RoPE
-      (Multimodal Rotary Position Embedding)**: the new TNNetMRotaryEmbedding layer (a
-      TNNetRotaryEmbedding subclass that REUSES the parent theta cache; only the
-      per-token rotary INDEX changes) splits the head_dim/2 channel-pairs into three
-      contiguous mrope_section chunks (temporal/height/width). Vision tokens carry the
-      patch grid's (t,h,w); text tokens carry the same scalar in all three sections (1-D
-      RoPE fallback). The Qwen2 decoder is built by the shared Llama path with a new
-      Config.MRoPEEnabled flag (CreateRoPELayerForConfig swaps in M-RoPE on the per-head
-      Q/K rotary slices). The M-RoPE 3-D position builder
-      (BuildQwen2VLMRoPEPositionIds, the HF get_rope_index port for one still image,
-      T=1) + Qwen2VLSetMRoPEPositions thread the per-token index. The merged visual
-      tokens are spliced into the decoder's embedding sequence at the image_token_id
-      slots via the LLaVA splice (LlavaAssembleEmbeddings) — the embedding-injection
-      convention. Tests: TestQwen2VLMRoPEPositionIds (position ids match the HF oracle
-      EXACTLY) + TestQwen2VLLogitParity (next-token logits max|diff| ~7e-8 < 1e-4 vs the
-      REAL HF Qwen2VLForConditionalGeneration float64 oracle for a mixed image+text
-      prompt; a scalar-1D negative control breaks parity, proving the 3-D index is
-      load-bearing). Pico fixtures + tools/make_pico_qwen2vl_fixture.py committed. Also
-      fixed a latent bug: ReadLlamaConfigFromJSONFile left new optional record fields as
-      stack garbage (it never zeroed Result) — now the M-RoPE flags are zero-initialized.
-      Follow-ups:
+- [ ] Qwen2-VL / Qwen2.5-VL vision-language importer follow-ups (M-RoPE v1 LANDED —
+      BuildQwen2VLFromSafeTensors[Ex] + TNNetMRotaryEmbedding + Qwen2VLRunLogits):
   - [ ] The native-dynamic-resolution VISION TOWER (Conv3d patch embed + window
         attention over a variable patch grid + the 2x2 spatial patch-merger MLP) — v1
         takes the MERGED visual tokens as input (precomputed). Reuse the landed
