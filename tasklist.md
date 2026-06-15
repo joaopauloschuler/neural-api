@@ -707,14 +707,6 @@ rather than acted on.
       (do_stable_layer_norm), and the final encoder LayerNorm placement that
       pre-norm implies. Then wav2vec2 SELF-SUPERVISED pretraining (the quantizer /
       contrastive masked-prediction heads currently dropped as ignorable tensors).
-- [X] WAV writer in neuralaudio.pas (`SaveVolumeToWav16` / `WriteWav16File`) — the
-      symmetric counterpart to the landed `LoadWav16ToVolume`. The library can read
-      16 kHz mono PCM and compute the log-mel frontend, but has NO path to write a
-      waveform back to disk, which blocks listening to ANY synthesis output (neural
-      vocoder, TTS, EnCodec resynthesis, latent text-to-audio). v1: a 1-D float
-      TNNetVolume in [-1,1] -> canonical 16-bit PCM WAV (RIFF header + sample
-      clamping/dither), round-trip tested against `LoadWav16ToVolume` to <=1 LSB.
-      Prerequisite enabler for the speech/music tasks below.
 - [ ] HiFi-GAN neural vocoder importer follow-ups (`BuildHiFiGANFromSafeTensors[Ex]`
       LANDED + `ReadHiFiGANConfigFromJSONFile`/`HiFiGANConfigToString` +
       `THiFiGANConfig` + the `TNNetHiFiGAN` channel-major holder
@@ -733,7 +725,6 @@ rather than acted on.
   - [ ] real-checkpoint smoke: resynthesize a clip with a downloaded `hifigan` /
         SpeechT5HifiGan generator (weight_norm fold path) and write it via
         SaveVolumeToWav16 (offline + RAM-gated here, so deferred).
-  - [ ] consume from the VITS / MMS-TTS importer (decoder is shared with this).
 - [ ] VITS / MMS-TTS end-to-end text-to-speech importer (`BuildVitsFromSafeTensors[Ex]`
       LANDED + `ReadVitsConfigFromJSONFile`/`VitsConfigToString` + the `TVitsConfig`
       record + the `TNNetVits` channel-major holder (Analyze / ExpandPrior /
@@ -771,7 +762,7 @@ rather than acted on.
   - [ ] real-checkpoint smoke: synthesize a sentence with a downloaded
         `facebook/mms-tts-eng` / `kakao-enterprise/vits-ljs` and write it via
         `SaveVolumeToWav16` (offline + RAM-gated here, so deferred).
-- [X] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
+- [ ] CLAP audio-text contrastive importer (`BuildClapFromSafeTensors[Ex]` +
       `BuildClapFromSafeTensorsWithConfig`, `TClapConfig`/`ReadClapConfigFromJSONFile`)
       + examples/ZeroShotAudioTag — LANDED. Audio-domain analogue of the CLIP
       dual-encoder (two nets, shared L2-normalized space, `exp(logit_scale_a)*cosine`),
