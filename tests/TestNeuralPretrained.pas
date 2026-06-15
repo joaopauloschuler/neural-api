@@ -320,6 +320,12 @@ type
     // bit-identically, and that a guidance pass with a different uncond
     // condition shifts at least one emitted code (the blend is wired).
     procedure TestMusicGenCFG;
+    // KV-cache incremental decode + top-k/temperature sampling
+    // (TMusicGenModel.GenerateEx): asserts the cached greedy path is
+    // BIT-IDENTICAL to the full re-encode loop, that a weighted top-k=1 sampler
+    // equals greedy, and that the temperature/top-k path is reproducible at a
+    // fixed RandSeed.
+    procedure TestMusicGenGenerateEx;
     procedure TestClipConfigFromJSONFile;
     procedure TestClipParity;
     procedure TestClapParity;
@@ -13246,6 +13252,113 @@ begin
     Uncond.Free;
     Zero.Free;
     Model.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestMusicGenGenerateEx;
+
+  procedure EncodePrompt(const Ids: array of integer; EncStates: TNNetVolume;
+    out Config: TMusicGenConfig);
+  var
+    T5Enc, T5Dec: TNNet;
+    T5Cfg: TT5Config;
+    Tokens: TNNetVolume;
+    EncSeq, i: integer;
+  begin
+    EncSeq := Length(Ids);
+    T5Enc := nil; T5Dec := nil;
+    Tokens := TNNetVolume.Create;
+    try
+      BuildT5FromSafeTensors(FixturePath('tiny_musicgen_t5enc.safetensors'),
+        T5Enc, T5Dec, T5Cfg, EncSeq, 1, {pInferenceOnly=}true,
+        FixturePath('tiny_musicgen_t5enc_config.json'));
+      Tokens.ReSize(EncSeq, 1, 1);
+      for i := 0 to EncSeq - 1 do Tokens.FData[i] := Ids[i];
+      T5Enc.Compute(Tokens);
+      EncStates.Copy(T5Enc.GetLastLayer.Output);
+      Config := ReadMusicGenConfigFromJSONFile(
+        FixturePath('tiny_musicgen_config.json'));
+    finally
+      T5Enc.Free;
+      T5Dec.Free;
+      Tokens.Free;
+    end;
+  end;
+
+const
+  NumFrames = 6;
+var
+  Cond: TNNetVolume;
+  Config: TMusicGenConfig;
+  Model: TMusicGenModel;
+  DecSeq, k_i, t, diff: integer;
+  CodesGreedy, CodesCached, CodesTopK1, CodesTempA, CodesTempB: TNNetIntArr2D;
+  SampK1, SampTemp: TNNetSamplerBase;
+begin
+  RandSeed := 424242;
+  Cond := TNNetVolume.Create;
+  Model := nil;
+  SampK1 := nil;
+  SampTemp := nil;
+  try
+    EncodePrompt([3, 8, 1, 5, 2], Cond, Config);
+    DecSeq := NumFrames + Config.NumCodebooks - 1 + 1;
+    Model := BuildMusicGenFromSafeTensors(
+      FixturePath('tiny_musicgen.safetensors'), Config, Length([3, 8, 1, 5, 2]),
+      DecSeq, {pInferenceOnly=}true, FixturePath('tiny_musicgen_config.json'));
+
+    // Baseline: the full re-encode greedy loop.
+    Model.Generate(Cond, NumFrames, CodesGreedy);
+
+    // (a) KV-cache incremental decode under greedy MUST be bit-identical.
+    Model.GenerateEx(Cond, nil, NumFrames, 1.0, {UseCache=}true,
+      {Sampler=}nil, {Temperature=}1.0, CodesCached);
+    diff := 0;
+    for k_i := 0 to Length(CodesGreedy) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesGreedy[k_i][t] <> CodesCached[k_i][t] then Inc(diff);
+    AssertEquals('KV-cache greedy decode is bit-identical to full re-encode',
+      0, diff);
+
+    // (b) A weighted top-k=1 sampler is exactly the argmax -> equals greedy,
+    // on BOTH the cached and un-cached paths.
+    SampK1 := TNNetSamplerWeightedTopK.Create(1);
+    Model.GenerateEx(Cond, nil, NumFrames, 1.0, {UseCache=}false,
+      SampK1, {Temperature=}1.0, CodesTopK1);
+    diff := 0;
+    for k_i := 0 to Length(CodesGreedy) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesGreedy[k_i][t] <> CodesTopK1[k_i][t] then Inc(diff);
+    AssertEquals('weighted top-k=1 sampler equals greedy (un-cached)', 0, diff);
+
+    Model.GenerateEx(Cond, nil, NumFrames, 1.0, {UseCache=}true,
+      SampK1, {Temperature=}1.0, CodesTopK1);
+    diff := 0;
+    for k_i := 0 to Length(CodesGreedy) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesGreedy[k_i][t] <> CodesTopK1[k_i][t] then Inc(diff);
+    AssertEquals('weighted top-k=1 sampler equals greedy (cached)', 0, diff);
+
+    // (c) Temperature / top-k stochastic path is reproducible at a fixed seed:
+    // two runs with the same RandSeed produce identical codes.
+    SampTemp := TNNetSamplerWeightedTopK.Create(4);
+    RandSeed := 777;
+    Model.GenerateEx(Cond, nil, NumFrames, 1.0, {UseCache=}false,
+      SampTemp, {Temperature=}0.8, CodesTempA);
+    RandSeed := 777;
+    Model.GenerateEx(Cond, nil, NumFrames, 1.0, {UseCache=}false,
+      SampTemp, {Temperature=}0.8, CodesTempB);
+    diff := 0;
+    for k_i := 0 to Length(CodesTempA) - 1 do
+      for t := 0 to NumFrames - 1 do
+        if CodesTempA[k_i][t] <> CodesTempB[k_i][t] then Inc(diff);
+    AssertEquals('temperature/top-k sampling is reproducible at a fixed seed',
+      0, diff);
+  finally
+    Cond.Free;
+    Model.Free;
+    SampK1.Free;
+    SampTemp.Free;
   end;
 end;
 

@@ -823,11 +823,25 @@ rather than acted on.
       latent, decoded to a short (~5 s) clip written via the WAV writer; defer
       classifier-free-guidance tuning and long-form generation to a follow-up.
       DEPENDS ON the WAV writer + HiFi-GAN vocoder tasks above.
+- [X] KV-cache incremental decode + top-k/temperature sampling for the MusicGen
+      generation loop (follow-up to the landed examples/MusicGenText).
+      TMusicGenModel.GenerateEx adds (a) a KV-cache fast path: every self-attn
+      head (TNNetScaledDotProductAttention) is armed via BeginIncrementalDecode
+      and driven on a lazily-built WIDTH-1 twin decoder (FStepDecoder, weights
+      CopyWeights'd from the full decoder) one frame at a time — bit-identical to
+      the full re-encode greedy loop (cross-attn re-reads the fixed encoder
+      states; the per-frame sinusoidal position is baked into the fed embedding,
+      so the SDPA positional contract holds with no internal pos layer); and
+      (b) top-k/temperature sampling reusing the neuralvolume TNNetSampler family
+      over softmax(logits/temperature) per codebook (Sampler=nil = exact argmax).
+      CFG runs two passes per step so it stays on the un-cached loop. Verified by
+      tests/TestNeuralPretrained TestMusicGenGenerateEx (cached==full greedy;
+      weighted top-k=1==greedy on both paths; seeded reproducibility) and the
+      examples/MusicGenText smoke (default decode now uses the KV-cache path).
 - [ ] Stereo MusicGen (audio_channels=2, the 2K-codebook layout) and a real
       large downloaded musicgen-small checkpoint + a real tokenizer for the
-      text prompt; plus KV-cache incremental decode and top-k/temperature
-      sampling for the generation loop (follow-up to the landed
-      examples/MusicGenText).
+      text prompt (the network/RAM-gated remainder of the MusicGenText
+      follow-up; KV-cache + sampling above are done).
 - [ ] SeamlessM4T-v2 follow-ups deferred from the landed S2TT v1:
       (1) position_embeddings_type="relative_key" — the v2 conformer self-attn
       distance-embedding attention bias (einsum("bhld,lrd->bhlr") added to the

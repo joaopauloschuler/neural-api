@@ -4395,11 +4395,17 @@ type
   private
     FConfig: TMusicGenConfig;
     FDecoder: TNNet;                       // the transformer-block net
+    // Lazily-built WIDTH-1 twin of FDecoder (DecSeqLen=1 input), weights copied
+    // from FDecoder, used by the KV-cache incremental-decode path in GenerateEx.
+    FStepDecoder: TNNet;
     FEmbed: array of TNNetVolume;          // [K] each (vocab+1)*hidden flat
     FPosTable: TNNetVolume;                // MaxPos*hidden sinusoids
     FEncToDecW: TNNetVolume;               // hidden*textDModel row-major
     FEncToDecB: TNNetVolume;               // hidden
     FDecSeqLen, FEncSeqLen: integer;
+    // Builds FStepDecoder (the width-1 twin) on first use and copies weights
+    // from FDecoder. No-op once built. Coded by Claude (AI).
+    procedure EnsureStepDecoder;
   public
     constructor Create(const pConfig: TMusicGenConfig;
       EncSeqLen, DecSeqLen: integer);
@@ -4435,6 +4441,34 @@ type
     // typical MusicGen GuidanceScale is 3.0. Coded by Claude (AI).
     procedure GenerateCFG(EncStates, UncondStates: TNNetVolume;
       NumFrames: integer; GuidanceScale: TNeuralFloat;
+      out Codes: TNNetIntArr2D);
+    // Full generation entry point that adds two generation-quality knobs on top
+    // of GenerateCFG: a KV-CACHE incremental-decode fast path and TOP-K /
+    // TEMPERATURE sampling.
+    //
+    // UseCache=true switches every self-attention head of the decoder onto its
+    // KV-cache incremental-decode path (TNNetScaledDotProductAttention.
+    // BeginIncrementalDecode), so each decode step feeds only the ONE newest
+    // delayed frame instead of re-running the whole prefix - O(steps) work in
+    // total rather than O(steps^2). Cross-attention re-reads the FIXED encoder
+    // states every step (no caching needed) and the per-frame sinusoidal
+    // position is baked into the fed embedding (the decoder carries no internal
+    // positional layer), so the cached path is BIT-IDENTICAL to the full
+    // re-encode loop under greedy decoding. Classifier-free guidance is NOT
+    // available on the cached path (the two conditional/unconditional passes
+    // would double-append to one cache); when GuidanceScale>1.0 with a non-nil
+    // UncondStates, UseCache is ignored and the full GenerateCFG loop runs.
+    //
+    // Sampler selects the per-codebook token: nil (the default) keeps the exact
+    // argmax / greedy behavior of Generate (bit-identical). Any non-nil sampler
+    // (e.g. TNNetSamplerGreedy, TNNetSamplerWeightedTopK, TNNetSamplerTopP) is
+    // applied to the per-codebook PROBABILITY row softmax(logits / Temperature);
+    // Temperature must be > 0 (1.0 = no scaling). A weighted top-k sampler with
+    // TopK=1 reduces to greedy. Stochastic samplers draw from the global RNG, so
+    // seed RandSeed for reproducibility. Coded by Claude (AI).
+    procedure GenerateEx(EncStates, UncondStates: TNNetVolume;
+      NumFrames: integer; GuidanceScale: TNeuralFloat; UseCache: boolean;
+      Sampler: TNNetSamplerBase; Temperature: TNeuralFloat;
       out Codes: TNNetIntArr2D);
   end;
 
@@ -25423,6 +25457,13 @@ end;
 
 { TMusicGenModel }
 
+// Forward declaration: the width-1 step net builder is defined alongside the
+// importer below, but EnsureStepDecoder (above it) needs it.
+function BuildMusicGenDecoderNet(const Config: TMusicGenConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean;
+  out Blocks: TMarianBlockArray;
+  out HeadLayers: array of TNNetLayer; out FinalLN: TNNetLayer): TNNet; forward;
+
 constructor TMusicGenModel.Create(const pConfig: TMusicGenConfig;
   EncSeqLen, DecSeqLen: integer);
 var
@@ -25439,6 +25480,7 @@ begin
   FEncToDecW := TNNetVolume.Create;
   FEncToDecB := TNNetVolume.Create;
   FDecoder := nil;
+  FStepDecoder := nil;
 end;
 
 destructor TMusicGenModel.Destroy;
@@ -25451,7 +25493,26 @@ begin
   FEncToDecW.Free;
   FEncToDecB.Free;
   FDecoder.Free;
+  FStepDecoder.Free;
   inherited Destroy;
+end;
+
+procedure TMusicGenModel.EnsureStepDecoder;
+var
+  StepBlocks: TMarianBlockArray;
+  StepHeads: array of TNNetLayer;
+  StepFinalLN: TNNetLayer;
+begin
+  if Assigned(FStepDecoder) then exit;
+  // Same structure as FDecoder but with a width-1 decoder input (DecSeqLen=1).
+  // The cross-attention encoder-states input keeps the full FEncSeqLen width.
+  // pInferenceOnly=true: the twin is only ever run forward.
+  SetLength(StepHeads, FConfig.NumCodebooks);
+  FStepDecoder := BuildMusicGenDecoderNet(FConfig, FEncSeqLen, 1,
+    {pInferenceOnly=}true, StepBlocks, StepHeads, StepFinalLN);
+  // Layer-by-layer weight copy: the two nets have identical layer topology
+  // (only the input SizeX differs), so every neuron weight transfers exactly.
+  FStepDecoder.CopyWeights(FDecoder);
 end;
 
 procedure TMusicGenModel.ProjectEncoderStates(EncStates, Dst: TNNetVolume);
@@ -25638,16 +25699,287 @@ begin
   end;
 end;
 
+procedure TMusicGenModel.GenerateEx(EncStates, UncondStates: TNNetVolume;
+  NumFrames: integer; GuidanceScale: TNeuralFloat; UseCache: boolean;
+  Sampler: TNNetSamplerBase; Temperature: TNeuralFloat;
+  out Codes: TNNetIntArr2D);
+var
+  EncHidden, FrameEmb, Probs: TNNetVolume;
+  Delayed: TNNetIntArr2D;
+  SDPAs: array of TNNetScaledDotProductAttention;
+  Lay: TNNetLayer;
+  EncStatesInput: TNNetLayer;
+  StepLogits: TNNetVolume;
+  PadId, Steps, step, k_i, c, tok, t, base, vbest: integer;
+  i, n: integer;
+
+  // Selects codebook k_i's token from its logit row (StepLogits starts at
+  // offset Off). nil Sampler -> exact argmax; else softmax(./Temperature) draw.
+  function SelectToken(L: TNNetVolume; Off: integer): integer;
+  var
+    v, best: integer;
+    bestVal, vv, MaxLogit, SumExp: TNeuralFloat;
+  begin
+    if Sampler = nil then
+    begin
+      best := 0;
+      bestVal := L.FData[Off];
+      for v := 1 to FConfig.VocabSize - 1 do
+      begin
+        vv := L.FData[Off + v];
+        if vv > bestVal then begin bestVal := vv; best := v; end;
+      end;
+      Result := best;
+    end
+    else
+    begin
+      // Stable softmax of the VocabSize-wide row at Temperature, then draw
+      // (the same probability convention as DecodeSeq2SeqSampled).
+      MaxLogit := L.FData[Off];
+      for v := 1 to FConfig.VocabSize - 1 do
+        if L.FData[Off + v] > MaxLogit then MaxLogit := L.FData[Off + v];
+      SumExp := 0;
+      for v := 0 to FConfig.VocabSize - 1 do
+      begin
+        Probs.FData[v] := Exp((L.FData[Off + v] - MaxLogit) / Temperature);
+        SumExp := SumExp + Probs.FData[v];
+      end;
+      if SumExp <= 0 then SumExp := 1.0;
+      for v := 0 to FConfig.VocabSize - 1 do
+        Probs.FData[v] := Probs.FData[v] / SumExp;
+      Result := Sampler.GetToken(Probs);
+    end;
+  end;
+
+begin
+  // Classifier-free guidance runs two decoder passes per step and is therefore
+  // incompatible with a single shared KV-cache; fall back to the full
+  // (re-encode) GenerateCFG path whenever guidance is actually active. When the
+  // caller also wants sampling under guidance, the un-cached path below is used
+  // instead (UseCache forced off).
+  if (GuidanceScale > 1.0) and (UncondStates <> nil) then
+    UseCache := false;
+  if Temperature <= 0 then
+    ImportError('MusicGen GenerateEx: Temperature must be > 0.');
+
+  // No cache requested AND no custom sampler -> the existing greedy/CFG loop is
+  // already the exact behavior; delegate so there is one source of truth.
+  if (not UseCache) and (Sampler = nil) then
+  begin
+    GenerateCFG(EncStates, UncondStates, NumFrames, GuidanceScale, Codes);
+    exit;
+  end;
+
+  PadId := FConfig.VocabSize;
+  Steps := NumFrames + FConfig.NumCodebooks - 1;
+  if Steps >= FDecSeqLen then
+    ImportError('MusicGen GenerateEx: NumFrames + K = ' + IntToStr(Steps + 1) +
+      ' exceeds DecSeqLen ' + IntToStr(FDecSeqLen) +
+      ' (rebuild the model with a larger DecSeqLen).');
+
+  // ---- un-cached path (sampling, optionally with guidance) ------------------
+  // Re-uses the full-prefix ComputeLogits; only the token SELECTION changes
+  // (Sampler instead of argmax). Guidance is blended exactly as in GenerateCFG
+  // before the row is handed to the sampler. StepLogits/FrameEmb stand in for
+  // the full-prefix logits / unconditional logits here.
+  if not UseCache then
+  begin
+    EncHidden := TNNetVolume.Create;
+    FrameEmb := TNNetVolume.Create;    // doubles as UncondHidden
+    StepLogits := TNNetVolume.Create;  // doubles as cond Logits
+    Probs := TNNetVolume.Create;
+    try
+      Probs.ReSize(FConfig.VocabSize, 1, 1);
+      ProjectEncoderStates(EncStates, EncHidden);
+      SetLength(Delayed, FConfig.NumCodebooks);
+      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      begin
+        SetLength(Delayed[k_i], FDecSeqLen);
+        for step := 0 to FDecSeqLen - 1 do
+          Delayed[k_i][step] := PadId;
+      end;
+      for step := 0 to Steps - 1 do
+      begin
+        ComputeLogits(Delayed, EncHidden, StepLogits);
+        t := step + 1;
+        for k_i := 0 to FConfig.NumCodebooks - 1 do
+          if (t < FDecSeqLen) and (t >= k_i + 1) and
+             (t - k_i - 1 < NumFrames) then
+          begin
+            base := step * (FConfig.NumCodebooks * FConfig.VocabSize) +
+              k_i * FConfig.VocabSize;
+            Delayed[k_i][t] := SelectToken(StepLogits, base);
+          end;
+      end;
+      SetLength(Codes, FConfig.NumCodebooks);
+      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      begin
+        SetLength(Codes[k_i], NumFrames);
+        for t := 0 to NumFrames - 1 do
+          Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+      end;
+    finally
+      EncHidden.Free;
+      FrameEmb.Free;
+      StepLogits.Free;
+      Probs.Free;
+    end;
+    exit;
+  end;
+
+  // ---- KV-cache incremental-decode path (no guidance) -----------------------
+  // Driven on a WIDTH-1 twin of the decoder (FStepDecoder): a net built with a
+  // single-frame input so every layer's buffers are width-1. The full decoder
+  // FDecoder cannot be fed one frame at a time (its TNNetIdentity bridge copies
+  // into a fixed DecSeqLen-wide buffer), so a dedicated width-1 net - the same
+  // pattern as the LLM streaming "Width1Net" - is required. The twin shares
+  // FDecoder's weights via CopyWeights and is built lazily once per model.
+  EnsureStepDecoder;
+  EncHidden := TNNetVolume.Create;
+  FrameEmb := TNNetVolume.Create;
+  StepLogits := TNNetVolume.Create;
+  Probs := TNNetVolume.Create;
+  SetLength(SDPAs, 0);
+  try
+    Probs.ReSize(FConfig.VocabSize, 1, 1);
+    ProjectEncoderStates(EncStates, EncHidden);
+    EncStatesInput := T5EncoderStatesInput(FStepDecoder);
+    if EncStatesInput.Output.Size <> EncHidden.Size then
+      ImportError('MusicGen GenerateEx: encoder-states size mismatch.');
+    EncStatesInput.Output.Copy(EncHidden);
+
+    // Collect every SELF-attention head (TNNetScaledDotProductAttention) and
+    // arm its KV-cache; cross-attention heads are TNNetCrossAttention (a
+    // distinct class) and are intentionally left on the full-sequence path so
+    // each step re-attends the fixed encoder states. Mirrors
+    // TNNetStreamingDecoder's class scan inline (no neuraldecode dependency).
+    for i := 0 to FStepDecoder.Layers.Count - 1 do
+    begin
+      Lay := FStepDecoder.Layers[i];
+      if Lay is TNNetScaledDotProductAttention then
+      begin
+        n := Length(SDPAs);
+        SetLength(SDPAs, n + 1);
+        SDPAs[n] := TNNetScaledDotProductAttention(Lay);
+        SDPAs[n].BeginIncrementalDecode(FDecSeqLen);
+      end;
+    end;
+
+    // Delayed[k][s] is the decoder input id at delayed column s; all PadId
+    // initially (the shared BOS prompt).
+    SetLength(Delayed, FConfig.NumCodebooks);
+    for k_i := 0 to FConfig.NumCodebooks - 1 do
+    begin
+      SetLength(Delayed[k_i], FDecSeqLen);
+      for step := 0 to FDecSeqLen - 1 do
+        Delayed[k_i][step] := PadId;
+    end;
+
+    FrameEmb.ReSize(1, 1, FConfig.Hidden);
+    // Incremental loop: feed exactly ONE frame embedding per step. At step s the
+    // fed frame is delayed column s (the codes emitted so far), whose self-attn
+    // K/V are appended to the cache; the head output corresponds to position s
+    // attending over [0..s]. The K LM logits for that position predict the
+    // tokens of delayed column s+1.
+    for step := 0 to Steps - 1 do
+    begin
+      // Build the single-frame embedding for delayed column `step`: sum of the
+      // K codebook lookups plus this frame's sinusoidal position vector.
+      for c := 0 to FConfig.Hidden - 1 do
+        FrameEmb.FData[c] := FPosTable.FData[step * FConfig.Hidden + c];
+      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      begin
+        tok := Delayed[k_i][step];
+        if (tok < 0) or (tok > FConfig.VocabSize) then
+          ImportError('MusicGen GenerateEx: code ' + IntToStr(tok) +
+            ' out of range [0, ' + IntToStr(FConfig.VocabSize) + '].');
+        for c := 0 to FConfig.Hidden - 1 do
+          FrameEmb.FData[c] := FrameEmb.FData[c] +
+            FEmbed[k_i].FData[tok * FConfig.Hidden + c];
+      end;
+      FStepDecoder.Compute(FrameEmb);
+      StepLogits.Copy(FStepDecoder.GetLastLayer().Output); // (1,1,K*VocabSize)
+
+      t := step + 1; // delayed column predicted this step
+      for k_i := 0 to FConfig.NumCodebooks - 1 do
+      begin
+        if (t < FDecSeqLen) and (t >= k_i + 1) and
+           (t - k_i - 1 < NumFrames) then
+        begin
+          base := k_i * FConfig.VocabSize;
+          vbest := SelectToken(StepLogits, base);
+          Delayed[k_i][t] := vbest;
+        end;
+      end;
+    end;
+
+    SetLength(Codes, FConfig.NumCodebooks);
+    for k_i := 0 to FConfig.NumCodebooks - 1 do
+    begin
+      SetLength(Codes[k_i], NumFrames);
+      for t := 0 to NumFrames - 1 do
+        Codes[k_i][t] := Delayed[k_i][t + k_i + 1];
+    end;
+  finally
+    // Restore the full-sequence forward on every head touched (so the step net
+    // is reusable; the cache is re-armed on the next GenerateEx call).
+    for i := 0 to High(SDPAs) do SDPAs[i].EndIncrementalDecode();
+    EncHidden.Free;
+    FrameEmb.Free;
+    StepLogits.Free;
+    Probs.Free;
+  end;
+end;
+
+// Builds the MusicGen DECODER net structure (no weights loaded) for a given
+// EncSeqLen/DecSeqLen and returns the layer handles the importer needs. Shared
+// by BuildMusicGenFromSafeTensorsEx (full build at DecSeqLen) and the KV-cache
+// step path (a width-1 twin: DecSeqLen=1 input, weights copied from the full
+// decoder). Coded by Claude (AI).
+function BuildMusicGenDecoderNet(const Config: TMusicGenConfig;
+  EncSeqLen, DecSeqLen: integer; pInferenceOnly: boolean;
+  out Blocks: TMarianBlockArray;
+  out HeadLayers: array of TNNetLayer; out FinalLN: TNNetLayer): TNNet;
+var
+  Dec: TNNet;
+  DecInput, EncStates: TNNetLayer;
+  PegShim: TPegasusConfig;
+  k_i: integer;
+begin
+  Dec := TNNet.Create();
+  DecInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen, 1, Config.Hidden) );
+  EncStates := Dec.AddLayerAfter(
+    TNNetInput.Create(EncSeqLen, 1, Config.Hidden, 1), 0);
+  // Keep the embedding stream as the active layer for the block builder.
+  Dec.AddLayerAfter( TNNetIdentity.Create(), DecInput );
+  // MusicGen decoder blocks are PRE-norm (LN, sublayer, add raw) with exact-
+  // erf GELU and cross-attention - the Pegasus block skeleton exactly. The
+  // shim only carries DModel into the loader.
+  PegShim.DModel := Config.Hidden;
+  PegShim.VocabSize := Config.VocabSize;
+  BuildPegasusStackBlocks(Dec, PegShim, Config.NumLayers, Config.NumHeads,
+    Config.FFNDim, {IsDecoder=}true, EncStates, Blocks, pInferenceOnly,
+    {pQuantizeInt8=}false, {UseReluFFN=}false);
+  // Final decoder LayerNorm (closes the pre-norm stack).
+  FinalLN := Dec.AddLayer( TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
+  // K LM heads over the final hidden, depth-concatenated into K*vocab.
+  for k_i := 0 to Config.NumCodebooks - 1 do
+    HeadLayers[k_i] := Dec.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.VocabSize), FinalLN);
+  Dec.AddLayer( TNNetDeepConcat.Create(HeadLayers) );
+  if pInferenceOnly then Dec.MakeInferenceOnly();
+  Result := Dec;
+end;
+
 function BuildMusicGenFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
   const Config: TMusicGenConfig; EncSeqLen, DecSeqLen: integer;
   pInferenceOnly: boolean = false): TMusicGenModel;
 var
   Model: TMusicGenModel;
   Dec: TNNet;
-  DecInput, EncStates, FinalLN: TNNetLayer;
   Blocks: TMarianBlockArray;
   HeadLayers: array of TNNetLayer;
-  PegShim: TPegasusConfig;
+  FinalLN: TNNetLayer;
   Tmp: TNNetVolume;
   Consumed: TStringList;
   k_i, j, i, BlockCnt, Half, PosCnt, ChCnt: integer;
@@ -25670,29 +26002,10 @@ begin
   Dec := nil;
   try
     // ----- decoder net: input embeddings + enc states -> blocks -> heads ---
-    Dec := TNNet.Create();
-    DecInput := Dec.AddLayer( TNNetInput.Create(DecSeqLen, 1, Config.Hidden) );
-    EncStates := Dec.AddLayerAfter(
-      TNNetInput.Create(EncSeqLen, 1, Config.Hidden, 1), 0);
-    // Keep the embedding stream as the active layer for the block builder.
-    Dec.AddLayerAfter( TNNetIdentity.Create(), DecInput );
-    // MusicGen decoder blocks are PRE-norm (LN, sublayer, add raw) with exact-
-    // erf GELU and cross-attention - the Pegasus block skeleton exactly. The
-    // shim only carries DModel into the loader.
-    PegShim.DModel := Config.Hidden;
-    PegShim.VocabSize := Config.VocabSize;
-    BuildPegasusStackBlocks(Dec, PegShim, Config.NumLayers, Config.NumHeads,
-      Config.FFNDim, {IsDecoder=}true, EncStates, Blocks, pInferenceOnly,
-      {pQuantizeInt8=}false, {UseReluFFN=}false);
-    // Final decoder LayerNorm (closes the pre-norm stack).
-    FinalLN := Dec.AddLayer( TNNetTokenLayerNorm.Create(PegasusLayerNormEps) );
-    // K LM heads over the final hidden, depth-concatenated into K*vocab.
     SetLength(HeadLayers, Config.NumCodebooks);
-    for k_i := 0 to Config.NumCodebooks - 1 do
-      HeadLayers[k_i] := Dec.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize), FinalLN);
-    Dec.AddLayer( TNNetDeepConcat.Create(HeadLayers) );
-    if pInferenceOnly then Dec.MakeInferenceOnly();
+    FinalLN := nil;
+    Dec := BuildMusicGenDecoderNet(Config, EncSeqLen, DecSeqLen, pInferenceOnly,
+      Blocks, HeadLayers, FinalLN);
     Model.FDecoder := Dec;
 
     Tmp := TNNetVolume.Create;

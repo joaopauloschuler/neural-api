@@ -46,10 +46,20 @@ Coded by Claude (AI).
 // sound like music; this only exercises the FULL text->audio wiring end to end.
 //
 // Usage:
-//   MusicGenText                 # pico text-conditioned demo (no download)
+//   MusicGenText                          # pico demo, greedy + KV-cache decode
+//   MusicGenText --guidance 3.0           # classifier-free guidance (un-cached)
+//   MusicGenText --topk 4 --temperature 0.9   # top-k / temperature sampling
+//   MusicGenText --no-cache               # force the full re-encode greedy loop
 //
-// Deferred follow-ups (see tasklist.md): classifier-free guidance (the
-// unconditional/null-prompt branch), stereo (the 2K-codebook layout), and
+// The default greedy decode runs the KV-CACHE incremental-decode fast path
+// (TMusicGenModel.GenerateEx with UseCache): each step feeds only the newest
+// delayed frame and the self-attention heads reuse their cached K/V instead of
+// re-running the whole prefix. It is BIT-IDENTICAL to the un-cached greedy loop
+// (asserted in tests/TestNeuralPretrained TestMusicGenGenerateEx). --topk /
+// --temperature switch the per-codebook pick from argmax to a weighted top-k
+// draw over softmax(logits / temperature); seed via the global RNG.
+//
+// Deferred follow-ups (see tasklist.md): stereo (the 2K-codebook layout) and
 // real large checkpoints / a real tokenizer for the prompt.
 
 {$mode objfpc}{$H+}
@@ -73,10 +83,12 @@ var
   Tokens, EncStates, NullStates, Wave: TNNetVolume;
   Codes: TNNetIntArr2D;
   Waveform: TNeuralFloatDynArr;
-  EncSeq, DecSeq, NumFrames, k_i, t, i: integer;
+  EncSeq, DecSeq, NumFrames, k_i, t, i, TopK: integer;
   MgSafe, MgCfg, T5Safe, T5CfgPath, EcSafe, EcCfg: string;
   Ids: array of integer;
-  GuidanceScale: TNeuralFloat;
+  GuidanceScale, Temperature: TNeuralFloat;
+  UseCache: boolean;
+  Sampler: TNNetSamplerBase;
 
   // Reads an optional "--guidance N" CLI flag (classifier-free-guidance scale,
   // MusicGen's default is 3.0). Returns 1.0 (no guidance) when absent.
@@ -89,6 +101,38 @@ var
     for a := 1 to ParamCount - 1 do
       if (ParamStr(a) = '--guidance') and TryStrToFloat(ParamStr(a + 1), v) then
         Result := v;
+  end;
+
+  // Reads an optional "--topk N" flag (0 = greedy/argmax, the default).
+  function ParseTopK: integer;
+  var a, v: integer;
+  begin
+    Result := 0;
+    for a := 1 to ParamCount - 1 do
+      if (ParamStr(a) = '--topk') and TryStrToInt(ParamStr(a + 1), v) then
+        Result := v;
+  end;
+
+  // Reads an optional "--temperature N" flag (1.0 = no scaling, the default).
+  function ParseTemperature: TNeuralFloat;
+  var
+    a: integer;
+    v: TNeuralFloat;
+  begin
+    Result := 1.0;
+    for a := 1 to ParamCount - 1 do
+      if (ParamStr(a) = '--temperature') and
+         TryStrToFloat(ParamStr(a + 1), v) then Result := v;
+  end;
+
+  // "--no-cache" forces the full re-encode greedy loop (otherwise the KV-cache
+  // incremental-decode path is used for the non-guidance branch).
+  function ParseNoCache: boolean;
+  var a: integer;
+  begin
+    Result := False;
+    for a := 1 to ParamCount do
+      if ParamStr(a) = '--no-cache' then Result := True;
   end;
 
 begin
@@ -127,6 +171,10 @@ begin
   NullStates := TNNetVolume.Create;
   Wave := TNNetVolume.Create;
   GuidanceScale := ParseGuidance;
+  TopK := ParseTopK;
+  Temperature := ParseTemperature;
+  UseCache := not ParseNoCache;
+  Sampler := nil;
   try
     // --- 1. Build the REAL T5 text encoder and run it on the prompt ids. ---
     BuildT5FromSafeTensors(T5Safe, T5Enc, T5Dec, T5Cfg, EncSeq, 1,
@@ -165,19 +213,39 @@ begin
 
     WriteLn('Generating ', NumFrames, ' frames over ', Config.NumCodebooks,
       ' codebooks via the delay pattern (conditioned on the T5 prompt)...');
+    if TopK > 0 then
+    begin
+      // Weighted top-k draw over softmax(logits / temperature). Seeded by the
+      // global RNG (set RandSeed before for reproducibility).
+      Sampler := TNNetSamplerWeightedTopK.Create(TopK);
+      WriteLn('Sampling: weighted top-k = ', TopK, ', temperature = ',
+        Temperature:0:2, '.');
+    end;
     if GuidanceScale > 1.0 then
     begin
       // Classifier-free guidance: the unconditional branch is a ZEROED text
       // condition of the same shape (HF feeds an empty/zeroed prompt with its
-      // attention mask zeroed). Blend: uncond + scale*(cond - uncond).
+      // attention mask zeroed). Blend: uncond + scale*(cond - uncond). Guidance
+      // runs two decoder passes per step, so the KV-cache path is unavailable
+      // (GenerateEx falls back to the un-cached loop automatically).
       NullStates.ReSize(EncStates.SizeX, EncStates.SizeY, EncStates.Depth);
       NullStates.Fill(0);
       WriteLn('Classifier-free guidance ON (scale = ',
-        GuidanceScale:0:2, ', null = zeroed text condition).');
-      Model.GenerateCFG(EncStates, NullStates, NumFrames, GuidanceScale, Codes);
+        GuidanceScale:0:2, ', null = zeroed text condition; KV-cache off).');
+      Model.GenerateEx(EncStates, NullStates, NumFrames, GuidanceScale,
+        {UseCache=}False, Sampler, Temperature, Codes);
     end
     else
-      Model.Generate(EncStates, NumFrames, Codes);
+    begin
+      if UseCache and (Sampler = nil) then
+        WriteLn('Decode: greedy with KV-cache incremental decode.')
+      else if UseCache then
+        WriteLn('Decode: KV-cache incremental decode with sampling.')
+      else
+        WriteLn('Decode: full re-encode loop (--no-cache).');
+      Model.GenerateEx(EncStates, nil, NumFrames, 1.0, UseCache, Sampler,
+        Temperature, Codes);
+    end;
     WriteLn('Generated code stack (codebook x frame):');
     for k_i := 0 to Config.NumCodebooks - 1 do
     begin
@@ -215,6 +283,7 @@ begin
     T5Dec.Free;
     Model.Free;
     Codec.Free;
+    Sampler.Free;
     Tokens.Free;
     EncStates.Free;
     NullStates.Free;
