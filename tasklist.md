@@ -234,15 +234,6 @@ rather than acted on.
       reader/ToString, resnet18 parity 1.0e-6 vs a numpy float64 oracle —
       torchvision not installed; ConvNeXt LayerScale+GRN+depthwise-7x7 is the
       modern-CNN stretch goal on the same path):
-  - [X] resnet50 Bottleneck (expansion 4) is CODED but not parity-tested — add a
-        pico Bottleneck fixture + TestResNet50...Parity. resnet34 likewise coded,
-        untested. resnet101/152 + ConvNeXt remain out of scope.
-        LANDED: tools/resnet50_tiny_fixture.py emits pico tiny_resnet50.* (depth=50
-        Bottleneck, [2,1,1,1], expansion 4) and tiny_resnet34.* (depth=34 BasicBlock,
-        deeper [3,2,2,2]) with shared numpy-float64 oracles reusing resnet18's
-        helpers. TestResNet50/34ImageClassificationParity (shared RunResNetParity
-        driver) assert vs oracle < 1e-4 — both pass; no Bottleneck bug found.
-        resnet101/152 + ConvNeXt still OPEN.
   - [ ] real torchvision .pth (pickle) load path: today the importer reads
         safetensors only; the pico fixture is a numpy float64 oracle (no
         torchvision). Also: CAI maxpool (ceil sizing + edge-clamped windows + zero
@@ -376,7 +367,7 @@ rather than acted on.
       image; an examples/ControlNetCanny that conditions generation on a hand-drawn
       edge map once the base UNet lands. First conditioning-by-feature-injection model.
 - [ ] RandAugment / TrivialAugment automatic augmentation policy in
-      neuraldatasets.pas — the repo has Mixup (landed) and CutMix (tracked) but NO
+      neuraldatasets.pas — the repo has Mixup and CutMix (both landed) but NO
       single-image geometric/photometric augmentation policy; CV training augmentation
       is currently just flips + pad-crop. Port the torchvision transforms-v2 staple:
       a fixed op bank (autocontrast, equalize, rotate, shear-x/y, translate-x/y,
@@ -555,14 +546,6 @@ rather than acted on.
       registered on TNeuralFitBase. Early stopping, custom logging, and the
       EMA/SWA tasks become small callbacks instead of ever more
       TNeuralFitBase fields.
-- [X] CutMix training augmentation (torchvision transforms-v2 staple;
-      Mixup itself is landed: CreateMixedVolumePairList in neuralvolume +
-      examples/Mixup): patch a random rectangle from a second sample into
-      the input and mix the targets by area fraction (Beta-distributed
-      lambda). LANDED: CreateCutMixVolumePairList + ComputeCutMixBox in
-      neuralvolume.pas (shares the Mixup Beta/Gamma sampler), tests in
-      TestNeuralVolumePairs (box geometry + paste/target area-fraction +
-      length/no-mutation), examples/CutMix bake-off.
 - [ ] True single-kernel batched forward (real batch axis + attention padding
       mask for left-pad) — the lockstep DecodeBatchGreedy orchestration landed,
       but NN.Compute has no SIMD batch axis on the char path, so each step still
@@ -681,17 +664,6 @@ rather than acted on.
       way to pretrain on corpora bigger than RAM. Assert: same model
       quality on a small corpus vs the in-memory path at matched
       examples-seen, and bounded RSS on a corpus larger than the buffer.
-- [X] MinHash near-duplicate corpus dedup tool: the C4/Pile hygiene step —
-      shingle each document, MinHash signatures, LSH banding to find
-      near-duplicate clusters, keep one representative. Small standalone
-      unit (or scripts/ tool) pairing with the streaming-corpus-loader
-      task above; report duplicate-cluster stats. Test: planted
-      near-duplicates (one-word edits) are found, distinct documents are
-      not merged. LANDED as neural/neuralminhash.pas (TNeuralMinHasher +
-      DeduplicateCorpus, word N-gram shingles, 2^61-1 universal MinHash,
-      LSH banding tuned to a 0.7 S-curve, union-find clusters keeping the
-      lowest-index representative); tests/TestNeuralMinHash.pas (8 tests).
-
 - [ ] Wav2Vec2 -large / robust LayerNorm variant + pretraining (follow-up to the
       landed Wav2Vec2/HuBERT CTC importer, which supports ONLY the wav2vec2-base
       "group" feat_extract_norm + post-norm encoder; ReadWav2Vec2ConfigFromJSONFile
@@ -714,12 +686,6 @@ rather than acted on.
       ships). Discriminators skipped (training-only). Parity-gated < 1e-4 against an
       HF SpeechT5HifiGan float64 oracle (tools/make_pico_hifigan_fixture.py ->
       tests/fixtures/tiny_hifigan*, TestHiFiGANSynthesisParity). Open follow-ups:
-  - [X] resblock type "2" (the alternative MRF wiring) — LANDED. THiFiGANConfig.ResblockType
-        (1|2); ReadHiFiGANConfigFromJSONFile accepts resblock="2"; builder loads single
-        `resblocks.{i}.convs.{j}` per tap (no convs2) and Synthesize does x:=x+Conv(LReLU(x))
-        per tap. Self-contained float64 numpy oracle (tools/make_pico_hifigan_rb2_fixture.py,
-        cross-validated to 5e-16 vs the HF type-1 oracle) -> tests/fixtures/tiny_hifigan_rb2*,
-        TestHiFiGANSynthesisParityResBlock2 (< 1e-4).
   - [ ] real-checkpoint smoke: resynthesize a clip with a downloaded `hifigan` /
         SpeechT5HifiGan generator (weight_norm fold path) and write it via
         SaveVolumeToWav16 (offline + RAM-gated here, so deferred).
