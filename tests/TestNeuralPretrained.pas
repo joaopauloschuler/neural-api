@@ -340,6 +340,8 @@ type
     procedure TestPixArtConfigFromJSONFile;
     procedure TestPixArtParity;
     procedure TestRRDBNetParity;
+    procedure TestNAFNetConfigFromJSONFile;
+    procedure TestNAFNetParity;
     procedure TestStyleGAN2ConfigFromJSONFile;
     procedure TestStyleGAN2GeneratorParity;
     procedure TestDINOv2ConfigFromJSONFile;
@@ -16204,6 +16206,115 @@ begin
       end;
     end;
     AssertTrue('super-res RGB: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    ImgInput.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// Verifies ReadNAFNetConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestNAFNetConfigFromJSONFile;
+var
+  Config: TNAFNetConfig;
+begin
+  Config := ReadNAFNetConfigFromJSONFile(
+    FixturePath('tiny_nafnet_config.json'));
+  AssertEquals('model_type', 'nafnet', Config.ModelType);
+  AssertEquals('img_channel', 3, Config.ImgChannel);
+  AssertEquals('width', 6, Config.Width);
+  AssertEquals('enc levels', 1, Length(Config.EncBlkNums));
+  AssertEquals('enc[0] blocks', 1, Config.EncBlkNums[0]);
+  AssertEquals('middle blocks', 1, Config.MiddleBlkNum);
+  AssertEquals('dec levels', 1, Length(Config.DecBlkNums));
+  AssertEquals('dec[0] blocks', 1, Config.DecBlkNums[0]);
+  AssertEquals('input_size', 8, Config.InputSize);
+end;
+
+// Parity test for the NAFNet image-restoration importer
+// (BuildNAFNetFromSafeTensors) against the committed tiny float64 numpy oracle
+// (tools/nafnet_tiny_fixture.py: width 6, 1 enc + 1 middle + 1 dec NAFBlock,
+// 3-channel 8x8 input). No official tiny checkpoint exists offline; the fixture
+// is a config-faithful random NAFNet + a hand-written float64 oracle of the
+// EXACT NAFBlock math. Exercises the new parameter-free TNNetSimpleGate
+// (split-depth GLU), Simplified Channel Attention (AvgChannel -> 1x1 conv ->
+// channelwise multiply), per-pixel LayerNorm2d (TNNetTokenLayerNorm), depthwise
+// 3x3 conv, stride-2 down conv, PixelShuffle up via TNNetDepthToSpace, the
+// per-channel beta/gamma residual scales and the global input skip. Asserts
+// < 1e-4 on the FULL restored (ImgChannel, InputSize, InputSize) image. The
+// output is the SAME spatial size as the input (restoration, not upscaling).
+procedure TTestNeuralPretrained.TestNAFNetParity;
+var
+  NN: TNNet;
+  Config: TNAFNetConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  InputArr, ChanArr, RowArr, ImgArr: TJSONArray;
+  ImgInput: TNNetVolume;
+  ImgSize: integer;
+  ChanCnt, YCnt, XCnt: integer;
+  Diff, MaxDiff, RefVal, GotVal: double;
+begin
+  RandSeed := 424242;
+  NN := BuildNAFNetFromSafeTensors(
+    FixturePath('tiny_nafnet.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_nafnet_config.json'));
+  RefJson := TStringList.Create;
+  ImgInput := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('net built', NN <> nil);
+    AssertEquals('input grid', Config.InputSize, NN.Layers[0].Output.SizeX);
+    RefJson.LoadFromFile(FixturePath('tiny_nafnet_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    InputArr := TJSONArray(TJSONObject(RefRoot).Find('input'));
+    ImgArr := TJSONArray(TJSONObject(RefRoot).Find('image'));
+    ImgSize := TJSONObject(RefRoot).Get('image_size', 0);
+    AssertTrue('input present', InputArr <> nil);
+    // Restoration: output grid == input grid.
+    AssertEquals('output image grid', Config.InputSize,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output grid vs oracle', ImgSize,
+      NN.GetLastLayer().Output.SizeX);
+    AssertEquals('output channels', Config.ImgChannel,
+      NN.GetLastLayer().Output.Depth);
+
+    // Load the (C,H,W) input into the CAI (x,y,depth)-indexed volume.
+    ImgInput.ReSize(Config.InputSize, Config.InputSize, Config.ImgChannel);
+    for ChanCnt := 0 to Config.ImgChannel - 1 do
+    begin
+      RowArr := TJSONArray(InputArr.Items[ChanCnt]);
+      for YCnt := 0 to Config.InputSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to Config.InputSize - 1 do
+          ImgInput.FData[
+            (YCnt * Config.InputSize + XCnt) * Config.ImgChannel + ChanCnt] :=
+            ChanArr.Items[XCnt].AsFloat;
+      end;
+    end;
+    NN.Compute(ImgInput);
+    // Compare the (C,H,W) oracle vs the CAI (x,y,depth) output volume.
+    MaxDiff := 0;
+    for ChanCnt := 0 to Config.ImgChannel - 1 do
+    begin
+      RowArr := TJSONArray(ImgArr.Items[ChanCnt]);
+      for YCnt := 0 to ImgSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[YCnt]);
+        for XCnt := 0 to ImgSize - 1 do
+        begin
+          RefVal := ChanArr.Items[XCnt].AsFloat;
+          GotVal := NN.GetLastLayer().Output.FData[
+            (YCnt * ImgSize + XCnt) * Config.ImgChannel + ChanCnt];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('restored RGB: max |diff| = ' + FloatToStr(MaxDiff) +
       ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     RefRoot.Free;

@@ -6832,6 +6832,64 @@ function BuildRRDBNetFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// NAFNet IMAGE-RESTORATION IMPORT (model_type "nafnet") -- the repo's FIRST
+// non-diffusion image-to-image RESTORATION importer that is NOT super-resolution
+// (the RRDBNet/ESRGAN path above is x4 upscaling only). NAFNet (Chen et al.
+// 2022, "Simple Baselines for Image Restoration", arXiv:2204.04676) denoises /
+// deblurs / dejpegs at the SAME resolution. It is a symmetric U-Net of
+// NAFBlocks. The only genuinely new primitive is the parameter-free SimpleGate
+// (TNNetSimpleGate): split the channel axis in half and multiply the halves -
+// a GLU with no activation. Simplified Channel Attention (SCA) reuses landed
+// global pooling + a 1x1 conv + a channelwise multiply. Everything else (1x1 /
+// 3x3 conv, depthwise conv, per-pixel LayerNorm via TNNetTokenLayerNorm,
+// pixel-shuffle up via TNNetDepthToSpace, stride-2 down conv, residual adds)
+// reuses landed layers.
+//
+// NAFBlock(C):
+//   x  = LayerNorm2d(inp) -> conv1(1x1,C->2C) -> dwconv2(3x3,2C->2C)
+//        -> SimpleGate(2C->C) -> x*SCA(x) -> conv3(1x1,C->C)
+//   y  = inp + beta .* x
+//   x2 = LayerNorm2d(y) -> conv4(1x1,C->2C) -> SimpleGate(2C->C)
+//        -> conv5(1x1,C->C)
+//   out = y + gamma .* x2
+// U-Net: intro 3x3 -> enc stages (NAFBlocks then stride-2 down conv, 2x ch)
+//        -> middle NAFBlocks -> dec stages (1x1 conv 2x ch + DepthToSpace(2)
+//        up, ADD the encoder skip, then NAFBlocks) -> ending 3x3, global skip.
+// ---------------------------------------------------------------------------
+type
+  TNAFNetConfig = record
+    ImgChannel: integer;            // input/output channels (3)
+    Width: integer;                 // base channel width (even)
+    EncBlkNums: TNeuralIntegerArray; // NAFBlocks per encoder stage
+    MiddleBlkNum: integer;          // NAFBlocks in the bottleneck
+    DecBlkNums: TNeuralIntegerArray; // NAFBlocks per decoder stage
+    InputSize: integer;             // input grid H=W for the Input layer
+    ModelType: string;              // 'nafnet'
+  end;
+
+// Reads a NAFNet config. Required: width. Optional: img_channel (3),
+// enc_blk_nums ([1]), middle_blk_num (1), dec_blk_nums ([1]), input_size,
+// model_type. enc_blk_nums and dec_blk_nums must have the same length (one
+// entry per U-Net level).
+function ReadNAFNetConfigFromJSONFile(
+  const FileName: string): TNAFNetConfig;
+
+function NAFNetConfigToString(const Config: TNAFNetConfig): string;
+
+// Builds the NAFNet described by Config and loads every weight from Reader
+// (caller owns Reader). The net takes a (InputSize, InputSize, ImgChannel)
+// image and outputs the SAME shape (restored image, raw).
+function BuildNAFNet(Reader: TNNetSafeTensorsReader;
+  const Config: TNAFNetConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildNAFNetFromSafeTensorsEx(const FileName: string;
+  const Config: TNAFNetConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildNAFNetFromSafeTensors(const FileName: string;
+  out Config: TNAFNetConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // StyleGAN2 GENERATOR IMPORT (model_type "stylegan2") -- the repo's FIRST
 // STYLE-BASED generative synthesis importer (Karras et al. 2020,
 // arXiv:1912.04958). INFERENCE-ONLY synthesis: an 8-layer mapping MLP turns a
@@ -40923,6 +40981,306 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadRRDBNetConfigFromJSONFile(ConfigPath);
   Result := BuildRRDBNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// NAFNet IMAGE-RESTORATION IMPORT (model_type "nafnet")
+// ===========================================================================
+
+function ReadNAFNetConfigFromJSONFile(
+  const FileName: string): TNAFNetConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+
+  function ReadIntArray(const FieldName: string;
+    const Default: array of integer): TNeuralIntegerArray;
+  var
+    Arr: TJSONArray;
+    i: integer;
+  begin
+    if (Obj.IndexOfName(FieldName) < 0) or
+       not (Obj.Find(FieldName) is TJSONArray) then
+    begin
+      SetLength(Result, Length(Default));
+      for i := 0 to Length(Default) - 1 do Result[i] := Default[i];
+      Exit;
+    end;
+    Arr := TJSONArray(Obj.Find(FieldName));
+    SetLength(Result, Arr.Count);
+    for i := 0 to Arr.Count - 1 do Result[i] := Arr.Items[i].AsInteger;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('NAFNet import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('NAFNet import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('NAFNet import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.ModelType := Obj.Get('model_type', 'nafnet');
+    Result.ImgChannel := Obj.Get('img_channel', 3);
+    Result.Width := Obj.Get('width', 0);
+    if Result.Width <= 0 then
+      ImportError('NAFNet import: config "' + FileName +
+        '" is missing the required positive field "width".');
+    Result.EncBlkNums := ReadIntArray('enc_blk_nums', [1]);
+    Result.MiddleBlkNum := Obj.Get('middle_blk_num', 1);
+    Result.DecBlkNums := ReadIntArray('dec_blk_nums', [1]);
+    Result.InputSize := Obj.Get('input_size', 0);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function NAFNetConfigToString(const Config: TNAFNetConfig): string;
+var
+  i: integer;
+  EncStr, DecStr: string;
+begin
+  EncStr := '';
+  for i := 0 to Length(Config.EncBlkNums) - 1 do
+  begin
+    if i > 0 then EncStr := EncStr + ',';
+    EncStr := EncStr + IntToStr(Config.EncBlkNums[i]);
+  end;
+  DecStr := '';
+  for i := 0 to Length(Config.DecBlkNums) - 1 do
+  begin
+    if i > 0 then DecStr := DecStr + ',';
+    DecStr := DecStr + IntToStr(Config.DecBlkNums[i]);
+  end;
+  Result := Config.ModelType + ' config: img_channel=' +
+    IntToStr(Config.ImgChannel) + ', width=' + IntToStr(Config.Width) +
+    ', enc_blk_nums=[' + EncStr + '], middle_blk_num=' +
+    IntToStr(Config.MiddleBlkNum) + ', dec_blk_nums=[' + DecStr + ']' +
+    ', input_size=' + IntToStr(Config.InputSize);
+end;
+
+type
+  // Layer refs needed to load one NAFBlock's weights (channel width C).
+  TNAFBlockLayers = record
+    Norm1, Conv1, DwConv2, DwBias2, ScaConv, Conv3, BetaScale: TNNetLayer;
+    Norm2, Conv4, Conv5, GammaScale: TNNetLayer;
+  end;
+
+// Architecture: append one NAFBlock(C) to NN, return its layer refs.
+// inp is the layer feeding the block.
+function AddNAFBlock(NN: TNNet; C: integer; inp: TNNetLayer;
+  out Refs: TNAFBlockLayers): TNNetLayer;
+var
+  Norm, Gate, Pool, Sca, Mul, MainOut, Y, X2: TNNetLayer;
+begin
+  // --- block 1: norm -> conv1 -> dwconv2 -> SimpleGate -> SCA -> conv3 ---
+  Norm := NN.AddLayerAfter(TNNetTokenLayerNorm.Create(1e-5), inp);
+  Refs.Norm1 := Norm;
+  Refs.Conv1 := NN.AddLayer(TNNetConvolutionLinear.Create(2 * C, 1, 0, 1, 0));
+  // depthwise 3x3, multiplier 1, pad 1, stride 1, NO bias (bias rides ChannelBias)
+  Refs.DwConv2 := NN.AddLayer(TNNetDepthwiseConvLinear.Create(1, 3, 1, 1));
+  Refs.DwBias2 := NN.AddLayer(TNNetChannelBias.Create());
+  Gate := NN.AddLayer(TNNetSimpleGate.Create());   // 2C -> C
+  // SCA: global avg pool over space -> 1x1 conv (C->C) -> channelwise multiply.
+  Pool := NN.AddLayerAfter(TNNetAvgChannel.Create(), Gate);
+  Sca := NN.AddLayer(TNNetConvolutionLinear.Create(C, 1, 0, 1, 0));
+  Refs.ScaConv := Sca;
+  Mul := NN.AddLayer(TNNetChannelMulByLayer.Create(Gate, Sca));
+  Refs.Conv3 := NN.AddLayerAfter(
+    TNNetConvolutionLinear.Create(C, 1, 0, 1, 0), Mul);
+  // y = inp + beta .* main
+  Refs.BetaScale := NN.AddLayer(TNNetChannelMul.Create());
+  Y := NN.AddLayer(TNNetSum.Create([Refs.BetaScale, inp]));
+
+  // --- block 2: norm -> conv4 -> SimpleGate -> conv5 ---
+  Norm := NN.AddLayerAfter(TNNetTokenLayerNorm.Create(1e-5), Y);
+  Refs.Norm2 := Norm;
+  Refs.Conv4 := NN.AddLayer(TNNetConvolutionLinear.Create(2 * C, 1, 0, 1, 0));
+  NN.AddLayer(TNNetSimpleGate.Create());           // 2C -> C
+  Refs.Conv5 := NN.AddLayer(TNNetConvolutionLinear.Create(C, 1, 0, 1, 0));
+  Refs.GammaScale := NN.AddLayer(TNNetChannelMul.Create());
+  MainOut := NN.AddLayer(TNNetSum.Create([Refs.GammaScale, Y]));
+  Result := MainOut;
+end;
+
+procedure LoadNAFBlock(Reader: TNNetSafeTensorsReader;
+  const Refs: TNAFBlockLayers; const Prefix: string; C: integer);
+begin
+  LoadLayerNormWeights(Reader, Refs.Norm1, Prefix + 'norm1.weight',
+    Prefix + 'norm1.bias', C);
+  LoadVaeConv(Reader, Refs.Conv1, Prefix + 'conv1.weight',
+    Prefix + 'conv1.bias', 2 * C, C, 1);
+  LoadConvNeXtDepthwise(Reader, Refs.DwConv2, Prefix + 'conv2.weight',
+    Prefix + 'conv2.bias', 2 * C, 3);
+  LoadConvNeXtChannelVector(Reader, Refs.DwBias2, Prefix + 'conv2.bias', 0,
+    2 * C);
+  LoadVaeConv(Reader, Refs.ScaConv, Prefix + 'sca.1.weight',
+    Prefix + 'sca.1.bias', C, C, 1);
+  LoadVaeConv(Reader, Refs.Conv3, Prefix + 'conv3.weight',
+    Prefix + 'conv3.bias', C, C, 1);
+  LoadConvNeXtChannelVector(Reader, Refs.BetaScale, Prefix + 'beta', 0, C);
+  LoadLayerNormWeights(Reader, Refs.Norm2, Prefix + 'norm2.weight',
+    Prefix + 'norm2.bias', C);
+  LoadVaeConv(Reader, Refs.Conv4, Prefix + 'conv4.weight',
+    Prefix + 'conv4.bias', 2 * C, C, 1);
+  LoadVaeConv(Reader, Refs.Conv5, Prefix + 'conv5.weight',
+    Prefix + 'conv5.bias', C, C, 1);
+  LoadConvNeXtChannelVector(Reader, Refs.GammaScale, Prefix + 'gamma', 0, C);
+end;
+
+function BuildNAFNet(Reader: TNNetSafeTensorsReader;
+  const Config: TNAFNetConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Intro, Ending: TNNetLayer;
+  EncSkips: array of TNNetLayer;
+  DownConvs, UpConvs: array of TNNetLayer;
+  EncRefs: array of array of TNAFBlockLayers;
+  MidRefs: array of TNAFBlockLayers;
+  DecRefs: array of array of TNAFBlockLayers;
+  NumLevels, lvl, b, C, ChDown, ChUp: integer;
+  Cur, Up, DecIn: TNNetLayer;
+begin
+  if Config.Width < 1 then
+    ImportError('NAFNet import: width must be >= 1.');
+  if (Config.Width mod 2) <> 0 then
+    ImportError('NAFNet import: width must be even (SimpleGate needs an even ' +
+      'channel count), got ' + IntToStr(Config.Width) + '.');
+  if Config.InputSize < 1 then
+    ImportError('NAFNet import: input_size must be >= 1.');
+  if Length(Config.EncBlkNums) <> Length(Config.DecBlkNums) then
+    ImportError('NAFNet import: enc_blk_nums and dec_blk_nums must have the ' +
+      'same length (one entry per U-Net level).');
+  NumLevels := Length(Config.EncBlkNums);
+
+  SetLength(EncSkips, NumLevels);
+  SetLength(DownConvs, NumLevels);
+  SetLength(UpConvs, NumLevels);
+  SetLength(EncRefs, NumLevels);
+  SetLength(DecRefs, NumLevels);
+  SetLength(MidRefs, Config.MiddleBlkNum);
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer(TNNetInput.Create(Config.InputSize, Config.InputSize,
+      Config.ImgChannel));
+    Intro := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.Width, 3, 1, 1, 0));
+    Cur := Intro;
+    C := Config.Width;
+    // Encoder.
+    for lvl := 0 to NumLevels - 1 do
+    begin
+      SetLength(EncRefs[lvl], Config.EncBlkNums[lvl]);
+      for b := 0 to Config.EncBlkNums[lvl] - 1 do
+        Cur := AddNAFBlock(NN, C, Cur, EncRefs[lvl][b]);
+      EncSkips[lvl] := Cur;
+      // Down: stride-2 2x2 conv, C -> 2C, no padding (exact H/2).
+      DownConvs[lvl] := NN.AddLayer(
+        TNNetConvolutionLinear.Create(2 * C, 2, 0, 2, 0));
+      Cur := DownConvs[lvl];
+      C := C * 2;
+    end;
+    // Middle.
+    for b := 0 to Config.MiddleBlkNum - 1 do
+      Cur := AddNAFBlock(NN, C, Cur, MidRefs[b]);
+    // Decoder (mirror).
+    for lvl := NumLevels - 1 downto 0 do
+    begin
+      // Up (NAFNet PixelShuffle upsample): 1x1 conv C -> 2C, then
+      // DepthToSpace(2) divides channels by 4 and doubles each spatial axis,
+      // so 2C -> C/2 channels at 2x resolution. Mirrors the encoder's stride-2
+      // down conv (C -> 2C at H/2) to land back on the skip's (C/2, H) shape.
+      UpConvs[lvl] := NN.AddLayer(
+        TNNetConvolutionLinear.Create(2 * C, 1, 0, 1, 0));
+      NN.AddLayer(TNNetDepthToSpace.Create(2));  // 2C -> C/2, spatial x2
+      C := C div 2;
+      Up := NN.GetLastLayer();
+      // Add encoder skip (same channel count C and spatial size).
+      DecIn := NN.AddLayer(TNNetSum.Create([Up, EncSkips[lvl]]));
+      Cur := DecIn;
+      SetLength(DecRefs[lvl], Config.DecBlkNums[lvl]);
+      for b := 0 to Config.DecBlkNums[lvl] - 1 do
+        Cur := AddNAFBlock(NN, C, Cur, DecRefs[lvl][b]);
+    end;
+    Ending := NN.AddLayer(
+      TNNetConvolutionLinear.Create(Config.ImgChannel, 3, 1, 1, 0));
+    // Global residual: out = ending(...) + input image.
+    NN.AddLayer(TNNetSum.Create([Ending, NN.Layers[0]]));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadVaeConv(Reader, Intro, 'intro.weight', 'intro.bias',
+      Config.Width, Config.ImgChannel, 3);
+    C := Config.Width;
+    for lvl := 0 to NumLevels - 1 do
+    begin
+      for b := 0 to Config.EncBlkNums[lvl] - 1 do
+        LoadNAFBlock(Reader, EncRefs[lvl][b],
+          'encoders.' + IntToStr(lvl) + '.' + IntToStr(b) + '.', C);
+      ChDown := C;
+      LoadVaeConv(Reader, DownConvs[lvl],
+        'downs.' + IntToStr(lvl) + '.weight',
+        'downs.' + IntToStr(lvl) + '.bias', 2 * ChDown, ChDown, 2);
+      C := C * 2;
+    end;
+    for b := 0 to Config.MiddleBlkNum - 1 do
+      LoadNAFBlock(Reader, MidRefs[b],
+        'middle_blks.' + IntToStr(b) + '.', C);
+    for lvl := NumLevels - 1 downto 0 do
+    begin
+      ChUp := C;
+      LoadVaeConv(Reader, UpConvs[lvl],
+        'ups.' + IntToStr(lvl) + '.weight',
+        'ups.' + IntToStr(lvl) + '.bias', 2 * ChUp, ChUp, 1);
+      C := C div 2;
+      for b := 0 to Config.DecBlkNums[lvl] - 1 do
+        LoadNAFBlock(Reader, DecRefs[lvl][b],
+          'decoders.' + IntToStr(lvl) + '.' + IntToStr(b) + '.', C);
+    end;
+    LoadVaeConv(Reader, Ending, 'ending.weight', 'ending.bias',
+      Config.ImgChannel, Config.Width, 3);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildNAFNetFromSafeTensorsEx(const FileName: string;
+  const Config: TNAFNetConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildNAFNet(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildNAFNetFromSafeTensors(const FileName: string;
+  out Config: TNAFNetConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadNAFNetConfigFromJSONFile(ConfigPath);
+  Result := BuildNAFNetFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

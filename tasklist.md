@@ -295,18 +295,31 @@ rather than acted on.
       (TNNetTorchBinReader path); (b) real x4 upscale of a tiny PNG end-to-end
       example; (c) scale=2 / other scales (currently only scale=4 = two upsample
       stages wired).
-- [ ] NAFNet image-restoration importer (BuildNAFNetFromSafeTensors[Ex] +
-      TNAFNetConfig, e.g. the official NAFNet denoise/deblur checkpoints) — the
-      first non-diffusion image-to-image RESTORATION importer that is NOT
-      super-resolution (the landed RRDBNet/ESRGAN path is x4 upscaling only). The
-      only genuinely new pieces are SimpleGate (split the channel axis in half and
-      multiply the two halves elementwise — a parameter-free GLU; add a small
-      TNNetSimpleGate or a Split+Mul builder) and Simplified Channel Attention
-      (global-avg-pool -> 1x1 conv -> channel-wise multiply, no activation),
-      assembled into a U-Net of NAFBlocks with LayerNorm. Everything else (1x1/3x3
-      conv, pixel-shuffle up/down via TNNetDepthToSpace, residual add) reuses landed
-      layers. Pico parity vs a numpy float64 oracle on a tiny denoise net +
-      examples/ImageRestoration that denoises/deblurs a small PNG end-to-end on CPU.
+- [X] NAFNet image-restoration importer (BuildNAFNetFromSafeTensors[Ex] +
+      TNAFNetConfig) — the first non-diffusion image-to-image RESTORATION importer
+      that is NOT super-resolution (the landed RRDBNet/ESRGAN path is x4 upscaling
+      only). Landed:
+      [X] TNNetSimpleGate leaf layer in neuralnetwork.pas (split channel axis in
+          half + multiply; parameter-free GLU) with forward + backward, registered
+          in both layer-load tables, numerical-gradient + forward + serialization
+          tests in tests/TestNeuralNumerical.pas, added to README.md layer list.
+      [X] Simplified Channel Attention (SCA) via landed AvgChannel -> 1x1 conv ->
+          TNNetChannelMulByLayer (no activation).
+      [X] U-Net of NAFBlocks with per-pixel LayerNorm2d (TNNetTokenLayerNorm),
+          depthwise 3x3, stride-2 down conv, PixelShuffle up via TNNetDepthToSpace,
+          per-channel beta/gamma residual scales, global input skip.
+      [X] Pico parity vs a numpy float64 oracle (tools/nafnet_tiny_fixture.py,
+          tests/fixtures/tiny_nafnet.*, TestNAFNetParity asserts max|diff| < 1e-4).
+      [X] examples/ImageRestoration denoises a small image end-to-end on CPU
+          (writes before/after PPM); entry added to examples/README.md.
+      Deferred follow-ups:
+      [ ] Real official NAFNet denoise/deblur checkpoint parity (offline env — the
+          weights are large / not redistributable; importer uses the canonical
+          NAFNet state_dict key scheme so a real checkpoint should drop in).
+      [ ] PNG input/output (the example uses deterministic synthetic images + PPM;
+          no PNG decoder in-tree).
+      [ ] NAFBlock dropout + the wider official width/block configs are wired by
+          config but only the small pico shape is parity-pinned.
 - [ ] SwinIR transformer image-restoration importer (BuildSwinIRFromSafeTensors[Ex])
       — classical/lightweight super-resolution + denoising + JPEG-artifact removal
       built on the LANDED Swin window/shifted-window attention

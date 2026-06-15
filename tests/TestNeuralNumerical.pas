@@ -1043,6 +1043,9 @@ type
     procedure TestReverseChannelsGradientCheck;
     procedure TestReverseChannelsInvolution;
     procedure TestReverseChannelsSerializationRoundTrip;
+    procedure TestSimpleGateForward;
+    procedure TestSimpleGateGradientCheck;
+    procedure TestSimpleGateSerializationRoundTrip;
     procedure TestCumSumForward;
     procedure TestCumSumGradientCheck;
     procedure TestCumSumGradientCheckAxisX;
@@ -22579,6 +22582,45 @@ begin
   // SaveToString -> LoadFromString cycle.
   SerializationRoundTrip(Self, TNNetReverseChannels.Create(),
     'ReverseChannels', 2, 2, 5, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestSimpleGateForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  // Depth=6 (=2*3): Output[c] = Input[c] * Input[3 + c].
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 6, 1));
+    NN.AddLayer(TNNetSimpleGate.Create());
+    Input.Raw[0] := 2.0;  Input.Raw[3] := 5.0;   // -> 10
+    Input.Raw[1] := -3.0; Input.Raw[4] := 4.0;   // -> -12
+    Input.Raw[2] := 1.5;  Input.Raw[5] := -2.0;  // -> -3
+    NN.Compute(Input);
+    AssertEquals('output depth halved', 3, NN.GetLastLayer.Output.Depth);
+    AssertEquals('SimpleGate c0', 10.0, NN.GetLastLayer.Output.Raw[0], 1e-6);
+    AssertEquals('SimpleGate c1', -12.0, NN.GetLastLayer.Output.Raw[1], 1e-6);
+    AssertEquals('SimpleGate c2', -3.0, NN.GetLastLayer.Output.Raw[2], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSimpleGateGradientCheck;
+begin
+  // Bilinear gate; backward is the product rule. Depth=6 -> output depth 3.
+  LayerInputGradientCheck(Self, TNNetSimpleGate.Create(),
+    'SimpleGate', 2, 2, 6, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestSimpleGateSerializationRoundTrip;
+begin
+  // Parameter-free; output parity after SaveToString -> LoadFromString.
+  SerializationRoundTrip(Self, TNNetSimpleGate.Create(),
+    'SimpleGate', 2, 2, 6, 1e-5);
 end;
 
 procedure TTestNeuralNumerical.TestCumSumForward;

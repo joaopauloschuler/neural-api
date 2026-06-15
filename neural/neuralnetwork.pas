@@ -8150,6 +8150,26 @@ type
       procedure Backpropagate(); override;
   end;
 
+  /// Parameter-free SimpleGate (Chen et al. 2022, "Simple Baselines for Image
+  // Restoration", https://arxiv.org/abs/2204.04676). Splits the channel
+  // (depth) axis in half and multiplies the two halves elementwise — a
+  // parameter-free GLU / gating without any nonlinearity. The input depth
+  // must be even (= 2*C); the output depth is C:
+  //   Output[x, y, c] := Input[x, y, c] * Input[x, y, C + c]   (c in 0..C-1)
+  // Backward is the product rule: the gradient w.r.t. the first half is the
+  // upstream error times the second half, and w.r.t. the second half is the
+  // upstream error times the first half:
+  //   dInput[x, y, c]     += OutputError[x, y, c] * Input[x, y, C + c]
+  //   dInput[x, y, C + c] += OutputError[x, y, c] * Input[x, y, c]
+  // Coded by Claude (AI).
+  TNNetSimpleGate = class(TNNetIdentity)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// Tiny parameter-free shape layer that computes the cumulative sum along
   // a configurable axis. The axis is selected by the constructor parameter
   // pAxis stored in FStruct[0]: 0 = X (cumulate along SizeX),
@@ -33218,6 +33238,79 @@ begin
     // for output channel d into source channel Depth - 1 - d.
     for CntDepth := 0 to MaxDepth do
       FPrevLayer.OutputError.AddFromDepthToDepth(FOutputError, CntDepth, MaxDepth - CntDepth);
+  end;
+  LocalNow := Now();
+  FBackwardTime := FBackwardTime + (LocalNow - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetSimpleGate }
+
+procedure TNNetSimpleGate.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  if (pPrevLayer.Output.Depth mod 2) <> 0 then
+  begin
+    FErrorProc('TNNetSimpleGate requires an even Depth, got Depth=' +
+      IntToStr(pPrevLayer.Output.Depth));
+    Exit;
+  end;
+  FOutput.ReSize(pPrevLayer.Output.SizeX,
+                 pPrevLayer.Output.SizeY,
+                 pPrevLayer.Output.Depth div 2);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+procedure TNNetSimpleGate.Compute();
+var
+  IX, IY, IC: integer;
+  MaxIX, MaxIY, HalfDepth, MaxC: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  HalfDepth := FOutput.Depth;
+  MaxIX := FPrevLayer.Output.SizeX - 1;
+  MaxIY := FPrevLayer.Output.SizeY - 1;
+  MaxC := HalfDepth - 1;
+  for IX := 0 to MaxIX do
+    for IY := 0 to MaxIY do
+      for IC := 0 to MaxC do
+        FOutput[IX, IY, IC] :=
+          FPrevLayer.FOutput[IX, IY, IC] *
+          FPrevLayer.FOutput[IX, IY, HalfDepth + IC];
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetSimpleGate.Backpropagate();
+var
+  IX, IY, IC: integer;
+  MaxIX, MaxIY, HalfDepth, MaxC: integer;
+  Err: TNeuralFloat;
+  StartTime, LocalNow: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  if (FPrevLayer.FOutputError.Size > 0) and
+     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
+  begin
+    HalfDepth := FOutput.Depth;
+    MaxIX := FPrevLayer.Output.SizeX - 1;
+    MaxIY := FPrevLayer.Output.SizeY - 1;
+    MaxC := HalfDepth - 1;
+    for IX := 0 to MaxIX do
+      for IY := 0 to MaxIY do
+        for IC := 0 to MaxC do
+        begin
+          Err := FOutputError[IX, IY, IC];
+          // Product rule: d/d(a) = err*b ; d/d(b) = err*a.
+          FPrevLayer.OutputError.Add(IX, IY, IC,
+            Err * FPrevLayer.FOutput[IX, IY, HalfDepth + IC]);
+          FPrevLayer.OutputError.Add(IX, IY, HalfDepth + IC,
+            Err * FPrevLayer.FOutput[IX, IY, IC]);
+        end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -90364,6 +90457,7 @@ begin
       'TNNetSparsemax' :            Result := TNNetSparsemax.Create();
       'TNNetChannelShuffle' :       Result := TNNetChannelShuffle.Create(St[0]);
       'TNNetReverseChannels' :      Result := TNNetReverseChannels.Create();
+      'TNNetSimpleGate' :           Result := TNNetSimpleGate.Create();
       'TNNetCumSum' :               Result := TNNetCumSum.Create(St[0]);
       'TNNetRoll' :                 if StructCount >= 2 then
                                       // St[1] is the STORED axis code (0 = Depth,
@@ -90773,6 +90867,7 @@ begin
       if S[0] = 'TNNetSparsemax' then Result := TNNetSparsemax.Create() else
       if S[0] = 'TNNetChannelShuffle' then Result := TNNetChannelShuffle.Create(St[0]) else
       if S[0] = 'TNNetReverseChannels' then Result := TNNetReverseChannels.Create() else
+      if S[0] = 'TNNetSimpleGate' then Result := TNNetSimpleGate.Create() else
       if S[0] = 'TNNetCumSum' then Result := TNNetCumSum.Create(St[0]) else
       if S[0] = 'TNNetRoll' then
         begin
