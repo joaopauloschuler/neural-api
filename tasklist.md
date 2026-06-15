@@ -453,6 +453,69 @@ rather than acted on.
       everything else is landed. Depends on the tracked Conv3D task. Pico parity vs
       HF float64 on the logits + an examples/VideoAction that classifies a short
       Moving-MNIST-tubelet or a tiny clip on CPU. First image-sequence-in importer.
+- [ ] PixArt-alpha text-to-image importer (BuildPixArtFromSafeTensors, e.g.
+      PixArt-alpha/PixArt-XL-2-512x512) — the TEXT-conditioned DiT variant that the
+      landed class-conditional DiT importer (BuildDiTFromSafeTensors) explicitly
+      defers (see the neuralpretrained.pas DiT header note). The ONLY structurally
+      new pieces vs the landed DiT are: (a) the conditioning source — drop the
+      y_embedder class table and instead feed T5 encoder states (reuse the landed
+      BuildT5FromSafeTensors encoder as the prompt tower) into each block; (b) a
+      CROSS-attention sublayer per DiTBlock between the (already landed)
+      self-attention and the FFN, attending image tokens -> T5 tokens (reuse
+      TNNetCrossAttention); (c) PixArt's SHARED adaLN-single (one global
+      timestep-modulation table broadcast to all blocks, instead of per-block
+      adaLN-Zero). Everything else — patch embed, sin-cos pos embed, the
+      DDPM/DDIM/DPM-Solver++ sampler, the VAE decoder — is already landed, so this
+      is the cheapest path to a REAL text-to-image checkpoint and directly unblocks
+      the tracked LatentTextToImage example WITHOUT needing the SD UNet. Pico parity
+      vs a diffusers float64 oracle on one denoise step + reuse make_pico_*_fixture.
+- [ ] ControlNet spatial-conditioning importer (BuildControlNetFromSafeTensors, e.g.
+      lllyasviel/sd-controlnet-canny) — adds spatial control (edge / depth / pose
+      map -> image) to latent diffusion: a trainable COPY of the SD UNet encoder +
+      mid block whose per-resolution residuals are added into the frozen base UNet
+      via zero-initialised 1x1 convs, plus a small conv "hint" stem that embeds the
+      control image into the latent grid. Genuinely new code is only the zero-conv
+      residual injection wiring and the hint encoder; the encoder blocks reuse the
+      SD UNet importer path. DEPENDS ON the open SD UNet importer (the VAE-decoder
+      follow-up's deferred piece) — track as its natural successor. Pico parity vs a
+      diffusers float64 oracle on the down/mid residual tensors for a fixed control
+      image; an examples/ControlNetCanny that conditions generation on a hand-drawn
+      edge map once the base UNet lands. First conditioning-by-feature-injection model.
+- [ ] MaskGIT non-autoregressive image-generation example (examples/MaskGIT) — the
+      VQModelImport README already names MaskGIT as the intended downstream generator
+      for the landed VQ tokenizer, but no generator exists. Train a small
+      bidirectional transformer (reuse the landed encoder-block builder) over the
+      VQGAN/VqModel codebook indices to predict masked tokens, then GENERATE by
+      iterative parallel decoding: start all-[MASK], predict every token, keep the
+      most-confident fraction per step on a cosine mask schedule, remask the rest,
+      repeat ~8-12 steps. Structurally distinct from every landed generator — the
+      repo has autoregressive (TinyGPT), GAN (VisualGAN/StyleGAN2) and diffusion
+      paths but NO masked-token parallel image decoding. New code is the random
+      span-mask + confidence-based unmasking scheduler; the net and the VQ encode/
+      decode are landed. CPU-friendly on CIFAR-10 latents; writes a generated grid.
+- [ ] RandAugment / TrivialAugment automatic augmentation policy in
+      neuraldatasets.pas — the repo has Mixup (landed) and CutMix (tracked) but NO
+      single-image geometric/photometric augmentation policy; CV training augmentation
+      is currently just flips + pad-crop. Port the torchvision transforms-v2 staple:
+      a fixed op bank (autocontrast, equalize, rotate, shear-x/y, translate-x/y,
+      posterize, solarize, color/contrast/brightness/sharpness) over a TNNetVolume,
+      with RandAugment (N ops at fixed magnitude M) and the parameter-free
+      TrivialAugment (one op, magnitude drawn uniformly) selection policies, plus
+      RandomErasing/Cutout. Wire it as an optional hook in the TNeuralImageFit
+      augmentation path so existing CIFAR examples can opt in. New code is the op
+      bank + the two sampling policies; reuses existing volume rotate/shear/color
+      primitives where present. Adds a measurable top-1 lift on the SimpleImageClassifier.
+- [ ] Euler-ancestral + Karras-sigma noise-schedule follow-up for
+      TNNetDiffusionScheduler (neuraldiffusion.pas) — the landed sampler covers
+      DDPM/DDIM/DPM-Solver++(2M) on the linear/cosine beta schedule, but the de-facto
+      default of most diffusion UIs (Karras sigma spacing + the stochastic
+      Euler-ancestral step) is absent. Add the Karras sigma rescaling (rho=7 spacing
+      between sigma_min/sigma_max) as a schedule option and an Euler-ancestral
+      sampler step (deterministic Euler drift + per-step ancestral noise injection),
+      both reusing the existing TNNetDenoiseCallback interface. Small, self-contained,
+      and a real quality/few-step-sampling lift for every diffusion example and the
+      tracked PixArt/LatentTextToImage importers. Verify a 20-step Karras+Euler-a run
+      on DiffusionMNIST matches the existing DDIM FID within tolerance.
 - [ ] Cohere real-checkpoint slicer follow-up (BuildCohereFromSafeTensors[Ex]
       for cohere + cohere2 LANDED on a dedicated parallel-residual builder,
       parity 3.96e-7/2.15e-7 vs HF float64 against SYNTHETIC config-faithful
