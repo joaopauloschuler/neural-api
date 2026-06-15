@@ -312,28 +312,6 @@ rather than acted on.
       prompt + single mask output to keep the decoder small. Pico parity vs HF
       float64 on the encoder embedding first (decoder is the stretch); demo:
       examples/SegmentAnything segments an object from one click on a tiny image.
-- [X] Monocular depth importer (DPT / Depth-Anything, e.g. Intel/dpt-hybrid-midas
-      or depth-anything/Depth-Anything-V2-Small) — first DENSE-REGRESSION vision
-      importer (per-pixel depth, not classification). ViT/DINOv2 backbone (both
-      already importable) + the DPT reassemble/fusion neck (4 hooked stages ->
-      transpose-conv resample -> RefineNet-style additive fusion -> head). Reuses
-      the ViT encoder path; the new code is the convolutional fusion decoder.
-      Pico parity vs HF float64 + a real-image relative-depth sanity check;
-      demo: examples/DepthEstimation writes a depth map for one CPU image.
-      DONE (this commit): BuildDPTFromSafeTensors[Ex]/(file overload) +
-      TDPTConfig + ReadDPTConfigFromJSONFile + DPTConfigToString in
-      neuralpretrained.pas (depth_anything DINOv2 backbone tapped at 4 stages w/
-      shared final LN; reassemble = 1x1 proj + ConvTranspose-as-PixelShuffle up /
-      3x3 stride-2 down; bias-free neck convs; pre-act residual RefineNet fusion;
-      3-conv head). New layer TNNetBilinearResize (absolute-target bilinear resize
-      w/ align_corners True/False) in neuralnetwork.pas; PixelShuffle reused.
-      Tests TestDPTConfigFromJSONFile + TestDPTDepthEstimationParity (max |diff|
-      ~1.5e-8 < 1e-4 vs transformers float64); fixtures tests/fixtures/tiny_dpt.*
-      (gen tools/make_pico_dpt_fixture.py); demo examples/DepthEstimation.
-      Follow-ups: dpt-hybrid (ViT-hybrid ResNet stem + readout-project reassemble)
-      and metric-depth (Sigmoid head) paths are wired in code but only the
-      depth_anything/relative DINOv2 path is parity-tested; a real-checkpoint
-      relative-depth sanity check on Depth-Anything-V2-Small is still open.
 - [ ] Real-ESRGAN / ESRGAN importer follow-ups (BuildRRDBNet[FromSafeTensors][Ex]
       + TRRDBNetConfig LANDED in neuralpretrained.pas; RRDBNet x4 with
       NEAREST-interpolate conv upsampling via TNNetDeMaxPool(2), parametrized
@@ -378,20 +356,6 @@ rather than acted on.
       offline here); (b) expose LPIPS as a backprop TRAINING LOSS head so the SR
       examples can opt into perceptual fine-tuning (the VGG build already enables
       input/error collection, so the gradient path exists).
-- [X] Pix2Pix conditional image-to-image translation example (examples/Pix2Pix) —
-      DONE: U-Net generator (TNNet.AddUNet) + PatchGAN discriminator, L1+adversarial
-      loss, synthetic grayscale->color task; smoke run drives held-out L1 0.69->0.13,
-      colorAcc->0.88 in ~3.5 min CPU. No new layer class. (Original task below.)
-      the repo's only GAN (VisualGAN) is UNCONDITIONAL (noise -> CIFAR image); there
-      is no PAIRED image-to-image translation. Train a conditional GAN that maps an
-      input image to an output image (edges->shapes, grayscale->color, or a synthetic
-      mask->image task on CPU): a U-Net generator (reuses the landed TNNet.AddUNet)
-      conditioned on the input image, an L1 reconstruction term + adversarial loss,
-      and a PatchGAN discriminator (a small fully-convolutional net scoring NxN
-      overlapping patches as real/fake instead of one global logit — a builder /
-      thin example head, NOT a new leaf class). Isola et al. 2017; foundational
-      conditional-generation recipe distinct from the unconditional VisualGAN and the
-      diffusion examples. Edit examples/README.md.
 - [ ] DETR object-detection importer (BuildDetrFromSafeTensors,
       facebook/detr-resnet-50) — the FIRST object-detection importer, a wholly new
       CV vertical (bounding boxes + class per box, not a single label / dense map).
@@ -419,52 +383,6 @@ rather than acted on.
       upsample), and DFL box decoding; NMS is a small CPU post-process. Pico parity
       vs an ultralytics float64 oracle on the head outputs + an examples/YoloDetect
       that draws boxes on one CPU image. Reuses the conv-BN-fold loader path.
-- [X] SegFormer semantic-segmentation importer (nvidia/segformer-b0-finetuned-ade)
-      — DONE (commit 6048520): BuildSegformerFromSafeTensors + new TNNetBilinearUpsample
-      layer, all-MLP decode head, examples/SemanticSegmentation, pico parity
-      TestSegformerSemanticSegmentationParity < 1e-4 vs HF float64. (Original task below.)
-      — the FIRST dense semantic-segmentation importer (per-pixel class map), the
-      vertical explicitly flagged as "unblocked" by the hierarchical backbone work.
-      Two pieces: (a) the MiT (Mix Transformer) hierarchical encoder — overlap-patch
-      embeddings + efficient-attention with spatial-reduction (sequence-reduction
-      ratio sr) + Mix-FFN (depthwise 3x3 inside the FFN, no positional embedding);
-      (b) the lightweight all-MLP decode head (project each of the 4 stages to a
-      common dim, upsample, concat, fuse, 1x1 to num_classes). Pico parity vs HF
-      float64 + an examples/SemanticSegmentation that colors a tiny CPU image.
-- [X] ViTPose human-pose keypoint-estimation importer (BuildViTPoseFromSafeTensors,
-      e.g. usyd-community/vitpose-base-simple) — the FIRST keypoint/pose vertical, a
-      new output modality (per-joint 2-D heatmaps, not a class label, a box, or a
-      dense class map). Top-down single-person recipe: the landed ViT backbone
-      (BuildViTFromSafeTensors / BuildClipVisionTower path) over the cropped person
-      image -> a tiny deconvolution head (2 transpose-conv upsample stages, reuse
-      TNNetDeconvolution / TNNetDeMaxPool) -> one HxW heatmap per joint -> argmax
-      decode to (x, y) keypoint coordinates on the CPU. The only genuinely new code
-      is the deconv heatmap head + the spatial-argmax-to-coordinate decode (NOT a
-      new layer). Pico parity vs HF float64 on the heatmaps + an examples/PoseEstimation
-      that draws a 17-keypoint COCO skeleton on one CPU image. Reuses the ViT path and
-      the vision preprocessing helper; distinct from classification / detection /
-      segmentation outputs already tracked.
-      DONE (this commit): BuildViTPoseFromSafeTensors[Ex] + TViTPoseConfig +
-      ReadViTPoseConfigFromJSONFile + ViTPoseConfigToString + DecodeViTPoseKeypoints in
-      neuralpretrained.pas (model_type vitpose / vitpose_backbone). The "simple"
-      decoder head is the actual usyd-community/vitpose-base-simple head (ReLU ->
-      bilinear-upsample-by-scale_factor [reused TNNetBilinearUpsample, align_corners=
-      False] -> 3x3 conv to num_labels heatmaps), NOT a 2-stage deconv — the simple
-      checkpoint has a single upsample, so no new deconv layer was needed. ViT backbone
-      reused via AddClipEncoderBlock (separate biased q/k/v); two ViTPose quirks
-      reproduced: hardcoded patch-conv padding=2, and NO cls token (each patch gets
-      position_embeddings[1:] + broadcast [:1]). Argmax decode is a plain CPU helper.
-      Tests: TestViTPoseConfigFromJSONFile, TestViTPosePoseEstimationParity (max |diff|
-      < 1e-4 vs HF float64 over the whole heatmap stack), TestViTPoseKeypointDecode
-      (argmax (x,y) peaks match the oracle). Fixture tools/make_pico_vitpose_fixture.py
-      (48KB tiny_vitpose.safetensors + config/io json). examples/PoseEstimation demo.
-      Remaining sub-tasks (scoped out): (a) the ViTPose "classic" multi-stage
-      DECONV head (vitpose-base, not -simple: 2x ConvTranspose2d + BN + ReLU) — only
-      the simple single-upsample head is wired; (b) MoE backbone (num_experts > 1,
-      dataset_index routing) is rejected; (c) the COCO 17-keypoint skeleton EDGE
-      rendering / detector-box preprocessing + sub-pixel (DARK) heatmap refinement are
-      not implemented (the demo draws per-joint argmax peaks, no skeleton edges);
-      (d) BuildFromPretrained auto-dispatch wiring for model_type vitpose.
 - [ ] RAFT optical-flow importer (BuildRaftFromSafeTensors, e.g. princeton-vl/raft or
       the torchvision raft_small weights) — the FIRST optical-flow vertical and the
       first model with a TWO-image input producing a dense 2-channel (dx, dy) motion
@@ -480,7 +398,7 @@ rather than acted on.
       flow + an examples/OpticalFlow that warps one tiny frame toward the next and
       writes a color-coded flow map. Unblocks video-stabilization / frame-interp work.
 - [ ] Image inpainting example (examples/Inpainting) — the repo has unconditional
-      (VisualGAN) and, once landed, paired (tracked Pix2Pix) image translation, but
+      (VisualGAN) and paired (Pix2Pix) image translation, but
       NO free-form mask completion (fill a hole in an image from its surroundings).
       Train a small context-encoder / partial-convolution U-Net that takes a masked
       image + binary mask and reconstructs the missing region, supervised by
@@ -902,7 +820,7 @@ rather than acted on.
 
 - [ ] StyleGAN2 generator importer (BuildStyleGAN2Generator, e.g. a small
       stylegan2-ffhq / a config-faithful pico) — the repo's only GANs are the
-      UNCONDITIONAL VisualGAN (noise -> CIFAR) and the tracked Pix2Pix conditional
+      UNCONDITIONAL VisualGAN (noise -> CIFAR) and the landed Pix2Pix conditional
       translation; there is no STYLE-BASED synthesis import and no way to run a real
       pretrained GAN generator. The genuinely new primitive is the MODULATED /
       DEMODULATED convolution (per-layer style vector scales the conv weights, then a
