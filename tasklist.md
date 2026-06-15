@@ -943,8 +943,11 @@ rather than acted on.
       next-token logits for a mixed image+text prompt (reuse make_pico_*_fixture.py) +
       an examples/Qwen2VLDescribe that captions a tiny image (ulimit-bounded). The
       M-RoPE index builder also unblocks Qwen2.5-VL video (the temporal section) later.
-- [ ] CLIPScore text-image-alignment metric (ComputeCLIPScore / CLIPScoreReport in
-      neuralimagemetrics.pas) — the one generative-image metric the repo is missing: FID
+- [X] CLIPScore text-image-alignment metric — LANDED in neuralpretrained.pas as
+      ClipScore / ClipScoreFromEmbeddings / RefCLIPScore (w=2.5 rescale, harmonic-mean
+      RefCLIPScore) reusing BuildClipFromSafeTensors, plus examples/ClipScore demo.
+      (Original entry placed it in neuralimagemetrics.pas; implemented alongside the
+      CLIP importer instead.) FID
       / Inception Score / KID (all landed) measure sample QUALITY and DIVERSITY but NONE
       measure whether a generated image actually MATCHES its text prompt (prompt
       faithfulness), which is the headline eval for every text-to-image model the tree
