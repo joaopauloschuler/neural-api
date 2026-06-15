@@ -1063,7 +1063,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
 
 ## Lucky-day additions 2026-06-14 (CV / generative / imports)
 
-- [ ] CycleGAN unpaired image-to-image translation example
+- [X] CycleGAN unpaired image-to-image translation example
       (examples/CycleGAN) — the GENERATIVE-CV gap left by the landed Pix2Pix
       (which is PAIRED supervised). CycleGAN learns two generators G:A->B and
       F:B->A plus two PatchGAN discriminators with a CYCLE-CONSISTENCY loss
