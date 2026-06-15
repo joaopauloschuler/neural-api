@@ -375,6 +375,8 @@ type
     procedure TestDiTConfigFromJSONFile;
     procedure TestDiTParity;
     procedure TestDiTSchedulerSmoke;
+    procedure TestVARConfigFromJSONFile;
+    procedure TestVARParity;
     procedure TestPixArtConfigFromJSONFile;
     procedure TestPixArtParity;
     procedure TestMMDiTConfigFromJSONFile;
@@ -17385,6 +17387,117 @@ begin
     Eps.Free;
     Latent.Free;
     Scheduler.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestVARConfigFromJSONFile;
+var
+  Config: TVARConfig;
+begin
+  Config := ReadVARConfigFromJSONFile(FixturePath('tiny_var_config.json'));
+  AssertEquals('hidden', 16, Config.HiddenSize);
+  AssertEquals('depth', 2, Config.NumLayers);
+  AssertEquals('heads', 2, Config.NumHeads);
+  AssertEquals('vocab', 12, Config.VocabSize);
+  AssertEquals('classes', 5, Config.NumClasses);
+  AssertEquals('scales', 3, Config.NumScales);
+  AssertEquals('patch0', 1, Config.PatchNums[0]);
+  AssertEquals('patch1', 2, Config.PatchNums[1]);
+  AssertEquals('patch2', 3, Config.PatchNums[2]);
+  AssertEquals('seq_len', 14, Config.SeqLen);  // 1 + 4 + 9
+end;
+
+// Parity test for the class-conditional VAR importer (BuildVARFromSafeTensors)
+// against the committed tiny float64 numpy oracle (tools/make_pico_var_fixture
+// .py: hidden 16, depth 2, heads 2, vocab 12, 5 classes, pyramid [1,2,3] ->
+// 14 flattened tokens). FoundationVision/var is NOT installed; the oracle
+// re-implements the canonical VAR transformer forward (next-scale word+level+
+// pos embedding, single class token AdaLN-Zero conditioning, the SCALE-BLOCK-
+// CAUSAL attention mask, the final adaLN logits head). Exercises the new
+// TNNetScaledDotProductAttention.BlockCausalSegments scale-block-causal mask
+// (every token attends to all tokens at its own + earlier scales, none later),
+// the DiT-style FiLM adaLN modulation and per-channel gate, gelu_tanh FFN, and
+// the per-token logits head. Asserts < 1e-4 on EVERY scale's logits (the v1
+// next-scale-prediction parity). Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestVARParity;
+var
+  NN, Cloned: TNNet;
+  Config: TVARConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, OneCase, IdxArr, LogitsArr: TJSONArray;
+  CaseObj: TJSONObject;
+  TokInput, Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  y, CaseCnt, pos, v, FlatIdx: integer;
+  AnyBlockCausal: boolean;
+begin
+  RandSeed := 424242;
+  NN := BuildVARFromSafeTensors(FixturePath('tiny_var.safetensors'), Config,
+    {pInferenceOnly=}false, FixturePath('tiny_var_config.json'));
+  RefJson := TStringList.Create;
+  TokInput := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  try
+    AssertTrue('net built', NN <> nil);
+    // Fill the static per-token scale-id side channel (drives the mask + lvl_embed).
+    VARFillScaleIds(NN, Config);
+    RefJson.LoadFromFile(FixturePath('tiny_var_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      IdxArr := TJSONArray(CaseObj.Find('idx'));      // (SeqLen,) token indices
+      LogitsArr := TJSONArray(CaseObj.Find('logits'));// flat (SeqLen, vocab)
+      y := CaseObj.Get('y', 0);
+      // input0: token index sequence (SeqLen,1,1).
+      TokInput.ReSize(Config.SeqLen, 1, 1);
+      for pos := 0 to Config.SeqLen - 1 do
+        TokInput.FData[pos] := IdxArr.Items[pos].AsInteger;
+      // input2: class id (1,1,1) - the net's THIRD TNNetInput.
+      VARClassInput(NN).Output.FData[0] := y;
+      // Re-fill the scale ids each case (Compute may resize buffers).
+      VARFillScaleIds(NN, Config);
+      NN.Compute(TokInput);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('logits seq', Config.SeqLen, Output.SizeX);
+      AssertEquals('logits vocab', Config.VocabSize, Output.Depth);
+      for pos := 0 to Config.SeqLen - 1 do
+        for v := 0 to Config.VocabSize - 1 do
+        begin
+          FlatIdx := pos * Config.VocabSize + v;
+          RefVal := LogitsArr.Items[FlatIdx].AsFloat;
+          GotVal := Output.FData[pos * Config.VocabSize + v];
+          Diff := Abs(GotVal - RefVal);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+    end;
+    AssertTrue('VAR logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    // The scale-block-causal flag must round-trip through Save/Load (Clone goes
+    // through SaveToString/LoadFromString): the cloned SDPA leaves must still
+    // carry BlockCausalSegments=true and a segment source.
+    Cloned := NN.Clone();
+    try
+      AnyBlockCausal := false;
+      for pos := 0 to Cloned.CountLayers() - 1 do
+        if (Cloned.Layers[pos] is TNNetScaledDotProductAttention) and
+           TNNetScaledDotProductAttention(Cloned.Layers[pos]).BlockCausalSegments
+        then
+          AnyBlockCausal := true;
+      AssertTrue('cloned net keeps scale-block-causal SDPA leaves',
+        AnyBlockCausal);
+    finally
+      Cloned.Free;
+    end;
+  finally
+    RefRoot.Free;
+    TokInput.Free;
+    RefJson.Free;
     NN.Free;
   end;
 end;

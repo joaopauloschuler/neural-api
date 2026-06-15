@@ -2780,6 +2780,20 @@ type
     // (or TNNet.SetAttentionPrefixLen); it is a transient runtime knob, so it is
     // NOT written by SaveStructureToString. Coded by Claude (AI).
     FPrefixLen: integer;
+    // Optional SCALE-BLOCK-CAUSAL reinterpretation of the segment side channel
+    // (VAR / next-scale prediction). OFF by default (FBlockCausalSeg = false):
+    // the segment ids mask by EQUALITY (seg[i] = seg[j], document/block-diagonal).
+    // When set true (requires FSegLayer) the ids are read as a MONOTONE scale
+    // index per token and the comparison becomes ORDERED: query i may attend key
+    // j iff seg[j] <= seg[i]. Because VAR flattens the multi-scale token pyramid
+    // scale-by-scale (1x1, 2x2, ... contiguous blocks of increasing resolution),
+    // tagging each token with its scale index and using this ordered rule gives
+    // EXACTLY the scale-block-causal mask: every token attends to all tokens at
+    // its own scale and every earlier scale, and none at later scales (full
+    // attention within and across earlier blocks - the GPT-style causal mask at
+    // scale-BLOCK granularity rather than per-token). Serialized in FStruct[4]
+    // (old saved models load with 0 = equality, bit-identical). Coded by Claude (AI).
+    FBlockCausalSeg: boolean;
     FAttn: TNNetVolume; // attention weights [SizeX=key, SizeY=query, 1]
     // --- KV-cache incremental-decode state (inference only, not serialized) ---
     FCacheEnabled: boolean;
@@ -2831,6 +2845,7 @@ type
     procedure DequantizeCacheRow(const Codes: array of ShortInt;
       const Scale: array of TNeuralFloat; Slot: integer; Dst: TNeuralFloatArrPtr);
     procedure ComputeIncremental();
+    procedure SetBlockCausalSeg(pValue: boolean);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     // pWindow = 0 (default) keeps the original full-attention behavior.
@@ -2988,6 +3003,11 @@ type
     property BidirectionalWindow: boolean read FBidirectionalWindow;
     property ScoreSoftCap: TNeuralFloat read FScoreSoftCap;
     property SegmentSource: TNNetLayer read FSegLayer;
+    // Scale-block-causal reinterpretation of the segment side channel (VAR).
+    // false (default) = equality/document mask; true = ordered seg[j] <= seg[i]
+    // (requires a segment source). Serialized in FStruct[4].
+    property BlockCausalSegments: boolean
+      read FBlockCausalSeg write SetBlockCausalSeg;
     // Prefix-LM bidirectional block length (0 = off; transient, not serialized).
     property PrefixLen: integer read FPrefixLen write FPrefixLen;
     property CacheEnabled: boolean read FCacheEnabled;
@@ -23581,6 +23601,7 @@ begin
   FScoreSoftCap := pScoreSoftCap;
   FSegLayer := pSegmentSource;
   FPrefixLen := 0; // prefix-LM bidirectional block off by default
+  FBlockCausalSeg := false; // segment ids mask by equality by default
   if FDk < 1 then
     FErrorProc('TNNetScaledDotProductAttention requires d_k >= 1. d_k=' + IntToStr(FDk));
   if FWindow < 0 then
@@ -23602,6 +23623,7 @@ begin
   if FCausal then FStruct[1] := 1 else FStruct[1] := 0;
   FStruct[2] := FWindow;
   if FBidirectionalWindow then FStruct[3] := 1 else FStruct[3] := 0;
+  if FBlockCausalSeg then FStruct[4] := 1 else FStruct[4] := 0;
   FFloatSt[0] := FScoreSoftCap;
   FAttn := TNNetVolume.Create();
   if Assigned(FSegLayer) then
@@ -23612,6 +23634,15 @@ begin
     // reference-counting balance (same convention as TNNetCrossAttention).
     FSegLayer.IncDepartingBranchesCnt();
   end;
+end;
+
+procedure TNNetScaledDotProductAttention.SetBlockCausalSeg(pValue: boolean);
+begin
+  if pValue and (not Assigned(FSegLayer)) then
+    FErrorProc('TNNetScaledDotProductAttention.BlockCausalSegments requires a ' +
+      'segment (scale-id) source layer.');
+  FBlockCausalSeg := pValue;
+  if FBlockCausalSeg then FStruct[4] := 1 else FStruct[4] := 0;
 end;
 
 destructor TNNetScaledDotProductAttention.Destroy();
@@ -24101,7 +24132,8 @@ begin
             not ((FPrefixLen > 0) and (i < FPrefixLen) and (j < FPrefixLen))) or
          ((FWindow > 0) and ((i - j >= FWindow) or
           (FBidirectionalWindow and (j - i >= FWindow)))) or
-         (HasSeg and (Round(Seg[j, 0, 0]) <> SegI)) then
+         (HasSeg and (not FBlockCausalSeg) and (Round(Seg[j, 0, 0]) <> SegI)) or
+         (HasSeg and FBlockCausalSeg and (Round(Seg[j, 0, 0]) > SegI)) then
       begin
         // Masked: strict future (causal) - EXCEPT when both query and key are in
         // the prefix-LM bidirectional block ([0..FPrefixLen-1] attend to each
@@ -91841,6 +91873,11 @@ begin
   begin
     FErrorProc('Error loading CreateLayer:'+strData+' has '+IntToStr(S.Count)+' parameters.');
   end;
+  // Restore the VAR scale-block-causal flag (FStruct[4]) for SDPA when present.
+  if Assigned(Result) and (Result is TNNetScaledDotProductAttention) and
+     (St[4] = 1) and
+     Assigned(TNNetScaledDotProductAttention(Result).SegmentSource) then
+    TNNetScaledDotProductAttention(Result).BlockCausalSegments := true;
   S2.Free;
   S.Free;
 end;

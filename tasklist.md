@@ -1045,22 +1045,36 @@ rather than acted on.
       examples/TextToVideo that writes a short animated GIF/PPM sequence on CPU once the
       base UNet lands. Note: the cheaper no-UNet route to video is bolting the same
       temporal block onto the landed PixArt DiT — worth scoping if SD UNet stays blocked.
-- [ ] VAR (Visual AutoRegressive, next-SCALE prediction) image generation importer
-      (`BuildVARFromSafeTensors[Ex]`, e.g. `FoundationVision/var`) + an
-      examples/VARGenerate demo — a fundamentally DIFFERENT generative paradigm from
-      every landed image generator (diffusion DiT/PixArt, GAN, MaskGIT's masked
-      parallel decode): VAR predicts a coarse-to-fine pyramid of token maps, one
-      whole RESOLUTION at a time, with a GPT-style causal transformer over the
-      flattened multi-scale token sequence. The image priority and a clean reuse of
-      landed parts: the multi-scale VQ tokenizer is the landed `BuildVqModelFromSafeTensors`
-      family (residual quantization over scales) and the backbone is a standard
-      pre-norm causal transformer (landed). The genuinely new code is (a) the
-      next-scale embedding/interpolation between pyramid levels, (b) the AdaLN-style
-      class-conditioning (single class token, like DiT's timestep cond), and (c) the
-      scale-block-causal attention mask (tokens attend to all earlier scales + their
-      own scale). Scope v1 to class-conditional 256px generation from a committed
-      pico fixture; defer the text-conditioned (Infinity-style) variant. Pico parity
-      vs a torch float64 oracle on one scale's logits.
+- [X] VAR (Visual AutoRegressive, next-SCALE prediction) image generation importer —
+      class-conditional v1 LANDED. `BuildVARFromSafeTensors[Ex]` +
+      `ReadVARConfigFromJSONFile` / `TVARConfig` in neuralpretrained.pas builds the
+      GPT-style transformer over the flattened multi-scale token sequence, reusing the
+      landed DiT adaLN-Zero block recipe (DiTModCond / TNNetFiLM modulation + per-channel
+      gate). The three genuinely-new pieces are all expressed by composition + ONE tiny
+      SDPA flag: (a) next-scale embedding x = word_embed[idx] + lvl_embed[scale] +
+      pos_embed (one learnable level vector per pyramid level), (b) AdaLN single-class-
+      token conditioning (class_emb, the DiT timestep-cond pattern), (c) the
+      scale-block-causal mask via the NEW
+      `TNNetScaledDotProductAttention.BlockCausalSegments` flag — it reinterprets the
+      existing per-token segment side channel as a MONOTONE scale id with ordered
+      seg[j] <= seg[i] (vs the default equality/document mask), threaded into every
+      per-head SDPA leaf as the per-token scale id (VARFillScaleIds). Pico parity test
+      TestVARParity asserts < 1e-4 on EVERY scale's logits vs a self-contained torch/
+      numpy float64 oracle (FoundationVision/var not installed); committed pico fixture
+      tiny_var.* + generator tools/make_pico_var_fixture.py (hidden 16, depth 2, heads 2,
+      vocab 12, 5 classes, pyramid [1,2,3] -> 14 flattened tokens). Open follow-ups:
+  - [ ] VAR full multi-scale autoregressive SAMPLING loop (next-scale interpolation/
+        up-sampling between predicted levels + residual-VQ decode to pixels via the
+        landed BuildVqModelFromSafeTensors family) + an examples/VARGenerate demo. v1
+        only runs the forward producing one scale's logits; the coarse-to-fine
+        generation loop and pixel decode are deferred.
+  - [ ] VAR text-conditioned (Infinity-style) variant — replace the single class token
+        with caller-supplied text encoder states + cross-attention (the PixArt-style
+        text-cond path), the analogue of the DiT->PixArt step.
+  - [ ] VAR real-checkpoint parity (FoundationVision/var) — v1 parity is vs a
+        first-principles float64 oracle on a random pico config; verify against a sliced
+        real checkpoint once weights are available (the make_pico_*_fixture slicer
+        pattern).
 - [ ] Diffusion INPAINTING example (examples/ImageToImage --inpaint, or a sibling) — the
       one-flag follow-up unblocked by the landed SDEdit examples/ImageToImage driver: reuse
       the exact same encode->partial-noise->denoise->decode pipeline but, BEFORE each

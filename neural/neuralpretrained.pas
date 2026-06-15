@@ -7656,6 +7656,109 @@ procedure DiTDenoise(Net: TNNet; const Config: TDiTConfig;
   Latent: TNNetVolume; t: TNeuralFloat; ClassId: integer; EpsOut: TNNetVolume);
 
 // ===========================================================================
+// VAR IMPORT (Visual AutoRegressive modeling via NEXT-SCALE prediction, Tian
+// et al. 2024, "Visual Autoregressive Modeling: Scalable Image Generation via
+// Next-Scale Prediction", arXiv:2404.02905 - FoundationVision/var). VAR is a
+// fundamentally DIFFERENT generative paradigm from the landed diffusion (DiT/
+// PixArt) and masked-parallel (MaskGIT) image generators: it predicts a
+// COARSE-TO-FINE pyramid of token maps, ONE WHOLE RESOLUTION at a time, with a
+// GPT-style causal transformer over the flattened multi-scale token sequence.
+//
+// v1 SCOPE (class-conditional 256px, the clean recipe). The genuinely NEW code
+// over the landed parts is THREE pieces, all expressed by COMPOSITION + a tiny
+// SDPA mask flag (no heavy new leaf layer):
+//
+//   (a) NEXT-SCALE EMBEDDING. The flattened input sequence is the concatenation
+//       of the per-scale token maps at increasing resolution (1x1, 2x2, ... up
+//       to the final PatchNums[K-1] x PatchNums[K-1] grid). Each token carries
+//       its codebook EMBEDDING (word_embed) PLUS a per-scale LEVEL embedding
+//       (lvl_embed, one learnable vector per pyramid level, broadcast to every
+//       token of that level) PLUS an absolute position embedding (pos_1LC, one
+//       row per flattened position). The VQ tokenizer that PRODUCES the
+//       multi-scale code indices (residual quantization over scales) is the
+//       landed BuildVqModelFromSafeTensors family and is NOT re-implemented
+//       here; this importer consumes the already-tokenized + embedded sequence
+//       (caller fills the embeddings, OR the net embeds caller-supplied indices
+//       via the word_embed table - see BuildVAR's input contract).
+//   (b) AdaLN CLASS CONDITIONING. A SINGLE class token (like DiT's timestep
+//       cond) is embedded (class_emb) into a (1,1,d) conditioning vector c that
+//       AdaLN-modulates every transformer block - the SAME adaLN-Zero recipe as
+//       the landed DiT (DiTModCond / TNNetFiLM(LN(x), gamma|beta) + per-channel
+//       gate). v1 uses the DiT 6-chunk shared-per-block layout for clean reuse.
+//   (c) SCALE-BLOCK-CAUSAL ATTENTION MASK. A token at scale s attends to ALL
+//       tokens at scales <= s (full attention within and across earlier scales,
+//       none to later scales). This is the GPT causal mask at scale-BLOCK
+//       granularity. It is supplied as the per-token SCALE-ID side channel to
+//       every per-head SDPA leaf with the new TNNetScaledDotProductAttention
+//       .BlockCausalSegments flag (ordered seg[j] <= seg[i], vs the default
+//       equality/document mask). See neuralnetwork.pas.
+//
+// The backbone is otherwise a standard pre-norm transformer (landed builders).
+// DEFERRED follow-ups (left [ ] in tasklist): the text-conditioned Infinity
+// variant, the full multi-scale autoregressive SAMPLING loop (next-scale
+// interpolation/up-sampling between predicted levels + VQ decode to pixels),
+// and real-checkpoint parity. v1's parity is on ONE scale's logits vs a torch
+// float64 oracle. Coded by Claude (AI).
+type
+  TVARConfig = record
+    HiddenSize: integer;        // transformer width (C / embed_dim)
+    NumLayers: integer;         // depth (number of transformer blocks)
+    NumHeads: integer;          // num_heads
+    MlpRatio: integer;          // mlp_ratio (4) -> ffn hidden = ratio*hidden
+    VocabSize: integer;         // codebook size V (word_embed rows / head cols)
+    NumClasses: integer;        // class label table rows (class_emb)
+    NumScales: integer;         // number of pyramid levels K
+    PatchNums: array of integer;// per-scale grid side (PatchNums[s] x PatchNums[s])
+    SeqLen: integer;            // sum_s PatchNums[s]^2 (flattened length)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-6)
+    ModelType: string;          // 'VAR'
+  end;
+
+// Reads a VAR config.json. Required: hidden_size (or C/embed_dim), depth,
+// num_heads, vocab_size, num_classes, patch_nums (the list of per-scale grid
+// sides). Optional: mlp_ratio (4), layer_norm_eps (1e-6). SeqLen / NumScales
+// are derived from patch_nums.
+function ReadVARConfigFromJSONFile(const FileName: string): TVARConfig;
+
+function VARConfigToString(const Config: TVARConfig): string;
+
+// Builds the class-conditional VAR backbone described by Config and loads every
+// weight from Reader (caller owns Reader). The net has THREE inputs:
+//   input0: the token INDEX sequence (SeqLen,1,1), each value a codebook id in
+//           [0,VocabSize) (the multi-scale tokens flattened scale-by-scale).
+//   input1: the per-token SCALE-ID side channel (SeqLen,1,1), value = the
+//           pyramid level index of each token (drives the scale-block-causal
+//           mask). Fill with VARFillScaleIds.
+//   input2: the class id (1,1,1) in [0,NumClasses) (the single class token).
+// Output: per-token logits (SeqLen,1,VocabSize) - the next-scale-prediction
+// head. v1 reads ONE scale's logits for parity (VARScaleLogits).
+function BuildVAR(Reader: TNNetSafeTensorsReader; const Config: TVARConfig;
+  pInferenceOnly: boolean = false): TNNet;
+
+function BuildVARFromSafeTensorsEx(const FileName: string;
+  const Config: TVARConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildVARFromSafeTensors(const FileName: string;
+  out Config: TVARConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// Fills input1 (the scale-id side channel) with the per-token pyramid level
+// index derived from Config.PatchNums (PatchNums[0]^2 zeros, PatchNums[1]^2
+// ones, ...). Call once after building the net (the ids are static for a fixed
+// pyramid). Returns the byte offset (token index) where scale ScaleId starts.
+procedure VARFillScaleIds(Net: TNNet; const Config: TVARConfig);
+
+// First flattened token index of pyramid level ScaleId (sum of earlier scales'
+// token counts); ScaleId = NumScales returns SeqLen.
+function VARScaleStart(const Config: TVARConfig; ScaleId: integer): integer;
+
+// The VAR net's three inputs: input0 the token-index sequence (SeqLen,1,1),
+// input1 the scale-id side channel (SeqLen,1,1), input2 the class id (1,1,1).
+function VARTokenInput(Net: TNNet): TNNetLayer;
+function VARScaleInput(Net: TNNet): TNNetLayer;
+function VARClassInput(Net: TNNet): TNNetLayer;
+
+// ===========================================================================
 // PixArt-alpha IMPORT (text-conditioned Diffusion Transformer, Chen et al.
 // 2023, "PixArt-alpha: Fast Training of Diffusion Transformer for
 // Photorealistic Text-to-Image Synthesis", arXiv:2310.00426 - the diffusers
@@ -55016,6 +55119,320 @@ begin
     for y := 0 to Config.LatentSize - 1 do
       for c := 0 to Config.InChannels - 1 do
         EpsOut[x, y, c] := Output[x, y, c];
+end;
+
+// ============================ VAR IMPORT ===================================
+// Coded by Claude (AI).
+
+function ReadVARConfigFromJSONFile(const FileName: string): TVARConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  PatchArr: TJSONArray;
+  i: integer;
+begin
+  FillChar(Result, SizeOf(Result), 0);
+  Result.MlpRatio := 4;
+  Result.LayerNormEps := 1e-6;
+  Result.ModelType := 'VAR';
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('VAR import: ' + FileName + ' is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.HiddenSize := Obj.Get('hidden_size', 0);
+    if Result.HiddenSize = 0 then Result.HiddenSize := Obj.Get('C', 0);
+    if Result.HiddenSize = 0 then Result.HiddenSize := Obj.Get('embed_dim', 0);
+    Result.NumLayers := Obj.Get('depth', 0);
+    Result.NumHeads := Obj.Get('num_heads', 0);
+    Result.MlpRatio := Obj.Get('mlp_ratio', Result.MlpRatio);
+    Result.VocabSize := Obj.Get('vocab_size', 0);
+    Result.NumClasses := Obj.Get('num_classes', 0);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', double(Result.LayerNormEps));
+    if Obj.Find('_class_name') <> nil then
+      Result.ModelType := Obj.Get('_class_name', Result.ModelType);
+    PatchArr := TJSONArray(Obj.Find('patch_nums'));
+    if (PatchArr = nil) or (PatchArr.Count < 1) then
+      ImportError('VAR import: ' + FileName + ' missing "patch_nums" (the ' +
+        'per-scale grid sides).');
+    Result.NumScales := PatchArr.Count;
+    SetLength(Result.PatchNums, Result.NumScales);
+    Result.SeqLen := 0;
+    for i := 0 to Result.NumScales - 1 do
+    begin
+      Result.PatchNums[i] := PatchArr.Items[i].AsInteger;
+      if Result.PatchNums[i] < 1 then
+        ImportError('VAR import: patch_nums[' + IntToStr(i) + '] must be >= 1.');
+      Result.SeqLen := Result.SeqLen + Result.PatchNums[i] * Result.PatchNums[i];
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  if (Result.HiddenSize <= 0) or (Result.NumLayers <= 0) or
+     (Result.NumHeads <= 0) or (Result.VocabSize <= 0) or
+     (Result.NumClasses <= 0) then
+    ImportError('VAR import: ' + FileName + ' is missing one of the required ' +
+      'keys hidden_size/depth/num_heads/vocab_size/num_classes.');
+  if (Result.HiddenSize mod Result.NumHeads) <> 0 then
+    ImportError('VAR import: hidden_size=' + IntToStr(Result.HiddenSize) +
+      ' not divisible by num_heads=' + IntToStr(Result.NumHeads) + '.');
+end;
+
+function VARConfigToString(const Config: TVARConfig): string;
+var
+  i: integer;
+  Pyramid: string;
+begin
+  Pyramid := '';
+  for i := 0 to Config.NumScales - 1 do
+  begin
+    if i > 0 then Pyramid := Pyramid + ',';
+    Pyramid := Pyramid + IntToStr(Config.PatchNums[i]);
+  end;
+  Result := Config.ModelType + ' config: d=' + IntToStr(Config.HiddenSize) +
+    ', depth=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', mlp_ratio=' + IntToStr(Config.MlpRatio) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', classes=' + IntToStr(Config.NumClasses) +
+    ', scales=[' + Pyramid + ']' +
+    ', seq_len=' + IntToStr(Config.SeqLen);
+end;
+
+function VARScaleStart(const Config: TVARConfig; ScaleId: integer): integer;
+var
+  i: integer;
+begin
+  if (ScaleId < 0) or (ScaleId > Config.NumScales) then
+    ImportError('VAR: scale id ' + IntToStr(ScaleId) + ' out of range.');
+  Result := 0;
+  for i := 0 to ScaleId - 1 do
+    Result := Result + Config.PatchNums[i] * Config.PatchNums[i];
+end;
+
+function VARTokenInput(Net: TNNet): TNNetLayer;
+begin
+  Result := DiTNthInput(Net, 0);
+end;
+
+function VARScaleInput(Net: TNNet): TNNetLayer;
+begin
+  Result := DiTNthInput(Net, 1);
+end;
+
+function VARClassInput(Net: TNNet): TNNetLayer;
+begin
+  Result := DiTNthInput(Net, 2);
+end;
+
+procedure VARFillScaleIds(Net: TNNet; const Config: TVARConfig);
+var
+  ScaleInput: TNNetVolume;
+  s, k, Cnt, Pos: integer;
+begin
+  // input1 is the SECOND TNNetInput (scale-id side channel, (SeqLen,1,1)).
+  ScaleInput := VARScaleInput(Net).Output;
+  ScaleInput.ReSize(Config.SeqLen, 1, 1);
+  Pos := 0;
+  for s := 0 to Config.NumScales - 1 do
+  begin
+    Cnt := Config.PatchNums[s] * Config.PatchNums[s];
+    for k := 0 to Cnt - 1 do
+    begin
+      ScaleInput.FData[Pos] := s;
+      Inc(Pos);
+    end;
+  end;
+end;
+
+// One VAR transformer block. Structurally identical to the landed DiT adaLN-Zero
+// block (DiTModCond / TNNetFiLM modulation + per-channel gate, same 6-chunk
+// shared adaLN layout), EXCEPT the self-attention is SCALE-BLOCK-CAUSAL: every
+// per-head SDPA leaf is fed the per-token scale-id side channel and has its
+// BlockCausalSegments flag set, so token i (scale s) attends only to keys whose
+// scale <= s. Records the layers that need weights loaded.
+type
+  TVARBlockLayers = record
+    AdaLN: TNNetLayer;     // ada_lin / adaLN_modulation Linear (d -> 6*d)
+    QKV: TNNetLayer;       // attn.qkv (d -> 3*d)
+    AttnProj: TNNetLayer;  // attn.proj (d -> d)
+    Fc1: TNNetLayer;       // ffn.fc1 (d -> mlp_hidden)
+    Fc2: TNNetLayer;       // ffn.fc2 (mlp_hidden -> d)
+  end;
+
+function AddVARBlock(NN: TNNet; XInput, CondLayer, ScaleIdLayer: TNNetLayer;
+  const Config: TVARConfig; var Block: TVARBlockLayers;
+  pInferenceOnly: boolean): TNNetLayer;
+var
+  d, MlpHidden, i, AttnStart: integer;
+  SiluC, LN1, Mod1, FiLM1, Attn, Gate1Slice, Gated1, Res1: TNNetLayer;
+  LN2, Mod2, FiLM2, Gate2Slice, Gated2: TNNetLayer;
+  L: TNNetLayer;
+begin
+  d := Config.HiddenSize;
+  MlpHidden := Config.MlpRatio * d;
+  // adaLN_modulation: Linear(SiLU(c)) -> 6*d (shared per block, DiT layout).
+  SiluC := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
+  Block.AdaLN := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(6 * d), SiluC);
+  // ---- attention sub-block (scale-block-causal) ----
+  LN1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), XInput);
+  Mod1 := DiTModCond(NN, Block.AdaLN, {scale}1 * d, {shift}0 * d, d);
+  FiLM1 := NN.AddLayer( TNNetFiLM.Create([LN1, Mod1]) );
+  Block.QKV := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(3 * d), FiLM1);
+  AttnStart := NN.CountLayers();
+  Block.AttnProj := NN.AddMultiHeadSelfAttention(Config.NumHeads,
+    {CausalMask=}false, {UseRoPE=}false, avSDPA, 1, 0, 32, 128,
+    {QKRMSNorm=}false, {SegmentSource=}ScaleIdLayer);
+  // Flip every SDPA leaf created by the builder to scale-block-causal mode.
+  for i := AttnStart to NN.CountLayers() - 1 do
+  begin
+    L := NN.Layers[i];
+    if (L is TNNetScaledDotProductAttention) and
+       (TNNetScaledDotProductAttention(L).SegmentSource = ScaleIdLayer) then
+      TNNetScaledDotProductAttention(L).BlockCausalSegments := true;
+  end;
+  Attn := NN.GetLastLayer();
+  Gate1Slice := NN.AddLayerAfter(
+    TNNetSplitChannels.Create(2 * d, d), Block.AdaLN);
+  Gated1 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Attn, Gate1Slice) );
+  Res1 := NN.AddLayer( TNNetSum.Create([Gated1, XInput]) );
+  // ---- FFN sub-block ----
+  LN2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.LayerNormEps), Res1);
+  Mod2 := DiTModCond(NN, Block.AdaLN, {scale}4 * d, {shift}3 * d, d);
+  FiLM2 := NN.AddLayer( TNNetFiLM.Create([LN2, Mod2]) );
+  Block.Fc1 := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(MlpHidden), FiLM2);
+  NN.AddLayer( TNNetGELU.Create() );
+  Block.Fc2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(d) );
+  Gate2Slice := NN.AddLayerAfter(
+    TNNetSplitChannels.Create(5 * d, d), Block.AdaLN);
+  Gated2 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Block.Fc2, Gate2Slice) );
+  Result := NN.AddLayer( TNNetSum.Create([Gated2, Res1]) );
+  if pInferenceOnly then NN.MakeInferenceOnly();
+end;
+
+function BuildVAR(Reader: TNNetSafeTensorsReader; const Config: TVARConfig;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  TokInput, ScaleInput, ClassInput: TNNetLayer;
+  WordEmb, LvlEmb, ClassEmb, PosEmb, XLayer, CondLayer: TNNetLayer;
+  FinalSilu, FinalModLayer, FinalMod, FinalLN, FinalFiLM, HeadLin: TNNetLayer;
+  Blocks: array of TVARBlockLayers;
+  d, MlpHidden, BlockCnt: integer;
+  p: string;
+begin
+  d := Config.HiddenSize;
+  MlpHidden := Config.MlpRatio * d;
+  NN := TNNet.Create();
+  try
+    // input0: token index sequence (SeqLen,1,1) -> word_embed table -> (SeqLen,1,d)
+    TokInput := NN.AddLayer( TNNetInput.Create(Config.SeqLen, 1, 1) );
+    WordEmb := NN.AddLayer( TNNetEmbedding.Create(Config.VocabSize, d,
+      {EncodeZero=}1, {ScaleEmbedding=}1.0) );
+    // input1: per-token scale id (SeqLen,1,1). Used BOTH for the level embedding
+    // (lvl_embed table) AND the scale-block-causal attention mask side channel.
+    ScaleInput := NN.AddLayer( TNNetInput.Create(Config.SeqLen, 1, 1) );
+    LvlEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumScales, d,
+      {EncodeZero=}1, {ScaleEmbedding=}1.0) );
+    // x = word_embed + lvl_embed + pos_embed.
+    XLayer := NN.AddLayer( TNNetSum.Create([WordEmb, LvlEmb]) );
+    PosEmb := NN.AddLayer(
+      TNNetLearnedPositionalEmbedding.Create(Config.SeqLen) );
+    XLayer := PosEmb;
+    // input2: class id (1,1,1) -> class_emb -> conditioning vector c (1,1,d).
+    ClassInput := NN.AddLayer( TNNetInput.Create(1, 1, 1) );
+    ClassEmb := NN.AddLayer( TNNetEmbedding.Create(Config.NumClasses, d,
+      {EncodeZero=}1, {ScaleEmbedding=}1.0) );
+    CondLayer := ClassEmb;
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    SetLength(Blocks, Config.NumLayers);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+      XLayer := AddVARBlock(NN, XLayer, CondLayer, ScaleInput, Config,
+        Blocks[BlockCnt], pInferenceOnly);
+
+    // ---- final adaLN head -> per-token logits (SeqLen,1,VocabSize) ----
+    FinalSilu := NN.AddLayerAfter(TNNetSiLU.Create(), CondLayer);
+    FinalModLayer := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(2 * d) ); // [shift, scale]
+    FinalLN := NN.AddLayerAfter(
+      TNNetTokenLayerNorm.Create(Config.LayerNormEps), XLayer);
+    FinalMod := DiTModCond(NN, FinalModLayer, {scale}1 * d, {shift}0 * d, d);
+    FinalFiLM := NN.AddLayer( TNNetFiLM.Create([FinalLN, FinalMod]) );
+    HeadLin := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(Config.VocabSize), FinalFiLM);
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    LoadClipEmbeddingTable(Reader, WordEmb, 'word_embed.weight',
+      Config.VocabSize, d);
+    LoadClipEmbeddingTable(Reader, LvlEmb, 'lvl_embed.weight',
+      Config.NumScales, d);
+    LoadClipEmbeddingTable(Reader, ClassEmb, 'class_emb.weight',
+      Config.NumClasses, d);
+    // pos_embed buffer [SeqLen, d] -> the learned table.
+    LoadClipEmbeddingTable(Reader, PosEmb, 'pos_embed.weight',
+      Config.SeqLen, d);
+    for BlockCnt := 0 to Config.NumLayers - 1 do
+    begin
+      p := 'blocks.' + IntToStr(BlockCnt) + '.';
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AdaLN,
+        p + 'ada_lin.weight', d, 6 * d, 0, -1, 0, p + 'ada_lin.bias');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QKV,
+        p + 'attn.qkv.weight', d, 3 * d, 0, -1, 0, p + 'attn.qkv.bias');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].AttnProj,
+        p + 'attn.proj.weight', d, d, 0, -1, 0, p + 'attn.proj.bias');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc1,
+        p + 'ffn.fc1.weight', d, MlpHidden, 0, -1, 0, p + 'ffn.fc1.bias');
+      LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].Fc2,
+        p + 'ffn.fc2.weight', MlpHidden, d, 0, -1, 0, p + 'ffn.fc2.bias');
+    end;
+    LoadLlamaLinearWeights(Reader, FinalModLayer, 'head_ada_lin.weight',
+      d, 2 * d, 0, -1, 0, 'head_ada_lin.bias');
+    LoadLlamaLinearWeights(Reader, HeadLin, 'head.weight',
+      d, Config.VocabSize, 0, -1, 0, 'head.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildVARFromSafeTensorsEx(const FileName: string;
+  const Config: TVARConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildVAR(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildVARFromSafeTensors(const FileName: string;
+  out Config: TVARConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadVARConfigFromJSONFile(ConfigPath);
+  Result := BuildVARFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ============================ PixArt-alpha IMPORT ==========================
