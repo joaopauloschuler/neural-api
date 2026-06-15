@@ -884,6 +884,27 @@ rather than acted on.
   - [ ] KV-cache O(1) incremental decode for the Moonshine decoder (self-attn cache +
         cross-attn states are constant across steps; reuse the SDPA Begin/EndIncrementalDecode
         machinery) so long transcripts don't re-run the whole prefix each step.
+- [ ] Whisper WORD-LEVEL timestamps via cross-attention DTW alignment (port of
+      openai-whisper / transformers `return_timestamps="word"`) — the landed Whisper
+      importer transcribes text but emits NO timing; this is the standard, high-value
+      voice feature for subtitles/karaoke/forced alignment. After greedy/beam decode,
+      collect the decoder->encoder CROSS-ATTENTION weight matrices from the model's
+      designated "alignment heads" (a small per-checkpoint subset; HF stores them in
+      `generation_config.alignment_heads`, openai-whisper bakes them into the released
+      checkpoints — read or hardcode-per-size), average + normalize them into a
+      (text-token x audio-frame) score matrix, then run dynamic time warping (the same
+      O(N*M) DP as in openai-whisper's `find_alignment`) to extract the monotonic
+      token->frame path; convert frame indices to seconds (each encoder frame = 20 ms
+      for the 16 kHz/hop-160 mel front-end) and merge sub-word tokens back into words
+      to produce (word, start_s, end_s) tuples. New piece is a small DTW helper +
+      cross-attention-weight capture hook on the SDPA layers (the attention probs are
+      already computed in the forward — expose/accumulate them for the chosen heads);
+      the rest reuses the landed Whisper graph + tokenizer. Scope v1 to greedy decode
+      of one 30 s window with the head list supplied as a config arg; defer multi-window
+      stitching and the median-filter smoothing refinement to a follow-up. Parity-gate
+      the DTW path length/monotonicity (and optionally token->frame indices) against an
+      openai-whisper / HF float64 oracle on a pico fixture. Voice priority; extends an
+      already-landed importer rather than adding a near-duplicate of one.
 - [X] SAM two-way MASK DECODER (successor to the landed SAM image-encoder above). v1
       SINGLE point prompt + SINGLE mask: RunSAMMaskDecoder + ReadSAMMaskDecoderConfig +
       TSAMMaskDecoderConfig in neuralpretrained.pas compose the prompt encoder (point
