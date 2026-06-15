@@ -976,6 +976,46 @@ rather than acted on.
       next-token logits for a mixed image+text prompt (reuse make_pico_*_fixture.py) +
       an examples/Qwen2VLDescribe that captions a tiny image (ulimit-bounded). The
       M-RoPE index builder also unblocks Qwen2.5-VL video (the temporal section) later.
+- [ ] CLIPSeg text-prompted zero-shot segmentation importer (BuildCLIPSegFromSafeTensors,
+      e.g. CIDAS/clipseg-rd64-refined) — a genuinely DISTINCT dense-prediction output
+      modality: given an image and a free-text prompt (or a prompt image), it emits a
+      single-channel binary mask for "whatever the prompt names", with NO fixed label
+      set. Different from every landed/tracked segmentation vertical — SegFormer
+      (per-pixel argmax over a FIXED class list), SAM (geometric point/box prompts, no
+      semantics), Mask2Former (closed-vocab query set), and OWL-ViT (open-vocab BOXES,
+      not masks). The genuinely new piece is the lightweight FiLM-conditioned transformer
+      DECODER: the frozen CLIP ViT image tower (reuse BuildClipVisionTower) exposes a few
+      intermediate hidden states which are projected and FiLM-modulated by the CLIP TEXT
+      embedding of the prompt (BuildClipFromSafeTensors text tower), then upsampled
+      through a small transposed-conv stack to a HxW logit map. Reuses the landed CLIP
+      dual encoder + the TNNetDeMaxPool/conv upsampling blocks the VAE decoder already
+      uses; the new code is the conditional decoder wiring (text-embedding -> per-token
+      affine modulation of the visual tokens). Scope v1 to a SINGLE text prompt -> one
+      mask, inference-only. Pico parity vs an HF float64 oracle on the decoder logit map
+      for a fixed (image, prompt) pair (reuse make_pico_*_fixture.py) + an
+      examples/CLIPSegPrompt that writes a binary-mask PPM for a hand-typed prompt over a
+      tiny CPU image. First "text-prompt -> dense mask" importer; the segmentation
+      counterpart to the landed open-vocab DETECTION (OWL-ViT).
+- [ ] TinyNeRF novel-view-synthesis example (examples/TinyNeRF) — a brand-new
+      output modality for the tree: a learned implicit 3-D scene that renders an image
+      from an arbitrary camera pose, the first differentiable VOLUME RENDERER in the
+      repo. Distinct from every landed image generator (DiT/PixArt diffusion,
+      VisualGAN/StyleGAN2, MaskGIT token gen) and from the landed implicit-function
+      examples (SIREN/Fourier-feature image fitting are 2-D pixel regressions; this is
+      3-D ray integration). The genuinely new code is the volume-rendering compositing
+      step: cast rays from the camera, sample points along each ray, run a small
+      positional-encoded MLP (reuse the landed Fourier/positional-encoding feature map +
+      a couple of TNNetFullConnectReLU layers) to predict (RGB, density) per sample, then
+      alpha-composite along the ray (C = sum T_i (1 - exp(-sigma_i delta_i)) c_i) with
+      the standard transmittance weights — plus its analytic backward so the whole
+      render is trainable end-to-end by the existing TNeuralFit MSE loss against ground-
+      truth pixels. Scope v1 to a SINGLE tiny synthetic scene (a handful of posed low-res
+      views shipped as a fixture, e.g. a procedurally generated colored cube or the
+      classic tiny_nerf lego crop downsampled), train a few thousand steps on CPU, then
+      render one HELD-OUT pose and write it as a PPM next to the ground truth. Pure CPU,
+      ulimit/time-bounded smoke run; no importer, no external download. Establishes the
+      ray-marching + alpha-compositing primitive that any future 3-D / view-synthesis
+      work (instant-NGP hash grids, 3D Gaussian splatting) would build on.
 - [X] CLIPScore text-image-alignment metric — LANDED in neuralpretrained.pas as
       ClipScore / ClipScoreFromEmbeddings / RefCLIPScore (w=2.5 rescale, harmonic-mean
       RefCLIPScore) reusing BuildClipFromSafeTensors, plus examples/ClipScore demo.
