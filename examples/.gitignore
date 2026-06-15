@@ -68,3 +68,18 @@ OCRTranscribe/OCRTranscribe
 OCRTranscribe/*.o
 OCRTranscribe/*.ppu
 OCRTranscribe/*.ppr
+
+# ConsistencyDistill: compiled few-step consistency-distillation demo binary,
+# build artifacts, generated sample grid, MNIST data symlinks, run logs
+ConsistencyDistill/ConsistencyDistill
+ConsistencyDistill/*.o
+ConsistencyDistill/*.ppu
+ConsistencyDistill/*.ppr
+ConsistencyDistill/*.png
+ConsistencyDistill/*.ppm
+ConsistencyDistill/*-ubyte
+ConsistencyDistill/*.idx*-ubyte
+ConsistencyDistill/run*.log
+ConsistencyDistill/run*.time
+ConsistencyDistill/time.log
+ConsistencyDistill/*.nn
