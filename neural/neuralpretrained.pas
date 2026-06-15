@@ -5120,6 +5120,120 @@ procedure ClipPreprocessImage(Src, Dst: TNNetVolume;
   const Config: TClipImageProcessorConfig);
 
 // ===========================================================================
+// LLaVA GENERATIVE VISION-LANGUAGE IMPORT (model_type "llava": the
+// llava-hf/llava-interleave-qwen-0.5b-hf recipe and its siblings) - the FIRST
+// image-in / text-out importer in the repo. The classic LLaVA pipeline:
+//   pixel tensor -> a ViT vision tower -> the "vision feature"
+//   (hidden_states[vision_feature_layer], select_strategy) -> a 2-layer MLP
+//   projector (linear_1 -> gelu -> linear_2) -> the projected visual tokens
+//   SPLICED into the language decoder's token-embedding sequence at the
+//   <image> placeholder positions (image_token_index) -> ordinary CAUSAL
+//   decoding through the language model -> next-token logits.
+// Almost everything is reused: the vision tower is BuildSigLIPVisionTower /
+// BuildClipVisionTower in pVisionFeatures mode (vision_feature_layer = -1 ->
+// SelectHiddenLayer = num_layers, returning the RAW encoder output WITHOUT
+// post_layernorm - HF captures hidden_states BEFORE post_layernorm), the
+// language side is the stock Llama/Qwen2 path (BuildLlamaFrom...), and the
+// genuinely new pieces here are: (a) the 2-layer MLP projector net, and (b)
+// LlavaAssembleEmbeddings, a prompt-assembly helper that runs the vision
+// tower + projector once and concatenates [text-embeds | projected visual
+// tokens | text-embeds] into the decoder's embedding sequence, fed by
+// LlavaRunLogits (the embedding-injection convention, sibling of RunT5's
+// external-states feed). The vision tower is SigLIP (vision_use_head=False)
+// for the Qwen interleave checkpoint; a CLIP-tower LLaVA is supported via the
+// same path (model_type detected from vision_config).
+// ---------------------------------------------------------------------------
+type
+  TLlavaVisionKind = (lvkSigLIP, lvkClip);
+
+  TLlavaConfig = record
+    Text: TLlamaConfig;             // text_config (the Llama/Qwen2 decoder)
+    Vision: TClipTowerConfig;       // vision_config encoder-block shape
+    VisionKind: TLlavaVisionKind;   // SigLIP (default) or CLIP vision tower
+    ImageSize: integer;             // vision_config.image_size
+    PatchSize: integer;             // vision_config.patch_size
+    NumChannels: integer;           // vision_config.num_channels (3)
+    NumPatches: integer;            // (image_size/patch_size)^2 (no CLS for
+                                    // SigLIP; CLIP adds 1, cropped when
+                                    // select_strategy = "default")
+    ImageTokenIndex: integer;       // image_token_index (the <image> id the
+                                    // projected visual tokens replace)
+    VisionFeatureLayer: integer;    // vision_feature_layer (HF; -1 = last
+                                    // encoder hidden state, pre-post_layernorm)
+    SelectDefault: boolean;         // vision_feature_select_strategy
+                                    // "default" (crop the CLS row); "full"
+                                    // keeps every patch (the SigLIP default)
+    ProjectorGeluExact: boolean;    // projector_hidden_act "gelu" (exact erf)
+                                    // vs the tanh approximation ("gelu_new")
+    ModelType: string;              // 'llava'
+  end;
+
+// Reads a HF LLaVA config.json (model_type "llava"). The text_config
+// sub-object is parsed by the Llama config reader (Qwen2/Llama family); the
+// vision_config sub-object supplies the ViT tower shape (SigLIP or CLIP).
+// Defaults follow LlavaConfig: image_token_index 32000 (or as given),
+// vision_feature_layer -2 for CLIP / -1 for SigLIP, select_strategy
+// "default" for CLIP / "full" for SigLIP, projector_hidden_act "gelu".
+function ReadLlavaConfigFromJSONFile(const FileName: string): TLlavaConfig;
+
+function LlavaConfigToString(const Config: TLlavaConfig): string;
+
+// Builds the LLaVA PROJECTOR net: a 2-layer per-token MLP
+// (multi_modal_projector.linear_1 -> gelu -> linear_2) mapping the
+// (NumPatches,1,vision_hidden) vision feature to (NumPatches,1,text_hidden)
+// visual tokens. Prefix is the tensor-name prefix
+// ('model.multi_modal_projector.' for transformers 5.x,
+// 'multi_modal_projector.' for older checkpoints - auto-detected). The net is
+// owned by the caller. Coded by Claude (AI).
+function BuildLlavaProjector(Reader: TNNetSafeTensorsReader;
+  NumPatches, VisionHidden, TextHidden: integer; GeluExact: boolean;
+  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+
+// Builds the three LLaVA nets from the checkpoint at FileName (.safetensors /
+// sharded index / .bin via CreatePretrainedTensorReader): VisionNet (the ViT
+// tower in vision-feature mode), ProjectorNet (the 2-layer MLP), and TextNet
+// (the stock Llama/Qwen2 decoder, its TNNetEmbedding fed externally by
+// LlavaRunLogits). All three are owned by the caller. pSeqLen <= 0 uses the
+// text max_position_embeddings; the prompt's assembled length must not exceed
+// it. pInferenceOnly frees training volumes during construction.
+procedure BuildLlavaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TLlavaConfig; out VisionNet, ProjectorNet, TextNet: TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+procedure BuildLlavaFromSafeTensors(const FileName: string;
+  out VisionNet, ProjectorNet, TextNet: TNNet; out Config: TLlavaConfig;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+
+// Runs the vision tower + projector on Pixels (an (ImageSize,ImageSize,3)
+// normalized RGB volume) and returns the projected visual tokens in
+// VisualTokens (resized to (NumPatches,1,text_hidden)). Coded by Claude (AI).
+procedure LlavaProjectImage(VisionNet, ProjectorNet: TNNet;
+  Pixels, VisualTokens: TNNetVolume);
+
+// Assembles the decoder's input embedding sequence for a mixed image+text
+// prompt: TokenIds is the full id sequence WITH Config.ImageTokenIndex at the
+// NumPatches image-placeholder slots; VisualTokens are the projected visual
+// tokens (from LlavaProjectImage). Each non-image id looks up its row in the
+// TextNet embedding table; the image slots receive the visual tokens in
+// order. Dst is resized to (Length(TokenIds),1,text_hidden). Raises if the
+// number of image slots <> NumPatches. Coded by Claude (AI).
+procedure LlavaAssembleEmbeddings(TextNet: TNNet;
+  const TokenIds: array of integer; ImageTokenIndex, NumPatches: integer;
+  VisualTokens, Dst: TNNetVolume);
+
+// Full LLaVA forward: projects the image, assembles the spliced embedding
+// sequence, injects it into TextNet's TNNetEmbedding output, runs the decoder
+// from the embedding onward (skipping the token lookup), and returns the
+// (SeqLen,1,vocab) next-token logits in Logits. This is the LLaVA analogue of
+// RunT5 - the embedding-injection convention. Coded by Claude (AI).
+procedure LlavaRunLogits(VisionNet, ProjectorNet, TextNet: TNNet;
+  Pixels: TNNetVolume; const TokenIds: array of integer;
+  ImageTokenIndex, NumPatches: integer; Logits: TNNetVolume);
+
+// ===========================================================================
 // ViT IMAGE-CLASSIFICATION IMPORT (model_type "vit": google/vit-base-
 // patch16-224 and timm/HF ViTForImageClassification siblings) - a STANDALONE
 // image classifier. It REUSES the CLIP pre-LN ViT encoder block
@@ -41672,6 +41786,389 @@ begin
       end;
   finally
     Work.Free;
+  end;
+end;
+
+// ===========================================================================
+// LLaVA GENERATIVE VISION-LANGUAGE IMPORT (implementation)
+// ===========================================================================
+
+function ReadLlavaConfigFromJSONFile(const FileName: string): TLlavaConfig;
+var
+  JsonText, TextCfgText: TStringList;
+  Root: TJSONData;
+  Obj, TextObj, VisionObj: TJSONObject;
+  TempTextCfg, ProjAct, VisModelType, SelStrat: string;
+  Grid, FeatField: integer;
+  Data: TJSONData;
+
+  function RequiredSubObject(const FieldName: string): TJSONObject;
+  var
+    D: TJSONData;
+  begin
+    D := Obj.Find(FieldName);
+    if (D = nil) or not (D is TJSONObject) then
+      ImportError('LLaVA import: config "' + FileName +
+        '" is missing the required sub-object "' + FieldName + '".');
+    Result := TJSONObject(D);
+  end;
+
+  function RequiredInt(O: TJSONObject; const FieldName: string): integer;
+  begin
+    if O.IndexOfName(FieldName) < 0 then
+      ImportError('LLaVA import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := O.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('LLaVA import: config field "' + FieldName +
+        '" must be a positive integer, got ' + O.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('LLaVA import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  TempTextCfg := '';
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('LLaVA import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('LLaVA import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    if Obj.Get('model_type', 'llava') <> 'llava' then
+      ImportError('LLaVA import: config model_type is "' +
+        Obj.Get('model_type', '') + '" - only "llava" is supported here.');
+    Result.ModelType := 'llava';
+
+    // ---- text_config: hand the sub-object to the Llama config reader by
+    // writing it to a temp file (it expects a top-level config). ----
+    TextObj := RequiredSubObject('text_config');
+    TextCfgText := TStringList.Create;
+    try
+      TextCfgText.Text := TextObj.AsJSON;
+      TempTextCfg := GetTempFileName('', 'llava_txt') + '.json';
+      TextCfgText.SaveToFile(TempTextCfg);
+    finally
+      TextCfgText.Free;
+    end;
+    Result.Text := ReadLlamaConfigFromJSONFile(TempTextCfg);
+
+    // ---- vision_config: tower shape + image geometry. ----
+    VisionObj := RequiredSubObject('vision_config');
+    VisModelType := VisionObj.Get('model_type', 'siglip_vision_model');
+    if (VisModelType = 'clip_vision_model') then
+      Result.VisionKind := lvkClip
+    else
+      Result.VisionKind := lvkSigLIP;   // siglip / siglip_vision_model
+    Result.Vision.HiddenSize := RequiredInt(VisionObj, 'hidden_size');
+    Result.Vision.IntermediateSize := RequiredInt(VisionObj,
+      'intermediate_size');
+    Result.Vision.NumLayers := RequiredInt(VisionObj, 'num_hidden_layers');
+    Result.Vision.NumHeads := RequiredInt(VisionObj, 'num_attention_heads');
+    Result.Vision.LayerNormEps := VisionObj.Get('layer_norm_eps', 0.000001);
+    Result.Vision.HiddenAct := SigLIPHiddenActFromString(
+      VisionObj.Get('hidden_act', 'gelu_pytorch_tanh'));
+    Result.ImageSize := RequiredInt(VisionObj, 'image_size');
+    Result.PatchSize := RequiredInt(VisionObj, 'patch_size');
+    Result.NumChannels := VisionObj.Get('num_channels', 3);
+    Grid := Result.ImageSize div Result.PatchSize;
+
+    // ---- multimodal knobs. ----
+    Result.ImageTokenIndex := Obj.Get('image_token_index', 32000);
+    // vision_feature_layer default: -1 (SigLIP) / -2 (CLIP).
+    if Obj.IndexOfName('vision_feature_layer') >= 0 then
+    begin
+      Data := Obj.Find('vision_feature_layer');
+      FeatField := Data.AsInteger;
+    end
+    else if Result.VisionKind = lvkClip then FeatField := -2
+    else FeatField := -1;
+    Result.VisionFeatureLayer := FeatField;
+    // select_strategy default: "full" (SigLIP) / "default" (CLIP, crops CLS).
+    if Result.VisionKind = lvkClip then SelStrat := 'default'
+    else SelStrat := 'full';
+    SelStrat := Obj.Get('vision_feature_select_strategy', SelStrat);
+    Result.SelectDefault := (SelStrat = 'default');
+    // CLIP adds a CLS token (num_patches+1 rows); "default" crops it back out.
+    if Result.VisionKind = lvkClip then
+      Result.NumPatches := Grid * Grid    // post-CLS-crop count
+    else
+      Result.NumPatches := Grid * Grid;
+    ProjAct := Obj.Get('projector_hidden_act', 'gelu');
+    Result.ProjectorGeluExact := (ProjAct = 'gelu');
+  finally
+    if (TempTextCfg <> '') and FileExists(TempTextCfg) then
+      DeleteFile(TempTextCfg);
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function LlavaConfigToString(const Config: TLlavaConfig): string;
+begin
+  if Config.VisionKind = lvkClip then Result := 'llava(clip-vision)'
+  else Result := 'llava(siglip-vision)';
+  Result := Result + ': text(' + Config.Text.ModelType +
+    ', d=' + IntToStr(Config.Text.HiddenSize) +
+    ', layers=' + IntToStr(Config.Text.NumLayers) +
+    ', vocab=' + IntToStr(Config.Text.VocabSize) +
+    '), vision(d=' + IntToStr(Config.Vision.HiddenSize) +
+    ', layers=' + IntToStr(Config.Vision.NumLayers) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', patch=' + IntToStr(Config.PatchSize) +
+    ', patches=' + IntToStr(Config.NumPatches) +
+    '), image_token=' + IntToStr(Config.ImageTokenIndex) +
+    ', feature_layer=' + IntToStr(Config.VisionFeatureLayer);
+  if Config.SelectDefault then Result := Result + ', select=default'
+  else Result := Result + ', select=full';
+  if Config.ProjectorGeluExact then Result := Result + ', proj_gelu=exact'
+  else Result := Result + ', proj_gelu=tanh';
+end;
+
+function BuildLlavaProjector(Reader: TNNetSafeTensorsReader;
+  NumPatches, VisionHidden, TextHidden: integer; GeluExact: boolean;
+  const Prefix: string; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Lin1, Lin2: TNNetLayer;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer( TNNetInput.Create(NumPatches, 1, VisionHidden) );
+    // linear_1: VisionHidden -> TextHidden (biased), per token.
+    Lin1 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden) );
+    if GeluExact then AddClipHiddenAct(NN, chaGeluExact)
+    else NN.AddLayer( TNNetGELU.Create() );  // gelu_new tanh approximation
+    // linear_2: TextHidden -> TextHidden (biased), per token.
+    Lin2 := NN.AddLayer( TNNetPointwiseConvLinear.Create(TextHidden) );
+    if pInferenceOnly then NN.MakeInferenceOnly();
+    // weights (HF nn.Linear weight is [out, in]; LoadLlamaLinearWeights
+    // handles the row-major [out,in] layout + the bias vector).
+    LoadLlamaLinearWeights(Reader, Lin1, Prefix + 'linear_1.weight',
+      VisionHidden, TextHidden, 0, -1, 0, Prefix + 'linear_1.bias');
+    LoadLlamaLinearWeights(Reader, Lin2, Prefix + 'linear_2.weight',
+      TextHidden, TextHidden, 0, -1, 0, Prefix + 'linear_2.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+procedure BuildLlavaFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TLlavaConfig; out VisionNet, ProjectorNet, TextNet: TNNet;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false);
+var
+  Reader: TNNetSafeTensorsReader;
+  VisionPrefix, ProjPrefix: string;
+  SelHidden: integer;
+begin
+  VisionNet := nil;
+  ProjectorNet := nil;
+  TextNet := nil;
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    // ---- tensor-name prefix detection (transformers 5.x adds "model.") ----
+    // Vision tower: model.vision_tower. (5.x) or vision_tower. (older).
+    if Reader.HasTensor('model.vision_tower.embeddings.patch_embedding.weight')
+    then VisionPrefix := 'model.vision_tower.'
+    else if Reader.HasTensor(
+      'vision_tower.embeddings.patch_embedding.weight') then
+      VisionPrefix := 'vision_tower.'
+    else
+      ImportError('LLaVA import: vision tower patch_embedding not found ' +
+        '(looked under model.vision_tower. and vision_tower.) in ' +
+        Reader.FileName + '.');
+    // Projector.
+    if Reader.HasTensor('model.multi_modal_projector.linear_1.weight') then
+      ProjPrefix := 'model.multi_modal_projector.'
+    else if Reader.HasTensor('multi_modal_projector.linear_1.weight') then
+      ProjPrefix := 'multi_modal_projector.'
+    else
+      ImportError('LLaVA import: multi_modal_projector.linear_1 not found in ' +
+        Reader.FileName + '.');
+    // Language model: alias model.language_model.* -> model.* so the stock
+    // Llama builder's prefix auto-detection ("model.embed_tokens.weight")
+    // fires. lm_head.weight is already at the top level. Older single-net
+    // llava checkpoints store language_model.model.* -> model.* .
+    if Reader.HasTensor('model.language_model.embed_tokens.weight') then
+      Reader.RenameTensorPrefix('model.language_model.', 'model.')
+    else if Reader.HasTensor('language_model.model.embed_tokens.weight') then
+    begin
+      Reader.RenameTensorPrefix('language_model.model.', 'model.');
+      if Reader.HasTensor('language_model.lm_head.weight') then
+        Reader.RenameTensor('language_model.lm_head.weight', 'lm_head.weight');
+    end
+    else if not Reader.HasTensor('model.embed_tokens.weight') then
+      ImportError('LLaVA import: language-model embed_tokens not found ' +
+        '(looked under model.language_model., language_model.model. and ' +
+        'model.) in ' + Reader.FileName + '.');
+
+    // ---- vision tower (feature mode). vision_feature_layer = -1 -> run ALL
+    // encoder blocks but SKIP post_layernorm (HF hidden_states[-1] is the
+    // raw encoder output): SelectHiddenLayer = num_layers. A more negative
+    // layer (-2: CLIP's penultimate) drops trailing blocks. ----
+    SelHidden := Config.Vision.NumLayers + Config.VisionFeatureLayer + 1;
+    if SelHidden < 1 then SelHidden := 1;
+    if SelHidden > Config.Vision.NumLayers then
+      SelHidden := Config.Vision.NumLayers;
+    if Config.VisionKind = lvkClip then
+      VisionNet := BuildClipVisionTower(Reader, Config.Vision,
+        Config.ImageSize, Config.PatchSize, Config.NumChannels,
+        {ProjectionDim=}Config.Vision.HiddenSize, VisionPrefix, '',
+        pInferenceOnly, {pVisionFeatures=}true)
+    else
+      VisionNet := BuildSigLIPVisionTower(Reader, Config.Vision,
+        Config.ImageSize, Config.PatchSize, Config.NumChannels,
+        VisionPrefix, pInferenceOnly, {pVisionFeatures=}true, SelHidden);
+
+    // ---- projector ----
+    ProjectorNet := BuildLlavaProjector(Reader, Config.NumPatches,
+      Config.Vision.HiddenSize, Config.Text.HiddenSize,
+      Config.ProjectorGeluExact, ProjPrefix, pInferenceOnly);
+
+    // Drop the vision-tower + projector tensors from the reader so the stock
+    // Llama builder's strict all-tensors-consumed check sees only the
+    // language-model tensors (the vision/projector weights are already loaded).
+    Reader.RemoveTensorsWithPrefix(VisionPrefix);
+    Reader.RemoveTensorsWithPrefix(ProjPrefix);
+
+    // ---- language model (stock Llama/Qwen2 path; embedding fed externally
+    // by LlavaRunLogits). The reader is consumed (freed) by the core builder,
+    // so this MUST be last. ----
+    TextNet := BuildLlamaFromTensorReaderWithConfig(Reader, FileName,
+      Config.Text, pSeqLen, pInferenceOnly, {pQuantizeInt8=}false);
+    Reader := nil;  // ownership transferred to the Llama builder
+  except
+    VisionNet.Free;
+    ProjectorNet.Free;
+    TextNet.Free;
+    Reader.Free;
+    raise;
+  end;
+end;
+
+procedure BuildLlavaFromSafeTensors(const FileName: string;
+  out VisionNet, ProjectorNet, TextNet: TNNet; out Config: TLlavaConfig;
+  pSeqLen: integer = 0; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = '');
+var
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := IncludeTrailingPathDelimiter(ExtractFilePath(FileName)) +
+    'config.json';
+  Config := ReadLlavaConfigFromJSONFile(CfgPath);
+  BuildLlavaFromSafeTensorsWithConfig(FileName, Config,
+    VisionNet, ProjectorNet, TextNet, pSeqLen, pInferenceOnly);
+end;
+
+procedure LlavaProjectImage(VisionNet, ProjectorNet: TNNet;
+  Pixels, VisualTokens: TNNetVolume);
+begin
+  VisionNet.Compute(Pixels);
+  ProjectorNet.Compute(VisionNet.GetLastLayer().Output);
+  VisualTokens.Copy(ProjectorNet.GetLastLayer().Output);
+end;
+
+procedure LlavaAssembleEmbeddings(TextNet: TNNet;
+  const TokenIds: array of integer; ImageTokenIndex, NumPatches: integer;
+  VisualTokens, Dst: TNNetVolume);
+var
+  EmbeddingLayer: TNNetLayer;
+  d, SeqLen, t, c, ImageSlots, VisRow: integer;
+  EmbWeights: TNNetVolume;
+begin
+  EmbeddingLayer := nil;
+  if (TextNet.Layers.Count > 1) and (TextNet.Layers[1] is TNNetEmbedding) then
+    EmbeddingLayer := TextNet.Layers[1]
+  else
+    ImportError('LlavaAssembleEmbeddings: TextNet layer 1 is not a ' +
+      'TNNetEmbedding (not a BuildLlavaFromSafeTensors language model?).');
+  EmbWeights := EmbeddingLayer.Neurons[0].Weights;
+  d := TNNetEmbedding(EmbeddingLayer).EmbeddingSize;
+  SeqLen := Length(TokenIds);
+  // count image placeholder slots
+  ImageSlots := 0;
+  for t := 0 to SeqLen - 1 do
+    if TokenIds[t] = ImageTokenIndex then Inc(ImageSlots);
+  if ImageSlots <> NumPatches then
+    ImportError('LlavaAssembleEmbeddings: prompt has ' +
+      IntToStr(ImageSlots) + ' image placeholder tokens but the projector ' +
+      'produced ' + IntToStr(NumPatches) + ' visual tokens (they must match).');
+  if (VisualTokens.SizeX <> NumPatches) or (VisualTokens.Depth <> d) then
+    ImportError('LlavaAssembleEmbeddings: visual tokens shape (' +
+      IntToStr(VisualTokens.SizeX) + ',' + IntToStr(VisualTokens.Depth) +
+      ') must be (' + IntToStr(NumPatches) + ',' + IntToStr(d) + ').');
+  Dst.ReSize(SeqLen, 1, d);
+  VisRow := 0;
+  for t := 0 to SeqLen - 1 do
+  begin
+    if TokenIds[t] = ImageTokenIndex then
+    begin
+      // splice the next projected visual token (row VisRow of VisualTokens)
+      for c := 0 to d - 1 do
+        Dst.FData[t * d + c] := VisualTokens.FData[VisRow * d + c];
+      Inc(VisRow);
+    end
+    else
+    begin
+      // text token: copy row TokenIds[t] of the embedding table (row-major,
+      // the EmbedScale/Multiplier folds are already baked into the table).
+      if (TokenIds[t] < 0) or
+         (TokenIds[t] >= TNNetEmbedding(EmbeddingLayer).VocabSize) then
+        ImportError('LlavaAssembleEmbeddings: token id ' +
+          IntToStr(TokenIds[t]) + ' out of range [0,' +
+          IntToStr(TNNetEmbedding(EmbeddingLayer).VocabSize - 1) + '].');
+      for c := 0 to d - 1 do
+        Dst.FData[t * d + c] := EmbWeights.FData[TokenIds[t] * d + c];
+    end;
+  end;
+end;
+
+procedure LlavaRunLogits(VisionNet, ProjectorNet, TextNet: TNNet;
+  Pixels: TNNetVolume; const TokenIds: array of integer;
+  ImageTokenIndex, NumPatches: integer; Logits: TNNetVolume);
+var
+  VisualTokens, Embeds: TNNetVolume;
+  EmbeddingLayer: TNNetLayer;
+  i, SeqLen: integer;
+begin
+  if (TextNet.Layers.Count <= 2) or
+     not (TextNet.Layers[1] is TNNetEmbedding) then
+    ImportError('LlavaRunLogits: TextNet is not a BuildLlavaFromSafeTensors ' +
+      'language model (layer 1 must be a TNNetEmbedding).');
+  EmbeddingLayer := TextNet.Layers[1];
+  SeqLen := Length(TokenIds);
+  if SeqLen <> EmbeddingLayer.Output.SizeX then
+    ImportError('LlavaRunLogits: prompt length ' + IntToStr(SeqLen) +
+      ' must equal the decoder''s SeqLen ' +
+      IntToStr(EmbeddingLayer.Output.SizeX) +
+      ' (rebuild with pSeqLen = assembled prompt length).');
+  VisualTokens := TNNetVolume.Create;
+  Embeds := TNNetVolume.Create;
+  try
+    LlavaProjectImage(VisionNet, ProjectorNet, Pixels, VisualTokens);
+    LlavaAssembleEmbeddings(TextNet, TokenIds, ImageTokenIndex, NumPatches,
+      VisualTokens, Embeds);
+    // INJECT: write the assembled embedding sequence into the embedding
+    // layer's Output, then run every layer AFTER it (skip the token lookup
+    // so the splice survives) - the embedding-injection convention.
+    EmbeddingLayer.Output.Copy(Embeds);
+    for i := 2 to TextNet.GetLastLayerIdx() do
+      TextNet.Layers[i].Compute();
+    TextNet.GetOutput(Logits);
+  finally
+    Embeds.Free;
+    VisualTokens.Free;
   end;
 end;
 

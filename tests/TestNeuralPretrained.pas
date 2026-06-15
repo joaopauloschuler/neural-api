@@ -272,6 +272,9 @@ type
     procedure TestSigLIPConfigFromJSONFile;
     procedure TestSigLIPParity;
     procedure TestSigLIPVisionFeatures;
+    procedure TestLlavaConfigFromJSONFile;
+    procedure TestLlavaVisualTokenParity;
+    procedure TestLlavaNextTokenLogitsParity;
     procedure TestViTConfigFromJSONFile;
     procedure TestViTImageClassificationParity;
     procedure TestResNetConfigFromJSONFile;
@@ -12627,6 +12630,191 @@ begin
   finally
     VisionNet.Free;
     Reader.Free;
+  end;
+end;
+
+// Verifies ReadLlavaConfigFromJSONFile on the committed pico LLaVA config:
+// a SigLIP vision tower + Qwen2 text decoder + 2-layer gelu projector.
+procedure TTestNeuralPretrained.TestLlavaConfigFromJSONFile;
+var
+  Config: TLlavaConfig;
+begin
+  Config := ReadLlavaConfigFromJSONFile(FixturePath('tiny_llava_config.json'));
+  AssertEquals('model_type', 'llava', Config.ModelType);
+  AssertTrue('SigLIP vision tower', Config.VisionKind = lvkSigLIP);
+  AssertEquals('text model_type', 'qwen2', Config.Text.ModelType);
+  AssertEquals('text hidden', 32, Config.Text.HiddenSize);
+  AssertEquals('text layers', 2, Config.Text.NumLayers);
+  AssertEquals('text vocab', 50, Config.Text.VocabSize);
+  AssertTrue('Qwen2 q/k/v biased', Config.Text.QKVBias);
+  AssertEquals('vision hidden', 24, Config.Vision.HiddenSize);
+  AssertEquals('vision layers', 2, Config.Vision.NumLayers);
+  AssertEquals('image size', 12, Config.ImageSize);
+  AssertEquals('patch size', 4, Config.PatchSize);
+  AssertEquals('num patches (3x3)', 9, Config.NumPatches);
+  AssertEquals('image_token_index', 49, Config.ImageTokenIndex);
+  AssertEquals('vision_feature_layer', -1, Config.VisionFeatureLayer);
+  AssertTrue('select strategy full (keep all patches)',
+    not Config.SelectDefault);
+  AssertTrue('projector gelu exact (erf)', Config.ProjectorGeluExact);
+end;
+
+// LLaVA Step 3 parity: the PROJECTED VISUAL TOKENS. Runs the SigLIP vision
+// tower (feature mode, vision_feature_layer = -1 -> all blocks, NO
+// post_layernorm) + the 2-layer gelu projector on the pinned pixel tensor
+// and compares the (9,1,text_hidden) visual tokens < 1e-4 vs the HF float64
+// oracle (LlavaForConditionalGeneration.get_image_features). The fixture
+// generator asserts the projector gelu + bias and the pre-post_layernorm
+// feature selection all matter.
+procedure TTestNeuralPretrained.TestLlavaVisualTokenParity;
+var
+  VisionNet, ProjectorNet, TextNet: TNNet;
+  Config: TLlavaConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, RowVT: TJSONArray;
+  ImageInput, VisualTokens: TNNetVolume;
+  C, Y, X, P, j: integer;
+  Diff, MaxDiff, RefV: double;
+begin
+  RandSeed := 424242;
+  BuildLlavaFromSafeTensors(FixturePath('tiny_llava.safetensors'),
+    VisionNet, ProjectorNet, TextNet, Config, {pSeqLen=}13,
+    {pInferenceOnly=}false, FixturePath('tiny_llava_config.json'));
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  VisualTokens := TNNetVolume.Create;
+  RefRoot := nil;
+  try
+    AssertTrue('vision net built', VisionNet <> nil);
+    AssertTrue('projector net built', ProjectorNet <> nil);
+    AssertTrue('text net built', TextNet <> nil);
+    AssertEquals('vision feature rows = num patches', Config.NumPatches,
+      VisionNet.GetLastLayer().Output.SizeX);
+
+    RefJson.LoadFromFile(FixturePath('tiny_llava_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));   // [3][12][12]
+    // channel-last (W,H,3) load
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for C := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[C]);
+      for Y := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[Y]);
+        for X := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[(Y * Config.ImageSize + X) * Config.NumChannels + C]
+            := ChanArr.Items[X].AsFloat;
+      end;
+    end;
+
+    LlavaProjectImage(VisionNet, ProjectorNet, ImageInput, VisualTokens);
+    AssertEquals('visual tokens rows', Config.NumPatches, VisualTokens.SizeX);
+    AssertEquals('visual tokens depth = text hidden', Config.Text.HiddenSize,
+      VisualTokens.Depth);
+
+    MaxDiff := 0;
+    for P := 0 to Config.NumPatches - 1 do
+    begin
+      RowVT := TJSONArray(TJSONArray(
+        TJSONObject(RefRoot).Find('visual_tokens')).Items[P]);
+      for j := 0 to Config.Text.HiddenSize - 1 do
+      begin
+        RefV := RowVT.Items[j].AsFloat;
+        Diff := Abs(VisualTokens.FData[P * Config.Text.HiddenSize + j] - RefV);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('projected visual tokens: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    VisualTokens.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    ProjectorNet.Free;
+    TextNet.Free;
+  end;
+end;
+
+// LLaVA Step 4 parity: the NEXT-TOKEN LOGITS for a mixed image+text prompt.
+// LlavaRunLogits projects the image, splices the visual tokens into the
+// decoder's embedding sequence at the image_token_index slots, and runs the
+// Qwen2 decoder causally. Compares the (seq,vocab) logits < 1e-4 vs the HF
+// float64 oracle (LlavaForConditionalGeneration forward).
+procedure TTestNeuralPretrained.TestLlavaNextTokenLogitsParity;
+var
+  VisionNet, ProjectorNet, TextNet: TNNet;
+  Config: TLlavaConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Pixels, RowArr, ChanArr, IdsArr, LogitsArr, RowL: TJSONArray;
+  ImageInput, Logits: TNNetVolume;
+  TokenIds: array of integer;
+  C, Y, X, t, v, SeqLen, Vocab: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  ImageInput := TNNetVolume.Create;
+  Logits := TNNetVolume.Create;
+  RefRoot := nil;
+  VisionNet := nil; ProjectorNet := nil; TextNet := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_llava_logits.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    IdsArr := TJSONArray(TJSONObject(RefRoot).Find('token_ids'));
+    SeqLen := IdsArr.Count;
+    SetLength(TokenIds, SeqLen);
+    for t := 0 to SeqLen - 1 do TokenIds[t] := IdsArr.Items[t].AsInteger;
+
+    BuildLlavaFromSafeTensors(FixturePath('tiny_llava.safetensors'),
+      VisionNet, ProjectorNet, TextNet, Config, {pSeqLen=}SeqLen,
+      {pInferenceOnly=}false, FixturePath('tiny_llava_config.json'));
+
+    Pixels := TJSONArray(TJSONObject(RefRoot).Find('pixels'));
+    ImageInput.ReSize(Config.ImageSize, Config.ImageSize, Config.NumChannels);
+    for C := 0 to Config.NumChannels - 1 do
+    begin
+      RowArr := TJSONArray(Pixels.Items[C]);
+      for Y := 0 to Config.ImageSize - 1 do
+      begin
+        ChanArr := TJSONArray(RowArr.Items[Y]);
+        for X := 0 to Config.ImageSize - 1 do
+          ImageInput.FData[(Y * Config.ImageSize + X) * Config.NumChannels + C]
+            := ChanArr.Items[X].AsFloat;
+      end;
+    end;
+
+    LlavaRunLogits(VisionNet, ProjectorNet, TextNet, ImageInput, TokenIds,
+      Config.ImageTokenIndex, Config.NumPatches, Logits);
+    AssertEquals('logits rows = seq len', SeqLen, Logits.SizeX);
+    AssertEquals('logits depth = vocab', Config.Text.VocabSize, Logits.Depth);
+
+    LogitsArr := TJSONArray(TJSONObject(RefRoot).Find('logits'));
+    Vocab := Config.Text.VocabSize;
+    MaxDiff := 0;
+    for t := 0 to SeqLen - 1 do
+    begin
+      RowL := TJSONArray(LogitsArr.Items[t]);
+      for v := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(Logits.FData[t * Vocab + v] - RowL.Items[v].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('next-token logits: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Logits.Free;
+    ImageInput.Free;
+    RefJson.Free;
+    VisionNet.Free;
+    ProjectorNet.Free;
+    TextNet.Free;
   end;
 end;
 

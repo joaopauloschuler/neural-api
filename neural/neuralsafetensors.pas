@@ -106,6 +106,26 @@ type
     // be read byte-for-byte. Dest is set to Length(Dest) = the tensor's byte
     // length. Coded by Claude (AI).
     procedure LoadTensorRawBytes(const pName: string; out Dest: TBytes);
+    // Renames a tensor in place (the on-disk file is untouched; only this
+    // reader's name table changes). Used by composite importers that load a
+    // sub-net through a builder expecting a different name prefix - e.g. the
+    // LLaVA importer feeds the language_model.* sub-tree to the stock Llama
+    // builder by aliasing 'model.language_model.X' -> 'model.X'. Raises if
+    // pOldName is absent or pNewName already exists. Coded by Claude (AI).
+    procedure RenameTensor(const pOldName, pNewName: string);
+    // Renames every tensor whose name starts with pOldPrefix, replacing that
+    // leading prefix with pNewPrefix (e.g. 'model.language_model.' ->
+    // 'model.'). No-op when nothing matches. Returns the count renamed.
+    // Coded by Claude (AI).
+    function RenameTensorPrefix(const pOldPrefix, pNewPrefix: string): integer;
+    // Drops every tensor whose name starts with pPrefix from this reader's
+    // name table (the on-disk file is untouched). Composite importers use it
+    // to hide a sub-net's tensors from a downstream builder's strict
+    // all-tensors-consumed check after that sub-net has been loaded - e.g.
+    // the LLaVA importer drops the vision-tower + projector tensors before
+    // handing the reader to the stock Llama builder. Returns the count
+    // dropped. Coded by Claude (AI).
+    function RemoveTensorsWithPrefix(const pPrefix: string): integer;
     property FileName: string read FFileName;
   end;
 
@@ -614,6 +634,61 @@ end;
 function TNNetSafeTensorsReader.Count: integer;
 begin
   Result := Length(FTensors);
+end;
+
+procedure TNNetSafeTensorsReader.RenameTensor(const pOldName, pNewName: string);
+var
+  Idx: integer;
+begin
+  Idx := FindTensor(pOldName);
+  if Idx < 0 then
+    raise ESafeTensorsError.CreateFmt(
+      'safetensors RenameTensor: tensor "%s" not found: %s',
+      [pOldName, FFileName]);
+  if (pNewName <> pOldName) and (FindTensor(pNewName) >= 0) then
+    raise ESafeTensorsError.CreateFmt(
+      'safetensors RenameTensor: target name "%s" already exists: %s',
+      [pNewName, FFileName]);
+  FTensors[Idx].Name := pNewName;
+end;
+
+function TNNetSafeTensorsReader.RenameTensorPrefix(
+  const pOldPrefix, pNewPrefix: string): integer;
+var
+  i, OldLen: integer;
+begin
+  Result := 0;
+  OldLen := Length(pOldPrefix);
+  for i := 0 to High(FTensors) do
+    if (Length(FTensors[i].Name) >= OldLen) and
+       (Copy(FTensors[i].Name, 1, OldLen) = pOldPrefix) then
+    begin
+      FTensors[i].Name := pNewPrefix +
+        Copy(FTensors[i].Name, OldLen + 1, MaxInt);
+      Inc(Result);
+    end;
+end;
+
+function TNNetSafeTensorsReader.RemoveTensorsWithPrefix(
+  const pPrefix: string): integer;
+var
+  i, PfxLen, WriteIdx: integer;
+begin
+  Result := 0;
+  PfxLen := Length(pPrefix);
+  WriteIdx := 0;
+  for i := 0 to High(FTensors) do
+  begin
+    if (Length(FTensors[i].Name) >= PfxLen) and
+       (Copy(FTensors[i].Name, 1, PfxLen) = pPrefix) then
+    begin
+      Inc(Result);
+      continue;   // drop this tensor (do not copy it forward)
+    end;
+    if WriteIdx <> i then FTensors[WriteIdx] := FTensors[i];
+    Inc(WriteIdx);
+  end;
+  SetLength(FTensors, WriteIdx);
 end;
 
 function TNNetSafeTensorsReader.ShardCount: integer;
