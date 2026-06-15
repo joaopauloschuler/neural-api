@@ -312,22 +312,12 @@ rather than acted on.
       prompt + single mask output to keep the decoder small. Pico parity vs HF
       float64 on the encoder embedding first (decoder is the stretch); demo:
       examples/SegmentAnything segments an object from one click on a tiny image.
-- [ ] Depth Anything V2 / DPT monocular-depth importer
-      (BuildDepthAnythingFromSafeTensors, e.g. depth-anything/Depth-Anything-V2-Small-hf
-      or Intel/dpt-hybrid-midas) — the FIRST DENSE-REGRESSION vision importer and a
-      brand-new output modality: one RGB image -> a per-pixel depth map (the landed
-      examples/DepthEstimation is a from-scratch TRAINING toy, not a real-checkpoint
-      importer). Reuses the landed DINOv2 ViT backbone wholesale (Depth Anything's
-      encoder IS DINOv2) and adds the DPT head: (a) the "reassemble" step that takes
-      patch tokens from 4 chosen encoder layers and projects+resizes them into a
-      4-level feature pyramid (1x1 conv + transpose/identity/strided resampling), and
-      (b) the RefineNet-style top-down fusion (residual conv units + nearest upsample)
-      ending in a small conv depth head -> single-channel HxW map. The only genuinely
-      new code is the multi-layer-token reassemble + the fusion-block wiring; resize
-      reuses TNNetDeMaxPool / TNNetUpsample. Pico parity vs HF float64 on the depth
-      logits < 1e-4 + an examples/MonoDepth that writes a grayscale depth map of one
-      tiny CPU image. Distinct from SegFormer (class map), DETR/SAM (objects/masks)
-      and the open Mask R-CNN — this is continuous per-pixel regression.
+  (DPT / Depth-Anything monocular-depth importer LANDED: BuildDPTFromSafeTensors
+   + ReadDPTConfigFromJSONFile/DPTConfigToString, DINOv2 backbone reuse + DPT
+   reassemble/RefineNet-fusion neck, pico parity < 1e-4 via tiny_dpt.* fixtures
+   and TestDPT{Config,DepthEstimation}Parity. Follow-ups deferred: real-checkpoint
+   slicer for depth-anything/Depth-Anything-V2-Small-hf, the dpt-hybrid (resnet
+   backbone) variant, and an examples/MonoDepth grayscale demo.)
 - [ ] Mask2Former universal-segmentation importer
       (BuildMask2FormerFromSafeTensors, e.g. facebook/mask2former-swin-tiny-*-semantic)
       — a third, architecturally DISTINCT segmentation vertical: mask-classification
