@@ -681,13 +681,16 @@ rather than acted on.
       way to pretrain on corpora bigger than RAM. Assert: same model
       quality on a small corpus vs the in-memory path at matched
       examples-seen, and bounded RSS on a corpus larger than the buffer.
-- [ ] MinHash near-duplicate corpus dedup tool: the C4/Pile hygiene step —
+- [X] MinHash near-duplicate corpus dedup tool: the C4/Pile hygiene step —
       shingle each document, MinHash signatures, LSH banding to find
       near-duplicate clusters, keep one representative. Small standalone
       unit (or scripts/ tool) pairing with the streaming-corpus-loader
       task above; report duplicate-cluster stats. Test: planted
       near-duplicates (one-word edits) are found, distinct documents are
-      not merged.
+      not merged. LANDED as neural/neuralminhash.pas (TNeuralMinHasher +
+      DeduplicateCorpus, word N-gram shingles, 2^61-1 universal MinHash,
+      LSH banding tuned to a 0.7 S-curve, union-find clusters keeping the
+      lowest-index representative); tests/TestNeuralMinHash.pas (8 tests).
 
 - [ ] Wav2Vec2 -large / robust LayerNorm variant + pretraining (follow-up to the
       landed Wav2Vec2/HuBERT CTC importer, which supports ONLY the wav2vec2-base

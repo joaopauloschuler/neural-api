@@ -14,7 +14,7 @@ uses
   TestNeuralScheduler, TestNeuralDecode, TestNeuralPretrained,
   TestNeuralDPO, TestNeuralGRPO, TestNeuralPreference,
   TestNeuralRewardModel,
-  TestNeuralKD, TestNeuralNLPMetrics, TestNeuralPacking,
+  TestNeuralKD, TestNeuralNLPMetrics, TestNeuralMinHash, TestNeuralPacking,
   TestNeuralLengthGrouped,
   TestNeuralMaskedLM,
   TestNeuralHFTokenizer, TestNeuralHFHub, TestNeuralNumpy,
