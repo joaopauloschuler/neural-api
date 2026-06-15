@@ -1170,21 +1170,27 @@ rather than acted on.
         use_mean_pooling pooler LayerNorm + patch mean left to the caller).
   - [ ] BEiTv2 (vector-quantized) not validated.
 
-- [ ] BLIP-2 Q-Former vision-language importer (BuildBlip2QFormerFromSafeTensors[Ex]
-      + BuildBlip2FromSafeTensors, e.g. Salesforce/blip2-opt-2.7b). The landed VLM
-      bridges (LLaVA `BuildLlavaProjector`, the SigLIP/CLIP towers) are simple
-      linear/MLP projectors from a frozen vision tower into an LLM; BLIP-2's
-      Q-Former is a genuinely DIFFERENT bridging module worth its own builder: a
-      small BERT-style transformer fed a fixed set of LEARNED query tokens
-      (`query_tokens`, e.g. 32) that, in each block, self-attend among themselves
-      AND cross-attend (`crossattention`) into the frozen ViT patch features, then
-      project the resulting query embeddings into the LLM token space. New code is
-      the query-token soft-prompt (reuse TNNetSoftPrompt) + the interleaved
-      self/cross-attention Q-Former block (reuse the landed two-source
-      cross-attention wiring) + the OPT/LLM decode tail (Build* already exists).
-      Establishes the querying-transformer primitive shared by InstructBLIP and
-      many later VLMs. Scope v1 to image-conditioned text generation on a pico
-      fixture; keep the ViT + LLM frozen.
+- [X] BLIP-2 Q-Former vision-language importer (BuildBlip2QFormerFromSafeTensors[Ex]
+      + BuildBlip2FromSafeTensors, neuralpretrained.pas). The Q-Former is a
+      BERT-style transformer fed a fixed set of LEARNED query tokens that, in each
+      POST-LN block, self-attend among themselves AND cross-attend into the FROZEN
+      ViT patch features (fed as the net's SECOND TNNetInput, the
+      T5EncoderStatesInput two-source convention; RECTANGULAR NumQuery x NumPatches
+      cross-attention via TNNetCrossAttention, encoder_hidden may differ from
+      hidden), then a query-specific FFN (intermediate_query/output_query) in
+      exact-erf gelu. A model-level layernorm normalizes the query embeddings first.
+      BuildBlip2FromSafeTensors returns the Q-Former net + the learned query_tokens
+      (input0) + the language_projection net (Q-Former hidden -> LLM token width);
+      it DETECTS the 'qformer.' prefix in a full blip2 checkpoint. LANDED: Q-Former
+      parity < 1e-4 vs the float64 HF Blip2QFormerModel oracle (TestBlip2QFormer-
+      Parity, measured ~2.5e-7; generator tools/blip2_qformer_tiny_fixture.py,
+      fixtures tests/fixtures/tiny_blip2_qformer.* + tiny_blip2_full.*) + the
+      full-bridge projection parity (TestBlip2FullBridgeParity) + examples/
+      Blip2Caption smoke. The FROZEN ViT (BuildClipVisionTower) and the FLAN-T5
+      decode tail (BuildT5FromSafeTensors via T5EncoderStatesInput) are REUSE,
+      documented not re-built. DEFERRED: the text-grounded use_qformer_text_input
+      ITC/ITM path, blip2-opt (no OPT importer in-tree), InstructBLIP, the full
+      ViT->Q-Former->FLAN-T5 caption on a real download.
 
 - [ ] DepthPro (Apple ml-depth-pro) sharp metric monocular-depth importer
       (BuildDepthProFromSafeTensors[Ex], apple/DepthPro). DISTINCT from the landed

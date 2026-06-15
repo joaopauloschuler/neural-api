@@ -326,6 +326,9 @@ type
     // equals greedy, and that the temperature/top-k path is reproducible at a
     // fixed RandSeed.
     procedure TestMusicGenGenerateEx;
+    procedure TestBlip2QFormerConfigFromJSONFile;
+    procedure TestBlip2QFormerParity;
+    procedure TestBlip2FullBridgeParity;
     procedure TestClipConfigFromJSONFile;
     procedure TestClipParity;
     procedure TestClapParity;
@@ -13374,6 +13377,203 @@ end;
 // plus the BuildFromPretrained "clip" rejection (a dual encoder cannot be
 // returned by the single-net dispatch; the error must redirect to
 // BuildClipFromSafeTensors) and the ClipTextEosPosition pooling rules.
+// BLIP-2 Q-Former config reader: the tiny fixture config.json round-trips
+// to the expected pico shape (gelu exact, cross_attention_frequency=2,
+// encoder_hidden_size != hidden_size).
+procedure TTestNeuralPretrained.TestBlip2QFormerConfigFromJSONFile;
+var
+  Config: TBlip2QFormerConfig;
+begin
+  Config := ReadBlip2QFormerConfigFromJSONFile(
+    FixturePath('tiny_blip2_qformer_config.json'));
+  AssertEquals('qformer hidden_size', 8, Config.HiddenSize);
+  AssertEquals('qformer num_hidden_layers', 2, Config.NumLayers);
+  AssertEquals('qformer num_attention_heads', 2, Config.NumHeads);
+  AssertEquals('qformer intermediate_size', 16, Config.IntermediateSize);
+  AssertEquals('qformer encoder_hidden_size', 12, Config.EncoderHiddenSize);
+  AssertEquals('qformer cross_attention_frequency', 2, Config.CrossAttnFreq);
+  AssertTrue('qformer gelu is exact (not tanh)', not Config.HiddenActTanh);
+end;
+
+// BLIP-2 Q-Former PARITY: build the pico Q-Former from the committed
+// fixture, feed the SAME fixed query_embeds (input0) and ViT features
+// (input1 - the second TNNetInput, the T5EncoderStatesInput convention)
+// the float64 HF Blip2QFormerModel oracle used, and assert the query
+// embeddings (last_hidden_state) match within 1e-4. This covers the
+// genuinely NEW Q-Former math: per-token embeddings.LayerNorm, bidirectional
+// self-attention over the queries, RECTANGULAR cross-attention into the
+// (different-width, different-length) ViT features, the query-specific FFN,
+// and the gelu(erf) path - all in BERT post-LN form. The fixture self-checks
+// assert the cross-attention, the query tokens, and the exact-vs-tanh gelu
+// all genuinely move the reference, so this gate is not vacuous.
+procedure TTestNeuralPretrained.TestBlip2QFormerParity;
+var
+  Config: TBlip2QFormerConfig;
+  NN: TNNet;
+  VisInput, Query, Output: TNNetVolume;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  QArr, EncArr, HidArr, RowArr: TJSONArray;
+  NumQuery, NumPatches, Hidden, EncHidden, i, j: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Query := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_blip2_qformer_qformer.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    QArr := TJSONArray(TJSONObject(RefRoot).Find('query_embeds'));
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    HidArr := TJSONArray(TJSONObject(RefRoot).Find('hidden'));
+    AssertTrue('query_embeds present', QArr <> nil);
+    AssertTrue('encoder_hidden_states present', EncArr <> nil);
+    AssertTrue('hidden present', HidArr <> nil);
+
+    NumQuery := QArr.Count;
+    NumPatches := EncArr.Count;
+    Hidden := TJSONArray(QArr.Items[0]).Count;
+    EncHidden := TJSONArray(EncArr.Items[0]).Count;
+
+    NN := BuildBlip2QFormerFromSafeTensorsEx(
+      FixturePath('tiny_blip2_qformer.safetensors'), Config, NumPatches,
+      {pInferenceOnly=}true, FixturePath('tiny_blip2_qformer_config.json'));
+    AssertEquals('qformer num query tokens', NumQuery, Config.NumQueryTokens);
+    AssertEquals('qformer encoder hidden', EncHidden, Config.EncoderHiddenSize);
+
+    // input1: the (NumPatches,1,EncHidden) frozen ViT features - fill the
+    // SECOND TNNetInput before Compute.
+    VisInput := Blip2QFormerVisionInput(NN).Output;
+    VisInput.ReSize(NumPatches, 1, EncHidden);
+    for i := 0 to NumPatches - 1 do
+    begin
+      RowArr := TJSONArray(EncArr.Items[i]);
+      for j := 0 to EncHidden - 1 do
+        VisInput[i, 0, j] := RowArr.Items[j].AsFloat;
+    end;
+    // input0: the (NumQuery,1,Hidden) query embeddings.
+    Query.ReSize(NumQuery, 1, Hidden);
+    for i := 0 to NumQuery - 1 do
+    begin
+      RowArr := TJSONArray(QArr.Items[i]);
+      for j := 0 to Hidden - 1 do
+        Query[i, 0, j] := RowArr.Items[j].AsFloat;
+    end;
+
+    NN.Compute(Query);
+    NN.GetOutput(Output);
+    AssertEquals('qformer output size', NumQuery * Hidden, Output.Size);
+    MaxDiff := 0;
+    for i := 0 to NumQuery - 1 do
+    begin
+      RowArr := TJSONArray(HidArr.Items[i]);
+      for j := 0 to Hidden - 1 do
+      begin
+        Diff := Abs(Output[i, 0, j] - RowArr.Items[j].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('BLIP-2 Q-Former parity: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    NN.Free;
+    Output.Free;
+    Query.Free;
+    RefJson.Free;
+  end;
+end;
+
+// BLIP-2 FULL-BRIDGE smoke + parity: from a full-blip2-LAYOUT checkpoint
+// (qformer.* tensors + the learned query_tokens + the language_projection
+// head), BuildBlip2FromSafeTensors returns the Q-Former net, the query_tokens
+// (input0) and the language_projection net. Feed the query_tokens + the same
+// ViT features and assert the PROJECTED query embeddings
+// (language_projection(qformer(...))) match the float64 oracle within 1e-4.
+// This exercises the 'qformer.' prefix detection, the query_tokens load and
+// the per-token projection head - the BLIP-2-specific glue beyond the
+// Q-Former. The ViT tower + FLAN-T5 decode tail are reused via the landed
+// BuildClipVisionTower / BuildT5FromSafeTensors (documented, not built here).
+procedure TTestNeuralPretrained.TestBlip2FullBridgeParity;
+var
+  QFormerNet, ProjectionNet: TNNet;
+  QueryTokens, VisInput, QfOut, ProjOut: TNNetVolume;
+  Config: TBlip2QFormerConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  EncArr, ProjArr, RowArr: TJSONArray;
+  NumPatches, EncHidden, NumQuery, TextHidden, i, j: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  ProjOut := TNNetVolume.Create;
+  QfOut := TNNetVolume.Create;
+  RefRoot := nil;
+  QFormerNet := nil;
+  ProjectionNet := nil;
+  QueryTokens := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_blip2_full_projected.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    EncArr := TJSONArray(TJSONObject(RefRoot).Find('encoder_hidden_states'));
+    ProjArr := TJSONArray(TJSONObject(RefRoot).Find('projected'));
+    AssertTrue('encoder_hidden_states present', EncArr <> nil);
+    AssertTrue('projected present', ProjArr <> nil);
+    NumPatches := EncArr.Count;
+    EncHidden := TJSONArray(EncArr.Items[0]).Count;
+
+    BuildBlip2FromSafeTensors(FixturePath('tiny_blip2_full.safetensors'),
+      QFormerNet, ProjectionNet, QueryTokens, Config, NumPatches,
+      {pInferenceOnly=}true,
+      FixturePath('tiny_blip2_full_config.json'));
+    NumQuery := Config.NumQueryTokens;
+    AssertTrue('query_tokens loaded', QueryTokens <> nil);
+    AssertEquals('query_tokens size', NumQuery * Config.HiddenSize,
+      QueryTokens.Size);
+    TextHidden := TJSONArray(ProjArr.Items[0]).Count;
+
+    // Fill the Q-Former ViT input (input1) with the fixed features.
+    VisInput := Blip2QFormerVisionInput(QFormerNet).Output;
+    VisInput.ReSize(NumPatches, 1, EncHidden);
+    for i := 0 to NumPatches - 1 do
+    begin
+      RowArr := TJSONArray(EncArr.Items[i]);
+      for j := 0 to EncHidden - 1 do
+        VisInput[i, 0, j] := RowArr.Items[j].AsFloat;
+    end;
+    // Q-Former on the learned query_tokens, then the projection head.
+    QFormerNet.Compute(QueryTokens);
+    QFormerNet.GetOutput(QfOut);
+    ProjectionNet.Compute(QfOut);
+    ProjectionNet.GetOutput(ProjOut);
+    AssertEquals('projected size', NumQuery * TextHidden, ProjOut.Size);
+    MaxDiff := 0;
+    for i := 0 to NumQuery - 1 do
+    begin
+      RowArr := TJSONArray(ProjArr.Items[i]);
+      for j := 0 to TextHidden - 1 do
+      begin
+        Diff := Abs(ProjOut[i, 0, j] - RowArr.Items[j].AsFloat);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('BLIP-2 full-bridge parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    QueryTokens.Free;
+    ProjectionNet.Free;
+    QFormerNet.Free;
+    QfOut.Free;
+    ProjOut.Free;
+    RefJson.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestClipConfigFromJSONFile;
 var
   Config: TClipConfig;

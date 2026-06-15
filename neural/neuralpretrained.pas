@@ -2154,6 +2154,124 @@ procedure SaveBertToSafeTensors(Net: TNNet; const Config: TBertConfig;
   const FileName: string; pIncludePooler: boolean = false;
   pDType: TSafeTensorsWriteDType = stwF32);
 
+// ========================== BLIP-2 Q-FORMER ================================
+// The BLIP-2 (Li et al. 2023, arXiv:2301.12597) querying transformer
+// (Q-Former) - the repo's FIRST genuinely DIFFERENT vision-language BRIDGE
+// (the landed LLaVA / SigLIP / CLIP projectors are simple linear/MLP heads
+// from a frozen vision tower into an LLM; the Q-Former is a small
+// BERT-style transformer that distils the ViT patch grid into a fixed set
+// of query embeddings).
+//
+// A fixed set of LEARNED query tokens (query_tokens, e.g. 32) is fed
+// through NumLayers BERT-style POST-LN blocks. In each block the query
+// tokens:
+//   1. SELF-attend among themselves (bidirectional MHA), post-LN:
+//        q := LN(q + attn.output.dense(MHA(q,q,q)))     [attention.*]
+//   2. CROSS-attend into the FROZEN ViT patch features (only on layers
+//      where layer_idx mod cross_attention_frequency = 0), post-LN:
+//        q := LN(q + crossattention.output.dense(MHA(q, kv=ViT)))
+//      The K|V come from the (NumPatches,1,encoder_hidden) ViT features
+//      fed as the net's SECOND TNNetInput (the T5EncoderStatesInput
+//      two-source convention), so the scores are RECTANGULAR
+//      NumQuery x NumPatches and encoder_hidden may differ from hidden.
+//   3. FFN, post-LN, via the query-specific intermediate_query/output_query
+//      (use_qformer_text_input=false, the BLIP-2 query-only path):
+//        q := LN(q + output_query.dense(gelu(intermediate_query.dense(q))))
+// A model-level layernorm is applied to the query embeddings FIRST
+// (embeddings.LayerNorm). hidden_act "gelu" is the EXACT erf form (the
+// same ReGLU(Phi|x) composition the BERT importer uses).
+//
+// SCOPE v1: image-conditioned query distillation - the parity-critical
+// Q-Former piece (TestBlip2QFormerParity vs a float64 HF Blip2QFormerModel
+// oracle). The net takes input0 = (NumQuery,1,hidden) query embeddings and
+// input1 = (NumPatches,1,encoder_hidden) frozen ViT features, and outputs
+// the (NumQuery,1,hidden) query embeddings (HF last_hidden_state). The full
+// BLIP-2 caption pipeline (ViT tower -> Q-Former -> language_projection ->
+// FLAN-T5 decode) is wired by BuildBlip2FromSafeTensors below.
+// DEFERRED: use_qformer_text_input=true (the text-grounded ITC/ITM path),
+// blip2-opt (no OPT importer in-tree), InstructBLIP. Real checkpoints are
+// not redistributable; the pico fixture is a config-faithful random
+// generator checked against a float64 oracle (tools/blip2_qformer_tiny_
+// fixture.py). Coded by Claude (AI).
+type
+  TBlip2QFormerConfig = record
+    HiddenSize: integer;        // hidden_size (Q-Former working width)
+    NumLayers: integer;         // num_hidden_layers
+    NumHeads: integer;          // num_attention_heads
+    IntermediateSize: integer;  // intermediate_size (FFN width)
+    EncoderHiddenSize: integer; // encoder_hidden_size (ViT feature width)
+    CrossAttnFreq: integer;     // cross_attention_frequency (2)
+    NumQueryTokens: integer;    // number of learned query tokens (32)
+    LayerNormEps: TNeuralFloat; // layer_norm_eps (1e-12)
+    HiddenActTanh: boolean;     // gelu_pytorch_tanh vs exact erf gelu
+    Prefix: string;             // tensor-name prefix ('' standalone, 'qformer.'
+                                // inside a full blip2 checkpoint) - DETECTED
+                                // by the builder
+    ModelType: string;          // 'blip_2_qformer'
+  end;
+
+// Reads a HF Q-Former config (a blip2 config.json "qformer_config" object,
+// or a standalone Blip2QFormerConfig). Defaults follow Blip2QFormerConfig:
+// hidden_act "gelu" (exact erf), layer_norm_eps 1e-12,
+// cross_attention_frequency 2. NumQueryTokens / EncoderHiddenSize come from
+// the top-level config (num_query_tokens, vision_config.hidden_size) when
+// reading a full blip2 config; for a standalone qformer config they default
+// to 32 / hidden_size and may be overridden. hidden_act other than
+// gelu / gelu_new / gelu_pytorch_tanh is rejected.
+function ReadBlip2QFormerConfigFromJSONFile(
+  const FileName: string): TBlip2QFormerConfig;
+
+function Blip2QFormerConfigToString(
+  const Config: TBlip2QFormerConfig): string;
+
+// Builds the BLIP-2 Q-Former net described by Config and loads every weight
+// from the checkpoint at FileName (encoder.layer.N.* tensors + the
+// model-level layernorm.*). The net has TWO inputs: input0 =
+// (NumQueryTokens,1,HiddenSize) query embeddings (the learned query_tokens
+// in the full model; fed directly here), input1 =
+// (NumPatches,1,EncoderHiddenSize) frozen ViT patch features (the
+// T5EncoderStatesInput convention - fill its Output before Compute). The
+// output is the (NumQueryTokens,1,HiddenSize) query embeddings (HF
+// Blip2QFormerModel last_hidden_state). NumPatches <= 0 uses 1 patch
+// (resized at Compute). The net is owned by the caller.
+function BuildBlip2QFormerFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBlip2QFormerConfig; NumPatches: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildBlip2QFormerFromSafeTensorsEx(const FileName: string;
+  out Config: TBlip2QFormerConfig; NumPatches: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// Returns the SECOND TNNetInput of a Q-Former net (built above): the
+// (NumPatches,1,EncoderHiddenSize) frozen ViT-feature input. Fill its
+// Output (e.g. Copy the vision tower's patch hidden states) before
+// QFormerNet.Compute(queryEmbeds). Raises if the net has no second input.
+function Blip2QFormerVisionInput(QFormerNet: TNNet): TNNetLayer;
+
+// Builds the BLIP-2-SPECIFIC bridge from a full blip2 checkpoint (e.g.
+// Salesforce/blip2-flan-t5-xl): the Q-Former net (above, with the qformer.*
+// prefix), the learned query_tokens (returned in QueryTokens, the fixed
+// (NumQueryTokens,1,HiddenSize) input0 the caller feeds the Q-Former), and
+// the language_projection net (a single per-token linear mapping the
+// Q-Former hidden width to the LLM token width - returned in ProjectionNet,
+// a 1-input (NumQueryTokens,1,HiddenSize) -> (NumQueryTokens,1,TextHidden)
+// net). The FROZEN ViT tower and the FLAN-T5 decode tail are NOT built here
+// (v1 scope): reuse the landed BuildClipVisionTower for the EVA/CLIP-style
+// ViT (feed its (NumPatches,1,vHidden) patch states into the Q-Former vision
+// input) and BuildT5FromSafeTensors for the decoder (feed the projected
+// query embeddings as the encoder states via T5EncoderStatesInput - the
+// SAME two-net convention TrOCR/Marian use). The full caption pipeline
+// (ViT -> Q-Former -> language_projection -> spliced into FLAN-T5) is the
+// documented examples/Blip2Caption smoke. All returned nets/volumes are
+// owned by the caller. Coded by Claude (AI).
+procedure BuildBlip2FromSafeTensors(const FileName: string;
+  out QFormerNet, ProjectionNet: TNNet; out QueryTokens: TNNetVolume;
+  out QFormerConfig: TBlip2QFormerConfig; NumPatches: integer = 0;
+  pInferenceOnly: boolean = false; const ConfigFileName: string = '');
+
 // Inverse of BuildGPTNeoXFromSafeTensors: walks the wired GPT-NeoX decoder
 // in importer build order, recovers each HF-named tensor with the EXACT
 // inverse of every load transform (re-interleaving the per-head Q|K|V slab
@@ -19070,6 +19188,498 @@ var
 begin
   Result := BuildBertFromSafeTensorsEx(FileName, IgnoredConfig, pSeqLen,
     pInferenceOnly, pIncludePooler, '', pQuantizeInt8);
+end;
+
+// ======================= BLIP-2 Q-FORMER (impl) ============================
+
+function ReadBlip2QFormerConfigFromJSONFile(
+  const FileName: string): TBlip2QFormerConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  TopObj, QObj, VObj: TJSONObject;
+  HiddenAct: string;
+
+  function GetIntField(Obj: TJSONObject; const FieldName: string;
+    Default: integer): integer;
+  begin
+    if (Obj <> nil) and (Obj.IndexOfName(FieldName) >= 0) then
+      Result := Obj.Get(FieldName, Default)
+    else
+      Result := Default;
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('BLIP-2 Q-Former import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('BLIP-2 Q-Former import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('BLIP-2 Q-Former import: config "' + FileName +
+        '" is not a JSON object.');
+    TopObj := TJSONObject(Root);
+    // A full blip2 config nests the Q-Former under "qformer_config" and the
+    // ViT under "vision_config"; a standalone Blip2QFormerConfig is flat.
+    if TopObj.IndexOfName('qformer_config') >= 0 then
+      QObj := TJSONObject(TopObj.Find('qformer_config'))
+    else
+      QObj := TopObj;
+    VObj := nil;
+    if TopObj.IndexOfName('vision_config') >= 0 then
+      VObj := TJSONObject(TopObj.Find('vision_config'));
+
+    Result.HiddenSize := GetIntField(QObj, 'hidden_size', 768);
+    Result.NumLayers := GetIntField(QObj, 'num_hidden_layers', 12);
+    Result.NumHeads := GetIntField(QObj, 'num_attention_heads', 12);
+    Result.IntermediateSize := GetIntField(QObj, 'intermediate_size', 3072);
+    Result.CrossAttnFreq := GetIntField(QObj, 'cross_attention_frequency', 2);
+    // encoder_hidden_size: explicit on the qformer config, else the ViT
+    // hidden_size (the full-blip2 layout where the Q-Former cross-attends
+    // into vision_config.hidden_size features).
+    Result.EncoderHiddenSize := GetIntField(QObj, 'encoder_hidden_size', 0);
+    if Result.EncoderHiddenSize <= 0 then
+      Result.EncoderHiddenSize := GetIntField(VObj, 'hidden_size',
+        Result.HiddenSize);
+    // num_query_tokens lives on the TOP-LEVEL blip2 config.
+    Result.NumQueryTokens := GetIntField(TopObj, 'num_query_tokens',
+      GetIntField(QObj, 'num_query_tokens', 32));
+    Result.LayerNormEps := 1e-12;
+    if (QObj <> nil) and (QObj.IndexOfName('layer_norm_eps') >= 0) then
+      Result.LayerNormEps := QObj.Get('layer_norm_eps', 1e-12);
+    HiddenAct := 'gelu';
+    if (QObj <> nil) and (QObj.IndexOfName('hidden_act') >= 0) then
+      HiddenAct := QObj.Get('hidden_act', 'gelu');
+    if (HiddenAct = 'gelu') or (HiddenAct = 'gelu_new') then
+      Result.HiddenActTanh := false
+    else if (HiddenAct = 'gelu_pytorch_tanh') then
+      Result.HiddenActTanh := true
+    else
+      ImportError('BLIP-2 Q-Former import: unsupported hidden_act "' +
+        HiddenAct + '" (only gelu / gelu_new / gelu_pytorch_tanh).');
+    Result.Prefix := ''; // detected by the builder
+    Result.ModelType := 'blip_2_qformer';
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function Blip2QFormerConfigToString(
+  const Config: TBlip2QFormerConfig): string;
+begin
+  Result := 'Blip2QFormer(hidden=' + IntToStr(Config.HiddenSize) +
+    ', layers=' + IntToStr(Config.NumLayers) +
+    ', heads=' + IntToStr(Config.NumHeads) +
+    ', inter=' + IntToStr(Config.IntermediateSize) +
+    ', enc_hidden=' + IntToStr(Config.EncoderHiddenSize) +
+    ', cross_freq=' + IntToStr(Config.CrossAttnFreq) +
+    ', queries=' + IntToStr(Config.NumQueryTokens) +
+    ', gelu=' + BoolToStr(not Config.HiddenActTanh, 'erf', 'tanh') + ')';
+end;
+
+function BuildBlip2QFormerFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TBlip2QFormerConfig; NumPatches: integer = 0;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  QueryInput, VisionInput, EmbLN, QKV, BranchInput, HiddenAct, PhiBranch: TNNetLayer;
+  QProj, KProj, VProj, QSlice, KSlice, VSlice, KVPack: TNNetLayer;
+  AttnLN, CrossLN, FFNInter, FFNOut, FFNLN: TNNetLayer;
+  Heads: array of TNNetLayer;
+  BlockCnt, HeadCnt, HeadDim, d, i: integer;
+  Patches: integer;
+  BlockPrefix, QName, KName, VName, ADense, ALN: string;
+  CQName, CKName, CVName, CDense, CLN: string;
+  InterName, OutName, OutLNName, TensorNameStr: string;
+  HasCross: boolean;
+  Consumed: TStringList;
+  SliceChannels: array of integer;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+  // gelu(x): exact erf form x*Phi(x) (Phi = 0.5*(1+erf(x/sqrt2))) composed
+  // as ReGLU(Phi|x) = ReLU(Phi)*x = Phi*x (Phi in (0,1)), exactly the BERT
+  // importer's construction; the tanh approximation uses TNNetGELU.
+  procedure AddGelu();
+  begin
+    if Config.HiddenActTanh then
+      NN.AddLayer( TNNetGELU.Create() )
+    else
+    begin
+      HiddenAct := NN.GetLastLayer();
+      NN.AddLayerAfter(
+        TNNetMulByConstant.Create(0.7071067811865476), HiddenAct);
+      NN.AddLayer( TNNetErf.Create() );
+      NN.AddLayer( TNNetAddConstant.Create(1.0) );
+      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
+      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, HiddenAct]) );
+      NN.AddLayer( TNNetReGLU.Create() );
+    end;
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation ----------------
+      if Config.NumHeads < 1 then
+        ImportError('BLIP-2 Q-Former import: num_attention_heads must >= 1.');
+      if (Config.HiddenSize mod Config.NumHeads) <> 0 then
+        ImportError('BLIP-2 Q-Former import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' not divisible by num_heads=' +
+          IntToStr(Config.NumHeads) + '.');
+      if Config.NumQueryTokens < 1 then
+        ImportError('BLIP-2 Q-Former import: num_query_tokens must >= 1.');
+      if Config.CrossAttnFreq < 1 then
+        ImportError('BLIP-2 Q-Former import: cross_attention_frequency >= 1.');
+      // Prefix detection: a standalone Blip2QFormerModel serializes
+      // encoder.layer.0.* / layernorm.*; a full blip2 checkpoint carries
+      // qformer.encoder.layer.0.* / qformer.layernorm.*.
+      if Reader.HasTensor('encoder.layer.0.attention.attention.query.weight')
+      then Config.Prefix := ''
+      else if Reader.HasTensor(
+        'qformer.encoder.layer.0.attention.attention.query.weight') then
+        Config.Prefix := 'qformer.'
+      else
+        ImportError('BLIP-2 Q-Former import: neither "encoder.layer.0..." ' +
+          'nor "qformer.encoder.layer.0..." found in ' + Reader.FileName +
+          ' - not a Q-Former checkpoint?');
+      HeadDim := Config.HiddenSize div Config.NumHeads;
+      Patches := NumPatches;
+      if Patches <= 0 then Patches := 1;
+      SetLength(Heads, Config.NumHeads);
+      SetLength(SliceChannels, HeadDim);
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      // input0: the (NumQuery,1,hidden) query embeddings (learned
+      // query_tokens in the full model). input1: the (NumPatches,1,
+      // encoder_hidden) frozen ViT features (filled before Compute -- the
+      // T5EncoderStatesInput two-source convention).
+      QueryInput := NN.AddLayer(
+        TNNetInput.Create(Config.NumQueryTokens, 1, Config.HiddenSize) );
+      VisionInput := NN.AddLayer(
+        TNNetInput.Create(Patches, 1, Config.EncoderHiddenSize) );
+      // Model-level embeddings.LayerNorm on the query embeddings FIRST.
+      EmbLN := NN.AddLayerAfter(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps), QueryInput );
+
+      for BlockCnt := 0 to Config.NumLayers - 1 do
+      begin
+        HasCross := (BlockCnt mod Config.CrossAttnFreq) = 0;
+        // ---- self-attention sub-block (BERT POST-LN) ----
+        //   q := LN(q + attn.output.dense(BIDIRECTIONAL-MHA(q|k|v(q)))).
+        BranchInput := NN.GetLastLayer();
+        QKV := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize) );
+        NN.AddMultiHeadSelfAttention(Config.NumHeads, {CausalMask=}false,
+          {UseRoPE=}false, avSDPA, {NumSinks=}1, {Window=}0,
+          {RelPosNumBuckets=}32, {RelPosMaxDistance=}128, {QKRMSNorm=}false,
+          {SegmentSource=}nil);
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        AttnLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+
+        // ---- cross-attention sub-block (only on cross-attn layers) ----
+        // Q from the post-normed query stream; K|V projected from the ViT
+        // features (VisionInput). The two grids differ in length (NumQuery
+        // vs NumPatches) AND width (encoder_hidden vs hidden for K|V), so
+        // the per-head leaf is TNNetCrossAttention (rectangular scores).
+        CrossLN := nil;
+        QProj := nil; KProj := nil; VProj := nil;
+        if HasCross then
+        begin
+          BranchInput := AttnLN;
+          QProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize), BranchInput);
+          KProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize), VisionInput);
+          VProj := NN.AddLayerAfter(
+            TNNetPointwiseConvLinear.Create(Config.HiddenSize), VisionInput);
+          for HeadCnt := 0 to Config.NumHeads - 1 do
+          begin
+            for d := 0 to HeadDim - 1 do
+              SliceChannels[d] := HeadCnt * HeadDim + d;
+            QSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), QProj);
+            KSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), KProj);
+            VSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), VProj);
+            KVPack := NN.AddLayer( TNNetDeepConcat.Create([KSlice, VSlice]) );
+            Heads[HeadCnt] := NN.AddLayerAfter(
+              TNNetCrossAttention.Create(HeadDim, {CausalMask=}false,
+                KVPack), QSlice);
+          end;
+          NN.AddLayer( TNNetDeepConcat.Create(Heads) );
+          // crossattention.output.dense out-projection.
+          NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+          NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+          CrossLN := NN.AddLayer(
+            TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        end;
+
+        // ---- FFN sub-block (intermediate_query / output_query) ----
+        //   q := LN(q + output_query.dense(gelu(intermediate_query.dense(q)))).
+        BranchInput := NN.GetLastLayer();
+        FFNInter := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        AddGelu();
+        FFNOut := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        FFNLN := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+
+        // ---------------- Weights for this block ----------------
+        BlockPrefix := Config.Prefix + 'encoder.layer.' +
+          IntToStr(BlockCnt) + '.';
+        QName := BlockPrefix + 'attention.attention.query';
+        KName := BlockPrefix + 'attention.attention.key';
+        VName := BlockPrefix + 'attention.attention.value';
+        ADense := BlockPrefix + 'attention.output.dense';
+        ALN := BlockPrefix + 'attention.output.LayerNorm';
+        InterName := BlockPrefix + 'intermediate_query.dense';
+        OutName := BlockPrefix + 'output_query.dense';
+        OutLNName := BlockPrefix + 'output_query.LayerNorm';
+        // Self-attn q/k/v -> fused Q|K|V slab thirds (matches the builder's
+        // per-head slicing = HF transpose_for_scores).
+        LoadLlamaLinearWeights(Reader, QKV, QName + '.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, 3 * Config.HiddenSize,
+          0, QName + '.bias');
+        MarkConsumed(QName + '.weight'); MarkConsumed(QName + '.bias');
+        LoadLlamaLinearWeights(Reader, QKV, KName + '.weight',
+          Config.HiddenSize, Config.HiddenSize, Config.HiddenSize,
+          3 * Config.HiddenSize, 0, KName + '.bias');
+        MarkConsumed(KName + '.weight'); MarkConsumed(KName + '.bias');
+        LoadLlamaLinearWeights(Reader, QKV, VName + '.weight',
+          Config.HiddenSize, Config.HiddenSize, 2 * Config.HiddenSize,
+          3 * Config.HiddenSize, 0, VName + '.bias');
+        MarkConsumed(VName + '.weight'); MarkConsumed(VName + '.bias');
+        // attention.output.dense is the LAST layer the self-attn builder
+        // appended before the Sum (the out-projection PointwiseConvLinear).
+        LoadLlamaLinearWeights(Reader,
+          AttnLN.PrevLayer.PrevLayer, ADense + '.weight',
+          Config.HiddenSize, Config.HiddenSize, 0, -1, 0, ADense + '.bias');
+        MarkConsumed(ADense + '.weight'); MarkConsumed(ADense + '.bias');
+        LoadLayerNormWeights(Reader, AttnLN, ALN + '.weight', ALN + '.bias',
+          Config.HiddenSize);
+        MarkConsumed(ALN + '.weight'); MarkConsumed(ALN + '.bias');
+
+        if HasCross then
+        begin
+          CQName := BlockPrefix + 'crossattention.attention.query';
+          CKName := BlockPrefix + 'crossattention.attention.key';
+          CVName := BlockPrefix + 'crossattention.attention.value';
+          CDense := BlockPrefix + 'crossattention.output.dense';
+          CLN := BlockPrefix + 'crossattention.output.LayerNorm';
+          // Q from hidden, K|V from encoder_hidden (rectangular projections).
+          LoadLlamaLinearWeights(Reader, QProj, CQName + '.weight',
+            Config.HiddenSize, Config.HiddenSize, 0, -1, 0, CQName + '.bias');
+          MarkConsumed(CQName + '.weight'); MarkConsumed(CQName + '.bias');
+          LoadLlamaLinearWeights(Reader, KProj, CKName + '.weight',
+            Config.EncoderHiddenSize, Config.HiddenSize, 0, -1, 0,
+            CKName + '.bias');
+          MarkConsumed(CKName + '.weight'); MarkConsumed(CKName + '.bias');
+          LoadLlamaLinearWeights(Reader, VProj, CVName + '.weight',
+            Config.EncoderHiddenSize, Config.HiddenSize, 0, -1, 0,
+            CVName + '.bias');
+          MarkConsumed(CVName + '.weight'); MarkConsumed(CVName + '.bias');
+          // crossattention.output.dense = the layer before the cross Sum.
+          LoadLlamaLinearWeights(Reader,
+            CrossLN.PrevLayer.PrevLayer, CDense + '.weight',
+            Config.HiddenSize, Config.HiddenSize, 0, -1, 0, CDense + '.bias');
+          MarkConsumed(CDense + '.weight'); MarkConsumed(CDense + '.bias');
+          LoadLayerNormWeights(Reader, CrossLN, CLN + '.weight',
+            CLN + '.bias', Config.HiddenSize);
+          MarkConsumed(CLN + '.weight'); MarkConsumed(CLN + '.bias');
+        end;
+
+        LoadLlamaLinearWeights(Reader, FFNInter, InterName + '.weight',
+          Config.HiddenSize, Config.IntermediateSize, 0, -1, 0,
+          InterName + '.bias');
+        MarkConsumed(InterName + '.weight'); MarkConsumed(InterName + '.bias');
+        LoadLlamaLinearWeights(Reader, FFNOut, OutName + '.weight',
+          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0,
+          OutName + '.bias');
+        MarkConsumed(OutName + '.weight'); MarkConsumed(OutName + '.bias');
+        LoadLayerNormWeights(Reader, FFNLN, OutLNName + '.weight',
+          OutLNName + '.bias', Config.HiddenSize);
+        MarkConsumed(OutLNName + '.weight'); MarkConsumed(OutLNName + '.bias');
+      end;
+
+      // Model-level embeddings.LayerNorm (the FIRST TokenLayerNorm, right
+      // after the query input).
+      LoadLayerNormWeights(Reader,
+        EmbLN, Config.Prefix + 'layernorm.weight',
+        Config.Prefix + 'layernorm.bias', Config.HiddenSize);
+      MarkConsumed(Config.Prefix + 'layernorm.weight');
+      MarkConsumed(Config.Prefix + 'layernorm.bias');
+
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // Text-input path tensors (use_qformer_text_input=true) are not part
+        // of the query-only bridge this v1 imports.
+        if Pos('embeddings.word_embeddings', TensorNameStr) > 0 then continue;
+        if Pos('embeddings.position_embeddings', TensorNameStr) > 0 then
+          continue;
+        if (Pos('.intermediate.', TensorNameStr) > 0) or
+           (Pos('.output.dense', TensorNameStr) > 0) or
+           (Pos('.output.LayerNorm', TensorNameStr) > 0) then continue;
+        // Full-blip2-checkpoint siblings the Q-Former net does not carry:
+        // the ViT tower, the LLM, the learned query_tokens and the
+        // language_projection head (loaded by BuildBlip2FromSafeTensors).
+        if Config.Prefix <> '' then
+        begin
+          if (Pos('vision_model.', TensorNameStr) > 0) or
+             (Pos('language_model.', TensorNameStr) > 0) or
+             (Pos('language_projection.', TensorNameStr) > 0) or
+             (TensorNameStr = 'query_tokens') then continue;
+        end;
+        ImportError('BLIP-2 Q-Former import: unexpected tensor "' +
+          TensorNameStr + '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free;
+    Consumed.Free;
+    Reader.Free;
+    SetLength(Heads, 0);
+    SetLength(SliceChannels, 0);
+  end;
+end;
+
+function BuildBlip2QFormerFromSafeTensorsEx(const FileName: string;
+  out Config: TBlip2QFormerConfig; NumPatches: integer = 0;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadBlip2QFormerConfigFromJSONFile(ConfigPath);
+  Result := BuildBlip2QFormerFromSafeTensorsWithConfig(FileName, Config,
+    NumPatches, pInferenceOnly);
+end;
+
+function Blip2QFormerVisionInput(QFormerNet: TNNet): TNNetLayer;
+var
+  LayerCnt, InputCnt: integer;
+begin
+  Result := nil;
+  InputCnt := 0;
+  for LayerCnt := 0 to QFormerNet.Layers.Count - 1 do
+    if QFormerNet.Layers[LayerCnt] is TNNetInput then
+    begin
+      Inc(InputCnt);
+      if InputCnt = 2 then
+      begin
+        Result := QFormerNet.Layers[LayerCnt];
+        exit;
+      end;
+    end;
+  ImportError('Blip2QFormerVisionInput: the net has no second TNNetInput - ' +
+    'not a BuildBlip2QFormerFromSafeTensors net?');
+end;
+
+procedure BuildBlip2FromSafeTensors(const FileName: string;
+  out QFormerNet, ProjectionNet: TNNet; out QueryTokens: TNNetVolume;
+  out QFormerConfig: TBlip2QFormerConfig; NumPatches: integer = 0;
+  pInferenceOnly: boolean = false; const ConfigFileName: string = '');
+var
+  Reader: TNNetSafeTensorsReader;
+  ConfigPath, QTName, ProjName: string;
+  ProjInput, ProjDense: TNNetLayer;
+  TextHidden: integer;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  QFormerConfig := ReadBlip2QFormerConfigFromJSONFile(ConfigPath);
+  // The Q-Former net (its builder detects the 'qformer.' prefix in a full
+  // blip2 checkpoint and ignores the ViT / LLM / projection siblings).
+  QFormerNet := BuildBlip2QFormerFromSafeTensorsWithConfig(FileName,
+    QFormerConfig, NumPatches, pInferenceOnly);
+  ProjectionNet := nil;
+  QueryTokens := nil;
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    try
+      // query_tokens: (1, NumQueryTokens, HiddenSize) -> the fixed input0.
+      QTName := 'query_tokens';
+      if not Reader.HasTensor(QTName) then
+        ImportError('BLIP-2 import: missing tensor "query_tokens" - not a ' +
+          'full blip2 checkpoint? (use BuildBlip2QFormerFromSafeTensors for ' +
+          'a standalone Q-Former).');
+      QueryTokens := TNNetVolume.Create;
+      Reader.LoadTensorFlat(QTName, QueryTokens);
+      QueryTokens.ReSize(QFormerConfig.NumQueryTokens, 1,
+        QFormerConfig.HiddenSize);
+
+      // language_projection: a single nn.Linear(hidden -> text_hidden),
+      // applied per query token. Built as a 1-input per-token linear net.
+      ProjName := 'language_projection';
+      if not Reader.HasTensor(ProjName + '.weight') then
+        ImportError('BLIP-2 import: missing tensor "language_projection.' +
+          'weight".');
+      TextHidden := Reader.DimSize(ProjName + '.weight', 0);
+      ProjectionNet := TNNet.Create();
+      ProjInput := ProjectionNet.AddLayer(
+        TNNetInput.Create(QFormerConfig.NumQueryTokens, 1,
+          QFormerConfig.HiddenSize) );
+      ProjDense := ProjectionNet.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(TextHidden), ProjInput);
+      if pInferenceOnly then ProjectionNet.MakeInferenceOnly();
+      LoadLlamaLinearWeights(Reader, ProjDense, ProjName + '.weight',
+        QFormerConfig.HiddenSize, TextHidden, 0, -1, 0, ProjName + '.bias');
+    except
+      on E: ESafeTensorsError do
+      begin
+        QFormerNet.Free; QFormerNet := nil;
+        ProjectionNet.Free; ProjectionNet := nil;
+        QueryTokens.Free; QueryTokens := nil;
+        raise EPretrainedImportError.Create(E.Message);
+      end;
+      on E: Exception do
+      begin
+        QFormerNet.Free; QFormerNet := nil;
+        ProjectionNet.Free; ProjectionNet := nil;
+        QueryTokens.Free; QueryTokens := nil;
+        raise;
+      end;
+    end;
+  finally
+    Reader.Free;
+  end;
 end;
 
 // ======================= SENTENCE EMBEDDINGS ===============================
