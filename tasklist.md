@@ -818,6 +818,26 @@ rather than acted on.
       ("yes"/"no"/"up"/"down"/...). Pure CPU, ships a tiny downloader + a
       reproducible accuracy number; demonstrates that the audio frontend is usable
       for ordinary supervised training, not only for pretrained-model import.
+      LANDED (examples/SpeechCommands, .lpr + .lpi + README + scripts/download_speech_commands.sh):
+      default no-network SMOKE generates a deterministic synthetic 6-keyword set
+      (fixed RandSeed; low/mid/high tones + up/down chirps + band-limited noise)
+      and runs it through the REAL ComputeWhisperLogMel ((100,1,40) log-mel) into a
+      Conv(24,5)/MaxPool4 -> Conv(32,3)/MaxPool4 -> Conv(48,3)/MaxPool2 ->
+      FullConnectReLU(64) -> Dropout -> FullConnectLinear -> SoftMax stack trained
+      with TNeuralFit. Smoke validation climbs 83.5% -> 100% over 2 epochs and the
+      held-out test set scores 93.89% (chance 16.7%), well under the 280 s /
+      ulimit -v 3000000 budget. An optional `--full <dir>` loads real Speech
+      Commands WAVs via LoadWav16ToVolume (same frontend), documented but NOT
+      exercised by the smoke. Open follow-ups:
+  - [ ] run the `--full` path on real downloaded Speech Commands v2 and record a
+        real-data accuracy number (the synthetic smoke is trivially separable —
+        validation saturates at epoch 2 — so it proves the path, not a hard
+        benchmark).
+  - [ ] a harder synthetic task (overlapping classes / lower SNR / more keywords)
+        so the smoke trains for more than ~2 epochs before validation hits the
+        default TargetAccuracy and early-stops.
+  - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
+        directly instead of requiring an ffmpeg pre-pass.
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
