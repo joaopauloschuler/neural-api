@@ -264,6 +264,11 @@ type
     procedure TestWav2Vec2ConfigFromJSONFile;
     procedure TestWav2Vec2CTCParity;
     procedure TestHubertCTCParity;
+    // Moonshine streaming-ASR ENCODER parity: raw waveform -> conv stem ->
+    // partial-RoPE bidirectional transformer -> encoder hidden states, vs an
+    // HF float64 oracle (a SECOND speech-to-text architecture, distinct from
+    // Whisper: no mel frontend, RoPE positions).
+    procedure TestMoonshineEncoderParity;
     // EnCodec: round-trips three pinned waveforms through the imported codec
     // (waveform -> RVQ codes -> waveform) and asserts the codes match the HF
     // oracle EXACTLY and the reconstructed waveform matches < 1e-4.
@@ -11880,6 +11885,79 @@ end;
 procedure TTestNeuralPretrained.TestHubertCTCParity;
 begin
   AssertWav2Vec2CTCParity({IsHubert=}true);
+end;
+
+procedure TTestNeuralPretrained.TestMoonshineEncoderParity;
+var
+  NN: TNNet;
+  Config: TMoonshineConfig;
+  RefRoot: TJSONData;
+  WaveArr, Hidden, RowArr: TJSONArray;
+  Input, Output: TNNetVolume;
+  RefJson: TStringList;
+  PosCnt, ChCnt, NumSamples, EncLen, expLen: integer;
+  Diff, MaxHiddenDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  NN := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_moonshine_encoder.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    WaveArr := TJSONArray(TJSONObject(RefRoot).Find('waveform'));
+    Hidden := TJSONArray(TJSONObject(RefRoot).Find('enc_hidden'));
+    expLen := TJSONObject(RefRoot).Get('enc_len', 0);
+    AssertTrue('waveform present', WaveArr <> nil);
+    AssertTrue('enc_hidden present', Hidden <> nil);
+    NumSamples := WaveArr.Count;
+
+    NN := BuildMoonshineFromSafeTensorsEx(
+      FixturePath('tiny_moonshine.safetensors'), Config, NumSamples,
+      {pInferenceOnly=}false, FixturePath('tiny_moonshine_config.json'));
+    AssertTrue('net built', NN <> nil);
+    EncLen := MoonshineEncoderLength(NumSamples);
+    AssertEquals('encoder length matches the oracle', expLen, EncLen);
+    AssertEquals('raw input length', NumSamples, NN.Layers[0].Output.SizeX);
+    AssertEquals('encoder hidden shape', EncLen * Config.HiddenSize,
+      NN.GetLastLayer().Output.Size);
+
+    // Partial-rotary sanity: int(head_dim * partial_rotary_factor) is even.
+    AssertEquals('partial rotary factor from config', 0.75,
+      Config.PartialRotaryFactor, 1e-9);
+
+    Input.ReSize(NumSamples, 1, 1);
+    for PosCnt := 0 to NumSamples - 1 do
+      Input.FData[PosCnt] := WaveArr.Items[PosCnt].AsFloat;
+    NN.Compute(Input);
+    NN.GetOutput(Output);
+
+    MaxHiddenDiff := 0;
+    AssertEquals('hidden frames', EncLen, Hidden.Count);
+    for PosCnt := 0 to EncLen - 1 do
+    begin
+      RowArr := TJSONArray(Hidden.Items[PosCnt]);
+      AssertEquals('hidden width', Config.HiddenSize, RowArr.Count);
+      for ChCnt := 0 to Config.HiddenSize - 1 do
+      begin
+        Diff := Abs(Output.FData[PosCnt * Config.HiddenSize + ChCnt] -
+          RowArr.Items[ChCnt].AsFloat);
+        if Diff > MaxHiddenDiff then MaxHiddenDiff := Diff;
+      end;
+    end;
+    // 1e-4 importer-parity gate (the committed-fixture convention). NEVER
+    // loosen - fix the model instead.
+    AssertTrue('Moonshine encoder hidden parity: max |diff| = ' +
+      FloatToStr(MaxHiddenDiff) + ' must be < 1e-4', MaxHiddenDiff < 1e-4);
+  finally
+    NN.Free;
+    RefRoot.Free;
+    Output.Free;
+    Input.Free;
+    RefJson.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestEnCodecRoundTripParity;

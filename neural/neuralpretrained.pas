@@ -3425,6 +3425,89 @@ function BuildWav2Vec2FromSafeTensors(const FileName: string;
   NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
 
 // ---------------------------------------------------------------------------
+// MOONSHINE STREAMING-ASR ENCODER IMPORT (model_type "moonshine", e.g.
+// UsefulSensors/moonshine-tiny | moonshine-base) - a SECOND speech-to-text
+// architecture, deliberately distinct from the landed Whisper importer.
+//
+// Whisper pads every clip to a FIXED 30 s log-mel spectrogram; Moonshine has
+// NO mel frontend. It convolves RoPE-positioned features DIRECTLY off the raw
+// 16 kHz waveform with a small strided-conv STEM, so compute scales with the
+// ACTUAL audio length. Its encoder-decoder transformer uses RoPE (partial
+// rotary) + (decoder) SwiGLU, not Whisper's learned absolute positions + GELU
+// MLP. This v1 imports the ENCODER (the parity surface); the decoder reuses
+// the landed seq2seq RoPE/SwiGLU machinery and is a documented follow-up.
+//
+// Encoder forward (HF MoonshineEncoder, on input_values shape (B, samples)):
+//   x := input_values.unsqueeze(1)                       # (B, 1, samples)
+//   x := tanh(conv1(x))           # Conv1d(1->hid, k=127, s=64, BIAS-FREE)
+//   x := groupnorm(x)             # GroupNorm(num_groups=1, hid), affine
+//   x := gelu(conv2(x))           # Conv1d(hid->2*hid, k=7, s=3) + bias
+//   x := gelu(conv3(x))           # Conv1d(2*hid->hid, k=3, s=2) + bias
+//   x := x.permute(0, 2, 1)                              # (B, T, hid)
+//   # PRE-norm bidirectional transformer blocks; partial RoPE on q/k:
+//   for blk: x := x + self_attn(input_layernorm(x))
+//            x := x + mlp(post_attention_layernorm(x))   # fc1->gelu->fc2
+//   x := layer_norm(x)            # FINAL stack norm
+// Every LayerNorm here is bias=False (CENTERED, gain-only - the same op as
+// TNNetTokenLayerNorm with a zeroed beta). Every GELU is the exact erf form.
+// Attention is BIDIRECTIONAL (non-causal), 1/sqrt(head_dim) scaling, bias-free
+// q/k/v/o; RoPE rotates the first int(head_dim * partial_rotary_factor)
+// channels of each head, the tail passes through (the Phi-3 partial-rotary
+// slice wiring, reused verbatim). Coded by Claude (AI).
+
+type
+  TMoonshineConfig = record
+    HiddenSize: integer;            // hidden_size (d_model)
+    NumEncoderLayers: integer;      // encoder_num_hidden_layers
+    NumDecoderLayers: integer;      // decoder_num_hidden_layers (info only)
+    NumEncoderHeads: integer;       // encoder_num_attention_heads
+    NumEncoderKVHeads: integer;     // encoder_num_key_value_heads
+    IntermediateSize: integer;      // intermediate_size (encoder FFN width)
+    VocabSize: integer;             // vocab_size (decoder head - info only)
+    MaxPositions: integer;          // max_position_embeddings
+    PartialRotaryFactor: TNeuralFloat; // partial_rotary_factor (0.9 default)
+    RopeTheta: TNeuralFloat;        // rope_theta (10000.0 default)
+    LayerNormEps: TNeuralFloat;     // 1e-5 (Moonshine LayerNorms are bias-free)
+    ModelType: string;              // 'moonshine'
+  end;
+
+// Reads a HF Moonshine config.json (model_type "moonshine"). Required:
+// hidden_size, encoder_num_hidden_layers, encoder_num_attention_heads,
+// intermediate_size. Defaults follow MoonshineConfig: partial_rotary_factor
+// 0.9, rope_theta 10000, max_position_embeddings 512, encoder_hidden_act
+// "gelu". rope_theta / partial_rotary_factor are also read from the nested
+// rope_parameters object when present (the transformers v5 spelling).
+function ReadMoonshineConfigFromJSONFile(const FileName: string): TMoonshineConfig;
+
+function MoonshineConfigToString(const Config: TMoonshineConfig): string;
+
+// Computes the encoder frame count the conv stem emits for a raw clip of
+// NumSamples samples (conv1 k127 s64, conv2 k7 s3, conv3 k3 s2; each conv:
+// (n - kernel) div stride + 1). NumSamples must clear all three convs.
+function MoonshineEncoderLength(NumSamples: integer): integer;
+
+// Builds the Moonshine ENCODER described by Config: a single TNNetInput
+// (NumSamples,1,1) raw waveform in, (EncLen,1,hidden) encoder hidden states
+// out (EncLen = MoonshineEncoderLength(NumSamples)), loading every encoder.*
+// weight from the checkpoint at FileName. pInferenceOnly frees training
+// volumes during construction. Feed the hidden states to a seq2seq decoder
+// via T5EncoderStatesInput (the landed two-net convention) - that decoder is
+// a documented follow-up.
+function BuildMoonshineFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMoonshineConfig; NumSamples: integer;
+  pInferenceOnly: boolean = false): TNNet;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildMoonshineFromSafeTensorsEx(const FileName: string;
+  out Config: TMoonshineConfig; NumSamples: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+function BuildMoonshineFromSafeTensors(const FileName: string;
+  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+
+// ---------------------------------------------------------------------------
 // EnCodec NEURAL AUDIO CODEC IMPORT (model_type "encodec", e.g.
 // facebook/encodec_24khz, architectures ["EncodecModel"]) - the FIRST
 // audio-GENERATIVE importer. Every landed audio model (Wav2Vec2 / HuBERT /
@@ -26899,6 +26982,523 @@ var
   Config: TWav2Vec2Config;
 begin
   Result := BuildWav2Vec2FromSafeTensorsEx(FileName, Config, NumSamples,
+    pInferenceOnly);
+end;
+
+// ===========================================================================
+// MOONSHINE STREAMING-ASR ENCODER IMPORT - see the interface header.
+// ===========================================================================
+
+function ReadMoonshineConfigFromJSONFile(
+  const FileName: string): TMoonshineConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj, RopeObj: TJSONObject;
+  ModelType, ActFn: string;
+
+  function RequiredInt(const FieldName: string): integer;
+  begin
+    if Obj.IndexOfName(FieldName) < 0 then
+      ImportError('Moonshine import: config "' + FileName +
+        '" is missing the required field "' + FieldName + '".');
+    Result := Obj.Get(FieldName, 0);
+    if Result <= 0 then
+      ImportError('Moonshine import: config field "' + FieldName +
+        '" must be a positive integer, got ' +
+        Obj.Find(FieldName).AsJSON + '.');
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError('Moonshine import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Moonshine import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Moonshine import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', 'moonshine');
+    if ModelType <> 'moonshine' then
+      ImportError('Moonshine import: config model_type is "' + ModelType +
+        '" - only "moonshine" is supported here.');
+    Result.ModelType := ModelType;
+    Result.HiddenSize := RequiredInt('hidden_size');
+    Result.NumEncoderLayers := RequiredInt('encoder_num_hidden_layers');
+    Result.NumEncoderHeads := RequiredInt('encoder_num_attention_heads');
+    Result.IntermediateSize := RequiredInt('intermediate_size');
+    Result.NumDecoderLayers := Obj.Get('decoder_num_hidden_layers',
+      Result.NumEncoderLayers);
+    // encoder_num_key_value_heads defaults to the head count (no GQA).
+    Result.NumEncoderKVHeads := Obj.Get('encoder_num_key_value_heads',
+      Result.NumEncoderHeads);
+    if (Result.NumEncoderKVHeads < 1) or
+       (Result.NumEncoderHeads mod Result.NumEncoderKVHeads <> 0) then
+      ImportError('Moonshine import: encoder_num_attention_heads=' +
+        IntToStr(Result.NumEncoderHeads) + ' is not divisible by ' +
+        'encoder_num_key_value_heads=' +
+        IntToStr(Result.NumEncoderKVHeads) + '.');
+    Result.VocabSize := Obj.Get('vocab_size', 32768);
+    Result.MaxPositions := Obj.Get('max_position_embeddings', 512);
+    Result.LayerNormEps := 1e-5; // Moonshine LayerNorms use the torch default
+    // RoPE: partial_rotary_factor / rope_theta live at the top level AND
+    // (transformers v5) inside a nested rope_parameters object; the nested
+    // spelling wins when present (it carries the canonical values).
+    Result.PartialRotaryFactor := Obj.Get('partial_rotary_factor', 0.9);
+    Result.RopeTheta := Obj.Get('rope_theta', 10000.0);
+    if (Obj.IndexOfName('rope_parameters') >= 0) and
+       (Obj.Find('rope_parameters') is TJSONObject) then
+    begin
+      RopeObj := TJSONObject(Obj.Find('rope_parameters'));
+      Result.PartialRotaryFactor :=
+        RopeObj.Get('partial_rotary_factor', Result.PartialRotaryFactor);
+      Result.RopeTheta := RopeObj.Get('rope_theta', Result.RopeTheta);
+      ActFn := RopeObj.Get('rope_type', 'default');
+      if ActFn <> 'default' then
+        ImportError('Moonshine import: rope_parameters.rope_type "' + ActFn +
+          '" is not supported - only "default" RoPE is implemented.');
+    end;
+    if (Result.PartialRotaryFactor <= 0) or
+       (Result.PartialRotaryFactor > 1) then
+      ImportError('Moonshine import: partial_rotary_factor must be in ' +
+        '(0, 1], got ' + FloatToStr(Result.PartialRotaryFactor) + '.');
+    ActFn := Obj.Get('encoder_hidden_act', 'gelu');
+    if ActFn <> 'gelu' then
+      ImportError('Moonshine import: encoder_hidden_act "' + ActFn +
+        '" is not supported - the encoder MLP uses exact erf "gelu".');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function MoonshineConfigToString(const Config: TMoonshineConfig): string;
+begin
+  Result := 'Moonshine(' + Config.ModelType + '): hidden=' +
+    IntToStr(Config.HiddenSize) + ', enc_layers=' +
+    IntToStr(Config.NumEncoderLayers) + ', enc_heads=' +
+    IntToStr(Config.NumEncoderHeads);
+  if Config.NumEncoderKVHeads <> Config.NumEncoderHeads then
+    Result := Result + ', enc_kv_heads=' +
+      IntToStr(Config.NumEncoderKVHeads);
+  Result := Result + ', ffn=' + IntToStr(Config.IntermediateSize) +
+    ', partial_rotary=' + FloatToStr(Config.PartialRotaryFactor) +
+    ', rope_theta=' + FloatToStr(Config.RopeTheta) +
+    ', vocab=' + IntToStr(Config.VocabSize) +
+    ', dec_layers=' + IntToStr(Config.NumDecoderLayers);
+end;
+
+function MoonshineEncoderLength(NumSamples: integer): integer;
+begin
+  // Three strided convs: conv1 k127 s64, conv2 k7 s3, conv3 k3 s2.
+  Result := (NumSamples - 127) div 64 + 1;
+  Result := (Result - 7) div 3 + 1;
+  Result := (Result - 3) div 2 + 1;
+end;
+
+// Loads a HF nn.Conv1d weight [out, in, kernel] (+ optional [out] bias) into
+// a TNNetConvolutionLinear - the same row layout as LoadWav2Vec2FeatureConv
+// but ALSO loading the conv bias (Moonshine's conv2/conv3 are biased;
+// LoadWav2Vec2FeatureConv force-zeros the bias for its bias-free convs).
+procedure LoadMoonshineConv(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName, BName: string;
+  InDim, OutDim, Kernel: integer; Consumed: TStringList);
+var
+  W, B: TNNetVolume;
+  o, i, kk: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Moonshine import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 3) or
+     (Reader.DimSize(WName, 0) <> OutDim) or
+     (Reader.DimSize(WName, 1) <> InDim) or
+     (Reader.DimSize(WName, 2) <> Kernel) then
+    ImportError('Moonshine import: "' + WName + '" must have shape [' +
+      IntToStr(OutDim) + ', ' + IntToStr(InDim) + ', ' + IntToStr(Kernel) +
+      '] (nn.Conv1d stores [out, in, kernel]), got ' +
+      Reader.ShapeAsString(WName));
+  if Layer.Neurons.Count <> OutDim then
+    ImportError('Moonshine import: internal error - conv layer for "' +
+      WName + '" has ' + IntToStr(Layer.Neurons.Count) +
+      ' neurons, expected ' + IntToStr(OutDim) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if BName <> '' then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('Moonshine import: missing tensor "' + BName + '".');
+      if (Reader.DimCount(BName) <> 1) or
+         (Reader.DimSize(BName, 0) <> OutDim) then
+        ImportError('Moonshine import: "' + BName + '" must have shape [' +
+          IntToStr(OutDim) + '], got ' + Reader.ShapeAsString(BName));
+      Reader.LoadTensorFlat(BName, B);
+    end;
+    for o := 0 to OutDim - 1 do
+    begin
+      for kk := 0 to Kernel - 1 do
+        for i := 0 to InDim - 1 do
+          Layer.Neurons[o].Weights.FData[kk * InDim + i] :=
+            W.FData[(o * InDim + i) * Kernel + kk];
+      if BName <> '' then Layer.Neurons[o].BiasWeight := B.FData[o]
+      else Layer.Neurons[o].BiasWeight := 0;
+    end;
+  finally
+    B.Free;
+    W.Free;
+  end;
+  Layer.FlushWeightCache();
+  Consumed.Add(WName);
+  if BName <> '' then Consumed.Add(BName);
+end;
+
+// Loads a bias-free, gain-only HF LayerNorm (nn.LayerNorm with bias=False -
+// the Moonshine convention) into a TNNetTokenLayerNorm: the [d_model] gain
+// lands in Neurons[0]; Neurons[1] (the beta) is zeroed (no learned bias).
+procedure LoadMoonshineGainOnlyLayerNorm(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; d_model: integer;
+  Consumed: TStringList);
+var
+  Tmp: TNNetVolume;
+  i: integer;
+begin
+  if not Reader.HasTensor(WName) then
+    ImportError('Moonshine import: missing tensor "' + WName + '".');
+  if (Reader.DimCount(WName) <> 1) or
+     (Reader.DimSize(WName, 0) <> d_model) then
+    ImportError('Moonshine import: "' + WName + '" must have shape [' +
+      IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
+  Tmp := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, Tmp);
+    for i := 0 to d_model - 1 do
+    begin
+      Layer.Neurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+      Layer.Neurons[1].Weights.FData[i] := 0;            // beta = 0 (bias-free)
+    end;
+  finally
+    Tmp.Free;
+  end;
+  Layer.FlushWeightCache();
+  Consumed.Add(WName);
+end;
+
+function BuildMoonshineFromSafeTensorsWithConfig(const FileName: string;
+  var Config: TMoonshineConfig; NumSamples: integer;
+  pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Conv1, Conv2, Conv3, ConvGN, FinalLN: TNNetLayer;
+  AttnNorm, QProj, KProj, VProj, OProj, MlpNorm, Fc1, Fc2: array of TNNetLayer;
+  BranchInput, NormedSource, HeadPack, RotSlice, PassSlice: TNNetLayer;
+  QSlice, KSlice: TNNetLayer;
+  KRotated, VSlices: array of TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  RotChannels, PassChannels, SliceChannels: array of integer;
+  RopeScaling: TRoPEScalingConfig;
+  HeadDim, QWidth, KVWidth, RotaryDims, GroupSize: integer;
+  EncLen, k, d, BlockCnt, HeadCnt, KVHeadCnt, KVGroup, i: integer;
+  BlockPrefix, TensorNameStr: string;
+  Consumed: TStringList;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation ----------------
+      if Config.NumEncoderHeads < 1 then
+        ImportError('Moonshine import: encoder_num_attention_heads >= 1.');
+      if (Config.HiddenSize mod Config.NumEncoderHeads) <> 0 then
+        ImportError('Moonshine import: hidden_size=' +
+          IntToStr(Config.HiddenSize) + ' is not divisible by ' +
+          'encoder_num_attention_heads=' +
+          IntToStr(Config.NumEncoderHeads) + '.');
+      HeadDim := Config.HiddenSize div Config.NumEncoderHeads;
+      if Odd(HeadDim) then
+        ImportError('Moonshine import: head_dim=' + IntToStr(HeadDim) +
+          ' must be even (RoPE rotates channel pairs).');
+      if (Config.PartialRotaryFactor > 0) and
+         (Config.PartialRotaryFactor < 1) then
+        RotaryDims := Trunc(HeadDim * Config.PartialRotaryFactor)
+      else
+        RotaryDims := HeadDim;
+      if (RotaryDims < 2) or Odd(RotaryDims) then
+        ImportError('Moonshine import: rotary_dim = int(head_dim * ' +
+          'partial_rotary_factor) = ' + IntToStr(RotaryDims) +
+          ' must be an even number >= 2 (RoPE rotates channel pairs).');
+      if not Reader.HasTensor('encoder.conv1.weight') then
+        ImportError('Moonshine import: "encoder.conv1.weight" not found in ' +
+          Reader.FileName + ' - not a Moonshine encoder checkpoint?');
+      EncLen := MoonshineEncoderLength(NumSamples);
+      if EncLen < 1 then
+        ImportError('Moonshine import: NumSamples=' + IntToStr(NumSamples) +
+          ' is too short for the conv stem (emits ' + IntToStr(EncLen) +
+          ' frames).');
+      QWidth := Config.NumEncoderHeads * HeadDim;
+      KVWidth := Config.NumEncoderKVHeads * HeadDim;
+      GroupSize := Config.NumEncoderHeads div Config.NumEncoderKVHeads;
+      RopeScaling := DefaultRoPEScaling();
+
+      // ---------------- Architecture ----------------
+      NN := TNNet.Create();
+      // Raw waveform: (NumSamples, 1, 1).
+      NN.AddLayer( TNNetInput.Create(NumSamples, 1, 1) );
+      // ----- conv stem off the raw waveform (the Moonshine frontend). -----
+      // conv1: 1 -> hidden, k=127, s=64, BIAS-FREE, then tanh.
+      Conv1 := NN.AddLayer( TNNetConvolutionLinear.Create(
+        Config.HiddenSize, 127, {Padding=}0, {Stride=}64, {SuppressBias=}1) );
+      NN.AddLayer( TNNetHyperbolicTangent.Create() );
+      // groupnorm: GroupNorm(num_groups=1, hidden) over the WHOLE (T,C) block,
+      // per-channel affine - sits BETWEEN conv1 and conv2.
+      ConvGN := NN.AddLayer( TNNetGroupNorm.Create({Groups=}1, {Affine=}True) );
+      // conv2: hidden -> 2*hidden, k=7, s=3, biased, then erf-GELU.
+      Conv2 := NN.AddLayer( TNNetConvolutionLinear.Create(
+        2 * Config.HiddenSize, 7, {Padding=}0, {Stride=}3, {SuppressBias=}0) );
+      AddWhisperExactGelu(NN);
+      // conv3: 2*hidden -> hidden, k=3, s=2, biased, then erf-GELU.
+      Conv3 := NN.AddLayer( TNNetConvolutionLinear.Create(
+        Config.HiddenSize, 3, {Padding=}0, {Stride=}2, {SuppressBias=}0) );
+      AddWhisperExactGelu(NN);
+      if pInferenceOnly then NN.MakeInferenceOnly();
+      // ----- PRE-norm BIDIRECTIONAL transformer encoder blocks. -----------
+      SetLength(AttnNorm, Config.NumEncoderLayers);
+      SetLength(QProj, Config.NumEncoderLayers);
+      SetLength(KProj, Config.NumEncoderLayers);
+      SetLength(VProj, Config.NumEncoderLayers);
+      SetLength(OProj, Config.NumEncoderLayers);
+      SetLength(MlpNorm, Config.NumEncoderLayers);
+      SetLength(Fc1, Config.NumEncoderLayers);
+      SetLength(Fc2, Config.NumEncoderLayers);
+      SetLength(KRotated, Config.NumEncoderKVHeads);
+      SetLength(VSlices, Config.NumEncoderKVHeads);
+      SetLength(HeadOutputs, Config.NumEncoderHeads);
+      SetLength(SliceChannels, HeadDim);
+      SetLength(RotChannels, RotaryDims);
+      SetLength(PassChannels, HeadDim - RotaryDims);
+      for BlockCnt := 0 to Config.NumEncoderLayers - 1 do
+      begin
+        // x := x + o_proj(bidirectional-RoPE-MHA(input_layernorm(x))).
+        BranchInput := NN.GetLastLayer();
+        AttnNorm[BlockCnt] := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        NormedSource := NN.GetLastLayer();
+        QProj[BlockCnt] := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(QWidth), NormedSource);
+        KProj[BlockCnt] := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        VProj[BlockCnt] := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(KVWidth), NormedSource);
+        // K rotated once per KV head; V never rotated. Partial rotary: RoPE
+        // on the first RotaryDims channels, the tail passes through (the
+        // Phi-3 partial-rotary slice wiring).
+        for KVHeadCnt := 0 to Config.NumEncoderKVHeads - 1 do
+        begin
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := KVHeadCnt * HeadDim + d;
+          if RotaryDims < HeadDim then
+          begin
+            for d := 0 to RotaryDims - 1 do
+              RotChannels[d] := KVHeadCnt * HeadDim + d;
+            for d := 0 to HeadDim - RotaryDims - 1 do
+              PassChannels[d] := KVHeadCnt * HeadDim + RotaryDims + d;
+            RotSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(RotChannels), KProj[BlockCnt]);
+            RotSlice := NN.AddLayerAfter(
+              CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), RotSlice);
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels), KProj[BlockCnt]);
+            KRotated[KVHeadCnt] := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+          begin
+            KSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), KProj[BlockCnt]);
+            KRotated[KVHeadCnt] := NN.AddLayerAfter(
+              CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), KSlice);
+          end;
+          VSlices[KVHeadCnt] := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SliceChannels), VProj[BlockCnt]);
+        end;
+        for HeadCnt := 0 to Config.NumEncoderHeads - 1 do
+        begin
+          KVGroup := HeadCnt div GroupSize;
+          for d := 0 to HeadDim - 1 do
+            SliceChannels[d] := HeadCnt * HeadDim + d;
+          if RotaryDims < HeadDim then
+          begin
+            for d := 0 to RotaryDims - 1 do
+              RotChannels[d] := HeadCnt * HeadDim + d;
+            for d := 0 to HeadDim - RotaryDims - 1 do
+              PassChannels[d] := HeadCnt * HeadDim + RotaryDims + d;
+            RotSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(RotChannels), QProj[BlockCnt]);
+            RotSlice := NN.AddLayerAfter(
+              CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), RotSlice);
+            PassSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(PassChannels), QProj[BlockCnt]);
+            QSlice := NN.AddLayer(
+              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
+          end
+          else
+          begin
+            QSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(SliceChannels), QProj[BlockCnt]);
+            QSlice := NN.AddLayerAfter(
+              CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), QSlice);
+          end;
+          HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
+            [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
+          // BIDIRECTIONAL (CausalMask=false) SDPA, 1/sqrt(head_dim) scaling.
+          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}false),
+            HeadPack);
+        end;
+        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        OProj[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        // x := x + fc2(gelu(fc1(post_attention_layernorm(x)))).
+        BranchInput := NN.GetLastLayer();
+        MlpNorm[BlockCnt] := NN.AddLayer(
+          TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+        Fc1[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.IntermediateSize) );
+        AddWhisperExactGelu(NN);
+        Fc2[BlockCnt] := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.HiddenSize) );
+        NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
+        if pInferenceOnly then NN.MakeInferenceOnly();
+      end;
+      // ----- FINAL stack LayerNorm (gain-only). -----
+      FinalLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps) );
+      if pInferenceOnly then NN.MakeInferenceOnly();
+
+      // ---------------- Weights ----------------
+      LoadMoonshineConv(Reader, Conv1, 'encoder.conv1.weight', '',
+        1, Config.HiddenSize, 127, Consumed);
+      // groupnorm is a TRUE affine GroupNorm (gain AND learned bias), unlike
+      // the encoder's bias-free LayerNorms: load gamma+beta via the standard
+      // LayerNorm loader (same Neurons[0]=gamma / Neurons[1]=beta layout).
+      LoadLayerNormWeights(Reader, ConvGN, 'encoder.groupnorm.weight',
+        'encoder.groupnorm.bias', Config.HiddenSize);
+      MarkConsumed('encoder.groupnorm.weight');
+      MarkConsumed('encoder.groupnorm.bias');
+      LoadMoonshineConv(Reader, Conv2, 'encoder.conv2.weight',
+        'encoder.conv2.bias', Config.HiddenSize, 2 * Config.HiddenSize, 7,
+        Consumed);
+      LoadMoonshineConv(Reader, Conv3, 'encoder.conv3.weight',
+        'encoder.conv3.bias', 2 * Config.HiddenSize, Config.HiddenSize, 3,
+        Consumed);
+      for BlockCnt := 0 to Config.NumEncoderLayers - 1 do
+      begin
+        BlockPrefix := 'encoder.layers.' + IntToStr(BlockCnt) + '.';
+        LoadMoonshineGainOnlyLayerNorm(Reader, AttnNorm[BlockCnt],
+          BlockPrefix + 'input_layernorm.weight', Config.HiddenSize, Consumed);
+        // Bias-free q/k/v/o projections (attention_bias=false).
+        LoadLlamaLinearWeights(Reader, QProj[BlockCnt],
+          BlockPrefix + 'self_attn.q_proj.weight',
+          Config.HiddenSize, QWidth, 0, -1, 0, '');
+        MarkConsumed(BlockPrefix + 'self_attn.q_proj.weight');
+        LoadLlamaLinearWeights(Reader, KProj[BlockCnt],
+          BlockPrefix + 'self_attn.k_proj.weight',
+          Config.HiddenSize, KVWidth, 0, -1, 0, '');
+        MarkConsumed(BlockPrefix + 'self_attn.k_proj.weight');
+        LoadLlamaLinearWeights(Reader, VProj[BlockCnt],
+          BlockPrefix + 'self_attn.v_proj.weight',
+          Config.HiddenSize, KVWidth, 0, -1, 0, '');
+        MarkConsumed(BlockPrefix + 'self_attn.v_proj.weight');
+        LoadLlamaLinearWeights(Reader, OProj[BlockCnt],
+          BlockPrefix + 'self_attn.o_proj.weight',
+          QWidth, Config.HiddenSize, 0, -1, 0, '');
+        MarkConsumed(BlockPrefix + 'self_attn.o_proj.weight');
+        LoadMoonshineGainOnlyLayerNorm(Reader, MlpNorm[BlockCnt],
+          BlockPrefix + 'post_attention_layernorm.weight', Config.HiddenSize,
+          Consumed);
+        // Encoder MLP: biased fc1 / fc2 (standard GELU MLP, NOT SwiGLU).
+        LoadLlamaLinearWeights(Reader, Fc1[BlockCnt],
+          BlockPrefix + 'mlp.fc1.weight',
+          Config.HiddenSize, Config.IntermediateSize, 0, -1, 0,
+          BlockPrefix + 'mlp.fc1.bias');
+        MarkConsumed(BlockPrefix + 'mlp.fc1.weight');
+        MarkConsumed(BlockPrefix + 'mlp.fc1.bias');
+        LoadLlamaLinearWeights(Reader, Fc2[BlockCnt],
+          BlockPrefix + 'mlp.fc2.weight',
+          Config.IntermediateSize, Config.HiddenSize, 0, -1, 0,
+          BlockPrefix + 'mlp.fc2.bias');
+        MarkConsumed(BlockPrefix + 'mlp.fc2.weight');
+        MarkConsumed(BlockPrefix + 'mlp.fc2.bias');
+      end;
+      LoadMoonshineGainOnlyLayerNorm(Reader, FinalLN,
+        'encoder.layer_norm.weight', Config.HiddenSize, Consumed);
+
+      // ---------------- Unexpected-tensor check ----------------
+      for i := 0 to Reader.Count - 1 do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        // Decoder / embedding tensors are out of the v1 encoder scope; a
+        // checkpoint sliced to encoder.* only (the test fixture) has none.
+        if Pos('encoder.', TensorNameStr) <> 1 then continue;
+        ImportError('Moonshine import: unexpected encoder tensor "' +
+          TensorNameStr + '" (shape ' +
+          Reader.ShapeAsString(TensorNameStr) + ') in ' + FileName +
+          ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildMoonshineFromSafeTensorsEx(const FileName: string;
+  out Config: TMoonshineConfig; NumSamples: integer;
+  pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadMoonshineConfigFromJSONFile(ConfigPath);
+  Result := BuildMoonshineFromSafeTensorsWithConfig(FileName, Config,
+    NumSamples, pInferenceOnly);
+end;
+
+function BuildMoonshineFromSafeTensors(const FileName: string;
+  NumSamples: integer; pInferenceOnly: boolean = false): TNNet;
+var
+  Config: TMoonshineConfig;
+begin
+  Result := BuildMoonshineFromSafeTensorsEx(FileName, Config, NumSamples,
     pInferenceOnly);
 end;
 

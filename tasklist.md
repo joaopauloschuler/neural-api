@@ -845,20 +845,26 @@ rather than acted on.
       -> tests/fixtures/tiny_demucs*, TestDemucsSeparationParity < 1e-4), then an
       examples/MusicSourceSeparation that splits a short clip and writes the four
       stems via the landed WAV writer. DEPENDS ON the WAV writer (landed).
-- [ ] Moonshine streaming-ASR importer (BuildMoonshineFromSafeTensors[Ex] +
-      TMoonshineConfig, UsefulSensors/moonshine-tiny|base) — a SECOND speech-to-text
-      architecture that is deliberately distinct from the landed Whisper importer,
-      not a near-duplicate: Moonshine has NO fixed 30 s mel frontend (it convolves
-      RoPE-positioned features directly off the raw 16 kHz waveform with a small
-      strided-conv stem) so compute scales with actual audio length, and its
-      encoder-decoder transformer uses RoPE + SwiGLU rather than Whisper's learned
-      sinusoidal absolute positions + GELU MLP. Reuses the landed seq2seq decode
-      machinery (DecodeSeq2SeqGreedy/BeamSearch) and the RoPE/SwiGLU leaf layers;
-      the only new code is the raw-waveform conv stem + the config/key wiring. Pico
-      parity vs an HF float64 oracle on encoder hidden states for a fixed waveform
-      (tools/make_pico_moonshine_fixture.py -> tests/fixtures/tiny_moonshine*,
-      TestMoonshineEncoderParity < 1e-4) + an examples/MoonshineTranscribe smoke that
-      transcribes a short clip, contrasting decode latency vs WhisperTranscribe.
+- [X] Moonshine streaming-ASR importer (BuildMoonshineFromSafeTensors[Ex] +
+      TMoonshineConfig + ReadMoonshineConfigFromJSONFile / MoonshineConfigToString +
+      MoonshineEncoderLength, UsefulSensors/moonshine-tiny|base) — LANDED the ENCODER
+      (the v1 parity surface). A SECOND speech-to-text architecture, distinct from the
+      landed Whisper importer: NO fixed 30 s mel frontend — the raw-waveform conv stem
+      (conv1 k127 s64 bias-free + tanh; GroupNorm(1) over the (T,C) block; conv2 k7 s3
+      + erf-GELU; conv3 k3 s2 + erf-GELU) convolves features directly off the 16 kHz
+      waveform so compute scales with actual audio length; PRE-norm BIDIRECTIONAL
+      encoder with PARTIAL RoPE (partial_rotary_factor, the Phi-3 slice wiring reused
+      verbatim), bias-free q/k/v/o, bias-free (gain-only) TNNetTokenLayerNorm norms,
+      erf-GELU fc1/fc2 MLP. Pico parity vs the HF MoonshineModel float64 oracle on
+      encoder hidden states (tools/make_pico_moonshine_fixture.py ->
+      tests/fixtures/tiny_moonshine*, TestMoonshineEncoderParity, max|diff| < 1e-4,
+      PASSING) + a DETERMINISTIC examples/MoonshineTranscribe smoke (no-arg fixture run
+      contrasting the length-scaled frame count/latency vs Whisper's fixed cost; real
+      checkpoint path supported). OPEN FOLLOW-UPS: the RoPE + SwiGLU DECODER (cross-
+      attending the encoder states via T5EncoderStatesInput; reuse
+      DecodeSeq2SeqGreedy/BeamSearch) + the GQA encoder_num_key_value_heads != heads
+      path (wired but only exercised at full multi-head in the pico) + the
+      MoonshineTokenizer for end-to-end WAV -> text transcription.
 - [ ] Medusa / EAGLE tree-attention speculative decoding — a follow-up that is
       genuinely distinct from the landed SEQUENTIAL self-speculative paths
       (MTP-draft SelfSpeculativeDecoding + LayerSkip/CALM EarlyExitSelfSpeculative,
