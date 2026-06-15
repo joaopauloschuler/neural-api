@@ -829,22 +829,39 @@ rather than acted on.
         default TargetAccuracy and early-stops.
   - [ ] a 16 kHz resampler in neuralaudio so `--full` accepts non-16 kHz WAVs
         directly instead of requiring an ffmpeg pre-pass.
-- [ ] HTDemucs / Demucs music SOURCE-SEPARATION importer
-      (BuildDemucsFromSafeTensors[Ex] + TDemucsConfig, e.g.
-      facebook/demucs / htdemucs) — the FIRST audio source-separation model and a
-      genuinely new audio OUTPUT modality: one mixed track in, four stems out
-      (drums / bass / other / vocals), squarely in the music priority. Distinct from
-      every landed audio model — EnCodec (codec), Wav2Vec2/Whisper (recognition),
-      HiFi-GAN/VITS (synthesis), CLAP (embedding) — none separate sources. v1 scope:
-      the time-domain (waveform) Demucs (v2/v3) U-Net — a symmetric stack of strided
-      1-D conv encoders with GLU + a bi-LSTM (or the v3 cross-domain transformer)
-      bottleneck + transposed-conv decoders with skip connections, reusing the
-      existing 1-D conv / GLU / LSTM leaf layers (no new leaf layer expected; the
-      hybrid time+spectral HTDemucs spectral branch is the stretch). Pico parity
-      vs an HF/torch float64 oracle on a short fixed waveform (tools/make_pico_demucs_fixture.py
-      -> tests/fixtures/tiny_demucs*, TestDemucsSeparationParity < 1e-4), then an
+- [X] HTDemucs / Demucs music SOURCE-SEPARATION importer
+      (BuildDemucsFromSafeTensors[Ex] + TDemucsConfig +
+      ReadDemucsConfigFromJSONFile / DemucsConfigToString, facebook/demucs /
+      htdemucs) — LANDED the TIME-DOMAIN (waveform) Demucs (v2/v3) U-Net, the
+      FIRST audio source-separation model and a genuinely new audio OUTPUT
+      modality: one mixed stereo track in, four stems out (drums / bass / other
+      / vocals). Distinct from every landed audio model — EnCodec (codec),
+      Wav2Vec2/Whisper (recognition), HiFi-GAN/VITS (synthesis), CLAP
+      (embedding) — none separate sources. Built as a self-contained
+      channel-major TNNetDemucs holder (the HiFi-GAN/VITS/EnCodec convention),
+      REUSING THiFiGANConv / RunHiFiGANConv for every Conv1d / ConvTranspose1d
+      (no new leaf layer): an ENCODER of `depth` blocks (strided Conv1d -> ReLU
+      -> 1x1 Conv1d -> GLU, each saving a U-Net skip) -> a bi-LSTM bottleneck
+      (`lstm_layers` stacked bidirectional cells run INLINE in the holder, there
+      being no bidirectional-LSTM leaf layer, then Linear(2C -> C)) -> a DECODER
+      of `depth` blocks (skip-add with Demucs center_trim -> Conv1d -> GLU ->
+      ConvTranspose1d -> ReLU except the last) reshaped to (sources,
+      audio_channels, time) and center-trimmed to the input length. Conv /
+      nn.LSTM weights load as plain folded tensors (encoder.i.{0,2}, lstm.*_l*
+      + *_reverse, lstm_linear, decoder.i.{0,2}). Pico parity vs a SELF-CONTAINED
+      numpy float64 oracle (transformers ships no Demucs, so the oracle is
+      hand-built from the published architecture math — the *_tiny_fixture
+      precedent) on two short fixed stereo waveforms
+      (tools/make_pico_demucs_fixture.py -> tests/fixtures/tiny_demucs*,
+      TestDemucsSeparationParity max|diff| < 1e-4, PASSING) + an
       examples/MusicSourceSeparation that splits a short clip and writes the four
-      stems via the landed WAV writer. DEPENDS ON the WAV writer (landed).
+      stems via SaveVolumeToWav16 (no-arg pico smoke + real-checkpoint path).
+      OPEN FOLLOW-UPS: the hybrid TIME+SPECTRAL HTDemucs spectral branch (STFT +
+      a parallel 2-D spectral U-Net summed with the time branch); the v3
+      CROSS-DOMAIN TRANSFORMER bottleneck (in place of the bi-LSTM); input/output
+      NORMALIZATION (centering + std rescale, `normalize=true`) and weight
+      rescaling; and a real downloaded checkpoint end-to-end separation within
+      the ~5 min / ulimit budget.
 - [X] Moonshine streaming-ASR importer (BuildMoonshineFromSafeTensors[Ex] +
       TMoonshineConfig + ReadMoonshineConfigFromJSONFile / MoonshineConfigToString +
       MoonshineEncoderLength, UsefulSensors/moonshine-tiny|base) — LANDED the ENCODER

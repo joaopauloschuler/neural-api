@@ -3946,6 +3946,108 @@ function BuildVitsFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNetVits;
 
 // ---------------------------------------------------------------------------
+// DEMUCS TIME-DOMAIN MUSIC SOURCE-SEPARATION IMPORT (facebook/demucs, htdemucs
+// time branch; Defossez et al. 2019, "Music Source Separation in the Waveform
+// Domain", arXiv:1911.13254) - the FIRST audio source-separation model and a
+// new audio OUTPUT modality: one MIXED stereo waveform in, FOUR stems out
+// (drums / bass / other / vocals). Like HiFi-GAN / VITS / EnCodec above it is
+// a self-contained channel-major holder (TNNetDemucs) doing the conv math
+// directly (reusing THiFiGANConv / RunHiFiGANConv), because the whole network
+// is strided Conv1d + GLU + a bi-LSTM bottleneck + ConvTranspose1d decoders
+// with U-Net skips - all exactly faithful in direct conv math.
+//
+// This v1 imports the TIME-DOMAIN (waveform) Demucs (v2/v3) U-Net ONLY. The
+// hybrid time+spectral HTDemucs spectral branch and the v3 cross-domain
+// transformer bottleneck are documented follow-ups, NOT v1.
+//
+// Pipeline (Demucs.forward; normalize=False, the bare conv stack):
+//   encoder block i (depth blocks):
+//     Conv1d(in -> out, k=kernel_size, stride=stride) -> ReLU
+//     Conv1d(out -> 2*out, k=1) -> GLU(channel axis)   (halves back to out)
+//     channels[i] = channels * 2^i; block 0 takes audio_channels in. The skip
+//     tensor saved per block is the GLU output.
+//   bottleneck:
+//     bi-LSTM (lstm_layers stacked, bidirectional; forward+reverse cells)
+//     over the time axis, then Linear(2*C -> C). (The bi-LSTM math is run
+//     inline in the holder - there is no bidirectional-LSTM leaf layer.)
+//   decoder block j (reverse order, depth blocks):
+//     x := x + center_trim(skip, len(x))               (U-Net skip add)
+//     Conv1d(in -> 2*in, k=context, stride=1, pad=context div 2) -> GLU
+//     ConvTranspose1d(in -> out, k=kernel_size, stride=stride)
+//     ReLU on every block EXCEPT the last (which emits sources*audio_channels)
+//   final output is center_trim'd to the input length and reshaped to
+//   (sources, audio_channels, time).
+//
+// Conv weights load as plain ".weight" Conv1d/ConvTranspose1d tensors (Demucs
+// applies weight rescaling at TRAIN time and ships folded weights); the bi-LSTM
+// loads the torch nn.LSTM weight_ih_l*/weight_hh_l*/bias_*/*_reverse tensors.
+// Coded by Claude (AI).
+// ---------------------------------------------------------------------------
+type
+  TDemucsConfig = record
+    Sources: integer;          // sources (4: drums/bass/other/vocals)
+    AudioChannels: integer;    // audio_channels (2: stereo)
+    Channels: integer;         // base hidden width
+    Depth: integer;            // number of encoder/decoder blocks
+    KernelSize: integer;       // encoder/decoder (transpose) conv kernel (8)
+    Stride: integer;           // encoder/decoder stride (4)
+    Context: integer;          // decoder pre-conv kernel (3)
+    LSTMLayers: integer;       // bi-LSTM stacked layers (2)
+    SamplingRate: integer;     // for the WAV writer
+    ModelType: string;         // 'demucs'
+  end;
+
+  // One bi-LSTM layer: forward + reverse cell weights. Each cell packs the 4
+  // gates (i,f,g,o) row-blocked in Wih/Whh exactly like torch nn.LSTM.
+  TDemucsLSTMLayer = record
+    WihF, WhhF, BihF, BhhF: array of TNeuralFloat;  // forward
+    WihR, WhhR, BihR, BhhR: array of TNeuralFloat;  // reverse
+    InSize, Hidden: integer;
+  end;
+
+  { TNNetDemucs }
+  // Holds the imported time-domain Demucs U-Net and runs the full mixed-
+  // waveform -> 4-stem separation in inference. Built by
+  // BuildDemucsFromSafeTensors[Ex]; caller-owned. Reuses THiFiGANConv /
+  // RunHiFiGANConv for every conv. Coded by Claude (AI).
+  TNNetDemucs = class
+  private
+    FConfig: TDemucsConfig;
+    FEncConv1, FEncConv2: array of THiFiGANConv;   // [depth]
+    FDecConv1: array of THiFiGANConv;              // [depth] pre-GLU conv
+    FDecTConv: array of THiFiGANConv;              // [depth] transpose conv
+    FLSTM: array of TDemucsLSTMLayer;              // [lstm_layers]
+    FLinW, FLinB: array of TNeuralFloat;           // Linear(2C -> C)
+    FLinIn, FLinOut: integer;
+  public
+    constructor Create(const pConfig: TDemucsConfig);
+    destructor Destroy; override;
+    property Config: TDemucsConfig read FConfig;
+    // Separates a mixed waveform Mix[channel][sample] (audio_channels rows)
+    // into Stems[source][channel][sample]. Source order is the Demucs default
+    // (drums / bass / other / vocals).
+    procedure Separate(const Mix: array of TNeuralFloatDynArr;
+      out Stems: array of TNNetFloatDynArr2D);
+  end;
+
+// Reads a Demucs config.json (model_type "demucs" / "htdemucs", or absent).
+// Coded by Claude (AI).
+function ReadDemucsConfigFromJSONFile(const FileName: string): TDemucsConfig;
+
+function DemucsConfigToString(const Config: TDemucsConfig): string;
+
+// Builds a TNNetDemucs from Reader (the caller owns Reader). Coded by
+// Claude (AI).
+function BuildDemucsFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TDemucsConfig): TNNetDemucs;
+
+// Same, reading the config from ConfigFileName ('' = "config.json" beside
+// FileName) and returning it in Config.
+function BuildDemucsFromSafeTensors(const FileName: string;
+  out Config: TDemucsConfig;
+  const ConfigFileName: string = ''): TNNetDemucs;
+
+// ---------------------------------------------------------------------------
 // MUSICGEN IMPORT (model_type "musicgen": facebook/musicgen-small and
 // siblings, architectures ["MusicgenForConditionalGeneration"]) - the FIRST
 // text-to-AUDIO generative importer (Copet et al. 2023, arXiv:2306.05284). It
@@ -28899,6 +29001,403 @@ begin
   Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildHiFiGANFromSafeTensorsEx(Reader, Config);
+  finally
+    Reader.Free;
+  end;
+end;
+
+// ===========================================================================
+// DEMUCS time-domain source-separation implementation. Coded by Claude (AI).
+// ===========================================================================
+
+function ReadDemucsConfigFromJSONFile(const FileName: string): TDemucsConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ModelType: string;
+begin
+  if not FileExists(FileName) then
+    ImportError('Demucs import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('Demucs import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('Demucs import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ModelType := Obj.Get('model_type', '');
+    if (ModelType <> '') and (ModelType <> 'demucs') and
+       (ModelType <> 'htdemucs') then
+      ImportError('Demucs import: config model_type is "' + ModelType +
+        '" - only the time-domain "demucs" / "htdemucs" branch is supported ' +
+        '(the hybrid spectral branch is a documented follow-up).');
+    Result.ModelType := 'demucs';
+    Result.Sources := Obj.Get('sources', 4);
+    Result.AudioChannels := Obj.Get('audio_channels', 2);
+    Result.Channels := Obj.Get('channels', 64);
+    Result.Depth := Obj.Get('depth', 6);
+    Result.KernelSize := Obj.Get('kernel_size', 8);
+    Result.Stride := Obj.Get('stride', 4);
+    Result.Context := Obj.Get('context', 3);
+    Result.LSTMLayers := Obj.Get('lstm_layers', 2);
+    Result.SamplingRate := Obj.Get('sampling_rate', 44100);
+    if Result.Sources <= 0 then
+      ImportError('Demucs import: "sources" must be positive.');
+    if Result.Depth <= 0 then
+      ImportError('Demucs import: "depth" must be positive.');
+    if Result.Stride <= 0 then
+      ImportError('Demucs import: "stride" must be positive.');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function DemucsConfigToString(const Config: TDemucsConfig): string;
+begin
+  Result := 'DemucsConfig(model_type=' + Config.ModelType +
+    ', sources=' + IntToStr(Config.Sources) +
+    ', audio_channels=' + IntToStr(Config.AudioChannels) +
+    ', channels=' + IntToStr(Config.Channels) +
+    ', depth=' + IntToStr(Config.Depth) +
+    ', kernel=' + IntToStr(Config.KernelSize) +
+    ', stride=' + IntToStr(Config.Stride) +
+    ', context=' + IntToStr(Config.Context) +
+    ', lstm_layers=' + IntToStr(Config.LSTMLayers) +
+    ', sr=' + IntToStr(Config.SamplingRate) + ')';
+end;
+
+constructor TNNetDemucs.Create(const pConfig: TDemucsConfig);
+begin
+  inherited Create();
+  FConfig := pConfig;
+end;
+
+destructor TNNetDemucs.Destroy;
+begin
+  inherited Destroy;
+end;
+
+// GLU on a channel-major signal: out[c] = a[c] * sigmoid(b[c]) where a is the
+// first half of the channels and b the second.
+procedure DemucsGLU(const InSig: array of TNeuralFloatDynArr;
+  out OutSig: TNNetFloatDynArr2D);
+var
+  Half, c, t: integer;
+begin
+  Half := Length(InSig) div 2;
+  SetLength(OutSig, Half);
+  for c := 0 to Half - 1 do
+  begin
+    SetLength(OutSig[c], Length(InSig[c]));
+    for t := 0 to Length(InSig[c]) - 1 do
+      OutSig[c][t] := InSig[c][t] *
+        (1.0 / (1.0 + Exp(-InSig[Half + c][t])));
+  end;
+end;
+
+procedure DemucsReLU(var Sig: TNNetFloatDynArr2D);
+var
+  c, t: integer;
+begin
+  for c := 0 to Length(Sig) - 1 do
+    for t := 0 to Length(Sig[c]) - 1 do
+      if Sig[c][t] < 0 then Sig[c][t] := 0;
+end;
+
+// Symmetric center trim of a channel-major signal to RefLen (Demucs
+// center_trim); a no-op when already <= RefLen.
+procedure DemucsCenterTrim(var Sig: TNNetFloatDynArr2D; RefLen: integer);
+var
+  Extra, Left, c, t: integer;
+  NewSig: TNNetFloatDynArr2D;
+begin
+  if Length(Sig) = 0 then Exit;
+  Extra := Length(Sig[0]) - RefLen;
+  if Extra <= 0 then Exit;
+  Left := Extra div 2;
+  SetLength(NewSig, Length(Sig));
+  for c := 0 to Length(Sig) - 1 do
+  begin
+    SetLength(NewSig[c], RefLen);
+    for t := 0 to RefLen - 1 do NewSig[c][t] := Sig[c][t + Left];
+  end;
+  Sig := NewSig;
+end;
+
+// One torch nn.LSTM cell pass over a (T, in) sequence held channel-major as
+// Seq[feature][t]. Gates packed (i,f,g,o) row-blocked in Wih/Whh. Writes the
+// hidden states into Out[hidden][t].
+procedure DemucsLSTMCell(const Seq: TNNetFloatDynArr2D;
+  const Wih, Whh, Bih, Bhh: array of TNeuralFloat;
+  InSize, Hidden, T: integer; Reverse: boolean; out Outp: TNNetFloatDynArr2D);
+var
+  h, cstate, g: TNeuralFloatDynArr;
+  step, t0, k, j, baseR: integer;
+  gi, gf, gg, go: TNeuralFloat;
+begin
+  SetLength(h, Hidden);
+  SetLength(cstate, Hidden);
+  SetLength(g, 4 * Hidden);
+  for k := 0 to Hidden - 1 do begin h[k] := 0; cstate[k] := 0; end;
+  SetLength(Outp, Hidden);
+  for k := 0 to Hidden - 1 do SetLength(Outp[k], T);
+  for step := 0 to T - 1 do
+  begin
+    if Reverse then t0 := T - 1 - step else t0 := step;
+    // g = Wih*x + Bih + Whh*h + Bhh
+    for k := 0 to 4 * Hidden - 1 do
+    begin
+      baseR := k * InSize;
+      g[k] := Bih[k] + Bhh[k];
+      for j := 0 to InSize - 1 do
+        g[k] := g[k] + Wih[baseR + j] * Seq[j][t0];
+      baseR := k * Hidden;
+      for j := 0 to Hidden - 1 do
+        g[k] := g[k] + Whh[baseR + j] * h[j];
+    end;
+    for k := 0 to Hidden - 1 do
+    begin
+      gi := 1.0 / (1.0 + Exp(-g[k]));
+      gf := 1.0 / (1.0 + Exp(-g[Hidden + k]));
+      gg := Tanh(g[2 * Hidden + k]);
+      go := 1.0 / (1.0 + Exp(-g[3 * Hidden + k]));
+      cstate[k] := gf * cstate[k] + gi * gg;
+      h[k] := go * Tanh(cstate[k]);
+      Outp[k][t0] := h[k];
+    end;
+  end;
+end;
+
+procedure TNNetDemucs.Separate(const Mix: array of TNeuralFloatDynArr;
+  out Stems: array of TNNetFloatDynArr2D);
+var
+  Sig, Nxt, Gout: TNNetFloatDynArr2D;
+  Skips: array of TNNetFloatDynArr2D;
+  i, j, c, t, Tlen, InLen, L, src, ch: integer;
+  Fwd, Bwd, Seq, Cat: TNNetFloatDynArr2D;
+  Lin: TNNetFloatDynArr2D;
+  Acc: TNeuralFloat;
+begin
+  InLen := Length(Mix[0]);
+  // ---- mixed waveform as channel-major Sig[channel][sample].
+  SetLength(Sig, FConfig.AudioChannels);
+  for c := 0 to FConfig.AudioChannels - 1 do
+  begin
+    SetLength(Sig[c], InLen);
+    for t := 0 to InLen - 1 do Sig[c][t] := Mix[c][t];
+  end;
+
+  // ---- encoder: depth blocks, saving each GLU output as a skip.
+  SetLength(Skips, FConfig.Depth);
+  for i := 0 to FConfig.Depth - 1 do
+  begin
+    RunHiFiGANConv(FEncConv1[i], Sig, Nxt);   // strided Conv1d
+    Sig := Nxt;
+    DemucsReLU(Sig);
+    RunHiFiGANConv(FEncConv2[i], Sig, Nxt);   // 1x1 Conv1d -> 2*out
+    DemucsGLU(Nxt, Gout);
+    Sig := Gout;
+    // save a copy as the skip.
+    SetLength(Skips[i], Length(Sig));
+    for c := 0 to Length(Sig) - 1 do
+    begin
+      SetLength(Skips[i][c], Length(Sig[c]));
+      for t := 0 to Length(Sig[c]) - 1 do Skips[i][c][t] := Sig[c][t];
+    end;
+  end;
+
+  // ---- bi-LSTM bottleneck over time, then Linear(2C -> C). Seq is the same
+  // channel-major buffer Sig (feature index = channel, time = sample).
+  Tlen := Length(Sig[0]);
+  Seq := Sig;
+  for i := 0 to FConfig.LSTMLayers - 1 do
+  begin
+    DemucsLSTMCell(Seq, FLSTM[i].WihF, FLSTM[i].WhhF, FLSTM[i].BihF,
+      FLSTM[i].BhhF, FLSTM[i].InSize, FLSTM[i].Hidden, Tlen, False, Fwd);
+    DemucsLSTMCell(Seq, FLSTM[i].WihR, FLSTM[i].WhhR, FLSTM[i].BihR,
+      FLSTM[i].BhhR, FLSTM[i].InSize, FLSTM[i].Hidden, Tlen, True, Bwd);
+    // concat forward then reverse on the feature axis.
+    SetLength(Cat, 2 * FLSTM[i].Hidden);
+    for c := 0 to FLSTM[i].Hidden - 1 do Cat[c] := Fwd[c];
+    for c := 0 to FLSTM[i].Hidden - 1 do Cat[FLSTM[i].Hidden + c] := Bwd[c];
+    Seq := Cat;
+  end;
+  // Linear(2C -> C): Lin[o][t] = sum_in W[o,in]*Seq[in][t] + B[o].
+  SetLength(Lin, FLinOut);
+  for c := 0 to FLinOut - 1 do
+  begin
+    SetLength(Lin[c], Tlen);
+    for t := 0 to Tlen - 1 do
+    begin
+      Acc := FLinB[c];
+      for j := 0 to FLinIn - 1 do
+        Acc := Acc + FLinW[c * FLinIn + j] * Seq[j][t];
+      Lin[c][t] := Acc;
+    end;
+  end;
+  Sig := Lin;
+
+  // ---- decoder: reverse order, U-Net skip add then GLU conv + transpose conv.
+  for j := 0 to FConfig.Depth - 1 do
+  begin
+    L := Length(Sig[0]);
+    // skip from encoder block (depth-1-j), center-trimmed to len(Sig).
+    DemucsCenterTrim(Skips[FConfig.Depth - 1 - j], L);
+    for c := 0 to Length(Sig) - 1 do
+      for t := 0 to L - 1 do
+        Sig[c][t] := Sig[c][t] + Skips[FConfig.Depth - 1 - j][c][t];
+    RunHiFiGANConv(FDecConv1[j], Sig, Nxt);   // Conv1d -> 2*in, pad context/2
+    DemucsGLU(Nxt, Gout);
+    Sig := Gout;
+    RunHiFiGANConv(FDecTConv[j], Sig, Nxt);   // ConvTranspose1d
+    Sig := Nxt;
+    if j <> FConfig.Depth - 1 then DemucsReLU(Sig);
+  end;
+
+  // ---- trim to input length, reshape (sources*audio_channels) -> stems.
+  DemucsCenterTrim(Sig, InLen);
+  Tlen := Length(Sig[0]);
+  for src := 0 to FConfig.Sources - 1 do
+  begin
+    SetLength(Stems[src], FConfig.AudioChannels);
+    for ch := 0 to FConfig.AudioChannels - 1 do
+    begin
+      SetLength(Stems[src][ch], Tlen);
+      for t := 0 to Tlen - 1 do
+        Stems[src][ch][t] := Sig[src * FConfig.AudioChannels + ch][t];
+    end;
+  end;
+end;
+
+// Loads a torch nn.LSTM layer L (forward + reverse) from the "lstm" prefix.
+procedure LoadDemucsLSTMLayer(Reader: TNNetSafeTensorsReader;
+  const Prefix: string; L: integer; var Layer: TDemucsLSTMLayer;
+  Consumed: TStrings);
+
+  procedure LoadFlat(const Name: string; var Dst: TNeuralFloatDynArr);
+  var
+    V: TNNetVolume;
+    k: integer;
+  begin
+    V := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat(Name, V);
+      Consumed.Add(Name);
+      SetLength(Dst, V.Size);
+      for k := 0 to V.Size - 1 do Dst[k] := V.FData[k];
+    finally
+      V.Free;
+    end;
+  end;
+
+var
+  Suffix: string;
+  WihName: string;
+begin
+  Suffix := '_l' + IntToStr(L);
+  WihName := Prefix + '.weight_ih' + Suffix;
+  Layer.Hidden := Reader.DimSize(Prefix + '.weight_hh' + Suffix, 1);
+  Layer.InSize := Reader.DimSize(WihName, 1);
+  LoadFlat(WihName, Layer.WihF);
+  LoadFlat(Prefix + '.weight_hh' + Suffix, Layer.WhhF);
+  LoadFlat(Prefix + '.bias_ih' + Suffix, Layer.BihF);
+  LoadFlat(Prefix + '.bias_hh' + Suffix, Layer.BhhF);
+  LoadFlat(Prefix + '.weight_ih' + Suffix + '_reverse', Layer.WihR);
+  LoadFlat(Prefix + '.weight_hh' + Suffix + '_reverse', Layer.WhhR);
+  LoadFlat(Prefix + '.bias_ih' + Suffix + '_reverse', Layer.BihR);
+  LoadFlat(Prefix + '.bias_hh' + Suffix + '_reverse', Layer.BhhR);
+end;
+
+function BuildDemucsFromSafeTensorsEx(Reader: TNNetSafeTensorsReader;
+  var Config: TDemucsConfig): TNNetDemucs;
+var
+  Model: TNNetDemucs;
+  Consumed: TStringList;
+  V: TNNetVolume;
+  i, k, pad: integer;
+begin
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  Model := nil;
+  V := TNNetVolume.Create;
+  try
+    Model := TNNetDemucs.Create(Config);
+
+    // ---- encoder convs.
+    SetLength(Model.FEncConv1, Config.Depth);
+    SetLength(Model.FEncConv2, Config.Depth);
+    for i := 0 to Config.Depth - 1 do
+    begin
+      // encoder.i.0: Conv1d(in -> out, k=kernel_size, stride=stride).
+      LoadHiFiGANConv(Reader, 'encoder.' + IntToStr(i) + '.0',
+        Model.FEncConv1[i], False, Config.Stride, 1, 0, Consumed);
+      // encoder.i.2: Conv1d(out -> 2*out, k=1, stride=1).
+      LoadHiFiGANConv(Reader, 'encoder.' + IntToStr(i) + '.2',
+        Model.FEncConv2[i], False, 1, 1, 0, Consumed);
+    end;
+
+    // ---- bi-LSTM bottleneck + Linear.
+    SetLength(Model.FLSTM, Config.LSTMLayers);
+    for i := 0 to Config.LSTMLayers - 1 do
+      LoadDemucsLSTMLayer(Reader, 'lstm', i, Model.FLSTM[i], Consumed);
+    Reader.LoadTensorFlat('lstm_linear.weight', V);
+    Consumed.Add('lstm_linear.weight');
+    Model.FLinOut := Reader.DimSize('lstm_linear.weight', 0);
+    Model.FLinIn := Reader.DimSize('lstm_linear.weight', 1);
+    SetLength(Model.FLinW, V.Size);
+    for k := 0 to V.Size - 1 do Model.FLinW[k] := V.FData[k];
+    Reader.LoadTensorFlat('lstm_linear.bias', V);
+    Consumed.Add('lstm_linear.bias');
+    SetLength(Model.FLinB, V.Size);
+    for k := 0 to V.Size - 1 do Model.FLinB[k] := V.FData[k];
+
+    // ---- decoder convs.
+    pad := Config.Context div 2;
+    SetLength(Model.FDecConv1, Config.Depth);
+    SetLength(Model.FDecTConv, Config.Depth);
+    for i := 0 to Config.Depth - 1 do
+    begin
+      // decoder.i.0: Conv1d(in -> 2*in, k=context, stride=1, pad=context div 2).
+      LoadHiFiGANConv(Reader, 'decoder.' + IntToStr(i) + '.0',
+        Model.FDecConv1[i], False, 1, 1, pad, Consumed);
+      // decoder.i.2: ConvTranspose1d(in -> out, k=kernel_size, stride=stride).
+      LoadHiFiGANConv(Reader, 'decoder.' + IntToStr(i) + '.2',
+        Model.FDecTConv[i], True, Config.Stride, 1, 0, Consumed);
+    end;
+
+    Result := Model;
+    Model := nil;
+  finally
+    V.Free;
+    Model.Free;
+    Consumed.Free;
+  end;
+end;
+
+function BuildDemucsFromSafeTensors(const FileName: string;
+  out Config: TDemucsConfig;
+  const ConfigFileName: string = ''): TNNetDemucs;
+var
+  Reader: TNNetSafeTensorsReader;
+  CfgPath: string;
+begin
+  if ConfigFileName <> '' then CfgPath := ConfigFileName
+  else CfgPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadDemucsConfigFromJSONFile(CfgPath);
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildDemucsFromSafeTensorsEx(Reader, Config);
   finally
     Reader.Free;
   end;

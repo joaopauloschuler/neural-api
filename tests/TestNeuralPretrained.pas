@@ -281,6 +281,11 @@ type
     // flow reverse, end-to-end waveform) vs the HF VitsModel float64 oracle,
     // with the prior noise z fed explicitly for a deterministic result < 1e-4.
     procedure TestVitsSynthesisParity;
+    // Demucs: separates two pinned mixed waveforms through the imported
+    // time-domain U-Net (strided conv + GLU + bi-LSTM + transpose conv with
+    // U-Net skips) and asserts the four stems match the self-contained numpy
+    // float64 oracle < 1e-4.
+    procedure TestDemucsSeparationParity;
     // MusicGen: asserts the imported text-to-music DECODER's next-token
     // logits (K codebooks x T frames x vocab) match the HF float64 oracle <
     // 1e-4, and the pure delay-pattern (de)interleave helpers round-trip and
@@ -12221,6 +12226,83 @@ begin
     end;
     // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
     AssertTrue('VITS end-to-end waveform parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Model.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestDemucsSeparationParity;
+var
+  Model: TNNetDemucs;
+  Config: TDemucsConfig;
+  RefRoot: TJSONData;
+  RefObj: TJSONObject;
+  RefJson: TStringList;
+  Clips, Clip, MixArr, MixRow, StemsArr, StemSrc, StemCh: TJSONArray;
+  Mix: array of TNeuralFloatDynArr;
+  Stems: array of TNNetFloatDynArr2D;
+  Sources, AudioCh, MixLen, ci, src, ch, t: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_demucs_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    Sources := RefObj.Get('sources', 0);
+    AudioCh := RefObj.Get('audio_channels', 0);
+    Clips := TJSONArray(RefObj.Find('clips'));
+    AssertTrue('clips present', Clips <> nil);
+    AssertTrue('at least 2 clips', Clips.Count >= 2);
+
+    Model := BuildDemucsFromSafeTensors(
+      FixturePath('tiny_demucs.safetensors'), Config,
+      FixturePath('tiny_demucs_config.json'));
+    AssertTrue('demucs built', Model <> nil);
+    AssertEquals('sources from config', Sources, Config.Sources);
+    AssertEquals('audio_channels from config', AudioCh, Config.AudioChannels);
+
+    SetLength(Stems, Sources);
+    MaxDiff := 0;
+    for ci := 0 to Clips.Count - 1 do
+    begin
+      Clip := TJSONArray(Clips.Items[ci]);
+      MixArr := TJSONArray(TJSONObject(Clip).Find('mix'));  // [ch][T]
+      StemsArr := TJSONArray(TJSONObject(Clip).Find('stems')); // [src][ch][T]
+      MixLen := TJSONArray(MixArr.Items[0]).Count;
+      SetLength(Mix, AudioCh);
+      for ch := 0 to AudioCh - 1 do
+      begin
+        SetLength(Mix[ch], MixLen);
+        MixRow := TJSONArray(MixArr.Items[ch]);
+        for t := 0 to MixLen - 1 do Mix[ch][t] := MixRow.Items[t].AsFloat;
+      end;
+
+      Model.Separate(Mix, Stems);
+      AssertEquals('stem source count', Sources, Length(Stems));
+      for src := 0 to Sources - 1 do
+      begin
+        StemSrc := TJSONArray(StemsArr.Items[src]);
+        for ch := 0 to AudioCh - 1 do
+        begin
+          StemCh := TJSONArray(StemSrc.Items[ch]);
+          AssertEquals('stem length', StemCh.Count, Length(Stems[src][ch]));
+          for t := 0 to StemCh.Count - 1 do
+          begin
+            Diff := Abs(Stems[src][ch][t] - StemCh.Items[t].AsFloat);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+        end;
+      end;
+    end;
+    // 1e-4 importer-parity gate. NEVER loosen - fix the model instead.
+    AssertTrue('Demucs separation parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     Model.Free;

@@ -1,0 +1,14 @@
+{
+ "model_type": "demucs",
+ "sources": 4,
+ "audio_channels": 2,
+ "channels": 4,
+ "depth": 2,
+ "kernel_size": 8,
+ "stride": 4,
+ "context": 3,
+ "lstm_layers": 2,
+ "rescale": 1.0,
+ "normalize": false,
+ "sampling_rate": 8000
+}
