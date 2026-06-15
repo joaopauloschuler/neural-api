@@ -1074,7 +1074,7 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       Demo: a tiny horse<->zebra-style recoloring or MNIST<->edge toy on CPU.
       Distinct from Pix2Pix (unpaired, dual generators, cycle loss) — not a
       near-duplicate.
-- [ ] Masked Autoencoder (MAE, He et al. 2022) self-supervised pretraining
+- [X] Masked Autoencoder (MAE, He et al. 2022) self-supervised pretraining
       example (examples/MaskedAutoencoder) — the SELF-SUPERVISED-VISION gap
       (existing autoencoders VisualAutoencoder/SparseAutoencoder/AnomalyAuto
       encoder/GumbelAnnealingAutoencoder are all full-image, not masked). Patch
@@ -1085,6 +1085,16 @@ every recurrence currently trains as a strict per-token left-to-right scan.)
       downstream linear-probe / fine-tune on a small classification set. Reuses
       the patch-embed + EncoderBlock path; new code is the random-mask gather/
       scatter and the asymmetric encoder/decoder split.
+      FOLLOW-UPS (the landed examples/MaskedAutoencoder uses an honest
+      single-graph approximation): (a) a TRUE asymmetric encode-visible-only
+      variant — encode only the K visible tokens (manual cross-net gather/scatter
+      + gradient routing, or a variable-length sequence primitive) for the real
+      MAE compute speedup, not just the zero-mask-token full-grid encoder;
+      (b) a robust few-shot FINE-TUNE payoff (the current fine-tune path is
+      omitted because the narrow MAE-reconstruction init sits in a sharp minimum
+      the small fine-tune LR can't escape and underperforms random init — needs
+      LR warmup / layerwise-LR / head-warmup to show the expected MAE-init win);
+      (c) a learnable (non-zero) shared mask token.
 - [X] OWL-ViT open-vocabulary object-detection importer
       (BuildOwlViTFromSafeTensors, e.g. google/owlvit-base-patch32) — the
       ZERO-SHOT-DETECTION gap (DETR is open but closed-vocabulary). OWL-ViT
