@@ -295,6 +295,50 @@ rather than acted on.
       (TNNetTorchBinReader path); (b) real x4 upscale of a tiny PNG end-to-end
       example; (c) scale=2 / other scales (currently only scale=4 = two upsample
       stages wired).
+- [ ] NAFNet image-restoration importer (BuildNAFNetFromSafeTensors[Ex] +
+      TNAFNetConfig, e.g. the official NAFNet denoise/deblur checkpoints) — the
+      first non-diffusion image-to-image RESTORATION importer that is NOT
+      super-resolution (the landed RRDBNet/ESRGAN path is x4 upscaling only). The
+      only genuinely new pieces are SimpleGate (split the channel axis in half and
+      multiply the two halves elementwise — a parameter-free GLU; add a small
+      TNNetSimpleGate or a Split+Mul builder) and Simplified Channel Attention
+      (global-avg-pool -> 1x1 conv -> channel-wise multiply, no activation),
+      assembled into a U-Net of NAFBlocks with LayerNorm. Everything else (1x1/3x3
+      conv, pixel-shuffle up/down via TNNetDepthToSpace, residual add) reuses landed
+      layers. Pico parity vs a numpy float64 oracle on a tiny denoise net +
+      examples/ImageRestoration that denoises/deblurs a small PNG end-to-end on CPU.
+- [ ] SwinIR transformer image-restoration importer (BuildSwinIRFromSafeTensors[Ex])
+      — classical/lightweight super-resolution + denoising + JPEG-artifact removal
+      built on the LANDED Swin window/shifted-window attention
+      (BuildSwinFromSafeTensors). The new code is only the shallow-feature conv stem,
+      the Residual Swin Transformer Blocks (RSTB = a few Swin layers + a conv +
+      residual) and the pixel-shuffle (TNNetDepthToSpace) upsample tail; the
+      window-attention core is reuse. Architecturally distinct from the CNN-only
+      RRDBNet SR and the SimpleGate-CNN NAFNet (transformer restoration). Pico parity
+      vs a float64 oracle on a tiny SR net; folds into examples/SuperResolution as a
+      real pretrained option.
+- [ ] RIFE real-time video frame-interpolation importer (BuildRIFEFromSafeTensors[Ex],
+      the IFNet of hzwer/Practical-RIFE) — fills the VIDEO-generative importer gap:
+      synthesises an intermediate frame between two input frames (the landed RAFT
+      estimates optical FLOW but does NOT synthesise frames, and
+      examples/FrameInterpolation is a from-scratch toy, not an importer). New code is
+      the coarse-to-fine IFNet (a few stride-2 conv "IFBlocks" each predicting a flow
+      residual + a soft fusion mask at increasing resolution) plus a differentiable
+      backward-warp op (TNNetBackwardWarp: bilinear-sample frame0/frame1 by the
+      predicted flow — reuse the bilinear sampler already in TNNetDeformableConv).
+      Pico parity vs a numpy float64 oracle on a tiny IFNet + examples/VideoFrameInterpolation
+      that interpolates one middle frame between two small PNGs on CPU.
+- [ ] GFPGAN blind face-restoration importer (BuildGFPGANFromSafeTensors[Ex],
+      TencentARC/GFPGAN) — leverages the LANDED StyleGAN2 generator
+      (BuildStyleGAN2GeneratorFromSafeTensors) as a fixed facial prior: a U-Net
+      degradation-removal encoder maps a low-quality face to the StyleGAN2 latent/
+      noise inputs, and per-resolution encoder features are spatially modulated into
+      the generator via CS-SFT (channel-split spatial feature transform) layers. The
+      only genuinely new code is the small U-Net encoder + the CS-SFT scale/shift
+      injection (an affine FiLM-like modulation — reuse the landed TNNetFiLM); the
+      synthesis backbone is reuse. Distinct from NAFNet/SwinIR (generic restoration
+      with no generative face prior). Pico parity vs a float64 oracle on the SFT
+      injection for a fixed latent + examples/FaceRestoration on a tiny CPU image.
 - [ ] Inception-v3 / GoogLeNet importer (BuildInceptionV3FromSafeTensors,
       torchvision) — PARTIAL (commit 503540b): the branch-concatenation block
       builder LANDED (AddInceptionAModule runs 4 parallel branches
