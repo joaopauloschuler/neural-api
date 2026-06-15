@@ -448,6 +448,10 @@ type
     procedure TestMinLSTMInputGradientCheck;
     procedure TestMinLSTMWeightGradientCheck;
     procedure TestMinLSTMSerializationRoundTrip;
+    procedure TestConvLSTMCellShapeInference;
+    procedure TestConvLSTMCellInputGradientCheck;
+    procedure TestConvLSTMCellWeightGradientCheck;
+    procedure TestConvLSTMCellSerializationRoundTrip;
     procedure TestDeltaNetShapeInference;
     procedure TestDeltaNetInputGradientCheck;
     procedure TestDeltaNetWeightGradientCheck;
@@ -33471,6 +33475,199 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetMinLSTM.Create(), 'MinLSTM', 4, 1, 3, 1e-5);
+end;
+
+// --- TNNetConvLSTMCell (convolutional LSTM spatiotemporal recurrent cell) -----
+
+// Deterministic, BOUNDED gate kernels + biases so every gate (i/f/o sigmoid,
+// g tanh), the f_t*c_{t-1} memory carry AND the h_{t-1} gate feed are exercised,
+// while staying inside the small-magnitude regime where the FD truncation of
+// tanh/sigmoid stays under the gradient tolerance.
+procedure SeedConvLSTMCell(L: TNNetConvLSTMCell);
+var n, i: integer;
+begin
+  // Kernels [0..3], then biases [4..7].
+  for n := 0 to 3 do
+    for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      L.Neurons[n].Weights.Raw[i] := Sin(n * 1.3 + i * 0.21) * 0.15;
+  for n := 4 to 7 do
+    for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      L.Neurons[n].Weights.Raw[i] := Cos(n * 0.9 + i * 0.5) * 0.2;
+end;
+
+procedure TTestNeuralNumerical.TestConvLSTMCellShapeInference;
+var
+  NN: TNNet;
+  L: TNNetConvLSTMCell;
+begin
+  // T=2, H=SizeX/T=2, W=2, InC=2; HiddenC=3, K=3 -> ZC=InC+HiddenC=5.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 2, 2)); // (T*H=4, W=2, InC=2)
+    L := TNNetConvLSTMCell.Create(2, 3, 3);
+    NN.AddLayer(L);
+    AssertEquals('ConvLSTM output SizeX = T*H', 4, L.Output.SizeX);
+    AssertEquals('ConvLSTM output SizeY = W', 2, L.Output.SizeY);
+    AssertEquals('ConvLSTM output Depth = HiddenC', 3, L.Output.Depth);
+    AssertEquals('ConvLSTM neuron count', 8, L.Neurons.Count);
+    // Kernel = HiddenC * K*K * (InC+HiddenC) = 3*9*5 = 135.
+    AssertEquals('ConvLSTM Wi size', 135, L.Neurons[0].Weights.Size);
+    AssertEquals('ConvLSTM bi size', 3, L.Neurons[4].Weights.Size);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvLSTMCellInputGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  L: TNNetConvLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  // T=2, H=2, W=2, InC=2; HiddenC=2, K=3.
+  Input := TNNetVolume.Create(4, 2, 2);
+  InputPlus := TNNetVolume.Create(4, 2, 2);
+  Desired := TNNetVolume.Create(4, 2, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  try
+    // 4-arg input (pError=1) so the input-grad buffer is sized -> no OOB flake.
+    NN.AddLayer(TNNetInput.Create(4, 2, 2, 1));
+    L := TNNetConvLSTMCell.Create(2, 2, 3);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.55) * 1.1 + 0.2;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.37) * 0.6;
+    SeedConvLSTMCell(L);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      if Abs(numericalGrad - analyticalGrad) > maxErr then
+        maxErr := Abs(numericalGrad - analyticalGrad);
+      AssertTrue('ConvLSTM input gradient check at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+    WriteLn('ConvLSTM input gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; InputPlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvLSTMCellWeightGradientCheck;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  L: TNNetConvLSTMCell;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  maxErr: TNeuralFloat;
+  i, n: integer;
+  Names: array[0..7] of string;
+
+  function ComputeLoss: TNeuralFloat;
+  var k: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 2, 2);
+  Desired := TNNetVolume.Create(4, 2, 2);
+  epsilon := 0.0001;
+  maxErr := 0;
+  Names[0] := 'Wi'; Names[1] := 'Wf'; Names[2] := 'Wo'; Names[3] := 'Wg';
+  Names[4] := 'bi'; Names[5] := 'bf'; Names[6] := 'bo'; Names[7] := 'bg';
+  try
+    NN.AddLayer(TNNetInput.Create(4, 2, 2, 1));
+    L := TNNetConvLSTMCell.Create(2, 2, 3);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.43) * 1.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.31) * 0.6;
+    SeedConvLSTMCell(L);
+
+    // Cover all eight tensors. The h_{t-1} gate feed couples adjacent timesteps,
+    // a classic place for a silent ConvLSTM BPTT truncation.
+    for n := 0 to 7 do
+      for i := 0 to L.Neurons[n].Weights.Size - 1 do
+      begin
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        lossPlus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] - 2 * epsilon;
+        lossMinus := ComputeLoss;
+        L.Neurons[n].Weights.Raw[i] := L.Neurons[n].Weights.Raw[i] + epsilon;
+        numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+        NN.Compute(Input);
+        L.Neurons[n].ClearDelta;
+        NN.Backpropagate(Desired);
+        analyticalGrad := -L.Neurons[n].Delta.Raw[i];
+
+        if Abs(numericalGrad - analyticalGrad) > maxErr then
+          maxErr := Abs(numericalGrad - analyticalGrad);
+        AssertTrue('ConvLSTM weight gradient check ' + Names[n] +
+          '[' + IntToStr(i) + '] num=' + FloatToStr(numericalGrad) +
+          ' ana=' + FloatToStr(analyticalGrad),
+          Abs(numericalGrad - analyticalGrad) < 0.01);
+      end;
+    WriteLn('ConvLSTM weight gradient max abs error: ', maxErr:0:8);
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConvLSTMCellSerializationRoundTrip;
+begin
+  // ConvLSTM stores eight learnable tensors (four KxK gate kernels + four
+  // HiddenC biases) plus T/HiddenC/K in FStruct; the perturbed-weights helper
+  // exercises the kernel round-trip and the constructor-arg reconstruction.
+  RandSeed := 424242;
+  NormSerializationRoundTripWithPerturbedWeights(Self,
+    TNNetConvLSTMCell.Create(2, 2, 3), 'ConvLSTMCell', 4, 2, 2, 1e-5);
 end;
 
 procedure SeedDeltaNet(L: TNNetDeltaNet; Depth: integer);

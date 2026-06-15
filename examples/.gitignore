@@ -49,6 +49,13 @@ CycleGAN/*.o
 CycleGAN/*.ppr
 CycleGAN/cyclegan_sample.ppm
 
+# VideoPrediction: compiled ConvLSTM next-frame demo binary, build artifacts, sample image
+VideoPrediction/VideoPrediction
+VideoPrediction/*.o
+VideoPrediction/*.ppu
+VideoPrediction/*.ppr
+VideoPrediction/videoprediction_sample.ppm
+
 # VQGAN: compiled VQ-GAN demo binary, build artifacts, sample image, run logs
 VQGAN/VQGAN
 VQGAN/*.o
