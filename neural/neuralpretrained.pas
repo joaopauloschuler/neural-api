@@ -5015,6 +5015,85 @@ function BuildConvNeXtFromSafeTensors(const FileName: string;
   const ConfigFileName: string = ''): TNNet;
 
 // ---------------------------------------------------------------------------
+// SEGFORMER SEMANTIC-SEGMENTATION IMPORT (HF "segformer", MiT encoder + all-MLP
+// decode head; e.g. nvidia/segformer-b0-finetuned-ade-512-512). The FIRST dense
+// per-pixel class-map importer. The MiT (Mix Transformer) encoder is a 4-stage
+// hierarchical transformer:
+//   - Overlap-patch embed: a strided/padded Conv2d (stage 0 = 7x7 stride 4 pad 3;
+//     stages 1..3 = 3x3 stride 2 pad 1) producing a (Wi,Hi,Ci) grid, then a
+//     channel LayerNorm. NO positional embedding anywhere.
+//   - depths[i] blocks, each: LN -> efficient self-attention -> residual ->
+//     LN -> Mix-FFN -> residual.
+//   - Efficient self-attention with spatial-reduction ratio sr[i]: Q is the full
+//     (Hi*Wi) token grid; when sr>1 the K/V come from a sr x sr stride-sr conv
+//     ("sequence reduction") + LN that shrinks the grid to (Hi/sr)*(Wi/sr) tokens
+//     FIRST -- a RECTANGULAR Q_len != KV_len attention, wired with
+//     TNNetCrossAttention (Q from prev, K|V from the reduced source). Per head is
+//     a separate single-head cross-attention; heads are concatenated.
+//   - Mix-FFN: pointwise Linear expand (fc1) -> depthwise 3x3 (pad 1) on the grid
+//     -> GELU (exact erf) -> pointwise Linear project (fc2). The dwconv is the
+//     implicit positional encoding (replaces position embeddings).
+//   - per-stage final channel LayerNorm.
+// All channel LayerNorm / Linear ops run per-token on the (Wi,Hi,Ci) grid
+// (TNNetTokenLayerNorm / TNNetPointwiseConvLinear); only the attention flattens
+// the grid to a (L,1,C) sequence (TNNetReshape, row-major over (y,x) == HF
+// flatten(2).transpose(1,2)) and back.
+// The lightweight all-MLP decode head: each of the 4 stage outputs (Wi,Hi,Ci) is
+// projected by a per-token Linear to decoder_hidden_size, bilinearly upsampled
+// (TNNetBilinearUpsample, align_corners=False) to stage-0 resolution (W/4,H/4),
+// the 4 are concatenated on channels in REVERSED stage order (HF cat([::-1])),
+// fused by a 1x1 conv -> frozen BatchNorm (folded into ChannelMul+ChannelBias)
+// -> ReLU -> 1x1 conv classifier. Output is (W/4,H/4,num_labels) class logits;
+// the caller upsamples to input resolution (kept out of the net so the parity
+// test can score the head logits directly).
+// HF transformers 5.x tensor names (segformer.stages.{i}...): both the legacy
+// (segformer.encoder...) and the 5.x (segformer.stages..., q_proj/k_proj/v_proj/
+// o_proj, decode_head.linear_projections) spellings are accepted.
+// Scope: MiT-b0 verified (depths [2,2,2,2], hidden [32,64,160,256],
+// sr [8,4,2,1], heads [1,2,5,8], decoder 256). Larger MiT-b1..b5 differ only in
+// the config arrays (same code path).
+// ---------------------------------------------------------------------------
+type
+  TSegformerConfig = record
+    Depths: array[0..3] of integer;       // blocks per stage (b0 [2,2,2,2])
+    HiddenSizes: array[0..3] of integer;  // channels per stage (b0 [32,64,160,256])
+    SrRatios: array[0..3] of integer;     // sequence-reduction ratios (b0 [8,4,2,1])
+    NumHeads: array[0..3] of integer;     // attention heads per stage (b0 [1,2,5,8])
+    PatchSizes: array[0..3] of integer;   // overlap-patch conv kernel ([7,3,3,3])
+    Strides: array[0..3] of integer;      // overlap-patch conv stride ([4,2,2,2])
+    MlpRatios: array[0..3] of integer;    // FFN expansion ratio per stage ([4,4,4,4])
+    DecoderHiddenSize: integer;           // all-MLP head common dim (b0 256)
+    ImageSize: integer;                   // square input edge (512 for ADE)
+    NumChannels: integer;                 // 3
+    NumLabels: integer;                   // segmentation classes (150 for ADE)
+    LayerNormEps: TNeuralFloat;           // 1e-6
+    HiddenAct: string;                    // 'gelu'
+  end;
+
+// Reads an HF SegFormer config.json. depths / hidden_sizes / sr_ratios /
+// num_attention_heads / strides / patch_sizes / mlp_ratios (4-int arrays)
+// override the b0 defaults; decoder_hidden_size, num_labels (or id2label) set the
+// head. hidden_act must be a gelu variant (exact erf).
+function ReadSegformerConfigFromJSONFile(
+  const FileName: string): TSegformerConfig;
+
+function SegformerConfigToString(const Config: TSegformerConfig): string;
+
+// Builds the SegFormer described by Config and loads every weight from Reader
+// (caller owns Reader). Input (ImageSize, ImageSize, NumChannels) RGB volume;
+// output (ImageSize/4, ImageSize/4, NumLabels) per-pixel class logits (the caller
+// upsamples to full input resolution).
+function BuildSegformer(Reader: TNNetSafeTensorsReader;
+  const Config: TSegformerConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildSegformerFromSafeTensorsEx(const FileName: string;
+  const Config: TSegformerConfig; pInferenceOnly: boolean = false): TNNet;
+
+function BuildSegformerFromSafeTensors(const FileName: string;
+  out Config: TSegformerConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+
+// ---------------------------------------------------------------------------
 // MOBILENETV3 IMPORT (torchvision "mobilenet_v3_small" / "mobilenet_v3_large").
 // The efficient mobile-CNN family, structurally distinct from ResNet: the body
 // is a stack of inverted-residual MBConv blocks, each:
@@ -32703,6 +32782,583 @@ begin
   else ConfigPath := ExtractFilePath(FileName) + 'config.json';
   Config := ReadConvNeXtConfigFromJSONFile(ConfigPath);
   Result := BuildConvNeXtFromSafeTensorsEx(FileName, Config, pInferenceOnly);
+end;
+
+// ===========================================================================
+// SEGFORMER SEMANTIC-SEGMENTATION IMPORT (HF "segformer")
+// ===========================================================================
+
+function ReadSegformerConfigFromJSONFile(
+  const FileName: string): TSegformerConfig;
+const
+  cB0Depths: array[0..3] of integer = (2, 2, 2, 2);
+  cB0Hidden: array[0..3] of integer = (32, 64, 160, 256);
+  cB0Sr: array[0..3] of integer = (8, 4, 2, 1);
+  cB0Heads: array[0..3] of integer = (1, 2, 5, 8);
+  cPatch: array[0..3] of integer = (7, 3, 3, 3);
+  cStride: array[0..3] of integer = (4, 2, 2, 2);
+  cMlp: array[0..3] of integer = (4, 4, 4, 4);
+var
+  JsonText: TStringList;
+  Root, ArrData, LabelObj: TJSONData;
+  Obj: TJSONObject;
+  Arr: TJSONArray;
+  i: integer;
+
+  procedure ReadIntArray(const Key: string; var Dst: array of integer);
+  var d: TJSONData; a: TJSONArray; k: integer;
+  begin
+    d := Obj.Find(Key);
+    if (d <> nil) and (d is TJSONArray) then
+    begin
+      a := TJSONArray(d);
+      if a.Count <> 4 then
+        ImportError('SegFormer import: "' + Key + '" must have 4 entries, got ' +
+          IntToStr(a.Count) + '.');
+      for k := 0 to 3 do Dst[k] := a.Integers[k];
+    end;
+  end;
+begin
+  if not FileExists(FileName) then
+    ImportError('SegFormer import: config file "' + FileName +
+      '" not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('SegFormer import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('SegFormer import: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    for i := 0 to 3 do
+    begin
+      Result.Depths[i] := cB0Depths[i];
+      Result.HiddenSizes[i] := cB0Hidden[i];
+      Result.SrRatios[i] := cB0Sr[i];
+      Result.NumHeads[i] := cB0Heads[i];
+      Result.PatchSizes[i] := cPatch[i];
+      Result.Strides[i] := cStride[i];
+      Result.MlpRatios[i] := cMlp[i];
+    end;
+    ReadIntArray('depths', Result.Depths);
+    ReadIntArray('hidden_sizes', Result.HiddenSizes);
+    ReadIntArray('sr_ratios', Result.SrRatios);
+    ReadIntArray('num_attention_heads', Result.NumHeads);
+    ReadIntArray('patch_sizes', Result.PatchSizes);
+    ReadIntArray('strides', Result.Strides);
+    ReadIntArray('mlp_ratios', Result.MlpRatios);
+    Result.DecoderHiddenSize := Obj.Get('decoder_hidden_size', 256);
+    Result.ImageSize := Obj.Get('image_size', 512);
+    Result.NumChannels := Obj.Get('num_channels', 3);
+    Result.LayerNormEps := Obj.Get('layer_norm_eps', 0.000001);
+    Result.HiddenAct := Obj.Get('hidden_act', 'gelu');
+    Result.NumLabels := 0;
+    if Obj.IndexOfName('num_labels') >= 0 then
+      Result.NumLabels := Obj.Get('num_labels', 0);
+    if Result.NumLabels <= 0 then
+    begin
+      LabelObj := Obj.Find('id2label');
+      if (LabelObj <> nil) and (LabelObj is TJSONObject) then
+        Result.NumLabels := TJSONObject(LabelObj).Count;
+    end;
+    ArrData := nil; // silence hint
+    if Result.NumLabels <= 0 then Result.NumLabels := 150;
+  finally
+    if Root <> nil then Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function SegformerConfigToString(const Config: TSegformerConfig): string;
+begin
+  Result := 'segformer config: ' +
+    'depths=[' + IntToStr(Config.Depths[0]) + ',' + IntToStr(Config.Depths[1]) +
+    ',' + IntToStr(Config.Depths[2]) + ',' + IntToStr(Config.Depths[3]) + ']' +
+    ', hidden=[' + IntToStr(Config.HiddenSizes[0]) + ',' +
+    IntToStr(Config.HiddenSizes[1]) + ',' + IntToStr(Config.HiddenSizes[2]) +
+    ',' + IntToStr(Config.HiddenSizes[3]) + ']' +
+    ', sr=[' + IntToStr(Config.SrRatios[0]) + ',' + IntToStr(Config.SrRatios[1]) +
+    ',' + IntToStr(Config.SrRatios[2]) + ',' + IntToStr(Config.SrRatios[3]) + ']' +
+    ', heads=[' + IntToStr(Config.NumHeads[0]) + ',' + IntToStr(Config.NumHeads[1]) +
+    ',' + IntToStr(Config.NumHeads[2]) + ',' + IntToStr(Config.NumHeads[3]) + ']' +
+    ', decoder=' + IntToStr(Config.DecoderHiddenSize) +
+    ', image=' + IntToStr(Config.ImageSize) +
+    ', num_labels=' + IntToStr(Config.NumLabels) +
+    ', act=' + Config.HiddenAct;
+end;
+
+type
+  // Layer refs needed to load one SegFormer (MiT) encoder block's weights.
+  TSegformerBlockLayers = record
+    LN1, LN2: TNNetLayer;
+    QProj, KProj, VProj, OProj: TNNetLayer;
+    SrConv, SrLN: TNNetLayer;        // nil when sr_ratio = 1
+    Fc1, DwConv, DwBias, Fc2: TNNetLayer;
+  end;
+  TSegformerStageRefs = record
+    PatchConv, PatchLN, StageLN: TNNetLayer;
+    Blocks: array of TSegformerBlockLayers;
+  end;
+
+// Resolves a tensor name across the legacy (segformer.encoder...) and the
+// transformers-5.x (segformer.stages...) naming schemes. Returns the first
+// spelling that exists; if neither exists returns the 5.x spelling (so the
+// downstream loader raises a clear "missing tensor" error on it).
+function SegPickName(Reader: TNNetSafeTensorsReader;
+  const NameA, NameB: string): string;
+begin
+  if Reader.HasTensor(NameA) then Result := NameA
+  else if Reader.HasTensor(NameB) then Result := NameB
+  else Result := NameA;
+end;
+
+// Loads a bias-free 1x1 nn.Conv2d (weight [O,I,1,1] or the flattened [O,I]) into
+// a TNNetPointwiseConvLinear (per-token Linear over Depth). The flat element
+// order of [O,I,1,1] is identical to [O,I], so the same row-major copy works for
+// both ranks; the CAI per-neuron bias stays zero (HF linear_fuse has bias=False).
+procedure LoadSegformer1x1(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; OutCh, InCh: integer;
+  const BName: string = '');
+var
+  W, B: TNNetVolume;
+  o, c: integer;
+begin
+  EnsureWritableImportWeights(Layer);
+  if not Reader.HasTensor(WName) then
+    ImportError('SegFormer import: missing tensor "' + WName + '".');
+  if Layer.Neurons.Count <> OutCh then
+    ImportError('SegFormer import: internal error - "' + WName +
+      '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
+      IntToStr(OutCh) + '.');
+  W := TNNetVolume.Create;
+  B := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(WName, W);
+    if W.Size <> OutCh * InCh then
+      ImportError('SegFormer import: "' + WName + '" must flatten to ' +
+        IntToStr(OutCh * InCh) + ' elements, got ' + IntToStr(W.Size) + '.');
+    if BName <> '' then
+    begin
+      if not Reader.HasTensor(BName) then
+        ImportError('SegFormer import: missing tensor "' + BName + '".');
+      Reader.LoadTensorFlat(BName, B);
+      if B.Size <> OutCh then
+        ImportError('SegFormer import: "' + BName + '" must have ' +
+          IntToStr(OutCh) + ' elements.');
+    end;
+    for o := 0 to OutCh - 1 do
+    begin
+      for c := 0 to InCh - 1 do
+        Layer.Neurons[o].Weights.FData[c] := W.FData[o * InCh + c];
+      if BName <> '' then Layer.Neurons[o].BiasWeight := B.FData[o]
+      else Layer.Neurons[o].BiasWeight := 0;
+    end;
+    Layer.FlushWeightCache();
+  finally
+    W.Free; B.Free;
+  end;
+end;
+
+// Builds the multi-head efficient self-attention for one block onto NN, reading
+// the (Wg,Hg,C) grid produced by Norm. sr>1 inserts a sr x sr stride-sr
+// "sequence reduction" conv + LN that shrinks the K/V grid first (rectangular
+// Q_len != KV_len attention via TNNetCrossAttention). Returns the o_proj layer
+// and fills the per-block refs needed for weight loading.
+procedure AddSegformerAttention(NN: TNNet; NormLayer: TNNetLayer;
+  C, Heads, Sr, Wg, Hg: integer; LayerNormEps: TNeuralFloat;
+  var Refs: TSegformerBlockLayers);
+var
+  HeadDim, h: integer;
+  QFull, KVSource, KFull, VFull: TNNetLayer;
+  Kh, Vh, Qh, KVh, Att: TNNetLayer;
+  HeadOuts: array of TNNetLayer;
+begin
+  HeadDim := C div Heads;
+  // Q projection on the FULL grid (per-token Linear), then flatten to sequence.
+  Refs.QProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(C), NormLayer);
+  QFull := NN.AddLayer(TNNetReshape.Create(Wg * Hg, 1, C));
+  // K/V source: full grid, or the spatially-reduced grid when sr > 1.
+  Refs.SrConv := nil; Refs.SrLN := nil;
+  if Sr > 1 then
+  begin
+    Refs.SrConv := NN.AddLayerAfter(
+      TNNetConvolutionLinear.Create(C, Sr, 0, Sr, 0), NormLayer);
+    Refs.SrLN := NN.AddLayer(TNNetTokenLayerNorm.Create(LayerNormEps));
+    KVSource := Refs.SrLN;
+  end
+  else
+    KVSource := NormLayer;
+  // K and V projections on the (reduced) grid, flattened to sequence.
+  Refs.KProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(C), KVSource);
+  KFull := NN.AddLayer(TNNetReshape.Create(
+    (Wg div Sr) * (Hg div Sr), 1, C));
+  Refs.VProj := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(C), KVSource);
+  VFull := NN.AddLayer(TNNetReshape.Create(
+    (Wg div Sr) * (Hg div Sr), 1, C));
+  // Per head: slice Q_h, K_h, V_h; pack K_h|V_h (depth 2*HeadDim); cross-attend.
+  SetLength(HeadOuts, Heads);
+  for h := 0 to Heads - 1 do
+  begin
+    Qh := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(h * HeadDim, HeadDim), QFull);
+    Kh := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(h * HeadDim, HeadDim), KFull);
+    Vh := NN.AddLayerAfter(
+      TNNetSplitChannels.Create(h * HeadDim, HeadDim), VFull);
+    KVh := NN.AddLayer(TNNetDeepConcat.Create([Kh, Vh]));
+    Att := NN.AddLayerAfter(
+      TNNetCrossAttention.Create(HeadDim, false, KVh), Qh);
+    HeadOuts[h] := Att;
+  end;
+  // Concat heads back to depth C, reshape to grid, o_proj (per-token Linear).
+  if Heads > 1 then
+    NN.AddLayer(TNNetDeepConcat.Create(HeadOuts))
+  else
+    NN.AddLayerAfter(TNNetReshape.Create(Wg * Hg, 1, C), HeadOuts[0]);
+  // (single-head path already a (L,1,HeadDim=C) sequence; reshape is a no-op
+  //  shape assertion to keep the depth/sequence layout uniform)
+  NN.AddLayer(TNNetReshape.Create(Wg, Hg, C));
+  Refs.OProj := NN.AddLayer(TNNetPointwiseConvLinear.Create(C));
+end;
+
+// Builds one MiT block (LN -> attention -> residual -> LN -> Mix-FFN -> residual)
+// onto NN over a (Wg,Hg,C) grid. Mix-FFN: fc1 expand -> depthwise 3x3 pad1 (the
+// positional encoder) + per-channel bias -> GELU(erf) -> fc2 project.
+procedure AddSegformerBlock(NN: TNNet; const Config: TSegformerConfig;
+  Stage, Wg, Hg: integer; var Refs: TSegformerBlockLayers);
+var
+  C, Heads, Sr, Hidden: integer;
+  BlockIn, AttnOut, FfnIn, FfnOut: TNNetLayer;
+begin
+  C := Config.HiddenSizes[Stage];
+  Heads := Config.NumHeads[Stage];
+  Sr := Config.SrRatios[Stage];
+  Hidden := C * Config.MlpRatios[Stage];
+  BlockIn := NN.GetLastLayer();
+  // --- attention sublayer ---
+  Refs.LN1 := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+  AddSegformerAttention(NN, Refs.LN1, C, Heads, Sr, Wg, Hg,
+    Config.LayerNormEps, Refs);
+  AttnOut := NN.GetLastLayer();
+  NN.AddLayer(TNNetSum.Create([AttnOut, BlockIn]));
+  FfnIn := NN.GetLastLayer();
+  // --- Mix-FFN sublayer ---
+  Refs.LN2 := NN.AddLayer(TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+  Refs.Fc1 := NN.AddLayer(TNNetPointwiseConvLinear.Create(Hidden));
+  // depthwise 3x3 pad 1 on the grid (LINEAR), then per-channel bias. The
+  // padding is done with an EXPLICIT TNNetPadXY(1,1) followed by a pad-0 conv
+  // rather than the conv's built-in padding: CAI clamps a conv kernel to the
+  // input spatial size, so on a small grid (Wg,Hg < 3) the built-in path would
+  // shrink the 3x3 kernel and diverge from PyTorch's zero-padded 3x3. Explicit
+  // padding makes the conv input (Wg+2,Hg+2) >= 3 so the full 3x3 always fits.
+  NN.AddLayer(TNNetPadXY.Create(1, 1));
+  Refs.DwConv := NN.AddLayer(TNNetDepthwiseConvLinear.Create(1, 3, 0, 1));
+  Refs.DwBias := NN.AddLayer(TNNetChannelBias.Create());
+  NN.AddLayer(TNNetGELUErf.Create());
+  Refs.Fc2 := NN.AddLayer(TNNetPointwiseConvLinear.Create(C));
+  FfnOut := NN.GetLastLayer();
+  NN.AddLayer(TNNetSum.Create([FfnOut, FfnIn]));
+end;
+
+function BuildSegformer(Reader: TNNetSafeTensorsReader;
+  const Config: TSegformerConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  NN: TNNet;
+  Stages: array[0..3] of TSegformerStageRefs;
+  StageOut: array[0..3] of TNNetLayer;
+  ProjLinear: array[0..3] of TNNetLayer;  // the per-stage Linear (weight target)
+  Projected: array[0..3] of TNNetLayer;   // its (upsampled) output for concat
+  FuseConv, BNScale, BNShift, Classifier: TNNetLayer;
+  Stage, BlockIdx, Wg, Hg, C, Heads, Sr, HeadDim, h, k, Factor: integer;
+  Wg0, Hg0, InC: integer;
+  GW: array of integer;
+  GH: array of integer;
+  EncPre, StagePfx, BlkPfx, AttPfx, Nm: string;
+  UseStages: boolean;
+  BNScaleVol, BNShiftVol, BNMean, BNVar, BNGamma, BNBeta: TNNetVolume;
+  ci: integer;
+  inv: TNeuralFloat;
+begin
+  if Config.NumChannels < 1 then
+    ImportError('SegFormer import: num_channels must be >= 1.');
+  if Config.NumLabels < 1 then
+    ImportError('SegFormer import: num_labels must be >= 1.');
+  if LowerCase(Copy(Config.HiddenAct, 1, 4)) <> 'gelu' then
+    ImportError('SegFormer import: hidden_act "' + Config.HiddenAct +
+      '" unsupported (only gelu variants are wired, mapped to exact-erf GELU).');
+  // Per-stage grid sizes from the overlap-patch conv chain.
+  SetLength(GW, 4); SetLength(GH, 4);
+  Wg := Config.ImageSize; Hg := Config.ImageSize;
+  for Stage := 0 to 3 do
+  begin
+    Wg := (Wg - Config.PatchSizes[Stage] + 2 * (Config.PatchSizes[Stage] div 2))
+          div Config.Strides[Stage] + 1;
+    Hg := (Hg - Config.PatchSizes[Stage] + 2 * (Config.PatchSizes[Stage] div 2))
+          div Config.Strides[Stage] + 1;
+    GW[Stage] := Wg; GH[Stage] := Hg;
+    if (Config.SrRatios[Stage] > 1) and
+       (((Wg mod Config.SrRatios[Stage]) <> 0) or
+        ((Hg mod Config.SrRatios[Stage]) <> 0)) then
+      ImportError('SegFormer import: stage ' + IntToStr(Stage) + ' grid ' +
+        IntToStr(Wg) + 'x' + IntToStr(Hg) + ' not divisible by sr=' +
+        IntToStr(Config.SrRatios[Stage]) + '.');
+    if (Config.HiddenSizes[Stage] mod Config.NumHeads[Stage]) <> 0 then
+      ImportError('SegFormer import: stage ' + IntToStr(Stage) + ' hidden ' +
+        IntToStr(Config.HiddenSizes[Stage]) + ' not divisible by heads ' +
+        IntToStr(Config.NumHeads[Stage]) + '.');
+  end;
+  Wg0 := GW[0]; Hg0 := GH[0];
+  UseStages := Reader.HasTensor('segformer.stages.0.patch_embeddings.proj.weight');
+  if UseStages then EncPre := 'segformer.stages.'
+  else EncPre := 'segformer.encoder.patch_embeddings.';
+  NN := TNNet.Create();
+  try
+    // ---------------- Architecture ----------------
+    NN.AddLayer(TNNetInput.Create(Config.ImageSize, Config.ImageSize,
+      Config.NumChannels));
+    InC := Config.NumChannels;
+    for Stage := 0 to 3 do
+    begin
+      C := Config.HiddenSizes[Stage];
+      // Overlap-patch embed: KxK stride S pad K div 2, biased.
+      Stages[Stage].PatchConv := NN.AddLayer(TNNetConvolutionLinear.Create(
+        C, Config.PatchSizes[Stage], Config.PatchSizes[Stage] div 2,
+        Config.Strides[Stage], 0));
+      Stages[Stage].PatchLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+      SetLength(Stages[Stage].Blocks, Config.Depths[Stage]);
+      for BlockIdx := 0 to Config.Depths[Stage] - 1 do
+        AddSegformerBlock(NN, Config, Stage, GW[Stage], GH[Stage],
+          Stages[Stage].Blocks[BlockIdx]);
+      Stages[Stage].StageLN := NN.AddLayer(
+        TNNetTokenLayerNorm.Create(Config.LayerNormEps));
+      StageOut[Stage] := NN.GetLastLayer();
+      InC := C;
+    end;
+    // ---------------- all-MLP decode head ----------------
+    for Stage := 0 to 3 do
+    begin
+      // per-token Linear to decoder dim, then bilinear-upsample to stage-0 grid.
+      ProjLinear[Stage] := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize),
+        StageOut[Stage]);
+      Projected[Stage] := ProjLinear[Stage];
+      Factor := GW[0] div GW[Stage];
+      if Factor > 1 then
+        Projected[Stage] := NN.AddLayer(TNNetBilinearUpsample.Create(Factor));
+    end;
+    // HF concatenates the projected stages in REVERSED order (cat([::-1])).
+    NN.AddLayer(TNNetDeepConcat.Create(
+      [Projected[3], Projected[2], Projected[1], Projected[0]]));
+    // linear_fuse 1x1 conv (4*decoder -> decoder, biased), BN, ReLU, classifier.
+    FuseConv := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.DecoderHiddenSize));
+    BNScale := NN.AddLayer(TNNetChannelMul.Create());
+    BNShift := NN.AddLayer(TNNetChannelBias.Create());
+    NN.AddLayer(TNNetReLU.Create());
+    Classifier := NN.AddLayer(
+      TNNetPointwiseConvLinear.Create(Config.NumLabels));
+    if pInferenceOnly then NN.MakeInferenceOnly();
+
+    // ---------------- Weights ----------------
+    for Stage := 0 to 3 do
+    begin
+      C := Config.HiddenSizes[Stage];
+      Heads := Config.NumHeads[Stage];
+      Sr := Config.SrRatios[Stage];
+      HeadDim := C div Heads;
+      if Stage > 0 then InC := Config.HiddenSizes[Stage - 1]
+      else InC := Config.NumChannels;
+      if UseStages then
+        StagePfx := 'segformer.stages.' + IntToStr(Stage) + '.'
+      else
+        StagePfx := 'segformer.encoder.';
+      // patch embed conv + LN
+      if UseStages then
+      begin
+        LoadConvNeXtConv(Reader, Stages[Stage].PatchConv,
+          StagePfx + 'patch_embeddings.proj.weight',
+          StagePfx + 'patch_embeddings.proj.bias', C, InC,
+          Config.PatchSizes[Stage]);
+        LoadLayerNormWeights(Reader, Stages[Stage].PatchLN,
+          StagePfx + 'patch_embeddings.layer_norm.weight',
+          StagePfx + 'patch_embeddings.layer_norm.bias', C);
+      end
+      else
+      begin
+        LoadConvNeXtConv(Reader, Stages[Stage].PatchConv,
+          'segformer.encoder.patch_embeddings.' + IntToStr(Stage) + '.proj.weight',
+          'segformer.encoder.patch_embeddings.' + IntToStr(Stage) + '.proj.bias',
+          C, InC, Config.PatchSizes[Stage]);
+        LoadLayerNormWeights(Reader, Stages[Stage].PatchLN,
+          'segformer.encoder.patch_embeddings.' + IntToStr(Stage) + '.layer_norm.weight',
+          'segformer.encoder.patch_embeddings.' + IntToStr(Stage) + '.layer_norm.bias', C);
+      end;
+      for BlockIdx := 0 to Config.Depths[Stage] - 1 do
+      begin
+        if UseStages then
+          BlkPfx := StagePfx + 'blocks.' + IntToStr(BlockIdx) + '.'
+        else
+          BlkPfx := 'segformer.encoder.block.' + IntToStr(Stage) + '.' +
+            IntToStr(BlockIdx) + '.';
+        with Stages[Stage].Blocks[BlockIdx] do
+        begin
+          LoadLayerNormWeights(Reader, LN1,
+            BlkPfx + 'layernorm_before.weight',
+            BlkPfx + 'layernorm_before.bias', C);
+          // attention q/k/v/o projections (5.x q_proj... or legacy
+          // attention.self.query / attention.output.dense)
+          if UseStages then AttPfx := BlkPfx + 'attention.'
+          else AttPfx := BlkPfx + 'attention.';
+          LoadLlamaLinearWeights(Reader, QProj,
+            SegPickName(Reader, AttPfx + 'q_proj.weight',
+              AttPfx + 'self.query.weight'),
+            C, C, 0, -1, 0,
+            SegPickName(Reader, AttPfx + 'q_proj.bias',
+              AttPfx + 'self.query.bias'));
+          LoadLlamaLinearWeights(Reader, KProj,
+            SegPickName(Reader, AttPfx + 'k_proj.weight',
+              AttPfx + 'self.key.weight'),
+            C, C, 0, -1, 0,
+            SegPickName(Reader, AttPfx + 'k_proj.bias',
+              AttPfx + 'self.key.bias'));
+          LoadLlamaLinearWeights(Reader, VProj,
+            SegPickName(Reader, AttPfx + 'v_proj.weight',
+              AttPfx + 'self.value.weight'),
+            C, C, 0, -1, 0,
+            SegPickName(Reader, AttPfx + 'v_proj.bias',
+              AttPfx + 'self.value.bias'));
+          LoadLlamaLinearWeights(Reader, OProj,
+            SegPickName(Reader, AttPfx + 'o_proj.weight',
+              AttPfx + 'output.dense.weight'),
+            C, C, 0, -1, 0,
+            SegPickName(Reader, AttPfx + 'o_proj.bias',
+              AttPfx + 'output.dense.bias'));
+          if Sr > 1 then
+          begin
+            LoadConvNeXtConv(Reader, SrConv,
+              SegPickName(Reader,
+                AttPfx + 'sequence_reduction.sequence_reduction.weight',
+                AttPfx + 'self.sr.weight'),
+              SegPickName(Reader,
+                AttPfx + 'sequence_reduction.sequence_reduction.bias',
+                AttPfx + 'self.sr.bias'), C, C, Sr);
+            LoadLayerNormWeights(Reader, SrLN,
+              SegPickName(Reader,
+                AttPfx + 'sequence_reduction.layer_norm.weight',
+                AttPfx + 'self.layer_norm.weight'),
+              SegPickName(Reader,
+                AttPfx + 'sequence_reduction.layer_norm.bias',
+                AttPfx + 'self.layer_norm.bias'), C);
+          end;
+          LoadLayerNormWeights(Reader, LN2,
+            BlkPfx + 'layernorm_after.weight',
+            BlkPfx + 'layernorm_after.bias', C);
+          LoadLlamaLinearWeights(Reader, Fc1,
+            BlkPfx + 'mlp.fc1.weight', C, C * Config.MlpRatios[Stage],
+            0, -1, 0, BlkPfx + 'mlp.fc1.bias');
+          LoadConvNeXtDepthwise(Reader, DwConv,
+            BlkPfx + 'mlp.dwconv.dwconv.weight',
+            BlkPfx + 'mlp.dwconv.dwconv.bias',
+            C * Config.MlpRatios[Stage], 3);
+          LoadConvNeXtChannelVector(Reader, DwBias,
+            BlkPfx + 'mlp.dwconv.dwconv.bias', 0,
+            C * Config.MlpRatios[Stage]);
+          LoadLlamaLinearWeights(Reader, Fc2,
+            BlkPfx + 'mlp.fc2.weight', C * Config.MlpRatios[Stage], C,
+            0, -1, 0, BlkPfx + 'mlp.fc2.bias');
+        end;
+      end;
+      LoadLayerNormWeights(Reader, Stages[Stage].StageLN,
+        SegPickName(Reader, StagePfx + 'layer_norm.weight',
+          'segformer.encoder.layer_norm.' + IntToStr(Stage) + '.weight'),
+        SegPickName(Reader, StagePfx + 'layer_norm.bias',
+          'segformer.encoder.layer_norm.' + IntToStr(Stage) + '.bias'), C);
+    end;
+    // decode head linear projections
+    for Stage := 0 to 3 do
+      LoadLlamaLinearWeights(Reader, ProjLinear[Stage],
+        SegPickName(Reader,
+          'decode_head.linear_projections.' + IntToStr(Stage) + '.proj.weight',
+          'decode_head.linear_c.' + IntToStr(Stage) + '.proj.weight'),
+        Config.HiddenSizes[Stage], Config.DecoderHiddenSize, 0, -1, 0,
+        SegPickName(Reader,
+          'decode_head.linear_projections.' + IntToStr(Stage) + '.proj.bias',
+          'decode_head.linear_c.' + IntToStr(Stage) + '.proj.bias'));
+    // linear_fuse is a Conv2d 1x1, bias=False. Weight [O,I,1,1] flattens to the
+    // [O,I] nn.Linear layout LoadLlamaLinearWeights reads; no bias name -> the
+    // CAI per-neuron bias stays zero (exact: HF has no bias here).
+    LoadSegformer1x1(Reader, FuseConv, 'decode_head.linear_fuse.weight',
+      Config.DecoderHiddenSize, 4 * Config.DecoderHiddenSize);
+    // frozen BatchNorm folded into ChannelMul (scale) + ChannelBias (shift):
+    //   scale = gamma / sqrt(var + eps),  shift = beta - mean * scale
+    BNGamma := TNNetVolume.Create; BNBeta := TNNetVolume.Create;
+    BNMean := TNNetVolume.Create; BNVar := TNNetVolume.Create;
+    BNScaleVol := TNNetVolume.Create; BNShiftVol := TNNetVolume.Create;
+    try
+      Reader.LoadTensorFlat('decode_head.batch_norm.weight', BNGamma);
+      Reader.LoadTensorFlat('decode_head.batch_norm.bias', BNBeta);
+      Reader.LoadTensorFlat('decode_head.batch_norm.running_mean', BNMean);
+      Reader.LoadTensorFlat('decode_head.batch_norm.running_var', BNVar);
+      if (BNGamma.Size <> Config.DecoderHiddenSize) then
+        ImportError('SegFormer import: batch_norm.weight must have ' +
+          IntToStr(Config.DecoderHiddenSize) + ' elements.');
+      EnsureWritableImportWeights(BNScale);
+      EnsureWritableImportWeights(BNShift);
+      for ci := 0 to Config.DecoderHiddenSize - 1 do
+      begin
+        inv := BNGamma.FData[ci] / Sqrt(BNVar.FData[ci] + 0.00001);
+        BNScale.Neurons[0].Weights.FData[ci] := inv;
+        BNShift.Neurons[0].Weights.FData[ci] :=
+          BNBeta.FData[ci] - BNMean.FData[ci] * inv;
+      end;
+      BNScale.FlushWeightCache();
+      BNShift.FlushWeightCache();
+    finally
+      BNGamma.Free; BNBeta.Free; BNMean.Free; BNVar.Free;
+      BNScaleVol.Free; BNShiftVol.Free;
+    end;
+    // classifier 1x1 conv (decoder -> num_labels, biased); weight is [O,I,1,1].
+    LoadSegformer1x1(Reader, Classifier, 'decode_head.classifier.weight',
+      Config.NumLabels, Config.DecoderHiddenSize,
+      'decode_head.classifier.bias');
+    Result := NN;
+  except
+    NN.Free;
+    raise;
+  end;
+end;
+
+function BuildSegformerFromSafeTensorsEx(const FileName: string;
+  const Config: TSegformerConfig; pInferenceOnly: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+begin
+  Reader := CreatePretrainedTensorReader(FileName);
+  try
+    Result := BuildSegformer(Reader, Config, pInferenceOnly);
+  finally
+    Reader.Free;
+  end;
+end;
+
+function BuildSegformerFromSafeTensors(const FileName: string;
+  out Config: TSegformerConfig; pInferenceOnly: boolean = false;
+  const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadSegformerConfigFromJSONFile(ConfigPath);
+  Result := BuildSegformerFromSafeTensorsEx(FileName, Config, pInferenceOnly);
 end;
 
 // ===========================================================================

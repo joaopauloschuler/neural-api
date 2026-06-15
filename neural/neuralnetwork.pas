@@ -11638,6 +11638,28 @@ type
 
   TNNetDeAvgPool = class(TNNetDeMaxPool);
 
+  /// Spatial BILINEAR upsample by an INTEGER factor, matching PyTorch's
+  // nn.functional.interpolate(mode='bilinear', align_corners=False). Given an
+  // input (W,H,C) and factor s it produces (W*s, H*s, C). For an output pixel
+  // (ox,oy) the source coordinate (align_corners=False) is
+  //   sx = (ox + 0.5)/s - 0.5,   sy = (oy + 0.5)/s - 0.5
+  // clamped to [0, W-1] / [0, H-1] (PyTorch clamps NEGATIVE source coords to 0
+  // before sampling; the upper edge is handled by clamping the integer corner
+  // index). The output is the bilinear blend of the 4 surrounding source pixels,
+  // applied independently per channel. No trainable parameters. The factor is
+  // serialized in FStruct[0] so the layer round-trips through Save/LoadFromString.
+  // Backward scatters each output error back to its 4 source corners weighted by
+  // the same bilinear weights (the exact adjoint).
+  // Coded by Claude (AI).
+  TNNetBilinearUpsample = class(TNNetLayer)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(pFactor: integer = 2); reintroduce; overload;
+      procedure Compute(); override;
+      procedure Backpropagate(); override;
+  end;
+
   /// neural network
   TNNet = class(TMObject)
     protected
@@ -34486,6 +34508,108 @@ begin
             FPrevLayer.OutputError.Add(x, y, InD,
               FOutputError[r * x + i, r * y + j, c]);
           end;
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetBilinearUpsample }
+constructor TNNetBilinearUpsample.Create(pFactor: integer);
+begin
+  inherited Create();
+  if pFactor < 1 then pFactor := 1;
+  FStruct[0] := pFactor;
+end;
+
+procedure TNNetBilinearUpsample.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  s: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  s := FStruct[0];
+  if s < 1 then s := 1;
+  FOutput.ReSize(pPrevLayer.Output.SizeX * s,
+                 pPrevLayer.Output.SizeY * s,
+                 pPrevLayer.Output.Depth);
+  FOutputError.ReSize(FOutput);
+  FOutputErrorDeriv.ReSize(FOutput);
+end;
+
+// Bilinear sampling shared geometry: for output index o on an axis of input
+// size InSize, returns the two source corner indices i0,i1 and the weight w1 of
+// the FAR (i1) corner (the near corner i0 weight is 1-w1). align_corners=False.
+procedure BilinearMap(o, s, InSize: integer; out i0, i1: integer;
+  out w1: TNeuralFloat); inline;
+var
+  src, ff: TNeuralFloat;
+begin
+  src := (o + 0.5) / s - 0.5;
+  if src < 0 then src := 0;
+  i0 := Trunc(src);
+  ff := src - i0;
+  i1 := i0 + 1;
+  if i1 > InSize - 1 then i1 := InSize - 1;
+  if i0 > InSize - 1 then i0 := InSize - 1;
+  w1 := ff;
+end;
+
+procedure TNNetBilinearUpsample.Compute();
+var
+  s, OutX, OutY, D, ox, oy, c: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx1, wy1, v: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  s := FStruct[0];
+  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
+  for oy := 0 to OutY - 1 do
+  begin
+    BilinearMap(oy, s, FPrevLayer.Output.SizeY, iy0, iy1, wy1);
+    for ox := 0 to OutX - 1 do
+    begin
+      BilinearMap(ox, s, FPrevLayer.Output.SizeX, ix0, ix1, wx1);
+      for c := 0 to D - 1 do
+      begin
+        v := (1 - wy1) * ((1 - wx1) * FPrevLayer.Output[ix0, iy0, c] +
+                          wx1 * FPrevLayer.Output[ix1, iy0, c]) +
+             wy1 * ((1 - wx1) * FPrevLayer.Output[ix0, iy1, c] +
+                    wx1 * FPrevLayer.Output[ix1, iy1, c]);
+        FOutput[ox, oy, c] := v;
+      end;
+    end;
+  end;
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetBilinearUpsample.Backpropagate();
+var
+  s, OutX, OutY, D, ox, oy, c: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx1, wy1, g: TNeuralFloat;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  s := FStruct[0];
+  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
+  for oy := 0 to OutY - 1 do
+  begin
+    BilinearMap(oy, s, FPrevLayer.Output.SizeY, iy0, iy1, wy1);
+    for ox := 0 to OutX - 1 do
+    begin
+      BilinearMap(ox, s, FPrevLayer.Output.SizeX, ix0, ix1, wx1);
+      for c := 0 to D - 1 do
+      begin
+        g := FOutputError[ox, oy, c];
+        FPrevLayer.OutputError.Add(ix0, iy0, c, (1 - wy1) * (1 - wx1) * g);
+        FPrevLayer.OutputError.Add(ix1, iy0, c, (1 - wy1) * wx1 * g);
+        FPrevLayer.OutputError.Add(ix0, iy1, c, wy1 * (1 - wx1) * g);
+        FPrevLayer.OutputError.Add(ix1, iy1, c, wy1 * wx1 * g);
+      end;
+    end;
+  end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
 end;
@@ -88492,6 +88616,7 @@ begin
       'TNNetDeAvgPool' :            Result := TNNetDeAvgPool.Create(St[0]);
       'TNNetUpsample' :             Result := TNNetUpsample.Create();
       'TNNetPixelShuffle' :         Result := TNNetPixelShuffle.Create(St[0]);
+      'TNNetBilinearUpsample' :     Result := TNNetBilinearUpsample.Create(St[0]);
       'TNNetLayerMaxNormalization': Result := TNNetLayerMaxNormalization.Create();
       'TNNetLayerStdNormalization': Result := TNNetLayerStdNormalization.Create();
       'TNNetMovingStdNormalization': Result := TNNetMovingStdNormalization.Create();
@@ -88893,6 +89018,7 @@ begin
       if S[0] = 'TNNetDeAvgPool' then Result := TNNetDeAvgPool.Create(St[0]) else
       if S[0] = 'TNNetUpsample' then Result := TNNetUpsample.Create() else
       if S[0] = 'TNNetPixelShuffle' then Result := TNNetPixelShuffle.Create(St[0]) else
+      if S[0] = 'TNNetBilinearUpsample' then Result := TNNetBilinearUpsample.Create(St[0]) else
       if S[0] = 'TNNetLayerMaxNormalization' then Result := TNNetLayerMaxNormalization.Create() else
       if S[0] = 'TNNetLayerStdNormalization' then Result := TNNetLayerStdNormalization.Create() else
       if S[0] = 'TNNetMovingStdNormalization' then Result := TNNetMovingStdNormalization.Create() else

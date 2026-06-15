@@ -27,3 +27,6 @@ DiffusionMNIST/*.png
 DiffusionMNIST/*-ubyte
 DiffusionMNIST/*.idx*-ubyte
 DiffusionMNIST/*.nn
+
+# SemanticSegmentation: compiled SegFormer demo binary
+SemanticSegmentation/SemanticSegmentation

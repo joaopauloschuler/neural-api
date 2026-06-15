@@ -279,6 +279,8 @@ type
     procedure TestConvNeXtConfigFromJSONFile;
     procedure TestConvNeXtV1ImageClassificationParity;
     procedure TestConvNeXtV2ImageClassificationParity;
+    procedure TestSegformerConfigFromJSONFile;
+    procedure TestSegformerSemanticSegmentationParity;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestMobileNetV3ConfigFromJSONFile;
@@ -12907,6 +12909,108 @@ end;
 procedure TTestNeuralPretrained.TestConvNeXtV2ImageClassificationParity;
 begin
   RunConvNeXtParity('tiny_convnextv2');
+end;
+
+// Verifies ReadSegformerConfigFromJSONFile on the committed pico config.
+procedure TTestNeuralPretrained.TestSegformerConfigFromJSONFile;
+var
+  Config: TSegformerConfig;
+begin
+  Config := ReadSegformerConfigFromJSONFile(
+    FixturePath('tiny_segformer_config.json'));
+  AssertEquals('image_size', 64, Config.ImageSize);
+  AssertEquals('num_channels', 3, Config.NumChannels);
+  AssertEquals('num_labels', 5, Config.NumLabels);
+  AssertEquals('decoder', 16, Config.DecoderHiddenSize);
+  AssertEquals('hidden[0]', 8, Config.HiddenSizes[0]);
+  AssertEquals('hidden[3]', 32, Config.HiddenSizes[3]);
+  AssertEquals('sr[0]', 2, Config.SrRatios[0]);
+  AssertEquals('sr[3]', 1, Config.SrRatios[3]);
+  AssertEquals('heads[1]', 2, Config.NumHeads[1]);
+  AssertEquals('depths[0]', 1, Config.Depths[0]);
+  AssertEquals('patch[0]', 7, Config.PatchSizes[0]);
+  AssertEquals('stride[0]', 4, Config.Strides[0]);
+  AssertEquals('act', 'gelu', Config.HiddenAct);
+end;
+
+// HF SegFormer semantic-segmentation parity (the FIRST dense per-pixel class-map
+// importer). tiny_segformer.* is a pico MiT-b0-shaped SegformerForSemanticSeg-
+// mentation with re-randomized O(1) weights; the reference per-pixel logits at
+// input/4 resolution come from the REAL transformers float64 forward. Asserts
+// max |diff| < 1e-4 over the whole (H/4, W/4, num_labels) logit map - exercising
+// the overlap-patch convs, the spatial-reduction (rectangular) efficient
+// attention, the Mix-FFN depthwise positional conv, and the all-MLP decode head
+// (per-stage Linear, bilinear upsample, reversed concat, fuse conv, folded
+// BatchNorm, classifier).
+procedure TTestNeuralPretrained.TestSegformerSemanticSegmentationParity;
+var
+  NN: TNNet;
+  Config: TSegformerConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  CasesArr, OneCaseArr, OutArr, InArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Img, Output: TNNetVolume;
+  RefVal, GotVal, Diff, MaxDiff: double;
+  CaseCnt, x, yy, c, FlatIdx, GW, GH, NLab, W, H, NumCh: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildSegformerFromSafeTensors(FixturePath('tiny_segformer.safetensors'),
+    Config, {pInferenceOnly=}false, FixturePath('tiny_segformer_config.json'));
+  RefJson := TStringList.Create;
+  Img := TNNetVolume.Create;
+  RefRoot := nil;
+  MaxDiff := 0;
+  W := Config.ImageSize; H := Config.ImageSize; NumCh := Config.NumChannels;
+  try
+    AssertTrue('net built', NN <> nil);
+    RefJson.LoadFromFile(FixturePath('tiny_segformer_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    CasesArr := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertTrue('cases present', CasesArr <> nil);
+    for CaseCnt := 0 to CasesArr.Count - 1 do
+    begin
+      CaseObj := TJSONObject(CasesArr.Items[CaseCnt]);
+      InArr := TJSONArray(CaseObj.Find('input'));   // flat (y,x,c) CAI order
+      OutArr := TJSONArray(CaseObj.Find('output')); // flat (y,x,c) CAI order
+      GW := CaseObj.Get('out_grid_w', 0);
+      GH := CaseObj.Get('out_grid_h', 0);
+      NLab := CaseObj.Get('out_labels', 0);
+      // Load input into the CAI (x,y,depth) volume (the fixture already stores
+      // the flat (y*W+x)*C+c raster).
+      Img.ReSize(W, H, NumCh);
+      for yy := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          for c := 0 to NumCh - 1 do
+          begin
+            FlatIdx := (yy * W + x) * NumCh + c;
+            Img.FData[(yy * W + x) * NumCh + c] := InArr.Items[FlatIdx].AsFloat;
+          end;
+      NN.Compute(Img);
+      Output := NN.GetLastLayer().Output;
+      AssertEquals('output grid w', GW, Output.SizeX);
+      AssertEquals('output grid h', GH, Output.SizeY);
+      AssertEquals('output labels', NLab, Output.Depth);
+      for yy := 0 to GH - 1 do
+        for x := 0 to GW - 1 do
+          for c := 0 to NLab - 1 do
+          begin
+            FlatIdx := (yy * GW + x) * NLab + c;
+            RefVal := OutArr.Items[FlatIdx].AsFloat;
+            GotVal := Output.FData[(yy * GW + x) * NLab + c];
+            Diff := Abs(GotVal - RefVal);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+    end;
+    OneCaseArr := nil; // silence hint
+    AssertTrue('SegFormer output: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Img.Free;
+    RefJson.Free;
+    NN.Free;
+  end;
 end;
 
 // Verifies ReadInceptionV3ConfigFromJSONFile on the committed Inception pico
